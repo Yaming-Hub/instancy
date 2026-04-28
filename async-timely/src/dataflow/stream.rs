@@ -10,36 +10,36 @@ use super::channels::PartitionStrategy;
 use super::region::RegionId;
 use super::scope::Scope;
 
-/// Identifies a specific port on an operator.
+/// Identifies a specific input or output slot on an operator.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub struct Port {
+pub struct Slot {
     /// The operator index within its scope.
     pub operator_index: usize,
-    /// The port number (0 for single-output operators).
-    pub port_index: usize,
+    /// The slot number (0 for single-output operators, 0=left/1=right for binary inputs).
+    pub slot_index: usize,
 }
 
-impl Port {
-    /// Create a new port identifier.
-    pub fn new(operator_index: usize, port_index: usize) -> Self {
+impl Slot {
+    /// Create a new slot identifier.
+    pub fn new(operator_index: usize, slot_index: usize) -> Self {
         Self {
             operator_index,
-            port_index,
+            slot_index,
         }
     }
 }
 
-impl fmt::Display for Port {
+impl fmt::Display for Slot {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "Op{}:Port{}", self.operator_index, self.port_index)
+        write!(f, "Op{}:Slot{}", self.operator_index, self.slot_index)
     }
 }
 
 /// A connection target for a stream edge.
 #[derive(Debug, Clone)]
 pub struct StreamTarget {
-    /// The target port (operator + port index).
-    pub port: Port,
+    /// The target slot (operator + slot index).
+    pub slot: Slot,
     /// The partition strategy used to route data to this target.
     pub pact: String, // Strategy name for debugging; actual routing is in the channel.
 }
@@ -48,7 +48,7 @@ pub struct StreamTarget {
 ///
 /// `Stream<S, D>` represents a logical stream of data records of type `D`
 /// flowing at timestamps defined by scope `S`. Streams connect an output
-/// port of one operator to the input port(s) of downstream operators.
+/// slot of one operator to the input slot(s) of downstream operators.
 ///
 /// Streams are created by operators (e.g., `unary`, `binary`) and consumed
 /// by downstream operators or terminal operators (e.g., `output`).
@@ -56,8 +56,8 @@ pub struct StreamTarget {
 pub struct Stream<S: Scope, D> {
     /// The scope this stream belongs to.
     scope: S,
-    /// The source port (which operator output produced this stream).
-    source: Port,
+    /// The source slot (which operator output produced this stream).
+    source: Slot,
     /// The execution region this stream's source operator belongs to.
     region_id: RegionId,
     /// Phantom for the data type.
@@ -65,8 +65,8 @@ pub struct Stream<S: Scope, D> {
 }
 
 impl<S: Scope, D> Stream<S, D> {
-    /// Create a new stream from a source operator's output port.
-    pub fn new(scope: S, source: Port, region_id: RegionId) -> Self {
+    /// Create a new stream from a source operator's output slot.
+    pub fn new(scope: S, source: Slot, region_id: RegionId) -> Self {
         Self {
             scope,
             source,
@@ -85,8 +85,8 @@ impl<S: Scope, D> Stream<S, D> {
         &mut self.scope
     }
 
-    /// Get the source port of this stream.
-    pub fn source(&self) -> &Port {
+    /// Get the source slot of this stream.
+    pub fn source(&self) -> &Slot {
         &self.source
     }
 
@@ -97,7 +97,7 @@ impl<S: Scope, D> Stream<S, D> {
 
     /// Create a derived stream in a new region.
     /// This is used internally by repartition operators.
-    pub fn in_region(mut self, new_region_id: RegionId, new_source: Port) -> Self {
+    pub fn in_region(mut self, new_region_id: RegionId, new_source: Slot) -> Self {
         self.region_id = new_region_id;
         self.source = new_source;
         self
@@ -107,10 +107,10 @@ impl<S: Scope, D> Stream<S, D> {
 /// Describes how two streams connect, including the partition strategy.
 #[derive(Debug)]
 pub struct StreamConnection<D> {
-    /// Source port.
-    pub source: Port,
-    /// Target port.
-    pub target: Port,
+    /// Source slot.
+    pub source: Slot,
+    /// Target slot.
+    pub target: Slot,
     /// The source region.
     pub source_region: RegionId,
     /// The target region.
@@ -145,18 +145,18 @@ mod tests {
     use crate::dataflow::scope::RootScope;
 
     #[test]
-    fn port_creation_and_display() {
-        let port = Port::new(3, 1);
-        assert_eq!(port.operator_index, 3);
-        assert_eq!(port.port_index, 1);
-        assert_eq!(format!("{}", port), "Op3:Port1");
+    fn slot_creation_and_display() {
+        let slot = Slot::new(3, 1);
+        assert_eq!(slot.operator_index, 3);
+        assert_eq!(slot.slot_index, 1);
+        assert_eq!(format!("{}", slot), "Op3:Slot1");
     }
 
     #[test]
     fn stream_creation() {
         let scope = RootScope::<u64>::new("test", 4);
         let region_id = scope.current_region().id();
-        let source = Port::new(0, 0);
+        let source = Slot::new(0, 0);
 
         let stream: Stream<RootScope<u64>, i32> = Stream::new(scope, source, region_id);
         assert_eq!(stream.source().operator_index, 0);
@@ -169,12 +169,12 @@ mod tests {
         let mut scope = RootScope::<u64>::new("test", 4);
         let region1 = scope.current_region().id();
         let region2 = scope.new_region(8);
-        let source = Port::new(0, 0);
+        let source = Slot::new(0, 0);
 
         let stream: Stream<RootScope<u64>, i32> =
             Stream::new(scope, source, region1);
 
-        let new_source = Port::new(1, 0);
+        let new_source = Slot::new(1, 0);
         let stream2 = stream.in_region(region2, new_source);
         assert_eq!(stream2.region_id(), region2);
         assert_eq!(stream2.source().operator_index, 1);
@@ -184,8 +184,8 @@ mod tests {
     fn connection_validation_pipeline_same_region() {
         let region = RegionId::new(0);
         let conn: StreamConnection<i32> = StreamConnection {
-            source: Port::new(0, 0),
-            target: Port::new(1, 0),
+            source: Slot::new(0, 0),
+            target: Slot::new(1, 0),
             source_region: region,
             target_region: region,
             strategy: PartitionStrategy::Pipeline,
@@ -196,8 +196,8 @@ mod tests {
     #[test]
     fn connection_validation_pipeline_cross_region_fails() {
         let conn: StreamConnection<i32> = StreamConnection {
-            source: Port::new(0, 0),
-            target: Port::new(1, 0),
+            source: Slot::new(0, 0),
+            target: Slot::new(1, 0),
             source_region: RegionId::new(0),
             target_region: RegionId::new(1),
             strategy: PartitionStrategy::Pipeline,
@@ -212,8 +212,8 @@ mod tests {
     #[test]
     fn connection_validation_exchange_cross_region_ok() {
         let conn: StreamConnection<i32> = StreamConnection {
-            source: Port::new(0, 0),
-            target: Port::new(1, 0),
+            source: Slot::new(0, 0),
+            target: Slot::new(1, 0),
             source_region: RegionId::new(0),
             target_region: RegionId::new(1),
             strategy: PartitionStrategy::exchange("by value", |x: &i32| *x as u64),
@@ -224,8 +224,8 @@ mod tests {
     #[test]
     fn connection_validation_rebalance_cross_region_ok() {
         let conn: StreamConnection<i32> = StreamConnection {
-            source: Port::new(0, 0),
-            target: Port::new(1, 0),
+            source: Slot::new(0, 0),
+            target: Slot::new(1, 0),
             source_region: RegionId::new(0),
             target_region: RegionId::new(2),
             strategy: PartitionStrategy::Rebalance,
@@ -236,8 +236,8 @@ mod tests {
     #[test]
     fn connection_validation_gather_cross_region_ok() {
         let conn: StreamConnection<i32> = StreamConnection {
-            source: Port::new(0, 0),
-            target: Port::new(1, 0),
+            source: Slot::new(0, 0),
+            target: Slot::new(1, 0),
             source_region: RegionId::new(0),
             target_region: RegionId::new(1),
             strategy: PartitionStrategy::Gather,
@@ -248,8 +248,8 @@ mod tests {
     #[test]
     fn connection_validation_broadcast_cross_region_ok() {
         let conn: StreamConnection<i32> = StreamConnection {
-            source: Port::new(0, 0),
-            target: Port::new(1, 0),
+            source: Slot::new(0, 0),
+            target: Slot::new(1, 0),
             source_region: RegionId::new(0),
             target_region: RegionId::new(1),
             strategy: PartitionStrategy::Broadcast,

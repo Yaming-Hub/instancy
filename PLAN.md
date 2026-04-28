@@ -108,15 +108,27 @@ Contract-and-test-driven development. Each PR defines traits/interfaces first, t
 
 ---
 
-## PR 5 — Worker thread pool + execution engine
-**Goal**: Implement the custom compute thread pool, logical worker model, and runtime bootstrap.
+## PR 5 — Worker thread pool + execution engine + provider traits
+**Goal**: Implement the custom compute thread pool, logical worker model, provider traits, and runtime bootstrap.
 
+- `providers/mod.rs`
+  - `TransportProvider` trait — resolves logical targets to Push endpoints
+  - `ExecutionProvider` trait — submits tasks for logical workers
+  - `LogicalTarget` — `(RegionId, WorkerId, OperatorIndex, Port)`
+- `providers/local_transport.rs`
+  - `LocalTransport` — all targets resolved to bounded in-memory buffers (single-process default)
+- `providers/in_memory_cluster.rs`
+  - `InMemoryClusterTransport` — simulates multi-node in single process (for testing)
+  - `InMemoryCluster` — virtual cluster state
+- `providers/inline_execution.rs`
+  - `InlineExecution` — runs all tasks on calling thread (for deterministic tests)
 - `compute_pool.rs`
-  - `ComputePoolConfig` — `min_threads`, `max_threads`, `idle_shutdown`
-  - `ComputePool` — dynamic thread pool with shared task queue
+  - `WorkerPoolConfig` — `min_threads`, `max_threads`, `idle_shutdown`
+  - `WorkerPool` — dynamic thread pool with shared task queue
   - Worker thread loop: spin → yield → park → shutdown lifecycle
   - `TaskQueue` — lock-free shared queue (crossbeam deque or similar)
   - Thread scaling: spawn on demand, shutdown on idle
+  - Implements `ExecutionProvider` trait
 - `scheduler.rs`
   - `TaskScheduler` — per-worker FIFO queues, per-region concurrency limits
   - `ComputeTask` — worker_id + activation + region permit
@@ -125,7 +137,7 @@ Contract-and-test-driven development. Each PR defines traits/interfaces first, t
   - `WorkerId(usize)` — globally unique logical worker identity
   - `OperatorActivation` — queued work item for an operator
 - `execute.rs`
-  - `RuntimeConfig` — `ComputePoolConfig`, optional Tokio runtime handle (for I/O), progress mode
+  - `RuntimeConfig` — `WorkerPoolConfig`, optional Tokio runtime handle, transport provider, execution provider
   - `DataflowConfig` — cluster topology, cancellation token, `ErrorPolicy`
   - `ErrorPolicy` — `Stop` (default) or `Ignore { on_error }` per-dataflow error handling
   - `ClusterTopology` — `nodes: Vec<NodeConfig>`, `total_workers()`, `worker_range()`, `node_for_worker()`
@@ -137,10 +149,15 @@ Contract-and-test-driven development. Each PR defines traits/interfaces first, t
   - `OperatorMetrics` — name, index, activations, cpu_time, records_processed
 
 **Tests**:
-- ComputePool: tasks execute on pool threads
-- ComputePool: dynamic scaling — starts at min, grows under load, shrinks on idle
-- ComputePool: idle threads park (low CPU usage when no tasks)
-- ComputePool: threads above min shut down after idle_shutdown
+- TransportProvider: LocalTransport resolves co-local targets to buffers
+- TransportProvider: InMemoryClusterTransport resolves cross-node targets
+- TransportProvider: is_local() correctly identifies co-located targets
+- ExecutionProvider: WorkerPool submits and executes tasks
+- ExecutionProvider: InlineExecution runs tasks synchronously on calling thread
+- WorkerPool: tasks execute on pool threads
+- WorkerPool: dynamic scaling — starts at min, grows under load, shrinks on idle
+- WorkerPool: idle threads park (low CPU usage when no tasks)
+- WorkerPool: threads above min shut down after idle_shutdown
 - TaskScheduler: FIFO ordering within a worker
 - TaskScheduler: per-region concurrency limit enforced
 - TaskScheduler: dispatch only when worker has no in-flight task
@@ -150,8 +167,9 @@ Contract-and-test-driven development. Each PR defines traits/interfaces first, t
 - DataflowMetrics: accumulation of operator metrics
 - execute(): basic smoke test — empty dataflow starts and completes
 - Runtime isolation: passing an external Tokio handle for I/O works
+- **Multi-node in single process**: InMemoryClusterTransport + InlineExecution runs a distributed dataflow in one test
 
-**Estimated size**: ~3000 lines
+**Estimated size**: ~3500 lines
 
 ---
 

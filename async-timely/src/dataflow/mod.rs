@@ -11,4 +11,4 @@ pub mod stream;
 pub use channels::{ControlSignal, Envelope, PartitionStrategy, Payload};
 pub use region::{PlacementPolicy, Region, RegionAllocator, RegionId};
 pub use scope::{ChildScope, RootScope, Scope, ScopeAddr};
-pub use stream::{Port, Stream, StreamConnection};
+pub use stream::{Slot, Stream, StreamConnection};
