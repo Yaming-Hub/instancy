@@ -1,0 +1,14 @@
+[package]
+name = "async-timely"
+version = "0.1.0"
+edition = "2024"
+description = "An async reimplementation of timely-dataflow"
+license = "MIT"
+
+[dependencies]
+thiserror = "2"
+
+[dev-dependencies]
+
+[features]
+default = []
