@@ -37,6 +37,15 @@ pub enum Error {
         source: Box<dyn std::error::Error + Send + Sync>,
     },
 
+    /// The channel is full and cannot accept more data.
+    /// The scheduler should re-queue the task and retry later.
+    #[error("Channel backpressure: buffer is full")]
+    Backpressure,
+
+    /// The channel has been closed (sender or receiver disconnected).
+    #[error("Channel closed")]
+    ChannelClosed,
+
     /// A custom error message.
     #[error("{0}")]
     Custom(String),
