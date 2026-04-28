@@ -18,4 +18,4 @@ pub use operators::output::{OutputEvent, OutputStream, OutputSender};
 pub use region::{PlacementPolicy, Region, RegionAllocator, RegionId};
 pub use scope::{ChildScope, RootScope, Scope, ScopeAddr};
 pub use spec::{DataflowHandle, DataflowInputs, DataflowSpec};
-pub use stream::{Slot, Stream, StreamConnection};
+pub use stream::{DataStream, Slot, StreamConnection};

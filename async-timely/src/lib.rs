@@ -6,7 +6,7 @@
 //!
 //! Key concepts:
 //! - **Scope**: A region of the dataflow graph sharing a common timestamp type.
-//! - **Stream**: A typed edge connecting operators in the graph.
+//! - **DataStream**: A typed edge connecting operators in the graph.
 //! - **Region**: An execution region with its own parallelism level.
 //! - **Envelope**: A structured message carrying data, control signals, and metadata.
 //! - **Frontier/Antichain**: Progress tracking primitives.
