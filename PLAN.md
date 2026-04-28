@@ -482,16 +482,18 @@ Contract-and-test-driven development. Each PR defines traits/interfaces first, t
 ---
 
 ## PR 18 — Observability + metrics integration
-**Goal**: Per-dataflow CPU time tracking and structured tracing.
+**Goal**: Per-dataflow CPU time tracking, backpressure measurement, and structured tracing.
 
 - Wire up `DataflowMetrics` collection throughout the runtime:
   - Wrap each operator activation with `Instant::now()` timing
   - Accumulate per-operator CPU time, activation counts, records processed
+  - Track backpressure per-operator: `BackpressureMetrics` (blocked_count, blocked_duration, max_blocked_duration)
+  - When an operator push returns `Error::Backpressure`, record the wait duration until buffer drains
   - Aggregate into `DataflowMetrics` at dataflow completion
   - `execute()` returns `DataflowResult<R>` with result + metrics
 - `tracing` integration:
-  - Instrument key paths: operator activation, progress updates, connection events
-  - Structured fields: worker_id, operator_name, timestamp
+  - Instrument key paths: operator activation, progress updates, connection events, backpressure events
+  - Structured fields: worker_id, operator_name, timestamp, backpressure_duration
   - Emit `OperatorMetrics` as tracing events at dataflow completion
 
 **Tests**:
@@ -499,8 +501,11 @@ Contract-and-test-driven development. Each PR defines traits/interfaces first, t
 - DataflowMetrics: total_cpu_time ≤ wall_time × num_workers
 - OperatorMetrics: each operator reports activations > 0 and cpu_time > 0
 - OperatorMetrics: records_processed matches input count for pass-through operators
+- BackpressureMetrics: slow consumer causes upstream blocked_count > 0 and blocked_duration > 0
+- BackpressureMetrics: max_blocked_duration ≤ blocked_duration
+- BackpressureMetrics: end-to-end chain — backpressure traces from slow op back to input
 - Tracing: verify spans emitted for key operations (using `tracing-test`)
-- **End-to-end**: run pipeline, inspect returned metrics, validate per-operator breakdown
+- **End-to-end**: run pipeline, inspect returned metrics, validate per-operator breakdown including backpressure
 
 **Estimated size**: ~2500 lines
 
