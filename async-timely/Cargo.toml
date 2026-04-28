@@ -7,6 +7,8 @@ license = "MIT"
 
 [dependencies]
 thiserror = "2"
+crossbeam-deque = "0.8"
+crossbeam-utils = "0.8"
 
 [dev-dependencies]
 

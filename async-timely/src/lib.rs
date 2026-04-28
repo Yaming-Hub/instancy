@@ -10,9 +10,17 @@
 //! - **Region**: An execution region with its own parallelism level.
 //! - **Envelope**: A structured message carrying data, control signals, and metadata.
 //! - **Frontier/Antichain**: Progress tracking primitives.
+//! - **WorkerPool**: Custom thread pool for synchronous operator execution.
+//! - **Providers**: Pluggable transport and execution backends.
 
 pub mod communication;
 pub mod dataflow;
 pub mod error;
+pub mod execute;
+pub mod metrics;
 pub mod order;
 pub mod progress;
+pub mod providers;
+pub mod scheduler;
+pub mod worker;
+pub mod worker_pool;

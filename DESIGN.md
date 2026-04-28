@@ -899,7 +899,71 @@ Since multiple dataflows share the same Worker Thread Pool, we need controls to 
 - **Cross-dataflow fairness**: since the Worker Thread Pool's shared queue is FIFO across all dataflows, no single dataflow can monopolize threads indefinitely. The round-robin effect of interleaved task completions provides natural fairness.
 - **Dynamic thread count**: under-utilized pools shrink (threads shut down), while burst load causes growth up to `max_threads`. This adapts to actual demand.
 
-### 5.7 Observability & Metrics
+### 5.7a Backpressure
+
+Backpressure is a critical mechanism that prevents fast operators from overwhelming slow ones. async-timely implements **end-to-end backpressure** that traces all the way from any blocked downstream operator back to the input streams.
+
+#### Backpressure Chain
+
+```
+Input Stream → Op A → [buffer full] → Op B (slow) → Op C → Output Stream
+                 ↑
+                 └── Op A's push returns Backpressure error
+                     → Op A's activation yields back to scheduler
+                     → Op A is re-queued with "blocked on output" status
+                     → Input stream stops pulling new data (backpressure propagates upstream)
+```
+
+#### Local Backpressure (same process)
+
+When an operator pushes data to a downstream operator's input buffer:
+1. If the buffer has capacity, the push succeeds immediately.
+2. If the buffer is full, the push returns `Error::Backpressure`.
+3. The upstream operator's activation **yields** — it returns to the scheduler with a "blocked" status.
+4. The scheduler re-enqueues the activation with a dependency on the downstream buffer draining.
+5. When the downstream operator consumes data and frees buffer space, the blocked upstream activation is re-dispatched.
+
+This chain propagates naturally: if Op C is slow, Op B's output buffer fills, then Op B blocks, then Op A's output buffer fills, then Op A blocks, then the input stream's read is paused.
+
+#### Remote Backpressure (cross-process)
+
+For inter-process channels:
+1. The local send buffer is bounded. When full, the sending operator gets `Error::Backpressure` just like local channels.
+2. TCP flow control provides additional backpressure at the network layer — if the remote receiver is slow, the TCP send buffer fills, which blocks the local write.
+3. The `ConnectionPool` tracks per-connection send buffer utilization. When a connection's buffer exceeds a configurable high-water mark, the transport layer returns `Backpressure` to the operator.
+
+#### Backpressure Metrics
+
+Backpressure delays are measured and reported per-operator:
+
+```rust
+pub struct BackpressureMetrics {
+    /// Number of times this operator was blocked by downstream backpressure.
+    pub blocked_count: u64,
+    /// Total time this operator spent blocked waiting for downstream capacity.
+    pub blocked_duration: Duration,
+    /// Maximum single blocking duration observed.
+    pub max_blocked_duration: Duration,
+}
+```
+
+These metrics are included in `OperatorMetrics` so users can identify bottleneck operators:
+
+```rust
+pub struct OperatorMetrics {
+    pub name: String,
+    pub index: usize,
+    pub activations: u64,
+    pub cpu_time: Duration,
+    pub records_processed: u64,
+    /// Backpressure statistics for this operator.
+    pub backpressure: BackpressureMetrics,
+}
+```
+
+**Diagnosis pattern**: If `Op A` has high `backpressure.blocked_duration` but low `cpu_time`, the bottleneck is downstream. Follow the chain until you find the operator with high `cpu_time` — that's the actual bottleneck.
+
+### 5.7b Observability & Metrics
 
 For production use, understanding the performance characteristics of each dataflow run is essential. async-timely provides built-in observability:
 

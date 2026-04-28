@@ -1,0 +1,558 @@
+//! Custom worker thread pool for synchronous operator execution.
+//!
+//! The [`WorkerPool`] is a lightweight, purpose-built thread pool optimized
+//! for short-to-medium synchronous computation tasks. Unlike Tokio, it has
+//! no async overhead — worker threads simply dequeue tasks and run them.
+//!
+//! ## Thread Lifecycle
+//!
+//! Worker threads follow a **spin → yield → park → shutdown** idle strategy:
+//! 1. Spinning (tight loop) — zero latency for back-to-back tasks
+//! 2. Yielding — gives CPU while remaining responsive  
+//! 3. Parking (condvar) — near-zero CPU, woken by new tasks
+//! 4. Shutdown — threads above `min_threads` exit after idle timeout
+
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::{Arc, Condvar, Mutex};
+use std::thread::{self, JoinHandle};
+use std::time::{Duration, Instant};
+
+use crossbeam_deque::{Injector, Steal};
+
+use crate::worker::OperatorActivation;
+
+/// Configuration for the worker thread pool.
+#[derive(Debug, Clone)]
+pub struct WorkerPoolConfig {
+    /// Minimum number of worker threads (always kept alive).
+    pub min_threads: usize,
+    /// Maximum number of worker threads the pool can grow to.
+    pub max_threads: usize,
+    /// How long a thread above `min_threads` can be idle before shutdown.
+    pub idle_shutdown: Duration,
+    /// Number of spin iterations before yielding.
+    pub spin_limit: u32,
+    /// Number of yield iterations before parking.
+    pub yield_limit: u32,
+}
+
+impl Default for WorkerPoolConfig {
+    fn default() -> Self {
+        let cpus = std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(4);
+        Self {
+            min_threads: cpus.max(2) / 2,
+            max_threads: cpus,
+            idle_shutdown: Duration::from_secs(30),
+            spin_limit: 10,
+            yield_limit: 20,
+        }
+    }
+}
+
+impl WorkerPoolConfig {
+    /// Validate configuration. Returns an error message if invalid.
+    pub fn validate(&self) -> Result<(), &'static str> {
+        if self.min_threads == 0 {
+            return Err("min_threads must be at least 1");
+        }
+        if self.max_threads < self.min_threads {
+            return Err("max_threads must be >= min_threads");
+        }
+        if self.spin_limit == 0 {
+            return Err("spin_limit must be at least 1");
+        }
+        if self.yield_limit <= self.spin_limit {
+            return Err("yield_limit must be > spin_limit");
+        }
+        Ok(())
+    }
+}
+
+/// Shared state for the worker thread pool.
+struct PoolState {
+    /// The global task injector queue.
+    injector: Injector<OperatorActivation>,
+    /// Condition variable for parking idle threads.
+    park_condvar: Condvar,
+    /// Mutex paired with the condvar (only used for waiting, not data protection).
+    park_mutex: Mutex<()>,
+    /// Current number of active (non-idle) threads.
+    active_count: AtomicUsize,
+    /// Total number of live threads.
+    thread_count: AtomicUsize,
+    /// Whether the pool is shutting down.
+    shutdown: AtomicBool,
+    /// Total tasks submitted (for metrics).
+    tasks_submitted: AtomicUsize,
+    /// Total tasks completed (for metrics).
+    tasks_completed: AtomicUsize,
+    /// Pool configuration.
+    config: WorkerPoolConfig,
+}
+
+impl PoolState {
+    fn new(config: WorkerPoolConfig) -> Self {
+        Self {
+            injector: Injector::new(),
+            park_condvar: Condvar::new(),
+            park_mutex: Mutex::new(()),
+            active_count: AtomicUsize::new(0),
+            thread_count: AtomicUsize::new(0),
+            shutdown: AtomicBool::new(false),
+            tasks_submitted: AtomicUsize::new(0),
+            tasks_completed: AtomicUsize::new(0),
+            config,
+        }
+    }
+}
+
+/// A lightweight worker thread pool for synchronous operator execution.
+///
+/// Dynamically scales between `min_threads` and `max_threads` based on load.
+/// Threads follow a spin → yield → park → shutdown lifecycle.
+pub struct WorkerPool {
+    state: Arc<PoolState>,
+    threads: Mutex<Vec<JoinHandle<()>>>,
+}
+
+impl WorkerPool {
+    /// Create a new worker pool with the given configuration.
+    ///
+    /// Spawns `min_threads` worker threads immediately.
+    pub fn new(config: WorkerPoolConfig) -> Result<Self, &'static str> {
+        config.validate()?;
+
+        let state = Arc::new(PoolState::new(config.clone()));
+        let threads = Mutex::new(Vec::with_capacity(config.max_threads));
+
+        let pool = Self { state, threads };
+
+        // Spawn initial min_threads
+        for _ in 0..config.min_threads {
+            pool.spawn_thread();
+        }
+
+        Ok(pool)
+    }
+
+    /// Submit an operator activation for execution.
+    pub fn submit(&self, task: OperatorActivation) {
+        self.state.tasks_submitted.fetch_add(1, Ordering::Relaxed);
+        self.state.injector.push(task);
+
+        // If all threads are busy and below max, try to spawn a new one atomically
+        let active = self.state.active_count.load(Ordering::Acquire);
+        let current = self.state.thread_count.load(Ordering::Acquire);
+        if active >= current && current < self.state.config.max_threads {
+            self.try_spawn_thread();
+        }
+
+        // Wake a parked thread
+        self.state.park_condvar.notify_one();
+    }
+
+    /// Shut down the pool, waiting for all threads to complete.
+    pub fn shutdown(&self) {
+        self.state.shutdown.store(true, Ordering::SeqCst);
+        // Wake all parked threads so they see the shutdown flag
+        self.state.park_condvar.notify_all();
+
+        let mut threads = self.threads.lock().unwrap();
+        for handle in threads.drain(..) {
+            let _ = handle.join();
+        }
+    }
+
+    /// Returns the number of currently active (executing) threads.
+    pub fn active_threads(&self) -> usize {
+        self.state.active_count.load(Ordering::Relaxed)
+    }
+
+    /// Returns the total number of live threads in the pool.
+    pub fn thread_count(&self) -> usize {
+        self.state.thread_count.load(Ordering::Relaxed)
+    }
+
+    /// Returns total tasks submitted since pool creation.
+    pub fn tasks_submitted(&self) -> usize {
+        self.state.tasks_submitted.load(Ordering::Relaxed)
+    }
+
+    /// Returns total tasks completed since pool creation.
+    pub fn tasks_completed(&self) -> usize {
+        self.state.tasks_completed.load(Ordering::Relaxed)
+    }
+
+    /// Returns true if the pool is in shutdown mode.
+    pub fn is_shutdown(&self) -> bool {
+        self.state.shutdown.load(Ordering::Relaxed)
+    }
+
+    /// Attempt to spawn a new worker thread, atomically reserving a slot.
+    /// Returns true if a thread was spawned.
+    fn try_spawn_thread(&self) -> bool {
+        // Atomically reserve a slot below max_threads
+        loop {
+            let current = self.state.thread_count.load(Ordering::Acquire);
+            if current >= self.state.config.max_threads {
+                return false;
+            }
+            if self.state.thread_count
+                .compare_exchange_weak(current, current + 1, Ordering::AcqRel, Ordering::Relaxed)
+                .is_ok()
+            {
+                break;
+            }
+        }
+
+        let state = self.state.clone();
+        let handle = thread::Builder::new()
+            .name("async-timely-worker".to_string())
+            .spawn(move || {
+                worker_thread_loop(&state);
+                // thread_count is decremented inside the loop on idle exit,
+                // or we decrement here for normal/shutdown exit.
+            })
+            .expect("failed to spawn worker thread");
+
+        self.threads.lock().unwrap().push(handle);
+        true
+    }
+
+    /// Spawn a thread unconditionally (used during pool initialization).
+    fn spawn_thread(&self) {
+        self.state.thread_count.fetch_add(1, Ordering::SeqCst);
+
+        let state = self.state.clone();
+        let handle = thread::Builder::new()
+            .name("async-timely-worker".to_string())
+            .spawn(move || {
+                worker_thread_loop(&state);
+            })
+            .expect("failed to spawn worker thread");
+
+        self.threads.lock().unwrap().push(handle);
+    }
+}
+
+impl Drop for WorkerPool {
+    fn drop(&mut self) {
+        self.shutdown();
+    }
+}
+
+/// The main loop for each worker thread.
+/// On exit, decrements `thread_count`.
+fn worker_thread_loop(state: &PoolState) {
+    // Ensure thread_count is decremented when this thread exits, regardless of path.
+    struct ThreadGuard<'a>(&'a PoolState);
+    impl Drop for ThreadGuard<'_> {
+        fn drop(&mut self) {
+            self.0.thread_count.fetch_sub(1, Ordering::SeqCst);
+        }
+    }
+    let _guard = ThreadGuard(state);
+
+    let mut idle_cycles: u32 = 0;
+
+    loop {
+        // Check shutdown
+        if state.shutdown.load(Ordering::Relaxed) {
+            return;
+        }
+
+        // Try to steal a task from the global queue
+        match state.injector.steal() {
+            Steal::Success(task) => {
+                idle_cycles = 0;
+                state.active_count.fetch_add(1, Ordering::Relaxed);
+
+                // Execute with panic safety — ensure active_count is decremented
+                let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    task.execute();
+                }));
+
+                state.active_count.fetch_sub(1, Ordering::Relaxed);
+                state.tasks_completed.fetch_add(1, Ordering::Relaxed);
+
+                if let Err(_panic) = result {
+                    // Task panicked — continue serving.
+                }
+                continue;
+            }
+            Steal::Empty | Steal::Retry => {}
+        }
+
+        // No task available — idle strategy
+        idle_cycles = idle_cycles.saturating_add(1);
+
+        if idle_cycles < state.config.spin_limit {
+            // Phase 1: spin
+            std::hint::spin_loop();
+        } else if idle_cycles < state.config.yield_limit {
+            // Phase 2: yield
+            thread::yield_now();
+        } else {
+            // Phase 3: park on condvar
+            let parked_at = Instant::now();
+
+            let guard = state.park_mutex.lock().unwrap();
+            let _result = state
+                .park_condvar
+                .wait_timeout(guard, state.config.idle_shutdown)
+                .unwrap();
+
+            // After waking, check if we should shut down this thread
+            if state.shutdown.load(Ordering::Relaxed) {
+                return;
+            }
+
+            // Re-check queue before deciding to exit (avoid lost wake-up starvation)
+            if !state.injector.is_empty() {
+                idle_cycles = 0;
+                continue;
+            }
+
+            // If we timed out and we're above min_threads, exit.
+            // The guard's Drop will decrement thread_count. We check if
+            // current count > min_threads. (Benign race: at worst one extra
+            // thread exits, but new submits will respawn it.)
+            if parked_at.elapsed() >= state.config.idle_shutdown
+                && state.thread_count.load(Ordering::SeqCst) > state.config.min_threads
+            {
+                return;
+            }
+
+            // Reset idle cycles to re-enter spin phase
+            idle_cycles = 0;
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::AtomicU32;
+
+    #[test]
+    fn config_default_is_valid() {
+        let config = WorkerPoolConfig::default();
+        assert!(config.validate().is_ok());
+        assert!(config.min_threads >= 1);
+        assert!(config.max_threads >= config.min_threads);
+    }
+
+    #[test]
+    fn config_validation_errors() {
+        let mut config = WorkerPoolConfig::default();
+
+        config.min_threads = 0;
+        assert_eq!(config.validate(), Err("min_threads must be at least 1"));
+
+        config.min_threads = 4;
+        config.max_threads = 2;
+        assert_eq!(config.validate(), Err("max_threads must be >= min_threads"));
+
+        config.max_threads = 8;
+        config.spin_limit = 0;
+        assert_eq!(config.validate(), Err("spin_limit must be at least 1"));
+
+        config.spin_limit = 10;
+        config.yield_limit = 5;
+        assert_eq!(config.validate(), Err("yield_limit must be > spin_limit"));
+    }
+
+    #[test]
+    fn pool_creation_spawns_min_threads() {
+        let config = WorkerPoolConfig {
+            min_threads: 3,
+            max_threads: 8,
+            idle_shutdown: Duration::from_secs(1),
+            spin_limit: 5,
+            yield_limit: 10,
+        };
+        let pool = WorkerPool::new(config).unwrap();
+        // Give threads time to start
+        thread::sleep(Duration::from_millis(50));
+        assert_eq!(pool.thread_count(), 3);
+        pool.shutdown();
+    }
+
+    #[test]
+    fn pool_executes_tasks() {
+        let config = WorkerPoolConfig {
+            min_threads: 2,
+            max_threads: 4,
+            idle_shutdown: Duration::from_secs(5),
+            spin_limit: 5,
+            yield_limit: 10,
+        };
+        let pool = WorkerPool::new(config).unwrap();
+        let counter = Arc::new(AtomicU32::new(0));
+
+        for i in 0..10 {
+            let counter = counter.clone();
+            pool.submit(OperatorActivation::new(
+                crate::worker::WorkerId::new(i % 2),
+                "test",
+                i,
+                move || { counter.fetch_add(1, Ordering::SeqCst); },
+            ));
+        }
+
+        // Wait for all tasks
+        let start = Instant::now();
+        while counter.load(Ordering::SeqCst) < 10 {
+            thread::sleep(Duration::from_millis(10));
+            if start.elapsed() > Duration::from_secs(5) {
+                panic!("tasks did not complete in time");
+            }
+        }
+
+        assert_eq!(counter.load(Ordering::SeqCst), 10);
+        assert_eq!(pool.tasks_submitted(), 10);
+        assert_eq!(pool.tasks_completed(), 10);
+        pool.shutdown();
+    }
+
+    #[test]
+    fn pool_grows_under_load() {
+        let config = WorkerPoolConfig {
+            min_threads: 1,
+            max_threads: 4,
+            idle_shutdown: Duration::from_secs(5),
+            spin_limit: 5,
+            yield_limit: 10,
+        };
+        let pool = WorkerPool::new(config).unwrap();
+        let running = Arc::new(AtomicU32::new(0));
+        let max_concurrent = Arc::new(AtomicU32::new(0));
+        let done = Arc::new(AtomicU32::new(0));
+
+        // Submit tasks that sleep briefly — should cause pool to grow
+        for i in 0..4 {
+            let running = running.clone();
+            let max_concurrent = max_concurrent.clone();
+            let done = done.clone();
+            pool.submit(OperatorActivation::new(
+                crate::worker::WorkerId::new(i),
+                "sleeper",
+                i,
+                move || {
+                    let current = running.fetch_add(1, Ordering::SeqCst) + 1;
+                    // Update max concurrent
+                    loop {
+                        let prev_max = max_concurrent.load(Ordering::SeqCst);
+                        if current <= prev_max {
+                            break;
+                        }
+                        if max_concurrent.compare_exchange(
+                            prev_max, current, Ordering::SeqCst, Ordering::Relaxed
+                        ).is_ok() {
+                            break;
+                        }
+                    }
+                    thread::sleep(Duration::from_millis(100));
+                    running.fetch_sub(1, Ordering::SeqCst);
+                    done.fetch_add(1, Ordering::SeqCst);
+                },
+            ));
+            // Small delay between submits to let pool detect load
+            thread::sleep(Duration::from_millis(10));
+        }
+
+        // Wait for tasks to complete
+        let start = Instant::now();
+        while done.load(Ordering::SeqCst) < 4 {
+            thread::sleep(Duration::from_millis(20));
+            if start.elapsed() > Duration::from_secs(5) {
+                panic!("tasks did not complete in time");
+            }
+        }
+
+        // Pool should have grown beyond 1
+        assert!(max_concurrent.load(Ordering::SeqCst) > 1 || pool.thread_count() > 1);
+        pool.shutdown();
+    }
+
+    #[test]
+    fn pool_shrinks_on_idle() {
+        let config = WorkerPoolConfig {
+            min_threads: 1,
+            max_threads: 4,
+            idle_shutdown: Duration::from_millis(200),
+            spin_limit: 2,
+            yield_limit: 4,
+        };
+        let pool = WorkerPool::new(config).unwrap();
+        let done = Arc::new(AtomicU32::new(0));
+
+        // Submit tasks that sleep to force growth
+        for i in 0..4 {
+            let done = done.clone();
+            pool.submit(OperatorActivation::new(
+                crate::worker::WorkerId::new(i),
+                "sleeper",
+                i,
+                move || {
+                    thread::sleep(Duration::from_millis(50));
+                    done.fetch_add(1, Ordering::SeqCst);
+                },
+            ));
+            thread::sleep(Duration::from_millis(5));
+        }
+
+        // Wait for tasks to finish
+        let start = Instant::now();
+        while done.load(Ordering::SeqCst) < 4 {
+            thread::sleep(Duration::from_millis(20));
+            if start.elapsed() > Duration::from_secs(3) {
+                panic!("tasks did not complete");
+            }
+        }
+
+        // Wait for idle timeout + some buffer
+        thread::sleep(Duration::from_millis(500));
+
+        // Should have shrunk back toward min_threads
+        let count = pool.thread_count();
+        assert!(count <= 2, "expected <=2, got {count}");
+        pool.shutdown();
+    }
+
+    #[test]
+    fn pool_shutdown_stops_all_threads() {
+        let config = WorkerPoolConfig {
+            min_threads: 4,
+            max_threads: 8,
+            idle_shutdown: Duration::from_secs(30),
+            spin_limit: 5,
+            yield_limit: 10,
+        };
+        let pool = WorkerPool::new(config).unwrap();
+        thread::sleep(Duration::from_millis(50));
+        assert_eq!(pool.thread_count(), 4);
+        pool.shutdown();
+        assert_eq!(pool.thread_count(), 0);
+    }
+
+    #[test]
+    fn pool_idle_threads_low_cpu() {
+        // This is a basic sanity test — idle pool shouldn't burn CPU
+        let config = WorkerPoolConfig {
+            min_threads: 2,
+            max_threads: 4,
+            idle_shutdown: Duration::from_secs(5),
+            spin_limit: 2,
+            yield_limit: 4,
+        };
+        let pool = WorkerPool::new(config).unwrap();
+        // Just let it idle for a bit — no panics, no busy-wait errors
+        thread::sleep(Duration::from_millis(200));
+        // Threads should be parked, not burning CPU
+        assert_eq!(pool.active_threads(), 0);
+        pool.shutdown();
+    }
+}
