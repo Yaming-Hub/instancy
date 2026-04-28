@@ -173,15 +173,17 @@ impl ClusterTopology {
 
 /// Handle returned by `execute()` for monitoring and controlling a running dataflow.
 #[derive(Debug)]
-pub struct DataflowHandle {
+#[allow(dead_code)]
+pub struct ExecutionHandle {
     /// Name of the dataflow.
     pub name: String,
     /// Whether the dataflow has completed.
     completed: bool,
 }
 
-impl DataflowHandle {
+impl ExecutionHandle {
     /// Create a new handle (used internally).
+    #[allow(dead_code)]
     pub(crate) fn new(name: String) -> Self {
         Self {
             name,
@@ -190,6 +192,7 @@ impl DataflowHandle {
     }
 
     /// Check if the dataflow has completed.
+    #[allow(dead_code)]
     pub fn is_completed(&self) -> bool {
         self.completed
     }
@@ -214,7 +217,7 @@ impl DataflowHandle {
 pub fn execute(
     runtime_config: &RuntimeConfig,
     dataflow_config: DataflowConfig,
-) -> Result<DataflowHandle, Error> {
+) -> Result<ExecutionHandle, Error> {
     // Validate configs
     runtime_config
         .worker_pool
@@ -227,7 +230,7 @@ pub fn execute(
         ));
     }
 
-    let handle = DataflowHandle::new(dataflow_config.name);
+    let handle = ExecutionHandle::new(dataflow_config.name);
     Ok(handle)
 }
 
