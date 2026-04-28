@@ -3,6 +3,25 @@
 ## Approach
 Contract-and-test-driven development. Each PR defines traits/interfaces first, then implements them, accompanied by comprehensive tests. PRs are ordered by dependency and sized under 5000 lines (including tests). Terminology renames (pending approval) will be applied via a dedicated PR early in the process.
 
+## Coding Conventions
+
+### Generic Type Parameter Naming
+
+All generic type parameters must follow these codebase-wide conventions for consistency:
+
+| Parameter | Meaning | Example |
+|---|---|---|
+| `T` | Timestamp type (implements `Timestamp`) | `Envelope<T, D, M>`, `Capability<T>` |
+| `D` | Data record type | `Stream<S, D>`, `InputEvent<T, D>` |
+| `M` | User-defined metadata type (default `()`) | `Envelope<T, D, M>`, `Push<T, D, M>` |
+| `S` | Scope (implements `Scope` trait) or Summary (PathSummary) | `Stream<S, D>`, `PortConnectivity<S>` |
+| `TOuter` / `TInner` | Nested timestamp components in `Product` | `Product<TOuter, TInner>` |
+
+**Rules:**
+- Never use `T` for non-timestamp generic data. Use `D` for data, `M` for metadata.
+- When a generic container is not timestamp-specific (e.g., `Antichain<T>`, `ChangeBatch<T>`), `T` refers to the element type, which is typically a timestamp in practice.
+- Maintain these conventions in all new code, tests, and documentation.
+
 ---
 
 ## PR 1 — Workspace scaffold + core types

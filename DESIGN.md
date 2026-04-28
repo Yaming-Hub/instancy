@@ -66,7 +66,7 @@ async-timely/
 │   │   ├── dataflow/
 │   │   │   ├── mod.rs
 │   │   │   ├── scope.rs     — Scope trait + ChildScope
-│   │   │   ├── stream.rs    — Stream<S, C>
+│   │   │   ├── stream.rs    — DataStream<S, C>
 │   │   │   ├── region.rs    — Region, PlacementPolicy
 │   │   │   ├── channels/    — Push/Pull abstractions, Envelope
 │   │   │   └── operators/
@@ -760,7 +760,7 @@ pub type OutputStream<T, D> = Pin<Box<dyn Stream<Item = OutputEvent<T, D>> + Sen
 The `.output()` operator (terminal operator) converts the dataflow's internal representation into user-consumable async streams:
 
 ```rust
-impl<S: Scope, C: Container> Stream<S, C> {
+impl<S: Scope, C: Container> DataStream<S, C> {
     /// Terminates the dataflow with output streams.
     /// Returns one async stream per worker in the current execution region.
     /// The caller receives these streams from `execute()` and can consume them
@@ -1638,7 +1638,7 @@ fn exchange_with_codec<D, C>(
     &self,
     route: impl Fn(&D) -> u64 + Send + Sync + 'static,
     codec: C,
-) -> Stream<S, Vec<D>>
+) -> DataStream<S, Vec<D>>
 where
     C: Codec<Vec<D>>;
 ```
@@ -1722,7 +1722,7 @@ pub trait Operator<S: Scope, C: Container> {
         &self,
         name: &str,
         logic: L,
-    ) -> Stream<S, C2>
+    ) -> DataStream<S, C2>
     where
         C2: Container,
         L: FnMut(
@@ -1737,7 +1737,7 @@ pub trait Operator<S: Scope, C: Container> {
         &self,
         name: &str,
         logic: L,
-    ) -> Stream<S, C2>
+    ) -> DataStream<S, C2>
     where
         C2: Container,
         M: Clone + Send + Sync + 'static,
@@ -1755,10 +1755,10 @@ pub trait Operator<S: Scope, C: Container> {
 ```rust
 fn binary<C2, C3, L>(
     &self,
-    other: &Stream<S, C2>,
+    other: &DataStream<S, C2>,
     name: &str,
     logic: L,
-) -> Stream<S, C3>
+) -> DataStream<S, C3>
 where
     L: FnMut(
         &mut InputHandle<S::Timestamp, C>,
@@ -1774,12 +1774,12 @@ where
 fn branch(
     &self,
     condition: impl Fn(&T) -> bool + Send + Sync + 'static,
-) -> (Stream<S, C>, Stream<S, C>);
+) -> (DataStream<S, C>, DataStream<S, C>);
 
 fn ok_err<O, E>(
     &self,
     logic: impl Fn(T) -> Result<O, E> + Send + Sync + 'static,
-) -> (Stream<S, Vec<O>>, Stream<S, Vec<E>>);
+) -> (DataStream<S, Vec<O>>, DataStream<S, Vec<E>>);
 ```
 
 ### 9.5 Feedback / Loops
@@ -1814,7 +1814,7 @@ The `delay` operator buffers incoming data and re-timestamps it, releasing the d
 fn delay<F>(
     &self,
     delay_fn: F,
-) -> Stream<S, C>
+) -> DataStream<S, C>
 where
     F: Fn(&T, &C::Item) -> T + Send + Sync + 'static;
 
@@ -1823,7 +1823,7 @@ where
 fn delay_batch<F>(
     &self,
     delay_fn: F,
-) -> Stream<S, C>
+) -> DataStream<S, C>
 where
     F: Fn(&T) -> T + Send + Sync + 'static;
 ```
@@ -1837,7 +1837,7 @@ where
 
 ### 9.7 Extension Point
 
-Extension crates add operators by implementing traits on `Stream`:
+Extension crates add operators by implementing traits on `DataStream`:
 
 ```rust
 // In crate `async-timely-extras`
@@ -1845,11 +1845,11 @@ pub trait MapOperator<S: Scope, T: Data> {
     fn map<U: Data>(
         &self,
         f: impl Fn(T) -> U + Send + Sync + 'static,
-    ) -> Stream<S, Vec<U>>;
+    ) -> DataStream<S, Vec<U>>;
 }
 
-impl<S: Scope, T: Data> MapOperator<S, T> for Stream<S, Vec<T>> {
-    fn map<U: Data>(&self, f: impl Fn(T) -> U + Send + Sync + 'static) -> Stream<S, Vec<U>> {
+impl<S: Scope, T: Data> MapOperator<S, T> for DataStream<S, Vec<T>> {
+    fn map<U: Data>(&self, f: impl Fn(T) -> U + Send + Sync + 'static) -> DataStream<S, Vec<U>> {
         self.unary("Map", move |input, output, _notificator| {
             while let Some((time, data)) = input.next()? {
                 let mut session = output.session(&time);
@@ -2122,7 +2122,7 @@ pub trait CheckpointBackend<T: Timestamp, D: Data>: Send + Sync + 'static {
 fn checkpoint<B>(
     &self,
     backend: B,
-) -> Stream<S, C>
+) -> DataStream<S, C>
 where
     B: CheckpointBackend<S::Timestamp, C::Item>;
 ```
@@ -2157,6 +2157,259 @@ where
 ```
 
 **Design rationale**: Checkpointing is not built into the core runtime — it's an optional operator consumers add where needed. This keeps the core simple while giving consumers full control over what is checkpointed, how it is stored (local disk, S3, database), and how recovery works. The `Timestamp` system naturally provides consistent cut points.
+
+### 12.6 Throughput & Resource Management
+
+A dataflow system's value is directly proportional to its throughput under constrained resources. async-timely's architecture has four major throughput domains — data ingestion, computation, network exchange, and output emission — each with distinct bottleneck patterns and tuning levers. This section describes how the system maximizes end-to-end throughput while staying within resource budgets, and how backpressure ties the domains together so no single domain overwhelms the others.
+
+#### 12.6.1 Data Ingestion Throughput
+
+External data sources (Kafka, files, network sockets, actor messages) feed the dataflow through `TimestampedInput` sources, bridged via bounded `ChannelInput` channels.
+
+**Key throughput levers:**
+
+| Lever | Mechanism | Default |
+|---|---|---|
+| Input parallelism | Multiple named inputs, each independently read | 1 per `add_input()` |
+| Batch size | `InputEvent::Data` carries `Vec<D>` — larger batches amortize per-event overhead | Caller-defined |
+| Channel buffer depth | `ChannelInput::with_capacity(name, cap)` — deeper buffers absorb bursts | 1024 |
+| Reader thread count | One I/O thread per input source (Tokio); sources are independent | 1 per source |
+
+**Throughput model:**
+
+```
+ingestion_rate = Σ (batch_size × batches_per_sec) across all inputs
+effective_rate = min(ingestion_rate, first_operator_consumption_rate)
+```
+
+When the first operator cannot keep up, the `ChannelInput`'s bounded `sync_channel` blocks the I/O reader, which in turn applies backpressure to the external source (e.g., Kafka consumer pauses, TCP recv blocks). This is the first link in the end-to-end backpressure chain.
+
+**Design guidance:**
+- Size input batches to amortize per-scheduling overhead (~1024 items is a good starting point). Very small batches (1-10 items) can make scheduling cost dominate.
+- Use multiple independent inputs for multi-topic or multi-partition sources — each gets its own I/O thread and does not contend with others.
+- Prefer `send_blocking` in the I/O reader to naturally throttle ingestion when the pipeline is saturated.
+
+#### 12.6.2 Computation Throughput & Worker Thread Pool Sizing
+
+The Worker Thread Pool is the central resource. All operator tasks compete for pool threads. The goal: keep all threads busy without over-subscribing CPU cores, while responding to load changes within milliseconds.
+
+**Thread pool dynamics:**
+
+```
+                         ┌─────────────────────────────────┐
+  Incoming tasks ───────→│     Shared Task Queue            │
+                         │  (lock-free injector deque)      │
+                         └────────────┬────────────────────┘
+                                      │
+         ┌────────────────────────────┼────────────────────────────┐
+         ▼                            ▼                            ▼
+   ┌───────────┐               ┌───────────┐               ┌───────────┐
+   │ Thread 0  │               │ Thread 1  │               │ Thread N  │
+   │ spinning  │               │ parked    │               │ (spawning)│
+   └───────────┘               └───────────┘               └───────────┘
+         │                            │                            │
+    min_threads ◄─────────── idle_timeout ──────────► max_threads
+    (always alive)           (shrink back)            (burst ceiling)
+```
+
+**Sizing guidelines:**
+
+| Workload | min_threads | max_threads | Rationale |
+|---|---|---|---|
+| Steady streaming | CPU cores | CPU cores × 1.5 | Fully utilize cores, small headroom for bursts |
+| Bursty/batch | 2 | CPU cores × 2 | Low idle cost, fast scale-up on burst |
+| Mixed (dataflow + app) | CPU cores / 2 | CPU cores | Share machine with application threads |
+| Testing | 1 | 4 | Minimize contention in test harness |
+
+**Computation throughput formula:**
+
+```
+tasks_per_sec = active_threads × (1 / avg_task_duration)
+effective_throughput = tasks_per_sec × avg_batch_size_per_task
+
+overhead_per_task ≈ dequeue_cost + dispatch_cost + enqueue_result_cost
+                  ≈ 100–500ns (lock-free deque operations)
+
+useful_fraction = avg_task_duration / (avg_task_duration + overhead_per_task)
+```
+
+For a 10μs operator processing a 1024-item batch, useful fraction ≈ 99.5%. For a 100ns operator processing 1 item, useful fraction ≈ 50% — batching matters enormously.
+
+**Minimizing scheduling overhead:**
+
+1. **Batch processing**: Operators always receive and produce `Vec<D>` batches. The scheduler enqueues one task per (worker, operator, batch) — not one per record.
+2. **Operator fusion (future)**: Chains of pipeline-local operators (e.g., `map → filter → map`) can be fused into a single task, eliminating intermediate buffer writes and task transitions.
+3. **Per-worker FIFO**: Tasks for the same logical worker are dispatched in order without extra synchronization — the scheduler's per-worker queue avoids lock contention.
+4. **Region permits**: Per-region concurrency limits prevent thread starvation across dataflows sharing the pool.
+
+**Thread lifecycle and CPU conservation:**
+
+```
+  Active (processing tasks)
+      │
+      ▼ no tasks for N spins
+  Yielding (thread::yield_now)
+      │
+      ▼ no tasks for M yields
+  Parked (condvar wait — zero CPU)
+      │
+      ▼ idle_timeout exceeded & thread_count > min_threads
+  Shutdown (thread exits)
+```
+
+The spin→yield→park→shutdown progression ensures:
+- Sub-microsecond response to new tasks during active processing (spinning)
+- Rapid backoff when load drops (yielding within ~1μs, parking within ~100μs)
+- Zero CPU consumption when idle (condvar-parked threads consume no cycles)
+- Automatic scaling down to `min_threads` during quiet periods
+
+#### 12.6.3 Network Exchange: Connection & Bandwidth Management
+
+When a dataflow spans multiple nodes, inter-process data exchange becomes the bottleneck. The system manages throughput across three layers:
+
+```
+┌─────────────────────────────────────────────────────────┐
+│  Operator Layer                                          │
+│  push() / pull() — sees bounded buffers only             │
+├─────────────────────────────────────────────────────────┤
+│  Connection Pool Layer                                   │
+│  Manages connections per peer, scales up/down             │
+│  Multiplexes logical channels onto physical connections   │
+├─────────────────────────────────────────────────────────┤
+│  Transport Layer (application-provided)                  │
+│  ConnectionManager::establish() creates the wire          │
+│  Handles TLS, routing, firewall traversal                │
+└─────────────────────────────────────────────────────────┘
+```
+
+**Connection pool throughput management:**
+
+| Parameter | Effect on throughput | Trade-off |
+|---|---|---|
+| `max_connections_per_peer` | More connections = higher aggregate bandwidth (multiple TCP streams avoid head-of-line blocking) | More file descriptors, more memory for send/recv buffers |
+| `min_connections_per_peer` | Pre-warmed connections avoid cold-start latency | Idle resource consumption |
+| `idle_timeout` | Controls how quickly excess connections are reclaimed | Too aggressive = reconnection cost on next burst |
+| `connect_timeout` | Bounds worst-case latency for pool growth | Too short = failed connections under network jitter |
+
+**Bandwidth management strategy:**
+
+1. **Multiplexed channels**: All logical (worker, channel) pairs to the same peer share pooled connections via a framing protocol. This avoids O(workers²) connection explosion.
+2. **Bounded send buffers**: Each connection has a bounded write buffer. When the buffer is full, the sending operator sees `Error::Backpressure` — this is the remote backpressure trigger (see §12.6.4).
+3. **Adaptive connection scaling**: The pool monitors per-connection throughput. When all connections to a peer are saturated (send buffers consistently >80% full) and the count is below `max_connections_per_peer`, the pool requests a new connection from `ConnectionManager::establish()`.
+4. **TCP flow control integration**: The OS TCP stack provides an additional backpressure layer. When the remote receiver is slow, TCP's receive window shrinks, which slows the local sender, which fills the send buffer, which triggers operator-level backpressure. No application-level acknowledgment protocol is needed.
+5. **Serialization cost amortization**: The `Codec` encodes entire `Vec<D>` batches at once (not individual records), amortizing the serialization overhead across the batch.
+
+**Throughput estimation for network exchange:**
+
+```
+per_connection_throughput ≈ min(
+    link_bandwidth,
+    1 / (serialization_time_per_batch + network_rtt_amortized)
+)
+
+aggregate_peer_throughput = num_connections × per_connection_throughput
+
+bottleneck = min(
+    sender_computation_rate,
+    aggregate_peer_throughput,
+    receiver_computation_rate
+)
+```
+
+#### 12.6.4 End-to-End Backpressure-Aware Design
+
+Backpressure is not a bolt-on feature — it is the primary mechanism that ties all throughput domains together and prevents resource exhaustion. Every buffer boundary in the system is bounded and participates in the backpressure chain.
+
+**Complete backpressure path:**
+
+```
+External Source
+    │
+    ▼ (ChannelInput, bounded sync_channel)
+  Input Reader ──── blocks when channel full ──── I/O rate throttled
+    │
+    ▼ (operator input buffer, bounded)
+  Operator A ──── push returns Backpressure ──── activation yields, re-queued
+    │
+    ▼ (operator input buffer, bounded)
+  Operator B ──── push returns Backpressure ──── activation yields, re-queued
+    │
+    ▼ (network send buffer, bounded)         ┌────────────────────────────┐
+  TCP Send ──── buffer full ─────────────────│ Remote Node                │
+    │              │                          │  Operator C (slow)         │
+    │         TCP flow control                │  ← processing backlog     │
+    │         (window shrinks)                └────────────────────────────┘
+    │
+    ▼ (OutputSender, bounded sync_channel)
+  Output Stream ──── try_send returns Backpressure ──── operator slows down
+    │
+    ▼
+  Consumer (reads at its own pace)
+```
+
+**Backpressure design principles:**
+
+1. **Every buffer is bounded**: No unbounded queues anywhere in the data path. This provides a hard memory ceiling and ensures backpressure always propagates.
+2. **Backpressure is synchronous**: When an operator hits a full downstream buffer, its task yields immediately (no polling, no async wait). The scheduler re-queues the task, freeing the thread for other work.
+3. **No data loss on backpressure**: `Error::Backpressure` means "try again later" — the data remains in the sending operator's buffer. The re-queued activation retries the push on its next execution.
+4. **Backpressure is measurable**: Every operator tracks `BackpressureMetrics` (blocked count, total blocked duration, max single block). This makes bottleneck identification straightforward.
+5. **Backpressure crosses process boundaries**: TCP flow control provides implicit network-level backpressure. The system does not require application-level ack/nack for flow control.
+
+**Tuning for throughput vs. latency:**
+
+| Goal | Buffer sizes | Pool size | Trade-off |
+|---|---|---|---|
+| Maximum throughput | Large (4096+) | max_threads = cores | Higher memory usage, higher tail latency |
+| Low latency | Small (64–256) | max_threads = cores × 1.5 | Lower throughput ceiling, faster response |
+| Balanced | Medium (1024) | max_threads = cores | Good default for most workloads |
+
+**Buffer sizing rule of thumb:**
+
+```
+optimal_buffer_size ≈ producer_rate × target_absorb_time
+```
+
+Where `target_absorb_time` is how many milliseconds of burst you want to absorb before backpressure kicks in. For a producer at 100K items/sec with 10ms burst target: buffer = 1000 items.
+
+#### 12.6.5 Resource Budget Model
+
+The overall system resource consumption can be modeled as:
+
+```
+CPU:
+  pool_threads × duty_cycle + io_threads × io_duty_cycle
+  where duty_cycle = useful_compute / (useful_compute + idle + scheduling_overhead)
+
+Memory:
+  Σ (buffer_capacity × avg_item_size) across all buffers
+  + thread_stacks × (pool_threads + io_threads)
+  + connection_buffers × total_connections
+  (thread stack default: 2MB; connection buffer default: 64KB send + 64KB recv)
+
+Network:
+  Σ (data_rate × serialization_expansion) per peer connection
+  + progress_messages × progress_frequency
+  (progress messages are small — typically <1KB — but sent frequently)
+
+File descriptors:
+  pool_connections × num_peers + io_sockets + internal_channels
+```
+
+**Monitoring these budgets:**
+
+- `DataflowMetrics.total_cpu_time` → CPU utilization of the dataflow
+- `OperatorMetrics.cpu_time` → per-operator CPU breakdown
+- `BackpressureMetrics.blocked_duration` → time lost to backpressure (indicates capacity mismatch)
+- Connection pool stats (future) → connection count, utilization, error rate
+- Worker pool stats → active threads, queued tasks, idle time
+
+**Anti-patterns to avoid:**
+
+1. **Unbounded producer with small buffer**: A fast external source pushing into a small-buffer `ChannelInput` will spend most of its time blocked. Either increase buffer size or add flow control at the source.
+2. **Under-parallelized bottleneck stage**: If one execution region has high `cpu_time` and high upstream `backpressure.blocked_duration`, increase that region's parallelism.
+3. **Over-parallelized idle stage**: If an execution region has many workers but low `cpu_time`, reduce parallelism to free pool threads for bottleneck regions.
+4. **Too many connections**: More connections per peer doesn't always help — contention on the serialization path can negate the benefit. Profile before adding connections.
+5. **Tiny batches across network**: Sending 1-item batches over the network pays full framing + serialization overhead per item. Batch at the source or add a buffering operator.
 
 ---
 
