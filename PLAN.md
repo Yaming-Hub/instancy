@@ -71,18 +71,25 @@ Contract-and-test-driven development. Each PR defines traits/interfaces first, t
 ---
 
 ## PR 4 — Scope, Stream, intra-process channels
-**Goal**: Define the dataflow graph abstractions and local communication.
+**Goal**: Define the dataflow graph abstractions, local communication with structured message envelopes, and execution region types.
 
 - `dataflow/scope.rs`
   - `Scope` trait — `name()`, `addr()`, `add_operator()`, `allocate_operator_index()`, timestamp type
   - `ChildScope<T>` — implementation for nested scopes
 - `dataflow/stream.rs`
   - `Stream<S: Scope, C>` — a named edge in the dataflow graph; connects output port to downstream operators
+  - `.with_parallelism(n)` — sets the execution region for subsequent operators
+  - `.in_region(&Region)` — assigns stream to a named execution region
+- `dataflow/region.rs`
+  - `Region` — execution region with `parallelism` and `PlacementPolicy`
+  - `PlacementPolicy` — `Proportional` (default), `RoundRobin`, `Pinned { node_index }`
+  - Validation: connecting operators across regions without explicit repartition is an error
 - `dataflow/channels/mod.rs`
+  - `Envelope<T, D>` — structured message: `Data { time, data }` | `Control(ControlSignal<T>)`
+  - `ControlSignal<T>` — `Error { source_operator, message }` | `Watermark(T)`
   - `Push<T>` / `Pull<T>` traits — channel send/receive abstractions
-  - `Message<T, C>` — timestamped container
 - `dataflow/channels/pact.rs`
-  - `PartitionStrategy` enum/trait — `Pipeline` (no shuffle), `Exchange(fn)` (hash routing), `Broadcast`, `BroadcastLocal`
+  - `PartitionStrategy` enum/trait — `Pipeline` (no shuffle), `Exchange(fn)` (hash routing), `Rebalance` (round-robin), `Gather` (to single replica), `Broadcast`, `BroadcastLocal`
 - `communication/allocator.rs`
   - `ChannelAllocator` — creates local `mpsc`-based channel pairs for intra-process communication
   - Bounded channels with configurable buffer size
@@ -90,50 +97,80 @@ Contract-and-test-driven development. Each PR defines traits/interfaces first, t
 **Tests**:
 - Scope: operator registration, index allocation, address hierarchy
 - Stream: connects source to target, metadata propagation
+- Region: construction, default parallelism, placement policies
+- Region: validation — cross-region connection without repartition is rejected
+- Envelope: Data variant round-trip, Control variant (Error, Watermark) creation and matching
 - Push/Pull: send batch through local channel, receive in order, backpressure when full
-- PartitionStrategy: Pipeline routes to same worker, Exchange routes by hash, Broadcast fans out
+- PartitionStrategy: Pipeline routes to same worker, Exchange routes by hash, Rebalance round-robins, Gather funnels, Broadcast fans out
 - ChannelAllocator: allocate N channels, each pair is independent
 
-**Estimated size**: ~2000 lines
+**Estimated size**: ~2500 lines
 
 ---
 
-## PR 5 — Worker executor + execution engine
-**Goal**: Implement the logical worker model and runtime bootstrap.
+## PR 5 — Worker thread pool + execution engine
+**Goal**: Implement the custom compute thread pool, logical worker model, and runtime bootstrap.
 
+- `compute_pool.rs`
+  - `ComputePoolConfig` — `min_threads`, `max_threads`, `idle_shutdown`
+  - `ComputePool` — dynamic thread pool with shared task queue
+  - Worker thread loop: spin → yield → park → shutdown lifecycle
+  - `TaskQueue` — lock-free shared queue (crossbeam deque or similar)
+  - Thread scaling: spawn on demand, shutdown on idle
+- `scheduler.rs`
+  - `TaskScheduler` — per-worker FIFO queues, per-region concurrency limits
+  - `ComputeTask` — worker_id + activation + region permit
+  - Dispatch logic: only dispatch when worker has no in-flight task AND region has capacity
 - `worker.rs`
   - `WorkerId(usize)` — globally unique logical worker identity
-  - `WorkerExecutor` — FIFO task queue + concurrency semaphore; `run()` loop
   - `OperatorActivation` — queued work item for an operator
 - `execute.rs`
-  - `RuntimeConfig` — optional Tokio runtime handle, progress mode
-  - `DataflowConfig` — cluster topology, cancellation token
+  - `RuntimeConfig` — `ComputePoolConfig`, optional Tokio runtime handle (for I/O), progress mode
+  - `DataflowConfig` — cluster topology, cancellation token, `ErrorPolicy`
+  - `ErrorPolicy` — `Stop` (default) or `Ignore { on_error }` per-dataflow error handling
   - `ClusterTopology` — `nodes: Vec<NodeConfig>`, `total_workers()`, `worker_range()`, `node_for_worker()`
   - `NodeConfig` — `node_index`, `workers`
-  - `execute()` — async entry point; creates WorkerExecutors, runs them on the runtime
+  - `execute()` — entry point; creates Worker thread pool, I/O runtime, runs dataflow
+  - `DataflowHandle<T, D>` — output streams + metrics + cancel token
+- `metrics.rs`
+  - `DataflowMetrics` — wall_time, total_cpu_time, per-operator metrics
+  - `OperatorMetrics` — name, index, activations, cpu_time, records_processed
 
 **Tests**:
-- WorkerExecutor: tasks execute in FIFO order within a worker
-- WorkerExecutor: concurrency semaphore limits parallel activations to N
-- ClusterTopology: `total_workers()` sums correctly, `worker_range()` returns correct ranges, `node_for_worker()` maps back correctly
+- ComputePool: tasks execute on pool threads
+- ComputePool: dynamic scaling — starts at min, grows under load, shrinks on idle
+- ComputePool: idle threads park (low CPU usage when no tasks)
+- ComputePool: threads above min shut down after idle_shutdown
+- TaskScheduler: FIFO ordering within a worker
+- TaskScheduler: per-region concurrency limit enforced
+- TaskScheduler: dispatch only when worker has no in-flight task
+- ClusterTopology: `total_workers()` sums correctly, `worker_range()` returns correct ranges
 - ClusterTopology: heterogeneous configs (4, 1, 8 workers)
+- ErrorPolicy: Stop and Ignore variants construct correctly, default is Stop
+- DataflowMetrics: accumulation of operator metrics
 - execute(): basic smoke test — empty dataflow starts and completes
-- Runtime isolation: passing an external runtime handle works
+- Runtime isolation: passing an external Tokio handle for I/O works
 
-**Estimated size**: ~2000 lines
+**Estimated size**: ~3000 lines
 
 ---
 
-## PR 6 — Input system (from_stream + DataflowSpec)
-**Goal**: Implement stream-driven input binding.
+## PR 6 — Input/Output system (from_stream, output, DataflowSpec)
+**Goal**: Implement stream-driven input binding and async output stream emission.
 
 - `dataflow/operators/from_stream.rs`
   - `InputEvent<T, D>` enum — `Data(T, Vec<D>)`, `Frontier(T)`
   - `TimestampedInput<T, D>` trait (blanket impl for any matching `Stream`)
-  - `from_stream` operator — spawns reader task, manages capabilities, posts to worker queue
+  - `from_stream` operator — spawns reader task on I/O runtime, manages capabilities, posts to Worker thread pool
+- `dataflow/operators/output.rs`
+  - `OutputEvent<T, D>` enum — `Data(T, Vec<D>)`, `Frontier(T)`
+  - `OutputStream<T, D>` — `Pin<Box<dyn Stream<Item = OutputEvent<T, D>> + Send>>`
+  - `.output()` terminal operator — produces one async stream per worker in the last region
+  - Internal bounded buffer bridges Worker thread pool → async stream consumer
 - `dataflow/spec.rs`
-  - `DataflowSpec<T, R>` — builder for binding inputs + graph definition
+  - `DataflowSpec<T, D>` — builder for binding inputs + graph + output streams
   - `DataflowInputs<T>` — accessor for named input streams inside the builder closure
+  - `DataflowHandle<T, D>` — returned by `execute()`, holds output streams + metrics + cancel
   - `ErasedTimestampedInput<T>` — type-erased input stream for heterogeneous inputs
 - `dataflow/handles.rs`
   - `InputHandle<T, C>` — operator-side input reading
@@ -145,9 +182,14 @@ Contract-and-test-driven development. Each PR defines traits/interfaces first, t
 - DataflowSpec: bind multiple named inputs, access by name inside builder
 - InputHandle: `next()` yields batches in order
 - OutputHandle: `session(&time).give()` produces output
-- Backpressure: from_stream respects channel bounds
+- Backpressure: from_stream respects buffer bounds
+- OutputStream: consumer receives Data events in order
+- OutputStream: Frontier events emitted when output frontier advances
+- OutputStream: multiple output streams (one per worker) when parallelism > 1
+- OutputStream: backpressure — slow consumer slows down pipeline
+- DataflowHandle: cancel token stops dataflow, output streams end
 
-**Estimated size**: ~2000 lines
+**Estimated size**: ~2500 lines
 
 ---
 
@@ -155,9 +197,9 @@ Contract-and-test-driven development. Each PR defines traits/interfaces first, t
 **Goal**: First working operator pipeline. End-to-end test.
 
 - `dataflow/operators/unary.rs`
-  - `unary()` — sync closure variant
-  - `unary_async()` — async closure variant
-  - Registers operator with scope, wires input/output channels
+  - `unary()` — synchronous closure variant (the standard operator form)
+  - `unary_with_metadata()` — variant that receives and can modify envelope metadata
+  - Registers operator with scope, wires input/output buffers
 - `dataflow/operators/inspect.rs`
   - `inspect()` — side-effect observation, passes data through unchanged
 - `dataflow/operators/probe.rs`
@@ -167,32 +209,43 @@ Contract-and-test-driven development. Each PR defines traits/interfaces first, t
 
 **Tests**:
 - unary: identity pass-through, stateful accumulation, error propagation from closure
-- unary_async: async closure with `.await` inside
+- unary_with_metadata: metadata flows through, can be modified
 - inspect: callback receives all data, output stream equals input stream
 - probe: `less_than` reflects frontier, `async_wait_for` resolves when frontier advances past target
-- **End-to-end**: `from_stream → unary(double) → inspect(collect) → probe` — verify results and completion
+- **End-to-end**: `from_stream → unary(double) → inspect(collect) → output` — verify output stream results
+
+**Estimated size**: ~2500 lines
 
 **Estimated size**: ~2500 lines
 
 ---
 
-## PR 8 — Operators: binary, concat
-**Goal**: Multi-input operators.
+## PR 8 — Operators: binary, concat, delay
+**Goal**: Multi-input operators and time-based buffering.
 
 - `dataflow/operators/binary.rs`
   - `binary()` — two inputs, one output, sync closure
   - `binary_async()` — async variant
 - `dataflow/operators/concat.rs`
   - `concat()` — merge multiple streams into one, preserving timestamps
+- `dataflow/operators/delay.rs`
+  - `delay(delay_fn)` — per-record timestamp reassignment; buffers until frontier advances
+  - `delay_batch(delay_fn)` — per-timestamp reassignment (simpler variant)
+  - Internal buffer keyed by output timestamp, releases on frontier advance
 
 **Tests**:
 - binary: join-like logic (match items from two streams by timestamp)
 - binary: one input finishes before the other — correct completion
 - concat: N streams merged, all data present, timestamps preserved
 - concat: empty streams handled correctly
+- delay: data buffered until frontier advances past original timestamp
+- delay: delayed timestamps are correct per delay_fn
+- delay_batch: all data at same timestamp delayed together
+- delay: capabilities held for buffered timestamps, released on flush
 - **End-to-end**: two `from_stream` inputs → `binary` → `inspect` → `probe`
+- **End-to-end**: `from_stream → delay_batch → inspect` — verify output order
 
-**Estimated size**: ~1500 lines
+**Estimated size**: ~2000 lines
 
 ---
 
@@ -220,12 +273,19 @@ Contract-and-test-driven development. Each PR defines traits/interfaces first, t
 
 ---
 
-## PR 10 — Exchange operator (intra-process) + broadcast
-**Goal**: Data redistribution across local workers.
+## PR 10 — Exchange, rebalance, gather, broadcast operators
+**Goal**: Data redistribution across local workers with per-region parallelism support.
 
 - `dataflow/operators/exchange.rs`
   - `exchange(route_fn)` — repartitions data across all workers by hash
+  - Creates region boundary when target parallelism differs from source
   - Uses `PartitionStrategy::Exchange` with `ChannelAllocator` for local workers
+- `dataflow/operators/rebalance.rs`
+  - `rebalance()` — round-robin distribution across target replicas
+  - Used at region boundaries when data distribution doesn't depend on key
+- `dataflow/operators/gather.rs`
+  - `gather()` — funnels all data to a single replica (parallelism 1)
+  - Used for global aggregation/sorting
 - `dataflow/operators/broadcast.rs`
   - `broadcast()` — sends each record to all workers (cross-process when networked)
   - `broadcast_local()` — sends each record to all workers in the same process only
@@ -234,11 +294,17 @@ Contract-and-test-driven development. Each PR defines traits/interfaces first, t
 **Tests**:
 - exchange: items routed to correct worker by hash, multi-worker single-process
 - exchange: all data accounted for (no loss, no duplication)
+- exchange: region boundary — repartition from 4 → 16 workers
+- rebalance: data distributed round-robin across target replicas
+- rebalance: even distribution verified (each replica gets ≈ equal share)
+- gather: all data arrives at single replica
+- gather: works as 16 → 1 repartition
 - broadcast: every worker receives every item (single-process for now)
 - broadcast_local: every local worker receives every item
-- **End-to-end**: `from_stream → exchange → unary(count per worker) → probe`
+- **End-to-end**: `from_stream → exchange(4→16) → unary(count per worker) → gather → probe`
+- **End-to-end**: `from_stream → rebalance → unary → probe`
 
-**Estimated size**: ~2000 lines
+**Estimated size**: ~2500 lines
 
 ---
 
@@ -267,6 +333,7 @@ Contract-and-test-driven development. Each PR defines traits/interfaces first, t
 - `dataflow/scope.rs` additions:
   - `iterative()` — creates a nested scope for iteration
   - `enter_scope()` / `exit_scope()` — wraps/unwraps `Product<TOuter, TInner>` timestamps
+  - **Validation**: all operators inside `iterative()` must share the same execution region (no parallelism changes inside cycles)
 - `progress/timestamp.rs` additions:
   - `Product<TOuter, TInner>` — nested timestamp type
   - PathSummary for Product timestamps
@@ -326,23 +393,25 @@ Contract-and-test-driven development. Each PR defines traits/interfaces first, t
 ---
 
 ## PR 15 — ConnectionManager + ConnectionPool
-**Goal**: Pluggable networking with connection reuse.
+**Goal**: Pluggable networking with dynamic connection scaling.
 
 - `communication/connection.rs`
   - `PeerId` — process identity
   - `ConnectionRequest` — peer_id, local_id, request_id
   - `ConnectionManager` trait — `async fn establish(ConnectionRequest) -> Connection`
   - `TcpConnectionManager` — default impl with address map
-  - `ConnectionPool<M>` — acquire/release, health checks, idle cleanup, reconnection
-  - `PoolConfig` — max_per_peer, idle_timeout, health_check_interval, connect_timeout
+  - `ConnectionPool<M>` — acquire/release, dynamic scaling (grow under load, shrink when idle), health checks, reconnection
+  - `PoolConfig` — min_connections_per_peer, max_connections_per_peer, idle_timeout, health_check_interval, connect_timeout
   - `PoolGuard<C>` — RAII guard that returns connection on drop
 
 **Tests**:
 - MockConnectionManager: establish returns mock streams
 - ConnectionPool: acquire creates new connection, second acquire reuses returned connection
-- Pool: max_per_peer limit enforced, waits for release
-- Pool: dead connection detected → re-establish
-- Pool: idle timeout → connection dropped
+- Pool: scales up to max_connections_per_peer under concurrent demand
+- Pool: scales down — idle connections above min_connections_per_peer are dropped after idle_timeout
+- Pool: max_per_peer limit enforced, waits for release when at capacity
+- Pool: dead connection detected → re-establish via manager
+- Pool: min_connections_per_peer connections are never dropped due to idle timeout
 - TcpConnectionManager: integration test with localhost TCP (optional, cfg(test))
 
 **Estimated size**: ~2500 lines
@@ -394,26 +463,81 @@ Contract-and-test-driven development. Each PR defines traits/interfaces first, t
 
 ---
 
-## PR 18 — Error hardening, tracing, examples, docs
+## PR 18 — Observability + metrics integration
+**Goal**: Per-dataflow CPU time tracking and structured tracing.
+
+- Wire up `DataflowMetrics` collection throughout the runtime:
+  - Wrap each operator activation with `Instant::now()` timing
+  - Accumulate per-operator CPU time, activation counts, records processed
+  - Aggregate into `DataflowMetrics` at dataflow completion
+  - `execute()` returns `DataflowResult<R>` with result + metrics
+- `tracing` integration:
+  - Instrument key paths: operator activation, progress updates, connection events
+  - Structured fields: worker_id, operator_name, timestamp
+  - Emit `OperatorMetrics` as tracing events at dataflow completion
+
+**Tests**:
+- DataflowMetrics: wall_time is non-zero for a completed dataflow
+- DataflowMetrics: total_cpu_time ≤ wall_time × num_workers
+- OperatorMetrics: each operator reports activations > 0 and cpu_time > 0
+- OperatorMetrics: records_processed matches input count for pass-through operators
+- Tracing: verify spans emitted for key operations (using `tracing-test`)
+- **End-to-end**: run pipeline, inspect returned metrics, validate per-operator breakdown
+
+**Estimated size**: ~2500 lines
+
+---
+
+## PR 19 — Checkpoint operator + recovery
+**Goal**: Consumer-defined checkpointing with timestamp-based recovery.
+
+- `dataflow/operators/checkpoint.rs`
+  - `CheckpointBackend<T, D>` trait — `save()`, `save_frontier()`, `load_frontier()`
+  - `checkpoint(backend)` operator — transparent pass-through that persists data/frontier
+  - `InMemoryCheckpointBackend` — default in-memory implementation (for testing)
+- `dataflow/checkpoint_recovery.rs`
+  - `resume_from_checkpoint(input, backend)` — wraps input stream, skips data at/before stored frontier
+  - `FilteredInput<T, D>` — filtered input stream implementation
+
+**Tests**:
+- CheckpointBackend: InMemoryBackend save/load_frontier round-trip
+- Checkpoint operator: data passes through unchanged (transparency)
+- Checkpoint operator: save() called for each batch
+- Checkpoint operator: save_frontier() called on frontier advance
+- Recovery: resume_from_checkpoint skips data ≤ stored frontier
+- Recovery: data beyond stored frontier passes through
+- Recovery: no stored frontier → all data passes through
+- **End-to-end**: run pipeline with checkpoint, "restart" with resume_from_checkpoint, verify no duplicate processing
+
+**Estimated size**: ~2000 lines
+
+---
+
+## PR 20 — Error hardening, examples, docs
 **Goal**: Production readiness polish.
 
 - Error handling audit:
   - Verify no `unwrap()`/`expect()` in library code
   - Add context to errors where needed
   - Ensure all error paths are tested
-- `tracing` integration:
-  - Instrument key paths: operator activation, progress updates, connection events
-  - Structured fields: worker_id, operator_name, timestamp
+  - Verify `ErrorPolicy::Stop` and `ErrorPolicy::Ignore` work end-to-end
+- Error policy end-to-end wiring:
+  - `ErrorPolicy::Stop`: operator error → `Envelope::Control(Error)` → pipeline stops → `execute()` returns error
+  - `ErrorPolicy::Ignore`: operator error → logged + callback invoked → batch skipped → pipeline continues
+  - Skipped error count in `DataflowMetrics`
 - Examples:
   - `examples/hello.rs` — minimal pipeline
   - `examples/wordcount.rs` — classic word count with exchange
   - `examples/loop_example.rs` — iterative computation
+  - `examples/checkpoint.rs` — checkpointing and recovery
 - README.md — quickstart, feature overview, architecture summary
 - API documentation pass (doc comments on all public items)
 
 **Tests**:
 - Examples compile and run (integration tests or `trybuild`)
-- Tracing: verify spans emitted for key operations (using `tracing-test`)
+- Error policy: Stop halts on first error, Ignore continues
+- Error policy: Ignore invokes on_error callback with correct error
+- Error policy: skipped_errors count in DataflowMetrics
 - Error messages are descriptive and actionable
 
 **Estimated size**: ~3000 lines
@@ -429,37 +553,43 @@ PR2  (progress primitives)
  ↓
 PR3  (capability + reachability)
  ↓
-PR4  (scope, stream, channels)
+PR4  (scope, stream, channels + envelope + execution regions)
  ↓
-PR5  (worker + execute)
+PR5  (worker + execute + dynamic pool + error policy + metrics types)
  ↓
 PR6  (input system)
  ↓
 PR7  (unary, inspect, probe)
- ├──→ PR8  (binary, concat)
+ ├──→ PR8  (binary, concat, delay)
  ↓
 PR9  (progress tracker integration)
- ├──→ PR10 (exchange + broadcast)
+ ├──→ PR10 (exchange, rebalance, gather, broadcast — with region boundaries)
  ├──→ PR11 (branch + ok_err)
- ├──→ PR12 (loops + nested scopes)
+ ├──→ PR12 (loops + nested scopes — no parallelism changes in cycles)
  ↓
 PR13 (cancellation) ← depends on PR10-12 being in
  ↓
 PR14 (codec + serialization)
  ↓
-PR15 (connection manager + pool)
+PR15 (connection manager + pool with dynamic scaling)
  ↓
 PR16 (wire protocol + transport)
  ↓
 PR17 (inter-process dataflow)
  ↓
-PR18 (polish: errors, tracing, examples, docs)
+PR18 (observability + metrics integration)
+ ↓
+PR19 (checkpoint operator + recovery)
+ ↓
+PR20 (polish: errors, error policy wiring, examples, docs)
 ```
 
 ## Notes
 
 - **Terminology renames** (Antichain→Frontier, etc.) should be applied before PR1. If approved, the new names will be used from the start, avoiding a rename refactor later.
-- **Custom runtime optimization** is deferred — the WorkerExecutor design already minimizes Tokio scheduling overhead. Can revisit with benchmarks after PR18.
+- **Custom runtime optimization** is deferred — the WorkerExecutor design already minimizes Tokio scheduling overhead. Can revisit with benchmarks after PR20.
 - **Operator fusion** is deferred to post-v1.
 - PRs 10, 11, 12 can proceed in parallel after PR9.
 - PR8 can proceed in parallel with PR9 (only needs PR7).
+- **New additions (v2)**: Dynamic worker pool sizing (PR5), message envelope with control signals (PR4), per-dataflow error policy (PR5/PR20), observability/metrics (PR18), delay operator (PR8), checkpointing (PR19).
+- **New additions (v3)**: Per-stage dynamic parallelism via execution regions (PR4), `rebalance`/`gather` operators (PR10), no parallelism changes inside cycles (PR12 restriction). Region types are defined in PR4; repartition operators in PR10; progress tracking for regions in PR9.
