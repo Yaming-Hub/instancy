@@ -106,6 +106,16 @@ impl<T: Ord> ChangeBatch<T> {
         }
     }
 
+    /// Returns `true` if the batch is definitely empty without mutating.
+    ///
+    /// This is a conservative check: it returns `true` only when the internal
+    /// storage is empty (no pending updates at all). If there are uncompacted
+    /// entries that might cancel, this returns `false` even though `is_empty()`
+    /// (which compacts) might return `true`.
+    pub fn is_empty_clean(&self) -> bool {
+        self.updates.is_empty()
+    }
+
     /// Returns the number of distinct entries after compaction.
     pub fn len(&mut self) -> usize {
         self.compact();
