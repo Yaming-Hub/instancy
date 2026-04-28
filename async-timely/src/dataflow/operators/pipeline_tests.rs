@@ -420,4 +420,167 @@ mod tests {
         // The scope allocated: source(0), double(1), inspect(2), probe(3)
         assert_eq!(stream.scope().operator_count(), 4);
     }
+
+    /// End-to-end: two inputs → binary → inspect → probe
+    #[test]
+    fn pipeline_binary_inspect_probe() {
+        use crate::dataflow::operators::binary::BinaryOperator;
+
+        let region = RegionId::new(0);
+        let collected = Arc::new(Mutex::new(Vec::new()));
+        let collected_clone = Arc::clone(&collected);
+
+        let mut binary = BinaryOperator::<u64, i32, i32, i32>::new(
+            "sum_pairs",
+            0,
+            region,
+            |input1, input2, output| {
+                // Merge both inputs to output
+                while let Some((t, d)) = input1.next() {
+                    let mut s = output.session(t);
+                    for item in d { s.give(item); }
+                }
+                while let Some((t, d)) = input2.next() {
+                    let mut s = output.session(t);
+                    for item in d { s.give(item); }
+                }
+                Ok(())
+            },
+        );
+
+        let mut inspect = InspectOperator::<u64, i32>::new(
+            "collector",
+            1,
+            region,
+            move |time: &u64, data: &[i32]| {
+                let mut guard = collected_clone.lock().unwrap();
+                for item in data { guard.push((*time, *item)); }
+            },
+        );
+
+        let (mut probe_op, handle) =
+            ProbeOperator::<u64, i32>::new("probe", 2, region);
+
+        // Feed data to both inputs
+        binary.input1_mut().push_vec(1, vec![10, 20]);
+        binary.input2_mut().push_vec(1, vec![100]);
+        binary.input2_mut().push_vec(2, vec![200]);
+
+        binary.activate().unwrap();
+        for (t, d) in binary.drain_output() {
+            inspect.input_mut().push_vec(t, d);
+        }
+        inspect.activate().unwrap();
+        for (t, d) in inspect.drain_output() {
+            probe_op.input_mut().push_vec(t, d);
+        }
+        probe_op.activate();
+
+        let results = collected.lock().unwrap();
+        assert_eq!(*results, vec![(1, 10), (1, 20), (1, 100), (2, 200)]);
+
+        handle.update_frontier(Antichain::from_elem(3));
+        assert!(handle.less_than(&4));
+    }
+
+    /// End-to-end: input → delay_batch → inspect — verify output order
+    #[test]
+    fn pipeline_delay_batch_inspect() {
+        use crate::dataflow::operators::delay::DelayBatchOperator;
+
+        let region = RegionId::new(0);
+
+        let mut delay = DelayBatchOperator::<u64, i32, _>::new(
+            "delay_by_10",
+            0,
+            region,
+            |time: &u64| time + 10,
+        );
+
+        let collected = Arc::new(Mutex::new(Vec::new()));
+        let collected_clone = Arc::clone(&collected);
+
+        let mut inspect = InspectOperator::<u64, i32>::new(
+            "observer",
+            1,
+            region,
+            move |time: &u64, data: &[i32]| {
+                let mut guard = collected_clone.lock().unwrap();
+                for item in data { guard.push((*time, *item)); }
+            },
+        );
+
+        // Feed data at times 1 and 2
+        delay.input_mut().push_vec(1, vec![10, 20]);
+        delay.input_mut().push_vec(2, vec![30]);
+        delay.activate().unwrap();
+
+        // Nothing released yet (frontier at 0)
+        assert_eq!(delay.buffered_timestamps(), 2);
+
+        // Advance frontier past time 11 (releases time 11) but not 12
+        delay.update_frontier(Antichain::from_elem(12));
+        delay.activate().unwrap();
+
+        for (t, d) in delay.drain_output() {
+            inspect.input_mut().push_vec(t, d);
+        }
+        inspect.activate().unwrap();
+        let _ = inspect.drain_output().count();
+
+        {
+            let results = collected.lock().unwrap();
+            assert_eq!(*results, vec![(11, 10), (11, 20)]);
+        }
+
+        // Advance past 12
+        delay.update_frontier(Antichain::from_elem(13));
+        delay.activate().unwrap();
+
+        for (t, d) in delay.drain_output() {
+            inspect.input_mut().push_vec(t, d);
+        }
+        inspect.activate().unwrap();
+        let _ = inspect.drain_output().count();
+
+        let results = collected.lock().unwrap();
+        assert_eq!(*results, vec![(11, 10), (11, 20), (12, 30)]);
+    }
+
+    /// End-to-end: concat + unary pipeline
+    #[test]
+    fn pipeline_concat_unary() {
+        use crate::dataflow::operators::concat::ConcatOperator;
+
+        let region = RegionId::new(0);
+
+        let mut concat = ConcatOperator::<u64, i32>::new("merge", 0, region, 2);
+        let mut double = UnaryOperator::<u64, i32, i32>::new(
+            "double",
+            1,
+            region,
+            |input, output| {
+                while let Some((time, data)) = input.next() {
+                    let mut session = output.session(time);
+                    for item in data { session.give(item * 2); }
+                }
+                Ok(())
+            },
+        );
+
+        concat.input_mut(0).push_vec(1, vec![5]);
+        concat.input_mut(1).push_vec(1, vec![10]);
+        concat.input_mut(1).push_vec(2, vec![15]);
+
+        concat.activate().unwrap();
+        for (t, d) in concat.drain_output() {
+            double.input_mut().push_vec(t, d);
+        }
+        double.activate().unwrap();
+
+        let results: Vec<_> = double.drain_output().collect();
+        assert_eq!(results[0], (1, vec![10]));  // 5*2
+        assert_eq!(results[1], (1, vec![20]));  // 10*2
+        assert_eq!(results[2], (2, vec![30]));  // 15*2
+    }
 }
