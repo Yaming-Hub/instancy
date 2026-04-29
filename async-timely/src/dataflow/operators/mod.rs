@@ -14,6 +14,9 @@ pub mod handles;
 pub mod unary;
 pub mod inspect;
 pub mod probe;
+pub mod binary;
+pub mod concat;
+pub mod delay;
 
 #[cfg(test)]
 mod pipeline_tests;
