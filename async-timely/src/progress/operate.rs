@@ -146,14 +146,21 @@ impl<T: Timestamp> Default for ProgressReporter<T> {
 
 /// Shared progress buffers between an operator and the progress tracker.
 ///
-/// Each operator has one `OperatorProgress` instance. The operator writes to
-/// `consumed` (what it read from inputs) and the capabilities write to
-/// `internal` (via [`ProgressReporter`]). The progress tracker reads all three.
+/// Each operator has one `OperatorProgress` instance. Capabilities write to
+/// `internal` (via [`ProgressReporter`]) and the progress tracker drains those
+/// changes during propagation.
+///
+/// The `consumed` and `produced` buffers are reserved for future use when
+/// operators explicitly report message consumption/production for in-flight
+/// message accounting. Currently, progress tracking relies solely on capability
+/// accounting via the `internal` reporters.
 #[derive(Debug)]
 pub struct OperatorProgress<T: Timestamp> {
-    /// Per-input consumed changes (operator reports what it read).
+    /// Per-input consumed changes — reserved for future message-flight accounting.
+    #[allow(dead_code)]
     pub consumed: Vec<ChangeBatch<T>>,
-    /// Per-output produced changes (operator reports what it sent).
+    /// Per-output produced changes — reserved for future message-flight accounting.
+    #[allow(dead_code)]
     pub produced: Vec<ChangeBatch<T>>,
     /// Per-output capability reporters (capabilities write here via ProgressReporter).
     pub internal: Vec<ProgressReporter<T>>,
