@@ -735,9 +735,11 @@ For each input stream, the library spawns a dedicated async task that:
 
 The caller never manually manages capabilities or frontier advancement.
 
-### 5.5 Output Streams
+### 5.5 Output: Sink-First Model
 
-Symmetrically to input, the dataflow emits results as **async streams of timestamped output**. The last stage of the dataflow produces one output stream per worker (at the last region's parallelism level). This allows the caller to consume results reactively and feed them into any destination (database, file, network, another dataflow).
+The orchestrator knows the full dataflow topology — including worker count, placement, and routing — **before** any data flows. Rather than forcing results through an intermediate async channel, the primary output path pushes data directly to a user-provided **`OutputSink`**. An async-stream convenience layer is built on top for cases where pull-based consumption is preferred.
+
+#### OutputSink trait (push-based, primary path)
 
 ```rust
 /// A timestamped output event emitted by the dataflow.
@@ -750,55 +752,84 @@ pub enum OutputEvent<T: Timestamp, D> {
     Frontier(T),
 }
 
-/// An async stream of output events produced by one worker of the final stage.
-/// The number of output streams equals the parallelism of the last execution region.
-pub type OutputStream<T, D> = Pin<Box<dyn Stream<Item = OutputEvent<T, D>> + Send>>;
-```
+/// Push-based sink that the dataflow writes output directly into.
+///
+/// The orchestrator wires the final operator's output to the sink at
+/// construction time — no intermediate async channel sits between the
+/// operator and the destination. One sink instance is created per worker
+/// in the last execution region.
+#[async_trait]
+pub trait OutputSink<T: Timestamp, D: Send>: Send + Sync {
+    /// Called for each output event produced by the final operator.
+    /// Returning `Err` signals backpressure or a fatal write failure;
+    /// the error policy decides whether to retry, skip, or halt.
+    async fn write(&mut self, event: OutputEvent<T, D>) -> Result<()>;
 
-**How the dataflow produces output streams:**
-
-The `.output()` operator (terminal operator) converts the dataflow's internal representation into user-consumable async streams:
-
-```rust
-impl<S: Scope, C: Container> DataStream<S, C> {
-    /// Terminates the dataflow with output streams.
-    /// Returns one async stream per worker in the current execution region.
-    /// The caller receives these streams from `execute()` and can consume them
-    /// concurrently (e.g., write each to a different partition of a database).
-    fn output(&self) -> Vec<OutputStream<S::Timestamp, C::Item>>;
+    /// Called once when the dataflow completes for this worker.
+    /// Use this to flush buffers, commit transactions, close handles, etc.
+    async fn close(&mut self) -> Result<()> {
+        Ok(())
+    }
 }
 ```
 
-**Usage pattern:**
+This is the high-throughput path: operator → sink, no channel hop.
+Backpressure flows naturally from the storage layer (e.g., a slow database write)
+back through the dataflow via the `write` future.
+
+#### OutputStream (pull-based, convenience wrapper)
+
+For testing, small result sets, or interactive consumption, a pull-based
+`OutputStream` is provided as a convenience built *on top of* `OutputSink`:
 
 ```rust
-let result = execute(config, |scope| {
-    let input = scope.input_from(input_streams);
-    
-    // Build the pipeline
-    let output_streams = input
-        .with_parallelism(4)
-        .map(|x| process(x))
-        .exchange(|x| hash(&x.key))
-        .with_parallelism(8)
-        .map(|x| transform(x))
-        .output();  // Returns 8 output streams (one per worker in last region)
-    
-    Ok(output_streams)
+/// An async stream of output events produced by one worker of the final stage.
+/// Internally backed by an OutputSink that writes into a bounded async channel.
+pub type OutputStream<T, D> = Pin<Box<dyn Stream<Item = OutputEvent<T, D>> + Send>>;
+```
+
+This is implemented as a `ChannelSink` that writes events into a bounded
+`mpsc` channel; the `OutputStream` is the receiver end. The caller gets
+standard `Stream` combinators, and backpressure still works (a slow consumer
+fills the channel, causing the `ChannelSink::write` future to block).
+
+#### Wiring outputs at construction time
+
+Because the orchestrator already knows the number of logical workers and
+their physical placement, it can wire outputs directly to their destination
+at dataflow construction time:
+
+```rust
+// High-throughput: push directly to storage
+let handle = execute(config, |builder| {
+    let input = builder.input("events");
+    input
+        .exchange(|e| hash(&e.key))
+        .unary("transform", |handle, output| { /* ... */ })
+        .output_to("results", BlobStoreSink::new(container));
+    Ok(())
 }).await?;
 
-// Consume output streams — each stream corresponds to one worker's output
-for (worker_idx, stream) in result.into_iter().enumerate() {
+// Convenience: pull via async stream
+let handle = execute(config, |builder| {
+    let input = builder.input("events");
+    let streams = input
+        .exchange(|e| hash(&e.key))
+        .unary("transform", |handle, output| { /* ... */ })
+        .output();  // Returns Vec<OutputStream> (one per worker)
+    Ok(streams)
+}).await?;
+
+// Consume output streams
+for (worker_idx, stream) in handle.output_streams().enumerate() {
     tokio::spawn(async move {
         pin_mut!(stream);
         while let Some(event) = stream.next().await {
             match event {
                 OutputEvent::Data(time, batch) => {
-                    // Write to database partition, file, etc.
                     db.write_partition(worker_idx, time, batch).await;
                 }
                 OutputEvent::Frontier(time) => {
-                    // All data up to `time` has been emitted for this worker
                     db.commit_up_to(worker_idx, time).await;
                 }
             }
@@ -808,9 +839,11 @@ for (worker_idx, stream) in result.into_iter().enumerate() {
 ```
 
 **Design rationale**:
-- **Multiple streams**: One stream per final-stage worker preserves parallelism all the way to the sink. The caller can write to multiple database partitions, files, or network connections concurrently.
+- **Sink-first**: The orchestrator knows the full graph topology at construction time. Wiring the final operator directly to its destination avoids an unnecessary channel hop and gives the best throughput.
+- **Multiple sinks/streams**: One sink (or stream) per final-stage worker preserves parallelism all the way to the destination. The caller can write to multiple database partitions, files, or network connections concurrently.
 - **Frontier events included**: The caller knows when a timestamp is "complete" (no more data at that time will arrive), enabling commit/flush at appropriate points.
-- **Async stream interface**: The caller can use standard Rust async stream combinators, backpressure naturally flows back into the dataflow (if the consumer is slow, the last operator's output buffer fills up, creating backpressure).
+- **Backpressure**: In the sink path, backpressure comes from the async `write` future. In the stream path, the bounded channel provides equivalent backpressure. Both propagate naturally back through the dataflow.
+- **Pull-based as convenience**: `OutputStream` is useful for tests and interactive use but is not the primary production path — it adds one channel hop compared to a direct sink.
 
 ### 5.6 Bootstrap: execute & DataflowSpec
 

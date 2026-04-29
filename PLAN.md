@@ -195,6 +195,12 @@ All generic type parameters must follow these codebase-wide conventions for cons
 ## PR 6 — Input/Output system (from_stream, output, DataflowSpec)
 **Goal**: Implement stream-driven input binding and async output stream emission.
 
+**Note**: PR6 implemented the pull-based `OutputStream` approach. The sink-first
+`OutputSink` trait (push-based primary path) will be added in PR 17 as part of
+the full inter-process dataflow wiring, where the orchestrator knows the complete
+topology and can wire outputs directly to their destination at construction time.
+See DESIGN.md §5.5 for the dual-model design (OutputSink + OutputStream).
+
 - `dataflow/operators/from_stream.rs`
   - `InputEvent<T, D>` enum — `Data(T, Vec<D>)`, `Frontier(T)`
   - `TimestampedInput<T, D>` trait (blanket impl for any matching `Stream`)
@@ -477,7 +483,7 @@ All generic type parameters must follow these codebase-wide conventions for cons
 ---
 
 ## PR 17 — Inter-process dataflow
-**Goal**: Full multi-process data exchange and progress tracking.
+**Goal**: Full multi-process data exchange, progress tracking, and sink-first output.
 
 - Wire up `exchange` operator to use connections for remote workers:
   - Detect local vs remote workers from `ClusterTopology`
@@ -487,6 +493,12 @@ All generic type parameters must follow these codebase-wide conventions for cons
   - Progress updates serialized and sent to peer processes
   - Received progress updates fed into local tracker
 - `ChannelAllocator` extended to handle remote channels
+- **OutputSink trait (push-based output)**:
+  - `OutputSink<T, D>` trait — `write(event)` + `close()`
+  - `.output_to(name, sink)` terminal operator — wires final operator directly to user-provided sink
+  - `ChannelSink` — built-in sink that bridges to a bounded `mpsc`, backing the pull-based `OutputStream`
+  - `.output()` reimplemented as syntactic sugar: creates `ChannelSink` internally, returns `OutputStream`
+  - One sink instance per worker in the final region
 
 **Tests**:
 - Two-process simulation using in-memory mock connections
@@ -494,6 +506,11 @@ All generic type parameters must follow these codebase-wide conventions for cons
 - Broadcast sends to all remote workers
 - Progress: frontier advances across processes
 - Connection failure mid-dataflow → Error::Connection propagated
+- OutputSink: custom sink receives all output events in order
+- OutputSink: backpressure from slow sink propagates back through pipeline
+- OutputSink: `close()` called on completion
+- ChannelSink: OutputStream receives events matching direct sink output
+- `.output_to()` wires sink at construction time (one per final-region worker)
 - **End-to-end**: multi-process wordcount (simulated)
 
 **Estimated size**: ~3500 lines

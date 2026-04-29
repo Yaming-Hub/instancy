@@ -92,7 +92,8 @@ impl<T: Timestamp> Builder<T> {
     /// Creates a new builder.
     ///
     /// `scope_inputs` and `scope_outputs` define the boundary ports of the
-    /// enclosing scope (node 0 is reserved for the scope boundary).
+    /// enclosing scope (graph node 0 is reserved for the scope boundary;
+    /// "node" here refers to a vertex in the dataflow graph, not a machine).
     pub fn new(scope_inputs: usize, scope_outputs: usize) -> Self {
         let mut builder = Self {
             nodes: Vec::new(),
@@ -101,9 +102,10 @@ impl<T: Timestamp> Builder<T> {
             scope_inputs,
             scope_outputs,
         };
-        // Node 0 is the scope boundary: scope_outputs inputs, scope_inputs outputs.
-        // (The scope's outputs are "inputs" to node 0, and scope's inputs are "outputs".)
-        // This follows timely's convention where the scope wrapper is node 0.
+        // Graph node 0 is the scope boundary: scope_outputs inputs, scope_inputs outputs.
+        // (The scope's outputs are "inputs" to graph node 0, and scope's inputs are "outputs".)
+        // "Node" here means a vertex in the dataflow graph, not a machine/cluster node.
+        // This follows timely's convention where the scope wrapper is graph node 0.
         let boundary_inputs = scope_outputs;
         let boundary_outputs = scope_inputs;
         builder.ensure_node(0);
@@ -269,8 +271,8 @@ impl<T: Timestamp> Builder<T> {
             })
             .collect();
 
-        // Initialize: scope boundary node (node 0) inputs connect to scope outputs.
-        // Node 0's inputs correspond to scope outputs.
+        // Initialize: scope boundary (graph node 0) inputs connect to scope outputs.
+        // Graph node 0's inputs correspond to scope outputs.
         for so in 0..self.scope_outputs {
             if so < target_to_output[0].len() {
                 target_to_output[0][so][so].insert(T::Summary::default());
@@ -338,7 +340,7 @@ impl<T: Timestamp> Builder<T> {
         }
 
         // Extract scope-level summary: scope input → scope output.
-        // Scope inputs are node 0's outputs.
+        // Scope inputs are graph node 0's outputs.
         for si in 0..self.scope_inputs {
             if si < source_to_output[0].len() {
                 for so in 0..self.scope_outputs {
@@ -660,8 +662,8 @@ impl<T: Timestamp> Tracker<T> {
             self.pushed_changes.update((location.clone(), t.clone()), *d);
         }
 
-        // Update scope output changes if this is the scope boundary node.
-        // Node 0's inputs (targets) correspond to scope outputs.
+        // Update scope output changes if this is the scope boundary (graph node 0).
+        // Graph node 0's inputs (targets) correspond to scope outputs.
         if node == 0 {
             for (t, d) in &implication_changes {
                 if port < self.output_changes.len() {
