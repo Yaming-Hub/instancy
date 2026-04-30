@@ -274,6 +274,11 @@ impl<R> DataflowResult<R> {
     pub fn into_result(self) -> Result<R, crate::error::Error> {
         self.result
     }
+
+    /// Decompose into result and metrics (useful when you need both).
+    pub fn into_parts(self) -> (Result<R, crate::error::Error>, Arc<DataflowMetrics>) {
+        (self.result, self.metrics)
+    }
 }
 
 #[cfg(test)]

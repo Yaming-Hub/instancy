@@ -113,6 +113,76 @@ fn tracing_config_controls() {
 }
 
 #[test]
+fn concurrent_metrics_accumulation() {
+    let collector = Arc::new(instancy::metrics::OperatorMetricsCollector::new("concurrent_op", 0));
+    let num_threads = 8;
+    let activations_per_thread = 100;
+
+    let handles: Vec<_> = (0..num_threads)
+        .map(|_| {
+            let c = collector.clone();
+            std::thread::spawn(move || {
+                for _ in 0..activations_per_thread {
+                    let guard =
+                        instancy::metrics::activation::ActivationGuard::new(c.clone());
+                    guard.finish(10);
+                }
+            })
+        })
+        .collect();
+
+    for h in handles {
+        h.join().unwrap();
+    }
+
+    let snapshot = collector.snapshot();
+    assert_eq!(snapshot.activations, num_threads * activations_per_thread);
+    assert_eq!(
+        snapshot.records_processed,
+        num_threads * activations_per_thread * 10
+    );
+    assert!(snapshot.cpu_time.as_nanos() > 0);
+}
+
+#[test]
+fn concurrent_backpressure_max_tracking() {
+    let collector = Arc::new(instancy::metrics::OperatorMetricsCollector::new("bp_concurrent", 0));
+    let num_threads = 4;
+
+    let handles: Vec<_> = (0..num_threads)
+        .map(|i| {
+            let c = collector.clone();
+            std::thread::spawn(move || {
+                for j in 0..50u64 {
+                    c.record_backpressure(Duration::from_micros(i as u64 * 100 + j));
+                }
+            })
+        })
+        .collect();
+
+    for h in handles {
+        h.join().unwrap();
+    }
+
+    let snapshot = collector.snapshot();
+    assert_eq!(snapshot.backpressure.blocked_count, num_threads * 50);
+    // Max should be at least (num_threads-1)*100 + 49 = 349 micros
+    assert!(snapshot.backpressure.max_blocked_duration.as_micros() >= 349);
+}
+
+#[test]
+fn dataflow_result_into_parts() {
+    let mut metrics = DataflowMetrics::new("parts_test");
+    metrics.register_operator("op", 0);
+    let metrics = Arc::new(metrics);
+
+    let result: DataflowResult<i32> = DataflowResult::new(Ok(99), metrics);
+    let (res, m) = result.into_parts();
+    assert_eq!(res.unwrap(), 99);
+    assert_eq!(m.name(), "parts_test");
+}
+
+#[test]
 fn emit_completion_metrics_does_not_panic() {
     let mut metrics = DataflowMetrics::new("emit_test");
     let op = metrics.register_operator("test_op", 0);
