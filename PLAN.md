@@ -521,7 +521,7 @@ See DESIGN.md §5.5 for the dual-model design (OutputSink + OutputStream).
 ---
 
 ## PR 17 — Inter-process dataflow
-**Goal**: Full multi-process data exchange, progress tracking, and sink-first output.
+**Goal**: Full multi-process data exchange, progress tracking, sink-first output, and **dataflow isolation**.
 
 - Wire up `exchange` operator to use connections for remote workers:
   - Detect local vs remote workers from `ClusterTopology`
@@ -531,6 +531,12 @@ See DESIGN.md §5.5 for the dual-model design (OutputSink + OutputStream).
   - Progress updates serialized and sent to peer processes
   - Received progress updates fed into local tracker
 - `ChannelAllocator` extended to handle remote channels
+- **Dataflow isolation on shared connections**:
+  - `DataflowId(u64)` — cluster-unique, assigned as `(node_index << 48) | local_seq`
+  - Frame header extended to `dataflow_id(u64) + channel_id(u64) + payload_len(u32) + payload`
+  - Demuxer routes by `(dataflow_id, channel_id)` tuple
+  - Scheduler distinguishes work by `(DataflowId, WorkerId)` for FIFO ordering
+  - Frames for unknown/cancelled DataflowIds are logged and dropped
 - **OutputSink trait (push-based output)**:
   - `OutputSink<T, D>` trait — `write(event)` + `close()`
   - `.output_to(name, sink)` terminal operator — wires final operator directly to user-provided sink
@@ -544,6 +550,9 @@ See DESIGN.md §5.5 for the dual-model design (OutputSink + OutputStream).
 - Broadcast sends to all remote workers
 - Progress: frontier advances across processes
 - Connection failure mid-dataflow → Error::Connection propagated
+- **Dataflow isolation**: two concurrent dataflows share a connection; frames route correctly by DataflowId
+- **Dataflow isolation**: cancelled dataflow's in-flight frames are dropped (not delivered to other dataflows)
+- **Dataflow isolation**: DataflowId uniqueness across nodes (no collision with node_index encoding)
 - OutputSink: custom sink receives all output events in order
 - OutputSink: backpressure from slow sink propagates back through pipeline
 - OutputSink: `close()` called on completion

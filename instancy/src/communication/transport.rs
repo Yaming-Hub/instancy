@@ -31,16 +31,21 @@ use std::io;
 use crate::communication::codec::MAX_MESSAGE_SIZE;
 
 /// A single frame in the wire protocol.
+///
+/// Each frame carries a `dataflow_id` to isolate concurrent dataflows sharing
+/// the same pooled connection, plus a `channel_id` for edge-level demuxing.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Frame {
-    /// Logical channel identifier.
+    /// Identifies which dataflow this frame belongs to (isolation key).
+    pub dataflow_id: u64,
+    /// Logical channel identifier within the dataflow.
     pub channel_id: u64,
     /// Payload bytes.
     pub payload: Vec<u8>,
 }
 
-/// Header size: 8 (channel_id) + 4 (length) = 12 bytes.
-const HEADER_SIZE: usize = 12;
+/// Header size: 8 (dataflow_id) + 8 (channel_id) + 4 (length) = 20 bytes.
+const HEADER_SIZE: usize = 20;
 
 /// Errors that can occur during framed transport operations.
 #[derive(Debug, thiserror::Error)]
@@ -104,10 +109,11 @@ mod tokio_impl {
                 });
             }
 
-            // Write header: channel_id (8 LE) + length (4 LE)
+            // Write header: dataflow_id (8 LE) + channel_id (8 LE) + length (4 LE)
             let mut header = [0u8; HEADER_SIZE];
-            header[..8].copy_from_slice(&frame.channel_id.to_le_bytes());
-            header[8..12].copy_from_slice(&(len as u32).to_le_bytes());
+            header[..8].copy_from_slice(&frame.dataflow_id.to_le_bytes());
+            header[8..16].copy_from_slice(&frame.channel_id.to_le_bytes());
+            header[16..20].copy_from_slice(&(len as u32).to_le_bytes());
 
             self.writer.write_all(&header).await?;
             self.writer.write_all(&frame.payload).await?;
@@ -135,8 +141,9 @@ mod tokio_impl {
             for frame in frames {
                 let len = frame.payload.len();
                 let mut header = [0u8; HEADER_SIZE];
-                header[..8].copy_from_slice(&frame.channel_id.to_le_bytes());
-                header[8..12].copy_from_slice(&(len as u32).to_le_bytes());
+                header[..8].copy_from_slice(&frame.dataflow_id.to_le_bytes());
+                header[8..16].copy_from_slice(&frame.channel_id.to_le_bytes());
+                header[16..20].copy_from_slice(&(len as u32).to_le_bytes());
 
                 self.writer.write_all(&header).await?;
                 self.writer.write_all(&frame.payload).await?;
@@ -194,8 +201,9 @@ mod tokio_impl {
                 }
             }
 
-            let channel_id = u64::from_le_bytes(header[..8].try_into().unwrap());
-            let length = u32::from_le_bytes(header[8..12].try_into().unwrap()) as usize;
+            let dataflow_id = u64::from_le_bytes(header[..8].try_into().unwrap());
+            let channel_id = u64::from_le_bytes(header[8..16].try_into().unwrap());
+            let length = u32::from_le_bytes(header[16..20].try_into().unwrap()) as usize;
 
             if length > MAX_MESSAGE_SIZE {
                 return Err(TransportError::PayloadTooLarge {
@@ -218,6 +226,7 @@ mod tokio_impl {
             })?;
 
             Ok(Frame {
+                dataflow_id,
                 channel_id,
                 payload,
             })
@@ -245,11 +254,12 @@ mod tokio_impl {
     }
 
     /// A demultiplexer that reads frames from a connection and dispatches them
-    /// to per-channel receivers.
+    /// to per-(dataflow, channel) receivers.
     ///
     /// The demuxer runs as a background task. It reads frames from the underlying
-    /// stream and routes them to registered channel receivers. If a channel
-    /// receiver is dropped, the frame is discarded.
+    /// stream and routes them to registered channel receivers based on the
+    /// `(dataflow_id, channel_id)` pair. If a channel receiver is dropped, the
+    /// frame is discarded.
     ///
     /// # Backpressure
     ///
@@ -261,7 +271,7 @@ mod tokio_impl {
     /// connections per channel or spawn per-channel forwarding tasks.
     pub struct Demuxer<R> {
         reader: FramedReader<R>,
-        channels: HashMap<u64, mpsc::Sender<Vec<u8>>>,
+        channels: HashMap<(u64, u64), mpsc::Sender<Vec<u8>>>,
         config: DemuxConfig,
     }
 
@@ -279,13 +289,17 @@ mod tokio_impl {
             }
         }
 
-        /// Register a channel to receive frames.
+        /// Register a channel to receive frames for a specific dataflow.
         ///
         /// Returns a receiver that will get the payload bytes for frames
-        /// matching the given `channel_id`.
-        pub fn register_channel(&mut self, channel_id: u64) -> ChannelReceiver {
+        /// matching the given `(dataflow_id, channel_id)` pair.
+        pub fn register_channel(
+            &mut self,
+            dataflow_id: u64,
+            channel_id: u64,
+        ) -> ChannelReceiver {
             let (tx, rx) = mpsc::channel(self.config.channel_buffer);
-            self.channels.insert(channel_id, tx);
+            self.channels.insert((dataflow_id, channel_id), tx);
             rx
         }
 
@@ -303,13 +317,14 @@ mod tokio_impl {
                     Err(e) => return Err(e),
                 };
 
-                if let Some(tx) = self.channels.get(&frame.channel_id) {
+                let key = (frame.dataflow_id, frame.channel_id);
+                if let Some(tx) = self.channels.get(&key) {
                     // If the receiver is dropped, remove the channel
                     if tx.send(frame.payload).await.is_err() {
-                        self.channels.remove(&frame.channel_id);
+                        self.channels.remove(&key);
                     }
                 }
-                // Frames for unregistered channels are silently dropped.
+                // Frames for unregistered (dataflow, channel) pairs are silently dropped.
 
                 // If all channels are gone, stop
                 if self.channels.is_empty() {
@@ -346,13 +361,15 @@ mod tokio_impl {
                 .map_err(|_| TransportError::MuxerShutdown)
         }
 
-        /// Send a payload on a specific channel.
+        /// Send a payload on a specific (dataflow, channel) pair.
         pub async fn send_payload(
             &self,
+            dataflow_id: u64,
             channel_id: u64,
             payload: Vec<u8>,
         ) -> Result<(), TransportError> {
             self.send(Frame {
+                dataflow_id,
                 channel_id,
                 payload,
             })
@@ -438,10 +455,12 @@ mod tests {
     #[test]
     fn frame_equality() {
         let f1 = Frame {
+            dataflow_id: 1,
             channel_id: 42,
             payload: vec![1, 2, 3],
         };
         let f2 = Frame {
+            dataflow_id: 1,
             channel_id: 42,
             payload: vec![1, 2, 3],
         };
@@ -451,6 +470,7 @@ mod tests {
     #[test]
     fn frame_debug() {
         let f = Frame {
+            dataflow_id: 1,
             channel_id: 1,
             payload: vec![0xAA],
         };
@@ -489,6 +509,7 @@ mod transport_tests {
         let mut reader = FramedReader::new(server);
 
         let frame = Frame {
+            dataflow_id: 1,
             channel_id: 123,
             payload: b"hello world".to_vec(),
         };
@@ -507,6 +528,7 @@ mod transport_tests {
 
         let frames: Vec<Frame> = (0..5)
             .map(|i| Frame {
+                dataflow_id: 1,
                 channel_id: i,
                 payload: format!("message {i}").into_bytes(),
             })
@@ -531,6 +553,7 @@ mod transport_tests {
 
         let frames: Vec<Frame> = (0..3)
             .map(|i| Frame {
+                dataflow_id: 1,
                 channel_id: i * 10,
                 payload: vec![i as u8; 100],
             })
@@ -552,6 +575,7 @@ mod transport_tests {
         let mut reader = FramedReader::new(server);
 
         let frame = Frame {
+            dataflow_id: 1,
             channel_id: 0,
             payload: vec![],
         };
@@ -572,6 +596,7 @@ mod transport_tests {
         // 100KB payload
         let payload = vec![0xAB; 100_000];
         let frame = Frame {
+            dataflow_id: 1,
             channel_id: 99,
             payload: payload.clone(),
         };
@@ -590,6 +615,7 @@ mod transport_tests {
 
         // Exceeds MAX_MESSAGE_SIZE (256 MB)
         let frame = Frame {
+            dataflow_id: 1,
             channel_id: 1,
             payload: vec![0; (MAX_MESSAGE_SIZE as usize) + 1],
         };
@@ -622,6 +648,7 @@ mod transport_tests {
 
         writer
             .write_frame(&Frame {
+                dataflow_id: 1,
                 channel_id: 1,
                 payload: b"data".to_vec(),
             })
@@ -646,13 +673,14 @@ mod transport_tests {
         let config = DemuxConfig { channel_buffer: 16 };
         let mut demuxer = Demuxer::new(server, config);
 
-        let mut rx1 = demuxer.register_channel(1);
-        let mut rx2 = demuxer.register_channel(2);
-        let mut rx3 = demuxer.register_channel(3);
+        let mut rx1 = demuxer.register_channel(1, 1);
+        let mut rx2 = demuxer.register_channel(1, 2);
+        let mut rx3 = demuxer.register_channel(1, 3);
 
         // Write interleaved frames
         writer
             .write_frame(&Frame {
+                dataflow_id: 1,
                 channel_id: 1,
                 payload: b"ch1-a".to_vec(),
             })
@@ -660,6 +688,7 @@ mod transport_tests {
             .unwrap();
         writer
             .write_frame(&Frame {
+                dataflow_id: 1,
                 channel_id: 2,
                 payload: b"ch2-a".to_vec(),
             })
@@ -667,6 +696,7 @@ mod transport_tests {
             .unwrap();
         writer
             .write_frame(&Frame {
+                dataflow_id: 1,
                 channel_id: 3,
                 payload: b"ch3-a".to_vec(),
             })
@@ -674,6 +704,7 @@ mod transport_tests {
             .unwrap();
         writer
             .write_frame(&Frame {
+                dataflow_id: 1,
                 channel_id: 1,
                 payload: b"ch1-b".to_vec(),
             })
@@ -703,11 +734,12 @@ mod transport_tests {
 
         let config = DemuxConfig::default();
         let mut demuxer = Demuxer::new(server, config);
-        let mut rx1 = demuxer.register_channel(1);
+        let mut rx1 = demuxer.register_channel(1, 1);
 
         // Write to registered and unregistered channels
         writer
             .write_frame(&Frame {
+                dataflow_id: 1,
                 channel_id: 99,
                 payload: b"unknown".to_vec(),
             })
@@ -715,6 +747,7 @@ mod transport_tests {
             .unwrap();
         writer
             .write_frame(&Frame {
+                dataflow_id: 1,
                 channel_id: 1,
                 payload: b"known".to_vec(),
             })
@@ -735,7 +768,7 @@ mod transport_tests {
 
         let config = DemuxConfig::default();
         let mut demuxer = Demuxer::new(server, config);
-        let rx1 = demuxer.register_channel(1);
+        let rx1 = demuxer.register_channel(1, 1);
 
         // Drop the receiver before sending
         drop(rx1);
@@ -743,6 +776,7 @@ mod transport_tests {
         // Send a frame — demuxer should stop because no receivers left
         writer
             .write_frame(&Frame {
+                dataflow_id: 1,
                 channel_id: 1,
                 payload: b"orphan".to_vec(),
             })
@@ -767,11 +801,11 @@ mod transport_tests {
         let muxer_handle = tokio::spawn(async move { muxer.run().await });
 
         sender
-            .send_payload(1, b"hello".to_vec())
+            .send_payload(1, 1, b"hello".to_vec())
             .await
             .unwrap();
         sender
-            .send_payload(2, b"world".to_vec())
+            .send_payload(1, 2, b"world".to_vec())
             .await
             .unwrap();
         drop(sender); // Signal muxer to stop
@@ -799,7 +833,7 @@ mod transport_tests {
 
         for i in 0..10u64 {
             sender
-                .send_payload(i, format!("msg-{i}").into_bytes())
+                .send_payload(1, i, format!("msg-{i}").into_bytes())
                 .await
                 .unwrap();
         }
@@ -825,8 +859,8 @@ mod transport_tests {
 
         let muxer_handle = tokio::spawn(async move { muxer.run().await });
 
-        sender.send_payload(1, b"from-1".to_vec()).await.unwrap();
-        sender2.send_payload(2, b"from-2".to_vec()).await.unwrap();
+        sender.send_payload(1, 1, b"from-1".to_vec()).await.unwrap();
+        sender2.send_payload(1, 2, b"from-2".to_vec()).await.unwrap();
         drop(sender);
         drop(sender2);
 
@@ -851,7 +885,7 @@ mod transport_tests {
         drop(muxer);
 
         // Sending should fail
-        let result = sender.send_payload(1, b"late".to_vec()).await;
+        let result = sender.send_payload(1, 1, b"late".to_vec()).await;
         assert!(matches!(result, Err(TransportError::MuxerShutdown)));
     }
 
@@ -866,12 +900,12 @@ mod transport_tests {
         let (muxer_a, sender_a) = Muxer::new(a_write, mux_config.clone());
         let demux_config = DemuxConfig { channel_buffer: 32 };
         let mut demuxer_a = Demuxer::new(a_read, demux_config.clone());
-        let mut rx_a = demuxer_a.register_channel(100);
+        let mut rx_a = demuxer_a.register_channel(1, 100);
 
         // Peer B: muxer on b_write, demuxer on b_read
         let (muxer_b, sender_b) = Muxer::new(b_write, mux_config);
         let mut demuxer_b = Demuxer::new(b_read, demux_config);
-        let mut rx_b = demuxer_b.register_channel(200);
+        let mut rx_b = demuxer_b.register_channel(1, 200);
 
         // Start background tasks
         let ha = tokio::spawn(async move { muxer_a.run().await });
@@ -881,12 +915,12 @@ mod transport_tests {
 
         // A sends to B on channel 200
         sender_a
-            .send_payload(200, b"hello from A".to_vec())
+            .send_payload(1, 200, b"hello from A".to_vec())
             .await
             .unwrap();
         // B sends to A on channel 100
         sender_b
-            .send_payload(100, b"hello from B".to_vec())
+            .send_payload(1, 100, b"hello from B".to_vec())
             .await
             .unwrap();
 

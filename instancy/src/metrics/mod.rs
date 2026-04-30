@@ -1,7 +1,19 @@
 //! Observability metrics for dataflow execution.
 //!
 //! Provides per-dataflow and per-operator metrics including CPU time,
-//! activation counts, and records processed.
+//! activation counts, records processed, and backpressure statistics.
+//!
+//! Key components:
+//! - [`DataflowMetrics`] — aggregate metrics for a complete dataflow execution
+//! - [`OperatorMetricsCollector`] — lock-free per-operator metrics accumulator
+//! - [`ActivationGuard`] — RAII timer for measuring operator activation cost
+//! - [`DataflowResult`] — execution result bundled with collected metrics
+
+pub mod activation;
+pub mod tracing_integration;
+
+pub use activation::ActivationGuard;
+pub use tracing_integration::TracingConfig;
 
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
@@ -85,6 +97,16 @@ impl OperatorMetricsCollector {
             bp_blocked_nanos: AtomicU64::new(0),
             bp_max_blocked_nanos: AtomicU64::new(0),
         }
+    }
+
+    /// Get the operator name.
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+
+    /// Get the operator index.
+    pub fn index(&self) -> usize {
+        self.index
     }
 
     /// Record one activation with the given CPU time and records processed.
@@ -217,6 +239,45 @@ impl DataflowMetrics {
     /// Number of registered operators.
     pub fn operator_count(&self) -> usize {
         self.operators.len()
+    }
+}
+
+/// Result of a dataflow execution, bundling the computation result with metrics.
+///
+/// Returned by `execute()` when the dataflow completes (or errors).
+/// Provides access to both the output value and the collected performance data.
+#[derive(Debug)]
+pub struct DataflowResult<R> {
+    /// The computation result (Ok on success, Err on failure).
+    pub result: Result<R, crate::error::Error>,
+    /// Metrics collected during execution.
+    pub metrics: Arc<DataflowMetrics>,
+}
+
+impl<R> DataflowResult<R> {
+    /// Create a new dataflow result.
+    pub fn new(result: Result<R, crate::error::Error>, metrics: Arc<DataflowMetrics>) -> Self {
+        Self { result, metrics }
+    }
+
+    /// Check if the dataflow completed successfully.
+    pub fn is_ok(&self) -> bool {
+        self.result.is_ok()
+    }
+
+    /// Get the metrics regardless of success/failure.
+    pub fn metrics(&self) -> &DataflowMetrics {
+        &self.metrics
+    }
+
+    /// Unwrap the result, discarding metrics.
+    pub fn into_result(self) -> Result<R, crate::error::Error> {
+        self.result
+    }
+
+    /// Decompose into result and metrics (useful when you need both).
+    pub fn into_parts(self) -> (Result<R, crate::error::Error>, Arc<DataflowMetrics>) {
+        (self.result, self.metrics)
     }
 }
 
