@@ -2005,6 +2005,10 @@ DataflowIds are assigned by the local runtime using an atomic counter. To ensure
 
 Logical workers (`WorkerId`) are **per-dataflow**. Dataflow A's `WorkerId(0)` and dataflow B's `WorkerId(0)` are distinct logical entities. However, they may execute on the same physical OS thread in the worker pool. The scheduler distinguishes them by `(DataflowId, WorkerId)` to maintain per-worker FIFO ordering.
 
+#### Operator Identity
+
+An `operator_index` (usize) is only unique **within** a single dataflow's operator registry. To globally identify an operator across the cluster, the full identity is `(DataflowId, operator_index)`. This composite key is used in metrics collection, tracing spans, and diagnostics. There is no single `GlobalOperatorId` struct — instead, the pairing is carried contextually wherever cross-dataflow disambiguation is needed.
+
 #### Summary: Where DataflowId Appears
 
 | Layer | How DataflowId is Used |
