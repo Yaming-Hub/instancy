@@ -20,7 +20,7 @@
 //! # Example: Custom codec
 //!
 //! ```
-//! use async_timely::communication::codec::{Codec, CodecError};
+//! use instancy::communication::codec::{Codec, CodecError};
 //!
 //! struct LengthPrefixedStringCodec;
 //!

@@ -1,4 +1,4 @@
-//! # async-timely
+//! # instancy
 //!
 //! A reimplementation of [timely-dataflow](https://github.com/TimelyDataflow/timely-dataflow)
 //! with a custom worker thread pool, per-stage dynamic parallelism, structured

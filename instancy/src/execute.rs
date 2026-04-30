@@ -12,7 +12,7 @@ use crate::scheduler::batching::BatchingPolicy;
 use crate::worker::WorkerId;
 use crate::worker_pool::WorkerPoolConfig;
 
-/// Configuration for the async-timely runtime.
+/// Configuration for the instancy runtime.
 #[derive(Debug, Clone)]
 pub struct RuntimeConfig {
     /// Worker thread pool configuration.

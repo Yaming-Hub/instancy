@@ -1,6 +1,6 @@
-//! Error types for async-timely.
+//! Error types for instancy.
 
-/// The main error type for async-timely operations.
+/// The main error type for instancy operations.
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
     /// An I/O error occurred.

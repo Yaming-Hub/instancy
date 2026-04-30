@@ -14,7 +14,7 @@
 //! # Example
 //!
 //! ```ignore
-//! use async_timely::communication::connection::*;
+//! use instancy::communication::connection::*;
 //!
 //! // Application implements ConnectionManager for its networking
 //! struct MyAppConnectionManager { /* ... */ }

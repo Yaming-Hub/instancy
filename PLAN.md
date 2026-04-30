@@ -1,4 +1,4 @@
-# async-timely Development Plan
+# instancy Development Plan
 
 ## Approach
 Contract-and-test-driven development. Each PR defines traits/interfaces first, then implements them, accompanied by comprehensive tests. PRs are ordered by dependency and sized under 5000 lines (including tests). Terminology renames (pending approval) will be applied via a dedicated PR early in the process.
@@ -28,7 +28,7 @@ All generic type parameters must follow these codebase-wide conventions for cons
 **Goal**: Establish workspace structure, error types, `PartialOrder`, `Timestamp`, `PathSummary`.
 
 - Workspace `Cargo.toml` (workspace members, shared dependencies)
-- Crate `async-timely/Cargo.toml` with initial dependencies
+- Crate `instancy/Cargo.toml` with initial dependencies
 - `lib.rs` — module declarations, re-exports
 - `error.rs` — `Error` enum with all variants (Io, Codec, Connection, Cancelled, Progress, Operator, Custom)
 - `order.rs` — `PartialOrder` trait + implementations for `()`, `usize`, `u32`, `u64`, `i32`, `(A,B)` (product order)

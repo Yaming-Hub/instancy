@@ -1,4 +1,4 @@
-//! Communication infrastructure for async-timely.
+//! Communication infrastructure for instancy.
 //!
 //! This module provides channel allocation for intra-process communication
 //! between operators, codec infrastructure for inter-process serialization,

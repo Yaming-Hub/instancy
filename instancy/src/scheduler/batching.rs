@@ -8,7 +8,7 @@
 //! # Example
 //!
 //! ```
-//! use async_timely::scheduler::batching::{BatchingPolicy, BatchAccumulator};
+//! use instancy::scheduler::batching::{BatchingPolicy, BatchAccumulator};
 //! use std::time::Duration;
 //!
 //! let policy = BatchingPolicy::default(); // 1024 msgs, 64KB, 1ms

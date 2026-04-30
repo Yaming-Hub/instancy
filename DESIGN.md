@@ -1,8 +1,8 @@
-# async-timely: Design Document
+# instancy: Design Document
 
 ## 1. Overview
 
-**async-timely** is an asynchronous, Tokio-based reimplementation of [timely-dataflow](https://github.com/TimelyDataflow/timely-dataflow) — a low-latency cyclic dataflow computational model. It retains the core concepts of timely dataflow (timestamps, frontiers, progress tracking, capabilities, scopes) while making fundamental changes to the execution model, networking, serialization, and error handling.
+**instancy** is an asynchronous, Tokio-based reimplementation of [timely-dataflow](https://github.com/TimelyDataflow/timely-dataflow) — a low-latency cyclic dataflow computational model. It retains the core concepts of timely dataflow (timestamps, frontiers, progress tracking, capabilities, scopes) while making fundamental changes to the execution model, networking, serialization, and error handling.
 
 ### Design Principles
 
@@ -22,9 +22,9 @@
 
 ---
 
-## 2. Architecture Comparison: timely-dataflow vs async-timely
+## 2. Architecture Comparison: timely-dataflow vs instancy
 
-| Aspect | timely-dataflow | async-timely |
+| Aspect | timely-dataflow | instancy |
 |---|---|---|
 | Abstraction level | Workers and channels tied to physical threads and TCP connections | Fully logical: workers, streams, and routing are virtual; physical resources provided by adapters |
 | Execution | 1 OS thread per worker; worker owns its dataflows and steps through them synchronously | Dual-layer: Custom Worker Thread Pool (sync operator logic) + Tokio I/O runtime (network, input streams); logical `WorkerId`s for FIFO ordering |
@@ -50,9 +50,9 @@
 ## 3. Crate Structure
 
 ```
-async-timely/
+instancy/
 ├── Cargo.toml              (workspace root)
-├── async-timely/            (main crate)
+├── instancy/            (main crate)
 │   ├── src/
 │   │   ├── lib.rs
 │   │   ├── error.rs         — Error types
@@ -96,7 +96,7 @@ async-timely/
 │   │       ├── connection.rs— ConnectionFactory + pool
 │   │       └── transport.rs — Framed async read/write
 │   └── Cargo.toml
-├── async-timely-communication/  (optional: split networking crate)
+├── instancy-communication/  (optional: split networking crate)
 └── examples/
     ├── hello.rs
     ├── wordcount.rs
@@ -154,7 +154,7 @@ Scopes nest exactly as in timely-dataflow. A `Scope` owns a `SubgraphBuilder` th
 
 ## 4.5 Logical/Physical Separation Architecture
 
-A fundamental design choice in async-timely is the complete separation between **logical computation** and **physical execution**. The dataflow graph, streams, operators, workers, and partitioning are all purely logical abstractions. Physical resources (OS threads, network connections, processes) are provided by pluggable **adapters** (also called **providers**).
+A fundamental design choice in instancy is the complete separation between **logical computation** and **physical execution**. The dataflow graph, streams, operators, workers, and partitioning are all purely logical abstractions. Physical resources (OS threads, network connections, processes) are provided by pluggable **adapters** (also called **providers**).
 
 ### The Three Layers
 
@@ -294,7 +294,7 @@ fn test_distributed_word_count() {
 
 ### 5.1 Dual-Layer Architecture: Worker Thread Pool + I/O Runtime
 
-async-timely separates **computation** from **I/O** into two distinct layers:
+instancy separates **computation** from **I/O** into two distinct layers:
 
 1. **Worker Thread Pool** (custom, lightweight) — a dedicated thread pool that executes operator logic. Operators are pure synchronous functions: take input batches, compute, produce output batches. No async, no I/O, no `await` points in operator code.
 
@@ -475,7 +475,7 @@ We retain the concept of a **logical worker ID** — a `WorkerId` — which serv
 
 #### Heterogeneous Worker Assignment
 
-Unlike timely-dataflow where every process must run the same number of workers, async-timely allows **each node to declare its own worker count** based on its available resources (CPU cores, memory, etc.). The global worker set is the union of all per-node workers, and each worker is assigned a globally unique `WorkerId`.
+Unlike timely-dataflow where every process must run the same number of workers, instancy allows **each node to declare its own worker count** based on its available resources (CPU cores, memory, etc.). The global worker set is the union of all per-node workers, and each worker is assigned a globally unique `WorkerId`.
 
 ```
 Example: 3-node cluster with heterogeneous workers
@@ -506,12 +506,12 @@ pub struct NodeConfig {
     pub workers: usize,
 }
 
-/// Configuration for the async-timely runtime.
+/// Configuration for the instancy runtime.
 pub struct RuntimeConfig {
     /// Worker Thread Pool configuration (the custom thread pool for operator logic).
     pub compute_pool: WorkerPoolConfig,
     /// Optional: provide an existing Tokio runtime handle for I/O tasks.
-    /// If None, async-timely creates a minimal Tokio runtime internally.
+    /// If None, instancy creates a minimal Tokio runtime internally.
     /// The Tokio runtime is used ONLY for I/O: input stream reading,
     /// network connections, and inter-process progress exchange.
     pub io_runtime: Option<tokio::runtime::Handle>,
@@ -520,13 +520,13 @@ pub struct RuntimeConfig {
 }
 ```
 
-> **Runtime isolation**: The caller application can provide a dedicated Tokio runtime handle for async-timely's I/O tasks via `RuntimeConfig::io_runtime`. This keeps async-timely's network and input reading separate from the application's own async work. The Worker Thread Pool is always isolated by design (it's a separate thread pool from any Tokio runtime).
+> **Runtime isolation**: The caller application can provide a dedicated Tokio runtime handle for instancy's I/O tasks via `RuntimeConfig::io_runtime`. This keeps instancy's network and input reading separate from the application's own async work. The Worker Thread Pool is always isolated by design (it's a separate thread pool from any Tokio runtime).
 >
 > ```rust
-> // Application creates a minimal Tokio runtime for async-timely I/O only
+> // Application creates a minimal Tokio runtime for instancy I/O only
 > let io_runtime = tokio::runtime::Builder::new_multi_thread()
 >     .worker_threads(2)  // I/O doesn't need many threads
->     .thread_name("async-timely-io")
+>     .thread_name("instancy-io")
 >     .build()?;
 >
 > let config = RuntimeConfig {
@@ -1044,7 +1044,7 @@ Since multiple dataflows share the same Worker Thread Pool, we need controls to 
 
 ### 5.7a Backpressure
 
-Backpressure is a critical mechanism that prevents fast operators from overwhelming slow ones. async-timely implements **end-to-end backpressure** that traces all the way from any blocked downstream operator back to the input streams.
+Backpressure is a critical mechanism that prevents fast operators from overwhelming slow ones. instancy implements **end-to-end backpressure** that traces all the way from any blocked downstream operator back to the input streams.
 
 #### Backpressure Chain
 
@@ -1108,7 +1108,7 @@ pub struct OperatorMetrics {
 
 ### 5.7b Observability & Metrics
 
-For production use, understanding the performance characteristics of each dataflow run is essential. async-timely provides built-in observability:
+For production use, understanding the performance characteristics of each dataflow run is essential. instancy provides built-in observability:
 
 #### Per-Dataflow CPU Time Tracking
 
@@ -1162,7 +1162,7 @@ All metrics are also emitted as `tracing` spans and events for integration with 
 
 ```rust
 // Example tracing output:
-// SPAN async_timely::operator{name="Exchange" index=3 worker=0}
+// SPAN instancy::operator{name="Exchange" index=3 worker=0}
 //   activation_count=42, cpu_time_us=1234, records=50000
 ```
 
@@ -1560,7 +1560,7 @@ This structured error enables:
 
 In traditional timely-dataflow, every operator in a dataflow uses the same number of workers. This is wasteful for operations like global aggregation (funneling to 1 worker) or when different stages have different computational needs.
 
-async-timely introduces **execution regions** — groups of operators that share a parallelism level. Different regions can have different parallelism, with explicit repartition operators at region boundaries.
+instancy introduces **execution regions** — groups of operators that share a parallelism level. Different regions can have different parallelism, with explicit repartition operators at region boundaries.
 
 #### Motivation
 
@@ -2215,7 +2215,7 @@ where
 Extension crates add operators by implementing traits on `DataStream`:
 
 ```rust
-// In crate `async-timely-extras`
+// In crate `instancy-extras`
 pub trait MapOperator<S: Scope, T: Data> {
     fn map<U: Data>(
         &self,
@@ -2243,7 +2243,7 @@ impl<S: Scope, T: Data> MapOperator<S, T> for DataStream<S, Vec<T>> {
 ## 10. User-Facing API Example
 
 ```rust
-use async_timely::prelude::*;
+use instancy::prelude::*;
 use tokio_stream::wrappers::ReceiverStream;
 
 #[tokio::main]
@@ -2385,7 +2385,7 @@ let communication = CommunicationConfig::Cluster {
 
 ## 11. Progress Tracking Details
 
-Progress tracking in async-timely mirrors the timely-dataflow protocol but is adapted for async:
+Progress tracking in instancy mirrors the timely-dataflow protocol but is adapted for async:
 
 ### 11.1 Per-Subgraph Progress Task
 
@@ -2424,7 +2424,7 @@ impl<T: Timestamp> ProbeHandle<T> {
 
 ### 12.1 Send + Sync Everywhere
 
-Unlike timely-dataflow which uses `Rc<RefCell<...>>` extensively (single-threaded), async-timely requires `Send + 'static` bounds on operator closures and data because tasks can run on any Worker Thread Pool thread. This adds some constraints but enables the shared pool model.
+Unlike timely-dataflow which uses `Rc<RefCell<...>>` extensively (single-threaded), instancy requires `Send + 'static` bounds on operator closures and data because tasks can run on any Worker Thread Pool thread. This adds some constraints but enables the shared pool model.
 
 **Mitigation**: Use lock-free structures and channels where possible. The `progress` tracker uses channels to avoid shared mutable state. Operator state is owned by the closure (no shared references needed).
 
@@ -2463,11 +2463,11 @@ Default batch size: 1024 items (configurable).
 
 ### 12.4 Connection Multiplexing
 
-Rather than one TCP connection per (worker, channel) pair, async-timely multiplexes all channels to the same peer over a small number of pooled connections. The pool delegates all connection establishment to the application's `ConnectionManager`, so the library never touches sockets directly. This dramatically reduces connection count in large clusters and supports arbitrarily complex networking topologies.
+Rather than one TCP connection per (worker, channel) pair, instancy multiplexes all channels to the same peer over a small number of pooled connections. The pool delegates all connection establishment to the application's `ConnectionManager`, so the library never touches sockets directly. This dramatically reduces connection count in large clusters and supports arbitrarily complex networking topologies.
 
 ### 12.5 Dynamic Cluster Scaling
 
-async-timely supports **dynamic cluster scaling** — nodes can be added to or removed from the cluster at runtime. The hosting application is responsible for detecting node changes (health checks, service discovery, autoscaler events, connection failures) and notifying the timely runtime. The library does **not** perform its own node discovery or health monitoring.
+instancy supports **dynamic cluster scaling** — nodes can be added to or removed from the cluster at runtime. The hosting application is responsible for detecting node changes (health checks, service discovery, autoscaler events, connection failures) and notifying the timely runtime. The library does **not** perform its own node discovery or health monitoring.
 
 #### Responsibilities
 
@@ -2577,7 +2577,7 @@ impl ClusterMembership for K8sClusterMembership {
 
 ### 12.6 Checkpointing
 
-async-timely supports **consumer-defined checkpointing** via a `Checkpoint` operator that can be inserted at any point in the dataflow graph. Timestamps provide a natural checkpoint boundary — all data up to a given frontier has been fully processed.
+instancy supports **consumer-defined checkpointing** via a `Checkpoint` operator that can be inserted at any point in the dataflow graph. Timestamps provide a natural checkpoint boundary — all data up to a given frontier has been fully processed.
 
 #### Checkpoint Trait
 
@@ -2645,7 +2645,7 @@ where
 
 ### 12.6 Throughput & Resource Management
 
-A dataflow system's value is directly proportional to its throughput under constrained resources. async-timely's architecture has four major throughput domains — data ingestion, computation, network exchange, and output emission — each with distinct bottleneck patterns and tuning levers. This section describes how the system maximizes end-to-end throughput while staying within resource budgets, and how backpressure ties the domains together so no single domain overwhelms the others.
+A dataflow system's value is directly proportional to its throughput under constrained resources. instancy's architecture has four major throughput domains — data ingestion, computation, network exchange, and output emission — each with distinct bottleneck patterns and tuning levers. This section describes how the system maximizes end-to-end throughput while staying within resource budgets, and how backpressure ties the domains together so no single domain overwhelms the others.
 
 #### 12.6.1 Data Ingestion Throughput
 
