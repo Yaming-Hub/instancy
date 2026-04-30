@@ -44,6 +44,7 @@
 | Checkpointing | Not supported | Extensible checkpoint operators using timestamp boundaries |
 | Parallelism | Uniform: all operators share the same worker count | Per-region: execution regions can have different parallelism; explicit repartition at boundaries |
 | Cluster scaling | Static: all nodes must be known at startup | Dynamic: application notifies runtime of node joins/departures; routing tables rebuild on the fly |
+| Multi-dataflow | One worker owns its dataflows; implicit isolation via thread-local state | Explicit DataflowId in frame headers; shared connections demux by (dataflow_id, channel_id) |
 
 ---
 
@@ -1954,13 +1955,66 @@ pub struct PoolConfig {
 Each connection carries multiplexed channels using a simple framing protocol:
 
 ```
-┌───────────┬───────────┬──────────────────┐
-│ channel_id│ length    │ payload (codec)  │
-│ (u64)     │ (u32)     │ (variable)       │
-└───────────┴───────────┴──────────────────┘
+┌───────────┬───────────┬───────────┬──────────────────┐
+│ dataflow_id│ channel_id│ length    │ payload (codec)  │
+│ (u64)      │ (u64)     │ (u32)     │ (variable)       │
+└───────────┴───────────┴───────────┴──────────────────┘
 ```
 
-A background demux task reads frames from a connection and dispatches them to the appropriate channel's `mpsc::Sender`.
+The `dataflow_id` field ensures that frames from different dataflows sharing the same pooled connection are never misrouted. Each dataflow is assigned a cluster-unique `DataflowId` at construction time.
+
+A background demux task reads frames from a connection and dispatches them to the appropriate (dataflow, channel) pair's `mpsc::Sender`.
+
+### 6.5 Dataflow Isolation
+
+Multiple dataflows can run concurrently on the same cluster, sharing the same worker thread pool and the same pooled network connections. Isolation between dataflows is maintained at multiple levels:
+
+#### Logical Isolation
+
+Each dataflow is an independent computation graph with:
+- Its own `DataflowId` (cluster-unique `u64`, assigned by the runtime)
+- Its own operator registry (operator index 3 in dataflow A ≠ operator index 3 in dataflow B)
+- Its own channel wiring (each edge gets push/pull endpoints scoped to that dataflow)
+- Its own progress tracker instance (frontiers are independent)
+- Its own `DataflowMetrics` and `CancellationToken`
+
+Operators in dataflow A **never** share input/output buffers with operators in dataflow B. The `TransportProvider` resolves `LogicalTarget` using the specific dataflow's channel map — there is no global operator namespace.
+
+#### Physical Isolation on Shared Connections
+
+When two dataflows share a pooled TCP connection to the same peer:
+- Each frame includes a `dataflow_id` field in its wire header
+- The demuxer dispatches frames to the correct dataflow's channel receivers based on `(dataflow_id, channel_id)` pair
+- A frame with an unknown `dataflow_id` is logged and dropped (e.g., if the dataflow was cancelled but in-flight frames remain)
+
+#### DataflowId Assignment
+
+```rust
+/// Cluster-unique identifier for a running dataflow instance.
+///
+/// This is a **logical** concept — it identifies a specific computation graph
+/// instance. Multiple dataflows with different IDs can run concurrently on
+/// the same physical infrastructure.
+#[derive(Debug, Clone, Copy, Hash, Eq, PartialEq, Ord, PartialOrd)]
+pub struct DataflowId(pub u64);
+```
+
+DataflowIds are assigned by the local runtime using an atomic counter. To ensure cluster-wide uniqueness without coordination, the ID encodes `(node_index << 48) | local_sequence`. This guarantees uniqueness as long as each node processes fewer than 2^48 dataflows (≈281 trillion).
+
+#### Worker Sharing
+
+Logical workers (`WorkerId`) are **per-dataflow**. Dataflow A's `WorkerId(0)` and dataflow B's `WorkerId(0)` are distinct logical entities. However, they may execute on the same physical OS thread in the worker pool. The scheduler distinguishes them by `(DataflowId, WorkerId)` to maintain per-worker FIFO ordering.
+
+#### Summary: Where DataflowId Appears
+
+| Layer | How DataflowId is Used |
+|---|---|
+| Logical | Scopes operator/channel allocation; included in LogicalTarget |
+| Scheduler | `(DataflowId, WorkerId)` ensures FIFO per logical worker per dataflow |
+| Transport (intra-process) | Buffers are per-dataflow — no sharing |
+| Transport (inter-process) | Frame header field for demux routing |
+| Progress | Each dataflow has independent frontier tracking |
+| Metrics | Each dataflow has its own DataflowMetrics |
 
 ---
 
