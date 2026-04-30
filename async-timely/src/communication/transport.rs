@@ -116,7 +116,12 @@ mod tokio_impl {
         }
 
         /// Write multiple frames, flushing once at the end for better throughput.
+        ///
+        /// All frames are validated for size before any data is written, ensuring
+        /// atomicity: either all frames are written or none are (on size error).
+        /// I/O errors mid-batch are still possible and should be treated as fatal.
         pub async fn write_frames(&mut self, frames: &[Frame]) -> Result<(), TransportError> {
+            // Pre-validate all sizes before writing any bytes
             for frame in frames {
                 let len = frame.payload.len();
                 if len > MAX_MESSAGE_SIZE {
@@ -125,7 +130,10 @@ mod tokio_impl {
                         max: MAX_MESSAGE_SIZE,
                     });
                 }
+            }
 
+            for frame in frames {
+                let len = frame.payload.len();
                 let mut header = [0u8; HEADER_SIZE];
                 header[..8].copy_from_slice(&frame.channel_id.to_le_bytes());
                 header[8..12].copy_from_slice(&(len as u32).to_le_bytes());
@@ -164,15 +172,26 @@ mod tokio_impl {
         /// - [`TransportError::PayloadTooLarge`] if the declared length exceeds max
         /// - [`TransportError::Io`] on read failure (including unexpected EOF mid-frame)
         pub async fn read_frame(&mut self) -> Result<Frame, TransportError> {
-            // Read header
+            // Read header byte-by-byte to distinguish clean EOF from mid-header disconnect.
+            // A clean close is when we get 0 bytes before reading any header data.
+            // A partial header read indicates a protocol error or peer crash.
             let mut header = [0u8; HEADER_SIZE];
-            match self.reader.read_exact(&mut header).await {
-                Ok(_) => {}
-                Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => {
-                    // Check if we got zero bytes (clean close) vs partial header
-                    return Err(TransportError::ConnectionClosed);
+            let mut pos = 0;
+            while pos < HEADER_SIZE {
+                match self.reader.read(&mut header[pos..]).await {
+                    Ok(0) => {
+                        if pos == 0 {
+                            return Err(TransportError::ConnectionClosed);
+                        } else {
+                            return Err(TransportError::Io(io::Error::new(
+                                io::ErrorKind::UnexpectedEof,
+                                "connection closed mid-header",
+                            )));
+                        }
+                    }
+                    Ok(n) => pos += n,
+                    Err(e) => return Err(TransportError::Io(e)),
                 }
-                Err(e) => return Err(TransportError::Io(e)),
             }
 
             let channel_id = u64::from_le_bytes(header[..8].try_into().unwrap());
@@ -230,7 +249,16 @@ mod tokio_impl {
     ///
     /// The demuxer runs as a background task. It reads frames from the underlying
     /// stream and routes them to registered channel receivers. If a channel
-    /// receiver is dropped, the frame is discarded (logged if tracing is enabled).
+    /// receiver is dropped, the frame is discarded.
+    ///
+    /// # Backpressure
+    ///
+    /// The demuxer applies **per-channel backpressure**: when a channel's buffer
+    /// is full, the demuxer awaits until the receiver drains capacity. This means
+    /// a single slow consumer can block delivery to all other channels on the same
+    /// connection. This is intentional — in a dataflow system, dropping frames
+    /// would violate correctness. Callers that need isolation should use separate
+    /// connections per channel or spawn per-channel forwarding tasks.
     pub struct Demuxer<R> {
         reader: FramedReader<R>,
         channels: HashMap<u64, mpsc::Sender<Vec<u8>>>,
