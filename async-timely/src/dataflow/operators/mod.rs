@@ -15,6 +15,7 @@
 //! - [`gather`]: Funnel all data to a single worker
 //! - [`broadcast`]: Fan-out data to all workers
 //! - [`branch`]: Conditional stream splitting (branch + ok_err)
+//! - [`feedback`]: Loop-back edges for iterative computation
 
 pub mod input;
 pub mod output;
@@ -30,6 +31,7 @@ pub mod rebalance;
 pub mod gather;
 pub mod broadcast;
 pub mod branch;
+pub mod feedback;
 
 #[cfg(test)]
 mod pipeline_tests;
