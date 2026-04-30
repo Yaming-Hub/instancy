@@ -9,8 +9,10 @@ license = "MIT"
 thiserror = "2"
 crossbeam-deque = "0.8"
 crossbeam-utils = "0.8"
+tracing = { version = "0.1", optional = true }
 
 [dev-dependencies]
 
 [features]
-default = []
+default = ["tracing"]
+tracing = ["dep:tracing"]

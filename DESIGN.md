@@ -1177,25 +1177,126 @@ This also enables future extensions like per-record error tagging or priority si
 
 ### 5.9 Error Handling Policy
 
-Each dataflow specifies how errors should be handled:
+Dataflows operate in environments where many types of failures can occur. The system classifies errors into categories and provides configurable policies for each.
+
+#### 5.9.1 Error Taxonomy
+
+```rust
+/// Categories of errors that can occur during dataflow execution.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ErrorKind {
+    /// The operator's user-provided logic returned an error.
+    /// Examples: invalid data format, business logic violation, missing lookup key.
+    ComputeError,
+    /// The operator's user-provided logic panicked (caught via catch_unwind).
+    /// Examples: index out of bounds, unwrap on None, assertion failure in user code.
+    ComputePanic,
+    /// An operator exceeded its time budget for a single activation.
+    /// Indicates runaway computation or unexpectedly large input.
+    ComputeTimeout,
+    /// A network operation failed: connection lost, send/receive timeout.
+    /// Applies to inter-process data exchange channels.
+    NetworkError,
+    /// A remote worker is no longer reachable (heartbeat lost, process crashed).
+    /// The affected region/partition cannot make progress.
+    WorkerLost,
+    /// The dataflow was explicitly cancelled via CancellationToken.
+    Cancelled,
+    /// An internal system error (bug in the framework, not user code).
+    Internal,
+}
+```
+
+#### 5.9.2 Error Policy Configuration
+
+Each dataflow specifies how errors should be handled, with per-category granularity:
 
 ```rust
 /// Determines how operator errors are handled within a dataflow.
+#[derive(Clone, Debug)]
+pub struct ErrorPolicy {
+    /// Policy for user compute errors (operator logic returns Err).
+    pub on_compute_error: ErrorAction,
+    /// Policy for user compute panics (caught via catch_unwind).
+    pub on_compute_panic: ErrorAction,
+    /// Policy for compute timeouts.
+    pub on_compute_timeout: ErrorAction,
+    /// Policy for network failures.
+    pub on_network_error: ErrorAction,
+    /// Policy for lost workers.
+    pub on_worker_lost: ErrorAction,
+    /// Optional callback invoked for every error regardless of action.
+    /// Used for logging, alerting, dead-letter routing, metrics.
+    pub on_error_callback: Option<Arc<dyn Fn(&Error, ErrorKind) + Send + Sync>>,
+}
+
+/// What to do when an error of a specific kind occurs.
 #[derive(Clone, Debug, Default)]
-pub enum ErrorPolicy {
-    /// Stop the entire dataflow on the first operator error.
-    /// The error is propagated to the `execute()` caller.
-    /// This is the default and safest option.
+pub enum ErrorAction {
+    /// Stop the entire dataflow immediately.
+    /// The error propagates to execute() as Err(e).
     #[default]
     Stop,
-    /// Log the error and skip the offending record/batch.
-    /// The dataflow continues processing remaining data.
-    /// Useful for best-effort pipelines where some data loss is acceptable.
-    Ignore {
-        /// Optional callback invoked for each skipped error.
-        /// Can be used for alerting, counting, or dead-letter routing.
-        on_error: Option<Arc<dyn Fn(&Error) + Send + Sync>>,
+    /// Skip the offending record/batch and continue processing.
+    /// The error is logged and counted in DataflowMetrics.
+    Skip,
+    /// Retry the operation up to N times with exponential backoff.
+    /// After exhausting retries, falls back to the specified action.
+    Retry {
+        max_retries: u32,
+        backoff_base: Duration,
+        fallback: Box<ErrorAction>,
     },
+}
+
+impl Default for ErrorPolicy {
+    fn default() -> Self {
+        Self {
+            on_compute_error: ErrorAction::Stop,
+            on_compute_panic: ErrorAction::Stop,
+            on_compute_timeout: ErrorAction::Stop,
+            on_network_error: ErrorAction::Stop,
+            on_worker_lost: ErrorAction::Stop,
+            on_error_callback: None,
+        }
+    }
+}
+```
+
+Convenience constructors:
+
+```rust
+impl ErrorPolicy {
+    /// Stop on any error (default, safest).
+    pub fn strict() -> Self { Self::default() }
+
+    /// Skip compute errors/panics, stop on infrastructure failures.
+    pub fn best_effort() -> Self {
+        Self {
+            on_compute_error: ErrorAction::Skip,
+            on_compute_panic: ErrorAction::Skip,
+            on_compute_timeout: ErrorAction::Skip,
+            on_network_error: ErrorAction::Stop,
+            on_worker_lost: ErrorAction::Stop,
+            on_error_callback: None,
+        }
+    }
+
+    /// Retry network errors, skip compute errors, stop on worker loss.
+    pub fn resilient() -> Self {
+        Self {
+            on_compute_error: ErrorAction::Skip,
+            on_compute_panic: ErrorAction::Stop,
+            on_compute_timeout: ErrorAction::Skip,
+            on_network_error: ErrorAction::Retry {
+                max_retries: 3,
+                backoff_base: Duration::from_millis(100),
+                fallback: Box::new(ErrorAction::Stop),
+            },
+            on_worker_lost: ErrorAction::Stop,
+            on_error_callback: None,
+        }
+    }
 }
 ```
 
@@ -1205,14 +1306,145 @@ The policy is set in `DataflowConfig`:
 pub struct DataflowConfig {
     pub cluster: ClusterTopology,
     pub cancellation_token: CancellationToken,
-    /// How to handle operator errors. Default: Stop.
+    /// How to handle errors. Default: strict (stop on any error).
     pub error_policy: ErrorPolicy,
 }
 ```
 
-When an operator returns `Err(e)`:
-- **`ErrorPolicy::Stop`**: The error is sent as `Envelope::Control(Error { .. })` downstream, all operators observe it and exit, and `execute()` returns `Err(e)`.
-- **`ErrorPolicy::Ignore`**: The error is logged (and the callback invoked if set), the current batch is skipped, and the operator continues with the next activation. A count of skipped errors is included in `DataflowMetrics`.
+#### 5.9.3 Operator Logic Error Handling
+
+Custom operator logic (unary, binary closures) returns `Result<()>`. When an error is returned:
+
+```
+Operator activate() returns Err(e)
+  │
+  ├─ Classify: ErrorKind::ComputeError
+  │
+  ├─ Invoke on_error_callback (if set) for observability
+  │
+  └─ Apply policy.on_compute_error:
+       ├─ Stop → send Control::Error downstream → all operators exit → execute() returns Err
+       ├─ Skip → discard current batch, log, increment error_count → continue next activation
+       └─ Retry → re-invoke activate() with same input → on exhaustion, apply fallback
+```
+
+For panics, the runtime wraps operator activation in `std::panic::catch_unwind`:
+
+```rust
+// Conceptual runtime activation loop
+let result = std::panic::catch_unwind(AssertUnwindSafe(|| {
+    operator.activate(&mut input, &mut output)
+}));
+
+match result {
+    Ok(Ok(())) => { /* success, drain output */ }
+    Ok(Err(e)) => { /* ComputeError — apply policy */ }
+    Err(panic_payload) => { /* ComputePanic — apply policy */ }
+}
+```
+
+This ensures user logic panics never crash the worker thread pool — they are caught, classified, and handled according to policy.
+
+#### 5.9.4 Compute Timeout
+
+Each operator activation has an optional time budget:
+
+```rust
+pub struct DataflowConfig {
+    // ...
+    /// Maximum wall-clock time for a single operator activation.
+    /// None means no timeout (operator runs until completion).
+    pub activation_timeout: Option<Duration>,
+}
+```
+
+If an activation exceeds the timeout:
+1. The runtime signals the activation to abort (via a flag checked periodically).
+2. If the operator does not exit within a grace period, the activation is forcibly cancelled.
+3. The error is classified as `ErrorKind::ComputeTimeout` and handled per policy.
+
+**Design note**: Since operator logic runs synchronously within an async task, true preemption is not possible. The operator must cooperate by checking a timeout flag periodically for large batches. The runtime provides a helper:
+
+```rust
+/// Check if the current activation has exceeded its time budget.
+/// Call this periodically in long-running operator logic.
+pub fn check_timeout(ctx: &ActivationContext) -> Result<()> {
+    if ctx.is_timed_out() {
+        Err(Error::timeout("operator activation exceeded time budget"))
+    } else {
+        Ok(())
+    }
+}
+```
+
+#### 5.9.5 Network and Worker Failures
+
+| Failure | Detection | Handling |
+|---|---|---|
+| Connection timeout | Send/recv deadline | `ErrorKind::NetworkError` → policy |
+| Connection reset | I/O error on channel | `ErrorKind::NetworkError` → reconnect via pool, then retry |
+| Worker lost | Heartbeat timeout | `ErrorKind::WorkerLost` → policy |
+| Remote process crash | Connection pool detects all connections to peer failed | `ErrorKind::WorkerLost` → policy |
+
+For `ErrorAction::Retry` on network errors:
+1. The failed send/receive is retried after exponential backoff.
+2. If the connection is dead, the connection pool establishes a new one.
+3. After `max_retries`, the fallback action (typically `Stop`) is applied.
+
+For `ErrorAction::Stop` on worker loss:
+1. The affected operator(s) are terminated.
+2. A `Control::Error` message propagates through the dataflow.
+3. `execute()` returns with the error describing which worker was lost.
+
+#### 5.9.6 Error Propagation Flow
+
+```
+Error in Operator B (worker 2)
+  │
+  ├─ Policy says Stop:
+  │    ├─ B sends Control::Error to downstream operators
+  │    ├─ Downstream operators receive error, drop capabilities, exit
+  │    ├─ Progress tracker detects all operators done
+  │    └─ execute() returns Err(OperatorError { source: "B", worker: 2, cause: ... })
+  │
+  └─ Policy says Skip:
+       ├─ B discards current input batch
+       ├─ B increments metrics.skipped_errors
+       ├─ B continues processing next batch normally
+       └─ execute() eventually returns Ok(()) with metrics showing skipped count
+```
+
+#### 5.9.7 Error Context and Reporting
+
+Errors carry rich context for debugging:
+
+```rust
+/// Error produced during dataflow execution with full context.
+pub struct DataflowError {
+    /// The underlying error.
+    pub cause: Error,
+    /// Which category of error occurred.
+    pub kind: ErrorKind,
+    /// The operator that produced the error.
+    pub operator_name: String,
+    /// The operator's index in the scope.
+    pub operator_index: usize,
+    /// Which worker instance hit the error.
+    pub worker_index: usize,
+    /// The timestamp(s) being processed when the error occurred.
+    pub at_timestamp: Option<String>,
+    /// Number of records in the batch being processed.
+    pub batch_size: Option<usize>,
+    /// How many times this operation was retried before failing.
+    pub retry_count: u32,
+}
+```
+
+This structured error enables:
+- Pinpointing exactly where failures occur in complex dataflows
+- Correlating errors with specific timestamps/epochs
+- Understanding retry behavior before final failure
+- Dead-letter routing with full provenance
 
 ### 5.10 Per-Stage Dynamic Parallelism (Execution Regions)
 

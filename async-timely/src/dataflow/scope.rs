@@ -11,6 +11,7 @@ use std::fmt;
 use std::sync::{Arc, Mutex};
 
 use crate::error::Result;
+use crate::order::Product;
 use crate::progress::timestamp::Timestamp;
 
 use super::region::{Region, RegionAllocator, RegionId};
@@ -90,6 +91,12 @@ pub trait Scope: Clone + 'static {
     /// Create a new execution region with the given parallelism.
     /// Returns the region ID for use with subsequent operators.
     fn new_region(&mut self, parallelism: usize) -> RegionId;
+
+    /// Allocate the next ingress (enter) slot index for the scope boundary.
+    fn allocate_ingress_slot(&mut self) -> usize;
+
+    /// Allocate the next egress (leave) slot index for the scope boundary.
+    fn allocate_egress_slot(&mut self) -> usize;
 }
 
 /// Mutable state shared across all clones of a scope.
@@ -103,6 +110,10 @@ struct ScopeState {
     regions: Vec<Region>,
     /// The index of the current default region.
     current_region_index: usize,
+    /// Next ingress (enter) slot index for the scope boundary operator.
+    next_ingress_slot: usize,
+    /// Next egress (leave) slot index for the scope boundary operator.
+    next_egress_slot: usize,
 }
 
 /// The root-level scope for a dataflow.
@@ -136,6 +147,8 @@ impl<T: Timestamp> RootScope<T> {
                 region_allocator,
                 regions: vec![default_region],
                 current_region_index: 0,
+                next_ingress_slot: 0,
+                next_egress_slot: 0,
             })),
             _phantom: std::marker::PhantomData,
         }
@@ -158,6 +171,22 @@ impl<T: Timestamp> RootScope<T> {
     /// Get all regions in this scope (snapshot).
     pub fn regions(&self) -> Vec<Region> {
         self.state.lock().unwrap().regions.clone()
+    }
+
+    /// Create a nested child scope for iterative computation.
+    ///
+    /// The child scope uses `Product<T, TInner>` timestamps, where `TInner`
+    /// tracks the iteration counter. Operators inside the child scope see
+    /// the combined timestamp and can distinguish iterations.
+    ///
+    /// The child scope inherits the same parallelism as the parent's current region.
+    pub fn iterative<TInner: Timestamp>(&mut self, name: impl Into<String>) -> ChildScope<Product<T, TInner>>
+    where
+        Product<T, TInner>: Timestamp,
+    {
+        let child_index = self.allocate_operator_index();
+        let parallelism = self.current_region().parallelism();
+        ChildScope::new(name, &self.addr(), child_index, parallelism)
     }
 }
 
@@ -200,9 +229,21 @@ impl<T: Timestamp> Scope for RootScope<T> {
         state.regions.push(region);
         id
     }
-}
 
-/// A child scope for nested dataflows (e.g., loops).
+    fn allocate_ingress_slot(&mut self) -> usize {
+        let mut state = self.state.lock().unwrap();
+        let slot = state.next_ingress_slot;
+        state.next_ingress_slot += 1;
+        slot
+    }
+
+    fn allocate_egress_slot(&mut self) -> usize {
+        let mut state = self.state.lock().unwrap();
+        let slot = state.next_egress_slot;
+        state.next_egress_slot += 1;
+        slot
+    }
+}
 ///
 /// The child scope has a timestamp type that extends the parent's timestamp
 /// (typically `Product<TOuter, TInner>`). Cloning shares state.
@@ -220,6 +261,9 @@ pub struct ChildScope<T: Timestamp> {
 
 impl<T: Timestamp> ChildScope<T> {
     /// Create a new child scope nested under a parent.
+    ///
+    /// Operator index 0 is reserved for the scope boundary (ingress/egress
+    /// metadata used by the progress tracker). User operators start at index 1.
     pub fn new(
         name: impl Into<String>,
         parent_addr: &ScopeAddr,
@@ -233,13 +277,28 @@ impl<T: Timestamp> ChildScope<T> {
             name: Arc::new(name.into()),
             addr: parent_addr.child(child_index),
             state: Arc::new(Mutex::new(ScopeState {
-                next_operator_index: 0,
+                // Start at 1: index 0 is reserved for scope boundary metadata.
+                next_operator_index: 1,
                 region_allocator,
                 regions: vec![default_region],
                 current_region_index: 0,
+                next_ingress_slot: 0,
+                next_egress_slot: 0,
             })),
             _phantom: std::marker::PhantomData,
         }
+    }
+
+    /// Create a further-nested child scope for iterative computation.
+    ///
+    /// Enables nested loops: an iterative scope inside another iterative scope.
+    pub fn iterative<TInner: Timestamp>(&mut self, name: impl Into<String>) -> ChildScope<Product<T, TInner>>
+    where
+        Product<T, TInner>: Timestamp,
+    {
+        let child_index = self.allocate_operator_index();
+        let parallelism = self.current_region().parallelism();
+        ChildScope::new(name, &self.addr(), child_index, parallelism)
     }
 }
 
@@ -281,6 +340,20 @@ impl<T: Timestamp> Scope for ChildScope<T> {
         let id = region.id();
         state.regions.push(region);
         id
+    }
+
+    fn allocate_ingress_slot(&mut self) -> usize {
+        let mut state = self.state.lock().unwrap();
+        let slot = state.next_ingress_slot;
+        state.next_ingress_slot += 1;
+        slot
+    }
+
+    fn allocate_egress_slot(&mut self) -> usize {
+        let mut state = self.state.lock().unwrap();
+        let slot = state.next_egress_slot;
+        state.next_egress_slot += 1;
+        slot
     }
 }
 
@@ -368,9 +441,10 @@ mod tests {
         let parent_addr = ScopeAddr::root();
         let mut scope = ChildScope::<u64>::new("inner", &parent_addr, 0, 4);
 
-        assert_eq!(scope.allocate_operator_index(), 0);
+        // Index 0 is reserved for scope boundary; first user allocation is 1
         assert_eq!(scope.allocate_operator_index(), 1);
-        assert_eq!(scope.operator_count(), 2);
+        assert_eq!(scope.allocate_operator_index(), 2);
+        assert_eq!(scope.operator_count(), 3); // includes reserved index 0
     }
 
     #[test]
