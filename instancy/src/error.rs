@@ -1,6 +1,6 @@
-//! Error types for async-timely.
+//! Error types for instancy.
 
-/// The main error type for async-timely operations.
+/// The main error type for instancy operations.
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
     /// An I/O error occurred.
@@ -49,6 +49,16 @@ pub enum Error {
     /// A custom error message.
     #[error("{0}")]
     Custom(String),
+
+    /// A remote node was lost (disconnected or removed from cluster).
+    /// Contains the physical node index that departed.
+    #[error("Node lost: physical node {node_index} departed ({reason})")]
+    NodeLost {
+        /// The physical node index that was lost.
+        node_index: usize,
+        /// Human-readable reason for the departure.
+        reason: String,
+    },
 }
 
 impl Error {

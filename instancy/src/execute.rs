@@ -12,7 +12,7 @@ use crate::scheduler::batching::BatchingPolicy;
 use crate::worker::WorkerId;
 use crate::worker_pool::WorkerPoolConfig;
 
-/// Configuration for the async-timely runtime.
+/// Configuration for the instancy runtime.
 #[derive(Debug, Clone)]
 pub struct RuntimeConfig {
     /// Worker thread pool configuration.
@@ -91,45 +91,53 @@ impl Default for ErrorPolicy {
     }
 }
 
-/// Describes the worker topology of a node in the cluster.
+/// Configuration for a physical node (OS process) in the cluster.
+///
+/// This is a **physical** concept — each `NodeConfig` corresponds to one
+/// OS process. A node hosts one or more logical workers. The `node_index`
+/// identifies the process within the physical cluster topology.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct NodeConfig {
-    /// Unique index of this node in the cluster.
+    /// Physical node index — identifies this OS process in the cluster.
     pub node_index: usize,
-    /// Number of logical workers hosted by this node.
-    pub workers: usize,
+    /// Number of logical workers hosted by this physical node.
+    pub logical_workers: usize,
 }
 
 impl NodeConfig {
     /// Create a new node config.
-    pub fn new(node_index: usize, workers: usize) -> Self {
-        Self { node_index, workers }
+    pub fn new(node_index: usize, logical_workers: usize) -> Self {
+        Self { node_index, logical_workers }
     }
 }
 
-/// Cluster topology: describes all nodes and their worker assignments.
+/// Physical cluster topology: describes all nodes and their logical worker assignments.
+///
+/// This is a **physical** layout — it describes how many OS processes exist
+/// and how logical workers are distributed across them. The runtime uses this
+/// to determine which workers are local vs remote and to assign global worker indices.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ClusterTopology {
-    /// Configuration for each node in the cluster.
+    /// Configuration for each physical node in the cluster.
     pub nodes: Vec<NodeConfig>,
 }
 
 impl ClusterTopology {
-    /// Create a single-node topology with the given number of workers.
-    pub fn single_node(workers: usize) -> Self {
+    /// Create a single-node topology with the given number of logical workers.
+    pub fn single_node(logical_workers: usize) -> Self {
         Self {
-            nodes: vec![NodeConfig::new(0, workers)],
+            nodes: vec![NodeConfig::new(0, logical_workers)],
         }
     }
 
-    /// Create a multi-node topology from a list of (node_index, workers) pairs.
+    /// Create a multi-node topology from a list of node configs.
     /// Nodes are sorted by `node_index` to ensure consistent worker range assignment.
     pub fn multi_node(mut configs: Vec<NodeConfig>) -> Result<Self, Error> {
         if configs.is_empty() {
             return Err(Error::Custom("cluster must have at least one node".into()));
         }
         for config in &configs {
-            if config.workers == 0 {
+            if config.logical_workers == 0 {
                 return Err(Error::Custom(format!(
                     "node {} must have at least 1 worker",
                     config.node_index
@@ -140,33 +148,33 @@ impl ClusterTopology {
         Ok(Self { nodes: configs })
     }
 
-    /// Total number of logical workers across all nodes.
+    /// Total number of logical workers across all physical nodes.
     pub fn total_workers(&self) -> usize {
-        self.nodes.iter().map(|n| n.workers).sum()
+        self.nodes.iter().map(|n| n.logical_workers).sum()
     }
 
-    /// Get the range of global worker IDs for a given node.
+    /// Get the range of global logical worker IDs for a given physical node.
     ///
-    /// Returns `(start, end)` where workers are `start..end`.
+    /// Returns `(start, end)` where logical workers are `start..end`.
     pub fn worker_range(&self, node_index: usize) -> Option<(usize, usize)> {
         let mut offset = 0;
         for node in &self.nodes {
             if node.node_index == node_index {
-                return Some((offset, offset + node.workers));
+                return Some((offset, offset + node.logical_workers));
             }
-            offset += node.workers;
+            offset += node.logical_workers;
         }
         None
     }
 
-    /// Determine which node a worker belongs to.
+    /// Determine which physical node a logical worker belongs to.
     pub fn node_for_worker(&self, worker_id: WorkerId) -> Option<usize> {
         let mut offset = 0;
         for node in &self.nodes {
-            if worker_id.index() < offset + node.workers {
+            if worker_id.index() < offset + node.logical_workers {
                 return Some(node.node_index);
             }
-            offset += node.workers;
+            offset += node.logical_workers;
         }
         None
     }

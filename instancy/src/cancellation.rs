@@ -22,7 +22,7 @@
 //! # Usage
 //!
 //! ```
-//! use async_timely::cancellation::CancellationToken;
+//! use instancy::cancellation::CancellationToken;
 //!
 //! let token = CancellationToken::new();
 //! let child = token.child_token();

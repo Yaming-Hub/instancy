@@ -17,6 +17,11 @@ use crate::progress::timestamp::Timestamp;
 use super::region::{Region, RegionAllocator, RegionId};
 
 /// A unique address within the dataflow graph.
+///
+/// This is a **logical** concept — it identifies an operator's position in the
+/// nested scope hierarchy. It has no relation to physical machine addresses
+/// or network locations.
+///
 /// Each element identifies a nesting level; the full path locates
 /// an operator within possibly nested scopes.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]

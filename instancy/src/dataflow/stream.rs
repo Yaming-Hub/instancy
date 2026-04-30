@@ -10,12 +10,15 @@ use super::channels::PartitionStrategy;
 use super::region::RegionId;
 use super::scope::Scope;
 
-/// Identifies a specific input or output slot on an operator.
+/// Identifies a specific input or output slot on a logical operator.
+///
+/// This is a **logical** concept — it references an operator's port in the
+/// dataflow graph, not a physical processor core or memory location.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct Slot {
-    /// The operator index within its scope.
+    /// The logical operator index within its scope.
     pub operator_index: usize,
-    /// The slot number (0 for single-output operators, 0=left/1=right for binary inputs).
+    /// The logical slot number (0 for single-output operators, 0=left/1=right for binary inputs).
     pub slot_index: usize,
 }
 
@@ -35,10 +38,13 @@ impl fmt::Display for Slot {
     }
 }
 
-/// A connection target for a stream edge.
+/// A logical connection target for a stream edge.
+///
+/// This is a **logical** concept — it describes where data flows in the graph,
+/// not how it is physically delivered (that is the transport layer's job).
 #[derive(Debug, Clone)]
 pub struct StreamTarget {
-    /// The target slot (operator + slot index).
+    /// The logical target slot (operator + slot index).
     pub slot: Slot,
     /// The partition strategy used to route data to this target.
     pub pact: String, // Strategy name for debugging; actual routing is in the channel.

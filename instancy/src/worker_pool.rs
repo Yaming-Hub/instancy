@@ -209,7 +209,7 @@ impl WorkerPool {
 
         let state = self.state.clone();
         let handle = thread::Builder::new()
-            .name("async-timely-worker".to_string())
+            .name("instancy-worker".to_string())
             .spawn(move || {
                 worker_thread_loop(&state);
                 // thread_count is decremented inside the loop on idle exit,
@@ -227,7 +227,7 @@ impl WorkerPool {
 
         let state = self.state.clone();
         let handle = thread::Builder::new()
-            .name("async-timely-worker".to_string())
+            .name("instancy-worker".to_string())
             .spawn(move || {
                 worker_thread_loop(&state);
             })
