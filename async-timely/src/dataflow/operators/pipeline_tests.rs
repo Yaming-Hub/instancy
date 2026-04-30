@@ -583,4 +583,108 @@ mod tests {
         assert_eq!(results[1], (1, vec![20]));  // 10*2
         assert_eq!(results[2], (2, vec![30]));  // 15*2
     }
+
+    /// End-to-end: chaining exchange → unary → gather → probe at DataStream level.
+    #[test]
+    fn pipeline_exchange_gather_probe() {
+        use crate::dataflow::operators::exchange::ExchangeExt;
+        use crate::dataflow::operators::gather::GatherExt;
+        use crate::dataflow::operators::probe::ProbeExt;
+        use crate::dataflow::operators::unary::UnaryExt;
+        use crate::dataflow::scope::{RootScope, Scope};
+        use crate::dataflow::stream::{DataStream, Slot};
+
+        let mut scope = RootScope::<u64>::new("pipeline", 4);
+        let region_id = scope.current_region().id();
+        let src_idx = scope.allocate_operator_index();
+        let source = Slot::new(src_idx, 0);
+        let stream: DataStream<RootScope<u64>, (u64, i32)> =
+            DataStream::new(scope, source, region_id);
+
+        // Chain: exchange(by key) → exchange_to(16) → unary → gather → probe
+        let handle = stream
+            .exchange(|r: &(u64, i32)| r.0)
+            .exchange_to(16, |r: &(u64, i32)| r.0)
+            .unary("process", |input, output| {
+                while let Some((time, data)) = input.next() {
+                    let mut session = output.session(time);
+                    for item in data { session.give(item); }
+                }
+                Ok(())
+            })
+            .gather()
+            .probe("final");
+
+        assert!(!handle.done());
+    }
+
+    /// Pipeline with rebalance → broadcast → inspect.
+    #[test]
+    fn pipeline_rebalance_broadcast_chain() {
+        use crate::dataflow::operators::broadcast::BroadcastExt;
+        use crate::dataflow::operators::inspect::InspectExt;
+        use crate::dataflow::operators::rebalance::RebalanceExt;
+        use crate::dataflow::scope::{RootScope, Scope};
+        use crate::dataflow::stream::{DataStream, Slot};
+
+        let mut scope = RootScope::<u64>::new("pipeline", 4);
+        let region_id = scope.current_region().id();
+        let src_idx = scope.allocate_operator_index();
+        let source = Slot::new(src_idx, 0);
+        let stream: DataStream<RootScope<u64>, i32> =
+            DataStream::new(scope, source, region_id);
+
+        // Chain: rebalance_to(8) → broadcast → broadcast_local → inspect
+        let _output = stream
+            .rebalance_to(8)
+            .broadcast()
+            .broadcast_local()
+            .inspect("observe", |_time, _data| {});
+
+        // Verify regions were created correctly
+        assert_ne!(_output.region_id(), region_id);
+    }
+
+    /// Verify region transitions through a multi-repartition pipeline.
+    #[test]
+    fn pipeline_region_transitions() {
+        use crate::dataflow::operators::exchange::ExchangeExt;
+        use crate::dataflow::operators::gather::GatherExt;
+        use crate::dataflow::operators::rebalance::RebalanceExt;
+        use crate::dataflow::scope::{RootScope, Scope};
+        use crate::dataflow::stream::{DataStream, Slot};
+
+        let mut scope = RootScope::<u64>::new("test", 4);
+        let r0 = scope.current_region().id();
+        let src_idx = scope.allocate_operator_index();
+        let source = Slot::new(src_idx, 0);
+        let stream: DataStream<RootScope<u64>, i32> =
+            DataStream::new(scope.clone(), source, r0);
+
+        // exchange same parallelism → same region
+        let s1 = stream.exchange(|x: &i32| *x);
+        assert_eq!(s1.region_id(), r0);
+
+        // exchange_to different parallelism → new region
+        let s2 = s1.exchange_to(8, |x: &i32| *x);
+        let r1 = s2.region_id();
+        assert_ne!(r1, r0);
+        assert_eq!(scope.region(r1).unwrap().parallelism(), 8);
+
+        // rebalance same parallelism → same region
+        let s3 = s2.rebalance();
+        assert_eq!(s3.region_id(), r1);
+
+        // gather → new region parallelism=1
+        let s4 = s3.gather();
+        let r2 = s4.region_id();
+        assert_ne!(r2, r1);
+        assert_eq!(scope.region(r2).unwrap().parallelism(), 1);
+
+        // rebalance_to(4) from gather → new region
+        let s5 = s4.rebalance_to(4);
+        let r3 = s5.region_id();
+        assert_ne!(r3, r2);
+        assert_eq!(scope.region(r3).unwrap().parallelism(), 4);
+    }
 }
