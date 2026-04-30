@@ -67,14 +67,24 @@ impl RoutingTable {
     ///
     /// `base_channel_id` is the starting channel ID for this edge.
     /// Each remote worker gets `base_channel_id + target_worker_index`.
+    /// Must be > 0 since channel ID 0 is reserved for progress protocol.
     ///
     /// `peer_map` maps node_index → PeerId for all remote nodes.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `base_channel_id` is 0 (reserved for progress).
     pub fn new(
         topology: &ClusterTopology,
         local_node: usize,
         base_channel_id: ChannelId,
         peer_map: &HashMap<usize, PeerId>,
     ) -> Self {
+        assert!(
+            base_channel_id > PROGRESS_CHANNEL_ID,
+            "base_channel_id must be > 0 (channel 0 is reserved for progress)"
+        );
+
         let mut remote_targets = HashMap::new();
 
         for node in &topology.nodes {
@@ -162,24 +172,30 @@ where
     buf.clear();
 
     // Source worker (4 bytes)
-    buf.extend_from_slice(&(source_worker.index() as u32).to_le_bytes());
+    let worker_u32 = u32::try_from(source_worker.index())
+        .map_err(|_| CodecError::Custom("source_worker index exceeds u32".into()))?;
+    buf.extend_from_slice(&worker_u32.to_le_bytes());
 
     // Encode timestamp (length-prefixed)
     let time_start = buf.len();
     buf.extend_from_slice(&[0u8; 4]); // placeholder for time_len
     time_codec.encode(time, buf)?;
-    let time_len = (buf.len() - time_start - 4) as u32;
+    let time_len = u32::try_from(buf.len() - time_start - 4)
+        .map_err(|_| CodecError::Custom("encoded timestamp exceeds u32 length".into()))?;
     buf[time_start..time_start + 4].copy_from_slice(&time_len.to_le_bytes());
 
     // Number of records
-    buf.extend_from_slice(&(data.len() as u32).to_le_bytes());
+    let num_records = u32::try_from(data.len())
+        .map_err(|_| CodecError::Custom("batch record count exceeds u32".into()))?;
+    buf.extend_from_slice(&num_records.to_le_bytes());
 
     // Each record (length-prefixed)
     for record in data {
         let rec_start = buf.len();
         buf.extend_from_slice(&[0u8; 4]); // placeholder for record_len
         data_codec.encode(record, buf)?;
-        let rec_len = (buf.len() - rec_start - 4) as u32;
+        let rec_len = u32::try_from(buf.len() - rec_start - 4)
+            .map_err(|_| CodecError::Custom("encoded record exceeds u32 length".into()))?;
         buf[rec_start..rec_start + 4].copy_from_slice(&rec_len.to_le_bytes());
     }
 
@@ -252,8 +268,11 @@ where
     let num_records = u32::from_le_bytes(bytes[offset..offset + 4].try_into().unwrap()) as usize;
     offset += 4;
 
-    // Decode each record
-    let mut data = Vec::with_capacity(num_records);
+    // Cap pre-allocation to prevent DoS from malicious count.
+    // Each record needs at least 4 bytes (length prefix), so cap at remaining/4.
+    let remaining = bytes.len().saturating_sub(offset);
+    let safe_capacity = num_records.min(remaining / 4);
+    let mut data = Vec::with_capacity(safe_capacity);
     for _ in 0..num_records {
         if offset + 4 > bytes.len() {
             return Err(CodecError::InsufficientData {
@@ -317,19 +336,26 @@ where
     buf.clear();
 
     // Source node (4 bytes)
-    buf.extend_from_slice(&(msg.source_node as u32).to_le_bytes());
+    let node_u32 = u32::try_from(msg.source_node)
+        .map_err(|_| CodecError::Custom("source_node exceeds u32".into()))?;
+    buf.extend_from_slice(&node_u32.to_le_bytes());
 
     // Number of changes (4 bytes)
-    buf.extend_from_slice(&(msg.changes.len() as u32).to_le_bytes());
+    let count_u32 = u32::try_from(msg.changes.len())
+        .map_err(|_| CodecError::Custom("changes count exceeds u32".into()))?;
+    buf.extend_from_slice(&count_u32.to_le_bytes());
 
     // Each change: operator_index (4 bytes) + time (length-prefixed) + delta (8 bytes)
     for (op_idx, time, delta) in &msg.changes {
-        buf.extend_from_slice(&(*op_idx as u32).to_le_bytes());
+        let idx_u32 = u32::try_from(*op_idx)
+            .map_err(|_| CodecError::Custom("operator_index exceeds u32".into()))?;
+        buf.extend_from_slice(&idx_u32.to_le_bytes());
 
         let time_start = buf.len();
         buf.extend_from_slice(&[0u8; 4]); // placeholder
         time_codec.encode(time, buf)?;
-        let time_len = (buf.len() - time_start - 4) as u32;
+        let time_len = u32::try_from(buf.len() - time_start - 4)
+            .map_err(|_| CodecError::Custom("encoded timestamp exceeds u32 length".into()))?;
         buf[time_start..time_start + 4].copy_from_slice(&time_len.to_le_bytes());
 
         buf.extend_from_slice(&delta.to_le_bytes());
@@ -358,7 +384,10 @@ where
     let count = u32::from_le_bytes(bytes[4..8].try_into().unwrap()) as usize;
     let mut offset = 8;
 
-    let mut changes = Vec::with_capacity(count);
+    // Cap pre-allocation: each change needs at least 4+4+time+8 bytes (min ~16)
+    let remaining = bytes.len().saturating_sub(offset);
+    let safe_capacity = count.min(remaining / 16);
+    let mut changes = Vec::with_capacity(safe_capacity);
     for _ in 0..count {
         if offset + 4 > bytes.len() {
             return Err(CodecError::InsufficientData {
@@ -527,10 +556,23 @@ mod tests {
         let mut peer_map = HashMap::new();
         peer_map.insert(1, PeerId(42));
 
-        let table = RoutingTable::new(&topology, 0, 0, &peer_map);
+        let table = RoutingTable::new(&topology, 0, 1, &peer_map);
 
         let endpoints: Vec<_> = table.remote_endpoints().collect();
         assert_eq!(endpoints.len(), 2);
+    }
+
+    #[test]
+    #[should_panic(expected = "base_channel_id must be > 0")]
+    fn routing_table_rejects_channel_id_zero() {
+        let topology = ClusterTopology::multi_node(vec![
+            NodeConfig::new(0, 1),
+            NodeConfig::new(1, 2),
+        ])
+        .unwrap();
+        let mut peer_map = HashMap::new();
+        peer_map.insert(1, PeerId(42));
+        let _table = RoutingTable::new(&topology, 0, 0, &peer_map);
     }
 
     // --- Data batch encode/decode tests ---
