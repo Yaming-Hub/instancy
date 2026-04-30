@@ -229,6 +229,32 @@ pub struct ConnectionPool<M: ConnectionManager> {
     next_request_id: std::sync::atomic::AtomicU64,
 }
 
+/// RAII guard that rolls back pool counters if a connection establishment
+/// is cancelled (task dropped) or panics. Call `commit()` on success.
+struct SlotReservation<'a, M: ConnectionManager> {
+    pool: &'a ConnectionPool<M>,
+    peer_id: PeerId,
+    committed: bool,
+}
+
+impl<'a, M: ConnectionManager> SlotReservation<'a, M> {
+    fn commit(mut self) {
+        self.committed = true;
+    }
+}
+
+impl<'a, M: ConnectionManager> Drop for SlotReservation<'a, M> {
+    fn drop(&mut self) {
+        if !self.committed {
+            let mut peers = self.pool.peers.lock().unwrap();
+            if let Some(state) = peers.get_mut(&self.peer_id) {
+                state.in_use -= 1;
+                state.total -= 1;
+            }
+        }
+    }
+}
+
 impl<M: ConnectionManager> ConnectionPool<M> {
     /// Create a new connection pool with the given manager and configuration.
     ///
@@ -279,7 +305,14 @@ impl<M: ConnectionManager> ConnectionPool<M> {
         let connection = match conn {
             Some(c) => c,
             None => {
-                // Establish a new connection
+                // Establish a new connection.
+                // Use a reservation guard to ensure counters are rolled back if
+                // establish() panics or the task is cancelled.
+                let reservation = SlotReservation {
+                    pool: self,
+                    peer_id,
+                    committed: false,
+                };
                 let request_id = self
                     .next_request_id
                     .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -289,14 +322,12 @@ impl<M: ConnectionManager> ConnectionPool<M> {
                     request_id,
                 };
                 match self.manager.establish(request).await {
-                    Ok(c) => c,
+                    Ok(c) => {
+                        reservation.commit();
+                        c
+                    }
                     Err(e) => {
-                        // Roll back the counters
-                        let mut peers = self.peers.lock().unwrap();
-                        if let Some(state) = peers.get_mut(&peer_id) {
-                            state.in_use -= 1;
-                            state.total -= 1;
-                        }
+                        // reservation drops here and rolls back counters
                         return Err(PoolError::ConnectionFailed(e));
                     }
                 }
@@ -367,8 +398,8 @@ impl<M: ConnectionManager> ConnectionPool<M> {
     pub async fn health_check(&self) {
         let now = Instant::now();
 
-        // Collect connections that need checking
-        let mut to_check: Vec<(PeerId, M::Connection, usize)> = Vec::new();
+        // Collect connections that need checking (preserving last_used for idle timeout)
+        let mut to_check: Vec<(PeerId, M::Connection, Instant)> = Vec::new();
         {
             let mut peers = self.peers.lock().unwrap();
             for (&peer_id, state) in peers.iter_mut() {
@@ -378,7 +409,7 @@ impl<M: ConnectionManager> ConnectionPool<M> {
                         >= self.config.health_check_interval
                     {
                         let pooled = state.idle.swap_remove(i);
-                        to_check.push((peer_id, pooled.connection, i));
+                        to_check.push((peer_id, pooled.connection, pooled.last_used));
                         // Don't increment i since swap_remove replaced it
                     } else {
                         i += 1;
@@ -388,14 +419,14 @@ impl<M: ConnectionManager> ConnectionPool<M> {
         }
 
         // Check health outside the lock
-        for (peer_id, conn, _) in to_check {
+        for (peer_id, conn, last_used) in to_check {
             if self.manager.is_healthy(&conn).await {
-                // Return healthy connection
+                // Return healthy connection, preserving original last_used
                 let mut peers = self.peers.lock().unwrap();
                 if let Some(state) = peers.get_mut(&peer_id) {
                     state.idle.push(PooledConnection {
                         connection: conn,
-                        last_used: Instant::now(),
+                        last_used,
                         last_health_check: Instant::now(),
                     });
                 }
