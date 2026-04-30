@@ -2274,6 +2274,133 @@ For a 10μs operator processing a 1024-item batch, useful fraction ≈ 99.5%. Fo
 2. **Operator fusion (future)**: Chains of pipeline-local operators (e.g., `map → filter → map`) can be fused into a single task, eliminating intermediate buffer writes and task transitions.
 3. **Per-worker FIFO**: Tasks for the same logical worker are dispatched in order without extra synchronization — the scheduler's per-worker queue avoids lock contention.
 4. **Region permits**: Per-region concurrency limits prevent thread starvation across dataflows sharing the pool.
+5. **Time-bounded message batching**: Instead of scheduling an operator activation for every arriving message, the orchestrator accumulates messages in the operator's input buffer and dispatches a single activation once a batching threshold is reached (see below).
+
+#### 12.6.2a Time-Bounded Message Batching
+
+When many small data messages arrive for an operator, scheduling one activation per message creates excessive task overhead — the scheduling cost can dominate the actual compute. **Time-bounded batching** solves this by letting the orchestrator coalesce messages before dispatching.
+
+**How it works:**
+
+```
+Messages arriving for Op B:
+  msg1 ─┐
+  msg2 ─┤
+  msg3 ─┼──→ [Input Buffer] ──(batch threshold met)──→ Schedule activation
+  msg4 ─┤                                                (processes all buffered msgs)
+  msg5 ─┘
+```
+
+The orchestrator holds messages in an operator's input buffer until one of three conditions triggers a dispatch:
+
+| Threshold | Description | Default |
+|---|---|---|
+| `max_batch_count` | Maximum number of messages before dispatch | 1024 |
+| `max_batch_bytes` | Maximum total byte size before dispatch (requires `MessageSize` impl) | 64 KB |
+| `max_batch_wait` | Maximum time since first buffered message before dispatch | 1 ms |
+
+Whichever threshold is reached first triggers the activation. This gives bounded latency (via `max_batch_wait`) while maximizing throughput (via `max_batch_count` / `max_batch_bytes`).
+
+**Configuration:**
+
+Batching is configured per-dataflow execution, applying uniformly to all operators in that dataflow:
+
+```rust
+/// Batching policy for operator input message coalescing.
+#[derive(Debug, Clone)]
+pub struct BatchingPolicy {
+    /// Maximum number of data messages before triggering activation.
+    /// Set to 1 to disable batching (activate on every message).
+    pub max_batch_count: usize,
+    /// Maximum total byte size of buffered messages before triggering activation.
+    /// Only enforced for data types that implement `MessageSize`.
+    /// `None` means no byte-size limit (count and time thresholds still apply).
+    pub max_batch_bytes: Option<usize>,
+    /// Maximum duration to wait for more messages before triggering activation.
+    /// Bounds worst-case latency. A message never waits longer than this.
+    pub max_batch_wait: Duration,
+}
+
+impl Default for BatchingPolicy {
+    fn default() -> Self {
+        Self {
+            max_batch_count: 1024,
+            max_batch_bytes: Some(64 * 1024), // 64 KB
+            max_batch_wait: Duration::from_millis(1),
+        }
+    }
+}
+```
+
+**Message size measurement:**
+
+For byte-size-based batching to work, the system needs to know the size of each message. This is provided via an optional trait:
+
+```rust
+/// Optional trait for measuring the in-memory byte size of a data message.
+///
+/// Implement this for data types where byte-size-based batching is desired.
+/// If not implemented, only count-based and time-based thresholds are used.
+pub trait MessageSize {
+    /// Returns the approximate in-memory byte size of this message.
+    /// Does not need to be exact — used for batching heuristics, not memory accounting.
+    fn message_size(&self) -> usize;
+}
+
+// Blanket impls for common types
+impl MessageSize for String {
+    fn message_size(&self) -> usize { self.len() }
+}
+
+impl<T: Sized> MessageSize for Vec<T> {
+    fn message_size(&self) -> usize { self.len() * std::mem::size_of::<T>() }
+}
+```
+
+When `D: MessageSize`, the orchestrator tracks cumulative byte size and triggers dispatch when `max_batch_bytes` is reached. When `D` does not implement `MessageSize`, the byte-size threshold is ignored and only count/time thresholds apply.
+
+**Batching timer lifecycle:**
+
+```
+Message arrives for Op X (buffer was empty)
+  → Start batch timer (max_batch_wait countdown)
+  → Check count/size thresholds
+
+More messages arrive
+  → Accumulate in buffer
+  → Check count/size thresholds after each arrival
+
+Threshold reached (count, size, OR timer fires)
+  → Cancel timer (if still running)
+  → Schedule operator activation
+  → Operator processes all buffered messages in one activate() call
+  → Buffer is empty; timer is idle until next message
+```
+
+**Interaction with backpressure:**
+
+Batching and backpressure are complementary:
+- Backpressure limits how much data flows *between* operators (bounded buffers).
+- Batching limits how *often* operators are activated (coalescing messages into fewer activations).
+- When an operator is backpressured (output buffer full), its input buffer continues accumulating — effectively getting "free" batching from the stall.
+
+**Throughput impact:**
+
+```
+Without batching (activate per message):
+  overhead_fraction = scheduling_cost / (scheduling_cost + per_msg_compute)
+  For 100ns compute + 500ns scheduling → 83% overhead!
+
+With batching (1024 messages per activation):
+  overhead_fraction = scheduling_cost / (scheduling_cost + 1024 × per_msg_compute)
+  For 100ns compute + 500ns scheduling → 0.5% overhead
+```
+
+**Design rationale:**
+- **Per-dataflow configuration**: Different dataflows have different latency requirements. A real-time alerting pipeline might set `max_batch_wait: 100μs` and `max_batch_count: 16`, while a batch ETL pipeline might set `max_batch_wait: 10ms` and `max_batch_count: 65536`.
+- **Optional size trait**: Not all data types have meaningful "size." Making it optional via a trait avoids imposing unnecessary bounds on simple types.
+- **Bounded latency**: The `max_batch_wait` timer guarantees that even at low throughput, messages are processed within a bounded time. Without it, a nearly-idle operator could wait indefinitely for a full batch.
+- **Composable with existing batching**: The `Vec<D>` data batches from input sources are independent of operator-level batching. Input sources produce batches of their own (e.g., 1000 Kafka messages); operator batching coalesces *those batches* further at the scheduling level.
 
 **Thread lifecycle and CPU conservation:**
 

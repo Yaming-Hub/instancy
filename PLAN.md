@@ -414,7 +414,45 @@ See DESIGN.md §5.5 for the dual-model design (OutputSink + OutputStream).
 
 ---
 
-## PR 14 — Codec trait + serialization
+## PR 14 — Time-bounded message batching
+**Goal**: Reduce scheduling overhead by coalescing messages before operator activation.
+
+- `scheduler/batching.rs`
+  - `BatchingPolicy` struct — `max_batch_count`, `max_batch_bytes: Option<usize>`, `max_batch_wait: Duration`
+  - `Default` impl: 1024 messages, 64KB, 1ms
+  - `BatchingPolicy::no_batching()` — convenience for `max_batch_count: 1`
+  - `MessageSize` trait — optional `fn message_size(&self) -> usize`
+  - Blanket impls for `String`, `Vec<T>`, `Bytes`, common primitives
+  - `BatchAccumulator<D>` — tracks count, byte size (if D: MessageSize), elapsed time since first message
+  - `BatchAccumulator::should_dispatch(&self, policy: &BatchingPolicy) -> bool`
+- `scheduler/mod.rs` integration:
+  - Per-operator input buffer uses `BatchAccumulator` to decide when to schedule activation
+  - Timer wheel or per-operator deadline for `max_batch_wait` enforcement
+  - On threshold met: cancel timer, enqueue operator activation task
+- `execute.rs` / `dataflow/spec.rs`:
+  - `DataflowConfig` gains `batching_policy: BatchingPolicy` field
+  - Policy is per-dataflow, applied uniformly to all operators in that dataflow
+- Conditional compilation: `MessageSize` bound is optional — size threshold ignored when not implemented
+
+**Tests**:
+- BatchingPolicy: default values correct
+- BatchingPolicy: no_batching sets count=1
+- BatchAccumulator: count threshold triggers dispatch
+- BatchAccumulator: byte size threshold triggers dispatch (with MessageSize impl)
+- BatchAccumulator: time threshold triggers dispatch (simulated clock)
+- BatchAccumulator: byte size ignored when D does not impl MessageSize
+- BatchAccumulator: first-threshold-wins (whichever fires first)
+- MessageSize: blanket impls return reasonable values
+- MessageSize: custom impl respected
+- Integration: operator receives coalesced messages in one activation
+- Integration: max_batch_wait guarantees bounded latency under low throughput
+- Integration: batching + backpressure interaction — stalled operator gets natural batching
+
+**Estimated size**: ~1500 lines
+
+---
+
+## PR 15 — Codec trait + serialization
 **Goal**: Pluggable serialization for inter-process data exchange.
 
 - `communication/codec.rs`
