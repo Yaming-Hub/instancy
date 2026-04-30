@@ -12,7 +12,9 @@
 //! - **Frontier/Antichain**: Progress tracking primitives.
 //! - **WorkerPool**: Custom thread pool for synchronous operator execution.
 //! - **Providers**: Pluggable transport and execution backends.
+//! - **CancellationToken**: Cooperative shutdown signal for dataflows.
 
+pub mod cancellation;
 pub mod communication;
 pub mod dataflow;
 pub mod error;

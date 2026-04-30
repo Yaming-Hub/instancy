@@ -6,6 +6,7 @@
 
 use std::time::Duration;
 
+use crate::cancellation::CancellationToken;
 use crate::error::Error;
 use crate::worker::WorkerId;
 use crate::worker_pool::WorkerPoolConfig;
@@ -47,6 +48,9 @@ pub struct DataflowConfig {
     pub topology: ClusterTopology,
     /// Error handling policy.
     pub error_policy: ErrorPolicy,
+    /// Cancellation token for graceful shutdown.
+    /// Cancel this token to request the dataflow to stop.
+    pub cancellation_token: CancellationToken,
     /// Human-readable name for this dataflow (for metrics/logging).
     pub name: String,
 }
@@ -57,6 +61,7 @@ impl DataflowConfig {
         Self {
             topology: ClusterTopology::single_node(workers),
             error_policy: ErrorPolicy::default(),
+            cancellation_token: CancellationToken::new(),
             name: name.into(),
         }
     }
@@ -347,6 +352,17 @@ mod tests {
         assert_eq!(config.name, "test_df");
         assert_eq!(config.topology.total_workers(), 4);
         assert_eq!(config.error_policy, ErrorPolicy::Stop);
+        assert!(!config.cancellation_token.is_cancelled());
+    }
+
+    #[test]
+    fn dataflow_config_cancellation_token() {
+        let config = DataflowConfig::single_node(4, "cancelable");
+        let token = config.cancellation_token.clone();
+
+        assert!(!token.is_cancelled());
+        token.cancel();
+        assert!(config.cancellation_token.is_cancelled());
     }
 
     #[test]
@@ -364,6 +380,7 @@ mod tests {
         let df = DataflowConfig {
             topology: ClusterTopology { nodes: vec![NodeConfig::new(0, 0)] },
             error_policy: ErrorPolicy::Stop,
+            cancellation_token: CancellationToken::new(),
             name: "bad".into(),
         };
         assert!(execute(&runtime, df).is_err());
@@ -371,6 +388,7 @@ mod tests {
         let df2 = DataflowConfig {
             topology: ClusterTopology { nodes: vec![] },
             error_policy: ErrorPolicy::Stop,
+            cancellation_token: CancellationToken::new(),
             name: "empty".into(),
         };
         assert!(execute(&runtime, df2).is_err());
