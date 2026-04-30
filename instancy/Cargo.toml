@@ -16,6 +16,8 @@ tokio = { version = "1", features = ["io-util", "sync", "rt"], optional = true }
 
 [dev-dependencies]
 tokio = { version = "1", features = ["rt", "macros", "time", "io-util", "sync"] }
+tracing-test = "0.2"
+tracing-subscriber = "0.3"
 
 [features]
 default = ["tracing", "transport"]
