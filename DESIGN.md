@@ -697,6 +697,114 @@ I/O Runtime (Tokio) ──► reads input stream ──► enqueues to Worker qu
 5. The operator produces output, which is written to downstream input buffers.
 6. The thread signals task completion; the scheduler dispatches the next task for that worker.
 
+#### 5.4.1 Who Creates Tasks? — The Orchestrator Event Loop
+
+The **orchestrator** (also called the runtime event loop) is the component responsible
+for receiving data messages and turning them into compute tasks. It runs on the I/O
+runtime and performs the following for each operator input:
+
+1. **Receives messages** — from local in-process channels (downstream output buffers)
+   or from the network (remote exchange).
+2. **Deposits into input buffer** — each operator input has a per-worker buffer where
+   incoming messages accumulate.
+3. **Feeds the BatchAccumulator** — calls `BatchAccumulator::record_message()` for
+   each incoming message. The accumulator tracks count, byte size, and elapsed time
+   since the first message in the current batch (see §12.6.2a).
+4. **Checks dispatch threshold** — calls `BatchAccumulator::should_dispatch(policy)`.
+   When any threshold is met (count, bytes, or time), the batch is ready.
+5. **Creates an OperatorActivation** — wraps a closure that will invoke the operator's
+   `FnMut` logic with a reference to the filled input buffer. The closure captures
+   access to the operator's input/output handles.
+6. **Enqueues into TaskScheduler** — calls `TaskScheduler::enqueue(activation, region_id)`.
+   The scheduler places it in the per-worker FIFO queue.
+7. **Resets the accumulator** — calls `BatchAccumulator::reset()` to start fresh for
+   the next batch.
+
+```
+                    ┌──────────────────────────────────────┐
+                    │   Orchestrator Event Loop (I/O side)  │
+                    │                                      │
+   messages ──────►│  1. Receive message                   │
+   (channel/net)   │  2. Deposit into operator input buf   │
+                    │  3. BatchAccumulator.record_message() │
+                    │  4. should_dispatch(policy)?          │
+                    │     NO  → wait for more messages      │
+                    │     YES → create OperatorActivation   │
+                    │  5. TaskScheduler.enqueue(activation)  │
+                    │  6. BatchAccumulator.reset()           │
+                    └──────────────────────┬───────────────┘
+                                           │
+                                           ▼
+                    ┌──────────────────────────────────────┐
+                    │   TaskScheduler (per-worker FIFO)     │
+                    │                                      │
+                    │  dispatch_ready() → ComputeTask      │
+                    └──────────────────────┬───────────────┘
+                                           │
+                                           ▼
+                    ┌──────────────────────────────────────┐
+                    │   Worker Thread Pool (compute)        │
+                    │   thread picks up task, runs closure  │
+                    └──────────────────────────────────────┘
+```
+
+The orchestrator also manages a **timer wheel** (or per-operator deadlines) for the
+`max_batch_wait` threshold: if no new messages arrive but time expires, the
+orchestrator fires the activation anyway to ensure bounded latency.
+
+#### 5.4.2 Where is Operator State Stored?
+
+Operator state (e.g., a `HashMap` for aggregation, a running counter, a window buffer)
+lives **inside the operator's closure**. The operator logic is declared as:
+
+```rust
+logic: Box<dyn FnMut(&mut InputHandle<T, D1>, &mut OutputHandle<T, D2>) -> Result<()> + Send>
+```
+
+Because this is `FnMut` (not `FnOnce`), the closure is **invoked repeatedly** across
+activations and retains mutable state between calls. The state is simply captured
+variables in the closure:
+
+```rust
+// Example: stateful aggregation operator
+let mut counts: HashMap<String, u64> = HashMap::new();  // ← operator state
+
+stream.unary("word_count", |input, output| {
+    // `counts` is moved into this FnMut closure and persists across activations
+    while let Some((time, batch)) = input.next() {
+        for word in batch {
+            *counts.entry(word).or_insert(0) += 1;
+        }
+        output.session(&time).give_vec(counts.iter().collect());
+    }
+    Ok(())
+});
+```
+
+**Key design properties:**
+
+- **One closure instance per logical worker** — there is no sharing of state across
+  workers. Each worker has its own independent operator instance with its own state.
+  No locking or synchronization is needed to access operator state.
+
+- **The orchestrator owns the operator struct** — the `UnaryOperator` (or `BinaryOperator`)
+  struct lives in the orchestrator's operator registry. When an activation fires, the
+  orchestrator calls the operator's `activate()` method which invokes the `FnMut` closure.
+  The state persists for the operator's entire lifetime.
+
+- **Thread safety via FIFO guarantee** — even though the Worker Thread Pool may run the
+  closure on different OS threads across activations, the per-worker FIFO guarantee
+  ensures the closure is **never called concurrently**. It is `Send` (can move between
+  threads) but never needs to be `Sync`.
+
+- **No external state store needed** — unlike actor frameworks that require a separate
+  "state" object, the closure-capture pattern is natural Rust: the compiler enforces
+  move semantics and lifetime correctness. The operator "is" its closure + captured state.
+
+- **State lifetime** — operator state lives as long as the dataflow is running. When the
+  dataflow is dropped or cancelled, the operator struct (and its closure with all captured
+  state) is dropped, freeing all resources.
+
 ### 5.3 Input Streams
 
 The executor accepts a dataflow definition that binds external async streams as inputs. Instead of the caller imperatively calling `input.send()` and `input.advance_to()`, the dataflow is driven by `TimestampedInput` streams — async streams that yield timestamped data. The library reads from these streams, manages capabilities and frontier advancement automatically, and the dataflow makes progress reactively as data arrives.

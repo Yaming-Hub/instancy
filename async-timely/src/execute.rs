@@ -8,6 +8,7 @@ use std::time::Duration;
 
 use crate::cancellation::CancellationToken;
 use crate::error::Error;
+use crate::scheduler::batching::BatchingPolicy;
 use crate::worker::WorkerId;
 use crate::worker_pool::WorkerPoolConfig;
 
@@ -51,6 +52,9 @@ pub struct DataflowConfig {
     /// Cancellation token for graceful shutdown.
     /// Cancel this token to request the dataflow to stop.
     pub cancellation_token: CancellationToken,
+    /// Message batching policy for operator activations.
+    /// Controls how messages are coalesced before dispatching.
+    pub batching_policy: BatchingPolicy,
     /// Human-readable name for this dataflow (for metrics/logging).
     pub name: String,
 }
@@ -62,6 +66,7 @@ impl DataflowConfig {
             topology: ClusterTopology::single_node(workers),
             error_policy: ErrorPolicy::default(),
             cancellation_token: CancellationToken::new(),
+            batching_policy: BatchingPolicy::default(),
             name: name.into(),
         }
     }
@@ -381,6 +386,7 @@ mod tests {
             topology: ClusterTopology { nodes: vec![NodeConfig::new(0, 0)] },
             error_policy: ErrorPolicy::Stop,
             cancellation_token: CancellationToken::new(),
+            batching_policy: BatchingPolicy::default(),
             name: "bad".into(),
         };
         assert!(execute(&runtime, df).is_err());
@@ -389,6 +395,7 @@ mod tests {
             topology: ClusterTopology { nodes: vec![] },
             error_policy: ErrorPolicy::Stop,
             cancellation_token: CancellationToken::new(),
+            batching_policy: BatchingPolicy::default(),
             name: "empty".into(),
         };
         assert!(execute(&runtime, df2).is_err());
