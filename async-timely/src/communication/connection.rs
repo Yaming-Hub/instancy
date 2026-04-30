@@ -41,7 +41,11 @@ use std::future::Future;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-/// Unique identifier for a process (peer) in the cluster.
+/// Unique identifier for a physical process (peer) in the cluster.
+///
+/// This is a **physical** concept — each `PeerId` identifies a distinct OS process
+/// that participates in distributed dataflow execution. The connection pool uses
+/// `PeerId` to manage physical TCP connections between processes.
 #[derive(Clone, Copy, Debug, Hash, Eq, PartialEq, Ord, PartialOrd)]
 pub struct PeerId(pub usize);
 

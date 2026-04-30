@@ -29,18 +29,21 @@ use crate::progress::timestamp::{PathSummary, Timestamp};
 // ---------------------------------------------------------------------------
 
 /// A location in the dataflow graph: either an operator's output port or input port.
+///
+/// This is a **logical** concept — `node` refers to the logical operator index
+/// in the graph, not a physical machine or cluster node.
 #[derive(Clone, Debug, Hash, Eq, PartialEq, Ord, PartialOrd)]
 pub enum Location {
     /// An operator's output port (where data is produced).
     Source {
-        /// Operator index.
+        /// Logical operator index in the graph.
         node: usize,
         /// Output port index.
         port: usize,
     },
     /// An operator's input port (where data is consumed).
     Target {
-        /// Operator index.
+        /// Logical operator index in the graph.
         node: usize,
         /// Input port index.
         port: usize,

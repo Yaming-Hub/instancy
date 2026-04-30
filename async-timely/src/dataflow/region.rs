@@ -8,6 +8,10 @@
 use std::fmt;
 
 /// Unique identifier for an execution region within a dataflow.
+///
+/// This is a **logical** concept — regions define parallelism groupings in the
+/// computation graph. A region has no inherent physical location; the runtime
+/// maps logical regions to physical threads via the scheduler.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct RegionId(pub(crate) usize);
 

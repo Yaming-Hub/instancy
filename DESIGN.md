@@ -18,6 +18,7 @@
 10. **Observability built-in** — per-dataflow CPU time tracking, operator-level metrics, and structured tracing for understanding performance characteristics.
 11. **Checkpointing support** — consumers can add checkpoint operators that persist state at timestamp boundaries, enabling recovery by fast-forwarding input to the stored frontier.
 12. **Per-stage dynamic parallelism** — operators in the same execution region share a parallelism level; different regions can have different parallelism. Explicit repartition operators (`exchange`, `rebalance`, `gather`, `broadcast`) connect regions with different parallelism.
+13. **Dynamic cluster scaling** — nodes can join or leave the cluster at runtime. The hosting application is responsible for detecting membership changes and notifying the runtime via a `ClusterMembership` trait. The library rebuilds routing and rebalances work accordingly.
 
 ---
 
@@ -42,6 +43,7 @@
 | Observability | Limited | Built-in CPU time tracking per dataflow, operator-level metrics |
 | Checkpointing | Not supported | Extensible checkpoint operators using timestamp boundaries |
 | Parallelism | Uniform: all operators share the same worker count | Per-region: execution regions can have different parallelism; explicit repartition at boundaries |
+| Cluster scaling | Static: all nodes must be known at startup | Dynamic: application notifies runtime of node joins/departures; routing tables rebuild on the fly |
 
 ---
 
@@ -2463,7 +2465,117 @@ Default batch size: 1024 items (configurable).
 
 Rather than one TCP connection per (worker, channel) pair, async-timely multiplexes all channels to the same peer over a small number of pooled connections. The pool delegates all connection establishment to the application's `ConnectionManager`, so the library never touches sockets directly. This dramatically reduces connection count in large clusters and supports arbitrarily complex networking topologies.
 
-### 12.5 Checkpointing
+### 12.5 Dynamic Cluster Scaling
+
+async-timely supports **dynamic cluster scaling** — nodes can be added to or removed from the cluster at runtime. The hosting application is responsible for detecting node changes (health checks, service discovery, autoscaler events, connection failures) and notifying the timely runtime. The library does **not** perform its own node discovery or health monitoring.
+
+#### Responsibilities
+
+| Responsibility | Owner |
+|---|---|
+| Detect node joins, departures, and failures | **Application** (hosting process) |
+| Notify the runtime of topology changes | **Application** → `ClusterMembership` callback |
+| Rebuild routing tables and rebalance logical workers | **Library** (runtime) |
+| Migrate in-flight data for affected workers | **Library** (runtime) |
+| Re-establish connections to new nodes | **Application** (via `ConnectionManager`) |
+| Decide whether to retry/abort affected dataflows | **Application** (via error policy) |
+
+#### ClusterMembership Trait
+
+The application implements this trait and passes it to the runtime at startup. The runtime calls `subscribe()` to receive a stream of membership change events.
+
+```rust
+/// Events describing changes to the physical cluster topology.
+/// The hosting application produces these events; the runtime consumes them.
+pub enum MembershipEvent {
+    /// A new physical node has joined the cluster and is ready to host logical workers.
+    NodeJoined {
+        node_index: usize,
+        logical_workers: usize,
+        peer_id: PeerId,
+    },
+    /// A physical node has left the cluster (graceful shutdown or detected failure).
+    NodeLeft {
+        node_index: usize,
+        reason: NodeDepartureReason,
+    },
+}
+
+/// Why a node departed.
+pub enum NodeDepartureReason {
+    /// Graceful shutdown (node drained its work before leaving).
+    Graceful,
+    /// Connection lost / health check failed (unexpected departure).
+    ConnectionLost,
+    /// Application-initiated removal (e.g., scale-down decision).
+    Removed,
+}
+
+/// Application-implemented trait for providing cluster membership changes.
+///
+/// The runtime subscribes to membership events at startup. The application
+/// is free to use any discovery mechanism: Kubernetes watch, Consul, ZooKeeper,
+/// gossip protocol, or manual operator commands.
+pub trait ClusterMembership: Send + Sync + 'static {
+    /// Returns a stream of membership change events.
+    /// The runtime processes these events to update routing tables,
+    /// rebalance workers, and handle in-flight data for departing nodes.
+    fn subscribe(&self) -> Box<dyn Stream<Item = MembershipEvent> + Send + Unpin>;
+}
+```
+
+#### Scaling-Up (Node Joins)
+
+When the application notifies the runtime that a new node has joined:
+
+1. **Topology update**: `ClusterTopology` is extended with the new `NodeConfig`.
+2. **Worker assignment**: New logical worker indices are allocated for the joining node's workers.
+3. **Routing table rebuild**: All `RoutingTable` instances are updated to include the new remote endpoints.
+4. **Connection establishment**: The pool requests connections to the new peer via `ConnectionManager`.
+5. **Rebalance (optional)**: Running dataflows with `Exchange` or `Rebalance` routing can gradually redirect new data to the expanded worker set. In-flight data for the old topology continues on the original routes until its timestamp frontier advances.
+
+**Important**: Existing in-flight data is NOT migrated. Only new data (at future timestamps) takes advantage of the expanded topology. This ensures progress tracking remains consistent — a timestamp that has already been produced cannot change its routing.
+
+#### Scaling-Down (Node Departures)
+
+When the application reports a node departure:
+
+1. **Mark workers unavailable**: Logical workers on the departed node are marked as unavailable.
+2. **Drain in-flight data**: For graceful departures, the runtime waits for the node to drain its pending output (bounded by a configurable timeout). For failures, in-flight data on the lost node is considered lost.
+3. **Error propagation**: Depending on the dataflow's error policy:
+   - **Stop**: All affected dataflows receive `Error::NodeLost` and terminate.
+   - **Continue**: The runtime logs the loss, discards affected timestamps, and advances frontiers past the lost data.
+4. **Routing table update**: Routes to the departed node are removed. Future exchange/rebalance targets only include surviving nodes.
+5. **Connection cleanup**: The pool evicts all connections to the departed peer.
+
+#### Consistency Guarantees
+
+- **Progress safety**: A departed node's outstanding capabilities are treated as "released" — the frontier advances past any timestamps that only the lost node could produce. This is safe because no more data at those timestamps will arrive.
+- **At-most-once by default**: If a node fails mid-computation, records being processed by that node may be lost. Applications requiring exactly-once semantics must use the checkpoint/recovery mechanism.
+- **No split-brain**: The application is the single source of truth for membership. The runtime trusts the application's events and does not perform its own consensus.
+
+#### Example: Kubernetes Integration
+
+```rust
+struct K8sClusterMembership {
+    pod_watcher: kube::runtime::watcher::Watcher<Pod>,
+}
+
+impl ClusterMembership for K8sClusterMembership {
+    fn subscribe(&self) -> Box<dyn Stream<Item = MembershipEvent> + Send + Unpin> {
+        // Convert Kubernetes pod events into MembershipEvent stream
+        // Pod Ready → NodeJoined
+        // Pod Deleted/Failed → NodeLeft
+        Box::new(self.pod_watcher.map(|event| match event {
+            WatchEvent::Added(pod) => MembershipEvent::NodeJoined { ... },
+            WatchEvent::Deleted(pod) => MembershipEvent::NodeLeft { ... },
+            _ => ...
+        }))
+    }
+}
+```
+
+### 12.6 Checkpointing
 
 async-timely supports **consumer-defined checkpointing** via a `Checkpoint` operator that can be inserted at any point in the dataflow graph. Timestamps provide a natural checkpoint boundary — all data up to a given frontier has been fully processed.
 

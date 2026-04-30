@@ -641,6 +641,50 @@ See DESIGN.md §5.5 for the dual-model design (OutputSink + OutputStream).
 
 ---
 
+## PR 21 — Dynamic cluster scaling
+**Goal**: Support adding/removing nodes at runtime, driven by the hosting application.
+
+- `ClusterMembership` trait:
+  - `subscribe() -> Box<dyn Stream<Item = MembershipEvent> + Send + Unpin>`
+  - `MembershipEvent::NodeJoined { node_index, logical_workers, peer_id }`
+  - `MembershipEvent::NodeLeft { node_index, reason: NodeDepartureReason }`
+  - `NodeDepartureReason`: `Graceful`, `ConnectionLost`, `Removed`
+- Runtime membership listener (async task):
+  - Consumes `MembershipEvent` stream
+  - Updates `ClusterTopology` (atomic swap with Arc)
+  - Triggers routing table rebuild for all active dataflows
+  - Notifies connection pool to establish/evict connections
+- `ClusterTopology` made dynamic:
+  - Wrap in `Arc<ArcSwap<ClusterTopology>>` for lock-free reads
+  - `RoutingTable` references topology version; rebuilt when stale
+- Scale-up handling:
+  - New logical worker indices allocated for joining node
+  - Future data (new timestamps) routed to expanded worker set
+  - In-flight data continues on original routes (consistency)
+- Scale-down handling:
+  - Mark departed node's logical workers as unavailable
+  - Graceful: wait for drain (configurable timeout)
+  - Failure: release departed node's capabilities (advance frontier)
+  - Apply `ErrorPolicy`: Stop → propagate `Error::NodeLost`, Continue → log + skip
+  - Connection pool evicts connections to departed peer
+- Default `StaticMembership` implementation (no changes, for single-node / fixed clusters)
+
+**Tests**:
+- StaticMembership: no events emitted, topology never changes
+- NodeJoined: routing table expands, new worker indices assigned
+- NodeLeft (graceful): drain timeout honored, frontier advances
+- NodeLeft (failure): capabilities released, error propagated per policy
+- Concurrent scale-up + data flow: new timestamps use new routes, old timestamps use old routes
+- Scale-down mid-computation: ErrorPolicy::Stop returns NodeLost error
+- Scale-down mid-computation: ErrorPolicy::Continue logs + continues
+- Connection pool evicts on NodeLeft
+- Rapid join+leave: no routing table corruption
+- Single-node topology remains unchanged by membership events
+
+**Estimated size**: ~2500 lines
+
+---
+
 ## Dependency Graph
 
 ```
@@ -679,6 +723,8 @@ PR18 (observability + metrics integration)
 PR19 (checkpoint operator + recovery)
  ↓
 PR20 (polish: errors, error policy wiring, examples, docs)
+ ↓
+PR21 (dynamic cluster scaling — ClusterMembership, scale-up/down)
 ```
 
 ## Notes

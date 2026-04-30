@@ -7,10 +7,12 @@ use std::fmt;
 use std::hash::{Hash, Hasher};
 use std::sync::Arc;
 
-/// Describes how data is routed between operators across workers.
+/// Describes how data is routed between operators across logical workers.
 ///
-/// This determines the data exchange pattern when connecting an upstream
-/// operator to a downstream operator.
+/// This is a **logical** routing strategy — it defines the data exchange pattern
+/// in graph terms (which logical worker receives each record). The physical
+/// delivery mechanism (in-memory buffer, TCP, etc.) is resolved separately
+/// by the transport layer.
 #[derive(Debug, Clone)]
 pub enum PartitionStrategy<D> {
     /// No shuffle — data stays on the same worker.

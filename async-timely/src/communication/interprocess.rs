@@ -34,31 +34,38 @@ use crate::worker::WorkerId;
 ///
 /// Each dataflow edge that crosses a process boundary is assigned a unique
 /// channel ID. This ID is used in the frame header to multiplex/demultiplex
-/// frames on a shared connection.
+/// frames on a shared physical connection.
+///
+/// This is a **physical** wire-protocol concept — it maps a logical dataflow
+/// edge to a specific multiplexed channel on the physical TCP connection.
 pub type ChannelId = u64;
 
-/// Describes a remote endpoint: which peer and which wire channel.
+/// Describes a physical remote endpoint: which peer process and which wire channel.
+///
+/// This is a **physical** delivery target — it tells the transport layer exactly
+/// where to send frames: which physical peer (PeerId) and which multiplexed
+/// channel on that peer's connection.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct RemoteEndpoint {
-    /// The peer process hosting the target worker.
+    /// The physical peer process hosting the target worker.
     pub peer_id: PeerId,
-    /// The wire channel ID for this edge.
+    /// The physical wire channel ID for this edge on the shared connection.
     pub channel_id: ChannelId,
 }
 
-/// Maps worker pairs to remote endpoints for a single dataflow edge.
+/// Maps logical worker indices to physical remote endpoints for a single dataflow edge.
 ///
-/// Given the cluster topology and a dataflow edge identifier, the routing
-/// table determines which (peer, channel) to use when sending data from
-/// one worker to another.
+/// This bridges **logical → physical**: given a logical target worker index,
+/// it resolves the physical (peer_id, channel_id) needed to deliver data
+/// over the network. Workers on the local node have no entry (handled in-process).
 #[derive(Debug, Clone)]
 pub struct RoutingTable {
-    /// The local node index in the cluster.
+    /// The local physical node index in the cluster.
     local_node: usize,
-    /// Map from target worker index to remote endpoint.
-    /// Only contains entries for workers on remote nodes.
+    /// Map from logical worker index to physical remote endpoint.
+    /// Only contains entries for workers on remote physical nodes.
     remote_targets: HashMap<usize, RemoteEndpoint>,
-    /// Total workers in the cluster.
+    /// Total logical workers in the cluster.
     total_workers: usize,
 }
 
@@ -113,15 +120,15 @@ impl RoutingTable {
         }
     }
 
-    /// Check if a target worker is remote (on a different node).
-    pub fn is_remote(&self, target_worker: usize) -> bool {
-        self.remote_targets.contains_key(&target_worker)
+    /// Check if a target worker is remote (on a different physical node).
+    pub fn is_remote(&self, logical_worker_index: usize) -> bool {
+        self.remote_targets.contains_key(&logical_worker_index)
     }
 
-    /// Get the remote endpoint for a target worker.
-    /// Returns `None` if the worker is local.
-    pub fn endpoint(&self, target_worker: usize) -> Option<&RemoteEndpoint> {
-        self.remote_targets.get(&target_worker)
+    /// Get the physical remote endpoint for a logical target worker.
+    /// Returns `None` if the worker is local (same physical node).
+    pub fn endpoint(&self, logical_worker_index: usize) -> Option<&RemoteEndpoint> {
+        self.remote_targets.get(&logical_worker_index)
     }
 
     /// Get the local node index.

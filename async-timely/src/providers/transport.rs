@@ -14,15 +14,20 @@ use crate::progress::timestamp::Timestamp;
 use crate::worker::WorkerId;
 
 /// Identifies a logical destination for data delivery.
+///
+/// This is a **logical** concept — it names the target by region, worker,
+/// operator, and input slot in graph terms. The `TransportProvider` resolves
+/// a `LogicalTarget` to a physical delivery mechanism (in-memory buffer or
+/// remote TCP endpoint).
 #[derive(Debug, Clone, Hash, Eq, PartialEq)]
 pub struct LogicalTarget {
-    /// The execution region containing the target operator.
+    /// The logical execution region containing the target operator.
     pub region: RegionId,
     /// The logical worker index within the region.
     pub worker: WorkerId,
-    /// The operator index within the worker.
+    /// The logical operator index within the worker.
     pub operator: usize,
-    /// The input slot on the target operator (e.g., 0 = left, 1 = right for binary).
+    /// The logical input slot on the target operator (e.g., 0 = left, 1 = right for binary).
     pub input_index: usize,
 }
 

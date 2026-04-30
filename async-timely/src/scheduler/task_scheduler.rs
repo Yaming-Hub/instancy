@@ -12,11 +12,15 @@ use std::sync::{Arc, Mutex};
 use crate::dataflow::region::RegionId;
 use crate::worker::{OperatorActivation, WorkerId};
 
-/// A compute task ready for dispatch to the worker pool.
+/// A compute task ready for dispatch to the physical worker thread pool.
+///
+/// This bridges **logical → physical**: it carries a logical `OperatorActivation`
+/// (identified by logical WorkerId + operator_index) that the physical thread pool
+/// will execute on an actual OS thread.
 pub struct ComputeTask {
-    /// The activation to execute.
+    /// The logical activation to execute.
     pub activation: OperatorActivation,
-    /// Region this task belongs to (for concurrency limiting).
+    /// Logical region this task belongs to (for concurrency limiting).
     pub region_id: RegionId,
     /// Shared permit tracker for the region.
     pub(crate) region_permit: Arc<RegionPermit>,
