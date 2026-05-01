@@ -23,7 +23,7 @@ use crate::dataflow::probe::ProbeHandle;
 use crate::dataflow::region::RegionId;
 use crate::dataflow::schedulable::{ChannelEndpoints, ChannelFactory, OperatorFactory, SchedulableOperator};
 use crate::dataflow::stream::Slot;
-use crate::dataflow::wired_operators::WiredSourceOperator;
+use crate::dataflow::wired_operators::{WiredSourceOperator, WiredUnaryOperator};
 use crate::error::{Error, Result};
 use crate::progress::change_batch::ChangeBatch;
 use crate::progress::operate::PortConnectivity;
@@ -154,6 +154,125 @@ impl<T: Timestamp> BuildContext<T> {
         });
 
         self.operator_factories.push((op_idx, factory));
+        op_idx
+    }
+
+    /// Register a unary operator (one input, one output) with a transformation closure.
+    ///
+    /// The closure receives each timestamped batch and returns a transformed batch.
+    /// This is the primary way to add computation to a dataflow pipeline.
+    ///
+    /// # Parameters
+    ///
+    /// - `name`: Human-readable operator name for diagnostics.
+    /// - `source_op_idx`: The upstream operator whose output feeds this operator's input.
+    /// - `logic`: A closure `FnMut(T, Vec<D1>) -> Vec<D2>` that transforms each batch.
+    ///
+    /// # Returns
+    ///
+    /// The operator index for this unary operator, which can be passed to
+    /// `add_sink`, `add_unary`, or `add_probe` to continue the pipeline.
+    ///
+    /// # Type Safety
+    ///
+    /// `D1` must match the output type of the upstream operator. `D2` becomes
+    /// the output type visible to downstream operators. Mismatches cause a
+    /// runtime panic during materialization.
+    pub fn add_unary<D1, D2, F>(
+        &mut self,
+        name: impl Into<String>,
+        source_op_idx: usize,
+        logic: F,
+    ) -> usize
+    where
+        D1: Send + 'static,
+        D2: Send + 'static,
+        F: FnMut(T, Vec<D1>) -> Vec<D2> + Send + 'static,
+    {
+        let name = name.into();
+        let op_idx = self.allocate_operator_index();
+        let region_id = RegionId::new(0);
+
+        // Register in graph (1 input, 1 output)
+        self.graph
+            .register_operator(crate::dataflow::graph::OperatorInfo::new(
+                op_idx, &name, region_id, 1, 1,
+            ))
+            .expect("operator index unique");
+
+        // Register edge from upstream output to this operator's input
+        self.graph.add_edge(crate::dataflow::graph::EdgeInfo::new(
+            Slot::new(source_op_idx, 0),
+            Slot::new(op_idx, 0),
+            region_id,
+            region_id,
+        ));
+
+        // Register in subgraph builder — unary has 1 input, 1 output.
+        self.subgraph_builder.add_operator(
+            op_idx,
+            &name,
+            1, // one input
+            1, // one output
+            PortConnectivity::new(1, 1),
+        );
+
+        // Register edge in subgraph builder for progress/frontier tracking.
+        self.subgraph_builder.add_edge(
+            Location::source(source_op_idx, 0),
+            Location::target(op_idx, 0),
+        );
+
+        // Wrap the simple batch-transform closure into the WiredUnaryOperator's
+        // full logic signature: FnMut(&mut InputHandle, &mut OutputHandle) -> Result<()>
+        let mut logic = logic;
+        let wired_logic = move |input: &mut crate::dataflow::operators::handles::InputHandle<T, D1>,
+                                output: &mut crate::dataflow::operators::handles::OutputHandle<T, D2>|
+                                -> Result<()> {
+            while let Some((time, data)) = input.next() {
+                let result = logic(time.clone(), data);
+                if !result.is_empty() {
+                    output.push_vec(time, result);
+                }
+            }
+            Ok(())
+        };
+
+        // Operator factory — wires input puller and output pusher at materialization time.
+        let name_clone = name.clone();
+        let factory: OperatorFactory = Box::new(move |endpoints: ChannelEndpoints| {
+            let input_puller: Box<dyn Pull<T, D1>> = *endpoints.input_pullers
+                .into_iter().next()
+                .expect("unary must have input puller")
+                .downcast::<Box<dyn Pull<T, D1>>>()
+                .expect("unary input puller type mismatch");
+
+            let output_pusher: Box<dyn Push<T, D2>> = if !endpoints.output_pushers.is_empty() {
+                *endpoints.output_pushers.into_iter().next().unwrap()
+                    .downcast::<Box<dyn Push<T, D2>>>()
+                    .expect("unary output pusher type mismatch")
+            } else {
+                Box::new(NullPush)
+            };
+
+            Box::new(WiredUnaryOperator::new(
+                name_clone, op_idx, region_id, wired_logic, input_puller, output_pusher,
+            )) as Box<dyn SchedulableOperator>
+        });
+        self.operator_factories.push((op_idx, factory));
+
+        // Channel factory for the input edge
+        let edge_idx = self.graph.edges().len() - 1;
+        let capacity = self.channel_capacity;
+        let channel_factory: ChannelFactory = Box::new(move |_cap: usize| {
+            let (push, pull) = bounded_channel::<T, D1, ()>(capacity);
+            (
+                Box::new(Box::new(push) as Box<dyn Push<T, D1>>) as Box<dyn std::any::Any + Send>,
+                Box::new(Box::new(pull) as Box<dyn Pull<T, D1>>) as Box<dyn std::any::Any + Send>,
+            )
+        });
+        self.channel_factories.push((edge_idx, channel_factory));
+
         op_idx
     }
 
@@ -610,5 +729,138 @@ mod tests {
         let probe = result.unwrap();
         // After full completion, the sink probe shows done.
         assert!(probe.is_done());
+    }
+
+    #[test]
+    fn unary_map_doubles_values() {
+        let collected = build_and_run::<u64, _, _>(BuilderConfig::default(), |ctx| {
+            let source = ctx.add_source("numbers", vec![
+                (0u64, vec![1i32, 2, 3]),
+                (1u64, vec![4, 5]),
+            ]);
+            let mapped = ctx.add_unary::<i32, i32, _>("double", source, |_time, data| {
+                data.into_iter().map(|x| x * 2).collect()
+            });
+            let (_, collector) = ctx.add_sink::<i32>("output", mapped);
+            Ok(collector)
+        })
+        .unwrap();
+
+        let data = collected.lock().unwrap();
+        let all: Vec<i32> = data.iter().flat_map(|(_, v)| v.iter().copied()).collect();
+        assert_eq!(all.len(), 5);
+        assert!(all.contains(&2));
+        assert!(all.contains(&4));
+        assert!(all.contains(&6));
+        assert!(all.contains(&8));
+        assert!(all.contains(&10));
+    }
+
+    #[test]
+    fn unary_filter() {
+        let collected = build_and_run::<u64, _, _>(BuilderConfig::default(), |ctx| {
+            let source = ctx.add_source("numbers", vec![
+                (0u64, vec![1i32, 2, 3, 4, 5, 6]),
+            ]);
+            let evens = ctx.add_unary::<i32, i32, _>("filter_even", source, |_time, data| {
+                data.into_iter().filter(|x| x % 2 == 0).collect()
+            });
+            let (_, collector) = ctx.add_sink::<i32>("output", evens);
+            Ok(collector)
+        })
+        .unwrap();
+
+        let data = collected.lock().unwrap();
+        let all: Vec<i32> = data.iter().flat_map(|(_, v)| v.iter().copied()).collect();
+        assert_eq!(all, vec![2, 4, 6]);
+    }
+
+    #[test]
+    fn unary_type_conversion() {
+        // Source produces i32, unary converts to String, sink collects String.
+        let collected = build_and_run::<u64, _, _>(BuilderConfig::default(), |ctx| {
+            let source = ctx.add_source("numbers", vec![
+                (0u64, vec![42i32, 7]),
+            ]);
+            let stringified = ctx.add_unary::<i32, String, _>("to_string", source, |_time, data| {
+                data.into_iter().map(|x| x.to_string()).collect()
+            });
+            let (_, collector) = ctx.add_sink::<String>("output", stringified);
+            Ok(collector)
+        })
+        .unwrap();
+
+        let data = collected.lock().unwrap();
+        let all: Vec<String> = data.iter().flat_map(|(_, v)| v.clone()).collect();
+        assert_eq!(all, vec!["42".to_string(), "7".to_string()]);
+    }
+
+    #[test]
+    fn chained_unary_operators() {
+        // source → double → add_one → sink
+        let collected = build_and_run::<u64, _, _>(BuilderConfig::default(), |ctx| {
+            let source = ctx.add_source("numbers", vec![
+                (0u64, vec![1i32, 2, 3]),
+            ]);
+            let doubled = ctx.add_unary::<i32, i32, _>("double", source, |_t, data| {
+                data.into_iter().map(|x| x * 2).collect()
+            });
+            let incremented = ctx.add_unary::<i32, i32, _>("add_one", doubled, |_t, data| {
+                data.into_iter().map(|x| x + 1).collect()
+            });
+            let (_, collector) = ctx.add_sink::<i32>("output", incremented);
+            Ok(collector)
+        })
+        .unwrap();
+
+        let data = collected.lock().unwrap();
+        let all: Vec<i32> = data.iter().flat_map(|(_, v)| v.iter().copied()).collect();
+        // 1*2+1=3, 2*2+1=5, 3*2+1=7
+        assert_eq!(all, vec![3, 5, 7]);
+    }
+
+    #[test]
+    fn unary_with_empty_output() {
+        // Filter that removes all items — empty batches should be handled gracefully.
+        let collected = build_and_run::<u64, _, _>(BuilderConfig::default(), |ctx| {
+            let source = ctx.add_source("numbers", vec![
+                (0u64, vec![1i32, 3, 5]),
+            ]);
+            let filtered = ctx.add_unary::<i32, i32, _>("no_evens", source, |_t, data| {
+                data.into_iter().filter(|x| x % 2 == 0).collect()
+            });
+            let (_, collector) = ctx.add_sink::<i32>("output", filtered);
+            Ok(collector)
+        })
+        .unwrap();
+
+        let data = collected.lock().unwrap();
+        let all: Vec<i32> = data.iter().flat_map(|(_, v)| v.iter().copied()).collect();
+        assert!(all.is_empty());
+    }
+
+    #[test]
+    fn unary_with_probe() {
+        let (collector, probe) = build_and_run::<u64, _, _>(BuilderConfig::default(), |ctx| {
+            let source = ctx.add_source("numbers", vec![
+                (0u64, vec![10i32, 20]),
+                (1u64, vec![30]),
+            ]);
+            let doubled = ctx.add_unary::<i32, i32, _>("double", source, |_t, data| {
+                data.into_iter().map(|x| x * 2).collect()
+            });
+            let (sink_idx, collector) = ctx.add_sink::<i32>("output", doubled);
+            let probe = ctx.add_probe(sink_idx);
+            Ok((collector, probe))
+        })
+        .unwrap();
+
+        assert!(probe.is_done());
+        let data = collector.lock().unwrap();
+        let all: Vec<i32> = data.iter().flat_map(|(_, v)| v.iter().copied()).collect();
+        assert_eq!(all.len(), 3);
+        assert!(all.contains(&20));
+        assert!(all.contains(&40));
+        assert!(all.contains(&60));
     }
 }
