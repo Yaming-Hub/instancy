@@ -13,7 +13,7 @@ pub mod spec;
 pub mod stream;
 
 pub use channels::{ControlSignal, Envelope, PartitionStrategy, Payload};
-pub use id::{DataflowId, DataflowIdAllocator};
+pub use id::DataflowId;
 pub use operators::handles::{InputHandle, NotificationHandle, OutputHandle, OutputSession};
 pub use operators::input::{ChannelInput, InputEvent, TimestampedInput, VecInput};
 pub use operators::output::{OutputEvent, OutputStream, OutputSender};

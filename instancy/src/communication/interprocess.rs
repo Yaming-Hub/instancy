@@ -36,6 +36,24 @@ use crate::worker::WorkerId;
 /// channel ID. This ID is used in the frame header to multiplex/demultiplex
 /// frames on a shared physical connection.
 ///
+/// # Scope and Consistency
+///
+/// - **Per-dataflow**: Channel IDs are scoped to a single dataflow. Two different
+///   dataflows may reuse the same numeric channel ID without conflict because
+///   frames are always tagged with the `DataflowId` in the wire header.
+/// - **Cluster-consistent**: The same logical edge gets the same `ChannelId` on
+///   every node in the cluster. This is guaranteed by the deterministic assignment
+///   during graph construction — all nodes construct the same graph and therefore
+///   assign the same IDs.
+/// - **Reserved**: `ChannelId = 0` (`PROGRESS_CHANNEL_ID`) is reserved for the
+///   progress exchange protocol and must not be used for data channels.
+///
+/// # Assignment
+///
+/// Channel IDs are assigned sequentially by [`DataflowSession::allocate_channel`]
+/// starting at 1 (since 0 is reserved). The allocation is deterministic given
+/// the same graph construction order.
+///
 /// This is a **physical** wire-protocol concept — it maps a logical dataflow
 /// edge to a specific multiplexed channel on the physical TCP connection.
 pub type ChannelId = u64;
@@ -60,8 +78,8 @@ pub struct RemoteEndpoint {
 /// over the network. Workers on the local node have no entry (handled in-process).
 #[derive(Debug, Clone)]
 pub struct RoutingTable {
-    /// The local physical node index in the cluster.
-    local_node: usize,
+    /// The local physical node identity in the cluster.
+    local_node_id: String,
     /// Map from logical worker index to physical remote endpoint.
     /// Only contains entries for workers on remote physical nodes.
     remote_targets: HashMap<usize, RemoteEndpoint>,
@@ -76,30 +94,31 @@ impl RoutingTable {
     /// Each remote worker gets `base_channel_id + target_worker_index`.
     /// Must be > 0 since channel ID 0 is reserved for progress protocol.
     ///
-    /// `peer_map` maps node_index → PeerId for all remote nodes.
+    /// `peer_map` maps node_id → PeerId for all remote nodes.
     ///
     /// # Panics
     ///
     /// Panics if `base_channel_id` is 0 (reserved for progress).
     pub fn new(
         topology: &ClusterTopology,
-        local_node: usize,
+        local_node_id: impl Into<String>,
         base_channel_id: ChannelId,
-        peer_map: &HashMap<usize, PeerId>,
+        peer_map: &HashMap<String, PeerId>,
     ) -> Self {
         assert!(
             base_channel_id > PROGRESS_CHANNEL_ID,
             "base_channel_id must be > 0 (channel 0 is reserved for progress)"
         );
 
+        let local_node_id = local_node_id.into();
         let mut remote_targets = HashMap::new();
 
         for node in &topology.nodes {
-            if node.node_index == local_node {
+            if node.node_id == local_node_id {
                 continue;
             }
-            if let Some(&peer_id) = peer_map.get(&node.node_index) {
-                if let Some((start, end)) = topology.worker_range(node.node_index) {
+            if let Some(&peer_id) = peer_map.get(&node.node_id) {
+                if let Some((start, end)) = topology.worker_range(&node.node_id) {
                     for worker_idx in start..end {
                         remote_targets.insert(
                             worker_idx,
@@ -114,7 +133,7 @@ impl RoutingTable {
         }
 
         Self {
-            local_node,
+            local_node_id,
             remote_targets,
             total_workers: topology.total_workers(),
         }
@@ -131,9 +150,9 @@ impl RoutingTable {
         self.remote_targets.get(&logical_worker_index)
     }
 
-    /// Get the local node index.
-    pub fn local_node(&self) -> usize {
-        self.local_node
+    /// Get the local node identity.
+    pub fn local_node_id(&self) -> &str {
+        &self.local_node_id
     }
 
     /// Total number of workers in the cluster.
@@ -320,8 +339,8 @@ where
 /// can update their global view of progress.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ProgressMessage<T> {
-    /// The node that produced this update.
-    pub source_node: usize,
+    /// The node identity that produced this update.
+    pub source_node_id: String,
     /// Per-operator frontier changes: (operator_index, timestamp, delta).
     /// Positive delta = new capability, negative = released capability.
     pub changes: Vec<(usize, T, i64)>,
@@ -342,10 +361,12 @@ where
 {
     buf.clear();
 
-    // Source node (4 bytes)
-    let node_u32 = u32::try_from(msg.source_node)
-        .map_err(|_| CodecError::Custom("source_node exceeds u32".into()))?;
-    buf.extend_from_slice(&node_u32.to_le_bytes());
+    // Source node_id (length-prefixed string: 4 bytes len + UTF-8 bytes)
+    let node_bytes = msg.source_node_id.as_bytes();
+    let node_len = u32::try_from(node_bytes.len())
+        .map_err(|_| CodecError::Custom("source_node_id length exceeds u32".into()))?;
+    buf.extend_from_slice(&node_len.to_le_bytes());
+    buf.extend_from_slice(node_bytes);
 
     // Number of changes (4 bytes)
     let count_u32 = u32::try_from(msg.changes.len())
@@ -380,16 +401,42 @@ where
     T: Timestamp,
     TC: Codec<T>,
 {
-    if bytes.len() < 8 {
+    if bytes.len() < 4 {
         return Err(CodecError::InsufficientData {
-            needed: 8,
+            needed: 4,
             available: bytes.len(),
         });
     }
 
-    let source_node = u32::from_le_bytes(bytes[0..4].try_into().unwrap()) as usize;
-    let count = u32::from_le_bytes(bytes[4..8].try_into().unwrap()) as usize;
-    let mut offset = 8;
+    // Read source_node_id (length-prefixed string)
+    let node_len = u32::from_le_bytes(bytes[0..4].try_into().unwrap()) as usize;
+    // Cap node_id length to prevent DoS from malicious peers
+    const MAX_NODE_ID_LEN: usize = 512;
+    if node_len > MAX_NODE_ID_LEN {
+        return Err(CodecError::InvalidData(format!(
+            "source_node_id length {node_len} exceeds maximum {MAX_NODE_ID_LEN}"
+        )));
+    }
+    let mut offset = 4;
+    if offset + node_len > bytes.len() {
+        return Err(CodecError::InsufficientData {
+            needed: offset + node_len,
+            available: bytes.len(),
+        });
+    }
+    let source_node_id = String::from_utf8(bytes[offset..offset + node_len].to_vec())
+        .map_err(|e| CodecError::InvalidData(format!("invalid UTF-8 in source_node_id: {e}")))?;
+    offset += node_len;
+
+    // Read count
+    if offset + 4 > bytes.len() {
+        return Err(CodecError::InsufficientData {
+            needed: offset + 4,
+            available: bytes.len(),
+        });
+    }
+    let count = u32::from_le_bytes(bytes[offset..offset + 4].try_into().unwrap()) as usize;
+    offset += 4;
 
     // Cap pre-allocation: each change needs at least 4+4+time+8 bytes (min ~16)
     let remaining = bytes.len().saturating_sub(offset);
@@ -442,7 +489,7 @@ where
     }
 
     Ok(ProgressMessage {
-        source_node,
+        source_node_id,
         changes,
     })
 }
@@ -461,10 +508,10 @@ mod tests {
     fn routing_table_single_node_no_remotes() {
         let topology = ClusterTopology::single_node(4);
         let peer_map = HashMap::new();
-        let table = RoutingTable::new(&topology, 0, 100, &peer_map);
+        let table = RoutingTable::new(&topology, "local", 100, &peer_map);
 
         assert_eq!(table.total_workers(), 4);
-        assert_eq!(table.local_node(), 0);
+        assert_eq!(table.local_node_id(), "local");
         for i in 0..4 {
             assert!(!table.is_remote(i));
             assert!(table.endpoint(i).is_none());
@@ -474,17 +521,17 @@ mod tests {
     #[test]
     fn routing_table_multi_node() {
         let topology = ClusterTopology::multi_node(vec![
-            NodeConfig::new(0, 2),
-            NodeConfig::new(1, 3),
-            NodeConfig::new(2, 1),
+            NodeConfig::new("node-0", 2),
+            NodeConfig::new("node-1", 3),
+            NodeConfig::new("node-2", 1),
         ])
         .unwrap();
 
         let mut peer_map = HashMap::new();
-        peer_map.insert(1, PeerId(100));
-        peer_map.insert(2, PeerId(200));
+        peer_map.insert("node-1".into(), PeerId(100));
+        peer_map.insert("node-2".into(), PeerId(200));
 
-        let table = RoutingTable::new(&topology, 0, 1000, &peer_map);
+        let table = RoutingTable::new(&topology, "node-0", 1000, &peer_map);
 
         assert_eq!(table.total_workers(), 6);
 
@@ -525,16 +572,16 @@ mod tests {
     #[test]
     fn routing_table_from_non_zero_node() {
         let topology = ClusterTopology::multi_node(vec![
-            NodeConfig::new(0, 2),
-            NodeConfig::new(1, 2),
+            NodeConfig::new("node-0", 2),
+            NodeConfig::new("node-1", 2),
         ])
         .unwrap();
 
         let mut peer_map = HashMap::new();
-        peer_map.insert(0, PeerId(10));
+        peer_map.insert("node-0".into(), PeerId(10));
 
         // We are node 1
-        let table = RoutingTable::new(&topology, 1, 500, &peer_map);
+        let table = RoutingTable::new(&topology, "node-1", 500, &peer_map);
 
         // Workers 0,1 are remote (node 0, peer 10)
         assert!(table.is_remote(0));
@@ -555,15 +602,15 @@ mod tests {
     #[test]
     fn routing_table_remote_endpoints_iter() {
         let topology = ClusterTopology::multi_node(vec![
-            NodeConfig::new(0, 1),
-            NodeConfig::new(1, 2),
+            NodeConfig::new("node-0", 1),
+            NodeConfig::new("node-1", 2),
         ])
         .unwrap();
 
         let mut peer_map = HashMap::new();
-        peer_map.insert(1, PeerId(42));
+        peer_map.insert("node-1".into(), PeerId(42));
 
-        let table = RoutingTable::new(&topology, 0, 1, &peer_map);
+        let table = RoutingTable::new(&topology, "node-0", 1, &peer_map);
 
         let endpoints: Vec<_> = table.remote_endpoints().collect();
         assert_eq!(endpoints.len(), 2);
@@ -573,13 +620,13 @@ mod tests {
     #[should_panic(expected = "base_channel_id must be > 0")]
     fn routing_table_rejects_channel_id_zero() {
         let topology = ClusterTopology::multi_node(vec![
-            NodeConfig::new(0, 1),
-            NodeConfig::new(1, 2),
+            NodeConfig::new("node-0", 1),
+            NodeConfig::new("node-1", 2),
         ])
         .unwrap();
         let mut peer_map = HashMap::new();
-        peer_map.insert(1, PeerId(42));
-        let _table = RoutingTable::new(&topology, 0, 0, &peer_map);
+        peer_map.insert("node-1".into(), PeerId(42));
+        let _table = RoutingTable::new(&topology, "node-0", 0, &peer_map);
     }
 
     // --- Data batch encode/decode tests ---
@@ -687,7 +734,7 @@ mod tests {
     #[test]
     fn encode_decode_progress_empty() {
         let msg = ProgressMessage::<u64> {
-            source_node: 0,
+            source_node_id: "node-0".into(),
             changes: vec![],
         };
 
@@ -696,14 +743,14 @@ mod tests {
         encode_progress(&msg, &codec, &mut buf).unwrap();
 
         let decoded = decode_progress::<u64, _>(&buf, &codec).unwrap();
-        assert_eq!(decoded.source_node, 0);
+        assert_eq!(decoded.source_node_id, "node-0");
         assert!(decoded.changes.is_empty());
     }
 
     #[test]
     fn encode_decode_progress_multiple_changes() {
         let msg = ProgressMessage::<u64> {
-            source_node: 2,
+            source_node_id: "node-2".into(),
             changes: vec![(0, 10, 1), (1, 20, -1), (3, 5, 2)],
         };
 
@@ -712,7 +759,7 @@ mod tests {
         encode_progress(&msg, &codec, &mut buf).unwrap();
 
         let decoded = decode_progress::<u64, _>(&buf, &codec).unwrap();
-        assert_eq!(decoded.source_node, 2);
+        assert_eq!(decoded.source_node_id, "node-2");
         assert_eq!(decoded.changes.len(), 3);
         assert_eq!(decoded.changes[0], (0, 10, 1));
         assert_eq!(decoded.changes[1], (1, 20, -1));
@@ -730,9 +777,10 @@ mod tests {
     fn decode_progress_truncated_change() {
         let codec = FixedSizeCodec::<u64>::new();
 
-        // Valid header claiming 1 change but no change data
+        // Valid header: empty node_id (len=0) + count=1 but no change data
         let mut buf = Vec::new();
-        buf.extend_from_slice(&0u32.to_le_bytes()); // source_node
+        buf.extend_from_slice(&0u32.to_le_bytes()); // node_id len = 0
+        // no node_id bytes
         buf.extend_from_slice(&1u32.to_le_bytes()); // count = 1
         // No actual change data
 
@@ -762,7 +810,7 @@ mod tests {
     #[test]
     fn progress_encode_is_deterministic() {
         let msg = ProgressMessage::<u64> {
-            source_node: 1,
+            source_node_id: "node-1".into(),
             changes: vec![(0, 5, 1), (2, 10, -1)],
         };
 

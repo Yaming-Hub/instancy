@@ -179,16 +179,16 @@ where
 pub struct InMemoryClusterTransport {
     /// The cluster topology for local/remote decisions.
     topology: ClusterTopology,
-    /// This node's index.
-    local_node_index: usize,
+    /// This node's identity.
+    local_node_id: String,
 }
 
 impl InMemoryClusterTransport {
     /// Create a new in-memory cluster transport.
-    pub fn new(topology: ClusterTopology, local_node_index: usize) -> Self {
+    pub fn new(topology: ClusterTopology, local_node_id: impl Into<String>) -> Self {
         Self {
             topology,
-            local_node_index,
+            local_node_id: local_node_id.into(),
         }
     }
 }
@@ -214,7 +214,7 @@ impl TransportProvider for InMemoryClusterTransport {
         let source_node = self.topology.node_for_worker(source.worker);
         let target_node = self.topology.node_for_worker(target.worker);
         source_node == target_node
-            && source_node == Some(self.local_node_index)
+            && source_node == Some(self.local_node_id.as_str())
     }
 }
 
@@ -292,20 +292,20 @@ mod tests {
     fn in_memory_cluster_transport_locality() {
         use crate::execute::NodeConfig;
 
-        // 2 nodes: node 0 has workers 0,1; node 1 has workers 2,3
+        // 2 nodes: node-0 has workers 0,1; node-1 has workers 2,3
         let topology = ClusterTopology::multi_node(vec![
-            NodeConfig::new(0, 2),
-            NodeConfig::new(1, 2),
+            NodeConfig::new("node-0", 2),
+            NodeConfig::new("node-1", 2),
         ])
         .unwrap();
-        let transport = InMemoryClusterTransport::new(topology, 0);
+        let transport = InMemoryClusterTransport::new(topology, "node-0");
 
-        // Same node (workers 0 and 1 both on node 0) = local
+        // Same node (workers 0 and 1 both on node-0) = local
         let src = make_target(0, 0, 0, 0);
         let dst_local = make_target(0, 1, 1, 0);
         assert!(transport.is_local(&src, &dst_local));
 
-        // Different nodes (worker 0 on node 0, worker 2 on node 1) = remote
+        // Different nodes (worker 0 on node-0, worker 2 on node-1) = remote
         let dst_remote = make_target(0, 2, 0, 0);
         assert!(!transport.is_local(&src, &dst_remote));
     }

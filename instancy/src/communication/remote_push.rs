@@ -44,7 +44,7 @@ impl Default for RemotePushConfig {
 #[derive(Debug, Clone)]
 pub struct OutboundFrame {
     /// The dataflow this frame belongs to.
-    pub dataflow_id: u64,
+    pub dataflow_id: DataflowId,
     /// The channel within the dataflow.
     pub channel_id: ChannelId,
     /// Serialized payload bytes.
@@ -188,7 +188,7 @@ where
         };
 
         let frame = OutboundFrame {
-            dataflow_id: self.dataflow_id.as_raw(),
+            dataflow_id: self.dataflow_id,
             channel_id: self.channel_id,
             payload: payload_bytes,
         };
@@ -270,7 +270,7 @@ mod tests {
     fn remote_push_sends_frame() {
         let (sender, receiver) = FrameSender::channel(16);
         let codec = Arc::new(TestCodec);
-        let dataflow_id = DataflowId::new(0, 1);
+        let dataflow_id = DataflowId::from_bytes([1u8; 16]);
         let channel_id = 42;
 
         let push = RemotePush::<u64, u32, (), TestCodec>::new(
@@ -291,7 +291,7 @@ mod tests {
         push.push(envelope).unwrap();
 
         let frame = receiver.recv().unwrap();
-        assert_eq!(frame.dataflow_id, dataflow_id.as_raw());
+        assert_eq!(frame.dataflow_id, dataflow_id);
         assert_eq!(frame.channel_id, 42);
         // Decode and verify
         let mut expected = Vec::new();
@@ -305,7 +305,7 @@ mod tests {
     fn remote_push_backpressure_on_full() {
         let (sender, _receiver) = FrameSender::channel(2);
         let codec = Arc::new(TestCodec);
-        let dataflow_id = DataflowId::new(0, 1);
+        let dataflow_id = DataflowId::from_bytes([1u8; 16]);
 
         let push = RemotePush::<u64, u32, (), TestCodec>::new(
             dataflow_id,
@@ -335,7 +335,7 @@ mod tests {
     fn remote_push_channel_closed() {
         let (sender, receiver) = FrameSender::channel(16);
         let codec = Arc::new(TestCodec);
-        let dataflow_id = DataflowId::new(0, 1);
+        let dataflow_id = DataflowId::from_bytes([1u8; 16]);
 
         let push = RemotePush::<u64, u32, (), TestCodec>::new(
             dataflow_id,
@@ -364,7 +364,7 @@ mod tests {
 
         let (sender, receiver) = FrameSender::channel(16);
         let codec = Arc::new(TestCodec);
-        let dataflow_id = DataflowId::new(0, 1);
+        let dataflow_id = DataflowId::from_bytes([1u8; 16]);
 
         let push = RemotePush::<u64, u32, (), TestCodec>::new(
             dataflow_id,
@@ -390,7 +390,7 @@ mod tests {
         for i in 0..3 {
             sender
                 .try_send(OutboundFrame {
-                    dataflow_id: 1,
+                    dataflow_id: DataflowId::from_bytes([1u8; 16]),
                     channel_id: i,
                     payload: vec![],
                 })
@@ -399,7 +399,7 @@ mod tests {
 
         // Full
         let result = sender.try_send(OutboundFrame {
-            dataflow_id: 1,
+            dataflow_id: DataflowId::from_bytes([1u8; 16]),
             channel_id: 99,
             payload: vec![],
         });
@@ -413,12 +413,12 @@ mod tests {
     #[test]
     fn outbound_frame_into_wire_frame() {
         let frame = OutboundFrame {
-            dataflow_id: 100,
+            dataflow_id: DataflowId::from_bytes([100u8; 16]),
             channel_id: 42,
             payload: vec![1, 2, 3],
         };
         let wire = frame.into_frame();
-        assert_eq!(wire.dataflow_id, 100);
+        assert_eq!(wire.dataflow_id, DataflowId::from_bytes([100u8; 16]));
         assert_eq!(wire.channel_id, 42);
         assert_eq!(wire.payload, vec![1, 2, 3]);
     }
@@ -434,7 +434,7 @@ mod tests {
         let (sender, _receiver) = FrameSender::channel(8);
         let codec = Arc::new(TestCodec);
         let push = RemotePush::<u64, u32, (), TestCodec>::new(
-            DataflowId::new(2, 5),
+            DataflowId::from_bytes([1u8; 16]),
             7,
             codec,
             sender,

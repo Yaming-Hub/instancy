@@ -15,7 +15,7 @@ use instancy::communication::interprocess::PROGRESS_CHANNEL_ID;
 use instancy::communication::remote_push::{FrameSender, OutboundFrame, RemotePush};
 use instancy::communication::session::DataflowSession;
 use instancy::communication::progress_exchange::{PeerProgressSender, ProgressExchange};
-use instancy::dataflow::id::{DataflowId, DataflowIdAllocator};
+use instancy::dataflow::id::DataflowId;
 use instancy::execute::{ClusterTopology, NodeConfig};
 use instancy::providers::transport::{InMemoryClusterTransport, PushEndpoint, TransportProvider};
 use instancy::worker::WorkerId;
@@ -82,8 +82,8 @@ impl Codec<u64> for U64Codec {
 
 fn two_node_topology() -> ClusterTopology {
     ClusterTopology::multi_node(vec![
-        NodeConfig::new(0, 2), // node 0: workers 0, 1
-        NodeConfig::new(1, 2), // node 1: workers 2, 3
+        NodeConfig::new("node-0", 2), // node 0: workers 0, 1
+        NodeConfig::new("node-1", 2), // node 1: workers 2, 3
     ])
     .unwrap()
 }
@@ -92,30 +92,22 @@ fn two_node_topology() -> ClusterTopology {
 
 #[test]
 fn dataflow_id_uniqueness_across_nodes() {
-    let alloc_node0 = DataflowIdAllocator::new(0);
-    let alloc_node1 = DataflowIdAllocator::new(1);
-    let alloc_node2 = DataflowIdAllocator::new(2);
+    // Simulate multiple nodes creating DataflowIds independently
+    let ids: Vec<_> = (0..300).map(|_| DataflowId::new()).collect();
 
-    // Generate IDs from each node
-    let ids0: Vec<_> = (0..100).map(|_| alloc_node0.allocate()).collect();
-    let ids1: Vec<_> = (0..100).map(|_| alloc_node1.allocate()).collect();
-    let ids2: Vec<_> = (0..100).map(|_| alloc_node2.allocate()).collect();
-
-    // No overlap
     let mut all: std::collections::HashSet<DataflowId> = std::collections::HashSet::new();
-    for id in ids0.iter().chain(ids1.iter()).chain(ids2.iter()) {
-        assert!(all.insert(*id), "duplicate DataflowId across nodes: {id:?}");
+    for id in &ids {
+        assert!(all.insert(*id), "duplicate DataflowId: {id:?}");
     }
     assert_eq!(all.len(), 300);
 }
 
 #[test]
-fn dataflow_id_encoding_preserves_node_index() {
-    let alloc = DataflowIdAllocator::new(42);
-    for _ in 0..50 {
-        let id = alloc.allocate();
-        assert_eq!(id.node_index(), 42);
-    }
+fn dataflow_id_encoding_preserves_bytes() {
+    let id = DataflowId::new();
+    let bytes = *id.as_bytes();
+    let restored = DataflowId::from_bytes(bytes);
+    assert_eq!(id, restored);
 }
 
 // ─── DataflowSession wiring tests ──────────────────────────────────────────
@@ -123,7 +115,7 @@ fn dataflow_id_encoding_preserves_node_index() {
 #[test]
 fn session_wires_local_and_remote_channels() {
     let topo = two_node_topology();
-    let session = DataflowSession::new(DataflowId::new(0, 1), topo, 0);
+    let session = DataflowSession::new(DataflowId::from_bytes([1u8; 16]), topo, "node-0");
 
     // Local: both workers on node 0
     let ch_local = session.allocate_channel(WorkerId::new(0), WorkerId::new(1));
@@ -140,7 +132,7 @@ fn session_wires_local_and_remote_channels() {
 #[test]
 fn session_remote_channels_lists_only_cross_node() {
     let topo = two_node_topology();
-    let session = DataflowSession::new(DataflowId::new(0, 1), topo, 0);
+    let session = DataflowSession::new(DataflowId::from_bytes([1u8; 16]), topo, "node-0");
 
     session.allocate_channel(WorkerId::new(0), WorkerId::new(1)); // local
     session.allocate_channel(WorkerId::new(0), WorkerId::new(2)); // remote
@@ -159,7 +151,7 @@ fn session_remote_channels_lists_only_cross_node() {
 fn remote_push_routes_data_to_correct_channel() {
     let (sender, receiver) = FrameSender::channel(32);
     let codec = Arc::new(TestBatchCodec);
-    let dataflow_id = DataflowId::new(0, 1);
+    let dataflow_id = DataflowId::from_bytes([1u8; 16]);
 
     let push = RemotePush::<u64, u32, (), TestBatchCodec>::new(
         dataflow_id,
@@ -181,7 +173,7 @@ fn remote_push_routes_data_to_correct_channel() {
     push.push(envelope).unwrap();
 
     let frame = receiver.recv().unwrap();
-    assert_eq!(frame.dataflow_id, dataflow_id.as_raw());
+    assert_eq!(frame.dataflow_id, dataflow_id);
     assert_eq!(frame.channel_id, 7);
 
     // Decode and verify
@@ -196,7 +188,7 @@ fn remote_push_backpressure_does_not_block() {
     let codec = Arc::new(TestBatchCodec);
 
     let push = RemotePush::<u64, u32, (), TestBatchCodec>::new(
-        DataflowId::new(0, 1),
+        DataflowId::from_bytes([1u8; 16]),
         1,
         codec,
         sender,
@@ -227,12 +219,12 @@ fn remote_push_backpressure_does_not_block() {
 
 #[test]
 fn progress_broadcast_and_decode_roundtrip() {
-    let dataflow_id = DataflowId::new(0, 1);
-    let (sender, receiver) = PeerProgressSender::new(1, 64);
+    let dataflow_id = DataflowId::from_bytes([1u8; 16]);
+    let (sender, receiver) = PeerProgressSender::new("node-1", 64);
 
     let exchange = ProgressExchange::new(
         dataflow_id,
-        0, // local node
+        "node-0", // local node
         vec![sender],
         Arc::new(U64Codec),
     );
@@ -248,23 +240,23 @@ fn progress_broadcast_and_decode_roundtrip() {
     // Receive and decode
     let frame = receiver.recv().unwrap();
     assert_eq!(frame.channel_id, PROGRESS_CHANNEL_ID);
-    assert_eq!(frame.dataflow_id, dataflow_id.as_raw());
+    assert_eq!(frame.dataflow_id, dataflow_id);
 
     let msg = exchange.decode_remote_progress(&frame.payload).unwrap();
-    assert_eq!(msg.source_node, 0);
+    assert_eq!(msg.source_node_id, "node-0");
     assert_eq!(msg.changes, changes);
 }
 
 #[test]
 fn progress_frontier_advances_across_simulated_nodes() {
     // Simulate: node 0 sends progress to node 1, node 1 decodes it
-    let dataflow_id = DataflowId::new(0, 1);
+    let dataflow_id = DataflowId::from_bytes([1u8; 16]);
 
     // Node 0's exchange
-    let (sender_to_1, receiver_at_1) = PeerProgressSender::new(1, 64);
+    let (sender_to_1, receiver_at_1) = PeerProgressSender::new("node-1", 64);
     let node0_exchange = ProgressExchange::new(
         dataflow_id,
-        0,
+        "node-0",
         vec![sender_to_1],
         Arc::new(U64Codec),
     );
@@ -272,7 +264,7 @@ fn progress_frontier_advances_across_simulated_nodes() {
     // Node 1's exchange (for decoding)
     let node1_exchange: ProgressExchange<u64, U64Codec> = ProgressExchange::new(
         dataflow_id,
-        1,
+        "node-1",
         vec![],
         Arc::new(U64Codec),
     );
@@ -285,7 +277,7 @@ fn progress_frontier_advances_across_simulated_nodes() {
     let frame = receiver_at_1.recv().unwrap();
     let msg = node1_exchange.decode_remote_progress(&frame.payload).unwrap();
 
-    assert_eq!(msg.source_node, 0);
+    assert_eq!(msg.source_node_id, "node-0");
     assert_eq!(msg.changes[0], (0, 5u64, -1)); // released time 5
     assert_eq!(msg.changes[1], (0, 10u64, 1)); // acquired time 10
 }
@@ -295,9 +287,8 @@ fn progress_frontier_advances_across_simulated_nodes() {
 #[test]
 fn isolation_two_dataflows_share_connection_frames_routed_correctly() {
     // Two dataflows produce frames — they should have different dataflow_ids
-    let alloc = DataflowIdAllocator::new(0);
-    let id_a = alloc.allocate();
-    let id_b = alloc.allocate();
+    let id_a = DataflowId::new();
+    let id_b = DataflowId::new();
     assert_ne!(id_a, id_b);
 
     // Both use channel_id=1 but different dataflow_ids
@@ -333,8 +324,8 @@ fn isolation_two_dataflows_share_connection_frames_routed_correctly() {
     // Same channel_id, different dataflow_ids
     assert_eq!(frame1.channel_id, 1);
     assert_eq!(frame2.channel_id, 1);
-    assert_eq!(frame1.dataflow_id, id_a.as_raw());
-    assert_eq!(frame2.dataflow_id, id_b.as_raw());
+    assert_eq!(frame1.dataflow_id, id_a);
+    assert_eq!(frame2.dataflow_id, id_b);
     assert_ne!(frame1.dataflow_id, frame2.dataflow_id);
 }
 
@@ -342,22 +333,22 @@ fn isolation_two_dataflows_share_connection_frames_routed_correctly() {
 fn isolation_cancelled_dataflow_frames_distinguishable() {
     // Frames from a cancelled dataflow still carry its DataflowId —
     // the demuxer can identify and drop them.
-    let cancelled_id = DataflowId::new(0, 99);
-    let active_id = DataflowId::new(0, 100);
+    let cancelled_id = DataflowId::from_bytes([99u8; 16]);
+    let active_id = DataflowId::from_bytes([100u8; 16]);
 
     let frame_cancelled = OutboundFrame {
-        dataflow_id: cancelled_id.as_raw(),
+        dataflow_id: cancelled_id,
         channel_id: 5,
         payload: vec![1, 2, 3],
     };
     let frame_active = OutboundFrame {
-        dataflow_id: active_id.as_raw(),
+        dataflow_id: active_id,
         channel_id: 5,
         payload: vec![4, 5, 6],
     };
 
     // A filter (simulating demuxer behavior) can distinguish them
-    let active_set = std::collections::HashSet::from([active_id.as_raw()]);
+    let active_set = std::collections::HashSet::from([active_id]);
 
     assert!(!active_set.contains(&frame_cancelled.dataflow_id));
     assert!(active_set.contains(&frame_active.dataflow_id));
@@ -368,7 +359,7 @@ fn isolation_cancelled_dataflow_frames_distinguishable() {
 #[test]
 fn cluster_transport_local_vs_remote() {
     let topo = two_node_topology();
-    let transport = InMemoryClusterTransport::new(topo, 0);
+    let transport = InMemoryClusterTransport::new(topo, "node-0");
 
     use instancy::dataflow::region::RegionId;
     use instancy::providers::transport::LogicalTarget;
@@ -407,7 +398,7 @@ async fn end_to_end_frame_delivery_through_muxer_demuxer() {
     use instancy::communication::{DemuxConfig, Demuxer, MuxConfig, Muxer};
     use tokio::io::duplex;
 
-    let dataflow_id = DataflowId::new(0, 1);
+    let dataflow_id = DataflowId::from_bytes([1u8; 16]);
 
     // Create a bidirectional connection
     let (node0_write, node1_read) = duplex(65536);
@@ -418,20 +409,20 @@ async fn end_to_end_frame_delivery_through_muxer_demuxer() {
     // Node 1: demuxer reads frames
     let config = DemuxConfig { channel_buffer: 32 };
     let mut demuxer = Demuxer::new(node1_read, config);
-    let mut rx_data = demuxer.register_channel(dataflow_id.as_raw(), 1);
-    let mut rx_progress = demuxer.register_channel(dataflow_id.as_raw(), PROGRESS_CHANNEL_ID);
+    let mut rx_data = demuxer.register_channel(dataflow_id, 1);
+    let mut rx_progress = demuxer.register_channel(dataflow_id, PROGRESS_CHANNEL_ID);
 
     let mux_handle = tokio::spawn(async move { muxer.run().await });
     let demux_handle = tokio::spawn(async move { demuxer.run().await });
 
     // Send a data frame and a progress frame
     mux_sender
-        .send_payload(dataflow_id.as_raw(), 1, b"data-payload".to_vec())
+        .send_payload(dataflow_id, 1, b"data-payload".to_vec())
         .await
         .unwrap();
     mux_sender
         .send_payload(
-            dataflow_id.as_raw(),
+            dataflow_id,
             PROGRESS_CHANNEL_ID,
             b"progress-payload".to_vec(),
         )
@@ -457,8 +448,8 @@ async fn end_to_end_two_dataflows_isolated_on_same_connection() {
     use instancy::communication::{DemuxConfig, Demuxer, MuxConfig, Muxer};
     use tokio::io::duplex;
 
-    let id_a = DataflowId::new(0, 1);
-    let id_b = DataflowId::new(0, 2);
+    let id_a = DataflowId::from_bytes([1u8; 16]);
+    let id_b = DataflowId::from_bytes([2u8; 16]);
 
     let (node0_write, node1_read) = duplex(65536);
 
@@ -467,19 +458,19 @@ async fn end_to_end_two_dataflows_isolated_on_same_connection() {
     let mut demuxer = Demuxer::new(node1_read, config);
 
     // Register same channel_id (1) for two different dataflows
-    let mut rx_a = demuxer.register_channel(id_a.as_raw(), 1);
-    let mut rx_b = demuxer.register_channel(id_b.as_raw(), 1);
+    let mut rx_a = demuxer.register_channel(id_a, 1);
+    let mut rx_b = demuxer.register_channel(id_b, 1);
 
     let mux_handle = tokio::spawn(async move { muxer.run().await });
     let demux_handle = tokio::spawn(async move { demuxer.run().await });
 
     // Send frames for both dataflows on channel_id=1
     mux_sender
-        .send_payload(id_a.as_raw(), 1, b"for-A".to_vec())
+        .send_payload(id_a, 1, b"for-A".to_vec())
         .await
         .unwrap();
     mux_sender
-        .send_payload(id_b.as_raw(), 1, b"for-B".to_vec())
+        .send_payload(id_b, 1, b"for-B".to_vec())
         .await
         .unwrap();
 
