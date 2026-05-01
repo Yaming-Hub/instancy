@@ -23,6 +23,7 @@ pub mod metrics;
 pub mod order;
 pub mod progress;
 pub mod providers;
+pub mod runtime;
 pub mod scheduler;
 pub mod worker;
 pub mod worker_pool;
