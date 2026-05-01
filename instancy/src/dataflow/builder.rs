@@ -208,13 +208,14 @@ impl<T: Timestamp> BuildContext<T> {
             region_id,
         ));
 
-        // Register in subgraph builder — unary has 1 input, 1 output.
+        // Register in subgraph builder — unary has 1 input, 1 output with
+        // identity path summary (timestamps pass through unchanged).
         self.subgraph_builder.add_operator(
             op_idx,
             &name,
             1, // one input
             1, // one output
-            PortConnectivity::new(1, 1),
+            PortConnectivity::identity(T::Summary::default()),
         );
 
         // Register edge in subgraph builder for progress/frontier tracking.
