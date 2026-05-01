@@ -739,6 +739,41 @@ Key components to document:
 
 ---
 
+## PR 22 — Coordinator integration primitives
+**Goal**: Provide the building blocks that host applications need to build a coordinator for distributed dataflow execution.
+
+- `dataflow/handle.rs`
+  - `DataflowHandle` — returned when submitting a dataflow; provides `result()`, `cancel()`, `progress_stream()`, `current_frontier()`
+  - `DataflowOutcome` enum — `Completed`, `Cancelled`, `Failed`, `Quiescent`, each carrying `progress_frontier` + `metrics`
+  - `ProgressUpdate` struct — streams frontier advances with records_processed count
+- `dataflow/outcome.rs`
+  - `OutcomeAggregator` — collects per-node outcomes, produces `AggregatedOutcome`
+  - `AggregatedOutcome` enum — `Completed`, `Failed { failed_nodes }`, `Cancelled`
+  - Logic: any node failure → global failure; all cancelled → global cancelled; all completed → global completed
+- Executor integration:
+  - `DataflowExecutor` emits `ProgressUpdate` when frontier advances
+  - `DataflowExecutor::run()` returns `DataflowOutcome` (rich) instead of `Result<bool>`
+  - On cancellation: captures `progress_frontier` at the point of cancellation
+  - On error: captures `progress_frontier` + failed operator info
+- `CancellationToken` distributed coordination support:
+  - `cancel_reason()` — why was it cancelled (user request, timeout, node failure)
+  - `cancelled_at()` — timestamp of cancellation for diagnostics
+
+**Tests**:
+- DataflowHandle: cancel() triggers CancellationToken; result() returns outcome
+- DataflowHandle: progress_stream() receives updates when frontier advances
+- DataflowOutcome: Completed has empty frontier; Cancelled/Failed have non-empty frontier
+- OutcomeAggregator: all-complete → Completed
+- OutcomeAggregator: one-failed → Failed with failed_nodes list
+- OutcomeAggregator: all-cancelled → Cancelled with global progress (min frontier)
+- OutcomeAggregator: mixed cancelled+completed → Cancelled (conservative)
+- ProgressUpdate: records_processed accumulates correctly across activations
+- End-to-end: run pipeline, cancel midway, verify progress_frontier reflects processed timestamps
+
+**Estimated size**: ~2000 lines
+
+---
+
 ## Dependency Graph
 
 ```
@@ -779,6 +814,8 @@ PR19 (checkpoint operator + recovery)
 PR20 (polish: errors, error policy wiring, examples, docs)
  ↓
 PR21 (dynamic cluster scaling — ClusterMembership, scale-up/down)
+ ↓
+PR22 (coordinator integration — DataflowHandle, OutcomeAggregator, ProgressUpdate)
 ```
 
 ## Notes

@@ -823,6 +823,93 @@ stream.unary("word_count", |input, output| {
   dataflow is dropped or cancelled, the operator struct (and its closure with all captured
   state) is dropped, freeing all resources.
 
+#### 5.4.3 Operator Instantiation & the SPMD Model
+
+In the SPMD model, each logical worker independently builds and runs the same dataflow graph. When a region has parallelism=5, there are 5 workers, each creating its own instance of every operator in that region. The **operator index is the same** across all workers — what differs is the **worker ID**.
+
+```
+Region (parallelism=5):
+  Worker 0: operator "filter" (index=3), operator "aggregate" (index=4)
+  Worker 1: operator "filter" (index=3), operator "aggregate" (index=4)
+  Worker 2: operator "filter" (index=3), operator "aggregate" (index=4)
+  Worker 3: operator "filter" (index=3), operator "aggregate" (index=4)
+  Worker 4: operator "filter" (index=3), operator "aggregate" (index=4)
+
+Each instance is independent — no shared state between workers.
+Operator full identity: (worker_id, operator_index)
+```
+
+**How instantiation works:**
+
+Each worker runs the graph-building code independently (this is the "single program" in SPMD). Each worker's `.unary(name, logic)` call creates a **new OperatorFactory closure** which, when called at materialization time, produces a new operator with fresh state.
+
+```rust
+// This code runs on EACH worker independently:
+stream.unary("word_count", |input, output| {
+    // Each worker gets its own HashMap — no sharing.
+    let mut counts: HashMap<String, u64> = HashMap::new();
+    // ...
+});
+```
+
+**Key properties:**
+
+- The `OperatorFactory` is `FnOnce` — called exactly once by the one worker that created it.
+- There is no single factory called N times; there are N workers each creating their own factory from the same source code.
+- For stateful operators, each worker's instance accumulates state only for its own data partition (ensured by `exchange()` routing).
+- Operator state is never shared across workers — no locks, no synchronization needed.
+
+#### 5.4.4 Dynamic Operator Generation (Query Engine Integration)
+
+The `OperatorFactory` pattern supports **dynamic operator generation** — operators created at runtime from a query plan or other configuration rather than being statically coded. This is essential for integration with query engines like Apache DataFusion, where SQL logical plans are compiled into physical instancy operators.
+
+**Use case: datafusion-instancy (distributed SQL execution)**
+
+A `datafusion-instancy` extension crate would convert DataFusion logical plans into instancy dataflow graphs:
+
+1. DataFusion produces a logical plan: `Scan → Filter → Project → HashAgg → Exchange → MergeAgg`
+2. The extension crate walks the plan and creates an `OperatorFactory` for each node, capturing the node's **serializable configuration** (filter expressions, column projections, aggregation functions, join keys)
+3. Factories are registered in the `DataflowGraph`
+4. At materialization, each factory creates the concrete physical operator
+
+```rust
+/// Example: converting a logical plan node to an OperatorFactory.
+/// This runs on each node independently (SPMD) after receiving the plan.
+fn plan_node_to_factory(node: &LogicalPlan) -> OperatorFactory {
+    match node {
+        LogicalPlan::Filter { predicate, .. } => {
+            let expr = compile_predicate(predicate); // serializable config
+            Box::new(move |endpoints: ChannelEndpoints| {
+                Box::new(FilterOperator::new(expr, endpoints))
+            })
+        }
+        LogicalPlan::HashAggregate { group_by, aggr_fns, .. } => {
+            let keys = group_by.clone();
+            let fns = aggr_fns.clone();
+            Box::new(move |endpoints| {
+                Box::new(HashAggOperator::new(keys, fns, endpoints))
+            })
+        }
+        // Each logical plan node type maps to a physical operator
+    }
+}
+```
+
+**Why this works with SPMD:**
+
+- The logical plan is **serializable data** (expressions, column names, types) — not Rust closures
+- The coordinator sends the plan (protobuf/JSON) to each participating node
+- Each node deserializes the plan, calls `plan_node_to_factory()` for each node, builds the graph, and runs
+- The `datafusion-instancy` crate defines extended operator types (FilterOperator, HashAggOperator, etc.) that implement `SchedulableOperator`
+- All operators work with `RecordBatch` (Arrow columnar format) as the data type `D`
+
+**Design requirements this imposes on instancy:**
+
+- `OperatorFactory` must remain a simple `Box<dyn FnOnce(ChannelEndpoints) -> Box<dyn SchedulableOperator>>` — no complex trait hierarchies that prevent dynamic dispatch
+- `SchedulableOperator` trait must be implementable by external crates (no sealed traits, no unstable associated types)
+- Channel data type `D` must support `RecordBatch` and similar large columnar types efficiently (zero-copy where possible)
+- The `DataflowGraph` metadata must be constructable programmatically (not only via the `.unary()` / `.binary()` extension traits) so query planners can build graphs from plan trees
+
 ### 5.3 Input Streams
 
 The executor accepts a dataflow definition that binds external async streams as inputs. Instead of the caller imperatively calling `input.send()` and `input.advance_to()`, the dataflow is driven by `TimestampedInput` streams — async streams that yield timestamped data. The library reads from these streams, manages capabilities and frontier advancement automatically, and the dataflow makes progress reactively as data arrives.
@@ -3105,6 +3192,205 @@ File descriptors:
 
 ---
 
+## 12.5 Coordinator Integration Model
+
+### Execution Model: SPMD with Host-Managed Coordination
+
+instancy uses the **SPMD (Single Program, Multiple Data)** execution model: the hosting application launches the same dataflow program on each participating node, and each node's local executor runs the local partition of the graph. instancy does NOT dispatch work from a central coordinator to worker nodes.
+
+However, real-world services always have a **coordinator** — a component in the hosting application that receives user requests, starts distributed dataflow execution, monitors progress, and returns results to callers. **The coordinator is implemented by the hosting application, not by instancy.** instancy provides primitives (traits, structs, helpers) to make this coordinator integration straightforward, but the coordination logic — how to start dataflows on remote nodes, how to route user requests, how to aggregate results — is entirely the host application's responsibility. This is by design: different applications have fundamentally different coordination needs (actor frameworks, gRPC services, message queues, custom RPC).
+
+### DataflowHandle — The Driver Abstraction
+
+When a node submits a dataflow for execution, it receives a `DataflowHandle` — a lightweight handle that represents the running dataflow and provides:
+
+```rust
+/// Handle returned when a dataflow is submitted to the local executor.
+/// One instance per dataflow per node.
+/// Cardinality: 1 per (dataflow, node). Lifetime: dataflow execution.
+pub struct DataflowHandle {
+    /// Unique identifier for this dataflow across all nodes.
+    dataflow_id: DataflowId,
+    /// Receiver for the final outcome from the local executor.
+    outcome_rx: oneshot::Receiver<DataflowOutcome>,
+    /// Cancellation token — calling cancel() requests graceful shutdown.
+    cancel: CancellationToken,
+    /// Progress subscription — streams frontier updates to the holder.
+    progress_rx: mpsc::Receiver<ProgressUpdate>,
+}
+
+impl DataflowHandle {
+    /// Wait for the dataflow to complete, returning the final outcome.
+    pub async fn result(self) -> DataflowOutcome { ... }
+
+    /// Request graceful cancellation. Operators finish their current batch
+    /// then drain. Returns immediately; use `result()` to wait for completion.
+    pub fn cancel(&self) { self.cancel.cancel(); }
+
+    /// Subscribe to progress updates (frontier advances).
+    /// The coordinator uses this to track how far the dataflow has progressed.
+    pub fn progress_stream(&mut self) -> &mut mpsc::Receiver<ProgressUpdate> {
+        &mut self.progress_rx
+    }
+
+    /// Query current frontier — the set of timestamps that may still arrive.
+    /// If the frontier is empty, the dataflow is complete for all timestamps.
+    pub fn current_frontier(&self) -> Antichain<T> { ... }
+}
+```
+
+### DataflowOutcome — Rich Completion Status
+
+```rust
+/// The final result of a dataflow execution on a single node.
+/// The coordinator aggregates outcomes from all nodes.
+pub enum DataflowOutcome {
+    /// All operators completed successfully. All timestamps processed.
+    Completed {
+        /// The final frontier (empty = all timestamps done).
+        final_frontier: Antichain<T>,
+        /// Execution metrics (total CPU time, operator stats).
+        metrics: DataflowMetrics,
+    },
+
+    /// Dataflow was cancelled by the coordinator or user.
+    Cancelled {
+        /// Frontier at the time of cancellation — timestamps up to (but not
+        /// including) this frontier have been fully processed and committed
+        /// to sinks. Timestamps at or beyond this frontier may be partial.
+        progress_frontier: Antichain<T>,
+        /// Metrics up to the point of cancellation.
+        metrics: DataflowMetrics,
+    },
+
+    /// A fatal error occurred in one or more operators.
+    Failed {
+        /// The error that caused the failure.
+        error: Error,
+        /// Frontier at the time of failure — same semantics as Cancelled.
+        progress_frontier: Antichain<T>,
+        /// Which operator(s) failed.
+        failed_operators: Vec<OperatorInfo>,
+        /// Metrics up to the point of failure.
+        metrics: DataflowMetrics,
+    },
+
+    /// Quiescent — no operator can make progress but not all are done.
+    /// This happens when the dataflow is waiting for external input
+    /// (e.g., a live stream that hasn't produced new data).
+    Quiescent {
+        /// Current frontier — timestamps beyond this may still arrive.
+        progress_frontier: Antichain<T>,
+        metrics: DataflowMetrics,
+    },
+}
+```
+
+### ProgressUpdate — Real-Time Progress Reporting
+
+The coordinator needs to know how far the dataflow has progressed, both for user-facing progress reporting and for determining which timestamps are "safe" (fully committed to sinks).
+
+```rust
+/// A progress update emitted by the executor when the frontier advances.
+/// Cardinality: streamed periodically to the DataflowHandle holder.
+pub struct ProgressUpdate {
+    /// The dataflow this update is for.
+    pub dataflow_id: DataflowId,
+    /// The new frontier after this advance.
+    pub frontier: Antichain<T>,
+    /// How many records have been processed since last update.
+    pub records_processed: u64,
+    /// Wall-clock time of this update.
+    pub timestamp: Instant,
+}
+```
+
+### Cross-Node Outcome Aggregation
+
+In a distributed dataflow, the coordinator (in the host application) must aggregate outcomes from all nodes. instancy provides a helper for this:
+
+```rust
+/// Aggregates DataflowOutcomes from multiple nodes into a single result.
+/// The coordinator collects outcomes from all nodes and feeds them here.
+/// Cardinality: 1 per dataflow on the coordinator node. Lifetime: dataflow execution.
+pub struct OutcomeAggregator {
+    expected_nodes: Vec<String>,
+    received: HashMap<String, DataflowOutcome>,
+}
+
+impl OutcomeAggregator {
+    pub fn new(participating_nodes: Vec<String>) -> Self { ... }
+
+    /// Record a node's outcome. Returns the aggregated result when all nodes
+    /// have reported, or None if still waiting.
+    pub fn record(&mut self, node_id: &str, outcome: DataflowOutcome)
+        -> Option<AggregatedOutcome> { ... }
+}
+
+/// The aggregated outcome across all nodes.
+pub enum AggregatedOutcome {
+    /// All nodes completed successfully.
+    Completed { metrics: AggregatedMetrics },
+    /// One or more nodes failed. The entire dataflow is considered failed.
+    /// Includes which nodes failed and which succeeded.
+    Failed {
+        error: Error,
+        failed_nodes: Vec<(String, Error)>,
+        /// The global progress frontier (min across all nodes' frontiers).
+        global_progress: Antichain<T>,
+    },
+    /// Cancelled on all nodes.
+    Cancelled { global_progress: Antichain<T> },
+}
+```
+
+### Coordinator ↔ instancy Interaction Pattern
+
+```
+┌─────────────────────────────────────────────────────────────────────────┐
+│                    Coordinator (in host application)                      │
+│                                                                         │
+│  1. Receives user request                                               │
+│  2. Builds dataflow definition                                          │
+│  3. Sends "start dataflow" command to all participating nodes           │
+│  4. Collects DataflowHandle on the local node                          │
+│  5. Monitors progress via progress_stream()                            │
+│  6. On cancellation request: calls handle.cancel() + sends cancel       │
+│     command to remote nodes                                             │
+│  7. Collects outcomes from all nodes via OutcomeAggregator             │
+│  8. Returns final result to the user                                   │
+└─────────┬───────────────────────────────┬─────────────────────┬─────────┘
+          │ Start + Monitor               │ Start + Monitor     │ Start + Monitor
+          ▼                               ▼                     ▼
+┌─────────────────┐            ┌─────────────────┐   ┌─────────────────┐
+│   Node A        │            │   Node B        │   │   Node C        │
+│                 │◄──────────►│                 │◄──►│                 │
+│ DataflowHandle  │  exchange  │ DataflowHandle  │   │ DataflowHandle  │
+│ Executor.run()  │  channels  │ Executor.run()  │   │ Executor.run()  │
+└─────────────────┘            └─────────────────┘   └─────────────────┘
+```
+
+### Key Design Points
+
+1. **The coordinator is the host application's responsibility, not instancy's** — instancy is a dataflow execution library, not a distributed job scheduler. The host application implements all coordination logic: receiving user requests, launching dataflows on remote nodes, collecting results, and returning them to callers. This separation keeps instancy focused and avoids imposing a specific coordination pattern on diverse applications.
+
+2. **Worker placement is decided by the coordinator (host app)** — a dataflow does not necessarily run on all cluster nodes. The coordinator selects which nodes participate and how many logical workers each node contributes. It builds a per-dataflow `ClusterTopology` containing only the selected nodes and their worker assignments, then passes this topology to each node when starting the dataflow. instancy does not make placement decisions — it executes the assignment it receives. instancy may provide a `PlacementStrategy` trait and validation helpers (e.g., verify total workers match region parallelism requirements), but actual placement logic depends on factors only the host app knows: node load, data locality, cost constraints, hardware capabilities, etc.
+
+3. **instancy provides the building blocks** — `DataflowHandle`, `ProgressUpdate`, `OutcomeAggregator`, and `CancellationToken` provide everything the coordinator needs to manage distributed execution.
+
+4. **Progress frontier is the source of truth for "how far we got"** — when a dataflow is interrupted (cancelled or failed), the `progress_frontier` tells the coordinator which timestamps have been fully processed. This enables:
+   - Resume from last committed timestamp
+   - Report partial progress to the user
+   - Exactly-once semantics when combined with checkpointing
+
+5. **Cancellation is cooperative and distributed** — the coordinator cancels locally via `DataflowHandle::cancel()`, then sends a cancel command to remote nodes via the host app's communication layer. Each node's executor checks its local `CancellationToken` and drains gracefully.
+
+6. **Error reporting flows back to the coordinator** — when an operator fails, the local executor captures the error in `DataflowOutcome::Failed` with the progress frontier. The host app collects these outcomes and the `OutcomeAggregator` determines the global result.
+
+7. **The coordinator node is designated by the host app, not by instancy** — any node can be the coordinator. Typically it's the node that received the user request. instancy doesn't need to know which node is the coordinator.
+
+---
+
 ## 13. Dependencies
 
 ```toml
@@ -3138,6 +3424,8 @@ This section documents the cardinality (how many instances exist) and lifetime (
 | `ConnectionPool` | 1 per process | Process | Manages connections to all peer nodes |
 | `ClusterTopology` | 1 per process | Process (mutable on membership changes) | Updated when nodes join/leave |
 | `DataflowId` | 1 per dataflow | Dataflow | UUID, created at dataflow start |
+| `DataflowHandle` | 1 per (dataflow, node) | Dataflow | Returned to caller; provides cancel/progress/result |
+| `OutcomeAggregator` | 1 per dataflow on coordinator node | Dataflow | Collects per-node outcomes; host-app managed |
 | `DataflowSession` | 1 per dataflow | Dataflow | Owns channel allocation for one dataflow |
 | `ProgressTracker` | 1 per dataflow | Dataflow | Tracks frontier advancement |
 | `ProgressExchange` | 1 per dataflow | Dataflow | Sends/receives progress to/from peers |

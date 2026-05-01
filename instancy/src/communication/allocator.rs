@@ -134,6 +134,21 @@ impl<T: Timestamp, D: Send, M: Send> Push<T, D, M> for LocalPush<T, D, M> {
         Ok(())
     }
 
+    fn try_push(
+        &mut self,
+        envelope: Envelope<T, D, M>,
+    ) -> std::result::Result<(), (Error, Envelope<T, D, M>)> {
+        let mut state = self.shared.lock().unwrap();
+        if state.sender_closed || state.receiver_dropped {
+            return Err((Error::ChannelClosed, envelope));
+        }
+        if state.buffer.len() >= state.capacity {
+            return Err((Error::Backpressure, envelope));
+        }
+        state.buffer.push_back(envelope);
+        Ok(())
+    }
+
     fn flush(&mut self) -> Result<()> {
         // No-op for local channels; data is immediately visible.
         Ok(())

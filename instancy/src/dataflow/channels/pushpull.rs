@@ -18,7 +18,20 @@ pub trait Push<T: Timestamp, D, M = ()>: Send {
     ///
     /// Returns `Ok(())` if the message was accepted (possibly buffered).
     /// Returns `Err` if the channel is closed or at capacity with no room.
+    /// Note: on error, the envelope is consumed and lost. Use `try_push()`
+    /// when you need to preserve the envelope on failure.
     fn push(&mut self, envelope: Envelope<T, D, M>) -> Result<()>;
+
+    /// Try to push an envelope, returning it back on failure.
+    ///
+    /// On success, returns `Ok(())`.
+    /// On failure, returns `Err((error, envelope))` so the caller can retry
+    /// without data loss. Implementors must check capacity/state *before*
+    /// consuming the envelope.
+    fn try_push(
+        &mut self,
+        envelope: Envelope<T, D, M>,
+    ) -> std::result::Result<(), (crate::error::Error, Envelope<T, D, M>)>;
 
     /// Flush all buffered messages, ensuring they are visible to the receiver.
     ///
@@ -86,6 +99,17 @@ mod tests {
         fn push(&mut self, envelope: Envelope<T, D, M>) -> Result<()> {
             if self.closed {
                 return Err(crate::error::Error::Custom("channel closed".into()));
+            }
+            self.buffer.lock().unwrap().push(envelope);
+            Ok(())
+        }
+
+        fn try_push(
+            &mut self,
+            envelope: Envelope<T, D, M>,
+        ) -> std::result::Result<(), (crate::error::Error, Envelope<T, D, M>)> {
+            if self.closed {
+                return Err((crate::error::Error::Custom("channel closed".into()), envelope));
             }
             self.buffer.lock().unwrap().push(envelope);
             Ok(())
