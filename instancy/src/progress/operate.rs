@@ -27,6 +27,10 @@ use crate::progress::timestamp::Timestamp;
 pub struct PortConnectivity<S> {
     /// `connectivity[input][output]` — antichain of path summaries.
     connectivity: Vec<Vec<Antichain<S>>>,
+    /// Explicitly stored input count.
+    num_inputs: usize,
+    /// Explicitly stored output count.
+    num_outputs: usize,
 }
 
 impl<S: Clone + Debug + PartialEq + PartialOrder> PortConnectivity<S> {
@@ -36,6 +40,8 @@ impl<S: Clone + Debug + PartialEq + PartialOrder> PortConnectivity<S> {
     pub fn new(inputs: usize, outputs: usize) -> Self {
         Self {
             connectivity: vec![vec![Antichain::new(); outputs]; inputs],
+            num_inputs: inputs,
+            num_outputs: outputs,
         }
     }
 
@@ -49,16 +55,12 @@ impl<S: Clone + Debug + PartialEq + PartialOrder> PortConnectivity<S> {
 
     /// Returns the number of inputs.
     pub fn inputs(&self) -> usize {
-        self.connectivity.len()
+        self.num_inputs
     }
 
     /// Returns the number of outputs.
     pub fn outputs(&self) -> usize {
-        if self.connectivity.is_empty() {
-            0
-        } else {
-            self.connectivity[0].len()
-        }
+        self.num_outputs
     }
 
     /// Returns the path summaries from `input` to `output`.

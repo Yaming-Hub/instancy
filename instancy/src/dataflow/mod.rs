@@ -4,6 +4,7 @@
 //! scopes, streams, execution regions, channels, routing strategies,
 //! operators, and the dataflow specification builder.
 
+pub mod builder;
 pub mod channels;
 pub mod executor;
 pub mod graph;
@@ -16,6 +17,7 @@ pub mod spec;
 pub mod stream;
 pub mod wired_operators;
 
+pub use builder::{build_and_run, build_and_run_with_cancel, BuildContext, BuilderConfig};
 pub use channels::{ControlSignal, Envelope, PartitionStrategy, Payload};
 pub use executor::{DataflowExecutor, ExecutorConfig};
 pub use graph::{DataflowGraph, EdgeInfo, OperatorInfo};
