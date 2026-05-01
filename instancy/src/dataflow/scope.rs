@@ -172,7 +172,9 @@ impl<T: Timestamp> RootScope<T> {
             name: Arc::new(name.into()),
             addr: ScopeAddr::root(),
             state: Arc::new(Mutex::new(ScopeState {
-                next_operator_index: 0,
+                // Start at 1: index 0 is reserved for scope boundary metadata
+                // (consistent with ChildScope and SubgraphBuilder conventions).
+                next_operator_index: 1,
                 region_allocator,
                 regions: vec![default_region],
                 current_region_index: 0,
@@ -253,7 +255,8 @@ impl<T: Timestamp> Scope for RootScope<T> {
     }
 
     fn operator_count(&self) -> usize {
-        self.state.lock().unwrap().next_operator_index
+        // Subtract 1: index 0 is reserved for scope boundary metadata.
+        self.state.lock().unwrap().next_operator_index - 1
     }
 
     fn current_region(&self) -> Region {
@@ -407,7 +410,8 @@ impl<T: Timestamp> Scope for ChildScope<T> {
     }
 
     fn operator_count(&self) -> usize {
-        self.state.lock().unwrap().next_operator_index
+        // Subtract 1: index 0 is reserved for scope boundary metadata.
+        self.state.lock().unwrap().next_operator_index - 1
     }
 
     fn current_region(&self) -> Region {
@@ -501,9 +505,9 @@ mod tests {
         assert_eq!(scope.operator_count(), 0);
         assert_eq!(scope.current_region().parallelism(), 4);
 
-        // Allocate operators
-        assert_eq!(scope.allocate_operator_index(), 0);
+        // Allocate operators (index 0 is reserved for scope boundary)
         assert_eq!(scope.allocate_operator_index(), 1);
+        assert_eq!(scope.allocate_operator_index(), 2);
         assert_eq!(scope.operator_count(), 2);
     }
 
@@ -554,7 +558,7 @@ mod tests {
         // Index 0 is reserved for scope boundary; first user allocation is 1
         assert_eq!(scope.allocate_operator_index(), 1);
         assert_eq!(scope.allocate_operator_index(), 2);
-        assert_eq!(scope.operator_count(), 3); // includes reserved index 0
+        assert_eq!(scope.operator_count(), 2); // user operators only (excludes reserved index 0)
     }
 
     #[test]
@@ -577,14 +581,14 @@ mod tests {
         let mut scope = RootScope::<u64>::new("shared", 4);
         let mut cloned = scope.clone();
 
-        // Allocate from original
-        assert_eq!(scope.allocate_operator_index(), 0);
+        // Allocate from original (index 0 reserved for scope boundary)
+        assert_eq!(scope.allocate_operator_index(), 1);
 
         // Clone sees the allocation
         assert_eq!(cloned.operator_count(), 1);
 
         // Allocate from clone
-        assert_eq!(cloned.allocate_operator_index(), 1);
+        assert_eq!(cloned.allocate_operator_index(), 2);
 
         // Original sees it too
         assert_eq!(scope.operator_count(), 2);

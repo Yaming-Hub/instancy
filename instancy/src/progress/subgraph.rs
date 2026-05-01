@@ -304,6 +304,11 @@ impl<T: Timestamp> ProgressTracker<T> {
         self.completed = !self.tracker.tracking_anything();
     }
 
+    /// Returns whether this tracker has been initialized.
+    pub fn is_initialized(&self) -> bool {
+        self.initialized
+    }
+
     /// Collects progress updates from all operators and propagates them.
     ///
     /// Returns the list of operator indices whose frontiers changed.
