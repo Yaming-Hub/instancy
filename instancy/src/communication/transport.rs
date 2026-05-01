@@ -29,6 +29,7 @@
 use std::io;
 
 use crate::communication::codec::MAX_MESSAGE_SIZE;
+use crate::dataflow::id::DataflowId;
 
 /// A single frame in the wire protocol.
 ///
@@ -37,7 +38,7 @@ use crate::communication::codec::MAX_MESSAGE_SIZE;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Frame {
     /// Identifies which dataflow this frame belongs to (isolation key).
-    pub dataflow_id: u64,
+    pub dataflow_id: DataflowId,
     /// Logical channel identifier within the dataflow.
     pub channel_id: u64,
     /// Payload bytes.
@@ -111,7 +112,7 @@ mod tokio_impl {
 
             // Write header: dataflow_id (8 LE) + channel_id (8 LE) + length (4 LE)
             let mut header = [0u8; HEADER_SIZE];
-            header[..8].copy_from_slice(&frame.dataflow_id.to_le_bytes());
+            header[..8].copy_from_slice(&frame.dataflow_id.as_raw().to_le_bytes());
             header[8..16].copy_from_slice(&frame.channel_id.to_le_bytes());
             header[16..20].copy_from_slice(&(len as u32).to_le_bytes());
 
@@ -141,7 +142,7 @@ mod tokio_impl {
             for frame in frames {
                 let len = frame.payload.len();
                 let mut header = [0u8; HEADER_SIZE];
-                header[..8].copy_from_slice(&frame.dataflow_id.to_le_bytes());
+                header[..8].copy_from_slice(&frame.dataflow_id.as_raw().to_le_bytes());
                 header[8..16].copy_from_slice(&frame.channel_id.to_le_bytes());
                 header[16..20].copy_from_slice(&(len as u32).to_le_bytes());
 
@@ -201,7 +202,7 @@ mod tokio_impl {
                 }
             }
 
-            let dataflow_id = u64::from_le_bytes(header[..8].try_into().unwrap());
+            let dataflow_id = DataflowId::from_raw(u64::from_le_bytes(header[..8].try_into().unwrap()));
             let channel_id = u64::from_le_bytes(header[8..16].try_into().unwrap());
             let length = u32::from_le_bytes(header[16..20].try_into().unwrap()) as usize;
 
@@ -271,7 +272,7 @@ mod tokio_impl {
     /// connections per channel or spawn per-channel forwarding tasks.
     pub struct Demuxer<R> {
         reader: FramedReader<R>,
-        channels: HashMap<(u64, u64), mpsc::Sender<Vec<u8>>>,
+        channels: HashMap<(DataflowId, u64), mpsc::Sender<Vec<u8>>>,
         config: DemuxConfig,
     }
 
@@ -295,7 +296,7 @@ mod tokio_impl {
         /// matching the given `(dataflow_id, channel_id)` pair.
         pub fn register_channel(
             &mut self,
-            dataflow_id: u64,
+            dataflow_id: DataflowId,
             channel_id: u64,
         ) -> ChannelReceiver {
             let (tx, rx) = mpsc::channel(self.config.channel_buffer);
@@ -364,7 +365,7 @@ mod tokio_impl {
         /// Send a payload on a specific (dataflow, channel) pair.
         pub async fn send_payload(
             &self,
-            dataflow_id: u64,
+            dataflow_id: DataflowId,
             channel_id: u64,
             payload: Vec<u8>,
         ) -> Result<(), TransportError> {
@@ -455,12 +456,12 @@ mod tests {
     #[test]
     fn frame_equality() {
         let f1 = Frame {
-            dataflow_id: 1,
+            dataflow_id: DataflowId::from_raw(1),
             channel_id: 42,
             payload: vec![1, 2, 3],
         };
         let f2 = Frame {
-            dataflow_id: 1,
+            dataflow_id: DataflowId::from_raw(1),
             channel_id: 42,
             payload: vec![1, 2, 3],
         };
@@ -470,7 +471,7 @@ mod tests {
     #[test]
     fn frame_debug() {
         let f = Frame {
-            dataflow_id: 1,
+            dataflow_id: DataflowId::from_raw(1),
             channel_id: 1,
             payload: vec![0xAA],
         };
@@ -509,7 +510,7 @@ mod transport_tests {
         let mut reader = FramedReader::new(server);
 
         let frame = Frame {
-            dataflow_id: 1,
+            dataflow_id: DataflowId::from_raw(1),
             channel_id: 123,
             payload: b"hello world".to_vec(),
         };
@@ -528,7 +529,7 @@ mod transport_tests {
 
         let frames: Vec<Frame> = (0..5)
             .map(|i| Frame {
-                dataflow_id: 1,
+                dataflow_id: DataflowId::from_raw(1),
                 channel_id: i,
                 payload: format!("message {i}").into_bytes(),
             })
@@ -553,7 +554,7 @@ mod transport_tests {
 
         let frames: Vec<Frame> = (0..3)
             .map(|i| Frame {
-                dataflow_id: 1,
+                dataflow_id: DataflowId::from_raw(1),
                 channel_id: i * 10,
                 payload: vec![i as u8; 100],
             })
@@ -575,7 +576,7 @@ mod transport_tests {
         let mut reader = FramedReader::new(server);
 
         let frame = Frame {
-            dataflow_id: 1,
+            dataflow_id: DataflowId::from_raw(1),
             channel_id: 0,
             payload: vec![],
         };
@@ -596,7 +597,7 @@ mod transport_tests {
         // 100KB payload
         let payload = vec![0xAB; 100_000];
         let frame = Frame {
-            dataflow_id: 1,
+            dataflow_id: DataflowId::from_raw(1),
             channel_id: 99,
             payload: payload.clone(),
         };
@@ -615,7 +616,7 @@ mod transport_tests {
 
         // Exceeds MAX_MESSAGE_SIZE (256 MB)
         let frame = Frame {
-            dataflow_id: 1,
+            dataflow_id: DataflowId::from_raw(1),
             channel_id: 1,
             payload: vec![0; (MAX_MESSAGE_SIZE as usize) + 1],
         };
@@ -648,7 +649,7 @@ mod transport_tests {
 
         writer
             .write_frame(&Frame {
-                dataflow_id: 1,
+                dataflow_id: DataflowId::from_raw(1),
                 channel_id: 1,
                 payload: b"data".to_vec(),
             })
@@ -680,7 +681,7 @@ mod transport_tests {
         // Write interleaved frames
         writer
             .write_frame(&Frame {
-                dataflow_id: 1,
+                dataflow_id: DataflowId::from_raw(1),
                 channel_id: 1,
                 payload: b"ch1-a".to_vec(),
             })
@@ -688,7 +689,7 @@ mod transport_tests {
             .unwrap();
         writer
             .write_frame(&Frame {
-                dataflow_id: 1,
+                dataflow_id: DataflowId::from_raw(1),
                 channel_id: 2,
                 payload: b"ch2-a".to_vec(),
             })
@@ -696,7 +697,7 @@ mod transport_tests {
             .unwrap();
         writer
             .write_frame(&Frame {
-                dataflow_id: 1,
+                dataflow_id: DataflowId::from_raw(1),
                 channel_id: 3,
                 payload: b"ch3-a".to_vec(),
             })
@@ -704,7 +705,7 @@ mod transport_tests {
             .unwrap();
         writer
             .write_frame(&Frame {
-                dataflow_id: 1,
+                dataflow_id: DataflowId::from_raw(1),
                 channel_id: 1,
                 payload: b"ch1-b".to_vec(),
             })
@@ -739,7 +740,7 @@ mod transport_tests {
         // Write to registered and unregistered channels
         writer
             .write_frame(&Frame {
-                dataflow_id: 1,
+                dataflow_id: DataflowId::from_raw(1),
                 channel_id: 99,
                 payload: b"unknown".to_vec(),
             })
@@ -747,7 +748,7 @@ mod transport_tests {
             .unwrap();
         writer
             .write_frame(&Frame {
-                dataflow_id: 1,
+                dataflow_id: DataflowId::from_raw(1),
                 channel_id: 1,
                 payload: b"known".to_vec(),
             })
@@ -776,7 +777,7 @@ mod transport_tests {
         // Send a frame — demuxer should stop because no receivers left
         writer
             .write_frame(&Frame {
-                dataflow_id: 1,
+                dataflow_id: DataflowId::from_raw(1),
                 channel_id: 1,
                 payload: b"orphan".to_vec(),
             })

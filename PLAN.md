@@ -532,8 +532,8 @@ See DESIGN.md §5.5 for the dual-model design (OutputSink + OutputStream).
   - Received progress updates fed into local tracker
 - `ChannelAllocator` extended to handle remote channels
 - **Dataflow isolation on shared connections**:
-  - `DataflowId(u64)` — cluster-unique, assigned as `(node_index << 48) | local_seq`
-  - Frame header extended to `dataflow_id(u64) + channel_id(u64) + payload_len(u32) + payload`
+  - `DataflowId` — wraps `uuid::Uuid`, random v4, universally unique without coordination
+  - Frame header: `dataflow_id(UUID, 16B) + channel_id(u64) + payload_len(u32) + payload` = 28 byte header
   - Demuxer routes by `(dataflow_id, channel_id)` tuple
   - Scheduler distinguishes work by `(DataflowId, WorkerId)` for FIFO ordering
   - Frames for unknown/cancelled DataflowIds are logged and dropped
@@ -561,6 +561,51 @@ See DESIGN.md §5.5 for the dual-model design (OutputSink + OutputStream).
 - **End-to-end**: multi-process wordcount (simulated)
 
 **Estimated size**: ~3500 lines
+
+---
+
+## PR 17B — Refactor: UUID DataflowId + String node identity + component lifetime docs
+**Goal**: Replace `u64` DataflowId with UUID, replace numeric `node_index` with String `node_id`, and document component cardinality/lifetime for all key types.
+
+### Identity changes:
+- `DataflowId` → wraps `uuid::Uuid` (random v4). Remove `DataflowIdAllocator`. Just call `DataflowId::new()`.
+- `NodeConfig.node_index: usize` → `NodeConfig.node_id: String` (typically IP:port or hostname)
+- `ClusterTopology.worker_range(node_index)` → `worker_range(node_id: &str) -> Option<Range>`
+- `ClusterTopology.node_for_worker()` → returns `Option<&str>` instead of `usize`
+- `MembershipEvent` variants use `node_id: String` instead of `node_index: usize`
+- `PlacementPolicy::Pinned { node_id: String }` instead of `node_index`
+- Wire protocol header: 16 bytes (UUID) + 8 (channel_id) + 4 (length) = 28 bytes
+- Add `uuid` crate dependency
+
+### Component cardinality & lifetime documentation:
+Add a "Component Lifecycle" section to DESIGN.md documenting each key type's:
+- **Cardinality**: singleton per process, one per dataflow, one per operator, one per connection, etc.
+- **Lifetime**: process lifetime, dataflow lifetime, operator activation, connection duration, etc.
+- **Ownership**: who creates it, who holds the reference
+
+Key components to document:
+| Component | Cardinality | Lifetime |
+|---|---|---|
+| `WorkerPool` | 1 per process | Process lifetime |
+| `ConnectionPool` | 1 per process | Process lifetime |
+| `ClusterTopology` | 1 per process (updated on membership changes) | Process lifetime (mutable) |
+| `CancellationToken` | 1 per dataflow | Dataflow lifetime |
+| `DataflowId` | 1 per dataflow | Dataflow lifetime |
+| `DataflowSession` | 1 per dataflow | Dataflow lifetime |
+| `ProgressTracker` | 1 per dataflow | Dataflow lifetime |
+| `DataflowMetrics` | 1 per dataflow | Dataflow lifetime |
+| `RemotePush` | 1 per (dataflow, channel, target node) | Dataflow lifetime |
+| `ProgressExchange` | 1 per dataflow | Dataflow lifetime |
+| `Demuxer` | 1 per connection | Connection lifetime |
+| `Muxer` / `MuxerSender` | 1 per connection / cloned per channel | Connection lifetime |
+| `FrameSender` / `FrameReceiver` | 1 per (dataflow, channel, peer) | Dataflow lifetime |
+| `Codec` | 1 per dataflow (shared via Arc) | Dataflow lifetime |
+| `OperatorState` | 1 per (dataflow, operator, worker) | Dataflow lifetime |
+| `InputHandle` / `OutputHandle` | 1 per operator activation | Activation (transient) |
+
+**Tests**: Existing tests continue to pass after refactoring.
+
+**Estimated size**: ~800 lines (mostly refactoring existing code + docs)
 
 ---
 
