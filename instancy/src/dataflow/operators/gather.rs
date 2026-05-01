@@ -106,7 +106,17 @@ impl<S: Scope, D: 'static> GatherExt<S, D> for DataStream<S, D> {
         // Gather always creates a new region with parallelism 1.
         let target_region = scope.new_region(1);
 
-        // TODO: Register operator in scope/graph registry.
+        // Register operator and edge in the dataflow graph.
+        scope.register_operator(crate::dataflow::graph::OperatorInfo::new(
+            op_index, "gather", target_region, 1, 1,
+        )).expect("operator index should be unique");
+        scope.add_edge(crate::dataflow::graph::EdgeInfo::new(
+            *self.source(),
+            Slot::new(op_index, 0),
+            source_region,
+            target_region,
+        ));
+
         let _operator = GatherOperator::<S::Timestamp, D>::new(
             "gather",
             op_index,

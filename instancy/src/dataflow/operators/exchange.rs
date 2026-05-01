@@ -214,8 +214,17 @@ impl<S: Scope, D: 'static> DataStream<S, D> {
             source_region
         };
 
-        // TODO: Register operator in scope/graph registry.
-        // The runtime will wire up actual data movement when the dataflow is materialized.
+        // Register operator and edge in the dataflow graph.
+        scope.register_operator(crate::dataflow::graph::OperatorInfo::new(
+            op_index, "exchange", target_region, 1, 1,
+        )).expect("operator index should be unique");
+        scope.add_edge(crate::dataflow::graph::EdgeInfo::new(
+            *self.source(),
+            Slot::new(op_index, 0),
+            source_region,
+            target_region,
+        ));
+
         let _operator = ExchangeOperator::<S::Timestamp, D>::new(
             "exchange",
             op_index,

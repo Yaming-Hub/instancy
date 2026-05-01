@@ -25,6 +25,7 @@
 use std::fmt;
 use std::marker::PhantomData;
 
+use crate::dataflow::graph::{EdgeInfo, OperatorInfo};
 use crate::dataflow::region::RegionId;
 use crate::dataflow::scope::{ChildScope, Scope};
 use crate::dataflow::stream::{DataStream, Slot};
@@ -97,6 +98,19 @@ impl<S: Scope, D: 'static> EnterExt<S, D> for DataStream<S, D> {
         let ingress_source = Slot::new(0, slot_index);
         let region_id = child.current_region().id();
 
+        // Update the parent graph: the child scope operator receives this data.
+        let child_index = child.addr().parts().last().copied()
+            .expect("enter() called on scope with no parent address — this is a bug");
+        let mut parent_scope = self.scope().clone();
+        parent_scope.increment_operator_input_count(child_index);
+        let parent_region = parent_scope.current_region().id();
+        parent_scope.add_edge(EdgeInfo::new(
+            *self.source(),
+            Slot::new(child_index, slot_index),
+            self.region_id(),
+            parent_region,
+        ));
+
         DataStream::new(child.clone(), ingress_source, region_id)
     }
 }
@@ -144,6 +158,20 @@ where
             .expect("leave() called on scope with no parent address — this is a bug");
         let parent_source = Slot::new(parent_op_index, slot_index);
         let region_id = parent.current_region().id();
+
+        // Update the parent graph: the child scope operator produces this output.
+        let mut parent_mut = parent.clone();
+        parent_mut.increment_operator_output_count(parent_op_index);
+
+        // Also record the edge in the child graph: from the stream source to
+        // the boundary operator's egress input.
+        let mut child_scope = self.scope().clone();
+        child_scope.add_edge(EdgeInfo::new(
+            *self.source(),
+            Slot::new(0, slot_index),
+            self.region_id(),
+            child_scope.current_region().id(),
+        ));
 
         DataStream::new(parent.clone(), parent_source, region_id)
     }
@@ -272,6 +300,17 @@ where
         let operator_index = self.allocate_operator_index();
         let region_id = self.current_region().id();
 
+        // Register the feedback operator in the child scope's graph.
+        // It has 1 input (from connect_loop) and 1 output (the feedback stream).
+        self.register_operator(OperatorInfo::new(
+            operator_index,
+            "feedback",
+            region_id,
+            1,
+            1,
+        ))
+        .expect("feedback operator index was just allocated, cannot conflict");
+
         // Lift the inner summary to a Product summary:
         // outer advances by identity (Default), inner advances by the provided summary.
         let full_summary: Product<TOuter::Summary, TInner::Summary> = Product::new(
@@ -311,13 +350,19 @@ impl<S: Scope, D: 'static> ConnectLoop<S, D> for DataStream<S, D> {
         // Mark as connected so the Drop impl doesn't fire the assertion.
         handle.connected = true;
 
-        // At the graph-construction level, this records that:
-        // - The stream's source connects to the feedback operator's input.
-        // - Data flowing through this edge has the feedback summary applied.
-        //
-        // The actual wiring happens at runtime materialization.
-        // For now, the metadata is captured in the FeedbackHandle's operator_index
-        // and summary, which the SubgraphBuilder will use.
+        // Record the feedback edge in the graph: stream source → feedback input.
+        let mut scope = self.scope().clone();
+        scope.add_edge(EdgeInfo::new(
+            *self.source(),
+            Slot::new(handle.operator_index, 0),
+            self.region_id(),
+            handle.region_id,
+        ));
+
+        // Note: This edge creates a cycle in the graph. The validate() method
+        // should either exclude feedback edges from cycle detection or feedback
+        // edges should be tracked separately. For now, topological_order() will
+        // detect the cycle — feedback-aware validation is deferred to PR 22.
     }
 }
 

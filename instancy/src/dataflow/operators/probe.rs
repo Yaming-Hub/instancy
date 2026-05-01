@@ -9,7 +9,7 @@ use std::sync::{Arc, Mutex};
 use crate::dataflow::operators::handles::InputHandle;
 use crate::dataflow::region::RegionId;
 use crate::dataflow::scope::Scope;
-use crate::dataflow::stream::DataStream;
+use crate::dataflow::stream::{DataStream, Slot};
 use crate::progress::frontier::Antichain;
 use crate::progress::timestamp::Timestamp;
 
@@ -210,8 +210,18 @@ impl<S: Scope, D: 'static> ProbeExt<S, D> for DataStream<S, D> {
         let op_index = scope.allocate_operator_index();
         let region_id = self.region_id();
 
-        // TODO: Register operator in scope/graph registry (PR9).
-        // Currently the operator is created for validation but not stored.
+        // Register operator and edge in the dataflow graph.
+        // Probe is a terminal operator: 1 input, 0 outputs.
+        scope.register_operator(crate::dataflow::graph::OperatorInfo::new(
+            op_index, name, region_id, 1, 0,
+        )).expect("operator index should be unique");
+        scope.add_edge(crate::dataflow::graph::EdgeInfo::new(
+            *self.source(),
+            Slot::new(op_index, 0),
+            self.region_id(),
+            region_id,
+        ));
+
         let (_operator, handle) = ProbeOperator::<S::Timestamp, D>::new(
             name,
             op_index,

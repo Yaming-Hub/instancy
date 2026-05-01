@@ -132,7 +132,23 @@ impl<S: Scope, D: 'static> ConcatExt<S, D> for DataStream<S, D> {
         let region_id = self.region_id();
         let output_slot = Slot::new(op_index, 0);
 
-        // TODO: Register operator in scope/graph registry (PR9).
+        // Register operator (2 inputs, 1 output) and edges.
+        scope.register_operator(crate::dataflow::graph::OperatorInfo::new(
+            op_index, "concat", region_id, 2, 1,
+        )).expect("operator index should be unique");
+        scope.add_edge(crate::dataflow::graph::EdgeInfo::new(
+            *self.source(),
+            Slot::new(op_index, 0),
+            self.region_id(),
+            region_id,
+        ));
+        scope.add_edge(crate::dataflow::graph::EdgeInfo::new(
+            *other.source(),
+            Slot::new(op_index, 1),
+            other.region_id(),
+            region_id,
+        ));
+
         let _operator = ConcatOperator::<S::Timestamp, D>::new(
             "concat",
             op_index,
@@ -162,7 +178,19 @@ pub fn concatenate<S: Scope, D: 'static>(streams: &[DataStream<S, D>]) -> DataSt
     let op_index = scope.allocate_operator_index();
     let output_slot = Slot::new(op_index, 0);
 
-    // TODO: Register operator in scope/graph registry (PR9).
+    // Register operator (N inputs, 1 output) and edges.
+    scope.register_operator(crate::dataflow::graph::OperatorInfo::new(
+        op_index, "concatenate", region_id, streams.len(), 1,
+    )).expect("operator index should be unique");
+    for (i, s) in streams.iter().enumerate() {
+        scope.add_edge(crate::dataflow::graph::EdgeInfo::new(
+            *s.source(),
+            Slot::new(op_index, i),
+            s.region_id(),
+            region_id,
+        ));
+    }
+
     let _operator = ConcatOperator::<S::Timestamp, D>::new(
         "concatenate",
         op_index,

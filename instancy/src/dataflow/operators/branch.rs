@@ -288,7 +288,17 @@ impl<S: Scope, D: 'static> BranchExt<S, D> for DataStream<S, D> {
         let true_slot = Slot::new(op_index, 0);
         let false_slot = Slot::new(op_index, 1);
 
-        // TODO: Register operator in scope/graph registry.
+        // Register operator (1 input, 2 outputs) and edge.
+        scope.register_operator(crate::dataflow::graph::OperatorInfo::new(
+            op_index, "branch", region_id, 1, 2,
+        )).expect("operator index should be unique");
+        scope.add_edge(crate::dataflow::graph::EdgeInfo::new(
+            *self.source(),
+            Slot::new(op_index, 0),
+            self.region_id(),
+            region_id,
+        ));
+
         let _operator = BranchOperator::<S::Timestamp, D>::new(
             "branch",
             op_index,
@@ -319,7 +329,17 @@ impl<S: Scope, D: 'static> OkErrExt<S, D> for DataStream<S, D> {
         let ok_slot = Slot::new(op_index, 0);
         let err_slot = Slot::new(op_index, 1);
 
-        // TODO: Register operator in scope/graph registry.
+        // Register operator (1 input, 2 outputs) and edge.
+        scope.register_operator(crate::dataflow::graph::OperatorInfo::new(
+            op_index, "ok_err", region_id, 1, 2,
+        )).expect("operator index should be unique");
+        scope.add_edge(crate::dataflow::graph::EdgeInfo::new(
+            *self.source(),
+            Slot::new(op_index, 0),
+            self.region_id(),
+            region_id,
+        ));
+
         let _operator = OkErrOperator::<S::Timestamp, D, O, E>::new(
             "ok_err",
             op_index,
