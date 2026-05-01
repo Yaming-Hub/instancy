@@ -128,8 +128,8 @@ pub enum PlacementPolicy {
     /// Pin all workers in this region to a specific node.
     /// Useful for operations that need local data access.
     Pinned {
-        /// The node index to pin to.
-        node_index: usize,
+        /// The node identity to pin to.
+        node_id: String,
     },
 }
 
@@ -144,8 +144,8 @@ impl fmt::Display for PlacementPolicy {
         match self {
             PlacementPolicy::Proportional => write!(f, "Proportional"),
             PlacementPolicy::RoundRobin => write!(f, "RoundRobin"),
-            PlacementPolicy::Pinned { node_index } => {
-                write!(f, "Pinned(node={})", node_index)
+            PlacementPolicy::Pinned { node_id } => {
+                write!(f, "Pinned(node={})", node_id)
             }
         }
     }
@@ -209,11 +209,11 @@ mod tests {
     #[test]
     fn region_pinned_placement() {
         let region = Region::new(RegionId::new(2), 1)
-            .with_placement(PlacementPolicy::Pinned { node_index: 3 });
+            .with_placement(PlacementPolicy::Pinned { node_id: "node-3".into() });
 
         assert_eq!(
             region.placement(),
-            &PlacementPolicy::Pinned { node_index: 3 }
+            &PlacementPolicy::Pinned { node_id: "node-3".into() }
         );
     }
 
@@ -239,8 +239,8 @@ mod tests {
         assert_eq!(format!("{}", PlacementPolicy::Proportional), "Proportional");
         assert_eq!(format!("{}", PlacementPolicy::RoundRobin), "RoundRobin");
         assert_eq!(
-            format!("{}", PlacementPolicy::Pinned { node_index: 2 }),
-            "Pinned(node=2)"
+            format!("{}", PlacementPolicy::Pinned { node_id: "node-2".into() }),
+            "Pinned(node=node-2)"
         );
     }
 

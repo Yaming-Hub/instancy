@@ -94,20 +94,22 @@ impl Default for ErrorPolicy {
 /// Configuration for a physical node (OS process) in the cluster.
 ///
 /// This is a **physical** concept — each `NodeConfig` corresponds to one
-/// OS process. A node hosts one or more logical workers. The `node_index`
-/// identifies the process within the physical cluster topology.
+/// OS process. A node hosts one or more logical workers. The `node_id`
+/// identifies the process within the physical cluster topology (typically
+/// an IP:port or hostname that is stable across reconnections).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct NodeConfig {
-    /// Physical node index — identifies this OS process in the cluster.
-    pub node_index: usize,
+    /// Physical node identity — a stable string identifying this OS process
+    /// (e.g., "192.168.1.5:8080", a hostname, or a pod name).
+    pub node_id: String,
     /// Number of logical workers hosted by this physical node.
     pub logical_workers: usize,
 }
 
 impl NodeConfig {
     /// Create a new node config.
-    pub fn new(node_index: usize, logical_workers: usize) -> Self {
-        Self { node_index, logical_workers }
+    pub fn new(node_id: impl Into<String>, logical_workers: usize) -> Self {
+        Self { node_id: node_id.into(), logical_workers }
     }
 }
 
@@ -116,6 +118,9 @@ impl NodeConfig {
 /// This is a **physical** layout — it describes how many OS processes exist
 /// and how logical workers are distributed across them. The runtime uses this
 /// to determine which workers are local vs remote and to assign global worker indices.
+///
+/// **Cardinality**: One per process (updated on membership changes).
+/// **Lifetime**: Process lifetime (mutable via membership events).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ClusterTopology {
     /// Configuration for each physical node in the cluster.
@@ -126,12 +131,12 @@ impl ClusterTopology {
     /// Create a single-node topology with the given number of logical workers.
     pub fn single_node(logical_workers: usize) -> Self {
         Self {
-            nodes: vec![NodeConfig::new(0, logical_workers)],
+            nodes: vec![NodeConfig::new("local", logical_workers)],
         }
     }
 
     /// Create a multi-node topology from a list of node configs.
-    /// Nodes are sorted by `node_index` to ensure consistent worker range assignment.
+    /// Nodes are sorted by `node_id` to ensure consistent worker range assignment.
     pub fn multi_node(mut configs: Vec<NodeConfig>) -> Result<Self, Error> {
         if configs.is_empty() {
             return Err(Error::Custom("cluster must have at least one node".into()));
@@ -139,12 +144,12 @@ impl ClusterTopology {
         for config in &configs {
             if config.logical_workers == 0 {
                 return Err(Error::Custom(format!(
-                    "node {} must have at least 1 worker",
-                    config.node_index
+                    "node '{}' must have at least 1 worker",
+                    config.node_id
                 )));
             }
         }
-        configs.sort_by_key(|c| c.node_index);
+        configs.sort_by(|a, b| a.node_id.cmp(&b.node_id));
         Ok(Self { nodes: configs })
     }
 
@@ -156,10 +161,10 @@ impl ClusterTopology {
     /// Get the range of global logical worker IDs for a given physical node.
     ///
     /// Returns `(start, end)` where logical workers are `start..end`.
-    pub fn worker_range(&self, node_index: usize) -> Option<(usize, usize)> {
+    pub fn worker_range(&self, node_id: &str) -> Option<(usize, usize)> {
         let mut offset = 0;
         for node in &self.nodes {
-            if node.node_index == node_index {
+            if node.node_id == node_id {
                 return Some((offset, offset + node.logical_workers));
             }
             offset += node.logical_workers;
@@ -168,11 +173,12 @@ impl ClusterTopology {
     }
 
     /// Determine which physical node a logical worker belongs to.
-    pub fn node_for_worker(&self, worker_id: WorkerId) -> Option<usize> {
+    /// Returns the node_id of the node hosting the given worker.
+    pub fn node_for_worker(&self, worker_id: WorkerId) -> Option<&str> {
         let mut offset = 0;
         for node in &self.nodes {
             if worker_id.index() < offset + node.logical_workers {
-                return Some(node.node_index);
+                return Some(&node.node_id);
             }
             offset += node.logical_workers;
         }
@@ -180,8 +186,8 @@ impl ClusterTopology {
     }
 
     /// Get all worker IDs for a specific node.
-    pub fn workers_for_node(&self, node_index: usize) -> Vec<WorkerId> {
-        if let Some((start, end)) = self.worker_range(node_index) {
+    pub fn workers_for_node(&self, node_id: &str) -> Vec<WorkerId> {
+        if let Some((start, end)) = self.worker_range(node_id) {
             (start..end).map(WorkerId::new).collect()
         } else {
             Vec::new()
@@ -260,67 +266,67 @@ mod tests {
     fn cluster_topology_single_node() {
         let topo = ClusterTopology::single_node(4);
         assert_eq!(topo.total_workers(), 4);
-        assert_eq!(topo.worker_range(0), Some((0, 4)));
-        assert_eq!(topo.worker_range(1), None);
+        assert_eq!(topo.worker_range("local"), Some((0, 4)));
+        assert_eq!(topo.worker_range("other"), None);
     }
 
     #[test]
     fn cluster_topology_multi_node() {
         let topo = ClusterTopology::multi_node(vec![
-            NodeConfig::new(0, 4),
-            NodeConfig::new(1, 2),
-            NodeConfig::new(2, 6),
+            NodeConfig::new("node-0", 4),
+            NodeConfig::new("node-1", 2),
+            NodeConfig::new("node-2", 6),
         ])
         .unwrap();
 
         assert_eq!(topo.total_workers(), 12);
-        assert_eq!(topo.worker_range(0), Some((0, 4)));
-        assert_eq!(topo.worker_range(1), Some((4, 6)));
-        assert_eq!(topo.worker_range(2), Some((6, 12)));
+        assert_eq!(topo.worker_range("node-0"), Some((0, 4)));
+        assert_eq!(topo.worker_range("node-1"), Some((4, 6)));
+        assert_eq!(topo.worker_range("node-2"), Some((6, 12)));
     }
 
     #[test]
     fn cluster_topology_node_for_worker() {
         let topo = ClusterTopology::multi_node(vec![
-            NodeConfig::new(0, 4),
-            NodeConfig::new(1, 2),
-            NodeConfig::new(2, 6),
+            NodeConfig::new("node-0", 4),
+            NodeConfig::new("node-1", 2),
+            NodeConfig::new("node-2", 6),
         ])
         .unwrap();
 
-        assert_eq!(topo.node_for_worker(WorkerId::new(0)), Some(0));
-        assert_eq!(topo.node_for_worker(WorkerId::new(3)), Some(0));
-        assert_eq!(topo.node_for_worker(WorkerId::new(4)), Some(1));
-        assert_eq!(topo.node_for_worker(WorkerId::new(5)), Some(1));
-        assert_eq!(topo.node_for_worker(WorkerId::new(6)), Some(2));
-        assert_eq!(topo.node_for_worker(WorkerId::new(11)), Some(2));
+        assert_eq!(topo.node_for_worker(WorkerId::new(0)), Some("node-0"));
+        assert_eq!(topo.node_for_worker(WorkerId::new(3)), Some("node-0"));
+        assert_eq!(topo.node_for_worker(WorkerId::new(4)), Some("node-1"));
+        assert_eq!(topo.node_for_worker(WorkerId::new(5)), Some("node-1"));
+        assert_eq!(topo.node_for_worker(WorkerId::new(6)), Some("node-2"));
+        assert_eq!(topo.node_for_worker(WorkerId::new(11)), Some("node-2"));
         assert_eq!(topo.node_for_worker(WorkerId::new(12)), None);
     }
 
     #[test]
     fn cluster_topology_workers_for_node() {
         let topo = ClusterTopology::multi_node(vec![
-            NodeConfig::new(0, 3),
-            NodeConfig::new(1, 2),
+            NodeConfig::new("node-0", 3),
+            NodeConfig::new("node-1", 2),
         ])
         .unwrap();
 
-        let w0 = topo.workers_for_node(0);
+        let w0 = topo.workers_for_node("node-0");
         assert_eq!(w0, vec![WorkerId::new(0), WorkerId::new(1), WorkerId::new(2)]);
 
-        let w1 = topo.workers_for_node(1);
+        let w1 = topo.workers_for_node("node-1");
         assert_eq!(w1, vec![WorkerId::new(3), WorkerId::new(4)]);
 
-        let w_none = topo.workers_for_node(5);
+        let w_none = topo.workers_for_node("node-5");
         assert!(w_none.is_empty());
     }
 
     #[test]
     fn cluster_topology_heterogeneous() {
         let topo = ClusterTopology::multi_node(vec![
-            NodeConfig::new(0, 4),
-            NodeConfig::new(1, 1),
-            NodeConfig::new(2, 8),
+            NodeConfig::new("node-0", 4),
+            NodeConfig::new("node-1", 1),
+            NodeConfig::new("node-2", 8),
         ])
         .unwrap();
         assert_eq!(topo.total_workers(), 13);
@@ -331,7 +337,7 @@ mod tests {
         // Empty cluster
         assert!(ClusterTopology::multi_node(vec![]).is_err());
         // Zero workers
-        assert!(ClusterTopology::multi_node(vec![NodeConfig::new(0, 0)]).is_err());
+        assert!(ClusterTopology::multi_node(vec![NodeConfig::new("node-0", 0)]).is_err());
     }
 
     #[test]
@@ -391,7 +397,7 @@ mod tests {
     fn execute_rejects_zero_workers() {
         let runtime = RuntimeConfig::default();
         let df = DataflowConfig {
-            topology: ClusterTopology { nodes: vec![NodeConfig::new(0, 0)] },
+            topology: ClusterTopology { nodes: vec![NodeConfig::new("node-0", 0)] },
             error_policy: ErrorPolicy::Stop,
             cancellation_token: CancellationToken::new(),
             batching_policy: BatchingPolicy::default(),

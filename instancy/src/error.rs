@@ -51,11 +51,11 @@ pub enum Error {
     Custom(String),
 
     /// A remote node was lost (disconnected or removed from cluster).
-    /// Contains the physical node index that departed.
-    #[error("Node lost: physical node {node_index} departed ({reason})")]
+    /// Contains the node identity that departed.
+    #[error("Node lost: node '{node_id}' departed ({reason})")]
     NodeLost {
-        /// The physical node index that was lost.
-        node_index: usize,
+        /// The node identity that was lost.
+        node_id: String,
         /// Human-readable reason for the departure.
         reason: String,
     },

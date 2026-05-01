@@ -3128,6 +3128,37 @@ bincode-codec = ["bincode", "serde"]
 
 ---
 
+## 13.5 Component Cardinality & Lifetime
+
+This section documents the cardinality (how many instances exist) and lifetime (when they are created and destroyed) of key components. This helps developers understand ownership, sharing, and resource management.
+
+| Component | Cardinality | Lifetime | Notes |
+|-----------|-------------|----------|-------|
+| `WorkerPool` | 1 per process | Process | Shared across all dataflows in the process |
+| `ConnectionPool` | 1 per process | Process | Manages connections to all peer nodes |
+| `ClusterTopology` | 1 per process | Process (mutable on membership changes) | Updated when nodes join/leave |
+| `DataflowId` | 1 per dataflow | Dataflow | UUID, created at dataflow start |
+| `DataflowSession` | 1 per dataflow | Dataflow | Owns channel allocation for one dataflow |
+| `ProgressTracker` | 1 per dataflow | Dataflow | Tracks frontier advancement |
+| `ProgressExchange` | 1 per dataflow | Dataflow | Sends/receives progress to/from peers |
+| `CancellationToken` | 1 per dataflow | Dataflow | Cloned into operators; shared cancellation signal |
+| `RemotePush` / `FrameSender` | 1 per (dataflow, remote peer) | Dataflow | Outbound data channel to one peer |
+| `Demuxer` | 1 per physical connection | Connection | Reads frames, dispatches to per-channel receivers |
+| `MuxerSender` | 1 per physical connection | Connection | Collects frames from multiple channels for one connection |
+| `Codec` (instance) | 1 per dataflow | Dataflow | Shared (Arc) across all operators in a dataflow |
+| `RoutingTable` | 1 per (dataflow, edge) | Dataflow | Maps workers → remote endpoints for one logical edge |
+| `InputHandle` / `OutputHandle` | 1 per operator activation | Transient | Created per activation, dropped after |
+| `Capability<T>` | N per operator | Operator activation | Tracks held timestamps; reports on drop |
+| `CapabilitySet<T>` | 1 per operator | Operator | Manages the set of capabilities an operator holds |
+
+**Key patterns:**
+- **Process-lifetime** components are typically created at startup and live until process exit. They are `Arc`-shared.
+- **Dataflow-lifetime** components are created when a dataflow starts and destroyed when it completes or is cancelled.
+- **Connection-lifetime** components are tied to a physical TCP connection; they are recreated on reconnection.
+- **Transient** components are created and destroyed within a single operator activation cycle.
+
+---
+
 ## 14. Implementation Phases
 
 **Phase 1 — Foundation**
