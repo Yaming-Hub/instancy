@@ -774,6 +774,40 @@ Key components to document:
 
 ---
 
+## PR 23 — RuntimeHandle & Task Scheduling Policy
+**Goal**: Implement the multi-cluster isolation model and pluggable task scheduling.
+
+- `runtime/mod.rs`
+  - `RuntimeHandle` — self-contained runtime instance owning worker pool, task queue, connection pool
+  - `RuntimeConfig` — configuration struct (pool sizes, schedule policy, tracing subscriber)
+  - Multiple `RuntimeHandle` instances coexist with full isolation (no global state)
+- `runtime/scheduler.rs`
+  - `TaskMeta` — per-task metadata: `dataflow_id`, `priority: u32`, `created_at: Instant`
+  - `SchedulePolicy` trait — `fn compare(&self, a: &TaskMeta, b: &TaskMeta) -> Ordering`
+  - `FifoPolicy` — pure creation-order scheduling
+  - `PriorityPolicy` — strict priority (higher wins)
+  - `PriorityWithAgingPolicy` — (default) priority + aging to prevent starvation
+- `runtime/task_queue.rs`
+  - Priority queue backed by BinaryHeap with custom comparator via `SchedulePolicy`
+  - `enqueue(task, meta)`, `dequeue() -> Option<Task>` using policy ordering
+- Integration:
+  - `RuntimeHandle::execute(spec)` assigns dataflow priority → all tasks inherit it
+  - Worker threads call `task_queue.dequeue()` to get next task per policy
+  - **No static variables** anywhere — verified via `cargo clippy` and grep for `static`/`lazy_static`/`thread_local`
+
+**Tests**:
+- Two RuntimeHandles in same process: submit dataflows to each, verify full isolation
+- FifoPolicy: tasks dequeued in creation order regardless of priority
+- PriorityPolicy: higher priority always dequeued first
+- PriorityWithAgingPolicy: high-priority first, but aged low-priority eventually overtakes
+- Starvation test: continuous high-priority submissions don't permanently block low-priority
+- TaskMeta: created_at is monotonic across enqueues
+- No global state: grep for static/lazy_static/thread_local finds zero hits in library code
+
+**Estimated size**: ~1500 lines
+
+---
+
 ## Dependency Graph
 
 ```
@@ -816,6 +850,8 @@ PR20 (polish: errors, error policy wiring, examples, docs)
 PR21 (dynamic cluster scaling — ClusterMembership, scale-up/down)
  ↓
 PR22 (coordinator integration — DataflowHandle, OutcomeAggregator, ProgressUpdate)
+ ↓
+PR23 (RuntimeHandle + SchedulePolicy — multi-cluster isolation, priority scheduling)
 ```
 
 ## Notes
@@ -828,3 +864,5 @@ PR22 (coordinator integration — DataflowHandle, OutcomeAggregator, ProgressUpd
 - **New additions (v2)**: Dynamic worker pool sizing (PR5), message envelope with control signals (PR4), per-dataflow error policy (PR5/PR20), observability/metrics (PR18), delay operator (PR8), checkpointing (PR19).
 - **New additions (v3)**: Per-stage dynamic parallelism via execution regions (PR4), `rebalance`/`gather` operators (PR10), no parallelism changes inside cycles (PR12 restriction). Region types are defined in PR4; repartition operators in PR10; progress tracking for regions in PR9.
 - **Event-driven executor** — the current `DataflowExecutor::run()` is a single-threaded test/validation helper. A future PR must implement the production event-driven model where the orchestrator event loop (on the I/O runtime) feeds operator activations into the `TaskScheduler` → Worker Thread Pool. The `run()` loop will be replaced by an event-driven `activate_operator()` method called by the orchestrator when data arrives or progress advances. This is prerequisite for multi-dataflow sharing of the Worker Thread Pool.
+- **No global state** — the instancy crate must contain zero `static`, `lazy_static`, `once_cell`, or `thread_local!` declarations. All state is owned by `RuntimeHandle` instances. This enables multiple isolated clusters in a single process (§12.6).
+- **Pluggable scheduling** — task dequeue order is determined by a `SchedulePolicy` trait per `RuntimeHandle`. Default policy uses priority-with-aging (§12.7).

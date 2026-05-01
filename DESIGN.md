@@ -19,6 +19,8 @@
 11. **Checkpointing support** — consumers can add checkpoint operators that persist state at timestamp boundaries, enabling recovery by fast-forwarding input to the stored frontier.
 12. **Per-stage dynamic parallelism** — operators in the same execution region share a parallelism level; different regions can have different parallelism. Explicit repartition operators (`exchange`, `rebalance`, `gather`, `broadcast`) connect regions with different parallelism.
 13. **Dynamic cluster scaling** — nodes can join or leave the cluster at runtime. The hosting application is responsible for detecting membership changes and notifying the runtime via a `ClusterMembership` trait. The library rebuilds routing and rebalances work accordingly.
+14. **No global state** — zero static variables, `lazy_static`, or thread-locals. All state is owned by an explicit `RuntimeHandle`. Multiple isolated clusters can coexist in a single process (e.g., interactive vs batch workloads).
+15. **Pluggable task scheduling** — the task queue accepts a `SchedulePolicy` trait that determines dequeue order based on (dataflow priority, task age). Default policy uses priority-with-aging to prevent starvation of low-priority dataflows.
 
 ---
 
@@ -3388,6 +3390,186 @@ pub enum AggregatedOutcome {
 6. **Error reporting flows back to the coordinator** — when an operator fails, the local executor captures the error in `DataflowOutcome::Failed` with the progress frontier. The host app collects these outcomes and the `OutcomeAggregator` determines the global result.
 
 7. **The coordinator node is designated by the host app, not by instancy** — any node can be the coordinator. Typically it's the node that received the user request. instancy doesn't need to know which node is the coordinator.
+
+---
+
+## 12.6 Multi-Cluster Isolation (No Global State)
+
+**Constraint:** The instancy crate must contain **zero static/global variables**. All state is owned by explicit runtime instances.
+
+### Motivation
+
+A hosting application may need to run multiple **isolated instancy clusters** within the same process. For example:
+
+- **Interactive cluster** — low-latency queries with small worker pool, high priority
+- **Batch cluster** — bulk ETL with large worker pool, best-effort priority
+- **Test cluster** — in-process integration tests that must not interfere with production clusters
+
+Each cluster must have fully independent:
+- Task queue
+- Worker thread pool
+- Connection pool
+- Progress tracking state
+- Cancellation scope
+
+### Design
+
+```rust
+/// A self-contained instancy runtime. Multiple RuntimeHandle instances
+/// can coexist in the same process with full isolation.
+pub struct RuntimeHandle {
+    worker_pool: WorkerPool,
+    task_queue: TaskQueue,
+    connection_pool: ConnectionPool,
+    config: RuntimeConfig,
+}
+
+impl RuntimeHandle {
+    /// Create a new isolated runtime with the given configuration.
+    pub fn new(config: RuntimeConfig) -> Self { ... }
+
+    /// Submit a dataflow for execution within this runtime.
+    pub fn execute(&self, spec: DataflowSpec) -> DataflowHandle { ... }
+}
+```
+
+### Rules
+
+1. **No `static`, `lazy_static`, `once_cell`, or thread-local state** in library code.
+2. All shared state flows from a `RuntimeHandle` root — never from global singletons.
+3. Metrics/tracing use the caller's subscriber (passed in config), not a global one.
+4. Tests create their own `RuntimeHandle` instances — no test-ordering dependencies.
+
+### Interaction Diagram
+
+```
+Process
+├── RuntimeHandle "interactive"
+│   ├── WorkerPool (4 threads)
+│   ├── TaskQueue (priority-aware)
+│   ├── ConnectionPool (to nodes A, B)
+│   └── Dataflows: [query_1, query_2]
+│
+├── RuntimeHandle "batch"
+│   ├── WorkerPool (16 threads)
+│   ├── TaskQueue (FIFO)
+│   ├── ConnectionPool (to nodes A, B, C, D)
+│   └── Dataflows: [etl_pipeline]
+│
+└── RuntimeHandle "test"
+    ├── WorkerPool (2 threads)
+    ├── TaskQueue (FIFO)
+    ├── InMemoryTransport (no real connections)
+    └── Dataflows: [test_dataflow]
+```
+
+---
+
+## 12.7 Configurable Task Scheduling Policy
+
+The task queue within a `RuntimeHandle` supports **pluggable scheduling policies** that determine the order in which operator activation tasks are dequeued by worker threads.
+
+### Motivation
+
+Different workloads have different latency/throughput requirements:
+- Interactive queries need low latency → higher priority
+- Background ETL can tolerate delays → lower priority
+- Within the same priority, fairness prevents starvation
+
+### Task Metadata
+
+Every task carries scheduling metadata:
+
+```rust
+/// Metadata attached to each queued operator activation task.
+pub struct TaskMeta {
+    /// The dataflow this task belongs to.
+    pub dataflow_id: DataflowId,
+    /// Priority inherited from the dataflow (higher = scheduled sooner).
+    pub priority: u32,
+    /// Wall-clock time when this task was enqueued.
+    pub created_at: Instant,
+}
+```
+
+### Scheduling Policy Trait
+
+```rust
+/// Determines task ordering in the queue.
+///
+/// The scheduler compares two tasks and returns which should run first.
+/// Implementations can use priority, age, or any combination.
+pub trait SchedulePolicy: Send + Sync {
+    /// Returns Ordering::Less if `a` should be scheduled before `b`.
+    fn compare(&self, a: &TaskMeta, b: &TaskMeta) -> std::cmp::Ordering;
+}
+```
+
+### Built-in Policies
+
+| Policy | Description |
+|--------|-------------|
+| `FifoPolicy` | Pure FIFO — tasks run in creation order regardless of priority. Simple and fair. |
+| `PriorityPolicy` | Strict priority — higher priority always wins. Risk of starvation for low-priority tasks. |
+| `PriorityWithAgingPolicy` | **(Default)** Priority-first, but tasks gain effective priority as they age. Prevents starvation. |
+
+### PriorityWithAgingPolicy Details
+
+```rust
+pub struct PriorityWithAgingPolicy {
+    /// How much effective priority a task gains per second of waiting.
+    /// Default: 1 priority level per 10 seconds.
+    pub aging_rate: f64,
+}
+
+impl SchedulePolicy for PriorityWithAgingPolicy {
+    fn compare(&self, a: &TaskMeta, b: &TaskMeta) -> Ordering {
+        let now = Instant::now();
+        let age_a = now.duration_since(a.created_at).as_secs_f64();
+        let age_b = now.duration_since(b.created_at).as_secs_f64();
+
+        let effective_a = a.priority as f64 + age_a * self.aging_rate;
+        let effective_b = b.priority as f64 + age_b * self.aging_rate;
+
+        // Higher effective priority → scheduled first
+        effective_b.partial_cmp(&effective_a).unwrap_or(Ordering::Equal)
+    }
+}
+```
+
+### Configuration
+
+```rust
+pub struct RuntimeConfig {
+    pub worker_pool: WorkerPoolConfig,
+    pub connection_pool: ConnectionPoolConfig,
+    /// Scheduling policy for the task queue. Default: PriorityWithAgingPolicy.
+    pub schedule_policy: Box<dyn SchedulePolicy>,
+    // ...
+}
+```
+
+### Dataflow Priority Assignment
+
+Priority is set when submitting a dataflow:
+
+```rust
+let handle = runtime.execute(DataflowSpec {
+    graph: my_graph,
+    priority: 100,  // higher = more important
+    // ...
+});
+```
+
+All operator activation tasks generated by this dataflow inherit its priority.
+
+### Key Design Points
+
+1. **Priority is per-dataflow, not per-operator** — simplifies reasoning; all tasks within a dataflow share the same priority level.
+2. **Aging prevents starvation** — even priority-0 tasks will eventually run as their effective priority grows with wait time.
+3. **Policy is per-RuntimeHandle** — different clusters can use different policies (e.g., interactive uses strict priority, batch uses FIFO).
+4. **No global queue** — each `RuntimeHandle` has its own task queue with its own policy, reinforcing the isolation guarantee from §12.6.
+5. **`created_at` uses `Instant`** — monotonic clock, immune to wall-clock adjustments.
 
 ---
 
