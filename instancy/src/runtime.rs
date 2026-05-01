@@ -98,7 +98,12 @@ impl RuntimeHandle {
         &self.cancel
     }
 
-    /// Shut down the runtime, cancelling all running dataflows.
+    /// Shut down the runtime by cancelling all running dataflows.
+    ///
+    /// This is **cooperative**: it signals cancellation to all dataflows but
+    /// does not forcibly terminate worker threads. Worker threads will drain
+    /// once operators observe cancellation and stop producing work.
+    /// Full WorkerPool shutdown integration is planned for a future PR.
     pub fn shutdown(&self) {
         self.cancel.cancel();
     }
