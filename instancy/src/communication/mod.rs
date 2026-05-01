@@ -9,6 +9,9 @@ pub mod allocator;
 pub mod codec;
 pub mod connection;
 pub mod interprocess;
+pub mod progress_exchange;
+pub mod remote_push;
+pub mod session;
 pub mod transport;
 
 pub use allocator::{AllocatorConfig, ChannelAllocator, DEFAULT_CHANNEL_CAPACITY};
@@ -19,6 +22,9 @@ pub use interprocess::{
     decode_data_batch, decode_progress, encode_data_batch, encode_progress,
 };
 pub use transport::{Frame, TransportError};
+pub use session::{ChannelInfo, DataflowSession, DataflowSessionBuilder, SharedSession};
+pub use remote_push::{FrameReceiver, FrameSender, OutboundFrame, RemotePush, RemotePushConfig};
+pub use progress_exchange::{PeerProgressSender, ProgressExchange, ProgressExchangeConfig};
 
 #[cfg(feature = "transport")]
 pub use transport::{
