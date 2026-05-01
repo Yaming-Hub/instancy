@@ -184,7 +184,10 @@ impl DataflowExecutor {
         })
     }
 
-    /// Run the dataflow to completion or cancellation.
+    /// Run the dataflow to completion or cancellation using a simple single-threaded
+    /// activation loop. This is a **testing/validation helper** — it does NOT use the
+    /// Worker Thread Pool. In production, the orchestrator event loop drives operator
+    /// activations via the TaskScheduler and Worker Thread Pool (see §5.4 in DESIGN.md).
     ///
     /// Returns `Ok(true)` on normal completion (all operators done).
     /// Returns `Ok(false)` on quiescence (no operator can make progress,
