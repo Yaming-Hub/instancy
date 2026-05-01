@@ -1,12 +1,22 @@
-//! Wired operator wrappers that implement [`SchedulableOperator`].
+//! Wired (materialized) operator implementations.
 //!
-//! These wrappers own both the concrete operator (with its InputHandle/OutputHandle)
-//! AND the channel endpoints (Push/Pull). When activated, they:
-//! 1. Pull envelopes from input channels → feed the InputHandle.
-//! 2. Call the operator's logic.
-//! 3. Drain the OutputHandle → push envelopes to output channels.
+//! A "wired" operator is one that has completed the **materialization phase**:
+//! its input/output channels are physically connected (Push/Pull endpoints attached),
+//! making it ready for execution. This contrasts with the **build phase** where
+//! operators exist only as metadata in the `DataflowGraph` (name, index, port counts,
+//! edges) with no real channels attached.
 //!
-//! This keeps type-erasure at the outer boundary only.
+//! **Lifecycle:**
+//! 1. Build phase → logical operator (metadata in DataflowGraph)
+//! 2. Materialize phase → wired operator (channels connected, implements SchedulableOperator)
+//!
+//! When activated, a wired operator:
+//! 1. Pulls envelopes from its input channel(s) → feeds the InputHandle.
+//! 2. Calls the operator's user logic.
+//! 3. Drains the OutputHandle → pushes envelopes to its output channel(s).
+//!
+//! Type-erasure happens at the outer `SchedulableOperator` boundary only —
+//! internally, operators work with concrete Rust types (no dynamic dispatch on data).
 
 use crate::dataflow::channels::envelope::{Envelope, Payload};
 use crate::dataflow::channels::pushpull::{Pull, Push};
@@ -20,7 +30,10 @@ use crate::progress::timestamp::Timestamp;
 // WiredUnaryOperator
 // ---------------------------------------------------------------------------
 
-/// A fully-wired unary operator ready for execution.
+/// A fully-wired (materialized) unary operator ready for execution.
+///
+/// "Wired" means its input/output channels are physically connected —
+/// this operator can pull data from upstream and push results downstream.
 ///
 /// Owns:
 /// - Input channel (puller) + InputHandle
@@ -206,9 +219,9 @@ impl<T: Timestamp, D1: Send + 'static, D2: Send + 'static> SchedulableOperator
 // WiredSourceOperator
 // ---------------------------------------------------------------------------
 
-/// A source operator that produces data from an iterator.
+/// A wired (materialized) source operator that produces data from an iterator.
 ///
-/// Has no input channels — generates data from a provided iterator and
+/// Has no input channels — generates data from a provided collection and
 /// pushes to its output channel.
 pub struct WiredSourceOperator<T: Timestamp, D: Send + 'static> {
     name: String,
@@ -309,7 +322,7 @@ impl<T: Timestamp, D: Send + 'static> SchedulableOperator for WiredSourceOperato
 // WiredSinkOperator
 // ---------------------------------------------------------------------------
 
-/// A sink operator that collects data from its input channel.
+/// A wired (materialized) sink operator that collects data from its input channel.
 ///
 /// Has no output channels — accumulates received data for later retrieval.
 pub struct WiredSinkOperator<T: Timestamp, D: Send + 'static> {
