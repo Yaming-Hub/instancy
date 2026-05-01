@@ -866,3 +866,75 @@ PR23 (RuntimeHandle + SchedulePolicy — multi-cluster isolation, priority sched
 - **Event-driven executor** — the current `DataflowExecutor::run()` is a single-threaded test/validation helper. A future PR must implement the production event-driven model where the orchestrator event loop (on the I/O runtime) feeds operator activations into the `TaskScheduler` → Worker Thread Pool. The `run()` loop will be replaced by an event-driven `activate_operator()` method called by the orchestrator when data arrives or progress advances. This is prerequisite for multi-dataflow sharing of the Worker Thread Pool.
 - **No global state** — the instancy crate must contain zero `static`, `lazy_static`, `once_cell`, or `thread_local!` declarations. All state is owned by `RuntimeHandle` instances. This enables multiple isolated clusters in a single process (§12.6).
 - **Pluggable scheduling** — task dequeue order is determined by a `SchedulePolicy` trait per `RuntimeHandle`. Default policy uses priority-with-aging (§12.7).
+
+---
+
+## Completed PRs (Post-Original Plan)
+
+| GH PR | Content |
+|-------|---------|
+| #30 | DataflowGraph registry |
+| #32 | Dataflow builder (BuildContext, build_and_run, source → sink pipelines) |
+| #33 | Progress integration + ProbeHandle |
+| #34 | RuntimeHandle + SchedulePolicy |
+| #35 | End-to-end examples (hello_dataflow, cancellation, runtime_isolation, probe) |
+
+---
+
+## Next PRs (Builder API Completeness)
+
+### PR 25 — Unary operator in builder + stream chaining
+**Goal**: Enable transformation pipelines (source → map → filter → sink).
+
+- Add `BuildContext::add_unary(name, source_idx, closure)` — 1 input, 1 output
+- Closure signature: `FnMut(T, Vec<D>) -> Vec<D2>`
+- Wire into subgraph builder with proper edges + progress
+- Tests: map, filter, multi-stage pipeline
+
+### PR 26 — Binary operator + concat in builder
+**Goal**: Multi-input operators.
+
+- `BuildContext::add_binary(name, left_idx, right_idx, closure)`
+- `BuildContext::add_concat(name, sources: &[usize])`
+- Tests: join-like logic, merging streams
+
+### PR 27 — Feedback/loop operator in builder
+**Goal**: Iterative computation.
+
+- `BuildContext::add_feedback(name, body_closure, max_iterations)`
+- Product timestamps for nested scope
+- Tests: iterative convergence
+
+### PR 28 — Wire RuntimeHandle to execute dataflows
+**Goal**: `RuntimeHandle::execute(spec)` → DataflowHandle.
+
+- Integrate SchedulePolicy into task dispatch
+- RuntimeHandle::execute() submits dataflow to worker pool
+- DataflowHandle for completion/cancellation
+- Tests: runtime executes dataflow end-to-end
+
+---
+
+## Future: Migrate timely-dataflow Examples to instancy
+
+Once the builder API supports unary, binary, loop, and exchange operators,
+migrate the key timely-dataflow examples to demonstrate equivalent functionality:
+
+| timely example | instancy equivalent | Requires |
+|---|---|---|
+| `hello.rs` | ✅ Done (`hello_dataflow.rs`) | — |
+| `simple.rs` | `simple.rs` — basic unary map | PR 25 |
+| `loopdemo.rs` | `loop_demo.rs` — iterative computation | PR 27 |
+| `hashjoin.rs` | `hash_join.rs` — binary join pattern | PR 26 |
+| `exchange.rs` | `exchange.rs` — data repartitioning | PR 25 + exchange in builder |
+| `barrier.rs` | `barrier.rs` — synchronization barrier | PR 27 |
+| `bfs.rs` | `bfs.rs` — breadth-first search (graph algo) | PR 26 + PR 27 |
+| `pagerank.rs` | `pagerank.rs` — iterative graph algorithm | PR 26 + PR 27 |
+| `distinct.rs` | `distinct.rs` — stateful deduplication | PR 25 |
+| `flow_controlled.rs` | `flow_controlled.rs` — backpressure demo | PR 25 |
+| `pingpong.rs` | `pingpong.rs` — multi-process messaging | PR 28 + networking |
+| `event_driven.rs` | `event_driven.rs` — external input events | PR 25 |
+| `capture_send/recv` | `capture.rs` — stream capture/replay | PR 25 + serialization |
+
+**Priority order:** simple → loopdemo → hashjoin → exchange → bfs → pagerank
+(Others are lower priority and can be added incrementally.)
