@@ -23,6 +23,7 @@ use crate::dataflow::schedulable::{
     ActivationOutcome, ChannelEndpoints, ChannelFactory, OperatorFactory, SchedulableOperator,
 };
 use crate::error::{Error, Result};
+use crate::progress::notificator::Notificator;
 use crate::progress::subgraph::ProgressTracker;
 use crate::progress::timestamp::Timestamp;
 
@@ -73,6 +74,9 @@ pub struct DataflowExecutor<T: Timestamp = u64> {
     cancel: CancellationToken,
     /// Optional progress tracker — when set, frontier advances trigger activation.
     progress_tracker: Option<ProgressTracker<T>>,
+    /// Per-operator notificators, indexed by position in `operators` vec.
+    /// Only populated when a progress tracker is attached.
+    notificators: Vec<Option<Notificator<T>>>,
     /// Phantom for the timestamp type.
     _phantom: PhantomData<T>,
 }
@@ -192,6 +196,7 @@ impl<T: Timestamp> DataflowExecutor<T> {
             config,
             cancel,
             progress_tracker: None,
+            notificators: Vec::new(),
             _phantom: PhantomData,
         })
     }
@@ -200,6 +205,7 @@ impl<T: Timestamp> DataflowExecutor<T> {
     ///
     /// When a progress tracker is attached, after each activation batch the executor
     /// propagates progress and adds operators with dirty frontiers to the ready queue.
+    /// Also creates per-operator Notificators initialized with current input frontiers.
     ///
     /// # Panics
     ///
@@ -209,12 +215,22 @@ impl<T: Timestamp> DataflowExecutor<T> {
             tracker.is_initialized(),
             "ProgressTracker must be initialized before attaching to executor"
         );
+
+        // Create per-operator notificators with initial frontiers.
+        let mut notificators: Vec<Option<Notificator<T>>> = Vec::with_capacity(self.operators.len());
+        for (_pos, op) in self.operators.iter().enumerate() {
+            let op_idx = op.index();
+            let frontier = tracker.operator_input_frontier_meet(op_idx);
+            notificators.push(Some(Notificator::new(frontier)));
+        }
+        self.notificators = notificators;
         self.progress_tracker = Some(tracker);
     }
 
     /// Propagate progress and enqueue operators whose frontiers changed.
     ///
     /// Called after each activation batch when a progress tracker is present.
+    /// Updates per-operator notificators with new frontiers.
     /// Returns true if any operator was newly activated.
     fn propagate_progress(&mut self) -> bool {
         let tracker = match &mut self.progress_tracker {
@@ -223,7 +239,32 @@ impl<T: Timestamp> DataflowExecutor<T> {
         };
 
         let dirty: Vec<usize> = tracker.propagate().to_vec();
+
+        // Collect frontier updates for dirty operators before releasing tracker borrow.
+        let frontier_updates: Vec<(usize, _)> = dirty
+            .iter()
+            .filter_map(|&op_idx| {
+                if op_idx < self.index_to_pos.len() {
+                    let pos = self.index_to_pos[op_idx];
+                    if pos != usize::MAX && pos < self.notificators.len() {
+                        let frontier = tracker.operator_input_frontier_meet(op_idx);
+                        return Some((pos, frontier));
+                    }
+                }
+                None
+            })
+            .collect();
+
+        // Apply frontier updates to notificators.
+        for (pos, frontier) in frontier_updates {
+            if let Some(notificator) = &mut self.notificators[pos] {
+                notificator.update_frontier(&frontier);
+            }
+        }
+
         let mut activated = false;
+
+        // Enqueue dirty operators
         for op_idx in dirty {
             if op_idx < self.index_to_pos.len() {
                 let pos = self.index_to_pos[op_idx];
@@ -234,6 +275,21 @@ impl<T: Timestamp> DataflowExecutor<T> {
                 }
             }
         }
+
+        // Also check if any operator has ready notifications (may not be dirty)
+        for pos in 0..self.notificators.len() {
+            if self.done[pos] || self.in_queue[pos] {
+                continue;
+            }
+            if let Some(notificator) = &self.notificators[pos] {
+                if notificator.has_ready() {
+                    self.ready_queue.push_back(pos);
+                    self.in_queue[pos] = true;
+                    activated = true;
+                }
+            }
+        }
+
         activated
     }
 
@@ -362,6 +418,32 @@ impl<T: Timestamp> DataflowExecutor<T> {
     pub fn completed_count(&self) -> usize {
         self.done.iter().filter(|&&d| d).count()
     }
+
+    /// Request a notification for the operator at the given position
+    /// when the frontier advances past the given time.
+    ///
+    /// The notification will fire once the input frontier meets (across all ports)
+    /// advances past `time`.
+    pub fn notify_at(&mut self, pos: usize, time: T) {
+        if let Some(Some(notificator)) = self.notificators.get_mut(pos) {
+            notificator.notify_at(time);
+        }
+    }
+
+    /// Drain ready notifications for the operator at the given position.
+    ///
+    /// Returns an iterator of timestamps whose frontier has advanced past.
+    pub fn drain_notifications(&mut self, pos: usize) -> Vec<T> {
+        if let Some(Some(notificator)) = self.notificators.get_mut(pos) {
+            let mut times = Vec::new();
+            while let Some(fired) = notificator.next() {
+                times.push(fired.into_time());
+            }
+            times
+        } else {
+            Vec::new()
+        }
+    }
 }
 
 #[cfg(test)]
@@ -427,7 +509,8 @@ mod tests {
             config: ExecutorConfig::default(),
             cancel: CancellationToken::new(),
         progress_tracker: None,
-        _phantom: std::marker::PhantomData::<u64>,
+            notificators: Vec::new(),
+            _phantom: std::marker::PhantomData::<u64>,
         };
 
         let result = executor.run();
@@ -454,7 +537,8 @@ mod tests {
             config: ExecutorConfig::default(),
             cancel,
         progress_tracker: None,
-        _phantom: std::marker::PhantomData::<u64>,
+            notificators: Vec::new(),
+            _phantom: std::marker::PhantomData::<u64>,
         };
 
         let result = executor.run();
@@ -485,7 +569,8 @@ mod tests {
             config: ExecutorConfig::default(),
             cancel: CancellationToken::new(),
         progress_tracker: None,
-        _phantom: std::marker::PhantomData::<u64>,
+            notificators: Vec::new(),
+            _phantom: std::marker::PhantomData::<u64>,
         };
 
         let result = executor.run();
@@ -504,7 +589,8 @@ mod tests {
             config: ExecutorConfig::default(),
             cancel: CancellationToken::new(),
         progress_tracker: None,
-        _phantom: std::marker::PhantomData::<u64>,
+            notificators: Vec::new(),
+            _phantom: std::marker::PhantomData::<u64>,
         };
 
         let result = executor.run();
@@ -537,7 +623,8 @@ mod tests {
             config: ExecutorConfig { max_activations_per_step: 10, max_idle_sweeps: 3 },
             cancel: CancellationToken::new(),
         progress_tracker: None,
-        _phantom: std::marker::PhantomData::<u64>,
+            notificators: Vec::new(),
+            _phantom: std::marker::PhantomData::<u64>,
         };
 
         // Should terminate via quiescence, not infinite loop.
@@ -592,7 +679,8 @@ mod tests {
             config: ExecutorConfig::default(),
             cancel: CancellationToken::new(),
         progress_tracker: None,
-        _phantom: std::marker::PhantomData::<u64>,
+            notificators: Vec::new(),
+            _phantom: std::marker::PhantomData::<u64>,
         };
 
         let result = executor.run();
@@ -635,6 +723,7 @@ mod tests {
             config: ExecutorConfig::default(),
             cancel: CancellationToken::new(),
             progress_tracker: None,
+            notificators: Vec::new(),
             _phantom: std::marker::PhantomData::<u64>,
         };
 
@@ -645,5 +734,79 @@ mod tests {
         // Run should still complete normally
         let result = executor.run();
         assert_eq!(result.unwrap(), true);
+    }
+
+    #[test]
+    fn notify_at_and_drain_notifications() {
+        use crate::progress::frontier::Antichain;
+        use crate::progress::notificator::Notificator;
+
+        let mut executor: DataflowExecutor<u64> = DataflowExecutor {
+            operators: vec![Box::new(CountingOperator {
+                name: "op".into(),
+                index: 1,
+                region_id: crate::dataflow::region::RegionId::new(0),
+                remaining: 1,
+            })],
+            ready_queue: VecDeque::from([0]),
+            in_queue: vec![true],
+            done: vec![false],
+            index_to_pos: vec![usize::MAX, 0],
+            config: ExecutorConfig::default(),
+            cancel: CancellationToken::new(),
+            progress_tracker: None,
+            notificators: vec![Some(Notificator::new(Antichain::from_elem(0u64)))],
+            _phantom: std::marker::PhantomData::<u64>,
+        };
+
+        // Request notification at time 5
+        executor.notify_at(0, 5);
+
+        // Nothing ready yet (frontier is still at 0, meaning time 5 not yet complete)
+        let ready = executor.drain_notifications(0);
+        assert!(ready.is_empty());
+
+        // Advance frontier past time 5 (empty frontier = all times complete)
+        if let Some(Some(notificator)) = executor.notificators.get_mut(0) {
+            notificator.update_frontier(&Antichain::new());
+        }
+
+        // Now notification should be ready
+        let ready = executor.drain_notifications(0);
+        assert_eq!(ready, vec![5]);
+
+        // Draining again yields nothing
+        let ready = executor.drain_notifications(0);
+        assert!(ready.is_empty());
+    }
+
+    #[test]
+    fn notify_at_fires_immediately_when_frontier_already_past() {
+        use crate::progress::frontier::Antichain;
+        use crate::progress::notificator::Notificator;
+
+        // Start with empty frontier (all times complete)
+        let mut executor: DataflowExecutor<u64> = DataflowExecutor {
+            operators: vec![Box::new(CountingOperator {
+                name: "op".into(),
+                index: 1,
+                region_id: crate::dataflow::region::RegionId::new(0),
+                remaining: 1,
+            })],
+            ready_queue: VecDeque::from([0]),
+            in_queue: vec![true],
+            done: vec![false],
+            index_to_pos: vec![usize::MAX, 0],
+            config: ExecutorConfig::default(),
+            cancel: CancellationToken::new(),
+            progress_tracker: None,
+            notificators: vec![Some(Notificator::new(Antichain::new()))],
+            _phantom: std::marker::PhantomData::<u64>,
+        };
+
+        // Request notification at time 3 — frontier already past, fires immediately
+        executor.notify_at(0, 3);
+        let ready = executor.drain_notifications(0);
+        assert_eq!(ready, vec![3]);
     }
 }

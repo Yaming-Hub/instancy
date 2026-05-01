@@ -372,6 +372,45 @@ impl<T: Timestamp> ProgressTracker<T> {
         &self.operator_indices
     }
 
+    /// Returns the meet (intersection) of all input frontiers for an operator.
+    ///
+    /// The meet represents the "combined" input frontier: a timestamp is complete
+    /// only when ALL input ports have advanced past it. For single-input operators,
+    /// this is just the one input frontier.
+    ///
+    /// Returns an empty antichain if the operator is not registered.
+    pub fn operator_input_frontier_meet(&self, operator: usize) -> Antichain<T> {
+        let state = match self.operator_frontiers.get(&operator) {
+            Some(s) => s,
+            None => return Antichain::new(),
+        };
+
+        if state.input_frontiers.is_empty() {
+            // Source operators have no inputs. Return Antichain::from_elem(T::minimum())
+            // so that notifications are NOT fired immediately — the source's progress is
+            // tracked via its output capabilities, and the frontier will advance when the
+            // executor propagates progress from the source's capability drops.
+            return Antichain::from_elem(T::minimum());
+        }
+
+        if state.input_frontiers.len() == 1 {
+            return state.input_frontiers[0].clone();
+        }
+
+        // Combined frontier for multiple inputs: merge all elements into one antichain.
+        // This gives us a frontier F where F.less_equal(t) iff ANY input frontier has
+        // less_equal(t). A notification fires only when ALL inputs have advanced past
+        // the requested time — i.e., when combined.less_equal(t) becomes false.
+        // This is the correct semantics: the "join" in the frontier lattice.
+        let mut combined = Antichain::new();
+        for frontier in &state.input_frontiers {
+            for elem in frontier.elements() {
+                combined.insert(elem.clone());
+            }
+        }
+        combined
+    }
+
     // -- internal --
 
     /// Drains capability changes from all operators' ProgressReporters into the tracker.
