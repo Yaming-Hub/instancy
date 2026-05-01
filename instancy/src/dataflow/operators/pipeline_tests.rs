@@ -687,4 +687,142 @@ mod tests {
         assert_ne!(r3, r2);
         assert_eq!(scope.region(r3).unwrap().parallelism(), 4);
     }
+
+    // ===================================================================
+    // Graph construction integration tests
+    // ===================================================================
+
+    /// Verify that a simple pipeline registers operators and edges in the graph.
+    #[test]
+    fn graph_simple_pipeline() {
+        use crate::dataflow::operators::inspect::InspectExt;
+        use crate::dataflow::operators::probe::ProbeExt;
+        use crate::dataflow::operators::unary::UnaryExt;
+        use crate::dataflow::scope::{RootScope, Scope};
+        use crate::dataflow::stream::{DataStream, Slot};
+
+        let mut scope = RootScope::<u64>::new("test", 4);
+        let region_id = scope.current_region().id();
+
+        // Simulate a source operator (index 0).
+        let src_idx = scope.allocate_operator_index();
+        scope.register_operator(crate::dataflow::graph::OperatorInfo::new(
+            src_idx, "source", region_id, 0, 1,
+        )).unwrap();
+
+        let source = Slot::new(src_idx, 0);
+        let stream: DataStream<RootScope<u64>, i32> =
+            DataStream::new(scope.clone(), source, region_id);
+
+        // Build: source → unary(double) → inspect → probe
+        let _handle = stream
+            .unary("double", |input, output| {
+                while let Some((t, d)) = input.next() {
+                    let mut s = output.session(t);
+                    for x in d { s.give(x * 2); }
+                }
+                Ok(())
+            })
+            .inspect("observe", |_t, _d| {})
+            .probe("end");
+
+        let graph = scope.graph();
+
+        // 4 operators: source(0), double(1), observe(2), end(3)
+        assert_eq!(graph.operator_count(), 4);
+        assert_eq!(graph.operator(0).unwrap().name, "source");
+        assert_eq!(graph.operator(1).unwrap().name, "double");
+        assert_eq!(graph.operator(2).unwrap().name, "observe");
+        assert_eq!(graph.operator(3).unwrap().name, "end");
+
+        // 3 edges: source→double, double→observe, observe→end
+        assert_eq!(graph.edge_count(), 3);
+
+        // Topological order
+        let order = graph.topological_order().unwrap();
+        assert_eq!(order, vec![0, 1, 2, 3]);
+
+        // Validation passes
+        assert!(graph.validate().is_ok());
+    }
+
+    /// Verify graph construction with binary operators.
+    #[test]
+    fn graph_binary_pipeline() {
+        use crate::dataflow::operators::binary::BinaryExt;
+        use crate::dataflow::operators::probe::ProbeExt;
+        use crate::dataflow::scope::{RootScope, Scope};
+        use crate::dataflow::stream::{DataStream, Slot};
+
+        let mut scope = RootScope::<u64>::new("test", 4);
+        let region_id = scope.current_region().id();
+
+        // Two source operators.
+        let src0 = scope.allocate_operator_index();
+        scope.register_operator(crate::dataflow::graph::OperatorInfo::new(
+            src0, "left_source", region_id, 0, 1,
+        )).unwrap();
+        let src1 = scope.allocate_operator_index();
+        scope.register_operator(crate::dataflow::graph::OperatorInfo::new(
+            src1, "right_source", region_id, 0, 1,
+        )).unwrap();
+
+        let left: DataStream<RootScope<u64>, i32> =
+            DataStream::new(scope.clone(), Slot::new(src0, 0), region_id);
+        let right: DataStream<RootScope<u64>, i32> =
+            DataStream::new(scope.clone(), Slot::new(src1, 0), region_id);
+
+        let _handle = left
+            .binary(&right, "join", |l, r, out| {
+                while let Some((t, d)) = l.next() { out.push_vec(t, d); }
+                while let Some((t, d)) = r.next() { out.push_vec(t, d); }
+                Ok(())
+            })
+            .probe("end");
+
+        let graph = scope.graph();
+        assert_eq!(graph.operator_count(), 4); // 2 sources + join + probe
+        assert_eq!(graph.edge_count(), 3); // src0→join, src1→join, join→probe
+
+        // Binary op has 2 inputs
+        assert_eq!(graph.operator(2).unwrap().input_count, 2);
+
+        let order = graph.topological_order().unwrap();
+        // Both sources before join, join before probe
+        let join_pos = order.iter().position(|&x| x == 2).unwrap();
+        let probe_pos = order.iter().position(|&x| x == 3).unwrap();
+        assert!(join_pos < probe_pos);
+
+        assert!(graph.validate().is_ok());
+    }
+
+    /// Verify graph construction with branch (1 input, 2 outputs).
+    #[test]
+    fn graph_branch_pipeline() {
+        use crate::dataflow::operators::branch::BranchExt;
+        use crate::dataflow::operators::probe::ProbeExt;
+        use crate::dataflow::scope::{RootScope, Scope};
+        use crate::dataflow::stream::{DataStream, Slot};
+
+        let mut scope = RootScope::<u64>::new("test", 4);
+        let region_id = scope.current_region().id();
+
+        let src_idx = scope.allocate_operator_index();
+        scope.register_operator(crate::dataflow::graph::OperatorInfo::new(
+            src_idx, "source", region_id, 0, 1,
+        )).unwrap();
+
+        let stream: DataStream<RootScope<u64>, i32> =
+            DataStream::new(scope.clone(), Slot::new(src_idx, 0), region_id);
+
+        let (true_stream, false_stream) = stream.branch(|x| *x > 0);
+        let _p1 = true_stream.probe("pos");
+        let _p2 = false_stream.probe("neg");
+
+        let graph = scope.graph();
+        // source(0), branch(1), pos(2), neg(3)
+        assert_eq!(graph.operator_count(), 4);
+        assert_eq!(graph.operator(1).unwrap().output_count, 2);
+        assert!(graph.validate().is_ok());
+    }
 }

@@ -178,7 +178,23 @@ impl<S: Scope, D1: 'static> BinaryExt<S, D1> for DataStream<S, D1> {
         let region_id = self.region_id();
         let output_slot = Slot::new(op_index, 0);
 
-        // TODO: Register operator in scope/graph registry (PR9).
+        // Register operator and edges in the dataflow graph.
+        scope.register_operator(crate::dataflow::graph::OperatorInfo::new(
+            op_index, name, region_id, 2, 1,
+        )).expect("operator index should be unique");
+        scope.add_edge(crate::dataflow::graph::EdgeInfo::new(
+            *self.source(),
+            Slot::new(op_index, 0),
+            self.region_id(),
+            region_id,
+        ));
+        scope.add_edge(crate::dataflow::graph::EdgeInfo::new(
+            *other.source(),
+            Slot::new(op_index, 1),
+            other.region_id(),
+            region_id,
+        ));
+
         let _operator = BinaryOperator::new(name, op_index, region_id, logic);
 
         DataStream::new(scope, output_slot, region_id)

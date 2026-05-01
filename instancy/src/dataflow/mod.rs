@@ -5,6 +5,7 @@
 //! operators, and the dataflow specification builder.
 
 pub mod channels;
+pub mod graph;
 pub mod id;
 pub mod operators;
 pub mod region;
@@ -13,6 +14,7 @@ pub mod spec;
 pub mod stream;
 
 pub use channels::{ControlSignal, Envelope, PartitionStrategy, Payload};
+pub use graph::{DataflowGraph, EdgeInfo, OperatorInfo};
 pub use id::DataflowId;
 pub use operators::handles::{InputHandle, NotificationHandle, OutputHandle, OutputSession};
 pub use operators::input::{ChannelInput, InputEvent, TimestampedInput, VecInput};

@@ -170,8 +170,17 @@ impl<S: Scope, D: 'static> InspectExt<S, D> for DataStream<S, D> {
         let region_id = self.region_id();
         let output_slot = Slot::new(op_index, 0);
 
-        // TODO: Register operator in scope/graph registry (PR9).
-        // Currently the operator is created for validation but not stored.
+        // Register operator and edge in the dataflow graph.
+        scope.register_operator(crate::dataflow::graph::OperatorInfo::new(
+            op_index, name, region_id, 1, 1,
+        )).expect("operator index should be unique");
+        scope.add_edge(crate::dataflow::graph::EdgeInfo::new(
+            *self.source(),
+            Slot::new(op_index, 0),
+            self.region_id(),
+            region_id,
+        ));
+
         let _operator = InspectOperator::new(name, op_index, region_id, _inspector);
 
         DataStream::new(scope, output_slot, region_id)

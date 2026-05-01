@@ -14,6 +14,7 @@ use crate::error::Result;
 use crate::order::Product;
 use crate::progress::timestamp::Timestamp;
 
+use super::graph::{DataflowGraph, EdgeInfo, OperatorInfo};
 use super::region::{Region, RegionAllocator, RegionId};
 
 /// A unique address within the dataflow graph.
@@ -102,6 +103,27 @@ pub trait Scope: Clone + 'static {
 
     /// Allocate the next egress (leave) slot index for the scope boundary.
     fn allocate_egress_slot(&mut self) -> usize;
+
+    /// Register an operator in the dataflow graph.
+    ///
+    /// Records the operator's metadata (index, name, region, port counts)
+    /// so the execution engine can later materialize it.
+    fn register_operator(&mut self, info: OperatorInfo) -> Result<()>;
+
+    /// Record a directed edge between operator ports in the dataflow graph.
+    fn add_edge(&mut self, edge: EdgeInfo);
+
+    /// Increment the input port count of a registered operator.
+    ///
+    /// Used for operators like child scopes whose port counts grow
+    /// dynamically as enter()/leave() calls are made.
+    fn increment_operator_input_count(&mut self, operator_index: usize);
+
+    /// Increment the output port count of a registered operator.
+    fn increment_operator_output_count(&mut self, operator_index: usize);
+
+    /// Get a snapshot of the current dataflow graph.
+    fn graph(&self) -> DataflowGraph;
 }
 
 /// Mutable state shared across all clones of a scope.
@@ -119,6 +141,8 @@ struct ScopeState {
     next_ingress_slot: usize,
     /// Next egress (leave) slot index for the scope boundary operator.
     next_egress_slot: usize,
+    /// The dataflow graph tracking operators and edges.
+    graph: DataflowGraph,
 }
 
 /// The root-level scope for a dataflow.
@@ -154,6 +178,7 @@ impl<T: Timestamp> RootScope<T> {
                 current_region_index: 0,
                 next_ingress_slot: 0,
                 next_egress_slot: 0,
+                graph: DataflowGraph::new(),
             })),
             _phantom: std::marker::PhantomData,
         }
@@ -189,8 +214,22 @@ impl<T: Timestamp> RootScope<T> {
     where
         Product<T, TInner>: Timestamp,
     {
+        let name = name.into();
         let child_index = self.allocate_operator_index();
+        let region_id = self.current_region().id();
         let parallelism = self.current_region().parallelism();
+
+        // Register the child scope as an operator in the parent's graph.
+        // Its input/output counts grow dynamically as enter()/leave() are called.
+        self.register_operator(OperatorInfo::new(
+            child_index,
+            format!("subscope:{}", name),
+            region_id,
+            0,
+            0,
+        ))
+        .expect("child scope operator index was just allocated, cannot conflict");
+
         ChildScope::new(name, &self.addr(), child_index, parallelism)
     }
 }
@@ -248,6 +287,26 @@ impl<T: Timestamp> Scope for RootScope<T> {
         state.next_egress_slot += 1;
         slot
     }
+
+    fn register_operator(&mut self, info: OperatorInfo) -> Result<()> {
+        self.state.lock().unwrap().graph.register_operator(info)
+    }
+
+    fn add_edge(&mut self, edge: EdgeInfo) {
+        self.state.lock().unwrap().graph.add_edge(edge);
+    }
+
+    fn increment_operator_input_count(&mut self, operator_index: usize) {
+        self.state.lock().unwrap().graph.increment_input_count(operator_index);
+    }
+
+    fn increment_operator_output_count(&mut self, operator_index: usize) {
+        self.state.lock().unwrap().graph.increment_output_count(operator_index);
+    }
+
+    fn graph(&self) -> DataflowGraph {
+        self.state.lock().unwrap().graph.clone()
+    }
 }
 ///
 /// The child scope has a timestamp type that extends the parent's timestamp
@@ -277,6 +336,14 @@ impl<T: Timestamp> ChildScope<T> {
     ) -> Self {
         let mut region_allocator = RegionAllocator::new();
         let default_region = region_allocator.allocate(parallelism);
+        let region_id = default_region.id();
+
+        let mut graph = DataflowGraph::new();
+        // Register the scope boundary operator (index 0). Its port counts
+        // grow dynamically as enter()/leave() allocate ingress/egress slots.
+        graph
+            .register_operator(OperatorInfo::new(0, "scope-boundary", region_id, 0, 0))
+            .expect("scope-boundary registration on fresh graph cannot fail");
 
         Self {
             name: Arc::new(name.into()),
@@ -289,6 +356,7 @@ impl<T: Timestamp> ChildScope<T> {
                 current_region_index: 0,
                 next_ingress_slot: 0,
                 next_egress_slot: 0,
+                graph,
             })),
             _phantom: std::marker::PhantomData,
         }
@@ -301,8 +369,21 @@ impl<T: Timestamp> ChildScope<T> {
     where
         Product<T, TInner>: Timestamp,
     {
+        let name = name.into();
         let child_index = self.allocate_operator_index();
+        let region_id = self.current_region().id();
         let parallelism = self.current_region().parallelism();
+
+        // Register the child scope as an operator in the parent's graph.
+        self.register_operator(OperatorInfo::new(
+            child_index,
+            format!("subscope:{}", name),
+            region_id,
+            0,
+            0,
+        ))
+        .expect("child scope operator index was just allocated, cannot conflict");
+
         ChildScope::new(name, &self.addr(), child_index, parallelism)
     }
 }
@@ -351,6 +432,8 @@ impl<T: Timestamp> Scope for ChildScope<T> {
         let mut state = self.state.lock().unwrap();
         let slot = state.next_ingress_slot;
         state.next_ingress_slot += 1;
+        // Each ingress slot is an output of the boundary operator (data enters child).
+        state.graph.increment_output_count(0);
         slot
     }
 
@@ -358,7 +441,29 @@ impl<T: Timestamp> Scope for ChildScope<T> {
         let mut state = self.state.lock().unwrap();
         let slot = state.next_egress_slot;
         state.next_egress_slot += 1;
+        // Each egress slot is an input of the boundary operator (data leaves child).
+        state.graph.increment_input_count(0);
         slot
+    }
+
+    fn register_operator(&mut self, info: OperatorInfo) -> Result<()> {
+        self.state.lock().unwrap().graph.register_operator(info)
+    }
+
+    fn add_edge(&mut self, edge: EdgeInfo) {
+        self.state.lock().unwrap().graph.add_edge(edge);
+    }
+
+    fn increment_operator_input_count(&mut self, operator_index: usize) {
+        self.state.lock().unwrap().graph.increment_input_count(operator_index);
+    }
+
+    fn increment_operator_output_count(&mut self, operator_index: usize) {
+        self.state.lock().unwrap().graph.increment_output_count(operator_index);
+    }
+
+    fn graph(&self) -> DataflowGraph {
+        self.state.lock().unwrap().graph.clone()
     }
 }
 
@@ -497,5 +602,52 @@ mod tests {
         let region = cloned.region(new_id);
         assert!(region.is_some());
         assert_eq!(region.unwrap().parallelism(), 8);
+    }
+
+    #[test]
+    fn scope_graph_initially_empty() {
+        let scope = RootScope::<u64>::new("test", 4);
+        let graph = scope.graph();
+        assert_eq!(graph.operator_count(), 0);
+        assert_eq!(graph.edge_count(), 0);
+    }
+
+    #[test]
+    fn scope_register_operator_and_edge() {
+        let mut scope = RootScope::<u64>::new("test", 4);
+        let region_id = scope.current_region().id();
+        let idx = scope.allocate_operator_index();
+
+        scope.register_operator(OperatorInfo::new(
+            idx, "my_op", region_id, 1, 1,
+        )).unwrap();
+        scope.add_edge(EdgeInfo::new(
+            crate::dataflow::stream::Slot::new(99, 0),
+            crate::dataflow::stream::Slot::new(idx, 0),
+            region_id,
+            region_id,
+        ));
+
+        let graph = scope.graph();
+        assert_eq!(graph.operator_count(), 1);
+        assert_eq!(graph.edge_count(), 1);
+        assert_eq!(graph.operator(idx).unwrap().name, "my_op");
+    }
+
+    #[test]
+    fn scope_clone_shares_graph() {
+        let mut scope = RootScope::<u64>::new("shared", 4);
+        let cloned = scope.clone();
+        let region_id = scope.current_region().id();
+
+        let idx = scope.allocate_operator_index();
+        scope.register_operator(OperatorInfo::new(
+            idx, "op_from_original", region_id, 0, 1,
+        )).unwrap();
+
+        // Clone sees the registration
+        let graph = cloned.graph();
+        assert_eq!(graph.operator_count(), 1);
+        assert_eq!(graph.operator(idx).unwrap().name, "op_from_original");
     }
 }
