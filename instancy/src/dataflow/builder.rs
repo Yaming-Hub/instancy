@@ -19,11 +19,13 @@ use crate::dataflow::channels::bounded::bounded_channel;
 use crate::dataflow::channels::pushpull::{Pull, Push};
 use crate::dataflow::executor::{DataflowExecutor, ExecutorConfig};
 use crate::dataflow::graph::DataflowGraph;
+use crate::dataflow::probe::ProbeHandle;
 use crate::dataflow::region::RegionId;
 use crate::dataflow::schedulable::{ChannelEndpoints, ChannelFactory, OperatorFactory, SchedulableOperator};
 use crate::dataflow::stream::Slot;
 use crate::dataflow::wired_operators::WiredSourceOperator;
 use crate::error::{Error, Result};
+use crate::progress::change_batch::ChangeBatch;
 use crate::progress::operate::PortConnectivity;
 use crate::progress::reachability::Location;
 use crate::progress::subgraph::SubgraphBuilder;
@@ -60,6 +62,8 @@ pub struct BuildContext<T: Timestamp> {
     channel_factories: Vec<(usize, ChannelFactory)>,
     /// SubgraphBuilder for progress tracking.
     subgraph_builder: SubgraphBuilder<T>,
+    /// Registered probes: (operator_index, probe_handle).
+    probes: Vec<(usize, ProbeHandle<T>)>,
     /// Next available operator index (starts at 1, 0 reserved for scope boundary).
     next_operator_index: usize,
     /// Default channel capacity.
@@ -73,6 +77,7 @@ impl<T: Timestamp> BuildContext<T> {
             operator_factories: Vec::new(),
             channel_factories: Vec::new(),
             subgraph_builder: SubgraphBuilder::new(0, 0),
+            probes: Vec::new(),
             next_operator_index: 1,
             channel_capacity,
         }
@@ -112,15 +117,20 @@ impl<T: Timestamp> BuildContext<T> {
             ))
             .expect("operator index unique");
 
-        // Register in subgraph builder for progress tracking.
-        // Source has 0 inputs, 1 output — connectivity matrix is 0×1 (empty).
-        self.subgraph_builder.add_operator(
+        // Register in subgraph builder with initial capability at T::minimum().
+        // Source has 0 inputs, 1 output — holds capability until all data emitted.
+        let mut initial_cap = ChangeBatch::new();
+        initial_cap.update(T::minimum(), 1);
+        let progress = self.subgraph_builder.add_operator_with_capabilities(
             op_idx,
             &name,
             0, // no inputs
             1, // one output
             PortConnectivity::new(0, 1),
+            vec![initial_cap],
         );
+        // Clone the reporter so the source operator can report capability drops.
+        let reporter = progress.reporter(0).clone();
 
         // Create operator factory — receives output pusher from materializer.
         // Only single fan-out is supported (one edge from source output port 0).
@@ -138,8 +148,9 @@ impl<T: Timestamp> BuildContext<T> {
                 Box::new(NullPush)
             };
 
-            Box::new(WiredSourceOperator::new(name, op_idx, region_id, data, output_pusher))
-                as Box<dyn SchedulableOperator>
+            Box::new(WiredSourceOperator::with_progress(
+                name, op_idx, region_id, data, output_pusher, reporter,
+            )) as Box<dyn SchedulableOperator>
         });
 
         self.operator_factories.push((op_idx, factory));
@@ -219,6 +230,29 @@ impl<T: Timestamp> BuildContext<T> {
         self.channel_factories.push((edge_idx, channel_factory));
 
         (op_idx, collector)
+    }
+
+    /// Register a probe at a specific operator to observe its input frontier.
+    ///
+    /// Returns a [`ProbeHandle`] that tracks the frontier at the given operator.
+    /// Use `probe.done_with(&time)` to check if the operator has processed
+    /// all data at or before `time`, or `probe.is_done()` for full completion.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `operator_index` refers to a source (0-input) operator.
+    /// Sources have no input frontier to observe — probe a downstream sink instead.
+    pub fn add_probe(&mut self, operator_index: usize) -> ProbeHandle<T> {
+        // Validate: operator must have at least 1 input for meaningful frontier.
+        let op_info = self.graph.operator(operator_index)
+            .expect("add_probe: invalid operator index");
+        assert!(
+            op_info.input_count > 0,
+            "Cannot probe source operator (0 inputs) — probe a downstream operator instead"
+        );
+        let probe = ProbeHandle::new();
+        self.probes.push((operator_index, probe.clone()));
+        probe
     }
 
     /// Get the number of registered operators.
@@ -427,6 +461,11 @@ where
     tracker.initialize();
     executor.set_progress_tracker(tracker);
 
+    // Register probes so they receive frontier updates during propagation.
+    for (op_idx, probe) in ctx.probes {
+        executor.register_probe(op_idx, probe);
+    }
+
     // Run to completion
     let completed = executor.run()?;
     if !completed {
@@ -537,5 +576,39 @@ mod tests {
         let data = collected.lock().unwrap();
         let all_values: Vec<i32> = data.iter().flat_map(|(_, v)| v.iter().copied()).collect();
         assert_eq!(all_values.len(), 5);
+    }
+
+    #[test]
+    fn probe_reflects_completion() {
+        let probe = build_and_run::<u64, _, _>(BuilderConfig::default(), |ctx| {
+            let source = ctx.add_source("numbers", vec![
+                (0u64, vec![1i32, 2]),
+                (1u64, vec![3]),
+            ]);
+            let (sink_idx, _collector) = ctx.add_sink::<i32>("output", source);
+            let probe = ctx.add_probe(sink_idx);
+            Ok(probe)
+        })
+        .unwrap();
+
+        // After completion, probe should show empty frontier (all done).
+        assert!(probe.is_done());
+        assert!(probe.done_with(&0));
+        assert!(probe.done_with(&u64::MAX));
+    }
+
+    #[test]
+    fn probe_on_source_only_dataflow_completes() {
+        // When there's only a source (no sink), the dataflow still completes.
+        // Probing the sink in the source→sink case is the meaningful use.
+        let result = build_and_run::<u64, _, _>(BuilderConfig::default(), |ctx| {
+            let source = ctx.add_source("numbers", vec![(0u64, vec![1i32])]);
+            let (sink_idx, _) = ctx.add_sink::<i32>("output", source);
+            let probe = ctx.add_probe(sink_idx);
+            Ok(probe)
+        });
+        let probe = result.unwrap();
+        // After full completion, the sink probe shows done.
+        assert!(probe.is_done());
     }
 }
