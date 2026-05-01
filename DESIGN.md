@@ -1873,6 +1873,27 @@ When an upstream operator produces output, it writes directly into the downstrea
 
 `Envelope` (defined in §5.8) carries data batches, control signals, and user-defined metadata through the same buffer.
 
+#### 6.1.1 Force-Network Mode (Testing Transport Fidelity)
+
+By default, intra-process channels bypass serialization for performance. However, the hosting application can configure instancy to use **TCP loopback connections** (or any network transport) even for operators colocated in the same process. This is configured per-`RuntimeHandle` via:
+
+```rust
+let config = RuntimeConfig::builder()
+    .local_transport(LocalTransportMode::Network)  // force TCP even locally
+    .build();
+```
+
+**`LocalTransportMode`** variants:
+- **`InMemory`** (default): Bounded in-memory buffers, zero-copy, no serialization.
+- **`Network`**: Route local channels through the same `ConnectionManager` + codec path used for inter-process communication. Messages are serialized and deserialized exactly as they would be over the wire.
+
+**Use cases:**
+- **Unit/integration testing**: Verify that all message types serialize and deserialize correctly without needing a multi-process deployment.
+- **Fuzz testing**: Catch codec edge cases (e.g., large payloads, special characters, boundary timestamps) in a single-process test harness.
+- **Deterministic replay**: Record and replay wire-format messages for debugging.
+
+The transport mode is transparent to operator logic — operators always see typed `InputHandle`/`OutputHandle`. The mode only affects the physical channel implementation chosen during graph materialization.
+
 ### 6.2 Inter-Process Connections: ConnectionManager
 
 Connection establishment is **fully delegated to the application**. The library does not know how to open TCP ports, listen for connections, or negotiate TLS — it only knows that it needs a bidirectional byte stream to a given peer. The application provides a `ConnectionManager` component that handles the entire connection lifecycle.
