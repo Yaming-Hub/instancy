@@ -26,6 +26,7 @@ use crate::dataflow::operators::handles::{InputHandle, OutputHandle};
 use crate::dataflow::region::RegionId;
 use crate::dataflow::schedulable::{ActivationOutcome, SchedulableOperator};
 use crate::error::{Error, Result};
+use crate::progress::operate::ProgressReporter;
 use crate::progress::timestamp::Timestamp;
 
 // ---------------------------------------------------------------------------
@@ -235,6 +236,10 @@ pub struct WiredSourceOperator<T: Timestamp, D: Send + 'static> {
     output_pusher: Box<dyn Push<T, D>>,
     /// Pending output envelopes (for backpressure retry).
     pending_output: VecDeque<Envelope<T, D>>,
+    /// Optional progress reporter for output port 0.
+    /// When present, the source holds a capability at T::minimum() initially
+    /// and drops it when all data has been emitted.
+    progress_reporter: Option<ProgressReporter<T>>,
     /// Whether all data has been emitted.
     done: bool,
 }
@@ -255,6 +260,32 @@ impl<T: Timestamp, D: Send + 'static> WiredSourceOperator<T, D> {
             pending_data: VecDeque::from(data),
             output_pusher,
             pending_output: VecDeque::new(),
+            progress_reporter: None,
+            done: false,
+        }
+    }
+
+    /// Create a source operator with progress reporting.
+    ///
+    /// The source uses the provided reporter to drop its capability at `T::minimum()`
+    /// when all data has been emitted, allowing downstream frontiers to advance.
+    /// The initial capability is seeded by `SubgraphBuilder::add_operator_with_capabilities`.
+    pub fn with_progress(
+        name: impl Into<String>,
+        index: usize,
+        region_id: RegionId,
+        data: Vec<(T, Vec<D>)>,
+        output_pusher: Box<dyn Push<T, D>>,
+        reporter: ProgressReporter<T>,
+    ) -> Self {
+        Self {
+            name: name.into(),
+            index,
+            region_id,
+            pending_data: VecDeque::from(data),
+            output_pusher,
+            pending_output: VecDeque::new(),
+            progress_reporter: Some(reporter),
             done: false,
         }
     }
@@ -291,7 +322,10 @@ impl<T: Timestamp, D: Send + 'static> SchedulableOperator for WiredSourceOperato
             }
         }
 
-        // All data emitted.
+        // All data emitted — drop capability and close output.
+        if let Some(ref reporter) = self.progress_reporter {
+            reporter.update(T::minimum(), -1);
+        }
         self.output_pusher.close();
         self.done = true;
         Ok(ActivationOutcome::Done)
@@ -314,8 +348,15 @@ impl<T: Timestamp, D: Send + 'static> SchedulableOperator for WiredSourceOperato
     }
 
     fn close_inputs(&mut self) {
-        // Source has no inputs.
-        self.done = true;
+        // Source has no inputs, but close_inputs can be called during shutdown.
+        // Drop capability if present to avoid leaking it.
+        if !self.done {
+            if let Some(ref reporter) = self.progress_reporter {
+                reporter.update(T::minimum(), -1);
+            }
+            self.output_pusher.close();
+            self.done = true;
+        }
     }
 }
 

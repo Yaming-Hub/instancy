@@ -19,6 +19,7 @@ use std::marker::PhantomData;
 
 use crate::cancellation::CancellationToken;
 use crate::dataflow::graph::DataflowGraph;
+use crate::dataflow::probe::ProbeHandle;
 use crate::dataflow::schedulable::{
     ActivationOutcome, ChannelEndpoints, ChannelFactory, OperatorFactory, SchedulableOperator,
 };
@@ -77,6 +78,9 @@ pub struct DataflowExecutor<T: Timestamp = u64> {
     /// Per-operator notificators, indexed by position in `operators` vec.
     /// Only populated when a progress tracker is attached.
     notificators: Vec<Option<Notificator<T>>>,
+    /// Registered probes: (operator_index, probe_handle).
+    /// Updated during progress propagation with the operator's input frontier.
+    probes: Vec<(usize, ProbeHandle<T>)>,
     /// Phantom for the timestamp type.
     _phantom: PhantomData<T>,
 }
@@ -197,6 +201,7 @@ impl<T: Timestamp> DataflowExecutor<T> {
             cancel,
             progress_tracker: None,
             notificators: Vec::new(),
+            probes: Vec::new(),
             _phantom: PhantomData,
         })
     }
@@ -225,6 +230,20 @@ impl<T: Timestamp> DataflowExecutor<T> {
         }
         self.notificators = notificators;
         self.progress_tracker = Some(tracker);
+    }
+
+    /// Register a probe handle to observe the frontier at a specific operator.
+    ///
+    /// The probe's frontier is updated during each progress propagation step
+    /// with the operator's input frontier (the combined frontier of all inputs).
+    /// On registration, the probe is immediately seeded with the current frontier.
+    pub fn register_probe(&mut self, operator_index: usize, probe: ProbeHandle<T>) {
+        // Seed the probe with the current frontier from the tracker.
+        if let Some(ref tracker) = self.progress_tracker {
+            let frontier = tracker.operator_input_frontier_meet(operator_index);
+            probe.update_frontier(&frontier);
+        }
+        self.probes.push((operator_index, probe));
     }
 
     /// Propagate progress and enqueue operators whose frontiers changed.
@@ -287,6 +306,15 @@ impl<T: Timestamp> DataflowExecutor<T> {
                     self.in_queue[pos] = true;
                     activated = true;
                 }
+            }
+        }
+
+        // Update registered probes with current frontiers.
+        if !self.probes.is_empty() {
+            let tracker = self.progress_tracker.as_ref().unwrap();
+            for (op_idx, probe) in &self.probes {
+                let frontier = tracker.operator_input_frontier_meet(*op_idx);
+                probe.update_frontier(&frontier);
             }
         }
 
@@ -510,6 +538,7 @@ mod tests {
             cancel: CancellationToken::new(),
         progress_tracker: None,
             notificators: Vec::new(),
+            probes: Vec::new(),
             _phantom: std::marker::PhantomData::<u64>,
         };
 
@@ -538,6 +567,7 @@ mod tests {
             cancel,
         progress_tracker: None,
             notificators: Vec::new(),
+            probes: Vec::new(),
             _phantom: std::marker::PhantomData::<u64>,
         };
 
@@ -570,6 +600,7 @@ mod tests {
             cancel: CancellationToken::new(),
         progress_tracker: None,
             notificators: Vec::new(),
+            probes: Vec::new(),
             _phantom: std::marker::PhantomData::<u64>,
         };
 
@@ -590,6 +621,7 @@ mod tests {
             cancel: CancellationToken::new(),
         progress_tracker: None,
             notificators: Vec::new(),
+            probes: Vec::new(),
             _phantom: std::marker::PhantomData::<u64>,
         };
 
@@ -624,6 +656,7 @@ mod tests {
             cancel: CancellationToken::new(),
         progress_tracker: None,
             notificators: Vec::new(),
+            probes: Vec::new(),
             _phantom: std::marker::PhantomData::<u64>,
         };
 
@@ -680,6 +713,7 @@ mod tests {
             cancel: CancellationToken::new(),
         progress_tracker: None,
             notificators: Vec::new(),
+            probes: Vec::new(),
             _phantom: std::marker::PhantomData::<u64>,
         };
 
@@ -724,6 +758,7 @@ mod tests {
             cancel: CancellationToken::new(),
             progress_tracker: None,
             notificators: Vec::new(),
+            probes: Vec::new(),
             _phantom: std::marker::PhantomData::<u64>,
         };
 
@@ -756,6 +791,7 @@ mod tests {
             cancel: CancellationToken::new(),
             progress_tracker: None,
             notificators: vec![Some(Notificator::new(Antichain::from_elem(0u64)))],
+            probes: Vec::new(),
             _phantom: std::marker::PhantomData::<u64>,
         };
 
@@ -801,6 +837,7 @@ mod tests {
             cancel: CancellationToken::new(),
             progress_tracker: None,
             notificators: vec![Some(Notificator::new(Antichain::new()))],
+            probes: Vec::new(),
             _phantom: std::marker::PhantomData::<u64>,
         };
 

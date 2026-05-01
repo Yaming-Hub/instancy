@@ -10,6 +10,7 @@ pub mod executor;
 pub mod graph;
 pub mod id;
 pub mod operators;
+pub mod probe;
 pub mod region;
 pub mod schedulable;
 pub mod scope;
