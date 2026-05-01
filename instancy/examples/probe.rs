@@ -26,12 +26,16 @@ fn main() {
     })
     .expect("dataflow failed");
 
-    // After execution, the probe reflects the final frontier state.
+    // After execution completes, the probe reflects the final frontier state.
+    // In a real application, probes are most useful *during* execution to
+    // coordinate progress (e.g., waiting for a specific timestamp to complete).
+    // Here we show the terminal state: all timestamps have been fully processed,
+    // meaning the frontier has advanced past every input timestamp.
     println!("Dataflow completed.");
     println!("Probe is_done: {}", probe.is_done());
-    println!("Probe done_with(0): {}", probe.done_with(&0u64));
-    println!("Probe done_with(1): {}", probe.done_with(&1u64));
-    println!("Probe done_with(2): {}", probe.done_with(&2u64));
+    println!("Probe done_with(0): {} (frontier advanced past t=0)", probe.done_with(&0u64));
+    println!("Probe done_with(1): {} (frontier advanced past t=1)", probe.done_with(&1u64));
+    println!("Probe done_with(2): {} (frontier advanced past t=2)", probe.done_with(&2u64));
 
     // Print collected data
     let data = collector.lock().unwrap();

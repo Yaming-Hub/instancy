@@ -39,5 +39,5 @@ fn main() {
 
     // The batch runtime continues to operate independently.
     assert!(!rt_batch.is_shutdown());
-    println!("\nIsolation verified: shutting down one runtime leaves others unaffected.");
+    println!("\nIndependent shutdown verified: cancelling one runtime's token leaves others unaffected.");
 }
