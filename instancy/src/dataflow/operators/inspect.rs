@@ -334,7 +334,7 @@ mod tests {
         let output = stream.inspect("observer", |_time, _data| {});
 
         assert_eq!(output.region_id(), region_id);
-        assert_eq!(output.source().operator_index, 1);
+        assert_eq!(output.source().operator_index, 2);
     }
 
     #[test]

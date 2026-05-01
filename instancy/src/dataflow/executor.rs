@@ -15,6 +15,7 @@
 //! and runs until completion or cancellation.
 
 use std::collections::VecDeque;
+use std::marker::PhantomData;
 
 use crate::cancellation::CancellationToken;
 use crate::dataflow::graph::DataflowGraph;
@@ -22,6 +23,8 @@ use crate::dataflow::schedulable::{
     ActivationOutcome, ChannelEndpoints, ChannelFactory, OperatorFactory, SchedulableOperator,
 };
 use crate::error::{Error, Result};
+use crate::progress::subgraph::ProgressTracker;
+use crate::progress::timestamp::Timestamp;
 
 // ---------------------------------------------------------------------------
 // ExecutorConfig
@@ -52,24 +55,29 @@ impl Default for ExecutorConfig {
 /// The runtime execution engine for a single dataflow.
 ///
 /// Owns all operators and drives their activation until the dataflow completes
-/// or is cancelled.
-pub struct DataflowExecutor {
+/// or is cancelled. Generic over `T` (timestamp type) to support progress tracking.
+pub struct DataflowExecutor<T: Timestamp = u64> {
     /// Running operators, indexed by operator index.
     operators: Vec<Box<dyn SchedulableOperator>>,
     /// Ready queue: operator indices that need activation.
     ready_queue: VecDeque<usize>,
+    /// Tracks which operator positions are currently in the ready queue (O(1) membership check).
+    in_queue: Vec<bool>,
     /// Tracks which operators are done.
     done: Vec<bool>,
     /// Maps operator index → position in the operators vec (used for precise activation).
-    #[allow(dead_code)]
     index_to_pos: Vec<usize>,
     /// Configuration.
     config: ExecutorConfig,
     /// Cancellation token for graceful shutdown.
     cancel: CancellationToken,
+    /// Optional progress tracker — when set, frontier advances trigger activation.
+    progress_tracker: Option<ProgressTracker<T>>,
+    /// Phantom for the timestamp type.
+    _phantom: PhantomData<T>,
 }
 
-impl DataflowExecutor {
+impl<T: Timestamp> DataflowExecutor<T> {
     /// Materialize a dataflow from its graph, factories, and channel factories.
     ///
     /// This is the bridge between the build phase and the execution phase:
@@ -173,15 +181,60 @@ impl DataflowExecutor {
         // Initially, all operators are ready (they may have initial input or
         // need to produce initial output like sources).
         let ready_queue: VecDeque<usize> = (0..operators.len()).collect();
+        let in_queue = vec![true; operators.len()];
 
         Ok(Self {
             operators,
             ready_queue,
+            in_queue,
             done,
             index_to_pos,
             config,
             cancel,
+            progress_tracker: None,
+            _phantom: PhantomData,
         })
+    }
+
+    /// Attach an initialized progress tracker to enable frontier-driven activation.
+    ///
+    /// When a progress tracker is attached, after each activation batch the executor
+    /// propagates progress and adds operators with dirty frontiers to the ready queue.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the tracker has not been initialized via `initialize()`.
+    pub fn set_progress_tracker(&mut self, tracker: ProgressTracker<T>) {
+        assert!(
+            tracker.is_initialized(),
+            "ProgressTracker must be initialized before attaching to executor"
+        );
+        self.progress_tracker = Some(tracker);
+    }
+
+    /// Propagate progress and enqueue operators whose frontiers changed.
+    ///
+    /// Called after each activation batch when a progress tracker is present.
+    /// Returns true if any operator was newly activated.
+    fn propagate_progress(&mut self) -> bool {
+        let tracker = match &mut self.progress_tracker {
+            Some(t) => t,
+            None => return false,
+        };
+
+        let dirty: Vec<usize> = tracker.propagate().to_vec();
+        let mut activated = false;
+        for op_idx in dirty {
+            if op_idx < self.index_to_pos.len() {
+                let pos = self.index_to_pos[op_idx];
+                if pos != usize::MAX && !self.done[pos] && !self.in_queue[pos] {
+                    self.ready_queue.push_back(pos);
+                    self.in_queue[pos] = true;
+                    activated = true;
+                }
+            }
+        }
+        activated
     }
 
     /// Run the dataflow to completion or cancellation using a simple single-threaded
@@ -211,6 +264,7 @@ impl DataflowExecutor {
                 for pos in 0..self.operators.len() {
                     if !self.done[pos] {
                         self.ready_queue.push_back(pos);
+                        self.in_queue[pos] = true;
                     }
                 }
                 // If still empty, all operators are done.
@@ -227,6 +281,7 @@ impl DataflowExecutor {
                 let Some(pos) = self.ready_queue.pop_front() else {
                     break;
                 };
+                self.in_queue[pos] = false;
 
                 if self.done[pos] {
                     continue;
@@ -239,6 +294,7 @@ impl DataflowExecutor {
                         any_progress = true;
                         // Re-queue: operator may have more work.
                         self.ready_queue.push_back(pos);
+                        self.in_queue[pos] = true;
                     }
                     ActivationOutcome::Idle => {
                         // Don't re-queue. Will be re-added on next sweep.
@@ -246,6 +302,7 @@ impl DataflowExecutor {
                     ActivationOutcome::BlockedOnBackpressure => {
                         // Re-queue at the back; downstream needs to drain first.
                         self.ready_queue.push_back(pos);
+                        self.in_queue[pos] = true;
                         any_progress = true;
                     }
                     ActivationOutcome::Done => {
@@ -260,11 +317,17 @@ impl DataflowExecutor {
                 consecutive_idle = 0;
             } else {
                 consecutive_idle += 1;
-                if consecutive_idle >= self.config.max_idle_sweeps {
-                    // Quiescent — no operator made progress. Return false
-                    // to distinguish from normal completion.
-                    return Ok(false);
-                }
+            }
+
+            // After each batch, propagate progress and enqueue dirty operators.
+            if self.propagate_progress() {
+                consecutive_idle = 0;
+            }
+
+            if consecutive_idle >= self.config.max_idle_sweeps {
+                // Quiescent — no operator made progress. Return false
+                // to distinguish from normal completion.
+                return Ok(false);
             }
         }
     }
@@ -358,10 +421,13 @@ mod tests {
                 remaining: 3,
             })],
             ready_queue: VecDeque::from([0]),
+            in_queue: vec![true],
             done: vec![false],
             index_to_pos: vec![0],
             config: ExecutorConfig::default(),
             cancel: CancellationToken::new(),
+        progress_tracker: None,
+        _phantom: std::marker::PhantomData::<u64>,
         };
 
         let result = executor.run();
@@ -382,10 +448,13 @@ mod tests {
                 remaining: usize::MAX,
             })],
             ready_queue: VecDeque::from([0]),
+            in_queue: vec![true],
             done: vec![false],
             index_to_pos: vec![0],
             config: ExecutorConfig::default(),
             cancel,
+        progress_tracker: None,
+        _phantom: std::marker::PhantomData::<u64>,
         };
 
         let result = executor.run();
@@ -410,10 +479,13 @@ mod tests {
                 }),
             ],
             ready_queue: VecDeque::from([0, 1]),
+            in_queue: vec![true, true],
             done: vec![false, false],
             index_to_pos: vec![0, 1],
             config: ExecutorConfig::default(),
             cancel: CancellationToken::new(),
+        progress_tracker: None,
+        _phantom: std::marker::PhantomData::<u64>,
         };
 
         let result = executor.run();
@@ -426,10 +498,13 @@ mod tests {
         let mut executor = DataflowExecutor {
             operators: vec![],
             ready_queue: VecDeque::new(),
+            in_queue: vec![],
             done: vec![],
             index_to_pos: vec![],
             config: ExecutorConfig::default(),
             cancel: CancellationToken::new(),
+        progress_tracker: None,
+        _phantom: std::marker::PhantomData::<u64>,
         };
 
         let result = executor.run();
@@ -456,10 +531,13 @@ mod tests {
         let mut executor = DataflowExecutor {
             operators: vec![Box::new(AlwaysIdle)],
             ready_queue: VecDeque::from([0]),
+            in_queue: vec![true],
             done: vec![false],
             index_to_pos: vec![0],
             config: ExecutorConfig { max_activations_per_step: 10, max_idle_sweeps: 3 },
             cancel: CancellationToken::new(),
+        progress_tracker: None,
+        _phantom: std::marker::PhantomData::<u64>,
         };
 
         // Should terminate via quiescence, not infinite loop.
@@ -508,10 +586,13 @@ mod tests {
         let mut executor = DataflowExecutor {
             operators: vec![source, double, sink],
             ready_queue: VecDeque::from([0, 1, 2]),
+            in_queue: vec![true, true, true],
             done: vec![false, false, false],
             index_to_pos: vec![0, 1, 2],
             config: ExecutorConfig::default(),
             cancel: CancellationToken::new(),
+        progress_tracker: None,
+        _phantom: std::marker::PhantomData::<u64>,
         };
 
         let result = executor.run();
@@ -520,5 +601,49 @@ mod tests {
 
         // Verify the sink collected the right data by checking it's done.
         assert_eq!(executor.completed_count(), 3);
+    }
+
+    #[test]
+    fn executor_with_progress_tracker_attached() {
+        use crate::progress::operate::PortConnectivity;
+        use crate::progress::subgraph::SubgraphBuilder;
+
+        // Build a minimal subgraph with one operator
+        let mut builder = SubgraphBuilder::<u64>::new(0, 0);
+        builder.add_operator(
+            1, // operator index
+            "op",
+            1, // inputs
+            1, // outputs
+            PortConnectivity::identity(0u64),
+        );
+
+        let mut tracker = builder.build();
+        tracker.initialize();
+
+        let mut executor: DataflowExecutor<u64> = DataflowExecutor {
+            operators: vec![Box::new(CountingOperator {
+                name: "op".into(),
+                index: 1,
+                region_id: crate::dataflow::region::RegionId::new(0),
+                remaining: 2,
+            })],
+            ready_queue: VecDeque::from([0]),
+            in_queue: vec![true],
+            done: vec![false],
+            index_to_pos: vec![usize::MAX, 0], // index 0 unused, index 1 → pos 0
+            config: ExecutorConfig::default(),
+            cancel: CancellationToken::new(),
+            progress_tracker: None,
+            _phantom: std::marker::PhantomData::<u64>,
+        };
+
+        // Attach progress tracker
+        executor.set_progress_tracker(tracker);
+        assert!(executor.progress_tracker.is_some());
+
+        // Run should still complete normally
+        let result = executor.run();
+        assert_eq!(result.unwrap(), true);
     }
 }

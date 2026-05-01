@@ -342,7 +342,7 @@ mod tests {
         });
 
         assert_eq!(output.region_id(), region_id);
-        assert_eq!(output.source().operator_index, 2); // 0, 1 for sources, 2 for binary
+        assert_eq!(output.source().operator_index, 3); // 1, 2 for sources, 3 for binary
     }
 
     #[test]

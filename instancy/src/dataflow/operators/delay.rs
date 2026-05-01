@@ -582,7 +582,7 @@ mod tests {
         let stream: DataStream<RootScope<u64>, i32> = DataStream::new(scope, source, region_id);
 
         let output = stream.delay("delay_5", |_item, time| time + 5);
-        assert_eq!(output.source().operator_index, 1);
+        assert_eq!(output.source().operator_index, 2);
     }
 
     #[test]
@@ -594,7 +594,7 @@ mod tests {
         let stream: DataStream<RootScope<u64>, i32> = DataStream::new(scope, source, region_id);
 
         let output = stream.delay_batch("delay_batch", |time| time + 10);
-        assert_eq!(output.source().operator_index, 1);
+        assert_eq!(output.source().operator_index, 2);
     }
 
     #[test]

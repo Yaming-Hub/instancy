@@ -306,7 +306,7 @@ mod tests {
             DataStream::new(scope, Slot::new(s2, 0), region_id);
 
         let output = stream1.concat(&stream2);
-        assert_eq!(output.source().operator_index, 2);
+        assert_eq!(output.source().operator_index, 3); // 1, 2 for sources, 3 for concat
     }
 
     #[test]
@@ -321,7 +321,7 @@ mod tests {
             .collect();
 
         let output = concatenate(&streams);
-        assert_eq!(output.source().operator_index, 3); // 0,1,2 for sources, 3 for concat
+        assert_eq!(output.source().operator_index, 4); // 1,2,3 for sources, 4 for concat
     }
 
     #[test]

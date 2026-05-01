@@ -422,9 +422,10 @@ mod tests {
             Ok(())
         });
 
-        // The output stream should be in the same region with operator index 1
+        // The output stream should be in the same region with operator index 2
+        // (index 0 reserved, source at 1, unary at 2)
         assert_eq!(output.region_id(), region_id);
-        assert_eq!(output.source().operator_index, 1);
+        assert_eq!(output.source().operator_index, 2);
     }
 
     #[test]
@@ -455,7 +456,7 @@ mod tests {
                 Ok(())
             });
 
-        // Chain of 3 operators: source(0), add_one(1), double(2)
-        assert_eq!(result.source().operator_index, 2);
+        // Chain of 3 operators: source(1), add_one(2), double(3)
+        assert_eq!(result.source().operator_index, 3);
     }
 }

@@ -18,6 +18,8 @@
 //! Type-erasure happens at the outer `SchedulableOperator` boundary only —
 //! internally, operators work with concrete Rust types (no dynamic dispatch on data).
 
+use std::collections::VecDeque;
+
 use crate::dataflow::channels::envelope::{Envelope, Payload};
 use crate::dataflow::channels::pushpull::{Pull, Push};
 use crate::dataflow::operators::handles::{InputHandle, OutputHandle};
@@ -227,12 +229,12 @@ pub struct WiredSourceOperator<T: Timestamp, D: Send + 'static> {
     name: String,
     index: usize,
     region_id: RegionId,
-    /// Data to emit, organized by timestamp.
-    pending_data: Vec<(T, Vec<D>)>,
+    /// Data to emit, organized by timestamp (FIFO order).
+    pending_data: VecDeque<(T, Vec<D>)>,
     /// Output channel.
     output_pusher: Box<dyn Push<T, D>>,
     /// Pending output envelopes (for backpressure retry).
-    pending_output: Vec<Envelope<T, D>>,
+    pending_output: VecDeque<Envelope<T, D>>,
     /// Whether all data has been emitted.
     done: bool,
 }
@@ -250,9 +252,9 @@ impl<T: Timestamp, D: Send + 'static> WiredSourceOperator<T, D> {
             name: name.into(),
             index,
             region_id,
-            pending_data: data,
+            pending_data: VecDeque::from(data),
             output_pusher,
-            pending_output: Vec::new(),
+            pending_output: VecDeque::new(),
             done: false,
         }
     }
@@ -265,25 +267,24 @@ impl<T: Timestamp, D: Send + 'static> SchedulableOperator for WiredSourceOperato
         }
 
         // Try to flush pending output first.
-        while !self.pending_output.is_empty() {
-            let envelope = self.pending_output.remove(0);
+        while let Some(envelope) = self.pending_output.pop_front() {
             match self.output_pusher.try_push(envelope) {
                 Ok(()) => {}
                 Err((Error::Backpressure, returned)) => {
-                    self.pending_output.insert(0, returned);
+                    self.pending_output.push_front(returned);
                     return Ok(ActivationOutcome::BlockedOnBackpressure);
                 }
                 Err((e, _)) => return Err(e),
             }
         }
 
-        // Emit pending data.
-        while let Some((time, data)) = self.pending_data.pop() {
+        // Emit pending data in FIFO order (front-to-back).
+        while let Some((time, data)) = self.pending_data.pop_front() {
             let envelope = Envelope::data(time, data);
             match self.output_pusher.try_push(envelope) {
                 Ok(()) => {}
                 Err((Error::Backpressure, returned)) => {
-                    self.pending_output.push(returned);
+                    self.pending_output.push_back(returned);
                     return Ok(ActivationOutcome::BlockedOnBackpressure);
                 }
                 Err((e, _)) => return Err(e),
@@ -464,8 +465,10 @@ mod tests {
                 received.push((time, data));
             }
         }
-        // Note: source pops from back, so order is reversed.
+        // Source emits in FIFO order (insertion order).
         assert_eq!(received.len(), 2);
+        assert_eq!(received[0].0, 0u64); // first inserted batch emitted first
+        assert_eq!(received[1].0, 1u64);
     }
 
     #[test]

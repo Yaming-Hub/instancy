@@ -728,19 +728,19 @@ mod tests {
 
         let graph = scope.graph();
 
-        // 4 operators: source(0), double(1), observe(2), end(3)
+        // 4 operators: source(1), double(2), observe(3), end(4)
         assert_eq!(graph.operator_count(), 4);
-        assert_eq!(graph.operator(0).unwrap().name, "source");
-        assert_eq!(graph.operator(1).unwrap().name, "double");
-        assert_eq!(graph.operator(2).unwrap().name, "observe");
-        assert_eq!(graph.operator(3).unwrap().name, "end");
+        assert_eq!(graph.operator(1).unwrap().name, "source");
+        assert_eq!(graph.operator(2).unwrap().name, "double");
+        assert_eq!(graph.operator(3).unwrap().name, "observe");
+        assert_eq!(graph.operator(4).unwrap().name, "end");
 
         // 3 edges: source→double, double→observe, observe→end
         assert_eq!(graph.edge_count(), 3);
 
         // Topological order
         let order = graph.topological_order().unwrap();
-        assert_eq!(order, vec![0, 1, 2, 3]);
+        assert_eq!(order, vec![1, 2, 3, 4]);
 
         // Validation passes
         assert!(graph.validate().is_ok());
@@ -785,12 +785,12 @@ mod tests {
         assert_eq!(graph.edge_count(), 3); // src0→join, src1→join, join→probe
 
         // Binary op has 2 inputs
-        assert_eq!(graph.operator(2).unwrap().input_count, 2);
+        assert_eq!(graph.operator(3).unwrap().input_count, 2);
 
         let order = graph.topological_order().unwrap();
         // Both sources before join, join before probe
-        let join_pos = order.iter().position(|&x| x == 2).unwrap();
-        let probe_pos = order.iter().position(|&x| x == 3).unwrap();
+        let join_pos = order.iter().position(|&x| x == 3).unwrap();
+        let probe_pos = order.iter().position(|&x| x == 4).unwrap();
         assert!(join_pos < probe_pos);
 
         assert!(graph.validate().is_ok());
@@ -820,9 +820,9 @@ mod tests {
         let _p2 = false_stream.probe("neg");
 
         let graph = scope.graph();
-        // source(0), branch(1), pos(2), neg(3)
+        // source(1), branch(2), pos(3), neg(4)
         assert_eq!(graph.operator_count(), 4);
-        assert_eq!(graph.operator(1).unwrap().output_count, 2);
+        assert_eq!(graph.operator(2).unwrap().output_count, 2);
         assert!(graph.validate().is_ok());
     }
 }
