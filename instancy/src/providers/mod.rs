@@ -13,4 +13,7 @@ pub mod execution;
 pub mod transport;
 
 pub use execution::{ExecutionProvider, InlineExecution, WorkerPoolExecution};
-pub use transport::{LocalTransport, LogicalTarget, TransportProvider};
+pub use transport::{
+    InMemoryClusterTransport, InMemoryPush, LocalTransport, LogicalTarget, PushEndpoint,
+    TransportProvider,
+};

@@ -10,6 +10,7 @@ use std::collections::VecDeque;
 use crate::dataflow::channels::envelope::Envelope;
 use crate::dataflow::region::RegionId;
 use crate::error::Error;
+use crate::execute::ClusterTopology;
 use crate::progress::timestamp::Timestamp;
 use crate::worker::WorkerId;
 
@@ -172,17 +173,23 @@ where
 /// Testing transport that simulates multi-node clusters entirely in-memory.
 ///
 /// All nodes run in the same process, but the transport partitions data
-/// as if they were on separate machines.
+/// as if they were on separate machines. Remote targets are delivered to
+/// in-memory buffers keyed by `LogicalTarget`, simulating network delivery.
 #[derive(Debug, Clone)]
 pub struct InMemoryClusterTransport {
-    /// Number of nodes in the simulated cluster.
-    pub num_nodes: usize,
+    /// The cluster topology for local/remote decisions.
+    topology: ClusterTopology,
+    /// This node's index.
+    local_node_index: usize,
 }
 
 impl InMemoryClusterTransport {
     /// Create a new in-memory cluster transport.
-    pub fn new(num_nodes: usize) -> Self {
-        Self { num_nodes }
+    pub fn new(topology: ClusterTopology, local_node_index: usize) -> Self {
+        Self {
+            topology,
+            local_node_index,
+        }
     }
 }
 
@@ -197,16 +204,17 @@ impl TransportProvider for InMemoryClusterTransport {
         D: Send + Sync + 'static,
         M: Send + Sync + 'static,
     {
-        // In a real implementation, this would route to the appropriate
-        // simulated node's buffer. For now, use a simple in-memory buffer.
+        // In the in-memory cluster transport, both local and remote targets
+        // use in-memory buffers. The distinction matters for serialization
+        // (tested via `is_local()`), but delivery is always in-process.
         Box::new(InMemoryPush::new())
     }
 
     fn is_local(&self, source: &LogicalTarget, target: &LogicalTarget) -> bool {
-        // In cluster mode, locality is determined by region/worker mapping
-        // For the in-memory cluster, everything is technically local
-        // but we pretend remote targets need serialization
-        source.region == target.region
+        let source_node = self.topology.node_for_worker(source.worker);
+        let target_node = self.topology.node_for_worker(target.worker);
+        source_node == target_node
+            && source_node == Some(self.local_node_index)
     }
 }
 
@@ -282,15 +290,23 @@ mod tests {
 
     #[test]
     fn in_memory_cluster_transport_locality() {
-        let transport = InMemoryClusterTransport::new(3);
+        use crate::execute::NodeConfig;
 
-        // Same region = local
+        // 2 nodes: node 0 has workers 0,1; node 1 has workers 2,3
+        let topology = ClusterTopology::multi_node(vec![
+            NodeConfig::new(0, 2),
+            NodeConfig::new(1, 2),
+        ])
+        .unwrap();
+        let transport = InMemoryClusterTransport::new(topology, 0);
+
+        // Same node (workers 0 and 1 both on node 0) = local
         let src = make_target(0, 0, 0, 0);
         let dst_local = make_target(0, 1, 1, 0);
         assert!(transport.is_local(&src, &dst_local));
 
-        // Different region = remote
-        let dst_remote = make_target(1, 2, 0, 0);
+        // Different nodes (worker 0 on node 0, worker 2 on node 1) = remote
+        let dst_remote = make_target(0, 2, 0, 0);
         assert!(!transport.is_local(&src, &dst_remote));
     }
 

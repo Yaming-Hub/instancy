@@ -500,8 +500,9 @@ pub struct WorkerId(pub usize);
 /// Describes the worker topology of a node in the cluster.
 #[derive(Clone, Debug)]
 pub struct NodeConfig {
-    /// Unique index of this node in the cluster.
-    pub node_index: usize,
+    /// Unique identity of this node (typically IP:port, hostname, or URI).
+    /// Must be stable across reconnections of the same physical node.
+    pub node_id: String,
     /// Number of logical workers hosted by this node.
     /// Can differ from other nodes based on this node's capacity.
     pub workers: usize,
@@ -556,7 +557,7 @@ pub struct DataflowConfig {
 /// Describes the full cluster topology.
 #[derive(Clone, Debug)]
 pub struct ClusterTopology {
-    /// All nodes in the cluster, ordered by node index.
+    /// All nodes in the cluster, ordered by their position in the topology.
     pub nodes: Vec<NodeConfig>,
 }
 
@@ -567,14 +568,28 @@ impl ClusterTopology {
     }
     
     /// Returns the global WorkerId range assigned to a given node.
-    pub fn worker_range(&self, node_index: usize) -> std::ops::Range<usize> {
-        let start: usize = self.nodes[..node_index].iter().map(|n| n.workers).sum();
-        let count = self.nodes[node_index].workers;
-        start..start + count
+    pub fn worker_range(&self, node_id: &str) -> Option<std::ops::Range<usize>> {
+        let mut start = 0;
+        for node in &self.nodes {
+            if node.node_id == node_id {
+                return Some(start..start + node.workers);
+            }
+            start += node.workers;
+        }
+        None
     }
     
     /// Determines which node hosts a given global WorkerId.
-    pub fn node_for_worker(&self, worker_id: WorkerId) -> usize { /* ... */ }
+    pub fn node_for_worker(&self, worker_id: WorkerId) -> Option<&str> {
+        let mut offset = 0;
+        for node in &self.nodes {
+            if worker_id.0 < offset + node.workers {
+                return Some(&node.node_id);
+            }
+            offset += node.workers;
+        }
+        None
+    }
 }
 ```
 
@@ -1610,7 +1625,7 @@ pub enum PlacementPolicy {
     /// Distribute replicas evenly (round-robin) across all nodes.
     RoundRobin,
     /// Pin all replicas to a specific node (e.g., for local aggregation).
-    Pinned { node_index: usize },
+    Pinned { node_id: String },
 }
 ```
 
@@ -1672,7 +1687,7 @@ let output = scope
 ```rust
 let ingest  = Region { parallelism: 4,  placement: PlacementPolicy::Proportional };
 let compute = Region { parallelism: 16, placement: PlacementPolicy::Proportional };
-let global  = Region { parallelism: 1,  placement: PlacementPolicy::Pinned { node_index: 0 } };
+let global  = Region { parallelism: 1,  placement: PlacementPolicy::Pinned { node_id: "10.0.0.1:8080".into() } };
 let egress  = Region { parallelism: 4,  placement: PlacementPolicy::Proportional };
 
 let input = scope
@@ -1955,13 +1970,15 @@ pub struct PoolConfig {
 Each connection carries multiplexed channels using a simple framing protocol:
 
 ```
-┌───────────┬───────────┬───────────┬──────────────────┐
-│ dataflow_id│ channel_id│ length    │ payload (codec)  │
-│ (u64)      │ (u64)     │ (u32)     │ (variable)       │
-└───────────┴───────────┴───────────┴──────────────────┘
+┌───────────────┬───────────┬───────────┬──────────────────┐
+│ dataflow_id   │ channel_id│ length    │ payload (codec)  │
+│ (UUID, 16B)   │ (u64)     │ (u32)     │ (variable)       │
+└───────────────┴───────────┴───────────┴──────────────────┘
 ```
 
-The `dataflow_id` field ensures that frames from different dataflows sharing the same pooled connection are never misrouted. Each dataflow is assigned a cluster-unique `DataflowId` at construction time.
+Header size: 16 (dataflow_id UUID) + 8 (channel_id) + 4 (length) = **28 bytes**.
+
+The `dataflow_id` field ensures that frames from different dataflows sharing the same pooled connection are never misrouted. Each dataflow is assigned a random UUID at construction time — universally unique without any coordination.
 
 A background demux task reads frames from a connection and dispatches them to the appropriate (dataflow, channel) pair's `mpsc::Sender`.
 
@@ -1972,7 +1989,7 @@ Multiple dataflows can run concurrently on the same cluster, sharing the same wo
 #### Logical Isolation
 
 Each dataflow is an independent computation graph with:
-- Its own `DataflowId` (cluster-unique `u64`, assigned by the runtime)
+- Its own `DataflowId` (a random UUID, universally unique)
 - Its own operator registry (operator index 3 in dataflow A ≠ operator index 3 in dataflow B)
 - Its own channel wiring (each edge gets push/pull endpoints scoped to that dataflow)
 - Its own progress tracker instance (frontiers are independent)
@@ -1983,7 +2000,7 @@ Operators in dataflow A **never** share input/output buffers with operators in d
 #### Physical Isolation on Shared Connections
 
 When two dataflows share a pooled TCP connection to the same peer:
-- Each frame includes a `dataflow_id` field in its wire header
+- Each frame includes a `dataflow_id` (UUID) field in its wire header
 - The demuxer dispatches frames to the correct dataflow's channel receivers based on `(dataflow_id, channel_id)` pair
 - A frame with an unknown `dataflow_id` is logged and dropped (e.g., if the dataflow was cancelled but in-flight frames remain)
 
@@ -1992,14 +2009,20 @@ When two dataflows share a pooled TCP connection to the same peer:
 ```rust
 /// Cluster-unique identifier for a running dataflow instance.
 ///
-/// This is a **logical** concept — it identifies a specific computation graph
-/// instance. Multiple dataflows with different IDs can run concurrently on
-/// the same physical infrastructure.
+/// Uses a random UUID (v4) — universally unique without coordination.
+/// Any node can create a new dataflow without communicating with other nodes.
 #[derive(Debug, Clone, Copy, Hash, Eq, PartialEq, Ord, PartialOrd)]
-pub struct DataflowId(pub u64);
+pub struct DataflowId(pub uuid::Uuid);
+
+impl DataflowId {
+    /// Create a new random DataflowId.
+    pub fn new() -> Self {
+        Self(uuid::Uuid::new_v4())
+    }
+}
 ```
 
-DataflowIds are assigned by the local runtime using an atomic counter. To ensure cluster-wide uniqueness without coordination, the ID encodes `(node_index << 48) | local_sequence`. This guarantees uniqueness as long as each node processes fewer than 2^48 dataflows (≈281 trillion).
+DataflowIds are random UUIDs generated locally when a dataflow is constructed. No allocator, counter, or coordination is needed. UUID v4 provides 122 bits of randomness — collision probability is negligible even across billions of dataflows.
 
 #### Worker Sharing
 
@@ -2016,7 +2039,7 @@ An `operator_index` (usize) is only unique **within** a single dataflow's operat
 | Logical | Scopes operator/channel allocation; included in LogicalTarget |
 | Scheduler | `(DataflowId, WorkerId)` ensures FIFO per logical worker per dataflow |
 | Transport (intra-process) | Buffers are per-dataflow — no sharing |
-| Transport (inter-process) | Frame header field for demux routing |
+| Transport (inter-process) | Frame header field (UUID) for demux routing |
 | Progress | Each dataflow has independent frontier tracking |
 | Metrics | Each dataflow has its own DataflowMetrics |
 
@@ -2417,9 +2440,9 @@ impl ConnectionManager for MyActorConnectionManager {
 // Total: 13 workers; exchange hashes across all 13.
 let cluster = ClusterTopology {
     nodes: vec![
-        NodeConfig { node_index: 0, workers: 4 },
-        NodeConfig { node_index: 1, workers: 1 },
-        NodeConfig { node_index: 2, workers: 8 },
+        NodeConfig { node_id: "10.0.0.1:8080".into(), workers: 4 },
+        NodeConfig { node_id: "10.0.0.2:8080".into(), workers: 1 },
+        NodeConfig { node_id: "10.0.0.3:8080".into(), workers: 8 },
     ],
 };
 
@@ -2548,13 +2571,12 @@ The application implements this trait and passes it to the runtime at startup. T
 pub enum MembershipEvent {
     /// A new physical node has joined the cluster and is ready to host logical workers.
     NodeJoined {
-        node_index: usize,
+        node_id: String,
         logical_workers: usize,
-        peer_id: PeerId,
     },
     /// A physical node has left the cluster (graceful shutdown or detected failure).
     NodeLeft {
-        node_index: usize,
+        node_id: String,
         reason: NodeDepartureReason,
     },
 }

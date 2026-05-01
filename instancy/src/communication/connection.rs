@@ -558,6 +558,7 @@ mod tests {
 
     /// A mock connection for testing.
     #[derive(Debug)]
+    #[allow(dead_code)]
     struct MockConnection {
         id: u64,
         healthy: bool,
