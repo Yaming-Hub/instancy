@@ -274,6 +274,77 @@ impl RuntimeHandle {
     /// - `build` closure returns an error
     /// - Replicas have mismatched graph topologies
     /// - Dataflow contains exchange operators (not yet supported)
+    ///
+    /// # Example: partitioned input with multiple workers
+    ///
+    /// A common pattern is processing physically partitioned data. Each
+    /// partition maps to one logical worker, and the hosting application
+    /// feeds each partition's data into its corresponding worker's input
+    /// stream.
+    ///
+    /// ```rust
+    /// use instancy::runtime::{RuntimeConfig, RuntimeHandle};
+    /// use instancy::dataflow::DataflowBuilder;
+    ///
+    /// // Simulate 4 data partitions.
+    /// let partitions: Vec<Vec<i32>> = vec![
+    ///     vec![1, 2, 3],       // partition 0
+    ///     vec![10, 20],        // partition 1
+    ///     vec![100],           // partition 2
+    ///     vec![1000, 2000],    // partition 3
+    /// ];
+    /// let num_workers = partitions.len();
+    ///
+    /// // Create a runtime — worker_threads controls physical parallelism.
+    /// // Here 2 threads service 4 logical workers cooperatively.
+    /// let rt = RuntimeHandle::new(RuntimeConfig {
+    ///     worker_threads: 2,
+    ///     ..RuntimeConfig::default()
+    /// }).unwrap();
+    ///
+    /// // Spawn 4 replicated workers, each with identical graph topology.
+    /// // The worker_idx is available in the closure but the graph structure
+    /// // must be the same for every worker.
+    /// let mut multi = rt.spawn_multi(
+    ///     "partitioned-sum",
+    ///     num_workers,
+    ///     |_worker_idx, builder: &mut DataflowBuilder<u64>| {
+    ///         let input = builder.input::<i32>("data");
+    ///         // Each worker independently doubles its partition's values.
+    ///         input.map("double", |_t, x| x * 2).output("results");
+    ///         Ok(())
+    ///     },
+    /// ).unwrap();
+    ///
+    /// // Wire each partition to its corresponding worker's input stream.
+    /// let mut senders = Vec::new();
+    /// let mut receivers = Vec::new();
+    /// for i in 0..num_workers {
+    ///     senders.push(multi.take_input::<i32>(i, "data").unwrap());
+    ///     receivers.push(multi.take_output::<i32>(i, "results").unwrap());
+    /// }
+    ///
+    /// // Feed partitioned data — each sender maps to one logical worker.
+    /// for (i, partition) in partitions.into_iter().enumerate() {
+    ///     senders[i].send(0, partition).unwrap();
+    /// }
+    /// // Close all inputs to signal end-of-data.
+    /// drop(senders);
+    ///
+    /// // Collect results from each worker independently.
+    /// let results: Vec<Vec<i32>> = receivers
+    ///     .into_iter()
+    ///     .map(|r| r.collect_data().into_iter().flat_map(|(_, d)| d).collect())
+    ///     .collect();
+    ///
+    /// assert_eq!(results[0], vec![2, 4, 6]);
+    /// assert_eq!(results[1], vec![20, 40]);
+    /// assert_eq!(results[2], vec![200]);
+    /// assert_eq!(results[3], vec![2000, 4000]);
+    ///
+    /// // Wait for all workers to finish.
+    /// multi.join_blocking().unwrap();
+    /// ```
     pub fn spawn_multi<T, F>(
         &self,
         name: &str,
