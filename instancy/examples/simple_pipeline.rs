@@ -26,7 +26,7 @@ fn main() {
         .output("results");
 
     // Inspect the logical graph before running
-    let dataflow = builder.build();
+    let dataflow = builder.build().expect("graph construction failed");
     println!("Dataflow: {} ({} operators, {} edges)",
         dataflow.name(),
         dataflow.operator_count(),

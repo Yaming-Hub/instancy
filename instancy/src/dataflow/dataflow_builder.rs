@@ -18,7 +18,7 @@
 //!     .map("double", |_t, x| x * 2)
 //!     .filter("keep_even", |_t, x| x % 2 == 0)
 //!     .output("results");
-//! let dataflow = builder.build();
+//! let dataflow = builder.build().unwrap();
 //! ```
 //!
 //! Streams are **cloneable** — enabling branching and multi-input patterns:
@@ -96,6 +96,7 @@ struct BuilderState<T: Timestamp> {
     output_ports: Vec<OutputPortInfo>,
     probes: Vec<(usize, ProbeHandle<T>)>,
     next_operator_index: usize,
+    next_collect_index: usize,
     channel_capacity: usize,
 }
 
@@ -160,6 +161,7 @@ impl<T: Timestamp> DataflowBuilder<T> {
                 output_ports: Vec::new(),
                 probes: Vec::new(),
                 next_operator_index: 1,
+                next_collect_index: 0,
                 channel_capacity: config.channel_capacity,
             })),
         }
@@ -311,15 +313,42 @@ impl<T: Timestamp> DataflowBuilder<T> {
 
     /// Finalize construction and produce a [`LogicalDataflow`].
     ///
-    /// After calling `build()`, the builder is consumed and no further
-    /// modifications are possible.
-    pub fn build(self) -> LogicalDataflow<T> {
+    /// Returns an error if:
+    /// - Outstanding `Stream` references still exist (drop them first)
+    /// - Fan-out detected (same output port feeds multiple downstreams — not yet supported)
+    ///
+    /// After a successful call, the builder is consumed.
+    pub fn build(self) -> Result<LogicalDataflow<T>> {
         let state = match Rc::try_unwrap(self.state) {
             Ok(cell) => cell.into_inner(),
-            Err(_) => panic!("cannot build: outstanding Stream references still exist"),
+            Err(_) => {
+                return Err(Error::Custom(
+                    "cannot build: outstanding Stream references still exist — \
+                     drop all Stream handles before calling build()"
+                        .into(),
+                ))
+            }
         };
 
-        LogicalDataflow {
+        // Validate: no fan-out (multiple edges from same source slot).
+        // Fan-out requires TeePush (Phase B). For now, detect and reject.
+        {
+            use std::collections::HashSet;
+            let mut seen_sources: HashSet<(usize, usize)> = HashSet::new();
+            for edge in state.graph.edges() {
+                let key = (edge.source.operator_index, edge.source.slot_index);
+                if !seen_sources.insert(key) {
+                    return Err(Error::Custom(format!(
+                        "fan-out not yet supported: operator {} output slot {} \
+                         feeds multiple downstream operators. Use a tee/broadcast \
+                         operator instead (coming in Phase B).",
+                        key.0, key.1
+                    )));
+                }
+            }
+        }
+
+        Ok(LogicalDataflow {
             name: self.name,
             graph: state.graph,
             subgraph_builder: state.subgraph_builder,
@@ -328,7 +357,7 @@ impl<T: Timestamp> DataflowBuilder<T> {
             input_ports: state.input_ports,
             output_ports: state.output_ports,
             probes: state.probes,
-        }
+        })
     }
 }
 
@@ -544,9 +573,15 @@ impl<T: Timestamp, D: Send + 'static> Stream<T, D> {
 
     /// Convenience: collect output into a shared vector (for testing).
     ///
-    /// Equivalent to `.output("collect")` but returns just the collector handle.
+    /// Each call generates a unique internal output port name.
     pub fn collect(self) -> Arc<Mutex<Vec<(T, Vec<D>)>>> {
-        self.output("_collect").collector
+        let name = {
+            let mut state = self.state.borrow_mut();
+            let idx = state.next_collect_index;
+            state.next_collect_index += 1;
+            format!("__collect_{idx}")
+        };
+        self.output(name).collector
     }
 
     /// Attach a probe to observe the frontier at this point in the pipeline.
@@ -869,14 +904,28 @@ impl<T: Timestamp> LogicalDataflow<T> {
 
     /// Materialize and run the dataflow to completion (blocking).
     ///
-    /// This is a convenience method for testing. Production use should submit
-    /// the dataflow to an async runtime via `Runtime::spawn()` (Phase C).
+    /// This is a convenience method for testing with pre-loaded sources.
+    /// Dataflows using `input()` ports require async runtime (Phase C).
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::Custom` if the dataflow has declared input ports
+    /// (use `Runtime::spawn()` instead for runtime-fed inputs).
     pub fn run(self) -> Result<()> {
         self.run_with_cancel(CancellationToken::new())
     }
 
     /// Materialize and run with a cancellation token (blocking).
     pub fn run_with_cancel(self, cancel: CancellationToken) -> Result<()> {
+        if !self.input_ports.is_empty() {
+            return Err(Error::Custom(
+                "cannot run() a dataflow with declared input ports — \
+                 input ports require async runtime (Runtime::spawn). \
+                 Use builder.source() for pre-loaded data instead."
+                    .into(),
+            ));
+        }
+
         if self.operator_factories.is_empty() {
             return Ok(());
         }
@@ -1047,7 +1096,7 @@ mod tests {
     fn test_empty_builder() {
         let builder = DataflowBuilder::<u64>::new("empty");
         assert_eq!(builder.operator_count(), 0);
-        let dataflow = builder.build();
+        let dataflow = builder.build().unwrap();
         assert_eq!(dataflow.operator_count(), 0);
         dataflow.run().unwrap();
     }
@@ -1057,7 +1106,7 @@ mod tests {
         let builder = DataflowBuilder::<u64>::new("source_to_output");
         let stream = builder.source("nums", vec![(0u64, vec![1i32, 2, 3])]);
         let port = stream.output("results");
-        let dataflow = builder.build();
+        let dataflow = builder.build().unwrap();
         dataflow.run().unwrap();
 
         let collector = port.collector();
@@ -1072,7 +1121,7 @@ mod tests {
         let stream = builder.source("nums", vec![(0u64, vec![1i32, 2, 3, 4, 5])]);
         let doubled = stream.map("double", |_t, x| x * 2);
         let port = doubled.output("results");
-        let dataflow = builder.build();
+        let dataflow = builder.build().unwrap();
         dataflow.run().unwrap();
 
         let collector = port.collector();
@@ -1087,7 +1136,7 @@ mod tests {
         let stream = builder.source("nums", vec![(0u64, vec![1i32, 2, 3, 4, 5, 6])]);
         let evens = stream.filter("evens", |_t, x| x % 2 == 0);
         let port = evens.output("results");
-        let dataflow = builder.build();
+        let dataflow = builder.build().unwrap();
         dataflow.run().unwrap();
 
         let collector = port.collector();
@@ -1104,7 +1153,7 @@ mod tests {
             .filter("div_by_3", |_t, x| x % 3 == 0)
             .map("to_string", |_t, x| format!("{x}"))
             .output("results");
-        let dataflow = builder.build();
+        let dataflow = builder.build().unwrap();
         dataflow.run().unwrap();
 
         let collector = port.collector();
@@ -1122,7 +1171,7 @@ mod tests {
                 line.split_whitespace().map(|w| w.to_string()).collect()
             })
             .output("words");
-        let dataflow = builder.build();
+        let dataflow = builder.build().unwrap();
         dataflow.run().unwrap();
 
         let collector = port.collector();
@@ -1137,29 +1186,23 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // Fan-out (one output → multiple downstreams) requires TeePush; coming in Phase B
-    fn test_branching_clone() {
-        // Two downstream consumers from the same source
+    fn test_branching_clone_rejected() {
+        // Fan-out (one output → multiple downstreams) is detected at build() time
         let builder = DataflowBuilder::<u64>::new("branch_test");
         let stream = builder.source("nums", vec![(0u64, vec![1i32, 2, 3, 4, 5, 6])]);
 
-        let evens_port = stream
+        let _evens_port = stream
             .clone()
             .filter("evens", |_t, x| x % 2 == 0)
             .output("evens");
-        let odds_port = stream
+        let _odds_port = stream
             .filter("odds", |_t, x| x % 2 != 0)
             .output("odds");
 
-        let dataflow = builder.build();
-        dataflow.run().unwrap();
-
-        let collector_evens = evens_port.collector();
-        let evens = collector_evens.lock().unwrap();
-        let collector_odds = odds_port.collector();
-        let odds = collector_odds.lock().unwrap();
-        assert_eq!(evens[0].1, vec![2, 4, 6]);
-        assert_eq!(odds[0].1, vec![1, 3, 5]);
+        let result = builder.build();
+        assert!(result.is_err());
+        let err_msg = format!("{}", result.err().unwrap());
+        assert!(err_msg.contains("fan-out not yet supported"));
     }
 
     #[test]
@@ -1172,7 +1215,7 @@ mod tests {
         let port_a = a.map("inc_a", |_t, x| x + 1).output("out_a");
         let port_b = b.map("inc_b", |_t, x| x + 1).output("out_b");
 
-        let dataflow = builder.build();
+        let dataflow = builder.build().unwrap();
         dataflow.run().unwrap();
 
         let collector_ra = port_a.collector();
@@ -1191,7 +1234,7 @@ mod tests {
             .map("to_f64", |_t, x| x as f64 * 1.5)
             .map("to_string", |_t, x| format!("{x:.1}"))
             .output("results");
-        let dataflow = builder.build();
+        let dataflow = builder.build().unwrap();
         dataflow.run().unwrap();
 
         let collector = port.collector();
@@ -1206,7 +1249,7 @@ mod tests {
             .source::<i32>("nums", vec![(0u64, vec![])])
             .map("double", |_t, x| x * 2)
             .output("results");
-        let dataflow = builder.build();
+        let dataflow = builder.build().unwrap();
         dataflow.run().unwrap();
 
         let collector = port.collector();
@@ -1229,7 +1272,7 @@ mod tests {
             )
             .map("double", |_t, x| x * 2)
             .output("results");
-        let dataflow = builder.build();
+        let dataflow = builder.build().unwrap();
         dataflow.run().unwrap();
 
         let collector = port.collector();
@@ -1246,7 +1289,7 @@ mod tests {
         let collector = builder
             .source("nums", vec![(0u64, vec![42i32])])
             .collect();
-        let dataflow = builder.build();
+        let dataflow = builder.build().unwrap();
         dataflow.run().unwrap();
 
         let results = collector.lock().unwrap();
@@ -1262,7 +1305,7 @@ mod tests {
         let _port = builder
             .source("nums", vec![(0u64, vec![1i32, 2, 3])])
             .output("results");
-        let dataflow = builder.build();
+        let dataflow = builder.build().unwrap();
         let result = dataflow.run_with_cancel(cancel);
         assert!(result.is_err());
     }
@@ -1274,7 +1317,7 @@ mod tests {
         let b = builder.source::<i32>("src_b", vec![]);
         let _port = b.map("transform", |_t, x| x).output("out");
         drop(_a); // release Rc reference before build
-        let dataflow = builder.build();
+        let dataflow = builder.build().unwrap();
 
         assert_eq!(dataflow.name(), "meta_test");
         assert_eq!(dataflow.input_names().len(), 0); // sources are not "input ports"
@@ -1287,9 +1330,11 @@ mod tests {
     #[should_panic(expected = "duplicate output port name")]
     fn test_duplicate_output_name_panics() {
         let builder = DataflowBuilder::<u64>::new("dup_test");
-        let stream = builder.source("nums", vec![(0u64, vec![1i32])]);
-        let _p1 = stream.clone().output("results");
-        let _p2 = stream.output("results"); // should panic
+        // Use two independent sources to avoid fan-out detection
+        let s1 = builder.source("src1", vec![(0u64, vec![1i32])]);
+        let s2 = builder.source("src2", vec![(0u64, vec![2i32])]);
+        let _p1 = s1.output("results");
+        let _p2 = s2.output("results"); // should panic: duplicate name
     }
 
     #[test]
@@ -1298,7 +1343,7 @@ mod tests {
         let stream = builder.source("nums", vec![(0u64, vec![1i32, 2, 3])]);
         let (stream, _probe) = stream.probe();
         let _port = stream.output("results");
-        let dataflow = builder.build();
+        let dataflow = builder.build().unwrap();
         dataflow.run().unwrap();
         // Probe was registered — basic smoke test that it doesn't panic
     }
@@ -1316,11 +1361,22 @@ mod tests {
                 Ok(())
             })
             .output("results");
-        let dataflow = builder.build();
+        let dataflow = builder.build().unwrap();
         dataflow.run().unwrap();
 
         let collector = port.collector();
         let results = collector.lock().unwrap();
         assert_eq!(results[0].1, vec![15]);
+    }
+
+    #[test]
+    fn test_input_port_rejected_by_run() {
+        let builder = DataflowBuilder::<u64>::new("input_test");
+        let _port = builder.input::<i32>("data").output("results");
+        let dataflow = builder.build().unwrap();
+        let result = dataflow.run();
+        assert!(result.is_err());
+        let err_msg = format!("{}", result.unwrap_err());
+        assert!(err_msg.contains("input ports require async runtime"));
     }
 }
