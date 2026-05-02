@@ -47,7 +47,7 @@ use crate::dataflow::schedulable::{
     ChannelEndpoints, ChannelFactory, OperatorFactory, SchedulableOperator,
 };
 use crate::dataflow::stream::Slot;
-use crate::dataflow::wired_operators::{WiredSourceOperator, WiredUnaryOperator};
+use crate::dataflow::wired_operators::{WiredBinaryOperator, WiredConcatOperator, WiredSourceOperator, WiredUnaryOperator};
 use crate::error::{Error, Result};
 use crate::progress::change_batch::ChangeBatch;
 use crate::progress::operate::PortConnectivity;
@@ -531,6 +531,315 @@ impl<T: Timestamp, D: Clone + Send + 'static> Stream<T, D> {
             + 'static,
     {
         self.add_unary_with_handles(name, logic)
+    }
+
+    /// Combine two streams with a binary operator.
+    ///
+    /// Creates an operator with two typed inputs and one typed output. Data
+    /// may arrive on either input independently — the logic must handle
+    /// partial availability (e.g., buffer data per-input if a cross-input
+    /// join is needed).
+    ///
+    /// # Arguments
+    ///
+    /// - `other` — the second input stream (must belong to the same builder)
+    /// - `name` — operator name for debugging and graph inspection
+    /// - `logic` — closure receiving two `InputHandle`s and one `OutputHandle`
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// let joined = names.binary::<i32, String>(ages, "join", |names_in, ages_in, out| {
+    ///     // Process both inputs and produce joined output
+    ///     while let Some((t, data)) = names_in.next() {
+    ///         out.push_vec(t, data.into_iter().map(|n| format!("{n}:?")).collect());
+    ///     }
+    ///     Ok(())
+    /// });
+    /// ```
+    pub fn binary<D2, D3, L>(
+        self,
+        other: Stream<T, D2>,
+        name: impl Into<String>,
+        logic: L,
+    ) -> Stream<T, D3>
+    where
+        D2: Clone + Send + 'static,
+        D3: Clone + Send + 'static,
+        L: FnMut(
+                &mut InputHandle<T, D>,
+                &mut InputHandle<T, D2>,
+                &mut OutputHandle<T, D3>,
+            ) -> Result<()>
+            + Send
+            + 'static,
+    {
+        // Both streams must share the same builder state.
+        assert!(
+            Rc::ptr_eq(&self.state, &other.state),
+            "binary operator streams must belong to the same DataflowBuilder"
+        );
+
+        let name = name.into();
+        let op_idx;
+        let region_id = RegionId::new(0);
+
+        {
+            let mut state = self.state.borrow_mut();
+            op_idx = state.allocate_operator_index();
+
+            // Register in graph (2 inputs, 1 output)
+            state
+                .graph
+                .register_operator(crate::dataflow::graph::OperatorInfo::new(
+                    op_idx, &name, region_id, 2, 1,
+                ))
+                .expect("operator index unique");
+
+            // Edge from self → slot 0
+            state.graph.add_edge(crate::dataflow::graph::EdgeInfo::new(
+                Slot::new(self.op_idx, self.output_slot),
+                Slot::new(op_idx, 0),
+                region_id,
+                region_id,
+            ));
+            let edge1_idx = state.graph.edges().len() - 1;
+
+            // Edge from other → slot 1
+            state.graph.add_edge(crate::dataflow::graph::EdgeInfo::new(
+                Slot::new(other.op_idx, other.output_slot),
+                Slot::new(op_idx, 1),
+                region_id,
+                region_id,
+            ));
+            let edge2_idx = state.graph.edges().len() - 1;
+
+            // Subgraph: 2 inputs → 1 output, both paths active
+            let mut connectivity = PortConnectivity::new(2, 1);
+            connectivity.path_mut(0, 0).insert(T::Summary::default());
+            connectivity.path_mut(1, 0).insert(T::Summary::default());
+            state
+                .subgraph_builder
+                .add_operator(op_idx, &name, 2, 1, connectivity);
+            state.subgraph_builder.add_edge(
+                Location::source(self.op_idx, self.output_slot),
+                Location::target(op_idx, 0),
+            );
+            state.subgraph_builder.add_edge(
+                Location::source(other.op_idx, other.output_slot),
+                Location::target(op_idx, 1),
+            );
+
+            // Operator factory
+            let name_clone = name.clone();
+            let factory: OperatorFactory = Box::new(move |endpoints: ChannelEndpoints| {
+                let mut pullers = endpoints.input_pullers.into_iter();
+
+                let input1_puller: Box<dyn Pull<T, D>> = *pullers
+                    .next()
+                    .expect("binary must have input puller 0")
+                    .downcast::<Box<dyn Pull<T, D>>>()
+                    .expect("binary input1 puller type mismatch");
+
+                let input2_puller: Box<dyn Pull<T, D2>> = *pullers
+                    .next()
+                    .expect("binary must have input puller 1")
+                    .downcast::<Box<dyn Pull<T, D2>>>()
+                    .expect("binary input2 puller type mismatch");
+
+                let output_pusher: Box<dyn Push<T, D3>> = {
+                    let pushers: Vec<Box<dyn Push<T, D3>>> = endpoints
+                        .output_pushers
+                        .into_iter()
+                        .map(|any_box| {
+                            *any_box
+                                .downcast::<Box<dyn Push<T, D3>>>()
+                                .expect("binary output pusher type mismatch")
+                        })
+                        .collect();
+                    tee_or_single(pushers).unwrap_or_else(|| Box::new(NullPush))
+                };
+
+                Box::new(WiredBinaryOperator::new(
+                    name_clone,
+                    op_idx,
+                    region_id,
+                    logic,
+                    input1_puller,
+                    input2_puller,
+                    output_pusher,
+                )) as Box<dyn SchedulableOperator>
+            });
+            state.operator_factories.push((op_idx, factory));
+
+            // Channel factories for both input edges
+            let capacity = state.channel_capacity;
+            let channel_factory1: ChannelFactory = Box::new(move |_cap: usize| {
+                let (push, pull) = bounded_channel::<T, D, ()>(capacity);
+                (
+                    Box::new(Box::new(push) as Box<dyn Push<T, D>>)
+                        as Box<dyn std::any::Any + Send>,
+                    Box::new(Box::new(pull) as Box<dyn Pull<T, D>>)
+                        as Box<dyn std::any::Any + Send>,
+                )
+            });
+            state.channel_factories.push((edge1_idx, channel_factory1));
+
+            let channel_factory2: ChannelFactory = Box::new(move |_cap: usize| {
+                let (push, pull) = bounded_channel::<T, D2, ()>(capacity);
+                (
+                    Box::new(Box::new(push) as Box<dyn Push<T, D2>>)
+                        as Box<dyn std::any::Any + Send>,
+                    Box::new(Box::new(pull) as Box<dyn Pull<T, D2>>)
+                        as Box<dyn std::any::Any + Send>,
+                )
+            });
+            state.channel_factories.push((edge2_idx, channel_factory2));
+        }
+
+        Stream {
+            state: Rc::clone(&self.state),
+            op_idx,
+            output_slot: 0,
+            _phantom: PhantomData,
+        }
+    }
+
+    /// Merge this stream with another same-typed stream.
+    ///
+    /// Shorthand for `Stream::concat(vec![self, other])`. Data from both
+    /// streams is interleaved in the output.
+    pub fn merge(self, other: Stream<T, D>) -> Stream<T, D> {
+        Stream::concat(vec![self, other])
+    }
+
+    /// Merge multiple same-typed streams into one.
+    ///
+    /// Creates a concat operator that forwards all data from every input
+    /// stream to a single output stream. Data order within a timestamp is
+    /// preserved per-input but interleaved across inputs.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `streams` is empty or if streams belong to different builders.
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// let merged = Stream::concat(vec![evens, odds, zeros]);
+    /// ```
+    pub fn concat(streams: Vec<Stream<T, D>>) -> Stream<T, D> {
+        assert!(!streams.is_empty(), "concat requires at least one stream");
+
+        // Verify all streams share the same builder.
+        for s in &streams[1..] {
+            assert!(
+                Rc::ptr_eq(&streams[0].state, &s.state),
+                "concat streams must belong to the same DataflowBuilder"
+            );
+        }
+
+        let num_inputs = streams.len();
+        let op_idx;
+        let region_id = RegionId::new(0);
+        let state_rc = Rc::clone(&streams[0].state);
+
+        {
+            let mut state = state_rc.borrow_mut();
+            op_idx = state.allocate_operator_index();
+
+            // Register in graph (N inputs, 1 output)
+            state
+                .graph
+                .register_operator(crate::dataflow::graph::OperatorInfo::new(
+                    op_idx, "concat", region_id, num_inputs, 1,
+                ))
+                .expect("operator index unique");
+
+            // Edges and channel factories for each input
+            let mut edge_indices = Vec::with_capacity(num_inputs);
+            for (i, s) in streams.iter().enumerate() {
+                state.graph.add_edge(crate::dataflow::graph::EdgeInfo::new(
+                    Slot::new(s.op_idx, s.output_slot),
+                    Slot::new(op_idx, i),
+                    region_id,
+                    region_id,
+                ));
+                edge_indices.push(state.graph.edges().len() - 1);
+            }
+
+            // Subgraph: N inputs → 1 output, all paths active
+            let mut connectivity = PortConnectivity::new(num_inputs, 1);
+            for i in 0..num_inputs {
+                connectivity.path_mut(i, 0).insert(T::Summary::default());
+            }
+            state
+                .subgraph_builder
+                .add_operator(op_idx, "concat", num_inputs, 1, connectivity);
+            for (i, s) in streams.iter().enumerate() {
+                state.subgraph_builder.add_edge(
+                    Location::source(s.op_idx, s.output_slot),
+                    Location::target(op_idx, i),
+                );
+            }
+
+            // Operator factory
+            let factory: OperatorFactory = Box::new(move |endpoints: ChannelEndpoints| {
+                let input_pullers: Vec<Box<dyn Pull<T, D>>> = endpoints
+                    .input_pullers
+                    .into_iter()
+                    .map(|any_box| {
+                        *any_box
+                            .downcast::<Box<dyn Pull<T, D>>>()
+                            .expect("concat input puller type mismatch")
+                    })
+                    .collect();
+
+                let output_pusher: Box<dyn Push<T, D>> = {
+                    let pushers: Vec<Box<dyn Push<T, D>>> = endpoints
+                        .output_pushers
+                        .into_iter()
+                        .map(|any_box| {
+                            *any_box
+                                .downcast::<Box<dyn Push<T, D>>>()
+                                .expect("concat output pusher type mismatch")
+                        })
+                        .collect();
+                    tee_or_single(pushers).unwrap_or_else(|| Box::new(NullPush))
+                };
+
+                Box::new(WiredConcatOperator::new(
+                    "concat",
+                    op_idx,
+                    region_id,
+                    input_pullers,
+                    output_pusher,
+                )) as Box<dyn SchedulableOperator>
+            });
+            state.operator_factories.push((op_idx, factory));
+
+            // Channel factories for each input edge
+            let capacity = state.channel_capacity;
+            for edge_idx in edge_indices {
+                let channel_factory: ChannelFactory = Box::new(move |_cap: usize| {
+                    let (push, pull) = bounded_channel::<T, D, ()>(capacity);
+                    (
+                        Box::new(Box::new(push) as Box<dyn Push<T, D>>)
+                            as Box<dyn std::any::Any + Send>,
+                        Box::new(Box::new(pull) as Box<dyn Pull<T, D>>)
+                            as Box<dyn std::any::Any + Send>,
+                    )
+                });
+                state.channel_factories.push((edge_idx, channel_factory));
+            }
+        }
+
+        Stream {
+            state: state_rc,
+            op_idx,
+            output_slot: 0,
+            _phantom: PhantomData,
+        }
     }
 
     /// Declare this stream as a named output port.
@@ -1522,5 +1831,176 @@ mod tests {
 
         let _handle = rt().spawn(dataflow).unwrap();
         // SpawnedDataflow::drop cancels and joins
+    }
+
+    // --- Binary operator tests ---
+
+    #[test]
+    fn test_binary_merge_two_streams() {
+        // Binary: combine two streams by pairing data at each timestamp
+        let builder = DataflowBuilder::<u64>::new("binary_test");
+        let names = builder.source("names", vec![
+            (0u64, vec!["alice".to_string(), "bob".to_string()]),
+        ]);
+        let ages = builder.source("ages", vec![
+            (0u64, vec![30i32, 25]),
+        ]);
+
+        let port = names.binary::<i32, String, _>(ages, "pair", |names_in, ages_in, out| {
+            // Collect names at this timestamp
+            let mut name_buf = Vec::new();
+            while let Some((_t, data)) = names_in.next() {
+                name_buf.extend(data.iter().cloned());
+            }
+            // Collect ages at this timestamp
+            let mut age_buf = Vec::new();
+            while let Some((_t, data)) = ages_in.next() {
+                age_buf.extend(data.iter().cloned());
+            }
+            // Zip them together
+            if !name_buf.is_empty() || !age_buf.is_empty() {
+                let pairs: Vec<String> = name_buf.iter().zip(age_buf.iter())
+                    .map(|(n, a)| format!("{n}={a}"))
+                    .collect();
+                out.push_vec(0, pairs);
+            }
+            Ok(())
+        }).output("results");
+
+        let dataflow = builder.build().unwrap();
+        rt().run(dataflow).unwrap();
+
+        let c = port.collector();
+        let r = c.lock().unwrap();
+        assert_eq!(r[0].1, vec!["alice=30", "bob=25"]);
+    }
+
+    #[test]
+    fn test_binary_different_types() {
+        // Binary with different input types
+        let builder = DataflowBuilder::<u64>::new("binary_types");
+        let ints = builder.source("ints", vec![(0u64, vec![1i32, 2, 3])]);
+        let strs = builder.source("strs", vec![(0u64, vec!["a".to_string(), "b".to_string()])]);
+
+        let port = ints.binary::<String, String, _>(strs, "combine", |ints_in, strs_in, out| {
+            let mut result = Vec::new();
+            while let Some((t, data)) = ints_in.next() {
+                for x in data {
+                    result.push((t, format!("int:{x}")));
+                }
+            }
+            while let Some((t, data)) = strs_in.next() {
+                for s in data {
+                    result.push((t, format!("str:{s}")));
+                }
+            }
+            for (t, s) in result {
+                out.push_vec(t, vec![s]);
+            }
+            Ok(())
+        }).output("out");
+
+        let dataflow = builder.build().unwrap();
+        rt().run(dataflow).unwrap();
+
+        let c = port.collector();
+        let r = c.lock().unwrap();
+        let mut all: Vec<&str> = r.iter().flat_map(|(_, v)| v.iter().map(|s| s.as_str())).collect();
+        all.sort();
+        assert_eq!(all, vec!["int:1", "int:2", "int:3", "str:a", "str:b"]);
+    }
+
+    // --- Concat tests ---
+
+    #[test]
+    fn test_concat_two_streams() {
+        let builder = DataflowBuilder::<u64>::new("concat_test");
+        let a = builder.source("a", vec![(0u64, vec![1i32, 2])]);
+        let b = builder.source("b", vec![(0u64, vec![3i32, 4])]);
+
+        let port = Stream::concat(vec![a, b]).output("merged");
+        let dataflow = builder.build().unwrap();
+        rt().run(dataflow).unwrap();
+
+        let c = port.collector();
+        let r = c.lock().unwrap();
+        let mut all: Vec<i32> = r.iter().flat_map(|(_, v)| v.iter().copied()).collect();
+        all.sort();
+        assert_eq!(all, vec![1, 2, 3, 4]);
+    }
+
+    #[test]
+    fn test_concat_three_streams() {
+        let builder = DataflowBuilder::<u64>::new("concat3");
+        let a = builder.source("a", vec![(0u64, vec![1i32])]);
+        let b = builder.source("b", vec![(0u64, vec![2i32])]);
+        let c = builder.source("c", vec![(0u64, vec![3i32])]);
+
+        let port = Stream::concat(vec![a, b, c]).output("merged");
+        let dataflow = builder.build().unwrap();
+        rt().run(dataflow).unwrap();
+
+        let col = port.collector();
+        let r = col.lock().unwrap();
+        let mut all: Vec<i32> = r.iter().flat_map(|(_, v)| v.iter().copied()).collect();
+        all.sort();
+        assert_eq!(all, vec![1, 2, 3]);
+    }
+
+    #[test]
+    fn test_merge_two_streams() {
+        let builder = DataflowBuilder::<u64>::new("merge_test");
+        let evens = builder.source("evens", vec![(0u64, vec![2i32, 4, 6])]);
+        let odds = builder.source("odds", vec![(0u64, vec![1i32, 3, 5])]);
+
+        let port = evens.merge(odds).output("all");
+        let dataflow = builder.build().unwrap();
+        rt().run(dataflow).unwrap();
+
+        let c = port.collector();
+        let r = c.lock().unwrap();
+        let mut all: Vec<i32> = r.iter().flat_map(|(_, v)| v.iter().copied()).collect();
+        all.sort();
+        assert_eq!(all, vec![1, 2, 3, 4, 5, 6]);
+    }
+
+    #[test]
+    fn test_concat_then_process() {
+        // Concat → downstream operator
+        let builder = DataflowBuilder::<u64>::new("concat_chain");
+        let a = builder.source("a", vec![(0u64, vec![1i32, 2])]);
+        let b = builder.source("b", vec![(0u64, vec![3i32, 4])]);
+
+        let port = Stream::concat(vec![a, b])
+            .map("double", |_t, x| x * 2)
+            .output("results");
+        let dataflow = builder.build().unwrap();
+        rt().run(dataflow).unwrap();
+
+        let c = port.collector();
+        let r = c.lock().unwrap();
+        let mut all: Vec<i32> = r.iter().flat_map(|(_, v)| v.iter().copied()).collect();
+        all.sort();
+        assert_eq!(all, vec![2, 4, 6, 8]);
+    }
+
+    #[test]
+    fn test_concat_multiple_timestamps() {
+        let builder = DataflowBuilder::<u64>::new("concat_ts");
+        let a = builder.source("a", vec![(0u64, vec![1i32]), (1u64, vec![10])]);
+        let b = builder.source("b", vec![(0u64, vec![2i32]), (1u64, vec![20])]);
+
+        let port = Stream::concat(vec![a, b]).output("merged");
+        let dataflow = builder.build().unwrap();
+        rt().run(dataflow).unwrap();
+
+        let c = port.collector();
+        let r = c.lock().unwrap();
+        let mut t0: Vec<i32> = r.iter().filter(|(t, _)| *t == 0).flat_map(|(_, v)| v.iter().copied()).collect();
+        let mut t1: Vec<i32> = r.iter().filter(|(t, _)| *t == 1).flat_map(|(_, v)| v.iter().copied()).collect();
+        t0.sort();
+        t1.sort();
+        assert_eq!(t0, vec![1, 2]);
+        assert_eq!(t1, vec![10, 20]);
     }
 }
