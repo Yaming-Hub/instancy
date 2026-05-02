@@ -19,6 +19,7 @@ pub mod communication;
 pub mod dataflow;
 pub mod error;
 pub mod execute;
+pub mod executor_task;
 pub mod metrics;
 pub mod order;
 pub mod progress;
