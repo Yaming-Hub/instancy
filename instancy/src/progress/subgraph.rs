@@ -160,6 +160,21 @@ impl<T: Timestamp> SubgraphBuilder<T> {
         self.operators.len()
     }
 
+    /// Returns all registered operator shapes (for merging into a parent builder).
+    pub fn operator_shapes(&self) -> impl Iterator<Item = &OperatorShape> {
+        self.operators.values()
+    }
+
+    /// Returns all connectivity entries (for merging into a parent builder).
+    pub fn connectivities(&self) -> impl Iterator<Item = (usize, &PortConnectivity<T::Summary>)> {
+        self.connectivity.iter().map(|(&k, v)| (k, v))
+    }
+
+    /// Returns all edges (for merging into a parent builder).
+    pub fn edges(&self) -> &[(Location, Location)] {
+        &self.edges
+    }
+
     /// Compiles the subgraph into a live [`ProgressTracker`].
     ///
     /// Consumes the builder and returns the tracker along with per-operator

@@ -47,13 +47,14 @@ use crate::dataflow::schedulable::{
     ChannelEndpoints, ChannelFactory, OperatorFactory, SchedulableOperator,
 };
 use crate::dataflow::stream::Slot;
-use crate::dataflow::wired_operators::{WiredBinaryOperator, WiredConcatOperator, WiredSourceOperator, WiredUnaryOperator};
+use crate::dataflow::wired_operators::{WiredBinaryOperator, WiredConcatOperator, WiredEnterOperator, WiredFeedbackOperator, WiredLeaveOperator, WiredSourceOperator, WiredUnaryOperator};
 use crate::error::{Error, Result};
 use crate::progress::change_batch::ChangeBatch;
 use crate::progress::operate::PortConnectivity;
 use crate::progress::reachability::Location;
 use crate::progress::subgraph::SubgraphBuilder;
 use crate::progress::timestamp::Timestamp;
+use crate::order::Product;
 
 // ---------------------------------------------------------------------------
 // InputPortInfo / OutputPortInfo — metadata for named I/O ports
@@ -92,6 +93,8 @@ struct BuilderState<T: Timestamp> {
     subgraph_builder: SubgraphBuilder<T>,
     operator_factories: Vec<(usize, OperatorFactory)>,
     channel_factories: Vec<(usize, ChannelFactory)>,
+    /// Channel factories for feedback edges, indexed by position in graph.feedback_edges.
+    feedback_channel_factories: Vec<(usize, ChannelFactory)>,
     input_ports: Vec<InputPortInfo>,
     output_ports: Vec<OutputPortInfo>,
     /// Type-erased closures that create ChannelSourceOperator + InputSender
@@ -185,6 +188,7 @@ impl<T: Timestamp> DataflowBuilder<T> {
                 subgraph_builder: SubgraphBuilder::new(0, 0),
                 operator_factories: Vec::new(),
                 channel_factories: Vec::new(),
+                feedback_channel_factories: Vec::new(),
                 input_ports: Vec::new(),
                 output_ports: Vec::new(),
                 input_port_wiring: Vec::new(),
@@ -398,7 +402,7 @@ impl<T: Timestamp> DataflowBuilder<T> {
     ///
     /// After a successful call, the builder is consumed.
     pub fn build(self) -> Result<LogicalDataflow<T>> {
-        let state = match Rc::try_unwrap(self.state) {
+        let mut state = match Rc::try_unwrap(self.state) {
             Ok(cell) => cell.into_inner(),
             Err(_) => {
                 return Err(Error::Custom(
@@ -408,6 +412,13 @@ impl<T: Timestamp> DataflowBuilder<T> {
                 ))
             }
         };
+
+        // Merge feedback channel factories with correct indices.
+        // Feedback edges are materialized at indices: edges.len()..edges.len()+feedback_edges.len()
+        let regular_edge_count = state.graph.edges().len();
+        for (fb_position, factory) in state.feedback_channel_factories {
+            state.channel_factories.push((regular_edge_count + fb_position, factory));
+        }
 
         Ok(LogicalDataflow {
             name: self.name,
@@ -456,6 +467,14 @@ impl<T: Timestamp, D: Clone + Send + 'static> Clone for Pipe<T, D> {
             _phantom: PhantomData,
         }
     }
+}
+
+/// Result of an iterate closure — specifies which data feeds back and which exits.
+pub struct IterateResult<T: Timestamp, D: Clone + Send + 'static> {
+    /// Data that feeds back for another iteration.
+    pub feedback: Pipe<T, D>,
+    /// Data that exits the loop.
+    pub output: Pipe<T, D>,
 }
 
 impl<T: Timestamp, D: Clone + Send + 'static> Pipe<T, D> {
@@ -715,6 +734,500 @@ impl<T: Timestamp, D: Clone + Send + 'static> Pipe<T, D> {
     /// streams is interleaved in the output.
     pub fn merge(self, other: Pipe<T, D>) -> Pipe<T, D> {
         Pipe::concat(vec![self, other])
+    }
+
+    /// Create an iterative loop scope.
+    ///
+    /// The input data enters the loop and is merged with the feedback stream.
+    /// The closure receives the merged iteration variable (with nested timestamp
+    /// `Product<T, TInner>`) and must return an [`IterateResult`] specifying
+    /// which data feeds back and which exits the loop.
+    ///
+    /// `summary` describes how the inner timestamp advances per iteration
+    /// (e.g., `1u32` means inner timestamp increments by 1 each iteration).
+    ///
+    /// # Type Parameters
+    /// - `TInner`: The inner timestamp type for the loop (typically `u32`)
+    ///
+    /// # Example
+    /// ```ignore
+    /// let result = input.iterate::<u32>("loop", 1u32, |iter_var| {
+    ///     let doubled = iter_var.map("double", |_t, x| x * 2);
+    ///     let done = doubled.clone().filter("done", |_t, x| *x >= 100);
+    ///     let again = doubled.filter("again", |_t, x| *x < 100);
+    ///     IterateResult { feedback: again, output: done }
+    /// });
+    /// ```
+    pub fn iterate<TInner>(
+        self,
+        name: impl Into<String>,
+        summary: TInner::Summary,
+        body: impl FnOnce(Pipe<Product<T, TInner>, D>) -> IterateResult<Product<T, TInner>, D>,
+    ) -> Pipe<T, D>
+    where
+        TInner: Timestamp,
+        Product<T, TInner>: Timestamp,
+    {
+        let name = name.into();
+        let region_id = RegionId::new(0);
+        type PT<T, TInner> = Product<T, TInner>;
+
+        // Phase 1: Allocate enter, feedback, concat operators in parent state.
+        // We also create a separate inner BuilderState for the loop body.
+        let enter_idx;
+        let feedback_idx;
+        let concat_idx;
+        let leave_idx;
+        let inner_start_idx;
+        let capacity;
+
+        {
+            let mut state = self.state.borrow_mut();
+            capacity = state.channel_capacity;
+
+            // Enter operator: 1 input (T,D), 1 output (Product<T,TInner>,D)
+            enter_idx = state.allocate_operator_index();
+            state
+                .graph
+                .register_operator(crate::dataflow::graph::OperatorInfo::new(
+                    enter_idx, format!("{name}::enter"), region_id, 1, 1,
+                ))
+                .expect("operator index unique");
+            state.graph.add_edge(crate::dataflow::graph::EdgeInfo::new(
+                Slot::new(self.op_idx, self.output_slot),
+                Slot::new(enter_idx, 0),
+                region_id,
+                region_id,
+            ));
+            // Subgraph registration for enter
+            state.subgraph_builder.add_operator(
+                enter_idx,
+                &format!("{name}::enter"),
+                1,
+                1,
+                PortConnectivity::identity(T::Summary::default()),
+            );
+            state.subgraph_builder.add_edge(
+                Location::source(self.op_idx, self.output_slot),
+                Location::target(enter_idx, 0),
+            );
+
+            // Enter operator factory
+            let enter_name = format!("{name}::enter");
+            let enter_factory: OperatorFactory = Box::new(move |endpoints: ChannelEndpoints| {
+                let input_puller: Box<dyn Pull<T, D>> = *endpoints
+                    .input_pullers
+                    .into_iter()
+                    .next()
+                    .expect("enter must have input puller")
+                    .downcast::<Box<dyn Pull<T, D>>>()
+                    .expect("enter input puller type mismatch");
+
+                let output_pusher: Box<dyn Push<PT<T, TInner>, D>> = {
+                    let pushers: Vec<Box<dyn Push<PT<T, TInner>, D>>> = endpoints
+                        .output_pushers
+                        .into_iter()
+                        .map(|any_box| {
+                            *any_box
+                                .downcast::<Box<dyn Push<PT<T, TInner>, D>>>()
+                                .expect("enter output pusher type mismatch")
+                        })
+                        .collect();
+                    tee_or_single(pushers).unwrap_or_else(|| Box::new(NullPush))
+                };
+
+                Box::new(WiredEnterOperator::<T, TInner, D>::new(
+                    enter_name,
+                    enter_idx,
+                    region_id,
+                    input_puller,
+                    output_pusher,
+                )) as Box<dyn SchedulableOperator>
+            });
+            state.operator_factories.push((enter_idx, enter_factory));
+
+            // Channel factory for enter's input edge
+            let enter_edge_idx = state.graph.edges().len() - 1;
+            let cap = capacity;
+            let cf: ChannelFactory = Box::new(move |_cap: usize| {
+                let (push, pull) = bounded_channel::<T, D, ()>(cap);
+                (
+                    Box::new(Box::new(push) as Box<dyn Push<T, D>>) as Box<dyn std::any::Any + Send>,
+                    Box::new(Box::new(pull) as Box<dyn Pull<T, D>>) as Box<dyn std::any::Any + Send>,
+                )
+            });
+            state.channel_factories.push((enter_edge_idx, cf));
+
+            // Feedback operator: 1 input (Product<T,TInner>,D), 1 output (Product<T,TInner>,D)
+            feedback_idx = state.allocate_operator_index();
+            state
+                .graph
+                .register_operator(crate::dataflow::graph::OperatorInfo::new(
+                    feedback_idx, format!("{name}::feedback"), region_id, 1, 1,
+                ))
+                .expect("operator index unique");
+            // Subgraph registration for feedback
+            state.subgraph_builder.add_operator(
+                feedback_idx,
+                &format!("{name}::feedback"),
+                1,
+                1,
+                PortConnectivity::identity(T::Summary::default()),
+            );
+
+            // Feedback operator factory
+            let fb_name = format!("{name}::feedback");
+            let fb_summary = summary.clone();
+            let feedback_factory: OperatorFactory = Box::new(move |endpoints: ChannelEndpoints| {
+                let input_puller: Box<dyn Pull<PT<T, TInner>, D>> = *endpoints
+                    .input_pullers
+                    .into_iter()
+                    .next()
+                    .expect("feedback must have input puller")
+                    .downcast::<Box<dyn Pull<PT<T, TInner>, D>>>()
+                    .expect("feedback input puller type mismatch");
+
+                let output_pusher: Box<dyn Push<PT<T, TInner>, D>> = {
+                    let pushers: Vec<Box<dyn Push<PT<T, TInner>, D>>> = endpoints
+                        .output_pushers
+                        .into_iter()
+                        .map(|any_box| {
+                            *any_box
+                                .downcast::<Box<dyn Push<PT<T, TInner>, D>>>()
+                                .expect("feedback output pusher type mismatch")
+                        })
+                        .collect();
+                    tee_or_single(pushers).unwrap_or_else(|| Box::new(NullPush))
+                };
+
+                Box::new(WiredFeedbackOperator::<T, TInner, D>::new(
+                    fb_name,
+                    feedback_idx,
+                    region_id,
+                    fb_summary,
+                    input_puller,
+                    output_pusher,
+                )) as Box<dyn SchedulableOperator>
+            });
+            state.operator_factories.push((feedback_idx, feedback_factory));
+
+            // Concat operator: 2 inputs (enter output + feedback output), 1 output
+            concat_idx = state.allocate_operator_index();
+            state
+                .graph
+                .register_operator(crate::dataflow::graph::OperatorInfo::new(
+                    concat_idx, format!("{name}::concat"), region_id, 2, 1,
+                ))
+                .expect("operator index unique");
+            // Edge: enter → concat input 0
+            state.graph.add_edge(crate::dataflow::graph::EdgeInfo::new(
+                Slot::new(enter_idx, 0),
+                Slot::new(concat_idx, 0),
+                region_id,
+                region_id,
+            ));
+            let enter_concat_edge_idx = state.graph.edges().len() - 1;
+            // Edge: feedback → concat input 1
+            state.graph.add_edge(crate::dataflow::graph::EdgeInfo::new(
+                Slot::new(feedback_idx, 0),
+                Slot::new(concat_idx, 1),
+                region_id,
+                region_id,
+            ));
+            let fb_concat_edge_idx = state.graph.edges().len() - 1;
+
+            // Subgraph for concat
+            let mut concat_connectivity = PortConnectivity::new(2, 1);
+            concat_connectivity.path_mut(0, 0).insert(T::Summary::default());
+            concat_connectivity.path_mut(1, 0).insert(T::Summary::default());
+            state.subgraph_builder.add_operator(
+                concat_idx,
+                &format!("{name}::concat"),
+                2,
+                1,
+                concat_connectivity,
+            );
+            state.subgraph_builder.add_edge(
+                Location::source(enter_idx, 0),
+                Location::target(concat_idx, 0),
+            );
+            state.subgraph_builder.add_edge(
+                Location::source(feedback_idx, 0),
+                Location::target(concat_idx, 1),
+            );
+
+            // Concat operator factory
+            let concat_name = format!("{name}::concat");
+            let concat_factory: OperatorFactory = Box::new(move |endpoints: ChannelEndpoints| {
+                let input_pullers: Vec<Box<dyn Pull<PT<T, TInner>, D>>> = endpoints
+                    .input_pullers
+                    .into_iter()
+                    .map(|any_box| {
+                        *any_box
+                            .downcast::<Box<dyn Pull<PT<T, TInner>, D>>>()
+                            .expect("concat input puller type mismatch")
+                    })
+                    .collect();
+
+                let output_pusher: Box<dyn Push<PT<T, TInner>, D>> = {
+                    let pushers: Vec<Box<dyn Push<PT<T, TInner>, D>>> = endpoints
+                        .output_pushers
+                        .into_iter()
+                        .map(|any_box| {
+                            *any_box
+                                .downcast::<Box<dyn Push<PT<T, TInner>, D>>>()
+                                .expect("concat output pusher type mismatch")
+                        })
+                        .collect();
+                    tee_or_single(pushers).unwrap_or_else(|| Box::new(NullPush))
+                };
+
+                Box::new(WiredConcatOperator::new(
+                    concat_name,
+                    concat_idx,
+                    region_id,
+                    input_pullers,
+                    output_pusher,
+                )) as Box<dyn SchedulableOperator>
+            });
+            state.operator_factories.push((concat_idx, concat_factory));
+
+            // Channel factories for concat inputs
+            let cap = capacity;
+            let cf1: ChannelFactory = Box::new(move |_cap: usize| {
+                let (push, pull) = bounded_channel::<PT<T, TInner>, D, ()>(cap);
+                (
+                    Box::new(Box::new(push) as Box<dyn Push<PT<T, TInner>, D>>) as Box<dyn std::any::Any + Send>,
+                    Box::new(Box::new(pull) as Box<dyn Pull<PT<T, TInner>, D>>) as Box<dyn std::any::Any + Send>,
+                )
+            });
+            state.channel_factories.push((enter_concat_edge_idx, cf1));
+
+            let cap = capacity;
+            let cf2: ChannelFactory = Box::new(move |_cap: usize| {
+                let (push, pull) = bounded_channel::<PT<T, TInner>, D, ()>(cap);
+                (
+                    Box::new(Box::new(push) as Box<dyn Push<PT<T, TInner>, D>>) as Box<dyn std::any::Any + Send>,
+                    Box::new(Box::new(pull) as Box<dyn Pull<PT<T, TInner>, D>>) as Box<dyn std::any::Any + Send>,
+                )
+            });
+            state.channel_factories.push((fb_concat_edge_idx, cf2));
+
+            // Leave operator: 1 input (Product<T,TInner>,D), 1 output (T,D)
+            leave_idx = state.allocate_operator_index();
+            state
+                .graph
+                .register_operator(crate::dataflow::graph::OperatorInfo::new(
+                    leave_idx, format!("{name}::leave"), region_id, 1, 1,
+                ))
+                .expect("operator index unique");
+            // Subgraph registration for leave
+            state.subgraph_builder.add_operator(
+                leave_idx,
+                &format!("{name}::leave"),
+                1,
+                1,
+                PortConnectivity::identity(T::Summary::default()),
+            );
+
+            // Leave factory will be added after we know the output pipe from body
+            // For now, record where the inner builder should start
+            inner_start_idx = state.next_operator_index;
+        }
+
+        // Phase 2: Create inner builder for loop body and call body closure.
+        let inner_state: Rc<RefCell<BuilderState<Product<T, TInner>>>> =
+            Rc::new(RefCell::new(BuilderState {
+                graph: DataflowGraph::new(),
+                subgraph_builder: SubgraphBuilder::new(0, 0),
+                operator_factories: Vec::new(),
+                channel_factories: Vec::new(),
+                feedback_channel_factories: Vec::new(),
+                input_ports: Vec::new(),
+                output_ports: Vec::new(),
+                input_port_wiring: Vec::new(),
+                output_port_wiring: Vec::new(),
+                probes: Vec::new(),
+                next_operator_index: inner_start_idx,
+                next_collect_index: 0,
+                channel_capacity: capacity,
+            }));
+
+        // The iteration variable pipe points to concat's output
+        let iter_var: Pipe<Product<T, TInner>, D> = Pipe {
+            state: Rc::clone(&inner_state),
+            op_idx: concat_idx,
+            output_slot: 0,
+            _phantom: PhantomData,
+        };
+
+        let result = body(iter_var);
+
+        // Extract info from result pipes before dropping them
+        let feedback_op_idx = result.feedback.op_idx;
+        let feedback_output_slot = result.feedback.output_slot;
+        let output_op_idx = result.output.op_idx;
+        let output_output_slot = result.output.output_slot;
+        drop(result);
+
+        // Phase 3: Merge inner state into parent state.
+        let inner = match Rc::try_unwrap(inner_state) {
+            Ok(cell) => cell.into_inner(),
+            Err(_) => panic!("iterate body must not hold Pipe references after returning"),
+        };
+
+        {
+            let mut state = self.state.borrow_mut();
+
+            // Advance parent's next_operator_index
+            if inner.next_operator_index > state.next_operator_index {
+                state.next_operator_index = inner.next_operator_index;
+            }
+
+            // Merge inner operators into parent graph
+            for op in inner.graph.operators() {
+                state
+                    .graph
+                    .register_operator(op.clone())
+                    .expect("inner operator index conflict");
+            }
+            // Merge inner edges with offset: inner edge 0 becomes parent edge N
+            let inner_edge_offset = state.graph.edges().len();
+            for edge in inner.graph.edges() {
+                state.graph.add_edge(edge.clone());
+            }
+            for edge in inner.graph.feedback_edges() {
+                state.graph.add_feedback_edge(edge.clone());
+            }
+
+            // Merge inner subgraph builder operators and edges into parent.
+            // Inner operators use Product<T,TInner> timestamps internally, but for
+            // the parent's progress tracker we register them with identity T::Summary
+            // connectivity (sufficient for activation scheduling).
+            for shape in inner.subgraph_builder.operator_shapes() {
+                let mut conn: PortConnectivity<T::Summary> = PortConnectivity::new(shape.inputs, shape.outputs);
+                for i in 0..shape.inputs {
+                    for o in 0..shape.outputs {
+                        conn.path_mut(i, o).insert(T::Summary::default());
+                    }
+                }
+                state.subgraph_builder.add_operator(
+                    shape.index,
+                    &shape.name,
+                    shape.inputs,
+                    shape.outputs,
+                    conn,
+                );
+            }
+            for (src, tgt) in inner.subgraph_builder.edges() {
+                state.subgraph_builder.add_edge(src.clone(), tgt.clone());
+            }
+
+            // Merge factories (offset inner channel factory indices)
+            state.operator_factories.extend(inner.operator_factories);
+            for (edge_idx, factory) in inner.channel_factories {
+                state.channel_factories.push((edge_idx + inner_edge_offset, factory));
+            }
+            // Merge inner feedback channel factories (offset by parent's existing feedback edges)
+            let fb_offset = state.graph.feedback_edges().len();
+            for (fb_idx, factory) in inner.feedback_channel_factories {
+                state.feedback_channel_factories.push((fb_idx + fb_offset, factory));
+            }
+
+            // Wire output: result.output → leave_op input (regular edge)
+            // Must be added before feedback edge so indices are sequential.
+            state.graph.add_edge(crate::dataflow::graph::EdgeInfo::new(
+                Slot::new(output_op_idx, output_output_slot),
+                Slot::new(leave_idx, 0),
+                region_id,
+                region_id,
+            ));
+            let leave_edge_idx = state.graph.edges().len() - 1;
+
+            // Subgraph edge for leave
+            state.subgraph_builder.add_edge(
+                Location::source(output_op_idx, output_output_slot),
+                Location::target(leave_idx, 0),
+            );
+
+            // Wire feedback: result.feedback → feedback_op input (as feedback edge, not regular)
+            state.graph.add_feedback_edge(crate::dataflow::graph::EdgeInfo::new(
+                Slot::new(feedback_op_idx, feedback_output_slot),
+                Slot::new(feedback_idx, 0),
+                region_id,
+                region_id,
+            ));
+
+            // NOTE: We do NOT add the feedback edge to subgraph_builder because it's
+            // a back-edge. Adding it would create a cycle in the reachability graph
+            // and prevent termination detection.
+
+            // Channel factory for feedback edge.
+            // Stored separately; merged with correct indices at build() time.
+            // Index by position in feedback_edges (0-based).
+            let fb_position = state.graph.feedback_edges().len() - 1;
+            let cap = capacity;
+            let cf_fb: ChannelFactory = Box::new(move |_cap: usize| {
+                let (push, pull) = bounded_channel::<PT<T, TInner>, D, ()>(cap);
+                (
+                    Box::new(Box::new(push) as Box<dyn Push<PT<T, TInner>, D>>) as Box<dyn std::any::Any + Send>,
+                    Box::new(Box::new(pull) as Box<dyn Pull<PT<T, TInner>, D>>) as Box<dyn std::any::Any + Send>,
+                )
+            });
+            state.feedback_channel_factories.push((fb_position, cf_fb));
+
+            // Leave operator factory
+            let leave_name = format!("{name}::leave");
+            let leave_factory: OperatorFactory = Box::new(move |endpoints: ChannelEndpoints| {
+                let input_puller: Box<dyn Pull<PT<T, TInner>, D>> = *endpoints
+                    .input_pullers
+                    .into_iter()
+                    .next()
+                    .expect("leave must have input puller")
+                    .downcast::<Box<dyn Pull<PT<T, TInner>, D>>>()
+                    .expect("leave input puller type mismatch");
+
+                let output_pusher: Box<dyn Push<T, D>> = {
+                    let pushers: Vec<Box<dyn Push<T, D>>> = endpoints
+                        .output_pushers
+                        .into_iter()
+                        .map(|any_box| {
+                            *any_box
+                                .downcast::<Box<dyn Push<T, D>>>()
+                                .expect("leave output pusher type mismatch")
+                        })
+                        .collect();
+                    tee_or_single(pushers).unwrap_or_else(|| Box::new(NullPush))
+                };
+
+                Box::new(WiredLeaveOperator::<T, TInner, D>::new(
+                    leave_name,
+                    leave_idx,
+                    region_id,
+                    input_puller,
+                    output_pusher,
+                )) as Box<dyn SchedulableOperator>
+            });
+            state.operator_factories.push((leave_idx, leave_factory));
+
+            // Channel factory for leave's input edge
+            let cap = capacity;
+            let cf_leave: ChannelFactory = Box::new(move |_cap: usize| {
+                let (push, pull) = bounded_channel::<PT<T, TInner>, D, ()>(cap);
+                (
+                    Box::new(Box::new(push) as Box<dyn Push<PT<T, TInner>, D>>) as Box<dyn std::any::Any + Send>,
+                    Box::new(Box::new(pull) as Box<dyn Pull<PT<T, TInner>, D>>) as Box<dyn std::any::Any + Send>,
+                )
+            });
+            state.channel_factories.push((leave_edge_idx, cf_leave));
+        }
+
+        Pipe {
+            state: Rc::clone(&self.state),
+            op_idx: leave_idx,
+            output_slot: 0,
+            _phantom: PhantomData,
+        }
     }
 
     /// Merge multiple same-typed streams into one.
@@ -2006,5 +2519,121 @@ mod tests {
         t1.sort();
         assert_eq!(t0, vec![1, 2]);
         assert_eq!(t1, vec![10, 20]);
+    }
+
+    // --- Iterate tests ---
+
+    #[test]
+    fn test_iterate_simple() {
+        // Iterate: multiply by 2 until >= 100
+        let builder = DataflowBuilder::<u64>::new("iterate_simple");
+        let stream = builder.source("nums", vec![(0u64, vec![1i32, 3, 7])]);
+        let port = stream
+            .iterate::<u32>("loop", 1u32, |iter_var| {
+                let doubled = iter_var.map("double", |_t, x| x * 2);
+                let done = doubled.clone().filter("done", |_t, x| *x >= 100);
+                let again = doubled.filter("again", |_t, x| *x < 100);
+                IterateResult {
+                    feedback: again,
+                    output: done,
+                }
+            })
+            .output("results");
+        let dataflow = builder.build().unwrap();
+        rt().run(dataflow).unwrap();
+
+        let c = port.collector();
+        let r = c.lock().unwrap();
+        let mut all: Vec<i32> = r.iter().flat_map(|(_, v)| v.iter().copied()).collect();
+        all.sort();
+        // 1 → 2 → 4 → 8 → 16 → 32 → 64 → 128 (7 iterations)
+        // 3 → 6 → 12 → 24 → 48 → 96 → 192 (6 iterations)
+        // 7 → 14 → 28 → 56 → 112 (4 iterations)
+        assert_eq!(all, vec![112, 128, 192]);
+    }
+
+    #[test]
+    fn test_iterate_convergence() {
+        // Items converge at different rates
+        let builder = DataflowBuilder::<u64>::new("iterate_conv");
+        let stream = builder.source("nums", vec![(0u64, vec![50i32, 90, 10])]);
+        let port = stream
+            .iterate::<u32>("loop", 1u32, |iter_var| {
+                // Add 10 each iteration; exit when >= 100
+                let incremented = iter_var.map("add10", |_t, x| x + 10);
+                let done = incremented.clone().filter("done", |_t, x| *x >= 100);
+                let again = incremented.filter("again", |_t, x| *x < 100);
+                IterateResult {
+                    feedback: again,
+                    output: done,
+                }
+            })
+            .output("results");
+        let dataflow = builder.build().unwrap();
+        rt().run(dataflow).unwrap();
+
+        let c = port.collector();
+        let r = c.lock().unwrap();
+        let mut all: Vec<i32> = r.iter().flat_map(|(_, v)| v.iter().copied()).collect();
+        all.sort();
+        // 50 → 60 → 70 → 80 → 90 → 100 (5 iters)
+        // 90 → 100 (1 iter)
+        // 10 → 20 → 30 → 40 → 50 → 60 → 70 → 80 → 90 → 100 (9 iters)
+        assert_eq!(all, vec![100, 100, 100]);
+    }
+
+    #[test]
+    fn test_iterate_empty() {
+        // Empty input should pass through without hanging
+        let builder = DataflowBuilder::<u64>::new("iterate_empty");
+        let stream = builder.source::<i32>("nums", vec![]);
+        let port = stream
+            .iterate::<u32>("loop", 1u32, |iter_var| {
+                let done = iter_var.clone().filter("done", |_t, x| *x >= 100);
+                let again = iter_var.filter("again", |_t, x| *x < 100);
+                IterateResult {
+                    feedback: again,
+                    output: done,
+                }
+            })
+            .output("results");
+        let dataflow = builder.build().unwrap();
+        rt().run(dataflow).unwrap();
+
+        let c = port.collector();
+        let r = c.lock().unwrap();
+        assert!(r.is_empty());
+    }
+
+    #[test]
+    fn test_iterate_multi_batch() {
+        // Multiple batches at different timestamps should all iterate correctly
+        let builder = DataflowBuilder::<u64>::new("iterate_multi");
+        let stream = builder.source(
+            "nums",
+            vec![
+                (0u64, vec![5i32]),   // 5 → 10 → 20 → 40 → 80 → 160 (5 iters)
+                (1u64, vec![50i32]),  // 50 → 100 (1 iter)
+            ],
+        );
+        let port = stream
+            .iterate::<u32>("loop", 1u32, |iter_var| {
+                let doubled = iter_var.map("double", |_t, x| x * 2);
+                let done = doubled.clone().filter("done", |_t, x| *x >= 100);
+                let again = doubled.filter("again", |_t, x| *x < 100);
+                IterateResult {
+                    feedback: again,
+                    output: done,
+                }
+            })
+            .output("results");
+        let dataflow = builder.build().unwrap();
+        rt().run(dataflow).unwrap();
+
+        let c = port.collector();
+        let r = c.lock().unwrap();
+        let mut all: Vec<i32> = r.iter().flat_map(|(_, v)| v.iter().copied()).collect();
+        all.sort();
+        assert_eq!(all, vec![100, 160]);
     }
 }

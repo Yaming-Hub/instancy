@@ -104,9 +104,13 @@ impl<T: Timestamp> DataflowExecutor<T> {
         cancel: CancellationToken,
     ) -> Result<Self> {
         let edges = graph.edges();
+        let feedback_edges = graph.feedback_edges();
+        let total_edge_count = edges.len() + feedback_edges.len();
 
-        // Phase 1: Create channels for each edge.
+        // Phase 1: Create channels for each edge (regular + feedback).
         // channel_endpoints[edge_index] = (push_end, pull_end)
+        // Regular edges: indices 0..edges.len()
+        // Feedback edges: indices edges.len()..total_edge_count
         let mut push_ends: Vec<Option<Box<dyn std::any::Any + Send>>> = Vec::new();
         let mut pull_ends: Vec<Option<Box<dyn std::any::Any + Send>>> = Vec::new();
 
@@ -115,7 +119,7 @@ impl<T: Timestamp> DataflowExecutor<T> {
         let mut factory_map: std::collections::HashMap<usize, ChannelFactory> =
             channel_factories.into_iter().collect();
 
-        for (edge_idx, _edge) in edges.iter().enumerate() {
+        for edge_idx in 0..total_edge_count {
             let factory = factory_map.remove(&edge_idx).ok_or_else(|| {
                 Error::Custom(format!("No channel factory for edge index {edge_idx}"))
             })?;
@@ -134,7 +138,25 @@ impl<T: Timestamp> DataflowExecutor<T> {
         let mut op_output_pushers: std::collections::HashMap<usize, Vec<(usize, Box<dyn std::any::Any + Send>)>> =
             std::collections::HashMap::new();
 
+        // Process regular edges
         for (edge_idx, edge) in edges.iter().enumerate() {
+            let pull = pull_ends[edge_idx].take().unwrap();
+            let push = push_ends[edge_idx].take().unwrap();
+
+            op_input_pullers
+                .entry(edge.target.operator_index)
+                .or_default()
+                .push((edge.target.slot_index, pull));
+
+            op_output_pushers
+                .entry(edge.source.operator_index)
+                .or_default()
+                .push((edge.source.slot_index, push));
+        }
+
+        // Process feedback edges (same as regular edges for materialization purposes)
+        for (i, edge) in feedback_edges.iter().enumerate() {
+            let edge_idx = edges.len() + i;
             let pull = pull_ends[edge_idx].take().unwrap();
             let push = push_ends[edge_idx].take().unwrap();
 
@@ -449,6 +471,22 @@ impl<T: Timestamp> DataflowExecutor<T> {
                     consecutive_idle = 0;
                     continue;
                 }
+
+                // If a progress tracker is attached and reports completion,
+                // force-close remaining operators (they are in a feedback cycle
+                // that quiesced). Treat as normal completion.
+                if let Some(ref tracker) = self.progress_tracker {
+                    if tracker.is_completed() {
+                        for pos in 0..self.operators.len() {
+                            if !self.done[pos] {
+                                self.operators[pos].close_inputs();
+                                self.done[pos] = true;
+                            }
+                        }
+                        return Ok(true);
+                    }
+                }
+
                 // Quiescent — no operator made progress. Return false
                 // to distinguish from normal completion.
                 return Ok(false);
