@@ -43,6 +43,16 @@ pub struct ExecutorConfig {
     pub max_activations_per_step: usize,
     /// Maximum consecutive idle sweeps before declaring quiescence.
     pub max_idle_sweeps: usize,
+    /// Maximum sweeps per `poll_run()` call before yielding.
+    ///
+    /// When the executor has been running for this many sweeps in a single
+    /// `poll_run()` invocation, it self-notifies its `WakeHandle` and returns
+    /// `Poll::Pending`. This ensures CPU-active dataflows don't monopolize
+    /// a pool thread indefinitely, enabling cooperative multiplexing with
+    /// other dataflows on the same thread.
+    ///
+    /// Set to `0` to disable the budget (poll until completion/quiescence).
+    pub max_sweeps_per_poll: usize,
 }
 
 impl Default for ExecutorConfig {
@@ -50,6 +60,7 @@ impl Default for ExecutorConfig {
         Self {
             max_activations_per_step: 1024,
             max_idle_sweeps: 3,
+            max_sweeps_per_poll: 64,
         }
     }
 }
@@ -599,7 +610,8 @@ impl<T: Timestamp> DataflowExecutor<T> {
     }
 
     /// Poll the executor as a [`Future`], driving sweeps until the dataflow
-    /// completes, becomes quiescent, or needs to wait for input/notifications.
+    /// completes, becomes quiescent, exhausts its poll budget, or needs to
+    /// wait for input/notifications.
     ///
     /// # Async execution model
     ///
@@ -607,8 +619,17 @@ impl<T: Timestamp> DataflowExecutor<T> {
     /// [`WakeHandle`]. When channels push data, free capacity, or close,
     /// they notify the handle, which wakes this future to run more sweeps.
     ///
-    /// The race-safe protocol is:
-    /// 1. Run sweeps until idle
+    /// # Poll budget
+    ///
+    /// To enable cooperative multiplexing on shared pool threads, the executor
+    /// limits each `poll_run()` call to `config.max_sweeps_per_poll` sweeps.
+    /// On budget exhaustion, it self-notifies its WakeHandle (ensuring it will
+    /// be re-polled) and returns `Poll::Pending`. This lets other dataflow
+    /// executors run on the same thread.
+    ///
+    /// # Race-safe protocol
+    ///
+    /// 1. Run sweeps until idle or budget exhausted
     /// 2. Register the waker
     /// 3. Re-check for notifications (handles the race where a channel
     ///    pushed data between step 1 and step 2)
@@ -617,17 +638,32 @@ impl<T: Timestamp> DataflowExecutor<T> {
     /// Returns `Poll::Ready(Ok(true))` on completion, `Poll::Ready(Ok(false))`
     /// on quiescence, or `Poll::Ready(Err(...))` on error/cancellation.
     pub fn poll_run(&mut self, cx: &mut Context<'_>) -> Poll<Result<bool>> {
+        let budget = self.config.max_sweeps_per_poll;
+        let mut sweeps_this_poll: usize = 0;
+
         loop {
             match self.run_one_sweep() {
                 Ok(SweepOutcome::Completed) => return Poll::Ready(Ok(true)),
                 Ok(SweepOutcome::Quiescent) => return Poll::Ready(Ok(false)),
                 Ok(SweepOutcome::MadeProgress) => {
-                    // Continue sweeping — more work may be available.
+                    sweeps_this_poll += 1;
+                    // Check poll budget (0 = unlimited)
+                    if budget > 0 && sweeps_this_poll >= budget {
+                        // Budget exhausted — self-notify so we get re-polled,
+                        // then yield to let other executors run.
+                        self.wake_handle.register_waker(cx.waker());
+                        self.wake_handle.notify();
+                        return Poll::Pending;
+                    }
                     continue;
                 }
                 Ok(SweepOutcome::Idle) => {
-                    // No progress this sweep. Continue sweeping until
-                    // quiescence threshold is reached.
+                    sweeps_this_poll += 1;
+                    if budget > 0 && sweeps_this_poll >= budget {
+                        self.wake_handle.register_waker(cx.waker());
+                        self.wake_handle.notify();
+                        return Poll::Pending;
+                    }
                     continue;
                 }
                 Ok(SweepOutcome::WaitingForInput) => {
@@ -957,7 +993,7 @@ mod tests {
             in_queue: vec![true],
             done: vec![false],
             index_to_pos: vec![0],
-            config: ExecutorConfig { max_activations_per_step: 10, max_idle_sweeps: 3 },
+            config: ExecutorConfig { max_activations_per_step: 10, max_idle_sweeps: 3, max_sweeps_per_poll: 0 },
             cancel: CancellationToken::new(),
         progress_tracker: None,
             notificators: Vec::new(),
@@ -1250,6 +1286,7 @@ mod tests {
             config: ExecutorConfig {
                 max_activations_per_step: 1024,
                 max_idle_sweeps: 1, // reach idle threshold quickly
+                max_sweeps_per_poll: 0, // no budget limit for this test
             },
             cancel: CancellationToken::new(),
             progress_tracker: None,
@@ -1314,6 +1351,7 @@ mod tests {
             config: ExecutorConfig {
                 max_activations_per_step: 1024,
                 max_idle_sweeps: 1,
+                max_sweeps_per_poll: 0,
             },
             cancel: CancellationToken::new(),
             progress_tracker: None,
@@ -1474,5 +1512,115 @@ mod tests {
         // Pull from non-full channel — should NOT notify
         let _ = pull.pull();
         assert!(!wake.take_notification());
+    }
+
+    #[test]
+    fn poll_budget_yields_after_max_sweeps() {
+        // A CPU-active dataflow (operator always makes progress) should yield
+        // after max_sweeps_per_poll sweeps, returning Pending and self-notifying
+        // so it gets re-polled later.
+        use std::task::{Context, Wake};
+
+        struct NoopWaker;
+        impl Wake for NoopWaker {
+            fn wake(self: std::sync::Arc<Self>) {}
+        }
+
+        let waker: std::task::Waker = std::sync::Arc::new(NoopWaker).into();
+        let mut cx = Context::from_waker(&waker);
+
+        let wake_handle = WakeHandle::new();
+        let budget = 4;
+
+        let mut executor = DataflowExecutor::<u64> {
+            operators: vec![Box::new(CountingOperator {
+                name: "busy".to_string(),
+                index: 0,
+                region_id: crate::dataflow::region::RegionId(0),
+                remaining: 100, // way more than budget
+            })],
+            ready_queue: std::collections::VecDeque::from(vec![0]),
+            in_queue: vec![true],
+            done: vec![false],
+            index_to_pos: vec![0],
+            config: ExecutorConfig {
+                max_activations_per_step: 1024,
+                max_idle_sweeps: 3,
+                max_sweeps_per_poll: budget,
+            },
+            cancel: CancellationToken::new(),
+            progress_tracker: None,
+            notificators: Vec::new(),
+            probes: Vec::new(),
+            external_inputs_open: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            wake_handle: wake_handle.clone(),
+            consecutive_idle: 0,
+            _phantom: std::marker::PhantomData::<u64>,
+        };
+
+        // First poll: should yield after `budget` sweeps (Pending, not Ready)
+        let result = executor.poll_run(&mut cx);
+        assert!(
+            result.is_pending(),
+            "Expected Pending after budget exhaustion, got {:?}",
+            result
+        );
+
+        // WakeHandle should have been self-notified so the executor gets re-polled
+        assert!(
+            wake_handle.take_notification(),
+            "Expected self-notification after budget exhaustion"
+        );
+
+        // The operator should still have remaining work (not fully consumed)
+        assert!(!executor.operators[0].is_done());
+    }
+
+    #[test]
+    fn poll_budget_zero_means_unlimited() {
+        // With max_sweeps_per_poll = 0, the executor should run to completion
+        // without yielding, regardless of how many sweeps it takes.
+        use std::task::{Context, Poll, Wake};
+
+        struct NoopWaker;
+        impl Wake for NoopWaker {
+            fn wake(self: std::sync::Arc<Self>) {}
+        }
+
+        let waker: std::task::Waker = std::sync::Arc::new(NoopWaker).into();
+        let mut cx = Context::from_waker(&waker);
+
+        let mut executor = DataflowExecutor::<u64> {
+            operators: vec![Box::new(CountingOperator {
+                name: "busy".to_string(),
+                index: 0,
+                region_id: crate::dataflow::region::RegionId(0),
+                remaining: 50,
+            })],
+            ready_queue: std::collections::VecDeque::from(vec![0]),
+            in_queue: vec![true],
+            done: vec![false],
+            index_to_pos: vec![0],
+            config: ExecutorConfig {
+                max_activations_per_step: 1024,
+                max_idle_sweeps: 3,
+                max_sweeps_per_poll: 0, // unlimited
+            },
+            cancel: CancellationToken::new(),
+            progress_tracker: None,
+            notificators: Vec::new(),
+            probes: Vec::new(),
+            external_inputs_open: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            wake_handle: WakeHandle::new(),
+            consecutive_idle: 0,
+            _phantom: std::marker::PhantomData::<u64>,
+        };
+
+        // Should run to completion without yielding
+        let result = executor.poll_run(&mut cx);
+        match result {
+            Poll::Ready(Ok(true)) => {} // expected — completed
+            other => panic!("Expected Ready(Ok(true)), got {:?}", other),
+        }
     }
 }

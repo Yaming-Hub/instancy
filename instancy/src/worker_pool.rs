@@ -19,6 +19,7 @@ use std::time::{Duration, Instant};
 
 use crossbeam_deque::{Injector, Steal};
 
+use crate::executor_task::{ExecutorRegistry, PoolWaker};
 use crate::worker::OperatorActivation;
 
 /// Configuration for the worker thread pool.
@@ -72,10 +73,11 @@ impl WorkerPoolConfig {
 
 /// Shared state for the worker thread pool.
 struct PoolState {
-    /// The global task injector queue.
+    /// The global task injector queue (one-shot closures).
     injector: Injector<OperatorActivation>,
-    /// Condition variable for parking idle threads.
-    park_condvar: Condvar,
+    /// Condition variable for parking idle threads. Arc-wrapped so the
+    /// executor registry can share it for unified wake/park.
+    park_condvar: Arc<Condvar>,
     /// Mutex paired with the condvar (only used for waiting, not data protection).
     park_mutex: Mutex<()>,
     /// Current number of active (non-idle) threads.
@@ -90,13 +92,17 @@ struct PoolState {
     tasks_completed: AtomicUsize,
     /// Pool configuration.
     config: WorkerPoolConfig,
+    /// Optional executor registry for cooperative polling of dataflow futures.
+    /// When set, worker threads also poll executor tasks from this registry's
+    /// ready queue alongside one-shot tasks from the injector.
+    executor_registry: Mutex<Option<Arc<ExecutorRegistry>>>,
 }
 
 impl PoolState {
     fn new(config: WorkerPoolConfig) -> Self {
         Self {
             injector: Injector::new(),
-            park_condvar: Condvar::new(),
+            park_condvar: Arc::new(Condvar::new()),
             park_mutex: Mutex::new(()),
             active_count: AtomicUsize::new(0),
             thread_count: AtomicUsize::new(0),
@@ -104,6 +110,7 @@ impl PoolState {
             tasks_submitted: AtomicUsize::new(0),
             tasks_completed: AtomicUsize::new(0),
             config,
+            executor_registry: Mutex::new(None),
         }
     }
 }
@@ -156,8 +163,14 @@ impl WorkerPool {
     /// Shut down the pool, waiting for all threads to complete.
     pub fn shutdown(&self) {
         self.state.shutdown.store(true, Ordering::SeqCst);
-        // Wake all parked threads so they see the shutdown flag
-        self.state.park_condvar.notify_all();
+        // Wake all parked threads so they see the shutdown flag.
+        // Hold the mutex briefly to avoid the race where a thread is between
+        // lock() and wait_timeout() — without the mutex, notify_all can fire
+        // before the thread enters the wait, causing it to miss the signal.
+        {
+            let _guard = self.state.park_mutex.lock().unwrap();
+            self.state.park_condvar.notify_all();
+        }
 
         let mut threads = self.threads.lock().unwrap();
         for handle in threads.drain(..) {
@@ -188,6 +201,30 @@ impl WorkerPool {
     /// Returns true if the pool is in shutdown mode.
     pub fn is_shutdown(&self) -> bool {
         self.state.shutdown.load(Ordering::Relaxed)
+    }
+
+    /// Create an [`ExecutorRegistry`] wired to this pool's condvar, set it
+    /// as this pool's registry, and return a shared reference.
+    ///
+    /// Worker threads will begin polling executor tasks from the registry's
+    /// ready queue alongside one-shot tasks from the injector.
+    ///
+    /// Panics if a registry is already set (call only once per pool).
+    pub fn create_registry(&self) -> Arc<ExecutorRegistry> {
+        let mut guard = self.state.executor_registry.lock().unwrap();
+        assert!(
+            guard.is_none(),
+            "ExecutorRegistry already set for this pool"
+        );
+        // Share the pool's condvar so executor wakeups unpark worker threads.
+        let registry = Arc::new(ExecutorRegistry::new(Arc::clone(&self.state.park_condvar)));
+        *guard = Some(Arc::clone(&registry));
+        registry
+    }
+
+    /// Get the executor registry, if one has been created.
+    pub fn registry(&self) -> Option<Arc<ExecutorRegistry>> {
+        self.state.executor_registry.lock().unwrap().clone()
     }
 
     /// Attempt to spawn a new worker thread, atomically reserving a slot.
@@ -244,6 +281,11 @@ impl Drop for WorkerPool {
 }
 
 /// The main loop for each worker thread.
+///
+/// Tries work in priority order:
+/// 1. One-shot tasks from the global injector queue
+/// 2. Executor tasks from the registry's ready queue (if registry is set)
+///
 /// On exit, decrements `thread_count`.
 fn worker_thread_loop(state: &PoolState) {
     // Ensure thread_count is decremented when this thread exits, regardless of path.
@@ -263,7 +305,7 @@ fn worker_thread_loop(state: &PoolState) {
             return;
         }
 
-        // Try to steal a task from the global queue
+        // Priority 1: Try one-shot tasks from the global injector queue
         match state.injector.steal() {
             Steal::Success(task) => {
                 idle_cycles = 0;
@@ -285,7 +327,55 @@ fn worker_thread_loop(state: &PoolState) {
             Steal::Empty | Steal::Retry => {}
         }
 
-        // No task available — idle strategy
+        // Priority 2: Try executor tasks from the registry's ready queue
+        if let Some(registry) = state.executor_registry.lock().unwrap().as_ref().cloned() {
+            if let Some(task) = registry.dequeue() {
+                if task.try_start_poll() {
+                    idle_cycles = 0;
+                    state.active_count.fetch_add(1, Ordering::Relaxed);
+
+                    // Create a PoolWaker so the executor's WakeHandle can
+                    // re-enqueue this task when channels push data.
+                    let pool_waker = Arc::new(PoolWaker::new(
+                        Arc::clone(&task),
+                        Arc::clone(&registry),
+                    ));
+                    let waker: std::task::Waker = pool_waker.into();
+                    let mut cx = std::task::Context::from_waker(&waker);
+
+                    // Poll with panic safety
+                    let result = std::panic::catch_unwind(
+                        std::panic::AssertUnwindSafe(|| task.poll(&mut cx)),
+                    );
+
+                    state.active_count.fetch_sub(1, Ordering::Relaxed);
+
+                    match result {
+                        Ok(outcome) => {
+                            use crate::executor_task::PollOutcome;
+                            if outcome == PollOutcome::PendingNeedsReenqueue {
+                                // A wake arrived during our poll: PoolWaker set
+                                // POLLING→QUEUED but couldn't enqueue. We are
+                                // the sole thread responsible for re-enqueuing.
+                                registry.enqueue(Arc::clone(&task));
+                            }
+                            // Completed: task is DONE, notifier fired.
+                            // Pending: task is IDLE, future wakes handle re-enqueue.
+                        }
+                        Err(_panic) => {
+                            // Executor panicked. PanicGuard transitions to DONE,
+                            // drops the future (breaking Arc cycles), and takes
+                            // the notifier (whose Drop fires the error path).
+                        }
+                    }
+                    continue;
+                }
+                // try_start_poll failed — task was already claimed or done.
+                // Fall through to idle strategy.
+            }
+        }
+
+        // No work available — idle strategy
         idle_cycles = idle_cycles.saturating_add(1);
 
         if idle_cycles < state.config.spin_limit {
@@ -296,9 +386,24 @@ fn worker_thread_loop(state: &PoolState) {
             thread::yield_now();
         } else {
             // Phase 3: park on condvar
+            // Re-check shutdown before parking (avoids missing a notify_all
+            // that fired while we were in the spin/yield phase).
+            if state.shutdown.load(Ordering::Relaxed) {
+                return;
+            }
+
             let parked_at = Instant::now();
 
             let guard = state.park_mutex.lock().unwrap();
+
+            // Re-check shutdown while holding park_mutex. shutdown() holds
+            // this same mutex during notify_all(), so if shutdown happened
+            // between our earlier check and this lock acquisition, we'll
+            // see it here (no lost wakeup possible).
+            if state.shutdown.load(Ordering::Acquire) {
+                return;
+            }
+
             let _result = state
                 .park_condvar
                 .wait_timeout(guard, state.config.idle_shutdown)
@@ -309,8 +414,16 @@ fn worker_thread_loop(state: &PoolState) {
                 return;
             }
 
-            // Re-check queue before deciding to exit (avoid lost wake-up starvation)
-            if !state.injector.is_empty() {
+            // Re-check queues before deciding to exit (avoid lost wake-up starvation)
+            let has_injector_work = !state.injector.is_empty();
+            let has_executor_work = state
+                .executor_registry
+                .lock()
+                .unwrap()
+                .as_ref()
+                .map_or(false, |r| !r.is_empty());
+
+            if has_injector_work || has_executor_work {
                 idle_cycles = 0;
                 continue;
             }
@@ -553,6 +666,89 @@ mod tests {
         thread::sleep(Duration::from_millis(200));
         // Threads should be parked, not burning CPU
         assert_eq!(pool.active_threads(), 0);
+        pool.shutdown();
+    }
+
+    #[test]
+    fn pool_polls_executor_tasks_to_completion() {
+        // Verify that pool worker threads poll executor tasks from the
+        // registry's ready queue and run them to completion.
+        use crate::runtime::DataflowCompletion;
+        use std::future::Future;
+        use std::pin::Pin;
+        use std::task::{Context, Poll};
+
+        struct CompletesOnFirstPoll;
+        impl Future for CompletesOnFirstPoll {
+            type Output = crate::error::Result<bool>;
+            fn poll(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Self::Output> {
+                Poll::Ready(Ok(true))
+            }
+        }
+
+        let config = WorkerPoolConfig {
+            min_threads: 1,
+            max_threads: 1,
+            idle_shutdown: Duration::from_secs(30),
+            spin_limit: 5,
+            yield_limit: 10,
+        };
+        let pool = WorkerPool::new(config).unwrap();
+        let registry = pool.create_registry();
+
+        let (completion, notifier) = DataflowCompletion::new();
+        registry.register(Box::pin(CompletesOnFirstPoll), notifier);
+
+        // Wait for completion
+        let result = completion.wait();
+        assert!(result.is_ok());
+        pool.shutdown();
+    }
+
+    #[test]
+    fn pool_polls_multiple_executors_cooperatively() {
+        // Two executor futures on a single-thread pool. Each counts down
+        // and yields on each poll. Both should complete.
+        use crate::runtime::DataflowCompletion;
+        use std::future::Future;
+        use std::pin::Pin;
+        use std::task::{Context, Poll};
+
+        struct CountdownFuture {
+            remaining: usize,
+        }
+        impl Future for CountdownFuture {
+            type Output = crate::error::Result<bool>;
+            fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+                if self.remaining <= 1 {
+                    return Poll::Ready(Ok(true));
+                }
+                self.remaining -= 1;
+                // Re-schedule via waker so the pool re-polls us
+                cx.waker().wake_by_ref();
+                Poll::Pending
+            }
+        }
+
+        let config = WorkerPoolConfig {
+            min_threads: 1,
+            max_threads: 1,
+            idle_shutdown: Duration::from_secs(30),
+            spin_limit: 5,
+            yield_limit: 10,
+        };
+        let pool = WorkerPool::new(config).unwrap();
+        let registry = pool.create_registry();
+
+        let (comp1, notifier1) = DataflowCompletion::new();
+        let (comp2, notifier2) = DataflowCompletion::new();
+
+        registry.register(Box::pin(CountdownFuture { remaining: 5 }), notifier1);
+        registry.register(Box::pin(CountdownFuture { remaining: 5 }), notifier2);
+
+        // Both should complete
+        assert!(comp1.wait().is_ok());
+        assert!(comp2.wait().is_ok());
         pool.shutdown();
     }
 }

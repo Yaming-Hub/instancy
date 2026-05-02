@@ -32,7 +32,6 @@ use crate::dataflow::executor::{DataflowExecutor, ExecutorConfig};
 use crate::error::{Error, Result};
 use crate::progress::timestamp::Timestamp;
 use crate::scheduler::policy::{PriorityWithAgingPolicy, SchedulePolicy};
-use crate::worker::OperatorActivation;
 use crate::worker_pool::{WorkerPool, WorkerPoolConfig};
 
 /// Configuration for creating a [`RuntimeHandle`].
@@ -89,6 +88,9 @@ pub struct RuntimeHandle {
     cancel: CancellationToken,
     /// Runtime name for diagnostics.
     name: String,
+    /// Executor registry for cooperative multiplexing of dataflow futures.
+    /// Created lazily on first run()/spawn() call.
+    registry: Arc<crate::executor_task::ExecutorRegistry>,
 }
 
 impl RuntimeHandle {
@@ -107,11 +109,13 @@ impl RuntimeHandle {
         };
         let worker_pool = WorkerPool::new(pool_config)
             .map_err(|e| crate::error::Error::Custom(e.to_string()))?;
+        let registry = worker_pool.create_registry();
         Ok(Self {
             worker_pool,
             _schedule_policy: config.schedule_policy,
             cancel: CancellationToken::new(),
             name: config.name,
+            registry,
         })
     }
 
@@ -159,15 +163,10 @@ impl RuntimeHandle {
     ///
     /// # Execution model
     ///
-    /// The entire `executor.run()` sweep loop executes as a single pool task.
-    /// True per-operator pool dispatch is deferred to a future PR once
-    /// readiness notification support is added to channels.
-    ///
-    /// # Panics
-    ///
-    /// Must not be called from within a worker pool thread of the same runtime —
-    /// the pool may have no free threads to execute the submitted task, causing
-    /// the dataflow to never start.
+    /// The executor is registered as an `ExecutorTask` in the pool's
+    /// `ExecutorRegistry`. Pool threads cooperatively poll the task via the
+    /// `poll_run()` future, yielding after each poll budget to allow other
+    /// dataflows to make progress on the same threads.
     ///
     /// # Errors
     ///
@@ -188,19 +187,13 @@ impl RuntimeHandle {
         }
 
         let cancel = self.cancel.child_token();
-        let mut executor = materialize_executor(dataflow, cancel)?;
+        let executor = materialize_executor(dataflow, cancel)?;
 
         let (completion, notifier) = DataflowCompletion::new();
 
-        self.worker_pool.submit(OperatorActivation::new(
-            crate::worker::WorkerId::new(0),
-            "dataflow-run",
-            0,
-            move || {
-                let result = executor.run();
-                notifier.complete(result);
-            },
-        ));
+        // Register the executor as a cooperative task. The pool's worker threads
+        // will poll it via the registry's ready queue.
+        self.registry.register(Box::pin(executor), notifier);
 
         Ok(completion)
     }
@@ -222,15 +215,10 @@ impl RuntimeHandle {
     ///
     /// # Execution model
     ///
-    /// The entire `executor.run()` sweep loop executes as a single pool task.
-    /// True per-operator pool dispatch is deferred to a future PR once
-    /// readiness notification support is added to channels.
-    ///
-    /// # Panics
-    ///
-    /// Must not be called from within a worker pool thread of the same runtime —
-    /// this will deadlock because the calling thread blocks while the pool has
-    /// no free threads to execute the submitted task.
+    /// The executor is registered as an `ExecutorTask` in the pool's
+    /// `ExecutorRegistry`. Pool threads cooperatively poll the task via
+    /// `poll_run()`, yielding after each poll budget to allow other
+    /// dataflows to make progress on the same threads.
     pub fn spawn<T: Timestamp>(
         &self,
         mut dataflow: LogicalDataflow<T>,
@@ -282,7 +270,7 @@ impl RuntimeHandle {
             output_receivers.push((info.name.clone(), info.type_name, receiver_any));
         }
 
-        // --- Materialize and submit to worker pool ---
+        // --- Materialize and register as cooperative task ---
         let mut executor = materialize_executor(dataflow, cancel)?;
 
         external_inputs_open.store(input_count, std::sync::atomic::Ordering::SeqCst);
@@ -290,15 +278,7 @@ impl RuntimeHandle {
 
         let (completion, notifier) = DataflowCompletion::new();
 
-        self.worker_pool.submit(OperatorActivation::new(
-            crate::worker::WorkerId::new(0),
-            format!("dataflow-{}", name),
-            0,
-            move || {
-                let result = executor.run();
-                notifier.complete(result);
-            },
-        ));
+        self.registry.register(Box::pin(executor), notifier);
 
         Ok(SpawnedDataflow {
             name,
@@ -540,14 +520,14 @@ struct SharedCompletionState {
 ///
 /// If dropped without calling [`complete()`](Self::complete) (e.g., due to
 /// a panic), the `Drop` impl publishes an error so the future never hangs.
-struct CompletionNotifier {
+pub struct CompletionNotifier {
     shared: Arc<Mutex<SharedCompletionState>>,
     condvar: Arc<Condvar>,
 }
 
 impl CompletionNotifier {
     /// Publish the executor result and wake any waiting future/condvar.
-    fn complete(self, result: Result<bool>) {
+    pub fn complete(self, result: Result<bool>) {
         {
             let mut state = self.shared.lock().unwrap();
             state.result = Some(result);
@@ -620,7 +600,7 @@ impl std::fmt::Debug for DataflowCompletion {
 
 impl DataflowCompletion {
     /// Create a new completion pair (future + notifier).
-    fn new() -> (Self, CompletionNotifier) {
+    pub fn new() -> (Self, CompletionNotifier) {
         let shared = Arc::new(Mutex::new(SharedCompletionState {
             result: None,
             waker: None,
@@ -849,6 +829,7 @@ fn materialize_executor<T: Timestamp>(
     let executor_config = ExecutorConfig {
         max_activations_per_step: 1024,
         max_idle_sweeps: 64,
+        max_sweeps_per_poll: 64,
     };
 
     let mut executor: DataflowExecutor<T> = DataflowExecutor::materialize(
