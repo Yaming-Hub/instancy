@@ -134,26 +134,37 @@ impl<T: Timestamp, D: Send + 'static> ExchangeChannelSet<T, D> {
     pub fn take_pair(
         &mut self,
         worker_idx: usize,
-    ) -> (Vec<BoundedPush<T, D, ()>>, Vec<BoundedPull<T, D, ()>>) {
+    ) -> Result<(Vec<BoundedPush<T, D, ()>>, Vec<BoundedPull<T, D, ()>>)> {
+        if worker_idx >= self.num_workers {
+            return Err(Error::Custom(format!(
+                "worker index {worker_idx} out of range (num_workers={})",
+                self.num_workers
+            )));
+        }
+
         // Take row of pushers: push_ends[worker_idx][*]
-        let pushers: Vec<BoundedPush<T, D, ()>> = (0..self.num_workers)
-            .map(|dst| {
-                self.push_ends[worker_idx][dst]
-                    .take()
-                    .expect("push end already taken")
-            })
-            .collect();
+        let mut pushers = Vec::with_capacity(self.num_workers);
+        for dst in 0..self.num_workers {
+            let push = self.push_ends[worker_idx][dst].take().ok_or_else(|| {
+                Error::Custom(format!(
+                    "push end [{worker_idx}][{dst}] already taken"
+                ))
+            })?;
+            pushers.push(push);
+        }
 
         // Take column of pullers: pull_ends[*][worker_idx]
-        let pullers: Vec<BoundedPull<T, D, ()>> = (0..self.num_workers)
-            .map(|src| {
-                self.pull_ends[src][worker_idx]
-                    .take()
-                    .expect("pull end already taken")
-            })
-            .collect();
+        let mut pullers = Vec::with_capacity(self.num_workers);
+        for src in 0..self.num_workers {
+            let pull = self.pull_ends[src][worker_idx].take().ok_or_else(|| {
+                Error::Custom(format!(
+                    "pull end [{src}][{worker_idx}] already taken"
+                ))
+            })?;
+            pullers.push(pull);
+        }
 
-        (pushers, pullers)
+        Ok((pushers, pullers))
     }
 }
 
@@ -226,10 +237,26 @@ impl<T: Timestamp, D: Clone + Send + 'static> Push<T, D> for ExchangePush<T, D> 
                 }
             }
             Payload::Control(signal) => {
-                // Broadcast control signals to ALL target workers.
+                // Control signals (watermarks, errors) MUST reach ALL targets
+                // to avoid progress deadlocks. Use try_push with retry to
+                // avoid partial delivery of control signals.
                 for (target_idx, target) in self.targets.iter_mut().enumerate() {
-                    target.push(Envelope::control(signal.clone()))?;
-                    self.wakes.wake(target_idx);
+                    // Retry loop: control signals are rare and small, so
+                    // spinning briefly is acceptable to ensure atomicity.
+                    loop {
+                        match target.try_push(Envelope::control(signal.clone())) {
+                            Ok(()) => {
+                                self.wakes.wake(target_idx);
+                                break;
+                            }
+                            Err((Error::Backpressure, _)) => {
+                                // Wake the target so it drains, then retry.
+                                self.wakes.wake(target_idx);
+                                std::thread::yield_now();
+                            }
+                            Err((err, _)) => return Err(err),
+                        }
+                    }
                 }
             }
         }
@@ -256,18 +283,29 @@ impl<T: Timestamp, D: Clone + Send + 'static> Push<T, D> for ExchangePush<T, D> 
                     buckets[target].push(record.clone());
                 }
 
-                // Pre-check: if any target is closed, fail immediately.
+                // Pre-check ALL targets: closed or insufficient capacity.
+                // This avoids partial delivery — we only push if all targets
+                // can accept their sub-batch.
                 for (target_idx, bucket) in buckets.iter().enumerate() {
-                    if !bucket.is_empty() && self.targets[target_idx].is_closed() {
+                    if bucket.is_empty() {
+                        continue;
+                    }
+                    if self.targets[target_idx].is_closed() {
                         return Err((Error::ChannelClosed, envelope));
+                    }
+                    let available = self.targets[target_idx].capacity()
+                        .saturating_sub(self.targets[target_idx].len());
+                    if available == 0 {
+                        return Err((Error::Backpressure, envelope));
                     }
                 }
 
-                // Push sub-batches. If a later target fails after earlier ones
-                // succeeded, we accept partial delivery — try_push callers
-                // should use push() for fully reliable delivery.
+                // All targets have capacity — push sub-batches.
                 for (target_idx, bucket) in buckets.into_iter().enumerate() {
                     if !bucket.is_empty() {
+                        // Pre-check passed, so this should succeed. If it
+                        // doesn't (e.g., concurrent access in future), we
+                        // accept partial delivery as a last resort.
                         match self.targets[target_idx].try_push(Envelope::data(
                             time.clone(),
                             bucket,
@@ -281,7 +319,18 @@ impl<T: Timestamp, D: Clone + Send + 'static> Push<T, D> for ExchangePush<T, D> 
                 }
             }
             Payload::Control(signal) => {
-                // Broadcast control to all targets.
+                // Pre-check: all targets must have capacity for control signal.
+                for target in self.targets.iter() {
+                    if target.is_closed() {
+                        return Err((Error::ChannelClosed, envelope));
+                    }
+                    let available = target.capacity().saturating_sub(target.len());
+                    if available == 0 {
+                        return Err((Error::Backpressure, envelope));
+                    }
+                }
+
+                // All targets ready — broadcast control signal.
                 for (target_idx, target) in self.targets.iter_mut().enumerate() {
                     match target.try_push(Envelope::control(signal.clone())) {
                         Ok(()) => self.wakes.wake(target_idx),
@@ -446,7 +495,13 @@ where
                         let (pushers, pullers) = channel_set
                             .lock()
                             .unwrap_or_else(|e| e.into_inner())
-                            .take_pair(ctx.worker_index());
+                            .take_pair(ctx.worker_index())
+                            .unwrap_or_else(|e| {
+                                // Materialization-time invariant: each worker's pair
+                                // is taken exactly once. This should never fail if
+                                // spawn_multi assigns one factory per worker correctly.
+                                panic!("exchange channel take_pair failed during materialization: {e}")
+                            });
 
                         let push = ExchangePush::new(pushers, exchange_fn.clone(), wakes.clone());
                         let pull = ExchangePull::new(pullers, wakes.clone());
@@ -497,11 +552,11 @@ mod tests {
     fn exchange_channel_set_take_pair() {
         let mut set = ExchangeChannelSet::<u64, i32>::new(2, 16);
 
-        let (pushers0, pullers0) = set.take_pair(0);
+        let (pushers0, pullers0) = set.take_pair(0).unwrap();
         assert_eq!(pushers0.len(), 2); // worker 0 pushes to 0 and 1
         assert_eq!(pullers0.len(), 2); // worker 0 pulls from 0 and 1
 
-        let (pushers1, pullers1) = set.take_pair(1);
+        let (pushers1, pullers1) = set.take_pair(1).unwrap();
         assert_eq!(pushers1.len(), 2);
         assert_eq!(pullers1.len(), 2);
     }
@@ -512,8 +567,8 @@ mod tests {
         let mut set = ExchangeChannelSet::<u64, i32>::new(2, 16);
         let wakes = Arc::new(SharedWakeRegistry::new(2));
 
-        let (pushers, _pullers0) = set.take_pair(0);
-        let (_pushers1, pullers1) = set.take_pair(1);
+        let (pushers, _pullers0) = set.take_pair(0).unwrap();
+        let (_pushers1, pullers1) = set.take_pair(1).unwrap();
 
         let exchange_fn = ExchangeFn::new("mod2", |x: &i32| *x as u64);
         let mut push = ExchangePush::new(pushers, exchange_fn, wakes.clone());
@@ -543,8 +598,8 @@ mod tests {
         let wakes = Arc::new(SharedWakeRegistry::new(2));
 
         // Both workers push some data to worker 0.
-        let (mut pushers0, pullers0) = set.take_pair(0);
-        let (mut pushers1, _pullers1) = set.take_pair(1);
+        let (mut pushers0, pullers0) = set.take_pair(0).unwrap();
+        let (mut pushers1, _pullers1) = set.take_pair(1).unwrap();
 
         // Worker 0 pushes to self (target 0).
         pushers0[0]
@@ -575,8 +630,8 @@ mod tests {
         let mut set = ExchangeChannelSet::<u64, i32>::new(2, 16);
         let wakes = Arc::new(SharedWakeRegistry::new(2));
 
-        let (pushers0, pullers0) = set.take_pair(0);
-        let (pushers1, _pullers1) = set.take_pair(1);
+        let (pushers0, pullers0) = set.take_pair(0).unwrap();
+        let (pushers1, _pullers1) = set.take_pair(1).unwrap();
 
         let exchange_fn = ExchangeFn::new("id", |x: &i32| *x as u64);
         let mut push0 = ExchangePush::new(pushers0, exchange_fn.clone(), wakes.clone());
@@ -597,7 +652,7 @@ mod tests {
         let mut set = ExchangeChannelSet::<u64, i32>::new(1, 1);
         let wakes = Arc::new(SharedWakeRegistry::new(1));
 
-        let (pushers, _pullers) = set.take_pair(0);
+        let (pushers, _pullers) = set.take_pair(0).unwrap();
         let exchange_fn = ExchangeFn::new("id", |x: &i32| *x as u64);
         let mut push = ExchangePush::new(pushers, exchange_fn, wakes);
 
@@ -618,8 +673,8 @@ mod tests {
         let mut set = ExchangeChannelSet::<u64, i32>::new(2, 16);
         let wakes = Arc::new(SharedWakeRegistry::new(2));
 
-        let (mut pushers0, pullers0) = set.take_pair(0);
-        let (mut pushers1, _pullers1) = set.take_pair(1);
+        let (mut pushers0, pullers0) = set.take_pair(0).unwrap();
+        let (mut pushers1, _pullers1) = set.take_pair(1).unwrap();
 
         // Both workers send to worker 0.
         pushers0[0]

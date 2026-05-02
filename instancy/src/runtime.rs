@@ -535,15 +535,22 @@ impl RuntimeHandle {
             // topology, so worker 0's creators are representative).
             let creators = std::mem::take(&mut dataflows[0].exchange_creators);
             for (edge_idx, creator) in creators {
-                let mut shared_factories = creator(num_workers, 1024);
-                for df in dataflows.iter_mut() {
-                    if let Some(pos) = df
+                let shared_factories = creator(num_workers, 1024);
+                if shared_factories.len() != num_workers {
+                    return Err(Error::Custom(format!(
+                        "exchange factory creator for edge {edge_idx} produced {} factories, expected {num_workers}",
+                        shared_factories.len()
+                    )));
+                }
+                for (worker_idx, factory) in shared_factories.into_iter().enumerate() {
+                    let pos = dataflows[worker_idx]
                         .channel_factories
                         .iter()
                         .position(|(idx, _)| *idx == edge_idx)
-                    {
-                        df.channel_factories[pos].1 = shared_factories.remove(0);
-                    }
+                        .ok_or_else(|| Error::Custom(format!(
+                            "exchange edge {edge_idx} not found in worker {worker_idx}'s channel factories"
+                        )))?;
+                    dataflows[worker_idx].channel_factories[pos].1 = factory;
                 }
             }
             // Drain unused exchange_creators from other workers.
@@ -859,15 +866,22 @@ impl SimpleRuntime {
         if num_workers > 1 {
             let creators = std::mem::take(&mut dataflows[0].exchange_creators);
             for (edge_idx, creator) in creators {
-                let mut shared_factories = creator(num_workers, 1024);
-                for df in dataflows.iter_mut() {
-                    if let Some(pos) = df
+                let shared_factories = creator(num_workers, 1024);
+                if shared_factories.len() != num_workers {
+                    return Err(Error::Custom(format!(
+                        "exchange factory creator for edge {edge_idx} produced {} factories, expected {num_workers}",
+                        shared_factories.len()
+                    )));
+                }
+                for (worker_idx, factory) in shared_factories.into_iter().enumerate() {
+                    let pos = dataflows[worker_idx]
                         .channel_factories
                         .iter()
                         .position(|(idx, _)| *idx == edge_idx)
-                    {
-                        df.channel_factories[pos].1 = shared_factories.remove(0);
-                    }
+                        .ok_or_else(|| Error::Custom(format!(
+                            "exchange edge {edge_idx} not found in worker {worker_idx}'s channel factories"
+                        )))?;
+                    dataflows[worker_idx].channel_factories[pos].1 = factory;
                 }
             }
             for df in dataflows.iter_mut().skip(1) {
