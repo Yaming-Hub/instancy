@@ -883,33 +883,95 @@ PR23 (RuntimeHandle + SchedulePolicy — multi-cluster isolation, priority sched
 
 ## Next PRs (Builder API Completeness)
 
-### PR 25 — Unary operator in builder + stream chaining
-**Goal**: Enable transformation pipelines (source → map → filter → sink).
+### Architecture Decision: Separated Builder + Runtime (ADR-001)
 
-- Add `BuildContext::add_unary(name, source_idx, closure)` — 1 input, 1 output
-- Closure signature: `FnMut(T, Vec<D>) -> Vec<D2>`
-- Wire into subgraph builder with proper edges + progress
-- Tests: map, filter, multi-stage pipeline
+**Decision**: Adopt a two-phase design where logical graph construction is fully
+separated from physical execution. The old `build_and_run` closure pattern is replaced
+with a standalone `DataflowBuilder` that produces a `LogicalDataflow`, which is then
+submitted to a `Runtime` for async execution.
 
-### PR 26 — Binary operator + concat in builder
-**Goal**: Multi-input operators.
+**Target API:**
+```rust
+// Phase 1: Build logical dataflow (pure, no runtime)
+let mut builder = DataflowBuilder::<u64>::new("pipeline");
+let input = builder.input::<i32>("numbers");
+let output = input
+    .map("double", |_t, x| x * 2)
+    .filter("div_by_3", |_t, x| x % 3 == 0)
+    .map("describe", |_t, x| format!("{x}"))
+    .output::<String>("results");
+let dataflow = builder.build();
 
-- `BuildContext::add_binary(name, left_idx, right_idx, closure)`
-- `BuildContext::add_concat(name, sources: &[usize])`
+// Phase 2: Execute with runtime (async, connects physical I/O)
+let runtime = Runtime::new(RuntimeConfig::default());
+let mut handle = runtime.spawn(dataflow).await?;
+
+// Phase 3: Feed data and collect results via async streams
+handle.input("numbers").send(0u64, vec![1,2,3,4,5]).await?;
+handle.input("numbers").close().await?;
+while let Some((time, batch)) = handle.output("results").recv().await {
+    println!("t={time}: {batch:?}");
+}
+```
+
+**Benefits:**
+- Type-safe stream chaining (compile-time connection validation)
+- Logical graph is inspectable/testable without a runtime
+- Same `LogicalDataflow` can run on different runtimes/configs
+- Async-native I/O (no closure wrapping)
+- Clean separation: graph construction ≠ execution ≠ I/O
+
+---
+
+### PR 25 — DataflowBuilder + Stream chaining + Materializer
+
+**Goal**: Replace closure-based `build_and_run` with separated builder/runtime.
+
+**Phase A — DataflowBuilder + Stream:**
+- `DataflowBuilder<T>`: allocates operators, tracks edges, stores factories
+- `Stream<'a, T, D>`: typed handle borrowing the builder, provides chaining:
+  - `.map(name, FnMut(T, D) -> D2)` → returns `Stream<T, D2>`
+  - `.filter(name, FnMut(&T, &D) -> bool)` → returns `Stream<T, D>`
+  - `.unary(name, FnMut(InputHandle, OutputHandle) -> Result<()>)` → general unary
+  - `.output(name)` → declares logical output port
+- `builder.input::<D>(name)` → declares logical input, returns `Stream<T, D>`
+- `builder.build()` → produces `LogicalDataflow<T>`
+
+**Phase B — Materializer:**
+- `LogicalDataflow::materialize(config, cancel) -> DataflowExecutor`
+- Extract existing materialization logic from `build_and_run_with_cancel`
+- Operator/channel factories remain internal to LogicalDataflow
+
+**Phase C — Async Runtime integration:**
+- `Runtime::spawn(dataflow) -> DataflowHandle`
+- `DataflowHandle.input(name) -> InputSender<T, D>` (async mpsc)
+- `DataflowHandle.output(name) -> OutputReceiver<T, D>` (async mpsc)
+- `DataflowHandle.cancel()`, `.await` (completion)
+
+**Phase D — Cleanup:**
+- Remove old `build_and_run` / `BuildContext` (or deprecate)
+- Update all examples to new API
+
+### PR 26 — Binary operator + concat via Stream
+**Goal**: Multi-input operators in the new Stream API.
+
+- `stream1.binary(stream2, name, logic)` → merges two streams
+- `Stream::concat([s1, s2, s3])` → merge multiple streams
 - Tests: join-like logic, merging streams
 
-### PR 27 — Feedback/loop operator in builder
-**Goal**: Iterative computation.
+### PR 27 — Feedback/loop operator via Stream
+**Goal**: Iterative computation in the new Stream API.
 
-- `BuildContext::add_feedback(name, body_closure, max_iterations)`
+- `builder.loop_scope(|scope| { ... })` → nested timestamp scope
+- `stream.connect_loop(handle)` → feedback edge
 - Product timestamps for nested scope
 - Tests: iterative convergence
 
-### PR 28 — Wire RuntimeHandle to execute dataflows
-**Goal**: `RuntimeHandle::execute(spec)` → DataflowHandle.
+### PR 28 — Wire RuntimeHandle to Runtime
+**Goal**: Full runtime integration with SchedulePolicy.
 
-- Integrate SchedulePolicy into task dispatch
-- RuntimeHandle::execute() submits dataflow to worker pool
+- Integrate SchedulePolicy into worker dispatch
+- RuntimeHandle wraps Runtime for lifecycle management
 - DataflowHandle for completion/cancellation
 - Tests: runtime executes dataflow end-to-end
 
@@ -917,7 +979,7 @@ PR23 (RuntimeHandle + SchedulePolicy — multi-cluster isolation, priority sched
 
 ## Future: Migrate timely-dataflow Examples to instancy
 
-Once the builder API supports unary, binary, loop, and exchange operators,
+Once the Stream chaining API supports unary, binary, loop, and exchange operators,
 migrate the key timely-dataflow examples to demonstrate equivalent functionality:
 
 | timely example | instancy equivalent | Requires |

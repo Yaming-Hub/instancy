@@ -6,6 +6,7 @@
 
 pub mod builder;
 pub mod channels;
+pub mod dataflow_builder;
 pub mod executor;
 pub mod graph;
 pub mod id;
@@ -20,6 +21,7 @@ pub mod wired_operators;
 
 pub use builder::{build_and_run, build_and_run_with_cancel, BuildContext, BuilderConfig};
 pub use channels::{ControlSignal, Envelope, PartitionStrategy, Payload};
+pub use dataflow_builder::{DataflowBuilder, DataflowBuilderConfig, LogicalDataflow, OutputPort, Stream};
 pub use executor::{DataflowExecutor, ExecutorConfig};
 pub use graph::{DataflowGraph, EdgeInfo, OperatorInfo};
 pub use id::DataflowId;
