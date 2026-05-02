@@ -1059,4 +1059,18 @@ mod tests {
         let graph = DataflowGraph::new();
         assert!(!graph.has_exchange_edges());
     }
+
+    #[test]
+    fn has_exchange_edges_true_for_feedback_exchange() {
+        let r = make_region();
+        let mut graph = DataflowGraph::new();
+        graph.register_operator(OperatorInfo::new(0, "loop_body", r, 1, 1)).unwrap();
+        graph.add_feedback_edge(EdgeInfo::exchange(
+            Slot::new(0, 0),
+            Slot::new(0, 0),
+            r,
+            r,
+        ));
+        assert!(graph.has_exchange_edges());
+    }
 }
