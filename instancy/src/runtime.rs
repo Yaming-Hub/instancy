@@ -294,7 +294,7 @@ impl RuntimeHandle {
             Vec::new();
         let input_count = dataflow.input_port_wiring.len();
 
-        for (info, wiring) in dataflow
+        for (info, mut wiring) in dataflow
             .input_ports
             .iter()
             .zip(dataflow.input_port_wiring.drain(..))
@@ -311,7 +311,7 @@ impl RuntimeHandle {
         let mut output_receivers: Vec<(String, &'static str, Box<dyn std::any::Any + Send>)> =
             Vec::new();
 
-        for (info, wiring) in dataflow
+        for (info, mut wiring) in dataflow
             .output_ports
             .iter()
             .zip(dataflow.output_port_wiring.drain(..))
@@ -508,7 +508,7 @@ impl SimpleRuntime {
             Vec::new();
         let input_count = dataflow.input_port_wiring.len();
 
-        for (info, wiring) in dataflow
+        for (info, mut wiring) in dataflow
             .input_ports
             .iter()
             .zip(dataflow.input_port_wiring.drain(..))
@@ -525,7 +525,7 @@ impl SimpleRuntime {
         let mut output_receivers: Vec<(String, &'static str, Box<dyn std::any::Any + Send>)> =
             Vec::new();
 
-        for (info, wiring) in dataflow
+        for (info, mut wiring) in dataflow
             .output_ports
             .iter()
             .zip(dataflow.output_port_wiring.drain(..))

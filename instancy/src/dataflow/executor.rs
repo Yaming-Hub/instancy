@@ -188,11 +188,11 @@ impl<T: Timestamp> DataflowExecutor<T> {
         let wake_handle = external_wake_handle.unwrap_or_else(WakeHandle::new);
 
         for edge_idx in 0..total_edge_count {
-            let factory = factory_map.remove(&edge_idx).ok_or_else(|| {
+            let mut factory = factory_map.remove(&edge_idx).ok_or_else(|| {
                 Error::Custom(format!("No channel factory for edge index {edge_idx}"))
             })?;
             let capacity = 1024; // TODO: make configurable per edge
-            let (push, pull) = factory(capacity, Some(wake_handle.clone()));
+            let (push, pull) = factory.build(capacity, Some(wake_handle.clone()));
             push_ends.push(Some(push));
             pull_ends.push(Some(pull));
         }
@@ -252,7 +252,7 @@ impl<T: Timestamp> DataflowExecutor<T> {
             .unwrap_or(0);
         index_to_pos.resize(max_index + 1, usize::MAX);
 
-        for (op_idx, factory) in operator_factories {
+        for (op_idx, mut factory) in operator_factories {
             // Collect input pullers sorted by port index.
             let mut inputs = op_input_pullers.remove(&op_idx).unwrap_or_default();
             inputs.sort_by_key(|(port, _)| *port);
@@ -270,7 +270,7 @@ impl<T: Timestamp> DataflowExecutor<T> {
                 output_pushers,
             };
 
-            let operator = factory(endpoints);
+            let operator = factory.build(endpoints);
             let pos = operators.len();
             if op_idx < index_to_pos.len() {
                 index_to_pos[op_idx] = pos;

@@ -94,10 +94,120 @@ pub trait SchedulableOperator: Send {
 /// Stored during the build phase (when concrete types are known) and invoked
 /// during materialization (when channels have been allocated).
 ///
-/// The `ChannelEndpoints` argument provides the operator's input pullers and
-/// output pushers as type-erased `Box<dyn Any>` values. The factory downcasts
-/// them to the concrete channel types.
-pub type OperatorFactory = Box<dyn FnOnce(ChannelEndpoints) -> Box<dyn SchedulableOperator> + Send>;
+/// # Single-worker vs. multi-worker
+///
+/// For single-worker dataflows, `build()` is called exactly once. For
+/// multi-worker dataflows, `build()` is called N times (once per worker),
+/// each time with fresh channel endpoints. Implementations must produce
+/// independent operator instances on each call.
+///
+/// Use [`SingleUseFactory`] for closures that can only be invoked once
+/// (backward-compatible with existing `FnOnce` factories). Use
+/// [`ReplayableFactory`] for multi-worker-capable factories.
+pub trait OperatorBlueprint: Send {
+    /// Create a wired operator instance for the given worker.
+    ///
+    /// `endpoints` provides the input pullers and output pushers allocated
+    /// for this worker's copy of the operator.
+    fn build(&mut self, endpoints: ChannelEndpoints) -> Box<dyn SchedulableOperator>;
+
+    /// Whether this blueprint can produce multiple operator instances.
+    ///
+    /// Returns `false` for single-use factories (will panic on second `build()`).
+    /// Returns `true` for replayable factories.
+    fn is_replayable(&self) -> bool;
+}
+
+/// Type alias for a boxed operator blueprint.
+pub type OperatorFactory = Box<dyn OperatorBlueprint>;
+
+/// Create an [`OperatorFactory`] from a single-use `FnOnce` closure.
+///
+/// This is the primary way to create operator factories in builder methods.
+/// The resulting factory can be called exactly once during materialization.
+pub fn single_use_factory(
+    f: impl FnOnce(ChannelEndpoints) -> Box<dyn SchedulableOperator> + Send + 'static,
+) -> OperatorFactory {
+    Box::new(SingleUseFactory(Some(Box::new(f))))
+}
+
+/// A single-use operator factory wrapping a `FnOnce` closure.
+///
+/// This is the default for all current builder methods. It can produce
+/// exactly one operator instance. Calling `build()` a second time panics.
+pub struct SingleUseFactory(
+    Option<Box<dyn FnOnce(ChannelEndpoints) -> Box<dyn SchedulableOperator> + Send>>,
+);
+
+impl SingleUseFactory {
+    /// Create a new single-use factory from a `FnOnce` closure.
+    pub fn new(
+        factory: impl FnOnce(ChannelEndpoints) -> Box<dyn SchedulableOperator> + Send + 'static,
+    ) -> Self {
+        Self(Some(Box::new(factory)))
+    }
+
+    /// Box this factory as an [`OperatorFactory`].
+    pub fn boxed(self) -> OperatorFactory {
+        Box::new(self)
+    }
+}
+
+impl OperatorBlueprint for SingleUseFactory {
+    fn build(&mut self, endpoints: ChannelEndpoints) -> Box<dyn SchedulableOperator> {
+        let factory = self
+            .0
+            .take()
+            .expect("SingleUseFactory::build() called more than once");
+        factory(endpoints)
+    }
+
+    fn is_replayable(&self) -> bool {
+        false
+    }
+}
+
+/// A replayable operator factory that can produce multiple independent instances.
+///
+/// Wraps a `FnMut` that creates a fresh operator on each `build()` call.
+/// Used for multi-worker dataflows where each worker needs its own operator.
+///
+/// # Example
+///
+/// ```ignore
+/// ReplayableFactory::new(move |endpoints| {
+///     // Create fresh state for this worker
+///     let logic = logic_factory();
+///     Box::new(WiredUnaryOperator::new(name, idx, region, logic, ...))
+/// })
+/// ```
+pub struct ReplayableFactory(
+    Box<dyn FnMut(ChannelEndpoints) -> Box<dyn SchedulableOperator> + Send>,
+);
+
+impl ReplayableFactory {
+    /// Create a new replayable factory from a `FnMut` closure.
+    pub fn new(
+        factory: impl FnMut(ChannelEndpoints) -> Box<dyn SchedulableOperator> + Send + 'static,
+    ) -> Self {
+        Self(Box::new(factory))
+    }
+
+    /// Box this factory as an [`OperatorFactory`].
+    pub fn boxed(self) -> OperatorFactory {
+        Box::new(self)
+    }
+}
+
+impl OperatorBlueprint for ReplayableFactory {
+    fn build(&mut self, endpoints: ChannelEndpoints) -> Box<dyn SchedulableOperator> {
+        (self.0)(endpoints)
+    }
+
+    fn is_replayable(&self) -> bool {
+        true
+    }
+}
 
 /// Channel endpoints provided to an operator factory during materialization.
 ///
@@ -142,7 +252,7 @@ pub struct EdgeTypeInfo {
     pub metadata_type_id: std::any::TypeId,
 }
 
-/// A factory that creates a typed channel pair for an edge.
+/// A blueprint that creates a typed channel pair for an edge.
 ///
 /// Takes `(capacity, wake_handle)` where:
 /// - `capacity` is the channel buffer size
@@ -152,4 +262,72 @@ pub struct EdgeTypeInfo {
 ///
 /// Returns `(Box<dyn Any + Send>, Box<dyn Any + Send>)` where the first
 /// element is a `Box<dyn Push<T, D, M>>` and the second is a `Box<dyn Pull<T, D, M>>`.
-pub type ChannelFactory = Box<dyn FnOnce(usize, Option<crate::dataflow::channels::wake::WakeHandle>) -> (Box<dyn std::any::Any + Send>, Box<dyn std::any::Any + Send>) + Send>;
+///
+/// Channel factories are inherently replayable — they create fresh channel
+/// pairs from configuration (capacity) without consuming state.
+pub trait ChannelBlueprint: Send {
+    /// Create a channel pair for the given capacity and wake handle.
+    fn build(
+        &mut self,
+        capacity: usize,
+        wake_handle: Option<crate::dataflow::channels::wake::WakeHandle>,
+    ) -> (Box<dyn std::any::Any + Send>, Box<dyn std::any::Any + Send>);
+}
+
+/// Type alias for a boxed channel blueprint.
+pub type ChannelFactory = Box<dyn ChannelBlueprint>;
+
+/// Create a [`ChannelFactory`] from a closure.
+///
+/// Channel factories are inherently replayable (they only capture
+/// configuration like capacity).
+pub fn channel_factory(
+    f: impl FnMut(
+            usize,
+            Option<crate::dataflow::channels::wake::WakeHandle>,
+        ) -> (Box<dyn std::any::Any + Send>, Box<dyn std::any::Any + Send>)
+        + Send
+        + 'static,
+) -> ChannelFactory {
+    Box::new(ChannelBlueprintFn(Box::new(f)))
+}
+
+/// Wraps a `FnMut` as a [`ChannelBlueprint`].
+pub struct ChannelBlueprintFn(
+    Box<
+        dyn FnMut(
+                usize,
+                Option<crate::dataflow::channels::wake::WakeHandle>,
+            ) -> (Box<dyn std::any::Any + Send>, Box<dyn std::any::Any + Send>)
+            + Send,
+    >,
+);
+
+impl ChannelBlueprintFn {
+    /// Create a new channel blueprint from a closure.
+    pub fn new(
+        factory: impl FnMut(
+                usize,
+                Option<crate::dataflow::channels::wake::WakeHandle>,
+            ) -> (Box<dyn std::any::Any + Send>, Box<dyn std::any::Any + Send>)
+            + Send
+            + 'static,
+    ) -> Self {
+        Self(Box::new(factory))
+    }
+
+    /// Box this blueprint as a [`ChannelFactory`].
+    pub fn boxed(self) -> ChannelFactory {
+        Box::new(self)
+    }
+}
+
+impl ChannelBlueprint for ChannelBlueprintFn {
+    fn build(
+        &mut self,
+        capacity: usize,
+        wake_handle: Option<crate::dataflow::channels::wake::WakeHandle>,
+    ) -> (Box<dyn std::any::Any + Send>, Box<dyn std::any::Any + Send>) {
+        (self.0)(capacity, wake_handle)
+    }
+}
