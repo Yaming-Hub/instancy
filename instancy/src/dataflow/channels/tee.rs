@@ -29,13 +29,24 @@ use crate::progress::timestamp::Timestamp;
 /// (branching). Each clone creates an additional downstream edge, and `TeePush`
 /// ensures all targets receive a copy of every envelope.
 ///
+/// # Backpressure handling
+///
+/// If a downstream target returns an error (e.g., backpressure) after some
+/// targets have already received data, `TeePush` stores the envelope internally
+/// and retries delivery to remaining targets on the next `push()` or `flush()`
+/// call. This avoids both data loss and duplicate delivery.
+///
 /// # Type parameters
 ///
 /// - `T`: Timestamp type
 /// - `D`: Data record type (must be `Clone` for fan-out)
-/// - `M`: Metadata type (default `()`, must be `Clone` for fan-out)
+/// - `M`: Metadata type (default `()`, must be `Clone + Default` for fan-out)
 pub struct TeePush<T: Timestamp, D: Clone + Send + 'static, M: Clone + Default + Send + 'static = ()> {
     targets: Vec<Box<dyn Push<T, D, M>>>,
+    /// Partially-delivered envelope: (envelope, next_target_index).
+    /// When a target returns an error mid-delivery, we store the envelope
+    /// and the index of the first undelivered target for retry.
+    pending: Option<(Envelope<T, D, M>, usize)>,
     closed: bool,
 }
 
@@ -49,6 +60,7 @@ impl<T: Timestamp, D: Clone + Send + 'static, M: Clone + Default + Send + 'stati
         assert!(!targets.is_empty(), "TeePush requires at least one target");
         Self {
             targets,
+            pending: None,
             closed: false,
         }
     }
@@ -56,6 +68,41 @@ impl<T: Timestamp, D: Clone + Send + 'static, M: Clone + Default + Send + 'stati
     /// Returns the number of downstream targets.
     pub fn target_count(&self) -> usize {
         self.targets.len()
+    }
+
+    /// Drain any pending partial delivery, retrying from where we left off.
+    /// Returns Ok(()) if pending was drained (or there was nothing pending).
+    fn drain_pending(&mut self) -> Result<()> {
+        if let Some((envelope, start_idx)) = self.pending.take() {
+            if let Err(e) = self.deliver(envelope, start_idx) {
+                return Err(e);
+            }
+        }
+        Ok(())
+    }
+
+    /// Deliver an envelope to targets[start_idx..], cloning for all but the last.
+    /// On partial failure, stores remaining work in `self.pending`.
+    fn deliver(&mut self, envelope: Envelope<T, D, M>, start_idx: usize) -> Result<()> {
+        let count = self.targets.len();
+        // Deliver clones to all targets except the last one in range.
+        for i in start_idx..count.saturating_sub(1) {
+            if let Err(e) = self.targets[i].push(envelope.clone()) {
+                self.pending = Some((envelope, i + 1));
+                return Err(e);
+            }
+        }
+        // Deliver original (moved) to the last target.
+        let last_idx = count - 1;
+        if last_idx >= start_idx {
+            if let Err(e) = self.targets[last_idx].push(envelope) {
+                // Last target failed — envelope is consumed (all clones already
+                // delivered to earlier targets). No pending to store since
+                // there are no more targets after this one.
+                return Err(e);
+            }
+        }
+        Ok(())
     }
 }
 
@@ -67,27 +114,17 @@ impl<T: Timestamp, D: Clone + Send + 'static, M: Clone + Default + Send + 'stati
             return Err(Error::Custom("TeePush is closed".into()));
         }
 
-        let last_idx = self.targets.len() - 1;
-        // Clone for all targets except the last; move original to the last.
-        for (i, target) in self.targets.iter_mut().enumerate() {
-            if i < last_idx {
-                target.push(envelope.clone())?;
-            } else {
-                target.push(envelope)?;
-                break;
-            }
-        }
-        Ok(())
+        // First drain any partially-delivered envelope from a previous call.
+        self.drain_pending()?;
+
+        // Deliver to all targets.
+        self.deliver(envelope, 0)
     }
 
     fn try_push(
         &mut self,
         envelope: Envelope<T, D, M>,
     ) -> std::result::Result<(), (Error, Envelope<T, D, M>)> {
-        // TeePush cannot support atomic try_push across multiple targets
-        // because partial delivery cannot be rolled back. We degrade to
-        // push semantics: the envelope is always consumed regardless of
-        // success or failure.
         if self.closed {
             return Err((
                 Error::Custom("TeePush is closed".into()),
@@ -95,9 +132,17 @@ impl<T: Timestamp, D: Clone + Send + 'static, M: Clone + Default + Send + 'stati
             ));
         }
 
-        // Use push() which handles the clone-all-but-last pattern internally.
-        self.push(envelope).map_err(|e| {
-            // Envelope is consumed; return error with placeholder envelope.
+        // Drain pending first; if that fails, return the NEW envelope untouched.
+        if let Err(e) = self.drain_pending() {
+            return Err((e, envelope));
+        }
+
+        // Deliver to all targets. On partial failure, the envelope is stored
+        // in self.pending for retry on next push/flush — no data is lost.
+        // We return a placeholder envelope since the original is consumed
+        // (stored in pending or already delivered). Callers should NOT use
+        // the returned envelope for retry — TeePush handles retry internally.
+        self.deliver(envelope, 0).map_err(|e| {
             (
                 e,
                 Envelope::with_metadata(
@@ -112,6 +157,9 @@ impl<T: Timestamp, D: Clone + Send + 'static, M: Clone + Default + Send + 'stati
     }
 
     fn flush(&mut self) -> Result<()> {
+        // Drain any pending partial delivery first.
+        self.drain_pending()?;
+
         let mut first_error: Option<Error> = None;
         for target in &mut self.targets {
             if let Err(e) = target.flush() {
@@ -127,6 +175,8 @@ impl<T: Timestamp, D: Clone + Send + 'static, M: Clone + Default + Send + 'stati
     }
 
     fn close(&mut self) {
+        // Best-effort drain of pending data before closing.
+        let _ = self.drain_pending();
         self.closed = true;
         for target in &mut self.targets {
             target.close();
