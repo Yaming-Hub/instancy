@@ -14,6 +14,7 @@ use crate::progress::timestamp::Timestamp;
 
 use super::envelope::Envelope;
 use super::pushpull::{Pull, Push};
+use super::wake::WakeHandle;
 
 /// Default channel capacity when not specified.
 pub const DEFAULT_CHANNEL_CAPACITY: usize = 1024;
@@ -32,6 +33,19 @@ struct SharedState<T: Timestamp, D, M> {
 pub fn bounded_channel<T: Timestamp, D: Send + 'static, M: Send + 'static>(
     capacity: usize,
 ) -> (BoundedPush<T, D, M>, BoundedPull<T, D, M>) {
+    bounded_channel_with_wake(capacity, None)
+}
+
+/// Creates a bounded channel pair with a [`WakeHandle`] for executor notification.
+///
+/// The `WakeHandle` is notified when:
+/// - Data is pushed into the channel (downstream may be runnable)
+/// - The sender is closed or dropped (downstream may see exhaustion)
+/// - Data is pulled from a full channel (upstream backpressure is relieved)
+pub fn bounded_channel_with_wake<T: Timestamp, D: Send + 'static, M: Send + 'static>(
+    capacity: usize,
+    wake: Option<WakeHandle>,
+) -> (BoundedPush<T, D, M>, BoundedPull<T, D, M>) {
     let state = Arc::new(Mutex::new(SharedState {
         buffer: VecDeque::with_capacity(capacity),
         capacity,
@@ -41,10 +55,12 @@ pub fn bounded_channel<T: Timestamp, D: Send + 'static, M: Send + 'static>(
     let push = BoundedPush {
         state: Arc::clone(&state),
         closed: Arc::clone(&closed),
+        wake: wake.clone(),
     };
     let pull = BoundedPull {
         state,
         closed,
+        wake,
     };
     (push, pull)
 }
@@ -67,6 +83,7 @@ pub fn default_channel<T: Timestamp, D: Send + 'static, M: Send + 'static>(
 pub struct BoundedPush<T: Timestamp, D, M = ()> {
     state: Arc<Mutex<SharedState<T, D, M>>>,
     closed: Arc<AtomicBool>,
+    wake: Option<WakeHandle>,
 }
 
 impl<T: Timestamp, D: Send + 'static, M: Send + 'static> Push<T, D, M>
@@ -81,6 +98,10 @@ impl<T: Timestamp, D: Send + 'static, M: Send + 'static> Push<T, D, M>
             return Err(Error::Backpressure);
         }
         state.buffer.push_back(envelope);
+        drop(state); // release lock before notify
+        if let Some(ref wake) = self.wake {
+            wake.notify();
+        }
         Ok(())
     }
 
@@ -96,6 +117,10 @@ impl<T: Timestamp, D: Send + 'static, M: Send + 'static> Push<T, D, M>
             return Err((Error::Backpressure, envelope));
         }
         state.buffer.push_back(envelope);
+        drop(state); // release lock before notify
+        if let Some(ref wake) = self.wake {
+            wake.notify();
+        }
         Ok(())
     }
 
@@ -106,6 +131,9 @@ impl<T: Timestamp, D: Send + 'static, M: Send + 'static> Push<T, D, M>
 
     fn close(&mut self) {
         self.closed.store(true, Ordering::Release);
+        if let Some(ref wake) = self.wake {
+            wake.notify();
+        }
     }
 
     fn is_closed(&self) -> bool {
@@ -121,6 +149,7 @@ impl<T: Timestamp, D: Send + 'static, M: Send + 'static> Push<T, D, M>
 pub struct BoundedPull<T: Timestamp, D, M = ()> {
     state: Arc<Mutex<SharedState<T, D, M>>>,
     closed: Arc<AtomicBool>,
+    wake: Option<WakeHandle>,
 }
 
 /// Auto-close on drop so the receiver sees exhaustion even if the sender
@@ -128,6 +157,9 @@ pub struct BoundedPull<T: Timestamp, D, M = ()> {
 impl<T: Timestamp, D, M> Drop for BoundedPush<T, D, M> {
     fn drop(&mut self) {
         self.closed.store(true, Ordering::Release);
+        if let Some(ref wake) = self.wake {
+            wake.notify();
+        }
     }
 }
 
@@ -136,13 +168,30 @@ impl<T: Timestamp, D: Send + 'static, M: Send + 'static> Pull<T, D, M>
 {
     fn pull(&mut self) -> Option<Envelope<T, D, M>> {
         let mut state = self.state.lock().unwrap();
-        state.buffer.pop_front()
+        let was_full = state.buffer.len() >= state.capacity;
+        let result = state.buffer.pop_front();
+        drop(state); // release lock before notify
+        // Notify if we freed capacity — upstream may be blocked on backpressure
+        if result.is_some() && was_full {
+            if let Some(ref wake) = self.wake {
+                wake.notify();
+            }
+        }
+        result
     }
 
     fn drain_into(&mut self, buffer: &mut Vec<Envelope<T, D, M>>) -> usize {
         let mut state = self.state.lock().unwrap();
+        let was_full = state.buffer.len() >= state.capacity;
         let count = state.buffer.len();
         buffer.extend(state.buffer.drain(..));
+        drop(state); // release lock before notify
+        // Notify if we freed capacity
+        if count > 0 && was_full {
+            if let Some(ref wake) = self.wake {
+                wake.notify();
+            }
+        }
         count
     }
 
@@ -175,6 +224,11 @@ impl<T: Timestamp, D, M> BoundedPush<T, D, M> {
     pub fn capacity(&self) -> usize {
         self.state.lock().unwrap().capacity
     }
+
+    /// Set or replace the wake handle for this channel endpoint.
+    pub fn set_wake(&mut self, wake: WakeHandle) {
+        self.wake = Some(wake);
+    }
 }
 
 impl<T: Timestamp, D, M> BoundedPull<T, D, M> {
@@ -186,6 +240,11 @@ impl<T: Timestamp, D, M> BoundedPull<T, D, M> {
     /// Returns true if no envelopes are available.
     pub fn is_empty(&self) -> bool {
         self.len() == 0
+    }
+
+    /// Set or replace the wake handle for this channel endpoint.
+    pub fn set_wake(&mut self, wake: WakeHandle) {
+        self.wake = Some(wake);
     }
 }
 
