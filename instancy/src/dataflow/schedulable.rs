@@ -287,9 +287,15 @@ pub struct EdgeTypeInfo {
 /// Channel factories are inherently replayable — they create fresh channel
 /// pairs from configuration (capacity) without consuming state.
 pub trait ChannelBlueprint: Send {
-    /// Create a channel pair for the given capacity and wake handle.
+    /// Create a channel pair for the given worker, capacity, and wake handle.
+    ///
+    /// For pipeline channels, the worker context is ignored (each worker gets
+    /// an independent bounded channel). For exchange channels, the context
+    /// determines which worker's Push/Pull pair to return from the shared
+    /// cross-worker channel set.
     fn build(
         &mut self,
+        ctx: &WorkerContext,
         capacity: usize,
         wake_handle: Option<crate::dataflow::channels::wake::WakeHandle>,
     ) -> (Box<dyn std::any::Any + Send>, Box<dyn std::any::Any + Send>);
@@ -304,6 +310,7 @@ pub type ChannelFactory = Box<dyn ChannelBlueprint>;
 /// configuration like capacity).
 pub fn channel_factory(
     f: impl FnMut(
+            &WorkerContext,
             usize,
             Option<crate::dataflow::channels::wake::WakeHandle>,
         ) -> (Box<dyn std::any::Any + Send>, Box<dyn std::any::Any + Send>)
@@ -317,6 +324,7 @@ pub fn channel_factory(
 pub struct ChannelBlueprintFn(
     Box<
         dyn FnMut(
+                &WorkerContext,
                 usize,
                 Option<crate::dataflow::channels::wake::WakeHandle>,
             ) -> (Box<dyn std::any::Any + Send>, Box<dyn std::any::Any + Send>)
@@ -328,6 +336,7 @@ impl ChannelBlueprintFn {
     /// Create a new channel blueprint from a closure.
     pub fn new(
         factory: impl FnMut(
+                &WorkerContext,
                 usize,
                 Option<crate::dataflow::channels::wake::WakeHandle>,
             ) -> (Box<dyn std::any::Any + Send>, Box<dyn std::any::Any + Send>)
@@ -346,9 +355,10 @@ impl ChannelBlueprintFn {
 impl ChannelBlueprint for ChannelBlueprintFn {
     fn build(
         &mut self,
+        ctx: &WorkerContext,
         capacity: usize,
         wake_handle: Option<crate::dataflow::channels::wake::WakeHandle>,
     ) -> (Box<dyn std::any::Any + Send>, Box<dyn std::any::Any + Send>) {
-        (self.0)(capacity, wake_handle)
+        (self.0)(ctx, capacity, wake_handle)
     }
 }

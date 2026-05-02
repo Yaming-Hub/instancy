@@ -528,9 +528,17 @@ impl RuntimeHandle {
             validate_multi_worker_topologies(&dataflows)?;
         }
 
-        // Phase 3: Validate no exchange operators (not yet supported).
+        // Phase 3: Validate no exchange operators/edges (not yet supported).
         if num_workers > 1 {
             for (i, df) in dataflows.iter().enumerate() {
+                // Check edge-level metadata (preferred).
+                if df.graph().has_exchange_edges() {
+                    return Err(Error::Custom(format!(
+                        "multi-worker execution does not yet support exchange channels \
+                         (worker {i} has exchange edges). All channels are worker-local in replicated mode."
+                    )));
+                }
+                // Also check operator names for backward compatibility.
                 let exchange_ops = df.graph().exchange_operator_names();
                 if !exchange_ops.is_empty() {
                     return Err(Error::Custom(format!(
@@ -844,9 +852,15 @@ impl SimpleRuntime {
             validate_multi_worker_topologies(&dataflows)?;
         }
 
-        // Phase 3: Validate no exchange operators (check all replicas).
+        // Phase 3: Validate no exchange operators/edges (check all replicas).
         if num_workers > 1 {
             for (i, df) in dataflows.iter().enumerate() {
+                if df.graph().has_exchange_edges() {
+                    return Err(Error::Custom(format!(
+                        "multi-worker execution does not yet support exchange channels \
+                         (worker {i} has exchange edges). All channels are worker-local in replicated mode."
+                    )));
+                }
                 let exchange_ops = df.graph().exchange_operator_names();
                 if !exchange_ops.is_empty() {
                     return Err(Error::Custom(format!(
