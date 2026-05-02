@@ -246,6 +246,21 @@ impl RuntimeHandle {
     /// Returns a [`MultiSpawnedDataflow`] with per-worker input senders and
     /// output receivers, shared cancellation, and aggregated completion.
     ///
+    /// # Uniform replication
+    ///
+    /// `num_workers` creates N **complete replicas** of the entire dataflow
+    /// graph. Every region in the dataflow gets the same number of workers —
+    /// there is no per-region parallelism control. Each worker is an
+    /// independent executor; the `num_workers` parameter controls **logical**
+    /// parallelism, while the runtime's `worker_threads` configuration
+    /// controls **physical** parallelism. For example, 4 logical workers on a
+    /// pool with 1 thread will run cooperatively and sequentially.
+    ///
+    /// Per-region worker counts (e.g., 4 workers in region 0 funneling into
+    /// 2 workers in region 1) require exchange channels to redistribute data
+    /// at region boundaries. This will be supported once exchange operators
+    /// are implemented.
+    ///
     /// # Execution model
     ///
     /// Each worker runs as an independent [`DataflowExecutor`] on the shared
@@ -1201,6 +1216,23 @@ impl<T: Timestamp> Drop for SpawnedDataflow<T> {
 /// Each worker is an independent [`SpawnedDataflow`] with its own executor,
 /// input senders, and output receivers. There is no cross-worker data routing —
 /// all channels are worker-local.
+///
+/// ## Uniform replication
+///
+/// All regions in the dataflow have the same number of workers (`num_workers`).
+/// Per-region parallelism (e.g., more workers in a data-ingestion region,
+/// fewer in a reduction region) is not yet supported and requires exchange
+/// channels at region boundaries. Note that "region" is instancy's scoping
+/// concept for progress tracking — it is more general than Spark's linear
+/// "stage" model because regions can be nested (e.g., loop bodies are inner
+/// regions).
+///
+/// ## Logical vs physical parallelism
+///
+/// `num_workers` controls **logical** parallelism — the number of independent
+/// executor instances. The runtime's thread pool controls **physical**
+/// parallelism. It is valid to have more logical workers than physical
+/// threads; the executors will be scheduled cooperatively on the pool.
 ///
 /// # Lifecycle
 ///
