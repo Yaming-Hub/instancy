@@ -188,7 +188,7 @@ impl<T: Timestamp> RootScope<T> {
 
     /// Set the current default region for new operators.
     pub fn set_current_region(&mut self, id: RegionId) -> Result<()> {
-        let mut state = self.state.lock().unwrap();
+        let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
         if let Some(idx) = state.regions.iter().position(|r| r.id() == id) {
             state.current_region_index = idx;
             Ok(())
@@ -202,7 +202,7 @@ impl<T: Timestamp> RootScope<T> {
 
     /// Get all regions in this scope (snapshot).
     pub fn regions(&self) -> Vec<Region> {
-        self.state.lock().unwrap().regions.clone()
+        self.state.lock().unwrap_or_else(|e| e.into_inner()).regions.clone()
     }
 
     /// Create a nested child scope for iterative computation.
@@ -248,7 +248,7 @@ impl<T: Timestamp> Scope for RootScope<T> {
     }
 
     fn allocate_operator_index(&mut self) -> usize {
-        let mut state = self.state.lock().unwrap();
+        let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
         let idx = state.next_operator_index;
         state.next_operator_index += 1;
         idx
@@ -256,21 +256,21 @@ impl<T: Timestamp> Scope for RootScope<T> {
 
     fn operator_count(&self) -> usize {
         // Subtract 1: index 0 is reserved for scope boundary metadata.
-        self.state.lock().unwrap().next_operator_index - 1
+        self.state.lock().unwrap_or_else(|e| e.into_inner()).next_operator_index - 1
     }
 
     fn current_region(&self) -> Region {
-        let state = self.state.lock().unwrap();
+        let state = self.state.lock().unwrap_or_else(|e| e.into_inner());
         state.regions[state.current_region_index].clone()
     }
 
     fn region(&self, id: RegionId) -> Option<Region> {
-        let state = self.state.lock().unwrap();
+        let state = self.state.lock().unwrap_or_else(|e| e.into_inner());
         state.regions.iter().find(|r| r.id() == id).cloned()
     }
 
     fn new_region(&mut self, parallelism: usize) -> RegionId {
-        let mut state = self.state.lock().unwrap();
+        let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
         let region = state.region_allocator.allocate(parallelism);
         let id = region.id();
         state.regions.push(region);
@@ -278,37 +278,37 @@ impl<T: Timestamp> Scope for RootScope<T> {
     }
 
     fn allocate_ingress_slot(&mut self) -> usize {
-        let mut state = self.state.lock().unwrap();
+        let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
         let slot = state.next_ingress_slot;
         state.next_ingress_slot += 1;
         slot
     }
 
     fn allocate_egress_slot(&mut self) -> usize {
-        let mut state = self.state.lock().unwrap();
+        let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
         let slot = state.next_egress_slot;
         state.next_egress_slot += 1;
         slot
     }
 
     fn register_operator(&mut self, info: OperatorInfo) -> Result<()> {
-        self.state.lock().unwrap().graph.register_operator(info)
+        self.state.lock().unwrap_or_else(|e| e.into_inner()).graph.register_operator(info)
     }
 
     fn add_edge(&mut self, edge: EdgeInfo) {
-        self.state.lock().unwrap().graph.add_edge(edge);
+        self.state.lock().unwrap_or_else(|e| e.into_inner()).graph.add_edge(edge);
     }
 
     fn increment_operator_input_count(&mut self, operator_index: usize) {
-        self.state.lock().unwrap().graph.increment_input_count(operator_index);
+        self.state.lock().unwrap_or_else(|e| e.into_inner()).graph.increment_input_count(operator_index);
     }
 
     fn increment_operator_output_count(&mut self, operator_index: usize) {
-        self.state.lock().unwrap().graph.increment_output_count(operator_index);
+        self.state.lock().unwrap_or_else(|e| e.into_inner()).graph.increment_output_count(operator_index);
     }
 
     fn graph(&self) -> DataflowGraph {
-        self.state.lock().unwrap().graph.clone()
+        self.state.lock().unwrap_or_else(|e| e.into_inner()).graph.clone()
     }
 }
 ///
@@ -403,7 +403,7 @@ impl<T: Timestamp> Scope for ChildScope<T> {
     }
 
     fn allocate_operator_index(&mut self) -> usize {
-        let mut state = self.state.lock().unwrap();
+        let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
         let idx = state.next_operator_index;
         state.next_operator_index += 1;
         idx
@@ -411,21 +411,21 @@ impl<T: Timestamp> Scope for ChildScope<T> {
 
     fn operator_count(&self) -> usize {
         // Subtract 1: index 0 is reserved for scope boundary metadata.
-        self.state.lock().unwrap().next_operator_index - 1
+        self.state.lock().unwrap_or_else(|e| e.into_inner()).next_operator_index - 1
     }
 
     fn current_region(&self) -> Region {
-        let state = self.state.lock().unwrap();
+        let state = self.state.lock().unwrap_or_else(|e| e.into_inner());
         state.regions[state.current_region_index].clone()
     }
 
     fn region(&self, id: RegionId) -> Option<Region> {
-        let state = self.state.lock().unwrap();
+        let state = self.state.lock().unwrap_or_else(|e| e.into_inner());
         state.regions.iter().find(|r| r.id() == id).cloned()
     }
 
     fn new_region(&mut self, parallelism: usize) -> RegionId {
-        let mut state = self.state.lock().unwrap();
+        let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
         let region = state.region_allocator.allocate(parallelism);
         let id = region.id();
         state.regions.push(region);
@@ -433,7 +433,7 @@ impl<T: Timestamp> Scope for ChildScope<T> {
     }
 
     fn allocate_ingress_slot(&mut self) -> usize {
-        let mut state = self.state.lock().unwrap();
+        let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
         let slot = state.next_ingress_slot;
         state.next_ingress_slot += 1;
         // Each ingress slot is an output of the boundary operator (data enters child).
@@ -442,7 +442,7 @@ impl<T: Timestamp> Scope for ChildScope<T> {
     }
 
     fn allocate_egress_slot(&mut self) -> usize {
-        let mut state = self.state.lock().unwrap();
+        let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
         let slot = state.next_egress_slot;
         state.next_egress_slot += 1;
         // Each egress slot is an input of the boundary operator (data leaves child).
@@ -451,23 +451,23 @@ impl<T: Timestamp> Scope for ChildScope<T> {
     }
 
     fn register_operator(&mut self, info: OperatorInfo) -> Result<()> {
-        self.state.lock().unwrap().graph.register_operator(info)
+        self.state.lock().unwrap_or_else(|e| e.into_inner()).graph.register_operator(info)
     }
 
     fn add_edge(&mut self, edge: EdgeInfo) {
-        self.state.lock().unwrap().graph.add_edge(edge);
+        self.state.lock().unwrap_or_else(|e| e.into_inner()).graph.add_edge(edge);
     }
 
     fn increment_operator_input_count(&mut self, operator_index: usize) {
-        self.state.lock().unwrap().graph.increment_input_count(operator_index);
+        self.state.lock().unwrap_or_else(|e| e.into_inner()).graph.increment_input_count(operator_index);
     }
 
     fn increment_operator_output_count(&mut self, operator_index: usize) {
-        self.state.lock().unwrap().graph.increment_output_count(operator_index);
+        self.state.lock().unwrap_or_else(|e| e.into_inner()).graph.increment_output_count(operator_index);
     }
 
     fn graph(&self) -> DataflowGraph {
-        self.state.lock().unwrap().graph.clone()
+        self.state.lock().unwrap_or_else(|e| e.into_inner()).graph.clone()
     }
 }
 

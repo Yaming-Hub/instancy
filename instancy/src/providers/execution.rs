@@ -111,7 +111,7 @@ impl InlineExecution {
 
     /// Run all deferred tasks. Returns the count of tasks executed.
     pub fn run_deferred(&self) -> usize {
-        let tasks: Vec<_> = self.deferred.lock().unwrap().drain(..).collect();
+        let tasks: Vec<_> = self.deferred.lock().unwrap_or_else(|e| e.into_inner()).drain(..).collect();
         let count = tasks.len();
         for task in tasks {
             task();
@@ -122,7 +122,7 @@ impl InlineExecution {
 
     /// Number of deferred tasks waiting.
     pub fn pending_count(&self) -> usize {
-        self.deferred.lock().unwrap().len()
+        self.deferred.lock().unwrap_or_else(|e| e.into_inner()).len()
     }
 }
 
@@ -138,7 +138,7 @@ impl ExecutionProvider for InlineExecution {
             task();
             self.tasks_executed.fetch_add(1, Ordering::Relaxed);
         } else {
-            self.deferred.lock().unwrap().push(task);
+            self.deferred.lock().unwrap_or_else(|e| e.into_inner()).push(task);
         }
     }
 

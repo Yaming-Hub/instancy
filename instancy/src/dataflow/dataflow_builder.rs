@@ -1971,7 +1971,10 @@ impl<T: Timestamp, D: Send + 'static> SchedulableOperator for CollectingSink<T, 
         let mut made_progress = false;
         while let Some(envelope) = self.input_puller.pull() {
             if let Payload::Data { time, data } = envelope.payload {
-                self.collector.lock().unwrap().push((time, data));
+                self.collector
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .push((time, data));
                 made_progress = true;
             }
         }

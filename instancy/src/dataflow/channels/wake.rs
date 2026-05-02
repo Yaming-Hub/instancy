@@ -69,9 +69,9 @@ impl WakeHandle {
         // Wake the executor if it has a registered waker.
         // Clone the waker before dropping the lock to avoid blocking
         // register_waker() during the (potentially expensive) wake call.
-        let waker = self.inner.waker.lock().unwrap()
-            .as_ref()
-            .cloned();
+        // If the mutex is poisoned, skip the waker — the flag is already set.
+        let waker = self.inner.waker.lock().ok()
+            .and_then(|g| g.as_ref().cloned());
         if let Some(w) = waker {
             w.wake();
         }
@@ -83,7 +83,7 @@ impl WakeHandle {
     /// transition makes the dataflow potentially runnable. Only the most
     /// recently registered waker is kept.
     pub fn register_waker(&self, waker: &Waker) {
-        let mut guard = self.inner.waker.lock().unwrap();
+        let mut guard = self.inner.waker.lock().unwrap_or_else(|e| e.into_inner());
         // Only clone if the waker has changed (avoids unnecessary allocation).
         match guard.as_ref() {
             Some(existing) if existing.will_wake(waker) => {}
