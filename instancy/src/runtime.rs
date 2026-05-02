@@ -1453,11 +1453,14 @@ impl<T: Timestamp> MultiSpawnedDataflow<T> {
         name: &str,
     ) -> Result<Vec<crate::dataflow::channel_operators::InputSender<T, D>>> {
         let type_name = std::any::type_name::<D>();
-        // Pre-validate: every worker must have this port with the right type.
+        // Pre-validate: every worker must have this port with the right type
+        // and correct channel mode (sync).
         for (idx, w) in self.workers.iter().enumerate() {
-            Self::validate_input_port(w, idx, name, type_name)?;
+            Self::validate_port::<crate::dataflow::channel_operators::InputSender<T, D>>(
+                &w.input_senders, idx, name, type_name, "input",
+            )?;
         }
-        // All validated — consume from each worker (infallible after validation).
+        // Consume from each worker. After full validation this cannot fail.
         let mut senders = Vec::with_capacity(self.num_workers);
         for w in &mut self.workers {
             senders.push(w.take_input::<D>(name).expect(
@@ -1477,7 +1480,9 @@ impl<T: Timestamp> MultiSpawnedDataflow<T> {
     ) -> Result<Vec<crate::dataflow::channel_operators::OutputReceiver<T, D>>> {
         let type_name = std::any::type_name::<D>();
         for (idx, w) in self.workers.iter().enumerate() {
-            Self::validate_output_port(w, idx, name, type_name)?;
+            Self::validate_port::<crate::dataflow::channel_operators::OutputReceiver<T, D>>(
+                &w.output_receivers, idx, name, type_name, "output",
+            )?;
         }
         let mut receivers = Vec::with_capacity(self.num_workers);
         for w in &mut self.workers {
@@ -1499,7 +1504,9 @@ impl<T: Timestamp> MultiSpawnedDataflow<T> {
     ) -> Result<Vec<crate::dataflow::channel_operators::AsyncInputSender<T, D>>> {
         let type_name = std::any::type_name::<D>();
         for (idx, w) in self.workers.iter().enumerate() {
-            Self::validate_input_port(w, idx, name, type_name)?;
+            Self::validate_port::<crate::dataflow::channel_operators::AsyncInputSender<T, D>>(
+                &w.input_senders, idx, name, type_name, "input",
+            )?;
         }
         let mut senders = Vec::with_capacity(self.num_workers);
         for w in &mut self.workers {
@@ -1521,7 +1528,9 @@ impl<T: Timestamp> MultiSpawnedDataflow<T> {
     ) -> Result<Vec<crate::dataflow::channel_operators::AsyncOutputReceiver<T, D>>> {
         let type_name = std::any::type_name::<D>();
         for (idx, w) in self.workers.iter().enumerate() {
-            Self::validate_output_port(w, idx, name, type_name)?;
+            Self::validate_port::<crate::dataflow::channel_operators::AsyncOutputReceiver<T, D>>(
+                &w.output_receivers, idx, name, type_name, "output",
+            )?;
         }
         let mut receivers = Vec::with_capacity(self.num_workers);
         for w in &mut self.workers {
@@ -1534,42 +1543,28 @@ impl<T: Timestamp> MultiSpawnedDataflow<T> {
 
     // -- Validation helpers ------------------------------------------------
 
-    /// Check that a worker has an input port with the given name and type,
-    /// without consuming it.
-    fn validate_input_port(
-        worker: &SpawnedDataflow<T>,
+    /// Check that a worker has a port with the given name, data type, and
+    /// concrete channel type (sync vs async), without consuming it.
+    fn validate_port<C: 'static>(
+        ports: &[(String, &'static str, Box<dyn std::any::Any + Send>)],
         worker_idx: usize,
         name: &str,
         type_name: &str,
+        direction: &str,
     ) -> Result<()> {
-        match worker.input_senders.iter().find(|(n, _, _)| n == name) {
+        match ports.iter().find(|(n, _, _)| n == name) {
             None => Err(Error::Custom(format!(
-                "worker {worker_idx} has no input port named '{name}'"
+                "worker {worker_idx} has no {direction} port named '{name}'"
             ))),
             Some((_, port_type, _)) if *port_type != type_name => Err(Error::Custom(
                 format!(
-                    "worker {worker_idx} input port '{name}' has type {port_type}, but requested {type_name}"
+                    "worker {worker_idx} {direction} port '{name}' has type {port_type}, but requested {type_name}"
                 ),
             )),
-            _ => Ok(()),
-        }
-    }
-
-    /// Check that a worker has an output port with the given name and type,
-    /// without consuming it.
-    fn validate_output_port(
-        worker: &SpawnedDataflow<T>,
-        worker_idx: usize,
-        name: &str,
-        type_name: &str,
-    ) -> Result<()> {
-        match worker.output_receivers.iter().find(|(n, _, _)| n == name) {
-            None => Err(Error::Custom(format!(
-                "worker {worker_idx} has no output port named '{name}'"
-            ))),
-            Some((_, port_type, _)) if *port_type != type_name => Err(Error::Custom(
+            Some((_, _, any_box)) if !any_box.is::<C>() => Err(Error::Custom(
                 format!(
-                    "worker {worker_idx} output port '{name}' has type {port_type}, but requested {type_name}"
+                    "worker {worker_idx} {direction} port '{name}' channel mode mismatch \
+                     (sync port with async take, or vice versa)"
                 ),
             )),
             _ => Ok(()),
@@ -2673,5 +2668,30 @@ mod tests {
         assert!(results[3].is_empty());
 
         multi.join_blocking().unwrap();
+    }
+
+    #[test]
+    #[cfg(feature = "async-io")]
+    fn take_all_async_inputs_on_sync_spawned_returns_error() {
+        let rt = SimpleRuntime::new();
+        let mut multi = rt
+            .spawn_multi("mode-err", 2, |_, builder: &mut DataflowBuilder<u64>| {
+                let input = builder.input::<i32>("data");
+                input.output("out");
+                Ok(())
+            })
+            .unwrap();
+
+        // sync-spawned → take_all_async_inputs should fail gracefully (not panic).
+        let result = multi.take_all_async_inputs::<i32>("data");
+        assert!(result.is_err());
+
+        // Ports should still be available for sync take.
+        let senders = multi.take_all_inputs::<i32>("data").unwrap();
+        assert_eq!(senders.len(), 2);
+        drop(senders);
+
+        multi.cancel();
+        let _ = multi.join_blocking();
     }
 }
