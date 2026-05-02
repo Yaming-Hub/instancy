@@ -25,7 +25,7 @@ pub use channel_operators::{
     ChannelSinkOperator, ChannelSourceOperator, InputSender, OutputReceiver,
 };
 pub use channels::{ControlSignal, Envelope, PartitionStrategy, Payload};
-pub use dataflow_builder::{DataflowBuilder, DataflowBuilderConfig, LogicalDataflow, OutputPort, SpawnedDataflow, Stream};
+pub use dataflow_builder::{DataflowBuilder, DataflowBuilderConfig, LogicalDataflow, OutputPort, Stream};
 pub use executor::{DataflowExecutor, ExecutorConfig};
 pub use graph::{DataflowGraph, EdgeInfo, OperatorInfo};
 pub use id::DataflowId;

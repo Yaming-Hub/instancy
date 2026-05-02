@@ -1,6 +1,6 @@
 //! Example: Spawning a dataflow with channel-based I/O.
 //!
-//! Demonstrates the `spawn()` API where the dataflow runs on a background
+//! Demonstrates the `SimpleRuntime::spawn()` API where the dataflow runs on a background
 //! thread and the main thread feeds data through input channels and
 //! collects results from output channels.
 //!
@@ -19,7 +19,8 @@
 //!
 //! Run with: `cargo run --example spawn_pipeline`
 
-use instancy::dataflow::{DataflowBuilder, SpawnedDataflow};
+use instancy::dataflow::DataflowBuilder;
+use instancy::runtime::{SimpleRuntime, SpawnedDataflow};
 
 fn main() {
     println!("=== Spawn Pipeline Example ===\n");
@@ -40,8 +41,9 @@ fn main() {
         dataflow.edge_count(),
     );
 
-    // Phase 2: Spawn on a background thread
-    let mut handle: SpawnedDataflow<u64> = dataflow.spawn().expect("spawn failed");
+    // Phase 2: Spawn on a background thread via SimpleRuntime
+    let rt = SimpleRuntime::new();
+    let mut handle: SpawnedDataflow<u64> = rt.spawn(dataflow).expect("spawn failed");
     println!("Dataflow spawned on background thread\n");
 
     // Phase 3: Feed data through the input channel

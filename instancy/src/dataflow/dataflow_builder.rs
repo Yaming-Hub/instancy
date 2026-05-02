@@ -34,11 +34,9 @@ use std::marker::PhantomData;
 use std::rc::Rc;
 use std::sync::{Arc, Mutex};
 
-use crate::cancellation::CancellationToken;
 use crate::dataflow::channels::bounded::bounded_channel;
 use crate::dataflow::channels::pushpull::{Pull, Push};
 use crate::dataflow::channels::tee::tee_or_single;
-use crate::dataflow::executor::{DataflowExecutor, ExecutorConfig};
 use crate::dataflow::graph::DataflowGraph;
 use crate::dataflow::operators::handles::{InputHandle, OutputHandle};
 use crate::dataflow::operators::input::InputEvent;
@@ -63,25 +61,25 @@ use crate::progress::timestamp::Timestamp;
 
 /// Metadata for a named input port in the logical dataflow.
 #[derive(Clone)]
-struct InputPortInfo {
+pub(crate) struct InputPortInfo {
     /// User-visible name of this input.
-    name: String,
+    pub(crate) name: String,
     /// The source operator index that this input feeds into.
-    operator_index: usize,
+    pub(crate) operator_index: usize,
     /// TypeId of the data type for runtime validation.
-    type_name: &'static str,
+    pub(crate) type_name: &'static str,
 }
 
 /// Metadata for a named output port in the logical dataflow.
 #[derive(Debug, Clone)]
 #[allow(dead_code)] // Fields used in Phase C (async runtime integration)
-struct OutputPortInfo {
+pub(crate) struct OutputPortInfo {
     /// User-visible name of this output.
-    name: String,
+    pub(crate) name: String,
     /// The sink operator index that collects output.
-    operator_index: usize,
+    pub(crate) operator_index: usize,
     /// TypeId of the data type for runtime validation.
-    type_name: &'static str,
+    pub(crate) type_name: &'static str,
 }
 
 // ---------------------------------------------------------------------------
@@ -114,7 +112,7 @@ struct BuilderState<T: Timestamp> {
 /// Captures the data type D and creates:
 /// - An OperatorFactory for the ChannelSourceOperator
 /// - An InputSender (as Box<dyn Any + Send>) for the caller
-type InputPortWiring = Box<
+pub(crate) type InputPortWiring = Box<
     dyn FnOnce(
             std::sync::Arc<std::sync::atomic::AtomicUsize>, // external_inputs_open counter
         ) -> (OperatorFactory, Box<dyn std::any::Any + Send>) // (factory, InputSender)
@@ -125,7 +123,7 @@ type InputPortWiring = Box<
 /// Returns:
 /// - An OperatorFactory for the ChannelSinkOperator (replaces CollectingSink)
 /// - An OutputReceiver (as Box<dyn Any + Send>) for the caller
-type OutputPortWiring = Box<
+pub(crate) type OutputPortWiring = Box<
     dyn FnOnce() -> (OperatorFactory, Box<dyn std::any::Any + Send>) // (factory, OutputReceiver)
         + Send,
 >;
@@ -961,20 +959,27 @@ impl<T: Timestamp, D: Send + 'static> OutputPort<T, D> {
 /// graph topology, operator factories, and channel factories — everything needed
 /// to materialize a physical executor.
 ///
-/// `LogicalDataflow` is `Send` and can be submitted to an async runtime on
-/// another thread. It is **single-use** — each materialization consumes the
-/// factories (which may contain `FnOnce` closures).
+/// `LogicalDataflow` is `Send` and can be submitted to any runtime for
+/// physical materialization and execution. It is **single-use** — each
+/// materialization consumes the factories (which may contain `FnOnce` closures).
+///
+/// `LogicalDataflow` is a purely logical artifact — it knows nothing about
+/// threads, channels, or execution strategy. All physical execution goes
+/// through a runtime:
+///
+/// - [`SimpleRuntime`](crate::runtime::SimpleRuntime) — single-thread, for tests and simple scripts
+/// - [`RuntimeHandle`](crate::runtime::RuntimeHandle) — shared worker pool, for production
 pub struct LogicalDataflow<T: Timestamp> {
-    name: String,
-    graph: DataflowGraph,
-    subgraph_builder: SubgraphBuilder<T>,
-    operator_factories: Vec<(usize, OperatorFactory)>,
-    channel_factories: Vec<(usize, ChannelFactory)>,
-    input_ports: Vec<InputPortInfo>,
-    output_ports: Vec<OutputPortInfo>,
-    input_port_wiring: Vec<InputPortWiring>,
-    output_port_wiring: Vec<OutputPortWiring>,
-    probes: Vec<(usize, ProbeHandle<T>)>,
+    pub(crate) name: String,
+    pub(crate) graph: DataflowGraph,
+    pub(crate) subgraph_builder: SubgraphBuilder<T>,
+    pub(crate) operator_factories: Vec<(usize, OperatorFactory)>,
+    pub(crate) channel_factories: Vec<(usize, ChannelFactory)>,
+    pub(crate) input_ports: Vec<InputPortInfo>,
+    pub(crate) output_ports: Vec<OutputPortInfo>,
+    pub(crate) input_port_wiring: Vec<InputPortWiring>,
+    pub(crate) output_port_wiring: Vec<OutputPortWiring>,
+    pub(crate) probes: Vec<(usize, ProbeHandle<T>)>,
 }
 
 impl<T: Timestamp> LogicalDataflow<T> {
@@ -1003,343 +1008,12 @@ impl<T: Timestamp> LogicalDataflow<T> {
         self.output_ports.iter().map(|p| p.name.as_str()).collect()
     }
 
-    /// Materialize and run the dataflow to completion (blocking).
+    /// Returns true if this dataflow has declared input ports.
     ///
-    /// This is a convenience method for testing with pre-loaded sources.
-    /// Dataflows using `input()` ports require async runtime (Phase C).
-    ///
-    /// # Errors
-    ///
-    /// Returns `Error::Custom` if the dataflow has declared input ports
-    /// (use `Runtime::spawn()` instead for runtime-fed inputs).
-    pub fn run(self) -> Result<()> {
-        self.run_with_cancel(CancellationToken::new())
-    }
-
-    /// Materialize and run with a cancellation token (blocking).
-    pub fn run_with_cancel(self, cancel: CancellationToken) -> Result<()> {
-        if !self.input_ports.is_empty() {
-            return Err(Error::Custom(
-                "cannot run() a dataflow with declared input ports — \
-                 input ports require async runtime (Runtime::spawn). \
-                 Use builder.source() for pre-loaded data instead."
-                    .into(),
-            ));
-        }
-
-        if self.operator_factories.is_empty() {
-            return Ok(());
-        }
-
-        let executor_config = ExecutorConfig {
-            max_activations_per_step: 1024,
-            max_idle_sweeps: 64,
-        };
-
-        // Materialize: converts logical graph into physical executor
-        let mut executor: DataflowExecutor<T> = DataflowExecutor::materialize(
-            &self.graph,
-            self.operator_factories,
-            self.channel_factories,
-            executor_config,
-            cancel,
-        )?;
-
-        // Build and attach progress tracker
-        let mut tracker = self.subgraph_builder.build();
-        tracker.initialize();
-        executor.set_progress_tracker(tracker);
-
-        // Register probes
-        for (op_idx, probe) in self.probes {
-            executor.register_probe(op_idx, probe);
-        }
-
-        // Run to completion
-        let completed = executor.run()?;
-        if !completed {
-            return Err(Error::Custom(
-                "dataflow did not complete (quiescence without termination)".into(),
-            ));
-        }
-
-        Ok(())
-    }
-
-    /// Spawn this dataflow on a dedicated background thread with channel-based I/O.
-    ///
-    /// This is the **standalone** spawn mode — the dataflow gets its own thread
-    /// and runs an executor loop independently. For production workloads where
-    /// multiple dataflows share a thread pool, use [`RuntimeHandle::spawn()`]
-    /// instead (planned).
-    ///
-    /// Unlike [`run()`](Self::run) which blocks and requires all data to be pre-loaded,
-    /// `spawn()` launches the dataflow on a background thread and returns a
-    /// [`SpawnedDataflow`] that provides:
-    ///
-    /// - **Input senders** — feed data into the dataflow via bounded channels
-    /// - **Output receivers** — collect results as they're produced
-    /// - **Cancellation** — cancel the running dataflow
-    /// - **Join** — wait for the dataflow to complete
-    ///
-    /// # Channel wiring
-    ///
-    /// For each [`input()`](DataflowBuilder::input) port:
-    /// - Creates a bounded `mpsc` channel
-    /// - Installs a `ChannelSourceOperator` that drains the receiver into the graph
-    /// - Returns the sender half as `InputSender<T, D>` (via [`SpawnedDataflow::take_input()`])
-    ///
-    /// For each [`output()`](Stream::output) port:
-    /// - Replaces the `CollectingSink` factory with a `ChannelSinkOperator`
-    /// - Creates a bounded `mpsc` channel for the sink to write into
-    /// - Returns the receiver half as `OutputReceiver<T, D>` (via [`SpawnedDataflow::take_output()`])
-    ///
-    /// # Example
-    ///
-    /// ```ignore
-    /// let builder = DataflowBuilder::<u64>::new("pipeline");
-    /// let input = builder.input::<i32>("numbers");
-    /// input.map("double", |_t, x| x * 2).output::<i32>("results");
-    /// let dataflow = builder.build()?;
-    ///
-    /// let handle = dataflow.spawn()?;
-    /// handle.take_input::<i32>("numbers")?.send(0, vec![1, 2, 3])?;
-    /// handle.take_input::<i32>("numbers")?.close();
-    /// let results = handle.take_output::<i32>("results")?.collect_data();
-    /// handle.join()?;
-    /// ```
-    pub fn spawn(mut self) -> Result<SpawnedDataflow<T>> {
-        use std::sync::atomic::AtomicUsize;
-
-        if self.operator_factories.is_empty() && self.input_port_wiring.is_empty() {
-            return Err(Error::Custom("cannot spawn an empty dataflow".into()));
-        }
-
-        let cancel = CancellationToken::new();
-        let cancel_handle = cancel.clone();
-        let external_inputs_open = Arc::new(AtomicUsize::new(0));
-
-        // --- Wire input ports ---
-        // Each input port wiring closure creates a ChannelSourceOperator factory
-        // and an InputSender. The factory is added to operator_factories so it
-        // gets materialized normally by the executor.
-        let mut input_senders: Vec<(String, &'static str, Box<dyn std::any::Any + Send>)> = Vec::new();
-        let input_count = self.input_port_wiring.len();
-
-        for (info, wiring) in self.input_ports.iter().zip(self.input_port_wiring.drain(..)) {
-            let (factory, sender_any) = wiring(Arc::clone(&external_inputs_open));
-            self.operator_factories.push((info.operator_index, factory));
-            input_senders.push((info.name.clone(), info.type_name, sender_any));
-        }
-
-        // --- Wire output ports ---
-        // Each output port wiring closure creates a ChannelSinkOperator factory
-        // that replaces the CollectingSink factory for the same operator index.
-        let mut output_receivers: Vec<(String, &'static str, Box<dyn std::any::Any + Send>)> = Vec::new();
-
-        for (info, wiring) in self.output_ports.iter().zip(self.output_port_wiring.drain(..)) {
-            let (replacement_factory, receiver_any) = wiring();
-            // Replace the CollectingSink factory with ChannelSinkOperator factory
-            if let Some(pos) = self.operator_factories.iter().position(|(idx, _)| *idx == info.operator_index) {
-                self.operator_factories[pos] = (info.operator_index, replacement_factory);
-            }
-            output_receivers.push((info.name.clone(), info.type_name, receiver_any));
-        }
-
-        // --- Materialize and run ---
-        let executor_config = ExecutorConfig {
-            max_activations_per_step: 1024,
-            max_idle_sweeps: 64,
-        };
-
-        let mut executor: DataflowExecutor<T> = DataflowExecutor::materialize(
-            &self.graph,
-            self.operator_factories,
-            self.channel_factories,
-            executor_config,
-            cancel,
-        )?;
-
-        // Share the SAME external_inputs_open counter between the executor
-        // and the ChannelSourceOperators. Operators decrement this counter
-        // when their channel closes; the executor reads it to decide quiescence.
-        external_inputs_open.store(input_count, std::sync::atomic::Ordering::SeqCst);
-        executor.replace_external_inputs_counter(external_inputs_open);
-
-        // Build and attach progress tracker
-        let mut tracker = self.subgraph_builder.build();
-        tracker.initialize();
-        executor.set_progress_tracker(tracker);
-
-        // Register probes
-        for (op_idx, probe) in self.probes {
-            executor.register_probe(op_idx, probe);
-        }
-
-        // Spawn executor on background thread
-        let name = self.name.clone();
-        let join_handle = std::thread::Builder::new()
-            .name(format!("dataflow-{}", name))
-            .spawn(move || -> Result<bool> { executor.run() })
-            .map_err(|e| Error::Custom(format!("failed to spawn dataflow thread: {e}")))?;
-
-        Ok(SpawnedDataflow {
-            name,
-            cancel: cancel_handle,
-            join_handle: Some(join_handle),
-            input_senders,
-            output_receivers,
-            _phantom: PhantomData,
-        })
-    }
-}
-
-// ---------------------------------------------------------------------------
-// SpawnedDataflow — handle for a running dataflow with channel-based I/O
-// ---------------------------------------------------------------------------
-
-/// A handle to a running dataflow spawned on a background thread.
-///
-/// Provides typed access to input senders and output receivers for each
-/// named port declared during graph construction. The dataflow runs
-/// independently on its own thread; use the methods below to feed data,
-/// collect results, cancel execution, or wait for completion.
-///
-/// # Type safety
-///
-/// Port types are validated at runtime: calling `input::<i32>("x")` on a
-/// port that was declared as `input::<String>("x")` will return an error.
-///
-/// # Lifecycle
-///
-/// 1. Send data via `input()` senders
-/// 2. Close inputs when done (drop the `InputSender` or call `.close()`)
-/// 3. Collect results from `output()` receivers
-/// 4. Call `join()` to wait for the executor to finish
-///
-/// Dropping a `SpawnedDataflow` without calling `join()` will cancel the
-/// dataflow and wait for the background thread to exit.
-pub struct SpawnedDataflow<T: Timestamp> {
-    name: String,
-    cancel: CancellationToken,
-    join_handle: Option<std::thread::JoinHandle<Result<bool>>>,
-    /// (name, type_name, Box<InputSender<T, D>> as Box<dyn Any>)
-    input_senders: Vec<(String, &'static str, Box<dyn std::any::Any + Send>)>,
-    /// (name, type_name, Box<OutputReceiver<T, D>> as Box<dyn Any>)
-    output_receivers: Vec<(String, &'static str, Box<dyn std::any::Any + Send>)>,
-    _phantom: PhantomData<T>,
-}
-
-impl<T: Timestamp> SpawnedDataflow<T> {
-    /// Get the dataflow name.
-    pub fn name(&self) -> &str {
-        &self.name
-    }
-
-    /// Take the input sender for the named port (consumes it from the handle).
-    ///
-    /// Input senders can only be taken once — subsequent calls for the
-    /// same port will return an error. Drop the returned sender (or call
-    /// `.close()`) to signal that no more data will arrive on this port.
-    ///
-    /// # Type safety
-    ///
-    /// The type parameter `D` must match the type used in `builder.input::<D>(name)`.
-    /// Returns an error if the name doesn't exist or the type doesn't match.
-    pub fn take_input<D: Clone + Send + 'static>(
-        &mut self,
-        name: &str,
-    ) -> Result<crate::dataflow::channel_operators::InputSender<T, D>> {
-        let type_name = std::any::type_name::<D>();
-        let pos = self
-            .input_senders
-            .iter()
-            .position(|(n, _, _)| n == name)
-            .ok_or_else(|| Error::Custom(format!("no input port named '{name}'")))?;
-
-        let (_, port_type, _) = &self.input_senders[pos];
-        if *port_type != type_name {
-            return Err(Error::Custom(format!(
-                "input port '{name}' has type {port_type}, but requested {type_name}"
-            )));
-        }
-
-        let (_, _, sender_any) = self.input_senders.remove(pos);
-        sender_any
-            .downcast::<crate::dataflow::channel_operators::InputSender<T, D>>()
-            .map(|boxed| *boxed)
-            .map_err(|_| Error::Custom(format!("input port '{name}' type downcast failed")))
-    }
-
-    /// Take the output receiver for the named port (consumes it from the handle).
-    ///
-    /// Output receivers can only be taken once — subsequent calls for the
-    /// same port will return an error.
-    ///
-    /// # Type safety
-    ///
-    /// The type parameter `D` must match the type used in `stream.output::<D>(name)`.
-    pub fn take_output<D: Send + 'static>(
-        &mut self,
-        name: &str,
-    ) -> Result<crate::dataflow::channel_operators::OutputReceiver<T, D>> {
-        let type_name = std::any::type_name::<D>();
-        let pos = self
-            .output_receivers
-            .iter()
-            .position(|(n, _, _)| n == name)
-            .ok_or_else(|| Error::Custom(format!("no output port named '{name}'")))?;
-
-        let (_, port_type, _) = &self.output_receivers[pos];
-        if *port_type != type_name {
-            return Err(Error::Custom(format!(
-                "output port '{name}' has type {port_type}, but requested {type_name}"
-            )));
-        }
-
-        let (_, _, receiver_any) = self.output_receivers.remove(pos);
-        receiver_any
-            .downcast::<crate::dataflow::channel_operators::OutputReceiver<T, D>>()
-            .map(|boxed| *boxed)
-            .map_err(|_| Error::Custom(format!("output port '{name}' type downcast failed")))
-    }
-
-    /// Cancel the running dataflow.
-    ///
-    /// Signals the executor's cancellation token. The executor will stop
-    /// at the next cancellation check point. Does not block.
-    pub fn cancel(&self) {
-        self.cancel.cancel();
-    }
-
-    /// Wait for the dataflow to complete and return the result.
-    ///
-    /// Returns `Ok(())` if the dataflow ran to completion.
-    /// Returns an error if the executor encountered an error or the
-    /// background thread panicked.
-    pub fn join(mut self) -> Result<()> {
-        if let Some(handle) = self.join_handle.take() {
-            match handle.join() {
-                Ok(Ok(_completed)) => Ok(()),
-                Ok(Err(e)) => Err(e),
-                Err(_panic) => Err(Error::Custom(
-                    "dataflow thread panicked".into(),
-                )),
-            }
-        } else {
-            Ok(())
-        }
-    }
-}
-
-impl<T: Timestamp> Drop for SpawnedDataflow<T> {
-    fn drop(&mut self) {
-        // Cancel the dataflow so the background thread exits
-        self.cancel.cancel();
-        // Wait for it to finish (best-effort)
-        if let Some(handle) = self.join_handle.take() {
-            let _ = handle.join();
-        }
+    /// Dataflows with input ports require `spawn()` on a runtime;
+    /// they cannot be run with `SimpleRuntime::run()`.
+    pub fn has_input_ports(&self) -> bool {
+        !self.input_ports.is_empty()
     }
 }
 
@@ -1468,6 +1142,12 @@ impl<T: Timestamp, D: Send + 'static> Push<T, D> for NullPush {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::cancellation::CancellationToken;
+    use crate::runtime::SimpleRuntime;
+
+    fn rt() -> SimpleRuntime {
+        SimpleRuntime::new()
+    }
 
     #[test]
     fn test_empty_builder() {
@@ -1475,7 +1155,7 @@ mod tests {
         assert_eq!(builder.operator_count(), 0);
         let dataflow = builder.build().unwrap();
         assert_eq!(dataflow.operator_count(), 0);
-        dataflow.run().unwrap();
+        rt().run(dataflow).unwrap();
     }
 
     #[test]
@@ -1484,7 +1164,7 @@ mod tests {
         let stream = builder.source("nums", vec![(0u64, vec![1i32, 2, 3])]);
         let port = stream.output("results");
         let dataflow = builder.build().unwrap();
-        dataflow.run().unwrap();
+        rt().run(dataflow).unwrap();
 
         let collector = port.collector();
         let results = collector.lock().unwrap();
@@ -1499,7 +1179,7 @@ mod tests {
         let doubled = stream.map("double", |_t, x| x * 2);
         let port = doubled.output("results");
         let dataflow = builder.build().unwrap();
-        dataflow.run().unwrap();
+        rt().run(dataflow).unwrap();
 
         let collector = port.collector();
         let results = collector.lock().unwrap();
@@ -1514,7 +1194,7 @@ mod tests {
         let evens = stream.filter("evens", |_t, x| x % 2 == 0);
         let port = evens.output("results");
         let dataflow = builder.build().unwrap();
-        dataflow.run().unwrap();
+        rt().run(dataflow).unwrap();
 
         let collector = port.collector();
         let results = collector.lock().unwrap();
@@ -1531,7 +1211,7 @@ mod tests {
             .map("to_string", |_t, x| format!("{x}"))
             .output("results");
         let dataflow = builder.build().unwrap();
-        dataflow.run().unwrap();
+        rt().run(dataflow).unwrap();
 
         let collector = port.collector();
         let results = collector.lock().unwrap();
@@ -1549,7 +1229,7 @@ mod tests {
             })
             .output("words");
         let dataflow = builder.build().unwrap();
-        dataflow.run().unwrap();
+        rt().run(dataflow).unwrap();
 
         let collector = port.collector();
         let results = collector.lock().unwrap();
@@ -1564,8 +1244,6 @@ mod tests {
 
     #[test]
     fn test_branching_fan_out() {
-        // Fan-out: one source → two downstream branches via Stream::clone()
-        // Uses TeePush to distribute data to both branches
         let builder = DataflowBuilder::<u64>::new("branch_test");
         let stream = builder.source("nums", vec![(0u64, vec![1i32, 2, 3, 4, 5, 6])]);
 
@@ -1578,7 +1256,7 @@ mod tests {
             .output("odds");
 
         let dataflow = builder.build().unwrap();
-        dataflow.run().unwrap();
+        rt().run(dataflow).unwrap();
 
         let evens_c = evens_port.collector();
         let evens = evens_c.lock().unwrap();
@@ -1591,7 +1269,6 @@ mod tests {
 
     #[test]
     fn test_multiple_inputs() {
-        // Two independent sources feeding separate pipelines
         let builder = DataflowBuilder::<u64>::new("multi_input");
         let a = builder.source("a", vec![(0u64, vec![10i32, 20])]);
         let b = builder.source("b", vec![(0u64, vec![100i32, 200])]);
@@ -1600,7 +1277,7 @@ mod tests {
         let port_b = b.map("inc_b", |_t, x| x + 1).output("out_b");
 
         let dataflow = builder.build().unwrap();
-        dataflow.run().unwrap();
+        rt().run(dataflow).unwrap();
 
         let collector_ra = port_a.collector();
         let ra = collector_ra.lock().unwrap();
@@ -1619,7 +1296,7 @@ mod tests {
             .map("to_string", |_t, x| format!("{x:.1}"))
             .output("results");
         let dataflow = builder.build().unwrap();
-        dataflow.run().unwrap();
+        rt().run(dataflow).unwrap();
 
         let collector = port.collector();
         let results = collector.lock().unwrap();
@@ -1634,11 +1311,10 @@ mod tests {
             .map("double", |_t, x| x * 2)
             .output("results");
         let dataflow = builder.build().unwrap();
-        dataflow.run().unwrap();
+        rt().run(dataflow).unwrap();
 
         let collector = port.collector();
         let results = collector.lock().unwrap();
-        // Empty batch produces no output (filtered by !result.is_empty())
         assert!(results.is_empty() || results[0].1.is_empty());
     }
 
@@ -1657,7 +1333,7 @@ mod tests {
             .map("double", |_t, x| x * 2)
             .output("results");
         let dataflow = builder.build().unwrap();
-        dataflow.run().unwrap();
+        rt().run(dataflow).unwrap();
 
         let collector = port.collector();
         let results = collector.lock().unwrap();
@@ -1674,7 +1350,7 @@ mod tests {
             .source("nums", vec![(0u64, vec![42i32])])
             .collect();
         let dataflow = builder.build().unwrap();
-        dataflow.run().unwrap();
+        rt().run(dataflow).unwrap();
 
         let results = collector.lock().unwrap();
         assert_eq!(results[0].1, vec![42]);
@@ -1690,7 +1366,7 @@ mod tests {
             .source("nums", vec![(0u64, vec![1i32, 2, 3])])
             .output("results");
         let dataflow = builder.build().unwrap();
-        let result = dataflow.run_with_cancel(cancel);
+        let result = SimpleRuntime::with_cancel(cancel).run(dataflow);
         assert!(result.is_err());
     }
 
@@ -1706,7 +1382,6 @@ mod tests {
         assert_eq!(dataflow.name(), "meta_test");
         assert_eq!(dataflow.input_names().len(), 0); // sources are not "input ports"
         assert_eq!(dataflow.output_names(), vec!["out"]);
-        // 2 sources + 1 unary + 1 sink = 4 operators
         assert_eq!(dataflow.operator_count(), 4);
     }
 
@@ -1714,7 +1389,6 @@ mod tests {
     #[should_panic(expected = "duplicate output port name")]
     fn test_duplicate_output_name_panics() {
         let builder = DataflowBuilder::<u64>::new("dup_test");
-        // Use two independent sources to avoid fan-out detection
         let s1 = builder.source("src1", vec![(0u64, vec![1i32])]);
         let s2 = builder.source("src2", vec![(0u64, vec![2i32])]);
         let _p1 = s1.output("results");
@@ -1728,8 +1402,7 @@ mod tests {
         let (stream, _probe) = stream.probe();
         let _port = stream.output("results");
         let dataflow = builder.build().unwrap();
-        dataflow.run().unwrap();
-        // Probe was registered — basic smoke test that it doesn't panic
+        rt().run(dataflow).unwrap();
     }
 
     #[test]
@@ -1746,7 +1419,7 @@ mod tests {
             })
             .output("results");
         let dataflow = builder.build().unwrap();
-        dataflow.run().unwrap();
+        rt().run(dataflow).unwrap();
 
         let collector = port.collector();
         let results = collector.lock().unwrap();
@@ -1758,15 +1431,14 @@ mod tests {
         let builder = DataflowBuilder::<u64>::new("input_test");
         let _port = builder.input::<i32>("data").output("results");
         let dataflow = builder.build().unwrap();
-        let result = dataflow.run();
+        let result = rt().run(dataflow);
         assert!(result.is_err());
         let err_msg = format!("{}", result.unwrap_err());
-        assert!(err_msg.contains("input ports require async runtime"));
+        assert!(err_msg.contains("input ports"));
     }
 
     #[test]
     fn test_spawn_basic_pipeline() {
-        // Build: input → double → output
         let builder = DataflowBuilder::<u64>::new("spawn_test");
         let input = builder.input::<i32>("numbers");
         input
@@ -1774,28 +1446,23 @@ mod tests {
             .output("results");
         let dataflow = builder.build().unwrap();
 
-        // Spawn on background thread
-        let mut handle = dataflow.spawn().unwrap();
+        let mut handle = rt().spawn(dataflow).unwrap();
 
-        // Send data and close input
         let sender = handle.take_input::<i32>("numbers").unwrap();
         sender.send(0, vec![1, 2, 3]).unwrap();
         sender.send(1, vec![10, 20]).unwrap();
         sender.close();
 
-        // Collect output
         let receiver = handle.take_output::<i32>("results").unwrap();
         let mut results = receiver.collect_data();
         results.sort_by_key(|(t, _)| *t);
 
-        // Verify doubling
         assert_eq!(results.len(), 2);
         assert_eq!(results[0].0, 0);
         assert_eq!(results[0].1, vec![2, 4, 6]);
         assert_eq!(results[1].0, 1);
         assert_eq!(results[1].1, vec![20, 40]);
 
-        // Wait for completion
         handle.join().unwrap();
     }
 
@@ -1808,7 +1475,7 @@ mod tests {
             .output("evens");
         let dataflow = builder.build().unwrap();
 
-        let mut handle = dataflow.spawn().unwrap();
+        let mut handle = rt().spawn(dataflow).unwrap();
         let sender = handle.take_input::<i32>("src").unwrap();
         sender.send(0, vec![1, 2, 3, 4, 5, 6]).unwrap();
         sender.close();
@@ -1828,8 +1495,7 @@ mod tests {
         input.output("out");
         let dataflow = builder.build().unwrap();
 
-        let mut handle = dataflow.spawn().unwrap();
-        // Try to get input with wrong type
+        let mut handle = rt().spawn(dataflow).unwrap();
         let result = handle.take_input::<String>("numbers");
         assert!(result.is_err());
         assert!(format!("{}", result.unwrap_err()).contains("type"));
@@ -1842,13 +1508,9 @@ mod tests {
         input.output("out");
         let dataflow = builder.build().unwrap();
 
-        let handle = dataflow.spawn().unwrap();
-        // Cancel without sending any data
+        let handle = rt().spawn(dataflow).unwrap();
         handle.cancel();
-        // join() should succeed (cancellation is not an error)
-        let result = handle.join();
-        // Either Ok or a cancellation error — both are acceptable
-        let _ = result;
+        let _ = handle.join();
     }
 
     #[test]
@@ -1858,8 +1520,7 @@ mod tests {
         input.output("out");
         let dataflow = builder.build().unwrap();
 
-        // Drop without join — should cancel and not hang
-        let _handle = dataflow.spawn().unwrap();
+        let _handle = rt().spawn(dataflow).unwrap();
         // SpawnedDataflow::drop cancels and joins
     }
 }
