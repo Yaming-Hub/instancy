@@ -12,7 +12,7 @@
 //! cargo run --example distinct
 //! ```
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 use instancy::dataflow::DataflowBuilder;
 use instancy::runtime::SimpleRuntime;
@@ -20,24 +20,32 @@ use instancy::runtime::SimpleRuntime;
 fn main() {
     let builder = DataflowBuilder::<u64>::new("distinct_demo");
 
-    let port = builder
-        .source(
-            "events",
-            vec![
-                (0u64, vec!["click", "view", "click", "purchase", "view", "click"]),
-                (1u64, vec!["login", "view", "click", "login", "purchase"]),
-            ],
-        )
+    let input = builder.source(
+        "events",
+        vec![
+            (0u64, vec!["click", "view", "click", "purchase", "view", "click"]),
+            (1u64, vec!["login", "view", "click", "login", "purchase"]),
+        ],
+    );
+
+    // State lives outside the closure so it persists across activations —
+    // the unary operator may call the closure multiple times as data arrives
+    // in separate batches under backpressure.
+    let mut seen: HashMap<u64, HashSet<String>> = HashMap::new();
+
+    let port = input
         // Deduplicate within each timestamp
-        .unary("distinct", |input, output| {
+        .unary("distinct", move |input, output| {
             while let Some((time, data)) = input.next() {
-                let mut seen = HashSet::new();
+                let set = seen.entry(time).or_default();
                 let unique: Vec<&str> = data
                     .iter()
-                    .filter(|item| seen.insert(item.to_string()))
+                    .filter(|item| set.insert(item.to_string()))
                     .copied()
                     .collect();
-                output.push_vec(time, unique);
+                if !unique.is_empty() {
+                    output.push_vec(time, unique);
+                }
             }
             Ok(())
         })

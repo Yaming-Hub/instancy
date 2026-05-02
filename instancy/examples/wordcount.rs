@@ -43,19 +43,29 @@ fn main() {
                 .map(|w| w.to_lowercase())
                 .collect()
         })
-        // Count word occurrences per timestamp using a stateful unary operator
-        .unary("count_words", |input, output| {
-            while let Some((time, words)) = input.next() {
-                let mut counts: HashMap<String, usize> = HashMap::new();
-                for word in words {
-                    *counts.entry(word.clone()).or_insert(0) += 1;
+        // Count word occurrences per timestamp using a stateful unary operator.
+        // State lives outside the closure so it persists across activations —
+        // under backpressure, data for the same timestamp may arrive in
+        // multiple batches.
+        .unary("count_words", {
+            let mut counts_by_time: HashMap<u64, HashMap<String, usize>> = HashMap::new();
+            move |input, output| {
+                while let Some((time, words)) = input.next() {
+                    let counts = counts_by_time.entry(time).or_default();
+                    for word in words {
+                        *counts.entry(word.clone()).or_insert(0) += 1;
+                    }
+                    // Emit current snapshot — a production pipeline would use
+                    // notifications/frontiers to emit only when a timestamp
+                    // is fully consumed.
+                    let mut pairs: Vec<(String, usize)> = counts.iter()
+                        .map(|(k, &v)| (k.clone(), v))
+                        .collect();
+                    pairs.sort();
+                    output.push_vec(time, pairs);
                 }
-                // Emit sorted (word, count) pairs for deterministic output
-                let mut pairs: Vec<(String, usize)> = counts.into_iter().collect();
-                pairs.sort();
-                output.push_vec(time, pairs);
+                Ok(())
             }
-            Ok(())
         })
         .output("counts");
 
