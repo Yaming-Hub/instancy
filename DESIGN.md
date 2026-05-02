@@ -518,47 +518,162 @@ a waker and returns `Pending`.
    multiple executor futures on the same thread with per-task CAS-based state
    machine (IDLE→QUEUED→POLLING→DONE) and `PoolWaker` for async re-enqueue.
 
-**Async public API (Phase 3 — planned):** `RuntimeHandle::spawn()` and `run()`
-become `async fn`, making the API natural for callers already in an async runtime.
-Since most production applications use async I/O, the hosting app will typically
-run inside tokio or similar, and async spawn integrates cleanly:
+**Async I/O (Phase 3 — implemented):** While `spawn()`/`run()` remain synchronous
+(graph construction and channel wiring is pure CPU work), `spawn_async()` creates
+async I/O channels for feeding data into and collecting results from a running
+dataflow. This is feature-gated behind the `async-io` Cargo feature.
+
+The key insight: the **executor** is already async (Phase 2), but the **I/O boundary**
+was still synchronous. Phase 3 adds `AsyncInputSender` and `AsyncOutputReceiver` —
+async wrappers around `tokio::sync::mpsc` channels that integrate with the executor's
+`WakeHandle` for backpressure-aware async data flow.
+
+#### Channel Mode Selection
+
+The channel type is chosen at spawn time:
+
+| Method | Channel type | I/O handles | Use case |
+|---|---|---|---|
+| `spawn()` / `run()` | `std::sync::mpsc` | `InputSender` / `OutputReceiver` (sync) | Tests, scripts, CPU-only |
+| `spawn_async()` | `tokio::sync::mpsc` | `AsyncInputSender` / `AsyncOutputReceiver` | Production async I/O |
+
+Both modes share the same `ChannelSourceOperator` and `ChannelSinkOperator` via
+the `InputRecv` / `OutputSend` enum dispatch — the operator code doesn't know
+which channel backend is active:
 
 ```rust
-// Phase 3 API (planned)
-let mut handle = rt.spawn(dataflow).await?;
-let sender = handle.take_input::<i32>("data")?;
-sender.send(0, vec![1, 2, 3])?;
+/// Channel receive half — sync or async, selected at spawn time.
+enum InputRecv<T> {
+    Std(std::sync::mpsc::Receiver<T>),
+    #[cfg(feature = "async-io")]
+    Tokio(tokio::sync::mpsc::Receiver<T>),
+}
+
+/// Channel send half — sync or async, selected at spawn time.
+enum OutputSend<T> {
+    Std(std::sync::mpsc::SyncSender<T>),
+    #[cfg(feature = "async-io")]
+    Tokio(tokio::sync::mpsc::Sender<T>),
+}
+```
+
+Both variants expose a `try_recv()` / `try_send()` interface that works without
+a tokio runtime context — important because operator code runs on the custom
+worker pool threads, not on tokio threads.
+
+#### AsyncInputSender
+
+`AsyncInputSender<T, D>` wraps a `tokio::sync::mpsc::Sender` and the dataflow's
+`WakeHandle`. It provides the same API as the sync `InputSender`:
+
+```rust
+// Feed data into a running dataflow
+let sender = handle.take_async_input::<i32>("numbers").unwrap();
+
+// Send a batch — awaits if the channel is full (backpressure)
+sender.send(timestamp, vec![1, 2, 3]).await?;
+
+// Advance the input frontier
+sender.advance_frontier(next_timestamp).await?;
+
+// Signal input complete — drops all capabilities
 sender.close();
-handle.join().await?;
-
-// Multiple concurrent dataflows
-let (r1, r2) = tokio::join!(
-    rt.run(dataflow_a),
-    rt.run(dataflow_b),
-);
 ```
 
-Currently spawn/run are synchronous (graph construction + channel wiring is CPU-only),
-but the async signature future-proofs for cases where materialization involves async
-work (e.g., network connection setup for distributed dataflows, async resource
-allocation). Sync convenience methods (`run_blocking()`) remain available.
-Implementation: extract current sync logic into private `spawn_sync()`/`run_sync()`,
-public `async fn` wraps them, `run_blocking()` calls `run_sync()` directly.
+Key properties:
+- **Clone**: multiple producers can feed the same input (channel closes when all drop)
+- **WakeHandle integration**: each `send()` notifies the executor's WakeHandle,
+  waking it from idle to process the new data
+- **Backpressure**: `send().await` yields when the channel is full, naturally
+  integrating with tokio's cooperative scheduling
 
-This is the key enabler for "multiple dataflows share threads cooperatively" — the
-original design goal. Operators remain synchronous (`activate()` works on in-memory
-data), but the executor itself is async-aware for idle waiting.
+#### AsyncOutputReceiver
+
+`AsyncOutputReceiver<T, D>` wraps a `tokio::sync::mpsc::Receiver` and the
+dataflow's `WakeHandle`. It provides an async stream-like interface:
+
+```rust
+// Collect results from a running dataflow
+let mut out = handle.take_async_output::<String>("results").unwrap();
+
+// Receive batches — awaits until data is available
+while let Some((timestamp, batch)) = out.recv().await {
+    println!("t={timestamp}: {batch:?}");
+}
+// None means the output is exhausted (dataflow complete)
+```
+
+Key properties:
+- **WakeHandle integration**: each `recv()` notifies the executor's WakeHandle
+  after consuming data, relieving backpressure on sink operators
+- **Drop notification**: dropping the receiver notifies the WakeHandle, so
+  backpressured sinks don't block forever if the consumer is cancelled
+
+#### End-to-End Async Flow
 
 ```
-Phase 1 (current):                    Phase 2 (planned):
-┌──────────────┐                     ┌──────────────┐
-│ Worker Thread │                     │ Worker Thread │
-│              │                     │              │
-│ executor.run()  ← blocks until    │ poll(executor_A)  ← returns Pending
-│                   completion      │ poll(executor_B)  ← returns Ready
-│              │                     │ poll(executor_C)  ← returns Pending
-│              │                     │ ... park until woken ...
-└──────────────┘                     └──────────────┘
+Producer task                  Worker Pool                    Consumer task
+(tokio thread)                 (custom threads)               (tokio thread)
+     │                              │                              │
+     │ sender.send(t, data).await   │                              │
+     ├─────────tokio::mpsc──────────►                              │
+     │                         try_recv()                          │
+     │                    ChannelSourceOperator                     │
+     │                         activates                           │
+     │                              │                              │
+     │                    operator pipeline                        │
+     │                    (map → filter → ...)                     │
+     │                              │                              │
+     │                    ChannelSinkOperator                      │
+     │                        try_send()                           │
+     │                              ├──────tokio::mpsc─────────────►
+     │                              │              out.recv().await │
+     │                              │                              │
+```
+
+#### Panic Safety
+
+All mutex locks in the async I/O path use poison-safe patterns (Phase 3.5):
+- Channel operators: `lock().ok()` / `lock().map_err()` — errors propagate naturally
+- WakeHandle: `lock().unwrap_or_else(|e| e.into_inner())` for waker registration
+- CompletionNotifier: `into_inner()` ensures completion signal always delivered
+
+```rust
+// Example: spawn_async end-to-end
+let rt = RuntimeHandle::new(pool, registry);
+let mut spawned = rt.spawn_async(&dataflow)?;
+
+let sender = spawned.take_async_input::<i32>("data").unwrap();
+let mut output = spawned.take_async_output::<String>("results").unwrap();
+let completion = spawned.join();
+
+// Producer
+tokio::spawn(async move {
+    sender.send(0, vec![1, 2, 3, 4, 5]).await.unwrap();
+    sender.close();
+});
+
+// Consumer
+while let Some((t, batch)) = output.recv().await {
+    println!("t={t}: {batch:?}");
+}
+
+completion.await?;
+```
+
+```
+Phase 1 (sync):                      Phase 2 (async executor):           Phase 3 (async I/O):
+┌──────────────┐                     ┌──────────────┐                    ┌──────────────┐
+│ Worker Thread │                     │ Worker Thread │                    │ Worker Thread │
+│              │                     │              │                    │              │
+│ executor.run()  ← blocks until    │ poll(exec_A)  ← Pending          │ poll(exec_A)  ← Pending
+│                   completion      │ poll(exec_B)  ← Ready            │ poll(exec_B)  ← Ready
+│              │                     │ poll(exec_C)  ← Pending          │              │
+│              │                     │ ... park ...  │                    │ ... park ...  │
+└──────────────┘                     └──────────────┘                    └──┬───────┬───┘
+                                                                           │       │
+                                                            tokio::mpsc ◄──┘       └──► tokio::mpsc
+                                                           (async input)           (async output)
 ```
 
 ### 5.3 Logical Workers & Task Queue
@@ -3786,20 +3901,28 @@ This section documents the cardinality (how many instances exist) and lifetime (
 - Progress tracking (single-process)
 - `execute()` bootstrap with dynamic worker pool
 
-**Phase 3 — Loops & Branching**
+**Phase 3 — Async I/O & Robustness**
+- `spawn_async()` with `tokio::sync::mpsc` channel backend (feature-gated `async-io`)
+- `AsyncInputSender` / `AsyncOutputReceiver` with WakeHandle integration
+- `ChannelMode` enum (Sync | Async) selected at spawn time
+- `InputRecv` / `OutputSend` enum dispatch in ChannelSourceOperator / ChannelSinkOperator
+- Panic safety audit: poison-safe mutex patterns across all non-test source files
+- `DataflowCompletion` as real Future (poll + sync wait)
+
+**Phase 4 — Loops & Branching**
 - `feedback` / `loop_variable` / `connect_loop`
 - `enter` / `leave` for nested scopes
 - `branch` / `ok_err`
 - Error handling policy (`ErrorPolicy::Stop` / `ErrorPolicy::Ignore`)
 
-**Phase 4 — Networking**
+**Phase 5 — Networking**
 - `ConnectionManager` trait + `TcpConnectionManager` default
 - `ConnectionPool` with dynamic scaling (min/max connections)
 - Wire protocol (framing + multiplexing)
 - `exchange` operator across processes
 - Inter-process progress tracking
 
-**Phase 5 — Observability, Checkpointing & Polish**
+**Phase 6 — Observability, Checkpointing & Polish**
 - Per-dataflow CPU time tracking (`DataflowMetrics`, `OperatorMetrics`)
 - `Checkpoint` operator + `CheckpointBackend` trait + fast-forward recovery
 - Cancellation integration
