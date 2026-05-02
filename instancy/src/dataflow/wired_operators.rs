@@ -468,6 +468,351 @@ impl<T: Timestamp, D: Send + 'static> SchedulableOperator for WiredSinkOperator<
 }
 
 // ---------------------------------------------------------------------------
+// WiredBinaryOperator
+// ---------------------------------------------------------------------------
+
+/// A fully-wired (materialized) binary operator with two typed inputs and one output.
+///
+/// The user logic receives two `InputHandle`s and one `OutputHandle`. Data may
+/// arrive on either input independently; the logic must handle partial availability.
+pub struct WiredBinaryOperator<
+    T: Timestamp,
+    D1: Send + 'static,
+    D2: Send + 'static,
+    D3: Send + 'static,
+> {
+    name: String,
+    index: usize,
+    region_id: RegionId,
+    input1_puller: Box<dyn Pull<T, D1>>,
+    input2_puller: Box<dyn Pull<T, D2>>,
+    input1_handle: InputHandle<T, D1>,
+    input2_handle: InputHandle<T, D2>,
+    logic: Box<
+        dyn FnMut(&mut InputHandle<T, D1>, &mut InputHandle<T, D2>, &mut OutputHandle<T, D3>) -> Result<()>
+            + Send,
+    >,
+    output_handle: OutputHandle<T, D3>,
+    output_pusher: Box<dyn Push<T, D3>>,
+    pending_output: VecDeque<Envelope<T, D3>>,
+    input1_exhausted: bool,
+    input2_exhausted: bool,
+    done: bool,
+}
+
+impl<T: Timestamp, D1: Send + 'static, D2: Send + 'static, D3: Send + 'static>
+    WiredBinaryOperator<T, D1, D2, D3>
+{
+    /// Create a new wired binary operator.
+    pub fn new(
+        name: impl Into<String>,
+        index: usize,
+        region_id: RegionId,
+        logic: impl FnMut(&mut InputHandle<T, D1>, &mut InputHandle<T, D2>, &mut OutputHandle<T, D3>) -> Result<()>
+            + Send
+            + 'static,
+        input1_puller: Box<dyn Pull<T, D1>>,
+        input2_puller: Box<dyn Pull<T, D2>>,
+        output_pusher: Box<dyn Push<T, D3>>,
+    ) -> Self {
+        let name = name.into();
+        Self {
+            input1_handle: InputHandle::new(format!("{name}:input1")),
+            input2_handle: InputHandle::new(format!("{name}:input2")),
+            output_handle: OutputHandle::new(format!("{name}:output")),
+            name,
+            index,
+            region_id,
+            input1_puller,
+            input2_puller,
+            logic: Box::new(logic),
+            output_pusher,
+            pending_output: VecDeque::new(),
+            input1_exhausted: false,
+            input2_exhausted: false,
+            done: false,
+        }
+    }
+
+    fn flush_pending_output(&mut self) -> Result<bool> {
+        while let Some(envelope) = self.pending_output.pop_front() {
+            match self.output_pusher.try_push(envelope) {
+                Ok(()) => {}
+                Err((Error::Backpressure, returned)) => {
+                    self.pending_output.push_front(returned);
+                    return Ok(false);
+                }
+                Err((e, _returned)) => return Err(e),
+            }
+        }
+        Ok(true)
+    }
+
+    fn pull_input1(&mut self) {
+        loop {
+            match self.input1_puller.pull() {
+                Some(envelope) => match envelope.payload {
+                    Payload::Data { time, data } => {
+                        self.input1_handle.push_vec(time, data);
+                    }
+                    Payload::Control(_) => {}
+                },
+                None => {
+                    if self.input1_puller.is_exhausted() {
+                        self.input1_exhausted = true;
+                        self.input1_handle.mark_exhausted();
+                    }
+                    break;
+                }
+            }
+        }
+    }
+
+    fn pull_input2(&mut self) {
+        loop {
+            match self.input2_puller.pull() {
+                Some(envelope) => match envelope.payload {
+                    Payload::Data { time, data } => {
+                        self.input2_handle.push_vec(time, data);
+                    }
+                    Payload::Control(_) => {}
+                },
+                None => {
+                    if self.input2_puller.is_exhausted() {
+                        self.input2_exhausted = true;
+                        self.input2_handle.mark_exhausted();
+                    }
+                    break;
+                }
+            }
+        }
+    }
+
+    fn push_output(&mut self) -> Result<bool> {
+        for (time, data) in self.output_handle.drain() {
+            self.pending_output.push_back(Envelope::data(time, data));
+        }
+        self.flush_pending_output()
+    }
+}
+
+impl<T: Timestamp, D1: Send + 'static, D2: Send + 'static, D3: Send + 'static>
+    SchedulableOperator for WiredBinaryOperator<T, D1, D2, D3>
+{
+    fn activate(&mut self) -> Result<ActivationOutcome> {
+        if self.done {
+            return Ok(ActivationOutcome::Done);
+        }
+
+        // Step 1: Flush pending output from previous activation.
+        if !self.pending_output.is_empty() {
+            if !self.flush_pending_output()? {
+                return Ok(ActivationOutcome::BlockedOnBackpressure);
+            }
+        }
+
+        // Step 2: Pull from both input channels.
+        self.pull_input1();
+        self.pull_input2();
+
+        // Step 3: Check if there's work to do.
+        let has_input = self.input1_handle.has_pending() || self.input2_handle.has_pending();
+        let both_exhausted = self.input1_exhausted && self.input2_exhausted;
+
+        if !has_input && both_exhausted {
+            self.output_pusher.close();
+            self.done = true;
+            return Ok(ActivationOutcome::Done);
+        }
+
+        if !has_input {
+            return Ok(ActivationOutcome::Idle);
+        }
+
+        // Step 4: Run user logic.
+        (self.logic)(
+            &mut self.input1_handle,
+            &mut self.input2_handle,
+            &mut self.output_handle,
+        )?;
+
+        // Step 5: Push output.
+        if !self.push_output()? {
+            return Ok(ActivationOutcome::BlockedOnBackpressure);
+        }
+
+        // Step 6: Check if done.
+        if both_exhausted
+            && !self.input1_handle.has_pending()
+            && !self.input2_handle.has_pending()
+            && !self.output_handle.has_output()
+        {
+            self.output_pusher.close();
+            self.done = true;
+            return Ok(ActivationOutcome::Done);
+        }
+
+        Ok(ActivationOutcome::MadeProgress)
+    }
+
+    fn is_done(&self) -> bool {
+        self.done
+    }
+
+    fn name(&self) -> &str {
+        &self.name
+    }
+
+    fn index(&self) -> usize {
+        self.index
+    }
+
+    fn region_id(&self) -> RegionId {
+        self.region_id
+    }
+
+    fn close_inputs(&mut self) {
+        self.input1_exhausted = true;
+        self.input1_handle.mark_exhausted();
+        self.input2_exhausted = true;
+        self.input2_handle.mark_exhausted();
+    }
+}
+
+// ---------------------------------------------------------------------------
+// WiredConcatOperator
+// ---------------------------------------------------------------------------
+
+/// A fully-wired N-input, 1-output operator that merges data from multiple
+/// same-typed streams into a single output stream. Data order within a
+/// timestamp is preserved per-input but interleaved across inputs.
+pub struct WiredConcatOperator<T: Timestamp, D: Send + 'static> {
+    name: String,
+    index: usize,
+    region_id: RegionId,
+    input_pullers: Vec<Box<dyn Pull<T, D>>>,
+    inputs_exhausted: Vec<bool>,
+    output_pusher: Box<dyn Push<T, D>>,
+    pending_output: VecDeque<Envelope<T, D>>,
+    done: bool,
+}
+
+impl<T: Timestamp, D: Send + 'static> WiredConcatOperator<T, D> {
+    /// Create a concat operator that merges N input streams.
+    pub fn new(
+        name: impl Into<String>,
+        index: usize,
+        region_id: RegionId,
+        input_pullers: Vec<Box<dyn Pull<T, D>>>,
+        output_pusher: Box<dyn Push<T, D>>,
+    ) -> Self {
+        let num_inputs = input_pullers.len();
+        Self {
+            name: name.into(),
+            index,
+            region_id,
+            input_pullers,
+            inputs_exhausted: vec![false; num_inputs],
+            output_pusher,
+            pending_output: VecDeque::new(),
+            done: false,
+        }
+    }
+
+    fn flush_pending_output(&mut self) -> Result<bool> {
+        while let Some(envelope) = self.pending_output.pop_front() {
+            match self.output_pusher.try_push(envelope) {
+                Ok(()) => {}
+                Err((Error::Backpressure, returned)) => {
+                    self.pending_output.push_front(returned);
+                    return Ok(false);
+                }
+                Err((e, _returned)) => return Err(e),
+            }
+        }
+        Ok(true)
+    }
+}
+
+impl<T: Timestamp, D: Send + 'static> SchedulableOperator for WiredConcatOperator<T, D> {
+    fn activate(&mut self) -> Result<ActivationOutcome> {
+        if self.done {
+            return Ok(ActivationOutcome::Done);
+        }
+
+        // Flush pending output.
+        if !self.pending_output.is_empty() {
+            if !self.flush_pending_output()? {
+                return Ok(ActivationOutcome::BlockedOnBackpressure);
+            }
+        }
+
+        // Pull from all inputs and forward directly to output.
+        let mut made_progress = false;
+        for i in 0..self.input_pullers.len() {
+            loop {
+                match self.input_pullers[i].pull() {
+                    Some(envelope) => {
+                        if let Payload::Data { time, data } = envelope.payload {
+                            self.pending_output.push_back(Envelope::data(time, data));
+                            made_progress = true;
+                        }
+                    }
+                    None => {
+                        if self.input_pullers[i].is_exhausted() {
+                            self.inputs_exhausted[i] = true;
+                        }
+                        break;
+                    }
+                }
+            }
+        }
+
+        // Push to output.
+        if !self.pending_output.is_empty() {
+            if !self.flush_pending_output()? {
+                return Ok(ActivationOutcome::BlockedOnBackpressure);
+            }
+        }
+
+        // Check if all inputs are exhausted.
+        if self.inputs_exhausted.iter().all(|e| *e) {
+            self.output_pusher.close();
+            self.done = true;
+            return Ok(ActivationOutcome::Done);
+        }
+
+        if made_progress {
+            Ok(ActivationOutcome::MadeProgress)
+        } else {
+            Ok(ActivationOutcome::Idle)
+        }
+    }
+
+    fn is_done(&self) -> bool {
+        self.done
+    }
+
+    fn name(&self) -> &str {
+        &self.name
+    }
+
+    fn index(&self) -> usize {
+        self.index
+    }
+
+    fn region_id(&self) -> RegionId {
+        self.region_id
+    }
+
+    fn close_inputs(&mut self) {
+        for exhausted in &mut self.inputs_exhausted {
+            *exhausted = true;
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
