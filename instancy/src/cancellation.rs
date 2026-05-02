@@ -42,15 +42,21 @@
 
 use std::fmt;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
+
+use crate::dataflow::channels::wake::WakeHandle;
 
 /// Shared state for a cancellation token.
-#[derive(Debug)]
 struct TokenInner {
     /// Whether this token has been cancelled.
     cancelled: AtomicBool,
     /// Parent token (if any). Cancelling the parent cancels this token.
     parent: Option<Arc<TokenInner>>,
+    /// Wake handles to notify when this token is cancelled.
+    ///
+    /// Only accessed during `register_wake_handle()` (setup) and `cancel()`
+    /// (one-shot). The `is_cancelled()` hot path remains lock-free.
+    wake_handles: Mutex<Vec<WakeHandle>>,
 }
 
 /// A cooperative cancellation signal for dataflow shutdown.
@@ -76,6 +82,7 @@ impl CancellationToken {
             inner: Arc::new(TokenInner {
                 cancelled: AtomicBool::new(false),
                 parent: None,
+                wake_handles: Mutex::new(Vec::new()),
             }),
         }
     }
@@ -91,6 +98,7 @@ impl CancellationToken {
             inner: Arc::new(TokenInner {
                 cancelled: AtomicBool::new(false),
                 parent: Some(Arc::clone(&self.inner)),
+                wake_handles: Mutex::new(Vec::new()),
             }),
         }
     }
@@ -100,8 +108,19 @@ impl CancellationToken {
     /// This is idempotent — calling cancel() multiple times is safe.
     /// Cancellation propagates to all child tokens (they observe it
     /// via their parent link).
+    ///
+    /// Any wake handles registered via [`register_wake_handle`](Self::register_wake_handle)
+    /// are notified so that sleeping async executors wake promptly.
     pub fn cancel(&self) {
-        self.inner.cancelled.store(true, Ordering::Release);
+        // Use swap to ensure we only notify once (idempotent).
+        if !self.inner.cancelled.swap(true, Ordering::AcqRel) {
+            // First cancellation — notify all registered wake handles.
+            if let Ok(handles) = self.inner.wake_handles.lock() {
+                for handle in handles.iter() {
+                    handle.notify();
+                }
+            }
+        }
     }
 
     /// Check whether this token has been cancelled.
@@ -147,6 +166,59 @@ impl CancellationToken {
             Err(crate::error::Error::Cancelled)
         } else {
             Ok(())
+        }
+    }
+
+    /// Register a wake handle to be notified when this token is cancelled.
+    ///
+    /// The handle is registered on this token **and all ancestor tokens** so
+    /// that parent cancellation (which children detect via `is_cancelled()`
+    /// polling) also wakes sleeping executors promptly.
+    ///
+    /// **Race safety:** If the token (or any ancestor) is already cancelled at
+    /// the time of registration, the handle is notified immediately. This
+    /// prevents a lost-wakeup race where cancellation fires just before
+    /// registration completes.
+    ///
+    /// This method is called once during executor setup — it is not on the
+    /// hot path. The `is_cancelled()` check remains lock-free.
+    ///
+    /// **Note on lifecycle:** The WakeHandle clones stored in ancestor tokens
+    /// are *not* automatically removed when the child token or executor is
+    /// dropped. After executor completion, `WakeHandle::clear_waker()` should
+    /// be called to break the Waker→Executor reference chain, leaving only a
+    /// lightweight `Arc<WakeState>` (AtomicBool + empty Mutex). For extremely
+    /// long-lived runtimes that spawn millions of dataflows, consider switching
+    /// to `Weak<WakeState>` in the Vec to allow full reclamation.
+    pub fn register_wake_handle(&self, handle: WakeHandle) {
+        // Register on self
+        Self::register_on_node(&self.inner, handle.clone());
+
+        // Register on all ancestors so parent.cancel() also wakes us
+        let mut current = &self.inner.parent;
+        while let Some(ancestor) = current {
+            Self::register_on_node(ancestor, handle.clone());
+            current = &ancestor.parent;
+        }
+
+        // Race safety: re-check cancellation after registration. If the token
+        // was cancelled between our initial check and the registration, we
+        // might have missed the notification. Notify now to be safe.
+        if self.is_cancelled() {
+            handle.notify();
+        }
+    }
+
+    /// Register a wake handle on a single token node.
+    /// If the node is already cancelled, notify immediately.
+    fn register_on_node(node: &Arc<TokenInner>, handle: WakeHandle) {
+        if let Ok(mut handles) = node.wake_handles.lock() {
+            handles.push(handle.clone());
+        }
+        // If this node is already cancelled, notify immediately.
+        // This handles the race where cancel() ran before we inserted.
+        if node.cancelled.load(Ordering::Acquire) {
+            handle.notify();
         }
     }
 
@@ -423,5 +495,96 @@ mod tests {
         }
 
         assert!(token.is_cancelled());
+    }
+
+    #[test]
+    fn cancel_notifies_registered_wake_handle() {
+        let token = CancellationToken::new();
+        let wake = WakeHandle::new();
+        // Consume the initial notification (WakeHandle starts notified)
+        wake.take_notification();
+
+        token.register_wake_handle(wake.clone());
+        assert!(!wake.take_notification());
+
+        token.cancel();
+        assert!(wake.take_notification());
+    }
+
+    #[test]
+    fn parent_cancel_notifies_child_wake_handle() {
+        let parent = CancellationToken::new();
+        let child = parent.child_token();
+        let wake = WakeHandle::new();
+        wake.take_notification();
+
+        // Register on child — should also register on parent
+        child.register_wake_handle(wake.clone());
+        assert!(!wake.take_notification());
+
+        // Cancel parent — child's wake handle should be notified
+        parent.cancel();
+        assert!(wake.take_notification());
+        assert!(child.is_cancelled());
+    }
+
+    #[test]
+    fn register_on_already_cancelled_token_notifies_immediately() {
+        let token = CancellationToken::new();
+        token.cancel();
+
+        let wake = WakeHandle::new();
+        wake.take_notification();
+
+        // Register after cancellation — should notify immediately
+        token.register_wake_handle(wake.clone());
+        assert!(wake.take_notification());
+    }
+
+    #[test]
+    fn register_on_child_of_already_cancelled_parent_notifies_immediately() {
+        let parent = CancellationToken::new();
+        parent.cancel();
+
+        let child = parent.child_token();
+        let wake = WakeHandle::new();
+        wake.take_notification();
+
+        child.register_wake_handle(wake.clone());
+        assert!(wake.take_notification());
+    }
+
+    #[test]
+    fn multiple_wake_handles_all_notified() {
+        let token = CancellationToken::new();
+        let wake1 = WakeHandle::new();
+        let wake2 = WakeHandle::new();
+        wake1.take_notification();
+        wake2.take_notification();
+
+        token.register_wake_handle(wake1.clone());
+        token.register_wake_handle(wake2.clone());
+
+        token.cancel();
+        assert!(wake1.take_notification());
+        assert!(wake2.take_notification());
+    }
+
+    #[test]
+    fn idempotent_cancel_only_notifies_once() {
+        use std::sync::atomic::AtomicUsize;
+
+        let token = CancellationToken::new();
+        let wake = WakeHandle::new();
+        wake.take_notification();
+
+        token.register_wake_handle(wake.clone());
+        token.cancel();
+        assert!(wake.take_notification());
+
+        // Second cancel — wake handle was already notified during first cancel.
+        // swap(true) returns true, so notification loop is skipped.
+        token.cancel();
+        assert!(!wake.take_notification());
     }
 }
