@@ -3494,18 +3494,42 @@ pub enum AggregatedOutcome {
 
 2. **Worker placement is decided by the coordinator (host app)** — a dataflow does not necessarily run on all cluster nodes. The coordinator selects which nodes participate and how many logical workers each node contributes. It builds a per-dataflow `ClusterTopology` containing only the selected nodes and their worker assignments, then passes this topology to each node when starting the dataflow. instancy does not make placement decisions — it executes the assignment it receives. instancy may provide a `PlacementStrategy` trait and validation helpers (e.g., verify total workers match region parallelism requirements), but actual placement logic depends on factors only the host app knows: node load, data locality, cost constraints, hardware capabilities, etc.
 
-3. **instancy provides the building blocks** — `DataflowHandle`, `ProgressUpdate`, `OutcomeAggregator`, and `CancellationToken` provide everything the coordinator needs to manage distributed execution.
+3. **Data locality is application knowledge, not instancy's** — expanding on #2 above: instancy is a data-locality-agnostic execution engine. It provides mechanisms — per-worker named input ports, configurable cluster topology, exchange operators — but never assumes where data resides or how partitions map to workers. The hosting application has full knowledge of data placement and configures the dataflow accordingly. For example, if a dataset has 8 partitions across 2 machines (4 per machine), the host app starts 2 nodes with 4 logical workers each, and feeds each worker its local partition by binding a separate `TimestampedInput` stream per worker (e.g., `.input("data_0", partition_0_stream)` through `.input("data_3", partition_3_stream)` on each node). First-region operators process data locally (no exchange needed), reducing data volume before cross-node `exchange()` in later regions. This data-local-first pattern minimizes network traffic and maximizes throughput, but it is entirely the host app's decision — instancy simply executes the worker-to-partition mapping it receives. Worker IDs are global and assigned by the topology (via node ordering in `ClusterTopology`); the host should compute each node's worker-id range from the topology rather than assuming `0..N` are local.
 
-4. **Progress frontier is the source of truth for "how far we got"** — when a dataflow is interrupted (cancelled or failed), the `progress_frontier` tells the coordinator which timestamps have been fully processed. This enables:
+    ```
+    Host app decides placement based on data locality:
+
+    Machine A (data partitions 0-3):       Machine B (data partitions 4-7):
+    ┌────────────────────────────┐         ┌────────────────────────────┐
+    │ Partition 0 → Worker 0     │         │ Partition 4 → Worker 4     │
+    │ Partition 1 → Worker 1     │         │ Partition 5 → Worker 5     │
+    │ Partition 2 → Worker 2     │         │ Partition 6 → Worker 6     │
+    │ Partition 3 → Worker 3     │         │ Partition 7 → Worker 7     │
+    │                            │         │                            │
+    │ First region: local        │         │ First region: local        │
+    │ processing (no shuffle)    │         │ processing (no shuffle)    │
+    │                            │         │                            │
+    │ Later regions:             │◄───────►│ Later regions:             │
+    │ exchange() across nodes    │         │ exchange() across nodes    │
+    │ (all-to-all by hash key)   │         │ (all-to-all by hash key)   │
+    └────────────────────────────┘         └────────────────────────────┘
+
+    instancy provides: per-worker input ports, exchange(), ConnectionPool
+    Host app provides: partition-to-worker mapping, connection factory, node topology
+    ```
+
+4. **instancy provides the building blocks** — `DataflowHandle`, `ProgressUpdate`, `OutcomeAggregator`, and `CancellationToken` provide everything the coordinator needs to manage distributed execution.
+
+5. **Progress frontier is the source of truth for "how far we got"** — when a dataflow is interrupted (cancelled or failed), the `progress_frontier` tells the coordinator which timestamps have been fully processed. This enables:
    - Resume from last committed timestamp
    - Report partial progress to the user
    - Exactly-once semantics when combined with checkpointing
 
-5. **Cancellation is cooperative and distributed** — the coordinator cancels locally via `DataflowHandle::cancel()`, then sends a cancel command to remote nodes via the host app's communication layer. Each node's executor checks its local `CancellationToken` and drains gracefully.
+6. **Cancellation is cooperative and distributed** — the coordinator cancels locally via `DataflowHandle::cancel()`, then sends a cancel command to remote nodes via the host app's communication layer. Each node's executor checks its local `CancellationToken` and drains gracefully.
 
-6. **Error reporting flows back to the coordinator** — when an operator fails, the local executor captures the error in `DataflowOutcome::Failed` with the progress frontier. The host app collects these outcomes and the `OutcomeAggregator` determines the global result.
+7. **Error reporting flows back to the coordinator** — when an operator fails, the local executor captures the error in `DataflowOutcome::Failed` with the progress frontier. The host app collects these outcomes and the `OutcomeAggregator` determines the global result.
 
-7. **The coordinator node is designated by the host app, not by instancy** — any node can be the coordinator. Typically it's the node that received the user request. instancy doesn't need to know which node is the coordinator.
+8. **The coordinator node is designated by the host app, not by instancy** — any node can be the coordinator. Typically it's the node that received the user request. instancy doesn't need to know which node is the coordinator.
 
 ---
 
