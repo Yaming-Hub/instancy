@@ -9,7 +9,7 @@ use std::fmt;
 use crate::dataflow::channels::PartitionStrategy;
 use crate::dataflow::region::RegionId;
 use crate::dataflow::scope::Scope;
-use crate::dataflow::stream::{DataStream, Slot};
+use crate::dataflow::stream::{StreamEdge, Slot};
 use crate::progress::timestamp::Timestamp;
 
 /// A registered gather operator.
@@ -87,17 +87,17 @@ impl<T: Timestamp, D> fmt::Debug for GatherOperator<T, D> {
     }
 }
 
-/// Extension trait for constructing gather operators on a `DataStream`.
+/// Extension trait for constructing gather operators on a `StreamEdge`.
 pub trait GatherExt<S: Scope, D> {
     /// Funnel all data to a single worker.
     ///
     /// Creates a new execution region with parallelism 1 and routes all
     /// data to worker 0 in that region. Use this before global aggregations.
-    fn gather(&self) -> DataStream<S, D>;
+    fn gather(&self) -> StreamEdge<S, D>;
 }
 
-impl<S: Scope, D: 'static> GatherExt<S, D> for DataStream<S, D> {
-    fn gather(&self) -> DataStream<S, D> {
+impl<S: Scope, D: 'static> GatherExt<S, D> for StreamEdge<S, D> {
+    fn gather(&self) -> StreamEdge<S, D> {
         let mut scope = self.scope().clone();
         let source_region = self.region_id();
         let op_index = scope.allocate_operator_index();
@@ -124,7 +124,7 @@ impl<S: Scope, D: 'static> GatherExt<S, D> for DataStream<S, D> {
             target_region,
         );
 
-        DataStream::new(scope, output_slot, target_region)
+        StreamEdge::new(scope, output_slot, target_region)
     }
 }
 
@@ -138,8 +138,8 @@ mod tests {
         let scope = RootScope::<u64>::new("test", 8);
         let region_id = scope.current_region().id();
         let source = Slot::new(0, 0);
-        let stream: DataStream<RootScope<u64>, i32> =
-            DataStream::new(scope.clone(), source, region_id);
+        let stream: StreamEdge<RootScope<u64>, i32> =
+            StreamEdge::new(scope.clone(), source, region_id);
 
         let gathered = stream.gather();
         // Must be a different region
@@ -154,8 +154,8 @@ mod tests {
         let scope = RootScope::<u64>::new("test", 1);
         let region_id = scope.current_region().id();
         let source = Slot::new(0, 0);
-        let stream: DataStream<RootScope<u64>, i32> =
-            DataStream::new(scope.clone(), source, region_id);
+        let stream: StreamEdge<RootScope<u64>, i32> =
+            StreamEdge::new(scope.clone(), source, region_id);
 
         // Even from parallelism=1, gather creates a new region (consistent behavior).
         let gathered = stream.gather();

@@ -23,7 +23,7 @@ pub use channel_operators::{
     ChannelSinkOperator, ChannelSourceOperator, InputSender, OutputReceiver,
 };
 pub use channels::{ControlSignal, Envelope, PartitionStrategy, Payload};
-pub use dataflow_builder::{DataflowBuilder, DataflowBuilderConfig, LogicalDataflow, OutputPort, Stream};
+pub use dataflow_builder::{DataflowBuilder, DataflowBuilderConfig, LogicalDataflow, OutputPort, Pipe};
 pub use executor::{DataflowExecutor, ExecutorConfig};
 pub use graph::{DataflowGraph, EdgeInfo, OperatorInfo};
 pub use id::DataflowId;
@@ -34,4 +34,4 @@ pub use region::{PlacementPolicy, Region, RegionAllocator, RegionId};
 pub use schedulable::{ActivationOutcome, ChannelEndpoints, OperatorFactory, SchedulableOperator};
 pub use scope::{ChildScope, RootScope, Scope, ScopeAddr};
 pub use spec::{DataflowHandle, DataflowInputs, DataflowSpec};
-pub use stream::{DataStream, Slot, StreamConnection};
+pub use stream::{StreamEdge, Slot, StreamConnection};

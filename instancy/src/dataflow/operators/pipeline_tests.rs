@@ -385,21 +385,21 @@ mod tests {
         assert!(handle.frontier().elements().is_empty());
     }
 
-    /// DataStream extension chaining: unary → inspect → probe
+    /// StreamEdge extension chaining: unary → inspect → probe
     #[test]
     fn stream_ext_chaining() {
         use crate::dataflow::operators::inspect::InspectExt;
         use crate::dataflow::operators::probe::ProbeExt;
         use crate::dataflow::operators::unary::UnaryExt;
         use crate::dataflow::scope::{RootScope, Scope};
-        use crate::dataflow::stream::{DataStream, Slot};
+        use crate::dataflow::stream::{StreamEdge, Slot};
 
         let mut scope = RootScope::<u64>::new("pipeline", 4);
         let region_id = scope.current_region().id();
         let src_idx = scope.allocate_operator_index();
         let source = Slot::new(src_idx, 0);
-        let stream: DataStream<RootScope<u64>, i32> =
-            DataStream::new(scope, source, region_id);
+        let stream: StreamEdge<RootScope<u64>, i32> =
+            StreamEdge::new(scope, source, region_id);
 
         // Chain: unary(double) → inspect → probe
         let handle = stream
@@ -584,7 +584,7 @@ mod tests {
         assert_eq!(results[2], (2, vec![30]));  // 15*2
     }
 
-    /// End-to-end: chaining exchange → unary → gather → probe at DataStream level.
+    /// End-to-end: chaining exchange → unary → gather → probe at StreamEdge level.
     #[test]
     fn pipeline_exchange_gather_probe() {
         use crate::dataflow::operators::exchange::ExchangeExt;
@@ -592,14 +592,14 @@ mod tests {
         use crate::dataflow::operators::probe::ProbeExt;
         use crate::dataflow::operators::unary::UnaryExt;
         use crate::dataflow::scope::{RootScope, Scope};
-        use crate::dataflow::stream::{DataStream, Slot};
+        use crate::dataflow::stream::{StreamEdge, Slot};
 
         let mut scope = RootScope::<u64>::new("pipeline", 4);
         let region_id = scope.current_region().id();
         let src_idx = scope.allocate_operator_index();
         let source = Slot::new(src_idx, 0);
-        let stream: DataStream<RootScope<u64>, (u64, i32)> =
-            DataStream::new(scope, source, region_id);
+        let stream: StreamEdge<RootScope<u64>, (u64, i32)> =
+            StreamEdge::new(scope, source, region_id);
 
         // Chain: exchange(by key) → exchange_to(16) → unary → gather → probe
         let handle = stream
@@ -625,14 +625,14 @@ mod tests {
         use crate::dataflow::operators::inspect::InspectExt;
         use crate::dataflow::operators::rebalance::RebalanceExt;
         use crate::dataflow::scope::{RootScope, Scope};
-        use crate::dataflow::stream::{DataStream, Slot};
+        use crate::dataflow::stream::{StreamEdge, Slot};
 
         let mut scope = RootScope::<u64>::new("pipeline", 4);
         let region_id = scope.current_region().id();
         let src_idx = scope.allocate_operator_index();
         let source = Slot::new(src_idx, 0);
-        let stream: DataStream<RootScope<u64>, i32> =
-            DataStream::new(scope, source, region_id);
+        let stream: StreamEdge<RootScope<u64>, i32> =
+            StreamEdge::new(scope, source, region_id);
 
         // Chain: rebalance_to(8) → broadcast → broadcast_local → inspect
         let _output = stream
@@ -652,14 +652,14 @@ mod tests {
         use crate::dataflow::operators::gather::GatherExt;
         use crate::dataflow::operators::rebalance::RebalanceExt;
         use crate::dataflow::scope::{RootScope, Scope};
-        use crate::dataflow::stream::{DataStream, Slot};
+        use crate::dataflow::stream::{StreamEdge, Slot};
 
         let mut scope = RootScope::<u64>::new("test", 4);
         let r0 = scope.current_region().id();
         let src_idx = scope.allocate_operator_index();
         let source = Slot::new(src_idx, 0);
-        let stream: DataStream<RootScope<u64>, i32> =
-            DataStream::new(scope.clone(), source, r0);
+        let stream: StreamEdge<RootScope<u64>, i32> =
+            StreamEdge::new(scope.clone(), source, r0);
 
         // exchange same parallelism → same region
         let s1 = stream.exchange(|x: &i32| *x);
@@ -699,7 +699,7 @@ mod tests {
         use crate::dataflow::operators::probe::ProbeExt;
         use crate::dataflow::operators::unary::UnaryExt;
         use crate::dataflow::scope::{RootScope, Scope};
-        use crate::dataflow::stream::{DataStream, Slot};
+        use crate::dataflow::stream::{StreamEdge, Slot};
 
         let mut scope = RootScope::<u64>::new("test", 4);
         let region_id = scope.current_region().id();
@@ -711,8 +711,8 @@ mod tests {
         )).unwrap();
 
         let source = Slot::new(src_idx, 0);
-        let stream: DataStream<RootScope<u64>, i32> =
-            DataStream::new(scope.clone(), source, region_id);
+        let stream: StreamEdge<RootScope<u64>, i32> =
+            StreamEdge::new(scope.clone(), source, region_id);
 
         // Build: source → unary(double) → inspect → probe
         let _handle = stream
@@ -752,7 +752,7 @@ mod tests {
         use crate::dataflow::operators::binary::BinaryExt;
         use crate::dataflow::operators::probe::ProbeExt;
         use crate::dataflow::scope::{RootScope, Scope};
-        use crate::dataflow::stream::{DataStream, Slot};
+        use crate::dataflow::stream::{StreamEdge, Slot};
 
         let mut scope = RootScope::<u64>::new("test", 4);
         let region_id = scope.current_region().id();
@@ -767,10 +767,10 @@ mod tests {
             src1, "right_source", region_id, 0, 1,
         )).unwrap();
 
-        let left: DataStream<RootScope<u64>, i32> =
-            DataStream::new(scope.clone(), Slot::new(src0, 0), region_id);
-        let right: DataStream<RootScope<u64>, i32> =
-            DataStream::new(scope.clone(), Slot::new(src1, 0), region_id);
+        let left: StreamEdge<RootScope<u64>, i32> =
+            StreamEdge::new(scope.clone(), Slot::new(src0, 0), region_id);
+        let right: StreamEdge<RootScope<u64>, i32> =
+            StreamEdge::new(scope.clone(), Slot::new(src1, 0), region_id);
 
         let _handle = left
             .binary(&right, "join", |l, r, out| {
@@ -802,7 +802,7 @@ mod tests {
         use crate::dataflow::operators::branch::BranchExt;
         use crate::dataflow::operators::probe::ProbeExt;
         use crate::dataflow::scope::{RootScope, Scope};
-        use crate::dataflow::stream::{DataStream, Slot};
+        use crate::dataflow::stream::{StreamEdge, Slot};
 
         let mut scope = RootScope::<u64>::new("test", 4);
         let region_id = scope.current_region().id();
@@ -812,8 +812,8 @@ mod tests {
             src_idx, "source", region_id, 0, 1,
         )).unwrap();
 
-        let stream: DataStream<RootScope<u64>, i32> =
-            DataStream::new(scope.clone(), Slot::new(src_idx, 0), region_id);
+        let stream: StreamEdge<RootScope<u64>, i32> =
+            StreamEdge::new(scope.clone(), Slot::new(src_idx, 0), region_id);
 
         let (true_stream, false_stream) = stream.branch(|x| *x > 0);
         let _p1 = true_stream.probe("pos");

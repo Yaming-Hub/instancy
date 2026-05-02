@@ -9,7 +9,7 @@ use std::fmt;
 use crate::dataflow::operators::handles::{InputHandle, OutputHandle};
 use crate::dataflow::region::RegionId;
 use crate::dataflow::scope::Scope;
-use crate::dataflow::stream::{DataStream, Slot};
+use crate::dataflow::stream::{StreamEdge, Slot};
 use crate::error::Result;
 use crate::progress::timestamp::Timestamp;
 
@@ -115,7 +115,7 @@ impl<T: Timestamp, D1, D2> fmt::Debug for UnaryOperator<T, D1, D2> {
     }
 }
 
-/// Extension trait for constructing unary operators on a `DataStream`.
+/// Extension trait for constructing unary operators on a `StreamEdge`.
 pub trait UnaryExt<S: Scope, D1> {
     /// Create a unary operator with one input and one output.
     ///
@@ -138,7 +138,7 @@ pub trait UnaryExt<S: Scope, D1> {
         &self,
         name: &str,
         logic: L,
-    ) -> DataStream<S, D2>
+    ) -> StreamEdge<S, D2>
     where
         D2: 'static,
         L: FnMut(&mut InputHandle<S::Timestamp, D1>, &mut OutputHandle<S::Timestamp, D2>) -> Result<()>
@@ -146,12 +146,12 @@ pub trait UnaryExt<S: Scope, D1> {
             + 'static;
 }
 
-impl<S: Scope, D1: 'static> UnaryExt<S, D1> for DataStream<S, D1> {
+impl<S: Scope, D1: 'static> UnaryExt<S, D1> for StreamEdge<S, D1> {
     fn unary<D2, L>(
         &self,
         name: &str,
         logic: L,
-    ) -> DataStream<S, D2>
+    ) -> StreamEdge<S, D2>
     where
         D2: 'static,
         L: FnMut(&mut InputHandle<S::Timestamp, D1>, &mut OutputHandle<S::Timestamp, D2>) -> Result<()>
@@ -179,7 +179,7 @@ impl<S: Scope, D1: 'static> UnaryExt<S, D1> for DataStream<S, D1> {
         // re-create it with channel wiring during materialization.
         let _operator = UnaryOperator::new(name, op_index, region_id, logic);
 
-        DataStream::new(scope, output_slot, region_id)
+        StreamEdge::new(scope, output_slot, region_id)
     }
 }
 
@@ -410,9 +410,9 @@ mod tests {
         // Allocate index 0 for the "source" operator
         let src_idx = scope.allocate_operator_index();
         let source = Slot::new(src_idx, 0);
-        let stream: DataStream<RootScope<u64>, i32> = DataStream::new(scope, source, region_id);
+        let stream: StreamEdge<RootScope<u64>, i32> = StreamEdge::new(scope, source, region_id);
 
-        let output: DataStream<RootScope<u64>, i32> = stream.unary("double", |input, output| {
+        let output: StreamEdge<RootScope<u64>, i32> = stream.unary("double", |input, output| {
             while let Some((time, data)) = input.next() {
                 let mut session = output.session(time);
                 for item in data {
@@ -434,7 +434,7 @@ mod tests {
         let region_id = scope.current_region().id();
         let src_idx = scope.allocate_operator_index();
         let source = Slot::new(src_idx, 0);
-        let stream: DataStream<RootScope<u64>, i32> = DataStream::new(scope, source, region_id);
+        let stream: StreamEdge<RootScope<u64>, i32> = StreamEdge::new(scope, source, region_id);
 
         let result = stream
             .unary("add_one", |input, output| {

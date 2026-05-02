@@ -1,6 +1,6 @@
 //! Fan-out / branching example — one stream feeding two independent pipelines.
 //!
-//! Demonstrates how `Stream::clone()` enables splitting a data stream
+//! Demonstrates how `Pipe::clone()` enables splitting a data stream
 //! into multiple downstream branches. Each branch processes data independently
 //! using a `TeePush` adapter that clones data to all consumers.
 

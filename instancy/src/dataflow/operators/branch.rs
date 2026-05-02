@@ -8,7 +8,7 @@ use std::fmt;
 use crate::dataflow::operators::handles::{InputHandle, OutputHandle};
 use crate::dataflow::region::RegionId;
 use crate::dataflow::scope::Scope;
-use crate::dataflow::stream::{DataStream, Slot};
+use crate::dataflow::stream::{StreamEdge, Slot};
 use crate::error::Result;
 use crate::progress::timestamp::Timestamp;
 
@@ -231,7 +231,7 @@ impl<T: Timestamp, D, O, E> fmt::Debug for OkErrOperator<T, D, O, E> {
     }
 }
 
-/// Extension trait for constructing branch operators on a `DataStream`.
+/// Extension trait for constructing branch operators on a `StreamEdge`.
 pub trait BranchExt<S: Scope, D> {
     /// Split the stream into two based on a predicate.
     ///
@@ -246,12 +246,12 @@ pub trait BranchExt<S: Scope, D> {
     fn branch<P>(
         &self,
         predicate: P,
-    ) -> (DataStream<S, D>, DataStream<S, D>)
+    ) -> (StreamEdge<S, D>, StreamEdge<S, D>)
     where
         P: FnMut(&D) -> bool + Send + 'static;
 }
 
-/// Extension trait for constructing ok_err operators on a `DataStream`.
+/// Extension trait for constructing ok_err operators on a `StreamEdge`.
 pub trait OkErrExt<S: Scope, D> {
     /// Split the stream based on a function returning `Result`.
     ///
@@ -266,18 +266,18 @@ pub trait OkErrExt<S: Scope, D> {
     fn ok_err<O, E, F>(
         &self,
         splitter: F,
-    ) -> (DataStream<S, O>, DataStream<S, E>)
+    ) -> (StreamEdge<S, O>, StreamEdge<S, E>)
     where
         O: 'static,
         E: 'static,
         F: FnMut(D) -> std::result::Result<O, E> + Send + 'static;
 }
 
-impl<S: Scope, D: 'static> BranchExt<S, D> for DataStream<S, D> {
+impl<S: Scope, D: 'static> BranchExt<S, D> for StreamEdge<S, D> {
     fn branch<P>(
         &self,
         predicate: P,
-    ) -> (DataStream<S, D>, DataStream<S, D>)
+    ) -> (StreamEdge<S, D>, StreamEdge<S, D>)
     where
         P: FnMut(&D) -> bool + Send + 'static,
     {
@@ -306,17 +306,17 @@ impl<S: Scope, D: 'static> BranchExt<S, D> for DataStream<S, D> {
             predicate,
         );
 
-        let true_stream = DataStream::new(scope.clone(), true_slot, region_id);
-        let false_stream = DataStream::new(scope, false_slot, region_id);
+        let true_stream = StreamEdge::new(scope.clone(), true_slot, region_id);
+        let false_stream = StreamEdge::new(scope, false_slot, region_id);
         (true_stream, false_stream)
     }
 }
 
-impl<S: Scope, D: 'static> OkErrExt<S, D> for DataStream<S, D> {
+impl<S: Scope, D: 'static> OkErrExt<S, D> for StreamEdge<S, D> {
     fn ok_err<O, E, F>(
         &self,
         splitter: F,
-    ) -> (DataStream<S, O>, DataStream<S, E>)
+    ) -> (StreamEdge<S, O>, StreamEdge<S, E>)
     where
         O: 'static,
         E: 'static,
@@ -347,8 +347,8 @@ impl<S: Scope, D: 'static> OkErrExt<S, D> for DataStream<S, D> {
             splitter,
         );
 
-        let ok_stream = DataStream::new(scope.clone(), ok_slot, region_id);
-        let err_stream = DataStream::new(scope, err_slot, region_id);
+        let ok_stream = StreamEdge::new(scope.clone(), ok_slot, region_id);
+        let err_stream = StreamEdge::new(scope, err_slot, region_id);
         (ok_stream, err_stream)
     }
 }
@@ -600,8 +600,8 @@ mod tests {
         let scope = RootScope::<u64>::new("test", 4);
         let region_id = scope.current_region().id();
         let source = Slot::new(0, 0);
-        let stream: DataStream<RootScope<u64>, i32> =
-            DataStream::new(scope, source, region_id);
+        let stream: StreamEdge<RootScope<u64>, i32> =
+            StreamEdge::new(scope, source, region_id);
 
         let (true_stream, false_stream) = stream.branch(|x: &i32| *x > 0);
 
@@ -619,10 +619,10 @@ mod tests {
         let scope = RootScope::<u64>::new("test", 4);
         let region_id = scope.current_region().id();
         let source = Slot::new(0, 0);
-        let stream: DataStream<RootScope<u64>, i32> =
-            DataStream::new(scope, source, region_id);
+        let stream: StreamEdge<RootScope<u64>, i32> =
+            StreamEdge::new(scope, source, region_id);
 
-        let (ok_stream, err_stream): (DataStream<RootScope<u64>, i32>, DataStream<RootScope<u64>, String>) =
+        let (ok_stream, err_stream): (StreamEdge<RootScope<u64>, i32>, StreamEdge<RootScope<u64>, String>) =
             stream.ok_err(|x: i32| if x > 0 { Ok(x) } else { Err(format!("negative: {x}")) });
 
         // Both streams in same region

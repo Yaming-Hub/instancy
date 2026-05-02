@@ -5,7 +5,7 @@
 //! have timestamps that extend the outer scope's timestamp.
 //!
 //! Scopes use shared interior state so that cloning a Scope (e.g., when
-//! embedded in multiple DataStream values) shares operator/region allocation.
+//! embedded in multiple StreamEdge values) shares operator/region allocation.
 
 use std::fmt;
 use std::sync::{Arc, Mutex};

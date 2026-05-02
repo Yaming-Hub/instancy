@@ -12,9 +12,9 @@ All generic type parameters must follow these codebase-wide conventions for cons
 | Parameter | Meaning | Example |
 |---|---|---|
 | `T` | Timestamp type (implements `Timestamp`) | `Envelope<T, D, M>`, `Capability<T>` |
-| `D` | Data record type | `Stream<S, D>`, `InputEvent<T, D>` |
+| `D` | Data record type | `StreamEdge<S, D>`, `InputEvent<T, D>` |
 | `M` | User-defined metadata type (default `()`) | `Envelope<T, D, M>`, `Push<T, D, M>` |
-| `S` | Scope (implements `Scope` trait) or Summary (PathSummary) | `Stream<S, D>`, `PortConnectivity<S>` |
+| `S` | Scope (implements `Scope` trait) or Summary (PathSummary) | `StreamEdge<S, D>`, `PortConnectivity<S>` |
 | `TOuter` / `TInner` | Nested timestamp components in `Product` | `Product<TOuter, TInner>` |
 
 **Rules:**

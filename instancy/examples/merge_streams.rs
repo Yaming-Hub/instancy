@@ -1,6 +1,6 @@
 /// Demonstrates binary and concat operators for merging multiple streams.
 use instancy::dataflow::DataflowBuilder;
-use instancy::dataflow::Stream;
+use instancy::dataflow::Pipe;
 use instancy::runtime::SimpleRuntime;
 
 fn main() {
@@ -47,7 +47,7 @@ fn main() {
     let warnings = builder.source("warnings", vec![(0u64, vec!["[WARN] high cpu".to_string()])]);
     let info = builder.source("info", vec![(0u64, vec!["[INFO] started".to_string()])]);
 
-    let all_logs = Stream::concat(vec![critical, warnings, info]);
+    let all_logs = Pipe::concat(vec![critical, warnings, info]);
     let concat_out = all_logs.output("all_logs");
 
     let dataflow = builder.build().unwrap();

@@ -11,7 +11,7 @@ use std::hash::Hash;
 use crate::dataflow::channels::PartitionStrategy;
 use crate::dataflow::region::RegionId;
 use crate::dataflow::scope::Scope;
-use crate::dataflow::stream::{DataStream, Slot};
+use crate::dataflow::stream::{StreamEdge, Slot};
 use crate::progress::timestamp::Timestamp;
 
 /// A registered exchange (repartition) operator.
@@ -92,7 +92,7 @@ impl<T: Timestamp, D> fmt::Debug for ExchangeOperator<T, D> {
     }
 }
 
-/// Extension trait for constructing exchange operators on a `DataStream`.
+/// Extension trait for constructing exchange operators on a `StreamEdge`.
 pub trait ExchangeExt<S: Scope, D> {
     /// Repartition data by hashing a key extracted from each record.
     ///
@@ -106,7 +106,7 @@ pub trait ExchangeExt<S: Scope, D> {
     fn exchange<K: Hash + 'static>(
         &self,
         key_fn: impl Fn(&D) -> K + Send + Sync + 'static,
-    ) -> DataStream<S, D>;
+    ) -> StreamEdge<S, D>;
 
     /// Repartition data by hashing a key, targeting a specific parallelism level.
     ///
@@ -119,7 +119,7 @@ pub trait ExchangeExt<S: Scope, D> {
         &self,
         target_parallelism: usize,
         key_fn: impl Fn(&D) -> K + Send + Sync + 'static,
-    ) -> DataStream<S, D>;
+    ) -> StreamEdge<S, D>;
 
     /// Repartition data using a direct hash function (returns u64).
     ///
@@ -128,7 +128,7 @@ pub trait ExchangeExt<S: Scope, D> {
     fn exchange_by_hash(
         &self,
         hash_fn: impl Fn(&D) -> u64 + Send + Sync + 'static,
-    ) -> DataStream<S, D>;
+    ) -> StreamEdge<S, D>;
 
     /// Repartition data using a direct hash function, targeting a specific parallelism.
     ///
@@ -141,14 +141,14 @@ pub trait ExchangeExt<S: Scope, D> {
         &self,
         target_parallelism: usize,
         hash_fn: impl Fn(&D) -> u64 + Send + Sync + 'static,
-    ) -> DataStream<S, D>;
+    ) -> StreamEdge<S, D>;
 }
 
-impl<S: Scope, D: 'static> ExchangeExt<S, D> for DataStream<S, D> {
+impl<S: Scope, D: 'static> ExchangeExt<S, D> for StreamEdge<S, D> {
     fn exchange<K: Hash + 'static>(
         &self,
         key_fn: impl Fn(&D) -> K + Send + Sync + 'static,
-    ) -> DataStream<S, D> {
+    ) -> StreamEdge<S, D> {
         let scope = self.scope().clone();
         let source_region = self.region_id();
         let parallelism = scope.region(source_region)
@@ -161,7 +161,7 @@ impl<S: Scope, D: 'static> ExchangeExt<S, D> for DataStream<S, D> {
         &self,
         target_parallelism: usize,
         key_fn: impl Fn(&D) -> K + Send + Sync + 'static,
-    ) -> DataStream<S, D> {
+    ) -> StreamEdge<S, D> {
         assert!(target_parallelism > 0, "target_parallelism must be > 0");
         let scope = self.scope().clone();
         let source_region = self.region_id();
@@ -171,7 +171,7 @@ impl<S: Scope, D: 'static> ExchangeExt<S, D> for DataStream<S, D> {
     fn exchange_by_hash(
         &self,
         hash_fn: impl Fn(&D) -> u64 + Send + Sync + 'static,
-    ) -> DataStream<S, D> {
+    ) -> StreamEdge<S, D> {
         let scope = self.scope().clone();
         let source_region = self.region_id();
         let parallelism = scope.region(source_region)
@@ -184,7 +184,7 @@ impl<S: Scope, D: 'static> ExchangeExt<S, D> for DataStream<S, D> {
         &self,
         target_parallelism: usize,
         hash_fn: impl Fn(&D) -> u64 + Send + Sync + 'static,
-    ) -> DataStream<S, D> {
+    ) -> StreamEdge<S, D> {
         assert!(target_parallelism > 0, "target_parallelism must be > 0");
         let scope = self.scope().clone();
         let source_region = self.region_id();
@@ -192,7 +192,7 @@ impl<S: Scope, D: 'static> ExchangeExt<S, D> for DataStream<S, D> {
     }
 }
 
-impl<S: Scope, D: 'static> DataStream<S, D> {
+impl<S: Scope, D: 'static> StreamEdge<S, D> {
     /// Internal helper to build an exchange operator.
     fn build_exchange(
         &self,
@@ -200,7 +200,7 @@ impl<S: Scope, D: 'static> DataStream<S, D> {
         source_region: RegionId,
         target_parallelism: usize,
         strategy: PartitionStrategy<D>,
-    ) -> DataStream<S, D> {
+    ) -> StreamEdge<S, D> {
         let op_index = scope.allocate_operator_index();
         let output_slot = Slot::new(op_index, 0);
 
@@ -233,7 +233,7 @@ impl<S: Scope, D: 'static> DataStream<S, D> {
             strategy,
         );
 
-        DataStream::new(scope, output_slot, target_region)
+        StreamEdge::new(scope, output_slot, target_region)
     }
 }
 
@@ -247,8 +247,8 @@ mod tests {
         let scope = RootScope::<u64>::new("test", 4);
         let region_id = scope.current_region().id();
         let source = Slot::new(0, 0);
-        let stream: DataStream<RootScope<u64>, (u64, String)> =
-            DataStream::new(scope, source, region_id);
+        let stream: StreamEdge<RootScope<u64>, (u64, String)> =
+            StreamEdge::new(scope, source, region_id);
 
         let exchanged = stream.exchange(|record: &(u64, String)| record.0);
         // Same parallelism → same region
@@ -260,8 +260,8 @@ mod tests {
         let scope = RootScope::<u64>::new("test", 4);
         let region_id = scope.current_region().id();
         let source = Slot::new(0, 0);
-        let stream: DataStream<RootScope<u64>, i32> =
-            DataStream::new(scope, source, region_id);
+        let stream: StreamEdge<RootScope<u64>, i32> =
+            StreamEdge::new(scope, source, region_id);
 
         let exchanged = stream.exchange_to(8, |record: &i32| *record);
         // Different parallelism → new region
@@ -274,8 +274,8 @@ mod tests {
         let scope = RootScope::<u64>::new("test", 4);
         let region_id = scope.current_region().id();
         let source = Slot::new(0, 0);
-        let stream: DataStream<RootScope<u64>, i32> =
-            DataStream::new(scope, source, region_id);
+        let stream: StreamEdge<RootScope<u64>, i32> =
+            StreamEdge::new(scope, source, region_id);
 
         let _ = stream.exchange_to(0, |record: &i32| *record);
     }
@@ -285,8 +285,8 @@ mod tests {
         let scope = RootScope::<u64>::new("test", 4);
         let region_id = scope.current_region().id();
         let source = Slot::new(0, 0);
-        let stream: DataStream<RootScope<u64>, i32> =
-            DataStream::new(scope, source, region_id);
+        let stream: StreamEdge<RootScope<u64>, i32> =
+            StreamEdge::new(scope, source, region_id);
 
         let exchanged = stream.exchange_by_hash(|record: &i32| *record as u64);
         assert_eq!(exchanged.region_id(), region_id);
@@ -297,8 +297,8 @@ mod tests {
         let scope = RootScope::<u64>::new("test", 4);
         let region_id = scope.current_region().id();
         let source = Slot::new(0, 0);
-        let stream: DataStream<RootScope<u64>, i32> =
-            DataStream::new(scope, source, region_id);
+        let stream: StreamEdge<RootScope<u64>, i32> =
+            StreamEdge::new(scope, source, region_id);
 
         let exchanged = stream.exchange_by_hash_to(16, |record: &i32| *record as u64);
         assert_ne!(exchanged.region_id(), region_id);

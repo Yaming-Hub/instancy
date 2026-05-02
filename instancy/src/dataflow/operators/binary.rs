@@ -9,7 +9,7 @@ use std::fmt;
 use crate::dataflow::operators::handles::{InputHandle, OutputHandle};
 use crate::dataflow::region::RegionId;
 use crate::dataflow::scope::Scope;
-use crate::dataflow::stream::{DataStream, Slot};
+use crate::dataflow::stream::{StreamEdge, Slot};
 use crate::error::Result;
 use crate::progress::timestamp::Timestamp;
 
@@ -127,17 +127,17 @@ impl<T: Timestamp, D1, D2, D3> fmt::Debug for BinaryOperator<T, D1, D2, D3> {
     }
 }
 
-/// Extension trait for constructing binary operators on a pair of `DataStream`s.
+/// Extension trait for constructing binary operators on a pair of `StreamEdge`s.
 pub trait BinaryExt<S: Scope, D1> {
     /// Create a binary operator with two inputs and one output.
     ///
     /// The closure receives both input handles and the output handle.
     fn binary<D2, D3, L>(
         &self,
-        other: &DataStream<S, D2>,
+        other: &StreamEdge<S, D2>,
         name: &str,
         logic: L,
-    ) -> DataStream<S, D3>
+    ) -> StreamEdge<S, D3>
     where
         D2: 'static,
         D3: 'static,
@@ -150,13 +150,13 @@ pub trait BinaryExt<S: Scope, D1> {
             + 'static;
 }
 
-impl<S: Scope, D1: 'static> BinaryExt<S, D1> for DataStream<S, D1> {
+impl<S: Scope, D1: 'static> BinaryExt<S, D1> for StreamEdge<S, D1> {
     fn binary<D2, D3, L>(
         &self,
-        other: &DataStream<S, D2>,
+        other: &StreamEdge<S, D2>,
         name: &str,
         logic: L,
-    ) -> DataStream<S, D3>
+    ) -> StreamEdge<S, D3>
     where
         D2: 'static,
         D3: 'static,
@@ -197,7 +197,7 @@ impl<S: Scope, D1: 'static> BinaryExt<S, D1> for DataStream<S, D1> {
 
         let _operator = BinaryOperator::new(name, op_index, region_id, logic);
 
-        DataStream::new(scope, output_slot, region_id)
+        StreamEdge::new(scope, output_slot, region_id)
     }
 }
 
@@ -324,10 +324,10 @@ mod tests {
         let region_id = scope.current_region().id();
         let s1_idx = scope.allocate_operator_index();
         let s2_idx = scope.allocate_operator_index();
-        let stream1: DataStream<RootScope<u64>, i32> =
-            DataStream::new(scope.clone(), Slot::new(s1_idx, 0), region_id);
-        let stream2: DataStream<RootScope<u64>, i32> =
-            DataStream::new(scope, Slot::new(s2_idx, 0), region_id);
+        let stream1: StreamEdge<RootScope<u64>, i32> =
+            StreamEdge::new(scope.clone(), Slot::new(s1_idx, 0), region_id);
+        let stream2: StreamEdge<RootScope<u64>, i32> =
+            StreamEdge::new(scope, Slot::new(s2_idx, 0), region_id);
 
         let output = stream1.binary(&stream2, "join", |i1, i2, out| {
             while let Some((t, d)) = i1.next() {
