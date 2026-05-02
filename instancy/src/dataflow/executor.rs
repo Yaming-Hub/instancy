@@ -31,6 +31,7 @@ use crate::error::{Error, Result};
 use crate::progress::notificator::Notificator;
 use crate::progress::subgraph::ProgressTracker;
 use crate::progress::timestamp::Timestamp;
+use crate::worker::WorkerContext;
 
 // ---------------------------------------------------------------------------
 // ExecutorConfig
@@ -168,6 +169,7 @@ impl<T: Timestamp> DataflowExecutor<T> {
         config: ExecutorConfig,
         cancel: CancellationToken,
         external_wake_handle: Option<WakeHandle>,
+        worker_context: WorkerContext,
     ) -> Result<Self> {
         let edges = graph.edges();
         let feedback_edges = graph.feedback_edges();
@@ -275,7 +277,7 @@ impl<T: Timestamp> DataflowExecutor<T> {
                 output_pushers,
             };
 
-            let operator = factory.build(endpoints);
+            let operator = factory.build(&worker_context, endpoints);
             let pos = operators.len();
             if op_idx < index_to_pos.len() {
                 index_to_pos[op_idx] = pos;

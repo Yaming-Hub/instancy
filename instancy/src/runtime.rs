@@ -35,6 +35,7 @@ use crate::dataflow::graph::OperatorInfo;
 use crate::error::{Error, Result};
 use crate::progress::timestamp::Timestamp;
 use crate::scheduler::policy::{PriorityWithAgingPolicy, SchedulePolicy};
+use crate::worker::WorkerContext;
 use crate::worker_pool::{WorkerPool, WorkerPoolConfig};
 
 /// Configuration for creating a [`RuntimeHandle`].
@@ -206,7 +207,7 @@ impl RuntimeHandle {
         &self,
         dataflow: LogicalDataflow<T>,
     ) -> Result<SpawnedDataflow<T>> {
-        self.spawn_internal(dataflow, ChannelMode::Sync)
+        self.spawn_internal(dataflow, ChannelMode::Sync, WorkerContext::single())
     }
 
     /// Spawn a dataflow with async channel-based I/O.
@@ -233,7 +234,7 @@ impl RuntimeHandle {
         &self,
         dataflow: LogicalDataflow<T>,
     ) -> Result<SpawnedDataflow<T>> {
-        self.spawn_internal(dataflow, ChannelMode::Async)
+        self.spawn_internal(dataflow, ChannelMode::Async, WorkerContext::single())
     }
 
     /// Spawn N replicated workers from the same dataflow builder closure.
@@ -398,7 +399,8 @@ impl RuntimeHandle {
         let cancel = self.cancel.child_token();
         let wake_handle = WakeHandle::new();
         cancel.register_wake_handle(wake_handle.clone());
-        let executor = materialize_executor(dataflow, cancel, Some(wake_handle))?;
+        let executor =
+            materialize_executor(dataflow, cancel, Some(wake_handle), WorkerContext::single())?;
 
         let (completion, notifier) = DataflowCompletion::new();
 
@@ -413,6 +415,7 @@ impl RuntimeHandle {
         &self,
         mut dataflow: LogicalDataflow<T>,
         mode: ChannelMode,
+        worker_context: WorkerContext,
     ) -> Result<SpawnedDataflow<T>> {
         if dataflow.operator_factories.is_empty() && dataflow.input_port_wiring.is_empty() {
             return Err(Error::Custom("cannot spawn an empty dataflow".into()));
@@ -476,7 +479,8 @@ impl RuntimeHandle {
         }
 
         // --- Materialize and register as cooperative task ---
-        let mut executor = materialize_executor(dataflow, cancel, Some(wake_handle))?;
+        let mut executor =
+            materialize_executor(dataflow, cancel, Some(wake_handle), worker_context)?;
 
         external_inputs_open.store(input_count, std::sync::atomic::Ordering::SeqCst);
         executor.replace_external_inputs_counter(external_inputs_open);
@@ -542,8 +546,9 @@ impl RuntimeHandle {
         let mut workers = Vec::with_capacity(num_workers);
         let mut spawned_count = 0usize;
 
-        for dataflow in dataflows {
-            match self.spawn_internal(dataflow, mode) {
+        for (worker_idx, dataflow) in dataflows.into_iter().enumerate() {
+            let ctx = WorkerContext::new(worker_idx, num_workers);
+            match self.spawn_internal(dataflow, mode, ctx) {
                 Ok(spawned) => {
                     workers.push(spawned);
                     spawned_count += 1;
@@ -667,7 +672,12 @@ impl SimpleRuntime {
 
         let wake_handle = WakeHandle::new();
         self.cancel.register_wake_handle(wake_handle.clone());
-        let mut executor = materialize_executor(dataflow, self.cancel.clone(), Some(wake_handle))?;
+        let mut executor = materialize_executor(
+            dataflow,
+            self.cancel.clone(),
+            Some(wake_handle),
+            WorkerContext::single(),
+        )?;
 
         let completed = executor.run()?;
         if !completed {
@@ -707,7 +717,15 @@ impl SimpleRuntime {
     /// ```
     pub fn spawn<T: Timestamp>(
         &self,
+        dataflow: LogicalDataflow<T>,
+    ) -> Result<SpawnedDataflow<T>> {
+        self.spawn_with_context(dataflow, WorkerContext::single())
+    }
+
+    fn spawn_with_context<T: Timestamp>(
+        &self,
         mut dataflow: LogicalDataflow<T>,
+        worker_context: WorkerContext,
     ) -> Result<SpawnedDataflow<T>> {
         if dataflow.operator_factories.is_empty() && dataflow.input_port_wiring.is_empty() {
             return Err(Error::Custom("cannot spawn an empty dataflow".into()));
@@ -766,7 +784,8 @@ impl SimpleRuntime {
         }
 
         // --- Materialize and run on background thread ---
-        let mut executor = materialize_executor(dataflow, cancel, Some(wake_handle))?;
+        let mut executor =
+            materialize_executor(dataflow, cancel, Some(wake_handle), worker_context)?;
 
         external_inputs_open.store(input_count, std::sync::atomic::Ordering::SeqCst);
         executor.replace_external_inputs_counter(external_inputs_open);
@@ -843,8 +862,9 @@ impl SimpleRuntime {
         let mut workers = Vec::with_capacity(num_workers);
         let mut spawned_count = 0usize;
 
-        for dataflow in dataflows {
-            match self.spawn(dataflow) {
+        for (worker_idx, dataflow) in dataflows.into_iter().enumerate() {
+            let ctx = WorkerContext::new(worker_idx, num_workers);
+            match self.spawn_with_context(dataflow, ctx) {
                 Ok(spawned) => {
                     workers.push(spawned);
                     spawned_count += 1;
@@ -1635,6 +1655,7 @@ fn materialize_executor<T: Timestamp>(
     dataflow: LogicalDataflow<T>,
     cancel: CancellationToken,
     wake_handle: Option<WakeHandle>,
+    worker_context: WorkerContext,
 ) -> Result<DataflowExecutor<T>> {
     let executor_config = ExecutorConfig {
         max_activations_per_step: 1024,
@@ -1649,6 +1670,7 @@ fn materialize_executor<T: Timestamp>(
         executor_config,
         cancel,
         wake_handle,
+        worker_context,
     )?;
 
     // Build and attach progress tracker

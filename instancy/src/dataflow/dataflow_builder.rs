@@ -281,7 +281,7 @@ impl<T: Timestamp> DataflowBuilder<T> {
 
                         let ext_counter = Arc::clone(&external_inputs_open);
                         let factory_name = wiring_name.clone();
-                        let factory: OperatorFactory = single_use_factory(move |endpoints| {
+                        let factory: OperatorFactory = single_use_factory(move |_ctx, endpoints| {
                             let output_pusher: Box<dyn Push<T, D>> = {
                                 let pushers: Vec<Box<dyn Push<T, D>>> = endpoints
                                     .output_pushers
@@ -318,7 +318,7 @@ impl<T: Timestamp> DataflowBuilder<T> {
 
                         let ext_counter = Arc::clone(&external_inputs_open);
                         let factory_name = wiring_name.clone();
-                        let factory: OperatorFactory = single_use_factory(move |endpoints| {
+                        let factory: OperatorFactory = single_use_factory(move |_ctx, endpoints| {
                             let output_pusher: Box<dyn Push<T, D>> = {
                                 let pushers: Vec<Box<dyn Push<T, D>>> = endpoints
                                     .output_pushers
@@ -401,7 +401,7 @@ impl<T: Timestamp> DataflowBuilder<T> {
             // Handles fan-out: if multiple downstream edges exist (Pipe was
             // cloned), wraps all pushers in a TeePush adapter.
             let name_clone = name.clone();
-            let factory: OperatorFactory = single_use_factory(move |endpoints: ChannelEndpoints| {
+            let factory: OperatorFactory = single_use_factory(move |_ctx, endpoints: ChannelEndpoints| {
                 let output_pusher: Box<dyn Push<T, D>> = {
                     let pushers: Vec<Box<dyn Push<T, D>>> = endpoints
                         .output_pushers
@@ -704,7 +704,7 @@ impl<T: Timestamp, D: Clone + Send + 'static> Pipe<T, D> {
 
             // Operator factory
             let name_clone = name.clone();
-            let factory: OperatorFactory = single_use_factory(move |endpoints: ChannelEndpoints| {
+            let factory: OperatorFactory = single_use_factory(move |_ctx, endpoints: ChannelEndpoints| {
                 let mut pullers = endpoints.input_pullers.into_iter();
 
                 let input1_puller: Box<dyn Pull<T, D>> = *pullers
@@ -863,7 +863,7 @@ impl<T: Timestamp, D: Clone + Send + 'static> Pipe<T, D> {
 
             // Enter operator factory
             let enter_name = format!("{name}::enter");
-            let enter_factory: OperatorFactory = single_use_factory(move |endpoints: ChannelEndpoints| {
+            let enter_factory: OperatorFactory = single_use_factory(move |_ctx, endpoints: ChannelEndpoints| {
                 let input_puller: Box<dyn Pull<T, D>> = *endpoints
                     .input_pullers
                     .into_iter()
@@ -927,7 +927,7 @@ impl<T: Timestamp, D: Clone + Send + 'static> Pipe<T, D> {
             // Feedback operator factory
             let fb_name = format!("{name}::feedback");
             let fb_summary = summary.clone();
-            let feedback_factory: OperatorFactory = single_use_factory(move |endpoints: ChannelEndpoints| {
+            let feedback_factory: OperatorFactory = single_use_factory(move |_ctx, endpoints: ChannelEndpoints| {
                 let input_puller: Box<dyn Pull<PT<T, TInner>, D>> = *endpoints
                     .input_pullers
                     .into_iter()
@@ -1007,7 +1007,7 @@ impl<T: Timestamp, D: Clone + Send + 'static> Pipe<T, D> {
 
             // Concat operator factory
             let concat_name = format!("{name}::concat");
-            let concat_factory: OperatorFactory = single_use_factory(move |endpoints: ChannelEndpoints| {
+            let concat_factory: OperatorFactory = single_use_factory(move |_ctx, endpoints: ChannelEndpoints| {
                 let input_pullers: Vec<Box<dyn Pull<PT<T, TInner>, D>>> = endpoints
                     .input_pullers
                     .into_iter()
@@ -1227,7 +1227,7 @@ impl<T: Timestamp, D: Clone + Send + 'static> Pipe<T, D> {
 
             // Leave operator factory
             let leave_name = format!("{name}::leave");
-            let leave_factory: OperatorFactory = single_use_factory(move |endpoints: ChannelEndpoints| {
+            let leave_factory: OperatorFactory = single_use_factory(move |_ctx, endpoints: ChannelEndpoints| {
                 let input_puller: Box<dyn Pull<PT<T, TInner>, D>> = *endpoints
                     .input_pullers
                     .into_iter()
@@ -1350,7 +1350,7 @@ impl<T: Timestamp, D: Clone + Send + 'static> Pipe<T, D> {
             }
 
             // Operator factory
-            let factory: OperatorFactory = single_use_factory(move |endpoints: ChannelEndpoints| {
+            let factory: OperatorFactory = single_use_factory(move |_ctx, endpoints: ChannelEndpoints| {
                 let input_pullers: Vec<Box<dyn Pull<T, D>>> = endpoints
                     .input_pullers
                     .into_iter()
@@ -1470,7 +1470,7 @@ impl<T: Timestamp, D: Clone + Send + 'static> Pipe<T, D> {
             // Operator factory: collecting sink (used by run(), replaced by spawn())
             let collector_clone = Arc::clone(&collector);
             let name_clone = name.clone();
-            let factory: OperatorFactory = single_use_factory(move |endpoints: ChannelEndpoints| {
+            let factory: OperatorFactory = single_use_factory(move |_ctx, endpoints: ChannelEndpoints| {
                 let input_puller: Box<dyn Pull<T, D>> = *endpoints
                     .input_pullers
                     .into_iter()
@@ -1502,7 +1502,7 @@ impl<T: Timestamp, D: Clone + Send + 'static> Pipe<T, D> {
                         let receiver = OutputReceiver::new(rx);
 
                         let sink_name_inner = sink_name.clone();
-                        let factory: OperatorFactory = single_use_factory(move |endpoints: ChannelEndpoints| {
+                        let factory: OperatorFactory = single_use_factory(move |_ctx, endpoints: ChannelEndpoints| {
                             let input_puller: Box<dyn Pull<T, D>> = *endpoints
                                 .input_pullers
                                 .into_iter()
@@ -1535,7 +1535,7 @@ impl<T: Timestamp, D: Clone + Send + 'static> Pipe<T, D> {
                         };
 
                         let sink_name_inner = sink_name.clone();
-                        let factory: OperatorFactory = single_use_factory(move |endpoints: ChannelEndpoints| {
+                        let factory: OperatorFactory = single_use_factory(move |_ctx, endpoints: ChannelEndpoints| {
                             let input_puller: Box<dyn Pull<T, D>> = *endpoints
                                 .input_pullers
                                 .into_iter()
@@ -1674,7 +1674,7 @@ impl<T: Timestamp, D: Clone + Send + 'static> Pipe<T, D> {
             // Operator factory — handles fan-out by wrapping multiple output
             // pushers in a TeePush adapter when the Pipe was cloned.
             let name_clone = name.clone();
-            let factory: OperatorFactory = single_use_factory(move |endpoints: ChannelEndpoints| {
+            let factory: OperatorFactory = single_use_factory(move |_ctx, endpoints: ChannelEndpoints| {
                 let input_puller: Box<dyn Pull<T, D>> = *endpoints
                     .input_pullers
                     .into_iter()
@@ -1781,7 +1781,7 @@ impl<T: Timestamp, D: Clone + Send + 'static> Pipe<T, D> {
 
             // Operator factory — handles fan-out via TeePush
             let name_clone = name.clone();
-            let factory: OperatorFactory = single_use_factory(move |endpoints: ChannelEndpoints| {
+            let factory: OperatorFactory = single_use_factory(move |_ctx, endpoints: ChannelEndpoints| {
                 let input_puller: Box<dyn Pull<T, D>> = *endpoints
                     .input_pullers
                     .into_iter()
