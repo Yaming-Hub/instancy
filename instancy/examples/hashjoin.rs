@@ -42,14 +42,22 @@ fn main() {
 
     // Binary hash join: for each (key, val) from one side, probe the other
     // side's hash map and emit matched pairs.
+    //
+    // State lives *outside* the closure so it persists across activations —
+    // the binary operator may call the closure multiple times as data arrives.
+    //
+    // NOTE: Output is emitted at the timestamp of the currently-drained batch.
+    // A production join should emit at max(left_time, right_time) for causal
+    // correctness; this simplified version works for ordered, same-time data.
+    let mut user_map: HashMap<u64, Vec<String>> = HashMap::new();
+    let mut order_map: HashMap<u64, Vec<String>> = HashMap::new();
+
     let joined = users.binary::<(u64, String), String, _>(
         orders,
         "hash_join",
-        |users_in, orders_in, out| {
-            let mut user_map: HashMap<u64, Vec<String>> = HashMap::new();
-            let mut order_map: HashMap<u64, Vec<String>> = HashMap::new();
-
+        move |users_in, orders_in, out| {
             // Drain users: check order_map for matches, then insert into user_map.
+            // (order_map may have entries from a previous activation.)
             while let Some((time, data)) = users_in.next() {
                 let mut results = Vec::new();
                 for (uid, name) in data.iter().cloned() {
@@ -129,19 +137,19 @@ fn main() {
     );
 
     // Join edges on (left.dst == right.src) to find 2-hop paths: A→B→C
+    // State persists across activations via `move` capture.
+    let mut left_map: HashMap<u64, Vec<u64>> = HashMap::new(); // keyed by dst
+    let mut right_map: HashMap<u64, Vec<u64>> = HashMap::new(); // keyed by src
+
     let two_hop = edges_left.binary::<(u64, u64), String, _>(
         edges_right,
         "two_hop_join",
-        |left_in, right_in, out| {
-            // left_map: keyed by dst (the join key from left side)
-            let mut left_map: HashMap<u64, Vec<u64>> = HashMap::new();
-            // right_map: keyed by src (the join key from right side)
-            let mut right_map: HashMap<u64, Vec<u64>> = HashMap::new();
-
+        move |left_in, right_in, out| {
             while let Some((time, data)) = left_in.next() {
                 let mut paths = Vec::new();
                 for (src, dst) in data.iter().cloned() {
                     // Check if right side has edges starting from dst
+                    // (right_map may have entries from a previous activation.)
                     if let Some(dsts) = right_map.get(&dst) {
                         for &final_dst in dsts {
                             paths.push(format!("{src}→{dst}→{final_dst}"));
