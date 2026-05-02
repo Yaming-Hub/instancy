@@ -5,6 +5,7 @@
 //! operators, and the dataflow specification builder.
 
 pub mod builder;
+pub mod channel_operators;
 pub mod channels;
 pub mod dataflow_builder;
 pub mod executor;
@@ -20,8 +21,11 @@ pub mod stream;
 pub mod wired_operators;
 
 pub use builder::{build_and_run, build_and_run_with_cancel, BuildContext, BuilderConfig};
+pub use channel_operators::{
+    ChannelSinkOperator, ChannelSourceOperator, InputSender, OutputReceiver,
+};
 pub use channels::{ControlSignal, Envelope, PartitionStrategy, Payload};
-pub use dataflow_builder::{DataflowBuilder, DataflowBuilderConfig, LogicalDataflow, OutputPort, Stream};
+pub use dataflow_builder::{DataflowBuilder, DataflowBuilderConfig, LogicalDataflow, OutputPort, SpawnedDataflow, Stream};
 pub use executor::{DataflowExecutor, ExecutorConfig};
 pub use graph::{DataflowGraph, EdgeInfo, OperatorInfo};
 pub use id::DataflowId;
