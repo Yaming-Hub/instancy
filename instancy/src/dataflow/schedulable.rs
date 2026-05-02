@@ -144,6 +144,12 @@ pub struct EdgeTypeInfo {
 
 /// A factory that creates a typed channel pair for an edge.
 ///
+/// Takes `(capacity, wake_handle)` where:
+/// - `capacity` is the channel buffer size
+/// - `wake_handle` is an optional [`WakeHandle`] for async executor notifications.
+///   When provided, channels notify the handle on push, close, drop, and
+///   when pulling frees capacity (backpressure relief).
+///
 /// Returns `(Box<dyn Any + Send>, Box<dyn Any + Send>)` where the first
 /// element is a `Box<dyn Push<T, D, M>>` and the second is a `Box<dyn Pull<T, D, M>>`.
-pub type ChannelFactory = Box<dyn FnOnce(usize) -> (Box<dyn std::any::Any + Send>, Box<dyn std::any::Any + Send>) + Send>;
+pub type ChannelFactory = Box<dyn FnOnce(usize, Option<crate::dataflow::channels::wake::WakeHandle>) -> (Box<dyn std::any::Any + Send>, Box<dyn std::any::Any + Send>) + Send>;

@@ -482,17 +482,40 @@ either a completion future or a `SpawnedDataflow` handle:
 on a pool thread. The caller receives a `DataflowCompletion` future that resolves when
 the executor finishes. The worker thread is occupied for the duration of the sweep loop.
 
-**Planned evolution (Phase 2 — Async Executor):** The executor's sweep loop becomes a
+#### Sweep model
+
+A **sweep** is one full pass through the executor's ready queue — it activates each
+queued operator once (up to `max_activations_per_step`), then propagates progress and
+updates quiescence counters. Think of it as a single clock tick in a reactor loop:
+
+- **Sweep** = scan all ready operators, activate each, propagate progress, check quiescence.
+- **Run** = repeated sweeps until completion or idle.
+
+Each sweep returns a `SweepOutcome` that tells the caller what happened:
+
+| Outcome | Meaning |
+|---|---|
+| `Completed` | All operators are done — dataflow finished normally |
+| `Quiescent` | No operator made progress for N consecutive sweeps, no external inputs |
+| `MadeProgress` | At least one operator made progress — more sweeps likely needed |
+| `Idle` | No progress this sweep, but quiescence threshold not yet reached |
+| `WaitingForInput` | Idle threshold reached but external inputs still open |
+
+The sync `run()` and async `poll_run()` both delegate to `run_one_sweep()` and
+react to the outcome differently — `run()` loops or sleeps, `poll_run()` registers
+a waker and returns `Pending`.
+
+**Async executor (Phase 2 — implemented):** The executor's sweep loop is a
 `Future` that yields when idle (no operator made progress). This requires:
 
-1. **Channel waker integration** — in-memory channels register a `Waker` so they can
-   wake the executor when data arrives, instead of the executor spinning/polling.
-2. **Executor as Future** — the sweep loop returns `Poll::Pending` when no operator
-   produced output and all channels are empty. When a channel receives data, it wakes
-   the executor's `Waker`, and the runtime re-polls it.
-3. **Task scheduler multiplexing** — the worker pool gains a task scheduler that can
-   poll multiple executor futures on the same thread. When dataflow A yields (idle),
-   its thread can run dataflow B.
+1. **Channel waker integration** — `WakeHandle` is a per-dataflow notification
+   primitive (`AtomicBool` + `Mutex<Option<Waker>>`). Bounded channels notify it
+   on push, close, drop, and when pulling frees capacity (backpressure relief).
+2. **Executor as Future** — `poll_run()` runs sweeps until idle, then registers
+   a waker via the `WakeHandle`. Uses a race-safe protocol: register waker →
+   re-check for notifications → only return `Pending` if no notification pending.
+3. **Task scheduler multiplexing** (planned) — the worker pool gains a task
+   scheduler that can poll multiple executor futures on the same thread.
 
 This is the key enabler for "multiple dataflows share threads cooperatively" — the
 original design goal. Operators remain synchronous (`activate()` works on in-memory

@@ -15,9 +15,13 @@
 //! and runs until completion or cancellation.
 
 use std::collections::VecDeque;
+use std::future::Future;
 use std::marker::PhantomData;
+use std::pin::Pin;
+use std::task::{Context, Poll};
 
 use crate::cancellation::CancellationToken;
+use crate::dataflow::channels::wake::WakeHandle;
 use crate::dataflow::graph::DataflowGraph;
 use crate::dataflow::probe::ProbeHandle;
 use crate::dataflow::schedulable::{
@@ -48,6 +52,43 @@ impl Default for ExecutorConfig {
             max_idle_sweeps: 3,
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// SweepOutcome
+// ---------------------------------------------------------------------------
+
+/// Result of a single [`DataflowExecutor::run_one_sweep`] call.
+///
+/// # What is a "sweep"?
+///
+/// A **sweep** is one full pass through the executor's ready queue — it
+/// activates each queued operator once (up to `max_activations_per_step`),
+/// then propagates progress and updates quiescence counters. Think of it
+/// as a single clock tick in a reactor loop:
+///
+/// - **Sweep** = scan all ready operators, activate each, propagate progress,
+///   check quiescence.
+/// - **Run** = repeated sweeps until completion or idle.
+///
+/// `SweepOutcome` tells the caller what happened in that single pass, so
+/// `run()` (sync) and `poll_run()` (async) can each decide how to react
+/// between sweeps — sleep, yield, or return `Pending`.
+enum SweepOutcome {
+    /// All operators are done — the dataflow completed normally.
+    Completed,
+    /// No operator made progress for `max_idle_sweeps` consecutive sweeps
+    /// and no external inputs are open — the dataflow is quiescent.
+    Quiescent,
+    /// At least one operator made progress. More sweeps are likely needed.
+    MadeProgress,
+    /// No operator made progress this sweep, but the quiescence threshold
+    /// has not been reached yet. More sweeps may be needed.
+    Idle,
+    /// The executor hit the idle threshold but external inputs are still open.
+    /// In sync mode, the caller should sleep briefly. In async mode, the
+    /// caller should register a waker and return Pending.
+    WaitingForInput,
 }
 
 // ---------------------------------------------------------------------------
@@ -85,6 +126,15 @@ pub struct DataflowExecutor<T: Timestamp = u64> {
     /// fed by the caller via `DataflowHandle`). While > 0, the executor will
     /// not declare quiescence — it waits for external data instead.
     external_inputs_open: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    /// Per-dataflow wake handle for async executor notifications.
+    /// Channels notify this handle when data arrives or capacity is freed,
+    /// allowing the executor to sleep (return `Poll::Pending`) when idle
+    /// instead of busy-polling.
+    wake_handle: WakeHandle,
+    /// Count of consecutive idle sweeps (used for quiescence detection).
+    /// Persisted across `poll_run` calls so the executor remembers how long
+    /// it has been idle.
+    consecutive_idle: usize,
     /// Phantom for the timestamp type.
     _phantom: PhantomData<T>,
 }
@@ -119,12 +169,14 @@ impl<T: Timestamp> DataflowExecutor<T> {
         let mut factory_map: std::collections::HashMap<usize, ChannelFactory> =
             channel_factories.into_iter().collect();
 
+        let wake_handle = WakeHandle::new();
+
         for edge_idx in 0..total_edge_count {
             let factory = factory_map.remove(&edge_idx).ok_or_else(|| {
                 Error::Custom(format!("No channel factory for edge index {edge_idx}"))
             })?;
             let capacity = 1024; // TODO: make configurable per edge
-            let (push, pull) = factory(capacity);
+            let (push, pull) = factory(capacity, Some(wake_handle.clone()));
             push_ends.push(Some(push));
             pull_ends.push(Some(pull));
         }
@@ -229,10 +281,13 @@ impl<T: Timestamp> DataflowExecutor<T> {
             notificators: Vec::new(),
             probes: Vec::new(),
             external_inputs_open: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            wake_handle,
+            consecutive_idle: 0,
             _phantom: PhantomData,
         })
     }
-
+
+
     /// Get a shared reference to the external inputs counter.
     ///
     /// Used by `ChannelSourceOperator` to decrement when its channel closes.
@@ -247,6 +302,26 @@ impl<T: Timestamp> DataflowExecutor<T> {
     pub fn set_external_inputs_open(&self, count: usize) {
         self.external_inputs_open
             .store(count, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    /// Get the wake handle for this executor.
+    ///
+    /// Share this handle with channels so they can notify the executor when
+    /// data arrives or capacity is freed. The executor uses the handle to
+    /// sleep (return `Poll::Pending`) when idle instead of busy-polling.
+    ///
+    /// # Integration notes (TODO for runtime wiring)
+    ///
+    /// The following components should also notify this handle but are not
+    /// yet wired:
+    /// - **InputSender**: should notify on `send()`, `advance_frontier()`,
+    ///   and `close()`/`Drop` so the async executor wakes when external
+    ///   data arrives.
+    /// - **CancellationToken**: the runtime should notify this handle when
+    ///   calling `cancel()` so a pending async executor promptly resolves
+    ///   with `Err(Cancelled)`.
+    pub fn wake_handle(&self) -> WakeHandle {
+        self.wake_handle.clone()
     }
 
     /// Replace the executor's external inputs counter with a shared one.
@@ -387,109 +462,187 @@ impl<T: Timestamp> DataflowExecutor<T> {
     /// Returns `Err(Error::Cancelled)` if the cancellation token fires.
     /// Returns `Err(...)` if any operator produces an error.
     pub fn run(&mut self) -> Result<bool> {
-        let mut consecutive_idle = 0;
-
         loop {
-            // Check cancellation.
-            self.cancel.check()?;
-
-            // If all operators are done, we're finished.
-            if self.done.iter().all(|&d| d) {
-                return Ok(true);
-            }
-
-            // If the ready queue is empty, re-populate it with non-done operators.
-            if self.ready_queue.is_empty() {
-                for pos in 0..self.operators.len() {
-                    if !self.done[pos] {
-                        self.ready_queue.push_back(pos);
-                        self.in_queue[pos] = true;
-                    }
+            match self.run_one_sweep()? {
+                SweepOutcome::Completed => return Ok(true),
+                SweepOutcome::Quiescent => return Ok(false),
+                SweepOutcome::MadeProgress => {
+                    // Continue immediately — there may be more work.
                 }
-                // If still empty, all operators are done.
-                if self.ready_queue.is_empty() {
-                    return Ok(true);
+                SweepOutcome::Idle => {
+                    // No progress this sweep but not quiescent yet.
+                    // In sync mode, just loop again (tight poll).
                 }
-            }
-
-            // Process the ready queue.
-            let mut any_progress = false;
-
-            let batch_size = self.ready_queue.len().min(self.config.max_activations_per_step);
-            for _ in 0..batch_size {
-                let Some(pos) = self.ready_queue.pop_front() else {
-                    break;
-                };
-                self.in_queue[pos] = false;
-
-                if self.done[pos] {
-                    continue;
-                }
-
-                let outcome = self.operators[pos].activate()?;
-
-                match outcome {
-                    ActivationOutcome::MadeProgress => {
-                        any_progress = true;
-                        // Re-queue: operator may have more work.
-                        self.ready_queue.push_back(pos);
-                        self.in_queue[pos] = true;
-                    }
-                    ActivationOutcome::Idle => {
-                        // Don't re-queue. Will be re-added on next sweep.
-                    }
-                    ActivationOutcome::BlockedOnBackpressure => {
-                        // Re-queue at the back; downstream needs to drain first.
-                        self.ready_queue.push_back(pos);
-                        self.in_queue[pos] = true;
-                        any_progress = true;
-                    }
-                    ActivationOutcome::Done => {
-                        self.done[pos] = true;
-                        self.propagate_completion(pos);
-                        any_progress = true;
-                    }
-                }
-            }
-
-            if any_progress {
-                consecutive_idle = 0;
-            } else {
-                consecutive_idle += 1;
-            }
-
-            // After each batch, propagate progress and enqueue dirty operators.
-            if self.propagate_progress() {
-                consecutive_idle = 0;
-            }
-
-            if consecutive_idle >= self.config.max_idle_sweeps {
-                // Check if external inputs are still open — if so, don't
-                // declare quiescence. Sleep briefly to avoid busy-polling.
-                if self.external_inputs_open.load(std::sync::atomic::Ordering::SeqCst) > 0 {
+                SweepOutcome::WaitingForInput => {
+                    // External inputs still open. In sync mode, sleep briefly
+                    // to avoid busy-polling.
                     std::thread::sleep(std::time::Duration::from_millis(1));
-                    consecutive_idle = 0;
+                }
+            }
+        }
+    }
+
+    /// Execute one sweep of the activation loop.
+    ///
+    /// A sweep processes the ready queue (up to `max_activations_per_step`),
+    /// propagates progress, and updates quiescence counters. Returns a
+    /// [`SweepOutcome`] indicating what happened.
+    ///
+    /// This is the core building block for both sync [`run()`](Self::run)
+    /// and async [`poll_run()`](#method.poll_run).
+    fn run_one_sweep(&mut self) -> Result<SweepOutcome> {
+        // Check cancellation.
+        self.cancel.check()?;
+
+        // If all operators are done, we're finished.
+        if self.done.iter().all(|&d| d) {
+            return Ok(SweepOutcome::Completed);
+        }
+
+        // If the ready queue is empty, re-populate it with non-done operators.
+        if self.ready_queue.is_empty() {
+            for pos in 0..self.operators.len() {
+                if !self.done[pos] {
+                    self.ready_queue.push_back(pos);
+                    self.in_queue[pos] = true;
+                }
+            }
+            // If still empty, all operators are done.
+            if self.ready_queue.is_empty() {
+                return Ok(SweepOutcome::Completed);
+            }
+        }
+
+        // Process the ready queue.
+        let mut any_progress = false;
+
+        let batch_size = self.ready_queue.len().min(self.config.max_activations_per_step);
+        for _ in 0..batch_size {
+            let Some(pos) = self.ready_queue.pop_front() else {
+                break;
+            };
+            self.in_queue[pos] = false;
+
+            if self.done[pos] {
+                continue;
+            }
+
+            let outcome = self.operators[pos].activate()?;
+
+            match outcome {
+                ActivationOutcome::MadeProgress => {
+                    any_progress = true;
+                    // Re-queue: operator may have more work.
+                    self.ready_queue.push_back(pos);
+                    self.in_queue[pos] = true;
+                }
+                ActivationOutcome::Idle => {
+                    // Don't re-queue. Will be re-added on next sweep.
+                }
+                ActivationOutcome::BlockedOnBackpressure => {
+                    // Re-queue at the back; downstream needs to drain first.
+                    self.ready_queue.push_back(pos);
+                    self.in_queue[pos] = true;
+                    any_progress = true;
+                }
+                ActivationOutcome::Done => {
+                    self.done[pos] = true;
+                    self.propagate_completion(pos);
+                    any_progress = true;
+                }
+            }
+        }
+
+        if any_progress {
+            self.consecutive_idle = 0;
+        } else {
+            self.consecutive_idle += 1;
+        }
+
+        // After each batch, propagate progress and enqueue dirty operators.
+        if self.propagate_progress() {
+            self.consecutive_idle = 0;
+        }
+
+        if self.consecutive_idle >= self.config.max_idle_sweeps {
+            // Check if external inputs are still open — if so, don't
+            // declare quiescence, but signal the caller to wait.
+            if self.external_inputs_open.load(std::sync::atomic::Ordering::SeqCst) > 0 {
+                self.consecutive_idle = 0;
+                return Ok(SweepOutcome::WaitingForInput);
+            }
+
+            // If a progress tracker is attached and reports completion,
+            // force-close remaining operators (they are in a feedback cycle
+            // that quiesced). Treat as normal completion.
+            if let Some(ref tracker) = self.progress_tracker {
+                if tracker.is_completed() {
+                    for pos in 0..self.operators.len() {
+                        if !self.done[pos] {
+                            self.operators[pos].close_inputs();
+                            self.done[pos] = true;
+                        }
+                    }
+                    return Ok(SweepOutcome::Completed);
+                }
+            }
+
+            // Quiescent — no operator made progress.
+            return Ok(SweepOutcome::Quiescent);
+        }
+
+        if any_progress {
+            Ok(SweepOutcome::MadeProgress)
+        } else {
+            Ok(SweepOutcome::Idle)
+        }
+    }
+
+    /// Poll the executor as a [`Future`], driving sweeps until the dataflow
+    /// completes, becomes quiescent, or needs to wait for input/notifications.
+    ///
+    /// # Async execution model
+    ///
+    /// Instead of busy-looping, the executor registers a waker with its
+    /// [`WakeHandle`]. When channels push data, free capacity, or close,
+    /// they notify the handle, which wakes this future to run more sweeps.
+    ///
+    /// The race-safe protocol is:
+    /// 1. Run sweeps until idle
+    /// 2. Register the waker
+    /// 3. Re-check for notifications (handles the race where a channel
+    ///    pushed data between step 1 and step 2)
+    /// 4. Only return `Pending` if no notification is pending
+    ///
+    /// Returns `Poll::Ready(Ok(true))` on completion, `Poll::Ready(Ok(false))`
+    /// on quiescence, or `Poll::Ready(Err(...))` on error/cancellation.
+    pub fn poll_run(&mut self, cx: &mut Context<'_>) -> Poll<Result<bool>> {
+        loop {
+            match self.run_one_sweep() {
+                Ok(SweepOutcome::Completed) => return Poll::Ready(Ok(true)),
+                Ok(SweepOutcome::Quiescent) => return Poll::Ready(Ok(false)),
+                Ok(SweepOutcome::MadeProgress) => {
+                    // Continue sweeping — more work may be available.
                     continue;
                 }
-
-                // If a progress tracker is attached and reports completion,
-                // force-close remaining operators (they are in a feedback cycle
-                // that quiesced). Treat as normal completion.
-                if let Some(ref tracker) = self.progress_tracker {
-                    if tracker.is_completed() {
-                        for pos in 0..self.operators.len() {
-                            if !self.done[pos] {
-                                self.operators[pos].close_inputs();
-                                self.done[pos] = true;
-                            }
-                        }
-                        return Ok(true);
-                    }
+                Ok(SweepOutcome::Idle) => {
+                    // No progress this sweep. Continue sweeping until
+                    // quiescence threshold is reached.
+                    continue;
                 }
+                Ok(SweepOutcome::WaitingForInput) => {
+                    // External inputs still open. Register waker first,
+                    // then re-check for notifications (race-safe protocol).
+                    self.wake_handle.register_waker(cx.waker());
 
-                // Quiescent — no operator made progress. Return false
-                // to distinguish from normal completion.
-                return Ok(false);
+                    // Race-safe re-check: if a notification arrived between
+                    // the sweep and register_waker, we must sweep again.
+                    if self.wake_handle.take_notification() {
+                        continue;
+                    }
+                    return Poll::Pending;
+                }
+                Err(e) => return Poll::Ready(Err(e)),
             }
         }
     }
@@ -552,6 +705,31 @@ impl<T: Timestamp> DataflowExecutor<T> {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Future implementation
+// ---------------------------------------------------------------------------
+
+/// Implements [`Future`] so the executor can be driven by an async runtime.
+///
+/// Resolves to `Ok(true)` on normal completion, `Ok(false)` on quiescence,
+/// or `Err(...)` on error/cancellation. Between polls, the executor sleeps
+/// until a channel notifies its [`WakeHandle`].
+impl<T: Timestamp> Future for DataflowExecutor<T> {
+    type Output = Result<bool>;
+
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        // SAFETY: DataflowExecutor is Unpin (no self-referential fields).
+        let this = self.get_mut();
+        this.poll_run(cx)
+    }
+}
+
+// DataflowExecutor is Unpin because all its fields are either behind
+// indirection (Arc, Box, Vec) or are plain data. The PhantomData<T> makes
+// auto-Unpin conservative, but T only appears as a type parameter — no
+// T values are stored inline that could create self-referential pointers.
+impl<T: Timestamp> Unpin for DataflowExecutor<T> {}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -599,6 +777,43 @@ mod tests {
         }
     }
 
+    /// An operator that always returns Idle — never makes progress, never finishes.
+    /// Used for testing async waiting behavior.
+    struct IdleOperator {
+        index: usize,
+        region_id: crate::dataflow::region::RegionId,
+        closed: bool,
+    }
+
+    impl SchedulableOperator for IdleOperator {
+        fn activate(&mut self) -> Result<ActivationOutcome> {
+            if self.closed {
+                return Ok(ActivationOutcome::Done);
+            }
+            Ok(ActivationOutcome::Idle)
+        }
+
+        fn is_done(&self) -> bool {
+            self.closed
+        }
+
+        fn name(&self) -> &str {
+            "idle"
+        }
+
+        fn index(&self) -> usize {
+            self.index
+        }
+
+        fn region_id(&self) -> crate::dataflow::region::RegionId {
+            self.region_id
+        }
+
+        fn close_inputs(&mut self) {
+            self.closed = true;
+        }
+    }
+
     #[test]
     fn executor_runs_single_operator_to_completion() {
         let mut executor = DataflowExecutor {
@@ -618,6 +833,8 @@ mod tests {
             notificators: Vec::new(),
             probes: Vec::new(),
             external_inputs_open: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            wake_handle: WakeHandle::new(),
+            consecutive_idle: 0,
             _phantom: std::marker::PhantomData::<u64>,
         };
 
@@ -648,6 +865,8 @@ mod tests {
             notificators: Vec::new(),
             probes: Vec::new(),
             external_inputs_open: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            wake_handle: WakeHandle::new(),
+            consecutive_idle: 0,
             _phantom: std::marker::PhantomData::<u64>,
         };
 
@@ -682,6 +901,8 @@ mod tests {
             notificators: Vec::new(),
             probes: Vec::new(),
             external_inputs_open: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            wake_handle: WakeHandle::new(),
+            consecutive_idle: 0,
             _phantom: std::marker::PhantomData::<u64>,
         };
 
@@ -704,6 +925,8 @@ mod tests {
             notificators: Vec::new(),
             probes: Vec::new(),
             external_inputs_open: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            wake_handle: WakeHandle::new(),
+            consecutive_idle: 0,
             _phantom: std::marker::PhantomData::<u64>,
         };
 
@@ -740,6 +963,8 @@ mod tests {
             notificators: Vec::new(),
             probes: Vec::new(),
             external_inputs_open: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            wake_handle: WakeHandle::new(),
+            consecutive_idle: 0,
             _phantom: std::marker::PhantomData::<u64>,
         };
 
@@ -798,6 +1023,8 @@ mod tests {
             notificators: Vec::new(),
             probes: Vec::new(),
             external_inputs_open: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            wake_handle: WakeHandle::new(),
+            consecutive_idle: 0,
             _phantom: std::marker::PhantomData::<u64>,
         };
 
@@ -844,6 +1071,8 @@ mod tests {
             notificators: Vec::new(),
             probes: Vec::new(),
             external_inputs_open: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            wake_handle: WakeHandle::new(),
+            consecutive_idle: 0,
             _phantom: std::marker::PhantomData::<u64>,
         };
 
@@ -878,6 +1107,8 @@ mod tests {
             notificators: vec![Some(Notificator::new(Antichain::from_elem(0u64)))],
             probes: Vec::new(),
             external_inputs_open: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            wake_handle: WakeHandle::new(),
+            consecutive_idle: 0,
             _phantom: std::marker::PhantomData::<u64>,
         };
 
@@ -925,6 +1156,8 @@ mod tests {
             notificators: vec![Some(Notificator::new(Antichain::new()))],
             probes: Vec::new(),
             external_inputs_open: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            wake_handle: WakeHandle::new(),
+            consecutive_idle: 0,
             _phantom: std::marker::PhantomData::<u64>,
         };
 
@@ -932,5 +1165,314 @@ mod tests {
         executor.notify_at(0, 3);
         let ready = executor.drain_notifications(0);
         assert_eq!(ready, vec![3]);
+    }
+
+    // -----------------------------------------------------------------------
+    // Async executor / poll_run tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn poll_run_completes_simple_dataflow() {
+        // A dataflow with one operator that finishes in 2 activations
+        // should resolve to Ready(Ok(true)) when polled.
+        use std::future::Future;
+        use std::pin::Pin;
+        use std::task::{Context, Poll, Wake};
+
+        struct NoopWaker;
+        impl Wake for NoopWaker {
+            fn wake(self: std::sync::Arc<Self>) {}
+        }
+
+        let waker = std::sync::Arc::new(NoopWaker).into();
+        let mut cx = Context::from_waker(&waker);
+
+        let mut executor: DataflowExecutor<u64> = DataflowExecutor {
+            operators: vec![Box::new(CountingOperator {
+                name: "counter".into(),
+                index: 0,
+                region_id: crate::dataflow::region::RegionId::new(0),
+                remaining: 2,
+            })],
+            ready_queue: VecDeque::from([0]),
+            in_queue: vec![true],
+            done: vec![false],
+            index_to_pos: vec![0],
+            config: ExecutorConfig::default(),
+            cancel: CancellationToken::new(),
+            progress_tracker: None,
+            notificators: Vec::new(),
+            probes: Vec::new(),
+            external_inputs_open: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            wake_handle: WakeHandle::new(),
+            consecutive_idle: 0,
+            _phantom: std::marker::PhantomData::<u64>,
+        };
+
+        // Poll the Future — should complete in one poll since all operators finish.
+        let result = Pin::new(&mut executor).poll(&mut cx);
+        assert!(matches!(result, Poll::Ready(Ok(true))));
+    }
+
+    #[test]
+    fn poll_run_returns_pending_with_external_inputs() {
+        // When external inputs are open, the executor should return Pending
+        // (not quiescence) after reaching idle threshold.
+        use std::future::Future;
+        use std::pin::Pin;
+        use std::task::{Context, Poll, Wake};
+
+        struct TrackingWaker {
+            woken: std::sync::atomic::AtomicBool,
+        }
+        impl Wake for TrackingWaker {
+            fn wake(self: std::sync::Arc<Self>) {
+                self.woken.store(true, std::sync::atomic::Ordering::Release);
+            }
+        }
+
+        let tracking = std::sync::Arc::new(TrackingWaker {
+            woken: std::sync::atomic::AtomicBool::new(false),
+        });
+        let waker = tracking.clone().into();
+        let mut cx = Context::from_waker(&waker);
+
+        let mut executor: DataflowExecutor<u64> = DataflowExecutor {
+            operators: vec![Box::new(IdleOperator {
+                index: 0,
+                region_id: crate::dataflow::region::RegionId::new(0),
+                closed: false,
+            })],
+            ready_queue: VecDeque::from([0]),
+            in_queue: vec![true],
+            done: vec![false],
+            index_to_pos: vec![0],
+            config: ExecutorConfig {
+                max_activations_per_step: 1024,
+                max_idle_sweeps: 1, // reach idle threshold quickly
+            },
+            cancel: CancellationToken::new(),
+            progress_tracker: None,
+            notificators: Vec::new(),
+            probes: Vec::new(),
+            external_inputs_open: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(1)),
+            wake_handle: WakeHandle::new(),
+            consecutive_idle: 0,
+            _phantom: std::marker::PhantomData::<u64>,
+        };
+
+        // IdleOperator always returns Idle → hits idle threshold → WaitingForInput.
+        // poll_run should register waker and return Pending.
+        let mut got_pending = false;
+        for _ in 0..200 {
+            match Pin::new(&mut executor).poll(&mut cx) {
+                Poll::Pending => {
+                    got_pending = true;
+                    break;
+                }
+                Poll::Ready(_) => {
+                    panic!("Should not have resolved yet — external inputs open");
+                }
+            }
+        }
+        assert!(got_pending, "Expected Pending due to external inputs");
+    }
+
+    #[test]
+    fn poll_run_wakes_on_notification() {
+        // Verify that after returning Pending, notifying the wake handle
+        // wakes the registered waker.
+        use std::future::Future;
+        use std::pin::Pin;
+        use std::task::{Context, Poll, Wake};
+
+        struct TrackingWaker {
+            woken: std::sync::atomic::AtomicBool,
+        }
+        impl Wake for TrackingWaker {
+            fn wake(self: std::sync::Arc<Self>) {
+                self.woken.store(true, std::sync::atomic::Ordering::Release);
+            }
+        }
+
+        let tracking = std::sync::Arc::new(TrackingWaker {
+            woken: std::sync::atomic::AtomicBool::new(false),
+        });
+        let waker = tracking.clone().into();
+        let mut cx = Context::from_waker(&waker);
+
+        let mut executor: DataflowExecutor<u64> = DataflowExecutor {
+            operators: vec![Box::new(IdleOperator {
+                index: 0,
+                region_id: crate::dataflow::region::RegionId::new(0),
+                closed: false,
+            })],
+            ready_queue: VecDeque::from([0]),
+            in_queue: vec![true],
+            done: vec![false],
+            index_to_pos: vec![0],
+            config: ExecutorConfig {
+                max_activations_per_step: 1024,
+                max_idle_sweeps: 1,
+            },
+            cancel: CancellationToken::new(),
+            progress_tracker: None,
+            notificators: Vec::new(),
+            probes: Vec::new(),
+            external_inputs_open: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(1)),
+            wake_handle: WakeHandle::new(),
+            consecutive_idle: 0,
+            _phantom: std::marker::PhantomData::<u64>,
+        };
+
+        let wake = executor.wake_handle();
+
+        // Drive to Pending
+        let mut reached_pending = false;
+        for _ in 0..200 {
+            if let Poll::Pending = Pin::new(&mut executor).poll(&mut cx) {
+                reached_pending = true;
+                break;
+            }
+        }
+        assert!(reached_pending);
+        assert!(!tracking.woken.load(std::sync::atomic::Ordering::Acquire));
+
+        // Notify via wake handle — waker should fire
+        wake.notify();
+        assert!(tracking.woken.load(std::sync::atomic::Ordering::Acquire));
+    }
+
+    #[test]
+    fn poll_run_cancelled_returns_error() {
+        use std::future::Future;
+        use std::pin::Pin;
+        use std::task::{Context, Poll, Wake};
+
+        struct NoopWaker;
+        impl Wake for NoopWaker {
+            fn wake(self: std::sync::Arc<Self>) {}
+        }
+
+        let cancel = CancellationToken::new();
+        cancel.cancel();
+
+        let waker = std::sync::Arc::new(NoopWaker).into();
+        let mut cx = Context::from_waker(&waker);
+
+        let mut executor: DataflowExecutor<u64> = DataflowExecutor {
+            operators: vec![Box::new(CountingOperator {
+                name: "op".into(),
+                index: 0,
+                region_id: crate::dataflow::region::RegionId::new(0),
+                remaining: 5,
+            })],
+            ready_queue: VecDeque::from([0]),
+            in_queue: vec![true],
+            done: vec![false],
+            index_to_pos: vec![0],
+            config: ExecutorConfig::default(),
+            cancel,
+            progress_tracker: None,
+            notificators: Vec::new(),
+            probes: Vec::new(),
+            external_inputs_open: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            wake_handle: WakeHandle::new(),
+            consecutive_idle: 0,
+            _phantom: std::marker::PhantomData::<u64>,
+        };
+
+        let result = Pin::new(&mut executor).poll(&mut cx);
+        match result {
+            Poll::Ready(Err(Error::Cancelled)) => {} // expected
+            other => panic!("Expected Cancelled error, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn bounded_channel_with_wake_notifies_on_push() {
+        // Verify that pushing to a BoundedPush with WakeHandle notifies.
+        use crate::dataflow::channels::bounded::bounded_channel_with_wake;
+        use crate::dataflow::channels::envelope::Envelope;
+        use crate::dataflow::channels::pushpull::Push;
+
+        let wake = WakeHandle::new();
+        // Drain initial notification
+        wake.take_notification();
+
+        let (mut push, _pull) = bounded_channel_with_wake::<u64, i32, ()>(4, Some(wake.clone()));
+
+        // Push should notify
+        push.push(Envelope::data(0, vec![1])).unwrap();
+        assert!(wake.take_notification());
+    }
+
+    #[test]
+    fn bounded_channel_with_wake_notifies_on_close() {
+        use crate::dataflow::channels::bounded::bounded_channel_with_wake;
+        use crate::dataflow::channels::pushpull::Push;
+
+        let wake = WakeHandle::new();
+        wake.take_notification();
+
+        let (mut push, _pull) = bounded_channel_with_wake::<u64, i32, ()>(4, Some(wake.clone()));
+
+        push.close();
+        assert!(wake.take_notification());
+    }
+
+    #[test]
+    fn bounded_channel_with_wake_notifies_on_drop() {
+        use crate::dataflow::channels::bounded::bounded_channel_with_wake;
+
+        let wake = WakeHandle::new();
+        wake.take_notification();
+
+        let (push, _pull) = bounded_channel_with_wake::<u64, i32, ()>(4, Some(wake.clone()));
+
+        drop(push);
+        assert!(wake.take_notification());
+    }
+
+    #[test]
+    fn bounded_channel_pull_notifies_when_freeing_capacity() {
+        use crate::dataflow::channels::bounded::bounded_channel_with_wake;
+        use crate::dataflow::channels::envelope::Envelope;
+        use crate::dataflow::channels::pushpull::{Pull, Push};
+
+        let wake = WakeHandle::new();
+
+        let (mut push, mut pull) = bounded_channel_with_wake::<u64, i32, ()>(2, Some(wake.clone()));
+
+        // Fill channel to capacity
+        push.push(Envelope::data(0, vec![1])).unwrap();
+        push.push(Envelope::data(0, vec![2])).unwrap();
+        assert!(push.push(Envelope::data(0, vec![3])).is_err()); // backpressure
+
+        // Drain notification from pushes
+        wake.take_notification();
+
+        // Pull should notify (channel was full, now has space)
+        let _ = pull.pull();
+        assert!(wake.take_notification());
+    }
+
+    #[test]
+    fn bounded_channel_pull_no_notify_when_not_full() {
+        use crate::dataflow::channels::bounded::bounded_channel_with_wake;
+        use crate::dataflow::channels::envelope::Envelope;
+        use crate::dataflow::channels::pushpull::{Pull, Push};
+
+        let wake = WakeHandle::new();
+
+        let (mut push, mut pull) = bounded_channel_with_wake::<u64, i32, ()>(4, Some(wake.clone()));
+
+        // Push one item (channel not full)
+        push.push(Envelope::data(0, vec![1])).unwrap();
+        wake.take_notification(); // drain push notification
+
+        // Pull from non-full channel — should NOT notify
+        let _ = pull.pull();
+        assert!(!wake.take_notification());
     }
 }
