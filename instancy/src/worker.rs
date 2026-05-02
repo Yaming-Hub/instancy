@@ -67,10 +67,10 @@ impl From<usize> for WorkerId {
 /// ```rust
 /// use instancy::worker::WorkerContext;
 ///
-/// let ctx = WorkerContext::new(2, 4);
-/// assert_eq!(ctx.worker_index(), 2);
-/// assert_eq!(ctx.num_workers(), 4);
-/// assert!(!ctx.is_single_worker());
+/// let ctx = WorkerContext::single();
+/// assert_eq!(ctx.worker_index(), 0);
+/// assert_eq!(ctx.num_workers(), 1);
+/// assert!(ctx.is_single_worker());
 /// ```
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct WorkerContext {
@@ -84,7 +84,9 @@ impl WorkerContext {
     /// # Panics
     ///
     /// Panics if `worker_index >= num_workers` or `num_workers == 0`.
-    pub fn new(worker_index: usize, num_workers: usize) -> Self {
+    /// This is `pub(crate)` because only the runtime constructs worker contexts;
+    /// callers should never need to create one directly.
+    pub(crate) fn new(worker_index: usize, num_workers: usize) -> Self {
         assert!(num_workers > 0, "num_workers must be >= 1");
         assert!(
             worker_index < num_workers,
