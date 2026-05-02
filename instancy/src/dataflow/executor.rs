@@ -252,6 +252,11 @@ impl<T: Timestamp> DataflowExecutor<T> {
             .unwrap_or(0);
         index_to_pos.resize(max_index + 1, usize::MAX);
 
+        // TODO(multi-worker): For N-worker materialization, this loop runs N times
+        // on the same factories. Currently all factories are SingleUseFactory (panics
+        // on 2nd call). PR 39 will: (1) check is_replayable() for all factories and
+        // return an error if N>1 with non-replayable factories, (2) change ownership
+        // model to &mut LogicalDataflow so factories survive across materializations.
         for (op_idx, mut factory) in operator_factories {
             // Collect input pullers sorted by port index.
             let mut inputs = op_input_pullers.remove(&op_idx).unwrap_or_default();

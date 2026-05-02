@@ -115,6 +115,9 @@ pub trait OperatorBlueprint: Send {
     ///
     /// Returns `false` for single-use factories (will panic on second `build()`).
     /// Returns `true` for replayable factories.
+    ///
+    /// Currently unused — will be checked in the multi-worker materialization path
+    /// (PR 39) to validate all factories before attempting N materializations.
     fn is_replayable(&self) -> bool;
 }
 
