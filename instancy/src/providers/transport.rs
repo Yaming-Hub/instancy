@@ -127,7 +127,7 @@ impl<T: Timestamp, D, M> InMemoryPush<T, D, M> {
 
     /// Check if closed.
     pub fn is_closed(&self) -> bool {
-        *self.closed.lock().unwrap()
+        *self.closed.lock().unwrap_or_else(|e| e.into_inner())
     }
 }
 
@@ -140,7 +140,7 @@ impl<T: Timestamp, D, M> Default for InMemoryPush<T, D, M> {
 impl<T: Timestamp, D, M> fmt::Debug for InMemoryPush<T, D, M> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("InMemoryPush")
-            .field("buffer_len", &self.buffer.lock().unwrap().len())
+            .field("buffer_len", &self.buffer.lock().unwrap_or_else(|e| e.into_inner()).len())
             .field("closed", &self.is_closed())
             .finish()
     }
@@ -156,7 +156,7 @@ where
         if self.is_closed() {
             return Err(Error::ChannelClosed);
         }
-        self.buffer.lock().unwrap().push_back(envelope);
+        self.buffer.lock().unwrap_or_else(|e| e.into_inner()).push_back(envelope);
         Ok(())
     }
 
@@ -165,7 +165,7 @@ where
     }
 
     fn close(&self) -> Result<(), Error> {
-        *self.closed.lock().unwrap() = true;
+        *self.closed.lock().unwrap_or_else(|e| e.into_inner()) = true;
         Ok(())
     }
 }
@@ -271,7 +271,7 @@ mod tests {
         push.push(Envelope::data(1, vec![10, 20])).unwrap();
         push.push(Envelope::data(2, vec![30])).unwrap();
 
-        let buf = buffer.lock().unwrap();
+        let buf = buffer.lock().unwrap_or_else(|e| e.into_inner());
         assert_eq!(buf.len(), 2);
     }
 

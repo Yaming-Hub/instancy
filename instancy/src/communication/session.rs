@@ -105,7 +105,7 @@ impl DataflowSession {
             is_local,
         };
 
-        self.channels.lock().unwrap().insert(channel_id, info.clone());
+        self.channels.lock().unwrap_or_else(|e| e.into_inner()).insert(channel_id, info.clone());
         info
     }
 
@@ -116,7 +116,7 @@ impl DataflowSession {
 
     /// Get all allocated channels.
     pub fn channels(&self) -> Vec<ChannelInfo> {
-        self.channels.lock().unwrap().values().cloned().collect()
+        self.channels.lock().unwrap_or_else(|e| e.into_inner()).values().cloned().collect()
     }
 
     /// Get all remote channels (cross-node).
@@ -132,7 +132,7 @@ impl DataflowSession {
 
     /// Get a specific channel's info.
     pub fn channel_info(&self, channel_id: ChannelId) -> Option<ChannelInfo> {
-        self.channels.lock().unwrap().get(&channel_id).cloned()
+        self.channels.lock().unwrap_or_else(|e| e.into_inner()).get(&channel_id).cloned()
     }
 
     /// Get the DataflowId as bytes (for wire protocol frames).

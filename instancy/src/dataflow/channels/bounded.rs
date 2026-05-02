@@ -90,7 +90,7 @@ impl<T: Timestamp, D: Send + 'static, M: Send + 'static> Push<T, D, M>
     for BoundedPush<T, D, M>
 {
     fn push(&mut self, envelope: Envelope<T, D, M>) -> Result<()> {
-        let mut state = self.state.lock().unwrap();
+        let mut state = self.state.lock().map_err(|_| Error::Custom("channel mutex poisoned".into()))?;
         if self.closed.load(Ordering::Acquire) {
             return Err(Error::ChannelClosed);
         }
@@ -109,7 +109,10 @@ impl<T: Timestamp, D: Send + 'static, M: Send + 'static> Push<T, D, M>
         &mut self,
         envelope: Envelope<T, D, M>,
     ) -> std::result::Result<(), (Error, Envelope<T, D, M>)> {
-        let mut state = self.state.lock().unwrap();
+        let mut state = match self.state.lock() {
+            Ok(s) => s,
+            Err(_) => return Err((Error::Custom("channel mutex poisoned".into()), envelope)),
+        };
         if self.closed.load(Ordering::Acquire) {
             return Err((Error::ChannelClosed, envelope));
         }
@@ -167,7 +170,7 @@ impl<T: Timestamp, D: Send + 'static, M: Send + 'static> Pull<T, D, M>
     for BoundedPull<T, D, M>
 {
     fn pull(&mut self) -> Option<Envelope<T, D, M>> {
-        let mut state = self.state.lock().unwrap();
+        let mut state = self.state.lock().ok()?;
         let was_full = state.buffer.len() >= state.capacity;
         let result = state.buffer.pop_front();
         drop(state); // release lock before notify
@@ -181,7 +184,10 @@ impl<T: Timestamp, D: Send + 'static, M: Send + 'static> Pull<T, D, M>
     }
 
     fn drain_into(&mut self, buffer: &mut Vec<Envelope<T, D, M>>) -> usize {
-        let mut state = self.state.lock().unwrap();
+        let mut state = match self.state.lock() {
+            Ok(s) => s,
+            Err(_) => return 0,
+        };
         let was_full = state.buffer.len() >= state.capacity;
         let count = state.buffer.len();
         buffer.extend(state.buffer.drain(..));
@@ -200,8 +206,7 @@ impl<T: Timestamp, D: Send + 'static, M: Send + 'static> Pull<T, D, M>
         if !self.closed.load(Ordering::Acquire) {
             return false;
         }
-        let state = self.state.lock().unwrap();
-        state.buffer.is_empty()
+        self.state.lock().map_or(true, |s| s.buffer.is_empty())
     }
 }
 
@@ -212,7 +217,7 @@ impl<T: Timestamp, D: Send + 'static, M: Send + 'static> Pull<T, D, M>
 impl<T: Timestamp, D, M> BoundedPush<T, D, M> {
     /// Returns the current number of envelopes in the buffer.
     pub fn len(&self) -> usize {
-        self.state.lock().unwrap().buffer.len()
+        self.state.lock().map_or(0, |s| s.buffer.len())
     }
 
     /// Returns true if the buffer is empty.
@@ -222,7 +227,7 @@ impl<T: Timestamp, D, M> BoundedPush<T, D, M> {
 
     /// Returns the capacity of this channel.
     pub fn capacity(&self) -> usize {
-        self.state.lock().unwrap().capacity
+        self.state.lock().map_or(0, |s| s.capacity)
     }
 
     /// Set or replace the wake handle for this channel endpoint.
@@ -234,7 +239,7 @@ impl<T: Timestamp, D, M> BoundedPush<T, D, M> {
 impl<T: Timestamp, D, M> BoundedPull<T, D, M> {
     /// Returns the current number of envelopes available to pull.
     pub fn len(&self) -> usize {
-        self.state.lock().unwrap().buffer.len()
+        self.state.lock().map_or(0, |s| s.buffer.len())
     }
 
     /// Returns true if no envelopes are available.

@@ -41,23 +41,23 @@ impl<T: Timestamp> ProbeHandle<T> {
     /// When this returns `true`, no more data at timestamps ≤ `time` will arrive
     /// at this point in the dataflow.
     pub fn done_with(&self, time: &T) -> bool {
-        let frontier = self.frontier.lock().unwrap();
+        let frontier = self.frontier.lock().unwrap_or_else(|e| e.into_inner());
         !frontier.less_equal(time)
     }
 
     /// Returns the current frontier as a snapshot.
     pub fn frontier(&self) -> Antichain<T> {
-        self.frontier.lock().unwrap().clone()
+        self.frontier.lock().unwrap_or_else(|e| e.into_inner()).clone()
     }
 
     /// Returns `true` if the frontier is empty (all work complete).
     pub fn is_done(&self) -> bool {
-        self.frontier.lock().unwrap().is_empty()
+        self.frontier.lock().unwrap_or_else(|e| e.into_inner()).is_empty()
     }
 
     /// Update the frontier. Called by the executor during progress propagation.
     pub(crate) fn update_frontier(&self, new_frontier: &Antichain<T>) {
-        let mut frontier = self.frontier.lock().unwrap();
+        let mut frontier = self.frontier.lock().unwrap_or_else(|e| e.into_inner());
         *frontier = new_frontier.clone();
     }
 }

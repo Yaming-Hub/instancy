@@ -100,7 +100,10 @@ mod tests {
             if self.closed {
                 return Err(crate::error::Error::Custom("channel closed".into()));
             }
-            self.buffer.lock().unwrap().push(envelope);
+            self.buffer
+                .lock()
+                .map_err(|_| crate::error::Error::Custom("channel mutex poisoned".into()))?
+                .push(envelope);
             Ok(())
         }
 
@@ -111,7 +114,10 @@ mod tests {
             if self.closed {
                 return Err((crate::error::Error::Custom("channel closed".into()), envelope));
             }
-            self.buffer.lock().unwrap().push(envelope);
+            match self.buffer.lock() {
+                Ok(mut buf) => buf.push(envelope),
+                Err(_) => return Err((crate::error::Error::Custom("channel mutex poisoned".into()), envelope)),
+            }
             Ok(())
         }
 
@@ -130,7 +136,7 @@ mod tests {
 
     impl<T: Timestamp, D: Send, M: Send> Pull<T, D, M> for VecPull<T, D, M> {
         fn pull(&mut self) -> Option<Envelope<T, D, M>> {
-            let mut buf = self.buffer.lock().unwrap();
+            let mut buf = self.buffer.lock().ok()?;
             if buf.is_empty() {
                 None
             } else {
@@ -142,7 +148,7 @@ mod tests {
             let is_sender_closed = self
                 .sender_closed
                 .load(std::sync::atomic::Ordering::Relaxed);
-            let is_empty = self.buffer.lock().unwrap().is_empty();
+            let is_empty = self.buffer.lock().map_or(true, |b| b.is_empty());
             is_sender_closed && is_empty
         }
     }

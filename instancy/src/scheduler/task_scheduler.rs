@@ -154,7 +154,7 @@ impl TaskScheduler {
     ) {
         let worker_idx = activation.worker_id.index();
         {
-            let mut queues = self.worker_queues.lock().unwrap();
+            let mut queues = self.worker_queues.lock().unwrap_or_else(|e| e.into_inner());
             // Grow worker queue vector if needed
             while queues.len() <= worker_idx {
                 queues.push(WorkerQueue::new());
@@ -171,8 +171,8 @@ impl TaskScheduler {
     /// 2. The region has available concurrency permits
     pub fn dispatch_ready(&self) -> Vec<ComputeTask> {
         let mut ready = Vec::new();
-        let mut queues = self.worker_queues.lock().unwrap();
-        let mut permits = self.region_permits.lock().unwrap();
+        let mut queues = self.worker_queues.lock().unwrap_or_else(|e| e.into_inner());
+        let mut permits = self.region_permits.lock().unwrap_or_else(|e| e.into_inner());
 
         for queue in queues.iter_mut() {
             if queue.has_in_flight {
@@ -200,7 +200,7 @@ impl TaskScheduler {
 
     /// Mark a worker as no longer having an in-flight task.
     pub fn mark_completed(&self, worker_id: WorkerId) {
-        let mut queues = self.worker_queues.lock().unwrap();
+        let mut queues = self.worker_queues.lock().unwrap_or_else(|e| e.into_inner());
         let idx = worker_id.index();
         if idx < queues.len() {
             queues[idx].has_in_flight = false;
@@ -209,7 +209,7 @@ impl TaskScheduler {
 
     /// Set the concurrency limit for a specific region.
     pub fn set_region_concurrency(&self, region_id: RegionId, max_concurrent: usize) {
-        let mut permits = self.region_permits.lock().unwrap();
+        let mut permits = self.region_permits.lock().unwrap_or_else(|e| e.into_inner());
         let idx = region_id.0;
         while permits.len() <= idx {
             permits.push(Arc::new(RegionPermit::new(
@@ -221,7 +221,7 @@ impl TaskScheduler {
 
     /// Get the number of pending tasks across all workers.
     pub fn pending_tasks(&self) -> usize {
-        let queues = self.worker_queues.lock().unwrap();
+        let queues = self.worker_queues.lock().unwrap_or_else(|e| e.into_inner());
         queues.iter().map(|q| q.queue.len()).sum()
     }
 

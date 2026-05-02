@@ -123,7 +123,7 @@ struct LocalPush<T: Timestamp, D, M> {
 
 impl<T: Timestamp, D: Send, M: Send> Push<T, D, M> for LocalPush<T, D, M> {
     fn push(&mut self, envelope: Envelope<T, D, M>) -> Result<()> {
-        let mut state = self.shared.lock().unwrap();
+        let mut state = self.shared.lock().map_err(|_| Error::Custom("channel mutex poisoned".into()))?;
         if state.sender_closed || state.receiver_dropped {
             return Err(Error::ChannelClosed);
         }
@@ -138,7 +138,10 @@ impl<T: Timestamp, D: Send, M: Send> Push<T, D, M> for LocalPush<T, D, M> {
         &mut self,
         envelope: Envelope<T, D, M>,
     ) -> std::result::Result<(), (Error, Envelope<T, D, M>)> {
-        let mut state = self.shared.lock().unwrap();
+        let mut state = match self.shared.lock() {
+            Ok(s) => s,
+            Err(_) => return Err((Error::Custom("channel mutex poisoned".into()), envelope)),
+        };
         if state.sender_closed || state.receiver_dropped {
             return Err((Error::ChannelClosed, envelope));
         }
@@ -155,20 +158,21 @@ impl<T: Timestamp, D: Send, M: Send> Push<T, D, M> for LocalPush<T, D, M> {
     }
 
     fn close(&mut self) {
-        let mut state = self.shared.lock().unwrap();
-        state.sender_closed = true;
+        if let Ok(mut state) = self.shared.lock() {
+            state.sender_closed = true;
+        }
     }
 
     fn is_closed(&self) -> bool {
-        let state = self.shared.lock().unwrap();
-        state.sender_closed
+        self.shared.lock().map_or(true, |s| s.sender_closed)
     }
 }
 
 impl<T: Timestamp, D, M> Drop for LocalPush<T, D, M> {
     fn drop(&mut self) {
-        let mut state = self.shared.lock().unwrap();
-        state.sender_closed = true;
+        if let Ok(mut state) = self.shared.lock() {
+            state.sender_closed = true;
+        }
     }
 }
 
@@ -179,20 +183,21 @@ struct LocalPull<T: Timestamp, D, M> {
 
 impl<T: Timestamp, D: Send, M: Send> Pull<T, D, M> for LocalPull<T, D, M> {
     fn pull(&mut self) -> Option<Envelope<T, D, M>> {
-        let mut state = self.shared.lock().unwrap();
-        state.buffer.pop_front()
+        self.shared.lock().ok()?.buffer.pop_front()
     }
 
     fn is_exhausted(&self) -> bool {
-        let state = self.shared.lock().unwrap();
-        state.sender_closed && state.buffer.is_empty()
+        self.shared
+            .lock()
+            .map_or(true, |s| s.sender_closed && s.buffer.is_empty())
     }
 }
 
 impl<T: Timestamp, D, M> Drop for LocalPull<T, D, M> {
     fn drop(&mut self) {
-        let mut state = self.shared.lock().unwrap();
-        state.receiver_dropped = true;
+        if let Ok(mut state) = self.shared.lock() {
+            state.receiver_dropped = true;
+        }
     }
 }
 

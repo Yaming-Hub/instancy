@@ -127,7 +127,8 @@ pub struct WorkerPool {
 impl WorkerPool {
     /// Create a new worker pool with the given configuration.
     ///
-    /// Spawns `min_threads` worker threads immediately.
+    /// Spawns `min_threads` worker threads immediately. Returns an error if
+    /// configuration is invalid or any initial thread fails to spawn.
     pub fn new(config: WorkerPoolConfig) -> Result<Self, &'static str> {
         config.validate()?;
 
@@ -138,7 +139,7 @@ impl WorkerPool {
 
         // Spawn initial min_threads
         for _ in 0..config.min_threads {
-            pool.spawn_thread();
+            pool.spawn_thread().map_err(|_| "failed to spawn initial worker thread")?;
         }
 
         Ok(pool)
@@ -168,13 +169,14 @@ impl WorkerPool {
         // lock() and wait_timeout() — without the mutex, notify_all can fire
         // before the thread enters the wait, causing it to miss the signal.
         {
-            let _guard = self.state.park_mutex.lock().unwrap();
+            let _guard = self.state.park_mutex.lock().ok();
             self.state.park_condvar.notify_all();
         }
 
-        let mut threads = self.threads.lock().unwrap();
-        for handle in threads.drain(..) {
-            let _ = handle.join();
+        if let Ok(mut threads) = self.threads.lock() {
+            for handle in threads.drain(..) {
+                let _ = handle.join();
+            }
         }
     }
 
@@ -211,7 +213,11 @@ impl WorkerPool {
     ///
     /// Panics if a registry is already set (call only once per pool).
     pub fn create_registry(&self) -> Arc<ExecutorRegistry> {
-        let mut guard = self.state.executor_registry.lock().unwrap();
+        let mut guard = self
+            .state
+            .executor_registry
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         assert!(
             guard.is_none(),
             "ExecutorRegistry already set for this pool"
@@ -224,11 +230,15 @@ impl WorkerPool {
 
     /// Get the executor registry, if one has been created.
     pub fn registry(&self) -> Option<Arc<ExecutorRegistry>> {
-        self.state.executor_registry.lock().unwrap().clone()
+        self.state
+            .executor_registry
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
     }
 
     /// Attempt to spawn a new worker thread, atomically reserving a slot.
-    /// Returns true if a thread was spawned.
+    /// Returns true if a thread was spawned, false if at max capacity or spawn failed.
     fn try_spawn_thread(&self) -> bool {
         // Atomically reserve a slot below max_threads
         loop {
@@ -245,32 +255,49 @@ impl WorkerPool {
         }
 
         let state = self.state.clone();
-        let handle = thread::Builder::new()
+        let handle = match thread::Builder::new()
             .name("instancy-worker".to_string())
             .spawn(move || {
                 worker_thread_loop(&state);
-                // thread_count is decremented inside the loop on idle exit,
-                // or we decrement here for normal/shutdown exit.
             })
-            .expect("failed to spawn worker thread");
+        {
+            Ok(h) => h,
+            Err(_) => {
+                // Undo the reservation — spawn failed.
+                self.state.thread_count.fetch_sub(1, Ordering::SeqCst);
+                return false;
+            }
+        };
 
-        self.threads.lock().unwrap().push(handle);
+        if let Ok(mut threads) = self.threads.lock() {
+            threads.push(handle);
+        }
         true
     }
 
     /// Spawn a thread unconditionally (used during pool initialization).
-    fn spawn_thread(&self) {
+    /// Returns an error if the OS refuses to create the thread.
+    fn spawn_thread(&self) -> std::result::Result<(), std::io::Error> {
         self.state.thread_count.fetch_add(1, Ordering::SeqCst);
 
         let state = self.state.clone();
-        let handle = thread::Builder::new()
+        let handle = match thread::Builder::new()
             .name("instancy-worker".to_string())
             .spawn(move || {
                 worker_thread_loop(&state);
             })
-            .expect("failed to spawn worker thread");
+        {
+            Ok(h) => h,
+            Err(e) => {
+                self.state.thread_count.fetch_sub(1, Ordering::SeqCst);
+                return Err(e);
+            }
+        };
 
-        self.threads.lock().unwrap().push(handle);
+        if let Ok(mut threads) = self.threads.lock() {
+            threads.push(handle);
+        }
+        Ok(())
     }
 }
 
@@ -328,7 +355,7 @@ fn worker_thread_loop(state: &PoolState) {
         }
 
         // Priority 2: Try executor tasks from the registry's ready queue
-        if let Some(registry) = state.executor_registry.lock().unwrap().as_ref().cloned() {
+        if let Some(registry) = state.executor_registry.lock().ok().and_then(|g| g.as_ref().cloned()) {
             if let Some(task) = registry.dequeue() {
                 if task.try_start_poll() {
                     idle_cycles = 0;
@@ -394,7 +421,10 @@ fn worker_thread_loop(state: &PoolState) {
 
             let parked_at = Instant::now();
 
-            let guard = state.park_mutex.lock().unwrap();
+            let guard = match state.park_mutex.lock() {
+                Ok(g) => g,
+                Err(_) => return, // mutex poisoned, exit thread gracefully
+            };
 
             // Re-check shutdown while holding park_mutex. shutdown() holds
             // this same mutex during notify_all(), so if shutdown happened
@@ -404,10 +434,13 @@ fn worker_thread_loop(state: &PoolState) {
                 return;
             }
 
-            let _result = state
+            let _result = match state
                 .park_condvar
                 .wait_timeout(guard, state.config.idle_shutdown)
-                .unwrap();
+            {
+                Ok(r) => r,
+                Err(_) => return, // mutex poisoned during wait, exit gracefully
+            };
 
             // After waking, check if we should shut down this thread
             if state.shutdown.load(Ordering::Relaxed) {
@@ -419,9 +452,9 @@ fn worker_thread_loop(state: &PoolState) {
             let has_executor_work = state
                 .executor_registry
                 .lock()
-                .unwrap()
-                .as_ref()
-                .map_or(false, |r| !r.is_empty());
+                .ok()
+                .and_then(|g| g.as_ref().map(|r| !r.is_empty()))
+                .unwrap_or(false);
 
             if has_injector_work || has_executor_work {
                 idle_cycles = 0;

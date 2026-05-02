@@ -54,25 +54,25 @@ impl<T: Timestamp> ProbeHandle<T> {
     /// This means all future data will have timestamps ≥ `time`,
     /// so all data at timestamps < `time` has been fully processed.
     pub fn less_than(&self, time: &T) -> bool {
-        let guard = self.state.lock().unwrap();
+        let guard = self.state.lock().unwrap_or_else(|e| e.into_inner());
         guard.frontier.less_than(time)
     }
 
     /// Returns `true` if the frontier is less than or equal to `time`.
     pub fn less_equal(&self, time: &T) -> bool {
-        let guard = self.state.lock().unwrap();
+        let guard = self.state.lock().unwrap_or_else(|e| e.into_inner());
         guard.frontier.less_equal(time)
     }
 
     /// Returns a copy of the current frontier.
     pub fn frontier(&self) -> Antichain<T> {
-        let guard = self.state.lock().unwrap();
+        let guard = self.state.lock().unwrap_or_else(|e| e.into_inner());
         guard.frontier.clone()
     }
 
     /// Returns `true` if the probed stream is complete (no more data).
     pub fn done(&self) -> bool {
-        let guard = self.state.lock().unwrap();
+        let guard = self.state.lock().unwrap_or_else(|e| e.into_inner());
         guard.done
     }
 
@@ -80,13 +80,13 @@ impl<T: Timestamp> ProbeHandle<T> {
     ///
     /// This is called by the runtime/probe operator when progress is made.
     pub fn update_frontier(&self, new_frontier: Antichain<T>) {
-        let mut guard = self.state.lock().unwrap();
+        let mut guard = self.state.lock().unwrap_or_else(|e| e.into_inner());
         guard.frontier = new_frontier;
     }
 
     /// Mark the probe as done — the stream is complete.
     pub fn mark_done(&self) {
-        let mut guard = self.state.lock().unwrap();
+        let mut guard = self.state.lock().unwrap_or_else(|e| e.into_inner());
         guard.done = true;
         guard.frontier = Antichain::new();
     }
@@ -94,7 +94,7 @@ impl<T: Timestamp> ProbeHandle<T> {
 
 impl<T: Timestamp> fmt::Debug for ProbeHandle<T> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let guard = self.state.lock().unwrap();
+        let guard = self.state.lock().unwrap_or_else(|e| e.into_inner());
         f.debug_struct("ProbeHandle")
             .field("frontier", &guard.frontier)
             .field("done", &guard.done)

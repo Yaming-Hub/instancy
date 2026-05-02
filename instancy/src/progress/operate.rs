@@ -107,7 +107,10 @@ impl<T: Timestamp> ProgressReporter<T> {
 
     /// Records a change: `+1` for a new capability, `-1` for a dropped one.
     pub fn update(&self, time: T, diff: i64) {
-        self.inner.lock().expect("reporter lock poisoned").update(time, diff);
+        self.inner
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .update(time, diff);
     }
 
     /// Records a paired update atomically: `-1` at `old_time`, `+1` at `new_time`.
@@ -115,24 +118,34 @@ impl<T: Timestamp> ProgressReporter<T> {
     /// Used by [`Capability::downgrade`](super::capability::Capability::downgrade) to
     /// ensure the frontier never sees an intermediate state.
     pub fn downgrade(&self, old_time: T, new_time: T) {
-        let mut batch = self.inner.lock().expect("reporter lock poisoned");
+        let mut batch = self.inner.lock().unwrap_or_else(|e| e.into_inner());
         batch.update(old_time, -1);
         batch.update(new_time, 1);
     }
 
     /// Drains all pending changes from this reporter, returning them as a vec.
     pub fn drain(&self) -> Vec<(T, i64)> {
-        self.inner.lock().expect("reporter lock poisoned").drain().collect()
+        self.inner
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .drain()
+            .collect()
     }
 
     /// Drains pending changes into the given `ChangeBatch`.
     pub fn drain_into(&self, target: &mut ChangeBatch<T>) {
-        self.inner.lock().expect("reporter lock poisoned").drain_into(target);
+        self.inner
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .drain_into(target);
     }
 
     /// Returns `true` if there are no pending (unread) changes.
     pub fn is_empty(&self) -> bool {
-        self.inner.lock().expect("reporter lock poisoned").is_empty()
+        self.inner
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .is_empty()
     }
 }
 

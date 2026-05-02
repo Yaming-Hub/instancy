@@ -598,7 +598,10 @@ impl CompletionNotifier {
     /// Publish the executor result and wake any waiting future/condvar.
     pub fn complete(self, result: Result<bool>) {
         {
-            let mut state = self.shared.lock().unwrap();
+            let mut state = match self.shared.lock() {
+                Ok(s) => s,
+                Err(e) => e.into_inner(),
+            };
             state.result = Some(result);
             if let Some(waker) = state.waker.take() {
                 waker.wake();
@@ -615,7 +618,10 @@ impl CompletionNotifier {
 impl Drop for CompletionNotifier {
     fn drop(&mut self) {
         // Executor panicked or was killed without publishing a result.
-        let mut state = self.shared.lock().unwrap();
+        let mut state = match self.shared.lock() {
+            Ok(s) => s,
+            Err(e) => e.into_inner(),
+        };
         if state.result.is_none() {
             state.result = Some(Err(Error::Custom(
                 "dataflow executor terminated unexpectedly (possible panic)".into(),
@@ -655,11 +661,15 @@ pub struct DataflowCompletion {
 
 impl std::fmt::Debug for DataflowCompletion {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let state = self.shared.lock().unwrap();
-        let status = if state.result.is_some() {
-            "ready"
-        } else {
-            "pending"
+        let status = match self.shared.lock() {
+            Ok(state) => {
+                if state.result.is_some() {
+                    "ready"
+                } else {
+                    "pending"
+                }
+            }
+            Err(_) => "poisoned",
         };
         f.debug_struct("DataflowCompletion")
             .field("status", &status)
@@ -698,9 +708,15 @@ impl DataflowCompletion {
     /// Returns `Ok(())` if the dataflow ran to completion, or an error if
     /// the executor failed or reached quiescence without completing.
     pub fn wait(self) -> Result<()> {
-        let mut state = self.shared.lock().unwrap();
+        let mut state = self
+            .shared
+            .lock()
+            .map_err(|_| Error::Custom("completion mutex poisoned".into()))?;
         while state.result.is_none() {
-            state = self.condvar.wait(state).unwrap();
+            state = self
+                .condvar
+                .wait(state)
+                .map_err(|_| Error::Custom("completion mutex poisoned during wait".into()))?;
         }
         interpret_completion(state.result.take().unwrap())
     }
@@ -710,7 +726,14 @@ impl Future for DataflowCompletion {
     type Output = Result<()>;
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-        let mut state = self.shared.lock().unwrap();
+        let mut state = match self.shared.lock() {
+            Ok(s) => s,
+            Err(_) => {
+                return Poll::Ready(Err(Error::Custom(
+                    "completion mutex poisoned".into(),
+                )))
+            }
+        };
         if let Some(result) = state.result.take() {
             Poll::Ready(interpret_completion(result))
         } else {
