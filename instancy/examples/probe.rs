@@ -1,36 +1,38 @@
 //! # Probe Example
 //!
-//! Demonstrates using a `ProbeHandle` to observe the input frontier of a
-//! sink operator — tracking progress through the dataflow.
+//! Demonstrates using a `ProbeHandle` to observe the input frontier of an
+//! operator — tracking progress through the dataflow.
 //!
 //! ```bash
 //! cargo run --example probe
 //! ```
 
-use instancy::dataflow::builder::{build_and_run, BuilderConfig};
+use instancy::dataflow::DataflowBuilder;
+use instancy::runtime::SimpleRuntime;
 
 fn main() {
-    // Build a dataflow with a probe attached to the sink.
-    // The probe lets us observe the frontier after execution completes.
-    let (collector, probe) = build_and_run::<u64, _, _>(BuilderConfig::default(), |ctx| {
-        let source = ctx.add_source("events", vec![
-            (0u64, vec!["login", "page_view"]),
-            (1u64, vec!["click", "purchase"]),
-            (2u64, vec!["logout"]),
-        ]);
-        let (sink_idx, collector) = ctx.add_sink::<&str>("sink", source);
+    // Build a dataflow with a probe attached after a map operator.
+    let builder = DataflowBuilder::<u64>::new("probe_demo");
+    let stream = builder.source("events", vec![
+        (0u64, vec!["login", "page_view"]),
+        (1u64, vec!["click", "purchase"]),
+        (2u64, vec!["logout"]),
+    ]);
 
-        // Attach a probe to observe the sink's input frontier.
-        let probe = ctx.add_probe(sink_idx);
-        Ok((collector, probe))
-    })
-    .expect("dataflow failed");
+    // Add a pass-through operator so the probe observes an input frontier
+    // that actually advances (probes on source operators never advance).
+    let stream = stream.map("pass", |_t, x| x);
+
+    // Attach a probe to observe the frontier after this point.
+    let (stream, probe) = stream.probe();
+    let port = stream.output("sink");
+
+    let dataflow = builder.build().expect("build failed");
+    SimpleRuntime::new().run(dataflow).expect("dataflow failed");
 
     // After execution completes, the probe reflects the final frontier state.
     // In a real application, probes are most useful *during* execution to
     // coordinate progress (e.g., waiting for a specific timestamp to complete).
-    // Here we show the terminal state: all timestamps have been fully processed,
-    // meaning the frontier has advanced past every input timestamp.
     println!("Dataflow completed.");
     println!("Probe is_done: {}", probe.is_done());
     println!("Probe done_with(0): {} (frontier advanced past t=0)", probe.done_with(&0u64));
@@ -38,6 +40,7 @@ fn main() {
     println!("Probe done_with(2): {} (frontier advanced past t=2)", probe.done_with(&2u64));
 
     // Print collected data
+    let collector = port.collector();
     let data = collector.lock().unwrap();
     println!("\nCollected {} batches, {} total events",
         data.len(),
