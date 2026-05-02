@@ -9,7 +9,7 @@ use std::fmt;
 use crate::dataflow::channels::PartitionStrategy;
 use crate::dataflow::region::RegionId;
 use crate::dataflow::scope::Scope;
-use crate::dataflow::stream::{DataStream, Slot};
+use crate::dataflow::stream::{StreamEdge, Slot};
 use crate::progress::timestamp::Timestamp;
 
 /// A registered rebalance (round-robin redistribution) operator.
@@ -86,13 +86,13 @@ impl<T: Timestamp, D> fmt::Debug for RebalanceOperator<T, D> {
     }
 }
 
-/// Extension trait for constructing rebalance operators on a `DataStream`.
+/// Extension trait for constructing rebalance operators on a `StreamEdge`.
 pub trait RebalanceExt<S: Scope, D> {
     /// Redistribute data round-robin across all workers in the current region.
     ///
     /// The target region has the same parallelism as the source region.
     /// This is useful for load-balancing after skewed computations.
-    fn rebalance(&self) -> DataStream<S, D>;
+    fn rebalance(&self) -> StreamEdge<S, D>;
 
     /// Redistribute data round-robin into a new region with specified parallelism.
     ///
@@ -101,11 +101,11 @@ pub trait RebalanceExt<S: Scope, D> {
     ///
     /// # Panics
     /// Panics if `target_parallelism` is 0.
-    fn rebalance_to(&self, target_parallelism: usize) -> DataStream<S, D>;
+    fn rebalance_to(&self, target_parallelism: usize) -> StreamEdge<S, D>;
 }
 
-impl<S: Scope, D: 'static> RebalanceExt<S, D> for DataStream<S, D> {
-    fn rebalance(&self) -> DataStream<S, D> {
+impl<S: Scope, D: 'static> RebalanceExt<S, D> for StreamEdge<S, D> {
+    fn rebalance(&self) -> StreamEdge<S, D> {
         let scope = self.scope().clone();
         let source_region = self.region_id();
         let parallelism = scope.region(source_region)
@@ -114,7 +114,7 @@ impl<S: Scope, D: 'static> RebalanceExt<S, D> for DataStream<S, D> {
         self.build_rebalance(scope, source_region, parallelism)
     }
 
-    fn rebalance_to(&self, target_parallelism: usize) -> DataStream<S, D> {
+    fn rebalance_to(&self, target_parallelism: usize) -> StreamEdge<S, D> {
         assert!(target_parallelism > 0, "target_parallelism must be > 0");
         let scope = self.scope().clone();
         let source_region = self.region_id();
@@ -122,14 +122,14 @@ impl<S: Scope, D: 'static> RebalanceExt<S, D> for DataStream<S, D> {
     }
 }
 
-impl<S: Scope, D: 'static> DataStream<S, D> {
+impl<S: Scope, D: 'static> StreamEdge<S, D> {
     /// Internal helper to build a rebalance operator.
     fn build_rebalance(
         &self,
         mut scope: S,
         source_region: RegionId,
         target_parallelism: usize,
-    ) -> DataStream<S, D> {
+    ) -> StreamEdge<S, D> {
         let op_index = scope.allocate_operator_index();
         let output_slot = Slot::new(op_index, 0);
 
@@ -160,7 +160,7 @@ impl<S: Scope, D: 'static> DataStream<S, D> {
             target_region,
         );
 
-        DataStream::new(scope, output_slot, target_region)
+        StreamEdge::new(scope, output_slot, target_region)
     }
 }
 
@@ -174,8 +174,8 @@ mod tests {
         let scope = RootScope::<u64>::new("test", 4);
         let region_id = scope.current_region().id();
         let source = Slot::new(0, 0);
-        let stream: DataStream<RootScope<u64>, i32> =
-            DataStream::new(scope, source, region_id);
+        let stream: StreamEdge<RootScope<u64>, i32> =
+            StreamEdge::new(scope, source, region_id);
 
         let rebalanced = stream.rebalance();
         assert_eq!(rebalanced.region_id(), region_id);
@@ -186,8 +186,8 @@ mod tests {
         let scope = RootScope::<u64>::new("test", 4);
         let region_id = scope.current_region().id();
         let source = Slot::new(0, 0);
-        let stream: DataStream<RootScope<u64>, i32> =
-            DataStream::new(scope, source, region_id);
+        let stream: StreamEdge<RootScope<u64>, i32> =
+            StreamEdge::new(scope, source, region_id);
 
         let rebalanced = stream.rebalance_to(16);
         assert_ne!(rebalanced.region_id(), region_id);
@@ -199,8 +199,8 @@ mod tests {
         let scope = RootScope::<u64>::new("test", 4);
         let region_id = scope.current_region().id();
         let source = Slot::new(0, 0);
-        let stream: DataStream<RootScope<u64>, i32> =
-            DataStream::new(scope, source, region_id);
+        let stream: StreamEdge<RootScope<u64>, i32> =
+            StreamEdge::new(scope, source, region_id);
 
         let _ = stream.rebalance_to(0);
     }

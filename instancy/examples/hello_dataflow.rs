@@ -11,7 +11,7 @@ use instancy::dataflow::DataflowBuilder;
 use instancy::runtime::SimpleRuntime;
 
 fn main() {
-    // Build a simple source → output dataflow using the Stream chaining API.
+    // Build a simple source → output dataflow using the Pipe chaining API.
     let builder = DataflowBuilder::<u64>::new("hello");
     let port = builder
         .source("greetings", vec![

@@ -10,7 +10,7 @@ use std::fmt;
 use crate::dataflow::operators::handles::{InputHandle, OutputHandle};
 use crate::dataflow::region::RegionId;
 use crate::dataflow::scope::Scope;
-use crate::dataflow::stream::{DataStream, Slot};
+use crate::dataflow::stream::{StreamEdge, Slot};
 use crate::error::Result;
 use crate::progress::frontier::Antichain;
 use crate::progress::timestamp::Timestamp;
@@ -315,24 +315,24 @@ impl<T: Timestamp, D, F> fmt::Debug for DelayBatchOperator<T, D, F> {
     }
 }
 
-/// Extension trait for delay operators on `DataStream`.
+/// Extension trait for delay operators on `StreamEdge`.
 pub trait DelayExt<S: Scope, D> {
     /// Delay each record by applying `delay_fn` to determine its output timestamp.
-    fn delay<F>(&self, name: &str, delay_fn: F) -> DataStream<S, D>
+    fn delay<F>(&self, name: &str, delay_fn: F) -> StreamEdge<S, D>
     where
         F: FnMut(&D, &S::Timestamp) -> S::Timestamp + Send + 'static;
 
     /// Delay all records at a timestamp by applying `delay_fn` to the timestamp.
-    fn delay_batch<F>(&self, name: &str, delay_fn: F) -> DataStream<S, D>
+    fn delay_batch<F>(&self, name: &str, delay_fn: F) -> StreamEdge<S, D>
     where
         F: FnMut(&S::Timestamp) -> S::Timestamp + Send + 'static;
 }
 
-impl<S: Scope, D: 'static> DelayExt<S, D> for DataStream<S, D>
+impl<S: Scope, D: 'static> DelayExt<S, D> for StreamEdge<S, D>
 where
     S::Timestamp: Ord,
 {
-    fn delay<F>(&self, name: &str, _delay_fn: F) -> DataStream<S, D>
+    fn delay<F>(&self, name: &str, _delay_fn: F) -> StreamEdge<S, D>
     where
         F: FnMut(&D, &S::Timestamp) -> S::Timestamp + Send + 'static,
     {
@@ -355,10 +355,10 @@ where
         let _operator: DelayOperator<S::Timestamp, D, F> =
             DelayOperator::new(name, op_index, region_id, _delay_fn);
 
-        DataStream::new(scope, output_slot, region_id)
+        StreamEdge::new(scope, output_slot, region_id)
     }
 
-    fn delay_batch<F>(&self, name: &str, _delay_fn: F) -> DataStream<S, D>
+    fn delay_batch<F>(&self, name: &str, _delay_fn: F) -> StreamEdge<S, D>
     where
         F: FnMut(&S::Timestamp) -> S::Timestamp + Send + 'static,
     {
@@ -381,7 +381,7 @@ where
         let _operator: DelayBatchOperator<S::Timestamp, D, F> =
             DelayBatchOperator::new(name, op_index, region_id, _delay_fn);
 
-        DataStream::new(scope, output_slot, region_id)
+        StreamEdge::new(scope, output_slot, region_id)
     }
 }
 
@@ -579,7 +579,7 @@ mod tests {
         let region_id = scope.current_region().id();
         let src_idx = scope.allocate_operator_index();
         let source = Slot::new(src_idx, 0);
-        let stream: DataStream<RootScope<u64>, i32> = DataStream::new(scope, source, region_id);
+        let stream: StreamEdge<RootScope<u64>, i32> = StreamEdge::new(scope, source, region_id);
 
         let output = stream.delay("delay_5", |_item, time| time + 5);
         assert_eq!(output.source().operator_index, 2);
@@ -591,7 +591,7 @@ mod tests {
         let region_id = scope.current_region().id();
         let src_idx = scope.allocate_operator_index();
         let source = Slot::new(src_idx, 0);
-        let stream: DataStream<RootScope<u64>, i32> = DataStream::new(scope, source, region_id);
+        let stream: StreamEdge<RootScope<u64>, i32> = StreamEdge::new(scope, source, region_id);
 
         let output = stream.delay_batch("delay_batch", |time| time + 10);
         assert_eq!(output.source().operator_index, 2);

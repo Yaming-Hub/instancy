@@ -1,7 +1,7 @@
-//! # Simple Pipeline (Stream Chaining API)
+//! # Simple Pipeline (Pipe Chaining API)
 //!
 //! Demonstrates the separated builder pattern:
-//! 1. Build a logical dataflow using typed Stream chaining
+//! 1. Build a logical dataflow using typed Pipe chaining
 //! 2. Execute it via `SimpleRuntime::run()`
 //!
 //! Pipeline: source(1..10) → double → filter(÷3) → describe → output

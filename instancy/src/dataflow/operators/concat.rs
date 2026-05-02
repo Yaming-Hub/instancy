@@ -8,7 +8,7 @@ use std::fmt;
 use crate::dataflow::operators::handles::{InputHandle, OutputHandle};
 use crate::dataflow::region::RegionId;
 use crate::dataflow::scope::Scope;
-use crate::dataflow::stream::{DataStream, Slot};
+use crate::dataflow::stream::{StreamEdge, Slot};
 use crate::error::Result;
 use crate::progress::timestamp::Timestamp;
 
@@ -114,14 +114,14 @@ impl<T: Timestamp, D> fmt::Debug for ConcatOperator<T, D> {
     }
 }
 
-/// Extension trait for concatenating `DataStream`s.
+/// Extension trait for concatenating `StreamEdge`s.
 pub trait ConcatExt<S: Scope, D> {
     /// Concatenate this stream with another, producing a merged output stream.
-    fn concat(&self, other: &DataStream<S, D>) -> DataStream<S, D>;
+    fn concat(&self, other: &StreamEdge<S, D>) -> StreamEdge<S, D>;
 }
 
-impl<S: Scope, D: 'static> ConcatExt<S, D> for DataStream<S, D> {
-    fn concat(&self, other: &DataStream<S, D>) -> DataStream<S, D> {
+impl<S: Scope, D: 'static> ConcatExt<S, D> for StreamEdge<S, D> {
+    fn concat(&self, other: &StreamEdge<S, D>) -> StreamEdge<S, D> {
         debug_assert_eq!(
             self.region_id(), other.region_id(),
             "concat: both input streams must be in the same region"
@@ -156,14 +156,14 @@ impl<S: Scope, D: 'static> ConcatExt<S, D> for DataStream<S, D> {
             2,
         );
 
-        DataStream::new(scope, output_slot, region_id)
+        StreamEdge::new(scope, output_slot, region_id)
     }
 }
 
 /// Concatenate a vector of streams into one.
 ///
 /// All streams must belong to the same scope and region.
-pub fn concatenate<S: Scope, D: 'static>(streams: &[DataStream<S, D>]) -> DataStream<S, D> {
+pub fn concatenate<S: Scope, D: 'static>(streams: &[StreamEdge<S, D>]) -> StreamEdge<S, D> {
     assert!(!streams.is_empty(), "concatenate requires at least one stream");
 
     let region_id = streams[0].region_id();
@@ -198,7 +198,7 @@ pub fn concatenate<S: Scope, D: 'static>(streams: &[DataStream<S, D>]) -> DataSt
         streams.len(),
     );
 
-    DataStream::new(scope, output_slot, region_id)
+    StreamEdge::new(scope, output_slot, region_id)
 }
 
 #[cfg(test)]
@@ -300,10 +300,10 @@ mod tests {
         let region_id = scope.current_region().id();
         let s1 = scope.allocate_operator_index();
         let s2 = scope.allocate_operator_index();
-        let stream1: DataStream<RootScope<u64>, i32> =
-            DataStream::new(scope.clone(), Slot::new(s1, 0), region_id);
-        let stream2: DataStream<RootScope<u64>, i32> =
-            DataStream::new(scope, Slot::new(s2, 0), region_id);
+        let stream1: StreamEdge<RootScope<u64>, i32> =
+            StreamEdge::new(scope.clone(), Slot::new(s1, 0), region_id);
+        let stream2: StreamEdge<RootScope<u64>, i32> =
+            StreamEdge::new(scope, Slot::new(s2, 0), region_id);
 
         let output = stream1.concat(&stream2);
         assert_eq!(output.source().operator_index, 3); // 1, 2 for sources, 3 for concat
@@ -313,10 +313,10 @@ mod tests {
     fn concatenate_function_works() {
         let mut scope = RootScope::<u64>::new("test", 4);
         let region_id = scope.current_region().id();
-        let streams: Vec<DataStream<RootScope<u64>, i32>> = (0..3)
+        let streams: Vec<StreamEdge<RootScope<u64>, i32>> = (0..3)
             .map(|_| {
                 let idx = scope.allocate_operator_index();
-                DataStream::new(scope.clone(), Slot::new(idx, 0), region_id)
+                StreamEdge::new(scope.clone(), Slot::new(idx, 0), region_id)
             })
             .collect();
 
@@ -327,7 +327,7 @@ mod tests {
     #[test]
     #[should_panic(expected = "at least one stream")]
     fn concatenate_panics_on_empty() {
-        let streams: Vec<DataStream<RootScope<u64>, i32>> = vec![];
+        let streams: Vec<StreamEdge<RootScope<u64>, i32>> = vec![];
         let _output = concatenate(&streams);
     }
 

@@ -1,6 +1,6 @@
 //! Probe operator — frontier observation.
 //!
-//! A probe attaches to a `DataStream` and exposes its current frontier,
+//! A probe attaches to a `StreamEdge` and exposes its current frontier,
 //! allowing external code to monitor the progress of a computation.
 
 use std::fmt;
@@ -9,7 +9,7 @@ use std::sync::{Arc, Mutex};
 use crate::dataflow::operators::handles::InputHandle;
 use crate::dataflow::region::RegionId;
 use crate::dataflow::scope::Scope;
-use crate::dataflow::stream::{DataStream, Slot};
+use crate::dataflow::stream::{StreamEdge, Slot};
 use crate::progress::frontier::Antichain;
 use crate::progress::timestamp::Timestamp;
 
@@ -195,7 +195,7 @@ impl<T: Timestamp, D> fmt::Debug for ProbeOperator<T, D> {
     }
 }
 
-/// Extension trait for attaching a probe to a `DataStream`.
+/// Extension trait for attaching a probe to a `StreamEdge`.
 pub trait ProbeExt<S: Scope, D> {
     /// Attach a probe to this stream.
     ///
@@ -204,7 +204,7 @@ pub trait ProbeExt<S: Scope, D> {
     fn probe(&self, name: &str) -> ProbeHandle<S::Timestamp>;
 }
 
-impl<S: Scope, D: 'static> ProbeExt<S, D> for DataStream<S, D> {
+impl<S: Scope, D: 'static> ProbeExt<S, D> for StreamEdge<S, D> {
     fn probe(&self, name: &str) -> ProbeHandle<S::Timestamp> {
         let mut scope = self.scope().clone();
         let op_index = scope.allocate_operator_index();
@@ -355,7 +355,7 @@ mod tests {
         let scope = RootScope::<u64>::new("test", 4);
         let region_id = scope.current_region().id();
         let source = Slot::new(0, 0);
-        let stream: DataStream<RootScope<u64>, i32> = DataStream::new(scope, source, region_id);
+        let stream: StreamEdge<RootScope<u64>, i32> = StreamEdge::new(scope, source, region_id);
 
         let handle = stream.probe("my_probe");
         assert!(!handle.done());

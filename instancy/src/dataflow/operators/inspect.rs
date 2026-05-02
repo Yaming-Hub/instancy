@@ -10,7 +10,7 @@ use std::sync::{Arc, Mutex};
 use crate::dataflow::operators::handles::{InputHandle, OutputHandle};
 use crate::dataflow::region::RegionId;
 use crate::dataflow::scope::Scope;
-use crate::dataflow::stream::{DataStream, Slot};
+use crate::dataflow::stream::{StreamEdge, Slot};
 use crate::error::Result;
 use crate::progress::timestamp::Timestamp;
 
@@ -117,7 +117,7 @@ impl<T: Timestamp, D> fmt::Debug for InspectOperator<T, D> {
     }
 }
 
-/// Extension trait for constructing inspect operators on a `DataStream`.
+/// Extension trait for constructing inspect operators on a `StreamEdge`.
 pub trait InspectExt<S: Scope, D> {
     /// Observe each batch of data flowing through the stream.
     ///
@@ -127,7 +127,7 @@ pub trait InspectExt<S: Scope, D> {
         &self,
         name: &str,
         inspector: F,
-    ) -> DataStream<S, D>
+    ) -> StreamEdge<S, D>
     where
         F: FnMut(&S::Timestamp, &[D]) + Send + 'static;
 
@@ -139,7 +139,7 @@ pub trait InspectExt<S: Scope, D> {
         &self,
         name: &str,
         inspector: F,
-    ) -> DataStream<S, D>
+    ) -> StreamEdge<S, D>
     where
         F: FnMut(&S::Timestamp, &D) + Send + 'static;
 
@@ -150,18 +150,18 @@ pub trait InspectExt<S: Scope, D> {
     fn inspect_collect(
         &self,
         name: &str,
-    ) -> (DataStream<S, D>, Arc<Mutex<Vec<(S::Timestamp, D)>>>)
+    ) -> (StreamEdge<S, D>, Arc<Mutex<Vec<(S::Timestamp, D)>>>)
     where
         D: Clone + Send + 'static,
         S::Timestamp: Clone;
 }
 
-impl<S: Scope, D: 'static> InspectExt<S, D> for DataStream<S, D> {
+impl<S: Scope, D: 'static> InspectExt<S, D> for StreamEdge<S, D> {
     fn inspect<F>(
         &self,
         name: &str,
         _inspector: F,
-    ) -> DataStream<S, D>
+    ) -> StreamEdge<S, D>
     where
         F: FnMut(&S::Timestamp, &[D]) + Send + 'static,
     {
@@ -183,14 +183,14 @@ impl<S: Scope, D: 'static> InspectExt<S, D> for DataStream<S, D> {
 
         let _operator = InspectOperator::new(name, op_index, region_id, _inspector);
 
-        DataStream::new(scope, output_slot, region_id)
+        StreamEdge::new(scope, output_slot, region_id)
     }
 
     fn inspect_each<F>(
         &self,
         name: &str,
         mut inspector: F,
-    ) -> DataStream<S, D>
+    ) -> StreamEdge<S, D>
     where
         F: FnMut(&S::Timestamp, &D) + Send + 'static,
     {
@@ -204,7 +204,7 @@ impl<S: Scope, D: 'static> InspectExt<S, D> for DataStream<S, D> {
     fn inspect_collect(
         &self,
         name: &str,
-    ) -> (DataStream<S, D>, Arc<Mutex<Vec<(S::Timestamp, D)>>>)
+    ) -> (StreamEdge<S, D>, Arc<Mutex<Vec<(S::Timestamp, D)>>>)
     where
         D: Clone + Send + 'static,
         S::Timestamp: Clone,
@@ -329,7 +329,7 @@ mod tests {
         let region_id = scope.current_region().id();
         let src_idx = scope.allocate_operator_index();
         let source = Slot::new(src_idx, 0);
-        let stream: DataStream<RootScope<u64>, i32> = DataStream::new(scope, source, region_id);
+        let stream: StreamEdge<RootScope<u64>, i32> = StreamEdge::new(scope, source, region_id);
 
         let output = stream.inspect("observer", |_time, _data| {});
 
@@ -342,7 +342,7 @@ mod tests {
         let scope = RootScope::<u64>::new("test", 4);
         let region_id = scope.current_region().id();
         let source = Slot::new(0, 0);
-        let stream: DataStream<RootScope<u64>, i32> = DataStream::new(scope, source, region_id);
+        let stream: StreamEdge<RootScope<u64>, i32> = StreamEdge::new(scope, source, region_id);
 
         let (_output_stream, _collected) = stream.inspect_collect("test_collect");
 

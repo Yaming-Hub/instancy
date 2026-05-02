@@ -28,7 +28,7 @@ use std::marker::PhantomData;
 use crate::dataflow::graph::{EdgeInfo, OperatorInfo};
 use crate::dataflow::region::RegionId;
 use crate::dataflow::scope::{ChildScope, Scope};
-use crate::dataflow::stream::{DataStream, Slot};
+use crate::dataflow::stream::{StreamEdge, Slot};
 use crate::order::Product;
 use crate::progress::timestamp::Timestamp;
 
@@ -80,16 +80,16 @@ pub trait EnterExt<S: Scope, D> {
     fn enter<TInner: Timestamp>(
         &self,
         child: &ChildScope<Product<S::Timestamp, TInner>>,
-    ) -> DataStream<ChildScope<Product<S::Timestamp, TInner>>, D>
+    ) -> StreamEdge<ChildScope<Product<S::Timestamp, TInner>>, D>
     where
         Product<S::Timestamp, TInner>: Timestamp;
 }
 
-impl<S: Scope, D: 'static> EnterExt<S, D> for DataStream<S, D> {
+impl<S: Scope, D: 'static> EnterExt<S, D> for StreamEdge<S, D> {
     fn enter<TInner: Timestamp>(
         &self,
         child: &ChildScope<Product<S::Timestamp, TInner>>,
-    ) -> DataStream<ChildScope<Product<S::Timestamp, TInner>>, D>
+    ) -> StreamEdge<ChildScope<Product<S::Timestamp, TInner>>, D>
     where
         Product<S::Timestamp, TInner>: Timestamp,
     {
@@ -111,7 +111,7 @@ impl<S: Scope, D: 'static> EnterExt<S, D> for DataStream<S, D> {
             parent_region,
         ));
 
-        DataStream::new(child.clone(), ingress_source, region_id)
+        StreamEdge::new(child.clone(), ingress_source, region_id)
     }
 }
 
@@ -134,11 +134,11 @@ where
     fn leave<P: Scope<Timestamp = TOuter>>(
         &self,
         parent: &P,
-    ) -> DataStream<P, D>;
+    ) -> StreamEdge<P, D>;
 }
 
 impl<TOuter, TInner, D> LeaveExt<TOuter, TInner, D>
-    for DataStream<ChildScope<Product<TOuter, TInner>>, D>
+    for StreamEdge<ChildScope<Product<TOuter, TInner>>, D>
 where
     TOuter: Timestamp,
     TInner: Timestamp,
@@ -148,7 +148,7 @@ where
     fn leave<P: Scope<Timestamp = TOuter>>(
         &self,
         parent: &P,
-    ) -> DataStream<P, D> {
+    ) -> StreamEdge<P, D> {
         // Each leave() call gets a unique egress slot on the scope boundary operator.
         let slot_index = self.scope().clone().allocate_egress_slot();
 
@@ -173,7 +173,7 @@ where
             child_scope.current_region().id(),
         ));
 
-        DataStream::new(parent.clone(), parent_source, region_id)
+        StreamEdge::new(parent.clone(), parent_source, region_id)
     }
 }
 
@@ -282,7 +282,7 @@ where
     fn feedback<D: 'static>(
         &mut self,
         inner_summary: TInner::Summary,
-    ) -> (FeedbackHandle<ChildScope<Product<TOuter, TInner>>, D>, DataStream<ChildScope<Product<TOuter, TInner>>, D>);
+    ) -> (FeedbackHandle<ChildScope<Product<TOuter, TInner>>, D>, StreamEdge<ChildScope<Product<TOuter, TInner>>, D>);
 }
 
 impl<TOuter, TInner> FeedbackExt<TOuter, TInner> for ChildScope<Product<TOuter, TInner>>
@@ -296,7 +296,7 @@ where
     fn feedback<D: 'static>(
         &mut self,
         inner_summary: TInner::Summary,
-    ) -> (FeedbackHandle<ChildScope<Product<TOuter, TInner>>, D>, DataStream<ChildScope<Product<TOuter, TInner>>, D>) {
+    ) -> (FeedbackHandle<ChildScope<Product<TOuter, TInner>>, D>, StreamEdge<ChildScope<Product<TOuter, TInner>>, D>) {
         let operator_index = self.allocate_operator_index();
         let region_id = self.current_region().id();
 
@@ -327,7 +327,7 @@ where
         };
 
         let source = Slot::new(operator_index, 0);
-        let stream = DataStream::new(self.clone(), source, region_id);
+        let stream = StreamEdge::new(self.clone(), source, region_id);
 
         (handle, stream)
     }
@@ -345,7 +345,7 @@ pub trait ConnectLoop<S: Scope, D> {
     fn connect_loop(self, handle: FeedbackHandle<S, D>);
 }
 
-impl<S: Scope, D: 'static> ConnectLoop<S, D> for DataStream<S, D> {
+impl<S: Scope, D: 'static> ConnectLoop<S, D> for StreamEdge<S, D> {
     fn connect_loop(self, mut handle: FeedbackHandle<S, D>) {
         // Mark as connected so the Drop impl doesn't fire the assertion.
         handle.connected = true;
@@ -432,8 +432,8 @@ mod tests {
 
         let source = Slot::new(0, 0);
         let region_id = root.current_region().id();
-        let parent_stream: DataStream<RootScope<u64>, i32> =
-            DataStream::new(root.clone(), source, region_id);
+        let parent_stream: StreamEdge<RootScope<u64>, i32> =
+            StreamEdge::new(root.clone(), source, region_id);
 
         let child_stream = parent_stream.enter(&child);
 
@@ -450,8 +450,8 @@ mod tests {
 
         let source = Slot::new(0, 0);
         let region_id = root.current_region().id();
-        let parent_stream: DataStream<RootScope<u64>, i32> =
-            DataStream::new(root.clone(), source, region_id);
+        let parent_stream: StreamEdge<RootScope<u64>, i32> =
+            StreamEdge::new(root.clone(), source, region_id);
 
         let child_stream = parent_stream.enter(&child);
         assert_eq!(child_stream.region_id(), child.current_region().id());
@@ -463,10 +463,10 @@ mod tests {
         let child = root.iterative::<u32>("loop");
 
         let region_id = root.current_region().id();
-        let stream1: DataStream<RootScope<u64>, i32> =
-            DataStream::new(root.clone(), Slot::new(0, 0), region_id);
-        let stream2: DataStream<RootScope<u64>, String> =
-            DataStream::new(root.clone(), Slot::new(1, 0), region_id);
+        let stream1: StreamEdge<RootScope<u64>, i32> =
+            StreamEdge::new(root.clone(), Slot::new(0, 0), region_id);
+        let stream2: StreamEdge<RootScope<u64>, String> =
+            StreamEdge::new(root.clone(), Slot::new(1, 0), region_id);
 
         let in1 = stream1.enter(&child);
         let in2 = stream2.enter(&child);
@@ -488,10 +488,10 @@ mod tests {
         let op1 = child.allocate_operator_index();
         let op2 = child.allocate_operator_index();
 
-        let s1: DataStream<ChildScope<Product<u64, u32>>, i32> =
-            DataStream::new(child.clone(), Slot::new(op1, 0), child_region);
-        let s2: DataStream<ChildScope<Product<u64, u32>>, String> =
-            DataStream::new(child.clone(), Slot::new(op2, 0), child_region);
+        let s1: StreamEdge<ChildScope<Product<u64, u32>>, i32> =
+            StreamEdge::new(child.clone(), Slot::new(op1, 0), child_region);
+        let s2: StreamEdge<ChildScope<Product<u64, u32>>, String> =
+            StreamEdge::new(child.clone(), Slot::new(op2, 0), child_region);
 
         let out1 = s1.leave(&root);
         let out2 = s2.leave(&root);
@@ -512,8 +512,8 @@ mod tests {
 
         let op_idx = child.allocate_operator_index();
         let child_region = child.current_region().id();
-        let child_stream: DataStream<ChildScope<Product<u64, u32>>, i32> =
-            DataStream::new(child.clone(), Slot::new(op_idx, 0), child_region);
+        let child_stream: StreamEdge<ChildScope<Product<u64, u32>>, i32> =
+            StreamEdge::new(child.clone(), Slot::new(op_idx, 0), child_region);
 
         let parent_stream = child_stream.leave(&root);
 
@@ -527,8 +527,8 @@ mod tests {
 
         let op_idx = child.allocate_operator_index();
         let child_region = child.current_region().id();
-        let child_stream: DataStream<ChildScope<Product<u64, u32>>, i32> =
-            DataStream::new(child.clone(), Slot::new(op_idx, 0), child_region);
+        let child_stream: StreamEdge<ChildScope<Product<u64, u32>>, i32> =
+            StreamEdge::new(child.clone(), Slot::new(op_idx, 0), child_region);
 
         let parent_stream = child_stream.leave(&root);
 
@@ -554,8 +554,8 @@ mod tests {
 
         // Clean up: connect the loop
         let region = child.current_region().id();
-        let dummy: DataStream<ChildScope<Product<u64, u32>>, i32> =
-            DataStream::new(child.clone(), Slot::new(99, 0), region);
+        let dummy: StreamEdge<ChildScope<Product<u64, u32>>, i32> =
+            StreamEdge::new(child.clone(), Slot::new(99, 0), region);
         dummy.connect_loop(handle);
     }
 
@@ -573,8 +573,8 @@ mod tests {
 
         // Clean up: connect the loop
         let region = child.current_region().id();
-        let dummy: DataStream<ChildScope<Product<u64, u32>>, i32> =
-            DataStream::new(child.clone(), Slot::new(99, 0), region);
+        let dummy: StreamEdge<ChildScope<Product<u64, u32>>, i32> =
+            StreamEdge::new(child.clone(), Slot::new(99, 0), region);
         dummy.connect_loop(handle);
     }
 
@@ -597,8 +597,8 @@ mod tests {
 
         // Clean up: connect the loop
         let region = child.current_region().id();
-        let dummy: DataStream<ChildScope<Product<u64, u32>>, i32> =
-            DataStream::new(child.clone(), Slot::new(99, 0), region);
+        let dummy: StreamEdge<ChildScope<Product<u64, u32>>, i32> =
+            StreamEdge::new(child.clone(), Slot::new(99, 0), region);
         dummy.connect_loop(handle);
     }
 
@@ -616,10 +616,10 @@ mod tests {
         // Clean up: connect them
         let source = Slot::new(99, 0);
         let region = child.current_region().id();
-        let dummy1: DataStream<ChildScope<Product<u64, u32>>, i32> =
-            DataStream::new(child.clone(), source, region);
-        let dummy2: DataStream<ChildScope<Product<u64, u32>>, String> =
-            DataStream::new(child.clone(), source, region);
+        let dummy1: StreamEdge<ChildScope<Product<u64, u32>>, i32> =
+            StreamEdge::new(child.clone(), source, region);
+        let dummy2: StreamEdge<ChildScope<Product<u64, u32>>, String> =
+            StreamEdge::new(child.clone(), source, region);
         dummy1.connect_loop(h1);
         dummy2.connect_loop(h2);
     }
@@ -635,8 +635,8 @@ mod tests {
 
         let source = Slot::new(2, 0);
         let region = child.current_region().id();
-        let result_stream: DataStream<ChildScope<Product<u64, u32>>, i32> =
-            DataStream::new(child.clone(), source, region);
+        let result_stream: StreamEdge<ChildScope<Product<u64, u32>>, i32> =
+            StreamEdge::new(child.clone(), source, region);
 
         // connect_loop consumes the handle
         result_stream.connect_loop(handle);
@@ -656,8 +656,8 @@ mod tests {
         // Create input entering the scope
         let parent_source = Slot::new(0, 0);
         let parent_region = root.current_region().id();
-        let input: DataStream<RootScope<u64>, i32> =
-            DataStream::new(root.clone(), parent_source, parent_region);
+        let input: StreamEdge<RootScope<u64>, i32> =
+            StreamEdge::new(root.clone(), parent_source, parent_region);
         let input_in_loop = input.enter(&child);
 
         // Both streams exist in the child scope
@@ -667,16 +667,16 @@ mod tests {
         // Simulate processing: create a result stream
         let result_source = Slot::new(child.allocate_operator_index(), 0);
         let child_region = child.current_region().id();
-        let result: DataStream<ChildScope<Product<u64, u32>>, i32> =
-            DataStream::new(child.clone(), result_source, child_region);
+        let result: StreamEdge<ChildScope<Product<u64, u32>>, i32> =
+            StreamEdge::new(child.clone(), result_source, child_region);
 
         // Close the loop
         result.connect_loop(handle);
 
         // Create output leaving the scope
         let output_source = Slot::new(child.allocate_operator_index(), 0);
-        let output: DataStream<ChildScope<Product<u64, u32>>, i32> =
-            DataStream::new(child.clone(), output_source, child_region);
+        let output: StreamEdge<ChildScope<Product<u64, u32>>, i32> =
+            StreamEdge::new(child.clone(), output_source, child_region);
         let _parent_output = output.leave(&root);
     }
 
@@ -689,8 +689,8 @@ mod tests {
 
         let source = Slot::new(0, 0);
         let region = root.current_region().id();
-        let stream: DataStream<RootScope<u64>, i32> =
-            DataStream::new(root.clone(), source, region);
+        let stream: StreamEdge<RootScope<u64>, i32> =
+            StreamEdge::new(root.clone(), source, region);
 
         // Enter and immediately leave
         let in_child = stream.enter(&child);
@@ -717,8 +717,8 @@ mod tests {
         // Graph construction allows it; progress tracker will reject at validation time.
         // Clean up
         let region = child.current_region().id();
-        let dummy: DataStream<ChildScope<Product<u64, u32>>, i32> =
-            DataStream::new(child.clone(), Slot::new(99, 0), region);
+        let dummy: StreamEdge<ChildScope<Product<u64, u32>>, i32> =
+            StreamEdge::new(child.clone(), Slot::new(99, 0), region);
         dummy.connect_loop(handle);
     }
 
@@ -740,8 +740,8 @@ mod tests {
 
         // Clean up
         let region = inner_loop.current_region().id();
-        let dummy: DataStream<ChildScope<Product<Product<u64, u32>, u32>>, i32> =
-            DataStream::new(inner_loop.clone(), Slot::new(99, 0), region);
+        let dummy: StreamEdge<ChildScope<Product<Product<u64, u32>, u32>>, i32> =
+            StreamEdge::new(inner_loop.clone(), Slot::new(99, 0), region);
         dummy.connect_loop(handle);
     }
 

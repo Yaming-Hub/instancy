@@ -237,7 +237,7 @@ impl SimpleRuntime {
     /// - Installs a `ChannelSourceOperator` that drains the receiver into the graph
     /// - Returns the sender via [`SpawnedDataflow::take_input()`]
     ///
-    /// For each [`output()`](crate::dataflow::Stream::output) port:
+    /// For each [`output()`](crate::dataflow::Pipe::output) port:
     /// - Replaces the `CollectingSink` with a `ChannelSinkOperator`
     /// - Returns the receiver via [`SpawnedDataflow::take_output()`]
     ///

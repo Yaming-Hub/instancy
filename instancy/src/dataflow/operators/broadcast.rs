@@ -13,7 +13,7 @@ use std::fmt;
 use crate::dataflow::channels::PartitionStrategy;
 use crate::dataflow::region::RegionId;
 use crate::dataflow::scope::Scope;
-use crate::dataflow::stream::{DataStream, Slot};
+use crate::dataflow::stream::{StreamEdge, Slot};
 use crate::progress::timestamp::Timestamp;
 
 /// A registered broadcast operator.
@@ -93,13 +93,13 @@ impl<T: Timestamp, D> fmt::Debug for BroadcastOperator<T, D> {
     }
 }
 
-/// Extension trait for constructing broadcast operators on a `DataStream`.
+/// Extension trait for constructing broadcast operators on a `StreamEdge`.
 pub trait BroadcastExt<S: Scope, D> {
     /// Broadcast each record to all workers in the current region.
     ///
     /// Every worker in the target region receives a copy of each record.
     /// The target region has the same parallelism as the source.
-    fn broadcast(&self) -> DataStream<S, D>;
+    fn broadcast(&self) -> StreamEdge<S, D>;
 
     /// Broadcast each record to all workers in a new region with specified parallelism.
     ///
@@ -108,13 +108,13 @@ pub trait BroadcastExt<S: Scope, D> {
     ///
     /// # Panics
     /// Panics if `target_parallelism` is 0.
-    fn broadcast_to(&self, target_parallelism: usize) -> DataStream<S, D>;
+    fn broadcast_to(&self, target_parallelism: usize) -> StreamEdge<S, D>;
 
     /// Broadcast each record to all workers in the same process only.
     ///
     /// This avoids network transfer for reference data that only needs
     /// local distribution. The target region has the same parallelism as the source.
-    fn broadcast_local(&self) -> DataStream<S, D>;
+    fn broadcast_local(&self) -> StreamEdge<S, D>;
 
     /// Broadcast each record to all local workers in a new region with specified parallelism.
     ///
@@ -123,11 +123,11 @@ pub trait BroadcastExt<S: Scope, D> {
     ///
     /// # Panics
     /// Panics if `target_parallelism` is 0.
-    fn broadcast_local_to(&self, target_parallelism: usize) -> DataStream<S, D>;
+    fn broadcast_local_to(&self, target_parallelism: usize) -> StreamEdge<S, D>;
 }
 
-impl<S: Scope, D: 'static> BroadcastExt<S, D> for DataStream<S, D> {
-    fn broadcast(&self) -> DataStream<S, D> {
+impl<S: Scope, D: 'static> BroadcastExt<S, D> for StreamEdge<S, D> {
+    fn broadcast(&self) -> StreamEdge<S, D> {
         let scope = self.scope().clone();
         let source_region = self.region_id();
         let parallelism = scope.region(source_region)
@@ -136,14 +136,14 @@ impl<S: Scope, D: 'static> BroadcastExt<S, D> for DataStream<S, D> {
         self.build_broadcast(scope, source_region, parallelism, PartitionStrategy::Broadcast)
     }
 
-    fn broadcast_to(&self, target_parallelism: usize) -> DataStream<S, D> {
+    fn broadcast_to(&self, target_parallelism: usize) -> StreamEdge<S, D> {
         assert!(target_parallelism > 0, "target_parallelism must be > 0");
         let scope = self.scope().clone();
         let source_region = self.region_id();
         self.build_broadcast(scope, source_region, target_parallelism, PartitionStrategy::Broadcast)
     }
 
-    fn broadcast_local(&self) -> DataStream<S, D> {
+    fn broadcast_local(&self) -> StreamEdge<S, D> {
         let scope = self.scope().clone();
         let source_region = self.region_id();
         let parallelism = scope.region(source_region)
@@ -152,7 +152,7 @@ impl<S: Scope, D: 'static> BroadcastExt<S, D> for DataStream<S, D> {
         self.build_broadcast(scope, source_region, parallelism, PartitionStrategy::BroadcastLocal)
     }
 
-    fn broadcast_local_to(&self, target_parallelism: usize) -> DataStream<S, D> {
+    fn broadcast_local_to(&self, target_parallelism: usize) -> StreamEdge<S, D> {
         assert!(target_parallelism > 0, "target_parallelism must be > 0");
         let scope = self.scope().clone();
         let source_region = self.region_id();
@@ -160,7 +160,7 @@ impl<S: Scope, D: 'static> BroadcastExt<S, D> for DataStream<S, D> {
     }
 }
 
-impl<S: Scope, D: 'static> DataStream<S, D> {
+impl<S: Scope, D: 'static> StreamEdge<S, D> {
     /// Internal helper to build a broadcast operator.
     fn build_broadcast(
         &self,
@@ -168,7 +168,7 @@ impl<S: Scope, D: 'static> DataStream<S, D> {
         source_region: RegionId,
         target_parallelism: usize,
         strategy: PartitionStrategy<D>,
-    ) -> DataStream<S, D> {
+    ) -> StreamEdge<S, D> {
         let op_index = scope.allocate_operator_index();
         let output_slot = Slot::new(op_index, 0);
 
@@ -201,7 +201,7 @@ impl<S: Scope, D: 'static> DataStream<S, D> {
             strategy,
         );
 
-        DataStream::new(scope, output_slot, target_region)
+        StreamEdge::new(scope, output_slot, target_region)
     }
 }
 
@@ -215,8 +215,8 @@ mod tests {
         let scope = RootScope::<u64>::new("test", 4);
         let region_id = scope.current_region().id();
         let source = Slot::new(0, 0);
-        let stream: DataStream<RootScope<u64>, i32> =
-            DataStream::new(scope, source, region_id);
+        let stream: StreamEdge<RootScope<u64>, i32> =
+            StreamEdge::new(scope, source, region_id);
 
         let broadcasted = stream.broadcast();
         assert_eq!(broadcasted.region_id(), region_id);
@@ -227,8 +227,8 @@ mod tests {
         let scope = RootScope::<u64>::new("test", 4);
         let region_id = scope.current_region().id();
         let source = Slot::new(0, 0);
-        let stream: DataStream<RootScope<u64>, i32> =
-            DataStream::new(scope.clone(), source, region_id);
+        let stream: StreamEdge<RootScope<u64>, i32> =
+            StreamEdge::new(scope.clone(), source, region_id);
 
         let broadcasted = stream.broadcast_to(8);
         assert_ne!(broadcasted.region_id(), region_id);
@@ -242,8 +242,8 @@ mod tests {
         let scope = RootScope::<u64>::new("test", 4);
         let region_id = scope.current_region().id();
         let source = Slot::new(0, 0);
-        let stream: DataStream<RootScope<u64>, i32> =
-            DataStream::new(scope, source, region_id);
+        let stream: StreamEdge<RootScope<u64>, i32> =
+            StreamEdge::new(scope, source, region_id);
 
         let _ = stream.broadcast_to(0);
     }
@@ -253,8 +253,8 @@ mod tests {
         let scope = RootScope::<u64>::new("test", 4);
         let region_id = scope.current_region().id();
         let source = Slot::new(0, 0);
-        let stream: DataStream<RootScope<u64>, i32> =
-            DataStream::new(scope, source, region_id);
+        let stream: StreamEdge<RootScope<u64>, i32> =
+            StreamEdge::new(scope, source, region_id);
 
         let broadcasted = stream.broadcast_local();
         assert_eq!(broadcasted.region_id(), region_id);
@@ -265,8 +265,8 @@ mod tests {
         let scope = RootScope::<u64>::new("test", 4);
         let region_id = scope.current_region().id();
         let source = Slot::new(0, 0);
-        let stream: DataStream<RootScope<u64>, i32> =
-            DataStream::new(scope.clone(), source, region_id);
+        let stream: StreamEdge<RootScope<u64>, i32> =
+            StreamEdge::new(scope.clone(), source, region_id);
 
         let broadcasted = stream.broadcast_local_to(12);
         assert_ne!(broadcasted.region_id(), region_id);
@@ -280,8 +280,8 @@ mod tests {
         let scope = RootScope::<u64>::new("test", 4);
         let region_id = scope.current_region().id();
         let source = Slot::new(0, 0);
-        let stream: DataStream<RootScope<u64>, i32> =
-            DataStream::new(scope, source, region_id);
+        let stream: StreamEdge<RootScope<u64>, i32> =
+            StreamEdge::new(scope, source, region_id);
 
         let _ = stream.broadcast_local_to(0);
     }

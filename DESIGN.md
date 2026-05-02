@@ -71,7 +71,7 @@ instancy/
 │   │   ├── dataflow/
 │   │   │   ├── mod.rs
 │   │   │   ├── scope.rs     — Scope trait + ChildScope
-│   │   │   ├── stream.rs    — DataStream<S, C>
+│   │   │   ├── stream.rs    — StreamEdge<S, C>
 │   │   │   ├── region.rs    — Region, PlacementPolicy
 │   │   │   ├── channels/    — Push/Pull abstractions, Envelope
 │   │   │   └── operators/
@@ -2204,7 +2204,7 @@ fn exchange_with_codec<D, C>(
     &self,
     route: impl Fn(&D) -> u64 + Send + Sync + 'static,
     codec: C,
-) -> DataStream<S, Vec<D>>
+) -> StreamEdge<S, Vec<D>>
 where
     C: Codec<Vec<D>>;
 ```
@@ -2288,7 +2288,7 @@ pub trait Operator<S: Scope, C: Container> {
         &self,
         name: &str,
         logic: L,
-    ) -> DataStream<S, C2>
+    ) -> StreamEdge<S, C2>
     where
         C2: Container,
         L: FnMut(
@@ -2303,7 +2303,7 @@ pub trait Operator<S: Scope, C: Container> {
         &self,
         name: &str,
         logic: L,
-    ) -> DataStream<S, C2>
+    ) -> StreamEdge<S, C2>
     where
         C2: Container,
         M: Clone + Send + Sync + 'static,
@@ -2321,10 +2321,10 @@ pub trait Operator<S: Scope, C: Container> {
 ```rust
 fn binary<C2, C3, L>(
     &self,
-    other: &DataStream<S, C2>,
+    other: &StreamEdge<S, C2>,
     name: &str,
     logic: L,
-) -> DataStream<S, C3>
+) -> StreamEdge<S, C3>
 where
     L: FnMut(
         &mut InputHandle<S::Timestamp, C>,
@@ -2340,12 +2340,12 @@ where
 fn branch(
     &self,
     condition: impl Fn(&T) -> bool + Send + Sync + 'static,
-) -> (DataStream<S, C>, DataStream<S, C>);
+) -> (StreamEdge<S, C>, StreamEdge<S, C>);
 
 fn ok_err<O, E>(
     &self,
     logic: impl Fn(T) -> Result<O, E> + Send + Sync + 'static,
-) -> (DataStream<S, Vec<O>>, DataStream<S, Vec<E>>);
+) -> (StreamEdge<S, Vec<O>>, StreamEdge<S, Vec<E>>);
 ```
 
 ### 9.5 Feedback / Loops
@@ -2380,7 +2380,7 @@ The `delay` operator buffers incoming data and re-timestamps it, releasing the d
 fn delay<F>(
     &self,
     delay_fn: F,
-) -> DataStream<S, C>
+) -> StreamEdge<S, C>
 where
     F: Fn(&T, &C::Item) -> T + Send + Sync + 'static;
 
@@ -2389,7 +2389,7 @@ where
 fn delay_batch<F>(
     &self,
     delay_fn: F,
-) -> DataStream<S, C>
+) -> StreamEdge<S, C>
 where
     F: Fn(&T) -> T + Send + Sync + 'static;
 ```
@@ -2403,7 +2403,7 @@ where
 
 ### 9.7 Extension Point
 
-Extension crates add operators by implementing traits on `DataStream`:
+Extension crates add operators by implementing traits on `StreamEdge`:
 
 ```rust
 // In crate `instancy-extras`
@@ -2411,11 +2411,11 @@ pub trait MapOperator<S: Scope, T: Data> {
     fn map<U: Data>(
         &self,
         f: impl Fn(T) -> U + Send + Sync + 'static,
-    ) -> DataStream<S, Vec<U>>;
+    ) -> StreamEdge<S, Vec<U>>;
 }
 
-impl<S: Scope, T: Data> MapOperator<S, T> for DataStream<S, Vec<T>> {
-    fn map<U: Data>(&self, f: impl Fn(T) -> U + Send + Sync + 'static) -> DataStream<S, Vec<U>> {
+impl<S: Scope, T: Data> MapOperator<S, T> for StreamEdge<S, Vec<T>> {
+    fn map<U: Data>(&self, f: impl Fn(T) -> U + Send + Sync + 'static) -> StreamEdge<S, Vec<U>> {
         self.unary("Map", move |input, output, _notificator| {
             while let Some((time, data)) = input.next()? {
                 let mut session = output.session(&time);
@@ -2797,7 +2797,7 @@ pub trait CheckpointBackend<T: Timestamp, D: Data>: Send + Sync + 'static {
 fn checkpoint<B>(
     &self,
     backend: B,
-) -> DataStream<S, C>
+) -> StreamEdge<S, C>
 where
     B: CheckpointBackend<S::Timestamp, C::Item>;
 ```

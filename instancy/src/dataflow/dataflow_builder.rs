@@ -5,7 +5,7 @@
 //! The builder follows a two-phase pattern:
 //!
 //! 1. **Construction**: Use [`DataflowBuilder`] to declare inputs, chain operators
-//!    via [`Stream`], and declare outputs. This produces a [`LogicalDataflow`].
+//!    via [`Pipe`], and declare outputs. This produces a [`LogicalDataflow`].
 //! 2. **Execution**: Submit the `LogicalDataflow` to a runtime for physical
 //!    materialization and async execution (Phase C, future PR).
 //!
@@ -21,7 +21,7 @@
 //! let dataflow = builder.build().unwrap();
 //! ```
 //!
-//! Streams are **cloneable** — enabling branching and multi-input patterns:
+//! Pipes are **cloneable** — enabling branching and multi-input patterns:
 //!
 //! ```ignore
 //! let stream = builder.input::<i32>("src");
@@ -155,10 +155,10 @@ impl Default for DataflowBuilderConfig {
     }
 }
 
-/// Builder for constructing a [`LogicalDataflow`] via typed stream chaining.
+/// Builder for constructing a [`LogicalDataflow`] via typed Pipe chaining.
 ///
 /// The builder uses interior mutability (`Rc<RefCell>`) so that multiple
-/// [`Stream`] handles can coexist — enabling branching and multi-input patterns.
+/// [`Pipe`] handles can coexist — enabling branching and multi-input patterns.
 ///
 /// # Thread Safety
 ///
@@ -199,13 +199,13 @@ impl<T: Timestamp> DataflowBuilder<T> {
 
     /// Declare a named input port that data will be fed into at runtime.
     ///
-    /// Returns a [`Stream`] representing the data flowing from this input.
+    /// Returns a [`Pipe`] representing the data flowing from this input.
     /// At execution time, the runtime connects an async channel to this port.
     ///
     /// # Panics
     ///
     /// Panics if an input with the same name already exists.
-    pub fn input<D: Clone + Send + 'static>(&self, name: impl Into<String>) -> Stream<T, D> {
+    pub fn input<D: Clone + Send + 'static>(&self, name: impl Into<String>) -> Pipe<T, D> {
         let name = name.into();
         let op_idx;
         let region_id = RegionId::new(0);
@@ -298,7 +298,7 @@ impl<T: Timestamp> DataflowBuilder<T> {
             state.input_port_wiring.push(wiring);
         }
 
-        Stream {
+        Pipe {
             state: Rc::clone(&self.state),
             op_idx,
             output_slot: 0,
@@ -314,7 +314,7 @@ impl<T: Timestamp> DataflowBuilder<T> {
         &self,
         name: impl Into<String>,
         data: Vec<(T, Vec<D>)>,
-    ) -> Stream<T, D> {
+    ) -> Pipe<T, D> {
         let name = name.into();
         let op_idx;
         let region_id = RegionId::new(0);
@@ -345,7 +345,7 @@ impl<T: Timestamp> DataflowBuilder<T> {
             let reporter = progress.reporter(0).clone();
 
             // Create operator factory for pre-loaded source.
-            // Handles fan-out: if multiple downstream edges exist (Stream was
+            // Handles fan-out: if multiple downstream edges exist (Pipe was
             // cloned), wraps all pushers in a TeePush adapter.
             let name_clone = name.clone();
             let factory: OperatorFactory = Box::new(move |endpoints: ChannelEndpoints| {
@@ -369,7 +369,7 @@ impl<T: Timestamp> DataflowBuilder<T> {
             state.operator_factories.push((op_idx, factory));
         }
 
-        Stream {
+        Pipe {
             state: Rc::clone(&self.state),
             op_idx,
             output_slot: 0,
@@ -389,10 +389,10 @@ impl<T: Timestamp> DataflowBuilder<T> {
 
     /// Finalize construction and produce a [`LogicalDataflow`].
     ///
-    /// Returns an error if outstanding `Stream` references still exist
+    /// Returns an error if outstanding `Pipe` references still exist
     /// (drop them first).
     ///
-    /// Fan-out (stream cloning/branching) is supported: each cloned stream
+    /// Fan-out (Pipe cloning/branching) is supported: each cloned Pipe
     /// output port automatically uses a [`TeePush`](crate::dataflow::channels::tee::TeePush)
     /// adapter that clones data to all downstream consumers.
     ///
@@ -402,8 +402,8 @@ impl<T: Timestamp> DataflowBuilder<T> {
             Ok(cell) => cell.into_inner(),
             Err(_) => {
                 return Err(Error::Custom(
-                    "cannot build: outstanding Stream references still exist — \
-                     drop all Stream handles before calling build()"
+                    "cannot build: outstanding Pipe references still exist — \
+                     drop all Pipe handles before calling build()"
                         .into(),
                 ))
             }
@@ -425,25 +425,29 @@ impl<T: Timestamp> DataflowBuilder<T> {
 }
 
 // ---------------------------------------------------------------------------
-// Stream<T, D> — cloneable typed handle for chaining operators
+// Pipe<T, D> — cloneable typed handle for chaining operators
 // ---------------------------------------------------------------------------
 
-/// A typed stream handle representing data flowing from an operator's output.
+/// A builder-time handle representing an operator's output in the dataflow graph.
 ///
-/// `Stream` is **cloneable** — cloning creates a second reference to the same
-/// output port, enabling fan-out (branching) patterns. Each clone can be
-/// independently consumed by different downstream operators.
+/// `Pipe` is part of the construction plumbing layer (Layer 3). It holds a shared
+/// reference to the builder's internal state and provides fluent method chaining
+/// (`.map()`, `.filter()`, `.binary()`, `.output()`) to wire operators together.
 ///
-/// Methods on `Stream` register new operators in the builder and return new
-/// `Stream` handles pointing to the new operator's output.
-pub struct Stream<T: Timestamp, D: Clone + Send + 'static> {
+/// Pipes are ephemeral — they exist only during `DataflowBuilder` construction
+/// and are consumed when `.build()` produces the `LogicalDataflow`. They do not
+/// exist at runtime.
+///
+/// See PLAN.md "Conceptual Architecture: Three Layers of a Dataflow" for how Pipe
+/// relates to StreamEdge (Layer 2) and the abstract Dataflow Graph (Layer 1).
+pub struct Pipe<T: Timestamp, D: Clone + Send + 'static> {
     state: Rc<RefCell<BuilderState<T>>>,
     op_idx: usize,
     output_slot: usize,
     _phantom: PhantomData<D>,
 }
 
-impl<T: Timestamp, D: Clone + Send + 'static> Clone for Stream<T, D> {
+impl<T: Timestamp, D: Clone + Send + 'static> Clone for Pipe<T, D> {
     fn clone(&self) -> Self {
         Self {
             state: Rc::clone(&self.state),
@@ -454,8 +458,8 @@ impl<T: Timestamp, D: Clone + Send + 'static> Clone for Stream<T, D> {
     }
 }
 
-impl<T: Timestamp, D: Clone + Send + 'static> Stream<T, D> {
-    /// Apply a per-element transformation, producing a new stream of type `D2`.
+impl<T: Timestamp, D: Clone + Send + 'static> Pipe<T, D> {
+    /// Apply a per-element transformation, producing a new Pipe of type `D2`.
     ///
     /// The closure receives a reference to the timestamp and ownership of each element.
     /// If you need to capture the timestamp, clone it inside the closure.
@@ -464,7 +468,7 @@ impl<T: Timestamp, D: Clone + Send + 'static> Stream<T, D> {
     /// ```ignore
     /// let doubled = stream.map("double", |_t, x: i32| x * 2);
     /// ```
-    pub fn map<D2, F>(self, name: impl Into<String>, mut logic: F) -> Stream<T, D2>
+    pub fn map<D2, F>(self, name: impl Into<String>, mut logic: F) -> Pipe<T, D2>
     where
         D2: Clone + Send + 'static,
         F: FnMut(&T, D) -> D2 + Send + 'static,
@@ -480,7 +484,7 @@ impl<T: Timestamp, D: Clone + Send + 'static> Stream<T, D> {
     /// ```ignore
     /// let evens = stream.filter("evens", |_t, x| x % 2 == 0);
     /// ```
-    pub fn filter<F>(self, name: impl Into<String>, mut predicate: F) -> Stream<T, D>
+    pub fn filter<F>(self, name: impl Into<String>, mut predicate: F) -> Pipe<T, D>
     where
         F: FnMut(&T, &D) -> bool + Send + 'static,
     {
@@ -497,7 +501,7 @@ impl<T: Timestamp, D: Clone + Send + 'static> Stream<T, D> {
     ///     line.split_whitespace().map(|w| w.to_string()).collect::<Vec<_>>()
     /// });
     /// ```
-    pub fn flat_map<D2, F>(self, name: impl Into<String>, mut logic: F) -> Stream<T, D2>
+    pub fn flat_map<D2, F>(self, name: impl Into<String>, mut logic: F) -> Pipe<T, D2>
     where
         D2: Clone + Send + 'static,
         F: FnMut(&T, D) -> Vec<D2> + Send + 'static,
@@ -523,7 +527,7 @@ impl<T: Timestamp, D: Clone + Send + 'static> Stream<T, D> {
     ///     Ok(())
     /// });
     /// ```
-    pub fn unary<D2, L>(self, name: impl Into<String>, logic: L) -> Stream<T, D2>
+    pub fn unary<D2, L>(self, name: impl Into<String>, logic: L) -> Pipe<T, D2>
     where
         D2: Clone + Send + 'static,
         L: FnMut(&mut InputHandle<T, D>, &mut OutputHandle<T, D2>) -> Result<()>
@@ -542,7 +546,7 @@ impl<T: Timestamp, D: Clone + Send + 'static> Stream<T, D> {
     ///
     /// # Arguments
     ///
-    /// - `other` — the second input stream (must belong to the same builder)
+    /// - `other` — the second input Pipe (must belong to the same builder)
     /// - `name` — operator name for debugging and graph inspection
     /// - `logic` — closure receiving two `InputHandle`s and one `OutputHandle`
     ///
@@ -559,10 +563,10 @@ impl<T: Timestamp, D: Clone + Send + 'static> Stream<T, D> {
     /// ```
     pub fn binary<D2, D3, L>(
         self,
-        other: Stream<T, D2>,
+        other: Pipe<T, D2>,
         name: impl Into<String>,
         logic: L,
-    ) -> Stream<T, D3>
+    ) -> Pipe<T, D3>
     where
         D2: Clone + Send + 'static,
         D3: Clone + Send + 'static,
@@ -697,7 +701,7 @@ impl<T: Timestamp, D: Clone + Send + 'static> Stream<T, D> {
             state.channel_factories.push((edge2_idx, channel_factory2));
         }
 
-        Stream {
+        Pipe {
             state: Rc::clone(&self.state),
             op_idx,
             output_slot: 0,
@@ -705,18 +709,18 @@ impl<T: Timestamp, D: Clone + Send + 'static> Stream<T, D> {
         }
     }
 
-    /// Merge this stream with another same-typed stream.
+    /// Merge this Pipe with another same-typed Pipe.
     ///
-    /// Shorthand for `Stream::concat(vec![self, other])`. Data from both
+    /// Shorthand for `Pipe::concat(vec![self, other])`. Data from both
     /// streams is interleaved in the output.
-    pub fn merge(self, other: Stream<T, D>) -> Stream<T, D> {
-        Stream::concat(vec![self, other])
+    pub fn merge(self, other: Pipe<T, D>) -> Pipe<T, D> {
+        Pipe::concat(vec![self, other])
     }
 
     /// Merge multiple same-typed streams into one.
     ///
     /// Creates a concat operator that forwards all data from every input
-    /// stream to a single output stream. Data order within a timestamp is
+    /// Pipe to a single output Pipe. Data order within a timestamp is
     /// preserved per-input but interleaved across inputs.
     ///
     /// # Panics
@@ -726,10 +730,10 @@ impl<T: Timestamp, D: Clone + Send + 'static> Stream<T, D> {
     /// # Example
     ///
     /// ```ignore
-    /// let merged = Stream::concat(vec![evens, odds, zeros]);
+    /// let merged = Pipe::concat(vec![evens, odds, zeros]);
     /// ```
-    pub fn concat(streams: Vec<Stream<T, D>>) -> Stream<T, D> {
-        assert!(!streams.is_empty(), "concat requires at least one stream");
+    pub fn concat(streams: Vec<Pipe<T, D>>) -> Pipe<T, D> {
+        assert!(!streams.is_empty(), "concat requires at least one Pipe");
 
         // Verify all streams share the same builder.
         for s in &streams[1..] {
@@ -834,7 +838,7 @@ impl<T: Timestamp, D: Clone + Send + 'static> Stream<T, D> {
             }
         }
 
-        Stream {
+        Pipe {
             state: state_rc,
             op_idx,
             output_slot: 0,
@@ -842,7 +846,7 @@ impl<T: Timestamp, D: Clone + Send + 'static> Stream<T, D> {
         }
     }
 
-    /// Declare this stream as a named output port.
+    /// Declare this Pipe as a named output port.
     ///
     /// Returns an [`OutputPort`] handle. At execution time, the runtime connects
     /// an async channel to this port for collecting results.
@@ -991,7 +995,7 @@ impl<T: Timestamp, D: Clone + Send + 'static> Stream<T, D> {
 
     /// Attach a probe to observe the frontier at this point in the pipeline.
     ///
-    /// Returns `(Stream, ProbeHandle)` — the stream continues unchanged,
+    /// Returns `(Pipe, ProbeHandle)` — the Pipe continues unchanged,
     /// and the probe can be queried after execution.
     pub fn probe(self) -> (Self, ProbeHandle<T>) {
         let probe = ProbeHandle::new();
@@ -1014,7 +1018,7 @@ impl<T: Timestamp, D: Clone + Send + 'static> Stream<T, D> {
         &self,
         name: impl Into<String>,
         logic: impl FnMut(T, Vec<D>) -> Vec<D2> + Send + 'static,
-    ) -> Stream<T, D2>
+    ) -> Pipe<T, D2>
     where
         D2: Clone + Send + 'static,
     {
@@ -1068,7 +1072,7 @@ impl<T: Timestamp, D: Clone + Send + 'static> Stream<T, D> {
             );
 
             // Operator factory — handles fan-out by wrapping multiple output
-            // pushers in a TeePush adapter when the stream was cloned.
+            // pushers in a TeePush adapter when the Pipe was cloned.
             let name_clone = name.clone();
             let factory: OperatorFactory = Box::new(move |endpoints: ChannelEndpoints| {
                 let input_puller: Box<dyn Pull<T, D>> = *endpoints
@@ -1118,7 +1122,7 @@ impl<T: Timestamp, D: Clone + Send + 'static> Stream<T, D> {
             state.channel_factories.push((edge_idx, channel_factory));
         }
 
-        Stream {
+        Pipe {
             state: Rc::clone(&self.state),
             op_idx,
             output_slot: 0,
@@ -1131,7 +1135,7 @@ impl<T: Timestamp, D: Clone + Send + 'static> Stream<T, D> {
         &self,
         name: impl Into<String>,
         logic: L,
-    ) -> Stream<T, D2>
+    ) -> Pipe<T, D2>
     where
         D2: Clone + Send + 'static,
         L: FnMut(&mut InputHandle<T, D>, &mut OutputHandle<T, D2>) -> Result<()>
@@ -1225,7 +1229,7 @@ impl<T: Timestamp, D: Clone + Send + 'static> Stream<T, D> {
             state.channel_factories.push((edge_idx, channel_factory));
         }
 
-        Stream {
+        Pipe {
             state: Rc::clone(&self.state),
             op_idx,
             output_slot: 0,
@@ -1918,7 +1922,7 @@ mod tests {
         let a = builder.source("a", vec![(0u64, vec![1i32, 2])]);
         let b = builder.source("b", vec![(0u64, vec![3i32, 4])]);
 
-        let port = Stream::concat(vec![a, b]).output("merged");
+        let port = Pipe::concat(vec![a, b]).output("merged");
         let dataflow = builder.build().unwrap();
         rt().run(dataflow).unwrap();
 
@@ -1936,7 +1940,7 @@ mod tests {
         let b = builder.source("b", vec![(0u64, vec![2i32])]);
         let c = builder.source("c", vec![(0u64, vec![3i32])]);
 
-        let port = Stream::concat(vec![a, b, c]).output("merged");
+        let port = Pipe::concat(vec![a, b, c]).output("merged");
         let dataflow = builder.build().unwrap();
         rt().run(dataflow).unwrap();
 
@@ -1971,7 +1975,7 @@ mod tests {
         let a = builder.source("a", vec![(0u64, vec![1i32, 2])]);
         let b = builder.source("b", vec![(0u64, vec![3i32, 4])]);
 
-        let port = Stream::concat(vec![a, b])
+        let port = Pipe::concat(vec![a, b])
             .map("double", |_t, x| x * 2)
             .output("results");
         let dataflow = builder.build().unwrap();
@@ -1990,7 +1994,7 @@ mod tests {
         let a = builder.source("a", vec![(0u64, vec![1i32]), (1u64, vec![10])]);
         let b = builder.source("b", vec![(0u64, vec![2i32]), (1u64, vec![20])]);
 
-        let port = Stream::concat(vec![a, b]).output("merged");
+        let port = Pipe::concat(vec![a, b]).output("merged");
         let dataflow = builder.build().unwrap();
         rt().run(dataflow).unwrap();
 

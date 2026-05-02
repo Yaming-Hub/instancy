@@ -25,7 +25,7 @@ use crate::progress::timestamp::Timestamp;
 
 /// A fan-out push adapter that clones envelopes to multiple downstream targets.
 ///
-/// Created automatically by the dataflow builder when a [`Stream`] is cloned
+/// Created automatically by the dataflow builder when a [`Pipe`] is cloned
 /// (branching). Each clone creates an additional downstream edge, and `TeePush`
 /// ensures all targets receive a copy of every envelope.
 ///

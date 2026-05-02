@@ -1,7 +1,7 @@
-//! DataStream — a typed edge in the dataflow graph.
+//! StreamEdge — a typed edge in the dataflow graph.
 //!
-//! A `DataStream<S, D>` represents a collection of timestamped data records
-//! flowing from one operator to the next. DataStreams are the primary
+//! A `StreamEdge<S, D>` represents a collection of timestamped data records
+//! flowing from one operator to the next. StreamEdges are the primary
 //! way operators are connected.
 
 use std::fmt;
@@ -50,16 +50,19 @@ pub struct StreamTarget {
     pub pact: String, // Strategy name for debugging; actual routing is in the channel.
 }
 
-/// A typed edge in the dataflow graph.
+/// A typed edge in the dataflow graph (Layer 2: Typed Stream Graph).
 ///
-/// `DataStream<S, D>` represents a logical stream of data records of type `D`
-/// flowing at timestamps defined by scope `S`. DataStreams connect an output
+/// `StreamEdge<S, D>` represents a logical stream of data records of type `D`
+/// flowing at timestamps defined by scope `S`. StreamEdges connect an output
 /// slot of one operator to the input slot(s) of downstream operators.
 ///
-/// DataStreams are created by operators (e.g., `unary`, `binary`) and consumed
+/// StreamEdges are created by operators (e.g., `unary`, `binary`) and consumed
 /// by downstream operators or terminal operators (e.g., `output`).
+///
+/// See PLAN.md "Conceptual Architecture: Three Layers of a Dataflow" for how
+/// StreamEdge relates to Pipe (Layer 3) and the abstract Dataflow Graph (Layer 1).
 #[derive(Debug, Clone)]
-pub struct DataStream<S: Scope, D> {
+pub struct StreamEdge<S: Scope, D> {
     /// The scope this stream belongs to.
     scope: S,
     /// The source slot (which operator output produced this stream).
@@ -70,7 +73,7 @@ pub struct DataStream<S: Scope, D> {
     _data: std::marker::PhantomData<D>,
 }
 
-impl<S: Scope, D> DataStream<S, D> {
+impl<S: Scope, D> StreamEdge<S, D> {
     /// Create a new stream from a source operator's output slot.
     pub fn new(scope: S, source: Slot, region_id: RegionId) -> Self {
         Self {
@@ -164,7 +167,7 @@ mod tests {
         let region_id = scope.current_region().id();
         let source = Slot::new(0, 0);
 
-        let stream: DataStream<RootScope<u64>, i32> = DataStream::new(scope, source, region_id);
+        let stream: StreamEdge<RootScope<u64>, i32> = StreamEdge::new(scope, source, region_id);
         assert_eq!(stream.source().operator_index, 0);
         assert_eq!(stream.region_id(), region_id);
         assert_eq!(stream.scope().name(), "test");
@@ -177,8 +180,8 @@ mod tests {
         let region2 = scope.new_region(8);
         let source = Slot::new(0, 0);
 
-        let stream: DataStream<RootScope<u64>, i32> =
-            DataStream::new(scope, source, region1);
+        let stream: StreamEdge<RootScope<u64>, i32> =
+            StreamEdge::new(scope, source, region1);
 
         let new_source = Slot::new(1, 0);
         let stream2 = stream.in_region(region2, new_source);
