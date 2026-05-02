@@ -1928,6 +1928,11 @@ impl<T: Timestamp> LogicalDataflow<T> {
     pub fn has_input_ports(&self) -> bool {
         !self.input_ports.is_empty()
     }
+
+    /// Get a reference to the dataflow graph.
+    pub fn graph(&self) -> &DataflowGraph {
+        &self.graph
+    }
 }
 
 // ---------------------------------------------------------------------------
