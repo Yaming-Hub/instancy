@@ -596,11 +596,16 @@ dataflow's `WakeHandle`. It provides an async stream-like interface:
 // Collect results from a running dataflow
 let mut out = handle.take_async_output::<String>("results").unwrap();
 
-// Receive batches — awaits until data is available
-while let Some((timestamp, batch)) = out.recv().await {
-    println!("t={timestamp}: {batch:?}");
+// Receive events — awaits until data is available
+while let Some(event) = out.recv().await {
+    if let OutputEvent::Data { time, data } = event {
+        println!("t={time}: {data:?}");
+    }
 }
 // None means the output is exhausted (dataflow complete)
+
+// Or use the convenience helper to collect all data batches:
+// let results: Vec<(T, Vec<D>)> = out.collect_data().await;
 ```
 
 Key properties:
@@ -634,14 +639,17 @@ Producer task                  Worker Pool                    Consumer task
 #### Panic Safety
 
 All mutex locks in the async I/O path use poison-safe patterns (Phase 3.5):
-- Channel operators: `lock().ok()` / `lock().map_err()` — errors propagate naturally
+- Bounded channels: `lock().ok()` / `lock().map_err()` — errors propagate naturally
 - WakeHandle: `lock().unwrap_or_else(|e| e.into_inner())` for waker registration
 - CompletionNotifier: `into_inner()` ensures completion signal always delivered
 
 ```rust
 // Example: spawn_async end-to-end
-let rt = RuntimeHandle::new(pool, registry);
-let mut spawned = rt.spawn_async(&dataflow)?;
+let rt = RuntimeHandle::new(RuntimeConfig {
+    worker_threads: 4,
+    ..Default::default()
+}).unwrap();
+let mut spawned = rt.spawn_async(dataflow)?;
 
 let sender = spawned.take_async_input::<i32>("data").unwrap();
 let mut output = spawned.take_async_output::<String>("results").unwrap();
@@ -654,8 +662,10 @@ tokio::spawn(async move {
 });
 
 // Consumer
-while let Some((t, batch)) = output.recv().await {
-    println!("t={t}: {batch:?}");
+while let Some(event) = output.recv().await {
+    if let OutputEvent::Data { time, data } = event {
+        println!("t={time}: {data:?}");
+    }
 }
 
 completion.await?;
@@ -3906,7 +3916,7 @@ This section documents the cardinality (how many instances exist) and lifetime (
 - `AsyncInputSender` / `AsyncOutputReceiver` with WakeHandle integration
 - `ChannelMode` enum (Sync | Async) selected at spawn time
 - `InputRecv` / `OutputSend` enum dispatch in ChannelSourceOperator / ChannelSinkOperator
-- Panic safety audit: poison-safe mutex patterns across all non-test source files
+- Panic safety audit: poison-safe mutex patterns in critical paths (channels, worker pool, completion, wake, progress, connection pool)
 - `DataflowCompletion` as real Future (poll + sync wait)
 
 **Phase 4 — Loops & Branching**
