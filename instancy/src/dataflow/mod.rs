@@ -22,6 +22,8 @@ pub mod wired_operators;
 pub use channel_operators::{
     ChannelSinkOperator, ChannelSourceOperator, InputSender, OutputReceiver,
 };
+#[cfg(feature = "async-io")]
+pub use channel_operators::{AsyncInputSender, AsyncOutputReceiver};
 pub use channels::{ControlSignal, Envelope, PartitionStrategy, Payload};
 pub use dataflow_builder::{DataflowBuilder, DataflowBuilderConfig, LogicalDataflow, OutputPort, Pipe};
 pub use executor::{DataflowExecutor, ExecutorConfig};

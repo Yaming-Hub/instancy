@@ -25,3 +25,8 @@ default = ["tracing", "transport"]
 tracing = ["dep:tracing"]
 bincode-codec = ["dep:bincode", "dep:serde"]
 transport = ["dep:tokio"]
+async-io = ["dep:tokio"]
+
+[[example]]
+name = "async_spawn"
+required-features = ["async-io"]
