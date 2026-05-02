@@ -299,6 +299,36 @@ impl DataflowGraph {
         preds
     }
 
+    /// Names of operator types that require cross-worker data routing.
+    ///
+    /// These operators are not yet supported in multi-worker execution
+    /// (each worker runs an independent replica). Attempting to use them
+    /// with `spawn_multi(N > 1)` will return an error.
+    const EXCHANGE_OPERATOR_NAMES: &[&str] = &[
+        "exchange", "rebalance", "gather", "broadcast", "broadcast_local",
+    ];
+
+    /// Returns `true` if the graph contains any exchange/rebalance/gather/broadcast
+    /// operators that require cross-worker data routing.
+    pub fn has_exchange_operators(&self) -> bool {
+        self.operators.values().any(|op| {
+            let lower = op.name.to_lowercase();
+            Self::EXCHANGE_OPERATOR_NAMES.iter().any(|name| lower == *name)
+        })
+    }
+
+    /// Returns the names of exchange operators present in the graph, if any.
+    pub fn exchange_operator_names(&self) -> Vec<&str> {
+        self.operators
+            .values()
+            .filter(|op| {
+                let lower = op.name.to_lowercase();
+                Self::EXCHANGE_OPERATOR_NAMES.iter().any(|name| lower == *name)
+            })
+            .map(|op| op.name.as_str())
+            .collect()
+    }
+
     // -- Topological ordering --
 
     /// Compute a topological ordering of operators using Kahn's algorithm.
@@ -864,5 +894,40 @@ mod tests {
         assert!(s.contains("1 edges"));
         assert!(s.contains("source"));
         assert!(s.contains("sink"));
+    }
+
+    #[test]
+    fn has_exchange_operators_false_for_pipeline() {
+        let r = RegionId::new(0);
+        let mut graph = DataflowGraph::new();
+        graph.register_operator(OperatorInfo::new(0, "source", r, 0, 1)).unwrap();
+        graph.register_operator(OperatorInfo::new(1, "map", r, 1, 1)).unwrap();
+        graph.register_operator(OperatorInfo::new(2, "sink", r, 1, 0)).unwrap();
+        assert!(!graph.has_exchange_operators());
+        assert!(graph.exchange_operator_names().is_empty());
+    }
+
+    #[test]
+    fn has_exchange_operators_detects_exchange() {
+        let r = RegionId::new(0);
+        let mut graph = DataflowGraph::new();
+        graph.register_operator(OperatorInfo::new(0, "source", r, 0, 1)).unwrap();
+        graph.register_operator(OperatorInfo::new(1, "exchange", r, 1, 1)).unwrap();
+        graph.register_operator(OperatorInfo::new(2, "sink", r, 1, 0)).unwrap();
+        assert!(graph.has_exchange_operators());
+        assert_eq!(graph.exchange_operator_names(), vec!["exchange"]);
+    }
+
+    #[test]
+    fn has_exchange_operators_detects_rebalance_gather_broadcast() {
+        let r = RegionId::new(0);
+        let mut graph = DataflowGraph::new();
+        graph.register_operator(OperatorInfo::new(0, "rebalance", r, 1, 1)).unwrap();
+        graph.register_operator(OperatorInfo::new(1, "gather", r, 1, 1)).unwrap();
+        graph.register_operator(OperatorInfo::new(2, "broadcast", r, 1, 1)).unwrap();
+        assert!(graph.has_exchange_operators());
+        let mut names = graph.exchange_operator_names();
+        names.sort();
+        assert_eq!(names, vec!["broadcast", "gather", "rebalance"]);
     }
 }
