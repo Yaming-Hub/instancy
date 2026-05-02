@@ -194,7 +194,7 @@ impl<T: Timestamp> DataflowExecutor<T> {
                 Error::Custom(format!("No channel factory for edge index {edge_idx}"))
             })?;
             let capacity = 1024; // TODO: make configurable per edge
-            let (push, pull) = factory.build(capacity, Some(wake_handle.clone()));
+            let (push, pull) = factory.build(&worker_context, capacity, Some(wake_handle.clone()));
             push_ends.push(Some(push));
             pull_ends.push(Some(pull));
         }

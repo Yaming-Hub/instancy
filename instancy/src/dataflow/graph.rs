@@ -83,6 +83,24 @@ impl fmt::Display for OperatorInfo {
 // EdgeInfo — a directed edge between operator ports
 // ---------------------------------------------------------------------------
 
+/// The routing kind for a channel (edge) in the dataflow graph.
+///
+/// Pipeline channels deliver data within a single worker. Exchange channels
+/// route data between workers based on a partition strategy.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ChannelKind {
+    /// Data stays on the same worker (default for intra-worker edges).
+    Pipeline,
+    /// Data is routed between workers (requires multi-worker materialization).
+    Exchange,
+}
+
+impl Default for ChannelKind {
+    fn default() -> Self {
+        Self::Pipeline
+    }
+}
+
 /// A directed edge connecting an output port of one operator to an input
 /// port of another operator.
 ///
@@ -99,10 +117,12 @@ pub struct EdgeInfo {
     pub source_region: RegionId,
     /// Region of the target operator.
     pub target_region: RegionId,
+    /// Whether this edge is a pipeline (worker-local) or exchange (cross-worker).
+    pub channel_kind: ChannelKind,
 }
 
 impl EdgeInfo {
-    /// Create a new edge descriptor.
+    /// Create a new pipeline edge descriptor (worker-local channel).
     pub fn new(
         source: Slot,
         target: Slot,
@@ -114,7 +134,29 @@ impl EdgeInfo {
             target,
             source_region,
             target_region,
+            channel_kind: ChannelKind::Pipeline,
         }
+    }
+
+    /// Create a new exchange edge descriptor (cross-worker channel).
+    pub fn exchange(
+        source: Slot,
+        target: Slot,
+        source_region: RegionId,
+        target_region: RegionId,
+    ) -> Self {
+        Self {
+            source,
+            target,
+            source_region,
+            target_region,
+            channel_kind: ChannelKind::Exchange,
+        }
+    }
+
+    /// Whether this edge requires cross-worker routing.
+    pub fn is_exchange(&self) -> bool {
+        self.channel_kind == ChannelKind::Exchange
     }
 }
 
@@ -308,8 +350,20 @@ impl DataflowGraph {
         "exchange", "rebalance", "gather", "broadcast", "broadcastlocal",
     ];
 
+    /// Returns `true` if the graph contains any exchange edges that require
+    /// cross-worker data routing.
+    ///
+    /// This checks the edge-level `ChannelKind` metadata — more reliable than
+    /// name-based detection which is kept for backward compatibility.
+    pub fn has_exchange_edges(&self) -> bool {
+        self.edges.iter().any(|e| e.is_exchange())
+            || self.feedback_edges.iter().any(|e| e.is_exchange())
+    }
+
     /// Returns `true` if the graph contains any exchange/rebalance/gather/broadcast
     /// operators that require cross-worker data routing.
+    ///
+    /// Prefer [`has_exchange_edges()`](Self::has_exchange_edges) for reliable detection.
     pub fn has_exchange_operators(&self) -> bool {
         self.operators.values().any(|op| {
             let lower = op.name.to_lowercase();
@@ -929,5 +983,94 @@ mod tests {
         let mut names = graph.exchange_operator_names();
         names.sort();
         assert_eq!(names, vec!["broadcast", "gather", "rebalance"]);
+    }
+
+    // -- ChannelKind + exchange edge metadata --
+
+    #[test]
+    fn channel_kind_default_is_pipeline() {
+        assert_eq!(ChannelKind::default(), ChannelKind::Pipeline);
+    }
+
+    #[test]
+    fn edge_info_new_creates_pipeline() {
+        let edge = EdgeInfo::new(
+            Slot::new(0, 0),
+            Slot::new(1, 0),
+            make_region(),
+            make_region(),
+        );
+        assert_eq!(edge.channel_kind, ChannelKind::Pipeline);
+        assert!(!edge.is_exchange());
+    }
+
+    #[test]
+    fn edge_info_exchange_creates_exchange() {
+        let edge = EdgeInfo::exchange(
+            Slot::new(0, 0),
+            Slot::new(1, 0),
+            make_region(),
+            make_region(),
+        );
+        assert_eq!(edge.channel_kind, ChannelKind::Exchange);
+        assert!(edge.is_exchange());
+    }
+
+    #[test]
+    fn has_exchange_edges_false_for_pipeline_only() {
+        let r = make_region();
+        let mut graph = DataflowGraph::new();
+        graph.register_operator(OperatorInfo::new(0, "src", r, 0, 1)).unwrap();
+        graph.register_operator(OperatorInfo::new(1, "sink", r, 1, 0)).unwrap();
+        graph.add_edge(EdgeInfo::new(
+            Slot::new(0, 0),
+            Slot::new(1, 0),
+            r,
+            r,
+        ));
+        assert!(!graph.has_exchange_edges());
+    }
+
+    #[test]
+    fn has_exchange_edges_true_when_exchange_present() {
+        let r = make_region();
+        let mut graph = DataflowGraph::new();
+        graph.register_operator(OperatorInfo::new(0, "src", r, 0, 1)).unwrap();
+        graph.register_operator(OperatorInfo::new(1, "mid", r, 1, 1)).unwrap();
+        graph.register_operator(OperatorInfo::new(2, "sink", r, 1, 0)).unwrap();
+        // One pipeline edge, one exchange edge.
+        graph.add_edge(EdgeInfo::new(
+            Slot::new(0, 0),
+            Slot::new(1, 0),
+            r,
+            r,
+        ));
+        graph.add_edge(EdgeInfo::exchange(
+            Slot::new(1, 0),
+            Slot::new(2, 0),
+            r,
+            r,
+        ));
+        assert!(graph.has_exchange_edges());
+    }
+
+    #[test]
+    fn has_exchange_edges_empty_graph_is_false() {
+        let graph = DataflowGraph::new();
+        assert!(!graph.has_exchange_edges());
+    }
+
+    #[test]
+    fn has_exchange_edges_true_for_feedback_exchange() {
+        let r = make_region();
+        let mut graph = DataflowGraph::new();
+        graph.register_operator(OperatorInfo::new(0, "loop_body", r, 1, 1)).unwrap();
+        graph.add_feedback_edge(EdgeInfo::exchange(
+            Slot::new(0, 0),
+            Slot::new(0, 0),
+            r,
+            r,
+        ));
+        assert!(graph.has_exchange_edges());
     }
 }
