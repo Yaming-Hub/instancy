@@ -959,6 +959,25 @@ while let Some((time, batch)) = handle.output("results").recv().await {
 - `Stream::concat([s1, s2, s3])` → merge multiple streams
 - Tests: join-like logic, merging streams
 
+### PR 26b — Rename Stream → Pipe, DataStream → StreamEdge
+**Goal**: Clarify naming to avoid confusion between builder-time handle and logical graph edge.
+
+**Problem**: `Stream<T, D>` (dataflow_builder.rs) and `DataStream<S, D>` (stream.rs) have overlapping
+names but completely different responsibilities. This causes confusion.
+
+**Renames**:
+| Current | New | Responsibility |
+|---|---|---|
+| `Stream<T, D>` | `Pipe<T, D>` | Builder-time fluent API handle. Holds shared reference to builder state; used to chain `.map()`, `.filter()`, `.binary()`, `.output()` during dataflow construction. Not the data itself — a construction-time pipe you extend. |
+| `DataStream<S, D>` | `StreamEdge<S, D>` | Logical typed edge in the dataflow graph. Describes where data originates (scope, source slot, region). Used by the graph/scope layer for operator wiring and connection tracking. |
+
+**Changes**:
+- Rename `Stream` → `Pipe` in `dataflow_builder.rs` (struct + all method impls + tests + examples)
+- Rename `DataStream` → `StreamEdge` in `stream.rs` (struct + impls + usages)
+- Add doc-comments explaining the conceptual role of each struct
+- Update `StreamConnection` and `StreamTarget` names if needed for consistency
+- Update all examples and tests
+
 ### PR 27 — Feedback/loop operator via Stream
 **Goal**: Iterative computation in the new Stream API.
 
