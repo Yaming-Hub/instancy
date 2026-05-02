@@ -8,8 +8,9 @@
 //! ```
 
 use instancy::cancellation::CancellationToken;
-use instancy::dataflow::builder::{build_and_run_with_cancel, BuilderConfig};
+use instancy::dataflow::DataflowBuilder;
 use instancy::error::Error;
+use instancy::runtime::SimpleRuntime;
 
 fn main() {
     // Create a cancellation token and cancel it immediately.
@@ -17,17 +18,14 @@ fn main() {
     let token = CancellationToken::new();
     token.cancel();
 
-    let result = build_and_run_with_cancel::<u64, _, _>(
-        BuilderConfig::default(),
-        token,
-        |ctx| {
-            let source = ctx.add_source("data", vec![
-                (0u64, vec![1, 2, 3, 4, 5]),
-            ]);
-            let (_sink, collector) = ctx.add_sink::<i32>("output", source);
-            Ok(collector)
-        },
-    );
+    let builder = DataflowBuilder::<u64>::new("cancellation_demo");
+    let _port = builder
+        .source("data", vec![(0u64, vec![1, 2, 3, 4, 5])])
+        .output("output");
+    let dataflow = builder.build().expect("build failed");
+
+    // Run with a pre-cancelled token — should fail immediately
+    let result = SimpleRuntime::with_cancel(token).run(dataflow);
 
     match result {
         Err(Error::Cancelled) => {

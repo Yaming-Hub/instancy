@@ -4,7 +4,6 @@
 //! scopes, streams, execution regions, channels, routing strategies,
 //! operators, and the dataflow specification builder.
 
-pub mod builder;
 pub mod channel_operators;
 pub mod channels;
 pub mod dataflow_builder;
@@ -20,7 +19,6 @@ pub mod spec;
 pub mod stream;
 pub mod wired_operators;
 
-pub use builder::{build_and_run, build_and_run_with_cancel, BuildContext, BuilderConfig};
 pub use channel_operators::{
     ChannelSinkOperator, ChannelSourceOperator, InputSender, OutputReceiver,
 };
