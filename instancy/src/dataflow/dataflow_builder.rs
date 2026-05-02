@@ -37,6 +37,7 @@ use std::sync::{Arc, Mutex};
 use crate::cancellation::CancellationToken;
 use crate::dataflow::channels::bounded::bounded_channel;
 use crate::dataflow::channels::pushpull::{Pull, Push};
+use crate::dataflow::channels::tee::tee_or_single;
 use crate::dataflow::executor::{DataflowExecutor, ExecutorConfig};
 use crate::dataflow::graph::DataflowGraph;
 use crate::dataflow::operators::handles::{InputHandle, OutputHandle};
@@ -175,7 +176,7 @@ impl<T: Timestamp> DataflowBuilder<T> {
     /// # Panics
     ///
     /// Panics if an input with the same name already exists.
-    pub fn input<D: Send + 'static>(&self, name: impl Into<String>) -> Stream<T, D> {
+    pub fn input<D: Clone + Send + 'static>(&self, name: impl Into<String>) -> Stream<T, D> {
         let name = name.into();
         let op_idx;
         let region_id = RegionId::new(0);
@@ -236,7 +237,7 @@ impl<T: Timestamp> DataflowBuilder<T> {
     ///
     /// Unlike [`input`](Self::input), this source has data baked in at build time
     /// rather than receiving it from an async channel at runtime.
-    pub fn source<D: Send + 'static>(
+    pub fn source<D: Clone + Send + 'static>(
         &self,
         name: impl Into<String>,
         data: Vec<(T, Vec<D>)>,
@@ -270,21 +271,23 @@ impl<T: Timestamp> DataflowBuilder<T> {
             );
             let reporter = progress.reporter(0).clone();
 
-            // Create operator factory for pre-loaded source
+            // Create operator factory for pre-loaded source.
+            // Handles fan-out: if multiple downstream edges exist (Stream was
+            // cloned), wraps all pushers in a TeePush adapter.
             let name_clone = name.clone();
             let factory: OperatorFactory = Box::new(move |endpoints: ChannelEndpoints| {
-                let output_pusher: Box<dyn Push<T, D>> =
-                    if !endpoints.output_pushers.is_empty() {
-                        *endpoints
-                            .output_pushers
-                            .into_iter()
-                            .next()
-                            .unwrap()
-                            .downcast::<Box<dyn Push<T, D>>>()
-                            .expect("source output pusher type mismatch")
-                    } else {
-                        Box::new(NullPush)
-                    };
+                let output_pusher: Box<dyn Push<T, D>> = {
+                    let pushers: Vec<Box<dyn Push<T, D>>> = endpoints
+                        .output_pushers
+                        .into_iter()
+                        .map(|any_box| {
+                            *any_box
+                                .downcast::<Box<dyn Push<T, D>>>()
+                                .expect("source output pusher type mismatch")
+                        })
+                        .collect();
+                    tee_or_single(pushers).unwrap_or_else(|| Box::new(NullPush))
+                };
 
                 Box::new(WiredSourceOperator::with_progress(
                     name_clone, op_idx, region_id, data, output_pusher, reporter,
@@ -313,9 +316,12 @@ impl<T: Timestamp> DataflowBuilder<T> {
 
     /// Finalize construction and produce a [`LogicalDataflow`].
     ///
-    /// Returns an error if:
-    /// - Outstanding `Stream` references still exist (drop them first)
-    /// - Fan-out detected (same output port feeds multiple downstreams — not yet supported)
+    /// Returns an error if outstanding `Stream` references still exist
+    /// (drop them first).
+    ///
+    /// Fan-out (stream cloning/branching) is supported: each cloned stream
+    /// output port automatically uses a [`TeePush`](crate::dataflow::channels::tee::TeePush)
+    /// adapter that clones data to all downstream consumers.
     ///
     /// After a successful call, the builder is consumed.
     pub fn build(self) -> Result<LogicalDataflow<T>> {
@@ -329,24 +335,6 @@ impl<T: Timestamp> DataflowBuilder<T> {
                 ))
             }
         };
-
-        // Validate: no fan-out (multiple edges from same source slot).
-        // Fan-out requires TeePush (Phase B). For now, detect and reject.
-        {
-            use std::collections::HashSet;
-            let mut seen_sources: HashSet<(usize, usize)> = HashSet::new();
-            for edge in state.graph.edges() {
-                let key = (edge.source.operator_index, edge.source.slot_index);
-                if !seen_sources.insert(key) {
-                    return Err(Error::Custom(format!(
-                        "fan-out not yet supported: operator {} output slot {} \
-                         feeds multiple downstream operators. Use a tee/broadcast \
-                         operator instead (coming in Phase B).",
-                        key.0, key.1
-                    )));
-                }
-            }
-        }
 
         Ok(LogicalDataflow {
             name: self.name,
@@ -373,14 +361,14 @@ impl<T: Timestamp> DataflowBuilder<T> {
 ///
 /// Methods on `Stream` register new operators in the builder and return new
 /// `Stream` handles pointing to the new operator's output.
-pub struct Stream<T: Timestamp, D: Send + 'static> {
+pub struct Stream<T: Timestamp, D: Clone + Send + 'static> {
     state: Rc<RefCell<BuilderState<T>>>,
     op_idx: usize,
     output_slot: usize,
     _phantom: PhantomData<D>,
 }
 
-impl<T: Timestamp, D: Send + 'static> Clone for Stream<T, D> {
+impl<T: Timestamp, D: Clone + Send + 'static> Clone for Stream<T, D> {
     fn clone(&self) -> Self {
         Self {
             state: Rc::clone(&self.state),
@@ -391,7 +379,7 @@ impl<T: Timestamp, D: Send + 'static> Clone for Stream<T, D> {
     }
 }
 
-impl<T: Timestamp, D: Send + 'static> Stream<T, D> {
+impl<T: Timestamp, D: Clone + Send + 'static> Stream<T, D> {
     /// Apply a per-element transformation, producing a new stream of type `D2`.
     ///
     /// The closure receives a reference to the timestamp and ownership of each element.
@@ -403,7 +391,7 @@ impl<T: Timestamp, D: Send + 'static> Stream<T, D> {
     /// ```
     pub fn map<D2, F>(self, name: impl Into<String>, mut logic: F) -> Stream<T, D2>
     where
-        D2: Send + 'static,
+        D2: Clone + Send + 'static,
         F: FnMut(&T, D) -> D2 + Send + 'static,
     {
         self.add_unary_internal(name, move |time, batch| {
@@ -436,7 +424,7 @@ impl<T: Timestamp, D: Send + 'static> Stream<T, D> {
     /// ```
     pub fn flat_map<D2, F>(self, name: impl Into<String>, mut logic: F) -> Stream<T, D2>
     where
-        D2: Send + 'static,
+        D2: Clone + Send + 'static,
         F: FnMut(&T, D) -> Vec<D2> + Send + 'static,
     {
         self.add_unary_internal(name, move |time, batch| {
@@ -462,7 +450,7 @@ impl<T: Timestamp, D: Send + 'static> Stream<T, D> {
     /// ```
     pub fn unary<D2, L>(self, name: impl Into<String>, logic: L) -> Stream<T, D2>
     where
-        D2: Send + 'static,
+        D2: Clone + Send + 'static,
         L: FnMut(&mut InputHandle<T, D>, &mut OutputHandle<T, D2>) -> Result<()>
             + Send
             + 'static,
@@ -611,7 +599,7 @@ impl<T: Timestamp, D: Send + 'static> Stream<T, D> {
         logic: impl FnMut(T, Vec<D>) -> Vec<D2> + Send + 'static,
     ) -> Stream<T, D2>
     where
-        D2: Send + 'static,
+        D2: Clone + Send + 'static,
     {
         let name = name.into();
         let op_idx;
@@ -662,7 +650,8 @@ impl<T: Timestamp, D: Send + 'static> Stream<T, D> {
                 Location::target(op_idx, 0),
             );
 
-            // Operator factory
+            // Operator factory — handles fan-out by wrapping multiple output
+            // pushers in a TeePush adapter when the stream was cloned.
             let name_clone = name.clone();
             let factory: OperatorFactory = Box::new(move |endpoints: ChannelEndpoints| {
                 let input_puller: Box<dyn Pull<T, D>> = *endpoints
@@ -673,18 +662,18 @@ impl<T: Timestamp, D: Send + 'static> Stream<T, D> {
                     .downcast::<Box<dyn Pull<T, D>>>()
                     .expect("unary input puller type mismatch");
 
-                let output_pusher: Box<dyn Push<T, D2>> =
-                    if !endpoints.output_pushers.is_empty() {
-                        *endpoints
-                            .output_pushers
-                            .into_iter()
-                            .next()
-                            .unwrap()
-                            .downcast::<Box<dyn Push<T, D2>>>()
-                            .expect("unary output pusher type mismatch")
-                    } else {
-                        Box::new(NullPush)
-                    };
+                let output_pusher: Box<dyn Push<T, D2>> = {
+                    let pushers: Vec<Box<dyn Push<T, D2>>> = endpoints
+                        .output_pushers
+                        .into_iter()
+                        .map(|any_box| {
+                            *any_box
+                                .downcast::<Box<dyn Push<T, D2>>>()
+                                .expect("unary output pusher type mismatch")
+                        })
+                        .collect();
+                    tee_or_single(pushers).unwrap_or_else(|| Box::new(NullPush))
+                };
 
                 Box::new(WiredUnaryOperator::new(
                     name_clone,
@@ -727,7 +716,7 @@ impl<T: Timestamp, D: Send + 'static> Stream<T, D> {
         logic: L,
     ) -> Stream<T, D2>
     where
-        D2: Send + 'static,
+        D2: Clone + Send + 'static,
         L: FnMut(&mut InputHandle<T, D>, &mut OutputHandle<T, D2>) -> Result<()>
             + Send
             + 'static,
@@ -769,7 +758,7 @@ impl<T: Timestamp, D: Send + 'static> Stream<T, D> {
                 Location::target(op_idx, 0),
             );
 
-            // Operator factory
+            // Operator factory — handles fan-out via TeePush
             let name_clone = name.clone();
             let factory: OperatorFactory = Box::new(move |endpoints: ChannelEndpoints| {
                 let input_puller: Box<dyn Pull<T, D>> = *endpoints
@@ -780,18 +769,18 @@ impl<T: Timestamp, D: Send + 'static> Stream<T, D> {
                     .downcast::<Box<dyn Pull<T, D>>>()
                     .expect("unary input puller type mismatch");
 
-                let output_pusher: Box<dyn Push<T, D2>> =
-                    if !endpoints.output_pushers.is_empty() {
-                        *endpoints
-                            .output_pushers
-                            .into_iter()
-                            .next()
-                            .unwrap()
-                            .downcast::<Box<dyn Push<T, D2>>>()
-                            .expect("unary output pusher type mismatch")
-                    } else {
-                        Box::new(NullPush)
-                    };
+                let output_pusher: Box<dyn Push<T, D2>> = {
+                    let pushers: Vec<Box<dyn Push<T, D2>>> = endpoints
+                        .output_pushers
+                        .into_iter()
+                        .map(|any_box| {
+                            *any_box
+                                .downcast::<Box<dyn Push<T, D2>>>()
+                                .expect("unary output pusher type mismatch")
+                        })
+                        .collect();
+                    tee_or_single(pushers).unwrap_or_else(|| Box::new(NullPush))
+                };
 
                 Box::new(WiredUnaryOperator::new(
                     name_clone,
@@ -1186,23 +1175,30 @@ mod tests {
     }
 
     #[test]
-    fn test_branching_clone_rejected() {
-        // Fan-out (one output → multiple downstreams) is detected at build() time
+    fn test_branching_fan_out() {
+        // Fan-out: one source → two downstream branches via Stream::clone()
+        // Uses TeePush to distribute data to both branches
         let builder = DataflowBuilder::<u64>::new("branch_test");
         let stream = builder.source("nums", vec![(0u64, vec![1i32, 2, 3, 4, 5, 6])]);
 
-        let _evens_port = stream
+        let evens_port = stream
             .clone()
             .filter("evens", |_t, x| x % 2 == 0)
             .output("evens");
-        let _odds_port = stream
+        let odds_port = stream
             .filter("odds", |_t, x| x % 2 != 0)
             .output("odds");
 
-        let result = builder.build();
-        assert!(result.is_err());
-        let err_msg = format!("{}", result.err().unwrap());
-        assert!(err_msg.contains("fan-out not yet supported"));
+        let dataflow = builder.build().unwrap();
+        dataflow.run().unwrap();
+
+        let evens_c = evens_port.collector();
+        let evens = evens_c.lock().unwrap();
+        let odds_c = odds_port.collector();
+        let odds = odds_c.lock().unwrap();
+
+        assert_eq!(evens[0].1, vec![2, 4, 6]);
+        assert_eq!(odds[0].1, vec![1, 3, 5]);
     }
 
     #[test]
