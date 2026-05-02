@@ -169,7 +169,7 @@ impl WorkerPool {
         // lock() and wait_timeout() — without the mutex, notify_all can fire
         // before the thread enters the wait, causing it to miss the signal.
         {
-            let _guard = self.state.park_mutex.lock().ok();
+            let _guard = self.state.park_mutex.lock().unwrap_or_else(|e| e.into_inner());
             self.state.park_condvar.notify_all();
         }
 

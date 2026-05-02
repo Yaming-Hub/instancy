@@ -83,12 +83,11 @@ impl WakeHandle {
     /// transition makes the dataflow potentially runnable. Only the most
     /// recently registered waker is kept.
     pub fn register_waker(&self, waker: &Waker) {
-        if let Ok(mut guard) = self.inner.waker.lock() {
-            // Only clone if the waker has changed (avoids unnecessary allocation).
-            match guard.as_ref() {
-                Some(existing) if existing.will_wake(waker) => {}
-                _ => *guard = Some(waker.clone()),
-            }
+        let mut guard = self.inner.waker.lock().unwrap_or_else(|e| e.into_inner());
+        // Only clone if the waker has changed (avoids unnecessary allocation).
+        match guard.as_ref() {
+            Some(existing) if existing.will_wake(waker) => {}
+            _ => *guard = Some(waker.clone()),
         }
     }
 

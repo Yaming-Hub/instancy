@@ -250,11 +250,10 @@ impl<'a, M: ConnectionManager> SlotReservation<'a, M> {
 impl<'a, M: ConnectionManager> Drop for SlotReservation<'a, M> {
     fn drop(&mut self) {
         if !self.committed {
-            if let Ok(mut peers) = self.pool.peers.lock() {
-                if let Some(state) = peers.get_mut(&self.peer_id) {
-                    state.in_use -= 1;
-                    state.total -= 1;
-                }
+            let mut peers = self.pool.peers.lock().unwrap_or_else(|e| e.into_inner());
+            if let Some(state) = peers.get_mut(&self.peer_id) {
+                state.in_use -= 1;
+                state.total -= 1;
             }
         }
     }
@@ -289,10 +288,7 @@ impl<M: ConnectionManager> ConnectionPool<M> {
     pub async fn acquire(&self, peer_id: PeerId) -> Result<PoolGuard<'_, M>, PoolError<M::Error>> {
         // Try to get an idle connection
         let conn = {
-            let mut peers = self.peers.lock().map_err(|_| PoolError::AtCapacity {
-                peer_id,
-                max: self.config.max_connections_per_peer,
-            })?;
+            let mut peers = self.peers.lock().unwrap_or_else(|e| e.into_inner());
             let state = peers.entry(peer_id).or_insert_with(PeerState::new);
 
             if let Some(pooled) = state.idle.pop() {
@@ -351,24 +347,22 @@ impl<M: ConnectionManager> ConnectionPool<M> {
 
     /// Return a connection to the pool.
     fn release(&self, peer_id: PeerId, connection: M::Connection) {
-        if let Ok(mut peers) = self.peers.lock() {
-            let state = peers.entry(peer_id).or_insert_with(PeerState::new);
-            state.in_use -= 1;
-            state.idle.push(PooledConnection {
-                connection,
-                last_used: Instant::now(),
-                last_health_check: Instant::now(),
-            });
-        }
+        let mut peers = self.peers.lock().unwrap_or_else(|e| e.into_inner());
+        let state = peers.entry(peer_id).or_insert_with(PeerState::new);
+        state.in_use -= 1;
+        state.idle.push(PooledConnection {
+            connection,
+            last_used: Instant::now(),
+            last_health_check: Instant::now(),
+        });
     }
 
     /// Drop a connection without returning it to the pool (e.g., dead connection).
     fn discard(&self, peer_id: PeerId) {
-        if let Ok(mut peers) = self.peers.lock() {
-            if let Some(state) = peers.get_mut(&peer_id) {
-                state.in_use -= 1;
-                state.total -= 1;
-            }
+        let mut peers = self.peers.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(state) = peers.get_mut(&peer_id) {
+            state.in_use -= 1;
+            state.total -= 1;
         }
     }
 
