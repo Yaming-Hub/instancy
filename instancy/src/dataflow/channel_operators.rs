@@ -199,6 +199,8 @@ pub struct ChannelSinkOperator<T: Timestamp, D: Send + 'static> {
     region_id: RegionId,
     input_puller: Box<dyn Pull<T, D>>,
     sender: mpsc::SyncSender<OutputEvent<T, D>>,
+    /// Buffered output event that couldn't be sent due to channel full.
+    pending_send: Option<OutputEvent<T, D>>,
     input_exhausted: bool,
     done: bool,
 }
@@ -218,8 +220,22 @@ impl<T: Timestamp, D: Send + 'static> ChannelSinkOperator<T, D> {
             region_id,
             input_puller,
             sender,
+            pending_send: None,
             input_exhausted: false,
             done: false,
+        }
+    }
+
+    /// Try to send an event, returning false if the channel is full.
+    /// Returns Err if the receiver was dropped (output no longer needed).
+    fn try_send_event(&mut self, event: OutputEvent<T, D>) -> std::result::Result<bool, ()> {
+        match self.sender.try_send(event) {
+            Ok(()) => Ok(true),
+            Err(mpsc::TrySendError::Full(event)) => {
+                self.pending_send = Some(event);
+                Ok(false)
+            }
+            Err(mpsc::TrySendError::Disconnected(_)) => Err(()),
         }
     }
 }
@@ -230,22 +246,40 @@ impl<T: Timestamp, D: Send + 'static> SchedulableOperator for ChannelSinkOperato
             return Ok(ActivationOutcome::Done);
         }
 
+        // First, try to drain any pending send from a previous activation.
+        if let Some(event) = self.pending_send.take() {
+            match self.try_send_event(event) {
+                Ok(true) => {} // sent successfully
+                Ok(false) => return Ok(ActivationOutcome::BlockedOnBackpressure),
+                Err(()) => {
+                    self.done = true;
+                    return Ok(ActivationOutcome::Done);
+                }
+            }
+        }
+
         let mut made_progress = false;
 
-        // Pull data from upstream and forward to channel.
+        // Pull data from upstream and forward to channel (non-blocking).
         loop {
             match self.input_puller.pull() {
                 Some(envelope) => {
                     match envelope.payload {
                         crate::dataflow::channels::envelope::Payload::Data { time, data } => {
-                            // Send to the external channel. If the receiver is dropped,
-                            // we treat it as cancellation (output is no longer needed).
-                            if self.sender.send(OutputEvent::data(time, data)).is_err() {
-                                // Receiver dropped — stop producing
-                                self.done = true;
-                                return Ok(ActivationOutcome::Done);
+                            match self.try_send_event(OutputEvent::data(time, data)) {
+                                Ok(true) => {
+                                    made_progress = true;
+                                }
+                                Ok(false) => {
+                                    // Channel full — stop pulling, will retry next activation
+                                    return Ok(ActivationOutcome::BlockedOnBackpressure);
+                                }
+                                Err(()) => {
+                                    // Receiver dropped — output no longer needed
+                                    self.done = true;
+                                    return Ok(ActivationOutcome::Done);
+                                }
                             }
-                            made_progress = true;
                         }
                         crate::dataflow::channels::envelope::Payload::Control(_) => {
                             // Control signals are not forwarded to external consumers.

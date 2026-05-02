@@ -227,6 +227,18 @@ impl<T: Timestamp> DataflowExecutor<T> {
             .store(count, std::sync::atomic::Ordering::SeqCst);
     }
 
+    /// Replace the executor's external inputs counter with a shared one.
+    ///
+    /// This allows operators (e.g., `ChannelSourceOperator`) and the executor
+    /// to share the same `Arc<AtomicUsize>`, so operator decrements are
+    /// visible to the executor's quiescence check.
+    pub fn replace_external_inputs_counter(
+        &mut self,
+        counter: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    ) {
+        self.external_inputs_open = counter;
+    }
+
     /// Attach an initialized progress tracker to enable frontier-driven activation.
     ///
     /// When a progress tracker is attached, after each activation batch the executor

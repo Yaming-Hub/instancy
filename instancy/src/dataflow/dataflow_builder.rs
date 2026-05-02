@@ -1155,8 +1155,11 @@ impl<T: Timestamp> LogicalDataflow<T> {
             cancel,
         )?;
 
-        // Set external inputs count so executor waits for channel data
-        executor.set_external_inputs_open(input_count);
+        // Share the SAME external_inputs_open counter between the executor
+        // and the ChannelSourceOperators. Operators decrement this counter
+        // when their channel closes; the executor reads it to decide quiescence.
+        external_inputs_open.store(input_count, std::sync::atomic::Ordering::SeqCst);
+        executor.replace_external_inputs_counter(external_inputs_open);
 
         // Build and attach progress tracker
         let mut tracker = self.subgraph_builder.build();
