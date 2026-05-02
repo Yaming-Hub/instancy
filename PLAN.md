@@ -985,18 +985,22 @@ migrate the key timely-dataflow examples to demonstrate equivalent functionality
 | timely example | instancy equivalent | Requires |
 |---|---|---|
 | `hello.rs` | ✅ Done (`hello_dataflow.rs`) | — |
-| `simple.rs` | `simple.rs` — basic unary map | PR 25 |
+| `simple.rs` | ✅ Done (`simple_pipeline.rs`, `branching_pipeline.rs`) | — |
 | `loopdemo.rs` | `loop_demo.rs` — iterative computation | PR 27 |
 | `hashjoin.rs` | `hash_join.rs` — binary join pattern | PR 26 |
-| `exchange.rs` | `exchange.rs` — data repartitioning | PR 25 + exchange in builder |
+| `exchange.rs` | `exchange.rs` — data repartitioning | exchange in builder |
 | `barrier.rs` | `barrier.rs` — synchronization barrier | PR 27 |
 | `bfs.rs` | `bfs.rs` — breadth-first search (graph algo) | PR 26 + PR 27 |
 | `pagerank.rs` | `pagerank.rs` — iterative graph algorithm | PR 26 + PR 27 |
-| `distinct.rs` | `distinct.rs` — stateful deduplication | PR 25 |
-| `flow_controlled.rs` | `flow_controlled.rs` — backpressure demo | PR 25 |
+| `distinct.rs` | ✅ Done (`distinct.rs`) — stateful deduplication | — |
+| `flow_controlled.rs` | `flow_controlled.rs` — backpressure demo | backpressure API |
 | `pingpong.rs` | `pingpong.rs` — multi-process messaging | PR 28 + networking |
-| `event_driven.rs` | `event_driven.rs` — external input events | PR 25 |
-| `capture_send/recv` | `capture.rs` — stream capture/replay | PR 25 + serialization |
+| `event_driven.rs` | ✅ Done (`event_driven.rs`) — external input events | — |
+| `capture_send/recv` | `capture.rs` — stream capture/replay | serialization |
+| — | ✅ Done (`wordcount.rs`) — streaming word count | — |
+| — | ✅ Done (`spawn_pipeline.rs`) — channel I/O demo | — |
+| — | ✅ Done (`cancellation.rs`) — cooperative shutdown | — |
+| — | ✅ Done (`probe.rs`) — progress tracking | — |
 
 **Priority order:** simple → loopdemo → hashjoin → exchange → bfs → pagerank
 (Others are lower priority and can be added incrementally.)
