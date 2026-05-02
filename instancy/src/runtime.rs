@@ -294,7 +294,12 @@ impl RuntimeHandle {
             Vec::new();
         let input_count = dataflow.input_port_wiring.len();
 
-        for (info, wiring) in dataflow
+        // TODO(multi-worker): Input/output port wiring closures are FnMut (callable
+        // N times) but the Vec is still drain()'d here, consuming ownership. PR 39 will
+        // change to &mut iteration so wiring survives across N worker materializations.
+        // Input wiring will also need fan-out (partition/broadcast) to distribute data
+        // across workers; output wiring will need fan-in to merge worker outputs.
+        for (info, mut wiring) in dataflow
             .input_ports
             .iter()
             .zip(dataflow.input_port_wiring.drain(..))
@@ -311,7 +316,7 @@ impl RuntimeHandle {
         let mut output_receivers: Vec<(String, &'static str, Box<dyn std::any::Any + Send>)> =
             Vec::new();
 
-        for (info, wiring) in dataflow
+        for (info, mut wiring) in dataflow
             .output_ports
             .iter()
             .zip(dataflow.output_port_wiring.drain(..))
@@ -508,7 +513,7 @@ impl SimpleRuntime {
             Vec::new();
         let input_count = dataflow.input_port_wiring.len();
 
-        for (info, wiring) in dataflow
+        for (info, mut wiring) in dataflow
             .input_ports
             .iter()
             .zip(dataflow.input_port_wiring.drain(..))
@@ -525,7 +530,7 @@ impl SimpleRuntime {
         let mut output_receivers: Vec<(String, &'static str, Box<dyn std::any::Any + Send>)> =
             Vec::new();
 
-        for (info, wiring) in dataflow
+        for (info, mut wiring) in dataflow
             .output_ports
             .iter()
             .zip(dataflow.output_port_wiring.drain(..))
