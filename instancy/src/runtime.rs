@@ -10,11 +10,21 @@
 //! Both runtimes accept a [`LogicalDataflow`](crate::dataflow::LogicalDataflow)
 //! and return a [`SpawnedDataflow`] handle for channel-based I/O.
 //!
+//! ## Async completion
+//!
+//! [`RuntimeHandle::run()`] returns a [`DataflowCompletion`] future — callers
+//! can `.await` it in async code or call [`.wait()`](DataflowCompletion::wait)
+//! for blocking synchronous use. [`SpawnedDataflow::join()`] likewise returns
+//! a `DataflowCompletion`.
+//!
 //! **No global state:** All shared state flows from runtime instances.
 
+use std::future::Future;
 use std::marker::PhantomData;
-use std::sync::Arc;
+use std::pin::Pin;
+use std::sync::{Arc, Condvar, Mutex};
 use std::sync::atomic::AtomicUsize;
+use std::task::{Context, Poll, Waker};
 
 use crate::cancellation::CancellationToken;
 use crate::dataflow::dataflow_builder::LogicalDataflow;
@@ -22,6 +32,7 @@ use crate::dataflow::executor::{DataflowExecutor, ExecutorConfig};
 use crate::error::{Error, Result};
 use crate::progress::timestamp::Timestamp;
 use crate::scheduler::policy::{PriorityWithAgingPolicy, SchedulePolicy};
+use crate::worker::OperatorActivation;
 use crate::worker_pool::{WorkerPool, WorkerPoolConfig};
 
 /// Configuration for creating a [`RuntimeHandle`].
@@ -135,6 +146,185 @@ impl RuntimeHandle {
     /// Returns true if the runtime has been shut down.
     pub fn is_shutdown(&self) -> bool {
         self.cancel.is_cancelled()
+    }
+
+    /// Run a pre-loaded dataflow to completion on the worker pool.
+    ///
+    /// The dataflow must not have declared `input()` ports — use
+    /// [`spawn()`](Self::spawn) for dataflows that receive external data.
+    ///
+    /// Returns a [`DataflowCompletion`] future that resolves when the executor
+    /// finishes. The caller can `.await` it or call [`.wait()`](DataflowCompletion::wait)
+    /// to block synchronously.
+    ///
+    /// # Execution model
+    ///
+    /// The entire `executor.run()` sweep loop executes as a single pool task.
+    /// True per-operator pool dispatch is deferred to a future PR once
+    /// readiness notification support is added to channels.
+    ///
+    /// # Panics
+    ///
+    /// Must not be called from within a worker pool thread of the same runtime —
+    /// the pool may have no free threads to execute the submitted task, causing
+    /// the dataflow to never start.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error immediately if the dataflow has input ports.
+    /// The returned future resolves to an error if the executor encounters
+    /// an error during execution.
+    pub fn run<T: Timestamp>(&self, dataflow: LogicalDataflow<T>) -> Result<DataflowCompletion> {
+        if dataflow.has_input_ports() {
+            return Err(Error::Custom(
+                "cannot run() a dataflow with declared input ports — \
+                 use spawn() for dataflows that receive external data."
+                    .into(),
+            ));
+        }
+
+        if dataflow.operator_factories.is_empty() {
+            return Ok(DataflowCompletion::ready_ok());
+        }
+
+        let cancel = self.cancel.child_token();
+        let mut executor = materialize_executor(dataflow, cancel)?;
+
+        let (completion, notifier) = DataflowCompletion::new();
+
+        self.worker_pool.submit(OperatorActivation::new(
+            crate::worker::WorkerId::new(0),
+            "dataflow-run",
+            0,
+            move || {
+                let result = executor.run();
+                notifier.complete(result);
+            },
+        ));
+
+        Ok(completion)
+    }
+
+    /// Run a pre-loaded dataflow to completion, blocking the current thread.
+    ///
+    /// Convenience wrapper around [`run()`](Self::run) + [`DataflowCompletion::wait()`].
+    pub fn run_blocking<T: Timestamp>(&self, dataflow: LogicalDataflow<T>) -> Result<()> {
+        self.run(dataflow)?.wait()
+    }
+
+    /// Spawn a dataflow on the worker pool with channel-based I/O.
+    ///
+    /// Returns a [`SpawnedDataflow`] handle for feeding data and collecting
+    /// results. The executor runs on a thread from the shared pool rather
+    /// than on a dedicated OS thread.
+    ///
+    /// See [`SimpleRuntime::spawn()`] for full channel-wiring documentation.
+    ///
+    /// # Execution model
+    ///
+    /// The entire `executor.run()` sweep loop executes as a single pool task.
+    /// True per-operator pool dispatch is deferred to a future PR once
+    /// readiness notification support is added to channels.
+    ///
+    /// # Panics
+    ///
+    /// Must not be called from within a worker pool thread of the same runtime —
+    /// this will deadlock because the calling thread blocks while the pool has
+    /// no free threads to execute the submitted task.
+    pub fn spawn<T: Timestamp>(
+        &self,
+        mut dataflow: LogicalDataflow<T>,
+    ) -> Result<SpawnedDataflow<T>> {
+        if dataflow.operator_factories.is_empty() && dataflow.input_port_wiring.is_empty() {
+            return Err(Error::Custom("cannot spawn an empty dataflow".into()));
+        }
+
+        let cancel = self.cancel.child_token();
+        let cancel_handle = cancel.clone();
+        let external_inputs_open = Arc::new(AtomicUsize::new(0));
+        let name = dataflow.name().to_string();
+
+        // --- Wire input ports ---
+        let mut input_senders: Vec<(String, &'static str, Box<dyn std::any::Any + Send>)> =
+            Vec::new();
+        let input_count = dataflow.input_port_wiring.len();
+
+        for (info, wiring) in dataflow
+            .input_ports
+            .iter()
+            .zip(dataflow.input_port_wiring.drain(..))
+        {
+            let (factory, sender_any) = wiring(Arc::clone(&external_inputs_open));
+            dataflow
+                .operator_factories
+                .push((info.operator_index, factory));
+            input_senders.push((info.name.clone(), info.type_name, sender_any));
+        }
+
+        // --- Wire output ports ---
+        let mut output_receivers: Vec<(String, &'static str, Box<dyn std::any::Any + Send>)> =
+            Vec::new();
+
+        for (info, wiring) in dataflow
+            .output_ports
+            .iter()
+            .zip(dataflow.output_port_wiring.drain(..))
+        {
+            let (replacement_factory, receiver_any) = wiring();
+            if let Some(pos) = dataflow
+                .operator_factories
+                .iter()
+                .position(|(idx, _)| *idx == info.operator_index)
+            {
+                dataflow.operator_factories[pos] =
+                    (info.operator_index, replacement_factory);
+            }
+            output_receivers.push((info.name.clone(), info.type_name, receiver_any));
+        }
+
+        // --- Materialize and submit to worker pool ---
+        let mut executor = materialize_executor(dataflow, cancel)?;
+
+        external_inputs_open.store(input_count, std::sync::atomic::Ordering::SeqCst);
+        executor.replace_external_inputs_counter(external_inputs_open);
+
+        let (completion, notifier) = DataflowCompletion::new();
+
+        self.worker_pool.submit(OperatorActivation::new(
+            crate::worker::WorkerId::new(0),
+            format!("dataflow-{}", name),
+            0,
+            move || {
+                let result = executor.run();
+                notifier.complete(result);
+            },
+        ));
+
+        Ok(SpawnedDataflow {
+            name,
+            cancel: cancel_handle,
+            completion: Some(completion),
+            input_senders,
+            output_receivers,
+            _phantom: PhantomData,
+        })
+    }
+}
+
+impl Drop for RuntimeHandle {
+    /// Cancel all running dataflows before the worker pool shuts down.
+    ///
+    /// Without this, `WorkerPool::drop()` would join worker threads that are
+    /// still running executor loops, causing a deadlock. Cancelling the token
+    /// first ensures executors observe cancellation and exit promptly.
+    ///
+    /// **Note:** Cancellation is cooperative — executors check the token at the
+    /// top of each sweep iteration. If an operator's `activate()` call blocks
+    /// for a long time (e.g., heavy computation), the pool join will wait until
+    /// that activation completes and the executor rechecks the token. Operators
+    /// should avoid unbounded blocking in `activate()`.
+    fn drop(&mut self) {
+        self.cancel.cancel();
     }
 }
 
@@ -309,15 +499,20 @@ impl SimpleRuntime {
         external_inputs_open.store(input_count, std::sync::atomic::Ordering::SeqCst);
         executor.replace_external_inputs_counter(external_inputs_open);
 
-        let join_handle = std::thread::Builder::new()
+        let (completion, notifier) = DataflowCompletion::new();
+
+        std::thread::Builder::new()
             .name(format!("dataflow-{}", name))
-            .spawn(move || -> Result<bool> { executor.run() })
+            .spawn(move || {
+                let result = executor.run();
+                notifier.complete(result);
+            })
             .map_err(|e| Error::Custom(format!("failed to spawn dataflow thread: {e}")))?;
 
         Ok(SpawnedDataflow {
             name,
             cancel: cancel_handle,
-            join_handle: Some(join_handle),
+            completion: Some(completion),
             input_senders,
             output_receivers,
             _phantom: PhantomData,
@@ -328,6 +523,164 @@ impl SimpleRuntime {
 impl Default for SimpleRuntime {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+// ---------------------------------------------------------------------------
+// DataflowCompletion — async/sync completion future
+// ---------------------------------------------------------------------------
+
+/// Shared state between the executor thread and the completion future.
+struct SharedCompletionState {
+    result: Option<Result<bool>>,
+    waker: Option<Waker>,
+}
+
+/// Internal writer side: signals that the executor has finished.
+///
+/// If dropped without calling [`complete()`](Self::complete) (e.g., due to
+/// a panic), the `Drop` impl publishes an error so the future never hangs.
+struct CompletionNotifier {
+    shared: Arc<Mutex<SharedCompletionState>>,
+    condvar: Arc<Condvar>,
+}
+
+impl CompletionNotifier {
+    /// Publish the executor result and wake any waiting future/condvar.
+    fn complete(self, result: Result<bool>) {
+        {
+            let mut state = self.shared.lock().unwrap();
+            state.result = Some(result);
+            if let Some(waker) = state.waker.take() {
+                waker.wake();
+            }
+            self.condvar.notify_all();
+        }
+        // Prevent Drop from publishing a second result.
+        // Safety: shared/condvar Arcs are leaked but the DataflowCompletion
+        // side still holds clones that will clean up.
+        std::mem::forget(self);
+    }
+}
+
+impl Drop for CompletionNotifier {
+    fn drop(&mut self) {
+        // Executor panicked or was killed without publishing a result.
+        let mut state = self.shared.lock().unwrap();
+        if state.result.is_none() {
+            state.result = Some(Err(Error::Custom(
+                "dataflow executor terminated unexpectedly (possible panic)".into(),
+            )));
+            if let Some(waker) = state.waker.take() {
+                waker.wake();
+            }
+            self.condvar.notify_all();
+        }
+    }
+}
+
+/// A future that resolves when a dataflow completes execution.
+///
+/// Can be used in two ways:
+/// - **Async**: `.await` the future (implements [`Future`])
+/// - **Sync**: call [`wait()`](Self::wait) to block the current thread
+///
+/// # Examples
+///
+/// ```ignore
+/// // Async usage
+/// let completion = rt.run(dataflow)?;
+/// completion.await?;
+///
+/// // Sync usage
+/// let completion = rt.run(dataflow)?;
+/// completion.wait()?;
+///
+/// // Or use the convenience method
+/// rt.run_blocking(dataflow)?;
+/// ```
+pub struct DataflowCompletion {
+    shared: Arc<Mutex<SharedCompletionState>>,
+    condvar: Arc<Condvar>,
+}
+
+impl std::fmt::Debug for DataflowCompletion {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let state = self.shared.lock().unwrap();
+        let status = if state.result.is_some() {
+            "ready"
+        } else {
+            "pending"
+        };
+        f.debug_struct("DataflowCompletion")
+            .field("status", &status)
+            .finish()
+    }
+}
+
+impl DataflowCompletion {
+    /// Create a new completion pair (future + notifier).
+    fn new() -> (Self, CompletionNotifier) {
+        let shared = Arc::new(Mutex::new(SharedCompletionState {
+            result: None,
+            waker: None,
+        }));
+        let condvar = Arc::new(Condvar::new());
+        let completion = DataflowCompletion {
+            shared: Arc::clone(&shared),
+            condvar: Arc::clone(&condvar),
+        };
+        let notifier = CompletionNotifier { shared, condvar };
+        (completion, notifier)
+    }
+
+    /// Create an already-completed future with a successful result.
+    fn ready_ok() -> Self {
+        let shared = Arc::new(Mutex::new(SharedCompletionState {
+            result: Some(Ok(true)),
+            waker: None,
+        }));
+        let condvar = Arc::new(Condvar::new());
+        DataflowCompletion { shared, condvar }
+    }
+
+    /// Block the current thread until the dataflow completes.
+    ///
+    /// Returns `Ok(())` if the dataflow ran to completion, or an error if
+    /// the executor failed or reached quiescence without completing.
+    pub fn wait(self) -> Result<()> {
+        let mut state = self.shared.lock().unwrap();
+        while state.result.is_none() {
+            state = self.condvar.wait(state).unwrap();
+        }
+        interpret_completion(state.result.take().unwrap())
+    }
+}
+
+impl Future for DataflowCompletion {
+    type Output = Result<()>;
+
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        let mut state = self.shared.lock().unwrap();
+        if let Some(result) = state.result.take() {
+            Poll::Ready(interpret_completion(result))
+        } else {
+            state.waker = Some(cx.waker().clone());
+            Poll::Pending
+        }
+    }
+}
+
+/// Translate executor's `Result<bool>` into the public `Result<()>`.
+fn interpret_completion(result: Result<bool>) -> Result<()> {
+    match result {
+        Ok(true) => Ok(()),
+        Ok(false) => Err(Error::Custom(
+            "dataflow reached quiescence without completing — \
+             some operators could not make progress"
+                .into(),
+        )),
+        Err(e) => Err(e),
     }
 }
 
@@ -352,14 +705,14 @@ impl Default for SimpleRuntime {
 /// 1. Take input senders via [`take_input()`](Self::take_input)
 /// 2. Send data, then close inputs (drop or call `.close()`)
 /// 3. Take output receivers via [`take_output()`](Self::take_output)
-/// 4. Call [`join()`](Self::join) to wait for the executor to finish
+/// 4. Call [`join()`](Self::join) to get a completion future
 ///
 /// Dropping a `SpawnedDataflow` without calling `join()` will cancel the
-/// dataflow and wait for the background thread to exit.
+/// dataflow. The executor will stop at the next cancellation check point.
 pub struct SpawnedDataflow<T: Timestamp> {
     name: String,
     cancel: CancellationToken,
-    join_handle: Option<std::thread::JoinHandle<Result<bool>>>,
+    completion: Option<DataflowCompletion>,
     /// (name, type_name, Box<InputSender<T, D>> as Box<dyn Any>)
     input_senders: Vec<(String, &'static str, Box<dyn std::any::Any + Send>)>,
     /// (name, type_name, Box<OutputReceiver<T, D>> as Box<dyn Any>)
@@ -448,30 +801,37 @@ impl<T: Timestamp> SpawnedDataflow<T> {
         self.cancel.cancel();
     }
 
-    /// Wait for the dataflow to complete and return the result.
+    /// Get a completion future for the dataflow.
     ///
-    /// Returns `Ok(())` if the dataflow ran to completion.
-    /// Returns an error if the executor encountered an error or the
-    /// background thread panicked.
-    pub fn join(mut self) -> Result<()> {
-        if let Some(handle) = self.join_handle.take() {
-            match handle.join() {
-                Ok(Ok(_completed)) => Ok(()),
-                Ok(Err(e)) => Err(e),
-                Err(_panic) => Err(Error::Custom("dataflow thread panicked".into())),
-            }
-        } else {
-            Ok(())
-        }
+    /// Returns a [`DataflowCompletion`] that resolves when the executor finishes.
+    /// The caller can `.await` it or call [`.wait()`](DataflowCompletion::wait)
+    /// to block synchronously.
+    ///
+    /// Consumes the handle — calling `join()` transfers lifecycle ownership
+    /// to the returned future. The dataflow will **not** be cancelled on drop.
+    pub fn join(mut self) -> DataflowCompletion {
+        self.completion
+            .take()
+            .unwrap_or_else(DataflowCompletion::ready_ok)
+    }
+
+    /// Wait for the dataflow to complete, blocking the current thread.
+    ///
+    /// Convenience wrapper around [`join()`](Self::join) + [`DataflowCompletion::wait()`].
+    pub fn join_blocking(self) -> Result<()> {
+        self.join().wait()
     }
 }
 
 impl<T: Timestamp> Drop for SpawnedDataflow<T> {
     fn drop(&mut self) {
-        self.cancel.cancel();
-        if let Some(handle) = self.join_handle.take() {
-            let _ = handle.join();
+        // Only cancel if join() wasn't called — if it was, completion is None
+        // and the caller owns the lifecycle via the returned DataflowCompletion.
+        if self.completion.is_some() {
+            self.cancel.cancel();
         }
+        // Don't block waiting — cancel and detach. The executor will stop
+        // at the next cancellation check point.
     }
 }
 
@@ -628,7 +988,7 @@ mod tests {
         let receiver = handle.take_output::<i32>("out").unwrap();
         let results = receiver.collect_data();
         assert_eq!(results[0].1, vec![11, 21]);
-        handle.join().unwrap();
+        handle.join_blocking().unwrap();
     }
 
     #[test]
@@ -645,6 +1005,204 @@ mod tests {
         // Cancel via the runtime's token
         rt.cancel_token().cancel();
         // Should not hang
-        let _ = handle.join();
+        let _ = handle.join_blocking();
+    }
+
+    // --- RuntimeHandle execution tests ---
+
+    #[test]
+    fn runtime_handle_run_basic() {
+        use crate::dataflow::DataflowBuilder;
+
+        let rt = RuntimeHandle::new(RuntimeConfig {
+            worker_threads: 2,
+            ..RuntimeConfig::default()
+        })
+        .unwrap();
+
+        let builder = DataflowBuilder::<u64>::new("rt_run");
+        let port = builder
+            .source("nums", vec![(0u64, vec![1i32, 2, 3])])
+            .map("double", |_t, x| x * 2)
+            .output("results");
+        let dataflow = builder.build().unwrap();
+
+        rt.run_blocking(dataflow).unwrap();
+
+        let c = port.collector();
+        let r = c.lock().unwrap();
+        assert_eq!(r[0].1, vec![2, 4, 6]);
+    }
+
+    #[test]
+    fn runtime_handle_spawn_basic() {
+        use crate::dataflow::DataflowBuilder;
+
+        let rt = RuntimeHandle::new(RuntimeConfig {
+            worker_threads: 2,
+            ..RuntimeConfig::default()
+        })
+        .unwrap();
+
+        let builder = DataflowBuilder::<u64>::new("rt_spawn");
+        let input = builder.input::<i32>("data");
+        input.map("double", |_t, x| x * 2).output("results");
+        let dataflow = builder.build().unwrap();
+
+        let mut handle = rt.spawn(dataflow).unwrap();
+        let sender = handle.take_input::<i32>("data").unwrap();
+        sender.send(0u64, vec![10, 20]).unwrap();
+        sender.close();
+
+        let receiver = handle.take_output::<i32>("results").unwrap();
+        let results = receiver.collect_data();
+        assert_eq!(results[0].1, vec![20, 40]);
+        handle.join_blocking().unwrap();
+    }
+
+    #[test]
+    fn runtime_handle_shutdown_cancels() {
+        use crate::dataflow::DataflowBuilder;
+
+        let rt = RuntimeHandle::new(RuntimeConfig {
+            worker_threads: 2,
+            ..RuntimeConfig::default()
+        })
+        .unwrap();
+
+        let builder = DataflowBuilder::<u64>::new("rt_cancel");
+        let input = builder.input::<i32>("data");
+        input.output("out");
+        let dataflow = builder.build().unwrap();
+
+        let handle = rt.spawn(dataflow).unwrap();
+        rt.shutdown();
+        // Should complete (cancelled), not hang
+        let _ = handle.join_blocking();
+    }
+
+    #[test]
+    fn runtime_handle_multiple_dataflows() {
+        use crate::dataflow::DataflowBuilder;
+
+        let rt = RuntimeHandle::new(RuntimeConfig {
+            worker_threads: 2,
+            ..RuntimeConfig::default()
+        })
+        .unwrap();
+
+        for i in 0..3 {
+            let builder = DataflowBuilder::<u64>::new(format!("df_{i}"));
+            builder
+                .source("data", vec![(0u64, vec![i as i32])])
+                .output("out");
+            let dataflow = builder.build().unwrap();
+            rt.run_blocking(dataflow).unwrap();
+        }
+    }
+
+    #[test]
+    fn runtime_handle_run_rejects_input_ports() {
+        use crate::dataflow::DataflowBuilder;
+
+        let rt = RuntimeHandle::new(RuntimeConfig {
+            worker_threads: 1,
+            ..RuntimeConfig::default()
+        })
+        .unwrap();
+
+        let builder = DataflowBuilder::<u64>::new("bad");
+        builder.input::<i32>("x").output("y");
+        let dataflow = builder.build().unwrap();
+
+        let result = rt.run(dataflow);
+        assert!(result.is_err());
+        assert!(format!("{}", result.unwrap_err()).contains("input ports"));
+    }
+
+    #[test]
+    fn dataflow_completion_future_poll() {
+        use std::task::{Context, Poll, RawWaker, RawWakerVTable, Waker};
+
+        // Create a minimal waker for manual polling
+        fn noop_raw_waker() -> RawWaker {
+            fn no_op(_: *const ()) {}
+            fn clone(p: *const ()) -> RawWaker {
+                RawWaker::new(p, &VTABLE)
+            }
+            const VTABLE: RawWakerVTable =
+                RawWakerVTable::new(clone, no_op, no_op, no_op);
+            RawWaker::new(std::ptr::null(), &VTABLE)
+        }
+        let waker = unsafe { Waker::from_raw(noop_raw_waker()) };
+        let mut cx = Context::from_waker(&waker);
+
+        let (mut completion, notifier) = DataflowCompletion::new();
+
+        // Before completion, polling returns Pending
+        let pinned = Pin::new(&mut completion);
+        assert!(matches!(pinned.poll(&mut cx), Poll::Pending));
+
+        // After notifier signals, polling returns Ready
+        notifier.complete(Ok(true));
+
+        let pinned = Pin::new(&mut completion);
+        match pinned.poll(&mut cx) {
+            Poll::Ready(Ok(())) => {} // expected
+            other => panic!("expected Ready(Ok(())), got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn dataflow_completion_notifier_drop_signals_error() {
+        // If the notifier is dropped without calling complete(),
+        // the future should resolve to an error (panic safety).
+        let (completion, notifier) = DataflowCompletion::new();
+        drop(notifier);
+
+        let result = completion.wait();
+        assert!(result.is_err());
+        assert!(format!("{}", result.unwrap_err()).contains("unexpectedly"));
+    }
+
+    #[test]
+    fn dataflow_completion_wait_blocking() {
+        use crate::dataflow::DataflowBuilder;
+
+        let rt = RuntimeHandle::new(RuntimeConfig {
+            worker_threads: 2,
+            ..RuntimeConfig::default()
+        })
+        .unwrap();
+
+        let builder = DataflowBuilder::<u64>::new("wait_test");
+        builder
+            .source("nums", vec![(0u64, vec![1i32, 2, 3])])
+            .output("out");
+        let dataflow = builder.build().unwrap();
+
+        // Use the async API + wait() instead of run_blocking()
+        let completion = rt.run(dataflow).unwrap();
+        completion.wait().unwrap();
+    }
+
+    #[test]
+    fn spawned_dataflow_drop_without_join_cancels() {
+        use crate::dataflow::DataflowBuilder;
+
+        let rt = RuntimeHandle::new(RuntimeConfig {
+            worker_threads: 2,
+            ..RuntimeConfig::default()
+        })
+        .unwrap();
+
+        let builder = DataflowBuilder::<u64>::new("drop_cancel");
+        let input = builder.input::<i32>("data");
+        input.output("out");
+        let dataflow = builder.build().unwrap();
+
+        // Drop without calling join() — should cancel and not hang
+        let _handle = rt.spawn(dataflow).unwrap();
+        // handle dropped here — cancellation + detach, no blocking
     }
 }

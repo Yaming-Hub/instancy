@@ -2289,7 +2289,7 @@ mod tests {
         assert_eq!(results[1].0, 1);
         assert_eq!(results[1].1, vec![20, 40]);
 
-        handle.join().unwrap();
+        handle.join_blocking().unwrap();
     }
 
     #[test]
@@ -2311,7 +2311,7 @@ mod tests {
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].1, vec![2, 4, 6]);
 
-        handle.join().unwrap();
+        handle.join_blocking().unwrap();
     }
 
     #[test]

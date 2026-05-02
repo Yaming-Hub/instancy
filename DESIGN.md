@@ -466,6 +466,50 @@ fn worker_thread_loop(queue: &TaskQueue, pool_state: &PoolState) {
 }
 ```
 
+### 5.2a Runtime Tiers & Async Completion
+
+instancy provides two runtime tiers, both accepting a `LogicalDataflow` and producing
+either a completion future or a `SpawnedDataflow` handle:
+
+| Runtime | Execution | API style | Use case |
+|---|---|---|---|
+| `SimpleRuntime` | Dedicated OS thread per dataflow | Blocking `run()`, async `join()` | Tests, scripts, prototyping |
+| `RuntimeHandle` | Shared worker pool | Async `run()` returns `DataflowCompletion` | Production workloads |
+
+**`DataflowCompletion`** is a `Future<Output=Result<()>>` backed by `Arc<Mutex<SharedState>>` + `Condvar`. It can be `.await`ed in async code or `.wait()`ed for synchronous blocking. Both runtimes use the same `DataflowCompletion` primitive for `SpawnedDataflow::join()`.
+
+**Current model (Phase 1):** The executor sweep loop runs as a single synchronous task
+on a pool thread. The caller receives a `DataflowCompletion` future that resolves when
+the executor finishes. The worker thread is occupied for the duration of the sweep loop.
+
+**Planned evolution (Phase 2 — Async Executor):** The executor's sweep loop becomes a
+`Future` that yields when idle (no operator made progress). This requires:
+
+1. **Channel waker integration** — in-memory channels register a `Waker` so they can
+   wake the executor when data arrives, instead of the executor spinning/polling.
+2. **Executor as Future** — the sweep loop returns `Poll::Pending` when no operator
+   produced output and all channels are empty. When a channel receives data, it wakes
+   the executor's `Waker`, and the runtime re-polls it.
+3. **Task scheduler multiplexing** — the worker pool gains a task scheduler that can
+   poll multiple executor futures on the same thread. When dataflow A yields (idle),
+   its thread can run dataflow B.
+
+This is the key enabler for "multiple dataflows share threads cooperatively" — the
+original design goal. Operators remain synchronous (`activate()` works on in-memory
+data), but the executor itself is async-aware for idle waiting.
+
+```
+Phase 1 (current):                    Phase 2 (planned):
+┌──────────────┐                     ┌──────────────┐
+│ Worker Thread │                     │ Worker Thread │
+│              │                     │              │
+│ executor.run()  ← blocks until    │ poll(executor_A)  ← returns Pending
+│                   completion      │ poll(executor_B)  ← returns Ready
+│              │                     │ poll(executor_C)  ← returns Pending
+│              │                     │ ... park until woken ...
+└──────────────┘                     └──────────────┘
+```
+
 ### 5.3 Logical Workers & Task Queue
 
 We retain the concept of a **logical worker ID** — a `WorkerId` — which serves three purposes:
