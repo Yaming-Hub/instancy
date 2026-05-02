@@ -31,6 +31,9 @@ fn main() {
     // State lives outside the closure so it persists across activations —
     // the unary operator may call the closure multiple times as data arrives
     // in separate batches under backpressure.
+    //
+    // NOTE: State grows unbounded — a production pipeline would evict
+    // completed timestamps via frontier tracking / watermarks.
     let mut seen: HashMap<u64, HashSet<String>> = HashMap::new();
 
     let port = input

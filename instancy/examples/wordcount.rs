@@ -12,7 +12,7 @@
 //! cargo run --example wordcount
 //! ```
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use instancy::dataflow::DataflowBuilder;
 use instancy::runtime::SimpleRuntime;
@@ -47,17 +47,25 @@ fn main() {
         // State lives outside the closure so it persists across activations —
         // under backpressure, data for the same timestamp may arrive in
         // multiple batches.
+        //
+        // NOTE: State grows unbounded — a production pipeline would evict
+        // completed timestamps via frontier tracking / watermarks.
         .unary("count_words", {
             let mut counts_by_time: HashMap<u64, HashMap<String, usize>> = HashMap::new();
             move |input, output| {
+                // Drain all available batches first, accumulating counts.
+                let mut dirty = HashSet::new();
                 while let Some((time, words)) = input.next() {
+                    dirty.insert(time);
                     let counts = counts_by_time.entry(time).or_default();
                     for word in words {
-                        *counts.entry(word.clone()).or_insert(0) += 1;
+                        *counts.entry(word).or_insert(0) += 1;
                     }
-                    // Emit current snapshot — a production pipeline would use
-                    // notifications/frontiers to emit only when a timestamp
-                    // is fully consumed.
+                }
+                // Emit once per touched timestamp after all batches are consumed,
+                // avoiding stale intermediate snapshots.
+                for time in dirty {
+                    let counts = &counts_by_time[&time];
                     let mut pairs: Vec<(String, usize)> = counts.iter()
                         .map(|(k, &v)| (k.clone(), v))
                         .collect();
