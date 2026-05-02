@@ -1,8 +1,13 @@
-//! Logical worker identity and operator activation types.
+//! Logical worker identity, context, and operator activation types.
 //!
 //! A [`WorkerId`] represents a globally unique logical worker that is not tied
 //! to any physical OS thread. The worker thread pool maps logical workers to
 //! physical threads at runtime.
+//!
+//! A [`WorkerContext`] provides operator factories with the worker's identity
+//! and the total worker count during materialization. This enables
+//! worker-aware operator construction (e.g., exchange routing, stateful
+//! partitioning).
 
 use std::fmt;
 
@@ -35,6 +40,93 @@ impl fmt::Display for WorkerId {
 impl From<usize> for WorkerId {
     fn from(index: usize) -> Self {
         Self(index)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// WorkerContext — passed to operator factories during materialization
+// ---------------------------------------------------------------------------
+
+/// Context provided to operator factories during materialization.
+///
+/// Each worker in a multi-worker dataflow receives a `WorkerContext` that
+/// identifies which worker replica is being materialized and how many workers
+/// exist in total. This enables:
+///
+/// - **Exchange routing**: operators can determine which peer to send data to
+///   based on `num_workers` and hash-based partitioning.
+/// - **Worker-local state**: stateful operators can key their internal state
+///   by `worker_index` to avoid cross-worker interference.
+/// - **Logging/metrics**: operators can tag metrics with the worker index.
+///
+/// For single-worker dataflows (spawned via [`RuntimeHandle::spawn()`] or
+/// [`SimpleRuntime::spawn()`]), `worker_index` is 0 and `num_workers` is 1.
+///
+/// # Example
+///
+/// ```rust
+/// use instancy::worker::WorkerContext;
+///
+/// let ctx = WorkerContext::new(2, 4);
+/// assert_eq!(ctx.worker_index(), 2);
+/// assert_eq!(ctx.num_workers(), 4);
+/// assert!(!ctx.is_single_worker());
+/// ```
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct WorkerContext {
+    worker_index: usize,
+    num_workers: usize,
+}
+
+impl WorkerContext {
+    /// Create a new worker context.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `worker_index >= num_workers` or `num_workers == 0`.
+    pub fn new(worker_index: usize, num_workers: usize) -> Self {
+        assert!(num_workers > 0, "num_workers must be >= 1");
+        assert!(
+            worker_index < num_workers,
+            "worker_index ({worker_index}) must be < num_workers ({num_workers})"
+        );
+        Self {
+            worker_index,
+            num_workers,
+        }
+    }
+
+    /// Create a context for a single-worker dataflow (index=0, count=1).
+    pub fn single() -> Self {
+        Self {
+            worker_index: 0,
+            num_workers: 1,
+        }
+    }
+
+    /// The zero-based index of this worker within the dataflow.
+    pub fn worker_index(&self) -> usize {
+        self.worker_index
+    }
+
+    /// Total number of workers in this dataflow.
+    pub fn num_workers(&self) -> usize {
+        self.num_workers
+    }
+
+    /// Whether this is a single-worker dataflow.
+    pub fn is_single_worker(&self) -> bool {
+        self.num_workers == 1
+    }
+}
+
+impl fmt::Display for WorkerContext {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "Worker({}/{})",
+            self.worker_index, self.num_workers
+        )
     }
 }
 
@@ -155,5 +247,58 @@ mod tests {
         assert!(debug.contains("WorkerId(3)"));
         assert!(debug.contains("map_op"));
         assert!(debug.contains("5"));
+    }
+
+    // --- WorkerContext tests ---
+
+    #[test]
+    fn worker_context_single() {
+        let ctx = WorkerContext::single();
+        assert_eq!(ctx.worker_index(), 0);
+        assert_eq!(ctx.num_workers(), 1);
+        assert!(ctx.is_single_worker());
+        assert_eq!(format!("{ctx}"), "Worker(0/1)");
+    }
+
+    #[test]
+    fn worker_context_multi() {
+        let ctx = WorkerContext::new(2, 4);
+        assert_eq!(ctx.worker_index(), 2);
+        assert_eq!(ctx.num_workers(), 4);
+        assert!(!ctx.is_single_worker());
+        assert_eq!(format!("{ctx}"), "Worker(2/4)");
+    }
+
+    #[test]
+    fn worker_context_boundary_values() {
+        // worker 0 of 1 (single worker)
+        let ctx = WorkerContext::new(0, 1);
+        assert!(ctx.is_single_worker());
+
+        // last worker
+        let ctx = WorkerContext::new(7, 8);
+        assert_eq!(ctx.worker_index(), 7);
+        assert_eq!(ctx.num_workers(), 8);
+    }
+
+    #[test]
+    #[should_panic(expected = "num_workers must be >= 1")]
+    fn worker_context_zero_workers_panics() {
+        WorkerContext::new(0, 0);
+    }
+
+    #[test]
+    #[should_panic(expected = "worker_index (3) must be < num_workers (3)")]
+    fn worker_context_index_out_of_range_panics() {
+        WorkerContext::new(3, 3);
+    }
+
+    #[test]
+    fn worker_context_equality() {
+        let a = WorkerContext::new(1, 4);
+        let b = WorkerContext::new(1, 4);
+        let c = WorkerContext::new(2, 4);
+        assert_eq!(a, b);
+        assert_ne!(a, c);
     }
 }
