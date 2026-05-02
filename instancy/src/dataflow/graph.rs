@@ -144,6 +144,10 @@ pub struct DataflowGraph {
     operators: HashMap<usize, OperatorInfo>,
     /// Directed edges between operator ports.
     edges: Vec<EdgeInfo>,
+    /// Feedback edges — stored separately to avoid cycle detection.
+    /// These edges are validated (endpoints exist) but excluded from
+    /// topological ordering.
+    feedback_edges: Vec<EdgeInfo>,
 }
 
 impl DataflowGraph {
@@ -152,6 +156,7 @@ impl DataflowGraph {
         Self {
             operators: HashMap::new(),
             edges: Vec::new(),
+            feedback_edges: Vec::new(),
         }
     }
 
@@ -181,6 +186,20 @@ impl DataflowGraph {
     /// [`validate`](Self::validate) after construction for that.
     pub fn add_edge(&mut self, edge: EdgeInfo) {
         self.edges.push(edge);
+    }
+
+    /// Record a feedback edge between two operator ports.
+    ///
+    /// Feedback edges are stored separately from regular edges and are
+    /// excluded from topological ordering (cycle detection). They are
+    /// still validated for endpoint existence.
+    pub fn add_feedback_edge(&mut self, edge: EdgeInfo) {
+        self.feedback_edges.push(edge);
+    }
+
+    /// All feedback edges.
+    pub fn feedback_edges(&self) -> &[EdgeInfo] {
+        &self.feedback_edges
     }
 
     /// Increment the input port count of an already-registered operator.
@@ -355,6 +374,7 @@ impl DataflowGraph {
     /// - Source port indices are within operator output count.
     /// - Target port indices are within operator input count.
     /// - No cycles (feedback edges are tracked separately, not as regular edges).
+    /// - Feedback edge endpoints are also validated.
     pub fn validate(&self) -> Result<()> {
         // Check edge endpoints reference registered operators.
         for (i, edge) in self.edges.iter().enumerate() {
@@ -388,6 +408,37 @@ impl DataflowGraph {
             }
         }
 
+        // Validate feedback edge endpoints.
+        for (i, edge) in self.feedback_edges.iter().enumerate() {
+            let src_idx = edge.source.operator_index;
+            let tgt_idx = edge.target.operator_index;
+
+            let src_op = self.operators.get(&src_idx).ok_or_else(|| {
+                Error::Custom(format!(
+                    "Feedback edge {i}: source operator {src_idx} is not registered"
+                ))
+            })?;
+
+            let tgt_op = self.operators.get(&tgt_idx).ok_or_else(|| {
+                Error::Custom(format!(
+                    "Feedback edge {i}: target operator {tgt_idx} is not registered"
+                ))
+            })?;
+
+            if edge.source.slot_index >= src_op.output_count {
+                return Err(Error::Custom(format!(
+                    "Feedback edge {i}: source port {} exceeds operator '{}' output count {}",
+                    edge.source.slot_index, src_op.name, src_op.output_count,
+                )));
+            }
+            if edge.target.slot_index >= tgt_op.input_count {
+                return Err(Error::Custom(format!(
+                    "Feedback edge {i}: target port {} exceeds operator '{}' input count {}",
+                    edge.target.slot_index, tgt_op.name, tgt_op.input_count,
+                )));
+            }
+        }
+
         // Check for duplicate edges.
         let mut seen = HashSet::new();
         for (i, edge) in self.edges.iter().enumerate() {
@@ -400,7 +451,7 @@ impl DataflowGraph {
             }
         }
 
-        // Check for cycles.
+        // Check for cycles (only on regular edges, not feedback edges).
         self.topological_order()?;
 
         Ok(())

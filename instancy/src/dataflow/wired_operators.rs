@@ -59,7 +59,7 @@ pub struct WiredUnaryOperator<T: Timestamp, D1: Send + 'static, D2: Send + 'stat
     output_pusher: Box<dyn Push<T, D2>>,
     /// Pending output: batches that have been produced but not yet pushed to channel.
     /// Items are pushed front-to-back; on backpressure, remaining items stay here.
-    pending_output: Vec<Envelope<T, D2>>,
+    pending_output: VecDeque<Envelope<T, D2>>,
     /// Whether the input channel is exhausted (sender closed + empty).
     input_exhausted: bool,
     /// Whether this operator has completed.
@@ -86,7 +86,7 @@ impl<T: Timestamp, D1: Send + 'static, D2: Send + 'static> WiredUnaryOperator<T,
             input_puller,
             logic: Box::new(logic),
             output_pusher,
-            pending_output: Vec::new(),
+            pending_output: VecDeque::new(),
             input_exhausted: false,
             done: false,
         }
@@ -95,13 +95,11 @@ impl<T: Timestamp, D1: Send + 'static, D2: Send + 'static> WiredUnaryOperator<T,
     /// Try to flush pending output envelopes to the output channel.
     /// Returns true if all pending output was sent successfully.
     fn flush_pending_output(&mut self) -> Result<bool> {
-        while !self.pending_output.is_empty() {
-            let envelope = self.pending_output.remove(0);
+        while let Some(envelope) = self.pending_output.pop_front() {
             match self.output_pusher.try_push(envelope) {
                 Ok(()) => {}
                 Err((Error::Backpressure, returned)) => {
-                    // Re-insert at front for retry on next activation.
-                    self.pending_output.insert(0, returned);
+                    self.pending_output.push_front(returned);
                     return Ok(false);
                 }
                 Err((e, _returned)) => return Err(e),
@@ -141,7 +139,7 @@ impl<T: Timestamp, D1: Send + 'static, D2: Send + 'static> WiredUnaryOperator<T,
     fn push_output(&mut self) -> Result<bool> {
         // Move output handle contents into pending_output.
         for (time, data) in self.output_handle.drain() {
-            self.pending_output.push(Envelope::data(time, data));
+            self.pending_output.push_back(Envelope::data(time, data));
         }
         self.flush_pending_output()
     }
@@ -809,6 +807,437 @@ impl<T: Timestamp, D: Send + 'static> SchedulableOperator for WiredConcatOperato
         for exhausted in &mut self.inputs_exhausted {
             *exhausted = true;
         }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// WiredEnterOperator
+// ---------------------------------------------------------------------------
+
+/// A wired operator that wraps timestamps for entering a nested loop scope.
+///
+/// Transforms `Envelope<TOuter, D>` → `Envelope<Product<TOuter, TInner>, D>`
+/// by wrapping each timestamp `t` into `Product(t, TInner::minimum())`.
+pub struct WiredEnterOperator<TOuter: Timestamp, TInner: Timestamp, D: Send + 'static>
+where
+    crate::order::Product<TOuter, TInner>: Timestamp,
+{
+    name: String,
+    index: usize,
+    region_id: RegionId,
+    input_puller: Box<dyn Pull<TOuter, D>>,
+    output_pusher: Box<dyn Push<crate::order::Product<TOuter, TInner>, D>>,
+    pending_output: VecDeque<Envelope<crate::order::Product<TOuter, TInner>, D>>,
+    input_exhausted: bool,
+    done: bool,
+    _phantom: std::marker::PhantomData<TInner>,
+}
+
+impl<TOuter: Timestamp, TInner: Timestamp, D: Send + 'static>
+    WiredEnterOperator<TOuter, TInner, D>
+where
+    crate::order::Product<TOuter, TInner>: Timestamp,
+{
+    /// Create a new enter operator.
+    pub fn new(
+        name: impl Into<String>,
+        index: usize,
+        region_id: RegionId,
+        input_puller: Box<dyn Pull<TOuter, D>>,
+        output_pusher: Box<dyn Push<crate::order::Product<TOuter, TInner>, D>>,
+    ) -> Self {
+        Self {
+            name: name.into(),
+            index,
+            region_id,
+            input_puller,
+            output_pusher,
+            pending_output: VecDeque::new(),
+            input_exhausted: false,
+            done: false,
+            _phantom: std::marker::PhantomData,
+        }
+    }
+
+    fn flush_pending_output(&mut self) -> Result<bool> {
+        while let Some(envelope) = self.pending_output.pop_front() {
+            match self.output_pusher.try_push(envelope) {
+                Ok(()) => {}
+                Err((Error::Backpressure, returned)) => {
+                    self.pending_output.push_front(returned);
+                    return Ok(false);
+                }
+                Err((e, _)) => return Err(e),
+            }
+        }
+        Ok(true)
+    }
+}
+
+impl<TOuter: Timestamp, TInner: Timestamp, D: Send + 'static> SchedulableOperator
+    for WiredEnterOperator<TOuter, TInner, D>
+where
+    crate::order::Product<TOuter, TInner>: Timestamp,
+{
+    fn activate(&mut self) -> Result<ActivationOutcome> {
+        if self.done {
+            return Ok(ActivationOutcome::Done);
+        }
+
+        if !self.pending_output.is_empty() {
+            if !self.flush_pending_output()? {
+                return Ok(ActivationOutcome::BlockedOnBackpressure);
+            }
+        }
+
+        let mut made_progress = false;
+        loop {
+            match self.input_puller.pull() {
+                Some(envelope) => match envelope.payload {
+                    Payload::Data { time, data } => {
+                        let product_time =
+                            crate::order::Product::new(time, TInner::minimum());
+                        self.pending_output
+                            .push_back(Envelope::data(product_time, data));
+                        made_progress = true;
+                    }
+                    Payload::Control(_) => {}
+                },
+                None => {
+                    if self.input_puller.is_exhausted() {
+                        self.input_exhausted = true;
+                    }
+                    break;
+                }
+            }
+        }
+
+        if !self.pending_output.is_empty() {
+            if !self.flush_pending_output()? {
+                return Ok(ActivationOutcome::BlockedOnBackpressure);
+            }
+        }
+
+        if self.input_exhausted && self.pending_output.is_empty() {
+            self.output_pusher.close();
+            self.done = true;
+            return Ok(ActivationOutcome::Done);
+        }
+
+        if made_progress {
+            Ok(ActivationOutcome::MadeProgress)
+        } else {
+            Ok(ActivationOutcome::Idle)
+        }
+    }
+
+    fn is_done(&self) -> bool {
+        self.done
+    }
+
+    fn name(&self) -> &str {
+        &self.name
+    }
+
+    fn index(&self) -> usize {
+        self.index
+    }
+
+    fn region_id(&self) -> RegionId {
+        self.region_id
+    }
+
+    fn close_inputs(&mut self) {
+        self.input_exhausted = true;
+    }
+}
+
+// ---------------------------------------------------------------------------
+// WiredLeaveOperator
+// ---------------------------------------------------------------------------
+
+/// A wired operator that strips the inner timestamp when leaving a loop scope.
+///
+/// Transforms `Envelope<Product<TOuter, TInner>, D>` → `Envelope<TOuter, D>`
+/// by extracting the outer component: `Product(outer, _inner)` → `outer`.
+pub struct WiredLeaveOperator<TOuter: Timestamp, TInner: Timestamp, D: Send + 'static>
+where
+    crate::order::Product<TOuter, TInner>: Timestamp,
+{
+    name: String,
+    index: usize,
+    region_id: RegionId,
+    input_puller: Box<dyn Pull<crate::order::Product<TOuter, TInner>, D>>,
+    output_pusher: Box<dyn Push<TOuter, D>>,
+    pending_output: VecDeque<Envelope<TOuter, D>>,
+    input_exhausted: bool,
+    done: bool,
+}
+
+impl<TOuter: Timestamp, TInner: Timestamp, D: Send + 'static>
+    WiredLeaveOperator<TOuter, TInner, D>
+where
+    crate::order::Product<TOuter, TInner>: Timestamp,
+{
+    /// Create a new leave operator.
+    pub fn new(
+        name: impl Into<String>,
+        index: usize,
+        region_id: RegionId,
+        input_puller: Box<dyn Pull<crate::order::Product<TOuter, TInner>, D>>,
+        output_pusher: Box<dyn Push<TOuter, D>>,
+    ) -> Self {
+        Self {
+            name: name.into(),
+            index,
+            region_id,
+            input_puller,
+            output_pusher,
+            pending_output: VecDeque::new(),
+            input_exhausted: false,
+            done: false,
+        }
+    }
+
+    fn flush_pending_output(&mut self) -> Result<bool> {
+        while let Some(envelope) = self.pending_output.pop_front() {
+            match self.output_pusher.try_push(envelope) {
+                Ok(()) => {}
+                Err((Error::Backpressure, returned)) => {
+                    self.pending_output.push_front(returned);
+                    return Ok(false);
+                }
+                Err((e, _)) => return Err(e),
+            }
+        }
+        Ok(true)
+    }
+}
+
+impl<TOuter: Timestamp, TInner: Timestamp, D: Send + 'static> SchedulableOperator
+    for WiredLeaveOperator<TOuter, TInner, D>
+where
+    crate::order::Product<TOuter, TInner>: Timestamp,
+{
+    fn activate(&mut self) -> Result<ActivationOutcome> {
+        if self.done {
+            return Ok(ActivationOutcome::Done);
+        }
+
+        if !self.pending_output.is_empty() {
+            if !self.flush_pending_output()? {
+                return Ok(ActivationOutcome::BlockedOnBackpressure);
+            }
+        }
+
+        let mut made_progress = false;
+        loop {
+            match self.input_puller.pull() {
+                Some(envelope) => match envelope.payload {
+                    Payload::Data { time, data } => {
+                        let outer_time = time.outer;
+                        self.pending_output
+                            .push_back(Envelope::data(outer_time, data));
+                        made_progress = true;
+                    }
+                    Payload::Control(_) => {}
+                },
+                None => {
+                    if self.input_puller.is_exhausted() {
+                        self.input_exhausted = true;
+                    }
+                    break;
+                }
+            }
+        }
+
+        if !self.pending_output.is_empty() {
+            if !self.flush_pending_output()? {
+                return Ok(ActivationOutcome::BlockedOnBackpressure);
+            }
+        }
+
+        if self.input_exhausted && self.pending_output.is_empty() {
+            self.output_pusher.close();
+            self.done = true;
+            return Ok(ActivationOutcome::Done);
+        }
+
+        if made_progress {
+            Ok(ActivationOutcome::MadeProgress)
+        } else {
+            Ok(ActivationOutcome::Idle)
+        }
+    }
+
+    fn is_done(&self) -> bool {
+        self.done
+    }
+
+    fn name(&self) -> &str {
+        &self.name
+    }
+
+    fn index(&self) -> usize {
+        self.index
+    }
+
+    fn region_id(&self) -> RegionId {
+        self.region_id
+    }
+
+    fn close_inputs(&mut self) {
+        self.input_exhausted = true;
+    }
+}
+
+// ---------------------------------------------------------------------------
+// WiredFeedbackOperator
+// ---------------------------------------------------------------------------
+
+/// A wired operator that advances the inner timestamp for feedback edges.
+///
+/// Transforms `Envelope<Product<TOuter, TInner>, D>` by applying the summary
+/// to the inner timestamp: `Product(outer, inner)` → `Product(outer, summary.results_in(inner))`.
+/// If `results_in()` returns `None` (overflow), the data is dropped.
+pub struct WiredFeedbackOperator<TOuter: Timestamp, TInner: Timestamp, D: Send + 'static>
+where
+    crate::order::Product<TOuter, TInner>: Timestamp,
+{
+    name: String,
+    index: usize,
+    region_id: RegionId,
+    summary: TInner::Summary,
+    input_puller: Box<dyn Pull<crate::order::Product<TOuter, TInner>, D>>,
+    output_pusher: Box<dyn Push<crate::order::Product<TOuter, TInner>, D>>,
+    pending_output: VecDeque<Envelope<crate::order::Product<TOuter, TInner>, D>>,
+    input_exhausted: bool,
+    done: bool,
+}
+
+impl<TOuter: Timestamp, TInner: Timestamp, D: Send + 'static>
+    WiredFeedbackOperator<TOuter, TInner, D>
+where
+    crate::order::Product<TOuter, TInner>: Timestamp,
+{
+    /// Create a new feedback operator with the given timestamp advancement summary.
+    pub fn new(
+        name: impl Into<String>,
+        index: usize,
+        region_id: RegionId,
+        summary: TInner::Summary,
+        input_puller: Box<dyn Pull<crate::order::Product<TOuter, TInner>, D>>,
+        output_pusher: Box<dyn Push<crate::order::Product<TOuter, TInner>, D>>,
+    ) -> Self {
+        Self {
+            name: name.into(),
+            index,
+            region_id,
+            summary,
+            input_puller,
+            output_pusher,
+            pending_output: VecDeque::new(),
+            input_exhausted: false,
+            done: false,
+        }
+    }
+
+    fn flush_pending_output(&mut self) -> Result<bool> {
+        while let Some(envelope) = self.pending_output.pop_front() {
+            match self.output_pusher.try_push(envelope) {
+                Ok(()) => {}
+                Err((Error::Backpressure, returned)) => {
+                    self.pending_output.push_front(returned);
+                    return Ok(false);
+                }
+                Err((e, _)) => return Err(e),
+            }
+        }
+        Ok(true)
+    }
+}
+
+impl<TOuter: Timestamp, TInner: Timestamp, D: Send + 'static> SchedulableOperator
+    for WiredFeedbackOperator<TOuter, TInner, D>
+where
+    crate::order::Product<TOuter, TInner>: Timestamp,
+{
+    fn activate(&mut self) -> Result<ActivationOutcome> {
+        use crate::progress::timestamp::PathSummary;
+
+        if self.done {
+            return Ok(ActivationOutcome::Done);
+        }
+
+        if !self.pending_output.is_empty() {
+            if !self.flush_pending_output()? {
+                return Ok(ActivationOutcome::BlockedOnBackpressure);
+            }
+        }
+
+        let mut made_progress = false;
+        loop {
+            match self.input_puller.pull() {
+                Some(envelope) => match envelope.payload {
+                    Payload::Data { time, data } => {
+                        // Advance inner timestamp by summary
+                        if let Some(new_inner) = self.summary.results_in(&time.inner) {
+                            let new_time =
+                                crate::order::Product::new(time.outer, new_inner);
+                            self.pending_output
+                                .push_back(Envelope::data(new_time, data));
+                            made_progress = true;
+                        }
+                        // If results_in returns None, drop the data (overflow)
+                    }
+                    Payload::Control(_) => {}
+                },
+                None => {
+                    if self.input_puller.is_exhausted() {
+                        self.input_exhausted = true;
+                    }
+                    break;
+                }
+            }
+        }
+
+        if !self.pending_output.is_empty() {
+            if !self.flush_pending_output()? {
+                return Ok(ActivationOutcome::BlockedOnBackpressure);
+            }
+        }
+
+        if self.input_exhausted && self.pending_output.is_empty() {
+            self.output_pusher.close();
+            self.done = true;
+            return Ok(ActivationOutcome::Done);
+        }
+
+        if made_progress {
+            Ok(ActivationOutcome::MadeProgress)
+        } else {
+            Ok(ActivationOutcome::Idle)
+        }
+    }
+
+    fn is_done(&self) -> bool {
+        self.done
+    }
+
+    fn name(&self) -> &str {
+        &self.name
+    }
+
+    fn index(&self) -> usize {
+        self.index
+    }
+
+    fn region_id(&self) -> RegionId {
+        self.region_id
+    }
+
+    fn close_inputs(&mut self) {
+        self.input_exhausted = true;
     }
 }
 
