@@ -28,6 +28,7 @@ use std::task::{Context, Poll, Waker};
 
 use crate::cancellation::CancellationToken;
 use crate::dataflow::channels::wake::WakeHandle;
+use crate::dataflow::channel_operators::ChannelMode;
 use crate::dataflow::dataflow_builder::LogicalDataflow;
 use crate::dataflow::executor::{DataflowExecutor, ExecutorConfig};
 use crate::error::{Error, Result};
@@ -174,7 +175,72 @@ impl RuntimeHandle {
     /// Returns an error immediately if the dataflow has input ports.
     /// The returned future resolves to an error if the executor encounters
     /// an error during execution.
-    pub fn run<T: Timestamp>(&self, dataflow: LogicalDataflow<T>) -> Result<DataflowCompletion> {
+    pub fn run<T: Timestamp>(
+        &self,
+        dataflow: LogicalDataflow<T>,
+    ) -> Result<DataflowCompletion> {
+        self.run_sync(dataflow)
+    }
+
+    /// Run a pre-loaded dataflow to completion, blocking the current thread.
+    ///
+    /// Convenience wrapper: equivalent to `run(df)?.wait()`.
+    pub fn run_blocking<T: Timestamp>(&self, dataflow: LogicalDataflow<T>) -> Result<()> {
+        self.run_sync(dataflow)?.wait()
+    }
+
+    /// Spawn a dataflow on the worker pool with synchronous channel-based I/O.
+    ///
+    /// Returns a [`SpawnedDataflow`] handle with sync [`InputSender`] and
+    /// [`OutputReceiver`] handles. Use [`spawn_async()`](Self::spawn_async)
+    /// for async I/O handles (feature-gated behind `async-io`).
+    ///
+    /// # Execution model
+    ///
+    /// The executor is registered as an `ExecutorTask` in the pool's
+    /// `ExecutorRegistry`. Pool threads cooperatively poll the task via
+    /// `poll_run()`, yielding after each poll budget to allow other
+    /// dataflows to make progress on the same threads.
+    pub fn spawn<T: Timestamp>(
+        &self,
+        dataflow: LogicalDataflow<T>,
+    ) -> Result<SpawnedDataflow<T>> {
+        self.spawn_internal(dataflow, ChannelMode::Sync)
+    }
+
+    /// Spawn a dataflow with async channel-based I/O.
+    ///
+    /// Like [`spawn()`](Self::spawn) but wires `tokio::sync::mpsc` channels
+    /// for the external I/O ports. Use [`SpawnedDataflow::take_async_input()`]
+    /// and [`SpawnedDataflow::take_async_output()`] to obtain the async handles.
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// let mut handle = rt.spawn_async(dataflow)?;
+    /// let sender = handle.take_async_input::<i32>("data")?;
+    /// let mut receiver = handle.take_async_output::<i32>("results")?;
+    ///
+    /// sender.send(0, vec![1, 2, 3]).await?;
+    /// sender.close();
+    ///
+    /// let results = receiver.collect_data().await;
+    /// handle.join().await?;
+    /// ```
+    #[cfg(feature = "async-io")]
+    pub fn spawn_async<T: Timestamp>(
+        &self,
+        dataflow: LogicalDataflow<T>,
+    ) -> Result<SpawnedDataflow<T>> {
+        self.spawn_internal(dataflow, ChannelMode::Async)
+    }
+
+    // -- Private sync implementations --
+
+    fn run_sync<T: Timestamp>(
+        &self,
+        dataflow: LogicalDataflow<T>,
+    ) -> Result<DataflowCompletion> {
         if dataflow.has_input_ports() {
             return Err(Error::Custom(
                 "cannot run() a dataflow with declared input ports — \
@@ -201,30 +267,10 @@ impl RuntimeHandle {
         Ok(completion)
     }
 
-    /// Run a pre-loaded dataflow to completion, blocking the current thread.
-    ///
-    /// Convenience wrapper around [`run()`](Self::run) + [`DataflowCompletion::wait()`].
-    pub fn run_blocking<T: Timestamp>(&self, dataflow: LogicalDataflow<T>) -> Result<()> {
-        self.run(dataflow)?.wait()
-    }
-
-    /// Spawn a dataflow on the worker pool with channel-based I/O.
-    ///
-    /// Returns a [`SpawnedDataflow`] handle for feeding data and collecting
-    /// results. The executor runs on a thread from the shared pool rather
-    /// than on a dedicated OS thread.
-    ///
-    /// See [`SimpleRuntime::spawn()`] for full channel-wiring documentation.
-    ///
-    /// # Execution model
-    ///
-    /// The executor is registered as an `ExecutorTask` in the pool's
-    /// `ExecutorRegistry`. Pool threads cooperatively poll the task via
-    /// `poll_run()`, yielding after each poll budget to allow other
-    /// dataflows to make progress on the same threads.
-    pub fn spawn<T: Timestamp>(
+    fn spawn_internal<T: Timestamp>(
         &self,
         mut dataflow: LogicalDataflow<T>,
+        mode: ChannelMode,
     ) -> Result<SpawnedDataflow<T>> {
         if dataflow.operator_factories.is_empty() && dataflow.input_port_wiring.is_empty() {
             return Err(Error::Custom("cannot spawn an empty dataflow".into()));
@@ -254,7 +300,7 @@ impl RuntimeHandle {
             .zip(dataflow.input_port_wiring.drain(..))
         {
             let (factory, sender_any) =
-                wiring(Arc::clone(&external_inputs_open), wake_handle.clone());
+                wiring(Arc::clone(&external_inputs_open), wake_handle.clone(), mode);
             dataflow
                 .operator_factories
                 .push((info.operator_index, factory));
@@ -270,7 +316,7 @@ impl RuntimeHandle {
             .iter()
             .zip(dataflow.output_port_wiring.drain(..))
         {
-            let (replacement_factory, receiver_any) = wiring();
+            let (replacement_factory, receiver_any) = wiring(mode, Some(wake_handle.clone()));
             if let Some(pos) = dataflow
                 .operator_factories
                 .iter()
@@ -468,7 +514,7 @@ impl SimpleRuntime {
             .zip(dataflow.input_port_wiring.drain(..))
         {
             let (factory, sender_any) =
-                wiring(Arc::clone(&external_inputs_open), wake_handle.clone());
+                wiring(Arc::clone(&external_inputs_open), wake_handle.clone(), ChannelMode::Sync);
             dataflow
                 .operator_factories
                 .push((info.operator_index, factory));
@@ -484,7 +530,7 @@ impl SimpleRuntime {
             .iter()
             .zip(dataflow.output_port_wiring.drain(..))
         {
-            let (replacement_factory, receiver_any) = wiring();
+            let (replacement_factory, receiver_any) = wiring(ChannelMode::Sync, None);
             if let Some(pos) = dataflow
                 .operator_factories
                 .iter()
@@ -760,7 +806,9 @@ impl<T: Timestamp> SpawnedDataflow<T> {
         sender_any
             .downcast::<crate::dataflow::channel_operators::InputSender<T, D>>()
             .map(|boxed| *boxed)
-            .map_err(|_| Error::Custom(format!("input port '{name}' type downcast failed")))
+            .map_err(|_| Error::Custom(format!(
+                "input port '{name}' type downcast failed — if spawned with spawn_async(), use take_async_input()"
+            )))
     }
 
     /// Take the output receiver for the named port (consumes it from the handle).
@@ -793,7 +841,73 @@ impl<T: Timestamp> SpawnedDataflow<T> {
         receiver_any
             .downcast::<crate::dataflow::channel_operators::OutputReceiver<T, D>>()
             .map(|boxed| *boxed)
-            .map_err(|_| Error::Custom(format!("output port '{name}' type downcast failed")))
+            .map_err(|_| Error::Custom(format!(
+                "output port '{name}' type downcast failed — if spawned with spawn_async(), use take_async_output()"
+            )))
+    }
+
+    /// Take the async input sender for the named port (consumes it).
+    ///
+    /// Only works when the dataflow was spawned with [`RuntimeHandle::spawn_async()`].
+    /// Returns an error if the port was wired as sync or does not exist.
+    #[cfg(feature = "async-io")]
+    pub fn take_async_input<D: Clone + Send + 'static>(
+        &mut self,
+        name: &str,
+    ) -> Result<crate::dataflow::channel_operators::AsyncInputSender<T, D>> {
+        let type_name = std::any::type_name::<D>();
+        let pos = self
+            .input_senders
+            .iter()
+            .position(|(n, _, _)| n == name)
+            .ok_or_else(|| Error::Custom(format!("no input port named '{name}'")))?;
+
+        let (_, port_type, _) = &self.input_senders[pos];
+        if *port_type != type_name {
+            return Err(Error::Custom(format!(
+                "input port '{name}' has type {port_type}, but requested {type_name}"
+            )));
+        }
+
+        let (_, _, sender_any) = self.input_senders.remove(pos);
+        sender_any
+            .downcast::<crate::dataflow::channel_operators::AsyncInputSender<T, D>>()
+            .map(|boxed| *boxed)
+            .map_err(|_| Error::Custom(format!(
+                "input port '{name}' was not wired for async I/O (use spawn_async)"
+            )))
+    }
+
+    /// Take the async output receiver for the named port (consumes it).
+    ///
+    /// Only works when the dataflow was spawned with [`RuntimeHandle::spawn_async()`].
+    /// Returns an error if the port was wired as sync or does not exist.
+    #[cfg(feature = "async-io")]
+    pub fn take_async_output<D: Send + 'static>(
+        &mut self,
+        name: &str,
+    ) -> Result<crate::dataflow::channel_operators::AsyncOutputReceiver<T, D>> {
+        let type_name = std::any::type_name::<D>();
+        let pos = self
+            .output_receivers
+            .iter()
+            .position(|(n, _, _)| n == name)
+            .ok_or_else(|| Error::Custom(format!("no output port named '{name}'")))?;
+
+        let (_, port_type, _) = &self.output_receivers[pos];
+        if *port_type != type_name {
+            return Err(Error::Custom(format!(
+                "output port '{name}' has type {port_type}, but requested {type_name}"
+            )));
+        }
+
+        let (_, _, receiver_any) = self.output_receivers.remove(pos);
+        receiver_any
+            .downcast::<crate::dataflow::channel_operators::AsyncOutputReceiver<T, D>>()
+            .map(|boxed| *boxed)
+            .map_err(|_| Error::Custom(format!(
+                "output port '{name}' was not wired for async I/O (use spawn_async)"
+            )))
     }
 
     /// Cancel the running dataflow.
@@ -1172,8 +1286,8 @@ mod tests {
         assert!(format!("{}", result.unwrap_err()).contains("unexpectedly"));
     }
 
-    #[test]
-    fn dataflow_completion_wait_blocking() {
+    #[tokio::test]
+    async fn dataflow_completion_await_async() {
         use crate::dataflow::DataflowBuilder;
 
         let rt = RuntimeHandle::new(RuntimeConfig {
@@ -1182,15 +1296,15 @@ mod tests {
         })
         .unwrap();
 
-        let builder = DataflowBuilder::<u64>::new("wait_test");
+        let builder = DataflowBuilder::<u64>::new("await_test");
         builder
             .source("nums", vec![(0u64, vec![1i32, 2, 3])])
             .output("out");
         let dataflow = builder.build().unwrap();
 
-        // Use the async API + wait() instead of run_blocking()
+        // Exercise the async completion path: .await on DataflowCompletion
         let completion = rt.run(dataflow).unwrap();
-        completion.wait().unwrap();
+        completion.await.unwrap();
     }
 
     #[test]
@@ -1211,5 +1325,145 @@ mod tests {
         // Drop without calling join() — should cancel and not hang
         let _handle = rt.spawn(dataflow).unwrap();
         // handle dropped here — cancellation + detach, no blocking
+    }
+
+    #[cfg(feature = "async-io")]
+    #[tokio::test]
+    async fn spawn_async_roundtrip() {
+        use crate::dataflow::DataflowBuilder;
+
+        let rt = RuntimeHandle::new(RuntimeConfig {
+            worker_threads: 2,
+            ..RuntimeConfig::default()
+        })
+        .unwrap();
+
+        let builder = DataflowBuilder::<u64>::new("async_roundtrip");
+        let input = builder.input::<i32>("data");
+        input.map("mul10", |_t, x| x * 10).output("out");
+        let dataflow = builder.build().unwrap();
+
+        let mut handle = rt.spawn_async(dataflow).unwrap();
+        let sender = handle.take_async_input::<i32>("data").unwrap();
+        let mut receiver = handle.take_async_output::<i32>("out").unwrap();
+
+        sender.send(0, vec![1, 2, 3]).await.unwrap();
+        sender.advance_frontier(0).await.unwrap();
+        sender.close();
+
+        let results = receiver.collect_data().await;
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].0, 0);
+        let mut vals = results[0].1.clone();
+        vals.sort();
+        assert_eq!(vals, vec![10, 20, 30]);
+
+        handle.join().await.unwrap();
+    }
+
+    #[cfg(feature = "async-io")]
+    #[tokio::test]
+    async fn sync_take_on_async_port_gives_helpful_error() {
+        use crate::dataflow::DataflowBuilder;
+
+        let rt = RuntimeHandle::new(RuntimeConfig {
+            worker_threads: 2,
+            ..RuntimeConfig::default()
+        })
+        .unwrap();
+
+        let builder = DataflowBuilder::<u64>::new("cross_mode_err");
+        let input = builder.input::<i32>("data");
+        input.output("out");
+        let dataflow = builder.build().unwrap();
+
+        let mut handle = rt.spawn_async(dataflow).unwrap();
+
+        // Using sync take_input on an async-wired port should give a helpful error
+        let err = handle.take_input::<i32>("data").unwrap_err();
+        assert!(
+            format!("{err}").contains("spawn_async"),
+            "error should hint at async mode: {err}"
+        );
+
+        let err = handle.take_output::<i32>("out");
+        assert!(err.is_err());
+        let msg = format!("{}", err.err().unwrap());
+        assert!(
+            msg.contains("spawn_async"),
+            "error should hint at async mode: {msg}"
+        );
+    }
+
+    #[cfg(feature = "async-io")]
+    #[tokio::test]
+    async fn spawn_async_multiple_timestamps() {
+        use crate::dataflow::DataflowBuilder;
+
+        let rt = RuntimeHandle::new(RuntimeConfig {
+            worker_threads: 2,
+            ..RuntimeConfig::default()
+        })
+        .unwrap();
+
+        let builder = DataflowBuilder::<u64>::new("async_multi_ts");
+        let input = builder.input::<i32>("data");
+        input.output("out");
+        let dataflow = builder.build().unwrap();
+
+        let mut handle = rt.spawn_async(dataflow).unwrap();
+        let sender = handle.take_async_input::<i32>("data").unwrap();
+        let mut receiver = handle.take_async_output::<i32>("out").unwrap();
+
+        sender.send(0, vec![10, 20]).await.unwrap();
+        sender.send(1, vec![30, 40]).await.unwrap();
+        sender.advance_frontier(1).await.unwrap();
+        sender.close();
+
+        let results = receiver.collect_data().await;
+        assert!(results.len() >= 1); // may be batched
+        let all_data: Vec<i32> = results.into_iter().flat_map(|(_, d)| d).collect();
+        let mut sorted = all_data;
+        sorted.sort();
+        assert_eq!(sorted, vec![10, 20, 30, 40]);
+
+        handle.join().await.unwrap();
+    }
+
+    #[cfg(feature = "async-io")]
+    #[tokio::test]
+    async fn async_input_sender_is_clone() {
+        use crate::dataflow::DataflowBuilder;
+
+        let rt = RuntimeHandle::new(RuntimeConfig {
+            worker_threads: 2,
+            ..RuntimeConfig::default()
+        })
+        .unwrap();
+
+        let builder = DataflowBuilder::<u64>::new("clone_sender");
+        let input = builder.input::<i32>("data");
+        input.output("out");
+        let dataflow = builder.build().unwrap();
+
+        let mut handle = rt.spawn_async(dataflow).unwrap();
+        let sender1 = handle.take_async_input::<i32>("data").unwrap();
+        let sender2 = sender1.clone();
+
+        // Both clones can send data
+        sender1.send(0, vec![1]).await.unwrap();
+        sender2.send(0, vec![2]).await.unwrap();
+        sender1.advance_frontier(0).await.unwrap();
+        drop(sender1);
+        drop(sender2); // channel closes when all clones drop
+
+        let mut receiver = handle.take_async_output::<i32>("out").unwrap();
+        let results = receiver.collect_data().await;
+        let all_data: Vec<i32> = results.into_iter().flat_map(|(_, d)| d).collect();
+        let mut sorted = all_data;
+        sorted.sort();
+        assert_eq!(sorted, vec![1, 2]);
+
+        handle.join().await.unwrap();
     }
 }

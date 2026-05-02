@@ -12,6 +12,7 @@ use instancy::dataflow::DataflowBuilder;
 use instancy::runtime::{RuntimeConfig, RuntimeHandle};
 use instancy::scheduler::policy::FifoPolicy;
 
+#[allow(clippy::needless_return)]
 fn main() {
     // Create two independent runtimes with different configurations.
     // Each runtime has its own worker pool, scheduling policy, and

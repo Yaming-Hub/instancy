@@ -38,6 +38,7 @@ use crate::dataflow::channels::bounded::bounded_channel_with_wake;
 use crate::dataflow::channels::pushpull::{Pull, Push};
 use crate::dataflow::channels::tee::tee_or_single;
 use crate::dataflow::channels::wake::WakeHandle;
+use crate::dataflow::channel_operators::ChannelMode;
 use crate::dataflow::graph::DataflowGraph;
 use crate::dataflow::operators::handles::{InputHandle, OutputHandle};
 use crate::dataflow::operators::input::InputEvent;
@@ -120,16 +121,17 @@ pub(crate) type InputPortWiring = Box<
     dyn FnOnce(
             std::sync::Arc<std::sync::atomic::AtomicUsize>, // external_inputs_open counter
             WakeHandle,                                      // executor wake handle
-        ) -> (OperatorFactory, Box<dyn std::any::Any + Send>) // (factory, InputSender)
+            ChannelMode,                                     // sync vs async channel backend
+        ) -> (OperatorFactory, Box<dyn std::any::Any + Send>) // (factory, InputSender or AsyncInputSender)
         + Send,
 >;
 
 /// Type-erased closure for wiring an output port during spawn().
 /// Returns:
 /// - An OperatorFactory for the ChannelSinkOperator (replaces CollectingSink)
-/// - An OutputReceiver (as Box<dyn Any + Send>) for the caller
+/// - An OutputReceiver or AsyncOutputReceiver (as Box<dyn Any + Send>) for the caller
 pub(crate) type OutputPortWiring = Box<
-    dyn FnOnce() -> (OperatorFactory, Box<dyn std::any::Any + Send>) // (factory, OutputReceiver)
+    dyn FnOnce(ChannelMode, Option<WakeHandle>) -> (OperatorFactory, Box<dyn std::any::Any + Send>)
         + Send,
 >;
 
@@ -259,47 +261,86 @@ impl<T: Timestamp> DataflowBuilder<T> {
             // spawn() to create the ChannelSourceOperator factory and InputSender.
             // The closure captures the concrete data type D.
             let wiring_name = name.clone();
-            let wiring: InputPortWiring = Box::new(move |external_inputs_open, wake_handle| {
-                use crate::dataflow::channel_operators::InputSender;
-                use crate::dataflow::channel_operators::ChannelSourceOperator;
+            let wiring: InputPortWiring = Box::new(move |external_inputs_open, wake_handle, mode| {
+                use crate::dataflow::channel_operators::{InputSender, ChannelSourceOperator, InputRecv};
                 use crate::dataflow::channels::tee::tee_or_single;
 
-                // Create bounded channel for external → dataflow communication
-                let (tx, rx) = std::sync::mpsc::sync_channel::<InputEvent<T, D>>(256);
-                let sender = InputSender::with_wake_handle(tx, wake_handle);
+                // Build the factory + sender based on channel mode.
+                // The factory closure captures the receiver; the sender is
+                // returned to the caller as a type-erased Box<dyn Any>.
+                match mode {
+                    ChannelMode::Sync => {
+                        let (tx, rx) = std::sync::mpsc::sync_channel::<InputEvent<T, D>>(256);
+                        let sender = InputSender::with_wake_handle(tx, wake_handle);
 
-                // The factory closure captures the receiver and wires it to
-                // the output pusher provided during materialization.
-                let ext_counter = Arc::clone(&external_inputs_open);
-                let factory_name = wiring_name.clone();
-                let factory: OperatorFactory = Box::new(move |endpoints| {
-                    // Source operator: 0 inputs, 1 output (may have fan-out)
-                    let output_pusher: Box<dyn Push<T, D>> = {
-                        let pushers: Vec<Box<dyn Push<T, D>>> = endpoints
-                            .output_pushers
-                            .into_iter()
-                            .map(|any_box| {
-                                *any_box
-                                    .downcast::<Box<dyn Push<T, D>>>()
-                                    .expect("channel source output pusher type mismatch")
-                            })
-                            .collect();
-                        tee_or_single(pushers).unwrap_or_else(|| Box::new(NullPush))
-                    };
-                    let op = ChannelSourceOperator::new(
-                        factory_name,
-                        op_idx,
-                        RegionId::new(0),
-                        rx,
-                        output_pusher,
-                        None, // progress reporter wired separately
-                        ext_counter,
-                    );
-                    Box::new(op) as Box<dyn SchedulableOperator>
-                });
+                        let ext_counter = Arc::clone(&external_inputs_open);
+                        let factory_name = wiring_name.clone();
+                        let factory: OperatorFactory = Box::new(move |endpoints| {
+                            let output_pusher: Box<dyn Push<T, D>> = {
+                                let pushers: Vec<Box<dyn Push<T, D>>> = endpoints
+                                    .output_pushers
+                                    .into_iter()
+                                    .map(|any_box| {
+                                        *any_box
+                                            .downcast::<Box<dyn Push<T, D>>>()
+                                            .expect("channel source output pusher type mismatch")
+                                    })
+                                    .collect();
+                                tee_or_single(pushers).unwrap_or_else(|| Box::new(NullPush))
+                            };
+                            let op = ChannelSourceOperator::new(
+                                factory_name,
+                                op_idx,
+                                RegionId::new(0),
+                                InputRecv::Std(rx),
+                                output_pusher,
+                                None,
+                                ext_counter,
+                            );
+                            Box::new(op) as Box<dyn SchedulableOperator>
+                        });
 
-                let sender_any: Box<dyn std::any::Any + Send> = Box::new(sender);
-                (factory, sender_any)
+                        let sender_any: Box<dyn std::any::Any + Send> = Box::new(sender);
+                        (factory, sender_any)
+                    }
+                    #[cfg(feature = "async-io")]
+                    ChannelMode::Async => {
+                        use crate::dataflow::channel_operators::AsyncInputSender;
+
+                        let (tx, rx) = tokio::sync::mpsc::channel::<InputEvent<T, D>>(256);
+                        let sender = AsyncInputSender::with_wake_handle(tx, wake_handle);
+
+                        let ext_counter = Arc::clone(&external_inputs_open);
+                        let factory_name = wiring_name.clone();
+                        let factory: OperatorFactory = Box::new(move |endpoints| {
+                            let output_pusher: Box<dyn Push<T, D>> = {
+                                let pushers: Vec<Box<dyn Push<T, D>>> = endpoints
+                                    .output_pushers
+                                    .into_iter()
+                                    .map(|any_box| {
+                                        *any_box
+                                            .downcast::<Box<dyn Push<T, D>>>()
+                                            .expect("channel source output pusher type mismatch")
+                                    })
+                                    .collect();
+                                tee_or_single(pushers).unwrap_or_else(|| Box::new(NullPush))
+                            };
+                            let op = ChannelSourceOperator::new(
+                                factory_name,
+                                op_idx,
+                                RegionId::new(0),
+                                InputRecv::Tokio(rx),
+                                output_pusher,
+                                None,
+                                ext_counter,
+                            );
+                            Box::new(op) as Box<dyn SchedulableOperator>
+                        });
+
+                        let sender_any: Box<dyn std::any::Any + Send> = Box::new(sender);
+                        (factory, sender_any)
+                    }
+                }
             });
             state.input_port_wiring.push(wiring);
         }
@@ -1446,32 +1487,68 @@ impl<T: Timestamp, D: Clone + Send + 'static> Pipe<T, D> {
             // replacement factory during spawn(). This replaces the
             // CollectingSink factory above with one that sends data out.
             let sink_name = name.clone();
-            let wiring: OutputPortWiring = Box::new(move || {
-                use crate::dataflow::channel_operators::{ChannelSinkOperator, OutputReceiver};
+            let wiring: OutputPortWiring = Box::new(move |mode, wake_handle| {
+                use crate::dataflow::channel_operators::{ChannelSinkOperator, OutputReceiver, OutputSend};
 
-                let (tx, rx) = std::sync::mpsc::sync_channel::<OutputEvent<T, D>>(256);
-                let receiver = OutputReceiver::new(rx);
+                match mode {
+                    ChannelMode::Sync => {
+                        let (tx, rx) = std::sync::mpsc::sync_channel::<OutputEvent<T, D>>(256);
+                        let receiver = OutputReceiver::new(rx);
 
-                let factory: OperatorFactory = Box::new(move |endpoints: ChannelEndpoints| {
-                    let input_puller: Box<dyn Pull<T, D>> = *endpoints
-                        .input_pullers
-                        .into_iter()
-                        .next()
-                        .expect("sink must have input puller")
-                        .downcast::<Box<dyn Pull<T, D>>>()
-                        .expect("sink input puller type mismatch");
+                        let factory: OperatorFactory = Box::new(move |endpoints: ChannelEndpoints| {
+                            let input_puller: Box<dyn Pull<T, D>> = *endpoints
+                                .input_pullers
+                                .into_iter()
+                                .next()
+                                .expect("sink must have input puller")
+                                .downcast::<Box<dyn Pull<T, D>>>()
+                                .expect("sink input puller type mismatch");
 
-                    Box::new(ChannelSinkOperator::new(
-                        sink_name,
-                        op_idx,
-                        RegionId::new(0),
-                        input_puller,
-                        tx,
-                    )) as Box<dyn SchedulableOperator>
-                });
+                            Box::new(ChannelSinkOperator::new(
+                                sink_name,
+                                op_idx,
+                                RegionId::new(0),
+                                input_puller,
+                                OutputSend::Std(tx),
+                            )) as Box<dyn SchedulableOperator>
+                        });
 
-                let receiver_any: Box<dyn std::any::Any + Send> = Box::new(receiver);
-                (factory, receiver_any)
+                        let receiver_any: Box<dyn std::any::Any + Send> = Box::new(receiver);
+                        (factory, receiver_any)
+                    }
+                    #[cfg(feature = "async-io")]
+                    ChannelMode::Async => {
+                        use crate::dataflow::channel_operators::AsyncOutputReceiver;
+
+                        let (tx, rx) = tokio::sync::mpsc::channel::<OutputEvent<T, D>>(256);
+                        let receiver = if let Some(wh) = wake_handle {
+                            AsyncOutputReceiver::with_wake_handle(rx, wh)
+                        } else {
+                            AsyncOutputReceiver::new(rx)
+                        };
+
+                        let factory: OperatorFactory = Box::new(move |endpoints: ChannelEndpoints| {
+                            let input_puller: Box<dyn Pull<T, D>> = *endpoints
+                                .input_pullers
+                                .into_iter()
+                                .next()
+                                .expect("sink must have input puller")
+                                .downcast::<Box<dyn Pull<T, D>>>()
+                                .expect("sink input puller type mismatch");
+
+                            Box::new(ChannelSinkOperator::new(
+                                sink_name,
+                                op_idx,
+                                RegionId::new(0),
+                                input_puller,
+                                OutputSend::Tokio(tx),
+                            )) as Box<dyn SchedulableOperator>
+                        });
+
+                        let receiver_any: Box<dyn std::any::Any + Send> = Box::new(receiver);
+                        (factory, receiver_any)
+                    }
+                }
             });
             state.output_port_wiring.push(wiring);
 

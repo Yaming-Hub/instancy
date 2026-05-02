@@ -2,10 +2,14 @@
 //!
 //! These operators bridge external callers to the dataflow graph:
 //!
-//! - [`ChannelSourceOperator`] receives [`InputEvent`]s from a `std::sync::mpsc`
+//! - [`ChannelSourceOperator`] receives [`InputEvent`]s from an external
 //!   channel and pushes data into the dataflow as a source operator.
 //! - [`ChannelSinkOperator`] collects data from the dataflow and sends
-//!   [`OutputEvent`]s to a `std::sync::mpsc` channel for external consumption.
+//!   [`OutputEvent`]s to an external channel for consumption.
+//!
+//! Both operators support synchronous (`std::sync::mpsc`) and asynchronous
+//! (`tokio::sync::mpsc`, feature-gated behind `async-io`) channel backends.
+//! The channel type is chosen at spawn time via [`ChannelMode`].
 
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -23,6 +27,86 @@ use crate::dataflow::schedulable::{ActivationOutcome, SchedulableOperator};
 use crate::error::Result;
 use crate::progress::operate::ProgressReporter;
 use crate::progress::timestamp::Timestamp;
+
+// ---------------------------------------------------------------------------
+// ChannelMode — sync vs async channel selection
+// ---------------------------------------------------------------------------
+
+/// Selects the channel backend for external I/O ports.
+///
+/// Passed to wiring closures at spawn time to determine whether
+/// `std::sync::mpsc` (sync) or `tokio::sync::mpsc` (async) channels
+/// are used for input/output communication with external code.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ChannelMode {
+    /// Use `std::sync::mpsc` channels — no async runtime required.
+    Sync,
+    /// Use `tokio::sync::mpsc` channels — enables async send/recv.
+    #[cfg(feature = "async-io")]
+    Async,
+}
+
+// ---------------------------------------------------------------------------
+// InputRecv / OutputSend — channel backend enums
+// ---------------------------------------------------------------------------
+
+/// Unified receiver for input channels, abstracting over std and tokio backends.
+pub(crate) enum InputRecv<T> {
+    Std(mpsc::Receiver<T>),
+    #[cfg(feature = "async-io")]
+    Tokio(tokio::sync::mpsc::Receiver<T>),
+}
+
+/// Error type for `InputRecv::try_recv()`.
+pub(crate) enum RecvError {
+    Empty,
+    Disconnected,
+}
+
+impl<T> InputRecv<T> {
+    pub(crate) fn try_recv(&mut self) -> std::result::Result<T, RecvError> {
+        match self {
+            Self::Std(rx) => rx.try_recv().map_err(|e| match e {
+                mpsc::TryRecvError::Empty => RecvError::Empty,
+                mpsc::TryRecvError::Disconnected => RecvError::Disconnected,
+            }),
+            #[cfg(feature = "async-io")]
+            Self::Tokio(rx) => rx.try_recv().map_err(|e| match e {
+                tokio::sync::mpsc::error::TryRecvError::Empty => RecvError::Empty,
+                tokio::sync::mpsc::error::TryRecvError::Disconnected => RecvError::Disconnected,
+            }),
+        }
+    }
+}
+
+/// Unified sender for output channels, abstracting over std and tokio backends.
+pub(crate) enum OutputSend<T> {
+    Std(mpsc::SyncSender<T>),
+    #[cfg(feature = "async-io")]
+    Tokio(tokio::sync::mpsc::Sender<T>),
+}
+
+/// Error from `OutputSend::try_send()`.
+pub(crate) enum SendError<T> {
+    Full(T),
+    Disconnected(T),
+}
+
+impl<T> OutputSend<T> {
+    pub(crate) fn try_send(&self, item: T) -> std::result::Result<(), SendError<T>> {
+        match self {
+            Self::Std(tx) => tx.try_send(item).map_err(|e| match e {
+                mpsc::TrySendError::Full(v) => SendError::Full(v),
+                mpsc::TrySendError::Disconnected(v) => SendError::Disconnected(v),
+            }),
+            #[cfg(feature = "async-io")]
+            Self::Tokio(tx) => tx.try_send(item).map_err(|e| match e {
+                tokio::sync::mpsc::error::TrySendError::Full(v) => SendError::Full(v),
+                tokio::sync::mpsc::error::TrySendError::Closed(v) => SendError::Disconnected(v),
+            }),
+        }
+    }
+}
 
 // ---------------------------------------------------------------------------
 // ChannelSourceOperator
@@ -44,7 +128,7 @@ pub struct ChannelSourceOperator<T: Timestamp, D: Send + 'static> {
     name: String,
     index: usize,
     region_id: RegionId,
-    receiver: mpsc::Receiver<InputEvent<T, D>>,
+    receiver: InputRecv<InputEvent<T, D>>,
     output_pusher: Box<dyn Push<T, D>>,
     pending_output: VecDeque<Envelope<T, D>>,
     progress_reporter: Option<ProgressReporter<T>>,
@@ -54,11 +138,11 @@ pub struct ChannelSourceOperator<T: Timestamp, D: Send + 'static> {
 
 impl<T: Timestamp, D: Send + 'static> ChannelSourceOperator<T, D> {
     /// Create a new channel source operator.
-    pub fn new(
+    pub(crate) fn new(
         name: String,
         index: usize,
         region_id: RegionId,
-        receiver: mpsc::Receiver<InputEvent<T, D>>,
+        receiver: InputRecv<InputEvent<T, D>>,
         output_pusher: Box<dyn Push<T, D>>,
         progress_reporter: Option<ProgressReporter<T>>,
         external_inputs_open: Arc<AtomicUsize>,
@@ -144,11 +228,11 @@ impl<T: Timestamp, D: Send + 'static> SchedulableOperator for ChannelSourceOpera
                     // The operator simply advances when all data is received.
                     made_progress = true;
                 }
-                Err(mpsc::TryRecvError::Empty) => {
+                Err(RecvError::Empty) => {
                     // No data available right now. Return Idle.
                     break;
                 }
-                Err(mpsc::TryRecvError::Disconnected) => {
+                Err(RecvError::Disconnected) => {
                     // Sender dropped — input is closed. Finish up.
                     self.finish();
                     return Ok(ActivationOutcome::Done);
@@ -199,7 +283,7 @@ pub struct ChannelSinkOperator<T: Timestamp, D: Send + 'static> {
     index: usize,
     region_id: RegionId,
     input_puller: Box<dyn Pull<T, D>>,
-    sender: mpsc::SyncSender<OutputEvent<T, D>>,
+    sender: OutputSend<OutputEvent<T, D>>,
     /// Buffered output event that couldn't be sent due to channel full.
     pending_send: Option<OutputEvent<T, D>>,
     input_exhausted: bool,
@@ -208,12 +292,12 @@ pub struct ChannelSinkOperator<T: Timestamp, D: Send + 'static> {
 
 impl<T: Timestamp, D: Send + 'static> ChannelSinkOperator<T, D> {
     /// Create a new channel sink operator.
-    pub fn new(
+    pub(crate) fn new(
         name: String,
         index: usize,
         region_id: RegionId,
         input_puller: Box<dyn Pull<T, D>>,
-        sender: mpsc::SyncSender<OutputEvent<T, D>>,
+        sender: OutputSend<OutputEvent<T, D>>,
     ) -> Self {
         Self {
             name,
@@ -232,11 +316,11 @@ impl<T: Timestamp, D: Send + 'static> ChannelSinkOperator<T, D> {
     fn try_send_event(&mut self, event: OutputEvent<T, D>) -> std::result::Result<bool, ()> {
         match self.sender.try_send(event) {
             Ok(()) => Ok(true),
-            Err(mpsc::TrySendError::Full(event)) => {
+            Err(SendError::Full(event)) => {
                 self.pending_send = Some(event);
                 Ok(false)
             }
-            Err(mpsc::TrySendError::Disconnected(_)) => Err(()),
+            Err(SendError::Disconnected(_)) => Err(()),
         }
     }
 }
@@ -355,6 +439,7 @@ pub struct InputSender<T: Timestamp, D: Send + 'static> {
 }
 
 impl<T: Timestamp, D: Send + 'static> InputSender<T, D> {
+    #[allow(dead_code)]
     pub(crate) fn new(sender: mpsc::SyncSender<InputEvent<T, D>>) -> Self {
         Self {
             sender,
@@ -466,6 +551,176 @@ impl<T: Timestamp, D: Send + 'static> OutputReceiver<T, D> {
     }
 }
 
+// ---------------------------------------------------------------------------
+// AsyncInputSender / AsyncOutputReceiver — async user-facing handles
+// ---------------------------------------------------------------------------
+
+/// A handle for sending data into a dataflow input port asynchronously.
+///
+/// Created by [`SpawnedDataflow::take_async_input()`] when the dataflow was
+/// spawned with [`RuntimeHandle::spawn_async()`]. Backed by a
+/// `tokio::sync::mpsc::Sender` — the `send()` method yields when the channel
+/// is full (backpressure) instead of blocking the calling thread.
+///
+/// When a `WakeHandle` is wired (set during runtime spawn), every `send()`,
+/// `advance_frontier()`, and `Drop` notifies the executor's wake handle so
+/// that a sleeping async executor wakes promptly when external data arrives.
+#[cfg(feature = "async-io")]
+#[derive(Clone)]
+pub struct AsyncInputSender<T: Timestamp, D: Send + 'static> {
+    sender: tokio::sync::mpsc::Sender<InputEvent<T, D>>,
+    wake_handle: Option<WakeHandle>,
+}
+
+#[cfg(feature = "async-io")]
+impl<T: Timestamp, D: Send + 'static> AsyncInputSender<T, D> {
+    pub(crate) fn with_wake_handle(
+        sender: tokio::sync::mpsc::Sender<InputEvent<T, D>>,
+        wake_handle: WakeHandle,
+    ) -> Self {
+        Self {
+            sender,
+            wake_handle: Some(wake_handle),
+        }
+    }
+
+    /// Send a batch of data at the given timestamp.
+    ///
+    /// Yields (returns `Poll::Pending`) if the channel is full, resuming
+    /// when capacity becomes available. This provides backpressure without
+    /// blocking an OS thread.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the dataflow has already terminated.
+    pub async fn send(&self, time: T, data: Vec<D>) -> Result<()> {
+        self.sender
+            .send(InputEvent::data(time, data))
+            .await
+            .map_err(|_| crate::error::Error::Custom("dataflow has terminated".into()))?;
+        if let Some(wh) = &self.wake_handle {
+            wh.notify();
+        }
+        Ok(())
+    }
+
+    /// Advance the input frontier past the given timestamp.
+    ///
+    /// After this call, no `send()` with `time <= frontier` should be made.
+    pub async fn advance_frontier(&self, time: T) -> Result<()> {
+        self.sender
+            .send(InputEvent::frontier(time))
+            .await
+            .map_err(|_| crate::error::Error::Custom("dataflow has terminated".into()))?;
+        if let Some(wh) = &self.wake_handle {
+            wh.notify();
+        }
+        Ok(())
+    }
+
+    /// Close this input, signaling no more data will arrive.
+    ///
+    /// Equivalent to dropping the sender.
+    pub fn close(self) {
+        // Drop self — triggers the Drop impl which notifies the wake handle.
+    }
+}
+
+#[cfg(feature = "async-io")]
+impl<T: Timestamp, D: Send + 'static> Drop for AsyncInputSender<T, D> {
+    fn drop(&mut self) {
+        if let Some(wh) = &self.wake_handle {
+            wh.notify();
+        }
+    }
+}
+
+/// A handle for receiving output from a dataflow output port asynchronously.
+///
+/// Created by [`SpawnedDataflow::take_async_output()`] when the dataflow was
+/// spawned with [`RuntimeHandle::spawn_async()`]. Backed by a
+/// `tokio::sync::mpsc::Receiver` — the `recv()` method yields when no data
+/// is available, resuming when the dataflow produces output.
+///
+/// Each successful `recv()` notifies the executor's `WakeHandle`, allowing
+/// a backpressure-blocked sink operator to retry sending.
+#[cfg(feature = "async-io")]
+pub struct AsyncOutputReceiver<T: Timestamp, D: Send + 'static> {
+    receiver: tokio::sync::mpsc::Receiver<OutputEvent<T, D>>,
+    /// Wake handle to notify when capacity is freed (unblocks backpressured sinks).
+    wake_handle: Option<WakeHandle>,
+}
+
+#[cfg(feature = "async-io")]
+impl<T: Timestamp, D: Send + 'static> AsyncOutputReceiver<T, D> {
+    pub(crate) fn new(receiver: tokio::sync::mpsc::Receiver<OutputEvent<T, D>>) -> Self {
+        Self {
+            receiver,
+            wake_handle: None,
+        }
+    }
+
+    pub(crate) fn with_wake_handle(
+        receiver: tokio::sync::mpsc::Receiver<OutputEvent<T, D>>,
+        wake_handle: WakeHandle,
+    ) -> Self {
+        Self {
+            receiver,
+            wake_handle: Some(wake_handle),
+        }
+    }
+
+    /// Receive the next output event asynchronously.
+    ///
+    /// Returns `None` when the dataflow completes and the output channel is
+    /// closed. Notifies the executor's wake handle after each successful
+    /// receive so that backpressure-blocked sinks can retry.
+    pub async fn recv(&mut self) -> Option<OutputEvent<T, D>> {
+        let result = self.receiver.recv().await;
+        if result.is_some() {
+            if let Some(wh) = &self.wake_handle {
+                wh.notify();
+            }
+        }
+        result
+    }
+
+    /// Try to receive the next output event (non-blocking).
+    pub fn try_recv(&mut self) -> Option<OutputEvent<T, D>> {
+        let result = self.receiver.try_recv().ok();
+        if result.is_some() {
+            if let Some(wh) = &self.wake_handle {
+                wh.notify();
+            }
+        }
+        result
+    }
+
+    /// Collect all output data asynchronously until the dataflow completes.
+    ///
+    /// Returns only `Data` events as `(time, data)` pairs.
+    pub async fn collect_data(&mut self) -> Vec<(T, Vec<D>)> {
+        let mut results = Vec::new();
+        while let Some(event) = self.recv().await {
+            if let OutputEvent::Data { time, data } = event {
+                results.push((time, data));
+            }
+        }
+        results
+    }
+}
+
+#[cfg(feature = "async-io")]
+impl<T: Timestamp, D: Send + 'static> Drop for AsyncOutputReceiver<T, D> {
+    fn drop(&mut self) {
+        // Notify the executor that this receiver is gone so backpressure-blocked
+        // sinks observe the closed channel promptly instead of waiting for a poll.
+        if let Some(wh) = &self.wake_handle {
+            wh.notify();
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -482,7 +737,7 @@ mod tests {
             "test_input".into(),
             0,
             RegionId::new(0),
-            rx,
+            InputRecv::Std(rx),
             Box::new(push),
             None,
             Arc::clone(&counter),
@@ -521,7 +776,7 @@ mod tests {
             "test_input".into(),
             0,
             RegionId::new(0),
-            rx,
+            InputRecv::Std(rx),
             Box::new(push),
             None,
             Arc::clone(&counter),
@@ -546,7 +801,7 @@ mod tests {
             "test_input".into(),
             0,
             RegionId::new(0),
-            rx,
+            InputRecv::Std(rx),
             Box::new(push),
             None,
             Arc::clone(&counter),
@@ -573,7 +828,7 @@ mod tests {
             0,
             RegionId::new(0),
             Box::new(pull),
-            tx,
+            OutputSend::Std(tx),
         );
 
         // Activate — should forward data and detect input exhaustion
