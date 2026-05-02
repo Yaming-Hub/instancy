@@ -91,6 +91,6 @@ fn main() {
         }
     }
 
-    handle.join().expect("dataflow completed");
+    handle.join_blocking().expect("dataflow completed");
     println!("\nPipeline completed successfully!");
 }

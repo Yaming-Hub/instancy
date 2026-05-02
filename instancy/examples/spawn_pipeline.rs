@@ -67,6 +67,6 @@ fn main() {
     }
 
     // Phase 5: Wait for completion
-    handle.join().expect("dataflow completed");
+    handle.join_blocking().expect("dataflow completed");
     println!("\nDataflow completed successfully!");
 }

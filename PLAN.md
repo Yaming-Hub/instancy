@@ -1067,12 +1067,46 @@ names but completely different responsibilities. This causes confusion.
 - Tests: iterative convergence
 
 ### PR 28 — Wire RuntimeHandle to Runtime
-**Goal**: Full runtime integration with SchedulePolicy.
+**Goal**: RuntimeHandle executes dataflows on the shared worker pool with async-first API.
+**Status**: ✅ Done
 
-- Integrate SchedulePolicy into worker dispatch
-- RuntimeHandle wraps Runtime for lifecycle management
-- DataflowHandle for completion/cancellation
-- Tests: runtime executes dataflow end-to-end
+- `RuntimeHandle::run()` — returns `DataflowCompletion` future (non-blocking)
+- `RuntimeHandle::run_blocking()` — convenience sync wrapper
+- `RuntimeHandle::spawn()` — submits dataflow to pool with channel I/O, returns `SpawnedDataflow`
+- `SpawnedDataflow::join()` — returns `DataflowCompletion` future
+- `SpawnedDataflow::join_blocking()` — convenience sync wrapper
+- `DataflowCompletion` — unified `Future<Output=Result<()>>` + `.wait()` for sync blocking
+- `CompletionNotifier` — panic-safe (Drop publishes error if result never written)
+- `Drop for SpawnedDataflow` — cancel + detach (no blocking); only cancels if `join()` wasn't called
+- `Drop for RuntimeHandle` — cancels all running dataflows before pool shutdown
+- 9 tests: basic run, spawn, shutdown, multiple dataflows, input rejection, future polling, notifier drop, wait blocking, drop-without-join
+- SchedulePolicy integration deferred — requires TaskScheduler wiring (future PR)
+
+### PR 29 — Async Executor (Planned)
+**Goal**: Make the executor sweep loop a `Future` so idle dataflows yield their thread.
+
+This is the key enabler for "multiple dataflows share threads cooperatively."
+Operators remain synchronous (`activate()` works on in-memory data), but the executor
+yields when idle instead of spinning.
+
+**Phase A — Channel waker integration:**
+- In-memory channels (`Push`/`Pull`) accept a `Waker` registration
+- When data is pushed into a channel, it wakes the registered waker
+- This replaces the current spin-based idle detection
+
+**Phase B — Executor as Future:**
+- `DataflowExecutor::run()` becomes `impl Future<Output=Result<bool>>`
+- Returns `Poll::Pending` when no operator made progress and all channels are empty
+- Woken via channel wakers when new data arrives
+- Operator `activate()` remains synchronous
+
+**Phase C — Task scheduler multiplexing:**
+- Worker pool gains ability to poll multiple executor futures per thread
+- When executor A yields (idle), its thread can poll executor B
+- `SchedulePolicy` determines which executor to poll next
+- Integrates with `RuntimeHandle`'s existing `SchedulePolicy` field
+
+**Dependency**: PR 28 (async completion API)
 
 ---
 
