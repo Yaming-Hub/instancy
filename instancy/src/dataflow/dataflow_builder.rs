@@ -1066,7 +1066,12 @@ impl<T: Timestamp> LogicalDataflow<T> {
         Ok(())
     }
 
-    /// Spawn this dataflow on a background thread with channel-based I/O.
+    /// Spawn this dataflow on a dedicated background thread with channel-based I/O.
+    ///
+    /// This is the **standalone** spawn mode — the dataflow gets its own thread
+    /// and runs an executor loop independently. For production workloads where
+    /// multiple dataflows share a thread pool, use [`RuntimeHandle::spawn()`]
+    /// instead (planned).
     ///
     /// Unlike [`run()`](Self::run) which blocks and requires all data to be pre-loaded,
     /// `spawn()` launches the dataflow on a background thread and returns a
@@ -1082,12 +1087,12 @@ impl<T: Timestamp> LogicalDataflow<T> {
     /// For each [`input()`](DataflowBuilder::input) port:
     /// - Creates a bounded `mpsc` channel
     /// - Installs a `ChannelSourceOperator` that drains the receiver into the graph
-    /// - Returns the sender half as `InputSender<T, D>` (accessed via `SpawnedDataflow::input()`)
+    /// - Returns the sender half as `InputSender<T, D>` (via [`SpawnedDataflow::take_input()`])
     ///
     /// For each [`output()`](Stream::output) port:
     /// - Replaces the `CollectingSink` factory with a `ChannelSinkOperator`
     /// - Creates a bounded `mpsc` channel for the sink to write into
-    /// - Returns the receiver half as `OutputReceiver<T, D>` (accessed via `SpawnedDataflow::output()`)
+    /// - Returns the receiver half as `OutputReceiver<T, D>` (via [`SpawnedDataflow::take_output()`])
     ///
     /// # Example
     ///
