@@ -72,14 +72,11 @@ fn main() {
     println!("Spawned {num_workers} workers\n");
 
     // --- Wire each partition to its worker's input stream ---
-    // This is where data locality is expressed: the hosting application
-    // decides which partition goes to which worker.
-    let mut senders = Vec::new();
-    let mut receivers = Vec::new();
-    for i in 0..num_workers {
-        senders.push(multi.take_input::<i32>(i, "data").unwrap());
-        receivers.push(multi.take_output::<i32>(i, "results").unwrap());
-    }
+    // Use take_all_inputs / take_all_outputs for batch convenience.
+    // These are all-or-nothing: if any worker is missing the port, all
+    // fail without partial consumption.
+    let senders = multi.take_all_inputs::<i32>("data").unwrap();
+    let receivers = multi.take_all_outputs::<i32>("results").unwrap();
 
     println!("Feeding partitioned data:");
     for (i, partition) in partitions.into_iter().enumerate() {

@@ -1427,6 +1427,155 @@ impl<T: Timestamp> MultiSpawnedDataflow<T> {
         self.workers[worker_idx].take_async_output(name)
     }
 
+    // -- Batch convenience APIs -------------------------------------------
+
+    /// Take input senders from **all** workers for the named port.
+    ///
+    /// Returns a `Vec` of length `num_workers`, where element `i` is the
+    /// `InputSender` for worker `i`. This is an all-or-nothing operation:
+    /// if any worker is missing the port or the type doesn't match, no
+    /// senders are consumed and an error is returned.
+    ///
+    /// # Example
+    ///
+    /// ```rust,no_run
+    /// use instancy::dataflow::DataflowBuilder;
+    /// use instancy::runtime::SimpleRuntime;
+    /// let rt = SimpleRuntime::new();
+    /// let mut multi = rt.spawn_multi("ex", 4, |_, b: &mut DataflowBuilder<u64>| {
+    ///     b.input::<i32>("data").output("out"); Ok(())
+    /// }).unwrap();
+    /// let senders = multi.take_all_inputs::<i32>("data").unwrap();
+    /// assert_eq!(senders.len(), 4);
+    /// ```
+    pub fn take_all_inputs<D: Clone + Send + 'static>(
+        &mut self,
+        name: &str,
+    ) -> Result<Vec<crate::dataflow::channel_operators::InputSender<T, D>>> {
+        let type_name = std::any::type_name::<D>();
+        // Pre-validate: every worker must have this port with the right type.
+        for (idx, w) in self.workers.iter().enumerate() {
+            Self::validate_input_port(w, idx, name, type_name)?;
+        }
+        // All validated — consume from each worker (infallible after validation).
+        let mut senders = Vec::with_capacity(self.num_workers);
+        for w in &mut self.workers {
+            senders.push(w.take_input::<D>(name).expect(
+                "take_all_inputs: pre-validated port disappeared",
+            ));
+        }
+        Ok(senders)
+    }
+
+    /// Take output receivers from **all** workers for the named port.
+    ///
+    /// Returns a `Vec` of length `num_workers`. All-or-nothing semantics
+    /// (see [`take_all_inputs`](Self::take_all_inputs)).
+    pub fn take_all_outputs<D: Send + 'static>(
+        &mut self,
+        name: &str,
+    ) -> Result<Vec<crate::dataflow::channel_operators::OutputReceiver<T, D>>> {
+        let type_name = std::any::type_name::<D>();
+        for (idx, w) in self.workers.iter().enumerate() {
+            Self::validate_output_port(w, idx, name, type_name)?;
+        }
+        let mut receivers = Vec::with_capacity(self.num_workers);
+        for w in &mut self.workers {
+            receivers.push(w.take_output::<D>(name).expect(
+                "take_all_outputs: pre-validated port disappeared",
+            ));
+        }
+        Ok(receivers)
+    }
+
+    /// Take async input senders from **all** workers for the named port.
+    ///
+    /// Only works when the dataflow was spawned with async channels.
+    /// All-or-nothing semantics (see [`take_all_inputs`](Self::take_all_inputs)).
+    #[cfg(feature = "async-io")]
+    pub fn take_all_async_inputs<D: Clone + Send + 'static>(
+        &mut self,
+        name: &str,
+    ) -> Result<Vec<crate::dataflow::channel_operators::AsyncInputSender<T, D>>> {
+        let type_name = std::any::type_name::<D>();
+        for (idx, w) in self.workers.iter().enumerate() {
+            Self::validate_input_port(w, idx, name, type_name)?;
+        }
+        let mut senders = Vec::with_capacity(self.num_workers);
+        for w in &mut self.workers {
+            senders.push(w.take_async_input::<D>(name).expect(
+                "take_all_async_inputs: pre-validated port disappeared",
+            ));
+        }
+        Ok(senders)
+    }
+
+    /// Take async output receivers from **all** workers for the named port.
+    ///
+    /// Only works when the dataflow was spawned with async channels.
+    /// All-or-nothing semantics (see [`take_all_inputs`](Self::take_all_inputs)).
+    #[cfg(feature = "async-io")]
+    pub fn take_all_async_outputs<D: Send + 'static>(
+        &mut self,
+        name: &str,
+    ) -> Result<Vec<crate::dataflow::channel_operators::AsyncOutputReceiver<T, D>>> {
+        let type_name = std::any::type_name::<D>();
+        for (idx, w) in self.workers.iter().enumerate() {
+            Self::validate_output_port(w, idx, name, type_name)?;
+        }
+        let mut receivers = Vec::with_capacity(self.num_workers);
+        for w in &mut self.workers {
+            receivers.push(w.take_async_output::<D>(name).expect(
+                "take_all_async_outputs: pre-validated port disappeared",
+            ));
+        }
+        Ok(receivers)
+    }
+
+    // -- Validation helpers ------------------------------------------------
+
+    /// Check that a worker has an input port with the given name and type,
+    /// without consuming it.
+    fn validate_input_port(
+        worker: &SpawnedDataflow<T>,
+        worker_idx: usize,
+        name: &str,
+        type_name: &str,
+    ) -> Result<()> {
+        match worker.input_senders.iter().find(|(n, _, _)| n == name) {
+            None => Err(Error::Custom(format!(
+                "worker {worker_idx} has no input port named '{name}'"
+            ))),
+            Some((_, port_type, _)) if *port_type != type_name => Err(Error::Custom(
+                format!(
+                    "worker {worker_idx} input port '{name}' has type {port_type}, but requested {type_name}"
+                ),
+            )),
+            _ => Ok(()),
+        }
+    }
+
+    /// Check that a worker has an output port with the given name and type,
+    /// without consuming it.
+    fn validate_output_port(
+        worker: &SpawnedDataflow<T>,
+        worker_idx: usize,
+        name: &str,
+        type_name: &str,
+    ) -> Result<()> {
+        match worker.output_receivers.iter().find(|(n, _, _)| n == name) {
+            None => Err(Error::Custom(format!(
+                "worker {worker_idx} has no output port named '{name}'"
+            ))),
+            Some((_, port_type, _)) if *port_type != type_name => Err(Error::Custom(
+                format!(
+                    "worker {worker_idx} output port '{name}' has type {port_type}, but requested {type_name}"
+                ),
+            )),
+            _ => Ok(()),
+        }
+    }
+
     /// Cancel all workers.
     ///
     /// Each worker's cancellation token is signalled. The executors will stop
@@ -2350,5 +2499,179 @@ mod tests {
 
         multi.cancel();
         let _ = multi.join_blocking();
+    }
+
+    // -- take_all_* tests --------------------------------------------------
+
+    #[test]
+    fn take_all_inputs_returns_all_senders() {
+        let rt = SimpleRuntime::new();
+        let n = 3;
+        let mut multi = rt
+            .spawn_multi("all-in", n, |_, builder: &mut DataflowBuilder<u64>| {
+                let input = builder.input::<i32>("data");
+                input.output("out");
+                Ok(())
+            })
+            .unwrap();
+
+        let senders = multi.take_all_inputs::<i32>("data").unwrap();
+        assert_eq!(senders.len(), n);
+
+        // Send distinct data to each worker.
+        for (i, s) in senders.iter().enumerate() {
+            s.send(0, vec![i as i32 * 10]).unwrap();
+        }
+        drop(senders);
+
+        // Collect per-worker outputs.
+        for i in 0..n {
+            let out = multi.take_output::<i32>(i, "out").unwrap();
+            let data: Vec<i32> = out.collect_data().into_iter().flat_map(|(_, d)| d).collect();
+            assert_eq!(data, vec![i as i32 * 10]);
+        }
+
+        multi.join_blocking().unwrap();
+    }
+
+    #[test]
+    fn take_all_outputs_returns_all_receivers() {
+        let rt = SimpleRuntime::new();
+        let n = 4;
+        let mut multi = rt
+            .spawn_multi("all-out", n, |_, builder: &mut DataflowBuilder<u64>| {
+                let input = builder.input::<i32>("nums");
+                input.map("double", |_t, x| x * 2).output("results");
+                Ok(())
+            })
+            .unwrap();
+
+        let senders = multi.take_all_inputs::<i32>("nums").unwrap();
+        let receivers = multi.take_all_outputs::<i32>("results").unwrap();
+        assert_eq!(receivers.len(), n);
+
+        for (i, s) in senders.iter().enumerate() {
+            s.send(0, vec![i as i32 + 1]).unwrap();
+        }
+        drop(senders);
+
+        for (i, r) in receivers.iter().enumerate() {
+            let data: Vec<i32> = r.collect_data().into_iter().flat_map(|(_, d)| d).collect();
+            assert_eq!(data, vec![(i as i32 + 1) * 2]);
+        }
+
+        multi.join_blocking().unwrap();
+    }
+
+    #[test]
+    fn take_all_inputs_wrong_type_fails_without_consuming() {
+        let rt = SimpleRuntime::new();
+        let mut multi = rt
+            .spawn_multi("type-err", 2, |_, builder: &mut DataflowBuilder<u64>| {
+                let input = builder.input::<i32>("data");
+                input.output("out");
+                Ok(())
+            })
+            .unwrap();
+
+        // Wrong type — should fail.
+        assert!(multi.take_all_inputs::<String>("data").is_err());
+
+        // Original ports are still available (no partial consumption).
+        let senders = multi.take_all_inputs::<i32>("data").unwrap();
+        assert_eq!(senders.len(), 2);
+        drop(senders);
+
+        multi.cancel();
+        let _ = multi.join_blocking();
+    }
+
+    #[test]
+    fn take_all_outputs_missing_port_fails_without_consuming() {
+        let rt = SimpleRuntime::new();
+        let mut multi = rt
+            .spawn_multi("missing", 2, |_, builder: &mut DataflowBuilder<u64>| {
+                let input = builder.input::<i32>("data");
+                input.output("out");
+                Ok(())
+            })
+            .unwrap();
+
+        // Port doesn't exist.
+        assert!(multi.take_all_outputs::<i32>("nonexistent").is_err());
+
+        // Original ports are still available.
+        let receivers = multi.take_all_outputs::<i32>("out").unwrap();
+        assert_eq!(receivers.len(), 2);
+        drop(receivers);
+
+        multi.cancel();
+        let _ = multi.join_blocking();
+    }
+
+    #[test]
+    fn take_all_inputs_idempotence_fails_after_consumed() {
+        let rt = SimpleRuntime::new();
+        let mut multi = rt
+            .spawn_multi("idem", 2, |_, builder: &mut DataflowBuilder<u64>| {
+                let input = builder.input::<i32>("data");
+                input.output("out");
+                Ok(())
+            })
+            .unwrap();
+
+        let senders = multi.take_all_inputs::<i32>("data").unwrap();
+        assert_eq!(senders.len(), 2);
+
+        // Second call should fail — ports already consumed.
+        assert!(multi.take_all_inputs::<i32>("data").is_err());
+
+        drop(senders);
+        multi.cancel();
+        let _ = multi.join_blocking();
+    }
+
+    #[test]
+    fn take_all_end_to_end_partitioned_pipeline() {
+        let rt = SimpleRuntime::new();
+        let n = 4;
+        let mut multi = rt
+            .spawn_multi("e2e", n, |_, builder: &mut DataflowBuilder<u64>| {
+                let input = builder.input::<String>("words");
+                input
+                    .map("upper", |_t, s: String| s.to_uppercase())
+                    .output("results");
+                Ok(())
+            })
+            .unwrap();
+
+        let senders = multi.take_all_inputs::<String>("words").unwrap();
+        let receivers = multi.take_all_outputs::<String>("results").unwrap();
+
+        let partitions = vec![
+            vec!["hello".to_string()],
+            vec!["world".to_string()],
+            vec!["foo".to_string(), "bar".to_string()],
+            vec![],
+        ];
+
+        for (i, partition) in partitions.iter().enumerate() {
+            if !partition.is_empty() {
+                senders[i].send(0, partition.clone()).unwrap();
+            }
+        }
+        drop(senders);
+
+        let results: Vec<Vec<String>> = receivers
+            .iter()
+            .map(|r| r.collect_data().into_iter().flat_map(|(_, d)| d).collect())
+            .collect();
+
+        assert_eq!(results[0], vec!["HELLO"]);
+        assert_eq!(results[1], vec!["WORLD"]);
+        assert_eq!(results[2], vec!["FOO", "BAR"]);
+        assert!(results[3].is_empty());
+
+        multi.join_blocking().unwrap();
     }
 }
