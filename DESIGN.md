@@ -514,8 +514,36 @@ a waker and returns `Pending`.
 2. **Executor as Future** — `poll_run()` runs sweeps until idle, then registers
    a waker via the `WakeHandle`. Uses a race-safe protocol: register waker →
    re-check for notifications → only return `Pending` if no notification pending.
-3. **Task scheduler multiplexing** (planned) — the worker pool gains a task
-   scheduler that can poll multiple executor futures on the same thread.
+3. **Task scheduler multiplexing** — the worker pool's `ExecutorRegistry` polls
+   multiple executor futures on the same thread with per-task CAS-based state
+   machine (IDLE→QUEUED→POLLING→DONE) and `PoolWaker` for async re-enqueue.
+
+**Async public API (Phase 3 — planned):** `RuntimeHandle::spawn()` and `run()`
+become `async fn`, making the API natural for callers already in an async runtime.
+Since most production applications use async I/O, the hosting app will typically
+run inside tokio or similar, and async spawn integrates cleanly:
+
+```rust
+// Phase 3 API (planned)
+let mut handle = rt.spawn(dataflow).await?;
+let sender = handle.take_input::<i32>("data")?;
+sender.send(0, vec![1, 2, 3])?;
+sender.close();
+handle.join().await?;
+
+// Multiple concurrent dataflows
+let (r1, r2) = tokio::join!(
+    rt.run(dataflow_a),
+    rt.run(dataflow_b),
+);
+```
+
+Currently spawn/run are synchronous (graph construction + channel wiring is CPU-only),
+but the async signature future-proofs for cases where materialization involves async
+work (e.g., network connection setup for distributed dataflows, async resource
+allocation). Sync convenience methods (`run_blocking()`) remain available.
+Implementation: extract current sync logic into private `spawn_sync()`/`run_sync()`,
+public `async fn` wraps them, `run_blocking()` calls `run_sync()` directly.
 
 This is the key enabler for "multiple dataflows share threads cooperatively" — the
 original design goal. Operators remain synchronous (`activate()` works on in-memory
