@@ -24,6 +24,86 @@ All generic type parameters must follow these codebase-wide conventions for cons
 
 ---
 
+## Conceptual Architecture: Three Layers of a Dataflow
+
+instancy separates concerns into three distinct conceptual layers. Understanding these
+layers is essential for navigating the codebase and knowing where new code belongs.
+
+### Layer 1 — Dataflow Graph (Abstract Topology)
+
+The pure logical structure of a computation. Operators are vertices, edges describe
+data flow between them. This layer knows about **scopes**, **regions**, **port
+connectivity**, and **progress tracking** — but has no knowledge of data types.
+
+| Concept | Description | Location |
+|---|---|---|
+| Operator | A vertex with typed input/output ports | `progress/operate.rs` |
+| PortConnectivity | Which inputs connect to which outputs (with path summaries) | `progress/operate.rs` |
+| Scope | A context that manages a set of operators and tracks progress | `dataflow/scope.rs` |
+| Region | A scheduling unit grouping operators for concurrent execution | `dataflow/region.rs` |
+| Reachability | Progress tracking across the operator graph | `progress/reachability.rs` |
+
+**Lifetime**: Persists from construction through execution. Drives the progress
+protocol and scheduling decisions at runtime.
+
+### Layer 2 — Typed Stream Graph (Data-Bound Topology)
+
+Binds the abstract graph with concrete data types and routing strategies. Describes
+*what data flows where* — which operator output produces type `D`, which input
+consumes it, and how data is partitioned across targets.
+
+| Concept | Description | Location |
+|---|---|---|
+| `StreamEdge<S, D>` | A typed edge from an operator's output slot, carrying data `D` within scope `S` | `dataflow/stream.rs` |
+| `StreamConnection<D>` | Full wiring: source slot → target slot with partition strategy | `dataflow/stream.rs` |
+| `StreamTarget` | A target slot with its routing strategy name | `dataflow/stream.rs` |
+
+**Lifetime**: Created during graph construction, stored in `LogicalDataflow`, consumed
+during materialization to create physical channels.
+
+### Layer 3 — Pipe (Construction Plumbing)
+
+A transient, builder-time handle used to construct the dataflow via fluent method
+chaining. A `Pipe` holds a shared reference to the builder's internal state and
+represents "an operator's output that you can attach more processing to."
+
+| Concept | Description | Location |
+|---|---|---|
+| `Pipe<T, D>` | Fluent handle: `.map()`, `.filter()`, `.binary()`, `.output()` | `dataflow/dataflow_builder.rs` |
+| `DataflowBuilder<T>` | Allocates operators, records edges, produces `LogicalDataflow<T>` | `dataflow/dataflow_builder.rs` |
+| `OutputPort<T, D>` | Terminal handle from `.output()`, provides result collector | `dataflow/dataflow_builder.rs` |
+
+**Lifetime**: Ephemeral — exists only during `DataflowBuilder` construction.
+Consumed by `.build()` which produces the `LogicalDataflow`. Pipes do not exist
+at runtime.
+
+### How the Layers Relate
+
+```
+  Construction time                    Runtime
+  ────────────────                     ───────
+
+  Pipe<T, D>          ──.build()──►  LogicalDataflow<T>  ──materialize()──►  Executor
+  (Layer 3)                           ├─ Dataflow Graph    (Layer 1)          (physical)
+  fluent chaining                     │  operators, scopes, regions
+  records into ──►                    └─ Typed Stream Graph (Layer 2)
+  BuilderState                           StreamEdges, StreamConnections
+                                         channel factories
+```
+
+1. **You use Pipes** (Layer 3) to plumb together operators via chaining
+2. **The builder records StreamEdges/Connections** (Layer 2) as the typed wiring
+3. **Underneath sits the Dataflow Graph** (Layer 1) — abstract topology that drives
+   progress tracking and scheduling
+4. **Materialization** turns the logical graph into physical channels and schedulable
+   operators for the runtime
+
+This separation ensures that graph construction (Pipe), typed data routing
+(StreamEdge), and progress/scheduling (Dataflow Graph) remain independently
+testable and evolvable.
+
+---
+
 ## PR 1 — Workspace scaffold + core types
 **Goal**: Establish workspace structure, error types, `PartialOrder`, `Timestamp`, `PathSummary`.
 
