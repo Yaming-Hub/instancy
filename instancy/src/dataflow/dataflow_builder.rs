@@ -34,13 +34,13 @@ use std::marker::PhantomData;
 use std::rc::Rc;
 use std::sync::{Arc, Mutex};
 
-use crate::cancellation::CancellationToken;
 use crate::dataflow::channels::bounded::bounded_channel;
 use crate::dataflow::channels::pushpull::{Pull, Push};
 use crate::dataflow::channels::tee::tee_or_single;
-use crate::dataflow::executor::{DataflowExecutor, ExecutorConfig};
 use crate::dataflow::graph::DataflowGraph;
 use crate::dataflow::operators::handles::{InputHandle, OutputHandle};
+use crate::dataflow::operators::input::InputEvent;
+use crate::dataflow::operators::output::OutputEvent;
 use crate::dataflow::probe::ProbeHandle;
 use crate::dataflow::region::RegionId;
 use crate::dataflow::schedulable::{
@@ -60,27 +60,26 @@ use crate::progress::timestamp::Timestamp;
 // ---------------------------------------------------------------------------
 
 /// Metadata for a named input port in the logical dataflow.
-#[derive(Debug, Clone)]
-#[allow(dead_code)] // Fields used in Phase C (async runtime integration)
-struct InputPortInfo {
+#[derive(Clone)]
+pub(crate) struct InputPortInfo {
     /// User-visible name of this input.
-    name: String,
+    pub(crate) name: String,
     /// The source operator index that this input feeds into.
-    operator_index: usize,
+    pub(crate) operator_index: usize,
     /// TypeId of the data type for runtime validation.
-    type_name: &'static str,
+    pub(crate) type_name: &'static str,
 }
 
 /// Metadata for a named output port in the logical dataflow.
 #[derive(Debug, Clone)]
 #[allow(dead_code)] // Fields used in Phase C (async runtime integration)
-struct OutputPortInfo {
+pub(crate) struct OutputPortInfo {
     /// User-visible name of this output.
-    name: String,
+    pub(crate) name: String,
     /// The sink operator index that collects output.
-    operator_index: usize,
+    pub(crate) operator_index: usize,
     /// TypeId of the data type for runtime validation.
-    type_name: &'static str,
+    pub(crate) type_name: &'static str,
 }
 
 // ---------------------------------------------------------------------------
@@ -95,11 +94,39 @@ struct BuilderState<T: Timestamp> {
     channel_factories: Vec<(usize, ChannelFactory)>,
     input_ports: Vec<InputPortInfo>,
     output_ports: Vec<OutputPortInfo>,
+    /// Type-erased closures that create ChannelSourceOperator + InputSender
+    /// for each input() port during spawn(). Each closure captures the
+    /// concrete data type D and creates the appropriate channel pair.
+    input_port_wiring: Vec<InputPortWiring>,
+    /// Type-erased closures that create ChannelSinkOperator + OutputReceiver
+    /// for each output() port during spawn(). Each closure creates a
+    /// replacement OperatorFactory that sends data out via mpsc channel.
+    output_port_wiring: Vec<OutputPortWiring>,
     probes: Vec<(usize, ProbeHandle<T>)>,
     next_operator_index: usize,
     next_collect_index: usize,
     channel_capacity: usize,
 }
+
+/// Type-erased closure for wiring an input port during spawn().
+/// Captures the data type D and creates:
+/// - An OperatorFactory for the ChannelSourceOperator
+/// - An InputSender (as Box<dyn Any + Send>) for the caller
+pub(crate) type InputPortWiring = Box<
+    dyn FnOnce(
+            std::sync::Arc<std::sync::atomic::AtomicUsize>, // external_inputs_open counter
+        ) -> (OperatorFactory, Box<dyn std::any::Any + Send>) // (factory, InputSender)
+        + Send,
+>;
+
+/// Type-erased closure for wiring an output port during spawn().
+/// Returns:
+/// - An OperatorFactory for the ChannelSinkOperator (replaces CollectingSink)
+/// - An OutputReceiver (as Box<dyn Any + Send>) for the caller
+pub(crate) type OutputPortWiring = Box<
+    dyn FnOnce() -> (OperatorFactory, Box<dyn std::any::Any + Send>) // (factory, OutputReceiver)
+        + Send,
+>;
 
 impl<T: Timestamp> BuilderState<T> {
     fn allocate_operator_index(&mut self) -> usize {
@@ -160,6 +187,8 @@ impl<T: Timestamp> DataflowBuilder<T> {
                 channel_factories: Vec::new(),
                 input_ports: Vec::new(),
                 output_ports: Vec::new(),
+                input_port_wiring: Vec::new(),
+                output_port_wiring: Vec::new(),
                 probes: Vec::new(),
                 next_operator_index: 1,
                 next_collect_index: 0,
@@ -220,9 +249,53 @@ impl<T: Timestamp> DataflowBuilder<T> {
                 type_name: std::any::type_name::<D>(),
             });
 
-            // Create operator factory — at materialization time this will be
-            // connected to the async input channel provided by the runtime.
-            // For now (Phase A/B), we support pre-loaded data via `build_with_data`.
+            // Store a type-erased wiring closure that will be invoked during
+            // spawn() to create the ChannelSourceOperator factory and InputSender.
+            // The closure captures the concrete data type D.
+            let wiring_name = name.clone();
+            let wiring: InputPortWiring = Box::new(move |external_inputs_open| {
+                use crate::dataflow::channel_operators::InputSender;
+                use crate::dataflow::channel_operators::ChannelSourceOperator;
+                use crate::dataflow::channels::tee::tee_or_single;
+
+                // Create bounded channel for external → dataflow communication
+                let (tx, rx) = std::sync::mpsc::sync_channel::<InputEvent<T, D>>(256);
+                let sender = InputSender::new(tx);
+
+                // The factory closure captures the receiver and wires it to
+                // the output pusher provided during materialization.
+                let ext_counter = Arc::clone(&external_inputs_open);
+                let factory_name = wiring_name.clone();
+                let factory: OperatorFactory = Box::new(move |endpoints| {
+                    // Source operator: 0 inputs, 1 output (may have fan-out)
+                    let output_pusher: Box<dyn Push<T, D>> = {
+                        let pushers: Vec<Box<dyn Push<T, D>>> = endpoints
+                            .output_pushers
+                            .into_iter()
+                            .map(|any_box| {
+                                *any_box
+                                    .downcast::<Box<dyn Push<T, D>>>()
+                                    .expect("channel source output pusher type mismatch")
+                            })
+                            .collect();
+                        tee_or_single(pushers).unwrap_or_else(|| Box::new(NullPush))
+                    };
+                    let op = ChannelSourceOperator::new(
+                        factory_name,
+                        op_idx,
+                        RegionId::new(0),
+                        rx,
+                        output_pusher,
+                        None, // progress reporter wired separately
+                        ext_counter,
+                    );
+                    Box::new(op) as Box<dyn SchedulableOperator>
+                });
+
+                let sender_any: Box<dyn std::any::Any + Send> = Box::new(sender);
+                (factory, sender_any)
+            });
+            state.input_port_wiring.push(wiring);
         }
 
         Stream {
@@ -344,6 +417,8 @@ impl<T: Timestamp> DataflowBuilder<T> {
             channel_factories: state.channel_factories,
             input_ports: state.input_ports,
             output_ports: state.output_ports,
+            input_port_wiring: state.input_port_wiring,
+            output_port_wiring: state.output_port_wiring,
             probes: state.probes,
         })
     }
@@ -517,7 +592,7 @@ impl<T: Timestamp, D: Clone + Send + 'static> Stream<T, D> {
                 type_name: std::any::type_name::<D>(),
             });
 
-            // Operator factory: collecting sink
+            // Operator factory: collecting sink (used by run(), replaced by spawn())
             let collector_clone = Arc::clone(&collector);
             let name_clone = name.clone();
             let factory: OperatorFactory = Box::new(move |endpoints: ChannelEndpoints| {
@@ -538,6 +613,39 @@ impl<T: Timestamp, D: Clone + Send + 'static> Stream<T, D> {
                 )) as Box<dyn SchedulableOperator>
             });
             state.operator_factories.push((op_idx, factory));
+
+            // Store a wiring closure that creates a ChannelSinkOperator
+            // replacement factory during spawn(). This replaces the
+            // CollectingSink factory above with one that sends data out.
+            let sink_name = name.clone();
+            let wiring: OutputPortWiring = Box::new(move || {
+                use crate::dataflow::channel_operators::{ChannelSinkOperator, OutputReceiver};
+
+                let (tx, rx) = std::sync::mpsc::sync_channel::<OutputEvent<T, D>>(256);
+                let receiver = OutputReceiver::new(rx);
+
+                let factory: OperatorFactory = Box::new(move |endpoints: ChannelEndpoints| {
+                    let input_puller: Box<dyn Pull<T, D>> = *endpoints
+                        .input_pullers
+                        .into_iter()
+                        .next()
+                        .expect("sink must have input puller")
+                        .downcast::<Box<dyn Pull<T, D>>>()
+                        .expect("sink input puller type mismatch");
+
+                    Box::new(ChannelSinkOperator::new(
+                        sink_name,
+                        op_idx,
+                        RegionId::new(0),
+                        input_puller,
+                        tx,
+                    )) as Box<dyn SchedulableOperator>
+                });
+
+                let receiver_any: Box<dyn std::any::Any + Send> = Box::new(receiver);
+                (factory, receiver_any)
+            });
+            state.output_port_wiring.push(wiring);
 
             // Channel factory for the input edge
             let edge_idx = state.graph.edges().len() - 1;
@@ -851,18 +959,27 @@ impl<T: Timestamp, D: Send + 'static> OutputPort<T, D> {
 /// graph topology, operator factories, and channel factories — everything needed
 /// to materialize a physical executor.
 ///
-/// `LogicalDataflow` is `Send` and can be submitted to an async runtime on
-/// another thread. It is **single-use** — each materialization consumes the
-/// factories (which may contain `FnOnce` closures).
+/// `LogicalDataflow` is `Send` and can be submitted to any runtime for
+/// physical materialization and execution. It is **single-use** — each
+/// materialization consumes the factories (which may contain `FnOnce` closures).
+///
+/// `LogicalDataflow` is a purely logical artifact — it knows nothing about
+/// threads, channels, or execution strategy. All physical execution goes
+/// through a runtime:
+///
+/// - [`SimpleRuntime`](crate::runtime::SimpleRuntime) — single-thread, for tests and simple scripts
+/// - [`RuntimeHandle`](crate::runtime::RuntimeHandle) — shared worker pool, for production
 pub struct LogicalDataflow<T: Timestamp> {
-    name: String,
-    graph: DataflowGraph,
-    subgraph_builder: SubgraphBuilder<T>,
-    operator_factories: Vec<(usize, OperatorFactory)>,
-    channel_factories: Vec<(usize, ChannelFactory)>,
-    input_ports: Vec<InputPortInfo>,
-    output_ports: Vec<OutputPortInfo>,
-    probes: Vec<(usize, ProbeHandle<T>)>,
+    pub(crate) name: String,
+    pub(crate) graph: DataflowGraph,
+    pub(crate) subgraph_builder: SubgraphBuilder<T>,
+    pub(crate) operator_factories: Vec<(usize, OperatorFactory)>,
+    pub(crate) channel_factories: Vec<(usize, ChannelFactory)>,
+    pub(crate) input_ports: Vec<InputPortInfo>,
+    pub(crate) output_ports: Vec<OutputPortInfo>,
+    pub(crate) input_port_wiring: Vec<InputPortWiring>,
+    pub(crate) output_port_wiring: Vec<OutputPortWiring>,
+    pub(crate) probes: Vec<(usize, ProbeHandle<T>)>,
 }
 
 impl<T: Timestamp> LogicalDataflow<T> {
@@ -891,67 +1008,12 @@ impl<T: Timestamp> LogicalDataflow<T> {
         self.output_ports.iter().map(|p| p.name.as_str()).collect()
     }
 
-    /// Materialize and run the dataflow to completion (blocking).
+    /// Returns true if this dataflow has declared input ports.
     ///
-    /// This is a convenience method for testing with pre-loaded sources.
-    /// Dataflows using `input()` ports require async runtime (Phase C).
-    ///
-    /// # Errors
-    ///
-    /// Returns `Error::Custom` if the dataflow has declared input ports
-    /// (use `Runtime::spawn()` instead for runtime-fed inputs).
-    pub fn run(self) -> Result<()> {
-        self.run_with_cancel(CancellationToken::new())
-    }
-
-    /// Materialize and run with a cancellation token (blocking).
-    pub fn run_with_cancel(self, cancel: CancellationToken) -> Result<()> {
-        if !self.input_ports.is_empty() {
-            return Err(Error::Custom(
-                "cannot run() a dataflow with declared input ports — \
-                 input ports require async runtime (Runtime::spawn). \
-                 Use builder.source() for pre-loaded data instead."
-                    .into(),
-            ));
-        }
-
-        if self.operator_factories.is_empty() {
-            return Ok(());
-        }
-
-        let executor_config = ExecutorConfig {
-            max_activations_per_step: 1024,
-            max_idle_sweeps: 64,
-        };
-
-        // Materialize: converts logical graph into physical executor
-        let mut executor: DataflowExecutor<T> = DataflowExecutor::materialize(
-            &self.graph,
-            self.operator_factories,
-            self.channel_factories,
-            executor_config,
-            cancel,
-        )?;
-
-        // Build and attach progress tracker
-        let mut tracker = self.subgraph_builder.build();
-        tracker.initialize();
-        executor.set_progress_tracker(tracker);
-
-        // Register probes
-        for (op_idx, probe) in self.probes {
-            executor.register_probe(op_idx, probe);
-        }
-
-        // Run to completion
-        let completed = executor.run()?;
-        if !completed {
-            return Err(Error::Custom(
-                "dataflow did not complete (quiescence without termination)".into(),
-            ));
-        }
-
-        Ok(())
+    /// Dataflows with input ports require `spawn()` on a runtime;
+    /// they cannot be run with `SimpleRuntime::run()`.
+    pub fn has_input_ports(&self) -> bool {
+        !self.input_ports.is_empty()
     }
 }
 
@@ -1080,6 +1142,12 @@ impl<T: Timestamp, D: Send + 'static> Push<T, D> for NullPush {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::cancellation::CancellationToken;
+    use crate::runtime::SimpleRuntime;
+
+    fn rt() -> SimpleRuntime {
+        SimpleRuntime::new()
+    }
 
     #[test]
     fn test_empty_builder() {
@@ -1087,7 +1155,7 @@ mod tests {
         assert_eq!(builder.operator_count(), 0);
         let dataflow = builder.build().unwrap();
         assert_eq!(dataflow.operator_count(), 0);
-        dataflow.run().unwrap();
+        rt().run(dataflow).unwrap();
     }
 
     #[test]
@@ -1096,7 +1164,7 @@ mod tests {
         let stream = builder.source("nums", vec![(0u64, vec![1i32, 2, 3])]);
         let port = stream.output("results");
         let dataflow = builder.build().unwrap();
-        dataflow.run().unwrap();
+        rt().run(dataflow).unwrap();
 
         let collector = port.collector();
         let results = collector.lock().unwrap();
@@ -1111,7 +1179,7 @@ mod tests {
         let doubled = stream.map("double", |_t, x| x * 2);
         let port = doubled.output("results");
         let dataflow = builder.build().unwrap();
-        dataflow.run().unwrap();
+        rt().run(dataflow).unwrap();
 
         let collector = port.collector();
         let results = collector.lock().unwrap();
@@ -1126,7 +1194,7 @@ mod tests {
         let evens = stream.filter("evens", |_t, x| x % 2 == 0);
         let port = evens.output("results");
         let dataflow = builder.build().unwrap();
-        dataflow.run().unwrap();
+        rt().run(dataflow).unwrap();
 
         let collector = port.collector();
         let results = collector.lock().unwrap();
@@ -1143,7 +1211,7 @@ mod tests {
             .map("to_string", |_t, x| format!("{x}"))
             .output("results");
         let dataflow = builder.build().unwrap();
-        dataflow.run().unwrap();
+        rt().run(dataflow).unwrap();
 
         let collector = port.collector();
         let results = collector.lock().unwrap();
@@ -1161,7 +1229,7 @@ mod tests {
             })
             .output("words");
         let dataflow = builder.build().unwrap();
-        dataflow.run().unwrap();
+        rt().run(dataflow).unwrap();
 
         let collector = port.collector();
         let results = collector.lock().unwrap();
@@ -1176,8 +1244,6 @@ mod tests {
 
     #[test]
     fn test_branching_fan_out() {
-        // Fan-out: one source → two downstream branches via Stream::clone()
-        // Uses TeePush to distribute data to both branches
         let builder = DataflowBuilder::<u64>::new("branch_test");
         let stream = builder.source("nums", vec![(0u64, vec![1i32, 2, 3, 4, 5, 6])]);
 
@@ -1190,7 +1256,7 @@ mod tests {
             .output("odds");
 
         let dataflow = builder.build().unwrap();
-        dataflow.run().unwrap();
+        rt().run(dataflow).unwrap();
 
         let evens_c = evens_port.collector();
         let evens = evens_c.lock().unwrap();
@@ -1203,7 +1269,6 @@ mod tests {
 
     #[test]
     fn test_multiple_inputs() {
-        // Two independent sources feeding separate pipelines
         let builder = DataflowBuilder::<u64>::new("multi_input");
         let a = builder.source("a", vec![(0u64, vec![10i32, 20])]);
         let b = builder.source("b", vec![(0u64, vec![100i32, 200])]);
@@ -1212,7 +1277,7 @@ mod tests {
         let port_b = b.map("inc_b", |_t, x| x + 1).output("out_b");
 
         let dataflow = builder.build().unwrap();
-        dataflow.run().unwrap();
+        rt().run(dataflow).unwrap();
 
         let collector_ra = port_a.collector();
         let ra = collector_ra.lock().unwrap();
@@ -1231,7 +1296,7 @@ mod tests {
             .map("to_string", |_t, x| format!("{x:.1}"))
             .output("results");
         let dataflow = builder.build().unwrap();
-        dataflow.run().unwrap();
+        rt().run(dataflow).unwrap();
 
         let collector = port.collector();
         let results = collector.lock().unwrap();
@@ -1246,11 +1311,10 @@ mod tests {
             .map("double", |_t, x| x * 2)
             .output("results");
         let dataflow = builder.build().unwrap();
-        dataflow.run().unwrap();
+        rt().run(dataflow).unwrap();
 
         let collector = port.collector();
         let results = collector.lock().unwrap();
-        // Empty batch produces no output (filtered by !result.is_empty())
         assert!(results.is_empty() || results[0].1.is_empty());
     }
 
@@ -1269,7 +1333,7 @@ mod tests {
             .map("double", |_t, x| x * 2)
             .output("results");
         let dataflow = builder.build().unwrap();
-        dataflow.run().unwrap();
+        rt().run(dataflow).unwrap();
 
         let collector = port.collector();
         let results = collector.lock().unwrap();
@@ -1286,7 +1350,7 @@ mod tests {
             .source("nums", vec![(0u64, vec![42i32])])
             .collect();
         let dataflow = builder.build().unwrap();
-        dataflow.run().unwrap();
+        rt().run(dataflow).unwrap();
 
         let results = collector.lock().unwrap();
         assert_eq!(results[0].1, vec![42]);
@@ -1302,7 +1366,7 @@ mod tests {
             .source("nums", vec![(0u64, vec![1i32, 2, 3])])
             .output("results");
         let dataflow = builder.build().unwrap();
-        let result = dataflow.run_with_cancel(cancel);
+        let result = SimpleRuntime::with_cancel(cancel).run(dataflow);
         assert!(result.is_err());
     }
 
@@ -1318,7 +1382,6 @@ mod tests {
         assert_eq!(dataflow.name(), "meta_test");
         assert_eq!(dataflow.input_names().len(), 0); // sources are not "input ports"
         assert_eq!(dataflow.output_names(), vec!["out"]);
-        // 2 sources + 1 unary + 1 sink = 4 operators
         assert_eq!(dataflow.operator_count(), 4);
     }
 
@@ -1326,7 +1389,6 @@ mod tests {
     #[should_panic(expected = "duplicate output port name")]
     fn test_duplicate_output_name_panics() {
         let builder = DataflowBuilder::<u64>::new("dup_test");
-        // Use two independent sources to avoid fan-out detection
         let s1 = builder.source("src1", vec![(0u64, vec![1i32])]);
         let s2 = builder.source("src2", vec![(0u64, vec![2i32])]);
         let _p1 = s1.output("results");
@@ -1340,8 +1402,7 @@ mod tests {
         let (stream, _probe) = stream.probe();
         let _port = stream.output("results");
         let dataflow = builder.build().unwrap();
-        dataflow.run().unwrap();
-        // Probe was registered — basic smoke test that it doesn't panic
+        rt().run(dataflow).unwrap();
     }
 
     #[test]
@@ -1358,7 +1419,7 @@ mod tests {
             })
             .output("results");
         let dataflow = builder.build().unwrap();
-        dataflow.run().unwrap();
+        rt().run(dataflow).unwrap();
 
         let collector = port.collector();
         let results = collector.lock().unwrap();
@@ -1370,9 +1431,96 @@ mod tests {
         let builder = DataflowBuilder::<u64>::new("input_test");
         let _port = builder.input::<i32>("data").output("results");
         let dataflow = builder.build().unwrap();
-        let result = dataflow.run();
+        let result = rt().run(dataflow);
         assert!(result.is_err());
         let err_msg = format!("{}", result.unwrap_err());
-        assert!(err_msg.contains("input ports require async runtime"));
+        assert!(err_msg.contains("input ports"));
+    }
+
+    #[test]
+    fn test_spawn_basic_pipeline() {
+        let builder = DataflowBuilder::<u64>::new("spawn_test");
+        let input = builder.input::<i32>("numbers");
+        input
+            .map("double", |_t, x| x * 2)
+            .output("results");
+        let dataflow = builder.build().unwrap();
+
+        let mut handle = rt().spawn(dataflow).unwrap();
+
+        let sender = handle.take_input::<i32>("numbers").unwrap();
+        sender.send(0, vec![1, 2, 3]).unwrap();
+        sender.send(1, vec![10, 20]).unwrap();
+        sender.close();
+
+        let receiver = handle.take_output::<i32>("results").unwrap();
+        let mut results = receiver.collect_data();
+        results.sort_by_key(|(t, _)| *t);
+
+        assert_eq!(results.len(), 2);
+        assert_eq!(results[0].0, 0);
+        assert_eq!(results[0].1, vec![2, 4, 6]);
+        assert_eq!(results[1].0, 1);
+        assert_eq!(results[1].1, vec![20, 40]);
+
+        handle.join().unwrap();
+    }
+
+    #[test]
+    fn test_spawn_filter_pipeline() {
+        let builder = DataflowBuilder::<u64>::new("filter_spawn");
+        let input = builder.input::<i32>("src");
+        input
+            .filter("evens", |_t, x| x % 2 == 0)
+            .output("evens");
+        let dataflow = builder.build().unwrap();
+
+        let mut handle = rt().spawn(dataflow).unwrap();
+        let sender = handle.take_input::<i32>("src").unwrap();
+        sender.send(0, vec![1, 2, 3, 4, 5, 6]).unwrap();
+        sender.close();
+
+        let receiver = handle.take_output::<i32>("evens").unwrap();
+        let results = receiver.collect_data();
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].1, vec![2, 4, 6]);
+
+        handle.join().unwrap();
+    }
+
+    #[test]
+    fn test_spawn_type_mismatch_error() {
+        let builder = DataflowBuilder::<u64>::new("type_test");
+        let input = builder.input::<i32>("numbers");
+        input.output("out");
+        let dataflow = builder.build().unwrap();
+
+        let mut handle = rt().spawn(dataflow).unwrap();
+        let result = handle.take_input::<String>("numbers");
+        assert!(result.is_err());
+        assert!(format!("{}", result.unwrap_err()).contains("type"));
+    }
+
+    #[test]
+    fn test_spawn_cancel() {
+        let builder = DataflowBuilder::<u64>::new("cancel_test");
+        let input = builder.input::<i32>("data");
+        input.output("out");
+        let dataflow = builder.build().unwrap();
+
+        let handle = rt().spawn(dataflow).unwrap();
+        handle.cancel();
+        let _ = handle.join();
+    }
+
+    #[test]
+    fn test_spawn_drop_cancels() {
+        let builder = DataflowBuilder::<u64>::new("drop_test");
+        let input = builder.input::<i32>("data");
+        input.output("out");
+        let dataflow = builder.build().unwrap();
+
+        let _handle = rt().spawn(dataflow).unwrap();
+        // SpawnedDataflow::drop cancels and joins
     }
 }

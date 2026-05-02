@@ -81,6 +81,10 @@ pub struct DataflowExecutor<T: Timestamp = u64> {
     /// Registered probes: (operator_index, probe_handle).
     /// Updated during progress propagation with the operator's input frontier.
     probes: Vec<(usize, ProbeHandle<T>)>,
+    /// Number of external input sources still open (e.g., channel-based inputs
+    /// fed by the caller via `DataflowHandle`). While > 0, the executor will
+    /// not declare quiescence — it waits for external data instead.
+    external_inputs_open: std::sync::Arc<std::sync::atomic::AtomicUsize>,
     /// Phantom for the timestamp type.
     _phantom: PhantomData<T>,
 }
@@ -202,8 +206,37 @@ impl<T: Timestamp> DataflowExecutor<T> {
             progress_tracker: None,
             notificators: Vec::new(),
             probes: Vec::new(),
+            external_inputs_open: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             _phantom: PhantomData,
         })
+    }
+
+    /// Get a shared reference to the external inputs counter.
+    ///
+    /// Used by `ChannelSourceOperator` to decrement when its channel closes.
+    pub fn external_inputs_counter(&self) -> std::sync::Arc<std::sync::atomic::AtomicUsize> {
+        std::sync::Arc::clone(&self.external_inputs_open)
+    }
+
+    /// Set the number of external input sources.
+    ///
+    /// While this count is > 0, the executor will not declare quiescence,
+    /// allowing channel-based input operators to wait for external data.
+    pub fn set_external_inputs_open(&self, count: usize) {
+        self.external_inputs_open
+            .store(count, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    /// Replace the executor's external inputs counter with a shared one.
+    ///
+    /// This allows operators (e.g., `ChannelSourceOperator`) and the executor
+    /// to share the same `Arc<AtomicUsize>`, so operator decrements are
+    /// visible to the executor's quiescence check.
+    pub fn replace_external_inputs_counter(
+        &mut self,
+        counter: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    ) {
+        self.external_inputs_open = counter;
     }
 
     /// Attach an initialized progress tracker to enable frontier-driven activation.
@@ -409,6 +442,13 @@ impl<T: Timestamp> DataflowExecutor<T> {
             }
 
             if consecutive_idle >= self.config.max_idle_sweeps {
+                // Check if external inputs are still open — if so, don't
+                // declare quiescence. Sleep briefly to avoid busy-polling.
+                if self.external_inputs_open.load(std::sync::atomic::Ordering::SeqCst) > 0 {
+                    std::thread::sleep(std::time::Duration::from_millis(1));
+                    consecutive_idle = 0;
+                    continue;
+                }
                 // Quiescent — no operator made progress. Return false
                 // to distinguish from normal completion.
                 return Ok(false);
@@ -539,6 +579,7 @@ mod tests {
         progress_tracker: None,
             notificators: Vec::new(),
             probes: Vec::new(),
+            external_inputs_open: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             _phantom: std::marker::PhantomData::<u64>,
         };
 
@@ -568,6 +609,7 @@ mod tests {
         progress_tracker: None,
             notificators: Vec::new(),
             probes: Vec::new(),
+            external_inputs_open: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             _phantom: std::marker::PhantomData::<u64>,
         };
 
@@ -601,6 +643,7 @@ mod tests {
         progress_tracker: None,
             notificators: Vec::new(),
             probes: Vec::new(),
+            external_inputs_open: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             _phantom: std::marker::PhantomData::<u64>,
         };
 
@@ -622,6 +665,7 @@ mod tests {
         progress_tracker: None,
             notificators: Vec::new(),
             probes: Vec::new(),
+            external_inputs_open: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             _phantom: std::marker::PhantomData::<u64>,
         };
 
@@ -657,6 +701,7 @@ mod tests {
         progress_tracker: None,
             notificators: Vec::new(),
             probes: Vec::new(),
+            external_inputs_open: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             _phantom: std::marker::PhantomData::<u64>,
         };
 
@@ -714,6 +759,7 @@ mod tests {
         progress_tracker: None,
             notificators: Vec::new(),
             probes: Vec::new(),
+            external_inputs_open: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             _phantom: std::marker::PhantomData::<u64>,
         };
 
@@ -759,6 +805,7 @@ mod tests {
             progress_tracker: None,
             notificators: Vec::new(),
             probes: Vec::new(),
+            external_inputs_open: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             _phantom: std::marker::PhantomData::<u64>,
         };
 
@@ -792,6 +839,7 @@ mod tests {
             progress_tracker: None,
             notificators: vec![Some(Notificator::new(Antichain::from_elem(0u64)))],
             probes: Vec::new(),
+            external_inputs_open: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             _phantom: std::marker::PhantomData::<u64>,
         };
 
@@ -838,6 +886,7 @@ mod tests {
             progress_tracker: None,
             notificators: vec![Some(Notificator::new(Antichain::new()))],
             probes: Vec::new(),
+            external_inputs_open: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             _phantom: std::marker::PhantomData::<u64>,
         };
 
