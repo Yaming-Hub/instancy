@@ -305,7 +305,7 @@ impl DataflowGraph {
     /// (each worker runs an independent replica). Attempting to use them
     /// with `spawn_multi(N > 1)` will return an error.
     const EXCHANGE_OPERATOR_NAMES: &[&str] = &[
-        "exchange", "rebalance", "gather", "broadcast", "broadcast_local",
+        "exchange", "rebalance", "gather", "broadcast", "broadcastlocal",
     ];
 
     /// Returns `true` if the graph contains any exchange/rebalance/gather/broadcast

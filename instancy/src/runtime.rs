@@ -31,6 +31,7 @@ use crate::dataflow::channels::wake::WakeHandle;
 use crate::dataflow::channel_operators::ChannelMode;
 use crate::dataflow::dataflow_builder::{DataflowBuilder, LogicalDataflow};
 use crate::dataflow::executor::{DataflowExecutor, ExecutorConfig};
+use crate::dataflow::graph::OperatorInfo;
 use crate::error::{Error, Result};
 use crate::progress::timestamp::Timestamp;
 use crate::scheduler::policy::{PriorityWithAgingPolicy, SchedulePolicy};
@@ -439,18 +440,19 @@ impl RuntimeHandle {
 
         // Phase 3: Validate no exchange operators (not yet supported).
         if num_workers > 1 {
-            let exchange_ops = dataflows[0].graph().exchange_operator_names();
-            if !exchange_ops.is_empty() {
-                return Err(Error::Custom(format!(
-                    "multi-worker execution does not yet support exchange operators \
-                     (found: {}). All channels are worker-local in replicated mode.",
-                    exchange_ops.join(", ")
-                )));
+            for (i, df) in dataflows.iter().enumerate() {
+                let exchange_ops = df.graph().exchange_operator_names();
+                if !exchange_ops.is_empty() {
+                    return Err(Error::Custom(format!(
+                        "multi-worker execution does not yet support exchange operators \
+                         (worker {i} has: {}). All channels are worker-local in replicated mode.",
+                        exchange_ops.join(", ")
+                    )));
+                }
             }
         }
 
         // Phase 4: Spawn all workers. If any spawn fails, cancel already-started ones.
-        let parent_cancel = self.cancel.child_token();
         let mut workers = Vec::with_capacity(num_workers);
         let mut spawned_count = 0usize;
 
@@ -478,7 +480,6 @@ impl RuntimeHandle {
         Ok(MultiSpawnedDataflow {
             name: name.to_string(),
             num_workers,
-            cancel: parent_cancel,
             workers,
             _phantom: PhantomData,
         })
@@ -738,20 +739,21 @@ impl SimpleRuntime {
             validate_multi_worker_topologies(&dataflows)?;
         }
 
-        // Phase 3: Validate no exchange operators.
+        // Phase 3: Validate no exchange operators (check all replicas).
         if num_workers > 1 {
-            let exchange_ops = dataflows[0].graph().exchange_operator_names();
-            if !exchange_ops.is_empty() {
-                return Err(Error::Custom(format!(
-                    "multi-worker execution does not yet support exchange operators \
-                     (found: {}). All channels are worker-local in replicated mode.",
-                    exchange_ops.join(", ")
-                )));
+            for (i, df) in dataflows.iter().enumerate() {
+                let exchange_ops = df.graph().exchange_operator_names();
+                if !exchange_ops.is_empty() {
+                    return Err(Error::Custom(format!(
+                        "multi-worker execution does not yet support exchange operators \
+                         (worker {i} has: {}). All channels are worker-local in replicated mode.",
+                        exchange_ops.join(", ")
+                    )));
+                }
             }
         }
 
         // Phase 4: Spawn all workers on dedicated threads.
-        let parent_cancel = self.cancel.child_token();
         let mut workers = Vec::with_capacity(num_workers);
         let mut spawned_count = 0usize;
 
@@ -778,7 +780,6 @@ impl SimpleRuntime {
         Ok(MultiSpawnedDataflow {
             name: name.to_string(),
             num_workers,
-            cancel: parent_cancel,
             workers,
             _phantom: PhantomData,
         })
@@ -1213,7 +1214,6 @@ impl<T: Timestamp> Drop for SpawnedDataflow<T> {
 pub struct MultiSpawnedDataflow<T: Timestamp> {
     name: String,
     num_workers: usize,
-    cancel: CancellationToken,
     workers: Vec<SpawnedDataflow<T>>,
     _phantom: PhantomData<T>,
 }
@@ -1309,7 +1309,6 @@ impl<T: Timestamp> MultiSpawnedDataflow<T> {
     /// Each worker's cancellation token is signalled. The executors will stop
     /// at the next cancellation check point.
     pub fn cancel(&self) {
-        self.cancel.cancel();
         for w in &self.workers {
             w.cancel();
         }
@@ -1320,19 +1319,22 @@ impl<T: Timestamp> MultiSpawnedDataflow<T> {
     /// Returns `Ok(())` if all workers ran to completion. If any worker
     /// fails, the remaining workers are cancelled and the first error is returned.
     pub fn join_blocking(mut self) -> Result<()> {
-        let cancel = self.cancel.clone();
-        let workers = std::mem::take(&mut self.workers);
+        let mut workers: Vec<SpawnedDataflow<T>> = std::mem::take(&mut self.workers);
         let mut first_error: Option<Error> = None;
 
-        for worker in workers {
+        while !workers.is_empty() {
+            let worker = workers.remove(0);
             match worker.join_blocking() {
                 Ok(()) => {}
                 Err(e) => {
                     if first_error.is_none() {
                         first_error = Some(e);
-                        // Cancel siblings on first failure.
-                        cancel.cancel();
+                        // Cancel all remaining workers directly.
+                        for w in &workers {
+                            w.cancel();
+                        }
                     }
+                    // Continue draining remaining workers (already cancelled).
                 }
             }
         }
@@ -1348,20 +1350,24 @@ impl<T: Timestamp> MultiSpawnedDataflow<T> {
     /// Returns a [`MultiDataflowCompletion`] that resolves when all workers
     /// finish. On first error, remaining workers are cancelled.
     pub fn join(mut self) -> MultiDataflowCompletion {
-        let cancel = self.cancel.clone();
         let workers = std::mem::take(&mut self.workers);
+        // Collect per-worker cancel tokens so MultiDataflowCompletion can
+        // cancel remaining workers directly on first error.
+        let worker_cancels: Vec<CancellationToken> = workers
+            .iter()
+            .map(|w| w.cancel.clone())
+            .collect();
         let completions: Vec<DataflowCompletion> = workers
             .into_iter()
             .map(|w| w.join())
             .collect();
-        MultiDataflowCompletion { cancel, completions }
+        MultiDataflowCompletion { worker_cancels, completions }
     }
 }
 
 impl<T: Timestamp> Drop for MultiSpawnedDataflow<T> {
     fn drop(&mut self) {
         // Cancel all workers if join() wasn't called.
-        self.cancel.cancel();
         for w in &self.workers {
             w.cancel();
         }
@@ -1377,7 +1383,8 @@ impl<T: Timestamp> Drop for MultiSpawnedDataflow<T> {
 /// Waits for all workers to finish. On first error, remaining workers are
 /// cancelled and the error is returned.
 pub struct MultiDataflowCompletion {
-    cancel: CancellationToken,
+    /// Per-worker cancellation tokens for direct cancellation.
+    worker_cancels: Vec<CancellationToken>,
     completions: Vec<DataflowCompletion>,
 }
 
@@ -1389,13 +1396,16 @@ impl MultiDataflowCompletion {
     pub fn wait(self) -> Result<()> {
         let mut first_error: Option<Error> = None;
 
-        for completion in self.completions {
+        for (idx, completion) in self.completions.into_iter().enumerate() {
             match completion.wait() {
                 Ok(()) => {}
                 Err(e) => {
                     if first_error.is_none() {
                         first_error = Some(e);
-                        self.cancel.cancel();
+                        // Cancel remaining workers directly.
+                        for cancel in &self.worker_cancels[idx + 1..] {
+                            cancel.cancel();
+                        }
                     }
                 }
             }
@@ -1425,31 +1435,77 @@ fn validate_multi_worker_topologies<T: Timestamp>(
     }
 
     let ref_df = &dataflows[0];
-    let ref_op_count = ref_df.operator_count();
-    let ref_edge_count = ref_df.edge_count();
-    let ref_feedback_count = ref_df.graph().feedback_edges().len();
+    let ref_graph = ref_df.graph();
+    let mut ref_ops: Vec<&OperatorInfo> = ref_graph.operators().collect();
+    ref_ops.sort_by_key(|op| op.index);
+    let ref_edges = ref_graph.edges();
+    let ref_feedback_count = ref_graph.feedback_edges().len();
     let ref_inputs = ref_df.input_names();
     let ref_outputs = ref_df.output_names();
 
     for (i, df) in dataflows.iter().enumerate().skip(1) {
-        if df.operator_count() != ref_op_count {
+        let graph = df.graph();
+
+        // Operator count.
+        let mut ops: Vec<&OperatorInfo> = graph.operators().collect();
+        ops.sort_by_key(|op| op.index);
+        if ops.len() != ref_ops.len() {
             return Err(Error::Custom(format!(
-                "worker {i} has {} operators but worker 0 has {ref_op_count}",
-                df.operator_count()
+                "worker {i} has {} operators but worker 0 has {}",
+                ops.len(),
+                ref_ops.len()
             )));
         }
-        if df.edge_count() != ref_edge_count {
+
+        // Operator names, regions, and port counts must match at each index.
+        for (j, (a, b)) in ref_ops.iter().zip(ops.iter()).enumerate() {
+            if a.name != b.name {
+                return Err(Error::Custom(format!(
+                    "worker {i} operator {j} is named '{}' but worker 0 has '{}'",
+                    b.name, a.name
+                )));
+            }
+            if a.region_id != b.region_id {
+                return Err(Error::Custom(format!(
+                    "worker {i} operator {j} ('{}') has region {:?} but worker 0 has {:?}",
+                    a.name, b.region_id, a.region_id
+                )));
+            }
+            if a.input_count != b.input_count || a.output_count != b.output_count {
+                return Err(Error::Custom(format!(
+                    "worker {i} operator {j} ('{}') has {}/{} in/out ports but worker 0 has {}/{}",
+                    a.name, b.input_count, b.output_count, a.input_count, a.output_count
+                )));
+            }
+        }
+
+        // Edge count and endpoints.
+        let edges = graph.edges();
+        if edges.len() != ref_edges.len() {
             return Err(Error::Custom(format!(
-                "worker {i} has {} edges but worker 0 has {ref_edge_count}",
-                df.edge_count()
+                "worker {i} has {} edges but worker 0 has {}",
+                edges.len(),
+                ref_edges.len()
             )));
         }
-        if df.graph().feedback_edges().len() != ref_feedback_count {
+        for (j, (a, b)) in ref_edges.iter().zip(edges.iter()).enumerate() {
+            if a.source != b.source || a.target != b.target {
+                return Err(Error::Custom(format!(
+                    "worker {i} edge {j} has {:?}->{:?} but worker 0 has {:?}->{:?}",
+                    b.source, b.target, a.source, a.target
+                )));
+            }
+        }
+
+        // Feedback edges.
+        if graph.feedback_edges().len() != ref_feedback_count {
             return Err(Error::Custom(format!(
                 "worker {i} has {} feedback edges but worker 0 has {ref_feedback_count}",
-                df.graph().feedback_edges().len()
+                graph.feedback_edges().len()
             )));
         }
+
+        // Input/output port names.
         let inputs = df.input_names();
         if inputs != ref_inputs {
             return Err(Error::Custom(format!(
