@@ -157,12 +157,17 @@ impl<T: Timestamp> DataflowExecutor<T> {
     /// - Creates channels for each edge using the channel factories.
     /// - Invokes operator factories with their assigned channel endpoints.
     /// - Returns a ready-to-run executor.
+    ///
+    /// If `external_wake_handle` is provided, the executor uses it instead of
+    /// creating its own. This allows the runtime to share the same WakeHandle
+    /// with InputSenders and CancellationTokens created before materialization.
     pub fn materialize(
         graph: &DataflowGraph,
         mut operator_factories: Vec<(usize, OperatorFactory)>,
         channel_factories: Vec<(usize, ChannelFactory)>,
         config: ExecutorConfig,
         cancel: CancellationToken,
+        external_wake_handle: Option<WakeHandle>,
     ) -> Result<Self> {
         let edges = graph.edges();
         let feedback_edges = graph.feedback_edges();
@@ -180,7 +185,7 @@ impl<T: Timestamp> DataflowExecutor<T> {
         let mut factory_map: std::collections::HashMap<usize, ChannelFactory> =
             channel_factories.into_iter().collect();
 
-        let wake_handle = WakeHandle::new();
+        let wake_handle = external_wake_handle.unwrap_or_else(WakeHandle::new);
 
         for edge_idx in 0..total_edge_count {
             let factory = factory_map.remove(&edge_idx).ok_or_else(|| {
@@ -321,16 +326,9 @@ impl<T: Timestamp> DataflowExecutor<T> {
     /// data arrives or capacity is freed. The executor uses the handle to
     /// sleep (return `Poll::Pending`) when idle instead of busy-polling.
     ///
-    /// # Integration notes (TODO for runtime wiring)
-    ///
-    /// The following components should also notify this handle but are not
-    /// yet wired:
-    /// - **InputSender**: should notify on `send()`, `advance_frontier()`,
-    ///   and `close()`/`Drop` so the async executor wakes when external
-    ///   data arrives.
-    /// - **CancellationToken**: the runtime should notify this handle when
-    ///   calling `cancel()` so a pending async executor promptly resolves
-    ///   with `Err(Cancelled)`.
+    /// When an external `WakeHandle` is passed to `materialize()`, this returns
+    /// that same handle — ensuring InputSenders, CancellationTokens, and
+    /// internal channels all share a single notification path.
     pub fn wake_handle(&self) -> WakeHandle {
         self.wake_handle.clone()
     }
@@ -643,8 +641,14 @@ impl<T: Timestamp> DataflowExecutor<T> {
 
         loop {
             match self.run_one_sweep() {
-                Ok(SweepOutcome::Completed) => return Poll::Ready(Ok(true)),
-                Ok(SweepOutcome::Quiescent) => return Poll::Ready(Ok(false)),
+                Ok(SweepOutcome::Completed) => {
+                    self.wake_handle.clear_waker();
+                    return Poll::Ready(Ok(true));
+                }
+                Ok(SweepOutcome::Quiescent) => {
+                    self.wake_handle.clear_waker();
+                    return Poll::Ready(Ok(false));
+                }
                 Ok(SweepOutcome::MadeProgress) => {
                     sweeps_this_poll += 1;
                     // Check poll budget (0 = unlimited)
@@ -678,7 +682,10 @@ impl<T: Timestamp> DataflowExecutor<T> {
                     }
                     return Poll::Pending;
                 }
-                Err(e) => return Poll::Ready(Err(e)),
+                Err(e) => {
+                    self.wake_handle.clear_waker();
+                    return Poll::Ready(Err(e));
+                }
             }
         }
     }

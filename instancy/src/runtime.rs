@@ -27,6 +27,7 @@ use std::sync::atomic::AtomicUsize;
 use std::task::{Context, Poll, Waker};
 
 use crate::cancellation::CancellationToken;
+use crate::dataflow::channels::wake::WakeHandle;
 use crate::dataflow::dataflow_builder::LogicalDataflow;
 use crate::dataflow::executor::{DataflowExecutor, ExecutorConfig};
 use crate::error::{Error, Result};
@@ -187,7 +188,9 @@ impl RuntimeHandle {
         }
 
         let cancel = self.cancel.child_token();
-        let executor = materialize_executor(dataflow, cancel)?;
+        let wake_handle = WakeHandle::new();
+        cancel.register_wake_handle(wake_handle.clone());
+        let executor = materialize_executor(dataflow, cancel, Some(wake_handle))?;
 
         let (completion, notifier) = DataflowCompletion::new();
 
@@ -232,6 +235,14 @@ impl RuntimeHandle {
         let external_inputs_open = Arc::new(AtomicUsize::new(0));
         let name = dataflow.name().to_string();
 
+        // Create the WakeHandle early so it can be shared with InputSenders,
+        // CancellationToken, and the executor's internal channels.
+        let wake_handle = WakeHandle::new();
+
+        // Register wake handle on the cancellation token (and all ancestors)
+        // so that cancel() wakes the sleeping executor promptly.
+        cancel.register_wake_handle(wake_handle.clone());
+
         // --- Wire input ports ---
         let mut input_senders: Vec<(String, &'static str, Box<dyn std::any::Any + Send>)> =
             Vec::new();
@@ -242,7 +253,8 @@ impl RuntimeHandle {
             .iter()
             .zip(dataflow.input_port_wiring.drain(..))
         {
-            let (factory, sender_any) = wiring(Arc::clone(&external_inputs_open));
+            let (factory, sender_any) =
+                wiring(Arc::clone(&external_inputs_open), wake_handle.clone());
             dataflow
                 .operator_factories
                 .push((info.operator_index, factory));
@@ -271,7 +283,7 @@ impl RuntimeHandle {
         }
 
         // --- Materialize and register as cooperative task ---
-        let mut executor = materialize_executor(dataflow, cancel)?;
+        let mut executor = materialize_executor(dataflow, cancel, Some(wake_handle))?;
 
         external_inputs_open.store(input_count, std::sync::atomic::Ordering::SeqCst);
         executor.replace_external_inputs_counter(external_inputs_open);
@@ -384,7 +396,9 @@ impl SimpleRuntime {
             return Ok(());
         }
 
-        let mut executor = materialize_executor(dataflow, self.cancel.clone())?;
+        let wake_handle = WakeHandle::new();
+        self.cancel.register_wake_handle(wake_handle.clone());
+        let mut executor = materialize_executor(dataflow, self.cancel.clone(), Some(wake_handle))?;
 
         let completed = executor.run()?;
         if !completed {
@@ -435,6 +449,14 @@ impl SimpleRuntime {
         let external_inputs_open = Arc::new(AtomicUsize::new(0));
         let name = dataflow.name().to_string();
 
+        // Create the WakeHandle early so it can be shared with InputSenders
+        // and the executor's internal channels.
+        let wake_handle = WakeHandle::new();
+
+        // Register wake handle on the cancellation token so cancel() wakes
+        // a sleeping executor.
+        cancel.register_wake_handle(wake_handle.clone());
+
         // --- Wire input ports ---
         let mut input_senders: Vec<(String, &'static str, Box<dyn std::any::Any + Send>)> =
             Vec::new();
@@ -445,7 +467,8 @@ impl SimpleRuntime {
             .iter()
             .zip(dataflow.input_port_wiring.drain(..))
         {
-            let (factory, sender_any) = wiring(Arc::clone(&external_inputs_open));
+            let (factory, sender_any) =
+                wiring(Arc::clone(&external_inputs_open), wake_handle.clone());
             dataflow
                 .operator_factories
                 .push((info.operator_index, factory));
@@ -474,7 +497,7 @@ impl SimpleRuntime {
         }
 
         // --- Materialize and run on background thread ---
-        let mut executor = materialize_executor(dataflow, cancel)?;
+        let mut executor = materialize_executor(dataflow, cancel, Some(wake_handle))?;
 
         external_inputs_open.store(input_count, std::sync::atomic::Ordering::SeqCst);
         executor.replace_external_inputs_counter(external_inputs_open);
@@ -821,10 +844,12 @@ impl<T: Timestamp> Drop for SpawnedDataflow<T> {
 
 /// Materialize a LogicalDataflow into a ready-to-run DataflowExecutor.
 ///
-/// Shared by both `SimpleRuntime::run()` and `SimpleRuntime::spawn()`.
+/// If `wake_handle` is provided, the executor uses it (shared with InputSenders
+/// and CancellationTokens). Otherwise a fresh one is created internally.
 fn materialize_executor<T: Timestamp>(
     dataflow: LogicalDataflow<T>,
     cancel: CancellationToken,
+    wake_handle: Option<WakeHandle>,
 ) -> Result<DataflowExecutor<T>> {
     let executor_config = ExecutorConfig {
         max_activations_per_step: 1024,
@@ -838,6 +863,7 @@ fn materialize_executor<T: Timestamp>(
         dataflow.channel_factories,
         executor_config,
         cancel,
+        wake_handle,
     )?;
 
     // Build and attach progress tracker

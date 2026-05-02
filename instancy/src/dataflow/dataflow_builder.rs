@@ -119,6 +119,7 @@ struct BuilderState<T: Timestamp> {
 pub(crate) type InputPortWiring = Box<
     dyn FnOnce(
             std::sync::Arc<std::sync::atomic::AtomicUsize>, // external_inputs_open counter
+            WakeHandle,                                      // executor wake handle
         ) -> (OperatorFactory, Box<dyn std::any::Any + Send>) // (factory, InputSender)
         + Send,
 >;
@@ -258,14 +259,14 @@ impl<T: Timestamp> DataflowBuilder<T> {
             // spawn() to create the ChannelSourceOperator factory and InputSender.
             // The closure captures the concrete data type D.
             let wiring_name = name.clone();
-            let wiring: InputPortWiring = Box::new(move |external_inputs_open| {
+            let wiring: InputPortWiring = Box::new(move |external_inputs_open, wake_handle| {
                 use crate::dataflow::channel_operators::InputSender;
                 use crate::dataflow::channel_operators::ChannelSourceOperator;
                 use crate::dataflow::channels::tee::tee_or_single;
 
                 // Create bounded channel for external → dataflow communication
                 let (tx, rx) = std::sync::mpsc::sync_channel::<InputEvent<T, D>>(256);
-                let sender = InputSender::new(tx);
+                let sender = InputSender::with_wake_handle(tx, wake_handle);
 
                 // The factory closure captures the receiver and wires it to
                 // the output pusher provided during materialization.

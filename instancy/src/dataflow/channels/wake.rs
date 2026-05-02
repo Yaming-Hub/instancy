@@ -100,6 +100,20 @@ impl WakeHandle {
     pub fn take_notification(&self) -> bool {
         self.inner.notified.swap(false, Ordering::AcqRel)
     }
+
+    /// Clear the stored waker, releasing any references it holds.
+    ///
+    /// Called when the executor completes or is cancelled. This breaks the
+    /// WakeHandle → Waker → PoolWaker → ExecutorTask reference chain,
+    /// preventing completed executors from being kept alive by WakeHandle
+    /// clones retained in CancellationTokens or other long-lived structures.
+    ///
+    /// After clearing, `notify()` still sets the flag but won't wake anyone.
+    pub fn clear_waker(&self) {
+        if let Ok(mut guard) = self.inner.waker.lock() {
+            *guard = None;
+        }
+    }
 }
 
 impl Default for WakeHandle {

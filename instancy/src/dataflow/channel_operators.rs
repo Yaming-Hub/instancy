@@ -15,6 +15,7 @@ use std::time::Duration;
 
 use crate::dataflow::channels::envelope::Envelope;
 use crate::dataflow::channels::pushpull::{Pull, Push};
+use crate::dataflow::channels::wake::WakeHandle;
 use crate::dataflow::operators::input::InputEvent;
 use crate::dataflow::operators::output::OutputEvent;
 use crate::dataflow::region::RegionId;
@@ -341,14 +342,35 @@ impl<T: Timestamp, D: Send + 'static> SchedulableOperator for ChannelSinkOperato
 /// clones share the same underlying channel. The channel closes only when
 /// **all** clones (including the one held by `SpawnedDataflow`) are dropped,
 /// or when [`close()`](Self::close) is called on this instance.
+///
+/// When a `WakeHandle` is wired (set during runtime spawn), every `send()`,
+/// `advance_frontier()`, and `Drop` notifies the executor's wake handle so
+/// that a sleeping async executor wakes promptly when external data arrives.
 #[derive(Clone, Debug)]
 pub struct InputSender<T: Timestamp, D: Send + 'static> {
     sender: mpsc::SyncSender<InputEvent<T, D>>,
+    /// Optional wake handle to notify the executor when data is sent.
+    /// Set during runtime spawn; None in standalone / test usage.
+    wake_handle: Option<WakeHandle>,
 }
 
 impl<T: Timestamp, D: Send + 'static> InputSender<T, D> {
     pub(crate) fn new(sender: mpsc::SyncSender<InputEvent<T, D>>) -> Self {
-        Self { sender }
+        Self {
+            sender,
+            wake_handle: None,
+        }
+    }
+
+    /// Create an InputSender with a wake handle for async executor notification.
+    pub(crate) fn with_wake_handle(
+        sender: mpsc::SyncSender<InputEvent<T, D>>,
+        wake_handle: WakeHandle,
+    ) -> Self {
+        Self {
+            sender,
+            wake_handle: Some(wake_handle),
+        }
     }
 
     /// Send a batch of data at the given timestamp.
@@ -359,7 +381,11 @@ impl<T: Timestamp, D: Send + 'static> InputSender<T, D> {
     pub fn send(&self, time: T, data: Vec<D>) -> Result<()> {
         self.sender
             .send(InputEvent::data(time, data))
-            .map_err(|_| crate::error::Error::Custom("dataflow has terminated".into()))
+            .map_err(|_| crate::error::Error::Custom("dataflow has terminated".into()))?;
+        if let Some(wh) = &self.wake_handle {
+            wh.notify();
+        }
+        Ok(())
     }
 
     /// Advance the input frontier past the given timestamp.
@@ -368,14 +394,30 @@ impl<T: Timestamp, D: Send + 'static> InputSender<T, D> {
     pub fn advance_frontier(&self, time: T) -> Result<()> {
         self.sender
             .send(InputEvent::frontier(time))
-            .map_err(|_| crate::error::Error::Custom("dataflow has terminated".into()))
+            .map_err(|_| crate::error::Error::Custom("dataflow has terminated".into()))?;
+        if let Some(wh) = &self.wake_handle {
+            wh.notify();
+        }
+        Ok(())
     }
 
     /// Close this input, signaling no more data will arrive.
     ///
     /// Equivalent to dropping the sender.
     pub fn close(self) {
-        // Drop self — the SyncSender will be dropped, disconnecting the channel.
+        // Drop self — the SyncSender will be dropped, triggering the
+        // Drop impl which notifies the wake handle.
+    }
+}
+
+impl<T: Timestamp, D: Send + 'static> Drop for InputSender<T, D> {
+    fn drop(&mut self) {
+        // Notify the executor that an input sender was dropped. This may
+        // be the last clone, causing the channel to disconnect — the executor
+        // needs to wake up to observe the closed input and potentially complete.
+        if let Some(wh) = &self.wake_handle {
+            wh.notify();
+        }
     }
 }
 
