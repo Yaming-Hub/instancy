@@ -418,6 +418,49 @@ where
 }
 
 // =============================================================================
+// Product codec (for nested-scope timestamps used by iterate)
+// =============================================================================
+
+impl<TOuter, TInner> ExchangeData for crate::order::Product<TOuter, TInner>
+where
+    TOuter: ExchangeData + crate::order::PartialOrder + Ord + Default + Copy,
+    TInner: ExchangeData + crate::order::PartialOrder + Ord + Default + Copy,
+{
+    type CodecType = TupleCodec<TOuter::CodecType, TInner::CodecType>;
+    fn codec() -> Self::CodecType {
+        TupleCodec {
+            a_codec: TOuter::codec(),
+            b_codec: TInner::codec(),
+        }
+    }
+}
+
+// Provide Codec<Product<A,B>> for TupleCodec so encoding/decoding works.
+impl<A, B, CA, CB> Codec<crate::order::Product<A, B>> for TupleCodec<CA, CB>
+where
+    A: ExchangeData<CodecType = CA>,
+    B: ExchangeData<CodecType = CB>,
+    CA: Codec<A>,
+    CB: Codec<B>,
+{
+    fn encode(
+        &self,
+        value: &crate::order::Product<A, B>,
+        buf: &mut Vec<u8>,
+    ) -> Result<(), CodecError> {
+        self.a_codec.encode(&value.outer, buf)?;
+        self.b_codec.encode(&value.inner, buf)?;
+        Ok(())
+    }
+
+    fn decode(&self, buf: &[u8]) -> Result<(crate::order::Product<A, B>, usize), CodecError> {
+        let (outer, a_len) = self.a_codec.decode(buf)?;
+        let (inner, b_len) = self.b_codec.decode(&buf[a_len..])?;
+        Ok((crate::order::Product { outer, inner }, a_len + b_len))
+    }
+}
+
+// =============================================================================
 // Tests
 // =============================================================================
 
@@ -784,5 +827,21 @@ mod tests {
             CodecError::InvalidData(msg) => assert!(msg.contains("exceeds maximum")),
             other => panic!("expected InvalidData, got {other:?}"),
         }
+    }
+
+    // --- Product codec tests ---
+
+    #[test]
+    fn product_codec_roundtrip() {
+        use crate::order::Product;
+
+        let product = Product::new(42u64, 7u32);
+        let codec = <Product<u64, u32> as ExchangeData>::codec();
+        let mut buf = Vec::new();
+        codec.encode(&product, &mut buf).unwrap();
+        assert_eq!(buf.len(), 12); // 8 (u64) + 4 (u32)
+        let (decoded, consumed): (Product<u64, u32>, usize) = codec.decode(&buf).unwrap();
+        assert_eq!(decoded, product);
+        assert_eq!(consumed, 12);
     }
 }
