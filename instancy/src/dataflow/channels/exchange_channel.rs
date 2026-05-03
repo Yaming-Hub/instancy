@@ -31,6 +31,11 @@ use crate::progress::timestamp::Timestamp;
 
 /// Registry of per-worker wake handles for cross-worker notification.
 ///
+/// Each `SharedWakeRegistry` is scoped to a **single exchange edge** within
+/// one `spawn_multi` group — it is *not* shared across different dataflows
+/// or different exchange edges. Created by [`create_exchange_factory_creator`],
+/// it holds one slot per worker in that group.
+///
 /// Workers register their wake handles during materialization. During
 /// execution, exchange push/pull endpoints use this registry to wake
 /// the appropriate worker when data arrives or capacity frees up.
