@@ -11,9 +11,15 @@
 //! [`ExchangePull`] merges data from its N physical input channels using
 //! round-robin.
 //!
-//! For cross-process exchange (remote workers), a separate network transport
-//! layer would replace these in-process bounded channels with TCP/network
-//! connections while keeping the same [`Push`]/[`Pull`] interface.
+//! # Short-term implementation
+//!
+//! This is an **intra-process-only** implementation that uses concrete
+//! `BoundedPush`/`BoundedPull` (shared-memory) channels. In the future,
+//! `ExchangePush` and `ExchangePull` will be refactored to hold
+//! `Vec<Box<dyn Push/Pull>>` so that the **runtime** (not the dataflow) decides
+//! the physical transport per worker pair — local workers get bounded channels,
+//! remote workers get network-backed channels via `TransportProvider` (see
+//! DESIGN.md §4.5). The dataflow layer should be agnostic to worker placement.
 //!
 //! # Wake semantics
 //!
@@ -211,6 +217,14 @@ impl<T: Timestamp, D: Send + 'static> ExchangeChannelSet<T, D> {
 /// Routes each record in a batch to the appropriate target worker based on
 /// the exchange hash function. After pushing, wakes the target worker's
 /// executor via [`SharedWakeRegistry`].
+///
+/// # Transport abstraction (future work)
+///
+/// Currently holds concrete `BoundedPush` endpoints (in-process shared memory).
+/// A future refactor will change `targets` to `Vec<Box<dyn Push<T, D>>>` so
+/// the runtime can mix local (bounded channel) and remote (network) transports
+/// per target worker. The dataflow layer should not know whether a target
+/// worker is local or remote — that is a physical concern owned by the runtime.
 pub struct ExchangePush<T: Timestamp, D: Send + 'static> {
     /// One push endpoint per target worker.
     targets: Vec<BoundedPush<T, D, ()>>,
@@ -416,6 +430,12 @@ impl<T: Timestamp, D: Send + 'static> Drop for ExchangePush<T, D> {
 /// Merges data from all source workers using round-robin polling.
 /// After pulling (which frees channel capacity), wakes the source
 /// worker so a backpressured sender can retry.
+///
+/// # Transport abstraction (future work)
+///
+/// Currently holds concrete `BoundedPull` endpoints. Will be refactored to
+/// `Vec<Box<dyn Pull<T, D>>>` so the runtime can provide local or remote
+/// transports per source worker transparently.
 pub struct ExchangePull<T: Timestamp, D> {
     /// One pull endpoint per source worker.
     sources: Vec<BoundedPull<T, D, ()>>,

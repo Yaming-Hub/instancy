@@ -3931,6 +3931,11 @@ This section documents the cardinality (how many instances exist) and lifetime (
 - Wire protocol (framing + multiplexing)
 - `exchange` operator across processes
 - Inter-process progress tracking
+- **Refactor `ExchangePush`/`ExchangePull` to use `Box<dyn Push/Pull>`** instead of
+  concrete `BoundedPush`/`BoundedPull`, enabling the runtime to provide local (shared
+  memory) or remote (network) transports per worker pair transparently via
+  `TransportProvider` (see §4.5). The dataflow layer must not know whether a
+  target worker is local or remote.
 
 **Phase 6 — Observability, Checkpointing & Polish**
 - Per-dataflow CPU time tracking (`DataflowMetrics`, `OperatorMetrics`)
