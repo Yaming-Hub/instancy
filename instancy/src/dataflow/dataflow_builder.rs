@@ -3294,10 +3294,12 @@ mod tests {
         let r = c.lock().unwrap();
         let all: Vec<i32> = r.iter().flat_map(|(_, v)| v.iter().copied()).collect();
         // The Notificator coalesces duplicate notify_at calls for the same time,
-        // so only one notification fires per time. However, each notify_at call
-        // creates a separate output Capability (+1 each), all of which are dropped
-        // together when next_notification() fires. The key invariant: data is
-        // emitted exactly once per timestamp regardless of how many notify_at calls.
+        // so only one notification fires per time. With the dedup guard in
+        // NotifyContext::notify_at(), only ONE capability is created regardless
+        // of how many times notify_at is called for the same timestamp. The key
+        // invariant: data is emitted exactly once per timestamp.
         assert!(!all.is_empty(), "should have at least one notification");
+        // Verify exactly one notification fired (notification_count == 1)
+        assert_eq!(all, vec![1], "should fire exactly one notification for the deduplicated time");
     }
 }

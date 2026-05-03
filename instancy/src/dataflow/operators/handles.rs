@@ -415,13 +415,29 @@ impl<'a, T: Timestamp> NotifyContext<'a, T> {
     /// Call `notify_at(time)` whenever you buffer data at `time` that you plan
     /// to emit later. Typically called inside the `while let Some((time, data)) = input.next()`
     /// loop.
+    ///
+    /// # Common Pitfalls
+    ///
+    /// - **Not consuming notifications**: If you call `notify_at()` but never call
+    ///   `next_notification()`, capabilities accumulate and downstream operators
+    ///   will stall indefinitely.
+    /// - **Late notifications**: Calling `notify_at(time)` when the frontier has
+    ///   already advanced past `time` will cause the notification to fire immediately
+    ///   on the next activation.
     pub fn notify_at(&mut self, time: T) {
-        // Create an output capability at this time.
-        // This increments +1 in the ProgressReporter, which the reachability
-        // tracker sees as a pointstamp at (operator, output_port, time).
-        // Downstream frontiers cannot advance past `time` while this exists.
-        let cap = Capability::new(time.clone(), self.reporter.clone());
-        self.capabilities.push(cap);
+        // Only create a new capability if we don't already hold one at this time.
+        // The notificator deduplicates notification requests internally, but without
+        // this guard, repeated calls (e.g., once per data item) would create redundant
+        // capabilities — each requiring a mutex lock on drop. One capability per time
+        // is sufficient to hold the downstream frontier.
+        if !self.capabilities.iter().any(|c| c.time() == &time) {
+            // Create an output capability at this time.
+            // This increments +1 in the ProgressReporter, which the reachability
+            // tracker sees as a pointstamp at (operator, output_port, time).
+            // Downstream frontiers cannot advance past `time` while this exists.
+            let cap = Capability::new(time.clone(), self.reporter.clone());
+            self.capabilities.push(cap);
+        }
 
         // Register the notification request with the notificator.
         // When the input frontier advances past `time`, the notificator will
@@ -446,6 +462,16 @@ impl<'a, T: Timestamp> NotifyContext<'a, T> {
     /// channel in the same activation. The capability drop happens right
     /// after, so downstream sees both the data arrival and the frontier
     /// advancement in the next progress propagation cycle.
+    ///
+    /// # Known limitation (backpressure)
+    ///
+    /// If the output channel is full when the operator's activation tries to
+    /// flush `pending_output`, data may remain buffered while the capability
+    /// has already been dropped. In this case, downstream could observe frontier
+    /// advancement before receiving the data. This is a known design limitation
+    /// that will be addressed when message-flight accounting (`consumed`/`produced`
+    /// in `OperatorProgress`) is implemented. In practice, with the default 1024
+    /// envelope channel capacity, this is unlikely to occur.
     ///
     /// Returns `None` when no notifications are ready. More may become ready
     /// in future activations as the frontier continues to advance.
