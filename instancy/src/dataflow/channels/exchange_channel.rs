@@ -30,14 +30,18 @@
 //!   so a backpressured sender can retry
 //! - **Close→all**: when a push end closes, all target workers are woken
 
+use std::collections::VecDeque;
 use std::sync::{Arc, Mutex};
 
 use crate::dataflow::channels::bounded::{bounded_channel, BoundedPull, BoundedPush};
-use crate::dataflow::channels::envelope::{Envelope, Payload};
+use crate::dataflow::channels::envelope::{ControlSignal, Envelope, Payload};
 use crate::dataflow::channels::pact::ExchangeFn;
 use crate::dataflow::channels::pushpull::{Pull, Push};
 use crate::dataflow::channels::wake::WakeHandle;
 use crate::error::{Error, Result};
+#[cfg(test)]
+use crate::progress::frontier::Antichain;
+use crate::progress::mutable_antichain::MutableAntichain;
 use crate::progress::timestamp::Timestamp;
 
 // ---------------------------------------------------------------------------
@@ -427,9 +431,139 @@ impl<T: Timestamp, D: Send + 'static> Drop for ExchangePush<T, D> {
 
 /// Pull endpoint for an exchange channel.
 ///
+// ---------------------------------------------------------------------------
+// FrontierAggregator — per-source watermark tracking
+// ---------------------------------------------------------------------------
+
+/// Aggregates watermarks from N source workers into a single frontier.
+///
+/// Each source worker independently advances its watermark. The aggregated
+/// frontier is the **meet** (minimal antichain) across all per-source frontiers.
+/// A downstream operator should only see a watermark advance when ALL sources
+/// have advanced past that timestamp.
+///
+/// Uses [`MutableAntichain`] internally: each source contributes +1 count for
+/// its current watermark. The frontier = minimal timestamps with positive count
+/// = the set of timestamps where at least one source might still produce data.
+///
+/// Handles both total-order and partial-order timestamps correctly, though the
+/// current [`ControlSignal::Watermark`] carries a single `T` (natural for
+/// total-order). For partial-order timestamps, multiple watermark emissions may
+/// be needed per frontier change.
+struct FrontierAggregator<T: Timestamp> {
+    /// Current watermark per source. `None` = no watermark received yet, meaning
+    /// the source's frontier is at `T::minimum()` (data at any time possible).
+    per_source: Vec<Option<T>>,
+    /// Tracks the aggregated frontier using change-based accounting.
+    aggregated: MutableAntichain<T>,
+}
+
+impl<T: Timestamp> FrontierAggregator<T> {
+    /// Create a new aggregator for `num_sources` upstream workers.
+    ///
+    /// Each source starts with its frontier at `T::minimum()`, meaning data at
+    /// any timestamp could still arrive. The initial aggregated frontier is
+    /// `{T::minimum()}`.
+    ///
+    /// # Contract
+    ///
+    /// Sources **must** send monotonically non-decreasing watermarks. A source
+    /// that closes without advancing its watermark will hold back the aggregated
+    /// frontier. Higher-level close/exhaustion handling (removing a closed
+    /// source's contribution) is deferred to a future PR.
+    ///
+    /// # Panics (debug only)
+    ///
+    /// Panics in debug builds if `num_sources == 0`.
+    fn new(num_sources: usize) -> Self {
+        debug_assert!(num_sources > 0, "FrontierAggregator requires at least one source");
+
+        let mut aggregated = MutableAntichain::new();
+        // Each source contributes T::minimum() with count +1.
+        let inits: Vec<(T, i64)> = (0..num_sources)
+            .map(|_| (T::minimum(), 1))
+            .collect();
+        aggregated.update_iter(inits);
+
+        FrontierAggregator {
+            per_source: vec![None; num_sources],
+            aggregated,
+        }
+    }
+
+    /// Update the watermark for a specific source and return any new frontier
+    /// timestamps to emit downstream.
+    ///
+    /// Returns timestamps that were **added** to the aggregated frontier (i.e.,
+    /// the frontier advanced). Empty if the overall frontier didn't change.
+    ///
+    /// # Panics (debug only)
+    ///
+    /// Panics in debug builds if `source_idx >= num_sources` or if `new_watermark`
+    /// is less than the source's previous watermark (monotonicity violation).
+    fn update(&mut self, source_idx: usize, new_watermark: T) -> Vec<T> {
+        debug_assert!(
+            source_idx < self.per_source.len(),
+            "source_idx {} out of bounds (num_sources = {})",
+            source_idx,
+            self.per_source.len()
+        );
+
+        let old = self.per_source[source_idx].take();
+        let old_time = old.unwrap_or_else(T::minimum);
+
+        // Watermarks must be monotonically non-decreasing.
+        debug_assert!(
+            old_time.less_equal(&new_watermark),
+            "watermark must not decrease: old={:?}, new={:?}",
+            old_time,
+            new_watermark
+        );
+
+        self.per_source[source_idx] = Some(new_watermark.clone());
+
+        let changes = self.aggregated.update_iter(vec![
+            (old_time, -1),
+            (new_watermark, 1),
+        ]);
+
+        // Return only the frontier additions (new watermarks to emit).
+        // Removals (frontier retreats) are not expressible with the current
+        // Watermark(T) control signal and should not occur in practice since
+        // watermarks only advance.
+        changes
+            .into_iter()
+            .filter(|(_, delta)| *delta > 0)
+            .map(|(t, _)| t)
+            .collect()
+    }
+
+    /// Returns the current aggregated frontier.
+    #[cfg(test)]
+    fn frontier(&self) -> Antichain<T> {
+        self.aggregated.frontier_antichain()
+    }
+}
+
+// ---------------------------------------------------------------------------
+// ExchangePull — merges data from all source workers with frontier aggregation
+// ---------------------------------------------------------------------------
+
+/// Pull endpoint for exchange channels.
+///
 /// Merges data from all source workers using round-robin polling.
 /// After pulling (which frees channel capacity), wakes the source
 /// worker so a backpressured sender can retry.
+///
+/// ## Frontier aggregation
+///
+/// Watermarks from individual source workers are **not** passed through directly.
+/// Instead, a [`FrontierAggregator`] tracks per-source watermarks and only emits
+/// an aggregated watermark downstream when ALL sources have advanced past a
+/// timestamp. This prevents premature frontier advancement that could cause
+/// operators to incorrectly discard data or deadlock.
+///
+/// Error control signals pass through immediately (they are not aggregated).
 ///
 /// # Transport abstraction (future work)
 ///
@@ -445,6 +579,10 @@ pub struct ExchangePull<T: Timestamp, D> {
     num_sources: usize,
     /// Shared wake registry for notifying source workers on capacity freed.
     wakes: Arc<SharedWakeRegistry>,
+    /// Aggregates watermarks from all source workers.
+    frontier_agg: FrontierAggregator<T>,
+    /// Buffered watermark envelopes produced by frontier aggregation.
+    pending_watermarks: VecDeque<T>,
 }
 
 impl<T: Timestamp, D> ExchangePull<T, D> {
@@ -454,42 +592,105 @@ impl<T: Timestamp, D> ExchangePull<T, D> {
         wakes: Arc<SharedWakeRegistry>,
     ) -> Self {
         let num_sources = sources.len();
+        let frontier_agg = FrontierAggregator::new(num_sources);
         Self {
             sources,
             next_source: 0,
             num_sources,
             wakes,
+            frontier_agg,
+            pending_watermarks: VecDeque::new(),
         }
     }
 }
 
 impl<T: Timestamp, D: Send + 'static> Pull<T, D> for ExchangePull<T, D> {
     fn pull(&mut self) -> Option<Envelope<T, D, ()>> {
-        // Round-robin: try each source starting from next_source.
-        for _ in 0..self.num_sources {
-            let idx = self.next_source;
-            self.next_source = (self.next_source + 1) % self.num_sources;
-            if let Some(env) = self.sources[idx].pull() {
-                // Wake the source worker — we freed capacity, so a
-                // backpressured sender can retry.
-                self.wakes.wake(idx);
-                return Some(env);
-            }
+        // First, emit any buffered aggregated watermarks.
+        if let Some(t) = self.pending_watermarks.pop_front() {
+            return Some(Envelope::watermark(t));
         }
-        None
+
+        // Round-robin with retry: if watermarks are absorbed (frontier didn't
+        // advance), data might be queued behind them. Restart the scan so we
+        // don't return None while deliverable messages exist. Each iteration
+        // consumes ≥1 item from a finite-capacity channel, guaranteeing
+        // termination.
+        loop {
+            let mut absorbed_watermark = false;
+            for _ in 0..self.num_sources {
+                let idx = self.next_source;
+                self.next_source = (self.next_source + 1) % self.num_sources;
+                if let Some(env) = self.sources[idx].pull() {
+                    // Wake the source worker — we freed capacity, so a
+                    // backpressured sender can retry.
+                    self.wakes.wake(idx);
+
+                    match env.payload {
+                        Payload::Data { .. } => return Some(env),
+                        Payload::Control(ControlSignal::Watermark(t)) => {
+                            // Aggregate: update source frontier, emit only if
+                            // the overall frontier advanced.
+                            let new_watermarks = self.frontier_agg.update(idx, t);
+                            for wm in new_watermarks {
+                                self.pending_watermarks.push_back(wm);
+                            }
+                            // Return a buffered watermark if available, else continue.
+                            if let Some(t) = self.pending_watermarks.pop_front() {
+                                return Some(Envelope::watermark(t));
+                            }
+                            // Frontier didn't advance — mark for retry.
+                            absorbed_watermark = true;
+                        }
+                        Payload::Control(_) => {
+                            // Errors pass through immediately.
+                            return Some(env);
+                        }
+                    }
+                }
+            }
+            if !absorbed_watermark {
+                return None;
+            }
+            // Watermarks absorbed — data might follow. Retry round-robin.
+        }
     }
 
     fn drain_into(&mut self, buffer: &mut Vec<Envelope<T, D, ()>>) -> usize {
         let mut count = 0;
+
+        // Emit any buffered aggregated watermarks first.
+        while let Some(t) = self.pending_watermarks.pop_front() {
+            buffer.push(Envelope::watermark(t));
+            count += 1;
+        }
+
         // Drain round-robin until no source has data.
         loop {
             let mut found_any = false;
             for src_idx in 0..self.num_sources {
                 if let Some(env) = self.sources[src_idx].pull() {
-                    buffer.push(env);
-                    count += 1;
                     found_any = true;
                     self.wakes.wake(src_idx);
+
+                    match env.payload {
+                        Payload::Data { .. } => {
+                            buffer.push(env);
+                            count += 1;
+                        }
+                        Payload::Control(ControlSignal::Watermark(t)) => {
+                            let new_watermarks = self.frontier_agg.update(src_idx, t);
+                            for wm in new_watermarks {
+                                buffer.push(Envelope::watermark(wm));
+                                count += 1;
+                            }
+                        }
+                        Payload::Control(_) => {
+                            // Errors pass through immediately.
+                            buffer.push(env);
+                            count += 1;
+                        }
+                    }
                 }
             }
             if !found_any {
@@ -752,5 +953,221 @@ mod tests {
             .collect();
         all_data.sort();
         assert_eq!(all_data, vec![1, 2, 3, 4]);
+    }
+
+    // -------------------------------------------------------------------
+    // FrontierAggregator tests
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn frontier_aggregator_initial_frontier() {
+        let agg = FrontierAggregator::<u64>::new(3);
+        // Initial frontier = {T::minimum()} = {0}
+        assert_eq!(agg.frontier().elements(), &[0u64]);
+    }
+
+    #[test]
+    fn frontier_aggregator_single_source_advance() {
+        let mut agg = FrontierAggregator::<u64>::new(1);
+        // Source 0 advances from minimum(0) to 5.
+        let emitted = agg.update(0, 5);
+        // Frontier should now be {5}.
+        assert_eq!(agg.frontier().elements(), &[5u64]);
+        assert_eq!(emitted, vec![5]);
+    }
+
+    #[test]
+    fn frontier_aggregator_two_sources_staggered() {
+        let mut agg = FrontierAggregator::<u64>::new(2);
+        // Initial frontier = {0} (both at minimum).
+
+        // Source 0 advances to 5 — but source 1 is still at 0.
+        let emitted = agg.update(0, 5);
+        assert_eq!(agg.frontier().elements(), &[0u64]); // held back by source 1
+        assert!(emitted.is_empty());
+
+        // Source 1 advances to 3 — overall frontier should be {3}.
+        let emitted = agg.update(1, 3);
+        assert_eq!(agg.frontier().elements(), &[3u64]);
+        assert_eq!(emitted, vec![3]);
+
+        // Source 1 advances to 7 — overall frontier should be {5} (source 0 = 5).
+        let emitted = agg.update(1, 7);
+        assert_eq!(agg.frontier().elements(), &[5u64]);
+        assert_eq!(emitted, vec![5]);
+
+        // Source 0 advances to 7 — overall frontier should be {7}.
+        let emitted = agg.update(0, 7);
+        assert_eq!(agg.frontier().elements(), &[7u64]);
+        assert_eq!(emitted, vec![7]);
+    }
+
+    #[test]
+    fn frontier_aggregator_all_close() {
+        let mut agg = FrontierAggregator::<u64>::new(2);
+
+        // Both advance to 10 — only the second triggers emission.
+        let e1 = agg.update(0, 10);
+        let e2 = agg.update(1, 10);
+        assert!(e1.is_empty());
+        assert_eq!(e2, vec![10]);
+        assert_eq!(agg.frontier().elements(), &[10u64]);
+    }
+
+    // -------------------------------------------------------------------
+    // ExchangePull frontier aggregation integration tests
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn exchange_pull_aggregates_watermarks() {
+        let mut set = ExchangeChannelSet::<u64, i32>::new(2, 16);
+        let wakes = Arc::new(SharedWakeRegistry::new(2));
+
+        let (mut pushers0, pullers0) = set.take_pair(0).unwrap();
+        let (mut pushers1, _pullers1) = set.take_pair(1).unwrap();
+
+        let mut pull = ExchangePull::new(pullers0, wakes.clone());
+
+        // Source 0 sends watermark(5) to worker 0.
+        pushers0[0]
+            .push(Envelope::watermark(5u64))
+            .unwrap();
+        // Should NOT emit — source 1 hasn't advanced, so frontier stays at 0.
+        // The watermark is absorbed by the aggregator without advancing the frontier.
+        assert!(pull.pull().is_none());
+
+        // Source 1 sends watermark(3) to worker 0.
+        pushers1[0]
+            .push(Envelope::watermark(3u64))
+            .unwrap();
+        // Now both have advanced: min(5, 3) = 3. Should emit watermark(3).
+        let env = pull.pull().unwrap();
+        match env.payload {
+            Payload::Control(ControlSignal::Watermark(t)) => assert_eq!(t, 3),
+            _ => panic!("expected aggregated watermark(3), got {:?}", env.payload),
+        }
+
+        // No more messages.
+        assert!(pull.pull().is_none());
+    }
+
+    #[test]
+    fn exchange_pull_passes_data_through() {
+        let mut set = ExchangeChannelSet::<u64, i32>::new(2, 16);
+        let wakes = Arc::new(SharedWakeRegistry::new(2));
+
+        let (mut pushers0, pullers0) = set.take_pair(0).unwrap();
+        let (_pushers1, _pullers1) = set.take_pair(1).unwrap();
+
+        let mut pull = ExchangePull::new(pullers0, wakes.clone());
+
+        // Data passes through unchanged.
+        pushers0[0]
+            .push(Envelope::data(1u64, vec![42]))
+            .unwrap();
+        let env = pull.pull().unwrap();
+        let (t, d) = env.as_data().unwrap();
+        assert_eq!(*t, 1);
+        assert_eq!(d, &vec![42]);
+    }
+
+    #[test]
+    fn exchange_pull_errors_pass_through_immediately() {
+        let mut set = ExchangeChannelSet::<u64, i32>::new(2, 16);
+        let wakes = Arc::new(SharedWakeRegistry::new(2));
+
+        let (mut pushers0, pullers0) = set.take_pair(0).unwrap();
+        let (_pushers1, _pullers1) = set.take_pair(1).unwrap();
+
+        let mut pull = ExchangePull::new(pullers0, wakes.clone());
+
+        // Error passes through immediately without aggregation.
+        pushers0[0]
+            .push(Envelope::error("op1", "test error"))
+            .unwrap();
+        let env = pull.pull().unwrap();
+        match &env.payload {
+            Payload::Control(ControlSignal::Error { message, .. }) => {
+                assert_eq!(message, "test error");
+            }
+            _ => panic!("expected error, got {:?}", env.payload),
+        }
+    }
+
+    #[test]
+    fn exchange_pull_drain_aggregates_watermarks() {
+        let mut set = ExchangeChannelSet::<u64, i32>::new(2, 16);
+        let wakes = Arc::new(SharedWakeRegistry::new(2));
+
+        let (mut pushers0, pullers0) = set.take_pair(0).unwrap();
+        let (mut pushers1, _pullers1) = set.take_pair(1).unwrap();
+
+        // Source 0: data + watermark(10)
+        pushers0[0]
+            .push(Envelope::data(1u64, vec![1]))
+            .unwrap();
+        pushers0[0]
+            .push(Envelope::watermark(10u64))
+            .unwrap();
+        // Source 1: watermark(7)
+        pushers1[0]
+            .push(Envelope::watermark(7u64))
+            .unwrap();
+
+        let mut pull = ExchangePull::new(pullers0, wakes.clone());
+        let mut buffer = Vec::new();
+        let count = pull.drain_into(&mut buffer);
+
+        // Should have: 1 data + 1 aggregated watermark(7).
+        // Source 0 watermark(10) + source 1 watermark(7) → frontier = {7}.
+        let data_count = buffer.iter().filter(|e| e.as_data().is_some()).count();
+        let watermark_count = buffer
+            .iter()
+            .filter(|e| matches!(e.payload, Payload::Control(ControlSignal::Watermark(_))))
+            .count();
+
+        assert_eq!(data_count, 1);
+        assert_eq!(watermark_count, 1);
+        assert_eq!(count, 2);
+
+        // Verify the watermark value.
+        let wm = buffer
+            .iter()
+            .find_map(|e| match &e.payload {
+                Payload::Control(ControlSignal::Watermark(t)) => Some(*t),
+                _ => None,
+            })
+            .unwrap();
+        assert_eq!(wm, 7);
+    }
+
+    #[test]
+    fn exchange_pull_data_behind_absorbed_watermark() {
+        // Regression test: pull() must not return None when data is queued
+        // behind an absorbed watermark. Source 0 sends [watermark(5), data],
+        // source 1 hasn't advanced → watermark absorbed, but data must still
+        // be returned in the same pull() call.
+        let mut set = ExchangeChannelSet::<u64, i32>::new(2, 16);
+        let wakes = Arc::new(SharedWakeRegistry::new(2));
+
+        let (mut pushers0, pullers0) = set.take_pair(0).unwrap();
+        let (_pushers1, _pullers1) = set.take_pair(1).unwrap();
+
+        let mut pull = ExchangePull::new(pullers0, wakes.clone());
+
+        // Source 0: watermark(5) followed by data.
+        pushers0[0]
+            .push(Envelope::watermark(5u64))
+            .unwrap();
+        pushers0[0]
+            .push(Envelope::data(6u64, vec![99]))
+            .unwrap();
+
+        // pull() should absorb the watermark (source 1 still at 0) and
+        // then return the data — NOT None.
+        let env = pull.pull().unwrap();
+        let (t, d) = env.as_data().unwrap();
+        assert_eq!(*t, 6);
+        assert_eq!(d, &vec![99]);
     }
 }
