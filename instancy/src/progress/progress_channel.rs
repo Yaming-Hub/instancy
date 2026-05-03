@@ -35,6 +35,16 @@
 //!
 //! Senders notify the target worker's [`WakeHandle`] on send, ensuring
 //! idle workers are woken to process incoming progress updates.
+//!
+//! # Network progress
+//!
+//! For cross-node progress exchange, the `Network` variant of
+//! [`ProgressSender`] serializes changes and sends them via an unbounded
+//! intermediary channel to a bridge task that feeds into the
+//! [`TransportSession`](crate::communication::TransportSession)'s
+//! priority progress channel. On the receiving side, a bridge task
+//! reads from the Demuxer, deserializes, and pushes into the same
+//! `SharedBuffer` used by local progress, waking the target worker.
 
 use std::collections::VecDeque;
 use std::sync::{Arc, Mutex};
@@ -52,25 +62,48 @@ use crate::dataflow::channels::wake::WakeHandle;
 pub type ProgressChange<T> = (usize, usize, T, i64);
 
 /// Shared buffer between a sender/receiver pair.
-struct SharedBuffer<T> {
-    queue: VecDeque<Vec<ProgressChange<T>>>,
+pub(crate) struct SharedBuffer<T> {
+    pub(crate) queue: VecDeque<Vec<ProgressChange<T>>>,
 }
 
 /// Sends progress updates to a single peer worker.
 ///
-/// Each send appends a batch of changes to a FIFO queue. The target
-/// worker's [`WakeHandle`] is notified so it wakes up to process
-/// the incoming progress.
+/// # Variants
+///
+/// - **Local**: Appends to a shared in-memory buffer and wakes the target
+///   worker directly. Used for same-process workers.
+/// - **Network** (requires `transport` feature): Serializes the batch and
+///   sends it via an unbounded channel to a bridge task that feeds the
+///   [`TransportSession`](crate::communication::TransportSession).
+///   Delivery is reliable — the unbounded channel never drops frames.
+///   The bridge task handles backpressure to the bounded transport layer.
 pub struct ProgressSender<T: Timestamp> {
-    buffer: Arc<Mutex<SharedBuffer<T>>>,
-    /// Wake handle of the TARGET worker, notified on each send.
-    target_wake: WakeHandle,
+    pub(crate) inner: SenderInner<T>,
+}
+
+pub(crate) enum SenderInner<T: Timestamp> {
+    Local {
+        buffer: Arc<Mutex<SharedBuffer<T>>>,
+        target_wake: WakeHandle,
+    },
+    #[cfg(feature = "transport")]
+    Network {
+        /// Type-erased send function that serializes and sends.
+        /// Captures the codec, channel IDs, and unbounded sender at
+        /// construction time so ProgressSender<T> doesn't require
+        /// T: ExchangeData.
+        send_fn: Box<dyn Fn(Vec<ProgressChange<T>>) + Send + Sync>,
+    },
 }
 
 /// Receives progress updates from a single peer worker.
 ///
 /// Drains all queued batches in FIFO order. This is called during
 /// the progress propagation phase of the executor sweep.
+///
+/// For network progress, a background bridge task pushes deserialized
+/// batches into the same shared buffer, so this type works identically
+/// for both local and network progress.
 pub struct ProgressReceiver<T: Timestamp> {
     buffer: Arc<Mutex<SharedBuffer<T>>>,
 }
@@ -90,24 +123,47 @@ pub struct WorkerProgressChannels<T: Timestamp> {
 }
 
 impl<T: Timestamp> ProgressSender<T> {
+    /// Create a local in-memory progress sender.
+    pub(crate) fn local(buffer: Arc<Mutex<SharedBuffer<T>>>, target_wake: WakeHandle) -> Self {
+        Self {
+            inner: SenderInner::Local { buffer, target_wake },
+        }
+    }
+
     /// Send a batch of progress changes to the peer.
     ///
     /// The batch is appended to the FIFO queue and the target worker is woken.
     /// Empty batches are ignored (no wake notification sent).
+    ///
+    /// For network senders, the batch is serialized and enqueued into an
+    /// unbounded channel for reliable delivery. The send never fails
+    /// (unless the bridge task has exited, which indicates a fatal error).
     pub fn send(&self, changes: Vec<ProgressChange<T>>) {
         if changes.is_empty() {
             return;
         }
-        {
-            let mut buf = self.buffer.lock().expect("progress channel lock poisoned");
-            buf.queue.push_back(changes);
+        match &self.inner {
+            SenderInner::Local { buffer, target_wake } => {
+                {
+                    let mut buf = buffer.lock().expect("progress channel lock poisoned");
+                    buf.queue.push_back(changes);
+                }
+                target_wake.notify();
+            }
+            #[cfg(feature = "transport")]
+            SenderInner::Network { send_fn } => {
+                send_fn(changes);
+            }
         }
-        // Wake the target worker so it processes the progress update.
-        self.target_wake.notify();
     }
 }
 
 impl<T: Timestamp> ProgressReceiver<T> {
+    /// Create a progress receiver from a shared buffer.
+    pub(crate) fn new(buffer: Arc<Mutex<SharedBuffer<T>>>) -> Self {
+        Self { buffer }
+    }
+
     /// Drain all queued progress batches from this peer.
     ///
     /// Returns an iterator over batches in FIFO order.
@@ -161,13 +217,11 @@ pub fn create_progress_channels<T: Timestamp>(
                 queue: VecDeque::new(),
             }));
 
-            let sender = ProgressSender {
-                buffer: Arc::clone(&shared),
-                target_wake: wake_handles[dst].clone(),
-            };
-            let receiver = ProgressReceiver {
-                buffer: shared,
-            };
+            let sender = ProgressSender::local(
+                Arc::clone(&shared),
+                wake_handles[dst].clone(),
+            );
+            let receiver = ProgressReceiver::new(shared);
 
             all_channels[src].senders[dst] = Some(sender);
             all_channels[dst].receivers[src] = Some(receiver);
