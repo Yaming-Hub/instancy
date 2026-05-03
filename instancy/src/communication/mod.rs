@@ -13,6 +13,7 @@ pub mod progress_exchange;
 pub mod remote_push;
 pub mod session;
 pub mod transport;
+pub mod transport_session;
 
 pub use allocator::{AllocatorConfig, ChannelAllocator, DEFAULT_CHANNEL_CAPACITY};
 pub use codec::{Codec, CodecError, Data, ExchangeData, FixedSizeCodec, RawBytesCodec, StringCodec, MAX_MESSAGE_SIZE};
@@ -30,4 +31,10 @@ pub use progress_exchange::{PeerProgressSender, ProgressExchange, ProgressExchan
 pub use transport::{
     ChannelReceiver, DemuxConfig, Demuxer, FramedReader, FramedWriter, MuxConfig, Muxer,
     MuxerSender,
+};
+
+#[cfg(feature = "transport")]
+pub use transport_session::{
+    ChannelRegistration, PeerConnection, TransportSession,
+    CONTROL_CHANNEL_ID, PROGRESS_CHANNEL_BASE,
 };

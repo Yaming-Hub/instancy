@@ -55,7 +55,7 @@
 //! [`Codec`]: crate::communication::codec::Codec
 //! [`EdgeMaterializer`]: crate::dataflow::channels::edge_materializer::EdgeMaterializer
 
-use std::sync::{mpsc as std_mpsc, Arc, Mutex};
+use std::sync::Arc;
 
 use crate::communication::codec::{Codec, CodecError, ExchangeData};
 use crate::dataflow::channels::bounded::{bounded_channel, BoundedPull, BoundedPush};
@@ -69,8 +69,10 @@ use crate::progress::timestamp::Timestamp;
 use crate::worker::WorkerId;
 
 #[cfg(feature = "transport")]
-use crate::communication::transport::{
-    DemuxConfig, Demuxer, Frame, FramedWriter,
+use crate::communication::transport::Frame;
+#[cfg(feature = "transport")]
+use crate::communication::transport_session::{
+    ChannelRegistration, PeerConnection, TransportSession,
 };
 
 #[cfg(feature = "transport")]
@@ -252,10 +254,8 @@ where
 // ---------------------------------------------------------------------------
 
 /// A `Push` endpoint that serializes envelopes through a [`Codec`] and
-/// sends the resulting bytes as frames to a Muxer via a sync channel.
-///
-/// The Muxer background task multiplexes frames from multiple `NetworkPush`
-/// endpoints onto a single TCP connection.
+/// sends the resulting bytes as frames via a [`TransportSession`]'s
+/// data-priority channel.
 ///
 /// On `close()`, an explicit close-sentinel frame is sent so the remote
 /// [`NetworkPull`] can detect per-channel exhaustion.
@@ -265,10 +265,10 @@ pub struct NetworkPush<T: Timestamp + ExchangeData, D: ExchangeData> {
     data_codec: D::CodecType,
     dataflow_id: DataflowId,
     channel_id: u64,
-    sender: std_mpsc::SyncSender<Frame>,
+    sender: tokio_mpsc::Sender<Frame>,
     closed: bool,
-    /// Shared transport state that keeps background tasks alive.
-    _transport: Arc<TransportState>,
+    /// Shared transport session that keeps background tasks alive.
+    _session: Arc<TransportSession>,
 }
 
 #[cfg(feature = "transport")]
@@ -287,8 +287,8 @@ impl<T: Timestamp + ExchangeData, D: ExchangeData> NetworkPush<T, D> {
             payload,
         };
         self.sender.try_send(frame).map_err(|e| match e {
-            std_mpsc::TrySendError::Full(_) => Error::Backpressure,
-            std_mpsc::TrySendError::Disconnected(_) => Error::ChannelClosed,
+            tokio_mpsc::error::TrySendError::Full(_) => Error::Backpressure,
+            tokio_mpsc::error::TrySendError::Closed(_) => Error::ChannelClosed,
         })
     }
 }
@@ -330,8 +330,18 @@ impl<T: Timestamp + ExchangeData, D: ExchangeData> Push<T, D, ()>
     fn close(&mut self) {
         if !self.closed {
             self.closed = true;
-            // Send close sentinel using blocking send to ensure delivery.
-            // This is a terminal one-shot operation; blocking is acceptable.
+            // Best-effort close sentinel delivery.
+            //
+            // We use try_send (non-blocking) instead of a spin loop because:
+            // - A spin loop with std::thread::yield_now() can deadlock on
+            //   single-threaded tokio runtimes (the bridge task that drains
+            //   the channel can't be scheduled while we hold the thread).
+            // - If the queue is full, the sentinel is lost, but the remote
+            //   side will detect EOF when the TCP connection closes (session
+            //   drop aborts all tasks).
+            //
+            // Callers should ensure the channel is not saturated before close,
+            // or rely on EOF-based exhaustion detection as a fallback.
             let mut buf = Vec::new();
             encode_close(&mut buf);
             let frame = Frame {
@@ -339,7 +349,13 @@ impl<T: Timestamp + ExchangeData, D: ExchangeData> Push<T, D, ()>
                 channel_id: self.channel_id,
                 payload: buf,
             };
-            let _ = self.sender.send(frame); // blocks until space or disconnected
+            if let Err(_e) = self.sender.try_send(frame) {
+                #[cfg(feature = "tracing")]
+                tracing::warn!(
+                    "close sentinel lost for channel {} (queue full or closed): {_e}",
+                    self.channel_id,
+                );
+            }
         }
     }
 
@@ -399,8 +415,8 @@ pub struct NetworkPull<T: Timestamp + ExchangeData, D: ExchangeData> {
     data_codec: D::CodecType,
     receiver: tokio_mpsc::Receiver<Vec<u8>>,
     exhausted: bool,
-    /// Shared transport state that keeps background tasks alive.
-    _transport: Arc<TransportState>,
+    /// Shared transport session that keeps background tasks alive.
+    _session: Arc<TransportSession>,
 }
 
 #[cfg(feature = "transport")]
@@ -441,71 +457,6 @@ impl<T: Timestamp + ExchangeData, D: ExchangeData> Pull<T, D, ()>
 }
 
 // ---------------------------------------------------------------------------
-// TransportState — shared lifetime anchor for background tasks
-// ---------------------------------------------------------------------------
-
-/// Holds references that keep Muxer/Demuxer background tasks alive.
-///
-/// This is wrapped in `Arc` and shared by all `NetworkPush`/`NetworkPull`
-/// endpoints. When the last reference is dropped (all Push/Pull endpoints
-/// gone), background tasks are aborted to prevent leaks.
-#[cfg(feature = "transport")]
-struct TransportState {
-    /// Muxer bridge task handles.
-    mux_handles: Vec<tokio::task::JoinHandle<()>>,
-    /// Demuxer task handles.
-    demux_handles: Vec<tokio::task::JoinHandle<()>>,
-}
-
-#[cfg(feature = "transport")]
-impl TransportState {
-    fn new(
-        mux_handles: Vec<tokio::task::JoinHandle<()>>,
-        demux_handles: Vec<tokio::task::JoinHandle<()>>,
-    ) -> Self {
-        Self {
-            mux_handles,
-            demux_handles,
-        }
-    }
-}
-
-#[cfg(feature = "transport")]
-impl Drop for TransportState {
-    fn drop(&mut self) {
-        // Abort background tasks to prevent leaks. Mux tasks will also
-        // terminate naturally when all SyncSenders are dropped, but
-        // Demuxer tasks may block on reads indefinitely without abort.
-        for handle in &self.mux_handles {
-            handle.abort();
-        }
-        for handle in &self.demux_handles {
-            handle.abort();
-        }
-    }
-}
-
-// ---------------------------------------------------------------------------
-// PeerConnection — a bidirectional connection to a remote node
-// ---------------------------------------------------------------------------
-
-/// A bidirectional connection to a remote peer, split into read/write halves.
-///
-/// The caller provides already-established connections (via [`ConnectionManager`]
-/// or direct TCP). The materializer wraps them with Muxer/Demuxer.
-///
-/// [`ConnectionManager`]: crate::communication::connection::ConnectionManager
-#[cfg(feature = "transport")]
-pub struct PeerConnection<R: AsyncRead + Unpin + Send + 'static, W: AsyncWrite + Unpin + Send + 'static> {
-    /// The node ID this connection leads to.
-    pub node_id: String,
-    /// Read half of the connection (feeds the Demuxer).
-    pub reader: R,
-    /// Write half of the connection (feeds the Muxer).
-    pub writer: W,
-}
-
-// ---------------------------------------------------------------------------
 // NetworkEdgeMaterializer
 // ---------------------------------------------------------------------------
 
@@ -513,45 +464,35 @@ pub struct PeerConnection<R: AsyncRead + Unpin + Send + 'static, W: AsyncWrite +
 ///
 /// Same-node worker pairs use direct `BoundedPush`/`BoundedPull` (zero-copy
 /// shared memory). Cross-node worker pairs use [`NetworkPush`]/[`NetworkPull`]
-/// that serialize through [`Codec`] and transport data over TCP via the
-/// Muxer/Demuxer infrastructure.
+/// that serialize through [`Codec`] and transport data over TCP via
+/// [`TransportSession`].
 ///
 /// # Connection setup
 ///
-/// The caller provides pre-established bidirectional connections to each
-/// remote peer via [`PeerConnection`]. The materializer wraps each
-/// connection with a Muxer (write side) and Demuxer (read side), spawning
-/// background tokio tasks for I/O.
+/// The caller provides a [`TransportSession`] (wrapped in `Arc`) that owns
+/// the per-peer Muxer/Demuxer infrastructure. This allows the session to be
+/// shared with progress channels and control protocols.
 ///
 /// # Channel ID scheme
 ///
 /// Each `(source_worker, target_worker)` pair gets a deterministic channel ID:
 /// `channel_id = source_worker * num_workers + target_worker + 1` (offset by 1
-/// because channel 0 is reserved for progress messages).
+/// because channel 0 is reserved for control messages).
 ///
 /// # Example
 ///
 /// ```ignore
-/// use tokio::net::TcpStream;
-/// use tokio::io::split;
+/// use instancy::communication::{PeerConnection, TransportSession, ChannelRegistration};
 ///
-/// let topology = ClusterTopology::multi_node(vec![
-///     NodeConfig::new("node-a", 2),
-///     NodeConfig::new("node-b", 2),
-/// ]).unwrap();
+/// // Create transport session first
+/// let (session, receivers) = TransportSession::new(
+///     dataflow_id, connections, &data_regs, &[], capacity, &rt,
+/// );
+/// let session = Arc::new(session);
 ///
-/// // Establish TCP connection to node-b
-/// let stream = TcpStream::connect("node-b:9000").await.unwrap();
-/// let (reader, writer) = split(stream);
-///
-/// let connections = vec![PeerConnection {
-///     node_id: "node-b".to_string(),
-///     reader,
-///     writer,
-/// }];
-///
+/// // Then create materializer using the session
 /// let mat = NetworkEdgeMaterializer::<u64, String>::new(
-///     dataflow_id, topology, "node-a", connections, 1024,
+///     dataflow_id, topology, "node-a", session, receivers, capacity,
 /// );
 /// ```
 #[cfg(feature = "transport")]
@@ -561,12 +502,8 @@ pub struct NetworkEdgeMaterializer<T: Timestamp + ExchangeData, D: ExchangeData>
     topology: ClusterTopology,
     dataflow_id: DataflowId,
 
-    /// Shared transport state (Arc so it outlives this materializer).
-    transport: Arc<TransportState>,
-
-    /// Per-peer sync senders: node_id → SyncSender<Frame>
-    /// Multiple NetworkPush endpoints sharing the same peer clone from here.
-    peer_senders: std::collections::HashMap<String, std_mpsc::SyncSender<Frame>>,
+    /// Shared transport session (Arc so it outlives this materializer).
+    session: Arc<TransportSession>,
 
     /// Demuxer channel receivers for remote pull endpoints.
     /// Key: (source_worker, target_worker) → tokio::mpsc::Receiver<Vec<u8>>
@@ -582,27 +519,25 @@ pub struct NetworkEdgeMaterializer<T: Timestamp + ExchangeData, D: ExchangeData>
 
 #[cfg(feature = "transport")]
 impl<T: Timestamp + ExchangeData, D: ExchangeData> NetworkEdgeMaterializer<T, D> {
-    /// Create a network edge materializer.
+    /// Create a network edge materializer from a pre-built [`TransportSession`].
     ///
     /// # Arguments
     /// - `dataflow_id`: Unique ID for this dataflow (used in frame routing).
     /// - `topology`: Cluster topology describing all nodes and workers.
     /// - `local_node_id`: The node ID of this process.
-    /// - `connections`: Pre-established connections to each remote peer.
-    /// - `capacity`: Buffer capacity for local channels and frame queues.
-    /// - `runtime_handle`: Tokio runtime handle for spawning Muxer/Demuxer tasks.
-    pub fn new<R, W>(
+    /// - `session`: Shared transport session (owns Muxer/Demuxer tasks).
+    /// - `receivers`: Channel receivers from [`TransportSession::new()`],
+    ///   keyed by `peer_node_id → channel_id`. Only data channel receivers
+    ///   are consumed here.
+    /// - `capacity`: Buffer capacity for local bounded channels.
+    pub fn new(
         dataflow_id: DataflowId,
         topology: ClusterTopology,
         local_node_id: impl Into<String>,
-        connections: Vec<PeerConnection<R, W>>,
+        session: Arc<TransportSession>,
+        mut receivers: std::collections::HashMap<String, std::collections::HashMap<u64, tokio_mpsc::Receiver<Vec<u8>>>>,
         capacity: usize,
-        runtime_handle: &tokio::runtime::Handle,
-    ) -> Self
-    where
-        R: AsyncRead + Unpin + Send + 'static,
-        W: AsyncWrite + Unpin + Send + 'static,
-    {
+    ) -> Self {
         let local_node_id = local_node_id.into();
         let num_workers = topology.total_workers();
 
@@ -624,87 +559,32 @@ impl<T: Timestamp + ExchangeData, D: ExchangeData> NetworkEdgeMaterializer<T, D>
             }
         }
 
-        // --- Set up Muxer/Demuxer per peer ---
-        let mut mux_handles = Vec::new();
-        let mut demux_handles = Vec::new();
-        let mut peer_senders = std::collections::HashMap::new();
+        // --- Extract demux receivers for remote pull endpoints ---
         let mut demux_receivers = std::collections::HashMap::new();
-
-        for conn in connections {
-            let peer_node_id = conn.node_id.clone();
-
-            // --- Muxer (write side) ---
-            // Use a sync channel as the bridge: NetworkPush calls try_send(),
-            // a bridge task reads and forwards to FramedWriter.
-            let (sync_tx, sync_rx) = std_mpsc::sync_channel::<Frame>(capacity);
-            peer_senders.insert(peer_node_id.clone(), sync_tx);
-
-            let writer = conn.writer;
-            let sync_rx = Arc::new(Mutex::new(sync_rx));
-            let mux_handle = runtime_handle.spawn(async move {
-                let mut framed_writer = FramedWriter::new(writer);
-                // Bridge: read from sync channel, write to framed writer.
-                // We use spawn_blocking to avoid blocking the async runtime.
-                loop {
-                    let rx_clone = sync_rx.clone();
-                    let frame = match tokio::task::spawn_blocking(move || {
-                        let rx = rx_clone.lock().unwrap();
-                        rx.recv().ok()
-                    })
-                    .await
-                    {
-                        Ok(Some(frame)) => frame,
-                        Ok(None) | Err(_) => break, // All senders dropped or task cancelled
-                    };
-
-                    if let Err(e) = framed_writer.write_frame(&frame).await {
-                        #[cfg(feature = "tracing")]
-                        tracing::error!("Muxer write error for peer {}: {e}", peer_node_id);
-                        break;
-                    }
-                }
-            });
-            mux_handles.push(mux_handle);
-
-            // --- Demuxer (read side) ---
-            let reader = conn.reader;
-            let mut demuxer = Demuxer::new(reader, DemuxConfig::default());
-
-            // Register channels for all remote worker pairs where
-            // source is on the peer and destination is on this node.
-            let local_range = topology.worker_range(&local_node_id);
-            let peer_range = topology.worker_range(&conn.node_id);
-
-            if let (Some((local_start, local_end)), Some((peer_start, peer_end))) =
-                (local_range, peer_range)
-            {
-                for src in peer_start..peer_end {
+        let local_range = topology.worker_range(&local_node_id);
+        if let Some((local_start, local_end)) = local_range {
+            for src in 0..num_workers {
+                let src_node = topology.node_for_worker(WorkerId::new(src));
+                if src_node != Some(local_node_id.as_str()) {
+                    let peer_id = src_node.unwrap_or("");
                     for dst in local_start..local_end {
                         let channel_id = Self::channel_id(src, dst, num_workers);
-                        let rx = demuxer.register_channel(dataflow_id, channel_id);
-                        demux_receivers.insert((src, dst), rx);
+                        if let Some(peer_map) = receivers.get_mut(peer_id) {
+                            if let Some(rx) = peer_map.remove(&channel_id) {
+                                demux_receivers.insert((src, dst), rx);
+                            }
+                        }
                     }
                 }
             }
-
-            let demux_handle = runtime_handle.spawn(async move {
-                if let Err(e) = demuxer.run().await {
-                    #[cfg(feature = "tracing")]
-                    tracing::error!("Demuxer error: {e}");
-                }
-            });
-            demux_handles.push(demux_handle);
         }
-
-        let transport = Arc::new(TransportState::new(mux_handles, demux_handles));
 
         Self {
             num_workers,
             local_node_id,
             topology,
             dataflow_id,
-            transport,
-            peer_senders,
+            session,
             demux_receivers,
             local_push,
             local_pull,
@@ -712,10 +592,61 @@ impl<T: Timestamp + ExchangeData, D: ExchangeData> NetworkEdgeMaterializer<T, D>
         }
     }
 
+    /// Convenience constructor that creates a [`TransportSession`] internally.
+    ///
+    /// Use this when you don't need to share the session with progress channels
+    /// or control protocols (e.g., single-dataflow setups or testing).
+    pub fn with_connections<R, W>(
+        dataflow_id: DataflowId,
+        topology: ClusterTopology,
+        local_node_id: impl Into<String>,
+        connections: Vec<PeerConnection<R, W>>,
+        capacity: usize,
+        runtime_handle: &tokio::runtime::Handle,
+    ) -> Self
+    where
+        R: AsyncRead + Unpin + Send + 'static,
+        W: AsyncWrite + Unpin + Send + 'static,
+    {
+        let local_node_id_str: String = local_node_id.into();
+        let num_workers = topology.total_workers();
+
+        // Build data channel registrations for all remote pairs where
+        // source is on a peer and destination is on this node.
+        let local_range = topology.worker_range(&local_node_id_str);
+        let peer_node_ids: Vec<String> = connections.iter().map(|c| c.node_id.clone()).collect();
+
+        let mut data_regs = Vec::new();
+        if let Some((local_start, local_end)) = local_range {
+            for peer_id in &peer_node_ids {
+                if let Some((peer_start, peer_end)) = topology.worker_range(peer_id) {
+                    for src in peer_start..peer_end {
+                        for dst in local_start..local_end {
+                            let channel_id = Self::channel_id(src, dst, num_workers);
+                            data_regs.push(ChannelRegistration {
+                                peer_node_id: peer_id.clone(),
+                                channel_id,
+                            });
+                        }
+                    }
+                }
+            }
+        }
+
+        let (session, receivers) = TransportSession::new(
+            dataflow_id, connections, &data_regs, &[], capacity, runtime_handle,
+        );
+
+        Self::new(
+            dataflow_id, topology, local_node_id_str,
+            Arc::new(session), receivers, capacity,
+        )
+    }
+
     /// Deterministic channel ID for a (source, target) worker pair.
     ///
-    /// Channel 0 is reserved for progress messages, so IDs start at 1.
-    fn channel_id(source: usize, target: usize, num_workers: usize) -> u64 {
+    /// Channel 0 is reserved for control messages, so data IDs start at 1.
+    pub fn channel_id(source: usize, target: usize, num_workers: usize) -> u64 {
         (source * num_workers + target + 1) as u64
     }
 }
@@ -768,7 +699,7 @@ impl<T: Timestamp + ExchangeData, D: ExchangeData> EdgeMaterializer<T, D>
                 pushers.push(Box::new(push));
             } else {
                 // Remote pair — use NetworkPush
-                let sender = self.peer_senders.get(dst_node)
+                let sender = self.session.data_sender(dst_node)
                     .ok_or_else(|| Error::Custom(format!(
                         "no connection to peer node '{dst_node}'"
                     )))?
@@ -782,7 +713,7 @@ impl<T: Timestamp + ExchangeData, D: ExchangeData> EdgeMaterializer<T, D>
                     channel_id,
                     sender,
                     closed: false,
-                    _transport: self.transport.clone(),
+                    _session: self.session.clone(),
                 }));
             }
         }
@@ -815,7 +746,7 @@ impl<T: Timestamp + ExchangeData, D: ExchangeData> EdgeMaterializer<T, D>
                     data_codec: D::codec(),
                     receiver,
                     exhausted: false,
-                    _transport: self.transport.clone(),
+                    _session: self.session.clone(),
                 }));
             }
         }
@@ -916,7 +847,7 @@ mod tests {
             let (a_to_b, b_from_a) = tokio::io::duplex(64 * 1024);
             let (b_to_a, a_from_b) = tokio::io::duplex(64 * 1024);
 
-            let mat_a = NetworkEdgeMaterializer::<u64, u64>::new(
+            let mat_a = NetworkEdgeMaterializer::<u64, u64>::with_connections(
                 dataflow_id,
                 topology.clone(),
                 "node-a",
@@ -929,7 +860,7 @@ mod tests {
                 rt,
             );
 
-            let mat_b = NetworkEdgeMaterializer::<u64, u64>::new(
+            let mat_b = NetworkEdgeMaterializer::<u64, u64>::with_connections(
                 dataflow_id,
                 topology,
                 "node-b",
@@ -1106,12 +1037,12 @@ mod tests {
             let (a_to_b, b_from_a) = tokio::io::duplex(64 * 1024);
             let (b_to_a, a_from_b) = tokio::io::duplex(64 * 1024);
 
-            let mut mat_a = NetworkEdgeMaterializer::<u64, String>::new(
+            let mut mat_a = NetworkEdgeMaterializer::<u64, String>::with_connections(
                 df_id, topo.clone(), "a",
                 vec![PeerConnection { node_id: "b".to_string(), reader: a_from_b, writer: a_to_b }],
                 16, &rt,
             );
-            let mut mat_b = NetworkEdgeMaterializer::<u64, String>::new(
+            let mut mat_b = NetworkEdgeMaterializer::<u64, String>::with_connections(
                 df_id, topo, "b",
                 vec![PeerConnection { node_id: "a".to_string(), reader: b_from_a, writer: b_to_a }],
                 16, &rt,
