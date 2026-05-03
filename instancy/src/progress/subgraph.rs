@@ -22,6 +22,7 @@ use std::fmt;
 use crate::progress::change_batch::ChangeBatch;
 use crate::progress::frontier::Antichain;
 use crate::progress::operate::{OperatorProgress, PortConnectivity};
+use crate::progress::progress_channel::{ProgressChange, WorkerProgressChannels};
 use crate::progress::reachability::{Builder as ReachabilityBuilder, Location, Tracker};
 use crate::progress::timestamp::Timestamp;
 
@@ -237,6 +238,8 @@ impl<T: Timestamp> SubgraphBuilder<T> {
             initialized: false,
             completed: false,
             dirty_operators: Vec::new(),
+            progress_channels: None,
+            local_changes_buffer: Vec::new(),
         }
     }
 }
@@ -298,6 +301,17 @@ pub struct ProgressTracker<T: Timestamp> {
     completed: bool,
     /// Operators whose frontiers changed in the last propagation round.
     dirty_operators: Vec<usize>,
+    /// Cross-worker progress exchange channels (None for single-worker).
+    ///
+    /// When present, capability changes from local operators are broadcast
+    /// to all peer workers, and peer workers' changes are absorbed into
+    /// this tracker. This makes `is_completed()` reflect GLOBAL state
+    /// across all workers, not just this worker's capabilities.
+    progress_channels: Option<WorkerProgressChannels<T>>,
+    /// Buffer for accumulating local changes to broadcast to peers.
+    /// Populated during `collect_operator_progress()` and drained
+    /// during `broadcast_local_changes()`.
+    local_changes_buffer: Vec<ProgressChange<T>>,
 }
 
 /// Per-operator frontier state tracked by the progress tracker.
@@ -313,6 +327,11 @@ impl<T: Timestamp> ProgressTracker<T> {
     /// Seeds initial capabilities into the reachability tracker.
     ///
     /// Must be called once before the first [`propagate`](Self::propagate) call.
+    ///
+    /// If cross-worker progress channels are attached, this also broadcasts
+    /// the initial capabilities to all peer workers and absorbs peers'
+    /// initial capabilities. This ensures every worker's tracker starts
+    /// with a global view of all capabilities across all workers.
     pub fn initialize(&mut self) {
         assert!(!self.initialized, "ProgressTracker already initialized");
         self.initialized = true;
@@ -322,7 +341,9 @@ impl<T: Timestamp> ProgressTracker<T> {
         for (index, mut caps) in initial_caps {
             for (output, batch) in caps.iter_mut().enumerate() {
                 for (time, diff) in batch.drain() {
-                    self.tracker.update_source(index, output, time, diff);
+                    self.tracker.update_source(index, output, time.clone(), diff);
+                    // Accumulate for broadcasting to peers.
+                    self.local_changes_buffer.push((index, output, time, diff));
                 }
             }
         }
@@ -330,6 +351,10 @@ impl<T: Timestamp> ProgressTracker<T> {
         // Drain any capabilities that operators may have already reported
         // through their ProgressReporter (e.g., from Capability::new).
         self.collect_operator_progress();
+
+        // Broadcast initial capabilities to peers and absorb theirs.
+        self.broadcast_local_changes();
+        self.receive_peer_changes();
 
         // Run initial propagation.
         self.tracker.propagate_all();
@@ -348,14 +373,33 @@ impl<T: Timestamp> ProgressTracker<T> {
 
     /// Collects progress updates from all operators and propagates them.
     ///
+    /// When cross-worker progress channels are attached, this also:
+    /// - Broadcasts local capability changes to all peer workers
+    /// - Absorbs peer workers' capability changes into this tracker
+    ///
+    /// This makes the completion check reflect GLOBAL state across all workers.
+    ///
     /// Returns the list of operator indices whose frontiers changed.
     pub fn propagate(&mut self) -> &[usize] {
         assert!(self.initialized, "must call initialize() first");
 
+        // 1. Collect local capability changes from operators.
+        //    Also accumulates changes into local_changes_buffer for broadcasting.
         self.collect_operator_progress();
+
+        // 2. Broadcast local changes to all peer workers.
+        self.broadcast_local_changes();
+
+        // 3. Receive and apply peer workers' capability changes.
+        self.receive_peer_changes();
+
+        // 4. Propagate all changes through the reachability graph.
         self.tracker.propagate_all();
+
+        // 5. Update per-operator frontiers.
         self.update_operator_frontiers();
 
+        // 6. Check completion — now reflects global state if channels are attached.
         self.completed = !self.tracker.tracking_anything();
 
         &self.dirty_operators
@@ -369,6 +413,43 @@ impl<T: Timestamp> ProgressTracker<T> {
     /// Returns `true` if there are any outstanding capabilities or pending changes.
     pub fn is_tracking(&self) -> bool {
         self.tracker.tracking_anything()
+    }
+
+    /// Attach cross-worker progress exchange channels.
+    ///
+    /// Must be called before [`initialize()`](Self::initialize) so that
+    /// initial capabilities are broadcast to peers during initialization.
+    pub fn set_progress_channels(&mut self, channels: WorkerProgressChannels<T>) {
+        assert!(
+            !self.initialized,
+            "set_progress_channels must be called before initialize()"
+        );
+        self.progress_channels = Some(channels);
+    }
+
+    /// Returns `true` if any peer worker (logical worker in the same
+    /// dataflow) has sent progress updates that haven't been absorbed yet.
+    ///
+    /// "Peer" means another logical worker/executor running the same
+    /// dataflow graph — it may be on the same thread, a different thread,
+    /// or a different machine. The progress channel abstraction is
+    /// physical-layer independent.
+    ///
+    /// Used as a defense-in-depth check before force-close: even if
+    /// `is_completed()` returns true, pending peer progress could
+    /// invalidate that conclusion.
+    pub fn has_pending_peer_progress(&self) -> bool {
+        if let Some(ref channels) = self.progress_channels {
+            channels.receivers.iter().any(|r| {
+                if let Some(recv) = r {
+                    recv.has_pending()
+                } else {
+                    false
+                }
+            })
+        } else {
+            false
+        }
     }
 
     /// Returns the current input frontier for an operator.
@@ -451,7 +532,12 @@ impl<T: Timestamp> ProgressTracker<T> {
     // -- internal --
 
     /// Drains capability changes from all operators' ProgressReporters into the tracker.
+    ///
+    /// Also accumulates changes into `local_changes_buffer` for broadcasting
+    /// to peer workers (if progress channels are attached).
     fn collect_operator_progress(&mut self) {
+        let has_channels = self.progress_channels.is_some();
+
         for &index in &self.operator_indices {
             let progress = &self.progress_buffers[&index];
             let shape = &self.operators[&index];
@@ -462,7 +548,64 @@ impl<T: Timestamp> ProgressTracker<T> {
             for output in 0..shape.outputs {
                 let changes = progress.internal[output].drain();
                 for (time, diff) in changes {
-                    self.tracker.update_source(index, output, time, diff);
+                    self.tracker.update_source(index, output, time.clone(), diff);
+                    // Accumulate for cross-worker broadcast.
+                    if has_channels {
+                        self.local_changes_buffer.push((index, output, time, diff));
+                    }
+                }
+            }
+        }
+    }
+
+    /// Broadcasts accumulated local capability changes to all peer workers.
+    ///
+    /// Drains `local_changes_buffer` and sends to each peer's progress channel.
+    /// No-op if no progress channels are attached (single-worker mode).
+    fn broadcast_local_changes(&mut self) {
+        let channels = match &self.progress_channels {
+            Some(c) => c,
+            None => {
+                self.local_changes_buffer.clear();
+                return;
+            }
+        };
+
+        if self.local_changes_buffer.is_empty() {
+            return;
+        }
+
+        let changes = std::mem::take(&mut self.local_changes_buffer);
+        for sender in &channels.senders {
+            if let Some(s) = sender {
+                s.send(changes.clone());
+            }
+        }
+    }
+
+    /// Receives and applies peer workers' capability changes to this tracker.
+    ///
+    /// Drains all pending progress batches from all peer receivers and
+    /// applies each change via `tracker.update_source()`. This makes the
+    /// local tracker aware of peer workers' capabilities.
+    ///
+    /// "Peer" means another logical worker/executor — physical location
+    /// is irrelevant. The progress channels abstract over shared memory,
+    /// network, or any other transport.
+    ///
+    /// No-op if no progress channels are attached (single-worker mode).
+    fn receive_peer_changes(&mut self) {
+        let channels = match &self.progress_channels {
+            Some(c) => c,
+            None => return,
+        };
+
+        for receiver in &channels.receivers {
+            if let Some(r) = receiver {
+                for batch in r.drain_all() {
+                    for (op_idx, output_port, time, diff) in batch {
+                        self.tracker.update_source(op_idx, output_port, time, diff);
+                    }
                 }
             }
         }

@@ -132,11 +132,12 @@ impl ExecutorTask {
     /// Returns a [`PollOutcome`] indicating whether the task completed,
     /// is pending-idle, or is pending and needs re-enqueue by the caller.
     pub fn poll(&self, cx: &mut Context<'_>) -> PollOutcome {
-        debug_assert_eq!(
-            self.state.load(Ordering::Relaxed),
-            TASK_POLLING,
-            "poll() called without try_start_poll()"
-        );
+        // Note: we intentionally do NOT assert state == POLLING here.
+        // Between try_start_poll() (which sets POLLING) and this call,
+        // a stale PoolWaker from a previous poll may fire try_wake(),
+        // which CAS transitions POLLING → QUEUED. This is benign:
+        // the CAS at the end of poll() will detect QUEUED and return
+        // PendingNeedsReenqueue, causing the caller to re-enqueue.
 
         // Helper: complete the task with an error when we detect an
         // unrecoverable internal problem (poisoned mutex, missing future).

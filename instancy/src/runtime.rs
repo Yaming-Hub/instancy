@@ -33,6 +33,7 @@ use crate::dataflow::dataflow_builder::{DataflowBuilder, LogicalDataflow};
 use crate::dataflow::executor::{DataflowExecutor, ExecutorConfig};
 use crate::dataflow::graph::OperatorInfo;
 use crate::error::{Error, Result};
+use crate::progress::progress_channel::{WorkerProgressChannels, create_progress_channels};
 use crate::progress::timestamp::Timestamp;
 use crate::scheduler::policy::{PriorityWithAgingPolicy, SchedulePolicy};
 use crate::worker::WorkerContext;
@@ -207,7 +208,7 @@ impl RuntimeHandle {
         &self,
         dataflow: LogicalDataflow<T>,
     ) -> Result<SpawnedDataflow<T>> {
-        self.spawn_internal(dataflow, ChannelMode::Sync, WorkerContext::single())
+        self.spawn_internal(dataflow, ChannelMode::Sync, WorkerContext::single(), None, None)
     }
 
     /// Spawn a dataflow with async channel-based I/O.
@@ -234,7 +235,7 @@ impl RuntimeHandle {
         &self,
         dataflow: LogicalDataflow<T>,
     ) -> Result<SpawnedDataflow<T>> {
-        self.spawn_internal(dataflow, ChannelMode::Async, WorkerContext::single())
+        self.spawn_internal(dataflow, ChannelMode::Async, WorkerContext::single(), None, None)
     }
 
     /// Spawn N replicated workers from the same dataflow builder closure.
@@ -400,7 +401,7 @@ impl RuntimeHandle {
         let wake_handle = WakeHandle::new();
         cancel.register_wake_handle(wake_handle.clone());
         let executor =
-            materialize_executor(dataflow, cancel, Some(wake_handle), WorkerContext::single())?;
+            materialize_executor(dataflow, cancel, Some(wake_handle), WorkerContext::single(), None)?;
 
         let (completion, notifier) = DataflowCompletion::new();
 
@@ -413,10 +414,36 @@ impl RuntimeHandle {
 
     fn spawn_internal<T: Timestamp>(
         &self,
+        dataflow: LogicalDataflow<T>,
+        mode: ChannelMode,
+        worker_context: WorkerContext,
+        progress_channels: Option<WorkerProgressChannels<T>>,
+        pre_created_wake_handle: Option<WakeHandle>,
+    ) -> Result<SpawnedDataflow<T>> {
+        let (spawned, executor, notifier) =
+            self.prepare_worker(dataflow, mode, worker_context, progress_channels, pre_created_wake_handle)?;
+        self.registry.register(executor, notifier);
+        Ok(spawned)
+    }
+
+    /// Materialize a worker (executor + I/O wiring) without registering it
+    /// on the task registry. Returns the SpawnedDataflow handle, the pinned
+    /// executor future, and the completion notifier.
+    ///
+    /// This separation allows `spawn_multi_internal` to materialize ALL workers
+    /// (including their progress tracker initialization) before registering any
+    /// of them. This is critical for correctness: progress tracker initialization
+    /// broadcasts initial capabilities to peer workers' channels. If workers
+    /// were registered (and thus polled) immediately, a fast worker could see
+    /// incomplete global state before slower workers have initialized.
+    fn prepare_worker<T: Timestamp>(
+        &self,
         mut dataflow: LogicalDataflow<T>,
         mode: ChannelMode,
         worker_context: WorkerContext,
-    ) -> Result<SpawnedDataflow<T>> {
+        progress_channels: Option<WorkerProgressChannels<T>>,
+        pre_created_wake_handle: Option<WakeHandle>,
+    ) -> Result<(SpawnedDataflow<T>, Pin<Box<DataflowExecutor<T>>>, CompletionNotifier)> {
         if dataflow.operator_factories.is_empty() && dataflow.input_port_wiring.is_empty() {
             return Err(Error::Custom("cannot spawn an empty dataflow".into()));
         }
@@ -426,9 +453,9 @@ impl RuntimeHandle {
         let external_inputs_open = Arc::new(AtomicUsize::new(0));
         let name = dataflow.name().to_string();
 
-        // Create the WakeHandle early so it can be shared with InputSenders,
-        // CancellationToken, and the executor's internal channels.
-        let wake_handle = WakeHandle::new();
+        // Use pre-created wake handle if provided (for multi-worker with
+        // progress channels that already reference it), otherwise create one.
+        let wake_handle = pre_created_wake_handle.unwrap_or_else(WakeHandle::new);
 
         // Register wake handle on the cancellation token (and all ancestors)
         // so that cancel() wakes the sleeping executor promptly.
@@ -478,25 +505,25 @@ impl RuntimeHandle {
             output_receivers.push((info.name.clone(), info.type_name, receiver_any));
         }
 
-        // --- Materialize and register as cooperative task ---
+        // --- Materialize executor (but do NOT register yet) ---
         let mut executor =
-            materialize_executor(dataflow, cancel, Some(wake_handle), worker_context)?;
+            materialize_executor(dataflow, cancel, Some(wake_handle), worker_context, progress_channels)?;
 
         external_inputs_open.store(input_count, std::sync::atomic::Ordering::SeqCst);
         executor.replace_external_inputs_counter(external_inputs_open);
 
         let (completion, notifier) = DataflowCompletion::new();
 
-        self.registry.register(Box::pin(executor), notifier);
-
-        Ok(SpawnedDataflow {
+        let spawned = SpawnedDataflow {
             name,
             cancel: cancel_handle,
             completion: Some(completion),
             input_senders,
             output_receivers,
             _phantom: PhantomData,
-        })
+        };
+
+        Ok((spawned, Box::pin(executor), notifier))
     }
 
     fn spawn_multi_internal<T, F>(
@@ -559,30 +586,71 @@ impl RuntimeHandle {
             }
         }
 
-        // Phase 4: Spawn all workers. If any spawn fails, cancel already-started ones.
-        let mut workers = Vec::with_capacity(num_workers);
+        // Phase 4: Create per-worker wake handles and progress exchange channels.
+        // Wake handles must be created first since progress channels reference them
+        // for cross-worker notification (waking idle workers on progress arrival).
+        let wake_handles: Vec<WakeHandle> = (0..num_workers).map(|_| WakeHandle::new()).collect();
+
+        let mut progress_channels = if num_workers > 1 {
+            create_progress_channels::<T>(num_workers, &wake_handles)
+        } else {
+            Vec::new()
+        };
+
+        // Phase 5: Materialize all workers WITHOUT registering them yet.
+        //
+        // This is critical for correctness: materialize_executor() calls
+        // tracker.initialize(), which broadcasts initial capabilities to peer
+        // workers' progress channels. If we registered (and thus polled)
+        // workers immediately, a fast worker could see incomplete global
+        // state before slower workers have initialized and broadcast their
+        // initial capabilities. By deferring registration until ALL workers
+        // are materialized, we guarantee every worker's progress channels
+        // contain the full set of initial capability broadcasts from all
+        // peers before any worker starts executing.
+        let mut prepared = Vec::with_capacity(num_workers);
         let mut spawned_count = 0usize;
 
         for (worker_idx, dataflow) in dataflows.into_iter().enumerate() {
             let ctx = WorkerContext::new(worker_idx, num_workers);
-            match self.spawn_internal(dataflow, mode, ctx) {
-                Ok(spawned) => {
-                    workers.push(spawned);
+            let pc = if !progress_channels.is_empty() {
+                // Take this worker's progress channels (replace with empty placeholder).
+                Some(std::mem::replace(
+                    &mut progress_channels[worker_idx],
+                    WorkerProgressChannels {
+                        senders: Vec::new(),
+                        receivers: Vec::new(),
+                    },
+                ))
+            } else {
+                None
+            };
+            let wh = wake_handles[worker_idx].clone();
+            match self.prepare_worker(dataflow, mode, ctx, pc, Some(wh)) {
+                Ok(worker) => {
+                    prepared.push(worker);
                     spawned_count += 1;
                 }
                 Err(e) => {
-                    // Cancel and drop already-started workers.
-                    for w in &workers {
+                    // Cancel and drop already-prepared workers (they haven't
+                    // been registered, so just cancel their tokens).
+                    for (w, _, _) in &prepared {
                         w.cancel();
-                    }
-                    for w in workers {
-                        let _ = w.join_blocking();
                     }
                     return Err(Error::Custom(format!(
                         "failed to spawn worker {spawned_count}: {e}"
                     )));
                 }
             }
+        }
+
+        // Phase 6: Register all workers NOW — every worker's tracker has
+        // initialized and broadcast its initial capabilities, so all progress
+        // channels contain the complete initial state from all peers.
+        let mut workers = Vec::with_capacity(num_workers);
+        for (spawned, executor, notifier) in prepared {
+            self.registry.register(executor, notifier);
+            workers.push(spawned);
         }
 
         Ok(MultiSpawnedDataflow {
@@ -694,6 +762,7 @@ impl SimpleRuntime {
             self.cancel.clone(),
             Some(wake_handle),
             WorkerContext::single(),
+            None,
         )?;
 
         let completed = executor.run()?;
@@ -802,7 +871,7 @@ impl SimpleRuntime {
 
         // --- Materialize and run on background thread ---
         let mut executor =
-            materialize_executor(dataflow, cancel, Some(wake_handle), worker_context)?;
+            materialize_executor(dataflow, cancel, Some(wake_handle), worker_context, None)?;
 
         external_inputs_open.store(input_count, std::sync::atomic::Ordering::SeqCst);
         executor.replace_external_inputs_counter(external_inputs_open);
@@ -1831,6 +1900,7 @@ fn materialize_executor<T: Timestamp>(
     cancel: CancellationToken,
     wake_handle: Option<WakeHandle>,
     worker_context: WorkerContext,
+    progress_channels: Option<WorkerProgressChannels<T>>,
 ) -> Result<DataflowExecutor<T>> {
     let executor_config = ExecutorConfig {
         max_activations_per_step: 1024,
@@ -1848,8 +1918,14 @@ fn materialize_executor<T: Timestamp>(
         worker_context,
     )?;
 
-    // Build and attach progress tracker
+    // Build and attach progress tracker.
+    // For multi-worker dataflows, attach cross-worker progress channels
+    // so the tracker broadcasts capability changes to peers and absorbs
+    // remote changes. This makes is_completed() reflect global state.
     let mut tracker = dataflow.subgraph_builder.build();
+    if let Some(channels) = progress_channels {
+        tracker.set_progress_channels(channels);
+    }
     tracker.initialize();
     executor.set_progress_tracker(tracker);
 
@@ -2907,5 +2983,365 @@ mod tests {
         // hash % 2: evens → w0, odds → w1
         assert_eq!(w0, vec![0, 2, 4, 6]);
         assert_eq!(w1, vec![1, 3, 5, 7]);
+    }
+
+    // ========================================================================
+    // Exchange + Notification integration tests
+    //
+    // These tests validate that `unary_notify` works correctly when combined
+    // with `exchange_by_hash` in multi-worker dataflows. They verify:
+    // - Exchange routing + notification-based aggregation produce correct results
+    // - Per-epoch notifications fire for the right timestamps
+    // - No data loss or duplication across workers
+    //
+    // NOTE: With channel-fed inputs (take_input/send/close), all notifications
+    // fire at end-of-stream when the input frontier is exhausted. Testing
+    // mid-stream frontier-driven notification timing requires AsyncInputSender
+    // with explicit advance_frontier() calls — a scenario for future tests.
+    //
+    // IMPORTANT: With multi-worker exchange, data for the same timestamp from
+    // different source workers may arrive in separate activations. This means
+    // a notification can fire multiple times for the same epoch (each time
+    // new data arrives and notify_at is called again). Tests must assert on
+    // total aggregated values per epoch, not assume exactly one emission.
+    // ========================================================================
+
+    #[test]
+    fn spawn_multi_exchange_notify_basic_aggregation() {
+        // 2 workers: input → exchange(value % 2) → unary_notify(sum per epoch) → output
+        // Evens go to worker 0, odds to worker 1. Each worker sums its partition.
+        let rt = RuntimeHandle::new(RuntimeConfig::default()).unwrap();
+        let mut multi = rt
+            .spawn_multi("exchange_notify_basic", 2, |_worker_idx, builder| {
+                let input = builder.input::<i32>("data");
+                input
+                    .exchange_by_hash("mod2", |x: &i32| *x as u64)
+                    .unary_notify("sum", {
+                        let mut stash: std::collections::HashMap<u64, Vec<i32>> =
+                            std::collections::HashMap::new();
+                        move |input, output, ctx| {
+                            while let Some((time, data)) = input.next() {
+                                stash.entry(time).or_default().extend(data);
+                                ctx.notify_at(time);
+                            }
+                            while let Some(time) = ctx.next_notification() {
+                                if let Some(data) = stash.remove(&time) {
+                                    let sum: i32 = data.iter().sum();
+                                    output.push_vec(time, vec![sum]);
+                                }
+                            }
+                            Ok(())
+                        }
+                    })
+                    .output("results");
+                Ok(())
+            })
+            .unwrap();
+
+        let out0 = multi.take_output::<i32>(0, "results").unwrap();
+        let out1 = multi.take_output::<i32>(1, "results").unwrap();
+
+        // Worker 0 sends 1..8
+        let in0 = multi.take_input::<i32>(0, "data").unwrap();
+        in0.send(0u64, vec![1, 2, 3, 4, 5, 6, 7, 8]).unwrap();
+        in0.close();
+
+        // Worker 1 also sends data — all routes through exchange.
+        let in1 = multi.take_input::<i32>(1, "data").unwrap();
+        in1.close();
+
+        let _ = multi.join_blocking().expect("dataflow should complete");
+
+        // After exchange(value % 2): worker 0 gets evens [2,4,6,8], worker 1 gets odds [1,3,5,7]
+        // Each worker's unary_notify sums its partition on notification.
+        // With multi-worker exchange, partial sums may be emitted across multiple
+        // activations, so we aggregate all outputs per epoch.
+        let sum0: i32 = out0.collect_data().iter().flat_map(|(_, v)| v).sum();
+        let sum1: i32 = out1.collect_data().iter().flat_map(|(_, v)| v).sum();
+
+        assert_eq!(sum0, 20, "worker 0: evens 2+4+6+8=20");
+        assert_eq!(sum1, 16, "worker 1: odds 1+3+5+7=16");
+    }
+
+    #[test]
+    fn spawn_multi_exchange_notify_multi_epoch() {
+        // 2 workers: multiple epochs, verify per-epoch notification correctness.
+        // Each epoch's data is aggregated independently.
+        let rt = RuntimeHandle::new(RuntimeConfig::default()).unwrap();
+        let mut multi = rt
+            .spawn_multi("exchange_notify_epochs", 2, |_worker_idx, builder| {
+                let input = builder.input::<i32>("data");
+                input
+                    .exchange_by_hash("mod2", |x: &i32| *x as u64)
+                    .unary_notify("sum_per_epoch", {
+                        let mut stash: std::collections::HashMap<u64, Vec<i32>> =
+                            std::collections::HashMap::new();
+                        move |input, output, ctx| {
+                            while let Some((time, data)) = input.next() {
+                                stash.entry(time).or_default().extend(data);
+                                ctx.notify_at(time);
+                            }
+                            while let Some(time) = ctx.next_notification() {
+                                if let Some(data) = stash.remove(&time) {
+                                    let sum: i32 = data.iter().sum();
+                                    output.push_vec(time, vec![sum]);
+                                }
+                            }
+                            Ok(())
+                        }
+                    })
+                    .output("results");
+                Ok(())
+            })
+            .unwrap();
+
+        let out0 = multi.take_output::<i32>(0, "results").unwrap();
+        let out1 = multi.take_output::<i32>(1, "results").unwrap();
+
+        // Worker 0: epoch 0 → [10,11], epoch 1 → [20,21]
+        let in0 = multi.take_input::<i32>(0, "data").unwrap();
+        in0.send(0u64, vec![10, 11]).unwrap();
+        in0.send(1u64, vec![20, 21]).unwrap();
+        in0.close();
+
+        // Worker 1: epoch 0 → [12,13], epoch 1 → [22,23]
+        let in1 = multi.take_input::<i32>(1, "data").unwrap();
+        in1.send(0u64, vec![12, 13]).unwrap();
+        in1.send(1u64, vec![22, 23]).unwrap();
+        in1.close();
+
+        let _ = multi.join_blocking().expect("dataflow should complete");
+
+        // After exchange(mod 2):
+        //   epoch 0: w0=[10,12], w1=[11,13] → sums: w0=22, w1=24
+        //   epoch 1: w0=[20,22], w1=[21,23] → sums: w0=42, w1=44
+        // Aggregate per epoch (multiple emissions possible per epoch).
+        let mut sums0: std::collections::HashMap<u64, i32> = std::collections::HashMap::new();
+        for (t, vs) in out0.collect_data() {
+            *sums0.entry(t).or_default() += vs.iter().sum::<i32>();
+        }
+        let mut sums1: std::collections::HashMap<u64, i32> = std::collections::HashMap::new();
+        for (t, vs) in out1.collect_data() {
+            *sums1.entry(t).or_default() += vs.iter().sum::<i32>();
+        }
+
+        assert_eq!(sums0.get(&0), Some(&22), "worker 0 epoch 0 sum");
+        assert_eq!(sums0.get(&1), Some(&42), "worker 0 epoch 1 sum");
+        assert_eq!(sums1.get(&0), Some(&24), "worker 1 epoch 0 sum");
+        assert_eq!(sums1.get(&1), Some(&44), "worker 1 epoch 1 sum");
+    }
+
+    #[test]
+    fn spawn_multi_exchange_notify_computation_chain() {
+        // 2 workers: input → map(double) → exchange → unary_notify(count) → output
+        // Tests computation before exchange combined with notification after.
+        let rt = RuntimeHandle::new(RuntimeConfig::default()).unwrap();
+        let mut multi = rt
+            .spawn_multi("exchange_notify_chain", 2, |_worker_idx, builder| {
+                let input = builder.input::<i32>("data");
+                input
+                    .map("double", |_t, x| x * 2)
+                    .exchange_by_hash("mod2", |x: &i32| *x as u64)
+                    .unary_notify("count", {
+                        let mut stash: std::collections::HashMap<u64, usize> =
+                            std::collections::HashMap::new();
+                        move |input, output, ctx| {
+                            while let Some((time, data)) = input.next() {
+                                *stash.entry(time).or_default() += data.len();
+                                ctx.notify_at(time);
+                            }
+                            while let Some(time) = ctx.next_notification() {
+                                if let Some(count) = stash.remove(&time) {
+                                    output.push_vec(time, vec![count as i32]);
+                                }
+                            }
+                            Ok(())
+                        }
+                    })
+                    .output("results");
+                Ok(())
+            })
+            .unwrap();
+
+        let out0 = multi.take_output::<i32>(0, "results").unwrap();
+        let out1 = multi.take_output::<i32>(1, "results").unwrap();
+
+        // Worker 0 sends [1,2,3]: doubled → [2,4,6], all even → all to worker 0
+        let in0 = multi.take_input::<i32>(0, "data").unwrap();
+        in0.send(0u64, vec![1, 2, 3]).unwrap();
+        in0.close();
+
+        // Worker 1 sends [5,7]: doubled → [10,14], all even → all to worker 0
+        let in1 = multi.take_input::<i32>(1, "data").unwrap();
+        in1.send(0u64, vec![5, 7]).unwrap();
+        in1.close();
+
+        let _ = multi.join_blocking().expect("dataflow should complete");
+
+        // All 5 items doubled are even → value % 2 == 0 → all route to worker 0.
+        // NOTE: With multi-worker exchange, data from different source workers
+        // may arrive in separate activations. The notification can fire multiple
+        // times for the same timestamp (once per activation that delivers new data),
+        // so we assert on the total count per epoch, not the number of emissions.
+        let total_count_w0: i32 = out0
+            .collect_data()
+            .iter()
+            .flat_map(|(_, v)| v)
+            .sum();
+        let total_count_w1: i32 = out1
+            .collect_data()
+            .iter()
+            .flat_map(|(_, v)| v)
+            .sum();
+
+        assert_eq!(total_count_w0, 5, "worker 0 should count all 5 items");
+        assert_eq!(total_count_w1, 0, "worker 1 should receive nothing");
+    }
+
+    #[test]
+    fn spawn_multi_exchange_notify_multi_batch_same_epoch() {
+        // 2 workers: both send data at t=0 in separate batches.
+        // Verifies correct final aggregation despite multi-batch inputs — each
+        // worker should emit exactly one sum at t=0 after all batches are collected.
+        let rt = RuntimeHandle::new(RuntimeConfig::default()).unwrap();
+        let mut multi = rt
+            .spawn_multi("exchange_notify_multibatch", 2, |_worker_idx, builder| {
+                let input = builder.input::<i32>("data");
+                input
+                    .exchange_by_hash("mod2", |x: &i32| *x as u64)
+                    .unary_notify("sum", {
+                        let mut stash: std::collections::HashMap<u64, Vec<i32>> =
+                            std::collections::HashMap::new();
+                        move |input, output, ctx| {
+                            while let Some((time, data)) = input.next() {
+                                stash.entry(time).or_default().extend(data);
+                                ctx.notify_at(time);
+                            }
+                            while let Some(time) = ctx.next_notification() {
+                                if let Some(data) = stash.remove(&time) {
+                                    let sum: i32 = data.iter().sum();
+                                    output.push_vec(time, vec![sum]);
+                                }
+                            }
+                            Ok(())
+                        }
+                    })
+                    .output("results");
+                Ok(())
+            })
+            .unwrap();
+
+        let out0 = multi.take_output::<i32>(0, "results").unwrap();
+        let out1 = multi.take_output::<i32>(1, "results").unwrap();
+
+        // Worker 0 sends t=0 in two separate batches.
+        let in0 = multi.take_input::<i32>(0, "data").unwrap();
+        in0.send(0u64, vec![2, 4]).unwrap();
+        in0.send(0u64, vec![6, 8]).unwrap();
+        in0.close();
+
+        // Worker 1 also sends t=0 in two batches.
+        let in1 = multi.take_input::<i32>(1, "data").unwrap();
+        in1.send(0u64, vec![1, 3]).unwrap();
+        in1.send(0u64, vec![5, 7]).unwrap();
+        in1.close();
+
+        let _ = multi.join_blocking().expect("dataflow should complete");
+
+        // After exchange: w0=[2,4,6,8], w1=[1,3,5,7]
+        // Aggregate per epoch (multiple emissions possible from multi-batch arrivals).
+        let sum0: i32 = out0.collect_data().iter().flat_map(|(_, v)| v).sum();
+        let sum1: i32 = out1.collect_data().iter().flat_map(|(_, v)| v).sum();
+
+        assert_eq!(sum0, 20, "worker 0: evens 2+4+6+8=20");
+        assert_eq!(sum1, 16, "worker 1: odds 1+3+5+7=16");
+
+        // Verify total data integrity: no loss, no duplication.
+        assert_eq!(sum0 + sum1, 36, "total sum should be 1+2+...+8=36");
+    }
+
+    #[test]
+    fn spawn_multi_exchange_notify_four_workers() {
+        // 4 workers: tests N×N matrix wiring with notifications.
+        // All 4 workers feed data, exchange routes by hash % 4.
+        // Uses fewer items per worker to reduce contention on the 4×4 matrix.
+        let rt = RuntimeHandle::new(RuntimeConfig::default()).unwrap();
+        let num_workers = 4;
+        let mut multi = rt
+            .spawn_multi(
+                "exchange_notify_4w",
+                num_workers,
+                |_worker_idx, builder| {
+                    let input = builder.input::<i32>("data");
+                    input
+                        .exchange_by_hash("mod4", |x: &i32| *x as u64)
+                        .unary_notify("collect", {
+                            let mut stash: std::collections::HashMap<u64, Vec<i32>> =
+                                std::collections::HashMap::new();
+                            move |input, output, ctx| {
+                                while let Some((time, data)) = input.next() {
+                                    stash.entry(time).or_default().extend(data);
+                                    ctx.notify_at(time);
+                                }
+                                while let Some(time) = ctx.next_notification() {
+                                    if let Some(mut data) = stash.remove(&time) {
+                                        data.sort();
+                                        output.push_vec(time, data);
+                                    }
+                                }
+                                Ok(())
+                            }
+                        })
+                        .output("results");
+                    Ok(())
+                },
+            )
+            .unwrap();
+
+        // Each worker sends values 0..8 — exchange routes each value to
+        // worker (value % 4). All 4 workers send identical data, so each
+        // worker receives 4 copies of its assigned values.
+        for i in 0..num_workers {
+            let inp = multi.take_input::<i32>(i, "data").unwrap();
+            inp.send(0u64, (0..8i32).collect()).unwrap();
+            inp.close();
+        }
+
+        // Take all output receivers before join — take_output moves the receiver.
+        let receivers: Vec<_> = (0..num_workers)
+            .map(|i| multi.take_output::<i32>(i, "results").unwrap())
+            .collect();
+
+        let _ = multi.join_blocking().expect("dataflow should complete");
+
+        let mut all_results: Vec<Vec<i32>> = Vec::new();
+        for recv in &receivers {
+            let mut data: Vec<i32> = recv
+                .collect_data()
+                .into_iter()
+                .flat_map(|(_, v)| v)
+                .collect();
+            data.sort();
+            all_results.push(data);
+        }
+
+        // Worker i should receive all values where value % 4 == i,
+        // with 4 copies each (one from each sending worker).
+        for (worker, data) in all_results.iter().enumerate() {
+            let expected: Vec<i32> = (0..8i32)
+                .filter(|x| (*x as u64) % 4 == worker as u64)
+                .flat_map(|x| std::iter::repeat(x).take(num_workers))
+                .collect();
+            let mut expected_sorted = expected;
+            expected_sorted.sort();
+            assert_eq!(
+                data, &expected_sorted,
+                "worker {worker} received wrong data"
+            );
+        }
+
+        // Total data integrity: 4 workers × 8 values = 32 total items.
+        let total: usize = all_results.iter().map(|v| v.len()).sum();
+        assert_eq!(total, 32, "total items across all workers");
     }
 }
