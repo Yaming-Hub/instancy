@@ -65,9 +65,6 @@ fn main() {
             let adj = out_edges.clone();
             let n = num_nodes;
 
-            // Count iterations to know when to stop.
-            let mut iteration = 0u32;
-
             let computed =
                 ranks.unary::<(u32, f64, bool), _>("distribute", move |input, output| {
                 while let Some((time, data)) = input.next() {
@@ -87,20 +84,21 @@ fn main() {
 
                     // Apply damping formula: rank(v) = (1 - d) / N + d * sum(incoming)
                     let base = (1.0 - DAMPING) / n as f64;
-                    let mut new_ranks: Vec<(u32, f64)> = (0..n)
+                    let new_ranks: Vec<(u32, f64)> = (0..n)
                         .map(|node| {
                             let contrib = incoming.get(&node).copied().unwrap_or(0.0);
                             (node, base + DAMPING * contrib)
                         })
                         .collect();
 
-                    // Tag: (node, rank, is_feedback).
-                    // After enough iterations, everything becomes output.
-                    iteration += 1;
-                    let is_feedback = iteration < ITERATIONS;
+                    // Use the timestamp's inner value (iteration counter maintained by
+                    // iterate()) rather than a manual counter. This is correct regardless
+                    // of how many batches arrive per iteration round.
+                    let iter_round = time.inner;
+                    let is_feedback = iter_round < ITERATIONS;
 
                     let tagged: Vec<(u32, f64, bool)> = new_ranks
-                        .drain(..)
+                        .into_iter()
                         .map(|(n, r)| (n, r, is_feedback))
                         .collect();
                     output.push_vec(time, tagged);
