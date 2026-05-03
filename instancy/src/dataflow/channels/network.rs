@@ -406,6 +406,8 @@ impl<T: Timestamp + ExchangeData, D: ExchangeData> Drop for NetworkPush<T, D> {
 ///
 /// The bridge terminates when the tokio receiver yields `None` (Demuxer
 /// closed) or when the std sender is disconnected (`NetworkPull` dropped).
+/// A final wake notification is always sent on exit so the executor can
+/// observe channel exhaustion and react accordingly.
 #[cfg(feature = "transport")]
 async fn data_recv_bridge(
     mut rx: tokio_mpsc::Receiver<Vec<u8>>,
@@ -419,7 +421,8 @@ async fn data_recv_bridge(
         }
         wake_handle.notify();
     }
-    // Channel closed or pull dropped — nothing to do.
+    // Final wake so the executor re-polls and observes channel closure.
+    wake_handle.notify();
 }
 
 // ---------------------------------------------------------------------------

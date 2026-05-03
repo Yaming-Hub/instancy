@@ -641,17 +641,15 @@ impl<T: Timestamp> DataflowExecutor<T> {
                     return Ok(SweepOutcome::Completed);
                 }
 
-                // If the tracker is NOT completed, there are outstanding
-                // capabilities somewhere in the global dataflow. In multi-
-                // worker/multi-node mode, these may belong to remote peers
-                // that are still processing data. We must wait for peer
-                // progress updates that will either:
-                // (a) release those capabilities (leading to completion), or
-                // (b) arrive with data that unblocks local operators.
-                //
-                // Similarly, if we haven't heard from all peers yet, their
-                // initial capabilities may still be in transit.
-                if !tracker.is_completed() || !tracker.all_peers_synced() {
+                // Any of these conditions means the global dataflow is still
+                // active and we should wait rather than declare quiescence:
+                // - Tracker not completed: outstanding capabilities somewhere
+                // - Peers not synced: initial caps still in transit
+                // - Pending peer progress: buffered updates not yet absorbed
+                if !tracker.is_completed()
+                    || !tracker.all_peers_synced()
+                    || tracker.has_pending_peer_progress()
+                {
                     self.consecutive_idle = 0;
                     return Ok(SweepOutcome::WaitingForInput);
                 }

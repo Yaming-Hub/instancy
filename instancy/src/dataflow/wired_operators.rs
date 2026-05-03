@@ -209,7 +209,8 @@ impl<T: Timestamp, D1: Send + 'static, D2: Send + 'static> SchedulableOperator
         if !had_input && self.input_exhausted {
             // No input and no more coming — we're done.
             self.output_pusher.close();
-            if let Some(ref reporter) = self.progress_reporter {
+            // Release capability (idempotent via take).
+            if let Some(reporter) = self.progress_reporter.take() {
                 reporter.update(T::minimum(), -1);
             }
             self.done = true;
@@ -231,7 +232,8 @@ impl<T: Timestamp, D1: Send + 'static, D2: Send + 'static> SchedulableOperator
         // Step 6: Check if we're done after processing.
         if self.input_exhausted && !self.input_handle.has_pending() && !self.output_handle.has_output() {
             self.output_pusher.close();
-            if let Some(ref reporter) = self.progress_reporter {
+            // Release capability (idempotent via take).
+            if let Some(reporter) = self.progress_reporter.take() {
                 reporter.update(T::minimum(), -1);
             }
             self.done = true;
@@ -260,9 +262,9 @@ impl<T: Timestamp, D1: Send + 'static, D2: Send + 'static> SchedulableOperator
     fn close_inputs(&mut self) {
         self.input_exhausted = true;
         self.input_handle.mark_exhausted();
-        // Release capability if held (exchange pass-through operators hold one
-        // to prevent premature completion while data is in flight).
-        if let Some(ref reporter) = self.progress_reporter {
+        // Release capability if held (idempotent via take — safe even if
+        // activate() already released it before force-close).
+        if let Some(reporter) = self.progress_reporter.take() {
             reporter.update(T::minimum(), -1);
         }
     }

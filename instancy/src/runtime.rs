@@ -2216,17 +2216,26 @@ impl<T: Timestamp> ClusterSpawnedDataflow<T> {
 
     /// Take the completion handles from all local workers.
     ///
-    /// Returns a `MultiDataflowCompletion` that waits for all workers.
-    /// Bridge tasks are NOT cancelled here — they stay alive until the
-    /// `ClusterSpawnedDataflow` is dropped, ensuring workers can still
-    /// receive remote data during completion.
+    /// **Important:** This consumes `self`, which triggers `Drop` and cancels
+    /// bridge tasks. Use [`join_blocking()`](Self::join_blocking) instead to
+    /// ensure bridges stay alive until workers complete.
+    ///
+    /// If you need async waiting, call `join_blocking()` from a
+    /// `spawn_blocking` task.
     pub fn join(mut self) -> MultiDataflowCompletion {
         self.inner.take().expect("join called after move").join()
     }
 
     /// Block until all local workers complete.
-    pub fn join_blocking(self) -> Result<()> {
-        self.join().wait()
+    ///
+    /// Bridges stay alive during the wait so workers can still receive
+    /// remote data and progress. They are cancelled only after all
+    /// workers have finished.
+    pub fn join_blocking(mut self) -> Result<()> {
+        let completion = self.inner.take().expect("join called after move").join();
+        let result = completion.wait();
+        // NOW self drops — bridges are cancelled AFTER workers complete.
+        result
     }
 }
 
