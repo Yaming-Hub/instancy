@@ -24,6 +24,11 @@ fn main() {
         .and_then(|s| s.parse().ok())
         .unwrap_or(1000);
 
+    if iterations == 0 {
+        println!("iterations must be >= 1");
+        return;
+    }
+
     let builder = DataflowBuilder::<u64>::new("barrier");
 
     // A single token enters the loop.
@@ -64,7 +69,7 @@ fn main() {
         "token should have value {iterations}"
     );
 
-    println!("=== Barrier: {iterations} iterations ===");
+     println!("=== Barrier: {iterations} iterations ===");
     println!("  Elapsed: {elapsed:?}");
     println!(
         "  Per iteration: {:.0} ns",

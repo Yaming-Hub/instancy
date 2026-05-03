@@ -86,11 +86,15 @@ fn main() {
 
     println!("=== Ping-Pong: {elements} elements × up to {iterations} iterations ===");
     println!("  Elapsed: {elapsed:?}");
-    println!(
-        "  Output: {} elements, min={}, max={}",
-        values.len(),
-        values[0],
-        values[values.len() - 1]
-    );
+    if values.is_empty() {
+        println!("  Output: 0 elements");
+    } else {
+        println!(
+            "  Output: {} elements, min={}, max={}",
+            values.len(),
+            values[0],
+            values[values.len() - 1]
+        );
+    }
     println!("✓ All assertions passed!");
 }
