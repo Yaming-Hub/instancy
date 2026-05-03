@@ -611,38 +611,49 @@ impl<T: Timestamp, D: Send + 'static> Pull<T, D> for ExchangePull<T, D> {
             return Some(Envelope::watermark(t));
         }
 
-        // Round-robin: try each source starting from next_source.
-        for _ in 0..self.num_sources {
-            let idx = self.next_source;
-            self.next_source = (self.next_source + 1) % self.num_sources;
-            if let Some(env) = self.sources[idx].pull() {
-                // Wake the source worker — we freed capacity, so a
-                // backpressured sender can retry.
-                self.wakes.wake(idx);
+        // Round-robin with retry: if watermarks are absorbed (frontier didn't
+        // advance), data might be queued behind them. Restart the scan so we
+        // don't return None while deliverable messages exist. Each iteration
+        // consumes ≥1 item from a finite-capacity channel, guaranteeing
+        // termination.
+        loop {
+            let mut absorbed_watermark = false;
+            for _ in 0..self.num_sources {
+                let idx = self.next_source;
+                self.next_source = (self.next_source + 1) % self.num_sources;
+                if let Some(env) = self.sources[idx].pull() {
+                    // Wake the source worker — we freed capacity, so a
+                    // backpressured sender can retry.
+                    self.wakes.wake(idx);
 
-                match env.payload {
-                    Payload::Data { .. } => return Some(env),
-                    Payload::Control(ControlSignal::Watermark(t)) => {
-                        // Aggregate: update source frontier, emit only if
-                        // the overall frontier advanced.
-                        let new_watermarks = self.frontier_agg.update(idx, t);
-                        for wm in new_watermarks {
-                            self.pending_watermarks.push_back(wm);
+                    match env.payload {
+                        Payload::Data { .. } => return Some(env),
+                        Payload::Control(ControlSignal::Watermark(t)) => {
+                            // Aggregate: update source frontier, emit only if
+                            // the overall frontier advanced.
+                            let new_watermarks = self.frontier_agg.update(idx, t);
+                            for wm in new_watermarks {
+                                self.pending_watermarks.push_back(wm);
+                            }
+                            // Return a buffered watermark if available, else continue.
+                            if let Some(t) = self.pending_watermarks.pop_front() {
+                                return Some(Envelope::watermark(t));
+                            }
+                            // Frontier didn't advance — mark for retry.
+                            absorbed_watermark = true;
                         }
-                        // Return a buffered watermark if available, else continue.
-                        if let Some(t) = self.pending_watermarks.pop_front() {
-                            return Some(Envelope::watermark(t));
+                        Payload::Control(_) => {
+                            // Errors pass through immediately.
+                            return Some(env);
                         }
-                        // Frontier didn't advance — continue pulling.
-                    }
-                    Payload::Control(_) => {
-                        // Errors pass through immediately.
-                        return Some(env);
                     }
                 }
             }
+            if !absorbed_watermark {
+                return None;
+            }
+            // Watermarks absorbed — data might follow. Retry round-robin.
         }
-        None
     }
 
     fn drain_into(&mut self, buffer: &mut Vec<Envelope<T, D, ()>>) -> usize {
@@ -1128,5 +1139,35 @@ mod tests {
             })
             .unwrap();
         assert_eq!(wm, 7);
+    }
+
+    #[test]
+    fn exchange_pull_data_behind_absorbed_watermark() {
+        // Regression test: pull() must not return None when data is queued
+        // behind an absorbed watermark. Source 0 sends [watermark(5), data],
+        // source 1 hasn't advanced → watermark absorbed, but data must still
+        // be returned in the same pull() call.
+        let mut set = ExchangeChannelSet::<u64, i32>::new(2, 16);
+        let wakes = Arc::new(SharedWakeRegistry::new(2));
+
+        let (mut pushers0, pullers0) = set.take_pair(0).unwrap();
+        let (_pushers1, _pullers1) = set.take_pair(1).unwrap();
+
+        let mut pull = ExchangePull::new(pullers0, wakes.clone());
+
+        // Source 0: watermark(5) followed by data.
+        pushers0[0]
+            .push(Envelope::watermark(5u64))
+            .unwrap();
+        pushers0[0]
+            .push(Envelope::data(6u64, vec![99]))
+            .unwrap();
+
+        // pull() should absorb the watermark (source 1 still at 0) and
+        // then return the data — NOT None.
+        let env = pull.pull().unwrap();
+        let (t, d) = env.as_data().unwrap();
+        assert_eq!(*t, 6);
+        assert_eq!(d, &vec![99]);
     }
 }
