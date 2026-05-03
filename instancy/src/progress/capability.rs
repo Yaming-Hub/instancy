@@ -110,6 +110,9 @@ impl<T: Timestamp> Drop for Capability<T> {
     }
 }
 
+/// Implements `Deref` to allow using a capability as a timestamp reference.
+/// This enables ergonomic patterns like `cap.less_equal(&time)` without
+/// explicit `cap.time()` calls, since `Deref` provides access to all `T` methods.
 impl<T: Timestamp> Deref for Capability<T> {
     type Target = T;
     fn deref(&self) -> &T {

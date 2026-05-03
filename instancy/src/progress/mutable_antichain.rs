@@ -1,28 +1,58 @@
 //! MutableAntichain — a frontier tracker that supports incremental updates.
 //!
-//! Unlike `Antichain`, which is a simple immutable-ish set, `MutableAntichain`
-//! tracks multiplicity of timestamps and efficiently maintains the frontier
-//! (minimal elements with positive count) as updates arrive.
+//! Unlike [`Antichain`](crate::progress::frontier::Antichain), which is a simple
+//! set of mutually incomparable elements, `MutableAntichain` tracks a **multiset**
+//! of timestamps where each timestamp has an integer count (multiplicity). The
+//! frontier is the set of minimal timestamps with positive total count.
+//!
+//! # Why multiplicity matters
+//!
+//! Multiple capabilities can exist at the same timestamp. For example, two operators
+//! might both hold a capability at time 5. The frontier should only advance past
+//! time 5 when BOTH capabilities are dropped. `MutableAntichain` tracks that time 5
+//! has count 2, so dropping one capability (count → 1) doesn't remove it from the
+//! frontier. Only when count reaches 0 does the timestamp leave the frontier.
+//!
+//! # Role in the progress tracking pipeline
+//!
+//! `MutableAntichain` is used in two key places:
+//! 1. **Pointstamp tracking** (in `reachability::PortInformation`): tracks the direct
+//!    capability counts at each port. Its frontier changes seed the propagation worklist.
+//! 2. **Implication tracking** (also in `PortInformation`): tracks the propagated
+//!    implications from all reachable upstream capabilities. Its frontier is what
+//!    operators observe as their "input frontier".
+//!
+//! # Three-field design
+//!
+//! - `updates`: A [`ChangeBatch`] accumulating raw `(timestamp, ±count)` changes.
+//!   This is the source of truth for multiplicity.
+//! - `frontier`: The current minimal elements with positive count (cached for fast reads).
+//! - `changes`: A [`ChangeBatch`] recording frontier deltas from the last `update_iter()`.
+//!   Callers read these to know what changed (e.g., to seed the propagation worklist).
 
 use crate::order::PartialOrder;
 use crate::progress::change_batch::ChangeBatch;
 use crate::progress::frontier::Antichain;
 
-/// A frontier tracker that supports incremental updates.
+/// A frontier tracker that supports incremental updates with multiplicity.
 ///
-/// `MutableAntichain` maintains a multiset of timestamps via `(T, i64)` updates.
-/// The frontier is the set of minimal timestamps with positive total count.
+/// See the [module documentation](self) for a full explanation of the three-field
+/// design and why multiplicity tracking is needed.
 ///
 /// Updates can both advance and retreat the frontier. The frontier is rebuilt
 /// from scratch when a batch of updates potentially changes it, which is efficient
 /// for batched use but may be expensive for single-element updates to large sets.
 #[derive(Clone, Debug)]
 pub struct MutableAntichain<T> {
-    /// Accumulated (timestamp, count) updates.
+    /// Accumulated (timestamp, count) updates — the source of truth for multiplicity.
+    /// After compaction, each timestamp appears at most once with its net count.
     updates: ChangeBatch<T>,
-    /// The current frontier: minimal elements with positive count.
+    /// The current frontier: minimal elements from `updates` that have positive count.
+    /// This is a cached derivation of `updates`, rebuilt when updates might change it.
     frontier: Vec<T>,
-    /// Changes to the frontier produced by the last batch of updates.
+    /// Frontier delta from the last `update_iter()` call: `(timestamp, +1)` for
+    /// elements added to the frontier, `(timestamp, -1)` for elements removed.
+    /// Consumed by callers to react to frontier changes (e.g., seeding the worklist).
     changes: ChangeBatch<T>,
 }
 
@@ -88,6 +118,20 @@ impl<T: Clone + PartialOrder + Ord> MutableAntichain<T> {
     ///
     /// Returns an iterator over the resulting changes to the frontier:
     /// `(timestamp, +1)` for elements added and `(timestamp, -1)` for elements removed.
+    ///
+    /// # Rebuild heuristic
+    ///
+    /// Rebuilding the frontier from scratch is O(n²) in the worst case. To avoid
+    /// unnecessary rebuilds, we check each update against the current frontier:
+    /// - **Positive delta** (adding counts): The frontier only changes if the new
+    ///   timestamp is NOT dominated by any current frontier element (it might be
+    ///   a new minimal element).
+    /// - **Negative delta** (removing counts): The frontier only changes if the
+    ///   timestamp IS a current frontier element (removing it might reveal new
+    ///   minimal elements behind it).
+    ///
+    /// Once a rebuild is detected as necessary, we skip the check for remaining
+    /// updates (they'll all be processed in the rebuild anyway).
     pub fn update_iter<I>(&mut self, updates: I) -> Vec<(T, i64)>
     where
         I: IntoIterator<Item = (T, i64)>,

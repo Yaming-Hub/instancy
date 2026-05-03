@@ -2,7 +2,28 @@
 //!
 //! A `ChangeBatch` accumulates updates of the form `(T, i64)` and can consolidate
 //! them by sorting and summing, removing entries whose accumulated value is zero.
-//! This is the fundamental building block for progress tracking.
+//!
+//! # Role in the progress tracking pipeline
+//!
+//! `ChangeBatch` is the fundamental building block that flows capability changes
+//! through the entire progress system:
+//!
+//! ```text
+//! Capability::new()/drop()  →  ProgressReporter (wraps ChangeBatch)
+//!                           →  ProgressTracker::collect_operator_progress()
+//!                           →  Tracker::update_source() (into ChangeBatch)
+//!                           →  drain_pending_changes() (into MutableAntichain)
+//!                           →  pushed_changes (ChangeBatch of frontier deltas)
+//! ```
+//!
+//! # Lazy compaction strategy
+//!
+//! Updates are appended eagerly (O(1)) but compaction (sort + consolidate + remove
+//! zeros) is deferred. The `clean` field marks how much of the `updates` vec has
+//! already been compacted. Compaction is triggered automatically when the dirty
+//! portion exceeds half the total size (see [`maintain_bounds`](ChangeBatch::maintain_bounds)),
+//! or explicitly when data is read (via `iter()`, `drain()`, etc.). This amortizes
+//! the O(n log n) sort cost across many O(1) appends.
 
 /// A collection of `(T, i64)` updates with lazy compaction.
 ///
@@ -11,8 +32,13 @@
 /// of compaction across many updates.
 #[derive(Clone, Debug)]
 pub struct ChangeBatch<T> {
+    /// The raw updates buffer. Entries `[0..clean)` are compacted (sorted, consolidated,
+    /// no zeros). Entries `[clean..)` are "dirty" — unprocessed appends that may contain
+    /// duplicates or zero-sum pairs.
     updates: Vec<(T, i64)>,
     /// The length of the prefix of `updates` known to be compacted.
+    /// Invariant: `clean <= updates.len()`. When `clean == updates.len()`, all data
+    /// is compacted. When `clean == 0`, everything is dirty.
     clean: usize,
 }
 
@@ -157,6 +183,13 @@ impl<T: Ord> ChangeBatch<T> {
     }
 
     /// Triggers compaction if the dirty portion exceeds half the total.
+    ///
+    /// The thresholds (minimum 32 entries, dirty ≥ half of total) are heuristic:
+    /// - **32 minimum**: Don't bother compacting tiny batches — the overhead of
+    ///   sorting isn't worth it for small N.
+    /// - **Half dirty**: Ensures amortized O(1) cost per update. Each update is
+    ///   "charged" for the compaction it eventually triggers. Since we compact when
+    ///   half the entries are dirty, each dirty entry pays for sorting ~2 entries.
     fn maintain_bounds(&mut self) {
         if self.updates.len() > 32 && self.updates.len() / 2 >= self.clean {
             self.compact();

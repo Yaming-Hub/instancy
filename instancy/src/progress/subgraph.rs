@@ -49,6 +49,16 @@ pub struct OperatorShape {
 /// Collects operator registrations and edges during dataflow construction,
 /// then compiles them into a [`ProgressTracker`].
 ///
+/// The builder accumulates the topology of the dataflow graph:
+/// - **operators**: what they are (shape, name)
+/// - **connectivity**: how timestamps transform through each operator
+/// - **edges**: which output ports connect to which input ports
+/// - **initial capabilities**: which operators start holding capabilities
+/// - **progress buffers**: shared reporters that operators will write to at runtime
+///
+/// Calling [`build()`](Self::build) consumes the builder and produces a
+/// `ProgressTracker` that owns all this state and can perform live propagation.
+///
 /// Graph node 0 (a vertex in the dataflow graph, not a machine) is reserved
 /// for the scope boundary (timely convention).
 pub struct SubgraphBuilder<T: Timestamp> {
@@ -248,12 +258,24 @@ impl<T: Timestamp> fmt::Debug for SubgraphBuilder<T> {
 
 /// Manages live frontier propagation for a subgraph.
 ///
-/// The tracker:
-/// 1. Collects capability changes from operators (via [`ProgressReporter`](crate::progress::operate::ProgressReporter)).
-/// 2. Feeds them into the reachability [`Tracker`].
-/// 3. Propagates to compute new frontier implications.
-/// 4. Delivers frontier changes back to operators.
-/// 5. Reports completion when all capabilities are drained.
+/// This is the main orchestrator that bridges operators and the reachability tracker.
+/// It performs a 5-step cycle on each [`propagate()`](Self::propagate) call:
+///
+/// 1. **Collect**: Drains ±1 capability changes from each operator's
+///    [`ProgressReporter`](crate::progress::operate::ProgressReporter) into the
+///    reachability tracker's pending change buffers.
+/// 2. **Propagate**: Calls `Tracker::propagate_all()` to process pending changes,
+///    update pointstamp frontiers, and compute implication frontier deltas.
+/// 3. **Update frontiers**: Reads the propagated frontier deltas and updates
+///    each operator's per-port frontier snapshots (`OperatorFrontierState`).
+/// 4. **Identify dirty operators**: Operators whose frontiers changed are added
+///    to the `dirty_operators` list so the executor can re-activate them.
+/// 5. **Check completion**: If no outstanding capabilities remain and no pending
+///    changes exist, marks the dataflow as completed.
+///
+/// The tracker also manages initialization: `initialize()` must be called once
+/// before the first propagation to seed initial capabilities (e.g., input operators
+/// that start with a capability at `T::minimum()`).
 pub struct ProgressTracker<T: Timestamp> {
     /// The reachability tracker that does the heavy lifting.
     tracker: Tracker<T>,

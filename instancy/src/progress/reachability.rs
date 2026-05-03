@@ -5,14 +5,52 @@
 //! when no capabilities for a given timestamp can reach a port, that port's
 //! frontier advances past that timestamp.
 //!
+//! # Why reachability tracking exists
+//!
+//! In a streaming dataflow, operators need to know when a timestamp `t` is
+//! "complete" — meaning no more data at `t` can ever arrive. This is what
+//! enables aggregation operators to emit final results, and it's what allows
+//! the system to free resources for processed timestamps.
+//!
+//! The key insight is that data at time `t` can only arrive at an operator's
+//! input port if there exists some upstream capability at a time `s` that can
+//! *reach* that port with a timestamp `<= t`. "Reach" means there is a path
+//! through the dataflow graph, and the timestamps may be *transformed* along
+//! the way by operator-internal path summaries (e.g., a loop feedback operator
+//! might add +1 to the timestamp).
+//!
+//! When all such reachable capabilities disappear (are dropped or downgraded),
+//! the port's frontier advances past `t`, signaling that `t` is complete.
+//!
 //! # Architecture
 //!
-//! 1. [`Builder`] — collects the static graph topology (operators, edges, summaries).
-//! 2. [`Tracker`] — live propagation engine that maintains per-port frontiers.
+//! 1. [`Builder`] — collects the static graph topology (operators, edges, path
+//!    summaries) during dataflow construction.
+//! 2. [`Tracker`] — live propagation engine that maintains per-port frontiers
+//!    at runtime.
 //!
 //! The [`Builder`] compiles the graph into a [`Tracker`] via [`Builder::build`].
-//! The [`Tracker`] then receives incremental updates (capability changes) and
-//! propagates their implications through the graph using a worklist algorithm.
+//! The [`Tracker`] then receives incremental capability changes (pointstamp
+//! updates) and propagates their implications through the graph using a
+//! min-heap worklist algorithm, computing new frontiers at every port.
+//!
+//! # Key concepts
+//!
+//! - **Pointstamp**: A count of outstanding capabilities at a specific
+//!   `(location, timestamp)`. When an operator creates a `Capability<T>`,
+//!   it increments the pointstamp at `(operator_output_port, T)` by +1.
+//!   When the capability is dropped, it decrements by -1.
+//!
+//! - **Implication**: The set of timestamps that *could* still arrive at a
+//!   location, computed by propagating pointstamps through path summaries.
+//!   The frontier of implications at a port is what operators observe as
+//!   their "input frontier."
+//!
+//! - **Path summary**: Describes how a timestamp transforms along a path.
+//!   For example, an identity summary means the timestamp passes through
+//!   unchanged. A loop feedback summary might map `t → t+1`. Summaries
+//!   are composed via `followed_by()` and stored as antichains (because
+//!   multiple paths with different summaries may exist between two ports).
 
 use std::cmp::Reverse;
 use std::collections::BinaryHeap;
@@ -30,8 +68,15 @@ use crate::progress::timestamp::{PathSummary, Timestamp};
 
 /// A location in the dataflow graph: either an operator's output port or input port.
 ///
+/// Locations identify where capabilities (pointstamps) exist and where frontiers
+/// are tracked. The progress system models the dataflow as a bipartite graph of
+/// locations: data flows from Source (output port) locations along edges to
+/// Target (input port) locations, and from Target locations through operator
+/// internals to Source locations.
+///
 /// This is a **logical** concept — `node` refers to the logical operator index
-/// in the graph, not a physical machine or cluster node.
+/// in the dataflow graph (assigned during construction), not a physical machine
+/// or cluster node.
 #[derive(Clone, Debug, Hash, Eq, PartialEq, Ord, PartialOrd)]
 pub enum Location {
     /// An operator's output port (where data is produced).
@@ -75,15 +120,28 @@ impl Location {
 
 /// Builds a reachability graph from operator topology.
 ///
+/// During dataflow construction, the builder collects three things per operator:
+/// - **Shape**: how many input/output ports (stored in `shape`).
+/// - **Internal connectivity**: how timestamps transform through the operator,
+///   as a matrix of path summary antichains (stored in `nodes`).
+/// - **Edges**: which output ports connect to which input ports (stored in `edges`).
+///
 /// Register operators with [`add_node`](Self::add_node), connect them with
 /// [`add_edge`](Self::add_edge), then call [`build`](Self::build) to produce
-/// a live [`Tracker`].
+/// a live [`Tracker`] and the scope-level summary.
 pub struct Builder<T: Timestamp> {
-    /// Per-node internal connectivity (how timestamps transform through operator).
+    /// Per-node internal connectivity: how timestamps transform from input ports
+    /// to output ports within each operator. `nodes[i]` is `Some(connectivity)`
+    /// for registered operators and `None` for unregistered indices.
     nodes: Vec<Option<PortConnectivity<T::Summary>>>,
-    /// Per-node outgoing edges: `edges[node][output_port]` → list of target locations.
+    /// Per-node outgoing edges: `edges[node][output_port]` → list of target
+    /// locations that this output port feeds into. Edges represent inter-operator
+    /// connections and use identity timestamp transformation (timestamps pass
+    /// through unchanged along edges — only operator internals transform them).
     edges: Vec<Vec<Vec<Location>>>,
-    /// (inputs, outputs) count per node.
+    /// Per-node port shape: `shape[node] = (num_inputs, num_outputs)`.
+    /// Stored separately from `nodes` because we need shapes before connectivity
+    /// is registered (edges reference port counts).
     shape: Vec<(usize, usize)>,
     /// Number of scope inputs (boundary targets that receive from outside).
     scope_inputs: usize,
@@ -105,10 +163,15 @@ impl<T: Timestamp> Builder<T> {
             scope_inputs,
             scope_outputs,
         };
-        // Graph node 0 is the scope boundary: scope_outputs inputs, scope_inputs outputs.
-        // (The scope's outputs are "inputs" to graph node 0, and scope's inputs are "outputs".)
+        // Graph node 0 is the scope boundary — a virtual operator that represents
+        // the interface between this subgraph and its parent scope.
+        //
+        // The direction inversion is key: the scope's OUTPUT ports are node 0's
+        // INPUTS (because scope outputs receive data from inside the subgraph),
+        // and the scope's INPUT ports are node 0's OUTPUTS (because scope inputs
+        // send data into the subgraph). This follows timely's convention.
+        //
         // "Node" here means a vertex in the dataflow graph, not a machine/cluster node.
-        // This follows timely's convention where the scope wrapper is graph node 0.
         let boundary_inputs = scope_outputs;
         let boundary_outputs = scope_inputs;
         builder.ensure_node(0);
@@ -251,13 +314,45 @@ impl<T: Timestamp> Builder<T> {
 
     /// Computes the scope-level summary using fixed-point iteration.
     ///
-    /// For each scope input → scope output path, computes the antichain of
-    /// path summaries describing all possible timestamp transformations.
+    /// # What is a scope summary?
+    ///
+    /// A scope summary describes how timestamps entering the scope (via scope
+    /// inputs) can reach scope outputs after traversing the internal subgraph.
+    /// For each (scope_input, scope_output) pair, the summary is an antichain
+    /// of path summaries representing all possible timestamp transformations.
+    ///
+    /// # Why fixed-point iteration?
+    ///
+    /// The subgraph may contain cycles (e.g., loop feedback edges). A timestamp
+    /// entering at a scope input might traverse a loop N times before reaching a
+    /// scope output, accumulating summary compositions at each step. We iterate
+    /// until no new summary paths are discovered, which converges because:
+    /// 1. Summary composition (`followed_by`) produces monotonically advancing times.
+    /// 2. Antichains only grow (new summaries are inserted, never removed).
+    /// 3. The timestamp lattice has no infinite descending chains.
+    ///
+    /// # Algorithm
+    ///
+    /// We compute "backward reachability" — for each location in the graph, which
+    /// scope outputs can it reach, and with what composed summary? This is done
+    /// by alternating two propagation steps until convergence:
+    ///
+    /// 1. **Internal propagation**: For each operator, compose the operator's
+    ///    internal path summaries with the output-to-scope-output summaries to
+    ///    derive input-to-scope-output summaries.
+    /// 2. **Edge propagation**: For each edge (source → target), copy the
+    ///    target-to-scope-output summaries to the source (edges are identity).
+    ///
+    /// Finally, scope input → scope output summaries are read from graph node 0's
+    /// source-to-output entries.
     fn compute_scope_summary(&self) -> PortConnectivity<T::Summary> {
         let mut summary = PortConnectivity::new(self.scope_inputs, self.scope_outputs);
 
-        // Summaries from each location to scope outputs.
-        // location_to_output[location] → Vec<Antichain<Summary>> indexed by scope output.
+        // Two parallel lookup tables for backward reachability:
+        // - source_to_output[node][output_port][scope_output] = Antichain<Summary>
+        //   "What summaries can reach scope output `so` from Source(node, output_port)?"
+        // - target_to_output[node][input_port][scope_output] = Antichain<Summary>
+        //   "What summaries can reach scope output `so` from Target(node, input_port)?"
         let num_nodes = self.shape.len();
         let mut source_to_output: Vec<Vec<Vec<Antichain<T::Summary>>>> = self
             .shape
@@ -357,10 +452,22 @@ impl<T: Timestamp> Builder<T> {
         summary
     }
 
-    /// Compiles forward propagation paths used by the Tracker.
+    /// Compiles forward propagation paths used by the Tracker at build time.
     ///
-    /// For each location, computes which other locations it can reach and with
-    /// what summary antichains. This avoids recomputing paths during propagation.
+    /// This pre-computes a lookup table so that during propagation, when a frontier
+    /// changes at some location, we can immediately look up which downstream
+    /// locations are affected and what summary transformation to apply — without
+    /// walking the graph structure on every propagation step.
+    ///
+    /// Returns two tables:
+    /// - `target_summaries[node][input]` → list of `(Source(node, output), summary_antichain)`.
+    ///   These represent internal operator paths: when a frontier changes at an
+    ///   operator's input, these summaries tell us how timestamps transform to
+    ///   reach each of the operator's outputs.
+    /// - `source_summaries[node][output]` → list of `(Target(next_node, port), identity)`.
+    ///   These represent inter-operator edges: when a frontier changes at an
+    ///   operator's output, the timestamp propagates unchanged (identity summary)
+    ///   to connected downstream inputs.
     fn compile_forward_paths(
         &self,
     ) -> (
@@ -447,11 +554,30 @@ impl<T: Ord> PartialOrd for WorklistEntry<T> {
     }
 }
 
-/// Per-port frontier and implication tracking.
+/// Per-port state tracking both direct pointstamps and propagated implications.
+///
+/// The distinction between pointstamps and implications is critical:
+///
+/// - **`pointstamps`**: Direct capability counts at THIS port. For a Source port,
+///   this tracks capabilities held by the operator at that output. For a Target
+///   port, this is less commonly used (capabilities are primarily at Sources).
+///   Pointstamps are updated directly by `drain_pending_changes()`.
+///
+/// - **`implications`**: The set of timestamps that COULD reach this port from
+///   ANY upstream capability, after applying all path summaries. This is computed
+///   by the propagation algorithm. The frontier of implications is what operators
+///   observe as their "input frontier" — it tells them which timestamps might
+///   still receive new data.
+///
+/// Example: If operator A holds a capability at time 5, and there's an identity
+/// path from A's output to B's input, then B's input Target has an implication
+/// at time 5 (even though no pointstamp exists at B's input — the pointstamp
+/// is at A's output Source).
 struct PortInformation<T: Timestamp> {
-    /// Current counts (pointstamps) at this port.
+    /// Direct capability counts at this port (the "local" view).
     pointstamps: MutableAntichain<T>,
-    /// Propagated implications: what times can reach downstream.
+    /// Propagated implications from all reachable upstream capabilities.
+    /// The frontier of this antichain is the port's observable frontier.
     implications: MutableAntichain<T>,
 }
 
@@ -472,6 +598,21 @@ struct PerOperator<T: Timestamp> {
 
 /// Live reachability tracker that propagates progress changes through the dataflow graph.
 ///
+/// # How progress flows through the system
+///
+/// 1. Operators create/drop capabilities → `ProgressReporter` records ±1 changes.
+/// 2. `ProgressTracker::collect_operator_progress()` drains reporters into this tracker
+///    via `update_source()`.
+/// 3. `propagate_all()` processes the changes:
+///    a. Updates pointstamp counts at source/target ports.
+///    b. Computes frontier changes (which timestamps entered/left the pointstamp frontier).
+///    c. Propagates frontier changes through the graph using path summaries.
+///    d. Updates implication frontiers at every reachable port.
+/// 4. `ProgressTracker::update_operator_frontiers()` reads the new frontiers and reports
+///    which operators' frontiers changed ("dirty" operators).
+/// 5. The executor re-activates dirty operators, which may observe advanced frontiers
+///    and fire notifications.
+///
 /// # Usage
 ///
 /// 1. Post updates via [`update_target`](Self::update_target) / [`update_source`](Self::update_source).
@@ -487,27 +628,41 @@ pub struct Tracker<T: Timestamp> {
     /// (inputs, outputs) per node.
     shape: Vec<(usize, usize)>,
 
-    /// Per-operator frontier state.
+    /// Per-operator frontier state (pointstamps and implications at each port).
     per_operator: Vec<PerOperator<T>>,
 
-    /// Pending input changes (buffered before propagation).
+    /// Pending capability changes buffered before propagation. These accumulate
+    /// between `propagate_all()` calls. `target_changes[node][port]` holds changes
+    /// at Target(node, port); `source_changes[node][port]` at Source(node, port).
     target_changes: Vec<Vec<ChangeBatch<T>>>,
     source_changes: Vec<Vec<ChangeBatch<T>>>,
 
-    /// Compiled forward paths for propagation.
+    /// Pre-compiled forward propagation paths (computed once at build time).
+    /// `target_summaries[node][input]` lists which Source locations can be
+    /// reached from Target(node, input) and with what summary antichains.
+    /// `source_summaries[node][output]` lists which Target locations can be
+    /// reached from Source(node, output) (always identity — edges don't transform).
     target_summaries: Vec<Vec<Vec<(Location, Antichain<T::Summary>)>>>,
     source_summaries: Vec<Vec<Vec<(Location, Antichain<T::Summary>)>>>,
 
-    /// Worklist for propagation (min-heap by timestamp).
+    /// Min-heap worklist for propagation. Entries are processed in timestamp
+    /// order (smallest first via `Reverse`) to ensure that when we process a
+    /// frontier change at time `t`, all changes at times `< t` have already
+    /// been processed. Same-location entries are accumulated before processing.
     worklist: BinaryHeap<Reverse<WorklistEntry<T>>>,
 
-    /// Accumulated frontier changes at all locations.
+    /// Accumulated frontier changes at all locations from the last propagation.
+    /// Read by `ProgressTracker::update_operator_frontiers()` to determine which
+    /// operators' frontiers changed. Format: `((Location, T), diff)`.
     pushed_changes: ChangeBatch<(Location, T)>,
 
-    /// Scope output frontier changes.
+    /// Scope output frontier changes — used when this subgraph is nested inside
+    /// a parent scope and needs to report its output frontier to the parent.
     output_changes: Vec<ChangeBatch<T>>,
 
-    /// Total outstanding capability counts across all locations.
+    /// Total outstanding capability count across ALL locations. When this reaches
+    /// 0 and no pending changes remain, the dataflow is complete (no more data
+    /// can be produced at any timestamp).
     total_counts: i64,
 }
 
@@ -527,6 +682,29 @@ impl<T: Timestamp> Tracker<T> {
     }
 
     /// Propagates all pending changes through the reachability graph.
+    ///
+    /// This is the core algorithm. It works in two steps:
+    ///
+    /// **Step 1 — Drain pending changes**: Capability changes (from operators
+    /// creating/dropping capabilities) are applied to pointstamp counts at each
+    /// port. When a pointstamp change alters a port's frontier, the frontier
+    /// delta is seeded into the worklist.
+    ///
+    /// **Step 2 — Process worklist in timestamp order**: The worklist is a
+    /// min-heap, so we always process the smallest timestamp first. This is
+    /// important because frontier changes at time `t` may be cancelled by
+    /// changes at time `t' < t`. Processing in order ensures correctness.
+    ///
+    /// For each worklist entry `(location, time, diff)`:
+    /// - If at a **Target** (input port): apply path summaries to propagate
+    ///   the change to downstream Source (output port) locations.
+    /// - If at a **Source** (output port): follow edges to propagate the
+    ///   change to connected Target locations.
+    /// - At each destination, update the implication frontier and, if it
+    ///   changed, add new worklist entries for further propagation.
+    ///
+    /// Same `(time, location)` entries are accumulated before processing,
+    /// so +1 and -1 for the same pointstamp cancel out without propagation.
     ///
     /// After calling this, read frontier implications via [`drain_pushed`] and
     /// [`drain_output_changes`].
@@ -612,6 +790,19 @@ impl<T: Timestamp> Tracker<T> {
     // -- internal --
 
     /// Drains pending target/source changes into pointstamps and seeds the worklist.
+    ///
+    /// This is the bridge between external updates (operators creating/dropping
+    /// capabilities) and the propagation algorithm. For each pending change:
+    ///
+    /// 1. Update `total_counts` (the global outstanding capability count).
+    /// 2. Apply the change to the port's `pointstamps` MutableAntichain.
+    /// 3. If the pointstamp frontier changed (i.e., the minimal set of active
+    ///    timestamps shifted), emit frontier deltas into the worklist.
+    ///
+    /// The worklist entries are frontier *changes* (not raw pointstamp changes).
+    /// This is crucial: if two capabilities exist at times 3 and 5, adding a
+    /// third capability at time 4 does NOT change the frontier (3 is still
+    /// minimal), so no propagation is needed.
     fn drain_pending_changes(&mut self) {
         for node in 0..self.shape.len() {
             let (inputs, outputs) = self.shape[node];
@@ -653,6 +844,18 @@ impl<T: Timestamp> Tracker<T> {
     }
 
     /// Propagates an implication change at a target (input port).
+    ///
+    /// When an implication frontier changes at Target(node, port), this method:
+    /// 1. Updates the implication MutableAntichain at this port.
+    /// 2. Records the change in `pushed_changes` (for external consumers).
+    /// 3. If this is graph node 0 (scope boundary), records scope output changes.
+    /// 4. For each resulting implication delta, applies the operator's internal
+    ///    path summaries (`target_summaries`) to compute what Source locations
+    ///    can be reached and with what transformed timestamps.
+    ///
+    /// The `results_in()` call on a summary transforms the input timestamp:
+    /// e.g., a feedback summary might map time `t` to `t+1`, representing that
+    /// data entering the loop body at time `t` can produce output at time `t+1`.
     fn propagate_target(&mut self, node: usize, port: usize, time: &T, diff: i64) {
         // Update implications at this target.
         let implication_changes = self.per_operator[node].targets[port]
@@ -693,6 +896,17 @@ impl<T: Timestamp> Tracker<T> {
     }
 
     /// Propagates an implication change at a source (output port).
+    ///
+    /// When an implication frontier changes at Source(node, port), this method:
+    /// 1. Updates the implication MutableAntichain at this port.
+    /// 2. Records the change in `pushed_changes` (for external consumers).
+    /// 3. Follows outgoing edges to connected Target locations. Edges use
+    ///    identity transformation (timestamps pass through unchanged), so the
+    ///    same `(time, diff)` is pushed to each connected Target's worklist entry.
+    ///
+    /// The asymmetry with `propagate_target` is intentional: edges between operators
+    /// are simple wires (no timestamp transformation), while operator internals
+    /// may have complex path summaries (e.g., feedback increments).
     fn propagate_source(&mut self, node: usize, port: usize, time: &T, diff: i64) {
         // Update implications at this source.
         let implication_changes = self.per_operator[node].sources[port]
