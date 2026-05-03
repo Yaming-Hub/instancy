@@ -395,7 +395,17 @@ impl<T: Timestamp> DataflowExecutor<T> {
     /// Propagate progress and enqueue operators whose frontiers changed.
     ///
     /// Called after each activation batch when a progress tracker is present.
-    /// Updates per-operator notificators with new frontiers.
+    /// Propagates progress and updates operator frontiers/notificators.
+    ///
+    /// After operators produce/consume data, capabilities change. This method:
+    /// 1. Collects capability changes from all operators' ProgressReporters.
+    /// 2. Runs the reachability tracker to compute new frontiers.
+    /// 3. Delivers frontier updates to both:
+    ///    a. The executor's per-operator notificators (legacy path for regular operators).
+    ///    b. The operators themselves via `update_input_frontier()` (for notify-capable
+    ///       operators like WiredUnaryNotifyOperator that manage their own notificator).
+    /// 4. Re-enqueues operators that have ready notifications.
+    ///
     /// Returns true if any operator was newly activated.
     fn propagate_progress(&mut self) -> bool {
         let tracker = match &mut self.progress_tracker {
@@ -411,7 +421,7 @@ impl<T: Timestamp> DataflowExecutor<T> {
             .filter_map(|&op_idx| {
                 if op_idx < self.index_to_pos.len() {
                     let pos = self.index_to_pos[op_idx];
-                    if pos != usize::MAX && pos < self.notificators.len() {
+                    if pos != usize::MAX && pos < self.operators.len() {
                         let frontier = tracker.operator_input_frontier_meet(op_idx);
                         return Some((pos, frontier));
                     }
@@ -420,11 +430,22 @@ impl<T: Timestamp> DataflowExecutor<T> {
             })
             .collect();
 
-        // Apply frontier updates to notificators.
-        for (pos, frontier) in frontier_updates {
-            if let Some(notificator) = &mut self.notificators[pos] {
-                notificator.update_frontier(&frontier);
+        // Apply frontier updates to:
+        // 1. Executor-owned notificators (legacy path, for operators that don't
+        //    override update_input_frontier — i.e., regular unary/binary operators).
+        // 2. The operators themselves (for notify-capable operators that manage
+        //    their own internal notificator). The default implementation is a no-op,
+        //    so this is safe to call on all operators.
+        for (pos, frontier) in &frontier_updates {
+            // Legacy path: executor-owned notificator
+            if *pos < self.notificators.len() {
+                if let Some(notificator) = &mut self.notificators[*pos] {
+                    notificator.update_frontier(frontier);
+                }
             }
+            // New path: operator-owned notificator (WiredUnaryNotifyOperator etc.)
+            // The operator downcasts &dyn Any to &Antichain<T> internally.
+            self.operators[*pos].update_input_frontier(frontier);
         }
 
         let mut activated = false;
@@ -441,17 +462,32 @@ impl<T: Timestamp> DataflowExecutor<T> {
             }
         }
 
-        // Also check if any operator has ready notifications (may not be dirty)
-        for pos in 0..self.notificators.len() {
+        // Check if any operator has ready notifications and should be re-enqueued.
+        // This covers two cases:
+        // 1. Executor-owned notificators (legacy): notifications fired by the
+        //    frontier update above.
+        // 2. Operator-owned notificators (new): the operator's has_ready_notifications()
+        //    returns true after update_input_frontier() fired notifications.
+        for pos in 0..self.operators.len() {
             if self.done[pos] || self.in_queue[pos] {
                 continue;
             }
-            if let Some(notificator) = &self.notificators[pos] {
-                if notificator.has_ready() {
-                    self.ready_queue.push_back(pos);
-                    self.in_queue[pos] = true;
-                    activated = true;
-                }
+            // Check executor-owned notificator (legacy path)
+            let executor_has_ready = if pos < self.notificators.len() {
+                self.notificators
+                    .get(pos)
+                    .and_then(|n| n.as_ref())
+                    .map_or(false, |n| n.has_ready())
+            } else {
+                false
+            };
+            // Check operator-owned notificator (new path)
+            let operator_has_ready = self.operators[pos].has_ready_notifications();
+
+            if executor_has_ready || operator_has_ready {
+                self.ready_queue.push_back(pos);
+                self.in_queue[pos] = true;
+                activated = true;
             }
         }
 

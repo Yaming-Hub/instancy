@@ -40,7 +40,7 @@ use crate::dataflow::channels::tee::tee_or_single;
 use crate::dataflow::channels::wake::WakeHandle;
 use crate::dataflow::channel_operators::ChannelMode;
 use crate::dataflow::graph::DataflowGraph;
-use crate::dataflow::operators::handles::{InputHandle, OutputHandle};
+use crate::dataflow::operators::handles::{InputHandle, NotifyContext, OutputHandle};
 use crate::dataflow::operators::input::InputEvent;
 use crate::dataflow::operators::output::OutputEvent;
 use crate::dataflow::probe::ProbeHandle;
@@ -50,8 +50,9 @@ use crate::dataflow::schedulable::{
     channel_factory, single_use_factory,
 };
 use crate::dataflow::stream::Slot;
-use crate::dataflow::wired_operators::{WiredBinaryOperator, WiredConcatOperator, WiredEnterOperator, WiredFeedbackOperator, WiredLeaveOperator, WiredSourceOperator, WiredUnaryOperator};
+use crate::dataflow::wired_operators::{WiredBinaryOperator, WiredConcatOperator, WiredEnterOperator, WiredFeedbackOperator, WiredLeaveOperator, WiredSourceOperator, WiredUnaryOperator, WiredUnaryNotifyOperator};
 use crate::error::{Error, Result};
+use crate::progress::frontier::Antichain;
 use crate::progress::change_batch::ChangeBatch;
 use crate::progress::operate::PortConnectivity;
 use crate::progress::reachability::Location;
@@ -251,7 +252,7 @@ impl<T: Timestamp> DataflowBuilder<T> {
             // The input source holds a capability at T::minimum() until closed.
             let mut initial_cap = ChangeBatch::new();
             initial_cap.update(T::minimum(), 1);
-            state.subgraph_builder.add_operator_with_capabilities(
+            let progress = state.subgraph_builder.add_operator_with_capabilities(
                 op_idx,
                 &name,
                 0,
@@ -259,6 +260,15 @@ impl<T: Timestamp> DataflowBuilder<T> {
                 PortConnectivity::new(0, 1),
                 vec![initial_cap],
             );
+
+            // Clone the progress reporter for the source's output port.
+            // The ChannelSourceOperator uses this to release the initial capability
+            // (reporter.update(T::minimum(), -1)) when its channel closes.
+            // Without this, the initial capability would never be released, and
+            // downstream frontiers would be stuck at T::minimum() forever —
+            // preventing frontier-based operators (unary_notify) from ever firing
+            // their notifications.
+            let source_reporter = progress.reporter(0).clone();
 
             // Record port metadata
             state.input_ports.push(InputPortInfo {
@@ -285,6 +295,7 @@ impl<T: Timestamp> DataflowBuilder<T> {
 
                         let ext_counter = Arc::clone(&external_inputs_open);
                         let factory_name = wiring_name.clone();
+                        let reporter = source_reporter.clone();
                         let factory: OperatorFactory = single_use_factory(move |_ctx, endpoints| {
                             let output_pusher: Box<dyn Push<T, D>> = {
                                 let pushers: Vec<Box<dyn Push<T, D>>> = endpoints
@@ -304,7 +315,7 @@ impl<T: Timestamp> DataflowBuilder<T> {
                                 RegionId::new(0),
                                 InputRecv::Std(rx),
                                 output_pusher,
-                                None,
+                                Some(reporter),
                                 ext_counter,
                             );
                             Box::new(op) as Box<dyn SchedulableOperator>
@@ -322,6 +333,7 @@ impl<T: Timestamp> DataflowBuilder<T> {
 
                         let ext_counter = Arc::clone(&external_inputs_open);
                         let factory_name = wiring_name.clone();
+                        let reporter = source_reporter.clone();
                         let factory: OperatorFactory = single_use_factory(move |_ctx, endpoints| {
                             let output_pusher: Box<dyn Push<T, D>> = {
                                 let pushers: Vec<Box<dyn Push<T, D>>> = endpoints
@@ -341,7 +353,7 @@ impl<T: Timestamp> DataflowBuilder<T> {
                                 RegionId::new(0),
                                 InputRecv::Tokio(rx),
                                 output_pusher,
-                                None,
+                                Some(reporter),
                                 ext_counter,
                             );
                             Box::new(op) as Box<dyn SchedulableOperator>
@@ -608,6 +620,68 @@ impl<T: Timestamp, D: Clone + Send + 'static> Pipe<T, D> {
             + 'static,
     {
         self.add_unary_with_handles(name, logic)
+    }
+
+    /// Apply a unary operator with frontier-based notification support.
+    ///
+    /// Like [`unary`](Self::unary), but the closure receives a [`NotifyContext`] that
+    /// enables buffering data and deferring emission until a timestamp is "complete"
+    /// (the input frontier has advanced past it).
+    ///
+    /// # Why use this instead of `unary`?
+    ///
+    /// Use `unary_notify` when the operator needs to **buffer data and emit final
+    /// results per timestamp**. For example:
+    /// - Aggregation after exchange (must wait for all workers' contributions)
+    /// - Window/batch operators (collect all data in a time range)
+    /// - Sort/distinct (need complete data at a timestamp)
+    ///
+    /// The `NotifyContext` provides:
+    /// - `ctx.notify_at(time)` — request a callback when time is complete, AND hold
+    ///   an output capability to prevent downstream from advancing past `time`
+    /// - `ctx.next_notification()` — consume fired notifications and drop capabilities
+    ///
+    /// # Progress safety
+    ///
+    /// When you call `ctx.notify_at(time)`, an output capability is created that
+    /// prevents downstream frontiers from advancing past `time`. This capability
+    /// is automatically dropped when you call `ctx.next_notification()`. If you
+    /// never consume notifications, downstream will never make progress.
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// input
+    ///     .unary_notify("aggregate", {
+    ///         let mut stash: HashMap<u64, Vec<i32>> = HashMap::new();
+    ///         move |input, output, ctx| {
+    ///             // Buffer incoming data and request notification
+    ///             while let Some((time, data)) = input.next() {
+    ///                 stash.entry(time).or_default().extend(data);
+    ///                 ctx.notify_at(time);
+    ///             }
+    ///             // When a timestamp is complete, emit the buffered data
+    ///             while let Some(time) = ctx.next_notification() {
+    ///                 if let Some(data) = stash.remove(&time) {
+    ///                     output.push_vec(time, data);
+    ///                 }
+    ///             }
+    ///             Ok(())
+    ///         }
+    ///     })
+    /// ```
+    pub fn unary_notify<D2, L>(self, name: impl Into<String>, logic: L) -> Pipe<T, D2>
+    where
+        D2: Clone + Send + 'static,
+        L: FnMut(
+                &mut InputHandle<T, D>,
+                &mut OutputHandle<T, D2>,
+                &mut NotifyContext<'_, T>,
+            ) -> Result<()>
+            + Send
+            + 'static,
+    {
+        self.add_unary_notify_internal(name, logic)
     }
 
     /// Combine two streams with a binary operator.
@@ -2002,6 +2076,145 @@ impl<T: Timestamp, D: Clone + Send + 'static> Pipe<T, D> {
             _phantom: PhantomData,
         }
     }
+
+    /// Internal implementation for `unary_notify`.
+    ///
+    /// This is nearly identical to `add_unary_with_handles`, but:
+    /// 1. Captures a `ProgressReporter<T>` from the subgraph builder's per-operator
+    ///    progress buffers. This reporter is shared with the `ProgressTracker` and
+    ///    enables the operator's `NotifyContext` to create output capabilities.
+    /// 2. Creates a `WiredUnaryNotifyOperator` instead of `WiredUnaryOperator`.
+    ///    The notify variant owns a `Notificator<T>` and manages held capabilities
+    ///    to prevent premature downstream frontier advancement while data is buffered.
+    fn add_unary_notify_internal<D2, L>(
+        &self,
+        name: impl Into<String>,
+        logic: L,
+    ) -> Pipe<T, D2>
+    where
+        D2: Clone + Send + 'static,
+        L: FnMut(
+                &mut InputHandle<T, D>,
+                &mut OutputHandle<T, D2>,
+                &mut NotifyContext<'_, T>,
+            ) -> Result<()>
+            + Send
+            + 'static,
+    {
+        let name = name.into();
+        let op_idx;
+        let region_id = RegionId::new(0);
+
+        {
+            let mut state = self.state.borrow_mut();
+            op_idx = state.allocate_operator_index();
+
+            // Register in graph (1 input, 1 output)
+            state
+                .graph
+                .register_operator(crate::dataflow::graph::OperatorInfo::new(
+                    op_idx, &name, region_id, 1, 1,
+                ))
+                .expect("operator index unique");
+
+            // Edge from upstream
+            state.graph.add_edge(crate::dataflow::graph::EdgeInfo::new(
+                Slot::new(self.op_idx, self.output_slot),
+                Slot::new(op_idx, 0),
+                region_id,
+                region_id,
+            ));
+
+            // Subgraph: identity connectivity (1 input → 1 output, default summary).
+            let progress = state.subgraph_builder.add_operator(
+                op_idx,
+                &name,
+                1,
+                1,
+                PortConnectivity::identity(T::Summary::default()),
+            );
+
+            // Clone the ProgressReporter for output port 0.
+            // This reporter is shared with the ProgressTracker — the tracker drains
+            // changes from it during `collect_operator_progress()`. The operator uses
+            // it via `NotifyContext::notify_at()` to create Capability<T> objects that
+            // write +1/-1 to this reporter, which the tracker sees as pointstamp
+            // changes that hold downstream frontiers.
+            let progress_reporter = progress.reporter(0).clone();
+
+            state.subgraph_builder.add_edge(
+                Location::source(self.op_idx, self.output_slot),
+                Location::target(op_idx, 0),
+            );
+
+            // Operator factory — creates a WiredUnaryNotifyOperator with the
+            // captured progress reporter. The reporter is moved into the closure
+            // and then into the operator; since ProgressReporter is Arc-based,
+            // the ProgressTracker and operator share the same underlying buffer.
+            let name_clone = name.clone();
+            let factory: OperatorFactory = single_use_factory(move |_ctx, endpoints: ChannelEndpoints| {
+                let input_puller: Box<dyn Pull<T, D>> = *endpoints
+                    .input_pullers
+                    .into_iter()
+                    .next()
+                    .expect("unary_notify must have input puller")
+                    .downcast::<Box<dyn Pull<T, D>>>()
+                    .expect("unary_notify input puller type mismatch");
+
+                let output_pusher: Box<dyn Push<T, D2>> = {
+                    let pushers: Vec<Box<dyn Push<T, D2>>> = endpoints
+                        .output_pushers
+                        .into_iter()
+                        .map(|any_box| {
+                            *any_box
+                                .downcast::<Box<dyn Push<T, D2>>>()
+                                .expect("unary_notify output pusher type mismatch")
+                        })
+                        .collect();
+                    tee_or_single(pushers).unwrap_or_else(|| Box::new(NullPush))
+                };
+
+                // The initial frontier is [T::minimum()] — the operator starts with
+                // the assumption that all timestamps are possible. The executor will
+                // call update_input_frontier() after the first progress propagation
+                // to set the actual frontier.
+                let initial_frontier = Antichain::from_elem(T::minimum());
+
+                Box::new(WiredUnaryNotifyOperator::new(
+                    name_clone,
+                    op_idx,
+                    region_id,
+                    logic,
+                    input_puller,
+                    output_pusher,
+                    progress_reporter,
+                    initial_frontier,
+                )) as Box<dyn SchedulableOperator>
+            });
+            state.operator_factories.push((op_idx, factory));
+
+            // Channel factory for the input edge
+            let edge_idx = state.graph.edges().len() - 1;
+            let capacity = state.channel_capacity;
+            let chan_factory: ChannelFactory = channel_factory(move |_ctx, _cap: usize, wake: Option<WakeHandle>| {
+                let (push, pull) = bounded_channel_with_wake::<T, D, ()>(capacity, wake.clone());
+                (
+                    Box::new(Box::new(push) as Box<dyn Push<T, D>>)
+                        as Box<dyn std::any::Any + Send>,
+                    Box::new(Box::new(pull) as Box<dyn Pull<T, D>>)
+                        as Box<dyn std::any::Any + Send>,
+                )
+            });
+            state.channel_factories.push((edge_idx, chan_factory));
+        }
+
+        Pipe {
+            state: Rc::clone(&self.state),
+            op_idx,
+            output_slot: 0,
+            _phantom: PhantomData,
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -2900,5 +3113,193 @@ mod tests {
         let mut all: Vec<i32> = r.iter().flat_map(|(_, v)| v.iter().copied()).collect();
         all.sort();
         assert_eq!(all, vec![100, 160]);
+    }
+
+    // -----------------------------------------------------------------------
+    // unary_notify — frontier-based buffering + emission
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_unary_notify_basic_passthrough() {
+        // Simplest notify test: buffer data, emit on notification.
+        // Single timestamp, single batch — notification fires when source closes
+        // and frontier advances past t=0.
+        let builder = DataflowBuilder::<u64>::new("notify_passthrough");
+        let port = builder
+            .source("nums", vec![(0u64, vec![1i32, 2, 3])])
+            .unary_notify("buffer_emit", {
+                let mut stash: std::collections::HashMap<u64, Vec<i32>> =
+                    std::collections::HashMap::new();
+                move |input, output, ctx| {
+                    while let Some((time, data)) = input.next() {
+                        stash.entry(time).or_default().extend(data);
+                        ctx.notify_at(time);
+                    }
+                    while let Some(time) = ctx.next_notification() {
+                        if let Some(data) = stash.remove(&time) {
+                            output.push_vec(time, data);
+                        }
+                    }
+                    Ok(())
+                }
+            })
+            .output("results");
+        let dataflow = builder.build().unwrap();
+        rt().run(dataflow).unwrap();
+
+        let c = port.collector();
+        let r = c.lock().unwrap();
+        let all: Vec<i32> = r.iter().flat_map(|(_, v)| v.iter().copied()).collect();
+        assert_eq!(all, vec![1, 2, 3]);
+    }
+
+    #[test]
+    fn test_unary_notify_multiple_timestamps() {
+        // Multiple timestamps — each gets its own notification.
+        // Verifies that notifications fire per-timestamp as frontier advances.
+        let builder = DataflowBuilder::<u64>::new("notify_multi_time");
+        let port = builder
+            .source(
+                "data",
+                vec![
+                    (0u64, vec![10i32, 20]),
+                    (1u64, vec![30, 40]),
+                    (2u64, vec![50]),
+                ],
+            )
+            .unary_notify("aggregate", {
+                let mut stash: std::collections::HashMap<u64, Vec<i32>> =
+                    std::collections::HashMap::new();
+                move |input, output, ctx| {
+                    while let Some((time, data)) = input.next() {
+                        stash.entry(time).or_default().extend(data);
+                        ctx.notify_at(time);
+                    }
+                    while let Some(time) = ctx.next_notification() {
+                        if let Some(mut data) = stash.remove(&time) {
+                            let sum: i32 = data.drain(..).sum();
+                            output.push_vec(time, vec![sum]);
+                        }
+                    }
+                    Ok(())
+                }
+            })
+            .output("results");
+        let dataflow = builder.build().unwrap();
+        rt().run(dataflow).unwrap();
+
+        let c = port.collector();
+        let r = c.lock().unwrap();
+        let mut results: Vec<(u64, i32)> = r
+            .iter()
+            .flat_map(|(t, vs)| vs.iter().map(move |v| (*t, *v)))
+            .collect();
+        results.sort();
+        // t=0: 10+20=30, t=1: 30+40=70, t=2: 50
+        assert_eq!(results, vec![(0, 30), (1, 70), (2, 50)]);
+    }
+
+    #[test]
+    fn test_unary_notify_downstream_chain() {
+        // Verify that a notify operator chains correctly with downstream operators.
+        // The downstream map should receive data only after the notify operator emits.
+        let builder = DataflowBuilder::<u64>::new("notify_chain");
+        let port = builder
+            .source("nums", vec![(0u64, vec![1i32, 2, 3, 4])])
+            .unary_notify("sum", {
+                let mut stash: std::collections::HashMap<u64, Vec<i32>> =
+                    std::collections::HashMap::new();
+                move |input, output, ctx| {
+                    while let Some((time, data)) = input.next() {
+                        stash.entry(time).or_default().extend(data);
+                        ctx.notify_at(time);
+                    }
+                    while let Some(time) = ctx.next_notification() {
+                        if let Some(data) = stash.remove(&time) {
+                            let sum: i32 = data.iter().sum();
+                            output.push_vec(time, vec![sum]);
+                        }
+                    }
+                    Ok(())
+                }
+            })
+            .map("format", |_t, x| format!("sum={x}"))
+            .output("results");
+        let dataflow = builder.build().unwrap();
+        rt().run(dataflow).unwrap();
+
+        let c = port.collector();
+        let r = c.lock().unwrap();
+        let all: Vec<&str> = r.iter().flat_map(|(_, v)| v.iter().map(|s| s.as_str())).collect();
+        assert_eq!(all, vec!["sum=10"]);
+    }
+
+    #[test]
+    fn test_unary_notify_no_data_no_notification() {
+        // If notify_at is never called, no notification fires.
+        // The operator should still complete cleanly.
+        let builder = DataflowBuilder::<u64>::new("notify_empty");
+        let port = builder
+            .source::<i32>("nums", vec![])
+            .unary_notify::<i32, _>("noop", {
+                move |input, _output, _ctx| {
+                    // Drain input but never call notify_at
+                    while input.next().is_some() {}
+                    Ok(())
+                }
+            })
+            .output("results");
+        let dataflow = builder.build().unwrap();
+        rt().run(dataflow).unwrap();
+
+        let c = port.collector();
+        let r = c.lock().unwrap();
+        assert!(r.is_empty());
+    }
+
+    #[test]
+    fn test_unary_notify_duplicate_notify_at() {
+        // Calling notify_at(t) multiple times for the same time should
+        // result in exactly one notification firing for that time.
+        let builder = DataflowBuilder::<u64>::new("notify_dedup");
+        let port = builder
+            .source("data", vec![(0u64, vec![1i32, 2, 3])])
+            .unary_notify("count_notifs", {
+                let mut stash: std::collections::HashMap<u64, Vec<i32>> =
+                    std::collections::HashMap::new();
+                let mut notification_count: i32 = 0;
+                move |input, output, ctx| {
+                    while let Some((time, data)) = input.next() {
+                        stash.entry(time).or_default().extend(data);
+                        // Call notify_at multiple times for the same timestamp
+                        ctx.notify_at(time);
+                        ctx.notify_at(time);
+                        ctx.notify_at(time);
+                    }
+                    while let Some(time) = ctx.next_notification() {
+                        notification_count += 1;
+                        if stash.remove(&time).is_some() {
+                            // Emit notification count to verify dedup
+                            output.push_vec(time, vec![notification_count]);
+                        }
+                    }
+                    Ok(())
+                }
+            })
+            .output("results");
+        let dataflow = builder.build().unwrap();
+        rt().run(dataflow).unwrap();
+
+        let c = port.collector();
+        let r = c.lock().unwrap();
+        let all: Vec<i32> = r.iter().flat_map(|(_, v)| v.iter().copied()).collect();
+        // The Notificator coalesces duplicate notify_at calls for the same time,
+        // so only one notification fires per time. With the dedup guard in
+        // NotifyContext::notify_at(), only ONE capability is created regardless
+        // of how many times notify_at is called for the same timestamp. The key
+        // invariant: data is emitted exactly once per timestamp.
+        assert!(!all.is_empty(), "should have at least one notification");
+        // Verify exactly one notification fired (notification_count == 1)
+        assert_eq!(all, vec![1], "should fire exactly one notification for the deduplicated time");
     }
 }

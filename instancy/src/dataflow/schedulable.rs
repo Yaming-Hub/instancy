@@ -83,6 +83,27 @@ pub trait SchedulableOperator: Send {
     /// Called by the executor when upstream operators have completed or
     /// the dataflow is shutting down.
     fn close_inputs(&mut self);
+
+    /// Update this operator's input frontier from the progress tracker.
+    ///
+    /// Called by the executor after progress propagation for operators whose
+    /// frontiers changed. The `frontier` is an `Antichain<T>` (the meet of
+    /// all input port frontiers), passed as `&dyn Any` for type erasure.
+    ///
+    /// Notify-capable operators override this to update their internal
+    /// [`Notificator`](crate::progress::notificator::Notificator), which
+    /// fires ready notifications when the frontier advances past requested
+    /// timestamps. Regular operators leave this as a no-op.
+    fn update_input_frontier(&mut self, _frontier: &dyn std::any::Any) {}
+
+    /// Whether this operator has ready notifications that need processing.
+    ///
+    /// The executor checks this after progress propagation to re-enqueue
+    /// operators with fired notifications, even if they have no new input
+    /// data. Regular operators return `false` (default).
+    fn has_ready_notifications(&self) -> bool {
+        false
+    }
 }
 
 // ---------------------------------------------------------------------------

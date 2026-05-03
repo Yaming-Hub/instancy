@@ -1,10 +1,27 @@
 //! Operator interface and progress reporting types.
 //!
-//! Defines the contract between operators and the progress tracking system:
-//! - [`PortConnectivity`] describes how timestamps transform through an operator.
-//! - [`OperatorProgress`] is the shared buffer for consumed/produced/internal changes.
-//! - [`ProgressReporter`] is a thread-safe handle for capability accounting.
-//! - [`OperatorCore`] is the trait operators implement to declare their shape.
+//! This module defines the contract between operators and the progress tracking system.
+//! Every operator in the dataflow graph participates in progress tracking through two
+//! mechanisms:
+//!
+//! 1. **Static shape declaration** (via [`OperatorCore`]): At construction time, each
+//!    operator declares how many input/output ports it has and how timestamps transform
+//!    through its internals. The reachability tracker uses this to build its propagation
+//!    graph.
+//!
+//! 2. **Runtime capability accounting** (via [`ProgressReporter`]): During execution,
+//!    operators create and drop capabilities (timestamps they are allowed to produce
+//!    output at). Each create/clone/drop/downgrade is recorded as a +1/-1 change in
+//!    the reporter, which the progress tracker drains periodically.
+//!
+//! Key types:
+//! - [`PortConnectivity`] — describes how timestamps transform through an operator
+//!   (a matrix of path summary antichains from inputs to outputs).
+//! - [`OperatorProgress`] — shared buffer holding per-port capability reporters.
+//! - [`ProgressReporter`] — thread-safe handle wrapping a [`ChangeBatch`] for atomic
+//!   capability change recording.
+//! - [`OperatorCore`] — trait that operators implement to declare their shape and
+//!   initial capabilities.
 
 use std::fmt::Debug;
 use std::sync::{Arc, Mutex};
@@ -23,6 +40,24 @@ use crate::progress::timestamp::Timestamp;
 /// For an operator with `I` inputs and `O` outputs, `connectivity[i][o]` is the
 /// [`Antichain`] of [`PathSummary`] values describing all paths from input `i`
 /// to output `o`. An empty antichain means there is no path.
+///
+/// # Why antichains of summaries?
+///
+/// A single input-to-output pair may have multiple internal paths (e.g., in a
+/// subgraph with branches). Each path has its own summary (timestamp transformation).
+/// Since timestamps form a partial order (not total), we cannot pick a single "best"
+/// summary — instead we keep the antichain of minimal summaries. During propagation,
+/// ALL summaries in the antichain are applied to compute the set of reachable
+/// downstream timestamps.
+///
+/// # Common patterns
+///
+/// - **Pass-through operator** (map, filter): 1 input, 1 output, identity summary.
+///   Use [`identity()`](Self::identity).
+/// - **Binary operator** (join): 2 inputs, 1 output, identity summary on both paths.
+/// - **Feedback/loop**: The ingress/egress operators increment a loop counter,
+///   so their summary advances the inner timestamp dimension.
+/// - **Sink** (no outputs): 0 outputs, all antichains trivially empty.
 #[derive(Clone, Debug)]
 pub struct PortConnectivity<S> {
     /// `connectivity[input][output]` — antichain of path summaries.
@@ -205,9 +240,20 @@ impl<T: Timestamp> OperatorProgress<T> {
 
 /// Trait for operator implementations to declare their shape and connectivity.
 ///
-/// This is the static interface: operators report how many inputs/outputs they have
-/// and how timestamps flow through them. The runtime uses this to build the
-/// reachability graph.
+/// This is the **static** interface between operators and the progress system.
+/// The runtime calls `get_internal_summary()` once during dataflow construction
+/// to build the reachability graph. After that, progress tracking is driven
+/// entirely by capability accounting through [`ProgressReporter`].
+///
+/// # Contract
+///
+/// - `inputs()` and `outputs()` must return stable values (never change after construction).
+/// - `get_internal_summary()` must return a `PortConnectivity` whose dimensions
+///   match `inputs() × outputs()`.
+/// - The initial capabilities (second return value) declare which timestamps the
+///   operator holds at construction time. For most operators this is empty. Input
+///   source operators return `[(initial_time, +1)]` on their output port to
+///   indicate they can produce data at the initial timestamp.
 pub trait OperatorCore<T: Timestamp>: Send {
     /// Returns the number of input ports.
     fn inputs(&self) -> usize;

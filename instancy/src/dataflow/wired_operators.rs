@@ -22,10 +22,13 @@ use std::collections::VecDeque;
 
 use crate::dataflow::channels::envelope::{Envelope, Payload};
 use crate::dataflow::channels::pushpull::{Pull, Push};
-use crate::dataflow::operators::handles::{InputHandle, OutputHandle};
+use crate::dataflow::operators::handles::{InputHandle, NotifyContext, OutputHandle};
 use crate::dataflow::region::RegionId;
 use crate::dataflow::schedulable::{ActivationOutcome, SchedulableOperator};
 use crate::error::{Error, Result};
+use crate::progress::capability::Capability;
+use crate::progress::frontier::Antichain;
+use crate::progress::notificator::Notificator;
 use crate::progress::operate::ProgressReporter;
 use crate::progress::timestamp::Timestamp;
 
@@ -1238,6 +1241,392 @@ where
 
     fn close_inputs(&mut self) {
         self.input_exhausted = true;
+    }
+}
+
+// ---------------------------------------------------------------------------
+// WiredUnaryNotifyOperator
+// ---------------------------------------------------------------------------
+
+/// A fully-wired unary operator that supports frontier-based notifications.
+///
+/// # Why this exists (vs regular WiredUnaryOperator)
+///
+/// A regular `WiredUnaryOperator` processes data immediately: it pulls input,
+/// runs the user closure, and pushes output — all in the same activation.
+/// This works for stateless operators (map, filter) and simple stateful ones
+/// that can emit partial results incrementally.
+///
+/// However, some operators need to **buffer data and defer emission** until a
+/// timestamp is "complete" — meaning all possible input at that timestamp has
+/// arrived. For example:
+///
+/// - **Aggregation after exchange**: When data for timestamp `t` arrives from
+///   multiple workers in separate batches, the operator must wait until ALL
+///   batches have arrived before emitting the final aggregate. The frontier
+///   advancing past `t` is the signal that no more data at `t` will arrive.
+///
+/// - **Window operators**: Collect all data in a time window, then process.
+///
+/// - **Sort/distinct**: Need all data at a timestamp before producing output.
+///
+/// The `WiredUnaryNotifyOperator` extends the regular unary with:
+///
+/// 1. **A [`Notificator`] that fires when the input frontier advances**, signaling
+///    that specific timestamps are complete.
+///
+/// 2. **Output capabilities** (via [`ProgressReporter`]) that prevent downstream
+///    frontiers from advancing while data is buffered. Without these, the progress
+///    tracker would propagate upstream completion through this operator, making
+///    downstream operators incorrectly believe buffered timestamps are done.
+///
+/// 3. **Frontier-aware activation**: Unlike the regular unary operator which skips
+///    activation when input is exhausted, this operator continues activating as long
+///    as it has pending or ready notifications — ensuring buffered data is eventually
+///    emitted even after all input is consumed.
+///
+/// # Activation flow
+///
+/// ```text
+/// 1. Flush pending output (backpressure retry)
+/// 2. Pull input from channel → feed InputHandle
+/// 3. Determine if there's work:
+///    - has_work = has_input OR notificator.has_ready()
+///    - If !has_work AND exhausted AND no pending notifications → Done
+///    - If !has_work → Idle
+/// 4. Run user logic with (InputHandle, OutputHandle, NotifyContext)
+/// 5. Push output to channel
+/// 6. Check completion
+/// ```
+///
+/// # Progress safety contract
+///
+/// When the user calls `ctx.notify_at(time)`, an output capability is created
+/// at `time`. This capability's existence in the progress tracker prevents
+/// downstream frontiers from advancing past `time`. When `ctx.next_notification()`
+/// returns `time`, the capability is dropped, allowing progress to flow.
+///
+/// The user MUST call `next_notification()` for every `notify_at()` — otherwise
+/// capabilities accumulate and downstream never makes progress. This is enforced
+/// by the notification firing mechanism: a notification only fires when the
+/// input frontier advances past the time, and `next_notification()` is the
+/// only way to consume it.
+pub struct WiredUnaryNotifyOperator<T: Timestamp, D1: Send + 'static, D2: Send + 'static> {
+    name: String,
+    index: usize,
+    region_id: RegionId,
+
+    /// Input channel — pulls envelopes from upstream.
+    input_puller: Box<dyn Pull<T, D1>>,
+    /// Operator's typed input buffer.
+    input_handle: InputHandle<T, D1>,
+
+    /// User logic closure — receives InputHandle, OutputHandle, AND NotifyContext.
+    /// The NotifyContext lets the user register notifications and consume them.
+    logic: Box<
+        dyn FnMut(
+                &mut InputHandle<T, D1>,
+                &mut OutputHandle<T, D2>,
+                &mut NotifyContext<'_, T>,
+            ) -> Result<()>
+            + Send,
+    >,
+
+    /// Operator's typed output buffer.
+    output_handle: OutputHandle<T, D2>,
+    /// Output channel — pushes envelopes downstream.
+    output_pusher: Box<dyn Push<T, D2>>,
+
+    /// Pending output envelopes (for backpressure retry).
+    pending_output: VecDeque<Envelope<T, D2>>,
+
+    /// Notificator that tracks when input frontier advances past requested timestamps.
+    /// Updated by the executor via `update_input_frontier()` after progress propagation.
+    /// The executor calls `propagate_progress()` → computes new operator input frontier →
+    /// calls `operator.update_input_frontier(&frontier)` → notificator fires ready
+    /// notifications → executor re-enqueues operator if `has_ready_notifications()`.
+    notificator: Notificator<T>,
+
+    /// Progress reporter for this operator's output port (port 0).
+    /// Used by NotifyContext to create output capabilities.
+    /// Each Capability::new(time, reporter) increments a pointstamp count at
+    /// (operator_index, output_port=0, time) in the reachability tracker.
+    /// Each Capability::drop decrements it. The reachability tracker uses these
+    /// pointstamps to compute downstream frontiers — a pointstamp at time `t`
+    /// prevents downstream operators from advancing past `t`.
+    progress_reporter: ProgressReporter<T>,
+
+    /// Output capabilities held while data is buffered.
+    /// Created in NotifyContext::notify_at(), dropped in NotifyContext::next_notification().
+    /// Each capability prevents downstream frontier advancement at its timestamp.
+    /// If this vec is non-empty, downstream operators are "held back" at the
+    /// minimum time among the capabilities.
+    held_capabilities: Vec<Capability<T>>,
+
+    /// Whether the input channel is exhausted (sender closed + empty).
+    input_exhausted: bool,
+    /// Whether this operator has completed all work.
+    done: bool,
+}
+
+impl<T: Timestamp, D1: Send + 'static, D2: Send + 'static>
+    WiredUnaryNotifyOperator<T, D1, D2>
+{
+    /// Create a new wired unary notify operator.
+    ///
+    /// # Arguments
+    ///
+    /// - `progress_reporter`: The [`ProgressReporter`] for this operator's output port.
+    ///   Obtained from `OperatorProgress::reporter(0)` during materialization.
+    ///   Used to create output capabilities that hold downstream frontiers.
+    ///
+    /// - `initial_frontier`: The initial input frontier at construction time.
+    ///   Typically `Antichain::from_elem(T::minimum())` for operators with
+    ///   connected input sources. The notificator uses this to determine which
+    ///   `notify_at` requests should fire immediately (for times already past
+    ///   the frontier).
+    pub fn new(
+        name: impl Into<String>,
+        index: usize,
+        region_id: RegionId,
+        logic: impl FnMut(
+                &mut InputHandle<T, D1>,
+                &mut OutputHandle<T, D2>,
+                &mut NotifyContext<'_, T>,
+            ) -> Result<()>
+            + Send
+            + 'static,
+        input_puller: Box<dyn Pull<T, D1>>,
+        output_pusher: Box<dyn Push<T, D2>>,
+        progress_reporter: ProgressReporter<T>,
+        initial_frontier: Antichain<T>,
+    ) -> Self {
+        let name = name.into();
+        Self {
+            input_handle: InputHandle::new(format!("{name}:input")),
+            output_handle: OutputHandle::new(format!("{name}:output")),
+            notificator: Notificator::new(initial_frontier),
+            name,
+            index,
+            region_id,
+            input_puller,
+            logic: Box::new(logic),
+            output_pusher,
+            pending_output: VecDeque::new(),
+            progress_reporter,
+            held_capabilities: Vec::new(),
+            input_exhausted: false,
+            done: false,
+        }
+    }
+
+    /// Try to flush pending output envelopes to the output channel.
+    fn flush_pending_output(&mut self) -> Result<bool> {
+        while let Some(envelope) = self.pending_output.pop_front() {
+            match self.output_pusher.try_push(envelope) {
+                Ok(()) => {}
+                Err((Error::Backpressure, returned)) => {
+                    self.pending_output.push_front(returned);
+                    return Ok(false);
+                }
+                Err((e, _returned)) => return Err(e),
+            }
+        }
+        Ok(true)
+    }
+
+    /// Pull from input channel and feed the InputHandle.
+    fn pull_input(&mut self) {
+        loop {
+            match self.input_puller.pull() {
+                Some(envelope) => match envelope.payload {
+                    Payload::Data { time, data } => {
+                        self.input_handle.push_vec(time, data);
+                    }
+                    Payload::Control(_signal) => {
+                        // Control signals handled by progress subsystem.
+                    }
+                },
+                None => {
+                    if self.input_puller.is_exhausted() {
+                        self.input_exhausted = true;
+                        self.input_handle.mark_exhausted();
+                    }
+                    break;
+                }
+            }
+        }
+    }
+
+    /// Drain output handle and push to output channel.
+    fn push_output(&mut self) -> Result<bool> {
+        for (time, data) in self.output_handle.drain() {
+            self.pending_output.push_back(Envelope::data(time, data));
+        }
+        self.flush_pending_output()
+    }
+
+    /// Whether the notificator has any outstanding work (pending or ready).
+    ///
+    /// Used in the completion check: the operator cannot report Done while
+    /// the notificator has pending notifications (the frontier may not have
+    /// advanced far enough yet) or ready notifications (buffered data hasn't
+    /// been emitted yet).
+    fn notificator_has_work(&self) -> bool {
+        self.notificator.has_ready()
+            || self.notificator.pending_count() > 0
+            || !self.held_capabilities.is_empty()
+    }
+}
+
+impl<T: Timestamp, D1: Send + 'static, D2: Send + 'static> SchedulableOperator
+    for WiredUnaryNotifyOperator<T, D1, D2>
+{
+    fn activate(&mut self) -> Result<ActivationOutcome> {
+        if self.done {
+            return Ok(ActivationOutcome::Done);
+        }
+
+        // Step 1: Flush pending output from previous activation (backpressure retry).
+        if !self.pending_output.is_empty() {
+            if !self.flush_pending_output()? {
+                return Ok(ActivationOutcome::BlockedOnBackpressure);
+            }
+        }
+
+        // Step 2: Pull from input channel → feed InputHandle.
+        self.pull_input();
+
+        // Step 3: Determine if the operator has work to do.
+        //
+        // Key difference from regular WiredUnaryOperator: we also check if
+        // the notificator has ready notifications. This allows the operator
+        // to run user logic EVEN WHEN there is no new input data — the user
+        // closure processes ready notifications and emits buffered data.
+        let had_input = self.input_handle.has_pending();
+        let has_notifications = self.notificator.has_ready();
+
+        if !had_input && !has_notifications {
+            if self.input_exhausted && !self.notificator_has_work() {
+                // Input exhausted, no pending/ready notifications, no held
+                // capabilities — the operator is truly done.
+                self.output_pusher.close();
+                self.done = true;
+                return Ok(ActivationOutcome::Done);
+            }
+            // No work right now, but we might get more input or notifications
+            // in a future activation.
+            return Ok(ActivationOutcome::Idle);
+        }
+
+        // Step 4: Build NotifyContext and run user logic.
+        //
+        // The NotifyContext wraps the notificator + progress reporter +
+        // held capabilities, giving the user closure a safe interface to:
+        // - Register notifications via notify_at(time) [creates output capability]
+        // - Consume notifications via next_notification() [drops output capability]
+        {
+            let mut ctx = NotifyContext::new(
+                &mut self.notificator,
+                &self.progress_reporter,
+                &mut self.held_capabilities,
+            );
+            (self.logic)(
+                &mut self.input_handle,
+                &mut self.output_handle,
+                &mut ctx,
+            )?;
+        }
+
+        // Step 5: Push output to channel.
+        if !self.push_output()? {
+            return Ok(ActivationOutcome::BlockedOnBackpressure);
+        }
+
+        // Step 6: Check completion.
+        //
+        // The operator is done only when ALL of these are true:
+        // - Input is exhausted (no more data from upstream)
+        // - No pending input batches in the InputHandle
+        // - No buffered output in the OutputHandle
+        // - No pending/ready notifications (all buffered data has been emitted)
+        // - No held output capabilities (all capabilities have been dropped)
+        //
+        // This is stricter than the regular unary operator, which only checks
+        // input exhaustion + empty handles. We must also wait for all
+        // notifications to fire and be consumed.
+        if self.input_exhausted
+            && !self.input_handle.has_pending()
+            && !self.output_handle.has_output()
+            && !self.notificator_has_work()
+        {
+            self.output_pusher.close();
+            self.done = true;
+            return Ok(ActivationOutcome::Done);
+        }
+
+        Ok(ActivationOutcome::MadeProgress)
+    }
+
+    fn is_done(&self) -> bool {
+        self.done
+    }
+
+    fn name(&self) -> &str {
+        &self.name
+    }
+
+    fn index(&self) -> usize {
+        self.index
+    }
+
+    fn region_id(&self) -> RegionId {
+        self.region_id
+    }
+
+    fn close_inputs(&mut self) {
+        self.input_exhausted = true;
+        self.input_handle.mark_exhausted();
+
+        // When input is closed, advance the notificator frontier to empty.
+        // An empty frontier means "no more data at ANY timestamp can arrive."
+        // This fires ALL pending notifications immediately, because every
+        // pending timestamp is now past the (empty) frontier.
+        //
+        // This is critical for correctness: without this, pending notifications
+        // would never fire after input exhaustion, and the operator would hang
+        // with buffered data that is never emitted.
+        //
+        // The fired notifications will be consumed in the next activation,
+        // where the user closure calls next_notification() and emits the
+        // buffered data.
+        self.notificator.update_frontier(&Antichain::new());
+    }
+
+    /// Update the operator's input frontier from the progress tracker.
+    ///
+    /// Called by the executor after progress propagation when this operator's
+    /// input frontier changed. The frontier is passed as `&dyn Any` because
+    /// the `SchedulableOperator` trait is type-erased — the concrete type
+    /// is `Antichain<T>` which we downcast here.
+    ///
+    /// This update may cause the notificator to fire notifications for
+    /// timestamps that are now past the frontier. The executor will check
+    /// `has_ready_notifications()` after this call and re-enqueue the
+    /// operator if there are ready notifications.
+    fn update_input_frontier(&mut self, frontier: &dyn std::any::Any) {
+        if let Some(frontier) = frontier.downcast_ref::<Antichain<T>>() {
+            self.notificator.update_frontier(frontier);
+        }
+    }
+
+    /// Whether this operator has ready notifications that need processing.
+    ///
+    /// The executor calls this after progress propagation to decide whether
+    /// to re-enqueue the operator. Returns true if the notificator has
+    /// fired notifications that haven't been consumed by `next_notification()`.
+    fn has_ready_notifications(&self) -> bool {
+        self.notificator.has_ready()
     }
 }
 
