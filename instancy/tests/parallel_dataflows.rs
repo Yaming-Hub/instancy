@@ -23,19 +23,25 @@ const TEST_TIMEOUT: Duration = Duration::from_secs(60);
 // Test 1: Shared worker pool — multiple dataflows on a single runtime
 // ===========================================================================
 
-/// Spawn N dataflows on a single RuntimeHandle with a small thread pool,
-/// feed them timestamp-by-timestamp in lockstep, and verify all complete
-/// correctly.
+/// Spawn N dataflows on a single RuntimeHandle with just 1 physical worker
+/// thread, feed them timestamp-by-timestamp in lockstep, and verify all
+/// complete correctly.
+///
+/// Using worker_threads=1 forces all logical workers from all dataflows to
+/// run sequentially on a single OS thread via cooperative async scheduling.
+/// This is the strongest test of the async worker model: it proves that
+/// logical workers don't require dedicated threads and that the runtime
+/// correctly multiplexes them without deadlocks or starvation.
 ///
 /// This validates:
-/// - Worker pool multiplexes multiple dataflows on limited threads
+/// - Multiple dataflows' async tasks cooperatively share a single thread
+/// - No deadlock when all dataflows' operators run sequentially
 /// - Task scheduling doesn't starve any dataflow
 /// - Progress tracking is independent per dataflow
-/// - No deadlocks when all dataflows compete for the same pool
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn shared_pool_parallel_dataflows_no_exchange() {
     let rt = RuntimeHandle::new(RuntimeConfig {
-        worker_threads: 2,
+        worker_threads: 1,
         ..RuntimeConfig::default()
     })
     .unwrap();
@@ -112,12 +118,17 @@ async fn shared_pool_parallel_dataflows_no_exchange() {
     }
 }
 
-/// Same as above but with multi-worker exchange dataflows sharing the pool.
-/// Verifies that exchange actually routes data to the correct worker.
+/// Multi-worker exchange dataflows sharing a single-thread pool.
+/// Each dataflow has 2 logical workers but only 1 physical thread is
+/// available, proving that exchange (cross-worker data routing) works
+/// correctly even when all logical workers run sequentially on one thread.
+///
+/// Verifies per-worker routing: with exchange_by_hash(|x| *x as u64) and
+/// 2 workers, even values route to worker 0 and odd values to worker 1.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn shared_pool_parallel_dataflows_with_exchange() {
     let rt = RuntimeHandle::new(RuntimeConfig {
-        worker_threads: 2,
+        worker_threads: 1,
         ..RuntimeConfig::default()
     })
     .unwrap();
@@ -216,12 +227,12 @@ async fn shared_pool_parallel_dataflows_with_exchange() {
     }
 }
 
-/// Stress variant: more dataflows, more epochs, verify no starvation.
+/// Stress variant: many dataflows on a single thread, verifying no starvation.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore] // stress test — run with `cargo test --ignored`
 async fn stress_shared_pool_many_dataflows() {
     let rt = RuntimeHandle::new(RuntimeConfig {
-        worker_threads: 2,
+        worker_threads: 1,
         ..RuntimeConfig::default()
     })
     .unwrap();
