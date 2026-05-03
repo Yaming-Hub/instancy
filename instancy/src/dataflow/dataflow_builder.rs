@@ -3293,10 +3293,11 @@ mod tests {
         let c = port.collector();
         let r = c.lock().unwrap();
         let all: Vec<i32> = r.iter().flat_map(|(_, v)| v.iter().copied()).collect();
-        // Multiple notify_at calls may produce multiple notifications depending
-        // on Notificator's dedup policy. The key invariant is that data is emitted
-        // correctly. With the current Notificator that doesn't dedup, we may get
-        // multiple notifications but stash.remove() returns None for duplicates.
+        // The Notificator coalesces duplicate notify_at calls for the same time,
+        // so only one notification fires per time. However, each notify_at call
+        // creates a separate output Capability (+1 each), all of which are dropped
+        // together when next_notification() fires. The key invariant: data is
+        // emitted exactly once per timestamp regardless of how many notify_at calls.
         assert!(!all.is_empty(), "should have at least one notification");
     }
 }
