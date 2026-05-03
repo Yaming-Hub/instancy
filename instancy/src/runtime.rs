@@ -2811,4 +2811,102 @@ mod tests {
         results.sort();
         assert_eq!(results, vec![1, 2, 3]);
     }
+
+    #[test]
+    fn spawn_multi_exchange_with_computation() {
+        // 2 workers: input → map(double) → exchange(mod 2) → map(+100) → output
+        // Tests that computation works both before and after exchange.
+        let rt = RuntimeHandle::new(RuntimeConfig::default()).unwrap();
+        let mut multi = rt
+            .spawn_multi("exchange_compute", 2, |_worker_idx, builder| {
+                let input = builder.input::<i32>("data");
+                input
+                    .map("double", |_t, x| x * 2)
+                    .exchange_by_hash("mod2", |x: &i32| *x as u64)
+                    .map("add100", |_t, x| x + 100)
+                    .output("results");
+                Ok(())
+            })
+            .unwrap();
+
+        let out0 = multi.take_output::<i32>(0, "results").unwrap();
+        let out1 = multi.take_output::<i32>(1, "results").unwrap();
+
+        // Input: [1, 2, 3, 4, 5] → doubled: [2, 4, 6, 8, 10]
+        // After exchange(mod 2): evens(0,2,4,6,8,10) → w0, odds → w1
+        // All doubled values are even, so all go to worker 0.
+        // After +100: [102, 104, 106, 108, 110]
+        let in0 = multi.take_input::<i32>(0, "data").unwrap();
+        in0.send(0u64, vec![1, 2, 3, 4, 5]).unwrap();
+        in0.close();
+
+        let in1 = multi.take_input::<i32>(1, "data").unwrap();
+        in1.close();
+
+        let _ = multi.join_blocking();
+
+        let mut w0: Vec<i32> = out0
+            .collect_data()
+            .into_iter()
+            .flat_map(|(_, d)| d)
+            .collect();
+        w0.sort();
+        let mut w1: Vec<i32> = out1
+            .collect_data()
+            .into_iter()
+            .flat_map(|(_, d)| d)
+            .collect();
+        w1.sort();
+
+        // All doubled values are even → mod 2 = 0 → all go to worker 0.
+        assert_eq!(w0, vec![102, 104, 106, 108, 110]);
+        assert!(w1.is_empty());
+    }
+
+    #[test]
+    fn spawn_multi_exchange_bidirectional_data() {
+        // Both workers send data, exchange redistributes.
+        // Tests that data flows correctly in both directions.
+        let rt = RuntimeHandle::new(RuntimeConfig::default()).unwrap();
+        let mut multi = rt
+            .spawn_multi("exchange_bidir", 2, |_worker_idx, builder| {
+                let input = builder.input::<i32>("data");
+                input
+                    .exchange_by_hash("mod2", |x: &i32| *x as u64)
+                    .output("out");
+                Ok(())
+            })
+            .unwrap();
+
+        let out0 = multi.take_output::<i32>(0, "out").unwrap();
+        let out1 = multi.take_output::<i32>(1, "out").unwrap();
+
+        // Worker 0 sends [0, 1, 2, 3], worker 1 sends [4, 5, 6, 7].
+        let in0 = multi.take_input::<i32>(0, "data").unwrap();
+        in0.send(0u64, vec![0, 1, 2, 3]).unwrap();
+        in0.close();
+
+        let in1 = multi.take_input::<i32>(1, "data").unwrap();
+        in1.send(0u64, vec![4, 5, 6, 7]).unwrap();
+        in1.close();
+
+        let _ = multi.join_blocking();
+
+        let mut w0: Vec<i32> = out0
+            .collect_data()
+            .into_iter()
+            .flat_map(|(_, d)| d)
+            .collect();
+        w0.sort();
+        let mut w1: Vec<i32> = out1
+            .collect_data()
+            .into_iter()
+            .flat_map(|(_, d)| d)
+            .collect();
+        w1.sort();
+
+        // mod 2: evens → w0, odds → w1
+        assert_eq!(w0, vec![0, 2, 4, 6]);
+        assert_eq!(w1, vec![1, 3, 5, 7]);
+    }
 }
