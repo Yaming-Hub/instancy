@@ -90,6 +90,12 @@ impl SharedWakeRegistry {
 
 /// Pre-allocated N×N matrix of bounded channels for one exchange edge.
 ///
+/// Currently assumes the same number of source and target workers (N×N),
+/// because `spawn_multi` creates a single group where all workers share the
+/// same topology. A future N×M variant will be needed when per-region
+/// parallelism is supported (e.g., region A with 4 workers exchanging into
+/// region B with 2 workers).
+///
 /// Created once per exchange edge during `spawn_multi`. Each worker
 /// calls [`take_pair`] to get its `ExchangePush` and `ExchangePull`.
 pub(crate) struct ExchangeChannelSet<T: Timestamp, D> {
