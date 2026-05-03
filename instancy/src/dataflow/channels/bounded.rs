@@ -142,6 +142,13 @@ impl<T: Timestamp, D: Send + 'static, M: Send + 'static> Push<T, D, M>
     fn is_closed(&self) -> bool {
         self.closed.load(Ordering::Acquire)
     }
+
+    fn available_capacity(&self) -> Option<usize> {
+        match self.state.lock() {
+            Ok(state) => Some(state.capacity.saturating_sub(state.buffer.len())),
+            Err(_) => Some(0), // poisoned → treat as no capacity
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------

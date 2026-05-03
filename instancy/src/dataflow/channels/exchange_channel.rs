@@ -2,29 +2,26 @@
 //!
 //! This module provides the **physical transport** for exchange edges. A single
 //! logical exchange edge in the dataflow graph (declared via [`Pipe::exchange`])
-//! is materialized into an N×N matrix of **physical** in-process bounded SPSC
-//! channels — one per (source worker, target worker) pair. These are real
-//! data-carrying channels, not graph-level abstractions.
+//! is materialized into an N×N matrix of channels — one per (source worker,
+//! target worker) pair. These are real data-carrying channels, not graph-level
+//! abstractions.
 //!
 //! Each source worker's [`ExchangePush`] partitions and routes records across
-//! the physical channels based on a hash function. Each target worker's
-//! [`ExchangePull`] merges data from its N physical input channels using
-//! round-robin.
+//! the channels based on a hash function. Each target worker's
+//! [`ExchangePull`] merges data from its N input channels using round-robin.
 //!
-//! # Short-term implementation
+//! # Transport independence
 //!
-//! This is an **intra-process-only** implementation that uses concrete
-//! `BoundedPush`/`BoundedPull` (shared-memory) channels. In the future,
-//! `ExchangePush` and `ExchangePull` will be refactored to hold
-//! `Vec<Box<dyn Push/Pull>>` so that the **runtime** (not the dataflow) decides
-//! the physical transport per worker pair — local workers get bounded channels,
-//! remote workers get network-backed channels via `TransportProvider` (see
-//! DESIGN.md §4.5). The dataflow layer should be agnostic to worker placement.
+//! `ExchangePush` and `ExchangePull` hold `Vec<Box<dyn Push/Pull>>` —
+//! the concrete transport per worker pair is injected at materialization time.
+//! Local workers get bounded in-memory channels; remote workers (future) get
+//! network-backed channels via serialization + wire protocol. The dataflow
+//! layer is agnostic to worker placement — that is a physical concern owned
+//! by the runtime.
 //!
 //! # Wake semantics
 //!
-//! Bounded channels in the matrix are created without per-channel wake handles.
-//! Instead, a [`SharedWakeRegistry`] provides bidirectional wake-up:
+//! A [`SharedWakeRegistry`] provides bidirectional wake-up:
 //! - **Push→target**: when worker i pushes to worker j, worker j is woken
 //! - **Pull→source**: when worker j pulls (freeing capacity), worker i is woken
 //!   so a backpressured sender can retry
@@ -174,11 +171,15 @@ impl<T: Timestamp, D: Send + 'static> ExchangeChannelSet<T, D> {
     /// - Push ends: `push_ends[idx][0..N]` (sends to all target workers)
     /// - Pull ends: `pull_ends[0..N][idx]` (receives from all source workers)
     ///
+    /// Returns boxed trait objects so `ExchangePush`/`ExchangePull` are
+    /// transport-agnostic. For this in-process implementation, the concrete
+    /// types behind the boxes are `BoundedPush`/`BoundedPull`.
+    ///
     /// Each worker's pair can only be taken once.
     pub fn take_pair(
         &mut self,
         worker_idx: usize,
-    ) -> Result<(Vec<BoundedPush<T, D, ()>>, Vec<BoundedPull<T, D, ()>>)> {
+    ) -> Result<(Vec<Box<dyn Push<T, D, ()>>>, Vec<Box<dyn Pull<T, D, ()>>>)> {
         if worker_idx >= self.num_workers {
             return Err(Error::Custom(format!(
                 "worker index {worker_idx} out of range (num_workers={})",
@@ -187,25 +188,25 @@ impl<T: Timestamp, D: Send + 'static> ExchangeChannelSet<T, D> {
         }
 
         // Take row of pushers: push_ends[worker_idx][*]
-        let mut pushers = Vec::with_capacity(self.num_workers);
+        let mut pushers: Vec<Box<dyn Push<T, D, ()>>> = Vec::with_capacity(self.num_workers);
         for dst in 0..self.num_workers {
             let push = self.push_ends[worker_idx][dst].take().ok_or_else(|| {
                 Error::Custom(format!(
                     "push end [{worker_idx}][{dst}] already taken"
                 ))
             })?;
-            pushers.push(push);
+            pushers.push(Box::new(push));
         }
 
         // Take column of pullers: pull_ends[*][worker_idx]
-        let mut pullers = Vec::with_capacity(self.num_workers);
+        let mut pullers: Vec<Box<dyn Pull<T, D, ()>>> = Vec::with_capacity(self.num_workers);
         for src in 0..self.num_workers {
             let pull = self.pull_ends[src][worker_idx].take().ok_or_else(|| {
                 Error::Custom(format!(
                     "pull end [{src}][{worker_idx}] already taken"
                 ))
             })?;
-            pullers.push(pull);
+            pullers.push(Box::new(pull));
         }
 
         Ok((pushers, pullers))
@@ -222,16 +223,16 @@ impl<T: Timestamp, D: Send + 'static> ExchangeChannelSet<T, D> {
 /// the exchange hash function. After pushing, wakes the target worker's
 /// executor via [`SharedWakeRegistry`].
 ///
-/// # Transport abstraction (future work)
+/// # Transport independence
 ///
-/// Currently holds concrete `BoundedPush` endpoints (in-process shared memory).
-/// A future refactor will change `targets` to `Vec<Box<dyn Push<T, D>>>` so
-/// the runtime can mix local (bounded channel) and remote (network) transports
-/// per target worker. The dataflow layer should not know whether a target
-/// worker is local or remote — that is a physical concern owned by the runtime.
+/// Holds `Vec<Box<dyn Push<T, D>>>` — the concrete transport per target
+/// worker is injected at construction time. This enables the runtime to
+/// mix local (bounded in-memory) and remote (network-backed) channels
+/// transparently. The exchange logic (partitioning, routing) is identical
+/// regardless of physical transport.
 pub struct ExchangePush<T: Timestamp, D: Send + 'static> {
-    /// One push endpoint per target worker.
-    targets: Vec<BoundedPush<T, D, ()>>,
+    /// One push endpoint per target worker (trait object — may be local or remote).
+    targets: Vec<Box<dyn Push<T, D, ()>>>,
     /// Hash function for routing records.
     exchange_fn: ExchangeFn<D>,
     /// Number of target workers.
@@ -245,7 +246,7 @@ pub struct ExchangePush<T: Timestamp, D: Send + 'static> {
 impl<T: Timestamp, D: Send + 'static> ExchangePush<T, D> {
     /// Create a new exchange push endpoint.
     pub(crate) fn new(
-        targets: Vec<BoundedPush<T, D, ()>>,
+        targets: Vec<Box<dyn Push<T, D, ()>>>,
         exchange_fn: ExchangeFn<D>,
         wakes: Arc<SharedWakeRegistry>,
     ) -> Self {
@@ -335,9 +336,15 @@ impl<T: Timestamp, D: Clone + Send + 'static> Push<T, D> for ExchangePush<T, D> 
                     buckets[target].push(record.clone());
                 }
 
-                // Pre-check ALL targets: closed or insufficient capacity.
-                // This avoids partial delivery — we only push if all targets
-                // can accept their sub-batch.
+                // Pre-check ALL targets for capacity before pushing anything.
+                // This preserves all-or-nothing delivery semantics: if any
+                // target cannot accept its sub-batch, the original envelope
+                // is returned intact for retry — no partial delivery.
+                //
+                // Targets that report available_capacity() == None (e.g.,
+                // future network channels) are assumed to have capacity.
+                // This is safe because network-backed Push implementations
+                // buffer internally and their try_push handles backpressure.
                 for (target_idx, bucket) in buckets.iter().enumerate() {
                     if bucket.is_empty() {
                         continue;
@@ -345,19 +352,21 @@ impl<T: Timestamp, D: Clone + Send + 'static> Push<T, D> for ExchangePush<T, D> 
                     if self.targets[target_idx].is_closed() {
                         return Err((Error::ChannelClosed, envelope));
                     }
-                    let available = self.targets[target_idx].capacity()
-                        .saturating_sub(self.targets[target_idx].len());
-                    if available == 0 {
-                        return Err((Error::Backpressure, envelope));
+                    if let Some(available) = self.targets[target_idx].available_capacity() {
+                        if available == 0 {
+                            return Err((Error::Backpressure, envelope));
+                        }
                     }
                 }
 
-                // All targets have capacity — push sub-batches.
+                // Pre-check passed — push sub-batches. For local channels
+                // (single-producer per exchange matrix slot), no concurrent
+                // writer can fill the channel between check and push, so
+                // this is effectively atomic. If it fails anyway (e.g.,
+                // future concurrent access), we accept partial delivery
+                // as a last resort.
                 for (target_idx, bucket) in buckets.into_iter().enumerate() {
                     if !bucket.is_empty() {
-                        // Pre-check passed, so this should succeed. If it
-                        // doesn't (e.g., concurrent access in future), we
-                        // accept partial delivery as a last resort.
                         match self.targets[target_idx].try_push(Envelope::data(
                             time.clone(),
                             bucket,
@@ -371,14 +380,15 @@ impl<T: Timestamp, D: Clone + Send + 'static> Push<T, D> for ExchangePush<T, D> 
                 }
             }
             Payload::Control(signal) => {
-                // Pre-check: all targets must have capacity for control signal.
+                // Pre-check all targets for capacity before broadcasting.
                 for target in self.targets.iter() {
                     if target.is_closed() {
                         return Err((Error::ChannelClosed, envelope));
                     }
-                    let available = target.capacity().saturating_sub(target.len());
-                    if available == 0 {
-                        return Err((Error::Backpressure, envelope));
+                    if let Some(available) = target.available_capacity() {
+                        if available == 0 {
+                            return Err((Error::Backpressure, envelope));
+                        }
                     }
                 }
 
@@ -419,7 +429,7 @@ impl<T: Timestamp, D: Send + 'static> Drop for ExchangePush<T, D> {
     fn drop(&mut self) {
         // Ensure all targets are closed so pull sides see exhaustion.
         for target in &mut self.targets {
-            Push::<T, D>::close(target);
+            target.close();
         }
         self.wakes.wake_all();
     }
@@ -565,14 +575,15 @@ impl<T: Timestamp> FrontierAggregator<T> {
 ///
 /// Error control signals pass through immediately (they are not aggregated).
 ///
-/// # Transport abstraction (future work)
+/// # Transport independence
 ///
-/// Currently holds concrete `BoundedPull` endpoints. Will be refactored to
-/// `Vec<Box<dyn Pull<T, D>>>` so the runtime can provide local or remote
-/// transports per source worker transparently.
+/// Holds `Vec<Box<dyn Pull<T, D>>>` — the concrete transport per source
+/// worker is injected at construction time. This enables the runtime to
+/// mix local (bounded in-memory) and remote (network-backed) channels
+/// transparently.
 pub struct ExchangePull<T: Timestamp, D> {
-    /// One pull endpoint per source worker.
-    sources: Vec<BoundedPull<T, D, ()>>,
+    /// One pull endpoint per source worker (trait object — may be local or remote).
+    sources: Vec<Box<dyn Pull<T, D, ()>>>,
     /// Round-robin index for fair merging.
     next_source: usize,
     /// Number of source workers.
@@ -588,7 +599,7 @@ pub struct ExchangePull<T: Timestamp, D> {
 impl<T: Timestamp, D> ExchangePull<T, D> {
     /// Create a new exchange pull endpoint.
     pub(crate) fn new(
-        sources: Vec<BoundedPull<T, D, ()>>,
+        sources: Vec<Box<dyn Pull<T, D, ()>>>,
         wakes: Arc<SharedWakeRegistry>,
     ) -> Self {
         let num_sources = sources.len();
