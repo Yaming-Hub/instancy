@@ -99,6 +99,20 @@ impl SharedWakeRegistry {
 
 /// Pre-allocated N×N matrix of bounded channels for one exchange edge.
 ///
+/// # Intra-node only
+///
+/// This implementation uses in-process [`BoundedPush`]/[`BoundedPull`] pairs
+/// backed by shared memory (`Arc<Mutex>`), so **all N workers must reside in
+/// the same OS process**. For cross-node (distributed) exchange, the matrix
+/// entries for remote worker pairs would be replaced with network-backed
+/// [`Push`]/[`Pull`] implementations using the `communication::codec` and
+/// `communication::connection_pool` layers. The [`ExchangePush`] and
+/// [`ExchangePull`] wrappers are transport-agnostic — they depend only on
+/// the `Push`/`Pull` trait interface and would work unchanged with remote
+/// transports.
+///
+/// # N×N assumption
+///
 /// Currently assumes the same number of source and target workers (N×N),
 /// because `spawn_multi` creates a single group where all workers share the
 /// same topology. A future N×M variant will be needed when per-region
