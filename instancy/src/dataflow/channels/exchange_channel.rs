@@ -725,15 +725,19 @@ impl<T: Timestamp, D: Send + 'static> Pull<T, D> for ExchangePull<T, D> {
 /// Created by the builder (which knows T, D, and ExchangeFn), stored on
 /// [`LogicalDataflow`], and consumed by `spawn_multi` to produce N shared
 /// channel factories — one per worker — that all reference the same
-/// underlying N×N channel matrix.
+/// underlying channel infrastructure.
 pub(crate) type ExchangeFactoryCreatorFn =
     Box<dyn FnOnce(usize, usize) -> Vec<super::super::schedulable::ChannelFactory> + Send>;
 
-/// Create a type-erased exchange factory creator.
+/// Create a type-erased exchange factory creator using the default local
+/// transport ([`LocalEdgeMaterializer`]).
 ///
 /// The returned closure captures the `ExchangeFn<D>` and concrete types
 /// `T`, `D`. When called with `(num_workers, capacity)`, it produces
-/// N channel factories that share an underlying [`ExchangeChannelSet`].
+/// N channel factories backed by in-process bounded channels.
+///
+/// For custom transports (network, mock), use
+/// [`create_exchange_factories_with`] instead.
 pub(crate) fn create_exchange_factory_creator<T, D>(
     exchange_fn: ExchangeFn<D>,
 ) -> ExchangeFactoryCreatorFn
@@ -742,47 +746,102 @@ where
     D: Clone + Send + 'static,
 {
     Box::new(move |num_workers: usize, capacity: usize| {
-        let wakes = Arc::new(SharedWakeRegistry::new(num_workers));
-        let channel_set = Arc::new(Mutex::new(ExchangeChannelSet::<T, D>::new(
-            num_workers, capacity,
-        )));
-
-        (0..num_workers)
-            .map(|_| {
-                let wakes = wakes.clone();
-                let channel_set = channel_set.clone();
-                let exchange_fn = exchange_fn.clone();
-                super::super::schedulable::channel_factory(
-                    move |ctx: &crate::worker::WorkerContext,
-                          _cap: usize,
-                          wake: Option<WakeHandle>| {
-                        wakes.register(ctx.worker_index(), wake);
-
-                        let (pushers, pullers) = channel_set
-                            .lock()
-                            .unwrap_or_else(|e| e.into_inner())
-                            .take_pair(ctx.worker_index())
-                            .unwrap_or_else(|e| {
-                                // Materialization-time invariant: each worker's pair
-                                // is taken exactly once. This should never fail if
-                                // spawn_multi assigns one factory per worker correctly.
-                                panic!("exchange channel take_pair failed during materialization: {e}")
-                            });
-
-                        let push = ExchangePush::new(pushers, exchange_fn.clone(), wakes.clone());
-                        let pull = ExchangePull::new(pullers, wakes.clone());
-
-                        (
-                            Box::new(Box::new(push) as Box<dyn Push<T, D>>)
-                                as Box<dyn std::any::Any + Send>,
-                            Box::new(Box::new(pull) as Box<dyn Pull<T, D>>)
-                                as Box<dyn std::any::Any + Send>,
-                        )
-                    },
-                )
-            })
-            .collect()
+        let materializer = Arc::new(Mutex::new(
+            super::edge_materializer::LocalEdgeMaterializer::<T, D>::new(num_workers, capacity),
+        ));
+        build_exchange_factories(num_workers, exchange_fn, materializer)
     })
+}
+
+/// Create exchange channel factories using a custom [`EdgeMaterializer`].
+///
+/// This is the extension point for cross-node exchange: the runtime
+/// creates a materializer that mixes local and network-backed channels
+/// based on cluster topology, then passes it here. The exchange routing
+/// logic (`ExchangePush`/`ExchangePull`) is identical regardless of
+/// the materializer — only the physical transport differs.
+///
+/// Unlike [`create_exchange_factory_creator`] (which defers materializer
+/// creation), this function takes a pre-built materializer and returns
+/// the factories directly. The runtime calls this when it knows the
+/// cluster topology and has created the appropriate materializer.
+///
+/// The materializer is wrapped in `Arc<Mutex<>>` because it is shared
+/// across N worker factory closures (each worker calls
+/// `materialize_worker` once during Phase 5 materialization).
+pub(crate) fn create_exchange_factories_with<T, D>(
+    num_workers: usize,
+    exchange_fn: ExchangeFn<D>,
+    materializer: Arc<Mutex<dyn super::edge_materializer::EdgeMaterializer<T, D>>>,
+) -> Vec<super::super::schedulable::ChannelFactory>
+where
+    T: Timestamp,
+    D: Clone + Send + 'static,
+{
+    build_exchange_factories(num_workers, exchange_fn, materializer)
+}
+
+/// Internal helper: build N channel factories from a shared materializer.
+///
+/// Each factory, when invoked during Phase 5, calls
+/// `materializer.materialize_worker(worker_idx)` to get its push/pull
+/// endpoints, then wraps them in `ExchangePush`/`ExchangePull`.
+fn build_exchange_factories<T, D>(
+    num_workers: usize,
+    exchange_fn: ExchangeFn<D>,
+    materializer: Arc<Mutex<dyn super::edge_materializer::EdgeMaterializer<T, D>>>,
+) -> Vec<super::super::schedulable::ChannelFactory>
+where
+    T: Timestamp,
+    D: Clone + Send + 'static,
+{
+    // Validate consistency: materializer's worker count must match.
+    {
+        let mat = materializer.lock().unwrap_or_else(|e| e.into_inner());
+        assert_eq!(
+            mat.num_workers(),
+            num_workers,
+            "EdgeMaterializer num_workers ({}) != expected num_workers ({})",
+            mat.num_workers(),
+            num_workers
+        );
+    }
+
+    let wakes = Arc::new(SharedWakeRegistry::new(num_workers));
+
+    (0..num_workers)
+        .map(|_| {
+            let wakes = wakes.clone();
+            let materializer = materializer.clone();
+            let exchange_fn = exchange_fn.clone();
+            super::super::schedulable::channel_factory(
+                move |ctx: &crate::worker::WorkerContext,
+                      _cap: usize,
+                      wake: Option<WakeHandle>| {
+                    wakes.register(ctx.worker_index(), wake);
+
+                    let (pushers, pullers) = materializer
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .materialize_worker(ctx.worker_index())
+                        .unwrap_or_else(|e| {
+                            panic!("edge materialization failed for worker {}: {e}",
+                                ctx.worker_index())
+                        });
+
+                    let push = ExchangePush::new(pushers, exchange_fn.clone(), wakes.clone());
+                    let pull = ExchangePull::new(pullers, wakes.clone());
+
+                    (
+                        Box::new(Box::new(push) as Box<dyn Push<T, D>>)
+                            as Box<dyn std::any::Any + Send>,
+                        Box::new(Box::new(pull) as Box<dyn Pull<T, D>>)
+                            as Box<dyn std::any::Any + Send>,
+                    )
+                },
+            )
+        })
+        .collect()
 }
 
 // ---------------------------------------------------------------------------

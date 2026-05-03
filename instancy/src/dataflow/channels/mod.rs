@@ -5,6 +5,7 @@
 //! between operators, and the [`WakeHandle`] notification primitive.
 
 pub mod bounded;
+pub mod edge_materializer;
 pub mod envelope;
 pub mod exchange_channel;
 pub mod pact;
@@ -13,6 +14,7 @@ pub mod tee;
 pub mod wake;
 
 pub use bounded::{bounded_channel, default_channel, BoundedPull, BoundedPush};
+pub use edge_materializer::{EdgeMaterializer, LocalEdgeMaterializer};
 pub use envelope::{ControlSignal, Envelope, Payload};
 pub use pact::{ExchangeFn, PartitionStrategy, Router};
 pub use pushpull::{ChannelPair, Pull, Push};
