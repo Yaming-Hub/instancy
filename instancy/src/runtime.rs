@@ -2833,9 +2833,8 @@ mod tests {
         let out1 = multi.take_output::<i32>(1, "results").unwrap();
 
         // Input: [1, 2, 3, 4, 5] → doubled: [2, 4, 6, 8, 10]
-        // After exchange(mod 2): evens(0,2,4,6,8,10) → w0, odds → w1
-        // All doubled values are even, so all go to worker 0.
-        // After +100: [102, 104, 106, 108, 110]
+        // After exchange(hash % 2): all doubled values are even, so hash % 2 == 0
+        // and all route to worker 0.  After +100: [102, 104, 106, 108, 110]
         let in0 = multi.take_input::<i32>(0, "data").unwrap();
         in0.send(0u64, vec![1, 2, 3, 4, 5]).unwrap();
         in0.close();
@@ -2843,7 +2842,7 @@ mod tests {
         let in1 = multi.take_input::<i32>(1, "data").unwrap();
         in1.close();
 
-        let _ = multi.join_blocking();
+        let _ = multi.join_blocking().expect("dataflow should complete without error");
 
         let mut w0: Vec<i32> = out0
             .collect_data()
@@ -2858,7 +2857,7 @@ mod tests {
             .collect();
         w1.sort();
 
-        // All doubled values are even → mod 2 = 0 → all go to worker 0.
+        // All doubled values are even → hash % 2 == 0 → all route to worker 0.
         assert_eq!(w0, vec![102, 104, 106, 108, 110]);
         assert!(w1.is_empty());
     }
@@ -2890,7 +2889,7 @@ mod tests {
         in1.send(0u64, vec![4, 5, 6, 7]).unwrap();
         in1.close();
 
-        let _ = multi.join_blocking();
+        let _ = multi.join_blocking().expect("dataflow should complete without error");
 
         let mut w0: Vec<i32> = out0
             .collect_data()
@@ -2905,7 +2904,7 @@ mod tests {
             .collect();
         w1.sort();
 
-        // mod 2: evens → w0, odds → w1
+        // hash % 2: evens → w0, odds → w1
         assert_eq!(w0, vec![0, 2, 4, 6]);
         assert_eq!(w1, vec![1, 3, 5, 7]);
     }

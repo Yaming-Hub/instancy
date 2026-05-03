@@ -10,13 +10,13 @@
 //! ```text
 //! Worker 0: ["hello world", "hello instancy"]
 //!     ↓ split + exchange(hash(word))
-//! Worker 0 counts: {"hello": 4, "world": 3, ...}   (words hashing to worker 0)
+//! Worker 0 counts: {"hello": 3, "world": 4, ...}   (words hashing to worker 0)
 //! Worker 1 counts: {"instancy": 2, "of": 1, ...}   (words hashing to worker 1)
 //! ```
 //!
 //! Demonstrates:
 //! - `spawn_multi()` with multiple logical workers
-//! - `exchange()` for key-partitioned cross-worker data routing
+//! - `exchange_by_hash()` for key-partitioned cross-worker data routing
 //! - `unary` with stateful aggregation after exchange
 //! - Per-worker output collection
 //!
@@ -79,7 +79,9 @@ fn main() {
                     })
                     // Exchange words by hash — all occurrences of the same word
                     // go to the same worker for correct global counting.
-                    .exchange("by_word", |word: &String| {
+                    // We use exchange_by_hash (not exchange) because we compute
+                    // the hash ourselves; exchange() would hash the key again.
+                    .exchange_by_hash("by_word", |word: &String| {
                         let mut h = DefaultHasher::new();
                         word.hash(&mut h);
                         h.finish()
@@ -89,16 +91,14 @@ fn main() {
                     //
                     // With exchange, data for the same timestamp may arrive in
                     // multiple batches (from different source workers across
-                    // separate activations). We track emitted state and only
-                    // output the final snapshot of each timestamp, replacing
-                    // any previously emitted partial results by re-emitting
-                    // when new data arrives. The downstream `output()` sink
-                    // collects all batches, so we clear previous partial
-                    // results by using a "last write wins" collection pattern.
+                    // separate activations). Each emission is a COMPLETE snapshot
+                    // of all accumulated counts for that timestamp. The collector
+                    // uses "last write wins" per timestamp — this is safe because
+                    // each snapshot subsumes all previous ones and the output
+                    // channel preserves send order.
                     .unary("count", {
                         let mut counts_by_time: HashMap<u64, HashMap<String, usize>> =
                             HashMap::new();
-                        let mut last_emitted: HashMap<u64, usize> = HashMap::new();
                         move |input, output| {
                             let mut dirty = HashSet::new();
                             while let Some((time, words)) = input.next() {
@@ -108,17 +108,13 @@ fn main() {
                                     *counts.entry(word).or_insert(0) += 1;
                                 }
                             }
+                            // Re-emit full snapshot for every dirty timestamp.
                             for time in dirty {
                                 let counts = &counts_by_time[&time];
-                                let total: usize = counts.values().sum();
-                                let prev = last_emitted.get(&time).copied().unwrap_or(0);
-                                if total != prev {
-                                    let mut pairs: Vec<(String, usize)> =
-                                        counts.iter().map(|(k, &v)| (k.clone(), v)).collect();
-                                    pairs.sort();
-                                    output.push_vec(time, pairs);
-                                    last_emitted.insert(time, total);
-                                }
+                                let mut pairs: Vec<(String, usize)> =
+                                    counts.iter().map(|(k, &v)| (k.clone(), v)).collect();
+                                pairs.sort();
+                                output.push_vec(time, pairs);
                             }
                             Ok(())
                         }
@@ -147,8 +143,10 @@ fn main() {
 
     // Merge results from all workers into a global count.
     // Each worker may emit multiple batches for the same timestamp as counts
-    // accumulate across exchange activations. The LAST batch per timestamp
-    // is the final result (complete snapshot), so we use last-write-wins.
+    // accumulate across exchange activations. Each batch is a complete snapshot
+    // that subsumes all previous ones, so we use "last write wins" per timestamp.
+    // This works because: (1) each emission is a full snapshot, not a delta,
+    // and (2) the output channel preserves send order within a single producer.
     let mut global_counts: HashMap<String, usize> = HashMap::new();
     for (i, receiver) in receivers.into_iter().enumerate() {
         // Group by timestamp, keep only the last batch per timestamp.
