@@ -26,6 +26,7 @@ tracing = ["dep:tracing"]
 bincode-codec = ["dep:bincode", "dep:serde"]
 transport = ["dep:tokio"]
 async-io = ["dep:tokio"]
+test-utils = []
 
 [[example]]
 name = "async_spawn"

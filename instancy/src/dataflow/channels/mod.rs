@@ -7,6 +7,8 @@
 pub mod bounded;
 pub mod edge_materializer;
 pub mod envelope;
+#[cfg(any(test, feature = "test-utils"))]
+pub mod mock_network;
 pub mod exchange_channel;
 pub mod pact;
 pub mod pushpull;
