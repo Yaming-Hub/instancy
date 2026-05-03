@@ -464,7 +464,20 @@ impl<T: Timestamp> FrontierAggregator<T> {
     /// Each source starts with its frontier at `T::minimum()`, meaning data at
     /// any timestamp could still arrive. The initial aggregated frontier is
     /// `{T::minimum()}`.
+    ///
+    /// # Contract
+    ///
+    /// Sources **must** send monotonically non-decreasing watermarks. A source
+    /// that closes without advancing its watermark will hold back the aggregated
+    /// frontier. Higher-level close/exhaustion handling (removing a closed
+    /// source's contribution) is deferred to a future PR.
+    ///
+    /// # Panics (debug only)
+    ///
+    /// Panics in debug builds if `num_sources == 0`.
     fn new(num_sources: usize) -> Self {
+        debug_assert!(num_sources > 0, "FrontierAggregator requires at least one source");
+
         let mut aggregated = MutableAntichain::new();
         // Each source contributes T::minimum() with count +1.
         let inits: Vec<(T, i64)> = (0..num_sources)
@@ -483,9 +496,29 @@ impl<T: Timestamp> FrontierAggregator<T> {
     ///
     /// Returns timestamps that were **added** to the aggregated frontier (i.e.,
     /// the frontier advanced). Empty if the overall frontier didn't change.
+    ///
+    /// # Panics (debug only)
+    ///
+    /// Panics in debug builds if `source_idx >= num_sources` or if `new_watermark`
+    /// is less than the source's previous watermark (monotonicity violation).
     fn update(&mut self, source_idx: usize, new_watermark: T) -> Vec<T> {
+        debug_assert!(
+            source_idx < self.per_source.len(),
+            "source_idx {} out of bounds (num_sources = {})",
+            source_idx,
+            self.per_source.len()
+        );
+
         let old = self.per_source[source_idx].take();
         let old_time = old.unwrap_or_else(T::minimum);
+
+        // Watermarks must be monotonically non-decreasing.
+        debug_assert!(
+            old_time.less_equal(&new_watermark),
+            "watermark must not decrease: old={:?}, new={:?}",
+            old_time,
+            new_watermark
+        );
 
         self.per_source[source_idx] = Some(new_watermark.clone());
 
@@ -988,16 +1021,9 @@ mod tests {
         pushers0[0]
             .push(Envelope::watermark(5u64))
             .unwrap();
-        // Should NOT emit — source 1 hasn't advanced.
-        assert!(pull.pull().is_none() || {
-            // If pull returns something, it must be data or error, not watermark.
-            false
-        });
-
-        // Actually, pull() should return None since only watermark was present
-        // and it gets absorbed without advancing the frontier.
-        // Let me just call pull and verify no watermark comes out.
-        // (The first call above already consumed the watermark from the channel.)
+        // Should NOT emit — source 1 hasn't advanced, so frontier stays at 0.
+        // The watermark is absorbed by the aggregator without advancing the frontier.
+        assert!(pull.pull().is_none());
 
         // Source 1 sends watermark(3) to worker 0.
         pushers1[0]
