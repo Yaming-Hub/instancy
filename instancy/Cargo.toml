@@ -14,9 +14,12 @@ tracing = { version = "0.1", optional = true }
 bincode = { version = "1.3", optional = true }
 serde = { version = "1", features = ["derive"], optional = true }
 tokio = { version = "1", features = ["io-util", "sync", "rt", "macros"], optional = true }
+tokio-util = { version = "0.7", optional = true }
+crc32fast = { version = "1.5.0", optional = true }
 
 [dev-dependencies]
 tokio = { version = "1", features = ["rt", "macros", "time", "io-util", "sync"] }
+tokio-util = "0.7"
 tracing-test = "0.2"
 tracing-subscriber = "0.3"
 
@@ -24,7 +27,7 @@ tracing-subscriber = "0.3"
 default = ["tracing", "transport"]
 tracing = ["dep:tracing"]
 bincode-codec = ["dep:bincode", "dep:serde"]
-transport = ["dep:tokio"]
+transport = ["dep:tokio", "dep:tokio-util", "dep:crc32fast"]
 async-io = ["dep:tokio"]
 test-utils = []
 
