@@ -8,6 +8,7 @@
 pub mod allocator;
 pub mod codec;
 pub mod connection;
+pub mod control_protocol;
 pub mod interprocess;
 pub mod progress_exchange;
 pub mod remote_push;

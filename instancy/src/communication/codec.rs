@@ -372,6 +372,52 @@ impl ExchangeData for String {
 }
 
 // =============================================================================
+// Tuple codec (pairs of ExchangeData)
+// =============================================================================
+
+/// A codec for 2-tuples `(A, B)` where both components are ExchangeData.
+///
+/// Encodes by concatenating: `A_encoded ++ B_encoded`.
+/// Decodes sequentially: decode A, then decode B from the remainder.
+#[derive(Debug)]
+pub struct TupleCodec<CA, CB> {
+    a_codec: CA,
+    b_codec: CB,
+}
+
+impl<A, B, CA, CB> Codec<(A, B)> for TupleCodec<CA, CB>
+where
+    CA: Codec<A>,
+    CB: Codec<B>,
+{
+    fn encode(&self, value: &(A, B), buf: &mut Vec<u8>) -> Result<(), CodecError> {
+        self.a_codec.encode(&value.0, buf)?;
+        self.b_codec.encode(&value.1, buf)?;
+        Ok(())
+    }
+
+    fn decode(&self, buf: &[u8]) -> Result<((A, B), usize), CodecError> {
+        let (a, a_len) = self.a_codec.decode(buf)?;
+        let (b, b_len) = self.b_codec.decode(&buf[a_len..])?;
+        Ok(((a, b), a_len + b_len))
+    }
+}
+
+impl<A, B> ExchangeData for (A, B)
+where
+    A: ExchangeData,
+    B: ExchangeData,
+{
+    type CodecType = TupleCodec<A::CodecType, B::CodecType>;
+    fn codec() -> Self::CodecType {
+        TupleCodec {
+            a_codec: A::codec(),
+            b_codec: B::codec(),
+        }
+    }
+}
+
+// =============================================================================
 // Tests
 // =============================================================================
 

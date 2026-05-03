@@ -720,7 +720,7 @@ impl<T: Timestamp, D: Send + 'static> Pull<T, D> for ExchangePull<T, D> {
 // ExchangeChannelCreator — type-erased factory for spawn_multi
 // ---------------------------------------------------------------------------
 
-/// Type-erased creator for exchange channel factories.
+/// Type-erased creator for exchange channel factories (local mode).
 ///
 /// Created by the builder (which knows T, D, and ExchangeFn), stored on
 /// [`LogicalDataflow`], and consumed by `spawn_multi` to produce N shared
@@ -751,6 +751,82 @@ where
         ));
         build_exchange_factories(num_workers, exchange_fn, materializer)
     })
+}
+
+/// Parameters for creating a network-backed edge materializer.
+///
+/// Passed by `spawn_cluster` to each [`NetworkExchangeCreator`].
+/// The creator uses these to construct a `NetworkEdgeMaterializer<T, D>`
+/// (it knows the concrete types T, D from its generic parameters).
+#[cfg(feature = "transport")]
+pub(crate) struct NetworkMaterializerParams {
+    pub dataflow_id: crate::dataflow::id::DataflowId,
+    pub topology: crate::execute::ClusterTopology,
+    pub local_node_id: String,
+    pub session: std::sync::Arc<crate::communication::TransportSession>,
+    /// Pre-extracted receivers for this specific exchange edge.
+    pub receivers: std::collections::HashMap<String, std::collections::HashMap<u64, tokio::sync::mpsc::Receiver<Vec<u8>>>>,
+    pub capacity: usize,
+    pub num_workers: usize,
+    pub edge_index: usize,
+    /// Wake handles for all workers (indexed by global worker ID).
+    /// Used to notify the executor when remote data arrives.
+    pub wake_handles: Vec<crate::dataflow::channels::wake::WakeHandle>,
+    /// Tokio runtime handle for spawning bridge tasks.
+    pub runtime_handle: tokio::runtime::Handle,
+}
+
+/// Trait for creating network-backed exchange channel factories.
+///
+/// Implemented by [`NetworkExchangeCreatorImpl`] which captures the concrete
+/// types T, D and the `ExchangeFn<D>`. This allows `spawn_cluster` to create
+/// network-backed factories without knowing the concrete data types — the
+/// virtual method dispatch handles the type erasure.
+#[cfg(feature = "transport")]
+pub(crate) trait NetworkExchangeCreator: Send {
+    /// Create exchange channel factories using network transport.
+    fn create(
+        self: Box<Self>,
+        params: NetworkMaterializerParams,
+    ) -> Vec<super::super::schedulable::ChannelFactory>;
+}
+
+/// Concrete implementation of [`NetworkExchangeCreator`] for specific T, D types.
+#[cfg(feature = "transport")]
+pub(crate) struct NetworkExchangeCreatorImpl<T, D>
+where
+    T: Timestamp + crate::communication::codec::ExchangeData,
+    D: Clone + crate::communication::codec::ExchangeData,
+{
+    pub exchange_fn: ExchangeFn<D>,
+    pub _phantom: std::marker::PhantomData<T>,
+}
+
+#[cfg(feature = "transport")]
+impl<T, D> NetworkExchangeCreator for NetworkExchangeCreatorImpl<T, D>
+where
+    T: Timestamp + crate::communication::codec::ExchangeData,
+    D: Clone + crate::communication::codec::ExchangeData,
+{
+    fn create(
+        self: Box<Self>,
+        params: NetworkMaterializerParams,
+    ) -> Vec<super::super::schedulable::ChannelFactory> {
+        let materializer = Arc::new(Mutex::new(
+            super::network::NetworkEdgeMaterializer::<T, D>::new(
+                params.dataflow_id,
+                params.topology,
+                params.local_node_id,
+                params.session,
+                params.receivers,
+                params.capacity,
+                params.edge_index,
+                params.wake_handles,
+                params.runtime_handle,
+            ),
+        ));
+        build_exchange_factories(params.num_workers, self.exchange_fn, materializer)
+    }
 }
 
 /// Create exchange channel factories using a custom [`EdgeMaterializer`].

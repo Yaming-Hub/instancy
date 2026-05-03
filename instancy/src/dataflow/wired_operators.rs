@@ -63,6 +63,11 @@ pub struct WiredUnaryOperator<T: Timestamp, D1: Send + 'static, D2: Send + 'stat
     /// Pending output: batches that have been produced but not yet pushed to channel.
     /// Items are pushed front-to-back; on backpressure, remaining items stay here.
     pending_output: VecDeque<Envelope<T, D2>>,
+    /// Optional progress reporter — when present, the operator holds an
+    /// initial capability that is released when inputs close. Used by
+    /// exchange pass-through operators to prevent premature completion
+    /// when data is in flight across network boundaries.
+    progress_reporter: Option<ProgressReporter<T>>,
     /// Whether the input channel is exhausted (sender closed + empty).
     input_exhausted: bool,
     /// Whether this operator has completed.
@@ -90,6 +95,39 @@ impl<T: Timestamp, D1: Send + 'static, D2: Send + 'static> WiredUnaryOperator<T,
             logic: Box::new(logic),
             output_pusher,
             pending_output: VecDeque::new(),
+            progress_reporter: None,
+            input_exhausted: false,
+            done: false,
+        }
+    }
+
+    /// Create a new wired unary operator with a progress reporter.
+    ///
+    /// The reporter holds an initial capability that is released when
+    /// `close_inputs()` is called. This prevents the progress tracker
+    /// from declaring the dataflow complete while data may still be
+    /// in flight on the operator's input edge (e.g., cross-node exchange).
+    pub fn with_reporter(
+        name: impl Into<String>,
+        index: usize,
+        region_id: RegionId,
+        logic: impl FnMut(&mut InputHandle<T, D1>, &mut OutputHandle<T, D2>) -> Result<()> + Send + 'static,
+        input_puller: Box<dyn Pull<T, D1>>,
+        output_pusher: Box<dyn Push<T, D2>>,
+        reporter: ProgressReporter<T>,
+    ) -> Self {
+        let name = name.into();
+        Self {
+            input_handle: InputHandle::new(format!("{name}:input")),
+            output_handle: OutputHandle::new(format!("{name}:output")),
+            name,
+            index,
+            region_id,
+            input_puller,
+            logic: Box::new(logic),
+            output_pusher,
+            pending_output: VecDeque::new(),
+            progress_reporter: Some(reporter),
             input_exhausted: false,
             done: false,
         }
@@ -171,6 +209,10 @@ impl<T: Timestamp, D1: Send + 'static, D2: Send + 'static> SchedulableOperator
         if !had_input && self.input_exhausted {
             // No input and no more coming — we're done.
             self.output_pusher.close();
+            // Release capability (idempotent via take).
+            if let Some(reporter) = self.progress_reporter.take() {
+                reporter.update(T::minimum(), -1);
+            }
             self.done = true;
             return Ok(ActivationOutcome::Done);
         }
@@ -190,6 +232,10 @@ impl<T: Timestamp, D1: Send + 'static, D2: Send + 'static> SchedulableOperator
         // Step 6: Check if we're done after processing.
         if self.input_exhausted && !self.input_handle.has_pending() && !self.output_handle.has_output() {
             self.output_pusher.close();
+            // Release capability (idempotent via take).
+            if let Some(reporter) = self.progress_reporter.take() {
+                reporter.update(T::minimum(), -1);
+            }
             self.done = true;
             return Ok(ActivationOutcome::Done);
         }
@@ -216,6 +262,11 @@ impl<T: Timestamp, D1: Send + 'static, D2: Send + 'static> SchedulableOperator
     fn close_inputs(&mut self) {
         self.input_exhausted = true;
         self.input_handle.mark_exhausted();
+        // Release capability if held (idempotent via take — safe even if
+        // activate() already released it before force-close).
+        if let Some(reporter) = self.progress_reporter.take() {
+            reporter.update(T::minimum(), -1);
+        }
     }
 }
 

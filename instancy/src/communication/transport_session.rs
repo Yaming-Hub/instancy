@@ -140,6 +140,10 @@ impl TransportSession {
     /// and Demuxer tasks. Returns the session (with senders) and a nested map
     /// of `peer_node_id → channel_id → Receiver` for all registered channels.
     ///
+    /// A control channel (ID 0) is **automatically registered** for each peer.
+    /// Use [`control_receivers`](Self) from the returned receivers map to
+    /// access them via `receivers[peer_id][CONTROL_CHANNEL_ID]`.
+    ///
     /// # Arguments
     ///
     /// - `dataflow_id`: Identifies this dataflow on the wire.
@@ -155,7 +159,7 @@ impl TransportSession {
     /// is responsible for assigning non-overlapping IDs. Typically:
     /// - Data: `src * num_workers + dst + 1`
     /// - Progress: `PROGRESS_CHANNEL_BASE + src * num_workers + dst`
-    /// - Control: channel ID 0
+    /// - Control: channel ID 0 (auto-registered per peer)
     pub fn new<R, W>(
         dataflow_id: DataflowId,
         connections: Vec<PeerConnection<R, W>>,
@@ -199,6 +203,13 @@ impl TransportSession {
             // --- Receive side: Demuxer per peer ---
             let reader = conn.reader;
             let mut demuxer = Demuxer::new(reader, DemuxConfig::default());
+
+            // Auto-register control channel (ID 0) for this peer.
+            let control_recv = demuxer.register_channel(dataflow_id, CONTROL_CHANNEL_ID);
+            all_receivers
+                .entry(peer_node_id.clone())
+                .or_default()
+                .insert(CONTROL_CHANNEL_ID, control_recv);
 
             // Register data channels from this peer
             for reg in data_channels {

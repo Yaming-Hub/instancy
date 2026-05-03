@@ -62,6 +62,7 @@ use crate::dataflow::channels::bounded::{bounded_channel, BoundedPull, BoundedPu
 use crate::dataflow::channels::edge_materializer::EdgeMaterializer;
 use crate::dataflow::channels::envelope::{ControlSignal, Envelope, Payload};
 use crate::dataflow::channels::pushpull::{Pull, Push};
+use crate::dataflow::channels::wake::WakeHandle;
 use crate::dataflow::id::DataflowId;
 use crate::error::{Error, Result};
 use crate::execute::ClusterTopology;
@@ -396,15 +397,46 @@ impl<T: Timestamp + ExchangeData, D: ExchangeData> Drop for NetworkPush<T, D> {
 }
 
 // ---------------------------------------------------------------------------
+// data_recv_bridge — async bridge from tokio mpsc to std::sync::mpsc + wake
+// ---------------------------------------------------------------------------
+
+/// Bridge task that forwards bytes from a Demuxer's tokio mpsc channel to a
+/// `std::sync::mpsc` channel, notifying the executor's `WakeHandle` after
+/// each forwarded frame so the sleeping executor wakes up promptly.
+///
+/// The bridge terminates when the tokio receiver yields `None` (Demuxer
+/// closed) or when the std sender is disconnected (`NetworkPull` dropped).
+/// A final wake notification is always sent on exit so the executor can
+/// observe channel exhaustion and react accordingly.
+#[cfg(feature = "transport")]
+async fn data_recv_bridge(
+    mut rx: tokio_mpsc::Receiver<Vec<u8>>,
+    tx: std::sync::mpsc::Sender<Vec<u8>>,
+    wake_handle: WakeHandle,
+) {
+    while let Some(bytes) = rx.recv().await {
+        if tx.send(bytes).is_err() {
+            // NetworkPull was dropped — stop forwarding.
+            break;
+        }
+        wake_handle.notify();
+    }
+    // Final wake so the executor re-polls and observes channel closure.
+    wake_handle.notify();
+}
+
+// ---------------------------------------------------------------------------
 // NetworkPull — Pull<T, D, ()> that receives and deserializes from the wire
 // ---------------------------------------------------------------------------
 
-/// A `Pull` endpoint that receives bytes from a Demuxer channel and
+/// A `Pull` endpoint that receives bytes forwarded by a bridge task and
 /// deserializes them through a [`Codec`] back into typed envelopes.
 ///
-/// The Demuxer background task reads frames from TCP and dispatches
-/// payloads to per-channel tokio mpsc receivers. `NetworkPull` uses
-/// `try_recv()` (non-blocking) to poll for available data.
+/// The bridge task receives from the Demuxer's tokio mpsc channel (async)
+/// and forwards to a `std::sync::mpsc` channel (sync), notifying the
+/// executor's WakeHandle on each frame. This allows `NetworkPull` to use
+/// non-blocking `try_recv()` while still waking the executor promptly
+/// when remote data arrives.
 ///
 /// When a close-sentinel frame is received, this endpoint marks itself
 /// as exhausted. Since the protocol guarantees FIFO ordering with a single
@@ -413,7 +445,7 @@ impl<T: Timestamp + ExchangeData, D: ExchangeData> Drop for NetworkPush<T, D> {
 pub struct NetworkPull<T: Timestamp + ExchangeData, D: ExchangeData> {
     time_codec: T::CodecType,
     data_codec: D::CodecType,
-    receiver: tokio_mpsc::Receiver<Vec<u8>>,
+    receiver: std::sync::mpsc::Receiver<Vec<u8>>,
     exhausted: bool,
     /// Shared transport session that keeps background tasks alive.
     _session: Arc<TransportSession>,
@@ -429,8 +461,8 @@ impl<T: Timestamp + ExchangeData, D: ExchangeData> Pull<T, D, ()>
         }
         let bytes = match self.receiver.try_recv() {
             Ok(b) => b,
-            Err(tokio_mpsc::error::TryRecvError::Empty) => return None,
-            Err(tokio_mpsc::error::TryRecvError::Disconnected) => {
+            Err(std::sync::mpsc::TryRecvError::Empty) => return None,
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => {
                 self.exhausted = true;
                 return None;
             }
@@ -501,6 +533,10 @@ pub struct NetworkEdgeMaterializer<T: Timestamp + ExchangeData, D: ExchangeData>
     local_node_id: String,
     topology: ClusterTopology,
     dataflow_id: DataflowId,
+    /// Index of this exchange edge in the dataflow graph.
+    /// Used to compute per-edge channel IDs that avoid collisions when
+    /// multiple exchange edges exist in the same dataflow.
+    edge_index: usize,
 
     /// Shared transport session (Arc so it outlives this materializer).
     session: Arc<TransportSession>,
@@ -515,6 +551,14 @@ pub struct NetworkEdgeMaterializer<T: Timestamp + ExchangeData, D: ExchangeData>
 
     /// Track which workers have been materialized.
     taken: Vec<bool>,
+
+    /// Wake handles for all workers (indexed by global worker ID).
+    /// Used to notify the executor when remote data arrives via bridge tasks.
+    wake_handles: Vec<WakeHandle>,
+
+    /// Tokio runtime handle for spawning bridge tasks that forward remote
+    /// data from tokio mpsc channels and notify the executor's WakeHandle.
+    runtime_handle: tokio::runtime::Handle,
 }
 
 #[cfg(feature = "transport")]
@@ -537,6 +581,9 @@ impl<T: Timestamp + ExchangeData, D: ExchangeData> NetworkEdgeMaterializer<T, D>
         session: Arc<TransportSession>,
         mut receivers: std::collections::HashMap<String, std::collections::HashMap<u64, tokio_mpsc::Receiver<Vec<u8>>>>,
         capacity: usize,
+        edge_index: usize,
+        wake_handles: Vec<WakeHandle>,
+        runtime_handle: tokio::runtime::Handle,
     ) -> Self {
         let local_node_id = local_node_id.into();
         let num_workers = topology.total_workers();
@@ -568,7 +615,7 @@ impl<T: Timestamp + ExchangeData, D: ExchangeData> NetworkEdgeMaterializer<T, D>
                 if src_node != Some(local_node_id.as_str()) {
                     let peer_id = src_node.unwrap_or("");
                     for dst in local_start..local_end {
-                        let channel_id = Self::channel_id(src, dst, num_workers);
+                        let channel_id = Self::channel_id(edge_index, src, dst, num_workers);
                         if let Some(peer_map) = receivers.get_mut(peer_id) {
                             if let Some(rx) = peer_map.remove(&channel_id) {
                                 demux_receivers.insert((src, dst), rx);
@@ -584,11 +631,14 @@ impl<T: Timestamp + ExchangeData, D: ExchangeData> NetworkEdgeMaterializer<T, D>
             local_node_id,
             topology,
             dataflow_id,
+            edge_index,
             session,
             demux_receivers,
             local_push,
             local_pull,
             taken: vec![false; num_workers],
+            wake_handles,
+            runtime_handle,
         }
     }
 
@@ -622,7 +672,7 @@ impl<T: Timestamp + ExchangeData, D: ExchangeData> NetworkEdgeMaterializer<T, D>
                 if let Some((peer_start, peer_end)) = topology.worker_range(peer_id) {
                     for src in peer_start..peer_end {
                         for dst in local_start..local_end {
-                            let channel_id = Self::channel_id(src, dst, num_workers);
+                            let channel_id = Self::channel_id(0, src, dst, num_workers);
                             data_regs.push(ChannelRegistration {
                                 peer_node_id: peer_id.clone(),
                                 channel_id,
@@ -637,17 +687,24 @@ impl<T: Timestamp + ExchangeData, D: ExchangeData> NetworkEdgeMaterializer<T, D>
             dataflow_id, connections, &data_regs, &[], capacity, runtime_handle,
         );
 
+        let wake_handles: Vec<WakeHandle> = (0..num_workers).map(|_| WakeHandle::new()).collect();
         Self::new(
             dataflow_id, topology, local_node_id_str,
-            Arc::new(session), receivers, capacity,
+            Arc::new(session), receivers, capacity, 0,
+            wake_handles, runtime_handle.clone(),
         )
     }
 
-    /// Deterministic channel ID for a (source, target) worker pair.
+    /// Deterministic channel ID for a (source, target) worker pair on a given exchange edge.
     ///
     /// Channel 0 is reserved for control messages, so data IDs start at 1.
-    pub fn channel_id(source: usize, target: usize, num_workers: usize) -> u64 {
-        (source * num_workers + target + 1) as u64
+    /// Each exchange edge gets its own channel ID space to prevent collisions
+    /// when multiple exchange edges exist in the same dataflow.
+    ///
+    /// Formula: `edge_index * num_workers² + source * num_workers + target + 1`
+    pub fn channel_id(edge_index: usize, source: usize, target: usize, num_workers: usize) -> u64 {
+        let edge_offset = edge_index * num_workers * num_workers;
+        (edge_offset + source * num_workers + target + 1) as u64
     }
 }
 
@@ -705,7 +762,7 @@ impl<T: Timestamp + ExchangeData, D: ExchangeData> EdgeMaterializer<T, D>
                     )))?
                     .clone();
 
-                let channel_id = Self::channel_id(worker_idx, dst, self.num_workers);
+                let channel_id = Self::channel_id(self.edge_index, worker_idx, dst, self.num_workers);
                 pushers.push(Box::new(NetworkPush::<T, D> {
                     time_codec: T::codec(),
                     data_codec: D::codec(),
@@ -735,16 +792,25 @@ impl<T: Timestamp + ExchangeData, D: ExchangeData> EdgeMaterializer<T, D>
                     )))?;
                 pullers.push(Box::new(pull));
             } else {
-                // Remote pair — use NetworkPull
-                let receiver = self.demux_receivers.remove(&(src, worker_idx))
+                // Remote pair — use NetworkPull with bridge task.
+                // The bridge receives from the Demuxer's tokio mpsc channel (async),
+                // forwards to a std::sync::mpsc channel (sync), and notifies the
+                // executor's WakeHandle so it wakes up to process the data.
+                let tokio_receiver = self.demux_receivers.remove(&(src, worker_idx))
                     .ok_or_else(|| Error::Custom(format!(
                         "no demux receiver for [{src}][{worker_idx}]"
                     )))?;
 
+                let (std_tx, std_rx) = std::sync::mpsc::channel::<Vec<u8>>();
+                let wake = self.wake_handles[worker_idx].clone();
+                self.runtime_handle.spawn(async move {
+                    data_recv_bridge(tokio_receiver, std_tx, wake).await;
+                });
+
                 pullers.push(Box::new(NetworkPull::<T, D> {
                     time_codec: T::codec(),
                     data_codec: D::codec(),
-                    receiver,
+                    receiver: std_rx,
                     exhausted: false,
                     _session: self.session.clone(),
                 }));
