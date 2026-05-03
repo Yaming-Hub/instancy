@@ -528,25 +528,34 @@ impl RuntimeHandle {
             validate_multi_worker_topologies(&dataflows)?;
         }
 
-        // Phase 3: Validate no exchange operators/edges (not yet supported).
+        // Phase 3: Wire up exchange channels (replace placeholder factories
+        // with shared cross-worker exchange channel factories).
         if num_workers > 1 {
-            for (i, df) in dataflows.iter().enumerate() {
-                // Check edge-level metadata (preferred).
-                if df.graph().has_exchange_edges() {
+            // Take exchange creators from worker 0 (all workers have identical
+            // topology, so worker 0's creators are representative).
+            let creators = std::mem::take(&mut dataflows[0].exchange_creators);
+            for (edge_idx, creator) in creators {
+                let shared_factories = creator(num_workers, 1024);
+                if shared_factories.len() != num_workers {
                     return Err(Error::Custom(format!(
-                        "multi-worker execution does not yet support exchange channels \
-                         (worker {i} has exchange edges). All channels are worker-local in replicated mode."
+                        "exchange factory creator for edge {edge_idx} produced {} factories, expected {num_workers}",
+                        shared_factories.len()
                     )));
                 }
-                // Also check operator names for backward compatibility.
-                let exchange_ops = df.graph().exchange_operator_names();
-                if !exchange_ops.is_empty() {
-                    return Err(Error::Custom(format!(
-                        "multi-worker execution does not yet support exchange operators \
-                         (worker {i} has: {}). All channels are worker-local in replicated mode.",
-                        exchange_ops.join(", ")
-                    )));
+                for (worker_idx, factory) in shared_factories.into_iter().enumerate() {
+                    let pos = dataflows[worker_idx]
+                        .channel_factories
+                        .iter()
+                        .position(|(idx, _)| *idx == edge_idx)
+                        .ok_or_else(|| Error::Custom(format!(
+                            "exchange edge {edge_idx} not found in worker {worker_idx}'s channel factories"
+                        )))?;
+                    dataflows[worker_idx].channel_factories[pos].1 = factory;
                 }
+            }
+            // Drain unused exchange_creators from other workers.
+            for df in dataflows.iter_mut().skip(1) {
+                df.exchange_creators.clear();
             }
         }
 
@@ -852,23 +861,31 @@ impl SimpleRuntime {
             validate_multi_worker_topologies(&dataflows)?;
         }
 
-        // Phase 3: Validate no exchange operators/edges (check all replicas).
+        // Phase 3: Wire up exchange channels (replace placeholder factories
+        // with shared cross-worker exchange channel factories).
         if num_workers > 1 {
-            for (i, df) in dataflows.iter().enumerate() {
-                if df.graph().has_exchange_edges() {
+            let creators = std::mem::take(&mut dataflows[0].exchange_creators);
+            for (edge_idx, creator) in creators {
+                let shared_factories = creator(num_workers, 1024);
+                if shared_factories.len() != num_workers {
                     return Err(Error::Custom(format!(
-                        "multi-worker execution does not yet support exchange channels \
-                         (worker {i} has exchange edges). All channels are worker-local in replicated mode."
+                        "exchange factory creator for edge {edge_idx} produced {} factories, expected {num_workers}",
+                        shared_factories.len()
                     )));
                 }
-                let exchange_ops = df.graph().exchange_operator_names();
-                if !exchange_ops.is_empty() {
-                    return Err(Error::Custom(format!(
-                        "multi-worker execution does not yet support exchange operators \
-                         (worker {i} has: {}). All channels are worker-local in replicated mode.",
-                        exchange_ops.join(", ")
-                    )));
+                for (worker_idx, factory) in shared_factories.into_iter().enumerate() {
+                    let pos = dataflows[worker_idx]
+                        .channel_factories
+                        .iter()
+                        .position(|(idx, _)| *idx == edge_idx)
+                        .ok_or_else(|| Error::Custom(format!(
+                            "exchange edge {edge_idx} not found in worker {worker_idx}'s channel factories"
+                        )))?;
+                    dataflows[worker_idx].channel_factories[pos].1 = factory;
                 }
+            }
+            for df in dataflows.iter_mut().skip(1) {
+                df.exchange_creators.clear();
             }
         }
 
@@ -2707,5 +2724,91 @@ mod tests {
 
         multi.cancel();
         let _ = multi.join_blocking();
+    }
+
+    // -----------------------------------------------------------------------
+    // Exchange channel integration tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn spawn_multi_exchange_routes_data_between_workers() {
+        // 2 workers with exchange: input → exchange(mod 2) → output
+        // Even numbers go to worker 0, odd numbers go to worker 1.
+        let rt = RuntimeHandle::new(RuntimeConfig::default()).unwrap();
+        let mut multi = rt
+            .spawn_multi("exchange_test", 2, |_worker_idx, builder| {
+                let input = builder.input::<i32>("data");
+                // Use exchange_by_hash for direct u64 routing (no extra hashing).
+                input
+                    .exchange_by_hash("mod2", |x: &i32| *x as u64)
+                    .output("results");
+                Ok(())
+            })
+            .unwrap();
+
+        // Get per-worker outputs and inputs.
+        let out0 = multi.take_output::<i32>(0, "results").unwrap();
+        let out1 = multi.take_output::<i32>(1, "results").unwrap();
+
+        // Send data through worker 0's input.
+        let in0 = multi.take_input::<i32>(0, "data").unwrap();
+        in0.send(0u64, vec![10, 11, 12, 13, 14, 15]).unwrap();
+        in0.close();
+
+        // Also send through worker 1's input.
+        let in1 = multi.take_input::<i32>(1, "data").unwrap();
+        in1.send(0u64, vec![20, 21, 22, 23]).unwrap();
+        in1.close();
+
+        let _ = multi.join_blocking();
+
+        // Worker 0 should receive all even numbers.
+        let mut worker0_data: Vec<i32> = out0
+            .collect_data()
+            .into_iter()
+            .flat_map(|(_t, batch)| batch)
+            .collect();
+        worker0_data.sort();
+
+        // Worker 1 should receive all odd numbers.
+        let mut worker1_data: Vec<i32> = out1
+            .collect_data()
+            .into_iter()
+            .flat_map(|(_t, batch)| batch)
+            .collect();
+        worker1_data.sort();
+
+        assert_eq!(worker0_data, vec![10, 12, 14, 20, 22], "worker0 got wrong data");
+        assert_eq!(worker1_data, vec![11, 13, 15, 21, 23], "worker1 got wrong data; worker0 was: {worker0_data:?}");
+    }
+
+    #[test]
+    fn spawn_multi_exchange_single_worker_passthrough() {
+        // With 1 worker, exchange degenerates to a pass-through.
+        let rt = RuntimeHandle::new(RuntimeConfig::default()).unwrap();
+        let mut multi = rt
+            .spawn_multi("exchange_1w", 1, |_worker_idx, builder| {
+                let input = builder.input::<i32>("data");
+                input
+                    .exchange("by_key", |x: &i32| *x as u64)
+                    .output("out");
+                Ok(())
+            })
+            .unwrap();
+
+        let out = multi.take_output::<i32>(0, "out").unwrap();
+        let inp = multi.take_input::<i32>(0, "data").unwrap();
+        inp.send(0u64, vec![1, 2, 3]).unwrap();
+        inp.close();
+
+        let _ = multi.join_blocking();
+
+        let mut results: Vec<i32> = out
+            .collect_data()
+            .into_iter()
+            .flat_map(|(_t, batch)| batch)
+            .collect();
+        results.sort();
+        assert_eq!(results, vec![1, 2, 3]);
     }
 }

@@ -109,6 +109,9 @@ struct BuilderState<T: Timestamp> {
     /// replacement OperatorFactory that sends data out via mpsc channel.
     output_port_wiring: Vec<OutputPortWiring>,
     probes: Vec<(usize, ProbeHandle<T>)>,
+    /// Type-erased exchange factory creators — one per exchange edge.
+    exchange_creators:
+        Vec<(usize, crate::dataflow::channels::exchange_channel::ExchangeFactoryCreatorFn)>,
     next_operator_index: usize,
     next_collect_index: usize,
     channel_capacity: usize,
@@ -204,6 +207,7 @@ impl<T: Timestamp> DataflowBuilder<T> {
                 input_port_wiring: Vec::new(),
                 output_port_wiring: Vec::new(),
                 probes: Vec::new(),
+                exchange_creators: Vec::new(),
                 next_operator_index: 1,
                 next_collect_index: 0,
                 channel_capacity: config.channel_capacity,
@@ -480,6 +484,7 @@ impl<T: Timestamp> DataflowBuilder<T> {
             input_port_wiring: state.input_port_wiring,
             output_port_wiring: state.output_port_wiring,
             probes: state.probes,
+            exchange_creators: state.exchange_creators,
         })
     }
 }
@@ -1097,6 +1102,7 @@ impl<T: Timestamp, D: Clone + Send + 'static> Pipe<T, D> {
                 input_port_wiring: Vec::new(),
                 output_port_wiring: Vec::new(),
                 probes: Vec::new(),
+                exchange_creators: Vec::new(),
                 next_operator_index: inner_start_idx,
                 next_collect_index: 0,
                 channel_capacity: capacity,
@@ -1593,6 +1599,166 @@ impl<T: Timestamp, D: Clone + Send + 'static> Pipe<T, D> {
         self.output(name).collector
     }
 
+    /// Repartition data across workers based on a hash function.
+    ///
+    /// Records with the same hash are routed to the same worker, enabling
+    /// key-partitioned computations like group-by and join.
+    ///
+    /// In single-worker mode, this is a pass-through (no routing needed).
+    /// In multi-worker mode (`spawn_multi`), the runtime creates shared
+    /// exchange channels that route data between workers.
+    ///
+    /// # Example
+    /// ```ignore
+    /// let partitioned = stream.exchange("by_key", |record: &(u64, String)| record.0);
+    /// ```
+    pub fn exchange<K: std::hash::Hash + 'static>(
+        self,
+        name: impl Into<String>,
+        key_fn: impl Fn(&D) -> K + Send + Sync + 'static,
+    ) -> Pipe<T, D> {
+        let exchange_fn =
+            crate::dataflow::channels::pact::ExchangeFn::by_key(&name.into(), key_fn);
+        self.add_exchange_internal(exchange_fn)
+    }
+
+    /// Repartition data using a direct hash function (returns u64).
+    ///
+    /// The returned u64 is reduced modulo the target worker count to
+    /// determine routing.
+    pub fn exchange_by_hash(
+        self,
+        name: impl Into<String>,
+        hash_fn: impl Fn(&D) -> u64 + Send + Sync + 'static,
+    ) -> Pipe<T, D> {
+        let exchange_fn =
+            crate::dataflow::channels::pact::ExchangeFn::new(name, hash_fn);
+        self.add_exchange_internal(exchange_fn)
+    }
+
+    /// Internal: add an exchange (repartition) operator.
+    ///
+    /// Creates a pass-through unary operator with an exchange channel
+    /// on its input edge. For multi-worker execution, `spawn_multi`
+    /// replaces the placeholder pipeline factory with shared exchange
+    /// channel factories.
+    fn add_exchange_internal(
+        &self,
+        exchange_fn: crate::dataflow::channels::pact::ExchangeFn<D>,
+    ) -> Pipe<T, D> {
+        let op_idx;
+        let region_id = RegionId::new(0);
+
+        // Identity pass-through logic: forward all input to output unchanged.
+        let wired_logic =
+            move |input: &mut InputHandle<T, D>, output: &mut OutputHandle<T, D>| -> Result<()> {
+                while let Some((time, data)) = input.next() {
+                    if !data.is_empty() {
+                        output.push_vec(time, data);
+                    }
+                }
+                Ok(())
+            };
+
+        {
+            let mut state = self.state.borrow_mut();
+            op_idx = state.allocate_operator_index();
+
+            // Register operator as "exchange" in the graph.
+            state
+                .graph
+                .register_operator(crate::dataflow::graph::OperatorInfo::new(
+                    op_idx, "exchange", region_id, 1, 1,
+                ))
+                .expect("operator index unique");
+
+            // Edge from upstream — marked as Exchange.
+            state.graph.add_edge(crate::dataflow::graph::EdgeInfo::exchange(
+                Slot::new(self.op_idx, self.output_slot),
+                Slot::new(op_idx, 0),
+                region_id,
+                region_id,
+            ));
+
+            // Subgraph connectivity.
+            state.subgraph_builder.add_operator(
+                op_idx,
+                "exchange",
+                1,
+                1,
+                PortConnectivity::identity(T::Summary::default()),
+            );
+            state.subgraph_builder.add_edge(
+                Location::source(self.op_idx, self.output_slot),
+                Location::target(op_idx, 0),
+            );
+
+            // Operator factory — pass-through unary.
+            let name_clone = String::from("exchange");
+            let factory: OperatorFactory =
+                single_use_factory(move |_ctx, endpoints: ChannelEndpoints| {
+                    let input_puller: Box<dyn Pull<T, D>> = *endpoints
+                        .input_pullers
+                        .into_iter()
+                        .next()
+                        .expect("exchange must have input puller")
+                        .downcast::<Box<dyn Pull<T, D>>>()
+                        .expect("exchange input puller type mismatch");
+
+                    let output_pusher: Box<dyn Push<T, D>> = {
+                        let pushers: Vec<Box<dyn Push<T, D>>> = endpoints
+                            .output_pushers
+                            .into_iter()
+                            .map(|any_box| {
+                                *any_box
+                                    .downcast::<Box<dyn Push<T, D>>>()
+                                    .expect("exchange output pusher type mismatch")
+                            })
+                            .collect();
+                        tee_or_single(pushers).unwrap_or_else(|| Box::new(NullPush))
+                    };
+
+                    Box::new(WiredUnaryOperator::new(
+                        name_clone,
+                        op_idx,
+                        region_id,
+                        wired_logic,
+                        input_puller,
+                        output_pusher,
+                    )) as Box<dyn SchedulableOperator>
+                });
+            state.operator_factories.push((op_idx, factory));
+
+            // Channel factory — pipeline placeholder for single-worker.
+            // spawn_multi replaces this with shared exchange factories.
+            let edge_idx = state.graph.edges().len() - 1;
+            let capacity = state.channel_capacity;
+            let chan_factory: ChannelFactory =
+                channel_factory(move |_ctx, _cap: usize, wake: Option<WakeHandle>| {
+                    let (push, pull) =
+                        bounded_channel_with_wake::<T, D, ()>(capacity, wake.clone());
+                    (
+                        Box::new(Box::new(push) as Box<dyn Push<T, D>>)
+                            as Box<dyn std::any::Any + Send>,
+                        Box::new(Box::new(pull) as Box<dyn Pull<T, D>>)
+                            as Box<dyn std::any::Any + Send>,
+                    )
+                });
+            state.channel_factories.push((edge_idx, chan_factory));
+
+            // Store exchange factory creator for multi-worker.
+            let creator = crate::dataflow::channels::exchange_channel::create_exchange_factory_creator::<T, D>(exchange_fn);
+            state.exchange_creators.push((edge_idx, creator));
+        }
+
+        Pipe {
+            state: Rc::clone(&self.state),
+            op_idx,
+            output_slot: 0,
+            _phantom: PhantomData,
+        }
+    }
+
     /// Attach a probe to observe the frontier at this point in the pipeline.
     ///
     /// Returns `(Pipe, ProbeHandle)` — the Pipe continues unchanged,
@@ -1893,6 +2059,10 @@ pub struct LogicalDataflow<T: Timestamp> {
     pub(crate) input_port_wiring: Vec<InputPortWiring>,
     pub(crate) output_port_wiring: Vec<OutputPortWiring>,
     pub(crate) probes: Vec<(usize, ProbeHandle<T>)>,
+    /// Type-erased exchange factory creators — one per exchange edge.
+    /// Consumed by `spawn_multi` to produce shared cross-worker channel factories.
+    pub(crate) exchange_creators:
+        Vec<(usize, crate::dataflow::channels::exchange_channel::ExchangeFactoryCreatorFn)>,
 }
 
 impl<T: Timestamp> LogicalDataflow<T> {

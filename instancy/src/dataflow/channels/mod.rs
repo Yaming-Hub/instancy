@@ -6,6 +6,7 @@
 
 pub mod bounded;
 pub mod envelope;
+pub mod exchange_channel;
 pub mod pact;
 pub mod pushpull;
 pub mod tee;
