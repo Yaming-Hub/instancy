@@ -32,8 +32,8 @@ const TEST_TIMEOUT: Duration = Duration::from_secs(60);
 /// - Task scheduling doesn't starve any dataflow
 /// - Progress tracking is independent per dataflow
 /// - No deadlocks when all dataflows compete for the same pool
-#[test]
-fn shared_pool_parallel_dataflows_no_exchange() {
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn shared_pool_parallel_dataflows_no_exchange() {
     let rt = RuntimeHandle::new(RuntimeConfig {
         worker_threads: 2,
         ..RuntimeConfig::default()
@@ -75,9 +75,25 @@ fn shared_pool_parallel_dataflows_no_exchange() {
     // Close all inputs.
     drop(senders);
 
-    // Join all dataflows.
+    // Join all dataflows with timeout.
+    let mut join_handles = Vec::new();
     for df in dataflows {
-        df.join_blocking().unwrap();
+        join_handles.push(tokio::spawn(async move {
+            let result = tokio::time::timeout(
+                TEST_TIMEOUT,
+                tokio::task::spawn_blocking(move || df.join_blocking()),
+            )
+            .await;
+            match result {
+                Ok(Ok(Ok(()))) => {}
+                Ok(Ok(Err(e))) => panic!("dataflow join failed: {e}"),
+                Ok(Err(e)) => panic!("spawn_blocking panicked: {e}"),
+                Err(_) => panic!("dataflow did not complete within {TEST_TIMEOUT:?}"),
+            }
+        }));
+    }
+    for h in join_handles {
+        h.await.unwrap();
     }
 
     // Verify each dataflow's output.
@@ -97,8 +113,9 @@ fn shared_pool_parallel_dataflows_no_exchange() {
 }
 
 /// Same as above but with multi-worker exchange dataflows sharing the pool.
-#[test]
-fn shared_pool_parallel_dataflows_with_exchange() {
+/// Verifies that exchange actually routes data to the correct worker.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn shared_pool_parallel_dataflows_with_exchange() {
     let rt = RuntimeHandle::new(RuntimeConfig {
         worker_threads: 2,
         ..RuntimeConfig::default()
@@ -115,7 +132,8 @@ fn shared_pool_parallel_dataflows_with_exchange() {
         let df = rt
             .spawn_multi(&format!("ex-df-{i}"), num_workers, |_worker_idx, builder| {
                 let input = builder.input::<i64>("data");
-                let exchanged = input.exchange("by_val", |x: &i64| *x as u64);
+                // Use exchange_by_hash for deterministic routing: hash % num_workers.
+                let exchanged = input.exchange_by_hash("by_val", |x: &i64| *x as u64);
                 exchanged.map("pass", |_t, x| x).output("results");
                 Ok(())
             })
@@ -123,7 +141,7 @@ fn shared_pool_parallel_dataflows_with_exchange() {
         dataflows.push(df);
     }
 
-    // Take inputs/outputs for worker 0 of each dataflow.
+    // Take inputs/outputs for each worker of each dataflow.
     let mut senders = Vec::new();
     let mut all_outputs: Vec<Vec<_>> = Vec::new();
     for df in dataflows.iter_mut() {
@@ -147,33 +165,61 @@ fn shared_pool_parallel_dataflows_with_exchange() {
     }
     drop(senders);
 
-    // Join all.
+    // Join all with timeout.
+    let mut join_handles = Vec::new();
     for df in dataflows {
-        df.join_blocking().unwrap();
+        join_handles.push(tokio::spawn(async move {
+            let result = tokio::time::timeout(
+                TEST_TIMEOUT,
+                tokio::task::spawn_blocking(move || df.join_blocking()),
+            )
+            .await;
+            match result {
+                Ok(Ok(Ok(()))) => {}
+                Ok(Ok(Err(e))) => panic!("dataflow join failed: {e}"),
+                Ok(Err(e)) => panic!("spawn_blocking panicked: {e}"),
+                Err(_) => panic!("dataflow did not complete within {TEST_TIMEOUT:?}"),
+            }
+        }));
+    }
+    for h in join_handles {
+        h.await.unwrap();
     }
 
-    // Verify each dataflow received all its data (across all workers).
+    // Verify exchange routing: worker 0 gets even hash values, worker 1 gets odd.
     for (df_idx, df_outputs) in all_outputs.into_iter().enumerate() {
-        let mut all: Vec<i64> = df_outputs
-            .into_iter()
-            .flat_map(|o| o.collect_data().into_iter().flat_map(|(_, d)| d))
-            .collect();
-        all.sort();
+        for (worker_idx, output) in df_outputs.into_iter().enumerate() {
+            let mut worker_data: Vec<i64> = output
+                .collect_data()
+                .into_iter()
+                .flat_map(|(_, d)| d)
+                .collect();
+            worker_data.sort();
 
-        let mut expected: Vec<i64> = Vec::new();
-        for epoch in 0..num_epochs {
-            let base = (df_idx as i64) * 1000 + (epoch as i64) * 10;
-            expected.extend(base..base + 10);
+            let mut expected: Vec<i64> = Vec::new();
+            for epoch in 0..num_epochs {
+                let base = (df_idx as i64) * 1000 + (epoch as i64) * 10;
+                for k in 0..10i64 {
+                    let val = base + k;
+                    // exchange("by_val", |x| *x as u64) routes by (val as u64) % num_workers
+                    if (val as u64) % 2 == worker_idx as u64 {
+                        expected.push(val);
+                    }
+                }
+            }
+            expected.sort();
+            assert_eq!(
+                worker_data, expected,
+                "exchange df-{df_idx} worker-{worker_idx}: wrong routing"
+            );
         }
-        expected.sort();
-        assert_eq!(all, expected, "exchange df-{df_idx}");
     }
 }
 
 /// Stress variant: more dataflows, more epochs, verify no starvation.
-#[test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore] // stress test — run with `cargo test --ignored`
-fn stress_shared_pool_many_dataflows() {
+async fn stress_shared_pool_many_dataflows() {
     let rt = RuntimeHandle::new(RuntimeConfig {
         worker_threads: 2,
         ..RuntimeConfig::default()
@@ -210,8 +256,25 @@ fn stress_shared_pool_many_dataflows() {
     }
     drop(senders);
 
+    // Join all with timeout.
+    let mut join_handles = Vec::new();
     for df in dataflows {
-        df.join_blocking().unwrap();
+        join_handles.push(tokio::spawn(async move {
+            let result = tokio::time::timeout(
+                TEST_TIMEOUT,
+                tokio::task::spawn_blocking(move || df.join_blocking()),
+            )
+            .await;
+            match result {
+                Ok(Ok(Ok(()))) => {}
+                Ok(Ok(Err(e))) => panic!("dataflow join failed: {e}"),
+                Ok(Err(e)) => panic!("spawn_blocking panicked: {e}"),
+                Err(_) => panic!("dataflow did not complete within {TEST_TIMEOUT:?}"),
+            }
+        }));
+    }
+    for h in join_handles {
+        h.await.unwrap();
     }
 
     for (df_idx, output) in outputs.into_iter().enumerate() {
@@ -311,7 +374,8 @@ async fn shared_transport_parallel_cluster_dataflows() {
 
         let build = |_worker_idx: usize, builder: &mut DataflowBuilder<u64>| -> Result<()> {
             let input = builder.input::<i64>("data");
-            let exchanged = input.exchange("by_val", |x: &i64| *x as u64);
+            // Use exchange_by_hash for deterministic routing: hash % num_nodes.
+            let exchanged = input.exchange_by_hash("by_val", |x: &i64| *x as u64);
             exchanged.map("pass", |_t, x| x).output("results");
             Ok(())
         };
@@ -415,24 +479,47 @@ async fn shared_transport_parallel_cluster_dataflows() {
     drop(rts_a);
     drop(rts_b);
 
-    // Verify each dataflow received all its data across both nodes.
+    // Verify exchange routing: node-a (index 0) gets even hash values, node-b (index 1) gets odd.
     for df_idx in 0..num_dataflows {
-        let mut all: Vec<i64> = outputs_a
+        let mut data_a: Vec<i64> = outputs_a
             .remove(0)
             .collect_data()
             .into_iter()
-            .chain(outputs_b.remove(0).collect_data().into_iter())
             .flat_map(|(_, d)| d)
             .collect();
-        all.sort();
+        let mut data_b: Vec<i64> = outputs_b
+            .remove(0)
+            .collect_data()
+            .into_iter()
+            .flat_map(|(_, d)| d)
+            .collect();
 
-        let mut expected: Vec<i64> = Vec::new();
+        // node-b must have received data — proves exchange actually happened.
+        assert!(
+            !data_b.is_empty(),
+            "cluster df-{df_idx}: node-b received no data — exchange may not be working"
+        );
+
+        data_a.sort();
+        data_b.sort();
+
+        let mut expected_a: Vec<i64> = Vec::new();
+        let mut expected_b: Vec<i64> = Vec::new();
         for epoch in 0..num_epochs {
             let base = (df_idx as i64) * 1000 + (epoch as i64) * 10;
-            expected.extend(base..base + 10);
+            for k in 0..10i64 {
+                let val = base + k;
+                if (val as u64) % 2 == 0 {
+                    expected_a.push(val);
+                } else {
+                    expected_b.push(val);
+                }
+            }
         }
-        expected.sort();
-        assert_eq!(all, expected, "cluster df-{df_idx}");
+        expected_a.sort();
+        expected_b.sort();
+        assert_eq!(data_a, expected_a, "cluster df-{df_idx} node-a: wrong routing");
+        assert_eq!(data_b, expected_b, "cluster df-{df_idx} node-b: wrong routing");
     }
 }
 
@@ -461,7 +548,7 @@ async fn stress_parallel_cluster_dataflows() {
 
         let build = |_worker_idx: usize, builder: &mut DataflowBuilder<u64>| -> Result<()> {
             let input = builder.input::<i64>("data");
-            let exchanged = input.exchange("by_val", |x: &i64| *x as u64);
+            let exchanged = input.exchange_by_hash("by_val", |x: &i64| *x as u64);
             exchanged.map("pass", |_t, x| x).output("results");
             Ok(())
         };
