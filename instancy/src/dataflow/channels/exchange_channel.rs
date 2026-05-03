@@ -1,10 +1,19 @@
 //! Exchange channel — cross-worker data routing for multi-worker dataflows.
 //!
-//! An exchange channel connects N source workers to N target workers via an
-//! N×N matrix of bounded channels. Each source worker's [`ExchangePush`]
-//! routes records to target workers based on a hash function. Each target
-//! worker's [`ExchangePull`] merges data from all source workers using
+//! This module provides the **physical transport** for exchange edges. A single
+//! logical exchange edge in the dataflow graph (declared via [`Pipe::exchange`])
+//! is materialized into an N×N matrix of **physical** in-process bounded SPSC
+//! channels — one per (source worker, target worker) pair. These are real
+//! data-carrying channels, not graph-level abstractions.
+//!
+//! Each source worker's [`ExchangePush`] partitions and routes records across
+//! the physical channels based on a hash function. Each target worker's
+//! [`ExchangePull`] merges data from its N physical input channels using
 //! round-robin.
+//!
+//! For cross-process exchange (remote workers), a separate network transport
+//! layer would replace these in-process bounded channels with TCP/network
+//! connections while keeping the same [`Push`]/[`Pull`] interface.
 //!
 //! # Wake semantics
 //!
