@@ -15,9 +15,9 @@
 //! makes it clean:
 //!
 //! ```text
-//! Epoch 0: batch1=[10, 20], batch2=[30]   →  Stats { sum=60, count=3, min=10, max=30, mean=20.0 }
-//! Epoch 1: batch1=[5],      batch2=[15,25] → Stats { sum=45, count=3, min=5,  max=25, mean=15.0 }
-//! Epoch 2: batch1=[100]                    →  Stats { sum=100, count=1, min=100, max=100, mean=100.0 }
+//! Epoch 0: batch1=[10, 20, 30], batch2=[40, 50]   →  Stats { sum=150, count=5, min=10, max=50 }
+//! Epoch 1: batch1=[5, 15], batch2=[25], batch3=[35, 45] → Stats { sum=125, count=5, min=5, max=45 }
+//! Epoch 2: batch1=[100, 200, 300, 400]              →  Stats { sum=1000, count=4, min=100, max=400 }
 //! ```
 //!
 //! Without notifications, the operator would have to guess when to emit (e.g., emit
@@ -25,11 +25,16 @@
 //! the operator buffers data, and the framework tells it exactly when each epoch is
 //! complete via a notification callback.
 //!
-//! ## Multi-worker behavior
+//! ## Note on frontier behavior in this example
 //!
-//! With 2 workers and exchange, each worker receives a subset of epochs' data.
-//! The notification fires independently per worker when that worker's input frontier
-//! advances, ensuring correct per-partition aggregation.
+//! The preloaded source operator holds a single capability at `T::minimum()` and
+//! drops it only when all data is emitted. This means the input frontier advances
+//! past ALL epochs at once (when the source finishes), so all notifications fire
+//! together. In a real streaming system with incremental frontier advancement
+//! (e.g., using `AsyncInputSender::advance_frontier()`), notifications would fire
+//! per-epoch as each epoch completes. The aggregation pattern is identical either
+//! way — the operator correctly buffers and emits per-epoch regardless of when
+//! notifications fire.
 //!
 //! Run with: `cargo run --example notify_epoch_stats`
 
@@ -68,6 +73,7 @@ impl EpochStats {
 
     /// Compute the mean (only valid when count > 0).
     fn mean(&self) -> f64 {
+        debug_assert!(self.count > 0, "mean() called on empty stats");
         self.sum as f64 / self.count as f64
     }
 }
@@ -155,7 +161,7 @@ fn main() {
     // --- Execute ---
     let config = RuntimeConfig::default();
     let rt = RuntimeHandle::new(config).unwrap();
-    rt.run(dataflow).unwrap();
+    rt.run_blocking(dataflow).unwrap();
 
     // --- Print results ---
     println!("Results:");
