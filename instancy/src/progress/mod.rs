@@ -6,6 +6,7 @@ pub mod frontier;
 pub mod mutable_antichain;
 pub mod notificator;
 pub mod operate;
+pub mod progress_channel;
 pub mod reachability;
 pub mod subgraph;
 pub mod timestamp;

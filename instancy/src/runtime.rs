@@ -33,6 +33,7 @@ use crate::dataflow::dataflow_builder::{DataflowBuilder, LogicalDataflow};
 use crate::dataflow::executor::{DataflowExecutor, ExecutorConfig};
 use crate::dataflow::graph::OperatorInfo;
 use crate::error::{Error, Result};
+use crate::progress::progress_channel::{WorkerProgressChannels, create_progress_channels};
 use crate::progress::timestamp::Timestamp;
 use crate::scheduler::policy::{PriorityWithAgingPolicy, SchedulePolicy};
 use crate::worker::WorkerContext;
@@ -207,7 +208,7 @@ impl RuntimeHandle {
         &self,
         dataflow: LogicalDataflow<T>,
     ) -> Result<SpawnedDataflow<T>> {
-        self.spawn_internal(dataflow, ChannelMode::Sync, WorkerContext::single())
+        self.spawn_internal(dataflow, ChannelMode::Sync, WorkerContext::single(), None, None)
     }
 
     /// Spawn a dataflow with async channel-based I/O.
@@ -234,7 +235,7 @@ impl RuntimeHandle {
         &self,
         dataflow: LogicalDataflow<T>,
     ) -> Result<SpawnedDataflow<T>> {
-        self.spawn_internal(dataflow, ChannelMode::Async, WorkerContext::single())
+        self.spawn_internal(dataflow, ChannelMode::Async, WorkerContext::single(), None, None)
     }
 
     /// Spawn N replicated workers from the same dataflow builder closure.
@@ -400,7 +401,7 @@ impl RuntimeHandle {
         let wake_handle = WakeHandle::new();
         cancel.register_wake_handle(wake_handle.clone());
         let executor =
-            materialize_executor(dataflow, cancel, Some(wake_handle), WorkerContext::single())?;
+            materialize_executor(dataflow, cancel, Some(wake_handle), WorkerContext::single(), None)?;
 
         let (completion, notifier) = DataflowCompletion::new();
 
@@ -413,10 +414,36 @@ impl RuntimeHandle {
 
     fn spawn_internal<T: Timestamp>(
         &self,
+        dataflow: LogicalDataflow<T>,
+        mode: ChannelMode,
+        worker_context: WorkerContext,
+        progress_channels: Option<WorkerProgressChannels<T>>,
+        pre_created_wake_handle: Option<WakeHandle>,
+    ) -> Result<SpawnedDataflow<T>> {
+        let (spawned, executor, notifier) =
+            self.prepare_worker(dataflow, mode, worker_context, progress_channels, pre_created_wake_handle)?;
+        self.registry.register(executor, notifier);
+        Ok(spawned)
+    }
+
+    /// Materialize a worker (executor + I/O wiring) without registering it
+    /// on the task registry. Returns the SpawnedDataflow handle, the pinned
+    /// executor future, and the completion notifier.
+    ///
+    /// This separation allows `spawn_multi_internal` to materialize ALL workers
+    /// (including their progress tracker initialization) before registering any
+    /// of them. This is critical for correctness: progress tracker initialization
+    /// broadcasts initial capabilities to peer workers' channels. If workers
+    /// were registered (and thus polled) immediately, a fast worker could see
+    /// incomplete global state before slower workers have initialized.
+    fn prepare_worker<T: Timestamp>(
+        &self,
         mut dataflow: LogicalDataflow<T>,
         mode: ChannelMode,
         worker_context: WorkerContext,
-    ) -> Result<SpawnedDataflow<T>> {
+        progress_channels: Option<WorkerProgressChannels<T>>,
+        pre_created_wake_handle: Option<WakeHandle>,
+    ) -> Result<(SpawnedDataflow<T>, Pin<Box<DataflowExecutor<T>>>, CompletionNotifier)> {
         if dataflow.operator_factories.is_empty() && dataflow.input_port_wiring.is_empty() {
             return Err(Error::Custom("cannot spawn an empty dataflow".into()));
         }
@@ -426,9 +453,9 @@ impl RuntimeHandle {
         let external_inputs_open = Arc::new(AtomicUsize::new(0));
         let name = dataflow.name().to_string();
 
-        // Create the WakeHandle early so it can be shared with InputSenders,
-        // CancellationToken, and the executor's internal channels.
-        let wake_handle = WakeHandle::new();
+        // Use pre-created wake handle if provided (for multi-worker with
+        // progress channels that already reference it), otherwise create one.
+        let wake_handle = pre_created_wake_handle.unwrap_or_else(WakeHandle::new);
 
         // Register wake handle on the cancellation token (and all ancestors)
         // so that cancel() wakes the sleeping executor promptly.
@@ -478,25 +505,25 @@ impl RuntimeHandle {
             output_receivers.push((info.name.clone(), info.type_name, receiver_any));
         }
 
-        // --- Materialize and register as cooperative task ---
+        // --- Materialize executor (but do NOT register yet) ---
         let mut executor =
-            materialize_executor(dataflow, cancel, Some(wake_handle), worker_context)?;
+            materialize_executor(dataflow, cancel, Some(wake_handle), worker_context, progress_channels)?;
 
         external_inputs_open.store(input_count, std::sync::atomic::Ordering::SeqCst);
         executor.replace_external_inputs_counter(external_inputs_open);
 
         let (completion, notifier) = DataflowCompletion::new();
 
-        self.registry.register(Box::pin(executor), notifier);
-
-        Ok(SpawnedDataflow {
+        let spawned = SpawnedDataflow {
             name,
             cancel: cancel_handle,
             completion: Some(completion),
             input_senders,
             output_receivers,
             _phantom: PhantomData,
-        })
+        };
+
+        Ok((spawned, Box::pin(executor), notifier))
     }
 
     fn spawn_multi_internal<T, F>(
@@ -559,30 +586,71 @@ impl RuntimeHandle {
             }
         }
 
-        // Phase 4: Spawn all workers. If any spawn fails, cancel already-started ones.
-        let mut workers = Vec::with_capacity(num_workers);
+        // Phase 4: Create per-worker wake handles and progress exchange channels.
+        // Wake handles must be created first since progress channels reference them
+        // for cross-worker notification (waking idle workers on progress arrival).
+        let wake_handles: Vec<WakeHandle> = (0..num_workers).map(|_| WakeHandle::new()).collect();
+
+        let mut progress_channels = if num_workers > 1 {
+            create_progress_channels::<T>(num_workers, &wake_handles)
+        } else {
+            Vec::new()
+        };
+
+        // Phase 5: Materialize all workers WITHOUT registering them yet.
+        //
+        // This is critical for correctness: materialize_executor() calls
+        // tracker.initialize(), which broadcasts initial capabilities to peer
+        // workers' progress channels. If we registered (and thus polled)
+        // workers immediately, a fast worker could see incomplete global
+        // state before slower workers have initialized and broadcast their
+        // initial capabilities. By deferring registration until ALL workers
+        // are materialized, we guarantee every worker's progress channels
+        // contain the full set of initial capability broadcasts from all
+        // peers before any worker starts executing.
+        let mut prepared = Vec::with_capacity(num_workers);
         let mut spawned_count = 0usize;
 
         for (worker_idx, dataflow) in dataflows.into_iter().enumerate() {
             let ctx = WorkerContext::new(worker_idx, num_workers);
-            match self.spawn_internal(dataflow, mode, ctx) {
-                Ok(spawned) => {
-                    workers.push(spawned);
+            let pc = if !progress_channels.is_empty() {
+                // Take this worker's progress channels (replace with empty placeholder).
+                Some(std::mem::replace(
+                    &mut progress_channels[worker_idx],
+                    WorkerProgressChannels {
+                        senders: Vec::new(),
+                        receivers: Vec::new(),
+                    },
+                ))
+            } else {
+                None
+            };
+            let wh = wake_handles[worker_idx].clone();
+            match self.prepare_worker(dataflow, mode, ctx, pc, Some(wh)) {
+                Ok(worker) => {
+                    prepared.push(worker);
                     spawned_count += 1;
                 }
                 Err(e) => {
-                    // Cancel and drop already-started workers.
-                    for w in &workers {
+                    // Cancel and drop already-prepared workers (they haven't
+                    // been registered, so just cancel their tokens).
+                    for (w, _, _) in &prepared {
                         w.cancel();
-                    }
-                    for w in workers {
-                        let _ = w.join_blocking();
                     }
                     return Err(Error::Custom(format!(
                         "failed to spawn worker {spawned_count}: {e}"
                     )));
                 }
             }
+        }
+
+        // Phase 6: Register all workers NOW — every worker's tracker has
+        // initialized and broadcast its initial capabilities, so all progress
+        // channels contain the complete initial state from all peers.
+        let mut workers = Vec::with_capacity(num_workers);
+        for (spawned, executor, notifier) in prepared {
+            self.registry.register(executor, notifier);
+            workers.push(spawned);
         }
 
         Ok(MultiSpawnedDataflow {
@@ -694,6 +762,7 @@ impl SimpleRuntime {
             self.cancel.clone(),
             Some(wake_handle),
             WorkerContext::single(),
+            None,
         )?;
 
         let completed = executor.run()?;
@@ -802,7 +871,7 @@ impl SimpleRuntime {
 
         // --- Materialize and run on background thread ---
         let mut executor =
-            materialize_executor(dataflow, cancel, Some(wake_handle), worker_context)?;
+            materialize_executor(dataflow, cancel, Some(wake_handle), worker_context, None)?;
 
         external_inputs_open.store(input_count, std::sync::atomic::Ordering::SeqCst);
         executor.replace_external_inputs_counter(external_inputs_open);
@@ -1831,6 +1900,7 @@ fn materialize_executor<T: Timestamp>(
     cancel: CancellationToken,
     wake_handle: Option<WakeHandle>,
     worker_context: WorkerContext,
+    progress_channels: Option<WorkerProgressChannels<T>>,
 ) -> Result<DataflowExecutor<T>> {
     let executor_config = ExecutorConfig {
         max_activations_per_step: 1024,
@@ -1848,8 +1918,14 @@ fn materialize_executor<T: Timestamp>(
         worker_context,
     )?;
 
-    // Build and attach progress tracker
+    // Build and attach progress tracker.
+    // For multi-worker dataflows, attach cross-worker progress channels
+    // so the tracker broadcasts capability changes to peers and absorbs
+    // remote changes. This makes is_completed() reflect global state.
     let mut tracker = dataflow.subgraph_builder.build();
+    if let Some(channels) = progress_channels {
+        tracker.set_progress_channels(channels);
+    }
     tracker.initialize();
     executor.set_progress_tracker(tracker);
 

@@ -627,8 +627,19 @@ impl<T: Timestamp> DataflowExecutor<T> {
             // If a progress tracker is attached and reports completion,
             // force-close remaining operators (they are in a feedback cycle
             // that quiesced). Treat as normal completion.
+            //
+            // With cross-worker progress exchange, the tracker's is_completed()
+            // reflects GLOBAL state (all workers' capabilities), so this is safe
+            // for both single-worker and multi-worker exchange dataflows.
+            //
+            // Defense-in-depth: also verify no peer progress is pending.
+            // "Peer" = another logical worker/executor in the same dataflow,
+            // regardless of physical location (same process or remote node).
+            // After 64+ idle sweeps this should always be empty, but checking
+            // guards against the narrow race where a peer sends progress
+            // between our last propagate() and this force-close decision.
             if let Some(ref tracker) = self.progress_tracker {
-                if tracker.is_completed() {
+                if tracker.is_completed() && !tracker.has_pending_peer_progress() {
                     for pos in 0..self.operators.len() {
                         if !self.done[pos] {
                             self.operators[pos].close_inputs();
