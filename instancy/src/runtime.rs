@@ -2970,15 +2970,23 @@ mod tests {
 
         let _ = multi.join_blocking().expect("dataflow should complete");
 
-        // After exchange(mod 2): worker 0 gets [2,4,6,8], worker 1 gets [1,3,5,7]
-        let w0: Vec<(u64, Vec<i32>)> = out0.collect_data();
-        let w1: Vec<(u64, Vec<i32>)> = out1.collect_data();
+        // After exchange(value % 2): worker 0 gets evens [2,4,6,8], worker 1 gets odds [1,3,5,7]
+        // Each worker's unary_notify sums its partition on notification.
+        let mut r0: Vec<(u64, i32)> = out0
+            .collect_data()
+            .into_iter()
+            .flat_map(|(t, vs)| vs.into_iter().map(move |v| (t, v)))
+            .collect();
+        r0.sort();
+        let mut r1: Vec<(u64, i32)> = out1
+            .collect_data()
+            .into_iter()
+            .flat_map(|(t, vs)| vs.into_iter().map(move |v| (t, v)))
+            .collect();
+        r1.sort();
 
-        let sum0: i32 = w0.iter().flat_map(|(_, v)| v).sum();
-        let sum1: i32 = w1.iter().flat_map(|(_, v)| v).sum();
-
-        assert_eq!(sum0, 20, "worker 0 should sum evens: 2+4+6+8=20");
-        assert_eq!(sum1, 16, "worker 1 should sum odds: 1+3+5+7=16");
+        assert_eq!(r0, vec![(0, 20)], "worker 0: one sum at t=0, evens 2+4+6+8=20");
+        assert_eq!(r1, vec![(0, 16)], "worker 1: one sum at t=0, odds 1+3+5+7=16");
     }
 
     #[test]
@@ -3098,19 +3106,29 @@ mod tests {
 
         let _ = multi.join_blocking().expect("dataflow should complete");
 
-        let count0: i32 = out0.collect_data().iter().flat_map(|(_, v)| v).sum();
-        let count1: i32 = out1.collect_data().iter().flat_map(|(_, v)| v).sum();
+        // All 5 items doubled are even → value % 2 == 0 → all route to worker 0.
+        // Worker 0 emits count=5 at t=0; worker 1 emits nothing.
+        let mut r0: Vec<(u64, i32)> = out0
+            .collect_data()
+            .into_iter()
+            .flat_map(|(t, vs)| vs.into_iter().map(move |v| (t, v)))
+            .collect();
+        r0.sort();
+        let r1: Vec<(u64, i32)> = out1
+            .collect_data()
+            .into_iter()
+            .flat_map(|(t, vs)| vs.into_iter().map(move |v| (t, v)))
+            .collect();
 
-        // All 5 items doubled are even → all route to worker 0
-        assert_eq!(count0, 5, "worker 0 should count all 5 items");
-        assert_eq!(count1, 0, "worker 1 should receive nothing");
+        assert_eq!(r0, vec![(0, 5)], "worker 0: one count at t=0");
+        assert!(r1.is_empty(), "worker 1 should receive nothing");
     }
 
     #[test]
     fn spawn_multi_exchange_notify_multi_batch_same_epoch() {
         // 2 workers: both send data at t=0 in separate batches.
-        // Verifies no duplicate notifications and no data loss when the same
-        // epoch arrives in multiple activations from different workers.
+        // Verifies correct final aggregation despite multi-batch inputs — each
+        // worker should emit exactly one sum at t=0 after all batches are collected.
         let rt = RuntimeHandle::new(RuntimeConfig::default()).unwrap();
         let mut multi = rt
             .spawn_multi("exchange_notify_multibatch", 2, |_worker_idx, builder| {
@@ -3157,14 +3175,26 @@ mod tests {
         let _ = multi.join_blocking().expect("dataflow should complete");
 
         // After exchange: w0=[2,4,6,8], w1=[1,3,5,7]
-        let sum0: i32 = out0.collect_data().iter().flat_map(|(_, v)| v).sum();
-        let sum1: i32 = out1.collect_data().iter().flat_map(|(_, v)| v).sum();
+        // Each worker should emit exactly one record at t=0.
+        let mut r0: Vec<(u64, i32)> = out0
+            .collect_data()
+            .into_iter()
+            .flat_map(|(t, vs)| vs.into_iter().map(move |v| (t, v)))
+            .collect();
+        r0.sort();
+        let mut r1: Vec<(u64, i32)> = out1
+            .collect_data()
+            .into_iter()
+            .flat_map(|(t, vs)| vs.into_iter().map(move |v| (t, v)))
+            .collect();
+        r1.sort();
 
-        assert_eq!(sum0, 20, "worker 0 evens: 2+4+6+8=20");
-        assert_eq!(sum1, 16, "worker 1 odds: 1+3+5+7=16");
+        assert_eq!(r0, vec![(0, 20)], "worker 0: one sum at t=0, evens 2+4+6+8=20");
+        assert_eq!(r1, vec![(0, 16)], "worker 1: one sum at t=0, odds 1+3+5+7=16");
 
         // Verify total data integrity: no loss, no duplication.
-        assert_eq!(sum0 + sum1, 36, "total sum should be 1+2+...+8=36");
+        let total: i32 = r0.iter().chain(r1.iter()).map(|(_, v)| v).sum();
+        assert_eq!(total, 36, "total sum should be 1+2+...+8=36");
     }
 
     #[test]
