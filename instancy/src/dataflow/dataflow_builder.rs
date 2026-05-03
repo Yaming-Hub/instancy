@@ -113,6 +113,12 @@ struct BuilderState<T: Timestamp> {
     /// Type-erased exchange factory creators — one per exchange edge.
     exchange_creators:
         Vec<(usize, crate::dataflow::channels::exchange_channel::ExchangeFactoryCreatorFn)>,
+    /// Network-capable exchange creators — one per exchange edge (transport feature only).
+    /// Stored by `Pipe::exchange` when `transport` feature is enabled.
+    /// Used by `spawn_cluster` to create network-backed exchange factories.
+    #[cfg(feature = "transport")]
+    exchange_network_creators:
+        Vec<(usize, Box<dyn crate::dataflow::channels::exchange_channel::NetworkExchangeCreator>)>,
     next_operator_index: usize,
     next_collect_index: usize,
     channel_capacity: usize,
@@ -209,6 +215,8 @@ impl<T: Timestamp> DataflowBuilder<T> {
                 output_port_wiring: Vec::new(),
                 probes: Vec::new(),
                 exchange_creators: Vec::new(),
+                #[cfg(feature = "transport")]
+                exchange_network_creators: Vec::new(),
                 next_operator_index: 1,
                 next_collect_index: 0,
                 channel_capacity: config.channel_capacity,
@@ -497,6 +505,8 @@ impl<T: Timestamp> DataflowBuilder<T> {
             output_port_wiring: state.output_port_wiring,
             probes: state.probes,
             exchange_creators: state.exchange_creators,
+            #[cfg(feature = "transport")]
+            exchange_network_creators: state.exchange_network_creators,
         })
     }
 }
@@ -1177,6 +1187,8 @@ impl<T: Timestamp, D: Clone + Send + 'static> Pipe<T, D> {
                 output_port_wiring: Vec::new(),
                 probes: Vec::new(),
                 exchange_creators: Vec::new(),
+                #[cfg(feature = "transport")]
+                exchange_network_creators: Vec::new(),
                 next_operator_index: inner_start_idx,
                 next_collect_index: 0,
                 channel_capacity: capacity,
@@ -1673,6 +1685,79 @@ impl<T: Timestamp, D: Clone + Send + 'static> Pipe<T, D> {
         self.output(name).collector
     }
 
+}
+
+/// Exchange methods that support both local and network-backed transport.
+///
+/// When the `transport` feature is enabled, exchange data types must implement
+/// [`ExchangeData`](crate::communication::codec::ExchangeData) to support
+/// potential network serialization in `spawn_cluster`. Common types (`i32`,
+/// `u64`, `String`, tuples of ExchangeData, etc.) already implement this trait.
+#[cfg(feature = "transport")]
+impl<T: Timestamp + crate::communication::codec::ExchangeData, D: Clone + crate::communication::codec::ExchangeData> Pipe<T, D> {
+    /// Repartition data across workers based on a hash function.
+    ///
+    /// Records with the same hash are routed to the same worker, enabling
+    /// key-partitioned computations like group-by and join.
+    ///
+    /// In single-worker mode, this is a pass-through (no routing needed).
+    /// In multi-worker mode (`spawn_multi` / `spawn_cluster`), the runtime
+    /// creates shared exchange channels that route data between workers.
+    ///
+    /// # Example
+    /// ```ignore
+    /// let partitioned = stream.exchange("by_key", |record: &(u64, String)| record.0);
+    /// ```
+    pub fn exchange<K: std::hash::Hash + 'static>(
+        self,
+        name: impl Into<String>,
+        key_fn: impl Fn(&D) -> K + Send + Sync + 'static,
+    ) -> Pipe<T, D> {
+        let exchange_fn =
+            crate::dataflow::channels::pact::ExchangeFn::by_key(&name.into(), key_fn);
+        self.add_exchange_internal_networked(exchange_fn)
+    }
+
+    /// Repartition data using a direct hash function (returns u64).
+    ///
+    /// The returned u64 is reduced modulo the target worker count to
+    /// determine routing.
+    pub fn exchange_by_hash(
+        self,
+        name: impl Into<String>,
+        hash_fn: impl Fn(&D) -> u64 + Send + Sync + 'static,
+    ) -> Pipe<T, D> {
+        let exchange_fn =
+            crate::dataflow::channels::pact::ExchangeFn::new(name, hash_fn);
+        self.add_exchange_internal_networked(exchange_fn)
+    }
+
+    /// Internal: add an exchange operator with network-capable factory creator.
+    fn add_exchange_internal_networked(
+        &self,
+        exchange_fn: crate::dataflow::channels::pact::ExchangeFn<D>,
+    ) -> Pipe<T, D> {
+        let pipe = self.add_exchange_internal(exchange_fn.clone());
+
+        // Store network exchange creator alongside the local one.
+        {
+            let mut state = self.state.borrow_mut();
+            let edge_idx = state.graph.edges().len() - 1;
+            let creator: Box<dyn crate::dataflow::channels::exchange_channel::NetworkExchangeCreator> =
+                Box::new(crate::dataflow::channels::exchange_channel::NetworkExchangeCreatorImpl::<T, D> {
+                    exchange_fn,
+                    _phantom: std::marker::PhantomData,
+                });
+            state.exchange_network_creators.push((edge_idx, creator));
+        }
+
+        pipe
+    }
+}
+
+/// Exchange methods for non-transport builds (local-only exchange).
+#[cfg(not(feature = "transport"))]
+impl<T: Timestamp, D: Clone + Send + 'static> Pipe<T, D> {
     /// Repartition data across workers based on a hash function.
     ///
     /// Records with the same hash are routed to the same worker, enabling
@@ -1709,7 +1794,10 @@ impl<T: Timestamp, D: Clone + Send + 'static> Pipe<T, D> {
             crate::dataflow::channels::pact::ExchangeFn::new(name, hash_fn);
         self.add_exchange_internal(exchange_fn)
     }
+}
 
+/// Internal exchange implementation — shared by both transport and non-transport builds.
+impl<T: Timestamp, D: Clone + Send + 'static> Pipe<T, D> {
     /// Internal: add an exchange (repartition) operator.
     ///
     /// Creates a pass-through unary operator with an exchange channel
@@ -1755,19 +1843,28 @@ impl<T: Timestamp, D: Clone + Send + 'static> Pipe<T, D> {
             ));
 
             // Subgraph connectivity.
-            state.subgraph_builder.add_operator(
+            // Register with an initial capability at T::minimum(). This prevents
+            // the progress tracker from declaring the dataflow complete while
+            // data may be in transit on the exchange channel (especially across
+            // network boundaries where data delivery is asynchronous).
+            let mut initial_cap = ChangeBatch::new();
+            initial_cap.update(T::minimum(), 1);
+            let progress = state.subgraph_builder.add_operator_with_capabilities(
                 op_idx,
                 "exchange",
                 1,
                 1,
                 PortConnectivity::identity(T::Summary::default()),
+                vec![initial_cap],
             );
+            let exchange_reporter = progress.reporter(0).clone();
+
             state.subgraph_builder.add_edge(
                 Location::source(self.op_idx, self.output_slot),
                 Location::target(op_idx, 0),
             );
 
-            // Operator factory — pass-through unary.
+            // Operator factory — pass-through unary with progress reporter.
             let name_clone = String::from("exchange");
             let factory: OperatorFactory =
                 single_use_factory(move |_ctx, endpoints: ChannelEndpoints| {
@@ -1792,13 +1889,14 @@ impl<T: Timestamp, D: Clone + Send + 'static> Pipe<T, D> {
                         tee_or_single(pushers).unwrap_or_else(|| Box::new(NullPush))
                     };
 
-                    Box::new(WiredUnaryOperator::new(
+                    Box::new(WiredUnaryOperator::with_reporter(
                         name_clone,
                         op_idx,
                         region_id,
                         wired_logic,
                         input_puller,
                         output_pusher,
+                        exchange_reporter,
                     )) as Box<dyn SchedulableOperator>
                 });
             state.operator_factories.push((op_idx, factory));
@@ -2276,6 +2374,11 @@ pub struct LogicalDataflow<T: Timestamp> {
     /// Consumed by `spawn_multi` to produce shared cross-worker channel factories.
     pub(crate) exchange_creators:
         Vec<(usize, crate::dataflow::channels::exchange_channel::ExchangeFactoryCreatorFn)>,
+    /// Network-capable exchange creators — one per exchange edge (transport feature only).
+    /// Consumed by `spawn_cluster` to produce network-backed exchange channel factories.
+    #[cfg(feature = "transport")]
+    pub(crate) exchange_network_creators:
+        Vec<(usize, Box<dyn crate::dataflow::channels::exchange_channel::NetworkExchangeCreator>)>,
 }
 
 impl<T: Timestamp> LogicalDataflow<T> {
@@ -2315,6 +2418,19 @@ impl<T: Timestamp> LogicalDataflow<T> {
     /// Get a reference to the dataflow graph.
     pub fn graph(&self) -> &DataflowGraph {
         &self.graph
+    }
+
+    /// Get the indices of exchange edges.
+    ///
+    /// These are the edge indices that use cross-worker exchange channels
+    /// (as opposed to pipeline channels).
+    pub fn exchange_edge_indices(&self) -> Vec<usize> {
+        self.exchange_creators.iter().map(|(idx, _)| *idx).collect()
+    }
+
+    /// Get the number of feedback (loop) edges in the graph.
+    pub fn feedback_edge_count(&self) -> usize {
+        self.graph.feedback_edges().len()
     }
 }
 

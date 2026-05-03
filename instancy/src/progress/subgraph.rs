@@ -240,6 +240,7 @@ impl<T: Timestamp> SubgraphBuilder<T> {
             dirty_operators: Vec::new(),
             progress_channels: None,
             local_changes_buffer: Vec::new(),
+            peers_heard_from: Vec::new(),
         }
     }
 }
@@ -312,6 +313,13 @@ pub struct ProgressTracker<T: Timestamp> {
     /// Populated during `collect_operator_progress()` and drained
     /// during `broadcast_local_changes()`.
     local_changes_buffer: Vec<ProgressChange<T>>,
+    /// Tracks which peer workers have sent at least one progress message.
+    /// Indexed by worker id. `true` for self (no receiver) and for peers
+    /// that have sent data. `false` for peers we haven't heard from yet.
+    /// Used to prevent premature completion: we must hear from all peers
+    /// before declaring the dataflow complete, since their initial
+    /// capabilities may still be in transit over the network.
+    peers_heard_from: Vec<bool>,
 }
 
 /// Per-operator frontier state tracked by the progress tracker.
@@ -424,6 +432,13 @@ impl<T: Timestamp> ProgressTracker<T> {
             !self.initialized,
             "set_progress_channels must be called before initialize()"
         );
+        // Initialize peer tracking: mark peers with receivers as "not yet heard from".
+        // Slots with `None` (self or non-existent peers) are pre-marked as heard.
+        self.peers_heard_from = channels
+            .receivers
+            .iter()
+            .map(|r| r.is_none())
+            .collect();
         self.progress_channels = Some(channels);
     }
 
@@ -450,6 +465,22 @@ impl<T: Timestamp> ProgressTracker<T> {
         } else {
             false
         }
+    }
+
+    /// Returns `true` if all peer workers have sent at least one progress
+    /// message. In multi-node clusters, initial capabilities are broadcast
+    /// during tracker initialization. Until we've received those from all
+    /// peers, we cannot safely declare the dataflow complete — remote
+    /// capabilities may still be in transit over the network.
+    ///
+    /// Returns `true` when:
+    /// - No progress channels are attached (single-worker mode), or
+    /// - Every peer with a receiver has sent at least one progress batch.
+    pub fn all_peers_synced(&self) -> bool {
+        if self.peers_heard_from.is_empty() {
+            return true; // no peers, single-worker mode
+        }
+        self.peers_heard_from.iter().all(|&heard| heard)
     }
 
     /// Returns the current input frontier for an operator.
@@ -600,11 +631,18 @@ impl<T: Timestamp> ProgressTracker<T> {
             None => return,
         };
 
-        for receiver in &channels.receivers {
+        for (idx, receiver) in channels.receivers.iter().enumerate() {
             if let Some(r) = receiver {
-                for batch in r.drain_all() {
-                    for (op_idx, output_port, time, diff) in batch {
-                        self.tracker.update_source(op_idx, output_port, time, diff);
+                let batches = r.drain_all();
+                if !batches.is_empty() {
+                    // Mark this peer as heard from (for initial sync tracking).
+                    if idx < self.peers_heard_from.len() {
+                        self.peers_heard_from[idx] = true;
+                    }
+                    for batch in batches {
+                        for (op_idx, output_port, time, diff) in batch {
+                            self.tracker.update_source(op_idx, output_port, time, diff);
+                        }
                     }
                 }
             }
