@@ -233,12 +233,17 @@ async fn parallel_tcp_dataflows_shared_pool() {
         let out_a = outputs_a.remove(0);
         let out_b = outputs_b.remove(0);
 
-        let mut combined: Vec<i64> = out_a
-            .collect_data()
-            .into_iter()
-            .chain(out_b.collect_data().into_iter())
-            .flat_map(|(_, d)| d)
-            .collect();
+        let data_a: Vec<i64> = out_a.collect_data().into_iter().flat_map(|(_, d)| d).collect();
+        let data_b: Vec<i64> = out_b.collect_data().into_iter().flat_map(|(_, d)| d).collect();
+
+        // Prove that node-b actually received exchanged records over TCP.
+        // If exchange were broken (routing everything locally), data_b would be empty.
+        assert!(
+            !data_b.is_empty(),
+            "dataflow {i}: node-b received no records — exchange may not be routing across TCP"
+        );
+
+        let mut combined: Vec<i64> = data_a.into_iter().chain(data_b).collect();
         combined.sort();
 
         let mut exp = expected[i].clone();
@@ -379,12 +384,16 @@ async fn parallel_tcp_dataflows_multi_epoch() {
         let out_a = outputs_a.remove(0);
         let out_b = outputs_b.remove(0);
 
-        let mut combined: Vec<i64> = out_a
-            .collect_data()
-            .into_iter()
-            .chain(out_b.collect_data().into_iter())
-            .flat_map(|(_, d)| d)
-            .collect();
+        let data_a: Vec<i64> = out_a.collect_data().into_iter().flat_map(|(_, d)| d).collect();
+        let data_b: Vec<i64> = out_b.collect_data().into_iter().flat_map(|(_, d)| d).collect();
+
+        // Prove that node-b actually received exchanged records over TCP.
+        assert!(
+            !data_b.is_empty(),
+            "dataflow {i}: node-b received no records — exchange may not be routing across TCP"
+        );
+
+        let mut combined: Vec<i64> = data_a.into_iter().chain(data_b).collect();
         combined.sort();
 
         let base = (i as i64) * 100;
