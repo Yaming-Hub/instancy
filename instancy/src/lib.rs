@@ -75,6 +75,9 @@ pub use runtime::{
     RuntimeConfig, RuntimeHandle, SimpleRuntime, SpawnedDataflow, DataflowCompletion,
 };
 
+// Execution / cluster topology
+pub use execute::{ClusterTopology, NodeConfig};
+
 // Cancellation
 pub use cancellation::{CancellationToken, CancellationReason};
 

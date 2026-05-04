@@ -16,7 +16,7 @@ use instancy::communication::remote_push::{FrameSender, OutboundFrame, RemotePus
 use instancy::communication::session::DataflowSession;
 use instancy::communication::progress_exchange::{PeerProgressSender, ProgressExchange};
 use instancy::dataflow::id::DataflowId;
-use instancy::execute::{ClusterTopology, NodeConfig};
+use instancy::{ClusterTopology, NodeConfig};
 use instancy::providers::transport::{InMemoryClusterTransport, PushEndpoint, TransportProvider};
 use instancy::worker::WorkerId;
 

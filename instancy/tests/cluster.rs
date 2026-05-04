@@ -11,7 +11,7 @@ use instancy::communication::transport_session::PeerConnection;
 use instancy::DataflowBuilder;
 use instancy::DataflowId;
 use instancy::Result;
-use instancy::execute::{ClusterTopology, NodeConfig};
+use instancy::{ClusterTopology, NodeConfig};
 use instancy::{RuntimeConfig, RuntimeHandle};
 
 /// Helper: create duplex connections between two nodes.
