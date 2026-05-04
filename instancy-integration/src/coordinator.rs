@@ -325,6 +325,69 @@ impl TestCoordinator {
         worker_counts
     }
 
+    /// Feed data to a specific node's worker input port.
+    ///
+    /// `data` is bincode-serialized `Vec<T>` matching the dataflow type's input type.
+    pub async fn feed_data(
+        &mut self,
+        node_id: &str,
+        dataflow_id: &str,
+        worker_idx: usize,
+        port_name: &str,
+        timestamp: u64,
+        data: Vec<u8>,
+    ) {
+        let resp = self
+            .send_command(
+                node_id,
+                NodeCommand::FeedData {
+                    dataflow_id: dataflow_id.into(),
+                    worker_idx,
+                    port_name: port_name.into(),
+                    timestamp,
+                    data,
+                },
+            )
+            .await;
+        match resp {
+            NodeResponse::DataFed => {}
+            NodeResponse::Error { message } => {
+                panic!("FeedData failed on {node_id}: {message}");
+            }
+            _ => panic!("unexpected response from {node_id}"),
+        }
+    }
+
+    /// Collect output from a specific node's worker output port.
+    ///
+    /// Returns `(timestamp, bincode_bytes)` pairs. The caller must deserialize
+    /// the bytes according to the dataflow type's output type.
+    pub async fn collect_output(
+        &mut self,
+        node_id: &str,
+        dataflow_id: &str,
+        worker_idx: usize,
+        port_name: &str,
+    ) -> Vec<(u64, Vec<u8>)> {
+        let resp = self
+            .send_command(
+                node_id,
+                NodeCommand::CollectOutput {
+                    dataflow_id: dataflow_id.into(),
+                    worker_idx,
+                    port_name: port_name.into(),
+                },
+            )
+            .await;
+        match resp {
+            NodeResponse::OutputData { data } => data,
+            NodeResponse::Error { message } => {
+                panic!("CollectOutput failed on {node_id}: {message}");
+            }
+            _ => panic!("unexpected response from {node_id}"),
+        }
+    }
+
     /// Close inputs for all workers on all nodes for the given dataflow.
     pub async fn close_all_inputs(&mut self, dataflow_id: &str) {
         let node_ids: Vec<String> = self.connections.keys().cloned().collect();

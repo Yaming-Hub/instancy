@@ -152,7 +152,7 @@ impl DataflowAgent {
                 port_name,
                 timestamp,
                 data,
-            } => self.handle_feed_data(dataflow_id, worker_idx, port_name, timestamp, data),
+            } => self.handle_feed_data(dataflow_id, worker_idx, port_name, timestamp, data).await,
 
             NodeCommand::CloseInputs {
                 dataflow_id,
@@ -465,16 +465,30 @@ impl DataflowAgent {
         }
     }
 
-    fn handle_feed_data(
+    async fn handle_feed_data(
         &mut self,
-        _dataflow_id: String,
-        _worker_idx: usize,
-        _port_name: String,
-        _timestamp: u64,
-        _data: Vec<u8>,
+        dataflow_id: String,
+        worker_idx: usize,
+        port_name: String,
+        timestamp: u64,
+        data: Vec<u8>,
     ) -> NodeResponse {
-        // TODO: type-aware feed — will implement when we need data-flow tests
-        NodeResponse::DataFed
+        let active = match self.active.get(&dataflow_id) {
+            Some(a) => a.clone(),
+            None => {
+                return NodeResponse::Error {
+                    message: format!("no active dataflow {dataflow_id}"),
+                }
+            }
+        };
+        let mut guard = active.lock().await;
+        let key = (worker_idx, port_name.clone());
+        let dataflow_type = guard.dataflow_type;
+        let result = feed_data_typed(dataflow_type, &mut guard.input_senders, &key, timestamp, &data);
+        match result {
+            Ok(()) => NodeResponse::DataFed,
+            Err(e) => NodeResponse::Error { message: e },
+        }
     }
 
     async fn handle_close_inputs(
@@ -514,12 +528,25 @@ impl DataflowAgent {
 
     async fn handle_collect_output(
         &mut self,
-        _dataflow_id: String,
-        _worker_idx: usize,
-        _port_name: String,
+        dataflow_id: String,
+        worker_idx: usize,
+        port_name: String,
     ) -> NodeResponse {
-        // TODO: type-aware collect
-        NodeResponse::OutputData { data: vec![] }
+        let active = match self.active.get(&dataflow_id) {
+            Some(a) => a.clone(),
+            None => {
+                return NodeResponse::Error {
+                    message: format!("no active dataflow {dataflow_id}"),
+                }
+            }
+        };
+        let mut guard = active.lock().await;
+        let key = (worker_idx, port_name.clone());
+        let dataflow_type = guard.dataflow_type;
+        match collect_output_typed(dataflow_type, &mut guard.output_collectors, &key) {
+            Ok(data) => NodeResponse::OutputData { data },
+            Err(e) => NodeResponse::Error { message: e },
+        }
     }
 
     async fn handle_cancel_dataflow(&mut self, dataflow_id: String) -> NodeResponse {
@@ -667,6 +694,166 @@ fn extract_output_receiver(
             .ok()
             .map(|r| Box::new(r) as Box<dyn std::any::Any + Send>),
     }
+}
+
+// ---------------------------------------------------------------------------
+// Type-aware FeedData / CollectOutput helpers
+// ---------------------------------------------------------------------------
+
+/// Feed data to a type-erased InputSender using dataflow_type to select concrete type.
+fn feed_data_typed(
+    dataflow_type: DataflowType,
+    senders: &mut HashMap<(usize, String), Box<dyn std::any::Any + Send>>,
+    key: &(usize, String),
+    timestamp: u64,
+    data: &[u8],
+) -> std::result::Result<(), String> {
+    let sender = senders
+        .get(key)
+        .ok_or_else(|| format!("no input sender for worker {} port '{}'", key.0, key.1))?;
+
+    match dataflow_type {
+        DataflowType::PassThrough => {
+            let s = sender
+                .downcast_ref::<instancy::dataflow::channel_operators::InputSender<u64, Vec<u8>>>()
+                .ok_or("downcast failed for PassThrough input")?;
+            let items: Vec<Vec<u8>> =
+                bincode::deserialize(data).map_err(|e| format!("deserialize: {e}"))?;
+            s.send(timestamp, items).map_err(|e| format!("send: {e}"))
+        }
+        DataflowType::ExchangeRoundTrip => {
+            let s = sender
+                .downcast_ref::<instancy::dataflow::channel_operators::InputSender<u64, (u64, String)>>()
+                .ok_or("downcast failed for ExchangeRoundTrip input")?;
+            let items: Vec<(u64, String)> =
+                bincode::deserialize(data).map_err(|e| format!("deserialize: {e}"))?;
+            s.send(timestamp, items).map_err(|e| format!("send: {e}"))
+        }
+        DataflowType::MultiEpochExchange => {
+            let s = sender
+                .downcast_ref::<instancy::dataflow::channel_operators::InputSender<u64, (u64, i64)>>()
+                .ok_or("downcast failed for MultiEpochExchange input")?;
+            let items: Vec<(u64, i64)> =
+                bincode::deserialize(data).map_err(|e| format!("deserialize: {e}"))?;
+            s.send(timestamp, items).map_err(|e| format!("send: {e}"))
+        }
+        DataflowType::DistributedWordCount => {
+            let s = sender
+                .downcast_ref::<instancy::dataflow::channel_operators::InputSender<u64, String>>()
+                .ok_or("downcast failed for DistributedWordCount input")?;
+            let items: Vec<String> =
+                bincode::deserialize(data).map_err(|e| format!("deserialize: {e}"))?;
+            s.send(timestamp, items).map_err(|e| format!("send: {e}"))
+        }
+        DataflowType::IterativeFilter => {
+            let s = sender
+                .downcast_ref::<instancy::dataflow::channel_operators::InputSender<u64, (u64, i64)>>()
+                .ok_or("downcast failed for IterativeFilter input")?;
+            let items: Vec<(u64, i64)> =
+                bincode::deserialize(data).map_err(|e| format!("deserialize: {e}"))?;
+            s.send(timestamp, items).map_err(|e| format!("send: {e}"))
+        }
+        DataflowType::DistributedJoin => {
+            // Port "left" → (u64, String), port "right" → (u64, i64)
+            if key.1 == "left" {
+                let s = sender
+                    .downcast_ref::<instancy::dataflow::channel_operators::InputSender<u64, (u64, String)>>()
+                    .ok_or("downcast failed for DistributedJoin left input")?;
+                let items: Vec<(u64, String)> =
+                    bincode::deserialize(data).map_err(|e| format!("deserialize: {e}"))?;
+                s.send(timestamp, items).map_err(|e| format!("send: {e}"))
+            } else {
+                let s = sender
+                    .downcast_ref::<instancy::dataflow::channel_operators::InputSender<u64, (u64, i64)>>()
+                    .ok_or("downcast failed for DistributedJoin right input")?;
+                let items: Vec<(u64, i64)> =
+                    bincode::deserialize(data).map_err(|e| format!("deserialize: {e}"))?;
+                s.send(timestamp, items).map_err(|e| format!("send: {e}"))
+            }
+        }
+    }
+}
+
+/// Collect output from a type-erased OutputReceiver using dataflow_type.
+///
+/// Drains all available output (non-blocking) and returns `(timestamp, bincode_bytes)` pairs.
+fn collect_output_typed(
+    dataflow_type: DataflowType,
+    collectors: &mut HashMap<(usize, String), Box<dyn std::any::Any + Send>>,
+    key: &(usize, String),
+) -> std::result::Result<Vec<(u64, Vec<u8>)>, String> {
+    let collector = collectors
+        .get(key)
+        .ok_or_else(|| format!("no output collector for worker {} port '{}'", key.0, key.1))?;
+
+    match dataflow_type {
+        DataflowType::PassThrough => {
+            let r = collector
+                .downcast_ref::<instancy::dataflow::channel_operators::OutputReceiver<u64, Vec<u8>>>()
+                .ok_or("downcast failed for PassThrough output")?;
+            drain_output(r)
+        }
+        DataflowType::ExchangeRoundTrip => {
+            let r = collector
+                .downcast_ref::<instancy::dataflow::channel_operators::OutputReceiver<u64, (u64, String)>>()
+                .ok_or("downcast failed for ExchangeRoundTrip output")?;
+            drain_output(r)
+        }
+        DataflowType::MultiEpochExchange => {
+            let r = collector
+                .downcast_ref::<instancy::dataflow::channel_operators::OutputReceiver<u64, (u64, i64)>>()
+                .ok_or("downcast failed for MultiEpochExchange output")?;
+            drain_output(r)
+        }
+        DataflowType::DistributedWordCount => {
+            let r = collector
+                .downcast_ref::<instancy::dataflow::channel_operators::OutputReceiver<u64, (String, u64)>>()
+                .ok_or("downcast failed for DistributedWordCount output")?;
+            drain_output(r)
+        }
+        DataflowType::IterativeFilter => {
+            let r = collector
+                .downcast_ref::<instancy::dataflow::channel_operators::OutputReceiver<u64, (u64, i64)>>()
+                .ok_or("downcast failed for IterativeFilter output")?;
+            drain_output(r)
+        }
+        DataflowType::DistributedJoin => {
+            let r = collector
+                .downcast_ref::<instancy::dataflow::channel_operators::OutputReceiver<u64, (u64, String, i64)>>()
+                .ok_or("downcast failed for DistributedJoin output")?;
+            drain_output(r)
+        }
+    }
+}
+
+/// Drain all available output events from a receiver, returning bincode-serialized batches.
+///
+/// Uses `try_recv()` (non-blocking). This is safe when called after `wait_for_completion`
+/// because `join_blocking()` ensures all worker threads have finished and flushed their
+/// output to the std::sync::mpsc channel. All buffered messages are visible to `try_recv`.
+///
+/// **Backpressure note**: The output channel is bounded (256 events). If a dataflow produces
+/// more output than fits in the buffer, `wait_for_completion` must NOT be called before
+/// draining — the dataflow will block on backpressure and never complete. For large outputs,
+/// drain concurrently with execution or increase channel capacity.
+fn drain_output<D: serde::Serialize + Send + 'static>(
+    receiver: &instancy::dataflow::channel_operators::OutputReceiver<u64, D>,
+) -> std::result::Result<Vec<(u64, Vec<u8>)>, String> {
+    use instancy::dataflow::OutputEvent;
+    let mut results = Vec::new();
+    while let Some(event) = receiver.try_recv() {
+        match event {
+            OutputEvent::Data { time, data } => {
+                let bytes =
+                    bincode::serialize(&data).map_err(|e| format!("serialize output: {e}"))?;
+                results.push((time, bytes));
+            }
+            OutputEvent::Frontier(_) => {
+                // Skip frontier events — only return data events
+            }
+        }
+    }
+    Ok(results)
 }
 
 // ---------------------------------------------------------------------------

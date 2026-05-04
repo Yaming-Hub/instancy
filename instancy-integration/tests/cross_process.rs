@@ -262,3 +262,159 @@ async fn test_sequential_dataflows() {
 
     coord.shutdown().await;
 }
+
+// ===========================================================================
+// Data-driven tests (feed data → collect output → verify correctness)
+// ===========================================================================
+
+/// Two-node PassThrough with data verification.
+///
+/// Feeds data to node-a, collects output from node-a (since PassThrough has no
+/// exchange, data stays on the originating node), and verifies the output matches.
+#[tokio::test]
+async fn test_pass_through_with_data() {
+    let mut coord = TestCoordinator::start(&["node-a", "node-b"], 1).await;
+    let topology = make_topology(&["node-a", "node-b"], 1);
+
+    coord
+        .setup_and_spawn_dataflow("df-pt-data", &topology, DataflowType::PassThrough)
+        .await;
+
+    // Feed data to node-a at timestamp 0.
+    let input_data: Vec<Vec<u8>> = vec![b"hello".to_vec(), b"world".to_vec()];
+    let payload = bincode::serialize(&input_data).unwrap();
+    coord
+        .feed_data("node-a", "df-pt-data", 0, "data", 0, payload)
+        .await;
+
+    // Close inputs so the dataflow completes.
+    coord.close_all_inputs("df-pt-data").await;
+    coord.wait_for_completion("df-pt-data").await;
+
+    // Collect output from node-a (PassThrough keeps data local).
+    let output = coord
+        .collect_output("node-a", "df-pt-data", 0, "results")
+        .await;
+    let mut all_output: Vec<Vec<u8>> = Vec::new();
+    for (_ts, bytes) in &output {
+        let batch: Vec<Vec<u8>> = bincode::deserialize(bytes).unwrap();
+        all_output.extend(batch);
+    }
+    all_output.sort();
+
+    let mut expected = input_data.clone();
+    expected.sort();
+    assert_eq!(all_output, expected, "PassThrough output should match input");
+
+    coord.shutdown().await;
+}
+
+/// Two-node ExchangeRoundTrip with data verification.
+///
+/// Feeds keyed data to node-a, closes inputs, then collects output from both nodes.
+/// The exchange operator partitions data by key hash across the 2 workers (one per node).
+/// All input records should appear exactly once in the combined output.
+#[tokio::test]
+async fn test_exchange_with_data() {
+    let mut coord = TestCoordinator::start(&["node-a", "node-b"], 1).await;
+    let topology = make_topology(&["node-a", "node-b"], 1);
+
+    coord
+        .setup_and_spawn_dataflow("df-ex-data", &topology, DataflowType::ExchangeRoundTrip)
+        .await;
+
+    // Feed 4 keyed records to node-a at timestamp 0.
+    let input_data: Vec<(u64, String)> = vec![
+        (1, "alpha".into()),
+        (2, "beta".into()),
+        (3, "gamma".into()),
+        (4, "delta".into()),
+    ];
+    let payload = bincode::serialize(&input_data).unwrap();
+    coord
+        .feed_data("node-a", "df-ex-data", 0, "data", 0, payload)
+        .await;
+
+    coord.close_all_inputs("df-ex-data").await;
+    coord.wait_for_completion("df-ex-data").await;
+
+    // Collect output from both nodes and merge.
+    let out_a = coord
+        .collect_output("node-a", "df-ex-data", 0, "results")
+        .await;
+    let out_b = coord
+        .collect_output("node-b", "df-ex-data", 0, "results")
+        .await;
+
+    let mut all_output: Vec<(u64, String)> = Vec::new();
+    for (_ts, bytes) in out_a.iter().chain(out_b.iter()) {
+        let batch: Vec<(u64, String)> = bincode::deserialize(bytes).unwrap();
+        all_output.extend(batch);
+    }
+    all_output.sort_by_key(|(k, _)| *k);
+
+    let mut expected = input_data.clone();
+    expected.sort_by_key(|(k, _)| *k);
+
+    assert_eq!(
+        all_output, expected,
+        "ExchangeRoundTrip output should contain all input records"
+    );
+
+    coord.shutdown().await;
+}
+
+/// Two-node DistributedWordCount with data verification.
+///
+/// Feeds sentences to both nodes, collects word counts, and verifies
+/// that all words are counted correctly across the cluster.
+#[tokio::test]
+async fn test_word_count_with_data() {
+    let mut coord = TestCoordinator::start(&["node-a", "node-b"], 1).await;
+    let topology = make_topology(&["node-a", "node-b"], 1);
+
+    coord
+        .setup_and_spawn_dataflow("df-wc-data", &topology, DataflowType::DistributedWordCount)
+        .await;
+
+    // Feed sentences to node-a at timestamp 0.
+    let sentences_a: Vec<String> = vec!["hello world hello".into()];
+    let payload_a = bincode::serialize(&sentences_a).unwrap();
+    coord
+        .feed_data("node-a", "df-wc-data", 0, "sentences", 0, payload_a)
+        .await;
+
+    // Feed sentences to node-b at timestamp 0.
+    let sentences_b: Vec<String> = vec!["world world rust".into()];
+    let payload_b = bincode::serialize(&sentences_b).unwrap();
+    coord
+        .feed_data("node-b", "df-wc-data", 0, "sentences", 0, payload_b)
+        .await;
+
+    coord.close_all_inputs("df-wc-data").await;
+    coord.wait_for_completion("df-wc-data").await;
+
+    // Collect output from both nodes.
+    let out_a = coord
+        .collect_output("node-a", "df-wc-data", 0, "results")
+        .await;
+    let out_b = coord
+        .collect_output("node-b", "df-wc-data", 0, "results")
+        .await;
+
+    let mut all_counts: std::collections::HashMap<String, u64> = std::collections::HashMap::new();
+    for (_ts, bytes) in out_a.iter().chain(out_b.iter()) {
+        let batch: Vec<(String, u64)> = bincode::deserialize(bytes).unwrap();
+        for (word, count) in batch {
+            *all_counts.entry(word).or_default() += count;
+        }
+    }
+
+    // Expected: "hello"=2, "world"=3, "rust"=1
+    assert_eq!(all_counts.get("hello"), Some(&2), "hello count");
+    assert_eq!(all_counts.get("world"), Some(&3), "world count");
+    assert_eq!(all_counts.get("rust"), Some(&1), "rust count");
+    assert_eq!(all_counts.len(), 3, "exactly 3 unique words");
+
+    coord.shutdown().await;
+}
