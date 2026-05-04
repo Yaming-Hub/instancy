@@ -705,3 +705,109 @@ async fn stress_tcp_many_epochs() {
     let expected = (num_epochs as usize) * (records_per_epoch as usize) * 2;
     assert_eq!(total, expected, "expected {expected} total records");
 }
+
+// ===========================================================================
+// Iterate (loop/feedback) in cluster mode
+// ===========================================================================
+
+/// Two-node cluster with iterate + exchange — data repartitioned inside a loop.
+///
+/// This tests that `Product<u64, u32>` timestamps (created by iterate) can be
+/// serialized/deserialized across TCP connections. The loop body exchanges data
+/// across nodes each iteration, proving that nested-scope timestamps work with
+/// the network transport layer.
+///
+/// Dataflow: input → iterate(exchange → increment → filter) → output
+/// Data starts at 0..10, increments each round, exits when >= 5.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn tcp_iterate_with_exchange() {
+    use instancy::dataflow::dataflow_builder::IterateResult;
+
+    let topology = ClusterTopology::multi_node(vec![
+        NodeConfig::new("node-a", 1),
+        NodeConfig::new("node-b", 1),
+    ])
+    .unwrap();
+    let dataflow_id = DataflowId::new();
+    let mut conns = make_tcp_connections(&["node-a", "node-b"]).await;
+    let tokio_handle = tokio::runtime::Handle::current();
+
+    let threshold = 5u64;
+
+    let build = move |_worker_idx: usize, builder: &mut DataflowBuilder<u64>| -> Result<()> {
+        let input = builder.input::<u64>("data");
+
+        let result = input.iterate::<u32>("loop", 1u32, move |stream| {
+            // Exchange inside the loop — data bounces between nodes each iteration.
+            let exchanged = stream.exchange_by_hash("route", |x: &u64| *x);
+            let incremented = exchanged.map("incr", |_t, x| x + 1);
+            let feedback = incremented
+                .clone()
+                .filter("keep", move |_t, &x| x < threshold);
+            let output = incremented.filter("done", move |_t, &x| x >= threshold);
+            IterateResult { feedback, output }
+        });
+
+        result.output("results");
+        Ok(())
+    };
+
+    let ha = spawn_node(
+        topology.clone(),
+        "node-a",
+        dataflow_id,
+        conns.remove("node-a").unwrap(),
+        2,
+        tokio_handle.clone(),
+        build,
+    );
+    let hb = spawn_node(
+        topology,
+        "node-b",
+        dataflow_id,
+        conns.remove("node-b").unwrap(),
+        2,
+        tokio_handle,
+        build,
+    );
+
+    let (ra, rb) = tokio::join!(ha, hb);
+    let (_rt_a, mut ca) = ra.unwrap().unwrap();
+    let (_rt_b, mut cb) = rb.unwrap().unwrap();
+
+    let out_a = ca.take_output::<u64>(0, "results").unwrap();
+    let out_b = cb.take_output::<u64>(0, "results").unwrap();
+
+    // Send 0..10 from node-a.
+    let sa = ca.take_input::<u64>(0, "data").unwrap();
+    sa.send(0u64, (0..10).collect()).unwrap();
+    drop(sa);
+
+    // Close node-b input.
+    drop(cb.take_input::<u64>(0, "data").unwrap());
+
+    join_with_timeout(ca).await;
+    join_with_timeout(cb).await;
+
+    // Collect and verify.
+    let mut all: Vec<u64> = out_a
+        .collect_data()
+        .into_iter()
+        .chain(out_b.collect_data().into_iter())
+        .flat_map(|(_, d)| d)
+        .collect();
+    all.sort();
+
+    // Each value v starts at v, increments by 1 per round.
+    // Exits when v + k >= threshold. Final value = threshold for v < threshold,
+    // or v + 1 for v >= threshold (exits after 1 increment).
+    let mut expected: Vec<u64> = (0..10u64)
+        .map(|v| if v < threshold { threshold } else { v + 1 })
+        .collect();
+    expected.sort();
+
+    assert_eq!(
+        all, expected,
+        "iterate+exchange across TCP nodes produced wrong output"
+    );
+}
