@@ -286,8 +286,8 @@ impl RuntimeHandle {
     /// stream.
     ///
     /// ```rust
-    /// use instancy::runtime::{RuntimeConfig, RuntimeHandle};
-    /// use instancy::dataflow::DataflowBuilder;
+    /// use instancy::{RuntimeConfig, RuntimeHandle};
+    /// use instancy::DataflowBuilder;
     ///
     /// // Simulate 4 data partitions.
     /// let partitions: Vec<Vec<i32>> = vec![
@@ -1945,8 +1945,8 @@ impl<T: Timestamp> MultiSpawnedDataflow<T> {
     /// # Example
     ///
     /// ```rust,no_run
-    /// use instancy::dataflow::DataflowBuilder;
-    /// use instancy::runtime::SimpleRuntime;
+    /// use instancy::DataflowBuilder;
+    /// use instancy::SimpleRuntime;
     /// let rt = SimpleRuntime::new();
     /// let mut multi = rt.spawn_multi("ex", 4, |_, b: &mut DataflowBuilder<u64>| {
     ///     b.input::<i32>("data").output("out"); Ok(())

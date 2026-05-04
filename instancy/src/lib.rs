@@ -40,6 +40,10 @@
 //! - `async-io` — async input/output channels
 //! - `test-utils` — helpers for testing dataflow programs
 
+// Enable automatic doc(cfg) annotations on docs.rs builds so that
+// feature-gated items display which feature enables them.
+#![cfg_attr(docsrs, feature(doc_auto_cfg))]
+
 pub mod cancellation;
 pub mod communication;
 pub mod dataflow;
