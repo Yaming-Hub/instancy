@@ -26,7 +26,7 @@ use std::sync::{Arc, Condvar, Mutex};
 use std::sync::atomic::AtomicUsize;
 use std::task::{Context, Poll, Waker};
 
-use crate::cancellation::CancellationToken;
+use crate::cancellation::{CancellationReason, CancellationToken};
 use crate::dataflow::channels::wake::WakeHandle;
 use crate::dataflow::channel_operators::ChannelMode;
 use crate::dataflow::dataflow_builder::{DataflowBuilder, LogicalDataflow};
@@ -139,7 +139,8 @@ impl RuntimeHandle {
     /// once operators observe cancellation and stop producing work.
     /// Full WorkerPool shutdown integration is planned for a future PR.
     pub fn shutdown(&self) {
-        self.cancel.cancel();
+        self.cancel
+            .cancel_with_reason(CancellationReason::RuntimeShutdown);
     }
 
     /// Returns the runtime name.
@@ -635,7 +636,11 @@ impl RuntimeHandle {
                     // Cancel and drop already-prepared workers (they haven't
                     // been registered, so just cancel their tokens).
                     for (w, _, _) in &prepared {
-                        w.cancel();
+                        w.cancel.cancel_with_reason(
+                            CancellationReason::WorkerFailed(
+                                format!("sibling worker {spawned_count} failed to spawn"),
+                            ),
+                        );
                     }
                     return Err(Error::Custom(format!(
                         "failed to spawn worker {spawned_count}: {e}"
@@ -1004,7 +1009,11 @@ impl RuntimeHandle {
                 Ok(worker) => prepared.push(worker),
                 Err(e) => {
                     for (w, _, _) in &prepared {
-                        w.cancel();
+                        w.cancel.cancel_with_reason(
+                            CancellationReason::WorkerFailed(
+                                format!("cluster worker {global_idx} failed to spawn"),
+                            ),
+                        );
                     }
                     return Err(Error::Custom(format!(
                         "failed to spawn cluster worker {global_idx}: {e}"
@@ -1058,7 +1067,8 @@ impl Drop for RuntimeHandle {
     /// that activation completes and the executor rechecks the token. Operators
     /// should avoid unbounded blocking in `activate()`.
     fn drop(&mut self) {
-        self.cancel.cancel();
+        self.cancel
+            .cancel_with_reason(CancellationReason::RuntimeShutdown);
     }
 }
 
@@ -1354,7 +1364,11 @@ impl SimpleRuntime {
                 }
                 Err(e) => {
                     for w in &workers {
-                        w.cancel();
+                        w.cancel.cancel_with_reason(
+                            CancellationReason::WorkerFailed(
+                                format!("sibling worker {spawned_count} failed to spawn"),
+                            ),
+                        );
                     }
                     for w in workers {
                         let _ = w.join_blocking();
@@ -1741,10 +1755,18 @@ impl<T: Timestamp> SpawnedDataflow<T> {
 
     /// Cancel the running dataflow.
     ///
-    /// Signals the executor's cancellation token. The executor will stop
-    /// at the next cancellation check point. Does not block.
+    /// Signals the executor's cancellation token with [`CancellationReason::UserRequested`].
+    /// The executor will stop at the next cancellation check point. Does not block.
     pub fn cancel(&self) {
         self.cancel.cancel();
+    }
+
+    /// Cancel the running dataflow with a specific reason.
+    ///
+    /// Signals the executor's cancellation token. The executor will stop
+    /// at the next cancellation check point. Does not block.
+    pub fn cancel_with_reason(&self, reason: CancellationReason) {
+        self.cancel.cancel_with_reason(reason);
     }
 
     /// Get a completion future for the dataflow.
@@ -1774,7 +1796,8 @@ impl<T: Timestamp> Drop for SpawnedDataflow<T> {
         // Only cancel if join() wasn't called — if it was, completion is None
         // and the caller owns the lifecycle via the returned DataflowCompletion.
         if self.completion.is_some() {
-            self.cancel.cancel();
+            self.cancel
+                .cancel_with_reason(CancellationReason::HandleDropped);
         }
         // Don't block waiting — cancel and detach. The executor will stop
         // at the next cancellation check point.
@@ -2064,6 +2087,13 @@ impl<T: Timestamp> MultiSpawnedDataflow<T> {
         }
     }
 
+    /// Cancel all workers with a specific reason.
+    pub fn cancel_with_reason(&self, reason: CancellationReason) {
+        for w in &self.workers {
+            w.cancel_with_reason(reason.clone());
+        }
+    }
+
     /// Wait for all workers to complete, blocking the current thread.
     ///
     /// Returns `Ok(())` if all workers ran to completion. If any worker
@@ -2081,7 +2111,11 @@ impl<T: Timestamp> MultiSpawnedDataflow<T> {
                         first_error = Some(e);
                         // Cancel all remaining workers directly.
                         for w in &workers {
-                            w.cancel();
+                            w.cancel.cancel_with_reason(
+                                CancellationReason::WorkerFailed(
+                                    "sibling worker failed".into(),
+                                ),
+                            );
                         }
                     }
                     // Continue draining remaining workers (already cancelled).
@@ -2214,6 +2248,16 @@ impl<T: Timestamp> ClusterSpawnedDataflow<T> {
         }
     }
 
+    /// Cancel all local workers with a specific reason and tear down the cluster.
+    pub fn cancel_with_reason(&self, reason: CancellationReason) {
+        self._bridge_cancel.cancel();
+        if let Some(ref inner) = self.inner {
+            for i in 0..inner.num_workers() {
+                inner.workers[i].cancel_with_reason(reason.clone());
+            }
+        }
+    }
+
     /// Take the completion handles from all local workers.
     ///
     /// **Important:** This consumes `self`, which triggers `Drop` and cancels
@@ -2276,7 +2320,11 @@ impl MultiDataflowCompletion {
                         first_error = Some(e);
                         // Cancel remaining workers directly.
                         for cancel in &self.worker_cancels[idx + 1..] {
-                            cancel.cancel();
+                            cancel.cancel_with_reason(
+                                CancellationReason::WorkerFailed(
+                                    "sibling worker failed".into(),
+                                ),
+                            );
                         }
                     }
                 }

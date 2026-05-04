@@ -227,7 +227,7 @@ fn shutdown_cancels_all_running_dataflows() {
     for (i, handle) in spawned.into_iter().enumerate() {
         let result = handle.join_blocking();
         assert!(
-            matches!(&result, Err(Error::Cancelled)),
+            matches!(&result, Err(Error::Cancelled { .. })),
             "dataflow {i} expected Cancelled, got {result:?}"
         );
     }
@@ -295,7 +295,7 @@ fn individual_cancel_preserves_siblings() {
 
     assert!(handle_0.join_blocking().is_ok(), "df_0 should succeed");
     assert!(
-        matches!(handle_1.join_blocking(), Err(Error::Cancelled)),
+        matches!(handle_1.join_blocking(), Err(Error::Cancelled { .. })),
         "df_1 should be Cancelled"
     );
     assert!(handle_2.join_blocking().is_ok(), "df_2 should succeed");

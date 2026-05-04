@@ -511,7 +511,7 @@ impl<T: Timestamp> DataflowExecutor<T> {
     /// Returns `Ok(true)` on normal completion (all operators done).
     /// Returns `Ok(false)` on quiescence (no operator can make progress,
     /// but not all operators are done — e.g., waiting for external input).
-    /// Returns `Err(Error::Cancelled)` if the cancellation token fires.
+    /// Returns `Err(Error::Cancelled { .. })` if the cancellation token fires.
     /// Returns `Err(...)` if any operator produces an error.
     pub fn run(&mut self) -> Result<bool> {
         loop {
@@ -973,7 +973,7 @@ mod tests {
         };
 
         let result = executor.run();
-        assert!(matches!(result, Err(Error::Cancelled)));
+        assert!(matches!(result, Err(Error::Cancelled { .. })));
     }
 
     #[test]
@@ -1488,7 +1488,7 @@ mod tests {
 
         let result = Pin::new(&mut executor).poll(&mut cx);
         match result {
-            Poll::Ready(Err(Error::Cancelled)) => {} // expected
+            Poll::Ready(Err(Error::Cancelled { .. })) => {} // expected
             other => panic!("Expected Cancelled error, got {:?}", other),
         }
     }
