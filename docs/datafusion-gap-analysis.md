@@ -220,6 +220,7 @@ The `WorkerStepMode` enum controls how aggressively workers process data:
 | **G5.1: Cross-worker control channel** | A built-in broadcast channel for control messages (not data). When any worker posts a control message (error, limit reached, cancel), all workers receive it. This replaces the manual `aggregate → broadcast → inspect` pipeline. | **High** |
 | **G5.2: Worker stepping control** | Expose a way for the caller to control how much progress each worker makes per "step" — analogous to `WorkerStepMode`. This is critical for incremental processing where the caller wants to process one timestamp at a time and check results before proceeding. | **Medium** |
 | **G5.3: Branch termination** | Support for early termination of a branch within a dataflow without cancelling the entire dataflow. The `LIMIT` operator needs to signal "stop sending data down this path" while other branches continue. This could be a `terminate_branch(branch_id)` on the cancellation token or a separate mechanism. | **Medium** |
+| **G5.4: Peer-down notification API** | In a multi-node cluster, a peer node may go down. The hosting application is responsible for health monitoring (heartbeat, liveness probes, etc.), but instancy must provide a runtime API that lets the application notify the runtime that a specific peer is unreachable. The runtime should then cancel all dataflows that have workers on the downed peer and surface a clear `PeerDown` error to callers. instancy should NOT attempt to reschedule work to other nodes — the application handles retry on healthy nodes. | **High** |
 
 ---
 
@@ -263,6 +264,7 @@ Several patterns in `ms-datafusion-timely` are DataFusion-specific but reveal ge
 | G4.1 | Operator-level context injection | Eliminates 13-field manual context threading |
 | G4.2 | Error-relay combinator | Eliminates per-operator error match boilerplate |
 | G5.1 | Cross-worker control channel | Eliminates manual control propagation pipeline |
+| G5.4 | Peer-down notification API | Enables graceful cluster failure handling without panic |
 
 ### Should-Have (Medium Priority)
 
