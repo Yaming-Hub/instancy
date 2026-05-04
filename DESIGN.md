@@ -577,7 +577,7 @@ let sender = handle.take_async_input::<i32>("numbers").unwrap();
 sender.send(timestamp, vec![1, 2, 3]).await?;
 
 // Advance the input frontier
-sender.advance_frontier(next_timestamp).await?;
+sender.advance_to(next_timestamp).await?;
 
 // Signal input complete — drops all capabilities
 sender.close();
@@ -2789,6 +2789,64 @@ affecting other dataflows on the same runtime.
 For single-worker dataflows (`num_workers == 1`), no `ControlBroadcast`
 is created — zero overhead. The executor's `control_sender` and
 `control_receiver` fields remain `None`.
+
+---
+
+### 9.10 Async Data Source Integration (`source_async`)
+
+The `source_async` operator allows users to declare a data source at build
+time using an async closure. Unlike the `input()` API where the caller
+manually sends data via an `InputSender`/`AsyncInputSender`, `source_async`
+encapsulates the data-producing logic within the dataflow definition.
+
+#### API
+
+```rust
+#[cfg(feature = "async-io")]
+pub fn source_async<D, F, Fut>(
+    &self,
+    name: impl Into<String>,
+    producer: F,
+) -> Pipe<T, D>
+where
+    D: Clone + Send + 'static,
+    F: FnOnce(AsyncInputSender<T, D>) -> Fut + Send + 'static,
+    Fut: Future<Output = Result<()>> + Send + 'static,
+```
+
+The `producer` receives an `AsyncInputSender` and drives data into the
+dataflow. The runtime manages the producer's lifecycle:
+
+1. **Build time**: The producer closure is stored (type-erased) in the
+   `LogicalDataflow`.
+2. **Spawn time**: A tokio channel is created, a `ChannelSourceOperator`
+   wired to the receiver end, and a **pump thread** spawned to run the
+   producer in a dedicated single-threaded tokio runtime.
+3. **Runtime**: The pump thread executes `producer(sender)`. Data flows
+   through the bounded tokio channel into the operator. Backpressure
+   is natural — `sender.send()` yields when the channel is full.
+4. **Completion**: When the producer returns (Ok or Err), the sender is
+   dropped, closing the channel. The `ChannelSourceOperator` detects
+   disconnection and releases its capability, allowing the dataflow to
+   complete.
+5. **Cancellation**: The pump thread runs in a `tokio::select!` with the
+   dataflow's `CancellationToken`. On cancellation, the sender is dropped
+   immediately, and any in-flight `send()` in the producer returns an error.
+
+#### Frontier propagation
+
+The `ChannelSourceOperator` properly handles `InputEvent::Frontier(t)`
+events by advancing its held capability. When a frontier event arrives,
+the operator drops its capability at the old time and acquires one at the
+new time, allowing downstream frontier-sensitive operators (e.g.,
+`unary_notify`) to fire notifications for completed timestamps.
+
+#### Quiescence tracking
+
+Each `source_async` port increments the `external_inputs_open` counter
+at spawn time (same as `input()` ports). The counter is decremented when
+the pump's sender is dropped and the `ChannelSourceOperator` finishes,
+allowing the executor to detect quiescence and complete.
 
 ---
 

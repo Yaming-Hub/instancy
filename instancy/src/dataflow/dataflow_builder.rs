@@ -110,6 +110,11 @@ struct BuilderState<T: Timestamp> {
     /// for each output() port during spawn(). Each closure creates a
     /// replacement OperatorFactory that sends data out via mpsc channel.
     output_port_wiring: Vec<OutputPortWiring>,
+    /// Type-erased closures for async source ports. Each closure creates a
+    /// ChannelSourceOperator + pump task at spawn time.
+    /// Tuple: (operator_index, wiring_closure).
+    #[cfg(feature = "async-io")]
+    async_source_wiring: Vec<(usize, AsyncSourceWiring)>,
     probes: Vec<(usize, ProbeHandle<T>)>,
     /// Type-erased exchange factory creators — one per exchange edge.
     /// Tuple: (edge_index, capacity, creator_fn).
@@ -155,6 +160,26 @@ pub(crate) type InputPortWiring = Box<
 /// Changed from `FnOnce` to `FnMut` to support multi-worker materialization.
 pub(crate) type OutputPortWiring = Box<
     dyn FnMut(ChannelMode, Option<WakeHandle>) -> (OperatorFactory, Box<dyn std::any::Any + Send>)
+        + Send,
+>;
+
+/// Type-erased closure for wiring an async source during spawn().
+///
+/// Unlike [`InputPortWiring`] (which returns an InputSender for external use),
+/// this returns:
+/// - An OperatorFactory for the ChannelSourceOperator
+/// - A pump closure that drives the user's async producer into the channel
+///
+/// The pump closure is `FnOnce` — the runtime spawns it as a background task.
+/// It captures the user's async producer, the tokio channel sender, and a
+/// `WakeHandle` for notifying the executor.
+#[cfg(feature = "async-io")]
+pub(crate) type AsyncSourceWiring = Box<
+    dyn FnOnce(
+            std::sync::Arc<std::sync::atomic::AtomicUsize>, // external_inputs_open counter
+            WakeHandle,                                      // executor wake handle
+            crate::cancellation::CancellationToken,          // cancellation token
+        ) -> (OperatorFactory, Box<dyn FnOnce() + Send>)    // (factory, pump_task)
         + Send,
 >;
 
@@ -220,6 +245,8 @@ impl<T: Timestamp> DataflowBuilder<T> {
                 output_ports: Vec::new(),
                 input_port_wiring: Vec::new(),
                 output_port_wiring: Vec::new(),
+                #[cfg(feature = "async-io")]
+                async_source_wiring: Vec::new(),
                 probes: Vec::new(),
                 exchange_creators: Vec::new(),
                 #[cfg(feature = "transport")]
@@ -526,6 +553,171 @@ impl<T: Timestamp> DataflowBuilder<T> {
         }
     }
 
+    /// Declare an async source that feeds data from a user-provided producer.
+    ///
+    /// The `producer` receives an [`AsyncInputSender`] and drives data into the
+    /// dataflow asynchronously. The runtime spawns the producer as a background
+    /// task at spawn time and manages its lifecycle (cancellation, cleanup).
+    ///
+    /// Unlike [`input`](Self::input), there is no external sender handle — the
+    /// producer closure **is** the data source.
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// let pipe = builder.source_async::<i32, _, _>("events", |sender| async move {
+    ///     for i in 0..100 {
+    ///         sender.send(0, vec![i]).await?;
+    ///     }
+    ///     Ok(())
+    /// });
+    /// pipe.map("process", |_t, x| x * 2).output("results");
+    /// ```
+    ///
+    /// # Backpressure
+    ///
+    /// The internal channel is bounded. When the downstream dataflow is slower
+    /// than the producer, `sender.send()` yields (returns `Pending`) until
+    /// capacity is available.
+    ///
+    /// # Cancellation
+    ///
+    /// When the dataflow is cancelled, the producer's `sender.send()` will
+    /// return an error (channel closed). The producer should handle this by
+    /// returning from the async block.
+    ///
+    /// # Errors
+    ///
+    /// If the producer returns `Err`, the pump task logs the error and
+    /// closes the channel, causing the source operator to finish gracefully.
+    #[cfg(feature = "async-io")]
+    pub fn source_async<D, F, Fut>(
+        &self,
+        name: impl Into<String>,
+        producer: F,
+    ) -> Pipe<T, D>
+    where
+        D: Clone + Send + 'static,
+        F: FnOnce(crate::dataflow::channel_operators::AsyncInputSender<T, D>) -> Fut + Send + 'static,
+        Fut: std::future::Future<Output = crate::error::Result<()>> + Send + 'static,
+    {
+        let name = name.into();
+        let op_idx;
+        let region_id = RegionId::new(0);
+
+        {
+            let mut state = self.state.borrow_mut();
+            op_idx = state.allocate_operator_index();
+
+            // Register source operator in graph (0 inputs, 1 output)
+            state
+                .graph
+                .register_operator(crate::dataflow::graph::OperatorInfo::new(
+                    op_idx, &name, region_id, 0, 1,
+                ))
+                .expect("operator index unique");
+
+            // Register in subgraph builder with initial capability.
+            let mut initial_cap = ChangeBatch::new();
+            initial_cap.update(T::minimum(), 1);
+            let progress = state.subgraph_builder.add_operator_with_capabilities(
+                op_idx,
+                &name,
+                0,
+                1,
+                PortConnectivity::new(0, 1),
+                vec![initial_cap],
+            );
+            let source_reporter = progress.reporter(0).clone();
+
+            // Create async source wiring closure. At spawn time, this creates
+            // the tokio channel + ChannelSourceOperator + pump task.
+            let wiring_name = name.clone();
+            let channel_cap = state.channel_capacity;
+            let wiring: AsyncSourceWiring = Box::new(move |external_inputs_open, wake_handle, cancel| {
+                use crate::dataflow::channel_operators::{AsyncInputSender, ChannelSourceOperator, InputRecv};
+
+                let (tx, rx) = tokio::sync::mpsc::channel::<InputEvent<T, D>>(channel_cap);
+                let sender = AsyncInputSender::with_wake_handle(tx, wake_handle.clone());
+
+                let ext_counter = std::sync::Arc::clone(&external_inputs_open);
+                let factory_name = wiring_name.clone();
+                let reporter = source_reporter.clone();
+                let factory: OperatorFactory = single_use_factory(move |_ctx, endpoints| {
+                    let output_pusher: Box<dyn Push<T, D>> = {
+                        let pushers: Vec<Box<dyn Push<T, D>>> = endpoints
+                            .output_pushers
+                            .into_iter()
+                            .map(|any_box| {
+                                *any_box
+                                    .downcast::<Box<dyn Push<T, D>>>()
+                                    .expect("async source output pusher type mismatch")
+                            })
+                            .collect();
+                        tee_or_single(pushers).unwrap_or_else(|| Box::new(NullPush))
+                    };
+                    let op = ChannelSourceOperator::new(
+                        factory_name,
+                        op_idx,
+                        RegionId::new(0),
+                        InputRecv::Tokio(rx),
+                        output_pusher,
+                        Some(reporter),
+                        ext_counter,
+                    );
+                    Box::new(op) as Box<dyn SchedulableOperator>
+                });
+
+                // Build pump task: runs the user's producer in a small tokio runtime.
+                let pump_wake = wake_handle;
+                let pump: Box<dyn FnOnce() + Send> = Box::new(move || {
+                    let rt = tokio::runtime::Builder::new_current_thread()
+                        .enable_all()
+                        .build()
+                        .expect("failed to create pump runtime");
+                    rt.block_on(async move {
+                        // Run producer with cancellation support.
+                        tokio::select! {
+                            biased;
+                            _ = cancel.cancelled_async() => {
+                                // Dataflow cancelled — drop sender to close channel.
+                            }
+                            result = producer(sender) => {
+                                if let Err(e) = result {
+                                    // Producer returned an error. Log it and close the
+                                    // channel by dropping sender, causing the
+                                    // ChannelSourceOperator to finish gracefully.
+                                    #[cfg(feature = "tracing")]
+                                    tracing::warn!(
+                                        source = %wiring_name,
+                                        error = %e,
+                                        "async source producer failed"
+                                    );
+                                    let _ = e; // suppress unused warning when tracing is off
+                                }
+                                // On success, sender is dropped here too, which
+                                // closes the channel and signals completion.
+                            }
+                        }
+                        // Notify executor that the source has finished/changed.
+                        pump_wake.notify();
+                    });
+                });
+
+                (factory, pump)
+            });
+            state.async_source_wiring.push((op_idx, wiring));
+        }
+
+        Pipe {
+            state: Rc::clone(&self.state),
+            op_idx,
+            output_slot: 0,
+            capacity_override: None,
+            _phantom: PhantomData,
+        }
+    }
+
     /// Get the number of registered operators.
     pub fn operator_count(&self) -> usize {
         self.state.borrow().next_operator_index - 1
@@ -575,6 +767,8 @@ impl<T: Timestamp> DataflowBuilder<T> {
             output_ports: state.output_ports,
             input_port_wiring: state.input_port_wiring,
             output_port_wiring: state.output_port_wiring,
+            #[cfg(feature = "async-io")]
+            async_source_wiring: state.async_source_wiring,
             probes: state.probes,
             exchange_creators: state.exchange_creators,
             #[cfg(feature = "transport")]
@@ -1320,6 +1514,8 @@ impl<T: Timestamp, D: Clone + Send + 'static> Pipe<T, D> {
                 output_ports: Vec::new(),
                 input_port_wiring: Vec::new(),
                 output_port_wiring: Vec::new(),
+                #[cfg(feature = "async-io")]
+                async_source_wiring: Vec::new(),
                 probes: Vec::new(),
                 exchange_creators: Vec::new(),
                 #[cfg(feature = "transport")]
@@ -2643,6 +2839,11 @@ pub struct LogicalDataflow<T: Timestamp> {
     pub(crate) output_ports: Vec<OutputPortInfo>,
     pub(crate) input_port_wiring: Vec<InputPortWiring>,
     pub(crate) output_port_wiring: Vec<OutputPortWiring>,
+    /// Async source pump wiring — one per `source_async()` call.
+    /// Consumed at spawn time to create pump tasks.
+    /// Tuple: (operator_index, wiring_closure).
+    #[cfg(feature = "async-io")]
+    pub(crate) async_source_wiring: Vec<(usize, AsyncSourceWiring)>,
     pub(crate) probes: Vec<(usize, ProbeHandle<T>)>,
     /// Type-erased exchange factory creators — one per exchange edge.
     /// Consumed by `spawn_multi` to produce shared cross-worker channel factories.

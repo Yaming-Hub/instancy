@@ -349,6 +349,29 @@ impl CancellationToken {
     pub fn drop_guard(self) -> CancellationGuard {
         CancellationGuard { token: Some(self) }
     }
+
+    /// Returns a future that resolves when this token is cancelled.
+    ///
+    /// Polls the cancellation flag with a small interval. Suitable for use
+    /// in `tokio::select!` branches to respond to cancellation in async code.
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// tokio::select! {
+    ///     _ = token.cancelled_async() => { /* cancelled */ }
+    ///     result = do_work() => { /* completed */ }
+    /// }
+    /// ```
+    #[cfg(feature = "async-io")]
+    pub async fn cancelled_async(&self) {
+        loop {
+            if self.is_cancelled() {
+                return;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    }
 }
 
 impl Default for CancellationToken {

@@ -31,7 +31,7 @@
 //! drops it only when all data is emitted. This means the input frontier advances
 //! past ALL epochs at once (when the source finishes), so all notifications fire
 //! together. In a real streaming system with incremental frontier advancement
-//! (e.g., using `AsyncInputSender::advance_frontier()`), notifications would fire
+//! (e.g., using `AsyncInputSender::advance_to()`), notifications would fire
 //! per-epoch as each epoch completes. The aggregation pattern is identical either
 //! way — the operator correctly buffers and emits per-epoch regardless of when
 //! notifications fire.

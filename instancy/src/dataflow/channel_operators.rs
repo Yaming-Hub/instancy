@@ -26,6 +26,7 @@ use crate::dataflow::region::RegionId;
 use crate::dataflow::schedulable::{ActivationOutcome, SchedulableOperator};
 use crate::error::Result;
 use crate::progress::operate::ProgressReporter;
+use crate::order::PartialOrder;
 use crate::progress::timestamp::Timestamp;
 
 // ---------------------------------------------------------------------------
@@ -133,6 +134,9 @@ pub struct ChannelSourceOperator<T: Timestamp, D: Send + 'static> {
     pending_output: VecDeque<Envelope<T, D>>,
     progress_reporter: Option<ProgressReporter<T>>,
     external_inputs_open: Arc<AtomicUsize>,
+    /// The timestamp of the currently held capability. Starts at T::minimum()
+    /// and advances when Frontier events are received.
+    current_capability: T,
     done: bool,
 }
 
@@ -156,6 +160,7 @@ impl<T: Timestamp, D: Send + 'static> ChannelSourceOperator<T, D> {
             pending_output: VecDeque::new(),
             progress_reporter,
             external_inputs_open,
+            current_capability: T::minimum(),
             done: false,
         }
     }
@@ -181,9 +186,9 @@ impl<T: Timestamp, D: Send + 'static> ChannelSourceOperator<T, D> {
         if self.done {
             return;
         }
-        // Release the initial capability
+        // Release the currently held capability
         if let Some(ref reporter) = self.progress_reporter {
-            reporter.update(T::minimum(), -1);
+            reporter.update(self.current_capability.clone(), -1);
         }
         self.output_pusher.close();
         self.done = true;
@@ -204,16 +209,25 @@ impl<T: Timestamp, D: Send + 'static> SchedulableOperator for ChannelSourceOpera
         }
 
         // Poll the channel for new events (non-blocking).
-        // We drain all available events in one activation to maximize throughput.
+        // We cap per-activation work to avoid starving other operators in the
+        // cooperative executor. The cap applies to data events; frontier and
+        // control events are lightweight and don't count.
+        const ACTIVATION_BUDGET: usize = 1024;
         let mut made_progress = false;
+        let mut data_events = 0usize;
 
         loop {
+            if data_events >= ACTIVATION_BUDGET {
+                // Yield to the scheduler so other operators get a turn.
+                break;
+            }
             match self.receiver.try_recv() {
                 Ok(InputEvent::Data { time, data }) => {
                     let envelope = Envelope::data(time, data);
                     match self.output_pusher.try_push(envelope) {
                         Ok(()) => {
                             made_progress = true;
+                            data_events += 1;
                         }
                         Err((crate::error::Error::Backpressure, returned)) => {
                             self.pending_output.push_back(returned);
@@ -222,10 +236,29 @@ impl<T: Timestamp, D: Send + 'static> SchedulableOperator for ChannelSourceOpera
                         Err((e, _)) => return Err(e),
                     }
                 }
-                Ok(InputEvent::Frontier(_time)) => {
-                    // Frontier advancement — for now we don't propagate frontier
-                    // events through the progress system (requires deeper integration).
-                    // The operator simply advances when all data is received.
+                Ok(InputEvent::Frontier(time)) => {
+                    // Advance the held capability to the new frontier time.
+                    // This releases the old capability and acquires a new one,
+                    // allowing downstream frontier-sensitive operators (e.g.
+                    // unary_notify) to fire notifications for completed times.
+                    //
+                    // Frontier must advance monotonically: the new time must be
+                    // >= the current capability in the partial order.
+                    if let Some(ref reporter) = self.progress_reporter {
+                        if self.current_capability.less_than(&time) {
+                            reporter.update(self.current_capability.clone(), -1);
+                            reporter.update(time.clone(), 1);
+                            self.current_capability = time;
+                        } else if time != self.current_capability {
+                            // Non-monotonic frontier: new time is incomparable or
+                            // less than current. This is a protocol violation.
+                            #[cfg(feature = "tracing")]
+                            tracing::warn!(
+                                operator = %self.name,
+                                "ignoring non-monotonic frontier advancement"
+                            );
+                        }
+                    }
                     made_progress = true;
                 }
                 Err(RecvError::Empty) => {
@@ -428,7 +461,7 @@ impl<T: Timestamp, D: Send + 'static> SchedulableOperator for ChannelSinkOperato
 /// or when [`close()`](Self::close) is called on this instance.
 ///
 /// When a `WakeHandle` is wired (set during runtime spawn), every `send()`,
-/// `advance_frontier()`, and `Drop` notifies the executor's wake handle so
+/// `advance_to()`, and `Drop` notifies the executor's wake handle so
 /// that a sleeping async executor wakes promptly when external data arrives.
 #[derive(Clone, Debug)]
 pub struct InputSender<T: Timestamp, D: Send + 'static> {
@@ -473,10 +506,22 @@ impl<T: Timestamp, D: Send + 'static> InputSender<T, D> {
         Ok(())
     }
 
-    /// Advance the input frontier past the given timestamp.
+    /// Advance the input frontier to `time`.
     ///
-    /// After this call, no `send()` with `time <= frontier` should be made.
-    pub fn advance_frontier(&self, time: T) -> Result<()> {
+    /// This declares that all data for timestamps **before** `time` has been
+    /// sent. After this call, only `send()` with timestamps `>= time` is
+    /// valid. Downstream `unary_notify` operators will receive notifications
+    /// for any completed timestamps.
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// sender.send(0, vec![data_for_epoch_0]).unwrap();
+    /// sender.advance_to(1).unwrap(); // epoch 0 is now sealed
+    /// sender.send(1, vec![data_for_epoch_1]).unwrap();
+    /// sender.advance_to(2).unwrap(); // epoch 1 is now sealed
+    /// ```
+    pub fn advance_to(&self, time: T) -> Result<()> {
         self.sender
             .send(InputEvent::frontier(time))
             .map_err(|_| crate::error::Error::Custom("dataflow has terminated".into()))?;
@@ -563,7 +608,7 @@ impl<T: Timestamp, D: Send + 'static> OutputReceiver<T, D> {
 /// is full (backpressure) instead of blocking the calling thread.
 ///
 /// When a `WakeHandle` is wired (set during runtime spawn), every `send()`,
-/// `advance_frontier()`, and `Drop` notifies the executor's wake handle so
+/// `advance_to()`, and `Drop` notifies the executor's wake handle so
 /// that a sleeping async executor wakes promptly when external data arrives.
 #[cfg(feature = "async-io")]
 #[derive(Clone)]
@@ -604,10 +649,22 @@ impl<T: Timestamp, D: Send + 'static> AsyncInputSender<T, D> {
         Ok(())
     }
 
-    /// Advance the input frontier past the given timestamp.
+    /// Advance the input frontier to `time`.
     ///
-    /// After this call, no `send()` with `time <= frontier` should be made.
-    pub async fn advance_frontier(&self, time: T) -> Result<()> {
+    /// This declares that all data for timestamps **before** `time` has been
+    /// sent. After this call, only `send()` with timestamps `>= time` is
+    /// valid. Downstream `unary_notify` operators will receive notifications
+    /// for any completed timestamps.
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// sender.send(0, vec![data_for_epoch_0]).await?;
+    /// sender.advance_to(1).await?; // epoch 0 is now sealed
+    /// sender.send(1, vec![data_for_epoch_1]).await?;
+    /// sender.advance_to(2).await?; // epoch 1 is now sealed
+    /// ```
+    pub async fn advance_to(&self, time: T) -> Result<()> {
         self.sender
             .send(InputEvent::frontier(time))
             .await

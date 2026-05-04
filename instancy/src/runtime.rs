@@ -448,7 +448,16 @@ impl RuntimeHandle {
         parent_cancel: Option<CancellationToken>,
         control_broadcast: Option<(ControlSender, ControlReceiver)>,
     ) -> Result<(SpawnedDataflow<T>, Pin<Box<DataflowExecutor<T>>>, CompletionNotifier)> {
-        if dataflow.operator_factories.is_empty() && dataflow.input_port_wiring.is_empty() {
+        let has_async_sources;
+        #[cfg(feature = "async-io")]
+        { has_async_sources = !dataflow.async_source_wiring.is_empty(); }
+        #[cfg(not(feature = "async-io"))]
+        { has_async_sources = false; }
+
+        if dataflow.operator_factories.is_empty()
+            && dataflow.input_port_wiring.is_empty()
+            && !has_async_sources
+        {
             return Err(Error::Custom("cannot spawn an empty dataflow".into()));
         }
 
@@ -469,7 +478,7 @@ impl RuntimeHandle {
         // --- Wire input ports ---
         let mut input_senders: Vec<(String, &'static str, Box<dyn std::any::Any + Send>)> =
             Vec::new();
-        let input_count = dataflow.input_port_wiring.len();
+        let mut input_count = dataflow.input_port_wiring.len();
 
         // TODO(multi-worker): Input/output port wiring closures are FnMut (callable
         // N times) but the Vec is still drain()'d here, consuming ownership. PR 39 will
@@ -487,6 +496,24 @@ impl RuntimeHandle {
                 .operator_factories
                 .push((info.operator_index, factory));
             input_senders.push((info.name.clone(), info.type_name, sender_any));
+        }
+
+        // --- Wire async source ports ---
+        #[cfg(feature = "async-io")]
+        let mut pump_tasks: Vec<Box<dyn FnOnce() + Send>> = Vec::new();
+        #[cfg(feature = "async-io")]
+        {
+            let async_count = dataflow.async_source_wiring.len();
+            input_count += async_count;
+            for (op_idx, wiring) in dataflow.async_source_wiring.drain(..) {
+                let (factory, pump) = wiring(
+                    Arc::clone(&external_inputs_open),
+                    wake_handle.clone(),
+                    cancel.clone(),
+                );
+                dataflow.operator_factories.push((op_idx, factory));
+                pump_tasks.push(pump);
+            }
         }
 
         // --- Wire output ports ---
@@ -523,6 +550,15 @@ impl RuntimeHandle {
         }
 
         let (completion, notifier) = DataflowCompletion::new();
+
+        // --- Spawn async source pump tasks ---
+        #[cfg(feature = "async-io")]
+        for (pump_idx, pump) in pump_tasks.into_iter().enumerate() {
+            std::thread::Builder::new()
+                .name(format!("source-pump-{}-{}", name, pump_idx))
+                .spawn(pump)
+                .map_err(|e| Error::Custom(format!("failed to spawn pump thread: {e}")))?;
+        }
 
         let spawned = SpawnedDataflow {
             name,
@@ -1249,6 +1285,11 @@ impl SimpleRuntime {
         worker_context: WorkerContext,
     ) -> Result<SpawnedDataflow<T>> {
         if dataflow.operator_factories.is_empty() && dataflow.input_port_wiring.is_empty() {
+            #[cfg(feature = "async-io")]
+            if dataflow.async_source_wiring.is_empty() {
+                return Err(Error::Custom("cannot spawn an empty dataflow".into()));
+            }
+            #[cfg(not(feature = "async-io"))]
             return Err(Error::Custom("cannot spawn an empty dataflow".into()));
         }
 
@@ -1268,7 +1309,7 @@ impl SimpleRuntime {
         // --- Wire input ports ---
         let mut input_senders: Vec<(String, &'static str, Box<dyn std::any::Any + Send>)> =
             Vec::new();
-        let input_count = dataflow.input_port_wiring.len();
+        let mut input_count = dataflow.input_port_wiring.len();
 
         for (info, mut wiring) in dataflow
             .input_ports
@@ -1281,6 +1322,24 @@ impl SimpleRuntime {
                 .operator_factories
                 .push((info.operator_index, factory));
             input_senders.push((info.name.clone(), info.type_name, sender_any));
+        }
+
+        // --- Wire async source ports ---
+        #[cfg(feature = "async-io")]
+        let mut pump_tasks: Vec<Box<dyn FnOnce() + Send>> = Vec::new();
+        #[cfg(feature = "async-io")]
+        {
+            let async_count = dataflow.async_source_wiring.len();
+            input_count += async_count;
+            for (op_idx, wiring) in dataflow.async_source_wiring.drain(..) {
+                let (factory, pump) = wiring(
+                    Arc::clone(&external_inputs_open),
+                    wake_handle.clone(),
+                    cancel.clone(),
+                );
+                dataflow.operator_factories.push((op_idx, factory));
+                pump_tasks.push(pump);
+            }
         }
 
         // --- Wire output ports ---
@@ -1312,6 +1371,15 @@ impl SimpleRuntime {
         executor.replace_external_inputs_counter(external_inputs_open);
 
         let (completion, notifier) = DataflowCompletion::new();
+
+        // --- Spawn async source pump tasks ---
+        #[cfg(feature = "async-io")]
+        for (pump_idx, pump) in pump_tasks.into_iter().enumerate() {
+            std::thread::Builder::new()
+                .name(format!("source-pump-{}-{}", name, pump_idx))
+                .spawn(pump)
+                .map_err(|e| Error::Custom(format!("failed to spawn pump thread: {e}")))?;
+        }
 
         std::thread::Builder::new()
             .name(format!("dataflow-{}", name))
@@ -2892,7 +2960,7 @@ mod tests {
         let mut receiver = handle.take_async_output::<i32>("out").unwrap();
 
         sender.send(0, vec![1, 2, 3]).await.unwrap();
-        sender.advance_frontier(0).await.unwrap();
+        sender.advance_to(0).await.unwrap();
         sender.close();
 
         let results = receiver.collect_data().await;
@@ -2961,7 +3029,7 @@ mod tests {
 
         sender.send(0, vec![10, 20]).await.unwrap();
         sender.send(1, vec![30, 40]).await.unwrap();
-        sender.advance_frontier(1).await.unwrap();
+        sender.advance_to(1).await.unwrap();
         sender.close();
 
         let results = receiver.collect_data().await;
@@ -2997,7 +3065,7 @@ mod tests {
         // Both clones can send data
         sender1.send(0, vec![1]).await.unwrap();
         sender2.send(0, vec![2]).await.unwrap();
-        sender1.advance_frontier(0).await.unwrap();
+        sender1.advance_to(0).await.unwrap();
         drop(sender1);
         drop(sender2); // channel closes when all clones drop
 
@@ -3597,7 +3665,7 @@ mod tests {
     // NOTE: With channel-fed inputs (take_input/send/close), all notifications
     // fire at end-of-stream when the input frontier is exhausted. Testing
     // mid-stream frontier-driven notification timing requires AsyncInputSender
-    // with explicit advance_frontier() calls — a scenario for future tests.
+    // with explicit advance_to() calls — a scenario for future tests.
     //
     // IMPORTANT: With multi-worker exchange, data for the same timestamp from
     // different source workers may arrive in separate activations. This means
@@ -4465,5 +4533,156 @@ mod tests {
 
         // LimitReached should NOT cancel the token
         assert!(!df_cancel.is_cancelled());
+    }
+
+    // -----------------------------------------------------------------------
+    // source_async tests
+    // -----------------------------------------------------------------------
+
+    #[cfg(feature = "async-io")]
+    #[test]
+    fn source_async_basic_roundtrip() {
+        use crate::dataflow::DataflowBuilder;
+
+        let rt = SimpleRuntime::new();
+        let builder = DataflowBuilder::<u64>::new("async_src");
+        let pipe = builder.source_async::<i32, _, _>("gen", |sender| async move {
+            sender.send(0, vec![1, 2, 3]).await?;
+            sender.send(1, vec![4, 5]).await?;
+            Ok(())
+        });
+        pipe.map("double", |_t, x| x * 2).output("out");
+        let dataflow = builder.build().unwrap();
+
+        let mut handle = rt.spawn(dataflow).unwrap();
+        let receiver = handle.take_output::<i32>("out").unwrap();
+        let data: Vec<i32> = receiver
+            .collect_data()
+            .into_iter()
+            .flat_map(|(_, d)| d)
+            .collect();
+
+        let mut sorted = data.clone();
+        sorted.sort();
+        assert_eq!(sorted, vec![2, 4, 6, 8, 10]);
+        handle.join_blocking().unwrap();
+    }
+
+    #[cfg(feature = "async-io")]
+    #[test]
+    fn source_async_empty_producer() {
+        use crate::dataflow::DataflowBuilder;
+
+        let rt = SimpleRuntime::new();
+        let builder = DataflowBuilder::<u64>::new("empty_src");
+        let pipe = builder.source_async::<i32, _, _>("gen", |_sender| async move {
+            // Produce nothing — just return immediately.
+            Ok(())
+        });
+        pipe.output("out");
+        let dataflow = builder.build().unwrap();
+
+        let mut handle = rt.spawn(dataflow).unwrap();
+        let receiver = handle.take_output::<i32>("out").unwrap();
+        let data: Vec<(u64, Vec<i32>)> = receiver.collect_data();
+        assert!(data.is_empty() || data.iter().all(|(_, v)| v.is_empty()));
+        handle.join_blocking().unwrap();
+    }
+
+    #[cfg(feature = "async-io")]
+    #[test]
+    fn source_async_cancellation() {
+        use crate::dataflow::DataflowBuilder;
+
+        let rt = SimpleRuntime::new();
+        let builder = DataflowBuilder::<u64>::new("cancel_src");
+        let pipe = builder.source_async::<i32, _, _>("gen", |sender| async move {
+            // Infinite producer — should be stopped by cancellation.
+            let mut i = 0;
+            loop {
+                if sender.send(0, vec![i]).await.is_err() {
+                    break;
+                }
+                i += 1;
+            }
+            Ok(())
+        });
+        pipe.output("out");
+        let dataflow = builder.build().unwrap();
+
+        let handle = rt.spawn(dataflow).unwrap();
+        // Cancel after a short delay.
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        handle.cancel();
+        // Should complete without hanging.
+        let _ = handle.join_blocking();
+    }
+
+    #[cfg(feature = "async-io")]
+    #[test]
+    fn source_async_with_runtime_handle() {
+        use crate::dataflow::DataflowBuilder;
+
+        let rt = RuntimeHandle::new(RuntimeConfig {
+            worker_threads: 2,
+            ..RuntimeConfig::default()
+        })
+        .unwrap();
+
+        let builder = DataflowBuilder::<u64>::new("rt_async_src");
+        let pipe = builder.source_async::<i32, _, _>("gen", |sender| async move {
+            for i in 0..5 {
+                sender.send(0, vec![i]).await?;
+            }
+            Ok(())
+        });
+        pipe.map("inc", |_t, x| x + 100).output("out");
+        let dataflow = builder.build().unwrap();
+
+        let mut handle = rt.spawn(dataflow).unwrap();
+        let receiver = handle.take_output::<i32>("out").unwrap();
+        let data: Vec<i32> = receiver
+            .collect_data()
+            .into_iter()
+            .flat_map(|(_, d)| d)
+            .collect();
+
+        let mut sorted = data;
+        sorted.sort();
+        assert_eq!(sorted, vec![100, 101, 102, 103, 104]);
+        handle.join_blocking().unwrap();
+    }
+
+    #[cfg(feature = "async-io")]
+    #[test]
+    fn source_async_with_frontier_advancement() {
+        use crate::dataflow::DataflowBuilder;
+
+        let rt = SimpleRuntime::new();
+        let builder = DataflowBuilder::<u64>::new("frontier_src");
+        let pipe = builder.source_async::<i32, _, _>("gen", |sender| async move {
+            sender.send(0, vec![10]).await?;
+            sender.advance_to(1).await?;
+            sender.send(1, vec![20]).await?;
+            sender.advance_to(2).await?;
+            sender.send(2, vec![30]).await?;
+            Ok(())
+        });
+        pipe.output("out");
+        let dataflow = builder.build().unwrap();
+
+        let mut handle = rt.spawn(dataflow).unwrap();
+        let receiver = handle.take_output::<i32>("out").unwrap();
+        let data: Vec<(u64, Vec<i32>)> = receiver.collect_data();
+
+        // Verify all timestamps and data are present.
+        let all_data: Vec<(u64, i32)> = data
+            .into_iter()
+            .flat_map(|(t, vs)| vs.into_iter().map(move |v| (t, v)))
+            .collect();
+        assert!(all_data.contains(&(0, 10)));
+        assert!(all_data.contains(&(1, 20)));
+        assert!(all_data.contains(&(2, 30)));
+        handle.join_blocking().unwrap();
     }
 }

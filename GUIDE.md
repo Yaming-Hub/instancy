@@ -258,6 +258,36 @@ sender.close();  // Signal no more data — this is critical for termination!
 
 **Important**: Always close your inputs when done. If you forget, the dataflow will wait forever for more data. Dropping the sender also closes the input.
 
+### Async Sources (feature: `async-io`)
+
+An **async source** lets you define the data-producing logic at build time
+using an async closure. The runtime manages the producer's lifecycle —
+no manual sender management needed:
+
+```rust
+use instancy::DataflowBuilder;
+
+let builder = DataflowBuilder::<u64>::new("pipeline");
+let stream = builder.source_async::<i32, _, _>("events", |sender| async move {
+    // Produce data from any async source — database, API, file, etc.
+    for batch_id in 0..10u64 {
+        let data: Vec<i32> = fetch_batch(batch_id).await;
+        sender.send(batch_id, data).await?;
+        sender.advance_to(batch_id + 1).await?;
+    }
+    Ok(())
+});
+stream.map("process", |_t, x| x * 2).output("results");
+```
+
+Key differences from `input()`:
+- **Self-contained**: The producer closure runs automatically — no external sender to manage.
+- **Backpressure**: `sender.send()` yields when the internal channel is full.
+- **Cancellation**: When the dataflow is cancelled, `send()` returns an error.
+- **Frontier support**: Call `sender.advance_to(t)` to advance the input frontier, enabling downstream `unary_notify` operators to fire notifications.
+
+The async source works with both `SimpleRuntime` and `RuntimeHandle`.
+
 ### Observing Outputs
 
 The simplest way to observe data is with a pass-through `map` that logs:
