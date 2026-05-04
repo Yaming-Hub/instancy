@@ -17,7 +17,15 @@ instancy retains the core concepts of timely dataflow — timestamps, frontiers,
 
 ## Quick Start
 
-Add to your `Cargo.toml` (not yet published on crates.io):
+Add to your `Cargo.toml`:
+
+```toml
+[dependencies]
+instancy = "0.1"
+tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
+```
+
+Or use the git dependency for the latest development version:
 
 ```toml
 [dependencies]

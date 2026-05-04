@@ -1585,6 +1585,7 @@ impl<T: Timestamp, D: Clone + Send + 'static> Pipe<T, D> {
             // replacement factory during spawn(). This replaces the
             // CollectingSink factory above with one that sends data out.
             let sink_name = name.clone();
+            #[allow(unused_variables)]
             let wiring: OutputPortWiring = Box::new(move |mode, wake_handle| {
                 use crate::dataflow::channel_operators::{ChannelSinkOperator, OutputReceiver, OutputSend};
 
