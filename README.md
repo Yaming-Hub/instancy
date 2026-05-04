@@ -254,37 +254,59 @@ Run any example with (from the workspace root):
 cargo run -p instancy --example <name>
 ```
 
+**Getting Started**
+
 | Example | Description |
 |---|---|
 | `hello_dataflow` | Minimal source → output pipeline |
 | `simple_pipeline` | Multi-stage pipeline with map/filter |
-| `wordcount` | Stateful streaming word count |
 | `spawn_pipeline` | Background execution with channel I/O |
-| `exchange_wordcount` | Multi-worker word count with exchange |
+| `async_spawn` | End-to-end async dataflow with async I/O *(requires `--features async-io`)* |
+| `event_driven` | Real-time event processing with channel-based I/O |
+
+**Operators & Patterns**
+
+| Example | Description |
+|---|---|
+| `wordcount` | Stateful streaming word count |
 | `distinct` | Deduplicate elements per timestamp |
 | `hashjoin` | Two-stream hash join |
+| `branching_pipeline` | Fan-out: one stream feeding independent pipelines |
+| `merge_streams` | Binary and concat operators for merging streams |
+| `probe` | Using `ProbeHandle` to observe frontier progress |
+| `cancellation` | Cooperative cancellation with `CancellationToken` |
+
+**Multi-Worker & Exchange**
+
+| Example | Description |
+|---|---|
+| `exchange` | Hash-based data repartitioning across workers |
+| `exchange_wordcount` | Multi-worker word count with exchange |
+| `notify_wordcount` | Frontier-based aggregation for distributed word count |
+| `notify_epoch_stats` | Multi-epoch frontier-based aggregation for statistics |
+| `partitioned_workers` | Partitioned input with multiple logical workers |
+
+**Loops & Graph Algorithms**
+
+| Example | Description |
+|---|---|
 | `loop_demo` | Feedback loop with iterate |
+| `pingpong` | Data elements circulating through a feedback loop |
+| `barrier` | Progress tracking through many iterations with minimal data |
 | `bfs` | Breadth-first search on a graph |
 | `pagerank` | Iterative PageRank algorithm |
-| `unionfind` | Union-find with iterate + exchange |
-| `barrier` | Iterate loop benchmark |
-| `pingpong` | Data feedback loop |
-| `exchange` | Exchange routing verification |
-| `branching_pipeline` | Stream splitting with branch |
-| `cancellation` | Cooperative cancellation |
-| `probe` | Frontier tracking with probe |
-| `notify_wordcount` | Word count using unary_notify |
-| `notify_epoch_stats` | Multi-epoch aggregation with notifications |
-| `partitioned_workers` | Multi-worker execution |
-| `event_driven` | Event-driven processing patterns |
-| `merge_streams` | Merging multiple streams with concat |
-| `runtime_isolation` | Multiple isolated runtimes |
-| `async_spawn` | Async dataflow spawning (requires `--features async-io`) |
+| `unionfind` | Streaming union-find connected components |
+
+**Runtime**
+
+| Example | Description |
+|---|---|
+| `runtime_isolation` | Multiple isolated `RuntimeHandle` instances in one process |
 
 ## Testing
 
 ```bash
-# Run all tests (1009 tests)
+# Run all tests
 cargo test --all-features -- --test-threads=4
 
 # Run without transport feature
@@ -299,7 +321,7 @@ cargo test --all-features --test cluster_tcp
 | File | Description |
 |---|---|
 | `tests/cluster.rs` | Multi-node cluster tests with in-memory transport |
-| `tests/cluster_tcp.rs` | TCP-based cluster tests (10 tests) |
+| `tests/cluster_tcp.rs` | TCP-based cluster integration tests |
 | `tests/parallel_dataflows.rs` | Shared worker pool correctness |
 | `tests/parallel_cluster_tcp.rs` | Parallel TCP dataflows on shared connections |
 | `tests/multi_dataflow.rs` | Multiple dataflows on one runtime |
