@@ -111,14 +111,16 @@ struct BuilderState<T: Timestamp> {
     output_port_wiring: Vec<OutputPortWiring>,
     probes: Vec<(usize, ProbeHandle<T>)>,
     /// Type-erased exchange factory creators — one per exchange edge.
+    /// Tuple: (edge_index, capacity, creator_fn).
     exchange_creators:
-        Vec<(usize, crate::dataflow::channels::exchange_channel::ExchangeFactoryCreatorFn)>,
+        Vec<(usize, usize, crate::dataflow::channels::exchange_channel::ExchangeFactoryCreatorFn)>,
     /// Network-capable exchange creators — one per exchange edge (transport feature only).
     /// Stored by `Pipe::exchange` when `transport` feature is enabled.
     /// Used by `spawn_cluster` to create network-backed exchange factories.
+    /// Tuple: (edge_index, capacity, creator).
     #[cfg(feature = "transport")]
     exchange_network_creators:
-        Vec<(usize, Box<dyn crate::dataflow::channels::exchange_channel::NetworkExchangeCreator>)>,
+        Vec<(usize, usize, Box<dyn crate::dataflow::channels::exchange_channel::NetworkExchangeCreator>)>,
     next_operator_index: usize,
     next_collect_index: usize,
     channel_capacity: usize,
@@ -379,6 +381,7 @@ impl<T: Timestamp> DataflowBuilder<T> {
             state: Rc::clone(&self.state),
             op_idx,
             output_slot: 0,
+            capacity_override: None,
             _phantom: PhantomData,
         }
     }
@@ -450,6 +453,7 @@ impl<T: Timestamp> DataflowBuilder<T> {
             state: Rc::clone(&self.state),
             op_idx,
             output_slot: 0,
+            capacity_override: None,
             _phantom: PhantomData,
         }
     }
@@ -531,15 +535,23 @@ pub struct Pipe<T: Timestamp, D: Clone + Send + 'static> {
     state: Rc<RefCell<BuilderState<T>>>,
     op_idx: usize,
     output_slot: usize,
+    /// Per-edge capacity override for the next downstream channel.
+    /// When `Some(n)`, the next edge-creating operation uses `n` instead
+    /// of `DataflowBuilderConfig::channel_capacity`. Consumed on use;
+    /// not propagated to the returned Pipe. Cleared on `clone()`.
+    capacity_override: Option<usize>,
     _phantom: PhantomData<D>,
 }
 
 impl<T: Timestamp, D: Clone + Send + 'static> Clone for Pipe<T, D> {
+    /// Clone this Pipe handle. The `capacity_override` is **not** copied —
+    /// each branch independently defaults to the builder's global capacity.
     fn clone(&self) -> Self {
         Self {
             state: Rc::clone(&self.state),
             op_idx: self.op_idx,
             output_slot: self.output_slot,
+            capacity_override: None,
             _phantom: PhantomData,
         }
     }
@@ -554,6 +566,46 @@ pub struct IterateResult<T: Timestamp, D: Clone + Send + 'static> {
 }
 
 impl<T: Timestamp, D: Clone + Send + 'static> Pipe<T, D> {
+    /// Override the channel capacity for the **next** edge-creating operation.
+    ///
+    /// By default, all edges use `DataflowBuilderConfig::channel_capacity`
+    /// (1024). Call `with_capacity` to set a different buffer size for the
+    /// channel between this Pipe and the next downstream operator.
+    ///
+    /// The override is consumed by the next edge-creating method (`map`,
+    /// `filter`, `unary`, `binary`, `output`, `exchange`, etc.) and is
+    /// **not** propagated further. Methods that do not create an edge
+    /// (e.g., `probe`) pass the override through unchanged.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `capacity` is 0.
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// input
+    ///     .map("double", |_t, x| x * 2)
+    ///     .with_capacity(64)       // next edge uses 64-element buffer
+    ///     .filter("positive", |_t, x| x > 0)
+    ///     // filter's output edge uses the default (1024)
+    ///     .output("results");
+    /// ```
+    pub fn with_capacity(mut self, capacity: usize) -> Self {
+        assert!(capacity > 0, "channel capacity must be greater than 0");
+        self.capacity_override = Some(capacity);
+        self
+    }
+
+    /// Resolve the effective channel capacity for the next edge.
+    /// Consumes `capacity_override` if present, otherwise falls back
+    /// to the builder's global `channel_capacity`.
+    fn resolve_capacity(&mut self) -> usize {
+        self.capacity_override.take().unwrap_or_else(|| {
+            self.state.borrow().channel_capacity
+        })
+    }
+
     /// Apply a per-element transformation, producing a new Pipe of type `D2`.
     ///
     /// The closure receives a reference to the timestamp and ownership of each element.
@@ -563,12 +615,13 @@ impl<T: Timestamp, D: Clone + Send + 'static> Pipe<T, D> {
     /// ```ignore
     /// let doubled = stream.map("double", |_t, x: i32| x * 2);
     /// ```
-    pub fn map<D2, F>(self, name: impl Into<String>, mut logic: F) -> Pipe<T, D2>
+    pub fn map<D2, F>(mut self, name: impl Into<String>, mut logic: F) -> Pipe<T, D2>
     where
         D2: Clone + Send + 'static,
         F: FnMut(&T, D) -> D2 + Send + 'static,
     {
-        self.add_unary_internal(name, move |time, batch| {
+        let capacity = self.resolve_capacity();
+        self.add_unary_internal(name, capacity, move |time, batch| {
             batch.into_iter().map(|x| logic(&time, x)).collect()
         })
     }
@@ -579,11 +632,12 @@ impl<T: Timestamp, D: Clone + Send + 'static> Pipe<T, D> {
     /// ```ignore
     /// let evens = stream.filter("evens", |_t, x| x % 2 == 0);
     /// ```
-    pub fn filter<F>(self, name: impl Into<String>, mut predicate: F) -> Pipe<T, D>
+    pub fn filter<F>(mut self, name: impl Into<String>, mut predicate: F) -> Pipe<T, D>
     where
         F: FnMut(&T, &D) -> bool + Send + 'static,
     {
-        self.add_unary_internal(name, move |time, batch| {
+        let capacity = self.resolve_capacity();
+        self.add_unary_internal(name, capacity, move |time, batch| {
             batch.into_iter().filter(|x| predicate(&time, x)).collect()
         })
     }
@@ -596,12 +650,13 @@ impl<T: Timestamp, D: Clone + Send + 'static> Pipe<T, D> {
     ///     line.split_whitespace().map(|w| w.to_string()).collect::<Vec<_>>()
     /// });
     /// ```
-    pub fn flat_map<D2, F>(self, name: impl Into<String>, mut logic: F) -> Pipe<T, D2>
+    pub fn flat_map<D2, F>(mut self, name: impl Into<String>, mut logic: F) -> Pipe<T, D2>
     where
         D2: Clone + Send + 'static,
         F: FnMut(&T, D) -> Vec<D2> + Send + 'static,
     {
-        self.add_unary_internal(name, move |time, batch| {
+        let capacity = self.resolve_capacity();
+        self.add_unary_internal(name, capacity, move |time, batch| {
             batch.into_iter().flat_map(|x| logic(&time, x)).collect()
         })
     }
@@ -622,14 +677,15 @@ impl<T: Timestamp, D: Clone + Send + 'static> Pipe<T, D> {
     ///     Ok(())
     /// });
     /// ```
-    pub fn unary<D2, L>(self, name: impl Into<String>, logic: L) -> Pipe<T, D2>
+    pub fn unary<D2, L>(mut self, name: impl Into<String>, logic: L) -> Pipe<T, D2>
     where
         D2: Clone + Send + 'static,
         L: FnMut(&mut InputHandle<T, D>, &mut OutputHandle<T, D2>) -> Result<()>
             + Send
             + 'static,
     {
-        self.add_unary_with_handles(name, logic)
+        let capacity = self.resolve_capacity();
+        self.add_unary_with_handles(name, capacity, logic)
     }
 
     /// Apply a unary operator with frontier-based notification support.
@@ -680,7 +736,7 @@ impl<T: Timestamp, D: Clone + Send + 'static> Pipe<T, D> {
     ///         }
     ///     })
     /// ```
-    pub fn unary_notify<D2, L>(self, name: impl Into<String>, logic: L) -> Pipe<T, D2>
+    pub fn unary_notify<D2, L>(mut self, name: impl Into<String>, logic: L) -> Pipe<T, D2>
     where
         D2: Clone + Send + 'static,
         L: FnMut(
@@ -691,7 +747,8 @@ impl<T: Timestamp, D: Clone + Send + 'static> Pipe<T, D> {
             + Send
             + 'static,
     {
-        self.add_unary_notify_internal(name, logic)
+        let capacity = self.resolve_capacity();
+        self.add_unary_notify_internal(name, capacity, logic)
     }
 
     /// Combine two streams with a binary operator.
@@ -719,8 +776,8 @@ impl<T: Timestamp, D: Clone + Send + 'static> Pipe<T, D> {
     /// });
     /// ```
     pub fn binary<D2, D3, L>(
-        self,
-        other: Pipe<T, D2>,
+        mut self,
+        mut other: Pipe<T, D2>,
         name: impl Into<String>,
         logic: L,
     ) -> Pipe<T, D3>
@@ -740,6 +797,9 @@ impl<T: Timestamp, D: Clone + Send + 'static> Pipe<T, D> {
             Rc::ptr_eq(&self.state, &other.state),
             "binary operator streams must belong to the same DataflowBuilder"
         );
+
+        let capacity1 = self.resolve_capacity();
+        let capacity2 = other.resolve_capacity();
 
         let name = name.into();
         let op_idx;
@@ -834,9 +894,8 @@ impl<T: Timestamp, D: Clone + Send + 'static> Pipe<T, D> {
             state.operator_factories.push((op_idx, factory));
 
             // Channel factories for both input edges
-            let capacity = state.channel_capacity;
             let channel_factory1: ChannelFactory = channel_factory(move |_ctx, _cap: usize, wake: Option<WakeHandle>| {
-                let (push, pull) = bounded_channel_with_wake::<T, D, ()>(capacity, wake.clone());
+                let (push, pull) = bounded_channel_with_wake::<T, D, ()>(capacity1, wake.clone());
                 (
                     Box::new(Box::new(push) as Box<dyn Push<T, D>>)
                         as Box<dyn std::any::Any + Send>,
@@ -847,7 +906,7 @@ impl<T: Timestamp, D: Clone + Send + 'static> Pipe<T, D> {
             state.channel_factories.push((edge1_idx, channel_factory1));
 
             let channel_factory2: ChannelFactory = channel_factory(move |_ctx, _cap: usize, wake: Option<WakeHandle>| {
-                let (push, pull) = bounded_channel_with_wake::<T, D2, ()>(capacity, wake.clone());
+                let (push, pull) = bounded_channel_with_wake::<T, D2, ()>(capacity2, wake.clone());
                 (
                     Box::new(Box::new(push) as Box<dyn Push<T, D2>>)
                         as Box<dyn std::any::Any + Send>,
@@ -862,6 +921,7 @@ impl<T: Timestamp, D: Clone + Send + 'static> Pipe<T, D> {
             state: Rc::clone(&self.state),
             op_idx,
             output_slot: 0,
+            capacity_override: None,
             _phantom: PhantomData,
         }
     }
@@ -897,7 +957,7 @@ impl<T: Timestamp, D: Clone + Send + 'static> Pipe<T, D> {
     /// });
     /// ```
     pub fn iterate<TInner>(
-        self,
+        mut self,
         name: impl Into<String>,
         summary: TInner::Summary,
         body: impl FnOnce(Pipe<Product<T, TInner>, D>) -> IterateResult<Product<T, TInner>, D>,
@@ -909,6 +969,9 @@ impl<T: Timestamp, D: Clone + Send + 'static> Pipe<T, D> {
         let name = name.into();
         let region_id = RegionId::new(0);
         type PT<T, TInner> = Product<T, TInner>;
+
+        // Resolve per-edge capacity for the enter edge; internal edges use global default.
+        let enter_capacity = self.resolve_capacity();
 
         // Phase 1: Allocate enter, feedback, concat operators in parent state.
         // We also create a separate inner BuilderState for the loop body.
@@ -984,9 +1047,9 @@ impl<T: Timestamp, D: Clone + Send + 'static> Pipe<T, D> {
             });
             state.operator_factories.push((enter_idx, enter_factory));
 
-            // Channel factory for enter's input edge
+            // Channel factory for enter's input edge (uses per-edge override if set)
             let enter_edge_idx = state.graph.edges().len() - 1;
-            let cap = capacity;
+            let cap = enter_capacity;
             let cf: ChannelFactory = channel_factory(move |_ctx, _cap: usize, wake: Option<WakeHandle>| {
                 let (push, pull) = bounded_channel_with_wake::<T, D, ()>(cap, wake.clone());
                 (
@@ -1199,16 +1262,19 @@ impl<T: Timestamp, D: Clone + Send + 'static> Pipe<T, D> {
             state: Rc::clone(&inner_state),
             op_idx: concat_idx,
             output_slot: 0,
+            capacity_override: None,
             _phantom: PhantomData,
         };
 
-        let result = body(iter_var);
+        let mut result = body(iter_var);
 
-        // Extract info from result pipes before dropping them
+        // Extract info and capacity overrides from result pipes before dropping them
         let feedback_op_idx = result.feedback.op_idx;
         let feedback_output_slot = result.feedback.output_slot;
+        let feedback_capacity = result.feedback.resolve_capacity();
         let output_op_idx = result.output.op_idx;
         let output_output_slot = result.output.output_slot;
+        let output_capacity = result.output.resolve_capacity();
         drop(result);
 
         // Phase 3: Merge inner state into parent state.
@@ -1307,7 +1373,7 @@ impl<T: Timestamp, D: Clone + Send + 'static> Pipe<T, D> {
             // Stored separately; merged with correct indices at build() time.
             // Index by position in feedback_edges (0-based).
             let fb_position = state.graph.feedback_edges().len() - 1;
-            let cap = capacity;
+            let cap = feedback_capacity;
             let cf_fb: ChannelFactory = channel_factory(move |_ctx, _cap: usize, wake: Option<WakeHandle>| {
                 let (push, pull) = bounded_channel_with_wake::<PT<T, TInner>, D, ()>(cap, wake.clone());
                 (
@@ -1352,7 +1418,7 @@ impl<T: Timestamp, D: Clone + Send + 'static> Pipe<T, D> {
             state.operator_factories.push((leave_idx, leave_factory));
 
             // Channel factory for leave's input edge
-            let cap = capacity;
+            let cap = output_capacity;
             let cf_leave: ChannelFactory = channel_factory(move |_ctx, _cap: usize, wake: Option<WakeHandle>| {
                 let (push, pull) = bounded_channel_with_wake::<PT<T, TInner>, D, ()>(cap, wake.clone());
                 (
@@ -1367,6 +1433,7 @@ impl<T: Timestamp, D: Clone + Send + 'static> Pipe<T, D> {
             state: Rc::clone(&self.state),
             op_idx: leave_idx,
             output_slot: 0,
+            capacity_override: None,
             _phantom: PhantomData,
         }
     }
@@ -1386,7 +1453,7 @@ impl<T: Timestamp, D: Clone + Send + 'static> Pipe<T, D> {
     /// ```ignore
     /// let merged = Pipe::concat(vec![evens, odds, zeros]);
     /// ```
-    pub fn concat(streams: Vec<Pipe<T, D>>) -> Pipe<T, D> {
+    pub fn concat(mut streams: Vec<Pipe<T, D>>) -> Pipe<T, D> {
         assert!(!streams.is_empty(), "concat requires at least one Pipe");
 
         // Verify all streams share the same builder.
@@ -1396,6 +1463,9 @@ impl<T: Timestamp, D: Clone + Send + 'static> Pipe<T, D> {
                 "concat streams must belong to the same DataflowBuilder"
             );
         }
+
+        // Resolve per-edge capacity for each input before borrowing state.
+        let capacities: Vec<usize> = streams.iter_mut().map(|s| s.resolve_capacity()).collect();
 
         let num_inputs = streams.len();
         let op_idx;
@@ -1476,9 +1546,8 @@ impl<T: Timestamp, D: Clone + Send + 'static> Pipe<T, D> {
             });
             state.operator_factories.push((op_idx, factory));
 
-            // Channel factories for each input edge
-            let capacity = state.channel_capacity;
-            for edge_idx in edge_indices {
+            // Channel factories for each input edge (per-input capacity)
+            for (edge_idx, capacity) in edge_indices.into_iter().zip(capacities) {
                 let chan_factory: ChannelFactory = channel_factory(move |_ctx, _cap: usize, wake: Option<WakeHandle>| {
                     let (push, pull) = bounded_channel_with_wake::<T, D, ()>(capacity, wake.clone());
                     (
@@ -1496,6 +1565,7 @@ impl<T: Timestamp, D: Clone + Send + 'static> Pipe<T, D> {
             state: state_rc,
             op_idx,
             output_slot: 0,
+            capacity_override: None,
             _phantom: PhantomData,
         }
     }
@@ -1506,10 +1576,11 @@ impl<T: Timestamp, D: Clone + Send + 'static> Pipe<T, D> {
     /// an async channel to this port for collecting results.
     ///
     /// For immediate testing, use [`collect`](Self::collect) instead.
-    pub fn output(self, name: impl Into<String>) -> OutputPort<T, D> {
+    pub fn output(mut self, name: impl Into<String>) -> OutputPort<T, D> {
         let name = name.into();
         let collector = Arc::new(Mutex::new(Vec::new()));
         let op_idx;
+        let capacity = self.resolve_capacity();
 
         {
             let mut state = self.state.borrow_mut();
@@ -1655,7 +1726,6 @@ impl<T: Timestamp, D: Clone + Send + 'static> Pipe<T, D> {
 
             // Channel factory for the input edge
             let edge_idx = state.graph.edges().len() - 1;
-            let capacity = state.channel_capacity;
             let chan_factory: ChannelFactory = channel_factory(move |_ctx, _cap: usize, wake: Option<WakeHandle>| {
                 let (push, pull) = bounded_channel_with_wake::<T, D, ()>(capacity, wake.clone());
                 (
@@ -1710,13 +1780,14 @@ impl<T: Timestamp + crate::communication::codec::ExchangeData, D: Clone + crate:
     /// let partitioned = stream.exchange("by_key", |record: &(u64, String)| record.0);
     /// ```
     pub fn exchange<K: std::hash::Hash + 'static>(
-        self,
+        mut self,
         name: impl Into<String>,
         key_fn: impl Fn(&D) -> K + Send + Sync + 'static,
     ) -> Pipe<T, D> {
+        let capacity = self.resolve_capacity();
         let exchange_fn =
             crate::dataflow::channels::pact::ExchangeFn::by_key(&name.into(), key_fn);
-        self.add_exchange_internal_networked(exchange_fn)
+        self.add_exchange_internal_networked(exchange_fn, capacity)
     }
 
     /// Repartition data using a direct hash function (returns u64).
@@ -1724,21 +1795,23 @@ impl<T: Timestamp + crate::communication::codec::ExchangeData, D: Clone + crate:
     /// The returned u64 is reduced modulo the target worker count to
     /// determine routing.
     pub fn exchange_by_hash(
-        self,
+        mut self,
         name: impl Into<String>,
         hash_fn: impl Fn(&D) -> u64 + Send + Sync + 'static,
     ) -> Pipe<T, D> {
+        let capacity = self.resolve_capacity();
         let exchange_fn =
             crate::dataflow::channels::pact::ExchangeFn::new(name, hash_fn);
-        self.add_exchange_internal_networked(exchange_fn)
+        self.add_exchange_internal_networked(exchange_fn, capacity)
     }
 
     /// Internal: add an exchange operator with network-capable factory creator.
     fn add_exchange_internal_networked(
         &self,
         exchange_fn: crate::dataflow::channels::pact::ExchangeFn<D>,
+        capacity: usize,
     ) -> Pipe<T, D> {
-        let pipe = self.add_exchange_internal(exchange_fn.clone());
+        let pipe = self.add_exchange_internal(exchange_fn.clone(), capacity);
 
         // Store network exchange creator alongside the local one.
         {
@@ -1749,7 +1822,7 @@ impl<T: Timestamp + crate::communication::codec::ExchangeData, D: Clone + crate:
                     exchange_fn,
                     _phantom: std::marker::PhantomData,
                 });
-            state.exchange_network_creators.push((edge_idx, creator));
+            state.exchange_network_creators.push((edge_idx, capacity, creator));
         }
 
         pipe
@@ -1773,13 +1846,14 @@ impl<T: Timestamp, D: Clone + Send + 'static> Pipe<T, D> {
     /// let partitioned = stream.exchange("by_key", |record: &(u64, String)| record.0);
     /// ```
     pub fn exchange<K: std::hash::Hash + 'static>(
-        self,
+        mut self,
         name: impl Into<String>,
         key_fn: impl Fn(&D) -> K + Send + Sync + 'static,
     ) -> Pipe<T, D> {
+        let capacity = self.resolve_capacity();
         let exchange_fn =
             crate::dataflow::channels::pact::ExchangeFn::by_key(&name.into(), key_fn);
-        self.add_exchange_internal(exchange_fn)
+        self.add_exchange_internal(exchange_fn, capacity)
     }
 
     /// Repartition data using a direct hash function (returns u64).
@@ -1787,13 +1861,14 @@ impl<T: Timestamp, D: Clone + Send + 'static> Pipe<T, D> {
     /// The returned u64 is reduced modulo the target worker count to
     /// determine routing.
     pub fn exchange_by_hash(
-        self,
+        mut self,
         name: impl Into<String>,
         hash_fn: impl Fn(&D) -> u64 + Send + Sync + 'static,
     ) -> Pipe<T, D> {
+        let capacity = self.resolve_capacity();
         let exchange_fn =
             crate::dataflow::channels::pact::ExchangeFn::new(name, hash_fn);
-        self.add_exchange_internal(exchange_fn)
+        self.add_exchange_internal(exchange_fn, capacity)
     }
 }
 
@@ -1808,6 +1883,7 @@ impl<T: Timestamp, D: Clone + Send + 'static> Pipe<T, D> {
     fn add_exchange_internal(
         &self,
         exchange_fn: crate::dataflow::channels::pact::ExchangeFn<D>,
+        capacity: usize,
     ) -> Pipe<T, D> {
         let op_idx;
         let region_id = RegionId::new(0);
@@ -1905,7 +1981,6 @@ impl<T: Timestamp, D: Clone + Send + 'static> Pipe<T, D> {
             // Channel factory — pipeline placeholder for single-worker.
             // spawn_multi replaces this with shared exchange factories.
             let edge_idx = state.graph.edges().len() - 1;
-            let capacity = state.channel_capacity;
             let chan_factory: ChannelFactory =
                 channel_factory(move |_ctx, _cap: usize, wake: Option<WakeHandle>| {
                     let (push, pull) =
@@ -1921,13 +1996,14 @@ impl<T: Timestamp, D: Clone + Send + 'static> Pipe<T, D> {
 
             // Store exchange factory creator for multi-worker.
             let creator = crate::dataflow::channels::exchange_channel::create_exchange_factory_creator::<T, D>(exchange_fn);
-            state.exchange_creators.push((edge_idx, creator));
+            state.exchange_creators.push((edge_idx, capacity, creator));
         }
 
         Pipe {
             state: Rc::clone(&self.state),
             op_idx,
             output_slot: 0,
+            capacity_override: None,
             _phantom: PhantomData,
         }
     }
@@ -1956,6 +2032,7 @@ impl<T: Timestamp, D: Clone + Send + 'static> Pipe<T, D> {
     fn add_unary_internal<D2>(
         &self,
         name: impl Into<String>,
+        capacity: usize,
         logic: impl FnMut(T, Vec<D>) -> Vec<D2> + Send + 'static,
     ) -> Pipe<T, D2>
     where
@@ -2048,7 +2125,6 @@ impl<T: Timestamp, D: Clone + Send + 'static> Pipe<T, D> {
 
             // Channel factory for the input edge
             let edge_idx = state.graph.edges().len() - 1;
-            let capacity = state.channel_capacity;
             let chan_factory: ChannelFactory = channel_factory(move |_ctx, _cap: usize, wake: Option<WakeHandle>| {
                 let (push, pull) = bounded_channel_with_wake::<T, D, ()>(capacity, wake.clone());
                 (
@@ -2065,6 +2141,7 @@ impl<T: Timestamp, D: Clone + Send + 'static> Pipe<T, D> {
             state: Rc::clone(&self.state),
             op_idx,
             output_slot: 0,
+            capacity_override: None,
             _phantom: PhantomData,
         }
     }
@@ -2073,6 +2150,7 @@ impl<T: Timestamp, D: Clone + Send + 'static> Pipe<T, D> {
     fn add_unary_with_handles<D2, L>(
         &self,
         name: impl Into<String>,
+        capacity: usize,
         logic: L,
     ) -> Pipe<T, D2>
     where
@@ -2155,7 +2233,6 @@ impl<T: Timestamp, D: Clone + Send + 'static> Pipe<T, D> {
 
             // Channel factory for the input edge
             let edge_idx = state.graph.edges().len() - 1;
-            let capacity = state.channel_capacity;
             let chan_factory: ChannelFactory = channel_factory(move |_ctx, _cap: usize, wake: Option<WakeHandle>| {
                 let (push, pull) = bounded_channel_with_wake::<T, D, ()>(capacity, wake.clone());
                 (
@@ -2172,6 +2249,7 @@ impl<T: Timestamp, D: Clone + Send + 'static> Pipe<T, D> {
             state: Rc::clone(&self.state),
             op_idx,
             output_slot: 0,
+            capacity_override: None,
             _phantom: PhantomData,
         }
     }
@@ -2188,6 +2266,7 @@ impl<T: Timestamp, D: Clone + Send + 'static> Pipe<T, D> {
     fn add_unary_notify_internal<D2, L>(
         &self,
         name: impl Into<String>,
+        capacity: usize,
         logic: L,
     ) -> Pipe<T, D2>
     where
@@ -2294,7 +2373,6 @@ impl<T: Timestamp, D: Clone + Send + 'static> Pipe<T, D> {
 
             // Channel factory for the input edge
             let edge_idx = state.graph.edges().len() - 1;
-            let capacity = state.channel_capacity;
             let chan_factory: ChannelFactory = channel_factory(move |_ctx, _cap: usize, wake: Option<WakeHandle>| {
                 let (push, pull) = bounded_channel_with_wake::<T, D, ()>(capacity, wake.clone());
                 (
@@ -2311,6 +2389,7 @@ impl<T: Timestamp, D: Clone + Send + 'static> Pipe<T, D> {
             state: Rc::clone(&self.state),
             op_idx,
             output_slot: 0,
+            capacity_override: None,
             _phantom: PhantomData,
         }
     }
@@ -2373,13 +2452,15 @@ pub struct LogicalDataflow<T: Timestamp> {
     pub(crate) probes: Vec<(usize, ProbeHandle<T>)>,
     /// Type-erased exchange factory creators — one per exchange edge.
     /// Consumed by `spawn_multi` to produce shared cross-worker channel factories.
+    /// Tuple: (edge_index, capacity, creator_fn).
     pub(crate) exchange_creators:
-        Vec<(usize, crate::dataflow::channels::exchange_channel::ExchangeFactoryCreatorFn)>,
+        Vec<(usize, usize, crate::dataflow::channels::exchange_channel::ExchangeFactoryCreatorFn)>,
     /// Network-capable exchange creators — one per exchange edge (transport feature only).
     /// Consumed by `spawn_cluster` to produce network-backed exchange channel factories.
+    /// Tuple: (edge_index, capacity, creator).
     #[cfg(feature = "transport")]
     pub(crate) exchange_network_creators:
-        Vec<(usize, Box<dyn crate::dataflow::channels::exchange_channel::NetworkExchangeCreator>)>,
+        Vec<(usize, usize, Box<dyn crate::dataflow::channels::exchange_channel::NetworkExchangeCreator>)>,
 }
 
 impl<T: Timestamp> LogicalDataflow<T> {
@@ -2426,7 +2507,7 @@ impl<T: Timestamp> LogicalDataflow<T> {
     /// These are the edge indices that use cross-worker exchange channels
     /// (as opposed to pipeline channels).
     pub fn exchange_edge_indices(&self) -> Vec<usize> {
-        self.exchange_creators.iter().map(|(idx, _)| *idx).collect()
+        self.exchange_creators.iter().map(|(idx, _, _)| *idx).collect()
     }
 
     /// Get the number of feedback (loop) edges in the graph.
@@ -3418,5 +3499,139 @@ mod tests {
         assert!(!all.is_empty(), "should have at least one notification");
         // Verify exactly one notification fired (notification_count == 1)
         assert_eq!(all, vec![1], "should fire exactly one notification for the deduplicated time");
+    }
+
+    // --- with_capacity tests ---
+
+    #[test]
+    fn test_with_capacity_basic() {
+        // with_capacity should not affect correctness — data still flows through
+        let builder = DataflowBuilder::<u64>::new("cap_basic");
+        let port = builder
+            .source("nums", vec![(0u64, vec![1i32, 2, 3])])
+            .with_capacity(4)
+            .map("double", |_t, x| x * 2)
+            .output("results");
+        let dataflow = builder.build().unwrap();
+        rt().run(dataflow).unwrap();
+
+        let c = port.collector();
+        let r = c.lock().unwrap();
+        assert_eq!(r[0].1, vec![2, 4, 6]);
+    }
+
+    #[test]
+    fn test_with_capacity_chained() {
+        // Override only applies to the next edge; subsequent edges use default
+        let builder = DataflowBuilder::<u64>::new("cap_chain");
+        let port = builder
+            .source("nums", vec![(0u64, vec![1i32, 2, 3, 4])])
+            .with_capacity(8)
+            .map("double", |_t, x| x * 2)
+            // no with_capacity here → default capacity
+            .filter("positive", |_t, &x| x > 0)
+            .with_capacity(16)
+            .output("results");
+        let dataflow = builder.build().unwrap();
+        rt().run(dataflow).unwrap();
+
+        let c = port.collector();
+        let r = c.lock().unwrap();
+        assert_eq!(r[0].1, vec![2, 4, 6, 8]);
+    }
+
+    #[test]
+    #[should_panic(expected = "channel capacity must be greater than 0")]
+    fn test_with_capacity_zero_panics() {
+        let builder = DataflowBuilder::<u64>::new("cap_zero");
+        builder
+            .source("nums", vec![(0u64, vec![1i32])])
+            .with_capacity(0);
+    }
+
+    #[test]
+    fn test_with_capacity_not_propagated_by_clone() {
+        // Cloning a Pipe should NOT copy the capacity_override
+        let builder = DataflowBuilder::<u64>::new("cap_clone");
+        let s = builder
+            .source("nums", vec![(0u64, vec![1i32, 2, 3])])
+            .with_capacity(4);
+        let s2 = s.clone();
+
+        // s still has the override, s2 does not
+        let port1 = s.map("double", |_t, x| x * 2).output("out1");
+        let port2 = s2.map("triple", |_t, x| x * 3).output("out2");
+
+        let dataflow = builder.build().unwrap();
+        rt().run(dataflow).unwrap();
+
+        let c1 = port1.collector();
+        let r1 = c1.lock().unwrap();
+        assert_eq!(r1[0].1, vec![2, 4, 6]);
+
+        let c2 = port2.collector();
+        let r2 = c2.lock().unwrap();
+        assert_eq!(r2[0].1, vec![3, 6, 9]);
+    }
+
+    #[test]
+    fn test_with_capacity_small_buffer() {
+        // Very small capacity (1) to stress backpressure — should still work
+        let builder = DataflowBuilder::<u64>::new("cap_small");
+        let port = builder
+            .source("nums", vec![(0u64, vec![1i32, 2, 3, 4, 5, 6, 7, 8, 9, 10])])
+            .with_capacity(1)
+            .map("inc", |_t, x| x + 1)
+            .with_capacity(1)
+            .filter("even", |_t, &x| x % 2 == 0)
+            .with_capacity(1)
+            .output("results");
+        let dataflow = builder.build().unwrap();
+        rt().run(dataflow).unwrap();
+
+        let c = port.collector();
+        let r = c.lock().unwrap();
+        let mut vals: Vec<i32> = r.iter().flat_map(|(_, v)| v.iter().copied()).collect();
+        vals.sort();
+        assert_eq!(vals, vec![2, 4, 6, 8, 10]);
+    }
+
+    #[test]
+    fn test_with_capacity_unary() {
+        let builder = DataflowBuilder::<u64>::new("cap_unary");
+        let port = builder
+            .source("nums", vec![(0u64, vec![1i32, 2, 3])])
+            .with_capacity(2)
+            .unary("sum", |input, output| {
+                while let Some((time, data)) = input.next() {
+                    let sum: i32 = data.iter().sum();
+                    output.push_vec(time, vec![sum]);
+                }
+                Ok(())
+            })
+            .output("results");
+        let dataflow = builder.build().unwrap();
+        rt().run(dataflow).unwrap();
+
+        let c = port.collector();
+        let r = c.lock().unwrap();
+        assert_eq!(r[0].1, vec![6]);
+    }
+
+    #[test]
+    fn test_with_capacity_concat() {
+        let builder = DataflowBuilder::<u64>::new("cap_concat");
+        let a = builder.source("a", vec![(0u64, vec![1i32, 2])]).with_capacity(4);
+        let b = builder.source("b", vec![(0u64, vec![3i32, 4])]).with_capacity(8);
+        let port = Pipe::concat(vec![a, b])
+            .output("merged");
+        let dataflow = builder.build().unwrap();
+        rt().run(dataflow).unwrap();
+
+        let c = port.collector();
+        let r = c.lock().unwrap();
+        let mut vals: Vec<i32> = r.iter().flat_map(|(_, v)| v.iter().copied()).collect();
+        vals.sort();
+        assert_eq!(vals, vec![1, 2, 3, 4]);
     }
 }
