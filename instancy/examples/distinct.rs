@@ -14,8 +14,8 @@
 
 use std::collections::{HashMap, HashSet};
 
-use instancy::dataflow::DataflowBuilder;
-use instancy::runtime::SimpleRuntime;
+use instancy::DataflowBuilder;
+use instancy::SimpleRuntime;
 
 fn main() {
     let builder = DataflowBuilder::<u64>::new("distinct_demo");

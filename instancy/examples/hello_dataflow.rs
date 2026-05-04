@@ -7,8 +7,8 @@
 //! cargo run --example hello_dataflow
 //! ```
 
-use instancy::dataflow::DataflowBuilder;
-use instancy::runtime::SimpleRuntime;
+use instancy::DataflowBuilder;
+use instancy::SimpleRuntime;
 
 fn main() {
     // Build a simple source → output dataflow using the Pipe chaining API.

@@ -16,8 +16,8 @@
 
 use std::cmp::Ordering;
 
-use instancy::dataflow::DataflowBuilder;
-use instancy::runtime::SimpleRuntime;
+use instancy::DataflowBuilder;
+use instancy::SimpleRuntime;
 
 fn main() {
     let builder = DataflowBuilder::<u64>::new("unionfind");

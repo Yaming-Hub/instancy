@@ -16,9 +16,9 @@
 
 use std::collections::HashMap;
 
-use instancy::dataflow::dataflow_builder::IterateResult;
-use instancy::dataflow::DataflowBuilder;
-use instancy::runtime::SimpleRuntime;
+use instancy::IterateResult;
+use instancy::DataflowBuilder;
+use instancy::SimpleRuntime;
 
 /// Number of PageRank iterations.
 const ITERATIONS: u32 = 20;

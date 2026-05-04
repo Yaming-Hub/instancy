@@ -18,8 +18,8 @@
 //! cargo run --example event_driven
 //! ```
 
-use instancy::dataflow::DataflowBuilder;
-use instancy::runtime::SimpleRuntime;
+use instancy::DataflowBuilder;
+use instancy::SimpleRuntime;
 
 /// Simulated sensor reading
 #[derive(Clone, Debug)]

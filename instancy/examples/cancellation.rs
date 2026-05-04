@@ -7,10 +7,10 @@
 //! cargo run --example cancellation
 //! ```
 
-use instancy::cancellation::CancellationToken;
-use instancy::dataflow::DataflowBuilder;
-use instancy::error::Error;
-use instancy::runtime::SimpleRuntime;
+use instancy::CancellationToken;
+use instancy::DataflowBuilder;
+use instancy::Error;
+use instancy::SimpleRuntime;
 
 fn main() {
     // Create a cancellation token and cancel it immediately.

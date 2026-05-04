@@ -93,8 +93,8 @@ instancy makes this accessible in Rust with a clean builder API, proper error ha
 Let's start with the simplest possible instancy program:
 
 ```rust
-use instancy::dataflow::DataflowBuilder;
-use instancy::runtime::SimpleRuntime;
+use instancy::DataflowBuilder;
+use instancy::SimpleRuntime;
 
 fn main() {
     let builder = DataflowBuilder::<u64>::new("hello");
@@ -115,8 +115,8 @@ This creates a stream of numbers and prints each one. Not very different from a 
 With instancy's `spawn` API, the dataflow runs on a background thread while you feed it data interactively:
 
 ```rust
-use instancy::dataflow::DataflowBuilder;
-use instancy::runtime::SimpleRuntime;
+use instancy::DataflowBuilder;
+use instancy::SimpleRuntime;
 
 fn main() {
     let builder = DataflowBuilder::<u64>::new("reactive");
@@ -218,7 +218,7 @@ Building a dataflow in instancy follows a consistent pattern:
 A **source** provides static data that's known at build time:
 
 ```rust
-use instancy::dataflow::DataflowBuilder;
+use instancy::DataflowBuilder;
 
 let builder = DataflowBuilder::<u64>::new("my_pipeline");
 let stream = builder.source("events", vec![
@@ -375,8 +375,8 @@ Here's a complete word count pipeline that demonstrates multiple operators worki
 
 ```rust
 use std::collections::{HashMap, HashSet};
-use instancy::dataflow::DataflowBuilder;
-use instancy::runtime::SimpleRuntime;
+use instancy::DataflowBuilder;
+use instancy::SimpleRuntime;
 
 fn main() {
     let builder = DataflowBuilder::<u64>::new("wordcount");
@@ -451,7 +451,7 @@ instancy provides two runtime modes depending on your needs.
 `SimpleRuntime` runs a dataflow on a single thread. It's the easiest way to get started:
 
 ```rust
-use instancy::runtime::SimpleRuntime;
+use instancy::SimpleRuntime;
 
 // Run to completion — blocks until all data is processed
 SimpleRuntime::new().run(dataflow).expect("execution failed");
@@ -478,7 +478,7 @@ handle.join_blocking().unwrap();
 For production use, `RuntimeHandle` provides a shared worker thread pool:
 
 ```rust
-use instancy::runtime::{RuntimeConfig, RuntimeHandle};
+use instancy::{RuntimeConfig, RuntimeHandle};
 
 let rt = RuntimeHandle::new(RuntimeConfig {
     worker_threads: 4,
@@ -553,7 +553,7 @@ Cancellation is **cooperative**: it signals operators at their next check point.
 Every cancellation carries a [`CancellationReason`](instancy::cancellation::CancellationReason) that explains *why* the dataflow was cancelled. This helps distinguish user-initiated stops from system failures:
 
 ```rust
-use instancy::cancellation::{CancellationToken, CancellationReason};
+use instancy::{CancellationToken, CancellationReason};
 
 let mut handle = rt.spawn(dataflow).unwrap();
 
@@ -704,7 +704,7 @@ For parallel processing, instancy can run multiple logical workers that partitio
 `spawn_multi` creates N replicated workers, each running the same dataflow graph but processing different partitions of data:
 
 ```rust
-use instancy::runtime::{RuntimeConfig, RuntimeHandle};
+use instancy::{RuntimeConfig, RuntimeHandle};
 
 let rt = RuntimeHandle::new(RuntimeConfig {
     worker_threads: 4,
@@ -777,7 +777,7 @@ instancy supports iterative computation through the `iterate` operator, which cr
 ### Basic Iteration
 
 ```rust
-use instancy::dataflow::dataflow_builder::IterateResult;
+use instancy::IterateResult;
 
 let result = stream.iterate::<u32>("loop", 1u32, |iter_stream| {
     // Transform data each iteration
@@ -881,7 +881,7 @@ let connections: Vec<PeerConnection<_, _>> = vec![
 ### Spawning a Cluster Dataflow
 
 ```rust
-use instancy::runtime::{RuntimeConfig, RuntimeHandle};
+use instancy::{RuntimeConfig, RuntimeHandle};
 use instancy::dataflow::id::DataflowId;
 use std::time::Duration;
 

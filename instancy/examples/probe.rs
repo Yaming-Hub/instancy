@@ -7,8 +7,8 @@
 //! cargo run --example probe
 //! ```
 
-use instancy::dataflow::DataflowBuilder;
-use instancy::runtime::SimpleRuntime;
+use instancy::DataflowBuilder;
+use instancy::SimpleRuntime;
 
 fn main() {
     // Build a dataflow with a probe attached after a map operator.

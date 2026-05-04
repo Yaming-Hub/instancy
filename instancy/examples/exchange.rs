@@ -14,7 +14,7 @@
 
 use std::collections::HashMap;
 
-use instancy::runtime::{RuntimeConfig, RuntimeHandle};
+use instancy::{RuntimeConfig, RuntimeHandle};
 
 fn main() {
     let num_workers = 4;

@@ -33,8 +33,8 @@ use std::collections::hash_map::DefaultHasher;
 use std::collections::HashMap;
 use std::hash::{Hash, Hasher};
 
-use instancy::dataflow::DataflowBuilder;
-use instancy::runtime::{RuntimeConfig, RuntimeHandle};
+use instancy::DataflowBuilder;
+use instancy::{RuntimeConfig, RuntimeHandle};
 
 fn main() {
     println!("=== Notify Word Count (Frontier-Based Aggregation) ===\n");

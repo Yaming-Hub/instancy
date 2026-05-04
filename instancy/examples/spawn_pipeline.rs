@@ -19,8 +19,8 @@
 //!
 //! Run with: `cargo run --example spawn_pipeline`
 
-use instancy::dataflow::DataflowBuilder;
-use instancy::runtime::{SimpleRuntime, SpawnedDataflow};
+use instancy::DataflowBuilder;
+use instancy::{SimpleRuntime, SpawnedDataflow};
 
 fn main() {
     println!("=== Spawn Pipeline Example ===\n");
