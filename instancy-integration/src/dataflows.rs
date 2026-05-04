@@ -182,25 +182,26 @@ fn build_distributed_join(
             while let Some((time, data)) = right_in.next() {
                 right_buf.entry(time).or_default().extend(data);
             }
-            // Emit matches for timestamps present in both sides
+            // Emit matches for timestamps present in both sides, then drain
+            // processed entries to avoid duplicate emission on subsequent calls.
             let common_times: Vec<u64> = left_buf
                 .keys()
                 .filter(|t| right_buf.contains_key(t))
                 .copied()
                 .collect();
             for t in common_times {
-                if let (Some(lefts), Some(rights)) = (left_buf.get(&t), right_buf.get(&t)) {
-                    let mut joined = Vec::new();
-                    for (lk, lv) in lefts {
-                        for (rk, rv) in rights {
-                            if lk == rk {
-                                joined.push((lk.clone(), lv.clone(), *rv));
-                            }
+                let lefts = left_buf.remove(&t).unwrap();
+                let rights = right_buf.remove(&t).unwrap();
+                let mut joined = Vec::new();
+                for (lk, lv) in &lefts {
+                    for (rk, rv) in &rights {
+                        if lk == rk {
+                            joined.push((lk.clone(), lv.clone(), *rv));
                         }
                     }
-                    if !joined.is_empty() {
-                        output.push_vec(t, joined);
-                    }
+                }
+                if !joined.is_empty() {
+                    output.push_vec(t, joined);
                 }
             }
             Ok(())

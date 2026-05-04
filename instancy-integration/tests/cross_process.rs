@@ -651,3 +651,79 @@ async fn test_distributed_join_with_data() {
 
     coord.shutdown().await;
 }
+
+/// Two-node DistributedJoin with inputs split across both nodes.
+///
+/// Feeds left data from node-a and right data from node-b to exercise
+/// cross-process input distribution. Also feeds data in multiple batches
+/// to verify the binary join operator doesn't emit duplicates.
+#[tokio::test]
+async fn test_distributed_join_cross_node() {
+    let mut coord = TestCoordinator::start(&["node-a", "node-b"], 1).await;
+    let topology = make_topology(&["node-a", "node-b"], 1);
+
+    coord
+        .setup_and_spawn_dataflow("df-join-cross", &topology, DataflowType::DistributedJoin)
+        .await;
+
+    // Feed left input from BOTH nodes in separate batches.
+    let left_batch1: Vec<(u64, String)> = vec![(1, "alice".into())];
+    coord
+        .feed_data(
+            "node-a",
+            "df-join-cross",
+            0,
+            "left",
+            0,
+            bincode::serialize(&left_batch1).unwrap(),
+        )
+        .await;
+    let left_batch2: Vec<(u64, String)> = vec![(2, "bob".into())];
+    coord
+        .feed_data(
+            "node-b",
+            "df-join-cross",
+            0,
+            "left",
+            0,
+            bincode::serialize(&left_batch2).unwrap(),
+        )
+        .await;
+
+    // Feed right input from node-b.
+    let right_data: Vec<(u64, i64)> = vec![(1, 10), (2, 20), (3, 30)];
+    coord
+        .feed_data(
+            "node-b",
+            "df-join-cross",
+            0,
+            "right",
+            0,
+            bincode::serialize(&right_data).unwrap(),
+        )
+        .await;
+
+    coord.close_all_inputs("df-join-cross").await;
+    coord.wait_for_completion("df-join-cross").await;
+
+    let out_a = coord
+        .collect_output("node-a", "df-join-cross", 0, "results")
+        .await;
+    let out_b = coord
+        .collect_output("node-b", "df-join-cross", 0, "results")
+        .await;
+
+    let mut all_output: Vec<(u64, String, i64)> = Vec::new();
+    for (_ts, bytes) in out_a.iter().chain(out_b.iter()) {
+        let batch: Vec<(u64, String, i64)> = bincode::deserialize(bytes).unwrap();
+        all_output.extend(batch);
+    }
+    all_output.sort_by_key(|(k, _, _)| *k);
+
+    // Expected: (1, "alice", 10), (2, "bob", 20). Key 3 has no left match.
+    assert_eq!(all_output.len(), 2, "should have exactly 2 joined records");
+    assert_eq!(all_output[0], (1, "alice".into(), 10));
+    assert_eq!(all_output[1], (2, "bob".into(), 20));
+
+    coord.shutdown().await;
+}
