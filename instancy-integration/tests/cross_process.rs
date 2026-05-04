@@ -418,3 +418,236 @@ async fn test_word_count_with_data() {
 
     coord.shutdown().await;
 }
+
+/// Two-node MultiEpochExchange with data verification.
+///
+/// Feeds data at two different timestamps (epochs 0 and 1), collects output,
+/// and verifies that per-epoch per-key sums are correct across the cluster.
+/// This exercises frontier propagation with real data across processes.
+#[tokio::test]
+async fn test_multi_epoch_with_data() {
+    let mut coord = TestCoordinator::start(&["node-a", "node-b"], 1).await;
+    let topology = make_topology(&["node-a", "node-b"], 1);
+
+    coord
+        .setup_and_spawn_dataflow("df-me-data", &topology, DataflowType::MultiEpochExchange)
+        .await;
+
+    // Epoch 0: feed data to node-a. Key 1 gets value 10 and 20; key 2 gets 30.
+    let epoch0_a: Vec<(u64, i64)> = vec![(1, 10), (2, 30), (1, 20)];
+    coord
+        .feed_data(
+            "node-a",
+            "df-me-data",
+            0,
+            "data",
+            0,
+            bincode::serialize(&epoch0_a).unwrap(),
+        )
+        .await;
+
+    // Epoch 0: feed data to node-b. Key 1 gets value 5.
+    let epoch0_b: Vec<(u64, i64)> = vec![(1, 5)];
+    coord
+        .feed_data(
+            "node-b",
+            "df-me-data",
+            0,
+            "data",
+            0,
+            bincode::serialize(&epoch0_b).unwrap(),
+        )
+        .await;
+
+    // Epoch 1: feed data to node-a. Key 2 gets value 100.
+    let epoch1_a: Vec<(u64, i64)> = vec![(2, 100)];
+    coord
+        .feed_data(
+            "node-a",
+            "df-me-data",
+            0,
+            "data",
+            1,
+            bincode::serialize(&epoch1_a).unwrap(),
+        )
+        .await;
+
+    coord.close_all_inputs("df-me-data").await;
+    coord.wait_for_completion("df-me-data").await;
+
+    // Collect output from both nodes.
+    let out_a = coord
+        .collect_output("node-a", "df-me-data", 0, "results")
+        .await;
+    let out_b = coord
+        .collect_output("node-b", "df-me-data", 0, "results")
+        .await;
+
+    // Aggregate per-epoch sums.
+    let mut epoch_sums: std::collections::HashMap<u64, std::collections::HashMap<u64, i64>> =
+        std::collections::HashMap::new();
+    for (ts, bytes) in out_a.iter().chain(out_b.iter()) {
+        let batch: Vec<(u64, i64)> = bincode::deserialize(bytes).unwrap();
+        let epoch = epoch_sums.entry(*ts).or_default();
+        for (key, val) in batch {
+            *epoch.entry(key).or_default() += val;
+        }
+    }
+
+    // Verify exactly 2 epochs in output.
+    assert_eq!(epoch_sums.len(), 2, "should have exactly 2 epochs");
+
+    // Epoch 0: key 1 = 10+20+5 = 35, key 2 = 30
+    let e0 = &epoch_sums[&0];
+    assert_eq!(e0.len(), 2, "epoch 0 should have exactly 2 keys");
+    assert_eq!(e0[&1], 35, "epoch 0, key 1 sum");
+    assert_eq!(e0[&2], 30, "epoch 0, key 2 sum");
+
+    // Epoch 1: key 2 = 100
+    let e1 = &epoch_sums[&1];
+    assert_eq!(e1.len(), 1, "epoch 1 should have exactly 1 key");
+    assert_eq!(e1[&2], 100, "epoch 1, key 2 sum");
+
+    coord.shutdown().await;
+}
+
+/// Two-node IterativeFilter with data verification.
+///
+/// Feeds `(key, value)` pairs where value determines how many iterations before
+/// the item exits the loop. Each iteration decrements the value by 1; items exit
+/// when value ≤ 1 (max 10 iterations). Verifies that all items eventually appear
+/// in the output with decremented values.
+#[tokio::test]
+async fn test_iterative_filter_with_data() {
+    let mut coord = TestCoordinator::start(&["node-a", "node-b"], 1).await;
+    let topology = make_topology(&["node-a", "node-b"], 1);
+
+    coord
+        .setup_and_spawn_dataflow("df-if-data", &topology, DataflowType::IterativeFilter)
+        .await;
+
+    // Feed items: value determines iterations before exit.
+    // (key=1, val=1) → exits immediately (1-1=0 ≤ 1, output as (1, 0))
+    // (key=2, val=3) → 2 iterations: 3→2→1, exits at val=1, output as (2, 1)
+    // (key=3, val=5) → 4 iterations: 5→4→3→2→1, exits at val=1, output as (3, 1)
+    let input: Vec<(u64, i64)> = vec![(1, 1), (2, 3), (3, 5)];
+    coord
+        .feed_data(
+            "node-a",
+            "df-if-data",
+            0,
+            "data",
+            0,
+            bincode::serialize(&input).unwrap(),
+        )
+        .await;
+
+    coord.close_all_inputs("df-if-data").await;
+    coord.wait_for_completion("df-if-data").await;
+
+    // Collect from both nodes.
+    let out_a = coord
+        .collect_output("node-a", "df-if-data", 0, "results")
+        .await;
+    let out_b = coord
+        .collect_output("node-b", "df-if-data", 0, "results")
+        .await;
+
+    let mut all_output: Vec<(u64, i64)> = Vec::new();
+    for (_ts, bytes) in out_a.iter().chain(out_b.iter()) {
+        let batch: Vec<(u64, i64)> = bincode::deserialize(bytes).unwrap();
+        all_output.extend(batch);
+    }
+    all_output.sort_by_key(|(k, _)| *k);
+
+    // All 3 keys should appear in output.
+    assert_eq!(all_output.len(), 3, "all 3 items should exit the loop");
+
+    // Each item's output value should be ≤ 1 (the exit condition).
+    for (key, val) in &all_output {
+        assert!(
+            *val <= 1,
+            "key {key} should have val ≤ 1, got {val}"
+        );
+    }
+
+    // Verify all keys present.
+    let keys: Vec<u64> = all_output.iter().map(|(k, _)| *k).collect();
+    assert!(keys.contains(&1), "key 1 should be in output");
+    assert!(keys.contains(&2), "key 2 should be in output");
+    assert!(keys.contains(&3), "key 3 should be in output");
+
+    coord.shutdown().await;
+}
+
+/// Two-node DistributedJoin with data verification.
+///
+/// Feeds keyed data to two input ports (left and right), verifies that the
+/// binary join produces correct results across the cluster. The join is on
+/// the u64 key, producing (key, left_value, right_value) tuples.
+#[tokio::test]
+async fn test_distributed_join_with_data() {
+    let mut coord = TestCoordinator::start(&["node-a", "node-b"], 1).await;
+    let topology = make_topology(&["node-a", "node-b"], 1);
+
+    coord
+        .setup_and_spawn_dataflow("df-join-data", &topology, DataflowType::DistributedJoin)
+        .await;
+
+    // Feed left input: (key, string_value)
+    let left_data: Vec<(u64, String)> = vec![
+        (1, "alice".into()),
+        (2, "bob".into()),
+        (3, "carol".into()),
+    ];
+    coord
+        .feed_data(
+            "node-a",
+            "df-join-data",
+            0,
+            "left",
+            0,
+            bincode::serialize(&left_data).unwrap(),
+        )
+        .await;
+
+    // Feed right input: (key, int_value)
+    // Key 1 and 2 match left, key 4 has no left match.
+    let right_data: Vec<(u64, i64)> = vec![(1, 100), (2, 200), (4, 400)];
+    coord
+        .feed_data(
+            "node-a",
+            "df-join-data",
+            0,
+            "right",
+            0,
+            bincode::serialize(&right_data).unwrap(),
+        )
+        .await;
+
+    coord.close_all_inputs("df-join-data").await;
+    coord.wait_for_completion("df-join-data").await;
+
+    // Collect output from both nodes.
+    let out_a = coord
+        .collect_output("node-a", "df-join-data", 0, "results")
+        .await;
+    let out_b = coord
+        .collect_output("node-b", "df-join-data", 0, "results")
+        .await;
+
+    let mut all_output: Vec<(u64, String, i64)> = Vec::new();
+    for (_ts, bytes) in out_a.iter().chain(out_b.iter()) {
+        let batch: Vec<(u64, String, i64)> = bincode::deserialize(bytes).unwrap();
+        all_output.extend(batch);
+    }
+    all_output.sort_by_key(|(k, _, _)| *k);
+
+    // Expected joins: (1, "alice", 100), (2, "bob", 200)
+    // Key 3 has no right match, key 4 has no left match — neither should appear.
+    assert_eq!(all_output.len(), 2, "should have exactly 2 joined records");
+    assert_eq!(all_output[0], (1, "alice".into(), 100));
+    assert_eq!(all_output[1], (2, "bob".into(), 200));
+
+    coord.shutdown().await;
+}
