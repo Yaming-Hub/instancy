@@ -562,8 +562,8 @@ impl RuntimeHandle {
             // Take exchange creators from worker 0 (all workers have identical
             // topology, so worker 0's creators are representative).
             let creators = std::mem::take(&mut dataflows[0].exchange_creators);
-            for (edge_idx, creator) in creators {
-                let shared_factories = creator(num_workers, 1024);
+            for (edge_idx, edge_capacity, creator) in creators {
+                let shared_factories = creator(num_workers, edge_capacity);
                 if shared_factories.len() != num_workers {
                     return Err(Error::Custom(format!(
                         "exchange factory creator for edge {edge_idx} produced {} factories, expected {num_workers}",
@@ -876,7 +876,7 @@ impl RuntimeHandle {
         // Take network creators from worker 0 (all workers have identical topology).
         let network_creators = std::mem::take(&mut dataflows[0].exchange_network_creators);
 
-        for (edge_order, (edge_idx, creator)) in network_creators.into_iter().enumerate() {
+        for (edge_order, (edge_idx, edge_capacity, creator)) in network_creators.into_iter().enumerate() {
             // Extract receivers for this specific exchange edge from the shared map.
             let mut edge_receivers: std::collections::HashMap<
                 String,
@@ -912,7 +912,7 @@ impl RuntimeHandle {
                 local_node_id: local_node_id.to_string(),
                 session: Arc::clone(&session),
                 receivers: edge_receivers,
-                capacity,
+                capacity: edge_capacity,
                 num_workers: total_workers,
                 edge_index: edge_order,
                 wake_handles: wake_handles.clone(),
@@ -1327,8 +1327,8 @@ impl SimpleRuntime {
         // with shared cross-worker exchange channel factories).
         if num_workers > 1 {
             let creators = std::mem::take(&mut dataflows[0].exchange_creators);
-            for (edge_idx, creator) in creators {
-                let shared_factories = creator(num_workers, 1024);
+            for (edge_idx, edge_capacity, creator) in creators {
+                let shared_factories = creator(num_workers, edge_capacity);
                 if shared_factories.len() != num_workers {
                     return Err(Error::Custom(format!(
                         "exchange factory creator for edge {edge_idx} produced {} factories, expected {num_workers}",
