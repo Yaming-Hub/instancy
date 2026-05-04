@@ -1821,7 +1821,7 @@ pub fn check_timeout(ctx: &ActivationContext) -> Result<()> {
 |---|---|---|
 | Connection timeout | Send/recv deadline | `ErrorKind::NetworkError` → policy |
 | Connection reset | I/O error on channel | `ErrorKind::NetworkError` → reconnect via pool, then retry |
-| Peer node down | **Hosting application** reports via `RuntimeHandle::report_peer_down(peer_id)` | `CancellationReason::PeerDown` → cancel affected dataflows |
+| Peer node down | **Hosting application** reports via `RuntimeHandle::report_node_leave(node_id)` | `CancellationReason::PeerDown` → cancel affected dataflows |
 
 **Peer-Down Notification Model**
 
@@ -1831,10 +1831,19 @@ instancy provides a notification API that the hosting application calls when it 
 
 ```rust
 /// Report that a peer node is no longer reachable.
-/// All dataflows with workers on the downed peer are cancelled with
-/// `CancellationReason::PeerDown { peer_id }`.
-runtime_handle.report_peer_down(peer_id: PeerId);
+/// All cluster dataflows with workers on the downed peer are cancelled with
+/// `CancellationReason::PeerDown(peer_node_id)`.
+/// Returns the number of dataflows that were newly cancelled.
+let cancelled = runtime_handle.report_node_leave("node-3");
 ```
+
+**Implementation details:**
+- Internally, a `PeerRegistry` maps each remote peer's `node_id` to the cancel tokens of cluster dataflows referencing that peer.
+- When `spawn_cluster()` completes, the dataflow's worker and bridge cancel tokens are automatically registered for each remote peer.
+- `report_node_leave()` cancels all matching tokens, removes entries, and prunes stale (already-completed) registrations.
+- The method is idempotent: calling it again for the same node returns `0` once all associated dataflows are already cancelled.
+- The node is remembered as "left" and any future `spawn_cluster()` that includes it will be immediately cancelled.
+- `report_node_join(node_id)` removes the node from the "left" set, allowing subsequent dataflows to use it normally. Already-cancelled dataflows are not restarted.
 
 **Design principles:**
 - **No automatic rescheduling**: instancy does not attempt to shift computation to surviving nodes. The hosting application handles retry by resubmitting the dataflow on healthy nodes.
@@ -1847,13 +1856,22 @@ For `ErrorAction::Retry` on network errors:
 2. If the connection is dead, the connection pool establishes a new one.
 3. After `max_retries`, the fallback action (typically `Stop`) is applied.
 
-For peer-down cancellation:
-1. The hosting application calls `report_peer_down(peer_id)`.
-2. The runtime identifies all active dataflows with workers on that peer.
-3. Each affected dataflow's `CancellationToken` is triggered with `CancellationReason::PeerDown { peer_id }`.
-4. Operators observe cancellation, drop capabilities, and exit.
-5. `execute()` / `DataflowHandle` returns with an error indicating peer failure.
-6. The hosting application can retry the dataflow on healthy nodes.
+For node leave (`report_node_leave(node_id)`):
+1. The hosting application calls `report_node_leave(node_id)`.
+2. All pooled connections to the departed node are dropped and evicted from the connection pool.
+3. The runtime identifies all active dataflows with workers on that node.
+4. Each affected dataflow's `CancellationToken` is triggered with `CancellationReason::PeerDown(node_id)`.
+5. Operators observe cancellation, drop capabilities, and exit.
+6. `execute()` / `DataflowHandle` returns with an error indicating peer failure.
+7. The node is recorded as "left" — any future `spawn_cluster` referencing it is immediately cancelled.
+8. The hosting application can retry the dataflow on healthy nodes.
+
+For node join (`report_node_join(node_id)`):
+1. The hosting application calls `report_node_join(node_id)` when a node recovers or a new node is added.
+2. The node is removed from the "left" set (no-op if the node was never marked as left).
+3. Future `spawn_cluster` calls that include this node proceed normally.
+4. New connections to the node are established on demand via the `ConnectionManager` when a dataflow first needs to communicate with it.
+5. Already-cancelled dataflows are **not** restarted — the application must re-spawn them.
 
 
 #### 5.9.6 Error Propagation Flow
@@ -3369,30 +3387,31 @@ pub trait ClusterMembership: Send + Sync + 'static {
 
 #### Scaling-Up (Node Joins)
 
-When the application notifies the runtime that a new node has joined:
+When the application calls `report_node_join(node_id)`:
 
-1. **Topology update**: `ClusterTopology` is extended with the new `NodeConfig`.
-2. **Worker assignment**: New logical worker indices are allocated for the joining node's workers.
-3. **Routing table rebuild**: All `RoutingTable` instances are updated to include the new remote endpoints.
-4. **Connection establishment**: The pool requests connections to the new peer via `ConnectionManager`.
-5. **Rebalance (optional)**: Running dataflows with `Exchange` or `Rebalance` routing can gradually redirect new data to the expanded worker set. In-flight data for the old topology continues on the original routes until its timestamp frontier advances.
+1. **Clear "left" state**: If the node was previously marked as left, it is removed from the left set. This is a no-op for brand-new nodes.
+2. **Connection on demand**: New connections to the node are established lazily — the connection pool calls `ConnectionManager` the first time a dataflow needs to communicate with the node.
+3. **Topology update**: `ClusterTopology` for new dataflows includes the joined node. Already-running dataflows are **not** affected.
+4. **Worker assignment**: New logical worker indices are allocated for the joining node's workers in subsequent `spawn_cluster` calls.
+5. **Routing table rebuild**: All `RoutingTable` instances in new dataflows include the new remote endpoints.
 
-**Important**: Existing in-flight data is NOT migrated. Only new data (at future timestamps) takes advantage of the expanded topology. This ensures progress tracking remains consistent — a timestamp that has already been produced cannot change its routing.
+**Important**: Existing in-flight data is NOT migrated. Only new dataflows (or re-spawned dataflows) take advantage of the expanded topology. This ensures progress tracking remains consistent — a timestamp that has already been produced cannot change its routing.
 
 #### Scaling-Down (Node Departures)
 
-When the application reports a node departure via `report_peer_down(peer_id)`:
+When the application calls `report_node_leave(node_id)`:
 
-1. **Cancel affected dataflows**: All dataflows with workers on the departed node are cancelled with `CancellationReason::PeerDown { peer_id }`. instancy does **not** attempt to reschedule work to surviving nodes — the hosting application owns retry logic.
-2. **Connection cleanup**: The pool evicts all connections to the departed peer.
+1. **Connection teardown**: All pooled connections to the departed node are immediately dropped and evicted from the connection pool.
+2. **Cancel affected dataflows**: All dataflows with workers on the departed node are cancelled with `CancellationReason::PeerDown(node_id)`. instancy does **not** attempt to reschedule work to surviving nodes — the hosting application owns retry logic.
 3. **Progress cleanup**: A departed node's outstanding capabilities are treated as "released" — the frontier advances past any timestamps that only the lost node could produce.
-4. **Application retry**: The hosting application can resubmit the dataflow targeting only healthy nodes.
+4. **Record as left**: The node is remembered in the "left" set. Any future `spawn_cluster` that includes this node is immediately cancelled, preventing races.
+5. **Application retry**: The hosting application can resubmit the dataflow targeting only healthy nodes, or call `report_node_join` once the node recovers and then retry.
 
 #### Consistency Guarantees
 
 - **Progress safety**: A departed node's outstanding capabilities are treated as "released" — the frontier advances past any timestamps that only the lost node could produce. This is safe because no more data at those timestamps will arrive.
 - **At-most-once by default**: If a node fails mid-computation, records being processed by that node may be lost. Applications requiring exactly-once semantics must use the checkpoint/recovery mechanism.
-- **No split-brain**: The application is the single source of truth for cluster membership. The runtime trusts the application's `report_peer_down` calls and does not perform its own consensus or health probing.
+- **No split-brain**: The application is the single source of truth for cluster membership. The runtime trusts the application's `report_node_leave` / `report_node_join` calls and does not perform its own consensus or health probing.
 
 #### Example: Kubernetes Integration
 
