@@ -1758,6 +1758,127 @@ impl<T: Timestamp, D: Clone + Send + 'static> Pipe<T, D> {
 
 }
 
+// ---------------------------------------------------------------------------
+// Result combinator methods — convenience for Pipe<T, Result<V, E>>
+// ---------------------------------------------------------------------------
+
+/// Combinators for streams carrying `Result<V, E>` data.
+///
+/// These methods provide ergonomic, zero-boilerplate handling of fallible
+/// pipelines. Instead of manually matching `Ok`/`Err` in every `map` or
+/// `filter` closure, use these combinators to operate on the success path
+/// while automatically relaying errors downstream.
+impl<T, V, E> Pipe<T, std::result::Result<V, E>>
+where
+    T: Timestamp,
+    V: Clone + Send + 'static,
+    E: Clone + Send + 'static,
+{
+    /// Apply a transformation to `Ok` values, passing `Err` values through unchanged.
+    ///
+    /// This is the `Result`-aware version of [`map`](Pipe::map). The closure
+    /// receives each `Ok(v)` and produces a new value; `Err(e)` records are
+    /// forwarded without invoking the closure.
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// let results: Pipe<u64, Result<i32, String>> = source.map_ok("double", |_t, v| v * 2);
+    /// // Ok(5) → Ok(10), Err("bad") → Err("bad")
+    /// ```
+    pub fn map_ok<V2, F>(self, name: impl Into<String>, mut f: F) -> Pipe<T, std::result::Result<V2, E>>
+    where
+        V2: Clone + Send + 'static,
+        F: FnMut(&T, V) -> V2 + Send + 'static,
+    {
+        self.map(name, move |t, item| match item {
+            Ok(v) => Ok(f(t, v)),
+            Err(e) => Err(e),
+        })
+    }
+
+    /// Filter `Ok` values by a predicate, passing `Err` values through unchanged.
+    ///
+    /// `Ok(v)` records where the predicate returns `false` are dropped.
+    /// `Err(e)` records are always forwarded regardless of the predicate.
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// let positive: Pipe<u64, Result<i32, String>> =
+    ///     source.filter_ok("positive", |_t, v| *v > 0);
+    /// // Ok(5) → Ok(5), Ok(-1) → dropped, Err("x") → Err("x")
+    /// ```
+    pub fn filter_ok<F>(self, name: impl Into<String>, mut predicate: F) -> Pipe<T, std::result::Result<V, E>>
+    where
+        F: FnMut(&T, &V) -> bool + Send + 'static,
+    {
+        self.filter(name, move |t, item| match item {
+            Ok(v) => predicate(t, v),
+            Err(_) => true,
+        })
+    }
+
+    /// Apply a fallible transformation to `Ok` values.
+    ///
+    /// The closure returns `Result<V2, E>`. If the input is `Ok(v)`, the
+    /// closure's result is forwarded. If the input is `Err(e)`, it passes
+    /// through without invoking the closure.
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// let parsed: Pipe<u64, Result<i32, String>> =
+    ///     strings.and_then("parse", |_t, s: String| s.parse::<i32>().map_err(|e| e.to_string()));
+    /// ```
+    pub fn and_then<V2, F>(self, name: impl Into<String>, mut f: F) -> Pipe<T, std::result::Result<V2, E>>
+    where
+        V2: Clone + Send + 'static,
+        F: FnMut(&T, V) -> std::result::Result<V2, E> + Send + 'static,
+    {
+        self.map(name, move |t, item| match item {
+            Ok(v) => f(t, v),
+            Err(e) => Err(e),
+        })
+    }
+
+    /// Split a `Result` stream into separate `Ok` and `Err` streams.
+    ///
+    /// Returns `(ok_pipe, err_pipe)` where:
+    /// - `ok_pipe` carries only the unwrapped `V` values from `Ok(v)`
+    /// - `err_pipe` carries only the unwrapped `E` values from `Err(e)`
+    ///
+    /// This is useful for routing errors to a side channel (logging, dead
+    /// letter queue) while continuing to process successes.
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// let (good, bad) = results.branch_result("split");
+    /// good.map("process", |_t, v| v * 2).output("results");
+    /// bad.map("log_error", |_t, e| format!("ERROR: {e}")).output("errors");
+    /// ```
+    pub fn branch_result(self, name: impl Into<String>) -> (Pipe<T, V>, Pipe<T, E>) {
+        let name = name.into();
+        let ok_name = format!("{name}::ok");
+        let err_name = format!("{name}::err");
+
+        // Use the existing map + filter pattern to split:
+        // Clone self so we can derive two downstream pipes.
+        let ok_pipe = self.clone().flat_map(ok_name, |_t, item| match item {
+            Ok(v) => vec![v],
+            Err(_) => vec![],
+        });
+        let err_pipe = self.flat_map(err_name, |_t, item| match item {
+            Ok(_) => vec![],
+            Err(e) => vec![e],
+        });
+
+        (ok_pipe, err_pipe)
+    }
+}
+
+
 /// Exchange methods that support both local and network-backed transport.
 ///
 /// When the `transport` feature is enabled, exchange data types must implement
@@ -3633,5 +3754,146 @@ mod tests {
         let mut vals: Vec<i32> = r.iter().flat_map(|(_, v)| v.iter().copied()).collect();
         vals.sort();
         assert_eq!(vals, vec![1, 2, 3, 4]);
+    }
+
+    // --- Result combinator tests ---
+
+    #[test]
+    fn test_map_ok() {
+        let builder = DataflowBuilder::<u64>::new("map_ok");
+        let stream = builder.source::<std::result::Result<i32, String>>(
+            "data",
+            vec![(0u64, vec![Ok(1), Err("bad".into()), Ok(3)])],
+        );
+        let port = stream.map_ok("double", |_t, v| v * 2).output("results");
+        let dataflow = builder.build().unwrap();
+        rt().run(dataflow).unwrap();
+
+        let c = port.collector();
+        let r = c.lock().unwrap();
+        assert_eq!(r[0].1, vec![Ok(2), Err("bad".into()), Ok(6)]);
+    }
+
+    #[test]
+    fn test_filter_ok() {
+        let builder = DataflowBuilder::<u64>::new("filter_ok");
+        let stream = builder.source::<std::result::Result<i32, String>>(
+            "data",
+            vec![(0u64, vec![Ok(1), Ok(2), Err("err".into()), Ok(3)])],
+        );
+        let port = stream
+            .filter_ok("even", |_t, v| v % 2 == 0)
+            .output("results");
+        let dataflow = builder.build().unwrap();
+        rt().run(dataflow).unwrap();
+
+        let c = port.collector();
+        let r = c.lock().unwrap();
+        assert_eq!(r[0].1, vec![Ok(2), Err("err".into())]);
+    }
+
+    #[test]
+    fn test_and_then() {
+        let builder = DataflowBuilder::<u64>::new("and_then");
+        let stream = builder.source::<std::result::Result<String, String>>(
+            "data",
+            vec![(0u64, vec![
+                Ok("42".into()),
+                Err("upstream_err".into()),
+                Ok("not_a_number".into()),
+            ])],
+        );
+        let port = stream
+            .and_then("parse", |_t, s: String| {
+                s.parse::<i32>().map_err(|e| e.to_string())
+            })
+            .output("results");
+        let dataflow = builder.build().unwrap();
+        rt().run(dataflow).unwrap();
+
+        let c = port.collector();
+        let r = c.lock().unwrap();
+        assert_eq!(r[0].1.len(), 3);
+        assert_eq!(r[0].1[0], Ok(42));
+        assert_eq!(r[0].1[1], Err("upstream_err".into()));
+        assert!(r[0].1[2].is_err()); // parse error
+    }
+
+    #[test]
+    fn test_branch_result() {
+        let builder = DataflowBuilder::<u64>::new("branch_result");
+        let stream = builder.source::<std::result::Result<i32, String>>(
+            "data",
+            vec![(0u64, vec![Ok(1), Err("a".into()), Ok(2), Err("b".into())])],
+        );
+        let (ok_pipe, err_pipe) = stream.branch_result("split");
+        let ok_port = ok_pipe.output("goods");
+        let err_port = err_pipe.output("bads");
+        let dataflow = builder.build().unwrap();
+        rt().run(dataflow).unwrap();
+
+        let oc = ok_port.collector();
+        let or = oc.lock().unwrap();
+        let mut ok_vals: Vec<i32> = or.iter().flat_map(|(_, v)| v.iter().copied()).collect();
+        ok_vals.sort();
+        assert_eq!(ok_vals, vec![1, 2]);
+
+        let ec = err_port.collector();
+        let er = ec.lock().unwrap();
+        let mut err_vals: Vec<String> = er.iter().flat_map(|(_, v)| v.iter().cloned()).collect();
+        err_vals.sort();
+        assert_eq!(err_vals, vec!["a", "b"]);
+    }
+
+    #[test]
+    fn test_map_ok_chained() {
+        // Chain: map_ok → filter_ok → output
+        let builder = DataflowBuilder::<u64>::new("chain");
+        let stream = builder.source::<std::result::Result<i32, String>>(
+            "data",
+            vec![(0u64, vec![Ok(1), Ok(2), Ok(3), Ok(4), Err("x".into())])],
+        );
+        let port = stream
+            .map_ok("double", |_t, v| v * 2)
+            .filter_ok("big", |_t, v| *v > 4)
+            .output("results");
+        let dataflow = builder.build().unwrap();
+        rt().run(dataflow).unwrap();
+
+        let c = port.collector();
+        let r = c.lock().unwrap();
+        assert_eq!(r[0].1, vec![Ok(6), Ok(8), Err("x".into())]);
+    }
+
+    #[test]
+    fn test_result_combinators_all_ok() {
+        let builder = DataflowBuilder::<u64>::new("all_ok");
+        let stream = builder.source::<std::result::Result<i32, String>>(
+            "data",
+            vec![(0u64, vec![Ok(10), Ok(20)])],
+        );
+        let port = stream.map_ok("inc", |_t, v| v + 1).output("results");
+        let dataflow = builder.build().unwrap();
+        rt().run(dataflow).unwrap();
+
+        let c = port.collector();
+        let r = c.lock().unwrap();
+        assert_eq!(r[0].1, vec![Ok(11), Ok(21)]);
+    }
+
+    #[test]
+    fn test_result_combinators_all_err() {
+        let builder = DataflowBuilder::<u64>::new("all_err");
+        let stream = builder.source::<std::result::Result<i32, String>>(
+            "data",
+            vec![(0u64, vec![Err("a".into()), Err("b".into())])],
+        );
+        let port = stream.map_ok("inc", |_t, v: i32| v + 1).output("results");
+        let dataflow = builder.build().unwrap();
+        rt().run(dataflow).unwrap();
+
+        let c = port.collector();
+        let r = c.lock().unwrap();
+        assert_eq!(r[0].1, vec![Err("a".into()), Err("b".into())]);
     }
 }
