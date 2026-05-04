@@ -2674,6 +2674,64 @@ impl<S: Scope, T: Data> MapOperator<S, T> for StreamEdge<S, Vec<T>> {
 }
 ```
 
+### 9.8 Operator Context Injection
+
+Operators often need access to shared configuration, schema registries, metrics
+collectors, or other application-specific services. instancy provides a typed
+context system via `SharedContext` and `DataflowBuilder`.
+
+#### Current: Build-Time Capture (v0.1)
+
+Context is set on the builder and captured by operator closures at graph construction time:
+
+```rust
+// Set context on the builder
+builder.with_context(AppConfig { batch_size: 1024 });
+// Or share a pre-existing Arc (avoids double-wrapping)
+builder.with_context_arc(db_pool.clone());
+
+// Capture at build time — returns Arc<T>
+let cfg = builder.get_context::<AppConfig>().unwrap();
+input.map("transform", move |_t, x| process(x, cfg.batch_size));
+```
+
+**Scope rules:**
+- One `SharedContext` per `DataflowBuilder` (per worker replica)
+- Context is inherited by `iterate()` inner scopes (cheap `Arc` sharing)
+- Context survives `build()` into `LogicalDataflow` via `contexts()` accessor
+- Type-keyed: one value per type; use newtypes for multiple values of the same type
+- `with_context_arc()` enables true zero-copy sharing across workers
+
+#### Planned: Runtime Operator Access (future)
+
+A future enhancement will thread `SharedContext` through the operator runtime so
+callbacks can access context directly without manual capture:
+
+```rust
+// Future API — operators receive context automatically
+input.unary_with_context("transform", |ctx, input, output| {
+    let cfg = ctx.get::<AppConfig>().unwrap();
+    while let Some((time, data)) = input.next() {
+        // Use cfg without pre-capturing it
+        let mut session = output.session(&time);
+        for item in data {
+            session.give(process(item, cfg.batch_size))?;
+        }
+    }
+    Ok(())
+});
+```
+
+This requires:
+1. Passing `SharedContext` through `DataflowExecutor::materialize()` to each operator
+2. Adding context to `OperatorBlueprint::build()` or a new `MaterializationContext`
+3. Making context available as a parameter in operator activation callbacks
+4. Keeping `WorkerContext` separate (worker identity only) from `SharedContext` (user data)
+
+The build-time capture pattern remains the recommended approach for simple cases.
+Runtime access is intended for complex operators (e.g., custom `unary`/`binary`)
+where manual capture is cumbersome.
+
 ---
 
 ## 10. User-Facing API Example

@@ -39,6 +39,7 @@ use crate::dataflow::channels::pushpull::{Pull, Push};
 use crate::dataflow::channels::tee::tee_or_single;
 use crate::dataflow::channels::wake::WakeHandle;
 use crate::dataflow::channel_operators::ChannelMode;
+use crate::dataflow::context::SharedContext;
 use crate::dataflow::graph::DataflowGraph;
 use crate::dataflow::operators::handles::{InputHandle, NotifyContext, OutputHandle};
 use crate::dataflow::operators::input::InputEvent;
@@ -124,6 +125,10 @@ struct BuilderState<T: Timestamp> {
     next_operator_index: usize,
     next_collect_index: usize,
     channel_capacity: usize,
+    /// User-supplied typed context values, accessible via
+    /// [`DataflowBuilder::get_context`]. Carried into [`LogicalDataflow`]
+    /// on [`DataflowBuilder::build()`].
+    contexts: SharedContext,
 }
 
 /// Type-erased closure for wiring an input port during spawn().
@@ -222,8 +227,71 @@ impl<T: Timestamp> DataflowBuilder<T> {
                 next_operator_index: 1,
                 next_collect_index: 0,
                 channel_capacity: config.channel_capacity,
+                contexts: SharedContext::new(),
             })),
         }
+    }
+
+    /// Store a typed context value that operator closures can capture at build time.
+    ///
+    /// Context values are wrapped in `Arc<T>` internally, so [`get_context`](Self::get_context)
+    /// returns a cheaply cloneable `Arc<T>` suitable for capturing in `move` closures.
+    ///
+    /// If a value of the same type was previously stored, it is replaced. Set all
+    /// context values **before** creating operators to ensure consistent captures.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use instancy::dataflow::DataflowBuilder;
+    ///
+    /// struct MyConfig { pub batch_size: usize }
+    ///
+    /// let builder = DataflowBuilder::<u64>::new("example");
+    /// builder.with_context(MyConfig { batch_size: 512 });
+    ///
+    /// let cfg = builder.get_context::<MyConfig>().unwrap();
+    /// assert_eq!(cfg.batch_size, 512);
+    /// ```
+    pub fn with_context<C: Send + Sync + 'static>(&self, value: C) -> &Self {
+        self.state.borrow_mut().contexts.insert(value);
+        self
+    }
+
+    /// Store a pre-existing `Arc<C>` as context, avoiding double-wrapping.
+    ///
+    /// Use this when you already have an `Arc<C>` (e.g., a shared service
+    /// handle, connection pool, or metrics collector) that you want to share
+    /// across dataflow operators without an extra `Arc` layer.
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// let pool = Arc::new(DbPool::connect("...").await?);
+    /// builder.with_context_arc(pool.clone());
+    ///
+    /// let p = builder.get_context::<DbPool>().unwrap();
+    /// // p is Arc<DbPool> — same allocation as pool, no double-wrapping
+    /// ```
+    pub fn with_context_arc<C: Send + Sync + 'static>(&self, value: Arc<C>) -> &Self {
+        self.state.borrow_mut().contexts.insert_arc(value);
+        self
+    }
+
+    /// Retrieve a previously stored context value as `Arc<C>`.
+    ///
+    /// Returns `None` if no value of type `C` has been stored. The returned `Arc`
+    /// can be captured in operator closures:
+    ///
+    /// ```ignore
+    /// let cfg = builder.get_context::<MyConfig>().unwrap();
+    /// input.map("transform", move |_t, data| {
+    ///     // cfg is Arc<MyConfig> — shared and cheaply cloned
+    ///     process(data, cfg.batch_size)
+    /// });
+    /// ```
+    pub fn get_context<C: Send + Sync + 'static>(&self) -> Option<Arc<C>> {
+        self.state.borrow().contexts.get::<C>()
     }
 
     /// Declare a named input port that data will be fed into at runtime.
@@ -511,6 +579,7 @@ impl<T: Timestamp> DataflowBuilder<T> {
             exchange_creators: state.exchange_creators,
             #[cfg(feature = "transport")]
             exchange_network_creators: state.exchange_network_creators,
+            contexts: state.contexts,
         })
     }
 }
@@ -1237,6 +1306,9 @@ impl<T: Timestamp, D: Clone + Send + 'static> Pipe<T, D> {
         }
 
         // Phase 2: Create inner builder for loop body and call body closure.
+        // Inherit parent context so operators inside loops can access the same
+        // context values. SharedContext::clone() is cheap (shares Arc pointers).
+        let parent_contexts = self.state.borrow().contexts.clone();
         let inner_state: Rc<RefCell<BuilderState<Product<T, TInner>>>> =
             Rc::new(RefCell::new(BuilderState {
                 graph: DataflowGraph::new(),
@@ -1255,6 +1327,7 @@ impl<T: Timestamp, D: Clone + Send + 'static> Pipe<T, D> {
                 next_operator_index: inner_start_idx,
                 next_collect_index: 0,
                 channel_capacity: capacity,
+                contexts: parent_contexts,
             }));
 
         // The iteration variable pipe points to concat's output
@@ -2582,12 +2655,24 @@ pub struct LogicalDataflow<T: Timestamp> {
     #[cfg(feature = "transport")]
     pub(crate) exchange_network_creators:
         Vec<(usize, usize, Box<dyn crate::dataflow::channels::exchange_channel::NetworkExchangeCreator>)>,
+    /// User-supplied typed context values, carried from the builder.
+    /// Available at materialization time and for future operator-level access.
+    pub(crate) contexts: SharedContext,
 }
 
 impl<T: Timestamp> LogicalDataflow<T> {
     /// Get the dataflow name.
     pub fn name(&self) -> &str {
         &self.name
+    }
+
+    /// Access the shared context values attached during graph construction.
+    ///
+    /// This allows code that has access to the `LogicalDataflow` (e.g., custom
+    /// materialization logic) to retrieve context values set via
+    /// [`DataflowBuilder::with_context`].
+    pub fn contexts(&self) -> &SharedContext {
+        &self.contexts
     }
 
     /// Get the number of operators in the graph.

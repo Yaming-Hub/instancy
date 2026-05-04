@@ -64,7 +64,7 @@ pub mod worker_pool;
 // ── Crate-level re-exports for ergonomic use ──────────────────────────
 
 // Dataflow construction
-pub use dataflow::{DataflowBuilder, DataflowBuilderConfig, LogicalDataflow, OutputPort, Pipe};
+pub use dataflow::{DataflowBuilder, DataflowBuilderConfig, LogicalDataflow, OutputPort, Pipe, SharedContext};
 pub use dataflow::id::DataflowId;
 pub use dataflow::dataflow_builder::IterateResult;
 pub use dataflow::stream::StreamEdge;
