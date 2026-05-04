@@ -22,6 +22,7 @@ use std::task::{Context, Poll};
 
 use crate::cancellation::CancellationToken;
 use crate::dataflow::channels::wake::WakeHandle;
+use crate::dataflow::control::{ControlReceiver, ControlSender};
 use crate::dataflow::graph::DataflowGraph;
 use crate::dataflow::probe::ProbeHandle;
 use crate::dataflow::schedulable::{
@@ -149,6 +150,10 @@ pub struct DataflowExecutor<T: Timestamp = u64> {
     consecutive_idle: usize,
     /// Worker index for error context enrichment.
     worker_index: usize,
+    /// Cross-worker control broadcast sender (for reporting errors to siblings).
+    control_sender: Option<ControlSender>,
+    /// Cross-worker control broadcast receiver (for learning about sibling errors).
+    control_receiver: Option<ControlReceiver>,
     /// Phantom for the timestamp type.
     _phantom: PhantomData<T>,
 }
@@ -309,6 +314,8 @@ impl<T: Timestamp> DataflowExecutor<T> {
             wake_handle,
             consecutive_idle: 0,
             worker_index: worker_context.worker_index(),
+            control_sender: None,
+            control_receiver: None,
             _phantom: PhantomData,
         })
     }
@@ -393,6 +400,22 @@ impl<T: Timestamp> DataflowExecutor<T> {
             probe.update_frontier(&frontier);
         }
         self.probes.push((operator_index, probe));
+    }
+
+    /// Attach cross-worker control broadcast sender and receiver.
+    ///
+    /// When set, the executor will:
+    /// - Broadcast operator errors to sibling workers before propagating them.
+    /// - Drain incoming control signals at the start of each sweep.
+    ///
+    /// Only used in multi-worker dataflows; single-worker dataflows skip this.
+    pub fn set_control_broadcast(
+        &mut self,
+        sender: ControlSender,
+        receiver: ControlReceiver,
+    ) {
+        self.control_sender = Some(sender);
+        self.control_receiver = Some(receiver);
     }
 
     /// Propagate progress and enqueue operators whose frontiers changed.
@@ -546,6 +569,16 @@ impl<T: Timestamp> DataflowExecutor<T> {
     /// This is the core building block for both sync [`run()`](Self::run)
     /// and async [`poll_run()`](#method.poll_run).
     fn run_one_sweep(&mut self) -> Result<SweepOutcome> {
+        // Drain incoming control signals (non-blocking).
+        // This is checked BEFORE the cancellation check so that control
+        // signals are consumed even when cancellation is already in flight.
+        if let Some(ref mut rx) = self.control_receiver {
+            // Signals are drained; currently the executor doesn't act on
+            // individual signals beyond what the CancellationToken provides.
+            // Future extensions (LimitReached handling, etc.) hook here.
+            let _signals = rx.try_recv();
+        }
+
         // Check cancellation.
         self.cancel.check()?;
 
@@ -584,7 +617,12 @@ impl<T: Timestamp> DataflowExecutor<T> {
 
             let outcome = self.operators[pos].activate().map_err(|e| {
                 let op_name = self.operators[pos].name().to_string();
-                e.with_operator_context(op_name, self.worker_index)
+                let enriched = e.with_operator_context(op_name.clone(), self.worker_index);
+                // Broadcast error to sibling workers so they cancel too.
+                if let Some(ref ctrl) = self.control_sender {
+                    ctrl.broadcast_error(op_name, format!("{enriched}"));
+                }
+                enriched
             })?;
 
             match outcome {
@@ -944,6 +982,8 @@ mod tests {
             wake_handle: WakeHandle::new(),
             consecutive_idle: 0,
             worker_index: 0,
+            control_sender: None,
+            control_receiver: None,
             _phantom: PhantomData,
         };
 
@@ -977,6 +1017,8 @@ mod tests {
             wake_handle: WakeHandle::new(),
             consecutive_idle: 0,
             worker_index: 0,
+            control_sender: None,
+            control_receiver: None,
             _phantom: PhantomData,
         };
 
@@ -1014,6 +1056,8 @@ mod tests {
             wake_handle: WakeHandle::new(),
             consecutive_idle: 0,
             worker_index: 0,
+            control_sender: None,
+            control_receiver: None,
             _phantom: PhantomData,
         };
 
@@ -1039,6 +1083,8 @@ mod tests {
             wake_handle: WakeHandle::new(),
             consecutive_idle: 0,
             worker_index: 0,
+            control_sender: None,
+            control_receiver: None,
             _phantom: PhantomData,
         };
 
@@ -1078,6 +1124,8 @@ mod tests {
             wake_handle: WakeHandle::new(),
             consecutive_idle: 0,
             worker_index: 0,
+            control_sender: None,
+            control_receiver: None,
             _phantom: PhantomData,
         };
 
@@ -1139,6 +1187,8 @@ mod tests {
             wake_handle: WakeHandle::new(),
             consecutive_idle: 0,
             worker_index: 0,
+            control_sender: None,
+            control_receiver: None,
             _phantom: PhantomData,
         };
 
@@ -1188,6 +1238,8 @@ mod tests {
             wake_handle: WakeHandle::new(),
             consecutive_idle: 0,
             worker_index: 0,
+            control_sender: None,
+            control_receiver: None,
             _phantom: PhantomData,
         };
 
@@ -1225,6 +1277,8 @@ mod tests {
             wake_handle: WakeHandle::new(),
             consecutive_idle: 0,
             worker_index: 0,
+            control_sender: None,
+            control_receiver: None,
             _phantom: PhantomData,
         };
 
@@ -1275,6 +1329,8 @@ mod tests {
             wake_handle: WakeHandle::new(),
             consecutive_idle: 0,
             worker_index: 0,
+            control_sender: None,
+            control_receiver: None,
             _phantom: PhantomData,
         };
 
@@ -1324,6 +1380,8 @@ mod tests {
             wake_handle: WakeHandle::new(),
             consecutive_idle: 0,
             worker_index: 0,
+            control_sender: None,
+            control_receiver: None,
             _phantom: PhantomData,
         };
 
@@ -1378,6 +1436,8 @@ mod tests {
             wake_handle: WakeHandle::new(),
             consecutive_idle: 0,
             worker_index: 0,
+            control_sender: None,
+            control_receiver: None,
             _phantom: PhantomData,
         };
 
@@ -1444,6 +1504,8 @@ mod tests {
             wake_handle: WakeHandle::new(),
             consecutive_idle: 0,
             worker_index: 0,
+            control_sender: None,
+            control_receiver: None,
             _phantom: PhantomData,
         };
 
@@ -1502,6 +1564,8 @@ mod tests {
             wake_handle: WakeHandle::new(),
             consecutive_idle: 0,
             worker_index: 0,
+            control_sender: None,
+            control_receiver: None,
             _phantom: PhantomData,
         };
 
@@ -1641,6 +1705,8 @@ mod tests {
             wake_handle: wake_handle.clone(),
             consecutive_idle: 0,
             worker_index: 0,
+            control_sender: None,
+            control_receiver: None,
             _phantom: PhantomData,
         };
 
@@ -1700,6 +1766,8 @@ mod tests {
             wake_handle: WakeHandle::new(),
             consecutive_idle: 0,
             worker_index: 0,
+            control_sender: None,
+            control_receiver: None,
             _phantom: PhantomData,
         };
 

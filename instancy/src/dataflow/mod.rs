@@ -7,6 +7,7 @@
 pub mod channel_operators;
 pub mod channels;
 pub mod context;
+pub mod control;
 pub mod dataflow_builder;
 pub mod executor;
 pub mod graph;
@@ -27,6 +28,8 @@ pub use channel_operators::{
 pub use channel_operators::{AsyncInputSender, AsyncOutputReceiver};
 pub use channels::{ControlSignal, Envelope, PartitionStrategy, Payload};
 pub use context::SharedContext;
+pub use control::{ControlReceiver, ControlSender, WorkerControl};
+pub(crate) use control::ControlBroadcast;
 pub use dataflow_builder::{DataflowBuilder, DataflowBuilderConfig, LogicalDataflow, OutputPort, Pipe};
 pub use executor::{DataflowExecutor, ExecutorConfig};
 pub use graph::{ChannelKind, DataflowGraph, EdgeInfo, OperatorInfo};

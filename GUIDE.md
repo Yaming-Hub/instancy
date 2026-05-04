@@ -848,6 +848,32 @@ stream.exchange("route", |x: &MyType| x.key.clone());
 
 If your operators are stateless (like `map` or `filter`), you don't need exchange — any worker can process any element.
 
+### Cross-Worker Error Propagation
+
+In multi-worker dataflows, if one worker's operator fails, all sibling workers
+are automatically cancelled via the built-in **control broadcast channel**.
+You don't need to wire up manual error forwarding — instancy handles it:
+
+```rust
+let rt = SimpleRuntime::new();
+let mut multi = rt.spawn_multi("my-pipeline", 4, |worker_idx, builder| {
+    let input = builder.input::<String>("data");
+    input.map("process", |_t, line| {
+        // If this panics in any worker, all 4 workers cancel promptly.
+        parse_line(&line).expect("bad input")
+    }).output("result");
+    Ok(())
+}).unwrap();
+```
+
+When worker 2's `process` operator panics, instancy:
+1. Catches the error and broadcasts a `WorkerControl::WorkerError` signal.
+2. Cancels the shared dataflow `CancellationToken`.
+3. All other workers see `Err(Cancelled)` on their next sweep and exit.
+
+The `join_blocking()` call returns the first error, with full operator and
+worker context attached.
+
 ---
 
 ## 7. Iteration and Loops
