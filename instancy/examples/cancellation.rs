@@ -28,7 +28,7 @@ fn main() {
     let result = SimpleRuntime::with_cancel(token).run(dataflow);
 
     match result {
-        Err(Error::Cancelled) => {
+        Err(Error::Cancelled { .. }) => {
             println!("Dataflow was cancelled (as expected).");
             println!("This demonstrates cooperative shutdown via CancellationToken.");
         }

@@ -21,8 +21,15 @@ pub enum Error {
     },
 
     /// The dataflow was cancelled via its cancellation token.
-    #[error("Dataflow cancelled")]
-    Cancelled,
+    ///
+    /// The optional [`CancellationReason`] indicates why cancellation occurred.
+    /// Use [`CancellationReason`] variants to distinguish user-initiated
+    /// cancellation from system-level causes (network errors, worker failures, etc.).
+    #[error("Dataflow cancelled{}", reason.as_ref().map(|r| format!(": {r}")).unwrap_or_default())]
+    Cancelled {
+        /// The reason for cancellation, if one was provided.
+        reason: Option<crate::cancellation::CancellationReason>,
+    },
 
     /// An error in progress tracking.
     #[error("Progress tracking error: {0}")]
@@ -127,7 +134,7 @@ mod tests {
 
     #[test]
     fn error_display_cancelled() {
-        let err = Error::Cancelled;
+        let err = Error::Cancelled { reason: None };
         assert_eq!(err.to_string(), "Dataflow cancelled");
     }
 
@@ -165,5 +172,31 @@ mod tests {
     fn error_is_send_sync() {
         fn assert_send_sync<T: Send + Sync>() {}
         assert_send_sync::<Error>();
+    }
+
+    #[test]
+    fn error_display_cancelled_with_reason() {
+        use crate::cancellation::CancellationReason;
+        let err = Error::Cancelled {
+            reason: Some(CancellationReason::NetworkError("timeout".into())),
+        };
+        assert_eq!(err.to_string(), "Dataflow cancelled: network error: timeout");
+    }
+
+    #[test]
+    fn error_cancelled_matches_with_struct_pattern() {
+        let err = Error::Cancelled { reason: None };
+        assert!(matches!(err, Error::Cancelled { reason: None }));
+
+        use crate::cancellation::CancellationReason;
+        let err2 = Error::Cancelled {
+            reason: Some(CancellationReason::UserRequested),
+        };
+        assert!(matches!(
+            err2,
+            Error::Cancelled {
+                reason: Some(CancellationReason::UserRequested)
+            }
+        ));
     }
 }

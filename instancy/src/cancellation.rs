@@ -46,12 +46,67 @@ use std::sync::{Arc, Mutex};
 
 use crate::dataflow::channels::wake::WakeHandle;
 
+/// The reason a dataflow was cancelled.
+///
+/// When a [`CancellationToken`] is cancelled, an optional reason can be
+/// attached to distinguish user-initiated cancellation from system-level
+/// causes. The reason follows **first-cancel-wins** semantics — if
+/// `cancel()` or `cancel_with_reason()` is called multiple times, only
+/// the first reason is recorded.
+///
+/// Child tokens inherit the reason from their parent: if a parent is
+/// cancelled with a reason, children will report that same reason via
+/// [`CancellationToken::reason()`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CancellationReason {
+    /// The user explicitly requested cancellation.
+    UserRequested,
+
+    /// The runtime is shutting down (e.g., [`RuntimeHandle`] dropped or
+    /// [`WorkerPool`] torn down).
+    RuntimeShutdown,
+
+    /// A network-level error caused cancellation (e.g., TCP disconnect,
+    /// transport session failure). The string describes the error.
+    NetworkError(String),
+
+    /// A worker in the dataflow failed, causing cascading cancellation
+    /// of peer workers. The string describes which worker or what failed.
+    WorkerFailed(String),
+
+    /// The owning handle (e.g., [`SpawnedDataflow`]) was dropped without
+    /// calling [`join()`], triggering automatic cancellation.
+    HandleDropped,
+
+    /// An operator produced an error that caused the dataflow to be cancelled.
+    /// The string describes the operator and the error.
+    OperatorError(String),
+}
+
+impl fmt::Display for CancellationReason {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::UserRequested => write!(f, "user requested cancellation"),
+            Self::RuntimeShutdown => write!(f, "runtime shutdown"),
+            Self::NetworkError(msg) => write!(f, "network error: {msg}"),
+            Self::WorkerFailed(msg) => write!(f, "worker failed: {msg}"),
+            Self::HandleDropped => write!(f, "handle dropped"),
+            Self::OperatorError(msg) => write!(f, "operator error: {msg}"),
+        }
+    }
+}
+
 /// Shared state for a cancellation token.
 struct TokenInner {
     /// Whether this token has been cancelled.
     cancelled: AtomicBool,
     /// Parent token (if any). Cancelling the parent cancels this token.
     parent: Option<Arc<TokenInner>>,
+    /// The reason for cancellation (first-cancel-wins).
+    ///
+    /// Only written once during the first `cancel()` / `cancel_with_reason()`
+    /// call. Read by `reason()`.
+    reason: Mutex<Option<CancellationReason>>,
     /// Wake handles to notify when this token is cancelled.
     ///
     /// Only accessed during `register_wake_handle()` (setup) and `cancel()`
@@ -82,6 +137,7 @@ impl CancellationToken {
             inner: Arc::new(TokenInner {
                 cancelled: AtomicBool::new(false),
                 parent: None,
+                reason: Mutex::new(None),
                 wake_handles: Mutex::new(Vec::new()),
             }),
         }
@@ -93,17 +149,21 @@ impl CancellationToken {
     ///
     /// Children do not affect the parent — cancelling a child does not
     /// propagate upward.
+    ///
+    /// When the parent is cancelled with a reason, the child inherits that
+    /// reason via [`reason()`](Self::reason).
     pub fn child_token(&self) -> Self {
         Self {
             inner: Arc::new(TokenInner {
                 cancelled: AtomicBool::new(false),
                 parent: Some(Arc::clone(&self.inner)),
+                reason: Mutex::new(None),
                 wake_handles: Mutex::new(Vec::new()),
             }),
         }
     }
 
-    /// Cancel this token, signaling all holders to shut down.
+    /// Cancel this token with the default reason ([`CancellationReason::UserRequested`]).
     ///
     /// This is idempotent — calling cancel() multiple times is safe.
     /// Cancellation propagates to all child tokens (they observe it
@@ -112,15 +172,73 @@ impl CancellationToken {
     /// Any wake handles registered via [`register_wake_handle`](Self::register_wake_handle)
     /// are notified so that sleeping async executors wake promptly.
     pub fn cancel(&self) {
-        // Use swap to ensure we only notify once (idempotent).
+        self.cancel_with_reason(CancellationReason::UserRequested);
+    }
+
+    /// Cancel this token with a specific reason.
+    ///
+    /// The reason follows **first-cancel-wins** semantics: if this token
+    /// is already cancelled — either directly or via an ancestor — the
+    /// new reason is silently ignored. This prevents child tokens from
+    /// overwriting an inherited parent reason.
+    ///
+    /// This is idempotent — subsequent calls do not change the state.
+    pub fn cancel_with_reason(&self, reason: CancellationReason) {
+        // If already cancelled (directly or via ancestor), do nothing.
+        // This prevents a child from overwriting an inherited parent reason.
+        if self.is_cancelled() {
+            return;
+        }
+        // Store the reason BEFORE setting the cancelled flag so that
+        // concurrent `reason()` callers never observe cancelled=true
+        // with reason=None. The mutex serializes concurrent writers;
+        // first writer wins (check r.is_none()).
+        {
+            let mut guard = self.inner.reason.lock().unwrap_or_else(|e| e.into_inner());
+            if guard.is_none() {
+                *guard = Some(reason);
+            }
+        }
+        // Now set the flag and notify (only the first swap notifies).
         if !self.inner.cancelled.swap(true, Ordering::AcqRel) {
-            // First cancellation — notify all registered wake handles.
             if let Ok(handles) = self.inner.wake_handles.lock() {
                 for handle in handles.iter() {
                     handle.notify();
                 }
             }
         }
+    }
+
+    /// Returns the reason this token was cancelled, if available.
+    ///
+    /// If this token was directly cancelled via [`cancel()`](Self::cancel) or
+    /// [`cancel_with_reason()`](Self::cancel_with_reason), returns that reason.
+    /// If this token was cancelled transitively (via a parent), walks up the
+    /// ancestor chain to find the reason.
+    ///
+    /// Returns `None` if the token is not cancelled.
+    pub fn reason(&self) -> Option<CancellationReason> {
+        if !self.is_cancelled() {
+            return None;
+        }
+        // Check our own reason first (recover from poison — data is write-once)
+        let guard = self.inner.reason.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(reason) = guard.as_ref() {
+            return Some(reason.clone());
+        }
+        drop(guard);
+        // Walk up the parent chain to find the reason
+        let mut current = &self.inner.parent;
+        while let Some(parent) = current {
+            let guard = parent.reason.lock().unwrap_or_else(|e| e.into_inner());
+            if let Some(reason) = guard.as_ref() {
+                return Some(reason.clone());
+            }
+            drop(guard);
+            current = &parent.parent;
+        }
+        // Cancelled but no reason stored (shouldn't happen in normal usage)
+        None
     }
 
     /// Check whether this token has been cancelled.
@@ -158,12 +276,14 @@ impl CancellationToken {
     ///
     /// Convenience method for use in operator logic:
     /// ```ignore
-    /// token.check()?;  // returns Err(Error::Cancelled) if cancelled
+    /// token.check()?;  // returns Err(Error::Cancelled { .. }) if cancelled
     /// ```
     #[inline]
     pub fn check(&self) -> crate::error::Result<()> {
         if self.is_cancelled() {
-            Err(crate::error::Error::Cancelled)
+            Err(crate::error::Error::Cancelled {
+                reason: self.reason(),
+            })
         } else {
             Ok(())
         }
@@ -241,6 +361,7 @@ impl fmt::Debug for CancellationToken {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("CancellationToken")
             .field("cancelled", &self.is_cancelled())
+            .field("reason", &self.reason())
             .finish()
     }
 }
@@ -360,7 +481,7 @@ mod tests {
         let token = CancellationToken::new();
         token.cancel();
         let err = token.check().unwrap_err();
-        assert!(matches!(err, crate::error::Error::Cancelled));
+        assert!(matches!(err, crate::error::Error::Cancelled { .. }));
     }
 
     #[test]
@@ -369,7 +490,7 @@ mod tests {
         let child = parent.child_token();
         parent.cancel();
         let err = child.check().unwrap_err();
-        assert!(matches!(err, crate::error::Error::Cancelled));
+        assert!(matches!(err, crate::error::Error::Cancelled { .. }));
     }
 
     #[test]
@@ -586,5 +707,193 @@ mod tests {
         // swap(true) returns true, so notification loop is skipped.
         token.cancel();
         assert!(!wake.take_notification());
+    }
+
+    // -----------------------------------------------------------------------
+    // CancellationReason tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn cancel_default_reason_is_user_requested() {
+        let token = CancellationToken::new();
+        token.cancel();
+        assert_eq!(token.reason(), Some(CancellationReason::UserRequested));
+    }
+
+    #[test]
+    fn cancel_with_reason_stores_reason() {
+        let token = CancellationToken::new();
+        token.cancel_with_reason(CancellationReason::RuntimeShutdown);
+        assert_eq!(token.reason(), Some(CancellationReason::RuntimeShutdown));
+    }
+
+    #[test]
+    fn cancel_with_network_error_reason() {
+        let token = CancellationToken::new();
+        token.cancel_with_reason(CancellationReason::NetworkError("peer lost".into()));
+        assert_eq!(
+            token.reason(),
+            Some(CancellationReason::NetworkError("peer lost".into()))
+        );
+    }
+
+    #[test]
+    fn cancel_with_worker_failed_reason() {
+        let token = CancellationToken::new();
+        token.cancel_with_reason(CancellationReason::WorkerFailed("worker 3 panicked".into()));
+        assert_eq!(
+            token.reason(),
+            Some(CancellationReason::WorkerFailed("worker 3 panicked".into()))
+        );
+    }
+
+    #[test]
+    fn cancel_with_handle_dropped_reason() {
+        let token = CancellationToken::new();
+        token.cancel_with_reason(CancellationReason::HandleDropped);
+        assert_eq!(token.reason(), Some(CancellationReason::HandleDropped));
+    }
+
+    #[test]
+    fn cancel_with_operator_error_reason() {
+        let token = CancellationToken::new();
+        token.cancel_with_reason(CancellationReason::OperatorError("division by zero".into()));
+        assert_eq!(
+            token.reason(),
+            Some(CancellationReason::OperatorError("division by zero".into()))
+        );
+    }
+
+    #[test]
+    fn reason_returns_none_when_not_cancelled() {
+        let token = CancellationToken::new();
+        assert_eq!(token.reason(), None);
+    }
+
+    #[test]
+    fn first_cancel_wins_semantics() {
+        let token = CancellationToken::new();
+        token.cancel_with_reason(CancellationReason::NetworkError("first".into()));
+        token.cancel_with_reason(CancellationReason::UserRequested);
+        // First reason wins
+        assert_eq!(
+            token.reason(),
+            Some(CancellationReason::NetworkError("first".into()))
+        );
+    }
+
+    #[test]
+    fn child_inherits_parent_reason() {
+        let parent = CancellationToken::new();
+        let child = parent.child_token();
+
+        parent.cancel_with_reason(CancellationReason::RuntimeShutdown);
+        assert!(child.is_cancelled());
+        assert_eq!(child.reason(), Some(CancellationReason::RuntimeShutdown));
+    }
+
+    #[test]
+    fn grandchild_inherits_grandparent_reason() {
+        let gp = CancellationToken::new();
+        let parent = gp.child_token();
+        let child = parent.child_token();
+
+        gp.cancel_with_reason(CancellationReason::NetworkError("link down".into()));
+        assert!(child.is_cancelled());
+        assert_eq!(
+            child.reason(),
+            Some(CancellationReason::NetworkError("link down".into()))
+        );
+    }
+
+    #[test]
+    fn child_direct_reason_takes_precedence_when_cancelled_first() {
+        let parent = CancellationToken::new();
+        let child = parent.child_token();
+
+        // Cancel child first with its own reason (before parent)
+        child.cancel_with_reason(CancellationReason::OperatorError("bad op".into()));
+        // Then cancel parent
+        parent.cancel_with_reason(CancellationReason::RuntimeShutdown);
+
+        // Child's own reason takes precedence (check self before walking parent)
+        assert_eq!(
+            child.reason(),
+            Some(CancellationReason::OperatorError("bad op".into()))
+        );
+    }
+
+    #[test]
+    fn child_cannot_overwrite_inherited_parent_reason() {
+        let parent = CancellationToken::new();
+        let child = parent.child_token();
+
+        // Cancel parent first — child is now effectively cancelled
+        parent.cancel_with_reason(CancellationReason::RuntimeShutdown);
+        assert!(child.is_cancelled());
+
+        // Attempting to cancel child with a different reason should be no-op
+        child.cancel_with_reason(CancellationReason::HandleDropped);
+
+        // Child should still report parent's reason
+        assert_eq!(child.reason(), Some(CancellationReason::RuntimeShutdown));
+    }
+
+    #[test]
+    fn check_includes_reason_in_error() {
+        let token = CancellationToken::new();
+        token.cancel_with_reason(CancellationReason::NetworkError("timeout".into()));
+        let err = token.check().unwrap_err();
+        match err {
+            crate::error::Error::Cancelled { reason } => {
+                assert_eq!(
+                    reason,
+                    Some(CancellationReason::NetworkError("timeout".into()))
+                );
+            }
+            other => panic!("expected Cancelled, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn cancellation_reason_display() {
+        assert_eq!(
+            CancellationReason::UserRequested.to_string(),
+            "user requested cancellation"
+        );
+        assert_eq!(
+            CancellationReason::RuntimeShutdown.to_string(),
+            "runtime shutdown"
+        );
+        assert_eq!(
+            CancellationReason::NetworkError("peer lost".into()).to_string(),
+            "network error: peer lost"
+        );
+        assert_eq!(
+            CancellationReason::WorkerFailed("w3".into()).to_string(),
+            "worker failed: w3"
+        );
+        assert_eq!(
+            CancellationReason::HandleDropped.to_string(),
+            "handle dropped"
+        );
+        assert_eq!(
+            CancellationReason::OperatorError("oops".into()).to_string(),
+            "operator error: oops"
+        );
+    }
+
+    #[test]
+    fn error_display_cancelled_with_reason() {
+        let err = crate::error::Error::Cancelled {
+            reason: Some(CancellationReason::RuntimeShutdown),
+        };
+        assert_eq!(err.to_string(), "Dataflow cancelled: runtime shutdown");
+    }
+
+    #[test]
+    fn error_display_cancelled_without_reason() {
+        let err = crate::error::Error::Cancelled { reason: None };
+        assert_eq!(err.to_string(), "Dataflow cancelled");
     }
 }

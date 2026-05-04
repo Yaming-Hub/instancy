@@ -548,6 +548,49 @@ std::thread::spawn(move || {
 
 Cancellation is **cooperative**: it signals operators at their next check point. Operators wind down in an orderly fashion — they don't get forcibly killed mid-operation.
 
+#### Cancellation Reasons
+
+Every cancellation carries a [`CancellationReason`](instancy::cancellation::CancellationReason) that explains *why* the dataflow was cancelled. This helps distinguish user-initiated stops from system failures:
+
+```rust
+use instancy::cancellation::{CancellationToken, CancellationReason};
+
+let mut handle = rt.spawn(dataflow).unwrap();
+
+// Cancel with a specific reason
+handle.cancel_with_reason(CancellationReason::UserRequested);
+
+// After join, inspect the cancellation reason
+match handle.join_blocking() {
+    Err(instancy::error::Error::Cancelled { reason }) => {
+        match reason {
+            Some(CancellationReason::UserRequested) => println!("User stopped the dataflow"),
+            Some(CancellationReason::NetworkError(msg)) => println!("Network failure: {msg}"),
+            Some(CancellationReason::WorkerFailed(msg)) => println!("Worker crashed: {msg}"),
+            Some(CancellationReason::RuntimeShutdown) => println!("Runtime shut down"),
+            Some(CancellationReason::HandleDropped) => println!("Handle was dropped"),
+            Some(CancellationReason::OperatorError(msg)) => println!("Operator error: {msg}"),
+            None => println!("Cancelled (no reason available)"),
+        }
+    }
+    Ok(()) => println!("Completed normally"),
+    Err(e) => println!("Other error: {e}"),
+}
+```
+
+The built-in reason variants are:
+
+| Variant | When used |
+|---------|-----------|
+| `UserRequested` | Default for `cancel()` — the caller explicitly requested cancellation |
+| `RuntimeShutdown` | The runtime is shutting down (`RuntimeHandle` dropped or `shutdown()` called) |
+| `NetworkError(String)` | A network-level error caused cancellation (TCP disconnect, transport failure) |
+| `WorkerFailed(String)` | A sibling worker failed, causing cascading cancellation |
+| `HandleDropped` | The `SpawnedDataflow` handle was dropped without calling `join()` |
+| `OperatorError(String)` | An operator produced an error that caused the dataflow to be cancelled |
+
+Reasons follow **first-cancel-wins** semantics: if a token is cancelled multiple times, only the first reason is recorded. Child tokens inherit their parent's reason.
+
 ---
 
 ## 5. Creating Custom Operators
