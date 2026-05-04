@@ -147,6 +147,8 @@ pub struct DataflowExecutor<T: Timestamp = u64> {
     /// Persisted across `poll_run` calls so the executor remembers how long
     /// it has been idle.
     consecutive_idle: usize,
+    /// Worker index for error context enrichment.
+    worker_index: usize,
     /// Phantom for the timestamp type.
     _phantom: PhantomData<T>,
 }
@@ -306,6 +308,7 @@ impl<T: Timestamp> DataflowExecutor<T> {
             external_inputs_open: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             wake_handle,
             consecutive_idle: 0,
+            worker_index: worker_context.worker_index(),
             _phantom: PhantomData,
         })
     }
@@ -579,7 +582,10 @@ impl<T: Timestamp> DataflowExecutor<T> {
                 continue;
             }
 
-            let outcome = self.operators[pos].activate()?;
+            let outcome = self.operators[pos].activate().map_err(|e| {
+                let op_name = self.operators[pos].name().to_string();
+                e.with_operator_context(op_name, self.worker_index)
+            })?;
 
             match outcome {
                 ActivationOutcome::MadeProgress => {
@@ -918,7 +924,7 @@ mod tests {
 
     #[test]
     fn executor_runs_single_operator_to_completion() {
-        let mut executor = DataflowExecutor {
+        let mut executor: DataflowExecutor<u64> = DataflowExecutor {
             operators: vec![Box::new(CountingOperator {
                 name: "counter".into(),
                 index: 0,
@@ -937,7 +943,8 @@ mod tests {
             external_inputs_open: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             wake_handle: WakeHandle::new(),
             consecutive_idle: 0,
-            _phantom: std::marker::PhantomData::<u64>,
+            worker_index: 0,
+            _phantom: PhantomData,
         };
 
         let result = executor.run();
@@ -950,7 +957,7 @@ mod tests {
         let cancel = CancellationToken::new();
         cancel.cancel();
 
-        let mut executor = DataflowExecutor {
+        let mut executor: DataflowExecutor<u64> = DataflowExecutor {
             operators: vec![Box::new(CountingOperator {
                 name: "infinite".into(),
                 index: 0,
@@ -969,7 +976,8 @@ mod tests {
             external_inputs_open: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             wake_handle: WakeHandle::new(),
             consecutive_idle: 0,
-            _phantom: std::marker::PhantomData::<u64>,
+            worker_index: 0,
+            _phantom: PhantomData,
         };
 
         let result = executor.run();
@@ -978,7 +986,7 @@ mod tests {
 
     #[test]
     fn executor_handles_multiple_operators() {
-        let mut executor = DataflowExecutor {
+        let mut executor: DataflowExecutor<u64> = DataflowExecutor {
             operators: vec![
                 Box::new(CountingOperator {
                     name: "a".into(),
@@ -1005,7 +1013,8 @@ mod tests {
             external_inputs_open: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             wake_handle: WakeHandle::new(),
             consecutive_idle: 0,
-            _phantom: std::marker::PhantomData::<u64>,
+            worker_index: 0,
+            _phantom: PhantomData,
         };
 
         let result = executor.run();
@@ -1015,7 +1024,7 @@ mod tests {
 
     #[test]
     fn executor_empty_dataflow_completes_immediately() {
-        let mut executor = DataflowExecutor {
+        let mut executor: DataflowExecutor<u64> = DataflowExecutor {
             operators: vec![],
             ready_queue: VecDeque::new(),
             in_queue: vec![],
@@ -1029,7 +1038,8 @@ mod tests {
             external_inputs_open: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             wake_handle: WakeHandle::new(),
             consecutive_idle: 0,
-            _phantom: std::marker::PhantomData::<u64>,
+            worker_index: 0,
+            _phantom: PhantomData,
         };
 
         let result = executor.run();
@@ -1053,7 +1063,7 @@ mod tests {
             fn close_inputs(&mut self) {}
         }
 
-        let mut executor = DataflowExecutor {
+        let mut executor: DataflowExecutor<u64> = DataflowExecutor {
             operators: vec![Box::new(AlwaysIdle)],
             ready_queue: VecDeque::from([0]),
             in_queue: vec![true],
@@ -1067,7 +1077,8 @@ mod tests {
             external_inputs_open: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             wake_handle: WakeHandle::new(),
             consecutive_idle: 0,
-            _phantom: std::marker::PhantomData::<u64>,
+            worker_index: 0,
+            _phantom: PhantomData,
         };
 
         // Should terminate via quiescence, not infinite loop.
@@ -1113,7 +1124,7 @@ mod tests {
             ch2.puller,
         ));
 
-        let mut executor = DataflowExecutor {
+        let mut executor: DataflowExecutor<u64> = DataflowExecutor {
             operators: vec![source, double, sink],
             ready_queue: VecDeque::from([0, 1, 2]),
             in_queue: vec![true, true, true],
@@ -1127,7 +1138,8 @@ mod tests {
             external_inputs_open: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             wake_handle: WakeHandle::new(),
             consecutive_idle: 0,
-            _phantom: std::marker::PhantomData::<u64>,
+            worker_index: 0,
+            _phantom: PhantomData,
         };
 
         let result = executor.run();
@@ -1175,7 +1187,8 @@ mod tests {
             external_inputs_open: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             wake_handle: WakeHandle::new(),
             consecutive_idle: 0,
-            _phantom: std::marker::PhantomData::<u64>,
+            worker_index: 0,
+            _phantom: PhantomData,
         };
 
         // Attach progress tracker
@@ -1211,7 +1224,8 @@ mod tests {
             external_inputs_open: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             wake_handle: WakeHandle::new(),
             consecutive_idle: 0,
-            _phantom: std::marker::PhantomData::<u64>,
+            worker_index: 0,
+            _phantom: PhantomData,
         };
 
         // Request notification at time 5
@@ -1260,7 +1274,8 @@ mod tests {
             external_inputs_open: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             wake_handle: WakeHandle::new(),
             consecutive_idle: 0,
-            _phantom: std::marker::PhantomData::<u64>,
+            worker_index: 0,
+            _phantom: PhantomData,
         };
 
         // Request notification at time 3 — frontier already past, fires immediately
@@ -1308,7 +1323,8 @@ mod tests {
             external_inputs_open: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             wake_handle: WakeHandle::new(),
             consecutive_idle: 0,
-            _phantom: std::marker::PhantomData::<u64>,
+            worker_index: 0,
+            _phantom: PhantomData,
         };
 
         // Poll the Future — should complete in one poll since all operators finish.
@@ -1361,7 +1377,8 @@ mod tests {
             external_inputs_open: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(1)),
             wake_handle: WakeHandle::new(),
             consecutive_idle: 0,
-            _phantom: std::marker::PhantomData::<u64>,
+            worker_index: 0,
+            _phantom: PhantomData,
         };
 
         // IdleOperator always returns Idle → hits idle threshold → WaitingForInput.
@@ -1426,7 +1443,8 @@ mod tests {
             external_inputs_open: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(1)),
             wake_handle: WakeHandle::new(),
             consecutive_idle: 0,
-            _phantom: std::marker::PhantomData::<u64>,
+            worker_index: 0,
+            _phantom: PhantomData,
         };
 
         let wake = executor.wake_handle();
@@ -1483,7 +1501,8 @@ mod tests {
             external_inputs_open: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             wake_handle: WakeHandle::new(),
             consecutive_idle: 0,
-            _phantom: std::marker::PhantomData::<u64>,
+            worker_index: 0,
+            _phantom: PhantomData,
         };
 
         let result = Pin::new(&mut executor).poll(&mut cx);
@@ -1621,7 +1640,8 @@ mod tests {
             external_inputs_open: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             wake_handle: wake_handle.clone(),
             consecutive_idle: 0,
-            _phantom: std::marker::PhantomData::<u64>,
+            worker_index: 0,
+            _phantom: PhantomData,
         };
 
         // First poll: should yield after `budget` sweeps (Pending, not Ready)
@@ -1679,7 +1699,8 @@ mod tests {
             external_inputs_open: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             wake_handle: WakeHandle::new(),
             consecutive_idle: 0,
-            _phantom: std::marker::PhantomData::<u64>,
+            worker_index: 0,
+            _phantom: PhantomData,
         };
 
         // Should run to completion without yielding
