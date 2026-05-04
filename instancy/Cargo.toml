@@ -2,6 +2,7 @@
 name = "instancy"
 version = "0.1.0"
 edition = "2024"
+rust-version = "1.85"
 description = "An async reimplementation of timely-dataflow built on Tokio"
 license = "MIT"
 repository = "https://github.com/Yaming-Hub/instancy"

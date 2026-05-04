@@ -13,11 +13,11 @@ use std::time::Duration;
 use tokio::net::{TcpListener, TcpStream};
 
 use instancy::communication::transport_session::PeerConnection;
-use instancy::dataflow::DataflowBuilder;
-use instancy::dataflow::id::DataflowId;
-use instancy::error::Result;
+use instancy::DataflowBuilder;
+use instancy::DataflowId;
+use instancy::Result;
 use instancy::execute::{ClusterTopology, NodeConfig};
-use instancy::runtime::{RuntimeConfig, RuntimeHandle};
+use instancy::{RuntimeConfig, RuntimeHandle};
 
 /// Default timeout for cluster completion in tests.
 const TEST_TIMEOUT: Duration = Duration::from_secs(30);
@@ -721,7 +721,7 @@ async fn stress_tcp_many_epochs() {
 /// Data starts at 0..10, increments each round, exits when >= 5.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn tcp_iterate_with_exchange() {
-    use instancy::dataflow::dataflow_builder::IterateResult;
+    use instancy::IterateResult;
 
     let topology = ClusterTopology::multi_node(vec![
         NodeConfig::new("node-a", 1),

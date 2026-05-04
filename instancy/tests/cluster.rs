@@ -8,11 +8,11 @@
 use std::time::Duration;
 
 use instancy::communication::transport_session::PeerConnection;
-use instancy::dataflow::DataflowBuilder;
-use instancy::dataflow::id::DataflowId;
-use instancy::error::Result;
+use instancy::DataflowBuilder;
+use instancy::DataflowId;
+use instancy::Result;
 use instancy::execute::{ClusterTopology, NodeConfig};
-use instancy::runtime::{RuntimeConfig, RuntimeHandle};
+use instancy::{RuntimeConfig, RuntimeHandle};
 
 /// Helper: create duplex connections between two nodes.
 ///
