@@ -50,7 +50,7 @@ use crate::worker::WorkerId;
 ///
 /// # Assignment
 ///
-/// Channel IDs are assigned sequentially by [`DataflowSession::allocate_channel`]
+/// Channel IDs are assigned sequentially by [`crate::communication::DataflowSession::allocate_channel`]
 /// starting at 1 (since 0 is reserved). The allocation is deterministic given
 /// the same graph construction order.
 ///
@@ -178,7 +178,7 @@ impl RoutingTable {
 /// Each record in the batch is individually length-prefixed to allow
 /// heterogeneous-size records within a single batch.
 
-/// Encode a data batch (time + Vec<D>) into wire bytes.
+/// Encode a data batch (time + `Vec<D>`) into wire bytes.
 ///
 /// The source_worker is included so the receiver knows which logical worker
 /// produced this batch (important for exchange routing verification).

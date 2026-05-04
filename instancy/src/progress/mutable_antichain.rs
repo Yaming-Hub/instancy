@@ -1,6 +1,6 @@
 //! MutableAntichain — a frontier tracker that supports incremental updates.
 //!
-//! Unlike [`Antichain`](crate::progress::frontier::Antichain), which is a simple
+//! Unlike [`Antichain`], which is a simple
 //! set of mutually incomparable elements, `MutableAntichain` tracks a **multiset**
 //! of timestamps where each timestamp has an integer count (multiplicity). The
 //! frontier is the set of minimal timestamps with positive total count.

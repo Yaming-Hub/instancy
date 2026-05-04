@@ -21,7 +21,7 @@
 //! Updates are appended eagerly (O(1)) but compaction (sort + consolidate + remove
 //! zeros) is deferred. The `clean` field marks how much of the `updates` vec has
 //! already been compacted. Compaction is triggered automatically when the dirty
-//! portion exceeds half the total size (see [`maintain_bounds`](ChangeBatch::maintain_bounds)),
+//! portion exceeds half the total size (see `maintain_bounds`),
 //! or explicitly when data is read (via `iter()`, `drain()`, etc.). This amortizes
 //! the O(n log n) sort cost across many O(1) appends.
 

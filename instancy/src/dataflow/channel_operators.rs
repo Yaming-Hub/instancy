@@ -9,7 +9,7 @@
 //!
 //! Both operators support synchronous (`std::sync::mpsc`) and asynchronous
 //! (`tokio::sync::mpsc`, feature-gated behind `async-io`) channel backends.
-//! The channel type is chosen at spawn time via [`ChannelMode`].
+//! The channel type is chosen at spawn time via `ChannelMode`.
 
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -114,8 +114,8 @@ impl<T> OutputSend<T> {
 
 /// A source operator that receives data from an external `mpsc` channel.
 ///
-/// Created by [`DataflowHandle`](super::dataflow_builder::DataflowHandle) for
-/// each declared `input()` port. The caller sends [`InputEvent`]s through
+/// Created by [`crate::dataflow::DataflowHandle`] for each declared `input()`
+/// port. The caller sends [`InputEvent`]s through
 /// an [`InputSender`], which this operator consumes and pushes downstream.
 ///
 /// # Quiescence behavior
@@ -275,8 +275,8 @@ impl<T: Timestamp, D: Send + 'static> SchedulableOperator for ChannelSourceOpera
 
 /// A sink operator that sends output data to an external `mpsc` channel.
 ///
-/// Created by [`DataflowHandle`](super::dataflow_builder::DataflowHandle) for
-/// each declared `output()` port. Data received from upstream is forwarded
+/// Created by [`crate::dataflow::DataflowHandle`] for each declared `output()`
+/// port. Data received from upstream is forwarded
 /// as [`OutputEvent`]s to an [`OutputReceiver`].
 pub struct ChannelSinkOperator<T: Timestamp, D: Send + 'static> {
     name: String,
@@ -421,7 +421,7 @@ impl<T: Timestamp, D: Send + 'static> SchedulableOperator for ChannelSinkOperato
 
 /// A handle for sending data into a dataflow input port.
 ///
-/// Created by [`SpawnedDataflow::input()`]. Send [`InputEvent`]s to feed
+/// Created by [`crate::SpawnedDataflow::take_input`]. Send [`InputEvent`]s to feed
 /// data into the running dataflow. `InputSender` is **cloneable** — all
 /// clones share the same underlying channel. The channel closes only when
 /// **all** clones (including the one held by `SpawnedDataflow`) are dropped,
@@ -508,7 +508,7 @@ impl<T: Timestamp, D: Send + 'static> Drop for InputSender<T, D> {
 
 /// A handle for receiving output from a dataflow output port.
 ///
-/// Created by [`DataflowHandle::output()`]. Receives [`OutputEvent`]s
+/// Created by [`crate::SpawnedDataflow::take_output`]. Receives [`OutputEvent`]s
 /// containing timestamped batches of results.
 pub struct OutputReceiver<T: Timestamp, D: Send + 'static> {
     receiver: mpsc::Receiver<OutputEvent<T, D>>,
@@ -557,8 +557,8 @@ impl<T: Timestamp, D: Send + 'static> OutputReceiver<T, D> {
 
 /// A handle for sending data into a dataflow input port asynchronously.
 ///
-/// Created by [`SpawnedDataflow::take_async_input()`] when the dataflow was
-/// spawned with [`RuntimeHandle::spawn_async()`]. Backed by a
+/// Created by [`crate::SpawnedDataflow::take_async_input`] when the dataflow was
+/// spawned with [`crate::RuntimeHandle::spawn_async`]. Backed by a
 /// `tokio::sync::mpsc::Sender` — the `send()` method yields when the channel
 /// is full (backpressure) instead of blocking the calling thread.
 ///
@@ -637,8 +637,8 @@ impl<T: Timestamp, D: Send + 'static> Drop for AsyncInputSender<T, D> {
 
 /// A handle for receiving output from a dataflow output port asynchronously.
 ///
-/// Created by [`SpawnedDataflow::take_async_output()`] when the dataflow was
-/// spawned with [`RuntimeHandle::spawn_async()`]. Backed by a
+/// Created by [`crate::SpawnedDataflow::take_async_output`] when the dataflow was
+/// spawned with [`crate::RuntimeHandle::spawn_async`]. Backed by a
 /// `tokio::sync::mpsc::Receiver` — the `recv()` method yields when no data
 /// is available, resuming when the dataflow produces output.
 ///

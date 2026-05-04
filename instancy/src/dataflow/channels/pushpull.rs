@@ -50,7 +50,7 @@ pub trait Push<T: Timestamp, D, M = ()>: Send {
     /// - `None`: capacity is unknown or not applicable (e.g., network channels
     ///   that buffer internally). Callers should attempt `try_push()` directly.
     ///
-    /// Used by composite pushers (e.g., [`ExchangePush`]) to pre-check capacity
+    /// Used by composite pushers (e.g., [`crate::dataflow::channels::exchange_channel::ExchangePush`]) to pre-check capacity
     /// across multiple targets before committing to delivery, preserving
     /// all-or-nothing semantics for `try_push`.
     fn available_capacity(&self) -> Option<usize> {

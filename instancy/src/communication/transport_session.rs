@@ -69,7 +69,7 @@ use crate::dataflow::id::DataflowId;
 /// [`ConnectionManager`]: crate::communication::connection::ConnectionManager
 #[cfg(feature = "transport")]
 pub struct PeerConnection<R, W> {
-    /// Identifier for the remote node (must match [`ClusterTopology`] node IDs).
+    /// Identifier for the remote node (must match [`crate::ClusterTopology`] node IDs).
     pub node_id: String,
     /// Read half of the connection (feeds Demuxer).
     pub reader: R,

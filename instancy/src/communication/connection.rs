@@ -524,7 +524,7 @@ impl<E: fmt::Debug + fmt::Display + Send + Sync + 'static> std::error::Error for
 
 /// RAII guard that returns a connection to the pool when dropped.
 ///
-/// Access the underlying connection via [`Deref`]/[`DerefMut`].
+/// Access the underlying connection via [`std::ops::Deref`]/[`std::ops::DerefMut`].
 pub struct PoolGuard<'pool, M: ConnectionManager> {
     pool: &'pool ConnectionPool<M>,
     peer_id: PeerId,
