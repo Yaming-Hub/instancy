@@ -845,6 +845,7 @@ where
 /// The materializer is wrapped in `Arc<Mutex<>>` because it is shared
 /// across N worker factory closures (each worker calls
 /// `materialize_worker` once during Phase 5 materialization).
+#[allow(dead_code)] // Available for custom materializer integration
 pub(crate) fn create_exchange_factories_with<T, D>(
     num_workers: usize,
     exchange_fn: ExchangeFn<D>,
