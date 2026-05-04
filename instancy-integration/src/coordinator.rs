@@ -13,10 +13,14 @@ use std::time::Duration;
 use tokio::io::{BufReader, BufWriter};
 use tokio::net::TcpListener;
 use tokio::process::{Child, Command};
+use tokio::time::timeout;
 
 use crate::protocol::*;
 
 /// Manages node processes and control connections for a test.
+///
+/// Timeout for waiting on node responses (prevents hung CI on wedged nodes).
+const WAIT_TIMEOUT: Duration = Duration::from_secs(60);
 pub struct TestCoordinator {
     /// Node ID → child process.
     processes: HashMap<String, Child>,
@@ -358,9 +362,13 @@ impl TestCoordinator {
             )
             .await;
         }
-        // Collect responses
+        // Collect responses (with timeout to prevent hung CI)
         for node_id in &node_ids {
-            let resp = self.recv_response(node_id).await;
+            let resp = timeout(WAIT_TIMEOUT, self.recv_response(node_id))
+                .await
+                .unwrap_or_else(|_| {
+                    panic!("Timed out waiting for completion on {node_id} ({}s)", WAIT_TIMEOUT.as_secs())
+                });
             match resp {
                 NodeResponse::DataflowCompleted { success, error, .. } => {
                     if !success {
@@ -376,6 +384,80 @@ impl TestCoordinator {
                 _ => panic!("unexpected response from {node_id}"),
             }
         }
+    }
+
+    /// Cancel a running dataflow on all nodes.
+    ///
+    /// Validates that each node acknowledged the cancellation. Panics if any
+    /// node returns an unexpected response (e.g., "no active dataflow").
+    pub async fn cancel_dataflow(&mut self, dataflow_id: &str) {
+        let node_ids: Vec<String> = self.connections.keys().cloned().collect();
+        for node_id in &node_ids {
+            self.send_command_fire(
+                node_id,
+                NodeCommand::CancelDataflow {
+                    dataflow_id: dataflow_id.into(),
+                },
+            )
+            .await;
+        }
+        for node_id in &node_ids {
+            let resp = self.recv_response(node_id).await;
+            match resp {
+                NodeResponse::Error { ref message }
+                    if message.to_lowercase().contains("cancel") =>
+                {
+                    // Expected: node_actor returns Error with "cancelled <id>"
+                }
+                _ => panic!(
+                    "Unexpected CancelDataflow response from {node_id}: {resp:?}"
+                ),
+            }
+        }
+    }
+
+    /// Wait for a dataflow to complete, accepting cancellation as a valid outcome.
+    ///
+    /// Returns `true` if all nodes completed successfully, `false` if any node
+    /// reported cancellation. Panics on unexpected errors.
+    pub async fn wait_for_completion_allow_cancel(&mut self, dataflow_id: &str) -> bool {
+        let node_ids: Vec<String> = self.connections.keys().cloned().collect();
+        for node_id in &node_ids {
+            self.send_command_fire(
+                node_id,
+                NodeCommand::WaitForCompletion {
+                    dataflow_id: dataflow_id.into(),
+                },
+            )
+            .await;
+        }
+        let mut all_success = true;
+        for node_id in &node_ids {
+            let resp = timeout(WAIT_TIMEOUT, self.recv_response(node_id))
+                .await
+                .unwrap_or_else(|_| {
+                    panic!("Timed out waiting for completion on {node_id} ({}s)", WAIT_TIMEOUT.as_secs())
+                });
+            match resp {
+                NodeResponse::DataflowCompleted { success, error, .. } => {
+                    if !success {
+                        let err_msg = error.unwrap_or_default();
+                        // Cancellation is expected — not a test failure
+                        if !err_msg.to_lowercase().contains("cancel") {
+                            panic!(
+                                "Dataflow failed on {node_id} (non-cancellation): {err_msg}"
+                            );
+                        }
+                        all_success = false;
+                    }
+                }
+                NodeResponse::Error { message } => {
+                    panic!("WaitForCompletion failed on {node_id}: {message}");
+                }
+                _ => panic!("unexpected response from {node_id}"),
+            }
+        }
+        all_success
     }
 
     /// Send shutdown to all nodes and wait for processes to exit.
