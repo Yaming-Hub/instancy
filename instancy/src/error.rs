@@ -22,8 +22,8 @@ pub enum Error {
 
     /// The dataflow was cancelled via its cancellation token.
     ///
-    /// The optional [`CancellationReason`] indicates why cancellation occurred.
-    /// Use [`CancellationReason`] variants to distinguish user-initiated
+    /// The optional [`crate::CancellationReason`] indicates why cancellation occurred.
+    /// Use [`crate::CancellationReason`] variants to distinguish user-initiated
     /// cancellation from system-level causes (network errors, worker failures, etc.).
     #[error("Dataflow cancelled{}", reason.as_ref().map(|r| format!(": {r}")).unwrap_or_default())]
     Cancelled {

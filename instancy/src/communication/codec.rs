@@ -7,7 +7,7 @@
 //!
 //! - [`Codec<T>`] is the core trait: `encode` serializes a value into a byte buffer,
 //!   `decode` deserializes from a byte slice.
-//! - [`BincodeCodec`] provides a default implementation using the `bincode` + `serde`
+//! - `BincodeCodec` provides a default implementation using the `bincode` + `serde`
 //!   ecosystem (behind the `bincode-codec` feature flag).
 //! - Users can implement custom codecs for domain-specific formats (protobuf,
 //!   flatbuffers, zero-copy, etc.).

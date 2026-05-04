@@ -2,7 +2,7 @@
 //!
 //! The [`execute`] function is the main entry point for running a dataflow.
 //! It creates the worker thread pool, sets up the execution context,
-//! and returns a [`DataflowHandle`] for monitoring and control.
+//! and returns a [`crate::dataflow::DataflowHandle`] for monitoring and control.
 
 use std::time::Duration;
 

@@ -62,8 +62,8 @@ pub enum CancellationReason {
     /// The user explicitly requested cancellation.
     UserRequested,
 
-    /// The runtime is shutting down (e.g., [`RuntimeHandle`] dropped or
-    /// [`WorkerPool`] torn down).
+    /// The runtime is shutting down (e.g., [`crate::RuntimeHandle`] dropped or
+    /// [`crate::worker_pool::WorkerPool`] torn down).
     RuntimeShutdown,
 
     /// A network-level error caused cancellation (e.g., TCP disconnect,
@@ -74,8 +74,8 @@ pub enum CancellationReason {
     /// of peer workers. The string describes which worker or what failed.
     WorkerFailed(String),
 
-    /// The owning handle (e.g., [`SpawnedDataflow`]) was dropped without
-    /// calling [`join()`], triggering automatic cancellation.
+    /// The owning handle (e.g., [`crate::SpawnedDataflow`]) was dropped without
+    /// calling `join()`, triggering automatic cancellation.
     HandleDropped,
 
     /// An operator produced an error that caused the dataflow to be cancelled.

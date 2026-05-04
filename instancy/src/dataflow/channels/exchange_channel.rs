@@ -1,7 +1,7 @@
 //! Exchange channel — cross-worker data routing for multi-worker dataflows.
 //!
 //! This module provides the **physical transport** for exchange edges. A single
-//! logical exchange edge in the dataflow graph (declared via [`Pipe::exchange`])
+//! logical exchange edge in the dataflow graph (declared via [`crate::Pipe::exchange`])
 //! is materialized into an N×N matrix of channels — one per (source worker,
 //! target worker) pair. These are real data-carrying channels, not graph-level
 //! abstractions.
@@ -21,7 +21,7 @@
 //!
 //! # Wake semantics
 //!
-//! A [`SharedWakeRegistry`] provides bidirectional wake-up:
+//! A `SharedWakeRegistry` provides bidirectional wake-up:
 //! - **Push→target**: when worker i pushes to worker j, worker j is woken
 //! - **Pull→source**: when worker j pulls (freeing capacity), worker i is woken
 //!   so a backpressured sender can retry
@@ -221,7 +221,7 @@ impl<T: Timestamp, D: Send + 'static> ExchangeChannelSet<T, D> {
 ///
 /// Routes each record in a batch to the appropriate target worker based on
 /// the exchange hash function. After pushing, wakes the target worker's
-/// executor via [`SharedWakeRegistry`].
+/// executor via `SharedWakeRegistry`.
 ///
 /// # Transport independence
 ///
@@ -568,7 +568,7 @@ impl<T: Timestamp> FrontierAggregator<T> {
 /// ## Frontier aggregation
 ///
 /// Watermarks from individual source workers are **not** passed through directly.
-/// Instead, a [`FrontierAggregator`] tracks per-source watermarks and only emits
+/// Instead, a `FrontierAggregator` tracks per-source watermarks and only emits
 /// an aggregated watermark downstream when ALL sources have advanced past a
 /// timestamp. This prevents premature frontier advancement that could cause
 /// operators to incorrectly discard data or deadlock.

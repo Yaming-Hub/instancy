@@ -298,7 +298,7 @@ pub struct EdgeTypeInfo {
 ///
 /// Takes `(capacity, wake_handle)` where:
 /// - `capacity` is the channel buffer size
-/// - `wake_handle` is an optional [`WakeHandle`] for async executor notifications.
+/// - `wake_handle` is an optional [`crate::dataflow::channels::WakeHandle`] for async executor notifications.
 ///   When provided, channels notify the handle on push, close, drop, and
 ///   when pulling frees capacity (backpressure relief).
 ///

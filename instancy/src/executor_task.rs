@@ -352,7 +352,7 @@ impl Wake for PoolWaker {
 
 /// Owns all active ExecutorTasks and their ready queue.
 ///
-/// The ready queue is a simple Mutex<VecDeque> rather than a lock-free structure
+/// The ready queue is a simple `Mutex<VecDeque>` rather than a lock-free structure
 /// because contention is low (tasks are coarse-grained) and the critical section
 /// is tiny (push/pop an Arc).
 ///

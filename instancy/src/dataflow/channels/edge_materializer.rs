@@ -12,17 +12,17 @@
 //! # Implementations
 //!
 //! - [`LocalEdgeMaterializer`]: In-process bounded channels (wraps
-//!   [`ExchangeChannelSet`]). Used for single-node or when all workers share
-//!   a process.
+//!   `ExchangeChannelSet`). Used for single-node or when all workers share a
+//!   process.
 //! - Future: `MockNetworkEdgeMaterializer` — serialize/deserialize through
-//!   [`Codec`] over in-memory channels (for distributed testing without a
-//!   real network).
+//!   [`crate::communication::Codec`] over in-memory channels (for distributed
+//!   testing without a real network).
 //! - Future: `NetworkEdgeMaterializer` — real TCP/QUIC transport via
-//!   [`ConnectionPool`] and [`Muxer`]/[`Demuxer`].
+//!   [`crate::communication::ConnectionPool`] and
+//!   [`crate::communication::Muxer`]/[`crate::communication::Demuxer`].
 //!
 //! [`ExchangePush`]: super::exchange_channel::ExchangePush
 //! [`ExchangePull`]: super::exchange_channel::ExchangePull
-//! [`ExchangeChannelSet`]: super::exchange_channel::ExchangeChannelSet
 
 use crate::error::Result;
 use crate::progress::timestamp::Timestamp;
@@ -106,7 +106,7 @@ pub trait EdgeMaterializer<T: Timestamp, D: Send + 'static>: Send {
 
 /// Edge materializer for single-node (all workers in one process).
 ///
-/// Wraps [`ExchangeChannelSet`] to provide in-process bounded channels.
+/// Wraps `ExchangeChannelSet` to provide in-process bounded channels.
 /// This is the default materializer used when no cluster topology is
 /// configured — it produces the same channels as before the
 /// `EdgeMaterializer` abstraction was introduced.

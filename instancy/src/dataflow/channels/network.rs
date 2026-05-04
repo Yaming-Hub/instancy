@@ -1,7 +1,7 @@
 //! Network-backed edge materializer for real cross-node exchange.
 //!
 //! Provides [`NetworkEdgeMaterializer`], which implements [`EdgeMaterializer`]
-//! using real TCP transport via the Muxer/Demuxer infrastructure:
+//! using real TCP transport via the [`crate::communication::Muxer`]/[`crate::communication::Demuxer`] infrastructure:
 //!
 //! - **Same-node** worker pairs: direct `BoundedPush`/`BoundedPull` (shared
 //!   memory, zero serialization overhead).
@@ -29,7 +29,7 @@
 //!
 //! # Transport state lifetime
 //!
-//! The Muxer/Demuxer background tasks must outlive the materializer (which
+//! The [`crate::communication::Muxer`]/[`crate::communication::Demuxer`] background tasks must outlive the materializer (which
 //! is dropped after Phase 5 materialization). Transport state is held in
 //! `Arc<TransportState>` and shared by all `NetworkPush`/`NetworkPull`
 //! endpoints returned from `materialize_worker()`.
@@ -43,7 +43,8 @@
 //!
 //! The underlying TCP connections to peer nodes *can* be shared across
 //! dataflows (the wire [`Frame`] carries the `dataflow_id`, and the
-//! [`Demuxer`] dispatches to the correct per-dataflow, per-channel receiver).
+//! [`crate::communication::Demuxer`] dispatches to the correct per-dataflow,
+//! per-channel receiver).
 //! However, the Push/Pull endpoints themselves are dataflow-specific.
 //!
 //! # Close semantics
@@ -542,7 +543,7 @@ pub struct NetworkEdgeMaterializer<T: Timestamp + ExchangeData, D: ExchangeData>
     session: Arc<TransportSession>,
 
     /// Demuxer channel receivers for remote pull endpoints.
-    /// Key: (source_worker, target_worker) → tokio::mpsc::Receiver<Vec<u8>>
+    /// Key: (source_worker, target_worker) → `tokio::mpsc::Receiver<Vec<u8>>`
     demux_receivers: std::collections::HashMap<(usize, usize), tokio_mpsc::Receiver<Vec<u8>>>,
 
     /// Local channels for same-node pairs: [src][dst]

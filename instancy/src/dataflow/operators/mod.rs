@@ -8,7 +8,7 @@
 //! - [`inspect`]: Side-effect observation (pass-through)
 //! - [`probe`]: Frontier observation
 //! - [`binary`]: Two-input, single-output operator
-//! - [`concat`]: Merge multiple streams
+//! - [`mod@concat`]: Merge multiple streams
 //! - [`delay`]: Buffer records until frontier advances
 //! - [`exchange`]: Hash-based repartitioning
 //! - [`rebalance`]: Round-robin redistribution

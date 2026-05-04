@@ -38,7 +38,8 @@ use crate::progress::timestamp::Timestamp;
 /// Describes how timestamps transform through an operator's internals.
 ///
 /// For an operator with `I` inputs and `O` outputs, `connectivity[i][o]` is the
-/// [`Antichain`] of [`PathSummary`] values describing all paths from input `i`
+/// [`Antichain`] of [`crate::progress::timestamp::PathSummary`] values describing all
+/// paths from input `i`
 /// to output `o`. An empty antichain means there is no path.
 ///
 /// # Why antichains of summaries?

@@ -7,7 +7,7 @@
 //! - [`RuntimeHandle`] — production runtime with a shared worker thread pool,
 //!   configurable scheduling policy, and centralized cancellation.
 //!
-//! Both runtimes accept a [`LogicalDataflow`](crate::dataflow::LogicalDataflow)
+//! Both runtimes accept a [`LogicalDataflow`]
 //! and return a [`SpawnedDataflow`] handle for channel-based I/O.
 //!
 //! ## Async completion
@@ -195,8 +195,8 @@ impl RuntimeHandle {
 
     /// Spawn a dataflow on the worker pool with synchronous channel-based I/O.
     ///
-    /// Returns a [`SpawnedDataflow`] handle with sync [`InputSender`] and
-    /// [`OutputReceiver`] handles. Use [`spawn_async()`](Self::spawn_async)
+    /// Returns a [`SpawnedDataflow`] handle with sync [`crate::InputSender`] and
+    /// [`crate::OutputReceiver`] handles. Use `spawn_async()`
     /// for async I/O handles (feature-gated behind `async-io`).
     ///
     /// # Execution model
@@ -1605,9 +1605,9 @@ pub struct SpawnedDataflow<T: Timestamp> {
     name: String,
     cancel: CancellationToken,
     completion: Option<DataflowCompletion>,
-    /// (name, type_name, Box<InputSender<T, D>> as Box<dyn Any>)
+    /// `(name, type_name, Box<InputSender<T, D>> as Box<dyn Any>)`
     input_senders: Vec<(String, &'static str, Box<dyn std::any::Any + Send>)>,
-    /// (name, type_name, Box<OutputReceiver<T, D>> as Box<dyn Any>)
+    /// `(name, type_name, Box<OutputReceiver<T, D>> as Box<dyn Any>)`
     output_receivers: Vec<(String, &'static str, Box<dyn std::any::Any + Send>)>,
     _phantom: PhantomData<T>,
 }

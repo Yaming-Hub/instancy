@@ -5,7 +5,7 @@
 //!
 //! - **Same-node** worker pairs: direct in-process `BoundedPush`/`BoundedPull`
 //!   (shared memory, zero serialization overhead).
-//! - **Cross-node** worker pairs: [`SerializingPush`] / [`DeserializingPull`]
+//! - **Cross-node** worker pairs: `SerializingPush` / `DeserializingPull`
 //!   that encode/decode data through the [`Codec`] trait over in-memory byte
 //!   channels.
 //!
@@ -435,7 +435,7 @@ impl<T: Timestamp + ExchangeData, D: ExchangeData> Pull<T, D, ()>
 /// Edge materializer that simulates multi-node exchange in a single process.
 ///
 /// **All** worker pairs — whether same-node or cross-node — communicate
-/// through [`SerializingPush`]/[`DeserializingPull`], which encode and
+/// through `SerializingPush`/`DeserializingPull`, which encode and
 /// decode every envelope through the [`Codec`] trait over in-memory byte
 /// channels. This ensures the mock exercises the full serialization
 /// round-trip for every message, catching codec bugs that a direct

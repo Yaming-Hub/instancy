@@ -706,8 +706,8 @@ impl<T: Timestamp> Tracker<T> {
     /// Same `(time, location)` entries are accumulated before processing,
     /// so +1 and -1 for the same pointstamp cancel out without propagation.
     ///
-    /// After calling this, read frontier implications via [`drain_pushed`] and
-    /// [`drain_output_changes`].
+    /// After calling this, read frontier implications via [`Self::drain_pushed`]
+    /// and [`Self::drain_output_changes`].
     pub fn propagate_all(&mut self) {
         // Step 1: Drain pending changes into pointstamps and seed the worklist.
         self.drain_pending_changes();

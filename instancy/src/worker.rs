@@ -59,8 +59,8 @@ impl From<usize> for WorkerId {
 ///   by `worker_index` to avoid cross-worker interference.
 /// - **Logging/metrics**: operators can tag metrics with the worker index.
 ///
-/// For single-worker dataflows (spawned via [`RuntimeHandle::spawn()`] or
-/// [`SimpleRuntime::spawn()`]), `worker_index` is 0 and `num_workers` is 1.
+/// For single-worker dataflows (spawned via [`crate::RuntimeHandle::spawn`] or
+/// [`crate::SimpleRuntime::spawn`]), `worker_index` is 0 and `num_workers` is 1.
 ///
 /// # Example
 ///
