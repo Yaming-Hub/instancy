@@ -2,8 +2,13 @@
 name = "instancy"
 version = "0.1.0"
 edition = "2024"
-description = "An async reimplementation of timely-dataflow"
+description = "An async reimplementation of timely-dataflow built on Tokio"
 license = "MIT"
+repository = "https://github.com/Yaming-Hub/instancy"
+homepage = "https://github.com/Yaming-Hub/instancy"
+keywords = ["dataflow", "streaming", "async", "distributed", "timely"]
+categories = ["concurrency", "asynchronous", "network-programming"]
+readme = "../README.md"
 
 [dependencies]
 thiserror = "2"
