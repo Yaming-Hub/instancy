@@ -4115,4 +4115,181 @@ mod tests {
             assert!(data[0].tag.starts_with("original-"), "pipeline data integrity failed");
         }
     }
+
+    // -----------------------------------------------------------------------
+    // Context injection tests
+    // -----------------------------------------------------------------------
+
+    #[derive(Debug, Clone, PartialEq)]
+    struct TestConfig {
+        multiplier: i32,
+    }
+
+    #[derive(Debug, Clone, PartialEq)]
+    struct TestLabel {
+        name: String,
+    }
+
+    #[test]
+    fn context_set_and_get_in_builder() {
+        let builder = DataflowBuilder::<u64>::new("ctx-test");
+        builder.with_context(TestConfig { multiplier: 42 });
+
+        let cfg = builder.get_context::<TestConfig>().unwrap();
+        assert_eq!(cfg.multiplier, 42);
+
+        // Missing type returns None
+        assert!(builder.get_context::<TestLabel>().is_none());
+    }
+
+    #[test]
+    fn context_multiple_types() {
+        let builder = DataflowBuilder::<u64>::new("ctx-multi");
+        builder
+            .with_context(TestConfig { multiplier: 10 })
+            .with_context(TestLabel {
+                name: "test".into(),
+            });
+
+        assert_eq!(builder.get_context::<TestConfig>().unwrap().multiplier, 10);
+        assert_eq!(
+            builder.get_context::<TestLabel>().unwrap().name,
+            "test"
+        );
+    }
+
+    #[test]
+    fn context_survives_build() {
+        let builder = DataflowBuilder::<u64>::new("ctx-build");
+        builder.with_context(TestConfig { multiplier: 7 });
+
+        let input = builder.input::<i32>("data");
+        let _out = input.output("sink");
+        let dataflow = builder.build().unwrap();
+
+        // Context is accessible on the LogicalDataflow
+        let cfg = dataflow.contexts().get::<TestConfig>().unwrap();
+        assert_eq!(cfg.multiplier, 7);
+    }
+
+    #[test]
+    fn context_used_in_map_operator() {
+        let rt = RuntimeHandle::new(RuntimeConfig::default()).unwrap();
+
+        let builder = DataflowBuilder::<u64>::new("ctx-map");
+        builder.with_context(TestConfig { multiplier: 3 });
+
+        let cfg = builder.get_context::<TestConfig>().unwrap();
+        let input = builder.input::<i32>("data");
+        let _out = input
+            .map("multiply", move |_t, x| x * cfg.multiplier)
+            .output("result");
+
+        let dataflow = builder.build().unwrap();
+        let mut handle = rt.spawn(dataflow).unwrap();
+
+        let sender = handle.take_input::<i32>("data").unwrap();
+        sender.send(0, vec![1, 2, 3]).unwrap();
+        sender.close();
+
+        let receiver = handle.take_output::<i32>("result").unwrap();
+        handle.join_blocking().unwrap();
+
+        let mut data: Vec<i32> = receiver.collect_data().into_iter().flat_map(|(_, d)| d).collect();
+        data.sort();
+        assert_eq!(data, vec![3, 6, 9]);
+    }
+
+    #[test]
+    fn context_in_multi_worker_dataflow() {
+        let rt = RuntimeHandle::new(RuntimeConfig::default()).unwrap();
+
+        let mut handle = rt
+            .spawn_multi("ctx-multi-worker", 3, move |_worker_idx, builder| {
+                builder.with_context(TestConfig { multiplier: 5 });
+
+                let cfg = builder.get_context::<TestConfig>().unwrap();
+                let input = builder.input::<i32>("data");
+                input
+                    .map("multiply", move |_t, x| x * cfg.multiplier)
+                    .output("result");
+                Ok(())
+            })
+            .unwrap();
+
+        // Send to worker 0
+        let sender = handle.take_input::<i32>(0, "data").unwrap();
+        sender.send(0, vec![1, 2]).unwrap();
+        sender.close();
+
+        // Close other workers' inputs
+        for i in 1..3 {
+            let s = handle.take_input::<i32>(i, "data").unwrap();
+            s.close();
+        }
+
+        // Collect results from all workers
+        let mut all_data = Vec::new();
+        for i in 0..3 {
+            let receiver = handle.take_output::<i32>(i, "result").unwrap();
+            all_data.push(receiver);
+        }
+
+        handle.join_blocking().unwrap();
+
+        let mut collected: Vec<i32> = all_data
+            .into_iter()
+            .flat_map(|r| r.collect_data().into_iter().flat_map(|(_, d)| d))
+            .collect();
+        collected.sort();
+        assert_eq!(collected, vec![5, 10]);
+    }
+
+    #[test]
+    fn context_override_latest_wins() {
+        let builder = DataflowBuilder::<u64>::new("ctx-override");
+        builder.with_context(TestConfig { multiplier: 1 });
+        builder.with_context(TestConfig { multiplier: 99 });
+
+        let cfg = builder.get_context::<TestConfig>().unwrap();
+        assert_eq!(cfg.multiplier, 99);
+    }
+
+    #[test]
+    fn context_with_arc_avoids_double_wrap() {
+        let shared = Arc::new(TestConfig { multiplier: 77 });
+        let builder = DataflowBuilder::<u64>::new("ctx-arc");
+        builder.with_context_arc(shared.clone());
+
+        let retrieved = builder.get_context::<TestConfig>().unwrap();
+        // Same Arc allocation — no double-wrapping
+        assert!(Arc::ptr_eq(&shared, &retrieved));
+        assert_eq!(retrieved.multiplier, 77);
+    }
+
+    #[test]
+    fn context_inherited_in_iterate() {
+        use crate::dataflow::dataflow_builder::IterateResult;
+
+        let builder = DataflowBuilder::<u64>::new("ctx-iterate");
+        builder.with_context(TestConfig { multiplier: 2 });
+
+        let input = builder.input::<i32>("data");
+
+        // Context captured outside iterate should work, AND the inner scope
+        // should also have the context available via the shared BuilderState.
+        let cfg = builder.get_context::<TestConfig>().unwrap();
+        let out = input.iterate("loop", 1u32, move |iter_var| {
+            let cfg_cap = cfg.clone();
+            let result = iter_var.map("double", move |_t: &crate::order::Product<u64, u32>, x| x * cfg_cap.multiplier);
+            IterateResult { feedback: result.clone(), output: result }
+        });
+        out.output("result");
+
+        let dataflow = builder.build().unwrap();
+
+        // Verify context survives through iterate into the LogicalDataflow
+        let ctx = dataflow.contexts().get::<TestConfig>().unwrap();
+        assert_eq!(ctx.multiplier, 2);
+    }
 }
