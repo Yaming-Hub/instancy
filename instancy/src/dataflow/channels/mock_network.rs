@@ -460,7 +460,7 @@ impl<T: Timestamp + ExchangeData, D: ExchangeData> Pull<T, D, ()>
 /// // All pairs use SerializingPush → DeserializingPull (Codec round-trip)
 /// ```
 pub struct MockNetworkEdgeMaterializer<T: Timestamp + ExchangeData, D: ExchangeData> {
-    topology: ClusterTopology,
+    _topology: ClusterTopology,
     num_workers: usize,
 
     /// Byte channel senders: senders[src][dst].
@@ -497,7 +497,7 @@ impl<T: Timestamp + ExchangeData, D: ExchangeData> MockNetworkEdgeMaterializer<T
         }
 
         Self {
-            topology,
+            _topology: topology,
             num_workers,
             senders,
             receivers,
