@@ -42,7 +42,7 @@
 
 // Enable automatic doc(cfg) annotations on docs.rs builds so that
 // feature-gated items display which feature enables them.
-#![cfg_attr(docsrs, feature(doc_auto_cfg))]
+#![cfg_attr(docsrs, feature(doc_cfg))]
 // Prevent regressions: treat broken doc links as errors.
 #![deny(rustdoc::broken_intra_doc_links)]
 
