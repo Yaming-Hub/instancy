@@ -36,10 +36,13 @@ pub enum Error {
     Progress(String),
 
     /// An error produced by an operator.
-    #[error("Operator error in '{operator}': {source}")]
+    #[error("Operator error in '{operator}'{}: {source}",
+        worker_index.map(|w| format!(" (worker {w})")).unwrap_or_default())]
     Operator {
         /// The name of the operator that failed.
         operator: String,
+        /// The worker index where the error occurred, if known.
+        worker_index: Option<usize>,
         /// The underlying error.
         source: Box<dyn std::error::Error + Send + Sync>,
     },
@@ -92,7 +95,51 @@ impl Error {
     ) -> Self {
         Self::Operator {
             operator: name.into(),
+            worker_index: None,
             source: Box::new(err),
+        }
+    }
+
+    /// Create an operator error with worker context.
+    pub fn operator_with_context(
+        name: impl Into<String>,
+        worker_index: usize,
+        err: impl std::error::Error + Send + Sync + 'static,
+    ) -> Self {
+        Self::Operator {
+            operator: name.into(),
+            worker_index: Some(worker_index),
+            source: Box::new(err),
+        }
+    }
+
+    /// Wrap an existing error with operator context.
+    ///
+    /// If `self` is already an `Operator` variant with a `worker_index`,
+    /// returns it unchanged (preserves original context). If the existing
+    /// `Operator` has `worker_index: None`, the worker index is backfilled.
+    /// For all other error variants, wraps as a new `Operator` error.
+    pub fn with_operator_context(
+        self,
+        operator: impl Into<String>,
+        worker_index: usize,
+    ) -> Self {
+        match self {
+            Error::Operator {
+                operator: op_name,
+                worker_index: None,
+                source,
+            } => Self::Operator {
+                operator: op_name,
+                worker_index: Some(worker_index),
+                source,
+            },
+            Error::Operator { .. } => self,
+            other => Self::Operator {
+                operator: operator.into(),
+                worker_index: Some(worker_index),
+                source: Box::new(other),
+            },
         }
     }
 }
@@ -198,5 +245,66 @@ mod tests {
                 reason: Some(CancellationReason::UserRequested)
             }
         ));
+    }
+
+    #[test]
+    fn error_operator_with_context() {
+        let err = Error::operator_with_context(
+            "hash_join",
+            3,
+            std::io::Error::new(std::io::ErrorKind::Other, "key mismatch"),
+        );
+        let msg = err.to_string();
+        assert!(msg.contains("hash_join"), "should contain operator name");
+        assert!(msg.contains("worker 3"), "should contain worker index");
+        assert!(msg.contains("key mismatch"), "should contain source error");
+    }
+
+    #[test]
+    fn error_with_operator_context_wraps_non_operator() {
+        let err = Error::Custom("something failed".into());
+        let wrapped = err.with_operator_context("my_op", 2);
+        let msg = wrapped.to_string();
+        assert!(msg.contains("my_op"), "should contain operator name");
+        assert!(msg.contains("worker 2"), "should contain worker index");
+        assert!(msg.contains("something failed"), "should contain original error");
+    }
+
+    #[test]
+    fn error_with_operator_context_preserves_existing_operator() {
+        // Existing Operator with worker_index: None gets backfilled
+        let err = Error::operator("original_op", std::io::Error::new(
+            std::io::ErrorKind::Other, "original cause",
+        ));
+        let wrapped = err.with_operator_context("wrapper_op", 5);
+        let msg = wrapped.to_string();
+        assert!(msg.contains("original_op"), "should preserve original operator name");
+        assert!(!msg.contains("wrapper_op"), "should not overwrite with wrapper");
+        assert!(msg.contains("worker 5"), "should backfill worker index");
+    }
+
+    #[test]
+    fn error_with_operator_context_preserves_existing_worker_index() {
+        // Existing Operator with worker_index already set is fully preserved
+        let err = Error::operator_with_context("original_op", 7, std::io::Error::new(
+            std::io::ErrorKind::Other, "original cause",
+        ));
+        let wrapped = err.with_operator_context("wrapper_op", 99);
+        let msg = wrapped.to_string();
+        assert!(msg.contains("original_op"), "should preserve original operator");
+        assert!(msg.contains("worker 7"), "should keep original worker index");
+        assert!(!msg.contains("worker 99"), "should not overwrite worker index");
+    }
+
+    #[test]
+    fn error_operator_no_worker_index() {
+        // Error::operator() without context should not show worker info
+        let err = Error::operator(
+            "my_filter",
+            std::io::Error::new(std::io::ErrorKind::Other, "oops"),
+        );
+        let msg = err.to_string();
+        assert!(!msg.contains("worker"), "no worker info without context");
+        assert!(msg.contains("my_filter"));
     }
 }
