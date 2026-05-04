@@ -65,6 +65,7 @@ pub mod worker_pool;
 
 // Dataflow construction
 pub use dataflow::{DataflowBuilder, DataflowBuilderConfig, LogicalDataflow, OutputPort, Pipe, SharedContext};
+pub use dataflow::{ControlReceiver, ControlSender, WorkerControl};
 pub use dataflow::id::DataflowId;
 pub use dataflow::dataflow_builder::IterateResult;
 pub use dataflow::stream::StreamEdge;

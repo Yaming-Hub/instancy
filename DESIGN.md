@@ -2732,6 +2732,64 @@ The build-time capture pattern remains the recommended approach for simple cases
 Runtime access is intended for complex operators (e.g., custom `unary`/`binary`)
 where manual capture is cumbersome.
 
+### 9.9 Cross-Worker Control Broadcast
+
+When multiple workers execute the same dataflow in parallel, an operator
+failure in one worker must propagate to all siblings so they cancel
+promptly instead of hanging or producing incomplete results.
+
+#### Architecture
+
+instancy provides a built-in **control broadcast channel** that operates on
+the management plane (separate from the data-plane `ControlSignal` used for
+watermarks/errors within edges):
+
+```
+┌─────────┐        ┌──────────────────────┐        ┌─────────┐
+│ Worker 0 │──tx──►│  ControlBroadcast     │◄──tx──│ Worker 1 │
+│          │◄──rx──│  (Arc<Mutex<Vec>>)    │──rx──►│          │
+└─────────┘        │  + dataflow cancel    │        └─────────┘
+                   └──────────────────────┘
+```
+
+- **`ControlSender`** (cloneable): any worker can broadcast signals.
+- **`ControlReceiver`** (single-owner): each worker drains new signals with
+  an independent read cursor.
+- **`WorkerControl`** enum:
+  - `WorkerError { worker_index, operator, message }` — triggers automatic cancellation.
+  - `Cancel { worker_index, reason }` — explicit cancel request.
+  - `LimitReached { worker_index, description }` — informational, does **not** auto-cancel.
+
+#### Cancellation flow
+
+1. Worker A's operator panics/errors.
+2. `DataflowExecutor::run_one_sweep()` catches the error, calls
+   `control_sender.broadcast_error(op_name, message)`.
+3. The sender appends the signal and cancels the **shared dataflow
+   `CancellationToken`** (child of the runtime token, parent of all
+   worker tokens).
+4. Worker B's next sweep calls `cancel.check()` → sees cancellation →
+   returns `Err(Cancelled { reason: OperatorError(...) })`.
+
+#### Token hierarchy for multi-worker dataflows
+
+```
+RuntimeToken
+  └── DataflowToken  (shared by all workers in this dataflow)
+        ├── WorkerToken[0]
+        ├── WorkerToken[1]
+        └── ...
+```
+
+Cancelling the `DataflowToken` cascades to all worker tokens without
+affecting other dataflows on the same runtime.
+
+#### Single-worker optimization
+
+For single-worker dataflows (`num_workers == 1`), no `ControlBroadcast`
+is created — zero overhead. The executor's `control_sender` and
+`control_receiver` fields remain `None`.
+
 ---
 
 ## 10. User-Facing API Example

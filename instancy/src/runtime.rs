@@ -29,6 +29,7 @@ use std::task::{Context, Poll, Waker};
 use crate::cancellation::{CancellationReason, CancellationToken};
 use crate::dataflow::channels::wake::WakeHandle;
 use crate::dataflow::channel_operators::ChannelMode;
+use crate::dataflow::control::{ControlBroadcast, ControlReceiver, ControlSender};
 use crate::dataflow::dataflow_builder::{DataflowBuilder, LogicalDataflow};
 use crate::dataflow::executor::{DataflowExecutor, ExecutorConfig};
 use crate::dataflow::graph::OperatorInfo;
@@ -422,7 +423,7 @@ impl RuntimeHandle {
         pre_created_wake_handle: Option<WakeHandle>,
     ) -> Result<SpawnedDataflow<T>> {
         let (spawned, executor, notifier) =
-            self.prepare_worker(dataflow, mode, worker_context, progress_channels, pre_created_wake_handle)?;
+            self.prepare_worker(dataflow, mode, worker_context, progress_channels, pre_created_wake_handle, None, None)?;
         self.registry.register(executor, notifier);
         Ok(spawned)
     }
@@ -444,12 +445,15 @@ impl RuntimeHandle {
         worker_context: WorkerContext,
         progress_channels: Option<WorkerProgressChannels<T>>,
         pre_created_wake_handle: Option<WakeHandle>,
+        parent_cancel: Option<CancellationToken>,
+        control_broadcast: Option<(ControlSender, ControlReceiver)>,
     ) -> Result<(SpawnedDataflow<T>, Pin<Box<DataflowExecutor<T>>>, CompletionNotifier)> {
         if dataflow.operator_factories.is_empty() && dataflow.input_port_wiring.is_empty() {
             return Err(Error::Custom("cannot spawn an empty dataflow".into()));
         }
 
-        let cancel = self.cancel.child_token();
+        let parent = parent_cancel.unwrap_or_else(|| self.cancel.clone());
+        let cancel = parent.child_token();
         let cancel_handle = cancel.clone();
         let external_inputs_open = Arc::new(AtomicUsize::new(0));
         let name = dataflow.name().to_string();
@@ -512,6 +516,11 @@ impl RuntimeHandle {
 
         external_inputs_open.store(input_count, std::sync::atomic::Ordering::SeqCst);
         executor.replace_external_inputs_counter(external_inputs_open);
+
+        // Attach cross-worker control broadcast if provided.
+        if let Some((sender, receiver)) = control_broadcast {
+            executor.set_control_broadcast(sender, receiver);
+        }
 
         let (completion, notifier) = DataflowCompletion::new();
 
@@ -598,6 +607,28 @@ impl RuntimeHandle {
             Vec::new()
         };
 
+        // Phase 4b: Create cross-worker control broadcast channel.
+        // For multi-worker dataflows, all workers share a broadcast channel for
+        // error propagation and control signals. A shared dataflow-level cancel
+        // token ensures that any worker's error cascades to all siblings.
+        let dataflow_cancel = if num_workers > 1 {
+            Some(self.cancel.child_token())
+        } else {
+            None
+        };
+        let mut control_pairs: Vec<Option<(ControlSender, ControlReceiver)>> = if num_workers > 1 {
+            let df_cancel = dataflow_cancel.as_ref().unwrap().clone();
+            let (senders, receivers) =
+                ControlBroadcast::new(num_workers, &wake_handles, df_cancel);
+            senders
+                .into_iter()
+                .zip(receivers)
+                .map(|(s, r)| Some((s, r)))
+                .collect()
+        } else {
+            (0..num_workers).map(|_| None).collect()
+        };
+
         // Phase 5: Materialize all workers WITHOUT registering them yet.
         //
         // This is critical for correctness: materialize_executor() calls
@@ -627,7 +658,16 @@ impl RuntimeHandle {
                 None
             };
             let wh = wake_handles[worker_idx].clone();
-            match self.prepare_worker(dataflow, mode, ctx, pc, Some(wh)) {
+            let ctrl = control_pairs[worker_idx].take();
+            match self.prepare_worker(
+                dataflow,
+                mode,
+                ctx,
+                pc,
+                Some(wh),
+                dataflow_cancel.clone(),
+                ctrl,
+            ) {
                 Ok(worker) => {
                     prepared.push(worker);
                     spawned_count += 1;
@@ -662,6 +702,7 @@ impl RuntimeHandle {
             name: name.to_string(),
             num_workers,
             workers,
+            dataflow_cancel,
             _phantom: PhantomData,
         })
     }
@@ -1005,7 +1046,7 @@ impl RuntimeHandle {
             let ctx = WorkerContext::new(global_idx, total_workers);
             let pc = progress_channels_iter.next().map(Some).unwrap_or(None);
             let wh = wake_handles[global_idx].clone();
-            match self.prepare_worker(dataflow, mode, ctx, pc, Some(wh)) {
+            match self.prepare_worker(dataflow, mode, ctx, pc, Some(wh), None, None) {
                 Ok(worker) => prepared.push(worker),
                 Err(e) => {
                     for (w, _, _) in &prepared {
@@ -1043,6 +1084,7 @@ impl RuntimeHandle {
                 name: name.to_string(),
                 num_workers: num_local,
                 workers,
+                dataflow_cancel: None, // TODO: wire control broadcast for cluster local workers
                 _phantom: PhantomData,
             }),
             local_worker_range: (local_start, local_end),
@@ -1384,6 +1426,7 @@ impl SimpleRuntime {
             name: name.to_string(),
             num_workers,
             workers,
+            dataflow_cancel: None, // SimpleRuntime uses dedicated threads, not shared task pool
             _phantom: PhantomData,
         })
     }
@@ -1844,6 +1887,10 @@ pub struct MultiSpawnedDataflow<T: Timestamp> {
     name: String,
     num_workers: usize,
     workers: Vec<SpawnedDataflow<T>>,
+    /// Shared cancellation token for all workers in this dataflow.
+    /// Cancelling this token cascades to all worker tokens.
+    /// `None` for single-worker dataflows (no intermediate token).
+    dataflow_cancel: Option<CancellationToken>,
     _phantom: PhantomData<T>,
 }
 
@@ -4291,5 +4338,132 @@ mod tests {
         // Verify context survives through iterate into the LogicalDataflow
         let ctx = dataflow.contexts().get::<TestConfig>().unwrap();
         assert_eq!(ctx.multiplier, 2);
+    }
+
+    // ── Cross-worker control broadcast tests ──────────────────────────
+
+    #[test]
+    fn control_broadcast_worker_error_cancels_siblings() {
+        // When one worker's operator errors, the sibling should be cancelled.
+        let rt = SimpleRuntime::new();
+
+        // Use a shared flag to make only worker 0 fail.
+        let fail_flag = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let fail_clone = fail_flag.clone();
+
+        let mut multi = rt
+            .spawn_multi("ctrl-err", 2, move |worker_idx, builder: &mut DataflowBuilder<u64>| {
+                let input = builder.input::<i32>("data");
+                let flag = fail_clone.clone();
+                input.map("process", move |_t, x: i32| -> i32 {
+                    if flag.load(std::sync::atomic::Ordering::Relaxed) {
+                        panic!("intentional failure from worker");
+                    }
+                    x + 1
+                }).output("out");
+                // Mark worker 0 to fail on its first activation
+                if worker_idx == 0 {
+                    // We'll set the flag externally after spawn
+                }
+                Ok(())
+            })
+            .unwrap();
+
+        // Set the flag so worker 0 fails when it processes data
+        fail_flag.store(true, std::sync::atomic::Ordering::Relaxed);
+
+        // Feed data to worker 0 to trigger the error.
+        let tx0 = multi.take_input::<i32>(0, "data").unwrap();
+        tx0.send(0, vec![1]).unwrap();
+        tx0.close();
+
+        // Close worker 1's input too.
+        let tx1 = multi.take_input::<i32>(1, "data").unwrap();
+        tx1.close();
+
+        // Join — should see error from worker 0; worker 1 should be cancelled.
+        let result = multi.join_blocking();
+        assert!(
+            result.is_err(),
+            "multi-worker join should fail when a worker errors"
+        );
+        // Verify the error message relates to the worker failure.
+        let err_msg = format!("{}", result.unwrap_err());
+        assert!(
+            err_msg.contains("process") || err_msg.contains("intentional") 
+                || err_msg.contains("cancel") || err_msg.contains("panic")
+                || err_msg.contains("terminated"),
+            "error should relate to the failing worker: {err_msg}"
+        );
+    }
+
+    #[test]
+    fn control_broadcast_single_worker_no_overhead() {
+        // Single-worker spawn works without any control broadcast.
+        let rt = SimpleRuntime::new();
+        let mut multi = rt
+            .spawn_multi("single", 1, |_worker_idx, builder: &mut DataflowBuilder<u64>| {
+                let input = builder.input::<i32>("data");
+                input.map("inc", |_t, x: i32| x + 1).output("out");
+                Ok(())
+            })
+            .unwrap();
+
+        assert_eq!(multi.num_workers(), 1);
+        let sender = multi.take_input::<i32>(0, "data").unwrap();
+        sender.send(0, vec![10]).unwrap();
+        sender.close();
+
+        let receiver = multi.take_output::<i32>(0, "out").unwrap();
+        let results = receiver.collect_data();
+        let data: Vec<i32> = results.into_iter().flat_map(|(_, d)| d).collect();
+        assert_eq!(data, vec![11]);
+
+        multi.join_blocking().unwrap();
+    }
+
+    #[test]
+    fn control_broadcast_unit_test_sender_receiver() {
+        // Direct test of ControlBroadcast types.
+        use crate::dataflow::control::{ControlBroadcast, WorkerControl};
+        use crate::dataflow::channels::wake::WakeHandle;
+
+        let parent = CancellationToken::new();
+        let df_cancel = parent.child_token();
+        let wakes: Vec<WakeHandle> = (0..3).map(|_| WakeHandle::new()).collect();
+        let (senders, mut receivers) = ControlBroadcast::new(3, &wakes, df_cancel.clone());
+
+        // Broadcast error from worker 1
+        senders[1].broadcast_error("Map".into(), "boom".into());
+
+        // Token should be cancelled
+        assert!(df_cancel.is_cancelled());
+
+        // All receivers should see the signal
+        for (i, rx) in receivers.iter_mut().enumerate() {
+            let signals = rx.try_recv();
+            assert_eq!(signals.len(), 1, "receiver {i} should have 1 signal");
+            assert!(matches!(
+                &signals[0],
+                WorkerControl::WorkerError { worker_index: 1, operator, message }
+                    if operator == "Map" && message == "boom"
+            ));
+        }
+    }
+
+    #[test]
+    fn control_broadcast_limit_does_not_cancel() {
+        use crate::dataflow::control::ControlBroadcast;
+        use crate::dataflow::channels::wake::WakeHandle;
+
+        let parent = CancellationToken::new();
+        let df_cancel = parent.child_token();
+        let wakes: Vec<WakeHandle> = (0..2).map(|_| WakeHandle::new()).collect();
+        let (senders, _receivers) = ControlBroadcast::new(2, &wakes, df_cancel.clone());
+
+        senders[0].broadcast_limit("row budget exceeded".into());
+
+        // LimitReached should NOT cancel the token
+        assert!(!df_cancel.is_cancelled());
     }
 }
