@@ -18,7 +18,7 @@ pub fn port_names(dataflow_type: DataflowType) -> (Vec<String>, String) {
         DataflowType::MultiEpochExchange => (vec!["data".into()], "results".into()),
         DataflowType::DistributedWordCount => (vec!["sentences".into()], "results".into()),
         DataflowType::IterativeFilter => (vec!["data".into()], "results".into()),
-        DataflowType::DistributedJoin => (vec!["left".into(), "right".into()], "joined".into()),
+        DataflowType::DistributedJoin => (vec!["left".into(), "right".into()], "results".into()),
     }
 }
 
