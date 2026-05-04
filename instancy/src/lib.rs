@@ -1,18 +1,44 @@
 //! # instancy
 //!
-//! A reimplementation of [timely-dataflow](https://github.com/TimelyDataflow/timely-dataflow)
-//! with a custom worker thread pool, per-stage dynamic parallelism, structured
-//! message envelopes, pluggable networking/serialization, and robust error handling.
+//! An async reimplementation of [timely-dataflow](https://github.com/TimelyDataflow/timely-dataflow)
+//! built on [Tokio](https://tokio.rs/). instancy preserves timely's core theoretical model —
+//! partially ordered timestamps, progress tracking via pointstamps, frontier-based notifications,
+//! and nested scopes — while rearchitecting the runtime for async Rust.
 //!
-//! Key concepts:
-//! - **Scope**: A region of the dataflow graph sharing a common timestamp type.
-//! - **StreamEdge**: A typed edge connecting operators in the graph.
-//! - **Region**: An execution region with its own parallelism level.
-//! - **Envelope**: A structured message carrying data, control signals, and metadata.
-//! - **Frontier/Antichain**: Progress tracking primitives.
-//! - **WorkerPool**: Custom thread pool for synchronous operator execution.
-//! - **Providers**: Pluggable transport and execution backends.
-//! - **CancellationToken**: Cooperative shutdown signal for dataflows.
+//! ## Key differences from timely-dataflow
+//!
+//! - **Async execution**: Shared worker pool instead of dedicated OS threads per worker.
+//!   Multiple dataflows share threads for better resource utilization. Tokio is used
+//!   for transport and async I/O.
+//! - **Error handling**: `Result<T, Error>` throughout — operators return errors instead of panicking.
+//! - **Cancellation**: Cooperative `CancellationToken` with
+//!   `CancellationReason` for diagnosing why a dataflow stopped.
+//! - **Pluggable networking**: Application provides connections via a `ConnectionManager` trait —
+//!   supports mTLS, custom topologies, and connection pooling.
+//! - **Pluggable serialization**: `Codec` trait replaces timely's Abomonation-based approach.
+//!   Optional bincode support via `bincode-codec` feature.
+//! - **Builder API**: Chainable `DataflowBuilder` API instead of closure-based scope nesting.
+//!
+//! ## Core concepts
+//!
+//! - **`DataflowBuilder`**: Constructs a dataflow graph with
+//!   typed operators and edges.
+//! - **`StreamEdge`**: A typed edge connecting operators,
+//!   with chainable methods for `map`, `filter`, `exchange`, `unary`, `binary`, `iterate`, etc.
+//! - **Timestamps & Frontiers**: Partially ordered timestamps tracked as antichains.
+//!   Operators receive frontier notifications to know when all data for a time has arrived.
+//! - **`RuntimeHandle`**: Spawns and manages dataflow execution,
+//!   including multi-worker and multi-node clusters.
+//! - **`CancellationToken`**: Cooperative shutdown signal
+//!   for graceful dataflow termination.
+//!
+//! ## Feature flags
+//!
+//! - `tracing` *(default)* — structured logging via the `tracing` crate
+//! - `transport` *(default)* — TCP-based cross-node communication
+//! - `bincode-codec` — bincode serialization for exchange data
+//! - `async-io` — async input/output channels
+//! - `test-utils` — helpers for testing dataflow programs
 
 pub mod cancellation;
 pub mod communication;
