@@ -4,6 +4,17 @@
 //! output to a downstream operator's input within the same process.
 //! When the channel is full, `try_push()` returns the envelope back to the
 //! caller for retry (backpressure).
+//!
+//! # No-serialization transport
+//!
+//! Data flows through this channel by **value** — envelopes are moved into a
+//! `VecDeque` on push and moved out on pull. No serialization, deserialization,
+//! or byte-buffer encoding occurs. This is the transport used for all in-process
+//! edges (both pipeline and local exchange).
+//!
+//! Note: exchange routing may still **clone** records when distributing to
+//! multiple target workers. The guarantee is no *serialization* overhead —
+//! the `Codec` trait is never invoked for in-process channels.
 
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, Ordering};

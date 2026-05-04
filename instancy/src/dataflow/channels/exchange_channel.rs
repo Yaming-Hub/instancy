@@ -10,6 +10,26 @@
 //! the channels based on a hash function. Each target worker's
 //! [`ExchangePull`] merges data from its N input channels using round-robin.
 //!
+//! # No-serialization guarantee (in-process)
+//!
+//! When all workers run in the same process (the default `spawn_multi` mode),
+//! exchange channels use in-memory bounded channels ([`super::bounded`]). Data
+//! is moved by value through a `VecDeque<Envelope>` — **no serialization or
+//! deserialization occurs**. The `Codec` trait is only invoked for network-backed
+//! channels (cross-process exchange via `spawn_cluster`).
+//!
+//! Note: exchange routing may **clone** records when distributing to multiple
+//! target workers. The guarantee is no *byte encoding* overhead, not no-clone.
+//!
+//! **API bounds vs runtime behavior (with `transport` feature):** When the
+//! `transport` feature is enabled, the `exchange` API requires `ExchangeData`
+//! at the type level — even for `spawn_multi` (single-process). This is a
+//! compile-time safety measure ensuring types are serialization-capable for
+//! when a dataflow is deployed cross-process. At runtime, in-process exchange
+//! still uses bounded channels and never invokes `Codec`.
+//!
+//! Without the `transport` feature, exchange only needs `Clone + Send + 'static`.
+//!
 //! # Transport independence
 //!
 //! `ExchangePush` and `ExchangePull` hold `Vec<Box<dyn Push/Pull>>` —

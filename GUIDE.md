@@ -885,6 +885,48 @@ let connections: Vec<PeerConnection<_, _>> = vec![
 ];
 ```
 
+#### TLS Example
+
+Since instancy accepts any `AsyncRead + AsyncWrite` stream, you can use TLS (or mTLS) by
+establishing TLS connections in your application code and passing the resulting streams:
+
+```rust
+use tokio::net::TcpStream;
+use tokio_rustls::{TlsConnector, rustls};
+use rustls::pki_types::ServerName;
+use instancy::communication::transport_session::PeerConnection;
+use std::sync::Arc;
+
+// Load your certificates and build a TLS config
+let tls_config = rustls::ClientConfig::builder()
+    .with_root_certificates(load_ca_certs())       // your CA bundle
+    .with_client_auth_cert(client_certs, client_key) // for mTLS
+    .unwrap();
+let connector = TlsConnector::from(Arc::new(tls_config));
+
+// Establish a TLS connection to a peer node
+let tcp_stream = TcpStream::connect("peer-b.example.com:9000").await?;
+let server_name = ServerName::try_from("peer-b.example.com")?;
+let tls_stream = connector.connect(server_name, tcp_stream).await?;
+
+// Split into read/write halves and hand to instancy
+let (reader, writer) = tokio::io::split(tls_stream);
+
+let connections = vec![
+    PeerConnection {
+        peer_node_id: "node-b".to_string(),
+        reader,
+        writer,
+    },
+];
+
+// Pass `connections` to rt.spawn_cluster(...) — instancy uses them as-is.
+// It never opens sockets or negotiates TLS itself; that's entirely your responsibility.
+```
+
+This pattern works with any TLS library (`tokio-rustls`, `tokio-native-tls`, `s2n-tls-tokio`, etc.)
+and any authentication scheme (one-way TLS, mutual TLS, custom certificate validation).
+
 ### Spawning a Cluster Dataflow
 
 ```rust
