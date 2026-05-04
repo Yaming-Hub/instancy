@@ -52,7 +52,14 @@ These foundational concepts work the same way:
 
 ## Installation
 
-instancy is not yet published on crates.io. Add it as a git dependency in your `Cargo.toml`:
+Add instancy to your `Cargo.toml`:
+
+```toml
+[dependencies]
+instancy = "0.1"
+```
+
+Or use the git dependency for the latest development version:
 
 ```toml
 [dependencies]
