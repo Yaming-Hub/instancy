@@ -11,6 +11,10 @@ keywords = ["dataflow", "streaming", "async", "distributed", "timely"]
 categories = ["concurrency", "asynchronous", "network-programming"]
 readme = "../README.md"
 
+[package.metadata.docs.rs]
+all-features = true
+rustdoc-args = ["--cfg", "docsrs"]
+
 [dependencies]
 thiserror = "2"
 crossbeam-deque = "0.8"
