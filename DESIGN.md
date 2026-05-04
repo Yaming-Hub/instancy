@@ -1821,18 +1821,40 @@ pub fn check_timeout(ctx: &ActivationContext) -> Result<()> {
 |---|---|---|
 | Connection timeout | Send/recv deadline | `ErrorKind::NetworkError` → policy |
 | Connection reset | I/O error on channel | `ErrorKind::NetworkError` → reconnect via pool, then retry |
-| Worker lost | Heartbeat timeout | `ErrorKind::WorkerLost` → policy |
-| Remote process crash | Connection pool detects all connections to peer failed | `ErrorKind::WorkerLost` → policy |
+| Peer node down | **Hosting application** reports via `RuntimeHandle::report_peer_down(peer_id)` | `CancellationReason::PeerDown` → cancel affected dataflows |
+
+**Peer-Down Notification Model**
+
+Cluster health monitoring (heartbeats, liveness probes, etc.) is **not** the responsibility of instancy — it is the hosting application's responsibility. Different applications have vastly different network topologies and health detection needs (e.g., Kubernetes pod watchers, actor framework supervision, custom heartbeat protocols).
+
+instancy provides a notification API that the hosting application calls when it determines a peer is unreachable:
+
+```rust
+/// Report that a peer node is no longer reachable.
+/// All dataflows with workers on the downed peer are cancelled with
+/// `CancellationReason::PeerDown { peer_id }`.
+runtime_handle.report_peer_down(peer_id: PeerId);
+```
+
+**Design principles:**
+- **No automatic rescheduling**: instancy does not attempt to shift computation to surviving nodes. The hosting application handles retry by resubmitting the dataflow on healthy nodes.
+- **Application is the source of truth**: The runtime trusts the application's peer-down notification and does not perform its own consensus or heartbeat protocol.
+- **Clean cancellation**: Affected dataflows receive `CancellationReason::PeerDown` through the existing `CancellationToken` mechanism, allowing operators to clean up gracefully.
+- **Connection cleanup**: The connection pool evicts all connections to the downed peer.
 
 For `ErrorAction::Retry` on network errors:
 1. The failed send/receive is retried after exponential backoff.
 2. If the connection is dead, the connection pool establishes a new one.
 3. After `max_retries`, the fallback action (typically `Stop`) is applied.
 
-For `ErrorAction::Stop` on worker loss:
-1. The affected operator(s) are terminated.
-2. A `Control::Error` message propagates through the dataflow.
-3. `execute()` returns with the error describing which worker was lost.
+For peer-down cancellation:
+1. The hosting application calls `report_peer_down(peer_id)`.
+2. The runtime identifies all active dataflows with workers on that peer.
+3. Each affected dataflow's `CancellationToken` is triggered with `CancellationReason::PeerDown { peer_id }`.
+4. Operators observe cancellation, drop capabilities, and exit.
+5. `execute()` / `DataflowHandle` returns with an error indicating peer failure.
+6. The hosting application can retry the dataflow on healthy nodes.
+
 
 #### 5.9.6 Error Propagation Flow
 
@@ -3185,21 +3207,18 @@ When the application notifies the runtime that a new node has joined:
 
 #### Scaling-Down (Node Departures)
 
-When the application reports a node departure:
+When the application reports a node departure via `report_peer_down(peer_id)`:
 
-1. **Mark workers unavailable**: Logical workers on the departed node are marked as unavailable.
-2. **Drain in-flight data**: For graceful departures, the runtime waits for the node to drain its pending output (bounded by a configurable timeout). For failures, in-flight data on the lost node is considered lost.
-3. **Error propagation**: Depending on the dataflow's error policy:
-   - **Stop**: All affected dataflows receive `Error::NodeLost` and terminate.
-   - **Continue**: The runtime logs the loss, discards affected timestamps, and advances frontiers past the lost data.
-4. **Routing table update**: Routes to the departed node are removed. Future exchange/rebalance targets only include surviving nodes.
-5. **Connection cleanup**: The pool evicts all connections to the departed peer.
+1. **Cancel affected dataflows**: All dataflows with workers on the departed node are cancelled with `CancellationReason::PeerDown { peer_id }`. instancy does **not** attempt to reschedule work to surviving nodes — the hosting application owns retry logic.
+2. **Connection cleanup**: The pool evicts all connections to the departed peer.
+3. **Progress cleanup**: A departed node's outstanding capabilities are treated as "released" — the frontier advances past any timestamps that only the lost node could produce.
+4. **Application retry**: The hosting application can resubmit the dataflow targeting only healthy nodes.
 
 #### Consistency Guarantees
 
 - **Progress safety**: A departed node's outstanding capabilities are treated as "released" — the frontier advances past any timestamps that only the lost node could produce. This is safe because no more data at those timestamps will arrive.
 - **At-most-once by default**: If a node fails mid-computation, records being processed by that node may be lost. Applications requiring exactly-once semantics must use the checkpoint/recovery mechanism.
-- **No split-brain**: The application is the single source of truth for membership. The runtime trusts the application's events and does not perform its own consensus.
+- **No split-brain**: The application is the single source of truth for cluster membership. The runtime trusts the application's `report_peer_down` calls and does not perform its own consensus or health probing.
 
 #### Example: Kubernetes Integration
 
