@@ -10,8 +10,8 @@
 //! cargo run --example simple_pipeline
 //! ```
 
-use instancy::dataflow::DataflowBuilder;
-use instancy::runtime::SimpleRuntime;
+use instancy::DataflowBuilder;
+use instancy::SimpleRuntime;
 
 fn main() {
     // Phase 1: Build logical dataflow (no runtime involved)

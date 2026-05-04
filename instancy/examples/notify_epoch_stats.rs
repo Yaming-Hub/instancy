@@ -41,8 +41,8 @@
 use std::collections::HashMap;
 use std::fmt;
 
-use instancy::dataflow::DataflowBuilder;
-use instancy::runtime::{RuntimeConfig, RuntimeHandle};
+use instancy::DataflowBuilder;
+use instancy::{RuntimeConfig, RuntimeHandle};
 
 /// Per-epoch running statistics, maintained incrementally as data arrives.
 #[derive(Clone)]

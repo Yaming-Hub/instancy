@@ -23,8 +23,8 @@
 //!
 //! Run with: `cargo run --example partitioned_workers`
 
-use instancy::dataflow::DataflowBuilder;
-use instancy::runtime::{RuntimeConfig, RuntimeHandle};
+use instancy::DataflowBuilder;
+use instancy::{RuntimeConfig, RuntimeHandle};
 
 fn main() {
     println!("=== Partitioned Workers Example ===\n");

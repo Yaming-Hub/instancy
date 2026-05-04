@@ -14,9 +14,9 @@
 //! cargo run --example barrier -- 100000  # custom iteration count
 //! ```
 
-use instancy::dataflow::dataflow_builder::IterateResult;
-use instancy::dataflow::DataflowBuilder;
-use instancy::runtime::SimpleRuntime;
+use instancy::IterateResult;
+use instancy::DataflowBuilder;
+use instancy::SimpleRuntime;
 
 fn main() {
     let iterations: u32 = std::env::args()

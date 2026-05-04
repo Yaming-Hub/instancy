@@ -28,8 +28,8 @@ tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
 ### Hello World
 
 ```rust
-use instancy::dataflow::DataflowBuilder;
-use instancy::runtime::SimpleRuntime;
+use instancy::DataflowBuilder;
+use instancy::SimpleRuntime;
 
 fn main() {
     let builder = DataflowBuilder::<u64>::new("hello");
@@ -54,8 +54,8 @@ fn main() {
 
 ```rust
 use std::collections::{HashMap, HashSet};
-use instancy::dataflow::DataflowBuilder;
-use instancy::runtime::SimpleRuntime;
+use instancy::DataflowBuilder;
+use instancy::SimpleRuntime;
 
 fn main() {
     let builder = DataflowBuilder::<u64>::new("wordcount");
@@ -100,8 +100,8 @@ fn main() {
 ### Spawned Dataflow with Channel I/O
 
 ```rust
-use instancy::dataflow::DataflowBuilder;
-use instancy::runtime::SimpleRuntime;
+use instancy::DataflowBuilder;
+use instancy::SimpleRuntime;
 
 fn main() {
     let builder = DataflowBuilder::<u64>::new("pipeline");

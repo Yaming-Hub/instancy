@@ -4,8 +4,8 @@
 //! into multiple downstream branches. Each branch processes data independently
 //! using a `TeePush` adapter that clones data to all consumers.
 
-use instancy::dataflow::dataflow_builder::DataflowBuilder;
-use instancy::runtime::SimpleRuntime;
+use instancy::DataflowBuilder;
+use instancy::SimpleRuntime;
 
 fn main() {
     let builder = DataflowBuilder::<u64>::new("branching_pipeline");

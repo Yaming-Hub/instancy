@@ -12,8 +12,8 @@
 
 use std::collections::HashMap;
 
-use instancy::dataflow::DataflowBuilder;
-use instancy::runtime::SimpleRuntime;
+use instancy::DataflowBuilder;
+use instancy::SimpleRuntime;
 
 fn main() {
     // -----------------------------------------------------------------------

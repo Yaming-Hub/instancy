@@ -54,3 +54,27 @@ pub mod runtime;
 pub mod scheduler;
 pub mod worker;
 pub mod worker_pool;
+
+// ── Crate-level re-exports for ergonomic use ──────────────────────────
+
+// Dataflow construction
+pub use dataflow::{DataflowBuilder, DataflowBuilderConfig, LogicalDataflow, OutputPort, Pipe};
+pub use dataflow::dataflow_builder::IterateResult;
+pub use dataflow::stream::StreamEdge;
+pub use dataflow::{InputSender, OutputReceiver};
+#[cfg(feature = "async-io")]
+pub use dataflow::{AsyncInputSender, AsyncOutputReceiver};
+
+// Runtime
+pub use runtime::{
+    RuntimeConfig, RuntimeHandle, SimpleRuntime, SpawnedDataflow, DataflowCompletion,
+};
+
+// Cancellation
+pub use cancellation::{CancellationToken, CancellationReason};
+
+// Error handling
+pub use error::{Error, Result};
+
+// Timestamp ordering
+pub use order::Product;

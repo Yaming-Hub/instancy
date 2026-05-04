@@ -9,9 +9,9 @@
 //! cargo run --example loop_demo
 //! ```
 
-use instancy::dataflow::dataflow_builder::IterateResult;
-use instancy::dataflow::DataflowBuilder;
-use instancy::runtime::SimpleRuntime;
+use instancy::IterateResult;
+use instancy::DataflowBuilder;
+use instancy::SimpleRuntime;
 
 fn main() {
     let builder = DataflowBuilder::<u64>::new("loop_demo");

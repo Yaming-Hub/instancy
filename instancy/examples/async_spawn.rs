@@ -24,8 +24,8 @@
 //!
 //! Run with: `cargo run --all-features --example async_spawn`
 
-use instancy::dataflow::DataflowBuilder;
-use instancy::runtime::{RuntimeConfig, RuntimeHandle};
+use instancy::DataflowBuilder;
+use instancy::{RuntimeConfig, RuntimeHandle};
 use instancy::scheduler::policy::FifoPolicy;
 
 #[tokio::main(flavor = "current_thread")]

@@ -1,7 +1,7 @@
 /// Demonstrates binary and concat operators for merging multiple streams.
-use instancy::dataflow::DataflowBuilder;
-use instancy::dataflow::Pipe;
-use instancy::runtime::SimpleRuntime;
+use instancy::DataflowBuilder;
+use instancy::Pipe;
+use instancy::SimpleRuntime;
 
 fn main() {
     // --- Binary: pair two streams element-wise ---

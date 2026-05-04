@@ -14,9 +14,9 @@
 //! cargo run --example pingpong -- 100 1000  # iterations elements
 //! ```
 
-use instancy::dataflow::dataflow_builder::IterateResult;
-use instancy::dataflow::DataflowBuilder;
-use instancy::runtime::SimpleRuntime;
+use instancy::IterateResult;
+use instancy::DataflowBuilder;
+use instancy::SimpleRuntime;
 
 fn main() {
     let iterations: u64 = std::env::args()

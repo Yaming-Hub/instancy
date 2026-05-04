@@ -8,8 +8,8 @@
 //! cargo run --example runtime_isolation
 //! ```
 
-use instancy::dataflow::DataflowBuilder;
-use instancy::runtime::{RuntimeConfig, RuntimeHandle};
+use instancy::DataflowBuilder;
+use instancy::{RuntimeConfig, RuntimeHandle};
 use instancy::scheduler::policy::FifoPolicy;
 
 #[allow(clippy::needless_return)]

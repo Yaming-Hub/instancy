@@ -15,9 +15,9 @@
 
 use std::collections::{HashMap, HashSet};
 
-use instancy::dataflow::dataflow_builder::IterateResult;
-use instancy::dataflow::DataflowBuilder;
-use instancy::runtime::SimpleRuntime;
+use instancy::IterateResult;
+use instancy::DataflowBuilder;
+use instancy::SimpleRuntime;
 
 fn main() {
     // Build a sample undirected graph:
