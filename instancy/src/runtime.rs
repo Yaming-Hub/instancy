@@ -3897,4 +3897,222 @@ mod tests {
         let total: usize = all_results.iter().map(|v| v.len()).sum();
         assert_eq!(total, 32, "total items across all workers");
     }
+
+    // -----------------------------------------------------------------------
+    // No-serialization in-process verification (G3.1)
+    //
+    // These tests prove that in-process channels never invoke serialization
+    // or deserialization (Codec). Exchange routing may clone records for
+    // multi-target distribution, but no byte encoding occurs.
+    //
+    // The compile-time proof: NonSerializable is Clone+Send but has no
+    // Serialize/Deserialize impl. If any code path tried to serialize it,
+    // compilation would fail.
+    //
+    // Exchange-level tests are gated on `not(feature = "transport")` because
+    // the transport-enabled `exchange` API requires `ExchangeData` at the
+    // type level (even though local exchange never actually serializes).
+    // This is a compile-time safety measure for cross-process deployability.
+    //
+    // The bounded-channel test and pipeline test run with ALL features,
+    // ensuring the core no-serialization guarantee is always verified.
+    // -----------------------------------------------------------------------
+
+    /// A data type that is Clone + Send but NOT Serialize/Deserialize.
+    /// If any code path attempts to serialize this, it would be a compile error.
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    struct NonSerializable {
+        value: i32,
+        /// Data integrity marker — survives Clone but would fail at compile
+        /// time if serialization were attempted (no Serialize impl).
+        tag: String,
+    }
+
+    impl NonSerializable {
+        fn new(value: i32) -> Self {
+            Self {
+                value,
+                tag: format!("original-{value}"),
+            }
+        }
+    }
+
+    #[test]
+    fn no_serialization_bounded_channel() {
+        // Runs with ALL features. Proves the bounded channel (used by both
+        // pipeline and in-process exchange) passes NonSerializable by value
+        // without any Codec invocation.
+        use crate::dataflow::channels::bounded::bounded_channel;
+        use crate::dataflow::channels::envelope::{Envelope, Payload};
+        use crate::dataflow::channels::pushpull::{Pull, Push};
+
+        let (mut push, mut pull) = bounded_channel::<u64, NonSerializable, ()>(16);
+
+        let items = vec![
+            NonSerializable::new(1),
+            NonSerializable::new(2),
+            NonSerializable::new(3),
+        ];
+        let envelope = Envelope {
+            payload: Payload::Data {
+                time: 0u64,
+                data: items,
+            },
+            metadata: (),
+        };
+        push.push(envelope).unwrap();
+
+        let received = pull.pull().expect("should have data");
+        match received.payload {
+            Payload::Data { time, data } => {
+                assert_eq!(time, 0);
+                assert_eq!(data.len(), 3);
+                for item in &data {
+                    assert!(
+                        item.tag.starts_with("original-"),
+                        "data integrity check failed: {:?}",
+                        item
+                    );
+                }
+                assert_eq!(data[0].value, 1);
+                assert_eq!(data[1].value, 2);
+                assert_eq!(data[2].value, 3);
+            }
+            _ => panic!("expected Data payload"),
+        }
+    }
+
+    #[cfg(not(feature = "transport"))]
+    #[test]
+    fn no_serialization_exchange_multi_worker() {
+        // Compile-time proof: NonSerializable flows through multi-worker
+        // exchange. This wouldn't compile if exchange used Codec.
+        // Hash routing: even values → worker 0, odd values → worker 1.
+        let rt = RuntimeHandle::new(RuntimeConfig::default()).unwrap();
+        let mut multi = rt
+            .spawn_multi("no_ser_exchange", 2, |_worker_idx, builder| {
+                let input = builder.input::<NonSerializable>("data");
+                input
+                    .exchange_by_hash("by_val", |x: &NonSerializable| x.value as u64)
+                    .output("out");
+                Ok(())
+            })
+            .unwrap();
+
+        let out0 = multi.take_output::<NonSerializable>(0, "out").unwrap();
+        let out1 = multi.take_output::<NonSerializable>(1, "out").unwrap();
+
+        let in0 = multi.take_input::<NonSerializable>(0, "data").unwrap();
+        in0.send(
+            0u64,
+            vec![
+                NonSerializable::new(10),
+                NonSerializable::new(11),
+                NonSerializable::new(20),
+                NonSerializable::new(21),
+            ],
+        )
+        .unwrap();
+        in0.close();
+
+        let in1 = multi.take_input::<NonSerializable>(1, "data").unwrap();
+        in1.close();
+
+        multi.join_blocking().expect("dataflow should complete");
+
+        // Collect all values regardless of which worker received them.
+        let mut all: Vec<i32> = out0
+            .collect_data()
+            .into_iter()
+            .chain(out1.collect_data())
+            .flat_map(|(_, d)| d)
+            .map(|x| x.value)
+            .collect();
+        all.sort();
+        assert_eq!(all, vec![10, 11, 20, 21], "all data should arrive intact");
+    }
+
+    #[cfg(not(feature = "transport"))]
+    #[test]
+    fn no_serialization_exchange_4_workers_integrity() {
+        // 4 workers, all send data, exchange redistributes. Verifies all
+        // NonSerializable items arrive intact at their destination workers.
+        let rt = RuntimeHandle::new(RuntimeConfig::default()).unwrap();
+        let num_workers = 4;
+        let mut multi = rt
+            .spawn_multi("integrity", num_workers, |_worker_idx, builder| {
+                let input = builder.input::<NonSerializable>("data");
+                input
+                    .exchange_by_hash("route", |x: &NonSerializable| x.value as u64)
+                    .output("out");
+                Ok(())
+            })
+            .unwrap();
+
+        let outputs: Vec<_> = (0..num_workers)
+            .map(|i| multi.take_output::<NonSerializable>(i, "out").unwrap())
+            .collect();
+
+        for i in 0..num_workers {
+            let inp = multi.take_input::<NonSerializable>(i, "data").unwrap();
+            let items: Vec<NonSerializable> = (0..8).map(|v| NonSerializable::new(i as i32 * 100 + v)).collect();
+            inp.send(0u64, items).unwrap();
+            inp.close();
+        }
+
+        multi.join_blocking().unwrap();
+
+        let mut all_values: Vec<i32> = Vec::new();
+        for out in outputs {
+            let data: Vec<NonSerializable> = out.collect_data().into_iter().flat_map(|(_, d)| d).collect();
+            for item in &data {
+                assert!(item.tag.starts_with("original-"), "data integrity failed: {:?}", item);
+            }
+            all_values.extend(data.into_iter().map(|x| x.value));
+        }
+
+        all_values.sort();
+        let mut expected: Vec<i32> = (0..num_workers as i32).flat_map(|w| (0..8).map(move |v| w * 100 + v)).collect();
+        expected.sort();
+        assert_eq!(all_values, expected, "all data should arrive intact");
+    }
+
+    #[test]
+    fn no_serialization_pipeline_multi_worker() {
+        // Pipeline edges never require Codec bounds regardless of features.
+        // Proves NonSerializable flows through map + filter in multi-worker.
+        let rt = RuntimeHandle::new(RuntimeConfig::default()).unwrap();
+        let mut multi = rt
+            .spawn_multi("no_ser_pipe", 2, |_worker_idx, builder| {
+                let input = builder.input::<NonSerializable>("data");
+                input
+                    .map("transform", |_t, mut x| {
+                        x.value *= 2;
+                        x
+                    })
+                    .filter("positive", |_t, x| x.value > 0)
+                    .output("out");
+                Ok(())
+            })
+            .unwrap();
+
+        let outputs: Vec<_> = (0..2)
+            .map(|i| multi.take_output::<NonSerializable>(i, "out").unwrap())
+            .collect();
+
+        for i in 0..2 {
+            let inp = multi.take_input::<NonSerializable>(i, "data").unwrap();
+            inp.send(0u64, vec![NonSerializable::new((i as i32 + 1) * 5)]).unwrap();
+            inp.close();
+        }
+
+        multi.join_blocking().unwrap();
+
+        for (i, out) in outputs.into_iter().enumerate() {
+            let data: Vec<NonSerializable> = out.collect_data().into_iter().flat_map(|(_, d)| d).collect();
+            assert_eq!(data.len(), 1);
+            assert_eq!(data[0].value, (i as i32 + 1) * 10);
+            assert!(data[0].tag.starts_with("original-"), "pipeline data integrity failed");
+        }
+    }
 }
