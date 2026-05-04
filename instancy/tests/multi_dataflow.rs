@@ -10,9 +10,9 @@
 use std::thread;
 use std::time::{Duration, Instant};
 
-use instancy::dataflow::DataflowBuilder;
-use instancy::error::Error;
-use instancy::runtime::{RuntimeConfig, RuntimeHandle};
+use instancy::DataflowBuilder;
+use instancy::Error;
+use instancy::{RuntimeConfig, RuntimeHandle};
 use instancy::scheduler::policy::FifoPolicy;
 
 /// Spawn 4 dataflows concurrently on a 2-thread pool. Each receives unique data
