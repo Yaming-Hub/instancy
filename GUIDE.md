@@ -449,6 +449,79 @@ fn main() {
 
 ---
 
+## Sharing Context with Operators
+
+When building complex dataflows, operators often need access to shared configuration,
+schema registries, metrics collectors, or other application-specific state. Rather
+than relying on global variables or threading values through every closure, instancy
+provides a typed context system on `DataflowBuilder`.
+
+### Setting and Retrieving Context
+
+```rust
+use instancy::DataflowBuilder;
+
+struct AppConfig {
+    pub batch_size: usize,
+    pub threshold: f64,
+}
+
+let mut builder = DataflowBuilder::<u64>::new("pipeline");
+
+// Store typed context — wrapped in Arc internally
+builder.with_context(AppConfig {
+    batch_size: 1024,
+    threshold: 0.95,
+});
+
+// Retrieve as Arc<T> — cheap to clone and capture in closures
+let cfg = builder.get_context::<AppConfig>().unwrap();
+
+let input = builder.input::<f64>("data");
+input
+    .filter("threshold", move |_t, x| *x > cfg.threshold)
+    .output("filtered");
+```
+
+### Key Design Points
+
+- **Type-keyed**: Each type `T` maps to one value. Use newtypes to store multiple
+  values of the same underlying type (e.g., `struct InputSchema(Schema)` vs
+  `struct OutputSchema(Schema)`).
+- **Build-time capture**: Call `get_context()` before creating operators, then capture
+  the `Arc<T>` in `move` closures. The context is immutable and shared across captures.
+- **Survives `build()`**: Context is carried into `LogicalDataflow` and accessible via
+  `dataflow.contexts().get::<T>()` for custom materialization logic.
+- **Multi-worker friendly**: Each worker's builder call creates its own `Arc`. To share
+  a single allocation across workers, use `with_context_arc(existing_arc.clone())`.
+
+### Multi-Worker Example
+
+```rust
+use instancy::{RuntimeHandle, RuntimeConfig, DataflowBuilder};
+use std::sync::Arc;
+
+struct WorkerConfig { pub multiplier: i32 }
+
+let rt = RuntimeHandle::new(RuntimeConfig::default()).unwrap();
+
+// Share a single Arc across all workers with with_context_arc
+let shared_cfg = Arc::new(WorkerConfig { multiplier: 10 });
+
+let mut handle = rt.spawn_multi("ctx-demo", 4, |worker_idx, builder| {
+    builder.with_context_arc(shared_cfg.clone());
+    let cfg = builder.get_context::<WorkerConfig>().unwrap();
+
+    let input = builder.input::<i32>("data");
+    input
+        .map("scale", move |_t, x| x * cfg.multiplier)
+        .output("result");
+    Ok(())
+}).unwrap();
+```
+
+---
+
 ## 4. Running Dataflows
 
 instancy provides two runtime modes depending on your needs.
