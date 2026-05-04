@@ -12,16 +12,20 @@ use crate::scheduler::batching::BatchingPolicy;
 use crate::worker::WorkerId;
 use crate::worker_pool::WorkerPoolConfig;
 
-/// Configuration for the instancy runtime.
+/// Configuration for the low-level execution engine.
+///
+/// This controls the worker thread pool and progress tracking mode used by
+/// [`execute()`]. Most users should prefer [`crate::RuntimeConfig`] (from the
+/// `runtime` module) which provides a higher-level API.
 #[derive(Debug, Clone)]
-pub struct RuntimeConfig {
+pub struct ExecutionConfig {
     /// Worker thread pool configuration.
     pub worker_pool: WorkerPoolConfig,
     /// Progress tracking mode.
     pub progress_mode: ProgressMode,
 }
 
-impl Default for RuntimeConfig {
+impl Default for ExecutionConfig {
     fn default() -> Self {
         Self {
             worker_pool: WorkerPoolConfig::default(),
@@ -239,7 +243,7 @@ impl ExecutionHandle {
 /// The actual dataflow construction happens via the returned handle
 /// and the scope/stream APIs.
 pub fn execute(
-    runtime_config: &RuntimeConfig,
+    runtime_config: &ExecutionConfig,
     dataflow_config: DataflowConfig,
 ) -> Result<ExecutionHandle, Error> {
     // Validate configs
@@ -359,8 +363,8 @@ mod tests {
     }
 
     #[test]
-    fn runtime_config_default() {
-        let config = RuntimeConfig::default();
+    fn execution_config_default() {
+        let config = ExecutionConfig::default();
         assert_eq!(config.progress_mode, ProgressMode::Eager);
         assert!(config.worker_pool.validate().is_ok());
     }
@@ -386,7 +390,7 @@ mod tests {
 
     #[test]
     fn execute_smoke_test() {
-        let runtime = RuntimeConfig::default();
+        let runtime = ExecutionConfig::default();
         let df = DataflowConfig::single_node(4, "smoke");
         let handle = execute(&runtime, df).unwrap();
         assert_eq!(handle.name, "smoke");
@@ -395,7 +399,7 @@ mod tests {
 
     #[test]
     fn execute_rejects_zero_workers() {
-        let runtime = RuntimeConfig::default();
+        let runtime = ExecutionConfig::default();
         let df = DataflowConfig {
             topology: ClusterTopology { nodes: vec![NodeConfig::new("node-0", 0)] },
             error_policy: ErrorPolicy::Stop,
@@ -417,7 +421,7 @@ mod tests {
 
     #[test]
     fn execute_rejects_bad_pool_config() {
-        let runtime = RuntimeConfig {
+        let runtime = ExecutionConfig {
             worker_pool: WorkerPoolConfig {
                 min_threads: 0,
                 ..WorkerPoolConfig::default()

@@ -16,7 +16,7 @@ use tokio::sync::Mutex;
 
 use instancy::communication::transport_session::PeerConnection;
 use instancy::dataflow::id::DataflowId;
-use instancy::execute::{ClusterTopology, NodeConfig};
+use instancy::{ClusterTopology, NodeConfig};
 use instancy::runtime::{RuntimeConfig, RuntimeHandle};
 
 use crate::dataflows;

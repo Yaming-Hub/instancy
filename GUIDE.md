@@ -850,7 +850,7 @@ instancy can distribute computation across multiple machines using TCP connectio
 First, describe your cluster:
 
 ```rust
-use instancy::execute::{ClusterTopology, NodeConfig};
+use instancy::{ClusterTopology, NodeConfig};
 
 let topology = ClusterTopology::multi_node(vec![
     NodeConfig::new("node-a", 2),  // 2 workers on node A
