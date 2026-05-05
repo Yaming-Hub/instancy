@@ -110,12 +110,15 @@ impl<S: Scope, D: 'static> GatherExt<S, D> for StreamEdge<S, D> {
         scope.register_operator(crate::dataflow::graph::OperatorInfo::new(
             op_index, "gather", target_region, 1, 1,
         )).expect("operator index should be unique");
-        scope.add_edge(crate::dataflow::graph::EdgeInfo::new(
+        scope.add_edge(crate::dataflow::graph::EdgeInfo::exchange(
             *self.source(),
             Slot::new(op_index, 0),
             source_region,
             target_region,
         ));
+
+        // Record target parallelism (always 1 for gather) for stage inference.
+        scope.set_exchange_parallelism(op_index, 1);
 
         let _operator = GatherOperator::<S::Timestamp, D>::new(
             "gather",
