@@ -510,8 +510,58 @@ impl<T: Timestamp + ExchangeData, D: ExchangeData> MockNetworkEdgeMaterializer<T
 impl<T: Timestamp + ExchangeData, D: ExchangeData> EdgeMaterializer<T, D>
     for MockNetworkEdgeMaterializer<T, D>
 {
-    fn num_workers(&self) -> usize {
+    fn num_source_workers(&self) -> usize {
         self.num_workers
+    }
+
+    fn num_target_workers(&self) -> usize {
+        self.num_workers
+    }
+
+    fn materialize_source_worker(
+        &mut self,
+        src_idx: usize,
+    ) -> Result<Vec<Box<dyn Push<T, D, ()>>>> {
+        if src_idx >= self.num_workers {
+            return Err(Error::Custom(format!(
+                "source index {src_idx} out of range (num_workers={})",
+                self.num_workers
+            )));
+        }
+
+        let mut pushers: Vec<Box<dyn Push<T, D, ()>>> = Vec::with_capacity(self.num_workers);
+        for dst in 0..self.num_workers {
+            let sender = self.senders[src_idx][dst]
+                .take()
+                .ok_or_else(|| Error::Custom(format!(
+                    "sender [{src_idx}][{dst}] already taken"
+                )))?;
+            pushers.push(Box::new(SerializingPush::<T, D>::new(sender)));
+        }
+        Ok(pushers)
+    }
+
+    fn materialize_target_worker(
+        &mut self,
+        dst_idx: usize,
+    ) -> Result<Vec<Box<dyn Pull<T, D, ()>>>> {
+        if dst_idx >= self.num_workers {
+            return Err(Error::Custom(format!(
+                "target index {dst_idx} out of range (num_workers={})",
+                self.num_workers
+            )));
+        }
+
+        let mut pullers: Vec<Box<dyn Pull<T, D, ()>>> = Vec::with_capacity(self.num_workers);
+        for src in 0..self.num_workers {
+            let receiver = self.receivers[src][dst_idx]
+                .take()
+                .ok_or_else(|| Error::Custom(format!(
+                    "receiver [{src}][{dst_idx}] already taken"
+                )))?;
+            pullers.push(Box::new(DeserializingPull::<T, D>::new(receiver)));
+        }
+        Ok(pullers)
     }
 
     fn materialize_worker(
@@ -531,28 +581,8 @@ impl<T: Timestamp + ExchangeData, D: ExchangeData> EdgeMaterializer<T, D>
         }
         self.taken[worker_idx] = true;
 
-        // Build push endpoints: one SerializingPush per destination worker.
-        let mut pushers: Vec<Box<dyn Push<T, D, ()>>> = Vec::with_capacity(self.num_workers);
-        for dst in 0..self.num_workers {
-            let sender = self.senders[worker_idx][dst]
-                .take()
-                .ok_or_else(|| Error::Custom(format!(
-                    "sender [{worker_idx}][{dst}] already taken"
-                )))?;
-            pushers.push(Box::new(SerializingPush::<T, D>::new(sender)));
-        }
-
-        // Build pull endpoints: one DeserializingPull per source worker.
-        let mut pullers: Vec<Box<dyn Pull<T, D, ()>>> = Vec::with_capacity(self.num_workers);
-        for src in 0..self.num_workers {
-            let receiver = self.receivers[src][worker_idx]
-                .take()
-                .ok_or_else(|| Error::Custom(format!(
-                    "receiver [{src}][{worker_idx}] already taken"
-                )))?;
-            pullers.push(Box::new(DeserializingPull::<T, D>::new(receiver)));
-        }
-
+        let pushers = self.materialize_source_worker(worker_idx)?;
+        let pullers = self.materialize_target_worker(worker_idx)?;
         Ok((pushers, pullers))
     }
 }

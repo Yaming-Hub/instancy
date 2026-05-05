@@ -872,7 +872,7 @@ impl RuntimeHandle {
             // topology, so worker 0's creators are representative).
             let creators = std::mem::take(&mut dataflows[0].exchange_creators);
             for (edge_idx, edge_capacity, creator) in creators {
-                let shared_factories = creator(num_workers, edge_capacity);
+                let shared_factories = creator(num_workers, num_workers, edge_capacity);
                 if shared_factories.len() != num_workers {
                     return Err(Error::Custom(format!(
                         "exchange factory creator for edge {edge_idx} produced {} factories, expected {num_workers}",
@@ -1719,7 +1719,7 @@ impl SimpleRuntime {
         if num_workers > 1 {
             let creators = std::mem::take(&mut dataflows[0].exchange_creators);
             for (edge_idx, edge_capacity, creator) in creators {
-                let shared_factories = creator(num_workers, edge_capacity);
+                let shared_factories = creator(num_workers, num_workers, edge_capacity);
                 if shared_factories.len() != num_workers {
                     return Err(Error::Custom(format!(
                         "exchange factory creator for edge {edge_idx} produced {} factories, expected {num_workers}",
