@@ -757,6 +757,9 @@ impl<T: Timestamp> DataflowBuilder<T> {
             state.channel_factories.push((regular_edge_count + fb_position, factory));
         }
 
+        // Infer stages from the graph topology (exchange edges form boundaries).
+        let stages = crate::dataflow::stage::infer_stages(&state.graph)?;
+
         Ok(LogicalDataflow {
             name: self.name,
             graph: state.graph,
@@ -774,6 +777,7 @@ impl<T: Timestamp> DataflowBuilder<T> {
             #[cfg(feature = "transport")]
             exchange_network_creators: state.exchange_network_creators,
             contexts: state.contexts,
+            stages,
         })
     }
 }
@@ -2859,6 +2863,9 @@ pub struct LogicalDataflow<T: Timestamp> {
     /// User-supplied typed context values, carried from the builder.
     /// Available at materialization time and for future operator-level access.
     pub(crate) contexts: SharedContext,
+    /// Auto-inferred stage metadata. Each stage groups operators connected
+    /// by pipeline edges, with exchange edges forming stage boundaries.
+    pub(crate) stages: Vec<crate::dataflow::stage::StageInfo>,
 }
 
 impl<T: Timestamp> LogicalDataflow<T> {
@@ -2920,6 +2927,14 @@ impl<T: Timestamp> LogicalDataflow<T> {
     /// Get the number of feedback (loop) edges in the graph.
     pub fn feedback_edge_count(&self) -> usize {
         self.graph.feedback_edges().len()
+    }
+
+    /// Get the auto-inferred stages for this dataflow.
+    ///
+    /// Each stage groups operators connected by pipeline edges. Exchange edges
+    /// form boundaries between stages. Stages are numbered sequentially from 0.
+    pub fn stages(&self) -> &[crate::dataflow::stage::StageInfo] {
+        &self.stages
     }
 }
 
