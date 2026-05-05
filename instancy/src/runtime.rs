@@ -1581,6 +1581,47 @@ impl SimpleRuntime {
         Ok(())
     }
 
+    /// Run a dataflow to completion and return collected metrics.
+    ///
+    /// Behaves like [`run()`](Self::run) but returns the per-operator metrics
+    /// when `collect_metrics(true)` was set on the builder. Returns `None` if
+    /// metrics collection was not enabled.
+    pub fn run_with_metrics<T: Timestamp>(
+        &self,
+        dataflow: LogicalDataflow<T>,
+    ) -> Result<Option<std::sync::Arc<crate::metrics::DataflowMetrics>>> {
+        if dataflow.has_input_ports() {
+            return Err(Error::Custom(
+                "cannot run() a dataflow with declared input ports — \
+                 use spawn() for dataflows that receive external data."
+                    .into(),
+            ));
+        }
+
+        if dataflow.operator_factories.is_empty() {
+            return Ok(None);
+        }
+
+        let wake_handle = WakeHandle::new();
+        self.cancel.register_wake_handle(wake_handle.clone());
+        let mut executor = materialize_executor(
+            dataflow,
+            self.cancel.clone(),
+            Some(wake_handle),
+            WorkerContext::single(),
+            None,
+        )?;
+
+        let completed = executor.run()?;
+        if !completed {
+            return Err(Error::Custom(
+                "dataflow did not complete (quiescence without termination)".into(),
+            ));
+        }
+
+        Ok(executor.metrics().cloned())
+    }
+
     /// Spawn a dataflow on a dedicated background thread with channel-based I/O.
     ///
     /// Returns a [`SpawnedDataflow`] handle for feeding data and collecting results.
@@ -2962,6 +3003,7 @@ fn materialize_executor<T: Timestamp>(
         max_idle_sweeps: 64,
         max_sweeps_per_poll: 64,
         catch_panics: dataflow.catch_panics,
+        collect_metrics: dataflow.collect_metrics,
     };
 
     // Destructure to allow accessing graph after moving factories.

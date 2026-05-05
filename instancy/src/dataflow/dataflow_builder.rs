@@ -147,6 +147,8 @@ struct BuilderState<T: Timestamp> {
     contexts: SharedContext,
     /// Whether to catch panics in operator activation.
     catch_panics: bool,
+    /// Whether to collect per-operator metrics.
+    collect_metrics: bool,
 }
 
 /// Type-erased closure for wiring an input port during spawn().
@@ -272,6 +274,7 @@ impl<T: Timestamp> DataflowBuilder<T> {
                 channel_capacity: config.channel_capacity,
                 contexts: SharedContext::new(),
                 catch_panics: false,
+                collect_metrics: false,
             })),
         }
     }
@@ -352,6 +355,19 @@ impl<T: Timestamp> DataflowBuilder<T> {
     /// [`Error::OperatorPanic`]: crate::error::Error::OperatorPanic
     pub fn catch_panics(&self, enable: bool) -> &Self {
         self.state.borrow_mut().catch_panics = enable;
+        self
+    }
+
+    /// Enable per-operator metrics collection (activation count, CPU time).
+    ///
+    /// When enabled, each operator activation is timed and statistics are
+    /// accumulated. Overhead is minimal (~1 `Instant::now()` per activation).
+    ///
+    /// Metrics are available after execution via [`DataflowMetrics`].
+    ///
+    /// [`DataflowMetrics`]: crate::metrics::DataflowMetrics
+    pub fn collect_metrics(&self, enable: bool) -> &Self {
+        self.state.borrow_mut().collect_metrics = enable;
         self
     }
 
@@ -829,6 +845,7 @@ impl<T: Timestamp> DataflowBuilder<T> {
             contexts: state.contexts,
             stages,
             catch_panics: state.catch_panics,
+            collect_metrics: state.collect_metrics,
         })
     }
 }
@@ -1686,6 +1703,7 @@ impl<T: Timestamp, D: Clone + Send + 'static> Pipe<T, D> {
                 channel_capacity: capacity,
                 contexts: parent_contexts,
                 catch_panics: false,
+                collect_metrics: false,
             }));
 
         // The iteration variable pipe points to concat's output
@@ -3203,6 +3221,8 @@ pub struct LogicalDataflow<T: Timestamp> {
     pub(crate) stages: Vec<crate::dataflow::stage::StageInfo>,
     /// Whether to catch panics in operator activation (see [`ExecutorConfig::catch_panics`]).
     pub(crate) catch_panics: bool,
+    /// Whether to collect per-operator metrics (see [`ExecutorConfig::collect_metrics`]).
+    pub(crate) collect_metrics: bool,
 }
 
 impl<T: Timestamp> LogicalDataflow<T> {
@@ -4712,5 +4732,50 @@ mod tests {
         let r = c.lock().unwrap();
         let all: Vec<i32> = r.iter().flat_map(|(_, d)| d.clone()).collect();
         assert_eq!(all, vec![2, 4]);
+    }
+
+    // ── metrics tests ────────────────────────────────────────────────
+
+    #[test]
+    fn test_collect_metrics_disabled_by_default() {
+        let builder = DataflowBuilder::<u64>::new("no_metrics");
+        let stream = builder.source("nums", vec![(0u64, vec![1i32])]);
+        stream.output("out");
+        let dataflow = builder.build().unwrap();
+        assert!(!dataflow.collect_metrics);
+    }
+
+    #[test]
+    fn test_collect_metrics_records_activations() {
+        let builder = DataflowBuilder::<u64>::new("metrics_test");
+        builder.collect_metrics(true);
+        let stream = builder.source("nums", vec![(0u64, vec![1i32, 2, 3])]);
+        stream.map("double", |_t, x| x * 2).output("out");
+        let dataflow = builder.build().unwrap();
+        assert!(dataflow.collect_metrics);
+
+        let metrics = rt().run_with_metrics(dataflow).unwrap();
+        let m = metrics.expect("metrics should be collected");
+        assert!(m.wall_time() > std::time::Duration::ZERO);
+        assert!(m.total_activations() > 0);
+        assert!(m.operator_count() > 0);
+
+        // Each operator should have been activated at least once
+        let snapshots = m.operator_snapshots();
+        assert!(!snapshots.is_empty());
+        for op in &snapshots {
+            assert!(op.activations > 0, "operator '{}' had 0 activations", op.name);
+        }
+    }
+
+    #[test]
+    fn test_collect_metrics_not_enabled() {
+        let builder = DataflowBuilder::<u64>::new("no_metrics");
+        let stream = builder.source("nums", vec![(0u64, vec![1i32, 2])]);
+        stream.output("out");
+        let dataflow = builder.build().unwrap();
+
+        let metrics = rt().run_with_metrics(dataflow).unwrap();
+        assert!(metrics.is_none());
     }
 }

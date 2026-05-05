@@ -20,6 +20,9 @@ use std::marker::PhantomData;
 use std::pin::Pin;
 use std::task::{Context, Poll};
 
+use std::sync::Arc;
+use std::time::Instant;
+
 use crate::cancellation::CancellationToken;
 use crate::dataflow::channels::wake::WakeHandle;
 use crate::dataflow::control::{ControlReceiver, ControlSender};
@@ -30,6 +33,7 @@ use crate::dataflow::schedulable::{
 };
 use crate::dataflow::stage::FusedActivationOrder;
 use crate::error::{Error, Result};
+use crate::metrics::{DataflowMetrics, OperatorMetricsCollector};
 use crate::progress::notificator::Notificator;
 use crate::progress::subgraph::ProgressTracker;
 use crate::progress::timestamp::Timestamp;
@@ -71,6 +75,10 @@ pub struct ExecutorConfig {
     ///
     /// Default: `false` (panics unwind normally).
     pub catch_panics: bool,
+    /// Whether to collect per-operator metrics (activation count, CPU time,
+    /// records processed). Overhead is ~1 Instant::now() per activation.
+    /// Default: false.
+    pub collect_metrics: bool,
 }
 
 impl Default for ExecutorConfig {
@@ -80,6 +88,7 @@ impl Default for ExecutorConfig {
             max_idle_sweeps: 3,
             max_sweeps_per_poll: 64,
             catch_panics: false,
+            collect_metrics: false,
         }
     }
 }
@@ -206,6 +215,7 @@ impl FusedStageTask {
         worker_index: usize,
         control_sender: Option<&ControlSender>,
         catch_panics: bool,
+        op_collectors: &[Option<Arc<OperatorMetricsCollector>>],
     ) -> Result<(bool, usize)> {
         let mut any_progress = false;
         let mut productive_activations = 0usize;
@@ -223,14 +233,29 @@ impl FusedStageTask {
                     return Ok((any_progress, productive_activations));
                 }
 
+                let start = if op_collectors.get(pos).and_then(|c| c.as_ref()).is_some() {
+                    Some(Instant::now())
+                } else {
+                    None
+                };
+
                 let op_name = operators[pos].name().to_string();
-                let outcome = activate_operator(&mut operators[pos], catch_panics).map_err(|e| {
+                let result = activate_operator(&mut operators[pos], catch_panics).map_err(|e| {
                     let enriched = e.with_operator_context(op_name.clone(), worker_index);
                     if let Some(ctrl) = control_sender {
                         ctrl.broadcast_error(op_name, format!("{enriched}"));
                     }
                     enriched
-                })?;
+                });
+
+                // Record metrics regardless of success/failure.
+                if let Some(start) = start {
+                    if let Some(ref collector) = op_collectors.get(pos).and_then(|c| c.as_ref()) {
+                        collector.record_activation(start.elapsed(), 0);
+                    }
+                }
+
+                let outcome = result?;
 
                 match outcome {
                     ActivationOutcome::MadeProgress => {
@@ -333,6 +358,10 @@ pub struct DataflowExecutor<T: Timestamp = u64> {
     op_pos_to_task: Vec<usize>,
     /// Per-task queue membership (mirrors `in_queue` but for stage tasks).
     task_in_queue: Vec<bool>,
+    /// Aggregate dataflow metrics. None when collect_metrics is false.
+    dataflow_metrics: Option<Arc<DataflowMetrics>>,
+    /// Per-operator metrics collectors, indexed by position.
+    op_collectors: Vec<Option<Arc<OperatorMetricsCollector>>>,
     /// Phantom for the timestamp type.
     _phantom: PhantomData<T>,
 }
@@ -477,6 +506,22 @@ impl<T: Timestamp> DataflowExecutor<T> {
 
         let done = vec![false; operators.len()];
 
+        // Initialize per-operator metrics collectors when enabled.
+        let (dataflow_metrics, op_collectors) = if config.collect_metrics {
+            let mut dm = DataflowMetrics::new("dataflow");
+            let collectors: Vec<Option<Arc<OperatorMetricsCollector>>> = operators
+                .iter()
+                .enumerate()
+                .map(|(pos, op)| {
+                    let c = dm.register_operator(op.name(), pos);
+                    Some(c)
+                })
+                .collect();
+            (Some(Arc::new(dm)), collectors)
+        } else {
+            (None, Vec::new())
+        };
+
         // Initially, all operators are ready (they may have initial input or
         // need to produce initial output like sources).
         let ready_queue: VecDeque<usize> = (0..operators.len()).collect();
@@ -505,8 +550,15 @@ impl<T: Timestamp> DataflowExecutor<T> {
             stage_tasks: Vec::new(),
             op_pos_to_task: Vec::new(),
             task_in_queue: Vec::new(),
+            dataflow_metrics,
+            op_collectors,
             _phantom: PhantomData,
         })
+    }
+
+    /// Get the collected dataflow metrics, if metrics collection was enabled.
+    pub fn metrics(&self) -> Option<&Arc<DataflowMetrics>> {
+        self.dataflow_metrics.as_ref()
     }
 
     /// Get a shared reference to the external inputs counter.
@@ -931,6 +983,15 @@ impl<T: Timestamp> DataflowExecutor<T> {
     /// Returns `Err(Error::Cancelled { .. })` if the cancellation token fires.
     /// Returns `Err(...)` if any operator produces an error.
     pub fn run(&mut self) -> Result<bool> {
+        let wall_start = Instant::now();
+        let result = self.run_loop();
+        if let Some(ref dm) = self.dataflow_metrics {
+            dm.set_wall_time(wall_start.elapsed());
+        }
+        result
+    }
+
+    fn run_loop(&mut self) -> Result<bool> {
         loop {
             match self.run_one_sweep()? {
                 SweepOutcome::Completed => return Ok(true),
@@ -949,6 +1010,36 @@ impl<T: Timestamp> DataflowExecutor<T> {
                 }
             }
         }
+    }
+
+    /// Activate an operator and record metrics if enabled.
+    #[inline(always)]
+    fn activate_with_metrics(&mut self, pos: usize) -> Result<ActivationOutcome> {
+        let start = if self.config.collect_metrics {
+            Some(Instant::now())
+        } else {
+            None
+        };
+
+        let op_name = self.operators[pos].name().to_string();
+        let result =
+            activate_operator(&mut self.operators[pos], self.config.catch_panics).map_err(|e| {
+                let enriched = e.with_operator_context(op_name.clone(), self.worker_index);
+                if let Some(ref ctrl) = self.control_sender {
+                    ctrl.broadcast_error(op_name, format!("{enriched}"));
+                }
+                enriched
+            });
+
+        // Record metrics regardless of success/failure — failed activations
+        // still consume CPU time and should be tracked.
+        if let Some(start) = start {
+            if let Some(ref collector) = self.op_collectors.get(pos).and_then(|c| c.as_ref()) {
+                collector.record_activation(start.elapsed(), 0);
+            }
+        }
+
+        result
     }
 
     /// Unfused activation: process operators from the ready queue in FIFO order.
@@ -985,14 +1076,7 @@ impl<T: Timestamp> DataflowExecutor<T> {
                 continue;
             }
 
-            let op_name = self.operators[pos].name().to_string();
-            let outcome = activate_operator(&mut self.operators[pos], self.config.catch_panics).map_err(|e| {
-                let enriched = e.with_operator_context(op_name.clone(), self.worker_index);
-                if let Some(ref ctrl) = self.control_sender {
-                    ctrl.broadcast_error(op_name, format!("{enriched}"));
-                }
-                enriched
-            })?;
+            let outcome = self.activate_with_metrics(pos)?;
 
             match outcome {
                 ActivationOutcome::MadeProgress => {
@@ -1063,14 +1147,7 @@ impl<T: Timestamp> DataflowExecutor<T> {
                     return Ok(any_progress);
                 }
 
-                let op_name = self.operators[pos].name().to_string();
-                let outcome = activate_operator(&mut self.operators[pos], self.config.catch_panics).map_err(|e| {
-                    let enriched = e.with_operator_context(op_name.clone(), self.worker_index);
-                    if let Some(ref ctrl) = self.control_sender {
-                        ctrl.broadcast_error(op_name, format!("{enriched}"));
-                    }
-                    enriched
-                })?;
+                let outcome = self.activate_with_metrics(pos)?;
 
                 match outcome {
                     ActivationOutcome::MadeProgress => {
@@ -1152,6 +1229,7 @@ impl<T: Timestamp> DataflowExecutor<T> {
                 self.worker_index,
                 self.control_sender.as_ref(),
                 self.config.catch_panics,
+                &self.op_collectors,
             )?;
 
             total_productive += productive;
@@ -1470,6 +1548,8 @@ mod tests {
                 stage_tasks: Vec::new(),
                 op_pos_to_task: Vec::new(),
                 task_in_queue: Vec::new(),
+                dataflow_metrics: None,
+                op_collectors: Vec::new(),
                 _phantom: PhantomData,
             }
         }
@@ -1584,6 +1664,8 @@ mod tests {
             stage_tasks: Vec::new(),
             op_pos_to_task: Vec::new(),
             task_in_queue: Vec::new(),
+            dataflow_metrics: None,
+            op_collectors: Vec::new(),
             _phantom: PhantomData,
         };
 
@@ -1625,6 +1707,8 @@ mod tests {
             stage_tasks: Vec::new(),
             op_pos_to_task: Vec::new(),
             task_in_queue: Vec::new(),
+            dataflow_metrics: None,
+            op_collectors: Vec::new(),
             _phantom: PhantomData,
         };
 
@@ -1670,6 +1754,8 @@ mod tests {
             stage_tasks: Vec::new(),
             op_pos_to_task: Vec::new(),
             task_in_queue: Vec::new(),
+            dataflow_metrics: None,
+            op_collectors: Vec::new(),
             _phantom: PhantomData,
         };
 
@@ -1703,6 +1789,8 @@ mod tests {
             stage_tasks: Vec::new(),
             op_pos_to_task: Vec::new(),
             task_in_queue: Vec::new(),
+            dataflow_metrics: None,
+            op_collectors: Vec::new(),
             _phantom: PhantomData,
         };
 
@@ -1744,6 +1832,7 @@ mod tests {
                 max_idle_sweeps: 3,
                 max_sweeps_per_poll: 0,
                 catch_panics: false,
+                collect_metrics: false,
             },
             cancel: CancellationToken::new(),
             progress_tracker: None,
@@ -1761,6 +1850,8 @@ mod tests {
             stage_tasks: Vec::new(),
             op_pos_to_task: Vec::new(),
             task_in_queue: Vec::new(),
+            dataflow_metrics: None,
+            op_collectors: Vec::new(),
             _phantom: PhantomData,
         };
 
@@ -1838,6 +1929,8 @@ mod tests {
             stage_tasks: Vec::new(),
             op_pos_to_task: Vec::new(),
             task_in_queue: Vec::new(),
+            dataflow_metrics: None,
+            op_collectors: Vec::new(),
             _phantom: PhantomData,
         };
 
@@ -1895,6 +1988,8 @@ mod tests {
             stage_tasks: Vec::new(),
             op_pos_to_task: Vec::new(),
             task_in_queue: Vec::new(),
+            dataflow_metrics: None,
+            op_collectors: Vec::new(),
             _phantom: PhantomData,
         };
 
@@ -1940,6 +2035,8 @@ mod tests {
             stage_tasks: Vec::new(),
             op_pos_to_task: Vec::new(),
             task_in_queue: Vec::new(),
+            dataflow_metrics: None,
+            op_collectors: Vec::new(),
             _phantom: PhantomData,
         };
 
@@ -1998,6 +2095,8 @@ mod tests {
             stage_tasks: Vec::new(),
             op_pos_to_task: Vec::new(),
             task_in_queue: Vec::new(),
+            dataflow_metrics: None,
+            op_collectors: Vec::new(),
             _phantom: PhantomData,
         };
 
@@ -2055,6 +2154,8 @@ mod tests {
             stage_tasks: Vec::new(),
             op_pos_to_task: Vec::new(),
             task_in_queue: Vec::new(),
+            dataflow_metrics: None,
+            op_collectors: Vec::new(),
             _phantom: PhantomData,
         };
 
@@ -2101,6 +2202,7 @@ mod tests {
                 max_idle_sweeps: 1,     // reach idle threshold quickly
                 max_sweeps_per_poll: 0, // no budget limit for this test
                 catch_panics: false,
+                collect_metrics: false,
             },
             cancel: CancellationToken::new(),
             progress_tracker: None,
@@ -2118,6 +2220,8 @@ mod tests {
             stage_tasks: Vec::new(),
             op_pos_to_task: Vec::new(),
             task_in_queue: Vec::new(),
+            dataflow_metrics: None,
+            op_collectors: Vec::new(),
             _phantom: PhantomData,
         };
 
@@ -2176,6 +2280,7 @@ mod tests {
                 max_idle_sweeps: 1,
                 max_sweeps_per_poll: 0,
                 catch_panics: false,
+                collect_metrics: false,
             },
             cancel: CancellationToken::new(),
             progress_tracker: None,
@@ -2193,6 +2298,8 @@ mod tests {
             stage_tasks: Vec::new(),
             op_pos_to_task: Vec::new(),
             task_in_queue: Vec::new(),
+            dataflow_metrics: None,
+            op_collectors: Vec::new(),
             _phantom: PhantomData,
         };
 
@@ -2259,6 +2366,8 @@ mod tests {
             stage_tasks: Vec::new(),
             op_pos_to_task: Vec::new(),
             task_in_queue: Vec::new(),
+            dataflow_metrics: None,
+            op_collectors: Vec::new(),
             _phantom: PhantomData,
         };
 
@@ -2390,6 +2499,7 @@ mod tests {
                 max_idle_sweeps: 3,
                 max_sweeps_per_poll: budget,
                 catch_panics: false,
+                collect_metrics: false,
             },
             cancel: CancellationToken::new(),
             progress_tracker: None,
@@ -2407,6 +2517,8 @@ mod tests {
             stage_tasks: Vec::new(),
             op_pos_to_task: Vec::new(),
             task_in_queue: Vec::new(),
+            dataflow_metrics: None,
+            op_collectors: Vec::new(),
             _phantom: PhantomData,
         };
 
@@ -2458,6 +2570,7 @@ mod tests {
                 max_idle_sweeps: 3,
                 max_sweeps_per_poll: 0, // unlimited
                 catch_panics: false,
+                collect_metrics: false,
             },
             cancel: CancellationToken::new(),
             progress_tracker: None,
@@ -2475,6 +2588,8 @@ mod tests {
             stage_tasks: Vec::new(),
             op_pos_to_task: Vec::new(),
             task_in_queue: Vec::new(),
+            dataflow_metrics: None,
+            op_collectors: Vec::new(),
             _phantom: PhantomData,
         };
 
@@ -2522,6 +2637,8 @@ mod tests {
             stage_tasks: Vec::new(),
             op_pos_to_task: Vec::new(),
             task_in_queue: Vec::new(),
+            dataflow_metrics: None,
+            op_collectors: Vec::new(),
             _phantom: PhantomData,
         };
 
@@ -2581,6 +2698,8 @@ mod tests {
             stage_tasks: Vec::new(),
             op_pos_to_task: Vec::new(),
             task_in_queue: Vec::new(),
+            dataflow_metrics: None,
+            op_collectors: Vec::new(),
             _phantom: PhantomData,
         };
 
@@ -2629,6 +2748,8 @@ mod tests {
             stage_tasks: Vec::new(),
             op_pos_to_task: Vec::new(),
             task_in_queue: Vec::new(),
+            dataflow_metrics: None,
+            op_collectors: Vec::new(),
             _phantom: PhantomData,
         };
 
@@ -2676,6 +2797,8 @@ mod tests {
             stage_tasks: Vec::new(),
             op_pos_to_task: Vec::new(),
             task_in_queue: Vec::new(),
+            dataflow_metrics: None,
+            op_collectors: Vec::new(),
             _phantom: PhantomData,
         };
 
@@ -2723,6 +2846,8 @@ mod tests {
             stage_tasks: Vec::new(),
             op_pos_to_task: Vec::new(),
             task_in_queue: Vec::new(),
+            dataflow_metrics: None,
+            op_collectors: Vec::new(),
             _phantom: PhantomData,
         };
 
@@ -2806,6 +2931,8 @@ mod tests {
             stage_tasks: Vec::new(),
             op_pos_to_task: Vec::new(),
             task_in_queue: Vec::new(),
+            dataflow_metrics: None,
+            op_collectors: Vec::new(),
             _phantom: PhantomData,
         };
 
@@ -2866,6 +2993,8 @@ mod tests {
             stage_tasks: Vec::new(),
             op_pos_to_task: Vec::new(),
             task_in_queue: Vec::new(),
+            dataflow_metrics: None,
+            op_collectors: Vec::new(),
             _phantom: PhantomData,
         };
 
@@ -2924,6 +3053,8 @@ mod tests {
             stage_tasks: Vec::new(),
             op_pos_to_task: Vec::new(),
             task_in_queue: Vec::new(),
+            dataflow_metrics: None,
+            op_collectors: Vec::new(),
             _phantom: PhantomData,
         };
 
@@ -2985,6 +3116,8 @@ mod tests {
             stage_tasks: Vec::new(),
             op_pos_to_task: Vec::new(),
             task_in_queue: Vec::new(),
+            dataflow_metrics: None,
+            op_collectors: Vec::new(),
             _phantom: PhantomData,
         };
 
@@ -3060,6 +3193,8 @@ mod tests {
             stage_tasks: Vec::new(),
             op_pos_to_task: Vec::new(),
             task_in_queue: Vec::new(),
+            dataflow_metrics: None,
+            op_collectors: Vec::new(),
             _phantom: PhantomData,
         };
 
@@ -3108,6 +3243,8 @@ mod tests {
             stage_tasks: Vec::new(),
             op_pos_to_task: Vec::new(),
             task_in_queue: Vec::new(),
+            dataflow_metrics: None,
+            op_collectors: Vec::new(),
             _phantom: PhantomData,
         };
 
