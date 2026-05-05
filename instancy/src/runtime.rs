@@ -2867,6 +2867,7 @@ fn materialize_executor<T: Timestamp>(
         channel_factories,
         subgraph_builder,
         probes,
+        stages,
         ..
     } = dataflow;
 
@@ -2880,12 +2881,16 @@ fn materialize_executor<T: Timestamp>(
         worker_context,
     )?;
 
-    // Enable fused activation — operators are polled in topological order within
-    // each sweep, allowing data to flow source→sink without scheduling round-trips.
-    // This is a no-op if the graph has cycles (shouldn't happen for valid dataflows)
-    // or if the graph/executor operator sets don't match (defensive fallback).
-    if let Err(e) = executor.enable_fusion_from_graph(&graph) {
-        tracing::debug!("Fused activation disabled: {e}");
+    // Enable stage-task scheduling if stages were inferred.
+    // This groups operators by stage and activates them in fused topological
+    // order within each stage task, reducing scheduling overhead.
+    if !stages.is_empty() {
+        executor.enable_stage_tasks(&stages);
+    } else {
+        // Fallback: enable whole-graph fused activation.
+        if let Err(e) = executor.enable_fusion_from_graph(&graph) {
+            tracing::debug!("Fused activation disabled: {e}");
+        }
     }
 
     // Build and attach progress tracker.

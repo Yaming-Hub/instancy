@@ -107,6 +107,102 @@ enum SweepOutcome {
 }
 
 // ---------------------------------------------------------------------------
+// FusedStageTask
+// ---------------------------------------------------------------------------
+
+/// A group of operators from a single stage, activated together in topological order.
+///
+/// Instead of scheduling individual operators, the executor schedules `FusedStageTask`s.
+/// Each task activation runs all its non-done operators in a single multi-pass fused
+/// sweep, allowing data to flow through the stage pipeline without inter-activation
+/// scheduling overhead.
+///
+/// # Scheduling unit
+///
+/// When stage-task mode is enabled, the executor's ready queue holds task indices
+/// (not operator positions). One task enqueue → one full stage activation.
+#[derive(Debug)]
+pub(crate) struct FusedStageTask {
+    /// Stage identifier for diagnostics.
+    pub stage_id: crate::dataflow::stage::StageId,
+    /// Operator positions (in the executor's `operators` vec) in topological order.
+    /// These are physical positions, not logical operator indices.
+    pub operator_positions: Vec<usize>,
+}
+
+impl FusedStageTask {
+    /// Activate all non-done operators in this stage in fused topological order.
+    ///
+    /// Uses multi-pass semantics: keeps iterating until no operator makes progress
+    /// or the budget is exhausted. This matches the existing fused activation behavior.
+    ///
+    /// Returns `(any_progress, productive_activations)`.
+    fn activate(
+        &self,
+        operators: &mut [Box<dyn SchedulableOperator>],
+        done: &mut [bool],
+        budget: usize,
+        worker_index: usize,
+        control_sender: Option<&ControlSender>,
+    ) -> Result<(bool, usize)> {
+        let mut any_progress = false;
+        let mut productive_activations = 0usize;
+
+        // Multi-pass: keep iterating until no operator makes progress or budget exhausted.
+        let mut made_progress_this_pass = true;
+        while made_progress_this_pass {
+            made_progress_this_pass = false;
+
+            for &pos in &self.operator_positions {
+                if done[pos] {
+                    continue;
+                }
+                if productive_activations >= budget {
+                    return Ok((any_progress, productive_activations));
+                }
+
+                let outcome = operators[pos].activate().map_err(|e| {
+                    let op_name = operators[pos].name().to_string();
+                    let enriched = e.with_operator_context(op_name.clone(), worker_index);
+                    if let Some(ctrl) = control_sender {
+                        ctrl.broadcast_error(op_name, format!("{enriched}"));
+                    }
+                    enriched
+                })?;
+
+                match outcome {
+                    ActivationOutcome::MadeProgress => {
+                        productive_activations += 1;
+                        any_progress = true;
+                        made_progress_this_pass = true;
+                    }
+                    ActivationOutcome::Idle => {
+                        // No input — will be re-checked if another pass is needed.
+                    }
+                    ActivationOutcome::BlockedOnBackpressure => {
+                        productive_activations += 1;
+                        any_progress = true;
+                        made_progress_this_pass = true;
+                    }
+                    ActivationOutcome::Done => {
+                        productive_activations += 1;
+                        done[pos] = true;
+                        any_progress = true;
+                    }
+                }
+            }
+        }
+
+        Ok((any_progress, productive_activations))
+    }
+
+    /// Whether all operators in this task are done.
+    fn is_done(&self, done: &[bool]) -> bool {
+        self.operator_positions.iter().all(|&pos| done[pos])
+    }
+}
+
+// ---------------------------------------------------------------------------
 // DataflowExecutor
 // ---------------------------------------------------------------------------
 
@@ -160,6 +256,16 @@ pub struct DataflowExecutor<T: Timestamp = u64> {
     /// topological order rather than FIFO ready-queue order. This allows data to
     /// flow through the pipeline in a single sweep (source → ... → sink).
     fused_order: Option<FusedActivationOrder>,
+    /// Stage tasks: when populated, the executor schedules stage tasks instead of
+    /// individual operators. Each task runs its operators in fused topological order.
+    /// Mutually exclusive with `fused_order` (stage_tasks supersedes it).
+    stage_tasks: Vec<FusedStageTask>,
+    /// Maps operator position → stage task index. Used by `propagate_progress()`
+    /// to enqueue the correct task when an operator's frontier changes.
+    /// Empty when stage_tasks is empty.
+    op_pos_to_task: Vec<usize>,
+    /// Per-task queue membership (mirrors `in_queue` but for stage tasks).
+    task_in_queue: Vec<bool>,
     /// Phantom for the timestamp type.
     _phantom: PhantomData<T>,
 }
@@ -323,6 +429,9 @@ impl<T: Timestamp> DataflowExecutor<T> {
             control_sender: None,
             control_receiver: None,
             fused_order: None,
+            stage_tasks: Vec::new(),
+            op_pos_to_task: Vec::new(),
+            task_in_queue: Vec::new(),
             _phantom: PhantomData,
         })
     }
@@ -490,9 +599,78 @@ impl<T: Timestamp> DataflowExecutor<T> {
         Ok(())
     }
 
-    /// Whether fused activation is enabled.
+    /// Enable stage-task scheduling using stage metadata from the dataflow.
+    ///
+    /// Groups operators into `FusedStageTask`s based on the provided stage info.
+    /// Each stage's operators are mapped to their physical positions in the executor
+    /// and activated together in topological order.
+    ///
+    /// When stage tasks are enabled, the ready queue holds task indices instead
+    /// of operator positions, and `fused_order` is ignored.
+    ///
+    /// # Arguments
+    ///
+    /// * `stages` — Stage metadata from `LogicalDataflow.stages()`. Each stage's
+    ///   `operator_indices` contains logical graph indices that are mapped to
+    ///   physical executor positions via `index_to_pos`.
+    pub fn enable_stage_tasks(&mut self, stages: &[crate::dataflow::stage::StageInfo]) {
+        let mut tasks = Vec::with_capacity(stages.len());
+        let mut op_pos_to_task = vec![usize::MAX; self.operators.len()];
+
+        for (task_idx, stage) in stages.iter().enumerate() {
+            // Map logical operator indices to physical positions, filtering
+            // any indices that don't exist in this executor (defensive).
+            let positions: Vec<usize> = stage
+                .operator_indices
+                .iter()
+                .filter_map(|&op_idx| {
+                    if op_idx < self.index_to_pos.len() {
+                        let pos = self.index_to_pos[op_idx];
+                        if pos != usize::MAX && pos < self.operators.len() {
+                            return Some(pos);
+                        }
+                    }
+                    None
+                })
+                .collect();
+
+            // Record mapping from operator position → task index.
+            for &pos in &positions {
+                op_pos_to_task[pos] = task_idx;
+            }
+
+            tasks.push(FusedStageTask {
+                stage_id: stage.id,
+                operator_positions: positions,
+            });
+        }
+
+        let num_tasks = tasks.len();
+        self.stage_tasks = tasks;
+        self.op_pos_to_task = op_pos_to_task;
+        self.task_in_queue = vec![false; num_tasks];
+
+        // Initialize ready queue with all non-empty tasks.
+        self.ready_queue.clear();
+        for flag in self.in_queue.iter_mut() {
+            *flag = false;
+        }
+        for (task_idx, task) in self.stage_tasks.iter().enumerate() {
+            if !task.operator_positions.is_empty() && !task.is_done(&self.done) {
+                self.ready_queue.push_back(task_idx);
+                self.task_in_queue[task_idx] = true;
+            }
+        }
+    }
+
+    /// Whether stage-task scheduling is enabled.
+    pub fn has_stage_tasks(&self) -> bool {
+        !self.stage_tasks.is_empty()
+    }
+
+    /// Whether fused activation is enabled (either via fused_order or stage_tasks).
     pub fn is_fused(&self) -> bool {
-        self.fused_order.is_some()
+        self.fused_order.is_some() || !self.stage_tasks.is_empty()
     }
 
     /// Propagate progress and enqueue operators whose frontiers changed.
@@ -553,44 +731,82 @@ impl<T: Timestamp> DataflowExecutor<T> {
 
         let mut activated = false;
 
-        // Enqueue dirty operators
-        for op_idx in dirty {
-            if op_idx < self.index_to_pos.len() {
-                let pos = self.index_to_pos[op_idx];
-                if pos != usize::MAX && !self.done[pos] && !self.in_queue[pos] {
+        // Enqueue dirty operators (or their owning stage tasks).
+        if !self.stage_tasks.is_empty() {
+            // Stage-task mode: enqueue the task that owns the dirty operator.
+            for op_idx in dirty {
+                if op_idx < self.index_to_pos.len() {
+                    let pos = self.index_to_pos[op_idx];
+                    if pos != usize::MAX && !self.done[pos] && pos < self.op_pos_to_task.len() {
+                        let task_idx = self.op_pos_to_task[pos];
+                        if task_idx != usize::MAX && !self.task_in_queue[task_idx] {
+                            self.ready_queue.push_back(task_idx);
+                            self.task_in_queue[task_idx] = true;
+                            activated = true;
+                        }
+                    }
+                }
+            }
+
+            // Check notifications — enqueue owning task.
+            for pos in 0..self.operators.len() {
+                if self.done[pos] {
+                    continue;
+                }
+                let executor_has_ready = if pos < self.notificators.len() {
+                    self.notificators
+                        .get(pos)
+                        .and_then(|n| n.as_ref())
+                        .map_or(false, |n| n.has_ready())
+                } else {
+                    false
+                };
+                let operator_has_ready = self.operators[pos].has_ready_notifications();
+
+                if executor_has_ready || operator_has_ready {
+                    if pos < self.op_pos_to_task.len() {
+                        let task_idx = self.op_pos_to_task[pos];
+                        if task_idx != usize::MAX && !self.task_in_queue[task_idx] {
+                            self.ready_queue.push_back(task_idx);
+                            self.task_in_queue[task_idx] = true;
+                            activated = true;
+                        }
+                    }
+                }
+            }
+        } else {
+            // Non-stage-task mode: enqueue individual operators.
+            for op_idx in dirty {
+                if op_idx < self.index_to_pos.len() {
+                    let pos = self.index_to_pos[op_idx];
+                    if pos != usize::MAX && !self.done[pos] && !self.in_queue[pos] {
+                        self.ready_queue.push_back(pos);
+                        self.in_queue[pos] = true;
+                        activated = true;
+                    }
+                }
+            }
+
+            // Check if any operator has ready notifications and should be re-enqueued.
+            for pos in 0..self.operators.len() {
+                if self.done[pos] || self.in_queue[pos] {
+                    continue;
+                }
+                let executor_has_ready = if pos < self.notificators.len() {
+                    self.notificators
+                        .get(pos)
+                        .and_then(|n| n.as_ref())
+                        .map_or(false, |n| n.has_ready())
+                } else {
+                    false
+                };
+                let operator_has_ready = self.operators[pos].has_ready_notifications();
+
+                if executor_has_ready || operator_has_ready {
                     self.ready_queue.push_back(pos);
                     self.in_queue[pos] = true;
                     activated = true;
                 }
-            }
-        }
-
-        // Check if any operator has ready notifications and should be re-enqueued.
-        // This covers two cases:
-        // 1. Executor-owned notificators (legacy): notifications fired by the
-        //    frontier update above.
-        // 2. Operator-owned notificators (new): the operator's has_ready_notifications()
-        //    returns true after update_input_frontier() fired notifications.
-        for pos in 0..self.operators.len() {
-            if self.done[pos] || self.in_queue[pos] {
-                continue;
-            }
-            // Check executor-owned notificator (legacy path)
-            let executor_has_ready = if pos < self.notificators.len() {
-                self.notificators
-                    .get(pos)
-                    .and_then(|n| n.as_ref())
-                    .map_or(false, |n| n.has_ready())
-            } else {
-                false
-            };
-            // Check operator-owned notificator (new path)
-            let operator_has_ready = self.operators[pos].has_ready_notifications();
-
-            if executor_has_ready || operator_has_ready {
-                self.ready_queue.push_back(pos);
-                self.in_queue[pos] = true;
-                activated = true;
             }
         }
 
@@ -783,6 +999,69 @@ impl<T: Timestamp> DataflowExecutor<T> {
         Ok(any_progress)
     }
 
+    /// Stage-task activation: process stage tasks from the ready queue.
+    ///
+    /// Each task runs its operators in fused topological order (multi-pass).
+    /// All non-done tasks are activated every sweep (matching old fused semantics
+    /// where all operators are considered each sweep). This prevents downstream
+    /// starvation when an upstream stage keeps producing data.
+    fn run_stage_task_activation(&mut self) -> Result<bool> {
+        // Always repopulate with all non-done tasks at the start of each sweep.
+        // This ensures downstream stages are activated even when upstream stages
+        // keep making progress (preventing starvation via bounded channels).
+        self.ready_queue.clear();
+        for flag in self.task_in_queue.iter_mut() {
+            *flag = false;
+        }
+        for (task_idx, task) in self.stage_tasks.iter().enumerate() {
+            if !task.operator_positions.is_empty() && !task.is_done(&self.done) {
+                self.ready_queue.push_back(task_idx);
+                self.task_in_queue[task_idx] = true;
+            }
+        }
+        if self.ready_queue.is_empty() {
+            return Ok(false);
+        }
+
+        let mut any_progress = false;
+        let budget = self.config.max_activations_per_step;
+        let mut total_productive = 0usize;
+        let batch_size = self.ready_queue.len();
+
+        for _ in 0..batch_size {
+            let Some(task_idx) = self.ready_queue.pop_front() else {
+                break;
+            };
+            self.task_in_queue[task_idx] = false;
+
+            if self.stage_tasks[task_idx].is_done(&self.done) {
+                continue;
+            }
+
+            let remaining_budget = budget.saturating_sub(total_productive);
+            if remaining_budget == 0 {
+                // Budget exhausted — stop processing more tasks this sweep.
+                break;
+            }
+
+            let (progress, productive) = self.stage_tasks[task_idx].activate(
+                &mut self.operators,
+                &mut self.done,
+                remaining_budget,
+                self.worker_index,
+                self.control_sender.as_ref(),
+            )?;
+
+            total_productive += productive;
+
+            if progress {
+                any_progress = true;
+            }
+        }
+
+        Ok(any_progress)
+    }
+
     /// Execute one sweep of the activation loop.
     ///
     /// A sweep processes the ready queue (up to `max_activations_per_step`),
@@ -810,8 +1089,10 @@ impl<T: Timestamp> DataflowExecutor<T> {
             return Ok(SweepOutcome::Completed);
         }
 
-        // Activate operators — fused or unfused path.
-        let any_progress = if self.fused_order.is_some() {
+        // Activate operators — stage-task, fused, or unfused path.
+        let any_progress = if !self.stage_tasks.is_empty() {
+            self.run_stage_task_activation()?
+        } else if self.fused_order.is_some() {
             self.run_fused_activation()?
         } else {
             self.run_unfused_activation()?
@@ -1153,6 +1434,9 @@ mod tests {
             control_sender: None,
             control_receiver: None,
             fused_order: None,
+            stage_tasks: Vec::new(),
+            op_pos_to_task: Vec::new(),
+            task_in_queue: Vec::new(),
             _phantom: PhantomData,
         };
 
@@ -1189,6 +1473,9 @@ mod tests {
             control_sender: None,
             control_receiver: None,
             fused_order: None,
+            stage_tasks: Vec::new(),
+            op_pos_to_task: Vec::new(),
+            task_in_queue: Vec::new(),
             _phantom: PhantomData,
         };
 
@@ -1229,6 +1516,9 @@ mod tests {
             control_sender: None,
             control_receiver: None,
             fused_order: None,
+            stage_tasks: Vec::new(),
+            op_pos_to_task: Vec::new(),
+            task_in_queue: Vec::new(),
             _phantom: PhantomData,
         };
 
@@ -1257,6 +1547,9 @@ mod tests {
             control_sender: None,
             control_receiver: None,
             fused_order: None,
+            stage_tasks: Vec::new(),
+            op_pos_to_task: Vec::new(),
+            task_in_queue: Vec::new(),
             _phantom: PhantomData,
         };
 
@@ -1299,6 +1592,9 @@ mod tests {
             control_sender: None,
             control_receiver: None,
             fused_order: None,
+            stage_tasks: Vec::new(),
+            op_pos_to_task: Vec::new(),
+            task_in_queue: Vec::new(),
             _phantom: PhantomData,
         };
 
@@ -1363,6 +1659,9 @@ mod tests {
             control_sender: None,
             control_receiver: None,
             fused_order: None,
+            stage_tasks: Vec::new(),
+            op_pos_to_task: Vec::new(),
+            task_in_queue: Vec::new(),
             _phantom: PhantomData,
         };
 
@@ -1415,6 +1714,9 @@ mod tests {
             control_sender: None,
             control_receiver: None,
             fused_order: None,
+            stage_tasks: Vec::new(),
+            op_pos_to_task: Vec::new(),
+            task_in_queue: Vec::new(),
             _phantom: PhantomData,
         };
 
@@ -1455,6 +1757,9 @@ mod tests {
             control_sender: None,
             control_receiver: None,
             fused_order: None,
+            stage_tasks: Vec::new(),
+            op_pos_to_task: Vec::new(),
+            task_in_queue: Vec::new(),
             _phantom: PhantomData,
         };
 
@@ -1508,6 +1813,9 @@ mod tests {
             control_sender: None,
             control_receiver: None,
             fused_order: None,
+            stage_tasks: Vec::new(),
+            op_pos_to_task: Vec::new(),
+            task_in_queue: Vec::new(),
             _phantom: PhantomData,
         };
 
@@ -1560,6 +1868,9 @@ mod tests {
             control_sender: None,
             control_receiver: None,
             fused_order: None,
+            stage_tasks: Vec::new(),
+            op_pos_to_task: Vec::new(),
+            task_in_queue: Vec::new(),
             _phantom: PhantomData,
         };
 
@@ -1617,6 +1928,9 @@ mod tests {
             control_sender: None,
             control_receiver: None,
             fused_order: None,
+            stage_tasks: Vec::new(),
+            op_pos_to_task: Vec::new(),
+            task_in_queue: Vec::new(),
             _phantom: PhantomData,
         };
 
@@ -1686,6 +2000,9 @@ mod tests {
             control_sender: None,
             control_receiver: None,
             fused_order: None,
+            stage_tasks: Vec::new(),
+            op_pos_to_task: Vec::new(),
+            task_in_queue: Vec::new(),
             _phantom: PhantomData,
         };
 
@@ -1747,6 +2064,9 @@ mod tests {
             control_sender: None,
             control_receiver: None,
             fused_order: None,
+            stage_tasks: Vec::new(),
+            op_pos_to_task: Vec::new(),
+            task_in_queue: Vec::new(),
             _phantom: PhantomData,
         };
 
@@ -1889,6 +2209,9 @@ mod tests {
             control_sender: None,
             control_receiver: None,
             fused_order: None,
+            stage_tasks: Vec::new(),
+            op_pos_to_task: Vec::new(),
+            task_in_queue: Vec::new(),
             _phantom: PhantomData,
         };
 
@@ -1951,6 +2274,9 @@ mod tests {
             control_sender: None,
             control_receiver: None,
             fused_order: None,
+            stage_tasks: Vec::new(),
+            op_pos_to_task: Vec::new(),
+            task_in_queue: Vec::new(),
             _phantom: PhantomData,
         };
 
@@ -1993,6 +2319,9 @@ mod tests {
             control_sender: None,
             control_receiver: None,
             fused_order: None,
+            stage_tasks: Vec::new(),
+            op_pos_to_task: Vec::new(),
+            task_in_queue: Vec::new(),
             _phantom: PhantomData,
         };
 
@@ -2047,6 +2376,9 @@ mod tests {
             control_sender: None,
             control_receiver: None,
             fused_order: None,
+            stage_tasks: Vec::new(),
+            op_pos_to_task: Vec::new(),
+            task_in_queue: Vec::new(),
             _phantom: PhantomData,
         };
 
@@ -2090,6 +2422,9 @@ mod tests {
             control_sender: None,
             control_receiver: None,
             fused_order: None,
+            stage_tasks: Vec::new(),
+            op_pos_to_task: Vec::new(),
+            task_in_queue: Vec::new(),
             _phantom: PhantomData,
         };
 
@@ -2132,6 +2467,9 @@ mod tests {
             control_sender: None,
             control_receiver: None,
             fused_order: None,
+            stage_tasks: Vec::new(),
+            op_pos_to_task: Vec::new(),
+            task_in_queue: Vec::new(),
             _phantom: PhantomData,
         };
 
@@ -2174,6 +2512,9 @@ mod tests {
             control_sender: None,
             control_receiver: None,
             fused_order: None,
+            stage_tasks: Vec::new(),
+            op_pos_to_task: Vec::new(),
+            task_in_queue: Vec::new(),
             _phantom: PhantomData,
         };
 
@@ -2252,6 +2593,9 @@ mod tests {
             control_sender: None,
             control_receiver: None,
             fused_order: None,
+            stage_tasks: Vec::new(),
+            op_pos_to_task: Vec::new(),
+            task_in_queue: Vec::new(),
             _phantom: PhantomData,
         };
 
@@ -2307,6 +2651,9 @@ mod tests {
             control_sender: None,
             control_receiver: None,
             fused_order: None,
+            stage_tasks: Vec::new(),
+            op_pos_to_task: Vec::new(),
+            task_in_queue: Vec::new(),
             _phantom: PhantomData,
         };
 
@@ -2360,6 +2707,9 @@ mod tests {
             control_sender: None,
             control_receiver: None,
             fused_order: None,
+            stage_tasks: Vec::new(),
+            op_pos_to_task: Vec::new(),
+            task_in_queue: Vec::new(),
             _phantom: PhantomData,
         };
 
@@ -2369,5 +2719,201 @@ mod tests {
         // consume budget). The sweep should return Idle, not get stuck.
         let outcome = executor.run_one_sweep().unwrap();
         assert_eq!(outcome, SweepOutcome::Idle);
+    }
+
+    // -----------------------------------------------------------------------
+    // Stage-task scheduling tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn stage_task_activation_runs_all_operators_in_stage() {
+        // Two stages: stage 0 has ops [0, 1], stage 1 has op [2].
+        // Op 0: 2 activations, Op 1: 1 activation, Op 2: 1 activation.
+        let mut executor: DataflowExecutor<u64> = DataflowExecutor {
+            operators: vec![
+                Box::new(CountingOperator {
+                    name: "op0".into(),
+                    index: 0,
+                    region_id: crate::dataflow::region::RegionId::new(0),
+                    remaining: 2,
+                }),
+                Box::new(CountingOperator {
+                    name: "op1".into(),
+                    index: 1,
+                    region_id: crate::dataflow::region::RegionId::new(0),
+                    remaining: 1,
+                }),
+                Box::new(CountingOperator {
+                    name: "op2".into(),
+                    index: 2,
+                    region_id: crate::dataflow::region::RegionId::new(0),
+                    remaining: 1,
+                }),
+            ],
+            ready_queue: VecDeque::new(),
+            in_queue: vec![false; 3],
+            done: vec![false; 3],
+            index_to_pos: vec![0, 1, 2],
+            config: ExecutorConfig::default(),
+            cancel: CancellationToken::new(),
+            progress_tracker: None,
+            notificators: Vec::new(),
+            probes: Vec::new(),
+            external_inputs_open: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            wake_handle: WakeHandle::new(),
+            consecutive_idle: 0,
+            worker_index: 0,
+            control_sender: None,
+            control_receiver: None,
+            fused_order: None,
+            stage_tasks: Vec::new(),
+            op_pos_to_task: Vec::new(),
+            task_in_queue: Vec::new(),
+            _phantom: PhantomData,
+        };
+
+        // Create stage info for two stages.
+        use crate::dataflow::stage::{FusedActivationOrder, StageId, StageInfo};
+        let stages = vec![
+            StageInfo {
+                id: StageId(0),
+                parallelism: None,
+                operator_indices: vec![0, 1],
+                fused_order: FusedActivationOrder::new(vec![0, 1]),
+            },
+            StageInfo {
+                id: StageId(1),
+                parallelism: Some(4),
+                operator_indices: vec![2],
+                fused_order: FusedActivationOrder::new(vec![2]),
+            },
+        ];
+
+        executor.enable_stage_tasks(&stages);
+        assert!(executor.has_stage_tasks());
+        assert_eq!(executor.stage_tasks.len(), 2);
+
+        // Run to completion.
+        let result = executor.run().unwrap();
+        assert!(result); // completed
+        assert!(executor.is_complete());
+    }
+
+    #[test]
+    fn stage_task_single_stage_equivalent_to_fused() {
+        // Single stage with 3 operators — should behave like fused activation.
+        let mut executor: DataflowExecutor<u64> = DataflowExecutor {
+            operators: vec![
+                Box::new(CountingOperator {
+                    name: "a".into(),
+                    index: 0,
+                    region_id: crate::dataflow::region::RegionId::new(0),
+                    remaining: 3,
+                }),
+                Box::new(CountingOperator {
+                    name: "b".into(),
+                    index: 1,
+                    region_id: crate::dataflow::region::RegionId::new(0),
+                    remaining: 2,
+                }),
+                Box::new(CountingOperator {
+                    name: "c".into(),
+                    index: 2,
+                    region_id: crate::dataflow::region::RegionId::new(0),
+                    remaining: 1,
+                }),
+            ],
+            ready_queue: VecDeque::new(),
+            in_queue: vec![false; 3],
+            done: vec![false; 3],
+            index_to_pos: vec![0, 1, 2],
+            config: ExecutorConfig::default(),
+            cancel: CancellationToken::new(),
+            progress_tracker: None,
+            notificators: Vec::new(),
+            probes: Vec::new(),
+            external_inputs_open: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            wake_handle: WakeHandle::new(),
+            consecutive_idle: 0,
+            worker_index: 0,
+            control_sender: None,
+            control_receiver: None,
+            fused_order: None,
+            stage_tasks: Vec::new(),
+            op_pos_to_task: Vec::new(),
+            task_in_queue: Vec::new(),
+            _phantom: PhantomData,
+        };
+
+        use crate::dataflow::stage::{FusedActivationOrder, StageId, StageInfo};
+        let stages = vec![StageInfo {
+            id: StageId(0),
+            parallelism: None,
+            operator_indices: vec![0, 1, 2],
+            fused_order: FusedActivationOrder::new(vec![0, 1, 2]),
+        }];
+
+        executor.enable_stage_tasks(&stages);
+        let result = executor.run().unwrap();
+        assert!(result);
+        assert_eq!(executor.completed_count(), 3);
+    }
+
+    #[test]
+    fn stage_task_empty_stage_skipped() {
+        // Stage with operators that map to valid positions, plus an empty stage.
+        let mut executor: DataflowExecutor<u64> = DataflowExecutor {
+            operators: vec![Box::new(CountingOperator {
+                name: "op0".into(),
+                index: 0,
+                region_id: crate::dataflow::region::RegionId::new(0),
+                remaining: 1,
+            })],
+            ready_queue: VecDeque::new(),
+            in_queue: vec![false],
+            done: vec![false],
+            index_to_pos: vec![0],
+            config: ExecutorConfig::default(),
+            cancel: CancellationToken::new(),
+            progress_tracker: None,
+            notificators: Vec::new(),
+            probes: Vec::new(),
+            external_inputs_open: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            wake_handle: WakeHandle::new(),
+            consecutive_idle: 0,
+            worker_index: 0,
+            control_sender: None,
+            control_receiver: None,
+            fused_order: None,
+            stage_tasks: Vec::new(),
+            op_pos_to_task: Vec::new(),
+            task_in_queue: Vec::new(),
+            _phantom: PhantomData,
+        };
+
+        use crate::dataflow::stage::{FusedActivationOrder, StageId, StageInfo};
+        let stages = vec![
+            StageInfo {
+                id: StageId(0),
+                parallelism: None,
+                operator_indices: vec![0],
+                fused_order: FusedActivationOrder::new(vec![0]),
+            },
+            StageInfo {
+                id: StageId(1),
+                parallelism: Some(2),
+                // Op index 99 doesn't exist — this stage will be empty.
+                operator_indices: vec![99],
+                fused_order: FusedActivationOrder::new(vec![99]),
+            },
+        ];
+
+        executor.enable_stage_tasks(&stages);
+        // Two tasks created, but second has no valid positions.
+        assert_eq!(executor.stage_tasks.len(), 2);
+        assert!(executor.stage_tasks[1].operator_positions.is_empty());
+
+        let result = executor.run().unwrap();
+        assert!(result);
     }
 }
