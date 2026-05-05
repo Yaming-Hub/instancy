@@ -2844,6 +2844,9 @@ fn validate_multi_worker_topologies<T: Timestamp>(
 ///
 /// If `wake_handle` is provided, the executor uses it (shared with InputSenders
 /// and CancellationTokens). Otherwise a fresh one is created internally.
+///
+/// Automatically enables fused activation (topological operator ordering) for
+/// reduced scheduling overhead.
 fn materialize_executor<T: Timestamp>(
     dataflow: LogicalDataflow<T>,
     cancel: CancellationToken,
@@ -2857,21 +2860,39 @@ fn materialize_executor<T: Timestamp>(
         max_sweeps_per_poll: 64,
     };
 
+    // Destructure to allow accessing graph after moving factories.
+    let LogicalDataflow {
+        graph,
+        operator_factories,
+        channel_factories,
+        subgraph_builder,
+        probes,
+        ..
+    } = dataflow;
+
     let mut executor: DataflowExecutor<T> = DataflowExecutor::materialize(
-        &dataflow.graph,
-        dataflow.operator_factories,
-        dataflow.channel_factories,
+        &graph,
+        operator_factories,
+        channel_factories,
         executor_config,
         cancel,
         wake_handle,
         worker_context,
     )?;
 
+    // Enable fused activation — operators are polled in topological order within
+    // each sweep, allowing data to flow source→sink without scheduling round-trips.
+    // This is a no-op if the graph has cycles (shouldn't happen for valid dataflows)
+    // or if the graph/executor operator sets don't match (defensive fallback).
+    if let Err(e) = executor.enable_fusion_from_graph(&graph) {
+        tracing::debug!("Fused activation disabled: {e}");
+    }
+
     // Build and attach progress tracker.
     // For multi-worker dataflows, attach cross-worker progress channels
     // so the tracker broadcasts capability changes to peers and absorbs
     // remote changes. This makes is_completed() reflect global state.
-    let mut tracker = dataflow.subgraph_builder.build();
+    let mut tracker = subgraph_builder.build();
     if let Some(channels) = progress_channels {
         tracker.set_progress_channels(channels);
     }
@@ -2879,7 +2900,7 @@ fn materialize_executor<T: Timestamp>(
     executor.set_progress_tracker(tracker);
 
     // Register probes
-    for (op_idx, probe) in dataflow.probes {
+    for (op_idx, probe) in probes {
         executor.register_probe(op_idx, probe);
     }
 
