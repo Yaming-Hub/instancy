@@ -42,5 +42,5 @@ pub use region::{PlacementPolicy, Region, RegionAllocator, RegionId};
 pub use schedulable::{ActivationOutcome, ChannelEndpoints, OperatorFactory, SchedulableOperator};
 pub use scope::{ChildScope, RootScope, Scope, ScopeAddr};
 pub use spec::{DataflowHandle, DataflowInputs, DataflowSpec};
-pub use stage::{FusedActivationOrder, StageId};
+pub use stage::{FusedActivationOrder, StageId, StageInfo, infer_stages};
 pub use stream::{StreamEdge, Slot, StreamConnection};
