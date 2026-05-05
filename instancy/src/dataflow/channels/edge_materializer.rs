@@ -41,13 +41,21 @@ use super::pushpull::{Pull, Push};
 /// exchange edge. The exchange routing logic (`ExchangePush`/`ExchangePull`)
 /// wraps these endpoints — the materializer only provides the raw transport.
 ///
+/// # Symmetric vs Asymmetric
+///
+/// - **Symmetric** (M==N): All workers are both sources and targets.
+///   Use `materialize_worker(i)` which returns both push and pull ends.
+/// - **Asymmetric** (M≠N): Source workers (0..M) differ from target workers
+///   (0..N). Use `materialize_source_worker(i)` for push endpoints and
+///   `materialize_target_worker(j)` for pull endpoints.
+///
 /// # Contract
 ///
-/// - `materialize_worker(i)` must be called exactly once per worker index
-///   in `0..num_workers`, in any order.
-/// - Returns `num_workers` push endpoints (index j → send to worker j)
-///   and `num_workers` pull endpoints (index j → receive from worker j).
-/// - After all workers are materialized, the materializer is consumed.
+/// - For symmetric usage: `materialize_worker(i)` must be called exactly
+///   once per worker index in `0..num_workers`, in any order.
+/// - For asymmetric usage: `materialize_source_worker(i)` once per source
+///   in `0..num_source_workers()`, `materialize_target_worker(j)` once per
+///   target in `0..num_target_workers()`.
 ///
 /// # Mixing transports
 ///
@@ -70,34 +78,64 @@ use super::pushpull::{Pull, Push};
 /// `SharedWakeRegistry` only covers in-process notification — remote wakes
 /// are the materializer's responsibility.
 pub trait EdgeMaterializer<T: Timestamp, D: Send + 'static>: Send {
-    /// Returns the number of workers this materializer is configured for.
+    /// Returns the number of workers for symmetric channels (asserts M==N).
     ///
     /// Used by callers to validate consistency and size shared structures
     /// (e.g., `SharedWakeRegistry`).
-    fn num_workers(&self) -> usize;
+    fn num_workers(&self) -> usize {
+        assert_eq!(
+            self.num_source_workers(),
+            self.num_target_workers(),
+            "num_workers() requires symmetric materializer (M==N)"
+        );
+        self.num_source_workers()
+    }
 
-    /// Produce the push and pull endpoints for the given worker.
+    /// Number of source workers (M dimension).
+    fn num_source_workers(&self) -> usize;
+
+    /// Number of target workers (N dimension).
+    fn num_target_workers(&self) -> usize;
+
+    /// Produce the push and pull endpoints for a worker in symmetric mode.
     ///
-    /// Returns `(pushers, pullers)` where both Vecs have length exactly
-    /// [`num_workers()`](Self::num_workers):
-    /// - `pushers[j]` sends data to worker j
-    /// - `pullers[j]` receives data from worker j
+    /// Returns `(pushers, pullers)`:
+    /// - `pushers[j]` sends data to target worker j (length = num_target_workers)
+    /// - `pullers[j]` receives data from source worker j (length = num_source_workers)
     ///
-    /// # Invariant
-    ///
-    /// Both returned Vecs **must** have length exactly `num_workers()`.
-    /// Violating this will cause out-of-bounds panics in
-    /// `ExchangePush`/`ExchangePull` during routing.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if the worker index is out of range or if the
-    /// worker's endpoints have already been taken. After all workers
-    /// are materialized, further calls must return an error.
+    /// # Panics
+    /// Default implementation panics if M ≠ N.
     fn materialize_worker(
         &mut self,
         worker_idx: usize,
-    ) -> Result<(Vec<Box<dyn Push<T, D, ()>>>, Vec<Box<dyn Pull<T, D, ()>>>)>;
+    ) -> Result<(Vec<Box<dyn Push<T, D, ()>>>, Vec<Box<dyn Pull<T, D, ()>>>)> {
+        assert_eq!(
+            self.num_source_workers(),
+            self.num_target_workers(),
+            "materialize_worker requires symmetric materializer"
+        );
+        let pushers = self.materialize_source_worker(worker_idx)?;
+        let pullers = self.materialize_target_worker(worker_idx)?;
+        Ok((pushers, pullers))
+    }
+
+    /// Produce push endpoints for source worker `src_idx`.
+    ///
+    /// Returns a Vec of length `num_target_workers()` — one push endpoint
+    /// per target worker.
+    fn materialize_source_worker(
+        &mut self,
+        src_idx: usize,
+    ) -> Result<Vec<Box<dyn Push<T, D, ()>>>>;
+
+    /// Produce pull endpoints for target worker `dst_idx`.
+    ///
+    /// Returns a Vec of length `num_source_workers()` — one pull endpoint
+    /// per source worker.
+    fn materialize_target_worker(
+        &mut self,
+        dst_idx: usize,
+    ) -> Result<Vec<Box<dyn Pull<T, D, ()>>>>;
 }
 
 // ---------------------------------------------------------------------------
@@ -112,18 +150,28 @@ pub trait EdgeMaterializer<T: Timestamp, D: Send + 'static>: Send {
 /// `EdgeMaterializer` abstraction was introduced.
 pub struct LocalEdgeMaterializer<T: Timestamp, D: Send + 'static> {
     channel_set: ExchangeChannelSet<T, D>,
-    num_workers: usize,
+    num_sources: usize,
+    num_targets: usize,
 }
 
 impl<T: Timestamp, D: Send + 'static> LocalEdgeMaterializer<T, D> {
-    /// Create a new local materializer for `num_workers` workers.
+    /// Create a new local materializer for `num_workers` workers (symmetric).
     ///
     /// Allocates an N×N matrix of bounded in-process channels with the
     /// given capacity per channel.
     pub fn new(num_workers: usize, capacity: usize) -> Self {
+        Self::new_asymmetric(num_workers, num_workers, capacity)
+    }
+
+    /// Create a new local materializer for M source → N target workers.
+    ///
+    /// Allocates an M×N matrix of bounded in-process channels with the
+    /// given capacity per channel.
+    pub fn new_asymmetric(num_sources: usize, num_targets: usize, capacity: usize) -> Self {
         Self {
-            channel_set: ExchangeChannelSet::new(num_workers, capacity),
-            num_workers,
+            channel_set: ExchangeChannelSet::new_asymmetric(num_sources, num_targets, capacity),
+            num_sources,
+            num_targets,
         }
     }
 }
@@ -131,15 +179,26 @@ impl<T: Timestamp, D: Send + 'static> LocalEdgeMaterializer<T, D> {
 impl<T: Timestamp, D: Send + 'static> EdgeMaterializer<T, D>
     for LocalEdgeMaterializer<T, D>
 {
-    fn num_workers(&self) -> usize {
-        self.num_workers
+    fn num_source_workers(&self) -> usize {
+        self.num_sources
     }
 
-    fn materialize_worker(
+    fn num_target_workers(&self) -> usize {
+        self.num_targets
+    }
+
+    fn materialize_source_worker(
         &mut self,
-        worker_idx: usize,
-    ) -> Result<(Vec<Box<dyn Push<T, D, ()>>>, Vec<Box<dyn Pull<T, D, ()>>>)> {
-        self.channel_set.take_pair(worker_idx)
+        src_idx: usize,
+    ) -> Result<Vec<Box<dyn Push<T, D, ()>>>> {
+        self.channel_set.take_source_endpoints(src_idx)
+    }
+
+    fn materialize_target_worker(
+        &mut self,
+        dst_idx: usize,
+    ) -> Result<Vec<Box<dyn Pull<T, D, ()>>>> {
+        self.channel_set.take_target_endpoints(dst_idx)
     }
 }
 
@@ -222,7 +281,8 @@ mod tests {
     #[test]
     fn local_materializer_num_workers() {
         let mat = LocalEdgeMaterializer::<u64, i32>::new(4, 16);
-        assert_eq!(mat.num_workers(), 4);
+        assert_eq!(mat.num_source_workers(), 4);
+        assert_eq!(mat.num_target_workers(), 4);
     }
 
     #[test]
@@ -231,6 +291,49 @@ mod tests {
         // by create_exchange_factories_with which takes Arc<Mutex<dyn ...>>).
         let mat: Box<dyn EdgeMaterializer<u64, i32>> =
             Box::new(LocalEdgeMaterializer::new(2, 16));
-        assert_eq!(mat.num_workers(), 2);
+        assert_eq!(mat.num_source_workers(), 2);
+        assert_eq!(mat.num_target_workers(), 2);
+    }
+
+    #[test]
+    fn local_materializer_asymmetric() {
+        // 2 sources → 3 targets
+        let mut mat = LocalEdgeMaterializer::<u64, i32>::new_asymmetric(2, 3, 16);
+        assert_eq!(mat.num_source_workers(), 2);
+        assert_eq!(mat.num_target_workers(), 3);
+
+        // Materialize source workers (push endpoints)
+        let push0 = mat.materialize_source_worker(0).unwrap();
+        let push1 = mat.materialize_source_worker(1).unwrap();
+        assert_eq!(push0.len(), 3); // each source pushes to 3 targets
+        assert_eq!(push1.len(), 3);
+
+        // Materialize target workers (pull endpoints)
+        let pull0 = mat.materialize_target_worker(0).unwrap();
+        let pull1 = mat.materialize_target_worker(1).unwrap();
+        let pull2 = mat.materialize_target_worker(2).unwrap();
+        assert_eq!(pull0.len(), 2); // each target pulls from 2 sources
+        assert_eq!(pull1.len(), 2);
+        assert_eq!(pull2.len(), 2);
+    }
+
+    #[test]
+    fn local_materializer_asymmetric_data_flows() {
+        let mut mat = LocalEdgeMaterializer::<u64, String>::new_asymmetric(2, 3, 16);
+
+        let mut push0 = mat.materialize_source_worker(0).unwrap();
+        let _push1 = mat.materialize_source_worker(1).unwrap();
+        let _pull0 = mat.materialize_target_worker(0).unwrap();
+        let mut pull1 = mat.materialize_target_worker(1).unwrap();
+        let _pull2 = mat.materialize_target_worker(2).unwrap();
+
+        // Source 0 pushes to target 1
+        push0[1]
+            .push(Envelope::data(7u64, vec!["msg".to_string()]))
+            .unwrap();
+
+        // Target 1 pulls from source 0
+        let env = pull1[0].pull().unwrap();
+        assert_eq!(env.as_data(), Some((&7u64, &vec!["msg".to_string()])));
     }
 }
