@@ -143,6 +143,8 @@ struct BuilderState<T: Timestamp> {
     /// [`DataflowBuilder::get_context`]. Carried into [`LogicalDataflow`]
     /// on [`DataflowBuilder::build()`].
     contexts: SharedContext,
+    /// Whether to catch panics in operator activation.
+    catch_panics: bool,
 }
 
 /// Type-erased closure for wiring an input port during spawn().
@@ -265,6 +267,7 @@ impl<T: Timestamp> DataflowBuilder<T> {
                 next_collect_index: 0,
                 channel_capacity: config.channel_capacity,
                 contexts: SharedContext::new(),
+                catch_panics: false,
             })),
         }
     }
@@ -329,6 +332,23 @@ impl<T: Timestamp> DataflowBuilder<T> {
     /// ```
     pub fn get_context<C: Send + Sync + 'static>(&self) -> Option<Arc<C>> {
         self.state.borrow().contexts.get::<C>()
+    }
+
+    /// Enable panic recovery for operator activations.
+    ///
+    /// When enabled, panics in operator `activate()` are caught with
+    /// `std::panic::catch_unwind` and converted to [`Error::OperatorPanic`].
+    /// This prevents a single misbehaving operator from crashing the entire
+    /// process.
+    ///
+    /// Defaults to `false` (panics propagate normally).
+    ///
+    /// **Note:** This has no effect if the binary is built with `panic = "abort"`.
+    ///
+    /// [`Error::OperatorPanic`]: crate::error::Error::OperatorPanic
+    pub fn catch_panics(&self, enable: bool) -> &Self {
+        self.state.borrow_mut().catch_panics = enable;
+        self
     }
 
     /// Declare a named input port that data will be fed into at runtime.
@@ -802,6 +822,7 @@ impl<T: Timestamp> DataflowBuilder<T> {
             exchange_network_creators: state.exchange_network_creators,
             contexts: state.contexts,
             stages,
+            catch_panics: state.catch_panics,
         })
     }
 }
@@ -1591,6 +1612,7 @@ impl<T: Timestamp, D: Clone + Send + 'static> Pipe<T, D> {
                 next_collect_index: 0,
                 channel_capacity: capacity,
                 contexts: parent_contexts,
+                catch_panics: false,
             }));
 
         // The iteration variable pipe points to concat's output
@@ -3083,6 +3105,8 @@ pub struct LogicalDataflow<T: Timestamp> {
     /// Auto-inferred stage metadata. Each stage groups operators connected
     /// by pipeline edges, with exchange edges forming stage boundaries.
     pub(crate) stages: Vec<crate::dataflow::stage::StageInfo>,
+    /// Whether to catch panics in operator activation (see [`ExecutorConfig::catch_panics`]).
+    pub(crate) catch_panics: bool,
 }
 
 impl<T: Timestamp> LogicalDataflow<T> {

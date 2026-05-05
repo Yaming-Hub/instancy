@@ -56,6 +56,21 @@ pub struct ExecutorConfig {
     ///
     /// Set to `0` to disable the budget (poll until completion/quiescence).
     pub max_sweeps_per_poll: usize,
+    /// Whether to catch panics in operator `activate()` calls.
+    ///
+    /// When enabled, a panicking operator produces an `Error::OperatorPanic`
+    /// instead of unwinding through the executor task. This is useful when
+    /// operators run user-defined functions (UDFs) that may panic.
+    ///
+    /// **Caveats:**
+    /// - After a caught panic, the operator is in an unknown state. The
+    ///   dataflow is terminated immediately (the error propagates up).
+    /// - `panic = "abort"` builds cannot catch panics — the process exits.
+    /// - The default panic hook still prints the panic message to stderr.
+    /// - Partial outputs produced before the panic are not rolled back.
+    ///
+    /// Default: `false` (panics unwind normally).
+    pub catch_panics: bool,
 }
 
 impl Default for ExecutorConfig {
@@ -64,6 +79,7 @@ impl Default for ExecutorConfig {
             max_activations_per_step: 1024,
             max_idle_sweeps: 3,
             max_sweeps_per_poll: 64,
+            catch_panics: false,
         }
     }
 }
@@ -107,6 +123,51 @@ enum SweepOutcome {
 }
 
 // ---------------------------------------------------------------------------
+// Panic-guarded operator activation
+// ---------------------------------------------------------------------------
+
+/// Activate an operator, optionally catching panics.
+///
+/// When `catch_panics` is true, uses `std::panic::catch_unwind` to convert
+/// panics into `Error::OperatorPanic`. The operator name is captured BEFORE
+/// the activation call to avoid touching poisoned state after a panic.
+///
+/// When `catch_panics` is false, calls `activate()` directly (zero overhead).
+fn activate_operator(
+    op: &mut Box<dyn SchedulableOperator>,
+    catch_panics: bool,
+) -> Result<ActivationOutcome> {
+    if catch_panics {
+        // Capture name before activation — operator may be poisoned after panic.
+        let op_name = op.name().to_string();
+        match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| op.activate())) {
+            Ok(result) => result,
+            Err(payload) => {
+                let message = extract_panic_message(&payload);
+                Err(Error::OperatorPanic {
+                    operator: op_name,
+                    worker_index: None,
+                    message,
+                })
+            }
+        }
+    } else {
+        op.activate()
+    }
+}
+
+/// Extract a human-readable message from a panic payload.
+fn extract_panic_message(payload: &Box<dyn std::any::Any + Send>) -> String {
+    if let Some(s) = payload.downcast_ref::<&str>() {
+        (*s).to_string()
+    } else if let Some(s) = payload.downcast_ref::<String>() {
+        s.clone()
+    } else {
+        "unknown panic payload".to_string()
+    }
+}
+
+// ---------------------------------------------------------------------------
 // FusedStageTask
 // ---------------------------------------------------------------------------
 
@@ -144,6 +205,7 @@ impl FusedStageTask {
         budget: usize,
         worker_index: usize,
         control_sender: Option<&ControlSender>,
+        catch_panics: bool,
     ) -> Result<(bool, usize)> {
         let mut any_progress = false;
         let mut productive_activations = 0usize;
@@ -161,8 +223,8 @@ impl FusedStageTask {
                     return Ok((any_progress, productive_activations));
                 }
 
-                let outcome = operators[pos].activate().map_err(|e| {
-                    let op_name = operators[pos].name().to_string();
+                let op_name = operators[pos].name().to_string();
+                let outcome = activate_operator(&mut operators[pos], catch_panics).map_err(|e| {
                     let enriched = e.with_operator_context(op_name.clone(), worker_index);
                     if let Some(ctrl) = control_sender {
                         ctrl.broadcast_error(op_name, format!("{enriched}"));
@@ -887,8 +949,8 @@ impl<T: Timestamp> DataflowExecutor<T> {
                 continue;
             }
 
-            let outcome = self.operators[pos].activate().map_err(|e| {
-                let op_name = self.operators[pos].name().to_string();
+            let op_name = self.operators[pos].name().to_string();
+            let outcome = activate_operator(&mut self.operators[pos], self.config.catch_panics).map_err(|e| {
                 let enriched = e.with_operator_context(op_name.clone(), self.worker_index);
                 if let Some(ref ctrl) = self.control_sender {
                     ctrl.broadcast_error(op_name, format!("{enriched}"));
@@ -965,8 +1027,8 @@ impl<T: Timestamp> DataflowExecutor<T> {
                     return Ok(any_progress);
                 }
 
-                let outcome = self.operators[pos].activate().map_err(|e| {
-                    let op_name = self.operators[pos].name().to_string();
+                let op_name = self.operators[pos].name().to_string();
+                let outcome = activate_operator(&mut self.operators[pos], self.config.catch_panics).map_err(|e| {
                     let enriched = e.with_operator_context(op_name.clone(), self.worker_index);
                     if let Some(ref ctrl) = self.control_sender {
                         ctrl.broadcast_error(op_name, format!("{enriched}"));
@@ -1053,6 +1115,7 @@ impl<T: Timestamp> DataflowExecutor<T> {
                 remaining_budget,
                 self.worker_index,
                 self.control_sender.as_ref(),
+                self.config.catch_panics,
             )?;
 
             total_productive += productive;
@@ -1337,6 +1400,43 @@ mod tests {
     use super::*;
     use crate::dataflow::schedulable::ActivationOutcome;
 
+    /// Helper to create a test executor from a list of operators.
+    impl DataflowExecutor<u64> {
+        fn new_test(
+            operators: Vec<Box<dyn SchedulableOperator>>,
+            config: ExecutorConfig,
+            worker_index: usize,
+        ) -> Self {
+            let n = operators.len();
+            let index_to_pos: Vec<usize> = operators.iter().map(|op| op.index()).collect();
+            Self {
+                operators,
+                ready_queue: VecDeque::from_iter(0..n),
+                in_queue: vec![true; n],
+                done: vec![false; n],
+                index_to_pos,
+                config,
+                cancel: CancellationToken::new(),
+                progress_tracker: None,
+                notificators: Vec::new(),
+                probes: Vec::new(),
+                external_inputs_open: std::sync::Arc::new(
+                    std::sync::atomic::AtomicUsize::new(0),
+                ),
+                wake_handle: WakeHandle::new(),
+                consecutive_idle: 0,
+                worker_index,
+                control_sender: None,
+                control_receiver: None,
+                fused_order: None,
+                stage_tasks: Vec::new(),
+                op_pos_to_task: Vec::new(),
+                task_in_queue: Vec::new(),
+                _phantom: PhantomData,
+            }
+        }
+    }
+
     /// A trivial operator that counts activations and becomes done after N.
     struct CountingOperator {
         name: String,
@@ -1597,6 +1697,7 @@ mod tests {
                 max_activations_per_step: 10,
                 max_idle_sweeps: 3,
                 max_sweeps_per_poll: 0,
+                catch_panics: false,
             },
             cancel: CancellationToken::new(),
             progress_tracker: None,
@@ -1941,6 +2042,7 @@ mod tests {
                 max_activations_per_step: 1024,
                 max_idle_sweeps: 1,     // reach idle threshold quickly
                 max_sweeps_per_poll: 0, // no budget limit for this test
+                catch_panics: false,
             },
             cancel: CancellationToken::new(),
             progress_tracker: None,
@@ -2013,6 +2115,7 @@ mod tests {
                 max_activations_per_step: 1024,
                 max_idle_sweeps: 1,
                 max_sweeps_per_poll: 0,
+                catch_panics: false,
             },
             cancel: CancellationToken::new(),
             progress_tracker: None,
@@ -2222,6 +2325,7 @@ mod tests {
                 max_activations_per_step: 1024,
                 max_idle_sweeps: 3,
                 max_sweeps_per_poll: budget,
+                catch_panics: false,
             },
             cancel: CancellationToken::new(),
             progress_tracker: None,
@@ -2287,6 +2391,7 @@ mod tests {
                 max_activations_per_step: 1024,
                 max_idle_sweeps: 3,
                 max_sweeps_per_poll: 0, // unlimited
+                catch_panics: false,
             },
             cancel: CancellationToken::new(),
             progress_tracker: None,
@@ -2940,5 +3045,114 @@ mod tests {
 
         let result = executor.run().unwrap();
         assert!(result);
+    }
+
+    // -----------------------------------------------------------------------
+    // Panic recovery tests
+    // -----------------------------------------------------------------------
+
+    /// An operator that panics on its first activation.
+    struct PanickingOperator {
+        name: String,
+        index: usize,
+        stage_id: crate::dataflow::stage::StageId,
+    }
+
+    impl SchedulableOperator for PanickingOperator {
+        fn activate(&mut self) -> Result<ActivationOutcome> {
+            panic!("operator {} exploded", self.name);
+        }
+        fn is_done(&self) -> bool {
+            false
+        }
+        fn name(&self) -> &str {
+            &self.name
+        }
+        fn index(&self) -> usize {
+            self.index
+        }
+        fn stage_id(&self) -> crate::dataflow::stage::StageId {
+            self.stage_id
+        }
+        fn close_inputs(&mut self) {}
+    }
+
+    #[test]
+    fn catch_panics_returns_operator_panic_error() {
+        let mut config = ExecutorConfig::default();
+        config.catch_panics = true;
+
+        let ops: Vec<Box<dyn SchedulableOperator>> = vec![Box::new(PanickingOperator {
+            name: "boom".to_string(),
+            index: 0,
+            stage_id: crate::dataflow::stage::StageId::new(0),
+        })];
+
+        let mut executor = DataflowExecutor::<u64>::new_test(ops, config, 0);
+
+        let err = executor.run().unwrap_err();
+        match &err {
+            Error::OperatorPanic {
+                operator,
+                message,
+                worker_index,
+            } => {
+                assert_eq!(operator, "boom");
+                assert!(
+                    message.contains("exploded"),
+                    "unexpected message: {message}"
+                );
+                // with_operator_context backfills worker_index
+                assert_eq!(*worker_index, Some(0));
+            }
+            other => panic!("expected OperatorPanic, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn catch_panics_disabled_propagates_panic() {
+        let mut config = ExecutorConfig::default();
+        config.catch_panics = false;
+
+        let ops: Vec<Box<dyn SchedulableOperator>> = vec![Box::new(PanickingOperator {
+            name: "boom".to_string(),
+            index: 0,
+            stage_id: crate::dataflow::stage::StageId::new(0),
+        })];
+
+        let mut executor = DataflowExecutor::<u64>::new_test(ops, config, 0);
+
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| executor.run()));
+        assert!(result.is_err(), "expected panic to propagate");
+    }
+
+    #[test]
+    fn activate_operator_helper_no_panic_passthrough() {
+        let mut op: Box<dyn SchedulableOperator> = Box::new(CountingOperator {
+            name: "ok_op".to_string(),
+            index: 0,
+            stage_id: crate::dataflow::stage::StageId::new(0),
+            remaining: 1,
+        });
+
+        // With catch_panics=true, normal returns pass through unchanged.
+        let result = activate_operator(&mut op, true);
+        assert!(matches!(result, Ok(ActivationOutcome::Done)));
+    }
+
+    #[test]
+    fn extract_panic_message_str_and_string() {
+        let str_payload: Box<dyn std::any::Any + Send> = Box::new("hello panic");
+        assert_eq!(extract_panic_message(&str_payload), "hello panic");
+
+        let string_payload: Box<dyn std::any::Any + Send> =
+            Box::new(String::from("string panic"));
+        assert_eq!(extract_panic_message(&string_payload), "string panic");
+
+        let other_payload: Box<dyn std::any::Any + Send> = Box::new(42u32);
+        assert_eq!(
+            extract_panic_message(&other_payload),
+            "unknown panic payload"
+        );
     }
 }

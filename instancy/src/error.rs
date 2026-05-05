@@ -56,6 +56,25 @@ pub enum Error {
     #[error("Channel closed")]
     ChannelClosed,
 
+    /// An operator panicked during activation.
+    ///
+    /// This is only returned when `catch_panics` is enabled in `ExecutorConfig`.
+    /// The panic payload is captured as a message string. After a panic, the
+    /// operator is in an unknown state and the dataflow is terminated.
+    ///
+    /// Note: `panic = "abort"` builds will not reach this variant — the process
+    /// exits before the panic can be caught.
+    #[error("Operator '{operator}' panicked{}: {message}",
+        worker_index.map(|w| format!(" (worker {w})")).unwrap_or_default())]
+    OperatorPanic {
+        /// The name of the operator that panicked.
+        operator: String,
+        /// The worker index where the panic occurred, if known.
+        worker_index: Option<usize>,
+        /// The panic message extracted from the payload.
+        message: String,
+    },
+
     /// A custom error message.
     #[error("{0}")]
     Custom(String),
@@ -131,6 +150,17 @@ impl Error {
                 source,
             },
             Error::Operator { .. } => self,
+            // Preserve OperatorPanic as-is (already has operator context).
+            Error::OperatorPanic {
+                operator: op_name,
+                worker_index: None,
+                message,
+            } => Self::OperatorPanic {
+                operator: op_name,
+                worker_index: Some(worker_index),
+                message,
+            },
+            Error::OperatorPanic { .. } => self,
             other => Self::Operator {
                 operator: operator.into(),
                 worker_index: Some(worker_index),

@@ -2961,6 +2961,7 @@ fn materialize_executor<T: Timestamp>(
         max_activations_per_step: 1024,
         max_idle_sweeps: 64,
         max_sweeps_per_poll: 64,
+        catch_panics: dataflow.catch_panics,
     };
 
     // Destructure to allow accessing graph after moving factories.
