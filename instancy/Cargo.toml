@@ -42,3 +42,11 @@ test-utils = []
 
 [[example]]
 name = "async_io_channels"
+
+[[example]]
+name = "cluster_basic"
+required-features = ["transport"]
+
+[[example]]
+name = "cluster_exchange"
+required-features = ["transport"]
