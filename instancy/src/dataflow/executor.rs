@@ -295,6 +295,11 @@ pub struct DataflowExecutor<T: Timestamp = u64> {
     /// Registered probes: (operator_index, probe_handle).
     /// Updated during progress propagation with the operator's input frontier.
     probes: Vec<(usize, ProbeHandle<T>)>,
+    /// Async notifiers for registered probes. When `async-io` is enabled,
+    /// each probe has a corresponding notifier that wakes async waiters.
+    /// Indices correspond 1:1 with `probes`.
+    #[cfg(feature = "async-io")]
+    probe_notifiers: Vec<crate::dataflow::probe::ProbeNotifier<T>>,
     /// Number of external input sources still open (e.g., channel-based inputs
     /// fed by the caller via `DataflowHandle`). While > 0, the executor will
     /// not declare quiescence — it waits for external data instead.
@@ -488,6 +493,8 @@ impl<T: Timestamp> DataflowExecutor<T> {
             progress_tracker: None,
             notificators: Vec::new(),
             probes: Vec::new(),
+            #[cfg(feature = "async-io")]
+            probe_notifiers: Vec::new(),
             external_inputs_open: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             wake_handle,
             consecutive_idle: 0,
@@ -575,6 +582,7 @@ impl<T: Timestamp> DataflowExecutor<T> {
     /// The probe's frontier is updated during each progress propagation step
     /// with the operator's input frontier (the combined frontier of all inputs).
     /// On registration, the probe is immediately seeded with the current frontier.
+    #[cfg(not(feature = "async-io"))]
     pub fn register_probe(&mut self, operator_index: usize, probe: ProbeHandle<T>) {
         // Seed the probe with the current frontier from the tracker.
         if let Some(ref tracker) = self.progress_tracker {
@@ -582,6 +590,30 @@ impl<T: Timestamp> DataflowExecutor<T> {
             probe.update_frontier(&frontier);
         }
         self.probes.push((operator_index, probe));
+    }
+
+    /// Register a probe handle to observe the frontier at a specific operator.
+    ///
+    /// The probe's frontier is updated during each progress propagation step
+    /// with the operator's input frontier (the combined frontier of all inputs).
+    /// On registration, the probe is immediately seeded with the current frontier.
+    ///
+    /// The notifier is stored to send async notifications when the frontier changes.
+    #[cfg(feature = "async-io")]
+    pub fn register_probe(
+        &mut self,
+        operator_index: usize,
+        probe: ProbeHandle<T>,
+        notifier: crate::dataflow::probe::ProbeNotifier<T>,
+    ) {
+        // Seed the probe with the current frontier from the tracker.
+        if let Some(ref tracker) = self.progress_tracker {
+            let frontier = tracker.operator_input_frontier_meet(operator_index);
+            probe.update_frontier(&frontier);
+            notifier.notify(&frontier);
+        }
+        self.probes.push((operator_index, probe));
+        self.probe_notifiers.push(notifier);
     }
 
     /// Attach cross-worker control broadcast sender and receiver.
@@ -875,9 +907,13 @@ impl<T: Timestamp> DataflowExecutor<T> {
         // Update registered probes with current frontiers.
         if !self.probes.is_empty() {
             let tracker = self.progress_tracker.as_ref().unwrap();
-            for (op_idx, probe) in &self.probes {
+            for (i, (op_idx, probe)) in self.probes.iter().enumerate() {
                 let frontier = tracker.operator_input_frontier_meet(*op_idx);
                 probe.update_frontier(&frontier);
+                #[cfg(feature = "async-io")]
+                if let Some(notifier) = self.probe_notifiers.get(i) {
+                    notifier.notify(&frontier);
+                }
             }
         }
 
@@ -1420,6 +1456,8 @@ mod tests {
                 progress_tracker: None,
                 notificators: Vec::new(),
                 probes: Vec::new(),
+                #[cfg(feature = "async-io")]
+                probe_notifiers: Vec::new(),
                 external_inputs_open: std::sync::Arc::new(
                     std::sync::atomic::AtomicUsize::new(0),
                 ),
@@ -1534,6 +1572,8 @@ mod tests {
             progress_tracker: None,
             notificators: Vec::new(),
             probes: Vec::new(),
+                #[cfg(feature = "async-io")]
+                probe_notifiers: Vec::new(),
             external_inputs_open: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             wake_handle: WakeHandle::new(),
             consecutive_idle: 0,
@@ -1573,6 +1613,8 @@ mod tests {
             progress_tracker: None,
             notificators: Vec::new(),
             probes: Vec::new(),
+                #[cfg(feature = "async-io")]
+                probe_notifiers: Vec::new(),
             external_inputs_open: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             wake_handle: WakeHandle::new(),
             consecutive_idle: 0,
@@ -1616,6 +1658,8 @@ mod tests {
             progress_tracker: None,
             notificators: Vec::new(),
             probes: Vec::new(),
+                #[cfg(feature = "async-io")]
+                probe_notifiers: Vec::new(),
             external_inputs_open: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             wake_handle: WakeHandle::new(),
             consecutive_idle: 0,
@@ -1647,6 +1691,8 @@ mod tests {
             progress_tracker: None,
             notificators: Vec::new(),
             probes: Vec::new(),
+                #[cfg(feature = "async-io")]
+                probe_notifiers: Vec::new(),
             external_inputs_open: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             wake_handle: WakeHandle::new(),
             consecutive_idle: 0,
@@ -1703,6 +1749,8 @@ mod tests {
             progress_tracker: None,
             notificators: Vec::new(),
             probes: Vec::new(),
+                #[cfg(feature = "async-io")]
+                probe_notifiers: Vec::new(),
             external_inputs_open: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             wake_handle: WakeHandle::new(),
             consecutive_idle: 0,
@@ -1778,6 +1826,8 @@ mod tests {
             progress_tracker: None,
             notificators: Vec::new(),
             probes: Vec::new(),
+                #[cfg(feature = "async-io")]
+                probe_notifiers: Vec::new(),
             external_inputs_open: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             wake_handle: WakeHandle::new(),
             consecutive_idle: 0,
@@ -1833,6 +1883,8 @@ mod tests {
             progress_tracker: None,
             notificators: Vec::new(),
             probes: Vec::new(),
+                #[cfg(feature = "async-io")]
+                probe_notifiers: Vec::new(),
             external_inputs_open: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             wake_handle: WakeHandle::new(),
             consecutive_idle: 0,
@@ -1876,6 +1928,8 @@ mod tests {
             progress_tracker: None,
             notificators: vec![Some(Notificator::new(Antichain::from_elem(0u64)))],
             probes: Vec::new(),
+                #[cfg(feature = "async-io")]
+                probe_notifiers: Vec::new(),
             external_inputs_open: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             wake_handle: WakeHandle::new(),
             consecutive_idle: 0,
@@ -1932,6 +1986,8 @@ mod tests {
             progress_tracker: None,
             notificators: vec![Some(Notificator::new(Antichain::new()))],
             probes: Vec::new(),
+                #[cfg(feature = "async-io")]
+                probe_notifiers: Vec::new(),
             external_inputs_open: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             wake_handle: WakeHandle::new(),
             consecutive_idle: 0,
@@ -1987,6 +2043,8 @@ mod tests {
             progress_tracker: None,
             notificators: Vec::new(),
             probes: Vec::new(),
+                #[cfg(feature = "async-io")]
+                probe_notifiers: Vec::new(),
             external_inputs_open: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             wake_handle: WakeHandle::new(),
             consecutive_idle: 0,
@@ -2048,6 +2106,8 @@ mod tests {
             progress_tracker: None,
             notificators: Vec::new(),
             probes: Vec::new(),
+                #[cfg(feature = "async-io")]
+                probe_notifiers: Vec::new(),
             external_inputs_open: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(1)),
             wake_handle: WakeHandle::new(),
             consecutive_idle: 0,
@@ -2121,6 +2181,8 @@ mod tests {
             progress_tracker: None,
             notificators: Vec::new(),
             probes: Vec::new(),
+                #[cfg(feature = "async-io")]
+                probe_notifiers: Vec::new(),
             external_inputs_open: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(1)),
             wake_handle: WakeHandle::new(),
             consecutive_idle: 0,
@@ -2185,6 +2247,8 @@ mod tests {
             progress_tracker: None,
             notificators: Vec::new(),
             probes: Vec::new(),
+                #[cfg(feature = "async-io")]
+                probe_notifiers: Vec::new(),
             external_inputs_open: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             wake_handle: WakeHandle::new(),
             consecutive_idle: 0,
@@ -2331,6 +2395,8 @@ mod tests {
             progress_tracker: None,
             notificators: Vec::new(),
             probes: Vec::new(),
+                #[cfg(feature = "async-io")]
+                probe_notifiers: Vec::new(),
             external_inputs_open: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             wake_handle: wake_handle.clone(),
             consecutive_idle: 0,
@@ -2397,6 +2463,8 @@ mod tests {
             progress_tracker: None,
             notificators: Vec::new(),
             probes: Vec::new(),
+                #[cfg(feature = "async-io")]
+                probe_notifiers: Vec::new(),
             external_inputs_open: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             wake_handle: WakeHandle::new(),
             consecutive_idle: 0,
@@ -2442,6 +2510,8 @@ mod tests {
             progress_tracker: None,
             notificators: Vec::new(),
             probes: Vec::new(),
+                #[cfg(feature = "async-io")]
+                probe_notifiers: Vec::new(),
             external_inputs_open: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             wake_handle: WakeHandle::new(),
             consecutive_idle: 0,
@@ -2499,6 +2569,8 @@ mod tests {
             progress_tracker: None,
             notificators: Vec::new(),
             probes: Vec::new(),
+                #[cfg(feature = "async-io")]
+                probe_notifiers: Vec::new(),
             external_inputs_open: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             wake_handle: WakeHandle::new(),
             consecutive_idle: 0,
@@ -2545,6 +2617,8 @@ mod tests {
             progress_tracker: None,
             notificators: Vec::new(),
             probes: Vec::new(),
+                #[cfg(feature = "async-io")]
+                probe_notifiers: Vec::new(),
             external_inputs_open: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             wake_handle: WakeHandle::new(),
             consecutive_idle: 0,
@@ -2590,6 +2664,8 @@ mod tests {
             progress_tracker: None,
             notificators: Vec::new(),
             probes: Vec::new(),
+                #[cfg(feature = "async-io")]
+                probe_notifiers: Vec::new(),
             external_inputs_open: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             wake_handle: WakeHandle::new(),
             consecutive_idle: 0,
@@ -2635,6 +2711,8 @@ mod tests {
             progress_tracker: None,
             notificators: Vec::new(),
             probes: Vec::new(),
+                #[cfg(feature = "async-io")]
+                probe_notifiers: Vec::new(),
             external_inputs_open: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             wake_handle: WakeHandle::new(),
             consecutive_idle: 0,
@@ -2716,6 +2794,8 @@ mod tests {
             progress_tracker: None,
             notificators: Vec::new(),
             probes: Vec::new(),
+                #[cfg(feature = "async-io")]
+                probe_notifiers: Vec::new(),
             external_inputs_open: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             wake_handle: WakeHandle::new(),
             consecutive_idle: 0,
@@ -2774,6 +2854,8 @@ mod tests {
             progress_tracker: None,
             notificators: Vec::new(),
             probes: Vec::new(),
+                #[cfg(feature = "async-io")]
+                probe_notifiers: Vec::new(),
             external_inputs_open: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             wake_handle: WakeHandle::new(),
             consecutive_idle: 0,
@@ -2830,6 +2912,8 @@ mod tests {
             progress_tracker: None,
             notificators: Vec::new(),
             probes: Vec::new(),
+                #[cfg(feature = "async-io")]
+                probe_notifiers: Vec::new(),
             external_inputs_open: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             wake_handle: WakeHandle::new(),
             consecutive_idle: 0,
@@ -2889,6 +2973,8 @@ mod tests {
             progress_tracker: None,
             notificators: Vec::new(),
             probes: Vec::new(),
+                #[cfg(feature = "async-io")]
+                probe_notifiers: Vec::new(),
             external_inputs_open: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             wake_handle: WakeHandle::new(),
             consecutive_idle: 0,
@@ -2962,6 +3048,8 @@ mod tests {
             progress_tracker: None,
             notificators: Vec::new(),
             probes: Vec::new(),
+                #[cfg(feature = "async-io")]
+                probe_notifiers: Vec::new(),
             external_inputs_open: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             wake_handle: WakeHandle::new(),
             consecutive_idle: 0,
@@ -3008,6 +3096,8 @@ mod tests {
             progress_tracker: None,
             notificators: Vec::new(),
             probes: Vec::new(),
+                #[cfg(feature = "async-io")]
+                probe_notifiers: Vec::new(),
             external_inputs_open: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             wake_handle: WakeHandle::new(),
             consecutive_idle: 0,

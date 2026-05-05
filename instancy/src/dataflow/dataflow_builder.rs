@@ -119,6 +119,8 @@ struct BuilderState<T: Timestamp> {
     #[cfg(feature = "async-io")]
     async_source_wiring: Vec<(usize, AsyncSourceWiring)>,
     probes: Vec<(usize, ProbeHandle<T>)>,
+    #[cfg(feature = "async-io")]
+    probe_notifiers: Vec<crate::dataflow::probe::ProbeNotifier<T>>,
     /// Type-erased exchange factory creators — one per exchange edge.
     /// Tuple: (edge_index, capacity, creator_fn).
     exchange_creators: Vec<(
@@ -260,6 +262,8 @@ impl<T: Timestamp> DataflowBuilder<T> {
                 #[cfg(feature = "async-io")]
                 async_source_wiring: Vec::new(),
                 probes: Vec::new(),
+                #[cfg(feature = "async-io")]
+                probe_notifiers: Vec::new(),
                 exchange_creators: Vec::new(),
                 #[cfg(feature = "transport")]
                 exchange_network_creators: Vec::new(),
@@ -817,6 +821,8 @@ impl<T: Timestamp> DataflowBuilder<T> {
             #[cfg(feature = "async-io")]
             async_source_wiring: state.async_source_wiring,
             probes: state.probes,
+            #[cfg(feature = "async-io")]
+            probe_notifiers: state.probe_notifiers,
             exchange_creators: state.exchange_creators,
             #[cfg(feature = "transport")]
             exchange_network_creators: state.exchange_network_creators,
@@ -1605,6 +1611,8 @@ impl<T: Timestamp, D: Clone + Send + 'static> Pipe<T, D> {
                 #[cfg(feature = "async-io")]
                 async_source_wiring: Vec::new(),
                 probes: Vec::new(),
+                #[cfg(feature = "async-io")]
+                probe_notifiers: Vec::new(),
                 exchange_creators: Vec::new(),
                 #[cfg(feature = "transport")]
                 exchange_network_creators: Vec::new(),
@@ -2632,14 +2640,35 @@ impl<T: Timestamp, D: Clone + Send + 'static> Pipe<T, D> {
     ///
     /// Returns `(Pipe, ProbeHandle)` — the Pipe continues unchanged,
     /// and the probe can be queried after execution.
+    ///
+    /// When the `async-io` feature is enabled, the returned `ProbeHandle`
+    /// supports async waiting via [`wait_until_done_with`](ProbeHandle::wait_until_done_with)
+    /// and [`wait_until_done`](ProbeHandle::wait_until_done).
+    #[cfg(not(feature = "async-io"))]
     pub fn probe(self) -> (Self, ProbeHandle<T>) {
         let probe = ProbeHandle::new();
         {
             let mut state = self.state.borrow_mut();
-            // Probe attaches to the next downstream operator's input.
-            // For now, record the probe at the upstream operator index.
-            // The materializer will wire it to observe the frontier at this point.
             state.probes.push((self.op_idx, probe.clone()));
+        }
+        (self, probe)
+    }
+
+    /// Attach a probe to observe the frontier at this point in the pipeline.
+    ///
+    /// Returns `(Pipe, ProbeHandle)` — the Pipe continues unchanged,
+    /// and the probe can be queried after execution.
+    ///
+    /// The returned `ProbeHandle` supports async waiting via
+    /// [`wait_until_done_with`](ProbeHandle::wait_until_done_with) and
+    /// [`wait_until_done`](ProbeHandle::wait_until_done).
+    #[cfg(feature = "async-io")]
+    pub fn probe(self) -> (Self, ProbeHandle<T>) {
+        let (probe, notifier) = ProbeHandle::new();
+        {
+            let mut state = self.state.borrow_mut();
+            state.probes.push((self.op_idx, probe.clone()));
+            state.probe_notifiers.push(notifier);
         }
         (self, probe)
     }
@@ -3082,6 +3111,8 @@ pub struct LogicalDataflow<T: Timestamp> {
     #[cfg(feature = "async-io")]
     pub(crate) async_source_wiring: Vec<(usize, AsyncSourceWiring)>,
     pub(crate) probes: Vec<(usize, ProbeHandle<T>)>,
+    #[cfg(feature = "async-io")]
+    pub(crate) probe_notifiers: Vec<crate::dataflow::probe::ProbeNotifier<T>>,
     /// Type-erased exchange factory creators — one per exchange edge.
     /// Consumed by `spawn_multi` to produce shared cross-worker channel factories.
     /// Tuple: (edge_index, capacity, creator_fn).
