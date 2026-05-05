@@ -81,6 +81,11 @@ pub enum CancellationReason {
     /// An operator produced an error that caused the dataflow to be cancelled.
     /// The string describes the operator and the error.
     OperatorError(String),
+
+    /// A peer node in the cluster was reported as down by the hosting
+    /// application via [`crate::RuntimeHandle::report_node_leave()`].
+    /// The string is the peer's `node_id`.
+    PeerDown(String),
 }
 
 impl fmt::Display for CancellationReason {
@@ -92,6 +97,7 @@ impl fmt::Display for CancellationReason {
             Self::WorkerFailed(msg) => write!(f, "worker failed: {msg}"),
             Self::HandleDropped => write!(f, "handle dropped"),
             Self::OperatorError(msg) => write!(f, "operator error: {msg}"),
+            Self::PeerDown(node_id) => write!(f, "peer node down: {node_id}"),
         }
     }
 }
@@ -903,6 +909,10 @@ mod tests {
         assert_eq!(
             CancellationReason::OperatorError("oops".into()).to_string(),
             "operator error: oops"
+        );
+        assert_eq!(
+            CancellationReason::PeerDown("node-3".into()).to_string(),
+            "peer node down: node-3"
         );
     }
 

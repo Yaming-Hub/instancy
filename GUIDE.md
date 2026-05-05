@@ -1128,6 +1128,46 @@ let (b_read, b_write) = tokio::io::split(b_to_a);
 
 This is how instancy's own integration tests work — see `tests/cluster.rs` for examples.
 
+### Handling Node Failures
+
+Cluster health monitoring (heartbeats, liveness probes) is the hosting application's responsibility — instancy does not run its own health checks. When the application detects a peer node is unreachable, it notifies the runtime:
+
+```rust
+// Application detects node-3 is unreachable (via its own health monitoring)
+let cancelled = runtime.report_node_leave("node-3");
+println!("Cancelled {cancelled} dataflows due to node-3 failure");
+```
+
+**What happens:**
+1. All cluster dataflows with workers on `"node-3"` are cancelled with `CancellationReason::PeerDown("node-3")`.
+2. Both the local worker executors and network bridge tasks are stopped.
+3. `DataflowCompletion` resolves with a cancellation error — the application can match on the `PeerDown` reason.
+
+**No automatic rescheduling:** instancy does not attempt to move computation to surviving nodes. The application retries the dataflow on healthy nodes:
+
+```rust
+match cluster_dataflow.join_blocking() {
+    Err(e) if e.is_cancelled() => {
+        // Check reason
+        if let Some(CancellationReason::PeerDown(node_id)) = e.cancellation_reason() {
+            println!("Peer {node_id} went down, retrying on healthy nodes...");
+            // Rebuild topology without the failed node and re-spawn
+        }
+    }
+    other => { /* handle normally */ }
+}
+```
+
+**Peer recovery:** If a previously-down peer comes back online, notify the runtime so future dataflows can use it:
+
+```rust
+// Application detects node-3 is back online
+runtime.report_node_join("node-3");
+// Now safe to spawn_cluster with node-3 in the topology again
+```
+
+Already-cancelled dataflows are **not** restarted — the application must re-spawn them if desired.
+
 ---
 
 ## 9. Custom Serialization

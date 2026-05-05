@@ -73,6 +73,202 @@ impl Default for RuntimeConfig {
     }
 }
 
+// ---------------------------------------------------------------------------
+// PeerRegistry — tracks cluster dataflows for peer-down notification
+// ---------------------------------------------------------------------------
+
+/// Lightweight handle for cancelling all local workers + network bridges
+/// of a cluster dataflow. Stored in [`PeerRegistry`].
+#[cfg(feature = "transport")]
+struct ClusterCancelHandle {
+    worker_tokens: Vec<CancellationToken>,
+    bridge_cancel: tokio_util::sync::CancellationToken,
+}
+
+#[cfg(feature = "transport")]
+impl ClusterCancelHandle {
+    fn cancel_with_reason(&self, reason: CancellationReason) {
+        self.bridge_cancel.cancel();
+        for token in &self.worker_tokens {
+            token.cancel_with_reason(reason.clone());
+        }
+    }
+
+    /// Returns true if this dataflow is already cancelled or completed.
+    ///
+    /// Checks the bridge cancel token (which is always cancelled when the
+    /// `ClusterSpawnedDataflow` is dropped, including on normal completion)
+    /// and the first worker token (which is cancelled on explicit cancellation
+    /// or runtime shutdown). All worker tokens are always cancelled together
+    /// via `cancel_with_reason` or parent token propagation.
+    fn is_cancelled(&self) -> bool {
+        self.bridge_cancel.is_cancelled()
+            || self.worker_tokens.first().map_or(false, |t| t.is_cancelled())
+    }
+}
+
+#[cfg(feature = "transport")]
+struct PeerRegistration {
+    id: u64,
+    #[allow(dead_code)]
+    dataflow_name: String,
+    cancel_handle: ClusterCancelHandle,
+}
+
+/// Registry mapping peer node IDs to active cluster dataflows.
+///
+/// When the hosting application reports a peer as down via
+/// [`RuntimeHandle::report_node_leave()`], the registry cancels all
+/// dataflows that have workers on the departed node.
+///
+/// Nodes reported as left are remembered in a `down_peers` set, so
+/// dataflows registered *after* a node-leave report are immediately
+/// cancelled (preventing a race between `spawn_cluster` and
+/// `report_node_leave`). Call [`RuntimeHandle::report_node_join()`] to
+/// clear this state when a node recovers or a new node is added.
+#[cfg(feature = "transport")]
+pub(crate) struct PeerRegistry {
+    next_id: std::sync::atomic::AtomicU64,
+    /// Protected state: peer-to-registration map + set of known-down peers.
+    state: Mutex<PeerRegistryState>,
+}
+
+#[cfg(feature = "transport")]
+struct PeerRegistryState {
+    /// Maps peer_node_id → list of registrations referencing that peer.
+    entries: std::collections::HashMap<String, Vec<PeerRegistration>>,
+    /// Peers that have been reported as down. Registrations against these
+    /// peers are immediately cancelled.
+    down_peers: std::collections::HashSet<String>,
+}
+
+#[cfg(feature = "transport")]
+impl PeerRegistry {
+    fn new() -> Self {
+        Self {
+            next_id: std::sync::atomic::AtomicU64::new(1),
+            state: Mutex::new(PeerRegistryState {
+                entries: std::collections::HashMap::new(),
+                down_peers: std::collections::HashSet::new(),
+            }),
+        }
+    }
+
+    /// Register a cluster dataflow for all its remote peer nodes.
+    /// Returns the registration ID.
+    ///
+    /// If any of the peers have already been reported as down, the
+    /// dataflow is immediately cancelled with `CancellationReason::PeerDown`.
+    fn register(
+        &self,
+        peer_node_ids: &[String],
+        dataflow_name: &str,
+        cancel_handle: ClusterCancelHandle,
+    ) -> u64 {
+        let id = self.next_id.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+
+        // Check if any peer is already known to be down.
+        let already_down: Option<String> = peer_node_ids
+            .iter()
+            .find(|pid| state.down_peers.contains(pid.as_str()))
+            .cloned();
+
+        if let Some(down_peer) = already_down {
+            // Release lock before cancelling to avoid nested lock contention.
+            drop(state);
+            cancel_handle.cancel_with_reason(
+                CancellationReason::PeerDown(down_peer),
+            );
+            return id;
+        }
+
+        for peer_id in peer_node_ids {
+            let bucket = state.entries.entry(peer_id.clone()).or_default();
+            bucket.push(PeerRegistration {
+                id,
+                dataflow_name: dataflow_name.to_string(),
+                cancel_handle: ClusterCancelHandle {
+                    worker_tokens: cancel_handle.worker_tokens.clone(),
+                    bridge_cancel: cancel_handle.bridge_cancel.clone(),
+                },
+            });
+        }
+
+        // Periodic pruning: remove stale (already-cancelled) entries to
+        // prevent unbounded growth in long-running systems.
+        if id % 64 == 0 {
+            state.entries.retain(|_peer, bucket| {
+                bucket.retain(|r| !r.cancel_handle.is_cancelled());
+                !bucket.is_empty()
+            });
+        }
+
+        id
+    }
+
+    /// Cancel all dataflows associated with the given peer and prune stale entries.
+    /// Returns the number of dataflows that were newly cancelled.
+    fn report_peer_down(&self, peer_node_id: &str) -> usize {
+        // Collect handles to cancel, then release lock before cancelling.
+        // This avoids holding the registry lock during CancellationToken
+        // operations (which acquire their own internal locks + notify wakers).
+        let to_cancel: Vec<ClusterCancelHandle>;
+        let cancelled_count;
+
+        {
+            let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+
+            // Mark peer as permanently down so future registrations are rejected.
+            state.down_peers.insert(peer_node_id.to_string());
+
+            // Remove the downed peer's bucket and collect non-cancelled handles.
+            if let Some(bucket) = state.entries.remove(peer_node_id) {
+                // Collect cancelled registration IDs for cross-pruning.
+                let cancelled_ids: std::collections::HashSet<u64> =
+                    bucket.iter().map(|r| r.id).collect();
+
+                // Separate into to-cancel and already-cancelled.
+                to_cancel = bucket
+                    .into_iter()
+                    .filter(|r| !r.cancel_handle.is_cancelled())
+                    .map(|r| r.cancel_handle)
+                    .collect();
+                cancelled_count = to_cancel.len();
+
+                // Remove these registration IDs from all other peer buckets.
+                for bucket in state.entries.values_mut() {
+                    bucket.retain(|r| !cancelled_ids.contains(&r.id));
+                }
+            } else {
+                to_cancel = Vec::new();
+                cancelled_count = 0;
+            }
+
+            // Prune empty buckets and stale entries.
+            state.entries.retain(|_peer, bucket| {
+                bucket.retain(|r| !r.cancel_handle.is_cancelled());
+                !bucket.is_empty()
+            });
+        }
+
+        // Cancel outside the lock to avoid nested lock contention.
+        let reason = CancellationReason::PeerDown(peer_node_id.to_string());
+        for handle in &to_cancel {
+            handle.cancel_with_reason(reason.clone());
+        }
+
+        cancelled_count
+    }
+
+    /// Remove a peer from the "known down" set, allowing future registrations.
+    /// Returns true if the peer was in the down set.
+    fn report_peer_recovered(&self, peer_node_id: &str) -> bool {
+        let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        state.down_peers.remove(peer_node_id)
+    }
+}
+
 /// A self-contained instancy runtime. Multiple `RuntimeHandle` instances
 /// can coexist in the same process with full isolation.
 ///
@@ -97,6 +293,10 @@ pub struct RuntimeHandle {
     /// Executor registry for cooperative multiplexing of dataflow futures.
     /// Created lazily on first run()/spawn() call.
     registry: Arc<crate::executor_task::ExecutorRegistry>,
+    /// Registry of cluster dataflows indexed by peer node ID for peer-down
+    /// notification. Only used with the `transport` feature.
+    #[cfg(feature = "transport")]
+    peer_registry: Arc<PeerRegistry>,
 }
 
 impl RuntimeHandle {
@@ -122,6 +322,8 @@ impl RuntimeHandle {
             cancel: CancellationToken::new(),
             name: config.name,
             registry,
+            #[cfg(feature = "transport")]
+            peer_registry: Arc::new(PeerRegistry::new()),
         })
     }
 
@@ -157,6 +359,68 @@ impl RuntimeHandle {
     /// Returns true if the runtime has been shut down.
     pub fn is_shutdown(&self) -> bool {
         self.cancel.is_cancelled()
+    }
+
+    /// Report that a node has left the cluster (crashed, shut down, or network-partitioned).
+    ///
+    /// The hosting application is responsible for health-monitoring peer nodes.
+    /// When a peer is detected as unreachable, call this method to cancel all
+    /// cluster dataflows that depend on the departed node.
+    ///
+    /// Each affected dataflow receives [`CancellationReason::PeerDown`] with
+    /// the given `node_id`. The hosting application can then retry the
+    /// dataflow on healthy nodes if desired.
+    ///
+    /// Returns the number of dataflows that were newly cancelled. Returns 0
+    /// if no active dataflows reference the given node (including if the node
+    /// ID is unknown).
+    ///
+    /// This method is idempotent: calling it again for the same node after
+    /// all its dataflows are already cancelled returns 0.
+    ///
+    /// The node is remembered as "left" until
+    /// [`report_node_join()`](Self::report_node_join) is called.
+    /// Any `spawn_cluster` that includes a left node will have its dataflow
+    /// immediately cancelled.
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// // Hosting application detects node-3 is unreachable
+    /// let cancelled = runtime.report_node_leave("node-3");
+    /// println!("Cancelled {cancelled} dataflows due to node-3 departure");
+    /// ```
+    #[cfg(feature = "transport")]
+    pub fn report_node_leave(&self, node_id: &str) -> usize {
+        self.peer_registry.report_peer_down(node_id)
+    }
+
+    /// Report that a node has joined (or re-joined) the cluster.
+    ///
+    /// This removes the node from the internal "left" set, allowing
+    /// future [`spawn_cluster()`](Self::spawn_cluster) calls that include
+    /// this node to proceed normally instead of being immediately cancelled.
+    ///
+    /// Call this when:
+    /// - A previously-down node recovers and rejoins the cluster.
+    /// - A brand-new node is added to the cluster topology.
+    ///
+    /// Already-cancelled dataflows are **not** restarted — the hosting
+    /// application must re-spawn them if desired.
+    ///
+    /// Returns `true` if the node was previously marked as left, `false`
+    /// if it was not in the left set (no-op for new nodes).
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// // Hosting application detects node-3 is back online (or newly added)
+    /// runtime.report_node_join("node-3");
+    /// // Now safe to spawn_cluster with node-3 in the topology
+    /// ```
+    #[cfg(feature = "transport")]
+    pub fn report_node_join(&self, node_id: &str) -> bool {
+        self.peer_registry.report_peer_recovered(node_id)
     }
 
     /// Run a pre-loaded dataflow to completion on the worker pool.
@@ -1113,6 +1377,23 @@ impl RuntimeHandle {
         for (spawned, executor, notifier) in prepared {
             self.registry.register(executor, notifier);
             workers.push(spawned);
+        }
+
+        // Phase 10: Register in peer registry for peer-down notification.
+        let remote_peer_ids: Vec<String> = topology
+            .nodes
+            .iter()
+            .map(|n| n.node_id.clone())
+            .filter(|id| id != local_node_id)
+            .collect();
+        if !remote_peer_ids.is_empty() {
+            let worker_tokens: Vec<CancellationToken> =
+                workers.iter().map(|w| w.cancel.clone()).collect();
+            let cancel_handle = ClusterCancelHandle {
+                worker_tokens,
+                bridge_cancel: bridge_cancel.clone(),
+            };
+            self.peer_registry.register(&remote_peer_ids, name, cancel_handle);
         }
 
         Ok(ClusterSpawnedDataflow {
@@ -4684,5 +4965,155 @@ mod tests {
         assert!(all_data.contains(&(1, 20)));
         assert!(all_data.contains(&(2, 30)));
         handle.join_blocking().unwrap();
+    }
+
+    // -----------------------------------------------------------------------
+    // PeerRegistry unit tests
+    // -----------------------------------------------------------------------
+
+    #[cfg(feature = "transport")]
+    #[test]
+    fn peer_registry_report_peer_down_cancels_dataflows() {
+        let registry = PeerRegistry::new();
+
+        // Create mock cancel tokens for two cluster dataflows.
+        let token1 = CancellationToken::new();
+        let token2 = CancellationToken::new();
+        let bridge1 = tokio_util::sync::CancellationToken::new();
+        let bridge2 = tokio_util::sync::CancellationToken::new();
+
+        // Dataflow 1 uses peers ["node-b", "node-c"]
+        let handle1 = ClusterCancelHandle {
+            worker_tokens: vec![token1.clone()],
+            bridge_cancel: bridge1.clone(),
+        };
+        registry.register(&["node-b".into(), "node-c".into()], "df1", handle1);
+
+        // Dataflow 2 uses peers ["node-b", "node-d"]
+        let handle2 = ClusterCancelHandle {
+            worker_tokens: vec![token2.clone()],
+            bridge_cancel: bridge2.clone(),
+        };
+        registry.register(&["node-b".into(), "node-d".into()], "df2", handle2);
+
+        // Report node-c down — should cancel df1 only.
+        let count = registry.report_peer_down("node-c");
+        assert_eq!(count, 1);
+        assert!(token1.is_cancelled());
+        assert!(!token2.is_cancelled());
+        assert!(bridge1.is_cancelled());
+        assert!(!bridge2.is_cancelled());
+        assert_eq!(
+            token1.reason(),
+            Some(CancellationReason::PeerDown("node-c".into()))
+        );
+
+        // Report node-b down — df1 already cancelled, only df2 is new.
+        let count = registry.report_peer_down("node-b");
+        assert_eq!(count, 1);
+        assert!(token2.is_cancelled());
+        assert!(bridge2.is_cancelled());
+        assert_eq!(
+            token2.reason(),
+            Some(CancellationReason::PeerDown("node-b".into()))
+        );
+
+        // Reporting again is a no-op.
+        let count = registry.report_peer_down("node-b");
+        assert_eq!(count, 0);
+    }
+
+    #[cfg(feature = "transport")]
+    #[test]
+    fn peer_registry_unknown_peer_returns_zero() {
+        let registry = PeerRegistry::new();
+        assert_eq!(registry.report_peer_down("unknown-node"), 0);
+    }
+
+    #[cfg(feature = "transport")]
+    #[test]
+    fn peer_registry_stale_entries_pruned() {
+        let registry = PeerRegistry::new();
+        let token = CancellationToken::new();
+        let bridge = tokio_util::sync::CancellationToken::new();
+
+        let handle = ClusterCancelHandle {
+            worker_tokens: vec![token.clone()],
+            bridge_cancel: bridge.clone(),
+        };
+        registry.register(&["node-x".into(), "node-y".into()], "df_stale", handle);
+
+        // Cancel externally (simulating natural completion).
+        token.cancel();
+        bridge.cancel();
+
+        // Reporting either peer should find 0 newly cancelled.
+        assert_eq!(registry.report_peer_down("node-x"), 0);
+        assert_eq!(registry.report_peer_down("node-y"), 0);
+    }
+
+    #[cfg(feature = "transport")]
+    #[test]
+    fn report_node_leave_on_runtime_handle() {
+        let rt = RuntimeHandle::new(RuntimeConfig {
+            worker_threads: 1,
+            ..Default::default()
+        })
+        .unwrap();
+
+        // No cluster dataflows registered, should return 0.
+        assert_eq!(rt.report_node_leave("some-peer"), 0);
+    }
+
+    #[cfg(feature = "transport")]
+    #[test]
+    fn peer_registry_register_after_peer_down_immediately_cancels() {
+        let registry = PeerRegistry::new();
+
+        // Report node-x down before any dataflows are registered.
+        assert_eq!(registry.report_peer_down("node-x"), 0);
+
+        // Now register a dataflow that uses node-x — should be cancelled immediately.
+        let token = CancellationToken::new();
+        let bridge = tokio_util::sync::CancellationToken::new();
+        let handle = ClusterCancelHandle {
+            worker_tokens: vec![token.clone()],
+            bridge_cancel: bridge.clone(),
+        };
+        registry.register(&["node-x".into(), "node-y".into()], "late_df", handle);
+
+        // Should have been cancelled immediately on registration.
+        assert!(token.is_cancelled());
+        assert!(bridge.is_cancelled());
+        assert_eq!(
+            token.reason(),
+            Some(CancellationReason::PeerDown("node-x".into()))
+        );
+    }
+
+    #[cfg(feature = "transport")]
+    #[test]
+    fn peer_registry_recovered_peer_allows_new_registrations() {
+        let registry = PeerRegistry::new();
+
+        // Report node-x down.
+        registry.report_peer_down("node-x");
+
+        // Recover node-x.
+        assert!(registry.report_peer_recovered("node-x"));
+        // Second call is a no-op.
+        assert!(!registry.report_peer_recovered("node-x"));
+
+        // Now register a dataflow using node-x — should NOT be cancelled.
+        let token = CancellationToken::new();
+        let bridge = tokio_util::sync::CancellationToken::new();
+        let handle = ClusterCancelHandle {
+            worker_tokens: vec![token.clone()],
+            bridge_cancel: bridge.clone(),
+        };
+        registry.register(&["node-x".into()], "recovered_df", handle);
+
+        assert!(!token.is_cancelled());
+        assert!(!bridge.is_cancelled());
     }
 }
