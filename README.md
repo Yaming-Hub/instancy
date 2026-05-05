@@ -281,7 +281,7 @@ cargo run -p instancy --example <name>
 | `hello_dataflow` | Minimal source → output pipeline |
 | `simple_pipeline` | Multi-stage pipeline with map/filter |
 | `spawn_pipeline` | Background execution with channel I/O |
-| `async_spawn` | End-to-end async dataflow with async I/O |
+| `async_io_channels` | End-to-end async dataflow with async I/O |
 | `event_driven` | Real-time event processing with channel-based I/O |
 
 **Operators & Patterns**
@@ -322,6 +322,13 @@ cargo run -p instancy --example <name>
 | Example | Description |
 |---|---|
 | `runtime_isolation` | Multiple isolated `RuntimeHandle` instances in one process |
+
+**Cluster (Distributed)**
+
+| Example | Description |
+|---|---|
+| `cluster_basic` | Two-node cluster with in-memory transport (no exchange) |
+| `cluster_exchange` | Two-node cluster with cross-node data repartitioning |
 
 ## Testing
 
