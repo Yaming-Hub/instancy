@@ -960,6 +960,71 @@ impl<T: Timestamp, D: Clone + Send + 'static> Pipe<T, D> {
         })
     }
 
+    /// Pass through the first `count` elements, then stop.
+    ///
+    /// This is the dataflow equivalent of SQL `LIMIT`. After emitting `count`
+    /// items, the operator completes and its output closes. Downstream
+    /// operators in this branch will drain and finish, while other branches
+    /// of the dataflow continue running.
+    ///
+    /// # Example
+    /// ```ignore
+    /// let first_10 = stream.take("limit-10", 10);
+    /// ```
+    pub fn take(mut self, name: impl Into<String>, count: usize) -> Pipe<T, D> {
+        let capacity = self.resolve_capacity();
+        let mut remaining = count;
+        self.add_unary_internal(name, capacity, move |time, batch| {
+            if remaining == 0 {
+                return Vec::new();
+            }
+            if batch.len() <= remaining {
+                remaining -= batch.len();
+                batch
+            } else {
+                let taken: Vec<D> = batch.into_iter().take(remaining).collect();
+                remaining = 0;
+                taken
+            }
+        })
+    }
+
+    /// Pass through elements while a predicate returns `true`, then stop.
+    ///
+    /// Once the predicate returns `false` for any element, the operator
+    /// stops emitting and completes. Remaining elements in the current
+    /// batch and all future batches are discarded.
+    ///
+    /// This enables condition-based early termination of a branch without
+    /// cancelling the entire dataflow.
+    ///
+    /// # Example
+    /// ```ignore
+    /// let until_large = stream.take_while("small-only", |_t, x| *x < 1000);
+    /// ```
+    pub fn take_while<F>(mut self, name: impl Into<String>, mut predicate: F) -> Pipe<T, D>
+    where
+        F: FnMut(&T, &D) -> bool + Send + 'static,
+    {
+        let capacity = self.resolve_capacity();
+        let mut stopped = false;
+        self.add_unary_internal(name, capacity, move |time, batch| {
+            if stopped {
+                return Vec::new();
+            }
+            let mut result = Vec::with_capacity(batch.len());
+            for item in batch {
+                if predicate(&time, &item) {
+                    result.push(item);
+                } else {
+                    stopped = true;
+                    break;
+                }
+            }
+            result
+        })
+    }
+
     /// Apply a flat-map transformation: each element produces zero or more output elements.
     ///
     /// # Example
@@ -4494,5 +4559,158 @@ mod tests {
         let c = port.collector();
         let r = c.lock().unwrap();
         assert_eq!(r[0].1, vec![Err("a".into()), Err("b".into())]);
+    }
+
+    // ── take / take_while tests ──────────────────────────────────────
+
+    #[test]
+    fn test_take_fewer_than_available() {
+        let builder = DataflowBuilder::<u64>::new("take_fewer");
+        let stream = builder.source("nums", vec![(0u64, vec![1i32, 2, 3, 4, 5])]);
+        let port = stream.take("first3", 3).output("out");
+        let dataflow = builder.build().unwrap();
+        rt().run(dataflow).unwrap();
+
+        let c = port.collector();
+        let r = c.lock().unwrap();
+        let all: Vec<i32> = r.iter().flat_map(|(_, d)| d.clone()).collect();
+        assert_eq!(all, vec![1, 2, 3]);
+    }
+
+    #[test]
+    fn test_take_more_than_available() {
+        let builder = DataflowBuilder::<u64>::new("take_more");
+        let stream = builder.source("nums", vec![(0u64, vec![1i32, 2, 3])]);
+        let port = stream.take("first10", 10).output("out");
+        let dataflow = builder.build().unwrap();
+        rt().run(dataflow).unwrap();
+
+        let c = port.collector();
+        let r = c.lock().unwrap();
+        let all: Vec<i32> = r.iter().flat_map(|(_, d)| d.clone()).collect();
+        assert_eq!(all, vec![1, 2, 3]);
+    }
+
+    #[test]
+    fn test_take_zero() {
+        let builder = DataflowBuilder::<u64>::new("take_zero");
+        let stream = builder.source("nums", vec![(0u64, vec![1i32, 2, 3])]);
+        let port = stream.take("none", 0).output("out");
+        let dataflow = builder.build().unwrap();
+        rt().run(dataflow).unwrap();
+
+        let c = port.collector();
+        let r = c.lock().unwrap();
+        let all: Vec<i32> = r.iter().flat_map(|(_, d)| d.clone()).collect();
+        assert!(all.is_empty());
+    }
+
+    #[test]
+    fn test_take_across_batches() {
+        let builder = DataflowBuilder::<u64>::new("take_batches");
+        let stream = builder.source(
+            "nums",
+            vec![
+                (0u64, vec![1i32, 2]),
+                (1u64, vec![3, 4]),
+                (2u64, vec![5, 6]),
+            ],
+        );
+        let port = stream.take("first3", 3).output("out");
+        let dataflow = builder.build().unwrap();
+        rt().run(dataflow).unwrap();
+
+        let c = port.collector();
+        let r = c.lock().unwrap();
+        let all: Vec<i32> = r.iter().flat_map(|(_, d)| d.clone()).collect();
+        assert_eq!(all, vec![1, 2, 3]);
+    }
+
+    #[test]
+    fn test_take_while_stops_at_predicate() {
+        let builder = DataflowBuilder::<u64>::new("take_while_stop");
+        let stream = builder.source("nums", vec![(0u64, vec![1i32, 2, 3, 4, 5])]);
+        let port = stream
+            .take_while("small", |_t, x| *x < 4)
+            .output("out");
+        let dataflow = builder.build().unwrap();
+        rt().run(dataflow).unwrap();
+
+        let c = port.collector();
+        let r = c.lock().unwrap();
+        let all: Vec<i32> = r.iter().flat_map(|(_, d)| d.clone()).collect();
+        assert_eq!(all, vec![1, 2, 3]);
+    }
+
+    #[test]
+    fn test_take_while_all_pass() {
+        let builder = DataflowBuilder::<u64>::new("take_while_all");
+        let stream = builder.source("nums", vec![(0u64, vec![1i32, 2, 3])]);
+        let port = stream
+            .take_while("always", |_t, _x| true)
+            .output("out");
+        let dataflow = builder.build().unwrap();
+        rt().run(dataflow).unwrap();
+
+        let c = port.collector();
+        let r = c.lock().unwrap();
+        let all: Vec<i32> = r.iter().flat_map(|(_, d)| d.clone()).collect();
+        assert_eq!(all, vec![1, 2, 3]);
+    }
+
+    #[test]
+    fn test_take_while_none_pass() {
+        let builder = DataflowBuilder::<u64>::new("take_while_none");
+        let stream = builder.source("nums", vec![(0u64, vec![1i32, 2, 3])]);
+        let port = stream
+            .take_while("never", |_t, _x| false)
+            .output("out");
+        let dataflow = builder.build().unwrap();
+        rt().run(dataflow).unwrap();
+
+        let c = port.collector();
+        let r = c.lock().unwrap();
+        let all: Vec<i32> = r.iter().flat_map(|(_, d)| d.clone()).collect();
+        assert!(all.is_empty());
+    }
+
+    #[test]
+    fn test_take_while_across_batches() {
+        let builder = DataflowBuilder::<u64>::new("take_while_batches");
+        let stream = builder.source(
+            "nums",
+            vec![
+                (0u64, vec![1i32, 2]),
+                (1u64, vec![3, 10]),
+                (2u64, vec![20]),
+            ],
+        );
+        let port = stream
+            .take_while("under10", |_t, x| *x < 10)
+            .output("out");
+        let dataflow = builder.build().unwrap();
+        rt().run(dataflow).unwrap();
+
+        let c = port.collector();
+        let r = c.lock().unwrap();
+        let all: Vec<i32> = r.iter().flat_map(|(_, d)| d.clone()).collect();
+        assert_eq!(all, vec![1, 2, 3]);
+    }
+
+    #[test]
+    fn test_take_with_downstream_map() {
+        let builder = DataflowBuilder::<u64>::new("take_then_map");
+        let stream = builder.source("nums", vec![(0u64, vec![1i32, 2, 3, 4, 5])]);
+        let port = stream
+            .take("first2", 2)
+            .map("double", |_t, x| x * 2)
+            .output("out");
+        let dataflow = builder.build().unwrap();
+        rt().run(dataflow).unwrap();
+
+        let c = port.collector();
+        let r = c.lock().unwrap();
+        let all: Vec<i32> = r.iter().flat_map(|(_, d)| d.clone()).collect();
+        assert_eq!(all, vec![2, 4]);
     }
 }
