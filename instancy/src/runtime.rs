@@ -865,6 +865,13 @@ impl RuntimeHandle {
             validate_multi_worker_topologies(&dataflows)?;
         }
 
+        // Phase 2b: Validate per-stage parallelism compatibility.
+        // All explicit stage parallelism values must equal num_workers because
+        // per-stage executors are not yet implemented. We validate dataflows[0]
+        // since validate_multi_worker_topologies already ensures all replicas
+        // have identical stage metadata.
+        validate_stage_parallelism(&dataflows[0], num_workers)?;
+
         // Phase 3: Wire up exchange channels (replace placeholder factories
         // with shared cross-worker exchange channel factories).
         if num_workers > 1 {
@@ -1127,6 +1134,10 @@ impl RuntimeHandle {
         if num_local > 1 {
             validate_multi_worker_topologies(&dataflows)?;
         }
+
+        // Phase 2b: Validate per-stage parallelism compatibility (uses total_workers
+        // since cluster mode spans all nodes).
+        validate_stage_parallelism(&dataflows[0], total_workers)?;
 
         // Phase 3: Compute fingerprint, build channel registrations, create TransportSession.
         let exchange_indices = dataflows[0].exchange_edge_indices();
@@ -1713,6 +1724,9 @@ impl SimpleRuntime {
         if num_workers > 1 {
             validate_multi_worker_topologies(&dataflows)?;
         }
+
+        // Phase 2b: Validate per-stage parallelism compatibility.
+        validate_stage_parallelism(&dataflows[0], num_workers)?;
 
         // Phase 3: Wire up exchange channels (replace placeholder factories
         // with shared cross-worker exchange channel factories).
@@ -2837,6 +2851,45 @@ fn validate_multi_worker_topologies<T: Timestamp>(
             )));
         }
     }
+    Ok(())
+}
+
+/// Validate that per-stage parallelism is compatible with the current execution model.
+///
+/// Currently, all runtime paths (`spawn_multi`, `spawn_cluster`) create a single group
+/// of N workers that all run the complete dataflow. Per-stage parallelism (where stage A
+/// has M workers and stage B has N workers, M≠N) requires per-stage executors which are
+/// not yet implemented.
+///
+/// This validation ensures that every stage with explicit parallelism has a value equal
+/// to `num_workers`. Stages without explicit parallelism (None) inherit num_workers
+/// implicitly and are always valid.
+///
+/// When per-stage executors are implemented, this validation will be relaxed to allow
+/// heterogeneous parallelism across stages.
+fn validate_stage_parallelism<T: Timestamp>(
+    dataflow: &LogicalDataflow<T>,
+    num_workers: usize,
+) -> Result<()> {
+    let stages = dataflow.stages();
+    if stages.is_empty() {
+        return Ok(());
+    }
+
+    for stage in stages {
+        if let Some(parallelism) = stage.parallelism {
+            if parallelism != num_workers {
+                return Err(Error::Custom(format!(
+                    "stage {} has explicit parallelism {} but the runtime is spawning \
+                     {} workers. Per-stage executors (heterogeneous worker counts) are \
+                     not yet implemented — all explicit stage parallelism values must \
+                     equal the spawned worker count.",
+                    stage.id.0, parallelism, num_workers
+                )));
+            }
+        }
+    }
+
     Ok(())
 }
 
@@ -5141,5 +5194,96 @@ mod tests {
 
         assert!(!token.is_cancelled());
         assert!(!bridge.is_cancelled());
+    }
+
+    #[test]
+    fn validate_stage_parallelism_matching_passes() {
+        // Build a dataflow with exchange_by_hash_to(par=2) and spawn with 2 workers.
+        // Should succeed because parallelism matches num_workers.
+        let rt = RuntimeHandle::new(RuntimeConfig {
+            worker_threads: 2,
+            schedule_policy: Box::new(FifoPolicy),
+            name: "par-match".to_string(),
+        })
+        .unwrap();
+
+        let result = rt.spawn_multi("par-match-df", 2, |_worker_idx, builder| {
+            builder
+                .source("src", vec![(0u64, vec![1i32, 2, 3])])
+                .exchange_by_hash_to("ex", 2, |x: &i32| *x as u64)
+                .map("noop", |_t, x| x)
+                .output("out");
+            Ok(())
+        });
+        // Should succeed — parallelism matches worker count.
+        match &result {
+            Ok(_) => {}
+            Err(e) => panic!("spawn_multi failed: {e}"),
+        }
+        rt.shutdown();
+    }
+
+    #[test]
+    fn validate_stage_parallelism_mismatch_fails() {
+        // Build a dataflow with exchange_by_hash_to(par=4) but spawn with 2 workers.
+        // Should fail because parallelism (4) != num_workers (2).
+        let rt = RuntimeHandle::new(RuntimeConfig {
+            worker_threads: 2,
+            schedule_policy: Box::new(FifoPolicy),
+            name: "par-mismatch".to_string(),
+        })
+        .unwrap();
+
+        let result = rt.spawn_multi("par-mismatch-df", 2, |_worker_idx, builder| {
+            builder
+                .source("src", vec![(0u64, vec![1i32, 2, 3])])
+                .exchange_by_hash_to("ex", 4, |x: &i32| *x as u64)
+                .map("noop", |_t, x| x)
+                .output("out");
+            Ok(())
+        });
+        // Should fail — parallelism (4) != num_workers (2).
+        match result {
+            Err(e) => {
+                let err_msg = format!("{e}");
+                assert!(
+                    err_msg.contains("parallelism 4") || err_msg.contains("explicit parallelism 4"),
+                    "unexpected error: {err_msg}"
+                );
+            }
+            Ok(_) => panic!("expected error for parallelism mismatch"),
+        }
+        rt.shutdown();
+    }
+
+    #[test]
+    fn validate_stage_parallelism_single_worker_mismatch_fails() {
+        // Even with 1 worker, explicit parallelism > 1 should be rejected.
+        let rt = RuntimeHandle::new(RuntimeConfig {
+            worker_threads: 1,
+            schedule_policy: Box::new(FifoPolicy),
+            name: "par-single".to_string(),
+        })
+        .unwrap();
+
+        let result = rt.spawn_multi("par-single-df", 1, |_worker_idx, builder| {
+            builder
+                .source("src", vec![(0u64, vec![1i32, 2, 3])])
+                .exchange_by_hash_to("ex", 4, |x: &i32| *x as u64)
+                .map("noop", |_t, x| x)
+                .output("out");
+            Ok(())
+        });
+        match result {
+            Err(e) => {
+                let err_msg = format!("{e}");
+                assert!(
+                    err_msg.contains("parallelism 4") || err_msg.contains("explicit parallelism 4"),
+                    "unexpected error: {err_msg}"
+                );
+            }
+            Ok(_) => panic!("expected error for single-worker parallelism mismatch"),
+        }
+        rt.shutdown();
     }
 }
