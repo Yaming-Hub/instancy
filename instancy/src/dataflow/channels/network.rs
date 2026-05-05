@@ -713,8 +713,32 @@ impl<T: Timestamp + ExchangeData, D: ExchangeData> NetworkEdgeMaterializer<T, D>
 impl<T: Timestamp + ExchangeData, D: ExchangeData> EdgeMaterializer<T, D>
     for NetworkEdgeMaterializer<T, D>
 {
-    fn num_workers(&self) -> usize {
+    fn num_source_workers(&self) -> usize {
         self.num_workers
+    }
+
+    fn num_target_workers(&self) -> usize {
+        self.num_workers
+    }
+
+    fn materialize_source_worker(
+        &mut self,
+        _src_idx: usize,
+    ) -> Result<Vec<Box<dyn Push<T, D, ()>>>> {
+        // Network materializer uses materialize_worker for both push and pull.
+        Err(Error::Custom(
+            "NetworkEdgeMaterializer does not support asymmetric materialization; use materialize_worker".to_string()
+        ))
+    }
+
+    fn materialize_target_worker(
+        &mut self,
+        _dst_idx: usize,
+    ) -> Result<Vec<Box<dyn Pull<T, D, ()>>>> {
+        // Network materializer uses materialize_worker for both push and pull.
+        Err(Error::Custom(
+            "NetworkEdgeMaterializer does not support asymmetric materialization; use materialize_worker".to_string()
+        ))
     }
 
     fn materialize_worker(

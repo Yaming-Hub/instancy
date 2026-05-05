@@ -138,38 +138,49 @@ impl SharedWakeRegistry {
 /// the `Push`/`Pull` trait interface and would work unchanged with remote
 /// transports.
 ///
-/// # N×N assumption
+/// # M×N support
 ///
-/// Currently assumes the same number of source and target workers (N×N),
-/// because `spawn_multi` creates a single group where all workers share the
-/// same topology. A future N×M variant will be needed when per-region
-/// parallelism is supported (e.g., region A with 4 workers exchanging into
-/// region B with 2 workers).
+/// Supports both symmetric (N×N, all workers are sources and targets) and
+/// asymmetric (M×N, different source/target counts) configurations.
+/// Use [`new`] for symmetric and [`new_asymmetric`] for M≠N cases.
+/// For symmetric channels, [`take_pair`] returns both push and pull;
+/// for asymmetric, use [`take_source_endpoints`] and [`take_target_endpoints`].
 ///
 /// Created once per exchange edge during `spawn_multi`. Each worker
 /// calls [`take_pair`] to get its `ExchangePush` and `ExchangePull`.
 pub(crate) struct ExchangeChannelSet<T: Timestamp, D> {
-    num_workers: usize,
+    num_sources: usize,
+    num_targets: usize,
     /// push_ends\[src\]\[dst\] — source worker pushes to destination worker.
+    /// Dimensions: num_sources × num_targets.
     push_ends: Vec<Vec<Option<BoundedPush<T, D, ()>>>>,
     /// pull_ends\[src\]\[dst\] — destination worker pulls from source worker.
+    /// Dimensions: num_sources × num_targets.
     pull_ends: Vec<Vec<Option<BoundedPull<T, D, ()>>>>,
 }
 
 impl<T: Timestamp, D: Send + 'static> ExchangeChannelSet<T, D> {
-    /// Create an N×N matrix of bounded channels.
+    /// Create an N×N matrix of bounded channels (symmetric).
     ///
     /// Channels are created without wake handles — waking is handled
     /// externally by [`SharedWakeRegistry`] through [`ExchangePush`] and
     /// [`ExchangePull`].
     pub fn new(num_workers: usize, capacity: usize) -> Self {
-        let mut push_ends = Vec::with_capacity(num_workers);
-        let mut pull_ends = Vec::with_capacity(num_workers);
+        Self::new_asymmetric(num_workers, num_workers, capacity)
+    }
 
-        for _src in 0..num_workers {
-            let mut src_pushers = Vec::with_capacity(num_workers);
-            let mut src_pullers = Vec::with_capacity(num_workers);
-            for _dst in 0..num_workers {
+    /// Create an M×N matrix of bounded channels (asymmetric).
+    ///
+    /// M source workers push to N target workers. Each source worker gets
+    /// N push endpoints; each target worker gets M pull endpoints.
+    pub fn new_asymmetric(num_sources: usize, num_targets: usize, capacity: usize) -> Self {
+        let mut push_ends = Vec::with_capacity(num_sources);
+        let mut pull_ends = Vec::with_capacity(num_sources);
+
+        for _src in 0..num_sources {
+            let mut src_pushers = Vec::with_capacity(num_targets);
+            let mut src_pullers = Vec::with_capacity(num_targets);
+            for _dst in 0..num_targets {
                 let (push, pull) = bounded_channel::<T, D, ()>(capacity);
                 src_pushers.push(Some(push));
                 src_pullers.push(Some(pull));
@@ -179,57 +190,106 @@ impl<T: Timestamp, D: Send + 'static> ExchangeChannelSet<T, D> {
         }
 
         Self {
-            num_workers,
+            num_sources,
+            num_targets,
             push_ends,
             pull_ends,
         }
     }
 
-    /// Take the Push/Pull endpoints for a specific worker.
+    /// Take the Push/Pull endpoints for a specific worker (symmetric M==N only).
     ///
     /// Worker `idx` gets:
     /// - Push ends: `push_ends[idx][0..N]` (sends to all target workers)
-    /// - Pull ends: `pull_ends[0..N][idx]` (receives from all source workers)
+    /// - Pull ends: `pull_ends[0..M][idx]` (receives from all source workers)
     ///
     /// Returns boxed trait objects so `ExchangePush`/`ExchangePull` are
     /// transport-agnostic. For this in-process implementation, the concrete
     /// types behind the boxes are `BoundedPush`/`BoundedPull`.
     ///
     /// Each worker's pair can only be taken once.
+    ///
+    /// # Panics
+    /// Panics if `num_sources != num_targets` (use `take_source_endpoints`/
+    /// `take_target_endpoints` for asymmetric channels).
     pub fn take_pair(
         &mut self,
         worker_idx: usize,
     ) -> Result<(Vec<Box<dyn Push<T, D, ()>>>, Vec<Box<dyn Pull<T, D, ()>>>)> {
-        if worker_idx >= self.num_workers {
+        assert_eq!(
+            self.num_sources, self.num_targets,
+            "take_pair requires symmetric channel (M==N), got M={} N={}",
+            self.num_sources, self.num_targets
+        );
+        let pushers = self.take_source_endpoints(worker_idx)?;
+        let pullers = self.take_target_endpoints(worker_idx)?;
+        Ok((pushers, pullers))
+    }
+
+    /// Take the push endpoints for source worker `src_idx`.
+    ///
+    /// Returns N push endpoints (one per target worker) from row `src_idx`.
+    /// Each source worker's endpoints can only be taken once.
+    pub fn take_source_endpoints(
+        &mut self,
+        src_idx: usize,
+    ) -> Result<Vec<Box<dyn Push<T, D, ()>>>> {
+        if src_idx >= self.num_sources {
             return Err(Error::Custom(format!(
-                "worker index {worker_idx} out of range (num_workers={})",
-                self.num_workers
+                "source index {src_idx} out of range (num_sources={})",
+                self.num_sources
             )));
         }
 
-        // Take row of pushers: push_ends[worker_idx][*]
-        let mut pushers: Vec<Box<dyn Push<T, D, ()>>> = Vec::with_capacity(self.num_workers);
-        for dst in 0..self.num_workers {
-            let push = self.push_ends[worker_idx][dst].take().ok_or_else(|| {
+        let mut pushers: Vec<Box<dyn Push<T, D, ()>>> = Vec::with_capacity(self.num_targets);
+        for dst in 0..self.num_targets {
+            let push = self.push_ends[src_idx][dst].take().ok_or_else(|| {
                 Error::Custom(format!(
-                    "push end [{worker_idx}][{dst}] already taken"
+                    "push end [{src_idx}][{dst}] already taken"
                 ))
             })?;
             pushers.push(Box::new(push));
         }
 
-        // Take column of pullers: pull_ends[*][worker_idx]
-        let mut pullers: Vec<Box<dyn Pull<T, D, ()>>> = Vec::with_capacity(self.num_workers);
-        for src in 0..self.num_workers {
-            let pull = self.pull_ends[src][worker_idx].take().ok_or_else(|| {
+        Ok(pushers)
+    }
+
+    /// Take the pull endpoints for target worker `dst_idx`.
+    ///
+    /// Returns M pull endpoints (one per source worker) from column `dst_idx`.
+    /// Each target worker's endpoints can only be taken once.
+    pub fn take_target_endpoints(
+        &mut self,
+        dst_idx: usize,
+    ) -> Result<Vec<Box<dyn Pull<T, D, ()>>>> {
+        if dst_idx >= self.num_targets {
+            return Err(Error::Custom(format!(
+                "target index {dst_idx} out of range (num_targets={})",
+                self.num_targets
+            )));
+        }
+
+        let mut pullers: Vec<Box<dyn Pull<T, D, ()>>> = Vec::with_capacity(self.num_sources);
+        for src in 0..self.num_sources {
+            let pull = self.pull_ends[src][dst_idx].take().ok_or_else(|| {
                 Error::Custom(format!(
-                    "pull end [{src}][{worker_idx}] already taken"
+                    "pull end [{src}][{dst_idx}] already taken"
                 ))
             })?;
             pullers.push(Box::new(pull));
         }
 
-        Ok((pushers, pullers))
+        Ok(pullers)
+    }
+
+    /// Number of source workers (M dimension).
+    pub fn num_sources(&self) -> usize {
+        self.num_sources
+    }
+
+    /// Number of target workers (N dimension).
+    pub fn num_targets(&self) -> usize {
+        self.num_targets
     }
 }
 
@@ -256,7 +316,7 @@ pub struct ExchangePush<T: Timestamp, D: Send + 'static> {
     /// Hash function for routing records.
     exchange_fn: ExchangeFn<D>,
     /// Number of target workers.
-    num_workers: usize,
+    num_targets: usize,
     /// Shared wake registry for cross-worker notification.
     wakes: Arc<SharedWakeRegistry>,
     /// Whether this push endpoint has been closed.
@@ -270,11 +330,11 @@ impl<T: Timestamp, D: Send + 'static> ExchangePush<T, D> {
         exchange_fn: ExchangeFn<D>,
         wakes: Arc<SharedWakeRegistry>,
     ) -> Self {
-        let num_workers = targets.len();
+        let num_targets = targets.len();
         Self {
             targets,
             exchange_fn,
-            num_workers,
+            num_targets,
             wakes,
             closed: false,
         }
@@ -291,10 +351,10 @@ impl<T: Timestamp, D: Clone + Send + 'static> Push<T, D> for ExchangePush<T, D> 
             Payload::Data { time, data } => {
                 // Partition records by target worker.
                 let mut buckets: Vec<Vec<D>> =
-                    (0..self.num_workers).map(|_| Vec::new()).collect();
+                    (0..self.num_targets).map(|_| Vec::new()).collect();
                 for record in data {
                     let hash = self.exchange_fn.route(&record);
-                    let target = ExchangeFn::<D>::target_worker(hash, self.num_workers);
+                    let target = ExchangeFn::<D>::target_worker(hash, self.num_targets);
                     buckets[target].push(record);
                 }
 
@@ -349,10 +409,10 @@ impl<T: Timestamp, D: Clone + Send + 'static> Push<T, D> for ExchangePush<T, D> 
             Payload::Data { time, data } => {
                 // Partition records by target worker.
                 let mut buckets: Vec<Vec<D>> =
-                    (0..self.num_workers).map(|_| Vec::new()).collect();
+                    (0..self.num_targets).map(|_| Vec::new()).collect();
                 for record in data {
                     let hash = self.exchange_fn.route(record);
-                    let target = ExchangeFn::<D>::target_worker(hash, self.num_workers);
+                    let target = ExchangeFn::<D>::target_worker(hash, self.num_targets);
                     buckets[target].push(record.clone());
                 }
 
@@ -743,18 +803,20 @@ impl<T: Timestamp, D: Send + 'static> Pull<T, D> for ExchangePull<T, D> {
 /// Type-erased creator for exchange channel factories (local mode).
 ///
 /// Created by the builder (which knows T, D, and ExchangeFn), stored on
-/// [`LogicalDataflow`], and consumed by `spawn_multi` to produce N shared
-/// channel factories — one per worker — that all reference the same
-/// underlying channel infrastructure.
+/// [`LogicalDataflow`], and consumed by `spawn_multi` to produce channel
+/// factories that all reference the same underlying channel infrastructure.
+///
+/// Parameters: `(num_source_workers, num_target_workers, capacity)`.
+/// For symmetric exchanges (most common), pass the same value for both counts.
 pub(crate) type ExchangeFactoryCreatorFn =
-    Box<dyn FnOnce(usize, usize) -> Vec<super::super::schedulable::ChannelFactory> + Send>;
+    Box<dyn FnOnce(usize, usize, usize) -> Vec<super::super::schedulable::ChannelFactory> + Send>;
 
 /// Create a type-erased exchange factory creator using the default local
 /// transport ([`LocalEdgeMaterializer`]).
 ///
 /// The returned closure captures the `ExchangeFn<D>` and concrete types
-/// `T`, `D`. When called with `(num_workers, capacity)`, it produces
-/// N channel factories backed by in-process bounded channels.
+/// `T`, `D`. When called with `(num_source_workers, num_target_workers, capacity)`,
+/// it produces channel factories backed by in-process bounded channels.
 ///
 /// For custom transports (network, mock), use
 /// [`create_exchange_factories_with`] instead.
@@ -765,11 +827,15 @@ where
     T: Timestamp,
     D: Clone + Send + 'static,
 {
-    Box::new(move |num_workers: usize, capacity: usize| {
+    Box::new(move |num_source_workers: usize, num_target_workers: usize, capacity: usize| {
         let materializer = Arc::new(Mutex::new(
-            super::edge_materializer::LocalEdgeMaterializer::<T, D>::new(num_workers, capacity),
+            super::edge_materializer::LocalEdgeMaterializer::<T, D>::new_asymmetric(
+                num_source_workers,
+                num_target_workers,
+                capacity,
+            ),
         ));
-        build_exchange_factories(num_workers, exchange_fn, materializer)
+        build_exchange_factories(num_source_workers, num_target_workers, exchange_fn, materializer)
     })
 }
 
@@ -845,7 +911,7 @@ where
                 params.runtime_handle,
             ),
         ));
-        build_exchange_factories(params.num_workers, self.exchange_fn, materializer)
+        build_exchange_factories(params.num_workers, params.num_workers, self.exchange_fn, materializer)
     }
 }
 
@@ -863,8 +929,9 @@ where
 /// cluster topology and has created the appropriate materializer.
 ///
 /// The materializer is wrapped in `Arc<Mutex<>>` because it is shared
-/// across N worker factory closures (each worker calls
-/// `materialize_worker` once during Phase 5 materialization).
+/// across worker factory closures (each worker calls
+/// `materialize_source_worker`/`materialize_target_worker` once during
+/// Phase 5 materialization).
 #[allow(dead_code)] // Available for custom materializer integration
 pub(crate) fn create_exchange_factories_with<T, D>(
     num_workers: usize,
@@ -875,16 +942,22 @@ where
     T: Timestamp,
     D: Clone + Send + 'static,
 {
-    build_exchange_factories(num_workers, exchange_fn, materializer)
+    build_exchange_factories(num_workers, num_workers, exchange_fn, materializer)
 }
 
-/// Internal helper: build N channel factories from a shared materializer.
+/// Internal helper: build channel factories from a shared materializer.
 ///
-/// Each factory, when invoked during Phase 5, calls
-/// `materializer.materialize_worker(worker_idx)` to get its push/pull
-/// endpoints, then wraps them in `ExchangePush`/`ExchangePull`.
+/// Creates `num_source_workers` factories. In symmetric mode (M==N), each
+/// factory materializes both push and pull endpoints. In asymmetric mode,
+/// source factories get push endpoints, and the first N factories also get
+/// pull endpoints for the target side.
+///
+/// Currently, all callers use symmetric mode (same workers serve as both
+/// source and target). Asymmetric materialization will be activated when
+/// per-stage executors are implemented.
 fn build_exchange_factories<T, D>(
-    num_workers: usize,
+    num_source_workers: usize,
+    num_target_workers: usize,
     exchange_fn: ExchangeFn<D>,
     materializer: Arc<Mutex<dyn super::edge_materializer::EdgeMaterializer<T, D>>>,
 ) -> Vec<super::super::schedulable::ChannelFactory>
@@ -892,21 +965,43 @@ where
     T: Timestamp,
     D: Clone + Send + 'static,
 {
-    // Validate consistency: materializer's worker count must match.
+    // Validate consistency.
     {
         let mat = materializer.lock().unwrap_or_else(|e| e.into_inner());
         assert_eq!(
-            mat.num_workers(),
-            num_workers,
-            "EdgeMaterializer num_workers ({}) != expected num_workers ({})",
-            mat.num_workers(),
-            num_workers
+            mat.num_source_workers(),
+            num_source_workers,
+            "EdgeMaterializer num_source_workers ({}) != expected ({})",
+            mat.num_source_workers(),
+            num_source_workers
+        );
+        assert_eq!(
+            mat.num_target_workers(),
+            num_target_workers,
+            "EdgeMaterializer num_target_workers ({}) != expected ({})",
+            mat.num_target_workers(),
+            num_target_workers
         );
     }
 
-    let wakes = Arc::new(SharedWakeRegistry::new(num_workers));
+    // For symmetric mode (M==N), each worker gets both push and pull.
+    // The wake registry is sized for the maximum of source/target counts
+    // to support both source and target workers' wake handles.
+    let wake_count = std::cmp::max(num_source_workers, num_target_workers);
+    let wakes = Arc::new(SharedWakeRegistry::new(wake_count));
 
-    (0..num_workers)
+    // In symmetric mode, produce one factory per worker. Each factory
+    // materializes both push (source) and pull (target) endpoints.
+    // In asymmetric mode, produce max(M, N) factories; source-only
+    // workers get dummy pull, target-only workers get dummy push.
+    // For now, only symmetric mode is used by the runtime.
+    assert_eq!(
+        num_source_workers, num_target_workers,
+        "Asymmetric per-stage executors not yet implemented; M ({}) must equal N ({})",
+        num_source_workers, num_target_workers
+    );
+
+    (0..num_source_workers)
         .map(|_| {
             let wakes = wakes.clone();
             let materializer = materializer.clone();
@@ -965,7 +1060,8 @@ mod tests {
     #[test]
     fn exchange_channel_set_creation() {
         let set = ExchangeChannelSet::<u64, i32>::new(3, 16);
-        assert_eq!(set.num_workers, 3);
+        assert_eq!(set.num_sources, 3);
+        assert_eq!(set.num_targets, 3);
         assert_eq!(set.push_ends.len(), 3);
         assert_eq!(set.pull_ends.len(), 3);
     }
@@ -1336,5 +1432,141 @@ mod tests {
         let (t, d) = env.as_data().unwrap();
         assert_eq!(*t, 6);
         assert_eq!(d, &vec![99]);
+    }
+
+    // -------------------------------------------------------------------
+    // M×N Asymmetric channel tests
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn asymmetric_channel_set_creation() {
+        // 2 sources, 3 targets
+        let set = ExchangeChannelSet::<u64, i32>::new_asymmetric(2, 3, 16);
+        assert_eq!(set.num_sources, 2);
+        assert_eq!(set.num_targets, 3);
+        assert_eq!(set.push_ends.len(), 2);    // M rows
+        assert_eq!(set.push_ends[0].len(), 3); // N columns
+        assert_eq!(set.pull_ends.len(), 2);    // M rows
+        assert_eq!(set.pull_ends[0].len(), 3); // N columns
+    }
+
+    #[test]
+    fn asymmetric_take_source_endpoints() {
+        let mut set = ExchangeChannelSet::<u64, i32>::new_asymmetric(2, 3, 16);
+
+        // Source 0 gets 3 push endpoints (one per target)
+        let pushers = set.take_source_endpoints(0).unwrap();
+        assert_eq!(pushers.len(), 3);
+
+        // Source 1 gets 3 push endpoints
+        let pushers1 = set.take_source_endpoints(1).unwrap();
+        assert_eq!(pushers1.len(), 3);
+
+        // Taking again should fail
+        assert!(set.take_source_endpoints(0).is_err());
+    }
+
+    #[test]
+    fn asymmetric_take_target_endpoints() {
+        let mut set = ExchangeChannelSet::<u64, i32>::new_asymmetric(2, 3, 16);
+
+        // Target 0 gets 2 pull endpoints (one per source)
+        let pullers = set.take_target_endpoints(0).unwrap();
+        assert_eq!(pullers.len(), 2);
+
+        // Target 1 and 2
+        let pullers1 = set.take_target_endpoints(1).unwrap();
+        assert_eq!(pullers1.len(), 2);
+        let pullers2 = set.take_target_endpoints(2).unwrap();
+        assert_eq!(pullers2.len(), 2);
+
+        // Taking again should fail
+        assert!(set.take_target_endpoints(0).is_err());
+    }
+
+    #[test]
+    fn asymmetric_data_flows_source_to_target() {
+        // 2 sources → 3 targets
+        let mut set = ExchangeChannelSet::<u64, i32>::new_asymmetric(2, 3, 16);
+
+        let mut pushers0 = set.take_source_endpoints(0).unwrap();
+        let mut pushers1 = set.take_source_endpoints(1).unwrap();
+        let mut pullers0 = set.take_target_endpoints(0).unwrap();
+        let mut pullers1 = set.take_target_endpoints(1).unwrap();
+        let mut pullers2 = set.take_target_endpoints(2).unwrap();
+
+        // Source 0 pushes to target 1
+        pushers0[1].push(Envelope::data(0u64, vec![42])).unwrap();
+        // Source 1 pushes to target 2
+        pushers1[2].push(Envelope::data(0u64, vec![99])).unwrap();
+
+        // Target 1 pulls from source 0
+        let env = pullers1[0].pull().unwrap();
+        let (_, data) = env.as_data().unwrap();
+        assert_eq!(data, &vec![42]);
+
+        // Target 2 pulls from source 1
+        let env = pullers2[1].pull().unwrap();
+        let (_, data) = env.as_data().unwrap();
+        assert_eq!(data, &vec![99]);
+
+        // Target 0 should have nothing
+        assert!(pullers0[0].pull().is_none());
+        assert!(pullers0[1].pull().is_none());
+    }
+
+    #[test]
+    fn asymmetric_exchange_push_routes_to_targets() {
+        // 2 sources, 3 targets. Exchange routes by hash % 3.
+        let mut set = ExchangeChannelSet::<u64, i32>::new_asymmetric(2, 3, 16);
+        let wakes = Arc::new(SharedWakeRegistry::new(3));
+
+        let pushers = set.take_source_endpoints(0).unwrap();
+        let _pushers1 = set.take_source_endpoints(1).unwrap();
+        let mut pullers0 = set.take_target_endpoints(0).unwrap();
+        let mut pullers1 = set.take_target_endpoints(1).unwrap();
+        let mut pullers2 = set.take_target_endpoints(2).unwrap();
+
+        let exchange_fn = ExchangeFn::new("mod3", |x: &i32| *x as u64);
+        let mut push = ExchangePush::new(pushers, exchange_fn, wakes);
+
+        // Push [0, 1, 2, 3, 4, 5]
+        // 0%3=0, 1%3=1, 2%3=2, 3%3=0, 4%3=1, 5%3=2
+        push.push(Envelope::data(0u64, vec![0, 1, 2, 3, 4, 5])).unwrap();
+
+        // Target 0 (from source 0): [0, 3]
+        let env = pullers0[0].pull().unwrap();
+        let (_, data) = env.as_data().unwrap();
+        assert_eq!(data, &vec![0, 3]);
+
+        // Target 1 (from source 0): [1, 4]
+        let env = pullers1[0].pull().unwrap();
+        let (_, data) = env.as_data().unwrap();
+        assert_eq!(data, &vec![1, 4]);
+
+        // Target 2 (from source 0): [2, 5]
+        let env = pullers2[0].pull().unwrap();
+        let (_, data) = env.as_data().unwrap();
+        assert_eq!(data, &vec![2, 5]);
+    }
+
+    #[test]
+    fn asymmetric_out_of_range_errors() {
+        let mut set = ExchangeChannelSet::<u64, i32>::new_asymmetric(2, 3, 16);
+
+        // Source index out of range
+        assert!(set.take_source_endpoints(2).is_err());
+        assert!(set.take_source_endpoints(5).is_err());
+
+        // Target index out of range
+        assert!(set.take_target_endpoints(3).is_err());
+        assert!(set.take_target_endpoints(10).is_err());
+    }
+
+    #[test]
+    #[should_panic(expected = "take_pair requires symmetric channel")]
+    fn take_pair_panics_on_asymmetric() {
+        let mut set = ExchangeChannelSet::<u64, i32>::new_asymmetric(2, 3, 16);
+        let _ = set.take_pair(0);
     }
 }
