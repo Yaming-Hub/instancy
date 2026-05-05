@@ -50,7 +50,7 @@
 use std::collections::VecDeque;
 use std::sync::{Arc, Mutex};
 
-use crate::dataflow::channels::bounded::{bounded_channel, BoundedPull, BoundedPush};
+use crate::dataflow::channels::bounded::{BoundedPull, BoundedPush, bounded_channel};
 use crate::dataflow::channels::envelope::{ControlSignal, Envelope, Payload};
 use crate::dataflow::channels::pact::ExchangeFn;
 use crate::dataflow::channels::pushpull::{Pull, Push};
@@ -82,9 +82,7 @@ pub(crate) struct SharedWakeRegistry {
 impl SharedWakeRegistry {
     /// Create a registry for `num_workers` workers with no handles registered.
     pub fn new(num_workers: usize) -> Self {
-        let handles = (0..num_workers)
-            .map(|_| Mutex::new(None))
-            .collect();
+        let handles = (0..num_workers).map(|_| Mutex::new(None)).collect();
         Self { handles }
     }
 
@@ -244,9 +242,7 @@ impl<T: Timestamp, D: Send + 'static> ExchangeChannelSet<T, D> {
         let mut pushers: Vec<Box<dyn Push<T, D, ()>>> = Vec::with_capacity(self.num_targets);
         for dst in 0..self.num_targets {
             let push = self.push_ends[src_idx][dst].take().ok_or_else(|| {
-                Error::Custom(format!(
-                    "push end [{src_idx}][{dst}] already taken"
-                ))
+                Error::Custom(format!("push end [{src_idx}][{dst}] already taken"))
             })?;
             pushers.push(Box::new(push));
         }
@@ -272,9 +268,7 @@ impl<T: Timestamp, D: Send + 'static> ExchangeChannelSet<T, D> {
         let mut pullers: Vec<Box<dyn Pull<T, D, ()>>> = Vec::with_capacity(self.num_sources);
         for src in 0..self.num_sources {
             let pull = self.pull_ends[src][dst_idx].take().ok_or_else(|| {
-                Error::Custom(format!(
-                    "pull end [{src}][{dst_idx}] already taken"
-                ))
+                Error::Custom(format!("pull end [{src}][{dst_idx}] already taken"))
             })?;
             pullers.push(Box::new(pull));
         }
@@ -350,8 +344,7 @@ impl<T: Timestamp, D: Clone + Send + 'static> Push<T, D> for ExchangePush<T, D> 
         match envelope.payload {
             Payload::Data { time, data } => {
                 // Partition records by target worker.
-                let mut buckets: Vec<Vec<D>> =
-                    (0..self.num_targets).map(|_| Vec::new()).collect();
+                let mut buckets: Vec<Vec<D>> = (0..self.num_targets).map(|_| Vec::new()).collect();
                 for record in data {
                     let hash = self.exchange_fn.route(&record);
                     let target = ExchangeFn::<D>::target_worker(hash, self.num_targets);
@@ -361,10 +354,7 @@ impl<T: Timestamp, D: Clone + Send + 'static> Push<T, D> for ExchangePush<T, D> 
                 // Push non-empty buckets and wake target workers.
                 for (target_idx, bucket) in buckets.into_iter().enumerate() {
                     if !bucket.is_empty() {
-                        self.targets[target_idx].push(Envelope::data(
-                            time.clone(),
-                            bucket,
-                        ))?;
+                        self.targets[target_idx].push(Envelope::data(time.clone(), bucket))?;
                         self.wakes.wake(target_idx);
                     }
                 }
@@ -408,8 +398,7 @@ impl<T: Timestamp, D: Clone + Send + 'static> Push<T, D> for ExchangePush<T, D> 
         match &envelope.payload {
             Payload::Data { time, data } => {
                 // Partition records by target worker.
-                let mut buckets: Vec<Vec<D>> =
-                    (0..self.num_targets).map(|_| Vec::new()).collect();
+                let mut buckets: Vec<Vec<D>> = (0..self.num_targets).map(|_| Vec::new()).collect();
                 for record in data {
                     let hash = self.exchange_fn.route(record);
                     let target = ExchangeFn::<D>::target_worker(hash, self.num_targets);
@@ -447,10 +436,9 @@ impl<T: Timestamp, D: Clone + Send + 'static> Push<T, D> for ExchangePush<T, D> 
                 // as a last resort.
                 for (target_idx, bucket) in buckets.into_iter().enumerate() {
                     if !bucket.is_empty() {
-                        match self.targets[target_idx].try_push(Envelope::data(
-                            time.clone(),
-                            bucket,
-                        )) {
+                        match self.targets[target_idx]
+                            .try_push(Envelope::data(time.clone(), bucket))
+                        {
                             Ok(()) => self.wakes.wake(target_idx),
                             Err((err, _sub)) => {
                                 return Err((err, envelope));
@@ -566,13 +554,14 @@ impl<T: Timestamp> FrontierAggregator<T> {
     ///
     /// Panics in debug builds if `num_sources == 0`.
     fn new(num_sources: usize) -> Self {
-        debug_assert!(num_sources > 0, "FrontierAggregator requires at least one source");
+        debug_assert!(
+            num_sources > 0,
+            "FrontierAggregator requires at least one source"
+        );
 
         let mut aggregated = MutableAntichain::new();
         // Each source contributes T::minimum() with count +1.
-        let inits: Vec<(T, i64)> = (0..num_sources)
-            .map(|_| (T::minimum(), 1))
-            .collect();
+        let inits: Vec<(T, i64)> = (0..num_sources).map(|_| (T::minimum(), 1)).collect();
         aggregated.update_iter(inits);
 
         FrontierAggregator {
@@ -612,10 +601,9 @@ impl<T: Timestamp> FrontierAggregator<T> {
 
         self.per_source[source_idx] = Some(new_watermark.clone());
 
-        let changes = self.aggregated.update_iter(vec![
-            (old_time, -1),
-            (new_watermark, 1),
-        ]);
+        let changes = self
+            .aggregated
+            .update_iter(vec![(old_time, -1), (new_watermark, 1)]);
 
         // Return only the frontier additions (new watermarks to emit).
         // Removals (frontier retreats) are not expressible with the current
@@ -827,16 +815,23 @@ where
     T: Timestamp,
     D: Clone + Send + 'static,
 {
-    Box::new(move |num_source_workers: usize, num_target_workers: usize, capacity: usize| {
-        let materializer = Arc::new(Mutex::new(
-            super::edge_materializer::LocalEdgeMaterializer::<T, D>::new_asymmetric(
+    Box::new(
+        move |num_source_workers: usize, num_target_workers: usize, capacity: usize| {
+            let materializer = Arc::new(Mutex::new(
+                super::edge_materializer::LocalEdgeMaterializer::<T, D>::new_asymmetric(
+                    num_source_workers,
+                    num_target_workers,
+                    capacity,
+                ),
+            ));
+            build_exchange_factories(
                 num_source_workers,
                 num_target_workers,
-                capacity,
-            ),
-        ));
-        build_exchange_factories(num_source_workers, num_target_workers, exchange_fn, materializer)
-    })
+                exchange_fn,
+                materializer,
+            )
+        },
+    )
 }
 
 /// Parameters for creating a network-backed edge materializer.
@@ -851,7 +846,10 @@ pub(crate) struct NetworkMaterializerParams {
     pub local_node_id: String,
     pub session: std::sync::Arc<crate::communication::TransportSession>,
     /// Pre-extracted receivers for this specific exchange edge.
-    pub receivers: std::collections::HashMap<String, std::collections::HashMap<u64, tokio::sync::mpsc::Receiver<Vec<u8>>>>,
+    pub receivers: std::collections::HashMap<
+        String,
+        std::collections::HashMap<u64, tokio::sync::mpsc::Receiver<Vec<u8>>>,
+    >,
     pub capacity: usize,
     pub num_workers: usize,
     pub edge_index: usize,
@@ -911,7 +909,12 @@ where
                 params.runtime_handle,
             ),
         ));
-        build_exchange_factories(params.num_workers, params.num_workers, self.exchange_fn, materializer)
+        build_exchange_factories(
+            params.num_workers,
+            params.num_workers,
+            self.exchange_fn,
+            materializer,
+        )
     }
 }
 
@@ -1007,9 +1010,7 @@ where
             let materializer = materializer.clone();
             let exchange_fn = exchange_fn.clone();
             super::super::schedulable::channel_factory(
-                move |ctx: &crate::worker::WorkerContext,
-                      _cap: usize,
-                      wake: Option<WakeHandle>| {
+                move |ctx: &crate::worker::WorkerContext, _cap: usize, wake: Option<WakeHandle>| {
                     wakes.register(ctx.worker_index(), wake);
 
                     let (pushers, pullers) = materializer
@@ -1017,8 +1018,10 @@ where
                         .unwrap_or_else(|e| e.into_inner())
                         .materialize_worker(ctx.worker_index())
                         .unwrap_or_else(|e| {
-                            panic!("edge materialization failed for worker {}: {e}",
-                                ctx.worker_index())
+                            panic!(
+                                "edge materialization failed for worker {}: {e}",
+                                ctx.worker_index()
+                            )
                         });
 
                     let push = ExchangePush::new(pushers, exchange_fn.clone(), wakes.clone());
@@ -1120,13 +1123,9 @@ mod tests {
         let (mut pushers1, _pullers1) = set.take_pair(1).unwrap();
 
         // Worker 0 pushes to self (target 0).
-        pushers0[0]
-            .push(Envelope::data(0u64, vec![100]))
-            .unwrap();
+        pushers0[0].push(Envelope::data(0u64, vec![100])).unwrap();
         // Worker 1 pushes to worker 0 (target 0).
-        pushers1[0]
-            .push(Envelope::data(0u64, vec![200]))
-            .unwrap();
+        pushers1[0].push(Envelope::data(0u64, vec![200])).unwrap();
 
         let mut pull = ExchangePull::new(pullers0, wakes);
 
@@ -1195,12 +1194,8 @@ mod tests {
         let (mut pushers1, _pullers1) = set.take_pair(1).unwrap();
 
         // Both workers send to worker 0.
-        pushers0[0]
-            .push(Envelope::data(0u64, vec![1, 2]))
-            .unwrap();
-        pushers1[0]
-            .push(Envelope::data(0u64, vec![3, 4]))
-            .unwrap();
+        pushers0[0].push(Envelope::data(0u64, vec![1, 2])).unwrap();
+        pushers1[0].push(Envelope::data(0u64, vec![3, 4])).unwrap();
 
         let mut pull = ExchangePull::new(pullers0, wakes);
         let mut buffer = Vec::new();
@@ -1292,17 +1287,13 @@ mod tests {
         let mut pull = ExchangePull::new(pullers0, wakes.clone());
 
         // Source 0 sends watermark(5) to worker 0.
-        pushers0[0]
-            .push(Envelope::watermark(5u64))
-            .unwrap();
+        pushers0[0].push(Envelope::watermark(5u64)).unwrap();
         // Should NOT emit — source 1 hasn't advanced, so frontier stays at 0.
         // The watermark is absorbed by the aggregator without advancing the frontier.
         assert!(pull.pull().is_none());
 
         // Source 1 sends watermark(3) to worker 0.
-        pushers1[0]
-            .push(Envelope::watermark(3u64))
-            .unwrap();
+        pushers1[0].push(Envelope::watermark(3u64)).unwrap();
         // Now both have advanced: min(5, 3) = 3. Should emit watermark(3).
         let env = pull.pull().unwrap();
         match env.payload {
@@ -1325,9 +1316,7 @@ mod tests {
         let mut pull = ExchangePull::new(pullers0, wakes.clone());
 
         // Data passes through unchanged.
-        pushers0[0]
-            .push(Envelope::data(1u64, vec![42]))
-            .unwrap();
+        pushers0[0].push(Envelope::data(1u64, vec![42])).unwrap();
         let env = pull.pull().unwrap();
         let (t, d) = env.as_data().unwrap();
         assert_eq!(*t, 1);
@@ -1366,16 +1355,10 @@ mod tests {
         let (mut pushers1, _pullers1) = set.take_pair(1).unwrap();
 
         // Source 0: data + watermark(10)
-        pushers0[0]
-            .push(Envelope::data(1u64, vec![1]))
-            .unwrap();
-        pushers0[0]
-            .push(Envelope::watermark(10u64))
-            .unwrap();
+        pushers0[0].push(Envelope::data(1u64, vec![1])).unwrap();
+        pushers0[0].push(Envelope::watermark(10u64)).unwrap();
         // Source 1: watermark(7)
-        pushers1[0]
-            .push(Envelope::watermark(7u64))
-            .unwrap();
+        pushers1[0].push(Envelope::watermark(7u64)).unwrap();
 
         let mut pull = ExchangePull::new(pullers0, wakes.clone());
         let mut buffer = Vec::new();
@@ -1419,12 +1402,8 @@ mod tests {
         let mut pull = ExchangePull::new(pullers0, wakes.clone());
 
         // Source 0: watermark(5) followed by data.
-        pushers0[0]
-            .push(Envelope::watermark(5u64))
-            .unwrap();
-        pushers0[0]
-            .push(Envelope::data(6u64, vec![99]))
-            .unwrap();
+        pushers0[0].push(Envelope::watermark(5u64)).unwrap();
+        pushers0[0].push(Envelope::data(6u64, vec![99])).unwrap();
 
         // pull() should absorb the watermark (source 1 still at 0) and
         // then return the data — NOT None.
@@ -1444,9 +1423,9 @@ mod tests {
         let set = ExchangeChannelSet::<u64, i32>::new_asymmetric(2, 3, 16);
         assert_eq!(set.num_sources, 2);
         assert_eq!(set.num_targets, 3);
-        assert_eq!(set.push_ends.len(), 2);    // M rows
+        assert_eq!(set.push_ends.len(), 2); // M rows
         assert_eq!(set.push_ends[0].len(), 3); // N columns
-        assert_eq!(set.pull_ends.len(), 2);    // M rows
+        assert_eq!(set.pull_ends.len(), 2); // M rows
         assert_eq!(set.pull_ends[0].len(), 3); // N columns
     }
 
@@ -1532,7 +1511,8 @@ mod tests {
 
         // Push [0, 1, 2, 3, 4, 5]
         // 0%3=0, 1%3=1, 2%3=2, 3%3=0, 4%3=1, 5%3=2
-        push.push(Envelope::data(0u64, vec![0, 1, 2, 3, 4, 5])).unwrap();
+        push.push(Envelope::data(0u64, vec![0, 1, 2, 3, 4, 5]))
+            .unwrap();
 
         // Target 0 (from source 0): [0, 3]
         let env = pullers0[0].pull().unwrap();

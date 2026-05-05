@@ -121,11 +121,7 @@ pub fn trace_progress_update(dataflow_name: &str, operator_index: usize, descrip
 /// Emit a tracing event for a connection lifecycle event.
 #[cfg(feature = "tracing")]
 pub fn trace_connection_event(peer_id: usize, event: &str) {
-    tracing::debug!(
-        peer = peer_id,
-        event = event,
-        "connection pool event"
-    );
+    tracing::debug!(peer = peer_id, event = event, "connection pool event");
 }
 
 /// No-op versions when tracing is disabled.

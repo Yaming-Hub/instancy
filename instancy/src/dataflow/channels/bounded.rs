@@ -77,8 +77,8 @@ pub fn bounded_channel_with_wake<T: Timestamp, D: Send + 'static, M: Send + 'sta
 }
 
 /// Creates a bounded channel pair with the default capacity.
-pub fn default_channel<T: Timestamp, D: Send + 'static, M: Send + 'static>(
-) -> (BoundedPush<T, D, M>, BoundedPull<T, D, M>) {
+pub fn default_channel<T: Timestamp, D: Send + 'static, M: Send + 'static>()
+-> (BoundedPush<T, D, M>, BoundedPull<T, D, M>) {
     bounded_channel(DEFAULT_CHANNEL_CAPACITY)
 }
 
@@ -97,11 +97,12 @@ pub struct BoundedPush<T: Timestamp, D, M = ()> {
     wake: Option<WakeHandle>,
 }
 
-impl<T: Timestamp, D: Send + 'static, M: Send + 'static> Push<T, D, M>
-    for BoundedPush<T, D, M>
-{
+impl<T: Timestamp, D: Send + 'static, M: Send + 'static> Push<T, D, M> for BoundedPush<T, D, M> {
     fn push(&mut self, envelope: Envelope<T, D, M>) -> Result<()> {
-        let mut state = self.state.lock().map_err(|_| Error::Custom("channel mutex poisoned".into()))?;
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| Error::Custom("channel mutex poisoned".into()))?;
         if self.closed.load(Ordering::Acquire) {
             return Err(Error::ChannelClosed);
         }
@@ -184,9 +185,7 @@ impl<T: Timestamp, D, M> Drop for BoundedPush<T, D, M> {
     }
 }
 
-impl<T: Timestamp, D: Send + 'static, M: Send + 'static> Pull<T, D, M>
-    for BoundedPull<T, D, M>
-{
+impl<T: Timestamp, D: Send + 'static, M: Send + 'static> Pull<T, D, M> for BoundedPull<T, D, M> {
     fn pull(&mut self) -> Option<Envelope<T, D, M>> {
         let mut state = self.state.lock().ok()?;
         let was_full = state.buffer.len() >= state.capacity;

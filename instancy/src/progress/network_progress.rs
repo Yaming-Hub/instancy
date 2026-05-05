@@ -40,7 +40,7 @@ use crate::communication::codec::{Codec, CodecError, ExchangeData};
 #[cfg(feature = "transport")]
 use crate::communication::transport::Frame;
 #[cfg(feature = "transport")]
-use crate::communication::transport_session::{TransportSession, PROGRESS_CHANNEL_BASE};
+use crate::communication::transport_session::{PROGRESS_CHANNEL_BASE, TransportSession};
 #[cfg(feature = "transport")]
 use crate::dataflow::channels::wake::WakeHandle;
 #[cfg(feature = "transport")]
@@ -548,9 +548,9 @@ pub fn create_network_progress_channels<T: Timestamp + ExchangeData>(
 
     // --- Receive side: one bridge task per (remote_src, local_dst) pair ---
     for (peer_id, peer_start, peer_end) in remote_peers {
-        let peer_map = receivers.get_mut(peer_id.as_str()).ok_or_else(|| {
-            format!("missing receiver map for peer {peer_id}")
-        })?;
+        let peer_map = receivers
+            .get_mut(peer_id.as_str())
+            .ok_or_else(|| format!("missing receiver map for peer {peer_id}"))?;
 
         for remote_w in *peer_start..*peer_end {
             for local_w in local_start..local_end {
@@ -633,11 +633,8 @@ mod tests {
 
     #[test]
     fn encode_decode_roundtrip_u64() {
-        let changes: Vec<ProgressChange<u64>> = vec![
-            (0, 0, 42u64, 1),
-            (1, 2, 100u64, -1),
-            (3, 0, 0u64, 5),
-        ];
+        let changes: Vec<ProgressChange<u64>> =
+            vec![(0, 0, 42u64, 1), (1, 2, 100u64, -1), (3, 0, 0u64, 5)];
 
         let mut bufs = Vec::new();
         encode_progress_batch(&changes, &mut bufs, DEFAULT_MAX_BATCH_SIZE);
@@ -709,9 +706,7 @@ mod tests {
 
     #[test]
     fn encode_splits_large_batches() {
-        let changes: Vec<ProgressChange<u64>> = (0..5)
-            .map(|i| (i, 0, i as u64, 1))
-            .collect();
+        let changes: Vec<ProgressChange<u64>> = (0..5).map(|i| (i, 0, i as u64, 1)).collect();
 
         // max_batch_size=2 → should produce 3 frames (2+2+1).
         let mut bufs = Vec::new();
@@ -757,13 +752,10 @@ mod tests {
         unbounded_tx.send(frame.clone()).unwrap();
 
         // Should arrive via the bridge.
-        let received = tokio::time::timeout(
-            std::time::Duration::from_secs(2),
-            session_rx.recv(),
-        )
-        .await
-        .unwrap()
-        .unwrap();
+        let received = tokio::time::timeout(std::time::Duration::from_secs(2), session_rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
         assert_eq!(received.payload, vec![1, 2, 3]);
         assert_eq!(received.channel_id, 42);
 
@@ -798,14 +790,14 @@ mod tests {
         };
         unbounded_tx.send(frame).unwrap();
 
-        let _ = tokio::time::timeout(
-            std::time::Duration::from_secs(2),
-            handle,
-        )
-        .await
-        .expect("bridge should exit promptly");
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(2), handle)
+            .await
+            .expect("bridge should exit promptly");
 
-        assert!(cancel.is_cancelled(), "should cancel dataflow on transport close");
+        assert!(
+            cancel.is_cancelled(),
+            "should cancel dataflow on transport close"
+        );
     }
 
     #[tokio::test]
@@ -898,14 +890,14 @@ mod tests {
         // Drop sender to simulate connection loss.
         drop(tx);
 
-        let _ = tokio::time::timeout(
-            std::time::Duration::from_secs(2),
-            handle,
-        )
-        .await
-        .expect("bridge should exit promptly");
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(2), handle)
+            .await
+            .expect("bridge should exit promptly");
 
-        assert!(cancel.is_cancelled(), "should cancel dataflow on connection drop");
+        assert!(
+            cancel.is_cancelled(),
+            "should cancel dataflow on connection drop"
+        );
     }
 
     #[tokio::test]
@@ -958,11 +950,8 @@ mod tests {
         sender.send(vec![]);
 
         // Verify no frame was sent.
-        let result = tokio::time::timeout(
-            std::time::Duration::from_millis(50),
-            unbounded_rx.recv(),
-        )
-        .await;
+        let result =
+            tokio::time::timeout(std::time::Duration::from_millis(50), unbounded_rx.recv()).await;
         assert!(result.is_err(), "no frame should be sent for empty batch");
     }
 
@@ -1045,10 +1034,8 @@ mod tests {
             &wake_handles,
         );
         // Take only node-A's workers (0 and 1).
-        let a_worker_channels: Vec<WorkerProgressChannels<u64>> = local_a
-            .into_iter()
-            .take(2)
-            .collect();
+        let a_worker_channels: Vec<WorkerProgressChannels<u64>> =
+            local_a.into_iter().take(2).collect();
 
         let (a_channels, _handles_a) = create_network_progress_channels::<u64>(
             a_worker_channels,
@@ -1070,11 +1057,8 @@ mod tests {
             num_workers,
             &wake_handles,
         );
-        let b_worker_channels: Vec<WorkerProgressChannels<u64>> = local_b
-            .into_iter()
-            .skip(2)
-            .take(2)
-            .collect();
+        let b_worker_channels: Vec<WorkerProgressChannels<u64>> =
+            local_b.into_iter().skip(2).take(2).collect();
 
         let (b_channels, _handles_b) = create_network_progress_channels::<u64>(
             b_worker_channels,

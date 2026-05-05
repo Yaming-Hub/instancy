@@ -6,9 +6,9 @@
 use std::fmt;
 
 use crate::dataflow::operators::handles::{InputHandle, OutputHandle};
-use crate::dataflow::region::RegionId;
 use crate::dataflow::scope::Scope;
-use crate::dataflow::stream::{StreamEdge, Slot};
+use crate::dataflow::stage::StageId;
+use crate::dataflow::stream::{Slot, StreamEdge};
 use crate::error::Result;
 use crate::progress::timestamp::Timestamp;
 
@@ -21,8 +21,8 @@ pub struct BranchOperator<T: Timestamp, D> {
     name: String,
     /// Operator index within the scope.
     index: usize,
-    /// The execution region this operator belongs to.
-    region_id: RegionId,
+    /// The execution stage this operator belongs to.
+    stage_id: StageId,
     /// The operator's input handle.
     input: InputHandle<T, D>,
     /// Output for records matching the predicate (true branch).
@@ -35,12 +35,7 @@ pub struct BranchOperator<T: Timestamp, D> {
 
 impl<T: Timestamp, D> BranchOperator<T, D> {
     /// Create a new branch operator.
-    pub fn new<P>(
-        name: impl Into<String>,
-        index: usize,
-        region_id: RegionId,
-        predicate: P,
-    ) -> Self
+    pub fn new<P>(name: impl Into<String>, index: usize, stage_id: StageId, predicate: P) -> Self
     where
         P: FnMut(&D) -> bool + Send + 'static,
     {
@@ -51,7 +46,7 @@ impl<T: Timestamp, D> BranchOperator<T, D> {
             output_false: OutputHandle::new(format!("{name}:false")),
             name,
             index,
-            region_id,
+            stage_id,
             predicate: Box::new(predicate),
         }
     }
@@ -66,9 +61,9 @@ impl<T: Timestamp, D> BranchOperator<T, D> {
         self.index
     }
 
-    /// The execution region.
-    pub fn region_id(&self) -> RegionId {
-        self.region_id
+    /// The execution stage.
+    pub fn stage_id(&self) -> StageId {
+        self.stage_id
     }
 
     /// Get a mutable reference to the input handle.
@@ -117,7 +112,7 @@ impl<T: Timestamp, D> fmt::Debug for BranchOperator<T, D> {
         f.debug_struct("BranchOperator")
             .field("name", &self.name)
             .field("index", &self.index)
-            .field("region_id", &self.region_id)
+            .field("stage_id", &self.stage_id)
             .finish()
     }
 }
@@ -131,8 +126,8 @@ pub struct OkErrOperator<T: Timestamp, D, O, E> {
     name: String,
     /// Operator index within the scope.
     index: usize,
-    /// The execution region this operator belongs to.
-    region_id: RegionId,
+    /// The execution stage this operator belongs to.
+    stage_id: StageId,
     /// The operator's input handle.
     input: InputHandle<T, D>,
     /// Output for Ok values.
@@ -145,12 +140,7 @@ pub struct OkErrOperator<T: Timestamp, D, O, E> {
 
 impl<T: Timestamp, D, O, E> OkErrOperator<T, D, O, E> {
     /// Create a new ok_err operator.
-    pub fn new<F>(
-        name: impl Into<String>,
-        index: usize,
-        region_id: RegionId,
-        splitter: F,
-    ) -> Self
+    pub fn new<F>(name: impl Into<String>, index: usize, stage_id: StageId, splitter: F) -> Self
     where
         F: FnMut(D) -> std::result::Result<O, E> + Send + 'static,
     {
@@ -161,7 +151,7 @@ impl<T: Timestamp, D, O, E> OkErrOperator<T, D, O, E> {
             output_err: OutputHandle::new(format!("{name}:err")),
             name,
             index,
-            region_id,
+            stage_id,
             splitter: Box::new(splitter),
         }
     }
@@ -176,9 +166,9 @@ impl<T: Timestamp, D, O, E> OkErrOperator<T, D, O, E> {
         self.index
     }
 
-    /// The execution region.
-    pub fn region_id(&self) -> RegionId {
-        self.region_id
+    /// The execution stage.
+    pub fn stage_id(&self) -> StageId {
+        self.stage_id
     }
 
     /// Get a mutable reference to the input handle.
@@ -226,7 +216,7 @@ impl<T: Timestamp, D, O, E> fmt::Debug for OkErrOperator<T, D, O, E> {
         f.debug_struct("OkErrOperator")
             .field("name", &self.name)
             .field("index", &self.index)
-            .field("region_id", &self.region_id)
+            .field("stage_id", &self.stage_id)
             .finish()
     }
 }
@@ -243,10 +233,7 @@ pub trait BranchExt<S: Scope, D> {
     /// ```ignore
     /// let (evens, odds) = stream.branch(|x| x % 2 == 0);
     /// ```
-    fn branch<P>(
-        &self,
-        predicate: P,
-    ) -> (StreamEdge<S, D>, StreamEdge<S, D>)
+    fn branch<P>(&self, predicate: P) -> (StreamEdge<S, D>, StreamEdge<S, D>)
     where
         P: FnMut(&D) -> bool + Send + 'static;
 }
@@ -263,10 +250,7 @@ pub trait OkErrExt<S: Scope, D> {
     /// ```ignore
     /// let (parsed, failures) = stream.ok_err(|s| s.parse::<i32>());
     /// ```
-    fn ok_err<O, E, F>(
-        &self,
-        splitter: F,
-    ) -> (StreamEdge<S, O>, StreamEdge<S, E>)
+    fn ok_err<O, E, F>(&self, splitter: F) -> (StreamEdge<S, O>, StreamEdge<S, E>)
     where
         O: 'static,
         E: 'static,
@@ -274,49 +258,41 @@ pub trait OkErrExt<S: Scope, D> {
 }
 
 impl<S: Scope, D: 'static> BranchExt<S, D> for StreamEdge<S, D> {
-    fn branch<P>(
-        &self,
-        predicate: P,
-    ) -> (StreamEdge<S, D>, StreamEdge<S, D>)
+    fn branch<P>(&self, predicate: P) -> (StreamEdge<S, D>, StreamEdge<S, D>)
     where
         P: FnMut(&D) -> bool + Send + 'static,
     {
         let mut scope = self.scope().clone();
         let op_index = scope.allocate_operator_index();
-        let region_id = self.region_id();
+        let stage_id = self.stage_id();
 
         let true_slot = Slot::new(op_index, 0);
         let false_slot = Slot::new(op_index, 1);
 
         // Register operator (1 input, 2 outputs) and edge.
-        scope.register_operator(crate::dataflow::graph::OperatorInfo::new(
-            op_index, "branch", region_id, 1, 2,
-        )).expect("operator index should be unique");
+        scope
+            .register_operator(crate::dataflow::graph::OperatorInfo::new(
+                op_index, "branch", stage_id, 1, 2,
+            ))
+            .expect("operator index should be unique");
         scope.add_edge(crate::dataflow::graph::EdgeInfo::new(
             *self.source(),
             Slot::new(op_index, 0),
-            self.region_id(),
-            region_id,
+            self.stage_id(),
+            stage_id,
         ));
 
-        let _operator = BranchOperator::<S::Timestamp, D>::new(
-            "branch",
-            op_index,
-            region_id,
-            predicate,
-        );
+        let _operator =
+            BranchOperator::<S::Timestamp, D>::new("branch", op_index, stage_id, predicate);
 
-        let true_stream = StreamEdge::new(scope.clone(), true_slot, region_id);
-        let false_stream = StreamEdge::new(scope, false_slot, region_id);
+        let true_stream = StreamEdge::new(scope.clone(), true_slot, stage_id);
+        let false_stream = StreamEdge::new(scope, false_slot, stage_id);
         (true_stream, false_stream)
     }
 }
 
 impl<S: Scope, D: 'static> OkErrExt<S, D> for StreamEdge<S, D> {
-    fn ok_err<O, E, F>(
-        &self,
-        splitter: F,
-    ) -> (StreamEdge<S, O>, StreamEdge<S, E>)
+    fn ok_err<O, E, F>(&self, splitter: F) -> (StreamEdge<S, O>, StreamEdge<S, E>)
     where
         O: 'static,
         E: 'static,
@@ -324,31 +300,29 @@ impl<S: Scope, D: 'static> OkErrExt<S, D> for StreamEdge<S, D> {
     {
         let mut scope = self.scope().clone();
         let op_index = scope.allocate_operator_index();
-        let region_id = self.region_id();
+        let stage_id = self.stage_id();
 
         let ok_slot = Slot::new(op_index, 0);
         let err_slot = Slot::new(op_index, 1);
 
         // Register operator (1 input, 2 outputs) and edge.
-        scope.register_operator(crate::dataflow::graph::OperatorInfo::new(
-            op_index, "ok_err", region_id, 1, 2,
-        )).expect("operator index should be unique");
+        scope
+            .register_operator(crate::dataflow::graph::OperatorInfo::new(
+                op_index, "ok_err", stage_id, 1, 2,
+            ))
+            .expect("operator index should be unique");
         scope.add_edge(crate::dataflow::graph::EdgeInfo::new(
             *self.source(),
             Slot::new(op_index, 0),
-            self.region_id(),
-            region_id,
+            self.stage_id(),
+            stage_id,
         ));
 
-        let _operator = OkErrOperator::<S::Timestamp, D, O, E>::new(
-            "ok_err",
-            op_index,
-            region_id,
-            splitter,
-        );
+        let _operator =
+            OkErrOperator::<S::Timestamp, D, O, E>::new("ok_err", op_index, stage_id, splitter);
 
-        let ok_stream = StreamEdge::new(scope.clone(), ok_slot, region_id);
-        let err_stream = StreamEdge::new(scope, err_slot, region_id);
+        let ok_stream = StreamEdge::new(scope.clone(), ok_slot, stage_id);
+        let err_stream = StreamEdge::new(scope, err_slot, stage_id);
         (ok_stream, err_stream)
     }
 }
@@ -360,25 +334,17 @@ mod tests {
 
     #[test]
     fn branch_operator_creation() {
-        let op = BranchOperator::<u64, i32>::new(
-            "even_odd",
-            0,
-            RegionId::new(0),
-            |x: &i32| x % 2 == 0,
-        );
+        let op =
+            BranchOperator::<u64, i32>::new("even_odd", 0, StageId::new(0), |x: &i32| x % 2 == 0);
         assert_eq!(op.name(), "even_odd");
         assert_eq!(op.index(), 0);
-        assert_eq!(op.region_id(), RegionId::new(0));
+        assert_eq!(op.stage_id(), StageId::new(0));
     }
 
     #[test]
     fn branch_splits_data() {
-        let mut op = BranchOperator::<u64, i32>::new(
-            "even_odd",
-            0,
-            RegionId::new(0),
-            |x: &i32| x % 2 == 0,
-        );
+        let mut op =
+            BranchOperator::<u64, i32>::new("even_odd", 0, StageId::new(0), |x: &i32| x % 2 == 0);
 
         op.input_mut().push_vec(1, vec![1, 2, 3, 4, 5, 6]);
         let batches = op.activate().unwrap();
@@ -393,12 +359,8 @@ mod tests {
 
     #[test]
     fn branch_all_true() {
-        let mut op = BranchOperator::<u64, i32>::new(
-            "all_true",
-            0,
-            RegionId::new(0),
-            |_: &i32| true,
-        );
+        let mut op =
+            BranchOperator::<u64, i32>::new("all_true", 0, StageId::new(0), |_: &i32| true);
 
         op.input_mut().push_vec(5, vec![10, 20, 30]);
         op.activate().unwrap();
@@ -412,12 +374,8 @@ mod tests {
 
     #[test]
     fn branch_all_false() {
-        let mut op = BranchOperator::<u64, i32>::new(
-            "all_false",
-            0,
-            RegionId::new(0),
-            |_: &i32| false,
-        );
+        let mut op =
+            BranchOperator::<u64, i32>::new("all_false", 0, StageId::new(0), |_: &i32| false);
 
         op.input_mut().push_vec(3, vec![1, 2, 3]);
         op.activate().unwrap();
@@ -431,12 +389,7 @@ mod tests {
 
     #[test]
     fn branch_empty_input() {
-        let mut op = BranchOperator::<u64, i32>::new(
-            "empty",
-            0,
-            RegionId::new(0),
-            |x: &i32| *x > 0,
-        );
+        let mut op = BranchOperator::<u64, i32>::new("empty", 0, StageId::new(0), |x: &i32| *x > 0);
 
         let batches = op.activate().unwrap();
         assert_eq!(batches, 0);
@@ -444,12 +397,8 @@ mod tests {
 
     #[test]
     fn branch_multiple_timestamps() {
-        let mut op = BranchOperator::<u64, i32>::new(
-            "pos_neg",
-            0,
-            RegionId::new(0),
-            |x: &i32| *x > 0,
-        );
+        let mut op =
+            BranchOperator::<u64, i32>::new("pos_neg", 0, StageId::new(0), |x: &i32| *x > 0);
 
         op.input_mut().push_vec(1, vec![-1, 2, -3]);
         op.input_mut().push_vec(2, vec![4, -5]);
@@ -464,12 +413,7 @@ mod tests {
 
     #[test]
     fn branch_is_done() {
-        let mut op = BranchOperator::<u64, i32>::new(
-            "test",
-            0,
-            RegionId::new(0),
-            |_: &i32| true,
-        );
+        let mut op = BranchOperator::<u64, i32>::new("test", 0, StageId::new(0), |_: &i32| true);
 
         assert!(!op.is_done());
 
@@ -488,7 +432,7 @@ mod tests {
         let op = OkErrOperator::<u64, String, i32, String>::new(
             "parse",
             1,
-            RegionId::new(0),
+            StageId::new(0),
             |s: String| s.parse::<i32>().map_err(|e| e.to_string()),
         );
         assert_eq!(op.name(), "parse");
@@ -497,12 +441,10 @@ mod tests {
 
     #[test]
     fn ok_err_splits_results() {
-        let mut op = OkErrOperator::<u64, i32, i32, i32>::new(
-            "split",
-            0,
-            RegionId::new(0),
-            |x: i32| if x >= 0 { Ok(x * 2) } else { Err(x) },
-        );
+        let mut op =
+            OkErrOperator::<u64, i32, i32, i32>::new("split", 0, StageId::new(0), |x: i32| {
+                if x >= 0 { Ok(x * 2) } else { Err(x) }
+            });
 
         op.input_mut().push_vec(1, vec![1, -2, 3, -4, 5]);
         op.activate().unwrap();
@@ -516,12 +458,10 @@ mod tests {
 
     #[test]
     fn ok_err_all_ok() {
-        let mut op = OkErrOperator::<u64, i32, i32, String>::new(
-            "all_ok",
-            0,
-            RegionId::new(0),
-            |x: i32| Ok(x),
-        );
+        let mut op =
+            OkErrOperator::<u64, i32, i32, String>::new("all_ok", 0, StageId::new(0), |x: i32| {
+                Ok(x)
+            });
 
         op.input_mut().push_vec(1, vec![10, 20]);
         op.activate().unwrap();
@@ -535,12 +475,10 @@ mod tests {
 
     #[test]
     fn ok_err_all_err() {
-        let mut op = OkErrOperator::<u64, i32, String, i32>::new(
-            "all_err",
-            0,
-            RegionId::new(0),
-            |x: i32| Err(x),
-        );
+        let mut op =
+            OkErrOperator::<u64, i32, String, i32>::new("all_err", 0, StageId::new(0), |x: i32| {
+                Err(x)
+            });
 
         op.input_mut().push_vec(1, vec![1, 2, 3]);
         op.activate().unwrap();
@@ -554,12 +492,10 @@ mod tests {
 
     #[test]
     fn ok_err_type_transform() {
-        let mut op = OkErrOperator::<u64, &str, i32, String>::new(
-            "parse",
-            0,
-            RegionId::new(0),
-            |s: &str| s.parse::<i32>().map_err(|e| e.to_string()),
-        );
+        let mut op =
+            OkErrOperator::<u64, &str, i32, String>::new("parse", 0, StageId::new(0), |s: &str| {
+                s.parse::<i32>().map_err(|e| e.to_string())
+            });
 
         op.input_mut().push_vec(1, vec!["42", "bad", "7"]);
         op.activate().unwrap();
@@ -576,12 +512,8 @@ mod tests {
 
     #[test]
     fn ok_err_is_done() {
-        let mut op = OkErrOperator::<u64, i32, i32, i32>::new(
-            "test",
-            0,
-            RegionId::new(0),
-            |x: i32| Ok(x),
-        );
+        let mut op =
+            OkErrOperator::<u64, i32, i32, i32>::new("test", 0, StageId::new(0), |x: i32| Ok(x));
 
         assert!(!op.is_done());
 
@@ -598,36 +530,45 @@ mod tests {
     #[test]
     fn branch_ext_produces_two_streams() {
         let scope = RootScope::<u64>::new("test", 4);
-        let region_id = scope.current_region().id();
+        let stage_id = scope.current_stage_id();
         let source = Slot::new(0, 0);
-        let stream: StreamEdge<RootScope<u64>, i32> =
-            StreamEdge::new(scope, source, region_id);
+        let stream: StreamEdge<RootScope<u64>, i32> = StreamEdge::new(scope, source, stage_id);
 
         let (true_stream, false_stream) = stream.branch(|x: &i32| *x > 0);
 
-        // Both streams in same region
-        assert_eq!(true_stream.region_id(), region_id);
-        assert_eq!(false_stream.region_id(), region_id);
+        // Both streams in same stage
+        assert_eq!(true_stream.stage_id(), stage_id);
+        assert_eq!(false_stream.stage_id(), stage_id);
         // Different slots (0 vs 1) on same operator
         assert_eq!(true_stream.source().slot_index, 0);
         assert_eq!(false_stream.source().slot_index, 1);
-        assert_eq!(true_stream.source().operator_index, false_stream.source().operator_index);
+        assert_eq!(
+            true_stream.source().operator_index,
+            false_stream.source().operator_index
+        );
     }
 
     #[test]
     fn ok_err_ext_produces_two_streams() {
         let scope = RootScope::<u64>::new("test", 4);
-        let region_id = scope.current_region().id();
+        let stage_id = scope.current_stage_id();
         let source = Slot::new(0, 0);
-        let stream: StreamEdge<RootScope<u64>, i32> =
-            StreamEdge::new(scope, source, region_id);
+        let stream: StreamEdge<RootScope<u64>, i32> = StreamEdge::new(scope, source, stage_id);
 
-        let (ok_stream, err_stream): (StreamEdge<RootScope<u64>, i32>, StreamEdge<RootScope<u64>, String>) =
-            stream.ok_err(|x: i32| if x > 0 { Ok(x) } else { Err(format!("negative: {x}")) });
+        let (ok_stream, err_stream): (
+            StreamEdge<RootScope<u64>, i32>,
+            StreamEdge<RootScope<u64>, String>,
+        ) = stream.ok_err(|x: i32| {
+            if x > 0 {
+                Ok(x)
+            } else {
+                Err(format!("negative: {x}"))
+            }
+        });
 
-        // Both streams in same region
-        assert_eq!(ok_stream.region_id(), region_id);
-        assert_eq!(err_stream.region_id(), region_id);
+        // Both streams in same stage
+        assert_eq!(ok_stream.stage_id(), stage_id);
+        assert_eq!(err_stream.stage_id(), stage_id);
         // Different slots on same operator
         assert_eq!(ok_stream.source().slot_index, 0);
         assert_eq!(err_stream.source().slot_index, 1);
@@ -635,12 +576,7 @@ mod tests {
 
     #[test]
     fn branch_debug() {
-        let op = BranchOperator::<u64, i32>::new(
-            "test_branch",
-            5,
-            RegionId::new(2),
-            |_: &i32| true,
-        );
+        let op = BranchOperator::<u64, i32>::new("test_branch", 5, StageId::new(2), |_: &i32| true);
         let debug = format!("{:?}", op);
         assert!(debug.contains("BranchOperator"));
         assert!(debug.contains("test_branch"));
@@ -651,7 +587,7 @@ mod tests {
         let op = OkErrOperator::<u64, i32, i32, i32>::new(
             "test_ok_err",
             3,
-            RegionId::new(1),
+            StageId::new(1),
             |x: i32| Ok(x),
         );
         let debug = format!("{:?}", op);

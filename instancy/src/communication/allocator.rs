@@ -68,7 +68,7 @@ impl ChannelAllocator {
         create_local_channel(capacity)
     }
 
-    /// Allocate N channel pairs (e.g., one per worker in a region).
+    /// Allocate N channel pairs (e.g., one per worker in a stage).
     pub fn allocate_many<T: Timestamp, D: Send + 'static, M: Send + 'static>(
         &mut self,
         count: usize,
@@ -123,7 +123,10 @@ struct LocalPush<T: Timestamp, D, M> {
 
 impl<T: Timestamp, D: Send, M: Send> Push<T, D, M> for LocalPush<T, D, M> {
     fn push(&mut self, envelope: Envelope<T, D, M>) -> Result<()> {
-        let mut state = self.shared.lock().map_err(|_| Error::Custom("channel mutex poisoned".into()))?;
+        let mut state = self
+            .shared
+            .lock()
+            .map_err(|_| Error::Custom("channel mutex poisoned".into()))?;
         if state.sender_closed || state.receiver_dropped {
             return Err(Error::ChannelClosed);
         }
@@ -222,7 +225,10 @@ mod tests {
     #[test]
     fn local_channel_send_receive() {
         let mut alloc = ChannelAllocator::new();
-        let ChannelPair { mut pusher, mut puller } = alloc.allocate::<u64, i32, ()>();
+        let ChannelPair {
+            mut pusher,
+            mut puller,
+        } = alloc.allocate::<u64, i32, ()>();
 
         // Send some data
         pusher.push(Envelope::data(1, vec![10, 20])).unwrap();
@@ -244,7 +250,10 @@ mod tests {
         let mut alloc = ChannelAllocator::with_config(AllocatorConfig {
             channel_capacity: 2,
         });
-        let ChannelPair { mut pusher, mut puller } = alloc.allocate::<u64, i32, ()>();
+        let ChannelPair {
+            mut pusher,
+            mut puller,
+        } = alloc.allocate::<u64, i32, ()>();
 
         // Fill to capacity
         pusher.push(Envelope::data(1, vec![1])).unwrap();
@@ -253,7 +262,10 @@ mod tests {
         // Third push should fail (backpressure)
         let result = pusher.push(Envelope::data(3, vec![3]));
         assert!(result.is_err());
-        assert!(matches!(result.unwrap_err(), crate::error::Error::Backpressure));
+        assert!(matches!(
+            result.unwrap_err(),
+            crate::error::Error::Backpressure
+        ));
 
         // Drain one, then push should succeed
         let _ = puller.pull();
@@ -263,7 +275,10 @@ mod tests {
     #[test]
     fn local_channel_close_and_exhausted() {
         let mut alloc = ChannelAllocator::new();
-        let ChannelPair { mut pusher, mut puller } = alloc.allocate::<u64, i32, ()>();
+        let ChannelPair {
+            mut pusher,
+            mut puller,
+        } = alloc.allocate::<u64, i32, ()>();
 
         pusher.push(Envelope::data(1, vec![42])).unwrap();
         assert!(!puller.is_exhausted());
@@ -316,7 +331,10 @@ mod tests {
     #[test]
     fn local_channel_control_signals() {
         let mut alloc = ChannelAllocator::new();
-        let ChannelPair { mut pusher, mut puller } = alloc.allocate::<u64, i32, ()>();
+        let ChannelPair {
+            mut pusher,
+            mut puller,
+        } = alloc.allocate::<u64, i32, ()>();
 
         // Send a mix of data and control
         pusher.push(Envelope::data(1, vec![10])).unwrap();
@@ -346,7 +364,10 @@ mod tests {
     #[test]
     fn local_channel_with_metadata() {
         let mut alloc = ChannelAllocator::new();
-        let ChannelPair { mut pusher, mut puller } = alloc.allocate::<u64, i32, String>();
+        let ChannelPair {
+            mut pusher,
+            mut puller,
+        } = alloc.allocate::<u64, i32, String>();
 
         let env = Envelope::with_metadata(
             crate::dataflow::channels::Payload::Data {
@@ -365,12 +386,13 @@ mod tests {
     #[test]
     fn local_channel_drain_into() {
         let mut alloc = ChannelAllocator::new();
-        let ChannelPair { mut pusher, mut puller } = alloc.allocate::<u64, i32, ()>();
+        let ChannelPair {
+            mut pusher,
+            mut puller,
+        } = alloc.allocate::<u64, i32, ()>();
 
         for i in 0..5 {
-            pusher
-                .push(Envelope::data(i as u64, vec![i * 10]))
-                .unwrap();
+            pusher.push(Envelope::data(i as u64, vec![i * 10])).unwrap();
         }
 
         let mut buffer = Vec::new();

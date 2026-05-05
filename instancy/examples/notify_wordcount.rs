@@ -29,8 +29,8 @@
 //!
 //! Run with: `cargo run --example notify_wordcount`
 
-use std::collections::hash_map::DefaultHasher;
 use std::collections::HashMap;
+use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
 
 use instancy::DataflowBuilder;
@@ -80,9 +80,7 @@ fn main() {
                 input
                     // Split lines into individual words.
                     .flat_map("split", |_t, line| {
-                        line.split_whitespace()
-                            .map(|w| w.to_lowercase())
-                            .collect()
+                        line.split_whitespace().map(|w| w.to_lowercase()).collect()
                     })
                     // Exchange words by hash — all occurrences of the same word
                     // go to the same worker for correct global counting.
@@ -96,8 +94,7 @@ fn main() {
                     // past the timestamp. This is the canonical streaming dataflow
                     // aggregation pattern — no redundant "last write wins" output.
                     .unary_notify("count", {
-                        let mut stash: HashMap<u64, HashMap<String, usize>> =
-                            HashMap::new();
+                        let mut stash: HashMap<u64, HashMap<String, usize>> = HashMap::new();
                         move |input, output, ctx| {
                             // Buffer words and request per-timestamp notification.
                             while let Some((time, words)) = input.next() {

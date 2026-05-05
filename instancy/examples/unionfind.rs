@@ -35,7 +35,7 @@ fn main() {
         (4, 5),
         (5, 6),
         (4, 6), // redundant
-        // Component 3: 7 alone (no edges)
+                // Component 3: 7 alone (no edges)
     ];
 
     let input = builder.source(
@@ -126,8 +126,10 @@ fn main() {
     // With 3 components of sizes {4, 3, 1}, we need exactly:
     //   (4-1) + (3-1) + (1-1) = 3 + 2 + 0 = 5 merges
     // out of the 8 input edges.
-    println!("\nTotal merges: {total_merges} (filtered {}/8 redundant edges)",
-        8 - total_merges);
+    println!(
+        "\nTotal merges: {total_merges} (filtered {}/8 redundant edges)",
+        8 - total_merges
+    );
     assert_eq!(total_merges, 5, "expected 5 merges for 3 components");
 
     println!("✓ All assertions passed!");

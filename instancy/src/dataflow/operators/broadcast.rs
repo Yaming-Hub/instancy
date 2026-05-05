@@ -1,7 +1,7 @@
 //! Broadcast operators — fan-out data to all workers.
 //!
 //! The `broadcast` operator sends each record to every worker in the target
-//! region. This is used for distributing reference data or configuration
+//! stage. This is used for distributing reference data or configuration
 //! that all workers need.
 //!
 //! `broadcast_local` is a variant that only fans out to workers within the
@@ -11,14 +11,14 @@
 use std::fmt;
 
 use crate::dataflow::channels::PartitionStrategy;
-use crate::dataflow::region::RegionId;
 use crate::dataflow::scope::Scope;
-use crate::dataflow::stream::{StreamEdge, Slot};
+use crate::dataflow::stage::StageId;
+use crate::dataflow::stream::{Slot, StreamEdge};
 use crate::progress::timestamp::Timestamp;
 
 /// A registered broadcast operator.
 ///
-/// Fans out each record to all workers in the target region.
+/// Fans out each record to all workers in the target stage.
 /// Records the repartition intent; actual data movement is handled by
 /// the runtime when the dataflow is materialized.
 pub struct BroadcastOperator<T: Timestamp, D> {
@@ -26,10 +26,10 @@ pub struct BroadcastOperator<T: Timestamp, D> {
     name: String,
     /// Operator index within the scope.
     index: usize,
-    /// The source execution region.
-    source_region: RegionId,
-    /// The target execution region.
-    target_region: RegionId,
+    /// The source execution stage.
+    source_stage: StageId,
+    /// The target execution stage.
+    target_stage: StageId,
     /// The partition strategy (Broadcast or BroadcastLocal).
     strategy: PartitionStrategy<D>,
     /// Phantom for timestamp.
@@ -41,15 +41,15 @@ impl<T: Timestamp, D> BroadcastOperator<T, D> {
     pub fn new(
         name: impl Into<String>,
         index: usize,
-        source_region: RegionId,
-        target_region: RegionId,
+        source_stage: StageId,
+        target_stage: StageId,
         strategy: PartitionStrategy<D>,
     ) -> Self {
         Self {
             name: name.into(),
             index,
-            source_region,
-            target_region,
+            source_stage,
+            target_stage,
             strategy,
             _phantom: std::marker::PhantomData,
         }
@@ -65,14 +65,14 @@ impl<T: Timestamp, D> BroadcastOperator<T, D> {
         self.index
     }
 
-    /// The source region.
-    pub fn source_region(&self) -> RegionId {
-        self.source_region
+    /// The source stage.
+    pub fn source_stage(&self) -> StageId {
+        self.source_stage
     }
 
-    /// The target region.
-    pub fn target_region(&self) -> RegionId {
-        self.target_region
+    /// The target stage.
+    pub fn target_stage(&self) -> StageId {
+        self.target_stage
     }
 
     /// The partition strategy.
@@ -86,8 +86,8 @@ impl<T: Timestamp, D> fmt::Debug for BroadcastOperator<T, D> {
         f.debug_struct("BroadcastOperator")
             .field("name", &self.name)
             .field("index", &self.index)
-            .field("source_region", &self.source_region)
-            .field("target_region", &self.target_region)
+            .field("source_stage", &self.source_stage)
+            .field("target_stage", &self.target_stage)
             .field("strategy", &self.strategy.name())
             .finish()
     }
@@ -95,16 +95,16 @@ impl<T: Timestamp, D> fmt::Debug for BroadcastOperator<T, D> {
 
 /// Extension trait for constructing broadcast operators on a `StreamEdge`.
 pub trait BroadcastExt<S: Scope, D> {
-    /// Broadcast each record to all workers in the current region.
+    /// Broadcast each record to all workers in the current stage.
     ///
-    /// Every worker in the target region receives a copy of each record.
-    /// The target region has the same parallelism as the source.
+    /// Every worker in the target stage receives a copy of each record.
+    /// The target stage has the same parallelism as the source.
     fn broadcast(&self) -> StreamEdge<S, D>;
 
-    /// Broadcast each record to all workers in a new region with specified parallelism.
+    /// Broadcast each record to all workers in a new stage with specified parallelism.
     ///
-    /// Creates a new execution region if `target_parallelism` differs from the
-    /// current region's parallelism; otherwise reuses the current region.
+    /// Creates a new execution stage if `target_parallelism` differs from the
+    /// current stage's parallelism; otherwise reuses the current stage.
     ///
     /// # Panics
     /// Panics if `target_parallelism` is 0.
@@ -113,13 +113,13 @@ pub trait BroadcastExt<S: Scope, D> {
     /// Broadcast each record to all workers in the same process only.
     ///
     /// This avoids network transfer for reference data that only needs
-    /// local distribution. The target region has the same parallelism as the source.
+    /// local distribution. The target stage has the same parallelism as the source.
     fn broadcast_local(&self) -> StreamEdge<S, D>;
 
-    /// Broadcast each record to all local workers in a new region with specified parallelism.
+    /// Broadcast each record to all local workers in a new stage with specified parallelism.
     ///
-    /// Creates a new execution region if `target_parallelism` differs from the
-    /// current region's parallelism; otherwise reuses the current region.
+    /// Creates a new execution stage if `target_parallelism` differs from the
+    /// current stage's parallelism; otherwise reuses the current stage.
     ///
     /// # Panics
     /// Panics if `target_parallelism` is 0.
@@ -129,34 +129,50 @@ pub trait BroadcastExt<S: Scope, D> {
 impl<S: Scope, D: 'static> BroadcastExt<S, D> for StreamEdge<S, D> {
     fn broadcast(&self) -> StreamEdge<S, D> {
         let scope = self.scope().clone();
-        let source_region = self.region_id();
-        let parallelism = scope.region(source_region)
-            .map(|r| r.parallelism())
-            .unwrap_or(1);
-        self.build_broadcast(scope, source_region, parallelism, PartitionStrategy::Broadcast)
+        let source_stage = self.stage_id();
+        let parallelism = scope.stage_parallelism(source_stage).unwrap_or(1);
+        self.build_broadcast(
+            scope,
+            source_stage,
+            parallelism,
+            PartitionStrategy::Broadcast,
+        )
     }
 
     fn broadcast_to(&self, target_parallelism: usize) -> StreamEdge<S, D> {
         assert!(target_parallelism > 0, "target_parallelism must be > 0");
         let scope = self.scope().clone();
-        let source_region = self.region_id();
-        self.build_broadcast(scope, source_region, target_parallelism, PartitionStrategy::Broadcast)
+        let source_stage = self.stage_id();
+        self.build_broadcast(
+            scope,
+            source_stage,
+            target_parallelism,
+            PartitionStrategy::Broadcast,
+        )
     }
 
     fn broadcast_local(&self) -> StreamEdge<S, D> {
         let scope = self.scope().clone();
-        let source_region = self.region_id();
-        let parallelism = scope.region(source_region)
-            .map(|r| r.parallelism())
-            .unwrap_or(1);
-        self.build_broadcast(scope, source_region, parallelism, PartitionStrategy::BroadcastLocal)
+        let source_stage = self.stage_id();
+        let parallelism = scope.stage_parallelism(source_stage).unwrap_or(1);
+        self.build_broadcast(
+            scope,
+            source_stage,
+            parallelism,
+            PartitionStrategy::BroadcastLocal,
+        )
     }
 
     fn broadcast_local_to(&self, target_parallelism: usize) -> StreamEdge<S, D> {
         assert!(target_parallelism > 0, "target_parallelism must be > 0");
         let scope = self.scope().clone();
-        let source_region = self.region_id();
-        self.build_broadcast(scope, source_region, target_parallelism, PartitionStrategy::BroadcastLocal)
+        let source_stage = self.stage_id();
+        self.build_broadcast(
+            scope,
+            source_stage,
+            target_parallelism,
+            PartitionStrategy::BroadcastLocal,
+        )
     }
 }
 
@@ -165,32 +181,36 @@ impl<S: Scope, D: 'static> StreamEdge<S, D> {
     fn build_broadcast(
         &self,
         mut scope: S,
-        source_region: RegionId,
+        source_stage: StageId,
         target_parallelism: usize,
         strategy: PartitionStrategy<D>,
     ) -> StreamEdge<S, D> {
         let op_index = scope.allocate_operator_index();
         let output_slot = Slot::new(op_index, 0);
 
-        let current_parallelism = scope.region(source_region)
-            .map(|r| r.parallelism())
-            .unwrap_or(1);
-        let target_region = if target_parallelism != current_parallelism {
-            scope.new_region(target_parallelism)
+        let current_parallelism = scope.stage_parallelism(source_stage).unwrap_or(1);
+        let target_stage = if target_parallelism != current_parallelism {
+            scope.new_stage(target_parallelism)
         } else {
-            source_region
+            source_stage
         };
 
         // Register operator and edge in the dataflow graph.
         let name = strategy.name().to_owned();
-        scope.register_operator(crate::dataflow::graph::OperatorInfo::new(
-            op_index, &name, target_region, 1, 1,
-        )).expect("operator index should be unique");
+        scope
+            .register_operator(crate::dataflow::graph::OperatorInfo::new(
+                op_index,
+                &name,
+                target_stage,
+                1,
+                1,
+            ))
+            .expect("operator index should be unique");
         scope.add_edge(crate::dataflow::graph::EdgeInfo::exchange(
             *self.source(),
             Slot::new(op_index, 0),
-            source_region,
-            target_region,
+            source_stage,
+            target_stage,
         ));
 
         // Record target parallelism for stage inference.
@@ -199,12 +219,12 @@ impl<S: Scope, D: 'static> StreamEdge<S, D> {
         let _operator = BroadcastOperator::<S::Timestamp, D>::new(
             name,
             op_index,
-            source_region,
-            target_region,
+            source_stage,
+            target_stage,
             strategy,
         );
 
-        StreamEdge::new(scope, output_slot, target_region)
+        StreamEdge::new(scope, output_slot, target_stage)
     }
 }
 
@@ -214,77 +234,73 @@ mod tests {
     use crate::dataflow::scope::RootScope;
 
     #[test]
-    fn broadcast_same_region() {
+    fn broadcast_same_stage() {
         let scope = RootScope::<u64>::new("test", 4);
-        let region_id = scope.current_region().id();
+        let stage_id = scope.current_stage_id();
         let source = Slot::new(0, 0);
-        let stream: StreamEdge<RootScope<u64>, i32> =
-            StreamEdge::new(scope, source, region_id);
+        let stream: StreamEdge<RootScope<u64>, i32> = StreamEdge::new(scope, source, stage_id);
 
         let broadcasted = stream.broadcast();
-        assert_eq!(broadcasted.region_id(), region_id);
+        assert_eq!(broadcasted.stage_id(), stage_id);
     }
 
     #[test]
-    fn broadcast_to_new_region() {
+    fn broadcast_to_new_stage() {
         let scope = RootScope::<u64>::new("test", 4);
-        let region_id = scope.current_region().id();
+        let stage_id = scope.current_stage_id();
         let source = Slot::new(0, 0);
         let stream: StreamEdge<RootScope<u64>, i32> =
-            StreamEdge::new(scope.clone(), source, region_id);
+            StreamEdge::new(scope.clone(), source, stage_id);
 
         let broadcasted = stream.broadcast_to(8);
-        assert_ne!(broadcasted.region_id(), region_id);
-        let new_region = scope.region(broadcasted.region_id()).unwrap();
-        assert_eq!(new_region.parallelism(), 8);
+        assert_ne!(broadcasted.stage_id(), stage_id);
+        let new_parallelism = scope.stage_parallelism(broadcasted.stage_id()).unwrap();
+        assert_eq!(new_parallelism, 8);
     }
 
     #[test]
     #[should_panic(expected = "target_parallelism must be > 0")]
     fn broadcast_to_zero_panics() {
         let scope = RootScope::<u64>::new("test", 4);
-        let region_id = scope.current_region().id();
+        let stage_id = scope.current_stage_id();
         let source = Slot::new(0, 0);
-        let stream: StreamEdge<RootScope<u64>, i32> =
-            StreamEdge::new(scope, source, region_id);
+        let stream: StreamEdge<RootScope<u64>, i32> = StreamEdge::new(scope, source, stage_id);
 
         let _ = stream.broadcast_to(0);
     }
 
     #[test]
-    fn broadcast_local_same_region() {
+    fn broadcast_local_same_stage() {
         let scope = RootScope::<u64>::new("test", 4);
-        let region_id = scope.current_region().id();
+        let stage_id = scope.current_stage_id();
         let source = Slot::new(0, 0);
-        let stream: StreamEdge<RootScope<u64>, i32> =
-            StreamEdge::new(scope, source, region_id);
+        let stream: StreamEdge<RootScope<u64>, i32> = StreamEdge::new(scope, source, stage_id);
 
         let broadcasted = stream.broadcast_local();
-        assert_eq!(broadcasted.region_id(), region_id);
+        assert_eq!(broadcasted.stage_id(), stage_id);
     }
 
     #[test]
-    fn broadcast_local_to_new_region() {
+    fn broadcast_local_to_new_stage() {
         let scope = RootScope::<u64>::new("test", 4);
-        let region_id = scope.current_region().id();
+        let stage_id = scope.current_stage_id();
         let source = Slot::new(0, 0);
         let stream: StreamEdge<RootScope<u64>, i32> =
-            StreamEdge::new(scope.clone(), source, region_id);
+            StreamEdge::new(scope.clone(), source, stage_id);
 
         let broadcasted = stream.broadcast_local_to(12);
-        assert_ne!(broadcasted.region_id(), region_id);
-        let new_region = scope.region(broadcasted.region_id()).unwrap();
-        assert_eq!(new_region.parallelism(), 12);
+        assert_ne!(broadcasted.stage_id(), stage_id);
+        let new_parallelism = scope.stage_parallelism(broadcasted.stage_id()).unwrap();
+        assert_eq!(new_parallelism, 12);
     }
 
     #[test]
     #[should_panic(expected = "target_parallelism must be > 0")]
     fn broadcast_local_to_zero_panics() {
         let scope = RootScope::<u64>::new("test", 4);
-        let region_id = scope.current_region().id();
+        let stage_id = scope.current_stage_id();
         let source = Slot::new(0, 0);
-        let stream: StreamEdge<RootScope<u64>, i32> =
-            StreamEdge::new(scope, source, region_id);
+        let stream: StreamEdge<RootScope<u64>, i32> = StreamEdge::new(scope, source, stage_id);
 
         let _ = stream.broadcast_local_to(0);
     }
@@ -294,14 +310,14 @@ mod tests {
         let op = BroadcastOperator::<u64, i32>::new(
             "my_broadcast",
             4,
-            RegionId::new(0),
-            RegionId::new(1),
+            StageId::new(0),
+            StageId::new(1),
             PartitionStrategy::Broadcast,
         );
         assert_eq!(op.name(), "my_broadcast");
         assert_eq!(op.index(), 4);
-        assert_eq!(op.source_region(), RegionId::new(0));
-        assert_eq!(op.target_region(), RegionId::new(1));
+        assert_eq!(op.source_stage(), StageId::new(0));
+        assert_eq!(op.target_stage(), StageId::new(1));
         assert_eq!(op.strategy().name(), "Broadcast");
     }
 
@@ -310,8 +326,8 @@ mod tests {
         let op = BroadcastOperator::<u64, i32>::new(
             "local_bc",
             6,
-            RegionId::new(0),
-            RegionId::new(0),
+            StageId::new(0),
+            StageId::new(0),
             PartitionStrategy::BroadcastLocal,
         );
         assert_eq!(op.strategy().name(), "BroadcastLocal");
@@ -322,8 +338,8 @@ mod tests {
         let op = BroadcastOperator::<u64, i32>::new(
             "bc",
             1,
-            RegionId::new(0),
-            RegionId::new(1),
+            StageId::new(0),
+            StageId::new(1),
             PartitionStrategy::Broadcast,
         );
         let debug = format!("{:?}", op);

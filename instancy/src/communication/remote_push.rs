@@ -11,8 +11,8 @@
 //! is full (muxer cannot flush fast enough), it returns [`Error::Backpressure`]
 //! rather than blocking the caller's worker thread.
 
-use std::sync::mpsc;
 use std::sync::Arc;
+use std::sync::mpsc;
 
 use crate::communication::codec::Codec;
 use crate::communication::interprocess::ChannelId;
@@ -227,11 +227,7 @@ mod tests {
     struct TestCodec;
 
     impl Codec<(u64, Vec<u32>)> for TestCodec {
-        fn encode(
-            &self,
-            value: &(u64, Vec<u32>),
-            buf: &mut Vec<u8>,
-        ) -> Result<(), CodecError> {
+        fn encode(&self, value: &(u64, Vec<u32>), buf: &mut Vec<u8>) -> Result<(), CodecError> {
             let (time, data) = value;
             buf.extend_from_slice(&time.to_le_bytes());
             buf.extend_from_slice(&(data.len() as u32).to_le_bytes());
@@ -260,7 +256,9 @@ mod tests {
             let mut data = Vec::with_capacity(count);
             for i in 0..count {
                 let offset = 12 + i * 4;
-                data.push(u32::from_le_bytes(buf[offset..offset + 4].try_into().unwrap()));
+                data.push(u32::from_le_bytes(
+                    buf[offset..offset + 4].try_into().unwrap(),
+                ));
             }
             Ok(((time, data), needed))
         }
@@ -273,12 +271,8 @@ mod tests {
         let dataflow_id = DataflowId::from_bytes([1u8; 16]);
         let channel_id = 42;
 
-        let push = RemotePush::<u64, u32, (), TestCodec>::new(
-            dataflow_id,
-            channel_id,
-            codec,
-            sender,
-        );
+        let push =
+            RemotePush::<u64, u32, (), TestCodec>::new(dataflow_id, channel_id, codec, sender);
 
         let envelope = Envelope {
             payload: Payload::Data {
@@ -307,12 +301,7 @@ mod tests {
         let codec = Arc::new(TestCodec);
         let dataflow_id = DataflowId::from_bytes([1u8; 16]);
 
-        let push = RemotePush::<u64, u32, (), TestCodec>::new(
-            dataflow_id,
-            1,
-            codec,
-            sender,
-        );
+        let push = RemotePush::<u64, u32, (), TestCodec>::new(dataflow_id, 1, codec, sender);
 
         let envelope = Envelope {
             payload: Payload::Data {
@@ -337,12 +326,7 @@ mod tests {
         let codec = Arc::new(TestCodec);
         let dataflow_id = DataflowId::from_bytes([1u8; 16]);
 
-        let push = RemotePush::<u64, u32, (), TestCodec>::new(
-            dataflow_id,
-            1,
-            codec,
-            sender,
-        );
+        let push = RemotePush::<u64, u32, (), TestCodec>::new(dataflow_id, 1, codec, sender);
 
         // Drop receiver to simulate mux shutdown
         drop(receiver);
@@ -366,12 +350,7 @@ mod tests {
         let codec = Arc::new(TestCodec);
         let dataflow_id = DataflowId::from_bytes([1u8; 16]);
 
-        let push = RemotePush::<u64, u32, (), TestCodec>::new(
-            dataflow_id,
-            1,
-            codec,
-            sender,
-        );
+        let push = RemotePush::<u64, u32, (), TestCodec>::new(dataflow_id, 1, codec, sender);
 
         let envelope = Envelope {
             payload: Payload::Control(ControlSignal::Watermark(5u64)),

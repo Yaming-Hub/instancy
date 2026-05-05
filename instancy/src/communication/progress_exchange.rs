@@ -36,7 +36,7 @@ use std::sync::Arc;
 
 use crate::communication::codec::Codec;
 use crate::communication::interprocess::{
-    decode_progress, encode_progress, ProgressMessage, PROGRESS_CHANNEL_ID,
+    PROGRESS_CHANNEL_ID, ProgressMessage, decode_progress, encode_progress,
 };
 use crate::communication::remote_push::{FrameReceiver, FrameSender, OutboundFrame};
 use crate::dataflow::id::DataflowId;
@@ -75,10 +75,7 @@ impl PeerProgressSender {
     /// Create a new peer progress sender.
     ///
     /// Returns the sender and its corresponding receiver (for the mux task).
-    pub fn new(
-        peer_node_id: impl Into<String>,
-        buffer_capacity: usize,
-    ) -> (Self, FrameReceiver) {
+    pub fn new(peer_node_id: impl Into<String>, buffer_capacity: usize) -> (Self, FrameReceiver) {
         let (sender, receiver) = FrameSender::channel(buffer_capacity);
         (
             Self {
@@ -145,10 +142,7 @@ where
     ///
     /// Returns the number of peers that accepted the update, or an error
     /// if delivery failed (backpressure or transport error).
-    pub fn broadcast_local_changes(
-        &self,
-        changes: &[(usize, T, i64)],
-    ) -> Result<usize, Error> {
+    pub fn broadcast_local_changes(&self, changes: &[(usize, T, i64)]) -> Result<usize, Error> {
         if changes.is_empty() || self.peer_senders.is_empty() {
             return Ok(0);
         }
@@ -159,8 +153,7 @@ where
         };
 
         let mut buf = Vec::new();
-        encode_progress(&msg, self.time_codec.as_ref(), &mut buf)
-            .map_err(|e| Error::codec(e))?;
+        encode_progress(&msg, self.time_codec.as_ref(), &mut buf).map_err(|e| Error::codec(e))?;
 
         let mut accepted = 0;
         for peer in &self.peer_senders {
@@ -187,12 +180,8 @@ where
     ///
     /// Called by the demux layer when a frame arrives on PROGRESS_CHANNEL_ID
     /// for this dataflow.
-    pub fn decode_remote_progress(
-        &self,
-        payload: &[u8],
-    ) -> Result<ProgressMessage<T>, Error> {
-        decode_progress(payload, self.time_codec.as_ref())
-            .map_err(|e| Error::codec(e))
+    pub fn decode_remote_progress(&self, payload: &[u8]) -> Result<ProgressMessage<T>, Error> {
+        decode_progress(payload, self.time_codec.as_ref()).map_err(|e| Error::codec(e))
     }
 
     /// Get this exchange's dataflow ID.
@@ -248,8 +237,10 @@ mod tests {
         let config = ProgressExchangeConfig::default();
         let dataflow_id = DataflowId::from_bytes([1u8; 16]);
 
-        let (sender1, receiver1) = PeerProgressSender::new("node-1", config.progress_buffer_capacity);
-        let (sender2, receiver2) = PeerProgressSender::new("node-2", config.progress_buffer_capacity);
+        let (sender1, receiver1) =
+            PeerProgressSender::new("node-1", config.progress_buffer_capacity);
+        let (sender2, receiver2) =
+            PeerProgressSender::new("node-2", config.progress_buffer_capacity);
 
         let exchange = ProgressExchange::new(
             dataflow_id,
@@ -286,7 +277,8 @@ mod tests {
     fn broadcast_empty_changes_is_noop() {
         let (sender, _receiver) = PeerProgressSender::new("node-1", 16);
         let exchange = ProgressExchange::new(
-            DataflowId::from_bytes([1u8; 16]), "node-0",
+            DataflowId::from_bytes([1u8; 16]),
+            "node-0",
             vec![sender],
             Arc::new(U64Codec),
         );
@@ -298,7 +290,8 @@ mod tests {
     #[test]
     fn broadcast_no_peers_is_noop() {
         let exchange: ProgressExchange<u64, U64Codec> = ProgressExchange::new(
-            DataflowId::from_bytes([1u8; 16]), "node-0",
+            DataflowId::from_bytes([1u8; 16]),
+            "node-0",
             vec![],
             Arc::new(U64Codec),
         );
@@ -313,7 +306,8 @@ mod tests {
         // Create a sender with capacity 1
         let (sender, receiver) = PeerProgressSender::new("node-1", 1);
         let exchange = ProgressExchange::new(
-            DataflowId::from_bytes([1u8; 16]), "node-0",
+            DataflowId::from_bytes([1u8; 16]),
+            "node-0",
             vec![sender],
             Arc::new(U64Codec),
         );
@@ -336,7 +330,8 @@ mod tests {
     #[test]
     fn decode_remote_progress_roundtrip() {
         let exchange: ProgressExchange<u64, U64Codec> = ProgressExchange::new(
-            DataflowId::from_bytes([1u8; 16]), "node-0",
+            DataflowId::from_bytes([1u8; 16]),
+            "node-0",
             vec![],
             Arc::new(U64Codec),
         );
@@ -358,7 +353,8 @@ mod tests {
     #[test]
     fn decode_remote_progress_invalid_data() {
         let exchange: ProgressExchange<u64, U64Codec> = ProgressExchange::new(
-            DataflowId::from_bytes([1u8; 16]), "node-0",
+            DataflowId::from_bytes([1u8; 16]),
+            "node-0",
             vec![],
             Arc::new(U64Codec),
         );
@@ -372,7 +368,8 @@ mod tests {
     fn progress_exchange_debug() {
         let (sender, _) = PeerProgressSender::new("node-1", 8);
         let exchange = ProgressExchange::new(
-            DataflowId::from_bytes([1u8; 16]), "node-0",
+            DataflowId::from_bytes([1u8; 16]),
+            "node-0",
             vec![sender],
             Arc::new(U64Codec),
         );
@@ -386,7 +383,8 @@ mod tests {
         let (s1, _) = PeerProgressSender::new("node-1", 8);
         let (s2, _) = PeerProgressSender::new("node-2", 8);
         let exchange = ProgressExchange::new(
-            DataflowId::from_bytes([1u8; 16]), "node-0",
+            DataflowId::from_bytes([1u8; 16]),
+            "node-0",
             vec![s1, s2],
             Arc::new(U64Codec),
         );

@@ -31,10 +31,7 @@ impl ActivationGuard {
     /// Create a new activation guard that starts timing immediately.
     pub fn new(collector: Arc<OperatorMetricsCollector>) -> Self {
         #[cfg(feature = "tracing")]
-        tracing::trace!(
-            operator = collector.name(),
-            "operator activation started"
-        );
+        tracing::trace!(operator = collector.name(), "operator activation started");
 
         Self {
             collector,
@@ -64,11 +61,7 @@ impl ActivationGuard {
     /// Finish the activation and additionally record a backpressure event.
     ///
     /// Use when the operator was blocked waiting for downstream capacity.
-    pub fn finish_with_backpressure(
-        mut self,
-        records_processed: u64,
-        blocked_duration: Duration,
-    ) {
+    pub fn finish_with_backpressure(mut self, records_processed: u64, blocked_duration: Duration) {
         let elapsed = self.start.elapsed();
         self.collector.record_activation(elapsed, records_processed);
         self.collector.record_backpressure(blocked_duration);

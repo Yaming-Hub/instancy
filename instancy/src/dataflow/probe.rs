@@ -47,12 +47,18 @@ impl<T: Timestamp> ProbeHandle<T> {
 
     /// Returns the current frontier as a snapshot.
     pub fn frontier(&self) -> Antichain<T> {
-        self.frontier.lock().unwrap_or_else(|e| e.into_inner()).clone()
+        self.frontier
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
     }
 
     /// Returns `true` if the frontier is empty (all work complete).
     pub fn is_done(&self) -> bool {
-        self.frontier.lock().unwrap_or_else(|e| e.into_inner()).is_empty()
+        self.frontier
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .is_empty()
     }
 
     /// Update the frontier. Called by the executor during progress propagation.

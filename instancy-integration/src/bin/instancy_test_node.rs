@@ -11,8 +11,8 @@ use clap::Parser;
 use tokio::io::{BufReader, BufWriter};
 use tokio::net::TcpStream;
 
-use dactor_ractor::RactorRuntime;
 use dactor::prelude::*;
+use dactor_ractor::RactorRuntime;
 
 use instancy_integration::node_actor::{DataflowAgent, DataflowAgentArgs, HandleCommand};
 use instancy_integration::protocol::*;
@@ -99,10 +99,7 @@ async fn main() {
         };
 
         // Check for shutdown before dispatching
-        let is_shutdown = matches!(
-            &envelope.kind,
-            MessageKind::Command(NodeCommand::Shutdown)
-        );
+        let is_shutdown = matches!(&envelope.kind, MessageKind::Command(NodeCommand::Shutdown));
 
         // Dispatch to actor via ask (request-response)
         let response = actor_ref
@@ -123,4 +120,3 @@ async fn main() {
         }
     }
 }
-

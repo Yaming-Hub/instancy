@@ -65,19 +65,50 @@ fn main() {
     let window_1001 = 1001u64; // next 10-second window
 
     println!("Sending readings for window {window_1000}...");
-    sender.send(window_1000, vec![
-        SensorReading { sensor_id: 1, value: 23.5 },  // below threshold
-        SensorReading { sensor_id: 2, value: 78.3 },  // above threshold
-        SensorReading { sensor_id: 3, value: 91.0 },  // above threshold
-        SensorReading { sensor_id: 4, value: 45.2 },  // below threshold
-    ]).unwrap();
+    sender
+        .send(
+            window_1000,
+            vec![
+                SensorReading {
+                    sensor_id: 1,
+                    value: 23.5,
+                }, // below threshold
+                SensorReading {
+                    sensor_id: 2,
+                    value: 78.3,
+                }, // above threshold
+                SensorReading {
+                    sensor_id: 3,
+                    value: 91.0,
+                }, // above threshold
+                SensorReading {
+                    sensor_id: 4,
+                    value: 45.2,
+                }, // below threshold
+            ],
+        )
+        .unwrap();
 
     println!("Sending readings for window {window_1001}...");
-    sender.send(window_1001, vec![
-        SensorReading { sensor_id: 1, value: 55.0 },  // above threshold
-        SensorReading { sensor_id: 2, value: 12.1 },  // below threshold
-        SensorReading { sensor_id: 5, value: 99.9 },  // above threshold
-    ]).unwrap();
+    sender
+        .send(
+            window_1001,
+            vec![
+                SensorReading {
+                    sensor_id: 1,
+                    value: 55.0,
+                }, // above threshold
+                SensorReading {
+                    sensor_id: 2,
+                    value: 12.1,
+                }, // below threshold
+                SensorReading {
+                    sensor_id: 5,
+                    value: 99.9,
+                }, // above threshold
+            ],
+        )
+        .unwrap();
 
     println!("Closing input...\n");
     sender.close();

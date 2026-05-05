@@ -14,16 +14,21 @@ fn main() {
     // Build a simple source → output dataflow using the Pipe chaining API.
     let builder = DataflowBuilder::<u64>::new("hello");
     let port = builder
-        .source("greetings", vec![
-            (0u64, vec!["Hello", "World"]),
-            (1u64, vec!["from", "instancy!"]),
-        ])
+        .source(
+            "greetings",
+            vec![
+                (0u64, vec!["Hello", "World"]),
+                (1u64, vec!["from", "instancy!"]),
+            ],
+        )
         .output("output");
 
     let dataflow = builder.build().expect("graph construction failed");
 
     // Execute via SimpleRuntime
-    SimpleRuntime::new().run(dataflow).expect("dataflow execution failed");
+    SimpleRuntime::new()
+        .run(dataflow)
+        .expect("dataflow execution failed");
 
     // Read collected results
     let collector = port.collector();

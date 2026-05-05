@@ -834,7 +834,11 @@ mod transport_tests {
 
         for i in 0..10u64 {
             sender
-                .send_payload(DataflowId::from_bytes([1u8; 16]), i, format!("msg-{i}").into_bytes())
+                .send_payload(
+                    DataflowId::from_bytes([1u8; 16]),
+                    i,
+                    format!("msg-{i}").into_bytes(),
+                )
                 .await
                 .unwrap();
         }
@@ -860,8 +864,14 @@ mod transport_tests {
 
         let muxer_handle = tokio::spawn(async move { muxer.run().await });
 
-        sender.send_payload(DataflowId::from_bytes([1u8; 16]), 1, b"from-1".to_vec()).await.unwrap();
-        sender2.send_payload(DataflowId::from_bytes([1u8; 16]), 2, b"from-2".to_vec()).await.unwrap();
+        sender
+            .send_payload(DataflowId::from_bytes([1u8; 16]), 1, b"from-1".to_vec())
+            .await
+            .unwrap();
+        sender2
+            .send_payload(DataflowId::from_bytes([1u8; 16]), 2, b"from-2".to_vec())
+            .await
+            .unwrap();
         drop(sender);
         drop(sender2);
 
@@ -886,7 +896,9 @@ mod transport_tests {
         drop(muxer);
 
         // Sending should fail
-        let result = sender.send_payload(DataflowId::from_bytes([1u8; 16]), 1, b"late".to_vec()).await;
+        let result = sender
+            .send_payload(DataflowId::from_bytes([1u8; 16]), 1, b"late".to_vec())
+            .await;
         assert!(matches!(result, Err(TransportError::MuxerShutdown)));
     }
 
@@ -916,12 +928,20 @@ mod transport_tests {
 
         // A sends to B on channel 200
         sender_a
-            .send_payload(DataflowId::from_bytes([1u8; 16]), 200, b"hello from A".to_vec())
+            .send_payload(
+                DataflowId::from_bytes([1u8; 16]),
+                200,
+                b"hello from A".to_vec(),
+            )
             .await
             .unwrap();
         // B sends to A on channel 100
         sender_b
-            .send_payload(DataflowId::from_bytes([1u8; 16]), 100, b"hello from B".to_vec())
+            .send_payload(
+                DataflowId::from_bytes([1u8; 16]),
+                100,
+                b"hello from B".to_vec(),
+            )
             .await
             .unwrap();
 

@@ -107,8 +107,8 @@ where
     }
 }
 
-impl<TOuter, TInner, TSummaryOuter, TSummaryInner>
-    PathSummary<Product<TOuter, TInner>> for Product<TSummaryOuter, TSummaryInner>
+impl<TOuter, TInner, TSummaryOuter, TSummaryInner> PathSummary<Product<TOuter, TInner>>
+    for Product<TSummaryOuter, TSummaryInner>
 where
     TOuter: Timestamp<Summary = TSummaryOuter>,
     TInner: Timestamp<Summary = TSummaryInner>,
@@ -175,7 +175,11 @@ mod tests {
                 assert!(
                     r1.less_equal(&r2),
                     "monotonicity failed: summary {:?} applied to {:?} gave {:?}, applied to {:?} gave {:?}",
-                    summary, t1, r1, t2, r2
+                    summary,
+                    t1,
+                    r1,
+                    t2,
+                    r2
                 );
             }
         }

@@ -113,7 +113,10 @@ pub struct NodeConfig {
 impl NodeConfig {
     /// Create a new node config.
     pub fn new(node_id: impl Into<String>, logical_workers: usize) -> Self {
-        Self { node_id: node_id.into(), logical_workers }
+        Self {
+            node_id: node_id.into(),
+            logical_workers,
+        }
     }
 }
 
@@ -316,7 +319,10 @@ mod tests {
         .unwrap();
 
         let w0 = topo.workers_for_node("node-0");
-        assert_eq!(w0, vec![WorkerId::new(0), WorkerId::new(1), WorkerId::new(2)]);
+        assert_eq!(
+            w0,
+            vec![WorkerId::new(0), WorkerId::new(1), WorkerId::new(2)]
+        );
 
         let w1 = topo.workers_for_node("node-1");
         assert_eq!(w1, vec![WorkerId::new(3), WorkerId::new(4)]);
@@ -401,7 +407,9 @@ mod tests {
     fn execute_rejects_zero_workers() {
         let runtime = ExecutionConfig::default();
         let df = DataflowConfig {
-            topology: ClusterTopology { nodes: vec![NodeConfig::new("node-0", 0)] },
+            topology: ClusterTopology {
+                nodes: vec![NodeConfig::new("node-0", 0)],
+            },
             error_policy: ErrorPolicy::Stop,
             cancellation_token: CancellationToken::new(),
             batching_policy: BatchingPolicy::default(),

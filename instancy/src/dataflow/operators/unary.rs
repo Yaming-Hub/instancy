@@ -7,9 +7,9 @@
 use std::fmt;
 
 use crate::dataflow::operators::handles::{InputHandle, OutputHandle};
-use crate::dataflow::region::RegionId;
 use crate::dataflow::scope::Scope;
-use crate::dataflow::stream::{StreamEdge, Slot};
+use crate::dataflow::stage::StageId;
+use crate::dataflow::stream::{Slot, StreamEdge};
 use crate::error::Result;
 use crate::progress::timestamp::Timestamp;
 
@@ -22,8 +22,8 @@ pub struct UnaryOperator<T: Timestamp, D1, D2> {
     name: String,
     /// Operator index within the scope.
     index: usize,
-    /// The execution region this operator belongs to.
-    region_id: RegionId,
+    /// The execution stage this operator belongs to.
+    stage_id: StageId,
     /// The operator's input handle.
     input: InputHandle<T, D1>,
     /// The operator's output handle.
@@ -34,12 +34,7 @@ pub struct UnaryOperator<T: Timestamp, D1, D2> {
 
 impl<T: Timestamp, D1, D2> UnaryOperator<T, D1, D2> {
     /// Create a new unary operator.
-    pub fn new<L>(
-        name: impl Into<String>,
-        index: usize,
-        region_id: RegionId,
-        logic: L,
-    ) -> Self
+    pub fn new<L>(name: impl Into<String>, index: usize, stage_id: StageId, logic: L) -> Self
     where
         L: FnMut(&mut InputHandle<T, D1>, &mut OutputHandle<T, D2>) -> Result<()> + Send + 'static,
     {
@@ -49,7 +44,7 @@ impl<T: Timestamp, D1, D2> UnaryOperator<T, D1, D2> {
             output: OutputHandle::new(format!("{name}:output")),
             name,
             index,
-            region_id,
+            stage_id,
             logic: Box::new(logic),
         }
     }
@@ -64,9 +59,9 @@ impl<T: Timestamp, D1, D2> UnaryOperator<T, D1, D2> {
         self.index
     }
 
-    /// Get the region ID.
-    pub fn region_id(&self) -> RegionId {
-        self.region_id
+    /// Get the stage ID.
+    pub fn stage_id(&self) -> StageId {
+        self.stage_id
     }
 
     /// Get a mutable reference to the input handle.
@@ -110,7 +105,7 @@ impl<T: Timestamp, D1, D2> fmt::Debug for UnaryOperator<T, D1, D2> {
         f.debug_struct("UnaryOperator")
             .field("name", &self.name)
             .field("index", &self.index)
-            .field("region_id", &self.region_id)
+            .field("stage_id", &self.stage_id)
             .finish()
     }
 }
@@ -134,52 +129,52 @@ pub trait UnaryExt<S: Scope, D1> {
     ///     Ok(())
     /// });
     /// ```
-    fn unary<D2, L>(
-        &self,
-        name: &str,
-        logic: L,
-    ) -> StreamEdge<S, D2>
+    fn unary<D2, L>(&self, name: &str, logic: L) -> StreamEdge<S, D2>
     where
         D2: 'static,
-        L: FnMut(&mut InputHandle<S::Timestamp, D1>, &mut OutputHandle<S::Timestamp, D2>) -> Result<()>
+        L: FnMut(
+                &mut InputHandle<S::Timestamp, D1>,
+                &mut OutputHandle<S::Timestamp, D2>,
+            ) -> Result<()>
             + Send
             + 'static;
 }
 
 impl<S: Scope, D1: 'static> UnaryExt<S, D1> for StreamEdge<S, D1> {
-    fn unary<D2, L>(
-        &self,
-        name: &str,
-        logic: L,
-    ) -> StreamEdge<S, D2>
+    fn unary<D2, L>(&self, name: &str, logic: L) -> StreamEdge<S, D2>
     where
         D2: 'static,
-        L: FnMut(&mut InputHandle<S::Timestamp, D1>, &mut OutputHandle<S::Timestamp, D2>) -> Result<()>
+        L: FnMut(
+                &mut InputHandle<S::Timestamp, D1>,
+                &mut OutputHandle<S::Timestamp, D2>,
+            ) -> Result<()>
             + Send
             + 'static,
     {
         let mut scope = self.scope().clone();
         let op_index = scope.allocate_operator_index();
-        let region_id = self.region_id();
+        let stage_id = self.stage_id();
         let source_slot = *self.source();
         let output_slot = Slot::new(op_index, 0);
 
         // Register operator and edge in the dataflow graph.
-        scope.register_operator(crate::dataflow::graph::OperatorInfo::new(
-            op_index, name, region_id, 1, 1,
-        )).expect("operator index should be unique");
+        scope
+            .register_operator(crate::dataflow::graph::OperatorInfo::new(
+                op_index, name, stage_id, 1, 1,
+            ))
+            .expect("operator index should be unique");
         scope.add_edge(crate::dataflow::graph::EdgeInfo::new(
             source_slot,
             Slot::new(op_index, 0),
-            self.region_id(),
-            region_id,
+            self.stage_id(),
+            stage_id,
         ));
 
         // Create the operator for validation. The runtime will
         // re-create it with channel wiring during materialization.
-        let _operator = UnaryOperator::new(name, op_index, region_id, logic);
+        let _operator = UnaryOperator::new(name, op_index, stage_id, logic);
 
-        StreamEdge::new(scope, output_slot, region_id)
+        StreamEdge::new(scope, output_slot, stage_id)
     }
 }
 
@@ -191,11 +186,8 @@ mod tests {
 
     #[test]
     fn unary_operator_creation() {
-        let op = UnaryOperator::<u64, i32, i32>::new(
-            "double",
-            0,
-            RegionId::new(0),
-            |input, output| {
+        let op =
+            UnaryOperator::<u64, i32, i32>::new("double", 0, StageId::new(0), |input, output| {
                 while let Some((time, data)) = input.next() {
                     let mut session = output.session(time);
                     for item in data {
@@ -203,21 +195,17 @@ mod tests {
                     }
                 }
                 Ok(())
-            },
-        );
+            });
 
         assert_eq!(op.name(), "double");
         assert_eq!(op.index(), 0);
-        assert_eq!(op.region_id(), RegionId::new(0));
+        assert_eq!(op.stage_id(), StageId::new(0));
     }
 
     #[test]
     fn unary_operator_identity_passthrough() {
-        let mut op = UnaryOperator::<u64, i32, i32>::new(
-            "identity",
-            0,
-            RegionId::new(0),
-            |input, output| {
+        let mut op =
+            UnaryOperator::<u64, i32, i32>::new("identity", 0, StageId::new(0), |input, output| {
                 while let Some((time, data)) = input.next() {
                     let mut session = output.session(time);
                     for item in data {
@@ -225,8 +213,7 @@ mod tests {
                     }
                 }
                 Ok(())
-            },
-        );
+            });
 
         op.input_mut().push_vec(1, vec![10, 20, 30]);
         op.input_mut().push_vec(2, vec![40]);
@@ -244,7 +231,7 @@ mod tests {
         let mut op = UnaryOperator::<u64, i32, String>::new(
             "to_string",
             0,
-            RegionId::new(0),
+            StageId::new(0),
             |input, output| {
                 while let Some((time, data)) = input.next() {
                     let mut session = output.session(time);
@@ -269,7 +256,7 @@ mod tests {
         let mut op = UnaryOperator::<u64, i32, i64>::new(
             "running_sum",
             0,
-            RegionId::new(0),
+            StageId::new(0),
             move |input, output| {
                 while let Some((time, data)) = input.next() {
                     for item in data {
@@ -298,7 +285,7 @@ mod tests {
         let mut op = UnaryOperator::<u64, i32, i32>::new(
             "failing_op",
             0,
-            RegionId::new(0),
+            StageId::new(0),
             |input, _output| {
                 while let Some((_time, data)) = input.next() {
                     if data.contains(&-1) {
@@ -320,7 +307,7 @@ mod tests {
         let mut op = UnaryOperator::<u64, i32, i32>::new(
             "filter_even",
             0,
-            RegionId::new(0),
+            StageId::new(0),
             |input, output| {
                 while let Some((time, data)) = input.next() {
                     let mut session = output.session(time);
@@ -343,11 +330,8 @@ mod tests {
 
     #[test]
     fn unary_operator_flatmap() {
-        let mut op = UnaryOperator::<u64, i32, i32>::new(
-            "flatmap",
-            0,
-            RegionId::new(0),
-            |input, output| {
+        let mut op =
+            UnaryOperator::<u64, i32, i32>::new("flatmap", 0, StageId::new(0), |input, output| {
                 while let Some((time, data)) = input.next() {
                     let mut session = output.session(time);
                     for item in data {
@@ -357,8 +341,7 @@ mod tests {
                     }
                 }
                 Ok(())
-            },
-        );
+            });
 
         op.input_mut().push_vec(1, vec![3]);
         op.activate().unwrap();
@@ -369,11 +352,8 @@ mod tests {
 
     #[test]
     fn unary_operator_empty_input() {
-        let mut op = UnaryOperator::<u64, i32, i32>::new(
-            "noop",
-            0,
-            RegionId::new(0),
-            |input, output| {
+        let mut op =
+            UnaryOperator::<u64, i32, i32>::new("noop", 0, StageId::new(0), |input, output| {
                 while let Some((time, data)) = input.next() {
                     let mut session = output.session(time);
                     for item in data {
@@ -381,8 +361,7 @@ mod tests {
                     }
                 }
                 Ok(())
-            },
-        );
+            });
 
         // No input pushed
         let count = op.activate().unwrap();
@@ -391,12 +370,10 @@ mod tests {
 
     #[test]
     fn unary_operator_is_done() {
-        let mut op = UnaryOperator::<u64, i32, i32>::new(
-            "test",
-            0,
-            RegionId::new(0),
-            |_input, _output| Ok(()),
-        );
+        let mut op =
+            UnaryOperator::<u64, i32, i32>::new("test", 0, StageId::new(0), |_input, _output| {
+                Ok(())
+            });
 
         assert!(!op.is_done());
         op.input_mut().mark_exhausted();
@@ -406,11 +383,11 @@ mod tests {
     #[test]
     fn unary_ext_produces_stream() {
         let mut scope = RootScope::<u64>::new("test", 4);
-        let region_id = scope.current_region().id();
+        let stage_id = scope.current_stage_id();
         // Allocate index 0 for the "source" operator
         let src_idx = scope.allocate_operator_index();
         let source = Slot::new(src_idx, 0);
-        let stream: StreamEdge<RootScope<u64>, i32> = StreamEdge::new(scope, source, region_id);
+        let stream: StreamEdge<RootScope<u64>, i32> = StreamEdge::new(scope, source, stage_id);
 
         let output: StreamEdge<RootScope<u64>, i32> = stream.unary("double", |input, output| {
             while let Some((time, data)) = input.next() {
@@ -422,19 +399,19 @@ mod tests {
             Ok(())
         });
 
-        // The output stream should be in the same region with operator index 2
+        // The output stream should be in the same stage with operator index 2
         // (index 0 reserved, source at 1, unary at 2)
-        assert_eq!(output.region_id(), region_id);
+        assert_eq!(output.stage_id(), stage_id);
         assert_eq!(output.source().operator_index, 2);
     }
 
     #[test]
     fn unary_ext_chained() {
         let mut scope = RootScope::<u64>::new("test", 4);
-        let region_id = scope.current_region().id();
+        let stage_id = scope.current_stage_id();
         let src_idx = scope.allocate_operator_index();
         let source = Slot::new(src_idx, 0);
-        let stream: StreamEdge<RootScope<u64>, i32> = StreamEdge::new(scope, source, region_id);
+        let stream: StreamEdge<RootScope<u64>, i32> = StreamEdge::new(scope, source, stage_id);
 
         let result = stream
             .unary("add_one", |input, output| {

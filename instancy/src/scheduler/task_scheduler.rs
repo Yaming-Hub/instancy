@@ -2,14 +2,14 @@
 //!
 //! The [`TaskScheduler`] ensures:
 //! - FIFO ordering within each logical worker
-//! - Per-region concurrency limits (at most N tasks from a region run concurrently)
+//! - Per-stage concurrency limits (at most N tasks from a stage run concurrently)
 //! - Dispatch only when a worker has no in-flight task
 
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
-use crate::dataflow::region::RegionId;
+use crate::dataflow::stage::StageId;
 use crate::worker::{OperatorActivation, WorkerId};
 
 /// A compute task ready for dispatch to the physical worker thread pool.
@@ -20,30 +20,30 @@ use crate::worker::{OperatorActivation, WorkerId};
 pub struct ComputeTask {
     /// The logical activation to execute.
     pub activation: OperatorActivation,
-    /// Logical region this task belongs to (for concurrency limiting).
-    pub region_id: RegionId,
-    /// Shared permit tracker for the region.
-    pub(crate) region_permit: Arc<RegionPermit>,
+    /// Logical stage this task belongs to (for concurrency limiting).
+    pub stage_id: StageId,
+    /// Shared permit tracker for the stage.
+    pub(crate) stage_permit: Arc<StagePermit>,
 }
 
 impl ComputeTask {
-    /// Execute this task, releasing the region permit when done.
+    /// Execute this task, releasing the stage permit when done.
     pub fn execute(self) {
         self.activation.execute();
-        self.region_permit.release();
+        self.stage_permit.release();
     }
 }
 
-/// Tracks concurrent task count for a region.
-pub struct RegionPermit {
-    /// Current number of in-flight tasks for this region.
+/// Tracks concurrent task count for a stage.
+pub struct StagePermit {
+    /// Current number of in-flight tasks for this stage.
     in_flight: AtomicUsize,
     /// Maximum concurrent tasks allowed.
     max_concurrent: usize,
 }
 
-impl RegionPermit {
-    /// Create a new region permit with the given concurrency limit.
+impl StagePermit {
+    /// Create a new stage permit with the given concurrency limit.
     pub fn new(max_concurrent: usize) -> Self {
         Self {
             in_flight: AtomicUsize::new(0),
@@ -58,7 +58,8 @@ impl RegionPermit {
             if current >= self.max_concurrent {
                 return false;
             }
-            if self.in_flight
+            if self
+                .in_flight
                 .compare_exchange_weak(current, current + 1, Ordering::AcqRel, Ordering::Relaxed)
                 .is_ok()
             {
@@ -86,7 +87,7 @@ impl RegionPermit {
 /// Per-worker queue state.
 struct WorkerQueue {
     /// Pending activations for this worker (FIFO).
-    queue: VecDeque<(OperatorActivation, RegionId)>,
+    queue: VecDeque<(OperatorActivation, StageId)>,
     /// Whether this worker has a task currently in-flight.
     has_in_flight: bool,
 }
@@ -103,8 +104,8 @@ impl WorkerQueue {
 /// Configuration for the task scheduler.
 #[derive(Debug, Clone)]
 pub struct SchedulerConfig {
-    /// Default concurrency limit for regions without explicit config.
-    pub default_region_concurrency: usize,
+    /// Default concurrency limit for stages without explicit config.
+    pub default_stage_concurrency: usize,
 }
 
 impl Default for SchedulerConfig {
@@ -113,19 +114,19 @@ impl Default for SchedulerConfig {
             .map(|n| n.get())
             .unwrap_or(4);
         Self {
-            default_region_concurrency: cpus,
+            default_stage_concurrency: cpus,
         }
     }
 }
 
 /// Task scheduler that manages dispatch of operator activations.
 ///
-/// Ensures FIFO per-worker ordering and per-region concurrency limits.
+/// Ensures FIFO per-worker ordering and per-stage concurrency limits.
 pub struct TaskScheduler {
     /// Per-worker queues, indexed by worker ID.
     worker_queues: Mutex<Vec<WorkerQueue>>,
-    /// Per-region permits, indexed by region ID.
-    region_permits: Mutex<Vec<Arc<RegionPermit>>>,
+    /// Per-stage permits, indexed by stage ID.
+    stage_permits: Mutex<Vec<Arc<StagePermit>>>,
     /// Configuration.
     config: SchedulerConfig,
     /// Total tasks enqueued.
@@ -139,19 +140,15 @@ impl TaskScheduler {
     pub fn new(config: SchedulerConfig) -> Self {
         Self {
             worker_queues: Mutex::new(Vec::new()),
-            region_permits: Mutex::new(Vec::new()),
+            stage_permits: Mutex::new(Vec::new()),
             config,
             tasks_enqueued: AtomicUsize::new(0),
             tasks_dispatched: AtomicUsize::new(0),
         }
     }
 
-    /// Enqueue an operator activation for a specific worker and region.
-    pub fn enqueue(
-        &self,
-        activation: OperatorActivation,
-        region_id: RegionId,
-    ) {
+    /// Enqueue an operator activation for a specific worker and stage.
+    pub fn enqueue(&self, activation: OperatorActivation, stage_id: StageId) {
         let worker_idx = activation.worker_id.index();
         {
             let mut queues = self.worker_queues.lock().unwrap_or_else(|e| e.into_inner());
@@ -159,7 +156,7 @@ impl TaskScheduler {
             while queues.len() <= worker_idx {
                 queues.push(WorkerQueue::new());
             }
-            queues[worker_idx].queue.push_back((activation, region_id));
+            queues[worker_idx].queue.push_back((activation, stage_id));
         }
         self.tasks_enqueued.fetch_add(1, Ordering::Relaxed);
     }
@@ -168,27 +165,27 @@ impl TaskScheduler {
     ///
     /// A task is ready when:
     /// 1. Its worker has no in-flight task (FIFO ordering)
-    /// 2. The region has available concurrency permits
+    /// 2. The stage has available concurrency permits
     pub fn dispatch_ready(&self) -> Vec<ComputeTask> {
         let mut ready = Vec::new();
         let mut queues = self.worker_queues.lock().unwrap_or_else(|e| e.into_inner());
-        let mut permits = self.region_permits.lock().unwrap_or_else(|e| e.into_inner());
+        let mut permits = self.stage_permits.lock().unwrap_or_else(|e| e.into_inner());
 
         for queue in queues.iter_mut() {
             if queue.has_in_flight {
                 continue; // Worker busy
             }
-            if let Some((_, region_id)) = queue.queue.front() {
-                let region_id = *region_id;
-                let permit = self.ensure_permit(&mut permits, region_id);
+            if let Some((_, stage_id)) = queue.queue.front() {
+                let stage_id = *stage_id;
+                let permit = self.ensure_permit(&mut permits, stage_id);
                 if permit.try_acquire() {
-                    let (activation, region_id) = queue.queue.pop_front().unwrap();
+                    let (activation, stage_id) = queue.queue.pop_front().unwrap();
                     queue.has_in_flight = true;
-                    let _ = region_id; // already used above
+                    let _ = stage_id; // already used above
                     ready.push(ComputeTask {
                         activation,
-                        region_id,
-                        region_permit: permit,
+                        stage_id,
+                        stage_permit: permit,
                     });
                     self.tasks_dispatched.fetch_add(1, Ordering::Relaxed);
                 }
@@ -207,16 +204,16 @@ impl TaskScheduler {
         }
     }
 
-    /// Set the concurrency limit for a specific region.
-    pub fn set_region_concurrency(&self, region_id: RegionId, max_concurrent: usize) {
-        let mut permits = self.region_permits.lock().unwrap_or_else(|e| e.into_inner());
-        let idx = region_id.0;
+    /// Set the concurrency limit for a specific stage.
+    pub fn set_stage_concurrency(&self, stage_id: StageId, max_concurrent: usize) {
+        let mut permits = self.stage_permits.lock().unwrap_or_else(|e| e.into_inner());
+        let idx = stage_id.0;
         while permits.len() <= idx {
-            permits.push(Arc::new(RegionPermit::new(
-                self.config.default_region_concurrency,
+            permits.push(Arc::new(StagePermit::new(
+                self.config.default_stage_concurrency,
             )));
         }
-        permits[idx] = Arc::new(RegionPermit::new(max_concurrent));
+        permits[idx] = Arc::new(StagePermit::new(max_concurrent));
     }
 
     /// Get the number of pending tasks across all workers.
@@ -235,17 +232,17 @@ impl TaskScheduler {
         self.tasks_dispatched.load(Ordering::Relaxed)
     }
 
-    /// Ensure a region permit exists and return it.
+    /// Ensure a stage permit exists and return it.
     /// Grows the permits vector if needed, storing the default permit.
     fn ensure_permit(
         &self,
-        permits: &mut Vec<Arc<RegionPermit>>,
-        region_id: RegionId,
-    ) -> Arc<RegionPermit> {
-        let idx = region_id.0;
+        permits: &mut Vec<Arc<StagePermit>>,
+        stage_id: StageId,
+    ) -> Arc<StagePermit> {
+        let idx = stage_id.0;
         while permits.len() <= idx {
-            permits.push(Arc::new(RegionPermit::new(
-                self.config.default_region_concurrency,
+            permits.push(Arc::new(StagePermit::new(
+                self.config.default_stage_concurrency,
             )));
         }
         permits[idx].clone()
@@ -263,14 +260,14 @@ mod tests {
     #[test]
     fn fifo_ordering_within_worker() {
         let scheduler = TaskScheduler::new(SchedulerConfig {
-            default_region_concurrency: 10,
+            default_stage_concurrency: 10,
         });
-        let region = RegionId(0);
+        let stage = StageId(0);
 
         // Enqueue 3 tasks for worker 0
-        scheduler.enqueue(make_activation(0, "first"), region);
-        scheduler.enqueue(make_activation(0, "second"), region);
-        scheduler.enqueue(make_activation(0, "third"), region);
+        scheduler.enqueue(make_activation(0, "first"), stage);
+        scheduler.enqueue(make_activation(0, "second"), stage);
+        scheduler.enqueue(make_activation(0, "third"), stage);
 
         // First dispatch should get only "first"
         let ready = scheduler.dispatch_ready();
@@ -293,32 +290,32 @@ mod tests {
     #[test]
     fn multiple_workers_dispatch_independently() {
         let scheduler = TaskScheduler::new(SchedulerConfig {
-            default_region_concurrency: 10,
+            default_stage_concurrency: 10,
         });
-        let region = RegionId(0);
+        let stage = StageId(0);
 
-        scheduler.enqueue(make_activation(0, "w0_task"), region);
-        scheduler.enqueue(make_activation(1, "w1_task"), region);
-        scheduler.enqueue(make_activation(2, "w2_task"), region);
+        scheduler.enqueue(make_activation(0, "w0_task"), stage);
+        scheduler.enqueue(make_activation(1, "w1_task"), stage);
+        scheduler.enqueue(make_activation(2, "w2_task"), stage);
 
         let ready = scheduler.dispatch_ready();
         assert_eq!(ready.len(), 3);
     }
 
     #[test]
-    fn region_concurrency_limit() {
+    fn stage_concurrency_limit() {
         let scheduler = TaskScheduler::new(SchedulerConfig {
-            default_region_concurrency: 2,
+            default_stage_concurrency: 2,
         });
-        let region = RegionId(0);
-        scheduler.set_region_concurrency(region, 2);
+        let stage = StageId(0);
+        scheduler.set_stage_concurrency(stage, 2);
 
-        // Enqueue tasks for 4 different workers in same region
+        // Enqueue tasks for 4 different workers in same stage
         for i in 0..4 {
-            scheduler.enqueue(make_activation(i, &format!("task_{i}")), region);
+            scheduler.enqueue(make_activation(i, &format!("task_{i}")), stage);
         }
 
-        // Only 2 should be dispatched (region limit)
+        // Only 2 should be dispatched (stage limit)
         let ready = scheduler.dispatch_ready();
         assert_eq!(ready.len(), 2);
 
@@ -328,15 +325,15 @@ mod tests {
     }
 
     #[test]
-    fn region_permit_release_allows_more() {
+    fn stage_permit_release_allows_more() {
         let scheduler = TaskScheduler::new(SchedulerConfig {
-            default_region_concurrency: 1,
+            default_stage_concurrency: 1,
         });
-        let region = RegionId(0);
-        scheduler.set_region_concurrency(region, 1);
+        let stage = StageId(0);
+        scheduler.set_stage_concurrency(stage, 1);
 
-        scheduler.enqueue(make_activation(0, "first"), region);
-        scheduler.enqueue(make_activation(1, "second"), region);
+        scheduler.enqueue(make_activation(0, "first"), stage);
+        scheduler.enqueue(make_activation(1, "second"), stage);
 
         let ready = scheduler.dispatch_ready();
         assert_eq!(ready.len(), 1);
@@ -357,16 +354,16 @@ mod tests {
     #[test]
     fn dispatch_only_when_no_in_flight() {
         let scheduler = TaskScheduler::new(SchedulerConfig {
-            default_region_concurrency: 100,
+            default_stage_concurrency: 100,
         });
-        let region = RegionId(0);
+        let stage = StageId(0);
 
-        scheduler.enqueue(make_activation(0, "task_a"), region);
+        scheduler.enqueue(make_activation(0, "task_a"), stage);
         let ready = scheduler.dispatch_ready();
         assert_eq!(ready.len(), 1);
 
         // Worker 0 has in-flight task — enqueue more, but they shouldn't dispatch
-        scheduler.enqueue(make_activation(0, "task_b"), region);
+        scheduler.enqueue(make_activation(0, "task_b"), stage);
         let ready = scheduler.dispatch_ready();
         assert_eq!(ready.len(), 0);
 
@@ -380,11 +377,11 @@ mod tests {
     #[test]
     fn pending_tasks_count() {
         let scheduler = TaskScheduler::new(SchedulerConfig::default());
-        let region = RegionId(0);
+        let stage = StageId(0);
 
         assert_eq!(scheduler.pending_tasks(), 0);
-        scheduler.enqueue(make_activation(0, "a"), region);
-        scheduler.enqueue(make_activation(1, "b"), region);
+        scheduler.enqueue(make_activation(0, "a"), stage);
+        scheduler.enqueue(make_activation(1, "b"), stage);
         assert_eq!(scheduler.pending_tasks(), 2);
 
         scheduler.dispatch_ready();
@@ -394,12 +391,12 @@ mod tests {
     #[test]
     fn metrics_tracking() {
         let scheduler = TaskScheduler::new(SchedulerConfig {
-            default_region_concurrency: 10,
+            default_stage_concurrency: 10,
         });
-        let region = RegionId(0);
+        let stage = StageId(0);
 
-        scheduler.enqueue(make_activation(0, "x"), region);
-        scheduler.enqueue(make_activation(1, "y"), region);
+        scheduler.enqueue(make_activation(0, "x"), stage);
+        scheduler.enqueue(make_activation(1, "y"), stage);
         assert_eq!(scheduler.total_enqueued(), 2);
         assert_eq!(scheduler.total_dispatched(), 0);
 

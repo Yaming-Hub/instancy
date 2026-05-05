@@ -23,7 +23,10 @@ fn main() {
     let input = builder.source(
         "events",
         vec![
-            (0u64, vec!["click", "view", "click", "purchase", "view", "click"]),
+            (
+                0u64,
+                vec!["click", "view", "click", "purchase", "view", "click"],
+            ),
             (1u64, vec!["login", "view", "click", "login", "purchase"]),
         ],
     );
@@ -55,7 +58,9 @@ fn main() {
         .output("unique_events");
 
     let dataflow = builder.build().expect("build failed");
-    SimpleRuntime::new().run(dataflow).expect("execution failed");
+    SimpleRuntime::new()
+        .run(dataflow)
+        .expect("execution failed");
 
     let collector = port.collector();
     let data = collector.lock().unwrap();

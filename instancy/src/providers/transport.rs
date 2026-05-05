@@ -3,12 +3,12 @@
 //! The [`TransportProvider`] resolves logical targets to physical delivery
 //! mechanisms for data exchange between operators.
 
+use std::collections::VecDeque;
 use std::fmt;
 use std::sync::{Arc, Mutex};
-use std::collections::VecDeque;
 
 use crate::dataflow::channels::envelope::Envelope;
-use crate::dataflow::region::RegionId;
+use crate::dataflow::stage::StageId;
 use crate::error::Error;
 use crate::execute::ClusterTopology;
 use crate::progress::timestamp::Timestamp;
@@ -16,15 +16,15 @@ use crate::worker::WorkerId;
 
 /// Identifies a logical destination for data delivery.
 ///
-/// This is a **logical** concept — it names the target by region, worker,
+/// This is a **logical** concept — it names the target by stage, worker,
 /// operator, and input slot in graph terms. The `TransportProvider` resolves
 /// a `LogicalTarget` to a physical delivery mechanism (in-memory buffer or
 /// remote TCP endpoint).
 #[derive(Debug, Clone, Hash, Eq, PartialEq)]
 pub struct LogicalTarget {
-    /// The logical execution region containing the target operator.
-    pub region: RegionId,
-    /// The logical worker index within the region.
+    /// The logical execution stage containing the target operator.
+    pub stage: StageId,
+    /// The logical worker index within the stage.
     pub worker: WorkerId,
     /// The logical operator index within the worker.
     pub operator: usize,
@@ -36,8 +36,11 @@ impl fmt::Display for LogicalTarget {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(
             f,
-            "Target(region={}, worker={}, op={}, slot={})",
-            self.region.0, self.worker.index(), self.operator, self.input_index
+            "Target(stage={}, worker={}, op={}, slot={})",
+            self.stage.0,
+            self.worker.index(),
+            self.operator,
+            self.input_index
         )
     }
 }
@@ -140,7 +143,10 @@ impl<T: Timestamp, D, M> Default for InMemoryPush<T, D, M> {
 impl<T: Timestamp, D, M> fmt::Debug for InMemoryPush<T, D, M> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("InMemoryPush")
-            .field("buffer_len", &self.buffer.lock().unwrap_or_else(|e| e.into_inner()).len())
+            .field(
+                "buffer_len",
+                &self.buffer.lock().unwrap_or_else(|e| e.into_inner()).len(),
+            )
             .field("closed", &self.is_closed())
             .finish()
     }
@@ -156,7 +162,10 @@ where
         if self.is_closed() {
             return Err(Error::ChannelClosed);
         }
-        self.buffer.lock().unwrap_or_else(|e| e.into_inner()).push_back(envelope);
+        self.buffer
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .push_back(envelope);
         Ok(())
     }
 
@@ -213,8 +222,7 @@ impl TransportProvider for InMemoryClusterTransport {
     fn is_local(&self, source: &LogicalTarget, target: &LogicalTarget) -> bool {
         let source_node = self.topology.node_for_worker(source.worker);
         let target_node = self.topology.node_for_worker(target.worker);
-        source_node == target_node
-            && source_node == Some(self.local_node_id.as_str())
+        source_node == target_node && source_node == Some(self.local_node_id.as_str())
     }
 }
 
@@ -223,9 +231,9 @@ mod tests {
     use super::*;
     use crate::dataflow::channels::envelope::Envelope;
 
-    fn make_target(region: usize, worker: usize, operator: usize, slot: usize) -> LogicalTarget {
+    fn make_target(stage: usize, worker: usize, operator: usize, slot: usize) -> LogicalTarget {
         LogicalTarget {
-            region: RegionId(region),
+            stage: StageId(stage),
             worker: WorkerId::new(worker),
             operator,
             input_index: slot,
@@ -236,7 +244,7 @@ mod tests {
     fn logical_target_display() {
         let t = make_target(1, 3, 5, 0);
         let s = format!("{t}");
-        assert!(s.contains("region=1"));
+        assert!(s.contains("stage=1"));
         assert!(s.contains("worker=3"));
         assert!(s.contains("op=5"));
         assert!(s.contains("slot=0"));
@@ -256,8 +264,7 @@ mod tests {
         let src = make_target(0, 0, 0, 0);
         let dst = make_target(0, 1, 1, 0);
 
-        let endpoint: Box<dyn PushEndpoint<u64, String, ()>> =
-            transport.resolve(&src, &dst);
+        let endpoint: Box<dyn PushEndpoint<u64, String, ()>> = transport.resolve(&src, &dst);
 
         let envelope = Envelope::data(42u64, vec!["hello".to_string()]);
         assert!(endpoint.push(envelope).is_ok());

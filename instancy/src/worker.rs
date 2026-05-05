@@ -124,11 +124,7 @@ impl WorkerContext {
 
 impl fmt::Display for WorkerContext {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(
-            f,
-            "Worker({}/{})",
-            self.worker_index, self.num_workers
-        )
+        write!(f, "Worker({}/{})", self.worker_index, self.num_workers)
     }
 }
 
@@ -225,12 +221,9 @@ mod tests {
         let executed = Arc::new(AtomicBool::new(false));
         let executed_clone = executed.clone();
 
-        let activation = OperatorActivation::new(
-            WorkerId::new(0),
-            "test_op",
-            0,
-            move || { executed_clone.store(true, Ordering::SeqCst); },
-        );
+        let activation = OperatorActivation::new(WorkerId::new(0), "test_op", 0, move || {
+            executed_clone.store(true, Ordering::SeqCst);
+        });
 
         assert!(!executed.load(Ordering::SeqCst));
         activation.execute();
@@ -239,12 +232,7 @@ mod tests {
 
     #[test]
     fn operator_activation_debug() {
-        let activation = OperatorActivation::new(
-            WorkerId::new(3),
-            "map_op",
-            5,
-            || {},
-        );
+        let activation = OperatorActivation::new(WorkerId::new(3), "map_op", 5, || {});
         let debug = format!("{activation:?}");
         assert!(debug.contains("WorkerId(3)"));
         assert!(debug.contains("map_op"));

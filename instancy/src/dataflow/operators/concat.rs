@@ -6,9 +6,9 @@
 use std::fmt;
 
 use crate::dataflow::operators::handles::{InputHandle, OutputHandle};
-use crate::dataflow::region::RegionId;
 use crate::dataflow::scope::Scope;
-use crate::dataflow::stream::{StreamEdge, Slot};
+use crate::dataflow::stage::StageId;
+use crate::dataflow::stream::{Slot, StreamEdge};
 use crate::error::Result;
 use crate::progress::timestamp::Timestamp;
 
@@ -18,8 +18,8 @@ pub struct ConcatOperator<T: Timestamp, D> {
     name: String,
     /// Operator index within the scope.
     index: usize,
-    /// The execution region.
-    region_id: RegionId,
+    /// The execution stage.
+    stage_id: StageId,
     /// Input handles — one per source stream.
     inputs: Vec<InputHandle<T, D>>,
     /// Single output handle.
@@ -31,7 +31,7 @@ impl<T: Timestamp, D> ConcatOperator<T, D> {
     pub fn new(
         name: impl Into<String>,
         index: usize,
-        region_id: RegionId,
+        stage_id: StageId,
         num_inputs: usize,
     ) -> Self {
         let name = name.into();
@@ -42,7 +42,7 @@ impl<T: Timestamp, D> ConcatOperator<T, D> {
             output: OutputHandle::new(format!("{name}:output")),
             name,
             index,
-            region_id,
+            stage_id,
             inputs,
         }
     }
@@ -57,9 +57,9 @@ impl<T: Timestamp, D> ConcatOperator<T, D> {
         self.index
     }
 
-    /// Get the region ID.
-    pub fn region_id(&self) -> RegionId {
-        self.region_id
+    /// Get the stage ID.
+    pub fn stage_id(&self) -> StageId {
+        self.stage_id
     }
 
     /// Get a mutable reference to an input handle by index.
@@ -108,7 +108,7 @@ impl<T: Timestamp, D> fmt::Debug for ConcatOperator<T, D> {
         f.debug_struct("ConcatOperator")
             .field("name", &self.name)
             .field("index", &self.index)
-            .field("region_id", &self.region_id)
+            .field("stage_id", &self.stage_id)
             .field("num_inputs", &self.inputs.len())
             .finish()
     }
@@ -123,54 +123,56 @@ pub trait ConcatExt<S: Scope, D> {
 impl<S: Scope, D: 'static> ConcatExt<S, D> for StreamEdge<S, D> {
     fn concat(&self, other: &StreamEdge<S, D>) -> StreamEdge<S, D> {
         debug_assert_eq!(
-            self.region_id(), other.region_id(),
-            "concat: both input streams must be in the same region"
+            self.stage_id(),
+            other.stage_id(),
+            "concat: both input streams must be in the same stage"
         );
 
         let mut scope = self.scope().clone();
         let op_index = scope.allocate_operator_index();
-        let region_id = self.region_id();
+        let stage_id = self.stage_id();
         let output_slot = Slot::new(op_index, 0);
 
         // Register operator (2 inputs, 1 output) and edges.
-        scope.register_operator(crate::dataflow::graph::OperatorInfo::new(
-            op_index, "concat", region_id, 2, 1,
-        )).expect("operator index should be unique");
+        scope
+            .register_operator(crate::dataflow::graph::OperatorInfo::new(
+                op_index, "concat", stage_id, 2, 1,
+            ))
+            .expect("operator index should be unique");
         scope.add_edge(crate::dataflow::graph::EdgeInfo::new(
             *self.source(),
             Slot::new(op_index, 0),
-            self.region_id(),
-            region_id,
+            self.stage_id(),
+            stage_id,
         ));
         scope.add_edge(crate::dataflow::graph::EdgeInfo::new(
             *other.source(),
             Slot::new(op_index, 1),
-            other.region_id(),
-            region_id,
+            other.stage_id(),
+            stage_id,
         ));
 
-        let _operator = ConcatOperator::<S::Timestamp, D>::new(
-            "concat",
-            op_index,
-            region_id,
-            2,
-        );
+        let _operator = ConcatOperator::<S::Timestamp, D>::new("concat", op_index, stage_id, 2);
 
-        StreamEdge::new(scope, output_slot, region_id)
+        StreamEdge::new(scope, output_slot, stage_id)
     }
 }
 
 /// Concatenate a vector of streams into one.
 ///
-/// All streams must belong to the same scope and region.
+/// All streams must belong to the same scope and stage.
 pub fn concatenate<S: Scope, D: 'static>(streams: &[StreamEdge<S, D>]) -> StreamEdge<S, D> {
-    assert!(!streams.is_empty(), "concatenate requires at least one stream");
+    assert!(
+        !streams.is_empty(),
+        "concatenate requires at least one stream"
+    );
 
-    let region_id = streams[0].region_id();
+    let stage_id = streams[0].stage_id();
     for (i, s) in streams.iter().enumerate().skip(1) {
         debug_assert_eq!(
-            s.region_id(), region_id,
-            "concatenate: stream {i} is in a different region than stream 0"
+            s.stage_id(),
+            stage_id,
+            "concatenate: stream {i} is in a different stage than stream 0"
         );
     }
 
@@ -179,26 +181,28 @@ pub fn concatenate<S: Scope, D: 'static>(streams: &[StreamEdge<S, D>]) -> Stream
     let output_slot = Slot::new(op_index, 0);
 
     // Register operator (N inputs, 1 output) and edges.
-    scope.register_operator(crate::dataflow::graph::OperatorInfo::new(
-        op_index, "concatenate", region_id, streams.len(), 1,
-    )).expect("operator index should be unique");
+    scope
+        .register_operator(crate::dataflow::graph::OperatorInfo::new(
+            op_index,
+            "concatenate",
+            stage_id,
+            streams.len(),
+            1,
+        ))
+        .expect("operator index should be unique");
     for (i, s) in streams.iter().enumerate() {
         scope.add_edge(crate::dataflow::graph::EdgeInfo::new(
             *s.source(),
             Slot::new(op_index, i),
-            s.region_id(),
-            region_id,
+            s.stage_id(),
+            stage_id,
         ));
     }
 
-    let _operator = ConcatOperator::<S::Timestamp, D>::new(
-        "concatenate",
-        op_index,
-        region_id,
-        streams.len(),
-    );
+    let _operator =
+        ConcatOperator::<S::Timestamp, D>::new("concatenate", op_index, stage_id, streams.len());
 
-    StreamEdge::new(scope, output_slot, region_id)
+    StreamEdge::new(scope, output_slot, stage_id)
 }
 
 #[cfg(test)]
@@ -208,14 +212,14 @@ mod tests {
 
     #[test]
     fn concat_operator_creation() {
-        let op = ConcatOperator::<u64, i32>::new("merge", 0, RegionId::new(0), 3);
+        let op = ConcatOperator::<u64, i32>::new("merge", 0, StageId::new(0), 3);
         assert_eq!(op.name(), "merge");
         assert_eq!(op.num_inputs(), 3);
     }
 
     #[test]
     fn concat_two_streams() {
-        let mut op = ConcatOperator::<u64, i32>::new("merge", 0, RegionId::new(0), 2);
+        let mut op = ConcatOperator::<u64, i32>::new("merge", 0, StageId::new(0), 2);
 
         op.input_mut(0).push_vec(1, vec![10, 20]);
         op.input_mut(1).push_vec(1, vec![30, 40]);
@@ -233,7 +237,7 @@ mod tests {
 
     #[test]
     fn concat_preserves_timestamps() {
-        let mut op = ConcatOperator::<u64, i32>::new("merge", 0, RegionId::new(0), 2);
+        let mut op = ConcatOperator::<u64, i32>::new("merge", 0, StageId::new(0), 2);
 
         op.input_mut(0).push_vec(5, vec![1]);
         op.input_mut(1).push_vec(10, vec![2]);
@@ -247,7 +251,7 @@ mod tests {
 
     #[test]
     fn concat_empty_streams() {
-        let mut op = ConcatOperator::<u64, i32>::new("merge", 0, RegionId::new(0), 3);
+        let mut op = ConcatOperator::<u64, i32>::new("merge", 0, StageId::new(0), 3);
 
         // No data on any input
         let count = op.activate().unwrap();
@@ -256,7 +260,7 @@ mod tests {
 
     #[test]
     fn concat_one_empty_one_full() {
-        let mut op = ConcatOperator::<u64, i32>::new("merge", 0, RegionId::new(0), 2);
+        let mut op = ConcatOperator::<u64, i32>::new("merge", 0, StageId::new(0), 2);
 
         // Only input 1 has data
         op.input_mut(1).push_vec(1, vec![99]);
@@ -269,7 +273,7 @@ mod tests {
 
     #[test]
     fn concat_n_streams() {
-        let mut op = ConcatOperator::<u64, i32>::new("merge_5", 0, RegionId::new(0), 5);
+        let mut op = ConcatOperator::<u64, i32>::new("merge_5", 0, StageId::new(0), 5);
 
         for i in 0..5 {
             op.input_mut(i).push_vec(1, vec![(i * 10) as i32]);
@@ -285,7 +289,7 @@ mod tests {
 
     #[test]
     fn concat_is_done() {
-        let mut op = ConcatOperator::<u64, i32>::new("merge", 0, RegionId::new(0), 2);
+        let mut op = ConcatOperator::<u64, i32>::new("merge", 0, StageId::new(0), 2);
 
         assert!(!op.is_done());
         op.input_mut(0).mark_exhausted();
@@ -297,13 +301,13 @@ mod tests {
     #[test]
     fn concat_ext_produces_stream() {
         let mut scope = RootScope::<u64>::new("test", 4);
-        let region_id = scope.current_region().id();
+        let stage_id = scope.current_stage_id();
         let s1 = scope.allocate_operator_index();
         let s2 = scope.allocate_operator_index();
         let stream1: StreamEdge<RootScope<u64>, i32> =
-            StreamEdge::new(scope.clone(), Slot::new(s1, 0), region_id);
+            StreamEdge::new(scope.clone(), Slot::new(s1, 0), stage_id);
         let stream2: StreamEdge<RootScope<u64>, i32> =
-            StreamEdge::new(scope, Slot::new(s2, 0), region_id);
+            StreamEdge::new(scope, Slot::new(s2, 0), stage_id);
 
         let output = stream1.concat(&stream2);
         assert_eq!(output.source().operator_index, 3); // 1, 2 for sources, 3 for concat
@@ -312,11 +316,11 @@ mod tests {
     #[test]
     fn concatenate_function_works() {
         let mut scope = RootScope::<u64>::new("test", 4);
-        let region_id = scope.current_region().id();
+        let stage_id = scope.current_stage_id();
         let streams: Vec<StreamEdge<RootScope<u64>, i32>> = (0..3)
             .map(|_| {
                 let idx = scope.allocate_operator_index();
-                StreamEdge::new(scope.clone(), Slot::new(idx, 0), region_id)
+                StreamEdge::new(scope.clone(), Slot::new(idx, 0), stage_id)
             })
             .collect();
 
@@ -333,7 +337,7 @@ mod tests {
 
     #[test]
     fn concat_multiple_activations() {
-        let mut op = ConcatOperator::<u64, i32>::new("merge", 0, RegionId::new(0), 2);
+        let mut op = ConcatOperator::<u64, i32>::new("merge", 0, StageId::new(0), 2);
 
         // First activation
         op.input_mut(0).push_vec(1, vec![10]);

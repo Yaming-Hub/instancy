@@ -16,8 +16,8 @@
 
 use std::collections::HashMap;
 
-use instancy::IterateResult;
 use instancy::DataflowBuilder;
+use instancy::IterateResult;
 use instancy::SimpleRuntime;
 
 /// Number of PageRank iterations.
@@ -34,15 +34,7 @@ fn main() {
     //
     // Node 0 links to 1; node 1 links to 2, 4; node 2 links to 5;
     // node 3 links to 0; node 4 links to 3, 5; node 5 has no outgoing edges (sink).
-    let edges: Vec<(u32, u32)> = vec![
-        (0, 1),
-        (1, 2),
-        (1, 4),
-        (2, 5),
-        (3, 0),
-        (4, 3),
-        (4, 5),
-    ];
+    let edges: Vec<(u32, u32)> = vec![(0, 1), (1, 2), (1, 4), (2, 5), (3, 0), (4, 3), (4, 5)];
 
     let num_nodes: u32 = 6;
 
@@ -67,44 +59,44 @@ fn main() {
 
             let computed =
                 ranks.unary::<(u32, f64, bool), _>("distribute", move |input, output| {
-                while let Some((time, data)) = input.next() {
-                    // Accumulate incoming rank contributions.
-                    let mut incoming: HashMap<u32, f64> = HashMap::new();
+                    while let Some((time, data)) = input.next() {
+                        // Accumulate incoming rank contributions.
+                        let mut incoming: HashMap<u32, f64> = HashMap::new();
 
-                    for (node, rank) in &data {
-                        if let Some(targets) = adj.get(node) {
-                            let share = rank / targets.len() as f64;
-                            for &dst in targets {
-                                *incoming.entry(dst).or_default() += share;
+                        for (node, rank) in &data {
+                            if let Some(targets) = adj.get(node) {
+                                let share = rank / targets.len() as f64;
+                                for &dst in targets {
+                                    *incoming.entry(dst).or_default() += share;
+                                }
                             }
+                            // Sink nodes (no outgoing): rank is lost (simplified model).
+                            // A full implementation would redistribute sink rank.
                         }
-                        // Sink nodes (no outgoing): rank is lost (simplified model).
-                        // A full implementation would redistribute sink rank.
+
+                        // Apply damping formula: rank(v) = (1 - d) / N + d * sum(incoming)
+                        let base = (1.0 - DAMPING) / n as f64;
+                        let new_ranks: Vec<(u32, f64)> = (0..n)
+                            .map(|node| {
+                                let contrib = incoming.get(&node).copied().unwrap_or(0.0);
+                                (node, base + DAMPING * contrib)
+                            })
+                            .collect();
+
+                        // Use the timestamp's inner value (iteration counter maintained by
+                        // iterate()) rather than a manual counter. This is correct regardless
+                        // of how many batches arrive per iteration round.
+                        let iter_round = time.inner;
+                        let is_feedback = iter_round < ITERATIONS;
+
+                        let tagged: Vec<(u32, f64, bool)> = new_ranks
+                            .into_iter()
+                            .map(|(n, r)| (n, r, is_feedback))
+                            .collect();
+                        output.push_vec(time, tagged);
                     }
-
-                    // Apply damping formula: rank(v) = (1 - d) / N + d * sum(incoming)
-                    let base = (1.0 - DAMPING) / n as f64;
-                    let new_ranks: Vec<(u32, f64)> = (0..n)
-                        .map(|node| {
-                            let contrib = incoming.get(&node).copied().unwrap_or(0.0);
-                            (node, base + DAMPING * contrib)
-                        })
-                        .collect();
-
-                    // Use the timestamp's inner value (iteration counter maintained by
-                    // iterate()) rather than a manual counter. This is correct regardless
-                    // of how many batches arrive per iteration round.
-                    let iter_round = time.inner;
-                    let is_feedback = iter_round < ITERATIONS;
-
-                    let tagged: Vec<(u32, f64, bool)> = new_ranks
-                        .into_iter()
-                        .map(|(n, r)| (n, r, is_feedback))
-                        .collect();
-                    output.push_vec(time, tagged);
-                }
-                Ok(())
-            });
+                    Ok(())
+                });
 
             let feedback = computed
                 .clone()
@@ -149,14 +141,15 @@ fn main() {
 
     // Verify: node 5 should have the highest rank (two incoming edges, no outgoing).
     // Ranks should sum to approximately 1.0 (with sink loss it may be less).
-    assert_eq!(ranks.len(), num_nodes as usize, "should have ranks for all nodes");
+    assert_eq!(
+        ranks.len(),
+        num_nodes as usize,
+        "should have ranks for all nodes"
+    );
 
     let node5_rank = ranks.iter().find(|(n, _)| *n == 5).unwrap().1;
     let max_rank = ranks.iter().map(|(_, r)| *r).fold(0.0_f64, f64::max);
-    assert_eq!(
-        node5_rank, max_rank,
-        "node 5 should have the highest rank"
-    );
+    assert_eq!(node5_rank, max_rank, "node 5 should have the highest rank");
 
     println!("\n✓ All assertions passed!");
 }

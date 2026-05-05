@@ -349,7 +349,8 @@ impl<T: Timestamp> ProgressTracker<T> {
         for (index, mut caps) in initial_caps {
             for (output, batch) in caps.iter_mut().enumerate() {
                 for (time, diff) in batch.drain() {
-                    self.tracker.update_source(index, output, time.clone(), diff);
+                    self.tracker
+                        .update_source(index, output, time.clone(), diff);
                     // Accumulate for broadcasting to peers.
                     self.local_changes_buffer.push((index, output, time, diff));
                 }
@@ -434,11 +435,7 @@ impl<T: Timestamp> ProgressTracker<T> {
         );
         // Initialize peer tracking: mark peers with receivers as "not yet heard from".
         // Slots with `None` (self or non-existent peers) are pre-marked as heard.
-        self.peers_heard_from = channels
-            .receivers
-            .iter()
-            .map(|r| r.is_none())
-            .collect();
+        self.peers_heard_from = channels.receivers.iter().map(|r| r.is_none()).collect();
         self.progress_channels = Some(channels);
     }
 
@@ -579,7 +576,8 @@ impl<T: Timestamp> ProgressTracker<T> {
             for output in 0..shape.outputs {
                 let changes = progress.internal[output].drain();
                 for (time, diff) in changes {
-                    self.tracker.update_source(index, output, time.clone(), diff);
+                    self.tracker
+                        .update_source(index, output, time.clone(), diff);
                     // Accumulate for cross-worker broadcast.
                     if has_channels {
                         self.local_changes_buffer.push((index, output, time, diff));
@@ -659,8 +657,9 @@ impl<T: Timestamp> ProgressTracker<T> {
             let mut changed = false;
 
             for input in 0..shape.inputs {
-                let new_frontier =
-                    Antichain::from_iter(self.tracker.target_frontier(index, input).iter().cloned());
+                let new_frontier = Antichain::from_iter(
+                    self.tracker.target_frontier(index, input).iter().cloned(),
+                );
                 if new_frontier != state.input_frontiers[input] {
                     state.input_frontiers[input] = new_frontier;
                     changed = true;
@@ -669,10 +668,7 @@ impl<T: Timestamp> ProgressTracker<T> {
 
             for output in 0..shape.outputs {
                 let new_frontier = Antichain::from_iter(
-                    self.tracker
-                        .source_frontier(index, output)
-                        .iter()
-                        .cloned(),
+                    self.tracker.source_frontier(index, output).iter().cloned(),
                 );
                 if new_frontier != state.output_frontiers[output] {
                     state.output_frontiers[output] = new_frontier;
@@ -714,13 +710,7 @@ mod tests {
 
         // Register N operators with identity connectivity.
         for i in 1..=n {
-            builder.add_operator(
-                i,
-                format!("op{i}"),
-                1,
-                1,
-                PortConnectivity::identity(0u64),
-            );
+            builder.add_operator(i, format!("op{i}"), 1, 1, PortConnectivity::identity(0u64));
         }
 
         // Wire: scope_input → op1 → op2 → ... → opN → scope_output
@@ -835,8 +825,7 @@ mod tests {
     fn tracker_capability_via_reporter() {
         // Build a simple 1-operator graph.
         let mut builder = SubgraphBuilder::<u64>::new(1, 1);
-        let progress =
-            builder.add_operator(1, "op1", 1, 1, PortConnectivity::identity(0u64));
+        let progress = builder.add_operator(1, "op1", 1, 1, PortConnectivity::identity(0u64));
         let reporter = progress.reporter(0).clone();
         builder.add_edge(Location::source(0, 0), Location::target(1, 0));
         builder.add_edge(Location::source(1, 0), Location::target(0, 0));
@@ -865,8 +854,7 @@ mod tests {
     #[test]
     fn tracker_capability_downgrade_advances_frontier() {
         let mut builder = SubgraphBuilder::<u64>::new(1, 1);
-        let progress =
-            builder.add_operator(1, "op1", 1, 1, PortConnectivity::identity(0u64));
+        let progress = builder.add_operator(1, "op1", 1, 1, PortConnectivity::identity(0u64));
         let reporter = progress.reporter(0).clone();
         builder.add_operator(2, "op2", 1, 1, PortConnectivity::identity(0u64));
         builder.add_edge(Location::source(0, 0), Location::target(1, 0));
@@ -906,8 +894,7 @@ mod tests {
     fn tracker_fan_out() {
         // One source, two consumers.
         let mut builder = SubgraphBuilder::<u64>::new(1, 1);
-        let progress =
-            builder.add_operator(1, "source", 1, 1, PortConnectivity::identity(0u64));
+        let progress = builder.add_operator(1, "source", 1, 1, PortConnectivity::identity(0u64));
         let reporter = progress.reporter(0).clone();
         builder.add_operator(2, "sink_a", 1, 1, PortConnectivity::identity(0u64));
         builder.add_operator(3, "sink_b", 1, 1, PortConnectivity::identity(0u64));
@@ -941,8 +928,7 @@ mod tests {
     #[test]
     fn tracker_dirty_operators_reported() {
         let mut builder = SubgraphBuilder::<u64>::new(1, 1);
-        let progress =
-            builder.add_operator(1, "op1", 1, 1, PortConnectivity::identity(0u64));
+        let progress = builder.add_operator(1, "op1", 1, 1, PortConnectivity::identity(0u64));
         let reporter = progress.reporter(0).clone();
         builder.add_operator(2, "op2", 1, 1, PortConnectivity::identity(0u64));
         builder.add_edge(Location::source(0, 0), Location::target(1, 0));
@@ -968,8 +954,7 @@ mod tests {
     #[test]
     fn tracker_multiple_capabilities() {
         let mut builder = SubgraphBuilder::<u64>::new(1, 1);
-        let progress =
-            builder.add_operator(1, "op1", 1, 1, PortConnectivity::identity(0u64));
+        let progress = builder.add_operator(1, "op1", 1, 1, PortConnectivity::identity(0u64));
         let reporter = progress.reporter(0).clone();
         builder.add_edge(Location::source(0, 0), Location::target(1, 0));
         builder.add_edge(Location::source(1, 0), Location::target(0, 0));

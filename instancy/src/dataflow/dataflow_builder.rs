@@ -34,32 +34,35 @@ use std::marker::PhantomData;
 use std::rc::Rc;
 use std::sync::{Arc, Mutex};
 
+use crate::dataflow::channel_operators::ChannelMode;
 use crate::dataflow::channels::bounded::bounded_channel_with_wake;
 use crate::dataflow::channels::pushpull::{Pull, Push};
 use crate::dataflow::channels::tee::tee_or_single;
 use crate::dataflow::channels::wake::WakeHandle;
-use crate::dataflow::channel_operators::ChannelMode;
 use crate::dataflow::context::SharedContext;
 use crate::dataflow::graph::DataflowGraph;
 use crate::dataflow::operators::handles::{InputHandle, NotifyContext, OutputHandle};
 use crate::dataflow::operators::input::InputEvent;
 use crate::dataflow::operators::output::OutputEvent;
 use crate::dataflow::probe::ProbeHandle;
-use crate::dataflow::region::RegionId;
 use crate::dataflow::schedulable::{
-    ChannelEndpoints, ChannelFactory, OperatorFactory, SchedulableOperator,
-    channel_factory, single_use_factory,
+    ChannelEndpoints, ChannelFactory, OperatorFactory, SchedulableOperator, channel_factory,
+    single_use_factory,
 };
+use crate::dataflow::stage::StageId;
 use crate::dataflow::stream::Slot;
-use crate::dataflow::wired_operators::{WiredBinaryOperator, WiredConcatOperator, WiredEnterOperator, WiredFeedbackOperator, WiredLeaveOperator, WiredSourceOperator, WiredUnaryOperator, WiredUnaryNotifyOperator};
+use crate::dataflow::wired_operators::{
+    WiredBinaryOperator, WiredConcatOperator, WiredEnterOperator, WiredFeedbackOperator,
+    WiredLeaveOperator, WiredSourceOperator, WiredUnaryNotifyOperator, WiredUnaryOperator,
+};
 use crate::error::{Error, Result};
-use crate::progress::frontier::Antichain;
+use crate::order::Product;
 use crate::progress::change_batch::ChangeBatch;
+use crate::progress::frontier::Antichain;
 use crate::progress::operate::PortConnectivity;
 use crate::progress::reachability::Location;
 use crate::progress::subgraph::SubgraphBuilder;
 use crate::progress::timestamp::Timestamp;
-use crate::order::Product;
 
 // ---------------------------------------------------------------------------
 // InputPortInfo / OutputPortInfo — metadata for named I/O ports
@@ -118,15 +121,21 @@ struct BuilderState<T: Timestamp> {
     probes: Vec<(usize, ProbeHandle<T>)>,
     /// Type-erased exchange factory creators — one per exchange edge.
     /// Tuple: (edge_index, capacity, creator_fn).
-    exchange_creators:
-        Vec<(usize, usize, crate::dataflow::channels::exchange_channel::ExchangeFactoryCreatorFn)>,
+    exchange_creators: Vec<(
+        usize,
+        usize,
+        crate::dataflow::channels::exchange_channel::ExchangeFactoryCreatorFn,
+    )>,
     /// Network-capable exchange creators — one per exchange edge (transport feature only).
     /// Stored by `Pipe::exchange` when `transport` feature is enabled.
     /// Used by `spawn_cluster` to create network-backed exchange factories.
     /// Tuple: (edge_index, capacity, creator).
     #[cfg(feature = "transport")]
-    exchange_network_creators:
-        Vec<(usize, usize, Box<dyn crate::dataflow::channels::exchange_channel::NetworkExchangeCreator>)>,
+    exchange_network_creators: Vec<(
+        usize,
+        usize,
+        Box<dyn crate::dataflow::channels::exchange_channel::NetworkExchangeCreator>,
+    )>,
     next_operator_index: usize,
     next_collect_index: usize,
     channel_capacity: usize,
@@ -146,9 +155,10 @@ struct BuilderState<T: Timestamp> {
 pub(crate) type InputPortWiring = Box<
     dyn FnMut(
             std::sync::Arc<std::sync::atomic::AtomicUsize>, // external_inputs_open counter
-            WakeHandle,                                      // executor wake handle
-            ChannelMode,                                     // sync vs async channel backend
-        ) -> (OperatorFactory, Box<dyn std::any::Any + Send>) // (factory, InputSender or AsyncInputSender)
+            WakeHandle,                                     // executor wake handle
+            ChannelMode,                                    // sync vs async channel backend
+        ) -> (OperatorFactory, Box<dyn std::any::Any + Send>)
+        // (factory, InputSender or AsyncInputSender)
         + Send,
 >;
 
@@ -177,9 +187,9 @@ pub(crate) type OutputPortWiring = Box<
 pub(crate) type AsyncSourceWiring = Box<
     dyn FnOnce(
             std::sync::Arc<std::sync::atomic::AtomicUsize>, // external_inputs_open counter
-            WakeHandle,                                      // executor wake handle
-            crate::cancellation::CancellationToken,          // cancellation token
-        ) -> (OperatorFactory, Box<dyn FnOnce() + Send>)    // (factory, pump_task)
+            WakeHandle,                                     // executor wake handle
+            crate::cancellation::CancellationToken,         // cancellation token
+        ) -> (OperatorFactory, Box<dyn FnOnce() + Send>) // (factory, pump_task)
         + Send,
 >;
 
@@ -332,7 +342,7 @@ impl<T: Timestamp> DataflowBuilder<T> {
     pub fn input<D: Clone + Send + 'static>(&self, name: impl Into<String>) -> Pipe<T, D> {
         let name = name.into();
         let op_idx;
-        let region_id = RegionId::new(0);
+        let stage_id = StageId::new(0);
 
         {
             let mut state = self.state.borrow_mut();
@@ -349,7 +359,7 @@ impl<T: Timestamp> DataflowBuilder<T> {
             state
                 .graph
                 .register_operator(crate::dataflow::graph::OperatorInfo::new(
-                    op_idx, &name, region_id, 0, 1,
+                    op_idx, &name, stage_id, 0, 1,
                 ))
                 .expect("operator index unique");
 
@@ -386,89 +396,94 @@ impl<T: Timestamp> DataflowBuilder<T> {
             // spawn() to create the ChannelSourceOperator factory and InputSender.
             // The closure captures the concrete data type D.
             let wiring_name = name.clone();
-            let wiring: InputPortWiring = Box::new(move |external_inputs_open, wake_handle, mode| {
-                use crate::dataflow::channel_operators::{InputSender, ChannelSourceOperator, InputRecv};
-                use crate::dataflow::channels::tee::tee_or_single;
+            let wiring: InputPortWiring =
+                Box::new(move |external_inputs_open, wake_handle, mode| {
+                    use crate::dataflow::channel_operators::{
+                        ChannelSourceOperator, InputRecv, InputSender,
+                    };
+                    use crate::dataflow::channels::tee::tee_or_single;
 
-                // Build the factory + sender based on channel mode.
-                // The factory closure captures the receiver; the sender is
-                // returned to the caller as a type-erased Box<dyn Any>.
-                match mode {
-                    ChannelMode::Sync => {
-                        let (tx, rx) = std::sync::mpsc::sync_channel::<InputEvent<T, D>>(256);
-                        let sender = InputSender::with_wake_handle(tx, wake_handle);
+                    // Build the factory + sender based on channel mode.
+                    // The factory closure captures the receiver; the sender is
+                    // returned to the caller as a type-erased Box<dyn Any>.
+                    match mode {
+                        ChannelMode::Sync => {
+                            let (tx, rx) = std::sync::mpsc::sync_channel::<InputEvent<T, D>>(256);
+                            let sender = InputSender::with_wake_handle(tx, wake_handle);
 
-                        let ext_counter = Arc::clone(&external_inputs_open);
-                        let factory_name = wiring_name.clone();
-                        let reporter = source_reporter.clone();
-                        let factory: OperatorFactory = single_use_factory(move |_ctx, endpoints| {
-                            let output_pusher: Box<dyn Push<T, D>> = {
-                                let pushers: Vec<Box<dyn Push<T, D>>> = endpoints
-                                    .output_pushers
-                                    .into_iter()
-                                    .map(|any_box| {
-                                        *any_box
-                                            .downcast::<Box<dyn Push<T, D>>>()
-                                            .expect("channel source output pusher type mismatch")
-                                    })
-                                    .collect();
-                                tee_or_single(pushers).unwrap_or_else(|| Box::new(NullPush))
-                            };
-                            let op = ChannelSourceOperator::new(
-                                factory_name,
-                                op_idx,
-                                RegionId::new(0),
-                                InputRecv::Std(rx),
-                                output_pusher,
-                                Some(reporter),
-                                ext_counter,
-                            );
-                            Box::new(op) as Box<dyn SchedulableOperator>
-                        });
+                            let ext_counter = Arc::clone(&external_inputs_open);
+                            let factory_name = wiring_name.clone();
+                            let reporter = source_reporter.clone();
+                            let factory: OperatorFactory =
+                                single_use_factory(move |_ctx, endpoints| {
+                                    let output_pusher: Box<dyn Push<T, D>> = {
+                                        let pushers: Vec<Box<dyn Push<T, D>>> = endpoints
+                                            .output_pushers
+                                            .into_iter()
+                                            .map(|any_box| {
+                                                *any_box.downcast::<Box<dyn Push<T, D>>>().expect(
+                                                    "channel source output pusher type mismatch",
+                                                )
+                                            })
+                                            .collect();
+                                        tee_or_single(pushers).unwrap_or_else(|| Box::new(NullPush))
+                                    };
+                                    let op = ChannelSourceOperator::new(
+                                        factory_name,
+                                        op_idx,
+                                        StageId::new(0),
+                                        InputRecv::Std(rx),
+                                        output_pusher,
+                                        Some(reporter),
+                                        ext_counter,
+                                    );
+                                    Box::new(op) as Box<dyn SchedulableOperator>
+                                });
 
-                        let sender_any: Box<dyn std::any::Any + Send> = Box::new(sender);
-                        (factory, sender_any)
+                            let sender_any: Box<dyn std::any::Any + Send> = Box::new(sender);
+                            (factory, sender_any)
+                        }
+                        #[cfg(feature = "async-io")]
+                        ChannelMode::Async => {
+                            use crate::dataflow::channel_operators::AsyncInputSender;
+
+                            let (tx, rx) = tokio::sync::mpsc::channel::<InputEvent<T, D>>(256);
+                            let sender = AsyncInputSender::with_wake_handle(tx, wake_handle);
+
+                            let ext_counter = Arc::clone(&external_inputs_open);
+                            let factory_name = wiring_name.clone();
+                            let reporter = source_reporter.clone();
+                            let factory: OperatorFactory =
+                                single_use_factory(move |_ctx, endpoints| {
+                                    let output_pusher: Box<dyn Push<T, D>> = {
+                                        let pushers: Vec<Box<dyn Push<T, D>>> = endpoints
+                                            .output_pushers
+                                            .into_iter()
+                                            .map(|any_box| {
+                                                *any_box.downcast::<Box<dyn Push<T, D>>>().expect(
+                                                    "channel source output pusher type mismatch",
+                                                )
+                                            })
+                                            .collect();
+                                        tee_or_single(pushers).unwrap_or_else(|| Box::new(NullPush))
+                                    };
+                                    let op = ChannelSourceOperator::new(
+                                        factory_name,
+                                        op_idx,
+                                        StageId::new(0),
+                                        InputRecv::Tokio(rx),
+                                        output_pusher,
+                                        Some(reporter),
+                                        ext_counter,
+                                    );
+                                    Box::new(op) as Box<dyn SchedulableOperator>
+                                });
+
+                            let sender_any: Box<dyn std::any::Any + Send> = Box::new(sender);
+                            (factory, sender_any)
+                        }
                     }
-                    #[cfg(feature = "async-io")]
-                    ChannelMode::Async => {
-                        use crate::dataflow::channel_operators::AsyncInputSender;
-
-                        let (tx, rx) = tokio::sync::mpsc::channel::<InputEvent<T, D>>(256);
-                        let sender = AsyncInputSender::with_wake_handle(tx, wake_handle);
-
-                        let ext_counter = Arc::clone(&external_inputs_open);
-                        let factory_name = wiring_name.clone();
-                        let reporter = source_reporter.clone();
-                        let factory: OperatorFactory = single_use_factory(move |_ctx, endpoints| {
-                            let output_pusher: Box<dyn Push<T, D>> = {
-                                let pushers: Vec<Box<dyn Push<T, D>>> = endpoints
-                                    .output_pushers
-                                    .into_iter()
-                                    .map(|any_box| {
-                                        *any_box
-                                            .downcast::<Box<dyn Push<T, D>>>()
-                                            .expect("channel source output pusher type mismatch")
-                                    })
-                                    .collect();
-                                tee_or_single(pushers).unwrap_or_else(|| Box::new(NullPush))
-                            };
-                            let op = ChannelSourceOperator::new(
-                                factory_name,
-                                op_idx,
-                                RegionId::new(0),
-                                InputRecv::Tokio(rx),
-                                output_pusher,
-                                Some(reporter),
-                                ext_counter,
-                            );
-                            Box::new(op) as Box<dyn SchedulableOperator>
-                        });
-
-                        let sender_any: Box<dyn std::any::Any + Send> = Box::new(sender);
-                        (factory, sender_any)
-                    }
-                }
-            });
+                });
             state.input_port_wiring.push(wiring);
         }
 
@@ -492,7 +507,7 @@ impl<T: Timestamp> DataflowBuilder<T> {
     ) -> Pipe<T, D> {
         let name = name.into();
         let op_idx;
-        let region_id = RegionId::new(0);
+        let stage_id = StageId::new(0);
 
         {
             let mut state = self.state.borrow_mut();
@@ -502,7 +517,7 @@ impl<T: Timestamp> DataflowBuilder<T> {
             state
                 .graph
                 .register_operator(crate::dataflow::graph::OperatorInfo::new(
-                    op_idx, &name, region_id, 0, 1,
+                    op_idx, &name, stage_id, 0, 1,
                 ))
                 .expect("operator index unique");
 
@@ -523,24 +538,30 @@ impl<T: Timestamp> DataflowBuilder<T> {
             // Handles fan-out: if multiple downstream edges exist (Pipe was
             // cloned), wraps all pushers in a TeePush adapter.
             let name_clone = name.clone();
-            let factory: OperatorFactory = single_use_factory(move |_ctx, endpoints: ChannelEndpoints| {
-                let output_pusher: Box<dyn Push<T, D>> = {
-                    let pushers: Vec<Box<dyn Push<T, D>>> = endpoints
-                        .output_pushers
-                        .into_iter()
-                        .map(|any_box| {
-                            *any_box
-                                .downcast::<Box<dyn Push<T, D>>>()
-                                .expect("source output pusher type mismatch")
-                        })
-                        .collect();
-                    tee_or_single(pushers).unwrap_or_else(|| Box::new(NullPush))
-                };
+            let factory: OperatorFactory =
+                single_use_factory(move |_ctx, endpoints: ChannelEndpoints| {
+                    let output_pusher: Box<dyn Push<T, D>> = {
+                        let pushers: Vec<Box<dyn Push<T, D>>> = endpoints
+                            .output_pushers
+                            .into_iter()
+                            .map(|any_box| {
+                                *any_box
+                                    .downcast::<Box<dyn Push<T, D>>>()
+                                    .expect("source output pusher type mismatch")
+                            })
+                            .collect();
+                        tee_or_single(pushers).unwrap_or_else(|| Box::new(NullPush))
+                    };
 
-                Box::new(WiredSourceOperator::with_progress(
-                    name_clone, op_idx, region_id, data, output_pusher, reporter,
-                )) as Box<dyn SchedulableOperator>
-            });
+                    Box::new(WiredSourceOperator::with_progress(
+                        name_clone,
+                        op_idx,
+                        stage_id,
+                        data,
+                        output_pusher,
+                        reporter,
+                    )) as Box<dyn SchedulableOperator>
+                });
             state.operator_factories.push((op_idx, factory));
         }
 
@@ -591,19 +612,17 @@ impl<T: Timestamp> DataflowBuilder<T> {
     /// If the producer returns `Err`, the pump task logs the error and
     /// closes the channel, causing the source operator to finish gracefully.
     #[cfg(feature = "async-io")]
-    pub fn source_async<D, F, Fut>(
-        &self,
-        name: impl Into<String>,
-        producer: F,
-    ) -> Pipe<T, D>
+    pub fn source_async<D, F, Fut>(&self, name: impl Into<String>, producer: F) -> Pipe<T, D>
     where
         D: Clone + Send + 'static,
-        F: FnOnce(crate::dataflow::channel_operators::AsyncInputSender<T, D>) -> Fut + Send + 'static,
+        F: FnOnce(crate::dataflow::channel_operators::AsyncInputSender<T, D>) -> Fut
+            + Send
+            + 'static,
         Fut: std::future::Future<Output = crate::error::Result<()>> + Send + 'static,
     {
         let name = name.into();
         let op_idx;
-        let region_id = RegionId::new(0);
+        let stage_id = StageId::new(0);
 
         {
             let mut state = self.state.borrow_mut();
@@ -613,7 +632,7 @@ impl<T: Timestamp> DataflowBuilder<T> {
             state
                 .graph
                 .register_operator(crate::dataflow::graph::OperatorInfo::new(
-                    op_idx, &name, region_id, 0, 1,
+                    op_idx, &name, stage_id, 0, 1,
                 ))
                 .expect("operator index unique");
 
@@ -634,78 +653,81 @@ impl<T: Timestamp> DataflowBuilder<T> {
             // the tokio channel + ChannelSourceOperator + pump task.
             let wiring_name = name.clone();
             let channel_cap = state.channel_capacity;
-            let wiring: AsyncSourceWiring = Box::new(move |external_inputs_open, wake_handle, cancel| {
-                use crate::dataflow::channel_operators::{AsyncInputSender, ChannelSourceOperator, InputRecv};
-
-                let (tx, rx) = tokio::sync::mpsc::channel::<InputEvent<T, D>>(channel_cap);
-                let sender = AsyncInputSender::with_wake_handle(tx, wake_handle.clone());
-
-                let ext_counter = std::sync::Arc::clone(&external_inputs_open);
-                let factory_name = wiring_name.clone();
-                let reporter = source_reporter.clone();
-                let factory: OperatorFactory = single_use_factory(move |_ctx, endpoints| {
-                    let output_pusher: Box<dyn Push<T, D>> = {
-                        let pushers: Vec<Box<dyn Push<T, D>>> = endpoints
-                            .output_pushers
-                            .into_iter()
-                            .map(|any_box| {
-                                *any_box
-                                    .downcast::<Box<dyn Push<T, D>>>()
-                                    .expect("async source output pusher type mismatch")
-                            })
-                            .collect();
-                        tee_or_single(pushers).unwrap_or_else(|| Box::new(NullPush))
+            let wiring: AsyncSourceWiring =
+                Box::new(move |external_inputs_open, wake_handle, cancel| {
+                    use crate::dataflow::channel_operators::{
+                        AsyncInputSender, ChannelSourceOperator, InputRecv,
                     };
-                    let op = ChannelSourceOperator::new(
-                        factory_name,
-                        op_idx,
-                        RegionId::new(0),
-                        InputRecv::Tokio(rx),
-                        output_pusher,
-                        Some(reporter),
-                        ext_counter,
-                    );
-                    Box::new(op) as Box<dyn SchedulableOperator>
-                });
 
-                // Build pump task: runs the user's producer in a small tokio runtime.
-                let pump_wake = wake_handle;
-                let pump: Box<dyn FnOnce() + Send> = Box::new(move || {
-                    let rt = tokio::runtime::Builder::new_current_thread()
-                        .enable_all()
-                        .build()
-                        .expect("failed to create pump runtime");
-                    rt.block_on(async move {
-                        // Run producer with cancellation support.
-                        tokio::select! {
-                            biased;
-                            _ = cancel.cancelled_async() => {
-                                // Dataflow cancelled — drop sender to close channel.
-                            }
-                            result = producer(sender) => {
-                                if let Err(e) = result {
-                                    // Producer returned an error. Log it and close the
-                                    // channel by dropping sender, causing the
-                                    // ChannelSourceOperator to finish gracefully.
-                                    #[cfg(feature = "tracing")]
-                                    tracing::warn!(
-                                        source = %wiring_name,
-                                        error = %e,
-                                        "async source producer failed"
-                                    );
-                                    let _ = e; // suppress unused warning when tracing is off
-                                }
-                                // On success, sender is dropped here too, which
-                                // closes the channel and signals completion.
-                            }
-                        }
-                        // Notify executor that the source has finished/changed.
-                        pump_wake.notify();
+                    let (tx, rx) = tokio::sync::mpsc::channel::<InputEvent<T, D>>(channel_cap);
+                    let sender = AsyncInputSender::with_wake_handle(tx, wake_handle.clone());
+
+                    let ext_counter = std::sync::Arc::clone(&external_inputs_open);
+                    let factory_name = wiring_name.clone();
+                    let reporter = source_reporter.clone();
+                    let factory: OperatorFactory = single_use_factory(move |_ctx, endpoints| {
+                        let output_pusher: Box<dyn Push<T, D>> = {
+                            let pushers: Vec<Box<dyn Push<T, D>>> = endpoints
+                                .output_pushers
+                                .into_iter()
+                                .map(|any_box| {
+                                    *any_box
+                                        .downcast::<Box<dyn Push<T, D>>>()
+                                        .expect("async source output pusher type mismatch")
+                                })
+                                .collect();
+                            tee_or_single(pushers).unwrap_or_else(|| Box::new(NullPush))
+                        };
+                        let op = ChannelSourceOperator::new(
+                            factory_name,
+                            op_idx,
+                            StageId::new(0),
+                            InputRecv::Tokio(rx),
+                            output_pusher,
+                            Some(reporter),
+                            ext_counter,
+                        );
+                        Box::new(op) as Box<dyn SchedulableOperator>
                     });
-                });
 
-                (factory, pump)
-            });
+                    // Build pump task: runs the user's producer in a small tokio runtime.
+                    let pump_wake = wake_handle;
+                    let pump: Box<dyn FnOnce() + Send> = Box::new(move || {
+                        let rt = tokio::runtime::Builder::new_current_thread()
+                            .enable_all()
+                            .build()
+                            .expect("failed to create pump runtime");
+                        rt.block_on(async move {
+                            // Run producer with cancellation support.
+                            tokio::select! {
+                                biased;
+                                _ = cancel.cancelled_async() => {
+                                    // Dataflow cancelled — drop sender to close channel.
+                                }
+                                result = producer(sender) => {
+                                    if let Err(e) = result {
+                                        // Producer returned an error. Log it and close the
+                                        // channel by dropping sender, causing the
+                                        // ChannelSourceOperator to finish gracefully.
+                                        #[cfg(feature = "tracing")]
+                                        tracing::warn!(
+                                            source = %wiring_name,
+                                            error = %e,
+                                            "async source producer failed"
+                                        );
+                                        let _ = e; // suppress unused warning when tracing is off
+                                    }
+                                    // On success, sender is dropped here too, which
+                                    // closes the channel and signals completion.
+                                }
+                            }
+                            // Notify executor that the source has finished/changed.
+                            pump_wake.notify();
+                        });
+                    });
+
+                    (factory, pump)
+                });
             state.async_source_wiring.push((op_idx, wiring));
         }
 
@@ -746,7 +768,7 @@ impl<T: Timestamp> DataflowBuilder<T> {
                     "cannot build: outstanding Pipe references still exist — \
                      drop all Pipe handles before calling build()"
                         .into(),
-                ))
+                ));
             }
         };
 
@@ -754,7 +776,9 @@ impl<T: Timestamp> DataflowBuilder<T> {
         // Feedback edges are materialized at indices: edges.len()..edges.len()+feedback_edges.len()
         let regular_edge_count = state.graph.edges().len();
         for (fb_position, factory) in state.feedback_channel_factories {
-            state.channel_factories.push((regular_edge_count + fb_position, factory));
+            state
+                .channel_factories
+                .push((regular_edge_count + fb_position, factory));
         }
 
         // Infer stages from the graph topology (exchange edges form boundaries).
@@ -868,9 +892,9 @@ impl<T: Timestamp, D: Clone + Send + 'static> Pipe<T, D> {
     /// Consumes `capacity_override` if present, otherwise falls back
     /// to the builder's global `channel_capacity`.
     fn resolve_capacity(&mut self) -> usize {
-        self.capacity_override.take().unwrap_or_else(|| {
-            self.state.borrow().channel_capacity
-        })
+        self.capacity_override
+            .take()
+            .unwrap_or_else(|| self.state.borrow().channel_capacity)
     }
 
     /// Apply a per-element transformation, producing a new Pipe of type `D2`.
@@ -947,9 +971,7 @@ impl<T: Timestamp, D: Clone + Send + 'static> Pipe<T, D> {
     pub fn unary<D2, L>(mut self, name: impl Into<String>, logic: L) -> Pipe<T, D2>
     where
         D2: Clone + Send + 'static,
-        L: FnMut(&mut InputHandle<T, D>, &mut OutputHandle<T, D2>) -> Result<()>
-            + Send
-            + 'static,
+        L: FnMut(&mut InputHandle<T, D>, &mut OutputHandle<T, D2>) -> Result<()> + Send + 'static,
     {
         let capacity = self.resolve_capacity();
         self.add_unary_with_handles(name, capacity, logic)
@@ -1070,7 +1092,7 @@ impl<T: Timestamp, D: Clone + Send + 'static> Pipe<T, D> {
 
         let name = name.into();
         let op_idx;
-        let region_id = RegionId::new(0);
+        let stage_id = StageId::new(0);
 
         {
             let mut state = self.state.borrow_mut();
@@ -1080,7 +1102,7 @@ impl<T: Timestamp, D: Clone + Send + 'static> Pipe<T, D> {
             state
                 .graph
                 .register_operator(crate::dataflow::graph::OperatorInfo::new(
-                    op_idx, &name, region_id, 2, 1,
+                    op_idx, &name, stage_id, 2, 1,
                 ))
                 .expect("operator index unique");
 
@@ -1088,8 +1110,8 @@ impl<T: Timestamp, D: Clone + Send + 'static> Pipe<T, D> {
             state.graph.add_edge(crate::dataflow::graph::EdgeInfo::new(
                 Slot::new(self.op_idx, self.output_slot),
                 Slot::new(op_idx, 0),
-                region_id,
-                region_id,
+                stage_id,
+                stage_id,
             ));
             let edge1_idx = state.graph.edges().len() - 1;
 
@@ -1097,8 +1119,8 @@ impl<T: Timestamp, D: Clone + Send + 'static> Pipe<T, D> {
             state.graph.add_edge(crate::dataflow::graph::EdgeInfo::new(
                 Slot::new(other.op_idx, other.output_slot),
                 Slot::new(op_idx, 1),
-                region_id,
-                region_id,
+                stage_id,
+                stage_id,
             ));
             let edge2_idx = state.graph.edges().len() - 1;
 
@@ -1120,67 +1142,72 @@ impl<T: Timestamp, D: Clone + Send + 'static> Pipe<T, D> {
 
             // Operator factory
             let name_clone = name.clone();
-            let factory: OperatorFactory = single_use_factory(move |_ctx, endpoints: ChannelEndpoints| {
-                let mut pullers = endpoints.input_pullers.into_iter();
+            let factory: OperatorFactory =
+                single_use_factory(move |_ctx, endpoints: ChannelEndpoints| {
+                    let mut pullers = endpoints.input_pullers.into_iter();
 
-                let input1_puller: Box<dyn Pull<T, D>> = *pullers
-                    .next()
-                    .expect("binary must have input puller 0")
-                    .downcast::<Box<dyn Pull<T, D>>>()
-                    .expect("binary input1 puller type mismatch");
+                    let input1_puller: Box<dyn Pull<T, D>> = *pullers
+                        .next()
+                        .expect("binary must have input puller 0")
+                        .downcast::<Box<dyn Pull<T, D>>>()
+                        .expect("binary input1 puller type mismatch");
 
-                let input2_puller: Box<dyn Pull<T, D2>> = *pullers
-                    .next()
-                    .expect("binary must have input puller 1")
-                    .downcast::<Box<dyn Pull<T, D2>>>()
-                    .expect("binary input2 puller type mismatch");
+                    let input2_puller: Box<dyn Pull<T, D2>> = *pullers
+                        .next()
+                        .expect("binary must have input puller 1")
+                        .downcast::<Box<dyn Pull<T, D2>>>()
+                        .expect("binary input2 puller type mismatch");
 
-                let output_pusher: Box<dyn Push<T, D3>> = {
-                    let pushers: Vec<Box<dyn Push<T, D3>>> = endpoints
-                        .output_pushers
-                        .into_iter()
-                        .map(|any_box| {
-                            *any_box
-                                .downcast::<Box<dyn Push<T, D3>>>()
-                                .expect("binary output pusher type mismatch")
-                        })
-                        .collect();
-                    tee_or_single(pushers).unwrap_or_else(|| Box::new(NullPush))
-                };
+                    let output_pusher: Box<dyn Push<T, D3>> = {
+                        let pushers: Vec<Box<dyn Push<T, D3>>> = endpoints
+                            .output_pushers
+                            .into_iter()
+                            .map(|any_box| {
+                                *any_box
+                                    .downcast::<Box<dyn Push<T, D3>>>()
+                                    .expect("binary output pusher type mismatch")
+                            })
+                            .collect();
+                        tee_or_single(pushers).unwrap_or_else(|| Box::new(NullPush))
+                    };
 
-                Box::new(WiredBinaryOperator::new(
-                    name_clone,
-                    op_idx,
-                    region_id,
-                    logic,
-                    input1_puller,
-                    input2_puller,
-                    output_pusher,
-                )) as Box<dyn SchedulableOperator>
-            });
+                    Box::new(WiredBinaryOperator::new(
+                        name_clone,
+                        op_idx,
+                        stage_id,
+                        logic,
+                        input1_puller,
+                        input2_puller,
+                        output_pusher,
+                    )) as Box<dyn SchedulableOperator>
+                });
             state.operator_factories.push((op_idx, factory));
 
             // Channel factories for both input edges
-            let channel_factory1: ChannelFactory = channel_factory(move |_ctx, _cap: usize, wake: Option<WakeHandle>| {
-                let (push, pull) = bounded_channel_with_wake::<T, D, ()>(capacity1, wake.clone());
-                (
-                    Box::new(Box::new(push) as Box<dyn Push<T, D>>)
-                        as Box<dyn std::any::Any + Send>,
-                    Box::new(Box::new(pull) as Box<dyn Pull<T, D>>)
-                        as Box<dyn std::any::Any + Send>,
-                )
-            });
+            let channel_factory1: ChannelFactory =
+                channel_factory(move |_ctx, _cap: usize, wake: Option<WakeHandle>| {
+                    let (push, pull) =
+                        bounded_channel_with_wake::<T, D, ()>(capacity1, wake.clone());
+                    (
+                        Box::new(Box::new(push) as Box<dyn Push<T, D>>)
+                            as Box<dyn std::any::Any + Send>,
+                        Box::new(Box::new(pull) as Box<dyn Pull<T, D>>)
+                            as Box<dyn std::any::Any + Send>,
+                    )
+                });
             state.channel_factories.push((edge1_idx, channel_factory1));
 
-            let channel_factory2: ChannelFactory = channel_factory(move |_ctx, _cap: usize, wake: Option<WakeHandle>| {
-                let (push, pull) = bounded_channel_with_wake::<T, D2, ()>(capacity2, wake.clone());
-                (
-                    Box::new(Box::new(push) as Box<dyn Push<T, D2>>)
-                        as Box<dyn std::any::Any + Send>,
-                    Box::new(Box::new(pull) as Box<dyn Pull<T, D2>>)
-                        as Box<dyn std::any::Any + Send>,
-                )
-            });
+            let channel_factory2: ChannelFactory =
+                channel_factory(move |_ctx, _cap: usize, wake: Option<WakeHandle>| {
+                    let (push, pull) =
+                        bounded_channel_with_wake::<T, D2, ()>(capacity2, wake.clone());
+                    (
+                        Box::new(Box::new(push) as Box<dyn Push<T, D2>>)
+                            as Box<dyn std::any::Any + Send>,
+                        Box::new(Box::new(pull) as Box<dyn Pull<T, D2>>)
+                            as Box<dyn std::any::Any + Send>,
+                    )
+                });
             state.channel_factories.push((edge2_idx, channel_factory2));
         }
 
@@ -1234,7 +1261,7 @@ impl<T: Timestamp, D: Clone + Send + 'static> Pipe<T, D> {
         Product<T, TInner>: Timestamp,
     {
         let name = name.into();
-        let region_id = RegionId::new(0);
+        let stage_id = StageId::new(0);
         type PT<T, TInner> = Product<T, TInner>;
 
         // Resolve per-edge capacity for the enter edge; internal edges use global default.
@@ -1258,14 +1285,18 @@ impl<T: Timestamp, D: Clone + Send + 'static> Pipe<T, D> {
             state
                 .graph
                 .register_operator(crate::dataflow::graph::OperatorInfo::new(
-                    enter_idx, format!("{name}::enter"), region_id, 1, 1,
+                    enter_idx,
+                    format!("{name}::enter"),
+                    stage_id,
+                    1,
+                    1,
                 ))
                 .expect("operator index unique");
             state.graph.add_edge(crate::dataflow::graph::EdgeInfo::new(
                 Slot::new(self.op_idx, self.output_slot),
                 Slot::new(enter_idx, 0),
-                region_id,
-                region_id,
+                stage_id,
+                stage_id,
             ));
             // Subgraph registration for enter
             state.subgraph_builder.add_operator(
@@ -1282,48 +1313,52 @@ impl<T: Timestamp, D: Clone + Send + 'static> Pipe<T, D> {
 
             // Enter operator factory
             let enter_name = format!("{name}::enter");
-            let enter_factory: OperatorFactory = single_use_factory(move |_ctx, endpoints: ChannelEndpoints| {
-                let input_puller: Box<dyn Pull<T, D>> = *endpoints
-                    .input_pullers
-                    .into_iter()
-                    .next()
-                    .expect("enter must have input puller")
-                    .downcast::<Box<dyn Pull<T, D>>>()
-                    .expect("enter input puller type mismatch");
-
-                let output_pusher: Box<dyn Push<PT<T, TInner>, D>> = {
-                    let pushers: Vec<Box<dyn Push<PT<T, TInner>, D>>> = endpoints
-                        .output_pushers
+            let enter_factory: OperatorFactory =
+                single_use_factory(move |_ctx, endpoints: ChannelEndpoints| {
+                    let input_puller: Box<dyn Pull<T, D>> = *endpoints
+                        .input_pullers
                         .into_iter()
-                        .map(|any_box| {
-                            *any_box
-                                .downcast::<Box<dyn Push<PT<T, TInner>, D>>>()
-                                .expect("enter output pusher type mismatch")
-                        })
-                        .collect();
-                    tee_or_single(pushers).unwrap_or_else(|| Box::new(NullPush))
-                };
+                        .next()
+                        .expect("enter must have input puller")
+                        .downcast::<Box<dyn Pull<T, D>>>()
+                        .expect("enter input puller type mismatch");
 
-                Box::new(WiredEnterOperator::<T, TInner, D>::new(
-                    enter_name,
-                    enter_idx,
-                    region_id,
-                    input_puller,
-                    output_pusher,
-                )) as Box<dyn SchedulableOperator>
-            });
+                    let output_pusher: Box<dyn Push<PT<T, TInner>, D>> = {
+                        let pushers: Vec<Box<dyn Push<PT<T, TInner>, D>>> = endpoints
+                            .output_pushers
+                            .into_iter()
+                            .map(|any_box| {
+                                *any_box
+                                    .downcast::<Box<dyn Push<PT<T, TInner>, D>>>()
+                                    .expect("enter output pusher type mismatch")
+                            })
+                            .collect();
+                        tee_or_single(pushers).unwrap_or_else(|| Box::new(NullPush))
+                    };
+
+                    Box::new(WiredEnterOperator::<T, TInner, D>::new(
+                        enter_name,
+                        enter_idx,
+                        stage_id,
+                        input_puller,
+                        output_pusher,
+                    )) as Box<dyn SchedulableOperator>
+                });
             state.operator_factories.push((enter_idx, enter_factory));
 
             // Channel factory for enter's input edge (uses per-edge override if set)
             let enter_edge_idx = state.graph.edges().len() - 1;
             let cap = enter_capacity;
-            let cf: ChannelFactory = channel_factory(move |_ctx, _cap: usize, wake: Option<WakeHandle>| {
-                let (push, pull) = bounded_channel_with_wake::<T, D, ()>(cap, wake.clone());
-                (
-                    Box::new(Box::new(push) as Box<dyn Push<T, D>>) as Box<dyn std::any::Any + Send>,
-                    Box::new(Box::new(pull) as Box<dyn Pull<T, D>>) as Box<dyn std::any::Any + Send>,
-                )
-            });
+            let cf: ChannelFactory =
+                channel_factory(move |_ctx, _cap: usize, wake: Option<WakeHandle>| {
+                    let (push, pull) = bounded_channel_with_wake::<T, D, ()>(cap, wake.clone());
+                    (
+                        Box::new(Box::new(push) as Box<dyn Push<T, D>>)
+                            as Box<dyn std::any::Any + Send>,
+                        Box::new(Box::new(pull) as Box<dyn Pull<T, D>>)
+                            as Box<dyn std::any::Any + Send>,
+                    )
+                });
             state.channel_factories.push((enter_edge_idx, cf));
 
             // Feedback operator: 1 input (Product<T,TInner>,D), 1 output (Product<T,TInner>,D)
@@ -1331,7 +1366,11 @@ impl<T: Timestamp, D: Clone + Send + 'static> Pipe<T, D> {
             state
                 .graph
                 .register_operator(crate::dataflow::graph::OperatorInfo::new(
-                    feedback_idx, format!("{name}::feedback"), region_id, 1, 1,
+                    feedback_idx,
+                    format!("{name}::feedback"),
+                    stage_id,
+                    1,
+                    1,
                 ))
                 .expect("operator index unique");
             // Subgraph registration for feedback
@@ -1346,68 +1385,79 @@ impl<T: Timestamp, D: Clone + Send + 'static> Pipe<T, D> {
             // Feedback operator factory
             let fb_name = format!("{name}::feedback");
             let fb_summary = summary.clone();
-            let feedback_factory: OperatorFactory = single_use_factory(move |_ctx, endpoints: ChannelEndpoints| {
-                let input_puller: Box<dyn Pull<PT<T, TInner>, D>> = *endpoints
-                    .input_pullers
-                    .into_iter()
-                    .next()
-                    .expect("feedback must have input puller")
-                    .downcast::<Box<dyn Pull<PT<T, TInner>, D>>>()
-                    .expect("feedback input puller type mismatch");
-
-                let output_pusher: Box<dyn Push<PT<T, TInner>, D>> = {
-                    let pushers: Vec<Box<dyn Push<PT<T, TInner>, D>>> = endpoints
-                        .output_pushers
+            let feedback_factory: OperatorFactory =
+                single_use_factory(move |_ctx, endpoints: ChannelEndpoints| {
+                    let input_puller: Box<dyn Pull<PT<T, TInner>, D>> = *endpoints
+                        .input_pullers
                         .into_iter()
-                        .map(|any_box| {
-                            *any_box
-                                .downcast::<Box<dyn Push<PT<T, TInner>, D>>>()
-                                .expect("feedback output pusher type mismatch")
-                        })
-                        .collect();
-                    tee_or_single(pushers).unwrap_or_else(|| Box::new(NullPush))
-                };
+                        .next()
+                        .expect("feedback must have input puller")
+                        .downcast::<Box<dyn Pull<PT<T, TInner>, D>>>()
+                        .expect("feedback input puller type mismatch");
 
-                Box::new(WiredFeedbackOperator::<T, TInner, D>::new(
-                    fb_name,
-                    feedback_idx,
-                    region_id,
-                    fb_summary,
-                    input_puller,
-                    output_pusher,
-                )) as Box<dyn SchedulableOperator>
-            });
-            state.operator_factories.push((feedback_idx, feedback_factory));
+                    let output_pusher: Box<dyn Push<PT<T, TInner>, D>> = {
+                        let pushers: Vec<Box<dyn Push<PT<T, TInner>, D>>> = endpoints
+                            .output_pushers
+                            .into_iter()
+                            .map(|any_box| {
+                                *any_box
+                                    .downcast::<Box<dyn Push<PT<T, TInner>, D>>>()
+                                    .expect("feedback output pusher type mismatch")
+                            })
+                            .collect();
+                        tee_or_single(pushers).unwrap_or_else(|| Box::new(NullPush))
+                    };
+
+                    Box::new(WiredFeedbackOperator::<T, TInner, D>::new(
+                        fb_name,
+                        feedback_idx,
+                        stage_id,
+                        fb_summary,
+                        input_puller,
+                        output_pusher,
+                    )) as Box<dyn SchedulableOperator>
+                });
+            state
+                .operator_factories
+                .push((feedback_idx, feedback_factory));
 
             // Concat operator: 2 inputs (enter output + feedback output), 1 output
             concat_idx = state.allocate_operator_index();
             state
                 .graph
                 .register_operator(crate::dataflow::graph::OperatorInfo::new(
-                    concat_idx, format!("{name}::concat"), region_id, 2, 1,
+                    concat_idx,
+                    format!("{name}::concat"),
+                    stage_id,
+                    2,
+                    1,
                 ))
                 .expect("operator index unique");
             // Edge: enter → concat input 0
             state.graph.add_edge(crate::dataflow::graph::EdgeInfo::new(
                 Slot::new(enter_idx, 0),
                 Slot::new(concat_idx, 0),
-                region_id,
-                region_id,
+                stage_id,
+                stage_id,
             ));
             let enter_concat_edge_idx = state.graph.edges().len() - 1;
             // Edge: feedback → concat input 1
             state.graph.add_edge(crate::dataflow::graph::EdgeInfo::new(
                 Slot::new(feedback_idx, 0),
                 Slot::new(concat_idx, 1),
-                region_id,
-                region_id,
+                stage_id,
+                stage_id,
             ));
             let fb_concat_edge_idx = state.graph.edges().len() - 1;
 
             // Subgraph for concat
             let mut concat_connectivity = PortConnectivity::new(2, 1);
-            concat_connectivity.path_mut(0, 0).insert(T::Summary::default());
-            concat_connectivity.path_mut(1, 0).insert(T::Summary::default());
+            concat_connectivity
+                .path_mut(0, 0)
+                .insert(T::Summary::default());
+            concat_connectivity
+                .path_mut(1, 0)
+                .insert(T::Summary::default());
             state.subgraph_builder.add_operator(
                 concat_idx,
                 &format!("{name}::concat"),
@@ -1426,59 +1476,68 @@ impl<T: Timestamp, D: Clone + Send + 'static> Pipe<T, D> {
 
             // Concat operator factory
             let concat_name = format!("{name}::concat");
-            let concat_factory: OperatorFactory = single_use_factory(move |_ctx, endpoints: ChannelEndpoints| {
-                let input_pullers: Vec<Box<dyn Pull<PT<T, TInner>, D>>> = endpoints
-                    .input_pullers
-                    .into_iter()
-                    .map(|any_box| {
-                        *any_box
-                            .downcast::<Box<dyn Pull<PT<T, TInner>, D>>>()
-                            .expect("concat input puller type mismatch")
-                    })
-                    .collect();
-
-                let output_pusher: Box<dyn Push<PT<T, TInner>, D>> = {
-                    let pushers: Vec<Box<dyn Push<PT<T, TInner>, D>>> = endpoints
-                        .output_pushers
+            let concat_factory: OperatorFactory =
+                single_use_factory(move |_ctx, endpoints: ChannelEndpoints| {
+                    let input_pullers: Vec<Box<dyn Pull<PT<T, TInner>, D>>> = endpoints
+                        .input_pullers
                         .into_iter()
                         .map(|any_box| {
                             *any_box
-                                .downcast::<Box<dyn Push<PT<T, TInner>, D>>>()
-                                .expect("concat output pusher type mismatch")
+                                .downcast::<Box<dyn Pull<PT<T, TInner>, D>>>()
+                                .expect("concat input puller type mismatch")
                         })
                         .collect();
-                    tee_or_single(pushers).unwrap_or_else(|| Box::new(NullPush))
-                };
 
-                Box::new(WiredConcatOperator::new(
-                    concat_name,
-                    concat_idx,
-                    region_id,
-                    input_pullers,
-                    output_pusher,
-                )) as Box<dyn SchedulableOperator>
-            });
+                    let output_pusher: Box<dyn Push<PT<T, TInner>, D>> = {
+                        let pushers: Vec<Box<dyn Push<PT<T, TInner>, D>>> = endpoints
+                            .output_pushers
+                            .into_iter()
+                            .map(|any_box| {
+                                *any_box
+                                    .downcast::<Box<dyn Push<PT<T, TInner>, D>>>()
+                                    .expect("concat output pusher type mismatch")
+                            })
+                            .collect();
+                        tee_or_single(pushers).unwrap_or_else(|| Box::new(NullPush))
+                    };
+
+                    Box::new(WiredConcatOperator::new(
+                        concat_name,
+                        concat_idx,
+                        stage_id,
+                        input_pullers,
+                        output_pusher,
+                    )) as Box<dyn SchedulableOperator>
+                });
             state.operator_factories.push((concat_idx, concat_factory));
 
             // Channel factories for concat inputs
             let cap = capacity;
-            let cf1: ChannelFactory = channel_factory(move |_ctx, _cap: usize, wake: Option<WakeHandle>| {
-                let (push, pull) = bounded_channel_with_wake::<PT<T, TInner>, D, ()>(cap, wake.clone());
-                (
-                    Box::new(Box::new(push) as Box<dyn Push<PT<T, TInner>, D>>) as Box<dyn std::any::Any + Send>,
-                    Box::new(Box::new(pull) as Box<dyn Pull<PT<T, TInner>, D>>) as Box<dyn std::any::Any + Send>,
-                )
-            });
+            let cf1: ChannelFactory =
+                channel_factory(move |_ctx, _cap: usize, wake: Option<WakeHandle>| {
+                    let (push, pull) =
+                        bounded_channel_with_wake::<PT<T, TInner>, D, ()>(cap, wake.clone());
+                    (
+                        Box::new(Box::new(push) as Box<dyn Push<PT<T, TInner>, D>>)
+                            as Box<dyn std::any::Any + Send>,
+                        Box::new(Box::new(pull) as Box<dyn Pull<PT<T, TInner>, D>>)
+                            as Box<dyn std::any::Any + Send>,
+                    )
+                });
             state.channel_factories.push((enter_concat_edge_idx, cf1));
 
             let cap = capacity;
-            let cf2: ChannelFactory = channel_factory(move |_ctx, _cap: usize, wake: Option<WakeHandle>| {
-                let (push, pull) = bounded_channel_with_wake::<PT<T, TInner>, D, ()>(cap, wake.clone());
-                (
-                    Box::new(Box::new(push) as Box<dyn Push<PT<T, TInner>, D>>) as Box<dyn std::any::Any + Send>,
-                    Box::new(Box::new(pull) as Box<dyn Pull<PT<T, TInner>, D>>) as Box<dyn std::any::Any + Send>,
-                )
-            });
+            let cf2: ChannelFactory =
+                channel_factory(move |_ctx, _cap: usize, wake: Option<WakeHandle>| {
+                    let (push, pull) =
+                        bounded_channel_with_wake::<PT<T, TInner>, D, ()>(cap, wake.clone());
+                    (
+                        Box::new(Box::new(push) as Box<dyn Push<PT<T, TInner>, D>>)
+                            as Box<dyn std::any::Any + Send>,
+                        Box::new(Box::new(pull) as Box<dyn Pull<PT<T, TInner>, D>>)
+                            as Box<dyn std::any::Any + Send>,
+                    )
+                });
             state.channel_factories.push((fb_concat_edge_idx, cf2));
 
             // Leave operator: 1 input (Product<T,TInner>,D), 1 output (T,D)
@@ -1486,7 +1545,11 @@ impl<T: Timestamp, D: Clone + Send + 'static> Pipe<T, D> {
             state
                 .graph
                 .register_operator(crate::dataflow::graph::OperatorInfo::new(
-                    leave_idx, format!("{name}::leave"), region_id, 1, 1,
+                    leave_idx,
+                    format!("{name}::leave"),
+                    stage_id,
+                    1,
+                    1,
                 ))
                 .expect("operator index unique");
             // Subgraph registration for leave
@@ -1585,7 +1648,8 @@ impl<T: Timestamp, D: Clone + Send + 'static> Pipe<T, D> {
             // the parent's progress tracker we register them with identity T::Summary
             // connectivity (sufficient for activation scheduling).
             for shape in inner.subgraph_builder.operator_shapes() {
-                let mut conn: PortConnectivity<T::Summary> = PortConnectivity::new(shape.inputs, shape.outputs);
+                let mut conn: PortConnectivity<T::Summary> =
+                    PortConnectivity::new(shape.inputs, shape.outputs);
                 for i in 0..shape.inputs {
                     for o in 0..shape.outputs {
                         conn.path_mut(i, o).insert(T::Summary::default());
@@ -1606,12 +1670,16 @@ impl<T: Timestamp, D: Clone + Send + 'static> Pipe<T, D> {
             // Merge factories (offset inner channel factory indices)
             state.operator_factories.extend(inner.operator_factories);
             for (edge_idx, factory) in inner.channel_factories {
-                state.channel_factories.push((edge_idx + inner_edge_offset, factory));
+                state
+                    .channel_factories
+                    .push((edge_idx + inner_edge_offset, factory));
             }
             // Merge inner feedback channel factories (offset by parent's existing feedback edges)
             let fb_offset = state.graph.feedback_edges().len();
             for (fb_idx, factory) in inner.feedback_channel_factories {
-                state.feedback_channel_factories.push((fb_idx + fb_offset, factory));
+                state
+                    .feedback_channel_factories
+                    .push((fb_idx + fb_offset, factory));
             }
 
             // Wire output: result.output → leave_op input (regular edge)
@@ -1619,8 +1687,8 @@ impl<T: Timestamp, D: Clone + Send + 'static> Pipe<T, D> {
             state.graph.add_edge(crate::dataflow::graph::EdgeInfo::new(
                 Slot::new(output_op_idx, output_output_slot),
                 Slot::new(leave_idx, 0),
-                region_id,
-                region_id,
+                stage_id,
+                stage_id,
             ));
             let leave_edge_idx = state.graph.edges().len() - 1;
 
@@ -1631,12 +1699,14 @@ impl<T: Timestamp, D: Clone + Send + 'static> Pipe<T, D> {
             );
 
             // Wire feedback: result.feedback → feedback_op input (as feedback edge, not regular)
-            state.graph.add_feedback_edge(crate::dataflow::graph::EdgeInfo::new(
-                Slot::new(feedback_op_idx, feedback_output_slot),
-                Slot::new(feedback_idx, 0),
-                region_id,
-                region_id,
-            ));
+            state
+                .graph
+                .add_feedback_edge(crate::dataflow::graph::EdgeInfo::new(
+                    Slot::new(feedback_op_idx, feedback_output_slot),
+                    Slot::new(feedback_idx, 0),
+                    stage_id,
+                    stage_id,
+                ));
 
             // NOTE: We do NOT add the feedback edge to subgraph_builder because it's
             // a back-edge. Adding it would create a cycle in the reachability graph
@@ -1647,58 +1717,67 @@ impl<T: Timestamp, D: Clone + Send + 'static> Pipe<T, D> {
             // Index by position in feedback_edges (0-based).
             let fb_position = state.graph.feedback_edges().len() - 1;
             let cap = feedback_capacity;
-            let cf_fb: ChannelFactory = channel_factory(move |_ctx, _cap: usize, wake: Option<WakeHandle>| {
-                let (push, pull) = bounded_channel_with_wake::<PT<T, TInner>, D, ()>(cap, wake.clone());
-                (
-                    Box::new(Box::new(push) as Box<dyn Push<PT<T, TInner>, D>>) as Box<dyn std::any::Any + Send>,
-                    Box::new(Box::new(pull) as Box<dyn Pull<PT<T, TInner>, D>>) as Box<dyn std::any::Any + Send>,
-                )
-            });
+            let cf_fb: ChannelFactory =
+                channel_factory(move |_ctx, _cap: usize, wake: Option<WakeHandle>| {
+                    let (push, pull) =
+                        bounded_channel_with_wake::<PT<T, TInner>, D, ()>(cap, wake.clone());
+                    (
+                        Box::new(Box::new(push) as Box<dyn Push<PT<T, TInner>, D>>)
+                            as Box<dyn std::any::Any + Send>,
+                        Box::new(Box::new(pull) as Box<dyn Pull<PT<T, TInner>, D>>)
+                            as Box<dyn std::any::Any + Send>,
+                    )
+                });
             state.feedback_channel_factories.push((fb_position, cf_fb));
 
             // Leave operator factory
             let leave_name = format!("{name}::leave");
-            let leave_factory: OperatorFactory = single_use_factory(move |_ctx, endpoints: ChannelEndpoints| {
-                let input_puller: Box<dyn Pull<PT<T, TInner>, D>> = *endpoints
-                    .input_pullers
-                    .into_iter()
-                    .next()
-                    .expect("leave must have input puller")
-                    .downcast::<Box<dyn Pull<PT<T, TInner>, D>>>()
-                    .expect("leave input puller type mismatch");
-
-                let output_pusher: Box<dyn Push<T, D>> = {
-                    let pushers: Vec<Box<dyn Push<T, D>>> = endpoints
-                        .output_pushers
+            let leave_factory: OperatorFactory =
+                single_use_factory(move |_ctx, endpoints: ChannelEndpoints| {
+                    let input_puller: Box<dyn Pull<PT<T, TInner>, D>> = *endpoints
+                        .input_pullers
                         .into_iter()
-                        .map(|any_box| {
-                            *any_box
-                                .downcast::<Box<dyn Push<T, D>>>()
-                                .expect("leave output pusher type mismatch")
-                        })
-                        .collect();
-                    tee_or_single(pushers).unwrap_or_else(|| Box::new(NullPush))
-                };
+                        .next()
+                        .expect("leave must have input puller")
+                        .downcast::<Box<dyn Pull<PT<T, TInner>, D>>>()
+                        .expect("leave input puller type mismatch");
 
-                Box::new(WiredLeaveOperator::<T, TInner, D>::new(
-                    leave_name,
-                    leave_idx,
-                    region_id,
-                    input_puller,
-                    output_pusher,
-                )) as Box<dyn SchedulableOperator>
-            });
+                    let output_pusher: Box<dyn Push<T, D>> = {
+                        let pushers: Vec<Box<dyn Push<T, D>>> = endpoints
+                            .output_pushers
+                            .into_iter()
+                            .map(|any_box| {
+                                *any_box
+                                    .downcast::<Box<dyn Push<T, D>>>()
+                                    .expect("leave output pusher type mismatch")
+                            })
+                            .collect();
+                        tee_or_single(pushers).unwrap_or_else(|| Box::new(NullPush))
+                    };
+
+                    Box::new(WiredLeaveOperator::<T, TInner, D>::new(
+                        leave_name,
+                        leave_idx,
+                        stage_id,
+                        input_puller,
+                        output_pusher,
+                    )) as Box<dyn SchedulableOperator>
+                });
             state.operator_factories.push((leave_idx, leave_factory));
 
             // Channel factory for leave's input edge
             let cap = output_capacity;
-            let cf_leave: ChannelFactory = channel_factory(move |_ctx, _cap: usize, wake: Option<WakeHandle>| {
-                let (push, pull) = bounded_channel_with_wake::<PT<T, TInner>, D, ()>(cap, wake.clone());
-                (
-                    Box::new(Box::new(push) as Box<dyn Push<PT<T, TInner>, D>>) as Box<dyn std::any::Any + Send>,
-                    Box::new(Box::new(pull) as Box<dyn Pull<PT<T, TInner>, D>>) as Box<dyn std::any::Any + Send>,
-                )
-            });
+            let cf_leave: ChannelFactory =
+                channel_factory(move |_ctx, _cap: usize, wake: Option<WakeHandle>| {
+                    let (push, pull) =
+                        bounded_channel_with_wake::<PT<T, TInner>, D, ()>(cap, wake.clone());
+                    (
+                        Box::new(Box::new(push) as Box<dyn Push<PT<T, TInner>, D>>)
+                            as Box<dyn std::any::Any + Send>,
+                        Box::new(Box::new(pull) as Box<dyn Pull<PT<T, TInner>, D>>)
+                            as Box<dyn std::any::Any + Send>,
+                    )
+                });
             state.channel_factories.push((leave_edge_idx, cf_leave));
         }
 
@@ -1742,7 +1821,7 @@ impl<T: Timestamp, D: Clone + Send + 'static> Pipe<T, D> {
 
         let num_inputs = streams.len();
         let op_idx;
-        let region_id = RegionId::new(0);
+        let stage_id = StageId::new(0);
         let state_rc = Rc::clone(&streams[0].state);
 
         {
@@ -1753,7 +1832,7 @@ impl<T: Timestamp, D: Clone + Send + 'static> Pipe<T, D> {
             state
                 .graph
                 .register_operator(crate::dataflow::graph::OperatorInfo::new(
-                    op_idx, "concat", region_id, num_inputs, 1,
+                    op_idx, "concat", stage_id, num_inputs, 1,
                 ))
                 .expect("operator index unique");
 
@@ -1763,8 +1842,8 @@ impl<T: Timestamp, D: Clone + Send + 'static> Pipe<T, D> {
                 state.graph.add_edge(crate::dataflow::graph::EdgeInfo::new(
                     Slot::new(s.op_idx, s.output_slot),
                     Slot::new(op_idx, i),
-                    region_id,
-                    region_id,
+                    stage_id,
+                    stage_id,
                 ));
                 edge_indices.push(state.graph.edges().len() - 1);
             }
@@ -1785,51 +1864,54 @@ impl<T: Timestamp, D: Clone + Send + 'static> Pipe<T, D> {
             }
 
             // Operator factory
-            let factory: OperatorFactory = single_use_factory(move |_ctx, endpoints: ChannelEndpoints| {
-                let input_pullers: Vec<Box<dyn Pull<T, D>>> = endpoints
-                    .input_pullers
-                    .into_iter()
-                    .map(|any_box| {
-                        *any_box
-                            .downcast::<Box<dyn Pull<T, D>>>()
-                            .expect("concat input puller type mismatch")
-                    })
-                    .collect();
-
-                let output_pusher: Box<dyn Push<T, D>> = {
-                    let pushers: Vec<Box<dyn Push<T, D>>> = endpoints
-                        .output_pushers
+            let factory: OperatorFactory =
+                single_use_factory(move |_ctx, endpoints: ChannelEndpoints| {
+                    let input_pullers: Vec<Box<dyn Pull<T, D>>> = endpoints
+                        .input_pullers
                         .into_iter()
                         .map(|any_box| {
                             *any_box
-                                .downcast::<Box<dyn Push<T, D>>>()
-                                .expect("concat output pusher type mismatch")
+                                .downcast::<Box<dyn Pull<T, D>>>()
+                                .expect("concat input puller type mismatch")
                         })
                         .collect();
-                    tee_or_single(pushers).unwrap_or_else(|| Box::new(NullPush))
-                };
 
-                Box::new(WiredConcatOperator::new(
-                    "concat",
-                    op_idx,
-                    region_id,
-                    input_pullers,
-                    output_pusher,
-                )) as Box<dyn SchedulableOperator>
-            });
+                    let output_pusher: Box<dyn Push<T, D>> = {
+                        let pushers: Vec<Box<dyn Push<T, D>>> = endpoints
+                            .output_pushers
+                            .into_iter()
+                            .map(|any_box| {
+                                *any_box
+                                    .downcast::<Box<dyn Push<T, D>>>()
+                                    .expect("concat output pusher type mismatch")
+                            })
+                            .collect();
+                        tee_or_single(pushers).unwrap_or_else(|| Box::new(NullPush))
+                    };
+
+                    Box::new(WiredConcatOperator::new(
+                        "concat",
+                        op_idx,
+                        stage_id,
+                        input_pullers,
+                        output_pusher,
+                    )) as Box<dyn SchedulableOperator>
+                });
             state.operator_factories.push((op_idx, factory));
 
             // Channel factories for each input edge (per-input capacity)
             for (edge_idx, capacity) in edge_indices.into_iter().zip(capacities) {
-                let chan_factory: ChannelFactory = channel_factory(move |_ctx, _cap: usize, wake: Option<WakeHandle>| {
-                    let (push, pull) = bounded_channel_with_wake::<T, D, ()>(capacity, wake.clone());
-                    (
-                        Box::new(Box::new(push) as Box<dyn Push<T, D>>)
-                            as Box<dyn std::any::Any + Send>,
-                        Box::new(Box::new(pull) as Box<dyn Pull<T, D>>)
-                            as Box<dyn std::any::Any + Send>,
-                    )
-                });
+                let chan_factory: ChannelFactory =
+                    channel_factory(move |_ctx, _cap: usize, wake: Option<WakeHandle>| {
+                        let (push, pull) =
+                            bounded_channel_with_wake::<T, D, ()>(capacity, wake.clone());
+                        (
+                            Box::new(Box::new(push) as Box<dyn Push<T, D>>)
+                                as Box<dyn std::any::Any + Send>,
+                            Box::new(Box::new(pull) as Box<dyn Pull<T, D>>)
+                                as Box<dyn std::any::Any + Send>,
+                        )
+                    });
                 state.channel_factories.push((edge_idx, chan_factory));
             }
         }
@@ -1865,13 +1947,13 @@ impl<T: Timestamp, D: Clone + Send + 'static> Pipe<T, D> {
             );
 
             op_idx = state.allocate_operator_index();
-            let region_id = RegionId::new(0);
+            let stage_id = StageId::new(0);
 
             // Register sink operator in graph (1 input, 0 outputs)
             state
                 .graph
                 .register_operator(crate::dataflow::graph::OperatorInfo::new(
-                    op_idx, &name, region_id, 1, 0,
+                    op_idx, &name, stage_id, 1, 0,
                 ))
                 .expect("operator index unique");
 
@@ -1879,18 +1961,14 @@ impl<T: Timestamp, D: Clone + Send + 'static> Pipe<T, D> {
             state.graph.add_edge(crate::dataflow::graph::EdgeInfo::new(
                 Slot::new(self.op_idx, self.output_slot),
                 Slot::new(op_idx, 0),
-                region_id,
-                region_id,
+                stage_id,
+                stage_id,
             ));
 
             // Subgraph builder: sink has 1 input, 0 outputs, no connectivity
-            state.subgraph_builder.add_operator(
-                op_idx,
-                &name,
-                1,
-                0,
-                PortConnectivity::new(1, 0),
-            );
+            state
+                .subgraph_builder
+                .add_operator(op_idx, &name, 1, 0, PortConnectivity::new(1, 0));
             state.subgraph_builder.add_edge(
                 Location::source(self.op_idx, self.output_slot),
                 Location::target(op_idx, 0),
@@ -1906,23 +1984,24 @@ impl<T: Timestamp, D: Clone + Send + 'static> Pipe<T, D> {
             // Operator factory: collecting sink (used by run(), replaced by spawn())
             let collector_clone = Arc::clone(&collector);
             let name_clone = name.clone();
-            let factory: OperatorFactory = single_use_factory(move |_ctx, endpoints: ChannelEndpoints| {
-                let input_puller: Box<dyn Pull<T, D>> = *endpoints
-                    .input_pullers
-                    .into_iter()
-                    .next()
-                    .expect("sink must have input puller")
-                    .downcast::<Box<dyn Pull<T, D>>>()
-                    .expect("sink input puller type mismatch");
+            let factory: OperatorFactory =
+                single_use_factory(move |_ctx, endpoints: ChannelEndpoints| {
+                    let input_puller: Box<dyn Pull<T, D>> = *endpoints
+                        .input_pullers
+                        .into_iter()
+                        .next()
+                        .expect("sink must have input puller")
+                        .downcast::<Box<dyn Pull<T, D>>>()
+                        .expect("sink input puller type mismatch");
 
-                Box::new(CollectingSink::new(
-                    name_clone,
-                    op_idx,
-                    region_id,
-                    input_puller,
-                    collector_clone,
-                )) as Box<dyn SchedulableOperator>
-            });
+                    Box::new(CollectingSink::new(
+                        name_clone,
+                        op_idx,
+                        stage_id,
+                        input_puller,
+                        collector_clone,
+                    )) as Box<dyn SchedulableOperator>
+                });
             state.operator_factories.push((op_idx, factory));
 
             // Store a wiring closure that creates a ChannelSinkOperator
@@ -1931,7 +2010,9 @@ impl<T: Timestamp, D: Clone + Send + 'static> Pipe<T, D> {
             let sink_name = name.clone();
             #[allow(unused_variables)]
             let wiring: OutputPortWiring = Box::new(move |mode, wake_handle| {
-                use crate::dataflow::channel_operators::{ChannelSinkOperator, OutputReceiver, OutputSend};
+                use crate::dataflow::channel_operators::{
+                    ChannelSinkOperator, OutputReceiver, OutputSend,
+                };
 
                 match mode {
                     ChannelMode::Sync => {
@@ -1939,23 +2020,24 @@ impl<T: Timestamp, D: Clone + Send + 'static> Pipe<T, D> {
                         let receiver = OutputReceiver::new(rx);
 
                         let sink_name_inner = sink_name.clone();
-                        let factory: OperatorFactory = single_use_factory(move |_ctx, endpoints: ChannelEndpoints| {
-                            let input_puller: Box<dyn Pull<T, D>> = *endpoints
-                                .input_pullers
-                                .into_iter()
-                                .next()
-                                .expect("sink must have input puller")
-                                .downcast::<Box<dyn Pull<T, D>>>()
-                                .expect("sink input puller type mismatch");
+                        let factory: OperatorFactory =
+                            single_use_factory(move |_ctx, endpoints: ChannelEndpoints| {
+                                let input_puller: Box<dyn Pull<T, D>> = *endpoints
+                                    .input_pullers
+                                    .into_iter()
+                                    .next()
+                                    .expect("sink must have input puller")
+                                    .downcast::<Box<dyn Pull<T, D>>>()
+                                    .expect("sink input puller type mismatch");
 
-                            Box::new(ChannelSinkOperator::new(
-                                sink_name_inner,
-                                op_idx,
-                                RegionId::new(0),
-                                input_puller,
-                                OutputSend::Std(tx),
-                            )) as Box<dyn SchedulableOperator>
-                        });
+                                Box::new(ChannelSinkOperator::new(
+                                    sink_name_inner,
+                                    op_idx,
+                                    StageId::new(0),
+                                    input_puller,
+                                    OutputSend::Std(tx),
+                                )) as Box<dyn SchedulableOperator>
+                            });
 
                         let receiver_any: Box<dyn std::any::Any + Send> = Box::new(receiver);
                         (factory, receiver_any)
@@ -1972,23 +2054,24 @@ impl<T: Timestamp, D: Clone + Send + 'static> Pipe<T, D> {
                         };
 
                         let sink_name_inner = sink_name.clone();
-                        let factory: OperatorFactory = single_use_factory(move |_ctx, endpoints: ChannelEndpoints| {
-                            let input_puller: Box<dyn Pull<T, D>> = *endpoints
-                                .input_pullers
-                                .into_iter()
-                                .next()
-                                .expect("sink must have input puller")
-                                .downcast::<Box<dyn Pull<T, D>>>()
-                                .expect("sink input puller type mismatch");
+                        let factory: OperatorFactory =
+                            single_use_factory(move |_ctx, endpoints: ChannelEndpoints| {
+                                let input_puller: Box<dyn Pull<T, D>> = *endpoints
+                                    .input_pullers
+                                    .into_iter()
+                                    .next()
+                                    .expect("sink must have input puller")
+                                    .downcast::<Box<dyn Pull<T, D>>>()
+                                    .expect("sink input puller type mismatch");
 
-                            Box::new(ChannelSinkOperator::new(
-                                sink_name_inner,
-                                op_idx,
-                                RegionId::new(0),
-                                input_puller,
-                                OutputSend::Tokio(tx),
-                            )) as Box<dyn SchedulableOperator>
-                        });
+                                Box::new(ChannelSinkOperator::new(
+                                    sink_name_inner,
+                                    op_idx,
+                                    StageId::new(0),
+                                    input_puller,
+                                    OutputSend::Tokio(tx),
+                                )) as Box<dyn SchedulableOperator>
+                            });
 
                         let receiver_any: Box<dyn std::any::Any + Send> = Box::new(receiver);
                         (factory, receiver_any)
@@ -1999,13 +2082,17 @@ impl<T: Timestamp, D: Clone + Send + 'static> Pipe<T, D> {
 
             // Channel factory for the input edge
             let edge_idx = state.graph.edges().len() - 1;
-            let chan_factory: ChannelFactory = channel_factory(move |_ctx, _cap: usize, wake: Option<WakeHandle>| {
-                let (push, pull) = bounded_channel_with_wake::<T, D, ()>(capacity, wake.clone());
-                (
-                    Box::new(Box::new(push) as Box<dyn Push<T, D>>) as Box<dyn std::any::Any + Send>,
-                    Box::new(Box::new(pull) as Box<dyn Pull<T, D>>) as Box<dyn std::any::Any + Send>,
-                )
-            });
+            let chan_factory: ChannelFactory =
+                channel_factory(move |_ctx, _cap: usize, wake: Option<WakeHandle>| {
+                    let (push, pull) =
+                        bounded_channel_with_wake::<T, D, ()>(capacity, wake.clone());
+                    (
+                        Box::new(Box::new(push) as Box<dyn Push<T, D>>)
+                            as Box<dyn std::any::Any + Send>,
+                        Box::new(Box::new(pull) as Box<dyn Pull<T, D>>)
+                            as Box<dyn std::any::Any + Send>,
+                    )
+                });
             state.channel_factories.push((edge_idx, chan_factory));
         }
 
@@ -2028,7 +2115,6 @@ impl<T: Timestamp, D: Clone + Send + 'static> Pipe<T, D> {
         };
         self.output(name).collector
     }
-
 }
 
 // ---------------------------------------------------------------------------
@@ -2059,7 +2145,11 @@ where
     /// let results: Pipe<u64, Result<i32, String>> = source.map_ok("double", |_t, v| v * 2);
     /// // Ok(5) → Ok(10), Err("bad") → Err("bad")
     /// ```
-    pub fn map_ok<V2, F>(self, name: impl Into<String>, mut f: F) -> Pipe<T, std::result::Result<V2, E>>
+    pub fn map_ok<V2, F>(
+        self,
+        name: impl Into<String>,
+        mut f: F,
+    ) -> Pipe<T, std::result::Result<V2, E>>
     where
         V2: Clone + Send + 'static,
         F: FnMut(&T, V) -> V2 + Send + 'static,
@@ -2082,7 +2172,11 @@ where
     ///     source.filter_ok("positive", |_t, v| *v > 0);
     /// // Ok(5) → Ok(5), Ok(-1) → dropped, Err("x") → Err("x")
     /// ```
-    pub fn filter_ok<F>(self, name: impl Into<String>, mut predicate: F) -> Pipe<T, std::result::Result<V, E>>
+    pub fn filter_ok<F>(
+        self,
+        name: impl Into<String>,
+        mut predicate: F,
+    ) -> Pipe<T, std::result::Result<V, E>>
     where
         F: FnMut(&T, &V) -> bool + Send + 'static,
     {
@@ -2104,7 +2198,11 @@ where
     /// let parsed: Pipe<u64, Result<i32, String>> =
     ///     strings.and_then("parse", |_t, s: String| s.parse::<i32>().map_err(|e| e.to_string()));
     /// ```
-    pub fn and_then<V2, F>(self, name: impl Into<String>, mut f: F) -> Pipe<T, std::result::Result<V2, E>>
+    pub fn and_then<V2, F>(
+        self,
+        name: impl Into<String>,
+        mut f: F,
+    ) -> Pipe<T, std::result::Result<V2, E>>
     where
         V2: Clone + Send + 'static,
         F: FnMut(&T, V) -> std::result::Result<V2, E> + Send + 'static,
@@ -2151,7 +2249,6 @@ where
     }
 }
 
-
 /// Exchange methods that support both local and network-backed transport.
 ///
 /// When the `transport` feature is enabled, exchange data types must implement
@@ -2159,7 +2256,11 @@ where
 /// potential network serialization in `spawn_cluster`. Common types (`i32`,
 /// `u64`, `String`, tuples of ExchangeData, etc.) already implement this trait.
 #[cfg(feature = "transport")]
-impl<T: Timestamp + crate::communication::codec::ExchangeData, D: Clone + crate::communication::codec::ExchangeData> Pipe<T, D> {
+impl<
+    T: Timestamp + crate::communication::codec::ExchangeData,
+    D: Clone + crate::communication::codec::ExchangeData,
+> Pipe<T, D>
+{
     /// Repartition data across workers based on a hash function.
     ///
     /// Records with the same hash are routed to the same worker, enabling
@@ -2179,8 +2280,7 @@ impl<T: Timestamp + crate::communication::codec::ExchangeData, D: Clone + crate:
         key_fn: impl Fn(&D) -> K + Send + Sync + 'static,
     ) -> Pipe<T, D> {
         let capacity = self.resolve_capacity();
-        let exchange_fn =
-            crate::dataflow::channels::pact::ExchangeFn::by_key(&name.into(), key_fn);
+        let exchange_fn = crate::dataflow::channels::pact::ExchangeFn::by_key(&name.into(), key_fn);
         self.add_exchange_internal_networked(exchange_fn, capacity)
     }
 
@@ -2200,12 +2300,14 @@ impl<T: Timestamp + crate::communication::codec::ExchangeData, D: Clone + crate:
     ) -> Pipe<T, D> {
         assert!(target_parallelism > 0, "target_parallelism must be > 0");
         let capacity = self.resolve_capacity();
-        let exchange_fn =
-            crate::dataflow::channels::pact::ExchangeFn::by_key(&name.into(), key_fn);
+        let exchange_fn = crate::dataflow::channels::pact::ExchangeFn::by_key(&name.into(), key_fn);
         let pipe = self.add_exchange_internal_networked(exchange_fn, capacity);
         // Record target parallelism on the exchange operator we just created.
         let exchange_op_idx = pipe.op_idx;
-        pipe.state.borrow_mut().graph.set_exchange_parallelism(exchange_op_idx, target_parallelism);
+        pipe.state
+            .borrow_mut()
+            .graph
+            .set_exchange_parallelism(exchange_op_idx, target_parallelism);
         pipe
     }
 
@@ -2219,8 +2321,7 @@ impl<T: Timestamp + crate::communication::codec::ExchangeData, D: Clone + crate:
         hash_fn: impl Fn(&D) -> u64 + Send + Sync + 'static,
     ) -> Pipe<T, D> {
         let capacity = self.resolve_capacity();
-        let exchange_fn =
-            crate::dataflow::channels::pact::ExchangeFn::new(name, hash_fn);
+        let exchange_fn = crate::dataflow::channels::pact::ExchangeFn::new(name, hash_fn);
         self.add_exchange_internal_networked(exchange_fn, capacity)
     }
 
@@ -2236,11 +2337,13 @@ impl<T: Timestamp + crate::communication::codec::ExchangeData, D: Clone + crate:
     ) -> Pipe<T, D> {
         assert!(target_parallelism > 0, "target_parallelism must be > 0");
         let capacity = self.resolve_capacity();
-        let exchange_fn =
-            crate::dataflow::channels::pact::ExchangeFn::new(name, hash_fn);
+        let exchange_fn = crate::dataflow::channels::pact::ExchangeFn::new(name, hash_fn);
         let pipe = self.add_exchange_internal_networked(exchange_fn, capacity);
         let exchange_op_idx = pipe.op_idx;
-        pipe.state.borrow_mut().graph.set_exchange_parallelism(exchange_op_idx, target_parallelism);
+        pipe.state
+            .borrow_mut()
+            .graph
+            .set_exchange_parallelism(exchange_op_idx, target_parallelism);
         pipe
     }
 
@@ -2256,12 +2359,17 @@ impl<T: Timestamp + crate::communication::codec::ExchangeData, D: Clone + crate:
         {
             let mut state = self.state.borrow_mut();
             let edge_idx = state.graph.edges().len() - 1;
-            let creator: Box<dyn crate::dataflow::channels::exchange_channel::NetworkExchangeCreator> =
-                Box::new(crate::dataflow::channels::exchange_channel::NetworkExchangeCreatorImpl::<T, D> {
+            let creator: Box<
+                dyn crate::dataflow::channels::exchange_channel::NetworkExchangeCreator,
+            > = Box::new(
+                crate::dataflow::channels::exchange_channel::NetworkExchangeCreatorImpl::<T, D> {
                     exchange_fn,
                     _phantom: std::marker::PhantomData,
-                });
-            state.exchange_network_creators.push((edge_idx, capacity, creator));
+                },
+            );
+            state
+                .exchange_network_creators
+                .push((edge_idx, capacity, creator));
         }
 
         pipe
@@ -2290,8 +2398,7 @@ impl<T: Timestamp, D: Clone + Send + 'static> Pipe<T, D> {
         key_fn: impl Fn(&D) -> K + Send + Sync + 'static,
     ) -> Pipe<T, D> {
         let capacity = self.resolve_capacity();
-        let exchange_fn =
-            crate::dataflow::channels::pact::ExchangeFn::by_key(&name.into(), key_fn);
+        let exchange_fn = crate::dataflow::channels::pact::ExchangeFn::by_key(&name.into(), key_fn);
         self.add_exchange_internal(exchange_fn, capacity)
     }
 
@@ -2311,11 +2418,13 @@ impl<T: Timestamp, D: Clone + Send + 'static> Pipe<T, D> {
     ) -> Pipe<T, D> {
         assert!(target_parallelism > 0, "target_parallelism must be > 0");
         let capacity = self.resolve_capacity();
-        let exchange_fn =
-            crate::dataflow::channels::pact::ExchangeFn::by_key(&name.into(), key_fn);
+        let exchange_fn = crate::dataflow::channels::pact::ExchangeFn::by_key(&name.into(), key_fn);
         let pipe = self.add_exchange_internal(exchange_fn, capacity);
         let exchange_op_idx = pipe.op_idx;
-        pipe.state.borrow_mut().graph.set_exchange_parallelism(exchange_op_idx, target_parallelism);
+        pipe.state
+            .borrow_mut()
+            .graph
+            .set_exchange_parallelism(exchange_op_idx, target_parallelism);
         pipe
     }
 
@@ -2329,8 +2438,7 @@ impl<T: Timestamp, D: Clone + Send + 'static> Pipe<T, D> {
         hash_fn: impl Fn(&D) -> u64 + Send + Sync + 'static,
     ) -> Pipe<T, D> {
         let capacity = self.resolve_capacity();
-        let exchange_fn =
-            crate::dataflow::channels::pact::ExchangeFn::new(name, hash_fn);
+        let exchange_fn = crate::dataflow::channels::pact::ExchangeFn::new(name, hash_fn);
         self.add_exchange_internal(exchange_fn, capacity)
     }
 
@@ -2346,11 +2454,13 @@ impl<T: Timestamp, D: Clone + Send + 'static> Pipe<T, D> {
     ) -> Pipe<T, D> {
         assert!(target_parallelism > 0, "target_parallelism must be > 0");
         let capacity = self.resolve_capacity();
-        let exchange_fn =
-            crate::dataflow::channels::pact::ExchangeFn::new(name, hash_fn);
+        let exchange_fn = crate::dataflow::channels::pact::ExchangeFn::new(name, hash_fn);
         let pipe = self.add_exchange_internal(exchange_fn, capacity);
         let exchange_op_idx = pipe.op_idx;
-        pipe.state.borrow_mut().graph.set_exchange_parallelism(exchange_op_idx, target_parallelism);
+        pipe.state
+            .borrow_mut()
+            .graph
+            .set_exchange_parallelism(exchange_op_idx, target_parallelism);
         pipe
     }
 }
@@ -2369,7 +2479,7 @@ impl<T: Timestamp, D: Clone + Send + 'static> Pipe<T, D> {
         capacity: usize,
     ) -> Pipe<T, D> {
         let op_idx;
-        let region_id = RegionId::new(0);
+        let stage_id = StageId::new(0);
 
         // Identity pass-through logic: forward all input to output unchanged.
         let wired_logic =
@@ -2390,17 +2500,19 @@ impl<T: Timestamp, D: Clone + Send + 'static> Pipe<T, D> {
             state
                 .graph
                 .register_operator(crate::dataflow::graph::OperatorInfo::new(
-                    op_idx, "exchange", region_id, 1, 1,
+                    op_idx, "exchange", stage_id, 1, 1,
                 ))
                 .expect("operator index unique");
 
             // Edge from upstream — marked as Exchange.
-            state.graph.add_edge(crate::dataflow::graph::EdgeInfo::exchange(
-                Slot::new(self.op_idx, self.output_slot),
-                Slot::new(op_idx, 0),
-                region_id,
-                region_id,
-            ));
+            state
+                .graph
+                .add_edge(crate::dataflow::graph::EdgeInfo::exchange(
+                    Slot::new(self.op_idx, self.output_slot),
+                    Slot::new(op_idx, 0),
+                    stage_id,
+                    stage_id,
+                ));
 
             // Subgraph connectivity.
             // Register with an initial capability at T::minimum(). This prevents
@@ -2452,7 +2564,7 @@ impl<T: Timestamp, D: Clone + Send + 'static> Pipe<T, D> {
                     Box::new(WiredUnaryOperator::with_reporter(
                         name_clone,
                         op_idx,
-                        region_id,
+                        stage_id,
                         wired_logic,
                         input_puller,
                         output_pusher,
@@ -2478,7 +2590,10 @@ impl<T: Timestamp, D: Clone + Send + 'static> Pipe<T, D> {
             state.channel_factories.push((edge_idx, chan_factory));
 
             // Store exchange factory creator for multi-worker.
-            let creator = crate::dataflow::channels::exchange_channel::create_exchange_factory_creator::<T, D>(exchange_fn);
+            let creator =
+                crate::dataflow::channels::exchange_channel::create_exchange_factory_creator::<T, D>(
+                    exchange_fn,
+                );
             state.exchange_creators.push((edge_idx, capacity, creator));
         }
 
@@ -2523,7 +2638,7 @@ impl<T: Timestamp, D: Clone + Send + 'static> Pipe<T, D> {
     {
         let name = name.into();
         let op_idx;
-        let region_id = RegionId::new(0);
+        let stage_id = StageId::new(0);
 
         let mut logic = logic;
         let wired_logic =
@@ -2545,7 +2660,7 @@ impl<T: Timestamp, D: Clone + Send + 'static> Pipe<T, D> {
             state
                 .graph
                 .register_operator(crate::dataflow::graph::OperatorInfo::new(
-                    op_idx, &name, region_id, 1, 1,
+                    op_idx, &name, stage_id, 1, 1,
                 ))
                 .expect("operator index unique");
 
@@ -2553,8 +2668,8 @@ impl<T: Timestamp, D: Clone + Send + 'static> Pipe<T, D> {
             state.graph.add_edge(crate::dataflow::graph::EdgeInfo::new(
                 Slot::new(self.op_idx, self.output_slot),
                 Slot::new(op_idx, 0),
-                region_id,
-                region_id,
+                stage_id,
+                stage_id,
             ));
 
             // Subgraph: identity connectivity (timestamps pass through unchanged)
@@ -2573,50 +2688,53 @@ impl<T: Timestamp, D: Clone + Send + 'static> Pipe<T, D> {
             // Operator factory — handles fan-out by wrapping multiple output
             // pushers in a TeePush adapter when the Pipe was cloned.
             let name_clone = name.clone();
-            let factory: OperatorFactory = single_use_factory(move |_ctx, endpoints: ChannelEndpoints| {
-                let input_puller: Box<dyn Pull<T, D>> = *endpoints
-                    .input_pullers
-                    .into_iter()
-                    .next()
-                    .expect("unary must have input puller")
-                    .downcast::<Box<dyn Pull<T, D>>>()
-                    .expect("unary input puller type mismatch");
-
-                let output_pusher: Box<dyn Push<T, D2>> = {
-                    let pushers: Vec<Box<dyn Push<T, D2>>> = endpoints
-                        .output_pushers
+            let factory: OperatorFactory =
+                single_use_factory(move |_ctx, endpoints: ChannelEndpoints| {
+                    let input_puller: Box<dyn Pull<T, D>> = *endpoints
+                        .input_pullers
                         .into_iter()
-                        .map(|any_box| {
-                            *any_box
-                                .downcast::<Box<dyn Push<T, D2>>>()
-                                .expect("unary output pusher type mismatch")
-                        })
-                        .collect();
-                    tee_or_single(pushers).unwrap_or_else(|| Box::new(NullPush))
-                };
+                        .next()
+                        .expect("unary must have input puller")
+                        .downcast::<Box<dyn Pull<T, D>>>()
+                        .expect("unary input puller type mismatch");
 
-                Box::new(WiredUnaryOperator::new(
-                    name_clone,
-                    op_idx,
-                    region_id,
-                    wired_logic,
-                    input_puller,
-                    output_pusher,
-                )) as Box<dyn SchedulableOperator>
-            });
+                    let output_pusher: Box<dyn Push<T, D2>> = {
+                        let pushers: Vec<Box<dyn Push<T, D2>>> = endpoints
+                            .output_pushers
+                            .into_iter()
+                            .map(|any_box| {
+                                *any_box
+                                    .downcast::<Box<dyn Push<T, D2>>>()
+                                    .expect("unary output pusher type mismatch")
+                            })
+                            .collect();
+                        tee_or_single(pushers).unwrap_or_else(|| Box::new(NullPush))
+                    };
+
+                    Box::new(WiredUnaryOperator::new(
+                        name_clone,
+                        op_idx,
+                        stage_id,
+                        wired_logic,
+                        input_puller,
+                        output_pusher,
+                    )) as Box<dyn SchedulableOperator>
+                });
             state.operator_factories.push((op_idx, factory));
 
             // Channel factory for the input edge
             let edge_idx = state.graph.edges().len() - 1;
-            let chan_factory: ChannelFactory = channel_factory(move |_ctx, _cap: usize, wake: Option<WakeHandle>| {
-                let (push, pull) = bounded_channel_with_wake::<T, D, ()>(capacity, wake.clone());
-                (
-                    Box::new(Box::new(push) as Box<dyn Push<T, D>>)
-                        as Box<dyn std::any::Any + Send>,
-                    Box::new(Box::new(pull) as Box<dyn Pull<T, D>>)
-                        as Box<dyn std::any::Any + Send>,
-                )
-            });
+            let chan_factory: ChannelFactory =
+                channel_factory(move |_ctx, _cap: usize, wake: Option<WakeHandle>| {
+                    let (push, pull) =
+                        bounded_channel_with_wake::<T, D, ()>(capacity, wake.clone());
+                    (
+                        Box::new(Box::new(push) as Box<dyn Push<T, D>>)
+                            as Box<dyn std::any::Any + Send>,
+                        Box::new(Box::new(pull) as Box<dyn Pull<T, D>>)
+                            as Box<dyn std::any::Any + Send>,
+                    )
+                });
             state.channel_factories.push((edge_idx, chan_factory));
         }
 
@@ -2638,13 +2756,11 @@ impl<T: Timestamp, D: Clone + Send + 'static> Pipe<T, D> {
     ) -> Pipe<T, D2>
     where
         D2: Clone + Send + 'static,
-        L: FnMut(&mut InputHandle<T, D>, &mut OutputHandle<T, D2>) -> Result<()>
-            + Send
-            + 'static,
+        L: FnMut(&mut InputHandle<T, D>, &mut OutputHandle<T, D2>) -> Result<()> + Send + 'static,
     {
         let name = name.into();
         let op_idx;
-        let region_id = RegionId::new(0);
+        let stage_id = StageId::new(0);
 
         {
             let mut state = self.state.borrow_mut();
@@ -2654,7 +2770,7 @@ impl<T: Timestamp, D: Clone + Send + 'static> Pipe<T, D> {
             state
                 .graph
                 .register_operator(crate::dataflow::graph::OperatorInfo::new(
-                    op_idx, &name, region_id, 1, 1,
+                    op_idx, &name, stage_id, 1, 1,
                 ))
                 .expect("operator index unique");
 
@@ -2662,8 +2778,8 @@ impl<T: Timestamp, D: Clone + Send + 'static> Pipe<T, D> {
             state.graph.add_edge(crate::dataflow::graph::EdgeInfo::new(
                 Slot::new(self.op_idx, self.output_slot),
                 Slot::new(op_idx, 0),
-                region_id,
-                region_id,
+                stage_id,
+                stage_id,
             ));
 
             // Subgraph: identity connectivity
@@ -2681,50 +2797,53 @@ impl<T: Timestamp, D: Clone + Send + 'static> Pipe<T, D> {
 
             // Operator factory — handles fan-out via TeePush
             let name_clone = name.clone();
-            let factory: OperatorFactory = single_use_factory(move |_ctx, endpoints: ChannelEndpoints| {
-                let input_puller: Box<dyn Pull<T, D>> = *endpoints
-                    .input_pullers
-                    .into_iter()
-                    .next()
-                    .expect("unary must have input puller")
-                    .downcast::<Box<dyn Pull<T, D>>>()
-                    .expect("unary input puller type mismatch");
-
-                let output_pusher: Box<dyn Push<T, D2>> = {
-                    let pushers: Vec<Box<dyn Push<T, D2>>> = endpoints
-                        .output_pushers
+            let factory: OperatorFactory =
+                single_use_factory(move |_ctx, endpoints: ChannelEndpoints| {
+                    let input_puller: Box<dyn Pull<T, D>> = *endpoints
+                        .input_pullers
                         .into_iter()
-                        .map(|any_box| {
-                            *any_box
-                                .downcast::<Box<dyn Push<T, D2>>>()
-                                .expect("unary output pusher type mismatch")
-                        })
-                        .collect();
-                    tee_or_single(pushers).unwrap_or_else(|| Box::new(NullPush))
-                };
+                        .next()
+                        .expect("unary must have input puller")
+                        .downcast::<Box<dyn Pull<T, D>>>()
+                        .expect("unary input puller type mismatch");
 
-                Box::new(WiredUnaryOperator::new(
-                    name_clone,
-                    op_idx,
-                    region_id,
-                    logic,
-                    input_puller,
-                    output_pusher,
-                )) as Box<dyn SchedulableOperator>
-            });
+                    let output_pusher: Box<dyn Push<T, D2>> = {
+                        let pushers: Vec<Box<dyn Push<T, D2>>> = endpoints
+                            .output_pushers
+                            .into_iter()
+                            .map(|any_box| {
+                                *any_box
+                                    .downcast::<Box<dyn Push<T, D2>>>()
+                                    .expect("unary output pusher type mismatch")
+                            })
+                            .collect();
+                        tee_or_single(pushers).unwrap_or_else(|| Box::new(NullPush))
+                    };
+
+                    Box::new(WiredUnaryOperator::new(
+                        name_clone,
+                        op_idx,
+                        stage_id,
+                        logic,
+                        input_puller,
+                        output_pusher,
+                    )) as Box<dyn SchedulableOperator>
+                });
             state.operator_factories.push((op_idx, factory));
 
             // Channel factory for the input edge
             let edge_idx = state.graph.edges().len() - 1;
-            let chan_factory: ChannelFactory = channel_factory(move |_ctx, _cap: usize, wake: Option<WakeHandle>| {
-                let (push, pull) = bounded_channel_with_wake::<T, D, ()>(capacity, wake.clone());
-                (
-                    Box::new(Box::new(push) as Box<dyn Push<T, D>>)
-                        as Box<dyn std::any::Any + Send>,
-                    Box::new(Box::new(pull) as Box<dyn Pull<T, D>>)
-                        as Box<dyn std::any::Any + Send>,
-                )
-            });
+            let chan_factory: ChannelFactory =
+                channel_factory(move |_ctx, _cap: usize, wake: Option<WakeHandle>| {
+                    let (push, pull) =
+                        bounded_channel_with_wake::<T, D, ()>(capacity, wake.clone());
+                    (
+                        Box::new(Box::new(push) as Box<dyn Push<T, D>>)
+                            as Box<dyn std::any::Any + Send>,
+                        Box::new(Box::new(pull) as Box<dyn Pull<T, D>>)
+                            as Box<dyn std::any::Any + Send>,
+                    )
+                });
             state.channel_factories.push((edge_idx, chan_factory));
         }
 
@@ -2764,7 +2883,7 @@ impl<T: Timestamp, D: Clone + Send + 'static> Pipe<T, D> {
     {
         let name = name.into();
         let op_idx;
-        let region_id = RegionId::new(0);
+        let stage_id = StageId::new(0);
 
         {
             let mut state = self.state.borrow_mut();
@@ -2774,7 +2893,7 @@ impl<T: Timestamp, D: Clone + Send + 'static> Pipe<T, D> {
             state
                 .graph
                 .register_operator(crate::dataflow::graph::OperatorInfo::new(
-                    op_idx, &name, region_id, 1, 1,
+                    op_idx, &name, stage_id, 1, 1,
                 ))
                 .expect("operator index unique");
 
@@ -2782,8 +2901,8 @@ impl<T: Timestamp, D: Clone + Send + 'static> Pipe<T, D> {
             state.graph.add_edge(crate::dataflow::graph::EdgeInfo::new(
                 Slot::new(self.op_idx, self.output_slot),
                 Slot::new(op_idx, 0),
-                region_id,
-                region_id,
+                stage_id,
+                stage_id,
             ));
 
             // Subgraph: identity connectivity (1 input → 1 output, default summary).
@@ -2813,58 +2932,61 @@ impl<T: Timestamp, D: Clone + Send + 'static> Pipe<T, D> {
             // and then into the operator; since ProgressReporter is Arc-based,
             // the ProgressTracker and operator share the same underlying buffer.
             let name_clone = name.clone();
-            let factory: OperatorFactory = single_use_factory(move |_ctx, endpoints: ChannelEndpoints| {
-                let input_puller: Box<dyn Pull<T, D>> = *endpoints
-                    .input_pullers
-                    .into_iter()
-                    .next()
-                    .expect("unary_notify must have input puller")
-                    .downcast::<Box<dyn Pull<T, D>>>()
-                    .expect("unary_notify input puller type mismatch");
-
-                let output_pusher: Box<dyn Push<T, D2>> = {
-                    let pushers: Vec<Box<dyn Push<T, D2>>> = endpoints
-                        .output_pushers
+            let factory: OperatorFactory =
+                single_use_factory(move |_ctx, endpoints: ChannelEndpoints| {
+                    let input_puller: Box<dyn Pull<T, D>> = *endpoints
+                        .input_pullers
                         .into_iter()
-                        .map(|any_box| {
-                            *any_box
-                                .downcast::<Box<dyn Push<T, D2>>>()
-                                .expect("unary_notify output pusher type mismatch")
-                        })
-                        .collect();
-                    tee_or_single(pushers).unwrap_or_else(|| Box::new(NullPush))
-                };
+                        .next()
+                        .expect("unary_notify must have input puller")
+                        .downcast::<Box<dyn Pull<T, D>>>()
+                        .expect("unary_notify input puller type mismatch");
 
-                // The initial frontier is [T::minimum()] — the operator starts with
-                // the assumption that all timestamps are possible. The executor will
-                // call update_input_frontier() after the first progress propagation
-                // to set the actual frontier.
-                let initial_frontier = Antichain::from_elem(T::minimum());
+                    let output_pusher: Box<dyn Push<T, D2>> = {
+                        let pushers: Vec<Box<dyn Push<T, D2>>> = endpoints
+                            .output_pushers
+                            .into_iter()
+                            .map(|any_box| {
+                                *any_box
+                                    .downcast::<Box<dyn Push<T, D2>>>()
+                                    .expect("unary_notify output pusher type mismatch")
+                            })
+                            .collect();
+                        tee_or_single(pushers).unwrap_or_else(|| Box::new(NullPush))
+                    };
 
-                Box::new(WiredUnaryNotifyOperator::new(
-                    name_clone,
-                    op_idx,
-                    region_id,
-                    logic,
-                    input_puller,
-                    output_pusher,
-                    progress_reporter,
-                    initial_frontier,
-                )) as Box<dyn SchedulableOperator>
-            });
+                    // The initial frontier is [T::minimum()] — the operator starts with
+                    // the assumption that all timestamps are possible. The executor will
+                    // call update_input_frontier() after the first progress propagation
+                    // to set the actual frontier.
+                    let initial_frontier = Antichain::from_elem(T::minimum());
+
+                    Box::new(WiredUnaryNotifyOperator::new(
+                        name_clone,
+                        op_idx,
+                        stage_id,
+                        logic,
+                        input_puller,
+                        output_pusher,
+                        progress_reporter,
+                        initial_frontier,
+                    )) as Box<dyn SchedulableOperator>
+                });
             state.operator_factories.push((op_idx, factory));
 
             // Channel factory for the input edge
             let edge_idx = state.graph.edges().len() - 1;
-            let chan_factory: ChannelFactory = channel_factory(move |_ctx, _cap: usize, wake: Option<WakeHandle>| {
-                let (push, pull) = bounded_channel_with_wake::<T, D, ()>(capacity, wake.clone());
-                (
-                    Box::new(Box::new(push) as Box<dyn Push<T, D>>)
-                        as Box<dyn std::any::Any + Send>,
-                    Box::new(Box::new(pull) as Box<dyn Pull<T, D>>)
-                        as Box<dyn std::any::Any + Send>,
-                )
-            });
+            let chan_factory: ChannelFactory =
+                channel_factory(move |_ctx, _cap: usize, wake: Option<WakeHandle>| {
+                    let (push, pull) =
+                        bounded_channel_with_wake::<T, D, ()>(capacity, wake.clone());
+                    (
+                        Box::new(Box::new(push) as Box<dyn Push<T, D>>)
+                            as Box<dyn std::any::Any + Send>,
+                        Box::new(Box::new(pull) as Box<dyn Pull<T, D>>)
+                            as Box<dyn std::any::Any + Send>,
+                    )
+                });
             state.channel_factories.push((edge_idx, chan_factory));
         }
 
@@ -2941,14 +3063,20 @@ pub struct LogicalDataflow<T: Timestamp> {
     /// Type-erased exchange factory creators — one per exchange edge.
     /// Consumed by `spawn_multi` to produce shared cross-worker channel factories.
     /// Tuple: (edge_index, capacity, creator_fn).
-    pub(crate) exchange_creators:
-        Vec<(usize, usize, crate::dataflow::channels::exchange_channel::ExchangeFactoryCreatorFn)>,
+    pub(crate) exchange_creators: Vec<(
+        usize,
+        usize,
+        crate::dataflow::channels::exchange_channel::ExchangeFactoryCreatorFn,
+    )>,
     /// Network-capable exchange creators — one per exchange edge (transport feature only).
     /// Consumed by `spawn_cluster` to produce network-backed exchange channel factories.
     /// Tuple: (edge_index, capacity, creator).
     #[cfg(feature = "transport")]
-    pub(crate) exchange_network_creators:
-        Vec<(usize, usize, Box<dyn crate::dataflow::channels::exchange_channel::NetworkExchangeCreator>)>,
+    pub(crate) exchange_network_creators: Vec<(
+        usize,
+        usize,
+        Box<dyn crate::dataflow::channels::exchange_channel::NetworkExchangeCreator>,
+    )>,
     /// User-supplied typed context values, carried from the builder.
     /// Available at materialization time and for future operator-level access.
     pub(crate) contexts: SharedContext,
@@ -3010,7 +3138,10 @@ impl<T: Timestamp> LogicalDataflow<T> {
     /// These are the edge indices that use cross-worker exchange channels
     /// (as opposed to pipeline channels).
     pub fn exchange_edge_indices(&self) -> Vec<usize> {
-        self.exchange_creators.iter().map(|(idx, _, _)| *idx).collect()
+        self.exchange_creators
+            .iter()
+            .map(|(idx, _, _)| *idx)
+            .collect()
     }
 
     /// Get the number of feedback (loop) edges in the graph.
@@ -3035,7 +3166,7 @@ impl<T: Timestamp> LogicalDataflow<T> {
 struct CollectingSink<T: Timestamp, D: Send + 'static> {
     name: String,
     index: usize,
-    region_id: RegionId,
+    stage_id: StageId,
     input_puller: Box<dyn Pull<T, D>>,
     collector: Arc<Mutex<Vec<(T, Vec<D>)>>>,
     input_exhausted: bool,
@@ -3046,14 +3177,14 @@ impl<T: Timestamp, D: Send + 'static> CollectingSink<T, D> {
     fn new(
         name: impl Into<String>,
         index: usize,
-        region_id: RegionId,
+        stage_id: StageId,
         input_puller: Box<dyn Pull<T, D>>,
         collector: Arc<Mutex<Vec<(T, Vec<D>)>>>,
     ) -> Self {
         Self {
             name: name.into(),
             index,
-            region_id,
+            stage_id,
             input_puller,
             collector,
             input_exhausted: false,
@@ -3109,8 +3240,8 @@ impl<T: Timestamp, D: Send + 'static> SchedulableOperator for CollectingSink<T, 
         self.index
     }
 
-    fn region_id(&self) -> RegionId {
-        self.region_id
+    fn stage_id(&self) -> StageId {
+        self.stage_id
     }
 
     fn close_inputs(&mut self) {
@@ -3132,8 +3263,13 @@ impl<T: Timestamp, D: Send + 'static> Push<T, D> for NullPush {
     fn try_push(
         &mut self,
         _envelope: crate::dataflow::channels::Envelope<T, D>,
-    ) -> std::result::Result<(), (crate::error::Error, crate::dataflow::channels::Envelope<T, D>)>
-    {
+    ) -> std::result::Result<
+        (),
+        (
+            crate::error::Error,
+            crate::dataflow::channels::Envelope<T, D>,
+        ),
+    > {
         Ok(())
     }
 
@@ -3236,7 +3372,10 @@ mod tests {
     fn test_flat_map() {
         let builder = DataflowBuilder::<u64>::new("flat_map_test");
         let port = builder
-            .source("lines", vec![(0u64, vec!["hello world".to_string(), "foo bar".to_string()])])
+            .source(
+                "lines",
+                vec![(0u64, vec!["hello world".to_string(), "foo bar".to_string()])],
+            )
             .flat_map("split", |_t, line| {
                 line.split_whitespace().map(|w| w.to_string()).collect()
             })
@@ -3264,9 +3403,7 @@ mod tests {
             .clone()
             .filter("evens", |_t, x| x % 2 == 0)
             .output("evens");
-        let odds_port = stream
-            .filter("odds", |_t, x| x % 2 != 0)
-            .output("odds");
+        let odds_port = stream.filter("odds", |_t, x| x % 2 != 0).output("odds");
 
         let dataflow = builder.build().unwrap();
         rt().run(dataflow).unwrap();
@@ -3337,11 +3474,7 @@ mod tests {
         let port = builder
             .source(
                 "nums",
-                vec![
-                    (0u64, vec![1i32, 2]),
-                    (1u64, vec![3, 4]),
-                    (2u64, vec![5]),
-                ],
+                vec![(0u64, vec![1i32, 2]), (1u64, vec![3, 4]), (2u64, vec![5])],
             )
             .map("double", |_t, x| x * 2)
             .output("results");
@@ -3359,9 +3492,7 @@ mod tests {
     #[test]
     fn test_collect_convenience() {
         let builder = DataflowBuilder::<u64>::new("collect");
-        let collector = builder
-            .source("nums", vec![(0u64, vec![42i32])])
-            .collect();
+        let collector = builder.source("nums", vec![(0u64, vec![42i32])]).collect();
         let dataflow = builder.build().unwrap();
         rt().run(dataflow).unwrap();
 
@@ -3454,9 +3585,7 @@ mod tests {
     fn test_spawn_basic_pipeline() {
         let builder = DataflowBuilder::<u64>::new("spawn_test");
         let input = builder.input::<i32>("numbers");
-        input
-            .map("double", |_t, x| x * 2)
-            .output("results");
+        input.map("double", |_t, x| x * 2).output("results");
         let dataflow = builder.build().unwrap();
 
         let mut handle = rt().spawn(dataflow).unwrap();
@@ -3483,9 +3612,7 @@ mod tests {
     fn test_spawn_filter_pipeline() {
         let builder = DataflowBuilder::<u64>::new("filter_spawn");
         let input = builder.input::<i32>("src");
-        input
-            .filter("evens", |_t, x| x % 2 == 0)
-            .output("evens");
+        input.filter("evens", |_t, x| x % 2 == 0).output("evens");
         let dataflow = builder.build().unwrap();
 
         let mut handle = rt().spawn(dataflow).unwrap();
@@ -3543,33 +3670,36 @@ mod tests {
     fn test_binary_merge_two_streams() {
         // Binary: combine two streams by pairing data at each timestamp
         let builder = DataflowBuilder::<u64>::new("binary_test");
-        let names = builder.source("names", vec![
-            (0u64, vec!["alice".to_string(), "bob".to_string()]),
-        ]);
-        let ages = builder.source("ages", vec![
-            (0u64, vec![30i32, 25]),
-        ]);
+        let names = builder.source(
+            "names",
+            vec![(0u64, vec!["alice".to_string(), "bob".to_string()])],
+        );
+        let ages = builder.source("ages", vec![(0u64, vec![30i32, 25])]);
 
-        let port = names.binary::<i32, String, _>(ages, "pair", |names_in, ages_in, out| {
-            // Collect names at this timestamp
-            let mut name_buf = Vec::new();
-            while let Some((_t, data)) = names_in.next() {
-                name_buf.extend(data.iter().cloned());
-            }
-            // Collect ages at this timestamp
-            let mut age_buf = Vec::new();
-            while let Some((_t, data)) = ages_in.next() {
-                age_buf.extend(data.iter().cloned());
-            }
-            // Zip them together
-            if !name_buf.is_empty() || !age_buf.is_empty() {
-                let pairs: Vec<String> = name_buf.iter().zip(age_buf.iter())
-                    .map(|(n, a)| format!("{n}={a}"))
-                    .collect();
-                out.push_vec(0, pairs);
-            }
-            Ok(())
-        }).output("results");
+        let port = names
+            .binary::<i32, String, _>(ages, "pair", |names_in, ages_in, out| {
+                // Collect names at this timestamp
+                let mut name_buf = Vec::new();
+                while let Some((_t, data)) = names_in.next() {
+                    name_buf.extend(data.iter().cloned());
+                }
+                // Collect ages at this timestamp
+                let mut age_buf = Vec::new();
+                while let Some((_t, data)) = ages_in.next() {
+                    age_buf.extend(data.iter().cloned());
+                }
+                // Zip them together
+                if !name_buf.is_empty() || !age_buf.is_empty() {
+                    let pairs: Vec<String> = name_buf
+                        .iter()
+                        .zip(age_buf.iter())
+                        .map(|(n, a)| format!("{n}={a}"))
+                        .collect();
+                    out.push_vec(0, pairs);
+                }
+                Ok(())
+            })
+            .output("results");
 
         let dataflow = builder.build().unwrap();
         rt().run(dataflow).unwrap();
@@ -3586,30 +3716,35 @@ mod tests {
         let ints = builder.source("ints", vec![(0u64, vec![1i32, 2, 3])]);
         let strs = builder.source("strs", vec![(0u64, vec!["a".to_string(), "b".to_string()])]);
 
-        let port = ints.binary::<String, String, _>(strs, "combine", |ints_in, strs_in, out| {
-            let mut result = Vec::new();
-            while let Some((t, data)) = ints_in.next() {
-                for x in data {
-                    result.push((t, format!("int:{x}")));
+        let port = ints
+            .binary::<String, String, _>(strs, "combine", |ints_in, strs_in, out| {
+                let mut result = Vec::new();
+                while let Some((t, data)) = ints_in.next() {
+                    for x in data {
+                        result.push((t, format!("int:{x}")));
+                    }
                 }
-            }
-            while let Some((t, data)) = strs_in.next() {
-                for s in data {
-                    result.push((t, format!("str:{s}")));
+                while let Some((t, data)) = strs_in.next() {
+                    for s in data {
+                        result.push((t, format!("str:{s}")));
+                    }
                 }
-            }
-            for (t, s) in result {
-                out.push_vec(t, vec![s]);
-            }
-            Ok(())
-        }).output("out");
+                for (t, s) in result {
+                    out.push_vec(t, vec![s]);
+                }
+                Ok(())
+            })
+            .output("out");
 
         let dataflow = builder.build().unwrap();
         rt().run(dataflow).unwrap();
 
         let c = port.collector();
         let r = c.lock().unwrap();
-        let mut all: Vec<&str> = r.iter().flat_map(|(_, v)| v.iter().map(|s| s.as_str())).collect();
+        let mut all: Vec<&str> = r
+            .iter()
+            .flat_map(|(_, v)| v.iter().map(|s| s.as_str()))
+            .collect();
         all.sort();
         assert_eq!(all, vec!["int:1", "int:2", "int:3", "str:a", "str:b"]);
     }
@@ -3700,8 +3835,16 @@ mod tests {
 
         let c = port.collector();
         let r = c.lock().unwrap();
-        let mut t0: Vec<i32> = r.iter().filter(|(t, _)| *t == 0).flat_map(|(_, v)| v.iter().copied()).collect();
-        let mut t1: Vec<i32> = r.iter().filter(|(t, _)| *t == 1).flat_map(|(_, v)| v.iter().copied()).collect();
+        let mut t0: Vec<i32> = r
+            .iter()
+            .filter(|(t, _)| *t == 0)
+            .flat_map(|(_, v)| v.iter().copied())
+            .collect();
+        let mut t1: Vec<i32> = r
+            .iter()
+            .filter(|(t, _)| *t == 1)
+            .flat_map(|(_, v)| v.iter().copied())
+            .collect();
         t0.sort();
         t1.sort();
         assert_eq!(t0, vec![1, 2]);
@@ -3799,8 +3942,8 @@ mod tests {
         let stream = builder.source(
             "nums",
             vec![
-                (0u64, vec![5i32]),   // 5 → 10 → 20 → 40 → 80 → 160 (5 iters)
-                (1u64, vec![50i32]),  // 50 → 100 (1 iter)
+                (0u64, vec![5i32]),  // 5 → 10 → 20 → 40 → 80 → 160 (5 iters)
+                (1u64, vec![50i32]), // 50 → 100 (1 iter)
             ],
         );
         let port = stream
@@ -3939,7 +4082,10 @@ mod tests {
 
         let c = port.collector();
         let r = c.lock().unwrap();
-        let all: Vec<&str> = r.iter().flat_map(|(_, v)| v.iter().map(|s| s.as_str())).collect();
+        let all: Vec<&str> = r
+            .iter()
+            .flat_map(|(_, v)| v.iter().map(|s| s.as_str()))
+            .collect();
         assert_eq!(all, vec!["sum=10"]);
     }
 
@@ -4009,7 +4155,11 @@ mod tests {
         // invariant: data is emitted exactly once per timestamp.
         assert!(!all.is_empty(), "should have at least one notification");
         // Verify exactly one notification fired (notification_count == 1)
-        assert_eq!(all, vec![1], "should fire exactly one notification for the deduplicated time");
+        assert_eq!(
+            all,
+            vec![1],
+            "should fire exactly one notification for the deduplicated time"
+        );
     }
 
     // --- with_capacity tests ---
@@ -4132,10 +4282,13 @@ mod tests {
     #[test]
     fn test_with_capacity_concat() {
         let builder = DataflowBuilder::<u64>::new("cap_concat");
-        let a = builder.source("a", vec![(0u64, vec![1i32, 2])]).with_capacity(4);
-        let b = builder.source("b", vec![(0u64, vec![3i32, 4])]).with_capacity(8);
-        let port = Pipe::concat(vec![a, b])
-            .output("merged");
+        let a = builder
+            .source("a", vec![(0u64, vec![1i32, 2])])
+            .with_capacity(4);
+        let b = builder
+            .source("b", vec![(0u64, vec![3i32, 4])])
+            .with_capacity(8);
+        let port = Pipe::concat(vec![a, b]).output("merged");
         let dataflow = builder.build().unwrap();
         rt().run(dataflow).unwrap();
 
@@ -4187,11 +4340,14 @@ mod tests {
         let builder = DataflowBuilder::<u64>::new("and_then");
         let stream = builder.source::<std::result::Result<String, String>>(
             "data",
-            vec![(0u64, vec![
-                Ok("42".into()),
-                Err("upstream_err".into()),
-                Ok("not_a_number".into()),
-            ])],
+            vec![(
+                0u64,
+                vec![
+                    Ok("42".into()),
+                    Err("upstream_err".into()),
+                    Ok("not_a_number".into()),
+                ],
+            )],
         );
         let port = stream
             .and_then("parse", |_t, s: String| {
@@ -4258,10 +4414,8 @@ mod tests {
     #[test]
     fn test_result_combinators_all_ok() {
         let builder = DataflowBuilder::<u64>::new("all_ok");
-        let stream = builder.source::<std::result::Result<i32, String>>(
-            "data",
-            vec![(0u64, vec![Ok(10), Ok(20)])],
-        );
+        let stream = builder
+            .source::<std::result::Result<i32, String>>("data", vec![(0u64, vec![Ok(10), Ok(20)])]);
         let port = stream.map_ok("inc", |_t, v| v + 1).output("results");
         let dataflow = builder.build().unwrap();
         rt().run(dataflow).unwrap();

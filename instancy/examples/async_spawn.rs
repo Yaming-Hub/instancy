@@ -25,8 +25,8 @@
 //! Run with: `cargo run --all-features --example async_spawn`
 
 use instancy::DataflowBuilder;
-use instancy::{RuntimeConfig, RuntimeHandle};
 use instancy::scheduler::policy::FifoPolicy;
+use instancy::{RuntimeConfig, RuntimeHandle};
 
 #[tokio::main(flavor = "current_thread")]
 async fn main() {
@@ -53,10 +53,14 @@ async fn main() {
     let mut handle = rt.spawn_async(dataflow).expect("spawn failed");
 
     // Async input: yields on backpressure instead of blocking
-    let sender = handle.take_async_input::<i32>("numbers").expect("input port");
+    let sender = handle
+        .take_async_input::<i32>("numbers")
+        .expect("input port");
 
     // Async output: yields waiting for data instead of blocking
-    let mut receiver = handle.take_async_output::<i32>("results").expect("output port");
+    let mut receiver = handle
+        .take_async_output::<i32>("results")
+        .expect("output port");
 
     // Producer task: feeds data asynchronously
     let producer = tokio::spawn(async move {
@@ -108,7 +112,10 @@ async fn main() {
     for i in 0..3 {
         let builder = DataflowBuilder::<u64>::new(format!("concurrent_{i}"));
         builder
-            .source("src", vec![(0u64, vec![i as i32 * 10 + 1, i as i32 * 10 + 2])])
+            .source(
+                "src",
+                vec![(0u64, vec![i as i32 * 10 + 1, i as i32 * 10 + 2])],
+            )
             .map("inc", |_t, x| x + 100)
             .output("out");
         let dataflow = builder.build().expect("build failed");

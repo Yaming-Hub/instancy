@@ -12,13 +12,13 @@ use std::sync::Arc;
 
 use instancy::communication::codec::{Codec, CodecError};
 use instancy::communication::interprocess::PROGRESS_CHANNEL_ID;
+use instancy::communication::progress_exchange::{PeerProgressSender, ProgressExchange};
 use instancy::communication::remote_push::{FrameSender, OutboundFrame, RemotePush};
 use instancy::communication::session::DataflowSession;
-use instancy::communication::progress_exchange::{PeerProgressSender, ProgressExchange};
 use instancy::dataflow::id::DataflowId;
-use instancy::{ClusterTopology, NodeConfig};
 use instancy::providers::transport::{InMemoryClusterTransport, PushEndpoint, TransportProvider};
 use instancy::worker::WorkerId;
+use instancy::{ClusterTopology, NodeConfig};
 
 /// A test codec for (u64, Vec<u32>) — timestamp + data batch.
 #[derive(Clone)]
@@ -54,7 +54,9 @@ impl Codec<(u64, Vec<u32>)> for TestBatchCodec {
         let mut data = Vec::with_capacity(count);
         for i in 0..count {
             let offset = 12 + i * 4;
-            data.push(u32::from_le_bytes(buf[offset..offset + 4].try_into().unwrap()));
+            data.push(u32::from_le_bytes(
+                buf[offset..offset + 4].try_into().unwrap(),
+            ));
         }
         Ok(((time, data), needed))
     }
@@ -254,20 +256,12 @@ fn progress_frontier_advances_across_simulated_nodes() {
 
     // Node 0's exchange
     let (sender_to_1, receiver_at_1) = PeerProgressSender::new("node-1", 64);
-    let node0_exchange = ProgressExchange::new(
-        dataflow_id,
-        "node-0",
-        vec![sender_to_1],
-        Arc::new(U64Codec),
-    );
+    let node0_exchange =
+        ProgressExchange::new(dataflow_id, "node-0", vec![sender_to_1], Arc::new(U64Codec));
 
     // Node 1's exchange (for decoding)
-    let node1_exchange: ProgressExchange<u64, U64Codec> = ProgressExchange::new(
-        dataflow_id,
-        "node-1",
-        vec![],
-        Arc::new(U64Codec),
-    );
+    let node1_exchange: ProgressExchange<u64, U64Codec> =
+        ProgressExchange::new(dataflow_id, "node-1", vec![], Arc::new(U64Codec));
 
     // Node 0 reports: operator 0 advanced frontier to time 5
     let changes = vec![(0, 5u64, -1), (0, 10u64, 1)];
@@ -275,7 +269,9 @@ fn progress_frontier_advances_across_simulated_nodes() {
 
     // Node 1 receives
     let frame = receiver_at_1.recv().unwrap();
-    let msg = node1_exchange.decode_remote_progress(&frame.payload).unwrap();
+    let msg = node1_exchange
+        .decode_remote_progress(&frame.payload)
+        .unwrap();
 
     assert_eq!(msg.source_node_id, "node-0");
     assert_eq!(msg.changes[0], (0, 5u64, -1)); // released time 5
@@ -295,25 +291,28 @@ fn isolation_two_dataflows_share_connection_frames_routed_correctly() {
     let (sender, receiver) = FrameSender::channel(32);
     let codec = Arc::new(TestBatchCodec);
 
-    let push_a = RemotePush::<u64, u32, (), TestBatchCodec>::new(
-        id_a, 1, codec.clone(), sender.clone(),
-    );
-    let push_b = RemotePush::<u64, u32, (), TestBatchCodec>::new(
-        id_b, 1, codec, sender,
-    );
+    let push_a =
+        RemotePush::<u64, u32, (), TestBatchCodec>::new(id_a, 1, codec.clone(), sender.clone());
+    let push_b = RemotePush::<u64, u32, (), TestBatchCodec>::new(id_b, 1, codec, sender);
 
     use instancy::dataflow::channels::envelope::{Envelope, Payload};
 
     push_a
         .push(Envelope {
-            payload: Payload::Data { time: 1, data: vec![100] },
+            payload: Payload::Data {
+                time: 1,
+                data: vec![100],
+            },
             metadata: (),
         })
         .unwrap();
 
     push_b
         .push(Envelope {
-            payload: Payload::Data { time: 2, data: vec![200] },
+            payload: Payload::Data {
+                time: 2,
+                data: vec![200],
+            },
             metadata: (),
         })
         .unwrap();
@@ -361,11 +360,11 @@ fn cluster_transport_local_vs_remote() {
     let topo = two_node_topology();
     let transport = InMemoryClusterTransport::new(topo, "node-0");
 
-    use instancy::dataflow::region::RegionId;
+    use instancy::dataflow::stage::StageId;
     use instancy::providers::transport::LogicalTarget;
 
     let src = LogicalTarget {
-        region: RegionId::new(0),
+        stage: StageId::new(0),
         worker: WorkerId::new(0),
         operator: 0,
         input_index: 0,
@@ -373,7 +372,7 @@ fn cluster_transport_local_vs_remote() {
 
     // Worker 1 is on same node (node 0)
     let local_target = LogicalTarget {
-        region: RegionId::new(0),
+        stage: StageId::new(0),
         worker: WorkerId::new(1),
         operator: 1,
         input_index: 0,
@@ -382,7 +381,7 @@ fn cluster_transport_local_vs_remote() {
 
     // Worker 2 is on node 1 — remote
     let remote_target = LogicalTarget {
-        region: RegionId::new(0),
+        stage: StageId::new(0),
         worker: WorkerId::new(2),
         operator: 0,
         input_index: 0,
