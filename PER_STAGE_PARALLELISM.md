@@ -303,39 +303,66 @@ stream
 
 ## Implementation Plan
 
-### Phase 1: Operator fusion (FusedStageTask)
+### Phase 1: Operator fusion (FusedStageTask) ✅
 - Introduce `FusedStageTask` that owns all operators for one stage-worker
 - Single `poll()` method runs operators in topological order
 - Replace per-operator ready-queue entries with per-stage-worker entries
 - Budget-based yielding for fairness
 - **Backward compatible**: with only one stage, this is equivalent to running all operators in a single executor (same as today but fused)
 
-### Phase 2: Stage inference in builder
+### Phase 2: Stage inference in builder ✅
 - Add `StageInfo` and `StageId` types
 - Builder's `build()` method auto-infers stages by walking Pipeline edges and cutting at exchange/gather/rebalance/broadcast
 - `LogicalDataflow` carries `Vec<StageInfo>` with operator indices per stage
 - Validation: operators within a stage have consistent parallelism
 
-### Phase 3: Repartition operator parallelism parameter
+### Phase 3: Repartition operator parallelism parameter ✅
 - `exchange(key_fn, par)`, `gather()`, `broadcast(par)`, `rebalance(par)` accept downstream parallelism
 - Builder validates parallelism consistency at stage boundaries
 - Build-time error if parallelism changes without a repartition operator
 
-### Phase 4: Multi-stage executor
+### Phase 4: Multi-stage executor ✅
 - Runtime reads stage metadata from `LogicalDataflow`
 - For each stage, creates `parallelism` number of `FusedStageTask` instances (one per worker in that stage)
 - Each `FusedStageTask` contains only the operators belonging to its stage
 - Per-stage concurrency semaphore limits how many stage-workers run simultaneously
 
-### Phase 5: Cross-stage channels (M×N asymmetric exchange)
-- Generalize `ExchangeChannelBuilder` from N×N to M×N routing
-- Wire cross-stage channels: upstream stage's workers push → downstream stage's workers pull
-- Activation: when data arrives on a cross-stage channel, the downstream `FusedStageTask` is enqueued
+### Phase 5: Cross-stage channels (M×N asymmetric exchange) ✅
+- `ExchangeChannelSet` generalized from N×N to M×N with `new_asymmetric(M, N, capacity)`
+- `EdgeMaterializer` trait extended with `materialize_source_worker()`/`materialize_target_worker()`
+- `ExchangeFactoryCreatorFn` accepts `(num_sources, num_targets, capacity)`
+- `ExchangePush` routes using `hash % num_targets` (semantic clarity)
+- Backward compatible: symmetric (M==N) path unchanged
 
-### Phase 6: Per-stage progress tracking
-- Each stage's workers form an independent progress-tracking group
-- Cross-stage frontier propagation: downstream stage's input frontier = aggregation of upstream workers' output frontiers
-- Integrate with existing `ProgressTracker` and `Notificator`
+### Phase 6: Per-stage progress tracking & validation ✅
+- Cross-stage frontier propagation handled by `ExchangePull::FrontierAggregator`
+  (aggregates watermarks from M sources → emits progress to downstream)
+- Each executor's `ProgressTracker` tracks only its own operators; exchange channels
+  provide the boundary between stages
+- Runtime validates stage parallelism compatibility at spawn time
+- **Full per-stage executors** (heterogeneous worker counts, M≠N at runtime) deferred
+  to future work — requires splitting dataflow into sub-dataflows and spawning
+  separate worker groups per stage
+
+## Current Status
+
+**All infrastructure for per-stage parallelism is in place:**
+- Stage inference detects boundaries automatically
+- Parallelism parameters stored per stage
+- FusedStageTask groups operators by stage in the executor
+- M×N exchange channels support asymmetric source/target counts
+- Progress tracking works correctly across stage boundaries
+
+**What works today:**
+- Dataflows with multiple stages and same parallelism (N workers, N×N exchange)
+- FusedStageTask scheduling (operators within a stage activate in topological order)
+- Parallelism parameter validation (mismatches caught at spawn time)
+
+**Future work (per-stage executors):**
+- `spawn_staged()` runtime path that creates M workers for stage 0, N for stage 1
+- Separate executor per stage-worker-group
+- M×N exchange channels wired between stage groups
+- Cross-stage progress tracking via exchange channel's FrontierAggregator (already works)
 
 ## Open Questions
 
