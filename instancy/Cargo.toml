@@ -47,6 +47,9 @@ name = "async_io_channels"
 name = "error_handling"
 
 [[example]]
+name = "metrics_collection"
+
+[[example]]
 name = "panic_recovery"
 
 [[example]]

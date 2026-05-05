@@ -810,6 +810,9 @@ impl RuntimeHandle {
 
         let (completion, notifier) = DataflowCompletion::new();
 
+        // Capture metrics handle before executor is moved into the registry.
+        let metrics = executor.metrics().cloned();
+
         // --- Spawn async source pump tasks ---
         for (pump_idx, pump) in pump_tasks.into_iter().enumerate() {
             std::thread::Builder::new()
@@ -824,6 +827,7 @@ impl RuntimeHandle {
             completion: Some(completion),
             input_senders,
             output_receivers,
+            metrics,
             _phantom: PhantomData,
         };
 
@@ -1711,6 +1715,7 @@ impl SimpleRuntime {
         executor.replace_external_inputs_counter(external_inputs_open);
 
         let (completion, notifier) = DataflowCompletion::new();
+        let metrics = executor.metrics().cloned();
 
         // --- Spawn async source pump tasks ---
         for (pump_idx, pump) in pump_tasks.into_iter().enumerate() {
@@ -1734,6 +1739,7 @@ impl SimpleRuntime {
             completion: Some(completion),
             input_senders,
             output_receivers,
+            metrics,
             _phantom: PhantomData,
         })
     }
@@ -2054,6 +2060,8 @@ pub struct SpawnedDataflow<T: Timestamp> {
     input_senders: Vec<(String, &'static str, Box<dyn std::any::Any + Send>)>,
     /// `(name, type_name, Box<OutputReceiver<T, D>> as Box<dyn Any>)`
     output_receivers: Vec<(String, &'static str, Box<dyn std::any::Any + Send>)>,
+    /// Collected per-operator metrics (None if metrics not enabled).
+    metrics: Option<Arc<crate::metrics::DataflowMetrics>>,
     _phantom: PhantomData<T>,
 }
 
@@ -2061,6 +2069,17 @@ impl<T: Timestamp> SpawnedDataflow<T> {
     /// Get the dataflow name.
     pub fn name(&self) -> &str {
         &self.name
+    }
+
+    /// Get the collected dataflow metrics.
+    ///
+    /// Returns `Some` if metrics collection was enabled via
+    /// [`SpawnOptions::collect_metrics(true)`]. The metrics are live —
+    /// values update as the dataflow executes.
+    ///
+    /// Returns `None` if metrics collection was not enabled.
+    pub fn metrics(&self) -> Option<&Arc<crate::metrics::DataflowMetrics>> {
+        self.metrics.as_ref()
     }
 
     /// Take the input sender for the named port (consumes it from the handle).

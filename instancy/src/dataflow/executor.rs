@@ -357,6 +357,8 @@ pub struct DataflowExecutor<T: Timestamp = u64> {
     task_in_queue: Vec<bool>,
     /// Aggregate dataflow metrics. None when collect_metrics is false.
     dataflow_metrics: Option<Arc<DataflowMetrics>>,
+    /// Start time for live wall-clock metrics when collection is enabled.
+    wall_start: Option<Instant>,
     /// Per-operator metrics collectors, indexed by position.
     op_collectors: Vec<Option<Arc<OperatorMetricsCollector>>>,
     /// Phantom for the timestamp type.
@@ -523,6 +525,7 @@ impl<T: Timestamp> DataflowExecutor<T> {
         // need to produce initial output like sources).
         let ready_queue: VecDeque<usize> = (0..operators.len()).collect();
         let in_queue = vec![true; operators.len()];
+        let wall_start = config.collect_metrics.then(Instant::now);
 
         Ok(Self {
             operators,
@@ -547,6 +550,7 @@ impl<T: Timestamp> DataflowExecutor<T> {
             op_pos_to_task: Vec::new(),
             task_in_queue: Vec::new(),
             dataflow_metrics,
+            wall_start,
             op_collectors,
             _phantom: PhantomData,
         })
@@ -555,6 +559,14 @@ impl<T: Timestamp> DataflowExecutor<T> {
     /// Get the collected dataflow metrics, if metrics collection was enabled.
     pub fn metrics(&self) -> Option<&Arc<DataflowMetrics>> {
         self.dataflow_metrics.as_ref()
+    }
+
+    fn update_wall_time_metric(&self) {
+        if let (Some(start), Some(metrics)) =
+            (self.wall_start.as_ref(), self.dataflow_metrics.as_ref())
+        {
+            metrics.set_wall_time(start.elapsed());
+        }
     }
 
     /// Get a shared reference to the external inputs counter.
@@ -955,11 +967,8 @@ impl<T: Timestamp> DataflowExecutor<T> {
     /// Returns `Err(Error::Cancelled { .. })` if the cancellation token fires.
     /// Returns `Err(...)` if any operator produces an error.
     pub fn run(&mut self) -> Result<bool> {
-        let wall_start = Instant::now();
         let result = self.run_loop();
-        if let Some(ref dm) = self.dataflow_metrics {
-            dm.set_wall_time(wall_start.elapsed());
-        }
+        self.update_wall_time_metric();
         result
     }
 
@@ -1351,10 +1360,12 @@ impl<T: Timestamp> DataflowExecutor<T> {
             match self.run_one_sweep() {
                 Ok(SweepOutcome::Completed) => {
                     self.wake_handle.clear_waker();
+                    self.update_wall_time_metric();
                     return Poll::Ready(Ok(true));
                 }
                 Ok(SweepOutcome::Quiescent) => {
                     self.wake_handle.clear_waker();
+                    self.update_wall_time_metric();
                     return Poll::Ready(Ok(false));
                 }
                 Ok(SweepOutcome::MadeProgress) => {
@@ -1365,6 +1376,7 @@ impl<T: Timestamp> DataflowExecutor<T> {
                         // then yield to let other executors run.
                         self.wake_handle.register_waker(cx.waker());
                         self.wake_handle.notify();
+                        self.update_wall_time_metric();
                         return Poll::Pending;
                     }
                     continue;
@@ -1374,6 +1386,7 @@ impl<T: Timestamp> DataflowExecutor<T> {
                     if budget > 0 && sweeps_this_poll >= budget {
                         self.wake_handle.register_waker(cx.waker());
                         self.wake_handle.notify();
+                        self.update_wall_time_metric();
                         return Poll::Pending;
                     }
                     continue;
@@ -1388,10 +1401,12 @@ impl<T: Timestamp> DataflowExecutor<T> {
                     if self.wake_handle.take_notification() {
                         continue;
                     }
+                    self.update_wall_time_metric();
                     return Poll::Pending;
                 }
                 Err(e) => {
                     self.wake_handle.clear_waker();
+                    self.update_wall_time_metric();
                     return Poll::Ready(Err(e));
                 }
             }
@@ -1518,6 +1533,7 @@ mod tests {
                 op_pos_to_task: Vec::new(),
                 task_in_queue: Vec::new(),
                 dataflow_metrics: None,
+                wall_start: None,
                 op_collectors: Vec::new(),
                 _phantom: PhantomData,
             }
@@ -1633,6 +1649,7 @@ mod tests {
             op_pos_to_task: Vec::new(),
             task_in_queue: Vec::new(),
             dataflow_metrics: None,
+            wall_start: None,
             op_collectors: Vec::new(),
             _phantom: PhantomData,
         };
@@ -1675,6 +1692,7 @@ mod tests {
             op_pos_to_task: Vec::new(),
             task_in_queue: Vec::new(),
             dataflow_metrics: None,
+            wall_start: None,
             op_collectors: Vec::new(),
             _phantom: PhantomData,
         };
@@ -1721,6 +1739,7 @@ mod tests {
             op_pos_to_task: Vec::new(),
             task_in_queue: Vec::new(),
             dataflow_metrics: None,
+            wall_start: None,
             op_collectors: Vec::new(),
             _phantom: PhantomData,
         };
@@ -1755,6 +1774,7 @@ mod tests {
             op_pos_to_task: Vec::new(),
             task_in_queue: Vec::new(),
             dataflow_metrics: None,
+            wall_start: None,
             op_collectors: Vec::new(),
             _phantom: PhantomData,
         };
@@ -1815,6 +1835,7 @@ mod tests {
             op_pos_to_task: Vec::new(),
             task_in_queue: Vec::new(),
             dataflow_metrics: None,
+            wall_start: None,
             op_collectors: Vec::new(),
             _phantom: PhantomData,
         };
@@ -1893,6 +1914,7 @@ mod tests {
             op_pos_to_task: Vec::new(),
             task_in_queue: Vec::new(),
             dataflow_metrics: None,
+            wall_start: None,
             op_collectors: Vec::new(),
             _phantom: PhantomData,
         };
@@ -1951,6 +1973,7 @@ mod tests {
             op_pos_to_task: Vec::new(),
             task_in_queue: Vec::new(),
             dataflow_metrics: None,
+            wall_start: None,
             op_collectors: Vec::new(),
             _phantom: PhantomData,
         };
@@ -1997,6 +2020,7 @@ mod tests {
             op_pos_to_task: Vec::new(),
             task_in_queue: Vec::new(),
             dataflow_metrics: None,
+            wall_start: None,
             op_collectors: Vec::new(),
             _phantom: PhantomData,
         };
@@ -2056,6 +2080,7 @@ mod tests {
             op_pos_to_task: Vec::new(),
             task_in_queue: Vec::new(),
             dataflow_metrics: None,
+            wall_start: None,
             op_collectors: Vec::new(),
             _phantom: PhantomData,
         };
@@ -2114,6 +2139,7 @@ mod tests {
             op_pos_to_task: Vec::new(),
             task_in_queue: Vec::new(),
             dataflow_metrics: None,
+            wall_start: None,
             op_collectors: Vec::new(),
             _phantom: PhantomData,
         };
@@ -2179,6 +2205,7 @@ mod tests {
             op_pos_to_task: Vec::new(),
             task_in_queue: Vec::new(),
             dataflow_metrics: None,
+            wall_start: None,
             op_collectors: Vec::new(),
             _phantom: PhantomData,
         };
@@ -2256,6 +2283,7 @@ mod tests {
             op_pos_to_task: Vec::new(),
             task_in_queue: Vec::new(),
             dataflow_metrics: None,
+            wall_start: None,
             op_collectors: Vec::new(),
             _phantom: PhantomData,
         };
@@ -2323,6 +2351,7 @@ mod tests {
             op_pos_to_task: Vec::new(),
             task_in_queue: Vec::new(),
             dataflow_metrics: None,
+            wall_start: None,
             op_collectors: Vec::new(),
             _phantom: PhantomData,
         };
@@ -2473,6 +2502,7 @@ mod tests {
             op_pos_to_task: Vec::new(),
             task_in_queue: Vec::new(),
             dataflow_metrics: None,
+            wall_start: None,
             op_collectors: Vec::new(),
             _phantom: PhantomData,
         };
@@ -2543,6 +2573,7 @@ mod tests {
             op_pos_to_task: Vec::new(),
             task_in_queue: Vec::new(),
             dataflow_metrics: None,
+            wall_start: None,
             op_collectors: Vec::new(),
             _phantom: PhantomData,
         };
@@ -2591,6 +2622,7 @@ mod tests {
             op_pos_to_task: Vec::new(),
             task_in_queue: Vec::new(),
             dataflow_metrics: None,
+            wall_start: None,
             op_collectors: Vec::new(),
             _phantom: PhantomData,
         };
@@ -2651,6 +2683,7 @@ mod tests {
             op_pos_to_task: Vec::new(),
             task_in_queue: Vec::new(),
             dataflow_metrics: None,
+            wall_start: None,
             op_collectors: Vec::new(),
             _phantom: PhantomData,
         };
@@ -2700,6 +2733,7 @@ mod tests {
             op_pos_to_task: Vec::new(),
             task_in_queue: Vec::new(),
             dataflow_metrics: None,
+            wall_start: None,
             op_collectors: Vec::new(),
             _phantom: PhantomData,
         };
@@ -2748,6 +2782,7 @@ mod tests {
             op_pos_to_task: Vec::new(),
             task_in_queue: Vec::new(),
             dataflow_metrics: None,
+            wall_start: None,
             op_collectors: Vec::new(),
             _phantom: PhantomData,
         };
@@ -2796,6 +2831,7 @@ mod tests {
             op_pos_to_task: Vec::new(),
             task_in_queue: Vec::new(),
             dataflow_metrics: None,
+            wall_start: None,
             op_collectors: Vec::new(),
             _phantom: PhantomData,
         };
@@ -2879,6 +2915,7 @@ mod tests {
             op_pos_to_task: Vec::new(),
             task_in_queue: Vec::new(),
             dataflow_metrics: None,
+            wall_start: None,
             op_collectors: Vec::new(),
             _phantom: PhantomData,
         };
@@ -2940,6 +2977,7 @@ mod tests {
             op_pos_to_task: Vec::new(),
             task_in_queue: Vec::new(),
             dataflow_metrics: None,
+            wall_start: None,
             op_collectors: Vec::new(),
             _phantom: PhantomData,
         };
@@ -2999,6 +3037,7 @@ mod tests {
             op_pos_to_task: Vec::new(),
             task_in_queue: Vec::new(),
             dataflow_metrics: None,
+            wall_start: None,
             op_collectors: Vec::new(),
             _phantom: PhantomData,
         };
@@ -3061,6 +3100,7 @@ mod tests {
             op_pos_to_task: Vec::new(),
             task_in_queue: Vec::new(),
             dataflow_metrics: None,
+            wall_start: None,
             op_collectors: Vec::new(),
             _phantom: PhantomData,
         };
@@ -3137,6 +3177,7 @@ mod tests {
             op_pos_to_task: Vec::new(),
             task_in_queue: Vec::new(),
             dataflow_metrics: None,
+            wall_start: None,
             op_collectors: Vec::new(),
             _phantom: PhantomData,
         };
@@ -3186,6 +3227,7 @@ mod tests {
             op_pos_to_task: Vec::new(),
             task_in_queue: Vec::new(),
             dataflow_metrics: None,
+            wall_start: None,
             op_collectors: Vec::new(),
             _phantom: PhantomData,
         };
@@ -3324,3 +3366,5 @@ mod tests {
         );
     }
 }
+
+
