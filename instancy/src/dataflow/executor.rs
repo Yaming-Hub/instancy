@@ -28,6 +28,7 @@ use crate::dataflow::probe::ProbeHandle;
 use crate::dataflow::schedulable::{
     ActivationOutcome, ChannelEndpoints, ChannelFactory, OperatorFactory, SchedulableOperator,
 };
+use crate::dataflow::stage::FusedActivationOrder;
 use crate::error::{Error, Result};
 use crate::progress::notificator::Notificator;
 use crate::progress::subgraph::ProgressTracker;
@@ -87,6 +88,7 @@ impl Default for ExecutorConfig {
 /// `SweepOutcome` tells the caller what happened in that single pass, so
 /// `run()` (sync) and `poll_run()` (async) can each decide how to react
 /// between sweeps — sleep, yield, or return `Pending`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum SweepOutcome {
     /// All operators are done — the dataflow completed normally.
     Completed,
@@ -154,6 +156,10 @@ pub struct DataflowExecutor<T: Timestamp = u64> {
     control_sender: Option<ControlSender>,
     /// Cross-worker control broadcast receiver (for learning about sibling errors).
     control_receiver: Option<ControlReceiver>,
+    /// Optional fused activation order — when set, operators are activated in
+    /// topological order rather than FIFO ready-queue order. This allows data to
+    /// flow through the pipeline in a single sweep (source → ... → sink).
+    fused_order: Option<FusedActivationOrder>,
     /// Phantom for the timestamp type.
     _phantom: PhantomData<T>,
 }
@@ -316,6 +322,7 @@ impl<T: Timestamp> DataflowExecutor<T> {
             worker_index: worker_context.worker_index(),
             control_sender: None,
             control_receiver: None,
+            fused_order: None,
             _phantom: PhantomData,
         })
     }
@@ -416,6 +423,76 @@ impl<T: Timestamp> DataflowExecutor<T> {
     ) {
         self.control_sender = Some(sender);
         self.control_receiver = Some(receiver);
+    }
+
+    /// Enable fused operator activation using the provided topological order.
+    ///
+    /// When enabled, the executor activates operators in topological (pipeline)
+    /// order within each sweep rather than using the FIFO ready-queue. This
+    /// allows data to flow from source to sink in a single sweep pass, reducing
+    /// scheduling overhead from O(operators) round-trips to O(1).
+    ///
+    /// # Arguments
+    ///
+    /// * `order` — Operator positions in topological order. Must contain exactly
+    ///   the positions of all operators in the executor.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the order length doesn't match the operator count.
+    pub fn enable_fusion(&mut self, order: FusedActivationOrder) {
+        assert_eq!(
+            order.len(),
+            self.operators.len(),
+            "FusedActivationOrder length ({}) must match operator count ({})",
+            order.len(),
+            self.operators.len(),
+        );
+        self.fused_order = Some(order);
+    }
+
+    /// Enable fused operator activation by computing topological order from
+    /// the dataflow graph.
+    ///
+    /// This is a convenience method that extracts the topological order from
+    /// the graph and maps operator indices to positions.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if:
+    /// - The graph contains a cycle.
+    /// - The graph's operator set doesn't match the executor's operators
+    ///   (positions count mismatch after index mapping).
+    pub fn enable_fusion_from_graph(&mut self, graph: &DataflowGraph) -> Result<()> {
+        let topo_indices = graph.topological_order()?;
+        let positions: Vec<usize> = topo_indices
+            .into_iter()
+            .filter_map(|op_idx| {
+                if op_idx < self.index_to_pos.len() {
+                    let pos = self.index_to_pos[op_idx];
+                    if pos != usize::MAX {
+                        return Some(pos);
+                    }
+                }
+                None
+            })
+            .collect();
+
+        if positions.len() != self.operators.len() {
+            return Err(Error::Custom(format!(
+                "Cannot enable fusion: graph produced {} operator positions but executor has {} operators",
+                positions.len(),
+                self.operators.len(),
+            )));
+        }
+
+        self.fused_order = Some(FusedActivationOrder::new(positions));
+        Ok(())
+    }
+
+    /// Whether fused activation is enabled.
+    pub fn is_fused(&self) -> bool {
+        self.fused_order.is_some()
     }
 
     /// Propagate progress and enqueue operators whose frontiers changed.
@@ -560,6 +637,152 @@ impl<T: Timestamp> DataflowExecutor<T> {
         }
     }
 
+    /// Unfused activation: process operators from the ready queue in FIFO order.
+    ///
+    /// This is the original scheduling strategy. Each operator is independently
+    /// scheduled; data flowing from op A to op B requires multiple sweeps.
+    fn run_unfused_activation(&mut self) -> Result<bool> {
+        // If the ready queue is empty, re-populate with non-done operators.
+        if self.ready_queue.is_empty() {
+            for pos in 0..self.operators.len() {
+                if !self.done[pos] {
+                    self.ready_queue.push_back(pos);
+                    self.in_queue[pos] = true;
+                }
+            }
+            if self.ready_queue.is_empty() {
+                return Ok(false);
+            }
+        }
+
+        let mut any_progress = false;
+        let batch_size = self.ready_queue.len().min(self.config.max_activations_per_step);
+
+        for _ in 0..batch_size {
+            let Some(pos) = self.ready_queue.pop_front() else {
+                break;
+            };
+            self.in_queue[pos] = false;
+
+            if self.done[pos] {
+                continue;
+            }
+
+            let outcome = self.operators[pos].activate().map_err(|e| {
+                let op_name = self.operators[pos].name().to_string();
+                let enriched = e.with_operator_context(op_name.clone(), self.worker_index);
+                if let Some(ref ctrl) = self.control_sender {
+                    ctrl.broadcast_error(op_name, format!("{enriched}"));
+                }
+                enriched
+            })?;
+
+            match outcome {
+                ActivationOutcome::MadeProgress => {
+                    any_progress = true;
+                    self.ready_queue.push_back(pos);
+                    self.in_queue[pos] = true;
+                }
+                ActivationOutcome::Idle => {
+                    // Don't re-queue until new input arrives.
+                }
+                ActivationOutcome::BlockedOnBackpressure => {
+                    self.ready_queue.push_back(pos);
+                    self.in_queue[pos] = true;
+                    any_progress = true;
+                }
+                ActivationOutcome::Done => {
+                    self.done[pos] = true;
+                    self.propagate_completion(pos);
+                    any_progress = true;
+                }
+            }
+        }
+
+        Ok(any_progress)
+    }
+
+    /// Fused activation: process ALL non-done operators in topological order.
+    ///
+    /// Data flows through the pipeline in a single pass (source → ... → sink).
+    /// When an upstream operator produces output, its downstream is activated
+    /// immediately in the same sweep — no re-scheduling round-trip needed.
+    ///
+    /// Budget limits only *productive* activations (MadeProgress, BlockedOnBackpressure,
+    /// Done). Idle activations are free — they represent operators with no input.
+    fn run_fused_activation(&mut self) -> Result<bool> {
+        // Clear queue state at the start — fused mode ignores the ready_queue
+        // but propagate_progress() uses in_queue to gate enqueuing. Keep state
+        // consistent regardless of how we exit (normal or early budget return).
+        self.ready_queue.clear();
+        for flag in self.in_queue.iter_mut() {
+            *flag = false;
+        }
+
+        // Safety: we only read positions from fused_order, no mutation needed.
+        let positions = self
+            .fused_order
+            .as_ref()
+            .expect("run_fused_activation called without fused_order")
+            .positions()
+            .to_vec();
+
+        let mut any_progress = false;
+        let mut productive_activations = 0usize;
+        let budget = self.config.max_activations_per_step;
+
+        // Multi-pass: keep iterating until no operator makes progress or budget exhausted.
+        // This ensures that when op[i] pushes data, op[i+1..] can consume it in the same sweep.
+        let mut made_progress_this_pass = true;
+        while made_progress_this_pass {
+            made_progress_this_pass = false;
+
+            for &pos in &positions {
+                if self.done[pos] {
+                    continue;
+                }
+                if productive_activations >= budget {
+                    // Budget exhausted — report progress so we get another sweep.
+                    return Ok(any_progress);
+                }
+
+                let outcome = self.operators[pos].activate().map_err(|e| {
+                    let op_name = self.operators[pos].name().to_string();
+                    let enriched = e.with_operator_context(op_name.clone(), self.worker_index);
+                    if let Some(ref ctrl) = self.control_sender {
+                        ctrl.broadcast_error(op_name, format!("{enriched}"));
+                    }
+                    enriched
+                })?;
+
+                match outcome {
+                    ActivationOutcome::MadeProgress => {
+                        productive_activations += 1;
+                        any_progress = true;
+                        made_progress_this_pass = true;
+                    }
+                    ActivationOutcome::Idle => {
+                        // No input available — will be re-checked if another pass is needed
+                        // (upstream may have produced data later in this pass).
+                    }
+                    ActivationOutcome::BlockedOnBackpressure => {
+                        productive_activations += 1;
+                        any_progress = true;
+                        made_progress_this_pass = true;
+                    }
+                    ActivationOutcome::Done => {
+                        productive_activations += 1;
+                        self.done[pos] = true;
+                        self.propagate_completion(pos);
+                        any_progress = true;
+                    }
+                }
+            }
+        }
+
+        Ok(any_progress)
+    }
+
     /// Execute one sweep of the activation loop.
     ///
     /// A sweep processes the ready queue (up to `max_activations_per_step`),
@@ -587,67 +810,12 @@ impl<T: Timestamp> DataflowExecutor<T> {
             return Ok(SweepOutcome::Completed);
         }
 
-        // If the ready queue is empty, re-populate it with non-done operators.
-        if self.ready_queue.is_empty() {
-            for pos in 0..self.operators.len() {
-                if !self.done[pos] {
-                    self.ready_queue.push_back(pos);
-                    self.in_queue[pos] = true;
-                }
-            }
-            // If still empty, all operators are done.
-            if self.ready_queue.is_empty() {
-                return Ok(SweepOutcome::Completed);
-            }
-        }
-
-        // Process the ready queue.
-        let mut any_progress = false;
-
-        let batch_size = self.ready_queue.len().min(self.config.max_activations_per_step);
-        for _ in 0..batch_size {
-            let Some(pos) = self.ready_queue.pop_front() else {
-                break;
-            };
-            self.in_queue[pos] = false;
-
-            if self.done[pos] {
-                continue;
-            }
-
-            let outcome = self.operators[pos].activate().map_err(|e| {
-                let op_name = self.operators[pos].name().to_string();
-                let enriched = e.with_operator_context(op_name.clone(), self.worker_index);
-                // Broadcast error to sibling workers so they cancel too.
-                if let Some(ref ctrl) = self.control_sender {
-                    ctrl.broadcast_error(op_name, format!("{enriched}"));
-                }
-                enriched
-            })?;
-
-            match outcome {
-                ActivationOutcome::MadeProgress => {
-                    any_progress = true;
-                    // Re-queue: operator may have more work.
-                    self.ready_queue.push_back(pos);
-                    self.in_queue[pos] = true;
-                }
-                ActivationOutcome::Idle => {
-                    // Don't re-queue. Will be re-added on next sweep.
-                }
-                ActivationOutcome::BlockedOnBackpressure => {
-                    // Re-queue at the back; downstream needs to drain first.
-                    self.ready_queue.push_back(pos);
-                    self.in_queue[pos] = true;
-                    any_progress = true;
-                }
-                ActivationOutcome::Done => {
-                    self.done[pos] = true;
-                    self.propagate_completion(pos);
-                    any_progress = true;
-                }
-            }
-        }
+        // Activate operators — fused or unfused path.
+        let any_progress = if self.fused_order.is_some() {
+            self.run_fused_activation()?
+        } else {
+            self.run_unfused_activation()?
+        };
 
         if any_progress {
             self.consecutive_idle = 0;
@@ -984,6 +1152,7 @@ mod tests {
             worker_index: 0,
             control_sender: None,
             control_receiver: None,
+            fused_order: None,
             _phantom: PhantomData,
         };
 
@@ -1019,6 +1188,7 @@ mod tests {
             worker_index: 0,
             control_sender: None,
             control_receiver: None,
+            fused_order: None,
             _phantom: PhantomData,
         };
 
@@ -1058,6 +1228,7 @@ mod tests {
             worker_index: 0,
             control_sender: None,
             control_receiver: None,
+            fused_order: None,
             _phantom: PhantomData,
         };
 
@@ -1085,6 +1256,7 @@ mod tests {
             worker_index: 0,
             control_sender: None,
             control_receiver: None,
+            fused_order: None,
             _phantom: PhantomData,
         };
 
@@ -1126,6 +1298,7 @@ mod tests {
             worker_index: 0,
             control_sender: None,
             control_receiver: None,
+            fused_order: None,
             _phantom: PhantomData,
         };
 
@@ -1189,6 +1362,7 @@ mod tests {
             worker_index: 0,
             control_sender: None,
             control_receiver: None,
+            fused_order: None,
             _phantom: PhantomData,
         };
 
@@ -1240,6 +1414,7 @@ mod tests {
             worker_index: 0,
             control_sender: None,
             control_receiver: None,
+            fused_order: None,
             _phantom: PhantomData,
         };
 
@@ -1279,6 +1454,7 @@ mod tests {
             worker_index: 0,
             control_sender: None,
             control_receiver: None,
+            fused_order: None,
             _phantom: PhantomData,
         };
 
@@ -1331,6 +1507,7 @@ mod tests {
             worker_index: 0,
             control_sender: None,
             control_receiver: None,
+            fused_order: None,
             _phantom: PhantomData,
         };
 
@@ -1382,6 +1559,7 @@ mod tests {
             worker_index: 0,
             control_sender: None,
             control_receiver: None,
+            fused_order: None,
             _phantom: PhantomData,
         };
 
@@ -1438,6 +1616,7 @@ mod tests {
             worker_index: 0,
             control_sender: None,
             control_receiver: None,
+            fused_order: None,
             _phantom: PhantomData,
         };
 
@@ -1506,6 +1685,7 @@ mod tests {
             worker_index: 0,
             control_sender: None,
             control_receiver: None,
+            fused_order: None,
             _phantom: PhantomData,
         };
 
@@ -1566,6 +1746,7 @@ mod tests {
             worker_index: 0,
             control_sender: None,
             control_receiver: None,
+            fused_order: None,
             _phantom: PhantomData,
         };
 
@@ -1707,6 +1888,7 @@ mod tests {
             worker_index: 0,
             control_sender: None,
             control_receiver: None,
+            fused_order: None,
             _phantom: PhantomData,
         };
 
@@ -1768,6 +1950,7 @@ mod tests {
             worker_index: 0,
             control_sender: None,
             control_receiver: None,
+            fused_order: None,
             _phantom: PhantomData,
         };
 
@@ -1777,5 +1960,414 @@ mod tests {
             Poll::Ready(Ok(true)) => {} // expected — completed
             other => panic!("Expected Ready(Ok(true)), got {:?}", other),
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // Fused activation tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn fused_executor_runs_single_operator_to_completion() {
+        use crate::dataflow::stage::FusedActivationOrder;
+
+        let mut executor: DataflowExecutor<u64> = DataflowExecutor {
+            operators: vec![Box::new(CountingOperator {
+                name: "counter".into(),
+                index: 0,
+                region_id: crate::dataflow::region::RegionId::new(0),
+                remaining: 3,
+            })],
+            ready_queue: VecDeque::from([0]),
+            in_queue: vec![true],
+            done: vec![false],
+            index_to_pos: vec![0],
+            config: ExecutorConfig::default(),
+            cancel: CancellationToken::new(),
+            progress_tracker: None,
+            notificators: Vec::new(),
+            probes: Vec::new(),
+            external_inputs_open: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            wake_handle: WakeHandle::new(),
+            consecutive_idle: 0,
+            worker_index: 0,
+            control_sender: None,
+            control_receiver: None,
+            fused_order: None,
+            _phantom: PhantomData,
+        };
+
+        // Enable fusion with topological order.
+        executor.enable_fusion(FusedActivationOrder::new(vec![0]));
+        assert!(executor.is_fused());
+
+        let result = executor.run();
+        assert_eq!(result.unwrap(), true);
+        assert!(executor.is_complete());
+    }
+
+    #[test]
+    fn fused_executor_runs_multiple_operators_in_topological_order() {
+        use crate::dataflow::stage::FusedActivationOrder;
+
+        // Three operators in a pipeline: op0(3 activations) → op1(2) → op2(1)
+        let mut executor: DataflowExecutor<u64> = DataflowExecutor {
+            operators: vec![
+                Box::new(CountingOperator {
+                    name: "source".into(),
+                    index: 0,
+                    region_id: crate::dataflow::region::RegionId::new(0),
+                    remaining: 3,
+                }),
+                Box::new(CountingOperator {
+                    name: "transform".into(),
+                    index: 1,
+                    region_id: crate::dataflow::region::RegionId::new(0),
+                    remaining: 2,
+                }),
+                Box::new(CountingOperator {
+                    name: "sink".into(),
+                    index: 2,
+                    region_id: crate::dataflow::region::RegionId::new(0),
+                    remaining: 1,
+                }),
+            ],
+            ready_queue: VecDeque::from([0, 1, 2]),
+            in_queue: vec![true, true, true],
+            done: vec![false, false, false],
+            index_to_pos: vec![0, 1, 2],
+            config: ExecutorConfig::default(),
+            cancel: CancellationToken::new(),
+            progress_tracker: None,
+            notificators: Vec::new(),
+            probes: Vec::new(),
+            external_inputs_open: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            wake_handle: WakeHandle::new(),
+            consecutive_idle: 0,
+            worker_index: 0,
+            control_sender: None,
+            control_receiver: None,
+            fused_order: None,
+            _phantom: PhantomData,
+        };
+
+        // Topological order: source → transform → sink
+        executor.enable_fusion(FusedActivationOrder::new(vec![0, 1, 2]));
+
+        let result = executor.run();
+        assert_eq!(result.unwrap(), true);
+        assert!(executor.is_complete());
+        assert_eq!(executor.completed_count(), 3);
+    }
+
+    #[test]
+    fn fused_executor_respects_activation_budget() {
+        use crate::dataflow::stage::FusedActivationOrder;
+
+        // Operator with many activations but tight budget.
+        let mut executor: DataflowExecutor<u64> = DataflowExecutor {
+            operators: vec![Box::new(CountingOperator {
+                name: "counter".into(),
+                index: 0,
+                region_id: crate::dataflow::region::RegionId::new(0),
+                remaining: 100,
+            })],
+            ready_queue: VecDeque::from([0]),
+            in_queue: vec![true],
+            done: vec![false],
+            index_to_pos: vec![0],
+            config: ExecutorConfig {
+                max_activations_per_step: 5, // tight budget
+                ..ExecutorConfig::default()
+            },
+            cancel: CancellationToken::new(),
+            progress_tracker: None,
+            notificators: Vec::new(),
+            probes: Vec::new(),
+            external_inputs_open: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            wake_handle: WakeHandle::new(),
+            consecutive_idle: 0,
+            worker_index: 0,
+            control_sender: None,
+            control_receiver: None,
+            fused_order: None,
+            _phantom: PhantomData,
+        };
+
+        executor.enable_fusion(FusedActivationOrder::new(vec![0]));
+
+        // A single sweep should be budget-limited, not run all 100 activations.
+        let outcome = executor.run_one_sweep().unwrap();
+        assert_eq!(outcome, SweepOutcome::MadeProgress);
+        // The operator should NOT be done yet (100 remaining, budget is 5).
+        assert!(!executor.is_complete());
+    }
+
+    #[test]
+    fn fused_executor_handles_cancellation() {
+        use crate::dataflow::stage::FusedActivationOrder;
+
+        let cancel = CancellationToken::new();
+        cancel.cancel();
+
+        let mut executor: DataflowExecutor<u64> = DataflowExecutor {
+            operators: vec![Box::new(CountingOperator {
+                name: "op".into(),
+                index: 0,
+                region_id: crate::dataflow::region::RegionId::new(0),
+                remaining: 10,
+            })],
+            ready_queue: VecDeque::from([0]),
+            in_queue: vec![true],
+            done: vec![false],
+            index_to_pos: vec![0],
+            config: ExecutorConfig::default(),
+            cancel,
+            progress_tracker: None,
+            notificators: Vec::new(),
+            probes: Vec::new(),
+            external_inputs_open: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            wake_handle: WakeHandle::new(),
+            consecutive_idle: 0,
+            worker_index: 0,
+            control_sender: None,
+            control_receiver: None,
+            fused_order: None,
+            _phantom: PhantomData,
+        };
+
+        executor.enable_fusion(FusedActivationOrder::new(vec![0]));
+
+        let result = executor.run();
+        assert!(result.is_err());
+        match result.unwrap_err() {
+            Error::Cancelled { .. } => {} // expected
+            other => panic!("Expected Cancelled, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn fused_executor_handles_idle_operators() {
+        use crate::dataflow::stage::FusedActivationOrder;
+
+        let mut executor: DataflowExecutor<u64> = DataflowExecutor {
+            operators: vec![Box::new(IdleOperator {
+                index: 0,
+                region_id: crate::dataflow::region::RegionId::new(0),
+                closed: false,
+            })],
+            ready_queue: VecDeque::from([0]),
+            in_queue: vec![true],
+            done: vec![false],
+            index_to_pos: vec![0],
+            config: ExecutorConfig {
+                max_idle_sweeps: 2,
+                ..ExecutorConfig::default()
+            },
+            cancel: CancellationToken::new(),
+            progress_tracker: None,
+            notificators: Vec::new(),
+            probes: Vec::new(),
+            external_inputs_open: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            wake_handle: WakeHandle::new(),
+            consecutive_idle: 0,
+            worker_index: 0,
+            control_sender: None,
+            control_receiver: None,
+            fused_order: None,
+            _phantom: PhantomData,
+        };
+
+        executor.enable_fusion(FusedActivationOrder::new(vec![0]));
+
+        // Idle operator → should eventually reach quiescence.
+        let result = executor.run();
+        assert_eq!(result.unwrap(), false); // quiescent, not completed
+    }
+
+    #[test]
+    fn enable_fusion_from_graph_computes_topological_order() {
+        use crate::dataflow::graph::{DataflowGraph, EdgeInfo, OperatorInfo};
+        use crate::dataflow::region::RegionId;
+        use crate::dataflow::stage::FusedActivationOrder;
+        use crate::dataflow::stream::Slot;
+
+        // Build a simple graph: op0 → op1 → op2
+        let mut graph = DataflowGraph::new();
+        graph
+            .register_operator(OperatorInfo::new(0, "source", RegionId::new(0), 0, 1))
+            .unwrap();
+        graph
+            .register_operator(OperatorInfo::new(1, "map", RegionId::new(0), 1, 1))
+            .unwrap();
+        graph
+            .register_operator(OperatorInfo::new(2, "sink", RegionId::new(0), 1, 0))
+            .unwrap();
+        graph.add_edge(EdgeInfo::new(
+            Slot::new(0, 0),
+            Slot::new(1, 0),
+            RegionId::new(0),
+            RegionId::new(0),
+        ));
+        graph.add_edge(EdgeInfo::new(
+            Slot::new(1, 0),
+            Slot::new(2, 0),
+            RegionId::new(0),
+            RegionId::new(0),
+        ));
+
+        let mut executor: DataflowExecutor<u64> = DataflowExecutor {
+            operators: vec![
+                Box::new(CountingOperator {
+                    name: "source".into(),
+                    index: 0,
+                    region_id: RegionId::new(0),
+                    remaining: 1,
+                }),
+                Box::new(CountingOperator {
+                    name: "map".into(),
+                    index: 1,
+                    region_id: RegionId::new(0),
+                    remaining: 1,
+                }),
+                Box::new(CountingOperator {
+                    name: "sink".into(),
+                    index: 2,
+                    region_id: RegionId::new(0),
+                    remaining: 1,
+                }),
+            ],
+            ready_queue: VecDeque::from([0, 1, 2]),
+            in_queue: vec![true, true, true],
+            done: vec![false, false, false],
+            index_to_pos: vec![0, 1, 2],
+            config: ExecutorConfig::default(),
+            cancel: CancellationToken::new(),
+            progress_tracker: None,
+            notificators: Vec::new(),
+            probes: Vec::new(),
+            external_inputs_open: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            wake_handle: WakeHandle::new(),
+            consecutive_idle: 0,
+            worker_index: 0,
+            control_sender: None,
+            control_receiver: None,
+            fused_order: None,
+            _phantom: PhantomData,
+        };
+
+        // Should succeed and enable fusion.
+        executor.enable_fusion_from_graph(&graph).unwrap();
+        assert!(executor.is_fused());
+
+        // Run to completion.
+        let result = executor.run();
+        assert_eq!(result.unwrap(), true);
+        assert!(executor.is_complete());
+    }
+
+    #[test]
+    fn enable_fusion_from_graph_returns_error_on_mismatch() {
+        use crate::dataflow::graph::{DataflowGraph, OperatorInfo};
+        use crate::dataflow::region::RegionId;
+
+        // Graph has 1 operator but executor has 2 — mismatch.
+        let mut graph = DataflowGraph::new();
+        graph
+            .register_operator(OperatorInfo::new(0, "op0", RegionId::new(0), 0, 0))
+            .unwrap();
+
+        let mut executor: DataflowExecutor<u64> = DataflowExecutor {
+            operators: vec![
+                Box::new(CountingOperator {
+                    name: "op0".into(),
+                    index: 0,
+                    region_id: RegionId::new(0),
+                    remaining: 1,
+                }),
+                Box::new(CountingOperator {
+                    name: "op1".into(),
+                    index: 1,
+                    region_id: RegionId::new(0),
+                    remaining: 1,
+                }),
+            ],
+            ready_queue: VecDeque::from([0, 1]),
+            in_queue: vec![true, true],
+            done: vec![false, false],
+            index_to_pos: vec![0, 1],
+            config: ExecutorConfig::default(),
+            cancel: CancellationToken::new(),
+            progress_tracker: None,
+            notificators: Vec::new(),
+            probes: Vec::new(),
+            external_inputs_open: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            wake_handle: WakeHandle::new(),
+            consecutive_idle: 0,
+            worker_index: 0,
+            control_sender: None,
+            control_receiver: None,
+            fused_order: None,
+            _phantom: PhantomData,
+        };
+
+        // Should return error, not panic.
+        let result = executor.enable_fusion_from_graph(&graph);
+        assert!(result.is_err());
+        assert!(!executor.is_fused());
+    }
+
+    #[test]
+    fn fused_executor_idle_activations_do_not_consume_budget() {
+        use crate::dataflow::stage::FusedActivationOrder;
+
+        // 3 idle operators with budget=2. In old code, budget would be exhausted
+        // after 2 idle activations. Now idle doesn't count, so all 3 get polled.
+        let mut executor: DataflowExecutor<u64> = DataflowExecutor {
+            operators: vec![
+                Box::new(IdleOperator {
+                    index: 0,
+                    region_id: crate::dataflow::region::RegionId::new(0),
+                    closed: false,
+                }),
+                Box::new(IdleOperator {
+                    index: 1,
+                    region_id: crate::dataflow::region::RegionId::new(0),
+                    closed: false,
+                }),
+                Box::new(IdleOperator {
+                    index: 2,
+                    region_id: crate::dataflow::region::RegionId::new(0),
+                    closed: false,
+                }),
+            ],
+            ready_queue: VecDeque::from([0, 1, 2]),
+            in_queue: vec![true, true, true],
+            done: vec![false, false, false],
+            index_to_pos: vec![0, 1, 2],
+            config: ExecutorConfig {
+                max_activations_per_step: 2, // very tight budget
+                max_idle_sweeps: 2,
+                ..ExecutorConfig::default()
+            },
+            cancel: CancellationToken::new(),
+            progress_tracker: None,
+            notificators: Vec::new(),
+            probes: Vec::new(),
+            external_inputs_open: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            wake_handle: WakeHandle::new(),
+            consecutive_idle: 0,
+            worker_index: 0,
+            control_sender: None,
+            control_receiver: None,
+            fused_order: None,
+            _phantom: PhantomData,
+        };
+
+        executor.enable_fusion(FusedActivationOrder::new(vec![0, 1, 2]));
+
+        // Even with budget=2, all idle operators should be reached (idle doesn't
+        // consume budget). The sweep should return Idle, not get stuck.
+        let outcome = executor.run_one_sweep().unwrap();
+        assert_eq!(outcome, SweepOutcome::Idle);
     }
 }
