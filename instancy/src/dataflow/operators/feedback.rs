@@ -26,9 +26,9 @@ use std::fmt;
 use std::marker::PhantomData;
 
 use crate::dataflow::graph::{EdgeInfo, OperatorInfo};
-use crate::dataflow::region::RegionId;
 use crate::dataflow::scope::{ChildScope, Scope};
-use crate::dataflow::stream::{StreamEdge, Slot};
+use crate::dataflow::stage::StageId;
+use crate::dataflow::stream::{Slot, StreamEdge};
 use crate::order::Product;
 use crate::progress::timestamp::Timestamp;
 
@@ -50,8 +50,8 @@ pub enum ScopeBoundary {
 pub struct IngressMetadata {
     /// The operator index in the child scope for this ingress.
     pub child_operator_index: usize,
-    /// The region this ingress belongs to.
-    pub region_id: RegionId,
+    /// The stage this ingress belongs to.
+    pub stage_id: StageId,
 }
 
 /// Metadata for a scope egress point (leave operator).
@@ -59,12 +59,12 @@ pub struct IngressMetadata {
 pub struct EgressMetadata {
     /// The operator index in the child scope for this egress.
     pub child_operator_index: usize,
-    /// The region in the child scope.
-    pub child_region_id: RegionId,
+    /// The stage in the child scope.
+    pub child_stage_id: StageId,
     /// The operator index in the parent scope for the output.
     pub parent_operator_index: usize,
-    /// The region in the parent scope.
-    pub parent_region_id: RegionId,
+    /// The stage in the parent scope.
+    pub parent_stage_id: StageId,
 }
 
 // ============================================================================
@@ -96,22 +96,26 @@ impl<S: Scope, D: 'static> EnterExt<S, D> for StreamEdge<S, D> {
         // Each enter() call gets a unique ingress slot on the scope boundary operator (index 0).
         let slot_index = child.clone().allocate_ingress_slot();
         let ingress_source = Slot::new(0, slot_index);
-        let region_id = child.current_region().id();
+        let stage_id = child.current_stage_id();
 
         // Update the parent graph: the child scope operator receives this data.
-        let child_index = child.addr().parts().last().copied()
+        let child_index = child
+            .addr()
+            .parts()
+            .last()
+            .copied()
             .expect("enter() called on scope with no parent address — this is a bug");
         let mut parent_scope = self.scope().clone();
         parent_scope.increment_operator_input_count(child_index);
-        let parent_region = parent_scope.current_region().id();
+        let parent_stage = parent_scope.current_stage_id();
         parent_scope.add_edge(EdgeInfo::new(
             *self.source(),
             Slot::new(child_index, slot_index),
-            self.region_id(),
-            parent_region,
+            self.stage_id(),
+            parent_stage,
         ));
 
-        StreamEdge::new(child.clone(), ingress_source, region_id)
+        StreamEdge::new(child.clone(), ingress_source, stage_id)
     }
 }
 
@@ -131,10 +135,7 @@ where
     ///
     /// Creates an egress boundary operator in the child scope and
     /// produces a stream in the parent scope.
-    fn leave<P: Scope<Timestamp = TOuter>>(
-        &self,
-        parent: &P,
-    ) -> StreamEdge<P, D>;
+    fn leave<P: Scope<Timestamp = TOuter>>(&self, parent: &P) -> StreamEdge<P, D>;
 }
 
 impl<TOuter, TInner, D> LeaveExt<TOuter, TInner, D>
@@ -145,19 +146,21 @@ where
     Product<TOuter, TInner>: Timestamp,
     D: 'static,
 {
-    fn leave<P: Scope<Timestamp = TOuter>>(
-        &self,
-        parent: &P,
-    ) -> StreamEdge<P, D> {
+    fn leave<P: Scope<Timestamp = TOuter>>(&self, parent: &P) -> StreamEdge<P, D> {
         // Each leave() call gets a unique egress slot on the scope boundary operator.
         let slot_index = self.scope().clone().allocate_egress_slot();
 
         // In the parent, the stream comes from the subscope operator (identified by
         // the child scope's position in the parent's operator index space).
-        let parent_op_index = self.scope().addr().parts().last().copied()
+        let parent_op_index = self
+            .scope()
+            .addr()
+            .parts()
+            .last()
+            .copied()
             .expect("leave() called on scope with no parent address — this is a bug");
         let parent_source = Slot::new(parent_op_index, slot_index);
-        let region_id = parent.current_region().id();
+        let stage_id = parent.current_stage_id();
 
         // Update the parent graph: the child scope operator produces this output.
         let mut parent_mut = parent.clone();
@@ -169,11 +172,11 @@ where
         child_scope.add_edge(EdgeInfo::new(
             *self.source(),
             Slot::new(0, slot_index),
-            self.region_id(),
-            child_scope.current_region().id(),
+            self.stage_id(),
+            child_scope.current_stage_id(),
         ));
 
-        StreamEdge::new(parent.clone(), parent_source, region_id)
+        StreamEdge::new(parent.clone(), parent_source, stage_id)
     }
 }
 
@@ -191,8 +194,8 @@ where
 pub struct FeedbackHandle<S: Scope, D> {
     /// Operator index of the feedback operator in the scope.
     operator_index: usize,
-    /// The region this feedback belongs to.
-    region_id: RegionId,
+    /// The stage this feedback belongs to.
+    stage_id: StageId,
     /// The path summary describing timestamp advancement per iteration.
     summary: <S::Timestamp as Timestamp>::Summary,
     /// Whether this handle has been connected.
@@ -207,9 +210,9 @@ impl<S: Scope, D> FeedbackHandle<S, D> {
         self.operator_index
     }
 
-    /// Get the region ID.
-    pub fn region_id(&self) -> RegionId {
-        self.region_id
+    /// Get the stage ID.
+    pub fn stage_id(&self) -> StageId {
+        self.stage_id
     }
 
     /// Get the path summary for this feedback edge.
@@ -225,7 +228,7 @@ where
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("FeedbackHandle")
             .field("operator_index", &self.operator_index)
-            .field("region_id", &self.region_id)
+            .field("stage_id", &self.stage_id)
             .field("summary", &self.summary)
             .field("connected", &self.connected)
             .finish()
@@ -282,7 +285,10 @@ where
     fn feedback<D: 'static>(
         &mut self,
         inner_summary: TInner::Summary,
-    ) -> (FeedbackHandle<ChildScope<Product<TOuter, TInner>>, D>, StreamEdge<ChildScope<Product<TOuter, TInner>>, D>);
+    ) -> (
+        FeedbackHandle<ChildScope<Product<TOuter, TInner>>, D>,
+        StreamEdge<ChildScope<Product<TOuter, TInner>>, D>,
+    );
 }
 
 impl<TOuter, TInner> FeedbackExt<TOuter, TInner> for ChildScope<Product<TOuter, TInner>>
@@ -296,16 +302,19 @@ where
     fn feedback<D: 'static>(
         &mut self,
         inner_summary: TInner::Summary,
-    ) -> (FeedbackHandle<ChildScope<Product<TOuter, TInner>>, D>, StreamEdge<ChildScope<Product<TOuter, TInner>>, D>) {
+    ) -> (
+        FeedbackHandle<ChildScope<Product<TOuter, TInner>>, D>,
+        StreamEdge<ChildScope<Product<TOuter, TInner>>, D>,
+    ) {
         let operator_index = self.allocate_operator_index();
-        let region_id = self.current_region().id();
+        let stage_id = self.current_stage_id();
 
         // Register the feedback operator in the child scope's graph.
         // It has 1 input (from connect_loop) and 1 output (the feedback stream).
         self.register_operator(OperatorInfo::new(
             operator_index,
             "feedback",
-            region_id,
+            stage_id,
             1,
             1,
         ))
@@ -313,21 +322,19 @@ where
 
         // Lift the inner summary to a Product summary:
         // outer advances by identity (Default), inner advances by the provided summary.
-        let full_summary: Product<TOuter::Summary, TInner::Summary> = Product::new(
-            <TOuter as Timestamp>::Summary::default(),
-            inner_summary,
-        );
+        let full_summary: Product<TOuter::Summary, TInner::Summary> =
+            Product::new(<TOuter as Timestamp>::Summary::default(), inner_summary);
 
         let handle = FeedbackHandle {
             operator_index,
-            region_id,
+            stage_id,
             summary: full_summary,
             connected: false,
             _data: PhantomData,
         };
 
         let source = Slot::new(operator_index, 0);
-        let stream = StreamEdge::new(self.clone(), source, region_id);
+        let stream = StreamEdge::new(self.clone(), source, stage_id);
 
         (handle, stream)
     }
@@ -355,8 +362,8 @@ impl<S: Scope, D: 'static> ConnectLoop<S, D> for StreamEdge<S, D> {
         scope.add_edge(EdgeInfo::new(
             *self.source(),
             Slot::new(handle.operator_index, 0),
-            self.region_id(),
-            handle.region_id,
+            self.stage_id(),
+            handle.stage_id,
         ));
 
         // Note: This edge creates a cycle in the graph. The validate() method
@@ -387,7 +394,7 @@ mod tests {
         assert_eq!(child.name(), "my_loop");
         // Child scope address is [parent_index] where parent_index is the allocated op index
         assert_eq!(child.addr().depth(), 1);
-        assert_eq!(child.current_region().parallelism(), 4);
+        assert_eq!(child.stage_parallelism(child.current_stage_id()), Some(4));
     }
 
     #[test]
@@ -420,7 +427,7 @@ mod tests {
 
         // Inner scope has depth 2
         assert_eq!(inner.addr().depth(), 2);
-        assert_eq!(inner.current_region().parallelism(), 4);
+        assert_eq!(inner.stage_parallelism(inner.current_stage_id()), Some(4));
     }
 
     // --- Enter ---
@@ -431,9 +438,9 @@ mod tests {
         let child = root.iterative::<u32>("loop");
 
         let source = Slot::new(0, 0);
-        let region_id = root.current_region().id();
+        let stage_id = root.current_stage_id();
         let parent_stream: StreamEdge<RootScope<u64>, i32> =
-            StreamEdge::new(root.clone(), source, region_id);
+            StreamEdge::new(root.clone(), source, stage_id);
 
         let child_stream = parent_stream.enter(&child);
 
@@ -444,17 +451,17 @@ mod tests {
     }
 
     #[test]
-    fn enter_preserves_child_region() {
+    fn enter_preserves_child_stage() {
         let mut root = RootScope::<u64>::new("root", 4);
         let child = root.iterative::<u32>("loop");
 
         let source = Slot::new(0, 0);
-        let region_id = root.current_region().id();
+        let stage_id = root.current_stage_id();
         let parent_stream: StreamEdge<RootScope<u64>, i32> =
-            StreamEdge::new(root.clone(), source, region_id);
+            StreamEdge::new(root.clone(), source, stage_id);
 
         let child_stream = parent_stream.enter(&child);
-        assert_eq!(child_stream.region_id(), child.current_region().id());
+        assert_eq!(child_stream.stage_id(), child.current_stage_id());
     }
 
     #[test]
@@ -462,11 +469,11 @@ mod tests {
         let mut root = RootScope::<u64>::new("root", 4);
         let child = root.iterative::<u32>("loop");
 
-        let region_id = root.current_region().id();
+        let stage_id = root.current_stage_id();
         let stream1: StreamEdge<RootScope<u64>, i32> =
-            StreamEdge::new(root.clone(), Slot::new(0, 0), region_id);
+            StreamEdge::new(root.clone(), Slot::new(0, 0), stage_id);
         let stream2: StreamEdge<RootScope<u64>, String> =
-            StreamEdge::new(root.clone(), Slot::new(1, 0), region_id);
+            StreamEdge::new(root.clone(), Slot::new(1, 0), stage_id);
 
         let in1 = stream1.enter(&child);
         let in2 = stream2.enter(&child);
@@ -484,14 +491,14 @@ mod tests {
         let mut root = RootScope::<u64>::new("root", 4);
         let mut child = root.iterative::<u32>("loop");
 
-        let child_region = child.current_region().id();
+        let child_stage = child.current_stage_id();
         let op1 = child.allocate_operator_index();
         let op2 = child.allocate_operator_index();
 
         let s1: StreamEdge<ChildScope<Product<u64, u32>>, i32> =
-            StreamEdge::new(child.clone(), Slot::new(op1, 0), child_region);
+            StreamEdge::new(child.clone(), Slot::new(op1, 0), child_stage);
         let s2: StreamEdge<ChildScope<Product<u64, u32>>, String> =
-            StreamEdge::new(child.clone(), Slot::new(op2, 0), child_region);
+            StreamEdge::new(child.clone(), Slot::new(op2, 0), child_stage);
 
         let out1 = s1.leave(&root);
         let out2 = s2.leave(&root);
@@ -511,9 +518,9 @@ mod tests {
         let mut child = root.iterative::<u32>("loop");
 
         let op_idx = child.allocate_operator_index();
-        let child_region = child.current_region().id();
+        let child_stage = child.current_stage_id();
         let child_stream: StreamEdge<ChildScope<Product<u64, u32>>, i32> =
-            StreamEdge::new(child.clone(), Slot::new(op_idx, 0), child_region);
+            StreamEdge::new(child.clone(), Slot::new(op_idx, 0), child_stage);
 
         let parent_stream = child_stream.leave(&root);
 
@@ -526,9 +533,9 @@ mod tests {
         let mut child = root.iterative::<u32>("loop");
 
         let op_idx = child.allocate_operator_index();
-        let child_region = child.current_region().id();
+        let child_stage = child.current_stage_id();
         let child_stream: StreamEdge<ChildScope<Product<u64, u32>>, i32> =
-            StreamEdge::new(child.clone(), Slot::new(op_idx, 0), child_region);
+            StreamEdge::new(child.clone(), Slot::new(op_idx, 0), child_stage);
 
         let parent_stream = child_stream.leave(&root);
 
@@ -550,12 +557,12 @@ mod tests {
 
         assert_eq!(handle.operator_index(), 1); // first user op
         assert_eq!(stream.source().operator_index, 1);
-        assert_eq!(stream.region_id(), child.current_region().id());
+        assert_eq!(stream.stage_id(), child.current_stage_id());
 
         // Clean up: connect the loop
-        let region = child.current_region().id();
+        let stage = child.current_stage_id();
         let dummy: StreamEdge<ChildScope<Product<u64, u32>>, i32> =
-            StreamEdge::new(child.clone(), Slot::new(99, 0), region);
+            StreamEdge::new(child.clone(), Slot::new(99, 0), stage);
         dummy.connect_loop(handle);
     }
 
@@ -572,9 +579,9 @@ mod tests {
         assert_eq!(summary.inner, 3u32); // inner advances by 3
 
         // Clean up: connect the loop
-        let region = child.current_region().id();
+        let stage = child.current_stage_id();
         let dummy: StreamEdge<ChildScope<Product<u64, u32>>, i32> =
-            StreamEdge::new(child.clone(), Slot::new(99, 0), region);
+            StreamEdge::new(child.clone(), Slot::new(99, 0), stage);
         dummy.connect_loop(handle);
     }
 
@@ -596,9 +603,9 @@ mod tests {
         assert_eq!(result2, Some(Product::new(5, 4)));
 
         // Clean up: connect the loop
-        let region = child.current_region().id();
+        let stage = child.current_stage_id();
         let dummy: StreamEdge<ChildScope<Product<u64, u32>>, i32> =
-            StreamEdge::new(child.clone(), Slot::new(99, 0), region);
+            StreamEdge::new(child.clone(), Slot::new(99, 0), stage);
         dummy.connect_loop(handle);
     }
 
@@ -615,11 +622,11 @@ mod tests {
 
         // Clean up: connect them
         let source = Slot::new(99, 0);
-        let region = child.current_region().id();
+        let stage = child.current_stage_id();
         let dummy1: StreamEdge<ChildScope<Product<u64, u32>>, i32> =
-            StreamEdge::new(child.clone(), source, region);
+            StreamEdge::new(child.clone(), source, stage);
         let dummy2: StreamEdge<ChildScope<Product<u64, u32>>, String> =
-            StreamEdge::new(child.clone(), source, region);
+            StreamEdge::new(child.clone(), source, stage);
         dummy1.connect_loop(h1);
         dummy2.connect_loop(h2);
     }
@@ -634,9 +641,9 @@ mod tests {
         let (handle, _stream) = child.feedback::<i32>(1u32);
 
         let source = Slot::new(2, 0);
-        let region = child.current_region().id();
+        let stage = child.current_stage_id();
         let result_stream: StreamEdge<ChildScope<Product<u64, u32>>, i32> =
-            StreamEdge::new(child.clone(), source, region);
+            StreamEdge::new(child.clone(), source, stage);
 
         // connect_loop consumes the handle
         result_stream.connect_loop(handle);
@@ -655,9 +662,9 @@ mod tests {
 
         // Create input entering the scope
         let parent_source = Slot::new(0, 0);
-        let parent_region = root.current_region().id();
+        let parent_stage = root.current_stage_id();
         let input: StreamEdge<RootScope<u64>, i32> =
-            StreamEdge::new(root.clone(), parent_source, parent_region);
+            StreamEdge::new(root.clone(), parent_source, parent_stage);
         let input_in_loop = input.enter(&child);
 
         // Both streams exist in the child scope
@@ -666,9 +673,9 @@ mod tests {
 
         // Simulate processing: create a result stream
         let result_source = Slot::new(child.allocate_operator_index(), 0);
-        let child_region = child.current_region().id();
+        let child_stage = child.current_stage_id();
         let result: StreamEdge<ChildScope<Product<u64, u32>>, i32> =
-            StreamEdge::new(child.clone(), result_source, child_region);
+            StreamEdge::new(child.clone(), result_source, child_stage);
 
         // Close the loop
         result.connect_loop(handle);
@@ -676,7 +683,7 @@ mod tests {
         // Create output leaving the scope
         let output_source = Slot::new(child.allocate_operator_index(), 0);
         let output: StreamEdge<ChildScope<Product<u64, u32>>, i32> =
-            StreamEdge::new(child.clone(), output_source, child_region);
+            StreamEdge::new(child.clone(), output_source, child_stage);
         let _parent_output = output.leave(&root);
     }
 
@@ -688,9 +695,8 @@ mod tests {
         let child = root.iterative::<u32>("loop");
 
         let source = Slot::new(0, 0);
-        let region = root.current_region().id();
-        let stream: StreamEdge<RootScope<u64>, i32> =
-            StreamEdge::new(root.clone(), source, region);
+        let stage = root.current_stage_id();
+        let stream: StreamEdge<RootScope<u64>, i32> = StreamEdge::new(root.clone(), source, stage);
 
         // Enter and immediately leave
         let in_child = stream.enter(&child);
@@ -716,9 +722,9 @@ mod tests {
 
         // Graph construction allows it; progress tracker will reject at validation time.
         // Clean up
-        let region = child.current_region().id();
+        let stage = child.current_stage_id();
         let dummy: StreamEdge<ChildScope<Product<u64, u32>>, i32> =
-            StreamEdge::new(child.clone(), Slot::new(99, 0), region);
+            StreamEdge::new(child.clone(), Slot::new(99, 0), stage);
         dummy.connect_loop(handle);
     }
 
@@ -739,9 +745,9 @@ mod tests {
         assert_eq!(summary.inner, 1u32);
 
         // Clean up
-        let region = inner_loop.current_region().id();
+        let stage = inner_loop.current_stage_id();
         let dummy: StreamEdge<ChildScope<Product<Product<u64, u32>, u32>>, i32> =
-            StreamEdge::new(inner_loop.clone(), Slot::new(99, 0), region);
+            StreamEdge::new(inner_loop.clone(), Slot::new(99, 0), stage);
         dummy.connect_loop(handle);
     }
 

@@ -18,9 +18,10 @@ fn main() {
     let builder = DataflowBuilder::<u64>::new("simple_pipeline");
 
     let output_port = builder
-        .source("numbers", vec![
-            (0u64, vec![1i32, 2, 3, 4, 5, 6, 7, 8, 9, 10]),
-        ])
+        .source(
+            "numbers",
+            vec![(0u64, vec![1i32, 2, 3, 4, 5, 6, 7, 8, 9, 10])],
+        )
         .map("double", |_t, x| x * 2)
         .filter("div_by_3", |_t, x| x % 3 == 0)
         .map("describe", |_t, x| format!("{x} is divisible by 3"))
@@ -28,7 +29,8 @@ fn main() {
 
     // Inspect the logical graph before running
     let dataflow = builder.build().expect("graph construction failed");
-    println!("Dataflow: {} ({} operators, {} edges)",
+    println!(
+        "Dataflow: {} ({} operators, {} edges)",
         dataflow.name(),
         dataflow.operator_count(),
         dataflow.edge_count(),

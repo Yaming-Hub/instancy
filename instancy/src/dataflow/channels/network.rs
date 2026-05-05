@@ -59,7 +59,7 @@
 use std::sync::Arc;
 
 use crate::communication::codec::{Codec, CodecError, ExchangeData};
-use crate::dataflow::channels::bounded::{bounded_channel, BoundedPull, BoundedPush};
+use crate::dataflow::channels::bounded::{BoundedPull, BoundedPush, bounded_channel};
 use crate::dataflow::channels::edge_materializer::EdgeMaterializer;
 use crate::dataflow::channels::envelope::{ControlSignal, Envelope, Payload};
 use crate::dataflow::channels::pushpull::{Pull, Push};
@@ -227,9 +227,8 @@ where
             let source_operator = String::from_utf8(rest[4..4 + src_len].to_vec())
                 .map_err(|e| CodecError::InvalidData(format!("invalid UTF-8: {e}")))?;
             let msg_offset = 4 + src_len;
-            let msg_len = u32::from_le_bytes(
-                rest[msg_offset..msg_offset + 4].try_into().unwrap(),
-            ) as usize;
+            let msg_len =
+                u32::from_le_bytes(rest[msg_offset..msg_offset + 4].try_into().unwrap()) as usize;
             let total_consumed = msg_offset + 4 + msg_len;
             if rest.len() < total_consumed {
                 return Err(CodecError::InsufficientData {
@@ -296,9 +295,7 @@ impl<T: Timestamp + ExchangeData, D: ExchangeData> NetworkPush<T, D> {
 }
 
 #[cfg(feature = "transport")]
-impl<T: Timestamp + ExchangeData, D: ExchangeData> Push<T, D, ()>
-    for NetworkPush<T, D>
-{
+impl<T: Timestamp + ExchangeData, D: ExchangeData> Push<T, D, ()> for NetworkPush<T, D> {
     fn push(&mut self, envelope: Envelope<T, D, ()>) -> Result<()> {
         if self.closed {
             return Err(Error::ChannelClosed);
@@ -453,9 +450,7 @@ pub struct NetworkPull<T: Timestamp + ExchangeData, D: ExchangeData> {
 }
 
 #[cfg(feature = "transport")]
-impl<T: Timestamp + ExchangeData, D: ExchangeData> Pull<T, D, ()>
-    for NetworkPull<T, D>
-{
+impl<T: Timestamp + ExchangeData, D: ExchangeData> Pull<T, D, ()> for NetworkPull<T, D> {
     fn pull(&mut self) -> Option<Envelope<T, D, ()>> {
         if self.exhausted {
             return None;
@@ -580,7 +575,10 @@ impl<T: Timestamp + ExchangeData, D: ExchangeData> NetworkEdgeMaterializer<T, D>
         topology: ClusterTopology,
         local_node_id: impl Into<String>,
         session: Arc<TransportSession>,
-        mut receivers: std::collections::HashMap<String, std::collections::HashMap<u64, tokio_mpsc::Receiver<Vec<u8>>>>,
+        mut receivers: std::collections::HashMap<
+            String,
+            std::collections::HashMap<u64, tokio_mpsc::Receiver<Vec<u8>>>,
+        >,
         capacity: usize,
         edge_index: usize,
         wake_handles: Vec<WakeHandle>,
@@ -590,10 +588,12 @@ impl<T: Timestamp + ExchangeData, D: ExchangeData> NetworkEdgeMaterializer<T, D>
         let num_workers = topology.total_workers();
 
         // --- Set up local channels for same-node pairs ---
-        let mut local_push: Vec<Vec<Option<BoundedPush<T, D, ()>>>> =
-            (0..num_workers).map(|_| (0..num_workers).map(|_| None).collect()).collect();
-        let mut local_pull: Vec<Vec<Option<BoundedPull<T, D, ()>>>> =
-            (0..num_workers).map(|_| (0..num_workers).map(|_| None).collect()).collect();
+        let mut local_push: Vec<Vec<Option<BoundedPush<T, D, ()>>>> = (0..num_workers)
+            .map(|_| (0..num_workers).map(|_| None).collect())
+            .collect();
+        let mut local_pull: Vec<Vec<Option<BoundedPull<T, D, ()>>>> = (0..num_workers)
+            .map(|_| (0..num_workers).map(|_| None).collect())
+            .collect();
 
         for src in 0..num_workers {
             let src_node = topology.node_for_worker(WorkerId::new(src));
@@ -685,14 +685,25 @@ impl<T: Timestamp + ExchangeData, D: ExchangeData> NetworkEdgeMaterializer<T, D>
         }
 
         let (session, receivers) = TransportSession::new(
-            dataflow_id, connections, &data_regs, &[], capacity, runtime_handle,
+            dataflow_id,
+            connections,
+            &data_regs,
+            &[],
+            capacity,
+            runtime_handle,
         );
 
         let wake_handles: Vec<WakeHandle> = (0..num_workers).map(|_| WakeHandle::new()).collect();
         Self::new(
-            dataflow_id, topology, local_node_id_str,
-            Arc::new(session), receivers, capacity, 0,
-            wake_handles, runtime_handle.clone(),
+            dataflow_id,
+            topology,
+            local_node_id_str,
+            Arc::new(session),
+            receivers,
+            capacity,
+            0,
+            wake_handles,
+            runtime_handle.clone(),
         )
     }
 
@@ -773,21 +784,22 @@ impl<T: Timestamp + ExchangeData, D: ExchangeData> EdgeMaterializer<T, D>
 
             if worker_node == dst_node && worker_node == self.local_node_id {
                 // Local pair — use BoundedPush
-                let push = self.local_push[worker_idx][dst]
-                    .take()
-                    .ok_or_else(|| Error::Custom(format!(
-                        "local push [{worker_idx}][{dst}] already taken"
-                    )))?;
+                let push = self.local_push[worker_idx][dst].take().ok_or_else(|| {
+                    Error::Custom(format!("local push [{worker_idx}][{dst}] already taken"))
+                })?;
                 pushers.push(Box::new(push));
             } else {
                 // Remote pair — use NetworkPush
-                let sender = self.session.data_sender(dst_node)
-                    .ok_or_else(|| Error::Custom(format!(
-                        "no connection to peer node '{dst_node}'"
-                    )))?
+                let sender = self
+                    .session
+                    .data_sender(dst_node)
+                    .ok_or_else(|| {
+                        Error::Custom(format!("no connection to peer node '{dst_node}'"))
+                    })?
                     .clone();
 
-                let channel_id = Self::channel_id(self.edge_index, worker_idx, dst, self.num_workers);
+                let channel_id =
+                    Self::channel_id(self.edge_index, worker_idx, dst, self.num_workers);
                 pushers.push(Box::new(NetworkPush::<T, D> {
                     time_codec: T::codec(),
                     data_codec: D::codec(),
@@ -810,21 +822,21 @@ impl<T: Timestamp + ExchangeData, D: ExchangeData> EdgeMaterializer<T, D>
 
             if src_node == worker_node && src_node == self.local_node_id {
                 // Local pair — use BoundedPull
-                let pull = self.local_pull[src][worker_idx]
-                    .take()
-                    .ok_or_else(|| Error::Custom(format!(
-                        "local pull [{src}][{worker_idx}] already taken"
-                    )))?;
+                let pull = self.local_pull[src][worker_idx].take().ok_or_else(|| {
+                    Error::Custom(format!("local pull [{src}][{worker_idx}] already taken"))
+                })?;
                 pullers.push(Box::new(pull));
             } else {
                 // Remote pair — use NetworkPull with bridge task.
                 // The bridge receives from the Demuxer's tokio mpsc channel (async),
                 // forwards to a std::sync::mpsc channel (sync), and notifies the
                 // executor's WakeHandle so it wakes up to process the data.
-                let tokio_receiver = self.demux_receivers.remove(&(src, worker_idx))
-                    .ok_or_else(|| Error::Custom(format!(
-                        "no demux receiver for [{src}][{worker_idx}]"
-                    )))?;
+                let tokio_receiver =
+                    self.demux_receivers
+                        .remove(&(src, worker_idx))
+                        .ok_or_else(|| {
+                            Error::Custom(format!("no demux receiver for [{src}][{worker_idx}]"))
+                        })?;
 
                 let (std_tx, std_rx) = std::sync::mpsc::channel::<Vec<u8>>();
                 let wake = self.wake_handles[worker_idx].clone();
@@ -890,7 +902,10 @@ mod tests {
         encode_envelope(&tc, &dc, &env, &mut buf).unwrap();
         let decoded = decode_envelope(&tc, &dc, &buf).unwrap().unwrap();
         match decoded.payload {
-            Payload::Control(ControlSignal::Error { source_operator, message }) => {
+            Payload::Control(ControlSignal::Error {
+                source_operator,
+                message,
+            }) => {
                 assert_eq!(source_operator, "op1");
                 assert_eq!(message, "bad data");
             }
@@ -1024,7 +1039,9 @@ mod tests {
             push0[2].push(Envelope::data(99, vec![1, 2, 3])).unwrap();
 
             let timeout = std::time::Duration::from_secs(2);
-            let env = poll_pull(pull2[0].as_mut(), timeout).await.expect("data should arrive");
+            let env = poll_pull(pull2[0].as_mut(), timeout)
+                .await
+                .expect("data should arrive");
             assert_eq!(env.as_data(), Some((&99u64, &vec![1u64, 2, 3])));
         }
 
@@ -1044,7 +1061,9 @@ mod tests {
             push0[2].push(Envelope::watermark(50)).unwrap();
 
             let timeout = std::time::Duration::from_secs(2);
-            let env = poll_pull(pull2[0].as_mut(), timeout).await.expect("watermark should arrive");
+            let env = poll_pull(pull2[0].as_mut(), timeout)
+                .await
+                .expect("watermark should arrive");
             match env.payload {
                 Payload::Control(ControlSignal::Watermark(t)) => assert_eq!(t, 50),
                 _ => panic!("expected watermark"),
@@ -1071,7 +1090,9 @@ mod tests {
             let timeout = std::time::Duration::from_secs(2);
 
             // Pull the data
-            let env = poll_pull(pull2[0].as_mut(), timeout).await.expect("data should arrive");
+            let env = poll_pull(pull2[0].as_mut(), timeout)
+                .await
+                .expect("data should arrive");
             assert_eq!(env.as_data(), Some((&1u64, &vec![10u64])));
 
             // Poll until exhausted (close sentinel must arrive)
@@ -1108,20 +1129,22 @@ mod tests {
             push2[0].push(Envelope::data(2, vec![200])).unwrap();
 
             let timeout = std::time::Duration::from_secs(2);
-            let env_at_b = poll_pull(pull2[0].as_mut(), timeout).await.expect("A→B data");
+            let env_at_b = poll_pull(pull2[0].as_mut(), timeout)
+                .await
+                .expect("A→B data");
             assert_eq!(env_at_b.as_data(), Some((&1u64, &vec![100u64])));
 
-            let env_at_a = poll_pull(pull0[2].as_mut(), timeout).await.expect("B→A data");
+            let env_at_a = poll_pull(pull0[2].as_mut(), timeout)
+                .await
+                .expect("B→A data");
             assert_eq!(env_at_a.as_data(), Some((&2u64, &vec![200u64])));
         }
 
         #[tokio::test]
         async fn network_materializer_with_string_data() {
-            let topo = ClusterTopology::multi_node(vec![
-                NodeConfig::new("a", 1),
-                NodeConfig::new("b", 1),
-            ])
-            .unwrap();
+            let topo =
+                ClusterTopology::multi_node(vec![NodeConfig::new("a", 1), NodeConfig::new("b", 1)])
+                    .unwrap();
             let df_id = DataflowId::new();
             let rt = tokio::runtime::Handle::current();
 
@@ -1129,23 +1152,41 @@ mod tests {
             let (b_to_a, a_from_b) = tokio::io::duplex(64 * 1024);
 
             let mut mat_a = NetworkEdgeMaterializer::<u64, String>::with_connections(
-                df_id, topo.clone(), "a",
-                vec![PeerConnection { node_id: "b".to_string(), reader: a_from_b, writer: a_to_b }],
-                16, &rt,
+                df_id,
+                topo.clone(),
+                "a",
+                vec![PeerConnection {
+                    node_id: "b".to_string(),
+                    reader: a_from_b,
+                    writer: a_to_b,
+                }],
+                16,
+                &rt,
             );
             let mut mat_b = NetworkEdgeMaterializer::<u64, String>::with_connections(
-                df_id, topo, "b",
-                vec![PeerConnection { node_id: "a".to_string(), reader: b_from_a, writer: b_to_a }],
-                16, &rt,
+                df_id,
+                topo,
+                "b",
+                vec![PeerConnection {
+                    node_id: "a".to_string(),
+                    reader: b_from_a,
+                    writer: b_to_a,
+                }],
+                16,
+                &rt,
             );
 
             let (mut push0, _) = mat_a.materialize_worker(0).unwrap();
             let (_, mut pull1) = mat_b.materialize_worker(1).unwrap();
 
-            push0[1].push(Envelope::data(7, vec!["hello".into(), "world".into()])).unwrap();
+            push0[1]
+                .push(Envelope::data(7, vec!["hello".into(), "world".into()]))
+                .unwrap();
 
             let timeout = std::time::Duration::from_secs(2);
-            let env = poll_pull(pull1[0].as_mut(), timeout).await.expect("string data should arrive");
+            let env = poll_pull(pull1[0].as_mut(), timeout)
+                .await
+                .expect("string data should arrive");
             assert_eq!(
                 env.as_data(),
                 Some((&7u64, &vec!["hello".to_string(), "world".to_string()]))

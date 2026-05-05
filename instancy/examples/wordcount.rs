@@ -24,24 +24,23 @@ fn main() {
         .source(
             "lines",
             vec![
-                (0u64, vec![
-                    "hello world".to_string(),
-                    "hello instancy".to_string(),
-                ]),
-                (1u64, vec![
-                    "world of dataflow".to_string(),
-                    "hello world again".to_string(),
-                ]),
-                (2u64, vec![
-                    "instancy is fast".to_string(),
-                ]),
+                (
+                    0u64,
+                    vec!["hello world".to_string(), "hello instancy".to_string()],
+                ),
+                (
+                    1u64,
+                    vec![
+                        "world of dataflow".to_string(),
+                        "hello world again".to_string(),
+                    ],
+                ),
+                (2u64, vec!["instancy is fast".to_string()]),
             ],
         )
         // Split lines into individual words
         .flat_map("split_words", |_t, line| {
-            line.split_whitespace()
-                .map(|w| w.to_lowercase())
-                .collect()
+            line.split_whitespace().map(|w| w.to_lowercase()).collect()
         })
         // Count word occurrences per timestamp using a stateful unary operator.
         // State lives outside the closure so it persists across activations —
@@ -66,9 +65,8 @@ fn main() {
                 // avoiding stale intermediate snapshots.
                 for time in dirty {
                     let counts = &counts_by_time[&time];
-                    let mut pairs: Vec<(String, usize)> = counts.iter()
-                        .map(|(k, &v)| (k.clone(), v))
-                        .collect();
+                    let mut pairs: Vec<(String, usize)> =
+                        counts.iter().map(|(k, &v)| (k.clone(), v)).collect();
                     pairs.sort();
                     output.push_vec(time, pairs);
                 }
@@ -85,7 +83,9 @@ fn main() {
         dataflow.edge_count(),
     );
 
-    SimpleRuntime::new().run(dataflow).expect("execution failed");
+    SimpleRuntime::new()
+        .run(dataflow)
+        .expect("execution failed");
 
     let collector = port.collector();
     let data = collector.lock().unwrap();

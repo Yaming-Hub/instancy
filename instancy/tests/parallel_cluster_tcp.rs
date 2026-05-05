@@ -23,10 +23,10 @@ use std::time::Duration;
 
 use tokio::net::{TcpListener, TcpStream};
 
-use instancy::communication::transport_session::PeerConnection;
 use instancy::DataflowBuilder;
 use instancy::DataflowId;
 use instancy::Result;
+use instancy::communication::transport_session::PeerConnection;
 use instancy::{ClusterTopology, NodeConfig};
 use instancy::{RuntimeConfig, RuntimeHandle};
 
@@ -233,8 +233,16 @@ async fn parallel_tcp_dataflows_shared_pool() {
         let out_a = outputs_a.remove(0);
         let out_b = outputs_b.remove(0);
 
-        let data_a: Vec<i64> = out_a.collect_data().into_iter().flat_map(|(_, d)| d).collect();
-        let data_b: Vec<i64> = out_b.collect_data().into_iter().flat_map(|(_, d)| d).collect();
+        let data_a: Vec<i64> = out_a
+            .collect_data()
+            .into_iter()
+            .flat_map(|(_, d)| d)
+            .collect();
+        let data_b: Vec<i64> = out_b
+            .collect_data()
+            .into_iter()
+            .flat_map(|(_, d)| d)
+            .collect();
 
         // Prove that node-b actually received exchanged records over TCP.
         // If exchange were broken (routing everything locally), data_b would be empty.
@@ -284,13 +292,12 @@ async fn parallel_tcp_dataflows_multi_epoch() {
     .unwrap();
     let topology2 = topology.clone();
 
-    let build =
-        |_worker_idx: usize, builder: &mut DataflowBuilder<u64>| -> Result<()> {
-            let input = builder.input::<i64>("data");
-            let exchanged = input.exchange("by_val", |x: &i64| *x as u64);
-            exchanged.map("double", |_t, x| x * 2).output("results");
-            Ok(())
-        };
+    let build = |_worker_idx: usize, builder: &mut DataflowBuilder<u64>| -> Result<()> {
+        let input = builder.input::<i64>("data");
+        let exchanged = input.exchange("by_val", |x: &i64| *x as u64);
+        exchanged.map("double", |_t, x| x * 2).output("results");
+        Ok(())
+    };
 
     let handle_a = tokio::task::spawn_blocking(move || -> Result<(RuntimeHandle, Vec<_>)> {
         let rt = RuntimeHandle::new(RuntimeConfig {
@@ -384,8 +391,16 @@ async fn parallel_tcp_dataflows_multi_epoch() {
         let out_a = outputs_a.remove(0);
         let out_b = outputs_b.remove(0);
 
-        let data_a: Vec<i64> = out_a.collect_data().into_iter().flat_map(|(_, d)| d).collect();
-        let data_b: Vec<i64> = out_b.collect_data().into_iter().flat_map(|(_, d)| d).collect();
+        let data_a: Vec<i64> = out_a
+            .collect_data()
+            .into_iter()
+            .flat_map(|(_, d)| d)
+            .collect();
+        let data_b: Vec<i64> = out_b
+            .collect_data()
+            .into_iter()
+            .flat_map(|(_, d)| d)
+            .collect();
 
         // Prove that node-b actually received exchanged records over TCP.
         assert!(

@@ -183,10 +183,7 @@ impl<T: Timestamp> CapabilitySet<T> {
     /// Returns [`Error::Progress`] if no capability in the set dominates `time`.
     pub fn delayed(&self, time: &T) -> Result<Capability<T>> {
         self.try_delayed(time).ok_or_else(|| {
-            Error::Progress(format!(
-                "no capability in set dominates time {:?}",
-                time
-            ))
+            Error::Progress(format!("no capability in set dominates time {:?}", time))
         })
     }
 
@@ -212,11 +209,7 @@ impl<T: Timestamp> CapabilitySet<T> {
 
         // Validate: each new time must be dominated by some existing cap.
         for new_time in &frontier_times {
-            if !self
-                .elements
-                .iter()
-                .any(|c| c.time.less_equal(new_time))
-            {
+            if !self.elements.iter().any(|c| c.time.less_equal(new_time)) {
                 return Err(Error::Progress(format!(
                     "cannot downgrade: time {:?} is not dominated by any held capability",
                     new_time
@@ -462,7 +455,8 @@ mod tests {
         let mut set = CapabilitySet::new();
         set.insert(Capability::new(Product::new(1, 1), r.clone()));
         // (2, 1) and (1, 2) are both >= (1, 1) and incomparable with each other.
-        set.downgrade(vec![Product::new(2, 1), Product::new(1, 2)]).unwrap();
+        set.downgrade(vec![Product::new(2, 1), Product::new(1, 2)])
+            .unwrap();
         assert_eq!(set.len(), 2);
         let frontier = set.frontier();
         assert!(frontier.elements().contains(&Product::new(2, 1)));

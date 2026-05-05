@@ -16,7 +16,7 @@ use std::sync::Arc;
 #[derive(Debug, Clone)]
 pub enum PartitionStrategy<D> {
     /// No shuffle — data stays on the same worker.
-    /// This is the default for operators within the same execution region.
+    /// This is the default for operators within the same execution stage.
     Pipeline,
 
     /// Hash-based exchange: routes each record to a worker determined by a key function.
@@ -25,14 +25,14 @@ pub enum PartitionStrategy<D> {
     Exchange(ExchangeFn<D>),
 
     /// Round-robin distribution across all target workers.
-    /// Used at execution region boundaries to rebalance load evenly.
+    /// Used at execution stage boundaries to rebalance load evenly.
     Rebalance,
 
-    /// Funnel all data to a single worker (worker index 0 in the target region).
+    /// Funnel all data to a single worker (worker index 0 in the target stage).
     /// Used before global aggregations.
     Gather,
 
-    /// Fan out each record to all workers in the target region.
+    /// Fan out each record to all workers in the target stage.
     /// Used for broadcasting reference data or configuration.
     Broadcast,
 
@@ -50,7 +50,10 @@ pub struct ExchangeFn<D> {
 
 impl<D> ExchangeFn<D> {
     /// Create a new exchange function from a closure that returns a hash key.
-    pub fn new(description: impl Into<String>, func: impl Fn(&D) -> u64 + Send + Sync + 'static) -> Self {
+    pub fn new(
+        description: impl Into<String>,
+        func: impl Fn(&D) -> u64 + Send + Sync + 'static,
+    ) -> Self {
         Self {
             func: Arc::new(func),
             description: description.into(),
@@ -165,7 +168,10 @@ impl<D> Router<D> {
     /// # Panics
     /// Panics if `num_targets` is 0.
     pub fn new(strategy: PartitionStrategy<D>, num_targets: usize) -> Self {
-        assert!(num_targets > 0, "Router requires at least one target worker");
+        assert!(
+            num_targets > 0,
+            "Router requires at least one target worker"
+        );
         Self {
             strategy,
             num_targets,
@@ -196,9 +202,7 @@ impl<D> Router<D> {
             PartitionStrategy::Gather => {
                 vec![0]
             }
-            PartitionStrategy::Broadcast => {
-                (0..self.num_targets).collect()
-            }
+            PartitionStrategy::Broadcast => (0..self.num_targets).collect(),
             PartitionStrategy::BroadcastLocal => {
                 // For now, treat same as Broadcast. The distinction between
                 // local and all workers is resolved at a higher level.

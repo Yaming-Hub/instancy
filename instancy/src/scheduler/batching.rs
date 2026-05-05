@@ -72,11 +72,7 @@ impl BatchingPolicy {
     /// # Panics
     ///
     /// Panics if `max_count` is zero.
-    pub fn custom(
-        max_count: usize,
-        max_bytes: Option<usize>,
-        max_wait: Duration,
-    ) -> Self {
+    pub fn custom(max_count: usize, max_bytes: Option<usize>, max_wait: Duration) -> Self {
         assert!(max_count > 0, "max_batch_count must be positive");
         Self {
             max_batch_count: max_count,
@@ -353,11 +349,7 @@ mod tests {
 
     #[test]
     fn custom_policy() {
-        let policy = BatchingPolicy::custom(
-            512,
-            Some(128 * 1024),
-            Duration::from_millis(5),
-        );
+        let policy = BatchingPolicy::custom(512, Some(128 * 1024), Duration::from_millis(5));
         assert_eq!(policy.max_batch_count, 512);
         assert_eq!(policy.max_batch_bytes, Some(128 * 1024));
         assert_eq!(policy.max_batch_wait, Duration::from_millis(5));
@@ -393,8 +385,8 @@ mod tests {
     #[test]
     fn byte_size_threshold_triggers_dispatch() {
         let policy = BatchingPolicy::custom(
-            1_000_000, // very high count
-            Some(100), // low byte threshold
+            1_000_000,               // very high count
+            Some(100),               // low byte threshold
             Duration::from_secs(60), // long wait
         );
         let mut acc = BatchAccumulator::new();
@@ -412,11 +404,7 @@ mod tests {
 
     #[test]
     fn byte_size_ignored_without_size_info() {
-        let policy = BatchingPolicy::custom(
-            1_000_000,
-            Some(100),
-            Duration::from_secs(60),
-        );
+        let policy = BatchingPolicy::custom(1_000_000, Some(100), Duration::from_secs(60));
         let mut acc = BatchAccumulator::new();
 
         // Record many messages without size info
@@ -430,11 +418,7 @@ mod tests {
 
     #[test]
     fn time_threshold_triggers_dispatch() {
-        let policy = BatchingPolicy::custom(
-            1_000_000,
-            None,
-            Duration::from_millis(10),
-        );
+        let policy = BatchingPolicy::custom(1_000_000, None, Duration::from_millis(10));
         let mut acc = BatchAccumulator::new();
         acc.record_message(None);
 
@@ -456,11 +440,7 @@ mod tests {
 
     #[test]
     fn first_threshold_wins_count_before_bytes() {
-        let policy = BatchingPolicy::custom(
-            5,
-            Some(1000),
-            Duration::from_secs(60),
-        );
+        let policy = BatchingPolicy::custom(5, Some(1000), Duration::from_secs(60));
         let mut acc = BatchAccumulator::new();
         for _ in 0..5 {
             acc.record_message(Some(10)); // total bytes = 50 < 1000
@@ -472,11 +452,7 @@ mod tests {
 
     #[test]
     fn first_threshold_wins_bytes_before_count() {
-        let policy = BatchingPolicy::custom(
-            1000,
-            Some(50),
-            Duration::from_secs(60),
-        );
+        let policy = BatchingPolicy::custom(1000, Some(50), Duration::from_secs(60));
         let mut acc = BatchAccumulator::new();
         for _ in 0..3 {
             acc.record_message(Some(20)); // total bytes = 60 >= 50
@@ -518,11 +494,7 @@ mod tests {
 
     #[test]
     fn should_dispatch_at_uses_provided_time() {
-        let policy = BatchingPolicy::custom(
-            1_000_000,
-            None,
-            Duration::from_millis(10),
-        );
+        let policy = BatchingPolicy::custom(1_000_000, None, Duration::from_millis(10));
         let mut acc = BatchAccumulator::new();
         acc.record_message(None);
         let first = acc.first_message_at().unwrap();
@@ -678,11 +650,7 @@ mod tests {
 
     #[test]
     fn should_dispatch_at_with_earlier_now_does_not_panic() {
-        let policy = BatchingPolicy::custom(
-            1_000_000,
-            None,
-            Duration::from_millis(10),
-        );
+        let policy = BatchingPolicy::custom(1_000_000, None, Duration::from_millis(10));
         let mut acc = BatchAccumulator::new();
 
         // Record a message, then pass a "now" that is earlier (simulated via subtraction)
@@ -707,8 +675,8 @@ mod tests {
     #[test]
     fn vec_of_strings_message_size_sums_elements() {
         let v = vec![
-            String::from("hello"),      // 5 bytes
-            String::from("world!"),     // 6 bytes
+            String::from("hello"),  // 5 bytes
+            String::from("world!"), // 6 bytes
         ];
         assert_eq!(v.message_size(), 11);
     }

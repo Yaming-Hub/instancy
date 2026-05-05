@@ -10,9 +10,9 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use instancy::metrics::{
+    DataflowMetrics, DataflowResult, OperatorMetricsCollector,
     activation::ActivationGuard,
     tracing_integration::{self, TracingConfig},
-    DataflowMetrics, DataflowResult, OperatorMetricsCollector,
 };
 
 #[test]
@@ -114,7 +114,10 @@ fn tracing_config_controls() {
 
 #[test]
 fn concurrent_metrics_accumulation() {
-    let collector = Arc::new(instancy::metrics::OperatorMetricsCollector::new("concurrent_op", 0));
+    let collector = Arc::new(instancy::metrics::OperatorMetricsCollector::new(
+        "concurrent_op",
+        0,
+    ));
     let num_threads = 8;
     let activations_per_thread = 100;
 
@@ -123,8 +126,7 @@ fn concurrent_metrics_accumulation() {
             let c = collector.clone();
             std::thread::spawn(move || {
                 for _ in 0..activations_per_thread {
-                    let guard =
-                        instancy::metrics::activation::ActivationGuard::new(c.clone());
+                    let guard = instancy::metrics::activation::ActivationGuard::new(c.clone());
                     guard.finish(10);
                 }
             })
@@ -146,7 +148,10 @@ fn concurrent_metrics_accumulation() {
 
 #[test]
 fn concurrent_backpressure_max_tracking() {
-    let collector = Arc::new(instancy::metrics::OperatorMetricsCollector::new("bp_concurrent", 0));
+    let collector = Arc::new(instancy::metrics::OperatorMetricsCollector::new(
+        "bp_concurrent",
+        0,
+    ));
     let num_threads = 4;
 
     let handles: Vec<_> = (0..num_threads)

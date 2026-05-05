@@ -6,12 +6,11 @@ use instancy::SimpleRuntime;
 fn main() {
     // --- Binary: pair two streams element-wise ---
     let builder = DataflowBuilder::<u64>::new("binary_demo");
-    let names = builder.source("names", vec![
-        (0u64, vec!["Alice".to_string(), "Bob".to_string()]),
-    ]);
-    let scores = builder.source("scores", vec![
-        (0u64, vec![95i32, 87]),
-    ]);
+    let names = builder.source(
+        "names",
+        vec![(0u64, vec!["Alice".to_string(), "Bob".to_string()])],
+    );
+    let scores = builder.source("scores", vec![(0u64, vec![95i32, 87])]);
 
     let paired = names.binary::<i32, String, _>(scores, "pair", |names_in, scores_in, out| {
         let mut ns = Vec::new();
@@ -23,7 +22,9 @@ fn main() {
             ss.extend(data.iter().cloned());
         }
         if !ns.is_empty() {
-            let pairs: Vec<String> = ns.iter().zip(ss.iter())
+            let pairs: Vec<String> = ns
+                .iter()
+                .zip(ss.iter())
                 .map(|(n, s)| format!("{n}: {s}"))
                 .collect();
             out.push_vec(0, pairs);
@@ -43,8 +44,14 @@ fn main() {
 
     // --- Concat: merge three streams ---
     let builder = DataflowBuilder::<u64>::new("concat_demo");
-    let critical = builder.source("critical", vec![(0u64, vec!["[CRIT] disk full".to_string()])]);
-    let warnings = builder.source("warnings", vec![(0u64, vec!["[WARN] high cpu".to_string()])]);
+    let critical = builder.source(
+        "critical",
+        vec![(0u64, vec!["[CRIT] disk full".to_string()])],
+    );
+    let warnings = builder.source(
+        "warnings",
+        vec![(0u64, vec!["[WARN] high cpu".to_string()])],
+    );
     let info = builder.source("info", vec![(0u64, vec!["[INFO] started".to_string()])]);
 
     let all_logs = Pipe::concat(vec![critical, warnings, info]);
@@ -63,7 +70,8 @@ fn main() {
     let evens = builder.source("evens", vec![(0u64, vec![2, 4, 6])]);
     let odds = builder.source("odds", vec![(0u64, vec![1, 3, 5])]);
 
-    let all = evens.merge(odds)
+    let all = evens
+        .merge(odds)
         .map("sort_label", |_t, x| format!("num={x}"));
     let merge_out = all.output("sorted");
 

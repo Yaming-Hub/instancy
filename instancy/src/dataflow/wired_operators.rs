@@ -23,8 +23,8 @@ use std::collections::VecDeque;
 use crate::dataflow::channels::envelope::{Envelope, Payload};
 use crate::dataflow::channels::pushpull::{Pull, Push};
 use crate::dataflow::operators::handles::{InputHandle, NotifyContext, OutputHandle};
-use crate::dataflow::region::RegionId;
 use crate::dataflow::schedulable::{ActivationOutcome, SchedulableOperator};
+use crate::dataflow::stage::StageId;
 use crate::error::{Error, Result};
 use crate::progress::capability::Capability;
 use crate::progress::frontier::Antichain;
@@ -49,7 +49,7 @@ use crate::progress::timestamp::Timestamp;
 pub struct WiredUnaryOperator<T: Timestamp, D1: Send + 'static, D2: Send + 'static> {
     name: String,
     index: usize,
-    region_id: RegionId,
+    stage_id: StageId,
     /// Input channel — pulls envelopes from upstream.
     input_puller: Box<dyn Pull<T, D1>>,
     /// Operator's typed input buffer.
@@ -79,8 +79,10 @@ impl<T: Timestamp, D1: Send + 'static, D2: Send + 'static> WiredUnaryOperator<T,
     pub fn new(
         name: impl Into<String>,
         index: usize,
-        region_id: RegionId,
-        logic: impl FnMut(&mut InputHandle<T, D1>, &mut OutputHandle<T, D2>) -> Result<()> + Send + 'static,
+        stage_id: StageId,
+        logic: impl FnMut(&mut InputHandle<T, D1>, &mut OutputHandle<T, D2>) -> Result<()>
+        + Send
+        + 'static,
         input_puller: Box<dyn Pull<T, D1>>,
         output_pusher: Box<dyn Push<T, D2>>,
     ) -> Self {
@@ -90,7 +92,7 @@ impl<T: Timestamp, D1: Send + 'static, D2: Send + 'static> WiredUnaryOperator<T,
             output_handle: OutputHandle::new(format!("{name}:output")),
             name,
             index,
-            region_id,
+            stage_id,
             input_puller,
             logic: Box::new(logic),
             output_pusher,
@@ -110,8 +112,10 @@ impl<T: Timestamp, D1: Send + 'static, D2: Send + 'static> WiredUnaryOperator<T,
     pub fn with_reporter(
         name: impl Into<String>,
         index: usize,
-        region_id: RegionId,
-        logic: impl FnMut(&mut InputHandle<T, D1>, &mut OutputHandle<T, D2>) -> Result<()> + Send + 'static,
+        stage_id: StageId,
+        logic: impl FnMut(&mut InputHandle<T, D1>, &mut OutputHandle<T, D2>) -> Result<()>
+        + Send
+        + 'static,
         input_puller: Box<dyn Pull<T, D1>>,
         output_pusher: Box<dyn Push<T, D2>>,
         reporter: ProgressReporter<T>,
@@ -122,7 +126,7 @@ impl<T: Timestamp, D1: Send + 'static, D2: Send + 'static> WiredUnaryOperator<T,
             output_handle: OutputHandle::new(format!("{name}:output")),
             name,
             index,
-            region_id,
+            stage_id,
             input_puller,
             logic: Box::new(logic),
             output_pusher,
@@ -230,7 +234,10 @@ impl<T: Timestamp, D1: Send + 'static, D2: Send + 'static> SchedulableOperator
         }
 
         // Step 6: Check if we're done after processing.
-        if self.input_exhausted && !self.input_handle.has_pending() && !self.output_handle.has_output() {
+        if self.input_exhausted
+            && !self.input_handle.has_pending()
+            && !self.output_handle.has_output()
+        {
             self.output_pusher.close();
             // Release capability (idempotent via take).
             if let Some(reporter) = self.progress_reporter.take() {
@@ -255,8 +262,8 @@ impl<T: Timestamp, D1: Send + 'static, D2: Send + 'static> SchedulableOperator
         self.index
     }
 
-    fn region_id(&self) -> RegionId {
-        self.region_id
+    fn stage_id(&self) -> StageId {
+        self.stage_id
     }
 
     fn close_inputs(&mut self) {
@@ -281,7 +288,7 @@ impl<T: Timestamp, D1: Send + 'static, D2: Send + 'static> SchedulableOperator
 pub struct WiredSourceOperator<T: Timestamp, D: Send + 'static> {
     name: String,
     index: usize,
-    region_id: RegionId,
+    stage_id: StageId,
     /// Data to emit, organized by timestamp (FIFO order).
     pending_data: VecDeque<(T, Vec<D>)>,
     /// Output channel.
@@ -301,14 +308,14 @@ impl<T: Timestamp, D: Send + 'static> WiredSourceOperator<T, D> {
     pub fn new(
         name: impl Into<String>,
         index: usize,
-        region_id: RegionId,
+        stage_id: StageId,
         data: Vec<(T, Vec<D>)>,
         output_pusher: Box<dyn Push<T, D>>,
     ) -> Self {
         Self {
             name: name.into(),
             index,
-            region_id,
+            stage_id,
             pending_data: VecDeque::from(data),
             output_pusher,
             pending_output: VecDeque::new(),
@@ -325,7 +332,7 @@ impl<T: Timestamp, D: Send + 'static> WiredSourceOperator<T, D> {
     pub fn with_progress(
         name: impl Into<String>,
         index: usize,
-        region_id: RegionId,
+        stage_id: StageId,
         data: Vec<(T, Vec<D>)>,
         output_pusher: Box<dyn Push<T, D>>,
         reporter: ProgressReporter<T>,
@@ -333,7 +340,7 @@ impl<T: Timestamp, D: Send + 'static> WiredSourceOperator<T, D> {
         Self {
             name: name.into(),
             index,
-            region_id,
+            stage_id,
             pending_data: VecDeque::from(data),
             output_pusher,
             pending_output: VecDeque::new(),
@@ -395,8 +402,8 @@ impl<T: Timestamp, D: Send + 'static> SchedulableOperator for WiredSourceOperato
         self.index
     }
 
-    fn region_id(&self) -> RegionId {
-        self.region_id
+    fn stage_id(&self) -> StageId {
+        self.stage_id
     }
 
     fn close_inputs(&mut self) {
@@ -422,7 +429,7 @@ impl<T: Timestamp, D: Send + 'static> SchedulableOperator for WiredSourceOperato
 pub struct WiredSinkOperator<T: Timestamp, D: Send + 'static> {
     name: String,
     index: usize,
-    region_id: RegionId,
+    stage_id: StageId,
     /// Input channel.
     input_puller: Box<dyn Pull<T, D>>,
     /// Collected output.
@@ -438,13 +445,13 @@ impl<T: Timestamp, D: Send + 'static> WiredSinkOperator<T, D> {
     pub fn new(
         name: impl Into<String>,
         index: usize,
-        region_id: RegionId,
+        stage_id: StageId,
         input_puller: Box<dyn Pull<T, D>>,
     ) -> Self {
         Self {
             name: name.into(),
             index,
-            region_id,
+            stage_id,
             input_puller,
             collected: Vec::new(),
             input_exhausted: false,
@@ -509,8 +516,8 @@ impl<T: Timestamp, D: Send + 'static> SchedulableOperator for WiredSinkOperator<
         self.index
     }
 
-    fn region_id(&self) -> RegionId {
-        self.region_id
+    fn stage_id(&self) -> StageId {
+        self.stage_id
     }
 
     fn close_inputs(&mut self) {
@@ -535,13 +542,17 @@ pub struct WiredBinaryOperator<
 > {
     name: String,
     index: usize,
-    region_id: RegionId,
+    stage_id: StageId,
     input1_puller: Box<dyn Pull<T, D1>>,
     input2_puller: Box<dyn Pull<T, D2>>,
     input1_handle: InputHandle<T, D1>,
     input2_handle: InputHandle<T, D2>,
     logic: Box<
-        dyn FnMut(&mut InputHandle<T, D1>, &mut InputHandle<T, D2>, &mut OutputHandle<T, D3>) -> Result<()>
+        dyn FnMut(
+                &mut InputHandle<T, D1>,
+                &mut InputHandle<T, D2>,
+                &mut OutputHandle<T, D3>,
+            ) -> Result<()>
             + Send,
     >,
     output_handle: OutputHandle<T, D3>,
@@ -559,10 +570,14 @@ impl<T: Timestamp, D1: Send + 'static, D2: Send + 'static, D3: Send + 'static>
     pub fn new(
         name: impl Into<String>,
         index: usize,
-        region_id: RegionId,
-        logic: impl FnMut(&mut InputHandle<T, D1>, &mut InputHandle<T, D2>, &mut OutputHandle<T, D3>) -> Result<()>
-            + Send
-            + 'static,
+        stage_id: StageId,
+        logic: impl FnMut(
+            &mut InputHandle<T, D1>,
+            &mut InputHandle<T, D2>,
+            &mut OutputHandle<T, D3>,
+        ) -> Result<()>
+        + Send
+        + 'static,
         input1_puller: Box<dyn Pull<T, D1>>,
         input2_puller: Box<dyn Pull<T, D2>>,
         output_pusher: Box<dyn Push<T, D3>>,
@@ -574,7 +589,7 @@ impl<T: Timestamp, D1: Send + 'static, D2: Send + 'static, D3: Send + 'static>
             output_handle: OutputHandle::new(format!("{name}:output")),
             name,
             index,
-            region_id,
+            stage_id,
             input1_puller,
             input2_puller,
             logic: Box::new(logic),
@@ -648,8 +663,8 @@ impl<T: Timestamp, D1: Send + 'static, D2: Send + 'static, D3: Send + 'static>
     }
 }
 
-impl<T: Timestamp, D1: Send + 'static, D2: Send + 'static, D3: Send + 'static>
-    SchedulableOperator for WiredBinaryOperator<T, D1, D2, D3>
+impl<T: Timestamp, D1: Send + 'static, D2: Send + 'static, D3: Send + 'static> SchedulableOperator
+    for WiredBinaryOperator<T, D1, D2, D3>
 {
     fn activate(&mut self) -> Result<ActivationOutcome> {
         if self.done {
@@ -719,8 +734,8 @@ impl<T: Timestamp, D1: Send + 'static, D2: Send + 'static, D3: Send + 'static>
         self.index
     }
 
-    fn region_id(&self) -> RegionId {
-        self.region_id
+    fn stage_id(&self) -> StageId {
+        self.stage_id
     }
 
     fn close_inputs(&mut self) {
@@ -741,7 +756,7 @@ impl<T: Timestamp, D1: Send + 'static, D2: Send + 'static, D3: Send + 'static>
 pub struct WiredConcatOperator<T: Timestamp, D: Send + 'static> {
     name: String,
     index: usize,
-    region_id: RegionId,
+    stage_id: StageId,
     input_pullers: Vec<Box<dyn Pull<T, D>>>,
     inputs_exhausted: Vec<bool>,
     output_pusher: Box<dyn Push<T, D>>,
@@ -754,7 +769,7 @@ impl<T: Timestamp, D: Send + 'static> WiredConcatOperator<T, D> {
     pub fn new(
         name: impl Into<String>,
         index: usize,
-        region_id: RegionId,
+        stage_id: StageId,
         input_pullers: Vec<Box<dyn Pull<T, D>>>,
         output_pusher: Box<dyn Push<T, D>>,
     ) -> Self {
@@ -762,7 +777,7 @@ impl<T: Timestamp, D: Send + 'static> WiredConcatOperator<T, D> {
         Self {
             name: name.into(),
             index,
-            region_id,
+            stage_id,
             input_pullers,
             inputs_exhausted: vec![false; num_inputs],
             output_pusher,
@@ -853,8 +868,8 @@ impl<T: Timestamp, D: Send + 'static> SchedulableOperator for WiredConcatOperato
         self.index
     }
 
-    fn region_id(&self) -> RegionId {
-        self.region_id
+    fn stage_id(&self) -> StageId {
+        self.stage_id
     }
 
     fn close_inputs(&mut self) {
@@ -878,7 +893,7 @@ where
 {
     name: String,
     index: usize,
-    region_id: RegionId,
+    stage_id: StageId,
     input_puller: Box<dyn Pull<TOuter, D>>,
     output_pusher: Box<dyn Push<crate::order::Product<TOuter, TInner>, D>>,
     pending_output: VecDeque<Envelope<crate::order::Product<TOuter, TInner>, D>>,
@@ -887,8 +902,7 @@ where
     _phantom: std::marker::PhantomData<TInner>,
 }
 
-impl<TOuter: Timestamp, TInner: Timestamp, D: Send + 'static>
-    WiredEnterOperator<TOuter, TInner, D>
+impl<TOuter: Timestamp, TInner: Timestamp, D: Send + 'static> WiredEnterOperator<TOuter, TInner, D>
 where
     crate::order::Product<TOuter, TInner>: Timestamp,
 {
@@ -896,14 +910,14 @@ where
     pub fn new(
         name: impl Into<String>,
         index: usize,
-        region_id: RegionId,
+        stage_id: StageId,
         input_puller: Box<dyn Pull<TOuter, D>>,
         output_pusher: Box<dyn Push<crate::order::Product<TOuter, TInner>, D>>,
     ) -> Self {
         Self {
             name: name.into(),
             index,
-            region_id,
+            stage_id,
             input_puller,
             output_pusher,
             pending_output: VecDeque::new(),
@@ -949,8 +963,7 @@ where
             match self.input_puller.pull() {
                 Some(envelope) => match envelope.payload {
                     Payload::Data { time, data } => {
-                        let product_time =
-                            crate::order::Product::new(time, TInner::minimum());
+                        let product_time = crate::order::Product::new(time, TInner::minimum());
                         self.pending_output
                             .push_back(Envelope::data(product_time, data));
                         made_progress = true;
@@ -997,8 +1010,8 @@ where
         self.index
     }
 
-    fn region_id(&self) -> RegionId {
-        self.region_id
+    fn stage_id(&self) -> StageId {
+        self.stage_id
     }
 
     fn close_inputs(&mut self) {
@@ -1020,7 +1033,7 @@ where
 {
     name: String,
     index: usize,
-    region_id: RegionId,
+    stage_id: StageId,
     input_puller: Box<dyn Pull<crate::order::Product<TOuter, TInner>, D>>,
     output_pusher: Box<dyn Push<TOuter, D>>,
     pending_output: VecDeque<Envelope<TOuter, D>>,
@@ -1028,8 +1041,7 @@ where
     done: bool,
 }
 
-impl<TOuter: Timestamp, TInner: Timestamp, D: Send + 'static>
-    WiredLeaveOperator<TOuter, TInner, D>
+impl<TOuter: Timestamp, TInner: Timestamp, D: Send + 'static> WiredLeaveOperator<TOuter, TInner, D>
 where
     crate::order::Product<TOuter, TInner>: Timestamp,
 {
@@ -1037,14 +1049,14 @@ where
     pub fn new(
         name: impl Into<String>,
         index: usize,
-        region_id: RegionId,
+        stage_id: StageId,
         input_puller: Box<dyn Pull<crate::order::Product<TOuter, TInner>, D>>,
         output_pusher: Box<dyn Push<TOuter, D>>,
     ) -> Self {
         Self {
             name: name.into(),
             index,
-            region_id,
+            stage_id,
             input_puller,
             output_pusher,
             pending_output: VecDeque::new(),
@@ -1136,8 +1148,8 @@ where
         self.index
     }
 
-    fn region_id(&self) -> RegionId {
-        self.region_id
+    fn stage_id(&self) -> StageId {
+        self.stage_id
     }
 
     fn close_inputs(&mut self) {
@@ -1160,7 +1172,7 @@ where
 {
     name: String,
     index: usize,
-    region_id: RegionId,
+    stage_id: StageId,
     summary: TInner::Summary,
     input_puller: Box<dyn Pull<crate::order::Product<TOuter, TInner>, D>>,
     output_pusher: Box<dyn Push<crate::order::Product<TOuter, TInner>, D>>,
@@ -1178,7 +1190,7 @@ where
     pub fn new(
         name: impl Into<String>,
         index: usize,
-        region_id: RegionId,
+        stage_id: StageId,
         summary: TInner::Summary,
         input_puller: Box<dyn Pull<crate::order::Product<TOuter, TInner>, D>>,
         output_pusher: Box<dyn Push<crate::order::Product<TOuter, TInner>, D>>,
@@ -1186,7 +1198,7 @@ where
         Self {
             name: name.into(),
             index,
-            region_id,
+            stage_id,
             summary,
             input_puller,
             output_pusher,
@@ -1236,8 +1248,7 @@ where
                     Payload::Data { time, data } => {
                         // Advance inner timestamp by summary
                         if let Some(new_inner) = self.summary.results_in(&time.inner) {
-                            let new_time =
-                                crate::order::Product::new(time.outer, new_inner);
+                            let new_time = crate::order::Product::new(time.outer, new_inner);
                             self.pending_output
                                 .push_back(Envelope::data(new_time, data));
                             made_progress = true;
@@ -1286,8 +1297,8 @@ where
         self.index
     }
 
-    fn region_id(&self) -> RegionId {
-        self.region_id
+    fn stage_id(&self) -> StageId {
+        self.stage_id
     }
 
     fn close_inputs(&mut self) {
@@ -1365,7 +1376,7 @@ where
 pub struct WiredUnaryNotifyOperator<T: Timestamp, D1: Send + 'static, D2: Send + 'static> {
     name: String,
     index: usize,
-    region_id: RegionId,
+    stage_id: StageId,
 
     /// Input channel — pulls envelopes from upstream.
     input_puller: Box<dyn Pull<T, D1>>,
@@ -1420,9 +1431,7 @@ pub struct WiredUnaryNotifyOperator<T: Timestamp, D1: Send + 'static, D2: Send +
     done: bool,
 }
 
-impl<T: Timestamp, D1: Send + 'static, D2: Send + 'static>
-    WiredUnaryNotifyOperator<T, D1, D2>
-{
+impl<T: Timestamp, D1: Send + 'static, D2: Send + 'static> WiredUnaryNotifyOperator<T, D1, D2> {
     /// Create a new wired unary notify operator.
     ///
     /// # Arguments
@@ -1439,14 +1448,14 @@ impl<T: Timestamp, D1: Send + 'static, D2: Send + 'static>
     pub fn new(
         name: impl Into<String>,
         index: usize,
-        region_id: RegionId,
+        stage_id: StageId,
         logic: impl FnMut(
-                &mut InputHandle<T, D1>,
-                &mut OutputHandle<T, D2>,
-                &mut NotifyContext<'_, T>,
-            ) -> Result<()>
-            + Send
-            + 'static,
+            &mut InputHandle<T, D1>,
+            &mut OutputHandle<T, D2>,
+            &mut NotifyContext<'_, T>,
+        ) -> Result<()>
+        + Send
+        + 'static,
         input_puller: Box<dyn Pull<T, D1>>,
         output_pusher: Box<dyn Push<T, D2>>,
         progress_reporter: ProgressReporter<T>,
@@ -1459,7 +1468,7 @@ impl<T: Timestamp, D1: Send + 'static, D2: Send + 'static>
             notificator: Notificator::new(initial_frontier),
             name,
             index,
-            region_id,
+            stage_id,
             input_puller,
             logic: Box::new(logic),
             output_pusher,
@@ -1582,11 +1591,7 @@ impl<T: Timestamp, D1: Send + 'static, D2: Send + 'static> SchedulableOperator
                 &self.progress_reporter,
                 &mut self.held_capabilities,
             );
-            (self.logic)(
-                &mut self.input_handle,
-                &mut self.output_handle,
-                &mut ctx,
-            )?;
+            (self.logic)(&mut self.input_handle, &mut self.output_handle, &mut ctx)?;
         }
 
         // Step 5: Push output to channel.
@@ -1631,8 +1636,8 @@ impl<T: Timestamp, D1: Send + 'static, D2: Send + 'static> SchedulableOperator
         self.index
     }
 
-    fn region_id(&self) -> RegionId {
-        self.region_id
+    fn stage_id(&self) -> StageId {
+        self.stage_id
     }
 
     fn close_inputs(&mut self) {
@@ -1690,7 +1695,8 @@ mod tests {
     use super::*;
     use crate::communication::allocator::ChannelAllocator;
 
-    fn make_channel<T: Timestamp, D: Send + 'static>() -> crate::dataflow::channels::pushpull::ChannelPair<T, D, ()> {
+    fn make_channel<T: Timestamp, D: Send + 'static>()
+    -> crate::dataflow::channels::pushpull::ChannelPair<T, D, ()> {
         let mut alloc = ChannelAllocator::new();
         alloc.allocate()
     }
@@ -1704,7 +1710,7 @@ mod tests {
         let mut source = WiredSourceOperator::new(
             "source",
             0,
-            RegionId::new(0),
+            StageId::new(0),
             vec![(0u64, vec![1, 2, 3]), (1u64, vec![4, 5])],
             pusher,
         );
@@ -1732,7 +1738,7 @@ mod tests {
         let mut pusher = ch.pusher;
         let puller = ch.puller;
 
-        let mut sink = WiredSinkOperator::new("sink", 0, RegionId::new(0), puller);
+        let mut sink = WiredSinkOperator::new("sink", 0, StageId::new(0), puller);
 
         // Push some data.
         pusher.push(Envelope::data(0, vec![10, 20])).unwrap();
@@ -1759,7 +1765,7 @@ mod tests {
         let mut op = WiredUnaryOperator::new(
             "double",
             1,
-            RegionId::new(0),
+            StageId::new(0),
             |input: &mut InputHandle<u64, i32>, output: &mut OutputHandle<u64, i32>| {
                 while let Some((time, data)) = input.next() {
                     let mut session = output.session(time);
@@ -1796,7 +1802,7 @@ mod tests {
         let mut op = WiredUnaryOperator::new(
             "noop",
             0,
-            RegionId::new(0),
+            StageId::new(0),
             |_input: &mut InputHandle<u64, i32>, _output: &mut OutputHandle<u64, i32>| Ok(()),
             ch_in.puller,
             ch_out.pusher,
@@ -1815,7 +1821,7 @@ mod tests {
         let mut source = WiredSourceOperator::new(
             "source",
             0,
-            RegionId::new(0),
+            StageId::new(0),
             vec![(0u64, vec![10, 20, 30])],
             ch1.pusher,
         );
@@ -1823,7 +1829,7 @@ mod tests {
         let mut transform = WiredUnaryOperator::new(
             "double",
             1,
-            RegionId::new(0),
+            StageId::new(0),
             |input: &mut InputHandle<u64, i32>, output: &mut OutputHandle<u64, i32>| {
                 while let Some((time, data)) = input.next() {
                     let mut session = output.session(time);
@@ -1837,7 +1843,7 @@ mod tests {
             ch2.pusher,
         );
 
-        let mut sink = WiredSinkOperator::new("sink", 2, RegionId::new(0), ch2.puller);
+        let mut sink = WiredSinkOperator::new("sink", 2, StageId::new(0), ch2.puller);
 
         // Run pipeline manually.
         assert_eq!(source.activate().unwrap(), ActivationOutcome::Done);

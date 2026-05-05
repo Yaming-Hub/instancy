@@ -9,15 +9,15 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use async_trait::async_trait;
-use dactor::prelude::*;
 use dactor::message::Message;
+use dactor::prelude::*;
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::Mutex;
 
 use instancy::communication::transport_session::PeerConnection;
 use instancy::dataflow::id::DataflowId;
-use instancy::{ClusterTopology, NodeConfig};
 use instancy::runtime::{RuntimeConfig, RuntimeHandle};
+use instancy::{ClusterTopology, NodeConfig};
 
 use crate::dataflows;
 use crate::protocol::*;
@@ -47,10 +47,8 @@ struct ListenerState {
 /// Tracks peer connections established for a dataflow before spawn.
 struct ConnectionState {
     topology: SerializableTopology,
-    connections: Vec<PeerConnection<
-        tokio::net::tcp::OwnedReadHalf,
-        tokio::net::tcp::OwnedWriteHalf,
-    >>,
+    connections:
+        Vec<PeerConnection<tokio::net::tcp::OwnedReadHalf, tokio::net::tcp::OwnedWriteHalf>>,
 }
 
 /// State for a running dataflow.
@@ -90,8 +88,7 @@ impl Actor for DataflowAgent {
             worker_threads: args.worker_threads,
             ..Default::default()
         };
-        let runtime = RuntimeHandle::new(config)
-            .expect("failed to create instancy runtime");
+        let runtime = RuntimeHandle::new(config).expect("failed to create instancy runtime");
         Self {
             node_id: args.node_id,
             runtime: Arc::new(std::sync::Mutex::new(runtime)),
@@ -152,7 +149,10 @@ impl DataflowAgent {
                 port_name,
                 timestamp,
                 data,
-            } => self.handle_feed_data(dataflow_id, worker_idx, port_name, timestamp, data).await,
+            } => {
+                self.handle_feed_data(dataflow_id, worker_idx, port_name, timestamp, data)
+                    .await
+            }
 
             NodeCommand::CloseInputs {
                 dataflow_id,
@@ -163,7 +163,10 @@ impl DataflowAgent {
                 dataflow_id,
                 worker_idx,
                 port_name,
-            } => self.handle_collect_output(dataflow_id, worker_idx, port_name).await,
+            } => {
+                self.handle_collect_output(dataflow_id, worker_idx, port_name)
+                    .await
+            }
 
             NodeCommand::CancelDataflow { dataflow_id } => {
                 self.handle_cancel_dataflow(dataflow_id).await
@@ -190,10 +193,8 @@ impl DataflowAgent {
         match TcpListener::bind("127.0.0.1:0").await {
             Ok(listener) => {
                 let addr = listener.local_addr().unwrap();
-                self.listeners.insert(
-                    dataflow_id.clone(),
-                    ListenerState { listener, topology },
-                );
+                self.listeners
+                    .insert(dataflow_id.clone(), ListenerState { listener, topology });
                 NodeResponse::ListenerReady {
                     dataflow_id,
                     listen_addr: addr,
@@ -240,11 +241,8 @@ impl DataflowAgent {
         // in any order, so we identify each peer via a lightweight handshake:
         // the connector writes its node_id (length-prefixed), the acceptor reads it.
         for _ in 0..accept_count {
-            match tokio::time::timeout(
-                Duration::from_secs(10),
-                listener_state.listener.accept(),
-            )
-            .await
+            match tokio::time::timeout(Duration::from_secs(10), listener_state.listener.accept())
+                .await
             {
                 Ok(Ok((stream, _addr))) => {
                     let (mut reader, mut writer) = stream.into_split();
@@ -404,15 +402,18 @@ impl DataflowAgent {
             )
         })
         .await
-        .unwrap_or_else(|e| Err(instancy::error::Error::Custom(format!("spawn_blocking join: {e}"))));
+        .unwrap_or_else(|e| {
+            Err(instancy::error::Error::Custom(format!(
+                "spawn_blocking join: {e}"
+            )))
+        });
 
         match spawn_result {
             Ok(mut cluster_handle) => {
                 let num_local = cluster_handle.num_local_workers();
 
                 // Extract I/O handles based on dataflow type.
-                let (input_names, output_name) =
-                    dataflows::port_names(dataflow_type);
+                let (input_names, output_name) = dataflows::port_names(dataflow_type);
                 let mut input_senders: HashMap<(usize, String), Box<dyn std::any::Any + Send>> =
                     HashMap::new();
                 let mut output_collectors: HashMap<(usize, String), Box<dyn std::any::Any + Send>> =
@@ -484,7 +485,13 @@ impl DataflowAgent {
         let mut guard = active.lock().await;
         let key = (worker_idx, port_name.clone());
         let dataflow_type = guard.dataflow_type;
-        let result = feed_data_typed(dataflow_type, &mut guard.input_senders, &key, timestamp, &data);
+        let result = feed_data_typed(
+            dataflow_type,
+            &mut guard.input_senders,
+            &key,
+            timestamp,
+            &data,
+        );
         match result {
             Ok(()) => NodeResponse::DataFed,
             Err(e) => NodeResponse::Error { message: e },
@@ -875,9 +882,7 @@ async fn write_peer_id(
 }
 
 /// Read a node_id from a length-prefixed string (u16 big-endian + UTF-8 bytes).
-async fn read_peer_id(
-    reader: &mut tokio::net::tcp::OwnedReadHalf,
-) -> std::io::Result<String> {
+async fn read_peer_id(reader: &mut tokio::net::tcp::OwnedReadHalf) -> std::io::Result<String> {
     use tokio::io::AsyncReadExt;
     let mut len_buf = [0u8; 2];
     reader.read_exact(&mut len_buf).await?;
@@ -890,7 +895,5 @@ async fn read_peer_id(
     }
     let mut buf = vec![0u8; len];
     reader.read_exact(&mut buf).await?;
-    String::from_utf8(buf).map_err(|e| {
-        std::io::Error::new(std::io::ErrorKind::InvalidData, e)
-    })
+    String::from_utf8(buf).map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))
 }

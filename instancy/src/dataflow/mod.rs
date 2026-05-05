@@ -1,8 +1,4 @@
 //! Dataflow graph abstractions.
-//!
-//! This module provides the core types for constructing dataflow graphs:
-//! scopes, streams, execution regions, channels, routing strategies,
-//! operators, and the dataflow specification builder.
 
 pub mod channel_operators;
 pub mod channels;
@@ -14,7 +10,6 @@ pub mod graph;
 pub mod id;
 pub mod operators;
 pub mod probe;
-pub mod region;
 pub mod schedulable;
 pub mod scope;
 pub mod spec;
@@ -22,25 +17,26 @@ pub mod stage;
 pub mod stream;
 pub mod wired_operators;
 
+#[cfg(feature = "async-io")]
+pub use channel_operators::{AsyncInputSender, AsyncOutputReceiver};
 pub use channel_operators::{
     ChannelSinkOperator, ChannelSourceOperator, InputSender, OutputReceiver,
 };
-#[cfg(feature = "async-io")]
-pub use channel_operators::{AsyncInputSender, AsyncOutputReceiver};
 pub use channels::{ControlSignal, Envelope, PartitionStrategy, Payload};
 pub use context::SharedContext;
-pub use control::{ControlReceiver, ControlSender, WorkerControl};
 pub(crate) use control::ControlBroadcast;
-pub use dataflow_builder::{DataflowBuilder, DataflowBuilderConfig, LogicalDataflow, OutputPort, Pipe};
+pub use control::{ControlReceiver, ControlSender, WorkerControl};
+pub use dataflow_builder::{
+    DataflowBuilder, DataflowBuilderConfig, LogicalDataflow, OutputPort, Pipe,
+};
 pub use executor::{DataflowExecutor, ExecutorConfig};
 pub use graph::{ChannelKind, DataflowGraph, EdgeInfo, OperatorInfo};
 pub use id::DataflowId;
 pub use operators::handles::{InputHandle, NotificationHandle, OutputHandle, OutputSession};
 pub use operators::input::{ChannelInput, InputEvent, TimestampedInput, VecInput};
-pub use operators::output::{OutputEvent, OutputStream, OutputSender};
-pub use region::{PlacementPolicy, Region, RegionAllocator, RegionId};
+pub use operators::output::{OutputEvent, OutputSender, OutputStream};
 pub use schedulable::{ActivationOutcome, ChannelEndpoints, OperatorFactory, SchedulableOperator};
 pub use scope::{ChildScope, RootScope, Scope, ScopeAddr};
 pub use spec::{DataflowHandle, DataflowInputs, DataflowSpec};
 pub use stage::{FusedActivationOrder, StageId, StageInfo, infer_stages};
-pub use stream::{StreamEdge, Slot, StreamConnection};
+pub use stream::{Slot, StreamConnection, StreamEdge};

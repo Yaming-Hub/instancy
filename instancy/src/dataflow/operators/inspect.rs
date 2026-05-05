@@ -8,9 +8,9 @@ use std::fmt;
 use std::sync::{Arc, Mutex};
 
 use crate::dataflow::operators::handles::{InputHandle, OutputHandle};
-use crate::dataflow::region::RegionId;
 use crate::dataflow::scope::Scope;
-use crate::dataflow::stream::{StreamEdge, Slot};
+use crate::dataflow::stage::StageId;
+use crate::dataflow::stream::{Slot, StreamEdge};
 use crate::error::Result;
 use crate::progress::timestamp::Timestamp;
 
@@ -23,8 +23,8 @@ pub struct InspectOperator<T: Timestamp, D> {
     name: String,
     /// Operator index within the scope.
     index: usize,
-    /// The execution region.
-    region_id: RegionId,
+    /// The execution stage.
+    stage_id: StageId,
     /// The operator's input handle.
     input: InputHandle<T, D>,
     /// The operator's output handle.
@@ -35,12 +35,7 @@ pub struct InspectOperator<T: Timestamp, D> {
 
 impl<T: Timestamp, D> InspectOperator<T, D> {
     /// Create a new inspect operator.
-    pub fn new<F>(
-        name: impl Into<String>,
-        index: usize,
-        region_id: RegionId,
-        inspector: F,
-    ) -> Self
+    pub fn new<F>(name: impl Into<String>, index: usize, stage_id: StageId, inspector: F) -> Self
     where
         F: FnMut(&T, &[D]) + Send + 'static,
     {
@@ -50,7 +45,7 @@ impl<T: Timestamp, D> InspectOperator<T, D> {
             output: OutputHandle::new(format!("{name}:output")),
             name,
             index,
-            region_id,
+            stage_id,
             inspector: Box::new(inspector),
         }
     }
@@ -65,9 +60,9 @@ impl<T: Timestamp, D> InspectOperator<T, D> {
         self.index
     }
 
-    /// Get the region ID.
-    pub fn region_id(&self) -> RegionId {
-        self.region_id
+    /// Get the stage ID.
+    pub fn stage_id(&self) -> StageId {
+        self.stage_id
     }
 
     /// Get a mutable reference to the input handle.
@@ -112,7 +107,7 @@ impl<T: Timestamp, D> fmt::Debug for InspectOperator<T, D> {
         f.debug_struct("InspectOperator")
             .field("name", &self.name)
             .field("index", &self.index)
-            .field("region_id", &self.region_id)
+            .field("stage_id", &self.stage_id)
             .finish()
     }
 }
@@ -123,11 +118,7 @@ pub trait InspectExt<S: Scope, D> {
     ///
     /// The closure receives `(&T, &[D])` for each batch. Data passes
     /// through unchanged to the output stream.
-    fn inspect<F>(
-        &self,
-        name: &str,
-        inspector: F,
-    ) -> StreamEdge<S, D>
+    fn inspect<F>(&self, name: &str, inspector: F) -> StreamEdge<S, D>
     where
         F: FnMut(&S::Timestamp, &[D]) + Send + 'static;
 
@@ -135,11 +126,7 @@ pub trait InspectExt<S: Scope, D> {
     ///
     /// A convenience wrapper over `inspect` that calls the closure
     /// for each individual data item.
-    fn inspect_each<F>(
-        &self,
-        name: &str,
-        inspector: F,
-    ) -> StreamEdge<S, D>
+    fn inspect_each<F>(&self, name: &str, inspector: F) -> StreamEdge<S, D>
     where
         F: FnMut(&S::Timestamp, &D) + Send + 'static;
 
@@ -147,50 +134,41 @@ pub trait InspectExt<S: Scope, D> {
     ///
     /// Returns the output stream and an `Arc<Mutex<Vec<(T, D)>>>` that
     /// accumulates all `(timestamp, item)` pairs seen.
-    fn inspect_collect(
-        &self,
-        name: &str,
-    ) -> (StreamEdge<S, D>, Arc<Mutex<Vec<(S::Timestamp, D)>>>)
+    fn inspect_collect(&self, name: &str) -> (StreamEdge<S, D>, Arc<Mutex<Vec<(S::Timestamp, D)>>>)
     where
         D: Clone + Send + 'static,
         S::Timestamp: Clone;
 }
 
 impl<S: Scope, D: 'static> InspectExt<S, D> for StreamEdge<S, D> {
-    fn inspect<F>(
-        &self,
-        name: &str,
-        _inspector: F,
-    ) -> StreamEdge<S, D>
+    fn inspect<F>(&self, name: &str, _inspector: F) -> StreamEdge<S, D>
     where
         F: FnMut(&S::Timestamp, &[D]) + Send + 'static,
     {
         let mut scope = self.scope().clone();
         let op_index = scope.allocate_operator_index();
-        let region_id = self.region_id();
+        let stage_id = self.stage_id();
         let output_slot = Slot::new(op_index, 0);
 
         // Register operator and edge in the dataflow graph.
-        scope.register_operator(crate::dataflow::graph::OperatorInfo::new(
-            op_index, name, region_id, 1, 1,
-        )).expect("operator index should be unique");
+        scope
+            .register_operator(crate::dataflow::graph::OperatorInfo::new(
+                op_index, name, stage_id, 1, 1,
+            ))
+            .expect("operator index should be unique");
         scope.add_edge(crate::dataflow::graph::EdgeInfo::new(
             *self.source(),
             Slot::new(op_index, 0),
-            self.region_id(),
-            region_id,
+            self.stage_id(),
+            stage_id,
         ));
 
-        let _operator = InspectOperator::new(name, op_index, region_id, _inspector);
+        let _operator = InspectOperator::new(name, op_index, stage_id, _inspector);
 
-        StreamEdge::new(scope, output_slot, region_id)
+        StreamEdge::new(scope, output_slot, stage_id)
     }
 
-    fn inspect_each<F>(
-        &self,
-        name: &str,
-        mut inspector: F,
-    ) -> StreamEdge<S, D>
+    fn inspect_each<F>(&self, name: &str, mut inspector: F) -> StreamEdge<S, D>
     where
         F: FnMut(&S::Timestamp, &D) + Send + 'static,
     {
@@ -201,10 +179,7 @@ impl<S: Scope, D: 'static> InspectExt<S, D> for StreamEdge<S, D> {
         })
     }
 
-    fn inspect_collect(
-        &self,
-        name: &str,
-    ) -> (StreamEdge<S, D>, Arc<Mutex<Vec<(S::Timestamp, D)>>>)
+    fn inspect_collect(&self, name: &str) -> (StreamEdge<S, D>, Arc<Mutex<Vec<(S::Timestamp, D)>>>)
     where
         D: Clone + Send + 'static,
         S::Timestamp: Clone,
@@ -233,7 +208,7 @@ mod tests {
         let op = InspectOperator::<u64, i32>::new(
             "observer",
             0,
-            RegionId::new(0),
+            StageId::new(0),
             |_time: &u64, _data: &[i32]| {},
         );
 
@@ -243,12 +218,8 @@ mod tests {
 
     #[test]
     fn inspect_operator_passthrough() {
-        let mut op = InspectOperator::<u64, i32>::new(
-            "passthrough",
-            0,
-            RegionId::new(0),
-            |_time, _data| {},
-        );
+        let mut op =
+            InspectOperator::<u64, i32>::new("passthrough", 0, StageId::new(0), |_time, _data| {});
 
         op.input_mut().push_vec(1, vec![10, 20, 30]);
         op.input_mut().push_vec(2, vec![40]);
@@ -269,7 +240,7 @@ mod tests {
         let mut op = InspectOperator::<u64, i32>::new(
             "collector",
             0,
-            RegionId::new(0),
+            StageId::new(0),
             move |time: &u64, data: &[i32]| {
                 let mut guard = seen_clone.lock().unwrap();
                 for item in data {
@@ -292,14 +263,10 @@ mod tests {
         let called = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let called_clone = Arc::clone(&called);
 
-        let mut op = InspectOperator::<u64, i32>::new(
-            "noop",
-            0,
-            RegionId::new(0),
-            move |_time, _data| {
+        let mut op =
+            InspectOperator::<u64, i32>::new("noop", 0, StageId::new(0), move |_time, _data| {
                 called_clone.store(true, std::sync::atomic::Ordering::SeqCst);
-            },
-        );
+            });
 
         op.activate().unwrap();
         // Inspector should not be called when there's no input
@@ -308,12 +275,8 @@ mod tests {
 
     #[test]
     fn inspect_operator_output_equals_input() {
-        let mut op = InspectOperator::<u64, String>::new(
-            "echo",
-            0,
-            RegionId::new(0),
-            |_time, _data| {},
-        );
+        let mut op =
+            InspectOperator::<u64, String>::new("echo", 0, StageId::new(0), |_time, _data| {});
 
         let input_data = vec!["hello".to_string(), "world".to_string()];
         op.input_mut().push_vec(1, input_data.clone());
@@ -326,23 +289,23 @@ mod tests {
     #[test]
     fn inspect_ext_produces_stream() {
         let mut scope = RootScope::<u64>::new("test", 4);
-        let region_id = scope.current_region().id();
+        let stage_id = scope.current_stage_id();
         let src_idx = scope.allocate_operator_index();
         let source = Slot::new(src_idx, 0);
-        let stream: StreamEdge<RootScope<u64>, i32> = StreamEdge::new(scope, source, region_id);
+        let stream: StreamEdge<RootScope<u64>, i32> = StreamEdge::new(scope, source, stage_id);
 
         let output = stream.inspect("observer", |_time, _data| {});
 
-        assert_eq!(output.region_id(), region_id);
+        assert_eq!(output.stage_id(), stage_id);
         assert_eq!(output.source().operator_index, 2);
     }
 
     #[test]
     fn inspect_collect_gathers_results() {
         let scope = RootScope::<u64>::new("test", 4);
-        let region_id = scope.current_region().id();
+        let stage_id = scope.current_stage_id();
         let source = Slot::new(0, 0);
-        let stream: StreamEdge<RootScope<u64>, i32> = StreamEdge::new(scope, source, region_id);
+        let stream: StreamEdge<RootScope<u64>, i32> = StreamEdge::new(scope, source, stage_id);
 
         let (_output_stream, _collected) = stream.inspect_collect("test_collect");
 
@@ -359,7 +322,7 @@ mod tests {
         let mut op = InspectOperator::<u64, i32>::new(
             "multi",
             0,
-            RegionId::new(0),
+            StageId::new(0),
             move |time: &u64, data: &[i32]| {
                 let mut guard = seen_clone.lock().unwrap();
                 for item in data {

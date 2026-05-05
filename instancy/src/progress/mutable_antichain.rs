@@ -314,20 +314,14 @@ mod tests {
     #[test]
     fn product_frontier_incomparable() {
         let mut mac = MutableAntichain::new();
-        mac.update_iter(vec![
-            (Product::new(1u64, 3u64), 1),
-            (Product::new(3, 1), 1),
-        ]);
+        mac.update_iter(vec![(Product::new(1u64, 3u64), 1), (Product::new(3, 1), 1)]);
         assert_eq!(mac.frontier().len(), 2);
     }
 
     #[test]
     fn product_frontier_eviction() {
         let mut mac = MutableAntichain::new();
-        mac.update_iter(vec![
-            (Product::new(2u64, 2u64), 1),
-            (Product::new(3, 3), 1),
-        ]);
+        mac.update_iter(vec![(Product::new(2u64, 2u64), 1), (Product::new(3, 3), 1)]);
         // Frontier should be {(2,2)} since (2,2) ≤ (3,3)
         assert_eq!(mac.frontier(), &[Product::new(2, 2)]);
 

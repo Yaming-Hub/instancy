@@ -123,19 +123,15 @@ pub trait EdgeMaterializer<T: Timestamp, D: Send + 'static>: Send {
     ///
     /// Returns a Vec of length `num_target_workers()` — one push endpoint
     /// per target worker.
-    fn materialize_source_worker(
-        &mut self,
-        src_idx: usize,
-    ) -> Result<Vec<Box<dyn Push<T, D, ()>>>>;
+    fn materialize_source_worker(&mut self, src_idx: usize)
+    -> Result<Vec<Box<dyn Push<T, D, ()>>>>;
 
     /// Produce pull endpoints for target worker `dst_idx`.
     ///
     /// Returns a Vec of length `num_source_workers()` — one pull endpoint
     /// per source worker.
-    fn materialize_target_worker(
-        &mut self,
-        dst_idx: usize,
-    ) -> Result<Vec<Box<dyn Pull<T, D, ()>>>>;
+    fn materialize_target_worker(&mut self, dst_idx: usize)
+    -> Result<Vec<Box<dyn Pull<T, D, ()>>>>;
 }
 
 // ---------------------------------------------------------------------------
@@ -176,9 +172,7 @@ impl<T: Timestamp, D: Send + 'static> LocalEdgeMaterializer<T, D> {
     }
 }
 
-impl<T: Timestamp, D: Send + 'static> EdgeMaterializer<T, D>
-    for LocalEdgeMaterializer<T, D>
-{
+impl<T: Timestamp, D: Send + 'static> EdgeMaterializer<T, D> for LocalEdgeMaterializer<T, D> {
     fn num_source_workers(&self) -> usize {
         self.num_sources
     }
@@ -289,8 +283,7 @@ mod tests {
     fn edge_materializer_is_object_safe() {
         // Proves the trait can be used as dyn EdgeMaterializer (required
         // by create_exchange_factories_with which takes Arc<Mutex<dyn ...>>).
-        let mat: Box<dyn EdgeMaterializer<u64, i32>> =
-            Box::new(LocalEdgeMaterializer::new(2, 16));
+        let mat: Box<dyn EdgeMaterializer<u64, i32>> = Box::new(LocalEdgeMaterializer::new(2, 16));
         assert_eq!(mat.num_source_workers(), 2);
         assert_eq!(mat.num_target_workers(), 2);
     }

@@ -9,8 +9,8 @@
 //! cargo run --example loop_demo
 //! ```
 
-use instancy::IterateResult;
 use instancy::DataflowBuilder;
+use instancy::IterateResult;
 use instancy::SimpleRuntime;
 
 fn main() {

@@ -42,21 +42,15 @@ pub fn build_dataflow(
 
 /// PassThrough: source → map(identity with marker) → output.
 /// No exchange — data stays on the node where it was fed.
-fn build_pass_through(
-    builder: &mut DataflowBuilder<u64>,
-) -> Result<(Vec<String>, String)> {
+fn build_pass_through(builder: &mut DataflowBuilder<u64>) -> Result<(Vec<String>, String)> {
     let input = builder.input::<Vec<u8>>("data");
-    input
-        .map("identity", |_t, x| x)
-        .output("results");
+    input.map("identity", |_t, x| x).output("results");
     Ok((vec!["data".into()], "results".into()))
 }
 
 /// ExchangeRoundTrip: source → exchange_by_hash(key) → map → output.
 /// Data is repartitioned across workers/nodes by the first 8 bytes as u64 hash.
-fn build_exchange_round_trip(
-    builder: &mut DataflowBuilder<u64>,
-) -> Result<(Vec<String>, String)> {
+fn build_exchange_round_trip(builder: &mut DataflowBuilder<u64>) -> Result<(Vec<String>, String)> {
     let input = builder.input::<(u64, String)>("data");
     input
         .exchange_by_hash("partition", |item: &(u64, String)| item.0)
@@ -67,9 +61,7 @@ fn build_exchange_round_trip(
 
 /// MultiEpochExchange: source → exchange(key) → unary_notify(sum per epoch) → output.
 /// Tests frontier propagation across many epochs.
-fn build_multi_epoch_exchange(
-    builder: &mut DataflowBuilder<u64>,
-) -> Result<(Vec<String>, String)> {
+fn build_multi_epoch_exchange(builder: &mut DataflowBuilder<u64>) -> Result<(Vec<String>, String)> {
     let input = builder.input::<(u64, i64)>("data");
     input
         .exchange_by_hash("partition", |item: &(u64, i64)| item.0)
@@ -136,9 +128,7 @@ fn build_distributed_word_count(
 
 /// IterativeFilter: source → iterate(decay + filter via exchange) → output.
 /// Each iteration decrements values and filters out those that reach zero.
-fn build_iterative_filter(
-    builder: &mut DataflowBuilder<u64>,
-) -> Result<(Vec<String>, String)> {
+fn build_iterative_filter(builder: &mut DataflowBuilder<u64>) -> Result<(Vec<String>, String)> {
     use instancy::dataflow::dataflow_builder::IterateResult;
 
     let input = builder.input::<(u64, i64)>("data");
@@ -166,10 +156,8 @@ fn build_distributed_join(
     let left_input = builder.input::<(u64, String)>("left");
     let right_input = builder.input::<(u64, i64)>("right");
 
-    let left = left_input
-        .exchange_by_hash("left_partition", |item: &(u64, String)| item.0);
-    let right = right_input
-        .exchange_by_hash("right_partition", |item: &(u64, i64)| item.0);
+    let left = left_input.exchange_by_hash("left_partition", |item: &(u64, String)| item.0);
+    let right = right_input.exchange_by_hash("right_partition", |item: &(u64, i64)| item.0);
 
     left.binary(right, "join", {
         let mut left_buf: HashMap<u64, Vec<(u64, String)>> = HashMap::new();

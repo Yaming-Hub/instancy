@@ -35,9 +35,7 @@ fn main() {
             let exchanged = input.exchange_by_hash("by_val", |x: &u64| *x);
 
             // Pass through to output for verification.
-            exchanged
-                .map("pass", |_t, x| x)
-                .output("results");
+            exchanged.map("pass", |_t, x| x).output("results");
 
             Ok(())
         })
@@ -66,7 +64,9 @@ fn main() {
 
     // Verify routing: each worker should receive exactly the values
     // where (value % num_workers) == worker_index.
-    println!("=== Exchange: {num_elements} elements × {num_epochs} epochs across {num_workers} workers ===");
+    println!(
+        "=== Exchange: {num_elements} elements × {num_epochs} epochs across {num_workers} workers ==="
+    );
     println!();
 
     let mut total = 0usize;
@@ -76,7 +76,10 @@ fn main() {
         // Group by epoch for display.
         let mut by_epoch: HashMap<u64, Vec<u64>> = HashMap::new();
         for (t, batch) in &data {
-            by_epoch.entry(*t).or_default().extend(batch.iter().copied());
+            by_epoch
+                .entry(*t)
+                .or_default()
+                .extend(batch.iter().copied());
         }
 
         let count: usize = by_epoch.values().map(|v| v.len()).sum();

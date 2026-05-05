@@ -118,10 +118,7 @@ pub trait ConnectionManager: Send + Sync + 'static {
     ///
     /// Called periodically by the pool to detect dead connections.
     /// The default implementation always returns `true` (no health check).
-    fn is_healthy(
-        &self,
-        _conn: &Self::Connection,
-    ) -> impl Future<Output = bool> + Send {
+    fn is_healthy(&self, _conn: &Self::Connection) -> impl Future<Output = bool> + Send {
         async { true }
     }
 }
@@ -461,7 +458,7 @@ impl<M: ConnectionManager> ConnectionPool<M> {
                     idle: 0,
                     in_use: 0,
                     total: 0,
-                }
+                };
             }
         };
         match peers.get(&peer_id) {
@@ -725,10 +722,7 @@ mod tests {
         assert_eq!(stats.in_use, 1);
         assert_eq!(stats.total, 1);
         // Only 1 establish call total
-        assert_eq!(
-            pool.manager.establish_count.load(Ordering::Relaxed),
-            1
-        );
+        assert_eq!(pool.manager.establish_count.load(Ordering::Relaxed), 1);
         drop(guard);
     }
 
@@ -798,9 +792,7 @@ mod tests {
         let pool = default_pool();
         let peer = PeerId(1);
 
-        pool.manager
-            .fail_establish
-            .store(true, Ordering::Relaxed);
+        pool.manager.fail_establish.store(true, Ordering::Relaxed);
 
         let result = pool.acquire(peer).await;
         assert!(result.is_err());
@@ -927,8 +919,7 @@ mod tests {
         assert!(err.to_string().contains("Peer(3)"));
         assert!(err.to_string().contains("max: 8"));
 
-        let err: PoolError<MockError> =
-            PoolError::ConnectionFailed(MockError("timeout".into()));
+        let err: PoolError<MockError> = PoolError::ConnectionFailed(MockError("timeout".into()));
         assert!(err.to_string().contains("timeout"));
     }
 }

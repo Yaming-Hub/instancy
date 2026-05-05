@@ -2,7 +2,7 @@
 //!
 //! During dataflow construction, operators and edges are registered in a
 //! [`DataflowGraph`]. This graph captures the logical topology of the
-//! computation — which operators exist, how they connect, and what regions
+//! computation — which operators exist, how they connect, and what stages
 //! they belong to.
 //!
 //! # Two-phase construction
@@ -23,7 +23,7 @@
 use std::collections::{HashMap, HashSet};
 use std::fmt;
 
-use crate::dataflow::region::RegionId;
+use crate::dataflow::stage::StageId;
 use crate::dataflow::stream::Slot;
 use crate::error::{Error, Result};
 
@@ -42,8 +42,8 @@ pub struct OperatorInfo {
     pub index: usize,
     /// Human-readable name (e.g., "double", "filter", "probe").
     pub name: String,
-    /// The execution region this operator belongs to.
-    pub region_id: RegionId,
+    /// The execution stage this operator belongs to.
+    pub stage_id: StageId,
     /// Number of input ports.
     pub input_count: usize,
     /// Number of output ports.
@@ -55,14 +55,14 @@ impl OperatorInfo {
     pub fn new(
         index: usize,
         name: impl Into<String>,
-        region_id: RegionId,
+        stage_id: StageId,
         input_count: usize,
         output_count: usize,
     ) -> Self {
         Self {
             index,
             name: name.into(),
-            region_id,
+            stage_id,
             input_count,
             output_count,
         }
@@ -73,8 +73,8 @@ impl fmt::Display for OperatorInfo {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(
             f,
-            "Op[{}] '{}' (region={}, in={}, out={})",
-            self.index, self.name, self.region_id, self.input_count, self.output_count,
+            "Op[{}] '{}' (stage={}, in={}, out={})",
+            self.index, self.name, self.stage_id, self.input_count, self.output_count,
         )
     }
 }
@@ -113,27 +113,22 @@ pub struct EdgeInfo {
     pub source: Slot,
     /// The target input slot (operator index + port number).
     pub target: Slot,
-    /// Region of the source operator.
-    pub source_region: RegionId,
-    /// Region of the target operator.
-    pub target_region: RegionId,
+    /// Stage of the source operator.
+    pub source_stage: StageId,
+    /// Stage of the target operator.
+    pub target_stage: StageId,
     /// Whether this edge is a pipeline (worker-local) or exchange (cross-worker).
     pub channel_kind: ChannelKind,
 }
 
 impl EdgeInfo {
     /// Create a new pipeline edge descriptor (worker-local channel).
-    pub fn new(
-        source: Slot,
-        target: Slot,
-        source_region: RegionId,
-        target_region: RegionId,
-    ) -> Self {
+    pub fn new(source: Slot, target: Slot, source_stage: StageId, target_stage: StageId) -> Self {
         Self {
             source,
             target,
-            source_region,
-            target_region,
+            source_stage,
+            target_stage,
             channel_kind: ChannelKind::Pipeline,
         }
     }
@@ -142,14 +137,14 @@ impl EdgeInfo {
     pub fn exchange(
         source: Slot,
         target: Slot,
-        source_region: RegionId,
-        target_region: RegionId,
+        source_stage: StageId,
+        target_stage: StageId,
     ) -> Self {
         Self {
             source,
             target,
-            source_region,
-            target_region,
+            source_stage,
+            target_stage,
             channel_kind: ChannelKind::Exchange,
         }
     }
@@ -218,9 +213,7 @@ impl DataflowGraph {
         if self.operators.contains_key(&info.index) {
             return Err(Error::Custom(format!(
                 "Duplicate operator index {}: '{}' conflicts with existing '{}'",
-                info.index,
-                info.name,
-                self.operators[&info.index].name,
+                info.index, info.name, self.operators[&info.index].name,
             )));
         }
         self.operators.insert(info.index, info);
@@ -249,7 +242,8 @@ impl DataflowGraph {
     /// Called by exchange_to/rebalance_to/broadcast_to/gather to record
     /// what parallelism the downstream stage should have.
     pub fn set_exchange_parallelism(&mut self, operator_index: usize, parallelism: usize) {
-        self.exchange_parallelism.insert(operator_index, parallelism);
+        self.exchange_parallelism
+            .insert(operator_index, parallelism);
     }
 
     /// Get the target parallelism for an exchange operator, if set.
@@ -365,7 +359,11 @@ impl DataflowGraph {
     /// (each worker runs an independent replica). Attempting to use them
     /// with `spawn_multi(N > 1)` will return an error.
     const EXCHANGE_OPERATOR_NAMES: &[&str] = &[
-        "exchange", "rebalance", "gather", "broadcast", "broadcastlocal",
+        "exchange",
+        "rebalance",
+        "gather",
+        "broadcast",
+        "broadcastlocal",
     ];
 
     /// Returns `true` if the graph contains any exchange edges that require
@@ -385,7 +383,9 @@ impl DataflowGraph {
     pub fn has_exchange_operators(&self) -> bool {
         self.operators.values().any(|op| {
             let lower = op.name.to_lowercase();
-            Self::EXCHANGE_OPERATOR_NAMES.iter().any(|name| lower == *name)
+            Self::EXCHANGE_OPERATOR_NAMES
+                .iter()
+                .any(|name| lower == *name)
         })
     }
 
@@ -395,7 +395,9 @@ impl DataflowGraph {
             .values()
             .filter(|op| {
                 let lower = op.name.to_lowercase();
-                Self::EXCHANGE_OPERATOR_NAMES.iter().any(|name| lower == *name)
+                Self::EXCHANGE_OPERATOR_NAMES
+                    .iter()
+                    .any(|name| lower == *name)
             })
             .map(|op| op.name.as_str())
             .collect()
@@ -591,15 +593,15 @@ impl fmt::Display for DataflowGraph {
 mod tests {
     use super::*;
 
-    fn make_region() -> RegionId {
-        RegionId::new(0)
+    fn make_stage() -> StageId {
+        StageId::new(0)
     }
 
     // -- OperatorInfo --
 
     #[test]
     fn operator_info_creation() {
-        let info = OperatorInfo::new(0, "my_op", make_region(), 1, 1);
+        let info = OperatorInfo::new(0, "my_op", make_stage(), 1, 1);
         assert_eq!(info.index, 0);
         assert_eq!(info.name, "my_op");
         assert_eq!(info.input_count, 1);
@@ -608,7 +610,7 @@ mod tests {
 
     #[test]
     fn operator_info_display() {
-        let info = OperatorInfo::new(3, "filter", make_region(), 1, 1);
+        let info = OperatorInfo::new(3, "filter", make_stage(), 1, 1);
         let s = format!("{info}");
         assert!(s.contains("Op[3]"));
         assert!(s.contains("filter"));
@@ -621,8 +623,8 @@ mod tests {
         let edge = EdgeInfo::new(
             Slot::new(0, 0),
             Slot::new(1, 0),
-            make_region(),
-            make_region(),
+            make_stage(),
+            make_stage(),
         );
         assert_eq!(edge.source.operator_index, 0);
         assert_eq!(edge.target.operator_index, 1);
@@ -633,8 +635,8 @@ mod tests {
         let edge = EdgeInfo::new(
             Slot::new(2, 0),
             Slot::new(3, 1),
-            make_region(),
-            make_region(),
+            make_stage(),
+            make_stage(),
         );
         let s = format!("{edge}");
         assert!(s.contains("Op2:Slot0"));
@@ -654,7 +656,7 @@ mod tests {
     #[test]
     fn register_operators() {
         let mut graph = DataflowGraph::new();
-        let r = make_region();
+        let r = make_stage();
         graph
             .register_operator(OperatorInfo::new(0, "source", r, 0, 1))
             .unwrap();
@@ -675,7 +677,7 @@ mod tests {
     #[test]
     fn duplicate_operator_rejected() {
         let mut graph = DataflowGraph::new();
-        let r = make_region();
+        let r = make_stage();
         graph
             .register_operator(OperatorInfo::new(0, "first", r, 1, 1))
             .unwrap();
@@ -688,7 +690,7 @@ mod tests {
     #[test]
     fn add_edges() {
         let mut graph = DataflowGraph::new();
-        let r = make_region();
+        let r = make_stage();
         graph
             .register_operator(OperatorInfo::new(0, "a", r, 0, 1))
             .unwrap();
@@ -696,12 +698,7 @@ mod tests {
             .register_operator(OperatorInfo::new(1, "b", r, 1, 1))
             .unwrap();
 
-        graph.add_edge(EdgeInfo::new(
-            Slot::new(0, 0),
-            Slot::new(1, 0),
-            r,
-            r,
-        ));
+        graph.add_edge(EdgeInfo::new(Slot::new(0, 0), Slot::new(1, 0), r, r));
 
         assert_eq!(graph.edge_count(), 1);
         assert_eq!(graph.edges()[0].source, Slot::new(0, 0));
@@ -713,7 +710,7 @@ mod tests {
     #[test]
     fn edges_from_and_to() {
         let mut graph = DataflowGraph::new();
-        let r = make_region();
+        let r = make_stage();
         graph
             .register_operator(OperatorInfo::new(0, "a", r, 0, 2))
             .unwrap();
@@ -737,7 +734,7 @@ mod tests {
     #[test]
     fn successors_and_predecessors() {
         let mut graph = DataflowGraph::new();
-        let r = make_region();
+        let r = make_stage();
         graph
             .register_operator(OperatorInfo::new(0, "a", r, 0, 1))
             .unwrap();
@@ -765,7 +762,7 @@ mod tests {
     #[test]
     fn topological_order_linear() {
         let mut graph = DataflowGraph::new();
-        let r = make_region();
+        let r = make_stage();
         graph
             .register_operator(OperatorInfo::new(0, "a", r, 0, 1))
             .unwrap();
@@ -791,7 +788,7 @@ mod tests {
         //  \ /
         //   3
         let mut graph = DataflowGraph::new();
-        let r = make_region();
+        let r = make_stage();
         graph
             .register_operator(OperatorInfo::new(0, "source", r, 0, 2))
             .unwrap();
@@ -821,7 +818,7 @@ mod tests {
     #[test]
     fn topological_order_disconnected() {
         let mut graph = DataflowGraph::new();
-        let r = make_region();
+        let r = make_stage();
         graph
             .register_operator(OperatorInfo::new(0, "a", r, 0, 0))
             .unwrap();
@@ -836,7 +833,7 @@ mod tests {
     #[test]
     fn topological_order_cycle_detected() {
         let mut graph = DataflowGraph::new();
-        let r = make_region();
+        let r = make_stage();
         graph
             .register_operator(OperatorInfo::new(0, "a", r, 1, 1))
             .unwrap();
@@ -856,7 +853,7 @@ mod tests {
     #[test]
     fn validate_valid_graph() {
         let mut graph = DataflowGraph::new();
-        let r = make_region();
+        let r = make_stage();
         graph
             .register_operator(OperatorInfo::new(0, "a", r, 0, 1))
             .unwrap();
@@ -871,33 +868,39 @@ mod tests {
     #[test]
     fn validate_missing_source_operator() {
         let mut graph = DataflowGraph::new();
-        let r = make_region();
+        let r = make_stage();
         graph
             .register_operator(OperatorInfo::new(1, "b", r, 1, 0))
             .unwrap();
         graph.add_edge(EdgeInfo::new(Slot::new(0, 0), Slot::new(1, 0), r, r));
 
         let err = graph.validate().unwrap_err();
-        assert!(err.to_string().contains("source operator 0 is not registered"));
+        assert!(
+            err.to_string()
+                .contains("source operator 0 is not registered")
+        );
     }
 
     #[test]
     fn validate_missing_target_operator() {
         let mut graph = DataflowGraph::new();
-        let r = make_region();
+        let r = make_stage();
         graph
             .register_operator(OperatorInfo::new(0, "a", r, 0, 1))
             .unwrap();
         graph.add_edge(EdgeInfo::new(Slot::new(0, 0), Slot::new(1, 0), r, r));
 
         let err = graph.validate().unwrap_err();
-        assert!(err.to_string().contains("target operator 1 is not registered"));
+        assert!(
+            err.to_string()
+                .contains("target operator 1 is not registered")
+        );
     }
 
     #[test]
     fn validate_port_out_of_bounds() {
         let mut graph = DataflowGraph::new();
-        let r = make_region();
+        let r = make_stage();
         graph
             .register_operator(OperatorInfo::new(0, "a", r, 0, 1))
             .unwrap();
@@ -914,7 +917,7 @@ mod tests {
     #[test]
     fn validate_duplicate_edge() {
         let mut graph = DataflowGraph::new();
-        let r = make_region();
+        let r = make_stage();
         graph
             .register_operator(OperatorInfo::new(0, "a", r, 0, 1))
             .unwrap();
@@ -932,7 +935,7 @@ mod tests {
     #[test]
     fn validate_cycle() {
         let mut graph = DataflowGraph::new();
-        let r = make_region();
+        let r = make_stage();
         graph
             .register_operator(OperatorInfo::new(0, "a", r, 1, 1))
             .unwrap();
@@ -952,7 +955,7 @@ mod tests {
     #[test]
     fn display_graph() {
         let mut graph = DataflowGraph::new();
-        let r = make_region();
+        let r = make_stage();
         graph
             .register_operator(OperatorInfo::new(0, "source", r, 0, 1))
             .unwrap();
@@ -970,33 +973,51 @@ mod tests {
 
     #[test]
     fn has_exchange_operators_false_for_pipeline() {
-        let r = RegionId::new(0);
+        let r = StageId::new(0);
         let mut graph = DataflowGraph::new();
-        graph.register_operator(OperatorInfo::new(0, "source", r, 0, 1)).unwrap();
-        graph.register_operator(OperatorInfo::new(1, "map", r, 1, 1)).unwrap();
-        graph.register_operator(OperatorInfo::new(2, "sink", r, 1, 0)).unwrap();
+        graph
+            .register_operator(OperatorInfo::new(0, "source", r, 0, 1))
+            .unwrap();
+        graph
+            .register_operator(OperatorInfo::new(1, "map", r, 1, 1))
+            .unwrap();
+        graph
+            .register_operator(OperatorInfo::new(2, "sink", r, 1, 0))
+            .unwrap();
         assert!(!graph.has_exchange_operators());
         assert!(graph.exchange_operator_names().is_empty());
     }
 
     #[test]
     fn has_exchange_operators_detects_exchange() {
-        let r = RegionId::new(0);
+        let r = StageId::new(0);
         let mut graph = DataflowGraph::new();
-        graph.register_operator(OperatorInfo::new(0, "source", r, 0, 1)).unwrap();
-        graph.register_operator(OperatorInfo::new(1, "exchange", r, 1, 1)).unwrap();
-        graph.register_operator(OperatorInfo::new(2, "sink", r, 1, 0)).unwrap();
+        graph
+            .register_operator(OperatorInfo::new(0, "source", r, 0, 1))
+            .unwrap();
+        graph
+            .register_operator(OperatorInfo::new(1, "exchange", r, 1, 1))
+            .unwrap();
+        graph
+            .register_operator(OperatorInfo::new(2, "sink", r, 1, 0))
+            .unwrap();
         assert!(graph.has_exchange_operators());
         assert_eq!(graph.exchange_operator_names(), vec!["exchange"]);
     }
 
     #[test]
     fn has_exchange_operators_detects_rebalance_gather_broadcast() {
-        let r = RegionId::new(0);
+        let r = StageId::new(0);
         let mut graph = DataflowGraph::new();
-        graph.register_operator(OperatorInfo::new(0, "rebalance", r, 1, 1)).unwrap();
-        graph.register_operator(OperatorInfo::new(1, "gather", r, 1, 1)).unwrap();
-        graph.register_operator(OperatorInfo::new(2, "broadcast", r, 1, 1)).unwrap();
+        graph
+            .register_operator(OperatorInfo::new(0, "rebalance", r, 1, 1))
+            .unwrap();
+        graph
+            .register_operator(OperatorInfo::new(1, "gather", r, 1, 1))
+            .unwrap();
+        graph
+            .register_operator(OperatorInfo::new(2, "broadcast", r, 1, 1))
+            .unwrap();
         assert!(graph.has_exchange_operators());
         let mut names = graph.exchange_operator_names();
         names.sort();
@@ -1015,8 +1036,8 @@ mod tests {
         let edge = EdgeInfo::new(
             Slot::new(0, 0),
             Slot::new(1, 0),
-            make_region(),
-            make_region(),
+            make_stage(),
+            make_stage(),
         );
         assert_eq!(edge.channel_kind, ChannelKind::Pipeline);
         assert!(!edge.is_exchange());
@@ -1027,8 +1048,8 @@ mod tests {
         let edge = EdgeInfo::exchange(
             Slot::new(0, 0),
             Slot::new(1, 0),
-            make_region(),
-            make_region(),
+            make_stage(),
+            make_stage(),
         );
         assert_eq!(edge.channel_kind, ChannelKind::Exchange);
         assert!(edge.is_exchange());
@@ -1036,39 +1057,34 @@ mod tests {
 
     #[test]
     fn has_exchange_edges_false_for_pipeline_only() {
-        let r = make_region();
+        let r = make_stage();
         let mut graph = DataflowGraph::new();
-        graph.register_operator(OperatorInfo::new(0, "src", r, 0, 1)).unwrap();
-        graph.register_operator(OperatorInfo::new(1, "sink", r, 1, 0)).unwrap();
-        graph.add_edge(EdgeInfo::new(
-            Slot::new(0, 0),
-            Slot::new(1, 0),
-            r,
-            r,
-        ));
+        graph
+            .register_operator(OperatorInfo::new(0, "src", r, 0, 1))
+            .unwrap();
+        graph
+            .register_operator(OperatorInfo::new(1, "sink", r, 1, 0))
+            .unwrap();
+        graph.add_edge(EdgeInfo::new(Slot::new(0, 0), Slot::new(1, 0), r, r));
         assert!(!graph.has_exchange_edges());
     }
 
     #[test]
     fn has_exchange_edges_true_when_exchange_present() {
-        let r = make_region();
+        let r = make_stage();
         let mut graph = DataflowGraph::new();
-        graph.register_operator(OperatorInfo::new(0, "src", r, 0, 1)).unwrap();
-        graph.register_operator(OperatorInfo::new(1, "mid", r, 1, 1)).unwrap();
-        graph.register_operator(OperatorInfo::new(2, "sink", r, 1, 0)).unwrap();
+        graph
+            .register_operator(OperatorInfo::new(0, "src", r, 0, 1))
+            .unwrap();
+        graph
+            .register_operator(OperatorInfo::new(1, "mid", r, 1, 1))
+            .unwrap();
+        graph
+            .register_operator(OperatorInfo::new(2, "sink", r, 1, 0))
+            .unwrap();
         // One pipeline edge, one exchange edge.
-        graph.add_edge(EdgeInfo::new(
-            Slot::new(0, 0),
-            Slot::new(1, 0),
-            r,
-            r,
-        ));
-        graph.add_edge(EdgeInfo::exchange(
-            Slot::new(1, 0),
-            Slot::new(2, 0),
-            r,
-            r,
-        ));
+        graph.add_edge(EdgeInfo::new(Slot::new(0, 0), Slot::new(1, 0), r, r));
+        graph.add_edge(EdgeInfo::exchange(Slot::new(1, 0), Slot::new(2, 0), r, r));
         assert!(graph.has_exchange_edges());
     }
 
@@ -1080,15 +1096,12 @@ mod tests {
 
     #[test]
     fn has_exchange_edges_true_for_feedback_exchange() {
-        let r = make_region();
+        let r = make_stage();
         let mut graph = DataflowGraph::new();
-        graph.register_operator(OperatorInfo::new(0, "loop_body", r, 1, 1)).unwrap();
-        graph.add_feedback_edge(EdgeInfo::exchange(
-            Slot::new(0, 0),
-            Slot::new(0, 0),
-            r,
-            r,
-        ));
+        graph
+            .register_operator(OperatorInfo::new(0, "loop_body", r, 1, 1))
+            .unwrap();
+        graph.add_feedback_edge(EdgeInfo::exchange(Slot::new(0, 0), Slot::new(0, 0), r, r));
         assert!(graph.has_exchange_edges());
     }
 }

@@ -11,10 +11,7 @@ fn main() {
     let builder = DataflowBuilder::<u64>::new("branching_pipeline");
 
     // Create a source of numbers 1..=10
-    let numbers = builder.source(
-        "numbers",
-        vec![(0u64, (1..=10i32).collect())],
-    );
+    let numbers = builder.source("numbers", vec![(0u64, (1..=10i32).collect())]);
 
     // Branch 1: even numbers, doubled
     let evens = numbers
@@ -39,7 +36,9 @@ fn main() {
     );
     println!("Outputs: {:?}", dataflow.output_names());
 
-    SimpleRuntime::new().run(dataflow).expect("execution failed");
+    SimpleRuntime::new()
+        .run(dataflow)
+        .expect("execution failed");
 
     // Read results
     let evens_c = evens_port.collector();

@@ -26,7 +26,10 @@ fn main() {
     let users = builder.source(
         "users",
         vec![
-            (0u64, vec![(1u64, "Alice".to_string()), (2, "Bob".to_string())]),
+            (
+                0u64,
+                vec![(1u64, "Alice".to_string()), (2, "Bob".to_string())],
+            ),
             (1, vec![(3, "Carol".to_string())]),
         ],
     );
@@ -35,8 +38,14 @@ fn main() {
     let orders = builder.source(
         "orders",
         vec![
-            (0u64, vec![(1u64, "Widget".to_string()), (2, "Gadget".to_string())]),
-            (1, vec![(1, "Sprocket".to_string()), (3, "Thingamajig".to_string())]),
+            (
+                0u64,
+                vec![(1u64, "Widget".to_string()), (2, "Gadget".to_string())],
+            ),
+            (
+                1,
+                vec![(1, "Sprocket".to_string()), (3, "Thingamajig".to_string())],
+            ),
         ],
     );
 

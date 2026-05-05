@@ -41,7 +41,11 @@ use crate::progress::timestamp::Timestamp;
 /// - `T`: Timestamp type
 /// - `D`: Data record type (must be `Clone` for fan-out)
 /// - `M`: Metadata type (default `()`, must be `Clone + Default` for fan-out)
-pub struct TeePush<T: Timestamp, D: Clone + Send + 'static, M: Clone + Default + Send + 'static = ()> {
+pub struct TeePush<
+    T: Timestamp,
+    D: Clone + Send + 'static,
+    M: Clone + Default + Send + 'static = (),
+> {
     targets: Vec<Box<dyn Push<T, D, M>>>,
     /// Partially-delivered envelope: (envelope, next_target_index).
     /// When a target returns an error mid-delivery, we store the envelope
@@ -50,7 +54,9 @@ pub struct TeePush<T: Timestamp, D: Clone + Send + 'static, M: Clone + Default +
     closed: bool,
 }
 
-impl<T: Timestamp, D: Clone + Send + 'static, M: Clone + Default + Send + 'static> TeePush<T, D, M> {
+impl<T: Timestamp, D: Clone + Send + 'static, M: Clone + Default + Send + 'static>
+    TeePush<T, D, M>
+{
     /// Create a new `TeePush` distributing to the given targets.
     ///
     /// # Panics
@@ -126,10 +132,7 @@ impl<T: Timestamp, D: Clone + Send + 'static, M: Clone + Default + Send + 'stati
         envelope: Envelope<T, D, M>,
     ) -> std::result::Result<(), (Error, Envelope<T, D, M>)> {
         if self.closed {
-            return Err((
-                Error::Custom("TeePush is closed".into()),
-                envelope,
-            ));
+            return Err((Error::Custom("TeePush is closed".into()), envelope));
         }
 
         // Drain pending first; if that fails, return the NEW envelope untouched.
@@ -193,7 +196,11 @@ impl<T: Timestamp, D: Clone + Send + 'static, M: Clone + Default + Send + 'stati
 /// - If there is exactly one pusher, returns it directly (no overhead).
 /// - If there are multiple, wraps them in a [`TeePush`].
 /// - If empty, returns `None`.
-pub fn tee_or_single<T: Timestamp, D: Clone + Send + 'static, M: Clone + Default + Send + 'static>(
+pub fn tee_or_single<
+    T: Timestamp,
+    D: Clone + Send + 'static,
+    M: Clone + Default + Send + 'static,
+>(
     mut pushers: Vec<Box<dyn Push<T, D, M>>>,
 ) -> Option<Box<dyn Push<T, D, M>>> {
     match pushers.len() {
@@ -243,12 +250,8 @@ mod tests {
             &mut self,
             envelope: Envelope<T, D>,
         ) -> std::result::Result<(), (Error, Envelope<T, D>)> {
-            self.push(envelope).map_err(|e| {
-                (
-                    e,
-                    Envelope::data(T::minimum(), vec![]),
-                )
-            })
+            self.push(envelope)
+                .map_err(|e| (e, Envelope::data(T::minimum(), vec![])))
         }
 
         fn flush(&mut self) -> Result<()> {
@@ -304,9 +307,8 @@ mod tests {
 
     #[test]
     fn tee_push_three_targets() {
-        let records: Vec<Arc<Mutex<Vec<(u64, Vec<i32>)>>>> = (0..3)
-            .map(|_| Arc::new(Mutex::new(Vec::new())))
-            .collect();
+        let records: Vec<Arc<Mutex<Vec<(u64, Vec<i32>)>>>> =
+            (0..3).map(|_| Arc::new(Mutex::new(Vec::new()))).collect();
         let targets: Vec<Box<dyn Push<u64, i32>>> = records
             .iter()
             .map(|r| Box::new(RecordingPush::new(Arc::clone(r))) as Box<dyn Push<u64, i32>>)

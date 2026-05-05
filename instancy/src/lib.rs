@@ -64,25 +64,27 @@ pub mod worker_pool;
 // ── Crate-level re-exports for ergonomic use ──────────────────────────
 
 // Dataflow construction
-pub use dataflow::{DataflowBuilder, DataflowBuilderConfig, LogicalDataflow, OutputPort, Pipe, SharedContext};
-pub use dataflow::{ControlReceiver, ControlSender, WorkerControl};
-pub use dataflow::id::DataflowId;
 pub use dataflow::dataflow_builder::IterateResult;
+pub use dataflow::id::DataflowId;
 pub use dataflow::stream::StreamEdge;
-pub use dataflow::{InputSender, OutputReceiver};
 #[cfg(feature = "async-io")]
 pub use dataflow::{AsyncInputSender, AsyncOutputReceiver};
+pub use dataflow::{ControlReceiver, ControlSender, WorkerControl};
+pub use dataflow::{
+    DataflowBuilder, DataflowBuilderConfig, LogicalDataflow, OutputPort, Pipe, SharedContext,
+};
+pub use dataflow::{InputSender, OutputReceiver};
 
 // Runtime
 pub use runtime::{
-    RuntimeConfig, RuntimeHandle, SimpleRuntime, SpawnedDataflow, DataflowCompletion,
+    DataflowCompletion, RuntimeConfig, RuntimeHandle, SimpleRuntime, SpawnedDataflow,
 };
 
 // Execution / cluster topology
 pub use execute::{ClusterTopology, NodeConfig};
 
 // Cancellation
-pub use cancellation::{CancellationToken, CancellationReason};
+pub use cancellation::{CancellationReason, CancellationToken};
 
 // Error handling
 pub use error::{Error, Result};

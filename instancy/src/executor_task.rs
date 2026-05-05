@@ -114,7 +114,12 @@ impl ExecutorTask {
     /// Returns `false` if another thread already claimed it or it's done.
     pub fn try_start_poll(&self) -> bool {
         self.state
-            .compare_exchange(TASK_QUEUED, TASK_POLLING, Ordering::AcqRel, Ordering::Acquire)
+            .compare_exchange(
+                TASK_QUEUED,
+                TASK_POLLING,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
             .is_ok()
     }
 
@@ -191,10 +196,7 @@ impl ExecutorTask {
                 Ok(lock) => lock,
                 Err(_poisoned) => {
                     std::mem::forget(guard);
-                    return complete_with_error(
-                        self,
-                        "executor mutex poisoned by a prior panic",
-                    );
+                    return complete_with_error(self, "executor mutex poisoned by a prior panic");
                 }
             };
             match executor_lock.as_mut() {
@@ -448,10 +450,7 @@ impl ExecutorRegistry {
 
     /// Number of tasks currently in the ready queue.
     pub fn ready_count(&self) -> usize {
-        self.ready_queue
-            .lock()
-            .map(|q| q.len())
-            .unwrap_or(0)
+        self.ready_queue.lock().map(|q| q.len()).unwrap_or(0)
     }
 }
 
@@ -550,7 +549,11 @@ mod tests {
     fn poll_ready_transitions_to_done() {
         let (completion, notifier) = make_notifier();
         // Future that completes on first poll
-        let task = ExecutorTask::new(TaskId(0), Box::pin(CountdownFuture { remaining: 0 }), notifier);
+        let task = ExecutorTask::new(
+            TaskId(0),
+            Box::pin(CountdownFuture { remaining: 0 }),
+            notifier,
+        );
         assert!(task.try_start_poll());
 
         let (waker, _) = noop_cx();
@@ -604,7 +607,11 @@ mod tests {
     #[test]
     fn try_wake_from_done_returns_false() {
         let (_, notifier) = make_notifier();
-        let task = ExecutorTask::new(TaskId(0), Box::pin(CountdownFuture { remaining: 0 }), notifier);
+        let task = ExecutorTask::new(
+            TaskId(0),
+            Box::pin(CountdownFuture { remaining: 0 }),
+            notifier,
+        );
         assert!(task.try_start_poll());
         let (waker, _) = noop_cx();
         let mut cx = Context::from_waker(&waker);
@@ -637,7 +644,11 @@ mod tests {
     fn pool_waker_enqueues_on_idle_to_queued() {
         let registry = Arc::new(ExecutorRegistry::new_standalone());
         let (_, notifier) = make_notifier();
-        let task = Arc::new(ExecutorTask::new(TaskId(0), Box::pin(PendingForever), notifier));
+        let task = Arc::new(ExecutorTask::new(
+            TaskId(0),
+            Box::pin(PendingForever),
+            notifier,
+        ));
 
         // Get task to IDLE state: QUEUED → POLLING → poll(Pending) → IDLE
         assert!(task.try_start_poll());
@@ -657,7 +668,11 @@ mod tests {
     fn pool_waker_dedup_no_double_enqueue() {
         let registry = Arc::new(ExecutorRegistry::new_standalone());
         let (_, notifier) = make_notifier();
-        let task = Arc::new(ExecutorTask::new(TaskId(0), Box::pin(PendingForever), notifier));
+        let task = Arc::new(ExecutorTask::new(
+            TaskId(0),
+            Box::pin(PendingForever),
+            notifier,
+        ));
 
         // Task starts QUEUED — wake should NOT enqueue again
         let waker = Arc::new(PoolWaker::new(Arc::clone(&task), Arc::clone(&registry)));
@@ -716,7 +731,11 @@ mod tests {
 
         let registry = Arc::new(ExecutorRegistry::new_standalone());
         let (completion, notifier) = make_notifier();
-        let task = Arc::new(ExecutorTask::new(TaskId(0), Box::pin(PanicFuture), notifier));
+        let task = Arc::new(ExecutorTask::new(
+            TaskId(0),
+            Box::pin(PanicFuture),
+            notifier,
+        ));
 
         assert!(task.try_start_poll());
 
@@ -727,9 +746,7 @@ mod tests {
         let mut cx = Context::from_waker(&waker);
 
         // Poll should panic — catch it
-        let result = std::panic::catch_unwind(
-            std::panic::AssertUnwindSafe(|| task.poll(&mut cx)),
-        );
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| task.poll(&mut cx)));
         assert!(result.is_err(), "expected panic");
 
         // PanicGuard should have set state to DONE

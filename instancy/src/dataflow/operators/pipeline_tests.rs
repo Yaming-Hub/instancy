@@ -10,21 +10,18 @@ mod tests {
     use crate::dataflow::operators::inspect::InspectOperator;
     use crate::dataflow::operators::probe::ProbeOperator;
     use crate::dataflow::operators::unary::UnaryOperator;
-    use crate::dataflow::region::RegionId;
+    use crate::dataflow::stage::StageId;
     use crate::progress::frontier::Antichain;
 
     /// Simulate a pipeline: input → unary(double) → inspect(collect) → probe
     /// by manually wiring operator handles together.
     #[test]
     fn pipeline_unary_inspect_probe() {
-        let region = RegionId::new(0);
+        let stage = StageId::new(0);
 
         // Create operators
-        let mut unary = UnaryOperator::<u64, i32, i32>::new(
-            "double",
-            0,
-            region,
-            |input, output| {
+        let mut unary =
+            UnaryOperator::<u64, i32, i32>::new("double", 0, stage, |input, output| {
                 while let Some((time, data)) = input.next() {
                     let mut session = output.session(time);
                     for item in data {
@@ -32,8 +29,7 @@ mod tests {
                     }
                 }
                 Ok(())
-            },
-        );
+            });
 
         let collected = Arc::new(Mutex::new(Vec::new()));
         let collected_clone = Arc::clone(&collected);
@@ -41,7 +37,7 @@ mod tests {
         let mut inspect = InspectOperator::<u64, i32>::new(
             "collector",
             1,
-            region,
+            stage,
             move |time: &u64, data: &[i32]| {
                 let mut guard = collected_clone.lock().unwrap();
                 for item in data {
@@ -50,8 +46,7 @@ mod tests {
             },
         );
 
-        let (mut probe_op, probe_handle) =
-            ProbeOperator::<u64, i32>::new("end_probe", 2, region);
+        let (mut probe_op, probe_handle) = ProbeOperator::<u64, i32>::new("end_probe", 2, stage);
 
         // Feed input data
         unary.input_mut().push_vec(1, vec![10, 20, 30]);
@@ -81,8 +76,11 @@ mod tests {
         assert_eq!(
             *result,
             vec![
-                (1, 20), (1, 40), (1, 60),  // 10*2, 20*2, 30*2
-                (2, 10), (2, 30),            // 5*2, 15*2
+                (1, 20),
+                (1, 40),
+                (1, 60), // 10*2, 20*2, 30*2
+                (2, 10),
+                (2, 30), // 5*2, 15*2
             ]
         );
 
@@ -95,14 +93,11 @@ mod tests {
     /// Pipeline with multiple unary stages chained.
     #[test]
     fn pipeline_chained_unary() {
-        let region = RegionId::new(0);
+        let stage = StageId::new(0);
 
         // Stage 1: add 1
-        let mut add_one = UnaryOperator::<u64, i32, i32>::new(
-            "add_one",
-            0,
-            region,
-            |input, output| {
+        let mut add_one =
+            UnaryOperator::<u64, i32, i32>::new("add_one", 0, stage, |input, output| {
                 while let Some((time, data)) = input.next() {
                     let mut session = output.session(time);
                     for item in data {
@@ -110,15 +105,11 @@ mod tests {
                     }
                 }
                 Ok(())
-            },
-        );
+            });
 
         // Stage 2: multiply by 3
-        let mut mul_three = UnaryOperator::<u64, i32, i32>::new(
-            "mul_three",
-            1,
-            region,
-            |input, output| {
+        let mut mul_three =
+            UnaryOperator::<u64, i32, i32>::new("mul_three", 1, stage, |input, output| {
                 while let Some((time, data)) = input.next() {
                     let mut session = output.session(time);
                     for item in data {
@@ -126,15 +117,11 @@ mod tests {
                     }
                 }
                 Ok(())
-            },
-        );
+            });
 
         // Stage 3: to_string
-        let mut to_str = UnaryOperator::<u64, i32, String>::new(
-            "to_string",
-            2,
-            region,
-            |input, output| {
+        let mut to_str =
+            UnaryOperator::<u64, i32, String>::new("to_string", 2, stage, |input, output| {
                 while let Some((time, data)) = input.next() {
                     let mut session = output.session(time);
                     for item in data {
@@ -142,8 +129,7 @@ mod tests {
                     }
                 }
                 Ok(())
-            },
-        );
+            });
 
         // Feed: [1, 2, 3] at time 0
         add_one.input_mut().push_vec(0, vec![1, 2, 3]);
@@ -165,21 +151,25 @@ mod tests {
         // (1+1)*3=6, (2+1)*3=9, (3+1)*3=12
         assert_eq!(
             results,
-            vec![(0, vec!["result=6".to_string(), "result=9".to_string(), "result=12".to_string()])]
+            vec![(
+                0,
+                vec![
+                    "result=6".to_string(),
+                    "result=9".to_string(),
+                    "result=12".to_string()
+                ]
+            )]
         );
     }
 
     /// Pipeline with stateful unary (running sum) + inspect.
     #[test]
     fn pipeline_stateful_unary_inspect() {
-        let region = RegionId::new(0);
+        let stage = StageId::new(0);
         let mut running_sum = 0i64;
 
-        let mut sum_op = UnaryOperator::<u64, i32, i64>::new(
-            "running_sum",
-            0,
-            region,
-            move |input, output| {
+        let mut sum_op =
+            UnaryOperator::<u64, i32, i64>::new("running_sum", 0, stage, move |input, output| {
                 while let Some((time, data)) = input.next() {
                     for item in data {
                         running_sum += item as i64;
@@ -188,8 +178,7 @@ mod tests {
                     session.give(running_sum);
                 }
                 Ok(())
-            },
-        );
+            });
 
         let sums = Arc::new(Mutex::new(Vec::new()));
         let sums_clone = Arc::clone(&sums);
@@ -197,7 +186,7 @@ mod tests {
         let mut inspect = InspectOperator::<u64, i64>::new(
             "sum_observer",
             1,
-            region,
+            stage,
             move |time: &u64, data: &[i64]| {
                 let mut guard = sums_clone.lock().unwrap();
                 for item in data {
@@ -231,13 +220,10 @@ mod tests {
     /// Pipeline with filter unary — some data is dropped.
     #[test]
     fn pipeline_filter_inspect_probe() {
-        let region = RegionId::new(0);
+        let stage = StageId::new(0);
 
-        let mut filter = UnaryOperator::<u64, i32, i32>::new(
-            "keep_positive",
-            0,
-            region,
-            |input, output| {
+        let mut filter =
+            UnaryOperator::<u64, i32, i32>::new("keep_positive", 0, stage, |input, output| {
                 while let Some((time, data)) = input.next() {
                     let mut session = output.session(time);
                     for item in data {
@@ -247,8 +233,7 @@ mod tests {
                     }
                 }
                 Ok(())
-            },
-        );
+            });
 
         let seen = Arc::new(Mutex::new(Vec::new()));
         let seen_clone = Arc::clone(&seen);
@@ -256,7 +241,7 @@ mod tests {
         let mut inspect = InspectOperator::<u64, i32>::new(
             "observe",
             1,
-            region,
+            stage,
             move |time: &u64, data: &[i32]| {
                 let mut guard = seen_clone.lock().unwrap();
                 for item in data {
@@ -265,8 +250,7 @@ mod tests {
             },
         );
 
-        let (mut probe_op, handle) =
-            ProbeOperator::<u64, i32>::new("probe", 2, region);
+        let (mut probe_op, handle) = ProbeOperator::<u64, i32>::new("probe", 2, stage);
 
         // Feed mixed positive/negative data
         filter.input_mut().push_vec(1, vec![-5, 3, -1, 7, 0, 2]);
@@ -296,25 +280,19 @@ mod tests {
     /// Pipeline completion: mark_exhausted propagates through.
     #[test]
     fn pipeline_completion() {
-        let region = RegionId::new(0);
+        let stage = StageId::new(0);
 
-        let mut pass = UnaryOperator::<u64, i32, i32>::new(
-            "pass",
-            0,
-            region,
-            |input, output| {
-                while let Some((time, data)) = input.next() {
-                    let mut session = output.session(time);
-                    for item in data {
-                        session.give(item);
-                    }
+        let mut pass = UnaryOperator::<u64, i32, i32>::new("pass", 0, stage, |input, output| {
+            while let Some((time, data)) = input.next() {
+                let mut session = output.session(time);
+                for item in data {
+                    session.give(item);
                 }
-                Ok(())
-            },
-        );
+            }
+            Ok(())
+        });
 
-        let (mut probe_op, handle) =
-            ProbeOperator::<u64, i32>::new("probe", 1, region);
+        let (mut probe_op, handle) = ProbeOperator::<u64, i32>::new("probe", 1, stage);
 
         // Process some data
         pass.input_mut().push_vec(1, vec![42]);
@@ -337,25 +315,19 @@ mod tests {
     /// Verify probe frontier tracking through a pipeline.
     #[test]
     fn pipeline_probe_frontier_tracking() {
-        let region = RegionId::new(0);
+        let stage = StageId::new(0);
 
-        let mut op = UnaryOperator::<u64, i32, i32>::new(
-            "identity",
-            0,
-            region,
-            |input, output| {
-                while let Some((time, data)) = input.next() {
-                    let mut session = output.session(time);
-                    for item in data {
-                        session.give(item);
-                    }
+        let mut op = UnaryOperator::<u64, i32, i32>::new("identity", 0, stage, |input, output| {
+            while let Some((time, data)) = input.next() {
+                let mut session = output.session(time);
+                for item in data {
+                    session.give(item);
                 }
-                Ok(())
-            },
-        );
+            }
+            Ok(())
+        });
 
-        let (mut probe_op, handle) =
-            ProbeOperator::<u64, i32>::new("probe", 1, region);
+        let (mut probe_op, handle) = ProbeOperator::<u64, i32>::new("probe", 1, stage);
 
         // Initial frontier at minimum (0)
         assert!(handle.less_equal(&0));
@@ -392,14 +364,13 @@ mod tests {
         use crate::dataflow::operators::probe::ProbeExt;
         use crate::dataflow::operators::unary::UnaryExt;
         use crate::dataflow::scope::{RootScope, Scope};
-        use crate::dataflow::stream::{StreamEdge, Slot};
+        use crate::dataflow::stream::{Slot, StreamEdge};
 
         let mut scope = RootScope::<u64>::new("pipeline", 4);
-        let region_id = scope.current_region().id();
+        let stage_id = scope.current_stage_id();
         let src_idx = scope.allocate_operator_index();
         let source = Slot::new(src_idx, 0);
-        let stream: StreamEdge<RootScope<u64>, i32> =
-            StreamEdge::new(scope, source, region_id);
+        let stream: StreamEdge<RootScope<u64>, i32> = StreamEdge::new(scope, source, stage_id);
 
         // Chain: unary(double) → inspect → probe
         let handle = stream
@@ -426,23 +397,27 @@ mod tests {
     fn pipeline_binary_inspect_probe() {
         use crate::dataflow::operators::binary::BinaryOperator;
 
-        let region = RegionId::new(0);
+        let stage = StageId::new(0);
         let collected = Arc::new(Mutex::new(Vec::new()));
         let collected_clone = Arc::clone(&collected);
 
         let mut binary = BinaryOperator::<u64, i32, i32, i32>::new(
             "sum_pairs",
             0,
-            region,
+            stage,
             |input1, input2, output| {
                 // Merge both inputs to output
                 while let Some((t, d)) = input1.next() {
                     let mut s = output.session(t);
-                    for item in d { s.give(item); }
+                    for item in d {
+                        s.give(item);
+                    }
                 }
                 while let Some((t, d)) = input2.next() {
                     let mut s = output.session(t);
-                    for item in d { s.give(item); }
+                    for item in d {
+                        s.give(item);
+                    }
                 }
                 Ok(())
             },
@@ -451,15 +426,16 @@ mod tests {
         let mut inspect = InspectOperator::<u64, i32>::new(
             "collector",
             1,
-            region,
+            stage,
             move |time: &u64, data: &[i32]| {
                 let mut guard = collected_clone.lock().unwrap();
-                for item in data { guard.push((*time, *item)); }
+                for item in data {
+                    guard.push((*time, *item));
+                }
             },
         );
 
-        let (mut probe_op, handle) =
-            ProbeOperator::<u64, i32>::new("probe", 2, region);
+        let (mut probe_op, handle) = ProbeOperator::<u64, i32>::new("probe", 2, stage);
 
         // Feed data to both inputs
         binary.input1_mut().push_vec(1, vec![10, 20]);
@@ -488,14 +464,12 @@ mod tests {
     fn pipeline_delay_batch_inspect() {
         use crate::dataflow::operators::delay::DelayBatchOperator;
 
-        let region = RegionId::new(0);
+        let stage = StageId::new(0);
 
-        let mut delay = DelayBatchOperator::<u64, i32, _>::new(
-            "delay_by_10",
-            0,
-            region,
-            |time: &u64| time + 10,
-        );
+        let mut delay =
+            DelayBatchOperator::<u64, i32, _>::new("delay_by_10", 0, stage, |time: &u64| {
+                time + 10
+            });
 
         let collected = Arc::new(Mutex::new(Vec::new()));
         let collected_clone = Arc::clone(&collected);
@@ -503,10 +477,12 @@ mod tests {
         let mut inspect = InspectOperator::<u64, i32>::new(
             "observer",
             1,
-            region,
+            stage,
             move |time: &u64, data: &[i32]| {
                 let mut guard = collected_clone.lock().unwrap();
-                for item in data { guard.push((*time, *item)); }
+                for item in data {
+                    guard.push((*time, *item));
+                }
             },
         );
 
@@ -552,21 +528,19 @@ mod tests {
     fn pipeline_concat_unary() {
         use crate::dataflow::operators::concat::ConcatOperator;
 
-        let region = RegionId::new(0);
+        let stage = StageId::new(0);
 
-        let mut concat = ConcatOperator::<u64, i32>::new("merge", 0, region, 2);
-        let mut double = UnaryOperator::<u64, i32, i32>::new(
-            "double",
-            1,
-            region,
-            |input, output| {
+        let mut concat = ConcatOperator::<u64, i32>::new("merge", 0, stage, 2);
+        let mut double =
+            UnaryOperator::<u64, i32, i32>::new("double", 1, stage, |input, output| {
                 while let Some((time, data)) = input.next() {
                     let mut session = output.session(time);
-                    for item in data { session.give(item * 2); }
+                    for item in data {
+                        session.give(item * 2);
+                    }
                 }
                 Ok(())
-            },
-        );
+            });
 
         concat.input_mut(0).push_vec(1, vec![5]);
         concat.input_mut(1).push_vec(1, vec![10]);
@@ -579,9 +553,9 @@ mod tests {
         double.activate().unwrap();
 
         let results: Vec<_> = double.drain_output().collect();
-        assert_eq!(results[0], (1, vec![10]));  // 5*2
-        assert_eq!(results[1], (1, vec![20]));  // 10*2
-        assert_eq!(results[2], (2, vec![30]));  // 15*2
+        assert_eq!(results[0], (1, vec![10])); // 5*2
+        assert_eq!(results[1], (1, vec![20])); // 10*2
+        assert_eq!(results[2], (2, vec![30])); // 15*2
     }
 
     /// End-to-end: chaining exchange → unary → gather → probe at StreamEdge level.
@@ -592,14 +566,14 @@ mod tests {
         use crate::dataflow::operators::probe::ProbeExt;
         use crate::dataflow::operators::unary::UnaryExt;
         use crate::dataflow::scope::{RootScope, Scope};
-        use crate::dataflow::stream::{StreamEdge, Slot};
+        use crate::dataflow::stream::{Slot, StreamEdge};
 
         let mut scope = RootScope::<u64>::new("pipeline", 4);
-        let region_id = scope.current_region().id();
+        let stage_id = scope.current_stage_id();
         let src_idx = scope.allocate_operator_index();
         let source = Slot::new(src_idx, 0);
         let stream: StreamEdge<RootScope<u64>, (u64, i32)> =
-            StreamEdge::new(scope, source, region_id);
+            StreamEdge::new(scope, source, stage_id);
 
         // Chain: exchange(by key) → exchange_to(16) → unary → gather → probe
         let handle = stream
@@ -608,7 +582,9 @@ mod tests {
             .unary("process", |input, output| {
                 while let Some((time, data)) = input.next() {
                     let mut session = output.session(time);
-                    for item in data { session.give(item); }
+                    for item in data {
+                        session.give(item);
+                    }
                 }
                 Ok(())
             })
@@ -625,14 +601,13 @@ mod tests {
         use crate::dataflow::operators::inspect::InspectExt;
         use crate::dataflow::operators::rebalance::RebalanceExt;
         use crate::dataflow::scope::{RootScope, Scope};
-        use crate::dataflow::stream::{StreamEdge, Slot};
+        use crate::dataflow::stream::{Slot, StreamEdge};
 
         let mut scope = RootScope::<u64>::new("pipeline", 4);
-        let region_id = scope.current_region().id();
+        let stage_id = scope.current_stage_id();
         let src_idx = scope.allocate_operator_index();
         let source = Slot::new(src_idx, 0);
-        let stream: StreamEdge<RootScope<u64>, i32> =
-            StreamEdge::new(scope, source, region_id);
+        let stream: StreamEdge<RootScope<u64>, i32> = StreamEdge::new(scope, source, stage_id);
 
         // Chain: rebalance_to(8) → broadcast → broadcast_local → inspect
         let _output = stream
@@ -641,51 +616,50 @@ mod tests {
             .broadcast_local()
             .inspect("observe", |_time, _data| {});
 
-        // Verify regions were created correctly
-        assert_ne!(_output.region_id(), region_id);
+        // Verify stages were created correctly
+        assert_ne!(_output.stage_id(), stage_id);
     }
 
-    /// Verify region transitions through a multi-repartition pipeline.
+    /// Verify stage transitions through a multi-repartition pipeline.
     #[test]
-    fn pipeline_region_transitions() {
+    fn pipeline_stage_transitions() {
         use crate::dataflow::operators::exchange::ExchangeExt;
         use crate::dataflow::operators::gather::GatherExt;
         use crate::dataflow::operators::rebalance::RebalanceExt;
         use crate::dataflow::scope::{RootScope, Scope};
-        use crate::dataflow::stream::{StreamEdge, Slot};
+        use crate::dataflow::stream::{Slot, StreamEdge};
 
         let mut scope = RootScope::<u64>::new("test", 4);
-        let r0 = scope.current_region().id();
+        let r0 = scope.current_stage_id();
         let src_idx = scope.allocate_operator_index();
         let source = Slot::new(src_idx, 0);
-        let stream: StreamEdge<RootScope<u64>, i32> =
-            StreamEdge::new(scope.clone(), source, r0);
+        let stream: StreamEdge<RootScope<u64>, i32> = StreamEdge::new(scope.clone(), source, r0);
 
-        // exchange same parallelism → same region
+        // exchange same parallelism → same stage
         let s1 = stream.exchange(|x: &i32| *x);
-        assert_eq!(s1.region_id(), r0);
+        assert_eq!(s1.stage_id(), r0);
 
-        // exchange_to different parallelism → new region
+        // exchange_to different parallelism → new stage
         let s2 = s1.exchange_to(8, |x: &i32| *x);
-        let r1 = s2.region_id();
+        let r1 = s2.stage_id();
         assert_ne!(r1, r0);
-        assert_eq!(scope.region(r1).unwrap().parallelism(), 8);
+        assert_eq!(scope.stage_parallelism(r1), Some(8));
 
-        // rebalance same parallelism → same region
+        // rebalance same parallelism → same stage
         let s3 = s2.rebalance();
-        assert_eq!(s3.region_id(), r1);
+        assert_eq!(s3.stage_id(), r1);
 
-        // gather → new region parallelism=1
+        // gather → new stage parallelism=1
         let s4 = s3.gather();
-        let r2 = s4.region_id();
+        let r2 = s4.stage_id();
         assert_ne!(r2, r1);
-        assert_eq!(scope.region(r2).unwrap().parallelism(), 1);
+        assert_eq!(scope.stage_parallelism(r2), Some(1));
 
-        // rebalance_to(4) from gather → new region
+        // rebalance_to(4) from gather → new stage
         let s5 = s4.rebalance_to(4);
-        let r3 = s5.region_id();
+        let r3 = s5.stage_id();
         assert_ne!(r3, r2);
-        assert_eq!(scope.region(r3).unwrap().parallelism(), 4);
+        assert_eq!(scope.stage_parallelism(r3), Some(4));
     }
 
     // ===================================================================
@@ -699,27 +673,31 @@ mod tests {
         use crate::dataflow::operators::probe::ProbeExt;
         use crate::dataflow::operators::unary::UnaryExt;
         use crate::dataflow::scope::{RootScope, Scope};
-        use crate::dataflow::stream::{StreamEdge, Slot};
+        use crate::dataflow::stream::{Slot, StreamEdge};
 
         let mut scope = RootScope::<u64>::new("test", 4);
-        let region_id = scope.current_region().id();
+        let stage_id = scope.current_stage_id();
 
         // Simulate a source operator (index 0).
         let src_idx = scope.allocate_operator_index();
-        scope.register_operator(crate::dataflow::graph::OperatorInfo::new(
-            src_idx, "source", region_id, 0, 1,
-        )).unwrap();
+        scope
+            .register_operator(crate::dataflow::graph::OperatorInfo::new(
+                src_idx, "source", stage_id, 0, 1,
+            ))
+            .unwrap();
 
         let source = Slot::new(src_idx, 0);
         let stream: StreamEdge<RootScope<u64>, i32> =
-            StreamEdge::new(scope.clone(), source, region_id);
+            StreamEdge::new(scope.clone(), source, stage_id);
 
         // Build: source → unary(double) → inspect → probe
         let _handle = stream
             .unary("double", |input, output| {
                 while let Some((t, d)) = input.next() {
                     let mut s = output.session(t);
-                    for x in d { s.give(x * 2); }
+                    for x in d {
+                        s.give(x * 2);
+                    }
                 }
                 Ok(())
             })
@@ -752,30 +730,46 @@ mod tests {
         use crate::dataflow::operators::binary::BinaryExt;
         use crate::dataflow::operators::probe::ProbeExt;
         use crate::dataflow::scope::{RootScope, Scope};
-        use crate::dataflow::stream::{StreamEdge, Slot};
+        use crate::dataflow::stream::{Slot, StreamEdge};
 
         let mut scope = RootScope::<u64>::new("test", 4);
-        let region_id = scope.current_region().id();
+        let stage_id = scope.current_stage_id();
 
         // Two source operators.
         let src0 = scope.allocate_operator_index();
-        scope.register_operator(crate::dataflow::graph::OperatorInfo::new(
-            src0, "left_source", region_id, 0, 1,
-        )).unwrap();
+        scope
+            .register_operator(crate::dataflow::graph::OperatorInfo::new(
+                src0,
+                "left_source",
+                stage_id,
+                0,
+                1,
+            ))
+            .unwrap();
         let src1 = scope.allocate_operator_index();
-        scope.register_operator(crate::dataflow::graph::OperatorInfo::new(
-            src1, "right_source", region_id, 0, 1,
-        )).unwrap();
+        scope
+            .register_operator(crate::dataflow::graph::OperatorInfo::new(
+                src1,
+                "right_source",
+                stage_id,
+                0,
+                1,
+            ))
+            .unwrap();
 
         let left: StreamEdge<RootScope<u64>, i32> =
-            StreamEdge::new(scope.clone(), Slot::new(src0, 0), region_id);
+            StreamEdge::new(scope.clone(), Slot::new(src0, 0), stage_id);
         let right: StreamEdge<RootScope<u64>, i32> =
-            StreamEdge::new(scope.clone(), Slot::new(src1, 0), region_id);
+            StreamEdge::new(scope.clone(), Slot::new(src1, 0), stage_id);
 
         let _handle = left
             .binary(&right, "join", |l, r, out| {
-                while let Some((t, d)) = l.next() { out.push_vec(t, d); }
-                while let Some((t, d)) = r.next() { out.push_vec(t, d); }
+                while let Some((t, d)) = l.next() {
+                    out.push_vec(t, d);
+                }
+                while let Some((t, d)) = r.next() {
+                    out.push_vec(t, d);
+                }
                 Ok(())
             })
             .probe("end");
@@ -802,18 +796,20 @@ mod tests {
         use crate::dataflow::operators::branch::BranchExt;
         use crate::dataflow::operators::probe::ProbeExt;
         use crate::dataflow::scope::{RootScope, Scope};
-        use crate::dataflow::stream::{StreamEdge, Slot};
+        use crate::dataflow::stream::{Slot, StreamEdge};
 
         let mut scope = RootScope::<u64>::new("test", 4);
-        let region_id = scope.current_region().id();
+        let stage_id = scope.current_stage_id();
 
         let src_idx = scope.allocate_operator_index();
-        scope.register_operator(crate::dataflow::graph::OperatorInfo::new(
-            src_idx, "source", region_id, 0, 1,
-        )).unwrap();
+        scope
+            .register_operator(crate::dataflow::graph::OperatorInfo::new(
+                src_idx, "source", stage_id, 0, 1,
+            ))
+            .unwrap();
 
         let stream: StreamEdge<RootScope<u64>, i32> =
-            StreamEdge::new(scope.clone(), Slot::new(src_idx, 0), region_id);
+            StreamEdge::new(scope.clone(), Slot::new(src_idx, 0), stage_id);
 
         let (true_stream, false_stream) = stream.branch(|x| *x > 0);
         let _p1 = true_stream.probe("pos");

@@ -1,7 +1,7 @@
 //! Task scheduling infrastructure for operator activation dispatch.
 //!
 //! This module contains:
-//! - [`TaskScheduler`] — manages FIFO per-worker dispatch with region concurrency limits.
+//! - [`TaskScheduler`] — manages FIFO per-worker dispatch with stage concurrency limits.
 //! - [`policy`] — pluggable scheduling policies (FIFO, Priority, PriorityWithAging).
 //! - [`batching`] — time-bounded message batching to reduce scheduling overhead.
 
