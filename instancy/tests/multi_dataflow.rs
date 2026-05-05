@@ -13,7 +13,7 @@ use std::time::{Duration, Instant};
 use instancy::DataflowBuilder;
 use instancy::Error;
 use instancy::scheduler::policy::FifoPolicy;
-use instancy::{RuntimeConfig, RuntimeHandle};
+use instancy::{RuntimeConfig, RuntimeHandle, SpawnOptions};
 
 /// Spawn 4 dataflows concurrently on a 2-thread pool. Each receives unique data
 /// via InputSender and produces results on OutputReceiver. Verify all complete
@@ -38,7 +38,7 @@ fn concurrent_spawn_four_dataflows() {
         input.map("triple", |_t, x| x * 3).output("results");
         let dataflow = builder.build().unwrap();
 
-        let mut handle = rt.spawn(dataflow).unwrap();
+        let mut handle = rt.spawn(dataflow, SpawnOptions::default()).unwrap();
         let sender = handle.take_input::<i32>("data").unwrap();
         let receiver = handle.take_output::<i32>("results").unwrap();
 
@@ -100,7 +100,7 @@ fn eight_dataflows_on_two_threads_no_starvation() {
             .map("inc", |_t, x| x + 1)
             .output("out");
         let dataflow = builder.build().unwrap();
-        handles.push(rt.run(dataflow).unwrap());
+        handles.push(rt.spawn(dataflow, SpawnOptions::default()).unwrap().join());
     }
 
     // All 8 should complete within a reasonable time
@@ -140,7 +140,7 @@ fn mixed_workload_fairness() {
         input.map("square", |_t, x| x * x).output("out");
         let dataflow = builder.build().unwrap();
 
-        let mut handle = rt.spawn(dataflow).unwrap();
+        let mut handle = rt.spawn(dataflow, SpawnOptions::default()).unwrap();
         let sender = handle.take_input::<i32>("data").unwrap();
         heavy_senders.push(sender);
         heavy_handles.push(handle);
@@ -155,7 +155,7 @@ fn mixed_workload_fairness() {
             .source("src", vec![(0u64, vec![1i32, 2, 3])])
             .output("out");
         let dataflow = builder.build().unwrap();
-        light_completions.push(rt.run(dataflow).unwrap());
+        light_completions.push(rt.spawn(dataflow, SpawnOptions::default()).unwrap().join());
     }
 
     // Send multiple rounds to heavy dataflows
@@ -214,7 +214,7 @@ fn shutdown_cancels_all_running_dataflows() {
         let input = builder.input::<i32>("data");
         input.output("out");
         let dataflow = builder.build().unwrap();
-        let handle = rt.spawn(dataflow).unwrap();
+        let handle = rt.spawn(dataflow, SpawnOptions::default()).unwrap();
         spawned.push(handle);
     }
 
@@ -262,7 +262,7 @@ fn individual_cancel_preserves_siblings() {
         input.map("inc", |_t, x| x + 1).output("out");
         let dataflow = builder.build().unwrap();
 
-        let mut handle = rt.spawn(dataflow).unwrap();
+        let mut handle = rt.spawn(dataflow, SpawnOptions::default()).unwrap();
         let sender = handle.take_input::<i32>("data").unwrap();
         senders.push(sender);
         handles.push(handle);
@@ -323,7 +323,7 @@ fn stress_spawn_twenty_dataflows() {
             .map("double", |_t, x| x * 2)
             .output("out");
         let dataflow = builder.build().unwrap();
-        completions.push(rt.run(dataflow).unwrap());
+        completions.push(rt.spawn(dataflow, SpawnOptions::default()).unwrap().join());
     }
 
     let start = Instant::now();
@@ -354,7 +354,7 @@ fn concurrent_input_from_multiple_threads() {
     input.map("inc", |_t, x| x + 1).output("out");
     let dataflow = builder.build().unwrap();
 
-    let mut handle = rt.spawn(dataflow).unwrap();
+    let mut handle = rt.spawn(dataflow, SpawnOptions::default()).unwrap();
     let sender = handle.take_input::<i32>("data").unwrap();
 
     // Clone sender and send from 4 threads
@@ -426,7 +426,7 @@ fn operator_panic_propagates_error() {
         .map("double", |_t, x| x * 2)
         .output("out");
     let good_df = good_builder.build().unwrap();
-    let good_completion = rt.run(good_df).unwrap();
+    let good_completion = rt.spawn(good_df, SpawnOptions::default()).unwrap().join();
 
     // Spawn a dataflow with a panicking operator
     let bad_builder = DataflowBuilder::<u64>::new("panicking");
@@ -437,7 +437,7 @@ fn operator_panic_propagates_error() {
         })
         .output("out");
     let bad_df = bad_builder.build().unwrap();
-    let bad_completion = rt.run(bad_df).unwrap();
+    let bad_completion = rt.spawn(bad_df, SpawnOptions::default()).unwrap().join();
 
     // The panicking dataflow should return an error (not crash the process)
     let bad_result = bad_completion.wait();
@@ -474,7 +474,7 @@ fn drop_runtime_cancels_active_dataflows() {
         input.output("out");
         let dataflow = builder.build().unwrap();
 
-        let spawned = rt.spawn(dataflow).unwrap();
+        let spawned = rt.spawn(dataflow, SpawnOptions::default()).unwrap();
         // rt dropped here → implicit cancel via Drop
         spawned
     };

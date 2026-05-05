@@ -8,7 +8,7 @@
 //! ```
 
 use instancy::DataflowBuilder;
-use instancy::SimpleRuntime;
+use instancy::{RuntimeConfig, RuntimeHandle, SpawnOptions};
 
 fn main() {
     // Build a simple source → output dataflow using the Pipe chaining API.
@@ -25,9 +25,11 @@ fn main() {
 
     let dataflow = builder.build().expect("graph construction failed");
 
-    // Execute via SimpleRuntime
-    SimpleRuntime::new()
-        .run(dataflow)
+    // Execute via RuntimeHandle
+    let rt = RuntimeHandle::new(RuntimeConfig::default()).unwrap();
+    rt.spawn(dataflow, SpawnOptions::default())
+        .unwrap()
+        .join_blocking()
         .expect("dataflow execution failed");
 
     // Read collected results

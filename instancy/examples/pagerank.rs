@@ -18,7 +18,7 @@ use std::collections::HashMap;
 
 use instancy::DataflowBuilder;
 use instancy::IterateResult;
-use instancy::SimpleRuntime;
+use instancy::{RuntimeConfig, RuntimeHandle, SpawnOptions};
 
 /// Number of PageRank iterations.
 const ITERATIONS: u32 = 20;
@@ -120,8 +120,11 @@ fn main() {
     println!("  3 ← 4 → 5");
     println!();
 
-    let rt = SimpleRuntime::new();
-    rt.run(dataflow).expect("execution failed");
+    let rt = RuntimeHandle::new(RuntimeConfig::default()).unwrap();
+    rt.spawn(dataflow, SpawnOptions::default())
+        .unwrap()
+        .join_blocking()
+        .expect("execution failed");
 
     let collector = results.collector();
     let data = collector.lock().unwrap();

@@ -8,7 +8,7 @@
 //! ```
 
 use instancy::DataflowBuilder;
-use instancy::SimpleRuntime;
+use instancy::{RuntimeConfig, RuntimeHandle, SpawnOptions};
 
 fn main() {
     // Build a dataflow with a probe attached after a map operator.
@@ -31,7 +31,11 @@ fn main() {
     let port = stream.output("sink");
 
     let dataflow = builder.build().expect("build failed");
-    SimpleRuntime::new().run(dataflow).expect("dataflow failed");
+    let rt = RuntimeHandle::new(RuntimeConfig::default()).unwrap();
+    rt.spawn(dataflow, SpawnOptions::default())
+        .unwrap()
+        .join_blocking()
+        .expect("dataflow failed");
 
     // After execution completes, the probe reflects the final frontier state.
     // In a real application, probes are most useful *during* execution to

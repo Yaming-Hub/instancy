@@ -1,6 +1,6 @@
 //! # Event-Driven Pipeline
 //!
-//! Demonstrates real-time event processing using `SimpleRuntime::spawn()`
+//! Demonstrates real-time event processing using `RuntimeHandle::spawn()`
 //! with channel-based I/O. Events arrive with meaningful timestamps
 //! representing time windows (e.g., seconds since epoch).
 //!
@@ -19,7 +19,7 @@
 //! ```
 
 use instancy::DataflowBuilder;
-use instancy::SimpleRuntime;
+use instancy::{RuntimeConfig, RuntimeHandle, SpawnOptions};
 
 /// Simulated sensor reading
 #[derive(Clone, Debug)]
@@ -55,8 +55,10 @@ fn main() {
     );
 
     // Spawn on background thread
-    let rt = SimpleRuntime::new();
-    let mut handle = rt.spawn(dataflow).expect("spawn failed");
+    let rt = RuntimeHandle::new(RuntimeConfig::default()).expect("runtime creation failed");
+    let mut handle = rt
+        .spawn(dataflow, SpawnOptions::default())
+        .expect("spawn failed");
     let sender = handle.take_input::<SensorReading>("readings").unwrap();
 
     // Simulate sensor readings arriving in time windows.

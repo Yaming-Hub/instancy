@@ -5,7 +5,7 @@
 //! using a `TeePush` adapter that clones data to all consumers.
 
 use instancy::DataflowBuilder;
-use instancy::SimpleRuntime;
+use instancy::{RuntimeConfig, RuntimeHandle, SpawnOptions};
 
 fn main() {
     let builder = DataflowBuilder::<u64>::new("branching_pipeline");
@@ -36,8 +36,10 @@ fn main() {
     );
     println!("Outputs: {:?}", dataflow.output_names());
 
-    SimpleRuntime::new()
-        .run(dataflow)
+    let rt = RuntimeHandle::new(RuntimeConfig::default()).unwrap();
+    rt.spawn(dataflow, SpawnOptions::default())
+        .unwrap()
+        .join_blocking()
         .expect("execution failed");
 
     // Read results

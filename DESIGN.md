@@ -471,25 +471,38 @@ fn worker_thread_loop(queue: &TaskQueue, pool_state: &PoolState) {
 
 ### 5.2a Runtime Tiers & Async Completion
 
-instancy provides two runtime tiers, both accepting a `LogicalDataflow` and producing
-either a completion future or a `SpawnedDataflow` handle:
+instancy now has one production runtime: `RuntimeHandle`. A dataflow is always executed as `spawn()` + `join()`; there is no separate public `run()` or `run_blocking()` API.
+
+`SimpleRuntime` still exists, but only behind the `test-utils` feature for tests and lightweight local experimentation.
 
 | Runtime | Execution | API style | Use case |
 |---|---|---|---|
-| `SimpleRuntime` | Dedicated OS thread per dataflow | Blocking `run()`, async `join()` | Tests, scripts, prototyping |
-| `RuntimeHandle` | Shared worker pool | Async `run()` returns `DataflowCompletion` | Production workloads |
+| `SimpleRuntime` (`test-utils`) | Dedicated OS thread per dataflow | `spawn()` + `join()` | Tests, scripts, prototyping |
+| `RuntimeHandle` | Shared worker pool | `spawn()` + `join()` / `join_blocking()` | Production workloads |
 
-**`DataflowCompletion`** is a `Future<Output=Result<()>>` backed by `Arc<Mutex<SharedState>>` + `Condvar`. It can be `.await`ed in async code or `.wait()`ed for synchronous blocking. Both runtimes use the same `DataflowCompletion` primitive for `SpawnedDataflow::join()`.
+A synchronous caller uses the compact pattern:
 
-**Current model (Phase 1):** The executor sweep loop runs as a single synchronous task
-on a pool thread. The caller receives a `DataflowCompletion` future that resolves when
-the executor finishes. The worker thread is occupied for the duration of the sweep loop.
+```rust
+let rt = RuntimeHandle::new(RuntimeConfig::default())?;
+rt.spawn(dataflow, SpawnOptions::default())?
+    .join_blocking()?;
+```
+
+Async callers keep the completion future returned by `join()`:
+
+```rust
+let rt = RuntimeHandle::new(RuntimeConfig::default())?;
+let completion = rt.spawn(dataflow, SpawnOptions::default())?.join();
+completion.await?;
+```
+
+**`DataflowCompletion`** is a `Future<Output=Result<()>>` backed by `Arc<Mutex<SharedState>>` + `Condvar`. It can be `.await`ed in async code or `.wait()`ed for synchronous blocking. `SpawnedDataflow::join()` returns this completion future, while `join_blocking()` is the convenience wrapper for synchronous callers.
+
+**Current model (Phase 1):** The executor sweep loop runs as a single synchronous task on a pool thread. The caller receives a `DataflowCompletion` future that resolves when the executor finishes. The worker thread is occupied for the duration of the sweep loop.
 
 #### Sweep model
 
-A **sweep** is one full pass through the executor's ready queue — it activates each
-queued operator once (up to `max_activations_per_step`), then propagates progress and
-updates quiescence counters. Think of it as a single clock tick in a reactor loop:
+A **sweep** is one full pass through the executor's ready queue: it activates each queued operator once (up to `max_activations_per_step`), then propagates progress and updates quiescence counters. Think of it as a single clock tick in a reactor loop:
 
 - **Sweep** = scan all ready operators, activate each, propagate progress, check quiescence.
 - **Run** = repeated sweeps until completion or idle.
@@ -498,108 +511,83 @@ Each sweep returns a `SweepOutcome` that tells the caller what happened:
 
 | Outcome | Meaning |
 |---|---|
-| `Completed` | All operators are done — dataflow finished normally |
+| `Completed` | All operators are done - dataflow finished normally |
 | `Quiescent` | No operator made progress for N consecutive sweeps, no external inputs |
-| `MadeProgress` | At least one operator made progress — more sweeps likely needed |
+| `MadeProgress` | At least one operator made progress - more sweeps likely needed |
 | `Idle` | No progress this sweep, but quiescence threshold not yet reached |
 | `WaitingForInput` | Idle threshold reached but external inputs still open |
 
-The sync `run()` and async `poll_run()` both delegate to `run_one_sweep()` and
-react to the outcome differently — `run()` loops or sleeps, `poll_run()` registers
-a waker and returns `Pending`.
+The spawned executor repeatedly calls `run_one_sweep()`. The async executor path uses `poll_run()` to register a waker and return `Pending` when the dataflow is idle.
 
-**Async executor (Phase 2 — implemented):** The executor's sweep loop is a
-`Future` that yields when idle (no operator made progress). This requires:
+**Async executor (Phase 2 - implemented):** The executor's sweep loop is a `Future` that yields when idle (no operator made progress). This requires:
 
-1. **Channel waker integration** — `WakeHandle` is a per-dataflow notification
-   primitive (`AtomicBool` + `Mutex<Option<Waker>>`). Bounded channels notify it
-   on push, close, drop, and when pulling frees capacity (backpressure relief).
-2. **Executor as Future** — `poll_run()` runs sweeps until idle, then registers
-   a waker via the `WakeHandle`. Uses a race-safe protocol: register waker →
-   re-check for notifications → only return `Pending` if no notification pending.
-3. **Task scheduler multiplexing** — the worker pool's `ExecutorRegistry` polls
-   multiple executor futures on the same thread with per-task CAS-based state
-   machine (IDLE→QUEUED→POLLING→DONE) and `PoolWaker` for async re-enqueue.
+1. **Channel waker integration** - `WakeHandle` is a per-dataflow notification primitive (`AtomicBool` + `Mutex<Option<Waker>>`). Bounded channels notify it on push, close, drop, and when pulling frees capacity (backpressure relief).
+2. **Executor as Future** - `poll_run()` runs sweeps until idle, then registers a waker via the `WakeHandle`. Uses a race-safe protocol: register waker -> re-check for notifications -> only return `Pending` if no notification pending.
+3. **Task scheduler multiplexing** - the worker pool's `ExecutorRegistry` polls multiple executor futures on the same thread with per-task CAS-based state machine (`IDLE -> QUEUED -> POLLING -> DONE`) and `PoolWaker` for async re-enqueue.
 
-**Async I/O (Phase 3 — implemented):** While `spawn()`/`run()` remain synchronous
-(graph construction and channel wiring is pure CPU work), `spawn_async()` creates
-async I/O channels for feeding data into and collecting results from a running
-dataflow. This is feature-gated behind the `async-io` Cargo feature.
+**Async I/O (Phase 3 - implemented):** `spawn()` stays synchronous because graph construction and channel wiring are pure CPU work. `SpawnOptions` selects the external channel backend at spawn time: `IoMode::Sync` for blocking `std::sync::mpsc`, or `IoMode::Async` for `tokio::sync::mpsc`. Async I/O is always available.
 
-The key insight: the **executor** is already async (Phase 2), but the **I/O boundary**
-was still synchronous. Phase 3 adds `AsyncInputSender` and `AsyncOutputReceiver` —
-async wrappers around `tokio::sync::mpsc` channels that integrate with the executor's
-`WakeHandle` for backpressure-aware async data flow.
+The key insight: the **executor** is already async (Phase 2), but the **I/O boundary** is chosen per spawn. `AsyncInputSender` and `AsyncOutputReceiver` are async wrappers around `tokio::sync::mpsc` channels that integrate with the executor's `WakeHandle` for backpressure-aware async data flow.
 
 #### Channel Mode Selection
 
-The channel type is chosen at spawn time:
+The channel type is chosen at spawn time via `SpawnOptions`:
 
-| Method | Channel type | I/O handles | Use case |
+| Spawn call | Channel type | I/O handles | Use case |
 |---|---|---|---|
-| `spawn()` / `run()` | `std::sync::mpsc` | `InputSender` / `OutputReceiver` (sync) | Tests, scripts, CPU-only |
-| `spawn_async()` | `tokio::sync::mpsc` | `AsyncInputSender` / `AsyncOutputReceiver` | Production async I/O |
+| `rt.spawn(dataflow, SpawnOptions::default())` | `std::sync::mpsc` | `InputSender` / `OutputReceiver` | Default sync channel I/O |
+| `rt.spawn(dataflow, SpawnOptions::new().io_mode(IoMode::Async))` | `tokio::sync::mpsc` | `AsyncInputSender` / `AsyncOutputReceiver` | Async producers and consumers |
 
-Both modes share the same `ChannelSourceOperator` and `ChannelSinkOperator` via
-the `InputRecv` / `OutputSend` enum dispatch — the operator code doesn't know
-which channel backend is active:
+Both modes share the same `ChannelSourceOperator` and `ChannelSinkOperator` via the `InputRecv` / `OutputSend` enum dispatch - the operator code doesn't know which channel backend is active:
 
 ```rust
-/// Channel receive half — sync or async, selected at spawn time.
+/// Channel receive half - sync or async, selected at spawn time.
 enum InputRecv<T> {
     Std(std::sync::mpsc::Receiver<T>),
-    #[cfg(feature = "async-io")]
     Tokio(tokio::sync::mpsc::Receiver<T>),
 }
 
-/// Channel send half — sync or async, selected at spawn time.
+/// Channel send half - sync or async, selected at spawn time.
 enum OutputSend<T> {
     Std(std::sync::mpsc::SyncSender<T>),
-    #[cfg(feature = "async-io")]
     Tokio(tokio::sync::mpsc::Sender<T>),
 }
 ```
 
-Both variants expose a `try_recv()` / `try_send()` interface that works without
-a tokio runtime context — important because operator code runs on the custom
-worker pool threads, not on tokio threads.
+Both variants expose a `try_recv()` / `try_send()` interface that works without a tokio runtime context - important because operator code runs on the custom worker pool threads, not on tokio threads.
 
 #### AsyncInputSender
 
-`AsyncInputSender<T, D>` wraps a `tokio::sync::mpsc::Sender` and the dataflow's
-`WakeHandle`. It provides the same API as the sync `InputSender`:
+`AsyncInputSender<T, D>` wraps a `tokio::sync::mpsc::Sender` and the dataflow's `WakeHandle`. It provides the same API as the sync `InputSender`:
 
 ```rust
 // Feed data into a running dataflow
 let sender = handle.take_async_input::<i32>("numbers").unwrap();
 
-// Send a batch — awaits if the channel is full (backpressure)
+// Send a batch - awaits if the channel is full (backpressure)
 sender.send(timestamp, vec![1, 2, 3]).await?;
 
 // Advance the input frontier
 sender.advance_to(next_timestamp).await?;
 
-// Signal input complete — drops all capabilities
+// Signal input complete - drops all capabilities
 sender.close();
 ```
 
 Key properties:
 - **Clone**: multiple producers can feed the same input (channel closes when all drop)
-- **WakeHandle integration**: each `send()` notifies the executor's WakeHandle,
-  waking it from idle to process the new data
-- **Backpressure**: `send().await` yields when the channel is full, naturally
-  integrating with tokio's cooperative scheduling
+- **WakeHandle integration**: each `send()` notifies the executor's WakeHandle, waking it from idle to process the new data
+- **Backpressure**: `send().await` yields when the channel is full, naturally integrating with tokio's cooperative scheduling
 
 #### AsyncOutputReceiver
 
-`AsyncOutputReceiver<T, D>` wraps a `tokio::sync::mpsc::Receiver` and the
-dataflow's `WakeHandle`. It provides an async stream-like interface:
+`AsyncOutputReceiver<T, D>` wraps a `tokio::sync::mpsc::Receiver` and the dataflow's `WakeHandle`. It provides an async stream-like interface:
 
 ```rust
 // Collect results from a running dataflow
 let mut out = handle.take_async_output::<String>("results").unwrap();
 
-// Receive events — awaits until data is available
+// Receive events - awaits until data is available
 while let Some(event) = out.recv().await {
     if let OutputEvent::Data { time, data } = event {
         println!("t={time}: {data:?}");
@@ -612,47 +600,47 @@ while let Some(event) = out.recv().await {
 ```
 
 Key properties:
-- **WakeHandle integration**: each `recv()` notifies the executor's WakeHandle
-  after consuming data, relieving backpressure on sink operators
-- **Drop notification**: dropping the receiver notifies the WakeHandle, so
-  backpressured sinks don't block forever if the consumer is cancelled
+- **WakeHandle integration**: each `recv()` notifies the executor's WakeHandle after consuming data, relieving backpressure on sink operators
+- **Drop notification**: dropping the receiver notifies the WakeHandle, so backpressured sinks don't block forever if the consumer is cancelled
 
 #### End-to-End Async Flow
 
 ```
 Producer task                  Worker Pool                    Consumer task
 (tokio thread)                 (custom threads)               (tokio thread)
-     │                              │                              │
-     │ sender.send(t, data).await   │                              │
-     ├─────────tokio::mpsc──────────►                              │
-     │                         try_recv()                          │
-     │                    ChannelSourceOperator                     │
-     │                         activates                           │
-     │                              │                              │
-     │                    operator pipeline                        │
-     │                    (map → filter → ...)                     │
-     │                              │                              │
-     │                    ChannelSinkOperator                      │
-     │                        try_send()                           │
-     │                              ├──────tokio::mpsc─────────────►
-     │                              │              out.recv().await │
-     │                              │                              │
+     |                               |                              |
+     | sender.send(t, data).await    |                              |
+     +-------- tokio::mpsc --------->|                              |
+     |                          try_recv()                          |
+     |                     ChannelSourceOperator                    |
+     |                          activates                          |
+     |                               |                              |
+     |                     operator pipeline                        |
+     |                     (map -> filter -> ...)                  |
+     |                               |                              |
+     |                     ChannelSinkOperator                      |
+     |                          try_send()                         |
+     |                               +-------- tokio::mpsc ------->|
+     |                                                    out.recv().await
 ```
 
 #### Panic Safety
 
 All mutex locks in the async I/O path use poison-safe patterns (Phase 3.5):
-- Bounded channels: `lock().ok()` / `lock().map_err()` — errors propagate naturally
+- Bounded channels: `lock().ok()` / `lock().map_err()` - errors propagate naturally
 - WakeHandle: `lock().unwrap_or_else(|e| e.into_inner())` for waker registration
 - CompletionNotifier: `into_inner()` ensures completion signal always delivered
 
 ```rust
-// Example: spawn_async end-to-end
+// Example: async I/O end-to-end
 let rt = RuntimeHandle::new(RuntimeConfig {
     worker_threads: 4,
     ..Default::default()
 }).unwrap();
-let mut spawned = rt.spawn_async(dataflow)?;
+let mut spawned = rt.spawn(
+    dataflow,
+    SpawnOptions::new().io_mode(IoMode::Async),
+)?;
 
 let sender = spawned.take_async_input::<i32>("data").unwrap();
 let mut output = spawned.take_async_output::<String>("results").unwrap();
@@ -679,8 +667,8 @@ Phase 1 (sync):                      Phase 2 (async executor):           Phase 3
 ┌──────────────┐                     ┌──────────────┐                    ┌──────────────┐
 │ Worker Thread │                     │ Worker Thread │                    │ Worker Thread │
 │              │                     │              │                    │              │
-│ executor.run()  ← blocks until    │ poll(exec_A)  ← Pending          │ poll(exec_A)  ← Pending
-│                   completion      │ poll(exec_B)  ← Ready            │ poll(exec_B)  ← Ready
+│ executor sweep loop <- blocks     │ poll(exec_A)  <- Pending         │ poll(exec_A)  <- Pending
+│ until completion                  │ poll(exec_B)  <- Ready           │ poll(exec_B)  <- Ready
 │              │                     │ poll(exec_C)  ← Pending          │              │
 │              │                     │ ... park ...  │                    │ ... park ...  │
 └──────────────┘                     └──────────────┘                    └──┬───────┬───┘
@@ -2747,7 +2735,6 @@ encapsulates the data-producing logic within the dataflow definition.
 #### API
 
 ```rust
-#[cfg(feature = "async-io")]
 pub fn source_async<D, F, Fut>(
     &self,
     name: impl Into<String>,
@@ -3985,7 +3972,7 @@ pub enum AggregatedOutcome {
 │   Node A        │            │   Node B        │   │   Node C        │
 │                 │◄──────────►│                 │◄──►│                 │
 │ DataflowHandle  │  exchange  │ DataflowHandle  │   │ DataflowHandle  │
-│ Executor.run()  │  channels  │ Executor.run()  │   │ Executor.run()  │
+│ Executor sweep  │  channels  │ Executor sweep  │   │ Executor sweep  │
 └─────────────────┘            └─────────────────┘   └─────────────────┘
 ```
 
@@ -4288,7 +4275,7 @@ This section documents the cardinality (how many instances exist) and lifetime (
 - `execute()` bootstrap with dynamic worker pool
 
 **Phase 3 — Async I/O & Robustness**
-- `spawn_async()` with `tokio::sync::mpsc` channel backend (feature-gated `async-io`)
+- `spawn()` with `SpawnOptions::new().io_mode(IoMode::Async)` for `tokio::sync::mpsc` channel I/O
 - `AsyncInputSender` / `AsyncOutputReceiver` with WakeHandle integration
 - `ChannelMode` enum (Sync | Async) selected at spawn time
 - `InputRecv` / `OutputSend` enum dispatch in ChannelSourceOperator / ChannelSinkOperator

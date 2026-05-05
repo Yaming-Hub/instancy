@@ -34,7 +34,7 @@ use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
 
 use instancy::DataflowBuilder;
-use instancy::{RuntimeConfig, RuntimeHandle};
+use instancy::{RuntimeConfig, RuntimeHandle, SpawnOptions};
 
 fn main() {
     println!("=== Notify Word Count (Frontier-Based Aggregation) ===\n");
@@ -122,6 +122,7 @@ fn main() {
 
                 Ok(())
             },
+            SpawnOptions::default(),
         )
         .expect("spawn_multi failed");
 

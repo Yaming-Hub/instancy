@@ -7,16 +7,15 @@
 //! cargo run --example cancellation
 //! ```
 
-use instancy::CancellationToken;
 use instancy::DataflowBuilder;
 use instancy::Error;
-use instancy::SimpleRuntime;
+use instancy::{RuntimeConfig, RuntimeHandle, SpawnOptions};
 
 fn main() {
-    // Create a cancellation token and cancel it immediately.
+    // Create a runtime and cancel it immediately.
     // This simulates an external shutdown signal arriving before the dataflow starts.
-    let token = CancellationToken::new();
-    token.cancel();
+    let rt = RuntimeHandle::new(RuntimeConfig::default()).expect("runtime creation failed");
+    rt.cancel_token().cancel();
 
     let builder = DataflowBuilder::<u64>::new("cancellation_demo");
     let _port = builder
@@ -24,8 +23,10 @@ fn main() {
         .output("output");
     let dataflow = builder.build().expect("build failed");
 
-    // Run with a pre-cancelled token — should fail immediately
-    let result = SimpleRuntime::with_cancel(token).run(dataflow);
+    // Run with a pre-cancelled runtime — should fail immediately
+    let result = rt
+        .spawn(dataflow, SpawnOptions::default())
+        .and_then(|handle| handle.join_blocking());
 
     match result {
         Err(Error::Cancelled { .. }) => {

@@ -13,9 +13,11 @@
 use std::collections::HashMap;
 
 use instancy::DataflowBuilder;
-use instancy::SimpleRuntime;
+use instancy::{RuntimeConfig, RuntimeHandle, SpawnOptions};
 
 fn main() {
+    let rt = RuntimeHandle::new(RuntimeConfig::default()).unwrap();
+
     // -----------------------------------------------------------------------
     // Example 1: Simple equi-join (users × orders on user_id)
     // -----------------------------------------------------------------------
@@ -105,7 +107,10 @@ fn main() {
     let output = joined.output("results");
 
     let dataflow = builder.build().unwrap();
-    SimpleRuntime::new().run(dataflow).unwrap();
+    rt.spawn(dataflow, SpawnOptions::default())
+        .unwrap()
+        .join_blocking()
+        .unwrap();
 
     println!("=== Hash Join: users × orders ===");
     for (t, batch) in output.collector().lock().unwrap().iter() {
@@ -194,7 +199,10 @@ fn main() {
     let graph_output = two_hop.output("two_hop_paths");
 
     let dataflow = builder.build().unwrap();
-    SimpleRuntime::new().run(dataflow).unwrap();
+    rt.spawn(dataflow, SpawnOptions::default())
+        .unwrap()
+        .join_blocking()
+        .unwrap();
 
     println!("\n=== Graph Join: 2-hop paths (A→B→C) ===");
     for (t, batch) in graph_output.collector().lock().unwrap().iter() {

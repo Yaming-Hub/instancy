@@ -2,7 +2,7 @@
 //!
 //! Demonstrates the separated builder pattern:
 //! 1. Build a logical dataflow using typed Pipe chaining
-//! 2. Execute it via `SimpleRuntime::run()`
+//! 2. Execute it via `RuntimeHandle::spawn()` + `join_blocking()`
 //!
 //! Pipeline: source(1..10) → double → filter(÷3) → describe → output
 //!
@@ -11,7 +11,7 @@
 //! ```
 
 use instancy::DataflowBuilder;
-use instancy::SimpleRuntime;
+use instancy::{RuntimeConfig, RuntimeHandle, SpawnOptions};
 
 fn main() {
     // Phase 1: Build logical dataflow (no runtime involved)
@@ -37,9 +37,12 @@ fn main() {
     );
     println!("Outputs: {:?}", dataflow.output_names());
 
-    // Phase 2: Execute via SimpleRuntime
-    let rt = SimpleRuntime::new();
-    rt.run(dataflow).expect("dataflow execution failed");
+    // Phase 2: Execute via RuntimeHandle
+    let rt = RuntimeHandle::new(RuntimeConfig::default()).unwrap();
+    rt.spawn(dataflow, SpawnOptions::default())
+        .unwrap()
+        .join_blocking()
+        .expect("dataflow execution failed");
 
     // Phase 3: Read results
     let results = output_port.collector();
