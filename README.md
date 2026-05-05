@@ -295,6 +295,8 @@ cargo run -p instancy --example <name>
 | `merge_streams` | Binary and concat operators for merging streams |
 | `probe` | Using `ProbeHandle` to observe frontier progress |
 | `cancellation` | Cooperative cancellation with `CancellationToken` |
+| `error_handling` | Result combinators: map_ok, filter_ok, branch_result |
+| `panic_recovery` | Operator panic recovery with catch_panics |
 
 **Multi-Worker & Exchange**
 
@@ -374,7 +376,7 @@ instancy/
 │   │   ├── control_protocol.rs   # Fingerprint exchange + ready barrier
 │   │   └── codec.rs              # Codec trait + built-in implementations
 │   └── order.rs                  # Timestamp types (Product for nested scopes)
-├── examples/                     # 24 runnable examples
+├── examples/                     # 26 runnable examples
 ├── tests/                        # Integration tests
 └── Cargo.toml
 ```
