@@ -1001,7 +1001,7 @@ where
             let materializer = materializer.clone();
             let exchange_fn = exchange_fn.clone();
             super::super::schedulable::channel_factory(
-                move |ctx: &crate::worker::WorkerContext, _cap: usize, wake: Option<WakeHandle>| {
+                move |ctx: &crate::worker::WorkerContext, wake: Option<WakeHandle>| {
                     wakes.register(ctx.worker_index(), wake);
 
                     let (pushers, pullers) = materializer
