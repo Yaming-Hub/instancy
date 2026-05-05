@@ -2,7 +2,7 @@
 //!
 //! When multiple workers execute a dataflow in parallel, they need a way to
 //! communicate control signals (primarily errors) without using the data plane.
-//! [`ControlBroadcast`] provides a simple broadcast mechanism:
+//! `ControlBroadcast` provides a simple broadcast mechanism:
 //!
 //! - Any worker can send a [`WorkerControl`] signal via its [`ControlSender`]
 //! - All workers (including the sender) receive it via their [`ControlReceiver`]

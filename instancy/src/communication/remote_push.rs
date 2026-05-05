@@ -177,7 +177,7 @@ where
                 let mut buf = Vec::new();
                 self.codec
                     .encode(&(time, data), &mut buf)
-                    .map_err(|e| Error::codec(e))?;
+                    .map_err(Error::codec)?;
                 buf
             }
             Payload::Control(_) => {

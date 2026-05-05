@@ -25,7 +25,6 @@ use crate::dataflow::operators::output::OutputEvent;
 use crate::dataflow::schedulable::{ActivationOutcome, SchedulableOperator};
 use crate::dataflow::stage::StageId;
 use crate::error::Result;
-use crate::order::PartialOrder;
 use crate::progress::operate::ProgressReporter;
 use crate::progress::timestamp::Timestamp;
 

@@ -77,9 +77,10 @@ impl DataflowConfig {
 }
 
 /// Per-dataflow error handling policy.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub enum ErrorPolicy {
     /// Stop the dataflow on the first error (default).
+    #[default]
     Stop,
     /// Ignore errors and continue processing.
     /// An optional callback name can be used for logging/alerting.
@@ -89,11 +90,6 @@ pub enum ErrorPolicy {
     },
 }
 
-impl Default for ErrorPolicy {
-    fn default() -> Self {
-        Self::Stop
-    }
-}
 
 /// Configuration for a physical node (OS process) in the cluster.
 ///

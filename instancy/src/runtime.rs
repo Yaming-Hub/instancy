@@ -2,8 +2,8 @@
 //!
 //! Instancy provides two runtime tiers:
 //!
-//! - [`SimpleRuntime`] — lightweight, single-thread execution for tests and
-//!   simple scripts. Each dataflow gets a dedicated background thread.
+//! - `SimpleRuntime` (feature `test-utils`) — lightweight, single-thread execution
+//!   for tests and simple scripts. Each dataflow gets a dedicated background thread.
 //! - [`RuntimeHandle`] — production runtime with a shared worker thread pool,
 //!   configurable scheduling policy, and centralized cancellation.
 //!
@@ -178,7 +178,7 @@ impl ClusterCancelHandle {
             || self
                 .worker_tokens
                 .first()
-                .map_or(false, |t| t.is_cancelled())
+                .is_some_and(|t| t.is_cancelled())
     }
 }
 
@@ -726,7 +726,7 @@ impl RuntimeHandle {
 
         // Use pre-created wake handle if provided (for multi-worker with
         // progress channels that already reference it), otherwise create one.
-        let wake_handle = pre_created_wake_handle.unwrap_or_else(WakeHandle::new);
+        let wake_handle = pre_created_wake_handle.unwrap_or_default();
 
         // Register wake handle on the cancellation token (and all ancestors)
         // so that cancel() wakes the sleeping executor promptly.

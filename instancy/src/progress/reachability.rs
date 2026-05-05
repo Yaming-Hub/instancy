@@ -379,7 +379,7 @@ impl<T: Timestamp> Builder<T> {
 
             // For each node, propagate from targets to sources using internal connectivity.
             for node in 0..num_nodes {
-                if let Some(ref conn) = self.nodes.get(node).and_then(|n| n.as_ref()) {
+                if let Some(conn) = self.nodes.get(node).and_then(|n| n.as_ref()) {
                     let (inputs, outputs) = self.shape[node];
                     for input in 0..inputs {
                         for output in 0..outputs {

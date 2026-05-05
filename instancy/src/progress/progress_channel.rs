@@ -241,7 +241,7 @@ mod tests {
     #[test]
     fn send_and_receive_progress() {
         let wakes: Vec<WakeHandle> = (0..3).map(|_| WakeHandle::new()).collect();
-        let mut channels = create_progress_channels::<u64>(3, &wakes);
+        let channels = create_progress_channels::<u64>(3, &wakes);
 
         // Worker 0 sends to Worker 1.
         let w0 = &channels[0];

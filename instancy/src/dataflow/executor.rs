@@ -193,8 +193,6 @@ fn extract_panic_message(payload: &Box<dyn std::any::Any + Send>) -> String {
 /// (not operator positions). One task enqueue → one full stage activation.
 #[derive(Debug)]
 pub(crate) struct FusedStageTask {
-    /// Stage identifier for diagnostics.
-    pub stage_id: crate::dataflow::stage::StageId,
     /// Operator positions (in the executor's `operators` vec) in topological order.
     /// These are physical positions, not logical operator indices.
     pub operator_positions: Vec<usize>,
@@ -250,7 +248,7 @@ impl FusedStageTask {
 
                 // Record metrics regardless of success/failure.
                 if let Some(start) = start {
-                    if let Some(ref collector) = op_collectors.get(pos).and_then(|c| c.as_ref()) {
+                    if let Some(collector) = op_collectors.get(pos).and_then(|c| c.as_ref()) {
                         collector.record_activation(start.elapsed(), 0);
                     }
                 }
@@ -401,7 +399,7 @@ impl<T: Timestamp> DataflowExecutor<T> {
         let mut factory_map: std::collections::HashMap<usize, ChannelFactory> =
             channel_factories.into_iter().collect();
 
-        let wake_handle = external_wake_handle.unwrap_or_else(WakeHandle::new);
+        let wake_handle = external_wake_handle.unwrap_or_default();
 
         for edge_idx in 0..total_edge_count {
             let mut factory = factory_map.remove(&edge_idx).ok_or_else(|| {
@@ -768,7 +766,6 @@ impl<T: Timestamp> DataflowExecutor<T> {
             }
 
             tasks.push(FusedStageTask {
-                stage_id: stage.id,
                 operator_positions: positions,
             });
         }
@@ -881,24 +878,20 @@ impl<T: Timestamp> DataflowExecutor<T> {
                 if self.done[pos] {
                     continue;
                 }
-                let executor_has_ready = if pos < self.notificators.len() {
-                    self.notificators
+                let executor_has_ready = pos < self.notificators.len()
+                    && self
+                        .notificators
                         .get(pos)
                         .and_then(|n| n.as_ref())
-                        .map_or(false, |n| n.has_ready())
-                } else {
-                    false
-                };
+                        .is_some_and(|n| n.has_ready());
                 let operator_has_ready = self.operators[pos].has_ready_notifications();
 
-                if executor_has_ready || operator_has_ready {
-                    if pos < self.op_pos_to_task.len() {
-                        let task_idx = self.op_pos_to_task[pos];
-                        if task_idx != usize::MAX && !self.task_in_queue[task_idx] {
-                            self.ready_queue.push_back(task_idx);
-                            self.task_in_queue[task_idx] = true;
-                            activated = true;
-                        }
+                if (executor_has_ready || operator_has_ready) && pos < self.op_pos_to_task.len() {
+                    let task_idx = self.op_pos_to_task[pos];
+                    if task_idx != usize::MAX && !self.task_in_queue[task_idx] {
+                        self.ready_queue.push_back(task_idx);
+                        self.task_in_queue[task_idx] = true;
+                        activated = true;
                     }
                 }
             }
@@ -920,14 +913,12 @@ impl<T: Timestamp> DataflowExecutor<T> {
                 if self.done[pos] || self.in_queue[pos] {
                     continue;
                 }
-                let executor_has_ready = if pos < self.notificators.len() {
-                    self.notificators
+                let executor_has_ready = pos < self.notificators.len()
+                    && self
+                        .notificators
                         .get(pos)
                         .and_then(|n| n.as_ref())
-                        .map_or(false, |n| n.has_ready())
-                } else {
-                    false
-                };
+                        .is_some_and(|n| n.has_ready());
                 let operator_has_ready = self.operators[pos].has_ready_notifications();
 
                 if executor_has_ready || operator_has_ready {
@@ -1015,7 +1006,7 @@ impl<T: Timestamp> DataflowExecutor<T> {
         // Record metrics regardless of success/failure — failed activations
         // still consume CPU time and should be tracked.
         if let Some(start) = start {
-            if let Some(ref collector) = self.op_collectors.get(pos).and_then(|c| c.as_ref()) {
+            if let Some(collector) = self.op_collectors.get(pos).and_then(|c| c.as_ref()) {
                 collector.record_activation(start.elapsed(), 0);
             }
         }
@@ -2819,7 +2810,6 @@ mod tests {
     #[test]
     fn enable_fusion_from_graph_computes_topological_order() {
         use crate::dataflow::graph::{DataflowGraph, EdgeInfo, OperatorInfo};
-        use crate::dataflow::stage::FusedActivationOrder;
         use crate::dataflow::stage::StageId;
         use crate::dataflow::stream::Slot;
 

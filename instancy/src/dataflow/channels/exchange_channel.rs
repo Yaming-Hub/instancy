@@ -163,6 +163,7 @@ impl<T: Timestamp, D: Send + 'static> ExchangeChannelSet<T, D> {
     /// Channels are created without wake handles — waking is handled
     /// externally by [`SharedWakeRegistry`] through [`ExchangePush`] and
     /// [`ExchangePull`].
+    #[cfg(test)]
     pub fn new(num_workers: usize, capacity: usize) -> Self {
         Self::new_asymmetric(num_workers, num_workers, capacity)
     }
@@ -210,6 +211,7 @@ impl<T: Timestamp, D: Send + 'static> ExchangeChannelSet<T, D> {
     /// # Panics
     /// Panics if `num_sources != num_targets` (use `take_source_endpoints`/
     /// `take_target_endpoints` for asymmetric channels).
+    #[cfg(test)]
     pub fn take_pair(
         &mut self,
         worker_idx: usize,
@@ -276,15 +278,6 @@ impl<T: Timestamp, D: Send + 'static> ExchangeChannelSet<T, D> {
         Ok(pullers)
     }
 
-    /// Number of source workers (M dimension).
-    pub fn num_sources(&self) -> usize {
-        self.num_sources
-    }
-
-    /// Number of target workers (N dimension).
-    pub fn num_targets(&self) -> usize {
-        self.num_targets
-    }
 }
 
 // ---------------------------------------------------------------------------
@@ -507,8 +500,6 @@ impl<T: Timestamp, D: Send + 'static> Drop for ExchangePush<T, D> {
 // ExchangePull
 // ---------------------------------------------------------------------------
 
-/// Pull endpoint for an exchange channel.
-///
 // ---------------------------------------------------------------------------
 // FrontierAggregator — per-source watermark tracking
 // ---------------------------------------------------------------------------
