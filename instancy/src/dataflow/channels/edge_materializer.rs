@@ -204,7 +204,6 @@ impl<T: Timestamp, D: Send + 'static> EdgeMaterializer<T, D> for LocalEdgeMateri
 mod tests {
     use super::*;
     use crate::dataflow::channels::envelope::Envelope;
-    use crate::dataflow::channels::pushpull::{Pull, Push};
 
     #[test]
     fn local_materializer_produces_endpoints() {

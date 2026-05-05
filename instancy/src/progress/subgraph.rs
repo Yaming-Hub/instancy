@@ -605,10 +605,8 @@ impl<T: Timestamp> ProgressTracker<T> {
         }
 
         let changes = std::mem::take(&mut self.local_changes_buffer);
-        for sender in &channels.senders {
-            if let Some(s) = sender {
-                s.send(changes.clone());
-            }
+        for sender in channels.senders.iter().flatten() {
+            sender.send(changes.clone());
         }
     }
 

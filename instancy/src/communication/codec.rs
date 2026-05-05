@@ -288,7 +288,7 @@ impl ExchangeData for Vec<u8> {
 ///
 /// Uses native-endian (little-endian on most platforms) encoding with no length prefix
 /// since the size is known at compile time.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, Default)]
 pub struct FixedSizeCodec<T: Copy> {
     _phantom: PhantomData<T>,
 }

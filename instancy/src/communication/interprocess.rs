@@ -177,7 +177,6 @@ impl RoutingTable {
 ///
 /// Each record in the batch is individually length-prefixed to allow
 /// heterogeneous-size records within a single batch.
-
 /// Encode a data batch (time + `Vec<D>`) into wire bytes.
 ///
 /// The source_worker is included so the receiver knows which logical worker

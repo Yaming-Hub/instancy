@@ -966,7 +966,7 @@ impl<T: Timestamp, D: Clone + Send + 'static> Pipe<T, D> {
     pub fn take(mut self, name: impl Into<String>, count: usize) -> Pipe<T, D> {
         let capacity = self.resolve_capacity();
         let mut remaining = count;
-        self.add_unary_internal(name, capacity, move |time, batch| {
+        self.add_unary_internal(name, capacity, move |_time, batch| {
             if remaining == 0 {
                 return Vec::new();
             }
@@ -3128,7 +3128,7 @@ impl<T: Timestamp, D: Send + 'static> OutputPort<T, D> {
 /// threads, channels, or execution strategy. All physical execution goes
 /// through a runtime:
 ///
-/// - [`SimpleRuntime`](crate::runtime::SimpleRuntime) — single-thread, for tests and simple scripts
+/// - `SimpleRuntime` (feature `test-utils`) — single-thread, for tests and simple scripts
 /// - [`RuntimeHandle`](crate::runtime::RuntimeHandle) — shared worker pool, for production
 pub struct LogicalDataflow<T: Timestamp> {
     pub(crate) name: String,

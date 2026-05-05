@@ -153,7 +153,7 @@ where
         };
 
         let mut buf = Vec::new();
-        encode_progress(&msg, self.time_codec.as_ref(), &mut buf).map_err(|e| Error::codec(e))?;
+        encode_progress(&msg, self.time_codec.as_ref(), &mut buf).map_err(Error::codec)?;
 
         let mut accepted = 0;
         for peer in &self.peer_senders {
@@ -181,7 +181,7 @@ where
     /// Called by the demux layer when a frame arrives on PROGRESS_CHANNEL_ID
     /// for this dataflow.
     pub fn decode_remote_progress(&self, payload: &[u8]) -> Result<ProgressMessage<T>, Error> {
-        decode_progress(payload, self.time_codec.as_ref()).map_err(|e| Error::codec(e))
+        decode_progress(payload, self.time_codec.as_ref()).map_err(Error::codec)
     }
 
     /// Get this exchange's dataflow ID.

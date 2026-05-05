@@ -87,19 +87,15 @@ impl fmt::Display for OperatorInfo {
 ///
 /// Pipeline channels deliver data within a single worker. Exchange channels
 /// route data between workers based on a partition strategy.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum ChannelKind {
     /// Data stays on the same worker (default for intra-worker edges).
+    #[default]
     Pipeline,
     /// Data is routed between workers (requires multi-worker materialization).
     Exchange,
 }
 
-impl Default for ChannelKind {
-    fn default() -> Self {
-        Self::Pipeline
-    }
-}
 
 /// A directed edge connecting an output port of one operator to an input
 /// port of another operator.

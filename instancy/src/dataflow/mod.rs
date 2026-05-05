@@ -23,7 +23,6 @@ pub use channel_operators::{
 };
 pub use channels::{ControlSignal, Envelope, PartitionStrategy, Payload};
 pub use context::SharedContext;
-pub(crate) use control::ControlBroadcast;
 pub use control::{ControlReceiver, ControlSender, WorkerControl};
 pub use dataflow_builder::{
     DataflowBuilder, DataflowBuilderConfig, LogicalDataflow, OutputPort, Pipe,
