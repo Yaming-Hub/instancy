@@ -113,6 +113,12 @@ pub trait Scope: Clone + 'static {
     /// Record a directed edge between operator ports in the dataflow graph.
     fn add_edge(&mut self, edge: EdgeInfo);
 
+    /// Set the target parallelism for an exchange operator.
+    ///
+    /// Records the downstream stage's intended parallelism, used by
+    /// stage inference to determine per-stage worker counts.
+    fn set_exchange_parallelism(&mut self, operator_index: usize, parallelism: usize);
+
     /// Increment the input port count of a registered operator.
     ///
     /// Used for operators like child scopes whose port counts grow
@@ -307,6 +313,10 @@ impl<T: Timestamp> Scope for RootScope<T> {
         self.state.lock().unwrap_or_else(|e| e.into_inner()).graph.increment_output_count(operator_index);
     }
 
+    fn set_exchange_parallelism(&mut self, operator_index: usize, parallelism: usize) {
+        self.state.lock().unwrap_or_else(|e| e.into_inner()).graph.set_exchange_parallelism(operator_index, parallelism);
+    }
+
     fn graph(&self) -> DataflowGraph {
         self.state.lock().unwrap_or_else(|e| e.into_inner()).graph.clone()
     }
@@ -464,6 +474,10 @@ impl<T: Timestamp> Scope for ChildScope<T> {
 
     fn increment_operator_output_count(&mut self, operator_index: usize) {
         self.state.lock().unwrap_or_else(|e| e.into_inner()).graph.increment_output_count(operator_index);
+    }
+
+    fn set_exchange_parallelism(&mut self, operator_index: usize, parallelism: usize) {
+        self.state.lock().unwrap_or_else(|e| e.into_inner()).graph.set_exchange_parallelism(operator_index, parallelism);
     }
 
     fn graph(&self) -> DataflowGraph {
