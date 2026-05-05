@@ -14,7 +14,7 @@
 
 use std::collections::HashMap;
 
-use instancy::{RuntimeConfig, RuntimeHandle};
+use instancy::{RuntimeConfig, RuntimeHandle, SpawnOptions};
 
 fn main() {
     let num_workers = 4;
@@ -28,17 +28,22 @@ fn main() {
     .unwrap();
 
     let mut spawned = rt
-        .spawn_multi("exchange_demo", num_workers, |_worker_idx, builder| {
-            let input = builder.input::<u64>("data");
+        .spawn_multi(
+            "exchange_demo",
+            num_workers,
+            |_worker_idx, builder| {
+                let input = builder.input::<u64>("data");
 
-            // Exchange by value — routes each element to worker (value % num_workers).
-            let exchanged = input.exchange_by_hash("by_val", |x: &u64| *x);
+                // Exchange by value — routes each element to worker (value % num_workers).
+                let exchanged = input.exchange_by_hash("by_val", |x: &u64| *x);
 
-            // Pass through to output for verification.
-            exchanged.map("pass", |_t, x| x).output("results");
+                // Pass through to output for verification.
+                exchanged.map("pass", |_t, x| x).output("results");
 
-            Ok(())
-        })
+                Ok(())
+            },
+            SpawnOptions::default(),
+        )
         .unwrap();
 
     // Take outputs from all workers.

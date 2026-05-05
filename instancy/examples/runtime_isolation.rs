@@ -10,7 +10,7 @@
 
 use instancy::DataflowBuilder;
 use instancy::scheduler::policy::FifoPolicy;
-use instancy::{RuntimeConfig, RuntimeHandle};
+use instancy::{RuntimeConfig, RuntimeHandle, SpawnOptions};
 
 #[allow(clippy::needless_return)]
 fn main() {
@@ -42,7 +42,9 @@ fn main() {
     input.map("double", |_t, x| x * 2).output("results");
     let dataflow = builder.build().expect("build failed");
 
-    let mut fast_handle = rt_fast.spawn(dataflow).expect("spawn failed");
+    let mut fast_handle = rt_fast
+        .spawn(dataflow, SpawnOptions::default())
+        .expect("spawn failed");
     let sender = fast_handle.take_input::<i32>("numbers").expect("input");
     sender.send(0, vec![1, 2, 3, 4, 5]).unwrap();
     sender.send(1, vec![10, 20]).unwrap();
@@ -64,7 +66,11 @@ fn main() {
         .output("results");
     let dataflow = builder.build().expect("build failed");
 
-    rt_batch.run_blocking(dataflow).expect("batch dataflow");
+    rt_batch
+        .spawn(dataflow, SpawnOptions::default())
+        .expect("batch dataflow spawn")
+        .join_blocking()
+        .expect("batch dataflow");
     let collector = out.collector();
     let batch_results = collector.lock().unwrap();
     println!("\nBatch runtime results:");
@@ -95,7 +101,11 @@ fn main() {
         .source("src", vec![(0u64, vec![100i32])])
         .output("out");
     let dataflow = builder.build().expect("build failed");
-    rt_batch.run_blocking(dataflow).expect("extra dataflow");
+    rt_batch
+        .spawn(dataflow, SpawnOptions::default())
+        .expect("extra dataflow spawn")
+        .join_blocking()
+        .expect("extra dataflow");
     println!("\nBatch runtime ran another dataflow after fast runtime shutdown.");
 
     println!("\nIndependent runtimes verified: cancelling one leaves others unaffected.");

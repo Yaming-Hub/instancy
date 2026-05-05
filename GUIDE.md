@@ -73,7 +73,7 @@ instancy = { git = "https://github.com/Yaming-Hub/instancy.git" }
 | `tracing` | ✅ | Structured logging via the `tracing` crate |
 | `transport` | ✅ | TCP-based cross-node communication |
 | `bincode-codec` | ❌ | Built-in bincode serialization for network data |
-| `async-io` | ❌ | Use async-io instead of tokio for transport I/O |
+| `test-utils` | ❌ | Test-only helpers, including `SimpleRuntime` |
 
 To use a specific feature set:
 
@@ -100,10 +100,11 @@ instancy makes this accessible in Rust with a clean builder API, proper error ha
 Let's start with the simplest possible instancy program:
 
 ```rust
-use instancy::DataflowBuilder;
-use instancy::SimpleRuntime;
+use instancy::{DataflowBuilder, RuntimeConfig, RuntimeHandle, SpawnOptions};
 
 fn main() {
+    let rt = RuntimeHandle::new(RuntimeConfig::default()).expect("runtime init failed");
+
     let builder = DataflowBuilder::<u64>::new("hello");
     builder
         .source("numbers", vec![(0u64, vec![1, 2, 3, 4, 5])])
@@ -111,7 +112,10 @@ fn main() {
         .output("sink");
 
     let dataflow = builder.build().expect("build failed");
-    SimpleRuntime::new().run(dataflow).expect("run failed");
+    rt.spawn(dataflow, SpawnOptions::default())
+        .expect("spawn failed")
+        .join_blocking()
+        .expect("run failed");
 }
 ```
 
@@ -122,10 +126,11 @@ This creates a stream of numbers and prints each one. Not very different from a 
 With instancy's `spawn` API, the dataflow runs on a background thread while you feed it data interactively:
 
 ```rust
-use instancy::DataflowBuilder;
-use instancy::SimpleRuntime;
+use instancy::{DataflowBuilder, RuntimeConfig, RuntimeHandle, SpawnOptions};
 
 fn main() {
+    let rt = RuntimeHandle::new(RuntimeConfig::default()).unwrap();
+
     let builder = DataflowBuilder::<u64>::new("reactive");
     let input = builder.input::<i32>("data");
     input
@@ -134,7 +139,7 @@ fn main() {
         .output("sink");
 
     let dataflow = builder.build().unwrap();
-    let mut handle = SimpleRuntime::new().spawn(dataflow).unwrap();
+    let mut handle = rt.spawn(dataflow, SpawnOptions::default()).unwrap();
     let sender = handle.take_input::<i32>("data").unwrap();
 
     // Feed data at different timestamps
@@ -248,7 +253,8 @@ let input_stream = builder.input::<String>("messages");
 After spawning the dataflow, you get a sender handle to push data:
 
 ```rust
-let mut handle = SimpleRuntime::new().spawn(dataflow).unwrap();
+let rt = RuntimeHandle::new(RuntimeConfig::default()).unwrap();
+let mut handle = rt.spawn(dataflow, SpawnOptions::default()).unwrap();
 let sender = handle.take_input::<String>("messages").unwrap();
 
 sender.send(0u64, vec!["hello".into(), "world".into()]).unwrap();
@@ -258,7 +264,7 @@ sender.close();  // Signal no more data — this is critical for termination!
 
 **Important**: Always close your inputs when done. If you forget, the dataflow will wait forever for more data. Dropping the sender also closes the input.
 
-### Async Sources (feature: `async-io`)
+### Async Sources
 
 An **async source** lets you define the data-producing logic at build time
 using an async closure. The runtime manages the producer's lifecycle —
@@ -286,7 +292,7 @@ Key differences from `input()`:
 - **Cancellation**: When the dataflow is cancelled, `send()` returns an error.
 - **Frontier support**: Call `sender.advance_to(t)` to advance the input frontier, enabling downstream `unary_notify` operators to fire notifications.
 
-The async source works with both `SimpleRuntime` and `RuntimeHandle`.
+The async source works with `RuntimeHandle`; `SimpleRuntime` remains available only for tests behind the `test-utils` feature.
 
 ### Observing Outputs
 
@@ -412,10 +418,10 @@ Here's a complete word count pipeline that demonstrates multiple operators worki
 
 ```rust
 use std::collections::{HashMap, HashSet};
-use instancy::DataflowBuilder;
-use instancy::SimpleRuntime;
+use instancy::{DataflowBuilder, RuntimeConfig, RuntimeHandle, SpawnOptions};
 
 fn main() {
+    let rt = RuntimeHandle::new(RuntimeConfig::default()).unwrap();
     let builder = DataflowBuilder::<u64>::new("wordcount");
 
     let port = builder
@@ -463,7 +469,10 @@ fn main() {
         .output("counts");
 
     let dataflow = builder.build().unwrap();
-    SimpleRuntime::new().run(dataflow).unwrap();
+    rt.spawn(dataflow, SpawnOptions::default())
+        .unwrap()
+        .join_blocking()
+        .unwrap();
 
     let data = port.collector().lock().unwrap();
     for (time, batch) in data.iter() {
@@ -528,7 +537,7 @@ input
 ### Multi-Worker Example
 
 ```rust
-use instancy::{RuntimeHandle, RuntimeConfig, DataflowBuilder};
+use instancy::{DataflowBuilder, RuntimeConfig, RuntimeHandle, SpawnOptions};
 use std::sync::Arc;
 
 struct WorkerConfig { pub multiplier: i32 }
@@ -547,30 +556,38 @@ let mut handle = rt.spawn_multi("ctx-demo", 4, |worker_idx, builder| {
         .map("scale", move |_t, x| x * cfg.multiplier)
         .output("result");
     Ok(())
-}).unwrap();
+}, SpawnOptions::default()).unwrap();
 ```
 
 ---
 
-## 4. Running Dataflows
+## 4. Execution
 
-instancy provides two runtime modes depending on your needs.
+`RuntimeHandle` is the production runtime. Create one runtime, spawn dataflows onto it, and join them when you need completion.
 
-### SimpleRuntime: Synchronous Execution
-
-`SimpleRuntime` runs a dataflow on a single thread. It's the easiest way to get started:
+### Running a Dataflow
 
 ```rust
-use instancy::SimpleRuntime;
+use instancy::{RuntimeConfig, RuntimeHandle, SpawnOptions};
 
-// Run to completion — blocks until all data is processed
-SimpleRuntime::new().run(dataflow).expect("execution failed");
+let rt = RuntimeHandle::new(RuntimeConfig {
+    worker_threads: 4,
+    ..Default::default()
+}).unwrap();
+
+rt.spawn(dataflow, SpawnOptions::default())
+    .unwrap()
+    .join_blocking()
+    .unwrap();
 ```
 
-For interactive use, `spawn` runs the dataflow on a background thread:
+### Interactive Channel I/O
 
 ```rust
-let mut handle = SimpleRuntime::new().spawn(dataflow).unwrap();
+use instancy::{RuntimeConfig, RuntimeHandle, SpawnOptions};
+
+let rt = RuntimeHandle::new(RuntimeConfig::default()).unwrap();
+let mut handle = rt.spawn(dataflow, SpawnOptions::default()).unwrap();
 let sender = handle.take_input::<i32>("data").unwrap();
 let receiver = handle.take_output::<i32>("results").unwrap();
 
@@ -583,27 +600,21 @@ let results = receiver.collect_data();
 handle.join_blocking().unwrap();
 ```
 
-### RuntimeHandle: Multi-Worker Async Execution
+### Shared Runtime
 
-For production use, `RuntimeHandle` provides a shared worker thread pool:
-
-```rust
-use instancy::{RuntimeConfig, RuntimeHandle};
-
-let rt = RuntimeHandle::new(RuntimeConfig {
-    worker_threads: 4,
-    ..Default::default()
-}).unwrap();
-```
-
-Multiple dataflows share the same thread pool. This is efficient because idle dataflows don't consume threads:
+Multiple dataflows can share the same thread pool. This is efficient because idle dataflows do not pin dedicated threads:
 
 ```rust
-// Spawn several independent dataflows on the same pool
-let h1 = rt.spawn(dataflow1).unwrap();
-let h2 = rt.spawn(dataflow2).unwrap();
-let h3 = rt.spawn(dataflow3).unwrap();
+use instancy::{RuntimeConfig, RuntimeHandle, SpawnOptions};
+
+let rt = RuntimeHandle::new(RuntimeConfig::default()).unwrap();
+
+let h1 = rt.spawn(dataflow1, SpawnOptions::default()).unwrap();
+let h2 = rt.spawn(dataflow2, SpawnOptions::default()).unwrap();
+let h3 = rt.spawn(dataflow3, SpawnOptions::default()).unwrap();
 ```
+
+`SpawnOptions` also selects sync versus async channel I/O. `SimpleRuntime` is still available for tests behind the `test-utils` feature, but production code should use `RuntimeHandle`.
 
 ### Cancellation
 
@@ -614,7 +625,7 @@ instancy supports cancellation at two levels: **per-dataflow** and **per-runtime
 Every `SpawnedDataflow` handle has a `cancel()` method:
 
 ```rust
-let mut handle = rt.spawn(dataflow).unwrap();
+let mut handle = rt.spawn(dataflow, SpawnOptions::default()).unwrap();
 let sender = handle.take_input::<i32>("data").unwrap();
 
 // Feed some data...
@@ -634,8 +645,8 @@ This is useful when you want to stop a long-running or streaming dataflow withou
 To shut down every dataflow on a runtime at once:
 
 ```rust
-let h1 = rt.spawn(dataflow1).unwrap();
-let h2 = rt.spawn(dataflow2).unwrap();
+let h1 = rt.spawn(dataflow1, SpawnOptions::default()).unwrap();
+let h2 = rt.spawn(dataflow2, SpawnOptions::default()).unwrap();
 
 // Shut down the entire runtime — cancels all running dataflows
 rt.shutdown();
@@ -663,9 +674,9 @@ Cancellation is **cooperative**: it signals operators at their next check point.
 Every cancellation carries a [`CancellationReason`](instancy::cancellation::CancellationReason) that explains *why* the dataflow was cancelled. This helps distinguish user-initiated stops from system failures:
 
 ```rust
-use instancy::{CancellationToken, CancellationReason};
+use instancy::{CancellationReason, CancellationToken, SpawnOptions};
 
-let mut handle = rt.spawn(dataflow).unwrap();
+let mut handle = rt.spawn(dataflow, SpawnOptions::default()).unwrap();
 
 // Cancel with a specific reason
 handle.cancel_with_reason(CancellationReason::UserRequested);
@@ -814,7 +825,7 @@ For parallel processing, instancy can run multiple logical workers that partitio
 `spawn_multi` creates N replicated workers, each running the same dataflow graph but processing different partitions of data:
 
 ```rust
-use instancy::{RuntimeConfig, RuntimeHandle};
+use instancy::{RuntimeConfig, RuntimeHandle, SpawnOptions};
 
 let rt = RuntimeHandle::new(RuntimeConfig {
     worker_threads: 4,
@@ -854,7 +865,7 @@ let mut multi = rt.spawn_multi("wordcount", 2, |worker_idx, builder| {
         })
         .output("counts");
     Ok(())
-}).unwrap();
+}, SpawnOptions::default()).unwrap();
 ```
 
 Each worker independently builds and runs the same graph. The `exchange_by_hash` operator is what makes this powerful: it repartitions data across workers by key, ensuring all occurrences of the same word end up at the same worker regardless of which input they came from.
@@ -885,7 +896,9 @@ are automatically cancelled via the built-in **control broadcast channel**.
 You don't need to wire up manual error forwarding — instancy handles it:
 
 ```rust
-let rt = SimpleRuntime::new();
+use instancy::{RuntimeConfig, RuntimeHandle, SpawnOptions};
+
+let rt = RuntimeHandle::new(RuntimeConfig::default()).unwrap();
 let mut multi = rt.spawn_multi("my-pipeline", 4, |worker_idx, builder| {
     let input = builder.input::<String>("data");
     input.map("process", |_t, line| {
@@ -893,7 +906,7 @@ let mut multi = rt.spawn_multi("my-pipeline", 4, |worker_idx, builder| {
         parse_line(&line).expect("bad input")
     }).output("result");
     Ok(())
-}).unwrap();
+}, SpawnOptions::default()).unwrap();
 ```
 
 When worker 2's `process` operator panics, instancy:

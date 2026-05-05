@@ -12,10 +12,9 @@
 //!
 //! ## Async completion
 //!
-//! [`RuntimeHandle::run()`] returns a [`DataflowCompletion`] future — callers
+//! [`SpawnedDataflow::join()`] returns a [`DataflowCompletion`] future — callers
 //! can `.await` it in async code or call [`.wait()`](DataflowCompletion::wait)
-//! for blocking synchronous use. [`SpawnedDataflow::join()`] likewise returns
-//! a `DataflowCompletion`.
+//! for blocking synchronous use.
 //!
 //! **No global state:** All shared state flows from runtime instances.
 
@@ -69,6 +68,79 @@ impl Default for RuntimeConfig {
             worker_threads: num_cpus(),
             schedule_policy: Box::new(PriorityWithAgingPolicy::default()),
             name: "instancy".to_string(),
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// SpawnOptions — per-spawn configuration
+// ---------------------------------------------------------------------------
+
+/// Selects the channel backend for external I/O ports when spawning a dataflow.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum IoMode {
+    /// Use `std::sync::mpsc` channels — blocking send/recv, no async runtime needed.
+    Sync,
+    /// Use `tokio::sync::mpsc` channels — enables async send/recv via
+    /// [`SpawnedDataflow::take_async_input()`] / [`SpawnedDataflow::take_async_output()`].
+    Async,
+}
+
+/// Options for spawning a dataflow on a runtime.
+///
+/// Pass to [`RuntimeHandle::spawn()`] or [`RuntimeHandle::spawn_multi()`]
+/// to configure channel mode and other per-spawn settings.
+///
+/// # Example
+///
+/// ```ignore
+/// let opts = SpawnOptions::default(); // sync channels, no metrics
+/// let opts = SpawnOptions::new().io_mode(IoMode::Async).collect_metrics(true);
+/// ```
+#[derive(Clone, Copy, Debug)]
+pub struct SpawnOptions {
+    /// Channel mode for external I/O ports. Default: [`IoMode::Sync`].
+    pub io_mode: IoMode,
+    /// Whether to collect per-operator metrics. Default: `false`.
+    pub collect_metrics: bool,
+}
+
+impl SpawnOptions {
+    /// Create spawn options with defaults.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Set the I/O channel mode.
+    pub fn io_mode(mut self, mode: IoMode) -> Self {
+        self.io_mode = mode;
+        self
+    }
+
+    /// Enable or disable per-operator metrics collection.
+    ///
+    /// When enabled, the runtime records activation counts and durations for
+    /// each operator. Retrieve via `DataflowCompletion` after join.
+    pub fn collect_metrics(mut self, enable: bool) -> Self {
+        self.collect_metrics = enable;
+        self
+    }
+}
+
+impl Default for SpawnOptions {
+    fn default() -> Self {
+        Self {
+            io_mode: IoMode::Sync,
+            collect_metrics: false,
+        }
+    }
+}
+
+impl From<IoMode> for ChannelMode {
+    fn from(mode: IoMode) -> Self {
+        match mode {
+            IoMode::Sync => ChannelMode::Sync,
+            IoMode::Async => ChannelMode::Async,
         }
     }
 }
@@ -426,43 +498,11 @@ impl RuntimeHandle {
         self.peer_registry.report_peer_recovered(node_id)
     }
 
-    /// Run a pre-loaded dataflow to completion on the worker pool.
+    /// Spawn a dataflow on the worker pool.
     ///
-    /// The dataflow must not have declared `input()` ports — use
-    /// [`spawn()`](Self::spawn) for dataflows that receive external data.
-    ///
-    /// Returns a [`DataflowCompletion`] future that resolves when the executor
-    /// finishes. The caller can `.await` it or call [`.wait()`](DataflowCompletion::wait)
-    /// to block synchronously.
-    ///
-    /// # Execution model
-    ///
-    /// The executor is registered as an `ExecutorTask` in the pool's
-    /// `ExecutorRegistry`. Pool threads cooperatively poll the task via the
-    /// `poll_run()` future, yielding after each poll budget to allow other
-    /// dataflows to make progress on the same threads.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error immediately if the dataflow has input ports.
-    /// The returned future resolves to an error if the executor encounters
-    /// an error during execution.
-    pub fn run<T: Timestamp>(&self, dataflow: LogicalDataflow<T>) -> Result<DataflowCompletion> {
-        self.run_sync(dataflow)
-    }
-
-    /// Run a pre-loaded dataflow to completion, blocking the current thread.
-    ///
-    /// Convenience wrapper: equivalent to `run(df)?.wait()`.
-    pub fn run_blocking<T: Timestamp>(&self, dataflow: LogicalDataflow<T>) -> Result<()> {
-        self.run_sync(dataflow)?.wait()
-    }
-
-    /// Spawn a dataflow on the worker pool with synchronous channel-based I/O.
-    ///
-    /// Returns a [`SpawnedDataflow`] handle with sync [`crate::InputSender`] and
-    /// [`crate::OutputReceiver`] handles. Use `spawn_async()`
-    /// for async I/O handles (feature-gated behind `async-io`).
+    /// Returns a [`SpawnedDataflow`] handle for feeding data and collecting
+    /// results. The channel mode (sync vs async) is controlled by
+    /// [`SpawnOptions::io_mode`].
     ///
     /// # Execution model
     ///
@@ -470,43 +510,28 @@ impl RuntimeHandle {
     /// `ExecutorRegistry`. Pool threads cooperatively poll the task via
     /// `poll_run()`, yielding after each poll budget to allow other
     /// dataflows to make progress on the same threads.
-    pub fn spawn<T: Timestamp>(&self, dataflow: LogicalDataflow<T>) -> Result<SpawnedDataflow<T>> {
-        self.spawn_internal(
-            dataflow,
-            ChannelMode::Sync,
-            WorkerContext::single(),
-            None,
-            None,
-        )
-    }
-
-    /// Spawn a dataflow with async channel-based I/O.
-    ///
-    /// Like [`spawn()`](Self::spawn) but wires `tokio::sync::mpsc` channels
-    /// for the external I/O ports. Use [`SpawnedDataflow::take_async_input()`]
-    /// and [`SpawnedDataflow::take_async_output()`] to obtain the async handles.
     ///
     /// # Example
     ///
     /// ```ignore
-    /// let mut handle = rt.spawn_async(dataflow)?;
+    /// // Sync I/O (default)
+    /// let mut handle = rt.spawn(dataflow, SpawnOptions::default())?;
+    /// let sender = handle.take_input::<i32>("data")?;
+    ///
+    /// // Async I/O
+    /// let opts = SpawnOptions::new().io_mode(IoMode::Async);
+    /// let mut handle = rt.spawn(dataflow, opts)?;
     /// let sender = handle.take_async_input::<i32>("data")?;
-    /// let mut receiver = handle.take_async_output::<i32>("results")?;
-    ///
-    /// sender.send(0, vec![1, 2, 3]).await?;
-    /// sender.close();
-    ///
-    /// let results = receiver.collect_data().await;
-    /// handle.join().await?;
     /// ```
-    #[cfg(feature = "async-io")]
-    pub fn spawn_async<T: Timestamp>(
+    pub fn spawn<T: Timestamp>(
         &self,
-        dataflow: LogicalDataflow<T>,
+        mut dataflow: LogicalDataflow<T>,
+        options: SpawnOptions,
     ) -> Result<SpawnedDataflow<T>> {
+        dataflow.collect_metrics = options.collect_metrics;
         self.spawn_internal(
             dataflow,
-            ChannelMode::Async,
+            options.io_mode.into(),
             WorkerContext::single(),
             None,
             None,
@@ -591,6 +616,7 @@ impl RuntimeHandle {
     ///         input.map("double", |_t, x| x * 2).output("results");
     ///         Ok(())
     ///     },
+    ///     SpawnOptions::default(),
     /// ).unwrap();
     ///
     /// // Wire each partition to its corresponding worker's input stream.
@@ -627,67 +653,16 @@ impl RuntimeHandle {
         name: &str,
         num_workers: usize,
         build: F,
+        options: SpawnOptions,
     ) -> Result<MultiSpawnedDataflow<T>>
     where
         T: Timestamp,
         F: Fn(usize, &mut DataflowBuilder<T>) -> Result<()>,
     {
-        self.spawn_multi_internal(name, num_workers, build, ChannelMode::Sync)
-    }
-
-    /// Spawn N replicated workers with async channel-based I/O.
-    ///
-    /// Like [`spawn_multi()`](Self::spawn_multi) but wires `tokio::sync::mpsc`
-    /// channels for external I/O ports. Use
-    /// [`MultiSpawnedDataflow::worker_mut()`] to access per-worker async handles.
-    #[cfg(feature = "async-io")]
-    pub fn spawn_multi_async<T, F>(
-        &self,
-        name: &str,
-        num_workers: usize,
-        build: F,
-    ) -> Result<MultiSpawnedDataflow<T>>
-    where
-        T: Timestamp,
-        F: Fn(usize, &mut DataflowBuilder<T>) -> Result<()>,
-    {
-        self.spawn_multi_internal(name, num_workers, build, ChannelMode::Async)
+        self.spawn_multi_internal(name, num_workers, build, options.io_mode.into(), options.collect_metrics)
     }
 
     // -- Private sync implementations --
-
-    fn run_sync<T: Timestamp>(&self, dataflow: LogicalDataflow<T>) -> Result<DataflowCompletion> {
-        if dataflow.has_input_ports() {
-            return Err(Error::Custom(
-                "cannot run() a dataflow with declared input ports — \
-                 use spawn() for dataflows that receive external data."
-                    .into(),
-            ));
-        }
-
-        if dataflow.operator_factories.is_empty() {
-            return Ok(DataflowCompletion::ready_ok());
-        }
-
-        let cancel = self.cancel.child_token();
-        let wake_handle = WakeHandle::new();
-        cancel.register_wake_handle(wake_handle.clone());
-        let executor = materialize_executor(
-            dataflow,
-            cancel,
-            Some(wake_handle),
-            WorkerContext::single(),
-            None,
-        )?;
-
-        let (completion, notifier) = DataflowCompletion::new();
-
-        // Register the executor as a cooperative task. The pool's worker threads
-        // will poll it via the registry's ready queue.
-        self.registry.register(Box::pin(executor), notifier);
-
-        Ok(completion)
-    }
 
     fn spawn_internal<T: Timestamp>(
         &self,
@@ -734,15 +709,7 @@ impl RuntimeHandle {
         Pin<Box<DataflowExecutor<T>>>,
         CompletionNotifier,
     )> {
-        let has_async_sources;
-        #[cfg(feature = "async-io")]
-        {
-            has_async_sources = !dataflow.async_source_wiring.is_empty();
-        }
-        #[cfg(not(feature = "async-io"))]
-        {
-            has_async_sources = false;
-        }
+        let has_async_sources = !dataflow.async_source_wiring.is_empty();
 
         if dataflow.operator_factories.is_empty()
             && dataflow.input_port_wiring.is_empty()
@@ -789,9 +756,7 @@ impl RuntimeHandle {
         }
 
         // --- Wire async source ports ---
-        #[cfg(feature = "async-io")]
         let mut pump_tasks: Vec<Box<dyn FnOnce() + Send>> = Vec::new();
-        #[cfg(feature = "async-io")]
         {
             let async_count = dataflow.async_source_wiring.len();
             input_count += async_count;
@@ -846,7 +811,6 @@ impl RuntimeHandle {
         let (completion, notifier) = DataflowCompletion::new();
 
         // --- Spawn async source pump tasks ---
-        #[cfg(feature = "async-io")]
         for (pump_idx, pump) in pump_tasks.into_iter().enumerate() {
             std::thread::Builder::new()
                 .name(format!("source-pump-{}-{}", name, pump_idx))
@@ -872,6 +836,7 @@ impl RuntimeHandle {
         num_workers: usize,
         build: F,
         mode: ChannelMode,
+        collect_metrics: bool,
     ) -> Result<MultiSpawnedDataflow<T>>
     where
         T: Timestamp,
@@ -886,7 +851,8 @@ impl RuntimeHandle {
         for worker_idx in 0..num_workers {
             let mut builder = DataflowBuilder::new(format!("{name}/worker-{worker_idx}"));
             build(worker_idx, &mut builder)?;
-            let df = builder.build()?;
+            let mut df = builder.build()?;
+            df.collect_metrics = collect_metrics;
             dataflows.push(df);
         }
 
@@ -1486,9 +1452,10 @@ impl Drop for RuntimeHandle {
 }
 
 // ---------------------------------------------------------------------------
-// SimpleRuntime — lightweight single-thread runtime
+// SimpleRuntime — lightweight single-thread runtime (test-utils only)
 // ---------------------------------------------------------------------------
 
+#[cfg(feature = "test-utils")]
 /// A lightweight runtime that runs each dataflow on a dedicated background thread.
 ///
 /// `SimpleRuntime` is the easiest way to execute a dataflow. It provides:
@@ -1521,6 +1488,7 @@ pub struct SimpleRuntime {
     cancel: CancellationToken,
 }
 
+#[cfg(feature = "test-utils")]
 impl SimpleRuntime {
     /// Create a new simple runtime.
     pub fn new() -> Self {
@@ -1583,12 +1551,11 @@ impl SimpleRuntime {
 
     /// Run a dataflow to completion and return collected metrics.
     ///
-    /// Behaves like [`run()`](Self::run) but returns the per-operator metrics
-    /// when `collect_metrics(true)` was set on the builder. Returns `None` if
-    /// metrics collection was not enabled.
+    /// Always enables metrics collection regardless of builder settings.
+    /// Returns the per-operator metrics on success.
     pub fn run_with_metrics<T: Timestamp>(
         &self,
-        dataflow: LogicalDataflow<T>,
+        mut dataflow: LogicalDataflow<T>,
     ) -> Result<Option<std::sync::Arc<crate::metrics::DataflowMetrics>>> {
         if dataflow.has_input_ports() {
             return Err(Error::Custom(
@@ -1601,6 +1568,8 @@ impl SimpleRuntime {
         if dataflow.operator_factories.is_empty() {
             return Ok(None);
         }
+
+        dataflow.collect_metrics = true;
 
         let wake_handle = WakeHandle::new();
         self.cancel.register_wake_handle(wake_handle.clone());
@@ -1657,12 +1626,10 @@ impl SimpleRuntime {
         mut dataflow: LogicalDataflow<T>,
         worker_context: WorkerContext,
     ) -> Result<SpawnedDataflow<T>> {
-        if dataflow.operator_factories.is_empty() && dataflow.input_port_wiring.is_empty() {
-            #[cfg(feature = "async-io")]
-            if dataflow.async_source_wiring.is_empty() {
-                return Err(Error::Custom("cannot spawn an empty dataflow".into()));
-            }
-            #[cfg(not(feature = "async-io"))]
+        if dataflow.operator_factories.is_empty()
+            && dataflow.input_port_wiring.is_empty()
+            && dataflow.async_source_wiring.is_empty()
+        {
             return Err(Error::Custom("cannot spawn an empty dataflow".into()));
         }
 
@@ -1701,9 +1668,7 @@ impl SimpleRuntime {
         }
 
         // --- Wire async source ports ---
-        #[cfg(feature = "async-io")]
         let mut pump_tasks: Vec<Box<dyn FnOnce() + Send>> = Vec::new();
-        #[cfg(feature = "async-io")]
         {
             let async_count = dataflow.async_source_wiring.len();
             input_count += async_count;
@@ -1748,7 +1713,6 @@ impl SimpleRuntime {
         let (completion, notifier) = DataflowCompletion::new();
 
         // --- Spawn async source pump tasks ---
-        #[cfg(feature = "async-io")]
         for (pump_idx, pump) in pump_tasks.into_iter().enumerate() {
             std::thread::Builder::new()
                 .name(format!("source-pump-{}-{}", name, pump_idx))
@@ -1877,6 +1841,7 @@ impl SimpleRuntime {
     }
 }
 
+#[cfg(feature = "test-utils")]
 impl Default for SimpleRuntime {
     fn default() -> Self {
         Self::new()
@@ -1952,15 +1917,11 @@ impl Drop for CompletionNotifier {
 ///
 /// ```ignore
 /// // Async usage
-/// let completion = rt.run(dataflow)?;
-/// completion.await?;
+/// let handle = rt.spawn(dataflow, SpawnOptions::default())?;
+/// handle.join().await?;
 ///
-/// // Sync usage
-/// let completion = rt.run(dataflow)?;
-/// completion.wait()?;
-///
-/// // Or use the convenience method
-/// rt.run_blocking(dataflow)?;
+/// // Sync (blocking) usage
+/// rt.spawn(dataflow, SpawnOptions::default())?.join_blocking()?;
 /// ```
 pub struct DataflowCompletion {
     shared: Arc<Mutex<SharedCompletionState>>,
@@ -2134,7 +2095,7 @@ impl<T: Timestamp> SpawnedDataflow<T> {
             .downcast::<crate::dataflow::channel_operators::InputSender<T, D>>()
             .map(|boxed| *boxed)
             .map_err(|_| Error::Custom(format!(
-                "input port '{name}' type downcast failed — if spawned with spawn_async(), use take_async_input()"
+                "input port '{name}' type downcast failed — if spawned with IoMode::Async, use take_async_input()"
             )))
     }
 
@@ -2169,15 +2130,14 @@ impl<T: Timestamp> SpawnedDataflow<T> {
             .downcast::<crate::dataflow::channel_operators::OutputReceiver<T, D>>()
             .map(|boxed| *boxed)
             .map_err(|_| Error::Custom(format!(
-                "output port '{name}' type downcast failed — if spawned with spawn_async(), use take_async_output()"
+                "output port '{name}' type downcast failed — if spawned with IoMode::Async, use take_async_output()"
             )))
     }
 
     /// Take the async input sender for the named port (consumes it).
     ///
-    /// Only works when the dataflow was spawned with [`RuntimeHandle::spawn_async()`].
+    /// Only works when the dataflow was spawned with async I/O (`IoMode::Async`).
     /// Returns an error if the port was wired as sync or does not exist.
-    #[cfg(feature = "async-io")]
     pub fn take_async_input<D: Clone + Send + 'static>(
         &mut self,
         name: &str,
@@ -2202,16 +2162,15 @@ impl<T: Timestamp> SpawnedDataflow<T> {
             .map(|boxed| *boxed)
             .map_err(|_| {
                 Error::Custom(format!(
-                    "input port '{name}' was not wired for async I/O (use spawn_async)"
+                    "input port '{name}' was not wired for async I/O (spawn with IoMode::Async)"
                 ))
             })
     }
 
     /// Take the async output receiver for the named port (consumes it).
     ///
-    /// Only works when the dataflow was spawned with [`RuntimeHandle::spawn_async()`].
+    /// Only works when the dataflow was spawned with async I/O (`IoMode::Async`).
     /// Returns an error if the port was wired as sync or does not exist.
-    #[cfg(feature = "async-io")]
     pub fn take_async_output<D: Send + 'static>(
         &mut self,
         name: &str,
@@ -2236,7 +2195,7 @@ impl<T: Timestamp> SpawnedDataflow<T> {
             .map(|boxed| *boxed)
             .map_err(|_| {
                 Error::Custom(format!(
-                    "output port '{name}' was not wired for async I/O (use spawn_async)"
+                    "output port '{name}' was not wired for async I/O (spawn with IoMode::Async)"
                 ))
             })
     }
@@ -2335,6 +2294,8 @@ pub struct MultiSpawnedDataflow<T: Timestamp> {
     /// Shared cancellation token for all workers in this dataflow.
     /// Cancelling this token cascades to all worker tokens.
     /// `None` for single-worker dataflows (no intermediate token).
+    /// Held for lifetime — dropping cancels all workers.
+    #[allow(dead_code)]
     dataflow_cancel: Option<CancellationToken>,
     _phantom: PhantomData<T>,
 }
@@ -2394,7 +2355,6 @@ impl<T: Timestamp> MultiSpawnedDataflow<T> {
     }
 
     /// Take the async input sender from a specific worker.
-    #[cfg(feature = "async-io")]
     pub fn take_async_input<D: Clone + Send + 'static>(
         &mut self,
         worker_idx: usize,
@@ -2410,7 +2370,6 @@ impl<T: Timestamp> MultiSpawnedDataflow<T> {
     }
 
     /// Take the async output receiver from a specific worker.
-    #[cfg(feature = "async-io")]
     pub fn take_async_output<D: Send + 'static>(
         &mut self,
         worker_idx: usize,
@@ -2505,7 +2464,6 @@ impl<T: Timestamp> MultiSpawnedDataflow<T> {
     ///
     /// Only works when the dataflow was spawned with async channels.
     /// All-or-nothing semantics (see [`take_all_inputs`](Self::take_all_inputs)).
-    #[cfg(feature = "async-io")]
     pub fn take_all_async_inputs<D: Clone + Send + 'static>(
         &mut self,
         name: &str,
@@ -2534,7 +2492,6 @@ impl<T: Timestamp> MultiSpawnedDataflow<T> {
     ///
     /// Only works when the dataflow was spawned with async channels.
     /// All-or-nothing semantics (see [`take_all_inputs`](Self::take_all_inputs)).
-    #[cfg(feature = "async-io")]
     pub fn take_all_async_outputs<D: Send + 'static>(
         &mut self,
         name: &str,
@@ -3013,7 +2970,6 @@ fn materialize_executor<T: Timestamp>(
         channel_factories,
         subgraph_builder,
         probes,
-        #[cfg(feature = "async-io")]
         probe_notifiers,
         stages,
         ..
@@ -3053,20 +3009,13 @@ fn materialize_executor<T: Timestamp>(
     executor.set_progress_tracker(tracker);
 
     // Register probes
-    #[cfg(not(feature = "async-io"))]
-    for (op_idx, probe) in probes {
-        executor.register_probe(op_idx, probe);
-    }
-    #[cfg(feature = "async-io")]
-    {
-        debug_assert_eq!(
-            probes.len(),
-            probe_notifiers.len(),
-            "probes and probe_notifiers must have matching lengths"
-        );
-        for ((op_idx, probe), notifier) in probes.into_iter().zip(probe_notifiers) {
-            executor.register_probe(op_idx, probe, notifier);
-        }
+    debug_assert_eq!(
+        probes.len(),
+        probe_notifiers.len(),
+        "probes and probe_notifiers must have matching lengths"
+    );
+    for ((op_idx, probe), notifier) in probes.into_iter().zip(probe_notifiers) {
+        executor.register_probe(op_idx, probe, notifier);
     }
 
     Ok(executor)
@@ -3221,17 +3170,17 @@ mod tests {
         .unwrap();
 
         let builder = DataflowBuilder::<u64>::new("rt_run");
-        let port = builder
+        builder
             .source("nums", vec![(0u64, vec![1i32, 2, 3])])
             .map("double", |_t, x| x * 2)
             .output("results");
         let dataflow = builder.build().unwrap();
 
-        rt.run_blocking(dataflow).unwrap();
-
-        let c = port.collector();
-        let r = c.lock().unwrap();
-        assert_eq!(r[0].1, vec![2, 4, 6]);
+        let mut handle = rt.spawn(dataflow, SpawnOptions::default()).unwrap();
+        let receiver = handle.take_output::<i32>("results").unwrap();
+        let results = receiver.collect_data();
+        assert_eq!(results[0].1, vec![2, 4, 6]);
+        handle.join_blocking().unwrap();
     }
 
     #[test]
@@ -3249,7 +3198,7 @@ mod tests {
         input.map("double", |_t, x| x * 2).output("results");
         let dataflow = builder.build().unwrap();
 
-        let mut handle = rt.spawn(dataflow).unwrap();
+        let mut handle = rt.spawn(dataflow, SpawnOptions::default()).unwrap();
         let sender = handle.take_input::<i32>("data").unwrap();
         sender.send(0u64, vec![10, 20]).unwrap();
         sender.close();
@@ -3275,7 +3224,7 @@ mod tests {
         input.output("out");
         let dataflow = builder.build().unwrap();
 
-        let handle = rt.spawn(dataflow).unwrap();
+        let handle = rt.spawn(dataflow, SpawnOptions::default()).unwrap();
         rt.shutdown();
         // Should complete (cancelled), not hang
         let _ = handle.join_blocking();
@@ -3297,12 +3246,12 @@ mod tests {
                 .source("data", vec![(0u64, vec![i as i32])])
                 .output("out");
             let dataflow = builder.build().unwrap();
-            rt.run_blocking(dataflow).unwrap();
+            rt.spawn(dataflow, SpawnOptions::default()).unwrap().join_blocking().unwrap();
         }
     }
 
     #[test]
-    fn runtime_handle_run_rejects_input_ports() {
+    fn runtime_handle_spawn_accepts_input_ports() {
         use crate::dataflow::DataflowBuilder;
 
         let rt = RuntimeHandle::new(RuntimeConfig {
@@ -3311,13 +3260,20 @@ mod tests {
         })
         .unwrap();
 
-        let builder = DataflowBuilder::<u64>::new("bad");
-        builder.input::<i32>("x").output("y");
+        let builder = DataflowBuilder::<u64>::new("spawn_with_inputs");
+        let input = builder.input::<i32>("x");
+        input.map("inc", |_t, x| x + 1).output("y");
         let dataflow = builder.build().unwrap();
 
-        let result = rt.run(dataflow);
-        assert!(result.is_err());
-        assert!(format!("{}", result.unwrap_err()).contains("input ports"));
+        let mut handle = rt.spawn(dataflow, SpawnOptions::default()).unwrap();
+        let sender = handle.take_input::<i32>("x").unwrap();
+        sender.send(0, vec![1, 2, 3]).unwrap();
+        sender.close();
+
+        let receiver = handle.take_output::<i32>("y").unwrap();
+        let results = receiver.collect_data();
+        assert_eq!(results[0].1, vec![2, 3, 4]);
+        handle.join_blocking().unwrap();
     }
 
     #[test]
@@ -3381,8 +3337,8 @@ mod tests {
         let dataflow = builder.build().unwrap();
 
         // Exercise the async completion path: .await on DataflowCompletion
-        let completion = rt.run(dataflow).unwrap();
-        completion.await.unwrap();
+        let handle = rt.spawn(dataflow, SpawnOptions::default()).unwrap();
+        handle.join().await.unwrap();
     }
 
     #[test]
@@ -3401,11 +3357,10 @@ mod tests {
         let dataflow = builder.build().unwrap();
 
         // Drop without calling join() — should cancel and not hang
-        let _handle = rt.spawn(dataflow).unwrap();
+        let _handle = rt.spawn(dataflow, SpawnOptions::default()).unwrap();
         // handle dropped here — cancellation + detach, no blocking
     }
 
-    #[cfg(feature = "async-io")]
     #[tokio::test]
     async fn spawn_async_roundtrip() {
         use crate::dataflow::DataflowBuilder;
@@ -3421,7 +3376,7 @@ mod tests {
         input.map("mul10", |_t, x| x * 10).output("out");
         let dataflow = builder.build().unwrap();
 
-        let mut handle = rt.spawn_async(dataflow).unwrap();
+        let mut handle = rt.spawn(dataflow, SpawnOptions::new().io_mode(IoMode::Async)).unwrap();
         let sender = handle.take_async_input::<i32>("data").unwrap();
         let mut receiver = handle.take_async_output::<i32>("out").unwrap();
 
@@ -3439,7 +3394,6 @@ mod tests {
         handle.join().await.unwrap();
     }
 
-    #[cfg(feature = "async-io")]
     #[tokio::test]
     async fn sync_take_on_async_port_gives_helpful_error() {
         use crate::dataflow::DataflowBuilder;
@@ -3455,12 +3409,12 @@ mod tests {
         input.output("out");
         let dataflow = builder.build().unwrap();
 
-        let mut handle = rt.spawn_async(dataflow).unwrap();
+        let mut handle = rt.spawn(dataflow, SpawnOptions::new().io_mode(IoMode::Async)).unwrap();
 
         // Using sync take_input on an async-wired port should give a helpful error
         let err = handle.take_input::<i32>("data").unwrap_err();
         assert!(
-            format!("{err}").contains("spawn_async"),
+            format!("{err}").contains("IoMode::Async"),
             "error should hint at async mode: {err}"
         );
 
@@ -3468,12 +3422,11 @@ mod tests {
         assert!(err.is_err());
         let msg = format!("{}", err.err().unwrap());
         assert!(
-            msg.contains("spawn_async"),
+            msg.contains("IoMode::Async"),
             "error should hint at async mode: {msg}"
         );
     }
 
-    #[cfg(feature = "async-io")]
     #[tokio::test]
     async fn spawn_async_multiple_timestamps() {
         use crate::dataflow::DataflowBuilder;
@@ -3489,7 +3442,7 @@ mod tests {
         input.output("out");
         let dataflow = builder.build().unwrap();
 
-        let mut handle = rt.spawn_async(dataflow).unwrap();
+        let mut handle = rt.spawn(dataflow, SpawnOptions::new().io_mode(IoMode::Async)).unwrap();
         let sender = handle.take_async_input::<i32>("data").unwrap();
         let mut receiver = handle.take_async_output::<i32>("out").unwrap();
 
@@ -3508,7 +3461,6 @@ mod tests {
         handle.join().await.unwrap();
     }
 
-    #[cfg(feature = "async-io")]
     #[tokio::test]
     async fn async_input_sender_is_clone() {
         use crate::dataflow::DataflowBuilder;
@@ -3524,7 +3476,7 @@ mod tests {
         input.output("out");
         let dataflow = builder.build().unwrap();
 
-        let mut handle = rt.spawn_async(dataflow).unwrap();
+        let mut handle = rt.spawn(dataflow, SpawnOptions::new().io_mode(IoMode::Async)).unwrap();
         let sender1 = handle.take_async_input::<i32>("data").unwrap();
         let sender2 = sender1.clone();
 
@@ -3702,6 +3654,7 @@ mod tests {
                     input.map("inc", |_t, x| x + 1).output("out");
                     Ok(())
                 },
+                SpawnOptions::default(),
             )
             .unwrap();
 
@@ -3940,7 +3893,6 @@ mod tests {
     }
 
     #[test]
-    #[cfg(feature = "async-io")]
     fn take_all_async_inputs_on_sync_spawned_returns_error() {
         let rt = SimpleRuntime::new();
         let mut multi = rt
@@ -3981,7 +3933,7 @@ mod tests {
                     .exchange_by_hash("mod2", |x: &i32| *x as u64)
                     .output("results");
                 Ok(())
-            })
+            }, SpawnOptions::default())
             .unwrap();
 
         // Get per-worker outputs and inputs.
@@ -4037,7 +3989,7 @@ mod tests {
                 let input = builder.input::<i32>("data");
                 input.exchange("by_key", |x: &i32| *x as u64).output("out");
                 Ok(())
-            })
+            }, SpawnOptions::default())
             .unwrap();
 
         let out = multi.take_output::<i32>(0, "out").unwrap();
@@ -4070,7 +4022,7 @@ mod tests {
                     .map("add100", |_t, x| x + 100)
                     .output("results");
                 Ok(())
-            })
+            }, SpawnOptions::default())
             .unwrap();
 
         let out0 = multi.take_output::<i32>(0, "results").unwrap();
@@ -4120,7 +4072,7 @@ mod tests {
                     .exchange_by_hash("mod2", |x: &i32| *x as u64)
                     .output("out");
                 Ok(())
-            })
+            }, SpawnOptions::default())
             .unwrap();
 
         let out0 = multi.take_output::<i32>(0, "out").unwrap();
@@ -4207,7 +4159,7 @@ mod tests {
                     })
                     .output("results");
                 Ok(())
-            })
+            }, SpawnOptions::default())
             .unwrap();
 
         let out0 = multi.take_output::<i32>(0, "results").unwrap();
@@ -4264,7 +4216,7 @@ mod tests {
                     })
                     .output("results");
                 Ok(())
-            })
+            }, SpawnOptions::default())
             .unwrap();
 
         let out0 = multi.take_output::<i32>(0, "results").unwrap();
@@ -4332,7 +4284,7 @@ mod tests {
                     })
                     .output("results");
                 Ok(())
-            })
+            }, SpawnOptions::default())
             .unwrap();
 
         let out0 = multi.take_output::<i32>(0, "results").unwrap();
@@ -4392,7 +4344,7 @@ mod tests {
                     })
                     .output("results");
                 Ok(())
-            })
+            }, SpawnOptions::default())
             .unwrap();
 
         let out0 = multi.take_output::<i32>(0, "results").unwrap();
@@ -4455,7 +4407,7 @@ mod tests {
                     })
                     .output("results");
                 Ok(())
-            })
+            }, SpawnOptions::default())
             .unwrap();
 
         // Each worker sends values 0..8 — exchange routes each value to
@@ -4603,7 +4555,7 @@ mod tests {
                     .exchange_by_hash("by_val", |x: &NonSerializable| x.value as u64)
                     .output("out");
                 Ok(())
-            })
+            }, SpawnOptions::default())
             .unwrap();
 
         let out0 = multi.take_output::<NonSerializable>(0, "out").unwrap();
@@ -4653,7 +4605,7 @@ mod tests {
                     .exchange_by_hash("route", |x: &NonSerializable| x.value as u64)
                     .output("out");
                 Ok(())
-            })
+            }, SpawnOptions::default())
             .unwrap();
 
         let outputs: Vec<_> = (0..num_workers)
@@ -4712,7 +4664,7 @@ mod tests {
                     .filter("positive", |_t, x| x.value > 0)
                     .output("out");
                 Ok(())
-            })
+            }, SpawnOptions::default())
             .unwrap();
 
         let outputs: Vec<_> = (0..2)
@@ -4810,7 +4762,7 @@ mod tests {
             .output("result");
 
         let dataflow = builder.build().unwrap();
-        let mut handle = rt.spawn(dataflow).unwrap();
+        let mut handle = rt.spawn(dataflow, SpawnOptions::default()).unwrap();
 
         let sender = handle.take_input::<i32>("data").unwrap();
         sender.send(0, vec![1, 2, 3]).unwrap();
@@ -4842,7 +4794,7 @@ mod tests {
                     .map("multiply", move |_t, x| x * cfg.multiplier)
                     .output("result");
                 Ok(())
-            })
+            }, SpawnOptions::default())
             .unwrap();
 
         // Send to worker 0
@@ -5069,7 +5021,6 @@ mod tests {
     // source_async tests
     // -----------------------------------------------------------------------
 
-    #[cfg(feature = "async-io")]
     #[test]
     fn source_async_basic_roundtrip() {
         use crate::dataflow::DataflowBuilder;
@@ -5098,7 +5049,6 @@ mod tests {
         handle.join_blocking().unwrap();
     }
 
-    #[cfg(feature = "async-io")]
     #[test]
     fn source_async_empty_producer() {
         use crate::dataflow::DataflowBuilder;
@@ -5119,7 +5069,6 @@ mod tests {
         handle.join_blocking().unwrap();
     }
 
-    #[cfg(feature = "async-io")]
     #[test]
     fn source_async_cancellation() {
         use crate::dataflow::DataflowBuilder;
@@ -5148,7 +5097,6 @@ mod tests {
         let _ = handle.join_blocking();
     }
 
-    #[cfg(feature = "async-io")]
     #[test]
     fn source_async_with_runtime_handle() {
         use crate::dataflow::DataflowBuilder;
@@ -5169,7 +5117,7 @@ mod tests {
         pipe.map("inc", |_t, x| x + 100).output("out");
         let dataflow = builder.build().unwrap();
 
-        let mut handle = rt.spawn(dataflow).unwrap();
+        let mut handle = rt.spawn(dataflow, SpawnOptions::default()).unwrap();
         let receiver = handle.take_output::<i32>("out").unwrap();
         let data: Vec<i32> = receiver
             .collect_data()
@@ -5183,7 +5131,6 @@ mod tests {
         handle.join_blocking().unwrap();
     }
 
-    #[cfg(feature = "async-io")]
     #[test]
     fn source_async_with_frontier_advancement() {
         use crate::dataflow::DataflowBuilder;
@@ -5384,7 +5331,7 @@ mod tests {
                 .map("noop", |_t, x| x)
                 .output("out");
             Ok(())
-        });
+        }, SpawnOptions::default());
         // Should succeed — parallelism matches worker count.
         match &result {
             Ok(_) => {}
@@ -5411,7 +5358,7 @@ mod tests {
                 .map("noop", |_t, x| x)
                 .output("out");
             Ok(())
-        });
+        }, SpawnOptions::default());
         // Should fail — parallelism (4) != num_workers (2).
         match result {
             Err(e) => {
@@ -5443,7 +5390,7 @@ mod tests {
                 .map("noop", |_t, x| x)
                 .output("out");
             Ok(())
-        });
+        }, SpawnOptions::default());
         match result {
             Err(e) => {
                 let err_msg = format!("{e}");

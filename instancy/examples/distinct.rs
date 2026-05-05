@@ -15,7 +15,7 @@
 use std::collections::{HashMap, HashSet};
 
 use instancy::DataflowBuilder;
-use instancy::SimpleRuntime;
+use instancy::{RuntimeConfig, RuntimeHandle, SpawnOptions};
 
 fn main() {
     let builder = DataflowBuilder::<u64>::new("distinct_demo");
@@ -58,8 +58,10 @@ fn main() {
         .output("unique_events");
 
     let dataflow = builder.build().expect("build failed");
-    SimpleRuntime::new()
-        .run(dataflow)
+    let rt = RuntimeHandle::new(RuntimeConfig::default()).unwrap();
+    rt.spawn(dataflow, SpawnOptions::default())
+        .unwrap()
+        .join_blocking()
         .expect("execution failed");
 
     let collector = port.collector();

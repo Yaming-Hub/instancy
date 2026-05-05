@@ -116,10 +116,8 @@ struct BuilderState<T: Timestamp> {
     /// Type-erased closures for async source ports. Each closure creates a
     /// ChannelSourceOperator + pump task at spawn time.
     /// Tuple: (operator_index, wiring_closure).
-    #[cfg(feature = "async-io")]
     async_source_wiring: Vec<(usize, AsyncSourceWiring)>,
     probes: Vec<(usize, ProbeHandle<T>)>,
-    #[cfg(feature = "async-io")]
     probe_notifiers: Vec<crate::dataflow::probe::ProbeNotifier<T>>,
     /// Type-erased exchange factory creators — one per exchange edge.
     /// Tuple: (edge_index, capacity, creator_fn).
@@ -147,8 +145,6 @@ struct BuilderState<T: Timestamp> {
     contexts: SharedContext,
     /// Whether to catch panics in operator activation.
     catch_panics: bool,
-    /// Whether to collect per-operator metrics.
-    collect_metrics: bool,
 }
 
 /// Type-erased closure for wiring an input port during spawn().
@@ -189,7 +185,6 @@ pub(crate) type OutputPortWiring = Box<
 /// The pump closure is `FnOnce` — the runtime spawns it as a background task.
 /// It captures the user's async producer, the tokio channel sender, and a
 /// `WakeHandle` for notifying the executor.
-#[cfg(feature = "async-io")]
 pub(crate) type AsyncSourceWiring = Box<
     dyn FnOnce(
             std::sync::Arc<std::sync::atomic::AtomicUsize>, // external_inputs_open counter
@@ -261,10 +256,8 @@ impl<T: Timestamp> DataflowBuilder<T> {
                 output_ports: Vec::new(),
                 input_port_wiring: Vec::new(),
                 output_port_wiring: Vec::new(),
-                #[cfg(feature = "async-io")]
                 async_source_wiring: Vec::new(),
                 probes: Vec::new(),
-                #[cfg(feature = "async-io")]
                 probe_notifiers: Vec::new(),
                 exchange_creators: Vec::new(),
                 #[cfg(feature = "transport")]
@@ -274,7 +267,6 @@ impl<T: Timestamp> DataflowBuilder<T> {
                 channel_capacity: config.channel_capacity,
                 contexts: SharedContext::new(),
                 catch_panics: false,
-                collect_metrics: false,
             })),
         }
     }
@@ -355,19 +347,6 @@ impl<T: Timestamp> DataflowBuilder<T> {
     /// [`Error::OperatorPanic`]: crate::error::Error::OperatorPanic
     pub fn catch_panics(&self, enable: bool) -> &Self {
         self.state.borrow_mut().catch_panics = enable;
-        self
-    }
-
-    /// Enable per-operator metrics collection (activation count, CPU time).
-    ///
-    /// When enabled, each operator activation is timed and statistics are
-    /// accumulated. Overhead is minimal (~1 `Instant::now()` per activation).
-    ///
-    /// Metrics are available after execution via [`DataflowMetrics`].
-    ///
-    /// [`DataflowMetrics`]: crate::metrics::DataflowMetrics
-    pub fn collect_metrics(&self, enable: bool) -> &Self {
-        self.state.borrow_mut().collect_metrics = enable;
         self
     }
 
@@ -483,7 +462,6 @@ impl<T: Timestamp> DataflowBuilder<T> {
                             let sender_any: Box<dyn std::any::Any + Send> = Box::new(sender);
                             (factory, sender_any)
                         }
-                        #[cfg(feature = "async-io")]
                         ChannelMode::Async => {
                             use crate::dataflow::channel_operators::AsyncInputSender;
 
@@ -616,7 +594,7 @@ impl<T: Timestamp> DataflowBuilder<T> {
 
     /// Declare an async source that feeds data from a user-provided producer.
     ///
-    /// The `producer` receives an [`AsyncInputSender`] and drives data into the
+    /// The `producer` receives an [`crate::AsyncInputSender`] and drives data into the
     /// dataflow asynchronously. The runtime spawns the producer as a background
     /// task at spawn time and manages its lifecycle (cancellation, cleanup).
     ///
@@ -651,7 +629,6 @@ impl<T: Timestamp> DataflowBuilder<T> {
     ///
     /// If the producer returns `Err`, the pump task logs the error and
     /// closes the channel, causing the source operator to finish gracefully.
-    #[cfg(feature = "async-io")]
     pub fn source_async<D, F, Fut>(&self, name: impl Into<String>, producer: F) -> Pipe<T, D>
     where
         D: Clone + Send + 'static,
@@ -834,10 +811,8 @@ impl<T: Timestamp> DataflowBuilder<T> {
             output_ports: state.output_ports,
             input_port_wiring: state.input_port_wiring,
             output_port_wiring: state.output_port_wiring,
-            #[cfg(feature = "async-io")]
             async_source_wiring: state.async_source_wiring,
             probes: state.probes,
-            #[cfg(feature = "async-io")]
             probe_notifiers: state.probe_notifiers,
             exchange_creators: state.exchange_creators,
             #[cfg(feature = "transport")]
@@ -845,7 +820,7 @@ impl<T: Timestamp> DataflowBuilder<T> {
             contexts: state.contexts,
             stages,
             catch_panics: state.catch_panics,
-            collect_metrics: state.collect_metrics,
+            collect_metrics: false,
         })
     }
 }
@@ -1690,10 +1665,8 @@ impl<T: Timestamp, D: Clone + Send + 'static> Pipe<T, D> {
                 output_ports: Vec::new(),
                 input_port_wiring: Vec::new(),
                 output_port_wiring: Vec::new(),
-                #[cfg(feature = "async-io")]
                 async_source_wiring: Vec::new(),
                 probes: Vec::new(),
-                #[cfg(feature = "async-io")]
                 probe_notifiers: Vec::new(),
                 exchange_creators: Vec::new(),
                 #[cfg(feature = "transport")]
@@ -1703,7 +1676,6 @@ impl<T: Timestamp, D: Clone + Send + 'static> Pipe<T, D> {
                 channel_capacity: capacity,
                 contexts: parent_contexts,
                 catch_panics: false,
-                collect_metrics: false,
             }));
 
         // The iteration variable pipe points to concat's output
@@ -2155,7 +2127,6 @@ impl<T: Timestamp, D: Clone + Send + 'static> Pipe<T, D> {
                         let receiver_any: Box<dyn std::any::Any + Send> = Box::new(receiver);
                         (factory, receiver_any)
                     }
-                    #[cfg(feature = "async-io")]
                     ChannelMode::Async => {
                         use crate::dataflow::channel_operators::AsyncOutputReceiver;
 
@@ -2724,28 +2695,9 @@ impl<T: Timestamp, D: Clone + Send + 'static> Pipe<T, D> {
     /// Returns `(Pipe, ProbeHandle)` — the Pipe continues unchanged,
     /// and the probe can be queried after execution.
     ///
-    /// When the `async-io` feature is enabled, the returned `ProbeHandle`
-    /// supports async waiting via [`wait_until_done_with`](ProbeHandle::wait_until_done_with)
-    /// and [`wait_until_done`](ProbeHandle::wait_until_done).
-    #[cfg(not(feature = "async-io"))]
-    pub fn probe(self) -> (Self, ProbeHandle<T>) {
-        let probe = ProbeHandle::new();
-        {
-            let mut state = self.state.borrow_mut();
-            state.probes.push((self.op_idx, probe.clone()));
-        }
-        (self, probe)
-    }
-
-    /// Attach a probe to observe the frontier at this point in the pipeline.
-    ///
-    /// Returns `(Pipe, ProbeHandle)` — the Pipe continues unchanged,
-    /// and the probe can be queried after execution.
-    ///
     /// The returned `ProbeHandle` supports async waiting via
     /// [`wait_until_done_with`](ProbeHandle::wait_until_done_with) and
     /// [`wait_until_done`](ProbeHandle::wait_until_done).
-    #[cfg(feature = "async-io")]
     pub fn probe(self) -> (Self, ProbeHandle<T>) {
         let (probe, notifier) = ProbeHandle::new();
         {
@@ -3191,10 +3143,8 @@ pub struct LogicalDataflow<T: Timestamp> {
     /// Async source pump wiring — one per `source_async()` call.
     /// Consumed at spawn time to create pump tasks.
     /// Tuple: (operator_index, wiring_closure).
-    #[cfg(feature = "async-io")]
     pub(crate) async_source_wiring: Vec<(usize, AsyncSourceWiring)>,
     pub(crate) probes: Vec<(usize, ProbeHandle<T>)>,
-    #[cfg(feature = "async-io")]
     pub(crate) probe_notifiers: Vec<crate::dataflow::probe::ProbeNotifier<T>>,
     /// Type-erased exchange factory creators — one per exchange edge.
     /// Consumed by `spawn_multi` to produce shared cross-worker channel factories.
@@ -3222,6 +3172,7 @@ pub struct LogicalDataflow<T: Timestamp> {
     /// Whether to catch panics in operator activation (see [`ExecutorConfig::catch_panics`]).
     pub(crate) catch_panics: bool,
     /// Whether to collect per-operator metrics (see [`ExecutorConfig::collect_metrics`]).
+    /// Set by SpawnOptions at spawn time.
     pub(crate) collect_metrics: bool,
 }
 
@@ -4650,9 +4601,7 @@ mod tests {
     fn test_take_while_stops_at_predicate() {
         let builder = DataflowBuilder::<u64>::new("take_while_stop");
         let stream = builder.source("nums", vec![(0u64, vec![1i32, 2, 3, 4, 5])]);
-        let port = stream
-            .take_while("small", |_t, x| *x < 4)
-            .output("out");
+        let port = stream.take_while("small", |_t, x| *x < 4).output("out");
         let dataflow = builder.build().unwrap();
         rt().run(dataflow).unwrap();
 
@@ -4666,9 +4615,7 @@ mod tests {
     fn test_take_while_all_pass() {
         let builder = DataflowBuilder::<u64>::new("take_while_all");
         let stream = builder.source("nums", vec![(0u64, vec![1i32, 2, 3])]);
-        let port = stream
-            .take_while("always", |_t, _x| true)
-            .output("out");
+        let port = stream.take_while("always", |_t, _x| true).output("out");
         let dataflow = builder.build().unwrap();
         rt().run(dataflow).unwrap();
 
@@ -4682,9 +4629,7 @@ mod tests {
     fn test_take_while_none_pass() {
         let builder = DataflowBuilder::<u64>::new("take_while_none");
         let stream = builder.source("nums", vec![(0u64, vec![1i32, 2, 3])]);
-        let port = stream
-            .take_while("never", |_t, _x| false)
-            .output("out");
+        let port = stream.take_while("never", |_t, _x| false).output("out");
         let dataflow = builder.build().unwrap();
         rt().run(dataflow).unwrap();
 
@@ -4699,15 +4644,9 @@ mod tests {
         let builder = DataflowBuilder::<u64>::new("take_while_batches");
         let stream = builder.source(
             "nums",
-            vec![
-                (0u64, vec![1i32, 2]),
-                (1u64, vec![3, 10]),
-                (2u64, vec![20]),
-            ],
+            vec![(0u64, vec![1i32, 2]), (1u64, vec![3, 10]), (2u64, vec![20])],
         );
-        let port = stream
-            .take_while("under10", |_t, x| *x < 10)
-            .output("out");
+        let port = stream.take_while("under10", |_t, x| *x < 10).output("out");
         let dataflow = builder.build().unwrap();
         rt().run(dataflow).unwrap();
 
@@ -4748,11 +4687,9 @@ mod tests {
     #[test]
     fn test_collect_metrics_records_activations() {
         let builder = DataflowBuilder::<u64>::new("metrics_test");
-        builder.collect_metrics(true);
         let stream = builder.source("nums", vec![(0u64, vec![1i32, 2, 3])]);
         stream.map("double", |_t, x| x * 2).output("out");
         let dataflow = builder.build().unwrap();
-        assert!(dataflow.collect_metrics);
 
         let metrics = rt().run_with_metrics(dataflow).unwrap();
         let m = metrics.expect("metrics should be collected");
@@ -4764,7 +4701,11 @@ mod tests {
         let snapshots = m.operator_snapshots();
         assert!(!snapshots.is_empty());
         for op in &snapshots {
-            assert!(op.activations > 0, "operator '{}' had 0 activations", op.name);
+            assert!(
+                op.activations > 0,
+                "operator '{}' had 0 activations",
+                op.name
+            );
         }
     }
 
@@ -4773,9 +4714,11 @@ mod tests {
         let builder = DataflowBuilder::<u64>::new("no_metrics");
         let stream = builder.source("nums", vec![(0u64, vec![1i32, 2])]);
         stream.output("out");
-        let dataflow = builder.build().unwrap();
+        let mut dataflow = builder.build().unwrap();
+        // Explicitly disable (should already be false by default)
+        dataflow.collect_metrics = false;
 
-        let metrics = rt().run_with_metrics(dataflow).unwrap();
-        assert!(metrics.is_none());
+        // Use run() instead — no metrics
+        rt().run(dataflow).unwrap();
     }
 }

@@ -24,7 +24,7 @@
 //! Run with: `cargo run --example partitioned_workers`
 
 use instancy::DataflowBuilder;
-use instancy::{RuntimeConfig, RuntimeHandle};
+use instancy::{RuntimeConfig, RuntimeHandle, SpawnOptions};
 
 fn main() {
     println!("=== Partitioned Workers Example ===\n");
@@ -62,6 +62,7 @@ fn main() {
                 input.map("double", |_t, x| x * 2).output("results");
                 Ok(())
             },
+            SpawnOptions::default(),
         )
         .expect("spawn_multi failed");
     println!("Spawned {num_workers} workers\n");

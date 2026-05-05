@@ -1,7 +1,7 @@
 //! Example: End-to-end async dataflow execution with async I/O.
 //!
 //! Demonstrates the full async story:
-//! - `spawn()` / `run()` are sync (fast CPU work, no reason to be async)
+//! - `spawn()` is sync (fast CPU work, no reason to be async)
 //! - Input feeding uses `AsyncInputSender::send().await` (yields on backpressure)
 //! - Output collection uses `AsyncOutputReceiver::recv().await` (yields waiting for data)
 //! - Completion uses `DataflowCompletion.await` (real Future)
@@ -9,7 +9,7 @@
 //! ```text
 //! [tokio async task]                     [instancy worker pool]
 //!     │                                         │
-//!     │── rt.spawn_async(df)? ────────────────►│ registers ExecutorTask
+//!     │── rt.spawn(df, SpawnOptions::new().io_mode(IoMode::Async))? ─►│ registers ExecutorTask
 //!     │                                         │
 //!     │── sender.send(data).await ────────────►│ WakeHandle notifies pool
 //!     │   (yields on backpressure)               │     │
@@ -22,11 +22,11 @@
 //!     │◄── Ok(()) ─────────────────────────────│
 //! ```
 //!
-//! Run with: `cargo run --all-features --example async_spawn`
+//! Run with: `cargo run --all-features --example async_io_channels`
 
 use instancy::DataflowBuilder;
 use instancy::scheduler::policy::FifoPolicy;
-use instancy::{RuntimeConfig, RuntimeHandle};
+use instancy::{IoMode, RuntimeConfig, RuntimeHandle, SpawnOptions};
 
 #[tokio::main(flavor = "current_thread")]
 async fn main() {
@@ -39,7 +39,7 @@ async fn main() {
     })
     .expect("failed to create runtime");
 
-    // --- Pipeline 1: async input/output with spawn_async ---
+    // --- Pipeline 1: async input/output with async SpawnOptions ---
 
     let builder = DataflowBuilder::<u64>::new("double-pipeline");
     let input = builder.input::<i32>("numbers");
@@ -49,8 +49,10 @@ async fn main() {
         .output("results");
     let dataflow = builder.build().expect("build failed");
 
-    // spawn_async() wires tokio::sync::mpsc channels for I/O
-    let mut handle = rt.spawn_async(dataflow).expect("spawn failed");
+    // Async SpawnOptions wires tokio::sync::mpsc channels for I/O
+    let mut handle = rt
+        .spawn(dataflow, SpawnOptions::new().io_mode(IoMode::Async))
+        .expect("spawn failed");
 
     // Async input: yields on backpressure instead of blocking
     let sender = handle
@@ -84,7 +86,7 @@ async fn main() {
     handle.join().await.expect("pipeline 1 failed");
     println!("Pipeline 1 completed\n");
 
-    // --- Pipeline 2: sync run + async completion ---
+    // --- Pipeline 2: sync spawn + async completion ---
 
     let builder = DataflowBuilder::<u64>::new("squares");
     let out = builder
@@ -93,13 +95,16 @@ async fn main() {
         .output("results");
     let dataflow = builder.build().expect("build failed");
 
-    // run() is sync — returns DataflowCompletion which IS a real Future
-    let completion = rt.run(dataflow).expect("run failed");
+    // spawn() is sync — join() returns DataflowCompletion which IS a real Future
+    let completion = rt
+        .spawn(dataflow, SpawnOptions::default())
+        .expect("run failed")
+        .join();
     completion.await.expect("pipeline 2 failed");
 
     let collector = out.collector();
     let data = collector.lock().unwrap();
-    println!("Pipeline 2 results (sync run + async await):");
+    println!("Pipeline 2 results (sync spawn + async await):");
     for (time, vals) in data.iter() {
         println!("  t={time}: {vals:?}");
     }
@@ -119,8 +124,12 @@ async fn main() {
             .map("inc", |_t, x| x + 100)
             .output("out");
         let dataflow = builder.build().expect("build failed");
-        // run() returns sync, DataflowCompletion is a real Future
-        completions.push(rt.run(dataflow).expect("run failed"));
+        // spawn() returns sync, join() yields a real Future
+        completions.push(
+            rt.spawn(dataflow, SpawnOptions::default())
+                .expect("run failed")
+                .join(),
+        );
     }
 
     // Await all three concurrently via tokio::join!

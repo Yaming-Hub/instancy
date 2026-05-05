@@ -8,7 +8,7 @@
 //!   [`OutputEvent`]s to an external channel for consumption.
 //!
 //! Both operators support synchronous (`std::sync::mpsc`) and asynchronous
-//! (`tokio::sync::mpsc`, feature-gated behind `async-io`) channel backends.
+//! (`tokio::sync::mpsc`) channel backends.
 //! The channel type is chosen at spawn time via `ChannelMode`.
 
 use std::collections::VecDeque;
@@ -43,7 +43,6 @@ pub(crate) enum ChannelMode {
     /// Use `std::sync::mpsc` channels — no async runtime required.
     Sync,
     /// Use `tokio::sync::mpsc` channels — enables async send/recv.
-    #[cfg(feature = "async-io")]
     Async,
 }
 
@@ -54,7 +53,6 @@ pub(crate) enum ChannelMode {
 /// Unified receiver for input channels, abstracting over std and tokio backends.
 pub(crate) enum InputRecv<T> {
     Std(mpsc::Receiver<T>),
-    #[cfg(feature = "async-io")]
     Tokio(tokio::sync::mpsc::Receiver<T>),
 }
 
@@ -71,7 +69,6 @@ impl<T> InputRecv<T> {
                 mpsc::TryRecvError::Empty => RecvError::Empty,
                 mpsc::TryRecvError::Disconnected => RecvError::Disconnected,
             }),
-            #[cfg(feature = "async-io")]
             Self::Tokio(rx) => rx.try_recv().map_err(|e| match e {
                 tokio::sync::mpsc::error::TryRecvError::Empty => RecvError::Empty,
                 tokio::sync::mpsc::error::TryRecvError::Disconnected => RecvError::Disconnected,
@@ -83,7 +80,6 @@ impl<T> InputRecv<T> {
 /// Unified sender for output channels, abstracting over std and tokio backends.
 pub(crate) enum OutputSend<T> {
     Std(mpsc::SyncSender<T>),
-    #[cfg(feature = "async-io")]
     Tokio(tokio::sync::mpsc::Sender<T>),
 }
 
@@ -100,7 +96,6 @@ impl<T> OutputSend<T> {
                 mpsc::TrySendError::Full(v) => SendError::Full(v),
                 mpsc::TrySendError::Disconnected(v) => SendError::Disconnected(v),
             }),
-            #[cfg(feature = "async-io")]
             Self::Tokio(tx) => tx.try_send(item).map_err(|e| match e {
                 tokio::sync::mpsc::error::TrySendError::Full(v) => SendError::Full(v),
                 tokio::sync::mpsc::error::TrySendError::Closed(v) => SendError::Disconnected(v),
@@ -603,21 +598,19 @@ impl<T: Timestamp, D: Send + 'static> OutputReceiver<T, D> {
 /// A handle for sending data into a dataflow input port asynchronously.
 ///
 /// Created by [`crate::SpawnedDataflow::take_async_input`] when the dataflow was
-/// spawned with [`crate::RuntimeHandle::spawn_async`]. Backed by a
+/// spawned with [`crate::IoMode::Async`]. Backed by a
 /// `tokio::sync::mpsc::Sender` — the `send()` method yields when the channel
 /// is full (backpressure) instead of blocking the calling thread.
 ///
 /// When a `WakeHandle` is wired (set during runtime spawn), every `send()`,
 /// `advance_to()`, and `Drop` notifies the executor's wake handle so
 /// that a sleeping async executor wakes promptly when external data arrives.
-#[cfg(feature = "async-io")]
 #[derive(Clone)]
 pub struct AsyncInputSender<T: Timestamp, D: Send + 'static> {
     sender: tokio::sync::mpsc::Sender<InputEvent<T, D>>,
     wake_handle: Option<WakeHandle>,
 }
 
-#[cfg(feature = "async-io")]
 impl<T: Timestamp, D: Send + 'static> AsyncInputSender<T, D> {
     pub(crate) fn with_wake_handle(
         sender: tokio::sync::mpsc::Sender<InputEvent<T, D>>,
@@ -683,7 +676,6 @@ impl<T: Timestamp, D: Send + 'static> AsyncInputSender<T, D> {
     }
 }
 
-#[cfg(feature = "async-io")]
 impl<T: Timestamp, D: Send + 'static> Drop for AsyncInputSender<T, D> {
     fn drop(&mut self) {
         if let Some(wh) = &self.wake_handle {
@@ -695,20 +687,18 @@ impl<T: Timestamp, D: Send + 'static> Drop for AsyncInputSender<T, D> {
 /// A handle for receiving output from a dataflow output port asynchronously.
 ///
 /// Created by [`crate::SpawnedDataflow::take_async_output`] when the dataflow was
-/// spawned with [`crate::RuntimeHandle::spawn_async`]. Backed by a
+/// spawned with [`crate::IoMode::Async`]. Backed by a
 /// `tokio::sync::mpsc::Receiver` — the `recv()` method yields when no data
 /// is available, resuming when the dataflow produces output.
 ///
 /// Each successful `recv()` notifies the executor's `WakeHandle`, allowing
 /// a backpressure-blocked sink operator to retry sending.
-#[cfg(feature = "async-io")]
 pub struct AsyncOutputReceiver<T: Timestamp, D: Send + 'static> {
     receiver: tokio::sync::mpsc::Receiver<OutputEvent<T, D>>,
     /// Wake handle to notify when capacity is freed (unblocks backpressured sinks).
     wake_handle: Option<WakeHandle>,
 }
 
-#[cfg(feature = "async-io")]
 impl<T: Timestamp, D: Send + 'static> AsyncOutputReceiver<T, D> {
     pub(crate) fn new(receiver: tokio::sync::mpsc::Receiver<OutputEvent<T, D>>) -> Self {
         Self {
@@ -767,7 +757,6 @@ impl<T: Timestamp, D: Send + 'static> AsyncOutputReceiver<T, D> {
     }
 }
 
-#[cfg(feature = "async-io")]
 impl<T: Timestamp, D: Send + 'static> Drop for AsyncOutputReceiver<T, D> {
     fn drop(&mut self) {
         // Notify the executor that this receiver is gone so backpressure-blocked

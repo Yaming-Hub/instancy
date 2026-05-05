@@ -369,7 +369,6 @@ impl CancellationToken {
     ///     result = do_work() => { /* completed */ }
     /// }
     /// ```
-    #[cfg(feature = "async-io")]
     pub async fn cancelled_async(&self) {
         loop {
             if self.is_cancelled() {
@@ -722,8 +721,6 @@ mod tests {
 
     #[test]
     fn idempotent_cancel_only_notifies_once() {
-        use std::sync::atomic::AtomicUsize;
-
         let token = CancellationToken::new();
         let wake = WakeHandle::new();
         wake.take_notification();

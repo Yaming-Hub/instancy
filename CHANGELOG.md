@@ -5,6 +5,32 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.2.0] - 2026-05-05
+
+### Changed
+
+#### Runtime API Simplification
+- **BREAKING:** `RuntimeHandle::spawn()` now takes `SpawnOptions` parameter
+- **BREAKING:** `RuntimeHandle::spawn_multi()` now takes `SpawnOptions` parameter
+- **BREAKING:** `SimpleRuntime` moved behind `test-utils` feature (use `RuntimeHandle` for production)
+- Introduced `SpawnOptions` struct and `IoMode` enum to consolidate channel mode selection
+- All examples updated to use `RuntimeHandle` with `SpawnOptions`
+
+### Removed
+- **BREAKING:** Removed `async-io` feature — async I/O is now always available (tokio is required)
+- **BREAKING:** Removed `RuntimeHandle::run()` and `run_blocking()` — use `spawn().join()` instead
+- **BREAKING:** Removed `RuntimeHandle::spawn_async()` — use `spawn(df, SpawnOptions::new().io_mode(IoMode::Async))`
+- **BREAKING:** Removed `RuntimeHandle::spawn_multi_async()` — use `spawn_multi(..., SpawnOptions::new().io_mode(IoMode::Async))`
+
+### Features
+
+| Feature | Default | Description |
+|---|---|---|
+| `transport` | ✅ | TCP transport layer (Tokio-based muxer/demuxer) |
+| `tracing` | ✅ | Structured logging via the `tracing` crate |
+| `bincode-codec` | ❌ | Bincode-based codec implementation |
+| `test-utils` | ❌ | SimpleRuntime and test helpers |
+
 ## [0.1.1] - 2026-05-03
 
 ### Fixed
@@ -36,14 +62,11 @@ Initial release of instancy — an async reimplementation of
 - Observation: `probe` (frontier tracking), `output` (result collection)
 
 #### Execution Modes
-- `SimpleRuntime` — synchronous single-threaded execution
 - `RuntimeHandle` — multi-worker async execution on a shared thread pool
 - `spawn` / `spawn_multi` — background dataflow execution with channel I/O
 - `spawn_cluster` — multi-node distributed execution over TCP
-
-#### Async I/O (`async-io` feature)
+- `SpawnOptions` with `IoMode::Sync` / `IoMode::Async` for channel mode selection
 - `AsyncInputSender` and `AsyncOutputReceiver` for async channel-based I/O
-- `spawn_async` for fully async dataflow lifecycle management
 
 #### Networking (`transport` feature)
 - Application-managed connections via `ConnectionManager` trait
@@ -86,7 +109,8 @@ Initial release of instancy — an async reimplementation of
 | `transport` | ✅ | TCP transport layer (Tokio-based muxer/demuxer) |
 | `tracing` | ✅ | Structured logging via the `tracing` crate |
 | `bincode-codec` | ❌ | Bincode-based codec implementation |
-| `async-io` | ❌ | Async channel-based I/O for spawned dataflows |
+| `test-utils` | ❌ | SimpleRuntime and test helpers |
 
+[0.2.0]: https://github.com/Yaming-Hub/instancy/compare/v0.1.1...v0.2.0
 [0.1.1]: https://github.com/Yaming-Hub/instancy/compare/v0.1.0...v0.1.1
 [0.1.0]: https://github.com/Yaming-Hub/instancy/releases/tag/v0.1.0

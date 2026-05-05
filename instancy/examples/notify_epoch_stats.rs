@@ -42,7 +42,7 @@ use std::collections::HashMap;
 use std::fmt;
 
 use instancy::DataflowBuilder;
-use instancy::{RuntimeConfig, RuntimeHandle};
+use instancy::{RuntimeConfig, RuntimeHandle, SpawnOptions};
 
 /// Per-epoch running statistics, maintained incrementally as data arrives.
 #[derive(Clone)]
@@ -158,7 +158,10 @@ fn main() {
     // --- Execute ---
     let config = RuntimeConfig::default();
     let rt = RuntimeHandle::new(config).unwrap();
-    rt.run_blocking(dataflow).unwrap();
+    rt.spawn(dataflow, SpawnOptions::default())
+        .unwrap()
+        .join_blocking()
+        .unwrap();
 
     // --- Print results ---
     println!("Results:");

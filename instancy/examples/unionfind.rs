@@ -17,7 +17,7 @@
 use std::cmp::Ordering;
 
 use instancy::DataflowBuilder;
-use instancy::SimpleRuntime;
+use instancy::{RuntimeConfig, RuntimeHandle, SpawnOptions};
 
 fn main() {
     let builder = DataflowBuilder::<u64>::new("unionfind");
@@ -108,8 +108,11 @@ fn main() {
     println!("  t=2: (5,6), (4,6)");
     println!();
 
-    let rt = SimpleRuntime::new();
-    rt.run(dataflow).expect("execution failed");
+    let rt = RuntimeHandle::new(RuntimeConfig::default()).unwrap();
+    rt.spawn(dataflow, SpawnOptions::default())
+        .unwrap()
+        .join_blocking()
+        .expect("execution failed");
 
     let collector = output.collector();
     let data = collector.lock().unwrap();

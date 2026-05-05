@@ -17,7 +17,7 @@ use std::collections::{HashMap, HashSet};
 
 use instancy::DataflowBuilder;
 use instancy::IterateResult;
-use instancy::SimpleRuntime;
+use instancy::{RuntimeConfig, RuntimeHandle, SpawnOptions};
 
 fn main() {
     // Build a sample undirected graph:
@@ -122,8 +122,11 @@ fn main() {
     println!("                    8 --- 9");
     println!();
 
-    let rt = SimpleRuntime::new();
-    rt.run(dataflow).expect("execution failed");
+    let rt = RuntimeHandle::new(RuntimeConfig::default()).unwrap();
+    rt.spawn(dataflow, SpawnOptions::default())
+        .unwrap()
+        .join_blocking()
+        .expect("execution failed");
 
     let collector = results.collector();
     let data = collector.lock().unwrap();

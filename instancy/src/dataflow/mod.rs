@@ -17,7 +17,6 @@ pub mod stage;
 pub mod stream;
 pub mod wired_operators;
 
-#[cfg(feature = "async-io")]
 pub use channel_operators::{AsyncInputSender, AsyncOutputReceiver};
 pub use channel_operators::{
     ChannelSinkOperator, ChannelSourceOperator, InputSender, OutputReceiver,

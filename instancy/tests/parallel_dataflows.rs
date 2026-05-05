@@ -14,7 +14,7 @@ use instancy::DataflowId;
 use instancy::Result;
 use instancy::communication::transport_session::PeerConnection;
 use instancy::{ClusterTopology, NodeConfig};
-use instancy::{RuntimeConfig, RuntimeHandle};
+use instancy::{RuntimeConfig, RuntimeHandle, SpawnOptions};
 
 /// Default timeout for test completion.
 const TEST_TIMEOUT: Duration = Duration::from_secs(60);
@@ -58,7 +58,7 @@ async fn shared_pool_parallel_dataflows_no_exchange() {
             .map("double", |_t, x| x * 2)
             .output("results");
         let logical = builder.build().unwrap();
-        let spawned = rt.spawn(logical).unwrap();
+        let spawned = rt.spawn(logical, SpawnOptions::default()).unwrap();
         dataflows.push(spawned);
     }
 
@@ -155,6 +155,7 @@ async fn shared_pool_parallel_dataflows_with_exchange() {
                     exchanged.map("pass", |_t, x| x).output("results");
                     Ok(())
                 },
+                SpawnOptions::default(),
             )
             .unwrap();
         dataflows.push(df);
@@ -256,7 +257,7 @@ async fn stress_shared_pool_many_dataflows() {
             .map("triple", |_t, x| x * 3)
             .output("results");
         let logical = builder.build().unwrap();
-        dataflows.push(rt.spawn(logical).unwrap());
+        dataflows.push(rt.spawn(logical, SpawnOptions::default()).unwrap());
     }
 
     let mut senders = Vec::new();

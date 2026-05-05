@@ -10,9 +10,9 @@
 //! - Monitoring progress for external scheduling decisions
 //! - Testing that frontiers advance correctly
 //!
-//! ## Async waiting (requires `async-io` feature)
+//! ## Async waiting
 //!
-//! When the `async-io` feature is enabled, [`ProbeHandle`] provides async
+//! [`ProbeHandle`] provides async
 //! methods for awaiting frontier changes:
 //!
 //! - [`wait_until_done_with`](ProbeHandle::wait_until_done_with) — awaits
@@ -35,7 +35,7 @@ use crate::progress::timestamp::Timestamp;
 ///
 /// Thread-safe: can be shared across threads via `Clone`.
 ///
-/// When the `async-io` feature is enabled, provides async methods for
+/// Provides async methods for
 /// awaiting frontier changes without polling.
 #[derive(Clone, Debug)]
 pub struct ProbeHandle<T: Timestamp> {
@@ -43,7 +43,6 @@ pub struct ProbeHandle<T: Timestamp> {
     frontier: Arc<Mutex<Antichain<T>>>,
     /// Async watch channel receiver for frontier change notifications.
     /// The sender is held separately by the executor (via `ProbeNotifier`).
-    #[cfg(feature = "async-io")]
     watch_rx: tokio::sync::watch::Receiver<Antichain<T>>,
 }
 
@@ -55,12 +54,10 @@ pub struct ProbeHandle<T: Timestamp> {
 ///
 /// When this is dropped (e.g., the executor shuts down), all async waiters
 /// will receive a channel-closed error and can detect termination.
-#[cfg(feature = "async-io")]
 pub(crate) struct ProbeNotifier<T: Timestamp> {
     watch_tx: tokio::sync::watch::Sender<Antichain<T>>,
 }
 
-#[cfg(feature = "async-io")]
 impl<T: Timestamp> ProbeNotifier<T> {
     /// Notify all watchers of a new frontier value.
     pub(crate) fn notify(&self, frontier: &Antichain<T>) {
@@ -72,22 +69,10 @@ impl<T: Timestamp> ProbeNotifier<T> {
 impl<T: Timestamp> ProbeHandle<T> {
     /// Create a new probe handle with an initial frontier at `T::minimum()`.
     ///
-    /// Without `async-io`, returns just the handle. With `async-io`, also
-    /// returns a [`ProbeNotifier`] that the executor uses to send updates.
-    #[cfg(not(feature = "async-io"))]
-    pub fn new() -> Self {
-        Self {
-            frontier: Arc::new(Mutex::new(Antichain::from_elem(T::minimum()))),
-        }
-    }
-
-    /// Create a new probe handle with an initial frontier at `T::minimum()`.
-    ///
     /// Returns `(handle, notifier)` — the notifier is held by the executor
     /// to send frontier updates that wake async waiters. When the notifier
     /// is dropped, async methods return promptly.
-    #[cfg(feature = "async-io")]
-    pub fn new() -> (Self, ProbeNotifier<T>) {
+    pub(crate) fn new() -> (Self, ProbeNotifier<T>) {
         let initial = Antichain::from_elem(T::minimum());
         let (watch_tx, watch_rx) = tokio::sync::watch::channel(initial.clone());
         let handle = Self {
@@ -130,8 +115,7 @@ impl<T: Timestamp> ProbeHandle<T> {
     }
 }
 
-// Async waiting methods — only available with `async-io` feature.
-#[cfg(feature = "async-io")]
+// Async waiting methods.
 impl<T: Timestamp> ProbeHandle<T> {
     /// Wait asynchronously until the frontier advances past `time`.
     ///
@@ -215,10 +199,9 @@ impl<T: Timestamp> ProbeHandle<T> {
     }
 }
 
-#[cfg(not(feature = "async-io"))]
 impl<T: Timestamp> Default for ProbeHandle<T> {
     fn default() -> Self {
-        Self::new()
+        Self::new().0
     }
 }
 
@@ -226,12 +209,6 @@ impl<T: Timestamp> Default for ProbeHandle<T> {
 mod tests {
     use super::*;
 
-    #[cfg(not(feature = "async-io"))]
-    fn make_probe<T: Timestamp>() -> ProbeHandle<T> {
-        ProbeHandle::new()
-    }
-
-    #[cfg(feature = "async-io")]
     fn make_probe<T: Timestamp>() -> ProbeHandle<T> {
         let (handle, _notifier) = ProbeHandle::new();
         handle
@@ -274,7 +251,7 @@ mod tests {
     }
 }
 
-#[cfg(all(test, feature = "async-io"))]
+#[cfg(test)]
 mod async_tests {
     use super::*;
 
@@ -355,7 +332,9 @@ mod async_tests {
         let mut handles = Vec::new();
         for _ in 0..5 {
             let p = probe.clone();
-            handles.push(tokio::spawn(async move { p.wait_until_done_with(&3).await }));
+            handles.push(tokio::spawn(
+                async move { p.wait_until_done_with(&3).await },
+            ));
         }
 
         tokio::task::yield_now().await;

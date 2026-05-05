@@ -37,7 +37,6 @@
 //! - `tracing` *(default)* — structured logging via the `tracing` crate
 //! - `transport` *(default)* — TCP-based cross-node communication
 //! - `bincode-codec` — bincode serialization for exchange data
-//! - `async-io` — async input/output channels
 //! - `test-utils` — helpers for testing dataflow programs
 
 // Enable automatic doc(cfg) annotations on docs.rs builds so that
@@ -67,7 +66,6 @@ pub mod worker_pool;
 pub use dataflow::dataflow_builder::IterateResult;
 pub use dataflow::id::DataflowId;
 pub use dataflow::stream::StreamEdge;
-#[cfg(feature = "async-io")]
 pub use dataflow::{AsyncInputSender, AsyncOutputReceiver};
 pub use dataflow::{ControlReceiver, ControlSender, WorkerControl};
 pub use dataflow::{
@@ -77,8 +75,10 @@ pub use dataflow::{InputSender, OutputReceiver};
 
 // Runtime
 pub use runtime::{
-    DataflowCompletion, RuntimeConfig, RuntimeHandle, SimpleRuntime, SpawnedDataflow,
+    DataflowCompletion, IoMode, RuntimeConfig, RuntimeHandle, SpawnOptions, SpawnedDataflow,
 };
+#[cfg(feature = "test-utils")]
+pub use runtime::SimpleRuntime;
 
 // Execution / cluster topology
 pub use execute::{ClusterTopology, NodeConfig};

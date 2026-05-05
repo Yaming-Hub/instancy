@@ -36,10 +36,11 @@ tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
 ### Hello World
 
 ```rust
-use instancy::DataflowBuilder;
-use instancy::SimpleRuntime;
+use instancy::{DataflowBuilder, RuntimeConfig, RuntimeHandle, SpawnOptions};
 
 fn main() {
+    let rt = RuntimeHandle::new(RuntimeConfig::default()).expect("runtime init failed");
+
     let builder = DataflowBuilder::<u64>::new("hello");
     let port = builder
         .source("greetings", vec![
@@ -49,7 +50,10 @@ fn main() {
         .output("output");
 
     let dataflow = builder.build().expect("build failed");
-    SimpleRuntime::new().run(dataflow).expect("execution failed");
+    rt.spawn(dataflow, SpawnOptions::default())
+        .expect("spawn failed")
+        .join_blocking()
+        .expect("execution failed");
 
     let data = port.collector().lock().unwrap();
     for (time, batch) in data.iter() {
@@ -62,10 +66,11 @@ fn main() {
 
 ```rust
 use std::collections::{HashMap, HashSet};
-use instancy::DataflowBuilder;
-use instancy::SimpleRuntime;
+use instancy::{DataflowBuilder, RuntimeConfig, RuntimeHandle, SpawnOptions};
 
 fn main() {
+    let rt = RuntimeHandle::new(RuntimeConfig::default()).unwrap();
+
     let builder = DataflowBuilder::<u64>::new("wordcount");
     let port = builder
         .source("lines", vec![
@@ -97,7 +102,10 @@ fn main() {
         .output("counts");
 
     let dataflow = builder.build().unwrap();
-    SimpleRuntime::new().run(dataflow).unwrap();
+    rt.spawn(dataflow, SpawnOptions::default())
+        .unwrap()
+        .join_blocking()
+        .unwrap();
 
     for (time, batch) in port.collector().lock().unwrap().iter() {
         println!("t={time}: {batch:?}");
@@ -108,10 +116,11 @@ fn main() {
 ### Spawned Dataflow with Channel I/O
 
 ```rust
-use instancy::DataflowBuilder;
-use instancy::SimpleRuntime;
+use instancy::{DataflowBuilder, RuntimeConfig, RuntimeHandle, SpawnOptions};
 
 fn main() {
+    let rt = RuntimeHandle::new(RuntimeConfig::default()).unwrap();
+
     let builder = DataflowBuilder::<u64>::new("pipeline");
     let input = builder.input::<i32>("numbers");
     input
@@ -120,7 +129,7 @@ fn main() {
         .output("results");
 
     let dataflow = builder.build().unwrap();
-    let mut handle = SimpleRuntime::new().spawn(dataflow).unwrap();
+    let mut handle = rt.spawn(dataflow, SpawnOptions::default()).unwrap();
 
     // Feed data from the main thread
     let sender = handle.take_input::<i32>("numbers").unwrap();
@@ -171,32 +180,35 @@ Higher-level operators (joins, windowing, etc.) can be composed from these primi
 
 ### Execution Modes
 
-**SimpleRuntime** — synchronous, single-threaded execution for simple pipelines:
+**RuntimeHandle** is the production runtime. Create one runtime, then `spawn()` dataflows and `join()` them when you need completion.
 
 ```rust
-// Run to completion (blocking)
-SimpleRuntime::new().run(dataflow)?;
+use instancy::{RuntimeConfig, RuntimeHandle, SpawnOptions};
 
-// Spawn on background thread with channel I/O
-let handle = SimpleRuntime::new().spawn(dataflow)?;
-```
-
-**RuntimeHandle** — multi-worker execution with a shared thread pool:
-
-```rust
 let rt = RuntimeHandle::new(RuntimeConfig {
     worker_threads: 4,
     ..Default::default()
 })?;
 
-// Spawn a dataflow with 2 logical workers — the closure builds the
-// graph independently for each worker.
+// Run to completion (blocking)
+rt.spawn(dataflow, SpawnOptions::default())?
+    .join_blocking()?;
+
+// Or keep the handle for channel I/O and cancellation
+let handle = rt.spawn(dataflow, SpawnOptions::default())?;
+```
+
+Use `SpawnOptions` to pick sync or async channel I/O, and pass it to multi-worker execution too:
+
+```rust
 let handle = rt.spawn_multi("my-dataflow", 2, |worker_idx, builder| {
     let input = builder.input::<i32>("data");
     input.map("double", |_t, x| x * 2).output("results");
     Ok(())
-})?;
+}, SpawnOptions::default())?;
 ```
+
+`SimpleRuntime` still exists for tests behind the `test-utils` feature, but production code should use `RuntimeHandle`.
 
 **Cluster mode** — multi-node distributed execution over TCP:
 
@@ -223,7 +235,7 @@ let handle = rt.spawn_cluster(
 | `transport` | ✅ | TCP transport layer (Tokio-based muxer/demuxer) |
 | `tracing` | ✅ | Structured logging via the `tracing` crate |
 | `bincode-codec` | ❌ | Bincode-based codec implementation |
-| `async-io` | ❌ | Async channel-based I/O for spawned dataflows |
+| `test-utils` | ❌ | Test-only helpers, including `SimpleRuntime` |
 
 Disable default features for a minimal build with no async runtime dependency:
 
@@ -269,7 +281,7 @@ cargo run -p instancy --example <name>
 | `hello_dataflow` | Minimal source → output pipeline |
 | `simple_pipeline` | Multi-stage pipeline with map/filter |
 | `spawn_pipeline` | Background execution with channel I/O |
-| `async_spawn` | End-to-end async dataflow with async I/O *(requires `--features async-io`)* |
+| `async_spawn` | End-to-end async dataflow with async I/O |
 | `event_driven` | Real-time event processing with channel-based I/O |
 
 **Operators & Patterns**
@@ -342,7 +354,7 @@ cargo test --all-features --test cluster_tcp
 instancy/
 ├── src/
 │   ├── lib.rs                    # Public API
-│   ├── runtime.rs                # RuntimeHandle, SimpleRuntime, spawn_cluster
+│   ├── runtime.rs                # RuntimeHandle, SpawnOptions, test-only SimpleRuntime, spawn_cluster
 │   ├── dataflow/
 │   │   ├── dataflow_builder.rs   # DataflowBuilder — operator chaining API
 │   │   ├── executor.rs           # Async sweep-based executor

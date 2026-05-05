@@ -16,7 +16,7 @@
 
 use instancy::DataflowBuilder;
 use instancy::IterateResult;
-use instancy::SimpleRuntime;
+use instancy::{RuntimeConfig, RuntimeHandle, SpawnOptions};
 
 fn main() {
     let iterations: u32 = std::env::args()
@@ -51,8 +51,11 @@ fn main() {
 
     let start = std::time::Instant::now();
 
-    let rt = SimpleRuntime::new();
-    rt.run(dataflow).expect("execution failed");
+    let rt = RuntimeHandle::new(RuntimeConfig::default()).unwrap();
+    rt.spawn(dataflow, SpawnOptions::default())
+        .unwrap()
+        .join_blocking()
+        .expect("execution failed");
 
     let elapsed = start.elapsed();
 

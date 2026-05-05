@@ -11,7 +11,7 @@
 
 use instancy::DataflowBuilder;
 use instancy::IterateResult;
-use instancy::SimpleRuntime;
+use instancy::{RuntimeConfig, RuntimeHandle, SpawnOptions};
 
 fn main() {
     let builder = DataflowBuilder::<u64>::new("loop_demo");
@@ -40,8 +40,11 @@ fn main() {
     println!("Input: [1, 3, 7, 25]");
     println!();
 
-    let rt = SimpleRuntime::new();
-    rt.run(dataflow).expect("execution failed");
+    let rt = RuntimeHandle::new(RuntimeConfig::default()).unwrap();
+    rt.spawn(dataflow, SpawnOptions::default())
+        .unwrap()
+        .join_blocking()
+        .expect("execution failed");
 
     let collector = output_port.collector();
     let results = collector.lock().unwrap();

@@ -40,7 +40,7 @@
 use std::collections::HashMap;
 
 use instancy::DataflowBuilder;
-use instancy::{RuntimeConfig, RuntimeHandle};
+use instancy::{RuntimeConfig, RuntimeHandle, SpawnOptions};
 
 fn main() {
     println!("=== Per-Stage Parallelism Example ===\n");
@@ -100,6 +100,7 @@ fn main() {
 
                 Ok(())
             },
+            SpawnOptions::default(),
         )
         .expect("spawn_multi should succeed with matching parallelism");
 
@@ -151,6 +152,7 @@ fn main() {
                 .output("out");
             Ok(())
         },
+        SpawnOptions::default(),
     );
 
     match result {
@@ -181,6 +183,7 @@ fn main() {
                     .output("out");
                 Ok(())
             },
+            SpawnOptions::default(),
         )
         .expect("single-stage should always succeed");
 

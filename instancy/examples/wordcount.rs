@@ -15,7 +15,7 @@
 use std::collections::{HashMap, HashSet};
 
 use instancy::DataflowBuilder;
-use instancy::SimpleRuntime;
+use instancy::{RuntimeConfig, RuntimeHandle, SpawnOptions};
 
 fn main() {
     let builder = DataflowBuilder::<u64>::new("wordcount");
@@ -83,8 +83,10 @@ fn main() {
         dataflow.edge_count(),
     );
 
-    SimpleRuntime::new()
-        .run(dataflow)
+    let rt = RuntimeHandle::new(RuntimeConfig::default()).unwrap();
+    rt.spawn(dataflow, SpawnOptions::default())
+        .unwrap()
+        .join_blocking()
         .expect("execution failed");
 
     let collector = port.collector();

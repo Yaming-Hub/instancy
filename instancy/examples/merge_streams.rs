@@ -1,9 +1,11 @@
 /// Demonstrates binary and concat operators for merging multiple streams.
 use instancy::DataflowBuilder;
 use instancy::Pipe;
-use instancy::SimpleRuntime;
+use instancy::{RuntimeConfig, RuntimeHandle, SpawnOptions};
 
 fn main() {
+    let rt = RuntimeHandle::new(RuntimeConfig::default()).unwrap();
+
     // --- Binary: pair two streams element-wise ---
     let builder = DataflowBuilder::<u64>::new("binary_demo");
     let names = builder.source(
@@ -35,7 +37,10 @@ fn main() {
     let binary_out = paired.output("binary_results");
 
     let dataflow = builder.build().unwrap();
-    SimpleRuntime::new().run(dataflow).unwrap();
+    rt.spawn(dataflow, SpawnOptions::default())
+        .unwrap()
+        .join_blocking()
+        .unwrap();
 
     println!("=== Binary (pair names with scores) ===");
     for (t, batch) in binary_out.collector().lock().unwrap().iter() {
@@ -58,7 +63,10 @@ fn main() {
     let concat_out = all_logs.output("all_logs");
 
     let dataflow = builder.build().unwrap();
-    SimpleRuntime::new().run(dataflow).unwrap();
+    rt.spawn(dataflow, SpawnOptions::default())
+        .unwrap()
+        .join_blocking()
+        .unwrap();
 
     println!("\n=== Concat (merge 3 log streams) ===");
     for (t, batch) in concat_out.collector().lock().unwrap().iter() {
@@ -76,7 +84,10 @@ fn main() {
     let merge_out = all.output("sorted");
 
     let dataflow = builder.build().unwrap();
-    SimpleRuntime::new().run(dataflow).unwrap();
+    rt.spawn(dataflow, SpawnOptions::default())
+        .unwrap()
+        .join_blocking()
+        .unwrap();
 
     println!("\n=== Merge (evens + odds → labeled) ===");
     for (t, batch) in merge_out.collector().lock().unwrap().iter() {
