@@ -298,8 +298,7 @@ pub struct EdgeTypeInfo {
 
 /// A blueprint that creates a typed channel pair for an edge.
 ///
-/// Takes `(capacity, wake_handle)` where:
-/// - `capacity` is the channel buffer size
+/// Takes `(wake_handle)` where:
 /// - `wake_handle` is an optional [`crate::dataflow::channels::WakeHandle`] for async executor notifications.
 ///   When provided, channels notify the handle on push, close, drop, and
 ///   when pulling frees capacity (backpressure relief).
@@ -308,9 +307,9 @@ pub struct EdgeTypeInfo {
 /// element is a `Box<dyn Push<T, D, M>>` and the second is a `Box<dyn Pull<T, D, M>>`.
 ///
 /// Channel factories are inherently replayable — they create fresh channel
-/// pairs from configuration (capacity) without consuming state.
+/// pairs from captured configuration without consuming state.
 pub trait ChannelBlueprint: Send {
-    /// Create a channel pair for the given worker, capacity, and wake handle.
+    /// Create a channel pair for the given worker and wake handle.
     ///
     /// For pipeline channels, the worker context is ignored (each worker gets
     /// an independent bounded channel). For exchange channels, the context
@@ -319,7 +318,6 @@ pub trait ChannelBlueprint: Send {
     fn build(
         &mut self,
         ctx: &WorkerContext,
-        capacity: usize,
         wake_handle: Option<crate::dataflow::channels::wake::WakeHandle>,
     ) -> (Box<dyn std::any::Any + Send>, Box<dyn std::any::Any + Send>);
 }
@@ -330,11 +328,10 @@ pub type ChannelFactory = Box<dyn ChannelBlueprint>;
 /// Create a [`ChannelFactory`] from a closure.
 ///
 /// Channel factories are inherently replayable (they only capture
-/// configuration like capacity).
+/// configuration chosen when the blueprint is constructed).
 pub fn channel_factory(
     f: impl FnMut(
         &WorkerContext,
-        usize,
         Option<crate::dataflow::channels::wake::WakeHandle>,
     ) -> (Box<dyn std::any::Any + Send>, Box<dyn std::any::Any + Send>)
     + Send
@@ -348,7 +345,6 @@ pub struct ChannelBlueprintFn(
     Box<
         dyn FnMut(
                 &WorkerContext,
-                usize,
                 Option<crate::dataflow::channels::wake::WakeHandle>,
             ) -> (Box<dyn std::any::Any + Send>, Box<dyn std::any::Any + Send>)
             + Send,
@@ -360,7 +356,6 @@ impl ChannelBlueprintFn {
     pub fn new(
         factory: impl FnMut(
             &WorkerContext,
-            usize,
             Option<crate::dataflow::channels::wake::WakeHandle>,
         ) -> (Box<dyn std::any::Any + Send>, Box<dyn std::any::Any + Send>)
         + Send
@@ -379,9 +374,8 @@ impl ChannelBlueprint for ChannelBlueprintFn {
     fn build(
         &mut self,
         ctx: &WorkerContext,
-        capacity: usize,
         wake_handle: Option<crate::dataflow::channels::wake::WakeHandle>,
     ) -> (Box<dyn std::any::Any + Send>, Box<dyn std::any::Any + Send>) {
-        (self.0)(ctx, capacity, wake_handle)
+        (self.0)(ctx, wake_handle)
     }
 }

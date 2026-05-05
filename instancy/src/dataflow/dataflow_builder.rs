@@ -1269,7 +1269,7 @@ impl<T: Timestamp, D: Clone + Send + 'static> Pipe<T, D> {
 
             // Channel factories for both input edges
             let channel_factory1: ChannelFactory =
-                channel_factory(move |_ctx, _cap: usize, wake: Option<WakeHandle>| {
+                channel_factory(move |_ctx, wake: Option<WakeHandle>| {
                     let (push, pull) =
                         bounded_channel_with_wake::<T, D, ()>(capacity1, wake.clone());
                     (
@@ -1282,7 +1282,7 @@ impl<T: Timestamp, D: Clone + Send + 'static> Pipe<T, D> {
             state.channel_factories.push((edge1_idx, channel_factory1));
 
             let channel_factory2: ChannelFactory =
-                channel_factory(move |_ctx, _cap: usize, wake: Option<WakeHandle>| {
+                channel_factory(move |_ctx, wake: Option<WakeHandle>| {
                     let (push, pull) =
                         bounded_channel_with_wake::<T, D2, ()>(capacity2, wake.clone());
                     (
@@ -1434,7 +1434,7 @@ impl<T: Timestamp, D: Clone + Send + 'static> Pipe<T, D> {
             let enter_edge_idx = state.graph.edges().len() - 1;
             let cap = enter_capacity;
             let cf: ChannelFactory =
-                channel_factory(move |_ctx, _cap: usize, wake: Option<WakeHandle>| {
+                channel_factory(move |_ctx, wake: Option<WakeHandle>| {
                     let (push, pull) = bounded_channel_with_wake::<T, D, ()>(cap, wake.clone());
                     (
                         Box::new(Box::new(push) as Box<dyn Push<T, D>>)
@@ -1598,7 +1598,7 @@ impl<T: Timestamp, D: Clone + Send + 'static> Pipe<T, D> {
             // Channel factories for concat inputs
             let cap = capacity;
             let cf1: ChannelFactory =
-                channel_factory(move |_ctx, _cap: usize, wake: Option<WakeHandle>| {
+                channel_factory(move |_ctx, wake: Option<WakeHandle>| {
                     let (push, pull) =
                         bounded_channel_with_wake::<PT<T, TInner>, D, ()>(cap, wake.clone());
                     (
@@ -1612,7 +1612,7 @@ impl<T: Timestamp, D: Clone + Send + 'static> Pipe<T, D> {
 
             let cap = capacity;
             let cf2: ChannelFactory =
-                channel_factory(move |_ctx, _cap: usize, wake: Option<WakeHandle>| {
+                channel_factory(move |_ctx, wake: Option<WakeHandle>| {
                     let (push, pull) =
                         bounded_channel_with_wake::<PT<T, TInner>, D, ()>(cap, wake.clone());
                     (
@@ -1803,7 +1803,7 @@ impl<T: Timestamp, D: Clone + Send + 'static> Pipe<T, D> {
             let fb_position = state.graph.feedback_edges().len() - 1;
             let cap = feedback_capacity;
             let cf_fb: ChannelFactory =
-                channel_factory(move |_ctx, _cap: usize, wake: Option<WakeHandle>| {
+                channel_factory(move |_ctx, wake: Option<WakeHandle>| {
                     let (push, pull) =
                         bounded_channel_with_wake::<PT<T, TInner>, D, ()>(cap, wake.clone());
                     (
@@ -1853,7 +1853,7 @@ impl<T: Timestamp, D: Clone + Send + 'static> Pipe<T, D> {
             // Channel factory for leave's input edge
             let cap = output_capacity;
             let cf_leave: ChannelFactory =
-                channel_factory(move |_ctx, _cap: usize, wake: Option<WakeHandle>| {
+                channel_factory(move |_ctx, wake: Option<WakeHandle>| {
                     let (push, pull) =
                         bounded_channel_with_wake::<PT<T, TInner>, D, ()>(cap, wake.clone());
                     (
@@ -1987,7 +1987,7 @@ impl<T: Timestamp, D: Clone + Send + 'static> Pipe<T, D> {
             // Channel factories for each input edge (per-input capacity)
             for (edge_idx, capacity) in edge_indices.into_iter().zip(capacities) {
                 let chan_factory: ChannelFactory =
-                    channel_factory(move |_ctx, _cap: usize, wake: Option<WakeHandle>| {
+                    channel_factory(move |_ctx, wake: Option<WakeHandle>| {
                         let (push, pull) =
                             bounded_channel_with_wake::<T, D, ()>(capacity, wake.clone());
                         (
@@ -2167,7 +2167,7 @@ impl<T: Timestamp, D: Clone + Send + 'static> Pipe<T, D> {
             // Channel factory for the input edge
             let edge_idx = state.graph.edges().len() - 1;
             let chan_factory: ChannelFactory =
-                channel_factory(move |_ctx, _cap: usize, wake: Option<WakeHandle>| {
+                channel_factory(move |_ctx, wake: Option<WakeHandle>| {
                     let (push, pull) =
                         bounded_channel_with_wake::<T, D, ()>(capacity, wake.clone());
                     (
@@ -2661,7 +2661,7 @@ impl<T: Timestamp, D: Clone + Send + 'static> Pipe<T, D> {
             // spawn_multi replaces this with shared exchange factories.
             let edge_idx = state.graph.edges().len() - 1;
             let chan_factory: ChannelFactory =
-                channel_factory(move |_ctx, _cap: usize, wake: Option<WakeHandle>| {
+                channel_factory(move |_ctx, wake: Option<WakeHandle>| {
                     let (push, pull) =
                         bounded_channel_with_wake::<T, D, ()>(capacity, wake.clone());
                     (
@@ -2811,7 +2811,7 @@ impl<T: Timestamp, D: Clone + Send + 'static> Pipe<T, D> {
             // Channel factory for the input edge
             let edge_idx = state.graph.edges().len() - 1;
             let chan_factory: ChannelFactory =
-                channel_factory(move |_ctx, _cap: usize, wake: Option<WakeHandle>| {
+                channel_factory(move |_ctx, wake: Option<WakeHandle>| {
                     let (push, pull) =
                         bounded_channel_with_wake::<T, D, ()>(capacity, wake.clone());
                     (
@@ -2920,7 +2920,7 @@ impl<T: Timestamp, D: Clone + Send + 'static> Pipe<T, D> {
             // Channel factory for the input edge
             let edge_idx = state.graph.edges().len() - 1;
             let chan_factory: ChannelFactory =
-                channel_factory(move |_ctx, _cap: usize, wake: Option<WakeHandle>| {
+                channel_factory(move |_ctx, wake: Option<WakeHandle>| {
                     let (push, pull) =
                         bounded_channel_with_wake::<T, D, ()>(capacity, wake.clone());
                     (
@@ -3063,7 +3063,7 @@ impl<T: Timestamp, D: Clone + Send + 'static> Pipe<T, D> {
             // Channel factory for the input edge
             let edge_idx = state.graph.edges().len() - 1;
             let chan_factory: ChannelFactory =
-                channel_factory(move |_ctx, _cap: usize, wake: Option<WakeHandle>| {
+                channel_factory(move |_ctx, wake: Option<WakeHandle>| {
                     let (push, pull) =
                         bounded_channel_with_wake::<T, D, ()>(capacity, wake.clone());
                     (
