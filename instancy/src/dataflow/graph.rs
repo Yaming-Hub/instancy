@@ -190,6 +190,10 @@ pub struct DataflowGraph {
     /// These edges are validated (endpoints exist) but excluded from
     /// topological ordering.
     feedback_edges: Vec<EdgeInfo>,
+    /// Target parallelism for exchange operators (operator_index → parallelism).
+    /// Set by exchange_to/rebalance_to/broadcast_to/gather to record the
+    /// downstream stage's intended parallelism.
+    exchange_parallelism: HashMap<usize, usize>,
 }
 
 impl DataflowGraph {
@@ -199,6 +203,7 @@ impl DataflowGraph {
             operators: HashMap::new(),
             edges: Vec::new(),
             feedback_edges: Vec::new(),
+            exchange_parallelism: HashMap::new(),
         }
     }
 
@@ -237,6 +242,19 @@ impl DataflowGraph {
     /// still validated for endpoint existence.
     pub fn add_feedback_edge(&mut self, edge: EdgeInfo) {
         self.feedback_edges.push(edge);
+    }
+
+    /// Set the target parallelism for an exchange operator.
+    ///
+    /// Called by exchange_to/rebalance_to/broadcast_to/gather to record
+    /// what parallelism the downstream stage should have.
+    pub fn set_exchange_parallelism(&mut self, operator_index: usize, parallelism: usize) {
+        self.exchange_parallelism.insert(operator_index, parallelism);
+    }
+
+    /// Get the target parallelism for an exchange operator, if set.
+    pub fn exchange_parallelism(&self, operator_index: usize) -> Option<usize> {
+        self.exchange_parallelism.get(&operator_index).copied()
     }
 
     /// All feedback edges.

@@ -186,12 +186,15 @@ impl<S: Scope, D: 'static> StreamEdge<S, D> {
         scope.register_operator(crate::dataflow::graph::OperatorInfo::new(
             op_index, &name, target_region, 1, 1,
         )).expect("operator index should be unique");
-        scope.add_edge(crate::dataflow::graph::EdgeInfo::new(
+        scope.add_edge(crate::dataflow::graph::EdgeInfo::exchange(
             *self.source(),
             Slot::new(op_index, 0),
             source_region,
             target_region,
         ));
+
+        // Record target parallelism for stage inference.
+        scope.set_exchange_parallelism(op_index, target_parallelism);
 
         let _operator = BroadcastOperator::<S::Timestamp, D>::new(
             name,

@@ -2184,6 +2184,31 @@ impl<T: Timestamp + crate::communication::codec::ExchangeData, D: Clone + crate:
         self.add_exchange_internal_networked(exchange_fn, capacity)
     }
 
+    /// Repartition data with explicit downstream parallelism (cluster-wide total).
+    ///
+    /// Like [`exchange`](Self::exchange), but specifies the target stage's
+    /// parallelism. This creates a stage boundary where the downstream operators
+    /// run with `target_parallelism` workers.
+    ///
+    /// # Panics
+    /// Panics if `target_parallelism` is 0.
+    pub fn exchange_to<K: std::hash::Hash + 'static>(
+        mut self,
+        name: impl Into<String>,
+        target_parallelism: usize,
+        key_fn: impl Fn(&D) -> K + Send + Sync + 'static,
+    ) -> Pipe<T, D> {
+        assert!(target_parallelism > 0, "target_parallelism must be > 0");
+        let capacity = self.resolve_capacity();
+        let exchange_fn =
+            crate::dataflow::channels::pact::ExchangeFn::by_key(&name.into(), key_fn);
+        let pipe = self.add_exchange_internal_networked(exchange_fn, capacity);
+        // Record target parallelism on the exchange operator we just created.
+        let exchange_op_idx = pipe.op_idx;
+        pipe.state.borrow_mut().graph.set_exchange_parallelism(exchange_op_idx, target_parallelism);
+        pipe
+    }
+
     /// Repartition data using a direct hash function (returns u64).
     ///
     /// The returned u64 is reduced modulo the target worker count to
@@ -2197,6 +2222,26 @@ impl<T: Timestamp + crate::communication::codec::ExchangeData, D: Clone + crate:
         let exchange_fn =
             crate::dataflow::channels::pact::ExchangeFn::new(name, hash_fn);
         self.add_exchange_internal_networked(exchange_fn, capacity)
+    }
+
+    /// Repartition with direct hash and explicit downstream parallelism.
+    ///
+    /// # Panics
+    /// Panics if `target_parallelism` is 0.
+    pub fn exchange_by_hash_to(
+        mut self,
+        name: impl Into<String>,
+        target_parallelism: usize,
+        hash_fn: impl Fn(&D) -> u64 + Send + Sync + 'static,
+    ) -> Pipe<T, D> {
+        assert!(target_parallelism > 0, "target_parallelism must be > 0");
+        let capacity = self.resolve_capacity();
+        let exchange_fn =
+            crate::dataflow::channels::pact::ExchangeFn::new(name, hash_fn);
+        let pipe = self.add_exchange_internal_networked(exchange_fn, capacity);
+        let exchange_op_idx = pipe.op_idx;
+        pipe.state.borrow_mut().graph.set_exchange_parallelism(exchange_op_idx, target_parallelism);
+        pipe
     }
 
     /// Internal: add an exchange operator with network-capable factory creator.
@@ -2250,6 +2295,30 @@ impl<T: Timestamp, D: Clone + Send + 'static> Pipe<T, D> {
         self.add_exchange_internal(exchange_fn, capacity)
     }
 
+    /// Repartition data with explicit downstream parallelism (cluster-wide total).
+    ///
+    /// Like [`exchange`](Self::exchange), but specifies the target stage's
+    /// parallelism. This creates a stage boundary where the downstream operators
+    /// run with `target_parallelism` workers.
+    ///
+    /// # Panics
+    /// Panics if `target_parallelism` is 0.
+    pub fn exchange_to<K: std::hash::Hash + 'static>(
+        mut self,
+        name: impl Into<String>,
+        target_parallelism: usize,
+        key_fn: impl Fn(&D) -> K + Send + Sync + 'static,
+    ) -> Pipe<T, D> {
+        assert!(target_parallelism > 0, "target_parallelism must be > 0");
+        let capacity = self.resolve_capacity();
+        let exchange_fn =
+            crate::dataflow::channels::pact::ExchangeFn::by_key(&name.into(), key_fn);
+        let pipe = self.add_exchange_internal(exchange_fn, capacity);
+        let exchange_op_idx = pipe.op_idx;
+        pipe.state.borrow_mut().graph.set_exchange_parallelism(exchange_op_idx, target_parallelism);
+        pipe
+    }
+
     /// Repartition data using a direct hash function (returns u64).
     ///
     /// The returned u64 is reduced modulo the target worker count to
@@ -2263,6 +2332,26 @@ impl<T: Timestamp, D: Clone + Send + 'static> Pipe<T, D> {
         let exchange_fn =
             crate::dataflow::channels::pact::ExchangeFn::new(name, hash_fn);
         self.add_exchange_internal(exchange_fn, capacity)
+    }
+
+    /// Repartition with direct hash and explicit downstream parallelism.
+    ///
+    /// # Panics
+    /// Panics if `target_parallelism` is 0.
+    pub fn exchange_by_hash_to(
+        mut self,
+        name: impl Into<String>,
+        target_parallelism: usize,
+        hash_fn: impl Fn(&D) -> u64 + Send + Sync + 'static,
+    ) -> Pipe<T, D> {
+        assert!(target_parallelism > 0, "target_parallelism must be > 0");
+        let capacity = self.resolve_capacity();
+        let exchange_fn =
+            crate::dataflow::channels::pact::ExchangeFn::new(name, hash_fn);
+        let pipe = self.add_exchange_internal(exchange_fn, capacity);
+        let exchange_op_idx = pipe.op_idx;
+        pipe.state.borrow_mut().graph.set_exchange_parallelism(exchange_op_idx, target_parallelism);
+        pipe
     }
 }
 

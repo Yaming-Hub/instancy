@@ -104,6 +104,9 @@ impl FusedActivationOrder {
 pub struct StageInfo {
     /// Unique stage identifier (sequential, starting from 0).
     pub id: StageId,
+    /// Target parallelism (cluster-wide worker count) for this stage.
+    /// `None` means the stage inherits the dataflow's default parallelism.
+    pub parallelism: Option<usize>,
     /// Operator indices belonging to this stage, in topological order.
     pub operator_indices: Vec<usize>,
     /// The fused activation order for this stage's operators.
@@ -166,9 +169,10 @@ pub fn infer_stages(graph: &DataflowGraph) -> Result<Vec<StageInfo>> {
     let mut op_stage: HashMap<usize, usize> = HashMap::new();
     let mut next_stage_id: usize = 0;
 
-    // When multiple exchange targets share the same upstream source stage,
-    // they should share the same downstream stage. Track: source_stage → new_stage.
-    let mut boundary_stage_map: HashMap<usize, usize> = HashMap::new();
+    // When multiple exchange targets share the same upstream source stage AND
+    // the same target parallelism, they should share the same downstream stage.
+    // Track: (source_stage, target_parallelism) → new_stage.
+    let mut boundary_stage_map: HashMap<(usize, Option<usize>), usize> = HashMap::new();
 
     for &op_idx in &topo_order {
         if exchange_targets.contains_key(&op_idx) {
@@ -187,9 +191,10 @@ pub fn infer_stages(graph: &DataflowGraph) -> Result<Vec<StageInfo>> {
             }
 
             // Use boundary_stage_map to ensure all exchange targets from the same
-            // source stage share the same downstream stage.
+            // source stage with the same parallelism share the same downstream stage.
             let src = source_stage.unwrap_or(0);
-            let stage = *boundary_stage_map.entry(src).or_insert_with(|| {
+            let par = graph.exchange_parallelism(op_idx);
+            let stage = *boundary_stage_map.entry((src, par)).or_insert_with(|| {
                 if next_stage_id == 0 {
                     next_stage_id = 1;
                 }
@@ -230,6 +235,22 @@ pub fn infer_stages(graph: &DataflowGraph) -> Result<Vec<StageInfo>> {
         stage_ops[stage].push(op_idx);
     }
 
+    // Determine parallelism for each stage.
+    // A stage's parallelism comes from the exchange operator that created it.
+    // The exchange operator (the target of the exchange edge) stores its
+    // target_parallelism via set_exchange_parallelism().
+    let mut stage_parallelism: Vec<Option<usize>> = vec![None; num_stages];
+    for edge in graph.edges() {
+        if edge.is_exchange() {
+            let target_op = edge.target.operator_index;
+            if let Some(&stage_id) = op_stage.get(&target_op) {
+                if let Some(par) = graph.exchange_parallelism(target_op) {
+                    stage_parallelism[stage_id] = Some(par);
+                }
+            }
+        }
+    }
+
     // Build StageInfo for each non-empty stage.
     let stages: Vec<StageInfo> = stage_ops
         .into_iter()
@@ -239,6 +260,7 @@ pub fn infer_stages(graph: &DataflowGraph) -> Result<Vec<StageInfo>> {
             let fused_order = FusedActivationOrder::new(ops.clone());
             StageInfo {
                 id: StageId(id),
+                parallelism: stage_parallelism[id],
                 operator_indices: ops,
                 fused_order,
             }
@@ -503,5 +525,88 @@ mod tests {
         let mut stage1_ops = stages[1].operator_indices.clone();
         stage1_ops.sort();
         assert_eq!(stage1_ops, vec![1, 2, 3]);
+    }
+
+    #[test]
+    fn test_infer_stages_parallelism_from_exchange() {
+        // 0 → [exchange with par=4] → 1 → [exchange with par=2] → 2
+        let mut graph = DataflowGraph::new();
+        for i in 0..3 {
+            graph.register_operator(make_op(i, &format!("op{}", i))).unwrap();
+        }
+        graph.add_edge(exchange_edge(0, 1));
+        graph.set_exchange_parallelism(1, 4); // exchange target op 1 has par=4
+        graph.add_edge(exchange_edge(1, 2));
+        graph.set_exchange_parallelism(2, 2); // exchange target op 2 has par=2
+
+        let stages = infer_stages(&graph).unwrap();
+        assert_eq!(stages.len(), 3);
+        // Stage 0: no parallelism set (inherits default)
+        assert_eq!(stages[0].parallelism, None);
+        // Stage 1: par=4 from exchange targeting op 1
+        assert_eq!(stages[1].parallelism, Some(4));
+        // Stage 2: par=2 from exchange targeting op 2
+        assert_eq!(stages[2].parallelism, Some(2));
+    }
+
+    #[test]
+    fn test_infer_stages_parallelism_none_when_not_set() {
+        // Exchange without explicit parallelism → None
+        let mut graph = DataflowGraph::new();
+        for i in 0..2 {
+            graph.register_operator(make_op(i, &format!("op{}", i))).unwrap();
+        }
+        graph.add_edge(exchange_edge(0, 1));
+        // No set_exchange_parallelism call
+
+        let stages = infer_stages(&graph).unwrap();
+        assert_eq!(stages.len(), 2);
+        assert_eq!(stages[0].parallelism, None);
+        assert_eq!(stages[1].parallelism, None);
+    }
+
+    #[test]
+    fn test_infer_stages_fan_out_different_parallelism_separate_stages() {
+        // 0 → [exchange par=4] → 1, 0 → [exchange par=8] → 2
+        // Because parallelism differs, ops 1 and 2 must be in DIFFERENT stages.
+        let mut graph = DataflowGraph::new();
+        for i in 0..3 {
+            graph.register_operator(make_op(i, &format!("op{}", i))).unwrap();
+        }
+        graph.add_edge(exchange_edge(0, 1));
+        graph.set_exchange_parallelism(1, 4);
+        graph.add_edge(exchange_edge(0, 2));
+        graph.set_exchange_parallelism(2, 8);
+
+        let stages = infer_stages(&graph).unwrap();
+        assert_eq!(stages.len(), 3); // stage 0, stage par=4, stage par=8
+        assert_eq!(stages[0].parallelism, None);
+        // Find stages by parallelism
+        let par4 = stages.iter().find(|s| s.parallelism == Some(4)).unwrap();
+        let par8 = stages.iter().find(|s| s.parallelism == Some(8)).unwrap();
+        assert_eq!(par4.operator_indices, vec![1]);
+        assert_eq!(par8.operator_indices, vec![2]);
+        assert_ne!(par4.id, par8.id);
+    }
+
+    #[test]
+    fn test_infer_stages_fan_out_same_parallelism_share_stage() {
+        // 0 → [exchange par=4] → 1, 0 → [exchange par=4] → 2
+        // Same parallelism from same source → share downstream stage.
+        let mut graph = DataflowGraph::new();
+        for i in 0..3 {
+            graph.register_operator(make_op(i, &format!("op{}", i))).unwrap();
+        }
+        graph.add_edge(exchange_edge(0, 1));
+        graph.set_exchange_parallelism(1, 4);
+        graph.add_edge(exchange_edge(0, 2));
+        graph.set_exchange_parallelism(2, 4);
+
+        let stages = infer_stages(&graph).unwrap();
+        assert_eq!(stages.len(), 2); // stage 0, shared stage par=4
+        assert_eq!(stages[1].parallelism, Some(4));
+        let mut ops = stages[1].operator_indices.clone();
+        ops.sort();
+        assert_eq!(ops, vec![1, 2]);
     }
 }
