@@ -1278,8 +1278,27 @@ impl ExchangeData for MyRecord {
 
 ---
 
+## 10. Troubleshooting
+
+### My dataflow hangs and never completes
+- Check that all `InputSender`s are dropped (closing the input)
+- Check that `unary_notify` operators consume all notifications (`ctx.next_notification()`)
+- Check that capabilities aren't held indefinitely
+
+### Output arrives out of order
+- Pipeline channels preserve ordering within a timestamp
+- Exchange channels may reorder across workers — use `unary_notify` to aggregate per-timestamp
+
+### How do I know if my dataflow is slow?
+- Enable metrics: `SpawnOptions::new().collect_metrics(true)`
+- Check per-operator CPU time and activation count
+- Look for operators with high backpressure blocked_duration
+
+---
+
 ## What's Next?
 
+- Read the [COOKBOOK.md](./COOKBOOK.md) for copy-paste patterns and troubleshooting-adjacent recipes
 - Browse the [examples/](./instancy/examples/) directory for complete runnable programs
 - Check the [tests/](./instancy/tests/) directory for integration test patterns
 - Read the [DESIGN.md](./DESIGN.md) for architectural details
