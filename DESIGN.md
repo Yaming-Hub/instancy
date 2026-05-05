@@ -17,7 +17,7 @@
 9. **Configurable error policy** — each dataflow specifies whether errors should halt the pipeline or be logged and skipped, giving consumers control over fault tolerance.
 10. **Observability built-in** — per-dataflow CPU time tracking, operator-level metrics, and structured tracing for understanding performance characteristics.
 11. **Checkpointing support** — consumers can add checkpoint operators that persist state at timestamp boundaries, enabling recovery by fast-forwarding input to the stored frontier.
-12. **Per-stage dynamic parallelism** — operators in the same execution region share a parallelism level; different regions can have different parallelism. Explicit repartition operators (`exchange`, `rebalance`, `gather`, `broadcast`) connect regions with different parallelism.
+12. **Per-stage dynamic parallelism** — operators in the same stage share a parallelism level; different stages can have different parallelism. Stage boundaries are auto-inferred from repartition operators (`exchange`, `rebalance`, `gather`, `broadcast`). Operators within a stage are fused into a single schedulable task for reduced scheduling overhead.
 13. **Dynamic cluster scaling** — nodes can join or leave the cluster at runtime. The hosting application is responsible for detecting membership changes and notifying the runtime via a `ClusterMembership` trait. The library rebuilds routing and rebalances work accordingly.
 14. **No global state** — zero static variables, `lazy_static`, or thread-locals. All state is owned by an explicit `RuntimeHandle`. Multiple isolated clusters can coexist in a single process (e.g., interactive vs batch workloads).
 15. **Pluggable task scheduling** — the task queue accepts a `SchedulePolicy` trait that determines dequeue order based on (dataflow priority, task age). Default policy uses priority-with-aging to prevent starvation of low-priority dataflows.
@@ -44,7 +44,7 @@
 | Messages | Raw data only | Structured envelope: `Data` or `Control` (error, cancellation) |
 | Observability | Limited | Built-in CPU time tracking per dataflow, operator-level metrics |
 | Checkpointing | Not supported | Extensible checkpoint operators using timestamp boundaries |
-| Parallelism | Uniform: all operators share the same worker count | Per-region: execution regions can have different parallelism; explicit repartition at boundaries |
+| Parallelism | Uniform: all operators share the same worker count | Per-stage: stages can have different parallelism; repartition operators at boundaries. Operators within a stage are fused. |
 | Cluster scaling | Static: all nodes must be known at startup | Dynamic: application notifies runtime of node joins/departures; routing tables rebuild on the fly |
 | Multi-dataflow | One worker owns its dataflows; implicit isolation via thread-local state | Explicit DataflowId in frame headers; shared connections demux by (dataflow_id, channel_id) |
 
@@ -1924,11 +1924,11 @@ This structured error enables:
 - Understanding retry behavior before final failure
 - Dead-letter routing with full provenance
 
-### 5.10 Per-Stage Dynamic Parallelism (Execution Regions)
+### 5.10 Per-Stage Dynamic Parallelism
 
-In traditional timely-dataflow, every operator in a dataflow uses the same number of workers. This is wasteful for operations like global aggregation (funneling to 1 worker) or when different stages have different computational needs.
+In traditional timely-dataflow, every operator in a dataflow uses the same number of workers. This is wasteful for operations like global aggregation (funneling to 1 worker) or when different computation phases have different computational needs.
 
-instancy introduces **execution regions** — groups of operators that share a parallelism level. Different regions can have different parallelism, with explicit repartition operators at region boundaries.
+instancy introduces **stages** — groups of contiguous operators connected by Pipeline edges, with implicit boundaries at repartition operators (exchange, gather, broadcast, rebalance). Each stage can have a different parallelism level.
 
 #### Motivation
 
@@ -1941,175 +1941,103 @@ Problem: 4-worker uniform parallelism
                          Workers 1-3 are idle but hold
                          logical capacity.
 
-Solution: per-region parallelism
+Solution: per-stage parallelism
 
-  from_stream [region: 4] → map [region: 16] → global_sort [region: 1] → sink [region: 4]
-                    ↑ rebalance          ↑ gather               ↑ rebalance
-              Explicit repartition at each boundary.
+  from_stream → map → [exchange] → compute → [gather] → global_sort → [rebalance] → sink
+  |__ Stage 0 (par=4) __|         |_ Stage 1 (par=16) _|             |_ Stage 2 (par=1) _| |_ Stage 3 (par=4) _|
+       auto-inferred                  auto-inferred                      auto-inferred         auto-inferred
 ```
 
-#### Execution Regions
+#### Stages (replacing Execution Regions)
 
-An **execution region** is a set of contiguous operators that share:
-- The same **parallelism** (number of logical worker replicas)
-- The same **placement policy** (how replicas are distributed across nodes)
+A **stage** is a maximal group of contiguous operators connected by Pipeline edges. All operators in a stage share the same parallelism and are **fused into a single schedulable task** per worker. Stage boundaries are created **implicitly** by repartition operators — the user never manages stages directly.
 
-Within a region, operators are connected by pipeline-local channels (no shuffle). Between regions, explicit repartition operators handle data redistribution.
+This design replaces the earlier "execution regions" concept. Regions required explicit user management (`new_region()`, `in_region()`), but since exchange/gather already forms the natural boundary, stages are auto-inferred with no extra API.
+
+**Key benefit: operator fusion.** All operators in a stage run as one poll cycle, reducing scheduling overhead. A dataflow with 20 operators across 3 stages and 8 workers creates 24 tasks instead of 160.
 
 ```rust
-/// An execution region defines a group of operators with shared parallelism.
-#[derive(Clone, Debug)]
-pub struct Region {
-    /// Number of logical workers (replicas) for operators in this region.
+pub struct StageInfo {
+    pub id: StageId,
     pub parallelism: usize,
-    /// How replicas are placed across cluster nodes.
-    /// Default: proportional to each node's declared worker count.
+    pub operator_indices: Vec<usize>,
     pub placement: PlacementPolicy,
-}
-
-/// How region replicas are distributed across nodes.
-#[derive(Clone, Debug, Default)]
-pub enum PlacementPolicy {
-    /// Distribute replicas proportionally to each node's capacity.
-    /// A node with 8 workers gets 2x the replicas of a node with 4 workers.
-    #[default]
-    Proportional,
-    /// Distribute replicas evenly (round-robin) across all nodes.
-    RoundRobin,
-    /// Pin all replicas to a specific node (e.g., for local aggregation).
-    Pinned { node_id: String },
+    pub name: Option<String>,
 }
 ```
 
 #### Repartition Operators
 
-When connecting operators across regions with different parallelism, the user specifies **how** data is redistributed. The system never auto-selects a distribution strategy.
+Repartition operators create stage boundaries and specify the downstream stage's parallelism:
 
-| Operator | Semantics | Use case |
+| Operator | Semantics | Downstream par |
 |---|---|---|
-| `exchange(key_fn)` | Hash-partition by key to target parallelism | Shuffle for joins, group-by |
-| `rebalance()` | Round-robin across target replicas | Even load distribution when key doesn't matter |
-| `gather()` | All data → single replica (parallelism 1) | Global aggregation, sorting |
-| `broadcast()` | Clone all data to every target replica | Reference data distribution |
+| `exchange(key_fn, par)` | Hash-partition by key | Explicit `par` |
+| `rebalance(par)` | Round-robin across target workers | Explicit `par` |
+| `gather()` | All data → single worker | Always 1 |
+| `broadcast(par)` | Clone all data to every target worker | Explicit `par` |
 
-These operators are **required** at parallelism boundaries. Connecting two operators with different parallelism without an explicit repartition is a compile-time error.
+These operators are **required** at parallelism boundaries. Connecting two operators with different parallelism without an explicit repartition is a build-time error.
 
 ```rust
 // ✅ Correct: explicit repartition at boundary
 let result = input
-    .with_parallelism(4)
     .map(|x| x * 2)
-    .exchange(|x| hash(x))   // explicit: hash-partition into 16 replicas
-    .with_parallelism(16)
+    .exchange(|x| hash(x), 16)     // stage boundary: current → 16 workers
     .filter(|x| x > 100);
 
-// ❌ Error: parallelism changes without repartition
-let result = input
-    .with_parallelism(4)
-    .map(|x| x * 2)
-    .with_parallelism(16)    // compile error: no repartition between 4→16
-    .filter(|x| x > 100);
+// Default: no repartition → single stage, par from spawn_multi
+let result = input.map(|x| x * 2).filter(|x| x > 100);
 ```
 
 #### API
 
-There are two equivalent styles for specifying execution regions:
-
-**Style 1: Inline `.with_parallelism(n)`** — creates a new region implicitly:
+Parallelism is specified at repartition points — no region management needed:
 
 ```rust
-let output = scope
-    .input_from(streams)              // region A: parallelism = 4
-    .with_parallelism(4)
-    .map(|x| expensive_compute(x))
-    .filter(|x| x.is_valid())
-    .exchange(|x| hash(&x.key))       // repartition: 4 → 16
-    .with_parallelism(16)
-    .map(|x| transform(x))
-    .gather()                          // repartition: 16 → 1
-    .with_parallelism(1)
-    .aggregate(Vec::new, |acc, x| acc.push(x))
-    .rebalance()                       // repartition: 1 → 4
-    .with_parallelism(4)
-    .sink(output_streams);
-```
-
-**Style 2: Named regions** — more explicit, better for complex graphs:
-
-```rust
-let ingest  = Region { parallelism: 4,  placement: PlacementPolicy::Proportional };
-let compute = Region { parallelism: 16, placement: PlacementPolicy::Proportional };
-let global  = Region { parallelism: 1,  placement: PlacementPolicy::Pinned { node_id: "10.0.0.1:8080".into() } };
-let egress  = Region { parallelism: 4,  placement: PlacementPolicy::Proportional };
-
-let input = scope
-    .input_from(streams)
-    .in_region(&ingest);
-
-let processed = input
-    .map(|x| expensive_compute(x))
-    .exchange(|x| hash(&x.key))
-    .in_region(&compute)
-    .map(|x| transform(x));
-
-let aggregated = processed
-    .gather()
-    .in_region(&global)
-    .aggregate(...);
-
-aggregated
-    .rebalance()
-    .in_region(&egress)
-    .sink(outputs);
+let output = builder
+    .source("input", |handle| { ... })       // Stage 0 (par=8, from spawn_multi)
+    .map(|data| parse(data))
+    .filter(|rec| rec.is_valid())
+    .exchange(|rec| hash(&rec.key), 4)        // Stage 0→1, par=4
+    .unary("aggregate", |input, output| { ... })
+    .gather()                                  // Stage 1→2, par=1
+    .unary("final_sort", |input, output| { ... })
+    .rebalance(8)                             // Stage 2→3, par=8
+    .inspect(|data| println!("{data:?}"));
 ```
 
 #### Default Behavior
 
-If no `.with_parallelism()` or `.in_region()` is specified, **all operators use the dataflow's default worker count** from `ClusterTopology`. This is fully backward-compatible with the uniform parallelism model.
+If no repartition operators with parallelism are used, all operators are in one stage with parallelism = `num_workers` from `spawn_multi()`. This is fully backward-compatible.
 
-```rust
-// These two are equivalent:
-// 1. Explicit
-input.with_parallelism(cluster.total_workers()).map(|x| x * 2);
-// 2. Default (uses dataflow worker count)
-input.map(|x| x * 2);
-```
+#### How the Runtime Discovers Worker Counts
 
-#### Progress Tracking with Regions
+1. **Build time**: `builder.build()` walks the operator graph and groups operators into stages by following Pipeline edges. Each repartition edge starts a new stage.
+2. **Stage metadata**: `LogicalDataflow` carries `Vec<StageInfo>` with each stage's parallelism and operator indices.
+3. **Spawn time**: `spawn_multi` reads stage metadata, creates per-stage executors with fused operators, and wires cross-stage exchange channels (M×N asymmetric routing).
 
-Each execution region maintains its own **per-replica progress frontiers**. The reachability tracker is extended to understand region boundaries:
+#### Progress Tracking with Stages
 
-- **Within a region**: Progress flows through operator ports as today. Each replica tracks its own frontier independently.
-- **At region boundaries**: The repartition operator aggregates upstream replicas' frontiers into the downstream region's input frontier. A downstream replica's input frontier only advances when **all** upstream replicas that send to it have advanced past that timestamp.
+Each stage's workers form an independent progress-tracking group:
 
-```
-Region A (parallelism=4)          Region B (parallelism=16)
-┌──────┐                          ┌──────┐
-│ R0   │──┐                   ┌──▶│ R0   │
-│ R1   │──┤  exchange(hash)   ├──▶│ R1   │
-│ R2   │──┤  ─────────────▶   ├──▶│ ...  │
-│ R3   │──┘                   └──▶│ R15  │
-└──────┘                          └──────┘
-
-Progress: B's replica input frontier = min of A's replica output
-          frontiers that route to that B replica.
-```
+- **Within a stage**: Workers exchange progress messages among themselves (same as multi-worker progress tracking today).
+- **At stage boundaries**: The exchange channel aggregates upstream workers' frontiers. A downstream worker's input frontier advances only when **all** upstream workers that can route to it have advanced past that timestamp.
 
 #### Restrictions
 
 For v1, the following restrictions apply:
 
-1. **No parallelism changes inside cycles/loops**: All operators within a `scope.iterative()` loop must share the same parallelism. Repartition must happen outside the loop boundary. This avoids complex per-replica progress accounting through feedback edges.
+1. **No parallelism changes inside cycles/loops**: All operators within a `scope.iterative()` loop must share the same parallelism. Repartition must happen outside the loop boundary.
 
-2. **Binary operators require co-partitioned inputs**: When a binary operator receives inputs from two different upstream regions, both must have been repartitioned to the same parallelism with compatible distribution (same key function for `exchange`). The system validates this at graph construction time.
-
-3. **Broadcast/broadcast_local use the current region's parallelism**: These operators do not create region boundaries.
+2. **Binary operators require co-partitioned inputs**: Both inputs to a binary operator must come from the same stage, or both must be repartitioned to the same parallelism with compatible distribution.
 
 #### Implementation Notes
 
-- **Logical WorkerId scope**: Within a region, replicas are assigned local indices `0..parallelism`. The global `WorkerId` mapping is: `global_id = region_base + local_replica_index`.
-- **Channel allocation**: Within a region → pipeline channels (no shuffle). Between regions → repartition channels with `upstream_replicas × downstream_replicas` routing (multiplexed over pooled connections for inter-process).
-- **Semaphore per region**: Each region has its own concurrency semaphore with `min(parallelism, local_replicas_on_this_node)` permits.
+- **Operator fusion**: All operators in a stage are fused into a single `poll()` loop. One ready-queue entry per stage-worker.
+- **Logical WorkerId scope**: Within a stage, workers are assigned local indices `0..parallelism`. The global mapping is: `global_id = stage_base + local_worker_index`.
+- **Channel allocation**: Within a stage → pipeline channels (no shuffle). Between stages → repartition channels with `upstream_par × downstream_par` routing.
+- **Semaphore per stage**: Each stage has its own concurrency semaphore with `min(parallelism, local_workers_on_this_node)` permits.
 
 ---
 
