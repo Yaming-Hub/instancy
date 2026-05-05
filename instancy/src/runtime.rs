@@ -2074,7 +2074,7 @@ impl<T: Timestamp> SpawnedDataflow<T> {
     /// Get the collected dataflow metrics.
     ///
     /// Returns `Some` if metrics collection was enabled via
-    /// [`SpawnOptions::collect_metrics(true)`]. The metrics are live —
+    /// [`SpawnOptions::collect_metrics`]. The metrics are live —
     /// values update as the dataflow executes.
     ///
     /// Returns `None` if metrics collection was not enabled.
