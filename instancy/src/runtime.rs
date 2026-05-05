@@ -2971,6 +2971,8 @@ fn materialize_executor<T: Timestamp>(
         channel_factories,
         subgraph_builder,
         probes,
+        #[cfg(feature = "async-io")]
+        probe_notifiers,
         stages,
         ..
     } = dataflow;
@@ -3009,8 +3011,20 @@ fn materialize_executor<T: Timestamp>(
     executor.set_progress_tracker(tracker);
 
     // Register probes
+    #[cfg(not(feature = "async-io"))]
     for (op_idx, probe) in probes {
         executor.register_probe(op_idx, probe);
+    }
+    #[cfg(feature = "async-io")]
+    {
+        debug_assert_eq!(
+            probes.len(),
+            probe_notifiers.len(),
+            "probes and probe_notifiers must have matching lengths"
+        );
+        for ((op_idx, probe), notifier) in probes.into_iter().zip(probe_notifiers) {
+            executor.register_probe(op_idx, probe, notifier);
+        }
     }
 
     Ok(executor)
