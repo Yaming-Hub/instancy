@@ -7,9 +7,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [0.2.0] - 2026-05-05
 
+### Added
+
+#### Reliability & Observability
+- `DataflowBuilder::catch_panics(true)` converts operator panics into `Error::OperatorPanic` instead of unwinding the runtime (#117)
+- Async probe notifications via `ProbeNotifier`, allowing `ProbeHandle` waiters to wake promptly on frontier changes (#118)
+- `take()` and `take_while()` operators for bounded and predicate-driven stream truncation (#119)
+- Per-operator metrics via `DataflowMetrics`, `OperatorMetrics`, and `BackpressureMetrics`; spawned dataflows can access the live metrics via `SpawnedDataflow::metrics()` (#120, #125)
+
+#### Examples
+- Added `cluster_basic` and `cluster_exchange` examples for distributed execution (#123)
+- Added `error_handling` example covering `map_ok`, `filter_ok`, and `branch_result` (#124)
+- Added `metrics_collection` example showing runtime metrics collection and reporting (#125)
+
 ### Changed
 
-#### Runtime API Simplification
+#### Runtime API Simplification (#121)
 - **BREAKING:** `RuntimeHandle::spawn()` now takes `SpawnOptions` parameter
 - **BREAKING:** `RuntimeHandle::spawn_multi()` now takes `SpawnOptions` parameter
 - **BREAKING:** `SimpleRuntime` moved behind `test-utils` feature (use `RuntimeHandle` for production)
@@ -21,6 +34,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **BREAKING:** Removed `RuntimeHandle::run()` and `run_blocking()` — use `spawn().join()` instead
 - **BREAKING:** Removed `RuntimeHandle::spawn_async()` — use `spawn(df, SpawnOptions::new().io_mode(IoMode::Async))`
 - **BREAKING:** Removed `RuntimeHandle::spawn_multi_async()` — use `spawn_multi(..., SpawnOptions::new().io_mode(IoMode::Async))`
+
+### Internal
+- Clippy cleanup and internal refactors (#122)
 
 ### Features
 

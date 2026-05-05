@@ -324,6 +324,7 @@ cargo run -p instancy --example <name>
 | Example | Description |
 |---|---|
 | `runtime_isolation` | Multiple isolated `RuntimeHandle` instances in one process |
+| `metrics_collection` | Per-operator metrics collection and reporting |
 
 **Cluster (Distributed)**
 
