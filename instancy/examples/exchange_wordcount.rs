@@ -73,9 +73,7 @@ fn main() {
                 input
                     // Split lines into individual words.
                     .flat_map("split", |_t, line| {
-                        line.split_whitespace()
-                            .map(|w| w.to_lowercase())
-                            .collect()
+                        line.split_whitespace().map(|w| w.to_lowercase()).collect()
                     })
                     // Exchange words by hash — all occurrences of the same word
                     // go to the same worker for correct global counting.

@@ -322,10 +322,14 @@ impl<T: Timestamp> DataflowExecutor<T> {
         // For each operator, gather:
         //   - input_pullers: pull ends of edges targeting this operator (by target port)
         //   - output_pushers: push ends of edges sourced from this operator (by source port)
-        let mut op_input_pullers: std::collections::HashMap<usize, Vec<(usize, Box<dyn std::any::Any + Send>)>> =
-            std::collections::HashMap::new();
-        let mut op_output_pushers: std::collections::HashMap<usize, Vec<(usize, Box<dyn std::any::Any + Send>)>> =
-            std::collections::HashMap::new();
+        let mut op_input_pullers: std::collections::HashMap<
+            usize,
+            Vec<(usize, Box<dyn std::any::Any + Send>)>,
+        > = std::collections::HashMap::new();
+        let mut op_output_pushers: std::collections::HashMap<
+            usize,
+            Vec<(usize, Box<dyn std::any::Any + Send>)>,
+        > = std::collections::HashMap::new();
 
         // Process regular edges
         for (edge_idx, edge) in edges.iter().enumerate() {
@@ -436,7 +440,6 @@ impl<T: Timestamp> DataflowExecutor<T> {
         })
     }
 
-
     /// Get a shared reference to the external inputs counter.
     ///
     /// Used by `ChannelSourceOperator` to decrement when its channel closes.
@@ -494,7 +497,8 @@ impl<T: Timestamp> DataflowExecutor<T> {
         );
 
         // Create per-operator notificators with initial frontiers.
-        let mut notificators: Vec<Option<Notificator<T>>> = Vec::with_capacity(self.operators.len());
+        let mut notificators: Vec<Option<Notificator<T>>> =
+            Vec::with_capacity(self.operators.len());
         for (_pos, op) in self.operators.iter().enumerate() {
             let op_idx = op.index();
             let frontier = tracker.operator_input_frontier_meet(op_idx);
@@ -525,11 +529,7 @@ impl<T: Timestamp> DataflowExecutor<T> {
     /// - Drain incoming control signals at the start of each sweep.
     ///
     /// Only used in multi-worker dataflows; single-worker dataflows skip this.
-    pub fn set_control_broadcast(
-        &mut self,
-        sender: ControlSender,
-        receiver: ControlReceiver,
-    ) {
+    pub fn set_control_broadcast(&mut self, sender: ControlSender, receiver: ControlReceiver) {
         self.control_sender = Some(sender);
         self.control_receiver = Some(receiver);
     }
@@ -872,7 +872,10 @@ impl<T: Timestamp> DataflowExecutor<T> {
         }
 
         let mut any_progress = false;
-        let batch_size = self.ready_queue.len().min(self.config.max_activations_per_step);
+        let batch_size = self
+            .ready_queue
+            .len()
+            .min(self.config.max_activations_per_step);
 
         for _ in 0..batch_size {
             let Some(pos) = self.ready_queue.pop_front() else {
@@ -1112,7 +1115,11 @@ impl<T: Timestamp> DataflowExecutor<T> {
         if self.consecutive_idle >= self.config.max_idle_sweeps {
             // Check if external inputs are still open — if so, don't
             // declare quiescence, but signal the caller to wait.
-            if self.external_inputs_open.load(std::sync::atomic::Ordering::SeqCst) > 0 {
+            if self
+                .external_inputs_open
+                .load(std::sync::atomic::Ordering::SeqCst)
+                > 0
+            {
                 self.consecutive_idle = 0;
                 return Ok(SweepOutcome::WaitingForInput);
             }
@@ -1334,7 +1341,7 @@ mod tests {
     struct CountingOperator {
         name: String,
         index: usize,
-        region_id: crate::dataflow::region::RegionId,
+        stage_id: crate::dataflow::stage::StageId,
         remaining: usize,
     }
 
@@ -1363,8 +1370,8 @@ mod tests {
             self.index
         }
 
-        fn region_id(&self) -> crate::dataflow::region::RegionId {
-            self.region_id
+        fn stage_id(&self) -> crate::dataflow::stage::StageId {
+            self.stage_id
         }
 
         fn close_inputs(&mut self) {
@@ -1376,7 +1383,7 @@ mod tests {
     /// Used for testing async waiting behavior.
     struct IdleOperator {
         index: usize,
-        region_id: crate::dataflow::region::RegionId,
+        stage_id: crate::dataflow::stage::StageId,
         closed: bool,
     }
 
@@ -1400,8 +1407,8 @@ mod tests {
             self.index
         }
 
-        fn region_id(&self) -> crate::dataflow::region::RegionId {
-            self.region_id
+        fn stage_id(&self) -> crate::dataflow::stage::StageId {
+            self.stage_id
         }
 
         fn close_inputs(&mut self) {
@@ -1415,7 +1422,7 @@ mod tests {
             operators: vec![Box::new(CountingOperator {
                 name: "counter".into(),
                 index: 0,
-                region_id: crate::dataflow::region::RegionId::new(0),
+                stage_id: crate::dataflow::stage::StageId::new(0),
                 remaining: 3,
             })],
             ready_queue: VecDeque::from([0]),
@@ -1424,7 +1431,7 @@ mod tests {
             index_to_pos: vec![0],
             config: ExecutorConfig::default(),
             cancel: CancellationToken::new(),
-        progress_tracker: None,
+            progress_tracker: None,
             notificators: Vec::new(),
             probes: Vec::new(),
             external_inputs_open: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
@@ -1454,7 +1461,7 @@ mod tests {
             operators: vec![Box::new(CountingOperator {
                 name: "infinite".into(),
                 index: 0,
-                region_id: crate::dataflow::region::RegionId::new(0),
+                stage_id: crate::dataflow::stage::StageId::new(0),
                 remaining: usize::MAX,
             })],
             ready_queue: VecDeque::from([0]),
@@ -1463,7 +1470,7 @@ mod tests {
             index_to_pos: vec![0],
             config: ExecutorConfig::default(),
             cancel,
-        progress_tracker: None,
+            progress_tracker: None,
             notificators: Vec::new(),
             probes: Vec::new(),
             external_inputs_open: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
@@ -1490,13 +1497,13 @@ mod tests {
                 Box::new(CountingOperator {
                     name: "a".into(),
                     index: 0,
-                    region_id: crate::dataflow::region::RegionId::new(0),
+                    stage_id: crate::dataflow::stage::StageId::new(0),
                     remaining: 2,
                 }),
                 Box::new(CountingOperator {
                     name: "b".into(),
                     index: 1,
-                    region_id: crate::dataflow::region::RegionId::new(0),
+                    stage_id: crate::dataflow::stage::StageId::new(0),
                     remaining: 5,
                 }),
             ],
@@ -1506,7 +1513,7 @@ mod tests {
             index_to_pos: vec![0, 1],
             config: ExecutorConfig::default(),
             cancel: CancellationToken::new(),
-        progress_tracker: None,
+            progress_tracker: None,
             notificators: Vec::new(),
             probes: Vec::new(),
             external_inputs_open: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
@@ -1537,7 +1544,7 @@ mod tests {
             index_to_pos: vec![],
             config: ExecutorConfig::default(),
             cancel: CancellationToken::new(),
-        progress_tracker: None,
+            progress_tracker: None,
             notificators: Vec::new(),
             probes: Vec::new(),
             external_inputs_open: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
@@ -1565,11 +1572,17 @@ mod tests {
             fn activate(&mut self) -> Result<ActivationOutcome> {
                 Ok(ActivationOutcome::Idle)
             }
-            fn is_done(&self) -> bool { false }
-            fn name(&self) -> &str { "idle" }
-            fn index(&self) -> usize { 0 }
-            fn region_id(&self) -> crate::dataflow::region::RegionId {
-                crate::dataflow::region::RegionId::new(0)
+            fn is_done(&self) -> bool {
+                false
+            }
+            fn name(&self) -> &str {
+                "idle"
+            }
+            fn index(&self) -> usize {
+                0
+            }
+            fn stage_id(&self) -> crate::dataflow::stage::StageId {
+                crate::dataflow::stage::StageId::new(0)
             }
             fn close_inputs(&mut self) {}
         }
@@ -1580,9 +1593,13 @@ mod tests {
             in_queue: vec![true],
             done: vec![false],
             index_to_pos: vec![0],
-            config: ExecutorConfig { max_activations_per_step: 10, max_idle_sweeps: 3, max_sweeps_per_poll: 0 },
+            config: ExecutorConfig {
+                max_activations_per_step: 10,
+                max_idle_sweeps: 3,
+                max_sweeps_per_poll: 0,
+            },
             cancel: CancellationToken::new(),
-        progress_tracker: None,
+            progress_tracker: None,
             notificators: Vec::new(),
             probes: Vec::new(),
             external_inputs_open: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
@@ -1608,21 +1625,27 @@ mod tests {
     fn executor_runs_wired_pipeline() {
         use crate::communication::allocator::ChannelAllocator;
         use crate::dataflow::operators::handles::{InputHandle, OutputHandle};
-        use crate::dataflow::region::RegionId;
-        use crate::dataflow::wired_operators::{WiredSinkOperator, WiredSourceOperator, WiredUnaryOperator};
+        use crate::dataflow::stage::StageId;
+        use crate::dataflow::wired_operators::{
+            WiredSinkOperator, WiredSourceOperator, WiredUnaryOperator,
+        };
 
         let mut alloc = ChannelAllocator::new();
         let ch1 = alloc.allocate::<u64, i32, ()>();
         let ch2 = alloc.allocate::<u64, i32, ()>();
 
         let source: Box<dyn SchedulableOperator> = Box::new(WiredSourceOperator::new(
-            "source", 0, RegionId::new(0),
+            "source",
+            0,
+            StageId::new(0),
             vec![(0u64, vec![1, 2, 3]), (1u64, vec![10, 20])],
             ch1.pusher,
         ));
 
         let double: Box<dyn SchedulableOperator> = Box::new(WiredUnaryOperator::new(
-            "double", 1, RegionId::new(0),
+            "double",
+            1,
+            StageId::new(0),
             move |input: &mut InputHandle<u64, i32>, output: &mut OutputHandle<u64, i32>| {
                 while let Some((time, data)) = input.next() {
                     let mut session = output.session(time);
@@ -1637,7 +1660,9 @@ mod tests {
         ));
 
         let sink: Box<dyn SchedulableOperator> = Box::new(WiredSinkOperator::new(
-            "sink", 2, RegionId::new(0),
+            "sink",
+            2,
+            StageId::new(0),
             ch2.puller,
         ));
 
@@ -1649,7 +1674,7 @@ mod tests {
             index_to_pos: vec![0, 1, 2],
             config: ExecutorConfig::default(),
             cancel: CancellationToken::new(),
-        progress_tracker: None,
+            progress_tracker: None,
             notificators: Vec::new(),
             probes: Vec::new(),
             external_inputs_open: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
@@ -1695,7 +1720,7 @@ mod tests {
             operators: vec![Box::new(CountingOperator {
                 name: "op".into(),
                 index: 1,
-                region_id: crate::dataflow::region::RegionId::new(0),
+                stage_id: crate::dataflow::stage::StageId::new(0),
                 remaining: 2,
             })],
             ready_queue: VecDeque::from([0]),
@@ -1738,7 +1763,7 @@ mod tests {
             operators: vec![Box::new(CountingOperator {
                 name: "op".into(),
                 index: 1,
-                region_id: crate::dataflow::region::RegionId::new(0),
+                stage_id: crate::dataflow::stage::StageId::new(0),
                 remaining: 1,
             })],
             ready_queue: VecDeque::from([0]),
@@ -1794,7 +1819,7 @@ mod tests {
             operators: vec![Box::new(CountingOperator {
                 name: "op".into(),
                 index: 1,
-                region_id: crate::dataflow::region::RegionId::new(0),
+                stage_id: crate::dataflow::stage::StageId::new(0),
                 remaining: 1,
             })],
             ready_queue: VecDeque::from([0]),
@@ -1849,7 +1874,7 @@ mod tests {
             operators: vec![Box::new(CountingOperator {
                 name: "counter".into(),
                 index: 0,
-                region_id: crate::dataflow::region::RegionId::new(0),
+                stage_id: crate::dataflow::stage::StageId::new(0),
                 remaining: 2,
             })],
             ready_queue: VecDeque::from([0]),
@@ -1905,7 +1930,7 @@ mod tests {
         let mut executor: DataflowExecutor<u64> = DataflowExecutor {
             operators: vec![Box::new(IdleOperator {
                 index: 0,
-                region_id: crate::dataflow::region::RegionId::new(0),
+                stage_id: crate::dataflow::stage::StageId::new(0),
                 closed: false,
             })],
             ready_queue: VecDeque::from([0]),
@@ -1914,7 +1939,7 @@ mod tests {
             index_to_pos: vec![0],
             config: ExecutorConfig {
                 max_activations_per_step: 1024,
-                max_idle_sweeps: 1, // reach idle threshold quickly
+                max_idle_sweeps: 1,     // reach idle threshold quickly
                 max_sweeps_per_poll: 0, // no budget limit for this test
             },
             cancel: CancellationToken::new(),
@@ -1977,7 +2002,7 @@ mod tests {
         let mut executor: DataflowExecutor<u64> = DataflowExecutor {
             operators: vec![Box::new(IdleOperator {
                 index: 0,
-                region_id: crate::dataflow::region::RegionId::new(0),
+                stage_id: crate::dataflow::stage::StageId::new(0),
                 closed: false,
             })],
             ready_queue: VecDeque::from([0]),
@@ -2045,7 +2070,7 @@ mod tests {
             operators: vec![Box::new(CountingOperator {
                 name: "op".into(),
                 index: 0,
-                region_id: crate::dataflow::region::RegionId::new(0),
+                stage_id: crate::dataflow::stage::StageId::new(0),
                 remaining: 5,
             })],
             ready_queue: VecDeque::from([0]),
@@ -2186,7 +2211,7 @@ mod tests {
             operators: vec![Box::new(CountingOperator {
                 name: "busy".to_string(),
                 index: 0,
-                region_id: crate::dataflow::region::RegionId(0),
+                stage_id: crate::dataflow::stage::StageId(0),
                 remaining: 100, // way more than budget
             })],
             ready_queue: std::collections::VecDeque::from(vec![0]),
@@ -2251,7 +2276,7 @@ mod tests {
             operators: vec![Box::new(CountingOperator {
                 name: "busy".to_string(),
                 index: 0,
-                region_id: crate::dataflow::region::RegionId(0),
+                stage_id: crate::dataflow::stage::StageId(0),
                 remaining: 50,
             })],
             ready_queue: std::collections::VecDeque::from(vec![0]),
@@ -2300,7 +2325,7 @@ mod tests {
             operators: vec![Box::new(CountingOperator {
                 name: "counter".into(),
                 index: 0,
-                region_id: crate::dataflow::region::RegionId::new(0),
+                stage_id: crate::dataflow::stage::StageId::new(0),
                 remaining: 3,
             })],
             ready_queue: VecDeque::from([0]),
@@ -2344,19 +2369,19 @@ mod tests {
                 Box::new(CountingOperator {
                     name: "source".into(),
                     index: 0,
-                    region_id: crate::dataflow::region::RegionId::new(0),
+                    stage_id: crate::dataflow::stage::StageId::new(0),
                     remaining: 3,
                 }),
                 Box::new(CountingOperator {
                     name: "transform".into(),
                     index: 1,
-                    region_id: crate::dataflow::region::RegionId::new(0),
+                    stage_id: crate::dataflow::stage::StageId::new(0),
                     remaining: 2,
                 }),
                 Box::new(CountingOperator {
                     name: "sink".into(),
                     index: 2,
-                    region_id: crate::dataflow::region::RegionId::new(0),
+                    stage_id: crate::dataflow::stage::StageId::new(0),
                     remaining: 1,
                 }),
             ],
@@ -2400,7 +2425,7 @@ mod tests {
             operators: vec![Box::new(CountingOperator {
                 name: "counter".into(),
                 index: 0,
-                region_id: crate::dataflow::region::RegionId::new(0),
+                stage_id: crate::dataflow::stage::StageId::new(0),
                 remaining: 100,
             })],
             ready_queue: VecDeque::from([0]),
@@ -2448,7 +2473,7 @@ mod tests {
             operators: vec![Box::new(CountingOperator {
                 name: "op".into(),
                 index: 0,
-                region_id: crate::dataflow::region::RegionId::new(0),
+                stage_id: crate::dataflow::stage::StageId::new(0),
                 remaining: 10,
             })],
             ready_queue: VecDeque::from([0]),
@@ -2490,7 +2515,7 @@ mod tests {
         let mut executor: DataflowExecutor<u64> = DataflowExecutor {
             operators: vec![Box::new(IdleOperator {
                 index: 0,
-                region_id: crate::dataflow::region::RegionId::new(0),
+                stage_id: crate::dataflow::stage::StageId::new(0),
                 closed: false,
             })],
             ready_queue: VecDeque::from([0]),
@@ -2528,32 +2553,32 @@ mod tests {
     #[test]
     fn enable_fusion_from_graph_computes_topological_order() {
         use crate::dataflow::graph::{DataflowGraph, EdgeInfo, OperatorInfo};
-        use crate::dataflow::region::RegionId;
         use crate::dataflow::stage::FusedActivationOrder;
+        use crate::dataflow::stage::StageId;
         use crate::dataflow::stream::Slot;
 
         // Build a simple graph: op0 → op1 → op2
         let mut graph = DataflowGraph::new();
         graph
-            .register_operator(OperatorInfo::new(0, "source", RegionId::new(0), 0, 1))
+            .register_operator(OperatorInfo::new(0, "source", StageId::new(0), 0, 1))
             .unwrap();
         graph
-            .register_operator(OperatorInfo::new(1, "map", RegionId::new(0), 1, 1))
+            .register_operator(OperatorInfo::new(1, "map", StageId::new(0), 1, 1))
             .unwrap();
         graph
-            .register_operator(OperatorInfo::new(2, "sink", RegionId::new(0), 1, 0))
+            .register_operator(OperatorInfo::new(2, "sink", StageId::new(0), 1, 0))
             .unwrap();
         graph.add_edge(EdgeInfo::new(
             Slot::new(0, 0),
             Slot::new(1, 0),
-            RegionId::new(0),
-            RegionId::new(0),
+            StageId::new(0),
+            StageId::new(0),
         ));
         graph.add_edge(EdgeInfo::new(
             Slot::new(1, 0),
             Slot::new(2, 0),
-            RegionId::new(0),
-            RegionId::new(0),
+            StageId::new(0),
+            StageId::new(0),
         ));
 
         let mut executor: DataflowExecutor<u64> = DataflowExecutor {
@@ -2561,19 +2586,19 @@ mod tests {
                 Box::new(CountingOperator {
                     name: "source".into(),
                     index: 0,
-                    region_id: RegionId::new(0),
+                    stage_id: StageId::new(0),
                     remaining: 1,
                 }),
                 Box::new(CountingOperator {
                     name: "map".into(),
                     index: 1,
-                    region_id: RegionId::new(0),
+                    stage_id: StageId::new(0),
                     remaining: 1,
                 }),
                 Box::new(CountingOperator {
                     name: "sink".into(),
                     index: 2,
-                    region_id: RegionId::new(0),
+                    stage_id: StageId::new(0),
                     remaining: 1,
                 }),
             ],
@@ -2612,12 +2637,12 @@ mod tests {
     #[test]
     fn enable_fusion_from_graph_returns_error_on_mismatch() {
         use crate::dataflow::graph::{DataflowGraph, OperatorInfo};
-        use crate::dataflow::region::RegionId;
+        use crate::dataflow::stage::StageId;
 
         // Graph has 1 operator but executor has 2 — mismatch.
         let mut graph = DataflowGraph::new();
         graph
-            .register_operator(OperatorInfo::new(0, "op0", RegionId::new(0), 0, 0))
+            .register_operator(OperatorInfo::new(0, "op0", StageId::new(0), 0, 0))
             .unwrap();
 
         let mut executor: DataflowExecutor<u64> = DataflowExecutor {
@@ -2625,13 +2650,13 @@ mod tests {
                 Box::new(CountingOperator {
                     name: "op0".into(),
                     index: 0,
-                    region_id: RegionId::new(0),
+                    stage_id: StageId::new(0),
                     remaining: 1,
                 }),
                 Box::new(CountingOperator {
                     name: "op1".into(),
                     index: 1,
-                    region_id: RegionId::new(0),
+                    stage_id: StageId::new(0),
                     remaining: 1,
                 }),
             ],
@@ -2673,17 +2698,17 @@ mod tests {
             operators: vec![
                 Box::new(IdleOperator {
                     index: 0,
-                    region_id: crate::dataflow::region::RegionId::new(0),
+                    stage_id: crate::dataflow::stage::StageId::new(0),
                     closed: false,
                 }),
                 Box::new(IdleOperator {
                     index: 1,
-                    region_id: crate::dataflow::region::RegionId::new(0),
+                    stage_id: crate::dataflow::stage::StageId::new(0),
                     closed: false,
                 }),
                 Box::new(IdleOperator {
                     index: 2,
-                    region_id: crate::dataflow::region::RegionId::new(0),
+                    stage_id: crate::dataflow::stage::StageId::new(0),
                     closed: false,
                 }),
             ],
@@ -2734,19 +2759,19 @@ mod tests {
                 Box::new(CountingOperator {
                     name: "op0".into(),
                     index: 0,
-                    region_id: crate::dataflow::region::RegionId::new(0),
+                    stage_id: crate::dataflow::stage::StageId::new(0),
                     remaining: 2,
                 }),
                 Box::new(CountingOperator {
                     name: "op1".into(),
                     index: 1,
-                    region_id: crate::dataflow::region::RegionId::new(0),
+                    stage_id: crate::dataflow::stage::StageId::new(0),
                     remaining: 1,
                 }),
                 Box::new(CountingOperator {
                     name: "op2".into(),
                     index: 2,
-                    region_id: crate::dataflow::region::RegionId::new(0),
+                    stage_id: crate::dataflow::stage::StageId::new(0),
                     remaining: 1,
                 }),
             ],
@@ -2807,19 +2832,19 @@ mod tests {
                 Box::new(CountingOperator {
                     name: "a".into(),
                     index: 0,
-                    region_id: crate::dataflow::region::RegionId::new(0),
+                    stage_id: crate::dataflow::stage::StageId::new(0),
                     remaining: 3,
                 }),
                 Box::new(CountingOperator {
                     name: "b".into(),
                     index: 1,
-                    region_id: crate::dataflow::region::RegionId::new(0),
+                    stage_id: crate::dataflow::stage::StageId::new(0),
                     remaining: 2,
                 }),
                 Box::new(CountingOperator {
                     name: "c".into(),
                     index: 2,
-                    region_id: crate::dataflow::region::RegionId::new(0),
+                    stage_id: crate::dataflow::stage::StageId::new(0),
                     remaining: 1,
                 }),
             ],
@@ -2866,7 +2891,7 @@ mod tests {
             operators: vec![Box::new(CountingOperator {
                 name: "op0".into(),
                 index: 0,
-                region_id: crate::dataflow::region::RegionId::new(0),
+                stage_id: crate::dataflow::stage::StageId::new(0),
                 remaining: 1,
             })],
             ready_queue: VecDeque::new(),

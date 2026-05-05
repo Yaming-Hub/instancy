@@ -693,7 +693,7 @@ mod tests {
         let mut handle = OutputHandle::<u64, i32>::new("test");
 
         handle.push_vec(1, vec![10, 20]);
-        handle.push_vec(2, vec![]);  // empty batch ignored
+        handle.push_vec(2, vec![]); // empty batch ignored
         handle.push_vec(3, vec![30]);
 
         assert_eq!(handle.buffered_count(), 2);

@@ -2,7 +2,7 @@
 //!
 //! The output system bridges the dataflow graph back to external consumers.
 //! Terminal operators produce [`OutputEvent`]s through [`OutputStream`]s,
-//! one per worker in the final execution region.
+//! one per worker in the final execution stage.
 
 use std::fmt;
 use std::sync::mpsc;
@@ -79,7 +79,7 @@ impl<T: Timestamp + fmt::Display, D> fmt::Display for OutputEvent<T, D> {
 ///
 /// This is the consumer-facing async stream that bridges the dataflow's
 /// internal bounded buffer to an external consumer. There is one
-/// `OutputStream` per worker in the final execution region.
+/// `OutputStream` per worker in the final execution stage.
 pub struct OutputStream<T: Timestamp, D> {
     /// The worker index that produced this stream.
     worker_index: usize,
@@ -174,9 +174,7 @@ impl<T: Timestamp, D> OutputSender<T, D> {
 
     /// Send an output event, blocking if the buffer is full.
     pub fn send_blocking(&self, event: OutputEvent<T, D>) -> Result<()> {
-        self.sender
-            .send(event)
-            .map_err(|_| Error::ChannelClosed)
+        self.sender.send(event).map_err(|_| Error::ChannelClosed)
     }
 
     /// The worker index.
@@ -282,15 +280,9 @@ mod tests {
     fn output_pair_basic() {
         let (sender, stream) = output_pair::<u64, i32>(0, 16);
 
-        sender
-            .send(OutputEvent::data(1, vec![10, 20]))
-            .unwrap();
-        sender
-            .send(OutputEvent::frontier(1))
-            .unwrap();
-        sender
-            .send(OutputEvent::data(2, vec![30]))
-            .unwrap();
+        sender.send(OutputEvent::data(1, vec![10, 20])).unwrap();
+        sender.send(OutputEvent::frontier(1)).unwrap();
+        sender.send(OutputEvent::data(2, vec![30])).unwrap();
 
         let e1 = stream.next().unwrap();
         assert_eq!(e1, OutputEvent::data(1, vec![10, 20]));
@@ -375,9 +367,7 @@ mod tests {
 
         for (i, sender) in senders.iter().enumerate() {
             assert_eq!(sender.worker_index(), i);
-            sender
-                .send(OutputEvent::data(1, vec![i as i32]))
-                .unwrap();
+            sender.send(OutputEvent::data(1, vec![i as i32])).unwrap();
         }
 
         for (i, stream) in streams.iter().enumerate() {
@@ -414,12 +404,8 @@ mod tests {
     fn output_sender_blocking_send() {
         let (sender, stream) = output_pair::<u64, i32>(0, 2);
 
-        sender
-            .send_blocking(OutputEvent::data(1, vec![1]))
-            .unwrap();
-        sender
-            .send_blocking(OutputEvent::data(2, vec![2]))
-            .unwrap();
+        sender.send_blocking(OutputEvent::data(1, vec![1])).unwrap();
+        sender.send_blocking(OutputEvent::data(2, vec![2])).unwrap();
 
         let e1 = stream.next().unwrap();
         assert_eq!(e1, OutputEvent::data(1, vec![1]));

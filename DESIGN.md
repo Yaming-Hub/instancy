@@ -72,7 +72,7 @@ instancy/
 │   │   │   ├── mod.rs
 │   │   │   ├── scope.rs     — Scope trait + ChildScope
 │   │   │   ├── stream.rs    — StreamEdge<S, C>
-│   │   │   ├── region.rs    — Region, PlacementPolicy
+│   │   │   ├── stage.rs     — StageId, StageInfo, infer_stages
 │   │   │   ├── channels/    — Push/Pull abstractions, Envelope
 │   │   │   └── operators/
 │   │   │       ├── mod.rs
@@ -165,7 +165,7 @@ A fundamental design choice in instancy is the complete separation between **log
 ┌─────────────────────────────────────────────────────────────────────┐
 │                   Logical Layer (Pure Computation)                   │
 │                                                                     │
-│  Dataflow graph, operators, streams, regions, workers, timestamps   │
+│  Dataflow graph, operators, streams, stages, workers, timestamps    │
 │  Progress tracking, capability exchange, frontier computation       │
 │  ← No knowledge of threads, network, OS, or physical topology →     │
 └─────────────────────────────┬───────────────────────────────────────┘
@@ -189,7 +189,7 @@ A fundamental design choice in instancy is the complete separation between **log
 
 ### Logical Targets
 
-When a stream produces data for a downstream operator, it addresses a **logical target** — a combination of `(RegionId, WorkerId, OperatorIndex)`. The stream never knows whether the target is:
+When a stream produces data for a downstream operator, it addresses a **logical target** — a combination of `(StageId, WorkerId, OperatorIndex)`. The stream never knows whether the target is:
 - On the same OS thread (just write into a buffer)
 - On a different thread in the same process (lock-free queue)
 - On a remote machine (serialize + network send)
@@ -200,9 +200,9 @@ The **TransportProvider** resolves logical targets to physical delivery:
 /// Identifies a logical destination for data delivery.
 #[derive(Debug, Clone, Hash, Eq, PartialEq)]
 pub struct LogicalTarget {
-    /// The execution region containing the target operator.
-    pub region: RegionId,
-    /// The logical worker index within the region.
+    /// The stage containing the target operator.
+    pub stage: StageId,
+    /// The logical worker index within the stage.
     pub worker: WorkerId,
     /// The operator index within the worker.
     pub operator: usize,
@@ -238,8 +238,8 @@ pub trait ExecutionProvider: Send + Sync + 'static {
     /// Submit a task for a logical worker to be executed on a physical thread.
     fn submit_task(&self, worker: WorkerId, task: Box<dyn FnOnce() + Send>);
 
-    /// Returns the maximum concurrent tasks allowed for a region.
-    fn region_concurrency(&self, region: RegionId) -> usize;
+    /// Returns the maximum concurrent tasks allowed for a stage.
+    fn stage_concurrency(&self, stage: StageId) -> usize;
 }
 ```
 
@@ -695,7 +695,7 @@ We retain the concept of a **logical worker ID** — a `WorkerId` — which serv
 
 1. **FIFO ordering**: All operator tasks assigned to the same `WorkerId` execute in FIFO sequence. This is enforced by per-worker task sub-queues that are drained into the shared pool queue sequentially.
 
-2. **Parallelism control**: A dataflow's execution region declares its parallelism (e.g., 4). The pool ensures that **at most N tasks from that region are executing concurrently** using a lightweight counting semaphore.
+2. **Parallelism control**: A dataflow stage declares its parallelism (e.g., 4). The pool ensures that **at most N tasks from that stage are executing concurrently** using a lightweight counting semaphore.
 
 3. **Data partitioning**: The `exchange` operator routes data by `hash(item) % total_workers`. The `WorkerId` determines which partition an operator instance belongs to.
 
@@ -820,14 +820,14 @@ impl ClusterTopology {
 
 **How logical workers are enforced on the Worker Thread Pool:**
 
-Each logical `WorkerId` has a per-worker FIFO queue. The Worker Thread Pool processes these queues respecting FIFO ordering per worker and concurrency limits per execution region:
+Each logical `WorkerId` has a per-worker FIFO queue. The Worker Thread Pool processes these queues respecting FIFO ordering per worker and concurrency limits per stage:
 
 ```
 ┌──────────────────────────────────────────────────────────────────┐
 │                     Worker Thread Pool (custom threads)                 │
 │             Threads poll from shared queue, run tasks             │
 │                                                                  │
-│  Dataflow A (region: parallelism=4)                              │
+│  Dataflow A (stage: parallelism=4)                               │
 │  ┌─────────────┐ ┌─────────────┐ ┌─────────────┐ ┌────────────┐│
 │  │ Worker 0    │ │ Worker 1    │ │ Worker 2    │ │ Worker 3   ││
 │  │ ┌─────────┐ │ │ ┌─────────┐ │ │ ┌─────────┐ │ │ ┌────────┐ ││
@@ -837,9 +837,9 @@ Each logical `WorkerId` has a per-worker FIFO queue. The Worker Thread Pool proc
 │  │ └─────────┘ │ │ └─────────┘ │ │ └─────────┘ │ │ └────────┘ ││
 │  └─────────────┘ └─────────────┘ └─────────────┘ └────────────┘│
 │                                                                  │
-│  Concurrency limit: at most 4 tasks from this region run at once │
+│  Concurrency limit: at most 4 tasks from this stage run at once  │
 │                                                                  │
-│  Dataflow B (region: parallelism=2) — shares the same threads   │
+│  Dataflow B (stage: parallelism=2) — shares the same threads    │
 │  ┌─────────────┐ ┌─────────────┐                                │
 │  │ Worker 0    │ │ Worker 1    │                                │
 │  └─────────────┘ └─────────────┘                                │
@@ -857,8 +857,8 @@ struct ComputeTask {
     worker_id: WorkerId,
     /// The operator activation to execute.
     activation: OperatorActivation,
-    /// Region concurrency permit (limits parallel tasks per region).
-    region_permit: Arc<CountingSemaphore>,
+    /// Stage concurrency permit (limits parallel tasks per stage).
+    stage_permit: Arc<CountingSemaphore>,
 }
 
 /// Manages per-worker FIFO queues and dispatches to the pool.
@@ -910,13 +910,13 @@ type OperatorFn<T, C1, C2> = dyn FnMut(
 
 When an operator has input data ready, an activation is posted to its logical worker's queue. The Worker Thread Pool's task scheduler dispatches it to a thread when:
 1. The worker has no other task in-flight (FIFO guarantee), and
-2. The region's concurrency limit has not been reached.
+2. The stage's concurrency limit has not been reached.
 
 This gives us:
 - **FIFO within a worker**: operators on the same worker are activated in order.
-- **Bounded parallelism per region**: at most N tasks from a region run concurrently.
+- **Bounded parallelism per stage**: at most N tasks from a stage run concurrently.
 - **Zero async overhead**: operator logic is a plain function call on a plain thread.
-- **Fair sharing**: multiple dataflows share the same pool threads, with per-region concurrency limits preventing starvation.
+- **Fair sharing**: multiple dataflows share the same pool threads, with per-stage concurrency limits preventing starvation.
 - **Low latency**: spinning phase means back-to-back tasks execute with sub-microsecond scheduling overhead.
 
 ```
@@ -935,7 +935,7 @@ I/O Runtime (Tokio) ──► reads input stream ──► enqueues to Worker qu
 
 1. Data arrives on an operator's input buffer (pushed by upstream, or read by I/O runtime from network/input stream).
 2. The task scheduler posts an activation to the operator's `WorkerId` queue.
-3. When the worker has no in-flight task and the region has spare concurrency, the task is moved to the ready queue.
+3. When the worker has no in-flight task and the stage has spare concurrency, the task is moved to the ready queue.
 4. A Worker Thread Pool thread dequeues it and calls the operator's synchronous logic.
 5. The operator produces output, which is written to downstream input buffers.
 6. The thread signals task completion; the scheduler dispatches the next task for that worker.
@@ -958,7 +958,7 @@ runtime and performs the following for each operator input:
 5. **Creates an OperatorActivation** — wraps a closure that will invoke the operator's
    `FnMut` logic with a reference to the filled input buffer. The closure captures
    access to the operator's input/output handles.
-6. **Enqueues into TaskScheduler** — calls `TaskScheduler::enqueue(activation, region_id)`.
+6. **Enqueues into TaskScheduler** — calls `TaskScheduler::enqueue(activation, stage_id)`.
    The scheduler places it in the per-worker FIFO queue.
 7. **Resets the accumulator** — calls `BatchAccumulator::reset()` to start fresh for
    the next batch.
@@ -1050,10 +1050,10 @@ stream.unary("word_count", |input, output| {
 
 #### 5.4.3 Operator Instantiation & the SPMD Model
 
-In the SPMD model, each logical worker independently builds and runs the same dataflow graph. When a region has parallelism=5, there are 5 workers, each creating its own instance of every operator in that region. The **operator index is the same** across all workers — what differs is the **worker ID**.
+In the SPMD model, each logical worker independently builds and runs the same dataflow graph. When a stage has parallelism=5, there are 5 workers, each creating its own instance of every operator in that stage. The **operator index is the same** across all workers — what differs is the **worker ID**.
 
 ```
-Region (parallelism=5):
+Stage (parallelism=5):
   Worker 0: operator "filter" (index=3), operator "aggregate" (index=4)
   Worker 1: operator "filter" (index=3), operator "aggregate" (index=4)
   Worker 2: operator "filter" (index=3), operator "aggregate" (index=4)
@@ -1195,7 +1195,7 @@ pub enum OutputEvent<T: Timestamp, D> {
 /// The orchestrator wires the final operator's output to the sink at
 /// construction time — no intermediate async channel sits between the
 /// operator and the destination. One sink instance is created per worker
-/// in the last execution region.
+/// in the last stage.
 #[async_trait]
 pub trait OutputSink<T: Timestamp, D: Send>: Send + Sync {
     /// Called for each output event produced by the final operator.
@@ -1312,7 +1312,7 @@ impl<T: Timestamp, D: Data> DataflowSpec<T, D> {
 }
 
 /// Run one or more dataflows on the Worker Thread Pool + I/O runtime.
-/// Returns output streams for each dataflow (one stream per worker in the last region).
+/// Returns output streams for each dataflow (one stream per worker in the last stage).
 pub async fn execute<T: Timestamp, D: Data>(
     runtime_config: RuntimeConfig,
     spec: DataflowSpec<T, D>,
@@ -1325,7 +1325,7 @@ pub async fn execute<T: Timestamp, D: Data>(
 
 /// Handle to a running or completed dataflow.
 pub struct DataflowHandle<T: Timestamp, D: Data> {
-    /// Output streams — one per worker in the last execution region.
+    /// Output streams — one per worker in the last stage.
     /// The caller consumes these to receive dataflow results.
     pub outputs: Vec<OutputStream<T, D>>,
     /// Metrics for this dataflow (available after completion).
@@ -1364,7 +1364,7 @@ When cancelled:
 
 Since multiple dataflows share the same Worker Thread Pool, we need controls to prevent one dataflow from starving others:
 
-- **Per-region concurrency limit**: the primary mechanism. Each execution region has a counting semaphore that limits how many tasks from that region can run concurrently (equal to the region's parallelism on this node).
+- **Per-stage concurrency limit**: the primary mechanism. Each stage has a counting semaphore that limits how many tasks from that stage can run concurrently (equal to the stage's parallelism on this node).
 - **Bounded input buffers** create natural backpressure — a fast producer's enqueue blocks when the downstream buffer is full.
 - **Per-worker FIFO dispatch**: the task scheduler only dispatches the next task for a worker when the current one completes, preventing a single worker from flooding the pool.
 - **Cross-dataflow fairness**: since the Worker Thread Pool's shared queue is FIFO across all dataflows, no single dataflow can monopolize threads indefinitely. The round-robin effect of interleaved task completions provides natural fairness.
@@ -1636,7 +1636,7 @@ pub enum ErrorKind {
     /// Applies to inter-process data exchange channels.
     NetworkError,
     /// A remote worker is no longer reachable (heartbeat lost, process crashed).
-    /// The affected region/partition cannot make progress.
+    /// The affected stage/partition cannot make progress.
     WorkerLost,
     /// The dataflow was explicitly cancelled via CancellationToken.
     Cancelled,
@@ -1948,11 +1948,11 @@ Solution: per-stage parallelism
        auto-inferred                  auto-inferred                      auto-inferred         auto-inferred
 ```
 
-#### Stages (replacing Execution Regions)
+#### Stages
 
 A **stage** is a maximal group of contiguous operators connected by Pipeline edges. All operators in a stage share the same parallelism and are **fused into a single schedulable task** per worker. Stage boundaries are created **implicitly** by repartition operators — the user never manages stages directly.
 
-This design replaces the earlier "execution regions" concept. Regions required explicit user management (`new_region()`, `in_region()`), but since exchange/gather already forms the natural boundary, stages are auto-inferred with no extra API.
+Stages are auto-inferred from repartition boundaries, so no explicit grouping API is needed.
 
 **Key benefit: operator fusion.** All operators in a stage run as one poll cycle, reducing scheduling overhead. A dataflow with 20 operators across 3 stages and 8 workers creates 24 tasks instead of 160.
 
@@ -1961,7 +1961,6 @@ pub struct StageInfo {
     pub id: StageId,
     pub parallelism: usize,
     pub operator_indices: Vec<usize>,
-    pub placement: PlacementPolicy,
     pub name: Option<String>,
 }
 ```
@@ -1992,7 +1991,7 @@ let result = input.map(|x| x * 2).filter(|x| x > 100);
 
 #### API
 
-Parallelism is specified at repartition points — no region management needed:
+Parallelism is specified at repartition points — no explicit stage management needed:
 
 ```rust
 let output = builder
@@ -2459,8 +2458,8 @@ pub enum Error {
 | `binary` | Two inputs, one output; user-supplied async closure |
 | `branch` / `ok_err` | One input, two outputs; partition by predicate |
 | `feedback` / `loop_variable` | Creates a feedback edge for iteration with timestamp advancement |
-| `exchange` | Repartitions data across workers by a routing function (hash-based); creates region boundary when parallelism changes |
-| `rebalance` | Round-robin distribution across target replicas; used at region boundaries when key doesn't matter |
+| `exchange` | Repartitions data across workers by a routing function (hash-based); creates a stage boundary when parallelism changes |
+| `rebalance` | Round-robin distribution across target replicas; used at stage boundaries when key doesn't matter |
 | `gather` | Funnels all data to a single replica (parallelism 1); used for global aggregation |
 | `broadcast` | Sends each record to **all** workers across the cluster (clones data cross-process via serialization) |
 | `broadcast_local` | Sends each record to all workers **within the same process** (cheap clone, no serialization) |
@@ -3239,14 +3238,14 @@ Default batch size: 1024 items (configurable).
 
 **Rayon rejected** because:
 - Rayon is designed for fork-join parallelism, not a persistent task queue
-- Rayon doesn't support per-worker FIFO ordering or per-region concurrency limits
+- Rayon doesn't support per-worker FIFO ordering or per-stage concurrency limits
 - Rayon doesn't support dynamic thread scaling (min/max with idle shutdown)
 
 **Custom pool advantages**:
 - Minimal overhead: dequeue → call closure → enqueue results
 - Spin/yield/park idle strategy tuned for dataflow burst patterns
 - Dynamic scaling between min/max threads
-- Per-region concurrency limits built into the scheduler
+- Per-stage concurrency limits built into the scheduler
 - Per-worker FIFO guarantee without extra synchronization
 
 **Hybrid approach (future optimization)**: Fuse chains of pipeline-local operators (e.g., `map -> filter -> map`) into a single task to eliminate intermediate buffer overhead.
@@ -3512,7 +3511,7 @@ For a 10μs operator processing a 1024-item batch, useful fraction ≈ 99.5%. Fo
 1. **Batch processing**: Operators always receive and produce `Vec<D>` batches. The scheduler enqueues one task per (worker, operator, batch) — not one per record.
 2. **Operator fusion (future)**: Chains of pipeline-local operators (e.g., `map → filter → map`) can be fused into a single task, eliminating intermediate buffer writes and task transitions.
 3. **Per-worker FIFO**: Tasks for the same logical worker are dispatched in order without extra synchronization — the scheduler's per-worker queue avoids lock contention.
-4. **Region permits**: Per-region concurrency limits prevent thread starvation across dataflows sharing the pool.
+4. **Stage permits**: Per-stage concurrency limits prevent thread starvation across dataflows sharing the pool.
 5. **Time-bounded message batching**: Instead of scheduling an operator activation for every arriving message, the orchestrator accumulates messages in the operator's input buffer and dispatches a single activation once a batching threshold is reached (see below).
 
 #### 12.6.2a Time-Bounded Message Batching
@@ -3805,8 +3804,8 @@ File descriptors:
 **Anti-patterns to avoid:**
 
 1. **Unbounded producer with small buffer**: A fast external source pushing into a small-buffer `ChannelInput` will spend most of its time blocked. Either increase buffer size or add flow control at the source.
-2. **Under-parallelized bottleneck stage**: If one execution region has high `cpu_time` and high upstream `backpressure.blocked_duration`, increase that region's parallelism.
-3. **Over-parallelized idle stage**: If an execution region has many workers but low `cpu_time`, reduce parallelism to free pool threads for bottleneck regions.
+2. **Under-parallelized bottleneck stage**: If one stage has high `cpu_time` and high upstream `backpressure.blocked_duration`, increase that stage's parallelism.
+3. **Over-parallelized idle stage**: If a stage has many workers but low `cpu_time`, reduce parallelism to free pool threads for bottleneck stages.
 4. **Too many connections**: More connections per peer doesn't always help — contention on the serialization path can negate the benefit. Profile before adding connections.
 5. **Tiny batches across network**: Sending 1-item batches over the network pays full framing + serialization overhead per item. Batch at the source or add a buffering operator.
 
@@ -3994,9 +3993,9 @@ pub enum AggregatedOutcome {
 
 1. **The coordinator is the host application's responsibility, not instancy's** — instancy is a dataflow execution library, not a distributed job scheduler. The host application implements all coordination logic: receiving user requests, launching dataflows on remote nodes, collecting results, and returning them to callers. This separation keeps instancy focused and avoids imposing a specific coordination pattern on diverse applications.
 
-2. **Worker placement is decided by the coordinator (host app)** — a dataflow does not necessarily run on all cluster nodes. The coordinator selects which nodes participate and how many logical workers each node contributes. It builds a per-dataflow `ClusterTopology` containing only the selected nodes and their worker assignments, then passes this topology to each node when starting the dataflow. instancy does not make placement decisions — it executes the assignment it receives. instancy may provide a `PlacementStrategy` trait and validation helpers (e.g., verify total workers match region parallelism requirements), but actual placement logic depends on factors only the host app knows: node load, data locality, cost constraints, hardware capabilities, etc.
+2. **Worker placement is decided by the coordinator (host app)** — a dataflow does not necessarily run on all cluster nodes. The coordinator selects which nodes participate and how many logical workers each node contributes. It builds a per-dataflow `ClusterTopology` containing only the selected nodes and their worker assignments, then passes this topology to each node when starting the dataflow. instancy does not make placement decisions — it executes the assignment it receives. instancy may provide a `PlacementStrategy` trait and validation helpers (e.g., verify total workers match stage parallelism requirements), but actual placement logic depends on factors only the host app knows: node load, data locality, cost constraints, hardware capabilities, etc.
 
-3. **Data locality is application knowledge, not instancy's** — expanding on #2 above: instancy is a data-locality-agnostic execution engine. It provides mechanisms — per-worker named input ports, configurable cluster topology, exchange operators — but never assumes where data resides or how partitions map to workers. The hosting application has full knowledge of data placement and configures the dataflow accordingly. For example, if a dataset has 8 partitions across 2 machines (4 per machine), the host app starts 2 nodes with 4 logical workers each, and feeds each worker its local partition by binding a separate `TimestampedInput` stream per worker (e.g., `.input("data_0", partition_0_stream)` through `.input("data_3", partition_3_stream)` on each node). First-region operators process data locally (no exchange needed), reducing data volume before cross-node `exchange()` in later regions. This data-local-first pattern minimizes network traffic and maximizes throughput, but it is entirely the host app's decision — instancy simply executes the worker-to-partition mapping it receives. Worker IDs are global and assigned by the topology (via node ordering in `ClusterTopology`); the host should compute each node's worker-id range from the topology rather than assuming `0..N` are local.
+3. **Data locality is application knowledge, not instancy's** — expanding on #2 above: instancy is a data-locality-agnostic execution engine. It provides mechanisms — per-worker named input ports, configurable cluster topology, exchange operators — but never assumes where data resides or how partitions map to workers. The hosting application has full knowledge of data placement and configures the dataflow accordingly. For example, if a dataset has 8 partitions across 2 machines (4 per machine), the host app starts 2 nodes with 4 logical workers each, and feeds each worker its local partition by binding a separate `TimestampedInput` stream per worker (e.g., `.input("data_0", partition_0_stream)` through `.input("data_3", partition_3_stream)` on each node). First-stage operators process data locally (no exchange needed), reducing data volume before cross-node `exchange()` in later stages. This data-local-first pattern minimizes network traffic and maximizes throughput, but it is entirely the host app's decision — instancy simply executes the worker-to-partition mapping it receives. Worker IDs are global and assigned by the topology (via node ordering in `ClusterTopology`); the host should compute each node's worker-id range from the topology rather than assuming `0..N` are local.
 
     ```
     Host app decides placement based on data locality:
@@ -4008,10 +4007,10 @@ pub enum AggregatedOutcome {
     │ Partition 2 → Worker 2     │         │ Partition 6 → Worker 6     │
     │ Partition 3 → Worker 3     │         │ Partition 7 → Worker 7     │
     │                            │         │                            │
-    │ First region: local        │         │ First region: local        │
+    │ First stage: local         │         │ First stage: local         │
     │ processing (no shuffle)    │         │ processing (no shuffle)    │
     │                            │         │                            │
-    │ Later regions:             │◄───────►│ Later regions:             │
+    │ Later stages:              │◄───────►│ Later stages:              │
     │ exchange() across nodes    │         │ exchange() across nodes    │
     │ (all-to-all by hash key)   │         │ (all-to-all by hash key)   │
     └────────────────────────────┘         └────────────────────────────┘

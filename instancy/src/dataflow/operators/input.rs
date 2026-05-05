@@ -129,9 +129,7 @@ pub struct ChannelInput<T: Timestamp, D> {
 impl<T: Timestamp, D> ChannelInput<T, D> {
     /// Create a new channel input with the given name.
     /// Returns both the input source and the sender for pushing events.
-    pub fn new(
-        name: impl Into<String>,
-    ) -> (Self, std::sync::mpsc::SyncSender<InputEvent<T, D>>) {
+    pub fn new(name: impl Into<String>) -> (Self, std::sync::mpsc::SyncSender<InputEvent<T, D>>) {
         Self::with_capacity(name, 1024)
     }
 
@@ -199,11 +197,14 @@ mod tests {
 
     #[test]
     fn vec_input_drains_in_order() {
-        let mut input = VecInput::new("test", vec![
-            InputEvent::data(1, vec![10]),
-            InputEvent::data(2, vec![20]),
-            InputEvent::frontier(2),
-        ]);
+        let mut input = VecInput::new(
+            "test",
+            vec![
+                InputEvent::data(1, vec![10]),
+                InputEvent::data(2, vec![20]),
+                InputEvent::frontier(2),
+            ],
+        );
 
         assert_eq!(input.name(), "test");
 

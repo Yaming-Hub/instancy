@@ -355,10 +355,7 @@ mod tests {
         senders[0].broadcast_cancel(CancellationReason::UserRequested);
 
         assert!(df_cancel.is_cancelled());
-        assert_eq!(
-            df_cancel.reason(),
-            Some(CancellationReason::UserRequested)
-        );
+        assert_eq!(df_cancel.reason(), Some(CancellationReason::UserRequested));
     }
 
     #[test]
@@ -513,7 +510,11 @@ mod tests {
         // Now the log should be compacted — both cursors advanced past all signals.
         {
             let inner = receivers[0].inner.lock().unwrap();
-            assert_eq!(inner.signals.len(), 0, "log should be empty after compaction");
+            assert_eq!(
+                inner.signals.len(),
+                0,
+                "log should be empty after compaction"
+            );
             assert_eq!(inner.base_offset, 3, "base_offset should advance");
         }
 

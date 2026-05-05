@@ -49,8 +49,8 @@
 use std::collections::VecDeque;
 use std::sync::{Arc, Mutex};
 
-use crate::progress::timestamp::Timestamp;
 use crate::dataflow::channels::wake::WakeHandle;
+use crate::progress::timestamp::Timestamp;
 
 /// A single progress change: (operator_index, output_port, timestamp, diff).
 ///
@@ -126,7 +126,10 @@ impl<T: Timestamp> ProgressSender<T> {
     /// Create a local in-memory progress sender.
     pub(crate) fn local(buffer: Arc<Mutex<SharedBuffer<T>>>, target_wake: WakeHandle) -> Self {
         Self {
-            inner: SenderInner::Local { buffer, target_wake },
+            inner: SenderInner::Local {
+                buffer,
+                target_wake,
+            },
         }
     }
 
@@ -143,7 +146,10 @@ impl<T: Timestamp> ProgressSender<T> {
             return;
         }
         match &self.inner {
-            SenderInner::Local { buffer, target_wake } => {
+            SenderInner::Local {
+                buffer,
+                target_wake,
+            } => {
                 {
                     let mut buf = buffer.lock().expect("progress channel lock poisoned");
                     buf.queue.push_back(changes);
@@ -217,10 +223,7 @@ pub fn create_progress_channels<T: Timestamp>(
                 queue: VecDeque::new(),
             }));
 
-            let sender = ProgressSender::local(
-                Arc::clone(&shared),
-                wake_handles[dst].clone(),
-            );
+            let sender = ProgressSender::local(Arc::clone(&shared), wake_handles[dst].clone());
             let receiver = ProgressReceiver::new(shared);
 
             all_channels[src].senders[dst] = Some(sender);
@@ -243,7 +246,10 @@ mod tests {
         // Worker 0 sends to Worker 1.
         let w0 = &channels[0];
         w0.senders[1].as_ref().unwrap().send(vec![(0, 0, 42u64, 1)]);
-        w0.senders[1].as_ref().unwrap().send(vec![(0, 0, 42u64, -1)]);
+        w0.senders[1]
+            .as_ref()
+            .unwrap()
+            .send(vec![(0, 0, 42u64, -1)]);
 
         // Worker 1 receives from Worker 0.
         let w1 = &channels[1];
@@ -301,7 +307,10 @@ mod tests {
         let recv = channels[1].receivers[0].as_ref().unwrap();
         assert!(!recv.has_pending());
 
-        channels[0].senders[1].as_ref().unwrap().send(vec![(0, 0, 1u64, 1)]);
+        channels[0].senders[1]
+            .as_ref()
+            .unwrap()
+            .send(vec![(0, 0, 1u64, 1)]);
         assert!(recv.has_pending());
 
         recv.drain_all();

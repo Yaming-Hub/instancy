@@ -8,7 +8,7 @@
 //!
 //! **Not published** — this crate exists solely for integration testing.
 
-pub mod protocol;
+pub mod coordinator;
 pub mod dataflows;
 pub mod node_actor;
-pub mod coordinator;
+pub mod protocol;

@@ -12,9 +12,9 @@
 //! The channel type is chosen at spawn time via `ChannelMode`.
 
 use std::collections::VecDeque;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::mpsc;
-use std::sync::Arc;
 use std::time::Duration;
 
 use crate::dataflow::channels::envelope::Envelope;
@@ -22,11 +22,11 @@ use crate::dataflow::channels::pushpull::{Pull, Push};
 use crate::dataflow::channels::wake::WakeHandle;
 use crate::dataflow::operators::input::InputEvent;
 use crate::dataflow::operators::output::OutputEvent;
-use crate::dataflow::region::RegionId;
 use crate::dataflow::schedulable::{ActivationOutcome, SchedulableOperator};
+use crate::dataflow::stage::StageId;
 use crate::error::Result;
-use crate::progress::operate::ProgressReporter;
 use crate::order::PartialOrder;
+use crate::progress::operate::ProgressReporter;
 use crate::progress::timestamp::Timestamp;
 
 // ---------------------------------------------------------------------------
@@ -128,7 +128,7 @@ impl<T> OutputSend<T> {
 pub struct ChannelSourceOperator<T: Timestamp, D: Send + 'static> {
     name: String,
     index: usize,
-    region_id: RegionId,
+    stage_id: StageId,
     receiver: InputRecv<InputEvent<T, D>>,
     output_pusher: Box<dyn Push<T, D>>,
     pending_output: VecDeque<Envelope<T, D>>,
@@ -145,7 +145,7 @@ impl<T: Timestamp, D: Send + 'static> ChannelSourceOperator<T, D> {
     pub(crate) fn new(
         name: String,
         index: usize,
-        region_id: RegionId,
+        stage_id: StageId,
         receiver: InputRecv<InputEvent<T, D>>,
         output_pusher: Box<dyn Push<T, D>>,
         progress_reporter: Option<ProgressReporter<T>>,
@@ -154,7 +154,7 @@ impl<T: Timestamp, D: Send + 'static> ChannelSourceOperator<T, D> {
         Self {
             name,
             index,
-            region_id,
+            stage_id,
             receiver,
             output_pusher,
             pending_output: VecDeque::new(),
@@ -292,8 +292,8 @@ impl<T: Timestamp, D: Send + 'static> SchedulableOperator for ChannelSourceOpera
         self.index
     }
 
-    fn region_id(&self) -> RegionId {
-        self.region_id
+    fn stage_id(&self) -> StageId {
+        self.stage_id
     }
 
     fn close_inputs(&mut self) {
@@ -314,7 +314,7 @@ impl<T: Timestamp, D: Send + 'static> SchedulableOperator for ChannelSourceOpera
 pub struct ChannelSinkOperator<T: Timestamp, D: Send + 'static> {
     name: String,
     index: usize,
-    region_id: RegionId,
+    stage_id: StageId,
     input_puller: Box<dyn Pull<T, D>>,
     sender: OutputSend<OutputEvent<T, D>>,
     /// Buffered output event that couldn't be sent due to channel full.
@@ -328,14 +328,14 @@ impl<T: Timestamp, D: Send + 'static> ChannelSinkOperator<T, D> {
     pub(crate) fn new(
         name: String,
         index: usize,
-        region_id: RegionId,
+        stage_id: StageId,
         input_puller: Box<dyn Pull<T, D>>,
         sender: OutputSend<OutputEvent<T, D>>,
     ) -> Self {
         Self {
             name,
             index,
-            region_id,
+            stage_id,
             input_puller,
             sender,
             pending_send: None,
@@ -439,8 +439,8 @@ impl<T: Timestamp, D: Send + 'static> SchedulableOperator for ChannelSinkOperato
         self.index
     }
 
-    fn region_id(&self) -> RegionId {
-        self.region_id
+    fn stage_id(&self) -> StageId {
+        self.stage_id
     }
 
     fn close_inputs(&mut self) {
@@ -793,7 +793,7 @@ mod tests {
         let mut op = ChannelSourceOperator::new(
             "test_input".into(),
             0,
-            RegionId::new(0),
+            StageId::new(0),
             InputRecv::Std(rx),
             Box::new(push),
             None,
@@ -832,7 +832,7 @@ mod tests {
         let mut op = ChannelSourceOperator::new(
             "test_input".into(),
             0,
-            RegionId::new(0),
+            StageId::new(0),
             InputRecv::Std(rx),
             Box::new(push),
             None,
@@ -857,7 +857,7 @@ mod tests {
         let mut op = ChannelSourceOperator::new(
             "test_input".into(),
             0,
-            RegionId::new(0),
+            StageId::new(0),
             InputRecv::Std(rx),
             Box::new(push),
             None,
@@ -883,7 +883,7 @@ mod tests {
         let mut op = ChannelSinkOperator::new(
             "test_output".into(),
             0,
-            RegionId::new(0),
+            StageId::new(0),
             Box::new(pull),
             OutputSend::Std(tx),
         );

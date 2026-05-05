@@ -15,8 +15,8 @@ pub mod tracing_integration;
 pub use activation::ActivationGuard;
 pub use tracing_integration::TracingConfig;
 
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 /// Per-operator metrics.
@@ -114,8 +114,7 @@ impl OperatorMetricsCollector {
         self.activations.fetch_add(1, Ordering::Relaxed);
         self.cpu_time_nanos
             .fetch_add(cpu_time.as_nanos() as u64, Ordering::Relaxed);
-        self.records_processed
-            .fetch_add(records, Ordering::Relaxed);
+        self.records_processed.fetch_add(records, Ordering::Relaxed);
     }
 
     /// Record a backpressure event with the duration the operator was blocked.
@@ -129,7 +128,8 @@ impl OperatorMetricsCollector {
             if nanos <= current_max {
                 break;
             }
-            if self.bp_max_blocked_nanos
+            if self
+                .bp_max_blocked_nanos
                 .compare_exchange_weak(current_max, nanos, Ordering::Relaxed, Ordering::Relaxed)
                 .is_ok()
             {
@@ -209,10 +209,7 @@ impl DataflowMetrics {
 
     /// Total CPU time across all operators.
     pub fn total_cpu_time(&self) -> Duration {
-        self.operators
-            .iter()
-            .map(|op| op.snapshot().cpu_time)
-            .sum()
+        self.operators.iter().map(|op| op.snapshot().cpu_time).sum()
     }
 
     /// Total activations across all operators.

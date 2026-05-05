@@ -39,11 +39,20 @@ impl TestCoordinator {
     /// Build the `instancy-test-node` binary and return its path.
     pub async fn build_node_binary() -> PathBuf {
         let output = Command::new("cargo")
-            .args(["build", "-p", "instancy-integration", "--bin", "instancy-test-node"])
-            .env("PROTOC", format!(
-                "{}/.local/protoc/bin/protoc.exe",
-                std::env::var("USERPROFILE").unwrap_or_default()
-            ))
+            .args([
+                "build",
+                "-p",
+                "instancy-integration",
+                "--bin",
+                "instancy-test-node",
+            ])
+            .env(
+                "PROTOC",
+                format!(
+                    "{}/.local/protoc/bin/protoc.exe",
+                    std::env::var("USERPROFILE").unwrap_or_default()
+                ),
+            )
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .output()
@@ -67,11 +76,7 @@ impl TestCoordinator {
         #[cfg(not(windows))]
         let binary = target_dir.join("instancy-test-node");
 
-        assert!(
-            binary.exists(),
-            "Binary not found at {}",
-            binary.display()
-        );
+        assert!(binary.exists(), "Binary not found at {}", binary.display());
         binary
     }
 
@@ -111,13 +116,10 @@ impl TestCoordinator {
         // Accept control connections from all nodes (with timeout)
         let mut connections = HashMap::new();
         for _ in 0..node_ids.len() {
-            let (stream, _addr) = tokio::time::timeout(
-                Duration::from_secs(30),
-                listener.accept(),
-            )
-            .await
-            .expect("timeout waiting for node connection")
-            .expect("failed to accept node connection");
+            let (stream, _addr) = tokio::time::timeout(Duration::from_secs(30), listener.accept())
+                .await
+                .expect("timeout waiting for node connection")
+                .expect("failed to accept node connection");
 
             let (reader, writer) = stream.into_split();
             let mut reader = BufReader::new(reader);
@@ -147,11 +149,7 @@ impl TestCoordinator {
 
     /// Send a command to a node without waiting for the response.
     /// Returns the request_id for later correlation.
-    async fn send_command_fire(
-        &mut self,
-        node_id: &str,
-        cmd: NodeCommand,
-    ) -> u64 {
+    async fn send_command_fire(&mut self, node_id: &str, cmd: NodeCommand) -> u64 {
         let conn = self
             .connections
             .get_mut(node_id)
@@ -212,11 +210,7 @@ impl TestCoordinator {
     }
 
     /// Send a command to a specific node and wait for its response.
-    pub async fn send_command(
-        &mut self,
-        node_id: &str,
-        cmd: NodeCommand,
-    ) -> NodeResponse {
+    pub async fn send_command(&mut self, node_id: &str, cmd: NodeCommand) -> NodeResponse {
         self.send_command_fire(node_id, cmd).await;
         self.recv_response(node_id).await
     }
@@ -228,11 +222,7 @@ impl TestCoordinator {
         topology: &SerializableTopology,
         dataflow_type: DataflowType,
     ) -> HashMap<String, usize> {
-        let node_ids: Vec<String> = topology
-            .nodes
-            .iter()
-            .map(|n| n.node_id.clone())
-            .collect();
+        let node_ids: Vec<String> = topology.nodes.iter().map(|n| n.node_id.clone()).collect();
 
         // Phase 1: BindListener on all nodes
         let mut listen_addrs: HashMap<String, SocketAddr> = HashMap::new();
@@ -247,10 +237,7 @@ impl TestCoordinator {
                 )
                 .await;
             match resp {
-                NodeResponse::ListenerReady {
-                    listen_addr,
-                    ..
-                } => {
+                NodeResponse::ListenerReady { listen_addr, .. } => {
                     listen_addrs.insert(node_id.clone(), listen_addr);
                 }
                 NodeResponse::Error { message } => {
@@ -430,7 +417,10 @@ impl TestCoordinator {
             let resp = timeout(WAIT_TIMEOUT, self.recv_response(node_id))
                 .await
                 .unwrap_or_else(|_| {
-                    panic!("Timed out waiting for completion on {node_id} ({}s)", WAIT_TIMEOUT.as_secs())
+                    panic!(
+                        "Timed out waiting for completion on {node_id} ({}s)",
+                        WAIT_TIMEOUT.as_secs()
+                    )
                 });
             match resp {
                 NodeResponse::DataflowCompleted { success, error, .. } => {
@@ -472,9 +462,7 @@ impl TestCoordinator {
                 {
                     // Expected: node_actor returns Error with "cancelled <id>"
                 }
-                _ => panic!(
-                    "Unexpected CancelDataflow response from {node_id}: {resp:?}"
-                ),
+                _ => panic!("Unexpected CancelDataflow response from {node_id}: {resp:?}"),
             }
         }
     }
@@ -499,7 +487,10 @@ impl TestCoordinator {
             let resp = timeout(WAIT_TIMEOUT, self.recv_response(node_id))
                 .await
                 .unwrap_or_else(|_| {
-                    panic!("Timed out waiting for completion on {node_id} ({}s)", WAIT_TIMEOUT.as_secs())
+                    panic!(
+                        "Timed out waiting for completion on {node_id} ({}s)",
+                        WAIT_TIMEOUT.as_secs()
+                    )
                 });
             match resp {
                 NodeResponse::DataflowCompleted { success, error, .. } => {
@@ -507,9 +498,7 @@ impl TestCoordinator {
                         let err_msg = error.unwrap_or_default();
                         // Cancellation is expected — not a test failure
                         if !err_msg.to_lowercase().contains("cancel") {
-                            panic!(
-                                "Dataflow failed on {node_id} (non-cancellation): {err_msg}"
-                            );
+                            panic!("Dataflow failed on {node_id} (non-cancellation): {err_msg}");
                         }
                         all_success = false;
                     }

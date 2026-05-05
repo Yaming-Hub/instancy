@@ -10,7 +10,7 @@
 //! One `Box<dyn SchedulableOperator>` per operator per worker. Created during
 //! dataflow materialization and owned by the [`DataflowExecutor`](super::executor::DataflowExecutor).
 
-use crate::dataflow::region::RegionId;
+use crate::dataflow::stage::StageId;
 use crate::error::Result;
 use crate::worker::WorkerContext;
 
@@ -75,8 +75,8 @@ pub trait SchedulableOperator: Send {
     /// Operator index within the scope.
     fn index(&self) -> usize;
 
-    /// The execution region this operator belongs to.
-    fn region_id(&self) -> RegionId;
+    /// The execution stage this operator belongs to.
+    fn stage_id(&self) -> StageId;
 
     /// Close all input channels to signal no more data will arrive.
     ///
@@ -166,15 +166,17 @@ pub fn single_use_factory(
 /// This is the default for all current builder methods. It can produce
 /// exactly one operator instance. Calling `build()` a second time panics.
 pub struct SingleUseFactory(
-    Option<Box<dyn FnOnce(&WorkerContext, ChannelEndpoints) -> Box<dyn SchedulableOperator> + Send>>,
+    Option<
+        Box<dyn FnOnce(&WorkerContext, ChannelEndpoints) -> Box<dyn SchedulableOperator> + Send>,
+    >,
 );
 
 impl SingleUseFactory {
     /// Create a new single-use factory from a `FnOnce` closure.
     pub fn new(
         factory: impl FnOnce(&WorkerContext, ChannelEndpoints) -> Box<dyn SchedulableOperator>
-            + Send
-            + 'static,
+        + Send
+        + 'static,
     ) -> Self {
         Self(Some(Box::new(factory)))
     }
@@ -214,7 +216,7 @@ impl OperatorBlueprint for SingleUseFactory {
 /// ReplayableFactory::new(move |endpoints| {
 ///     // Create fresh state for this worker
 ///     let logic = logic_factory();
-///     Box::new(WiredUnaryOperator::new(name, idx, region, logic, ...))
+///     Box::new(WiredUnaryOperator::new(name, idx, stage, logic, ...))
 /// })
 /// ```
 pub struct ReplayableFactory(
@@ -225,8 +227,8 @@ impl ReplayableFactory {
     /// Create a new replayable factory from a `FnMut` closure.
     pub fn new(
         factory: impl FnMut(&WorkerContext, ChannelEndpoints) -> Box<dyn SchedulableOperator>
-            + Send
-            + 'static,
+        + Send
+        + 'static,
     ) -> Self {
         Self(Box::new(factory))
     }
@@ -259,7 +261,7 @@ impl OperatorBlueprint for ReplayableFactory {
 pub struct ChannelEndpoints {
     /// Input pullers, one per input port. Each is `Box<dyn Pull<T, D, M>>`.
     pub input_pullers: Vec<Box<dyn std::any::Any + Send>>,
-    /// Output pushers, one per output port. Each entry is a `Vec<Box<dyn Push<T, D, M>>>` 
+    /// Output pushers, one per output port. Each entry is a `Vec<Box<dyn Push<T, D, M>>>`
     /// (multiple pushers per port when the output fans out to multiple targets).
     pub output_pushers: Vec<Box<dyn std::any::Any + Send>>,
 }
@@ -331,12 +333,12 @@ pub type ChannelFactory = Box<dyn ChannelBlueprint>;
 /// configuration like capacity).
 pub fn channel_factory(
     f: impl FnMut(
-            &WorkerContext,
-            usize,
-            Option<crate::dataflow::channels::wake::WakeHandle>,
-        ) -> (Box<dyn std::any::Any + Send>, Box<dyn std::any::Any + Send>)
-        + Send
-        + 'static,
+        &WorkerContext,
+        usize,
+        Option<crate::dataflow::channels::wake::WakeHandle>,
+    ) -> (Box<dyn std::any::Any + Send>, Box<dyn std::any::Any + Send>)
+    + Send
+    + 'static,
 ) -> ChannelFactory {
     Box::new(ChannelBlueprintFn(Box::new(f)))
 }
@@ -357,12 +359,12 @@ impl ChannelBlueprintFn {
     /// Create a new channel blueprint from a closure.
     pub fn new(
         factory: impl FnMut(
-                &WorkerContext,
-                usize,
-                Option<crate::dataflow::channels::wake::WakeHandle>,
-            ) -> (Box<dyn std::any::Any + Send>, Box<dyn std::any::Any + Send>)
-            + Send
-            + 'static,
+            &WorkerContext,
+            usize,
+            Option<crate::dataflow::channels::wake::WakeHandle>,
+        ) -> (Box<dyn std::any::Any + Send>, Box<dyn std::any::Any + Send>)
+        + Send
+        + 'static,
     ) -> Self {
         Self(Box::new(factory))
     }

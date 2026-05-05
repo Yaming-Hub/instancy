@@ -12,8 +12,8 @@ use std::time::{Duration, Instant};
 
 use instancy::DataflowBuilder;
 use instancy::Error;
-use instancy::{RuntimeConfig, RuntimeHandle};
 use instancy::scheduler::policy::FifoPolicy;
+use instancy::{RuntimeConfig, RuntimeHandle};
 
 /// Spawn 4 dataflows concurrently on a 2-thread pool. Each receives unique data
 /// via InputSender and produces results on OutputReceiver. Verify all complete
@@ -95,7 +95,10 @@ fn eight_dataflows_on_two_threads_no_starvation() {
     for i in 0..8u32 {
         let builder = DataflowBuilder::<u64>::new(format!("df_{i}"));
         let data: Vec<(u64, Vec<i32>)> = vec![(0, vec![i as i32])];
-        builder.source("src", data).map("inc", |_t, x| x + 1).output("out");
+        builder
+            .source("src", data)
+            .map("inc", |_t, x| x + 1)
+            .output("out");
         let dataflow = builder.build().unwrap();
         handles.push(rt.run(dataflow).unwrap());
     }
@@ -325,7 +328,8 @@ fn stress_spawn_twenty_dataflows() {
 
     let start = Instant::now();
     for (i, c) in completions.into_iter().enumerate() {
-        c.wait().unwrap_or_else(|e| panic!("stress_{i} failed: {e}"));
+        c.wait()
+            .unwrap_or_else(|e| panic!("stress_{i} failed: {e}"));
     }
     let elapsed = start.elapsed();
 
@@ -437,7 +441,10 @@ fn operator_panic_propagates_error() {
 
     // The panicking dataflow should return an error (not crash the process)
     let bad_result = bad_completion.wait();
-    assert!(bad_result.is_err(), "expected error from panicking operator");
+    assert!(
+        bad_result.is_err(),
+        "expected error from panicking operator"
+    );
 
     // The good dataflow should still complete successfully
     let good_result = good_completion.wait();

@@ -17,21 +17,21 @@
 //! - [`branch`]: Conditional stream splitting (branch + ok_err)
 //! - [`feedback`]: Loop-back edges for iterative computation
 
-pub mod input;
-pub mod output;
-pub mod handles;
-pub mod unary;
-pub mod inspect;
-pub mod probe;
 pub mod binary;
+pub mod branch;
+pub mod broadcast;
 pub mod concat;
 pub mod delay;
 pub mod exchange;
-pub mod rebalance;
-pub mod gather;
-pub mod broadcast;
-pub mod branch;
 pub mod feedback;
+pub mod gather;
+pub mod handles;
+pub mod input;
+pub mod inspect;
+pub mod output;
+pub mod probe;
+pub mod rebalance;
+pub mod unary;
 
 #[cfg(test)]
 mod pipeline_tests;

@@ -1,7 +1,7 @@
 //! Exchange operator — hash-based repartitioning across workers.
 //!
 //! The `exchange` operator redistributes data across workers in a target
-//! execution region based on a hash function. Records with the same key
+//! execution stage based on a hash function. Records with the same key
 //! hash are routed to the same worker, enabling key-partitioned computations
 //! like group-by and join.
 
@@ -9,14 +9,14 @@ use std::fmt;
 use std::hash::Hash;
 
 use crate::dataflow::channels::PartitionStrategy;
-use crate::dataflow::region::RegionId;
 use crate::dataflow::scope::Scope;
-use crate::dataflow::stream::{StreamEdge, Slot};
+use crate::dataflow::stage::StageId;
+use crate::dataflow::stream::{Slot, StreamEdge};
 use crate::progress::timestamp::Timestamp;
 
 /// A registered exchange (repartition) operator.
 ///
-/// This operator redistributes data across workers in the target region
+/// This operator redistributes data across workers in the target stage
 /// using a hash-based routing function. It records the repartition intent;
 /// actual data movement is handled by the runtime when the dataflow is
 /// materialized.
@@ -25,10 +25,10 @@ pub struct ExchangeOperator<T: Timestamp, D> {
     name: String,
     /// Operator index within the scope.
     index: usize,
-    /// The source execution region (where data comes from).
-    source_region: RegionId,
-    /// The target execution region (where data goes to).
-    target_region: RegionId,
+    /// The source execution stage (where data comes from).
+    source_stage: StageId,
+    /// The target execution stage (where data goes to).
+    target_stage: StageId,
     /// The partition strategy (Exchange with routing function).
     strategy: PartitionStrategy<D>,
     /// Phantom for timestamp.
@@ -40,15 +40,15 @@ impl<T: Timestamp, D> ExchangeOperator<T, D> {
     pub fn new(
         name: impl Into<String>,
         index: usize,
-        source_region: RegionId,
-        target_region: RegionId,
+        source_stage: StageId,
+        target_stage: StageId,
         strategy: PartitionStrategy<D>,
     ) -> Self {
         Self {
             name: name.into(),
             index,
-            source_region,
-            target_region,
+            source_stage,
+            target_stage,
             strategy,
             _phantom: std::marker::PhantomData,
         }
@@ -64,14 +64,14 @@ impl<T: Timestamp, D> ExchangeOperator<T, D> {
         self.index
     }
 
-    /// The source region.
-    pub fn source_region(&self) -> RegionId {
-        self.source_region
+    /// The source stage.
+    pub fn source_stage(&self) -> StageId {
+        self.source_stage
     }
 
-    /// The target region.
-    pub fn target_region(&self) -> RegionId {
-        self.target_region
+    /// The target stage.
+    pub fn target_stage(&self) -> StageId {
+        self.target_stage
     }
 
     /// The partition strategy.
@@ -85,8 +85,8 @@ impl<T: Timestamp, D> fmt::Debug for ExchangeOperator<T, D> {
         f.debug_struct("ExchangeOperator")
             .field("name", &self.name)
             .field("index", &self.index)
-            .field("source_region", &self.source_region)
-            .field("target_region", &self.target_region)
+            .field("source_stage", &self.source_stage)
+            .field("target_stage", &self.target_stage)
             .field("strategy", &self.strategy.name())
             .finish()
     }
@@ -97,7 +97,7 @@ pub trait ExchangeExt<S: Scope, D> {
     /// Repartition data by hashing a key extracted from each record.
     ///
     /// Records with the same key hash are routed to the same target worker.
-    /// The target region has the same parallelism as the source region.
+    /// The target stage has the same parallelism as the source stage.
     ///
     /// # Example
     /// ```ignore
@@ -110,8 +110,8 @@ pub trait ExchangeExt<S: Scope, D> {
 
     /// Repartition data by hashing a key, targeting a specific parallelism level.
     ///
-    /// Creates a new execution region if `target_parallelism` differs from the
-    /// current region's parallelism; otherwise reuses the current region.
+    /// Creates a new execution stage if `target_parallelism` differs from the
+    /// current stage's parallelism; otherwise reuses the current stage.
     ///
     /// # Panics
     /// Panics if `target_parallelism` is 0.
@@ -132,8 +132,8 @@ pub trait ExchangeExt<S: Scope, D> {
 
     /// Repartition data using a direct hash function, targeting a specific parallelism.
     ///
-    /// Creates a new execution region if `target_parallelism` differs from the
-    /// current region's parallelism; otherwise reuses the current region.
+    /// Creates a new execution stage if `target_parallelism` differs from the
+    /// current stage's parallelism; otherwise reuses the current stage.
     ///
     /// # Panics
     /// Panics if `target_parallelism` is 0.
@@ -150,11 +150,14 @@ impl<S: Scope, D: 'static> ExchangeExt<S, D> for StreamEdge<S, D> {
         key_fn: impl Fn(&D) -> K + Send + Sync + 'static,
     ) -> StreamEdge<S, D> {
         let scope = self.scope().clone();
-        let source_region = self.region_id();
-        let parallelism = scope.region(source_region)
-            .map(|r| r.parallelism())
-            .unwrap_or(1);
-        self.build_exchange(scope, source_region, parallelism, PartitionStrategy::exchange_by_key("exchange", key_fn))
+        let source_stage = self.stage_id();
+        let parallelism = scope.stage_parallelism(source_stage).unwrap_or(1);
+        self.build_exchange(
+            scope,
+            source_stage,
+            parallelism,
+            PartitionStrategy::exchange_by_key("exchange", key_fn),
+        )
     }
 
     fn exchange_to<K: Hash + 'static>(
@@ -164,8 +167,13 @@ impl<S: Scope, D: 'static> ExchangeExt<S, D> for StreamEdge<S, D> {
     ) -> StreamEdge<S, D> {
         assert!(target_parallelism > 0, "target_parallelism must be > 0");
         let scope = self.scope().clone();
-        let source_region = self.region_id();
-        self.build_exchange(scope, source_region, target_parallelism, PartitionStrategy::exchange_by_key("exchange", key_fn))
+        let source_stage = self.stage_id();
+        self.build_exchange(
+            scope,
+            source_stage,
+            target_parallelism,
+            PartitionStrategy::exchange_by_key("exchange", key_fn),
+        )
     }
 
     fn exchange_by_hash(
@@ -173,11 +181,14 @@ impl<S: Scope, D: 'static> ExchangeExt<S, D> for StreamEdge<S, D> {
         hash_fn: impl Fn(&D) -> u64 + Send + Sync + 'static,
     ) -> StreamEdge<S, D> {
         let scope = self.scope().clone();
-        let source_region = self.region_id();
-        let parallelism = scope.region(source_region)
-            .map(|r| r.parallelism())
-            .unwrap_or(1);
-        self.build_exchange(scope, source_region, parallelism, PartitionStrategy::exchange("exchange_hash", hash_fn))
+        let source_stage = self.stage_id();
+        let parallelism = scope.stage_parallelism(source_stage).unwrap_or(1);
+        self.build_exchange(
+            scope,
+            source_stage,
+            parallelism,
+            PartitionStrategy::exchange("exchange_hash", hash_fn),
+        )
     }
 
     fn exchange_by_hash_to(
@@ -187,8 +198,13 @@ impl<S: Scope, D: 'static> ExchangeExt<S, D> for StreamEdge<S, D> {
     ) -> StreamEdge<S, D> {
         assert!(target_parallelism > 0, "target_parallelism must be > 0");
         let scope = self.scope().clone();
-        let source_region = self.region_id();
-        self.build_exchange(scope, source_region, target_parallelism, PartitionStrategy::exchange("exchange_hash", hash_fn))
+        let source_stage = self.stage_id();
+        self.build_exchange(
+            scope,
+            source_stage,
+            target_parallelism,
+            PartitionStrategy::exchange("exchange_hash", hash_fn),
+        )
     }
 }
 
@@ -197,32 +213,36 @@ impl<S: Scope, D: 'static> StreamEdge<S, D> {
     fn build_exchange(
         &self,
         mut scope: S,
-        source_region: RegionId,
+        source_stage: StageId,
         target_parallelism: usize,
         strategy: PartitionStrategy<D>,
     ) -> StreamEdge<S, D> {
         let op_index = scope.allocate_operator_index();
         let output_slot = Slot::new(op_index, 0);
 
-        // Determine target region: new region if parallelism differs, else same.
-        let current_parallelism = scope.region(source_region)
-            .map(|r| r.parallelism())
-            .unwrap_or(1);
-        let target_region = if target_parallelism != current_parallelism {
-            scope.new_region(target_parallelism)
+        // Determine target stage: new stage if parallelism differs, else same.
+        let current_parallelism = scope.stage_parallelism(source_stage).unwrap_or(1);
+        let target_stage = if target_parallelism != current_parallelism {
+            scope.new_stage(target_parallelism)
         } else {
-            source_region
+            source_stage
         };
 
         // Register operator and edge in the dataflow graph.
-        scope.register_operator(crate::dataflow::graph::OperatorInfo::new(
-            op_index, "exchange", target_region, 1, 1,
-        )).expect("operator index should be unique");
+        scope
+            .register_operator(crate::dataflow::graph::OperatorInfo::new(
+                op_index,
+                "exchange",
+                target_stage,
+                1,
+                1,
+            ))
+            .expect("operator index should be unique");
         scope.add_edge(crate::dataflow::graph::EdgeInfo::exchange(
             *self.source(),
             Slot::new(op_index, 0),
-            source_region,
-            target_region,
+            source_stage,
+            target_stage,
         ));
 
         // Record target parallelism for stage inference.
@@ -231,12 +251,12 @@ impl<S: Scope, D: 'static> StreamEdge<S, D> {
         let _operator = ExchangeOperator::<S::Timestamp, D>::new(
             "exchange",
             op_index,
-            source_region,
-            target_region,
+            source_stage,
+            target_stage,
             strategy,
         );
 
-        StreamEdge::new(scope, output_slot, target_region)
+        StreamEdge::new(scope, output_slot, target_stage)
     }
 }
 
@@ -246,39 +266,37 @@ mod tests {
     use crate::dataflow::scope::RootScope;
 
     #[test]
-    fn exchange_ext_produces_stream_same_region() {
+    fn exchange_ext_produces_stream_same_stage() {
         let scope = RootScope::<u64>::new("test", 4);
-        let region_id = scope.current_region().id();
+        let stage_id = scope.current_stage_id();
         let source = Slot::new(0, 0);
         let stream: StreamEdge<RootScope<u64>, (u64, String)> =
-            StreamEdge::new(scope, source, region_id);
+            StreamEdge::new(scope, source, stage_id);
 
         let exchanged = stream.exchange(|record: &(u64, String)| record.0);
-        // Same parallelism → same region
-        assert_eq!(exchanged.region_id(), region_id);
+        // Same parallelism → same stage
+        assert_eq!(exchanged.stage_id(), stage_id);
     }
 
     #[test]
-    fn exchange_to_creates_new_region() {
+    fn exchange_to_creates_new_stage() {
         let scope = RootScope::<u64>::new("test", 4);
-        let region_id = scope.current_region().id();
+        let stage_id = scope.current_stage_id();
         let source = Slot::new(0, 0);
-        let stream: StreamEdge<RootScope<u64>, i32> =
-            StreamEdge::new(scope, source, region_id);
+        let stream: StreamEdge<RootScope<u64>, i32> = StreamEdge::new(scope, source, stage_id);
 
         let exchanged = stream.exchange_to(8, |record: &i32| *record);
-        // Different parallelism → new region
-        assert_ne!(exchanged.region_id(), region_id);
+        // Different parallelism → new stage
+        assert_ne!(exchanged.stage_id(), stage_id);
     }
 
     #[test]
     #[should_panic(expected = "target_parallelism must be > 0")]
     fn exchange_to_zero_parallelism_panics() {
         let scope = RootScope::<u64>::new("test", 4);
-        let region_id = scope.current_region().id();
+        let stage_id = scope.current_stage_id();
         let source = Slot::new(0, 0);
-        let stream: StreamEdge<RootScope<u64>, i32> =
-            StreamEdge::new(scope, source, region_id);
+        let stream: StreamEdge<RootScope<u64>, i32> = StreamEdge::new(scope, source, stage_id);
 
         let _ = stream.exchange_to(0, |record: &i32| *record);
     }
@@ -286,25 +304,23 @@ mod tests {
     #[test]
     fn exchange_by_hash_produces_stream() {
         let scope = RootScope::<u64>::new("test", 4);
-        let region_id = scope.current_region().id();
+        let stage_id = scope.current_stage_id();
         let source = Slot::new(0, 0);
-        let stream: StreamEdge<RootScope<u64>, i32> =
-            StreamEdge::new(scope, source, region_id);
+        let stream: StreamEdge<RootScope<u64>, i32> = StreamEdge::new(scope, source, stage_id);
 
         let exchanged = stream.exchange_by_hash(|record: &i32| *record as u64);
-        assert_eq!(exchanged.region_id(), region_id);
+        assert_eq!(exchanged.stage_id(), stage_id);
     }
 
     #[test]
-    fn exchange_by_hash_to_creates_new_region() {
+    fn exchange_by_hash_to_creates_new_stage() {
         let scope = RootScope::<u64>::new("test", 4);
-        let region_id = scope.current_region().id();
+        let stage_id = scope.current_stage_id();
         let source = Slot::new(0, 0);
-        let stream: StreamEdge<RootScope<u64>, i32> =
-            StreamEdge::new(scope, source, region_id);
+        let stream: StreamEdge<RootScope<u64>, i32> = StreamEdge::new(scope, source, stage_id);
 
         let exchanged = stream.exchange_by_hash_to(16, |record: &i32| *record as u64);
-        assert_ne!(exchanged.region_id(), region_id);
+        assert_ne!(exchanged.stage_id(), stage_id);
     }
 
     #[test]
@@ -313,27 +329,22 @@ mod tests {
         let op = ExchangeOperator::<u64, i32>::new(
             "my_exchange",
             5,
-            RegionId::new(0),
-            RegionId::new(1),
+            StageId::new(0),
+            StageId::new(1),
             strategy,
         );
         assert_eq!(op.name(), "my_exchange");
         assert_eq!(op.index(), 5);
-        assert_eq!(op.source_region(), RegionId::new(0));
-        assert_eq!(op.target_region(), RegionId::new(1));
+        assert_eq!(op.source_stage(), StageId::new(0));
+        assert_eq!(op.target_stage(), StageId::new(1));
         assert_eq!(op.strategy().name(), "Exchange");
     }
 
     #[test]
     fn exchange_operator_debug() {
         let strategy = PartitionStrategy::<i32>::exchange("hash", |x: &i32| *x as u64);
-        let op = ExchangeOperator::<u64, i32>::new(
-            "ex",
-            1,
-            RegionId::new(0),
-            RegionId::new(0),
-            strategy,
-        );
+        let op =
+            ExchangeOperator::<u64, i32>::new("ex", 1, StageId::new(0), StageId::new(0), strategy);
         let debug = format!("{:?}", op);
         assert!(debug.contains("ExchangeOperator"));
         assert!(debug.contains("ex"));

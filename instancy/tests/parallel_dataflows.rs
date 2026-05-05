@@ -9,10 +9,10 @@ use std::time::Duration;
 
 use tokio::net::{TcpListener, TcpStream};
 
-use instancy::communication::transport_session::PeerConnection;
 use instancy::DataflowBuilder;
 use instancy::DataflowId;
 use instancy::Result;
+use instancy::communication::transport_session::PeerConnection;
 use instancy::{ClusterTopology, NodeConfig};
 use instancy::{RuntimeConfig, RuntimeHandle};
 
@@ -114,7 +114,11 @@ async fn shared_pool_parallel_dataflows_no_exchange() {
             assert_eq!(data, &expected, "df-{df_idx} epoch {epoch}");
             total_count += data.len();
         }
-        assert_eq!(total_count, (num_epochs as usize) * 5, "df-{df_idx} total count");
+        assert_eq!(
+            total_count,
+            (num_epochs as usize) * 5,
+            "df-{df_idx} total count"
+        );
     }
 }
 
@@ -141,13 +145,17 @@ async fn shared_pool_parallel_dataflows_with_exchange() {
     let mut dataflows = Vec::new();
     for i in 0..num_dataflows {
         let df = rt
-            .spawn_multi(&format!("ex-df-{i}"), num_workers, |_worker_idx, builder| {
-                let input = builder.input::<i64>("data");
-                // Use exchange_by_hash for deterministic routing: hash % num_workers.
-                let exchanged = input.exchange_by_hash("by_val", |x: &i64| *x as u64);
-                exchanged.map("pass", |_t, x| x).output("results");
-                Ok(())
-            })
+            .spawn_multi(
+                &format!("ex-df-{i}"),
+                num_workers,
+                |_worker_idx, builder| {
+                    let input = builder.input::<i64>("data");
+                    // Use exchange_by_hash for deterministic routing: hash % num_workers.
+                    let exchanged = input.exchange_by_hash("by_val", |x: &i64| *x as u64);
+                    exchanged.map("pass", |_t, x| x).output("results");
+                    Ok(())
+                },
+            )
             .unwrap();
         dataflows.push(df);
     }
@@ -306,8 +314,7 @@ async fn stress_shared_pool_many_dataflows() {
 // ===========================================================================
 
 /// Helper: create TCP connection pairs between two nodes.
-async fn make_tcp_pair(
-) -> (
+async fn make_tcp_pair() -> (
     PeerConnection<tokio::net::tcp::OwnedReadHalf, tokio::net::tcp::OwnedWriteHalf>,
     PeerConnection<tokio::net::tcp::OwnedReadHalf, tokio::net::tcp::OwnedWriteHalf>,
 ) {
@@ -337,9 +344,7 @@ async fn make_tcp_pair(
 }
 
 /// Helper: join a cluster with timeout.
-async fn join_cluster_with_timeout(
-    cluster: instancy::runtime::ClusterSpawnedDataflow<u64>,
-) {
+async fn join_cluster_with_timeout(cluster: instancy::runtime::ClusterSpawnedDataflow<u64>) {
     let result = tokio::time::timeout(
         TEST_TIMEOUT,
         tokio::task::spawn_blocking(move || cluster.join_blocking()),
@@ -529,8 +534,14 @@ async fn shared_transport_parallel_cluster_dataflows() {
         }
         expected_a.sort();
         expected_b.sort();
-        assert_eq!(data_a, expected_a, "cluster df-{df_idx} node-a: wrong routing");
-        assert_eq!(data_b, expected_b, "cluster df-{df_idx} node-b: wrong routing");
+        assert_eq!(
+            data_a, expected_a,
+            "cluster df-{df_idx} node-a: wrong routing"
+        );
+        assert_eq!(
+            data_b, expected_b,
+            "cluster df-{df_idx} node-b: wrong routing"
+        );
     }
 }
 

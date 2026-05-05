@@ -12,10 +12,10 @@ use std::time::Duration;
 
 use tokio::net::{TcpListener, TcpStream};
 
-use instancy::communication::transport_session::PeerConnection;
 use instancy::DataflowBuilder;
 use instancy::DataflowId;
 use instancy::Result;
+use instancy::communication::transport_session::PeerConnection;
 use instancy::{ClusterTopology, NodeConfig};
 use instancy::{RuntimeConfig, RuntimeHandle};
 
@@ -26,9 +26,7 @@ const TEST_TIMEOUT: Duration = Duration::from_secs(30);
 ///
 /// Wraps `join_blocking()` in a `tokio::time::timeout` so that CI runners
 /// get a clear failure instead of a silent hang.
-async fn join_with_timeout(
-    cluster: instancy::runtime::ClusterSpawnedDataflow<u64>,
-) {
+async fn join_with_timeout(cluster: instancy::runtime::ClusterSpawnedDataflow<u64>) {
     let result = tokio::time::timeout(
         TEST_TIMEOUT,
         tokio::task::spawn_blocking(move || cluster.join_blocking()),
@@ -54,8 +52,10 @@ async fn join_with_timeout(
 /// the other connects.
 async fn make_tcp_connections(
     node_ids: &[&str],
-) -> HashMap<String, Vec<PeerConnection<tokio::net::tcp::OwnedReadHalf, tokio::net::tcp::OwnedWriteHalf>>>
-{
+) -> HashMap<
+    String,
+    Vec<PeerConnection<tokio::net::tcp::OwnedReadHalf, tokio::net::tcp::OwnedWriteHalf>>,
+> {
     let mut result: HashMap<String, Vec<_>> = HashMap::new();
     for id in node_ids {
         result.insert(id.to_string(), Vec::new());
@@ -111,11 +111,18 @@ fn spawn_node<F>(
     topology: ClusterTopology,
     node_id: &str,
     dataflow_id: DataflowId,
-    connections: Vec<PeerConnection<tokio::net::tcp::OwnedReadHalf, tokio::net::tcp::OwnedWriteHalf>>,
+    connections: Vec<
+        PeerConnection<tokio::net::tcp::OwnedReadHalf, tokio::net::tcp::OwnedWriteHalf>,
+    >,
     worker_threads: usize,
     tokio_handle: tokio::runtime::Handle,
     build: F,
-) -> tokio::task::JoinHandle<Result<(RuntimeHandle, instancy::runtime::ClusterSpawnedDataflow<u64>)>>
+) -> tokio::task::JoinHandle<
+    Result<(
+        RuntimeHandle,
+        instancy::runtime::ClusterSpawnedDataflow<u64>,
+    )>,
+>
 where
     F: Fn(usize, &mut DataflowBuilder<u64>) -> Result<()> + Send + 'static,
 {
@@ -157,17 +164,30 @@ async fn tcp_two_nodes_no_exchange() {
     let tokio_handle = tokio::runtime::Handle::current();
 
     let build = |_worker_idx: usize, builder: &mut DataflowBuilder<u64>| -> Result<()> {
-        builder.input::<i32>("data").map("double", |_t, x| x * 2).output("results");
+        builder
+            .input::<i32>("data")
+            .map("double", |_t, x| x * 2)
+            .output("results");
         Ok(())
     };
 
     let ha = spawn_node(
-        topology.clone(), "node-a", dataflow_id,
-        conns.remove("node-a").unwrap(), 1, tokio_handle.clone(), build,
+        topology.clone(),
+        "node-a",
+        dataflow_id,
+        conns.remove("node-a").unwrap(),
+        1,
+        tokio_handle.clone(),
+        build,
     );
     let hb = spawn_node(
-        topology, "node-b", dataflow_id,
-        conns.remove("node-b").unwrap(), 1, tokio_handle, build,
+        topology,
+        "node-b",
+        dataflow_id,
+        conns.remove("node-b").unwrap(),
+        1,
+        tokio_handle,
+        build,
     );
 
     let (ra, rb) = tokio::join!(ha, hb);
@@ -189,8 +209,16 @@ async fn tcp_two_nodes_no_exchange() {
     join_with_timeout(ca).await;
     join_with_timeout(cb).await;
 
-    let mut da: Vec<i32> = out_a.collect_data().into_iter().flat_map(|(_, d)| d).collect();
-    let mut db: Vec<i32> = out_b.collect_data().into_iter().flat_map(|(_, d)| d).collect();
+    let mut da: Vec<i32> = out_a
+        .collect_data()
+        .into_iter()
+        .flat_map(|(_, d)| d)
+        .collect();
+    let mut db: Vec<i32> = out_b
+        .collect_data()
+        .into_iter()
+        .flat_map(|(_, d)| d)
+        .collect();
     da.sort();
     db.sort();
 
@@ -218,12 +246,22 @@ async fn tcp_two_nodes_with_exchange() {
     };
 
     let ha = spawn_node(
-        topology.clone(), "node-a", dataflow_id,
-        conns.remove("node-a").unwrap(), 2, tokio_handle.clone(), build,
+        topology.clone(),
+        "node-a",
+        dataflow_id,
+        conns.remove("node-a").unwrap(),
+        2,
+        tokio_handle.clone(),
+        build,
     );
     let hb = spawn_node(
-        topology, "node-b", dataflow_id,
-        conns.remove("node-b").unwrap(), 2, tokio_handle, build,
+        topology,
+        "node-b",
+        dataflow_id,
+        conns.remove("node-b").unwrap(),
+        2,
+        tokio_handle,
+        build,
     );
 
     let (ra, rb) = tokio::join!(ha, hb);
@@ -276,16 +314,31 @@ async fn tcp_three_nodes_exchange() {
     };
 
     let h_alpha = spawn_node(
-        topology.clone(), "alpha", dataflow_id,
-        conns.remove("alpha").unwrap(), 2, tokio_handle.clone(), build,
+        topology.clone(),
+        "alpha",
+        dataflow_id,
+        conns.remove("alpha").unwrap(),
+        2,
+        tokio_handle.clone(),
+        build,
     );
     let h_beta = spawn_node(
-        topology.clone(), "beta", dataflow_id,
-        conns.remove("beta").unwrap(), 2, tokio_handle.clone(), build,
+        topology.clone(),
+        "beta",
+        dataflow_id,
+        conns.remove("beta").unwrap(),
+        2,
+        tokio_handle.clone(),
+        build,
     );
     let h_gamma = spawn_node(
-        topology, "gamma", dataflow_id,
-        conns.remove("gamma").unwrap(), 2, tokio_handle, build,
+        topology,
+        "gamma",
+        dataflow_id,
+        conns.remove("gamma").unwrap(),
+        2,
+        tokio_handle,
+        build,
     );
 
     let (ra, rb, rc) = tokio::join!(h_alpha, h_beta, h_gamma);
@@ -340,12 +393,22 @@ async fn tcp_multi_worker_exchange() {
     };
 
     let ha = spawn_node(
-        topology.clone(), "node-a", dataflow_id,
-        conns.remove("node-a").unwrap(), 4, tokio_handle.clone(), build,
+        topology.clone(),
+        "node-a",
+        dataflow_id,
+        conns.remove("node-a").unwrap(),
+        4,
+        tokio_handle.clone(),
+        build,
     );
     let hb = spawn_node(
-        topology, "node-b", dataflow_id,
-        conns.remove("node-b").unwrap(), 4, tokio_handle, build,
+        topology,
+        "node-b",
+        dataflow_id,
+        conns.remove("node-b").unwrap(),
+        4,
+        tokio_handle,
+        build,
     );
 
     let (ra, rb) = tokio::join!(ha, hb);
@@ -399,12 +462,22 @@ async fn tcp_multi_epoch_exchange() {
     };
 
     let ha = spawn_node(
-        topology.clone(), "node-a", dataflow_id,
-        conns.remove("node-a").unwrap(), 2, tokio_handle.clone(), build,
+        topology.clone(),
+        "node-a",
+        dataflow_id,
+        conns.remove("node-a").unwrap(),
+        2,
+        tokio_handle.clone(),
+        build,
     );
     let hb = spawn_node(
-        topology, "node-b", dataflow_id,
-        conns.remove("node-b").unwrap(), 2, tokio_handle, build,
+        topology,
+        "node-b",
+        dataflow_id,
+        conns.remove("node-b").unwrap(),
+        2,
+        tokio_handle,
+        build,
     );
 
     let (ra, rb) = tokio::join!(ha, hb);
@@ -477,12 +550,22 @@ async fn stress_tcp_exchange_high_volume() {
     };
 
     let ha = spawn_node(
-        topology.clone(), "node-a", dataflow_id,
-        conns.remove("node-a").unwrap(), 2, tokio_handle.clone(), build,
+        topology.clone(),
+        "node-a",
+        dataflow_id,
+        conns.remove("node-a").unwrap(),
+        2,
+        tokio_handle.clone(),
+        build,
     );
     let hb = spawn_node(
-        topology, "node-b", dataflow_id,
-        conns.remove("node-b").unwrap(), 2, tokio_handle, build,
+        topology,
+        "node-b",
+        dataflow_id,
+        conns.remove("node-b").unwrap(),
+        2,
+        tokio_handle,
+        build,
     );
 
     let (ra, rb) = tokio::join!(ha, hb);
@@ -536,17 +619,30 @@ async fn stress_tcp_repeated_creation() {
         let tokio_handle = tokio::runtime::Handle::current();
 
         let build = |_worker_idx: usize, builder: &mut DataflowBuilder<u64>| -> Result<()> {
-            builder.input::<i32>("data").map("double", |_t, x| x * 2).output("results");
+            builder
+                .input::<i32>("data")
+                .map("double", |_t, x| x * 2)
+                .output("results");
             Ok(())
         };
 
         let ha = spawn_node(
-            topology.clone(), "node-a", dataflow_id,
-            conns.remove("node-a").unwrap(), 1, tokio_handle.clone(), build,
+            topology.clone(),
+            "node-a",
+            dataflow_id,
+            conns.remove("node-a").unwrap(),
+            1,
+            tokio_handle.clone(),
+            build,
         );
         let hb = spawn_node(
-            topology, "node-b", dataflow_id,
-            conns.remove("node-b").unwrap(), 1, tokio_handle, build,
+            topology,
+            "node-b",
+            dataflow_id,
+            conns.remove("node-b").unwrap(),
+            1,
+            tokio_handle,
+            build,
         );
 
         let (ra, rb) = tokio::join!(ha, hb);
@@ -564,7 +660,11 @@ async fn stress_tcp_repeated_creation() {
         join_with_timeout(ca).await;
         join_with_timeout(cb).await;
 
-        let data: Vec<i32> = out_a.collect_data().into_iter().flat_map(|(_, d)| d).collect();
+        let data: Vec<i32> = out_a
+            .collect_data()
+            .into_iter()
+            .flat_map(|(_, d)| d)
+            .collect();
         assert_eq!(data, vec![iteration as i32 * 2], "iteration {iteration}");
     }
 }
@@ -591,16 +691,31 @@ async fn stress_tcp_three_nodes_high_volume() {
     };
 
     let h_alpha = spawn_node(
-        topology.clone(), "alpha", dataflow_id,
-        conns.remove("alpha").unwrap(), 2, tokio_handle.clone(), build,
+        topology.clone(),
+        "alpha",
+        dataflow_id,
+        conns.remove("alpha").unwrap(),
+        2,
+        tokio_handle.clone(),
+        build,
     );
     let h_beta = spawn_node(
-        topology.clone(), "beta", dataflow_id,
-        conns.remove("beta").unwrap(), 2, tokio_handle.clone(), build,
+        topology.clone(),
+        "beta",
+        dataflow_id,
+        conns.remove("beta").unwrap(),
+        2,
+        tokio_handle.clone(),
+        build,
     );
     let h_gamma = spawn_node(
-        topology, "gamma", dataflow_id,
-        conns.remove("gamma").unwrap(), 2, tokio_handle, build,
+        topology,
+        "gamma",
+        dataflow_id,
+        conns.remove("gamma").unwrap(),
+        2,
+        tokio_handle,
+        build,
     );
 
     let (ra, rb, rc) = tokio::join!(h_alpha, h_beta, h_gamma);
@@ -665,12 +780,22 @@ async fn stress_tcp_many_epochs() {
     };
 
     let ha = spawn_node(
-        topology.clone(), "node-a", dataflow_id,
-        conns.remove("node-a").unwrap(), 2, tokio_handle.clone(), build,
+        topology.clone(),
+        "node-a",
+        dataflow_id,
+        conns.remove("node-a").unwrap(),
+        2,
+        tokio_handle.clone(),
+        build,
     );
     let hb = spawn_node(
-        topology, "node-b", dataflow_id,
-        conns.remove("node-b").unwrap(), 2, tokio_handle, build,
+        topology,
+        "node-b",
+        dataflow_id,
+        conns.remove("node-b").unwrap(),
+        2,
+        tokio_handle,
+        build,
     );
 
     let (ra, rb) = tokio::join!(ha, hb);
@@ -687,8 +812,13 @@ async fn stress_tcp_many_epochs() {
     let sb = cb.take_input::<i64>(0, "data").unwrap();
     for epoch in 0..num_epochs {
         let base = (epoch as i64) * records_per_epoch;
-        sa.send(epoch, (base..base + records_per_epoch).collect()).unwrap();
-        sb.send(epoch, (base + 10_000..base + 10_000 + records_per_epoch).collect()).unwrap();
+        sa.send(epoch, (base..base + records_per_epoch).collect())
+            .unwrap();
+        sb.send(
+            epoch,
+            (base + 10_000..base + 10_000 + records_per_epoch).collect(),
+        )
+        .unwrap();
     }
     drop(sa);
     drop(sb);

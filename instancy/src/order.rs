@@ -227,16 +227,8 @@ mod tests {
                 Product::new(1, 1),
                 Product::new(2, 2),
             ),
-            (
-                Product::new(1, 1),
-                Product::new(1, 1),
-                Product::new(1, 1),
-            ),
-            (
-                Product::new(0, 0),
-                Product::new(0, 5),
-                Product::new(0, 10),
-            ),
+            (Product::new(1, 1), Product::new(1, 1), Product::new(1, 1)),
+            (Product::new(0, 0), Product::new(0, 5), Product::new(0, 10)),
         ];
         assert_transitive(&triples);
     }

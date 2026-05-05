@@ -91,7 +91,10 @@ fn byte_channel(capacity: usize) -> (ByteSender, ByteReceiver) {
 
 impl ByteSender {
     fn send(&self, data: Vec<u8>) -> std::result::Result<(), Error> {
-        let mut state = self.state.lock().map_err(|_| Error::Custom("poisoned".into()))?;
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| Error::Custom("poisoned".into()))?;
         if state.closed {
             return Err(Error::ChannelClosed);
         }
@@ -118,10 +121,7 @@ impl ByteReceiver {
 
     fn is_exhausted(&self) -> bool {
         let is_closed = self.closed.load(Ordering::Acquire);
-        let is_empty = self
-            .state
-            .lock()
-            .map_or(true, |s| s.buffer.is_empty());
+        let is_empty = self.state.lock().map_or(true, |s| s.buffer.is_empty());
         is_closed && is_empty
     }
 }
@@ -269,12 +269,13 @@ where
                     available: rest.len(),
                 });
             }
-            let source_operator = String::from_utf8(rest[4..4 + src_len].to_vec())
-                .map_err(|e| CodecError::InvalidData(format!("invalid UTF-8 in source_operator: {e}")))?;
+            let source_operator =
+                String::from_utf8(rest[4..4 + src_len].to_vec()).map_err(|e| {
+                    CodecError::InvalidData(format!("invalid UTF-8 in source_operator: {e}"))
+                })?;
             let msg_offset = 4 + src_len;
-            let msg_len = u32::from_le_bytes(
-                rest[msg_offset..msg_offset + 4].try_into().unwrap(),
-            ) as usize;
+            let msg_len =
+                u32::from_le_bytes(rest[msg_offset..msg_offset + 4].try_into().unwrap()) as usize;
             if rest.len() < msg_offset + 4 + msg_len {
                 return Err(CodecError::InsufficientData {
                     needed: msg_offset + 4 + msg_len,
@@ -335,9 +336,7 @@ impl<T: Timestamp + ExchangeData, D: ExchangeData> SerializingPush<T, D> {
     }
 }
 
-impl<T: Timestamp + ExchangeData, D: ExchangeData> Push<T, D, ()>
-    for SerializingPush<T, D>
-{
+impl<T: Timestamp + ExchangeData, D: ExchangeData> Push<T, D, ()> for SerializingPush<T, D> {
     fn push(&mut self, envelope: Envelope<T, D, ()>) -> Result<()> {
         if self.closed {
             return Err(Error::ChannelClosed);
@@ -410,9 +409,7 @@ impl<T: Timestamp + ExchangeData, D: ExchangeData> DeserializingPull<T, D> {
     }
 }
 
-impl<T: Timestamp + ExchangeData, D: ExchangeData> Pull<T, D, ()>
-    for DeserializingPull<T, D>
-{
+impl<T: Timestamp + ExchangeData, D: ExchangeData> Pull<T, D, ()> for DeserializingPull<T, D> {
     fn pull(&mut self) -> Option<Envelope<T, D, ()>> {
         let bytes = self.receiver.recv()?;
         // Panic on decode error: this is a test mock, so a decode failure
@@ -483,10 +480,12 @@ impl<T: Timestamp + ExchangeData, D: ExchangeData> MockNetworkEdgeMaterializer<T
     pub fn new(topology: ClusterTopology, capacity: usize) -> Self {
         let num_workers = topology.total_workers();
 
-        let mut senders: Vec<Vec<Option<ByteSender>>> =
-            (0..num_workers).map(|_| (0..num_workers).map(|_| None).collect()).collect();
-        let mut receivers: Vec<Vec<Option<ByteReceiver>>> =
-            (0..num_workers).map(|_| (0..num_workers).map(|_| None).collect()).collect();
+        let mut senders: Vec<Vec<Option<ByteSender>>> = (0..num_workers)
+            .map(|_| (0..num_workers).map(|_| None).collect())
+            .collect();
+        let mut receivers: Vec<Vec<Option<ByteReceiver>>> = (0..num_workers)
+            .map(|_| (0..num_workers).map(|_| None).collect())
+            .collect();
 
         for src in 0..num_workers {
             for dst in 0..num_workers {
@@ -533,9 +532,7 @@ impl<T: Timestamp + ExchangeData, D: ExchangeData> EdgeMaterializer<T, D>
         for dst in 0..self.num_workers {
             let sender = self.senders[src_idx][dst]
                 .take()
-                .ok_or_else(|| Error::Custom(format!(
-                    "sender [{src_idx}][{dst}] already taken"
-                )))?;
+                .ok_or_else(|| Error::Custom(format!("sender [{src_idx}][{dst}] already taken")))?;
             pushers.push(Box::new(SerializingPush::<T, D>::new(sender)));
         }
         Ok(pushers)
@@ -554,11 +551,9 @@ impl<T: Timestamp + ExchangeData, D: ExchangeData> EdgeMaterializer<T, D>
 
         let mut pullers: Vec<Box<dyn Pull<T, D, ()>>> = Vec::with_capacity(self.num_workers);
         for src in 0..self.num_workers {
-            let receiver = self.receivers[src][dst_idx]
-                .take()
-                .ok_or_else(|| Error::Custom(format!(
-                    "receiver [{src}][{dst_idx}] already taken"
-                )))?;
+            let receiver = self.receivers[src][dst_idx].take().ok_or_else(|| {
+                Error::Custom(format!("receiver [{src}][{dst_idx}] already taken"))
+            })?;
             pullers.push(Box::new(DeserializingPull::<T, D>::new(receiver)));
         }
         Ok(pullers)
@@ -775,9 +770,7 @@ mod tests {
         let (_push2, mut pull2) = mat.materialize_worker(2).unwrap();
 
         // push0[2] → pull2[0]: data goes through Codec encode/decode.
-        push0[2]
-            .push(Envelope::data(99, vec![1, 2, 3]))
-            .unwrap();
+        push0[2].push(Envelope::data(99, vec![1, 2, 3])).unwrap();
         let env = pull2[0].pull().unwrap();
         assert_eq!(env.as_data(), Some((&99u64, &vec![1u64, 2, 3])));
     }
@@ -812,23 +805,38 @@ mod tests {
 
         // Local: worker 0 → worker 1 (same node)
         push0[1].push(Envelope::data(1, vec![10])).unwrap();
-        assert_eq!(pull1[0].pull().unwrap().as_data(), Some((&1u64, &vec![10u64])));
+        assert_eq!(
+            pull1[0].pull().unwrap().as_data(),
+            Some((&1u64, &vec![10u64]))
+        );
 
         // Remote: worker 0 → worker 2 (cross-node, serialized)
         push0[2].push(Envelope::data(2, vec![20])).unwrap();
-        assert_eq!(pull2[0].pull().unwrap().as_data(), Some((&2u64, &vec![20u64])));
+        assert_eq!(
+            pull2[0].pull().unwrap().as_data(),
+            Some((&2u64, &vec![20u64]))
+        );
 
         // Remote: worker 3 → worker 0 (cross-node, serialized)
         push3[0].push(Envelope::data(3, vec![30])).unwrap();
-        assert_eq!(pull0[3].pull().unwrap().as_data(), Some((&3u64, &vec![30u64])));
+        assert_eq!(
+            pull0[3].pull().unwrap().as_data(),
+            Some((&3u64, &vec![30u64]))
+        );
 
         // Local: worker 2 → worker 3 (same node)
         push2[3].push(Envelope::data(4, vec![40])).unwrap();
-        assert_eq!(pull3[2].pull().unwrap().as_data(), Some((&4u64, &vec![40u64])));
+        assert_eq!(
+            pull3[2].pull().unwrap().as_data(),
+            Some((&4u64, &vec![40u64]))
+        );
 
         // Self-loop: worker 1 → worker 1 (local)
         push1[1].push(Envelope::data(5, vec![50])).unwrap();
-        assert_eq!(pull1[1].pull().unwrap().as_data(), Some((&5u64, &vec![50u64])));
+        assert_eq!(
+            pull1[1].pull().unwrap().as_data(),
+            Some((&5u64, &vec![50u64]))
+        );
     }
 
     #[test]
@@ -849,18 +857,19 @@ mod tests {
     #[test]
     fn mock_materializer_with_string_data() {
         // Proves Codec round-trip works with String (StringCodec).
-        let topo = ClusterTopology::multi_node(vec![
-            NodeConfig::new("a", 1),
-            NodeConfig::new("b", 1),
-        ])
-        .unwrap();
+        let topo =
+            ClusterTopology::multi_node(vec![NodeConfig::new("a", 1), NodeConfig::new("b", 1)])
+                .unwrap();
         let mut mat = MockNetworkEdgeMaterializer::<u64, String>::new(topo, 16);
 
         let (mut push0, _) = mat.materialize_worker(0).unwrap();
         let (_, mut pull1) = mat.materialize_worker(1).unwrap();
 
         push0[1]
-            .push(Envelope::data(7, vec!["hello".to_string(), "world".to_string()]))
+            .push(Envelope::data(
+                7,
+                vec!["hello".to_string(), "world".to_string()],
+            ))
             .unwrap();
         let env = pull1[0].pull().unwrap();
         assert_eq!(
@@ -869,4 +878,3 @@ mod tests {
         );
     }
 }
-

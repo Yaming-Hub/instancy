@@ -22,13 +22,13 @@
 use std::future::Future;
 use std::marker::PhantomData;
 use std::pin::Pin;
-use std::sync::{Arc, Condvar, Mutex};
 use std::sync::atomic::AtomicUsize;
+use std::sync::{Arc, Condvar, Mutex};
 use std::task::{Context, Poll, Waker};
 
 use crate::cancellation::{CancellationReason, CancellationToken};
-use crate::dataflow::channels::wake::WakeHandle;
 use crate::dataflow::channel_operators::ChannelMode;
+use crate::dataflow::channels::wake::WakeHandle;
 use crate::dataflow::control::{ControlBroadcast, ControlReceiver, ControlSender};
 use crate::dataflow::dataflow_builder::{DataflowBuilder, LogicalDataflow};
 use crate::dataflow::executor::{DataflowExecutor, ExecutorConfig};
@@ -103,7 +103,10 @@ impl ClusterCancelHandle {
     /// via `cancel_with_reason` or parent token propagation.
     fn is_cancelled(&self) -> bool {
         self.bridge_cancel.is_cancelled()
-            || self.worker_tokens.first().map_or(false, |t| t.is_cancelled())
+            || self
+                .worker_tokens
+                .first()
+                .map_or(false, |t| t.is_cancelled())
     }
 }
 
@@ -165,7 +168,9 @@ impl PeerRegistry {
         dataflow_name: &str,
         cancel_handle: ClusterCancelHandle,
     ) -> u64 {
-        let id = self.next_id.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let id = self
+            .next_id
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
 
         // Check if any peer is already known to be down.
@@ -177,9 +182,7 @@ impl PeerRegistry {
         if let Some(down_peer) = already_down {
             // Release lock before cancelling to avoid nested lock contention.
             drop(state);
-            cancel_handle.cancel_with_reason(
-                CancellationReason::PeerDown(down_peer),
-            );
+            cancel_handle.cancel_with_reason(CancellationReason::PeerDown(down_peer));
             return id;
         }
 
@@ -313,8 +316,8 @@ impl RuntimeHandle {
             max_threads: config.worker_threads,
             ..Default::default()
         };
-        let worker_pool = WorkerPool::new(pool_config)
-            .map_err(|e| crate::error::Error::Custom(e.to_string()))?;
+        let worker_pool =
+            WorkerPool::new(pool_config).map_err(|e| crate::error::Error::Custom(e.to_string()))?;
         let registry = worker_pool.create_registry();
         Ok(Self {
             worker_pool,
@@ -444,10 +447,7 @@ impl RuntimeHandle {
     /// Returns an error immediately if the dataflow has input ports.
     /// The returned future resolves to an error if the executor encounters
     /// an error during execution.
-    pub fn run<T: Timestamp>(
-        &self,
-        dataflow: LogicalDataflow<T>,
-    ) -> Result<DataflowCompletion> {
+    pub fn run<T: Timestamp>(&self, dataflow: LogicalDataflow<T>) -> Result<DataflowCompletion> {
         self.run_sync(dataflow)
     }
 
@@ -470,11 +470,14 @@ impl RuntimeHandle {
     /// `ExecutorRegistry`. Pool threads cooperatively poll the task via
     /// `poll_run()`, yielding after each poll budget to allow other
     /// dataflows to make progress on the same threads.
-    pub fn spawn<T: Timestamp>(
-        &self,
-        dataflow: LogicalDataflow<T>,
-    ) -> Result<SpawnedDataflow<T>> {
-        self.spawn_internal(dataflow, ChannelMode::Sync, WorkerContext::single(), None, None)
+    pub fn spawn<T: Timestamp>(&self, dataflow: LogicalDataflow<T>) -> Result<SpawnedDataflow<T>> {
+        self.spawn_internal(
+            dataflow,
+            ChannelMode::Sync,
+            WorkerContext::single(),
+            None,
+            None,
+        )
     }
 
     /// Spawn a dataflow with async channel-based I/O.
@@ -501,7 +504,13 @@ impl RuntimeHandle {
         &self,
         dataflow: LogicalDataflow<T>,
     ) -> Result<SpawnedDataflow<T>> {
-        self.spawn_internal(dataflow, ChannelMode::Async, WorkerContext::single(), None, None)
+        self.spawn_internal(
+            dataflow,
+            ChannelMode::Async,
+            WorkerContext::single(),
+            None,
+            None,
+        )
     }
 
     /// Spawn N replicated workers from the same dataflow builder closure.
@@ -517,16 +526,16 @@ impl RuntimeHandle {
     /// # Uniform replication
     ///
     /// `num_workers` creates N **complete replicas** of the entire dataflow
-    /// graph. Every region in the dataflow gets the same number of workers —
-    /// there is no per-region parallelism control. Each worker is an
+    /// graph. Every stage in the dataflow gets the same number of workers —
+    /// there is no per-stage parallelism control. Each worker is an
     /// independent executor; the `num_workers` parameter controls **logical**
     /// parallelism, while the runtime's `worker_threads` configuration
     /// controls **physical** parallelism. For example, 4 logical workers on a
     /// pool with 1 thread will run cooperatively and sequentially.
     ///
-    /// Per-region worker counts (e.g., 4 workers in region 0 funneling into
-    /// 2 workers in region 1) require exchange channels to redistribute data
-    /// at region boundaries. This will be supported once exchange operators
+    /// Per-stage worker counts (e.g., 4 workers in stage 0 funneling into
+    /// 2 workers in stage 1) require exchange channels to redistribute data
+    /// at stage boundaries. This will be supported once exchange operators
     /// are implemented.
     ///
     /// # Execution model
@@ -647,10 +656,7 @@ impl RuntimeHandle {
 
     // -- Private sync implementations --
 
-    fn run_sync<T: Timestamp>(
-        &self,
-        dataflow: LogicalDataflow<T>,
-    ) -> Result<DataflowCompletion> {
+    fn run_sync<T: Timestamp>(&self, dataflow: LogicalDataflow<T>) -> Result<DataflowCompletion> {
         if dataflow.has_input_ports() {
             return Err(Error::Custom(
                 "cannot run() a dataflow with declared input ports — \
@@ -666,8 +672,13 @@ impl RuntimeHandle {
         let cancel = self.cancel.child_token();
         let wake_handle = WakeHandle::new();
         cancel.register_wake_handle(wake_handle.clone());
-        let executor =
-            materialize_executor(dataflow, cancel, Some(wake_handle), WorkerContext::single(), None)?;
+        let executor = materialize_executor(
+            dataflow,
+            cancel,
+            Some(wake_handle),
+            WorkerContext::single(),
+            None,
+        )?;
 
         let (completion, notifier) = DataflowCompletion::new();
 
@@ -686,8 +697,15 @@ impl RuntimeHandle {
         progress_channels: Option<WorkerProgressChannels<T>>,
         pre_created_wake_handle: Option<WakeHandle>,
     ) -> Result<SpawnedDataflow<T>> {
-        let (spawned, executor, notifier) =
-            self.prepare_worker(dataflow, mode, worker_context, progress_channels, pre_created_wake_handle, None, None)?;
+        let (spawned, executor, notifier) = self.prepare_worker(
+            dataflow,
+            mode,
+            worker_context,
+            progress_channels,
+            pre_created_wake_handle,
+            None,
+            None,
+        )?;
         self.registry.register(executor, notifier);
         Ok(spawned)
     }
@@ -711,12 +729,20 @@ impl RuntimeHandle {
         pre_created_wake_handle: Option<WakeHandle>,
         parent_cancel: Option<CancellationToken>,
         control_broadcast: Option<(ControlSender, ControlReceiver)>,
-    ) -> Result<(SpawnedDataflow<T>, Pin<Box<DataflowExecutor<T>>>, CompletionNotifier)> {
+    ) -> Result<(
+        SpawnedDataflow<T>,
+        Pin<Box<DataflowExecutor<T>>>,
+        CompletionNotifier,
+    )> {
         let has_async_sources;
         #[cfg(feature = "async-io")]
-        { has_async_sources = !dataflow.async_source_wiring.is_empty(); }
+        {
+            has_async_sources = !dataflow.async_source_wiring.is_empty();
+        }
         #[cfg(not(feature = "async-io"))]
-        { has_async_sources = false; }
+        {
+            has_async_sources = false;
+        }
 
         if dataflow.operator_factories.is_empty()
             && dataflow.input_port_wiring.is_empty()
@@ -795,15 +821,19 @@ impl RuntimeHandle {
                 .iter()
                 .position(|(idx, _)| *idx == info.operator_index)
             {
-                dataflow.operator_factories[pos] =
-                    (info.operator_index, replacement_factory);
+                dataflow.operator_factories[pos] = (info.operator_index, replacement_factory);
             }
             output_receivers.push((info.name.clone(), info.type_name, receiver_any));
         }
 
         // --- Materialize executor (but do NOT register yet) ---
-        let mut executor =
-            materialize_executor(dataflow, cancel, Some(wake_handle), worker_context, progress_channels)?;
+        let mut executor = materialize_executor(
+            dataflow,
+            cancel,
+            Some(wake_handle),
+            worker_context,
+            progress_channels,
+        )?;
 
         external_inputs_open.store(input_count, std::sync::atomic::Ordering::SeqCst);
         executor.replace_external_inputs_counter(external_inputs_open);
@@ -925,8 +955,7 @@ impl RuntimeHandle {
         };
         let mut control_pairs: Vec<Option<(ControlSender, ControlReceiver)>> = if num_workers > 1 {
             let df_cancel = dataflow_cancel.as_ref().unwrap().clone();
-            let (senders, receivers) =
-                ControlBroadcast::new(num_workers, &wake_handles, df_cancel);
+            let (senders, receivers) = ControlBroadcast::new(num_workers, &wake_handles, df_cancel);
             senders
                 .into_iter()
                 .zip(receivers)
@@ -983,11 +1012,10 @@ impl RuntimeHandle {
                     // Cancel and drop already-prepared workers (they haven't
                     // been registered, so just cancel their tokens).
                     for (w, _, _) in &prepared {
-                        w.cancel.cancel_with_reason(
-                            CancellationReason::WorkerFailed(
-                                format!("sibling worker {spawned_count} failed to spawn"),
-                            ),
-                        );
+                        w.cancel
+                            .cancel_with_reason(CancellationReason::WorkerFailed(format!(
+                                "sibling worker {spawned_count} failed to spawn"
+                            )));
                     }
                     return Err(Error::Custom(format!(
                         "failed to spawn worker {spawned_count}: {e}"
@@ -1075,20 +1103,20 @@ impl RuntimeHandle {
             compute_fingerprint, perform_handshake, perform_ready_barrier,
         };
         use crate::communication::transport_session::{
-            ChannelRegistration, TransportSession, CONTROL_CHANNEL_ID,
+            CONTROL_CHANNEL_ID, ChannelRegistration, TransportSession,
         };
         use crate::dataflow::channels::exchange_channel::NetworkMaterializerParams;
         use crate::dataflow::channels::network::NetworkEdgeMaterializer;
         use crate::progress::network_progress::{
-            create_network_progress_channels, progress_channel_id, DEFAULT_MAX_BATCH_SIZE,
+            DEFAULT_MAX_BATCH_SIZE, create_network_progress_channels, progress_channel_id,
         };
 
         let total_workers = topology.total_workers();
-        let (local_start, local_end) = topology
-            .worker_range(local_node_id)
-            .ok_or_else(|| Error::Custom(format!(
+        let (local_start, local_end) = topology.worker_range(local_node_id).ok_or_else(|| {
+            Error::Custom(format!(
                 "local_node_id '{local_node_id}' not found in topology"
-            )))?;
+            ))
+        })?;
         let num_local = local_end - local_start;
 
         // Validate connections match topology (one per remote peer, no self, no dups).
@@ -1161,7 +1189,10 @@ impl RuntimeHandle {
                 for src in peer_start..peer_end {
                     for dst in local_start..local_end {
                         let channel_id = NetworkEdgeMaterializer::<T, u8>::channel_id(
-                            edge_order, src, dst, total_workers,
+                            edge_order,
+                            src,
+                            dst,
+                            total_workers,
                         );
                         data_regs.push(ChannelRegistration {
                             peer_node_id: peer_id.clone(),
@@ -1203,32 +1234,37 @@ impl RuntimeHandle {
 
         // Phase 4: Handshake — exchange fingerprints with all peers.
         // Extract control receivers from the receivers map.
-        let mut control_receivers: std::collections::HashMap<String, tokio::sync::mpsc::Receiver<Vec<u8>>> =
-            std::collections::HashMap::new();
+        let mut control_receivers: std::collections::HashMap<
+            String,
+            tokio::sync::mpsc::Receiver<Vec<u8>>,
+        > = std::collections::HashMap::new();
         for (peer_id, peer_map) in receivers.iter_mut() {
             if let Some(rx) = peer_map.remove(&CONTROL_CHANNEL_ID) {
                 control_receivers.insert(peer_id.clone(), rx);
             }
         }
 
-        runtime_handle.block_on(perform_handshake(
-            &session,
-            &mut control_receivers,
-            fingerprint,
-            dataflow_id,
-            handshake_timeout,
-        )).map_err(|e| Error::Custom(format!("cluster handshake failed: {e}")))?;
+        runtime_handle
+            .block_on(perform_handshake(
+                &session,
+                &mut control_receivers,
+                fingerprint,
+                dataflow_id,
+                handshake_timeout,
+            ))
+            .map_err(|e| Error::Custom(format!("cluster handshake failed: {e}")))?;
 
         // Phase 5: Wire exchange channels using network-backed factories.
         // Create wake handles BEFORE exchange wiring so bridge tasks can use them.
         // Wake handles for ALL workers (remote ones are placeholders for API compat).
-        let wake_handles: Vec<WakeHandle> =
-            (0..total_workers).map(|_| WakeHandle::new()).collect();
+        let wake_handles: Vec<WakeHandle> = (0..total_workers).map(|_| WakeHandle::new()).collect();
 
         // Take network creators from worker 0 (all workers have identical topology).
         let network_creators = std::mem::take(&mut dataflows[0].exchange_network_creators);
 
-        for (edge_order, (edge_idx, edge_capacity, creator)) in network_creators.into_iter().enumerate() {
+        for (edge_order, (edge_idx, edge_capacity, creator)) in
+            network_creators.into_iter().enumerate()
+        {
             // Extract receivers for this specific exchange edge from the shared map.
             let mut edge_receivers: std::collections::HashMap<
                 String,
@@ -1245,7 +1281,10 @@ impl RuntimeHandle {
                     for src in peer_start..peer_end {
                         for dst in local_start..local_end {
                             let channel_id = NetworkEdgeMaterializer::<T, u8>::channel_id(
-                                edge_order, src, dst, total_workers,
+                                edge_order,
+                                src,
+                                dst,
+                                total_workers,
                             );
                             if let Some(rx) = peer_map.remove(&channel_id) {
                                 extracted.insert(channel_id, rx);
@@ -1290,10 +1329,12 @@ impl RuntimeHandle {
                     .channel_factories
                     .iter()
                     .position(|(idx, _)| *idx == edge_idx)
-                    .ok_or_else(|| Error::Custom(format!(
-                        "exchange edge {edge_idx} not found in worker {}'s channel factories",
-                        local_start + local_idx
-                    )))?;
+                    .ok_or_else(|| {
+                        Error::Custom(format!(
+                            "exchange edge {edge_idx} not found in worker {}'s channel factories",
+                            local_start + local_idx
+                        ))
+                    })?;
                 dataflows[local_idx].channel_factories[pos].1 = factory;
             }
         }
@@ -1361,11 +1402,10 @@ impl RuntimeHandle {
                 Ok(worker) => prepared.push(worker),
                 Err(e) => {
                     for (w, _, _) in &prepared {
-                        w.cancel.cancel_with_reason(
-                            CancellationReason::WorkerFailed(
-                                format!("cluster worker {global_idx} failed to spawn"),
-                            ),
-                        );
+                        w.cancel
+                            .cancel_with_reason(CancellationReason::WorkerFailed(format!(
+                                "cluster worker {global_idx} failed to spawn"
+                            )));
                     }
                     return Err(Error::Custom(format!(
                         "failed to spawn cluster worker {global_idx}: {e}"
@@ -1375,13 +1415,15 @@ impl RuntimeHandle {
         }
 
         // Phase 8: Ready barrier — wait for all peers to finish materialization.
-        runtime_handle.block_on(perform_ready_barrier(
-            &session,
-            &mut control_receivers,
-            local_node_id,
-            dataflow_id,
-            handshake_timeout,
-        )).map_err(|e| Error::Custom(format!("cluster ready barrier failed: {e}")))?;
+        runtime_handle
+            .block_on(perform_ready_barrier(
+                &session,
+                &mut control_receivers,
+                local_node_id,
+                dataflow_id,
+                handshake_timeout,
+            ))
+            .map_err(|e| Error::Custom(format!("cluster ready barrier failed: {e}")))?;
 
         // Phase 9: Register all workers for execution.
         let mut workers = Vec::with_capacity(num_local);
@@ -1404,7 +1446,8 @@ impl RuntimeHandle {
                 worker_tokens,
                 bridge_cancel: bridge_cancel.clone(),
             };
-            self.peer_registry.register(&remote_peer_ids, name, cancel_handle);
+            self.peer_registry
+                .register(&remote_peer_ids, name, cancel_handle);
         }
 
         Ok(ClusterSpawnedDataflow {
@@ -1564,10 +1607,7 @@ impl SimpleRuntime {
     /// let results = handle.take_output::<i32>("results")?.collect_data();
     /// handle.join()?;
     /// ```
-    pub fn spawn<T: Timestamp>(
-        &self,
-        dataflow: LogicalDataflow<T>,
-    ) -> Result<SpawnedDataflow<T>> {
+    pub fn spawn<T: Timestamp>(&self, dataflow: LogicalDataflow<T>) -> Result<SpawnedDataflow<T>> {
         self.spawn_with_context(dataflow, WorkerContext::single())
     }
 
@@ -1608,8 +1648,11 @@ impl SimpleRuntime {
             .iter()
             .zip(dataflow.input_port_wiring.drain(..))
         {
-            let (factory, sender_any) =
-                wiring(Arc::clone(&external_inputs_open), wake_handle.clone(), ChannelMode::Sync);
+            let (factory, sender_any) = wiring(
+                Arc::clone(&external_inputs_open),
+                wake_handle.clone(),
+                ChannelMode::Sync,
+            );
             dataflow
                 .operator_factories
                 .push((info.operator_index, factory));
@@ -1649,8 +1692,7 @@ impl SimpleRuntime {
                 .iter()
                 .position(|(idx, _)| *idx == info.operator_index)
             {
-                dataflow.operator_factories[pos] =
-                    (info.operator_index, replacement_factory);
+                dataflow.operator_factories[pos] = (info.operator_index, replacement_factory);
             }
             output_receivers.push((info.name.clone(), info.type_name, receiver_any));
         }
@@ -1769,11 +1811,10 @@ impl SimpleRuntime {
                 }
                 Err(e) => {
                     for w in &workers {
-                        w.cancel.cancel_with_reason(
-                            CancellationReason::WorkerFailed(
-                                format!("sibling worker {spawned_count} failed to spawn"),
-                            ),
-                        );
+                        w.cancel
+                            .cancel_with_reason(CancellationReason::WorkerFailed(format!(
+                                "sibling worker {spawned_count} failed to spawn"
+                            )));
                     }
                     for w in workers {
                         let _ = w.join_blocking();
@@ -1954,11 +1995,7 @@ impl Future for DataflowCompletion {
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         let mut state = match self.shared.lock() {
             Ok(s) => s,
-            Err(_) => {
-                return Poll::Ready(Err(Error::Custom(
-                    "completion mutex poisoned".into(),
-                )))
-            }
+            Err(_) => return Poll::Ready(Err(Error::Custom("completion mutex poisoned".into()))),
         };
         if let Some(result) = state.result.take() {
             Poll::Ready(interpret_completion(result))
@@ -2122,9 +2159,11 @@ impl<T: Timestamp> SpawnedDataflow<T> {
         sender_any
             .downcast::<crate::dataflow::channel_operators::AsyncInputSender<T, D>>()
             .map(|boxed| *boxed)
-            .map_err(|_| Error::Custom(format!(
-                "input port '{name}' was not wired for async I/O (use spawn_async)"
-            )))
+            .map_err(|_| {
+                Error::Custom(format!(
+                    "input port '{name}' was not wired for async I/O (use spawn_async)"
+                ))
+            })
     }
 
     /// Take the async output receiver for the named port (consumes it).
@@ -2154,9 +2193,11 @@ impl<T: Timestamp> SpawnedDataflow<T> {
         receiver_any
             .downcast::<crate::dataflow::channel_operators::AsyncOutputReceiver<T, D>>()
             .map(|boxed| *boxed)
-            .map_err(|_| Error::Custom(format!(
-                "output port '{name}' was not wired for async I/O (use spawn_async)"
-            )))
+            .map_err(|_| {
+                Error::Custom(format!(
+                    "output port '{name}' was not wired for async I/O (use spawn_async)"
+                ))
+            })
     }
 
     /// Cancel the running dataflow.
@@ -2222,13 +2263,13 @@ impl<T: Timestamp> Drop for SpawnedDataflow<T> {
 ///
 /// ## Uniform replication
 ///
-/// All regions in the dataflow have the same number of workers (`num_workers`).
-/// Per-region parallelism (e.g., more workers in a data-ingestion region,
-/// fewer in a reduction region) is not yet supported and requires exchange
-/// channels at region boundaries. Note that "region" is instancy's scoping
+/// All stages in the dataflow have the same number of workers (`num_workers`).
+/// Per-stage parallelism (e.g., more workers in a data-ingestion stage,
+/// fewer in a reduction stage) is not yet supported and requires exchange
+/// channels at stage boundaries. Note that "stage" is instancy's scoping
 /// concept for progress tracking — it is more general than Spark's linear
-/// "stage" model because regions can be nested (e.g., loop bodies are inner
-/// regions).
+/// "stage" model because stages can be nested (e.g., loop bodies are inner
+/// stages).
 ///
 /// ## Logical vs physical parallelism
 ///
@@ -2373,15 +2414,20 @@ impl<T: Timestamp> MultiSpawnedDataflow<T> {
         // and correct channel mode (sync).
         for (idx, w) in self.workers.iter().enumerate() {
             Self::validate_port::<crate::dataflow::channel_operators::InputSender<T, D>>(
-                &w.input_senders, idx, name, type_name, "input",
+                &w.input_senders,
+                idx,
+                name,
+                type_name,
+                "input",
             )?;
         }
         // Consume from each worker. After full validation this cannot fail.
         let mut senders = Vec::with_capacity(self.num_workers);
         for w in &mut self.workers {
-            senders.push(w.take_input::<D>(name).expect(
-                "take_all_inputs: pre-validated port disappeared",
-            ));
+            senders.push(
+                w.take_input::<D>(name)
+                    .expect("take_all_inputs: pre-validated port disappeared"),
+            );
         }
         Ok(senders)
     }
@@ -2397,14 +2443,19 @@ impl<T: Timestamp> MultiSpawnedDataflow<T> {
         let type_name = std::any::type_name::<D>();
         for (idx, w) in self.workers.iter().enumerate() {
             Self::validate_port::<crate::dataflow::channel_operators::OutputReceiver<T, D>>(
-                &w.output_receivers, idx, name, type_name, "output",
+                &w.output_receivers,
+                idx,
+                name,
+                type_name,
+                "output",
             )?;
         }
         let mut receivers = Vec::with_capacity(self.num_workers);
         for w in &mut self.workers {
-            receivers.push(w.take_output::<D>(name).expect(
-                "take_all_outputs: pre-validated port disappeared",
-            ));
+            receivers.push(
+                w.take_output::<D>(name)
+                    .expect("take_all_outputs: pre-validated port disappeared"),
+            );
         }
         Ok(receivers)
     }
@@ -2421,14 +2472,19 @@ impl<T: Timestamp> MultiSpawnedDataflow<T> {
         let type_name = std::any::type_name::<D>();
         for (idx, w) in self.workers.iter().enumerate() {
             Self::validate_port::<crate::dataflow::channel_operators::AsyncInputSender<T, D>>(
-                &w.input_senders, idx, name, type_name, "input",
+                &w.input_senders,
+                idx,
+                name,
+                type_name,
+                "input",
             )?;
         }
         let mut senders = Vec::with_capacity(self.num_workers);
         for w in &mut self.workers {
-            senders.push(w.take_async_input::<D>(name).expect(
-                "take_all_async_inputs: pre-validated port disappeared",
-            ));
+            senders.push(
+                w.take_async_input::<D>(name)
+                    .expect("take_all_async_inputs: pre-validated port disappeared"),
+            );
         }
         Ok(senders)
     }
@@ -2445,14 +2501,19 @@ impl<T: Timestamp> MultiSpawnedDataflow<T> {
         let type_name = std::any::type_name::<D>();
         for (idx, w) in self.workers.iter().enumerate() {
             Self::validate_port::<crate::dataflow::channel_operators::AsyncOutputReceiver<T, D>>(
-                &w.output_receivers, idx, name, type_name, "output",
+                &w.output_receivers,
+                idx,
+                name,
+                type_name,
+                "output",
             )?;
         }
         let mut receivers = Vec::with_capacity(self.num_workers);
         for w in &mut self.workers {
-            receivers.push(w.take_async_output::<D>(name).expect(
-                "take_all_async_outputs: pre-validated port disappeared",
-            ));
+            receivers.push(
+                w.take_async_output::<D>(name)
+                    .expect("take_all_async_outputs: pre-validated port disappeared"),
+            );
         }
         Ok(receivers)
     }
@@ -2472,17 +2533,13 @@ impl<T: Timestamp> MultiSpawnedDataflow<T> {
             None => Err(Error::Custom(format!(
                 "worker {worker_idx} has no {direction} port named '{name}'"
             ))),
-            Some((_, port_type, _)) if *port_type != type_name => Err(Error::Custom(
-                format!(
-                    "worker {worker_idx} {direction} port '{name}' has type {port_type}, but requested {type_name}"
-                ),
-            )),
-            Some((_, _, any_box)) if !any_box.is::<C>() => Err(Error::Custom(
-                format!(
-                    "worker {worker_idx} {direction} port '{name}' channel mode mismatch \
+            Some((_, port_type, _)) if *port_type != type_name => Err(Error::Custom(format!(
+                "worker {worker_idx} {direction} port '{name}' has type {port_type}, but requested {type_name}"
+            ))),
+            Some((_, _, any_box)) if !any_box.is::<C>() => Err(Error::Custom(format!(
+                "worker {worker_idx} {direction} port '{name}' channel mode mismatch \
                      (sync port with async take, or vice versa)"
-                ),
-            )),
+            ))),
             _ => Ok(()),
         }
     }
@@ -2521,11 +2578,10 @@ impl<T: Timestamp> MultiSpawnedDataflow<T> {
                         first_error = Some(e);
                         // Cancel all remaining workers directly.
                         for w in &workers {
-                            w.cancel.cancel_with_reason(
-                                CancellationReason::WorkerFailed(
+                            w.cancel
+                                .cancel_with_reason(CancellationReason::WorkerFailed(
                                     "sibling worker failed".into(),
-                                ),
-                            );
+                                ));
                         }
                     }
                     // Continue draining remaining workers (already cancelled).
@@ -2547,15 +2603,13 @@ impl<T: Timestamp> MultiSpawnedDataflow<T> {
         let workers = std::mem::take(&mut self.workers);
         // Collect per-worker cancel tokens so MultiDataflowCompletion can
         // cancel remaining workers directly on first error.
-        let worker_cancels: Vec<CancellationToken> = workers
-            .iter()
-            .map(|w| w.cancel.clone())
-            .collect();
-        let completions: Vec<DataflowCompletion> = workers
-            .into_iter()
-            .map(|w| w.join())
-            .collect();
-        MultiDataflowCompletion { worker_cancels, completions }
+        let worker_cancels: Vec<CancellationToken> =
+            workers.iter().map(|w| w.cancel.clone()).collect();
+        let completions: Vec<DataflowCompletion> = workers.into_iter().map(|w| w.join()).collect();
+        MultiDataflowCompletion {
+            worker_cancels,
+            completions,
+        }
     }
 }
 
@@ -2730,11 +2784,9 @@ impl MultiDataflowCompletion {
                         first_error = Some(e);
                         // Cancel remaining workers directly.
                         for cancel in &self.worker_cancels[idx + 1..] {
-                            cancel.cancel_with_reason(
-                                CancellationReason::WorkerFailed(
-                                    "sibling worker failed".into(),
-                                ),
-                            );
+                            cancel.cancel_with_reason(CancellationReason::WorkerFailed(
+                                "sibling worker failed".into(),
+                            ));
                         }
                     }
                 }
@@ -2757,9 +2809,7 @@ impl MultiDataflowCompletion {
 /// Checks: operator count, edge count, feedback edge count, input port
 /// names/types, and output port names/types. All must match across replicas
 /// for correct replicated execution.
-fn validate_multi_worker_topologies<T: Timestamp>(
-    dataflows: &[LogicalDataflow<T>],
-) -> Result<()> {
+fn validate_multi_worker_topologies<T: Timestamp>(dataflows: &[LogicalDataflow<T>]) -> Result<()> {
     if dataflows.len() <= 1 {
         return Ok(());
     }
@@ -2787,7 +2837,7 @@ fn validate_multi_worker_topologies<T: Timestamp>(
             )));
         }
 
-        // Operator names, regions, and port counts must match at each index.
+        // Operator names, stages, and port counts must match at each index.
         for (j, (a, b)) in ref_ops.iter().zip(ops.iter()).enumerate() {
             if a.name != b.name {
                 return Err(Error::Custom(format!(
@@ -2795,10 +2845,10 @@ fn validate_multi_worker_topologies<T: Timestamp>(
                     b.name, a.name
                 )));
             }
-            if a.region_id != b.region_id {
+            if a.stage_id != b.stage_id {
                 return Err(Error::Custom(format!(
-                    "worker {i} operator {j} ('{}') has region {:?} but worker 0 has {:?}",
-                    a.name, b.region_id, a.region_id
+                    "worker {i} operator {j} ('{}') has stage {:?} but worker 0 has {:?}",
+                    a.name, b.stage_id, a.stage_id
                 )));
             }
             if a.input_count != b.input_count || a.output_count != b.output_count {
@@ -3223,8 +3273,7 @@ mod tests {
             fn clone(p: *const ()) -> RawWaker {
                 RawWaker::new(p, &VTABLE)
             }
-            const VTABLE: RawWakerVTable =
-                RawWakerVTable::new(clone, no_op, no_op, no_op);
+            const VTABLE: RawWakerVTable = RawWakerVTable::new(clone, no_op, no_op, no_op);
             RawWaker::new(std::ptr::null(), &VTABLE)
         }
         let waker = unsafe { Waker::from_raw(noop_raw_waker()) };
@@ -3447,11 +3496,15 @@ mod tests {
     fn spawn_multi_single_worker_matches_spawn() {
         let rt = SimpleRuntime::new();
         let mut multi = rt
-            .spawn_multi("test", 1, |_worker_idx, builder: &mut DataflowBuilder<u64>| {
-                let input = builder.input::<i32>("data");
-                input.map("double", |_t, x| x * 2).output("out");
-                Ok(())
-            })
+            .spawn_multi(
+                "test",
+                1,
+                |_worker_idx, builder: &mut DataflowBuilder<u64>| {
+                    let input = builder.input::<i32>("data");
+                    input.map("double", |_t, x| x * 2).output("out");
+                    Ok(())
+                },
+            )
             .unwrap();
 
         assert_eq!(multi.num_workers(), 1);
@@ -3474,11 +3527,15 @@ mod tests {
         let rt = SimpleRuntime::new();
         let num = 4;
         let mut multi = rt
-            .spawn_multi("parallel", num, |_worker_idx, builder: &mut DataflowBuilder<u64>| {
-                let input = builder.input::<i32>("data");
-                input.map("triple", |_t, x| x * 3).output("out");
-                Ok(())
-            })
+            .spawn_multi(
+                "parallel",
+                num,
+                |_worker_idx, builder: &mut DataflowBuilder<u64>| {
+                    let input = builder.input::<i32>("data");
+                    input.map("triple", |_t, x| x * 3).output("out");
+                    Ok(())
+                },
+            )
             .unwrap();
 
         assert_eq!(multi.num_workers(), num);
@@ -3503,10 +3560,10 @@ mod tests {
             all_results.push(data);
         }
 
-        assert_eq!(all_results[0], vec![0]);   // 0 * 3
-        assert_eq!(all_results[1], vec![30]);  // 10 * 3
-        assert_eq!(all_results[2], vec![60]);  // 20 * 3
-        assert_eq!(all_results[3], vec![90]);  // 30 * 3
+        assert_eq!(all_results[0], vec![0]); // 0 * 3
+        assert_eq!(all_results[1], vec![30]); // 10 * 3
+        assert_eq!(all_results[2], vec![60]); // 20 * 3
+        assert_eq!(all_results[3], vec![90]); // 30 * 3
 
         multi.join_blocking().unwrap();
     }
@@ -3527,11 +3584,15 @@ mod tests {
     fn spawn_multi_cancel_stops_all() {
         let rt = SimpleRuntime::new();
         let mut multi = rt
-            .spawn_multi("cancel-test", 3, |_worker_idx, builder: &mut DataflowBuilder<u64>| {
-                let input = builder.input::<i32>("data");
-                input.output("out");
-                Ok(())
-            })
+            .spawn_multi(
+                "cancel-test",
+                3,
+                |_worker_idx, builder: &mut DataflowBuilder<u64>| {
+                    let input = builder.input::<i32>("data");
+                    input.output("out");
+                    Ok(())
+                },
+            )
             .unwrap();
 
         // Take senders to keep workers alive (inputs open).
@@ -3556,11 +3617,15 @@ mod tests {
 
         let rt = SimpleRuntime::new();
         let multi = rt
-            .spawn_multi("idx-test", 4, move |worker_idx, builder: &mut DataflowBuilder<u64>| {
-                sum_clone.fetch_add(worker_idx, Ordering::Relaxed);
-                builder.source::<i32>("src", vec![]);
-                Ok(())
-            })
+            .spawn_multi(
+                "idx-test",
+                4,
+                move |worker_idx, builder: &mut DataflowBuilder<u64>| {
+                    sum_clone.fetch_add(worker_idx, Ordering::Relaxed);
+                    builder.source::<i32>("src", vec![]);
+                    Ok(())
+                },
+            )
             .unwrap();
 
         // 0 + 1 + 2 + 3 = 6
@@ -3572,11 +3637,15 @@ mod tests {
     fn spawn_multi_on_runtime_handle() {
         let rt = RuntimeHandle::new(RuntimeConfig::default()).unwrap();
         let mut multi = rt
-            .spawn_multi("pool-test", 2, |_worker_idx, builder: &mut DataflowBuilder<u64>| {
-                let input = builder.input::<i32>("data");
-                input.map("inc", |_t, x| x + 1).output("out");
-                Ok(())
-            })
+            .spawn_multi(
+                "pool-test",
+                2,
+                |_worker_idx, builder: &mut DataflowBuilder<u64>| {
+                    let input = builder.input::<i32>("data");
+                    input.map("inc", |_t, x| x + 1).output("out");
+                    Ok(())
+                },
+            )
             .unwrap();
 
         // Feed data to worker 0 and 1.
@@ -3603,10 +3672,14 @@ mod tests {
     fn spawn_multi_join_returns_completion() {
         let rt = SimpleRuntime::new();
         let multi = rt
-            .spawn_multi("join-test", 2, |_worker_idx, builder: &mut DataflowBuilder<u64>| {
-                builder.source::<i32>("src", vec![]);
-                Ok(())
-            })
+            .spawn_multi(
+                "join-test",
+                2,
+                |_worker_idx, builder: &mut DataflowBuilder<u64>| {
+                    builder.source::<i32>("src", vec![]);
+                    Ok(())
+                },
+            )
             .unwrap();
 
         let completion = multi.join();
@@ -3657,7 +3730,11 @@ mod tests {
         // Collect per-worker outputs.
         for i in 0..n {
             let out = multi.take_output::<i32>(i, "out").unwrap();
-            let data: Vec<i32> = out.collect_data().into_iter().flat_map(|(_, d)| d).collect();
+            let data: Vec<i32> = out
+                .collect_data()
+                .into_iter()
+                .flat_map(|(_, d)| d)
+                .collect();
             assert_eq!(data, vec![i as i32 * 10]);
         }
 
@@ -3882,8 +3959,16 @@ mod tests {
             .collect();
         worker1_data.sort();
 
-        assert_eq!(worker0_data, vec![10, 12, 14, 20, 22], "worker0 got wrong data");
-        assert_eq!(worker1_data, vec![11, 13, 15, 21, 23], "worker1 got wrong data; worker0 was: {worker0_data:?}");
+        assert_eq!(
+            worker0_data,
+            vec![10, 12, 14, 20, 22],
+            "worker0 got wrong data"
+        );
+        assert_eq!(
+            worker1_data,
+            vec![11, 13, 15, 21, 23],
+            "worker1 got wrong data; worker0 was: {worker0_data:?}"
+        );
     }
 
     #[test]
@@ -3893,9 +3978,7 @@ mod tests {
         let mut multi = rt
             .spawn_multi("exchange_1w", 1, |_worker_idx, builder| {
                 let input = builder.input::<i32>("data");
-                input
-                    .exchange("by_key", |x: &i32| *x as u64)
-                    .output("out");
+                input.exchange("by_key", |x: &i32| *x as u64).output("out");
                 Ok(())
             })
             .unwrap();
@@ -3946,7 +4029,9 @@ mod tests {
         let in1 = multi.take_input::<i32>(1, "data").unwrap();
         in1.close();
 
-        let _ = multi.join_blocking().expect("dataflow should complete without error");
+        let _ = multi
+            .join_blocking()
+            .expect("dataflow should complete without error");
 
         let mut w0: Vec<i32> = out0
             .collect_data()
@@ -3993,7 +4078,9 @@ mod tests {
         in1.send(0u64, vec![4, 5, 6, 7]).unwrap();
         in1.close();
 
-        let _ = multi.join_blocking().expect("dataflow should complete without error");
+        let _ = multi
+            .join_blocking()
+            .expect("dataflow should complete without error");
 
         let mut w0: Vec<i32> = out0
             .collect_data()
@@ -4211,16 +4298,8 @@ mod tests {
         // may arrive in separate activations. The notification can fire multiple
         // times for the same timestamp (once per activation that delivers new data),
         // so we assert on the total count per epoch, not the number of emissions.
-        let total_count_w0: i32 = out0
-            .collect_data()
-            .iter()
-            .flat_map(|(_, v)| v)
-            .sum();
-        let total_count_w1: i32 = out1
-            .collect_data()
-            .iter()
-            .flat_map(|(_, v)| v)
-            .sum();
+        let total_count_w0: i32 = out0.collect_data().iter().flat_map(|(_, v)| v).sum();
+        let total_count_w1: i32 = out1.collect_data().iter().flat_map(|(_, v)| v).sum();
 
         assert_eq!(total_count_w0, 5, "worker 0 should count all 5 items");
         assert_eq!(total_count_w1, 0, "worker 1 should receive nothing");
@@ -4296,34 +4375,30 @@ mod tests {
         let rt = RuntimeHandle::new(RuntimeConfig::default()).unwrap();
         let num_workers = 4;
         let mut multi = rt
-            .spawn_multi(
-                "exchange_notify_4w",
-                num_workers,
-                |_worker_idx, builder| {
-                    let input = builder.input::<i32>("data");
-                    input
-                        .exchange_by_hash("mod4", |x: &i32| *x as u64)
-                        .unary_notify("collect", {
-                            let mut stash: std::collections::HashMap<u64, Vec<i32>> =
-                                std::collections::HashMap::new();
-                            move |input, output, ctx| {
-                                while let Some((time, data)) = input.next() {
-                                    stash.entry(time).or_default().extend(data);
-                                    ctx.notify_at(time);
-                                }
-                                while let Some(time) = ctx.next_notification() {
-                                    if let Some(mut data) = stash.remove(&time) {
-                                        data.sort();
-                                        output.push_vec(time, data);
-                                    }
-                                }
-                                Ok(())
+            .spawn_multi("exchange_notify_4w", num_workers, |_worker_idx, builder| {
+                let input = builder.input::<i32>("data");
+                input
+                    .exchange_by_hash("mod4", |x: &i32| *x as u64)
+                    .unary_notify("collect", {
+                        let mut stash: std::collections::HashMap<u64, Vec<i32>> =
+                            std::collections::HashMap::new();
+                        move |input, output, ctx| {
+                            while let Some((time, data)) = input.next() {
+                                stash.entry(time).or_default().extend(data);
+                                ctx.notify_at(time);
                             }
-                        })
-                        .output("results");
-                    Ok(())
-                },
-            )
+                            while let Some(time) = ctx.next_notification() {
+                                if let Some(mut data) = stash.remove(&time) {
+                                    data.sort();
+                                    output.push_vec(time, data);
+                                }
+                            }
+                            Ok(())
+                        }
+                    })
+                    .output("results");
+                Ok(())
+            })
             .unwrap();
 
         // Each worker sends values 0..8 — exchange routes each value to
@@ -4530,7 +4605,9 @@ mod tests {
 
         for i in 0..num_workers {
             let inp = multi.take_input::<NonSerializable>(i, "data").unwrap();
-            let items: Vec<NonSerializable> = (0..8).map(|v| NonSerializable::new(i as i32 * 100 + v)).collect();
+            let items: Vec<NonSerializable> = (0..8)
+                .map(|v| NonSerializable::new(i as i32 * 100 + v))
+                .collect();
             inp.send(0u64, items).unwrap();
             inp.close();
         }
@@ -4539,15 +4616,25 @@ mod tests {
 
         let mut all_values: Vec<i32> = Vec::new();
         for out in outputs {
-            let data: Vec<NonSerializable> = out.collect_data().into_iter().flat_map(|(_, d)| d).collect();
+            let data: Vec<NonSerializable> = out
+                .collect_data()
+                .into_iter()
+                .flat_map(|(_, d)| d)
+                .collect();
             for item in &data {
-                assert!(item.tag.starts_with("original-"), "data integrity failed: {:?}", item);
+                assert!(
+                    item.tag.starts_with("original-"),
+                    "data integrity failed: {:?}",
+                    item
+                );
             }
             all_values.extend(data.into_iter().map(|x| x.value));
         }
 
         all_values.sort();
-        let mut expected: Vec<i32> = (0..num_workers as i32).flat_map(|w| (0..8).map(move |v| w * 100 + v)).collect();
+        let mut expected: Vec<i32> = (0..num_workers as i32)
+            .flat_map(|w| (0..8).map(move |v| w * 100 + v))
+            .collect();
         expected.sort();
         assert_eq!(all_values, expected, "all data should arrive intact");
     }
@@ -4577,17 +4664,25 @@ mod tests {
 
         for i in 0..2 {
             let inp = multi.take_input::<NonSerializable>(i, "data").unwrap();
-            inp.send(0u64, vec![NonSerializable::new((i as i32 + 1) * 5)]).unwrap();
+            inp.send(0u64, vec![NonSerializable::new((i as i32 + 1) * 5)])
+                .unwrap();
             inp.close();
         }
 
         multi.join_blocking().unwrap();
 
         for (i, out) in outputs.into_iter().enumerate() {
-            let data: Vec<NonSerializable> = out.collect_data().into_iter().flat_map(|(_, d)| d).collect();
+            let data: Vec<NonSerializable> = out
+                .collect_data()
+                .into_iter()
+                .flat_map(|(_, d)| d)
+                .collect();
             assert_eq!(data.len(), 1);
             assert_eq!(data[0].value, (i as i32 + 1) * 10);
-            assert!(data[0].tag.starts_with("original-"), "pipeline data integrity failed");
+            assert!(
+                data[0].tag.starts_with("original-"),
+                "pipeline data integrity failed"
+            );
         }
     }
 
@@ -4627,10 +4722,7 @@ mod tests {
             });
 
         assert_eq!(builder.get_context::<TestConfig>().unwrap().multiplier, 10);
-        assert_eq!(
-            builder.get_context::<TestLabel>().unwrap().name,
-            "test"
-        );
+        assert_eq!(builder.get_context::<TestLabel>().unwrap().name, "test");
     }
 
     #[test]
@@ -4670,7 +4762,11 @@ mod tests {
         let receiver = handle.take_output::<i32>("result").unwrap();
         handle.join_blocking().unwrap();
 
-        let mut data: Vec<i32> = receiver.collect_data().into_iter().flat_map(|(_, d)| d).collect();
+        let mut data: Vec<i32> = receiver
+            .collect_data()
+            .into_iter()
+            .flat_map(|(_, d)| d)
+            .collect();
         data.sort();
         assert_eq!(data, vec![3, 6, 9]);
     }
@@ -4756,8 +4852,13 @@ mod tests {
         let cfg = builder.get_context::<TestConfig>().unwrap();
         let out = input.iterate("loop", 1u32, move |iter_var| {
             let cfg_cap = cfg.clone();
-            let result = iter_var.map("double", move |_t: &crate::order::Product<u64, u32>, x| x * cfg_cap.multiplier);
-            IterateResult { feedback: result.clone(), output: result }
+            let result = iter_var.map("double", move |_t: &crate::order::Product<u64, u32>, x| {
+                x * cfg_cap.multiplier
+            });
+            IterateResult {
+                feedback: result.clone(),
+                output: result,
+            }
         });
         out.output("result");
 
@@ -4780,21 +4881,27 @@ mod tests {
         let fail_clone = fail_flag.clone();
 
         let mut multi = rt
-            .spawn_multi("ctrl-err", 2, move |worker_idx, builder: &mut DataflowBuilder<u64>| {
-                let input = builder.input::<i32>("data");
-                let flag = fail_clone.clone();
-                input.map("process", move |_t, x: i32| -> i32 {
-                    if flag.load(std::sync::atomic::Ordering::Relaxed) {
-                        panic!("intentional failure from worker");
+            .spawn_multi(
+                "ctrl-err",
+                2,
+                move |worker_idx, builder: &mut DataflowBuilder<u64>| {
+                    let input = builder.input::<i32>("data");
+                    let flag = fail_clone.clone();
+                    input
+                        .map("process", move |_t, x: i32| -> i32 {
+                            if flag.load(std::sync::atomic::Ordering::Relaxed) {
+                                panic!("intentional failure from worker");
+                            }
+                            x + 1
+                        })
+                        .output("out");
+                    // Mark worker 0 to fail on its first activation
+                    if worker_idx == 0 {
+                        // We'll set the flag externally after spawn
                     }
-                    x + 1
-                }).output("out");
-                // Mark worker 0 to fail on its first activation
-                if worker_idx == 0 {
-                    // We'll set the flag externally after spawn
-                }
-                Ok(())
-            })
+                    Ok(())
+                },
+            )
             .unwrap();
 
         // Set the flag so worker 0 fails when it processes data
@@ -4818,8 +4925,10 @@ mod tests {
         // Verify the error message relates to the worker failure.
         let err_msg = format!("{}", result.unwrap_err());
         assert!(
-            err_msg.contains("process") || err_msg.contains("intentional") 
-                || err_msg.contains("cancel") || err_msg.contains("panic")
+            err_msg.contains("process")
+                || err_msg.contains("intentional")
+                || err_msg.contains("cancel")
+                || err_msg.contains("panic")
                 || err_msg.contains("terminated"),
             "error should relate to the failing worker: {err_msg}"
         );
@@ -4830,11 +4939,15 @@ mod tests {
         // Single-worker spawn works without any control broadcast.
         let rt = SimpleRuntime::new();
         let mut multi = rt
-            .spawn_multi("single", 1, |_worker_idx, builder: &mut DataflowBuilder<u64>| {
-                let input = builder.input::<i32>("data");
-                input.map("inc", |_t, x: i32| x + 1).output("out");
-                Ok(())
-            })
+            .spawn_multi(
+                "single",
+                1,
+                |_worker_idx, builder: &mut DataflowBuilder<u64>| {
+                    let input = builder.input::<i32>("data");
+                    input.map("inc", |_t, x: i32| x + 1).output("out");
+                    Ok(())
+                },
+            )
             .unwrap();
 
         assert_eq!(multi.num_workers(), 1);
@@ -4853,8 +4966,8 @@ mod tests {
     #[test]
     fn control_broadcast_unit_test_sender_receiver() {
         // Direct test of ControlBroadcast types.
-        use crate::dataflow::control::{ControlBroadcast, WorkerControl};
         use crate::dataflow::channels::wake::WakeHandle;
+        use crate::dataflow::control::{ControlBroadcast, WorkerControl};
 
         let parent = CancellationToken::new();
         let df_cancel = parent.child_token();
@@ -4881,8 +4994,8 @@ mod tests {
 
     #[test]
     fn control_broadcast_limit_does_not_cancel() {
-        use crate::dataflow::control::ControlBroadcast;
         use crate::dataflow::channels::wake::WakeHandle;
+        use crate::dataflow::control::ControlBroadcast;
 
         let parent = CancellationToken::new();
         let df_cancel = parent.child_token();

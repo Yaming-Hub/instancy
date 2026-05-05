@@ -314,10 +314,8 @@ mod tests {
 
     #[test]
     fn equality_same_elements_different_order() {
-        let a: Antichain<Product<u64, u64>> =
-            vec![Product::new(1, 3), Product::new(3, 1)].into();
-        let b: Antichain<Product<u64, u64>> =
-            vec![Product::new(3, 1), Product::new(1, 3)].into();
+        let a: Antichain<Product<u64, u64>> = vec![Product::new(1, 3), Product::new(3, 1)].into();
+        let b: Antichain<Product<u64, u64>> = vec![Product::new(3, 1), Product::new(1, 3)].into();
         assert_eq!(a, b);
     }
 
@@ -392,8 +390,7 @@ mod tests {
 
     #[test]
     fn into_iter_owned() {
-        let ac: Antichain<Product<u64, u64>> =
-            vec![Product::new(1, 3), Product::new(3, 1)].into();
+        let ac: Antichain<Product<u64, u64>> = vec![Product::new(1, 3), Product::new(3, 1)].into();
         let collected: Vec<_> = ac.into_iter().collect();
         assert_eq!(collected.len(), 2);
     }

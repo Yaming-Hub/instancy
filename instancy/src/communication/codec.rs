@@ -80,7 +80,10 @@ impl fmt::Display for CodecError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::InsufficientData { needed, available } => {
-                write!(f, "insufficient data: need {needed} bytes, have {available}")
+                write!(
+                    f,
+                    "insufficient data: need {needed} bytes, have {available}"
+                )
             }
             Self::InvalidData(msg) => write!(f, "invalid data: {msg}"),
             Self::Custom(msg) => write!(f, "codec error: {msg}"),
@@ -98,7 +101,9 @@ fn encode_length_prefix(len: usize, buf: &mut Vec<u8>) -> Result<(), CodecError>
         )));
     }
     let len_u32 = u32::try_from(len).map_err(|_| {
-        CodecError::Custom(format!("payload too large for u32 length prefix: {len} bytes"))
+        CodecError::Custom(format!(
+            "payload too large for u32 length prefix: {len} bytes"
+        ))
     })?;
     buf.extend_from_slice(&len_u32.to_le_bytes());
     Ok(())

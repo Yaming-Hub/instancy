@@ -8,9 +8,9 @@ use std::collections::BTreeMap;
 use std::fmt;
 
 use crate::dataflow::operators::handles::{InputHandle, OutputHandle};
-use crate::dataflow::region::RegionId;
 use crate::dataflow::scope::Scope;
-use crate::dataflow::stream::{StreamEdge, Slot};
+use crate::dataflow::stage::StageId;
+use crate::dataflow::stream::{Slot, StreamEdge};
 use crate::error::Result;
 use crate::progress::frontier::Antichain;
 use crate::progress::timestamp::Timestamp;
@@ -25,8 +25,8 @@ pub struct DelayOperator<T: Timestamp, D, F> {
     name: String,
     /// Operator index within the scope.
     index: usize,
-    /// The execution region.
-    region_id: RegionId,
+    /// The execution stage.
+    stage_id: StageId,
     /// Input handle.
     input: InputHandle<T, D>,
     /// Output handle.
@@ -50,12 +50,7 @@ where
     /// and returns the output timestamp. The output timestamp must be ≥
     /// the input timestamp (the operator does not enforce this but incorrect
     /// timestamps may cause progress tracking issues).
-    pub fn new(
-        name: impl Into<String>,
-        index: usize,
-        region_id: RegionId,
-        delay_fn: F,
-    ) -> Self {
+    pub fn new(name: impl Into<String>, index: usize, stage_id: StageId, delay_fn: F) -> Self {
         let name = name.into();
         Self {
             input: InputHandle::new(format!("{name}:input")),
@@ -63,7 +58,7 @@ where
             buffer: BTreeMap::new(),
             name,
             index,
-            region_id,
+            stage_id,
             delay_fn,
             frontier: Antichain::from_elem(T::minimum()),
         }
@@ -79,9 +74,9 @@ where
         self.index
     }
 
-    /// Get the region ID.
-    pub fn region_id(&self) -> RegionId {
-        self.region_id
+    /// Get the stage ID.
+    pub fn stage_id(&self) -> StageId {
+        self.stage_id
     }
 
     /// Get a mutable reference to the input handle.
@@ -125,7 +120,9 @@ where
         // in the frontier (frontier has advanced past it).
         // Use filter (not take_while) to handle partial orders correctly —
         // BTreeMap's Ord ordering may not match the partial order.
-        let releasable: Vec<T> = self.buffer.keys()
+        let releasable: Vec<T> = self
+            .buffer
+            .keys()
             .filter(|t| !self.frontier.less_equal(t))
             .cloned()
             .collect();
@@ -164,7 +161,7 @@ impl<T: Timestamp, D, F> fmt::Debug for DelayOperator<T, D, F> {
         f.debug_struct("DelayOperator")
             .field("name", &self.name)
             .field("index", &self.index)
-            .field("region_id", &self.region_id)
+            .field("stage_id", &self.stage_id)
             .field("buffered_timestamps", &self.buffer.len())
             .finish()
     }
@@ -180,8 +177,8 @@ pub struct DelayBatchOperator<T: Timestamp, D, F> {
     name: String,
     /// Operator index within the scope.
     index: usize,
-    /// The execution region.
-    region_id: RegionId,
+    /// The execution stage.
+    stage_id: StageId,
     /// Input handle.
     input: InputHandle<T, D>,
     /// Output handle.
@@ -202,12 +199,7 @@ where
     /// Create a new batch-level delay operator.
     ///
     /// The `delay_fn` maps each input timestamp to an output timestamp.
-    pub fn new(
-        name: impl Into<String>,
-        index: usize,
-        region_id: RegionId,
-        delay_fn: F,
-    ) -> Self {
+    pub fn new(name: impl Into<String>, index: usize, stage_id: StageId, delay_fn: F) -> Self {
         let name = name.into();
         Self {
             input: InputHandle::new(format!("{name}:input")),
@@ -215,7 +207,7 @@ where
             buffer: BTreeMap::new(),
             name,
             index,
-            region_id,
+            stage_id,
             delay_fn,
             frontier: Antichain::from_elem(T::minimum()),
         }
@@ -231,9 +223,9 @@ where
         self.index
     }
 
-    /// Get the region ID.
-    pub fn region_id(&self) -> RegionId {
-        self.region_id
+    /// Get the stage ID.
+    pub fn stage_id(&self) -> StageId {
+        self.stage_id
     }
 
     /// Get a mutable reference to the input handle.
@@ -270,7 +262,9 @@ where
 
         // Release data whose output timestamp is past the frontier.
         // Use filter (not take_while) to handle partial orders correctly.
-        let releasable: Vec<T> = self.buffer.keys()
+        let releasable: Vec<T> = self
+            .buffer
+            .keys()
             .filter(|t| !self.frontier.less_equal(t))
             .cloned()
             .collect();
@@ -309,7 +303,7 @@ impl<T: Timestamp, D, F> fmt::Debug for DelayBatchOperator<T, D, F> {
         f.debug_struct("DelayBatchOperator")
             .field("name", &self.name)
             .field("index", &self.index)
-            .field("region_id", &self.region_id)
+            .field("stage_id", &self.stage_id)
             .field("buffered_timestamps", &self.buffer.len())
             .finish()
     }
@@ -338,24 +332,26 @@ where
     {
         let mut scope = self.scope().clone();
         let op_index = scope.allocate_operator_index();
-        let region_id = self.region_id();
+        let stage_id = self.stage_id();
         let output_slot = Slot::new(op_index, 0);
 
         // Register operator and edge in the dataflow graph.
-        scope.register_operator(crate::dataflow::graph::OperatorInfo::new(
-            op_index, name, region_id, 1, 1,
-        )).expect("operator index should be unique");
+        scope
+            .register_operator(crate::dataflow::graph::OperatorInfo::new(
+                op_index, name, stage_id, 1, 1,
+            ))
+            .expect("operator index should be unique");
         scope.add_edge(crate::dataflow::graph::EdgeInfo::new(
             *self.source(),
             Slot::new(op_index, 0),
-            self.region_id(),
-            region_id,
+            self.stage_id(),
+            stage_id,
         ));
 
         let _operator: DelayOperator<S::Timestamp, D, F> =
-            DelayOperator::new(name, op_index, region_id, _delay_fn);
+            DelayOperator::new(name, op_index, stage_id, _delay_fn);
 
-        StreamEdge::new(scope, output_slot, region_id)
+        StreamEdge::new(scope, output_slot, stage_id)
     }
 
     fn delay_batch<F>(&self, name: &str, _delay_fn: F) -> StreamEdge<S, D>
@@ -364,24 +360,26 @@ where
     {
         let mut scope = self.scope().clone();
         let op_index = scope.allocate_operator_index();
-        let region_id = self.region_id();
+        let stage_id = self.stage_id();
         let output_slot = Slot::new(op_index, 0);
 
         // Register operator and edge in the dataflow graph.
-        scope.register_operator(crate::dataflow::graph::OperatorInfo::new(
-            op_index, name, region_id, 1, 1,
-        )).expect("operator index should be unique");
+        scope
+            .register_operator(crate::dataflow::graph::OperatorInfo::new(
+                op_index, name, stage_id, 1, 1,
+            ))
+            .expect("operator index should be unique");
         scope.add_edge(crate::dataflow::graph::EdgeInfo::new(
             *self.source(),
             Slot::new(op_index, 0),
-            self.region_id(),
-            region_id,
+            self.stage_id(),
+            stage_id,
         ));
 
         let _operator: DelayBatchOperator<S::Timestamp, D, F> =
-            DelayBatchOperator::new(name, op_index, region_id, _delay_fn);
+            DelayBatchOperator::new(name, op_index, stage_id, _delay_fn);
 
-        StreamEdge::new(scope, output_slot, region_id)
+        StreamEdge::new(scope, output_slot, stage_id)
     }
 }
 
@@ -395,7 +393,7 @@ mod tests {
         let op = DelayOperator::<u64, i32, _>::new(
             "delay_by_10",
             0,
-            RegionId::new(0),
+            StageId::new(0),
             |_item: &i32, time: &u64| time + 10,
         );
         assert_eq!(op.name(), "delay_by_10");
@@ -407,7 +405,7 @@ mod tests {
         let mut op = DelayOperator::<u64, i32, _>::new(
             "delay_by_5",
             0,
-            RegionId::new(0),
+            StageId::new(0),
             |_item: &i32, time: &u64| time + 5,
         );
 
@@ -435,7 +433,7 @@ mod tests {
         let mut op = DelayOperator::<u64, i32, _>::new(
             "double_time",
             0,
-            RegionId::new(0),
+            StageId::new(0),
             |_item: &i32, time: &u64| time * 2,
         );
 
@@ -469,7 +467,7 @@ mod tests {
         let mut op = DelayOperator::<u64, i32, _>::new(
             "item_delay",
             0,
-            RegionId::new(0),
+            StageId::new(0),
             |item: &i32, time: &u64| time + (*item as u64),
         );
 
@@ -494,7 +492,7 @@ mod tests {
         let mut op = DelayOperator::<u64, i32, _>::new(
             "delay_10",
             0,
-            RegionId::new(0),
+            StageId::new(0),
             |_item: &i32, time: &u64| time + 10,
         );
 
@@ -516,7 +514,7 @@ mod tests {
         let mut op = DelayBatchOperator::<u64, i32, _>::new(
             "batch_delay",
             0,
-            RegionId::new(0),
+            StageId::new(0),
             |time: &u64| time + 5,
         );
 
@@ -542,7 +540,7 @@ mod tests {
         let mut op = DelayBatchOperator::<u64, i32, _>::new(
             "batch_delay",
             0,
-            RegionId::new(0),
+            StageId::new(0),
             |time: &u64| time + 1,
         );
 
@@ -565,7 +563,7 @@ mod tests {
         let mut op = DelayOperator::<u64, i32, _>::new(
             "noop",
             0,
-            RegionId::new(0),
+            StageId::new(0),
             |_item: &i32, time: &u64| *time,
         );
 
@@ -576,10 +574,10 @@ mod tests {
     #[test]
     fn delay_ext_produces_stream() {
         let mut scope = RootScope::<u64>::new("test", 4);
-        let region_id = scope.current_region().id();
+        let stage_id = scope.current_stage_id();
         let src_idx = scope.allocate_operator_index();
         let source = Slot::new(src_idx, 0);
-        let stream: StreamEdge<RootScope<u64>, i32> = StreamEdge::new(scope, source, region_id);
+        let stream: StreamEdge<RootScope<u64>, i32> = StreamEdge::new(scope, source, stage_id);
 
         let output = stream.delay("delay_5", |_item, time| time + 5);
         assert_eq!(output.source().operator_index, 2);
@@ -588,10 +586,10 @@ mod tests {
     #[test]
     fn delay_batch_ext_produces_stream() {
         let mut scope = RootScope::<u64>::new("test", 4);
-        let region_id = scope.current_region().id();
+        let stage_id = scope.current_stage_id();
         let src_idx = scope.allocate_operator_index();
         let source = Slot::new(src_idx, 0);
-        let stream: StreamEdge<RootScope<u64>, i32> = StreamEdge::new(scope, source, region_id);
+        let stream: StreamEdge<RootScope<u64>, i32> = StreamEdge::new(scope, source, stage_id);
 
         let output = stream.delay_batch("delay_batch", |time| time + 10);
         assert_eq!(output.source().operator_index, 2);
@@ -602,7 +600,7 @@ mod tests {
         let mut op = DelayBatchOperator::<u64, i32, _>::new(
             "flush_test",
             0,
-            RegionId::new(0),
+            StageId::new(0),
             |time: &u64| time + 100,
         );
 
@@ -621,7 +619,7 @@ mod tests {
         let mut op = DelayOperator::<u64, i32, _>::new(
             "cap_test",
             0,
-            RegionId::new(0),
+            StageId::new(0),
             |_item: &i32, time: &u64| time + 10,
         );
 

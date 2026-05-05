@@ -9,8 +9,8 @@
 //! ```
 
 use instancy::DataflowBuilder;
-use instancy::{RuntimeConfig, RuntimeHandle};
 use instancy::scheduler::policy::FifoPolicy;
+use instancy::{RuntimeConfig, RuntimeHandle};
 
 #[allow(clippy::needless_return)]
 fn main() {
@@ -59,10 +59,7 @@ fn main() {
     // Batch runtime: run a static source pipeline (no external input)
     let builder = DataflowBuilder::<u64>::new("batch-squares");
     let out = builder
-        .source("data", vec![
-            (0u64, vec![1i32, 2, 3]),
-            (1, vec![4, 5, 6]),
-        ])
+        .source("data", vec![(0u64, vec![1i32, 2, 3]), (1, vec![4, 5, 6])])
         .map("square", |_t, x| x * x)
         .output("results");
     let dataflow = builder.build().expect("build failed");
@@ -79,8 +76,16 @@ fn main() {
     // Shutting down one runtime doesn't affect the other.
     rt_fast.shutdown();
     println!("\nShut down '{}':", rt_fast.name());
-    println!("  {} is_shutdown: {}", rt_fast.name(), rt_fast.is_shutdown());
-    println!("  {} is_shutdown: {}", rt_batch.name(), rt_batch.is_shutdown());
+    println!(
+        "  {} is_shutdown: {}",
+        rt_fast.name(),
+        rt_fast.is_shutdown()
+    );
+    println!(
+        "  {} is_shutdown: {}",
+        rt_batch.name(),
+        rt_batch.is_shutdown()
+    );
 
     // The batch runtime can still run more dataflows.
     assert!(!rt_batch.is_shutdown());

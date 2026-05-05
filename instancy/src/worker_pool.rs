@@ -139,7 +139,8 @@ impl WorkerPool {
 
         // Spawn initial min_threads
         for _ in 0..config.min_threads {
-            pool.spawn_thread().map_err(|_| "failed to spawn initial worker thread")?;
+            pool.spawn_thread()
+                .map_err(|_| "failed to spawn initial worker thread")?;
         }
 
         Ok(pool)
@@ -169,7 +170,11 @@ impl WorkerPool {
         // lock() and wait_timeout() — without the mutex, notify_all can fire
         // before the thread enters the wait, causing it to miss the signal.
         {
-            let _guard = self.state.park_mutex.lock().unwrap_or_else(|e| e.into_inner());
+            let _guard = self
+                .state
+                .park_mutex
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
             self.state.park_condvar.notify_all();
         }
 
@@ -246,7 +251,9 @@ impl WorkerPool {
             if current >= self.state.config.max_threads {
                 return false;
             }
-            if self.state.thread_count
+            if self
+                .state
+                .thread_count
                 .compare_exchange_weak(current, current + 1, Ordering::AcqRel, Ordering::Relaxed)
                 .is_ok()
             {
@@ -259,8 +266,7 @@ impl WorkerPool {
             .name("instancy-worker".to_string())
             .spawn(move || {
                 worker_thread_loop(&state);
-            })
-        {
+            }) {
             Ok(h) => h,
             Err(_) => {
                 // Undo the reservation — spawn failed.
@@ -285,8 +291,7 @@ impl WorkerPool {
             .name("instancy-worker".to_string())
             .spawn(move || {
                 worker_thread_loop(&state);
-            })
-        {
+            }) {
             Ok(h) => h,
             Err(e) => {
                 self.state.thread_count.fetch_sub(1, Ordering::SeqCst);
@@ -355,7 +360,12 @@ fn worker_thread_loop(state: &PoolState) {
         }
 
         // Priority 2: Try executor tasks from the registry's ready queue
-        if let Some(registry) = state.executor_registry.lock().ok().and_then(|g| g.as_ref().cloned()) {
+        if let Some(registry) = state
+            .executor_registry
+            .lock()
+            .ok()
+            .and_then(|g| g.as_ref().cloned())
+        {
             if let Some(task) = registry.dequeue() {
                 if task.try_start_poll() {
                     idle_cycles = 0;
@@ -363,17 +373,15 @@ fn worker_thread_loop(state: &PoolState) {
 
                     // Create a PoolWaker so the executor's WakeHandle can
                     // re-enqueue this task when channels push data.
-                    let pool_waker = Arc::new(PoolWaker::new(
-                        Arc::clone(&task),
-                        Arc::clone(&registry),
-                    ));
+                    let pool_waker =
+                        Arc::new(PoolWaker::new(Arc::clone(&task), Arc::clone(&registry)));
                     let waker: std::task::Waker = pool_waker.into();
                     let mut cx = std::task::Context::from_waker(&waker);
 
                     // Poll with panic safety
-                    let result = std::panic::catch_unwind(
-                        std::panic::AssertUnwindSafe(|| task.poll(&mut cx)),
-                    );
+                    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        task.poll(&mut cx)
+                    }));
 
                     state.active_count.fetch_sub(1, Ordering::Relaxed);
 
@@ -544,7 +552,9 @@ mod tests {
                 crate::worker::WorkerId::new(i % 2),
                 "test",
                 i,
-                move || { counter.fetch_add(1, Ordering::SeqCst); },
+                move || {
+                    counter.fetch_add(1, Ordering::SeqCst);
+                },
             ));
         }
 
@@ -594,9 +604,15 @@ mod tests {
                         if current <= prev_max {
                             break;
                         }
-                        if max_concurrent.compare_exchange(
-                            prev_max, current, Ordering::SeqCst, Ordering::Relaxed
-                        ).is_ok() {
+                        if max_concurrent
+                            .compare_exchange(
+                                prev_max,
+                                current,
+                                Ordering::SeqCst,
+                                Ordering::Relaxed,
+                            )
+                            .is_ok()
+                        {
                             break;
                         }
                     }

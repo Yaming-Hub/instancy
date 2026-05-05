@@ -7,9 +7,9 @@ use std::fmt;
 use std::sync::{Arc, Mutex};
 
 use crate::dataflow::operators::handles::InputHandle;
-use crate::dataflow::region::RegionId;
 use crate::dataflow::scope::Scope;
-use crate::dataflow::stream::{StreamEdge, Slot};
+use crate::dataflow::stage::StageId;
+use crate::dataflow::stream::{Slot, StreamEdge};
 use crate::progress::frontier::Antichain;
 use crate::progress::timestamp::Timestamp;
 
@@ -111,8 +111,8 @@ pub struct ProbeOperator<T: Timestamp, D> {
     name: String,
     /// Operator index within the scope.
     index: usize,
-    /// The execution region.
-    region_id: RegionId,
+    /// The execution stage.
+    stage_id: StageId,
     /// The operator's input handle.
     input: InputHandle<T, D>,
     /// The shared probe state.
@@ -121,11 +121,7 @@ pub struct ProbeOperator<T: Timestamp, D> {
 
 impl<T: Timestamp, D> ProbeOperator<T, D> {
     /// Create a new probe operator and its handle.
-    pub fn new(
-        name: impl Into<String>,
-        index: usize,
-        region_id: RegionId,
-    ) -> (Self, ProbeHandle<T>) {
+    pub fn new(name: impl Into<String>, index: usize, stage_id: StageId) -> (Self, ProbeHandle<T>) {
         let state = Arc::new(Mutex::new(ProbeState::new()));
         let handle = ProbeHandle::new(Arc::clone(&state));
         let name = name.into();
@@ -134,7 +130,7 @@ impl<T: Timestamp, D> ProbeOperator<T, D> {
             input: InputHandle::new(format!("{name}:input")),
             name,
             index,
-            region_id,
+            stage_id,
             handle: ProbeHandle::new(state),
         };
 
@@ -151,9 +147,9 @@ impl<T: Timestamp, D> ProbeOperator<T, D> {
         self.index
     }
 
-    /// Get the region ID.
-    pub fn region_id(&self) -> RegionId {
-        self.region_id
+    /// Get the stage ID.
+    pub fn stage_id(&self) -> StageId {
+        self.stage_id
     }
 
     /// Get a mutable reference to the input handle.
@@ -190,7 +186,7 @@ impl<T: Timestamp, D> fmt::Debug for ProbeOperator<T, D> {
         f.debug_struct("ProbeOperator")
             .field("name", &self.name)
             .field("index", &self.index)
-            .field("region_id", &self.region_id)
+            .field("stage_id", &self.stage_id)
             .finish()
     }
 }
@@ -208,25 +204,23 @@ impl<S: Scope, D: 'static> ProbeExt<S, D> for StreamEdge<S, D> {
     fn probe(&self, name: &str) -> ProbeHandle<S::Timestamp> {
         let mut scope = self.scope().clone();
         let op_index = scope.allocate_operator_index();
-        let region_id = self.region_id();
+        let stage_id = self.stage_id();
 
         // Register operator and edge in the dataflow graph.
         // Probe is a terminal operator: 1 input, 0 outputs.
-        scope.register_operator(crate::dataflow::graph::OperatorInfo::new(
-            op_index, name, region_id, 1, 0,
-        )).expect("operator index should be unique");
+        scope
+            .register_operator(crate::dataflow::graph::OperatorInfo::new(
+                op_index, name, stage_id, 1, 0,
+            ))
+            .expect("operator index should be unique");
         scope.add_edge(crate::dataflow::graph::EdgeInfo::new(
             *self.source(),
             Slot::new(op_index, 0),
-            self.region_id(),
-            region_id,
+            self.stage_id(),
+            stage_id,
         ));
 
-        let (_operator, handle) = ProbeOperator::<S::Timestamp, D>::new(
-            name,
-            op_index,
-            region_id,
-        );
+        let (_operator, handle) = ProbeOperator::<S::Timestamp, D>::new(name, op_index, stage_id);
 
         handle
     }
@@ -318,7 +312,7 @@ mod tests {
 
     #[test]
     fn probe_operator_creation() {
-        let (op, handle) = ProbeOperator::<u64, i32>::new("test_probe", 0, RegionId::new(0));
+        let (op, handle) = ProbeOperator::<u64, i32>::new("test_probe", 0, StageId::new(0));
 
         assert_eq!(op.name(), "test_probe");
         assert_eq!(op.index(), 0);
@@ -327,7 +321,7 @@ mod tests {
 
     #[test]
     fn probe_operator_drains_input() {
-        let (mut op, _handle) = ProbeOperator::<u64, i32>::new("drain_test", 0, RegionId::new(0));
+        let (mut op, _handle) = ProbeOperator::<u64, i32>::new("drain_test", 0, StageId::new(0));
 
         op.input_mut().push_vec(1, vec![10, 20]);
         op.input_mut().push_vec(2, vec![30]);
@@ -340,7 +334,7 @@ mod tests {
 
     #[test]
     fn probe_operator_marks_done_on_exhaust() {
-        let (mut op, handle) = ProbeOperator::<u64, i32>::new("done_test", 0, RegionId::new(0));
+        let (mut op, handle) = ProbeOperator::<u64, i32>::new("done_test", 0, StageId::new(0));
 
         assert!(!handle.done());
 
@@ -353,9 +347,9 @@ mod tests {
     #[test]
     fn probe_ext_allocates_operator() {
         let scope = RootScope::<u64>::new("test", 4);
-        let region_id = scope.current_region().id();
+        let stage_id = scope.current_stage_id();
         let source = Slot::new(0, 0);
-        let stream: StreamEdge<RootScope<u64>, i32> = StreamEdge::new(scope, source, region_id);
+        let stream: StreamEdge<RootScope<u64>, i32> = StreamEdge::new(scope, source, stage_id);
 
         let handle = stream.probe("my_probe");
         assert!(!handle.done());

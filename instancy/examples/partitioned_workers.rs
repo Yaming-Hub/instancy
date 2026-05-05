@@ -32,12 +32,7 @@ fn main() {
     // --- Simulated partitioned dataset ---
     // In practice, each partition might be a file shard, a database
     // partition, or data co-located with a specific node.
-    let partitions: Vec<Vec<i32>> = vec![
-        vec![1, 2, 3],
-        vec![10, 20],
-        vec![100],
-        vec![1000, 2000],
-    ];
+    let partitions: Vec<Vec<i32>> = vec![vec![1, 2, 3], vec![10, 20], vec![100], vec![1000, 2000]];
     let num_workers = partitions.len();
     println!("Dataset has {num_workers} partitions:");
     for (i, p) in partitions.iter().enumerate() {

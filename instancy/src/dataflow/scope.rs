@@ -1,11 +1,8 @@
-//! Scope trait and implementations.
+//! Stage-oriented scope trait and implementations.
 //!
-//! A Scope represents a region of the dataflow graph that shares a common
-//! timestamp type. Scopes can be nested (for loops) where inner scopes
-//! have timestamps that extend the outer scope's timestamp.
-//!
-//! Scopes use shared interior state so that cloning a Scope (e.g., when
-//! embedded in multiple StreamEdge values) shares operator/region allocation.
+//! A Scope represents a stage of the dataflow graph that shares a common
+//! timestamp type. Scopes can be nested (for loops) where inner scopes have
+//! timestamps that extend the outer scope's timestamp.
 
 use std::fmt;
 use std::sync::{Arc, Mutex};
@@ -15,43 +12,30 @@ use crate::order::Product;
 use crate::progress::timestamp::Timestamp;
 
 use super::graph::{DataflowGraph, EdgeInfo, OperatorInfo};
-use super::region::{Region, RegionAllocator, RegionId};
+use super::stage::StageId;
 
-/// A unique address within the dataflow graph.
-///
-/// This is a **logical** concept — it identifies an operator's position in the
-/// nested scope hierarchy. It has no relation to physical machine addresses
-/// or network locations.
-///
-/// Each element identifies a nesting level; the full path locates
-/// an operator within possibly nested scopes.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct ScopeAddr(Vec<usize>);
 
 impl ScopeAddr {
-    /// Create a root-level address.
     pub fn root() -> Self {
         Self(Vec::new())
     }
 
-    /// Create an address from components.
     pub fn from_parts(parts: Vec<usize>) -> Self {
         Self(parts)
     }
 
-    /// Create a child address by appending an index.
     pub fn child(&self, index: usize) -> Self {
         let mut parts = self.0.clone();
         parts.push(index);
         Self(parts)
     }
 
-    /// The nesting depth (0 = root scope).
     pub fn depth(&self) -> usize {
         self.0.len()
     }
 
-    /// Get the address components.
     pub fn parts(&self) -> &[usize] {
         &self.0
     }
@@ -64,175 +48,114 @@ impl fmt::Display for ScopeAddr {
     }
 }
 
-/// The Scope trait defines a region of the dataflow graph with a
-/// uniform timestamp type.
-///
-/// Scopes manage operator registration, index allocation, and
-/// provide the structural context for building dataflows.
-///
-/// Cloning a scope produces a handle to the same shared state, so
-/// operator indices and regions remain consistent across all clones.
 pub trait Scope: Clone + 'static {
-    /// The timestamp type for this scope.
     type Timestamp: Timestamp;
 
-    /// The human-readable name of this scope.
     fn name(&self) -> String;
-
-    /// The address of this scope within the dataflow graph.
     fn addr(&self) -> ScopeAddr;
-
-    /// Allocate a new operator index within this scope.
     fn allocate_operator_index(&mut self) -> usize;
-
-    /// Get the number of operators registered in this scope.
     fn operator_count(&self) -> usize;
-
-    /// Get the current default execution region for new operators.
-    fn current_region(&self) -> Region;
-
-    /// Get a region by its ID.
-    fn region(&self, id: RegionId) -> Option<Region>;
-
-    /// Create a new execution region with the given parallelism.
-    /// Returns the region ID for use with subsequent operators.
-    fn new_region(&mut self, parallelism: usize) -> RegionId;
-
-    /// Allocate the next ingress (enter) slot index for the scope boundary.
+    fn current_stage_id(&self) -> StageId;
+    fn stage_parallelism(&self, id: StageId) -> Option<usize>;
+    fn new_stage(&mut self, parallelism: usize) -> StageId;
     fn allocate_ingress_slot(&mut self) -> usize;
-
-    /// Allocate the next egress (leave) slot index for the scope boundary.
     fn allocate_egress_slot(&mut self) -> usize;
-
-    /// Register an operator in the dataflow graph.
-    ///
-    /// Records the operator's metadata (index, name, region, port counts)
-    /// so the execution engine can later materialize it.
     fn register_operator(&mut self, info: OperatorInfo) -> Result<()>;
-
-    /// Record a directed edge between operator ports in the dataflow graph.
     fn add_edge(&mut self, edge: EdgeInfo);
-
-    /// Set the target parallelism for an exchange operator.
-    ///
-    /// Records the downstream stage's intended parallelism, used by
-    /// stage inference to determine per-stage worker counts.
     fn set_exchange_parallelism(&mut self, operator_index: usize, parallelism: usize);
-
-    /// Increment the input port count of a registered operator.
-    ///
-    /// Used for operators like child scopes whose port counts grow
-    /// dynamically as enter()/leave() calls are made.
     fn increment_operator_input_count(&mut self, operator_index: usize);
-
-    /// Increment the output port count of a registered operator.
     fn increment_operator_output_count(&mut self, operator_index: usize);
-
-    /// Get a snapshot of the current dataflow graph.
     fn graph(&self) -> DataflowGraph;
 }
 
-/// Mutable state shared across all clones of a scope.
 #[derive(Debug)]
 struct ScopeState {
-    /// Next operator index to allocate.
     next_operator_index: usize,
-    /// Region allocator for execution regions.
-    region_allocator: RegionAllocator,
-    /// All regions created within this scope.
-    regions: Vec<Region>,
-    /// The index of the current default region.
-    current_region_index: usize,
-    /// Next ingress (enter) slot index for the scope boundary operator.
+    current_stage_id: StageId,
+    next_stage_id: usize,
+    stage_parallelism: Vec<usize>,
     next_ingress_slot: usize,
-    /// Next egress (leave) slot index for the scope boundary operator.
     next_egress_slot: usize,
-    /// The dataflow graph tracking operators and edges.
     graph: DataflowGraph,
 }
 
-/// The root-level scope for a dataflow.
-///
-/// This is the top-level scope provided to the dataflow builder closure.
-/// It has a single timestamp type and manages operator indexing and regions.
-/// Cloning produces a handle to the same shared state.
+impl ScopeState {
+    fn new(default_parallelism: usize, graph: DataflowGraph) -> Self {
+        Self {
+            next_operator_index: 1,
+            current_stage_id: StageId::INITIAL,
+            next_stage_id: 1,
+            stage_parallelism: vec![default_parallelism],
+            next_ingress_slot: 0,
+            next_egress_slot: 0,
+            graph,
+        }
+    }
+
+    fn stage_parallelism(&self, id: StageId) -> Option<usize> {
+        self.stage_parallelism.get(id.index()).copied()
+    }
+
+    fn new_stage(&mut self, parallelism: usize) -> StageId {
+        let id = StageId::new(self.next_stage_id);
+        self.next_stage_id += 1;
+        self.stage_parallelism.push(parallelism);
+        id
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct RootScope<T: Timestamp> {
-    /// Name of this scope (immutable, shared by reference).
     name: Arc<String>,
-    /// Address of this scope (immutable).
     addr: ScopeAddr,
-    /// Shared mutable state.
     state: Arc<Mutex<ScopeState>>,
-    /// Phantom for timestamp type.
     _phantom: std::marker::PhantomData<T>,
 }
 
 impl<T: Timestamp> RootScope<T> {
-    /// Create a new root scope with a default region.
     pub fn new(name: impl Into<String>, default_parallelism: usize) -> Self {
-        let mut region_allocator = RegionAllocator::new();
-        let default_region = region_allocator.allocate(default_parallelism);
-
         Self {
             name: Arc::new(name.into()),
             addr: ScopeAddr::root(),
-            state: Arc::new(Mutex::new(ScopeState {
-                // Start at 1: index 0 is reserved for scope boundary metadata
-                // (consistent with ChildScope and SubgraphBuilder conventions).
-                next_operator_index: 1,
-                region_allocator,
-                regions: vec![default_region],
-                current_region_index: 0,
-                next_ingress_slot: 0,
-                next_egress_slot: 0,
-                graph: DataflowGraph::new(),
-            })),
+            state: Arc::new(Mutex::new(ScopeState::new(
+                default_parallelism,
+                DataflowGraph::new(),
+            ))),
             _phantom: std::marker::PhantomData,
         }
     }
 
-    /// Set the current default region for new operators.
-    pub fn set_current_region(&mut self, id: RegionId) -> Result<()> {
+    pub fn set_current_stage_id(&mut self, id: StageId) -> Result<()> {
         let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
-        if let Some(idx) = state.regions.iter().position(|r| r.id() == id) {
-            state.current_region_index = idx;
+        if state.stage_parallelism(id).is_some() {
+            state.current_stage_id = id;
             Ok(())
         } else {
             Err(crate::error::Error::Custom(format!(
-                "Region {} not found in scope '{}'",
+                "Stage {} not found in scope '{}'",
                 id, self.name
             )))
         }
     }
 
-    /// Get all regions in this scope (snapshot).
-    pub fn regions(&self) -> Vec<Region> {
-        self.state.lock().unwrap_or_else(|e| e.into_inner()).regions.clone()
-    }
-
-    /// Create a nested child scope for iterative computation.
-    ///
-    /// The child scope uses `Product<T, TInner>` timestamps, where `TInner`
-    /// tracks the iteration counter. Operators inside the child scope see
-    /// the combined timestamp and can distinguish iterations.
-    ///
-    /// The child scope inherits the same parallelism as the parent's current region.
-    pub fn iterative<TInner: Timestamp>(&mut self, name: impl Into<String>) -> ChildScope<Product<T, TInner>>
+    pub fn iterative<TInner: Timestamp>(
+        &mut self,
+        name: impl Into<String>,
+    ) -> ChildScope<Product<T, TInner>>
     where
         Product<T, TInner>: Timestamp,
     {
         let name = name.into();
         let child_index = self.allocate_operator_index();
-        let region_id = self.current_region().id();
-        let parallelism = self.current_region().parallelism();
+        let stage_id = self.current_stage_id();
+        let parallelism = self
+            .stage_parallelism(stage_id)
+            .expect("current stage must exist in scope state");
 
-        // Register the child scope as an operator in the parent's graph.
-        // Its input/output counts grow dynamically as enter()/leave() are called.
         self.register_operator(OperatorInfo::new(
             child_index,
             format!("subscope:{}", name),
-            region_id,
+            stage_id,
             0,
             0,
         ))
@@ -261,26 +184,32 @@ impl<T: Timestamp> Scope for RootScope<T> {
     }
 
     fn operator_count(&self) -> usize {
-        // Subtract 1: index 0 is reserved for scope boundary metadata.
-        self.state.lock().unwrap_or_else(|e| e.into_inner()).next_operator_index - 1
+        self.state
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .next_operator_index
+            - 1
     }
 
-    fn current_region(&self) -> Region {
-        let state = self.state.lock().unwrap_or_else(|e| e.into_inner());
-        state.regions[state.current_region_index].clone()
+    fn current_stage_id(&self) -> StageId {
+        self.state
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .current_stage_id
     }
 
-    fn region(&self, id: RegionId) -> Option<Region> {
-        let state = self.state.lock().unwrap_or_else(|e| e.into_inner());
-        state.regions.iter().find(|r| r.id() == id).cloned()
+    fn stage_parallelism(&self, id: StageId) -> Option<usize> {
+        self.state
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .stage_parallelism(id)
     }
 
-    fn new_region(&mut self, parallelism: usize) -> RegionId {
-        let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
-        let region = state.region_allocator.allocate(parallelism);
-        let id = region.id();
-        state.regions.push(region);
-        id
+    fn new_stage(&mut self, parallelism: usize) -> StageId {
+        self.state
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .new_stage(parallelism)
     }
 
     fn allocate_ingress_slot(&mut self) -> usize {
@@ -298,100 +227,106 @@ impl<T: Timestamp> Scope for RootScope<T> {
     }
 
     fn register_operator(&mut self, info: OperatorInfo) -> Result<()> {
-        self.state.lock().unwrap_or_else(|e| e.into_inner()).graph.register_operator(info)
+        self.state
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .graph
+            .register_operator(info)
     }
 
     fn add_edge(&mut self, edge: EdgeInfo) {
-        self.state.lock().unwrap_or_else(|e| e.into_inner()).graph.add_edge(edge);
-    }
-
-    fn increment_operator_input_count(&mut self, operator_index: usize) {
-        self.state.lock().unwrap_or_else(|e| e.into_inner()).graph.increment_input_count(operator_index);
-    }
-
-    fn increment_operator_output_count(&mut self, operator_index: usize) {
-        self.state.lock().unwrap_or_else(|e| e.into_inner()).graph.increment_output_count(operator_index);
+        self.state
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .graph
+            .add_edge(edge);
     }
 
     fn set_exchange_parallelism(&mut self, operator_index: usize, parallelism: usize) {
-        self.state.lock().unwrap_or_else(|e| e.into_inner()).graph.set_exchange_parallelism(operator_index, parallelism);
+        self.state
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .graph
+            .set_exchange_parallelism(operator_index, parallelism);
+    }
+
+    fn increment_operator_input_count(&mut self, operator_index: usize) {
+        self.state
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .graph
+            .increment_input_count(operator_index);
+    }
+
+    fn increment_operator_output_count(&mut self, operator_index: usize) {
+        self.state
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .graph
+            .increment_output_count(operator_index);
     }
 
     fn graph(&self) -> DataflowGraph {
-        self.state.lock().unwrap_or_else(|e| e.into_inner()).graph.clone()
+        self.state
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .graph
+            .clone()
     }
 }
-///
-/// The child scope has a timestamp type that extends the parent's timestamp
-/// (typically `Product<TOuter, TInner>`). Cloning shares state.
+
 #[derive(Debug, Clone)]
 pub struct ChildScope<T: Timestamp> {
-    /// Name of this child scope.
     name: Arc<String>,
-    /// Address of this scope (includes parent path + child index).
     addr: ScopeAddr,
-    /// Shared mutable state.
     state: Arc<Mutex<ScopeState>>,
-    /// Phantom for timestamp type.
     _phantom: std::marker::PhantomData<T>,
 }
 
 impl<T: Timestamp> ChildScope<T> {
-    /// Create a new child scope nested under a parent.
-    ///
-    /// Operator index 0 is reserved for the scope boundary (ingress/egress
-    /// metadata used by the progress tracker). User operators start at index 1.
     pub fn new(
         name: impl Into<String>,
         parent_addr: &ScopeAddr,
         child_index: usize,
         parallelism: usize,
     ) -> Self {
-        let mut region_allocator = RegionAllocator::new();
-        let default_region = region_allocator.allocate(parallelism);
-        let region_id = default_region.id();
-
         let mut graph = DataflowGraph::new();
-        // Register the scope boundary operator (index 0). Its port counts
-        // grow dynamically as enter()/leave() allocate ingress/egress slots.
         graph
-            .register_operator(OperatorInfo::new(0, "scope-boundary", region_id, 0, 0))
+            .register_operator(OperatorInfo::new(
+                0,
+                "scope-boundary",
+                StageId::INITIAL,
+                0,
+                0,
+            ))
             .expect("scope-boundary registration on fresh graph cannot fail");
 
         Self {
             name: Arc::new(name.into()),
             addr: parent_addr.child(child_index),
-            state: Arc::new(Mutex::new(ScopeState {
-                // Start at 1: index 0 is reserved for scope boundary metadata.
-                next_operator_index: 1,
-                region_allocator,
-                regions: vec![default_region],
-                current_region_index: 0,
-                next_ingress_slot: 0,
-                next_egress_slot: 0,
-                graph,
-            })),
+            state: Arc::new(Mutex::new(ScopeState::new(parallelism, graph))),
             _phantom: std::marker::PhantomData,
         }
     }
 
-    /// Create a further-nested child scope for iterative computation.
-    ///
-    /// Enables nested loops: an iterative scope inside another iterative scope.
-    pub fn iterative<TInner: Timestamp>(&mut self, name: impl Into<String>) -> ChildScope<Product<T, TInner>>
+    pub fn iterative<TInner: Timestamp>(
+        &mut self,
+        name: impl Into<String>,
+    ) -> ChildScope<Product<T, TInner>>
     where
         Product<T, TInner>: Timestamp,
     {
         let name = name.into();
         let child_index = self.allocate_operator_index();
-        let region_id = self.current_region().id();
-        let parallelism = self.current_region().parallelism();
+        let stage_id = self.current_stage_id();
+        let parallelism = self
+            .stage_parallelism(stage_id)
+            .expect("current stage must exist in scope state");
 
-        // Register the child scope as an operator in the parent's graph.
         self.register_operator(OperatorInfo::new(
             child_index,
             format!("subscope:{}", name),
-            region_id,
+            stage_id,
             0,
             0,
         ))
@@ -420,33 +355,38 @@ impl<T: Timestamp> Scope for ChildScope<T> {
     }
 
     fn operator_count(&self) -> usize {
-        // Subtract 1: index 0 is reserved for scope boundary metadata.
-        self.state.lock().unwrap_or_else(|e| e.into_inner()).next_operator_index - 1
+        self.state
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .next_operator_index
+            - 1
     }
 
-    fn current_region(&self) -> Region {
-        let state = self.state.lock().unwrap_or_else(|e| e.into_inner());
-        state.regions[state.current_region_index].clone()
+    fn current_stage_id(&self) -> StageId {
+        self.state
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .current_stage_id
     }
 
-    fn region(&self, id: RegionId) -> Option<Region> {
-        let state = self.state.lock().unwrap_or_else(|e| e.into_inner());
-        state.regions.iter().find(|r| r.id() == id).cloned()
+    fn stage_parallelism(&self, id: StageId) -> Option<usize> {
+        self.state
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .stage_parallelism(id)
     }
 
-    fn new_region(&mut self, parallelism: usize) -> RegionId {
-        let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
-        let region = state.region_allocator.allocate(parallelism);
-        let id = region.id();
-        state.regions.push(region);
-        id
+    fn new_stage(&mut self, parallelism: usize) -> StageId {
+        self.state
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .new_stage(parallelism)
     }
 
     fn allocate_ingress_slot(&mut self) -> usize {
         let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
         let slot = state.next_ingress_slot;
         state.next_ingress_slot += 1;
-        // Each ingress slot is an output of the boundary operator (data enters child).
         state.graph.increment_output_count(0);
         slot
     }
@@ -455,33 +395,56 @@ impl<T: Timestamp> Scope for ChildScope<T> {
         let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
         let slot = state.next_egress_slot;
         state.next_egress_slot += 1;
-        // Each egress slot is an input of the boundary operator (data leaves child).
         state.graph.increment_input_count(0);
         slot
     }
 
     fn register_operator(&mut self, info: OperatorInfo) -> Result<()> {
-        self.state.lock().unwrap_or_else(|e| e.into_inner()).graph.register_operator(info)
+        self.state
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .graph
+            .register_operator(info)
     }
 
     fn add_edge(&mut self, edge: EdgeInfo) {
-        self.state.lock().unwrap_or_else(|e| e.into_inner()).graph.add_edge(edge);
-    }
-
-    fn increment_operator_input_count(&mut self, operator_index: usize) {
-        self.state.lock().unwrap_or_else(|e| e.into_inner()).graph.increment_input_count(operator_index);
-    }
-
-    fn increment_operator_output_count(&mut self, operator_index: usize) {
-        self.state.lock().unwrap_or_else(|e| e.into_inner()).graph.increment_output_count(operator_index);
+        self.state
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .graph
+            .add_edge(edge);
     }
 
     fn set_exchange_parallelism(&mut self, operator_index: usize, parallelism: usize) {
-        self.state.lock().unwrap_or_else(|e| e.into_inner()).graph.set_exchange_parallelism(operator_index, parallelism);
+        self.state
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .graph
+            .set_exchange_parallelism(operator_index, parallelism);
+    }
+
+    fn increment_operator_input_count(&mut self, operator_index: usize) {
+        self.state
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .graph
+            .increment_input_count(operator_index);
+    }
+
+    fn increment_operator_output_count(&mut self, operator_index: usize) {
+        self.state
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .graph
+            .increment_output_count(operator_index);
     }
 
     fn graph(&self) -> DataflowGraph {
-        self.state.lock().unwrap_or_else(|e| e.into_inner()).graph.clone()
+        self.state
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .graph
+            .clone()
     }
 }
 
@@ -504,168 +467,52 @@ mod tests {
         assert_eq!(child.depth(), 1);
         assert_eq!(child.parts(), &[3]);
         assert_eq!(format!("{}", child), "[3]");
-
-        let grandchild = child.child(7);
-        assert_eq!(grandchild.depth(), 2);
-        assert_eq!(grandchild.parts(), &[3, 7]);
-        assert_eq!(format!("{}", grandchild), "[3.7]");
     }
 
     #[test]
     fn root_scope_basic() {
-        let mut scope = RootScope::<u64>::new("test", 4);
+        let scope = RootScope::<u64>::new("test", 4);
         assert_eq!(scope.name(), "test");
         assert_eq!(scope.addr().depth(), 0);
         assert_eq!(scope.operator_count(), 0);
-        assert_eq!(scope.current_region().parallelism(), 4);
-
-        // Allocate operators (index 0 is reserved for scope boundary)
-        assert_eq!(scope.allocate_operator_index(), 1);
-        assert_eq!(scope.allocate_operator_index(), 2);
-        assert_eq!(scope.operator_count(), 2);
+        assert_eq!(scope.current_stage_id(), StageId::INITIAL);
+        assert_eq!(scope.stage_parallelism(StageId::INITIAL), Some(4));
     }
 
     #[test]
-    fn root_scope_multiple_regions() {
-        let mut scope = RootScope::<u64>::new("multi_region", 4);
-
-        // Default region (parallelism=4)
-        let default_region_id = scope.current_region().id();
-        assert_eq!(scope.current_region().parallelism(), 4);
-
-        // Create new region with different parallelism
-        let new_id = scope.new_region(8);
-        assert_ne!(new_id, default_region_id);
-
-        // Switch to the new region
-        scope.set_current_region(new_id).unwrap();
-        assert_eq!(scope.current_region().parallelism(), 8);
-
-        // Switch back
-        scope.set_current_region(default_region_id).unwrap();
-        assert_eq!(scope.current_region().parallelism(), 4);
-    }
-
-    #[test]
-    fn root_scope_invalid_region() {
+    fn stages_allocate_sequentially() {
         let mut scope = RootScope::<u64>::new("test", 4);
-        let bad_id = RegionId::new(999);
-        assert!(scope.set_current_region(bad_id).is_err());
+        let s1 = scope.new_stage(8);
+        let s2 = scope.new_stage(1);
+        assert_eq!(s1, StageId::new(1));
+        assert_eq!(s2, StageId::new(2));
+        assert_eq!(scope.stage_parallelism(s1), Some(8));
+        assert_eq!(scope.stage_parallelism(s2), Some(1));
     }
 
     #[test]
-    fn child_scope_nested_address() {
-        let parent_addr = ScopeAddr::root();
-        let scope = ChildScope::<u64>::new("loop", &parent_addr, 5, 2);
-
-        assert_eq!(scope.name(), "loop");
-        assert_eq!(scope.addr().depth(), 1);
-        assert_eq!(scope.addr().parts(), &[5]);
-        assert_eq!(scope.current_region().parallelism(), 2);
-    }
-
-    #[test]
-    fn child_scope_operator_allocation() {
-        let parent_addr = ScopeAddr::root();
-        let mut scope = ChildScope::<u64>::new("inner", &parent_addr, 0, 4);
-
-        // Index 0 is reserved for scope boundary; first user allocation is 1
-        assert_eq!(scope.allocate_operator_index(), 1);
-        assert_eq!(scope.allocate_operator_index(), 2);
-        assert_eq!(scope.operator_count(), 2); // user operators only (excludes reserved index 0)
-    }
-
-    #[test]
-    fn child_scope_independent_regions() {
-        let parent_addr = ScopeAddr::root();
-        let mut scope = ChildScope::<u64>::new("inner", &parent_addr, 0, 4);
-
-        // Child scope has its own region allocator
-        let r1 = scope.new_region(2);
-        let r2 = scope.new_region(16);
-        assert_ne!(r1, r2);
-
-        // Both regions exist
-        assert!(scope.region(r1).is_some());
-        assert!(scope.region(r2).is_some());
-    }
-
-    #[test]
-    fn scope_clone_shares_state() {
-        let mut scope = RootScope::<u64>::new("shared", 4);
-        let mut cloned = scope.clone();
-
-        // Allocate from original (index 0 reserved for scope boundary)
-        assert_eq!(scope.allocate_operator_index(), 1);
-
-        // Clone sees the allocation
-        assert_eq!(cloned.operator_count(), 1);
-
-        // Allocate from clone
-        assert_eq!(cloned.allocate_operator_index(), 2);
-
-        // Original sees it too
-        assert_eq!(scope.operator_count(), 2);
-    }
-
-    #[test]
-    fn scope_clone_shares_regions() {
-        let mut scope = RootScope::<u64>::new("shared", 4);
-        let cloned = scope.clone();
-
-        // Add region from original
-        let new_id = scope.new_region(8);
-
-        // Clone sees the new region
-        let region = cloned.region(new_id);
-        assert!(region.is_some());
-        assert_eq!(region.unwrap().parallelism(), 8);
-    }
-
-    #[test]
-    fn scope_graph_initially_empty() {
-        let scope = RootScope::<u64>::new("test", 4);
-        let graph = scope.graph();
-        assert_eq!(graph.operator_count(), 0);
-        assert_eq!(graph.edge_count(), 0);
-    }
-
-    #[test]
-    fn scope_register_operator_and_edge() {
+    fn set_current_stage_id_switches_default_stage() {
         let mut scope = RootScope::<u64>::new("test", 4);
-        let region_id = scope.current_region().id();
-        let idx = scope.allocate_operator_index();
-
-        scope.register_operator(OperatorInfo::new(
-            idx, "my_op", region_id, 1, 1,
-        )).unwrap();
-        scope.add_edge(EdgeInfo::new(
-            crate::dataflow::stream::Slot::new(99, 0),
-            crate::dataflow::stream::Slot::new(idx, 0),
-            region_id,
-            region_id,
-        ));
-
-        let graph = scope.graph();
-        assert_eq!(graph.operator_count(), 1);
-        assert_eq!(graph.edge_count(), 1);
-        assert_eq!(graph.operator(idx).unwrap().name, "my_op");
+        let s1 = scope.new_stage(8);
+        scope.set_current_stage_id(s1).unwrap();
+        assert_eq!(scope.current_stage_id(), s1);
     }
 
     #[test]
-    fn scope_clone_shares_graph() {
-        let mut scope = RootScope::<u64>::new("shared", 4);
-        let cloned = scope.clone();
-        let region_id = scope.current_region().id();
+    fn child_scope_registers_boundary_operator() {
+        let child = ChildScope::<u64>::new("child", &ScopeAddr::root(), 2, 3);
+        let graph = child.graph();
+        let boundary = graph.operator(0).expect("boundary operator should exist");
+        assert_eq!(boundary.stage_id, StageId::INITIAL);
+        assert_eq!(child.stage_parallelism(StageId::INITIAL), Some(3));
+    }
 
-        let idx = scope.allocate_operator_index();
-        scope.register_operator(OperatorInfo::new(
-            idx, "op_from_original", region_id, 0, 1,
-        )).unwrap();
-
-        // Clone sees the registration
-        let graph = cloned.graph();
-        assert_eq!(graph.operator_count(), 1);
-        assert_eq!(graph.operator(idx).unwrap().name, "op_from_original");
+    #[test]
+    fn iterative_child_inherits_current_stage_parallelism() {
+        let mut root = RootScope::<u64>::new("root", 4);
+        let s1 = root.new_stage(7);
+        root.set_current_stage_id(s1).unwrap();
+        let child = root.iterative::<u32>("loop");
+        assert_eq!(child.stage_parallelism(child.current_stage_id()), Some(7));
     }
 }

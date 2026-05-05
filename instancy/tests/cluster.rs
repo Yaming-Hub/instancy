@@ -7,10 +7,10 @@
 
 use std::time::Duration;
 
-use instancy::communication::transport_session::PeerConnection;
 use instancy::DataflowBuilder;
 use instancy::DataflowId;
 use instancy::Result;
+use instancy::communication::transport_session::PeerConnection;
 use instancy::{ClusterTopology, NodeConfig};
 use instancy::{RuntimeConfig, RuntimeHandle};
 
@@ -139,8 +139,16 @@ async fn cluster_two_nodes_no_exchange() {
     cluster_b.join_blocking().unwrap();
 
     // Collect results.
-    let data_a: Vec<i32> = output_a.collect_data().into_iter().flat_map(|(_, d)| d).collect();
-    let data_b: Vec<i32> = output_b.collect_data().into_iter().flat_map(|(_, d)| d).collect();
+    let data_a: Vec<i32> = output_a
+        .collect_data()
+        .into_iter()
+        .flat_map(|(_, d)| d)
+        .collect();
+    let data_b: Vec<i32> = output_b
+        .collect_data()
+        .into_iter()
+        .flat_map(|(_, d)| d)
+        .collect();
 
     assert_eq!(data_a, vec![2, 4, 6]);
     assert_eq!(data_b, vec![20, 40]);
@@ -240,8 +248,16 @@ async fn cluster_two_nodes_with_exchange() {
     cluster_b.join_blocking().unwrap();
 
     // Collect results.
-    let mut data_a: Vec<i64> = output_a.collect_data().into_iter().flat_map(|(_, d)| d).collect();
-    let mut data_b: Vec<i64> = output_b.collect_data().into_iter().flat_map(|(_, d)| d).collect();
+    let mut data_a: Vec<i64> = output_a
+        .collect_data()
+        .into_iter()
+        .flat_map(|(_, d)| d)
+        .collect();
+    let mut data_b: Vec<i64> = output_b
+        .collect_data()
+        .into_iter()
+        .flat_map(|(_, d)| d)
+        .collect();
     data_a.sort();
     data_b.sort();
 
@@ -277,7 +293,10 @@ async fn cluster_fingerprint_mismatch() {
 
     // Node A: input → map → output (2 operators + source)
     let build_a = |_: usize, builder: &mut DataflowBuilder<u64>| -> Result<()> {
-        builder.input::<i32>("data").map("double", |_t, x| x * 2).output("results");
+        builder
+            .input::<i32>("data")
+            .map("double", |_t, x| x * 2)
+            .output("results");
         Ok(())
     };
 
@@ -334,7 +353,9 @@ async fn cluster_fingerprint_mismatch() {
         if let Err(e) = r {
             let msg = format!("{e}");
             assert!(
-                msg.contains("fingerprint") || msg.contains("mismatch") || msg.contains("handshake"),
+                msg.contains("fingerprint")
+                    || msg.contains("mismatch")
+                    || msg.contains("handshake"),
                 "unexpected error: {msg}"
             );
         }
@@ -381,5 +402,8 @@ async fn cluster_missing_connection() {
 
     assert!(result.is_err());
     let msg = format!("{}", result.err().unwrap());
-    assert!(msg.contains("missing"), "expected 'missing' in error: {msg}");
+    assert!(
+        msg.contains("missing"),
+        "expected 'missing' in error: {msg}"
+    );
 }

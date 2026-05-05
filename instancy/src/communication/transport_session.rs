@@ -167,7 +167,10 @@ impl TransportSession {
         progress_channels: &[ChannelRegistration],
         capacity: usize,
         runtime_handle: &tokio::runtime::Handle,
-    ) -> (Self, HashMap<String, HashMap<u64, tokio_mpsc::Receiver<Vec<u8>>>>)
+    ) -> (
+        Self,
+        HashMap<String, HashMap<u64, tokio_mpsc::Receiver<Vec<u8>>>>,
+    )
     where
         R: AsyncRead + Unpin + Send + 'static,
         W: AsyncWrite + Unpin + Send + 'static,
@@ -382,7 +385,10 @@ mod tests {
         rx: &mut tokio_mpsc::Receiver<T>,
         timeout: std::time::Duration,
     ) -> Option<T> {
-        tokio::time::timeout(timeout, rx.recv()).await.ok().flatten()
+        tokio::time::timeout(timeout, rx.recv())
+            .await
+            .ok()
+            .flatten()
     }
 
     #[tokio::test]
@@ -496,9 +502,15 @@ mod tests {
         .await
         .unwrap();
 
-        let rx = receivers_b.get_mut("node-a").unwrap().get_mut(&(PROGRESS_CHANNEL_BASE + 1)).unwrap();
+        let rx = receivers_b
+            .get_mut("node-a")
+            .unwrap()
+            .get_mut(&(PROGRESS_CHANNEL_BASE + 1))
+            .unwrap();
         let timeout = std::time::Duration::from_secs(2);
-        let payload = poll_recv(rx, timeout).await.expect("should receive progress");
+        let payload = poll_recv(rx, timeout)
+            .await
+            .expect("should receive progress");
         assert_eq!(payload, vec![1, 2, 3, 4]);
 
         drop(session_a);
@@ -556,19 +568,23 @@ mod tests {
 
         // Send multiple data frames to fill the pipe
         for i in 0..5u8 {
-            data_tx.try_send(Frame {
-                dataflow_id: df_id,
-                channel_id: 1,
-                payload: vec![i],
-            }).unwrap();
+            data_tx
+                .try_send(Frame {
+                    dataflow_id: df_id,
+                    channel_id: 1,
+                    payload: vec![i],
+                })
+                .unwrap();
         }
 
         // Now send a progress frame
-        progress_tx.try_send(Frame {
-            dataflow_id: df_id,
-            channel_id: PROGRESS_CHANNEL_BASE,
-            payload: vec![0xFF],
-        }).unwrap();
+        progress_tx
+            .try_send(Frame {
+                dataflow_id: df_id,
+                channel_id: PROGRESS_CHANNEL_BASE,
+                payload: vec![0xFF],
+            })
+            .unwrap();
 
         // Give the bridge task time to process
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
@@ -579,16 +595,22 @@ mod tests {
         // been sent before the progress frame was queued), but we CAN
         // verify all frames arrive.
         let timeout = std::time::Duration::from_secs(2);
-        let mut progress_rx = receivers_b.get_mut("node-a").unwrap().remove(&PROGRESS_CHANNEL_BASE).unwrap();
+        let mut progress_rx = receivers_b
+            .get_mut("node-a")
+            .unwrap()
+            .remove(&PROGRESS_CHANNEL_BASE)
+            .unwrap();
         let mut data_rx = receivers_b.get_mut("node-a").unwrap().remove(&1).unwrap();
 
-        let progress_payload = poll_recv(&mut progress_rx, timeout).await
+        let progress_payload = poll_recv(&mut progress_rx, timeout)
+            .await
             .expect("progress should arrive");
         assert_eq!(progress_payload, vec![0xFF]);
 
         // All 5 data frames should also arrive
         for i in 0..5u8 {
-            let data_payload = poll_recv(&mut data_rx, timeout).await
+            let data_payload = poll_recv(&mut data_rx, timeout)
+                .await
                 .expect("data should arrive");
             assert_eq!(data_payload, vec![i]);
         }
@@ -612,7 +634,10 @@ mod tests {
                 reader: a_from_b,
                 writer: a_to_b,
             }],
-            &[ChannelRegistration { peer_node_id: "node-b".into(), channel_id: 2 }],
+            &[ChannelRegistration {
+                peer_node_id: "node-b".into(),
+                channel_id: 2,
+            }],
             &[],
             16,
             &rt,
@@ -625,25 +650,52 @@ mod tests {
                 reader: b_from_a,
                 writer: b_to_a,
             }],
-            &[ChannelRegistration { peer_node_id: "node-a".into(), channel_id: 1 }],
+            &[ChannelRegistration {
+                peer_node_id: "node-a".into(),
+                channel_id: 1,
+            }],
             &[],
             16,
             &rt,
         );
 
         // A → B
-        session_a.data_sender("node-b").unwrap().send(Frame {
-            dataflow_id: df_id, channel_id: 1, payload: vec![10],
-        }).await.unwrap();
+        session_a
+            .data_sender("node-b")
+            .unwrap()
+            .send(Frame {
+                dataflow_id: df_id,
+                channel_id: 1,
+                payload: vec![10],
+            })
+            .await
+            .unwrap();
 
         // B → A
-        session_b.data_sender("node-a").unwrap().send(Frame {
-            dataflow_id: df_id, channel_id: 2, payload: vec![20],
-        }).await.unwrap();
+        session_b
+            .data_sender("node-a")
+            .unwrap()
+            .send(Frame {
+                dataflow_id: df_id,
+                channel_id: 2,
+                payload: vec![20],
+            })
+            .await
+            .unwrap();
 
         let timeout = std::time::Duration::from_secs(2);
-        let p1 = poll_recv(recv_b.get_mut("node-a").unwrap().get_mut(&1).unwrap(), timeout).await.unwrap();
-        let p2 = poll_recv(recv_a.get_mut("node-b").unwrap().get_mut(&2).unwrap(), timeout).await.unwrap();
+        let p1 = poll_recv(
+            recv_b.get_mut("node-a").unwrap().get_mut(&1).unwrap(),
+            timeout,
+        )
+        .await
+        .unwrap();
+        let p2 = poll_recv(
+            recv_a.get_mut("node-b").unwrap().get_mut(&2).unwrap(),
+            timeout,
+        )
+        .await
+        .unwrap();
         assert_eq!(p1, vec![10]);
         assert_eq!(p2, vec![20]);
 
@@ -667,7 +719,10 @@ mod tests {
                 reader: b_from_a,
                 writer: b_to_a,
             }],
-            &[ChannelRegistration { peer_node_id: "node-a".into(), channel_id: CONTROL_CHANNEL_ID }],
+            &[ChannelRegistration {
+                peer_node_id: "node-a".into(),
+                channel_id: CONTROL_CHANNEL_ID,
+            }],
             &[],
             16,
             &rt,
@@ -687,15 +742,28 @@ mod tests {
         );
 
         // Send control frame
-        session_a.control_sender("node-b").unwrap().send(Frame {
-            dataflow_id: df_id,
-            channel_id: CONTROL_CHANNEL_ID,
-            payload: b"READY".to_vec(),
-        }).await.unwrap();
+        session_a
+            .control_sender("node-b")
+            .unwrap()
+            .send(Frame {
+                dataflow_id: df_id,
+                channel_id: CONTROL_CHANNEL_ID,
+                payload: b"READY".to_vec(),
+            })
+            .await
+            .unwrap();
 
         let timeout = std::time::Duration::from_secs(2);
-        let payload = poll_recv(recv_b.get_mut("node-a").unwrap().get_mut(&CONTROL_CHANNEL_ID).unwrap(), timeout).await
-            .expect("control frame should arrive");
+        let payload = poll_recv(
+            recv_b
+                .get_mut("node-a")
+                .unwrap()
+                .get_mut(&CONTROL_CHANNEL_ID)
+                .unwrap(),
+            timeout,
+        )
+        .await
+        .expect("control frame should arrive");
         assert_eq!(payload, b"READY".to_vec());
 
         drop(session_a);

@@ -14,8 +14,8 @@
 //! cargo run --example barrier -- 100000  # custom iteration count
 //! ```
 
-use instancy::IterateResult;
 use instancy::DataflowBuilder;
+use instancy::IterateResult;
 use instancy::SimpleRuntime;
 
 fn main() {
@@ -69,7 +69,7 @@ fn main() {
         "token should have value {iterations}"
     );
 
-     println!("=== Barrier: {iterations} iterations ===");
+    println!("=== Barrier: {iterations} iterations ===");
     println!("  Elapsed: {elapsed:?}");
     println!(
         "  Per iteration: {:.0} ns",

@@ -304,7 +304,10 @@ async fn test_pass_through_with_data() {
 
     let mut expected = input_data.clone();
     expected.sort();
-    assert_eq!(all_output, expected, "PassThrough output should match input");
+    assert_eq!(
+        all_output, expected,
+        "PassThrough output should match input"
+    );
 
     coord.shutdown().await;
 }
@@ -565,10 +568,7 @@ async fn test_iterative_filter_with_data() {
 
     // Each item's output value should be ≤ 1 (the exit condition).
     for (key, val) in &all_output {
-        assert!(
-            *val <= 1,
-            "key {key} should have val ≤ 1, got {val}"
-        );
+        assert!(*val <= 1, "key {key} should have val ≤ 1, got {val}");
     }
 
     // Verify all keys present.
@@ -595,11 +595,8 @@ async fn test_distributed_join_with_data() {
         .await;
 
     // Feed left input: (key, string_value)
-    let left_data: Vec<(u64, String)> = vec![
-        (1, "alice".into()),
-        (2, "bob".into()),
-        (3, "carol".into()),
-    ];
+    let left_data: Vec<(u64, String)> =
+        vec![(1, "alice".into()), (2, "bob".into()), (3, "carol".into())];
     coord
         .feed_data(
             "node-a",

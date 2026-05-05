@@ -125,11 +125,19 @@ mod tests {
             envelope: Envelope<T, D, M>,
         ) -> std::result::Result<(), (crate::error::Error, Envelope<T, D, M>)> {
             if self.closed {
-                return Err((crate::error::Error::Custom("channel closed".into()), envelope));
+                return Err((
+                    crate::error::Error::Custom("channel closed".into()),
+                    envelope,
+                ));
             }
             match self.buffer.lock() {
                 Ok(mut buf) => buf.push(envelope),
-                Err(_) => return Err((crate::error::Error::Custom("channel mutex poisoned".into()), envelope)),
+                Err(_) => {
+                    return Err((
+                        crate::error::Error::Custom("channel mutex poisoned".into()),
+                        envelope,
+                    ));
+                }
             }
             Ok(())
         }
@@ -229,15 +237,9 @@ mod tests {
             sender_closed,
         };
 
-        pusher
-            .push(Envelope::data(1, vec!["a".into()]))
-            .unwrap();
-        pusher
-            .push(Envelope::data(2, vec!["b".into()]))
-            .unwrap();
-        pusher
-            .push(Envelope::data(3, vec!["c".into()]))
-            .unwrap();
+        pusher.push(Envelope::data(1, vec!["a".into()])).unwrap();
+        pusher.push(Envelope::data(2, vec!["b".into()])).unwrap();
+        pusher.push(Envelope::data(3, vec!["c".into()])).unwrap();
 
         let mut collected = Vec::new();
         let count = puller.drain_into(&mut collected);

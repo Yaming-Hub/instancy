@@ -7,8 +7,8 @@
 use std::fmt;
 
 use super::channels::PartitionStrategy;
-use super::region::RegionId;
 use super::scope::Scope;
+use super::stage::StageId;
 
 /// Identifies a specific input or output slot on a logical operator.
 ///
@@ -67,19 +67,19 @@ pub struct StreamEdge<S: Scope, D> {
     scope: S,
     /// The source slot (which operator output produced this stream).
     source: Slot,
-    /// The execution region this stream's source operator belongs to.
-    region_id: RegionId,
+    /// The execution stage this stream's source operator belongs to.
+    stage_id: StageId,
     /// Phantom for the data type.
     _data: std::marker::PhantomData<D>,
 }
 
 impl<S: Scope, D> StreamEdge<S, D> {
     /// Create a new stream from a source operator's output slot.
-    pub fn new(scope: S, source: Slot, region_id: RegionId) -> Self {
+    pub fn new(scope: S, source: Slot, stage_id: StageId) -> Self {
         Self {
             scope,
             source,
-            region_id,
+            stage_id,
             _data: std::marker::PhantomData,
         }
     }
@@ -99,15 +99,15 @@ impl<S: Scope, D> StreamEdge<S, D> {
         &self.source
     }
 
-    /// Get the region this stream's data originates from.
-    pub fn region_id(&self) -> RegionId {
-        self.region_id
+    /// Get the stage this stream's data originates from.
+    pub fn stage_id(&self) -> StageId {
+        self.stage_id
     }
 
-    /// Create a derived stream in a new region.
+    /// Create a derived stream in a new stage.
     /// This is used internally by repartition operators.
-    pub fn in_region(mut self, new_region_id: RegionId, new_source: Slot) -> Self {
-        self.region_id = new_region_id;
+    pub fn in_stage(mut self, new_stage_id: StageId, new_source: Slot) -> Self {
+        self.stage_id = new_stage_id;
         self.source = new_source;
         self
     }
@@ -120,27 +120,27 @@ pub struct StreamConnection<D> {
     pub source: Slot,
     /// Target slot.
     pub target: Slot,
-    /// The source region.
-    pub source_region: RegionId,
-    /// The target region.
-    pub target_region: RegionId,
+    /// The source stage.
+    pub source_stage: StageId,
+    /// The target stage.
+    pub target_stage: StageId,
     /// Routing strategy between source and target.
     pub strategy: PartitionStrategy<D>,
 }
 
 impl<D> StreamConnection<D> {
-    /// Validate that a connection between regions uses an appropriate strategy.
+    /// Validate that a connection between stages uses an appropriate strategy.
     ///
     /// Returns an error if:
-    /// - Regions differ but the strategy is Pipeline (must use a repartition).
+    /// - Stages differ but the strategy is Pipeline (must use a repartition).
     pub fn validate(&self) -> crate::error::Result<()> {
-        if self.source_region != self.target_region {
+        if self.source_stage != self.target_stage {
             if matches!(&self.strategy, PartitionStrategy::Pipeline) {
                 return Err(crate::error::Error::Custom(format!(
                     "Cannot connect {} in {} to {} in {} with Pipeline strategy. \
                      Use an explicit repartition operator (exchange, rebalance, gather, broadcast) \
-                     when crossing region boundaries.",
-                    self.source, self.source_region, self.target, self.target_region,
+                     when crossing stage boundaries.",
+                    self.source, self.source_stage, self.target, self.target_stage,
                 )));
             }
         }
@@ -164,51 +164,50 @@ mod tests {
     #[test]
     fn stream_creation() {
         let scope = RootScope::<u64>::new("test", 4);
-        let region_id = scope.current_region().id();
+        let stage_id = scope.current_stage_id();
         let source = Slot::new(0, 0);
 
-        let stream: StreamEdge<RootScope<u64>, i32> = StreamEdge::new(scope, source, region_id);
+        let stream: StreamEdge<RootScope<u64>, i32> = StreamEdge::new(scope, source, stage_id);
         assert_eq!(stream.source().operator_index, 0);
-        assert_eq!(stream.region_id(), region_id);
+        assert_eq!(stream.stage_id(), stage_id);
         assert_eq!(stream.scope().name(), "test");
     }
 
     #[test]
-    fn stream_in_new_region() {
+    fn stream_in_new_stage() {
         let mut scope = RootScope::<u64>::new("test", 4);
-        let region1 = scope.current_region().id();
-        let region2 = scope.new_region(8);
+        let stage1 = scope.current_stage_id();
+        let stage2 = scope.new_stage(8);
         let source = Slot::new(0, 0);
 
-        let stream: StreamEdge<RootScope<u64>, i32> =
-            StreamEdge::new(scope, source, region1);
+        let stream: StreamEdge<RootScope<u64>, i32> = StreamEdge::new(scope, source, stage1);
 
         let new_source = Slot::new(1, 0);
-        let stream2 = stream.in_region(region2, new_source);
-        assert_eq!(stream2.region_id(), region2);
+        let stream2 = stream.in_stage(stage2, new_source);
+        assert_eq!(stream2.stage_id(), stage2);
         assert_eq!(stream2.source().operator_index, 1);
     }
 
     #[test]
-    fn connection_validation_pipeline_same_region() {
-        let region = RegionId::new(0);
+    fn connection_validation_pipeline_same_stage() {
+        let stage = StageId::new(0);
         let conn: StreamConnection<i32> = StreamConnection {
             source: Slot::new(0, 0),
             target: Slot::new(1, 0),
-            source_region: region,
-            target_region: region,
+            source_stage: stage,
+            target_stage: stage,
             strategy: PartitionStrategy::Pipeline,
         };
         assert!(conn.validate().is_ok());
     }
 
     #[test]
-    fn connection_validation_pipeline_cross_region_fails() {
+    fn connection_validation_pipeline_cross_stage_fails() {
         let conn: StreamConnection<i32> = StreamConnection {
             source: Slot::new(0, 0),
             target: Slot::new(1, 0),
-            source_region: RegionId::new(0),
-            target_region: RegionId::new(1),
+            source_stage: StageId::new(0),
+            target_stage: StageId::new(1),
             strategy: PartitionStrategy::Pipeline,
         };
         let result = conn.validate();
@@ -219,48 +218,48 @@ mod tests {
     }
 
     #[test]
-    fn connection_validation_exchange_cross_region_ok() {
+    fn connection_validation_exchange_cross_stage_ok() {
         let conn: StreamConnection<i32> = StreamConnection {
             source: Slot::new(0, 0),
             target: Slot::new(1, 0),
-            source_region: RegionId::new(0),
-            target_region: RegionId::new(1),
+            source_stage: StageId::new(0),
+            target_stage: StageId::new(1),
             strategy: PartitionStrategy::exchange("by value", |x: &i32| *x as u64),
         };
         assert!(conn.validate().is_ok());
     }
 
     #[test]
-    fn connection_validation_rebalance_cross_region_ok() {
+    fn connection_validation_rebalance_cross_stage_ok() {
         let conn: StreamConnection<i32> = StreamConnection {
             source: Slot::new(0, 0),
             target: Slot::new(1, 0),
-            source_region: RegionId::new(0),
-            target_region: RegionId::new(2),
+            source_stage: StageId::new(0),
+            target_stage: StageId::new(2),
             strategy: PartitionStrategy::Rebalance,
         };
         assert!(conn.validate().is_ok());
     }
 
     #[test]
-    fn connection_validation_gather_cross_region_ok() {
+    fn connection_validation_gather_cross_stage_ok() {
         let conn: StreamConnection<i32> = StreamConnection {
             source: Slot::new(0, 0),
             target: Slot::new(1, 0),
-            source_region: RegionId::new(0),
-            target_region: RegionId::new(1),
+            source_stage: StageId::new(0),
+            target_stage: StageId::new(1),
             strategy: PartitionStrategy::Gather,
         };
         assert!(conn.validate().is_ok());
     }
 
     #[test]
-    fn connection_validation_broadcast_cross_region_ok() {
+    fn connection_validation_broadcast_cross_stage_ok() {
         let conn: StreamConnection<i32> = StreamConnection {
             source: Slot::new(0, 0),
             target: Slot::new(1, 0),
-            source_region: RegionId::new(0),
-            target_region: RegionId::new(1),
+            source_stage: StageId::new(0),
+            target_stage: StageId::new(1),
             strategy: PartitionStrategy::Broadcast,
         };
         assert!(conn.validate().is_ok());

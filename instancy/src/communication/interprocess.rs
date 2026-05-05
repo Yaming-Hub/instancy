@@ -306,8 +306,7 @@ where
                 available: bytes.len(),
             });
         }
-        let rec_len =
-            u32::from_le_bytes(bytes[offset..offset + 4].try_into().unwrap()) as usize;
+        let rec_len = u32::from_le_bytes(bytes[offset..offset + 4].try_into().unwrap()) as usize;
         offset += 4;
 
         if offset + rec_len > bytes.len() {
@@ -458,8 +457,7 @@ where
                 available: bytes.len(),
             });
         }
-        let time_len =
-            u32::from_le_bytes(bytes[offset..offset + 4].try_into().unwrap()) as usize;
+        let time_len = u32::from_le_bytes(bytes[offset..offset + 4].try_into().unwrap()) as usize;
         offset += 4;
 
         if offset + time_len > bytes.len() {

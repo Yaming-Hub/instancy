@@ -7,9 +7,9 @@
 use std::fmt;
 
 use crate::dataflow::operators::handles::{InputHandle, OutputHandle};
-use crate::dataflow::region::RegionId;
 use crate::dataflow::scope::Scope;
-use crate::dataflow::stream::{StreamEdge, Slot};
+use crate::dataflow::stage::StageId;
+use crate::dataflow::stream::{Slot, StreamEdge};
 use crate::error::Result;
 use crate::progress::timestamp::Timestamp;
 
@@ -19,8 +19,8 @@ pub struct BinaryOperator<T: Timestamp, D1, D2, D3> {
     name: String,
     /// Operator index within the scope.
     index: usize,
-    /// The execution region.
-    region_id: RegionId,
+    /// The execution stage.
+    stage_id: StageId,
     /// Left input handle.
     input1: InputHandle<T, D1>,
     /// Right input handle.
@@ -40,12 +40,7 @@ pub struct BinaryOperator<T: Timestamp, D1, D2, D3> {
 
 impl<T: Timestamp, D1, D2, D3> BinaryOperator<T, D1, D2, D3> {
     /// Create a new binary operator.
-    pub fn new<L>(
-        name: impl Into<String>,
-        index: usize,
-        region_id: RegionId,
-        logic: L,
-    ) -> Self
+    pub fn new<L>(name: impl Into<String>, index: usize, stage_id: StageId, logic: L) -> Self
     where
         L: FnMut(
                 &mut InputHandle<T, D1>,
@@ -62,7 +57,7 @@ impl<T: Timestamp, D1, D2, D3> BinaryOperator<T, D1, D2, D3> {
             output: OutputHandle::new(format!("{name}:output")),
             name,
             index,
-            region_id,
+            stage_id,
             logic: Box::new(logic),
         }
     }
@@ -77,9 +72,9 @@ impl<T: Timestamp, D1, D2, D3> BinaryOperator<T, D1, D2, D3> {
         self.index
     }
 
-    /// Get the region ID.
-    pub fn region_id(&self) -> RegionId {
-        self.region_id
+    /// Get the stage ID.
+    pub fn stage_id(&self) -> StageId {
+        self.stage_id
     }
 
     /// Get a mutable reference to the left input handle.
@@ -122,7 +117,7 @@ impl<T: Timestamp, D1, D2, D3> fmt::Debug for BinaryOperator<T, D1, D2, D3> {
         f.debug_struct("BinaryOperator")
             .field("name", &self.name)
             .field("index", &self.index)
-            .field("region_id", &self.region_id)
+            .field("stage_id", &self.stage_id)
             .finish()
     }
 }
@@ -169,35 +164,38 @@ impl<S: Scope, D1: 'static> BinaryExt<S, D1> for StreamEdge<S, D1> {
             + 'static,
     {
         debug_assert_eq!(
-            self.region_id(), other.region_id(),
-            "binary operator '{name}': both input streams must be in the same region"
+            self.stage_id(),
+            other.stage_id(),
+            "binary operator '{name}': both input streams must be in the same stage"
         );
 
         let mut scope = self.scope().clone();
         let op_index = scope.allocate_operator_index();
-        let region_id = self.region_id();
+        let stage_id = self.stage_id();
         let output_slot = Slot::new(op_index, 0);
 
         // Register operator and edges in the dataflow graph.
-        scope.register_operator(crate::dataflow::graph::OperatorInfo::new(
-            op_index, name, region_id, 2, 1,
-        )).expect("operator index should be unique");
+        scope
+            .register_operator(crate::dataflow::graph::OperatorInfo::new(
+                op_index, name, stage_id, 2, 1,
+            ))
+            .expect("operator index should be unique");
         scope.add_edge(crate::dataflow::graph::EdgeInfo::new(
             *self.source(),
             Slot::new(op_index, 0),
-            self.region_id(),
-            region_id,
+            self.stage_id(),
+            stage_id,
         ));
         scope.add_edge(crate::dataflow::graph::EdgeInfo::new(
             *other.source(),
             Slot::new(op_index, 1),
-            other.region_id(),
-            region_id,
+            other.stage_id(),
+            stage_id,
         ));
 
-        let _operator = BinaryOperator::new(name, op_index, region_id, logic);
+        let _operator = BinaryOperator::new(name, op_index, stage_id, logic);
 
-        StreamEdge::new(scope, output_slot, region_id)
+        StreamEdge::new(scope, output_slot, stage_id)
     }
 }
 
@@ -211,7 +209,7 @@ mod tests {
         let op = BinaryOperator::<u64, i32, i32, i32>::new(
             "add_pairs",
             0,
-            RegionId::new(0),
+            StageId::new(0),
             |_input1, _input2, _output| Ok(()),
         );
         assert_eq!(op.name(), "add_pairs");
@@ -223,7 +221,7 @@ mod tests {
         let mut op = BinaryOperator::<u64, i32, i32, (i32, i32)>::new(
             "zip",
             0,
-            RegionId::new(0),
+            StageId::new(0),
             |input1, input2, output| {
                 // Simple: match batches by timestamp
                 let mut left: Vec<(u64, Vec<i32>)> = Vec::new();
@@ -257,7 +255,7 @@ mod tests {
         let mut op = BinaryOperator::<u64, i32, i32, i32>::new(
             "sum_both",
             0,
-            RegionId::new(0),
+            StageId::new(0),
             |input1, input2, output| {
                 while let Some((time, data)) = input1.next() {
                     let mut session = output.session(time);
@@ -302,7 +300,7 @@ mod tests {
         let mut op = BinaryOperator::<u64, i32, i32, i32>::new(
             "failing",
             0,
-            RegionId::new(0),
+            StageId::new(0),
             |input1, _input2, _output| {
                 while let Some((_t, data)) = input1.next() {
                     if data.contains(&-1) {
@@ -321,27 +319,31 @@ mod tests {
     #[test]
     fn binary_ext_produces_stream() {
         let mut scope = RootScope::<u64>::new("test", 4);
-        let region_id = scope.current_region().id();
+        let stage_id = scope.current_stage_id();
         let s1_idx = scope.allocate_operator_index();
         let s2_idx = scope.allocate_operator_index();
         let stream1: StreamEdge<RootScope<u64>, i32> =
-            StreamEdge::new(scope.clone(), Slot::new(s1_idx, 0), region_id);
+            StreamEdge::new(scope.clone(), Slot::new(s1_idx, 0), stage_id);
         let stream2: StreamEdge<RootScope<u64>, i32> =
-            StreamEdge::new(scope, Slot::new(s2_idx, 0), region_id);
+            StreamEdge::new(scope, Slot::new(s2_idx, 0), stage_id);
 
         let output = stream1.binary(&stream2, "join", |i1, i2, out| {
             while let Some((t, d)) = i1.next() {
                 let mut s = out.session(t);
-                for item in d { s.give(item); }
+                for item in d {
+                    s.give(item);
+                }
             }
             while let Some((t, d)) = i2.next() {
                 let mut s = out.session(t);
-                for item in d { s.give(item); }
+                for item in d {
+                    s.give(item);
+                }
             }
             Ok(())
         });
 
-        assert_eq!(output.region_id(), region_id);
+        assert_eq!(output.stage_id(), stage_id);
         assert_eq!(output.source().operator_index, 3); // 1, 2 for sources, 3 for binary
     }
 
@@ -350,7 +352,7 @@ mod tests {
         let mut op = BinaryOperator::<u64, i32, i32, i32>::new(
             "noop",
             0,
-            RegionId::new(0),
+            StageId::new(0),
             |_i1, _i2, _out| Ok(()),
         );
 
@@ -363,7 +365,7 @@ mod tests {
         let mut op = BinaryOperator::<u64, i32, String, String>::new(
             "cross",
             0,
-            RegionId::new(0),
+            StageId::new(0),
             |input1, input2, output| {
                 let mut lefts = Vec::new();
                 while let Some((_t, data)) = input1.next() {
@@ -382,13 +384,19 @@ mod tests {
         );
 
         op.input1_mut().push_vec(1, vec![1, 2]);
-        op.input2_mut().push_vec(1, vec!["a".to_string(), "b".to_string()]);
+        op.input2_mut()
+            .push_vec(1, vec!["a".to_string(), "b".to_string()]);
         op.activate().unwrap();
 
         let batches: Vec<_> = op.drain_output().collect();
         assert_eq!(
             batches[0].1,
-            vec!["1:a".to_string(), "2:a".to_string(), "1:b".to_string(), "2:b".to_string()]
+            vec![
+                "1:a".to_string(),
+                "2:a".to_string(),
+                "1:b".to_string(),
+                "2:b".to_string()
+            ]
         );
     }
 }

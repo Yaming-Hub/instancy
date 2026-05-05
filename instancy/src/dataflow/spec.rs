@@ -32,7 +32,7 @@ pub struct DataflowSpec<T: Timestamp> {
     inputs: HashMap<String, Box<dyn ErasedInput<T>>>,
     /// Input insertion order (for deterministic iteration).
     input_order: Vec<String>,
-    /// Number of workers for the initial execution region.
+    /// Number of workers for the initial execution stage.
     initial_workers: usize,
     /// Error handling policy.
     error_policy: ErrorPolicy,
@@ -64,9 +64,7 @@ impl<T: Timestamp> DataflowSpec<T> {
     ) -> Result<Self> {
         let name = name.into();
         if self.inputs.contains_key(&name) {
-            return Err(Error::Custom(format!(
-                "duplicate input name: '{name}'"
-            )));
+            return Err(Error::Custom(format!("duplicate input name: '{name}'")));
         }
         self.input_order.push(name.clone());
         self.inputs.insert(name, Box::new(TypedInput::new(input)));
@@ -380,13 +378,17 @@ mod tests {
 
     #[test]
     fn dataflow_spec_builder() {
-        let input = VecInput::new("numbers", vec![
-            InputEvent::data(1u64, vec![10, 20]),
-            InputEvent::frontier(1),
-        ]);
+        let input = VecInput::new(
+            "numbers",
+            vec![
+                InputEvent::data(1u64, vec![10, 20]),
+                InputEvent::frontier(1),
+            ],
+        );
 
         let spec = DataflowSpec::<u64>::new("test_df")
-            .add_input("src", input).unwrap()
+            .add_input("src", input)
+            .unwrap()
             .with_workers(4)
             .with_error_policy(ErrorPolicy::Stop)
             .with_output_buffer_size(2048);
@@ -406,8 +408,10 @@ mod tests {
         let input2 = VecInput::<u64, String>::new("strings", vec![]);
 
         let spec = DataflowSpec::<u64>::new("multi")
-            .add_input("ints", input1).unwrap()
-            .add_input("strs", input2).unwrap();
+            .add_input("ints", input1)
+            .unwrap()
+            .add_input("strs", input2)
+            .unwrap();
 
         assert_eq!(spec.input_count(), 2);
         assert!(spec.has_input("ints"));
@@ -421,7 +425,8 @@ mod tests {
         let input2 = VecInput::<u64, i32>::new("b", vec![]);
 
         let result = DataflowSpec::<u64>::new("test")
-            .add_input("src", input1).unwrap()
+            .add_input("src", input1)
+            .unwrap()
             .add_input("src", input2);
 
         assert!(result.is_err());
@@ -461,7 +466,8 @@ mod tests {
         let input = VecInput::new("src", vec![InputEvent::data(1u64, vec![10])]);
 
         let spec = DataflowSpec::<u64>::new("parts_test")
-            .add_input("s1", input).unwrap()
+            .add_input("s1", input)
+            .unwrap()
             .with_workers(2);
 
         let (name, inputs, order, workers, policy, buf_size) = spec.into_parts();
@@ -477,7 +483,9 @@ mod tests {
     fn dataflow_inputs_from_erased() {
         let input = VecInput::new("nums", vec![InputEvent::data(1u64, vec![42])]);
 
-        let spec = DataflowSpec::<u64>::new("test").add_input("source", input).unwrap();
+        let spec = DataflowSpec::<u64>::new("test")
+            .add_input("source", input)
+            .unwrap();
         let (_, inputs, order, _, _, _) = spec.into_parts();
 
         let di = DataflowInputs::from_erased(&inputs, &order);
@@ -494,7 +502,9 @@ mod tests {
     #[test]
     fn erased_input_downcast() {
         let input = VecInput::new("nums", vec![InputEvent::data(1u64, vec![42i32])]);
-        let spec = DataflowSpec::<u64>::new("test").add_input("source", input).unwrap();
+        let spec = DataflowSpec::<u64>::new("test")
+            .add_input("source", input)
+            .unwrap();
         let (_, mut inputs, _, _, _, _) = spec.into_parts();
 
         let erased = inputs.get_mut("source").unwrap();

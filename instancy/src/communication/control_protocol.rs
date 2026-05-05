@@ -46,9 +46,7 @@ pub enum ControlMessage {
         dataflow_id: DataflowId,
     },
     /// Ready signal indicating the node has materialized all workers.
-    Ready {
-        node_id: String,
-    },
+    Ready { node_id: String },
 }
 
 #[cfg(feature = "transport")]
@@ -65,7 +63,10 @@ const MSG_TYPE_READY: u8 = 1;
 pub fn encode_control_message(msg: &ControlMessage) -> Vec<u8> {
     let mut buf = Vec::new();
     match msg {
-        ControlMessage::Handshake { fingerprint, dataflow_id } => {
+        ControlMessage::Handshake {
+            fingerprint,
+            dataflow_id,
+        } => {
             buf.push(MSG_TYPE_HANDSHAKE);
             buf.extend_from_slice(&fingerprint.to_le_bytes());
             buf.extend_from_slice(dataflow_id.as_bytes());
@@ -114,7 +115,10 @@ pub fn decode_control_message(data: &[u8]) -> Result<ControlMessage, String> {
                 .try_into()
                 .map_err(|_| "invalid dataflow_id bytes in handshake".to_string())?;
             let dataflow_id = DataflowId::from_bytes(df_bytes);
-            Ok(ControlMessage::Handshake { fingerprint, dataflow_id })
+            Ok(ControlMessage::Handshake {
+                fingerprint,
+                dataflow_id,
+            })
         }
         MSG_TYPE_READY => {
             // 1 (type) + 4 (len) + node_id bytes
@@ -209,17 +213,18 @@ pub async fn perform_handshake(
 
     // Send handshake to all peers.
     for peer_id in session.peer_node_ids().collect::<Vec<_>>() {
-        let sender = session.control_sender(peer_id).ok_or_else(|| {
-            format!("no control sender for peer {peer_id}")
-        })?;
+        let sender = session
+            .control_sender(peer_id)
+            .ok_or_else(|| format!("no control sender for peer {peer_id}"))?;
         let frame = Frame {
             dataflow_id,
             channel_id: CONTROL_CHANNEL_ID,
             payload: payload.clone(),
         };
-        sender.send(frame).await.map_err(|_| {
-            format!("failed to send handshake to peer {peer_id}")
-        })?;
+        sender
+            .send(frame)
+            .await
+            .map_err(|_| format!("failed to send handshake to peer {peer_id}"))?;
     }
 
     // Receive handshake from all peers.
@@ -235,7 +240,10 @@ pub async fn perform_handshake(
             .map_err(|e| format!("invalid handshake from peer {peer_id}: {e}"))?;
 
         match peer_msg {
-            ControlMessage::Handshake { fingerprint, dataflow_id: peer_df_id } => {
+            ControlMessage::Handshake {
+                fingerprint,
+                dataflow_id: peer_df_id,
+            } => {
                 if fingerprint != local_fingerprint {
                     return Err(format!(
                         "fingerprint mismatch with peer {peer_id}: \
@@ -243,9 +251,7 @@ pub async fn perform_handshake(
                     ));
                 }
                 if peer_df_id != dataflow_id {
-                    return Err(format!(
-                        "dataflow_id mismatch with peer {peer_id}"
-                    ));
+                    return Err(format!("dataflow_id mismatch with peer {peer_id}"));
                 }
             }
             other => {
@@ -282,17 +288,18 @@ pub async fn perform_ready_barrier(
 
     // Send Ready to all peers.
     for peer_id in session.peer_node_ids().collect::<Vec<_>>() {
-        let sender = session.control_sender(peer_id).ok_or_else(|| {
-            format!("no control sender for peer {peer_id}")
-        })?;
+        let sender = session
+            .control_sender(peer_id)
+            .ok_or_else(|| format!("no control sender for peer {peer_id}"))?;
         let frame = Frame {
             dataflow_id,
             channel_id: CONTROL_CHANNEL_ID,
             payload: payload.clone(),
         };
-        sender.send(frame).await.map_err(|_| {
-            format!("failed to send Ready to peer {peer_id}")
-        })?;
+        sender
+            .send(frame)
+            .await
+            .map_err(|_| format!("failed to send Ready to peer {peer_id}"))?;
     }
 
     // Receive Ready from all peers.

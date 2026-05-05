@@ -70,7 +70,11 @@ impl WakeHandle {
         // Clone the waker before dropping the lock to avoid blocking
         // register_waker() during the (potentially expensive) wake call.
         // If the mutex is poisoned, skip the waker — the flag is already set.
-        let waker = self.inner.waker.lock().ok()
+        let waker = self
+            .inner
+            .waker
+            .lock()
+            .ok()
             .and_then(|g| g.as_ref().cloned());
         if let Some(w) = waker {
             w.wake();
@@ -174,8 +178,7 @@ mod tests {
             WAKE_COUNT.fetch_add(1, Ordering::SeqCst);
         }
         fn drop_fn(_: *const ()) {}
-        static VTABLE: RawWakerVTable =
-            RawWakerVTable::new(clone_fn, wake_fn, wake_fn, drop_fn);
+        static VTABLE: RawWakerVTable = RawWakerVTable::new(clone_fn, wake_fn, wake_fn, drop_fn);
 
         WAKE_COUNT.store(0, Ordering::SeqCst);
 
@@ -207,7 +210,17 @@ mod tests {
         let raw = std::task::RawWaker::new(
             std::ptr::null(),
             &std::task::RawWakerVTable::new(
-                |p| std::task::RawWaker::new(p, &std::task::RawWakerVTable::new(|p| std::task::RawWaker::new(p, &NOOP_VTABLE), |_|{}, |_|{}, |_|{})),
+                |p| {
+                    std::task::RawWaker::new(
+                        p,
+                        &std::task::RawWakerVTable::new(
+                            |p| std::task::RawWaker::new(p, &NOOP_VTABLE),
+                            |_| {},
+                            |_| {},
+                            |_| {},
+                        ),
+                    )
+                },
                 |_| {},
                 |_| {},
                 |_| {},

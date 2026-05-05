@@ -15,8 +15,8 @@
 
 use std::collections::{HashMap, HashSet};
 
-use instancy::IterateResult;
 use instancy::DataflowBuilder;
+use instancy::IterateResult;
 use instancy::SimpleRuntime;
 
 fn main() {
@@ -70,33 +70,32 @@ fn main() {
             //    false for "done" nodes
             let adj = adjacency.clone();
 
-            let expanded =
-                frontier.unary::<(u32, u32, bool), _>("expand", move |input, output| {
-                    while let Some((time, data)) = input.next() {
-                        let mut tagged = Vec::new();
+            let expanded = frontier.unary::<(u32, u32, bool), _>("expand", move |input, output| {
+                while let Some((time, data)) = input.next() {
+                    let mut tagged = Vec::new();
 
-                        for (node, dist) in data {
-                            if visited.insert(node) {
-                                // Newly discovered — emit as "done" output.
-                                tagged.push((node, dist, false));
-                                // Expand neighbors into the next frontier.
-                                if let Some(neighbors) = adj.get(&node) {
-                                    for &nbr in neighbors {
-                                        if !visited.contains(&nbr) {
-                                            tagged.push((nbr, dist + 1, true));
-                                        }
+                    for (node, dist) in data {
+                        if visited.insert(node) {
+                            // Newly discovered — emit as "done" output.
+                            tagged.push((node, dist, false));
+                            // Expand neighbors into the next frontier.
+                            if let Some(neighbors) = adj.get(&node) {
+                                for &nbr in neighbors {
+                                    if !visited.contains(&nbr) {
+                                        tagged.push((nbr, dist + 1, true));
                                     }
                                 }
                             }
                         }
-
-                        if !tagged.is_empty() {
-                            output.push_vec(time, tagged);
-                        }
                     }
 
-                    Ok(())
-                });
+                    if !tagged.is_empty() {
+                        output.push_vec(time, tagged);
+                    }
+                }
+
+                Ok(())
+            });
 
             // Split tagged stream into feedback (new frontier) and output (done nodes).
             let feedback = expanded

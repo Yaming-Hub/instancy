@@ -7,7 +7,7 @@
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
-use crate::dataflow::region::RegionId;
+use crate::dataflow::stage::StageId;
 use crate::worker::WorkerId;
 
 /// Maps logical workers to physical execution resources.
@@ -19,8 +19,8 @@ pub trait ExecutionProvider: Send + Sync + 'static {
     /// Submit a task for a logical worker to be executed physically.
     fn submit_task(&self, worker: WorkerId, task: Box<dyn FnOnce() + Send>);
 
-    /// Returns the maximum concurrent tasks allowed for a region.
-    fn region_concurrency(&self, region: RegionId) -> usize;
+    /// Returns the maximum concurrent tasks allowed for a stage.
+    fn stage_concurrency(&self, stage: StageId) -> usize;
 
     /// Shut down the execution provider, releasing resources.
     fn shutdown(&self);
@@ -32,7 +32,7 @@ pub trait ExecutionProvider: Send + Sync + 'static {
 pub struct WorkerPoolExecution {
     /// Reference to the worker pool (tasks are submitted here).
     pool: Arc<crate::worker_pool::WorkerPool>,
-    /// Default region concurrency.
+    /// Default stage concurrency.
     default_concurrency: usize,
 }
 
@@ -58,7 +58,7 @@ impl ExecutionProvider for WorkerPoolExecution {
         self.pool.submit(activation);
     }
 
-    fn region_concurrency(&self, _region: RegionId) -> usize {
+    fn stage_concurrency(&self, _stage: StageId) -> usize {
         self.default_concurrency
     }
 
@@ -78,7 +78,7 @@ pub struct InlineExecution {
     deferred: Mutex<Vec<Box<dyn FnOnce() + Send>>>,
     /// Whether to execute immediately or defer.
     immediate: bool,
-    /// Default region concurrency (returned but not enforced in inline mode).
+    /// Default stage concurrency (returned but not enforced in inline mode).
     default_concurrency: usize,
 }
 
@@ -111,7 +111,12 @@ impl InlineExecution {
 
     /// Run all deferred tasks. Returns the count of tasks executed.
     pub fn run_deferred(&self) -> usize {
-        let tasks: Vec<_> = self.deferred.lock().unwrap_or_else(|e| e.into_inner()).drain(..).collect();
+        let tasks: Vec<_> = self
+            .deferred
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .drain(..)
+            .collect();
         let count = tasks.len();
         for task in tasks {
             task();
@@ -122,7 +127,10 @@ impl InlineExecution {
 
     /// Number of deferred tasks waiting.
     pub fn pending_count(&self) -> usize {
-        self.deferred.lock().unwrap_or_else(|e| e.into_inner()).len()
+        self.deferred
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .len()
     }
 }
 
@@ -138,11 +146,14 @@ impl ExecutionProvider for InlineExecution {
             task();
             self.tasks_executed.fetch_add(1, Ordering::Relaxed);
         } else {
-            self.deferred.lock().unwrap_or_else(|e| e.into_inner()).push(task);
+            self.deferred
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .push(task);
         }
     }
 
-    fn region_concurrency(&self, _region: RegionId) -> usize {
+    fn stage_concurrency(&self, _stage: StageId) -> usize {
         self.default_concurrency
     }
 
@@ -162,9 +173,12 @@ mod tests {
         let counter = Arc::new(AtomicU32::new(0));
 
         let c = counter.clone();
-        exec.submit_task(WorkerId::new(0), Box::new(move || {
-            c.fetch_add(1, Ordering::SeqCst);
-        }));
+        exec.submit_task(
+            WorkerId::new(0),
+            Box::new(move || {
+                c.fetch_add(1, Ordering::SeqCst);
+            }),
+        );
 
         assert_eq!(counter.load(Ordering::SeqCst), 1);
         assert_eq!(exec.tasks_executed(), 1);
@@ -177,9 +191,12 @@ mod tests {
 
         for _ in 0..5 {
             let c = counter.clone();
-            exec.submit_task(WorkerId::new(0), Box::new(move || {
-                c.fetch_add(1, Ordering::SeqCst);
-            }));
+            exec.submit_task(
+                WorkerId::new(0),
+                Box::new(move || {
+                    c.fetch_add(1, Ordering::SeqCst);
+                }),
+            );
         }
 
         assert_eq!(counter.load(Ordering::SeqCst), 0);
@@ -192,9 +209,9 @@ mod tests {
     }
 
     #[test]
-    fn inline_region_concurrency() {
+    fn inline_stage_concurrency() {
         let exec = InlineExecution::new();
-        assert_eq!(exec.region_concurrency(RegionId(0)), 1);
+        assert_eq!(exec.stage_concurrency(StageId(0)), 1);
     }
 
     #[test]
@@ -215,9 +232,12 @@ mod tests {
         let counter = Arc::new(AtomicU32::new(0));
         let c = counter.clone();
 
-        exec.submit_task(WorkerId::new(0), Box::new(move || {
-            c.fetch_add(1, Ordering::SeqCst);
-        }));
+        exec.submit_task(
+            WorkerId::new(0),
+            Box::new(move || {
+                c.fetch_add(1, Ordering::SeqCst);
+            }),
+        );
 
         // Wait for task to complete
         let start = std::time::Instant::now();

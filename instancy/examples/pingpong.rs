@@ -14,8 +14,8 @@
 //! cargo run --example pingpong -- 100 1000  # iterations elements
 //! ```
 
-use instancy::IterateResult;
 use instancy::DataflowBuilder;
+use instancy::IterateResult;
 use instancy::SimpleRuntime;
 
 fn main() {

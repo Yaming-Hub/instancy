@@ -270,8 +270,7 @@ impl<T: Timestamp> Builder<T> {
             .collect();
 
         // Compute scope-level summary via fixed-point iteration.
-        let scope_summary =
-            self.compute_scope_summary();
+        let scope_summary = self.compute_scope_summary();
 
         // Compile the forward path summaries for propagation.
         // target_summaries[node][input] → Vec<(Location, Antichain<Summary>)>
@@ -357,16 +356,12 @@ impl<T: Timestamp> Builder<T> {
         let mut source_to_output: Vec<Vec<Vec<Antichain<T::Summary>>>> = self
             .shape
             .iter()
-            .map(|&(_, outputs)| {
-                vec![vec![Antichain::new(); self.scope_outputs]; outputs]
-            })
+            .map(|&(_, outputs)| vec![vec![Antichain::new(); self.scope_outputs]; outputs])
             .collect();
         let mut target_to_output: Vec<Vec<Vec<Antichain<T::Summary>>>> = self
             .shape
             .iter()
-            .map(|&(inputs, _)| {
-                vec![vec![Antichain::new(); self.scope_outputs]; inputs]
-            })
+            .map(|&(inputs, _)| vec![vec![Antichain::new(); self.scope_outputs]; inputs])
             .collect();
 
         // Initialize: scope boundary (graph node 0) inputs connect to scope outputs.
@@ -489,10 +484,7 @@ impl<T: Timestamp> Builder<T> {
                             for output in 0..outputs {
                                 let path = conn.path(input, output);
                                 if !path.is_empty() {
-                                    paths.push((
-                                        Location::source(node, output),
-                                        path.clone(),
-                                    ));
+                                    paths.push((Location::source(node, output), path.clone()));
                                 }
                             }
                         }
@@ -669,15 +661,23 @@ pub struct Tracker<T: Timestamp> {
 impl<T: Timestamp> Tracker<T> {
     /// Posts a capability change at an operator's input port.
     pub fn update_target(&mut self, node: usize, port: usize, time: T, diff: i64) {
-        debug_assert!(node < self.target_changes.len() && port < self.target_changes[node].len(),
-            "update_target: node {} port {} out of bounds", node, port);
+        debug_assert!(
+            node < self.target_changes.len() && port < self.target_changes[node].len(),
+            "update_target: node {} port {} out of bounds",
+            node,
+            port
+        );
         self.target_changes[node][port].update(time, diff);
     }
 
     /// Posts a capability change at an operator's output port.
     pub fn update_source(&mut self, node: usize, port: usize, time: T, diff: i64) {
-        debug_assert!(node < self.source_changes.len() && port < self.source_changes[node].len(),
-            "update_source: node {} port {} out of bounds", node, port);
+        debug_assert!(
+            node < self.source_changes.len() && port < self.source_changes[node].len(),
+            "update_source: node {} port {} out of bounds",
+            node,
+            port
+        );
         self.source_changes[node][port].update(time, diff);
     }
 
@@ -865,7 +865,8 @@ impl<T: Timestamp> Tracker<T> {
         // Record in pushed_changes.
         let location = Location::target(node, port);
         for (t, d) in &implication_changes {
-            self.pushed_changes.update((location.clone(), t.clone()), *d);
+            self.pushed_changes
+                .update((location.clone(), t.clone()), *d);
         }
 
         // Update scope output changes if this is the scope boundary (graph node 0).
@@ -916,7 +917,8 @@ impl<T: Timestamp> Tracker<T> {
         // Record in pushed_changes.
         let location = Location::source(node, port);
         for (t, d) in &implication_changes {
-            self.pushed_changes.update((location.clone(), t.clone()), *d);
+            self.pushed_changes
+                .update((location.clone(), t.clone()), *d);
         }
 
         // Propagate along outgoing edges.

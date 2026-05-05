@@ -119,11 +119,7 @@ impl Error {
     /// returns it unchanged (preserves original context). If the existing
     /// `Operator` has `worker_index: None`, the worker index is backfilled.
     /// For all other error variants, wraps as a new `Operator` error.
-    pub fn with_operator_context(
-        self,
-        operator: impl Into<String>,
-        worker_index: usize,
-    ) -> Self {
+    pub fn with_operator_context(self, operator: impl Into<String>, worker_index: usize) -> Self {
         match self {
             Error::Operator {
                 operator: op_name,
@@ -227,7 +223,10 @@ mod tests {
         let err = Error::Cancelled {
             reason: Some(CancellationReason::NetworkError("timeout".into())),
         };
-        assert_eq!(err.to_string(), "Dataflow cancelled: network error: timeout");
+        assert_eq!(
+            err.to_string(),
+            "Dataflow cancelled: network error: timeout"
+        );
     }
 
     #[test]
@@ -267,33 +266,54 @@ mod tests {
         let msg = wrapped.to_string();
         assert!(msg.contains("my_op"), "should contain operator name");
         assert!(msg.contains("worker 2"), "should contain worker index");
-        assert!(msg.contains("something failed"), "should contain original error");
+        assert!(
+            msg.contains("something failed"),
+            "should contain original error"
+        );
     }
 
     #[test]
     fn error_with_operator_context_preserves_existing_operator() {
         // Existing Operator with worker_index: None gets backfilled
-        let err = Error::operator("original_op", std::io::Error::new(
-            std::io::ErrorKind::Other, "original cause",
-        ));
+        let err = Error::operator(
+            "original_op",
+            std::io::Error::new(std::io::ErrorKind::Other, "original cause"),
+        );
         let wrapped = err.with_operator_context("wrapper_op", 5);
         let msg = wrapped.to_string();
-        assert!(msg.contains("original_op"), "should preserve original operator name");
-        assert!(!msg.contains("wrapper_op"), "should not overwrite with wrapper");
+        assert!(
+            msg.contains("original_op"),
+            "should preserve original operator name"
+        );
+        assert!(
+            !msg.contains("wrapper_op"),
+            "should not overwrite with wrapper"
+        );
         assert!(msg.contains("worker 5"), "should backfill worker index");
     }
 
     #[test]
     fn error_with_operator_context_preserves_existing_worker_index() {
         // Existing Operator with worker_index already set is fully preserved
-        let err = Error::operator_with_context("original_op", 7, std::io::Error::new(
-            std::io::ErrorKind::Other, "original cause",
-        ));
+        let err = Error::operator_with_context(
+            "original_op",
+            7,
+            std::io::Error::new(std::io::ErrorKind::Other, "original cause"),
+        );
         let wrapped = err.with_operator_context("wrapper_op", 99);
         let msg = wrapped.to_string();
-        assert!(msg.contains("original_op"), "should preserve original operator");
-        assert!(msg.contains("worker 7"), "should keep original worker index");
-        assert!(!msg.contains("worker 99"), "should not overwrite worker index");
+        assert!(
+            msg.contains("original_op"),
+            "should preserve original operator"
+        );
+        assert!(
+            msg.contains("worker 7"),
+            "should keep original worker index"
+        );
+        assert!(
+            !msg.contains("worker 99"),
+            "should not overwrite worker index"
+        );
     }
 
     #[test]

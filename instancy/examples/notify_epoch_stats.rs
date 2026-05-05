@@ -143,10 +143,7 @@ fn main() {
                 while let Some(epoch) = ctx.next_notification() {
                     // Step 4: Emit final stats and remove state for this epoch.
                     if let Some(stats) = accumulators.remove(&epoch) {
-                        output.push_vec(
-                            epoch,
-                            vec![format!("epoch {epoch}: {stats}")],
-                        );
+                        output.push_vec(epoch, vec![format!("epoch {epoch}: {stats}")]);
                     }
                     // After this, the output capability for `epoch` is dropped,
                     // allowing downstream frontiers to advance past it.
@@ -181,7 +178,10 @@ fn main() {
     // --- Verify correctness ---
     // Each epoch should produce exactly one output (no duplicates, no missing).
     let epoch_count = all.len();
-    assert_eq!(epoch_count, 3, "expected exactly 3 epoch results, got {epoch_count}");
+    assert_eq!(
+        epoch_count, 3,
+        "expected exactly 3 epoch results, got {epoch_count}"
+    );
 
     // Verify epoch 0: values [10, 20, 30, 40, 50] → sum=150, count=5, min=10, max=50
     assert!(all[0].1.contains("count=5"), "epoch 0 count");
