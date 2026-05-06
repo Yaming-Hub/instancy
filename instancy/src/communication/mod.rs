@@ -16,6 +16,8 @@ pub mod remote_push;
 pub mod sequencing;
 pub mod session;
 pub mod shared_pool;
+#[cfg(feature = "transport")]
+pub mod shared_transport;
 pub mod transport;
 pub mod transport_session;
 
@@ -59,4 +61,10 @@ pub use transport::{
 pub use transport_session::{
     CONTROL_CHANNEL_ID, ChannelRegistration, PROGRESS_CHANNEL_BASE, PeerConnection,
     TransportSession,
+};
+
+#[cfg(feature = "transport")]
+pub use shared_transport::{
+    ConnectionFactory, DataframeSender, PROBE_CHANNEL_ID, SharedPeerManager,
+    SharedTransportSession,
 };

@@ -29,6 +29,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - `ProbeTimestamp` — epoch-relative nanosecond timestamps for accurate RTT measurement
   - `ScalingDriver` — orchestrates probe tracking, RTT computation, and scaling event emission
   - `ScalingEvent` enum — `ScaleUp` / `ScaleDown { connection_id }` events via mpsc channel
+- `shared_transport` module — shared transport session for pooled multi-dataflow connections
+  - `SharedPeerManager` — manages pooled connections to a single peer (pool, bridge, probe, scaling)
+  - `SharedTransportSession` — lightweight per-dataflow handle with same API as `TransportSession`
+  - `DataframeSender` — auto-tags frames with dataflow ID for transparent sequencing
+  - `ConnectionFactory` trait — user-provided connection establishment for scaling
+  - Payload lane sequencing: data + progress share one sequence per (dataflow_id, peer) for FIFO ordering
+  - `PROBE_CHANNEL_ID` — reserved channel for RTT probes using standard Frame wire format
+  - `check_reorder_timeouts()` — periodic timeout sweeper for gap detection
 
 ## [0.2.0] - 2026-05-05
 

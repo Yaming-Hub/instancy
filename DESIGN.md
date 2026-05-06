@@ -2438,6 +2438,10 @@ pub struct SharedConnectionConfig {
     pub probe_interval: Duration,         // e.g., 100ms
     /// Timeout for reorder buffer gap detection.
     pub reorder_timeout: Duration,        // e.g., 50ms
+    /// Close idle connections after this duration of inactivity.
+    /// Connections with no write activity for longer than this are
+    /// removed (down to min_connections). Set to None to disable.
+    pub idle_timeout: Option<Duration>,   // e.g., Some(60s)
 }
 ```
 
@@ -2451,6 +2455,8 @@ pub struct SharedConnectionConfig {
 
 4. **TCP kernel metrics** (optional, platform-specific) — `TCP_INFO` on Linux provides `tcpi_rtt`, `tcpi_retransmits`, `tcpi_snd_cwnd`. Direct visibility into TCP congestion state.
 
+5. **Idle detection** — Each connection tracks its last write activity timestamp. When a connection has had no frames written for longer than `idle_timeout`, it is considered idle and a candidate for removal (down to `min_connections`). This prevents resource waste when traffic subsides after a burst.
+
 **Scaling algorithm:**
 
 ```
@@ -2459,7 +2465,10 @@ On each probe response:
   2. If avg_rtt > rtt_scale_up_threshold AND current_connections < max_connections:
        - Establish new connection to peer
        - Begin load-balancing frames across all connections (round-robin or least-loaded)
-  3. If avg_rtt < rtt_scale_down_threshold for > cooldown_period
+  3. If any connection has been idle > idle_timeout
+     AND current_connections > min_connections:
+       - Close the longest-idle connection (no drain needed — no pending writes)
+  4. If avg_rtt < rtt_scale_down_threshold for > cooldown_period
      AND current_connections > min_connections:
        - Drain one connection (stop sending new frames, wait for in-flight to complete)
        - Close the drained connection
@@ -2481,10 +2490,11 @@ Probes are sent at data priority (not control priority) because we want to measu
 
 **Load-balancing frames across connections:**
 
-When multiple connections exist to the same peer, frames are distributed using a **least-loaded** strategy:
-- Pick the connection with the smallest pending write queue
-- This naturally avoids saturated connections
-- Sequence IDs ensure ordering is reconstructed at the receiver regardless of which connection carried each frame
+When multiple connections exist to the same peer, frames are distributed using a **load-aware packing** strategy:
+
+- **Low load** (total pending writes < connection count): traffic is *concentrated* onto the fewest connections. The busiest connection is selected, packing frames onto it. This leaves other connections idle so they can be cleaned up by the idle timeout, naturally shrinking the pool when demand subsides.
+- **High load** (total pending writes ≥ connection count): traffic is *spread* across connections using least-loaded selection (smallest pending write queue). This maximizes throughput by utilizing all connections' independent TCP congestion windows.
+- Sequence IDs ensure ordering is reconstructed at the receiver regardless of which connection carried each frame.
 
 **Why not just one connection?**
 
