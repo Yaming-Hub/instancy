@@ -18,6 +18,7 @@
 //! - Correct exchange routing across nodes for every dataflow
 
 #![cfg(feature = "transport")]
+#![allow(clippy::needless_range_loop)]
 
 use std::time::Duration;
 

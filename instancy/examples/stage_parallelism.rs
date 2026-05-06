@@ -128,7 +128,7 @@ fn main() {
 
     println!("  Results (sum of doubled+expanded values by parity):");
     let mut sorted: Vec<_> = totals.iter().collect();
-    sorted.sort_by_key(|(k, _)| k.clone());
+    sorted.sort_by_key(|(k, _)| (*k).clone());
     for (key, val) in &sorted {
         println!("    {key}: {val}");
     }

@@ -503,6 +503,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::field_reassign_with_default)]
     fn config_validation_errors() {
         let mut config = WorkerPoolConfig::default();
 

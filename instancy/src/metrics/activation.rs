@@ -161,7 +161,7 @@ mod tests {
 
         let snapshot = collector.snapshot();
         assert_eq!(snapshot.activations, 5);
-        assert_eq!(snapshot.records_processed, 0 + 10 + 20 + 30 + 40);
+        assert_eq!(snapshot.records_processed, 10 + 20 + 30 + 40);
     }
 
     #[test]

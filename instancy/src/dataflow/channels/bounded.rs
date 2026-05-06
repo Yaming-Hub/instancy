@@ -404,11 +404,8 @@ mod tests {
             let mut received = Vec::new();
             loop {
                 if let Some(env) = pull.pull() {
-                    match env.payload {
-                        super::super::envelope::Payload::Data { data, .. } => {
-                            received.extend(data);
-                        }
-                        _ => {}
+                    if let super::super::envelope::Payload::Data { data, .. } = env.payload {
+                        received.extend(data);
                     }
                 } else if pull.is_exhausted() {
                     break;

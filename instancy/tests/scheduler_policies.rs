@@ -23,6 +23,7 @@ impl CompletionProbe {
         self.order.load(Ordering::SeqCst)
     }
 
+    #[allow(dead_code)]
     fn completed_at_ms(&self) -> u64 {
         self.completed_at_ms.load(Ordering::SeqCst)
     }

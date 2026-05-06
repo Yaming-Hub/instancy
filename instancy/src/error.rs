@@ -221,7 +221,7 @@ mod tests {
     fn error_display_operator() {
         let err = Error::operator(
             "my_filter",
-            std::io::Error::new(std::io::ErrorKind::Other, "oops"),
+            std::io::Error::other("oops"),
         );
         let msg = err.to_string();
         assert!(msg.contains("my_filter"));
@@ -281,7 +281,7 @@ mod tests {
         let err = Error::operator_with_context(
             "hash_join",
             3,
-            std::io::Error::new(std::io::ErrorKind::Other, "key mismatch"),
+            std::io::Error::other("key mismatch"),
         );
         let msg = err.to_string();
         assert!(msg.contains("hash_join"), "should contain operator name");
@@ -307,7 +307,7 @@ mod tests {
         // Existing Operator with worker_index: None gets backfilled
         let err = Error::operator(
             "original_op",
-            std::io::Error::new(std::io::ErrorKind::Other, "original cause"),
+            std::io::Error::other("original cause"),
         );
         let wrapped = err.with_operator_context("wrapper_op", 5);
         let msg = wrapped.to_string();
@@ -328,7 +328,7 @@ mod tests {
         let err = Error::operator_with_context(
             "original_op",
             7,
-            std::io::Error::new(std::io::ErrorKind::Other, "original cause"),
+            std::io::Error::other("original cause"),
         );
         let wrapped = err.with_operator_context("wrapper_op", 99);
         let msg = wrapped.to_string();
@@ -351,7 +351,7 @@ mod tests {
         // Error::operator() without context should not show worker info
         let err = Error::operator(
             "my_filter",
-            std::io::Error::new(std::io::ErrorKind::Other, "oops"),
+            std::io::Error::other("oops"),
         );
         let msg = err.to_string();
         assert!(!msg.contains("worker"), "no worker info without context");

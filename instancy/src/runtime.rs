@@ -3549,7 +3549,7 @@ mod tests {
         for i in 0..3 {
             let builder = DataflowBuilder::<u64>::new(format!("df_{i}"));
             builder
-                .source("data", vec![(0u64, vec![i as i32])])
+                .source("data", vec![(0u64, vec![i])])
                 .output("out");
             let dataflow = builder.build().unwrap();
             rt.spawn(dataflow, SpawnOptions::default()).unwrap().join_blocking().unwrap();
@@ -3758,7 +3758,7 @@ mod tests {
         sender.close();
 
         let results = receiver.collect_data().await;
-        assert!(results.len() >= 1); // may be batched
+        assert!(!results.is_empty()); // may be batched
         let all_data: Vec<i32> = results.into_iter().flat_map(|(_, d)| d).collect();
         let mut sorted = all_data;
         sorted.sort();
@@ -4171,12 +4171,10 @@ mod tests {
         let senders = multi.take_all_inputs::<String>("words").unwrap();
         let receivers = multi.take_all_outputs::<String>("results").unwrap();
 
-        let partitions = vec![
-            vec!["hello".to_string()],
+        let partitions = [vec!["hello".to_string()],
             vec!["world".to_string()],
             vec!["foo".to_string(), "bar".to_string()],
-            vec![],
-        ];
+            vec![]];
 
         for (i, partition) in partitions.iter().enumerate() {
             if !partition.is_empty() {
@@ -4344,7 +4342,7 @@ mod tests {
         let in1 = multi.take_input::<i32>(1, "data").unwrap();
         in1.close();
 
-        let _ = multi
+        multi
             .join_blocking()
             .expect("dataflow should complete without error");
 
@@ -4393,7 +4391,7 @@ mod tests {
         in1.send(0u64, vec![4, 5, 6, 7]).unwrap();
         in1.close();
 
-        let _ = multi
+        multi
             .join_blocking()
             .expect("dataflow should complete without error");
 
@@ -4480,7 +4478,7 @@ mod tests {
         let in1 = multi.take_input::<i32>(1, "data").unwrap();
         in1.close();
 
-        let _ = multi.join_blocking().expect("dataflow should complete");
+        multi.join_blocking().expect("dataflow should complete");
 
         // After exchange(value % 2): worker 0 gets evens [2,4,6,8], worker 1 gets odds [1,3,5,7]
         // Each worker's unary_notify sums its partition on notification.
@@ -4540,7 +4538,7 @@ mod tests {
         in1.send(1u64, vec![22, 23]).unwrap();
         in1.close();
 
-        let _ = multi.join_blocking().expect("dataflow should complete");
+        multi.join_blocking().expect("dataflow should complete");
 
         // After exchange(mod 2):
         //   epoch 0: w0=[10,12], w1=[11,13] → sums: w0=22, w1=24
@@ -4606,7 +4604,7 @@ mod tests {
         in1.send(0u64, vec![5, 7]).unwrap();
         in1.close();
 
-        let _ = multi.join_blocking().expect("dataflow should complete");
+        multi.join_blocking().expect("dataflow should complete");
 
         // All 5 items doubled are even → value % 2 == 0 → all route to worker 0.
         // NOTE: With multi-worker exchange, data from different source workers
@@ -4668,7 +4666,7 @@ mod tests {
         in1.send(0u64, vec![5, 7]).unwrap();
         in1.close();
 
-        let _ = multi.join_blocking().expect("dataflow should complete");
+        multi.join_blocking().expect("dataflow should complete");
 
         // After exchange: w0=[2,4,6,8], w1=[1,3,5,7]
         // Aggregate per epoch (multiple emissions possible from multi-batch arrivals).
@@ -4730,7 +4728,7 @@ mod tests {
             .map(|i| multi.take_output::<i32>(i, "results").unwrap())
             .collect();
 
-        let _ = multi.join_blocking().expect("dataflow should complete");
+        multi.join_blocking().expect("dataflow should complete");
 
         let mut all_results: Vec<Vec<i32>> = Vec::new();
         for recv in &receivers {
@@ -4748,7 +4746,7 @@ mod tests {
         for (worker, data) in all_results.iter().enumerate() {
             let expected: Vec<i32> = (0..8i32)
                 .filter(|x| (*x as u64) % 4 == worker as u64)
-                .flat_map(|x| std::iter::repeat(x).take(num_workers))
+                .flat_map(|x| std::iter::repeat_n(x, num_workers))
                 .collect();
             let mut expected_sorted = expected;
             expected_sorted.sort();

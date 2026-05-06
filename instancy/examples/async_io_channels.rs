@@ -101,10 +101,12 @@ async fn main() {
     completion.await.expect("pipeline 2 failed");
 
     let collector = out.collector();
-    let data = collector.lock().unwrap();
-    println!("Pipeline 2 results (sync spawn + async await):");
-    for (time, vals) in data.iter() {
-        println!("  t={time}: {vals:?}");
+    {
+        let data = collector.lock().unwrap();
+        println!("Pipeline 2 results (sync spawn + async await):");
+        for (time, vals) in data.iter() {
+            println!("  t={time}: {vals:?}");
+        }
     }
     println!("Pipeline 2 completed\n");
 
@@ -117,7 +119,7 @@ async fn main() {
         builder
             .source(
                 "src",
-                vec![(0u64, vec![i as i32 * 10 + 1, i as i32 * 10 + 2])],
+                vec![(0u64, vec![i * 10 + 1, i * 10 + 2])],
             )
             .map("inc", |_t, x| x + 100)
             .output("out");
