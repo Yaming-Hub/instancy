@@ -77,8 +77,8 @@ pub use dataflow::{InputSender, OutputReceiver};
 
 // Runtime
 pub use runtime::{
-    DataflowCompletion, IoMode, RuntimeConfig, RuntimeHandle, SpawnOptions, SpawnedDataflow,
-    TokioMode,
+    DataflowCompletion, IoMode, MultiDataflowCompletion, MultiSpawnedDataflow, RuntimeConfig,
+    RuntimeHandle, SpawnOptions, SpawnedDataflow, TokioMode,
 };
 #[cfg(feature = "test-utils")]
 pub use runtime::SimpleRuntime;

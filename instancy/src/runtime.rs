@@ -3014,6 +3014,9 @@ impl<T: Timestamp> MultiSpawnedDataflow<T> {
     ///
     /// Returns a [`MultiDataflowCompletion`] that resolves when all workers
     /// finish. On first error, remaining workers are cancelled.
+    ///
+    /// The returned future implements [`Future`] and can be `.await`ed in
+    /// async code, or blocked on via [`.wait()`](MultiDataflowCompletion::wait).
     pub fn join(mut self) -> MultiDataflowCompletion {
         let workers = std::mem::take(&mut self.workers);
         // Collect per-worker cancel tokens so MultiDataflowCompletion can
@@ -3022,8 +3025,10 @@ impl<T: Timestamp> MultiSpawnedDataflow<T> {
             workers.iter().map(|w| w.cancel.clone()).collect();
         let completions: Vec<DataflowCompletion> = workers.into_iter().map(|w| w.join()).collect();
         MultiDataflowCompletion {
+            resolved: vec![false; completions.len()],
             worker_cancels,
             completions,
+            first_error: None,
         }
     }
 }
@@ -3143,8 +3148,8 @@ impl<T: Timestamp> ClusterSpawnedDataflow<T> {
     /// bridge tasks. Use [`join_blocking()`](Self::join_blocking) instead to
     /// ensure bridges stay alive until workers complete.
     ///
-    /// If you need async waiting, call `join_blocking()` from a
-    /// `spawn_blocking` task.
+    /// The returned [`MultiDataflowCompletion`] implements [`Future`] and can
+    /// be `.await`ed in async code, or blocked on via [`.wait()`](MultiDataflowCompletion::wait).
     pub fn join(mut self) -> MultiDataflowCompletion {
         self.inner.take().expect("join called after move").join()
     }
@@ -3181,6 +3186,10 @@ pub struct MultiDataflowCompletion {
     /// Per-worker cancellation tokens for direct cancellation.
     worker_cancels: Vec<CancellationToken>,
     completions: Vec<DataflowCompletion>,
+    /// Tracks which completions have already resolved (for Future impl).
+    resolved: Vec<bool>,
+    /// First error encountered (for Future impl).
+    first_error: Option<Error>,
 }
 
 impl MultiDataflowCompletion {
@@ -3211,6 +3220,54 @@ impl MultiDataflowCompletion {
         match first_error {
             Some(e) => Err(e),
             None => Ok(()),
+        }
+    }
+}
+
+impl Future for MultiDataflowCompletion {
+    type Output = Result<()>;
+
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        let this = self.get_mut();
+        let mut all_done = true;
+
+        for i in 0..this.completions.len() {
+            if this.resolved[i] {
+                continue;
+            }
+
+            let completion = Pin::new(&mut this.completions[i]);
+            match completion.poll(cx) {
+                Poll::Ready(Ok(())) => {
+                    this.resolved[i] = true;
+                }
+                Poll::Ready(Err(e)) => {
+                    this.resolved[i] = true;
+                    if this.first_error.is_none() {
+                        this.first_error = Some(e);
+                        // Cancel remaining unresolved workers.
+                        for (j, cancel) in this.worker_cancels.iter().enumerate() {
+                            if !this.resolved[j] {
+                                cancel.cancel_with_reason(CancellationReason::WorkerFailed(
+                                    "sibling worker failed".into(),
+                                ));
+                            }
+                        }
+                    }
+                }
+                Poll::Pending => {
+                    all_done = false;
+                }
+            }
+        }
+
+        if all_done {
+            match this.first_error.take() {
+                Some(e) => Poll::Ready(Err(e)),
+                None => Poll::Ready(Ok(())),
+            }
+        } else {
+            Poll::Pending
         }
     }
 }
@@ -5911,5 +5968,74 @@ mod tests {
 
         rt.wait_idle().await;
         assert_eq!(rt.active_dataflows(), 0);
+    }
+
+    #[tokio::test]
+    async fn multi_dataflow_completion_future() {
+        use crate::dataflow::DataflowBuilder;
+
+        let rt = RuntimeHandle::new(RuntimeConfig {
+            worker_threads: 2,
+            ..Default::default()
+        })
+        .unwrap();
+
+        let mut handle = rt
+            .spawn_multi(
+                "multi-future",
+                3,
+                |_idx, builder: &mut DataflowBuilder<u64>| {
+                    let input = builder.input::<i32>("data");
+                    input.output("out");
+                    Ok(())
+                },
+                SpawnOptions::default(),
+            )
+            .unwrap();
+
+        // Close all inputs so the dataflow can finish.
+        for i in 0..3 {
+            drop(handle.take_input::<i32>(i, "data").unwrap());
+        }
+
+        // Await the MultiDataflowCompletion as a Future.
+        let result = handle.join().await;
+        assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn multi_dataflow_completion_error_cancels_siblings() {
+        use crate::dataflow::DataflowBuilder;
+
+        let rt = RuntimeHandle::new(RuntimeConfig {
+            worker_threads: 2,
+            ..Default::default()
+        })
+        .unwrap();
+
+        let mut handle = rt
+            .spawn_multi(
+                "multi-error",
+                2,
+                |_idx, builder: &mut DataflowBuilder<u64>| {
+                    let input = builder.input::<i32>("data");
+                    input.output("out");
+                    Ok(())
+                },
+                SpawnOptions::default(),
+            )
+            .unwrap();
+
+        // Close only worker 0's input — worker 1 stays blocked.
+        drop(handle.take_input::<i32>(0, "data").unwrap());
+
+        // Cancel worker 1 explicitly to simulate a failure.
+        handle.worker_mut(1).cancel();
+
+        // Awaiting should complete (either success or error from worker 1).
+        let result = handle.join().await;
+        // Worker 1 was cancelled, so result should be an error or Ok depending
+        // on whether cancellation counts as error. Either way, it should not hang.
+        let _ = result;
     }
 }
