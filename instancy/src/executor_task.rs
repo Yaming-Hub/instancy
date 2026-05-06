@@ -381,7 +381,10 @@ impl Wake for PoolWaker {
 /// - **No policy (`None`)** — plain `VecDeque::pop_front()`, O(1), zero comparisons.
 ///   This is the default and should be used unless priority ordering is needed.
 /// - **With policy (`Some`)** — `BinaryHeap` backed by the policy's `compare`,
-///   giving O(log n) insert and O(log n) dequeue.
+///   giving O(log n) insert and O(log n) dequeue. This is correct because
+///   task metadata (priority, created_at) is stable while in the heap —
+///   `mark_enqueued()` updates `created_at` only at insertion time, before the
+///   entry enters the heap, so the heap invariant is never violated.
 ///
 /// The registry uses the pool's existing condvar for unified wake/park — when a
 /// task becomes ready, it notifies the condvar so a parked worker thread wakes up.
@@ -402,22 +405,24 @@ pub struct ExecutorRegistry {
 
 /// Internal queue — either a plain FIFO or a policy-ordered heap.
 enum ReadyQueue {
+    /// Pure FIFO — pop from front, no comparisons.
     Fifo(std::collections::VecDeque<Arc<ExecutorTask>>),
-    Ordered(std::collections::BinaryHeap<PolicyEntry>),
+    /// Binary heap — O(log n) for policy-based ordering.
+    Heap(std::collections::BinaryHeap<PolicyEntry>),
 }
 
 impl ReadyQueue {
     fn is_empty(&self) -> bool {
         match self {
             ReadyQueue::Fifo(d) => d.is_empty(),
-            ReadyQueue::Ordered(h) => h.is_empty(),
+            ReadyQueue::Heap(h) => h.is_empty(),
         }
     }
 
     fn len(&self) -> usize {
         match self {
             ReadyQueue::Fifo(d) => d.len(),
-            ReadyQueue::Ordered(h) => h.len(),
+            ReadyQueue::Heap(h) => h.len(),
         }
     }
 }
@@ -473,7 +478,7 @@ impl ExecutorRegistry {
     ) -> Self {
         let ready_queue = match &schedule_policy {
             None => ReadyQueue::Fifo(std::collections::VecDeque::new()),
-            Some(_) => ReadyQueue::Ordered(std::collections::BinaryHeap::new()),
+            Some(_) => ReadyQueue::Heap(std::collections::BinaryHeap::new()),
         };
         Self {
             ready_queue: Mutex::new(ready_queue),
@@ -526,7 +531,7 @@ impl ExecutorRegistry {
             match self.ready_queue.lock() {
                 Ok(mut queue) => match &mut *queue {
                     ReadyQueue::Fifo(deque) => deque.push_back(task),
-                    ReadyQueue::Ordered(heap) => {
+                    ReadyQueue::Heap(heap) => {
                         let policy = self.schedule_policy.as_ref().unwrap().clone();
                         heap.push(PolicyEntry { task, policy });
                     }
@@ -548,7 +553,7 @@ impl ExecutorRegistry {
         let mut queue = self.ready_queue.lock().ok()?;
         match &mut *queue {
             ReadyQueue::Fifo(deque) => deque.pop_front(),
-            ReadyQueue::Ordered(heap) => heap.pop().map(|entry| entry.task),
+            ReadyQueue::Heap(heap) => heap.pop().map(|entry| entry.task),
         }
     }
 
@@ -783,6 +788,36 @@ mod tests {
         assert_eq!(second.id, mid.id, "mid priority should dequeue second");
         assert_eq!(third.id, low.id, "lowest priority should dequeue last");
         assert!(registry.dequeue().is_none());
+    }
+
+    #[test]
+    fn registry_aging_policy_dequeue_order() {
+        use crate::scheduler::policy::PriorityWithAgingPolicy;
+
+        let condvar = Arc::new(std::sync::Condvar::new());
+        let policy = PriorityWithAgingPolicy { aging_rate: 1000.0 };
+
+        let registry = Arc::new(ExecutorRegistry::new(
+            condvar,
+            Some(Arc::new(policy)),
+        ));
+
+        let (_, n1) = make_notifier();
+        let (_, n2) = make_notifier();
+
+        // Enqueue low-priority first (will age), then high-priority
+        let low = registry.register(Box::pin(PendingForever), n1, DataflowId::new(), 0);
+        std::thread::sleep(std::time::Duration::from_millis(10));
+        let high = registry.register(Box::pin(PendingForever), n2, DataflowId::new(), 5);
+
+        // With aging_rate=1000, 10ms of age = 10 effective priority for low
+        // low effective = 0 + 10 = 10, high effective = 5 + ~0 = 5
+        // So low should be dequeued first (it aged past high)
+        let first = registry.dequeue().unwrap();
+        let second = registry.dequeue().unwrap();
+
+        assert_eq!(first.id, low.id, "aged low-priority should dequeue first");
+        assert_eq!(second.id, high.id, "fresh high-priority should dequeue second");
     }
 
     #[test]
