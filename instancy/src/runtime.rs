@@ -101,7 +101,7 @@ pub enum IoMode {
 /// let opts = SpawnOptions::default(); // sync channels, no metrics
 /// let opts = SpawnOptions::new().io_mode(IoMode::Async).collect_metrics(true);
 /// ```
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Debug)]
 pub struct SpawnOptions {
     /// Channel mode for external I/O ports. Default: [`IoMode::Sync`].
     pub io_mode: IoMode,
@@ -109,6 +109,29 @@ pub struct SpawnOptions {
     pub collect_metrics: bool,
     /// Scheduling priority for this dataflow (higher = scheduled sooner).
     pub priority: u32,
+    /// Optional external cancellation token.
+    ///
+    /// When this token is cancelled (by the hosting application), the dataflow
+    /// is automatically cancelled with [`CancellationReason::UserRequested`].
+    /// This allows the caller to control dataflow lifetime externally — e.g.,
+    /// implementing timeouts, graceful shutdown, or request-scoped cancellation.
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// use tokio_util::sync::CancellationToken;
+    ///
+    /// let token = CancellationToken::new();
+    /// // Cancel after 5 seconds:
+    /// tokio::spawn({
+    ///     let t = token.clone();
+    ///     async move { tokio::time::sleep(Duration::from_secs(5)).await; t.cancel(); }
+    /// });
+    ///
+    /// let opts = SpawnOptions::new().cancellation_token(token);
+    /// let handle = rt.spawn(dataflow, opts)?;
+    /// ```
+    pub cancellation_token: Option<tokio_util::sync::CancellationToken>,
 }
 
 impl SpawnOptions {
@@ -137,6 +160,17 @@ impl SpawnOptions {
         self.priority = priority;
         self
     }
+
+    /// Set an external cancellation token.
+    ///
+    /// When this token is cancelled, the dataflow is automatically cancelled
+    /// with [`CancellationReason::UserRequested`]. This allows the hosting
+    /// application to control dataflow lifetime — e.g., timeouts, graceful
+    /// shutdown, or request-scoped cancellation.
+    pub fn cancellation_token(mut self, token: tokio_util::sync::CancellationToken) -> Self {
+        self.cancellation_token = Some(token);
+        self
+    }
 }
 
 impl Default for SpawnOptions {
@@ -145,6 +179,7 @@ impl Default for SpawnOptions {
             io_mode: IoMode::Sync,
             collect_metrics: false,
             priority: 0,
+            cancellation_token: None,
         }
     }
 }
@@ -548,6 +583,7 @@ impl RuntimeHandle {
             dataflow,
             options.io_mode.into(),
             options.priority,
+            options.cancellation_token,
             WorkerContext::single(),
             None,
             None,
@@ -682,16 +718,19 @@ impl RuntimeHandle {
             options.io_mode.into(),
             options.collect_metrics,
             options.priority,
+            options.cancellation_token,
         )
     }
 
     // -- Private sync implementations --
 
+    #[allow(clippy::too_many_arguments)]
     fn spawn_internal<T: Timestamp>(
         &self,
         dataflow: LogicalDataflow<T>,
         mode: ChannelMode,
         priority: u32,
+        external_cancel: Option<tokio_util::sync::CancellationToken>,
         worker_context: WorkerContext,
         progress_channels: Option<WorkerProgressChannels<T>>,
         pre_created_wake_handle: Option<WakeHandle>,
@@ -708,6 +747,25 @@ impl RuntimeHandle {
         )?;
         self.registry
             .register(executor, notifier, dataflow_id, priority);
+
+        // If an external cancellation token was provided, spawn a bridge task
+        // that propagates cancellation from the user's token to our internal one.
+        // The task exits when either the user token fires OR the dataflow
+        // completes/cancels by other means.
+        if let Some(user_token) = external_cancel {
+            let cancel = spawned.cancel.clone();
+            tokio::spawn(async move {
+                tokio::select! {
+                    _ = user_token.cancelled() => {
+                        cancel.cancel_with_reason(CancellationReason::UserRequested);
+                    }
+                    _ = cancel.cancelled_async() => {
+                        // Dataflow already cancelled/completed — exit cleanly.
+                    }
+                }
+            });
+        }
+
         Ok(spawned)
     }
 
@@ -861,6 +919,7 @@ impl RuntimeHandle {
         Ok((spawned, Box::pin(executor), notifier))
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn spawn_multi_internal<T, F>(
         &self,
         name: &str,
@@ -869,6 +928,7 @@ impl RuntimeHandle {
         mode: ChannelMode,
         collect_metrics: bool,
         priority: u32,
+        external_cancel: Option<tokio_util::sync::CancellationToken>,
     ) -> Result<MultiSpawnedDataflow<T>>
     where
         T: Timestamp,
@@ -1033,13 +1093,35 @@ impl RuntimeHandle {
             workers.push(spawned);
         }
 
-        Ok(MultiSpawnedDataflow {
+        let multi = MultiSpawnedDataflow {
             name: name.to_string(),
             num_workers,
             workers,
-            dataflow_cancel,
+            dataflow_cancel: dataflow_cancel.clone(),
             _phantom: PhantomData,
-        })
+        };
+
+        // If an external cancellation token was provided, spawn a bridge task
+        // that propagates cancellation to all workers. Exits when either fires.
+        if let Some(user_token) = external_cancel {
+            let cancel = if let Some(ref dc) = multi.dataflow_cancel {
+                dc.clone()
+            } else {
+                multi.workers[0].cancel.clone()
+            };
+            tokio::spawn(async move {
+                tokio::select! {
+                    _ = user_token.cancelled() => {
+                        cancel.cancel_with_reason(CancellationReason::UserRequested);
+                    }
+                    _ = cancel.cancelled_async() => {
+                        // Dataflow already cancelled/completed — exit cleanly.
+                    }
+                }
+            });
+        }
+
+        Ok(multi)
     }
 
     /// Spawn a multi-node cluster dataflow.
@@ -2285,6 +2367,14 @@ impl<T: Timestamp> SpawnedDataflow<T> {
     /// The executor will stop at the next cancellation check point. Does not block.
     pub fn cancel(&self) {
         self.cancel.cancel();
+    }
+
+    /// Get a reference to the dataflow's cancellation token.
+    ///
+    /// Useful for observing the cancellation state (e.g., after a timeout) or
+    /// cloning the token for use in other contexts.
+    pub fn cancel_token(&self) -> &CancellationToken {
+        &self.cancel
     }
 
     /// Cancel the running dataflow with a specific reason.
