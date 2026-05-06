@@ -30,14 +30,20 @@
 //! - No concurrent polling (only one QUEUED→POLLING transition succeeds)
 //! - No missed wakeups (wake during POLLING sets QUEUED, re-enqueued after poll)
 
+use std::cmp::Ordering as CmpOrdering;
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicU8, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll, Wake};
+use std::time::Instant;
 
+use crate::dataflow::DataflowId;
 use crate::error::Result;
 use crate::runtime::CompletionNotifier;
+use crate::scheduler::policy::{SchedulePolicy, TaskMeta};
+#[cfg(test)]
+use crate::scheduler::policy::FifoPolicy;
 
 /// Task states for the executor state machine.
 ///
@@ -83,6 +89,9 @@ pub struct ExecutorTask {
     /// Completion notifier — signals DataflowCompletion when the executor finishes.
     notifier: Mutex<Option<CompletionNotifier>>,
 
+    /// Scheduling metadata used when the task is queued.
+    meta: Mutex<TaskMeta>,
+
     /// Atomic task state (IDLE / QUEUED / POLLING / DONE).
     state: AtomicU8,
 
@@ -97,15 +106,30 @@ impl ExecutorTask {
     /// immediately after creation so the pool can begin polling it.
     pub fn new(
         id: TaskId,
+        dataflow_id: DataflowId,
+        priority: u32,
         executor: Pin<Box<dyn Future<Output = Result<bool>> + Send>>,
         notifier: CompletionNotifier,
     ) -> Self {
         Self {
             executor: Mutex::new(Some(executor)),
             notifier: Mutex::new(Some(notifier)),
+            meta: Mutex::new(TaskMeta::new(dataflow_id, priority)),
             state: AtomicU8::new(TASK_QUEUED),
             id,
         }
+    }
+
+    /// Refresh the enqueue timestamp when the task enters the ready queue.
+    pub fn mark_enqueued(&self) {
+        if let Ok(mut meta) = self.meta.lock() {
+            meta.created_at = Instant::now();
+        }
+    }
+
+    /// Snapshot this task's scheduling metadata.
+    pub fn task_meta(&self) -> Option<TaskMeta> {
+        self.meta.lock().ok().map(|meta| meta.clone())
     }
 
     /// Attempt to transition from QUEUED to POLLING.
@@ -364,6 +388,9 @@ pub struct ExecutorRegistry {
     /// Ready queue of tasks waiting to be polled.
     ready_queue: Mutex<std::collections::VecDeque<Arc<ExecutorTask>>>,
 
+    /// Scheduling policy applied when selecting the next queued task.
+    schedule_policy: Arc<dyn SchedulePolicy>,
+
     /// Reference to the pool's condvar for waking parked worker threads.
     /// Set during initialization; None only in tests that don't use a pool.
     pool_condvar: Option<Arc<std::sync::Condvar>>,
@@ -375,9 +402,13 @@ pub struct ExecutorRegistry {
 impl ExecutorRegistry {
     /// Create a new registry that will notify the given condvar when tasks
     /// become ready. Pass the pool's `park_condvar` here.
-    pub fn new(pool_condvar: Arc<std::sync::Condvar>) -> Self {
+    pub fn new(
+        pool_condvar: Arc<std::sync::Condvar>,
+        schedule_policy: Arc<dyn SchedulePolicy>,
+    ) -> Self {
         Self {
             ready_queue: Mutex::new(std::collections::VecDeque::new()),
+            schedule_policy,
             pool_condvar: Some(pool_condvar),
             next_id: AtomicUsize::new(0),
         }
@@ -388,6 +419,7 @@ impl ExecutorRegistry {
     pub fn new_standalone() -> Self {
         Self {
             ready_queue: Mutex::new(std::collections::VecDeque::new()),
+            schedule_policy: Arc::new(FifoPolicy),
             pool_condvar: None,
             next_id: AtomicUsize::new(0),
         }
@@ -405,9 +437,11 @@ impl ExecutorRegistry {
         self: &Arc<Self>,
         executor: Pin<Box<dyn Future<Output = Result<bool>> + Send>>,
         notifier: CompletionNotifier,
+        dataflow_id: DataflowId,
+        priority: u32,
     ) -> Arc<ExecutorTask> {
         let id = self.next_task_id();
-        let task = Arc::new(ExecutorTask::new(id, executor, notifier));
+        let task = Arc::new(ExecutorTask::new(id, dataflow_id, priority, executor, notifier));
         self.enqueue(Arc::clone(&task));
         task
     }
@@ -418,6 +452,7 @@ impl ExecutorRegistry {
     /// operations inside are infallible), the task is silently dropped
     /// rather than panicking the pool thread.
     pub fn enqueue(&self, task: Arc<ExecutorTask>) {
+        task.mark_enqueued();
         {
             match self.ready_queue.lock() {
                 Ok(mut queue) => queue.push_back(task),
@@ -437,7 +472,28 @@ impl ExecutorRegistry {
     /// Try to dequeue a ready task. Returns None if the queue is empty
     /// or if the queue mutex is poisoned.
     pub fn dequeue(&self) -> Option<Arc<ExecutorTask>> {
-        self.ready_queue.lock().ok()?.pop_front()
+        let mut queue = self.ready_queue.lock().ok()?;
+        let mut best_idx = None;
+        let mut best_meta = None;
+
+        for (idx, task) in queue.iter().enumerate() {
+            let meta = match task.task_meta() {
+                Some(m) => m,
+                None => continue, // Skip tasks with poisoned metadata
+            };
+            let should_replace = match &best_meta {
+                None => true,
+                Some(current_best) => {
+                    self.schedule_policy.compare(&meta, current_best) == CmpOrdering::Less
+                }
+            };
+            if should_replace {
+                best_idx = Some(idx);
+                best_meta = Some(meta);
+            }
+        }
+
+        queue.remove(best_idx?)
     }
 
     /// Check if the ready queue is empty.
@@ -510,14 +566,14 @@ mod tests {
     #[test]
     fn task_starts_in_queued_state() {
         let (_, notifier) = make_notifier();
-        let task = ExecutorTask::new(TaskId(0), Box::pin(PendingForever), notifier);
+        let task = ExecutorTask::new(TaskId(0), DataflowId::new(), 0, Box::pin(PendingForever), notifier);
         assert_eq!(task.state(), TASK_QUEUED);
     }
 
     #[test]
     fn try_start_poll_transitions_queued_to_polling() {
         let (_, notifier) = make_notifier();
-        let task = ExecutorTask::new(TaskId(0), Box::pin(PendingForever), notifier);
+        let task = ExecutorTask::new(TaskId(0), DataflowId::new(), 0, Box::pin(PendingForever), notifier);
         assert!(task.try_start_poll());
         assert_eq!(task.state(), TASK_POLLING);
     }
@@ -525,7 +581,7 @@ mod tests {
     #[test]
     fn try_start_poll_fails_when_not_queued() {
         let (_, notifier) = make_notifier();
-        let task = ExecutorTask::new(TaskId(0), Box::pin(PendingForever), notifier);
+        let task = ExecutorTask::new(TaskId(0), DataflowId::new(), 0, Box::pin(PendingForever), notifier);
         // First claim succeeds
         assert!(task.try_start_poll());
         // Second claim from another "thread" fails
@@ -535,7 +591,7 @@ mod tests {
     #[test]
     fn poll_pending_transitions_to_idle() {
         let (_, notifier) = make_notifier();
-        let task = ExecutorTask::new(TaskId(0), Box::pin(PendingForever), notifier);
+        let task = ExecutorTask::new(TaskId(0), DataflowId::new(), 0, Box::pin(PendingForever), notifier);
         assert!(task.try_start_poll());
 
         let (waker, _) = noop_cx();
@@ -551,6 +607,8 @@ mod tests {
         // Future that completes on first poll
         let task = ExecutorTask::new(
             TaskId(0),
+            DataflowId::new(),
+            0,
             Box::pin(CountdownFuture { remaining: 0 }),
             notifier,
         );
@@ -569,7 +627,7 @@ mod tests {
     #[test]
     fn try_wake_from_idle_returns_true() {
         let (_, notifier) = make_notifier();
-        let task = ExecutorTask::new(TaskId(0), Box::pin(PendingForever), notifier);
+        let task = ExecutorTask::new(TaskId(0), DataflowId::new(), 0, Box::pin(PendingForever), notifier);
         // Start poll, then return Pending → IDLE
         assert!(task.try_start_poll());
         let (waker, _) = noop_cx();
@@ -585,7 +643,7 @@ mod tests {
     #[test]
     fn try_wake_from_queued_returns_false_dedup() {
         let (_, notifier) = make_notifier();
-        let task = ExecutorTask::new(TaskId(0), Box::pin(PendingForever), notifier);
+        let task = ExecutorTask::new(TaskId(0), DataflowId::new(), 0, Box::pin(PendingForever), notifier);
         // Already QUEUED — duplicate wake should be suppressed
         assert!(!task.try_wake());
         assert_eq!(task.state(), TASK_QUEUED);
@@ -594,7 +652,7 @@ mod tests {
     #[test]
     fn try_wake_during_polling_sets_queued() {
         let (_, notifier) = make_notifier();
-        let task = ExecutorTask::new(TaskId(0), Box::pin(PendingForever), notifier);
+        let task = ExecutorTask::new(TaskId(0), DataflowId::new(), 0, Box::pin(PendingForever), notifier);
         assert!(task.try_start_poll());
         assert_eq!(task.state(), TASK_POLLING);
 
@@ -609,6 +667,8 @@ mod tests {
         let (_, notifier) = make_notifier();
         let task = ExecutorTask::new(
             TaskId(0),
+            DataflowId::new(),
+            0,
             Box::pin(CountdownFuture { remaining: 0 }),
             notifier,
         );
@@ -626,7 +686,7 @@ mod tests {
     fn registry_register_enqueues_task() {
         let registry = Arc::new(ExecutorRegistry::new_standalone());
         let (_, notifier) = make_notifier();
-        let _task = registry.register(Box::pin(PendingForever), notifier);
+        let _task = registry.register(Box::pin(PendingForever), notifier, DataflowId::new(), 0);
         assert_eq!(registry.ready_count(), 1);
     }
 
@@ -634,7 +694,7 @@ mod tests {
     fn registry_dequeue_returns_task() {
         let registry = Arc::new(ExecutorRegistry::new_standalone());
         let (_, notifier) = make_notifier();
-        let task = registry.register(Box::pin(PendingForever), notifier);
+        let task = registry.register(Box::pin(PendingForever), notifier, DataflowId::new(), 0);
         let dequeued = registry.dequeue().unwrap();
         assert_eq!(dequeued.id, task.id);
         assert!(registry.is_empty());
@@ -646,6 +706,8 @@ mod tests {
         let (_, notifier) = make_notifier();
         let task = Arc::new(ExecutorTask::new(
             TaskId(0),
+            DataflowId::new(),
+            0,
             Box::pin(PendingForever),
             notifier,
         ));
@@ -670,6 +732,8 @@ mod tests {
         let (_, notifier) = make_notifier();
         let task = Arc::new(ExecutorTask::new(
             TaskId(0),
+            DataflowId::new(),
+            0,
             Box::pin(PendingForever),
             notifier,
         ));
@@ -688,7 +752,12 @@ mod tests {
         // Poll 2: remaining 1→0, returns Ready
         let registry = Arc::new(ExecutorRegistry::new_standalone());
         let (completion, notifier) = make_notifier();
-        let _task = registry.register(Box::pin(CountdownFuture { remaining: 2 }), notifier);
+        let _task = registry.register(
+            Box::pin(CountdownFuture { remaining: 2 }),
+            notifier,
+            DataflowId::new(),
+            0,
+        );
 
         // Dequeue and poll #1
         let t = registry.dequeue().unwrap();
@@ -733,6 +802,8 @@ mod tests {
         let (completion, notifier) = make_notifier();
         let task = Arc::new(ExecutorTask::new(
             TaskId(0),
+            DataflowId::new(),
+            0,
             Box::pin(PanicFuture),
             notifier,
         ));
@@ -765,6 +836,8 @@ mod tests {
         let (completion, notifier) = make_notifier();
         let task = Arc::new(ExecutorTask::new(
             TaskId(0),
+            DataflowId::new(),
+            0,
             Box::pin(CountdownFuture { remaining: 0 }),
             notifier,
         ));
