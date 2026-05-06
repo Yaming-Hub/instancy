@@ -22,8 +22,7 @@ fn concurrent_spawn_four_dataflows() {
     let rt = RuntimeHandle::new(RuntimeConfig {
         worker_threads: 2,
         schedule_policy: None,
-        name: "concurrent-4".into(),
-    })
+        name: "concurrent-4".into(), ..Default::default() })
     .unwrap();
 
     let mut handles = Vec::new();
@@ -85,8 +84,7 @@ fn eight_dataflows_on_two_threads_no_starvation() {
     let rt = RuntimeHandle::new(RuntimeConfig {
         worker_threads: 2,
         schedule_policy: None,
-        name: "starvation-8".into(),
-    })
+        name: "starvation-8".into(), ..Default::default() })
     .unwrap();
 
     let mut handles = Vec::new();
@@ -125,8 +123,7 @@ fn mixed_workload_fairness() {
     let rt = RuntimeHandle::new(RuntimeConfig {
         worker_threads: 2,
         schedule_policy: None,
-        name: "mixed-workload".into(),
-    })
+        name: "mixed-workload".into(), ..Default::default() })
     .unwrap();
 
     // 2 "heavy" dataflows: receive multiple rounds of data
@@ -201,8 +198,7 @@ fn shutdown_cancels_all_running_dataflows() {
     let rt = RuntimeHandle::new(RuntimeConfig {
         worker_threads: 2,
         schedule_policy: None,
-        name: "shutdown-test".into(),
-    })
+        name: "shutdown-test".into(), ..Default::default() })
     .unwrap();
 
     let mut spawned = Vec::new();
@@ -247,8 +243,7 @@ fn individual_cancel_preserves_siblings() {
     let rt = RuntimeHandle::new(RuntimeConfig {
         worker_threads: 2,
         schedule_policy: None,
-        name: "individual-cancel".into(),
-    })
+        name: "individual-cancel".into(), ..Default::default() })
     .unwrap();
 
     // Spawn 3 dataflows with input ports
@@ -309,8 +304,7 @@ fn stress_spawn_twenty_dataflows() {
     let rt = RuntimeHandle::new(RuntimeConfig {
         worker_threads: 4,
         schedule_policy: None,
-        name: "stress-20".into(),
-    })
+        name: "stress-20".into(), ..Default::default() })
     .unwrap();
 
     let mut completions = Vec::new();
@@ -344,8 +338,7 @@ fn concurrent_input_from_multiple_threads() {
     let rt = RuntimeHandle::new(RuntimeConfig {
         worker_threads: 2,
         schedule_policy: None,
-        name: "concurrent-input".into(),
-    })
+        name: "concurrent-input".into(), ..Default::default() })
     .unwrap();
 
     let builder = DataflowBuilder::<u64>::new("multi-sender");
@@ -414,8 +407,7 @@ fn operator_panic_propagates_error() {
     let rt = RuntimeHandle::new(RuntimeConfig {
         worker_threads: 2,
         schedule_policy: None,
-        name: "panic-test".into(),
-    })
+        name: "panic-test".into(), ..Default::default() })
     .unwrap();
 
     // Spawn a "good" dataflow alongside the failing one
@@ -464,8 +456,7 @@ fn drop_runtime_cancels_active_dataflows() {
         let rt = RuntimeHandle::new(RuntimeConfig {
             worker_threads: 2,
             schedule_policy: None,
-            name: "drop-cancel".into(),
-        })
+            name: "drop-cancel".into(), ..Default::default() })
         .unwrap();
 
         let builder = DataflowBuilder::<u64>::new("blocked");

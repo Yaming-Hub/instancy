@@ -123,8 +123,7 @@ fn priority_policy_schedules_high_priority_first() {
     let rt = RuntimeHandle::new(RuntimeConfig {
         worker_threads: 1,
         schedule_policy: Some(Box::new(PriorityPolicy)),
-        name: "priority-policy-test".into(),
-    })
+        name: "priority-policy-test".into(), ..Default::default() })
     .unwrap();
 
     let sequence = Arc::new(AtomicU64::new(0));
@@ -185,8 +184,7 @@ fn fifo_policy_is_fair_regardless_of_priority() {
     let rt = RuntimeHandle::new(RuntimeConfig {
         worker_threads: 1,
         schedule_policy: None,
-        name: "fifo-policy-test".into(),
-    })
+        name: "fifo-policy-test".into(), ..Default::default() })
     .unwrap();
 
     let sequence = Arc::new(AtomicU64::new(0));
@@ -245,8 +243,7 @@ fn aging_prevents_starvation() {
     let rt = RuntimeHandle::new(RuntimeConfig {
         worker_threads: 1,
         schedule_policy: Some(Box::new(PriorityWithAgingPolicy { aging_rate: 10.0 })),
-        name: "aging-policy-test".into(),
-    })
+        name: "aging-policy-test".into(), ..Default::default() })
     .unwrap();
 
     let sequence = Arc::new(AtomicU64::new(0));
