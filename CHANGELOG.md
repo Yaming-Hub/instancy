@@ -5,6 +5,24 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+
+#### Communication
+- `sequencing` module — message sequencing primitives for shared connection mode
+  - `SequenceCounter` — thread-safe monotonic sequence ID generator per logical stream
+  - `ReorderBuffer<T>` — delivers frames in sequence order with gap detection and timeout
+  - `SequencedFrame` — frame with attached sequence ID for wire protocol extension
+  - `encode_sequenced_header` / `decode_sequenced_header` — 36-byte wire format (28 base + 8 seq_id)
+- `shared_pool` module — adaptive connection pool for shared connection mode
+  - `SharedConnectionConfig` — configuration (min/max connections, RTT thresholds, cooldown, probe interval)
+  - `ConnectionMode` enum — `Dedicated` (default) vs `Shared(SharedConnectionConfig)`
+  - `RttTracker` — exponential moving average RTT measurement per connection
+  - `ConnectionMetrics` — per-connection load tracking (pending writes, RTT, bytes/frames written)
+  - `PeerPool` — per-peer pool with least-loaded selection and adaptive scaling decisions
+  - `ScalingDecision` enum — `None` / `ScaleUp` / `ScaleDown { connection_id }`
+
 ## [0.2.0] - 2026-05-05
 
 ### Added
