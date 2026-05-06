@@ -9,18 +9,45 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+#### Scheduler Priority & Optimization
+- Configurable task scheduling policies via `RuntimeConfig::schedule_policy` (#132, #133, #134)
+  - `PriorityPolicy` — schedule higher-priority dataflows first
+  - `PriorityWithAgingPolicy` — priority with wait-time bonus to prevent starvation
+  - `None` (default) — pure FIFO with O(1) dequeue, zero comparison overhead
+  - All policies use `BinaryHeap` for O(log n) insert/dequeue
+
+#### Documentation & Guides
+- `COOKBOOK.md` with practical patterns: windowed aggregation, fan-out/fan-in, error recovery (#129)
+- `GUIDE.md` troubleshooting section for common issues (#129)
+- Comprehensive progress tracking module documentation (#126)
+
 #### Reliability & Observability
 - `DataflowBuilder::catch_panics(true)` converts operator panics into `Error::OperatorPanic` instead of unwinding the runtime (#117)
 - Async probe notifications via `ProbeNotifier`, allowing `ProbeHandle` waiters to wake promptly on frontier changes (#118)
 - `take()` and `take_while()` operators for bounded and predicate-driven stream truncation (#119)
 - Per-operator metrics via `DataflowMetrics`, `OperatorMetrics`, and `BackpressureMetrics`; spawned dataflows can access the live metrics via `SpawnedDataflow::metrics()` (#120, #125)
 
+#### CI/CD
+- GitHub Actions workflow for automated testing on push and PR (#130)
+
 #### Examples
 - Added `cluster_basic` and `cluster_exchange` examples for distributed execution (#123)
 - Added `error_handling` example covering `map_ok`, `filter_ok`, and `branch_result` (#124)
 - Added `metrics_collection` example showing runtime metrics collection and reporting (#125)
 
+#### Testing
+- Scheduler policy integration tests: priority ordering, FIFO fairness, aging, multi-dataflow (#132)
+- Progress tracking integration tests: frontier advancement, notifications, iteration (#128)
+- Edge case integration tests: empty streams, large batches, deep pipelines, concat (#137)
+
+### Fixed
+- Control broadcast and cancellation wiring for cluster-local workers (#131)
+- Compilation regression in tests/examples from schedule_policy API change (#136)
+
 ### Changed
+
+#### Scheduler Configuration (#133)
+- **BREAKING:** `RuntimeConfig::schedule_policy` changed from `Box<dyn SchedulePolicy>` to `Option<Box<dyn SchedulePolicy>>` — `None` is the new default (FIFO)
 
 #### Runtime API Simplification (#121)
 - **BREAKING:** `RuntimeHandle::spawn()` now takes `SpawnOptions` parameter
@@ -36,7 +63,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **BREAKING:** Removed `RuntimeHandle::spawn_multi_async()` — use `spawn_multi(..., SpawnOptions::new().io_mode(IoMode::Async))`
 
 ### Internal
-- Clippy cleanup and internal refactors (#122)
+- Resolved all clippy warnings (74 → 0) (#135)
+- Removed unused capacity parameter from `ChannelBlueprint::build` (#127)
+- Optimized scheduler queue: BinaryHeap for policy-driven scheduling (#133, #134)
 
 ### Features
 
