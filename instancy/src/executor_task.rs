@@ -42,8 +42,6 @@ use crate::dataflow::DataflowId;
 use crate::error::Result;
 use crate::runtime::CompletionNotifier;
 use crate::scheduler::policy::{SchedulePolicy, TaskMeta};
-#[cfg(test)]
-use crate::scheduler::policy::FifoPolicy;
 
 /// Task states for the executor state machine.
 ///
@@ -378,18 +376,21 @@ impl Wake for PoolWaker {
 
 /// Owns all active ExecutorTasks and their ready queue.
 ///
-/// The ready queue is a simple `Mutex<VecDeque>` rather than a lock-free structure
-/// because contention is low (tasks are coarse-grained) and the critical section
-/// is tiny (push/pop an Arc).
+/// The ready queue uses one of two strategies:
+///
+/// - **No policy (`None`)** — plain `VecDeque::pop_front()`, O(1), zero comparisons.
+///   This is the default and should be used unless priority ordering is needed.
+/// - **With policy (`Some`)** — `BinaryHeap` backed by the policy's `compare`,
+///   giving O(log n) insert and O(log n) dequeue.
 ///
 /// The registry uses the pool's existing condvar for unified wake/park — when a
 /// task becomes ready, it notifies the condvar so a parked worker thread wakes up.
 pub struct ExecutorRegistry {
-    /// Ready queue of tasks waiting to be polled.
-    ready_queue: Mutex<std::collections::VecDeque<Arc<ExecutorTask>>>,
+    /// Strategy-specific queue storage.
+    ready_queue: Mutex<ReadyQueue>,
 
-    /// Scheduling policy applied when selecting the next queued task.
-    schedule_policy: Arc<dyn SchedulePolicy>,
+    /// Scheduling policy. `None` means pure FIFO (no comparisons).
+    schedule_policy: Option<Arc<dyn SchedulePolicy>>,
 
     /// Reference to the pool's condvar for waking parked worker threads.
     /// Set during initialization; None only in tests that don't use a pool.
@@ -399,15 +400,83 @@ pub struct ExecutorRegistry {
     next_id: AtomicUsize,
 }
 
+/// Internal queue — either a plain FIFO or a policy-ordered heap.
+enum ReadyQueue {
+    Fifo(std::collections::VecDeque<Arc<ExecutorTask>>),
+    Ordered(std::collections::BinaryHeap<PolicyEntry>),
+}
+
+impl ReadyQueue {
+    fn is_empty(&self) -> bool {
+        match self {
+            ReadyQueue::Fifo(d) => d.is_empty(),
+            ReadyQueue::Ordered(h) => h.is_empty(),
+        }
+    }
+
+    fn len(&self) -> usize {
+        match self {
+            ReadyQueue::Fifo(d) => d.len(),
+            ReadyQueue::Ordered(h) => h.len(),
+        }
+    }
+}
+
+/// Wrapper for BinaryHeap that carries the policy reference for ordering.
+struct PolicyEntry {
+    task: Arc<ExecutorTask>,
+    policy: Arc<dyn SchedulePolicy>,
+}
+
+impl PartialEq for PolicyEntry {
+    fn eq(&self, other: &Self) -> bool {
+        self.cmp(other) == CmpOrdering::Equal
+    }
+}
+
+impl Eq for PolicyEntry {}
+
+impl PartialOrd for PolicyEntry {
+    fn partial_cmp(&self, other: &Self) -> Option<CmpOrdering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for PolicyEntry {
+    fn cmp(&self, other: &Self) -> CmpOrdering {
+        let meta_a = self.task.task_meta();
+        let meta_b = other.task.task_meta();
+        match (meta_a, meta_b) {
+            (Some(a), Some(b)) => {
+                // BinaryHeap is a max-heap: pops the *greatest* element first.
+                // Policy returns Less when `a` should run before `b`.
+                // Reverse so the heap pops the "best" task first.
+                self.policy.compare(&a, &b).reverse()
+            }
+            (Some(_), None) => CmpOrdering::Greater,
+            (None, Some(_)) => CmpOrdering::Less,
+            (None, None) => CmpOrdering::Equal,
+        }
+    }
+}
+
 impl ExecutorRegistry {
     /// Create a new registry that will notify the given condvar when tasks
     /// become ready. Pass the pool's `park_condvar` here.
+    ///
+    /// If `schedule_policy` is `None`, a plain FIFO queue is used (O(1) dequeue,
+    /// no comparisons). If `Some`, tasks are ordered by the policy via a binary
+    /// heap (O(log n) insert and dequeue).
     pub fn new(
         pool_condvar: Arc<std::sync::Condvar>,
-        schedule_policy: Arc<dyn SchedulePolicy>,
+        schedule_policy: Option<Arc<dyn SchedulePolicy>>,
     ) -> Self {
+        let ready_queue = match &schedule_policy {
+            None => ReadyQueue::Fifo(std::collections::VecDeque::new()),
+            Some(_) => ReadyQueue::Ordered(std::collections::BinaryHeap::new()),
+        };
         Self {
-            ready_queue: Mutex::new(std::collections::VecDeque::new()),
+            ready_queue: Mutex::new(ready_queue),
             schedule_policy,
             pool_condvar: Some(pool_condvar),
             next_id: AtomicUsize::new(0),
@@ -418,8 +487,8 @@ impl ExecutorRegistry {
     #[cfg(test)]
     pub fn new_standalone() -> Self {
         Self {
-            ready_queue: Mutex::new(std::collections::VecDeque::new()),
-            schedule_policy: Arc::new(FifoPolicy),
+            ready_queue: Mutex::new(ReadyQueue::Fifo(std::collections::VecDeque::new())),
+            schedule_policy: None,
             pool_condvar: None,
             next_id: AtomicUsize::new(0),
         }
@@ -455,10 +524,14 @@ impl ExecutorRegistry {
         task.mark_enqueued();
         {
             match self.ready_queue.lock() {
-                Ok(mut queue) => queue.push_back(task),
+                Ok(mut queue) => match &mut *queue {
+                    ReadyQueue::Fifo(deque) => deque.push_back(task),
+                    ReadyQueue::Ordered(heap) => {
+                        let policy = self.schedule_policy.as_ref().unwrap().clone();
+                        heap.push(PolicyEntry { task, policy });
+                    }
+                },
                 Err(_poisoned) => {
-                    // Queue mutex poisoned — cannot schedule. The task's
-                    // CompletionNotifier will fire an error when dropped.
                     return;
                 }
             }
@@ -473,27 +546,10 @@ impl ExecutorRegistry {
     /// or if the queue mutex is poisoned.
     pub fn dequeue(&self) -> Option<Arc<ExecutorTask>> {
         let mut queue = self.ready_queue.lock().ok()?;
-        let mut best_idx = None;
-        let mut best_meta = None;
-
-        for (idx, task) in queue.iter().enumerate() {
-            let meta = match task.task_meta() {
-                Some(m) => m,
-                None => continue, // Skip tasks with poisoned metadata
-            };
-            let should_replace = match &best_meta {
-                None => true,
-                Some(current_best) => {
-                    self.schedule_policy.compare(&meta, current_best) == CmpOrdering::Less
-                }
-            };
-            if should_replace {
-                best_idx = Some(idx);
-                best_meta = Some(meta);
-            }
+        match &mut *queue {
+            ReadyQueue::Fifo(deque) => deque.pop_front(),
+            ReadyQueue::Ordered(heap) => heap.pop().map(|entry| entry.task),
         }
-
-        queue.remove(best_idx?)
     }
 
     /// Check if the ready queue is empty.
@@ -698,6 +754,35 @@ mod tests {
         let dequeued = registry.dequeue().unwrap();
         assert_eq!(dequeued.id, task.id);
         assert!(registry.is_empty());
+    }
+
+    #[test]
+    fn registry_priority_dequeue_order() {
+        use crate::scheduler::policy::PriorityPolicy;
+
+        let condvar = Arc::new(std::sync::Condvar::new());
+        let registry = Arc::new(ExecutorRegistry::new(
+            condvar,
+            Some(Arc::new(PriorityPolicy)),
+        ));
+
+        let (_, n1) = make_notifier();
+        let (_, n2) = make_notifier();
+        let (_, n3) = make_notifier();
+
+        let low = registry.register(Box::pin(PendingForever), n1, DataflowId::new(), 1);
+        let mid = registry.register(Box::pin(PendingForever), n2, DataflowId::new(), 50);
+        let high = registry.register(Box::pin(PendingForever), n3, DataflowId::new(), 100);
+
+        // Dequeue should return highest priority first
+        let first = registry.dequeue().unwrap();
+        let second = registry.dequeue().unwrap();
+        let third = registry.dequeue().unwrap();
+
+        assert_eq!(first.id, high.id, "highest priority should dequeue first");
+        assert_eq!(second.id, mid.id, "mid priority should dequeue second");
+        assert_eq!(third.id, low.id, "lowest priority should dequeue last");
+        assert!(registry.dequeue().is_none());
     }
 
     #[test]

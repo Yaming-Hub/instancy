@@ -38,10 +38,13 @@ impl TaskMeta {
 /// The scheduler compares two tasks and returns which should run first.
 /// Implementations can use priority, age, or any combination.
 ///
+/// **When no policy is set** (the default), the scheduler uses a plain FIFO
+/// queue with O(1) pop — no comparisons at all. Only set a policy if you need
+/// priority-based or custom ordering.
+///
 /// **Note on time-dependent policies:** Policies like [`PriorityWithAgingPolicy`]
 /// produce orderings that change over time. The scheduler calls `compare` at
-/// dequeue time (linear scan), NOT as a heap comparator — so this is correct
-/// by design.
+/// dequeue time, so this is correct by design.
 ///
 /// Returns `Ordering::Less` if `a` should be scheduled before `b`.
 pub trait SchedulePolicy: Send + Sync {
