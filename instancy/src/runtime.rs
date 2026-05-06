@@ -32,6 +32,7 @@ use crate::dataflow::control::{ControlBroadcast, ControlReceiver, ControlSender}
 use crate::dataflow::dataflow_builder::{DataflowBuilder, LogicalDataflow};
 use crate::dataflow::executor::{DataflowExecutor, ExecutorConfig};
 use crate::dataflow::graph::OperatorInfo;
+use crate::dataflow::DataflowId;
 use crate::error::{Error, Result};
 use crate::progress::progress_channel::{WorkerProgressChannels, create_progress_channels};
 use crate::progress::timestamp::Timestamp;
@@ -103,6 +104,8 @@ pub struct SpawnOptions {
     pub io_mode: IoMode,
     /// Whether to collect per-operator metrics. Default: `false`.
     pub collect_metrics: bool,
+    /// Scheduling priority for this dataflow (higher = scheduled sooner).
+    pub priority: u32,
 }
 
 impl SpawnOptions {
@@ -125,6 +128,12 @@ impl SpawnOptions {
         self.collect_metrics = enable;
         self
     }
+
+    /// Set the scheduling priority for this dataflow.
+    pub fn priority(mut self, priority: u32) -> Self {
+        self.priority = priority;
+        self
+    }
 }
 
 impl Default for SpawnOptions {
@@ -132,6 +141,7 @@ impl Default for SpawnOptions {
         Self {
             io_mode: IoMode::Sync,
             collect_metrics: false,
+            priority: 0,
         }
     }
 }
@@ -360,7 +370,7 @@ pub struct RuntimeHandle {
     /// The worker thread pool for this runtime.
     worker_pool: WorkerPool,
     /// Scheduling policy for task ordering.
-    _schedule_policy: Box<dyn SchedulePolicy>,
+    _schedule_policy: Arc<dyn SchedulePolicy>,
     /// Cancellation token for graceful shutdown of all dataflows in this runtime.
     cancel: CancellationToken,
     /// Runtime name for diagnostics.
@@ -390,10 +400,11 @@ impl RuntimeHandle {
         };
         let worker_pool =
             WorkerPool::new(pool_config).map_err(|e| crate::error::Error::Custom(e.to_string()))?;
-        let registry = worker_pool.create_registry();
+        let schedule_policy: Arc<dyn SchedulePolicy> = Arc::from(config.schedule_policy);
+        let registry = worker_pool.create_registry(Arc::clone(&schedule_policy));
         Ok(Self {
             worker_pool,
-            _schedule_policy: config.schedule_policy,
+            _schedule_policy: schedule_policy,
             cancel: CancellationToken::new(),
             name: config.name,
             registry,
@@ -532,6 +543,7 @@ impl RuntimeHandle {
         self.spawn_internal(
             dataflow,
             options.io_mode.into(),
+            options.priority,
             WorkerContext::single(),
             None,
             None,
@@ -659,7 +671,14 @@ impl RuntimeHandle {
         T: Timestamp,
         F: Fn(usize, &mut DataflowBuilder<T>) -> Result<()>,
     {
-        self.spawn_multi_internal(name, num_workers, build, options.io_mode.into(), options.collect_metrics)
+        self.spawn_multi_internal(
+            name,
+            num_workers,
+            build,
+            options.io_mode.into(),
+            options.collect_metrics,
+            options.priority,
+        )
     }
 
     // -- Private sync implementations --
@@ -668,10 +687,12 @@ impl RuntimeHandle {
         &self,
         dataflow: LogicalDataflow<T>,
         mode: ChannelMode,
+        priority: u32,
         worker_context: WorkerContext,
         progress_channels: Option<WorkerProgressChannels<T>>,
         pre_created_wake_handle: Option<WakeHandle>,
     ) -> Result<SpawnedDataflow<T>> {
+        let dataflow_id = DataflowId::new();
         let (spawned, executor, notifier) = self.prepare_worker(
             dataflow,
             mode,
@@ -681,7 +702,8 @@ impl RuntimeHandle {
             None,
             None,
         )?;
-        self.registry.register(executor, notifier);
+        self.registry
+            .register(executor, notifier, dataflow_id, priority);
         Ok(spawned)
     }
 
@@ -841,6 +863,7 @@ impl RuntimeHandle {
         build: F,
         mode: ChannelMode,
         collect_metrics: bool,
+        priority: u32,
     ) -> Result<MultiSpawnedDataflow<T>>
     where
         T: Timestamp,
@@ -946,6 +969,7 @@ impl RuntimeHandle {
         // are materialized, we guarantee every worker's progress channels
         // contain the full set of initial capability broadcasts from all
         // peers before any worker starts executing.
+        let dataflow_id = DataflowId::new();
         let mut prepared = Vec::with_capacity(num_workers);
         let mut spawned_count = 0usize;
 
@@ -999,7 +1023,8 @@ impl RuntimeHandle {
         // channels contain the complete initial state from all peers.
         let mut workers = Vec::with_capacity(num_workers);
         for (spawned, executor, notifier) in prepared {
-            self.registry.register(executor, notifier);
+            self.registry
+                .register(executor, notifier, dataflow_id, priority);
             workers.push(spawned);
         }
 
@@ -1378,6 +1403,7 @@ impl RuntimeHandle {
 
         // Phase 7: Materialize all local workers (without registering).
         let mode = ChannelMode::Sync;
+        let dataflow_priority = 0;
         let mut prepared = Vec::with_capacity(num_local);
         let mut progress_channels_iter = progress_channels.into_iter();
 
@@ -1425,7 +1451,8 @@ impl RuntimeHandle {
         // Phase 9: Register all workers for execution.
         let mut workers = Vec::with_capacity(num_local);
         for (spawned, executor, notifier) in prepared {
-            self.registry.register(executor, notifier);
+            self.registry
+                .register(executor, notifier, dataflow_id, dataflow_priority);
             workers.push(spawned);
         }
 

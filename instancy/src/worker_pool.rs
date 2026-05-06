@@ -20,6 +20,7 @@ use std::time::{Duration, Instant};
 use crossbeam_deque::{Injector, Steal};
 
 use crate::executor_task::{ExecutorRegistry, PoolWaker};
+use crate::scheduler::policy::SchedulePolicy;
 use crate::worker::OperatorActivation;
 
 /// Configuration for the worker thread pool.
@@ -217,7 +218,7 @@ impl WorkerPool {
     /// ready queue alongside one-shot tasks from the injector.
     ///
     /// Panics if a registry is already set (call only once per pool).
-    pub fn create_registry(&self) -> Arc<ExecutorRegistry> {
+    pub fn create_registry(&self, schedule_policy: Arc<dyn SchedulePolicy>) -> Arc<ExecutorRegistry> {
         let mut guard = self
             .state
             .executor_registry
@@ -228,7 +229,10 @@ impl WorkerPool {
             "ExecutorRegistry already set for this pool"
         );
         // Share the pool's condvar so executor wakeups unpark worker threads.
-        let registry = Arc::new(ExecutorRegistry::new(Arc::clone(&self.state.park_condvar)));
+        let registry = Arc::new(ExecutorRegistry::new(
+            Arc::clone(&self.state.park_condvar),
+            schedule_policy,
+        ));
         *guard = Some(Arc::clone(&registry));
         registry
     }
@@ -743,10 +747,15 @@ mod tests {
             yield_limit: 10,
         };
         let pool = WorkerPool::new(config).unwrap();
-        let registry = pool.create_registry();
+        let registry = pool.create_registry(Arc::new(crate::scheduler::policy::FifoPolicy));
 
         let (completion, notifier) = DataflowCompletion::new();
-        registry.register(Box::pin(CompletesOnFirstPoll), notifier);
+        registry.register(
+            Box::pin(CompletesOnFirstPoll),
+            notifier,
+            crate::dataflow::DataflowId::new(),
+            0,
+        );
 
         // Wait for completion
         let result = completion.wait();
@@ -787,13 +796,23 @@ mod tests {
             yield_limit: 10,
         };
         let pool = WorkerPool::new(config).unwrap();
-        let registry = pool.create_registry();
+        let registry = pool.create_registry(Arc::new(crate::scheduler::policy::FifoPolicy));
 
         let (comp1, notifier1) = DataflowCompletion::new();
         let (comp2, notifier2) = DataflowCompletion::new();
 
-        registry.register(Box::pin(CountdownFuture { remaining: 5 }), notifier1);
-        registry.register(Box::pin(CountdownFuture { remaining: 5 }), notifier2);
+        registry.register(
+            Box::pin(CountdownFuture { remaining: 5 }),
+            notifier1,
+            crate::dataflow::DataflowId::new(),
+            0,
+        );
+        registry.register(
+            Box::pin(CountdownFuture { remaining: 5 }),
+            notifier2,
+            crate::dataflow::DataflowId::new(),
+            0,
+        );
 
         // Both should complete
         assert!(comp1.wait().is_ok());
