@@ -218,7 +218,7 @@ impl WorkerPool {
     /// ready queue alongside one-shot tasks from the injector.
     ///
     /// Panics if a registry is already set (call only once per pool).
-    pub fn create_registry(&self, schedule_policy: Arc<dyn SchedulePolicy>) -> Arc<ExecutorRegistry> {
+    pub fn create_registry(&self, schedule_policy: Option<Arc<dyn SchedulePolicy>>) -> Arc<ExecutorRegistry> {
         let mut guard = self
             .state
             .executor_registry
@@ -747,7 +747,7 @@ mod tests {
             yield_limit: 10,
         };
         let pool = WorkerPool::new(config).unwrap();
-        let registry = pool.create_registry(Arc::new(crate::scheduler::policy::FifoPolicy));
+        let registry = pool.create_registry(None);
 
         let (completion, notifier) = DataflowCompletion::new();
         registry.register(
@@ -796,7 +796,7 @@ mod tests {
             yield_limit: 10,
         };
         let pool = WorkerPool::new(config).unwrap();
-        let registry = pool.create_registry(Arc::new(crate::scheduler::policy::FifoPolicy));
+        let registry = pool.create_registry(None);
 
         let (comp1, notifier1) = DataflowCompletion::new();
         let (comp2, notifier2) = DataflowCompletion::new();

@@ -36,7 +36,7 @@ use crate::dataflow::DataflowId;
 use crate::error::{Error, Result};
 use crate::progress::progress_channel::{WorkerProgressChannels, create_progress_channels};
 use crate::progress::timestamp::Timestamp;
-use crate::scheduler::policy::{PriorityWithAgingPolicy, SchedulePolicy};
+use crate::scheduler::policy::SchedulePolicy;
 use crate::worker::WorkerContext;
 use crate::worker_pool::{WorkerPool, WorkerPoolConfig};
 
@@ -47,8 +47,11 @@ use crate::worker_pool::{WorkerPool, WorkerPoolConfig};
 pub struct RuntimeConfig {
     /// Number of worker threads in the pool.
     pub worker_threads: usize,
-    /// Scheduling policy for the task queue. Default: PriorityWithAgingPolicy.
-    pub schedule_policy: Box<dyn SchedulePolicy>,
+    /// Scheduling policy for the task queue.
+    ///
+    /// - `None` (default) — pure FIFO queue, O(1) dequeue, no comparisons.
+    /// - `Some(policy)` — ordered by the policy via a binary heap, O(log n) dequeue.
+    pub schedule_policy: Option<Box<dyn SchedulePolicy>>,
     /// Name for this runtime (used in thread names and diagnostics).
     pub name: String,
 }
@@ -67,7 +70,7 @@ impl Default for RuntimeConfig {
     fn default() -> Self {
         Self {
             worker_threads: num_cpus(),
-            schedule_policy: Box::new(PriorityWithAgingPolicy::default()),
+            schedule_policy: None,
             name: "instancy".to_string(),
         }
     }
@@ -369,8 +372,8 @@ impl PeerRegistry {
 pub struct RuntimeHandle {
     /// The worker thread pool for this runtime.
     worker_pool: WorkerPool,
-    /// Scheduling policy for task ordering.
-    _schedule_policy: Arc<dyn SchedulePolicy>,
+    /// Scheduling policy for task ordering (None = FIFO).
+    _schedule_policy: Option<Arc<dyn SchedulePolicy>>,
     /// Cancellation token for graceful shutdown of all dataflows in this runtime.
     cancel: CancellationToken,
     /// Runtime name for diagnostics.
@@ -400,8 +403,9 @@ impl RuntimeHandle {
         };
         let worker_pool =
             WorkerPool::new(pool_config).map_err(|e| crate::error::Error::Custom(e.to_string()))?;
-        let schedule_policy: Arc<dyn SchedulePolicy> = Arc::from(config.schedule_policy);
-        let registry = worker_pool.create_registry(Arc::clone(&schedule_policy));
+        let schedule_policy: Option<Arc<dyn SchedulePolicy>> =
+            config.schedule_policy.map(|p| Arc::from(p) as Arc<dyn SchedulePolicy>);
+        let registry = worker_pool.create_registry(schedule_policy.clone());
         Ok(Self {
             worker_pool,
             _schedule_policy: schedule_policy,
@@ -3104,7 +3108,6 @@ fn num_cpus() -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::scheduler::policy::FifoPolicy;
 
     #[test]
     fn create_default_runtime() {
@@ -3117,7 +3120,7 @@ mod tests {
     fn custom_runtime_config() {
         let config = RuntimeConfig {
             worker_threads: 2,
-            schedule_policy: Box::new(FifoPolicy),
+            schedule_policy: None,
             name: "test-runtime".to_string(),
         };
         let rt = RuntimeHandle::new(config).unwrap();
@@ -3129,7 +3132,7 @@ mod tests {
     fn shutdown_cancels_token() {
         let rt = RuntimeHandle::new(RuntimeConfig {
             worker_threads: 1,
-            schedule_policy: Box::new(FifoPolicy),
+            schedule_policy: None,
             name: "shutdown-test".to_string(),
         })
         .unwrap();
@@ -3143,13 +3146,13 @@ mod tests {
     fn multiple_isolated_runtimes() {
         let rt1 = RuntimeHandle::new(RuntimeConfig {
             worker_threads: 1,
-            schedule_policy: Box::new(FifoPolicy),
+            schedule_policy: None,
             name: "rt1".to_string(),
         })
         .unwrap();
         let rt2 = RuntimeHandle::new(RuntimeConfig {
             worker_threads: 1,
-            schedule_policy: Box::new(FifoPolicy),
+            schedule_policy: None,
             name: "rt2".to_string(),
         })
         .unwrap();
@@ -5392,7 +5395,7 @@ mod tests {
         // Should succeed because parallelism matches num_workers.
         let rt = RuntimeHandle::new(RuntimeConfig {
             worker_threads: 2,
-            schedule_policy: Box::new(FifoPolicy),
+            schedule_policy: None,
             name: "par-match".to_string(),
         })
         .unwrap();
@@ -5419,7 +5422,7 @@ mod tests {
         // Should fail because parallelism (4) != num_workers (2).
         let rt = RuntimeHandle::new(RuntimeConfig {
             worker_threads: 2,
-            schedule_policy: Box::new(FifoPolicy),
+            schedule_policy: None,
             name: "par-mismatch".to_string(),
         })
         .unwrap();
@@ -5451,7 +5454,7 @@ mod tests {
         // Even with 1 worker, explicit parallelism > 1 should be rejected.
         let rt = RuntimeHandle::new(RuntimeConfig {
             worker_threads: 1,
-            schedule_policy: Box::new(FifoPolicy),
+            schedule_policy: None,
             name: "par-single".to_string(),
         })
         .unwrap();
