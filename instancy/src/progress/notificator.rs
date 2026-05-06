@@ -113,6 +113,7 @@ impl<T: Timestamp> Notificator<T> {
     }
 
     /// Returns the next ready notification, or `None` if no notifications have fired.
+    #[allow(clippy::should_implement_trait)]
     pub fn next(&mut self) -> Option<FiredNotification<T>> {
         self.ready.pop_front()
     }

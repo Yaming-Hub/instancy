@@ -344,6 +344,7 @@ impl<T: Timestamp> Builder<T> {
     ///
     /// Finally, scope input → scope output summaries are read from graph node 0's
     /// source-to-output entries.
+    #[allow(clippy::needless_range_loop)]
     fn compute_scope_summary(&self) -> PortConnectivity<T::Summary> {
         let mut summary = PortConnectivity::new(self.scope_inputs, self.scope_outputs);
 

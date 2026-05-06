@@ -1385,7 +1385,7 @@ impl<T: Timestamp, D: Clone + Send + 'static> Pipe<T, D> {
             // Subgraph registration for enter
             state.subgraph_builder.add_operator(
                 enter_idx,
-                &format!("{name}::enter"),
+                format!("{name}::enter"),
                 1,
                 1,
                 PortConnectivity::identity(T::Summary::default()),
@@ -1460,7 +1460,7 @@ impl<T: Timestamp, D: Clone + Send + 'static> Pipe<T, D> {
             // Subgraph registration for feedback
             state.subgraph_builder.add_operator(
                 feedback_idx,
-                &format!("{name}::feedback"),
+                format!("{name}::feedback"),
                 1,
                 1,
                 PortConnectivity::identity(T::Summary::default()),
@@ -1544,7 +1544,7 @@ impl<T: Timestamp, D: Clone + Send + 'static> Pipe<T, D> {
                 .insert(T::Summary::default());
             state.subgraph_builder.add_operator(
                 concat_idx,
-                &format!("{name}::concat"),
+                format!("{name}::concat"),
                 2,
                 1,
                 concat_connectivity,
@@ -1639,7 +1639,7 @@ impl<T: Timestamp, D: Clone + Send + 'static> Pipe<T, D> {
             // Subgraph registration for leave
             state.subgraph_builder.add_operator(
                 leave_idx,
-                &format!("{name}::leave"),
+                format!("{name}::leave"),
                 1,
                 1,
                 PortConnectivity::identity(T::Summary::default()),
@@ -2364,7 +2364,7 @@ impl<
         key_fn: impl Fn(&D) -> K + Send + Sync + 'static,
     ) -> Pipe<T, D> {
         let capacity = self.resolve_capacity();
-        let exchange_fn = crate::dataflow::channels::pact::ExchangeFn::by_key(&name.into(), key_fn);
+        let exchange_fn = crate::dataflow::channels::pact::ExchangeFn::by_key(name.into(), key_fn);
         self.add_exchange_internal_networked(exchange_fn, capacity)
     }
 
@@ -2384,7 +2384,7 @@ impl<
     ) -> Pipe<T, D> {
         assert!(target_parallelism > 0, "target_parallelism must be > 0");
         let capacity = self.resolve_capacity();
-        let exchange_fn = crate::dataflow::channels::pact::ExchangeFn::by_key(&name.into(), key_fn);
+        let exchange_fn = crate::dataflow::channels::pact::ExchangeFn::by_key(name.into(), key_fn);
         let pipe = self.add_exchange_internal_networked(exchange_fn, capacity);
         // Record target parallelism on the exchange operator we just created.
         let exchange_op_idx = pipe.op_idx;

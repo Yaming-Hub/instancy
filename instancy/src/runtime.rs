@@ -721,6 +721,7 @@ impl RuntimeHandle {
     /// broadcasts initial capabilities to peer workers' channels. If workers
     /// were registered (and thus polled) immediately, a fast worker could see
     /// incomplete global state before slower workers have initialized.
+    #[allow(clippy::too_many_arguments)]
     fn prepare_worker<T: Timestamp>(
         &self,
         mut dataflow: LogicalDataflow<T>,
@@ -1080,6 +1081,7 @@ impl RuntimeHandle {
     /// - Graph fingerprint mismatch with any peer
     /// - Handshake or ready barrier timeout
     #[cfg(feature = "transport")]
+    #[allow(clippy::too_many_arguments)]
     pub fn spawn_cluster<T, F, R, W>(
         &self,
         name: &str,

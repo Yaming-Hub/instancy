@@ -205,6 +205,7 @@ impl FusedStageTask {
     /// or the budget is exhausted. This matches the existing fused activation behavior.
     ///
     /// Returns `(any_progress, productive_activations)`.
+    #[allow(clippy::too_many_arguments)]
     fn activate(
         &self,
         operators: &mut [Box<dyn SchedulableOperator>],
@@ -627,7 +628,7 @@ impl<T: Timestamp> DataflowExecutor<T> {
         // Create per-operator notificators with initial frontiers.
         let mut notificators: Vec<Option<Notificator<T>>> =
             Vec::with_capacity(self.operators.len());
-        for (_pos, op) in self.operators.iter().enumerate() {
+        for op in self.operators.iter() {
             let op_idx = op.index();
             let frontier = tracker.operator_input_frontier_meet(op_idx);
             notificators.push(Some(Notificator::new(frontier)));
@@ -817,10 +818,8 @@ impl<T: Timestamp> DataflowExecutor<T> {
     /// After operators produce/consume data, capabilities change. This method:
     /// 1. Collects capability changes from all operators' ProgressReporters.
     /// 2. Runs the reachability tracker to compute new frontiers.
-    /// 3. Delivers frontier updates to both:
-    ///    a. The executor's per-operator notificators (legacy path for regular operators).
-    ///    b. The operators themselves via `update_input_frontier()` (for notify-capable
-    ///       operators like WiredUnaryNotifyOperator that manage their own notificator).
+    /// 3. Delivers frontier updates to the executor's per-operator notificators
+    ///    and to notify-capable operators via `update_input_frontier()`.
     /// 4. Re-enqueues operators that have ready notifications.
     ///
     /// Returns true if any operator was newly activated.

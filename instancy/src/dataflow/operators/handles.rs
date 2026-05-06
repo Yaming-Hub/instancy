@@ -60,6 +60,7 @@ impl<T: Timestamp, D> InputHandle<T, D> {
     ///
     /// Returns `Some((time, data))` if a batch is available,
     /// `None` if no data is currently pending.
+    #[allow(clippy::should_implement_trait)]
     pub fn next(&mut self) -> Option<(T, Vec<D>)> {
         self.pending.pop_front()
     }
@@ -263,6 +264,7 @@ impl<T: Timestamp> NotificationHandle<T> {
     }
 
     /// Get the next pending notification.
+    #[allow(clippy::should_implement_trait)]
     pub fn next(&mut self) -> Option<Notification<T>> {
         self.pending.pop_front()
     }

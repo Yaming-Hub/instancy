@@ -80,9 +80,7 @@ impl<T: Timestamp, D: Clone + Send + 'static, M: Clone + Default + Send + 'stati
     /// Returns Ok(()) if pending was drained (or there was nothing pending).
     fn drain_pending(&mut self) -> Result<()> {
         if let Some((envelope, start_idx)) = self.pending.take() {
-            if let Err(e) = self.deliver(envelope, start_idx) {
-                return Err(e);
-            }
+            self.deliver(envelope, start_idx)?
         }
         Ok(())
     }
@@ -101,12 +99,7 @@ impl<T: Timestamp, D: Clone + Send + 'static, M: Clone + Default + Send + 'stati
         // Deliver original (moved) to the last target.
         let last_idx = count - 1;
         if last_idx >= start_idx {
-            if let Err(e) = self.targets[last_idx].push(envelope) {
-                // Last target failed — envelope is consumed (all clones already
-                // delivered to earlier targets). No pending to store since
-                // there are no more targets after this one.
-                return Err(e);
-            }
+            self.targets[last_idx].push(envelope)?
         }
         Ok(())
     }

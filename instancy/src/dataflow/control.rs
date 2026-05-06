@@ -281,6 +281,7 @@ impl ControlBroadcast {
     ///
     /// `wake_handles` must have exactly `num_workers` entries.
     /// `dataflow_cancel` is the shared cancellation token for the dataflow.
+    #[allow(clippy::new_ret_no_self)]
     pub(crate) fn new(
         num_workers: usize,
         wake_handles: &[WakeHandle],

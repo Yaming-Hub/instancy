@@ -44,6 +44,8 @@
 #![cfg_attr(docsrs, feature(doc_cfg))]
 // Prevent regressions: treat broken doc links as errors.
 #![deny(rustdoc::broken_intra_doc_links)]
+// Inherent to the trait-object-heavy dataflow design (Push/Pull/Codec generics).
+#![allow(clippy::type_complexity)]
 
 pub mod cancellation;
 pub mod communication;

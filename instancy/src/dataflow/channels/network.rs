@@ -570,6 +570,7 @@ impl<T: Timestamp + ExchangeData, D: ExchangeData> NetworkEdgeMaterializer<T, D>
     ///   keyed by `peer_node_id → channel_id`. Only data channel receivers
     ///   are consumed here.
     /// - `capacity`: Buffer capacity for local bounded channels.
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         dataflow_id: DataflowId,
         topology: ClusterTopology,

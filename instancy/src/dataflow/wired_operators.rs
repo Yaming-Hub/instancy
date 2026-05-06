@@ -199,11 +199,10 @@ impl<T: Timestamp, D1: Send + 'static, D2: Send + 'static> SchedulableOperator
         }
 
         // Step 1: Try to flush any pending output first.
-        if !self.pending_output.is_empty() {
-            if !self.flush_pending_output()? {
+        if !self.pending_output.is_empty()
+            && !self.flush_pending_output()? {
                 return Ok(ActivationOutcome::BlockedOnBackpressure);
             }
-        }
 
         // Step 2: Pull from input channel.
         self.pull_input();
@@ -672,11 +671,10 @@ impl<T: Timestamp, D1: Send + 'static, D2: Send + 'static, D3: Send + 'static> S
         }
 
         // Step 1: Flush pending output from previous activation.
-        if !self.pending_output.is_empty() {
-            if !self.flush_pending_output()? {
+        if !self.pending_output.is_empty()
+            && !self.flush_pending_output()? {
                 return Ok(ActivationOutcome::BlockedOnBackpressure);
             }
-        }
 
         // Step 2: Pull from both input channels.
         self.pull_input1();
@@ -808,11 +806,10 @@ impl<T: Timestamp, D: Send + 'static> SchedulableOperator for WiredConcatOperato
         }
 
         // Flush pending output.
-        if !self.pending_output.is_empty() {
-            if !self.flush_pending_output()? {
+        if !self.pending_output.is_empty()
+            && !self.flush_pending_output()? {
                 return Ok(ActivationOutcome::BlockedOnBackpressure);
             }
-        }
 
         // Pull from all inputs and forward directly to output.
         let mut made_progress = false;
@@ -836,11 +833,10 @@ impl<T: Timestamp, D: Send + 'static> SchedulableOperator for WiredConcatOperato
         }
 
         // Push to output.
-        if !self.pending_output.is_empty() {
-            if !self.flush_pending_output()? {
+        if !self.pending_output.is_empty()
+            && !self.flush_pending_output()? {
                 return Ok(ActivationOutcome::BlockedOnBackpressure);
             }
-        }
 
         // Check if all inputs are exhausted.
         if self.inputs_exhausted.iter().all(|e| *e) {
@@ -952,11 +948,10 @@ where
             return Ok(ActivationOutcome::Done);
         }
 
-        if !self.pending_output.is_empty() {
-            if !self.flush_pending_output()? {
+        if !self.pending_output.is_empty()
+            && !self.flush_pending_output()? {
                 return Ok(ActivationOutcome::BlockedOnBackpressure);
             }
-        }
 
         let mut made_progress = false;
         loop {
@@ -979,11 +974,10 @@ where
             }
         }
 
-        if !self.pending_output.is_empty() {
-            if !self.flush_pending_output()? {
+        if !self.pending_output.is_empty()
+            && !self.flush_pending_output()? {
                 return Ok(ActivationOutcome::BlockedOnBackpressure);
             }
-        }
 
         if self.input_exhausted && self.pending_output.is_empty() {
             self.output_pusher.close();
@@ -1090,11 +1084,10 @@ where
             return Ok(ActivationOutcome::Done);
         }
 
-        if !self.pending_output.is_empty() {
-            if !self.flush_pending_output()? {
+        if !self.pending_output.is_empty()
+            && !self.flush_pending_output()? {
                 return Ok(ActivationOutcome::BlockedOnBackpressure);
             }
-        }
 
         let mut made_progress = false;
         loop {
@@ -1117,11 +1110,10 @@ where
             }
         }
 
-        if !self.pending_output.is_empty() {
-            if !self.flush_pending_output()? {
+        if !self.pending_output.is_empty()
+            && !self.flush_pending_output()? {
                 return Ok(ActivationOutcome::BlockedOnBackpressure);
             }
-        }
 
         if self.input_exhausted && self.pending_output.is_empty() {
             self.output_pusher.close();
@@ -1235,11 +1227,10 @@ where
             return Ok(ActivationOutcome::Done);
         }
 
-        if !self.pending_output.is_empty() {
-            if !self.flush_pending_output()? {
+        if !self.pending_output.is_empty()
+            && !self.flush_pending_output()? {
                 return Ok(ActivationOutcome::BlockedOnBackpressure);
             }
-        }
 
         let mut made_progress = false;
         loop {
@@ -1266,11 +1257,10 @@ where
             }
         }
 
-        if !self.pending_output.is_empty() {
-            if !self.flush_pending_output()? {
+        if !self.pending_output.is_empty()
+            && !self.flush_pending_output()? {
                 return Ok(ActivationOutcome::BlockedOnBackpressure);
             }
-        }
 
         if self.input_exhausted && self.pending_output.is_empty() {
             self.output_pusher.close();
@@ -1445,6 +1435,7 @@ impl<T: Timestamp, D1: Send + 'static, D2: Send + 'static> WiredUnaryNotifyOpera
     ///   connected input sources. The notificator uses this to determine which
     ///   `notify_at` requests should fire immediately (for times already past
     ///   the frontier).
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         name: impl Into<String>,
         index: usize,
@@ -1548,11 +1539,10 @@ impl<T: Timestamp, D1: Send + 'static, D2: Send + 'static> SchedulableOperator
         }
 
         // Step 1: Flush pending output from previous activation (backpressure retry).
-        if !self.pending_output.is_empty() {
-            if !self.flush_pending_output()? {
+        if !self.pending_output.is_empty()
+            && !self.flush_pending_output()? {
                 return Ok(ActivationOutcome::BlockedOnBackpressure);
             }
-        }
 
         // Step 2: Pull from input channel → feed InputHandle.
         self.pull_input();
