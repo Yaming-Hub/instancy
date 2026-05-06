@@ -10,6 +10,7 @@ pub mod codec;
 pub mod connection;
 pub mod control_protocol;
 pub mod interprocess;
+pub mod probing;
 pub mod progress_exchange;
 pub mod remote_push;
 pub mod sequencing;
@@ -32,6 +33,10 @@ pub use interprocess::{
     decode_data_batch, decode_progress, encode_data_batch, encode_progress,
 };
 pub use progress_exchange::{PeerProgressSender, ProgressExchange, ProgressExchangeConfig};
+pub use probing::{
+    PROBE_MESSAGE_SIZE, PROBE_REPLY_TYPE, PROBE_REQUEST_TYPE, ProbeCounter, ProbeKind,
+    ProbeMessage, ProbeTimestamp, ScalingDriver, ScalingEvent,
+};
 pub use remote_push::{FrameReceiver, FrameSender, OutboundFrame, RemotePush, RemotePushConfig};
 pub use sequencing::{
     BufferOverflow, InsertResult, ReorderBuffer, ReorderError, SequenceCounter, SequencedFrame,
