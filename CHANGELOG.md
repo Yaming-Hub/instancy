@@ -9,6 +9,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+#### Cancellation
+- External cancellation token support via `SpawnOptions::cancellation_token()` — accepts a `tokio_util::sync::CancellationToken` to cancel dataflows from user code (#139)
+- `SpawnedDataflow::cancel_token()` accessor for programmatic cancellation
+- Waker-based `CancellationToken::cancelled_async()` — replaces 10ms polling with instant notification via `tokio::sync::Notify` (#140)
+
 #### Scheduler Priority & Optimization
 - Configurable task scheduling policies via `RuntimeConfig::schedule_policy` (#132, #133, #134)
   - `PriorityPolicy` — schedule higher-priority dataflows first

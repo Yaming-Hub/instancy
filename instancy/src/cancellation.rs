@@ -118,6 +118,11 @@ struct TokenInner {
     /// Only accessed during `register_wake_handle()` (setup) and `cancel()`
     /// (one-shot). The `is_cancelled()` hot path remains lock-free.
     wake_handles: Mutex<Vec<WakeHandle>>,
+    /// Async notification primitive for `cancelled_async()`.
+    ///
+    /// Signalled when this token is directly cancelled. Waiters on
+    /// `cancelled_async()` await this instead of polling.
+    async_notify: tokio::sync::Notify,
 }
 
 /// A cooperative cancellation signal for dataflow shutdown.
@@ -145,6 +150,7 @@ impl CancellationToken {
                 parent: None,
                 reason: Mutex::new(None),
                 wake_handles: Mutex::new(Vec::new()),
+                async_notify: tokio::sync::Notify::new(),
             }),
         }
     }
@@ -165,6 +171,7 @@ impl CancellationToken {
                 parent: Some(Arc::clone(&self.inner)),
                 reason: Mutex::new(None),
                 wake_handles: Mutex::new(Vec::new()),
+                async_notify: tokio::sync::Notify::new(),
             }),
         }
     }
@@ -207,11 +214,14 @@ impl CancellationToken {
         }
         // Now set the flag and notify (only the first swap notifies).
         if !self.inner.cancelled.swap(true, Ordering::AcqRel) {
+            // Wake synchronous executor handles.
             if let Ok(handles) = self.inner.wake_handles.lock() {
                 for handle in handles.iter() {
                     handle.notify();
                 }
             }
+            // Wake async waiters on this token.
+            self.inner.async_notify.notify_waiters();
         }
     }
 
@@ -358,8 +368,34 @@ impl CancellationToken {
 
     /// Returns a future that resolves when this token is cancelled.
     ///
-    /// Polls the cancellation flag with a small interval. Suitable for use
-    /// in `tokio::select!` branches to respond to cancellation in async code.
+    /// Uses efficient waker-based notification — no polling. Suitable for
+    /// use in `tokio::select!` branches to respond to cancellation in async code.
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// tokio::select! {
+    ///     _ = token.cancelled_async() => { /* cancelled */ }
+    ///     result = do_work() => { /* completed */ }
+    /// }
+    /// ```
+    /// Returns a future that resolves when this token is cancelled.
+    ///
+    /// Uses efficient waker-based notification — no polling. Suitable for
+    /// use in `tokio::select!` branches to respond to cancellation in async code.
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// tokio::select! {
+    ///     _ = token.cancelled_async() => { /* cancelled */ }
+    ///     result = do_work() => { /* completed */ }
+    /// }
+    /// ```
+    /// Returns a future that resolves when this token is cancelled.
+    ///
+    /// Uses efficient waker-based notification — no polling. Suitable for
+    /// use in `tokio::select!` branches to respond to cancellation in async code.
     ///
     /// # Example
     ///
@@ -370,12 +406,76 @@ impl CancellationToken {
     /// }
     /// ```
     pub async fn cancelled_async(&self) {
+        // Fast path: already cancelled (self or ancestor).
+        if self.is_cancelled() {
+            return;
+        }
+
         loop {
+            // Await notification from self or any ancestor.
+            // After waking, re-check the flag to confirm actual cancellation.
+            //
+            // Race safety: tokio's Notified future registers interest on first
+            // poll (inside select!/await). If cancel_with_reason() calls
+            // notify_waiters() between our is_cancelled() check above and the
+            // first poll of notified(), the notification is missed. To handle
+            // this, we re-check is_cancelled() immediately after the first poll
+            // registers interest. The select! macro polls all branches once on
+            // entry, registering interest, so the window is only between our
+            // explicit check and the select! entry — which is synchronous code
+            // with no yield points. The only problematic ordering is:
+            //   1. We check is_cancelled() → false
+            //   2. Another thread calls cancel() + notify_waiters()
+            //   3. We enter select! and poll notified() (registers interest)
+            // In this case the notification at step 2 is lost. To handle this,
+            // we add a brief re-check after first poll using a fused approach.
+            //
+            // The correct pattern: create Notified, enable it (registers
+            // interest), then check the flag, then await.
+            let notified = self.inner.async_notify.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+
             if self.is_cancelled() {
                 return;
             }
-            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+
+            // If there are ancestors, race our notified with ancestor notifies.
+            match &self.inner.parent {
+                None => notified.await,
+                Some(parent) => {
+                    tokio::select! {
+                        biased;
+                        _ = notified => {}
+                        _ = Self::await_ancestor_notify(parent) => {}
+                    }
+                }
+            }
+
+            if self.is_cancelled() {
+                return;
+            }
         }
+    }
+
+    /// Await notification from an ancestor node and its parents.
+    fn await_ancestor_notify(node: &Arc<TokenInner>) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + '_>> {
+        Box::pin(async move {
+            let notified = node.async_notify.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+
+            match &node.parent {
+                None => notified.await,
+                Some(parent) => {
+                    tokio::select! {
+                        biased;
+                        _ = notified => {}
+                        _ = Self::await_ancestor_notify(parent) => {}
+                    }
+                }
+            }
+        })
     }
 }
 
