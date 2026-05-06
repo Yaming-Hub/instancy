@@ -42,9 +42,10 @@ impl TaskMeta {
 /// queue with O(1) pop — no comparisons at all. Only set a policy if you need
 /// priority-based or custom ordering.
 ///
-/// **Note on time-dependent policies:** Policies like [`PriorityWithAgingPolicy`]
-/// produce orderings that change over time. The scheduler calls `compare` at
-/// dequeue time, so this is correct by design.
+/// **When a policy is set**, the scheduler uses a `BinaryHeap` for O(log n)
+/// insert and dequeue. This is correct because task metadata (priority,
+/// created_at) is stable while in the heap — `mark_enqueued()` only updates
+/// `created_at` at insertion time, before the entry enters the heap.
 ///
 /// Returns `Ordering::Less` if `a` should be scheduled before `b`.
 pub trait SchedulePolicy: Send + Sync {
@@ -116,16 +117,20 @@ impl Default for PriorityWithAgingPolicy {
 
 impl SchedulePolicy for PriorityWithAgingPolicy {
     fn compare(&self, a: &TaskMeta, b: &TaskMeta) -> Ordering {
+        // Effective priority = base_priority + wait_time * aging_rate.
+        // The ordering is stable because both priority and created_at are fixed
+        // while a task is in the heap. The age difference between two tasks is
+        // constant regardless of when compare is called:
+        //   (a.age - b.age) = (b.created_at - a.created_at), always the same.
         let now = Instant::now();
-        let age_a = now.duration_since(a.created_at).as_secs_f64();
-        let age_b = now.duration_since(b.created_at).as_secs_f64();
-
-        let effective_a = a.priority as f64 + age_a * self.aging_rate;
-        let effective_b = b.priority as f64 + age_b * self.aging_rate;
+        let score_a = a.priority as f64
+            + now.duration_since(a.created_at).as_secs_f64() * self.aging_rate;
+        let score_b = b.priority as f64
+            + now.duration_since(b.created_at).as_secs_f64() * self.aging_rate;
 
         // Higher effective priority → scheduled first
-        effective_b
-            .partial_cmp(&effective_a)
+        score_b
+            .partial_cmp(&score_a)
             .unwrap_or(Ordering::Equal)
     }
 }
