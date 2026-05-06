@@ -425,6 +425,7 @@ impl Drop for NetworkProgressHandles {
 /// Returns an error if expected receiver channels are missing from the
 /// TransportSession (indicating misconfigured channel registrations).
 #[cfg(feature = "transport")]
+#[allow(clippy::too_many_arguments, clippy::needless_range_loop)]
 pub fn create_network_progress_channels<T: Timestamp + ExchangeData>(
     mut local_channels: Vec<WorkerProgressChannels<T>>,
     session: &TransportSession,
