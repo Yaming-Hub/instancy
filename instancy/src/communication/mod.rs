@@ -12,7 +12,9 @@ pub mod control_protocol;
 pub mod interprocess;
 pub mod progress_exchange;
 pub mod remote_push;
+pub mod sequencing;
 pub mod session;
+pub mod shared_pool;
 pub mod transport;
 pub mod transport_session;
 
@@ -31,7 +33,15 @@ pub use interprocess::{
 };
 pub use progress_exchange::{PeerProgressSender, ProgressExchange, ProgressExchangeConfig};
 pub use remote_push::{FrameReceiver, FrameSender, OutboundFrame, RemotePush, RemotePushConfig};
+pub use sequencing::{
+    BufferOverflow, InsertResult, ReorderBuffer, ReorderError, SequenceCounter, SequencedFrame,
+    SEQUENCED_HEADER_SIZE, decode_sequenced_header, encode_sequenced_header,
+};
 pub use session::{ChannelInfo, DataflowSession, DataflowSessionBuilder, SharedSession};
+pub use shared_pool::{
+    ConnectionMetrics, ConnectionMode, ConnectionSnapshot, PeerPool, RttTracker, ScalingDecision,
+    SharedConnectionConfig,
+};
 pub use transport::{Frame, TransportError};
 
 #[cfg(feature = "transport")]
