@@ -618,7 +618,7 @@ mod transport_tests {
         let frame = Frame {
             dataflow_id: DataflowId::from_bytes([1u8; 16]),
             channel_id: 1,
-            payload: vec![0; (MAX_MESSAGE_SIZE as usize) + 1],
+            payload: vec![0; MAX_MESSAGE_SIZE + 1],
         };
         let result = writer.write_frame(&frame).await;
         assert!(result.is_err());

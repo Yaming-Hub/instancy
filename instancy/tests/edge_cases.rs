@@ -248,7 +248,7 @@ fn deep_operator_pipeline() {
     // Chain 50 map operators
     let mut pipe = input.map("map-0", |_t, v| v + 1);
     for i in 1..50 {
-        pipe = pipe.map(&format!("map-{i}"), |_t, v| v + 1);
+        pipe = pipe.map(format!("map-{i}"), |_t, v| v + 1);
     }
     pipe.output("results");
     let dataflow = builder.build().unwrap();

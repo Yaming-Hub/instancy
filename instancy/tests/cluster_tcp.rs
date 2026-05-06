@@ -652,7 +652,7 @@ async fn stress_tcp_repeated_creation() {
         let out_a = ca.take_output::<i32>(0, "results").unwrap();
 
         let sa = ca.take_input::<i32>(0, "data").unwrap();
-        sa.send(0, vec![iteration as i32]).unwrap();
+        sa.send(0, vec![iteration]).unwrap();
         drop(sa);
 
         drop(cb.take_input::<i32>(0, "data").unwrap());
@@ -665,7 +665,7 @@ async fn stress_tcp_repeated_creation() {
             .into_iter()
             .flat_map(|(_, d)| d)
             .collect();
-        assert_eq!(data, vec![iteration as i32 * 2], "iteration {iteration}");
+        assert_eq!(data, vec![iteration * 2], "iteration {iteration}");
     }
 }
 

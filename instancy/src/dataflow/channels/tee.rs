@@ -230,11 +230,8 @@ mod tests {
                 // We need to move data out of envelope, so we match the payload
                 let _ = (time, data); // just to reference
             }
-            match envelope.payload {
-                crate::dataflow::channels::envelope::Payload::Data { time, data } => {
-                    self.records.lock().unwrap().push((time, data));
-                }
-                _ => {}
+            if let crate::dataflow::channels::envelope::Payload::Data { time, data } = envelope.payload {
+                self.records.lock().unwrap().push((time, data));
             }
             Ok(())
         }

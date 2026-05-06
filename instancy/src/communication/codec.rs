@@ -517,9 +517,9 @@ mod tests {
     fn fixed_codec_f64_roundtrip() {
         let codec = FixedSizeCodec::<f64>::new();
         let mut buf = Vec::new();
-        codec.encode(&3.14159f64, &mut buf).unwrap();
+        codec.encode(&std::f64::consts::PI, &mut buf).unwrap();
         let (val, consumed) = codec.decode(&buf).unwrap();
-        assert_eq!(val, 3.14159f64);
+        assert_eq!(val, std::f64::consts::PI);
         assert_eq!(consumed, 8);
     }
 

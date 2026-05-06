@@ -233,7 +233,7 @@ mod tests {
                     if let Some(pos) = left.iter().position(|(t, _)| *t == t2) {
                         let (t, d1) = left.remove(pos);
                         let mut session = output.session(t);
-                        for (a, b) in d1.into_iter().zip(d2.into_iter()) {
+                        for (a, b) in d1.into_iter().zip(d2) {
                             session.give((a, b));
                         }
                     }

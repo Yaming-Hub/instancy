@@ -1653,7 +1653,7 @@ mod tests {
         };
 
         let result = executor.run();
-        assert_eq!(result.unwrap(), true);
+        assert!(result.unwrap());
         assert!(executor.is_complete());
     }
 
@@ -1743,7 +1743,7 @@ mod tests {
         };
 
         let result = executor.run();
-        assert_eq!(result.unwrap(), true);
+        assert!(result.unwrap());
         assert!(executor.is_complete());
     }
 
@@ -1778,7 +1778,7 @@ mod tests {
         };
 
         let result = executor.run();
-        assert_eq!(result.unwrap(), true);
+        assert!(result.unwrap());
         assert!(executor.is_complete());
     }
 
@@ -1841,7 +1841,7 @@ mod tests {
         // Should terminate via quiescence, not infinite loop.
         // Returns Ok(false) because AlwaysIdle never completes.
         let result = executor.run();
-        assert_eq!(result.unwrap(), false);
+        assert!(!result.unwrap());
     }
 
     #[test]
@@ -1918,7 +1918,7 @@ mod tests {
         };
 
         let result = executor.run();
-        assert_eq!(result.unwrap(), true);
+        assert!(result.unwrap());
         assert!(executor.is_complete());
 
         // Verify the sink collected the right data by checking it's done.
@@ -1982,7 +1982,7 @@ mod tests {
 
         // Run should still complete normally
         let result = executor.run();
-        assert_eq!(result.unwrap(), true);
+        assert!(result.unwrap());
     }
 
     #[test]
@@ -2211,6 +2211,7 @@ mod tests {
         // IdleOperator always returns Idle → hits idle threshold → WaitingForInput.
         // poll_run should register waker and return Pending.
         let mut got_pending = false;
+        #[allow(clippy::never_loop)]
         for _ in 0..200 {
             match Pin::new(&mut executor).poll(&mut cx) {
                 Poll::Pending => {
@@ -2231,7 +2232,7 @@ mod tests {
         // wakes the registered waker.
         use std::future::Future;
         use std::pin::Pin;
-        use std::task::{Context, Poll, Wake};
+        use std::task::{Context, Wake};
 
         struct TrackingWaker {
             woken: std::sync::atomic::AtomicBool,
@@ -2291,7 +2292,7 @@ mod tests {
         // Drive to Pending
         let mut reached_pending = false;
         for _ in 0..200 {
-            if let Poll::Pending = Pin::new(&mut executor).poll(&mut cx) {
+            if Pin::new(&mut executor).poll(&mut cx).is_pending() {
                 reached_pending = true;
                 break;
             }
@@ -2630,7 +2631,7 @@ mod tests {
         assert!(executor.is_fused());
 
         let result = executor.run();
-        assert_eq!(result.unwrap(), true);
+        assert!(result.unwrap());
         assert!(executor.is_complete());
     }
 
@@ -2690,7 +2691,7 @@ mod tests {
         executor.enable_fusion(FusedActivationOrder::new(vec![0, 1, 2]));
 
         let result = executor.run();
-        assert_eq!(result.unwrap(), true);
+        assert!(result.unwrap());
         assert!(executor.is_complete());
         assert_eq!(executor.completed_count(), 3);
     }
@@ -2838,7 +2839,7 @@ mod tests {
 
         // Idle operator → should eventually reach quiescence.
         let result = executor.run();
-        assert_eq!(result.unwrap(), false); // quiescent, not completed
+        assert!(!result.unwrap()); // quiescent, not completed
     }
 
     #[test]
@@ -2924,7 +2925,7 @@ mod tests {
 
         // Run to completion.
         let result = executor.run();
-        assert_eq!(result.unwrap(), true);
+        assert!(result.unwrap());
         assert!(executor.is_complete());
     }
 
@@ -3288,8 +3289,10 @@ mod tests {
 
     #[test]
     fn catch_panics_returns_operator_panic_error() {
-        let mut config = ExecutorConfig::default();
-        config.catch_panics = true;
+        let config = ExecutorConfig {
+            catch_panics: true,
+            ..Default::default()
+        };
 
         let ops: Vec<Box<dyn SchedulableOperator>> = vec![Box::new(PanickingOperator {
             name: "boom".to_string(),
@@ -3320,8 +3323,10 @@ mod tests {
 
     #[test]
     fn catch_panics_disabled_propagates_panic() {
-        let mut config = ExecutorConfig::default();
-        config.catch_panics = false;
+        let config = ExecutorConfig {
+            catch_panics: false,
+            ..Default::default()
+        };
 
         let ops: Vec<Box<dyn SchedulableOperator>> = vec![Box::new(PanickingOperator {
             name: "boom".to_string(),

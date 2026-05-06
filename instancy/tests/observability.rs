@@ -159,7 +159,7 @@ fn concurrent_backpressure_max_tracking() {
             let c = collector.clone();
             std::thread::spawn(move || {
                 for j in 0..50u64 {
-                    c.record_backpressure(Duration::from_micros(i as u64 * 100 + j));
+                    c.record_backpressure(Duration::from_micros(i * 100 + j));
                 }
             })
         })

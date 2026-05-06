@@ -312,7 +312,7 @@ fn stress_spawn_twenty_dataflows() {
     for i in 0..20 {
         let builder = DataflowBuilder::<u64>::new(format!("stress_{i}"));
         builder
-            .source("src", vec![(0u64, vec![i as i32])])
+            .source("src", vec![(0u64, vec![i])])
             .map("double", |_t, x| x * 2)
             .output("out");
         let dataflow = builder.build().unwrap();
@@ -356,7 +356,7 @@ fn concurrent_input_from_multiple_threads() {
             thread::spawn(move || {
                 for round in 0..5u64 {
                     let time = (tid as u64) * 10 + round;
-                    s.send(time, vec![tid as i32 * 100 + round as i32]).unwrap();
+                    s.send(time, vec![tid * 100 + round as i32]).unwrap();
                 }
             })
         })

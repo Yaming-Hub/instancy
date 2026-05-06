@@ -3741,7 +3741,7 @@ mod tests {
 
         let handle = rt().spawn(dataflow).unwrap();
         handle.cancel();
-        let _ = handle.join();
+        handle.join_blocking().ok();
     }
 
     #[test]
