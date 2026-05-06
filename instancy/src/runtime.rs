@@ -489,6 +489,10 @@ pub struct RuntimeHandle {
     /// Owned tokio runtime (when `TokioMode::Create` was used).
     /// Kept alive for the lifetime of RuntimeHandle; dropped on RuntimeHandle::drop.
     _owned_tokio_runtime: Option<tokio::runtime::Runtime>,
+    /// Number of currently active (not yet completed) dataflows.
+    active_count: Arc<AtomicUsize>,
+    /// Notified whenever the active count reaches zero.
+    idle_notify: Arc<tokio::sync::Notify>,
 }
 
 impl RuntimeHandle {
@@ -579,6 +583,8 @@ impl RuntimeHandle {
             peer_registry: Arc::new(PeerRegistry::new()),
             tokio_handle,
             _owned_tokio_runtime: owned_runtime,
+            active_count: Arc::new(AtomicUsize::new(0)),
+            idle_notify: Arc::new(tokio::sync::Notify::new()),
         })
     }
 
@@ -611,6 +617,54 @@ impl RuntimeHandle {
     pub fn shutdown(&self) {
         self.cancel
             .cancel_with_reason(CancellationReason::RuntimeShutdown);
+    }
+
+    /// Shut down the runtime and wait for all active dataflows to complete.
+    ///
+    /// This method:
+    /// 1. Signals cancellation to all running dataflows (same as [`shutdown()`](Self::shutdown))
+    /// 2. Awaits until every active dataflow has finished executing
+    ///
+    /// Returns immediately if no dataflows are active.
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// rt.shutdown_async().await;
+    /// // All dataflows have now completed — safe to drop the runtime.
+    /// ```
+    pub async fn shutdown_async(&self) {
+        self.cancel
+            .cancel_with_reason(CancellationReason::RuntimeShutdown);
+        self.wait_idle().await;
+    }
+
+    /// Wait until all active dataflows have completed.
+    ///
+    /// Returns immediately if no dataflows are currently running. Otherwise,
+    /// waits for all spawned dataflows to finish (whether by normal completion,
+    /// cancellation, or error).
+    ///
+    /// This does NOT cancel anything — it purely waits. Use
+    /// [`shutdown_async()`](Self::shutdown_async) to cancel and wait.
+    pub async fn wait_idle(&self) {
+        loop {
+            // Register interest BEFORE checking the counter to avoid a race
+            // where a notification fires between our check and the await.
+            let notified = self.idle_notify.notified();
+            if self.active_count.load(std::sync::atomic::Ordering::Acquire) == 0 {
+                return;
+            }
+            notified.await;
+        }
+    }
+
+    /// Returns the number of currently active (not yet completed) dataflows.
+    ///
+    /// A dataflow is counted as active from the moment it is spawned until its
+    /// executor completes (successfully, with error, or via cancellation).
+    pub fn active_dataflows(&self) -> usize {
+        self.active_count.load(std::sync::atomic::Ordering::Relaxed)
     }
 
     /// Returns the runtime name.
@@ -878,7 +932,7 @@ impl RuntimeHandle {
         pre_created_wake_handle: Option<WakeHandle>,
     ) -> Result<SpawnedDataflow<T>> {
         let dataflow_id = DataflowId::new();
-        let (spawned, executor, notifier) = self.prepare_worker(
+        let (spawned, executor, mut notifier) = self.prepare_worker(
             dataflow,
             mode,
             worker_context,
@@ -887,6 +941,19 @@ impl RuntimeHandle {
             None,
             None,
         )?;
+
+        // Track active dataflow count for wait_idle()/shutdown_async().
+        self.active_count
+            .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+        let active_count = Arc::clone(&self.active_count);
+        let idle_notify = Arc::clone(&self.idle_notify);
+        notifier.set_on_complete(Box::new(move || {
+            let prev = active_count.fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
+            if prev == 1 {
+                idle_notify.notify_waiters();
+            }
+        }));
+
         self.registry
             .register(executor, notifier, dataflow_id, priority);
 
@@ -1228,8 +1295,20 @@ impl RuntimeHandle {
         // Phase 6: Register all workers NOW — every worker's tracker has
         // initialized and broadcast its initial capabilities, so all progress
         // channels contain the complete initial state from all peers.
+        //
+        // Track each worker as an active dataflow for wait_idle()/shutdown_async().
         let mut workers = Vec::with_capacity(num_workers);
-        for (spawned, executor, notifier) in prepared {
+        for (spawned, executor, mut notifier) in prepared {
+            self.active_count
+                .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+            let active_count = Arc::clone(&self.active_count);
+            let idle_notify = Arc::clone(&self.idle_notify);
+            notifier.set_on_complete(Box::new(move || {
+                let prev = active_count.fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
+                if prev == 1 {
+                    idle_notify.notify_waiters();
+                }
+            }));
             self.registry
                 .register(executor, notifier, dataflow_id, priority);
             workers.push(spawned);
@@ -1679,8 +1758,19 @@ impl RuntimeHandle {
             .map_err(|e| Error::Custom(format!("cluster ready barrier failed: {e}")))?;
 
         // Phase 9: Register all workers for execution.
+        // Track each worker as an active dataflow for wait_idle()/shutdown_async().
         let mut workers = Vec::with_capacity(num_local);
-        for (spawned, executor, notifier) in prepared {
+        for (spawned, executor, mut notifier) in prepared {
+            self.active_count
+                .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+            let active_count = Arc::clone(&self.active_count);
+            let idle_notify = Arc::clone(&self.idle_notify);
+            notifier.set_on_complete(Box::new(move || {
+                let prev = active_count.fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
+                if prev == 1 {
+                    idle_notify.notify_waiters();
+                }
+            }));
             self.registry
                 .register(executor, notifier, dataflow_id, dataflow_priority);
             workers.push(spawned);
@@ -2155,11 +2245,19 @@ struct SharedCompletionState {
 pub struct CompletionNotifier {
     shared: Arc<Mutex<SharedCompletionState>>,
     condvar: Arc<Condvar>,
+    on_complete: Option<Box<dyn FnOnce() + Send>>,
 }
 
 impl CompletionNotifier {
+    /// Attach a callback that fires when the notifier completes or is dropped.
+    ///
+    /// Used by `RuntimeHandle` to track active dataflow count.
+    pub(crate) fn set_on_complete(&mut self, f: Box<dyn FnOnce() + Send>) {
+        self.on_complete = Some(f);
+    }
+
     /// Publish the executor result and wake any waiting future/condvar.
-    pub fn complete(self, result: Result<bool>) {
+    pub fn complete(mut self, result: Result<bool>) {
         {
             let mut state = match self.shared.lock() {
                 Ok(s) => s,
@@ -2170,6 +2268,10 @@ impl CompletionNotifier {
                 waker.wake();
             }
             self.condvar.notify_all();
+        }
+        // Fire on_complete callback before forgetting self.
+        if let Some(cb) = self.on_complete.take() {
+            cb();
         }
         // Prevent Drop from publishing a second result.
         // Safety: shared/condvar Arcs are leaked but the DataflowCompletion
@@ -2193,6 +2295,10 @@ impl Drop for CompletionNotifier {
                 waker.wake();
             }
             self.condvar.notify_all();
+        }
+        // Fire on_complete callback.
+        if let Some(cb) = self.on_complete.take() {
+            cb();
         }
     }
 }
@@ -2248,7 +2354,7 @@ impl DataflowCompletion {
             shared: Arc::clone(&shared),
             condvar: Arc::clone(&condvar),
         };
-        let notifier = CompletionNotifier { shared, condvar };
+        let notifier = CompletionNotifier { shared, condvar, on_complete: None };
         (completion, notifier)
     }
 
@@ -5703,5 +5809,107 @@ mod tests {
             Ok(_) => panic!("expected error for single-worker parallelism mismatch"),
         }
         rt.shutdown();
+    }
+
+    #[test]
+    fn active_dataflows_counter() {
+        use crate::dataflow::DataflowBuilder;
+
+        let rt = RuntimeHandle::new(RuntimeConfig {
+            worker_threads: 2,
+            ..Default::default()
+        })
+        .unwrap();
+        assert_eq!(rt.active_dataflows(), 0);
+
+        // Spawn a dataflow with an input port (stays alive until input closes).
+        let builder = DataflowBuilder::<u64>::new("active-count-test");
+        let input = builder.input::<i32>("data");
+        input.output("out");
+        let dataflow = builder.build().unwrap();
+        let mut handle = rt.spawn(dataflow, SpawnOptions::default()).unwrap();
+        let sender = handle.take_input::<i32>("data").unwrap();
+
+        // Should show 1 active dataflow.
+        assert_eq!(rt.active_dataflows(), 1);
+
+        // Close input and wait for completion.
+        drop(sender);
+        handle.join_blocking().ok();
+
+        // Give the callback a moment to fire.
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        assert_eq!(rt.active_dataflows(), 0);
+        rt.shutdown();
+    }
+
+    #[tokio::test]
+    async fn shutdown_async_awaits_completion() {
+        use crate::dataflow::DataflowBuilder;
+
+        let rt = RuntimeHandle::new(RuntimeConfig {
+            worker_threads: 2,
+            ..Default::default()
+        })
+        .unwrap();
+
+        let builder = DataflowBuilder::<u64>::new("shutdown-async-test");
+        let input = builder.input::<i32>("data");
+        input.output("out");
+        let dataflow = builder.build().unwrap();
+        let mut handle = rt.spawn(dataflow, SpawnOptions::default()).unwrap();
+        let sender = handle.take_input::<i32>("data").unwrap();
+
+        assert_eq!(rt.active_dataflows(), 1);
+
+        // Drop sender so the dataflow can finish.
+        drop(sender);
+
+        // shutdown_async should cancel + wait for idle.
+        rt.shutdown_async().await;
+        assert_eq!(rt.active_dataflows(), 0);
+    }
+
+    #[tokio::test]
+    async fn wait_idle_returns_when_no_dataflows() {
+        let rt = RuntimeHandle::new(RuntimeConfig {
+            worker_threads: 1,
+            ..Default::default()
+        })
+        .unwrap();
+
+        // Should return immediately — no active dataflows.
+        rt.wait_idle().await;
+        assert_eq!(rt.active_dataflows(), 0);
+    }
+
+    #[tokio::test]
+    async fn wait_idle_multi_worker() {
+        use crate::dataflow::DataflowBuilder;
+
+        let rt = RuntimeHandle::new(RuntimeConfig {
+            worker_threads: 2,
+            ..Default::default()
+        })
+        .unwrap();
+
+        let mut handle = rt
+            .spawn_multi("idle-multi", 3, |_idx, builder: &mut DataflowBuilder<u64>| {
+                let input = builder.input::<i32>("data");
+                input.output("out");
+                Ok(())
+            }, SpawnOptions::default())
+            .unwrap();
+
+        // 3 workers = 3 active.
+        assert_eq!(rt.active_dataflows(), 3);
+
+        // Close all inputs.
+        for i in 0..3 {
+            drop(handle.take_input::<i32>(i, "data").unwrap());
+        }
+
+        rt.wait_idle().await;
+        assert_eq!(rt.active_dataflows(), 0);
     }
 }

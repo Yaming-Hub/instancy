@@ -9,6 +9,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+#### Runtime
+- `TokioMode` configuration for `RuntimeHandle` — control how instancy obtains a tokio runtime (#141)
+  - `Auto` (default) — reuses the current tokio context or creates a 2-thread runtime
+  - `Create { worker_threads }` — creates a dedicated multi-thread tokio runtime
+  - `External(Handle)` — uses an externally-provided tokio runtime handle
+  - `CurrentContext` — requires an active tokio runtime (errors if none exists)
+- `RuntimeHandle::tokio_handle()` accessor for the underlying tokio runtime
+- `RuntimeHandle::active_dataflows()` — returns the number of currently running dataflows (#143)
+- `RuntimeHandle::wait_idle()` — async method that resolves when all dataflows complete (#143)
+- `RuntimeHandle::shutdown_async()` — cancels all dataflows and awaits their completion (#143)
+
 #### Cancellation
 - External cancellation token support via `SpawnOptions::cancellation_token()` — accepts a `tokio_util::sync::CancellationToken` to cancel dataflows from user code (#139)
 - `SpawnedDataflow::cancel_token()` accessor for programmatic cancellation
@@ -68,9 +79,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **BREAKING:** Removed `RuntimeHandle::spawn_multi_async()` — use `spawn_multi(..., SpawnOptions::new().io_mode(IoMode::Async))`
 
 ### Internal
-- Resolved all clippy warnings (74 → 0) (#135)
+- Resolved all clippy warnings across lib, examples, and tests (#135, #142)
 - Removed unused capacity parameter from `ChannelBlueprint::build` (#127)
 - Optimized scheduler queue: BinaryHeap for policy-driven scheduling (#133, #134)
+- `CompletionNotifier` supports `on_complete` callback for active-dataflow tracking (#143)
 
 ### Features
 
