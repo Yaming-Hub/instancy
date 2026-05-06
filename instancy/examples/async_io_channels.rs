@@ -25,7 +25,6 @@
 //! Run with: `cargo run --all-features --example async_io_channels`
 
 use instancy::DataflowBuilder;
-use instancy::scheduler::policy::FifoPolicy;
 use instancy::{IoMode, RuntimeConfig, RuntimeHandle, SpawnOptions};
 
 #[tokio::main(flavor = "current_thread")]
@@ -34,7 +33,7 @@ async fn main() {
 
     let rt = RuntimeHandle::new(RuntimeConfig {
         worker_threads: 2,
-        schedule_policy: Box::new(FifoPolicy),
+        schedule_policy: None,
         name: "async-demo".into(),
     })
     .expect("failed to create runtime");
