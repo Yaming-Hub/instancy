@@ -30,6 +30,7 @@
 //! ```
 
 use std::cell::RefCell;
+use std::future::Future;
 use std::marker::PhantomData;
 use std::rc::Rc;
 use std::sync::{Arc, Mutex};
@@ -52,8 +53,9 @@ use crate::dataflow::schedulable::{
 use crate::dataflow::stage::StageId;
 use crate::dataflow::stream::Slot;
 use crate::dataflow::wired_operators::{
-    WiredBinaryOperator, WiredConcatOperator, WiredEnterOperator, WiredFeedbackOperator,
-    WiredLeaveOperator, WiredSourceOperator, WiredUnaryNotifyOperator, WiredUnaryOperator,
+    AsyncLogicFn, WiredBinaryOperator, WiredConcatOperator, WiredEnterOperator,
+    WiredFeedbackOperator, WiredLeaveOperator, WiredSourceOperator,
+    WiredUnaryAsyncOperator, WiredUnaryNotifyOperator, WiredUnaryOperator,
 };
 use crate::error::{Error, Result};
 use crate::order::Product;
@@ -1122,6 +1124,63 @@ impl<T: Timestamp, D: Clone + Send + 'static> Pipe<T, D> {
     {
         let capacity = self.resolve_capacity();
         self.add_unary_notify_internal(name, capacity, logic)
+    }
+
+    /// Apply an async unary operator that spawns tokio tasks for each input batch.
+    ///
+    /// Unlike [`unary`](Self::unary) which processes data synchronously during
+    /// operator activation, `unary_async` spawns a tokio task for each input
+    /// batch. This is ideal for operators that perform async I/O (database
+    /// lookups, HTTP requests, RPC calls).
+    ///
+    /// # Arguments
+    ///
+    /// - `name` — operator name for debugging and graph inspection
+    /// - `max_concurrency` — maximum number of in-flight async tasks. Input
+    ///   batches exceeding this limit are queued internally.
+    /// - `logic` — an `Fn(T, Vec<D1>) -> Future<Output = Result<Vec<D2>>>` closure.
+    ///   Must be `Send + Sync + 'static` since it is shared across spawned tasks.
+    ///
+    /// # Output ordering
+    ///
+    /// Output order matches **completion order**, not input order. If strict
+    /// ordering is required, include sequence information in the data and sort
+    /// downstream.
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// use std::sync::Arc;
+    ///
+    /// let enriched = input.unary_async("http_lookup", 8, Arc::new(|_time, batch| {
+    ///     Box::pin(async move {
+    ///         let mut results = Vec::new();
+    ///         for item in batch {
+    ///             let resp = reqwest::get(format!("http://api/{item}")).await?;
+    ///             results.push(resp.text().await?);
+    ///         }
+    ///         Ok(results)
+    ///     })
+    /// }));
+    /// ```
+    pub fn unary_async<D2, F, Fut>(
+        mut self,
+        name: impl Into<String>,
+        max_concurrency: usize,
+        logic: Arc<F>,
+    ) -> Pipe<T, D2>
+    where
+        D2: Clone + Send + 'static,
+        F: Fn(T, Vec<D>) -> Fut + Send + Sync + 'static,
+        Fut: Future<Output = Result<Vec<D2>>> + Send + 'static,
+    {
+        let capacity = self.resolve_capacity();
+        // Wrap into the type-erased AsyncLogicFn form.
+        let logic: AsyncLogicFn<T, D, D2> = Arc::new(move |t, data| {
+            let fut = logic(t, data);
+            Box::pin(fut)
+        });
+        self.add_unary_async_internal(name, capacity, logic, max_concurrency)
     }
 
     /// Combine two streams with a binary operator.
@@ -3056,6 +3115,130 @@ impl<T: Timestamp, D: Clone + Send + 'static> Pipe<T, D> {
                         output_pusher,
                         progress_reporter,
                         initial_frontier,
+                    )) as Box<dyn SchedulableOperator>
+                });
+            state.operator_factories.push((op_idx, factory));
+
+            // Channel factory for the input edge
+            let edge_idx = state.graph.edges().len() - 1;
+            let chan_factory: ChannelFactory =
+                channel_factory(move |_ctx, wake: Option<WakeHandle>| {
+                    let (push, pull) =
+                        bounded_channel_with_wake::<T, D, ()>(capacity, wake.clone());
+                    (
+                        Box::new(Box::new(push) as Box<dyn Push<T, D>>)
+                            as Box<dyn std::any::Any + Send>,
+                        Box::new(Box::new(pull) as Box<dyn Pull<T, D>>)
+                            as Box<dyn std::any::Any + Send>,
+                    )
+                });
+            state.channel_factories.push((edge_idx, chan_factory));
+        }
+
+        Pipe {
+            state: Rc::clone(&self.state),
+            op_idx,
+            output_slot: 0,
+            capacity_override: None,
+            _phantom: PhantomData,
+        }
+    }
+
+    /// Internal implementation for `unary_async`.
+    fn add_unary_async_internal<D2>(
+        &self,
+        name: impl Into<String>,
+        capacity: usize,
+        logic: AsyncLogicFn<T, D, D2>,
+        max_concurrency: usize,
+    ) -> Pipe<T, D2>
+    where
+        D2: Clone + Send + 'static,
+    {
+        let name = name.into();
+        let op_idx;
+        let stage_id = StageId::new(0);
+        // Capture the tokio handle at builder time. This requires that the caller
+        // is within a tokio runtime context (e.g., inside #[tokio::main] or an async task).
+        // If no runtime is available, fall back to trying at factory build time.
+        let tokio_handle = tokio::runtime::Handle::try_current()
+            .unwrap_or_else(|_| {
+                // Deferred: will be resolved at factory build time (during spawn).
+                // This path is hit when building outside tokio context.
+                // We store a dummy handle that will be overwritten.
+                panic!(
+                    "unary_async requires a tokio runtime context. \
+                     Call from within #[tokio::main], #[tokio::test], or similar."
+                )
+            });
+
+        {
+            let mut state = self.state.borrow_mut();
+            op_idx = state.allocate_operator_index();
+
+            // Register in graph (1 input, 1 output)
+            state
+                .graph
+                .register_operator(crate::dataflow::graph::OperatorInfo::new(
+                    op_idx, &name, stage_id, 1, 1,
+                ))
+                .expect("operator index unique");
+
+            // Edge from upstream
+            state.graph.add_edge(crate::dataflow::graph::EdgeInfo::new(
+                Slot::new(self.op_idx, self.output_slot),
+                Slot::new(op_idx, 0),
+                stage_id,
+                stage_id,
+            ));
+
+            // Subgraph: identity connectivity
+            state.subgraph_builder.add_operator(
+                op_idx,
+                &name,
+                1,
+                1,
+                PortConnectivity::identity(T::Summary::default()),
+            );
+            state.subgraph_builder.add_edge(
+                Location::source(self.op_idx, self.output_slot),
+                Location::target(op_idx, 0),
+            );
+
+            // Operator factory — creates a WiredUnaryAsyncOperator
+            let name_clone = name.clone();
+            let factory: OperatorFactory =
+                single_use_factory(move |_ctx, endpoints: ChannelEndpoints| {
+                    let input_puller: Box<dyn Pull<T, D>> = *endpoints
+                        .input_pullers
+                        .into_iter()
+                        .next()
+                        .expect("unary_async must have input puller")
+                        .downcast::<Box<dyn Pull<T, D>>>()
+                        .expect("unary_async input puller type mismatch");
+
+                    let output_pusher: Box<dyn Push<T, D2>> = {
+                        let pushers: Vec<Box<dyn Push<T, D2>>> = endpoints
+                            .output_pushers
+                            .into_iter()
+                            .map(|any_box| {
+                                *any_box
+                                    .downcast::<Box<dyn Push<T, D2>>>()
+                                    .expect("unary_async output pusher type mismatch")
+                            })
+                            .collect();
+                        tee_or_single(pushers).unwrap_or_else(|| Box::new(NullPush))
+                    };
+
+                    Box::new(WiredUnaryAsyncOperator::new(
+                        name_clone,
+                        op_idx,
+                        stage_id,
+                        logic,
+                        max_concurrency,
+                        input_puller,
+                        output_pusher,
+                        tokio_handle,
                     )) as Box<dyn SchedulableOperator>
                 });
             state.operator_factories.push((op_idx, factory));

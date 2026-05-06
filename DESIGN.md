@@ -2253,6 +2253,264 @@ pub struct PoolConfig {
 - When load is low, idle connections above the minimum are reclaimed after `idle_timeout`.
 - The application's `ConnectionManager` is the single point of control for all connection establishment — the pool just tells it when to create or destroy connections.
 
+### 6.3.1 Future: Shared Connection Mode with Sequenced Messages
+
+#### Motivation
+
+The **current design** assigns a dedicated TCP connection per (dataflow, peer) pair. This is simple — TCP guarantees FIFO, so message ordering is free. However, it limits scalability:
+- 100 concurrent dataflows across 10 nodes = 900 TCP connections per node
+- Connection setup latency for each new dataflow
+- Underutilization of connections when dataflows have bursty traffic
+
+A **shared connection mode** would allow multiple dataflows (and multiple workers within a dataflow) to share the same node-to-node TCP connection pool, similar to how HTTP/2 multiplexes streams over a single connection, or how instancy's worker thread pool shares OS threads across dataflows.
+
+#### The Ordering Challenge
+
+With shared connections, a single worker's messages may travel over **different TCP connections** (e.g., load-balanced across pool connections, or after a connection failure triggers failover). TCP only guarantees FIFO within a single stream — **not across streams**. This breaks the timely ordering invariant.
+
+Example scenario:
+```
+Worker 0 sends: [data(epoch=5), progress(epoch=5 done)]
+                     │                      │
+                     ▼                      ▼
+              Connection A            Connection B   (load-balanced)
+                     │                      │
+                     ▼                      ▼
+Receiver sees: progress(epoch=5 done)  THEN  data(epoch=5)  ← ORDERING VIOLATION
+```
+
+Additionally, connection failures introduce:
+- **Lost messages** — in-flight frames on a broken connection
+- **Duplicate messages** — retried frames that were actually delivered before the failure was detected
+
+#### Proposed Design: Sequenced Messages
+
+Each frame is stamped with a **sequence ID** scoped to its logical stream:
+
+```
+Message Identity: (dataflow_id, channel_id, sequence_id)
+```
+
+The `channel_id` already encodes `(edge/stage, source_worker, dest_worker)` — this is necessary because different stages can have different worker counts (per-stage parallelism). A stage with 4 workers and a downstream stage with 2 workers produce different sets of logical streams. The sequence is per logical stream, not per worker globally.
+
+**Wire protocol extension:**
+
+```
+┌───────────────┬───────────┬──────────────┬───────────┬──────────────────┐
+│ dataflow_id   │ channel_id│ sequence_id  │ length    │ payload (codec)  │
+│ (UUID, 16B)   │ (u64)     │ (u64)        │ (u32)     │ (variable)       │
+└───────────────┴───────────┴──────────────┴───────────┴──────────────────┘
+```
+
+Header size: 16 + 8 + 8 + 4 = **36 bytes** (8 bytes overhead vs current 28).
+
+**Sender behavior:**
+- Each `(dataflow_id, channel_id)` pair maintains a monotonically increasing sequence counter
+- Every frame sent on any connection is stamped with the next sequence number
+- On send failure, the sender retries the same frame (same sequence_id) on a different connection
+
+**Receiver behavior:**
+- Per `(dataflow_id, channel_id)`, tracks `next_expected_seq`
+- If received frame's `sequence_id == next_expected_seq`: deliver immediately, increment counter
+- If `sequence_id > next_expected_seq` (gap): buffer the frame, wait up to `reorder_timeout` for the missing frame(s)
+- If `sequence_id < next_expected_seq` (duplicate): discard silently (already delivered)
+- If timeout expires with gap: fail the dataflow (data loss detected — unrecoverable)
+
+```rust
+/// Receiver-side reorder buffer per logical stream.
+struct ReorderBuffer {
+    next_expected: u64,
+    /// Buffered out-of-order frames, keyed by sequence_id.
+    pending: BTreeMap<u64, Frame>,
+    /// How long to wait for a missing frame before failing.
+    reorder_timeout: Duration,
+    /// Timestamp when the gap was first detected.
+    gap_detected_at: Option<Instant>,
+}
+
+impl ReorderBuffer {
+    fn receive(&mut self, seq: u64, frame: Frame) -> ReorderAction {
+        if seq < self.next_expected {
+            return ReorderAction::Duplicate; // discard
+        }
+        if seq == self.next_expected {
+            // Deliver this frame and any consecutive buffered frames
+            self.next_expected += 1;
+            self.gap_detected_at = None;
+            let mut deliver = vec![frame];
+            while let Some(f) = self.pending.remove(&self.next_expected) {
+                deliver.push(f);
+                self.next_expected += 1;
+            }
+            return ReorderAction::Deliver(deliver);
+        }
+        // seq > next_expected: gap detected
+        self.pending.insert(seq, frame);
+        if self.gap_detected_at.is_none() {
+            self.gap_detected_at = Some(Instant::now());
+        }
+        ReorderAction::Wait
+    }
+
+    fn check_timeout(&self) -> bool {
+        self.gap_detected_at
+            .map(|t| t.elapsed() > self.reorder_timeout)
+            .unwrap_or(false)
+    }
+}
+```
+
+#### Comparison: Dedicated vs Shared Connection Mode
+
+| Aspect | Dedicated (Current) | Shared + Sequencing (Future) |
+|--------|---------------------|------------------------------|
+| **Ordering** | Free (TCP FIFO) | Explicit via sequence numbers |
+| **Connection count** | O(dataflows × peers) | O(peers) — bounded by pool size |
+| **Connection setup** | Per-dataflow latency | Amortized — pool pre-warms |
+| **Failure handling** | Dataflow fails immediately | Retry on another connection; fail only on timeout |
+| **Duplicate detection** | Not needed | Free via sequence_id comparison |
+| **Wire overhead** | 28 bytes/frame | 36 bytes/frame (+8 bytes seq_id) |
+| **Receiver complexity** | Zero buffering | Reorder buffer per logical stream |
+| **Memory overhead** | Minimal | Reorder buffers + pending maps |
+| **Latency** | Minimal (direct write) | Possible reorder wait on out-of-order delivery |
+| **Throughput** | Limited by single connection | Higher — parallel writes across pool connections |
+| **Cross-dataflow fairness** | Perfect isolation | Shared bandwidth — needs fair scheduling |
+| **Implementation complexity** | Simple | Moderate (sequencing, buffering, timeout, retry) |
+
+#### Pros of Shared Connection Mode (with Adaptive Scaling)
+
+1. **Resource efficiency** — O(peers) base connections instead of O(dataflows × peers). Critical at scale.
+2. **Connection reuse** — new dataflows start instantly on existing pool connections.
+3. **Resilience** — connection failure doesn't kill the dataflow; retry on alternate connection.
+4. **Higher throughput** — parallel connections per peer with independent congestion windows. A single TCP connection cannot fully utilize high-bandwidth links due to bandwidth-delay product limits.
+5. **Simpler lifecycle** — no need to establish/teardown connections per dataflow.
+6. **Self-tuning latency** — RTT probes detect congestion early; adaptive scaling adds connections to maintain latency target. Under heavy load, shared mode achieves *lower* latency than dedicated mode (which is stuck with a single saturated connection).
+7. **Graceful degradation** — under light load, operates with min_connections (essentially dedicated mode behavior with negligible overhead). Scales up only when measured RTT justifies it.
+
+#### Cons of Shared Connection Mode (with Adaptive Scaling)
+
+1. **Implementation complexity** — sequence management, gap detection, timeout handling, duplicate filtering, RTT probing, and scaling logic. Significantly more code than dedicated mode.
+2. **Memory overhead** — per-stream reorder buffers with pending frame storage. Bounded by `max_connections × max_in_flight_per_connection`.
+3. **Failure semantics change** — "connection broken" no longer means "dataflow dead" — must propagate failure differently (timeout-based after all retry paths exhausted).
+4. **Wire overhead** — 8 extra bytes per frame for sequence_id. Negligible for data payloads; ~20% overhead for small progress messages (~40 bytes). Sub-microsecond parsing cost — irrelevant vs network RTT.
+5. **Brief reorder windows** — during connection scale-up/scale-down transitions, frames may arrive out-of-order for a short period. The reorder buffer handles this transparently but adds a brief latency spike (~probe_interval duration).
+
+#### Performance Analysis: Adaptive Scaling Mitigates Original Concerns
+
+The original fixed-pool design had real performance concerns. Adaptive scaling addresses each:
+
+| Concern | Fixed Pool (no scaling) | With Adaptive Scaling |
+|---------|------------------------|----------------------|
+| **Latency under light load** | Same as dedicated | Same as dedicated (min_connections ≈ 1-2, near-zero overhead) |
+| **Latency under heavy load** | Reorder waits when frames contend | **Better than dedicated** — scales connections to maintain RTT below threshold |
+| **Head-of-line blocking** | Real risk — stalled connection blocks all streams | Detected via RTT probe in ~100ms; load balancer routes around stalled connection |
+| **Throughput ceiling** | Fixed by pool size | Scales dynamically — each new connection adds an independent TCP congestion window |
+| **Connection overhead at rest** | Fixed pool wastes resources | Scales down to min_connections during idle periods |
+
+**Key insight:** Dedicated mode has a fundamental limitation — under heavy load, a single TCP connection saturates with no recovery path. The adaptive shared mode is the only design that maintains latency invariants across all load levels, because it uses measured feedback (RTT probes) to trigger corrective action (add connections) before saturation causes visible delays.
+
+**When does shared mode equal or beat dedicated?**
+- **Light load:** Equivalent (min_connections, no reorder waits, negligible sequence overhead)
+- **Moderate load:** Equivalent or better (single connection handles load, probes confirm healthy RTT)
+- **Heavy load:** Significantly better (scales to multiple connections, parallel throughput, bounded latency)
+- **Connection failure:** Significantly better (retry on alternate, no dataflow death)
+
+The only scenario where dedicated mode wins is **zero-overhead simplicity** for deployments that never scale beyond moderate load and don't need resilience.
+
+#### Adaptive Connection Scaling
+
+The shared connection pool does **not** use a fixed number of connections per peer. Instead, it dynamically scales connections based on measured load — similar to how the worker pool scales threads within a min/max range.
+
+**Configuration:**
+```rust
+pub struct SharedConnectionConfig {
+    /// Minimum connections to maintain per peer (pre-warmed).
+    pub min_connections: usize,           // e.g., 1
+    /// Maximum connections allowed per peer.
+    pub max_connections: usize,           // e.g., 16
+    /// RTT threshold: scale up when probe RTT exceeds this.
+    pub rtt_scale_up_threshold: Duration, // e.g., 5ms
+    /// RTT target: scale down when probe RTT is below this for sustained period.
+    pub rtt_scale_down_threshold: Duration, // e.g., 1ms
+    /// How long RTT must stay below scale-down threshold before removing a connection.
+    pub cooldown_period: Duration,        // e.g., 30s
+    /// Interval between probe messages.
+    pub probe_interval: Duration,         // e.g., 100ms
+    /// Timeout for reorder buffer gap detection.
+    pub reorder_timeout: Duration,        // e.g., 50ms
+}
+```
+
+**Load measurement signals:**
+
+1. **RTT probes** (primary signal) — Lightweight probe messages sent at `probe_interval` with the **same priority as data** (travel through the same FIFO path). Measures true end-to-end latency including TCP buffer congestion. When RTT exceeds `rtt_scale_up_threshold`, it indicates the connection is saturated.
+
+2. **Send queue depth** — Number of frames buffered in the write queue waiting to be flushed to TCP. High queue depth means the connection can't drain fast enough.
+
+3. **Throughput per connection** — Bytes/sec actually written. When throughput plateaus while queue depth grows, the connection is at capacity.
+
+4. **TCP kernel metrics** (optional, platform-specific) — `TCP_INFO` on Linux provides `tcpi_rtt`, `tcpi_retransmits`, `tcpi_snd_cwnd`. Direct visibility into TCP congestion state.
+
+**Scaling algorithm:**
+
+```
+On each probe response:
+  1. Update exponential moving average of RTT for this connection
+  2. If avg_rtt > rtt_scale_up_threshold AND current_connections < max_connections:
+       - Establish new connection to peer
+       - Begin load-balancing frames across all connections (round-robin or least-loaded)
+  3. If avg_rtt < rtt_scale_down_threshold for > cooldown_period
+     AND current_connections > min_connections:
+       - Drain one connection (stop sending new frames, wait for in-flight to complete)
+       - Close the drained connection
+```
+
+**Probe message design:**
+
+```
+┌──────────────┬──────────────┬───────────────┐
+│ PROBE_REQUEST│ probe_seq: u64│ send_ts: u64  │
+└──────────────┴──────────────┴───────────────┘
+         ↓ peer echoes back:
+┌──────────────┬──────────────┬───────────────┐
+│ PROBE_REPLY  │ probe_seq: u64│ send_ts: u64  │
+└──────────────┴──────────────┴───────────────┘
+```
+
+Probes are sent at data priority (not control priority) because we want to measure the latency that **data actually experiences**. A probe bypassing the data queue would underestimate congestion.
+
+**Load-balancing frames across connections:**
+
+When multiple connections exist to the same peer, frames are distributed using a **least-loaded** strategy:
+- Pick the connection with the smallest pending write queue
+- This naturally avoids saturated connections
+- Sequence IDs ensure ordering is reconstructed at the receiver regardless of which connection carried each frame
+
+**Why not just one connection?**
+
+A single TCP connection has fundamental throughput limits:
+- TCP congestion window limits in-flight bytes
+- High-bandwidth links with significant RTT ("bandwidth-delay product") need large windows
+- A single stream cannot fully utilize a 10 Gbps link with 1ms RTT without ~1.25 MB in-flight
+- Multiple connections achieve better utilization by having independent congestion windows
+
+#### Recommendation
+
+**Phase 1 (current):** Keep dedicated connections. Simple, correct, sufficient for moderate scale.
+
+**Phase 2 (future):** Add shared mode as an opt-in configuration:
+```rust
+pub enum ConnectionMode {
+    /// Each dataflow gets its own connection(s) per peer. (Default, current behavior)
+    Dedicated,
+    /// Dataflows share adaptive pooled connections; frames are sequenced for ordering/dedup.
+    Shared(SharedConnectionConfig),
+}
+```
+
+The sequencing and adaptive scaling layers should be implemented **below** the `TransportSession` abstraction — `TransportSession` continues to see a reliable ordered stream regardless of the underlying connection mode. This keeps operator code and progress tracking unchanged.
+
+
 ### 6.4 Wire Protocol
 
 Each connection carries multiplexed channels using a simple framing protocol:
@@ -3132,7 +3390,7 @@ When workers run on different machines, progress exchange uses the same connecti
 └──────────┴────────────────────────────────┘
 ```
 
-**Critical ordering guarantee for cross-process:** Data messages and progress messages share connections through the `ConnectionManager`. The implementation must ensure that data pushed to a channel is fully transmitted before the corresponding capability release is sent. For in-process channels, this is guaranteed by Rust's memory model (writes to the bounded buffer happen-before the capability drop). For network channels, the implementation must flush data before sending progress, or use the same ordered stream for both.
+**Critical ordering guarantee for cross-process:** Data messages and progress messages share connections through the `ConnectionManager`. The implementation ensures that data pushed to a channel is transmitted before the corresponding capability release by using a **single FIFO payload channel** per peer in the `TransportSession`. Both data and progress frames are sent through the same bounded `mpsc` channel, preserving the causal order: a worker sends data at time T before releasing its capability for T. The bridge task writes from this shared channel to TCP in FIFO order, with only control messages (handshake, ready barrier) receiving biased priority. This design also prevents cross-dataflow starvation — one dataflow's heavy data cannot block another dataflow's progress messages since they interleave naturally in the shared queue.
 
 #### 11.5.2 Progress and the Adapter Layer
 

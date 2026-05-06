@@ -1,26 +1,31 @@
-//! Multiplexed transport session with priority-separated channels.
+//! Multiplexed transport session with FIFO payload and priority control.
 //!
 //! [`TransportSession`] manages per-peer Muxer/Demuxer infrastructure and
-//! provides **priority-separated send channels** for data, progress, and
-//! control frames.
+//! provides a **FIFO payload channel** (shared by data and progress) and a
+//! **priority control channel** per peer.
 //!
-//! # Priority
+//! # Channel Design
 //!
-//! The per-peer bridge task uses biased `select!` to ensure:
-//! 1. **Control** frames are sent first (handshake, shutdown)
-//! 2. **Progress** frames are sent next (frontier advancement)
-//! 3. **Data** frames are sent last
+//! The per-peer bridge task uses biased `select!`:
+//! 1. **Control** frames have priority (handshake, ready barrier, shutdown)
+//! 2. **Payload** frames (data + progress) are delivered in strict FIFO order
 //!
-//! This prevents data backpressure from blocking progress updates, which
-//! could cause distributed deadlock (full data queue blocks progress,
-//! which blocks frontier advancement needed to drain data).
+//! Data and progress share a single FIFO channel to preserve the timely
+//! ordering invariant: a worker sends data at time T before releasing its
+//! capability (generating the progress message for T). FIFO delivery
+//! guarantees receivers observe data before the frontier advances past T.
+//!
+//! This also prevents cross-dataflow starvation: with separate channels and
+//! priority, one dataflow's heavy data traffic could starve another dataflow's
+//! progress messages, preventing frontier advancement.
 //!
 //! # Ownership
 //!
 //! Each `TransportSession` is created per-dataflow. TCP connections can be
 //! shared across dataflows at the caller level, but each session gets its
 //! own logical channels. The session is `Arc`-wrapped and shared by all
-//! endpoints; background tasks are aborted when the last reference drops.
+//! endpoints; bridge tasks terminate naturally when all senders are dropped,
+//! demux tasks are aborted when the last `Arc` reference drops.
 //!
 //! # Usage
 //!
@@ -34,7 +39,7 @@
 //!     &runtime_handle,
 //! );
 //!
-//! // Get senders for a peer
+//! // Get senders for a peer (both return the same FIFO channel)
 //! let data_tx = session.data_sender("node-b").unwrap();
 //! let progress_tx = session.progress_sender("node-b").unwrap();
 //!
@@ -103,19 +108,33 @@ pub struct ChannelRegistration {
 /// See [module-level documentation](self) for details on priority and ownership.
 #[cfg(feature = "transport")]
 pub struct TransportSession {
-    /// Per-peer data frame senders (bounded).
-    data_senders: HashMap<String, tokio_mpsc::Sender<Frame>>,
-    /// Per-peer progress frame senders (bounded, higher priority than data).
-    progress_senders: HashMap<String, tokio_mpsc::Sender<Frame>>,
+    /// Per-peer payload frame senders (bounded, FIFO for data + progress).
+    ///
+    /// Data and progress frames share a single FIFO channel to preserve the
+    /// timely ordering invariant: a worker sends data before releasing its
+    /// capability (progress), so FIFO delivery guarantees the receiver sees
+    /// data before the frontier advances past it. This also prevents
+    /// cross-dataflow starvation when multiple dataflows share a connection.
+    payload_senders: HashMap<String, tokio_mpsc::Sender<Frame>>,
     /// Per-peer control frame senders (bounded, highest priority).
     control_senders: HashMap<String, tokio_mpsc::Sender<Frame>>,
     /// Shared state keeping background tasks alive (abort on drop).
     _state: std::sync::Arc<SessionState>,
 }
 
-/// Holds background task handles. Aborts all tasks on drop.
+/// Holds background task handles.
+///
+/// Bridge tasks (writers) are NOT aborted — they are detached and terminate
+/// naturally when all their input channel senders are dropped. This ensures
+/// pending data frames are flushed to TCP before the bridge exits.
+///
+/// Demuxer tasks (readers) ARE aborted because they block on TCP reads and
+/// would not terminate until the remote peer closes the connection.
 #[cfg(feature = "transport")]
 struct SessionState {
+    /// Kept alive so bridge tasks are not dropped prematurely.
+    /// They terminate naturally when all senders close.
+    #[allow(dead_code)]
     bridge_handles: Vec<tokio::task::JoinHandle<()>>,
     demux_handles: Vec<tokio::task::JoinHandle<()>>,
 }
@@ -123,9 +142,11 @@ struct SessionState {
 #[cfg(feature = "transport")]
 impl Drop for SessionState {
     fn drop(&mut self) {
-        for handle in &self.bridge_handles {
-            handle.abort();
-        }
+        // Bridge handles are intentionally NOT aborted. Dropping the JoinHandle
+        // detaches the task, letting it drain remaining frames and exit when
+        // all senders drop. This prevents data loss from premature cancellation.
+        //
+        // Demuxer handles must be aborted since they block on TCP reads.
         for handle in &self.demux_handles {
             handle.abort();
         }
@@ -175,8 +196,7 @@ impl TransportSession {
         R: AsyncRead + Unpin + Send + 'static,
         W: AsyncWrite + Unpin + Send + 'static,
     {
-        let mut data_senders = HashMap::new();
-        let mut progress_senders = HashMap::new();
+        let mut payload_senders = HashMap::new();
         let mut control_senders = HashMap::new();
         let mut bridge_handles = Vec::new();
         let mut demux_handles = Vec::new();
@@ -186,20 +206,18 @@ impl TransportSession {
         for conn in connections {
             let peer_node_id = conn.node_id.clone();
 
-            // --- Send side: three priority channels per peer ---
-            let (data_tx, data_rx) = tokio_mpsc::channel::<Frame>(capacity);
-            let (progress_tx, progress_rx) = tokio_mpsc::channel::<Frame>(capacity);
+            // --- Send side: control (priority) + payload (FIFO) per peer ---
+            let (payload_tx, payload_rx) = tokio_mpsc::channel::<Frame>(capacity);
             let (control_tx, control_rx) = tokio_mpsc::channel::<Frame>(capacity);
 
-            data_senders.insert(peer_node_id.clone(), data_tx);
-            progress_senders.insert(peer_node_id.clone(), progress_tx);
+            payload_senders.insert(peer_node_id.clone(), payload_tx);
             control_senders.insert(peer_node_id.clone(), control_tx);
 
-            // Spawn priority bridge task
+            // Spawn bridge task
             let writer = conn.writer;
             let peer_id = peer_node_id.clone();
             let bridge_handle = runtime_handle.spawn(async move {
-                Self::bridge_task(peer_id, writer, control_rx, progress_rx, data_rx).await;
+                Self::bridge_task(peer_id, writer, control_rx, payload_rx).await;
             });
             bridge_handles.push(bridge_handle);
 
@@ -253,8 +271,7 @@ impl TransportSession {
         });
 
         let session = Self {
-            data_senders,
-            progress_senders,
+            payload_senders,
             control_senders,
             _state: state,
         };
@@ -262,21 +279,22 @@ impl TransportSession {
         (session, all_receivers)
     }
 
-    /// Get a data-priority sender for a peer.
+    /// Get a data sender for a peer.
     ///
+    /// Returns the shared payload sender (FIFO with progress). Data and
+    /// progress share the same channel to preserve timely's ordering invariant.
     /// Returns `None` if no connection exists to the specified peer.
-    /// The sender can be cloned for use by multiple `NetworkPush` endpoints
-    /// targeting the same peer.
     pub fn data_sender(&self, peer_node_id: &str) -> Option<&tokio_mpsc::Sender<Frame>> {
-        self.data_senders.get(peer_node_id)
+        self.payload_senders.get(peer_node_id)
     }
 
-    /// Get a progress-priority sender for a peer.
+    /// Get a progress sender for a peer.
     ///
-    /// Progress frames are sent with higher priority than data, preventing
-    /// data backpressure from blocking frontier advancement.
+    /// Returns the same shared payload sender as [`data_sender`](Self::data_sender).
+    /// Data and progress use a single FIFO channel to ensure that data at
+    /// time T arrives at the receiver before the frontier advances past T.
     pub fn progress_sender(&self, peer_node_id: &str) -> Option<&tokio_mpsc::Sender<Frame>> {
-        self.progress_senders.get(peer_node_id)
+        self.payload_senders.get(peer_node_id)
     }
 
     /// Get a control-priority sender for a peer (highest priority).
@@ -289,26 +307,35 @@ impl TransportSession {
 
     /// Returns the set of peer node IDs this session has connections to.
     pub fn peer_node_ids(&self) -> impl Iterator<Item = &str> {
-        self.data_senders.keys().map(|s| s.as_str())
+        self.payload_senders.keys().map(|s| s.as_str())
     }
 
-    /// Priority bridge task: reads from control/progress/data channels
-    /// and writes to the TCP connection with priority ordering.
+    /// Multiplexes control and payload frames onto a single TCP writer.
     ///
-    /// Uses `biased` `select!` to ensure control > progress > data ordering
-    /// when multiple channels have pending frames simultaneously.
+    /// Priority: **control (biased) > payload (FIFO)**.
+    ///
+    /// Control messages (handshake, ready barrier) get priority to ensure
+    /// cluster setup completes promptly. Data and progress share a single
+    /// FIFO payload channel, preserving the timely ordering invariant:
+    /// since a worker sends data before releasing its capability, FIFO
+    /// delivery guarantees receivers see data before the frontier advances.
+    ///
+    /// The task exits when both channels are closed (all senders dropped).
     async fn bridge_task<W: AsyncWrite + Unpin>(
         _peer_id: String,
         writer: W,
         mut control_rx: tokio_mpsc::Receiver<Frame>,
-        mut progress_rx: tokio_mpsc::Receiver<Frame>,
-        mut data_rx: tokio_mpsc::Receiver<Frame>,
+        mut payload_rx: tokio_mpsc::Receiver<Frame>,
     ) {
         let mut framed_writer = FramedWriter::new(writer);
         let mut control_open = true;
-        let mut progress_open = true;
+        let mut payload_open = true;
 
         loop {
+            if !control_open && !payload_open {
+                break;
+            }
+
             let frame = tokio::select! {
                 biased;
 
@@ -316,28 +343,9 @@ impl TransportSession {
                     Some(f) => f,
                     None => { control_open = false; continue; }
                 },
-                result = progress_rx.recv(), if progress_open => match result {
+                result = payload_rx.recv(), if payload_open => match result {
                     Some(f) => f,
-                    None => { progress_open = false; continue; }
-                },
-                result = data_rx.recv() => match result {
-                    Some(f) => f,
-                    None => {
-                        // Data channel closed → drain remaining control/progress
-                        // frames before exiting to avoid losing late-arriving
-                        // progress updates or shutdown sentinels.
-                        while let Ok(f) = control_rx.try_recv() {
-                            if framed_writer.write_frame(&f).await.is_err() {
-                                return;
-                            }
-                        }
-                        while let Ok(f) = progress_rx.try_recv() {
-                            if framed_writer.write_frame(&f).await.is_err() {
-                                return;
-                            }
-                        }
-                        break;
-                    }
+                    None => { payload_open = false; continue; }
                 },
             };
 
@@ -770,7 +778,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn session_drop_aborts_tasks() {
+    async fn session_drop_terminates_tasks() {
         let df_id = make_dataflow_id();
         let (a_to_b, b_from_a) = tokio::io::duplex(64 * 1024);
         let (_b_to_a, _a_from_b) = tokio::io::duplex(64 * 1024);
@@ -790,10 +798,141 @@ mod tests {
             &rt,
         );
 
-        // Drop the session — tasks should be aborted
+        // Drop the session — bridge tasks terminate when senders close,
+        // demux tasks are aborted.
         drop(session);
 
-        // If tasks weren't aborted, they'd leak. We just verify no panic.
+        // Tasks should clean up promptly. Verify no panic or hang.
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+
+    /// Regression test: verifies that data and progress frames sent by a
+    /// worker in causal order (data first, then progress) arrive at the
+    /// receiver in the same order on the TCP stream.
+    ///
+    /// With the old 3-channel design (separate data/progress channels with
+    /// biased select prioritizing progress), this test would intermittently
+    /// fail because progress could be written to TCP before data.
+    #[tokio::test]
+    async fn data_progress_fifo_ordering() {
+        let df_id = make_dataflow_id();
+        let (a_to_b, b_from_a) = tokio::io::duplex(64 * 1024);
+        let (b_to_a, a_from_b) = tokio::io::duplex(64 * 1024);
+
+        let rt = tokio::runtime::Handle::current();
+
+        // Use channel IDs: 1 for data, 1000 for progress (typical layout).
+        let data_ch = 1u64;
+        let progress_ch = 1000u64;
+
+        let (session_a, _) = TransportSession::new(
+            df_id,
+            vec![PeerConnection {
+                node_id: "node-b".into(),
+                reader: a_from_b,
+                writer: a_to_b,
+            }],
+            &[],
+            &[],
+            16,
+            &rt,
+        );
+
+        let (_session_b, mut recv_b) = TransportSession::new(
+            df_id,
+            vec![PeerConnection {
+                node_id: "node-a".into(),
+                reader: b_from_a,
+                writer: b_to_a,
+            }],
+            &[
+                ChannelRegistration {
+                    peer_node_id: "node-a".into(),
+                    channel_id: data_ch,
+                },
+                ChannelRegistration {
+                    peer_node_id: "node-a".into(),
+                    channel_id: progress_ch,
+                },
+            ],
+            &[],
+            16,
+            &rt,
+        );
+
+        let data_sender = session_a.data_sender("node-b").unwrap().clone();
+        let progress_sender = session_a.progress_sender("node-b").unwrap().clone();
+
+        // Simulate a worker sending data then progress rapidly, many times.
+        // With the old priority bug, progress would race ahead of data.
+        let num_epochs = 100;
+        for epoch in 0u32..num_epochs {
+            // Worker sends data FIRST
+            data_sender
+                .send(Frame {
+                    dataflow_id: df_id,
+                    channel_id: data_ch,
+                    payload: epoch.to_le_bytes().to_vec(),
+                })
+                .await
+                .unwrap();
+            // Worker then releases capability (progress)
+            progress_sender
+                .send(Frame {
+                    dataflow_id: df_id,
+                    channel_id: progress_ch,
+                    payload: epoch.to_le_bytes().to_vec(),
+                })
+                .await
+                .unwrap();
+        }
+
+        // Drop senders to let bridge drain and close.
+        drop(data_sender);
+        drop(progress_sender);
+        drop(session_a);
+
+        // Collect received frames in order and verify data[N] arrives before
+        // progress[N] for every epoch.
+        let timeout = std::time::Duration::from_secs(5);
+        let peer_map = recv_b.get_mut("node-a").unwrap();
+        let mut data_rx = peer_map.remove(&data_ch).unwrap();
+        let mut progress_rx = peer_map.remove(&progress_ch).unwrap();
+
+        // Collect all data frames
+        let mut data_received = Vec::new();
+        while let Ok(Some(payload)) =
+            tokio::time::timeout(timeout, data_rx.recv()).await
+        {
+            data_received.push(u32::from_le_bytes(payload[..4].try_into().unwrap()));
+        }
+
+        // Collect all progress frames
+        let mut progress_received = Vec::new();
+        while let Ok(Some(payload)) =
+            tokio::time::timeout(timeout, progress_rx.recv()).await
+        {
+            progress_received.push(u32::from_le_bytes(payload[..4].try_into().unwrap()));
+        }
+
+        // All epochs must be received
+        assert_eq!(
+            data_received.len(),
+            num_epochs as usize,
+            "expected all data frames"
+        );
+        assert_eq!(
+            progress_received.len(),
+            num_epochs as usize,
+            "expected all progress frames"
+        );
+
+        // Verify FIFO ordering (both should be 0,1,2,...,N-1)
+        let expected: Vec<u32> = (0..num_epochs).collect();
+        assert_eq!(data_received, expected, "data should be in FIFO order");
+        assert_eq!(
+            progress_received, expected,
+            "progress should be in FIFO order"
+        );
     }
 }

@@ -19,6 +19,9 @@
 //! internally, operators work with concrete Rust types (no dynamic dispatch on data).
 
 use std::collections::VecDeque;
+use std::future::Future;
+use std::pin::Pin;
+use std::sync::Arc;
 
 use crate::dataflow::channels::envelope::{Envelope, Payload};
 use crate::dataflow::channels::pushpull::{Pull, Push};
@@ -1673,6 +1676,297 @@ impl<T: Timestamp, D1: Send + 'static, D2: Send + 'static> SchedulableOperator
     /// fired notifications that haven't been consumed by `next_notification()`.
     fn has_ready_notifications(&self) -> bool {
         self.notificator.has_ready()
+    }
+}
+
+// ---------------------------------------------------------------------------
+// WiredUnaryAsyncOperator
+// ---------------------------------------------------------------------------
+
+/// Type alias for the async logic closure used by `unary_async`.
+///
+/// The closure receives a timestamp and a batch of input items, and returns
+/// a future that produces a `Result<Vec<D2>>` (the output items for that batch).
+pub type AsyncLogicFn<T, D1, D2> = Arc<
+    dyn Fn(T, Vec<D1>) -> Pin<Box<dyn Future<Output = Result<Vec<D2>>> + Send>>
+        + Send
+        + Sync,
+>;
+
+/// A fully-wired async unary operator that spawns tokio tasks for batch processing.
+///
+/// Unlike the synchronous `WiredUnaryOperator`, this operator:
+/// 1. Spawns a tokio task for each input batch (bounded by `max_concurrency`)
+/// 2. Collects completed results via an internal mpsc channel
+/// 3. Pushes completed results to the output channel on each `activate()` call
+///
+/// This is ideal for operators that perform async I/O (database lookups, HTTP
+/// requests, RPC calls) where blocking the executor would waste scheduler time.
+///
+/// # Ordering
+///
+/// Output order is **not guaranteed** to match input order — results arrive in
+/// completion order. If strict ordering is required, the user should include
+/// sequence information in the data and sort downstream.
+///
+/// # Concurrency control
+///
+/// `max_concurrency` limits how many tokio tasks can be in-flight simultaneously.
+/// Input that exceeds the limit is buffered internally and dispatched as tasks
+/// complete.
+///
+/// # Limitations
+///
+/// - **Progress tracking**: This operator does not hold output capabilities while
+///   async tasks are in-flight. Downstream frontier advancement is not blocked by
+///   pending async work. For progress-sensitive use cases, use `unary_notify` with
+///   manual async coordination instead.
+/// - **Scheduling**: When tasks are in-flight but no results have arrived, the
+///   operator returns `MadeProgress` causing the executor to re-poll. Future work
+///   will integrate `WakeHandle` for proper wake-based scheduling.
+pub struct WiredUnaryAsyncOperator<T: Timestamp, D1: Send + 'static, D2: Send + 'static> {
+    name: String,
+    index: usize,
+    stage_id: StageId,
+
+    /// Input channel — pulls envelopes from upstream.
+    input_puller: Box<dyn Pull<T, D1>>,
+    /// Operator's typed input buffer.
+    input_handle: InputHandle<T, D1>,
+
+    /// Async logic — shared across spawned tasks via Arc.
+    logic: AsyncLogicFn<T, D1, D2>,
+
+    /// Maximum number of concurrent in-flight async tasks.
+    max_concurrency: usize,
+    /// Current number of in-flight tasks.
+    in_flight: usize,
+
+    /// Sender for spawned tasks to return results.
+    result_tx: tokio::sync::mpsc::UnboundedSender<Result<(T, Vec<D2>)>>,
+    /// Receiver for collecting completed task results.
+    result_rx: tokio::sync::mpsc::UnboundedReceiver<Result<(T, Vec<D2>)>>,
+
+    /// Buffered input waiting for concurrency slots.
+    pending_input: VecDeque<(T, Vec<D1>)>,
+
+    /// Output channel — pushes envelopes downstream.
+    output_pusher: Box<dyn Push<T, D2>>,
+    /// Pending output: batches produced but not yet pushed to channel.
+    pending_output: VecDeque<Envelope<T, D2>>,
+
+    /// Tokio runtime handle for spawning async tasks.
+    tokio_handle: tokio::runtime::Handle,
+
+    /// Whether the input channel is exhausted.
+    input_exhausted: bool,
+    /// Whether this operator has completed.
+    done: bool,
+}
+
+impl<T: Timestamp, D1: Send + 'static, D2: Send + 'static> WiredUnaryAsyncOperator<T, D1, D2> {
+    /// Create a new wired async unary operator.
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        name: impl Into<String>,
+        index: usize,
+        stage_id: StageId,
+        logic: AsyncLogicFn<T, D1, D2>,
+        max_concurrency: usize,
+        input_puller: Box<dyn Pull<T, D1>>,
+        output_pusher: Box<dyn Push<T, D2>>,
+        tokio_handle: tokio::runtime::Handle,
+    ) -> Self {
+        let (result_tx, result_rx) = tokio::sync::mpsc::unbounded_channel();
+        let name = name.into();
+        Self {
+            input_handle: InputHandle::new(format!("{name}:input")),
+            name,
+            index,
+            stage_id,
+            input_puller,
+            logic,
+            max_concurrency: max_concurrency.max(1),
+            in_flight: 0,
+            result_tx,
+            result_rx,
+            pending_input: VecDeque::new(),
+            output_pusher,
+            pending_output: VecDeque::new(),
+            tokio_handle,
+            input_exhausted: false,
+            done: false,
+        }
+    }
+
+    /// Try to flush pending output envelopes to the output channel.
+    fn flush_pending_output(&mut self) -> Result<bool> {
+        while let Some(envelope) = self.pending_output.pop_front() {
+            match self.output_pusher.try_push(envelope) {
+                Ok(()) => {}
+                Err((Error::Backpressure, returned)) => {
+                    self.pending_output.push_front(returned);
+                    return Ok(false);
+                }
+                Err((e, _returned)) => return Err(e),
+            }
+        }
+        Ok(true)
+    }
+
+    /// Pull from input channel and feed the InputHandle.
+    fn pull_input(&mut self) {
+        loop {
+            match self.input_puller.pull() {
+                Some(envelope) => match envelope.payload {
+                    Payload::Data { time, data } => {
+                        self.input_handle.push_vec(time, data);
+                    }
+                    Payload::Control(_signal) => {}
+                },
+                None => {
+                    if self.input_puller.is_exhausted() {
+                        self.input_exhausted = true;
+                        self.input_handle.mark_exhausted();
+                    }
+                    break;
+                }
+            }
+        }
+    }
+
+    /// Drain input handle into pending_input buffer.
+    fn drain_input_to_pending(&mut self) {
+        while let Some((time, data)) = self.input_handle.next() {
+            self.pending_input.push_back((time, data));
+        }
+    }
+
+    /// Spawn tasks for pending input up to the concurrency limit.
+    fn spawn_pending(&mut self) {
+        while self.in_flight < self.max_concurrency {
+            if let Some((time, data)) = self.pending_input.pop_front() {
+                let logic = Arc::clone(&self.logic);
+                let tx = self.result_tx.clone();
+                let time_for_logic = time.clone();
+                // Use a nested spawn to catch panics: the outer task awaits the
+                // inner JoinHandle, which converts panics into JoinError.
+                let handle = self.tokio_handle.clone();
+                self.tokio_handle.spawn(async move {
+                    let inner =
+                        handle.spawn(async move { logic(time_for_logic, data).await });
+                    let result = match inner.await {
+                        Ok(Ok(output)) => Ok(output),
+                        Ok(Err(e)) => Err(e),
+                        Err(join_err) => Err(Error::Custom(format!(
+                            "unary_async task panicked: {join_err}"
+                        ))),
+                    };
+                    let _ = tx.send(result.map(|output| (time, output)));
+                });
+                self.in_flight += 1;
+            } else {
+                break;
+            }
+        }
+    }
+
+    /// Drain completed results from the result channel into pending_output.
+    /// Returns true if any results were collected.
+    fn collect_results(&mut self) -> Result<bool> {
+        let mut collected = false;
+        loop {
+            match self.result_rx.try_recv() {
+                Ok(Ok((time, data))) => {
+                    self.in_flight -= 1;
+                    if !data.is_empty() {
+                        self.pending_output.push_back(Envelope::data(time, data));
+                    }
+                    collected = true;
+                }
+                Ok(Err(e)) => {
+                    self.in_flight -= 1;
+                    return Err(e);
+                }
+                Err(tokio::sync::mpsc::error::TryRecvError::Empty) => break,
+                Err(tokio::sync::mpsc::error::TryRecvError::Disconnected) => break,
+            }
+        }
+        Ok(collected)
+    }
+}
+
+impl<T: Timestamp, D1: Send + 'static, D2: Send + 'static> SchedulableOperator
+    for WiredUnaryAsyncOperator<T, D1, D2>
+{
+    fn activate(&mut self) -> Result<ActivationOutcome> {
+        if self.done {
+            return Ok(ActivationOutcome::Done);
+        }
+
+        // Step 1: Try to flush any pending output first.
+        if !self.pending_output.is_empty() && !self.flush_pending_output()? {
+            return Ok(ActivationOutcome::BlockedOnBackpressure);
+        }
+
+        // Step 2: Collect completed async results.
+        let collected = self.collect_results()?;
+
+        // Step 3: Flush newly collected results.
+        if !self.pending_output.is_empty() && !self.flush_pending_output()? {
+            return Ok(ActivationOutcome::BlockedOnBackpressure);
+        }
+
+        // Step 4: Pull from input channel.
+        self.pull_input();
+        self.drain_input_to_pending();
+
+        // Step 5: Spawn tasks for pending input.
+        self.spawn_pending();
+
+        // Step 6: Check completion conditions.
+        if self.input_exhausted
+            && self.pending_input.is_empty()
+            && self.in_flight == 0
+            && self.pending_output.is_empty()
+        {
+            self.output_pusher.close();
+            self.done = true;
+            return Ok(ActivationOutcome::Done);
+        }
+
+        // Step 7: Determine outcome.
+        // TODO: When in-flight tasks exist but no results were collected this activation,
+        // returning MadeProgress causes the executor to re-poll. A proper wake-based
+        // approach (passing WakeHandle to spawned tasks) would allow returning Idle here
+        // and getting woken when results arrive. For now, MadeProgress is correct but
+        // slightly less efficient (bounded by poll budget).
+        if collected || !self.pending_input.is_empty() || self.in_flight > 0 {
+            Ok(ActivationOutcome::MadeProgress)
+        } else {
+            Ok(ActivationOutcome::Idle)
+        }
+    }
+
+    fn is_done(&self) -> bool {
+        self.done
+    }
+
+    fn name(&self) -> &str {
+        &self.name
+    }
+
+    fn index(&self) -> usize {
+        self.index
+    }
+
+    fn stage_id(&self) -> StageId {
+        self.stage_id
+    }
+
+    fn close_inputs(&mut self) {
+        self.input_exhausted = true;
+        self.input_handle.mark_exhausted();
     }
 }
 

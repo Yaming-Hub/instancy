@@ -6038,4 +6038,159 @@ mod tests {
         // on whether cancellation counts as error. Either way, it should not hang.
         let _ = result;
     }
+
+    #[tokio::test]
+    async fn test_unary_async_basic() {
+        use crate::dataflow::DataflowBuilder;
+
+        let rt = RuntimeHandle::new(RuntimeConfig {
+            worker_threads: 2,
+            ..RuntimeConfig::default()
+        })
+        .unwrap();
+
+        let builder = DataflowBuilder::<u64>::new("async_pipeline");
+        let input = builder.input::<i32>("data");
+
+        // Async operator that doubles each item with a simulated async delay
+        let logic = Arc::new(|_time: u64, batch: Vec<i32>| async move {
+            tokio::task::yield_now().await;
+            Ok(batch.into_iter().map(|x| x * 2).collect::<Vec<i32>>())
+        });
+
+        let _output = input.unary_async("double_async", 4, logic).output("results");
+        let df = builder.build().unwrap();
+        let mut handle = rt.spawn(df, SpawnOptions::default()).unwrap();
+
+        let tx = handle.take_input::<i32>("data").unwrap();
+        let rx = handle.take_output::<i32>("results").unwrap();
+        tx.send(0, vec![10, 20, 30]).unwrap();
+        tx.close();
+
+        handle.join().await.unwrap();
+
+        let mut results: Vec<i32> = Vec::new();
+        while let Some(event) = rx.recv() {
+            if let crate::dataflow::operators::output::OutputEvent::Data { data, .. } = event {
+                results.extend(data);
+            }
+        }
+        results.sort();
+        assert_eq!(results, vec![20, 40, 60]);
+    }
+
+    #[tokio::test]
+    async fn test_unary_async_concurrency_limit() {
+        use crate::dataflow::DataflowBuilder;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let rt = RuntimeHandle::new(RuntimeConfig {
+            worker_threads: 2,
+            ..RuntimeConfig::default()
+        })
+        .unwrap();
+
+        let builder = DataflowBuilder::<u64>::new("concurrency_test");
+        let input = builder.input::<i32>("data");
+
+        let peak_concurrency = Arc::new(AtomicUsize::new(0));
+        let current = Arc::new(AtomicUsize::new(0));
+        let peak_clone = Arc::clone(&peak_concurrency);
+        let current_clone = Arc::clone(&current);
+
+        let logic = Arc::new(move |_time: u64, batch: Vec<i32>| {
+            let current = Arc::clone(&current_clone);
+            let peak = Arc::clone(&peak_clone);
+            async move {
+                let prev = current.fetch_add(1, Ordering::SeqCst);
+                peak.fetch_max(prev + 1, Ordering::SeqCst);
+                tokio::task::yield_now().await;
+                current.fetch_sub(1, Ordering::SeqCst);
+                Ok(batch)
+            }
+        });
+
+        // max_concurrency = 2
+        let _output = input.unary_async("limited", 2, logic).output("out");
+        let df = builder.build().unwrap();
+        let mut handle = rt.spawn(df, SpawnOptions::default()).unwrap();
+
+        let tx = handle.take_input::<i32>("data").unwrap();
+        for i in 0..10 {
+            tx.send(i as u64, vec![i]).unwrap();
+        }
+        tx.close();
+
+        handle.join().await.unwrap();
+
+        // Peak concurrency should not exceed 2
+        assert!(peak_concurrency.load(Ordering::SeqCst) <= 2);
+    }
+
+    #[tokio::test]
+    async fn test_unary_async_error_propagation() {
+        use crate::dataflow::DataflowBuilder;
+
+        let rt = RuntimeHandle::new(RuntimeConfig {
+            worker_threads: 2,
+            ..RuntimeConfig::default()
+        })
+        .unwrap();
+
+        let builder = DataflowBuilder::<u64>::new("error_test");
+        let input = builder.input::<i32>("data");
+
+        let logic = Arc::new(|_time: u64, _batch: Vec<i32>| async move {
+            Err(crate::error::Error::Custom("async failure".into()))
+        });
+
+        let _output = input
+            .unary_async::<i32, _, _>("failing", 4, logic)
+            .output("out");
+        let df = builder.build().unwrap();
+        let mut handle = rt.spawn(df, SpawnOptions::default()).unwrap();
+
+        let tx = handle.take_input::<i32>("data").unwrap();
+        tx.send(0, vec![1]).unwrap();
+        tx.close();
+
+        let result = handle.join().await;
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_unary_async_panic_recovery() {
+        use crate::dataflow::DataflowBuilder;
+
+        let rt = RuntimeHandle::new(RuntimeConfig {
+            worker_threads: 2,
+            ..RuntimeConfig::default()
+        })
+        .unwrap();
+
+        let builder = DataflowBuilder::<u64>::new("panic_test");
+        let input = builder.input::<i32>("data");
+
+        let logic = Arc::new(|_time: u64, _batch: Vec<i32>| async move {
+            panic!("intentional panic in async logic");
+            #[allow(unreachable_code)]
+            Ok(vec![])
+        });
+
+        let _output = input
+            .unary_async::<i32, _, _>("panicking", 4, logic)
+            .output("out");
+        let df = builder.build().unwrap();
+        let mut handle = rt.spawn(df, SpawnOptions::default()).unwrap();
+
+        let tx = handle.take_input::<i32>("data").unwrap();
+        tx.send(0, vec![1]).unwrap();
+        tx.close();
+
+        // Should complete with error rather than hanging
+        let result = handle.join().await;
+        assert!(result.is_err());
+        let err_msg = format!("{}", result.unwrap_err());
+        assert!(err_msg.contains("panic"), "error should mention panic: {err_msg}");
+    }
 }

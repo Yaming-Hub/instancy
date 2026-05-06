@@ -19,6 +19,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `RuntimeHandle::active_dataflows()` — returns the number of currently running dataflows (#143)
 - `RuntimeHandle::wait_idle()` — async method that resolves when all dataflows complete (#143)
 - `RuntimeHandle::shutdown_async()` — cancels all dataflows and awaits their completion (#143)
+- `Future` impl for `MultiDataflowCompletion` — enables `.await` on multi-worker dataflows (#144)
+
+#### Operators
+- `Pipe::unary_async(name, max_concurrency, logic)` — async unary operator that spawns tokio tasks for each input batch (#145)
+  - Bounded concurrency control via `max_concurrency` parameter
+  - Results arrive in completion order (not input order)
+  - Error propagation from async tasks to the dataflow
 
 #### Cancellation
 - External cancellation token support via `SpawnOptions::cancellation_token()` — accepts a `tokio_util::sync::CancellationToken` to cancel dataflows from user code (#139)
@@ -57,6 +64,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Edge case integration tests: empty streams, large batches, deep pipelines, concat (#137)
 
 ### Fixed
+- **Transport FIFO ordering violation** — data and progress frames could be reordered on the wire due to separate priority channels in the bridge task. Merged into a single FIFO payload channel per peer, preserving the timely ordering invariant (data at time T arrives before frontier advances past T). Also prevents cross-dataflow progress starvation under heavy data load. (#146)
 - Control broadcast and cancellation wiring for cluster-local workers (#131)
 - Compilation regression in tests/examples from schedule_policy API change (#136)
 
