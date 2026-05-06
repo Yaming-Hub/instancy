@@ -19,6 +19,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `RuntimeHandle::active_dataflows()` — returns the number of currently running dataflows (#143)
 - `RuntimeHandle::wait_idle()` — async method that resolves when all dataflows complete (#143)
 - `RuntimeHandle::shutdown_async()` — cancels all dataflows and awaits their completion (#143)
+- `Future` impl for `MultiDataflowCompletion` — enables `.await` on multi-worker dataflows (#144)
+
+#### Operators
+- `Pipe::unary_async(name, max_concurrency, logic)` — async unary operator that spawns tokio tasks for each input batch (#145)
+  - Bounded concurrency control via `max_concurrency` parameter
+  - Results arrive in completion order (not input order)
+  - Error propagation from async tasks to the dataflow
 
 #### Cancellation
 - External cancellation token support via `SpawnOptions::cancellation_token()` — accepts a `tokio_util::sync::CancellationToken` to cancel dataflows from user code (#139)
