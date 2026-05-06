@@ -2377,38 +2377,138 @@ impl ReorderBuffer {
 | **Cross-dataflow fairness** | Perfect isolation | Shared bandwidth — needs fair scheduling |
 | **Implementation complexity** | Simple | Moderate (sequencing, buffering, timeout, retry) |
 
-#### Pros of Shared Connection Mode
+#### Pros of Shared Connection Mode (with Adaptive Scaling)
 
-1. **Resource efficiency** — O(peers) connections instead of O(dataflows × peers). Critical at scale.
+1. **Resource efficiency** — O(peers) base connections instead of O(dataflows × peers). Critical at scale.
 2. **Connection reuse** — new dataflows start instantly on existing pool connections.
 3. **Resilience** — connection failure doesn't kill the dataflow; retry on alternate connection.
-4. **Higher throughput** — parallel connections per peer (stripe data across pool).
+4. **Higher throughput** — parallel connections per peer with independent congestion windows. A single TCP connection cannot fully utilize high-bandwidth links due to bandwidth-delay product limits.
 5. **Simpler lifecycle** — no need to establish/teardown connections per dataflow.
+6. **Self-tuning latency** — RTT probes detect congestion early; adaptive scaling adds connections to maintain latency target. Under heavy load, shared mode achieves *lower* latency than dedicated mode (which is stuck with a single saturated connection).
+7. **Graceful degradation** — under light load, operates with min_connections (essentially dedicated mode behavior with negligible overhead). Scales up only when measured RTT justifies it.
 
-#### Cons of Shared Connection Mode
+#### Cons of Shared Connection Mode (with Adaptive Scaling)
 
-1. **Added latency** — reorder buffer introduces wait time when frames arrive out-of-order.
-2. **Memory overhead** — per-stream reorder buffers with pending frame storage.
-3. **Complexity** — sequence management, gap detection, timeout handling, duplicate filtering.
-4. **Head-of-line blocking risk** — one slow/broken connection can cause reorder waits for all streams that touched it.
-5. **Failure semantics change** — "connection broken" no longer means "dataflow dead" — must propagate failure differently (timeout-based).
-6. **Wire overhead** — 8 extra bytes per frame (negligible for large payloads, noticeable for small progress messages).
+1. **Implementation complexity** — sequence management, gap detection, timeout handling, duplicate filtering, RTT probing, and scaling logic. Significantly more code than dedicated mode.
+2. **Memory overhead** — per-stream reorder buffers with pending frame storage. Bounded by `max_connections × max_in_flight_per_connection`.
+3. **Failure semantics change** — "connection broken" no longer means "dataflow dead" — must propagate failure differently (timeout-based after all retry paths exhausted).
+4. **Wire overhead** — 8 extra bytes per frame for sequence_id. Negligible for data payloads; ~20% overhead for small progress messages (~40 bytes). Sub-microsecond parsing cost — irrelevant vs network RTT.
+5. **Brief reorder windows** — during connection scale-up/scale-down transitions, frames may arrive out-of-order for a short period. The reorder buffer handles this transparently but adds a brief latency spike (~probe_interval duration).
+
+#### Performance Analysis: Adaptive Scaling Mitigates Original Concerns
+
+The original fixed-pool design had real performance concerns. Adaptive scaling addresses each:
+
+| Concern | Fixed Pool (no scaling) | With Adaptive Scaling |
+|---------|------------------------|----------------------|
+| **Latency under light load** | Same as dedicated | Same as dedicated (min_connections ≈ 1-2, near-zero overhead) |
+| **Latency under heavy load** | Reorder waits when frames contend | **Better than dedicated** — scales connections to maintain RTT below threshold |
+| **Head-of-line blocking** | Real risk — stalled connection blocks all streams | Detected via RTT probe in ~100ms; load balancer routes around stalled connection |
+| **Throughput ceiling** | Fixed by pool size | Scales dynamically — each new connection adds an independent TCP congestion window |
+| **Connection overhead at rest** | Fixed pool wastes resources | Scales down to min_connections during idle periods |
+
+**Key insight:** Dedicated mode has a fundamental limitation — under heavy load, a single TCP connection saturates with no recovery path. The adaptive shared mode is the only design that maintains latency invariants across all load levels, because it uses measured feedback (RTT probes) to trigger corrective action (add connections) before saturation causes visible delays.
+
+**When does shared mode equal or beat dedicated?**
+- **Light load:** Equivalent (min_connections, no reorder waits, negligible sequence overhead)
+- **Moderate load:** Equivalent or better (single connection handles load, probes confirm healthy RTT)
+- **Heavy load:** Significantly better (scales to multiple connections, parallel throughput, bounded latency)
+- **Connection failure:** Significantly better (retry on alternate, no dataflow death)
+
+The only scenario where dedicated mode wins is **zero-overhead simplicity** for deployments that never scale beyond moderate load and don't need resilience.
+
+#### Adaptive Connection Scaling
+
+The shared connection pool does **not** use a fixed number of connections per peer. Instead, it dynamically scales connections based on measured load — similar to how the worker pool scales threads within a min/max range.
+
+**Configuration:**
+```rust
+pub struct SharedConnectionConfig {
+    /// Minimum connections to maintain per peer (pre-warmed).
+    pub min_connections: usize,           // e.g., 1
+    /// Maximum connections allowed per peer.
+    pub max_connections: usize,           // e.g., 16
+    /// RTT threshold: scale up when probe RTT exceeds this.
+    pub rtt_scale_up_threshold: Duration, // e.g., 5ms
+    /// RTT target: scale down when probe RTT is below this for sustained period.
+    pub rtt_scale_down_threshold: Duration, // e.g., 1ms
+    /// How long RTT must stay below scale-down threshold before removing a connection.
+    pub cooldown_period: Duration,        // e.g., 30s
+    /// Interval between probe messages.
+    pub probe_interval: Duration,         // e.g., 100ms
+    /// Timeout for reorder buffer gap detection.
+    pub reorder_timeout: Duration,        // e.g., 50ms
+}
+```
+
+**Load measurement signals:**
+
+1. **RTT probes** (primary signal) — Lightweight probe messages sent at `probe_interval` with the **same priority as data** (travel through the same FIFO path). Measures true end-to-end latency including TCP buffer congestion. When RTT exceeds `rtt_scale_up_threshold`, it indicates the connection is saturated.
+
+2. **Send queue depth** — Number of frames buffered in the write queue waiting to be flushed to TCP. High queue depth means the connection can't drain fast enough.
+
+3. **Throughput per connection** — Bytes/sec actually written. When throughput plateaus while queue depth grows, the connection is at capacity.
+
+4. **TCP kernel metrics** (optional, platform-specific) — `TCP_INFO` on Linux provides `tcpi_rtt`, `tcpi_retransmits`, `tcpi_snd_cwnd`. Direct visibility into TCP congestion state.
+
+**Scaling algorithm:**
+
+```
+On each probe response:
+  1. Update exponential moving average of RTT for this connection
+  2. If avg_rtt > rtt_scale_up_threshold AND current_connections < max_connections:
+       - Establish new connection to peer
+       - Begin load-balancing frames across all connections (round-robin or least-loaded)
+  3. If avg_rtt < rtt_scale_down_threshold for > cooldown_period
+     AND current_connections > min_connections:
+       - Drain one connection (stop sending new frames, wait for in-flight to complete)
+       - Close the drained connection
+```
+
+**Probe message design:**
+
+```
+┌──────────────┬──────────────┬───────────────┐
+│ PROBE_REQUEST│ probe_seq: u64│ send_ts: u64  │
+└──────────────┴──────────────┴───────────────┘
+         ↓ peer echoes back:
+┌──────────────┬──────────────┬───────────────┐
+│ PROBE_REPLY  │ probe_seq: u64│ send_ts: u64  │
+└──────────────┴──────────────┴───────────────┘
+```
+
+Probes are sent at data priority (not control priority) because we want to measure the latency that **data actually experiences**. A probe bypassing the data queue would underestimate congestion.
+
+**Load-balancing frames across connections:**
+
+When multiple connections exist to the same peer, frames are distributed using a **least-loaded** strategy:
+- Pick the connection with the smallest pending write queue
+- This naturally avoids saturated connections
+- Sequence IDs ensure ordering is reconstructed at the receiver regardless of which connection carried each frame
+
+**Why not just one connection?**
+
+A single TCP connection has fundamental throughput limits:
+- TCP congestion window limits in-flight bytes
+- High-bandwidth links with significant RTT ("bandwidth-delay product") need large windows
+- A single stream cannot fully utilize a 10 Gbps link with 1ms RTT without ~1.25 MB in-flight
+- Multiple connections achieve better utilization by having independent congestion windows
 
 #### Recommendation
 
 **Phase 1 (current):** Keep dedicated connections. Simple, correct, sufficient for moderate scale.
 
-**Phase 2 (future):** Add shared mode as an opt-in `ConnectionMode` configuration:
+**Phase 2 (future):** Add shared mode as an opt-in configuration:
 ```rust
 pub enum ConnectionMode {
     /// Each dataflow gets its own connection(s) per peer. (Default, current behavior)
     Dedicated,
-    /// Dataflows share pooled connections; frames are sequenced for ordering/dedup.
-    Shared { reorder_timeout: Duration },
+    /// Dataflows share adaptive pooled connections; frames are sequenced for ordering/dedup.
+    Shared(SharedConnectionConfig),
 }
 ```
 
-The sequencing layer should be implemented **below** the `TransportSession` abstraction — `TransportSession` continues to see a reliable ordered stream regardless of the underlying connection mode. This keeps operator code and progress tracking unchanged.
+The sequencing and adaptive scaling layers should be implemented **below** the `TransportSession` abstraction — `TransportSession` continues to see a reliable ordered stream regardless of the underlying connection mode. This keeps operator code and progress tracking unchanged.
 
 
 ### 6.4 Wire Protocol
