@@ -22,6 +22,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - `ConnectionMetrics` — per-connection load tracking (pending writes, RTT, bytes/frames written)
   - `PeerPool` — per-peer pool with least-loaded selection and adaptive scaling decisions
   - `ScalingDecision` enum — `None` / `ScaleUp` / `ScaleDown { connection_id }`
+- `probing` module — RTT probing and adaptive scaling driver
+  - `ProbeMessage` — compact 17-byte probe wire format (request/reply) with encode/decode
+  - `ProbeKind` — `Request` / `Reply` discriminant
+  - `ProbeCounter` — atomic probe sequence generator
+  - `ProbeTimestamp` — epoch-relative nanosecond timestamps for accurate RTT measurement
+  - `ScalingDriver` — orchestrates probe tracking, RTT computation, and scaling event emission
+  - `ScalingEvent` enum — `ScaleUp` / `ScaleDown { connection_id }` events via mpsc channel
 
 ## [0.2.0] - 2026-05-05
 
