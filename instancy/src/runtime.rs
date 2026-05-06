@@ -1338,10 +1338,28 @@ impl RuntimeHandle {
             })
             .collect();
 
-        // Create a cancellation token for the cluster (child of runtime's token).
-        let _cluster_cancel = CancellationToken::new();
+        // Create a dataflow-level cancel token for local workers. When any local
+        // worker fails, this cascades cancellation to all siblings.
+        let dataflow_cancel = Some(self.cancel.child_token());
         // Convert to tokio_util CancellationToken for bridge tasks.
         let bridge_cancel = tokio_util::sync::CancellationToken::new();
+
+        // Create control broadcast for local workers (error propagation + control signals).
+        let local_wake_handles: Vec<WakeHandle> = (local_start..local_end)
+            .map(|i| wake_handles[i].clone())
+            .collect();
+        let mut control_pairs: Vec<Option<(ControlSender, ControlReceiver)>> = if num_local > 1 {
+            let df_cancel = dataflow_cancel.as_ref().unwrap().clone();
+            let (senders, receivers) =
+                ControlBroadcast::new(num_local, &local_wake_handles, df_cancel);
+            senders
+                .into_iter()
+                .zip(receivers)
+                .map(|(s, r)| Some((s, r)))
+                .collect()
+        } else {
+            vec![None]
+        };
 
         let (progress_channels, progress_handles) = create_network_progress_channels::<T>(
             local_progress,
@@ -1368,7 +1386,16 @@ impl RuntimeHandle {
             let ctx = WorkerContext::new(global_idx, total_workers);
             let pc = progress_channels_iter.next().map(Some).unwrap_or(None);
             let wh = wake_handles[global_idx].clone();
-            match self.prepare_worker(dataflow, mode, ctx, pc, Some(wh), None, None) {
+            let ctrl = control_pairs[local_idx].take();
+            match self.prepare_worker(
+                dataflow,
+                mode,
+                ctx,
+                pc,
+                Some(wh),
+                dataflow_cancel.clone(),
+                ctrl,
+            ) {
                 Ok(worker) => prepared.push(worker),
                 Err(e) => {
                     for (w, _, _) in &prepared {
@@ -1425,7 +1452,7 @@ impl RuntimeHandle {
                 name: name.to_string(),
                 num_workers: num_local,
                 workers,
-                dataflow_cancel: None, // TODO: wire control broadcast for cluster local workers
+                dataflow_cancel,
                 _phantom: PhantomData,
             }),
             local_worker_range: (local_start, local_end),
