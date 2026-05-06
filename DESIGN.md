@@ -2253,6 +2253,164 @@ pub struct PoolConfig {
 - When load is low, idle connections above the minimum are reclaimed after `idle_timeout`.
 - The application's `ConnectionManager` is the single point of control for all connection establishment — the pool just tells it when to create or destroy connections.
 
+### 6.3.1 Future: Shared Connection Mode with Sequenced Messages
+
+#### Motivation
+
+The **current design** assigns a dedicated TCP connection per (dataflow, peer) pair. This is simple — TCP guarantees FIFO, so message ordering is free. However, it limits scalability:
+- 100 concurrent dataflows across 10 nodes = 900 TCP connections per node
+- Connection setup latency for each new dataflow
+- Underutilization of connections when dataflows have bursty traffic
+
+A **shared connection mode** would allow multiple dataflows (and multiple workers within a dataflow) to share the same node-to-node TCP connection pool, similar to how HTTP/2 multiplexes streams over a single connection, or how instancy's worker thread pool shares OS threads across dataflows.
+
+#### The Ordering Challenge
+
+With shared connections, a single worker's messages may travel over **different TCP connections** (e.g., load-balanced across pool connections, or after a connection failure triggers failover). TCP only guarantees FIFO within a single stream — **not across streams**. This breaks the timely ordering invariant.
+
+Example scenario:
+```
+Worker 0 sends: [data(epoch=5), progress(epoch=5 done)]
+                     │                      │
+                     ▼                      ▼
+              Connection A            Connection B   (load-balanced)
+                     │                      │
+                     ▼                      ▼
+Receiver sees: progress(epoch=5 done)  THEN  data(epoch=5)  ← ORDERING VIOLATION
+```
+
+Additionally, connection failures introduce:
+- **Lost messages** — in-flight frames on a broken connection
+- **Duplicate messages** — retried frames that were actually delivered before the failure was detected
+
+#### Proposed Design: Sequenced Messages
+
+Each frame is stamped with a **sequence ID** scoped to its logical stream:
+
+```
+Message Identity: (dataflow_id, channel_id, sequence_id)
+```
+
+The `channel_id` already encodes `(edge/stage, source_worker, dest_worker)` — this is necessary because different stages can have different worker counts (per-stage parallelism). A stage with 4 workers and a downstream stage with 2 workers produce different sets of logical streams. The sequence is per logical stream, not per worker globally.
+
+**Wire protocol extension:**
+
+```
+┌───────────────┬───────────┬──────────────┬───────────┬──────────────────┐
+│ dataflow_id   │ channel_id│ sequence_id  │ length    │ payload (codec)  │
+│ (UUID, 16B)   │ (u64)     │ (u64)        │ (u32)     │ (variable)       │
+└───────────────┴───────────┴──────────────┴───────────┴──────────────────┘
+```
+
+Header size: 16 + 8 + 8 + 4 = **36 bytes** (8 bytes overhead vs current 28).
+
+**Sender behavior:**
+- Each `(dataflow_id, channel_id)` pair maintains a monotonically increasing sequence counter
+- Every frame sent on any connection is stamped with the next sequence number
+- On send failure, the sender retries the same frame (same sequence_id) on a different connection
+
+**Receiver behavior:**
+- Per `(dataflow_id, channel_id)`, tracks `next_expected_seq`
+- If received frame's `sequence_id == next_expected_seq`: deliver immediately, increment counter
+- If `sequence_id > next_expected_seq` (gap): buffer the frame, wait up to `reorder_timeout` for the missing frame(s)
+- If `sequence_id < next_expected_seq` (duplicate): discard silently (already delivered)
+- If timeout expires with gap: fail the dataflow (data loss detected — unrecoverable)
+
+```rust
+/// Receiver-side reorder buffer per logical stream.
+struct ReorderBuffer {
+    next_expected: u64,
+    /// Buffered out-of-order frames, keyed by sequence_id.
+    pending: BTreeMap<u64, Frame>,
+    /// How long to wait for a missing frame before failing.
+    reorder_timeout: Duration,
+    /// Timestamp when the gap was first detected.
+    gap_detected_at: Option<Instant>,
+}
+
+impl ReorderBuffer {
+    fn receive(&mut self, seq: u64, frame: Frame) -> ReorderAction {
+        if seq < self.next_expected {
+            return ReorderAction::Duplicate; // discard
+        }
+        if seq == self.next_expected {
+            // Deliver this frame and any consecutive buffered frames
+            self.next_expected += 1;
+            self.gap_detected_at = None;
+            let mut deliver = vec![frame];
+            while let Some(f) = self.pending.remove(&self.next_expected) {
+                deliver.push(f);
+                self.next_expected += 1;
+            }
+            return ReorderAction::Deliver(deliver);
+        }
+        // seq > next_expected: gap detected
+        self.pending.insert(seq, frame);
+        if self.gap_detected_at.is_none() {
+            self.gap_detected_at = Some(Instant::now());
+        }
+        ReorderAction::Wait
+    }
+
+    fn check_timeout(&self) -> bool {
+        self.gap_detected_at
+            .map(|t| t.elapsed() > self.reorder_timeout)
+            .unwrap_or(false)
+    }
+}
+```
+
+#### Comparison: Dedicated vs Shared Connection Mode
+
+| Aspect | Dedicated (Current) | Shared + Sequencing (Future) |
+|--------|---------------------|------------------------------|
+| **Ordering** | Free (TCP FIFO) | Explicit via sequence numbers |
+| **Connection count** | O(dataflows × peers) | O(peers) — bounded by pool size |
+| **Connection setup** | Per-dataflow latency | Amortized — pool pre-warms |
+| **Failure handling** | Dataflow fails immediately | Retry on another connection; fail only on timeout |
+| **Duplicate detection** | Not needed | Free via sequence_id comparison |
+| **Wire overhead** | 28 bytes/frame | 36 bytes/frame (+8 bytes seq_id) |
+| **Receiver complexity** | Zero buffering | Reorder buffer per logical stream |
+| **Memory overhead** | Minimal | Reorder buffers + pending maps |
+| **Latency** | Minimal (direct write) | Possible reorder wait on out-of-order delivery |
+| **Throughput** | Limited by single connection | Higher — parallel writes across pool connections |
+| **Cross-dataflow fairness** | Perfect isolation | Shared bandwidth — needs fair scheduling |
+| **Implementation complexity** | Simple | Moderate (sequencing, buffering, timeout, retry) |
+
+#### Pros of Shared Connection Mode
+
+1. **Resource efficiency** — O(peers) connections instead of O(dataflows × peers). Critical at scale.
+2. **Connection reuse** — new dataflows start instantly on existing pool connections.
+3. **Resilience** — connection failure doesn't kill the dataflow; retry on alternate connection.
+4. **Higher throughput** — parallel connections per peer (stripe data across pool).
+5. **Simpler lifecycle** — no need to establish/teardown connections per dataflow.
+
+#### Cons of Shared Connection Mode
+
+1. **Added latency** — reorder buffer introduces wait time when frames arrive out-of-order.
+2. **Memory overhead** — per-stream reorder buffers with pending frame storage.
+3. **Complexity** — sequence management, gap detection, timeout handling, duplicate filtering.
+4. **Head-of-line blocking risk** — one slow/broken connection can cause reorder waits for all streams that touched it.
+5. **Failure semantics change** — "connection broken" no longer means "dataflow dead" — must propagate failure differently (timeout-based).
+6. **Wire overhead** — 8 extra bytes per frame (negligible for large payloads, noticeable for small progress messages).
+
+#### Recommendation
+
+**Phase 1 (current):** Keep dedicated connections. Simple, correct, sufficient for moderate scale.
+
+**Phase 2 (future):** Add shared mode as an opt-in `ConnectionMode` configuration:
+```rust
+pub enum ConnectionMode {
+    /// Each dataflow gets its own connection(s) per peer. (Default, current behavior)
+    Dedicated,
+    /// Dataflows share pooled connections; frames are sequenced for ordering/dedup.
+    Shared { reorder_timeout: Duration },
+}
+```
+
+The sequencing layer should be implemented **below** the `TransportSession` abstraction — `TransportSession` continues to see a reliable ordered stream regardless of the underlying connection mode. This keeps operator code and progress tracking unchanged.
+
+
 ### 6.4 Wire Protocol
 
 Each connection carries multiplexed channels using a simple framing protocol:
