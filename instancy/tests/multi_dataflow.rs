@@ -12,7 +12,6 @@ use std::time::{Duration, Instant};
 
 use instancy::DataflowBuilder;
 use instancy::Error;
-use instancy::scheduler::policy::FifoPolicy;
 use instancy::{RuntimeConfig, RuntimeHandle, SpawnOptions};
 
 /// Spawn 4 dataflows concurrently on a 2-thread pool. Each receives unique data
@@ -22,7 +21,7 @@ use instancy::{RuntimeConfig, RuntimeHandle, SpawnOptions};
 fn concurrent_spawn_four_dataflows() {
     let rt = RuntimeHandle::new(RuntimeConfig {
         worker_threads: 2,
-        schedule_policy: Box::new(FifoPolicy),
+        schedule_policy: None,
         name: "concurrent-4".into(),
     })
     .unwrap();
@@ -85,7 +84,7 @@ fn concurrent_spawn_four_dataflows() {
 fn eight_dataflows_on_two_threads_no_starvation() {
     let rt = RuntimeHandle::new(RuntimeConfig {
         worker_threads: 2,
-        schedule_policy: Box::new(FifoPolicy),
+        schedule_policy: None,
         name: "starvation-8".into(),
     })
     .unwrap();
@@ -125,7 +124,7 @@ fn eight_dataflows_on_two_threads_no_starvation() {
 fn mixed_workload_fairness() {
     let rt = RuntimeHandle::new(RuntimeConfig {
         worker_threads: 2,
-        schedule_policy: Box::new(FifoPolicy),
+        schedule_policy: None,
         name: "mixed-workload".into(),
     })
     .unwrap();
@@ -201,7 +200,7 @@ fn mixed_workload_fairness() {
 fn shutdown_cancels_all_running_dataflows() {
     let rt = RuntimeHandle::new(RuntimeConfig {
         worker_threads: 2,
-        schedule_policy: Box::new(FifoPolicy),
+        schedule_policy: None,
         name: "shutdown-test".into(),
     })
     .unwrap();
@@ -247,7 +246,7 @@ fn shutdown_cancels_all_running_dataflows() {
 fn individual_cancel_preserves_siblings() {
     let rt = RuntimeHandle::new(RuntimeConfig {
         worker_threads: 2,
-        schedule_policy: Box::new(FifoPolicy),
+        schedule_policy: None,
         name: "individual-cancel".into(),
     })
     .unwrap();
@@ -309,7 +308,7 @@ fn individual_cancel_preserves_siblings() {
 fn stress_spawn_twenty_dataflows() {
     let rt = RuntimeHandle::new(RuntimeConfig {
         worker_threads: 4,
-        schedule_policy: Box::new(FifoPolicy),
+        schedule_policy: None,
         name: "stress-20".into(),
     })
     .unwrap();
@@ -344,7 +343,7 @@ fn stress_spawn_twenty_dataflows() {
 fn concurrent_input_from_multiple_threads() {
     let rt = RuntimeHandle::new(RuntimeConfig {
         worker_threads: 2,
-        schedule_policy: Box::new(FifoPolicy),
+        schedule_policy: None,
         name: "concurrent-input".into(),
     })
     .unwrap();
@@ -414,7 +413,7 @@ fn concurrent_input_from_multiple_threads() {
 fn operator_panic_propagates_error() {
     let rt = RuntimeHandle::new(RuntimeConfig {
         worker_threads: 2,
-        schedule_policy: Box::new(FifoPolicy),
+        schedule_policy: None,
         name: "panic-test".into(),
     })
     .unwrap();
@@ -464,7 +463,7 @@ fn drop_runtime_cancels_active_dataflows() {
     let handle = {
         let rt = RuntimeHandle::new(RuntimeConfig {
             worker_threads: 2,
-            schedule_policy: Box::new(FifoPolicy),
+            schedule_policy: None,
             name: "drop-cancel".into(),
         })
         .unwrap();
