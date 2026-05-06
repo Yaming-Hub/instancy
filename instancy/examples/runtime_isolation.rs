@@ -19,15 +19,13 @@ fn main() {
     let rt_fast = RuntimeHandle::new(RuntimeConfig {
         worker_threads: 4,
         schedule_policy: None,
-        name: "fast-pipeline".to_string(),
-    })
+        name: "fast-pipeline".to_string(), ..Default::default() })
     .expect("failed to create fast runtime");
 
     let rt_batch = RuntimeHandle::new(RuntimeConfig {
         worker_threads: 2,
         schedule_policy: None,
-        name: "batch-pipeline".to_string(),
-    })
+        name: "batch-pipeline".to_string(), ..Default::default() })
     .expect("failed to create batch runtime");
 
     println!("Created runtime '{}' (4 threads)", rt_fast.name());

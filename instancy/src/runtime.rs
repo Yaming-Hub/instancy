@@ -54,6 +54,60 @@ pub struct RuntimeConfig {
     pub schedule_policy: Option<Box<dyn SchedulePolicy>>,
     /// Name for this runtime (used in thread names and diagnostics).
     pub name: String,
+    /// Tokio runtime mode — controls how instancy obtains a tokio runtime
+    /// for async operations (bridge tasks, timers, async I/O).
+    pub tokio_mode: TokioMode,
+}
+
+/// Controls how instancy obtains a tokio runtime for async operations.
+///
+/// Instancy requires a tokio runtime for bridge tasks (external cancellation
+/// tokens), async I/O channels, timers, and network transport. This enum
+/// lets the hosting application decide whether instancy should create its
+/// own runtime or share an existing one.
+#[derive(Clone, Debug)]
+pub enum TokioMode {
+    /// Create a new multi-threaded tokio runtime owned by this `RuntimeHandle`.
+    ///
+    /// The runtime is shut down when the `RuntimeHandle` is dropped. The
+    /// `worker_threads` parameter controls the number of tokio worker threads
+    /// (separate from instancy's dataflow worker threads).
+    ///
+    /// Use this when your application doesn't already have a tokio runtime,
+    /// or when you want instancy to be fully self-contained.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if called inside an existing tokio context (e.g.,
+    /// `#[tokio::main]` or `#[tokio::test]`), because dropping the owned
+    /// runtime from within an async context would panic. Use [`TokioMode::Auto`]
+    /// or [`TokioMode::CurrentContext`] instead.
+    Create {
+        /// Number of tokio async worker threads. Defaults to 2.
+        worker_threads: usize,
+    },
+    /// Use an existing tokio runtime via its handle.
+    ///
+    /// The caller is responsible for keeping the tokio runtime alive for the
+    /// lifetime of the `RuntimeHandle`. If the tokio runtime shuts down while
+    /// instancy is running, async operations will fail.
+    ///
+    /// Use this when your application already runs on tokio and you want
+    /// instancy to share the same runtime (e.g., in an Actix/Axum server).
+    External(tokio::runtime::Handle),
+    /// Detect the current tokio runtime automatically.
+    ///
+    /// Equivalent to `External(tokio::runtime::Handle::current())` — panics
+    /// if called outside a tokio context. This is the default for backwards
+    /// compatibility.
+    CurrentContext,
+    /// Automatically detect: use the current tokio runtime if one is active,
+    /// otherwise create a new multi-threaded runtime with 2 worker threads.
+    ///
+    /// This is the recommended default — it works both inside existing tokio
+    /// applications (Actix, Axum, standalone `#[tokio::main]`) and in plain
+    /// synchronous contexts (tests, CLI tools).
+    Auto,
 }
 
 impl std::fmt::Debug for RuntimeConfig {
@@ -62,6 +116,7 @@ impl std::fmt::Debug for RuntimeConfig {
             .field("worker_threads", &self.worker_threads)
             .field("schedule_policy", &"<dyn SchedulePolicy>")
             .field("name", &self.name)
+            .field("tokio_mode", &self.tokio_mode)
             .finish()
     }
 }
@@ -72,7 +127,16 @@ impl Default for RuntimeConfig {
             worker_threads: num_cpus(),
             schedule_policy: None,
             name: "instancy".to_string(),
+            tokio_mode: TokioMode::default(),
         }
+    }
+}
+
+impl Default for TokioMode {
+    /// Defaults to [`TokioMode::Auto`] — uses the current tokio runtime if
+    /// available, otherwise creates a new one.
+    fn default() -> Self {
+        Self::Auto
     }
 }
 
@@ -420,6 +484,11 @@ pub struct RuntimeHandle {
     /// notification. Only used with the `transport` feature.
     #[cfg(feature = "transport")]
     peer_registry: Arc<PeerRegistry>,
+    /// Tokio runtime handle for spawning async bridge tasks, timers, etc.
+    tokio_handle: tokio::runtime::Handle,
+    /// Owned tokio runtime (when `TokioMode::Create` was used).
+    /// Kept alive for the lifetime of RuntimeHandle; dropped on RuntimeHandle::drop.
+    _owned_tokio_runtime: Option<tokio::runtime::Runtime>,
 }
 
 impl RuntimeHandle {
@@ -441,6 +510,65 @@ impl RuntimeHandle {
         let schedule_policy: Option<Arc<dyn SchedulePolicy>> =
             config.schedule_policy.map(|p| Arc::from(p) as Arc<dyn SchedulePolicy>);
         let registry = worker_pool.create_registry(schedule_policy.clone());
+
+        // Resolve the tokio runtime handle.
+        let (tokio_handle, owned_runtime) = match config.tokio_mode {
+            TokioMode::Create { worker_threads } => {
+                if tokio::runtime::Handle::try_current().is_ok() {
+                    return Err(crate::error::Error::Custom(
+                        "TokioMode::Create cannot be used inside an existing tokio context \
+                         (dropping the owned runtime would panic). \
+                         Use TokioMode::Auto, TokioMode::CurrentContext, or \
+                         TokioMode::External instead."
+                            .to_string(),
+                    ));
+                }
+                let rt = tokio::runtime::Builder::new_multi_thread()
+                    .worker_threads(worker_threads)
+                    .enable_all()
+                    .thread_name(format!("{}-tokio", config.name))
+                    .build()
+                    .map_err(|e| {
+                        crate::error::Error::Custom(format!(
+                            "failed to create tokio runtime: {e}"
+                        ))
+                    })?;
+                let handle = rt.handle().clone();
+                (handle, Some(rt))
+            }
+            TokioMode::External(handle) => (handle, None),
+            TokioMode::CurrentContext => {
+                let handle = tokio::runtime::Handle::try_current().map_err(|_| {
+                    crate::error::Error::Custom(
+                        "TokioMode::CurrentContext requires an active tokio runtime; \
+                         use TokioMode::Create or TokioMode::External instead"
+                            .to_string(),
+                    )
+                })?;
+                (handle, None)
+            }
+            TokioMode::Auto => {
+                match tokio::runtime::Handle::try_current() {
+                    Ok(handle) => (handle, None),
+                    Err(_) => {
+                        // No active tokio runtime — create one.
+                        let rt = tokio::runtime::Builder::new_multi_thread()
+                            .worker_threads(2)
+                            .enable_all()
+                            .thread_name(format!("{}-tokio", config.name))
+                            .build()
+                            .map_err(|e| {
+                                crate::error::Error::Custom(format!(
+                                    "failed to create tokio runtime: {e}"
+                                ))
+                            })?;
+                        let handle = rt.handle().clone();
+                        (handle, Some(rt))
+                    }
+                }
+            }
+        };
+
         Ok(Self {
             worker_pool,
             _schedule_policy: schedule_policy,
@@ -449,6 +577,8 @@ impl RuntimeHandle {
             registry,
             #[cfg(feature = "transport")]
             peer_registry: Arc::new(PeerRegistry::new()),
+            tokio_handle,
+            _owned_tokio_runtime: owned_runtime,
         })
     }
 
@@ -460,12 +590,24 @@ impl RuntimeHandle {
         &self.cancel
     }
 
+    /// Returns the tokio runtime handle used by this runtime.
+    ///
+    /// Use this to spawn async tasks that should run on the same tokio runtime
+    /// as instancy's internal bridge tasks and async I/O.
+    pub fn tokio_handle(&self) -> &tokio::runtime::Handle {
+        &self.tokio_handle
+    }
+
     /// Shut down the runtime by cancelling all running dataflows.
     ///
     /// This is **cooperative**: it signals cancellation to all dataflows but
-    /// does not forcibly terminate worker threads. Worker threads will drain
-    /// once operators observe cancellation and stop producing work.
-    /// Full WorkerPool shutdown integration is planned for a future PR.
+    /// does not forcibly terminate worker threads or the tokio runtime.
+    /// Worker threads will drain once operators observe cancellation and stop
+    /// producing work. Bridge tasks exit when they observe cancellation.
+    ///
+    /// The owned tokio runtime (if any) is shut down when this `RuntimeHandle`
+    /// is dropped — not by this method. To fully clean up, call `shutdown()`
+    /// and then drop the handle.
     pub fn shutdown(&self) {
         self.cancel
             .cancel_with_reason(CancellationReason::RuntimeShutdown);
@@ -754,7 +896,7 @@ impl RuntimeHandle {
         // completes/cancels by other means.
         if let Some(user_token) = external_cancel {
             let cancel = spawned.cancel.clone();
-            tokio::spawn(async move {
+            self.tokio_handle.spawn(async move {
                 tokio::select! {
                     _ = user_token.cancelled() => {
                         cancel.cancel_with_reason(CancellationReason::UserRequested);
@@ -1109,7 +1251,7 @@ impl RuntimeHandle {
             } else {
                 multi.workers[0].cancel.clone()
             };
-            tokio::spawn(async move {
+            self.tokio_handle.spawn(async move {
                 tokio::select! {
                     _ = user_token.cancelled() => {
                         cancel.cancel_with_reason(CancellationReason::UserRequested);
@@ -3213,8 +3355,7 @@ mod tests {
         let config = RuntimeConfig {
             worker_threads: 2,
             schedule_policy: None,
-            name: "test-runtime".to_string(),
-        };
+            name: "test-runtime".to_string(), ..Default::default() };
         let rt = RuntimeHandle::new(config).unwrap();
         assert_eq!(rt.name(), "test-runtime");
         assert!(!rt.is_shutdown());
@@ -3225,8 +3366,7 @@ mod tests {
         let rt = RuntimeHandle::new(RuntimeConfig {
             worker_threads: 1,
             schedule_policy: None,
-            name: "shutdown-test".to_string(),
-        })
+            name: "shutdown-test".to_string(), ..Default::default() })
         .unwrap();
         assert!(!rt.is_shutdown());
         rt.shutdown();
@@ -3239,14 +3379,12 @@ mod tests {
         let rt1 = RuntimeHandle::new(RuntimeConfig {
             worker_threads: 1,
             schedule_policy: None,
-            name: "rt1".to_string(),
-        })
+            name: "rt1".to_string(), ..Default::default() })
         .unwrap();
         let rt2 = RuntimeHandle::new(RuntimeConfig {
             worker_threads: 1,
             schedule_policy: None,
-            name: "rt2".to_string(),
-        })
+            name: "rt2".to_string(), ..Default::default() })
         .unwrap();
 
         // Shutting down rt1 doesn't affect rt2
@@ -5488,8 +5626,7 @@ mod tests {
         let rt = RuntimeHandle::new(RuntimeConfig {
             worker_threads: 2,
             schedule_policy: None,
-            name: "par-match".to_string(),
-        })
+            name: "par-match".to_string(), ..Default::default() })
         .unwrap();
 
         let result = rt.spawn_multi("par-match-df", 2, |_worker_idx, builder| {
@@ -5515,8 +5652,7 @@ mod tests {
         let rt = RuntimeHandle::new(RuntimeConfig {
             worker_threads: 2,
             schedule_policy: None,
-            name: "par-mismatch".to_string(),
-        })
+            name: "par-mismatch".to_string(), ..Default::default() })
         .unwrap();
 
         let result = rt.spawn_multi("par-mismatch-df", 2, |_worker_idx, builder| {
@@ -5547,8 +5683,7 @@ mod tests {
         let rt = RuntimeHandle::new(RuntimeConfig {
             worker_threads: 1,
             schedule_policy: None,
-            name: "par-single".to_string(),
-        })
+            name: "par-single".to_string(), ..Default::default() })
         .unwrap();
 
         let result = rt.spawn_multi("par-single-df", 1, |_worker_idx, builder| {

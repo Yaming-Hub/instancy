@@ -34,8 +34,7 @@ async fn main() {
     let rt = RuntimeHandle::new(RuntimeConfig {
         worker_threads: 2,
         schedule_policy: None,
-        name: "async-demo".into(),
-    })
+        name: "async-demo".into(), ..Default::default() })
     .expect("failed to create runtime");
 
     // --- Pipeline 1: async input/output with async SpawnOptions ---
