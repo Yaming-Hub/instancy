@@ -3132,7 +3132,7 @@ When workers run on different machines, progress exchange uses the same connecti
 └──────────┴────────────────────────────────┘
 ```
 
-**Critical ordering guarantee for cross-process:** Data messages and progress messages share connections through the `ConnectionManager`. The implementation must ensure that data pushed to a channel is fully transmitted before the corresponding capability release is sent. For in-process channels, this is guaranteed by Rust's memory model (writes to the bounded buffer happen-before the capability drop). For network channels, the implementation must flush data before sending progress, or use the same ordered stream for both.
+**Critical ordering guarantee for cross-process:** Data messages and progress messages share connections through the `ConnectionManager`. The implementation ensures that data pushed to a channel is transmitted before the corresponding capability release by using a **single FIFO payload channel** per peer in the `TransportSession`. Both data and progress frames are sent through the same bounded `mpsc` channel, preserving the causal order: a worker sends data at time T before releasing its capability for T. The bridge task writes from this shared channel to TCP in FIFO order, with only control messages (handshake, ready barrier) receiving biased priority. This design also prevents cross-dataflow starvation — one dataflow's heavy data cannot block another dataflow's progress messages since they interleave naturally in the shared queue.
 
 #### 11.5.2 Progress and the Adapter Layer
 

@@ -64,6 +64,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Edge case integration tests: empty streams, large batches, deep pipelines, concat (#137)
 
 ### Fixed
+- **Transport FIFO ordering violation** — data and progress frames could be reordered on the wire due to separate priority channels in the bridge task. Merged into a single FIFO payload channel per peer, preserving the timely ordering invariant (data at time T arrives before frontier advances past T). Also prevents cross-dataflow progress starvation under heavy data load. (#146)
 - Control broadcast and cancellation wiring for cluster-local workers (#131)
 - Compilation regression in tests/examples from schedule_policy API change (#136)
 
