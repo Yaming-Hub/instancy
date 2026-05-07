@@ -2882,9 +2882,8 @@ impl<
     /// ```
     pub fn rebalance(self, name: impl Into<String>) -> Pipe<T, D> {
         let counter = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
-        let counter_clone = counter.clone();
         self.exchange_by_hash(name, move |_| {
-            counter_clone.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+            counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
         })
     }
 }
@@ -3011,14 +3010,13 @@ impl<T: Timestamp, D: Clone + Send + 'static> Pipe<T, D> {
     /// ```
     pub fn rebalance(self, name: impl Into<String>) -> Pipe<T, D> {
         let counter = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
-        let counter_clone = counter.clone();
         self.exchange_by_hash(name, move |_| {
-            counter_clone.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+            counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
         })
     }
 }
 
-/// Internal exchange implementation — shared by both transport and non-transport builds.
+/// Internal exchange implementation— shared by both transport and non-transport builds.
 impl<T: Timestamp, D: Clone + Send + 'static> Pipe<T, D> {
     /// Internal: add an exchange (repartition) operator.
     ///
