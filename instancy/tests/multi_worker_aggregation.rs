@@ -191,7 +191,11 @@ async fn multi_worker_fold_count() {
     assert_eq!(total, 8, "total count should be 8, got {total}");
 }
 
-/// Multi-worker fold: product of elements.
+/// Multi-worker fold: product of elements (distributive operation).
+///
+/// Multiplication with identity 1 is distributive: the product of per-worker
+/// partial products equals the total product. This validates fold correctness
+/// specifically for monoid-homomorphic operations across workers.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn multi_worker_fold_product() {
     let results = run_multi_worker_aggregation::<i64, _>(
@@ -204,14 +208,13 @@ async fn multi_worker_fold_product() {
                 .fold("product", 1i64, |acc, x| acc * x);
             product.output("results");
         },
-        // Use small numbers to avoid overflow. All go to exchange.
         vec![
-            (0, vec![2, 3, 5]),  // product = 30
+            (0, vec![2, 3, 5]),  // total product = 30
         ],
     )
     .await;
 
-    // Product of partial results across workers = total product
+    // Product of per-worker results equals total product (distributive property)
     let total: i64 = results.iter().product();
     assert_eq!(total, 30, "product should be 30, got {total}");
 }
@@ -340,6 +343,86 @@ async fn multi_worker_count_multi_epoch() {
 
     let total: usize = results.iter().sum();
     assert_eq!(total, 8, "total count across all epochs should be 8, got {total}");
+}
+
+// =============================================================================
+// Edge case tests
+// =============================================================================
+
+/// Single element reduce: only one item, no actual combining needed.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn multi_worker_reduce_single_element() {
+    let results = run_multi_worker_aggregation::<i64, _>(
+        "mw-reduce-single",
+        2,
+        |builder| {
+            let input = builder.input::<i64>("data");
+            let summed = input
+                .exchange_by_hash("distribute", |x: &i64| *x as u64)
+                .reduce("sum", |acc, x| acc + x);
+            summed.output("results");
+        },
+        vec![
+            (0, vec![42]),
+        ],
+    )
+    .await;
+
+    // Single element goes to one worker, reduce returns it unchanged
+    assert_eq!(results, vec![42]);
+}
+
+/// Single element fold: validates fold with minimal input.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn multi_worker_fold_single_element() {
+    let results = run_multi_worker_aggregation::<i64, _>(
+        "mw-fold-single",
+        2,
+        |builder| {
+            let input = builder.input::<i64>("data");
+            let summed = input
+                .exchange_by_hash("distribute", |x: &i64| *x as u64)
+                .fold("sum", 0i64, |acc, x| acc + x);
+            summed.output("results");
+        },
+        vec![
+            (0, vec![42]),
+        ],
+    )
+    .await;
+
+    // Only one worker receives data, only that worker emits
+    let total: i64 = results.iter().sum();
+    assert_eq!(total, 42, "fold of single element should be 42, got {total}");
+}
+
+/// Fold with non-distributive operation: collect into sorted vec.
+/// Verifies fold works correctly per-worker even with complex accumulator.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn multi_worker_fold_collect_vec() {
+    let results = run_multi_worker_aggregation::<Vec<i64>, _>(
+        "mw-fold-vec",
+        2,
+        |builder| {
+            let input = builder.input::<i64>("data");
+            let collected = input
+                .exchange_by_hash("distribute", |x: &i64| *x as u64)
+                .fold("collect", Vec::<i64>::new(), |mut acc, x| {
+                    acc.push(x);
+                    acc
+                });
+            collected.output("results");
+        },
+        vec![
+            (0, vec![5, 3, 1, 4, 2]),
+        ],
+    )
+    .await;
+
+    // Concatenate all per-worker vecs and sort — should have all elements
+    let mut all: Vec<i64> = results.into_iter().flatten().collect();
+    all.sort();
+    assert_eq!(all, vec![1, 2, 3, 4, 5], "all elements should be present");
 }
 
 // =============================================================================
