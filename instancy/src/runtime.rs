@@ -1972,9 +1972,8 @@ impl RuntimeHandle {
         //   - PeerRegistry registration (peer-down notification)
         //   - SharedPeerManager registrations + reorder buffers
         //
-        // Timing: bridge_cancel fires in ClusterSpawnedDataflow::drop(). For
-        // join_blocking(), drop happens AFTER workers complete (safe). For join(),
-        // drop happens immediately (pre-existing documented limitation).
+        // Timing: bridge_cancel fires when ClusterCompletion resolves (after all
+        // workers complete) or when ClusterSpawnedDataflow is dropped without join().
         {
             let cleanup_cancel = bridge_cancel.clone();
             let peer_registry = Arc::clone(&self.peer_registry);
@@ -2009,8 +2008,9 @@ impl RuntimeHandle {
             total_workers,
             _transport: transport,
             _shared_managers: shared_managers_arc,
-            _progress_handles: progress_handles,
+            _progress_handles: Some(progress_handles),
             _bridge_cancel: bridge_cancel,
+            _bridge_cancel_moved: false,
         })
     }
 }
@@ -3277,9 +3277,11 @@ pub struct ClusterSpawnedDataflow<T: Timestamp> {
     /// Keeps shared peer managers alive (prevents task abort on drop).
     _shared_managers: Option<Arc<std::collections::HashMap<String, crate::communication::shared_transport::SharedPeerManager>>>,
     /// Keeps progress bridge tasks alive.
-    _progress_handles: crate::progress::network_progress::NetworkProgressHandles,
+    _progress_handles: Option<crate::progress::network_progress::NetworkProgressHandles>,
     /// Cancels bridge tasks on drop.
     _bridge_cancel: tokio_util::sync::CancellationToken,
+    /// Set to true when join() transfers bridge_cancel ownership to ClusterCompletion.
+    _bridge_cancel_moved: bool,
 }
 
 #[cfg(feature = "transport")]
@@ -3350,14 +3352,25 @@ impl<T: Timestamp> ClusterSpawnedDataflow<T> {
 
     /// Take the completion handles from all local workers.
     ///
-    /// **Important:** This consumes `self`, which triggers `Drop` and cancels
-    /// bridge tasks. Use [`join_blocking()`](Self::join_blocking) instead to
-    /// ensure bridges stay alive until workers complete.
+    /// Returns a [`ClusterCompletion`] that keeps transport and bridge resources
+    /// alive until all workers finish. Bridges are cancelled only when the
+    /// returned completion handle is dropped (after awaiting or waiting).
     ///
-    /// The returned [`MultiDataflowCompletion`] implements [`Future`] and can
-    /// be `.await`ed in async code, or blocked on via [`.wait()`](MultiDataflowCompletion::wait).
-    pub fn join(mut self) -> MultiDataflowCompletion {
-        self.inner.take().expect("join called after move").join()
+    /// The returned handle implements [`Future`] and can be `.await`ed in
+    /// async code, or blocked on via [`.wait()`](ClusterCompletion::wait).
+    pub fn join(mut self) -> ClusterCompletion<T> {
+        let completion = self.inner.take().expect("join called after move").join();
+        // Transfer all resources to ClusterCompletion so bridges stay alive.
+        // Setting _bridge_cancel_moved prevents Drop from firing it early.
+        self._bridge_cancel_moved = true;
+        ClusterCompletion {
+            completion: Some(completion),
+            _transport: self._transport.clone(),
+            _shared_managers: self._shared_managers.take(),
+            _progress_handles: self._progress_handles.take(),
+            _bridge_cancel: self._bridge_cancel.clone(),
+            _phantom: PhantomData,
+        }
     }
 
     /// Block until all local workers complete.
@@ -3365,24 +3378,85 @@ impl<T: Timestamp> ClusterSpawnedDataflow<T> {
     /// Bridges stay alive during the wait so workers can still receive
     /// remote data and progress. They are cancelled only after all
     /// workers have finished.
-    pub fn join_blocking(mut self) -> Result<()> {
-        let completion = self.inner.take().expect("join called after move").join();
-        let result = completion.wait();
-        // NOW self drops — bridges are cancelled AFTER workers complete.
-        result
+    pub fn join_blocking(self) -> Result<()> {
+        self.join().wait()
     }
 }
 
 #[cfg(feature = "transport")]
 impl<T: Timestamp> Drop for ClusterSpawnedDataflow<T> {
     fn drop(&mut self) {
-        self._bridge_cancel.cancel();
+        if !self._bridge_cancel_moved {
+            self._bridge_cancel.cancel();
+        }
     }
 }
 
 // ---------------------------------------------------------------------------
-// MultiDataflowCompletion — aggregated completion for N workers
+// ClusterCompletion — completion handle with bridge lifetime management
 // ---------------------------------------------------------------------------
+
+/// Completion handle for a cluster-spawned dataflow.
+///
+/// Keeps transport and bridge resources alive until all workers finish.
+/// When this handle drops, bridges are cancelled and transport resources
+/// are released. Implements [`Future`] for async usage and provides
+/// [`wait()`](Self::wait) for blocking usage.
+#[cfg(feature = "transport")]
+pub struct ClusterCompletion<T: Timestamp> {
+    completion: Option<MultiDataflowCompletion>,
+    /// Keeps transport alive (background Muxer/Demuxer tasks).
+    _transport: Arc<crate::communication::cluster_transport::ClusterTransport>,
+    /// Keeps shared peer managers alive (prevents task abort on drop).
+    _shared_managers: Option<Arc<std::collections::HashMap<String, crate::communication::shared_transport::SharedPeerManager>>>,
+    /// Progress handle keepalive (None if not transferrable).
+    _progress_handles: Option<crate::progress::network_progress::NetworkProgressHandles>,
+    /// Cancels bridge tasks when this completion drops.
+    _bridge_cancel: tokio_util::sync::CancellationToken,
+    _phantom: PhantomData<T>,
+}
+
+#[cfg(feature = "transport")]
+impl<T: Timestamp> ClusterCompletion<T> {
+    /// Block the current thread until all workers complete.
+    ///
+    /// Returns `Ok(())` if all workers succeeded. On first error, cancels
+    /// remaining workers and returns that error. Bridges are cancelled
+    /// after this method returns (when `self` drops).
+    pub fn wait(mut self) -> Result<()> {
+        let completion = self.completion.take().expect("wait called after poll completed");
+        let result = completion.wait();
+        // Cancel bridges eagerly so cleanup doesn't wait for handle drop.
+        self._bridge_cancel.cancel();
+        result
+    }
+}
+
+#[cfg(feature = "transport")]
+impl<T: Timestamp> Unpin for ClusterCompletion<T> {}
+
+#[cfg(feature = "transport")]
+impl<T: Timestamp> Future for ClusterCompletion<T> {
+    type Output = Result<()>;
+
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        let this = self.get_mut();
+        let completion = this.completion.as_mut().expect("polled after completion");
+        let result = Pin::new(completion).poll(cx);
+        if result.is_ready() {
+            // Cancel bridges eagerly so cleanup doesn't wait for handle drop.
+            this._bridge_cancel.cancel();
+        }
+        result
+    }
+}
+
+#[cfg(feature = "transport")]
+impl<T: Timestamp> Drop for ClusterCompletion<T> {
+    fn drop(&mut self) {
+        self._bridge_cancel.cancel();
+    }
+}
 
 /// Aggregated completion handle for multiple replicated dataflow workers.
 ///

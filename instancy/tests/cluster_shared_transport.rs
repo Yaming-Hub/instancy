@@ -544,3 +544,111 @@ async fn shared_dropping_arc_after_spawn_does_not_kill_transport() {
     all_results.sort();
     assert_eq!(all_results, vec![1, 2, 3, 4]);
 }
+
+/// Test that join() keeps bridges alive until await completes (async path).
+///
+/// Previously join() triggered Drop immediately, killing bridges. This test
+/// verifies the fix by using the async join() path with data exchange.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn shared_join_async_keeps_bridges_alive() {
+    let topology = ClusterTopology::multi_node(vec![
+        NodeConfig::new("node-a", 1),
+        NodeConfig::new("node-b", 1),
+    ])
+    .unwrap();
+    let dataflow_id = DataflowId::new();
+    let tokio_handle = tokio::runtime::Handle::current();
+
+    let (managers_a, managers_b) =
+        make_tcp_shared_managers(test_shared_config(), 2, &tokio_handle).await;
+    let managers_a = Arc::new(managers_a);
+    let managers_b = Arc::new(managers_b);
+
+    let build = |_worker_idx: usize, builder: &mut DataflowBuilder<u64>| -> Result<()> {
+        let input = builder.input::<u64>("data");
+        let exchanged = input.exchange("by_val", |x: &u64| *x);
+        exchanged.map("inc", |_t, x| x + 1).output("results");
+        Ok(())
+    };
+
+    let topo_a = topology.clone();
+    let th = tokio_handle.clone();
+    let mgr_a = Arc::clone(&managers_a);
+    let ha = tokio::task::spawn_blocking(move || {
+        let rt = RuntimeHandle::new(RuntimeConfig {
+            worker_threads: 1,
+            ..RuntimeConfig::default()
+        })?;
+        let cluster = rt.spawn_cluster(
+            "async-join-test",
+            topo_a,
+            "node-a",
+            dataflow_id,
+            ClusterSpawnTransport::shared(mgr_a, 1024),
+            Duration::from_secs(10),
+            build,
+            &th,
+        )?;
+        Ok::<_, instancy::error::Error>((rt, cluster))
+    });
+
+    let topo_b = topology;
+    let th2 = tokio_handle;
+    let mgr_b = Arc::clone(&managers_b);
+    let hb = tokio::task::spawn_blocking(move || {
+        let rt = RuntimeHandle::new(RuntimeConfig {
+            worker_threads: 1,
+            ..RuntimeConfig::default()
+        })?;
+        let cluster = rt.spawn_cluster(
+            "async-join-test",
+            topo_b,
+            "node-b",
+            dataflow_id,
+            ClusterSpawnTransport::shared(mgr_b, 1024),
+            Duration::from_secs(10),
+            build,
+            &th2,
+        )?;
+        Ok::<_, instancy::error::Error>((rt, cluster))
+    });
+
+    let (ra, rb) = tokio::join!(ha, hb);
+    let (_rt_a, mut ca) = ra.unwrap().unwrap();
+    let (_rt_b, mut cb) = rb.unwrap().unwrap();
+
+    let out_a = ca.take_output::<u64>(0, "results").unwrap();
+    let out_b = cb.take_output::<u64>(0, "results").unwrap();
+
+    // Send data from node-a
+    let sa = ca.take_input::<u64>(0, "data").unwrap();
+    sa.send(1, vec![0, 1, 2, 3, 4]).unwrap();
+    drop(sa);
+
+    // Node-b sends nothing
+    let sb = cb.take_input::<u64>(0, "data").unwrap();
+    drop(sb);
+
+    // Use the async join() path — this was previously broken.
+    let completion_a = ca.join();
+    let completion_b = cb.join();
+
+    let (res_a, res_b) = tokio::time::timeout(
+        TEST_TIMEOUT,
+        async { tokio::join!(completion_a, completion_b) },
+    )
+    .await
+    .expect("cluster did not complete within timeout");
+    res_a.unwrap();
+    res_b.unwrap();
+
+    // Verify all data exchanged correctly
+    let mut all_results: Vec<u64> = out_a
+        .collect_data()
+        .into_iter()
+        .flat_map(|(_, d)| d)
+        .chain(out_b.collect_data().into_iter().flat_map(|(_, d)| d))
+        .collect();
+    all_results.sort();
+    assert_eq!(all_results, vec![1, 2, 3, 4, 5]);
+}
