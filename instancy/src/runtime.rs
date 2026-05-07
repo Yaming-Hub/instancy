@@ -1804,10 +1804,11 @@ impl RuntimeHandle {
                 let bridge = bc.clone();
                 let peer = peer_id.clone();
                 runtime_handle.spawn(async move {
-                    if let Some(_err) = error_rx.recv().await {
+                    if let Some(err) = error_rx.recv().await {
                         #[cfg(feature = "tracing")]
                         tracing::error!(
                             peer = %peer,
+                            error = ?err,
                             "shared transport error received, cancelling dataflow"
                         );
                         cancel.cancel_with_reason(
