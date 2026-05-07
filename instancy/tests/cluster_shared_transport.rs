@@ -7,6 +7,7 @@
 #![cfg(feature = "transport")]
 
 use std::collections::HashMap;
+use std::sync::Arc;
 use std::time::Duration;
 
 use tokio::net::{TcpListener, TcpStream};
@@ -119,6 +120,8 @@ async fn shared_two_nodes_no_exchange() {
 
     let (managers_a, managers_b) =
         make_tcp_shared_managers(test_shared_config(), 1, &tokio_handle).await;
+    let managers_a = Arc::new(managers_a);
+    let managers_b = Arc::new(managers_b);
 
     let build = |_worker_idx: usize, builder: &mut DataflowBuilder<u64>| -> Result<()> {
         builder
@@ -130,6 +133,7 @@ async fn shared_two_nodes_no_exchange() {
 
     let topo_a = topology.clone();
     let th = tokio_handle.clone();
+    let mgr_a = Arc::clone(&managers_a);
     let ha = tokio::task::spawn_blocking(move || {
         let rt = RuntimeHandle::new(RuntimeConfig {
             worker_threads: 1,
@@ -140,17 +144,17 @@ async fn shared_two_nodes_no_exchange() {
             topo_a,
             "node-a",
             dataflow_id,
-            ClusterSpawnTransport::shared(&managers_a, 1024),
+            ClusterSpawnTransport::shared(mgr_a, 1024),
             Duration::from_secs(10),
             build,
             &th,
         )?;
-        // Return managers to keep SharedPeerManager (and its background tasks) alive
-        Ok::<_, instancy::error::Error>((rt, cluster, managers_a))
+        Ok::<_, instancy::error::Error>((rt, cluster))
     });
 
     let topo_b = topology;
     let th2 = tokio_handle;
+    let mgr_b = Arc::clone(&managers_b);
     let hb = tokio::task::spawn_blocking(move || {
         let rt = RuntimeHandle::new(RuntimeConfig {
             worker_threads: 1,
@@ -161,17 +165,17 @@ async fn shared_two_nodes_no_exchange() {
             topo_b,
             "node-b",
             dataflow_id,
-            ClusterSpawnTransport::shared(&managers_b, 1024),
+            ClusterSpawnTransport::shared(mgr_b, 1024),
             Duration::from_secs(10),
             build,
             &th2,
         )?;
-        Ok::<_, instancy::error::Error>((rt, cluster, managers_b))
+        Ok::<_, instancy::error::Error>((rt, cluster))
     });
 
     let (ra, rb) = tokio::join!(ha, hb);
-    let (_rt_a, mut ca, _mgr_a) = ra.unwrap().unwrap();
-    let (_rt_b, mut cb, _mgr_b) = rb.unwrap().unwrap();
+    let (_rt_a, mut ca) = ra.unwrap().unwrap();
+    let (_rt_b, mut cb) = rb.unwrap().unwrap();
 
     let out_a = ca.take_output::<i32>(0, "results").unwrap();
     let out_b = cb.take_output::<i32>(0, "results").unwrap();
@@ -218,6 +222,8 @@ async fn shared_two_nodes_with_exchange() {
 
     let (managers_a, managers_b) =
         make_tcp_shared_managers(test_shared_config(), 2, &tokio_handle).await;
+    let managers_a = Arc::new(managers_a);
+    let managers_b = Arc::new(managers_b);
 
     let build = |_worker_idx: usize, builder: &mut DataflowBuilder<u64>| -> Result<()> {
         let input = builder.input::<i64>("data");
@@ -228,6 +234,7 @@ async fn shared_two_nodes_with_exchange() {
 
     let topo_a = topology.clone();
     let th = tokio_handle.clone();
+    let mgr_a = Arc::clone(&managers_a);
     let ha = tokio::task::spawn_blocking(move || {
         let rt = RuntimeHandle::new(RuntimeConfig {
             worker_threads: 1,
@@ -238,16 +245,17 @@ async fn shared_two_nodes_with_exchange() {
             topo_a,
             "node-a",
             dataflow_id,
-            ClusterSpawnTransport::shared(&managers_a, 1024),
+            ClusterSpawnTransport::shared(mgr_a, 1024),
             Duration::from_secs(10),
             build,
             &th,
         )?;
-        Ok::<_, instancy::error::Error>((rt, cluster, managers_a))
+        Ok::<_, instancy::error::Error>((rt, cluster))
     });
 
     let topo_b = topology;
     let th2 = tokio_handle;
+    let mgr_b = Arc::clone(&managers_b);
     let hb = tokio::task::spawn_blocking(move || {
         let rt = RuntimeHandle::new(RuntimeConfig {
             worker_threads: 1,
@@ -258,17 +266,17 @@ async fn shared_two_nodes_with_exchange() {
             topo_b,
             "node-b",
             dataflow_id,
-            ClusterSpawnTransport::shared(&managers_b, 1024),
+            ClusterSpawnTransport::shared(mgr_b, 1024),
             Duration::from_secs(10),
             build,
             &th2,
         )?;
-        Ok::<_, instancy::error::Error>((rt, cluster, managers_b))
+        Ok::<_, instancy::error::Error>((rt, cluster))
     });
 
     let (ra, rb) = tokio::join!(ha, hb);
-    let (_rt_a, mut ca, _mgr_a) = ra.unwrap().unwrap();
-    let (_rt_b, mut cb, _mgr_b) = rb.unwrap().unwrap();
+    let (_rt_a, mut ca) = ra.unwrap().unwrap();
+    let (_rt_b, mut cb) = rb.unwrap().unwrap();
 
     let out_a = ca.take_output::<i64>(0, "results").unwrap();
     let out_b = cb.take_output::<i64>(0, "results").unwrap();
@@ -311,6 +319,8 @@ async fn shared_multiple_dataflows_same_connections() {
 
     let (managers_a, managers_b) =
         make_tcp_shared_managers(test_shared_config(), 2, &tokio_handle).await;
+    let managers_a = Arc::new(managers_a);
+    let managers_b = Arc::new(managers_b);
 
     let build = |_worker_idx: usize, builder: &mut DataflowBuilder<u64>| -> Result<()> {
         let input = builder.input::<u64>("data");
@@ -326,6 +336,7 @@ async fn shared_multiple_dataflows_same_connections() {
 
     let topo_a = topology.clone();
     let th = tokio_handle.clone();
+    let mgr_a = Arc::clone(&managers_a);
     let ha = tokio::task::spawn_blocking(move || {
         let rt = RuntimeHandle::new(RuntimeConfig {
             worker_threads: 2,
@@ -336,7 +347,7 @@ async fn shared_multiple_dataflows_same_connections() {
             topo_a.clone(),
             "node-a",
             df_id_1,
-            ClusterSpawnTransport::shared(&managers_a, 1024),
+            ClusterSpawnTransport::shared(Arc::clone(&mgr_a), 1024),
             Duration::from_secs(10),
             build,
             &th,
@@ -346,16 +357,17 @@ async fn shared_multiple_dataflows_same_connections() {
             topo_a,
             "node-a",
             df_id_2,
-            ClusterSpawnTransport::shared(&managers_a, 1024),
+            ClusterSpawnTransport::shared(mgr_a, 1024),
             Duration::from_secs(10),
             build,
             &th,
         )?;
-        Ok::<_, instancy::error::Error>((rt, c1, c2, managers_a))
+        Ok::<_, instancy::error::Error>((rt, c1, c2))
     });
 
     let topo_b = topology;
     let th2 = tokio_handle;
+    let mgr_b = Arc::clone(&managers_b);
     let hb = tokio::task::spawn_blocking(move || {
         let rt = RuntimeHandle::new(RuntimeConfig {
             worker_threads: 2,
@@ -366,7 +378,7 @@ async fn shared_multiple_dataflows_same_connections() {
             topo_b.clone(),
             "node-b",
             df_id_1,
-            ClusterSpawnTransport::shared(&managers_b, 1024),
+            ClusterSpawnTransport::shared(Arc::clone(&mgr_b), 1024),
             Duration::from_secs(10),
             build,
             &th2,
@@ -376,17 +388,17 @@ async fn shared_multiple_dataflows_same_connections() {
             topo_b,
             "node-b",
             df_id_2,
-            ClusterSpawnTransport::shared(&managers_b, 1024),
+            ClusterSpawnTransport::shared(mgr_b, 1024),
             Duration::from_secs(10),
             build,
             &th2,
         )?;
-        Ok::<_, instancy::error::Error>((rt, c1, c2, managers_b))
+        Ok::<_, instancy::error::Error>((rt, c1, c2))
     });
 
     let (ra, rb) = tokio::join!(ha, hb);
-    let (_rt_a, mut c1_a, mut c2_a, _mgr_a) = ra.unwrap().unwrap();
-    let (_rt_b, mut c1_b, mut c2_b, _mgr_b) = rb.unwrap().unwrap();
+    let (_rt_a, mut c1_a, mut c2_a) = ra.unwrap().unwrap();
+    let (_rt_b, mut c1_b, mut c2_b) = rb.unwrap().unwrap();
 
     // Dataflow 1: send values 0..5 from node-a
     let out_1a = c1_a.take_output::<u64>(0, "results").unwrap();
@@ -430,4 +442,105 @@ async fn shared_multiple_dataflows_same_connections() {
         .collect();
     results_2.sort();
     assert_eq!(results_2, vec![101, 102, 103, 104, 105]);
+}
+
+/// Regression test: dropping the original Arc after `spawn_cluster` must NOT
+/// kill background tasks. The `ClusterSpawnedDataflow` holds its own Arc clone.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn shared_dropping_arc_after_spawn_does_not_kill_transport() {
+    let topology = ClusterTopology::multi_node(vec![
+        NodeConfig::new("node-a", 1),
+        NodeConfig::new("node-b", 1),
+    ])
+    .unwrap();
+    let dataflow_id = DataflowId::new();
+    let tokio_handle = tokio::runtime::Handle::current();
+
+    let (managers_a, managers_b) =
+        make_tcp_shared_managers(test_shared_config(), 2, &tokio_handle).await;
+    let managers_a = Arc::new(managers_a);
+    let managers_b = Arc::new(managers_b);
+
+    let build = |_worker_idx: usize, builder: &mut DataflowBuilder<u64>| -> Result<()> {
+        let input = builder.input::<i64>("data");
+        let exchanged = input.exchange("by_val", |x: &i64| *x as u64);
+        exchanged.map("identity", |_t, x| x).output("results");
+        Ok(())
+    };
+
+    let topo_a = topology.clone();
+    let th = tokio_handle.clone();
+    let mgr_a = Arc::clone(&managers_a);
+    let ha = tokio::task::spawn_blocking(move || {
+        let rt = RuntimeHandle::new(RuntimeConfig {
+            worker_threads: 1,
+            ..RuntimeConfig::default()
+        })?;
+        let cluster = rt.spawn_cluster(
+            "drop-arc-test",
+            topo_a,
+            "node-a",
+            dataflow_id,
+            ClusterSpawnTransport::shared(mgr_a, 1024),
+            Duration::from_secs(10),
+            build,
+            &th,
+        )?;
+        Ok::<_, instancy::error::Error>((rt, cluster))
+    });
+
+    let topo_b = topology;
+    let th2 = tokio_handle;
+    let mgr_b = Arc::clone(&managers_b);
+    let hb = tokio::task::spawn_blocking(move || {
+        let rt = RuntimeHandle::new(RuntimeConfig {
+            worker_threads: 1,
+            ..RuntimeConfig::default()
+        })?;
+        let cluster = rt.spawn_cluster(
+            "drop-arc-test",
+            topo_b,
+            "node-b",
+            dataflow_id,
+            ClusterSpawnTransport::shared(mgr_b, 1024),
+            Duration::from_secs(10),
+            build,
+            &th2,
+        )?;
+        Ok::<_, instancy::error::Error>((rt, cluster))
+    });
+
+    let (ra, rb) = tokio::join!(ha, hb);
+    let (_rt_a, mut ca) = ra.unwrap().unwrap();
+    let (_rt_b, mut cb) = rb.unwrap().unwrap();
+
+    // Drop our original Arc handles — the dataflows must still work because
+    // ClusterSpawnedDataflow holds its own clone of the Arc.
+    drop(managers_a);
+    drop(managers_b);
+
+    let out_a = ca.take_output::<i64>(0, "results").unwrap();
+    let out_b = cb.take_output::<i64>(0, "results").unwrap();
+
+    // Send data from node-a
+    let sa = ca.take_input::<i64>(0, "data").unwrap();
+    sa.send(1, vec![1, 2, 3, 4]).unwrap();
+    drop(sa);
+
+    // Node-b sends nothing
+    let sb = cb.take_input::<i64>(0, "data").unwrap();
+    drop(sb);
+
+    join_with_timeout(ca).await;
+    join_with_timeout(cb).await;
+
+    // All data should arrive correctly despite the original Arc being dropped.
+    let mut all_results: Vec<i64> = out_a
+        .collect_data()
+        .into_iter()
+        .flat_map(|(_, d)| d)
+        .chain(out_b.collect_data().into_iter().flat_map(|(_, d)| d))
+        .collect();
+    all_results.sort();
+    assert_eq!(all_results, vec![1, 2, 3, 4]);
 }

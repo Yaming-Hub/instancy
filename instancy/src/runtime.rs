@@ -1390,7 +1390,7 @@ impl RuntimeHandle {
         topology: crate::execute::ClusterTopology,
         local_node_id: &str,
         dataflow_id: crate::dataflow::id::DataflowId,
-        transport_config: crate::communication::cluster_transport::ClusterSpawnTransport<'_, R, W>,
+        transport_config: crate::communication::cluster_transport::ClusterSpawnTransport<R, W>,
         handshake_timeout: std::time::Duration,
         build: F,
         runtime_handle: &tokio::runtime::Handle,
@@ -1468,6 +1468,8 @@ impl RuntimeHandle {
                 tokio::sync::mpsc::Receiver<crate::communication::transport::TransportError>,
             >,
         >;
+        // Shared peer managers Arc (keeps managers alive for the dataflow lifetime).
+        let shared_managers_arc: Option<Arc<std::collections::HashMap<String, crate::communication::shared_transport::SharedPeerManager>>>;
 
         match transport_config {
             ClusterSpawnTransport::Dedicated { connections, capacity } => {
@@ -1562,6 +1564,7 @@ impl RuntimeHandle {
                 receivers = raw_receivers;
                 dedicated_session = Some(session);
                 shared_error_receivers = None;
+                shared_managers_arc = None;
             }
 
             ClusterSpawnTransport::Shared { peer_managers, capacity } => {
@@ -1624,7 +1627,7 @@ impl RuntimeHandle {
                 let mut session = runtime_handle.block_on(
                     crate::communication::shared_transport::SharedTransportSession::new(
                         dataflow_id,
-                        peer_managers,
+                        &peer_managers,
                         &all_channel_ids,
                         capacity,
                     ),
@@ -1649,6 +1652,7 @@ impl RuntimeHandle {
                 receivers = raw_receivers;
                 dedicated_session = None;
                 shared_error_receivers = error_rxs;
+                shared_managers_arc = Some(peer_managers);
             }
         }
 
@@ -1961,6 +1965,7 @@ impl RuntimeHandle {
             local_worker_range: (local_start, local_end),
             total_workers,
             _transport: transport,
+            _shared_managers: shared_managers_arc,
             _progress_handles: progress_handles,
             _bridge_cancel: bridge_cancel,
         })
@@ -3226,6 +3231,8 @@ pub struct ClusterSpawnedDataflow<T: Timestamp> {
     total_workers: usize,
     /// Keeps transport alive (background Muxer/Demuxer tasks).
     _transport: Arc<crate::communication::cluster_transport::ClusterTransport>,
+    /// Keeps shared peer managers alive (prevents task abort on drop).
+    _shared_managers: Option<Arc<std::collections::HashMap<String, crate::communication::shared_transport::SharedPeerManager>>>,
     /// Keeps progress bridge tasks alive.
     _progress_handles: crate::progress::network_progress::NetworkProgressHandles,
     /// Cancels bridge tasks on drop.
