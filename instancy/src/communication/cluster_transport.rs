@@ -192,11 +192,12 @@ impl ClusterTransport {
 ///
 /// **Shared mode** (multiplexed over pooled connections):
 /// ```ignore
-/// let transport = ClusterSpawnTransport::shared(&peer_managers, 1024);
+/// let managers = Arc::new(peer_managers);
+/// let transport = ClusterSpawnTransport::shared(managers, 1024);
 /// runtime.spawn_cluster(name, topology, node_id, df_id, transport, timeout, build, &rt)?;
 /// ```
 #[cfg(feature = "transport")]
-pub enum ClusterSpawnTransport<'a, R = tokio::io::DuplexStream, W = tokio::io::DuplexStream> {
+pub enum ClusterSpawnTransport<R = tokio::io::DuplexStream, W = tokio::io::DuplexStream> {
     /// Use dedicated per-dataflow connections (one TCP connection per peer).
     Dedicated {
         /// Pre-established connections to each remote peer.
@@ -205,16 +206,19 @@ pub enum ClusterSpawnTransport<'a, R = tokio::io::DuplexStream, W = tokio::io::D
         capacity: usize,
     },
     /// Use shared pooled connections via existing [`SharedPeerManager`]s.
+    ///
+    /// The `Arc` ensures peer managers remain alive for the lifetime of the
+    /// dataflow, preventing premature task abortion.
     Shared {
         /// Map of peer_node_id → SharedPeerManager (must match topology peers).
-        peer_managers: &'a HashMap<String, crate::communication::shared_transport::SharedPeerManager>,
+        peer_managers: Arc<HashMap<String, crate::communication::shared_transport::SharedPeerManager>>,
         /// Buffer capacity for per-channel receivers.
         capacity: usize,
     },
 }
 
 #[cfg(feature = "transport")]
-impl<'a, R, W> ClusterSpawnTransport<'a, R, W> {
+impl<R, W> ClusterSpawnTransport<R, W> {
     /// Create a dedicated transport configuration.
     pub fn dedicated(
         connections: Vec<crate::communication::transport_session::PeerConnection<R, W>>,
@@ -225,10 +229,13 @@ impl<'a, R, W> ClusterSpawnTransport<'a, R, W> {
 }
 
 #[cfg(feature = "transport")]
-impl<'a> ClusterSpawnTransport<'a> {
+impl ClusterSpawnTransport {
     /// Create a shared transport configuration.
+    ///
+    /// The `Arc` ownership ensures peer managers stay alive for the duration of
+    /// the dataflow, preventing the background tasks from being aborted prematurely.
     pub fn shared(
-        peer_managers: &'a HashMap<String, crate::communication::shared_transport::SharedPeerManager>,
+        peer_managers: Arc<HashMap<String, crate::communication::shared_transport::SharedPeerManager>>,
         capacity: usize,
     ) -> Self {
         Self::Shared { peer_managers, capacity }
