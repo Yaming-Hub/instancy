@@ -2847,6 +2847,46 @@ impl<
 
         pipe
     }
+
+    /// Route all data to worker 0 (global aggregation pattern).
+    ///
+    /// Equivalent to `exchange_by_hash(name, |_| 0)` — every item is sent
+    /// to the same worker regardless of content. Use before global reduce/fold
+    /// when you need a single aggregated result.
+    ///
+    /// In single-worker mode, this is a no-op pass-through.
+    ///
+    /// # Example
+    /// ```ignore
+    /// let global_sum = stream
+    ///     .gather("collect-all")
+    ///     .reduce("global-sum", |acc, x| acc + x);
+    /// ```
+    pub fn gather(self, name: impl Into<String>) -> Pipe<T, D> {
+        self.exchange_by_hash(name, |_| 0u64)
+    }
+
+    /// Distribute data round-robin across workers for load balancing.
+    ///
+    /// Each item is sent to the next worker in sequence (modulo worker count),
+    /// providing even distribution regardless of data content. Use when items
+    /// are independent and you want uniform load across workers.
+    ///
+    /// In single-worker mode, this is a no-op pass-through.
+    ///
+    /// # Example
+    /// ```ignore
+    /// let balanced = stream
+    ///     .rebalance("spread-load")
+    ///     .map("process", |_t, x| expensive_computation(x));
+    /// ```
+    pub fn rebalance(self, name: impl Into<String>) -> Pipe<T, D> {
+        let counter = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let counter_clone = counter.clone();
+        self.exchange_by_hash(name, move |_| {
+            counter_clone.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        })
+    }
 }
 
 /// Exchange methods for non-transport builds (local-only exchange).
@@ -2935,6 +2975,46 @@ impl<T: Timestamp, D: Clone + Send + 'static> Pipe<T, D> {
             .graph
             .set_exchange_parallelism(exchange_op_idx, target_parallelism);
         pipe
+    }
+
+    /// Route all data to worker 0 (global aggregation pattern).
+    ///
+    /// Equivalent to `exchange_by_hash(name, |_| 0)` — every item is sent
+    /// to the same worker regardless of content. Use before global reduce/fold
+    /// when you need a single aggregated result.
+    ///
+    /// In single-worker mode, this is a no-op pass-through.
+    ///
+    /// # Example
+    /// ```ignore
+    /// let global_sum = stream
+    ///     .gather("collect-all")
+    ///     .reduce("global-sum", |acc, x| acc + x);
+    /// ```
+    pub fn gather(self, name: impl Into<String>) -> Pipe<T, D> {
+        self.exchange_by_hash(name, |_| 0u64)
+    }
+
+    /// Distribute data round-robin across workers for load balancing.
+    ///
+    /// Each item is sent to the next worker in sequence (modulo worker count),
+    /// providing even distribution regardless of data content. Use when items
+    /// are independent and you want uniform load across workers.
+    ///
+    /// In single-worker mode, this is a no-op pass-through.
+    ///
+    /// # Example
+    /// ```ignore
+    /// let balanced = stream
+    ///     .rebalance("spread-load")
+    ///     .map("process", |_t, x| expensive_computation(x));
+    /// ```
+    pub fn rebalance(self, name: impl Into<String>) -> Pipe<T, D> {
+        let counter = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let counter_clone = counter.clone();
+        self.exchange_by_hash(name, move |_| {
+            counter_clone.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        })
     }
 }
 
@@ -5751,5 +5831,98 @@ mod tests {
         let r = c.lock().unwrap();
         let results: Vec<usize> = r.iter().flat_map(|(_, d)| d.clone()).collect();
         assert_eq!(results, vec![3]);
+    }
+
+    #[test]
+    fn test_gather_routes_all_to_single_output() {
+        // In single-worker mode, gather is a pass-through.
+        let builder = DataflowBuilder::<u64>::new("gather_test");
+        let port = builder
+            .source("nums", vec![(0u64, vec![1i32, 2, 3, 4, 5])])
+            .gather("collect-all")
+            .output("results");
+        let dataflow = builder.build().unwrap();
+        rt().run(dataflow).unwrap();
+
+        let c = port.collector();
+        let r = c.lock().unwrap();
+        let results: Vec<i32> = r.iter().flat_map(|(_, d)| d.clone()).collect();
+        assert_eq!(results, vec![1, 2, 3, 4, 5]);
+    }
+
+    #[test]
+    fn test_gather_then_reduce() {
+        // gather → reduce produces a single global result.
+        let builder = DataflowBuilder::<u64>::new("gather_reduce");
+        let port = builder
+            .source("nums", vec![(0u64, vec![10i32, 20, 30])])
+            .gather("collect")
+            .reduce("sum", |acc, x| acc + x)
+            .output("results");
+        let dataflow = builder.build().unwrap();
+        rt().run(dataflow).unwrap();
+
+        let c = port.collector();
+        let r = c.lock().unwrap();
+        let results: Vec<i32> = r.iter().flat_map(|(_, d)| d.clone()).collect();
+        assert_eq!(results, vec![60]);
+    }
+
+    #[test]
+    fn test_rebalance_passes_all_data() {
+        // In single-worker mode, rebalance is a pass-through.
+        let builder = DataflowBuilder::<u64>::new("rebalance_test");
+        let port = builder
+            .source("nums", vec![(0u64, vec![1i32, 2, 3, 4, 5, 6])])
+            .rebalance("spread")
+            .output("results");
+        let dataflow = builder.build().unwrap();
+        rt().run(dataflow).unwrap();
+
+        let c = port.collector();
+        let r = c.lock().unwrap();
+        let results: Vec<i32> = r.iter().flat_map(|(_, d)| d.clone()).collect();
+        assert_eq!(results, vec![1, 2, 3, 4, 5, 6]);
+    }
+
+    #[test]
+    fn test_rebalance_then_map() {
+        // rebalance → map pipeline preserves all data.
+        let builder = DataflowBuilder::<u64>::new("rebalance_map");
+        let port = builder
+            .source("nums", vec![(0u64, vec![1i32, 2, 3])])
+            .rebalance("distribute")
+            .map("double", |_t, x| x * 2)
+            .output("results");
+        let dataflow = builder.build().unwrap();
+        rt().run(dataflow).unwrap();
+
+        let c = port.collector();
+        let r = c.lock().unwrap();
+        let results: Vec<i32> = r.iter().flat_map(|(_, d)| d.clone()).collect();
+        assert_eq!(results, vec![2, 4, 6]);
+    }
+
+    #[test]
+    fn test_gather_multi_epoch() {
+        // gather preserves data across multiple epochs.
+        let builder = DataflowBuilder::<u64>::new("gather_epochs");
+        let port = builder
+            .source(
+                "nums",
+                vec![
+                    (0u64, vec![1i32, 2]),
+                    (1u64, vec![10, 20]),
+                ],
+            )
+            .gather("collect")
+            .output("results");
+        let dataflow = builder.build().unwrap();
+        rt().run(dataflow).unwrap();
+
+        let c = port.collector();
+        let r = c.lock().unwrap();
+        let results: Vec<i32> = r.iter().flat_map(|(_, d)| d.clone()).collect();
+        assert_eq!(results, vec![1, 2, 10, 20]);
     }
 }
