@@ -1222,6 +1222,68 @@ impl<T: Timestamp, D: Clone + Send + 'static> Pipe<T, D> {
         )
     }
 
+    /// Remove duplicate elements within each timestamp.
+    ///
+    /// Buffers data until a timestamp is complete (input frontier advances
+    /// past it), then emits only unique elements. Uses a `HashSet` for
+    /// deduplication, so `D` must implement `Hash + Eq`.
+    ///
+    /// Order of elements in the output is not guaranteed.
+    ///
+    /// # When to use
+    ///
+    /// Use `distinct` after `exchange` in multi-worker dataflows to ensure
+    /// duplicates from different workers are eliminated. Without exchange,
+    /// each worker deduplicates only its local partition.
+    ///
+    /// # Example
+    /// ```ignore
+    /// let unique = input.distinct("dedup");
+    /// ```
+    pub fn distinct(mut self, name: impl Into<String>) -> Pipe<T, D>
+    where
+        D: std::hash::Hash + Eq,
+    {
+        let capacity = self.resolve_capacity();
+        let mut stash: std::collections::BTreeMap<T, Vec<D>> = std::collections::BTreeMap::new();
+        self.add_unary_notify_internal(
+            name,
+            capacity,
+            move |input, output, ctx| {
+                while let Some((time, data)) = input.next() {
+                    stash.entry(time.clone()).or_default().extend(data);
+                    ctx.notify_at(time);
+                }
+                while let Some(time) = ctx.next_notification() {
+                    if let Some(data) = stash.remove(&time) {
+                        let mut seen = std::collections::HashSet::with_capacity(data.len());
+                        let unique: Vec<D> = data
+                            .into_iter()
+                            .filter(|item| seen.insert(item.clone()))
+                            .collect();
+                        if !unique.is_empty() {
+                            output.push_vec(time, unique);
+                        }
+                    }
+                }
+                Ok(())
+            },
+        )
+    }
+
+    /// Count elements per timestamp.
+    ///
+    /// Convenience wrapper around [`fold`](Self::fold) that returns the
+    /// number of elements received at each timestamp as a `usize`.
+    ///
+    /// # Example
+    /// ```ignore
+    /// let counts = input.count("count-per-epoch");
+    /// ```
+    pub fn count(self, name: impl Into<String>) -> Pipe<T, usize> {
+        self.fold(name, 0usize, |acc, _item| acc + 1)
+    }
+
     /// Pass through the first `count` elements, then stop.
     ///
     /// This is the dataflow equivalent of SQL `LIMIT`. After emitting `count`
@@ -5562,5 +5624,132 @@ mod tests {
         let c = port.collector();
         let r = c.lock().unwrap();
         assert_eq!(r[0].1, vec![-10]);
+    }
+
+    #[test]
+    fn test_distinct_removes_duplicates() {
+        let builder = DataflowBuilder::<u64>::new("distinct_test");
+        let port = builder
+            .source("nums", vec![(0u64, vec![1i32, 2, 2, 3, 1, 3, 4])])
+            .distinct("dedup")
+            .output("results");
+        let dataflow = builder.build().unwrap();
+        rt().run(dataflow).unwrap();
+
+        let c = port.collector();
+        let r = c.lock().unwrap();
+        let mut results: Vec<i32> = r.iter().flat_map(|(_, d)| d.clone()).collect();
+        results.sort();
+        assert_eq!(results, vec![1, 2, 3, 4]);
+    }
+
+    #[test]
+    fn test_distinct_per_timestamp() {
+        let builder = DataflowBuilder::<u64>::new("distinct_per_ts");
+        let port = builder
+            .source(
+                "nums",
+                vec![
+                    (0u64, vec![1i32, 1, 2]),
+                    (1u64, vec![2i32, 2, 3]),
+                ],
+            )
+            .distinct("dedup")
+            .output("results");
+        let dataflow = builder.build().unwrap();
+        rt().run(dataflow).unwrap();
+
+        let c = port.collector();
+        let r = c.lock().unwrap();
+        // Each timestamp deduplicates independently
+        let mut t0: Vec<i32> = r
+            .iter()
+            .filter(|(t, _)| *t == 0)
+            .flat_map(|(_, d)| d.clone())
+            .collect();
+        let mut t1: Vec<i32> = r
+            .iter()
+            .filter(|(t, _)| *t == 1)
+            .flat_map(|(_, d)| d.clone())
+            .collect();
+        t0.sort();
+        t1.sort();
+        assert_eq!(t0, vec![1, 2]);
+        assert_eq!(t1, vec![2, 3]);
+    }
+
+    #[test]
+    fn test_distinct_no_duplicates() {
+        let builder = DataflowBuilder::<u64>::new("distinct_no_dups");
+        let port = builder
+            .source("nums", vec![(0u64, vec![1i32, 2, 3, 4, 5])])
+            .distinct("dedup")
+            .output("results");
+        let dataflow = builder.build().unwrap();
+        rt().run(dataflow).unwrap();
+
+        let c = port.collector();
+        let r = c.lock().unwrap();
+        let mut results: Vec<i32> = r.iter().flat_map(|(_, d)| d.clone()).collect();
+        results.sort();
+        assert_eq!(results, vec![1, 2, 3, 4, 5]);
+    }
+
+    #[test]
+    fn test_distinct_empty() {
+        let builder = DataflowBuilder::<u64>::new("distinct_empty");
+        let port = builder
+            .source::<i32>("nums", vec![])
+            .distinct("dedup")
+            .output("results");
+        let dataflow = builder.build().unwrap();
+        rt().run(dataflow).unwrap();
+
+        let c = port.collector();
+        let r = c.lock().unwrap();
+        assert!(r.iter().flat_map(|(_, d)| d.clone()).count() == 0);
+    }
+
+    #[test]
+    fn test_count_elements_per_timestamp() {
+        let builder = DataflowBuilder::<u64>::new("count_test");
+        let port = builder
+            .source(
+                "nums",
+                vec![
+                    (0u64, vec![10i32, 20, 30]),
+                    (1u64, vec![40i32, 50]),
+                ],
+            )
+            .count("count")
+            .output("results");
+        let dataflow = builder.build().unwrap();
+        rt().run(dataflow).unwrap();
+
+        let c = port.collector();
+        let r = c.lock().unwrap();
+        let mut results: Vec<(u64, usize)> = r
+            .iter()
+            .flat_map(|(t, d)| d.iter().map(move |v| (*t, *v)))
+            .collect();
+        results.sort();
+        assert_eq!(results, vec![(0, 3), (1, 2)]);
+    }
+
+    #[test]
+    fn test_distinct_then_count() {
+        let builder = DataflowBuilder::<u64>::new("distinct_then_count");
+        let port = builder
+            .source("nums", vec![(0u64, vec![1i32, 1, 2, 2, 3])])
+            .distinct("dedup")
+            .count("count")
+            .output("results");
+        let dataflow = builder.build().unwrap();
+        rt().run(dataflow).unwrap();
+
+        let c = port.collector();
+        let r = c.lock().unwrap();
+        let results: Vec<usize> = r.iter().flat_map(|(_, d)| d.clone()).collect();
+        assert_eq!(results, vec![3]);
     }
 }
