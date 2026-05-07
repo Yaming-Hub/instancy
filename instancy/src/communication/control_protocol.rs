@@ -329,6 +329,144 @@ pub async fn perform_ready_barrier(
     Ok(())
 }
 
+/// Perform the handshake protocol using a [`ClusterTransport`].
+///
+/// Functionally identical to [`perform_handshake`] but accepts the unified
+/// transport abstraction instead of a raw `TransportSession`.
+#[cfg(feature = "transport")]
+pub async fn perform_handshake_with_transport(
+    transport: &super::cluster_transport::ClusterTransport,
+    control_receivers: &mut std::collections::HashMap<String, tokio::sync::mpsc::Receiver<Vec<u8>>>,
+    local_fingerprint: u64,
+    dataflow_id: DataflowId,
+    timeout: std::time::Duration,
+) -> Result<(), String> {
+    use crate::communication::transport::Frame;
+    use crate::communication::transport_session::CONTROL_CHANNEL_ID;
+
+    let msg = ControlMessage::Handshake {
+        fingerprint: local_fingerprint,
+        dataflow_id,
+    };
+    let payload = encode_control_message(&msg);
+
+    // Send handshake to all peers.
+    for peer_id in transport.peer_node_ids() {
+        let sender = transport
+            .control_sender(&peer_id)
+            .ok_or_else(|| format!("no control sender for peer {peer_id}"))?;
+        let frame = Frame {
+            dataflow_id,
+            channel_id: CONTROL_CHANNEL_ID,
+            payload: payload.clone(),
+        };
+        sender
+            .send(frame)
+            .await
+            .map_err(|_| format!("failed to send handshake to peer {peer_id}"))?;
+    }
+
+    // Receive handshake from all peers.
+    let deadline = tokio::time::Instant::now() + timeout;
+    for (peer_id, rx) in control_receivers.iter_mut() {
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        let data = tokio::time::timeout(remaining, rx.recv())
+            .await
+            .map_err(|_| format!("handshake timeout waiting for peer {peer_id}"))?
+            .ok_or_else(|| format!("peer {peer_id} disconnected during handshake"))?;
+
+        let peer_msg = decode_control_message(&data)
+            .map_err(|e| format!("invalid handshake from peer {peer_id}: {e}"))?;
+
+        match peer_msg {
+            ControlMessage::Handshake {
+                fingerprint,
+                dataflow_id: peer_df_id,
+            } => {
+                if fingerprint != local_fingerprint {
+                    return Err(format!(
+                        "fingerprint mismatch with peer {peer_id}: \
+                         local={local_fingerprint:#018x}, remote={fingerprint:#018x}"
+                    ));
+                }
+                if peer_df_id != dataflow_id {
+                    return Err(format!("dataflow_id mismatch with peer {peer_id}"));
+                }
+            }
+            other => {
+                return Err(format!(
+                    "unexpected control message from peer {peer_id}: expected Handshake, got {other:?}"
+                ));
+            }
+        }
+    }
+
+    Ok(())
+}
+
+/// Perform the ready barrier using a [`ClusterTransport`].
+///
+/// Functionally identical to [`perform_ready_barrier`] but accepts the unified
+/// transport abstraction instead of a raw `TransportSession`.
+#[cfg(feature = "transport")]
+pub async fn perform_ready_barrier_with_transport(
+    transport: &super::cluster_transport::ClusterTransport,
+    control_receivers: &mut std::collections::HashMap<String, tokio::sync::mpsc::Receiver<Vec<u8>>>,
+    local_node_id: &str,
+    dataflow_id: DataflowId,
+    timeout: std::time::Duration,
+) -> Result<(), String> {
+    use crate::communication::transport::Frame;
+    use crate::communication::transport_session::CONTROL_CHANNEL_ID;
+
+    let msg = ControlMessage::Ready {
+        node_id: local_node_id.to_string(),
+    };
+    let payload = encode_control_message(&msg);
+
+    // Send Ready to all peers.
+    for peer_id in transport.peer_node_ids() {
+        let sender = transport
+            .control_sender(&peer_id)
+            .ok_or_else(|| format!("no control sender for peer {peer_id}"))?;
+        let frame = Frame {
+            dataflow_id,
+            channel_id: CONTROL_CHANNEL_ID,
+            payload: payload.clone(),
+        };
+        sender
+            .send(frame)
+            .await
+            .map_err(|_| format!("failed to send Ready to peer {peer_id}"))?;
+    }
+
+    // Receive Ready from all peers.
+    let deadline = tokio::time::Instant::now() + timeout;
+    for (peer_id, rx) in control_receivers.iter_mut() {
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        let data = tokio::time::timeout(remaining, rx.recv())
+            .await
+            .map_err(|_| format!("ready barrier timeout waiting for peer {peer_id}"))?
+            .ok_or_else(|| format!("peer {peer_id} disconnected during ready barrier"))?;
+
+        let peer_msg = decode_control_message(&data)
+            .map_err(|e| format!("invalid Ready from peer {peer_id}: {e}"))?;
+
+        match peer_msg {
+            ControlMessage::Ready { .. } => {
+                // Peer is ready.
+            }
+            other => {
+                return Err(format!(
+                    "unexpected control message from peer {peer_id}: expected Ready, got {other:?}"
+                ));
+            }
+        }
+    }
+
+    Ok(())
+}
+
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------

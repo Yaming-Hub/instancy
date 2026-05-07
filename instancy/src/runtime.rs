@@ -1814,6 +1814,462 @@ impl RuntimeHandle {
             _bridge_cancel: bridge_cancel,
         })
     }
+
+    /// Spawn a distributed dataflow using **shared** transport (connection pooling).
+    ///
+    /// Like [`spawn_cluster`](Self::spawn_cluster), this materializes a multi-node
+    /// dataflow with handshake and ready barrier, but uses pre-existing
+    /// [`SharedPeerManager`]s instead of dedicated per-dataflow connections.
+    ///
+    /// Multiple dataflows can share the same set of `SharedPeerManager`s,
+    /// multiplexing their traffic over pooled connections. This reduces
+    /// connection count and improves resource utilization for multi-dataflow
+    /// deployments.
+    ///
+    /// # Arguments
+    /// - `name`: Human-readable dataflow name (used in peer registry).
+    /// - `topology`: Cluster topology describing all nodes and workers.
+    /// - `local_node_id`: The node ID of this process.
+    /// - `dataflow_id`: Pre-agreed unique dataflow identifier.
+    /// - `peer_managers`: Map of peer_node_id → SharedPeerManager.
+    /// - `capacity`: Channel buffer capacity.
+    /// - `handshake_timeout`: Maximum time to wait for handshake/ready barrier.
+    /// - `build`: Closure that builds the dataflow graph.
+    /// - `runtime_handle`: Tokio runtime handle for async operations.
+    ///
+    /// # Errors
+    /// Same as [`spawn_cluster`](Self::spawn_cluster).
+    #[cfg(feature = "transport")]
+    #[allow(clippy::too_many_arguments)]
+    pub fn spawn_cluster_shared<T, F>(
+        &self,
+        name: &str,
+        topology: crate::execute::ClusterTopology,
+        local_node_id: &str,
+        dataflow_id: crate::dataflow::id::DataflowId,
+        peer_managers: &std::collections::HashMap<
+            String,
+            crate::communication::shared_transport::SharedPeerManager,
+        >,
+        capacity: usize,
+        handshake_timeout: std::time::Duration,
+        build: F,
+        runtime_handle: &tokio::runtime::Handle,
+    ) -> Result<ClusterSpawnedDataflow<T>>
+    where
+        T: Timestamp + crate::communication::codec::ExchangeData,
+        F: Fn(usize, &mut DataflowBuilder<T>) -> Result<()>,
+    {
+        use crate::communication::cluster_transport::ClusterTransport;
+        use crate::communication::control_protocol::{
+            compute_fingerprint, perform_handshake_with_transport,
+            perform_ready_barrier_with_transport,
+        };
+        use crate::communication::shared_transport::SharedTransportSession;
+        use crate::communication::transport_session::CONTROL_CHANNEL_ID;
+        use crate::dataflow::channels::exchange_channel::NetworkMaterializerParams;
+        use crate::dataflow::channels::network::NetworkEdgeMaterializer;
+        use crate::progress::network_progress::{
+            DEFAULT_MAX_BATCH_SIZE, create_network_progress_channels, progress_channel_id,
+        };
+
+        let total_workers = topology.total_workers();
+        let (local_start, local_end) = topology.worker_range(local_node_id).ok_or_else(|| {
+            Error::Custom(format!(
+                "local_node_id '{local_node_id}' not found in topology"
+            ))
+        })?;
+        let num_local = local_end - local_start;
+
+        // Validate peer_managers match topology.
+        {
+            let mut expected_peers: std::collections::HashSet<&str> = topology
+                .nodes
+                .iter()
+                .map(|n| n.node_id.as_str())
+                .filter(|id| *id != local_node_id)
+                .collect();
+            for peer_id in peer_managers.keys() {
+                if !expected_peers.remove(peer_id.as_str()) {
+                    return Err(Error::Custom(format!(
+                        "unexpected peer_manager for '{peer_id}' not in topology"
+                    )));
+                }
+            }
+            if !expected_peers.is_empty() {
+                return Err(Error::Custom(format!(
+                    "missing peer_managers for: {:?}",
+                    expected_peers
+                )));
+            }
+        }
+
+        // Phase 1: Build and validate dataflow graph (same as dedicated mode).
+        let mut dataflows = Vec::with_capacity(num_local);
+        for worker_idx in local_start..local_end {
+            let mut builder = DataflowBuilder::new(format!("{name}/worker-{worker_idx}"));
+            build(worker_idx, &mut builder)?;
+            let df = builder.build()?;
+            dataflows.push(df);
+        }
+
+        // Validate topologies match across local workers.
+        if num_local > 1 {
+            validate_multi_worker_topologies(&dataflows)?;
+        }
+        validate_stage_parallelism(&dataflows[0], total_workers)?;
+
+        // Compute fingerprint from worker 0.
+        let exchange_indices = dataflows[0].exchange_edge_indices();
+        let fingerprint = compute_fingerprint(
+            dataflows[0].operator_count(),
+            dataflows[0].edge_count(),
+            &exchange_indices,
+            dataflows[0].feedback_edge_count(),
+            total_workers,
+        );
+
+        // Phase 2: Compute channel IDs to register with SharedPeerManagers.
+        let num_workers = total_workers;
+        let mut all_channel_ids: Vec<u64> = Vec::new();
+
+        // Data channels: for each exchange edge
+        for (edge_order, &_edge_idx) in exchange_indices.iter().enumerate() {
+            for node in &topology.nodes {
+                if node.node_id == local_node_id {
+                    continue;
+                }
+                let (peer_start, peer_end) = topology.worker_range(&node.node_id).unwrap();
+                // Inbound: peer workers → local workers
+                for src in peer_start..peer_end {
+                    for dst in local_start..local_end {
+                        let ch_id = NetworkEdgeMaterializer::<T, u8>::channel_id(
+                            edge_order, src, dst, num_workers,
+                        );
+                        all_channel_ids.push(ch_id);
+                    }
+                }
+            }
+        }
+
+        // Progress channels
+        for node in &topology.nodes {
+            if node.node_id == local_node_id {
+                continue;
+            }
+            let (peer_start, peer_end) = topology.worker_range(&node.node_id).unwrap();
+            for src in peer_start..peer_end {
+                for dst in local_start..local_end {
+                    let ch_id = progress_channel_id(src, dst, num_workers);
+                    all_channel_ids.push(ch_id);
+                }
+            }
+        }
+
+        // Phase 3: Register dataflow with SharedPeerManagers to get receivers.
+        let mut session = runtime_handle.block_on(SharedTransportSession::new(
+            dataflow_id,
+            peer_managers,
+            &all_channel_ids,
+            capacity,
+        ));
+
+        // Take receivers and error receivers before wrapping in Arc.
+        let mut receivers = session
+            .take_receivers()
+            .ok_or_else(|| Error::Custom("receivers already taken".into()))?;
+        let error_receivers = session.take_error_receivers();
+
+        let transport = Arc::new(ClusterTransport::Shared {
+            session: Arc::new(session),
+            error_receivers: None, // Taken out for monitoring tasks below.
+        });
+
+        // Phase 4: Extract control receivers and perform handshake.
+        let mut control_receivers: std::collections::HashMap<
+            String,
+            tokio::sync::mpsc::Receiver<Vec<u8>>,
+        > = std::collections::HashMap::new();
+        for (peer_id, peer_map) in receivers.iter_mut() {
+            if let Some(rx) = peer_map.remove(&CONTROL_CHANNEL_ID) {
+                control_receivers.insert(peer_id.clone(), rx);
+            }
+        }
+
+        runtime_handle
+            .block_on(perform_handshake_with_transport(
+                &transport,
+                &mut control_receivers,
+                fingerprint,
+                dataflow_id,
+                handshake_timeout,
+            ))
+            .map_err(|e| Error::Custom(format!("cluster handshake failed: {e}")))?;
+
+        // Phase 5: Wire exchange channels using network-backed factories.
+        let wake_handles: Vec<WakeHandle> =
+            (0..total_workers).map(|_| WakeHandle::new()).collect();
+
+        let network_creators = std::mem::take(&mut dataflows[0].exchange_network_creators);
+
+        for (edge_order, (edge_idx, edge_capacity, creator)) in
+            network_creators.into_iter().enumerate()
+        {
+            let mut edge_receivers: std::collections::HashMap<
+                String,
+                std::collections::HashMap<u64, tokio::sync::mpsc::Receiver<Vec<u8>>>,
+            > = std::collections::HashMap::new();
+            for node in &topology.nodes {
+                if node.node_id == local_node_id {
+                    continue;
+                }
+                let peer_id = &node.node_id;
+                let (peer_start, peer_end) = topology.worker_range(peer_id).unwrap();
+                let mut extracted = std::collections::HashMap::new();
+                if let Some(peer_map) = receivers.get_mut(peer_id) {
+                    for src in peer_start..peer_end {
+                        for dst in local_start..local_end {
+                            let channel_id = NetworkEdgeMaterializer::<T, u8>::channel_id(
+                                edge_order,
+                                src,
+                                dst,
+                                total_workers,
+                            );
+                            if let Some(rx) = peer_map.remove(&channel_id) {
+                                extracted.insert(channel_id, rx);
+                            }
+                        }
+                    }
+                }
+                if !extracted.is_empty() {
+                    edge_receivers.insert(peer_id.clone(), extracted);
+                }
+            }
+
+            let params = NetworkMaterializerParams {
+                dataflow_id,
+                topology: topology.clone(),
+                local_node_id: local_node_id.to_string(),
+                transport: Arc::clone(&transport),
+                receivers: edge_receivers,
+                capacity: edge_capacity,
+                num_workers: total_workers,
+                edge_index: edge_order,
+                wake_handles: wake_handles.clone(),
+                runtime_handle: runtime_handle.clone(),
+            };
+            let all_factories = creator.create(params);
+
+            if all_factories.len() != total_workers {
+                return Err(Error::Custom(format!(
+                    "network exchange factory for edge {edge_idx} produced {} factories, expected {total_workers}",
+                    all_factories.len()
+                )));
+            }
+
+            for (local_idx, factory) in all_factories
+                .into_iter()
+                .skip(local_start)
+                .take(num_local)
+                .enumerate()
+            {
+                let pos = dataflows[local_idx]
+                    .channel_factories
+                    .iter()
+                    .position(|(idx, _)| *idx == edge_idx)
+                    .ok_or_else(|| {
+                        Error::Custom(format!(
+                            "exchange edge {edge_idx} not found in worker {}'s channel factories",
+                            local_start + local_idx
+                        ))
+                    })?;
+                dataflows[local_idx].channel_factories[pos].1 = factory;
+            }
+        }
+
+        // Drain unused exchange_creators.
+        for df in dataflows.iter_mut() {
+            df.exchange_creators.clear();
+            df.exchange_network_creators.clear();
+        }
+
+        // Phase 6: Create progress channels.
+        let all_local_progress = create_progress_channels::<T>(total_workers, &wake_handles);
+        let local_progress: Vec<_> = all_local_progress
+            .into_iter()
+            .skip(local_start)
+            .take(num_local)
+            .collect();
+
+        let remote_peers: Vec<(String, usize, usize)> = topology
+            .nodes
+            .iter()
+            .filter(|n| n.node_id != local_node_id)
+            .map(|n| {
+                let (s, e) = topology.worker_range(&n.node_id).unwrap();
+                (n.node_id.clone(), s, e)
+            })
+            .collect();
+
+        let dataflow_cancel = Some(self.cancel.child_token());
+        let bridge_cancel = tokio_util::sync::CancellationToken::new();
+
+        // Spawn error monitoring tasks for shared transport.
+        // These poll per-peer error receivers and cancel the dataflow on failure.
+        if let Some(error_rxs) = error_receivers {
+            let df_cancel = dataflow_cancel.as_ref().unwrap().clone();
+            let bc = bridge_cancel.clone();
+            for (peer_id, mut error_rx) in error_rxs {
+                let cancel = df_cancel.clone();
+                let bridge = bc.clone();
+                let peer = peer_id.clone();
+                runtime_handle.spawn(async move {
+                    if let Some(_err) = error_rx.recv().await {
+                        #[cfg(feature = "tracing")]
+                        tracing::error!(
+                            peer = %peer,
+                            "shared transport error received, cancelling dataflow"
+                        );
+                        cancel.cancel_with_reason(
+                            crate::cancellation::CancellationReason::WorkerFailed(
+                                format!("shared transport failure from peer {peer}")
+                            )
+                        );
+                        bridge.cancel();
+                    }
+                });
+            }
+        }
+
+        let local_wake_handles: Vec<WakeHandle> = (local_start..local_end)
+            .map(|i| wake_handles[i].clone())
+            .collect();
+        let mut control_pairs: Vec<Option<(ControlSender, ControlReceiver)>> = if num_local > 1 {
+            let df_cancel = dataflow_cancel.as_ref().unwrap().clone();
+            let (senders, receivers) =
+                ControlBroadcast::new(num_local, &local_wake_handles, df_cancel);
+            senders
+                .into_iter()
+                .zip(receivers)
+                .map(|(s, r)| Some((s, r)))
+                .collect()
+        } else {
+            vec![None]
+        };
+
+        let (progress_channels, progress_handles) = create_network_progress_channels::<T>(
+            local_progress,
+            &transport,
+            receivers,
+            dataflow_id,
+            (local_start, local_end),
+            &remote_peers,
+            total_workers,
+            &wake_handles,
+            bridge_cancel.clone(),
+            DEFAULT_MAX_BATCH_SIZE,
+            runtime_handle,
+        )
+        .map_err(|e| Error::Custom(format!("failed to create network progress channels: {e}")))?;
+
+        // Phase 7: Materialize all local workers.
+        let mode = ChannelMode::Sync;
+        let dataflow_priority = 0;
+        let mut prepared = Vec::with_capacity(num_local);
+        let mut progress_channels_iter = progress_channels.into_iter();
+
+        for (local_idx, dataflow) in dataflows.into_iter().enumerate() {
+            let global_idx = local_start + local_idx;
+            let ctx = WorkerContext::new(global_idx, total_workers);
+            let pc = progress_channels_iter.next().map(Some).unwrap_or(None);
+            let wh = wake_handles[global_idx].clone();
+            let ctrl = control_pairs[local_idx].take();
+            match self.prepare_worker(
+                dataflow,
+                mode,
+                ctx,
+                pc,
+                Some(wh),
+                dataflow_cancel.clone(),
+                ctrl,
+            ) {
+                Ok(worker) => prepared.push(worker),
+                Err(e) => {
+                    for (w, _, _) in &prepared {
+                        w.cancel
+                            .cancel_with_reason(CancellationReason::WorkerFailed(format!(
+                                "cluster worker {global_idx} failed to spawn"
+                            )));
+                    }
+                    return Err(Error::Custom(format!(
+                        "failed to spawn cluster worker {global_idx}: {e}"
+                    )));
+                }
+            }
+        }
+
+        // Phase 8: Ready barrier.
+        runtime_handle
+            .block_on(perform_ready_barrier_with_transport(
+                &transport,
+                &mut control_receivers,
+                local_node_id,
+                dataflow_id,
+                handshake_timeout,
+            ))
+            .map_err(|e| Error::Custom(format!("cluster ready barrier failed: {e}")))?;
+
+        // Phase 9: Register all workers for execution.
+        let mut workers = Vec::with_capacity(num_local);
+        for (spawned, executor, mut notifier) in prepared {
+            self.active_count
+                .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+            let active_count = Arc::clone(&self.active_count);
+            let idle_notify = Arc::clone(&self.idle_notify);
+            notifier.set_on_complete(Box::new(move || {
+                let prev = active_count.fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
+                if prev == 1 {
+                    idle_notify.notify_waiters();
+                }
+            }));
+            self.registry
+                .register(executor, notifier, dataflow_id, dataflow_priority);
+            workers.push(spawned);
+        }
+
+        // Phase 10: Register in peer registry for peer-down notification.
+        let remote_peer_ids: Vec<String> = topology
+            .nodes
+            .iter()
+            .map(|n| n.node_id.clone())
+            .filter(|id| id != local_node_id)
+            .collect();
+        if !remote_peer_ids.is_empty() {
+            let worker_tokens: Vec<CancellationToken> =
+                workers.iter().map(|w| w.cancel.clone()).collect();
+            let cancel_handle = ClusterCancelHandle {
+                worker_tokens,
+                bridge_cancel: bridge_cancel.clone(),
+            };
+            self.peer_registry
+                .register(&remote_peer_ids, name, cancel_handle);
+        }
+
+        Ok(ClusterSpawnedDataflow {
+            inner: Some(MultiSpawnedDataflow {
+                name: name.to_string(),
+                num_workers: num_local,
+                workers,
+                dataflow_cancel,
+                _phantom: PhantomData,
+            }),
+            local_worker_range: (local_start, local_end),
+            total_workers,
+            _transport: transport,
+            _progress_handles: progress_handles,
+            _bridge_cancel: bridge_cancel,
+        })
+    }
 }
 
 impl Drop for RuntimeHandle {
