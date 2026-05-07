@@ -134,3 +134,109 @@ async fn spawn_multi_cancelled_by_external_token() {
         "multi-worker dataflow should be cancelled by external token"
     );
 }
+
+/// Dataflow with timeout that exceeds deadline is automatically cancelled.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn dataflow_cancelled_by_timeout() {
+    let rt = RuntimeHandle::new(RuntimeConfig::default()).unwrap();
+    let builder = DataflowBuilder::<u64>::new("timeout-test");
+
+    // Create a dataflow with an input port that we never close.
+    let input = builder.input::<i32>("data");
+    input.map("identity", |_t, v| v);
+
+    let dataflow = builder.build().unwrap();
+
+    let opts = SpawnOptions::new().timeout(Duration::from_millis(200));
+    let mut handle = rt.spawn(dataflow, opts).unwrap();
+
+    let cancel_token = handle.cancel_token().clone();
+    let _input = handle.take_input::<i32>("data").unwrap();
+
+    // Wait for completion — should be cancelled by timeout.
+    let result = handle.join().await;
+
+    assert!(
+        result.is_err() || cancel_token.is_cancelled(),
+        "dataflow should be cancelled by timeout"
+    );
+
+    if cancel_token.is_cancelled() {
+        let reason = cancel_token.reason();
+        assert_eq!(
+            reason,
+            Some(CancellationReason::Timeout(Duration::from_millis(200))),
+            "cancellation reason should be Timeout with the configured duration"
+        );
+    }
+}
+
+/// Dataflow that completes before timeout is NOT cancelled.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn dataflow_completes_before_timeout() {
+    let rt = RuntimeHandle::new(RuntimeConfig::default()).unwrap();
+    let builder = DataflowBuilder::<u64>::new("no-timeout-test");
+
+    let input = builder.input::<i32>("data");
+    input.map("double", |_t, v| v * 2).output("results");
+
+    let dataflow = builder.build().unwrap();
+
+    // Generous timeout — dataflow should complete well before this.
+    let opts = SpawnOptions::new().timeout(Duration::from_secs(30));
+    let mut handle = rt.spawn(dataflow, opts).unwrap();
+
+    let cancel_token = handle.cancel_token().clone();
+    let receiver = handle.take_output::<i32>("results").unwrap();
+    let sender = handle.take_input::<i32>("data").unwrap();
+
+    sender.send(0, vec![1, 2, 3]).unwrap();
+    sender.close();
+
+    let result = handle.join().await;
+    assert!(result.is_ok(), "dataflow should complete successfully");
+
+    let data = receiver.collect_data();
+    assert_eq!(data, vec![(0, vec![2, 4, 6])]);
+
+    // Internal token should NOT be cancelled with Timeout.
+    assert!(
+        !cancel_token.is_cancelled()
+            || cancel_token.reason() != Some(CancellationReason::Timeout(Duration::from_secs(30))),
+        "timeout should not have fired"
+    );
+}
+
+/// Multi-worker dataflow with timeout is cancelled when deadline elapses.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn spawn_multi_cancelled_by_timeout() {
+    let rt = RuntimeHandle::new(RuntimeConfig::default()).unwrap();
+
+    let opts = SpawnOptions::new().timeout(Duration::from_millis(200));
+    let mut multi = rt
+        .spawn_multi(
+            "multi-timeout",
+            2,
+            |_worker_idx, builder: &mut DataflowBuilder<u64>| {
+                let input = builder.input::<i32>("data");
+                input.map("identity", |_t, v| v);
+                Ok(())
+            },
+            opts,
+        )
+        .unwrap();
+
+    // Don't close inputs — workers will hang until timeout fires.
+    let _input0 = multi.take_input::<i32>(0, "data").unwrap();
+    let _input1 = multi.take_input::<i32>(1, "data").unwrap();
+
+    let completion = multi.join();
+    let result = tokio::task::spawn_blocking(move || completion.wait())
+        .await
+        .unwrap();
+
+    assert!(
+        result.is_err(),
+        "multi-worker dataflow should be cancelled by timeout"
+    );
+}
