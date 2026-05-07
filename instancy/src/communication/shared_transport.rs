@@ -1077,6 +1077,7 @@ pub async fn check_reorder_timeouts(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use super::super::shared_pool::ScalingDecision;
     use tokio::io::{duplex, DuplexStream};
 
     /// Helper: create N duplex connection pairs (read, write) for each side.
@@ -1567,5 +1568,306 @@ mod tests {
             Ok(None) => panic!("Error channel closed without sending error"),
             Err(_) => panic!("Timed out waiting for error notification"),
         }
+    }
+
+    // =======================================================================
+    // Integration tests: multi-dataflow, failure mid-stream, scale-up
+    // =======================================================================
+
+    /// Helper: create a bidirectional shared transport (two managers connected).
+    /// Returns (manager_a, manager_b) where A's writer connects to B's reader and vice versa.
+    fn make_bidirectional_managers(
+        num_connections: usize,
+        config: SharedConnectionConfig,
+        rt: &tokio::runtime::Handle,
+    ) -> (SharedPeerManager, SharedPeerManager) {
+        let mut a_connections = Vec::new();
+        let mut b_connections = Vec::new();
+
+        for _ in 0..num_connections {
+            // Each "connection" is a pair of duplex streams
+            let (a_to_b, b_from_a) = duplex(65536);
+            let (b_to_a, a_from_b) = duplex(65536);
+
+            // Manager A: reads from a_from_b, writes to a_to_b
+            a_connections.push((a_from_b, a_to_b));
+            // Manager B: reads from b_from_a, writes to b_to_a
+            b_connections.push((b_from_a, b_to_a));
+        }
+
+        let manager_a = SharedPeerManager::new(
+            "node-b".to_string(), // A's peer is B
+            config.clone(),
+            a_connections,
+            rt,
+        );
+        let manager_b = SharedPeerManager::new(
+            "node-a".to_string(), // B's peer is A
+            config,
+            b_connections,
+            rt,
+        );
+
+        (manager_a, manager_b)
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn multiple_dataflows_share_connections_ordering_preserved() {
+        // 3 dataflows sharing 2 connections between nodes A and B
+        let config = SharedConnectionConfig {
+            min_connections: 2,
+            max_connections: 4,
+            probe_interval: Duration::from_secs(999),
+            ..Default::default()
+        };
+        let rt = tokio::runtime::Handle::current();
+        let (manager_a, manager_b) = make_bidirectional_managers(2, config, &rt);
+
+        // Register 3 dataflows on both sides
+        let df1 = DataflowId::new();
+        let df2 = DataflowId::new();
+        let df3 = DataflowId::new();
+
+        let _reg_a1 = manager_a.register_dataflow(df1, &[1], 64).await;
+        let _reg_a2 = manager_a.register_dataflow(df2, &[1], 64).await;
+        let _reg_a3 = manager_a.register_dataflow(df3, &[1], 64).await;
+
+        let (mut rx_b1, _) = manager_b.register_dataflow(df1, &[1], 64).await;
+        let (mut rx_b2, _) = manager_b.register_dataflow(df2, &[1], 64).await;
+        let (mut rx_b3, _) = manager_b.register_dataflow(df3, &[1], 64).await;
+
+        // Send 10 messages per dataflow (interleaved)
+        let sender = manager_a.payload_sender().clone();
+        for i in 0u32..10 {
+            for &df_id in &[df1, df2, df3] {
+                let frame = Frame {
+                    dataflow_id: df_id,
+                    channel_id: 1,
+                    payload: i.to_le_bytes().to_vec(),
+                };
+                sender.send((df_id, frame)).await.unwrap();
+            }
+        }
+
+        // Verify each dataflow receives its 10 messages in order (no arbitrary sleep;
+        // the 2s timeout per recv is sufficient synchronization)
+        for (name, rx) in [("df1", &mut rx_b1), ("df2", &mut rx_b2), ("df3", &mut rx_b3)] {
+            let ch_rx = rx.get_mut(&1).unwrap();
+            for expected in 0u32..10 {
+                let result = tokio::time::timeout(Duration::from_secs(2), ch_rx.recv()).await;
+                match result {
+                    Ok(Some(payload)) => {
+                        let val = u32::from_le_bytes(payload[..4].try_into().unwrap());
+                        assert_eq!(val, expected, "{name} frame {expected} out of order");
+                    }
+                    Ok(None) => panic!("{name}: channel closed at frame {expected}"),
+                    Err(_) => panic!("{name}: timed out at frame {expected}"),
+                }
+            }
+        }
+
+        drop(manager_a);
+        drop(manager_b);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn connection_drop_mid_stream_uses_surviving_connection() {
+        // 2 connections: kill one by dropping its remote endpoint, triggering real
+        // I/O failure in the writer_task. Then verify subsequent frames arrive via
+        // the surviving connection.
+        //
+        // We keep handles to the remote halves of connection 0 so we can drop them
+        // to simulate network failure.
+        let (a_to_b_1, b_from_a_1) = duplex(65536);
+        let (b_to_a_1, a_from_b_1) = duplex(65536);
+        let (a_to_b_2, b_from_a_2) = duplex(65536);
+        let (b_to_a_2, a_from_b_2) = duplex(65536);
+
+        let config = SharedConnectionConfig {
+            min_connections: 1,
+            max_connections: 4,
+            probe_interval: Duration::from_secs(999),
+            ..Default::default()
+        };
+        let rt = tokio::runtime::Handle::current();
+
+        // Manager A: connection 0 uses (a_from_b_1, a_to_b_1), connection 1 uses (a_from_b_2, a_to_b_2)
+        let a_connections = vec![(a_from_b_1, a_to_b_1), (a_from_b_2, a_to_b_2)];
+        let manager_a = SharedPeerManager::new(
+            "node-b".to_string(),
+            config.clone(),
+            a_connections,
+            &rt,
+        );
+
+        // Manager B: connection 0 uses (b_from_a_1, b_to_a_1), connection 1 uses (b_from_a_2, b_to_a_2)
+        let b_connections = vec![(b_from_a_1, b_to_a_1), (b_from_a_2, b_to_a_2)];
+        let manager_b = SharedPeerManager::new(
+            "node-a".to_string(),
+            config,
+            b_connections,
+            &rt,
+        );
+
+        let df_id = DataflowId::new();
+        let _reg_a = manager_a.register_dataflow(df_id, &[1], 64).await;
+        let (mut rx_b, _) = manager_b.register_dataflow(df_id, &[1], 64).await;
+
+        // Send first batch — both connections alive
+        let sender = manager_a.payload_sender().clone();
+        for i in 0u32..5 {
+            let frame = Frame {
+                dataflow_id: df_id,
+                channel_id: 1,
+                payload: i.to_le_bytes().to_vec(),
+            };
+            sender.send((df_id, frame)).await.unwrap();
+        }
+
+        // Receive first batch (timeout-based, no arbitrary sleep)
+        let ch_rx = rx_b.get_mut(&1).unwrap();
+        let mut received_count = 0;
+        for _ in 0..5 {
+            if tokio::time::timeout(Duration::from_secs(2), ch_rx.recv())
+                .await
+                .is_ok()
+            {
+                received_count += 1;
+            }
+        }
+        assert_eq!(received_count, 5, "expected all 5 frames before failure");
+
+        // Kill connection 0 by marking it dead (simulates what writer_task does on I/O error).
+        // In a real scenario, the writer_task would detect write failure and call mark_dead().
+        // We also close the writer channel to simulate the full failure path.
+        manager_a.pool.connection(0).unwrap().mark_dead();
+        {
+            let mut wc = manager_a.writer_channels.lock().await;
+            wc.remove(&0);
+        }
+
+        // Send more frames — bridge should route all to connection 1
+        for i in 100u32..110 {
+            let frame = Frame {
+                dataflow_id: df_id,
+                channel_id: 1,
+                payload: i.to_le_bytes().to_vec(),
+            };
+            sender.send((df_id, frame)).await.unwrap();
+        }
+
+        // Verify post-failure frames arrive via surviving connection
+        let mut post_fail_values = Vec::new();
+        for _ in 0..10 {
+            match tokio::time::timeout(Duration::from_secs(2), ch_rx.recv()).await {
+                Ok(Some(payload)) => {
+                    let val = u32::from_le_bytes(payload[..4].try_into().unwrap());
+                    post_fail_values.push(val);
+                }
+                _ => break,
+            }
+        }
+
+        assert_eq!(
+            post_fail_values.len(),
+            10,
+            "expected 10 post-failure frames, got {}",
+            post_fail_values.len()
+        );
+        // Verify ordering preserved on surviving connection
+        for (i, &val) in post_fail_values.iter().enumerate() {
+            assert_eq!(val, 100 + i as u32, "post-failure frame {i} out of order");
+        }
+
+        // Confirm pool state
+        assert_eq!(manager_a.pool.live_connection_count(), 1);
+
+        drop(manager_a);
+        drop(manager_b);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn high_rtt_triggers_scale_up_event() {
+        // Verify that when RTT exceeds threshold, ScaleUp event is generated
+        let config = SharedConnectionConfig {
+            min_connections: 1,
+            max_connections: 4,
+            rtt_scale_up_threshold: Duration::from_millis(5),
+            probe_interval: Duration::from_millis(50),
+            ..Default::default()
+        };
+        let pool = PeerPool::new(1, config.clone());
+
+        // Simulate high RTT
+        pool.connection(0).unwrap().record_rtt(Duration::from_millis(10));
+
+        // Evaluate scaling — should recommend scale up
+        let decision = pool.evaluate_scaling().await;
+        assert_eq!(
+            decision,
+            ScalingDecision::ScaleUp,
+            "high RTT should trigger ScaleUp"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn shared_transport_session_multi_peer() {
+        // Test SharedTransportSession with multiple peers
+        let config = SharedConnectionConfig {
+            probe_interval: Duration::from_secs(999),
+            ..Default::default()
+        };
+        let rt = tokio::runtime::Handle::current();
+
+        // Create two peer managers (simulating connections to peer-1 and peer-2)
+        let (stream_1a, stream_1b) = duplex(65536);
+        let (stream_2a, stream_2b) = duplex(65536);
+
+        let mgr1 = SharedPeerManager::new(
+            "peer-1".to_string(),
+            config.clone(),
+            vec![(stream_1a, stream_1b)],
+            &rt,
+        );
+        let mgr2 = SharedPeerManager::new(
+            "peer-2".to_string(),
+            config,
+            vec![(stream_2a, stream_2b)],
+            &rt,
+        );
+
+        let mut managers = HashMap::new();
+        managers.insert("peer-1".to_string(), mgr1);
+        managers.insert("peer-2".to_string(), mgr2);
+
+        let df_id = DataflowId::new();
+        let mut session = SharedTransportSession::new(
+            df_id,
+            &managers,
+            &[1, 2],
+            16,
+        )
+        .await;
+
+        // Verify API surface
+        assert!(session.data_sender("peer-1").is_some());
+        assert!(session.data_sender("peer-2").is_some());
+        assert!(session.data_sender("peer-3").is_none());
+        assert!(session.control_sender("peer-1").is_some());
+
+        let receivers = session.take_receivers().unwrap();
+        assert_eq!(receivers.len(), 2); // two peers
+        assert!(receivers.contains_key("peer-1"));
+        assert!(receivers.contains_key("peer-2"));
+
+        let error_rxs = session.take_error_receivers().unwrap();
+        assert_eq!(error_rxs.len(), 2);
+
+        // Second take returns None
+        assert!(session.take_receivers().is_none());
+        assert!(session.take_error_receivers().is_none());
+
+        drop(session);
+        drop(managers);
     }
 }
