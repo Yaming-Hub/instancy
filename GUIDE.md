@@ -413,14 +413,16 @@ odds.output("odd_numbers");
 
 Items where the predicate returns `true` go to the first output; `false` items go to the second.
 
-> **Note:** The predicate is evaluated **twice per item** (once for each branch). Use pure, side-effect-free predicates. For stateful logic, use `clone()` + `filter()` instead.
+> **Note:** The predicate is evaluated **twice per item** (once for each branch). Use pure, side-effect-free predicates. For stateful routing, compute the classification once with `map` (e.g., tag items as `Result` or an enum) and then split with `branch_result`.
 
 #### Branch by Result
 
 Split a `Result` stream into `Ok` and `Err` branches:
 
 ```rust
-let results: Pipe<u64, Result<i64, String>> = input.map("parse", |_t, s| s.parse::<i64>());
+let results = input.map("parse", |_t, s: String| {
+    s.parse::<i64>().map_err(|e| e.to_string())
+});
 let (ok_values, errors) = results.branch_result("split");
 ok_values.output("parsed");
 errors.for_each("log_errors", |_t, e| eprintln!("parse error: {e}"));
@@ -506,8 +508,8 @@ stream.fold("collect", Vec::new(), |mut acc, x| {
 }).output("collected");
 ```
 
-Unlike `reduce`, `fold` always emits a value (even for empty timestamps)
-and can change the output type.
+Unlike `reduce`, `fold` can change the output type. Both `reduce` and `fold`
+only emit for timestamps that received data.
 
 **Distinct** — deduplicate elements per timestamp:
 
@@ -1473,10 +1475,10 @@ impl ExchangeData for MyRecord {
 | | `clone()` | | Fan-out to multiple consumers |
 | **Observe** | `inspect` | `\|&T, &D\|` | Pass-through data observation |
 | | `inspect_batch` | `\|&T, &[D]\|` | Pass-through batch observation |
-| **Terminal** | `for_each` | `\|&T, D\|` | Consume stream (side-effects) |
-| | `for_each_batch` | `\|&T, Vec<D>\|` | Consume batches |
+| **Terminal** | `for_each` | `\|&T, &D\|` | Consume stream (side-effects) |
+| | `for_each_batch` | `\|&T, &[D]\|` | Consume batches |
 | | `output` | `(name)` | Named output port |
-| | `collect` | | Collect into `OutputReceiver` |
+| | `collect` | | Collect into `Arc<Mutex<Vec<(T, Vec<D>)>>>` |
 | **Aggregation** | `reduce` | `\|D, D\| -> D` | Combine per timestamp |
 | | `fold` | `(init, \|D2, D\| -> D2)` | Fold with initial value |
 | | `distinct` | | Deduplicate per timestamp |
@@ -1490,8 +1492,9 @@ impl ExchangeData for MyRecord {
 | **Loop** | `iterate` | `(\|Pipe\| -> Pipe, step)` | Feedback loop |
 | **Merge** | `merge` | `(other_pipe)` | Merge two streams |
 | | `concat` | `(vec_of_pipes)` | Merge multiple streams |
-| **Custom** | `unary` | `\|&T, Vec<D>\| -> Vec<D2>` | Custom single-input operator |
-| | `unary_notify` | `(NotifyContext)` | Frontier-aware custom operator |
+| **Distribution** | `exchange_by_hash_to` | `(\|&D\| -> u64, N)` | Direct hash with target parallelism |
+| **Custom** | `unary` | `(InputHandle, OutputHandle) -> Result<()>` | Custom single-input operator |
+| | `unary_notify` | `(InputHandle, OutputHandle, NotifyContext) -> Result<()>` | Frontier-aware custom operator |
 
 ---
 
