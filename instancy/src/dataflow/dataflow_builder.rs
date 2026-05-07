@@ -958,6 +958,46 @@ impl<T: Timestamp, D: Clone + Send + 'static> Pipe<T, D> {
         })
     }
 
+    /// Split a stream into two based on a predicate.
+    ///
+    /// Returns `(true_pipe, false_pipe)` where:
+    /// - `true_pipe` receives items for which the predicate returns `true`
+    /// - `false_pipe` receives items for which the predicate returns `false`
+    ///
+    /// Each item is routed to exactly one of the two output pipes.
+    ///
+    /// # Note
+    /// The predicate is evaluated once per item per branch (i.e., twice total).
+    /// For expensive predicates, consider using [`map`](Self::map) to compute
+    /// a `Result` or `Either` type, then split with [`branch_result`](super::Pipe::branch_result).
+    ///
+    /// # Example
+    /// ```ignore
+    /// let (evens, odds) = numbers.branch("parity", |_t, x| x % 2 == 0);
+    /// evens.map("half", |_t, x| x / 2).output("halved");
+    /// odds.output("odd_numbers");
+    /// ```
+    pub fn branch<F>(self, name: impl Into<String>, predicate: F) -> (Pipe<T, D>, Pipe<T, D>)
+    where
+        F: FnMut(&T, &D) -> bool + Send + 'static,
+    {
+        let name = name.into();
+        let true_name = format!("{name}::true");
+        let false_name = format!("{name}::false");
+        let predicate = std::sync::Arc::new(std::sync::Mutex::new(predicate));
+
+        let pred_true = predicate.clone();
+        let true_pipe = self.clone().filter(true_name, move |t, x| {
+            (pred_true.lock().unwrap())(t, x)
+        });
+        let pred_false = predicate;
+        let false_pipe = self.filter(false_name, move |t, x| {
+            !(pred_false.lock().unwrap())(t, x)
+        });
+
+        (true_pipe, false_pipe)
+    }
+
     /// Observe each element flowing through without modifying the stream.
     ///
     /// The closure receives a reference to each element (and its timestamp).
@@ -6120,5 +6160,122 @@ mod tests {
         let results: Vec<i32> = r.iter().flat_map(|(_, d)| d.clone()).collect();
         // Each epoch sorted independently
         assert_eq!(results, vec![1, 2, 3, 4, 5, 6]);
+    }
+
+    #[test]
+    fn test_branch_even_odd() {
+        let builder = DataflowBuilder::<u64>::new("branch_even_odd");
+        let (evens, odds) = builder
+            .source("nums", vec![(0u64, vec![1i32, 2, 3, 4, 5, 6])])
+            .branch("parity", |_t, x| x % 2 == 0);
+        let even_port = evens.output("evens");
+        let odd_port = odds.output("odds");
+        let dataflow = builder.build().unwrap();
+        rt().run(dataflow).unwrap();
+
+        let ec = even_port.collector();
+        let er = ec.lock().unwrap();
+        let even_results: Vec<i32> = er.iter().flat_map(|(_, d)| d.clone()).collect();
+        assert_eq!(even_results, vec![2, 4, 6]);
+
+        let oc = odd_port.collector();
+        let or_ = oc.lock().unwrap();
+        let odd_results: Vec<i32> = or_.iter().flat_map(|(_, d)| d.clone()).collect();
+        assert_eq!(odd_results, vec![1, 3, 5]);
+    }
+
+    #[test]
+    fn test_branch_all_true() {
+        let builder = DataflowBuilder::<u64>::new("branch_all_true");
+        let (matched, unmatched) = builder
+            .source("nums", vec![(0u64, vec![10i32, 20, 30])])
+            .branch("all", |_t, _x| true);
+        let matched_port = matched.output("matched");
+        let unmatched_port = unmatched.output("unmatched");
+        let dataflow = builder.build().unwrap();
+        rt().run(dataflow).unwrap();
+
+        let mc = matched_port.collector();
+        let mr = mc.lock().unwrap();
+        let matched_results: Vec<i32> = mr.iter().flat_map(|(_, d)| d.clone()).collect();
+        assert_eq!(matched_results, vec![10, 20, 30]);
+
+        let uc = unmatched_port.collector();
+        let ur = uc.lock().unwrap();
+        let unmatched_results: Vec<i32> = ur.iter().flat_map(|(_, d)| d.clone()).collect();
+        assert!(unmatched_results.is_empty());
+    }
+
+    #[test]
+    fn test_branch_all_false() {
+        let builder = DataflowBuilder::<u64>::new("branch_all_false");
+        let (matched, unmatched) = builder
+            .source("nums", vec![(0u64, vec![1i32, 2, 3])])
+            .branch("none", |_t, _x| false);
+        let matched_port = matched.output("matched");
+        let unmatched_port = unmatched.output("unmatched");
+        let dataflow = builder.build().unwrap();
+        rt().run(dataflow).unwrap();
+
+        let mc = matched_port.collector();
+        let mr = mc.lock().unwrap();
+        let matched_results: Vec<i32> = mr.iter().flat_map(|(_, d)| d.clone()).collect();
+        assert!(matched_results.is_empty());
+
+        let uc = unmatched_port.collector();
+        let ur = uc.lock().unwrap();
+        let unmatched_results: Vec<i32> = ur.iter().flat_map(|(_, d)| d.clone()).collect();
+        assert_eq!(unmatched_results, vec![1, 2, 3]);
+    }
+
+    #[test]
+    fn test_branch_with_downstream_processing() {
+        // Branch then process each side differently
+        let builder = DataflowBuilder::<u64>::new("branch_process");
+        let (big, small) = builder
+            .source("nums", vec![(0u64, vec![1i32, 5, 10, 15, 20])])
+            .branch("threshold", |_t, x| *x >= 10);
+        let big_port = big.map("negate", |_t, x| -x).output("big");
+        let small_port = small.map("double", |_t, x| x * 2).output("small");
+        let dataflow = builder.build().unwrap();
+        rt().run(dataflow).unwrap();
+
+        let bc = big_port.collector();
+        let br = bc.lock().unwrap();
+        let big_results: Vec<i32> = br.iter().flat_map(|(_, d)| d.clone()).collect();
+        assert_eq!(big_results, vec![-10, -15, -20]);
+
+        let sc = small_port.collector();
+        let sr = sc.lock().unwrap();
+        let small_results: Vec<i32> = sr.iter().flat_map(|(_, d)| d.clone()).collect();
+        assert_eq!(small_results, vec![2, 10]);
+    }
+
+    #[test]
+    fn test_branch_multi_epoch() {
+        let builder = DataflowBuilder::<u64>::new("branch_epochs");
+        let (pos, neg) = builder
+            .source(
+                "nums",
+                vec![
+                    (0u64, vec![-2i32, -1, 0, 1, 2]),
+                    (1u64, vec![-10, 10]),
+                ],
+            )
+            .branch("sign", |_t, x| *x >= 0);
+        let pos_port = pos.output("positive");
+        let neg_port = neg.output("negative");
+        let dataflow = builder.build().unwrap();
+        rt().run(dataflow).unwrap();
+
+        let pc = pos_port.collector();
+        let pr = pc.lock().unwrap();
+        let pos_results: Vec<i32> = pr.iter().flat_map(|(_, d)| d.clone()).collect();
+        assert_eq!(pos_results, vec![0, 1, 2, 10]);
+
+        let nc = neg_port.collector();
+        let nr = nc.lock().unwrap();
+        let neg_results: Vec<i32> = nr.iter().flat_map(|(_, d)| d.clone()).collect();
+        assert_eq!(neg_results, vec![-2, -1, -10]);
     }
 }
