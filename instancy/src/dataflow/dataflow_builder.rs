@@ -1002,6 +1002,130 @@ impl<T: Timestamp, D: Clone + Send + 'static> Pipe<T, D> {
         })
     }
 
+    /// Consume this stream, calling a closure on each element.
+    ///
+    /// This is a **terminal** operator — it does not produce an output stream.
+    /// Use it when you want to perform a side-effect (e.g., writing to a
+    /// database, sending to an external system) for every element without
+    /// needing to chain further operators.
+    ///
+    /// For observation without consuming the stream, use
+    /// [`inspect`](Self::inspect) instead.
+    ///
+    /// # Error handling
+    ///
+    /// If the closure panics, the executor catches it via `catch_unwind` and
+    /// converts it to [`Error::OperatorPanic`](crate::error::Error::OperatorPanic),
+    /// failing the dataflow gracefully. For recoverable errors, handle them
+    /// inside the closure (e.g., log and continue).
+    ///
+    /// # Example
+    /// ```ignore
+    /// input
+    ///     .map("double", |_t, x| x * 2)
+    ///     .for_each("print", |_t, x| println!("got: {x:?}"));
+    /// ```
+    pub fn for_each<F>(self, name: impl Into<String>, mut logic: F)
+    where
+        F: FnMut(&T, &D) + Send + 'static,
+    {
+        self.for_each_sink(name, move |time: &T, batch: &[D]| {
+            for item in batch {
+                logic(time, item);
+            }
+        });
+    }
+
+    /// Consume this stream, calling a closure on each batch.
+    ///
+    /// Like [`for_each`](Self::for_each), this is a **terminal** operator
+    /// that does not produce an output stream. The closure receives the
+    /// entire batch `&[D]` at once, which is more efficient when per-item
+    /// overhead matters (e.g., acquiring a lock once per batch, bulk-inserting
+    /// into a database).
+    ///
+    /// # Example
+    /// ```ignore
+    /// input
+    ///     .for_each_batch("bulk-insert", |_t, batch| db.insert_many(batch));
+    /// ```
+    pub fn for_each_batch<F>(self, name: impl Into<String>, logic: F)
+    where
+        F: FnMut(&T, &[D]) + Send + 'static,
+    {
+        self.for_each_sink(name, logic);
+    }
+
+    /// Internal: register a terminal sink operator that invokes a batch closure.
+    fn for_each_sink<F>(self, name: impl Into<String>, logic: F)
+    where
+        F: FnMut(&T, &[D]) + Send + 'static,
+    {
+        let name = name.into();
+        let capacity = self.capacity_override.unwrap_or(1024);
+
+        let mut state = self.state.borrow_mut();
+        let op_idx = state.allocate_operator_index();
+        let stage_id = StageId::new(0);
+
+        // Register sink operator in graph (1 input, 0 outputs)
+        state
+            .graph
+            .register_operator(crate::dataflow::graph::OperatorInfo::new(
+                op_idx, &name, stage_id, 1, 0,
+            ))
+            .expect("operator index unique");
+
+        // Edge from upstream
+        state.graph.add_edge(crate::dataflow::graph::EdgeInfo::new(
+            Slot::new(self.op_idx, self.output_slot),
+            Slot::new(op_idx, 0),
+            stage_id,
+            stage_id,
+        ));
+
+        // Subgraph: sink has 1 input, 0 outputs
+        state
+            .subgraph_builder
+            .add_operator(op_idx, &name, 1, 0, PortConnectivity::new(1, 0));
+        state.subgraph_builder.add_edge(
+            Location::source(self.op_idx, self.output_slot),
+            Location::target(op_idx, 0),
+        );
+
+        // Operator factory
+        let name_clone = name.clone();
+        let factory: OperatorFactory =
+            single_use_factory(move |_ctx, endpoints: ChannelEndpoints| {
+                let input_puller: Box<dyn Pull<T, D>> = *endpoints
+                    .input_pullers
+                    .into_iter()
+                    .next()
+                    .expect("for_each sink must have input puller")
+                    .downcast::<Box<dyn Pull<T, D>>>()
+                    .expect("for_each input puller type mismatch");
+
+                Box::new(ForEachSink::new(name_clone, op_idx, stage_id, input_puller, logic))
+                    as Box<dyn SchedulableOperator>
+            });
+        state.operator_factories.push((op_idx, factory));
+
+        // Channel factory for the input edge
+        let edge_idx = state.graph.edges().len() - 1;
+        let chan_factory: ChannelFactory =
+            channel_factory(move |_ctx, wake: Option<WakeHandle>| {
+                let (push, pull) =
+                    bounded_channel_with_wake::<T, D, ()>(capacity, wake.clone());
+                (
+                    Box::new(Box::new(push) as Box<dyn Push<T, D>>)
+                        as Box<dyn std::any::Any + Send>,
+                    Box::new(Box::new(pull) as Box<dyn Pull<T, D>>)
+                        as Box<dyn std::any::Any + Send>,
+                )
+            });
+        state.channel_factories.push((edge_idx, chan_factory));
+    }
+
     /// Pass through the first `count` elements, then stop.
     ///
     /// This is the dataflow equivalent of SQL `LIMIT`. After emitting `count`
@@ -3572,6 +3696,97 @@ impl<T: Timestamp, D: Send + 'static> SchedulableOperator for CollectingSink<T, 
 }
 
 // ---------------------------------------------------------------------------
+// ForEachSink — terminal sink that invokes a user closure on each batch
+// ---------------------------------------------------------------------------
+
+struct ForEachSink<T: Timestamp, D: Send + 'static, F: FnMut(&T, &[D]) + Send + 'static> {
+    name: String,
+    index: usize,
+    stage_id: StageId,
+    input_puller: Box<dyn Pull<T, D>>,
+    logic: F,
+    input_exhausted: bool,
+    done: bool,
+}
+
+impl<T: Timestamp, D: Send + 'static, F: FnMut(&T, &[D]) + Send + 'static>
+    ForEachSink<T, D, F>
+{
+    fn new(
+        name: impl Into<String>,
+        index: usize,
+        stage_id: StageId,
+        input_puller: Box<dyn Pull<T, D>>,
+        logic: F,
+    ) -> Self {
+        Self {
+            name: name.into(),
+            index,
+            stage_id,
+            input_puller,
+            logic,
+            input_exhausted: false,
+            done: false,
+        }
+    }
+}
+
+impl<T: Timestamp, D: Send + 'static, F: FnMut(&T, &[D]) + Send + 'static>
+    SchedulableOperator for ForEachSink<T, D, F>
+{
+    fn activate(
+        &mut self,
+    ) -> crate::error::Result<crate::dataflow::schedulable::ActivationOutcome> {
+        use crate::dataflow::channels::Payload;
+        use crate::dataflow::schedulable::ActivationOutcome;
+
+        if self.done {
+            return Ok(ActivationOutcome::Done);
+        }
+
+        let mut made_progress = false;
+        while let Some(envelope) = self.input_puller.pull() {
+            if let Payload::Data { time, data } = envelope.payload {
+                (self.logic)(&time, &data);
+                made_progress = true;
+            }
+        }
+
+        if self.input_puller.is_exhausted() {
+            self.input_exhausted = true;
+            self.done = true;
+            return Ok(ActivationOutcome::Done);
+        }
+
+        if made_progress {
+            Ok(ActivationOutcome::MadeProgress)
+        } else {
+            Ok(ActivationOutcome::Idle)
+        }
+    }
+
+    fn is_done(&self) -> bool {
+        self.done
+    }
+
+    fn name(&self) -> &str {
+        &self.name
+    }
+
+    fn index(&self) -> usize {
+        self.index
+    }
+
+    fn stage_id(&self) -> StageId {
+        self.stage_id
+    }
+
+    fn close_inputs(&mut self) {
+        self.input_exhausted = true;
+    }
+}
+
+// ---------------------------------------------------------------------------
 // NullPush — discards all pushed envelopes
 // ---------------------------------------------------------------------------
 
@@ -5053,5 +5268,83 @@ mod tests {
         let c = port.collector();
         let r = c.lock().unwrap();
         assert_eq!(r.len(), 2);
+    }
+
+    #[test]
+    fn test_for_each_sees_all_items() {
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let seen_clone = seen.clone();
+
+        let builder = DataflowBuilder::<u64>::new("for_each_test");
+        builder
+            .source("nums", vec![(0u64, vec![10i32, 20, 30])])
+            .for_each("consume", move |_t, x| {
+                seen_clone.lock().unwrap().push(*x);
+            });
+        let dataflow = builder.build().unwrap();
+        rt().run(dataflow).unwrap();
+
+        assert_eq!(*seen.lock().unwrap(), vec![10, 20, 30]);
+    }
+
+    #[test]
+    fn test_for_each_batch_sees_whole_batch() {
+        let batch_sizes = Arc::new(Mutex::new(Vec::new()));
+        let batch_sizes_clone = batch_sizes.clone();
+
+        let builder = DataflowBuilder::<u64>::new("for_each_batch_test");
+        builder
+            .source(
+                "nums",
+                vec![(0u64, vec![1i32, 2, 3]), (1u64, vec![4i32, 5])],
+            )
+            .for_each_batch("count", move |_t, batch| {
+                batch_sizes_clone.lock().unwrap().push(batch.len());
+            });
+        let dataflow = builder.build().unwrap();
+        rt().run(dataflow).unwrap();
+
+        let sizes = batch_sizes.lock().unwrap();
+        assert_eq!(sizes.iter().sum::<usize>(), 5);
+    }
+
+    #[test]
+    fn test_for_each_receives_timestamp() {
+        let timestamps = Arc::new(Mutex::new(Vec::new()));
+        let ts_clone = timestamps.clone();
+
+        let builder = DataflowBuilder::<u64>::new("for_each_ts_test");
+        builder
+            .source(
+                "nums",
+                vec![(10u64, vec![1i32]), (20u64, vec![2i32])],
+            )
+            .for_each("check-ts", move |t, _x| {
+                ts_clone.lock().unwrap().push(*t);
+            });
+        let dataflow = builder.build().unwrap();
+        rt().run(dataflow).unwrap();
+
+        let ts = timestamps.lock().unwrap();
+        assert!(ts.contains(&10));
+        assert!(ts.contains(&20));
+    }
+
+    #[test]
+    fn test_for_each_after_map() {
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let seen_clone = seen.clone();
+
+        let builder = DataflowBuilder::<u64>::new("for_each_after_map");
+        builder
+            .source("nums", vec![(0u64, vec![1i32, 2, 3])])
+            .map("double", |_t, x| x * 2)
+            .for_each("consume", move |_t, x| {
+                seen_clone.lock().unwrap().push(*x);
+            });
+        let dataflow = builder.build().unwrap();
+        rt().run(dataflow).unwrap();
+
+        assert_eq!(*seen.lock().unwrap(), vec![2, 4, 6]);
     }
 }

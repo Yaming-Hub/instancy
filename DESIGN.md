@@ -12,7 +12,7 @@
 4. **Production-grade robustness** — `Result`-based error handling everywhere; no panics in library code. First-class cancellation via `CancellationToken`.
 5. **Pluggable networking** — users supply their own connection factory (e.g., mTLS); the library manages a pooled, reusable connection layer.
 6. **Pluggable serialization** — a `Codec` trait lets users choose bincode, protobuf, flatbuffers, or any other format.
-7. **Minimal core operators** — only `unary`, `binary`, `branch`, `feedback` (loop), `exchange`, `rebalance`, `gather`, `broadcast`, `broadcast_local`, `delay`, `input`, `probe`, `inspect`, `concat`. Higher-level operators live in extension crates.
+7. **Minimal core operators** — only `unary`, `binary`, `branch`, `feedback` (loop), `exchange`, `rebalance`, `gather`, `broadcast`, `broadcast_local`, `delay`, `input`, `probe`, `inspect`, `for_each`, `concat`. Higher-level operators live in extension crates.
 8. **Structured message envelope** — messages carry either data or control signals (errors, cancellation) in a unified envelope, enabling in-band error propagation and coordinated shutdown.
 9. **Configurable error policy** — each dataflow specifies whether errors should halt the pipeline or be logged and skipped, giving consumers control over fault tolerance.
 10. **Observability built-in** — per-dataflow CPU time tracking, operator-level metrics, and structured tracing for understanding performance characteristics.
@@ -2721,8 +2721,9 @@ pub enum Error {
 | `broadcast_local` | Sends each record to all workers **within the same process** (cheap clone, no serialization) |
 | `delay` | Holds data until the frontier advances past a specified timestamp; useful for windowing and time-based buffering |
 | `concat` | Merges multiple streams into one |
-| `inspect` | Side-effect observation (logging, debugging) |
-| `probe` | Observe frontier progress; async `changed()` method |
+| `inspect` | Pass-through side-effect observation (logging, debugging); data continues downstream |
+| `for_each` | Terminal side-effect sink; consumes the stream, no output produced. Panics are caught and converted to `Error::OperatorPanic` |
+| `probe` | Observe frontier progress; returns `ProbeHandle` for async progress tracking (`done_with`, `is_done`, `wait_until_done`) |
 
 ### 9.2 Unary Operator API
 
