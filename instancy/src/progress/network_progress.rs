@@ -40,7 +40,7 @@ use crate::communication::codec::{Codec, CodecError, ExchangeData};
 #[cfg(feature = "transport")]
 use crate::communication::transport::Frame;
 #[cfg(feature = "transport")]
-use crate::communication::transport_session::{PROGRESS_CHANNEL_BASE, TransportSession};
+use crate::communication::transport_session::PROGRESS_CHANNEL_BASE;
 #[cfg(feature = "transport")]
 use crate::dataflow::channels::wake::WakeHandle;
 #[cfg(feature = "transport")]
@@ -233,7 +233,7 @@ pub fn decode_progress_batch<T: Timestamp + ExchangeData>(
 #[cfg(feature = "transport")]
 async fn progress_send_bridge(
     mut rx: tokio_mpsc::UnboundedReceiver<Frame>,
-    session_tx: tokio_mpsc::Sender<Frame>,
+    session_tx: crate::communication::cluster_transport::FrameSender,
     cancel: tokio_util::sync::CancellationToken,
     peer_id: String,
 ) {
@@ -428,7 +428,7 @@ impl Drop for NetworkProgressHandles {
 #[allow(clippy::too_many_arguments, clippy::needless_range_loop)]
 pub fn create_network_progress_channels<T: Timestamp + ExchangeData>(
     mut local_channels: Vec<WorkerProgressChannels<T>>,
-    session: &TransportSession,
+    transport: &crate::communication::cluster_transport::ClusterTransport,
     mut receivers: HashMap<String, HashMap<u64, tokio_mpsc::Receiver<Vec<u8>>>>,
     dataflow_id: DataflowId,
     local_worker_range: (usize, usize),
@@ -478,11 +478,10 @@ pub fn create_network_progress_channels<T: Timestamp + ExchangeData>(
 
     // --- Send side: one unbounded channel per peer, shared by all local workers ---
     for (peer_id, peer_start, peer_end) in remote_peers {
-        // Get the TransportSession's progress sender for this peer.
-        let session_tx = session
+        // Get the transport's progress sender for this peer.
+        let session_tx = transport
             .progress_sender(peer_id)
-            .ok_or_else(|| format!("missing progress sender for peer {peer_id}"))?
-            .clone();
+            .ok_or_else(|| format!("missing progress sender for peer {peer_id}"))?;
 
         // Create unbounded intermediary channel for this peer.
         let (unbounded_tx, unbounded_rx) = tokio_mpsc::unbounded_channel::<Frame>();
@@ -739,7 +738,7 @@ mod tests {
         // Spawn bridge task.
         let handle = tokio::spawn(progress_send_bridge(
             unbounded_rx,
-            session_tx,
+            crate::communication::cluster_transport::FrameSender::Direct(session_tx),
             cancel.clone(),
             "test-peer".into(),
         ));
@@ -775,7 +774,7 @@ mod tests {
 
         let handle = tokio::spawn(progress_send_bridge(
             unbounded_rx,
-            session_tx,
+            crate::communication::cluster_transport::FrameSender::Direct(session_tx),
             cancel.clone(),
             "test-peer".into(),
         ));
@@ -960,6 +959,7 @@ mod tests {
     /// using TransportSession + bridge tasks.
     #[tokio::test]
     async fn end_to_end_network_progress() {
+        use crate::communication::cluster_transport::ClusterTransport;
         use crate::communication::transport_session::{
             ChannelRegistration, PeerConnection, TransportSession,
         };
@@ -1023,6 +1023,9 @@ mod tests {
             &rt,
         );
 
+        let transport_a = ClusterTransport::Dedicated(std::sync::Arc::new(session_a));
+        let transport_b = ClusterTransport::Dedicated(std::sync::Arc::new(session_b));
+
         // Create local-only progress channels (we only need the structure;
         // local pairs won't be used in this cross-node test).
         let wake_handles: Vec<WakeHandle> = (0..num_workers).map(|_| WakeHandle::new()).collect();
@@ -1040,7 +1043,7 @@ mod tests {
 
         let (a_channels, _handles_a) = create_network_progress_channels::<u64>(
             a_worker_channels,
-            &session_a,
+            &transport_a,
             recv_a,
             df_id,
             (0, 2),
@@ -1063,7 +1066,7 @@ mod tests {
 
         let (b_channels, _handles_b) = create_network_progress_channels::<u64>(
             b_worker_channels,
-            &session_b,
+            &transport_b,
             recv_b,
             df_id,
             (2, 4),
@@ -1097,8 +1100,8 @@ mod tests {
         // Verify no spurious cancellation.
         assert!(!cancel.is_cancelled());
 
-        drop(session_a);
-        drop(session_b);
+        drop(transport_a);
+        drop(transport_b);
     }
 
     #[test]

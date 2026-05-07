@@ -6,6 +6,8 @@
 //! framed transport for wire communication, and inter-process routing/encoding.
 
 pub mod allocator;
+#[cfg(feature = "transport")]
+pub mod cluster_transport;
 pub mod codec;
 pub mod connection;
 pub mod control_protocol;
@@ -68,3 +70,6 @@ pub use shared_transport::{
     ConnectionFactory, DataframeSender, PROBE_CHANNEL_ID, SharedPeerManager,
     SharedTransportSession,
 };
+
+#[cfg(feature = "transport")]
+pub use cluster_transport::ClusterTransport;

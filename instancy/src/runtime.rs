@@ -1535,6 +1535,11 @@ impl RuntimeHandle {
             runtime_handle,
         );
         let session = Arc::new(session);
+        let transport = Arc::new(
+            crate::communication::cluster_transport::ClusterTransport::Dedicated(
+                Arc::clone(&session),
+            ),
+        );
 
         // Phase 4: Handshake — exchange fingerprints with all peers.
         // Extract control receivers from the receivers map.
@@ -1605,7 +1610,7 @@ impl RuntimeHandle {
                 dataflow_id,
                 topology: topology.clone(),
                 local_node_id: local_node_id.to_string(),
-                session: Arc::clone(&session),
+                transport: Arc::clone(&transport),
                 receivers: edge_receivers,
                 capacity: edge_capacity,
                 num_workers: total_workers,
@@ -1697,7 +1702,7 @@ impl RuntimeHandle {
 
         let (progress_channels, progress_handles) = create_network_progress_channels::<T>(
             local_progress,
-            &session,
+            &transport,
             receivers,
             dataflow_id,
             (local_start, local_end),
@@ -1804,7 +1809,7 @@ impl RuntimeHandle {
             }),
             local_worker_range: (local_start, local_end),
             total_workers,
-            _session: session,
+            _transport: transport,
             _progress_handles: progress_handles,
             _bridge_cancel: bridge_cancel,
         })
@@ -3068,8 +3073,8 @@ pub struct ClusterSpawnedDataflow<T: Timestamp> {
     inner: Option<MultiSpawnedDataflow<T>>,
     local_worker_range: (usize, usize),
     total_workers: usize,
-    /// Keeps transport session alive (background Muxer/Demuxer tasks).
-    _session: Arc<crate::communication::TransportSession>,
+    /// Keeps transport alive (background Muxer/Demuxer tasks).
+    _transport: Arc<crate::communication::cluster_transport::ClusterTransport>,
     /// Keeps progress bridge tasks alive.
     _progress_handles: crate::progress::network_progress::NetworkProgressHandles,
     /// Cancels bridge tasks on drop.

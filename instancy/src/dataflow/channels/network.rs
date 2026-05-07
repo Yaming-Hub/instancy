@@ -266,10 +266,8 @@ pub struct NetworkPush<T: Timestamp + ExchangeData, D: ExchangeData> {
     data_codec: D::CodecType,
     dataflow_id: DataflowId,
     channel_id: u64,
-    sender: tokio_mpsc::Sender<Frame>,
+    sender: crate::communication::cluster_transport::FrameSender,
     closed: bool,
-    /// Shared transport session that keeps background tasks alive.
-    _session: Arc<TransportSession>,
 }
 
 #[cfg(feature = "transport")]
@@ -445,8 +443,8 @@ pub struct NetworkPull<T: Timestamp + ExchangeData, D: ExchangeData> {
     data_codec: D::CodecType,
     receiver: std::sync::mpsc::Receiver<Vec<u8>>,
     exhausted: bool,
-    /// Shared transport session that keeps background tasks alive.
-    _session: Arc<TransportSession>,
+    /// Keeps transport alive (background tasks survive as long as this exists).
+    _transport: Arc<crate::communication::cluster_transport::ClusterTransport>,
 }
 
 #[cfg(feature = "transport")]
@@ -534,8 +532,8 @@ pub struct NetworkEdgeMaterializer<T: Timestamp + ExchangeData, D: ExchangeData>
     /// multiple exchange edges exist in the same dataflow.
     edge_index: usize,
 
-    /// Shared transport session (Arc so it outlives this materializer).
-    session: Arc<TransportSession>,
+    /// Unified transport (dedicated or shared).
+    transport: Arc<crate::communication::cluster_transport::ClusterTransport>,
 
     /// Demuxer channel receivers for remote pull endpoints.
     /// Key: (source_worker, target_worker) → `tokio::mpsc::Receiver<Vec<u8>>`
@@ -559,23 +557,22 @@ pub struct NetworkEdgeMaterializer<T: Timestamp + ExchangeData, D: ExchangeData>
 
 #[cfg(feature = "transport")]
 impl<T: Timestamp + ExchangeData, D: ExchangeData> NetworkEdgeMaterializer<T, D> {
-    /// Create a network edge materializer from a pre-built [`TransportSession`].
+    /// Create a network edge materializer from a pre-built [`ClusterTransport`].
     ///
     /// # Arguments
     /// - `dataflow_id`: Unique ID for this dataflow (used in frame routing).
     /// - `topology`: Cluster topology describing all nodes and workers.
     /// - `local_node_id`: The node ID of this process.
-    /// - `session`: Shared transport session (owns Muxer/Demuxer tasks).
-    /// - `receivers`: Channel receivers from [`TransportSession::new()`],
-    ///   keyed by `peer_node_id → channel_id`. Only data channel receivers
-    ///   are consumed here.
+    /// - `transport`: Unified transport (dedicated or shared).
+    /// - `receivers`: Channel receivers keyed by `peer_node_id → channel_id`.
+    ///   Only data channel receivers are consumed here.
     /// - `capacity`: Buffer capacity for local bounded channels.
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         dataflow_id: DataflowId,
         topology: ClusterTopology,
         local_node_id: impl Into<String>,
-        session: Arc<TransportSession>,
+        transport: Arc<crate::communication::cluster_transport::ClusterTransport>,
         mut receivers: std::collections::HashMap<
             String,
             std::collections::HashMap<u64, tokio_mpsc::Receiver<Vec<u8>>>,
@@ -634,7 +631,7 @@ impl<T: Timestamp + ExchangeData, D: ExchangeData> NetworkEdgeMaterializer<T, D>
             topology,
             dataflow_id,
             edge_index,
-            session,
+            transport,
             demux_receivers,
             local_push,
             local_pull,
@@ -694,12 +691,15 @@ impl<T: Timestamp + ExchangeData, D: ExchangeData> NetworkEdgeMaterializer<T, D>
             runtime_handle,
         );
 
+        let transport = Arc::new(
+            crate::communication::cluster_transport::ClusterTransport::Dedicated(Arc::new(session)),
+        );
         let wake_handles: Vec<WakeHandle> = (0..num_workers).map(|_| WakeHandle::new()).collect();
         Self::new(
             dataflow_id,
             topology,
             local_node_id_str,
-            Arc::new(session),
+            transport,
             receivers,
             capacity,
             0,
@@ -792,12 +792,11 @@ impl<T: Timestamp + ExchangeData, D: ExchangeData> EdgeMaterializer<T, D>
             } else {
                 // Remote pair — use NetworkPush
                 let sender = self
-                    .session
+                    .transport
                     .data_sender(dst_node)
                     .ok_or_else(|| {
                         Error::Custom(format!("no connection to peer node '{dst_node}'"))
-                    })?
-                    .clone();
+                    })?;
 
                 let channel_id =
                     Self::channel_id(self.edge_index, worker_idx, dst, self.num_workers);
@@ -808,7 +807,6 @@ impl<T: Timestamp + ExchangeData, D: ExchangeData> EdgeMaterializer<T, D>
                     channel_id,
                     sender,
                     closed: false,
-                    _session: self.session.clone(),
                 }));
             }
         }
@@ -850,7 +848,7 @@ impl<T: Timestamp + ExchangeData, D: ExchangeData> EdgeMaterializer<T, D>
                     data_codec: D::codec(),
                     receiver: std_rx,
                     exhausted: false,
-                    _session: self.session.clone(),
+                    _transport: self.transport.clone(),
                 }));
             }
         }

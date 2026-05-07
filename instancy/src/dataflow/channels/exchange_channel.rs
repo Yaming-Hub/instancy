@@ -835,7 +835,7 @@ pub(crate) struct NetworkMaterializerParams {
     pub dataflow_id: crate::dataflow::id::DataflowId,
     pub topology: crate::execute::ClusterTopology,
     pub local_node_id: String,
-    pub session: std::sync::Arc<crate::communication::TransportSession>,
+    pub transport: Arc<crate::communication::cluster_transport::ClusterTransport>,
     /// Pre-extracted receivers for this specific exchange edge.
     pub receivers: std::collections::HashMap<
         String,
@@ -892,7 +892,7 @@ where
                 params.dataflow_id,
                 params.topology,
                 params.local_node_id,
-                params.session,
+                params.transport,
                 params.receivers,
                 params.capacity,
                 params.edge_index,
