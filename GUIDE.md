@@ -389,22 +389,59 @@ let odds = stream.filter("odds", |_t, x| x % 2 != 0);
 
 `clone()` creates a fan-out point — data is duplicated to all downstream consumers. Each branch can then apply its own operators independently.
 
-#### Inspect
+#### Inspect — Observing Data
 
-For debugging, you can use `map` as a pass-through that logs:
+`inspect` and `inspect_batch` are **pass-through** operators: they let you
+observe data flowing through without consuming it. The stream continues
+downstream unchanged.
 
 ```rust
-stream.map("debug", |time, x| {
-    println!("[t={time}] processing: {x:?}");
-    x  // pass through unchanged
-});
+let stream = input
+    .inspect("log", |t, x| println!("[t={t}] saw: {x:?}"))
+    .map("double", |_t, x| x * 2);  // data keeps flowing
 ```
 
-#### Probe
-
-Track the progress frontier at a point in the dataflow:
+Use `inspect_batch` when per-batch efficiency matters (e.g., acquiring a
+lock once per batch instead of per element):
 
 ```rust
+let stream = input
+    .inspect_batch("count", |_t, batch| println!("batch size: {}", batch.len()))
+    .output("results");
+```
+
+#### For Each — Terminal Side-Effects
+
+`for_each` and `for_each_batch` are **terminal** operators: they consume
+the stream and do not produce output. Use them for fire-and-forget
+side-effects (writing to a database, sending metrics, etc.).
+
+```rust
+input
+    .map("double", |_t, x| x * 2)
+    .for_each("write", |_t, x| db.insert(x));  // no further chaining
+```
+
+**Error handling:** If the closure panics, the executor catches it via
+`catch_unwind` and converts it to `Error::OperatorPanic`, failing the
+dataflow gracefully. For recoverable errors, handle them inside the
+closure (e.g., log and continue, or accumulate into a shared error list).
+
+#### Inspect vs Probe — Key Difference
+
+These serve completely different purposes:
+
+| | `inspect` | `probe` |
+|---|---|---|
+| **Observes** | Data (elements/batches) | Progress (timestamp frontier) |
+| **Returns** | `Pipe<T, D>` (pass-through) | `(Pipe<T, D>, ProbeHandle<T>)` |
+| **Use case** | Debugging, logging, metrics | Waiting until a timestamp completes |
+
+**`inspect`** answers "what data is flowing through right now?"  
+**`probe`** answers "has timestamp X finished processing?"
+
+```rust
+// Probe: track progress for coordination
 let (stream, probe) = stream.probe();
 
 // Later, check progress:

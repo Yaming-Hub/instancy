@@ -1012,6 +1012,13 @@ impl<T: Timestamp, D: Clone + Send + 'static> Pipe<T, D> {
     /// For observation without consuming the stream, use
     /// [`inspect`](Self::inspect) instead.
     ///
+    /// # Error handling
+    ///
+    /// If the closure panics, the executor catches it via `catch_unwind` and
+    /// converts it to [`Error::OperatorPanic`](crate::error::Error::OperatorPanic),
+    /// failing the dataflow gracefully. For recoverable errors, handle them
+    /// inside the closure (e.g., log and continue).
+    ///
     /// # Example
     /// ```ignore
     /// input
