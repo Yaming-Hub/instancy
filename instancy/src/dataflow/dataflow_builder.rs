@@ -1181,8 +1181,8 @@ impl<T: Timestamp, D: Clone + Send + 'static> Pipe<T, D> {
     ///
     /// Like [`reduce`](Self::reduce), but starts with an initial value and
     /// can change the output type. Buffers data until a timestamp is complete,
-    /// then folds left-to-right. Always emits exactly one value per timestamp
-    /// (even if no data arrives, the initial value is emitted).
+    /// then folds left-to-right. Emits one value per timestamp that had data.
+    /// If no data arrives for a timestamp, nothing is emitted (same as `reduce`).
     ///
     /// # Example
     /// ```ignore
