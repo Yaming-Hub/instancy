@@ -803,6 +803,10 @@ impl<T: Timestamp> DataflowBuilder<T> {
         // Infer stages from the graph topology (exchange edges form boundaries).
         let stages = crate::dataflow::stage::infer_stages(&state.graph)?;
 
+        // Validate the graph for structural correctness (missing endpoints,
+        // port bounds, duplicate edges, cycles outside feedback scopes).
+        state.graph.validate()?;
+
         Ok(LogicalDataflow {
             name: self.name,
             graph: state.graph,
