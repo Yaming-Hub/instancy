@@ -394,6 +394,16 @@ impl PeerRegistry {
         id
     }
 
+    /// Remove a registration by ID. Called when a dataflow completes normally.
+    /// Returns the number of entries removed.
+    fn unregister(&self, registration_id: u64) {
+        let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        for bucket in state.entries.values_mut() {
+            bucket.retain(|r| r.id != registration_id);
+        }
+        state.entries.retain(|_, bucket| !bucket.is_empty());
+    }
+
     /// Cancel all dataflows associated with the given peer and prune stale entries.
     /// Returns the number of dataflows that were newly cancelled.
     fn report_peer_down(&self, peer_node_id: &str) -> usize {
@@ -1943,15 +1953,48 @@ impl RuntimeHandle {
             .map(|n| n.node_id.clone())
             .filter(|id| id != local_node_id)
             .collect();
-        if !remote_peer_ids.is_empty() {
+        let peer_reg_id = if !remote_peer_ids.is_empty() {
             let worker_tokens: Vec<CancellationToken> =
                 workers.iter().map(|w| w.cancel.clone()).collect();
             let cancel_handle = ClusterCancelHandle {
                 worker_tokens,
                 bridge_cancel: bridge_cancel.clone(),
             };
-            self.peer_registry
-                .register(&remote_peer_ids, name, cancel_handle);
+            Some(self.peer_registry
+                .register(&remote_peer_ids, name, cancel_handle))
+        } else {
+            None
+        };
+
+        // Phase 11: Spawn completion-triggered cleanup task.
+        // When bridge_cancel fires (dataflow completes or is cancelled), this task
+        // promptly frees all per-dataflow resources from shared state:
+        //   - PeerRegistry registration (peer-down notification)
+        //   - SharedPeerManager registrations + reorder buffers
+        //
+        // Timing: bridge_cancel fires in ClusterSpawnedDataflow::drop(). For
+        // join_blocking(), drop happens AFTER workers complete (safe). For join(),
+        // drop happens immediately (pre-existing documented limitation).
+        {
+            let cleanup_cancel = bridge_cancel.clone();
+            let peer_registry = Arc::clone(&self.peer_registry);
+            let shared_managers = shared_managers_arc.clone();
+            let cleanup_dataflow_id = dataflow_id;
+            runtime_handle.spawn(async move {
+                cleanup_cancel.cancelled().await;
+
+                // Unregister from peer registry.
+                if let Some(reg_id) = peer_reg_id {
+                    peer_registry.unregister(reg_id);
+                }
+
+                // Unregister from shared peer managers.
+                if let Some(managers) = shared_managers {
+                    for manager in managers.values() {
+                        manager.unregister_dataflow(&cleanup_dataflow_id).await;
+                    }
+                }
+            });
         }
 
         Ok(ClusterSpawnedDataflow {
