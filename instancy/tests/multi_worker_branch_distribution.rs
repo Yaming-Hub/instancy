@@ -175,7 +175,7 @@ async fn multi_worker_branch_even_odd() {
         2,
         |builder| {
             let input = builder.input::<i64>("data");
-            let exchanged = input.exchange_by_hash("distribute", |x: &i64| *x as u64);
+            let exchanged = input.exchange_by_hash("distribute", |x| *x as u64);
             let (evens, odds) = exchanged.branch("parity", |_t, x| x % 2 == 0);
             evens.output("evens");
             odds.output("odds");
@@ -198,7 +198,7 @@ async fn multi_worker_branch_multi_epoch() {
         2,
         |builder| {
             let input = builder.input::<i64>("data");
-            let exchanged = input.exchange_by_hash("distribute", |x: &i64| *x as u64);
+            let exchanged = input.exchange_by_hash("distribute", |x| *x as u64);
             let (pos, non_pos) = exchanged.branch("sign", |_t, x| *x > 0);
             pos.output("positives");
             non_pos.output("non_positives");
@@ -224,7 +224,7 @@ async fn multi_worker_branch_then_reduce() {
         2,
         |builder| {
             let input = builder.input::<i64>("data");
-            let exchanged = input.exchange_by_hash("distribute", |x: &i64| *x as u64);
+            let exchanged = input.exchange_by_hash("distribute", |x| *x as u64);
             let (evens, odds) = exchanged.branch("parity", |_t, x| x % 2 == 0);
             evens.reduce("sum-evens", |acc, x| acc + x).output("even_sums");
             odds.reduce("sum-odds", |acc, x| acc + x).output("odd_sums");
@@ -249,7 +249,7 @@ async fn multi_worker_branch_three_workers() {
         3,
         |builder| {
             let input = builder.input::<i64>("data");
-            let exchanged = input.exchange_by_hash("distribute", |x: &i64| *x as u64);
+            let exchanged = input.exchange_by_hash("distribute", |x| *x as u64);
             let (big, small) = exchanged.branch("threshold", |_t, x| *x > 5);
             big.output("big");
             small.output("small");
@@ -272,7 +272,7 @@ async fn multi_worker_branch_all_true() {
         2,
         |builder| {
             let input = builder.input::<i64>("data");
-            let exchanged = input.exchange_by_hash("distribute", |x: &i64| *x as u64);
+            let exchanged = input.exchange_by_hash("distribute", |x| *x as u64);
             let (matched, unmatched) = exchanged.branch("always-true", |_t, _x| true);
             matched.output("matched");
             unmatched.output("unmatched");
@@ -303,7 +303,7 @@ async fn multi_worker_gather_collects_all() {
             |_worker_idx, builder| {
                 let input = builder.input::<i64>("data");
                 let gathered = input
-                    .exchange_by_hash("distribute", |x: &i64| *x as u64)
+                    .exchange_by_hash("distribute", |x| *x as u64)
                     .gather("collect");
                 gathered.output("results");
                 Ok(())
@@ -361,7 +361,7 @@ async fn multi_worker_gather_then_reduce() {
         |builder| {
             let input = builder.input::<i64>("data");
             input
-                .exchange_by_hash("distribute", |x: &i64| *x as u64)
+                .exchange_by_hash("distribute", |x| *x as u64)
                 .gather("collect")
                 .reduce("sum", |acc, x| acc + x)
                 .output("results");
@@ -442,6 +442,186 @@ async fn multi_worker_rebalance_three_workers() {
     assert_eq!(results, (1..=30).collect::<Vec<_>>());
 }
 
+/// rebalance actually distributes data across workers (per-worker assertion).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn multi_worker_rebalance_per_worker_distribution() {
+    let rt = RuntimeHandle::new(RuntimeConfig::default()).unwrap();
+
+    let mut multi = rt
+        .spawn_multi(
+            "mw-rebalance-perw",
+            2,
+            |_worker_idx, builder| {
+                let input = builder.input::<i64>("data");
+                input.rebalance("redistribute").output("results");
+                Ok(())
+            },
+            SpawnOptions::default(),
+        )
+        .unwrap();
+
+    let sender = multi.take_input::<i64>(0, "data").unwrap();
+    drop(multi.take_input::<i64>(1, "data").unwrap());
+
+    // Send 20 items — round-robin should give ~10 to each worker
+    sender.send(0, (1..=20).collect()).unwrap();
+    drop(sender);
+
+    let recv0 = multi.take_output::<i64>(0, "results").unwrap();
+    let recv1 = multi.take_output::<i64>(1, "results").unwrap();
+
+    let result = tokio::time::timeout(
+        TEST_TIMEOUT,
+        tokio::task::spawn_blocking(move || multi.join_blocking()),
+    )
+    .await;
+
+    match result {
+        Ok(Ok(Ok(()))) => {}
+        Ok(Ok(Err(e))) => panic!("dataflow join failed: {e}"),
+        Ok(Err(e)) => panic!("spawn_blocking panicked: {e}"),
+        Err(_) => panic!("dataflow did not complete within {TEST_TIMEOUT:?}"),
+    }
+
+    let w0_data: Vec<i64> = recv0.collect_data().into_iter().flat_map(|(_, d)| d).collect();
+    let w1_data: Vec<i64> = recv1.collect_data().into_iter().flat_map(|(_, d)| d).collect();
+
+    // Both workers should have received data (not all on one worker)
+    assert!(!w0_data.is_empty(), "worker 0 should have data from rebalance");
+    assert!(!w1_data.is_empty(), "worker 1 should have data from rebalance");
+    // Total should be 20
+    assert_eq!(w0_data.len() + w1_data.len(), 20);
+    // All original values present
+    let mut all: Vec<i64> = [w0_data, w1_data].concat();
+    all.sort();
+    assert_eq!(all, (1..=20).collect::<Vec<_>>());
+}
+
+// =============================================================================
+// rebalance_to() tests
+// =============================================================================
+
+/// rebalance_to with matching parallelism: round-robin to N workers.
+/// Note: rebalance_to(N) where N != worker_count is rejected until per-stage
+/// parallelism is implemented. This test uses matching counts.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn multi_worker_rebalance_to_matching() {
+    let results = run_multi_worker::<i64, _>(
+        "mw-rebalance-to",
+        2,
+        |builder| {
+            let input = builder.input::<i64>("data");
+            // rebalance_to(2) with 2 workers — same as rebalance() but explicit
+            input.rebalance_to("redistribute", 2).output("results");
+        },
+        vec![(0, (1..=12).collect())],
+        "results",
+    )
+    .await;
+
+    // All data should be preserved
+    assert_eq!(results, (1..=12).collect::<Vec<_>>());
+}
+
+/// rebalance_to with per-worker assertion: data actually distributed.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn multi_worker_rebalance_to_distributes() {
+    let rt = RuntimeHandle::new(RuntimeConfig::default()).unwrap();
+
+    let mut multi = rt
+        .spawn_multi(
+            "mw-rebalance-to-dist",
+            2,
+            |_worker_idx, builder| {
+                let input = builder.input::<i64>("data");
+                input.rebalance_to("redistribute", 2).output("results");
+                Ok(())
+            },
+            SpawnOptions::default(),
+        )
+        .unwrap();
+
+    let sender = multi.take_input::<i64>(0, "data").unwrap();
+    drop(multi.take_input::<i64>(1, "data").unwrap());
+
+    sender.send(0, (1..=20).collect()).unwrap();
+    drop(sender);
+
+    let recv0 = multi.take_output::<i64>(0, "results").unwrap();
+    let recv1 = multi.take_output::<i64>(1, "results").unwrap();
+
+    let result = tokio::time::timeout(
+        TEST_TIMEOUT,
+        tokio::task::spawn_blocking(move || multi.join_blocking()),
+    )
+    .await;
+
+    match result {
+        Ok(Ok(Ok(()))) => {}
+        Ok(Ok(Err(e))) => panic!("dataflow join failed: {e}"),
+        Ok(Err(e)) => panic!("spawn_blocking panicked: {e}"),
+        Err(_) => panic!("dataflow did not complete within {TEST_TIMEOUT:?}"),
+    }
+
+    let w0_data: Vec<i64> = recv0.collect_data().into_iter().flat_map(|(_, d)| d).collect();
+    let w1_data: Vec<i64> = recv1.collect_data().into_iter().flat_map(|(_, d)| d).collect();
+
+    // Both workers should receive data
+    assert!(!w0_data.is_empty(), "worker 0 should have data");
+    assert!(!w1_data.is_empty(), "worker 1 should have data");
+    assert_eq!(w0_data.len() + w1_data.len(), 20);
+}
+
+// =============================================================================
+// Edge cases
+// =============================================================================
+
+/// branch with empty input: both branches should be empty.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn multi_worker_branch_empty_input() {
+    let (matched, unmatched) = run_multi_worker_two_outputs::<i64, _>(
+        "mw-branch-empty",
+        2,
+        |builder| {
+            let input = builder.input::<i64>("data");
+            let exchanged = input.exchange_by_hash("distribute", |x| *x as u64);
+            let (m, u) = exchanged.branch("split", |_t, _x| true);
+            m.output("matched");
+            u.output("unmatched");
+        },
+        vec![], // no data
+        "matched",
+        "unmatched",
+    )
+    .await;
+
+    assert!(matched.is_empty());
+    assert!(unmatched.is_empty());
+}
+
+/// branch where all items go to false branch.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn multi_worker_branch_all_false() {
+    let (matched, unmatched) = run_multi_worker_two_outputs::<i64, _>(
+        "mw-branch-all-false",
+        2,
+        |builder| {
+            let input = builder.input::<i64>("data");
+            let exchanged = input.exchange_by_hash("distribute", |x| *x as u64);
+            let (m, u) = exchanged.branch("never", |_t, _x| false);
+            m.output("matched");
+            u.output("unmatched");
+        },
+        vec![(0, vec![1, 2, 3, 4, 5])],
+        "matched",
+        "unmatched",
+    )
+    .await;
+
+    assert!(matched.is_empty());
+    assert_eq!(unmatched, vec![1, 2, 3, 4, 5]);
+}
+
 // =============================================================================
 // Combined branch + distribution tests
 // =============================================================================
@@ -454,7 +634,7 @@ async fn multi_worker_exchange_branch_gather() {
         2,
         |builder| {
             let input = builder.input::<i64>("data");
-            let exchanged = input.exchange_by_hash("distribute", |x: &i64| *x as u64);
+            let exchanged = input.exchange_by_hash("distribute", |x| *x as u64);
             let (evens, odds) = exchanged.branch("parity", |_t, x| x % 2 == 0);
             evens.gather("gather-evens").output("evens");
             odds.gather("gather-odds").output("odds");
@@ -477,7 +657,7 @@ async fn multi_worker_branch_rebalance_count() {
         2,
         |builder| {
             let input = builder.input::<i64>("data");
-            let exchanged = input.exchange_by_hash("distribute", |x: &i64| *x as u64);
+            let exchanged = input.exchange_by_hash("distribute", |x| *x as u64);
             let (evens, odds) = exchanged.branch("parity", |_t, x| x % 2 == 0);
             evens.rebalance("rebal-evens").count("count-evens").output("even_counts");
             odds.rebalance("rebal-odds").count("count-odds").output("odd_counts");
@@ -502,7 +682,7 @@ async fn multi_worker_map_branch_map() {
         2,
         |builder| {
             let input = builder.input::<i64>("data");
-            let exchanged = input.exchange_by_hash("distribute", |x: &i64| *x as u64);
+            let exchanged = input.exchange_by_hash("distribute", |x| *x as u64);
             let (evens, odds) = exchanged.branch("parity", |_t, x| x % 2 == 0);
             evens.map("double", |_t, x| x * 2).output("doubled_evens");
             odds.map("triple", |_t, x| x * 3).output("tripled_odds");
