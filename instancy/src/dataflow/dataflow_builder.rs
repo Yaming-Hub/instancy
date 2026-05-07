@@ -954,6 +954,54 @@ impl<T: Timestamp, D: Clone + Send + 'static> Pipe<T, D> {
         })
     }
 
+    /// Observe each element flowing through without modifying the stream.
+    ///
+    /// The closure receives a reference to each element (and its timestamp).
+    /// All data passes through unchanged. This is useful for debugging,
+    /// logging, or accumulating side-effects.
+    ///
+    /// # Example
+    /// ```ignore
+    /// let stream = input
+    ///     .inspect("log", |_t, x| println!("saw: {x:?}"))
+    ///     .map("double", |_t, x| x * 2);
+    /// ```
+    pub fn inspect<F>(mut self, name: impl Into<String>, mut logic: F) -> Pipe<T, D>
+    where
+        F: FnMut(&T, &D) + Send + 'static,
+    {
+        let capacity = self.resolve_capacity();
+        self.add_unary_internal(name, capacity, move |time, batch| {
+            for item in &batch {
+                logic(&time, item);
+            }
+            batch
+        })
+    }
+
+    /// Observe each batch of elements flowing through without modifying the stream.
+    ///
+    /// Like [`inspect`](Self::inspect), but the closure receives the entire
+    /// batch `&[D]` at once, which is more efficient when per-item overhead
+    /// matters (e.g., acquiring a lock once per batch instead of per item).
+    ///
+    /// # Example
+    /// ```ignore
+    /// let stream = input
+    ///     .inspect_batch("count", |_t, batch| println!("batch size: {}", batch.len()))
+    ///     .output("results");
+    /// ```
+    pub fn inspect_batch<F>(mut self, name: impl Into<String>, mut logic: F) -> Pipe<T, D>
+    where
+        F: FnMut(&T, &[D]) + Send + 'static,
+    {
+        let capacity = self.resolve_capacity();
+        self.add_unary_internal(name, capacity, move |time, batch| {
+            logic(&time, &batch);
+            batch
+        })
+    }
+
     /// Pass through the first `count` elements, then stop.
     ///
     /// This is the dataflow equivalent of SQL `LIMIT`. After emitting `count`
@@ -4903,5 +4951,107 @@ mod tests {
 
         // Use run() instead — no metrics
         rt().run(dataflow).unwrap();
+    }
+
+    // --- Inspect operator tests ---
+
+    #[test]
+    fn test_inspect_sees_all_items() {
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let seen_clone = seen.clone();
+
+        let builder = DataflowBuilder::<u64>::new("inspect_test");
+        let port = builder
+            .source("nums", vec![(0u64, vec![10i32, 20, 30])])
+            .inspect("spy", move |_t, x| {
+                seen_clone.lock().unwrap().push(*x);
+            })
+            .output("results");
+        let dataflow = builder.build().unwrap();
+        rt().run(dataflow).unwrap();
+
+        // Side-effect captured all items
+        assert_eq!(*seen.lock().unwrap(), vec![10, 20, 30]);
+
+        // Data passes through unchanged
+        let c = port.collector();
+        let r = c.lock().unwrap();
+        assert_eq!(r[0].1, vec![10, 20, 30]);
+    }
+
+    #[test]
+    fn test_inspect_batch_sees_whole_batch() {
+        let batch_sizes = Arc::new(Mutex::new(Vec::new()));
+        let batch_sizes_clone = batch_sizes.clone();
+
+        let builder = DataflowBuilder::<u64>::new("inspect_batch_test");
+        let port = builder
+            .source(
+                "nums",
+                vec![(0u64, vec![1i32, 2, 3]), (1u64, vec![4i32, 5])],
+            )
+            .inspect_batch("batch-spy", move |_t, batch| {
+                batch_sizes_clone.lock().unwrap().push(batch.len());
+            })
+            .output("results");
+        let dataflow = builder.build().unwrap();
+        rt().run(dataflow).unwrap();
+
+        // Two batches observed
+        let sizes = batch_sizes.lock().unwrap();
+        assert_eq!(sizes.len(), 2);
+        assert_eq!(sizes[0], 3);
+        assert_eq!(sizes[1], 2);
+
+        // Data passes through unchanged
+        let c = port.collector();
+        let r = c.lock().unwrap();
+        assert_eq!(r[0], (0, vec![1, 2, 3]));
+        assert_eq!(r[1], (1, vec![4, 5]));
+    }
+
+    #[test]
+    fn test_inspect_in_pipeline() {
+        // inspect should not alter downstream results
+        let builder = DataflowBuilder::<u64>::new("inspect_pipeline");
+        let port = builder
+            .source("nums", vec![(0u64, vec![1i32, 2, 3, 4, 5])])
+            .inspect("tap", |_t, _x| { /* no-op */ })
+            .filter("even", |_t, x| x % 2 == 0)
+            .inspect("tap2", |_t, _x| { /* no-op */ })
+            .map("double", |_t, x| x * 2)
+            .output("results");
+        let dataflow = builder.build().unwrap();
+        rt().run(dataflow).unwrap();
+
+        let c = port.collector();
+        let r = c.lock().unwrap();
+        assert_eq!(r[0].1, vec![4, 8]);
+    }
+
+    #[test]
+    fn test_inspect_receives_timestamp() {
+        let timestamps = Arc::new(Mutex::new(Vec::new()));
+        let ts_clone = timestamps.clone();
+
+        let builder = DataflowBuilder::<u64>::new("inspect_ts");
+        let port = builder
+            .source(
+                "nums",
+                vec![(10u64, vec![1i32]), (20u64, vec![2i32])],
+            )
+            .inspect("ts-spy", move |t, _x| {
+                ts_clone.lock().unwrap().push(*t);
+            })
+            .output("results");
+        let dataflow = builder.build().unwrap();
+        rt().run(dataflow).unwrap();
+
+        let ts = timestamps.lock().unwrap();
+        assert_eq!(*ts, vec![10, 20]);
+
+        let c = port.collector();
+        let r = c.lock().unwrap();
+        assert_eq!(r.len(), 2);
     }
 }
