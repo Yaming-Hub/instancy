@@ -39,7 +39,7 @@
 //! RTT probes use the standard [`Frame`] wire format with a reserved
 //! `PROBE_CHANNEL_ID` to avoid mixing wire formats on the same TCP stream.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -62,8 +62,8 @@ use crate::dataflow::id::DataflowId;
 /// Probe frames carry a [`ProbeMessage`] as their payload.
 pub const PROBE_CHANNEL_ID: u64 = u64::MAX;
 
-/// Probe frames use a nil dataflow ID (all zeros) as a sentinel.
-/// Obtained lazily since `DataflowId::nil()` is not const.
+// Probe frames use a nil dataflow ID (all zeros) as a sentinel.
+// Obtained lazily since `DataflowId::nil()` is not const.
 
 // ---------------------------------------------------------------------------
 // ConnectionFactory — user-provided connection establishment
@@ -113,6 +113,7 @@ struct DataflowRegistration {
 /// - Per-connection writer tasks
 /// - Shared reader tasks (demux + reorder)
 /// - RTT probing and adaptive scaling
+#[allow(dead_code)] // Fields are used via Arc clones in spawned tasks
 pub struct SharedPeerManager {
     /// The remote peer's node ID.
     peer_node_id: String,
@@ -136,6 +137,8 @@ pub struct SharedPeerManager {
     payload_tx: tokio_mpsc::Sender<(DataflowId, Frame)>,
     /// Control sender: high-priority frames bypass sequencing.
     control_tx: tokio_mpsc::Sender<Frame>,
+    /// Failure notification sender: writer/reader tasks send failed conn IDs here.
+    failure_tx: tokio_mpsc::Sender<usize>,
 }
 
 impl Drop for SharedPeerManager {
@@ -182,6 +185,8 @@ impl SharedPeerManager {
         let (payload_tx, payload_rx) = tokio_mpsc::channel::<(DataflowId, Frame)>(1024);
         // Control channel: high-priority frames
         let (control_tx, control_rx) = tokio_mpsc::channel::<Frame>(256);
+        // Failure notification channel: writer/reader tasks report dead connections
+        let (failure_tx, failure_rx) = tokio_mpsc::channel::<usize>(64);
 
         let registrations: Arc<TokioMutex<HashMap<DataflowId, DataflowRegistration>>> =
             Arc::new(TokioMutex::new(HashMap::new()));
@@ -199,8 +204,13 @@ impl SharedPeerManager {
             let conn_metrics = pool.connection(conn_id).cloned();
 
             // Spawn per-connection writer task
-            let handle =
-                runtime_handle.spawn(Self::writer_task(conn_id, writer, rx, conn_metrics));
+            let handle = runtime_handle.spawn(Self::writer_task(
+                conn_id,
+                writer,
+                rx,
+                conn_metrics,
+                failure_tx.clone(),
+            ));
             task_handles.push(handle);
 
             readers.push((conn_id, reader));
@@ -218,6 +228,7 @@ impl SharedPeerManager {
                 scaling_driver.clone(),
                 pool.clone(),
                 writer_channels.clone(),
+                failure_tx.clone(),
             ));
             task_handles.push(reader_handle);
         }
@@ -242,10 +253,19 @@ impl SharedPeerManager {
         ));
         task_handles.push(probe_handle);
 
-        // Spawn scaling event handler (log-only for now; factory integration is future work)
+        // Spawn scaling event handler
         let scale_handle =
             runtime_handle.spawn(Self::scaling_event_handler(scaling_event_rx, pool.clone()));
         task_handles.push(scale_handle);
+
+        // Spawn connection failure monitor
+        let monitor_handle = runtime_handle.spawn(Self::connection_monitor(
+            failure_rx,
+            pool.clone(),
+            writer_channels.clone(),
+            scaling_driver.clone(),
+        ));
+        task_handles.push(monitor_handle);
 
         // Spawn periodic reorder buffer timeout sweeper
         let sweep_handle = runtime_handle.spawn(Self::timeout_sweeper(
@@ -267,6 +287,7 @@ impl SharedPeerManager {
             _task_handles: task_handles,
             payload_tx,
             control_tx,
+            failure_tx,
         }
     }
 
@@ -349,12 +370,14 @@ impl SharedPeerManager {
     /// Per-connection writer task: reads frames from channel and writes to TCP.
     ///
     /// After each successful write, calls `dequeue()` on the connection metrics
-    /// to accurately track pending writes and throughput.
+    /// to accurately track pending writes and throughput. On write failure,
+    /// marks the connection dead and notifies via `failure_tx`.
     async fn writer_task<W: AsyncWrite + Unpin>(
-        _conn_id: usize,
+        conn_id: usize,
         writer: W,
         mut rx: tokio_mpsc::Receiver<Frame>,
         conn_metrics: Option<Arc<ConnectionMetrics>>,
+        failure_tx: tokio_mpsc::Sender<usize>,
     ) {
         let mut framed = FramedWriter::new(writer);
         while let Some(frame) = rx.recv().await {
@@ -362,7 +385,12 @@ impl SharedPeerManager {
             let is_user_traffic = frame.channel_id != PROBE_CHANNEL_ID;
             if let Err(_e) = framed.write_frame(&frame).await {
                 #[cfg(feature = "tracing")]
-                tracing::error!("Writer task conn {} error: {_e}", _conn_id);
+                tracing::error!("Writer task conn {conn_id} write error: {_e}");
+                // Mark connection dead and notify monitor
+                if let Some(ref metrics) = conn_metrics {
+                    metrics.mark_dead();
+                }
+                let _ = failure_tx.try_send(conn_id);
                 break;
             }
             if let Some(ref metrics) = conn_metrics {
@@ -430,22 +458,57 @@ impl SharedPeerManager {
                             sequenced_payload.extend_from_slice(&frame.payload);
                             frame.payload = sequenced_payload;
 
-                            // Select least-loaded connection
-                            let conn = pool.select_and_reserve();
-                            let conn_id = conn.id;
+                            // Select a live connection; retry on a different one if send fails
+                            let mut exclude = HashSet::new();
+                            let mut current_frame = frame;
+                            loop {
+                                let conn = match pool.select_connection_excluding(&exclude) {
+                                    Some(c) => {
+                                        c.enqueue();
+                                        c
+                                    }
+                                    None => {
+                                        // No live connections available
+                                        #[cfg(feature = "tracing")]
+                                        tracing::error!(
+                                            "No live connections for payload frame, dropping"
+                                        );
+                                        break;
+                                    }
+                                };
+                                let conn_id = conn.id;
 
-                            // Clone sender under lock, then release before await
-                            let tx = {
-                                let wc = writer_channels.lock().await;
-                                wc.get(&conn_id).cloned()
-                            };
-                            if let Some(tx) = tx {
-                                if tx.send(frame).await.is_err() {
-                                    #[cfg(feature = "tracing")]
-                                    tracing::error!("Writer channel closed for conn {conn_id}");
+                                // Clone sender under lock, then release before await
+                                let tx = {
+                                    let wc = writer_channels.lock().await;
+                                    wc.get(&conn_id).cloned()
+                                };
+                                match tx {
+                                    Some(tx) => {
+                                        match tx.send(current_frame).await {
+                                            Ok(()) => break, // Successfully enqueued
+                                            Err(tokio_mpsc::error::SendError(returned)) => {
+                                                // Recover the frame and retry on another connection
+                                                current_frame = returned;
+                                                conn.rollback_reservation();
+                                                conn.mark_dead();
+                                                exclude.insert(conn_id);
+                                                #[cfg(feature = "tracing")]
+                                                tracing::warn!(
+                                                    "Writer channel closed for conn {conn_id}, retrying"
+                                                );
+                                                continue;
+                                            }
+                                        }
+                                    }
+                                    None => {
+                                        // Writer channel already removed (monitor cleaned it up)
+                                        conn.rollback_reservation();
+                                        exclude.insert(conn_id);
+                                        continue;
+                                    }
                                 }
                             }
-                            // Note: dequeue() is called in writer_task after actual TCP write
                         }
                         None => { payload_open = false; }
                     }
@@ -461,6 +524,9 @@ impl SharedPeerManager {
     /// - Probe frames: process replies or generate reply to requests
     /// - Control frames (channel 0): delivered directly without sequencing
     /// - Payload frames: stripped of sequence prefix, reordered, dispatched
+    ///
+    /// On read error, marks the connection dead and notifies via `failure_tx`.
+    #[allow(clippy::too_many_arguments)]
     async fn reader_task<R: AsyncRead + Unpin>(
         conn_id: usize,
         reader: R,
@@ -469,6 +535,7 @@ impl SharedPeerManager {
         scaling_driver: Arc<ScalingDriver>,
         pool: Arc<PeerPool>,
         writer_channels: Arc<TokioMutex<HashMap<usize, tokio_mpsc::Sender<Frame>>>>,
+        failure_tx: tokio_mpsc::Sender<usize>,
     ) {
         let mut framed = FramedReader::new(reader);
 
@@ -557,12 +624,20 @@ impl SharedPeerManager {
                 }
                 Err(TransportError::ConnectionClosed) => {
                     #[cfg(feature = "tracing")]
-                    tracing::info!("Reader task conn {} closed", conn_id);
+                    tracing::info!("Reader task conn {conn_id} closed");
+                    if let Some(metrics) = pool.connection(conn_id) {
+                        metrics.mark_dead();
+                    }
+                    let _ = failure_tx.try_send(conn_id);
                     break;
                 }
                 Err(_e) => {
                     #[cfg(feature = "tracing")]
-                    tracing::error!("Reader task conn {} error: {_e}", conn_id);
+                    tracing::error!("Reader task conn {conn_id} error: {_e}");
+                    if let Some(metrics) = pool.connection(conn_id) {
+                        metrics.mark_dead();
+                    }
+                    let _ = failure_tx.try_send(conn_id);
                     break;
                 }
             }
@@ -586,7 +661,7 @@ impl SharedPeerManager {
                 ProbeKind::Reply => {
                     // Process the reply — updates RTT on the connection
                     if let Some(conn) = pool.connection(conn_id) {
-                        scaling_driver.process_probe_reply(&probe, &conn);
+                        scaling_driver.process_probe_reply(&probe, conn);
                     }
                 }
                 ProbeKind::Request => {
@@ -664,7 +739,51 @@ impl SharedPeerManager {
                     tracing::info!("Scaling event: ScaleDown conn {connection_id}");
                     // Future: drain and remove connection
                 }
+                ScalingEvent::ConnectionFailed { connection_id } => {
+                    #[cfg(feature = "tracing")]
+                    tracing::warn!("Scaling event: ConnectionFailed conn {connection_id}");
+                    // Future: call ConnectionFactory to replace dead connection
+                }
             }
+        }
+    }
+
+    /// Connection failure monitor: listens for dead connection notifications,
+    /// removes their writer channels, and emits `ConnectionFailed` events.
+    ///
+    /// Deduplicates notifications (both writer and reader may report the same
+    /// connection) — only processes each connection_id once.
+    async fn connection_monitor(
+        mut failure_rx: tokio_mpsc::Receiver<usize>,
+        pool: Arc<PeerPool>,
+        writer_channels: Arc<TokioMutex<HashMap<usize, tokio_mpsc::Sender<Frame>>>>,
+        scaling_driver: Arc<ScalingDriver>,
+    ) {
+        let mut processed = HashSet::new();
+        while let Some(conn_id) = failure_rx.recv().await {
+            if !processed.insert(conn_id) {
+                continue; // Already handled this connection
+            }
+
+            #[cfg(feature = "tracing")]
+            tracing::warn!(
+                "Connection monitor: conn {conn_id} failed, removing. Live: {}",
+                pool.live_connection_count()
+            );
+
+            // Remove writer channel (drops the sender, which will cause
+            // writer_task to exit if it hasn't already)
+            {
+                let mut wc = writer_channels.lock().await;
+                wc.remove(&conn_id);
+            }
+
+            // Emit scaling event for external handling
+            scaling_driver
+                .emit_event(ScalingEvent::ConnectionFailed {
+                    connection_id: conn_id,
+                })
+                .await;
         }
     }
 
@@ -901,7 +1020,6 @@ mod tests {
         let pairs = make_connections(2);
         let (readers, writers): (Vec<_>, Vec<_>) = pairs
             .into_iter()
-            .map(|(client, server)| (client, server))
             .unzip();
 
         let config = SharedConnectionConfig::default();
@@ -922,7 +1040,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn register_and_unregister_dataflow() {
         let pairs = make_connections(1);
-        let connections: Vec<_> = pairs.into_iter().map(|(c, s)| (c, s)).collect();
+        let connections: Vec<_> = pairs.into_iter().collect();
 
         let config = SharedConnectionConfig::default();
         let rt = tokio::runtime::Handle::current();
@@ -961,7 +1079,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn shared_transport_session_api() {
         let pairs = make_connections(1);
-        let connections: Vec<_> = pairs.into_iter().map(|(c, s)| (c, s)).collect();
+        let connections: Vec<_> = pairs.into_iter().collect();
 
         let config = SharedConnectionConfig::default();
         let rt = tokio::runtime::Handle::current();
@@ -1125,7 +1243,7 @@ mod tests {
     async fn dataframe_sender_normalizes_dataflow_id() {
         // DataframeSender should overwrite frame.dataflow_id with its own
         let pairs = make_connections(1);
-        let connections: Vec<_> = pairs.into_iter().map(|(c, s)| (c, s)).collect();
+        let connections: Vec<_> = pairs.into_iter().collect();
 
         let config = SharedConnectionConfig::default();
         let rt = tokio::runtime::Handle::current();
@@ -1251,5 +1369,82 @@ mod tests {
         }
 
         drop(manager);
+    }
+
+    #[tokio::test]
+    async fn writer_failure_marks_connection_dead() {
+        // Create a connection where we can drop the reader to cause writer failure
+        let (client_read, server_write) = duplex(8192);
+        let (server_read, client_write) = duplex(8192);
+
+        let connections: Vec<(DuplexStream, DuplexStream)> =
+            vec![(client_read, client_write)];
+
+        let config = SharedConnectionConfig {
+            min_connections: 1,
+            max_connections: 4,
+            probe_interval: Duration::from_secs(100), // disable probing
+            ..Default::default()
+        };
+
+        let rt = tokio::runtime::Handle::current();
+        let manager = SharedPeerManager::new(
+            "peer-fail".into(),
+            config,
+            connections,
+            &rt,
+        );
+
+        // Drop the remote side to cause write failures
+        drop(server_read);
+        drop(server_write);
+
+        // Give the writer/reader tasks time to detect the failure
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        // Connection should be marked dead
+        assert_eq!(
+            manager.pool.live_connection_count(),
+            0,
+            "dead connection should not be counted as live"
+        );
+    }
+
+    #[tokio::test]
+    async fn dead_connection_removed_from_writer_channels() {
+        let (client_read, _server_write) = duplex(8192);
+        let (_server_read, client_write) = duplex(8192);
+
+        let connections: Vec<(DuplexStream, DuplexStream)> =
+            vec![(client_read, client_write)];
+
+        let config = SharedConnectionConfig {
+            min_connections: 1,
+            max_connections: 4,
+            probe_interval: Duration::from_secs(100),
+            ..Default::default()
+        };
+
+        let rt = tokio::runtime::Handle::current();
+        let manager = SharedPeerManager::new(
+            "peer-monitor".into(),
+            config,
+            connections,
+            &rt,
+        );
+
+        // Drop remote sides
+        drop(_server_write);
+        drop(_server_read);
+
+        // Wait for monitor to process the failure
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        // Writer channel should have been removed by the monitor
+        let wc = manager.writer_channels.lock().await;
+        assert!(
+            wc.is_empty(),
+            "monitor should remove dead connection's writer channel"
+        );
     }
 }
