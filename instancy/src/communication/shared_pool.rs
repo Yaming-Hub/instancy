@@ -67,6 +67,12 @@ pub struct SharedConnectionConfig {
     pub reorder_timeout: Duration,
     /// EMA smoothing factor for RTT (0.0–1.0, higher = more weight to recent).
     pub rtt_ema_alpha: f64,
+    /// Close idle connections after this duration of inactivity.
+    ///
+    /// A connection is considered idle when it has had no frames written
+    /// for longer than this timeout. Idle connections are removed down to
+    /// `min_connections`. Set to `None` to disable idle cleanup.
+    pub idle_timeout: Option<Duration>,
 }
 
 impl Default for SharedConnectionConfig {
@@ -80,6 +86,7 @@ impl Default for SharedConnectionConfig {
             probe_interval: Duration::from_millis(100),
             reorder_timeout: Duration::from_millis(50),
             rtt_ema_alpha: 0.2,
+            idle_timeout: Some(Duration::from_secs(60)),
         }
     }
 }
@@ -193,17 +200,25 @@ pub struct ConnectionMetrics {
     bytes_written: AtomicU64,
     /// Total frames written through this connection.
     frames_written: AtomicU64,
+    /// Timestamp (nanos since UNIX epoch) of the last write activity.
+    /// Updated on each `dequeue()`. 0 means no activity yet.
+    last_activity_nanos: AtomicU64,
 }
 
 impl ConnectionMetrics {
     /// Create metrics for a new connection with the given ID and RTT alpha.
     pub fn new(id: usize, rtt_alpha: f64) -> Self {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos() as u64;
         Self {
             id,
             pending_writes: AtomicUsize::new(0),
             rtt: RttTracker::new(rtt_alpha),
             bytes_written: AtomicU64::new(0),
             frames_written: AtomicU64::new(0),
+            last_activity_nanos: AtomicU64::new(now),
         }
     }
 
@@ -213,11 +228,21 @@ impl ConnectionMetrics {
     }
 
     /// Decrement pending write count (called when frame is written to TCP).
-    pub fn dequeue(&self, payload_size: usize) {
+    ///
+    /// Set `is_user_traffic` to `true` for data/control/progress frames.
+    /// Probe frames should pass `false` so they don't reset the idle timer.
+    pub fn dequeue(&self, payload_size: usize, is_user_traffic: bool) {
         self.pending_writes.fetch_sub(1, Ordering::Relaxed);
         self.bytes_written
             .fetch_add(payload_size as u64, Ordering::Relaxed);
         self.frames_written.fetch_add(1, Ordering::Relaxed);
+        if is_user_traffic {
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos() as u64;
+            self.last_activity_nanos.store(now, Ordering::Relaxed);
+        }
     }
 
     /// Get current pending write queue depth.
@@ -250,6 +275,22 @@ impl ConnectionMetrics {
     /// Primary: pending write queue depth. Tiebreaker: RTT (lower is better).
     pub fn load_score(&self) -> (usize, u64) {
         (self.pending_writes(), self.rtt.average_nanos())
+    }
+
+    /// Duration since the last write activity on this connection.
+    ///
+    /// Returns `None` if the clock cannot be read or the connection has
+    /// never been used (in which case idle time is measured from creation).
+    pub fn idle_duration(&self) -> Option<Duration> {
+        let last = self.last_activity_nanos.load(Ordering::Relaxed);
+        if last == 0 {
+            return None;
+        }
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .ok()?
+            .as_nanos() as u64;
+        Some(Duration::from_nanos(now.saturating_sub(last)))
     }
 }
 
@@ -320,20 +361,48 @@ impl PeerPool {
         }
     }
 
-    /// Select the least-loaded connection and atomically reserve it.
+    /// Select a connection and atomically reserve it.
     ///
-    /// Returns the connection metrics for the selected connection.
+    /// **Low-load packing**: when total pending writes across the pool is
+    /// below the connection count, traffic is concentrated onto the fewest
+    /// connections (prefer the one with the most pending writes). This
+    /// leaves other connections idle so they can be cleaned up by the idle
+    /// timeout.
+    ///
+    /// **High-load spreading**: when the pool is busy (total pending ≥
+    /// connection count), the least-loaded connection is selected to
+    /// balance throughput across all connections.
+    ///
     /// Atomically increments `pending_writes` on the selected connection
     /// to prevent multiple callers from racing to the same connection.
-    ///
-    /// The caller must call `dequeue()` on the returned metrics after
-    /// the frame has been written.
+    /// The caller must call `dequeue()` after the frame has been written.
     pub fn select_and_reserve(&self) -> &Arc<ConnectionMetrics> {
-        let conn = self
+        let total_pending: usize = self
             .connections
             .values()
-            .min_by_key(|c| c.load_score())
-            .expect("PeerPool must have at least one connection");
+            .map(|c| c.pending_writes())
+            .sum();
+
+        let conn = if total_pending < self.connections.len() {
+            // Low load — pack onto fewest connections to let others go idle.
+            // Pick the connection with the most pending writes (ties broken
+            // by lowest RTT so we prefer the fastest busy connection).
+            self.connections
+                .values()
+                .max_by_key(|c| {
+                    let (pending, rtt) = c.load_score();
+                    // Primary: most pending (pack). Tiebreak: lowest RTT.
+                    (pending, std::cmp::Reverse(rtt))
+                })
+                .expect("PeerPool must have at least one connection")
+        } else {
+            // High load — spread across connections.
+            self.connections
+                .values()
+                .min_by_key(|c| c.load_score())
+                .expect("PeerPool must have at least one connection")
+        };
+
         conn.enqueue(); // Atomic reservation
         conn
     }
@@ -383,10 +452,12 @@ impl PeerPool {
         self.connections.remove(&id).is_some()
     }
 
-    /// Evaluate whether scaling is needed based on current RTT measurements.
+    /// Evaluate whether scaling is needed based on current RTT and idle state.
     ///
     /// This should be called periodically (e.g., after each probe response).
-    /// Connections without any RTT measurement are excluded from scaling decisions.
+    /// Connections without any RTT measurement are excluded from RTT-based
+    /// scaling decisions. Idle connections (no write activity for longer than
+    /// `idle_timeout`) are candidates for removal regardless of RTT.
     pub async fn evaluate_scaling(&self) -> ScalingDecision {
         let threshold_up = self.config.rtt_scale_up_threshold;
         let threshold_down = self.config.rtt_scale_down_threshold;
@@ -401,6 +472,26 @@ impl PeerPool {
             // Reset cooldown since we're scaling up
             *self.cooldown_start.lock().await = None;
             return ScalingDecision::ScaleUp;
+        }
+
+        // Check for idle connections (no traffic for idle_timeout).
+        // Remove the longest-idle connection, but never below min_connections.
+        if let Some(idle_timeout) = self.config.idle_timeout {
+            if self.connections.len() > self.config.min_connections {
+                let longest_idle = self
+                    .connections
+                    .values()
+                    .filter(|c| c.pending_writes() == 0)
+                    .filter_map(|c| c.idle_duration().map(|d| (c.id, d)))
+                    .filter(|(_, d)| *d >= idle_timeout)
+                    .max_by_key(|(_, d)| *d);
+
+                if let Some((conn_id, _)) = longest_idle {
+                    return ScalingDecision::ScaleDown {
+                        connection_id: conn_id,
+                    };
+                }
+            }
         }
 
         // Check if ALL connections have measurements and are below scale-down threshold.
@@ -463,6 +554,7 @@ impl PeerPool {
                 avg_rtt: c.average_rtt(),
                 total_bytes: c.total_bytes_written(),
                 total_frames: c.total_frames_written(),
+                idle_duration: c.idle_duration(),
             })
             .collect();
         snaps.sort_by_key(|s| s.id);
@@ -483,6 +575,8 @@ pub struct ConnectionSnapshot {
     pub total_bytes: u64,
     /// Total frames written since connection established.
     pub total_frames: u64,
+    /// Duration since the last write activity (None if never used).
+    pub idle_duration: Option<Duration>,
 }
 
 // ─── Tests ───────────────────────────────────────────────────────────────────
@@ -528,7 +622,7 @@ mod tests {
         m.enqueue();
         assert_eq!(m.pending_writes(), 2);
 
-        m.dequeue(100);
+        m.dequeue(100, true);
         assert_eq!(m.pending_writes(), 1);
         assert_eq!(m.total_bytes_written(), 100);
         assert_eq!(m.total_frames_written(), 1);
@@ -737,6 +831,30 @@ mod tests {
     }
 
     #[test]
+    fn select_packs_under_low_load() {
+        let config = SharedConnectionConfig {
+            min_connections: 2,
+            max_connections: 8,
+            ..Default::default()
+        };
+        let pool = PeerPool::new(3, config);
+
+        // All connections idle (total_pending=0 < 3 connections) → low-load packing.
+        // First select should pick ONE connection and keep using it.
+        let first = pool.select_and_reserve();
+        let first_id = first.id;
+        // Now total_pending=1 < 3 → still low-load → pack onto same connection
+        let second = pool.select_and_reserve();
+        assert_eq!(second.id, first_id, "low-load packing should reuse same connection");
+        // Now total_pending=2 < 3 → still low-load
+        let third = pool.select_and_reserve();
+        assert_eq!(third.id, first_id, "low-load packing should still reuse same connection");
+        // Now total_pending=3 >= 3 → high-load → spreads to least-loaded
+        let fourth = pool.select_and_reserve();
+        assert_ne!(fourth.id, first_id, "high-load should spread to a different connection");
+    }
+
+    #[test]
     fn peer_pool_stable_ids_after_removal() {
         let config = SharedConnectionConfig {
             min_connections: 1,
@@ -787,5 +905,85 @@ mod tests {
         assert_eq!(config.cooldown_period, Duration::from_secs(30));
         assert_eq!(config.probe_interval, Duration::from_millis(100));
         assert_eq!(config.reorder_timeout, Duration::from_millis(50));
+        assert_eq!(config.idle_timeout, Some(Duration::from_secs(60)));
+    }
+
+    #[tokio::test]
+    async fn idle_connection_scaled_down() {
+        let config = SharedConnectionConfig {
+            min_connections: 1,
+            max_connections: 4,
+            idle_timeout: Some(Duration::from_millis(10)),
+            ..Default::default()
+        };
+        let pool = PeerPool::new(2, config);
+
+        // Both connections are freshly created — not yet idle
+        assert_eq!(pool.evaluate_scaling().await, ScalingDecision::None);
+
+        // Wait for the idle timeout to elapse
+        tokio::time::sleep(Duration::from_millis(15)).await;
+
+        // Now one connection should be identified as idle and removed
+        let decision = pool.evaluate_scaling().await;
+        assert!(
+            matches!(decision, ScalingDecision::ScaleDown { .. }),
+            "expected ScaleDown for idle connection, got {decision:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn active_connection_not_idle() {
+        let config = SharedConnectionConfig {
+            min_connections: 1,
+            max_connections: 4,
+            idle_timeout: Some(Duration::from_millis(20)),
+            ..Default::default()
+        };
+        let pool = PeerPool::new(2, config);
+
+        // Wait a bit but keep one connection active
+        tokio::time::sleep(Duration::from_millis(25)).await;
+        pool.connection(0).unwrap().dequeue(100, true); // refreshes last_activity
+
+        // Connection 0 is active, connection 1 is idle
+        let decision = pool.evaluate_scaling().await;
+        assert_eq!(
+            decision,
+            ScalingDecision::ScaleDown { connection_id: 1 },
+            "should remove idle conn 1, not active conn 0"
+        );
+    }
+
+    #[tokio::test]
+    async fn idle_respects_min_connections() {
+        let config = SharedConnectionConfig {
+            min_connections: 1,
+            max_connections: 4,
+            idle_timeout: Some(Duration::from_millis(10)),
+            ..Default::default()
+        };
+        let pool = PeerPool::new(1, config);
+
+        tokio::time::sleep(Duration::from_millis(15)).await;
+
+        // At min_connections — should not scale down even if idle
+        assert_eq!(pool.evaluate_scaling().await, ScalingDecision::None);
+    }
+
+    #[tokio::test]
+    async fn idle_disabled_when_none() {
+        let config = SharedConnectionConfig {
+            min_connections: 1,
+            max_connections: 4,
+            idle_timeout: None,
+            ..Default::default()
+        };
+        let pool = PeerPool::new(2, config);
+
+        tokio::time::sleep(Duration::from_millis(15)).await;
+
+        // idle_timeout is None — no idle scale-down
+        assert_eq!(pool.evaluate_scaling().await, ScalingDecision::None);
     }
 }
