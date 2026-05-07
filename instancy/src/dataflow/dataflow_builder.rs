@@ -1368,6 +1368,30 @@ impl<T: Timestamp, D: Clone + Send + 'static> Pipe<T, D> {
         })
     }
 
+    /// Transform each batch as a whole, producing zero or more output items.
+    ///
+    /// Unlike [`flat_map`](Self::flat_map) which processes one element at a time,
+    /// `map_batch` receives the entire batch for a timestamp at once. This
+    /// enables efficient bulk operations like sorting, batch deduplication, or
+    /// transformations that benefit from seeing all items together.
+    ///
+    /// # Example
+    /// ```ignore
+    /// // Sort each batch before emitting
+    /// let sorted = stream.map_batch("sort", |_t, mut batch: Vec<i32>| {
+    ///     batch.sort();
+    ///     batch
+    /// });
+    /// ```
+    pub fn map_batch<D2, F>(mut self, name: impl Into<String>, mut logic: F) -> Pipe<T, D2>
+    where
+        D2: Clone + Send + 'static,
+        F: FnMut(&T, Vec<D>) -> Vec<D2> + Send + 'static,
+    {
+        let capacity = self.resolve_capacity();
+        self.add_unary_internal(name, capacity, move |time, batch| logic(&time, batch))
+    }
+
     /// General unary operator with full control over input/output handles.
     ///
     /// For simple per-element transformations, prefer [`map`](Self::map) or
@@ -5994,5 +6018,107 @@ mod tests {
         builder
             .source("nums", vec![(0u64, vec![1i32])])
             .rebalance_to("bad", 0);
+    }
+
+    #[test]
+    fn test_map_batch_sort() {
+        // Sort each batch
+        let builder = DataflowBuilder::<u64>::new("map_batch_sort");
+        let port = builder
+            .source("nums", vec![(0u64, vec![5i32, 3, 1, 4, 2])])
+            .map_batch("sort", |_t, mut batch| {
+                batch.sort();
+                batch
+            })
+            .output("results");
+        let dataflow = builder.build().unwrap();
+        rt().run(dataflow).unwrap();
+
+        let c = port.collector();
+        let r = c.lock().unwrap();
+        let results: Vec<i32> = r.iter().flat_map(|(_, d)| d.clone()).collect();
+        assert_eq!(results, vec![1, 2, 3, 4, 5]);
+    }
+
+    #[test]
+    fn test_map_batch_filter_and_transform() {
+        // Filter even numbers and double them, batch-level
+        let builder = DataflowBuilder::<u64>::new("map_batch_filter");
+        let port = builder
+            .source("nums", vec![(0u64, vec![1i32, 2, 3, 4, 5, 6])])
+            .map_batch("even_doubled", |_t, batch| {
+                batch.into_iter().filter(|x| x % 2 == 0).map(|x| x * 2).collect()
+            })
+            .output("results");
+        let dataflow = builder.build().unwrap();
+        rt().run(dataflow).unwrap();
+
+        let c = port.collector();
+        let r = c.lock().unwrap();
+        let results: Vec<i32> = r.iter().flat_map(|(_, d)| d.clone()).collect();
+        assert_eq!(results, vec![4, 8, 12]);
+    }
+
+    #[test]
+    fn test_map_batch_empty_output() {
+        // Return empty vec — filters out entire batch
+        let builder = DataflowBuilder::<u64>::new("map_batch_empty");
+        let port = builder
+            .source("nums", vec![(0u64, vec![1i32, 2, 3])])
+            .map_batch("drop-all", |_t, _batch| Vec::<i32>::new())
+            .output("results");
+        let dataflow = builder.build().unwrap();
+        rt().run(dataflow).unwrap();
+
+        let c = port.collector();
+        let r = c.lock().unwrap();
+        let results: Vec<i32> = r.iter().flat_map(|(_, d)| d.clone()).collect();
+        assert!(results.is_empty());
+    }
+
+    #[test]
+    fn test_map_batch_type_change() {
+        // Change output type: Vec<i32> → Vec<String>
+        let builder = DataflowBuilder::<u64>::new("map_batch_type");
+        let port = builder
+            .source("nums", vec![(0u64, vec![1i32, 2, 3])])
+            .map_batch("to_string", |_t, batch| {
+                batch.into_iter().map(|x| format!("v{x}")).collect()
+            })
+            .output("results");
+        let dataflow = builder.build().unwrap();
+        rt().run(dataflow).unwrap();
+
+        let c = port.collector();
+        let r = c.lock().unwrap();
+        let results: Vec<String> = r.iter().flat_map(|(_, d)| d.clone()).collect();
+        assert_eq!(results, vec!["v1", "v2", "v3"]);
+    }
+
+    #[test]
+    fn test_map_batch_multi_epoch() {
+        // Each epoch's batch processed independently
+        let builder = DataflowBuilder::<u64>::new("map_batch_epochs");
+        let port = builder
+            .source(
+                "nums",
+                vec![
+                    (0u64, vec![3i32, 1, 2]),
+                    (1u64, vec![6, 4, 5]),
+                ],
+            )
+            .map_batch("sort", |_t, mut batch| {
+                batch.sort();
+                batch
+            })
+            .output("results");
+        let dataflow = builder.build().unwrap();
+        rt().run(dataflow).unwrap();
+
+        let c = port.collector();
+        let r = c.lock().unwrap();
+        let results: Vec<i32> = r.iter().flat_map(|(_, d)| d.clone()).collect();
+        // Each epoch sorted independently
+        assert_eq!(results, vec![1, 2, 3, 4, 5, 6]);
     }
 }
