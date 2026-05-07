@@ -68,6 +68,7 @@ pub mod worker_pool;
 pub use dataflow::dataflow_builder::IterateResult;
 pub use dataflow::graph::DataflowGraph;
 pub use dataflow::id::DataflowId;
+pub use dataflow::probe::ProbeHandle;
 pub use dataflow::stream::StreamEdge;
 pub use dataflow::{AsyncInputSender, AsyncOutputReceiver};
 pub use dataflow::{ControlReceiver, ControlSender, WorkerControl};
