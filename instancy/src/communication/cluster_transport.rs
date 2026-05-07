@@ -172,3 +172,65 @@ impl ClusterTransport {
         }
     }
 }
+
+// ---------------------------------------------------------------------------
+// ClusterSpawnTransport — spawn_cluster transport configuration
+// ---------------------------------------------------------------------------
+
+/// Transport configuration for [`spawn_cluster`](crate::RuntimeHandle::spawn_cluster).
+///
+/// Determines whether the cluster dataflow uses dedicated per-dataflow connections
+/// or shares pooled connections via [`SharedPeerManager`]s.
+///
+/// # Examples
+///
+/// **Dedicated mode** (one connection per peer per dataflow):
+/// ```ignore
+/// let transport = ClusterSpawnTransport::dedicated(connections, 1024);
+/// runtime.spawn_cluster(name, topology, node_id, df_id, transport, timeout, build, &rt)?;
+/// ```
+///
+/// **Shared mode** (multiplexed over pooled connections):
+/// ```ignore
+/// let transport = ClusterSpawnTransport::shared(&peer_managers, 1024);
+/// runtime.spawn_cluster(name, topology, node_id, df_id, transport, timeout, build, &rt)?;
+/// ```
+#[cfg(feature = "transport")]
+pub enum ClusterSpawnTransport<'a, R = tokio::io::DuplexStream, W = tokio::io::DuplexStream> {
+    /// Use dedicated per-dataflow connections (one TCP connection per peer).
+    Dedicated {
+        /// Pre-established connections to each remote peer.
+        connections: Vec<crate::communication::transport_session::PeerConnection<R, W>>,
+        /// Buffer capacity for transport channels.
+        capacity: usize,
+    },
+    /// Use shared pooled connections via existing [`SharedPeerManager`]s.
+    Shared {
+        /// Map of peer_node_id → SharedPeerManager (must match topology peers).
+        peer_managers: &'a HashMap<String, crate::communication::shared_transport::SharedPeerManager>,
+        /// Buffer capacity for per-channel receivers.
+        capacity: usize,
+    },
+}
+
+#[cfg(feature = "transport")]
+impl<'a, R, W> ClusterSpawnTransport<'a, R, W> {
+    /// Create a dedicated transport configuration.
+    pub fn dedicated(
+        connections: Vec<crate::communication::transport_session::PeerConnection<R, W>>,
+        capacity: usize,
+    ) -> Self {
+        Self::Dedicated { connections, capacity }
+    }
+}
+
+#[cfg(feature = "transport")]
+impl<'a> ClusterSpawnTransport<'a> {
+    /// Create a shared transport configuration.
+    pub fn shared(
+        peer_managers: &'a HashMap<String, crate::communication::shared_transport::SharedPeerManager>,
+        capacity: usize,
+    ) -> Self {
+        Self::Shared { peer_managers, capacity }
+    }
+}

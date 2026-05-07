@@ -72,4 +72,4 @@ pub use shared_transport::{
 };
 
 #[cfg(feature = "transport")]
-pub use cluster_transport::ClusterTransport;
+pub use cluster_transport::{ClusterTransport, ClusterSpawnTransport};

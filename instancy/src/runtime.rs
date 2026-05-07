@@ -833,7 +833,7 @@ impl RuntimeHandle {
     /// stream.
     ///
     /// ```rust
-    /// use instancy::{RuntimeConfig, RuntimeHandle};
+    /// use instancy::{RuntimeConfig, RuntimeHandle, SpawnOptions};
     /// use instancy::DataflowBuilder;
     ///
     /// // Simulate 4 data partitions.
@@ -1350,13 +1350,13 @@ impl RuntimeHandle {
     /// Each physical node in the cluster calls this method independently with
     /// the same topology, dataflow ID, and build closure. Only workers assigned
     /// to `local_node_id` are created on this node; remote workers are
-    /// communicated with via `connections`.
+    /// communicated with via the transport specified in `transport_config`.
     ///
     /// # Protocol
     ///
     /// 1. Build local workers from the closure
     /// 2. Validate graph topology consistency
-    /// 3. Create transport session (priority-multiplexed TCP)
+    /// 3. Create/register transport (dedicated or shared)
     /// 4. Handshake: exchange graph fingerprints with all peers
     /// 5. Wire exchange channels (network for cross-node, local for same-node)
     /// 6. Wire progress channels (network + local)
@@ -1370,8 +1370,7 @@ impl RuntimeHandle {
     /// - `topology`: Cluster topology (must be identical on all nodes).
     /// - `local_node_id`: This node's ID in the topology.
     /// - `dataflow_id`: Unique dataflow ID (must be the same on all nodes).
-    /// - `connections`: Pre-established TCP connections to all remote peers.
-    /// - `capacity`: Buffer capacity for channels.
+    /// - `transport_config`: Transport mode — dedicated connections or shared pool.
     /// - `handshake_timeout`: Timeout for handshake and ready barrier.
     /// - `build`: Closure that builds the dataflow graph (called once per local worker).
     /// - `runtime_handle`: Tokio runtime handle for async bridge tasks.
@@ -1379,7 +1378,7 @@ impl RuntimeHandle {
     /// # Errors
     ///
     /// - `local_node_id` not found in topology
-    /// - Connections don't match expected remote peers
+    /// - Connections/peer_managers don't match expected remote peers
     /// - Build closure fails
     /// - Graph fingerprint mismatch with any peer
     /// - Handshake or ready barrier timeout
@@ -1391,8 +1390,7 @@ impl RuntimeHandle {
         topology: crate::execute::ClusterTopology,
         local_node_id: &str,
         dataflow_id: crate::dataflow::id::DataflowId,
-        connections: Vec<crate::communication::transport_session::PeerConnection<R, W>>,
-        capacity: usize,
+        transport_config: crate::communication::cluster_transport::ClusterSpawnTransport<'_, R, W>,
         handshake_timeout: std::time::Duration,
         build: F,
         runtime_handle: &tokio::runtime::Handle,
@@ -1403,8 +1401,10 @@ impl RuntimeHandle {
         R: tokio::io::AsyncRead + Unpin + Send + 'static,
         W: tokio::io::AsyncWrite + Unpin + Send + 'static,
     {
+        use crate::communication::cluster_transport::{ClusterTransport, ClusterSpawnTransport};
         use crate::communication::control_protocol::{
-            compute_fingerprint, perform_handshake, perform_ready_barrier,
+            compute_fingerprint, perform_handshake, perform_handshake_with_transport,
+            perform_ready_barrier, perform_ready_barrier_with_transport,
         };
         use crate::communication::transport_session::{
             CONTROL_CHANNEL_ID, ChannelRegistration, TransportSession,
@@ -1423,36 +1423,6 @@ impl RuntimeHandle {
         })?;
         let num_local = local_end - local_start;
 
-        // Validate connections match topology (one per remote peer, no self, no dups).
-        {
-            let mut expected_peers: std::collections::HashSet<&str> = topology
-                .nodes
-                .iter()
-                .map(|n| n.node_id.as_str())
-                .filter(|id| *id != local_node_id)
-                .collect();
-            for conn in &connections {
-                if conn.node_id == local_node_id {
-                    return Err(Error::Custom(format!(
-                        "connection to self ('{local_node_id}') is not allowed"
-                    )));
-                }
-                if !expected_peers.remove(conn.node_id.as_str()) {
-                    return Err(Error::Custom(format!(
-                        "unexpected or duplicate connection to peer '{}'",
-                        conn.node_id
-                    )));
-                }
-            }
-            if !expected_peers.is_empty() {
-                let missing: Vec<_> = expected_peers.into_iter().collect();
-                return Err(Error::Custom(format!(
-                    "missing connections to peers: {:?}",
-                    missing
-                )));
-            }
-        }
-
         // Phase 1: Build local workers from the closure.
         let mut dataflows = Vec::with_capacity(num_local);
         for worker_idx in local_start..local_end {
@@ -1466,12 +1436,9 @@ impl RuntimeHandle {
         if num_local > 1 {
             validate_multi_worker_topologies(&dataflows)?;
         }
-
-        // Phase 2b: Validate per-stage parallelism compatibility (uses total_workers
-        // since cluster mode spans all nodes).
         validate_stage_parallelism(&dataflows[0], total_workers)?;
 
-        // Phase 3: Compute fingerprint, build channel registrations, create TransportSession.
+        // Phase 3: Compute fingerprint and create transport.
         let exchange_indices = dataflows[0].exchange_edge_indices();
         let fingerprint = compute_fingerprint(
             dataflows[0].operator_count(),
@@ -1481,87 +1448,232 @@ impl RuntimeHandle {
             total_workers,
         );
 
-        // Data channel registrations: for each exchange edge × each (remote_src, local_dst) pair.
-        let mut data_regs = Vec::new();
-        for (edge_order, &_edge_idx) in exchange_indices.iter().enumerate() {
-            for node in &topology.nodes {
-                if node.node_id == local_node_id {
-                    continue;
-                }
-                let peer_id = &node.node_id;
-                let (peer_start, peer_end) = topology.worker_range(peer_id).unwrap();
-                for src in peer_start..peer_end {
-                    for dst in local_start..local_end {
-                        let channel_id = NetworkEdgeMaterializer::<T, u8>::channel_id(
-                            edge_order,
-                            src,
-                            dst,
-                            total_workers,
-                        );
-                        data_regs.push(ChannelRegistration {
-                            peer_node_id: peer_id.clone(),
-                            channel_id,
-                        });
-                    }
-                }
-            }
-        }
-
-        // Progress channel registrations.
-        let mut progress_regs = Vec::new();
-        for node in &topology.nodes {
-            if node.node_id == local_node_id {
-                continue;
-            }
-            let peer_id = &node.node_id;
-            let (peer_start, peer_end) = topology.worker_range(peer_id).unwrap();
-            for src in peer_start..peer_end {
-                for dst in local_start..local_end {
-                    let ch_id = progress_channel_id(src, dst, total_workers);
-                    progress_regs.push(ChannelRegistration {
-                        peer_node_id: peer_id.clone(),
-                        channel_id: ch_id,
-                    });
-                }
-            }
-        }
-
-        let (session, mut receivers) = TransportSession::new(
-            dataflow_id,
-            connections,
-            &data_regs,
-            &progress_regs,
-            capacity,
-            runtime_handle,
-        );
-        let session = Arc::new(session);
-        let transport = Arc::new(
-            crate::communication::cluster_transport::ClusterTransport::Dedicated(
-                Arc::clone(&session),
-            ),
-        );
-
-        // Phase 4: Handshake — exchange fingerprints with all peers.
-        // Extract control receivers from the receivers map.
+        // Create transport and extract receivers based on transport mode.
+        // After this block: `transport`, `receivers`, `control_receivers` are set.
+        // For dedicated mode, `dedicated_session` holds the raw session for handshake/barrier.
+        let transport: Arc<ClusterTransport>;
+        let mut receivers: std::collections::HashMap<
+            String,
+            std::collections::HashMap<u64, tokio::sync::mpsc::Receiver<Vec<u8>>>,
+        >;
         let mut control_receivers: std::collections::HashMap<
             String,
             tokio::sync::mpsc::Receiver<Vec<u8>>,
         > = std::collections::HashMap::new();
-        for (peer_id, peer_map) in receivers.iter_mut() {
-            if let Some(rx) = peer_map.remove(&CONTROL_CHANNEL_ID) {
-                control_receivers.insert(peer_id.clone(), rx);
+        let dedicated_session: Option<Arc<TransportSession>>;
+        // Error receivers from shared mode (for monitoring tasks).
+        let shared_error_receivers: Option<
+            std::collections::HashMap<
+                String,
+                tokio::sync::mpsc::Receiver<crate::communication::transport::TransportError>,
+            >,
+        >;
+
+        match transport_config {
+            ClusterSpawnTransport::Dedicated { connections, capacity } => {
+                // Validate connections match topology.
+                {
+                    let mut expected_peers: std::collections::HashSet<&str> = topology
+                        .nodes
+                        .iter()
+                        .map(|n| n.node_id.as_str())
+                        .filter(|id| *id != local_node_id)
+                        .collect();
+                    for conn in &connections {
+                        if conn.node_id == local_node_id {
+                            return Err(Error::Custom(format!(
+                                "connection to self ('{local_node_id}') is not allowed"
+                            )));
+                        }
+                        if !expected_peers.remove(conn.node_id.as_str()) {
+                            return Err(Error::Custom(format!(
+                                "unexpected or duplicate connection to peer '{}'",
+                                conn.node_id
+                            )));
+                        }
+                    }
+                    if !expected_peers.is_empty() {
+                        let missing: Vec<_> = expected_peers.into_iter().collect();
+                        return Err(Error::Custom(format!(
+                            "missing connections to peers: {:?}",
+                            missing
+                        )));
+                    }
+                }
+
+                // Build channel registrations.
+                let mut data_regs = Vec::new();
+                for (edge_order, &_edge_idx) in exchange_indices.iter().enumerate() {
+                    for node in &topology.nodes {
+                        if node.node_id == local_node_id {
+                            continue;
+                        }
+                        let peer_id = &node.node_id;
+                        let (peer_start, peer_end) = topology.worker_range(peer_id).unwrap();
+                        for src in peer_start..peer_end {
+                            for dst in local_start..local_end {
+                                let channel_id = NetworkEdgeMaterializer::<T, u8>::channel_id(
+                                    edge_order, src, dst, total_workers,
+                                );
+                                data_regs.push(ChannelRegistration {
+                                    peer_node_id: peer_id.clone(),
+                                    channel_id,
+                                });
+                            }
+                        }
+                    }
+                }
+
+                let mut progress_regs = Vec::new();
+                for node in &topology.nodes {
+                    if node.node_id == local_node_id {
+                        continue;
+                    }
+                    let peer_id = &node.node_id;
+                    let (peer_start, peer_end) = topology.worker_range(peer_id).unwrap();
+                    for src in peer_start..peer_end {
+                        for dst in local_start..local_end {
+                            let ch_id = progress_channel_id(src, dst, total_workers);
+                            progress_regs.push(ChannelRegistration {
+                                peer_node_id: peer_id.clone(),
+                                channel_id: ch_id,
+                            });
+                        }
+                    }
+                }
+
+                let (session, mut raw_receivers) = TransportSession::new(
+                    dataflow_id,
+                    connections,
+                    &data_regs,
+                    &progress_regs,
+                    capacity,
+                    runtime_handle,
+                );
+                let session = Arc::new(session);
+                transport = Arc::new(ClusterTransport::Dedicated(Arc::clone(&session)));
+
+                // Extract control receivers.
+                for (peer_id, peer_map) in raw_receivers.iter_mut() {
+                    if let Some(rx) = peer_map.remove(&CONTROL_CHANNEL_ID) {
+                        control_receivers.insert(peer_id.clone(), rx);
+                    }
+                }
+                receivers = raw_receivers;
+                dedicated_session = Some(session);
+                shared_error_receivers = None;
+            }
+
+            ClusterSpawnTransport::Shared { peer_managers, capacity } => {
+                // Validate peer_managers match topology.
+                {
+                    let mut expected_peers: std::collections::HashSet<&str> = topology
+                        .nodes
+                        .iter()
+                        .map(|n| n.node_id.as_str())
+                        .filter(|id| *id != local_node_id)
+                        .collect();
+                    for peer_id in peer_managers.keys() {
+                        if !expected_peers.remove(peer_id.as_str()) {
+                            return Err(Error::Custom(format!(
+                                "unexpected peer_manager for '{peer_id}' not in topology"
+                            )));
+                        }
+                    }
+                    if !expected_peers.is_empty() {
+                        return Err(Error::Custom(format!(
+                            "missing peer_managers for: {:?}",
+                            expected_peers
+                        )));
+                    }
+                }
+
+                // Compute channel IDs to register.
+                let mut all_channel_ids: Vec<u64> = Vec::new();
+                for (edge_order, &_edge_idx) in exchange_indices.iter().enumerate() {
+                    for node in &topology.nodes {
+                        if node.node_id == local_node_id {
+                            continue;
+                        }
+                        let (peer_start, peer_end) =
+                            topology.worker_range(&node.node_id).unwrap();
+                        for src in peer_start..peer_end {
+                            for dst in local_start..local_end {
+                                let ch_id = NetworkEdgeMaterializer::<T, u8>::channel_id(
+                                    edge_order, src, dst, total_workers,
+                                );
+                                all_channel_ids.push(ch_id);
+                            }
+                        }
+                    }
+                }
+                for node in &topology.nodes {
+                    if node.node_id == local_node_id {
+                        continue;
+                    }
+                    let (peer_start, peer_end) = topology.worker_range(&node.node_id).unwrap();
+                    for src in peer_start..peer_end {
+                        for dst in local_start..local_end {
+                            let ch_id = progress_channel_id(src, dst, total_workers);
+                            all_channel_ids.push(ch_id);
+                        }
+                    }
+                }
+
+                // Register with SharedPeerManagers.
+                let mut session = runtime_handle.block_on(
+                    crate::communication::shared_transport::SharedTransportSession::new(
+                        dataflow_id,
+                        peer_managers,
+                        &all_channel_ids,
+                        capacity,
+                    ),
+                );
+
+                let mut raw_receivers = session
+                    .take_receivers()
+                    .ok_or_else(|| Error::Custom("receivers already taken".into()))?;
+                let error_rxs = session.take_error_receivers();
+
+                transport = Arc::new(ClusterTransport::Shared {
+                    session: Arc::new(session),
+                    error_receivers: None,
+                });
+
+                // Extract control receivers.
+                for (peer_id, peer_map) in raw_receivers.iter_mut() {
+                    if let Some(rx) = peer_map.remove(&CONTROL_CHANNEL_ID) {
+                        control_receivers.insert(peer_id.clone(), rx);
+                    }
+                }
+                receivers = raw_receivers;
+                dedicated_session = None;
+                shared_error_receivers = error_rxs;
             }
         }
 
-        runtime_handle
-            .block_on(perform_handshake(
-                &session,
-                &mut control_receivers,
-                fingerprint,
-                dataflow_id,
-                handshake_timeout,
-            ))
-            .map_err(|e| Error::Custom(format!("cluster handshake failed: {e}")))?;
+        // Phase 4: Handshake — exchange fingerprints with all peers.
+        if let Some(ref session) = dedicated_session {
+            runtime_handle
+                .block_on(perform_handshake(
+                    session,
+                    &mut control_receivers,
+                    fingerprint,
+                    dataflow_id,
+                    handshake_timeout,
+                ))
+                .map_err(|e| Error::Custom(format!("cluster handshake failed: {e}")))?;
+        } else {
+            runtime_handle
+                .block_on(perform_handshake_with_transport(
+                    &transport,
+                    &mut control_receivers,
+                    fingerprint,
+                    dataflow_id,
+                    handshake_timeout,
+                ))
+                .map_err(|e| Error::Custom(format!("cluster handshake failed: {e}")))?;
+        }
 
         // Phase 5: Wire exchange channels using network-backed factories.
         // Create wake handles BEFORE exchange wiring so bridge tasks can use them.
@@ -1683,6 +1795,32 @@ impl RuntimeHandle {
         // Convert to tokio_util CancellationToken for bridge tasks.
         let bridge_cancel = tokio_util::sync::CancellationToken::new();
 
+        // Spawn error monitoring tasks for shared transport mode.
+        if let Some(error_rxs) = shared_error_receivers {
+            let df_cancel = dataflow_cancel.as_ref().unwrap().clone();
+            let bc = bridge_cancel.clone();
+            for (peer_id, mut error_rx) in error_rxs {
+                let cancel = df_cancel.clone();
+                let bridge = bc.clone();
+                let peer = peer_id.clone();
+                runtime_handle.spawn(async move {
+                    if let Some(_err) = error_rx.recv().await {
+                        #[cfg(feature = "tracing")]
+                        tracing::error!(
+                            peer = %peer,
+                            "shared transport error received, cancelling dataflow"
+                        );
+                        cancel.cancel_with_reason(
+                            crate::cancellation::CancellationReason::WorkerFailed(
+                                format!("shared transport failure from peer {peer}")
+                            )
+                        );
+                        bridge.cancel();
+                    }
+                });
+            }
+        }
+
         // Create control broadcast for local workers (error propagation + control signals).
         let local_wake_handles: Vec<WakeHandle> = (local_start..local_end)
             .map(|i| wake_handles[i].clone())
@@ -1752,15 +1890,27 @@ impl RuntimeHandle {
         }
 
         // Phase 8: Ready barrier — wait for all peers to finish materialization.
-        runtime_handle
-            .block_on(perform_ready_barrier(
-                &session,
-                &mut control_receivers,
-                local_node_id,
-                dataflow_id,
-                handshake_timeout,
-            ))
-            .map_err(|e| Error::Custom(format!("cluster ready barrier failed: {e}")))?;
+        if let Some(ref session) = dedicated_session {
+            runtime_handle
+                .block_on(perform_ready_barrier(
+                    session,
+                    &mut control_receivers,
+                    local_node_id,
+                    dataflow_id,
+                    handshake_timeout,
+                ))
+                .map_err(|e| Error::Custom(format!("cluster ready barrier failed: {e}")))?;
+        } else {
+            runtime_handle
+                .block_on(perform_ready_barrier_with_transport(
+                    &transport,
+                    &mut control_receivers,
+                    local_node_id,
+                    dataflow_id,
+                    handshake_timeout,
+                ))
+                .map_err(|e| Error::Custom(format!("cluster ready barrier failed: {e}")))?;
+        }
 
         // Phase 9: Register all workers for execution.
         // Track each worker as an active dataflow for wait_idle()/shutdown_async().

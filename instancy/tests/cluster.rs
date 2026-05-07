@@ -11,6 +11,7 @@ use instancy::DataflowBuilder;
 use instancy::DataflowId;
 use instancy::Result;
 use instancy::communication::transport_session::PeerConnection;
+use instancy::communication::ClusterSpawnTransport;
 use instancy::{ClusterTopology, NodeConfig};
 use instancy::{RuntimeConfig, RuntimeHandle};
 
@@ -87,8 +88,7 @@ async fn cluster_two_nodes_no_exchange() {
             topo_a,
             "node-a",
             dataflow_id,
-            vec![conn_a],
-            1024,
+            ClusterSpawnTransport::dedicated(vec![conn_a], 1024),
             Duration::from_secs(5),
             build,
             &th_a,
@@ -102,8 +102,7 @@ async fn cluster_two_nodes_no_exchange() {
             topo_b,
             "node-b",
             dataflow_id,
-            vec![conn_b],
-            1024,
+            ClusterSpawnTransport::dedicated(vec![conn_b], 1024),
             Duration::from_secs(5),
             build,
             &th_b,
@@ -202,8 +201,7 @@ async fn cluster_two_nodes_with_exchange() {
             topo_a,
             "node-a",
             dataflow_id,
-            vec![conn_a],
-            1024,
+            ClusterSpawnTransport::dedicated(vec![conn_a], 1024),
             Duration::from_secs(5),
             build,
             &th_a,
@@ -217,8 +215,7 @@ async fn cluster_two_nodes_with_exchange() {
             topo_b,
             "node-b",
             dataflow_id,
-            vec![conn_b],
-            1024,
+            ClusterSpawnTransport::dedicated(vec![conn_b], 1024),
             Duration::from_secs(5),
             build,
             &th_b,
@@ -317,8 +314,7 @@ async fn cluster_fingerprint_mismatch() {
             topo_a,
             "node-a",
             dataflow_id,
-            vec![conn_a],
-            1024,
+            ClusterSpawnTransport::dedicated(vec![conn_a], 1024),
             Duration::from_secs(5),
             build_a,
             &th_a,
@@ -331,8 +327,7 @@ async fn cluster_fingerprint_mismatch() {
             topo_b,
             "node-b",
             dataflow_id,
-            vec![conn_b],
-            1024,
+            ClusterSpawnTransport::dedicated(vec![conn_b], 1024),
             Duration::from_secs(5),
             build_b,
             &th_b,
@@ -390,8 +385,7 @@ async fn cluster_missing_connection() {
         topology,
         "node-a",
         DataflowId::new(),
-        vec![conn_a],
-        1024,
+        ClusterSpawnTransport::dedicated(vec![conn_a], 1024),
         Duration::from_secs(1),
         |_, builder: &mut DataflowBuilder<u64>| {
             builder.input::<i32>("data").output("out");
