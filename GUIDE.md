@@ -351,6 +351,18 @@ stream.filter("even_only", |_time, x| x % 2 == 0);
 
 Unlike `map`, the predicate receives a reference (`&x`), since filter doesn't transform the data.
 
+#### Take / Take While
+
+Limit the number of elements or stop at a condition:
+
+```rust
+// Keep only the first 100 elements (across all timestamps)
+stream.take("first_100", 100);
+
+// Keep elements while a condition holds; stop permanently after first failure
+stream.take_while("positive", |_time, x| *x > 0);
+```
+
 #### Flat Map
 
 Transform each element into zero or more elements:
@@ -389,6 +401,44 @@ let odds = stream.filter("odds", |_t, x| x % 2 != 0);
 
 `clone()` creates a fan-out point — data is duplicated to all downstream consumers. Each branch can then apply its own operators independently.
 
+#### Branch by Predicate
+
+Split a stream into two outputs based on a predicate:
+
+```rust
+let (evens, odds) = stream.branch("parity", |_time, x| x % 2 == 0);
+evens.map("half", |_t, x| x / 2).output("halved");
+odds.output("odd_numbers");
+```
+
+Items where the predicate returns `true` go to the first output; `false` items go to the second.
+
+> **Note:** The predicate is evaluated **twice per item** (once for each branch). Use pure, side-effect-free predicates. For stateful logic, use `clone()` + `filter()` instead.
+
+#### Branch by Result
+
+Split a `Result` stream into `Ok` and `Err` branches:
+
+```rust
+let results: Pipe<u64, Result<i64, String>> = input.map("parse", |_t, s| s.parse::<i64>());
+let (ok_values, errors) = results.branch_result("split");
+ok_values.output("parsed");
+errors.for_each("log_errors", |_t, e| eprintln!("parse error: {e}"));
+```
+
+#### Map Batch
+
+Transform an entire batch at once, useful when batch-level context matters:
+
+```rust
+stream.map_batch("sort_batch", |_time, mut batch| {
+    batch.sort();
+    batch
+});
+```
+
+The closure receives the timestamp and the full `Vec<D>`, returning a new `Vec<D2>`. This is more efficient than per-item `map` when the transformation benefits from seeing all items together (sorting, dedup, windowed aggregations).
+
 #### Inspect — Observing Data
 
 `inspect` and `inspect_batch` are **pass-through** operators: they let you
@@ -426,6 +476,54 @@ input
 `catch_unwind` and converts it to `Error::OperatorPanic`, failing the
 dataflow gracefully. For recoverable errors, handle them inside the
 closure (e.g., log and continue, or accumulate into a shared error list).
+
+#### Aggregation Operators
+
+Aggregation operators collect all data for a given timestamp and emit a
+summary once the timestamp is complete (frontier advances past it). They
+use the notification mechanism internally.
+
+**Reduce** — combine all elements into one:
+
+```rust
+// Sum all values per timestamp
+stream.reduce("sum", |acc, x| acc + x).output("totals");
+```
+
+The closure takes two values and returns their combination. Works like
+`Iterator::reduce` — if a timestamp has no data, nothing is emitted.
+
+**Fold** — aggregate with an initial value and a different output type:
+
+```rust
+// Count elements per timestamp
+stream.fold("count", 0usize, |acc, _x| acc + 1).output("counts");
+
+// Collect into a sorted Vec
+stream.fold("collect", Vec::new(), |mut acc, x| {
+    acc.push(x);
+    acc
+}).output("collected");
+```
+
+Unlike `reduce`, `fold` always emits a value (even for empty timestamps)
+and can change the output type.
+
+**Distinct** — deduplicate elements per timestamp:
+
+```rust
+stream.distinct("dedup").output("unique");
+```
+
+Requires `D: Eq + Hash`. Emits each unique value once per timestamp.
+
+**Count** — count elements per timestamp:
+
+```rust
+stream.count("count").output("counts");  // Pipe<T, usize>
+```
+
+Convenience wrapper around `fold` that returns the element count.
 
 #### Inspect vs Probe — Key Difference
 
@@ -926,6 +1024,51 @@ stream.exchange("route", |x: &MyType| x.key.clone());
 
 If your operators are stateless (like `map` or `filter`), you don't need exchange — any worker can process any element.
 
+### Distribution Operators
+
+Beyond `exchange`, instancy provides three convenience distribution operators
+for common routing patterns:
+
+#### Gather
+
+Route **all** data to worker 0. Useful for global aggregation:
+
+```rust
+stream
+    .exchange_by_hash("partition", |x| x.key)
+    .gather("collect")
+    .reduce("global_sum", |acc, x| acc + x)
+    .output("total");
+```
+
+After `gather`, only worker 0 has data — other workers receive nothing.
+
+#### Rebalance
+
+Distribute data round-robin across all workers. Useful for evening out load
+when key-based partitioning isn't needed:
+
+```rust
+// All items from worker 0 get spread evenly across all workers
+stream.rebalance("spread").output("results");
+```
+
+Unlike `exchange`, `rebalance` doesn't look at the data — it assigns workers
+sequentially (item 0 → worker 0, item 1 → worker 1, ..., wrapping around).
+
+#### Rebalance To
+
+Like `rebalance`, but with explicit target parallelism:
+
+```rust
+// Round-robin to exactly 4 workers
+stream.rebalance_to("spread", 4).output("results");
+```
+
+> **Current limitation:** `rebalance_to(N)` requires `N` to equal the spawned
+> worker count. Per-stage parallelism (different `N` per stage) is not yet
+> implemented.
+
 ### Cross-Worker Error Propagation
 
 In multi-worker dataflows, if one worker's operator fails, all sibling workers
@@ -1312,6 +1455,43 @@ impl ExchangeData for MyRecord {
     }
 }
 ```
+
+---
+
+## Operator Quick Reference
+
+| Category | Operator | Signature | Description |
+|----------|----------|-----------|-------------|
+| **Transform** | `map` | `\|&T, D\| -> D2` | Transform each element |
+| | `flat_map` | `\|&T, D\| -> Vec<D2>` | One-to-many transform |
+| | `map_batch` | `\|&T, Vec<D>\| -> Vec<D2>` | Batch-level transform |
+| **Filter** | `filter` | `\|&T, &D\| -> bool` | Keep matching elements |
+| | `take` | `(name, n)` | Keep first N elements |
+| | `take_while` | `\|&T, &D\| -> bool` | Keep while condition holds |
+| **Branch** | `branch` | `\|&T, &D\| -> bool` → `(Pipe, Pipe)` | Split by predicate |
+| | `branch_result` | `Pipe<T, Result<V,E>>` → `(Pipe<T,V>, Pipe<T,E>)` | Split Ok/Err |
+| | `clone()` | | Fan-out to multiple consumers |
+| **Observe** | `inspect` | `\|&T, &D\|` | Pass-through data observation |
+| | `inspect_batch` | `\|&T, &[D]\|` | Pass-through batch observation |
+| **Terminal** | `for_each` | `\|&T, D\|` | Consume stream (side-effects) |
+| | `for_each_batch` | `\|&T, Vec<D>\|` | Consume batches |
+| | `output` | `(name)` | Named output port |
+| | `collect` | | Collect into `OutputReceiver` |
+| **Aggregation** | `reduce` | `\|D, D\| -> D` | Combine per timestamp |
+| | `fold` | `(init, \|D2, D\| -> D2)` | Fold with initial value |
+| | `distinct` | | Deduplicate per timestamp |
+| | `count` | | Count per timestamp → `usize` |
+| **Distribution** | `exchange` | `\|&D\| -> K` | Hash-based routing |
+| | `exchange_by_hash` | `\|&D\| -> u64` | Direct hash routing |
+| | `gather` | | All data → worker 0 |
+| | `rebalance` | | Round-robin across workers |
+| | `rebalance_to` | `(name, N)` | Round-robin to N workers |
+| **Progress** | `probe` | → `(Pipe, ProbeHandle)` | Track frontier progress |
+| **Loop** | `iterate` | `(\|Pipe\| -> Pipe, step)` | Feedback loop |
+| **Merge** | `merge` | `(other_pipe)` | Merge two streams |
+| | `concat` | `(vec_of_pipes)` | Merge multiple streams |
+| **Custom** | `unary` | `\|&T, Vec<D>\| -> Vec<D2>` | Custom single-input operator |
+| | `unary_notify` | `(NotifyContext)` | Frontier-aware custom operator |
 
 ---
 
