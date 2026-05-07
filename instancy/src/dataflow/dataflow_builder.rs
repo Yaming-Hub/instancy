@@ -2886,6 +2886,29 @@ impl<
             counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
         })
     }
+
+    /// Distribute data round-robin with explicit downstream parallelism.
+    ///
+    /// Like [`rebalance`](Self::rebalance), but specifies the target stage's
+    /// worker count. Use when you want to scale up or down the number of
+    /// workers processing subsequent operators.
+    ///
+    /// # Panics
+    /// Panics if `target_parallelism` is 0.
+    ///
+    /// # Example
+    /// ```ignore
+    /// let scaled = stream
+    ///     .rebalance_to("fan-out", 8)
+    ///     .map("process", |_t, x| expensive_computation(x));
+    /// ```
+    pub fn rebalance_to(self, name: impl Into<String>, target_parallelism: usize) -> Pipe<T, D> {
+        assert!(target_parallelism > 0, "target_parallelism must be > 0");
+        let counter = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+        self.exchange_by_hash_to(name, target_parallelism, move |_| {
+            counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        })
+    }
 }
 
 /// Exchange methods for non-transport builds (local-only exchange).
@@ -3011,6 +3034,29 @@ impl<T: Timestamp, D: Clone + Send + 'static> Pipe<T, D> {
     pub fn rebalance(self, name: impl Into<String>) -> Pipe<T, D> {
         let counter = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
         self.exchange_by_hash(name, move |_| {
+            counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        })
+    }
+
+    /// Distribute data round-robin with explicit downstream parallelism.
+    ///
+    /// Like [`rebalance`](Self::rebalance), but specifies the target stage's
+    /// worker count. Use when you want to scale up or down the number of
+    /// workers processing subsequent operators.
+    ///
+    /// # Panics
+    /// Panics if `target_parallelism` is 0.
+    ///
+    /// # Example
+    /// ```ignore
+    /// let scaled = stream
+    ///     .rebalance_to("fan-out", 8)
+    ///     .map("process", |_t, x| expensive_computation(x));
+    /// ```
+    pub fn rebalance_to(self, name: impl Into<String>, target_parallelism: usize) -> Pipe<T, D> {
+        assert!(target_parallelism > 0, "target_parallelism must be > 0");
+        let counter = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+        self.exchange_by_hash_to(name, target_parallelism, move |_| {
             counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
         })
     }
@@ -5922,5 +5968,31 @@ mod tests {
         let r = c.lock().unwrap();
         let results: Vec<i32> = r.iter().flat_map(|(_, d)| d.clone()).collect();
         assert_eq!(results, vec![1, 2, 10, 20]);
+    }
+
+    #[test]
+    fn test_rebalance_to_passes_all_data() {
+        // rebalance_to with explicit parallelism preserves all data.
+        let builder = DataflowBuilder::<u64>::new("rebalance_to_test");
+        let port = builder
+            .source("nums", vec![(0u64, vec![1i32, 2, 3, 4])])
+            .rebalance_to("fan-out", 4)
+            .output("results");
+        let dataflow = builder.build().unwrap();
+        rt().run(dataflow).unwrap();
+
+        let c = port.collector();
+        let r = c.lock().unwrap();
+        let results: Vec<i32> = r.iter().flat_map(|(_, d)| d.clone()).collect();
+        assert_eq!(results, vec![1, 2, 3, 4]);
+    }
+
+    #[test]
+    #[should_panic(expected = "target_parallelism must be > 0")]
+    fn test_rebalance_to_zero_panics() {
+        let builder = DataflowBuilder::<u64>::new("rebalance_to_zero");
+        builder
+            .source("nums", vec![(0u64, vec![1i32])])
+            .rebalance_to("bad", 0);
     }
 }
