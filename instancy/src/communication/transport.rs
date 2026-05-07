@@ -70,6 +70,14 @@ pub enum TransportError {
     /// The muxer received a shutdown signal.
     #[error("muxer shut down")]
     MuxerShutdown,
+
+    /// A reorder buffer gap exceeded the configured timeout.
+    ///
+    /// This indicates that one or more sequenced frames were lost in transit
+    /// (e.g., due to a connection failure mid-write). The affected dataflow
+    /// cannot continue receiving ordered data from this peer.
+    #[error("reorder buffer gap timeout")]
+    ReorderTimeout,
 }
 
 // ─── Feature-gated implementations using tokio ───────────────────────────────
