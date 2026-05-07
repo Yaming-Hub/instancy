@@ -66,6 +66,7 @@ pub mod worker_pool;
 
 // Dataflow construction
 pub use dataflow::dataflow_builder::IterateResult;
+pub use dataflow::graph::DataflowGraph;
 pub use dataflow::id::DataflowId;
 pub use dataflow::stream::StreamEdge;
 pub use dataflow::{AsyncInputSender, AsyncOutputReceiver};
@@ -80,6 +81,8 @@ pub use runtime::{
     DataflowCompletion, IoMode, MultiDataflowCompletion, MultiSpawnedDataflow, RuntimeConfig,
     RuntimeHandle, SpawnOptions, SpawnedDataflow, TokioMode,
 };
+#[cfg(feature = "transport")]
+pub use runtime::ClusterCompletion;
 #[cfg(feature = "test-utils")]
 pub use runtime::SimpleRuntime;
 

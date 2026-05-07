@@ -556,6 +556,119 @@ impl DataflowGraph {
 
         Ok(())
     }
+
+    // -- Visualization --
+
+    /// Export the graph in Graphviz DOT format.
+    ///
+    /// Produces a directed graph where each operator is a node (labeled with
+    /// its name and stage) and edges show data flow between operators.
+    /// Exchange edges are rendered as dashed lines to distinguish them from
+    /// pipeline (worker-local) edges. Feedback edges are drawn in red.
+    ///
+    /// Nodes are grouped into subgraphs by stage for visual clarity.
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// let graph = builder.build()?.graph().clone();
+    /// std::fs::write("dataflow.dot", graph.to_dot()).unwrap();
+    /// // Then: dot -Tpng dataflow.dot -o dataflow.png
+    /// ```
+    pub fn to_dot(&self) -> String {
+        self.to_dot_named("dataflow")
+    }
+
+    /// Export the graph in Graphviz DOT format with a custom graph name.
+    pub fn to_dot_named(&self, name: &str) -> String {
+        use std::fmt::Write;
+
+        let mut out = String::new();
+        writeln!(out, "digraph \"{}\" {{", dot_escape(name)).unwrap();
+        writeln!(out, "    rankdir=TB;").unwrap();
+        writeln!(out, "    node [shape=box, style=rounded, fontname=\"Helvetica\"];").unwrap();
+        writeln!(out, "    edge [fontname=\"Helvetica\", fontsize=10];").unwrap();
+        writeln!(out).unwrap();
+
+        // Group operators by stage.
+        let mut stages: HashMap<StageId, Vec<&OperatorInfo>> = HashMap::new();
+        for op in self.operators.values() {
+            stages.entry(op.stage_id).or_default().push(op);
+        }
+
+        // Sort stages by ID for deterministic output.
+        let mut stage_ids: Vec<StageId> = stages.keys().copied().collect();
+        stage_ids.sort_by_key(|s| s.0);
+
+        for stage_id in &stage_ids {
+            let ops = stages.get(stage_id).unwrap();
+            let mut sorted_ops: Vec<&&OperatorInfo> = ops.iter().collect();
+            sorted_ops.sort_by_key(|op| op.index);
+
+            writeln!(out, "    subgraph cluster_stage_{} {{", stage_id.0).unwrap();
+            writeln!(out, "        label=\"Stage {}\";", stage_id.0).unwrap();
+            writeln!(out, "        style=dashed;").unwrap();
+            writeln!(out, "        color=gray;").unwrap();
+
+            for op in sorted_ops {
+                writeln!(
+                    out,
+                    "        op_{} [label=\"{}\\n[{}]\"];",
+                    op.index,
+                    dot_escape(&op.name),
+                    op.index,
+                )
+                .unwrap();
+            }
+            writeln!(out, "    }}").unwrap();
+            writeln!(out).unwrap();
+        }
+
+        // Regular edges.
+        for edge in &self.edges {
+            let style = if edge.is_exchange() {
+                " [style=dashed, label=\"exchange\"]"
+            } else {
+                ""
+            };
+            writeln!(
+                out,
+                "    op_{} -> op_{}{};",
+                edge.source.operator_index, edge.target.operator_index, style
+            )
+            .unwrap();
+        }
+
+        // Feedback edges.
+        for edge in &self.feedback_edges {
+            writeln!(
+                out,
+                "    op_{} -> op_{} [style=bold, color=red, label=\"feedback\"];",
+                edge.source.operator_index, edge.target.operator_index
+            )
+            .unwrap();
+        }
+
+        writeln!(out, "}}").unwrap();
+        out
+    }
+}
+
+/// Escape a string for use inside DOT double-quoted strings.
+///
+/// Replaces `\` with `\\`, `"` with `\"`, and newlines with `\n`.
+fn dot_escape(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for c in s.chars() {
+        match c {
+            '\\' => out.push_str("\\\\"),
+            '"' => out.push_str("\\\""),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            _ => out.push(c),
+        }
+    }
+    out
 }
 
 impl Default for DataflowGraph {
@@ -1099,5 +1212,92 @@ mod tests {
             .unwrap();
         graph.add_feedback_edge(EdgeInfo::exchange(Slot::new(0, 0), Slot::new(0, 0), r, r));
         assert!(graph.has_exchange_edges());
+    }
+
+    // -- DOT export --
+
+    #[test]
+    fn to_dot_simple_pipeline() {
+        let r = make_stage();
+        let mut graph = DataflowGraph::new();
+        graph.register_operator(OperatorInfo::new(0, "source", r, 0, 1)).unwrap();
+        graph.register_operator(OperatorInfo::new(1, "map", r, 1, 1)).unwrap();
+        graph.register_operator(OperatorInfo::new(2, "sink", r, 1, 0)).unwrap();
+        graph.add_edge(EdgeInfo::new(Slot::new(0, 0), Slot::new(1, 0), r, r));
+        graph.add_edge(EdgeInfo::new(Slot::new(1, 0), Slot::new(2, 0), r, r));
+
+        let dot = graph.to_dot();
+        assert!(dot.starts_with("digraph \"dataflow\" {"));
+        assert!(dot.contains("op_0 [label=\"source\\n[0]\"]"));
+        assert!(dot.contains("op_1 [label=\"map\\n[1]\"]"));
+        assert!(dot.contains("op_2 [label=\"sink\\n[2]\"]"));
+        assert!(dot.contains("op_0 -> op_1;"));
+        assert!(dot.contains("op_1 -> op_2;"));
+        assert!(dot.contains("cluster_stage_0"));
+        assert!(!dot.contains("exchange"));
+    }
+
+    #[test]
+    fn to_dot_with_exchange_edge() {
+        let s0 = StageId::new(0);
+        let s1 = StageId::new(1);
+        let mut graph = DataflowGraph::new();
+        graph.register_operator(OperatorInfo::new(0, "parse", s0, 0, 1)).unwrap();
+        graph.register_operator(OperatorInfo::new(1, "aggregate", s1, 1, 0)).unwrap();
+        graph.add_edge(EdgeInfo::exchange(Slot::new(0, 0), Slot::new(1, 0), s0, s1));
+
+        let dot = graph.to_dot();
+        assert!(dot.contains("cluster_stage_0"));
+        assert!(dot.contains("cluster_stage_1"));
+        assert!(dot.contains("style=dashed, label=\"exchange\""));
+        assert!(dot.contains("op_0 -> op_1"));
+    }
+
+    #[test]
+    fn to_dot_with_feedback_edge() {
+        let r = make_stage();
+        let mut graph = DataflowGraph::new();
+        graph.register_operator(OperatorInfo::new(0, "iterate", r, 1, 1)).unwrap();
+        graph.add_feedback_edge(EdgeInfo::new(Slot::new(0, 0), Slot::new(0, 0), r, r));
+
+        let dot = graph.to_dot();
+        assert!(dot.contains("color=red"));
+        assert!(dot.contains("label=\"feedback\""));
+    }
+
+    #[test]
+    fn to_dot_named_custom_name() {
+        let r = make_stage();
+        let mut graph = DataflowGraph::new();
+        graph.register_operator(OperatorInfo::new(0, "op", r, 0, 0)).unwrap();
+
+        let dot = graph.to_dot_named("my_pipeline");
+        assert!(dot.starts_with("digraph \"my_pipeline\" {"));
+    }
+
+    #[test]
+    fn to_dot_empty_graph() {
+        let graph = DataflowGraph::new();
+        let dot = graph.to_dot();
+        assert!(dot.contains("digraph \"dataflow\" {"));
+        assert!(dot.contains("}"));
+        // No operators or edges
+        assert!(!dot.contains("op_"));
+        assert!(!dot.contains("->"));
+    }
+
+    #[test]
+    fn to_dot_escapes_special_characters() {
+        let r = make_stage();
+        let mut graph = DataflowGraph::new();
+        graph
+            .register_operator(OperatorInfo::new(0, "op with \"quotes\"", r, 0, 0))
+            .unwrap();
+
+        let dot = graph.to_dot_named("my \"pipeline\"");
+        assert!(dot.contains(r#"digraph "my \"pipeline\""#));
+        assert!(dot.contains(r#"op with \"quotes\""#));
+        // Must not have unescaped quotes that break DOT syntax
+        assert!(!dot.contains("op with \"quotes\"\\n"));
     }
 }
