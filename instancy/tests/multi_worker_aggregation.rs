@@ -483,3 +483,78 @@ async fn multi_worker_reduce_then_filter() {
     // At least epoch 1 should produce results (50+60=110 or individual worker sums)
     assert!(!results.is_empty(), "should have at least one result > 10");
 }
+
+// =============================================================================
+// gather() and rebalance() tests
+// =============================================================================
+
+/// Multi-worker gather: all data routes to worker 0, producing a single reduce result.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn multi_worker_gather_then_reduce() {
+    let results = run_multi_worker_aggregation::<i64, _>(
+        "mw-gather-reduce",
+        3,
+        |builder| {
+            let input = builder.input::<i64>("data");
+            let global_sum = input
+                .gather("collect-all")
+                .reduce("global-sum", |acc, x| acc + x);
+            global_sum.output("results");
+        },
+        vec![
+            (0, vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10]),
+        ],
+    )
+    .await;
+
+    // Gather sends everything to worker 0, so reduce produces exactly one result
+    assert_eq!(results, vec![55], "gather → reduce should produce single sum 55");
+}
+
+/// Multi-worker rebalance: data is evenly distributed, all items processed.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn multi_worker_rebalance_preserves_all() {
+    let results = run_multi_worker_aggregation::<i64, _>(
+        "mw-rebalance",
+        3,
+        |builder| {
+            let input = builder.input::<i64>("data");
+            let processed = input
+                .rebalance("spread")
+                .map("double", |_t, x| x * 2);
+            processed.output("results");
+        },
+        vec![
+            (0, vec![1, 2, 3, 4, 5, 6, 7, 8, 9]),
+        ],
+    )
+    .await;
+
+    // All items should be present (doubled)
+    assert_eq!(results, vec![2, 4, 6, 8, 10, 12, 14, 16, 18]);
+}
+
+/// Multi-worker rebalance → fold: each worker folds its portion.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn multi_worker_rebalance_then_fold() {
+    let results = run_multi_worker_aggregation::<i64, _>(
+        "mw-rebalance-fold",
+        2,
+        |builder| {
+            let input = builder.input::<i64>("data");
+            let sums = input
+                .rebalance("spread")
+                .fold("sum", 0i64, |acc, x| acc + x);
+            sums.output("results");
+        },
+        vec![
+            (0, vec![1, 2, 3, 4, 5, 6]),
+        ],
+    )
+    .await;
+
+    // Sum of per-worker folds should equal total sum
+    let total: i64 = results.iter().sum();
+    assert_eq!(total, 21, "rebalance → fold total should be 21, got {total}");
+}
+
