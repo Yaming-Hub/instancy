@@ -1130,6 +1130,98 @@ impl<T: Timestamp, D: Clone + Send + 'static> Pipe<T, D> {
         state.channel_factories.push((edge_idx, chan_factory));
     }
 
+    /// Reduce all elements at each timestamp to a single value.
+    ///
+    /// Buffers incoming data until a timestamp is complete (the input frontier
+    /// advances past it), then applies the reducer to produce one output value
+    /// per timestamp. This is the dataflow equivalent of `Iterator::reduce`.
+    ///
+    /// Returns `Pipe<T, D>` — the output stream contains at most one element
+    /// per timestamp. If no data arrives for a timestamp, nothing is emitted.
+    ///
+    /// # When to use
+    ///
+    /// Use `reduce` after `exchange` in multi-worker dataflows so that each
+    /// worker's subset is fully collected before reduction. Without exchange,
+    /// each worker reduces only its local partition.
+    ///
+    /// # Example
+    /// ```ignore
+    /// // Sum all values per timestamp
+    /// let sums = input.reduce("sum", |a, b| a + b);
+    /// ```
+    pub fn reduce<F>(mut self, name: impl Into<String>, mut reducer: F) -> Pipe<T, D>
+    where
+        F: FnMut(D, D) -> D + Send + 'static,
+    {
+        let capacity = self.resolve_capacity();
+        let mut stash: std::collections::BTreeMap<T, Vec<D>> = std::collections::BTreeMap::new();
+        self.add_unary_notify_internal(
+            name,
+            capacity,
+            move |input, output, ctx| {
+                while let Some((time, data)) = input.next() {
+                    stash.entry(time.clone()).or_default().extend(data);
+                    ctx.notify_at(time);
+                }
+                while let Some(time) = ctx.next_notification() {
+                    if let Some(data) = stash.remove(&time) {
+                        let reduced = data.into_iter().reduce(&mut reducer);
+                        if let Some(value) = reduced {
+                            output.push_vec(time, vec![value]);
+                        }
+                    }
+                }
+                Ok(())
+            },
+        )
+    }
+
+    /// Fold all elements at each timestamp into an accumulator.
+    ///
+    /// Like [`reduce`](Self::reduce), but starts with an initial value and
+    /// can change the output type. Buffers data until a timestamp is complete,
+    /// then folds left-to-right. Emits one value per timestamp that had data.
+    /// If no data arrives for a timestamp, nothing is emitted (same as `reduce`).
+    ///
+    /// # Example
+    /// ```ignore
+    /// // Count elements per timestamp
+    /// let counts = input.fold("count", 0usize, |acc, _item| acc + 1);
+    ///
+    /// // Collect into a sorted vec
+    /// let sorted = input.fold("sort", Vec::new(), |mut v, x| { v.push(x); v.sort(); v });
+    /// ```
+    pub fn fold<D2, F>(
+        mut self,
+        name: impl Into<String>,
+        init: D2,
+        mut folder: F,
+    ) -> Pipe<T, D2>
+    where
+        D2: Clone + Send + 'static,
+        F: FnMut(D2, D) -> D2 + Send + 'static,
+    {
+        let capacity = self.resolve_capacity();
+        let mut stash: std::collections::BTreeMap<T, Vec<D>> = std::collections::BTreeMap::new();
+        self.add_unary_notify_internal(
+            name,
+            capacity,
+            move |input, output, ctx| {
+                while let Some((time, data)) = input.next() {
+                    stash.entry(time.clone()).or_default().extend(data);
+                    ctx.notify_at(time);
+                }
+                while let Some(time) = ctx.next_notification() {
+                    let data = stash.remove(&time).unwrap_or_default();
+                    let result = data.into_iter().fold(init.clone(), &mut folder);
+                    output.push_vec(time, vec![result]);
+                }
+                Ok(())
+            },
+        )
+    }
+
     /// Pass through the first `count` elements, then stop.
     ///
     /// This is the dataflow equivalent of SQL `LIMIT`. After emitting `count`
@@ -5350,5 +5442,125 @@ mod tests {
         rt().run(dataflow).unwrap();
 
         assert_eq!(*seen.lock().unwrap(), vec![2, 4, 6]);
+    }
+
+    #[test]
+    fn test_reduce_sums_per_timestamp() {
+        let builder = DataflowBuilder::<u64>::new("reduce_sum");
+        let port = builder
+            .source(
+                "nums",
+                vec![
+                    (0u64, vec![1i32, 2, 3]),
+                    (1u64, vec![10i32, 20]),
+                ],
+            )
+            .reduce("sum", |a, b| a + b)
+            .output("results");
+        let dataflow = builder.build().unwrap();
+        rt().run(dataflow).unwrap();
+
+        let c = port.collector();
+        let r = c.lock().unwrap();
+        let mut results: Vec<(u64, i32)> = r
+            .iter()
+            .flat_map(|(t, d)| d.iter().map(move |v| (*t, *v)))
+            .collect();
+        results.sort();
+        assert_eq!(results, vec![(0, 6), (1, 30)]);
+    }
+
+    #[test]
+    fn test_reduce_single_element() {
+        let builder = DataflowBuilder::<u64>::new("reduce_single");
+        let port = builder
+            .source("nums", vec![(0u64, vec![42i32])])
+            .reduce("id", |a, b| a + b)
+            .output("results");
+        let dataflow = builder.build().unwrap();
+        rt().run(dataflow).unwrap();
+
+        let c = port.collector();
+        let r = c.lock().unwrap();
+        assert_eq!(r[0].1, vec![42]);
+    }
+
+    #[test]
+    fn test_reduce_empty_input() {
+        let builder = DataflowBuilder::<u64>::new("reduce_empty");
+        let port = builder
+            .source::<i32>("nums", vec![])
+            .reduce("sum", |a, b| a + b)
+            .output("results");
+        let dataflow = builder.build().unwrap();
+        rt().run(dataflow).unwrap();
+
+        let c = port.collector();
+        let r = c.lock().unwrap();
+        let total: usize = r.iter().map(|(_, d)| d.len()).sum();
+        assert_eq!(total, 0);
+    }
+
+    #[test]
+    fn test_fold_count_elements() {
+        let builder = DataflowBuilder::<u64>::new("fold_count");
+        let port = builder
+            .source(
+                "nums",
+                vec![
+                    (0u64, vec![10i32, 20, 30]),
+                    (1u64, vec![40i32, 50]),
+                ],
+            )
+            .fold("count", 0usize, |acc, _item| acc + 1)
+            .output("results");
+        let dataflow = builder.build().unwrap();
+        rt().run(dataflow).unwrap();
+
+        let c = port.collector();
+        let r = c.lock().unwrap();
+        let mut results: Vec<(u64, usize)> = r
+            .iter()
+            .flat_map(|(t, d)| d.iter().map(move |v| (*t, *v)))
+            .collect();
+        results.sort();
+        assert_eq!(results, vec![(0, 3), (1, 2)]);
+    }
+
+    #[test]
+    fn test_fold_changes_type() {
+        let builder = DataflowBuilder::<u64>::new("fold_to_string");
+        let port = builder
+            .source("nums", vec![(0u64, vec![1i32, 2, 3])])
+            .fold("join", String::new(), |mut acc, x| {
+                if !acc.is_empty() {
+                    acc.push(',');
+                }
+                acc.push_str(&x.to_string());
+                acc
+            })
+            .output("results");
+        let dataflow = builder.build().unwrap();
+        rt().run(dataflow).unwrap();
+
+        let c = port.collector();
+        let r = c.lock().unwrap();
+        assert_eq!(r[0].1, vec!["1,2,3"]);
+    }
+
+    #[test]
+    fn test_reduce_then_map() {
+        let builder = DataflowBuilder::<u64>::new("reduce_then_map");
+        let port = builder
+            .source("nums", vec![(0u64, vec![1i32, 2, 3, 4])])
+            .reduce("sum", |a, b| a + b)
+            .map("negate", |_t, x| -x)
+            .output("results");
+        let dataflow = builder.build().unwrap();
+        rt().run(dataflow).unwrap();
+
+        let c = port.collector();
+        let r = c.lock().unwrap();
+        assert_eq!(r[0].1, vec![-10]);
     }
 }
