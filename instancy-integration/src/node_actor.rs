@@ -15,6 +15,7 @@ use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::Mutex;
 
 use instancy::communication::transport_session::PeerConnection;
+use instancy::communication::ClusterSpawnTransport;
 use instancy::dataflow::id::DataflowId;
 use instancy::runtime::{RuntimeConfig, RuntimeHandle};
 use instancy::{ClusterTopology, NodeConfig};
@@ -390,8 +391,7 @@ impl DataflowAgent {
                 topology,
                 &node_id,
                 df_id,
-                connections,
-                64,
+                ClusterSpawnTransport::dedicated(connections, 64),
                 Duration::from_secs(15),
                 move |worker_idx, builder| {
                     let (_inputs, _output) =

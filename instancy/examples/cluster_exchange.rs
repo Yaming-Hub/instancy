@@ -10,6 +10,7 @@
 use std::time::Duration;
 
 use instancy::communication::transport_session::PeerConnection;
+use instancy::communication::ClusterSpawnTransport;
 use instancy::{
     ClusterTopology, DataflowBuilder, DataflowId, NodeConfig, Result, RuntimeConfig, RuntimeHandle,
 };
@@ -71,8 +72,7 @@ fn spawn_node(
             topology,
             &node_id,
             dataflow_id,
-            vec![connection],
-            1024,
+            ClusterSpawnTransport::dedicated(vec![connection], 1024),
             Duration::from_secs(5),
             build_dataflow,
             &tokio_handle,

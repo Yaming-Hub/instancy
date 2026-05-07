@@ -28,6 +28,7 @@ use instancy::DataflowBuilder;
 use instancy::DataflowId;
 use instancy::Result;
 use instancy::communication::transport_session::PeerConnection;
+use instancy::communication::ClusterSpawnTransport;
 use instancy::{ClusterTopology, NodeConfig};
 use instancy::{RuntimeConfig, RuntimeHandle};
 
@@ -140,8 +141,7 @@ async fn parallel_tcp_dataflows_shared_pool() {
                 topology.clone(),
                 "node-a",
                 dataflow_ids[i],
-                vec![conns_a.remove(0)],
-                1024,
+                ClusterSpawnTransport::dedicated(vec![conns_a.remove(0)], 1024),
                 Duration::from_secs(30),
                 build_df(i),
                 &tokio_handle,
@@ -165,8 +165,7 @@ async fn parallel_tcp_dataflows_shared_pool() {
                 topology2.clone(),
                 "node-b",
                 dataflow_ids2[i],
-                vec![conns_b.remove(0)],
-                1024,
+                ClusterSpawnTransport::dedicated(vec![conns_b.remove(0)], 1024),
                 Duration::from_secs(30),
                 build_df(i),
                 &tokio_handle2,
@@ -312,8 +311,7 @@ async fn parallel_tcp_dataflows_multi_epoch() {
                 topology.clone(),
                 "node-a",
                 dataflow_ids[i],
-                vec![conns_a.remove(0)],
-                1024,
+                ClusterSpawnTransport::dedicated(vec![conns_a.remove(0)], 1024),
                 Duration::from_secs(30),
                 build,
                 &tokio_handle,
@@ -335,8 +333,7 @@ async fn parallel_tcp_dataflows_multi_epoch() {
                 topology2.clone(),
                 "node-b",
                 dataflow_ids2[i],
-                vec![conns_b.remove(0)],
-                1024,
+                ClusterSpawnTransport::dedicated(vec![conns_b.remove(0)], 1024),
                 Duration::from_secs(30),
                 build,
                 &tokio_handle2,

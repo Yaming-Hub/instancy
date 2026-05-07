@@ -16,6 +16,7 @@ use instancy::DataflowBuilder;
 use instancy::DataflowId;
 use instancy::Result;
 use instancy::communication::transport_session::PeerConnection;
+use instancy::communication::ClusterSpawnTransport;
 use instancy::{ClusterTopology, NodeConfig};
 use instancy::{RuntimeConfig, RuntimeHandle};
 
@@ -137,8 +138,7 @@ where
             topology,
             &node_id,
             dataflow_id,
-            connections,
-            1024,
+            ClusterSpawnTransport::dedicated(connections, 1024),
             Duration::from_secs(10),
             build,
             &tokio_handle,

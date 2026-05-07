@@ -13,6 +13,7 @@ use instancy::DataflowBuilder;
 use instancy::DataflowId;
 use instancy::Result;
 use instancy::communication::transport_session::PeerConnection;
+use instancy::communication::ClusterSpawnTransport;
 use instancy::{ClusterTopology, NodeConfig};
 use instancy::{RuntimeConfig, RuntimeHandle, SpawnOptions};
 
@@ -414,8 +415,7 @@ async fn shared_transport_parallel_cluster_dataflows() {
                     topo_a,
                     "node-a",
                     dataflow_id,
-                    vec![conn_a],
-                    1024,
+                    ClusterSpawnTransport::dedicated(vec![conn_a], 1024),
                     Duration::from_secs(10),
                     build,
                     &th,
@@ -437,8 +437,7 @@ async fn shared_transport_parallel_cluster_dataflows() {
                     topo_b,
                     "node-b",
                     dataflow_id,
-                    vec![conn_b],
-                    1024,
+                    ClusterSpawnTransport::dedicated(vec![conn_b], 1024),
                     Duration::from_secs(10),
                     build,
                     &th,
@@ -592,8 +591,7 @@ async fn stress_parallel_cluster_dataflows() {
                     topo_a,
                     "node-a",
                     dataflow_id,
-                    vec![conn_a],
-                    1024,
+                    ClusterSpawnTransport::dedicated(vec![conn_a], 1024),
                     Duration::from_secs(10),
                     build,
                     &th,
@@ -615,8 +613,7 @@ async fn stress_parallel_cluster_dataflows() {
                     topo_b,
                     "node-b",
                     dataflow_id,
-                    vec![conn_b],
-                    1024,
+                    ClusterSpawnTransport::dedicated(vec![conn_b], 1024),
                     Duration::from_secs(10),
                     build,
                     &th,
