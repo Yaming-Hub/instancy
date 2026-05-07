@@ -597,9 +597,14 @@ impl SharedPeerManager {
                     let mut buffers = reorder_buffers.lock().await;
                     if let Some(buffer) = buffers.get_mut(&frame.dataflow_id) {
                         match buffer.insert(seq_id, inner_frame) {
-                            Ok(InsertResult::Ready(count)) => {
+                            Ok(InsertResult::Ready(_count)) => {
                                 // Drain ready frames and dispatch
                                 let ready: Vec<Frame> = buffer.drain_ready().collect();
+                                debug_assert_eq!(
+                                    _count,
+                                    ready.len(),
+                                    "InsertResult::Ready count must match drain_ready length"
+                                );
                                 drop(buffers); // release lock before dispatching
 
                                 // Clone senders under lock, then release before awaiting
@@ -610,7 +615,7 @@ impl SharedPeerManager {
                                 };
 
                                 if let Some(senders) = senders {
-                                    for ready_frame in ready.into_iter().take(count) {
+                                    for ready_frame in ready {
                                         if let Some(tx) = senders.get(&ready_frame.channel_id) {
                                             let _ = tx.send(ready_frame.payload).await;
                                         }

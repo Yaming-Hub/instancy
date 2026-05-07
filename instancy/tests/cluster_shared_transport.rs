@@ -145,7 +145,8 @@ async fn shared_two_nodes_no_exchange() {
             build,
             &th,
         )?;
-        Ok::<_, instancy::error::Error>((rt, cluster))
+        // Return managers to keep SharedPeerManager (and its background tasks) alive
+        Ok::<_, instancy::error::Error>((rt, cluster, managers_a))
     });
 
     let topo_b = topology;
@@ -165,12 +166,12 @@ async fn shared_two_nodes_no_exchange() {
             build,
             &th2,
         )?;
-        Ok::<_, instancy::error::Error>((rt, cluster))
+        Ok::<_, instancy::error::Error>((rt, cluster, managers_b))
     });
 
     let (ra, rb) = tokio::join!(ha, hb);
-    let (_rt_a, mut ca) = ra.unwrap().unwrap();
-    let (_rt_b, mut cb) = rb.unwrap().unwrap();
+    let (_rt_a, mut ca, _mgr_a) = ra.unwrap().unwrap();
+    let (_rt_b, mut cb, _mgr_b) = rb.unwrap().unwrap();
 
     let out_a = ca.take_output::<i32>(0, "results").unwrap();
     let out_b = cb.take_output::<i32>(0, "results").unwrap();
@@ -205,13 +206,6 @@ async fn shared_two_nodes_no_exchange() {
 
 /// Two-node cluster with shared transport and exchange edges.
 /// Verifies data is correctly routed across nodes via shared connections.
-///
-/// NOTE: Currently ignored — data loss observed in shared transport mode with
-/// exchange edges. The handshake/barrier work correctly (shared_two_nodes_no_exchange
-/// passes), but exchange data delivery is incomplete. This needs investigation
-/// into the SharedTransportSession channel routing under concurrent data + progress
-/// message flows.
-#[ignore = "shared transport exchange data loss - needs investigation"]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn shared_two_nodes_with_exchange() {
     let topology = ClusterTopology::multi_node(vec![
@@ -249,7 +243,7 @@ async fn shared_two_nodes_with_exchange() {
             build,
             &th,
         )?;
-        Ok::<_, instancy::error::Error>((rt, cluster))
+        Ok::<_, instancy::error::Error>((rt, cluster, managers_a))
     });
 
     let topo_b = topology;
@@ -269,12 +263,12 @@ async fn shared_two_nodes_with_exchange() {
             build,
             &th2,
         )?;
-        Ok::<_, instancy::error::Error>((rt, cluster))
+        Ok::<_, instancy::error::Error>((rt, cluster, managers_b))
     });
 
     let (ra, rb) = tokio::join!(ha, hb);
-    let (_rt_a, mut ca) = ra.unwrap().unwrap();
-    let (_rt_b, mut cb) = rb.unwrap().unwrap();
+    let (_rt_a, mut ca, _mgr_a) = ra.unwrap().unwrap();
+    let (_rt_b, mut cb, _mgr_b) = rb.unwrap().unwrap();
 
     let out_a = ca.take_output::<i64>(0, "results").unwrap();
     let out_b = cb.take_output::<i64>(0, "results").unwrap();
@@ -306,11 +300,6 @@ async fn shared_two_nodes_with_exchange() {
 
 /// Multiple dataflows sharing the same pooled connections.
 /// Verifies dataflow isolation — each dataflow gets its own data.
-///
-/// NOTE: Currently ignored — same shared transport exchange data loss issue as
-/// shared_two_nodes_with_exchange. The multi-dataflow isolation logic is correct
-/// (no cross-contamination), but not all data is delivered.
-#[ignore = "shared transport exchange data loss - needs investigation"]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn shared_multiple_dataflows_same_connections() {
     let topology = ClusterTopology::multi_node(vec![
@@ -362,7 +351,7 @@ async fn shared_multiple_dataflows_same_connections() {
             build,
             &th,
         )?;
-        Ok::<_, instancy::error::Error>((rt, c1, c2))
+        Ok::<_, instancy::error::Error>((rt, c1, c2, managers_a))
     });
 
     let topo_b = topology;
@@ -392,12 +381,12 @@ async fn shared_multiple_dataflows_same_connections() {
             build,
             &th2,
         )?;
-        Ok::<_, instancy::error::Error>((rt, c1, c2))
+        Ok::<_, instancy::error::Error>((rt, c1, c2, managers_b))
     });
 
     let (ra, rb) = tokio::join!(ha, hb);
-    let (_rt_a, mut c1_a, mut c2_a) = ra.unwrap().unwrap();
-    let (_rt_b, mut c1_b, mut c2_b) = rb.unwrap().unwrap();
+    let (_rt_a, mut c1_a, mut c2_a, _mgr_a) = ra.unwrap().unwrap();
+    let (_rt_b, mut c1_b, mut c2_b, _mgr_b) = rb.unwrap().unwrap();
 
     // Dataflow 1: send values 0..5 from node-a
     let out_1a = c1_a.take_output::<u64>(0, "results").unwrap();
