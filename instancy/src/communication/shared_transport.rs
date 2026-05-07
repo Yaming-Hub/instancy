@@ -99,6 +99,9 @@ struct DataflowRegistration {
     sequence_counter: SequenceCounter,
     /// Per-channel receivers for delivering reordered frames.
     channel_senders: HashMap<u64, tokio_mpsc::Sender<Vec<u8>>>,
+    /// Error notification sender: transport errors are sent here.
+    /// The dataflow can poll the corresponding receiver to detect peer failures.
+    error_tx: tokio_mpsc::Sender<TransportError>,
 }
 
 // ---------------------------------------------------------------------------
@@ -264,6 +267,7 @@ impl SharedPeerManager {
             pool.clone(),
             writer_channels.clone(),
             scaling_driver.clone(),
+            registrations.clone(),
         ));
         task_handles.push(monitor_handle);
 
@@ -301,7 +305,10 @@ impl SharedPeerManager {
         dataflow_id: DataflowId,
         channel_ids: &[u64],
         channel_capacity: usize,
-    ) -> HashMap<u64, tokio_mpsc::Receiver<Vec<u8>>> {
+    ) -> (
+        HashMap<u64, tokio_mpsc::Receiver<Vec<u8>>>,
+        tokio_mpsc::Receiver<TransportError>,
+    ) {
         let mut receivers = HashMap::new();
         let mut channel_senders = HashMap::new();
 
@@ -318,9 +325,13 @@ impl SharedPeerManager {
             receivers.insert(ch_id, rx);
         }
 
+        // Error channel: capacity 4 (failures are rare, one notification is enough)
+        let (error_tx, error_rx) = tokio_mpsc::channel(4);
+
         let reg = DataflowRegistration {
             sequence_counter: SequenceCounter::new(),
             channel_senders,
+            error_tx,
         };
 
         self.registrations
@@ -334,7 +345,7 @@ impl SharedPeerManager {
             ReorderBuffer::with_capacity(self.config.reorder_timeout, 4096),
         );
 
-        receivers
+        (receivers, error_rx)
     }
 
     /// Unregister a dataflow, removing its channels and reorder buffer.
@@ -753,22 +764,28 @@ impl SharedPeerManager {
     ///
     /// Deduplicates notifications (both writer and reader may report the same
     /// connection) — only processes each connection_id once.
+    ///
+    /// When all connections are dead, notifies all registered dataflows with
+    /// a `TransportError::ConnectionClosed` error.
     async fn connection_monitor(
         mut failure_rx: tokio_mpsc::Receiver<usize>,
         pool: Arc<PeerPool>,
         writer_channels: Arc<TokioMutex<HashMap<usize, tokio_mpsc::Sender<Frame>>>>,
         scaling_driver: Arc<ScalingDriver>,
+        registrations: Arc<TokioMutex<HashMap<DataflowId, DataflowRegistration>>>,
     ) {
         let mut processed = HashSet::new();
+        let mut all_failed_notified = false;
         while let Some(conn_id) = failure_rx.recv().await {
             if !processed.insert(conn_id) {
                 continue; // Already handled this connection
             }
 
+            let live_count = pool.live_connection_count();
+
             #[cfg(feature = "tracing")]
             tracing::warn!(
-                "Connection monitor: conn {conn_id} failed, removing. Live: {}",
-                pool.live_connection_count()
+                "Connection monitor: conn {conn_id} failed, removing. Live: {live_count}"
             );
 
             // Remove writer channel (drops the sender, which will cause
@@ -784,16 +801,37 @@ impl SharedPeerManager {
                     connection_id: conn_id,
                 })
                 .await;
+
+            // Reset notification flag if connections were re-established
+            if live_count > 0 && all_failed_notified {
+                all_failed_notified = false;
+            }
+
+            // If all connections are dead, notify all registered dataflows
+            if live_count == 0 && !all_failed_notified {
+                all_failed_notified = true;
+                #[cfg(feature = "tracing")]
+                tracing::error!(
+                    "All connections to peer are dead — notifying dataflows"
+                );
+
+                let regs = registrations.lock().await;
+                for (_df_id, reg) in regs.iter() {
+                    let _ = reg
+                        .error_tx
+                        .try_send(TransportError::ConnectionClosed);
+                }
+            }
         }
     }
 
     /// Periodic sweeper that checks reorder buffer timeouts.
     ///
     /// If any dataflow's reorder buffer has a gap that exceeds the timeout,
-    /// the error is logged. Future: propagate as a dataflow error.
+    /// sends a `TransportError::ConnectionClosed` to that dataflow's error channel.
     async fn timeout_sweeper(
         reorder_buffers: Arc<TokioMutex<HashMap<DataflowId, ReorderBuffer<Frame>>>>,
-        _registrations: Arc<TokioMutex<HashMap<DataflowId, DataflowRegistration>>>,
+        registrations: Arc<TokioMutex<HashMap<DataflowId, DataflowRegistration>>>,
         check_interval: Duration,
     ) {
         let mut ticker = tokio::time::interval(check_interval);
@@ -803,11 +841,25 @@ impl SharedPeerManager {
             ticker.tick().await;
 
             let mut buffers = reorder_buffers.lock().await;
-            for (&_df_id, buffer) in buffers.iter_mut() {
+            let mut timed_out_dataflows = Vec::new();
+            for (&df_id, buffer) in buffers.iter_mut() {
                 if let Err(_e) = buffer.check_timeout() {
                     #[cfg(feature = "tracing")]
-                    tracing::error!("Reorder gap timeout for dataflow {:?}: {_e}", _df_id);
-                    // Future: propagate error to dataflow via cancellation
+                    tracing::error!("Reorder gap timeout for dataflow {df_id:?}: {_e}");
+                    timed_out_dataflows.push(df_id);
+                }
+            }
+            drop(buffers);
+
+            // Notify affected dataflows
+            if !timed_out_dataflows.is_empty() {
+                let regs = registrations.lock().await;
+                for df_id in timed_out_dataflows {
+                    if let Some(reg) = regs.get(&df_id) {
+                        let _ = reg
+                            .error_tx
+                            .try_send(TransportError::ReorderTimeout);
+                    }
                 }
             }
         }
@@ -839,6 +891,9 @@ pub struct SharedTransportSession {
     /// Per-peer channel receivers (peer → channel_id → receiver).
     /// Wrapped in Option so they can be taken out once.
     receivers: Option<HashMap<String, HashMap<u64, tokio_mpsc::Receiver<Vec<u8>>>>>,
+    /// Per-peer error receivers (peer → error channel).
+    /// Dataflows poll these to detect transport failures.
+    error_receivers: Option<HashMap<String, tokio_mpsc::Receiver<TransportError>>>,
 }
 
 impl SharedTransportSession {
@@ -858,16 +913,18 @@ impl SharedTransportSession {
         let mut payload_senders = HashMap::new();
         let mut control_senders = HashMap::new();
         let mut all_receivers = HashMap::new();
+        let mut error_receivers = HashMap::new();
 
         for (peer_id, manager) in peer_managers {
             // Register this dataflow with the peer manager
-            let receivers = manager
+            let (receivers, error_rx) = manager
                 .register_dataflow(dataflow_id, channel_ids, channel_capacity)
                 .await;
 
             payload_senders.insert(peer_id.clone(), manager.payload_sender().clone());
             control_senders.insert(peer_id.clone(), manager.control_sender().clone());
             all_receivers.insert(peer_id.clone(), receivers);
+            error_receivers.insert(peer_id.clone(), error_rx);
         }
 
         Self {
@@ -875,6 +932,7 @@ impl SharedTransportSession {
             payload_senders,
             control_senders,
             receivers: Some(all_receivers),
+            error_receivers: Some(error_receivers),
         }
     }
 
@@ -919,6 +977,17 @@ impl SharedTransportSession {
         &mut self,
     ) -> Option<HashMap<String, HashMap<u64, tokio_mpsc::Receiver<Vec<u8>>>>> {
         self.receivers.take()
+    }
+
+    /// Take the per-peer error receivers (can only be called once).
+    ///
+    /// Dataflows should poll these receivers to detect transport failures.
+    /// A received `TransportError` indicates the peer connection has failed
+    /// (either all connections dead, or reorder buffer gap timeout).
+    pub fn take_error_receivers(
+        &mut self,
+    ) -> Option<HashMap<String, tokio_mpsc::Receiver<TransportError>>> {
+        self.error_receivers.take()
     }
 
     /// Returns the set of peer node IDs this session has connections to.
@@ -1053,7 +1122,7 @@ mod tests {
 
         let df_id = DataflowId::new();
         let channel_ids = vec![1, 2, 3];
-        let receivers = manager.register_dataflow(df_id, &channel_ids, 16).await;
+        let (receivers, _error_rx) = manager.register_dataflow(df_id, &channel_ids, 16).await;
 
         // 3 requested + 1 auto-registered control channel (ID 0)
         assert_eq!(receivers.len(), 4);
@@ -1341,7 +1410,7 @@ mod tests {
         );
 
         let df_id = DataflowId::new();
-        let mut receivers = manager.register_dataflow(df_id, &[1], 16).await;
+        let (mut receivers, _error_rx) = manager.register_dataflow(df_id, &[1], 16).await;
         let mut control_rx = receivers.remove(&CONTROL_CHANNEL_ID).unwrap();
 
         // Send a control frame from the test side (no sequence prefix!)
@@ -1446,5 +1515,57 @@ mod tests {
             wc.is_empty(),
             "monitor should remove dead connection's writer channel"
         );
+    }
+
+    #[tokio::test]
+    async fn all_connections_dead_notifies_dataflows() {
+        let (client_read, server_write) = duplex(8192);
+        let (server_read, client_write) = duplex(8192);
+
+        let connections: Vec<(DuplexStream, DuplexStream)> =
+            vec![(client_read, client_write)];
+
+        let config = SharedConnectionConfig {
+            min_connections: 1,
+            max_connections: 4,
+            probe_interval: Duration::from_secs(100),
+            ..Default::default()
+        };
+
+        let rt = tokio::runtime::Handle::current();
+        let manager = SharedPeerManager::new(
+            "peer-notify".into(),
+            config,
+            connections,
+            &rt,
+        );
+
+        // Register a dataflow
+        let df_id = DataflowId::new();
+        let (_receivers, mut error_rx) = manager
+            .register_dataflow(df_id, &[1, 2], 16)
+            .await;
+
+        // Kill the connection
+        drop(server_read);
+        drop(server_write);
+
+        // Wait for error notification
+        let result = tokio::time::timeout(
+            Duration::from_secs(2),
+            error_rx.recv(),
+        )
+        .await;
+
+        match result {
+            Ok(Some(err)) => {
+                assert!(
+                    matches!(err, TransportError::ConnectionClosed),
+                    "expected ConnectionClosed, got {err:?}"
+                );
+            }
+            Ok(None) => panic!("Error channel closed without sending error"),
+            Err(_) => panic!("Timed out waiting for error notification"),
+        }
     }
 }
