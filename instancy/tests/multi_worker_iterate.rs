@@ -270,3 +270,77 @@ async fn multi_worker_iterate_three_workers() {
     assert_eq!(results.len(), 3);
     assert_eq!(results, vec![135, 150, 243]);
 }
+
+/// Multi-worker iteration with data entering from ALL workers simultaneously.
+///
+/// Unlike other tests that feed data only through worker 0, this test
+/// sends initial data through both workers to exercise concurrent entry
+/// into the iterate scope.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn multi_worker_iterate_input_from_all_workers() {
+    let rt = RuntimeHandle::new(RuntimeConfig::default()).unwrap();
+
+    let mut multi = rt
+        .spawn_multi(
+            "mw-all-inputs",
+            2,
+            |_worker_idx, builder| {
+                let input = builder.input::<i64>("data");
+                let output = input.iterate::<u32>("double-loop", 1u32, |iter_var| {
+                    let doubled = iter_var
+                        .map("double", |_t: &Product<u64, u32>, x| x * 2)
+                        .exchange_by_hash("redistribute", |x: &i64| *x as u64);
+                    let done = doubled.clone().filter("done", |_t, x| *x >= 100);
+                    let again = doubled.filter("again", |_t, x| *x < 100);
+                    IterateResult {
+                        feedback: again,
+                        output: done,
+                    }
+                });
+                output.output("results");
+                Ok(())
+            },
+            SpawnOptions::default(),
+        )
+        .unwrap();
+
+    // Send data through BOTH workers concurrently.
+    let sender0 = multi.take_input::<i64>(0, "data").unwrap();
+    let sender1 = multi.take_input::<i64>(1, "data").unwrap();
+
+    // Worker 0: 1 → 2 → 4 → 8 → 16 → 32 → 64 → 128
+    sender0.send(0, vec![1]).unwrap();
+    // Worker 1: 10 → 20 → 40 → 80 → 160
+    sender1.send(0, vec![10]).unwrap();
+
+    drop(sender0);
+    drop(sender1);
+
+    let recv0 = multi.take_output::<i64>(0, "results").unwrap();
+    let recv1 = multi.take_output::<i64>(1, "results").unwrap();
+
+    let result = tokio::time::timeout(
+        TEST_TIMEOUT,
+        tokio::task::spawn_blocking(move || multi.join_blocking()),
+    )
+    .await;
+
+    match result {
+        Ok(Ok(Ok(()))) => {}
+        Ok(Ok(Err(e))) => panic!("dataflow join failed: {e}"),
+        Ok(Err(e)) => panic!("spawn_blocking panicked: {e}"),
+        Err(_) => panic!("dataflow did not complete within {TEST_TIMEOUT:?}"),
+    }
+
+    let mut all_results: Vec<i64> = Vec::new();
+    for (_time, data) in recv0.collect_data() {
+        all_results.extend(data);
+    }
+    for (_time, data) in recv1.collect_data() {
+        all_results.extend(data);
+    }
+    all_results.sort();
+
+    assert_eq!(all_results.len(), 2);
+    assert_eq!(all_results, vec![128, 160]);
+}
