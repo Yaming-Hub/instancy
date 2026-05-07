@@ -37,7 +37,7 @@
 //!   for longer than `cooldown_period`, one connection is drained and closed
 //!   (down to `min_connections`).
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
@@ -203,6 +203,9 @@ pub struct ConnectionMetrics {
     /// Timestamp (nanos since UNIX epoch) of the last write activity.
     /// Updated on each `dequeue()`. 0 means no activity yet.
     last_activity_nanos: AtomicU64,
+    /// Whether this connection is alive (true) or has been marked dead (false).
+    /// Dead connections are skipped by selection and excluded from scaling.
+    alive: std::sync::atomic::AtomicBool,
 }
 
 impl ConnectionMetrics {
@@ -219,12 +222,49 @@ impl ConnectionMetrics {
             bytes_written: AtomicU64::new(0),
             frames_written: AtomicU64::new(0),
             last_activity_nanos: AtomicU64::new(now),
+            alive: std::sync::atomic::AtomicBool::new(true),
         }
     }
 
     /// Increment pending write count (called when frame is enqueued).
     pub fn enqueue(&self) {
         self.pending_writes.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Rollback a reservation that could not be fulfilled.
+    ///
+    /// Called when a frame could not be sent to the writer channel
+    /// (e.g., channel closed, connection dead). Decrements the pending
+    /// count that was incremented by `enqueue()`.
+    pub fn rollback_reservation(&self) {
+        // CAS loop to avoid underflow
+        loop {
+            let current = self.pending_writes.load(Ordering::Relaxed);
+            if current == 0 {
+                return;
+            }
+            if self
+                .pending_writes
+                .compare_exchange_weak(current, current - 1, Ordering::Relaxed, Ordering::Relaxed)
+                .is_ok()
+            {
+                return;
+            }
+        }
+    }
+
+    /// Mark this connection as dead. Returns `true` if this call
+    /// transitioned from alive to dead (first failure notification),
+    /// `false` if already dead (duplicate notification).
+    pub fn mark_dead(&self) -> bool {
+        self.alive
+            .compare_exchange(true, false, Ordering::AcqRel, Ordering::Relaxed)
+            .is_ok()
+    }
+
+    /// Whether this connection is still alive.
+    pub fn is_alive(&self) -> bool {
+        self.alive.load(Ordering::Acquire)
     }
 
     /// Decrement pending write count (called when frame is written to TCP).
@@ -363,60 +403,74 @@ impl PeerPool {
 
     /// Select a connection and atomically reserve it.
     ///
-    /// **Low-load packing**: when total pending writes across the pool is
-    /// below the connection count, traffic is concentrated onto the fewest
-    /// connections (prefer the one with the most pending writes). This
-    /// leaves other connections idle so they can be cleaned up by the idle
-    /// timeout.
+    /// **Skips dead connections** — connections marked dead via
+    /// `ConnectionMetrics::mark_dead()` are excluded from selection.
+    /// Returns `None` if all connections are dead.
     ///
-    /// **High-load spreading**: when the pool is busy (total pending ≥
-    /// connection count), the least-loaded connection is selected to
-    /// balance throughput across all connections.
+    /// **Low-load packing**: when total pending writes across live
+    /// connections is below the live connection count, traffic is
+    /// concentrated onto the fewest connections to let others go idle.
     ///
-    /// Atomically increments `pending_writes` on the selected connection
-    /// to prevent multiple callers from racing to the same connection.
-    /// The caller must call `dequeue()` after the frame has been written.
-    pub fn select_and_reserve(&self) -> &Arc<ConnectionMetrics> {
-        let total_pending: usize = self
-            .connections
-            .values()
-            .map(|c| c.pending_writes())
-            .sum();
+    /// **High-load spreading**: when the pool is busy, the least-loaded
+    /// live connection is selected to balance throughput.
+    ///
+    /// Atomically increments `pending_writes` on the selected connection.
+    /// The caller must call `dequeue()` after the frame has been written,
+    /// or `rollback_reservation()` if the send could not be completed.
+    pub fn select_and_reserve(&self) -> Option<&Arc<ConnectionMetrics>> {
+        let live: Vec<_> = self.connections.values().filter(|c| c.is_alive()).collect();
 
-        let conn = if total_pending < self.connections.len() {
+        if live.is_empty() {
+            return None;
+        }
+
+        let total_pending: usize = live.iter().map(|c| c.pending_writes()).sum();
+
+        let conn = if total_pending < live.len() {
             // Low load — pack onto fewest connections to let others go idle.
-            // Pick the connection with the most pending writes (ties broken
-            // by lowest RTT so we prefer the fastest busy connection).
-            self.connections
-                .values()
+            live.into_iter()
                 .max_by_key(|c| {
                     let (pending, rtt) = c.load_score();
-                    // Primary: most pending (pack). Tiebreak: lowest RTT.
                     (pending, std::cmp::Reverse(rtt))
                 })
-                .expect("PeerPool must have at least one connection")
+                .unwrap()
         } else {
             // High load — spread across connections.
-            self.connections
-                .values()
+            live.into_iter()
                 .min_by_key(|c| c.load_score())
-                .expect("PeerPool must have at least one connection")
+                .unwrap()
         };
 
         conn.enqueue(); // Atomic reservation
-        conn
+        Some(conn)
     }
 
-    /// Select the least-loaded connection without reserving.
+    /// Select the least-loaded live connection without reserving.
     ///
     /// Use [`select_and_reserve`] for production send paths to avoid
     /// concurrent senders all choosing the same connection.
     /// This method is useful for read-only inspection or diagnostics.
-    pub fn select_connection(&self) -> &Arc<ConnectionMetrics> {
+    pub fn select_connection(&self) -> Option<&Arc<ConnectionMetrics>> {
         self.connections
             .values()
+            .filter(|c| c.is_alive())
             .min_by_key(|c| c.load_score())
-            .expect("PeerPool must have at least one connection")
+    }
+
+    /// Select a live connection with the lowest load, excluding specified IDs.
+    pub fn select_connection_excluding(
+        &self,
+        exclude: &HashSet<usize>,
+    ) -> Option<&Arc<ConnectionMetrics>> {
+        self.connections
+            .values()
+            .filter(|c| c.is_alive() && !exclude.contains(&c.id))
+            .min_by_key(|c| c.load_score())
+    }
+
+    /// Count of live (non-dead) connections.
+    pub fn live_connection_count(&self) -> usize {
+        self.connections.values().filter(|c| c.is_alive()).count()
     }
 
     /// Get metrics for a specific connection by ID.
@@ -455,15 +509,18 @@ impl PeerPool {
     /// Evaluate whether scaling is needed based on current RTT and idle state.
     ///
     /// This should be called periodically (e.g., after each probe response).
+    /// Dead connections are excluded from all scaling decisions.
     /// Connections without any RTT measurement are excluded from RTT-based
     /// scaling decisions. Idle connections (no write activity for longer than
     /// `idle_timeout`) are candidates for removal regardless of RTT.
     pub async fn evaluate_scaling(&self) -> ScalingDecision {
         let threshold_up = self.config.rtt_scale_up_threshold;
         let threshold_down = self.config.rtt_scale_down_threshold;
+        let live: Vec<_> = self.connections.values().filter(|c| c.is_alive()).collect();
+        let live_count = live.len();
 
-        // Check if any connection with measurements exceeds the scale-up threshold
-        let any_overloaded = self.connections.values().any(|c| {
+        // Check if any live connection with measurements exceeds the scale-up threshold
+        let any_overloaded = live.iter().any(|c| {
             c.average_rtt()
                 .is_some_and(|rtt| rtt > threshold_up)
         });
@@ -474,13 +531,12 @@ impl PeerPool {
             return ScalingDecision::ScaleUp;
         }
 
-        // Check for idle connections (no traffic for idle_timeout).
+        // Check for idle live connections (no traffic for idle_timeout).
         // Remove the longest-idle connection, but never below min_connections.
         if let Some(idle_timeout) = self.config.idle_timeout {
-            if self.connections.len() > self.config.min_connections {
-                let longest_idle = self
-                    .connections
-                    .values()
+            if live_count > self.config.min_connections {
+                let longest_idle = live
+                    .iter()
                     .filter(|c| c.pending_writes() == 0)
                     .filter_map(|c| c.idle_duration().map(|d| (c.id, d)))
                     .filter(|(_, d)| *d >= idle_timeout)
@@ -494,23 +550,20 @@ impl PeerPool {
             }
         }
 
-        // Check if ALL connections have measurements and are below scale-down threshold.
-        // ALL connections must have at least one RTT sample to participate in scale-down.
-        let all_measured = self
-            .connections
-            .values()
+        // Check if ALL live connections have measurements and are below scale-down threshold.
+        let all_measured = live
+            .iter()
             .all(|c| c.average_rtt().is_some());
 
         if !all_measured {
             return ScalingDecision::None;
         }
 
-        let all_underloaded = self
-            .connections
-            .values()
+        let all_underloaded = live
+            .iter()
             .all(|c| c.average_rtt().unwrap() < threshold_down);
 
-        if all_underloaded && self.connections.len() > self.config.min_connections {
+        if all_underloaded && live_count > self.config.min_connections {
             let mut cooldown = self.cooldown_start.lock().await;
             match *cooldown {
                 None => {
@@ -520,11 +573,10 @@ impl PeerPool {
                 }
                 Some(start) => {
                     if start.elapsed() >= self.config.cooldown_period {
-                        // Cooldown expired — scale down the connection with highest RTT
+                        // Cooldown expired — scale down the live connection with highest RTT
                         *cooldown = None;
-                        let worst = self
-                            .connections
-                            .values()
+                        let worst = live
+                            .iter()
                             .max_by_key(|c| c.rtt.average_nanos())
                             .map(|c| c.id)
                             .unwrap_or(0);
@@ -657,7 +709,7 @@ mod tests {
         pool.connection(1).unwrap().enqueue();
         // Connection 2: 0 pending
 
-        let selected = pool.select_connection();
+        let selected = pool.select_connection().unwrap();
         assert_eq!(selected.id, 2); // least loaded
     }
 
@@ -674,7 +726,7 @@ mod tests {
         pool.connection(0).unwrap().record_rtt(Duration::from_millis(5));
         pool.connection(1).unwrap().record_rtt(Duration::from_millis(2));
 
-        let selected = pool.select_connection();
+        let selected = pool.select_connection().unwrap();
         assert_eq!(selected.id, 1); // lower RTT
     }
 
@@ -825,7 +877,7 @@ mod tests {
         pool.connection(0).unwrap().enqueue();
 
         // select_and_reserve picks conn 1 (less loaded) AND increments its pending
-        let selected = pool.select_and_reserve();
+        let selected = pool.select_and_reserve().unwrap();
         assert_eq!(selected.id, 1);
         assert_eq!(selected.pending_writes(), 1); // was 0, now 1 from reservation
     }
@@ -841,16 +893,16 @@ mod tests {
 
         // All connections idle (total_pending=0 < 3 connections) → low-load packing.
         // First select should pick ONE connection and keep using it.
-        let first = pool.select_and_reserve();
+        let first = pool.select_and_reserve().unwrap();
         let first_id = first.id;
         // Now total_pending=1 < 3 → still low-load → pack onto same connection
-        let second = pool.select_and_reserve();
+        let second = pool.select_and_reserve().unwrap();
         assert_eq!(second.id, first_id, "low-load packing should reuse same connection");
         // Now total_pending=2 < 3 → still low-load
-        let third = pool.select_and_reserve();
+        let third = pool.select_and_reserve().unwrap();
         assert_eq!(third.id, first_id, "low-load packing should still reuse same connection");
         // Now total_pending=3 >= 3 → high-load → spreads to least-loaded
-        let fourth = pool.select_and_reserve();
+        let fourth = pool.select_and_reserve().unwrap();
         assert_ne!(fourth.id, first_id, "high-load should spread to a different connection");
     }
 
@@ -985,5 +1037,90 @@ mod tests {
 
         // idle_timeout is None — no idle scale-down
         assert_eq!(pool.evaluate_scaling().await, ScalingDecision::None);
+    }
+
+    #[test]
+    fn mark_dead_skips_in_selection() {
+        let config = SharedConnectionConfig {
+            min_connections: 1,
+            max_connections: 4,
+            ..Default::default()
+        };
+        let pool = PeerPool::new(3, config);
+
+        // Mark connection 0 as dead
+        pool.connection(0).unwrap().mark_dead();
+
+        // select_connection should skip dead connections
+        let selected = pool.select_connection().unwrap();
+        assert_ne!(selected.id, 0, "dead connection should be skipped");
+        assert_eq!(pool.live_connection_count(), 2);
+    }
+
+    #[test]
+    fn mark_dead_idempotent() {
+        let config = SharedConnectionConfig::default();
+        let pool = PeerPool::new(1, config);
+
+        let conn = pool.connection(0).unwrap();
+        assert!(conn.is_alive());
+
+        // First mark_dead returns true
+        assert!(conn.mark_dead());
+        assert!(!conn.is_alive());
+
+        // Second mark_dead returns false (already dead)
+        assert!(!conn.mark_dead());
+    }
+
+    #[test]
+    fn select_and_reserve_returns_none_all_dead() {
+        let config = SharedConnectionConfig::default();
+        let pool = PeerPool::new(2, config);
+
+        pool.connection(0).unwrap().mark_dead();
+        pool.connection(1).unwrap().mark_dead();
+
+        assert!(pool.select_and_reserve().is_none());
+        assert!(pool.select_connection().is_none());
+        assert_eq!(pool.live_connection_count(), 0);
+    }
+
+    #[test]
+    fn rollback_reservation_decrements_pending() {
+        let config = SharedConnectionConfig::default();
+        let pool = PeerPool::new(1, config);
+
+        let conn = pool.connection(0).unwrap();
+        conn.enqueue();
+        conn.enqueue();
+        assert_eq!(conn.pending_writes(), 2);
+
+        conn.rollback_reservation();
+        assert_eq!(conn.pending_writes(), 1);
+
+        // Rollback at 0 should not underflow
+        conn.rollback_reservation();
+        conn.rollback_reservation();
+        assert_eq!(conn.pending_writes(), 0);
+    }
+
+    #[test]
+    fn select_connection_excluding_skips_specified() {
+        let config = SharedConnectionConfig::default();
+        let pool = PeerPool::new(3, config);
+
+        let mut exclude = HashSet::new();
+        exclude.insert(0);
+        exclude.insert(1);
+
+        let selected = pool.select_connection_excluding(&exclude).unwrap();
+        assert_eq!(selected.id, 2, "should only select non-excluded connection");
+
+        exclude.insert(2);
+        assert!(
+            pool.select_connection_excluding(&exclude).is_none(),
+            "all excluded should return None"
+        );
     }
 }

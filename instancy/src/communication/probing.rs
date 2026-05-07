@@ -170,6 +170,12 @@ pub enum ScalingEvent {
     ScaleUp,
     /// The specified connection should be drained and closed.
     ScaleDown { connection_id: usize },
+    /// A connection has failed (writer or reader error).
+    ///
+    /// The connection has already been marked dead in the pool.
+    /// The handler should remove it from writer_channels and attempt
+    /// to establish a replacement via ConnectionFactory.
+    ConnectionFailed { connection_id: usize },
 }
 
 // ─── Scaling Driver ──────────────────────────────────────────────────────────
@@ -300,6 +306,11 @@ impl ScalingDriver {
             }
         };
         // Best-effort send — if the receiver is full, skip this cycle
+        let _ = self.event_tx.try_send(event);
+    }
+
+    /// Emit a scaling event directly (e.g., connection failure notification).
+    pub async fn emit_event(&self, event: ScalingEvent) {
         let _ = self.event_tx.try_send(event);
     }
 
