@@ -59,3 +59,12 @@ required-features = ["transport"]
 [[example]]
 name = "cluster_exchange"
 required-features = ["transport"]
+
+[dev-dependencies.criterion]
+version = "0.5"
+features = ["async_tokio"]
+
+[[bench]]
+name = "transport_throughput"
+harness = false
+required-features = ["transport"]
