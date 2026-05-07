@@ -60,6 +60,10 @@ required-features = ["transport"]
 name = "cluster_exchange"
 required-features = ["transport"]
 
+[[example]]
+name = "cluster_shared_transport"
+required-features = ["transport"]
+
 [dev-dependencies.criterion]
 version = "0.5"
 features = ["async_tokio"]
