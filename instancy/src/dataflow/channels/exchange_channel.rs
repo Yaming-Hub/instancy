@@ -497,6 +497,184 @@ impl<T: Timestamp, D: Send + 'static> Drop for ExchangePush<T, D> {
 }
 
 // ---------------------------------------------------------------------------
+// BroadcastPush
+// ---------------------------------------------------------------------------
+
+/// Push endpoint for a broadcast channel.
+///
+/// Clones each record in a batch to ALL target workers. Unlike `ExchangePush`
+/// which routes each item to exactly one target, `BroadcastPush` sends every
+/// item to every target (fan-out). This is useful for distributing reference
+/// data, configuration updates, or small datasets to all workers.
+///
+/// Requires `D: Clone` since each record is duplicated N-1 times.
+pub struct BroadcastPush<T: Timestamp, D: Clone + Send + 'static> {
+    /// One push endpoint per target worker.
+    targets: Vec<Box<dyn Push<T, D, ()>>>,
+    /// Number of target workers.
+    num_targets: usize,
+    /// Shared wake registry for cross-worker notification.
+    wakes: Arc<SharedWakeRegistry>,
+    /// Whether this push endpoint has been closed.
+    closed: bool,
+}
+
+impl<T: Timestamp, D: Clone + Send + 'static> BroadcastPush<T, D> {
+    /// Create a new broadcast push endpoint.
+    pub(crate) fn new(
+        targets: Vec<Box<dyn Push<T, D, ()>>>,
+        wakes: Arc<SharedWakeRegistry>,
+    ) -> Self {
+        let num_targets = targets.len();
+        Self {
+            targets,
+            num_targets,
+            wakes,
+            closed: false,
+        }
+    }
+}
+
+impl<T: Timestamp, D: Clone + Send + 'static> Push<T, D> for BroadcastPush<T, D> {
+    fn push(&mut self, envelope: Envelope<T, D, ()>) -> Result<()> {
+        if self.closed {
+            return Err(Error::ChannelClosed);
+        }
+
+        match envelope.payload {
+            Payload::Data { time, data } => {
+                // Send a clone to each target except the last, which gets the owned data.
+                let last_idx = self.num_targets - 1;
+                for (target_idx, target) in self.targets.iter_mut().enumerate() {
+                    let batch = if target_idx == last_idx {
+                        // Last target gets the owned data (avoid final clone).
+                        break;
+                    } else {
+                        data.clone()
+                    };
+                    if !batch.is_empty() {
+                        target.push(Envelope::data(time.clone(), batch))?;
+                        self.wakes.wake(target_idx);
+                    }
+                }
+                // Send owned data to the last target.
+                if !data.is_empty() {
+                    self.targets[last_idx].push(Envelope::data(time, data))?;
+                    self.wakes.wake(last_idx);
+                }
+            }
+            Payload::Control(signal) => {
+                // Control signals broadcast to all targets (same as ExchangePush).
+                for (target_idx, target) in self.targets.iter_mut().enumerate() {
+                    loop {
+                        match target.try_push(Envelope::control(signal.clone())) {
+                            Ok(()) => {
+                                self.wakes.wake(target_idx);
+                                break;
+                            }
+                            Err((Error::Backpressure, _)) => {
+                                self.wakes.wake(target_idx);
+                                std::thread::yield_now();
+                            }
+                            Err((err, _)) => return Err(err),
+                        }
+                    }
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    fn try_push(
+        &mut self,
+        envelope: Envelope<T, D, ()>,
+    ) -> std::result::Result<(), (Error, Envelope<T, D, ()>)> {
+        if self.closed {
+            return Err((Error::ChannelClosed, envelope));
+        }
+
+        match &envelope.payload {
+            Payload::Data { time, data } => {
+                // Pre-check all targets for capacity.
+                for target in self.targets.iter() {
+                    if target.is_closed() {
+                        return Err((Error::ChannelClosed, envelope));
+                    }
+                    if let Some(available) = target.available_capacity() {
+                        if available == 0 {
+                            return Err((Error::Backpressure, envelope));
+                        }
+                    }
+                }
+
+                // All targets ready — broadcast data.
+                for (target_idx, target) in self.targets.iter_mut().enumerate() {
+                    let batch = data.clone();
+                    if !batch.is_empty() {
+                        match target.try_push(Envelope::data(time.clone(), batch)) {
+                            Ok(()) => self.wakes.wake(target_idx),
+                            Err((err, _)) => return Err((err, envelope)),
+                        }
+                    }
+                }
+            }
+            Payload::Control(signal) => {
+                // Pre-check all targets for capacity.
+                for target in self.targets.iter() {
+                    if target.is_closed() {
+                        return Err((Error::ChannelClosed, envelope));
+                    }
+                    if let Some(available) = target.available_capacity() {
+                        if available == 0 {
+                            return Err((Error::Backpressure, envelope));
+                        }
+                    }
+                }
+
+                // All targets ready — broadcast control signal.
+                for (target_idx, target) in self.targets.iter_mut().enumerate() {
+                    match target.try_push(Envelope::control(signal.clone())) {
+                        Ok(()) => self.wakes.wake(target_idx),
+                        Err((err, _)) => return Err((err, envelope)),
+                    }
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    fn flush(&mut self) -> Result<()> {
+        for target in &mut self.targets {
+            target.flush()?;
+        }
+        Ok(())
+    }
+
+    fn close(&mut self) {
+        self.closed = true;
+        for target in &mut self.targets {
+            target.close();
+        }
+        self.wakes.wake_all();
+    }
+
+    fn is_closed(&self) -> bool {
+        self.closed
+    }
+}
+
+impl<T: Timestamp, D: Clone + Send + 'static> Drop for BroadcastPush<T, D> {
+    fn drop(&mut self) {
+        for target in &mut self.targets {
+            target.close();
+        }
+        self.wakes.wake_all();
+    }
+}
+
+// ---------------------------------------------------------------------------
 // ExchangePull
 // ---------------------------------------------------------------------------
 
@@ -909,6 +1087,50 @@ where
     }
 }
 
+/// Concrete implementation of [`NetworkExchangeCreator`] for broadcast channels.
+///
+/// Unlike `NetworkExchangeCreatorImpl` which routes to one target,
+/// this creates broadcast factories that clone data to all targets.
+#[cfg(feature = "transport")]
+pub(crate) struct NetworkBroadcastCreatorImpl<T, D>
+where
+    T: Timestamp + crate::communication::codec::ExchangeData,
+    D: Clone + crate::communication::codec::ExchangeData,
+{
+    pub _phantom: std::marker::PhantomData<(T, D)>,
+}
+
+#[cfg(feature = "transport")]
+impl<T, D> NetworkExchangeCreator for NetworkBroadcastCreatorImpl<T, D>
+where
+    T: Timestamp + crate::communication::codec::ExchangeData,
+    D: Clone + crate::communication::codec::ExchangeData,
+{
+    fn create(
+        self: Box<Self>,
+        params: NetworkMaterializerParams,
+    ) -> Vec<super::super::schedulable::ChannelFactory> {
+        let materializer = Arc::new(Mutex::new(
+            super::network::NetworkEdgeMaterializer::<T, D>::new(
+                params.dataflow_id,
+                params.topology,
+                params.local_node_id,
+                params.transport,
+                params.receivers,
+                params.capacity,
+                params.edge_index,
+                params.wake_handles,
+                params.runtime_handle,
+            ),
+        ));
+        build_broadcast_factories(
+            params.num_workers,
+            params.num_workers,
+            materializer,
+        )
+    }
+}
+
 /// Create exchange channel factories using a custom [`EdgeMaterializer`].
 ///
 /// This is the extension point for cross-node exchange: the runtime
@@ -1016,6 +1238,91 @@ where
                         });
 
                     let push = ExchangePush::new(pushers, exchange_fn.clone(), wakes.clone());
+                    let pull = ExchangePull::new(pullers, wakes.clone());
+
+                    (
+                        Box::new(Box::new(push) as Box<dyn Push<T, D>>)
+                            as Box<dyn std::any::Any + Send>,
+                        Box::new(Box::new(pull) as Box<dyn Pull<T, D>>)
+                            as Box<dyn std::any::Any + Send>,
+                    )
+                },
+            )
+        })
+        .collect()
+}
+
+/// Create a type-erased broadcast factory creator using the default local transport.
+///
+/// Similar to [`create_exchange_factory_creator`] but produces broadcast channels
+/// where each item is cloned to ALL target workers (fan-out).
+pub(crate) fn create_broadcast_factory_creator<T, D>() -> ExchangeFactoryCreatorFn
+where
+    T: Timestamp,
+    D: Clone + Send + 'static,
+{
+    Box::new(
+        move |num_source_workers: usize, num_target_workers: usize, capacity: usize| {
+            let materializer = Arc::new(Mutex::new(
+                super::edge_materializer::LocalEdgeMaterializer::<T, D>::new_asymmetric(
+                    num_source_workers,
+                    num_target_workers,
+                    capacity,
+                ),
+            ));
+            build_broadcast_factories(num_source_workers, num_target_workers, materializer)
+        },
+    )
+}
+
+/// Internal helper: build broadcast channel factories from a shared materializer.
+///
+/// Like `build_exchange_factories` but uses `BroadcastPush` (clone to all)
+/// instead of `ExchangePush` (route to one).
+fn build_broadcast_factories<T, D>(
+    num_source_workers: usize,
+    num_target_workers: usize,
+    materializer: Arc<Mutex<dyn super::edge_materializer::EdgeMaterializer<T, D>>>,
+) -> Vec<super::super::schedulable::ChannelFactory>
+where
+    T: Timestamp,
+    D: Clone + Send + 'static,
+{
+    {
+        let mat = materializer.lock().unwrap_or_else(|e| e.into_inner());
+        assert_eq!(mat.num_source_workers(), num_source_workers);
+        assert_eq!(mat.num_target_workers(), num_target_workers);
+    }
+
+    assert_eq!(
+        num_source_workers, num_target_workers,
+        "Asymmetric per-stage executors not yet implemented; M ({}) must equal N ({})",
+        num_source_workers, num_target_workers
+    );
+
+    let wake_count = std::cmp::max(num_source_workers, num_target_workers);
+    let wakes = Arc::new(SharedWakeRegistry::new(wake_count));
+
+    (0..num_source_workers)
+        .map(|_| {
+            let wakes = wakes.clone();
+            let materializer = materializer.clone();
+            super::super::schedulable::channel_factory(
+                move |ctx: &crate::worker::WorkerContext, wake: Option<WakeHandle>| {
+                    wakes.register(ctx.worker_index(), wake);
+
+                    let (pushers, pullers) = materializer
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .materialize_worker(ctx.worker_index())
+                        .unwrap_or_else(|e| {
+                            panic!(
+                                "edge materialization failed for worker {}: {e}",
+                                ctx.worker_index()
+                            )
+                        });
+
+                    let push = BroadcastPush::new(pushers, wakes.clone());
                     let pull = ExchangePull::new(pullers, wakes.clone());
 
                     (
