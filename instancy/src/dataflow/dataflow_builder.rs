@@ -4384,24 +4384,18 @@ impl<T: Timestamp> LogicalDataflow<T> {
     /// Retain only the operators and channels for the given stages.
     ///
     /// Removes operator factories, channel factories, input/output port wiring,
-    /// async source wiring, and SubgraphBuilder entries for operators not in any
-    /// of the specified stages. Exchange channel factories at stage boundaries
-    /// are always retained (they provide cross-stage connectivity).
+    /// async source wiring, and probes for operators not in any of the specified
+    /// stages. Exchange channel factories at stage boundaries are always retained
+    /// (they provide cross-stage connectivity).
+    ///
+    /// Non-participating operators are kept as "ghost" operators in the
+    /// SubgraphBuilder's reachability graph. This allows cross-stage frontier
+    /// propagation: peer workers broadcast capability changes for ghost
+    /// operators, and the local reachability graph propagates those changes
+    /// through exchange edges to downstream materialized operators.
     ///
     /// This is used for per-stage materialization: each worker only
     /// materializes operators for stages it participates in.
-    ///
-    /// # Known Limitation (Phase 9)
-    ///
-    /// Progress updates from peer workers for non-participating operators are
-    /// skipped (see `ProgressTracker::receive_peer_changes`). This means
-    /// frontier-dependent operators (e.g., `unary_notify`, `delay`) across
-    /// stage boundaries won't observe correct frontier advances from upstream
-    /// stages not materialized on this worker. Simple data-flow operators
-    /// (map, filter, for_each) work correctly because they rely on input
-    /// exhaustion rather than frontier notifications. Phase 9 (per-stage
-    /// progress exchange) will fix this by scoping progress channels to
-    /// stage boundaries.
     pub fn retain_stages(&mut self, participating_stage_ids: &std::collections::HashSet<crate::dataflow::stage::StageId>) {
         use std::collections::HashSet;
 
@@ -4509,8 +4503,21 @@ impl<T: Timestamp> LogicalDataflow<T> {
             }
         }
 
-        // Filter SubgraphBuilder.
-        self.subgraph_builder.retain_operators(&participating_ops);
+        // Mark non-participating operators as "ghost" in the SubgraphBuilder.
+        // Ghost operators stay in the reachability graph for cross-stage
+        // frontier propagation but have no local progress buffers or
+        // initial capabilities (those come from peer workers).
+        {
+            let ghost_ops: std::collections::HashSet<usize> = self
+                .subgraph_builder
+                .operator_shapes()
+                .map(|s| s.index)
+                .filter(|idx| !participating_ops.contains(idx))
+                .collect();
+            if !ghost_ops.is_empty() {
+                self.subgraph_builder.mark_ghost_operators(&ghost_ops);
+            }
+        }
 
         // Filter stages to only include participating ones.
         self.stages

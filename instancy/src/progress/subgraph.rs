@@ -202,6 +202,24 @@ impl<T: Timestamp> SubgraphBuilder<T> {
         });
     }
 
+    /// Mark operators as "ghost" — present in the reachability graph for
+    /// frontier propagation, but not materialized on this worker.
+    ///
+    /// Ghost operators keep their shapes, connectivity, and edges in the
+    /// reachability graph so that peer progress updates can propagate
+    /// frontiers across stage boundaries. Their initial capabilities and
+    /// progress buffers are removed because:
+    /// - Initial capabilities: peers provide theirs via progress channels
+    /// - Progress buffers: no local operator writes to them
+    ///
+    /// The [`ProgressTracker`] built from this builder will skip ghost
+    /// operators during local progress collection but accept peer updates
+    /// for them, enabling correct cross-stage frontier propagation.
+    pub fn mark_ghost_operators(&mut self, ghost: &std::collections::HashSet<usize>) {
+        self.initial_capabilities.retain(|idx, _| !ghost.contains(idx));
+        self.progress_buffers.retain(|idx, _| !ghost.contains(idx));
+    }
+
     /// Compiles the subgraph into a live [`ProgressTracker`].
     ///
     /// Consumes the builder and returns the tracker along with per-operator
@@ -243,6 +261,13 @@ impl<T: Timestamp> SubgraphBuilder<T> {
         let mut operator_indices: Vec<usize> = self.operators.keys().copied().collect();
         operator_indices.sort();
 
+        // Materialized indices: operators that have progress buffers (not ghost).
+        let materialized_indices: Vec<usize> = operator_indices
+            .iter()
+            .copied()
+            .filter(|idx| self.progress_buffers.contains_key(idx))
+            .collect();
+
         ProgressTracker {
             tracker,
             scope_summary,
@@ -251,6 +276,7 @@ impl<T: Timestamp> SubgraphBuilder<T> {
             initial_capabilities: self.initial_capabilities,
             operator_frontiers,
             operator_indices,
+            materialized_indices,
             initialized: false,
             completed: false,
             dirty_operators: Vec::new(),
@@ -312,6 +338,9 @@ pub struct ProgressTracker<T: Timestamp> {
     operator_frontiers: HashMap<usize, OperatorFrontierState<T>>,
     /// Sorted operator indices for deterministic iteration.
     operator_indices: Vec<usize>,
+    /// Operator indices that have progress buffers (materialized, not ghost).
+    /// Used by `collect_operator_progress` to skip ghost operators.
+    materialized_indices: Vec<usize>,
     /// Whether initial capabilities have been seeded.
     initialized: bool,
     /// Whether the dataflow has completed (no outstanding capabilities).
@@ -582,7 +611,9 @@ impl<T: Timestamp> ProgressTracker<T> {
     fn collect_operator_progress(&mut self) {
         let has_channels = self.progress_channels.is_some();
 
-        for &index in &self.operator_indices {
+        // Only iterate materialized operators (not ghost). Ghost operators
+        // have no progress buffers — their progress comes from peers.
+        for &index in &self.materialized_indices {
             let progress = &self.progress_buffers[&index];
             let shape = &self.operators[&index];
 
@@ -653,18 +684,6 @@ impl<T: Timestamp> ProgressTracker<T> {
                     }
                     for batch in batches {
                         for (op_idx, output_port, time, diff) in batch {
-                            // Skip changes for operators not in this worker's
-                            // reachability graph. This happens with per-stage
-                            // materialization: a peer worker may participate in
-                            // stages that this worker does not.
-                            //
-                            // NOTE(Phase 9): This means frontier-dependent
-                            // operators won't see upstream frontier advances
-                            // from non-materialized stages. Phase 9 (per-stage
-                            // progress exchange) will fix this properly.
-                            if !self.operators.contains_key(&op_idx) {
-                                continue;
-                            }
                             self.tracker.update_source(op_idx, output_port, time, diff);
                         }
                     }
