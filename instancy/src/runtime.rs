@@ -2978,11 +2978,11 @@ impl<T: Timestamp> SpawnedDataflow<T> {
     /// # Example
     ///
     /// ```ignore
-    /// // Async:
+    /// // Async — consumes the handle:
     /// let result = handle.join().await;
     ///
-    /// // Sync (blocks current thread):
-    /// let result = handle.join().wait();
+    /// // Or sync — also consumes the handle:
+    /// // let result = handle.join().wait();
     /// ```
     pub fn join(mut self) -> DataflowCompletion {
         self.completion
