@@ -1071,6 +1071,24 @@ stream.rebalance_to("spread", 4).output("results");
 > worker count. Per-stage parallelism (different `N` per stage) is not yet
 > implemented.
 
+#### Broadcast
+
+Clone all data to **every** worker (fan-out). Useful for distributing small
+reference data, configuration, or lookup tables that every worker needs:
+
+```rust
+// Every worker gets a complete copy of the config stream
+let config = config_stream.broadcast("share-config");
+config
+    .map("use-config", |_t, cfg| apply_config(cfg))
+    .output("results");
+```
+
+> **Warning:** Broadcast multiplies data volume by the worker count. Only use
+> for small datasets or control signals — never for large data streams.
+
+In single-worker mode, `broadcast` is a no-op pass-through (no cloning needed).
+
 ### Cross-Worker Error Propagation
 
 In multi-worker dataflows, if one worker's operator fails, all sibling workers
@@ -1488,6 +1506,7 @@ impl ExchangeData for MyRecord {
 | | `gather` | | All data → worker 0 |
 | | `rebalance` | | Round-robin across workers |
 | | `rebalance_to` | `(name, N)` | Round-robin to N workers |
+| | `broadcast` | | Clone all data to every worker |
 | **Progress** | `probe` | → `(Pipe, ProbeHandle)` | Track frontier progress |
 | **Loop** | `iterate` | `(\|Pipe\| -> Pipe, step)` | Feedback loop |
 | **Merge** | `merge` | `(other_pipe)` | Merge two streams |
