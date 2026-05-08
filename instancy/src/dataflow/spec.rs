@@ -204,12 +204,6 @@ impl<T: Timestamp, D: 'static> TypedInput<T, D> {
             type_name: std::any::type_name::<D>(),
         }
     }
-
-    /// Get a mutable reference to the inner input.
-    #[allow(dead_code)]
-    fn inner_mut(&mut self) -> &mut dyn TimestampedInput<T, D> {
-        &mut *self.inner
-    }
 }
 
 impl<T: Timestamp + 'static, D: Send + 'static> ErasedInput<T> for TypedInput<T, D> {
@@ -317,7 +311,7 @@ pub struct DataflowHandle<T: Timestamp, D> {
 
 impl<T: Timestamp, D> DataflowHandle<T, D> {
     /// Create a new dataflow handle.
-    #[allow(dead_code)]
+    #[cfg(test)]
     pub(crate) fn new(name: String, output_streams: Vec<OutputStream<T, D>>) -> Self {
         Self {
             name,
@@ -353,8 +347,8 @@ impl<T: Timestamp, D> DataflowHandle<T, D> {
         self.completed
     }
 
-    /// Mark the dataflow as completed (used internally).
-    #[allow(dead_code)]
+    /// Mark the dataflow as completed (used in tests).
+    #[cfg(test)]
     pub(crate) fn mark_completed(&mut self) {
         self.completed = true;
     }

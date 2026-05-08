@@ -270,7 +270,7 @@ impl<T: Timestamp> SubgraphBuilder<T> {
 
         ProgressTracker {
             tracker,
-            scope_summary,
+            _scope_summary: scope_summary,
             operators: self.operators,
             progress_buffers: self.progress_buffers,
             initial_capabilities: self.initial_capabilities,
@@ -326,8 +326,7 @@ pub struct ProgressTracker<T: Timestamp> {
     /// The reachability tracker that does the heavy lifting.
     tracker: Tracker<T>,
     /// Scope-level summary (retained for introspection).
-    #[allow(dead_code)]
-    scope_summary: PortConnectivity<T::Summary>,
+    _scope_summary: PortConnectivity<T::Summary>,
     /// Registered operator shapes.
     operators: HashMap<usize, OperatorShape>,
     /// Per-operator shared progress buffers.

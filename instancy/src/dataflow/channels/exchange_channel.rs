@@ -1158,7 +1158,8 @@ where
 /// across worker factory closures (each worker calls
 /// `materialize_source_worker`/`materialize_target_worker` once during
 /// Phase 5 materialization).
-#[allow(dead_code)] // Available for custom materializer integration
+/// Available for custom materializer integration.
+#[allow(dead_code)]
 pub(crate) fn create_exchange_factories_with<T, D>(
     num_workers: usize,
     exchange_fn: ExchangeFn<D>,

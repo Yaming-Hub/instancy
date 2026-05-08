@@ -478,8 +478,7 @@ impl ClusterCancelHandle {
 #[cfg(feature = "transport")]
 struct PeerRegistration {
     id: u64,
-    #[allow(dead_code)]
-    dataflow_name: String,
+    _dataflow_name: String, // retained for diagnostics
     cancel_handle: ClusterCancelHandle,
 }
 
@@ -555,7 +554,7 @@ impl PeerRegistry {
             let bucket = state.entries.entry(peer_id.clone()).or_default();
             bucket.push(PeerRegistration {
                 id,
-                dataflow_name: dataflow_name.to_string(),
+                _dataflow_name: dataflow_name.to_string(),
                 cancel_handle: ClusterCancelHandle {
                     worker_tokens: cancel_handle.worker_tokens.clone(),
                     bridge_cancel: cancel_handle.bridge_cancel.clone(),
@@ -1503,7 +1502,7 @@ impl RuntimeHandle {
             None
         };
         let mut control_pairs: Vec<Option<(ControlSender, ControlReceiver)>> = if num_workers > 1 {
-            let df_cancel = dataflow_cancel.as_ref().unwrap().clone();
+            let df_cancel = dataflow_cancel.as_ref().expect("dataflow_cancel set for multi-worker").clone();
             let (senders, receivers) = ControlBroadcast::new(num_workers, &wake_handles, df_cancel);
             senders
                 .into_iter()
@@ -1600,14 +1599,14 @@ impl RuntimeHandle {
             name: name.to_string(),
             num_workers,
             workers,
-            dataflow_cancel: dataflow_cancel.clone(),
+            _dataflow_cancel: dataflow_cancel.clone(),
             _phantom: PhantomData,
         };
 
         // If an external cancellation token was provided, spawn a bridge task
         // that propagates cancellation to all workers. Exits when either fires.
         if let Some(user_token) = external_cancel {
-            let cancel = if let Some(ref dc) = multi.dataflow_cancel {
+            let cancel = if let Some(ref dc) = multi._dataflow_cancel {
                 dc.clone()
             } else {
                 multi.workers[0].cancel.clone()
@@ -1813,7 +1812,7 @@ impl RuntimeHandle {
             None
         };
         let mut control_pairs: Vec<Option<(ControlSender, ControlReceiver)>> = if num_workers > 1 {
-            let df_cancel = dataflow_cancel.as_ref().unwrap().clone();
+            let df_cancel = dataflow_cancel.as_ref().expect("dataflow_cancel set for multi-worker").clone();
             let (senders, receivers) = ControlBroadcast::new(num_workers, &wake_handles, df_cancel);
             senders
                 .into_iter()
@@ -1893,13 +1892,13 @@ impl RuntimeHandle {
             name: name.to_string(),
             num_workers,
             workers,
-            dataflow_cancel: dataflow_cancel.clone(),
+            _dataflow_cancel: dataflow_cancel.clone(),
             _phantom: PhantomData,
         };
 
         // Bridge external cancellation token.
         if let Some(user_token) = external_cancel {
-            let cancel = if let Some(ref dc) = multi.dataflow_cancel {
+            let cancel = if let Some(ref dc) = multi._dataflow_cancel {
                 dc.clone()
             } else {
                 multi.workers[0].cancel.clone()
@@ -2083,7 +2082,7 @@ impl RuntimeHandle {
                             continue;
                         }
                         let peer_id = &node.node_id;
-                        let (peer_start, peer_end) = topology.worker_range(peer_id).unwrap();
+                        let (peer_start, peer_end) = topology.worker_range(peer_id).expect("topology node must have worker range");
                         for src in peer_start..peer_end {
                             for dst in local_start..local_end {
                                 let channel_id = NetworkEdgeMaterializer::<T, u8>::channel_id(
@@ -2104,7 +2103,7 @@ impl RuntimeHandle {
                         continue;
                     }
                     let peer_id = &node.node_id;
-                    let (peer_start, peer_end) = topology.worker_range(peer_id).unwrap();
+                    let (peer_start, peer_end) = topology.worker_range(peer_id).expect("topology node must have worker range");
                     for src in peer_start..peer_end {
                         for dst in local_start..local_end {
                             let ch_id = progress_channel_id(src, dst, total_workers);
@@ -2171,7 +2170,7 @@ impl RuntimeHandle {
                             continue;
                         }
                         let (peer_start, peer_end) =
-                            topology.worker_range(&node.node_id).unwrap();
+                            topology.worker_range(&node.node_id).expect("topology node must have worker range");
                         for src in peer_start..peer_end {
                             for dst in local_start..local_end {
                                 let ch_id = NetworkEdgeMaterializer::<T, u8>::channel_id(
@@ -2186,7 +2185,7 @@ impl RuntimeHandle {
                     if node.node_id == local_node_id {
                         continue;
                     }
-                    let (peer_start, peer_end) = topology.worker_range(&node.node_id).unwrap();
+                    let (peer_start, peer_end) = topology.worker_range(&node.node_id).expect("topology node must have worker range");
                     for src in peer_start..peer_end {
                         for dst in local_start..local_end {
                             let ch_id = progress_channel_id(src, dst, total_workers);
@@ -2272,7 +2271,7 @@ impl RuntimeHandle {
                     continue;
                 }
                 let peer_id = &node.node_id;
-                let (peer_start, peer_end) = topology.worker_range(peer_id).unwrap();
+                let (peer_start, peer_end) = topology.worker_range(peer_id).expect("topology node must have worker range");
                 let mut extracted = std::collections::HashMap::new();
                 if let Some(peer_map) = receivers.get_mut(peer_id) {
                     for src in peer_start..peer_end {
@@ -2360,7 +2359,7 @@ impl RuntimeHandle {
             .iter()
             .filter(|n| n.node_id != local_node_id)
             .map(|n| {
-                let (s, e) = topology.worker_range(&n.node_id).unwrap();
+                let (s, e) = topology.worker_range(&n.node_id).expect("topology node must have worker range");
                 (n.node_id.clone(), s, e)
             })
             .collect();
@@ -2373,7 +2372,7 @@ impl RuntimeHandle {
 
         // Spawn error monitoring tasks for shared transport mode.
         if let Some(error_rxs) = shared_error_receivers {
-            let df_cancel = dataflow_cancel.as_ref().unwrap().clone();
+            let df_cancel = dataflow_cancel.as_ref().expect("dataflow_cancel always set for cluster dataflows").clone();
             let bc = bridge_cancel.clone();
             for (peer_id, mut error_rx) in error_rxs {
                 let cancel = df_cancel.clone();
@@ -2403,7 +2402,7 @@ impl RuntimeHandle {
             .map(|i| wake_handles[i].clone())
             .collect();
         let mut control_pairs: Vec<Option<(ControlSender, ControlReceiver)>> = if num_local > 1 {
-            let df_cancel = dataflow_cancel.as_ref().unwrap().clone();
+            let df_cancel = dataflow_cancel.as_ref().expect("dataflow_cancel always set for cluster dataflows").clone();
             let (senders, receivers) =
                 ControlBroadcast::new(num_local, &local_wake_handles, df_cancel);
             senders
@@ -2563,7 +2562,7 @@ impl RuntimeHandle {
                 name: name.to_string(),
                 num_workers: num_local,
                 workers,
-                dataflow_cancel,
+                _dataflow_cancel: dataflow_cancel,
                 _phantom: PhantomData,
             }),
             local_worker_range: (local_start, local_end),
@@ -2981,7 +2980,7 @@ impl SimpleRuntime {
             name: name.to_string(),
             num_workers,
             workers,
-            dataflow_cancel: None, // SimpleRuntime uses dedicated threads, not shared task pool
+            _dataflow_cancel: None, // SimpleRuntime uses dedicated threads, not shared task pool
             _phantom: PhantomData,
         })
     }
@@ -3149,7 +3148,7 @@ impl DataflowCompletion {
                 .wait(state)
                 .map_err(|_| Error::Custom("completion mutex poisoned during wait".into()))?;
         }
-        interpret_completion(state.result.take().unwrap())
+        interpret_completion(state.result.take().expect("result available after wait loop"))
     }
 }
 
@@ -3538,8 +3537,7 @@ pub struct MultiSpawnedDataflow<T: Timestamp> {
     /// Cancelling this token cascades to all worker tokens.
     /// `None` for single-worker dataflows (no intermediate token).
     /// Held for lifetime — dropping cancels all workers.
-    #[allow(dead_code)]
-    dataflow_cancel: Option<CancellationToken>,
+    _dataflow_cancel: Option<CancellationToken>,
     _phantom: PhantomData<T>,
 }
 
@@ -3934,12 +3932,12 @@ pub struct ClusterSpawnedDataflow<T: Timestamp> {
 impl<T: Timestamp> ClusterSpawnedDataflow<T> {
     /// Get the dataflow name.
     pub fn name(&self) -> &str {
-        self.inner.as_ref().unwrap().name()
+        self.inner.as_ref().expect("not yet joined").name()
     }
 
     /// Number of LOCAL workers on this node.
     pub fn num_local_workers(&self) -> usize {
-        self.inner.as_ref().unwrap().num_workers()
+        self.inner.as_ref().expect("not yet joined").num_workers()
     }
 
     /// Total worker count across all nodes in the cluster.
@@ -3962,7 +3960,7 @@ impl<T: Timestamp> ClusterSpawnedDataflow<T> {
         local_idx: usize,
         name: &str,
     ) -> Result<crate::dataflow::channel_operators::InputSender<T, D>> {
-        self.inner.as_mut().unwrap().take_input(local_idx, name)
+        self.inner.as_mut().expect("not yet joined").take_input(local_idx, name)
     }
 
     /// Take the output receiver from a local worker.
@@ -3973,7 +3971,7 @@ impl<T: Timestamp> ClusterSpawnedDataflow<T> {
         local_idx: usize,
         name: &str,
     ) -> Result<crate::dataflow::channel_operators::OutputReceiver<T, D>> {
-        self.inner.as_mut().unwrap().take_output(local_idx, name)
+        self.inner.as_mut().expect("not yet joined").take_output(local_idx, name)
     }
 
     /// Cancel all local workers and tear down the cluster.

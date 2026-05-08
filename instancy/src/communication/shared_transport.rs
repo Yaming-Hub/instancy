@@ -116,7 +116,8 @@ struct DataflowRegistration {
 /// - Per-connection writer tasks
 /// - Shared reader tasks (demux + reorder)
 /// - RTT probing and adaptive scaling
-#[allow(dead_code)] // Fields are used via Arc clones in spawned tasks
+// Fields are used via Arc clones in spawned tasks.
+#[allow(dead_code)]
 pub struct SharedPeerManager {
     /// The remote peer's node ID.
     peer_node_id: String,

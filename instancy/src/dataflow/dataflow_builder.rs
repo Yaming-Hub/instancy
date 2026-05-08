@@ -83,7 +83,6 @@ pub(crate) struct InputPortInfo {
 
 /// Metadata for a named output port in the logical dataflow.
 #[derive(Debug, Clone)]
-#[allow(dead_code)] // Fields used in Phase C (async runtime integration)
 pub(crate) struct OutputPortInfo {
     /// User-visible name of this output.
     pub(crate) name: String,
