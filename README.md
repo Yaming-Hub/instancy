@@ -315,6 +315,7 @@ cargo run -p instancy --example <name>
 | `delay` | Delay operators: windowing, priority routing, time shifting |
 | `broadcast` | Multi-worker broadcast replication |
 | `cancellation` | Cooperative cancellation with `CancellationToken` |
+| `graceful_drain` | Drain in-flight data on cancellation instead of stopping |
 | `error_handling` | Result combinators: map_ok, filter_ok, branch_result |
 | `panic_recovery` | Operator panic recovery with catch_panics |
 
@@ -390,6 +391,7 @@ cargo test --all-features --test cluster_tcp
 | `tests/observability.rs` | Metrics and tracing |
 | `tests/scheduler_policies.rs` | Task scheduler policy tests |
 | `tests/timeout.rs` | Timeout and cancellation tests |
+| `tests/graceful_drain.rs` | Graceful drain on cancellation tests |
 
 ## Project Structure
 
@@ -410,7 +412,7 @@ instancy/
 │   │   ├── control_protocol.rs   # Fingerprint exchange + ready barrier
 │   │   └── codec.rs              # Codec trait + built-in implementations
 │   └── order.rs                  # Timestamp types (Product for nested scopes)
-├── examples/                     # 33 runnable examples
+├── examples/                     # 34 runnable examples
 ├── tests/                        # Integration tests
 └── Cargo.toml
 ```

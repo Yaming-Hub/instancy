@@ -1003,7 +1003,11 @@ impl<T: Timestamp> DataflowExecutor<T> {
                 }
                 SweepOutcome::Idle => {
                     // No progress this sweep but not quiescent yet.
-                    // In sync mode, just loop again (tight poll).
+                    // During drain, sleep briefly to avoid 100% CPU spin while
+                    // waiting for the drain deadline to fire.
+                    if self.draining {
+                        std::thread::sleep(std::time::Duration::from_millis(1));
+                    }
                 }
                 SweepOutcome::WaitingForInput => {
                     // External inputs still open. In sync mode, sleep briefly
@@ -1348,9 +1352,13 @@ impl<T: Timestamp> DataflowExecutor<T> {
                 // - Tracker not completed: outstanding capabilities somewhere
                 // - Peers not synced: initial caps still in transit
                 // - Pending peer progress: buffered updates not yet absorbed
-                if !tracker.is_completed()
-                    || !tracker.all_peers_synced()
-                    || tracker.has_pending_peer_progress()
+                //
+                // During drain mode, we don't wait — the drain deadline
+                // controls when to give up, not the progress tracker.
+                if !self.draining
+                    && (!tracker.is_completed()
+                        || !tracker.all_peers_synced()
+                        || tracker.has_pending_peer_progress())
                 {
                     self.consecutive_idle = 0;
                     return Ok(SweepOutcome::WaitingForInput);
@@ -1359,8 +1367,23 @@ impl<T: Timestamp> DataflowExecutor<T> {
 
             // Quiescent — no operator made progress.
             // During drain mode, quiescence means all in-flight data has been
-            // processed — treat this as successful completion.
+            // processed — treat this as successful completion, BUT only if the
+            // progress tracker agrees (if present). If the tracker shows
+            // outstanding capabilities, the dataflow isn't truly done — keep
+            // draining until the deadline.
             if self.draining {
+                let tracker_active = self
+                    .progress_tracker
+                    .as_ref()
+                    .is_some_and(|t| !t.is_completed());
+                if tracker_active {
+                    // Dataflow still has outstanding capabilities but no progress.
+                    // Return Idle to let the drain deadline check fire next sweep.
+                    // In sync mode, run_loop adds a brief sleep to avoid spin-busy.
+                    // In async mode, Idle respects poll budget and self-wakes.
+                    self.consecutive_idle = 0;
+                    return Ok(SweepOutcome::Idle);
+                }
                 return Ok(SweepOutcome::Completed);
             }
             return Ok(SweepOutcome::Quiescent);
