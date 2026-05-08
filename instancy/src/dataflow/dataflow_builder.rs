@@ -390,7 +390,7 @@ impl<T: Timestamp> DataflowBuilder<T> {
                 .register_operator(crate::dataflow::graph::OperatorInfo::new(
                     op_idx, &name, stage_id, 0, 1,
                 ))
-                .expect("operator index unique");
+                .unwrap_or_else(|_| panic!("operator index unique"));
 
             // Register in subgraph builder with initial capability.
             // The input source holds a capability at T::minimum() until closed.
@@ -450,11 +450,17 @@ impl<T: Timestamp> DataflowBuilder<T> {
                                             .output_pushers
                                             .into_iter()
                                             .map(|any_box| {
-                                                *any_box.downcast::<Box<dyn Push<T, D>>>().expect(
-                                                    "channel source output pusher type mismatch",
-                                                )
+                                                any_box
+                                                    .downcast::<Box<dyn Push<T, D>>>()
+                                                    .map(|boxed| *boxed)
+                                                    .map_err(|_| {
+                                                        Error::Custom(
+                                                            "channel source output pusher type mismatch"
+                                                                .into(),
+                                                        )
+                                                    })
                                             })
-                                            .collect();
+                                            .collect::<Result<_>>()?;
                                         tee_or_single(pushers).unwrap_or_else(|| Box::new(NullPush))
                                     };
                                     let op = ChannelSourceOperator::new(
@@ -488,11 +494,17 @@ impl<T: Timestamp> DataflowBuilder<T> {
                                             .output_pushers
                                             .into_iter()
                                             .map(|any_box| {
-                                                *any_box.downcast::<Box<dyn Push<T, D>>>().expect(
-                                                    "channel source output pusher type mismatch",
-                                                )
+                                                any_box
+                                                    .downcast::<Box<dyn Push<T, D>>>()
+                                                    .map(|boxed| *boxed)
+                                                    .map_err(|_| {
+                                                        Error::Custom(
+                                                            "channel source output pusher type mismatch"
+                                                                .into(),
+                                                        )
+                                                    })
                                             })
-                                            .collect();
+                                            .collect::<Result<_>>()?;
                                         tee_or_single(pushers).unwrap_or_else(|| Box::new(NullPush))
                                     };
                                     let op = ChannelSourceOperator::new(
@@ -556,7 +568,7 @@ impl<T: Timestamp> DataflowBuilder<T> {
                 .register_operator(crate::dataflow::graph::OperatorInfo::new(
                     op_idx, &name, stage_id, 0, 1,
                 ))
-                .expect("operator index unique");
+                .unwrap_or_else(|_| panic!("operator index unique"));
 
             // Register in subgraph builder with initial capability.
             let mut initial_cap = ChangeBatch::new();
@@ -582,11 +594,14 @@ impl<T: Timestamp> DataflowBuilder<T> {
                             .output_pushers
                             .into_iter()
                             .map(|any_box| {
-                                *any_box
+                                any_box
                                     .downcast::<Box<dyn Push<T, D>>>()
-                                    .expect("source output pusher type mismatch")
+                                    .map(|boxed| *boxed)
+                                    .map_err(|_| {
+                                        Error::Custom("source output pusher type mismatch".into())
+                                    })
                             })
-                            .collect();
+                            .collect::<Result<_>>()?;
                         tee_or_single(pushers).unwrap_or_else(|| Box::new(NullPush))
                     };
 
@@ -670,7 +685,7 @@ impl<T: Timestamp> DataflowBuilder<T> {
                 .register_operator(crate::dataflow::graph::OperatorInfo::new(
                     op_idx, &name, stage_id, 0, 1,
                 ))
-                .expect("operator index unique");
+                .unwrap_or_else(|_| panic!("operator index unique"));
 
             // Register in subgraph builder with initial capability.
             let mut initial_cap = ChangeBatch::new();
@@ -707,11 +722,11 @@ impl<T: Timestamp> DataflowBuilder<T> {
                                 .output_pushers
                                 .into_iter()
                                 .map(|any_box| {
-                                    *any_box
+                                any_box
                                         .downcast::<Box<dyn Push<T, D>>>()
-                                        .expect("async source output pusher type mismatch")
-                                })
-                                .collect();
+                                        .map(|boxed| *boxed).map_err(|_| Error::Custom("async source output pusher type mismatch".into()))
+                            })
+                            .collect::<Result<_>>()?;
                             tee_or_single(pushers).unwrap_or_else(|| Box::new(NullPush))
                         };
                         let op = ChannelSourceOperator::new(
@@ -729,10 +744,24 @@ impl<T: Timestamp> DataflowBuilder<T> {
                     // Build pump task: runs the user's producer in a small tokio runtime.
                     let pump_wake = wake_handle;
                     let pump: Box<dyn FnOnce() + Send> = Box::new(move || {
-                        let rt = tokio::runtime::Builder::new_current_thread()
+                        let rt = match tokio::runtime::Builder::new_current_thread()
                             .enable_all()
                             .build()
-                            .expect("failed to create pump runtime");
+                        {
+                            Ok(rt) => rt,
+                            Err(err) => {
+                                #[cfg(feature = "tracing")]
+                                tracing::warn!(
+                                    source = %wiring_name,
+                                    error = %err,
+                                    "failed to create pump runtime"
+                                );
+                                let _ = err;
+                                // Notify the executor so it can detect the dropped sender.
+                                pump_wake.notify();
+                                return;
+                            }
+                        };
                         rt.block_on(async move {
                             // Run producer with cancellation support.
                             tokio::select! {
@@ -1145,7 +1174,7 @@ impl<T: Timestamp, D: Clone + Send + 'static> Pipe<T, D> {
             .register_operator(crate::dataflow::graph::OperatorInfo::new(
                 op_idx, &name, stage_id, 1, 0,
             ))
-            .expect("operator index unique");
+            .unwrap_or_else(|_| panic!("operator index unique"));
 
         // Edge from upstream
         state.graph.add_edge(crate::dataflow::graph::EdgeInfo::new(
@@ -1171,10 +1200,8 @@ impl<T: Timestamp, D: Clone + Send + 'static> Pipe<T, D> {
                 let input_puller: Box<dyn Pull<T, D>> = *endpoints
                     .input_pullers
                     .into_iter()
-                    .next()
-                    .expect("for_each sink must have input puller")
-                    .downcast::<Box<dyn Pull<T, D>>>()
-                    .expect("for_each input puller type mismatch");
+                    .next().ok_or_else(|| Error::Custom("for_each sink must have input puller".into()))?
+                    .downcast::<Box<dyn Pull<T, D>>>().map_err(|_| Error::Custom("for_each input puller type mismatch".into()))?;
 
                 Ok(Box::new(ForEachSink::new(
                     name_clone,
@@ -1774,7 +1801,7 @@ impl<T: Timestamp, D: Clone + Send + 'static> Pipe<T, D> {
                 .register_operator(crate::dataflow::graph::OperatorInfo::new(
                     op_idx, &name, stage_id, 2, 1,
                 ))
-                .expect("operator index unique");
+                .unwrap_or_else(|_| panic!("operator index unique"));
 
             // Edge from self → slot 0
             state.graph.add_edge(crate::dataflow::graph::EdgeInfo::new(
@@ -1817,27 +1844,23 @@ impl<T: Timestamp, D: Clone + Send + 'static> Pipe<T, D> {
                     let mut pullers = endpoints.input_pullers.into_iter();
 
                     let input1_puller: Box<dyn Pull<T, D>> = *pullers
-                        .next()
-                        .expect("binary must have input puller 0")
-                        .downcast::<Box<dyn Pull<T, D>>>()
-                        .expect("binary input1 puller type mismatch");
+                        .next().ok_or_else(|| Error::Custom("binary must have input puller 0".into()))?
+                        .downcast::<Box<dyn Pull<T, D>>>().map_err(|_| Error::Custom("binary input1 puller type mismatch".into()))?;
 
                     let input2_puller: Box<dyn Pull<T, D2>> = *pullers
-                        .next()
-                        .expect("binary must have input puller 1")
-                        .downcast::<Box<dyn Pull<T, D2>>>()
-                        .expect("binary input2 puller type mismatch");
+                        .next().ok_or_else(|| Error::Custom("binary must have input puller 1".into()))?
+                        .downcast::<Box<dyn Pull<T, D2>>>().map_err(|_| Error::Custom("binary input2 puller type mismatch".into()))?;
 
                     let output_pusher: Box<dyn Push<T, D3>> = {
                         let pushers: Vec<Box<dyn Push<T, D3>>> = endpoints
                             .output_pushers
                             .into_iter()
                             .map(|any_box| {
-                                *any_box
+                                any_box
                                     .downcast::<Box<dyn Push<T, D3>>>()
-                                    .expect("binary output pusher type mismatch")
+                                    .map(|boxed| *boxed).map_err(|_| Error::Custom("binary output pusher type mismatch".into()))
                             })
-                            .collect();
+                            .collect::<Result<_>>()?;
                         tee_or_single(pushers).unwrap_or_else(|| Box::new(NullPush))
                     };
 
@@ -1968,7 +1991,7 @@ impl<T: Timestamp, D: Clone + Send + 'static> Pipe<T, D> {
                     1,
                     1,
                 ))
-                .expect("operator index unique");
+                .unwrap_or_else(|_| panic!("operator index unique"));
             state.graph.add_edge(crate::dataflow::graph::EdgeInfo::new(
                 Slot::new(self.op_idx, self.output_slot),
                 Slot::new(enter_idx, 0),
@@ -1995,21 +2018,19 @@ impl<T: Timestamp, D: Clone + Send + 'static> Pipe<T, D> {
                     let input_puller: Box<dyn Pull<T, D>> = *endpoints
                         .input_pullers
                         .into_iter()
-                        .next()
-                        .expect("enter must have input puller")
-                        .downcast::<Box<dyn Pull<T, D>>>()
-                        .expect("enter input puller type mismatch");
+                        .next().ok_or_else(|| Error::Custom("enter must have input puller".into()))?
+                        .downcast::<Box<dyn Pull<T, D>>>().map_err(|_| Error::Custom("enter input puller type mismatch".into()))?;
 
                     let output_pusher: Box<dyn Push<PT<T, TInner>, D>> = {
                         let pushers: Vec<Box<dyn Push<PT<T, TInner>, D>>> = endpoints
                             .output_pushers
                             .into_iter()
                             .map(|any_box| {
-                                *any_box
+                                any_box
                                     .downcast::<Box<dyn Push<PT<T, TInner>, D>>>()
-                                    .expect("enter output pusher type mismatch")
+                                    .map(|boxed| *boxed).map_err(|_| Error::Custom("enter output pusher type mismatch".into()))
                             })
-                            .collect();
+                            .collect::<Result<_>>()?;
                         tee_or_single(pushers).unwrap_or_else(|| Box::new(NullPush))
                     };
 
@@ -2049,7 +2070,7 @@ impl<T: Timestamp, D: Clone + Send + 'static> Pipe<T, D> {
                     1,
                     1,
                 ))
-                .expect("operator index unique");
+                .unwrap_or_else(|_| panic!("operator index unique"));
             // Subgraph registration for feedback
             state.subgraph_builder.add_operator(
                 feedback_idx,
@@ -2067,21 +2088,19 @@ impl<T: Timestamp, D: Clone + Send + 'static> Pipe<T, D> {
                     let input_puller: Box<dyn Pull<PT<T, TInner>, D>> = *endpoints
                         .input_pullers
                         .into_iter()
-                        .next()
-                        .expect("feedback must have input puller")
-                        .downcast::<Box<dyn Pull<PT<T, TInner>, D>>>()
-                        .expect("feedback input puller type mismatch");
+                        .next().ok_or_else(|| Error::Custom("feedback must have input puller".into()))?
+                        .downcast::<Box<dyn Pull<PT<T, TInner>, D>>>().map_err(|_| Error::Custom("feedback input puller type mismatch".into()))?;
 
                     let output_pusher: Box<dyn Push<PT<T, TInner>, D>> = {
                         let pushers: Vec<Box<dyn Push<PT<T, TInner>, D>>> = endpoints
                             .output_pushers
                             .into_iter()
                             .map(|any_box| {
-                                *any_box
+                                any_box
                                     .downcast::<Box<dyn Push<PT<T, TInner>, D>>>()
-                                    .expect("feedback output pusher type mismatch")
+                                    .map(|boxed| *boxed).map_err(|_| Error::Custom("feedback output pusher type mismatch".into()))
                             })
-                            .collect();
+                            .collect::<Result<_>>()?;
                         tee_or_single(pushers).unwrap_or_else(|| Box::new(NullPush))
                     };
 
@@ -2109,7 +2128,7 @@ impl<T: Timestamp, D: Clone + Send + 'static> Pipe<T, D> {
                     2,
                     1,
                 ))
-                .expect("operator index unique");
+                .unwrap_or_else(|_| panic!("operator index unique"));
             // Edge: enter → concat input 0
             state.graph.add_edge(crate::dataflow::graph::EdgeInfo::new(
                 Slot::new(enter_idx, 0),
@@ -2159,22 +2178,22 @@ impl<T: Timestamp, D: Clone + Send + 'static> Pipe<T, D> {
                         .input_pullers
                         .into_iter()
                         .map(|any_box| {
-                            *any_box
+                                any_box
                                 .downcast::<Box<dyn Pull<PT<T, TInner>, D>>>()
-                                .expect("concat input puller type mismatch")
-                        })
-                        .collect();
+                                .map(|boxed| *boxed).map_err(|_| Error::Custom("concat input puller type mismatch".into()))
+                            })
+                            .collect::<Result<_>>()?;
 
                     let output_pusher: Box<dyn Push<PT<T, TInner>, D>> = {
                         let pushers: Vec<Box<dyn Push<PT<T, TInner>, D>>> = endpoints
                             .output_pushers
                             .into_iter()
                             .map(|any_box| {
-                                *any_box
+                                any_box
                                     .downcast::<Box<dyn Push<PT<T, TInner>, D>>>()
-                                    .expect("concat output pusher type mismatch")
+                                    .map(|boxed| *boxed).map_err(|_| Error::Custom("concat output pusher type mismatch".into()))
                             })
-                            .collect();
+                            .collect::<Result<_>>()?;
                         tee_or_single(pushers).unwrap_or_else(|| Box::new(NullPush))
                     };
 
@@ -2228,7 +2247,7 @@ impl<T: Timestamp, D: Clone + Send + 'static> Pipe<T, D> {
                     1,
                     1,
                 ))
-                .expect("operator index unique");
+                .unwrap_or_else(|_| panic!("operator index unique"));
             // Subgraph registration for leave
             state.subgraph_builder.add_operator(
                 leave_idx,
@@ -2310,7 +2329,7 @@ impl<T: Timestamp, D: Clone + Send + 'static> Pipe<T, D> {
                 state
                     .graph
                     .register_operator(op.clone())
-                    .expect("inner operator index conflict");
+                    .unwrap_or_else(|_| panic!("inner operator index conflict"));
             }
             // Merge inner edges with offset: inner edge 0 becomes parent edge N
             let inner_edge_offset = state.graph.edges().len();
@@ -2415,21 +2434,19 @@ impl<T: Timestamp, D: Clone + Send + 'static> Pipe<T, D> {
                     let input_puller: Box<dyn Pull<PT<T, TInner>, D>> = *endpoints
                         .input_pullers
                         .into_iter()
-                        .next()
-                        .expect("leave must have input puller")
-                        .downcast::<Box<dyn Pull<PT<T, TInner>, D>>>()
-                        .expect("leave input puller type mismatch");
+                        .next().ok_or_else(|| Error::Custom("leave must have input puller".into()))?
+                        .downcast::<Box<dyn Pull<PT<T, TInner>, D>>>().map_err(|_| Error::Custom("leave input puller type mismatch".into()))?;
 
                     let output_pusher: Box<dyn Push<T, D>> = {
                         let pushers: Vec<Box<dyn Push<T, D>>> = endpoints
                             .output_pushers
                             .into_iter()
                             .map(|any_box| {
-                                *any_box
+                                any_box
                                     .downcast::<Box<dyn Push<T, D>>>()
-                                    .expect("leave output pusher type mismatch")
+                                    .map(|boxed| *boxed).map_err(|_| Error::Custom("leave output pusher type mismatch".into()))
                             })
-                            .collect();
+                            .collect::<Result<_>>()?;
                         tee_or_single(pushers).unwrap_or_else(|| Box::new(NullPush))
                     };
 
@@ -2512,7 +2529,7 @@ impl<T: Timestamp, D: Clone + Send + 'static> Pipe<T, D> {
                 .register_operator(crate::dataflow::graph::OperatorInfo::new(
                     op_idx, "concat", stage_id, num_inputs, 1,
                 ))
-                .expect("operator index unique");
+                .unwrap_or_else(|_| panic!("operator index unique"));
 
             // Edges and channel factories for each input
             let mut edge_indices = Vec::with_capacity(num_inputs);
@@ -2548,22 +2565,22 @@ impl<T: Timestamp, D: Clone + Send + 'static> Pipe<T, D> {
                         .input_pullers
                         .into_iter()
                         .map(|any_box| {
-                            *any_box
+                                any_box
                                 .downcast::<Box<dyn Pull<T, D>>>()
-                                .expect("concat input puller type mismatch")
-                        })
-                        .collect();
+                                .map(|boxed| *boxed).map_err(|_| Error::Custom("concat input puller type mismatch".into()))
+                            })
+                            .collect::<Result<_>>()?;
 
                     let output_pusher: Box<dyn Push<T, D>> = {
                         let pushers: Vec<Box<dyn Push<T, D>>> = endpoints
                             .output_pushers
                             .into_iter()
                             .map(|any_box| {
-                                *any_box
+                                any_box
                                     .downcast::<Box<dyn Push<T, D>>>()
-                                    .expect("concat output pusher type mismatch")
+                                    .map(|boxed| *boxed).map_err(|_| Error::Custom("concat output pusher type mismatch".into()))
                             })
-                            .collect();
+                            .collect::<Result<_>>()?;
                         tee_or_single(pushers).unwrap_or_else(|| Box::new(NullPush))
                     };
 
@@ -2644,7 +2661,7 @@ impl<T: Timestamp, D: Clone + Send + 'static> Pipe<T, D> {
                 .register_operator(crate::dataflow::graph::OperatorInfo::new(
                     op_idx, &name, stage_id, 1, 0,
                 ))
-                .expect("operator index unique");
+                .unwrap_or_else(|_| panic!("operator index unique"));
 
             // Edge from upstream
             state.graph.add_edge(crate::dataflow::graph::EdgeInfo::new(
@@ -2678,10 +2695,8 @@ impl<T: Timestamp, D: Clone + Send + 'static> Pipe<T, D> {
                     let input_puller: Box<dyn Pull<T, D>> = *endpoints
                         .input_pullers
                         .into_iter()
-                        .next()
-                        .expect("sink must have input puller")
-                        .downcast::<Box<dyn Pull<T, D>>>()
-                        .expect("sink input puller type mismatch");
+                        .next().ok_or_else(|| Error::Custom("sink must have input puller".into()))?
+                        .downcast::<Box<dyn Pull<T, D>>>().map_err(|_| Error::Custom("sink input puller type mismatch".into()))?;
 
                     Ok(Box::new(CollectingSink::new(
                         name_clone,
@@ -2714,10 +2729,8 @@ impl<T: Timestamp, D: Clone + Send + 'static> Pipe<T, D> {
                                 let input_puller: Box<dyn Pull<T, D>> = *endpoints
                                     .input_pullers
                                     .into_iter()
-                                    .next()
-                                    .expect("sink must have input puller")
-                                    .downcast::<Box<dyn Pull<T, D>>>()
-                                    .expect("sink input puller type mismatch");
+                                    .next().ok_or_else(|| Error::Custom("sink must have input puller".into()))?
+                                    .downcast::<Box<dyn Pull<T, D>>>().map_err(|_| Error::Custom("sink input puller type mismatch".into()))?;
 
                                 Ok(Box::new(ChannelSinkOperator::new(
                                     sink_name_inner,
@@ -2747,10 +2760,8 @@ impl<T: Timestamp, D: Clone + Send + 'static> Pipe<T, D> {
                                 let input_puller: Box<dyn Pull<T, D>> = *endpoints
                                     .input_pullers
                                     .into_iter()
-                                    .next()
-                                    .expect("sink must have input puller")
-                                    .downcast::<Box<dyn Pull<T, D>>>()
-                                    .expect("sink input puller type mismatch");
+                                    .next().ok_or_else(|| Error::Custom("sink must have input puller".into()))?
+                                    .downcast::<Box<dyn Pull<T, D>>>().map_err(|_| Error::Custom("sink input puller type mismatch".into()))?;
 
                                 Ok(Box::new(ChannelSinkOperator::new(
                                     sink_name_inner,
@@ -3430,7 +3441,7 @@ impl<T: Timestamp, D: Clone + Send + 'static> Pipe<T, D> {
                 .register_operator(crate::dataflow::graph::OperatorInfo::new(
                     op_idx, "exchange", stage_id, 1, 1,
                 ))
-                .expect("operator index unique");
+                .unwrap_or_else(|_| panic!("operator index unique"));
 
             // Edge from upstream — marked as Exchange.
             state
@@ -3471,21 +3482,19 @@ impl<T: Timestamp, D: Clone + Send + 'static> Pipe<T, D> {
                     let input_puller: Box<dyn Pull<T, D>> = *endpoints
                         .input_pullers
                         .into_iter()
-                        .next()
-                        .expect("exchange must have input puller")
-                        .downcast::<Box<dyn Pull<T, D>>>()
-                        .expect("exchange input puller type mismatch");
+                        .next().ok_or_else(|| Error::Custom("exchange must have input puller".into()))?
+                        .downcast::<Box<dyn Pull<T, D>>>().map_err(|_| Error::Custom("exchange input puller type mismatch".into()))?;
 
                     let output_pusher: Box<dyn Push<T, D>> = {
                         let pushers: Vec<Box<dyn Push<T, D>>> = endpoints
                             .output_pushers
                             .into_iter()
                             .map(|any_box| {
-                                *any_box
+                                any_box
                                     .downcast::<Box<dyn Push<T, D>>>()
-                                    .expect("exchange output pusher type mismatch")
+                                    .map(|boxed| *boxed).map_err(|_| Error::Custom("exchange output pusher type mismatch".into()))
                             })
-                            .collect();
+                            .collect::<Result<_>>()?;
                         tee_or_single(pushers).unwrap_or_else(|| Box::new(NullPush))
                     };
 
@@ -3568,7 +3577,7 @@ impl<T: Timestamp, D: Clone + Send + 'static> Pipe<T, D> {
                 .register_operator(crate::dataflow::graph::OperatorInfo::new(
                     op_idx, "broadcast", stage_id, 1, 1,
                 ))
-                .expect("operator index unique");
+                .unwrap_or_else(|_| panic!("operator index unique"));
 
             // Edge from upstream — marked as Exchange (broadcast uses same infrastructure).
             state
@@ -3605,21 +3614,19 @@ impl<T: Timestamp, D: Clone + Send + 'static> Pipe<T, D> {
                     let input_puller: Box<dyn Pull<T, D>> = *endpoints
                         .input_pullers
                         .into_iter()
-                        .next()
-                        .expect("broadcast must have input puller")
-                        .downcast::<Box<dyn Pull<T, D>>>()
-                        .expect("broadcast input puller type mismatch");
+                        .next().ok_or_else(|| Error::Custom("broadcast must have input puller".into()))?
+                        .downcast::<Box<dyn Pull<T, D>>>().map_err(|_| Error::Custom("broadcast input puller type mismatch".into()))?;
 
                     let output_pusher: Box<dyn Push<T, D>> = {
                         let pushers: Vec<Box<dyn Push<T, D>>> = endpoints
                             .output_pushers
                             .into_iter()
                             .map(|any_box| {
-                                *any_box
+                                any_box
                                     .downcast::<Box<dyn Push<T, D>>>()
-                                    .expect("broadcast output pusher type mismatch")
+                                    .map(|boxed| *boxed).map_err(|_| Error::Custom("broadcast output pusher type mismatch".into()))
                             })
-                            .collect();
+                            .collect::<Result<_>>()?;
                         tee_or_single(pushers).unwrap_or_else(|| Box::new(NullPush))
                     };
 
@@ -3730,7 +3737,7 @@ impl<T: Timestamp, D: Clone + Send + 'static> Pipe<T, D> {
                 .register_operator(crate::dataflow::graph::OperatorInfo::new(
                     op_idx, &name, stage_id, 1, 1,
                 ))
-                .expect("operator index unique");
+                .unwrap_or_else(|_| panic!("operator index unique"));
 
             // Edge from upstream
             state.graph.add_edge(crate::dataflow::graph::EdgeInfo::new(
@@ -3761,21 +3768,19 @@ impl<T: Timestamp, D: Clone + Send + 'static> Pipe<T, D> {
                     let input_puller: Box<dyn Pull<T, D>> = *endpoints
                         .input_pullers
                         .into_iter()
-                        .next()
-                        .expect("unary must have input puller")
-                        .downcast::<Box<dyn Pull<T, D>>>()
-                        .expect("unary input puller type mismatch");
+                        .next().ok_or_else(|| Error::Custom("unary must have input puller".into()))?
+                        .downcast::<Box<dyn Pull<T, D>>>().map_err(|_| Error::Custom("unary input puller type mismatch".into()))?;
 
                     let output_pusher: Box<dyn Push<T, D2>> = {
                         let pushers: Vec<Box<dyn Push<T, D2>>> = endpoints
                             .output_pushers
                             .into_iter()
                             .map(|any_box| {
-                                *any_box
+                                any_box
                                     .downcast::<Box<dyn Push<T, D2>>>()
-                                    .expect("unary output pusher type mismatch")
+                                    .map(|boxed| *boxed).map_err(|_| Error::Custom("unary output pusher type mismatch".into()))
                             })
-                            .collect();
+                            .collect::<Result<_>>()?;
                         tee_or_single(pushers).unwrap_or_else(|| Box::new(NullPush))
                     };
 
@@ -3840,7 +3845,7 @@ impl<T: Timestamp, D: Clone + Send + 'static> Pipe<T, D> {
                 .register_operator(crate::dataflow::graph::OperatorInfo::new(
                     op_idx, &name, stage_id, 1, 1,
                 ))
-                .expect("operator index unique");
+                .unwrap_or_else(|_| panic!("operator index unique"));
 
             // Edge from upstream
             state.graph.add_edge(crate::dataflow::graph::EdgeInfo::new(
@@ -3870,21 +3875,19 @@ impl<T: Timestamp, D: Clone + Send + 'static> Pipe<T, D> {
                     let input_puller: Box<dyn Pull<T, D>> = *endpoints
                         .input_pullers
                         .into_iter()
-                        .next()
-                        .expect("unary must have input puller")
-                        .downcast::<Box<dyn Pull<T, D>>>()
-                        .expect("unary input puller type mismatch");
+                        .next().ok_or_else(|| Error::Custom("unary must have input puller".into()))?
+                        .downcast::<Box<dyn Pull<T, D>>>().map_err(|_| Error::Custom("unary input puller type mismatch".into()))?;
 
                     let output_pusher: Box<dyn Push<T, D2>> = {
                         let pushers: Vec<Box<dyn Push<T, D2>>> = endpoints
                             .output_pushers
                             .into_iter()
                             .map(|any_box| {
-                                *any_box
+                                any_box
                                     .downcast::<Box<dyn Push<T, D2>>>()
-                                    .expect("unary output pusher type mismatch")
+                                    .map(|boxed| *boxed).map_err(|_| Error::Custom("unary output pusher type mismatch".into()))
                             })
-                            .collect();
+                            .collect::<Result<_>>()?;
                         tee_or_single(pushers).unwrap_or_else(|| Box::new(NullPush))
                     };
 
@@ -3963,7 +3966,7 @@ impl<T: Timestamp, D: Clone + Send + 'static> Pipe<T, D> {
                 .register_operator(crate::dataflow::graph::OperatorInfo::new(
                     op_idx, &name, stage_id, 1, 1,
                 ))
-                .expect("operator index unique");
+                .unwrap_or_else(|_| panic!("operator index unique"));
 
             // Edge from upstream
             state.graph.add_edge(crate::dataflow::graph::EdgeInfo::new(
@@ -4005,21 +4008,19 @@ impl<T: Timestamp, D: Clone + Send + 'static> Pipe<T, D> {
                     let input_puller: Box<dyn Pull<T, D>> = *endpoints
                         .input_pullers
                         .into_iter()
-                        .next()
-                        .expect("unary_notify must have input puller")
-                        .downcast::<Box<dyn Pull<T, D>>>()
-                        .expect("unary_notify input puller type mismatch");
+                        .next().ok_or_else(|| Error::Custom("unary_notify must have input puller".into()))?
+                        .downcast::<Box<dyn Pull<T, D>>>().map_err(|_| Error::Custom("unary_notify input puller type mismatch".into()))?;
 
                     let output_pusher: Box<dyn Push<T, D2>> = {
                         let pushers: Vec<Box<dyn Push<T, D2>>> = endpoints
                             .output_pushers
                             .into_iter()
                             .map(|any_box| {
-                                *any_box
+                                any_box
                                     .downcast::<Box<dyn Push<T, D2>>>()
-                                    .expect("unary_notify output pusher type mismatch")
+                                    .map(|boxed| *boxed).map_err(|_| Error::Custom("unary_notify output pusher type mismatch".into()))
                             })
-                            .collect();
+                            .collect::<Result<_>>()?;
                         tee_or_single(pushers).unwrap_or_else(|| Box::new(NullPush))
                     };
 
@@ -4105,7 +4106,7 @@ impl<T: Timestamp, D: Clone + Send + 'static> Pipe<T, D> {
                 .register_operator(crate::dataflow::graph::OperatorInfo::new(
                     op_idx, &name, stage_id, 1, 1,
                 ))
-                .expect("operator index unique");
+                .unwrap_or_else(|_| panic!("operator index unique"));
 
             // Edge from upstream
             state.graph.add_edge(crate::dataflow::graph::EdgeInfo::new(
@@ -4135,21 +4136,19 @@ impl<T: Timestamp, D: Clone + Send + 'static> Pipe<T, D> {
                     let input_puller: Box<dyn Pull<T, D>> = *endpoints
                         .input_pullers
                         .into_iter()
-                        .next()
-                        .expect("unary_async must have input puller")
-                        .downcast::<Box<dyn Pull<T, D>>>()
-                        .expect("unary_async input puller type mismatch");
+                        .next().ok_or_else(|| Error::Custom("unary_async must have input puller".into()))?
+                        .downcast::<Box<dyn Pull<T, D>>>().map_err(|_| Error::Custom("unary_async input puller type mismatch".into()))?;
 
                     let output_pusher: Box<dyn Push<T, D2>> = {
                         let pushers: Vec<Box<dyn Push<T, D2>>> = endpoints
                             .output_pushers
                             .into_iter()
                             .map(|any_box| {
-                                *any_box
+                                any_box
                                     .downcast::<Box<dyn Push<T, D2>>>()
-                                    .expect("unary_async output pusher type mismatch")
+                                    .map(|boxed| *boxed).map_err(|_| Error::Custom("unary_async output pusher type mismatch".into()))
                             })
-                            .collect();
+                            .collect::<Result<_>>()?;
                         tee_or_single(pushers).unwrap_or_else(|| Box::new(NullPush))
                     };
 
