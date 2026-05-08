@@ -196,6 +196,23 @@ pub struct SpawnOptions {
     /// let handle = rt.spawn(dataflow, opts)?;
     /// ```
     pub cancellation_token: Option<tokio_util::sync::CancellationToken>,
+    /// When set, cancellation triggers a graceful drain phase instead of
+    /// immediate termination. The executor closes external inputs and
+    /// continues processing in-flight data until all operators complete
+    /// or the timeout expires.
+    ///
+    /// If the drain completes before the timeout, the dataflow returns
+    /// successfully. If the timeout expires, it returns `Err(Cancelled)`.
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// use std::time::Duration;
+    ///
+    /// let opts = SpawnOptions::new()
+    ///     .drain_on_cancel(Duration::from_secs(5));
+    /// ```
+    pub drain_timeout: Option<std::time::Duration>,
 }
 
 impl SpawnOptions {
@@ -235,6 +252,26 @@ impl SpawnOptions {
         self.cancellation_token = Some(token);
         self
     }
+
+    /// Enable graceful drain on cancellation with the given timeout.
+    ///
+    /// When cancellation is triggered, instead of stopping immediately the
+    /// executor closes external inputs and continues processing in-flight
+    /// data. If all operators complete within `timeout`, the dataflow
+    /// returns successfully. Otherwise it returns `Err(Cancelled)`.
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// use std::time::Duration;
+    ///
+    /// let opts = SpawnOptions::new()
+    ///     .drain_on_cancel(Duration::from_secs(5));
+    /// ```
+    pub fn drain_on_cancel(mut self, timeout: std::time::Duration) -> Self {
+        self.drain_timeout = Some(timeout);
+        self
+    }
 }
 
 impl Default for SpawnOptions {
@@ -244,6 +281,7 @@ impl Default for SpawnOptions {
             collect_metrics: false,
             priority: 0,
             cancellation_token: None,
+            drain_timeout: None,
         }
     }
 }
@@ -785,6 +823,7 @@ impl RuntimeHandle {
         options: SpawnOptions,
     ) -> Result<SpawnedDataflow<T>> {
         dataflow.collect_metrics = options.collect_metrics;
+        dataflow.drain_timeout = options.drain_timeout;
         self.spawn_internal(
             dataflow,
             options.io_mode.into(),
@@ -925,6 +964,7 @@ impl RuntimeHandle {
             options.collect_metrics,
             options.priority,
             options.cancellation_token,
+            options.drain_timeout,
         )
     }
 
@@ -1148,6 +1188,7 @@ impl RuntimeHandle {
         collect_metrics: bool,
         priority: u32,
         external_cancel: Option<tokio_util::sync::CancellationToken>,
+        drain_timeout: Option<std::time::Duration>,
     ) -> Result<MultiSpawnedDataflow<T>>
     where
         T: Timestamp,
@@ -1164,6 +1205,7 @@ impl RuntimeHandle {
             build(worker_idx, &mut builder)?;
             let mut df = builder.build()?;
             df.collect_metrics = collect_metrics;
+            df.drain_timeout = drain_timeout;
             dataflows.push(df);
         }
 
@@ -3715,6 +3757,7 @@ fn materialize_executor<T: Timestamp>(
         max_sweeps_per_poll: 64,
         catch_panics: dataflow.catch_panics,
         collect_metrics: dataflow.collect_metrics,
+        drain_timeout: dataflow.drain_timeout,
     };
 
     // Destructure to allow accessing graph after moving factories.
