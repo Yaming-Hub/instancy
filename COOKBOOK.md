@@ -467,7 +467,227 @@ for op in ops.iter().take(3) {
 }
 ```
 
-## 7. Common Pitfalls
+## 7. Timing & Delay
+
+### Shift all data forward by a fixed number of epochs
+Use `delay_batch` when the new timestamp depends only on the original timestamp.
+
+```rust
+use instancy::DataflowBuilder;
+
+let builder = DataflowBuilder::<u64>::new("shift-forward");
+let input = builder.input::<i32>("events");
+
+// Every item at epoch T is re-emitted at epoch T + 5.
+input
+    .delay_batch("shift-5", |t| t + 5)
+    .output("shifted");
+```
+
+### Window data into fixed-size epochs
+`delay_batch` with a rounding function groups items into windows.
+
+```rust
+use instancy::DataflowBuilder;
+
+let builder = DataflowBuilder::<u64>::new("windowed");
+let input = builder.input::<f64>("readings");
+
+// Round each epoch up to the next 100-unit boundary.
+input
+    .delay_batch("window-100", |t| (t / 100 + 1) * 100)
+    .unary_notify("avg-per-window", {
+        let mut stash = std::collections::HashMap::<u64, Vec<f64>>::new();
+        move |input, output, ctx| {
+            while let Some((time, data)) = input.next() {
+                stash.entry(time).or_default().extend(data);
+                ctx.notify_at(time);
+            }
+            while let Some(time) = ctx.next_notification() {
+                if let Some(vals) = stash.remove(&time) {
+                    let avg = vals.iter().sum::<f64>() / vals.len() as f64;
+                    output.push_vec(time, vec![avg]);
+                }
+            }
+            Ok(())
+        }
+    })
+    .output("averages");
+```
+
+### Delay individual items based on their content
+Use `delay` (not `delay_batch`) when each item's new timestamp depends on its value.
+
+```rust
+use instancy::DataflowBuilder;
+
+let builder = DataflowBuilder::<u64>::new("priority-delay");
+let input = builder.input::<(u64, String)>("tasks");
+
+// High-priority items (priority < 10) stay at their epoch;
+// low-priority items get pushed forward by their priority value.
+input
+    .delay("priority-shift", |t, (priority, _msg)| {
+        t + priority
+    })
+    .output("scheduled");
+```
+
+## 8. Distribution & Broadcast
+
+### Send reference data to every worker
+`broadcast` clones each item to all workers — ideal for config, lookup tables, or small reference datasets.
+
+```rust
+use instancy::DataflowBuilder;
+
+let builder = DataflowBuilder::<u64>::new("shared-config");
+let config = builder.input::<(String, String)>("config");
+
+// Every worker gets a full copy of the configuration.
+config
+    .broadcast("share-config")
+    .inspect("log-config", |_t, (k, v)| {
+        println!("worker got config: {k}={v}");
+    })
+    .output("local-config");
+```
+
+### Split a stream and process branches differently
+Use `branch` with a predicate to route items. Each item goes to exactly one branch.
+
+```rust
+use instancy::DataflowBuilder;
+
+let builder = DataflowBuilder::<u64>::new("split-pipeline");
+let input = builder.input::<i32>("numbers");
+
+let (big, small) = input.branch("size-split", |_t, x| *x > 1000);
+
+// Heavy processing for large values.
+big.map("expensive-transform", |_t, x| x * x)
+   .output("big-results");
+
+// Lightweight path for small values.
+small.output("small-values");
+```
+
+## 9. Monitoring & Debugging
+
+### Log every item passing through a pipeline stage
+`inspect` observes items without modifying the stream. Chain it anywhere for debugging.
+
+```rust
+use instancy::DataflowBuilder;
+
+let builder = DataflowBuilder::<u64>::new("debug-pipeline");
+let input = builder.input::<i32>("data");
+
+input
+    .inspect("before-filter", |t, x| eprintln!("[t={t}] input: {x}"))
+    .filter("positive", |_t, x| *x > 0)
+    .inspect("after-filter", |t, x| eprintln!("[t={t}] kept: {x}"))
+    .map("double", |_t, x| x * 2)
+    .output("results");
+```
+
+### Count items per epoch with inspect
+Accumulate side-effects in the closure's captured state.
+
+```rust
+use instancy::DataflowBuilder;
+use std::sync::{Arc, Mutex};
+
+let builder = DataflowBuilder::<u64>::new("counter");
+let input = builder.input::<String>("events");
+let counts = Arc::new(Mutex::new(std::collections::HashMap::<u64, usize>::new()));
+
+let counts_ref = counts.clone();
+input
+    .inspect("count", move |t, _item| {
+        *counts_ref.lock().unwrap().entry(*t).or_default() += 1;
+    })
+    .output("passthrough");
+
+// After dataflow completes, `counts` has per-epoch totals.
+```
+
+### Track dataflow progress with a probe
+`probe()` returns a handle you can poll from outside the dataflow to check completion.
+
+```rust
+use instancy::{DataflowBuilder, RuntimeConfig, RuntimeHandle, SpawnOptions};
+
+let rt = RuntimeHandle::new(RuntimeConfig::default()).unwrap();
+let builder = DataflowBuilder::<u64>::new("probed");
+let input = builder.input::<i32>("data");
+
+let (stream, probe) = input.map("double", |_t, x| x * 2).probe();
+stream.output("results");
+
+let dataflow = builder.build().unwrap();
+let mut handle = rt.spawn(dataflow, SpawnOptions::new()).unwrap();
+let sender = handle.take_input::<i32>("data").unwrap();
+sender.send(0, vec![1, 2, 3]).unwrap();
+sender.close();
+
+handle.join_blocking().unwrap();
+assert!(probe.is_done());
+```
+
+## 10. Graceful Shutdown
+
+### Drain in-flight data before stopping
+By default, cancellation drops everything immediately. Use `drain_on_cancel` to let in-flight
+data finish processing within a timeout.
+
+```rust
+use std::time::Duration;
+use instancy::{DataflowBuilder, RuntimeConfig, RuntimeHandle, SpawnOptions};
+
+let rt = RuntimeHandle::new(RuntimeConfig::default()).unwrap();
+let builder = DataflowBuilder::<u64>::new("graceful");
+let input = builder.input::<i32>("data");
+input.map("process", |_t, x| x * 2).output("results");
+
+let dataflow = builder.build().unwrap();
+let opts = SpawnOptions::new().drain_on_cancel(Duration::from_secs(5));
+let mut handle = rt.spawn(dataflow, opts).unwrap();
+
+let sender = handle.take_input::<i32>("data").unwrap();
+sender.send(0, vec![1, 2, 3]).unwrap();
+sender.close(); // Close input so drain can complete.
+
+handle.cancel(); // Triggers drain instead of immediate kill.
+let result = handle.join_blocking();
+assert!(result.is_ok()); // Data flowed through before shutdown.
+```
+
+### Detect drain timeout vs normal completion
+When the drain timeout expires (e.g., input stays open), the result is `Err(Cancelled)`.
+
+```rust
+use std::time::Duration;
+use instancy::{DataflowBuilder, RuntimeConfig, RuntimeHandle, SpawnOptions};
+
+let rt = RuntimeHandle::new(RuntimeConfig::default()).unwrap();
+let builder = DataflowBuilder::<u64>::new("timeout-demo");
+let input = builder.input::<i32>("data");
+input.output("out");
+
+let dataflow = builder.build().unwrap();
+let opts = SpawnOptions::new().drain_on_cancel(Duration::from_millis(100));
+let mut handle = rt.spawn(dataflow, opts).unwrap();
+
+// Keep sender alive — dataflow can't finish draining.
+let _sender = handle.take_input::<i32>("data").unwrap();
+
+handle.cancel();
+let result = handle.join_blocking();
+assert!(result.is_err()); // Drain timed out → Cancelled.
+```
+
+## 11. Common Pitfalls
 
 ### Pitfall: forgetting to drop the input sender
 If the sender stays alive, the runtime assumes more data may still arrive.
