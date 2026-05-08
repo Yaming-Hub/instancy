@@ -466,7 +466,7 @@ impl<T: Timestamp> DataflowBuilder<T> {
                                         Some(reporter),
                                         ext_counter,
                                     );
-                                    Box::new(op) as Box<dyn SchedulableOperator>
+                                    Ok(Box::new(op) as Box<dyn SchedulableOperator>)
                                 });
 
                             let sender_any: Box<dyn std::any::Any + Send> = Box::new(sender);
@@ -504,7 +504,7 @@ impl<T: Timestamp> DataflowBuilder<T> {
                                         Some(reporter),
                                         ext_counter,
                                     );
-                                    Box::new(op) as Box<dyn SchedulableOperator>
+                                    Ok(Box::new(op) as Box<dyn SchedulableOperator>)
                                 });
 
                             let sender_any: Box<dyn std::any::Any + Send> = Box::new(sender);
@@ -590,14 +590,14 @@ impl<T: Timestamp> DataflowBuilder<T> {
                         tee_or_single(pushers).unwrap_or_else(|| Box::new(NullPush))
                     };
 
-                    Box::new(WiredSourceOperator::with_progress(
+                    Ok(Box::new(WiredSourceOperator::with_progress(
                         name_clone,
                         op_idx,
                         stage_id,
                         data,
                         output_pusher,
                         reporter,
-                    )) as Box<dyn SchedulableOperator>
+                    )) as Box<dyn SchedulableOperator>)
                 });
             state.operator_factories.push((op_idx, factory));
         }
@@ -723,7 +723,7 @@ impl<T: Timestamp> DataflowBuilder<T> {
                             Some(reporter),
                             ext_counter,
                         );
-                        Box::new(op) as Box<dyn SchedulableOperator>
+                        Ok(Box::new(op) as Box<dyn SchedulableOperator>)
                     });
 
                     // Build pump task: runs the user's producer in a small tokio runtime.
@@ -1176,8 +1176,13 @@ impl<T: Timestamp, D: Clone + Send + 'static> Pipe<T, D> {
                     .downcast::<Box<dyn Pull<T, D>>>()
                     .expect("for_each input puller type mismatch");
 
-                Box::new(ForEachSink::new(name_clone, op_idx, stage_id, input_puller, logic))
-                    as Box<dyn SchedulableOperator>
+                Ok(Box::new(ForEachSink::new(
+                    name_clone,
+                    op_idx,
+                    stage_id,
+                    input_puller,
+                    logic,
+                )) as Box<dyn SchedulableOperator>)
             });
         state.operator_factories.push((op_idx, factory));
 
@@ -1836,7 +1841,7 @@ impl<T: Timestamp, D: Clone + Send + 'static> Pipe<T, D> {
                         tee_or_single(pushers).unwrap_or_else(|| Box::new(NullPush))
                     };
 
-                    Box::new(WiredBinaryOperator::new(
+                    Ok(Box::new(WiredBinaryOperator::new(
                         name_clone,
                         op_idx,
                         stage_id,
@@ -1844,7 +1849,7 @@ impl<T: Timestamp, D: Clone + Send + 'static> Pipe<T, D> {
                         input1_puller,
                         input2_puller,
                         output_pusher,
-                    )) as Box<dyn SchedulableOperator>
+                    )) as Box<dyn SchedulableOperator>)
                 });
             state.operator_factories.push((op_idx, factory));
 
@@ -2008,13 +2013,13 @@ impl<T: Timestamp, D: Clone + Send + 'static> Pipe<T, D> {
                         tee_or_single(pushers).unwrap_or_else(|| Box::new(NullPush))
                     };
 
-                    Box::new(WiredEnterOperator::<T, TInner, D>::new(
+                    Ok(Box::new(WiredEnterOperator::<T, TInner, D>::new(
                         enter_name,
                         enter_idx,
                         stage_id,
                         input_puller,
                         output_pusher,
-                    )) as Box<dyn SchedulableOperator>
+                    )) as Box<dyn SchedulableOperator>)
                 });
             state.operator_factories.push((enter_idx, enter_factory));
 
@@ -2080,14 +2085,14 @@ impl<T: Timestamp, D: Clone + Send + 'static> Pipe<T, D> {
                         tee_or_single(pushers).unwrap_or_else(|| Box::new(NullPush))
                     };
 
-                    Box::new(WiredFeedbackOperator::<T, TInner, D>::new(
+                    Ok(Box::new(WiredFeedbackOperator::<T, TInner, D>::new(
                         fb_name,
                         feedback_idx,
                         stage_id,
                         fb_summary,
                         input_puller,
                         output_pusher,
-                    )) as Box<dyn SchedulableOperator>
+                    )) as Box<dyn SchedulableOperator>)
                 });
             state
                 .operator_factories
@@ -2173,13 +2178,13 @@ impl<T: Timestamp, D: Clone + Send + 'static> Pipe<T, D> {
                         tee_or_single(pushers).unwrap_or_else(|| Box::new(NullPush))
                     };
 
-                    Box::new(WiredConcatOperator::new(
+                    Ok(Box::new(WiredConcatOperator::new(
                         concat_name,
                         concat_idx,
                         stage_id,
                         input_pullers,
                         output_pusher,
-                    )) as Box<dyn SchedulableOperator>
+                    )) as Box<dyn SchedulableOperator>)
                 });
             state.operator_factories.push((concat_idx, concat_factory));
 
@@ -2428,13 +2433,13 @@ impl<T: Timestamp, D: Clone + Send + 'static> Pipe<T, D> {
                         tee_or_single(pushers).unwrap_or_else(|| Box::new(NullPush))
                     };
 
-                    Box::new(WiredLeaveOperator::<T, TInner, D>::new(
+                    Ok(Box::new(WiredLeaveOperator::<T, TInner, D>::new(
                         leave_name,
                         leave_idx,
                         stage_id,
                         input_puller,
                         output_pusher,
-                    )) as Box<dyn SchedulableOperator>
+                    )) as Box<dyn SchedulableOperator>)
                 });
             state.operator_factories.push((leave_idx, leave_factory));
 
@@ -2562,13 +2567,13 @@ impl<T: Timestamp, D: Clone + Send + 'static> Pipe<T, D> {
                         tee_or_single(pushers).unwrap_or_else(|| Box::new(NullPush))
                     };
 
-                    Box::new(WiredConcatOperator::new(
+                    Ok(Box::new(WiredConcatOperator::new(
                         "concat",
                         op_idx,
                         stage_id,
                         input_pullers,
                         output_pusher,
-                    )) as Box<dyn SchedulableOperator>
+                    )) as Box<dyn SchedulableOperator>)
                 });
             state.operator_factories.push((op_idx, factory));
 
@@ -2678,13 +2683,13 @@ impl<T: Timestamp, D: Clone + Send + 'static> Pipe<T, D> {
                         .downcast::<Box<dyn Pull<T, D>>>()
                         .expect("sink input puller type mismatch");
 
-                    Box::new(CollectingSink::new(
+                    Ok(Box::new(CollectingSink::new(
                         name_clone,
                         op_idx,
                         stage_id,
                         input_puller,
                         collector_clone,
-                    )) as Box<dyn SchedulableOperator>
+                    )) as Box<dyn SchedulableOperator>)
                 });
             state.operator_factories.push((op_idx, factory));
 
@@ -2714,13 +2719,13 @@ impl<T: Timestamp, D: Clone + Send + 'static> Pipe<T, D> {
                                     .downcast::<Box<dyn Pull<T, D>>>()
                                     .expect("sink input puller type mismatch");
 
-                                Box::new(ChannelSinkOperator::new(
+                                Ok(Box::new(ChannelSinkOperator::new(
                                     sink_name_inner,
                                     op_idx,
                                     StageId::new(0),
                                     input_puller,
                                     OutputSend::Std(tx),
-                                )) as Box<dyn SchedulableOperator>
+                                )) as Box<dyn SchedulableOperator>)
                             });
 
                         let receiver_any: Box<dyn std::any::Any + Send> = Box::new(receiver);
@@ -2747,13 +2752,13 @@ impl<T: Timestamp, D: Clone + Send + 'static> Pipe<T, D> {
                                     .downcast::<Box<dyn Pull<T, D>>>()
                                     .expect("sink input puller type mismatch");
 
-                                Box::new(ChannelSinkOperator::new(
+                                Ok(Box::new(ChannelSinkOperator::new(
                                     sink_name_inner,
                                     op_idx,
                                     StageId::new(0),
                                     input_puller,
                                     OutputSend::Tokio(tx),
-                                )) as Box<dyn SchedulableOperator>
+                                )) as Box<dyn SchedulableOperator>)
                             });
 
                         let receiver_any: Box<dyn std::any::Any + Send> = Box::new(receiver);
@@ -3484,7 +3489,7 @@ impl<T: Timestamp, D: Clone + Send + 'static> Pipe<T, D> {
                         tee_or_single(pushers).unwrap_or_else(|| Box::new(NullPush))
                     };
 
-                    Box::new(WiredUnaryOperator::with_reporter(
+                    Ok(Box::new(WiredUnaryOperator::with_reporter(
                         name_clone,
                         op_idx,
                         stage_id,
@@ -3492,7 +3497,7 @@ impl<T: Timestamp, D: Clone + Send + 'static> Pipe<T, D> {
                         input_puller,
                         output_pusher,
                         exchange_reporter,
-                    )) as Box<dyn SchedulableOperator>
+                    )) as Box<dyn SchedulableOperator>)
                 });
             state.operator_factories.push((op_idx, factory));
 
@@ -3618,7 +3623,7 @@ impl<T: Timestamp, D: Clone + Send + 'static> Pipe<T, D> {
                         tee_or_single(pushers).unwrap_or_else(|| Box::new(NullPush))
                     };
 
-                    Box::new(WiredUnaryOperator::with_reporter(
+                    Ok(Box::new(WiredUnaryOperator::with_reporter(
                         name_clone,
                         op_idx,
                         stage_id,
@@ -3626,7 +3631,7 @@ impl<T: Timestamp, D: Clone + Send + 'static> Pipe<T, D> {
                         input_puller,
                         output_pusher,
                         exchange_reporter,
-                    )) as Box<dyn SchedulableOperator>
+                    )) as Box<dyn SchedulableOperator>)
                 });
             state.operator_factories.push((op_idx, factory));
 
@@ -3774,14 +3779,14 @@ impl<T: Timestamp, D: Clone + Send + 'static> Pipe<T, D> {
                         tee_or_single(pushers).unwrap_or_else(|| Box::new(NullPush))
                     };
 
-                    Box::new(WiredUnaryOperator::new(
+                    Ok(Box::new(WiredUnaryOperator::new(
                         name_clone,
                         op_idx,
                         stage_id,
                         wired_logic,
                         input_puller,
                         output_pusher,
-                    )) as Box<dyn SchedulableOperator>
+                    )) as Box<dyn SchedulableOperator>)
                 });
             state.operator_factories.push((op_idx, factory));
 
@@ -3883,14 +3888,14 @@ impl<T: Timestamp, D: Clone + Send + 'static> Pipe<T, D> {
                         tee_or_single(pushers).unwrap_or_else(|| Box::new(NullPush))
                     };
 
-                    Box::new(WiredUnaryOperator::new(
+                    Ok(Box::new(WiredUnaryOperator::new(
                         name_clone,
                         op_idx,
                         stage_id,
                         logic,
                         input_puller,
                         output_pusher,
-                    )) as Box<dyn SchedulableOperator>
+                    )) as Box<dyn SchedulableOperator>)
                 });
             state.operator_factories.push((op_idx, factory));
 
@@ -4024,7 +4029,7 @@ impl<T: Timestamp, D: Clone + Send + 'static> Pipe<T, D> {
                     // to set the actual frontier.
                     let initial_frontier = Antichain::from_elem(T::minimum());
 
-                    Box::new(WiredUnaryNotifyOperator::new(
+                    Ok(Box::new(WiredUnaryNotifyOperator::new(
                         name_clone,
                         op_idx,
                         stage_id,
@@ -4033,7 +4038,7 @@ impl<T: Timestamp, D: Clone + Send + 'static> Pipe<T, D> {
                         output_pusher,
                         progress_reporter,
                         initial_frontier,
-                    )) as Box<dyn SchedulableOperator>
+                    )) as Box<dyn SchedulableOperator>)
                 });
             state.operator_factories.push((op_idx, factory));
 
@@ -4148,7 +4153,7 @@ impl<T: Timestamp, D: Clone + Send + 'static> Pipe<T, D> {
                         tee_or_single(pushers).unwrap_or_else(|| Box::new(NullPush))
                     };
 
-                    Box::new(WiredUnaryAsyncOperator::new(
+                    Ok(Box::new(WiredUnaryAsyncOperator::new(
                         name_clone,
                         op_idx,
                         stage_id,
@@ -4157,7 +4162,7 @@ impl<T: Timestamp, D: Clone + Send + 'static> Pipe<T, D> {
                         input_puller,
                         output_pusher,
                         tokio_handle,
-                    )) as Box<dyn SchedulableOperator>
+                    )) as Box<dyn SchedulableOperator>)
                 });
             state.operator_factories.push((op_idx, factory));
 
