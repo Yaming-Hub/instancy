@@ -72,3 +72,7 @@ features = ["async_tokio"]
 name = "transport_throughput"
 harness = false
 required-features = ["transport"]
+
+[[bench]]
+name = "dataflow_throughput"
+harness = false
