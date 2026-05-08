@@ -208,10 +208,8 @@ impl<T: Timestamp> Default for ProgressReporter<T> {
 #[derive(Debug)]
 pub struct OperatorProgress<T: Timestamp> {
     /// Per-input consumed changes — reserved for future message-flight accounting.
-    #[allow(dead_code)]
     pub consumed: Vec<ChangeBatch<T>>,
     /// Per-output produced changes — reserved for future message-flight accounting.
-    #[allow(dead_code)]
     pub produced: Vec<ChangeBatch<T>>,
     /// Per-output capability reporters (capabilities write here via ProgressReporter).
     pub internal: Vec<ProgressReporter<T>>,

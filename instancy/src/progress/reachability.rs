@@ -282,12 +282,12 @@ impl<T: Timestamp> Builder<T> {
             .collect();
 
         let tracker = Tracker {
-            nodes: self
+            _nodes: self
                 .nodes
                 .into_iter()
                 .map(|n| n.unwrap_or_else(|| PortConnectivity::new(0, 0)))
                 .collect(),
-            edges: self.edges,
+            _edges: self.edges,
             shape: self.shape,
             per_operator,
             target_changes,
@@ -612,12 +612,10 @@ struct PerOperator<T: Timestamp> {
 /// 2. Call [`propagate_all`](Self::propagate_all) to compute frontier implications.
 /// 3. Read results via [`drain_pushed`](Self::drain_pushed) / [`drain_output_changes`](Self::drain_output_changes).
 pub struct Tracker<T: Timestamp> {
-    /// Per-node internal connectivity (retained for future introspection/debugging).
-    #[allow(dead_code)]
-    nodes: Vec<PortConnectivity<T::Summary>>,
-    /// Per-node outgoing edges (retained for future introspection/debugging).
-    #[allow(dead_code)]
-    edges: Vec<Vec<Vec<Location>>>,
+    /// Per-node internal connectivity (retained for introspection/debugging).
+    _nodes: Vec<PortConnectivity<T::Summary>>,
+    /// Per-node outgoing edges (retained for introspection/debugging).
+    _edges: Vec<Vec<Vec<Location>>>,
     /// (inputs, outputs) per node.
     shape: Vec<(usize, usize)>,
 

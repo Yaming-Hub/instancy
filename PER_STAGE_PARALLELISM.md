@@ -344,27 +344,24 @@ stream
   to future work — requires splitting dataflow into sub-dataflows and spawning
   separate worker groups per stage
 
-## Current Status (v1 — spawn_multi + SpawnOptions)
+## Status
 
-**Phase 1 implementation (PRs #190-#194):**
-- `SpawnOptions::per_stage_parallelism(true)` enables heterogeneous parallelism
-- `spawn_staged_internal` builds max(P_i) workers, wires M×N exchange channels
-- Workers beyond a stage's parallelism get NullOperator placeholders
-- Edge stage IDs properly propagated after `infer_stages()`
-- All tests pass, functional but architecturally impure
+**All phases complete.** Per-stage parallelism is the default behavior
+(`SpawnOptions::per_stage_parallelism` defaults to `true`).
 
-**Problems with v1 approach:**
-1. **Build closure takes `worker_idx`** — but the graph is the same for all workers.
-   The dataflow is a logical description; worker identity is a physical concern.
-2. **Idle operators** — workers beyond a stage's parallelism get NullOperator
-   placeholders. Wasteful: still builds full operator closures, allocates factories,
-   seeds SubgraphBuilder capabilities (which are leaked by NullOperator).
-3. **No-op exchange endpoints** — workers outside a stage get empty push/pull
-   endpoints that are never used. Complicates progress tracking.
-4. **Stage 0 parallelism is hardcoded** to `default_parallelism` parameter.
-   Should be derived from the number of physical input streams.
-5. **All workers participate in progress exchange** — even non-participating
-   workers send/receive progress messages. Unnecessary overhead.
+### v1 (PRs #190-#194) — superseded by v2
+- `spawn_staged_internal` built max(P_i) workers with NullOperator placeholders
+- Functional but architecturally impure (idle operators, no-op exchange endpoints)
+
+### v2 (PRs #195-#198) — current implementation
+- **Phase 7** (PR #195): `SpawnOptions::auto_parallelism` — build closure without
+  `worker_idx`, stage 0 parallelism auto-detected from input/source_async count
+- **Phase 8** (PR #196): Per-stage executor materialization — `retain_stages()`
+  strips non-participating operator/channel factories per worker
+- **Phase 9** (PR #197): Ghost operators — non-participating operators kept in
+  reachability graph (shapes + connectivity) but without capabilities or progress
+  buffers, enabling correct cross-stage frontier propagation
+- **Phase 10** (PR #198): `per_stage_parallelism: true` as default, doc updates
 
 ## Redesign: Build-Once, Materialize-Per-Stage (v2)
 
@@ -478,34 +475,31 @@ empty progress messages.
 - `per_stage_parallelism` option is no longer needed on `spawn_dataflow` —
   it's always stage-aware.
 
-## Implementation Plan (v2)
+## Implementation Plan (v2) — All Phases Complete ✅
 
-### Phase 7: `spawn_dataflow` API + stage 0 auto-parallelism
-- New `spawn_dataflow` method: `Fn(&mut DataflowBuilder<T>) -> Result<()>`
-- No `worker_idx` parameter in build closure
+### Phase 7: `spawn_dataflow` API + stage 0 auto-parallelism ✅
+- `SpawnOptions::auto_parallelism(true)` — build closure `Fn(usize, &mut DataflowBuilder)` 
 - Stage 0 parallelism = count of `input()` + `source_async()` operators in stage 0
-- Internally builds max(P_i) copies, discards non-participating factories
-- Uses current NullOperator approach as interim (replaced in Phase 8)
-- Integration tests for auto-parallelism
+- Internally builds max(P_i) copies via `spawn_staged_internal`
+- Integration tests for auto-parallelism (PR #195)
 
-### Phase 8: Per-stage executor materialization
-- `DataflowExecutor::materialize()` accepts a set of participating stage IDs
-- Skip operator/channel factory materialization for non-participating stages
-- SubgraphBuilder only registers operators for participating stages
-- Remove NullOperator, null_operator_factory, null_channel_factory, Phase 4b
-- Remove no-op exchange endpoint guards (num_sources==0 path)
-- Progress capabilities only seeded for participating operators
+### Phase 8: Per-stage executor materialization ✅
+- `LogicalDataflow::retain_stages()` strips non-participating operator/channel factories
+- `SubgraphBuilder::retain_operators()` removes operators from progress tracker
+- Edge index remapping for compacted edge vectors
+- Workers only materialize operators for stages they participate in (PR #196)
 
-### Phase 9: Per-stage progress exchange
-- Create separate progress channel groups per stage
-- Workers only exchange progress with same-stage peers
-- Cross-stage frontier propagation via exchange channel FrontierAggregator
-- Remove max(P_i)-wide progress broadcast
+### Phase 9: Ghost operators for cross-stage frontier propagation ✅
+- `SubgraphBuilder::mark_ghost_operators()` — keeps shapes and connectivity in
+  reachability graph, but removes initial_capabilities and progress_buffers
+- `ProgressTracker::materialized_indices` — `collect_operator_progress` skips ghosts
+- Peer progress broadcasts propagate through ghost operators to downstream stages
+- Frontier-dependent operators (delay, unary_notify) work correctly across stages (PR #197)
 
-### Phase 10: Make `spawn_dataflow` the default path
-- Deprecate `per_stage_parallelism` option on SpawnOptions
-- `spawn_multi` without worker_idx delegates to `spawn_dataflow` internally
-- Update all examples and documentation
+### Phase 10: Make per_stage_parallelism the default ✅
+- `SpawnOptions::default()` sets `per_stage_parallelism: true`
+- Updated spawn_multi/MultiSpawnedDataflow docs
+- Updated GUIDE.md, examples, validation tests (PR #198)
 
 ## Open Questions
 

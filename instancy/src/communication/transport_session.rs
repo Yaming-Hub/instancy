@@ -134,8 +134,7 @@ pub struct TransportSession {
 struct SessionState {
     /// Kept alive so bridge tasks are not dropped prematurely.
     /// They terminate naturally when all senders close.
-    #[allow(dead_code)]
-    bridge_handles: Vec<tokio::task::JoinHandle<()>>,
+    _bridge_handles: Vec<tokio::task::JoinHandle<()>>,
     demux_handles: Vec<tokio::task::JoinHandle<()>>,
 }
 
@@ -266,7 +265,7 @@ impl TransportSession {
         }
 
         let state = std::sync::Arc::new(SessionState {
-            bridge_handles,
+            _bridge_handles: bridge_handles,
             demux_handles,
         });
 

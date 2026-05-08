@@ -466,7 +466,7 @@ pub struct InputSender<T: Timestamp, D: Send + 'static> {
 }
 
 impl<T: Timestamp, D: Send + 'static> InputSender<T, D> {
-    #[allow(dead_code)]
+    #[cfg(test)]
     pub(crate) fn new(sender: mpsc::SyncSender<InputEvent<T, D>>) -> Self {
         Self {
             sender,
