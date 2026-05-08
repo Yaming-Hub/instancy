@@ -186,6 +186,22 @@ impl<T: Timestamp> SubgraphBuilder<T> {
         &self.edges
     }
 
+    /// Remove all operators (and their edges/capabilities) not in `keep`.
+    ///
+    /// After calling this, only operators whose index is in `keep` remain.
+    /// Edges where either endpoint references a removed operator are dropped.
+    /// This is used for per-stage materialization: workers only keep the
+    /// operators for stages they participate in.
+    pub fn retain_operators(&mut self, keep: &std::collections::HashSet<usize>) {
+        self.operators.retain(|idx, _| keep.contains(idx));
+        self.connectivity.retain(|idx, _| keep.contains(idx));
+        self.initial_capabilities.retain(|idx, _| keep.contains(idx));
+        self.progress_buffers.retain(|idx, _| keep.contains(idx));
+        self.edges.retain(|(src, tgt)| {
+            keep.contains(&src.node()) && keep.contains(&tgt.node())
+        });
+    }
+
     /// Compiles the subgraph into a live [`ProgressTracker`].
     ///
     /// Consumes the builder and returns the tracker along with per-operator
@@ -637,6 +653,18 @@ impl<T: Timestamp> ProgressTracker<T> {
                     }
                     for batch in batches {
                         for (op_idx, output_port, time, diff) in batch {
+                            // Skip changes for operators not in this worker's
+                            // reachability graph. This happens with per-stage
+                            // materialization: a peer worker may participate in
+                            // stages that this worker does not.
+                            //
+                            // NOTE(Phase 9): This means frontier-dependent
+                            // operators won't see upstream frontier advances
+                            // from non-materialized stages. Phase 9 (per-stage
+                            // progress exchange) will fix this properly.
+                            if !self.operators.contains_key(&op_idx) {
+                                continue;
+                            }
                             self.tracker.update_source(op_idx, output_port, time, diff);
                         }
                     }

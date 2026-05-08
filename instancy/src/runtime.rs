@@ -1794,6 +1794,22 @@ impl RuntimeHandle {
             }
         }
 
+        // Phase 4b: Per-stage materialization — strip non-participating
+        // operators and channels from each worker's dataflow.
+        // Worker `w` participates in stage `s` iff `w < stage_parallelism[s]`.
+        {
+            use crate::dataflow::stage::StageId;
+            for (worker_idx, dataflow) in dataflows.iter_mut().enumerate() {
+                let participating: std::collections::HashSet<StageId> = stages
+                    .iter()
+                    .enumerate()
+                    .filter(|(stage_idx, _)| worker_idx < stage_parallelism[*stage_idx])
+                    .map(|(_, s)| s.id)
+                    .collect();
+                dataflow.retain_stages(&participating);
+            }
+        }
+
         // Phase 5: Create per-worker wake handles and progress exchange channels.
         let wake_handles: Vec<WakeHandle> = (0..num_workers).map(|_| WakeHandle::new()).collect();
 
