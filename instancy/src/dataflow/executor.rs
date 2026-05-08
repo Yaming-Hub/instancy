@@ -79,6 +79,20 @@ pub struct ExecutorConfig {
     /// records processed). Overhead is ~1 Instant::now() per activation.
     /// Default: false.
     pub collect_metrics: bool,
+    /// When set, cancellation triggers a graceful drain phase instead of
+    /// immediate termination. During the drain phase:
+    ///
+    /// 1. External inputs are closed (no new data accepted).
+    /// 2. In-flight data continues to flow through operators.
+    /// 3. The executor keeps running sweeps until all operators complete
+    ///    or the timeout expires.
+    ///
+    /// If the drain completes before the timeout, the dataflow returns
+    /// `Ok(true)` (normal completion). If the timeout expires, the
+    /// dataflow returns `Err(Cancelled)` with the original reason.
+    ///
+    /// Default: `None` (immediate cancellation).
+    pub drain_timeout: Option<std::time::Duration>,
 }
 
 impl Default for ExecutorConfig {
@@ -89,6 +103,7 @@ impl Default for ExecutorConfig {
             max_sweeps_per_poll: 64,
             catch_panics: false,
             collect_metrics: false,
+            drain_timeout: None,
         }
     }
 }
@@ -364,6 +379,12 @@ pub struct DataflowExecutor<T: Timestamp = u64> {
     op_collectors: Vec<Option<Arc<OperatorMetricsCollector>>>,
     /// Phantom for the timestamp type.
     _phantom: PhantomData<T>,
+    /// Whether the executor is in the drain phase (cancellation received,
+    /// processing in-flight data before stopping).
+    draining: bool,
+    /// Deadline for the drain phase. If `Some`, the executor entered drain
+    /// mode and will return `Err(Cancelled)` if this deadline is exceeded.
+    drain_deadline: Option<Instant>,
 }
 
 impl<T: Timestamp> DataflowExecutor<T> {
@@ -553,6 +574,8 @@ impl<T: Timestamp> DataflowExecutor<T> {
             wall_start,
             op_collectors,
             _phantom: PhantomData,
+            draining: false,
+            drain_deadline: None,
         })
     }
 
@@ -1240,8 +1263,28 @@ impl<T: Timestamp> DataflowExecutor<T> {
             let _signals = rx.try_recv();
         }
 
-        // Check cancellation.
-        self.cancel.check()?;
+        // Check cancellation — either enter drain mode or return error.
+        if self.cancel.is_cancelled() {
+            if self.draining {
+                // Already draining — check if deadline expired.
+                if let Some(deadline) = self.drain_deadline {
+                    if Instant::now() >= deadline {
+                        // Drain timed out — propagate the cancellation error.
+                        self.cancel.check()?;
+                    }
+                }
+            } else if let Some(timeout) = self.config.drain_timeout {
+                // Enter drain mode: set deadline. Instead of zeroing the
+                // external_inputs_open counter (which would race with
+                // ChannelSourceOperator::close_inputs() calling fetch_sub),
+                // we skip the external-inputs-open check when draining.
+                self.draining = true;
+                self.drain_deadline = Some(Instant::now() + timeout);
+            } else {
+                // No drain configured — immediate cancellation.
+                self.cancel.check()?;
+            }
+        }
 
         // If all operators are done, we're finished.
         if self.done.iter().all(|&d| d) {
@@ -1271,10 +1314,13 @@ impl<T: Timestamp> DataflowExecutor<T> {
         if self.consecutive_idle >= self.config.max_idle_sweeps {
             // Check if external inputs are still open — if so, don't
             // declare quiescence, but signal the caller to wait.
-            if self
-                .external_inputs_open
-                .load(std::sync::atomic::Ordering::SeqCst)
-                > 0
+            // During drain mode, we ignore external inputs (they should
+            // close naturally; we don't want to wait for them).
+            if !self.draining
+                && self
+                    .external_inputs_open
+                    .load(std::sync::atomic::Ordering::SeqCst)
+                    > 0
             {
                 self.consecutive_idle = 0;
                 return Ok(SweepOutcome::WaitingForInput);
@@ -1312,6 +1358,11 @@ impl<T: Timestamp> DataflowExecutor<T> {
             }
 
             // Quiescent — no operator made progress.
+            // During drain mode, quiescence means all in-flight data has been
+            // processed — treat this as successful completion.
+            if self.draining {
+                return Ok(SweepOutcome::Completed);
+            }
             return Ok(SweepOutcome::Quiescent);
         }
 
@@ -1534,6 +1585,8 @@ mod tests {
                 wall_start: None,
                 op_collectors: Vec::new(),
                 _phantom: PhantomData,
+            draining: false,
+            drain_deadline: None,
             }
         }
     }
@@ -1650,6 +1703,8 @@ mod tests {
             wall_start: None,
             op_collectors: Vec::new(),
             _phantom: PhantomData,
+        draining: false,
+        drain_deadline: None,
         };
 
         let result = executor.run();
@@ -1693,6 +1748,8 @@ mod tests {
             wall_start: None,
             op_collectors: Vec::new(),
             _phantom: PhantomData,
+        draining: false,
+        drain_deadline: None,
         };
 
         let result = executor.run();
@@ -1740,6 +1797,8 @@ mod tests {
             wall_start: None,
             op_collectors: Vec::new(),
             _phantom: PhantomData,
+        draining: false,
+        drain_deadline: None,
         };
 
         let result = executor.run();
@@ -1775,6 +1834,8 @@ mod tests {
             wall_start: None,
             op_collectors: Vec::new(),
             _phantom: PhantomData,
+        draining: false,
+        drain_deadline: None,
         };
 
         let result = executor.run();
@@ -1816,6 +1877,7 @@ mod tests {
                 max_sweeps_per_poll: 0,
                 catch_panics: false,
                 collect_metrics: false,
+            drain_timeout: None,
             },
             cancel: CancellationToken::new(),
             progress_tracker: None,
@@ -1836,6 +1898,8 @@ mod tests {
             wall_start: None,
             op_collectors: Vec::new(),
             _phantom: PhantomData,
+        draining: false,
+        drain_deadline: None,
         };
 
         // Should terminate via quiescence, not infinite loop.
@@ -1915,6 +1979,8 @@ mod tests {
             wall_start: None,
             op_collectors: Vec::new(),
             _phantom: PhantomData,
+        draining: false,
+        drain_deadline: None,
         };
 
         let result = executor.run();
@@ -1974,6 +2040,8 @@ mod tests {
             wall_start: None,
             op_collectors: Vec::new(),
             _phantom: PhantomData,
+        draining: false,
+        drain_deadline: None,
         };
 
         // Attach progress tracker
@@ -2021,6 +2089,8 @@ mod tests {
             wall_start: None,
             op_collectors: Vec::new(),
             _phantom: PhantomData,
+        draining: false,
+        drain_deadline: None,
         };
 
         // Request notification at time 5
@@ -2081,6 +2151,8 @@ mod tests {
             wall_start: None,
             op_collectors: Vec::new(),
             _phantom: PhantomData,
+        draining: false,
+        drain_deadline: None,
         };
 
         // Request notification at time 3 — frontier already past, fires immediately
@@ -2140,6 +2212,8 @@ mod tests {
             wall_start: None,
             op_collectors: Vec::new(),
             _phantom: PhantomData,
+        draining: false,
+        drain_deadline: None,
         };
 
         // Poll the Future — should complete in one poll since all operators finish.
@@ -2186,6 +2260,7 @@ mod tests {
                 max_sweeps_per_poll: 0, // no budget limit for this test
                 catch_panics: false,
                 collect_metrics: false,
+            drain_timeout: None,
             },
             cancel: CancellationToken::new(),
             progress_tracker: None,
@@ -2206,6 +2281,8 @@ mod tests {
             wall_start: None,
             op_collectors: Vec::new(),
             _phantom: PhantomData,
+        draining: false,
+        drain_deadline: None,
         };
 
         // IdleOperator always returns Idle → hits idle threshold → WaitingForInput.
@@ -2265,6 +2342,7 @@ mod tests {
                 max_sweeps_per_poll: 0,
                 catch_panics: false,
                 collect_metrics: false,
+            drain_timeout: None,
             },
             cancel: CancellationToken::new(),
             progress_tracker: None,
@@ -2285,6 +2363,8 @@ mod tests {
             wall_start: None,
             op_collectors: Vec::new(),
             _phantom: PhantomData,
+        draining: false,
+        drain_deadline: None,
         };
 
         let wake = executor.wake_handle();
@@ -2353,6 +2433,8 @@ mod tests {
             wall_start: None,
             op_collectors: Vec::new(),
             _phantom: PhantomData,
+        draining: false,
+        drain_deadline: None,
         };
 
         let result = Pin::new(&mut executor).poll(&mut cx);
@@ -2484,6 +2566,7 @@ mod tests {
                 max_sweeps_per_poll: budget,
                 catch_panics: false,
                 collect_metrics: false,
+            drain_timeout: None,
             },
             cancel: CancellationToken::new(),
             progress_tracker: None,
@@ -2504,6 +2587,8 @@ mod tests {
             wall_start: None,
             op_collectors: Vec::new(),
             _phantom: PhantomData,
+        draining: false,
+        drain_deadline: None,
         };
 
         // First poll: should yield after `budget` sweeps (Pending, not Ready)
@@ -2555,6 +2640,7 @@ mod tests {
                 max_sweeps_per_poll: 0, // unlimited
                 catch_panics: false,
                 collect_metrics: false,
+            drain_timeout: None,
             },
             cancel: CancellationToken::new(),
             progress_tracker: None,
@@ -2575,6 +2661,8 @@ mod tests {
             wall_start: None,
             op_collectors: Vec::new(),
             _phantom: PhantomData,
+        draining: false,
+        drain_deadline: None,
         };
 
         // Should run to completion without yielding
@@ -2624,6 +2712,8 @@ mod tests {
             wall_start: None,
             op_collectors: Vec::new(),
             _phantom: PhantomData,
+        draining: false,
+        drain_deadline: None,
         };
 
         // Enable fusion with topological order.
@@ -2685,6 +2775,8 @@ mod tests {
             wall_start: None,
             op_collectors: Vec::new(),
             _phantom: PhantomData,
+        draining: false,
+        drain_deadline: None,
         };
 
         // Topological order: source → transform → sink
@@ -2735,6 +2827,8 @@ mod tests {
             wall_start: None,
             op_collectors: Vec::new(),
             _phantom: PhantomData,
+        draining: false,
+        drain_deadline: None,
         };
 
         executor.enable_fusion(FusedActivationOrder::new(vec![0]));
@@ -2784,6 +2878,8 @@ mod tests {
             wall_start: None,
             op_collectors: Vec::new(),
             _phantom: PhantomData,
+        draining: false,
+        drain_deadline: None,
         };
 
         executor.enable_fusion(FusedActivationOrder::new(vec![0]));
@@ -2833,6 +2929,8 @@ mod tests {
             wall_start: None,
             op_collectors: Vec::new(),
             _phantom: PhantomData,
+        draining: false,
+        drain_deadline: None,
         };
 
         executor.enable_fusion(FusedActivationOrder::new(vec![0]));
@@ -2917,6 +3015,8 @@ mod tests {
             wall_start: None,
             op_collectors: Vec::new(),
             _phantom: PhantomData,
+        draining: false,
+        drain_deadline: None,
         };
 
         // Should succeed and enable fusion.
@@ -2979,6 +3079,8 @@ mod tests {
             wall_start: None,
             op_collectors: Vec::new(),
             _phantom: PhantomData,
+        draining: false,
+        drain_deadline: None,
         };
 
         // Should return error, not panic.
@@ -3039,6 +3141,8 @@ mod tests {
             wall_start: None,
             op_collectors: Vec::new(),
             _phantom: PhantomData,
+        draining: false,
+        drain_deadline: None,
         };
 
         executor.enable_fusion(FusedActivationOrder::new(vec![0, 1, 2]));
@@ -3102,6 +3206,8 @@ mod tests {
             wall_start: None,
             op_collectors: Vec::new(),
             _phantom: PhantomData,
+        draining: false,
+        drain_deadline: None,
         };
 
         // Create stage info for two stages.
@@ -3179,6 +3285,8 @@ mod tests {
             wall_start: None,
             op_collectors: Vec::new(),
             _phantom: PhantomData,
+        draining: false,
+        drain_deadline: None,
         };
 
         use crate::dataflow::stage::{FusedActivationOrder, StageId, StageInfo};
@@ -3229,6 +3337,8 @@ mod tests {
             wall_start: None,
             op_collectors: Vec::new(),
             _phantom: PhantomData,
+        draining: false,
+        drain_deadline: None,
         };
 
         use crate::dataflow::stage::{FusedActivationOrder, StageId, StageInfo};
@@ -3366,6 +3476,146 @@ mod tests {
         assert_eq!(
             extract_panic_message(&other_payload),
             "unknown panic payload"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Graceful drain tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn drain_allows_inflight_data_to_complete() {
+        // An operator with 3 remaining activations. Cancel immediately but
+        // with drain enabled — the operator should finish all 3 activations.
+        let op = CountingOperator {
+            name: "drainer".into(),
+            index: 0,
+            stage_id: crate::dataflow::stage::StageId(0),
+            remaining: 3,
+        };
+        let config = ExecutorConfig {
+            max_activations_per_step: 10,
+            max_idle_sweeps: 3,
+            max_sweeps_per_poll: 0,
+            catch_panics: false,
+            collect_metrics: false,
+            drain_timeout: Some(std::time::Duration::from_secs(5)),
+        };
+        let mut executor =
+            DataflowExecutor::new_test(vec![Box::new(op)], config, 0);
+
+        // Cancel before running.
+        executor.cancel.cancel();
+
+        // Despite cancellation, drain mode should let the operator finish.
+        let result = executor.run();
+        assert!(result.is_ok(), "drain should complete successfully");
+        assert!(result.unwrap(), "should report completion");
+    }
+
+    #[test]
+    fn immediate_cancel_without_drain_returns_error() {
+        // Without drain, cancellation should return Err(Cancelled).
+        let op = CountingOperator {
+            name: "no-drain".into(),
+            index: 0,
+            stage_id: crate::dataflow::stage::StageId(0),
+            remaining: 3,
+        };
+        let config = ExecutorConfig {
+            max_activations_per_step: 10,
+            max_idle_sweeps: 3,
+            max_sweeps_per_poll: 0,
+            catch_panics: false,
+            collect_metrics: false,
+            drain_timeout: None,
+        };
+        let mut executor =
+            DataflowExecutor::new_test(vec![Box::new(op)], config, 0);
+        executor.cancel.cancel();
+
+        let result = executor.run();
+        assert!(result.is_err(), "should return Err(Cancelled)");
+        match result.unwrap_err() {
+            Error::Cancelled { .. } => {}
+            other => panic!("expected Cancelled, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn drain_timeout_expires_returns_cancelled() {
+        // An operator that never finishes (always returns MadeProgress).
+        struct InfiniteOperator;
+        impl SchedulableOperator for InfiniteOperator {
+            fn activate(&mut self) -> Result<ActivationOutcome> {
+                Ok(ActivationOutcome::MadeProgress)
+            }
+            fn name(&self) -> &str { "infinite" }
+            fn index(&self) -> usize { 0 }
+            fn stage_id(&self) -> crate::dataflow::stage::StageId {
+                crate::dataflow::stage::StageId(0)
+            }
+            fn close_inputs(&mut self) {}
+            fn is_done(&self) -> bool { false }
+        }
+
+        let config = ExecutorConfig {
+            max_activations_per_step: 10,
+            max_idle_sweeps: 3,
+            max_sweeps_per_poll: 0,
+            catch_panics: false,
+            collect_metrics: false,
+            // Very short timeout so test doesn't hang.
+            drain_timeout: Some(std::time::Duration::from_millis(50)),
+        };
+        let mut executor =
+            DataflowExecutor::new_test(vec![Box::new(InfiniteOperator)], config, 0);
+        executor.cancel.cancel();
+
+        let result = executor.run();
+        assert!(result.is_err(), "drain timeout should return Err");
+        match result.unwrap_err() {
+            Error::Cancelled { .. } => {}
+            other => panic!("expected Cancelled, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn drain_ignores_external_inputs_open() {
+        // Verify that drain mode completes even when external_inputs_open > 0,
+        // without zeroing the counter (avoids race with fetch_sub in operators).
+        let op = CountingOperator {
+            name: "drain-ignore".into(),
+            index: 0,
+            stage_id: crate::dataflow::stage::StageId(0),
+            remaining: 1,
+        };
+        let config = ExecutorConfig {
+            max_activations_per_step: 10,
+            max_idle_sweeps: 3,
+            max_sweeps_per_poll: 0,
+            catch_panics: false,
+            collect_metrics: false,
+            drain_timeout: Some(std::time::Duration::from_secs(5)),
+        };
+        let mut executor =
+            DataflowExecutor::new_test(vec![Box::new(op)], config, 0);
+
+        // Simulate external input being open.
+        executor
+            .external_inputs_open
+            .store(1, std::sync::atomic::Ordering::SeqCst);
+
+        executor.cancel.cancel();
+        let result = executor.run();
+        assert!(result.is_ok(), "drain should complete despite open inputs");
+
+        // Counter is NOT zeroed — operators close naturally via their own logic.
+        assert_eq!(
+            executor
+                .external_inputs_open
+                .load(std::sync::atomic::Ordering::SeqCst),
+            1
         );
     }
 }

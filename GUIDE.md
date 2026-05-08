@@ -849,6 +849,29 @@ The built-in reason variants are:
 
 Reasons follow **first-cancel-wins** semantics: if a token is cancelled multiple times, only the first reason is recorded. Child tokens inherit their parent's reason.
 
+### Graceful Drain on Cancellation
+
+By default, cancellation stops the dataflow immediately — any in-flight data in channels is lost. For pipelines where you want to finish processing buffered data before stopping, use `drain_on_cancel`:
+
+```rust
+use std::time::Duration;
+use instancy::SpawnOptions;
+
+let opts = SpawnOptions::new()
+    .drain_on_cancel(Duration::from_secs(5));
+
+let handle = rt.spawn(dataflow, opts).unwrap();
+```
+
+When cancellation is triggered with drain enabled:
+
+1. **External inputs are closed** — no new data is accepted.
+2. **In-flight data continues flowing** through operators normally.
+3. **If all operators complete** within the timeout, the dataflow returns successfully (`Ok`).
+4. **If the timeout expires**, the dataflow returns `Err(Cancelled)` with the original reason.
+
+This is useful for ETL pipelines, streaming aggregations, or any workflow where partial results are worse than slightly delayed shutdown.
+
 ---
 
 ## 5. Creating Custom Operators

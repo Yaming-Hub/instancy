@@ -853,6 +853,7 @@ impl<T: Timestamp> DataflowBuilder<T> {
             stages,
             catch_panics: state.catch_panics,
             collect_metrics: false,
+            drain_timeout: None,
         })
     }
 }
@@ -4274,6 +4275,9 @@ pub struct LogicalDataflow<T: Timestamp> {
     /// Whether to collect per-operator metrics (see [`ExecutorConfig::collect_metrics`]).
     /// Set by SpawnOptions at spawn time.
     pub(crate) collect_metrics: bool,
+    /// Graceful drain timeout (see [`ExecutorConfig::drain_timeout`]).
+    /// Set by SpawnOptions at spawn time.
+    pub(crate) drain_timeout: Option<std::time::Duration>,
 }
 
 impl<T: Timestamp> LogicalDataflow<T> {
