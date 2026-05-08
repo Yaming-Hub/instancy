@@ -86,6 +86,10 @@ pub enum CancellationReason {
     /// application via [`crate::RuntimeHandle::report_node_leave()`].
     /// The string is the peer's `node_id`.
     PeerDown(String),
+
+    /// The dataflow exceeded its execution timeout set via
+    /// [`crate::SpawnOptions::timeout()`].
+    Timeout,
 }
 
 impl fmt::Display for CancellationReason {
@@ -98,6 +102,7 @@ impl fmt::Display for CancellationReason {
             Self::HandleDropped => write!(f, "handle dropped"),
             Self::OperatorError(msg) => write!(f, "operator error: {msg}"),
             Self::PeerDown(node_id) => write!(f, "peer node down: {node_id}"),
+            Self::Timeout => write!(f, "execution timeout"),
         }
     }
 }

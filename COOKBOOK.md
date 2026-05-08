@@ -687,6 +687,28 @@ let result = handle.join_blocking();
 assert!(result.is_err()); // Drain timed out → Cancelled.
 ```
 
+### Auto-cancel long-running dataflows
+Use `timeout()` for batch jobs with SLA deadlines. The reason is `CancellationReason::Timeout`.
+
+```rust
+use std::time::Duration;
+use instancy::{DataflowBuilder, RuntimeConfig, RuntimeHandle, SpawnOptions};
+
+let rt = RuntimeHandle::new(RuntimeConfig::default()).unwrap();
+let builder = DataflowBuilder::<u64>::new("batch-job");
+let input = builder.input::<i32>("data");
+input.map("process", |_t, x| x * 2).output("results");
+
+let dataflow = builder.build().unwrap();
+let opts = SpawnOptions::new()
+    .timeout(Duration::from_secs(30))         // hard deadline
+    .drain_on_cancel(Duration::from_secs(5)); // drain after timeout
+
+let handle = rt.spawn(dataflow, opts).unwrap();
+// If the dataflow doesn't finish in 30s, it's cancelled with Timeout
+// and gets 5s to drain in-flight data.
+```
+
 ## 11. Common Pitfalls
 
 ### Pitfall: forgetting to drop the input sender

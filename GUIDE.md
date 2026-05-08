@@ -872,6 +872,30 @@ When cancellation is triggered with drain enabled:
 
 This is useful for ETL pipelines, streaming aggregations, or any workflow where partial results are worse than slightly delayed shutdown.
 
+### Execution Timeout
+
+For batch jobs or request-scoped processing with SLA deadlines, use `timeout` to automatically cancel a dataflow after a fixed duration:
+
+```rust
+use std::time::Duration;
+use instancy::SpawnOptions;
+
+let opts = SpawnOptions::new()
+    .timeout(Duration::from_secs(30));
+
+let handle = rt.spawn(dataflow, opts).unwrap();
+```
+
+When the timeout elapses, the dataflow is cancelled with `CancellationReason::Timeout`. The timeout starts from the moment the dataflow is spawned.
+
+Timeout combines naturally with drain: if both are set, the timeout triggers cancellation which then enters the drain phase, giving in-flight data a chance to complete:
+
+```rust
+let opts = SpawnOptions::new()
+    .timeout(Duration::from_secs(30))        // 30s total budget
+    .drain_on_cancel(Duration::from_secs(5)); // 5s to drain after timeout
+```
+
 ---
 
 ## 5. Creating Custom Operators

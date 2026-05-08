@@ -213,6 +213,24 @@ pub struct SpawnOptions {
     ///     .drain_on_cancel(Duration::from_secs(5));
     /// ```
     pub drain_timeout: Option<std::time::Duration>,
+    /// When set, the dataflow is automatically cancelled with
+    /// [`CancellationReason::Timeout`] after this duration elapses,
+    /// measured from the moment the dataflow is spawned.
+    ///
+    /// This is useful for bounding how long a dataflow can run — e.g.,
+    /// request-scoped processing or batch jobs with SLA deadlines.
+    /// Combines with `drain_on_cancel`: if both are set, timeout triggers
+    /// cancellation which then enters the drain phase.
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// use std::time::Duration;
+    ///
+    /// let opts = SpawnOptions::new()
+    ///     .timeout(Duration::from_secs(30));
+    /// ```
+    pub execution_timeout: Option<std::time::Duration>,
 }
 
 impl SpawnOptions {
@@ -272,6 +290,31 @@ impl SpawnOptions {
         self.drain_timeout = Some(timeout);
         self
     }
+
+    /// Set an execution timeout for this dataflow.
+    ///
+    /// After `timeout` elapses (from the moment the dataflow is spawned),
+    /// the dataflow is automatically cancelled with
+    /// [`CancellationReason::Timeout`]. If `drain_on_cancel` is also set,
+    /// the timeout triggers cancellation which then enters the drain phase.
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// use std::time::Duration;
+    ///
+    /// // Hard 30-second deadline:
+    /// let opts = SpawnOptions::new().timeout(Duration::from_secs(30));
+    ///
+    /// // 30-second deadline with 5-second drain:
+    /// let opts = SpawnOptions::new()
+    ///     .timeout(Duration::from_secs(30))
+    ///     .drain_on_cancel(Duration::from_secs(5));
+    /// ```
+    pub fn timeout(mut self, timeout: std::time::Duration) -> Self {
+        self.execution_timeout = Some(timeout);
+        self
+    }
 }
 
 impl Default for SpawnOptions {
@@ -282,6 +325,7 @@ impl Default for SpawnOptions {
             priority: 0,
             cancellation_token: None,
             drain_timeout: None,
+            execution_timeout: None,
         }
     }
 }
@@ -829,6 +873,7 @@ impl RuntimeHandle {
             options.io_mode.into(),
             options.priority,
             options.cancellation_token,
+            options.execution_timeout,
             WorkerContext::single(),
             None,
             None,
@@ -965,6 +1010,7 @@ impl RuntimeHandle {
             options.priority,
             options.cancellation_token,
             options.drain_timeout,
+            options.execution_timeout,
         )
     }
 
@@ -977,6 +1023,7 @@ impl RuntimeHandle {
         mode: ChannelMode,
         priority: u32,
         external_cancel: Option<tokio_util::sync::CancellationToken>,
+        execution_timeout: Option<std::time::Duration>,
         worker_context: WorkerContext,
         progress_channels: Option<WorkerProgressChannels<T>>,
         pre_created_wake_handle: Option<WakeHandle>,
@@ -1020,6 +1067,22 @@ impl RuntimeHandle {
                     }
                     _ = cancel.cancelled_async() => {
                         // Dataflow already cancelled/completed — exit cleanly.
+                    }
+                }
+            });
+        }
+
+        // If an execution timeout was provided, spawn a task that cancels
+        // the dataflow after the timeout elapses.
+        if let Some(timeout) = execution_timeout {
+            let cancel = spawned.cancel.clone();
+            self.tokio_handle.spawn(async move {
+                tokio::select! {
+                    _ = tokio::time::sleep(timeout) => {
+                        cancel.cancel_with_reason(CancellationReason::Timeout);
+                    }
+                    _ = cancel.cancelled_async() => {
+                        // Dataflow already finished — exit cleanly.
                     }
                 }
             });
@@ -1189,6 +1252,7 @@ impl RuntimeHandle {
         priority: u32,
         external_cancel: Option<tokio_util::sync::CancellationToken>,
         drain_timeout: Option<std::time::Duration>,
+        execution_timeout: Option<std::time::Duration>,
     ) -> Result<MultiSpawnedDataflow<T>>
     where
         T: Timestamp,
@@ -1389,6 +1453,26 @@ impl RuntimeHandle {
                     }
                     _ = cancel.cancelled_async() => {
                         // Dataflow already cancelled/completed — exit cleanly.
+                    }
+                }
+            });
+        }
+
+        // If an execution timeout was provided, spawn a task that cancels
+        // all workers after the timeout elapses.
+        if let Some(timeout) = execution_timeout {
+            let cancel = if let Some(ref dc) = multi.dataflow_cancel {
+                dc.clone()
+            } else {
+                multi.workers[0].cancel.clone()
+            };
+            self.tokio_handle.spawn(async move {
+                tokio::select! {
+                    _ = tokio::time::sleep(timeout) => {
+                        cancel.cancel_with_reason(CancellationReason::Timeout);
+                    }
+                    _ = cancel.cancelled_async() => {
+                        // Dataflow already finished — exit cleanly.
                     }
                 }
             });
