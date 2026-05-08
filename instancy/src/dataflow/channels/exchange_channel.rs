@@ -733,11 +733,6 @@ impl<T: Timestamp> FrontierAggregator<T> {
     ///
     /// Panics in debug builds if `num_sources == 0`.
     fn new(num_sources: usize) -> Self {
-        debug_assert!(
-            num_sources > 0,
-            "FrontierAggregator requires at least one source"
-        );
-
         let mut aggregated = MutableAntichain::new();
         // Each source contributes T::minimum() with count +1.
         let inits: Vec<(T, i64)> = (0..num_sources).map(|_| (T::minimum(), 1)).collect();

@@ -858,6 +858,31 @@ impl<T: Timestamp> DataflowBuilder<T> {
         // Infer stages from the graph topology (exchange edges form boundaries).
         let stages = crate::dataflow::stage::infer_stages(&state.graph)?;
 
+        // Propagate inferred stage IDs back to OperatorInfo and EdgeInfo so
+        // that downstream code (exchange channel wiring) sees correct stages
+        // instead of the placeholder StageId(0) assigned at build time.
+        {
+            let mut op_stage_map = std::collections::HashMap::new();
+            for stage in &stages {
+                for &op_idx in &stage.operator_indices {
+                    op_stage_map.insert(op_idx, stage.id);
+                }
+            }
+            for op in state.graph.operators_mut() {
+                if let Some(&sid) = op_stage_map.get(&op.index) {
+                    op.stage_id = sid;
+                }
+            }
+            for edge in state.graph.edges_mut() {
+                if let Some(&sid) = op_stage_map.get(&edge.source.operator_index) {
+                    edge.source_stage = sid;
+                }
+                if let Some(&sid) = op_stage_map.get(&edge.target.operator_index) {
+                    edge.target_stage = sid;
+                }
+            }
+        }
+
         // Validate the graph for structural correctness (missing endpoints,
         // port bounds, duplicate edges, cycles outside feedback scopes).
         state.graph.validate()?;
