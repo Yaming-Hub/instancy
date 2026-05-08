@@ -357,6 +357,14 @@ impl<T: Timestamp> DataflowBuilder<T> {
     /// Returns a [`Pipe`] representing the data flowing from this input.
     /// At execution time, the runtime connects an async channel to this port.
     ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// let builder = DataflowBuilder::<u64>::new("my_df");
+    /// let stream = builder.input::<i32>("data");
+    /// stream.map("double", |_t, x| x * 2).output("results");
+    /// ```
+    ///
     /// # Panics
     ///
     /// Panics if an input with the same name already exists.
@@ -520,6 +528,15 @@ impl<T: Timestamp> DataflowBuilder<T> {
     ///
     /// Unlike [`input`](Self::input), this source has data baked in at build time
     /// rather than receiving it from an async channel at runtime.
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// let stream = builder.source("numbers", vec![
+    ///     (0u64, vec![1, 2, 3]),
+    ///     (1u64, vec![4, 5]),
+    /// ]);
+    /// ```
     pub fn source<D: Clone + Send + 'static>(
         &self,
         name: impl Into<String>,
@@ -779,6 +796,15 @@ impl<T: Timestamp> DataflowBuilder<T> {
     /// adapter that clones data to all downstream consumers.
     ///
     /// After a successful call, the builder is consumed.
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// let builder = DataflowBuilder::<u64>::new("my_df");
+    /// let input = builder.input::<i32>("data");
+    /// input.map("double", |_t, x| x * 2).output("results");
+    /// let dataflow = builder.build().expect("build failed");
+    /// ```
     pub fn build(self) -> Result<LogicalDataflow<T>> {
         let mut state = match Rc::try_unwrap(self.state) {
             Ok(cell) => cell.into_inner(),
@@ -1862,6 +1888,13 @@ impl<T: Timestamp, D: Clone + Send + 'static> Pipe<T, D> {
     ///
     /// Shorthand for `Pipe::concat(vec![self, other])`. Data from both
     /// streams is interleaved in the output.
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// let merged = evens.merge(odds);
+    /// merged.output("all_numbers");
+    /// ```
     pub fn merge(self, other: Pipe<T, D>) -> Pipe<T, D> {
         Pipe::concat(vec![self, other])
     }
@@ -2570,6 +2603,17 @@ impl<T: Timestamp, D: Clone + Send + 'static> Pipe<T, D> {
     /// an async channel to this port for collecting results.
     ///
     /// For immediate testing, use [`collect`](Self::collect) instead.
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// let port = stream.output("results");
+    /// // After execution:
+    /// let data = port.collector().lock().unwrap();
+    /// for (time, batch) in data.iter() {
+    ///     println!("t={time}: {batch:?}");
+    /// }
+    /// ```
     pub fn output(mut self, name: impl Into<String>) -> OutputPort<T, D> {
         let name = name.into();
         let collector = Arc::new(Mutex::new(Vec::new()));
@@ -2744,6 +2788,18 @@ impl<T: Timestamp, D: Clone + Send + 'static> Pipe<T, D> {
     /// Convenience: collect output into a shared vector (for testing).
     ///
     /// Each call generates a unique internal output port name.
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// let input = builder.source("nums", vec![(0u64, vec![1, 2, 3])]);
+    /// let results = input.map("double", |_t, x| x * 2).collect();
+    /// // After execution:
+    /// let data = results.lock().unwrap();
+    /// for (time, batch) in data.iter() {
+    ///     println!("t={time}: {batch:?}");
+    /// }
+    /// ```
     pub fn collect(self) -> Arc<Mutex<Vec<(T, Vec<D>)>>> {
         let name = {
             let mut state = self.state.borrow_mut();
@@ -2928,6 +2984,13 @@ impl<
     /// parallelism. This creates a stage boundary where the downstream operators
     /// run with `target_parallelism` workers.
     ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// // Route to 8 workers based on user_id
+    /// let partitioned = stream.exchange_to("by_user", 8, |record| record.user_id);
+    /// ```
+    ///
     /// # Panics
     /// Panics if `target_parallelism` is 0.
     pub fn exchange_to<K: std::hash::Hash + 'static>(
@@ -2953,6 +3016,12 @@ impl<
     ///
     /// The returned u64 is reduced modulo the target worker count to
     /// determine routing.
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// let partitioned = stream.exchange_by_hash("by_id", |record| record.id as u64);
+    /// ```
     pub fn exchange_by_hash(
         mut self,
         name: impl Into<String>,
@@ -2964,6 +3033,12 @@ impl<
     }
 
     /// Repartition with direct hash and explicit downstream parallelism.
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// let partitioned = stream.exchange_by_hash_to("by_id", 4, |record| record.id as u64);
+    /// ```
     ///
     /// # Panics
     /// Panics if `target_parallelism` is 0.
@@ -3153,6 +3228,13 @@ impl<T: Timestamp, D: Clone + Send + 'static> Pipe<T, D> {
     /// parallelism. This creates a stage boundary where the downstream operators
     /// run with `target_parallelism` workers.
     ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// // Route to 8 workers based on user_id
+    /// let partitioned = stream.exchange_to("by_user", 8, |record| record.user_id);
+    /// ```
+    ///
     /// # Panics
     /// Panics if `target_parallelism` is 0.
     pub fn exchange_to<K: std::hash::Hash + 'static>(
@@ -3177,6 +3259,12 @@ impl<T: Timestamp, D: Clone + Send + 'static> Pipe<T, D> {
     ///
     /// The returned u64 is reduced modulo the target worker count to
     /// determine routing.
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// let partitioned = stream.exchange_by_hash("by_id", |record| record.id as u64);
+    /// ```
     pub fn exchange_by_hash(
         mut self,
         name: impl Into<String>,
@@ -3188,6 +3276,12 @@ impl<T: Timestamp, D: Clone + Send + 'static> Pipe<T, D> {
     }
 
     /// Repartition with direct hash and explicit downstream parallelism.
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// let partitioned = stream.exchange_by_hash_to("by_id", 4, |record| record.id as u64);
+    /// ```
     ///
     /// # Panics
     /// Panics if `target_parallelism` is 0.
@@ -3571,6 +3665,15 @@ impl<T: Timestamp, D: Clone + Send + 'static> Pipe<T, D> {
     /// The returned `ProbeHandle` supports async waiting via
     /// [`wait_until_done_with`](ProbeHandle::wait_until_done_with) and
     /// [`wait_until_done`](ProbeHandle::wait_until_done).
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// let (stream, probe) = stream.probe();
+    /// stream.output("results");
+    /// // After execution:
+    /// assert!(probe.is_done());
+    /// ```
     pub fn probe(self) -> (Self, ProbeHandle<T>) {
         let (probe, notifier) = ProbeHandle::new();
         {
