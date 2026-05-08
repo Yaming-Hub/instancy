@@ -1003,7 +1003,11 @@ impl<T: Timestamp> DataflowExecutor<T> {
                 }
                 SweepOutcome::Idle => {
                     // No progress this sweep but not quiescent yet.
-                    // In sync mode, just loop again (tight poll).
+                    // During drain, sleep briefly to avoid 100% CPU spin while
+                    // waiting for the drain deadline to fire.
+                    if self.draining {
+                        std::thread::sleep(std::time::Duration::from_millis(1));
+                    }
                 }
                 SweepOutcome::WaitingForInput => {
                     // External inputs still open. In sync mode, sleep briefly
@@ -1375,6 +1379,8 @@ impl<T: Timestamp> DataflowExecutor<T> {
                 if tracker_active {
                     // Dataflow still has outstanding capabilities but no progress.
                     // Return Idle to let the drain deadline check fire next sweep.
+                    // In sync mode, run_loop adds a brief sleep to avoid spin-busy.
+                    // In async mode, Idle respects poll budget and self-wakes.
                     self.consecutive_idle = 0;
                     return Ok(SweepOutcome::Idle);
                 }

@@ -127,8 +127,9 @@ async fn drain_with_multi_worker() {
     s0.close();
     s1.close();
 
-    // Give a moment for processing, then cancel.
+    // Give a moment for processing, then cancel to trigger drain.
     tokio::time::sleep(Duration::from_millis(50)).await;
+    multi.cancel();
 
     let completion = multi.join();
     let result =
