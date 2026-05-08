@@ -557,7 +557,7 @@ pub struct NetworkEdgeMaterializer<T: Timestamp + ExchangeData, D: ExchangeData>
 
 #[cfg(feature = "transport")]
 impl<T: Timestamp + ExchangeData, D: ExchangeData> NetworkEdgeMaterializer<T, D> {
-    /// Create a network edge materializer from a pre-built [`ClusterTransport`].
+    /// Create a network edge materializer from a pre-built [`ClusterTransport`](crate::communication::cluster_transport::ClusterTransport).
     ///
     /// # Arguments
     /// - `dataflow_id`: Unique ID for this dataflow (used in frame routing).
