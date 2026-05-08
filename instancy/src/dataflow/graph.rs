@@ -309,6 +309,16 @@ impl DataflowGraph {
         &self.edges
     }
 
+    /// Mutable access to all edges.
+    pub fn edges_mut(&mut self) -> &mut [EdgeInfo] {
+        &mut self.edges
+    }
+
+    /// Mutable access to registered operators.
+    pub fn operators_mut(&mut self) -> impl Iterator<Item = &mut OperatorInfo> {
+        self.operators.values_mut()
+    }
+
     /// Edges originating from the given operator index.
     pub fn edges_from(&self, operator_index: usize) -> Vec<&EdgeInfo> {
         self.edges

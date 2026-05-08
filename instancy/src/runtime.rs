@@ -250,6 +250,49 @@ pub struct SpawnOptions {
     /// )?;
     /// ```
     pub per_stage_parallelism: bool,
+    /// Enable automatic parallelism detection from graph structure.
+    ///
+    /// When `true`, stage 0 parallelism is automatically determined by the
+    /// number of physical input sources (`input()` + `source_async()` calls
+    /// in stage 0). The `num_workers` parameter to
+    /// [`spawn_multi`](RuntimeHandle::spawn_multi) is ignored — parallelism
+    /// is derived entirely from the graph structure.
+    ///
+    /// Subsequent stages use the parallelism specified at repartition points
+    /// (`exchange_to`, `gather`, `rebalance_to`). Stages without explicit
+    /// parallelism inherit stage 0's auto-detected count.
+    ///
+    /// This implicitly enables per-stage parallelism.
+    ///
+    /// # Known Limitations (v1 interim)
+    ///
+    /// The current implementation builds max(P_i) full copies of the graph.
+    /// Workers outside a stage get idle operators. This means:
+    /// - `source_async()` closures are materialized on non-stage-0 workers
+    /// - `take_input()` on non-stage-0 workers silently drops data
+    ///
+    /// Phase 8 (per-stage materialization) will fix these by only
+    /// materializing operators for each worker's participating stages.
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// // Stage 0 par=1 (auto: 1 input), Stage 1 par=4, Stage 2 par=1
+    /// let multi = rt.spawn_multi(
+    ///     "pipeline", 0, // num_workers ignored with auto_parallelism
+    ///     |_worker_idx, builder| {
+    ///         let input = builder.input::<i32>("data");
+    ///         input
+    ///             .exchange_to("scatter", 4, |v: &i32| *v as u64)
+    ///             .map("process", |_t, x| x * 2)
+    ///             .gather("collect")
+    ///             .output("results");
+    ///         Ok(())
+    ///     },
+    ///     SpawnOptions::new().auto_parallelism(true),
+    /// )?;
+    /// ```
+    pub auto_parallelism: bool,
 }
 
 impl SpawnOptions {
@@ -361,6 +404,26 @@ impl SpawnOptions {
         self.per_stage_parallelism = enable;
         self
     }
+
+    /// Enable automatic parallelism detection from graph structure.
+    ///
+    /// When enabled, stage 0 parallelism is auto-detected from the number
+    /// of `input()` + `source_async()` calls. The `num_workers` parameter
+    /// to `spawn_multi` is ignored. This implicitly enables per-stage
+    /// parallelism.
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// let opts = SpawnOptions::new().auto_parallelism(true);
+    /// ```
+    pub fn auto_parallelism(mut self, enable: bool) -> Self {
+        self.auto_parallelism = enable;
+        if enable {
+            self.per_stage_parallelism = true;
+        }
+        self
+    }
 }
 
 impl Default for SpawnOptions {
@@ -372,6 +435,7 @@ impl Default for SpawnOptions {
             cancellation_token: None,
             drain_timeout: None,
             per_stage_parallelism: false,
+            auto_parallelism: false,
         }
     }
 }
@@ -1054,7 +1118,75 @@ impl RuntimeHandle {
         T: Timestamp,
         F: Fn(usize, &mut DataflowBuilder<T>) -> Result<()>,
     {
-        if options.per_stage_parallelism {
+        if options.auto_parallelism {
+            // Auto-parallelism: probe the graph to determine stage 0
+            // parallelism from physical input/source_async count.
+            // The num_workers parameter is ignored.
+            let mut probe_builder = DataflowBuilder::new(format!("{name}/probe"));
+            build(0, &mut probe_builder)?;
+            let probe_df = probe_builder.build()?;
+            let stages = probe_df.stages().to_vec();
+
+            // Stage 0 parallelism = number of input + source_async operators.
+            let stage0_input_count =
+                probe_df.input_ports.len() + probe_df.async_source_wiring.len();
+            let default_parallelism = stage0_input_count.max(1);
+            drop(probe_df);
+
+            if stages.is_empty() {
+                // No stages (trivial graph) — use default spawn path.
+                return self.spawn_multi_internal(
+                    name,
+                    default_parallelism,
+                    build,
+                    options.io_mode.into(),
+                    options.collect_metrics,
+                    options.priority,
+                    options.cancellation_token,
+                    options.drain_timeout,
+                );
+            }
+
+            // Check if per-stage parallelism is actually needed.
+            let stage_pars: Vec<usize> = stages
+                .iter()
+                .map(|s| s.parallelism.unwrap_or(default_parallelism))
+                .collect();
+            let all_same = stage_pars.iter().all(|&p| p == stage_pars[0]);
+
+            if all_same {
+                self.spawn_multi_internal(
+                    name,
+                    stage_pars[0],
+                    build,
+                    options.io_mode.into(),
+                    options.collect_metrics,
+                    options.priority,
+                    options.cancellation_token,
+                    options.drain_timeout,
+                )
+            } else {
+                // TODO(Phase 8): The v1 architecture rebuilds the full graph
+                // for every worker slot (max(P_i) copies). This means:
+                // 1. source_async() producers are duplicated on every worker,
+                //    not just stage-0 workers.
+                // 2. input() ports are wired on every worker — take_input()
+                //    on workers outside stage 0 accepts data but silently
+                //    drops it at the exchange.
+                // Phase 8 (per-stage materialization) eliminates both issues
+                // by only materializing operators for participating stages.
+                self.spawn_staged_internal(
+                    name,
+                    default_parallelism,
+                    build,
+                    options.io_mode.into(),
+                    options.collect_metrics,
+                    options.priority,
+                    options.cancellation_token,
+                    options.drain_timeout,
+                )
+            }
+        } else if options.per_stage_parallelism {
             self.spawn_staged_internal(
                 name,
                 num_workers,
