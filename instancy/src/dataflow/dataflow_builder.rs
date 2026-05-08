@@ -1324,6 +1324,107 @@ impl<T: Timestamp, D: Clone + Send + 'static> Pipe<T, D> {
         self.fold(name, 0usize, |acc, _item| acc + 1)
     }
 
+    /// Delay data by re-assigning timestamps according to a per-item function.
+    ///
+    /// Each item is buffered and re-timestamped using `delay_fn(&time, &data) -> new_time`.
+    /// The data is held until the input frontier advances past the **new** (delayed) timestamp,
+    /// then emitted at that timestamp. This ensures downstream operators see correct
+    /// frontier progress.
+    ///
+    /// The `delay_fn` must return a timestamp `>= time` (the new timestamp must not
+    /// precede the original). Violating this will panic.
+    ///
+    /// # Use cases
+    /// - **Per-item windowing**: assign items to windows based on content
+    /// - **Priority-based delay**: delay low-priority items to later timestamps
+    ///
+    /// # Example
+    /// ```ignore
+    /// // Delay each item to the next 10-second window based on its value
+    /// let windowed = stream.delay("window", |t, item| {
+    ///     if item.priority > 5 { *t } else { *t + 10 }
+    /// });
+    /// ```
+    pub fn delay<F>(mut self, name: impl Into<String>, delay_fn: F) -> Pipe<T, D>
+    where
+        F: Fn(&T, &D) -> T + Send + 'static,
+    {
+        let capacity = self.resolve_capacity();
+        let mut stash: std::collections::BTreeMap<T, Vec<D>> = std::collections::BTreeMap::new();
+        self.add_unary_notify_internal(
+            name,
+            capacity,
+            move |input, output, ctx| {
+                while let Some((time, data)) = input.next() {
+                    for item in data {
+                        let new_time = delay_fn(&time, &item);
+                        assert!(
+                            new_time >= time,
+                            "delay_fn must not return a timestamp earlier than the input"
+                        );
+                        stash.entry(new_time.clone()).or_default().push(item);
+                        ctx.notify_at(new_time);
+                    }
+                }
+                while let Some(time) = ctx.next_notification() {
+                    if let Some(data) = stash.remove(&time) {
+                        output.push_vec(time, data);
+                    }
+                }
+                Ok(())
+            },
+        )
+    }
+
+    /// Delay data by re-assigning timestamps according to a per-timestamp function.
+    ///
+    /// Simpler version of [`delay`](Self::delay) when the new timestamp depends only
+    /// on the original timestamp, not the data content. All items at a given timestamp
+    /// are re-assigned to the same new timestamp.
+    ///
+    /// The `delay_fn` must return a timestamp `>= t` (the new timestamp must not
+    /// precede the original). Violating this will panic.
+    ///
+    /// # Use cases
+    /// - **Fixed windowing**: `delay_batch("window", |t| t / 10 * 10)` groups into 10-unit windows
+    /// - **Ordering guarantee**: `delay_batch("order", |t| *t)` (identity) buffers until frontier
+    ///   confirms no more data at `t` will arrive
+    /// - **Time shifting**: `delay_batch("shift", |t| t + 5)` shifts all data forward by 5 units
+    ///
+    /// # Example
+    /// ```ignore
+    /// // Group data into 100-unit windows
+    /// let windowed = stream.delay_batch("window-100", |t| t / 100 * 100 + 100);
+    /// ```
+    pub fn delay_batch<F>(mut self, name: impl Into<String>, delay_fn: F) -> Pipe<T, D>
+    where
+        F: Fn(&T) -> T + Send + 'static,
+    {
+        let capacity = self.resolve_capacity();
+        let mut stash: std::collections::BTreeMap<T, Vec<D>> = std::collections::BTreeMap::new();
+        self.add_unary_notify_internal(
+            name,
+            capacity,
+            move |input, output, ctx| {
+                while let Some((time, data)) = input.next() {
+                    let new_time = delay_fn(&time);
+                    assert!(
+                        new_time >= time,
+                        "delay_fn must not return a timestamp earlier than the input"
+                    );
+                    stash.entry(new_time.clone()).or_default().extend(data);
+                    ctx.notify_at(new_time);
+                }
+                while let Some(time) = ctx.next_notification() {
+                    if let Some(data) = stash.remove(&time) {
+                        output.push_vec(time, data);
+                    }
+                }
+                Ok(())
+            },
+        )
+    }
+
     /// Pass through the first `count` elements, then stop.
     ///
     /// This is the dataflow equivalent of SQL `LIMIT`. After emitting `count`

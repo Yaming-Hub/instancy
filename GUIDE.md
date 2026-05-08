@@ -1089,6 +1089,44 @@ config
 
 In single-worker mode, `broadcast` is a no-op pass-through (no cloning needed).
 
+### Delay Operators
+
+The `delay` operators buffer data and re-assign timestamps, releasing the data
+only when the input frontier advances past the **new** (delayed) timestamp. This is
+essential for windowing, time-based aggregation, and ensuring data is processed
+in timestamp order.
+
+#### delay_batch
+
+Re-timestamp all data at a given timestamp to a new timestamp computed from the
+original timestamp. Simpler version when the delay depends only on the timestamp:
+
+```rust
+// Group data into 100-unit windows
+let windowed = stream.delay_batch("window-100", |t| (t / 100 + 1) * 100);
+
+// Shift all timestamps forward by 10
+let shifted = stream.delay_batch("shift", |t| t + 10);
+
+// Identity: buffer until frontier confirms no more data at t
+let ordered = stream.delay_batch("order", |t| *t);
+```
+
+#### delay
+
+Per-item re-timestamp: each item can be assigned a different timestamp based on
+its content:
+
+```rust
+// High-priority items stay at current timestamp; low-priority delayed
+let prioritized = stream.delay("prioritize", |t, item| {
+    if item.priority > 5 { *t } else { *t + 10 }
+});
+```
+
+> **Constraint:** The delay function must return a timestamp `>=` the input
+> timestamp. Returning an earlier timestamp will panic.
+
 ### Cross-Worker Error Propagation
 
 In multi-worker dataflows, if one worker's operator fails, all sibling workers
@@ -1501,6 +1539,8 @@ impl ExchangeData for MyRecord {
 | | `fold` | `(init, \|D2, D\| -> D2)` | Fold with initial value |
 | | `distinct` | | Deduplicate per timestamp |
 | | `count` | | Count per timestamp → `usize` |
+| **Delay** | `delay` | `\|&T, &D\| -> T` | Per-item timestamp reassignment |
+| | `delay_batch` | `\|&T\| -> T` | Per-timestamp reassignment |
 | **Distribution** | `exchange` | `\|&D\| -> K` | Hash-based routing |
 | | `exchange_by_hash` | `\|&D\| -> u64` | Direct hash routing |
 | | `gather` | | All data → worker 0 |
