@@ -1187,12 +1187,12 @@ impl<T: Timestamp, D: Clone + Send + 'static> Pipe<T, D> {
             channel_factory(move |_ctx, wake: Option<WakeHandle>| {
                 let (push, pull) =
                     bounded_channel_with_wake::<T, D, ()>(capacity, wake.clone());
-                (
+                Ok((
                     Box::new(Box::new(push) as Box<dyn Push<T, D>>)
                         as Box<dyn std::any::Any + Send>,
                     Box::new(Box::new(pull) as Box<dyn Pull<T, D>>)
                         as Box<dyn std::any::Any + Send>,
-                )
+                ))
             });
         state.channel_factories.push((edge_idx, chan_factory));
     }
@@ -1853,12 +1853,12 @@ impl<T: Timestamp, D: Clone + Send + 'static> Pipe<T, D> {
                 channel_factory(move |_ctx, wake: Option<WakeHandle>| {
                     let (push, pull) =
                         bounded_channel_with_wake::<T, D, ()>(capacity1, wake.clone());
-                    (
+                    Ok((
                         Box::new(Box::new(push) as Box<dyn Push<T, D>>)
                             as Box<dyn std::any::Any + Send>,
                         Box::new(Box::new(pull) as Box<dyn Pull<T, D>>)
                             as Box<dyn std::any::Any + Send>,
-                    )
+                    ))
                 });
             state.channel_factories.push((edge1_idx, channel_factory1));
 
@@ -1866,12 +1866,12 @@ impl<T: Timestamp, D: Clone + Send + 'static> Pipe<T, D> {
                 channel_factory(move |_ctx, wake: Option<WakeHandle>| {
                     let (push, pull) =
                         bounded_channel_with_wake::<T, D2, ()>(capacity2, wake.clone());
-                    (
+                    Ok((
                         Box::new(Box::new(push) as Box<dyn Push<T, D2>>)
                             as Box<dyn std::any::Any + Send>,
                         Box::new(Box::new(pull) as Box<dyn Pull<T, D2>>)
                             as Box<dyn std::any::Any + Send>,
-                    )
+                    ))
                 });
             state.channel_factories.push((edge2_idx, channel_factory2));
         }
@@ -2024,12 +2024,12 @@ impl<T: Timestamp, D: Clone + Send + 'static> Pipe<T, D> {
             let cf: ChannelFactory =
                 channel_factory(move |_ctx, wake: Option<WakeHandle>| {
                     let (push, pull) = bounded_channel_with_wake::<T, D, ()>(cap, wake.clone());
-                    (
+                    Ok((
                         Box::new(Box::new(push) as Box<dyn Push<T, D>>)
                             as Box<dyn std::any::Any + Send>,
                         Box::new(Box::new(pull) as Box<dyn Pull<T, D>>)
                             as Box<dyn std::any::Any + Send>,
-                    )
+                    ))
                 });
             state.channel_factories.push((enter_edge_idx, cf));
 
@@ -2189,12 +2189,12 @@ impl<T: Timestamp, D: Clone + Send + 'static> Pipe<T, D> {
                 channel_factory(move |_ctx, wake: Option<WakeHandle>| {
                     let (push, pull) =
                         bounded_channel_with_wake::<PT<T, TInner>, D, ()>(cap, wake.clone());
-                    (
+                    Ok((
                         Box::new(Box::new(push) as Box<dyn Push<PT<T, TInner>, D>>)
                             as Box<dyn std::any::Any + Send>,
                         Box::new(Box::new(pull) as Box<dyn Pull<PT<T, TInner>, D>>)
                             as Box<dyn std::any::Any + Send>,
-                    )
+                    ))
                 });
             state.channel_factories.push((enter_concat_edge_idx, cf1));
 
@@ -2203,12 +2203,12 @@ impl<T: Timestamp, D: Clone + Send + 'static> Pipe<T, D> {
                 channel_factory(move |_ctx, wake: Option<WakeHandle>| {
                     let (push, pull) =
                         bounded_channel_with_wake::<PT<T, TInner>, D, ()>(cap, wake.clone());
-                    (
+                    Ok((
                         Box::new(Box::new(push) as Box<dyn Push<PT<T, TInner>, D>>)
                             as Box<dyn std::any::Any + Send>,
                         Box::new(Box::new(pull) as Box<dyn Pull<PT<T, TInner>, D>>)
                             as Box<dyn std::any::Any + Send>,
-                    )
+                    ))
                 });
             state.channel_factories.push((fb_concat_edge_idx, cf2));
 
@@ -2394,12 +2394,12 @@ impl<T: Timestamp, D: Clone + Send + 'static> Pipe<T, D> {
                 channel_factory(move |_ctx, wake: Option<WakeHandle>| {
                     let (push, pull) =
                         bounded_channel_with_wake::<PT<T, TInner>, D, ()>(cap, wake.clone());
-                    (
+                    Ok((
                         Box::new(Box::new(push) as Box<dyn Push<PT<T, TInner>, D>>)
                             as Box<dyn std::any::Any + Send>,
                         Box::new(Box::new(pull) as Box<dyn Pull<PT<T, TInner>, D>>)
                             as Box<dyn std::any::Any + Send>,
-                    )
+                    ))
                 });
             state.feedback_channel_factories.push((fb_position, cf_fb));
 
@@ -2444,12 +2444,12 @@ impl<T: Timestamp, D: Clone + Send + 'static> Pipe<T, D> {
                 channel_factory(move |_ctx, wake: Option<WakeHandle>| {
                     let (push, pull) =
                         bounded_channel_with_wake::<PT<T, TInner>, D, ()>(cap, wake.clone());
-                    (
+                    Ok((
                         Box::new(Box::new(push) as Box<dyn Push<PT<T, TInner>, D>>)
                             as Box<dyn std::any::Any + Send>,
                         Box::new(Box::new(pull) as Box<dyn Pull<PT<T, TInner>, D>>)
                             as Box<dyn std::any::Any + Send>,
-                    )
+                    ))
                 });
             state.channel_factories.push((leave_edge_idx, cf_leave));
         }
@@ -2578,12 +2578,12 @@ impl<T: Timestamp, D: Clone + Send + 'static> Pipe<T, D> {
                     channel_factory(move |_ctx, wake: Option<WakeHandle>| {
                         let (push, pull) =
                             bounded_channel_with_wake::<T, D, ()>(capacity, wake.clone());
-                        (
+                        Ok((
                             Box::new(Box::new(push) as Box<dyn Push<T, D>>)
                                 as Box<dyn std::any::Any + Send>,
                             Box::new(Box::new(pull) as Box<dyn Pull<T, D>>)
                                 as Box<dyn std::any::Any + Send>,
-                        )
+                        ))
                     });
                 state.channel_factories.push((edge_idx, chan_factory));
             }
@@ -2769,12 +2769,12 @@ impl<T: Timestamp, D: Clone + Send + 'static> Pipe<T, D> {
                 channel_factory(move |_ctx, wake: Option<WakeHandle>| {
                     let (push, pull) =
                         bounded_channel_with_wake::<T, D, ()>(capacity, wake.clone());
-                    (
+                    Ok((
                         Box::new(Box::new(push) as Box<dyn Push<T, D>>)
                             as Box<dyn std::any::Any + Send>,
                         Box::new(Box::new(pull) as Box<dyn Pull<T, D>>)
                             as Box<dyn std::any::Any + Send>,
-                    )
+                    ))
                 });
             state.channel_factories.push((edge_idx, chan_factory));
         }
@@ -3503,12 +3503,12 @@ impl<T: Timestamp, D: Clone + Send + 'static> Pipe<T, D> {
                 channel_factory(move |_ctx, wake: Option<WakeHandle>| {
                     let (push, pull) =
                         bounded_channel_with_wake::<T, D, ()>(capacity, wake.clone());
-                    (
+                    Ok((
                         Box::new(Box::new(push) as Box<dyn Push<T, D>>)
                             as Box<dyn std::any::Any + Send>,
                         Box::new(Box::new(pull) as Box<dyn Pull<T, D>>)
                             as Box<dyn std::any::Any + Send>,
-                    )
+                    ))
                 });
             state.channel_factories.push((edge_idx, chan_factory));
 
@@ -3636,12 +3636,12 @@ impl<T: Timestamp, D: Clone + Send + 'static> Pipe<T, D> {
                 channel_factory(move |_ctx, wake: Option<WakeHandle>| {
                     let (push, pull) =
                         bounded_channel_with_wake::<T, D, ()>(capacity, wake.clone());
-                    (
+                    Ok((
                         Box::new(Box::new(push) as Box<dyn Push<T, D>>)
                             as Box<dyn std::any::Any + Send>,
                         Box::new(Box::new(pull) as Box<dyn Pull<T, D>>)
                             as Box<dyn std::any::Any + Send>,
-                    )
+                    ))
                 });
             state.channel_factories.push((edge_idx, chan_factory));
 
@@ -3791,12 +3791,12 @@ impl<T: Timestamp, D: Clone + Send + 'static> Pipe<T, D> {
                 channel_factory(move |_ctx, wake: Option<WakeHandle>| {
                     let (push, pull) =
                         bounded_channel_with_wake::<T, D, ()>(capacity, wake.clone());
-                    (
+                    Ok((
                         Box::new(Box::new(push) as Box<dyn Push<T, D>>)
                             as Box<dyn std::any::Any + Send>,
                         Box::new(Box::new(pull) as Box<dyn Pull<T, D>>)
                             as Box<dyn std::any::Any + Send>,
-                    )
+                    ))
                 });
             state.channel_factories.push((edge_idx, chan_factory));
         }
@@ -3900,12 +3900,12 @@ impl<T: Timestamp, D: Clone + Send + 'static> Pipe<T, D> {
                 channel_factory(move |_ctx, wake: Option<WakeHandle>| {
                     let (push, pull) =
                         bounded_channel_with_wake::<T, D, ()>(capacity, wake.clone());
-                    (
+                    Ok((
                         Box::new(Box::new(push) as Box<dyn Push<T, D>>)
                             as Box<dyn std::any::Any + Send>,
                         Box::new(Box::new(pull) as Box<dyn Pull<T, D>>)
                             as Box<dyn std::any::Any + Send>,
-                    )
+                    ))
                 });
             state.channel_factories.push((edge_idx, chan_factory));
         }
@@ -4043,12 +4043,12 @@ impl<T: Timestamp, D: Clone + Send + 'static> Pipe<T, D> {
                 channel_factory(move |_ctx, wake: Option<WakeHandle>| {
                     let (push, pull) =
                         bounded_channel_with_wake::<T, D, ()>(capacity, wake.clone());
-                    (
+                    Ok((
                         Box::new(Box::new(push) as Box<dyn Push<T, D>>)
                             as Box<dyn std::any::Any + Send>,
                         Box::new(Box::new(pull) as Box<dyn Pull<T, D>>)
                             as Box<dyn std::any::Any + Send>,
-                    )
+                    ))
                 });
             state.channel_factories.push((edge_idx, chan_factory));
         }
@@ -4167,12 +4167,12 @@ impl<T: Timestamp, D: Clone + Send + 'static> Pipe<T, D> {
                 channel_factory(move |_ctx, wake: Option<WakeHandle>| {
                     let (push, pull) =
                         bounded_channel_with_wake::<T, D, ()>(capacity, wake.clone());
-                    (
+                    Ok((
                         Box::new(Box::new(push) as Box<dyn Push<T, D>>)
                             as Box<dyn std::any::Any + Send>,
                         Box::new(Box::new(pull) as Box<dyn Pull<T, D>>)
                             as Box<dyn std::any::Any + Send>,
-                    )
+                    ))
                 });
             state.channel_factories.push((edge_idx, chan_factory));
         }

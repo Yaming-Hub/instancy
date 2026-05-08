@@ -1239,20 +1239,14 @@ where
 
                     let pushers: Vec<Box<dyn crate::dataflow::channels::Push<T, D, ()>>> =
                         if slot < m {
-                            mat.materialize_source_worker(slot)
-                                .unwrap_or_else(|e| {
-                                    panic!("source materialization failed for slot {slot}: {e}")
-                                })
+                            mat.materialize_source_worker(slot)?
                         } else {
                             Vec::new()
                         };
 
                     let pullers: Vec<Box<dyn crate::dataflow::channels::Pull<T, D, ()>>> =
                         if slot < n {
-                            mat.materialize_target_worker(slot)
-                                .unwrap_or_else(|e| {
-                                    panic!("target materialization failed for slot {slot}: {e}")
-                                })
+                            mat.materialize_target_worker(slot)?
                         } else {
                             Vec::new()
                         };
@@ -1263,12 +1257,12 @@ where
                     let push = ExchangePush::new(pushers, exchange_fn.clone(), wakes.clone());
                     let pull = ExchangePull::new(pullers, wakes.clone());
 
-                    (
+                    Ok((
                         Box::new(Box::new(push) as Box<dyn Push<T, D>>)
                             as Box<dyn std::any::Any + Send>,
                         Box::new(Box::new(pull) as Box<dyn Pull<T, D>>)
                             as Box<dyn std::any::Any + Send>,
-                    )
+                    ))
                 },
             )
         })
@@ -1338,20 +1332,14 @@ where
 
                     let pushers: Vec<Box<dyn crate::dataflow::channels::Push<T, D, ()>>> =
                         if slot < m {
-                            mat.materialize_source_worker(slot)
-                                .unwrap_or_else(|e| {
-                                    panic!("source materialization failed for slot {slot}: {e}")
-                                })
+                            mat.materialize_source_worker(slot)?
                         } else {
                             Vec::new()
                         };
 
                     let pullers: Vec<Box<dyn crate::dataflow::channels::Pull<T, D, ()>>> =
                         if slot < n {
-                            mat.materialize_target_worker(slot)
-                                .unwrap_or_else(|e| {
-                                    panic!("target materialization failed for slot {slot}: {e}")
-                                })
+                            mat.materialize_target_worker(slot)?
                         } else {
                             Vec::new()
                         };
@@ -1362,12 +1350,12 @@ where
                     let push = BroadcastPush::new(pushers, wakes.clone());
                     let pull = ExchangePull::new(pullers, wakes.clone());
 
-                    (
+                    Ok((
                         Box::new(Box::new(push) as Box<dyn Push<T, D>>)
                             as Box<dyn std::any::Any + Send>,
                         Box::new(Box::new(pull) as Box<dyn Pull<T, D>>)
                             as Box<dyn std::any::Any + Send>,
-                    )
+                    ))
                 },
             )
         })
