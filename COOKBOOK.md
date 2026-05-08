@@ -528,7 +528,7 @@ let input = builder.input::<(u64, String)>("tasks");
 // low-priority items get pushed forward by their priority value.
 input
     .delay("priority-shift", |t, (priority, _msg)| {
-        t + priority
+        if *priority < 10 { *t } else { t + priority }
     })
     .output("scheduled");
 ```
