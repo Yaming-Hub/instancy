@@ -180,7 +180,7 @@ impl ClusterTransport {
 /// Transport configuration for [`spawn_cluster`](crate::RuntimeHandle::spawn_cluster).
 ///
 /// Determines whether the cluster dataflow uses dedicated per-dataflow connections
-/// or shares pooled connections via [`SharedPeerManager`]s.
+/// or shares pooled connections via [`SharedPeerManager`](crate::communication::shared_transport::SharedPeerManager)s.
 ///
 /// # Examples
 ///
@@ -205,7 +205,7 @@ pub enum ClusterSpawnTransport<R = tokio::io::DuplexStream, W = tokio::io::Duple
         /// Buffer capacity for transport channels.
         capacity: usize,
     },
-    /// Use shared pooled connections via existing [`SharedPeerManager`]s.
+    /// Use shared pooled connections via existing [`SharedPeerManager`](crate::communication::shared_transport::SharedPeerManager)s.
     ///
     /// The `Arc` ensures peer managers remain alive for the lifetime of the
     /// dataflow, preventing premature task abortion.

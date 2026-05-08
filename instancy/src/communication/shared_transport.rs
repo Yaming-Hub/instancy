@@ -1,7 +1,7 @@
 //! Shared transport layer for pooled, multi-dataflow connections.
 //!
 //! This module implements Phase 4 of the shared connection mode (DESIGN.md §6.3.1).
-//! Unlike [`TransportSession`] which creates dedicated per-dataflow TCP connections,
+//! Unlike [`TransportSession`](super::transport_session::TransportSession) which creates dedicated per-dataflow TCP connections,
 //! `SharedTransportSession` lets multiple dataflows share a pool of connections to
 //! each peer, with sequenced messages for ordering.
 //!
@@ -878,7 +878,7 @@ impl SharedPeerManager {
 /// A per-dataflow transport session backed by shared, pooled connections.
 ///
 /// This is a lightweight handle that references a [`SharedPeerManager`] for
-/// each peer. It provides the same API surface as [`TransportSession`]:
+/// each peer. It provides the same API surface as [`TransportSession`](super::transport_session::TransportSession):
 /// `data_sender()`, `progress_sender()`, and `control_sender()`.
 ///
 /// # Ordering

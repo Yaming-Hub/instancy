@@ -1,7 +1,7 @@
 //! Network progress exchange: serialization, bridge tasks, and factory functions.
 //!
 //! This module provides the infrastructure for exchanging progress updates
-//! across network nodes via [`TransportSession`].
+//! across network nodes via [`TransportSession`](crate::communication::transport_session::TransportSession).
 //!
 //! # Architecture
 //!

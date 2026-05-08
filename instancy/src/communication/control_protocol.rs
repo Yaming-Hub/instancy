@@ -329,7 +329,7 @@ pub async fn perform_ready_barrier(
     Ok(())
 }
 
-/// Perform the handshake protocol using a [`ClusterTransport`].
+/// Perform the handshake protocol using a [`ClusterTransport`](super::cluster_transport::ClusterTransport).
 ///
 /// Functionally identical to [`perform_handshake`] but accepts the unified
 /// transport abstraction instead of a raw `TransportSession`.
@@ -402,7 +402,7 @@ pub async fn perform_handshake_with_transport(
     Ok(())
 }
 
-/// Perform the ready barrier using a [`ClusterTransport`].
+/// Perform the ready barrier using a [`ClusterTransport`](super::cluster_transport::ClusterTransport).
 ///
 /// Functionally identical to [`perform_ready_barrier`] but accepts the unified
 /// transport abstraction instead of a raw `TransportSession`.

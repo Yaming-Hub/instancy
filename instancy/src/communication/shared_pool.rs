@@ -447,7 +447,7 @@ impl PeerPool {
 
     /// Select the least-loaded live connection without reserving.
     ///
-    /// Use [`select_and_reserve`] for production send paths to avoid
+    /// Use [`Self::select_and_reserve`] for production send paths to avoid
     /// concurrent senders all choosing the same connection.
     /// This method is useful for read-only inspection or diagnostics.
     pub fn select_connection(&self) -> Option<&Arc<ConnectionMetrics>> {
