@@ -319,3 +319,55 @@ fn auto_par_uniform_fallback() {
 
     multi.join_blocking().unwrap();
 }
+
+/// Cross-stage frontier propagation: input → exchange_to(2) → delay_batch → output.
+/// Stage 0 par=1, Stage 1 par=2.
+/// The delay_batch operator is frontier-dependent — it buffers data until the
+/// input frontier advances past the delayed timestamp. This test validates that
+/// ghost operators in the reachability graph correctly propagate frontier changes
+/// from the upstream stage to the downstream stage.
+#[test]
+fn auto_par_cross_stage_frontier() {
+    let rt = test_runtime();
+
+    let mut multi = rt
+        .spawn_multi(
+            "frontier",
+            0,
+            |_worker_idx, builder: &mut DataflowBuilder<u64>| {
+                let input = builder.input::<i32>("data");
+                input
+                    .exchange_to("scatter", 2, |v: &i32| *v as u64)
+                    .delay_batch("hold", |t| *t)
+                    .map("inc", |_t, x| x + 100)
+                    .output("results");
+                Ok(())
+            },
+            auto_opts(),
+        )
+        .unwrap();
+
+    let sender = multi.take_input::<i32>(0, "data").unwrap();
+    // Use multiple receivers since output is on stage 1 (par=2).
+    // Data at timestamp 0 and 1.
+    sender.send(0, vec![1, 2, 3, 4]).unwrap();
+    sender.send(1, vec![10, 20]).unwrap();
+    drop(sender);
+
+    // Collect from all workers' outputs.
+    let mut all_results = Vec::new();
+    for w in 0..multi.num_workers() {
+        if let Ok(receiver) = multi.take_output::<i32>(w, "results") {
+            let data: Vec<i32> = receiver
+                .collect_data()
+                .into_iter()
+                .flat_map(|(_, d)| d)
+                .collect();
+            all_results.extend(data);
+        }
+    }
+    all_results.sort();
+    assert_eq!(all_results, vec![101, 102, 103, 104, 110, 120]);
+
+    multi.join_blocking().unwrap();
+}
