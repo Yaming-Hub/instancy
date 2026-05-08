@@ -2973,9 +2973,54 @@ impl<
             counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
         })
     }
-}
 
-/// Exchange methods for non-transport builds (local-only exchange).
+    /// Broadcast all data to every worker (fan-out).
+    ///
+    /// Each item is cloned and sent to ALL workers in the dataflow. This is
+    /// useful for distributing small reference data, configuration, or lookup
+    /// tables that every worker needs a complete copy of.
+    ///
+    /// **Warning:** Broadcast multiplies data volume by the worker count. Only
+    /// use for small datasets or control signals, not for large data streams.
+    ///
+    /// In single-worker mode, this is a no-op pass-through.
+    ///
+    /// # Example
+    /// ```ignore
+    /// let config = config_stream.broadcast("share-config");
+    /// // Every worker now has a copy of all config items.
+    /// ```
+    pub fn broadcast(mut self, name: impl Into<String>) -> Pipe<T, D> {
+        let capacity = self.resolve_capacity();
+        self.add_broadcast_internal_networked(name, capacity)
+    }
+
+    fn add_broadcast_internal_networked(
+        &self,
+        name: impl Into<String>,
+        capacity: usize,
+    ) -> Pipe<T, D> {
+        let pipe = self.add_broadcast_internal(name, capacity);
+
+        // Store network broadcast creator alongside the local one.
+        {
+            let mut state = self.state.borrow_mut();
+            let edge_idx = state.graph.edges().len() - 1;
+            let creator: Box<
+                dyn crate::dataflow::channels::exchange_channel::NetworkExchangeCreator,
+            > = Box::new(
+                crate::dataflow::channels::exchange_channel::NetworkBroadcastCreatorImpl::<T, D> {
+                    _phantom: std::marker::PhantomData,
+                },
+            );
+            state
+                .exchange_network_creators
+                .push((edge_idx, capacity, creator));
+        }
+
+        pipe
+    }
+}
 #[cfg(not(feature = "transport"))]
 impl<T: Timestamp, D: Clone + Send + 'static> Pipe<T, D> {
     /// Repartition data across workers based on a hash function.
@@ -3124,6 +3169,27 @@ impl<T: Timestamp, D: Clone + Send + 'static> Pipe<T, D> {
             counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
         })
     }
+
+    /// Broadcast all data to every worker (fan-out).
+    ///
+    /// Each item is cloned and sent to ALL workers in the dataflow. This is
+    /// useful for distributing small reference data, configuration, or lookup
+    /// tables that every worker needs a complete copy of.
+    ///
+    /// **Warning:** Broadcast multiplies data volume by the worker count. Only
+    /// use for small datasets or control signals, not for large data streams.
+    ///
+    /// In single-worker mode, this is a no-op pass-through.
+    ///
+    /// # Example
+    /// ```ignore
+    /// let config = config_stream.broadcast("share-config");
+    /// // Every worker now has a copy of all config items.
+    /// ```
+    pub fn broadcast(mut self, name: impl Into<String>) -> Pipe<T, D> {
+        let capacity = self.resolve_capacity();
+        self.add_broadcast_internal(name, capacity)
+    }
 }
 
 /// Internal exchange implementation— shared by both transport and non-transport builds.
@@ -3267,7 +3333,136 @@ impl<T: Timestamp, D: Clone + Send + 'static> Pipe<T, D> {
         }
     }
 
-    /// Attach a probe to observe the frontier at this point in the pipeline.
+    /// Internal: add a broadcast (fan-out to all workers) operator.
+    ///
+    /// Like `add_exchange_internal` but uses `BroadcastPush` which clones
+    /// each item to ALL target workers instead of routing to one.
+    fn add_broadcast_internal(
+        &self,
+        name: impl Into<String>,
+        capacity: usize,
+    ) -> Pipe<T, D> {
+        let _name = name.into();
+        let op_idx;
+        let stage_id = StageId::new(0);
+
+        // Identity pass-through logic (same as exchange).
+        let wired_logic =
+            move |input: &mut InputHandle<T, D>, output: &mut OutputHandle<T, D>| -> Result<()> {
+                while let Some((time, data)) = input.next() {
+                    if !data.is_empty() {
+                        output.push_vec(time, data);
+                    }
+                }
+                Ok(())
+            };
+
+        {
+            let mut state = self.state.borrow_mut();
+            op_idx = state.allocate_operator_index();
+
+            // Register operator as "broadcast" in the graph.
+            state
+                .graph
+                .register_operator(crate::dataflow::graph::OperatorInfo::new(
+                    op_idx, "broadcast", stage_id, 1, 1,
+                ))
+                .expect("operator index unique");
+
+            // Edge from upstream — marked as Exchange (broadcast uses same infrastructure).
+            state
+                .graph
+                .add_edge(crate::dataflow::graph::EdgeInfo::exchange(
+                    Slot::new(self.op_idx, self.output_slot),
+                    Slot::new(op_idx, 0),
+                    stage_id,
+                    stage_id,
+                ));
+
+            // Subgraph connectivity with initial capability.
+            let mut initial_cap = ChangeBatch::new();
+            initial_cap.update(T::minimum(), 1);
+            let progress = state.subgraph_builder.add_operator_with_capabilities(
+                op_idx,
+                "broadcast",
+                1,
+                1,
+                PortConnectivity::identity(T::Summary::default()),
+                vec![initial_cap],
+            );
+            let exchange_reporter = progress.reporter(0).clone();
+
+            state.subgraph_builder.add_edge(
+                Location::source(self.op_idx, self.output_slot),
+                Location::target(op_idx, 0),
+            );
+
+            // Operator factory — same pass-through unary as exchange.
+            let name_clone = String::from("broadcast");
+            let factory: OperatorFactory =
+                single_use_factory(move |_ctx, endpoints: ChannelEndpoints| {
+                    let input_puller: Box<dyn Pull<T, D>> = *endpoints
+                        .input_pullers
+                        .into_iter()
+                        .next()
+                        .expect("broadcast must have input puller")
+                        .downcast::<Box<dyn Pull<T, D>>>()
+                        .expect("broadcast input puller type mismatch");
+
+                    let output_pusher: Box<dyn Push<T, D>> = {
+                        let pushers: Vec<Box<dyn Push<T, D>>> = endpoints
+                            .output_pushers
+                            .into_iter()
+                            .map(|any_box| {
+                                *any_box
+                                    .downcast::<Box<dyn Push<T, D>>>()
+                                    .expect("broadcast output pusher type mismatch")
+                            })
+                            .collect();
+                        tee_or_single(pushers).unwrap_or_else(|| Box::new(NullPush))
+                    };
+
+                    Box::new(WiredUnaryOperator::with_reporter(
+                        name_clone,
+                        op_idx,
+                        stage_id,
+                        wired_logic,
+                        input_puller,
+                        output_pusher,
+                        exchange_reporter,
+                    )) as Box<dyn SchedulableOperator>
+                });
+            state.operator_factories.push((op_idx, factory));
+
+            // Channel factory — pipeline placeholder for single-worker.
+            let edge_idx = state.graph.edges().len() - 1;
+            let chan_factory: ChannelFactory =
+                channel_factory(move |_ctx, wake: Option<WakeHandle>| {
+                    let (push, pull) =
+                        bounded_channel_with_wake::<T, D, ()>(capacity, wake.clone());
+                    (
+                        Box::new(Box::new(push) as Box<dyn Push<T, D>>)
+                            as Box<dyn std::any::Any + Send>,
+                        Box::new(Box::new(pull) as Box<dyn Pull<T, D>>)
+                            as Box<dyn std::any::Any + Send>,
+                    )
+                });
+            state.channel_factories.push((edge_idx, chan_factory));
+
+            // Store broadcast factory creator for multi-worker.
+            let creator =
+                crate::dataflow::channels::exchange_channel::create_broadcast_factory_creator::<T, D>();
+            state.exchange_creators.push((edge_idx, capacity, creator));
+        }
+
+        Pipe {
+            state: Rc::clone(&self.state),
+            op_idx,
+            output_slot: 0,
+            capacity_override: None,
+            _phantom: PhantomData,
+        }
+    }
     ///
     /// Returns `(Pipe, ProbeHandle)` — the Pipe continues unchanged,
     /// and the probe can be queried after execution.

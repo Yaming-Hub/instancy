@@ -12,7 +12,7 @@
 4. **Production-grade robustness** — `Result`-based error handling everywhere; no panics in library code. First-class cancellation via `CancellationToken`.
 5. **Pluggable networking** — users supply their own connection factory (e.g., mTLS); the library manages a pooled, reusable connection layer.
 6. **Pluggable serialization** — a `Codec` trait lets users choose bincode, protobuf, flatbuffers, or any other format.
-7. **Minimal core operators** — only `unary`, `binary`, `branch`, `feedback` (loop), `exchange`, `rebalance`, `gather`, `broadcast`, `broadcast_local`, `delay`, `input`, `probe`, `inspect`, `for_each`, `concat`. Higher-level operators live in extension crates.
+7. **Minimal core operators** — only `unary`, `binary`, `branch`, `feedback` (loop), `exchange`, `rebalance`, `gather`, `broadcast`, `delay`, `input`, `probe`, `inspect`, `for_each`, `concat`. Higher-level operators live in extension crates.
 8. **Structured message envelope** — messages carry either data or control signals (errors, cancellation) in a unified envelope, enabling in-band error propagation and coordinated shutdown.
 9. **Configurable error policy** — each dataflow specifies whether errors should halt the pipeline or be logged and skipped, giving consumers control over fault tolerance.
 10. **Observability built-in** — per-dataflow CPU time tracking, operator-level metrics, and structured tracing for understanding performance characteristics.
@@ -2026,6 +2026,49 @@ For v1, the following restrictions apply:
 - **Channel allocation**: Within a stage → pipeline channels (no shuffle). Between stages → repartition channels with `upstream_par × downstream_par` routing.
 - **Semaphore per stage**: Each stage has its own concurrency semaphore with `min(parallelism, local_workers_on_this_node)` permits.
 
+#### Local Broadcast via Per-Stage Parallelism
+
+A common pattern in distributed data processing is **node-local fan-out**: data is available locally on each node, one worker per node loads it, and it should be broadcast to all workers on the **same node** — without any network traffic.
+
+**Example scenario:**
+```
+Cluster: 2 nodes × 4 workers = 8 workers total
+Each node has a local copy of reference data (e.g., lookup table).
+
+Desired behavior:
+  Node A: worker 0 loads data → broadcast to workers 0,1,2,3 (local only)
+  Node B: worker 4 loads data → broadcast to workers 4,5,6,7 (local only)
+  No cross-node traffic — each node independently fans out to its local peers.
+```
+
+**Why a separate `broadcast_local()` operator is not the right abstraction:**
+
+A `broadcast_local()` operator would leak physical topology (node boundaries) into the logical dataflow graph. The logical graph should describe *what* data flows where, not *how* the physical transport works. A "broadcast only to same-node workers" is a physical constraint, not a logical one.
+
+**Per-stage parallelism solves this cleanly:**
+
+```rust
+let output = builder
+    .source("load-data", |handle| {
+        // Each node's single worker loads local data.
+        let data = load_local_reference_data();
+        handle.send_batch(0, data);
+    })                                          // Stage 0: par=1 per node
+    .broadcast(4)                               // Stage 0→1: fan-out to 4 workers
+    .map("enrich", |_t, record| enrich(record)) // Stage 1: par=4 per node
+    ...
+```
+
+With per-stage parallelism:
+1. Stage 0 has parallelism=1 (one loader per node). Each node independently runs one worker for this stage.
+2. The `broadcast(4)` operator creates a stage boundary to Stage 1 with parallelism=4.
+3. **The runtime knows both stages are on the same node.** The edge between them uses `LocalEdgeMaterializer` (in-process channels, no serialization, no network).
+4. Each node's single Stage 0 worker fans out to its 4 local Stage 1 workers — automatically, with no network traffic.
+
+The user never specifies "local" vs "global" — the runtime infers it from the cluster topology and stage placement. This keeps the logical API clean and topology-agnostic.
+
+**Current status:** Per-stage parallelism is not yet implemented. Until then, the workaround is to have all workers load data independently (redundant I/O but zero coordination), or use the global `broadcast()` operator which sends to all workers including cross-node.
+
 ---
 
 ## 6. Communication Layer
@@ -2717,8 +2760,7 @@ pub enum Error {
 | `exchange` | Repartitions data across workers by a routing function (hash-based); creates a stage boundary when parallelism changes |
 | `rebalance` | Round-robin distribution across target replicas; used at stage boundaries when key doesn't matter |
 | `gather` | Funnels all data to a single replica (parallelism 1); used for global aggregation |
-| `broadcast` | Sends each record to **all** workers across the cluster (clones data cross-process via serialization) |
-| `broadcast_local` | Sends each record to all workers **within the same process** (cheap clone, no serialization) |
+| `broadcast` | Sends each record to **all** workers (clones data); in a cluster with per-stage parallelism, the runtime automatically uses local channels when source and target stages are on the same node — no separate "local" variant needed (see §5.5 Local Broadcast) |
 | `delay` | Holds data until the frontier advances past a specified timestamp; useful for windowing and time-based buffering |
 | `concat` | Merges multiple streams into one |
 | `inspect` | Pass-through side-effect observation (logging, debugging); data continues downstream |
