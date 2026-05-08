@@ -84,6 +84,8 @@ pub use runtime::{
 };
 #[cfg(feature = "transport")]
 pub use runtime::ClusterCompletion;
+#[cfg(feature = "transport")]
+pub use runtime::ClusterSpawnedDataflow;
 #[cfg(feature = "test-utils")]
 pub use runtime::SimpleRuntime;
 

@@ -217,11 +217,27 @@ pub struct SpawnOptions {
 
 impl SpawnOptions {
     /// Create spawn options with defaults.
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// use instancy::SpawnOptions;
+    ///
+    /// let opts = SpawnOptions::new();
+    /// ```
     pub fn new() -> Self {
         Self::default()
     }
 
     /// Set the I/O channel mode.
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// use instancy::{SpawnOptions, IoMode};
+    ///
+    /// let opts = SpawnOptions::new().io_mode(IoMode::Async);
+    /// ```
     pub fn io_mode(mut self, mode: IoMode) -> Self {
         self.io_mode = mode;
         self
@@ -231,12 +247,31 @@ impl SpawnOptions {
     ///
     /// When enabled, the runtime records activation counts and durations for
     /// each operator. Retrieve via `DataflowCompletion` after join.
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// use instancy::SpawnOptions;
+    ///
+    /// let opts = SpawnOptions::new().collect_metrics(true);
+    /// ```
     pub fn collect_metrics(mut self, enable: bool) -> Self {
         self.collect_metrics = enable;
         self
     }
 
     /// Set the scheduling priority for this dataflow.
+    ///
+    /// Higher values mean the dataflow is scheduled sooner when multiple
+    /// dataflows compete for worker threads.
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// use instancy::SpawnOptions;
+    ///
+    /// let opts = SpawnOptions::new().priority(10);
+    /// ```
     pub fn priority(mut self, priority: u32) -> Self {
         self.priority = priority;
         self
@@ -551,6 +586,14 @@ impl RuntimeHandle {
     ///
     /// # Errors
     /// Returns an error if the worker pool configuration is invalid.
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// use instancy::{RuntimeConfig, RuntimeHandle};
+    ///
+    /// let rt = RuntimeHandle::new(RuntimeConfig::default()).unwrap();
+    /// ```
     pub fn new(config: RuntimeConfig) -> Result<Self> {
         let pool_config = WorkerPoolConfig {
             min_threads: config.worker_threads,
@@ -2703,6 +2746,12 @@ pub struct SpawnedDataflow<T: Timestamp> {
 
 impl<T: Timestamp> SpawnedDataflow<T> {
     /// Get the dataflow name.
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// assert_eq!(handle.name(), "my-dataflow");
+    /// ```
     pub fn name(&self) -> &str {
         &self.name
     }
@@ -2727,6 +2776,14 @@ impl<T: Timestamp> SpawnedDataflow<T> {
     /// # Type safety
     ///
     /// The type parameter `D` must match the type used in `builder.input::<D>(name)`.
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// let sender = handle.take_input::<i32>("data").unwrap();
+    /// sender.send(0, vec![1, 2, 3]).unwrap();
+    /// sender.close();
+    /// ```
     pub fn take_input<D: Clone + Send + 'static>(
         &mut self,
         name: &str,
@@ -2762,6 +2819,14 @@ impl<T: Timestamp> SpawnedDataflow<T> {
     /// # Type safety
     ///
     /// The type parameter `D` must match the type used in `stream.output(name)`.
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// let receiver = handle.take_output::<i32>("results").unwrap();
+    /// // After dataflow completes:
+    /// let data = receiver.collect_data();
+    /// ```
     pub fn take_output<D: Send + 'static>(
         &mut self,
         name: &str,
@@ -2859,14 +2924,30 @@ impl<T: Timestamp> SpawnedDataflow<T> {
     ///
     /// Signals the executor's cancellation token with [`CancellationReason::UserRequested`].
     /// The executor will stop at the next cancellation check point. Does not block.
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// handle.cancel();
+    /// let result = handle.join().await;
+    /// assert!(result.is_err()); // Cancelled
+    /// ```
     pub fn cancel(&self) {
         self.cancel.cancel();
     }
 
     /// Get a reference to the dataflow's cancellation token.
     ///
-    /// Useful for observing the cancellation state (e.g., after a timeout) or
-    /// cloning the token for use in other contexts.
+    /// Useful for observing the cancellation state (e.g., checking the
+    /// reason after completion) or cloning the token for use in other contexts.
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// let token = handle.cancel_token().clone();
+    /// handle.cancel();
+    /// assert_eq!(token.reason(), Some(CancellationReason::UserRequested));
+    /// ```
     pub fn cancel_token(&self) -> &CancellationToken {
         &self.cancel
     }
@@ -2875,6 +2956,12 @@ impl<T: Timestamp> SpawnedDataflow<T> {
     ///
     /// Signals the executor's cancellation token. The executor will stop
     /// at the next cancellation check point. Does not block.
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// handle.cancel_with_reason(CancellationReason::NetworkError("lost connection".into()));
+    /// ```
     pub fn cancel_with_reason(&self, reason: CancellationReason) {
         self.cancel.cancel_with_reason(reason);
     }
@@ -2887,6 +2974,16 @@ impl<T: Timestamp> SpawnedDataflow<T> {
     ///
     /// Consumes the handle — calling `join()` transfers lifecycle ownership
     /// to the returned future. The dataflow will **not** be cancelled on drop.
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// // Async — consumes the handle:
+    /// let result = handle.join().await;
+    ///
+    /// // Or sync — also consumes the handle:
+    /// // let result = handle.join().wait();
+    /// ```
     pub fn join(mut self) -> DataflowCompletion {
         self.completion
             .take()
@@ -2896,6 +2993,12 @@ impl<T: Timestamp> SpawnedDataflow<T> {
     /// Wait for the dataflow to complete, blocking the current thread.
     ///
     /// Convenience wrapper around [`join()`](Self::join) + [`DataflowCompletion::wait()`].
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// handle.join_blocking().unwrap();
+    /// ```
     pub fn join_blocking(self) -> Result<()> {
         self.join().wait()
     }
@@ -2970,6 +3073,12 @@ impl<T: Timestamp> MultiSpawnedDataflow<T> {
     }
 
     /// Number of workers.
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// assert_eq!(multi.num_workers(), 4);
+    /// ```
     pub fn num_workers(&self) -> usize {
         self.num_workers
     }
@@ -3209,6 +3318,12 @@ impl<T: Timestamp> MultiSpawnedDataflow<T> {
     ///
     /// Each worker's cancellation token is signalled. The executors will stop
     /// at the next cancellation check point.
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// multi.cancel();
+    /// ```
     pub fn cancel(&self) {
         for w in &self.workers {
             w.cancel();
@@ -3216,6 +3331,12 @@ impl<T: Timestamp> MultiSpawnedDataflow<T> {
     }
 
     /// Cancel all workers with a specific reason.
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// multi.cancel_with_reason(CancellationReason::UserRequested);
+    /// ```
     pub fn cancel_with_reason(&self, reason: CancellationReason) {
         for w in &self.workers {
             w.cancel_with_reason(reason.clone());
@@ -3226,6 +3347,12 @@ impl<T: Timestamp> MultiSpawnedDataflow<T> {
     ///
     /// Returns `Ok(())` if all workers ran to completion. If any worker
     /// fails, the remaining workers are cancelled and the first error is returned.
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// multi.join_blocking().unwrap();
+    /// ```
     pub fn join_blocking(mut self) -> Result<()> {
         let mut workers: Vec<SpawnedDataflow<T>> = std::mem::take(&mut self.workers);
         let mut first_error: Option<Error> = None;
