@@ -543,8 +543,10 @@ pub struct NetworkEdgeMaterializer<T: Timestamp + ExchangeData, D: ExchangeData>
     local_push: Vec<Vec<Option<BoundedPush<T, D, ()>>>>,
     local_pull: Vec<Vec<Option<BoundedPull<T, D, ()>>>>,
 
-    /// Track which workers have been materialized.
-    taken: Vec<bool>,
+    /// Track which workers have had push endpoints materialized.
+    taken_push: Vec<bool>,
+    /// Track which workers have had pull endpoints materialized.
+    taken_pull: Vec<bool>,
 
     /// Wake handles for all workers (indexed by global worker ID).
     /// Used to notify the executor when remote data arrives via bridge tasks.
@@ -635,7 +637,8 @@ impl<T: Timestamp + ExchangeData, D: ExchangeData> NetworkEdgeMaterializer<T, D>
             demux_receivers,
             local_push,
             local_pull,
-            taken: vec![false; num_workers],
+            taken_push: vec![false; num_workers],
+            taken_pull: vec![false; num_workers],
             wake_handles,
             runtime_handle,
         }
@@ -735,47 +738,26 @@ impl<T: Timestamp + ExchangeData, D: ExchangeData> EdgeMaterializer<T, D>
 
     fn materialize_source_worker(
         &mut self,
-        _src_idx: usize,
+        src_idx: usize,
     ) -> Result<Vec<Box<dyn Push<T, D, ()>>>> {
-        // Network materializer uses materialize_worker for both push and pull.
-        Err(Error::Custom(
-            "NetworkEdgeMaterializer does not support asymmetric materialization; use materialize_worker".to_string()
-        ))
-    }
-
-    fn materialize_target_worker(
-        &mut self,
-        _dst_idx: usize,
-    ) -> Result<Vec<Box<dyn Pull<T, D, ()>>>> {
-        // Network materializer uses materialize_worker for both push and pull.
-        Err(Error::Custom(
-            "NetworkEdgeMaterializer does not support asymmetric materialization; use materialize_worker".to_string()
-        ))
-    }
-
-    fn materialize_worker(
-        &mut self,
-        worker_idx: usize,
-    ) -> Result<(Vec<Box<dyn Push<T, D, ()>>>, Vec<Box<dyn Pull<T, D, ()>>>)> {
-        if worker_idx >= self.num_workers {
+        if src_idx >= self.num_workers {
             return Err(Error::Custom(format!(
-                "worker index {worker_idx} out of range (num_workers={})",
+                "source worker index {src_idx} out of range (num_workers={})",
                 self.num_workers
             )));
         }
-        if self.taken[worker_idx] {
+        if self.taken_push[src_idx] {
             return Err(Error::Custom(format!(
-                "worker {worker_idx} already materialized"
+                "source worker {src_idx} push already materialized"
             )));
         }
-        self.taken[worker_idx] = true;
+        self.taken_push[src_idx] = true;
 
         let worker_node = self
             .topology
-            .node_for_worker(WorkerId::new(worker_idx))
+            .node_for_worker(WorkerId::new(src_idx))
             .expect("worker index valid for topology");
 
-        // Build push endpoints
         let mut pushers: Vec<Box<dyn Push<T, D, ()>>> = Vec::with_capacity(self.num_workers);
         for dst in 0..self.num_workers {
             let dst_node = self
@@ -784,13 +766,11 @@ impl<T: Timestamp + ExchangeData, D: ExchangeData> EdgeMaterializer<T, D>
                 .expect("worker index valid for topology");
 
             if worker_node == dst_node && worker_node == self.local_node_id {
-                // Local pair — use BoundedPush
-                let push = self.local_push[worker_idx][dst].take().ok_or_else(|| {
-                    Error::Custom(format!("local push [{worker_idx}][{dst}] already taken"))
+                let push = self.local_push[src_idx][dst].take().ok_or_else(|| {
+                    Error::Custom(format!("local push [{src_idx}][{dst}] already taken"))
                 })?;
                 pushers.push(Box::new(push));
             } else {
-                // Remote pair — use NetworkPush
                 let sender = self
                     .transport
                     .data_sender(dst_node)
@@ -799,7 +779,7 @@ impl<T: Timestamp + ExchangeData, D: ExchangeData> EdgeMaterializer<T, D>
                     })?;
 
                 let channel_id =
-                    Self::channel_id(self.edge_index, worker_idx, dst, self.num_workers);
+                    Self::channel_id(self.edge_index, src_idx, dst, self.num_workers);
                 pushers.push(Box::new(NetworkPush::<T, D> {
                     time_codec: T::codec(),
                     data_codec: D::codec(),
@@ -811,7 +791,31 @@ impl<T: Timestamp + ExchangeData, D: ExchangeData> EdgeMaterializer<T, D>
             }
         }
 
-        // Build pull endpoints
+        Ok(pushers)
+    }
+
+    fn materialize_target_worker(
+        &mut self,
+        dst_idx: usize,
+    ) -> Result<Vec<Box<dyn Pull<T, D, ()>>>> {
+        if dst_idx >= self.num_workers {
+            return Err(Error::Custom(format!(
+                "target worker index {dst_idx} out of range (num_workers={})",
+                self.num_workers
+            )));
+        }
+        if self.taken_pull[dst_idx] {
+            return Err(Error::Custom(format!(
+                "target worker {dst_idx} pull already materialized"
+            )));
+        }
+        self.taken_pull[dst_idx] = true;
+
+        let worker_node = self
+            .topology
+            .node_for_worker(WorkerId::new(dst_idx))
+            .expect("worker index valid for topology");
+
         let mut pullers: Vec<Box<dyn Pull<T, D, ()>>> = Vec::with_capacity(self.num_workers);
         for src in 0..self.num_workers {
             let src_node = self
@@ -820,25 +824,20 @@ impl<T: Timestamp + ExchangeData, D: ExchangeData> EdgeMaterializer<T, D>
                 .expect("worker index valid for topology");
 
             if src_node == worker_node && src_node == self.local_node_id {
-                // Local pair — use BoundedPull
-                let pull = self.local_pull[src][worker_idx].take().ok_or_else(|| {
-                    Error::Custom(format!("local pull [{src}][{worker_idx}] already taken"))
+                let pull = self.local_pull[src][dst_idx].take().ok_or_else(|| {
+                    Error::Custom(format!("local pull [{src}][{dst_idx}] already taken"))
                 })?;
                 pullers.push(Box::new(pull));
             } else {
-                // Remote pair — use NetworkPull with bridge task.
-                // The bridge receives from the Demuxer's tokio mpsc channel (async),
-                // forwards to a std::sync::mpsc channel (sync), and notifies the
-                // executor's WakeHandle so it wakes up to process the data.
                 let tokio_receiver =
                     self.demux_receivers
-                        .remove(&(src, worker_idx))
+                        .remove(&(src, dst_idx))
                         .ok_or_else(|| {
-                            Error::Custom(format!("no demux receiver for [{src}][{worker_idx}]"))
+                            Error::Custom(format!("no demux receiver for [{src}][{dst_idx}]"))
                         })?;
 
                 let (std_tx, std_rx) = std::sync::mpsc::channel::<Vec<u8>>();
-                let wake = self.wake_handles[worker_idx].clone();
+                let wake = self.wake_handles[dst_idx].clone();
                 self.runtime_handle.spawn(async move {
                     data_recv_bridge(tokio_receiver, std_tx, wake).await;
                 });
@@ -853,6 +852,15 @@ impl<T: Timestamp + ExchangeData, D: ExchangeData> EdgeMaterializer<T, D>
             }
         }
 
+        Ok(pullers)
+    }
+
+    fn materialize_worker(
+        &mut self,
+        worker_idx: usize,
+    ) -> Result<(Vec<Box<dyn Push<T, D, ()>>>, Vec<Box<dyn Pull<T, D, ()>>>)> {
+        let pushers = self.materialize_source_worker(worker_idx)?;
+        let pullers = self.materialize_target_worker(worker_idx)?;
         Ok((pushers, pullers))
     }
 }

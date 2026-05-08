@@ -213,6 +213,43 @@ pub struct SpawnOptions {
     ///     .drain_on_cancel(Duration::from_secs(5));
     /// ```
     pub drain_timeout: Option<std::time::Duration>,
+    /// Enable per-stage parallelism for multi-worker dataflows.
+    ///
+    /// When `true`, [`spawn_multi`](RuntimeHandle::spawn_multi) respects the
+    /// parallelism specified via [`exchange_to`](crate::dataflow::Pipe::exchange_to),
+    /// [`gather`](crate::dataflow::Pipe::gather), or
+    /// [`rebalance_to`](crate::dataflow::Pipe::rebalance_to). Stages with
+    /// explicit parallelism get that many active workers; stages without
+    /// explicit parallelism use `num_workers` as the default.
+    ///
+    /// Exchange edges between stages with different parallelism are wired as
+    /// asymmetric M×N channels automatically.
+    ///
+    /// When `false` (current default), all stages must have the same
+    /// parallelism as `num_workers` (the legacy uniform behavior).
+    ///
+    /// **Note:** Per-stage parallelism will become the default in a future
+    /// release once it has been battle-tested.
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// // 1 source worker → 4 parallel workers → 1 aggregator
+    /// let multi = rt.spawn_multi(
+    ///     "pipeline", 1,
+    ///     |_worker_idx, builder| {
+    ///         let input = builder.input::<i32>("data");
+    ///         input
+    ///             .exchange_to("scatter", 4, |v: &i32| *v as u64)
+    ///             .map("process", |_t, x| x * 2)
+    ///             .gather("collect")
+    ///             .output("results");
+    ///         Ok(())
+    ///     },
+    ///     SpawnOptions::new().per_stage_parallelism(true),
+    /// )?;
+    /// ```
+    pub per_stage_parallelism: bool,
 }
 
 impl SpawnOptions {
@@ -307,6 +344,23 @@ impl SpawnOptions {
         self.drain_timeout = Some(timeout);
         self
     }
+
+    /// Enable per-stage parallelism.
+    ///
+    /// When enabled, stages with explicit parallelism (via `exchange_to`,
+    /// `gather`, `rebalance_to`) get their specified worker count. The
+    /// `num_workers` parameter to `spawn_multi` becomes the default for
+    /// stages without explicit parallelism.
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// let opts = SpawnOptions::new().per_stage_parallelism(true);
+    /// ```
+    pub fn per_stage_parallelism(mut self, enable: bool) -> Self {
+        self.per_stage_parallelism = enable;
+        self
+    }
 }
 
 impl Default for SpawnOptions {
@@ -317,6 +371,7 @@ impl Default for SpawnOptions {
             priority: 0,
             cancellation_token: None,
             drain_timeout: None,
+            per_stage_parallelism: false,
         }
     }
 }
@@ -999,16 +1054,29 @@ impl RuntimeHandle {
         T: Timestamp,
         F: Fn(usize, &mut DataflowBuilder<T>) -> Result<()>,
     {
-        self.spawn_multi_internal(
-            name,
-            num_workers,
-            build,
-            options.io_mode.into(),
-            options.collect_metrics,
-            options.priority,
-            options.cancellation_token,
-            options.drain_timeout,
-        )
+        if options.per_stage_parallelism {
+            self.spawn_staged_internal(
+                name,
+                num_workers,
+                build,
+                options.io_mode.into(),
+                options.collect_metrics,
+                options.priority,
+                options.cancellation_token,
+                options.drain_timeout,
+            )
+        } else {
+            self.spawn_multi_internal(
+                name,
+                num_workers,
+                build,
+                options.io_mode.into(),
+                options.collect_metrics,
+                options.priority,
+                options.cancellation_token,
+                options.drain_timeout,
+            )
+        }
     }
 
     // -- Private sync implementations --
@@ -1433,6 +1501,280 @@ impl RuntimeHandle {
                     _ = cancel.cancelled_async() => {
                         // Dataflow already cancelled/completed — exit cleanly.
                     }
+                }
+            });
+        }
+
+        Ok(multi)
+    }
+
+    /// Internal implementation for [`spawn_staged`](Self::spawn_staged).
+    ///
+    /// Creates per-stage worker groups with heterogeneous parallelism.
+    /// Exchange edges between stages with different parallelism use M×N
+    /// asymmetric channels.
+    #[allow(clippy::too_many_arguments)]
+    fn spawn_staged_internal<T, F>(
+        &self,
+        name: &str,
+        default_parallelism: usize,
+        build: F,
+        mode: ChannelMode,
+        collect_metrics: bool,
+        priority: u32,
+        external_cancel: Option<tokio_util::sync::CancellationToken>,
+        drain_timeout: Option<std::time::Duration>,
+    ) -> Result<MultiSpawnedDataflow<T>>
+    where
+        T: Timestamp,
+        F: Fn(usize, &mut DataflowBuilder<T>) -> Result<()>,
+    {
+        if default_parallelism == 0 {
+            return Err(Error::Custom("default_parallelism must be >= 1".into()));
+        }
+
+        // Phase 1: Build one dataflow to analyze stage structure.
+        let mut probe_builder = DataflowBuilder::new(format!("{name}/probe"));
+        build(0, &mut probe_builder)?;
+        let probe_df = probe_builder.build()?;
+        let stages = probe_df.stages().to_vec();
+
+        if stages.is_empty() {
+            // No stages inferred (trivial graph) — fall back to spawn_multi.
+            return self.spawn_multi_internal(
+                name,
+                default_parallelism,
+                build,
+                mode,
+                collect_metrics,
+                priority,
+                external_cancel,
+                drain_timeout,
+            );
+        }
+
+        // Determine per-stage parallelism.
+        let stage_parallelism: Vec<usize> = stages
+            .iter()
+            .map(|s| s.parallelism.unwrap_or(default_parallelism))
+            .collect();
+
+        let num_workers = *stage_parallelism.iter().max().unwrap_or(&default_parallelism);
+
+        if num_workers == 0 {
+            return Err(Error::Custom("computed num_workers must be >= 1".into()));
+        }
+
+        // If all stages have the same parallelism, use normal spawn_multi.
+        if stage_parallelism.iter().all(|&p| p == num_workers) {
+            return self.spawn_multi_internal(
+                name,
+                num_workers,
+                build,
+                mode,
+                collect_metrics,
+                priority,
+                external_cancel,
+                drain_timeout,
+            );
+        }
+
+        // Phase 2: Build all num_workers dataflows from the closure.
+        // We drop the probe dataflow and rebuild fresh copies.
+        drop(probe_df);
+        let mut dataflows = Vec::with_capacity(num_workers);
+        for worker_idx in 0..num_workers {
+            let mut builder = DataflowBuilder::new(format!("{name}/worker-{worker_idx}"));
+            build(worker_idx, &mut builder)?;
+            let mut df = builder.build()?;
+            df.collect_metrics = collect_metrics;
+            df.drain_timeout = drain_timeout;
+            dataflows.push(df);
+        }
+
+        // Phase 3: Validate topologies match across workers.
+        if num_workers > 1 {
+            validate_multi_worker_topologies(&dataflows)?;
+        }
+
+        // Phase 4: Wire up exchange channels with per-stage parallelism.
+        // For each exchange edge, determine source/target stage parallelism
+        // and create asymmetric M×N channels.
+        if num_workers > 1 {
+            let edges = dataflows[0].graph.edges().to_vec();
+            let creators = std::mem::take(&mut dataflows[0].exchange_creators);
+
+            for (edge_idx, edge_capacity, creator) in creators {
+                // edge_idx is the index into graph.edges().
+                let (source_par, target_par) = if edge_idx < edges.len() {
+                    let einfo = &edges[edge_idx];
+                    let src_stage = einfo.source_stage.index();
+                    let tgt_stage = einfo.target_stage.index();
+                    let src_p = stage_parallelism
+                        .get(src_stage)
+                        .copied()
+                        .unwrap_or(default_parallelism);
+                    let tgt_p = stage_parallelism
+                        .get(tgt_stage)
+                        .copied()
+                        .unwrap_or(default_parallelism);
+                    (src_p, tgt_p)
+                } else {
+                    // Fallback: can't determine stages, use num_workers for both.
+                    (num_workers, num_workers)
+                };
+
+                let shared_factories = creator(source_par, target_par, edge_capacity);
+                let expected_count = std::cmp::max(source_par, target_par);
+                if shared_factories.len() != expected_count {
+                    return Err(Error::Custom(format!(
+                        "exchange factory creator for edge {edge_idx} produced {} factories, \
+                         expected {} (max of source_par={}, target_par={})",
+                        shared_factories.len(),
+                        expected_count,
+                        source_par,
+                        target_par
+                    )));
+                }
+
+                // Distribute factories to workers. Workers beyond max(M,N)
+                // keep their placeholder (no-op) channel factories.
+                for (slot_idx, factory) in shared_factories.into_iter().enumerate() {
+                    if slot_idx < num_workers {
+                        let pos = dataflows[slot_idx]
+                            .channel_factories
+                            .iter()
+                            .position(|(idx, _)| *idx == edge_idx)
+                            .ok_or_else(|| {
+                                Error::Custom(format!(
+                                    "exchange edge {edge_idx} not found in worker {slot_idx}'s \
+                                     channel factories"
+                                ))
+                            })?;
+                        dataflows[slot_idx].channel_factories[pos].1 = factory;
+                    }
+                }
+            }
+
+            // Drain unused exchange_creators from other workers.
+            for df in dataflows.iter_mut().skip(1) {
+                df.exchange_creators.clear();
+            }
+        }
+
+        // Phase 5: Create per-worker wake handles and progress exchange channels.
+        let wake_handles: Vec<WakeHandle> = (0..num_workers).map(|_| WakeHandle::new()).collect();
+
+        let mut progress_channels = if num_workers > 1 {
+            create_progress_channels::<T>(num_workers, &wake_handles)
+        } else {
+            Vec::new()
+        };
+
+        // Phase 5b: Create cross-worker control broadcast channel.
+        let dataflow_cancel = if num_workers > 1 {
+            Some(self.cancel.child_token())
+        } else {
+            None
+        };
+        let mut control_pairs: Vec<Option<(ControlSender, ControlReceiver)>> = if num_workers > 1 {
+            let df_cancel = dataflow_cancel.as_ref().unwrap().clone();
+            let (senders, receivers) = ControlBroadcast::new(num_workers, &wake_handles, df_cancel);
+            senders
+                .into_iter()
+                .zip(receivers)
+                .map(|(s, r)| Some((s, r)))
+                .collect()
+        } else {
+            (0..num_workers).map(|_| None).collect()
+        };
+
+        // Phase 6: Materialize all workers.
+        let dataflow_id = DataflowId::new();
+        let mut prepared = Vec::with_capacity(num_workers);
+        let mut spawned_count = 0usize;
+
+        for (worker_idx, dataflow) in dataflows.into_iter().enumerate() {
+            let ctx = WorkerContext::new(worker_idx, num_workers);
+            let pc = if !progress_channels.is_empty() {
+                Some(std::mem::replace(
+                    &mut progress_channels[worker_idx],
+                    WorkerProgressChannels {
+                        senders: Vec::new(),
+                        receivers: Vec::new(),
+                    },
+                ))
+            } else {
+                None
+            };
+            let wh = wake_handles[worker_idx].clone();
+            let ctrl = control_pairs[worker_idx].take();
+            match self.prepare_worker(
+                dataflow,
+                mode,
+                ctx,
+                pc,
+                Some(wh),
+                dataflow_cancel.clone(),
+                ctrl,
+            ) {
+                Ok(worker) => {
+                    prepared.push(worker);
+                    spawned_count += 1;
+                }
+                Err(e) => {
+                    for (w, _, _) in &prepared {
+                        w.cancel
+                            .cancel_with_reason(CancellationReason::WorkerFailed(format!(
+                                "sibling worker {spawned_count} failed to spawn"
+                            )));
+                    }
+                    return Err(Error::Custom(format!(
+                        "failed to spawn worker {spawned_count}: {e}"
+                    )));
+                }
+            }
+        }
+
+        // Phase 7: Register all workers.
+        let mut workers = Vec::with_capacity(num_workers);
+        for (spawned, executor, mut notifier) in prepared {
+            self.active_count
+                .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+            let active_count = Arc::clone(&self.active_count);
+            let idle_notify = Arc::clone(&self.idle_notify);
+            notifier.set_on_complete(Box::new(move || {
+                let prev = active_count.fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
+                if prev == 1 {
+                    idle_notify.notify_waiters();
+                }
+            }));
+            self.registry
+                .register(executor, notifier, dataflow_id, priority);
+            workers.push(spawned);
+        }
+
+        let multi = MultiSpawnedDataflow {
+            name: name.to_string(),
+            num_workers,
+            workers,
+            dataflow_cancel: dataflow_cancel.clone(),
+            _phantom: PhantomData,
+        };
+
+        // Bridge external cancellation token.
+        if let Some(user_token) = external_cancel {
+            let cancel = if let Some(ref dc) = multi.dataflow_cancel {
+                dc.clone()
+            } else {
+                multi.workers[0].cancel.clone()
+            };
+            self.tokio_handle.spawn(async move {
+                tokio::select! {
+                    _ = user_token.cancelled() => {
+                        cancel.cancel_with_reason(CancellationReason::UserRequested);
+                    }
+                    _ = cancel.cancelled_async() => {}
                 }
             });
         }
@@ -3827,17 +4169,19 @@ fn validate_multi_worker_topologies<T: Timestamp>(dataflows: &[LogicalDataflow<T
 
 /// Validate that per-stage parallelism is compatible with the current execution model.
 ///
-/// Currently, all runtime paths (`spawn_multi`, `spawn_cluster`) create a single group
-/// of N workers that all run the complete dataflow. Per-stage parallelism (where stage A
-/// has M workers and stage B has N workers, M≠N) requires per-stage executors which are
-/// not yet implemented.
+/// Validates that all stages in a dataflow have parallelism matching `num_workers`.
 ///
-/// This validation ensures that every stage with explicit parallelism has a value equal
-/// to `num_workers`. Stages without explicit parallelism (None) inherit num_workers
-/// implicitly and are always valid.
+/// This validation is used by [`spawn_multi`](RuntimeHandle::spawn_multi) and
+/// [`spawn_cluster`](RuntimeHandle::spawn_cluster) which create a uniform group
+/// of N workers that all run the complete dataflow.
 ///
-/// When per-stage executors are implemented, this validation will be relaxed to allow
-/// heterogeneous parallelism across stages.
+/// For heterogeneous parallelism (stage A has M workers, stage B has N workers),
+/// use [`spawn_staged`](RuntimeHandle::spawn_staged) instead, which handles
+/// asymmetric exchange channel wiring automatically.
+///
+/// This validation ensures that every stage with explicit parallelism has a value
+/// equal to `num_workers`. Stages without explicit parallelism (None) inherit
+/// num_workers implicitly and are always valid.
 fn validate_stage_parallelism<T: Timestamp>(
     dataflow: &LogicalDataflow<T>,
     num_workers: usize,
@@ -3852,9 +4196,9 @@ fn validate_stage_parallelism<T: Timestamp>(
             if parallelism != num_workers {
                 return Err(Error::Custom(format!(
                     "stage {} has explicit parallelism {} but the runtime is spawning \
-                     {} workers. Per-stage executors (heterogeneous worker counts) are \
-                     not yet implemented — all explicit stage parallelism values must \
-                     equal the spawned worker count.",
+                     {} workers. Use `spawn_staged()` for heterogeneous per-stage \
+                     parallelism, or set all explicit parallelism values equal to \
+                     the spawned worker count.",
                     stage.id.0, parallelism, num_workers
                 )));
             }

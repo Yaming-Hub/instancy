@@ -334,6 +334,11 @@ impl<T: Timestamp, D: Clone + Send + 'static> Push<T, D> for ExchangePush<T, D> 
             return Err(Error::ChannelClosed);
         }
 
+        // No-op when there are no targets (idle worker in staged execution).
+        if self.num_targets == 0 {
+            return Ok(());
+        }
+
         match envelope.payload {
             Payload::Data { time, data } => {
                 // Partition records by target worker.
@@ -539,6 +544,11 @@ impl<T: Timestamp, D: Clone + Send + 'static> Push<T, D> for BroadcastPush<T, D>
     fn push(&mut self, envelope: Envelope<T, D, ()>) -> Result<()> {
         if self.closed {
             return Err(Error::ChannelClosed);
+        }
+
+        // No-op when there are no targets (idle worker in staged execution).
+        if self.num_targets == 0 {
+            return Ok(());
         }
 
         match envelope.payload {
@@ -854,6 +864,11 @@ impl<T: Timestamp, D> ExchangePull<T, D> {
 
 impl<T: Timestamp, D: Send + 'static> Pull<T, D> for ExchangePull<T, D> {
     fn pull(&mut self) -> Option<Envelope<T, D, ()>> {
+        // No sources means this is an idle worker in staged execution.
+        if self.num_sources == 0 {
+            return None;
+        }
+
         // First, emit any buffered aggregated watermarks.
         if let Some(t) = self.pending_watermarks.pop_front() {
             return Some(Envelope::watermark(t));
@@ -1200,43 +1215,51 @@ where
         );
     }
 
-    // For symmetric mode (M==N), each worker gets both push and pull.
     // The wake registry is sized for the maximum of source/target counts
     // to support both source and target workers' wake handles.
     let wake_count = std::cmp::max(num_source_workers, num_target_workers);
     let wakes = Arc::new(SharedWakeRegistry::new(wake_count));
+    let total_factories = std::cmp::max(num_source_workers, num_target_workers);
 
-    // In symmetric mode, produce one factory per worker. Each factory
-    // materializes both push (source) and pull (target) endpoints.
-    // In asymmetric mode, produce max(M, N) factories; source-only
-    // workers get dummy pull, target-only workers get dummy push.
-    // For now, only symmetric mode is used by the runtime.
-    assert_eq!(
-        num_source_workers, num_target_workers,
-        "Asymmetric per-stage executors not yet implemented; M ({}) must equal N ({})",
-        num_source_workers, num_target_workers
-    );
-
-    (0..num_source_workers)
-        .map(|_| {
+    (0..total_factories)
+        .map(|worker_slot| {
             let wakes = wakes.clone();
             let materializer = materializer.clone();
             let exchange_fn = exchange_fn.clone();
+            let m = num_source_workers;
+            let n = num_target_workers;
             super::super::schedulable::channel_factory(
                 move |ctx: &crate::worker::WorkerContext, wake: Option<WakeHandle>| {
-                    wakes.register(ctx.worker_index(), wake);
+                    let slot = worker_slot;
+                    wakes.register(slot, wake);
 
-                    let (pushers, pullers) = materializer
+                    let mut mat = materializer
                         .lock()
-                        .unwrap_or_else(|e| e.into_inner())
-                        .materialize_worker(ctx.worker_index())
-                        .unwrap_or_else(|e| {
-                            panic!(
-                                "edge materialization failed for worker {}: {e}",
-                                ctx.worker_index()
-                            )
-                        });
+                        .unwrap_or_else(|e| e.into_inner());
 
+                    let pushers: Vec<Box<dyn crate::dataflow::channels::Push<T, D, ()>>> =
+                        if slot < m {
+                            mat.materialize_source_worker(slot)
+                                .unwrap_or_else(|e| {
+                                    panic!("source materialization failed for slot {slot}: {e}")
+                                })
+                        } else {
+                            Vec::new()
+                        };
+
+                    let pullers: Vec<Box<dyn crate::dataflow::channels::Pull<T, D, ()>>> =
+                        if slot < n {
+                            mat.materialize_target_worker(slot)
+                                .unwrap_or_else(|e| {
+                                    panic!("target materialization failed for slot {slot}: {e}")
+                                })
+                        } else {
+                            Vec::new()
+                        };
+
+                    drop(mat);
+
+                    let _ = ctx;
                     let push = ExchangePush::new(pushers, exchange_fn.clone(), wakes.clone());
                     let pull = ExchangePull::new(pullers, wakes.clone());
 
@@ -1294,34 +1317,48 @@ where
         assert_eq!(mat.num_target_workers(), num_target_workers);
     }
 
-    assert_eq!(
-        num_source_workers, num_target_workers,
-        "Asymmetric per-stage executors not yet implemented; M ({}) must equal N ({})",
-        num_source_workers, num_target_workers
-    );
-
     let wake_count = std::cmp::max(num_source_workers, num_target_workers);
     let wakes = Arc::new(SharedWakeRegistry::new(wake_count));
+    let total_factories = std::cmp::max(num_source_workers, num_target_workers);
 
-    (0..num_source_workers)
-        .map(|_| {
+    (0..total_factories)
+        .map(|worker_slot| {
             let wakes = wakes.clone();
             let materializer = materializer.clone();
+            let m = num_source_workers;
+            let n = num_target_workers;
             super::super::schedulable::channel_factory(
                 move |ctx: &crate::worker::WorkerContext, wake: Option<WakeHandle>| {
-                    wakes.register(ctx.worker_index(), wake);
+                    let slot = worker_slot;
+                    wakes.register(slot, wake);
 
-                    let (pushers, pullers) = materializer
+                    let mut mat = materializer
                         .lock()
-                        .unwrap_or_else(|e| e.into_inner())
-                        .materialize_worker(ctx.worker_index())
-                        .unwrap_or_else(|e| {
-                            panic!(
-                                "edge materialization failed for worker {}: {e}",
-                                ctx.worker_index()
-                            )
-                        });
+                        .unwrap_or_else(|e| e.into_inner());
 
+                    let pushers: Vec<Box<dyn crate::dataflow::channels::Push<T, D, ()>>> =
+                        if slot < m {
+                            mat.materialize_source_worker(slot)
+                                .unwrap_or_else(|e| {
+                                    panic!("source materialization failed for slot {slot}: {e}")
+                                })
+                        } else {
+                            Vec::new()
+                        };
+
+                    let pullers: Vec<Box<dyn crate::dataflow::channels::Pull<T, D, ()>>> =
+                        if slot < n {
+                            mat.materialize_target_worker(slot)
+                                .unwrap_or_else(|e| {
+                                    panic!("target materialization failed for slot {slot}: {e}")
+                                })
+                        } else {
+                            Vec::new()
+                        };
+
+                    drop(mat);
+
+                    let _ = ctx;
                     let push = BroadcastPush::new(pushers, wakes.clone());
                     let pull = ExchangePull::new(pullers, wakes.clone());
 
