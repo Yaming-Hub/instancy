@@ -158,23 +158,41 @@ Every data element is associated with a **timestamp** that represents its logica
 
 instancy provides a focused set of core operators:
 
-| Operator | Description |
-|---|---|
-| `source` | Emit data from a static collection |
-| `input` | Channel-based external input |
-| `map` | Transform each element |
-| `flat_map` | Transform each element into zero or more |
-| `filter` | Keep elements matching a predicate |
-| `unary` | General-purpose stateful operator (one input) |
-| `binary` | General-purpose stateful operator (two inputs) |
-| `unary_notify` | Unary with frontier-based notifications |
-| `exchange` / `exchange_by_hash` | Repartition data across workers by key |
-| `concat` | Merge two streams |
-| `branch` | Split a stream by predicate |
-| `iterate` | Feedback loop with nested scope |
-| `inspect` | Side-effect observation without modifying data |
-| `probe` | Track frontier progress |
-| `output` | Collect results |
+| Category | Operator | Description |
+|---|---|---|
+| **Sources** | `source` | Emit data from a static collection |
+| | `source_async` | Async producer with backpressure |
+| | `input` | Channel-based external input |
+| **Transform** | `map` | Transform each element |
+| | `flat_map` | Transform each element into zero or more |
+| | `filter` | Keep elements matching a predicate |
+| | `map_batch` | Transform an entire batch at once |
+| | `take` / `take_while` | Limit element count or stop at condition |
+| **Aggregation** | `reduce` | Combine all elements per timestamp |
+| | `fold` | Aggregate with initial value and output type |
+| | `distinct` | Deduplicate per timestamp |
+| | `count` | Count elements per timestamp |
+| **Delay** | `delay` | Per-item timestamp reassignment |
+| | `delay_batch` | Per-timestamp reassignment |
+| **Distribution** | `exchange` / `exchange_by_hash` | Repartition data across workers by key |
+| | `gather` | All data → worker 0 |
+| | `rebalance` / `rebalance_to` | Round-robin across workers |
+| | `broadcast` | Clone all data to every worker |
+| **Branching** | `branch` | Split a stream by predicate |
+| | `branch_result` | Split `Result` into Ok/Err branches |
+| | `clone` | Fan-out to independent downstream branches |
+| **Merge** | `merge` | Merge two streams |
+| | `concat` | Merge multiple streams |
+| **Observation** | `inspect` / `inspect_batch` | Observe data without modifying |
+| | `for_each` / `for_each_batch` | Terminal side-effect operators |
+| | `probe` | Track frontier progress |
+| **Loop** | `iterate` | Feedback loop with nested scope |
+| **Result** | `map_ok` / `filter_ok` | Transform/filter Ok values in Result streams |
+| **Custom** | `unary` | General-purpose stateful operator (one input) |
+| | `unary_notify` | Unary with frontier-based notifications |
+| | `unary_async` | Async custom operator |
+| | `binary` | General-purpose stateful operator (two inputs) |
+| **Output** | `output` | Collect results |
 
 Higher-level operators (joins, windowing, etc.) can be composed from these primitives in extension crates.
 
@@ -294,6 +312,8 @@ cargo run -p instancy --example <name>
 | `branching_pipeline` | Fan-out: one stream feeding independent pipelines |
 | `merge_streams` | Binary and concat operators for merging streams |
 | `probe` | Using `ProbeHandle` to observe frontier progress |
+| `delay` | Delay operators: windowing, priority routing, time shifting |
+| `broadcast` | Multi-worker broadcast replication |
 | `cancellation` | Cooperative cancellation with `CancellationToken` |
 | `error_handling` | Result combinators: map_ok, filter_ok, branch_result |
 | `panic_recovery` | Operator panic recovery with catch_panics |
@@ -332,6 +352,8 @@ cargo run -p instancy --example <name>
 |---|---|
 | `cluster_basic` | Two-node cluster with in-memory transport (no exchange) |
 | `cluster_exchange` | Two-node cluster with cross-node data repartitioning |
+| `cluster_shared_transport` | Multi-dataflow shared connections with connection pooling |
+| `stage_parallelism` | Stage-level parallelism configuration |
 
 ## Testing
 
@@ -352,11 +374,22 @@ cargo test --all-features --test cluster_tcp
 |---|---|
 | `tests/cluster.rs` | Multi-node cluster tests with in-memory transport |
 | `tests/cluster_tcp.rs` | TCP-based cluster integration tests |
+| `tests/cluster_shared_transport.rs` | Shared transport connection tests |
 | `tests/parallel_dataflows.rs` | Shared worker pool correctness |
 | `tests/parallel_cluster_tcp.rs` | Parallel TCP dataflows on shared connections |
 | `tests/multi_dataflow.rs` | Multiple dataflows on one runtime |
+| `tests/multi_worker_aggregation.rs` | Multi-worker reduce/fold/distinct/count |
+| `tests/multi_worker_broadcast.rs` | Multi-worker broadcast operator |
+| `tests/multi_worker_branch_distribution.rs` | Branch and distribution operators |
+| `tests/multi_worker_iterate.rs` | Multi-worker iteration loops |
+| `tests/delay_operator.rs` | Delay and delay_batch operators |
+| `tests/feedback_loops.rs` | Feedback loop correctness |
+| `tests/progress_tracking.rs` | Frontier and progress tracking |
+| `tests/edge_cases.rs` | Edge cases and boundary conditions |
 | `tests/inter_process.rs` | Cross-process communication |
 | `tests/observability.rs` | Metrics and tracing |
+| `tests/scheduler_policies.rs` | Task scheduler policy tests |
+| `tests/timeout.rs` | Timeout and cancellation tests |
 
 ## Project Structure
 
@@ -377,7 +410,7 @@ instancy/
 │   │   ├── control_protocol.rs   # Fingerprint exchange + ready barrier
 │   │   └── codec.rs              # Codec trait + built-in implementations
 │   └── order.rs                  # Timestamp types (Product for nested scopes)
-├── examples/                     # 26 runnable examples
+├── examples/                     # 33 runnable examples
 ├── tests/                        # Integration tests
 └── Cargo.toml
 ```
