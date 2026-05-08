@@ -319,6 +319,29 @@ impl DataflowGraph {
         self.operators.values_mut()
     }
 
+    /// Retain only the operators whose index is in `keep`.
+    pub fn retain_operators(&mut self, keep: &std::collections::HashSet<usize>) {
+        self.operators.retain(|idx, _| keep.contains(idx));
+    }
+
+    /// Retain only the edges whose index is in `keep`.
+    pub fn retain_edges(&mut self, keep: &std::collections::HashSet<usize>) {
+        let mut idx = 0;
+        self.edges.retain(|_| {
+            let kept = keep.contains(&idx);
+            idx += 1;
+            kept
+        });
+    }
+
+    /// Retain only feedback edges whose both endpoints are in `keep_ops`.
+    pub fn retain_feedback_edges(&mut self, keep_ops: &std::collections::HashSet<usize>) {
+        self.feedback_edges.retain(|e| {
+            keep_ops.contains(&e.source.operator_index)
+                && keep_ops.contains(&e.target.operator_index)
+        });
+    }
+
     /// Edges originating from the given operator index.
     pub fn edges_from(&self, operator_index: usize) -> Vec<&EdgeInfo> {
         self.edges
