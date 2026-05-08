@@ -215,21 +215,20 @@ pub struct SpawnOptions {
     pub drain_timeout: Option<std::time::Duration>,
     /// Enable per-stage parallelism for multi-worker dataflows.
     ///
-    /// When `true`, [`spawn_multi`](RuntimeHandle::spawn_multi) respects the
-    /// parallelism specified via [`exchange_to`](crate::dataflow::Pipe::exchange_to),
+    /// When `true` (the default), [`spawn_multi`](RuntimeHandle::spawn_multi)
+    /// respects the parallelism specified via
+    /// [`exchange_to`](crate::dataflow::Pipe::exchange_to),
     /// [`gather`](crate::dataflow::Pipe::gather), or
     /// [`rebalance_to`](crate::dataflow::Pipe::rebalance_to). Stages with
     /// explicit parallelism get that many active workers; stages without
     /// explicit parallelism use `num_workers` as the default.
     ///
     /// Exchange edges between stages with different parallelism are wired as
-    /// asymmetric M×N channels automatically.
+    /// asymmetric M×N channels automatically. Workers only materialize
+    /// operators for stages they participate in (no idle operators).
     ///
-    /// When `false` (current default), all stages must have the same
-    /// parallelism as `num_workers` (the legacy uniform behavior).
-    ///
-    /// **Note:** Per-stage parallelism will become the default in a future
-    /// release once it has been battle-tested.
+    /// When `false`, all stages must have the same parallelism as
+    /// `num_workers` (legacy uniform behavior).
     ///
     /// # Example
     ///
@@ -263,16 +262,6 @@ pub struct SpawnOptions {
     /// parallelism inherit stage 0's auto-detected count.
     ///
     /// This implicitly enables per-stage parallelism.
-    ///
-    /// # Known Limitations (v1 interim)
-    ///
-    /// The current implementation builds max(P_i) full copies of the graph.
-    /// Workers outside a stage get idle operators. This means:
-    /// - `source_async()` closures are materialized on non-stage-0 workers
-    /// - `take_input()` on non-stage-0 workers silently drops data
-    ///
-    /// Phase 8 (per-stage materialization) will fix these by only
-    /// materializing operators for each worker's participating stages.
     ///
     /// # Example
     ///
@@ -388,12 +377,12 @@ impl SpawnOptions {
         self
     }
 
-    /// Enable per-stage parallelism.
+    /// Enable or disable per-stage parallelism.
     ///
-    /// When enabled, stages with explicit parallelism (via `exchange_to`,
-    /// `gather`, `rebalance_to`) get their specified worker count. The
-    /// `num_workers` parameter to `spawn_multi` becomes the default for
-    /// stages without explicit parallelism.
+    /// Per-stage parallelism is enabled by default. When enabled, stages with
+    /// explicit parallelism (via `exchange_to`, `gather`, `rebalance_to`) get
+    /// their specified worker count. Pass `false` to force legacy uniform
+    /// parallelism where all stages use `num_workers`.
     ///
     /// # Example
     ///
@@ -434,7 +423,7 @@ impl Default for SpawnOptions {
             priority: 0,
             cancellation_token: None,
             drain_timeout: None,
-            per_stage_parallelism: false,
+            per_stage_parallelism: true,
             auto_parallelism: false,
         }
     }
@@ -999,42 +988,49 @@ impl RuntimeHandle {
 
     /// Spawn N replicated workers from the same dataflow builder closure.
     ///
-    /// The `build` closure is called `num_workers` times, each with a fresh
-    /// [`DataflowBuilder`] and the worker index (0..num_workers). Each call
-    /// must construct an identical graph topology — the runtime validates that
-    /// all replicas have matching operator/edge/port structure.
+    /// The `build` closure is called once per worker with a fresh
+    /// [`DataflowBuilder`] and the worker index. Each call must construct an
+    /// identical graph topology — the runtime validates that all replicas have
+    /// matching operator/edge/port structure.
+    ///
+    /// **Note:** With per-stage parallelism (the default), the closure may be
+    /// called an additional time internally to probe the stage structure. The
+    /// closure should be free of one-time side effects.
     ///
     /// Returns a [`MultiSpawnedDataflow`] with per-worker input senders and
     /// output receivers, shared cancellation, and aggregated completion.
     ///
-    /// # Uniform replication
+    /// # Per-stage parallelism (default)
     ///
-    /// `num_workers` creates N **complete replicas** of the entire dataflow
-    /// graph. Every stage in the dataflow gets the same number of workers —
-    /// there is no per-stage parallelism control. Each worker is an
-    /// independent executor; the `num_workers` parameter controls **logical**
-    /// parallelism, while the runtime's `worker_threads` configuration
-    /// controls **physical** parallelism. For example, 4 logical workers on a
-    /// pool with 1 thread will run cooperatively and sequentially.
+    /// By default ([`SpawnOptions::per_stage_parallelism`] is `true`),
+    /// stages with explicit parallelism (via `exchange_to`, `gather`,
+    /// `rebalance_to`) get their specified worker count, while stages without
+    /// explicit parallelism use `num_workers`. Workers only materialize
+    /// operators for stages they participate in — there are no idle operators.
     ///
-    /// Per-stage worker counts (e.g., 4 workers in stage 0 funneling into
-    /// 2 workers in stage 1) require exchange channels to redistribute data
-    /// at stage boundaries. This will be supported once exchange operators
-    /// are implemented.
+    /// With [`SpawnOptions::per_stage_parallelism(false)`](SpawnOptions::per_stage_parallelism),
+    /// the legacy uniform behavior is used: all stages must have the same
+    /// parallelism as `num_workers`, and exchange operators are rejected.
+    ///
+    /// `num_workers` controls **logical** parallelism — the number of
+    /// independent executor instances per stage. The runtime's `worker_threads`
+    /// configuration controls **physical** parallelism. For example, 4
+    /// logical workers on a pool with 1 thread will run cooperatively and
+    /// sequentially.
     ///
     /// # Execution model
     ///
     /// Each worker runs as an independent [`DataflowExecutor`] on the shared
-    /// pool. There is **no cross-worker data routing** — all channels are
-    /// worker-local. Dataflows containing exchange/rebalance/gather/broadcast
-    /// operators are rejected with an error (fail-closed).
+    /// pool. With per-stage parallelism enabled, cross-worker data routing
+    /// is handled by exchange channels at stage boundaries.
     ///
     /// # Errors
     ///
     /// - `num_workers` is 0
     /// - `build` closure returns an error
     /// - Replicas have mismatched graph topologies
-    /// - Dataflow contains exchange operators (not yet supported)
+    /// - With `per_stage_parallelism(false)`: dataflow contains exchange
+    ///   operators with parallelism != `num_workers`
     ///
     /// # Example: partitioned input with multiple workers
     ///
@@ -1166,15 +1162,6 @@ impl RuntimeHandle {
                     options.drain_timeout,
                 )
             } else {
-                // TODO(Phase 8): The v1 architecture rebuilds the full graph
-                // for every worker slot (max(P_i) copies). This means:
-                // 1. source_async() producers are duplicated on every worker,
-                //    not just stage-0 workers.
-                // 2. input() ports are wired on every worker — take_input()
-                //    on workers outside stage 0 accepts data but silently
-                //    drops it at the exchange.
-                // Phase 8 (per-stage materialization) eliminates both issues
-                // by only materializing operators for participating stages.
                 self.spawn_staged_internal(
                     name,
                     default_parallelism,
@@ -3517,15 +3504,15 @@ impl<T: Timestamp> Drop for SpawnedDataflow<T> {
 /// input senders, and output receivers. There is no cross-worker data routing —
 /// all channels are worker-local.
 ///
-/// ## Uniform replication
+/// ## Per-stage parallelism
 ///
-/// All stages in the dataflow have the same number of workers (`num_workers`).
-/// Per-stage parallelism (e.g., more workers in a data-ingestion stage,
-/// fewer in a reduction stage) is not yet supported and requires exchange
-/// channels at stage boundaries. Note that "stage" is instancy's scoping
-/// concept for progress tracking — it is more general than Spark's linear
-/// "stage" model because stages can be nested (e.g., loop bodies are inner
-/// stages).
+/// By default, stages with explicit parallelism (via `exchange_to`, `gather`,
+/// `rebalance_to`) get their specified worker count, while stages without
+/// explicit parallelism use `num_workers`. Workers only materialize operators
+/// for stages they participate in. With
+/// [`SpawnOptions::per_stage_parallelism(false)`](SpawnOptions::per_stage_parallelism),
+/// the legacy uniform behavior is restored: all stages must have the same
+/// parallelism as `num_workers`.
 ///
 /// ## Logical vs physical parallelism
 ///
@@ -6725,7 +6712,7 @@ mod tests {
     #[test]
     fn validate_stage_parallelism_matching_passes() {
         // Build a dataflow with exchange_by_hash_to(par=2) and spawn with 2 workers.
-        // Should succeed because parallelism matches num_workers.
+        // Should succeed because parallelism matches num_workers (legacy uniform path).
         let rt = RuntimeHandle::new(RuntimeConfig {
             worker_threads: 2,
             schedule_policy: None,
@@ -6739,7 +6726,7 @@ mod tests {
                 .map("noop", |_t, x| x)
                 .output("out");
             Ok(())
-        }, SpawnOptions::default());
+        }, SpawnOptions::new().per_stage_parallelism(false));
         // Should succeed — parallelism matches worker count.
         match &result {
             Ok(_) => {}
@@ -6751,7 +6738,8 @@ mod tests {
     #[test]
     fn validate_stage_parallelism_mismatch_fails() {
         // Build a dataflow with exchange_by_hash_to(par=4) but spawn with 2 workers.
-        // Should fail because parallelism (4) != num_workers (2).
+        // Should fail because parallelism (4) != num_workers (2) when
+        // per_stage_parallelism is disabled (legacy uniform behavior).
         let rt = RuntimeHandle::new(RuntimeConfig {
             worker_threads: 2,
             schedule_policy: None,
@@ -6765,7 +6753,7 @@ mod tests {
                 .map("noop", |_t, x| x)
                 .output("out");
             Ok(())
-        }, SpawnOptions::default());
+        }, SpawnOptions::new().per_stage_parallelism(false));
         // Should fail — parallelism (4) != num_workers (2).
         match result {
             Err(e) => {
@@ -6782,7 +6770,8 @@ mod tests {
 
     #[test]
     fn validate_stage_parallelism_single_worker_mismatch_fails() {
-        // Even with 1 worker, explicit parallelism > 1 should be rejected.
+        // Even with 1 worker, explicit parallelism > 1 should be rejected
+        // when per_stage_parallelism is disabled (legacy uniform behavior).
         let rt = RuntimeHandle::new(RuntimeConfig {
             worker_threads: 1,
             schedule_policy: None,
@@ -6796,7 +6785,7 @@ mod tests {
                 .map("noop", |_t, x| x)
                 .output("out");
             Ok(())
-        }, SpawnOptions::default());
+        }, SpawnOptions::new().per_stage_parallelism(false));
         match result {
             Err(e) => {
                 let err_msg = format!("{e}");

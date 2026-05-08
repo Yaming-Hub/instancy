@@ -135,9 +135,10 @@ fn main() {
     println!();
 
     // ─────────────────────────────────────────────────────────────────────
-    // Example 2: Parallelism mismatch — caught at spawn time
+    // Example 2: Parallelism mismatch — caught when per_stage_parallelism
+    //            is disabled (legacy uniform behavior)
     // ─────────────────────────────────────────────────────────────────────
-    println!("── Example 2: Parallelism mismatch detection (par=4, workers=2) ──\n");
+    println!("── Example 2: Parallelism mismatch detection (par=4, workers=2, legacy mode) ──\n");
 
     let result = rt.spawn_multi(
         "stage-par-mismatch",
@@ -152,7 +153,7 @@ fn main() {
                 .output("out");
             Ok(())
         },
-        SpawnOptions::default(),
+        SpawnOptions::new().per_stage_parallelism(false),
     );
 
     match result {

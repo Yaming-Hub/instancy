@@ -1090,9 +1090,9 @@ Like `rebalance`, but with explicit target parallelism:
 stream.rebalance_to("spread", 4).output("results");
 ```
 
-> **Current limitation:** `rebalance_to(N)` requires `N` to equal the spawned
-> worker count. Per-stage parallelism (different `N` per stage) is not yet
-> implemented.
+> **Note:** With [`SpawnOptions::per_stage_parallelism`] enabled (the default),
+> `rebalance_to(N)` can use a different `N` per stage. With
+> `per_stage_parallelism(false)`, `N` must equal the spawned worker count.
 
 #### Broadcast
 
