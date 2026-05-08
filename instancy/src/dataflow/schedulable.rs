@@ -303,11 +303,13 @@ pub struct EdgeTypeInfo {
 ///   When provided, channels notify the handle on push, close, drop, and
 ///   when pulling frees capacity (backpressure relief).
 ///
-/// Returns `(Box<dyn Any + Send>, Box<dyn Any + Send>)` where the first
+/// Returns `Result<(Box<dyn Any + Send>, Box<dyn Any + Send>)>` where the first
 /// element is a `Box<dyn Push<T, D, M>>` and the second is a `Box<dyn Pull<T, D, M>>`.
 ///
-/// Channel factories are inherently replayable — they create fresh channel
-/// pairs from captured configuration without consuming state.
+/// Pipeline channel factories are stateless and can be called multiple times.
+/// Exchange channel factories consume shared materializer state and must only
+/// be called once per worker slot — a failed `build()` may leave the factory
+/// in a partially consumed state that cannot be retried.
 pub trait ChannelBlueprint: Send {
     /// Create a channel pair for the given worker and wake handle.
     ///
@@ -315,25 +317,30 @@ pub trait ChannelBlueprint: Send {
     /// an independent bounded channel). For exchange channels, the context
     /// determines which worker's Push/Pull pair to return from the shared
     /// cross-worker channel set.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if channel materialization fails (e.g., network
+    /// connection unavailable, materializer state already consumed).
     fn build(
         &mut self,
         ctx: &WorkerContext,
         wake_handle: Option<crate::dataflow::channels::wake::WakeHandle>,
-    ) -> (Box<dyn std::any::Any + Send>, Box<dyn std::any::Any + Send>);
+    ) -> crate::Result<(Box<dyn std::any::Any + Send>, Box<dyn std::any::Any + Send>)>;
 }
 
 /// Type alias for a boxed channel blueprint.
 pub type ChannelFactory = Box<dyn ChannelBlueprint>;
 
+/// Type alias for the channel pair returned by [`ChannelBlueprint::build`].
+pub type ChannelPair = (Box<dyn std::any::Any + Send>, Box<dyn std::any::Any + Send>);
+
 /// Create a [`ChannelFactory`] from a closure.
-///
-/// Channel factories are inherently replayable (they only capture
-/// configuration chosen when the blueprint is constructed).
 pub fn channel_factory(
     f: impl FnMut(
         &WorkerContext,
         Option<crate::dataflow::channels::wake::WakeHandle>,
-    ) -> (Box<dyn std::any::Any + Send>, Box<dyn std::any::Any + Send>)
+    ) -> crate::Result<ChannelPair>
     + Send
     + 'static,
 ) -> ChannelFactory {
@@ -346,7 +353,7 @@ pub struct ChannelBlueprintFn(
         dyn FnMut(
                 &WorkerContext,
                 Option<crate::dataflow::channels::wake::WakeHandle>,
-            ) -> (Box<dyn std::any::Any + Send>, Box<dyn std::any::Any + Send>)
+            ) -> crate::Result<ChannelPair>
             + Send,
     >,
 );
@@ -357,7 +364,7 @@ impl ChannelBlueprintFn {
         factory: impl FnMut(
             &WorkerContext,
             Option<crate::dataflow::channels::wake::WakeHandle>,
-        ) -> (Box<dyn std::any::Any + Send>, Box<dyn std::any::Any + Send>)
+        ) -> crate::Result<ChannelPair>
         + Send
         + 'static,
     ) -> Self {
@@ -375,7 +382,7 @@ impl ChannelBlueprint for ChannelBlueprintFn {
         &mut self,
         ctx: &WorkerContext,
         wake_handle: Option<crate::dataflow::channels::wake::WakeHandle>,
-    ) -> (Box<dyn std::any::Any + Send>, Box<dyn std::any::Any + Send>) {
+    ) -> crate::Result<ChannelPair> {
         (self.0)(ctx, wake_handle)
     }
 }
