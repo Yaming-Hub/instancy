@@ -344,35 +344,179 @@ stream
   to future work — requires splitting dataflow into sub-dataflows and spawning
   separate worker groups per stage
 
-## Current Status
+## Current Status (v1 — spawn_multi + SpawnOptions)
 
-**All infrastructure for per-stage parallelism is in place:**
-- Stage inference detects boundaries automatically
-- Parallelism parameters stored per stage
-- FusedStageTask groups operators by stage in the executor
-- M×N exchange channels support asymmetric source/target counts
-- Progress tracking works correctly across stage boundaries
+**Phase 1 implementation (PRs #190-#194):**
+- `SpawnOptions::per_stage_parallelism(true)` enables heterogeneous parallelism
+- `spawn_staged_internal` builds max(P_i) workers, wires M×N exchange channels
+- Workers beyond a stage's parallelism get NullOperator placeholders
+- Edge stage IDs properly propagated after `infer_stages()`
+- All tests pass, functional but architecturally impure
 
-**What works today:**
-- Dataflows with multiple stages and same parallelism (N workers, N×N exchange)
-- FusedStageTask scheduling (operators within a stage activate in topological order)
-- Parallelism parameter validation (mismatches caught at spawn time)
+**Problems with v1 approach:**
+1. **Build closure takes `worker_idx`** — but the graph is the same for all workers.
+   The dataflow is a logical description; worker identity is a physical concern.
+2. **Idle operators** — workers beyond a stage's parallelism get NullOperator
+   placeholders. Wasteful: still builds full operator closures, allocates factories,
+   seeds SubgraphBuilder capabilities (which are leaked by NullOperator).
+3. **No-op exchange endpoints** — workers outside a stage get empty push/pull
+   endpoints that are never used. Complicates progress tracking.
+4. **Stage 0 parallelism is hardcoded** to `default_parallelism` parameter.
+   Should be derived from the number of physical input streams.
+5. **All workers participate in progress exchange** — even non-participating
+   workers send/receive progress messages. Unnecessary overhead.
 
-**Future work (per-stage executors):**
-- `spawn_staged()` runtime path that creates M workers for stage 0, N for stage 1
-- Separate executor per stage-worker-group
-- M×N exchange channels wired between stage groups
-- Cross-stage progress tracking via exchange channel's FrontierAggregator (already works)
+## Redesign: Build-Once, Materialize-Per-Stage (v2)
+
+### Core Principle
+
+The dataflow graph is a **logical** description — it should be built **once**, not
+per-worker. The runtime determines how to materialize it onto workers based on
+stage parallelism. Workers only contain operators for stages they participate in.
+
+### API Change
+
+```rust
+// v1 (current): worker_idx in build closure, manual parallelism
+rt.spawn_multi("name", num_workers, |worker_idx, builder| {
+    // worker_idx is a physical concern leaked into logical graph construction
+    let input = builder.input::<i32>("data");
+    input.exchange_to("scatter", 4, |v| *v as u64)
+        .map("process", |_t, x| x * 2)
+        .gather("collect")
+        .for_each("sink", |_t, _v| {});
+    Ok(())
+}, SpawnOptions::new().per_stage_parallelism(true))
+
+// v2 (new): no worker_idx, parallelism derived from graph structure
+rt.spawn_dataflow("name", |builder| {
+    let input = builder.input::<i32>("data");
+    input.exchange_to("scatter", 4, |v| *v as u64)
+        .map("process", |_t, x| x * 2)
+        .gather("collect")
+        .for_each("sink", |_t, _v| {});
+    Ok(())
+}, SpawnOptions::new())
+```
+
+Operators that need worker identity access it via `WorkerContext` at activation
+time — a runtime concern, not a build-time concern.
+
+### Stage 0 Parallelism from Physical Inputs
+
+Stage 0 parallelism is determined automatically:
+- **Number of `input()` / `source_async()` calls in stage 0** = stage 0 parallelism
+- Each physical input stream gets its own worker
+- If 1 input → 1 worker; if 4 inputs → 4 workers
+- Rationale: input streams are the physical constraint — having more workers
+  than inputs means some workers have nothing to read
+
+```
+// 1 input → stage 0 par=1
+builder.input::<i32>("data")
+    .exchange_to("scatter", 4, hash_fn)  // stage 0→1 boundary
+    .map("process", ...)                  // stage 1 par=4
+
+// 3 inputs → stage 0 par=3
+let a = builder.input::<i32>("stream_a");
+let b = builder.input::<i32>("stream_b");
+let c = builder.input::<i32>("stream_c");
+a.binary(b, "merge_ab", ...).binary(c, "merge_all", ...)
+    .exchange_to("scatter", 8, hash_fn)  // stage 0→1, stage 1 par=8
+```
+
+For cluster mode, stage 0 parallelism per node = number of local input streams
+on that node.
+
+### Per-Stage Materialization
+
+Instead of building max(P_i) full copies and patching with NullOperator:
+
+1. **Build once** (probe) → LogicalDataflow with stages, parallelism, graph
+2. **Build P_i copies per stage** — call the build closure max(P_i) times,
+   but for each worker only retain the operator/channel factories for its
+   participating stages. Discard (not null) non-participating factories.
+3. **Per-stage SubgraphBuilder** — each worker's progress tracker only covers
+   its participating stages. No leaked capabilities.
+4. **Exchange channels** connect M source workers to N target workers directly.
+   No no-op endpoints — only participating workers have endpoints.
+5. **Per-stage progress exchange** — workers only exchange progress with peers
+   in the same stage. Cross-stage progress flows through exchange channels.
+
+```
+Worker allocation for stages [par=1, par=4, par=1]:
+
+   Worker 0: Stage 0 ops + Stage 2 ops
+   Worker 1: Stage 1 ops only
+   Worker 2: Stage 1 ops only
+   Worker 3: Stage 1 ops only
+
+   (Worker 0 also gets Stage 1 ops — it participates in all stages
+    because 0 < min(1, 4, 1))
+```
+
+### Progress Tracking Per Stage
+
+Each stage forms an independent progress-tracking group:
+
+- **Workers in the same stage** exchange progress among themselves
+- **Cross-stage frontiers** propagate through exchange channel's
+  `FrontierAggregator` (already implemented)
+- **No global progress exchange** across all max(P_i) workers —
+  only P_i workers per stage
+
+This eliminates the overhead of non-participating workers exchanging
+empty progress messages.
+
+### Backward Compatibility
+
+- `spawn_multi(name, N, |worker_idx, builder| ..., opts)` remains unchanged
+  for uniform parallelism (all stages same N). No per-stage materialization.
+- `spawn_dataflow(name, |builder| ..., opts)` is the new per-stage API.
+  When all stages have the same parallelism (no exchange_to/gather), it
+  degrades to the uniform path automatically.
+- `per_stage_parallelism` option is no longer needed on `spawn_dataflow` —
+  it's always stage-aware.
+
+## Implementation Plan (v2)
+
+### Phase 7: `spawn_dataflow` API + stage 0 auto-parallelism
+- New `spawn_dataflow` method: `Fn(&mut DataflowBuilder<T>) -> Result<()>`
+- No `worker_idx` parameter in build closure
+- Stage 0 parallelism = count of `input()` + `source_async()` operators in stage 0
+- Internally builds max(P_i) copies, discards non-participating factories
+- Uses current NullOperator approach as interim (replaced in Phase 8)
+- Integration tests for auto-parallelism
+
+### Phase 8: Per-stage executor materialization
+- `DataflowExecutor::materialize()` accepts a set of participating stage IDs
+- Skip operator/channel factory materialization for non-participating stages
+- SubgraphBuilder only registers operators for participating stages
+- Remove NullOperator, null_operator_factory, null_channel_factory, Phase 4b
+- Remove no-op exchange endpoint guards (num_sources==0 path)
+- Progress capabilities only seeded for participating operators
+
+### Phase 9: Per-stage progress exchange
+- Create separate progress channel groups per stage
+- Workers only exchange progress with same-stage peers
+- Cross-stage frontier propagation via exchange channel FrontierAggregator
+- Remove max(P_i)-wide progress broadcast
+
+### Phase 10: Make `spawn_dataflow` the default path
+- Deprecate `per_stage_parallelism` option on SpawnOptions
+- `spawn_multi` without worker_idx delegates to `spawn_dataflow` internally
+- Update all examples and documentation
 
 ## Open Questions
 
-1. **How does the initial worker count interact with per-stage parallelism?**
-   - The first stage's parallelism = total workers from topology (cluster) or `num_workers` (single-node)
-   - Subsequent stages get parallelism from repartition operators
-   - If no repartition operators: single stage, backward compatible
+1. **Loops/iteration**: All operators within `scope.iterative()` must be in the same stage (no repartition inside loops for v1).
 
-2. **Loops/iteration**: All operators within `scope.iterative()` must be in the same stage (no repartition inside loops for v1).
+2. **Binary operators**: Both inputs must come from the same stage, or both must be repartitioned to the same parallelism with compatible distribution.
 
-3. **Binary operators**: Both inputs must come from the same stage, or both must be repartitioned to the same parallelism with compatible distribution.
+3. **PlacementPolicy for subsequent stages**: Attach to the repartition operator as an optional parameter (e.g., `exchange(fn, 16).placement(Pinned("node-A"))`), or default to proportional distribution based on cluster topology.
 
-4. **PlacementPolicy for subsequent stages**: Attach to the repartition operator as an optional parameter (e.g., `exchange(fn, 16).placement(Pinned("node-A"))`), or default to proportional distribution based on cluster topology.
+4. **Worker assignment for multi-stage participation**: Worker 0 participates
+   in stage 0 (par=1) AND stage 1 (par=4). Its executor has operators from
+   both stages. How to schedule: single executor with all participating
+   operators (simpler) vs. separate executors per stage (more isolation)?
+   Decision: single executor with FusedStageTask per stage — already implemented.
