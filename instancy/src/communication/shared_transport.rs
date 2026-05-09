@@ -104,6 +104,68 @@ struct DataflowRegistration {
     error_tx: tokio_mpsc::Sender<TransportError>,
 }
 
+/// Combined registration + pending-control state, guarded by a **single** lock
+/// to prevent a TOCTOU race between `reader_task` and `register_dataflow`.
+///
+/// # Race condition (why a single lock is required)
+///
+/// When multiple dataflows share pooled connections, the remote peer may
+/// register a new dataflow and send its Handshake *before* the local peer
+/// has registered that dataflow. For example:
+///
+/// ```text
+/// Node-A (fast)                 TCP               Node-B (slow)
+/// ─────────────                 ───               ─────────────
+/// 1. df1 completes
+/// 2. register(df2)
+/// 3. send df2 Handshake ────────────────►  reader_task receives
+///                                          df2 Handshake
+///
+///                                          registrations[df2] → NOT FOUND
+///                                          → frame DROPPED silently ✗
+///
+///                                       4. register(df2)
+///                                       5. send df2 Handshake to node-A
+///                                       6. wait for df2 Handshake from node-A
+///                                          → never arrives → timeout ✗
+/// ```
+///
+/// The fix: `reader_task` buffers unregistered control frames in
+/// `pending_control`, and `register_dataflow` drains the buffer. Both
+/// operations happen under this single lock. If two separate locks were
+/// used (one for `registered`, one for `pending_control`), the following
+/// TOCTOU race would still be possible:
+///
+/// ```text
+/// reader_task                       register_dataflow
+/// ───────────                       ─────────────────
+/// lock(registrations)
+///   df2 not found
+/// unlock(registrations)
+///                                   lock(pending_control)
+///                                     drain → empty (nothing buffered yet)
+///                                   unlock(pending_control)
+///                                   lock(registrations)
+///                                     insert df2
+///                                   unlock(registrations)
+/// lock(pending_control)
+///   buffer Handshake frame        ← buffered AFTER drain already ran
+/// unlock(pending_control)           → frame is never delivered
+/// ```
+///
+/// With a single lock, both "check + buffer" and "drain + register" are
+/// atomic, eliminating this window entirely.
+struct RegistrationState {
+    /// Active dataflow registrations.
+    registered: HashMap<DataflowId, DataflowRegistration>,
+    /// Control frames buffered for dataflows that haven't been registered yet.
+    /// Drained into the control channel upon registration.
+    pending_control: HashMap<DataflowId, Vec<Vec<u8>>>,
+    /// Dataflows that have been unregistered (completed). Late control frames
+    /// for these IDs are dropped instead of being buffered indefinitely.
+    completed: HashSet<DataflowId>,
+}
+
 // ---------------------------------------------------------------------------
 // SharedPeerManager — owns pooled connections to one peer
 // ---------------------------------------------------------------------------
@@ -127,8 +189,12 @@ pub struct SharedPeerManager {
     pool: Arc<PeerPool>,
     /// Per-connection writers (connection_id → sender to writer task).
     writer_channels: Arc<TokioMutex<HashMap<usize, tokio_mpsc::Sender<Frame>>>>,
-    /// Per-dataflow registrations (dataflow_id → registration).
-    registrations: Arc<TokioMutex<HashMap<DataflowId, DataflowRegistration>>>,
+    /// Per-dataflow registrations and pending control frame buffer.
+    ///
+    /// A single lock protects both to avoid TOCTOU races: the reader_task
+    /// can atomically check if a dataflow is registered and, if not, buffer
+    /// the control frame — all under one lock acquisition.
+    reg_state: Arc<TokioMutex<RegistrationState>>,
     /// Reorder buffers keyed by (dataflow_id) — one per payload lane.
     reorder_buffers: Arc<TokioMutex<HashMap<DataflowId, ReorderBuffer<Frame>>>>,
     /// Scaling driver for RTT probing.
@@ -192,8 +258,12 @@ impl SharedPeerManager {
         // Failure notification channel: writer/reader tasks report dead connections
         let (failure_tx, failure_rx) = tokio_mpsc::channel::<usize>(64);
 
-        let registrations: Arc<TokioMutex<HashMap<DataflowId, DataflowRegistration>>> =
-            Arc::new(TokioMutex::new(HashMap::new()));
+        let reg_state: Arc<TokioMutex<RegistrationState>> =
+            Arc::new(TokioMutex::new(RegistrationState {
+                registered: HashMap::new(),
+                pending_control: HashMap::new(),
+                completed: HashSet::new(),
+            }));
         let reorder_buffers = Arc::new(TokioMutex::new(HashMap::new()));
 
         let mut task_handles = Vec::new();
@@ -227,7 +297,7 @@ impl SharedPeerManager {
             let reader_handle = runtime_handle.spawn(Self::reader_task(
                 conn_id,
                 reader,
-                registrations.clone(),
+                reg_state.clone(),
                 reorder_buffers.clone(),
                 scaling_driver.clone(),
                 pool.clone(),
@@ -241,7 +311,7 @@ impl SharedPeerManager {
         let bridge_handle = runtime_handle.spawn(Self::bridge_task(
             pool.clone(),
             writer_channels.clone(),
-            registrations.clone(),
+            reg_state.clone(),
             payload_rx,
             control_rx,
         ));
@@ -268,14 +338,14 @@ impl SharedPeerManager {
             pool.clone(),
             writer_channels.clone(),
             scaling_driver.clone(),
-            registrations.clone(),
+            reg_state.clone(),
         ));
         task_handles.push(monitor_handle);
 
         // Spawn periodic reorder buffer timeout sweeper
         let sweep_handle = runtime_handle.spawn(Self::timeout_sweeper(
             reorder_buffers.clone(),
-            registrations.clone(),
+            reg_state.clone(),
             config.reorder_timeout,
         ));
         task_handles.push(sweep_handle);
@@ -285,7 +355,7 @@ impl SharedPeerManager {
             config,
             pool,
             writer_channels,
-            registrations,
+            reg_state,
             reorder_buffers,
             scaling_driver,
             probe_counter,
@@ -301,6 +371,11 @@ impl SharedPeerManager {
     /// A control channel (ID 0) is **automatically registered** for each
     /// dataflow, matching `TransportSession` behavior. Returns per-channel
     /// receivers for incoming frames.
+    ///
+    /// Any control frames that arrived before registration (buffered in
+    /// `pending_control`) are drained into the control channel immediately.
+    /// Registration and pending-drain happen under a single lock to prevent
+    /// a TOCTOU race with the reader_task.
     pub async fn register_dataflow(
         &self,
         dataflow_id: DataflowId,
@@ -335,10 +410,39 @@ impl SharedPeerManager {
             error_tx,
         };
 
-        self.registrations
-            .lock()
-            .await
-            .insert(dataflow_id, reg);
+        // Atomically under one lock:
+        //   1. Drain any control frames that arrived before this registration
+        //   2. Insert the registration so future frames are routed directly
+        //   3. Deliver drained frames into the new control channel
+        //
+        // All three steps happen while holding `reg_state`, so reader_task
+        // cannot interleave between drain and register (see RegistrationState
+        // doc comment for the full race condition explanation).
+        //
+        // Buffered frames are delivered with try_send (not async send) so we
+        // don't yield while holding the lock. This is safe because the channel
+        // was just created with channel_capacity slots and pending frames are
+        // few (typically 1-2: one Handshake and/or one Ready).
+        {
+            let mut state = self.reg_state.lock().await;
+            let pending = state.pending_control.remove(&dataflow_id).unwrap_or_default();
+            state.registered.insert(dataflow_id, reg);
+
+            // Deliver buffered frames while still holding the lock.
+            // try_send is safe here: the channel was just created with
+            // channel_capacity slots and pending frames are few (1-2 at most).
+            if !pending.is_empty() {
+                if let Some(tx) = state
+                    .registered
+                    .get(&dataflow_id)
+                    .and_then(|r| r.channel_senders.get(&CONTROL_CHANNEL_ID))
+                {
+                    for payload in pending {
+                        let _ = tx.try_send(payload);
+                    }
+                }
+            }
+        }
 
         // Create reorder buffer for this dataflow's payload lane
         self.reorder_buffers.lock().await.insert(
@@ -349,9 +453,15 @@ impl SharedPeerManager {
         (receivers, error_rx)
     }
 
-    /// Unregister a dataflow, removing its channels and reorder buffer.
+    /// Unregister a dataflow, removing its channels, reorder buffer, and pending control frames.
+    /// The dataflow ID is recorded as completed so late control frames are dropped.
     pub async fn unregister_dataflow(&self, dataflow_id: &DataflowId) {
-        self.registrations.lock().await.remove(dataflow_id);
+        {
+            let mut state = self.reg_state.lock().await;
+            state.registered.remove(dataflow_id);
+            state.pending_control.remove(dataflow_id);
+            state.completed.insert(*dataflow_id);
+        }
         self.reorder_buffers.lock().await.remove(dataflow_id);
     }
 
@@ -420,7 +530,7 @@ impl SharedPeerManager {
     async fn bridge_task(
         pool: Arc<PeerPool>,
         writer_channels: Arc<TokioMutex<HashMap<usize, tokio_mpsc::Sender<Frame>>>>,
-        registrations: Arc<TokioMutex<HashMap<DataflowId, DataflowRegistration>>>,
+        reg_state: Arc<TokioMutex<RegistrationState>>,
         mut payload_rx: tokio_mpsc::Receiver<(DataflowId, Frame)>,
         mut control_rx: tokio_mpsc::Receiver<Frame>,
     ) {
@@ -456,8 +566,8 @@ impl SharedPeerManager {
                         Some((dataflow_id, mut frame)) => {
                             // Assign sequence_id from the dataflow's counter
                             let seq_id = {
-                                let regs = registrations.lock().await;
-                                if let Some(reg) = regs.get(&dataflow_id) {
+                                let state = reg_state.lock().await;
+                                if let Some(reg) = state.registered.get(&dataflow_id) {
                                     reg.sequence_counter.next_seq()
                                 } else {
                                     continue; // dataflow unregistered, drop frame
@@ -534,7 +644,9 @@ impl SharedPeerManager {
     ///
     /// Special handling:
     /// - Probe frames: process replies or generate reply to requests
-    /// - Control frames (channel 0): delivered directly without sequencing
+    /// - Control frames (channel 0): delivered directly without sequencing;
+    ///   if the target dataflow is not yet registered, frames are buffered in
+    ///   `pending_control` and drained on registration.
     /// - Payload frames: stripped of sequence prefix, reordered, dispatched
     ///
     /// On read error, marks the connection dead and notifies via `failure_tx`.
@@ -542,7 +654,7 @@ impl SharedPeerManager {
     async fn reader_task<R: AsyncRead + Unpin>(
         conn_id: usize,
         reader: R,
-        registrations: Arc<TokioMutex<HashMap<DataflowId, DataflowRegistration>>>,
+        reg_state: Arc<TokioMutex<RegistrationState>>,
         reorder_buffers: Arc<TokioMutex<HashMap<DataflowId, ReorderBuffer<Frame>>>>,
         scaling_driver: Arc<ScalingDriver>,
         pool: Arc<PeerPool>,
@@ -567,12 +679,38 @@ impl SharedPeerManager {
                         continue;
                     }
 
-                    // Control frames bypass sequencing — deliver raw payload directly
+                    // Control frames (Handshake, Ready) bypass sequencing — deliver
+                    // the raw payload directly to the control channel.
+                    //
+                    // Race condition handling: the remote peer may send a control
+                    // frame for a dataflow that hasn't been registered locally yet
+                    // (e.g., node-A finishes df1 and starts df2's handshake before
+                    // node-B has registered df2). Instead of dropping the frame, we
+                    // buffer it in `pending_control` so that `register_dataflow()`
+                    // can drain it upon registration. Both the "check registration +
+                    // buffer" here and the "drain + register" in register_dataflow()
+                    // hold the same `reg_state` lock, preventing TOCTOU races.
                     if frame.channel_id == CONTROL_CHANNEL_ID {
                         let tx = {
-                            let regs = registrations.lock().await;
-                            regs.get(&frame.dataflow_id)
-                                .and_then(|r| r.channel_senders.get(&CONTROL_CHANNEL_ID).cloned())
+                            let mut state = reg_state.lock().await;
+                            match state.registered.get(&frame.dataflow_id) {
+                                Some(reg) => {
+                                    reg.channel_senders.get(&CONTROL_CHANNEL_ID).cloned()
+                                }
+                                None => {
+                                    // Drop frames for completed dataflows instead
+                                    // of buffering them indefinitely.
+                                    if state.completed.contains(&frame.dataflow_id) {
+                                        continue;
+                                    }
+                                    // Dataflow not registered yet — buffer for later
+                                    state.pending_control
+                                        .entry(frame.dataflow_id)
+                                        .or_default()
+                                        .push(frame.payload);
+                                    continue;
+                                }
+                            }
                         };
                         if let Some(tx) = tx {
                             let _ = tx.send(frame.payload).await;
@@ -610,8 +748,8 @@ impl SharedPeerManager {
 
                                 // Clone senders under lock, then release before awaiting
                                 let senders = {
-                                    let regs = registrations.lock().await;
-                                    regs.get(&frame.dataflow_id)
+                                    let state = reg_state.lock().await;
+                                    state.registered.get(&frame.dataflow_id)
                                         .map(|reg| reg.channel_senders.clone())
                                 };
 
@@ -778,7 +916,7 @@ impl SharedPeerManager {
         pool: Arc<PeerPool>,
         writer_channels: Arc<TokioMutex<HashMap<usize, tokio_mpsc::Sender<Frame>>>>,
         scaling_driver: Arc<ScalingDriver>,
-        registrations: Arc<TokioMutex<HashMap<DataflowId, DataflowRegistration>>>,
+        reg_state: Arc<TokioMutex<RegistrationState>>,
     ) {
         let mut processed = HashSet::new();
         let mut all_failed_notified = false;
@@ -821,8 +959,8 @@ impl SharedPeerManager {
                     "All connections to peer are dead — notifying dataflows"
                 );
 
-                let regs = registrations.lock().await;
-                for (_df_id, reg) in regs.iter() {
+                let state = reg_state.lock().await;
+                for (_df_id, reg) in state.registered.iter() {
                     let _ = reg
                         .error_tx
                         .try_send(TransportError::ConnectionClosed);
@@ -837,7 +975,7 @@ impl SharedPeerManager {
     /// sends a `TransportError::ConnectionClosed` to that dataflow's error channel.
     async fn timeout_sweeper(
         reorder_buffers: Arc<TokioMutex<HashMap<DataflowId, ReorderBuffer<Frame>>>>,
-        registrations: Arc<TokioMutex<HashMap<DataflowId, DataflowRegistration>>>,
+        reg_state: Arc<TokioMutex<RegistrationState>>,
         check_interval: Duration,
     ) {
         let mut ticker = tokio::time::interval(check_interval);
@@ -859,9 +997,9 @@ impl SharedPeerManager {
 
             // Notify affected dataflows
             if !timed_out_dataflows.is_empty() {
-                let regs = registrations.lock().await;
+                let state = reg_state.lock().await;
                 for df_id in timed_out_dataflows {
-                    if let Some(reg) = regs.get(&df_id) {
+                    if let Some(reg) = state.registered.get(&df_id) {
                         let _ = reg
                             .error_tx
                             .try_send(TransportError::ReorderTimeout);
@@ -1140,15 +1278,15 @@ mod tests {
 
         // Verify registration exists
         {
-            let regs = manager.registrations.lock().await;
-            assert!(regs.contains_key(&df_id));
+            let state = manager.reg_state.lock().await;
+            assert!(state.registered.contains_key(&df_id));
         }
 
         // Unregister
         manager.unregister_dataflow(&df_id).await;
         {
-            let regs = manager.registrations.lock().await;
-            assert!(!regs.contains_key(&df_id));
+            let state = manager.reg_state.lock().await;
+            assert!(!state.registered.contains_key(&df_id));
         }
     }
 

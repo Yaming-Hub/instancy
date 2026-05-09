@@ -1,8 +1,7 @@
-//! Runtime configuration and dataflow execution entry point.
+//! Runtime configuration and dataflow execution types.
 //!
-//! The [`execute`] function is the main entry point for running a dataflow.
-//! It creates the worker thread pool, sets up the execution context,
-//! and returns a [`crate::dataflow::DataflowHandle`] for monitoring and control.
+//! Provides [`ClusterTopology`], [`NodeConfig`], [`DataflowConfig`], and
+//! [`ExecutionConfig`] for configuring multi-node dataflow clusters.
 
 use std::time::Duration;
 
@@ -14,8 +13,8 @@ use crate::worker_pool::WorkerPoolConfig;
 
 /// Configuration for the low-level execution engine.
 ///
-/// This controls the worker thread pool and progress tracking mode used by
-/// [`execute()`]. Most users should prefer [`crate::RuntimeConfig`] (from the
+/// This controls the worker thread pool and progress tracking mode.
+/// Most users should prefer [`crate::RuntimeConfig`] (from the
 /// `runtime` module) which provides a higher-level API.
 #[derive(Debug, Clone)]
 pub struct ExecutionConfig {
@@ -198,39 +197,6 @@ impl ClusterTopology {
     }
 }
 
-/// Handle returned by `execute()` for monitoring and controlling a running dataflow.
-#[derive(Debug)]
-#[allow(dead_code)]
-pub struct ExecutionHandle {
-    /// Name of the dataflow.
-    pub name: String,
-    /// Whether the dataflow has completed.
-    completed: bool,
-}
-
-impl ExecutionHandle {
-    /// Create a new handle (used internally).
-    #[allow(dead_code)]
-    pub(crate) fn new(name: String) -> Self {
-        Self {
-            name,
-            completed: false,
-        }
-    }
-
-    /// Check if the dataflow has completed.
-    #[allow(dead_code)]
-    pub fn is_completed(&self) -> bool {
-        self.completed
-    }
-
-    /// Mark the dataflow as completed.
-    #[allow(dead_code)]
-    pub(crate) fn mark_completed(&mut self) {
-        self.completed = true;
-    }
-}
-
 /// Bootstrap a dataflow execution.
 ///
 /// This is the main entry point. It:
@@ -241,10 +207,11 @@ impl ExecutionHandle {
 ///
 /// The actual dataflow construction happens via the returned handle
 /// and the scope/stream APIs.
-pub fn execute(
+#[cfg(test)]
+fn execute(
     runtime_config: &ExecutionConfig,
     dataflow_config: DataflowConfig,
-) -> Result<ExecutionHandle, Error> {
+) -> Result<String, Error> {
     // Validate configs
     runtime_config
         .worker_pool
@@ -257,8 +224,7 @@ pub fn execute(
         ));
     }
 
-    let handle = ExecutionHandle::new(dataflow_config.name);
-    Ok(handle)
+    Ok(dataflow_config.name)
 }
 
 #[cfg(test)]
@@ -394,9 +360,8 @@ mod tests {
     fn execute_smoke_test() {
         let runtime = ExecutionConfig::default();
         let df = DataflowConfig::single_node(4, "smoke");
-        let handle = execute(&runtime, df).unwrap();
-        assert_eq!(handle.name, "smoke");
-        assert!(!handle.is_completed());
+        let name = execute(&runtime, df).unwrap();
+        assert_eq!(name, "smoke");
     }
 
     #[test]
