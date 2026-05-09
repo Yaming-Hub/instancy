@@ -113,6 +113,9 @@ struct RegistrationState {
     /// Control frames buffered for dataflows that haven't been registered yet.
     /// Drained into the control channel upon registration.
     pending_control: HashMap<DataflowId, Vec<Vec<u8>>>,
+    /// Dataflows that have been unregistered (completed). Late control frames
+    /// for these IDs are dropped instead of being buffered indefinitely.
+    completed: HashSet<DataflowId>,
 }
 
 // ---------------------------------------------------------------------------
@@ -211,6 +214,7 @@ impl SharedPeerManager {
             Arc::new(TokioMutex::new(RegistrationState {
                 registered: HashMap::new(),
                 pending_control: HashMap::new(),
+                completed: HashSet::new(),
             }));
         let reorder_buffers = Arc::new(TokioMutex::new(HashMap::new()));
 
@@ -358,26 +362,28 @@ impl SharedPeerManager {
             error_tx,
         };
 
-        // Atomically: drain pending control frames + insert registration.
-        // The reader_task uses the same lock, so there is no window where a
-        // frame could be buffered after we drain but before we register.
-        let pending = {
+        // Atomically: drain pending control frames + insert registration +
+        // deliver buffered frames. The reader_task uses the same lock, so
+        // there is no window where a frame could be buffered after we drain
+        // but before we register, and no ordering inversion where reader_task
+        // delivers a newer frame before we finish delivering buffered ones.
+        {
             let mut state = self.reg_state.lock().await;
             let pending = state.pending_control.remove(&dataflow_id).unwrap_or_default();
             state.registered.insert(dataflow_id, reg);
-            pending
-        };
 
-        // Deliver buffered frames (lock released so we can await sends)
-        if !pending.is_empty() {
-            let ctrl_tx = {
-                let state = self.reg_state.lock().await;
-                state.registered.get(&dataflow_id)
-                    .and_then(|r| r.channel_senders.get(&CONTROL_CHANNEL_ID).cloned())
-            };
-            if let Some(tx) = ctrl_tx {
-                for payload in pending {
-                    let _ = tx.send(payload).await;
+            // Deliver buffered frames while still holding the lock.
+            // try_send is safe here: the channel was just created with
+            // channel_capacity slots and pending frames are few (1-2 at most).
+            if !pending.is_empty() {
+                if let Some(tx) = state
+                    .registered
+                    .get(&dataflow_id)
+                    .and_then(|r| r.channel_senders.get(&CONTROL_CHANNEL_ID))
+                {
+                    for payload in pending {
+                        let _ = tx.try_send(payload);
+                    }
                 }
             }
         }
@@ -392,11 +398,13 @@ impl SharedPeerManager {
     }
 
     /// Unregister a dataflow, removing its channels, reorder buffer, and pending control frames.
+    /// The dataflow ID is recorded as completed so late control frames are dropped.
     pub async fn unregister_dataflow(&self, dataflow_id: &DataflowId) {
         {
             let mut state = self.reg_state.lock().await;
             state.registered.remove(dataflow_id);
             state.pending_control.remove(dataflow_id);
+            state.completed.insert(*dataflow_id);
         }
         self.reorder_buffers.lock().await.remove(dataflow_id);
     }
@@ -626,6 +634,11 @@ impl SharedPeerManager {
                                     reg.channel_senders.get(&CONTROL_CHANNEL_ID).cloned()
                                 }
                                 None => {
+                                    // Drop frames for completed dataflows instead
+                                    // of buffering them indefinitely.
+                                    if state.completed.contains(&frame.dataflow_id) {
+                                        continue;
+                                    }
                                     // Dataflow not registered yet — buffer for later
                                     state.pending_control
                                         .entry(frame.dataflow_id)
