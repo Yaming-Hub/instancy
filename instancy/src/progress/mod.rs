@@ -84,11 +84,15 @@
 pub mod capability;
 pub mod change_batch;
 pub mod frontier;
-pub mod mutable_antichain;
-pub mod network_progress;
+#[allow(dead_code)]
+pub(crate) mod mutable_antichain;
+pub(crate) mod network_progress;
 pub mod notificator;
-pub mod operate;
-pub mod progress_channel;
-pub mod reachability;
-pub mod subgraph;
+#[allow(dead_code)]
+pub(crate) mod operate;
+pub(crate) mod progress_channel;
+#[allow(dead_code)]
+pub(crate) mod reachability;
+#[allow(dead_code)]
+pub(crate) mod subgraph;
 pub mod timestamp;

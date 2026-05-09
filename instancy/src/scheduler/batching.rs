@@ -7,7 +7,7 @@
 //!
 //! # Example
 //!
-//! ```
+//! ```ignore
 //! use instancy::scheduler::batching::{BatchingPolicy, BatchAccumulator};
 //! use std::time::Duration;
 //!

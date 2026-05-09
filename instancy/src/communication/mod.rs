@@ -5,17 +5,17 @@
 //! connection pooling for managing peer-to-peer connections, multiplexed
 //! framed transport for wire communication, and inter-process routing/encoding.
 
-pub mod allocator;
+pub(crate) mod allocator;
 #[cfg(feature = "transport")]
 pub mod cluster_transport;
 pub mod codec;
 pub mod connection;
-pub mod control_protocol;
+pub(crate) mod control_protocol;
 pub mod interprocess;
-pub mod probing;
+pub(crate) mod probing;
 pub mod progress_exchange;
 pub mod remote_push;
-pub mod sequencing;
+pub(crate) mod sequencing;
 pub mod session;
 pub mod shared_pool;
 #[cfg(feature = "transport")]

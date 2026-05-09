@@ -52,7 +52,7 @@ pub mod communication;
 pub mod dataflow;
 pub mod error;
 pub mod execute;
-pub mod executor_task;
+pub(crate) mod executor_task;
 pub mod metrics;
 pub mod order;
 pub mod progress;
@@ -61,7 +61,7 @@ pub mod runtime;
 pub mod scheduler;
 pub(crate) mod wire;
 pub mod worker;
-pub mod worker_pool;
+pub(crate) mod worker_pool;
 
 // ── Crate-level re-exports for ergonomic use ──────────────────────────
 
@@ -98,6 +98,15 @@ pub use cancellation::{CancellationReason, CancellationToken};
 
 // Error handling
 pub use error::{Error, Result};
+
+// Worker types
+pub use worker::WorkerId;
+
+// Progress tracking
+pub use progress::timestamp::Timestamp;
+
+// Scheduler policies
+pub use scheduler::policy::{PriorityPolicy, PriorityWithAgingPolicy, SchedulePolicy};
 
 // Timestamp ordering
 pub use order::Product;
