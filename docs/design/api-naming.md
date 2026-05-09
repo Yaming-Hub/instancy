@@ -10,14 +10,11 @@ The instancy public API has several naming inconsistencies that make the API har
 
 ## Changes
 
-### 1. `RuntimeHandle::shutdown()` → return `Result<()>`
+### 1. `RuntimeHandle::shutdown()` — keep infallible
 
-Currently `shutdown()` returns `()` while all other runtime methods return `Result`. Change to:
-```rust
-pub fn shutdown(&self) -> Result<()>
-```
-
-This is consistent with the project goal of proper error handling. The shutdown process could fail (e.g., if the runtime is already shut down).
+After review, `shutdown()` stays `()`. The underlying `cancel_with_reason()` is idempotent
+and can never fail. Returning `Result<()>` with always-`Ok(())` would be misleading.
+This matches `shutdown_async()` which also returns `()`.
 
 ### 2. `SpawnOptions` — consolidate to builder-only pattern
 

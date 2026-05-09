@@ -823,10 +823,9 @@ impl RuntimeHandle {
     /// The owned tokio runtime (if any) is shut down when this `RuntimeHandle`
     /// is dropped — not by this method. To fully clean up, call `shutdown()`
     /// and then drop the handle.
-    pub fn shutdown(&self) -> Result<()> {
+    pub fn shutdown(&self) {
         self.cancel
             .cancel_with_reason(CancellationReason::RuntimeShutdown);
-        Ok(())
     }
 
     /// Shut down the runtime and wait for all active dataflows to complete.
@@ -4644,7 +4643,7 @@ mod tests {
         })
         .unwrap();
         assert!(!rt.is_shutdown());
-        rt.shutdown().unwrap();
+        rt.shutdown();
         assert!(rt.is_shutdown());
         assert!(rt.cancel_token().is_cancelled());
     }
@@ -4667,7 +4666,7 @@ mod tests {
         .unwrap();
 
         // Shutting down rt1 doesn't affect rt2
-        rt1.shutdown().unwrap();
+        rt1.shutdown();
         assert!(rt1.is_shutdown());
         assert!(!rt2.is_shutdown());
     }
@@ -4810,7 +4809,7 @@ mod tests {
         let dataflow = builder.build().unwrap();
 
         let handle = rt.spawn(dataflow, SpawnOptions::default()).unwrap();
-        rt.shutdown().unwrap();
+        rt.shutdown();
         // Should complete (cancelled), not hang
         let _ = handle.join_blocking();
     }
@@ -6950,7 +6949,7 @@ mod tests {
             Ok(_) => {}
             Err(e) => panic!("spawn_multi failed: {e}"),
         }
-        rt.shutdown().unwrap();
+        rt.shutdown();
     }
 
     #[test]
@@ -6992,7 +6991,7 @@ mod tests {
             }
             Ok(_) => panic!("expected error for parallelism mismatch"),
         }
-        rt.shutdown().unwrap();
+        rt.shutdown();
     }
 
     #[test]
@@ -7032,7 +7031,7 @@ mod tests {
             }
             Ok(_) => panic!("expected error for single-worker parallelism mismatch"),
         }
-        rt.shutdown().unwrap();
+        rt.shutdown();
     }
 
     #[test]
@@ -7064,7 +7063,7 @@ mod tests {
         // Give the callback a moment to fire.
         std::thread::sleep(std::time::Duration::from_millis(50));
         assert_eq!(rt.active_dataflows(), 0);
-        rt.shutdown().unwrap();
+        rt.shutdown();
     }
 
     #[tokio::test]

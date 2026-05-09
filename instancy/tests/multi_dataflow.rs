@@ -225,7 +225,7 @@ fn shutdown_cancels_all_running_dataflows() {
     // by the time spawn() returns. No sleep needed.
 
     // Shutdown should cancel all
-    rt.shutdown().unwrap();
+    rt.shutdown();
 
     // All should complete with Cancelled error — no hangs.
     // Use a generous timeout (30s) as a hang guard, not a perf benchmark.
