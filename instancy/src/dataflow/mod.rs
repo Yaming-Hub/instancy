@@ -3,19 +3,21 @@
 pub mod channel_operators;
 pub mod channels;
 pub mod context;
-pub mod control;
+pub(crate) mod control;
 pub mod dataflow_builder;
-pub mod executor;
+pub(crate) mod executor;
 pub mod graph;
 pub mod id;
 pub mod operators;
 pub mod probe;
-pub mod schedulable;
+#[allow(dead_code)]
+pub(crate) mod schedulable;
 pub mod scope;
-pub mod spec;
+pub(crate) mod spec;
 pub mod stage;
 pub mod stream;
-pub mod wired_operators;
+#[allow(dead_code)]
+pub(crate) mod wired_operators;
 
 pub use channel_operators::{AsyncInputSender, AsyncOutputReceiver};
 pub use channel_operators::{

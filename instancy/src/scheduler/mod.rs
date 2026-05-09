@@ -5,8 +5,9 @@
 //! - [`policy`] — pluggable scheduling policies (FIFO, Priority, PriorityWithAging).
 //! - [`batching`] — time-bounded message batching to reduce scheduling overhead.
 
-pub mod batching;
+#[allow(dead_code)]
+pub(crate) mod batching;
 pub mod policy;
-mod task_scheduler;
+pub(crate) mod task_scheduler;
 
 pub use task_scheduler::*;
