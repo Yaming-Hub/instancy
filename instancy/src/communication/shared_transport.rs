@@ -684,13 +684,44 @@ impl SharedPeerManager {
                 result = payload_rx.recv(), if payload_open => {
                     match result {
                         Some((dataflow_id, mut frame)) => {
-                            // Assign sequence_id from the dataflow's counter
+                            // Verify dataflow is still registered before proceeding
+                            {
+                                let state = reg_state.lock().await;
+                                if !state.registered.contains_key(&dataflow_id) {
+                                    continue; // dataflow unregistered, drop frame
+                                }
+                            }
+
+                            // Select a live connection first — only assign a sequence
+                            // number AFTER confirming we can actually send. This prevents
+                            // sequence gaps in the reorder buffer when frames are dropped
+                            // due to no available connections (e.g., during reconnect).
+                            let mut exclude = HashSet::new();
+                            let first_conn = match pool.select_connection_excluding(&exclude) {
+                                Some(c) => {
+                                    c.enqueue();
+                                    c
+                                }
+                                None => {
+                                    // No live connections available — drop frame
+                                    // WITHOUT consuming a sequence number.
+                                    #[cfg(feature = "tracing")]
+                                    tracing::error!(
+                                        "No live connections for payload frame, dropping"
+                                    );
+                                    continue;
+                                }
+                            };
+
+                            // Now assign sequence_id — we know at least one connection
+                            // is available so this frame will be attempted.
                             let seq_id = {
                                 let state = reg_state.lock().await;
                                 if let Some(reg) = state.registered.get(&dataflow_id) {
                                     reg.sequence_counter.next_seq()
                                 } else {
-                                    continue; // dataflow unregistered, drop frame
+                                    first_conn.rollback_reservation();
+                                    continue; // dataflow unregistered between check and here
                                 }
                             };
 
@@ -700,24 +731,10 @@ impl SharedPeerManager {
                             sequenced_payload.extend_from_slice(&frame.payload);
                             frame.payload = sequenced_payload;
 
-                            // Select a live connection; retry on a different one if send fails
-                            let mut exclude = HashSet::new();
+                            // Try sending on the selected connection; retry on others if needed
                             let mut current_frame = frame;
+                            let mut conn = first_conn;
                             loop {
-                                let conn = match pool.select_connection_excluding(&exclude) {
-                                    Some(c) => {
-                                        c.enqueue();
-                                        c
-                                    }
-                                    None => {
-                                        // No live connections available
-                                        #[cfg(feature = "tracing")]
-                                        tracing::error!(
-                                            "No live connections for payload frame, dropping"
-                                        );
-                                        break;
-                                    }
-                                };
                                 let conn_id = conn.id;
 
                                 // Clone sender under lock, then release before await
@@ -739,7 +756,6 @@ impl SharedPeerManager {
                                                 tracing::warn!(
                                                     "Writer channel closed for conn {conn_id}, retrying"
                                                 );
-                                                continue;
                                             }
                                         }
                                     }
@@ -747,9 +763,27 @@ impl SharedPeerManager {
                                         // Writer channel already removed (monitor cleaned it up)
                                         conn.rollback_reservation();
                                         exclude.insert(conn_id);
-                                        continue;
                                     }
                                 }
+
+                                // Try the next connection
+                                conn = match pool.select_connection_excluding(&exclude) {
+                                    Some(c) => {
+                                        c.enqueue();
+                                        c
+                                    }
+                                    None => {
+                                        // Exhausted all connections after seq was assigned.
+                                        // The frame is lost — this creates a sequence gap,
+                                        // but it's unavoidable at this point since the seq
+                                        // was already committed.
+                                        #[cfg(feature = "tracing")]
+                                        tracing::error!(
+                                            "All connections exhausted after seq assignment, frame lost"
+                                        );
+                                        break;
+                                    }
+                                };
                             }
                         }
                         None => { payload_open = false; }
