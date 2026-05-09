@@ -377,6 +377,7 @@ impl DataflowAgent {
         let tokio_handle = self.tokio_handle.clone();
         let connections = conn_state.connections;
         let df_id_str = dataflow_id.clone();
+        let build_dataflow_type = dataflow_type.clone();
         // Both nodes must use the same DataflowId for the transport session to
         // route messages correctly. Derive a deterministic UUID from the string name.
         let df_id = DataflowId::from_uuid(uuid::Uuid::new_v5(
@@ -395,7 +396,7 @@ impl DataflowAgent {
                 Duration::from_secs(15),
                 move |builder| {
                     let (_inputs, _output) =
-                        dataflows::build_dataflow(dataflow_type, builder)?;
+                        dataflows::build_dataflow(&build_dataflow_type, builder)?;
                     Ok(())
                 },
                 &tokio_handle,
@@ -413,7 +414,7 @@ impl DataflowAgent {
                 let num_local = cluster_handle.num_local_workers();
 
                 // Extract I/O handles based on dataflow type.
-                let (input_names, output_name) = dataflows::port_names(dataflow_type);
+                let (input_names, output_name) = dataflows::port_names(&dataflow_type);
                 let mut input_senders: HashMap<(usize, String), Box<dyn std::any::Any + Send>> =
                     HashMap::new();
                 let mut output_collectors: HashMap<(usize, String), Box<dyn std::any::Any + Send>> =
@@ -423,7 +424,7 @@ impl DataflowAgent {
                     // Extract inputs based on DataflowType's concrete type.
                     for port in &input_names {
                         let sender = extract_input_sender(
-                            dataflow_type,
+                            &dataflow_type,
                             &mut cluster_handle,
                             local_idx,
                             port,
@@ -434,7 +435,7 @@ impl DataflowAgent {
                     }
                     // Extract output.
                     let receiver = extract_output_receiver(
-                        dataflow_type,
+                        &dataflow_type,
                         &mut cluster_handle,
                         local_idx,
                         &output_name,
@@ -484,9 +485,9 @@ impl DataflowAgent {
         };
         let mut guard = active.lock().await;
         let key = (worker_idx, port_name.clone());
-        let dataflow_type = guard.dataflow_type;
+        let dataflow_type = guard.dataflow_type.clone();
         let result = feed_data_typed(
-            dataflow_type,
+            &dataflow_type,
             &mut guard.input_senders,
             &key,
             timestamp,
@@ -549,8 +550,8 @@ impl DataflowAgent {
         };
         let mut guard = active.lock().await;
         let key = (worker_idx, port_name.clone());
-        let dataflow_type = guard.dataflow_type;
-        match collect_output_typed(dataflow_type, &mut guard.output_collectors, &key) {
+        let dataflow_type = guard.dataflow_type.clone();
+        match collect_output_typed(&dataflow_type, &mut guard.output_collectors, &key) {
             Ok(data) => NodeResponse::OutputData { data },
             Err(e) => NodeResponse::Error { message: e },
         }
@@ -625,7 +626,7 @@ impl DataflowAgent {
 /// Returns a type-erased Box<dyn Any + Send> wrapping the concrete InputSender.
 /// Types MUST match those declared in dataflows::build_* functions.
 fn extract_input_sender(
-    dataflow_type: DataflowType,
+    dataflow_type: &DataflowType,
     handle: &mut instancy::runtime::ClusterSpawnedDataflow<u64>,
     local_idx: usize,
     port: &str,
@@ -639,7 +640,7 @@ fn extract_input_sender(
             .take_input::<(u64, String)>(local_idx, port)
             .ok()
             .map(|s| Box::new(s) as Box<dyn std::any::Any + Send>),
-        DataflowType::MultiEpochExchange => handle
+        DataflowType::MultiEpochExchange | DataflowType::IterativeFilter => handle
             .take_input::<(u64, i64)>(local_idx, port)
             .ok()
             .map(|s| Box::new(s) as Box<dyn std::any::Any + Send>),
@@ -647,8 +648,12 @@ fn extract_input_sender(
             .take_input::<String>(local_idx, port)
             .ok()
             .map(|s| Box::new(s) as Box<dyn std::any::Any + Send>),
-        DataflowType::IterativeFilter => handle
-            .take_input::<(u64, i64)>(local_idx, port)
+        DataflowType::StagedFanOutFanIn { .. }
+        | DataflowType::FilterAggregate { .. }
+        | DataflowType::BranchMerge
+        | DataflowType::DelayedAggregation { .. }
+        | DataflowType::IterativeExchange { .. } => handle
+            .take_input::<i64>(local_idx, port)
             .ok()
             .map(|s| Box::new(s) as Box<dyn std::any::Any + Send>),
         DataflowType::DistributedJoin => {
@@ -670,7 +675,7 @@ fn extract_input_sender(
 /// Extract an output receiver from a cluster handle based on the dataflow type.
 /// Types MUST match those declared in dataflows::build_* functions.
 fn extract_output_receiver(
-    dataflow_type: DataflowType,
+    dataflow_type: &DataflowType,
     handle: &mut instancy::runtime::ClusterSpawnedDataflow<u64>,
     local_idx: usize,
     port: &str,
@@ -684,7 +689,7 @@ fn extract_output_receiver(
             .take_output::<(u64, String)>(local_idx, port)
             .ok()
             .map(|r| Box::new(r) as Box<dyn std::any::Any + Send>),
-        DataflowType::MultiEpochExchange => handle
+        DataflowType::MultiEpochExchange | DataflowType::IterativeFilter => handle
             .take_output::<(u64, i64)>(local_idx, port)
             .ok()
             .map(|r| Box::new(r) as Box<dyn std::any::Any + Send>),
@@ -692,8 +697,12 @@ fn extract_output_receiver(
             .take_output::<(String, u64)>(local_idx, port)
             .ok()
             .map(|r| Box::new(r) as Box<dyn std::any::Any + Send>),
-        DataflowType::IterativeFilter => handle
-            .take_output::<(u64, i64)>(local_idx, port)
+        DataflowType::StagedFanOutFanIn { .. }
+        | DataflowType::FilterAggregate { .. }
+        | DataflowType::BranchMerge
+        | DataflowType::DelayedAggregation { .. }
+        | DataflowType::IterativeExchange { .. } => handle
+            .take_output::<i64>(local_idx, port)
             .ok()
             .map(|r| Box::new(r) as Box<dyn std::any::Any + Send>),
         DataflowType::DistributedJoin => handle
@@ -709,7 +718,7 @@ fn extract_output_receiver(
 
 /// Feed data to a type-erased InputSender using dataflow_type to select concrete type.
 fn feed_data_typed(
-    dataflow_type: DataflowType,
+    dataflow_type: &DataflowType,
     senders: &mut HashMap<(usize, String), Box<dyn std::any::Any + Send>>,
     key: &(usize, String),
     timestamp: u64,
@@ -760,6 +769,18 @@ fn feed_data_typed(
                 bincode::deserialize(data).map_err(|e| format!("deserialize: {e}"))?;
             s.send(timestamp, items).map_err(|e| format!("send: {e}"))
         }
+        DataflowType::StagedFanOutFanIn { .. }
+        | DataflowType::FilterAggregate { .. }
+        | DataflowType::BranchMerge
+        | DataflowType::DelayedAggregation { .. }
+        | DataflowType::IterativeExchange { .. } => {
+            let s = sender
+                .downcast_ref::<instancy::dataflow::channel_operators::InputSender<u64, i64>>()
+                .ok_or("downcast failed for scalar-i64 input")?;
+            let items: Vec<i64> =
+                bincode::deserialize(data).map_err(|e| format!("deserialize: {e}"))?;
+            s.send(timestamp, items).map_err(|e| format!("send: {e}"))
+        }
         DataflowType::DistributedJoin => {
             // Port "left" → (u64, String), port "right" → (u64, i64)
             if key.1 == "left" {
@@ -785,7 +806,7 @@ fn feed_data_typed(
 ///
 /// Drains all available output (non-blocking) and returns `(timestamp, bincode_bytes)` pairs.
 fn collect_output_typed(
-    dataflow_type: DataflowType,
+    dataflow_type: &DataflowType,
     collectors: &mut HashMap<(usize, String), Box<dyn std::any::Any + Send>>,
     key: &(usize, String),
 ) -> std::result::Result<Vec<(u64, Vec<u8>)>, String> {
@@ -822,6 +843,16 @@ fn collect_output_typed(
             let r = collector
                 .downcast_ref::<instancy::dataflow::channel_operators::OutputReceiver<u64, (u64, i64)>>()
                 .ok_or("downcast failed for IterativeFilter output")?;
+            drain_output(r)
+        }
+        DataflowType::StagedFanOutFanIn { .. }
+        | DataflowType::FilterAggregate { .. }
+        | DataflowType::BranchMerge
+        | DataflowType::DelayedAggregation { .. }
+        | DataflowType::IterativeExchange { .. } => {
+            let r = collector
+                .downcast_ref::<instancy::dataflow::channel_operators::OutputReceiver<u64, i64>>()
+                .ok_or("downcast failed for scalar-i64 output")?;
             drain_output(r)
         }
         DataflowType::DistributedJoin => {

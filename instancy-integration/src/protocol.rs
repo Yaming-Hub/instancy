@@ -41,7 +41,7 @@ pub struct SerializableNodeConfig {
 }
 
 /// Enum selecting a predefined dataflow builder.
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub enum DataflowType {
     /// source → map(identity) → output. No exchange.
     PassThrough,
@@ -55,6 +55,21 @@ pub enum DataflowType {
     IterativeFilter,
     /// two sources → binary join via exchange → output.
     DistributedJoin,
+    /// source → map → exchange_to(N) → map → gather → output.
+    /// Tests per-stage parallelism with explicit fan-out and fan-in.
+    StagedFanOutFanIn { fan_out_parallelism: usize },
+    /// source → filter(>threshold) → exchange → reduce(sum) → output.
+    /// Tests filter + aggregation pipeline across nodes.
+    FilterAggregate { threshold: i64 },
+    /// source → branch(even/odd) → map(path-specific) → merge → exchange → reduce → output.
+    /// Tests branch + merge operators across cluster.
+    BranchMerge,
+    /// source → delay_batch(+offset) → exchange → unary_notify(sum per epoch) → output.
+    /// Tests delay operator across cluster boundaries.
+    DelayedAggregation { delay_offset: u64 },
+    /// source → iterate(exchange → map(double) → filter(<threshold) → feedback) → output.
+    /// Graph-style iterative computation with exchange inside the loop.
+    IterativeExchange { threshold: i64 },
 }
 
 // ---------------------------------------------------------------------------

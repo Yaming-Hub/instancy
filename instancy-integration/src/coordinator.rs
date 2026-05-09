@@ -84,6 +84,19 @@ impl TestCoordinator {
     ///
     /// Each node connects back to the coordinator's control listener.
     pub async fn start(node_ids: &[&str], worker_threads: usize) -> Self {
+        let nodes: Vec<(&str, usize)> = node_ids
+            .iter()
+            .copied()
+            .map(|node_id| (node_id, worker_threads))
+            .collect();
+        Self::start_asymmetric(&nodes).await
+    }
+
+    /// Start node processes with per-node worker thread counts.
+    ///
+    /// `nodes` is a slice of `(node_id, worker_threads)` pairs, allowing
+    /// asymmetric configurations (e.g., node-a with 4 threads, node-b with 1).
+    pub async fn start_asymmetric(nodes: &[(&str, usize)]) -> Self {
         let binary_path = Self::build_node_binary().await;
 
         // Bind the coordinator's control listener
@@ -95,7 +108,7 @@ impl TestCoordinator {
         let mut processes = HashMap::new();
 
         // Start each node process
-        for &node_id in node_ids {
+        for &(node_id, worker_threads) in nodes {
             let child = Command::new(&binary_path)
                 .args([
                     "--node-id",
@@ -115,7 +128,7 @@ impl TestCoordinator {
 
         // Accept control connections from all nodes (with timeout)
         let mut connections = HashMap::new();
-        for _ in 0..node_ids.len() {
+        for _ in 0..nodes.len() {
             let (stream, _addr) = tokio::time::timeout(Duration::from_secs(30), listener.accept())
                 .await
                 .expect("timeout waiting for node connection")
@@ -288,7 +301,7 @@ impl TestCoordinator {
                 node_id,
                 NodeCommand::SpawnDataflow {
                     dataflow_id: dataflow_id.into(),
-                    dataflow_type,
+                    dataflow_type: dataflow_type.clone(),
                 },
             )
             .await;
