@@ -1458,6 +1458,31 @@ runtime.report_node_join("node-3");
 
 Already-cancelled dataflows are **not** restarted — the application must re-spawn them if desired.
 
+### Connection Failure & Reconnection
+
+When using `SharedTransport` for cluster networking, connection failures are handled automatically if a **connection factory** is provided.
+
+**Automatic reconnection (with factory):**
+
+When a TCP connection drops (reader/writer error), `SharedTransport`:
+1. Marks the connection as dead and removes it from the active pool
+2. Invokes the connection factory to establish a new connection
+3. Retries with exponential backoff: 100ms → 200ms → 400ms → 800ms → 1.6s (up to 5 attempts)
+4. On success, the new connection is added to the pool and data flow resumes
+5. On permanent failure (all retries exhausted with no live connections remaining), affected dataflows receive `TransportError::ConnectionClosed`
+
+**No factory (pre-established connections only):**
+
+If `SharedTransport` is created with pre-established connections and no factory, a dropped connection is permanent — no reconnection is attempted. Remaining healthy connections continue serving data.
+
+**Data loss during reconnection:**
+
+Payload frames in transit when a connection drops may be lost. The `SharedTransport` does **not** buffer or replay lost frames. Applications that require exactly-once delivery should implement their own acknowledgment/retry protocol at the operator level.
+
+**`PeerConnection` and `TransportSession`:**
+
+These lower-level types represent pre-established connections with no built-in reconnection. Reconnection is handled at the `SharedTransport` layer, which wraps these into a managed, pooled transport.
+
 ---
 
 ## 9. Custom Serialization
