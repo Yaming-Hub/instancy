@@ -280,8 +280,8 @@ mod tests {
 
     #[test]
     fn edge_materializer_is_object_safe() {
-        // Proves the trait can be used as dyn EdgeMaterializer (required
-        // by create_exchange_factories_with which takes Arc<Mutex<dyn ...>>).
+        // Proves the trait can be used as dyn EdgeMaterializer
+        // (required by build_exchange_factories which takes Arc<Mutex<dyn ...>>).
         let mat: Box<dyn EdgeMaterializer<u64, i32>> = Box::new(LocalEdgeMaterializer::new(2, 16));
         assert_eq!(mat.num_source_workers(), 2);
         assert_eq!(mat.num_target_workers(), 2);

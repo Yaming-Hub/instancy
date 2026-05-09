@@ -984,9 +984,6 @@ pub(crate) type ExchangeFactoryCreatorFn =
 /// The returned closure captures the `ExchangeFn<D>` and concrete types
 /// `T`, `D`. When called with `(num_source_workers, num_target_workers, capacity)`,
 /// it produces channel factories backed by in-process bounded channels.
-///
-/// For custom transports (network, mock), use
-/// [`create_exchange_factories_with`] instead.
 pub(crate) fn create_exchange_factory_creator<T, D>(
     exchange_fn: ExchangeFn<D>,
 ) -> ExchangeFactoryCreatorFn
@@ -1147,31 +1144,6 @@ where
 /// creates a materializer that mixes local and network-backed channels
 /// based on cluster topology, then passes it here. The exchange routing
 /// logic (`ExchangePush`/`ExchangePull`) is identical regardless of
-/// the materializer — only the physical transport differs.
-///
-/// Unlike [`create_exchange_factory_creator`] (which defers materializer
-/// creation), this function takes a pre-built materializer and returns
-/// the factories directly. The runtime calls this when it knows the
-/// cluster topology and has created the appropriate materializer.
-///
-/// The materializer is wrapped in `Arc<Mutex<>>` because it is shared
-/// across worker factory closures (each worker calls
-/// `materialize_source_worker`/`materialize_target_worker` once during
-/// Phase 5 materialization).
-/// Available for custom materializer integration.
-#[allow(dead_code)]
-pub(crate) fn create_exchange_factories_with<T, D>(
-    num_workers: usize,
-    exchange_fn: ExchangeFn<D>,
-    materializer: Arc<Mutex<dyn super::edge_materializer::EdgeMaterializer<T, D>>>,
-) -> Vec<super::super::schedulable::ChannelFactory>
-where
-    T: Timestamp,
-    D: Clone + Send + 'static,
-{
-    build_exchange_factories(num_workers, num_workers, exchange_fn, materializer)
-}
-
 /// Internal helper: build channel factories from a shared materializer.
 ///
 /// Creates `num_source_workers` factories. In symmetric mode (M==N), each
