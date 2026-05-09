@@ -30,6 +30,13 @@ use super::wake::WakeHandle;
 /// Default channel capacity when not specified.
 pub const DEFAULT_CHANNEL_CAPACITY: usize = 1024;
 
+/// Initial physical allocation for channel buffers.
+///
+/// Channels start with a small allocation to cover typical minimum traffic
+/// (data + progress + control messages) and grow via doubling as needed.
+/// This avoids both zero-allocation churn and wasteful pre-allocation.
+const INITIAL_BUFFER_CAPACITY: usize = 4;
+
 /// Shared state between push and pull endpoints.
 struct SharedState<T: Timestamp, D, M> {
     buffer: VecDeque<Envelope<T, D, M>>,
@@ -44,7 +51,7 @@ struct SharedState<T: Timestamp, D, M> {
 pub fn bounded_channel<T: Timestamp, D: Send + 'static, M: Send + 'static>(
     capacity: usize,
 ) -> (BoundedPush<T, D, M>, BoundedPull<T, D, M>) {
-    bounded_channel_with_wake(capacity, None)
+    bounded_channel_with_wake(capacity, None, None)
 }
 
 /// Creates a bounded channel pair with a [`WakeHandle`] for executor notification.
@@ -53,12 +60,18 @@ pub fn bounded_channel<T: Timestamp, D: Send + 'static, M: Send + 'static>(
 /// - Data is pushed into the channel (downstream may be runnable)
 /// - The sender is closed or dropped (downstream may see exhaustion)
 /// - Data is pulled from a full channel (upstream backpressure is relieved)
+///
+/// `initial_capacity` controls the initial physical allocation. When `None`,
+/// defaults to [`INITIAL_BUFFER_CAPACITY`] (4). Pass `Some(capacity)` to
+/// pre-allocate the full logical capacity for high-throughput channels.
 pub fn bounded_channel_with_wake<T: Timestamp, D: Send + 'static, M: Send + 'static>(
     capacity: usize,
     wake: Option<WakeHandle>,
+    initial_capacity: Option<usize>,
 ) -> (BoundedPush<T, D, M>, BoundedPull<T, D, M>) {
+    let phys = initial_capacity.unwrap_or(INITIAL_BUFFER_CAPACITY).min(capacity);
     let state = Arc::new(Mutex::new(SharedState {
-        buffer: VecDeque::with_capacity(capacity),
+        buffer: VecDeque::with_capacity(phys),
         capacity,
     }));
     let closed = Arc::new(AtomicBool::new(false));
