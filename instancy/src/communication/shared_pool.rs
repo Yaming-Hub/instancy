@@ -515,15 +515,17 @@ impl PeerPool {
     /// Add a new connection to the pool. Returns its metrics handle,
     /// or `None` if already at `max_connections` live connections.
     pub fn add_connection(&self) -> Option<Arc<ConnectionMetrics>> {
-        if self.live_connection_count() >= self.config.max_connections {
+        let mut connections = self
+            .connections
+            .write()
+            .expect("peer pool connections lock poisoned");
+        let live_count = connections.values().filter(|c| c.is_alive()).count();
+        if live_count >= self.config.max_connections {
             return None;
         }
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
         let metrics = Arc::new(ConnectionMetrics::new(id, self.config.rtt_ema_alpha));
-        self.connections
-            .write()
-            .expect("peer pool connections lock poisoned")
-            .insert(id, metrics.clone());
+        connections.insert(id, metrics.clone());
         Some(metrics)
     }
 

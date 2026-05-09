@@ -401,7 +401,6 @@ impl SharedPeerManager {
             pool.clone(),
             writer_channels.clone(),
             scaling_driver.clone(),
-            reg_state.clone(),
         ));
         task_handles
             .lock()
@@ -1067,17 +1066,32 @@ impl SharedPeerManager {
                     let _ = pool.remove_connection(connection_id);
                 }
                 ScalingEvent::ConnectionFailed { connection_id } => {
+                    // Remove the dead connection from the pool to avoid
+                    // accumulating stale entries over time.
+                    let _ = pool.remove_connection(connection_id);
+
                     let Some(factory) = connection_factory.clone() else {
                         #[cfg(feature = "tracing")]
                         tracing::warn!(
                             "ConnectionFailed for {peer_node_id} conn {connection_id} without reconnect factory"
                         );
+                        // No factory — notify dataflows if all connections are dead
+                        if pool.live_connection_count() == 0 {
+                            let state = reg_state.lock().await;
+                            for (_df_id, reg) in state.registered.iter() {
+                                let _ = reg.error_tx.try_send(TransportError::ConnectionClosed);
+                            }
+                        }
                         continue;
                     };
 
+                    // Exponential backoff reconnect: 100ms → 200ms → 400ms → 800ms → 1.6s
+                    // (up to 5 attempts). If the peer is temporarily unavailable,
+                    // this gives ~3s total window for recovery.
+                    let max_attempts = 5u32;
                     let mut delay = Duration::from_millis(100);
                     let mut recovered = false;
-                    for attempt in 1..=3 {
+                    for attempt in 1..=max_attempts {
                         match Self::reconnect_connection(
                             &peer_node_id,
                             factory.clone(),
@@ -1103,21 +1117,30 @@ impl SharedPeerManager {
                             Err(error) => {
                                 #[cfg(feature = "tracing")]
                                 tracing::warn!(
-                                    "Reconnect attempt {attempt}/3 failed for peer {peer_node_id} after conn {connection_id} failed: {error}"
+                                    "Reconnect attempt {attempt}/{max_attempts} failed for peer {peer_node_id} after conn {connection_id} failed: {error}"
                                 );
-                                if attempt < 3 {
+                                if attempt < max_attempts {
                                     tokio::time::sleep(delay).await;
-                                    delay = std::cmp::min(delay.saturating_mul(2), Duration::from_secs(5));
+                                    delay = std::cmp::min(
+                                        delay.saturating_mul(2),
+                                        Duration::from_secs(5),
+                                    );
                                 }
                             }
                         }
                     }
 
-                    if !recovered {
+                    // Only notify dataflows after all reconnect attempts are
+                    // exhausted AND there are still no live connections.
+                    if !recovered && pool.live_connection_count() == 0 {
                         #[cfg(feature = "tracing")]
                         tracing::error!(
-                            "Failed to recover peer {peer_node_id} after conn {connection_id} failed"
+                            "Failed to recover peer {peer_node_id} after conn {connection_id} failed — notifying dataflows"
                         );
+                        let state = reg_state.lock().await;
+                        for (_df_id, reg) in state.registered.iter() {
+                            let _ = reg.error_tx.try_send(TransportError::ConnectionClosed);
+                        }
                     }
                 }
             }
@@ -1130,17 +1153,16 @@ impl SharedPeerManager {
     /// Deduplicates notifications (both writer and reader may report the same
     /// connection) — only processes each connection_id once.
     ///
-    /// When all connections are dead, notifies all registered dataflows with
-    /// a `TransportError::ConnectionClosed` error.
+    /// Does NOT immediately notify dataflows when all connections die — the
+    /// `scaling_event_handler` attempts reconnect first and only surfaces
+    /// `TransportError::ConnectionClosed` after reconnect is exhausted.
     async fn connection_monitor(
         mut failure_rx: tokio_mpsc::Receiver<usize>,
         pool: Arc<PeerPool>,
         writer_channels: Arc<TokioMutex<HashMap<usize, tokio_mpsc::Sender<Frame>>>>,
         scaling_driver: Arc<ScalingDriver>,
-        reg_state: Arc<TokioMutex<RegistrationState>>,
     ) {
         let mut processed = HashSet::new();
-        let mut all_failed_notified = false;
         while let Some(conn_id) = failure_rx.recv().await {
             if !processed.insert(conn_id) {
                 continue; // Already handled this connection
@@ -1160,29 +1182,13 @@ impl SharedPeerManager {
                 wc.remove(&conn_id);
             }
 
-            // Emit scaling event for external handling
+            // Emit scaling event — the scaling_event_handler will attempt
+            // reconnect and notify dataflows only if recovery fails.
             scaling_driver
                 .emit_event(ScalingEvent::ConnectionFailed {
                     connection_id: conn_id,
                 })
                 .await;
-
-            // Reset notification flag if connections were re-established
-            if live_count > 0 && all_failed_notified {
-                all_failed_notified = false;
-            }
-
-            // If all connections are dead, notify all registered dataflows
-            if live_count == 0 && !all_failed_notified {
-                all_failed_notified = true;
-                #[cfg(feature = "tracing")]
-                tracing::error!("All connections to peer are dead — notifying dataflows");
-
-                let state = reg_state.lock().await;
-                for (_df_id, reg) in state.registered.iter() {
-                    let _ = reg.error_tx.try_send(TransportError::ConnectionClosed);
-                }
-            }
         }
     }
 
