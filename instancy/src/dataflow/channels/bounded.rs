@@ -51,7 +51,7 @@ struct SharedState<T: Timestamp, D, M> {
 pub fn bounded_channel<T: Timestamp, D: Send + 'static, M: Send + 'static>(
     capacity: usize,
 ) -> (BoundedPush<T, D, M>, BoundedPull<T, D, M>) {
-    bounded_channel_with_wake(capacity, None)
+    bounded_channel_with_wake(capacity, None, None)
 }
 
 /// Creates a bounded channel pair with a [`WakeHandle`] for executor notification.
@@ -60,12 +60,18 @@ pub fn bounded_channel<T: Timestamp, D: Send + 'static, M: Send + 'static>(
 /// - Data is pushed into the channel (downstream may be runnable)
 /// - The sender is closed or dropped (downstream may see exhaustion)
 /// - Data is pulled from a full channel (upstream backpressure is relieved)
+///
+/// `initial_capacity` controls the initial physical allocation. When `None`,
+/// defaults to [`INITIAL_BUFFER_CAPACITY`] (4). Pass `Some(capacity)` to
+/// pre-allocate the full logical capacity for high-throughput channels.
 pub fn bounded_channel_with_wake<T: Timestamp, D: Send + 'static, M: Send + 'static>(
     capacity: usize,
     wake: Option<WakeHandle>,
+    initial_capacity: Option<usize>,
 ) -> (BoundedPush<T, D, M>, BoundedPull<T, D, M>) {
+    let phys = initial_capacity.unwrap_or(INITIAL_BUFFER_CAPACITY).min(capacity);
     let state = Arc::new(Mutex::new(SharedState {
-        buffer: VecDeque::with_capacity(INITIAL_BUFFER_CAPACITY),
+        buffer: VecDeque::with_capacity(phys),
         capacity,
     }));
     let closed = Arc::new(AtomicBool::new(false));

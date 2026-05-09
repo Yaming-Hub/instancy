@@ -76,7 +76,7 @@ struct ByteReceiver {
 
 fn byte_channel(capacity: usize) -> (ByteSender, ByteReceiver) {
     let state = Arc::new(Mutex::new(ByteChannelState {
-        buffer: VecDeque::with_capacity(4),
+        buffer: VecDeque::with_capacity(capacity.min(4)),
         capacity,
         closed: false,
     }));

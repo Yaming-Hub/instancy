@@ -141,6 +141,7 @@ struct BuilderState<T: Timestamp> {
     next_operator_index: usize,
     next_collect_index: usize,
     channel_capacity: usize,
+    channel_preallocate: Option<usize>,
     /// User-supplied typed context values, accessible via
     /// [`DataflowBuilder::get_context`]. Carried into [`LogicalDataflow`]
     /// on [`DataflowBuilder::build()`].
@@ -213,14 +214,37 @@ impl<T: Timestamp> BuilderState<T> {
 /// Configuration for the dataflow builder.
 #[derive(Debug, Clone)]
 pub struct DataflowBuilderConfig {
-    /// Default capacity for bounded channels between operators.
+    /// Maximum number of items a channel can buffer before backpressure
+    /// kicks in. When the buffer is full, upstream operators are stalled
+    /// until downstream consumes data.
+    ///
+    /// This is the *logical* limit — it controls flow control, not memory
+    /// allocation. Per-edge overrides are available via
+    /// [`Pipe::with_capacity`].
+    ///
+    /// Default: `1024`.
     pub channel_capacity: usize,
+
+    /// Initial physical allocation (in number of items) for channel buffers.
+    ///
+    /// When `Some(n)`, each channel pre-allocates space for `n` items at
+    /// creation time. Use this for high-throughput dataflows where you want
+    /// to avoid reallocation overhead during ramp-up.
+    ///
+    /// When `None` (the default), channels start with a small allocation
+    /// (4 items) and grow via doubling as data arrives. This is ideal for
+    /// dataflows with many edges where most channels are lightly used.
+    ///
+    /// The value is clamped to `channel_capacity` — pre-allocating more
+    /// than the backpressure limit would be wasteful.
+    pub channel_preallocate: Option<usize>,
 }
 
 impl Default for DataflowBuilderConfig {
     fn default() -> Self {
         Self {
             channel_capacity: 1024,
+            channel_preallocate: None,
         }
     }
 }
@@ -269,6 +293,7 @@ impl<T: Timestamp> DataflowBuilder<T> {
                 next_operator_index: 1,
                 next_collect_index: 0,
                 channel_capacity: config.channel_capacity,
+                channel_preallocate: config.channel_preallocate,
                 contexts: SharedContext::new(),
                 catch_panics: false,
                 builder_errors: Vec::new(),
@@ -1240,6 +1265,7 @@ impl<T: Timestamp, D: Clone + Send + 'static> Pipe<T, D> {
     {
         let name = name.into();
         let capacity = self.capacity_override.unwrap_or(1024);
+        let prealloc = self.state.borrow().channel_preallocate;
 
         let mut state = self.state.borrow_mut();
         let op_idx = state.allocate_operator_index();
@@ -1300,7 +1326,8 @@ impl<T: Timestamp, D: Clone + Send + 'static> Pipe<T, D> {
         let edge_idx = state.graph.edges().len() - 1;
         let chan_factory: ChannelFactory =
             channel_factory(move |_ctx, wake: Option<WakeHandle>| {
-                let (push, pull) = bounded_channel_with_wake::<T, D, ()>(capacity, wake.clone());
+                let (push, pull) =
+                    bounded_channel_with_wake::<T, D, ()>(capacity, wake.clone(), prealloc);
                 Ok((
                     Box::new(Box::new(push) as Box<dyn Push<T, D>>)
                         as Box<dyn std::any::Any + Send>,
@@ -1846,6 +1873,7 @@ impl<T: Timestamp, D: Clone + Send + 'static> Pipe<T, D> {
 
         let capacity1 = self.resolve_capacity();
         let capacity2 = other.resolve_capacity();
+        let prealloc = self.state.borrow().channel_preallocate;
 
         let name = name.into();
         let op_idx;
@@ -1950,7 +1978,7 @@ impl<T: Timestamp, D: Clone + Send + 'static> Pipe<T, D> {
             let channel_factory1: ChannelFactory =
                 channel_factory(move |_ctx, wake: Option<WakeHandle>| {
                     let (push, pull) =
-                        bounded_channel_with_wake::<T, D, ()>(capacity1, wake.clone());
+                        bounded_channel_with_wake::<T, D, ()>(capacity1, wake.clone(), prealloc);
                     Ok((
                         Box::new(Box::new(push) as Box<dyn Push<T, D>>)
                             as Box<dyn std::any::Any + Send>,
@@ -1963,7 +1991,7 @@ impl<T: Timestamp, D: Clone + Send + 'static> Pipe<T, D> {
             let channel_factory2: ChannelFactory =
                 channel_factory(move |_ctx, wake: Option<WakeHandle>| {
                     let (push, pull) =
-                        bounded_channel_with_wake::<T, D2, ()>(capacity2, wake.clone());
+                        bounded_channel_with_wake::<T, D2, ()>(capacity2, wake.clone(), prealloc);
                     Ok((
                         Box::new(Box::new(push) as Box<dyn Push<T, D2>>)
                             as Box<dyn std::any::Any + Send>,
@@ -2036,6 +2064,7 @@ impl<T: Timestamp, D: Clone + Send + 'static> Pipe<T, D> {
 
         // Resolve per-edge capacity for the enter edge; internal edges use global default.
         let enter_capacity = self.resolve_capacity();
+        let prealloc = self.state.borrow().channel_preallocate;
 
         // Phase 1: Allocate enter, feedback, concat operators in parent state.
         // We also create a separate inner BuilderState for the loop body.
@@ -2125,7 +2154,7 @@ impl<T: Timestamp, D: Clone + Send + 'static> Pipe<T, D> {
             let enter_edge_idx = state.graph.edges().len() - 1;
             let cap = enter_capacity;
             let cf: ChannelFactory = channel_factory(move |_ctx, wake: Option<WakeHandle>| {
-                let (push, pull) = bounded_channel_with_wake::<T, D, ()>(cap, wake.clone());
+                let (push, pull) = bounded_channel_with_wake::<T, D, ()>(cap, wake.clone(), prealloc);
                 Ok((
                     Box::new(Box::new(push) as Box<dyn Push<T, D>>)
                         as Box<dyn std::any::Any + Send>,
@@ -2302,7 +2331,7 @@ impl<T: Timestamp, D: Clone + Send + 'static> Pipe<T, D> {
             let cap = capacity;
             let cf1: ChannelFactory = channel_factory(move |_ctx, wake: Option<WakeHandle>| {
                 let (push, pull) =
-                    bounded_channel_with_wake::<PT<T, TInner>, D, ()>(cap, wake.clone());
+                    bounded_channel_with_wake::<PT<T, TInner>, D, ()>(cap, wake.clone(), prealloc);
                 Ok((
                     Box::new(Box::new(push) as Box<dyn Push<PT<T, TInner>, D>>)
                         as Box<dyn std::any::Any + Send>,
@@ -2315,7 +2344,7 @@ impl<T: Timestamp, D: Clone + Send + 'static> Pipe<T, D> {
             let cap = capacity;
             let cf2: ChannelFactory = channel_factory(move |_ctx, wake: Option<WakeHandle>| {
                 let (push, pull) =
-                    bounded_channel_with_wake::<PT<T, TInner>, D, ()>(cap, wake.clone());
+                    bounded_channel_with_wake::<PT<T, TInner>, D, ()>(cap, wake.clone(), prealloc);
                 Ok((
                     Box::new(Box::new(push) as Box<dyn Push<PT<T, TInner>, D>>)
                         as Box<dyn std::any::Any + Send>,
@@ -2377,6 +2406,7 @@ impl<T: Timestamp, D: Clone + Send + 'static> Pipe<T, D> {
                 next_operator_index: inner_start_idx,
                 next_collect_index: 0,
                 channel_capacity: capacity,
+                channel_preallocate: None,
                 contexts: parent_contexts,
                 catch_panics: false,
                 builder_errors: Vec::new(),
@@ -2522,7 +2552,7 @@ impl<T: Timestamp, D: Clone + Send + 'static> Pipe<T, D> {
             let cap = feedback_capacity;
             let cf_fb: ChannelFactory = channel_factory(move |_ctx, wake: Option<WakeHandle>| {
                 let (push, pull) =
-                    bounded_channel_with_wake::<PT<T, TInner>, D, ()>(cap, wake.clone());
+                    bounded_channel_with_wake::<PT<T, TInner>, D, ()>(cap, wake.clone(), prealloc);
                 Ok((
                     Box::new(Box::new(push) as Box<dyn Push<PT<T, TInner>, D>>)
                         as Box<dyn std::any::Any + Send>,
@@ -2575,7 +2605,7 @@ impl<T: Timestamp, D: Clone + Send + 'static> Pipe<T, D> {
             let cf_leave: ChannelFactory =
                 channel_factory(move |_ctx, wake: Option<WakeHandle>| {
                     let (push, pull) =
-                        bounded_channel_with_wake::<PT<T, TInner>, D, ()>(cap, wake.clone());
+                        bounded_channel_with_wake::<PT<T, TInner>, D, ()>(cap, wake.clone(), prealloc);
                     Ok((
                         Box::new(Box::new(push) as Box<dyn Push<PT<T, TInner>, D>>)
                             as Box<dyn std::any::Any + Send>,
@@ -2631,6 +2661,7 @@ impl<T: Timestamp, D: Clone + Send + 'static> Pipe<T, D> {
         let op_idx;
         let stage_id = StageId::new(0);
         let state_rc = Rc::clone(&streams[0].state);
+        let prealloc = state_rc.borrow().channel_preallocate;
 
         {
             let mut state = state_rc.borrow_mut();
@@ -2722,7 +2753,7 @@ impl<T: Timestamp, D: Clone + Send + 'static> Pipe<T, D> {
                 let chan_factory: ChannelFactory =
                     channel_factory(move |_ctx, wake: Option<WakeHandle>| {
                         let (push, pull) =
-                            bounded_channel_with_wake::<T, D, ()>(capacity, wake.clone());
+                            bounded_channel_with_wake::<T, D, ()>(capacity, wake.clone(), prealloc);
                         Ok((
                             Box::new(Box::new(push) as Box<dyn Push<T, D>>)
                                 as Box<dyn std::any::Any + Send>,
@@ -2765,6 +2796,7 @@ impl<T: Timestamp, D: Clone + Send + 'static> Pipe<T, D> {
         let collector = Arc::new(Mutex::new(Vec::new()));
         let op_idx;
         let capacity = self.resolve_capacity();
+        let prealloc = self.state.borrow().channel_preallocate;
 
         {
             let mut state = self.state.borrow_mut();
@@ -2930,7 +2962,7 @@ impl<T: Timestamp, D: Clone + Send + 'static> Pipe<T, D> {
             let chan_factory: ChannelFactory =
                 channel_factory(move |_ctx, wake: Option<WakeHandle>| {
                     let (push, pull) =
-                        bounded_channel_with_wake::<T, D, ()>(capacity, wake.clone());
+                        bounded_channel_with_wake::<T, D, ()>(capacity, wake.clone(), prealloc);
                     Ok((
                         Box::new(Box::new(push) as Box<dyn Push<T, D>>)
                             as Box<dyn std::any::Any + Send>,
@@ -3588,6 +3620,7 @@ impl<T: Timestamp, D: Clone + Send + 'static> Pipe<T, D> {
     ) -> Pipe<T, D> {
         let op_idx;
         let stage_id = StageId::new(0);
+        let prealloc = self.state.borrow().channel_preallocate;
 
         // Identity pass-through logic: forward all input to output unchanged.
         let wired_logic =
@@ -3695,7 +3728,7 @@ impl<T: Timestamp, D: Clone + Send + 'static> Pipe<T, D> {
             let chan_factory: ChannelFactory =
                 channel_factory(move |_ctx, wake: Option<WakeHandle>| {
                     let (push, pull) =
-                        bounded_channel_with_wake::<T, D, ()>(capacity, wake.clone());
+                        bounded_channel_with_wake::<T, D, ()>(capacity, wake.clone(), prealloc);
                     Ok((
                         Box::new(Box::new(push) as Box<dyn Push<T, D>>)
                             as Box<dyn std::any::Any + Send>,
@@ -3730,6 +3763,7 @@ impl<T: Timestamp, D: Clone + Send + 'static> Pipe<T, D> {
         let _name = name.into();
         let op_idx;
         let stage_id = StageId::new(0);
+        let prealloc = self.state.borrow().channel_preallocate;
 
         // Identity pass-through logic (same as exchange).
         let wired_logic =
@@ -3840,7 +3874,7 @@ impl<T: Timestamp, D: Clone + Send + 'static> Pipe<T, D> {
             let chan_factory: ChannelFactory =
                 channel_factory(move |_ctx, wake: Option<WakeHandle>| {
                     let (push, pull) =
-                        bounded_channel_with_wake::<T, D, ()>(capacity, wake.clone());
+                        bounded_channel_with_wake::<T, D, ()>(capacity, wake.clone(), prealloc);
                     Ok((
                         Box::new(Box::new(push) as Box<dyn Push<T, D>>)
                             as Box<dyn std::any::Any + Send>,
@@ -3908,6 +3942,7 @@ impl<T: Timestamp, D: Clone + Send + 'static> Pipe<T, D> {
         let name = name.into();
         let op_idx;
         let stage_id = StageId::new(0);
+        let prealloc = self.state.borrow().channel_preallocate;
 
         let mut logic = logic;
         let wired_logic =
@@ -4001,7 +4036,7 @@ impl<T: Timestamp, D: Clone + Send + 'static> Pipe<T, D> {
             let chan_factory: ChannelFactory =
                 channel_factory(move |_ctx, wake: Option<WakeHandle>| {
                     let (push, pull) =
-                        bounded_channel_with_wake::<T, D, ()>(capacity, wake.clone());
+                        bounded_channel_with_wake::<T, D, ()>(capacity, wake.clone(), prealloc);
                     Ok((
                         Box::new(Box::new(push) as Box<dyn Push<T, D>>)
                             as Box<dyn std::any::Any + Send>,
@@ -4035,6 +4070,7 @@ impl<T: Timestamp, D: Clone + Send + 'static> Pipe<T, D> {
         let name = name.into();
         let op_idx;
         let stage_id = StageId::new(0);
+        let prealloc = self.state.borrow().channel_preallocate;
 
         {
             let mut state = self.state.borrow_mut();
@@ -4115,7 +4151,7 @@ impl<T: Timestamp, D: Clone + Send + 'static> Pipe<T, D> {
             let chan_factory: ChannelFactory =
                 channel_factory(move |_ctx, wake: Option<WakeHandle>| {
                     let (push, pull) =
-                        bounded_channel_with_wake::<T, D, ()>(capacity, wake.clone());
+                        bounded_channel_with_wake::<T, D, ()>(capacity, wake.clone(), prealloc);
                     Ok((
                         Box::new(Box::new(push) as Box<dyn Push<T, D>>)
                             as Box<dyn std::any::Any + Send>,
@@ -4163,6 +4199,7 @@ impl<T: Timestamp, D: Clone + Send + 'static> Pipe<T, D> {
         let name = name.into();
         let op_idx;
         let stage_id = StageId::new(0);
+        let prealloc = self.state.borrow().channel_preallocate;
 
         {
             let mut state = self.state.borrow_mut();
@@ -4271,7 +4308,7 @@ impl<T: Timestamp, D: Clone + Send + 'static> Pipe<T, D> {
             let chan_factory: ChannelFactory =
                 channel_factory(move |_ctx, wake: Option<WakeHandle>| {
                     let (push, pull) =
-                        bounded_channel_with_wake::<T, D, ()>(capacity, wake.clone());
+                        bounded_channel_with_wake::<T, D, ()>(capacity, wake.clone(), prealloc);
                     Ok((
                         Box::new(Box::new(push) as Box<dyn Push<T, D>>)
                             as Box<dyn std::any::Any + Send>,
@@ -4305,6 +4342,7 @@ impl<T: Timestamp, D: Clone + Send + 'static> Pipe<T, D> {
         let name = name.into();
         let op_idx;
         let stage_id = StageId::new(0);
+        let prealloc = self.state.borrow().channel_preallocate;
         // Capture the tokio handle at builder time. This requires that the caller
         // is within a tokio runtime context (e.g., inside #[tokio::main] or an async task).
         let tokio_handle = tokio::runtime::Handle::try_current();
@@ -4412,7 +4450,7 @@ impl<T: Timestamp, D: Clone + Send + 'static> Pipe<T, D> {
             let chan_factory: ChannelFactory =
                 channel_factory(move |_ctx, wake: Option<WakeHandle>| {
                     let (push, pull) =
-                        bounded_channel_with_wake::<T, D, ()>(capacity, wake.clone());
+                        bounded_channel_with_wake::<T, D, ()>(capacity, wake.clone(), prealloc);
                     Ok((
                         Box::new(Box::new(push) as Box<dyn Push<T, D>>)
                             as Box<dyn std::any::Any + Send>,
