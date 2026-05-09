@@ -219,7 +219,7 @@ let handle = rt.spawn(dataflow, SpawnOptions::default())?;
 Use `SpawnOptions` to pick sync or async channel I/O, and pass it to multi-worker execution too:
 
 ```rust
-let handle = rt.spawn_multi("my-dataflow", 2, |worker_idx, builder| {
+let handle = rt.spawn_multi("my-dataflow", 2, |builder| {
     let input = builder.input::<i32>("data");
     input.map("double", |_t, x| x * 2).output("results");
     Ok(())
@@ -241,7 +241,7 @@ let topology = ClusterTopology::multi_node(vec![
 let handle = rt.spawn_cluster(
     "my-cluster-df", topology, "node-a", dataflow_id,
     connections, capacity, handshake_timeout,
-    |worker_idx, builder| { /* build graph */ Ok(()) },
+    |builder| { /* build graph */ Ok(()) },
     &tokio_handle,
 )?;
 ```

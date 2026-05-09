@@ -270,13 +270,13 @@ Each node runs the workers assigned to it by the topology. For example, with `to
 
 ```rust
 // Single-node: one stage, 4 workers (all local)
-runtime.spawn("my_df", 4, |worker_idx, builder| {
+runtime.spawn("my_df", 4, |builder| {
     builder.source(...).map(...).inspect(...);
 })
 
 // Cluster: one stage, 8 workers total (4 on each of 2 nodes)
 // Called on EVERY node with same topology + dataflow_id
-runtime.spawn_cluster("my_df", topology, local_node_id, df_id, connections, |worker_idx, builder| {
+runtime.spawn_cluster("my_df", topology, local_node_id, df_id, connections, |builder| {
     builder.source(...).map(...).inspect(...);
 })
 ```
@@ -374,7 +374,7 @@ stage parallelism. Workers only contain operators for stages they participate in
 ### API Change
 
 ```rust
-// v1 (current): worker_idx in build closure, manual parallelism
+// v1 (old): worker_idx in build closure, manual parallelism
 rt.spawn_multi("name", num_workers, |worker_idx, builder| {
     // worker_idx is a physical concern leaked into logical graph construction
     let input = builder.input::<i32>("data");
@@ -385,8 +385,8 @@ rt.spawn_multi("name", num_workers, |worker_idx, builder| {
     Ok(())
 }, SpawnOptions::new().per_stage_parallelism(true))
 
-// v2 (new): no worker_idx, parallelism derived from graph structure
-rt.spawn_dataflow("name", |builder| {
+// v2 (current): no worker_idx, parallelism derived from graph structure
+rt.spawn_multi("name", num_workers, |builder| {
     let input = builder.input::<i32>("data");
     input.exchange_to("scatter", 4, |v| *v as u64)
         .map("process", |_t, x| x * 2)
@@ -467,7 +467,7 @@ empty progress messages.
 
 ### Backward Compatibility
 
-- `spawn_multi(name, N, |worker_idx, builder| ..., opts)` remains unchanged
+- `spawn_multi(name, N, |builder| ..., opts)` remains unchanged
   for uniform parallelism (all stages same N). No per-stage materialization.
 - `spawn_dataflow(name, |builder| ..., opts)` is the new per-stage API.
   When all stages have the same parallelism (no exchange_to/gather), it

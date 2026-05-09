@@ -684,7 +684,7 @@ let rt = RuntimeHandle::new(RuntimeConfig::default()).unwrap();
 // Share a single Arc across all workers with with_context_arc
 let shared_cfg = Arc::new(WorkerConfig { multiplier: 10 });
 
-let mut handle = rt.spawn_multi("ctx-demo", 4, |worker_idx, builder| {
+let mut handle = rt.spawn_multi("ctx-demo", 4, |builder| {
     builder.with_context_arc(shared_cfg.clone());
     let cfg = builder.get_context::<WorkerConfig>().unwrap();
 
@@ -992,7 +992,7 @@ let rt = RuntimeHandle::new(RuntimeConfig {
     ..Default::default()
 }).unwrap();
 
-let mut multi = rt.spawn_multi("wordcount", 2, |worker_idx, builder| {
+let mut multi = rt.spawn_multi("wordcount", 2, |builder| {
     let input = builder.input::<String>("lines");
     input
         .flat_map("split", |_t, line| {
@@ -1160,7 +1160,7 @@ You don't need to wire up manual error forwarding — instancy handles it:
 use instancy::{RuntimeConfig, RuntimeHandle, SpawnOptions};
 
 let rt = RuntimeHandle::new(RuntimeConfig::default()).unwrap();
-let mut multi = rt.spawn_multi("my-pipeline", 4, |worker_idx, builder| {
+let mut multi = rt.spawn_multi("my-pipeline", 4, |builder| {
     let input = builder.input::<String>("data");
     input.map("process", |_t, line| {
         // If this panics in any worker, all 4 workers cancel promptly.
@@ -1354,7 +1354,7 @@ let mut cluster_handle = rt.spawn_cluster(
     connections,
     64,                // Channel capacity
     Duration::from_secs(10),  // Handshake timeout
-    |worker_idx, builder| {
+    |builder| {
         // Build the same graph on every node
         let input = builder.input::<String>("data");
         input
