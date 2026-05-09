@@ -83,6 +83,7 @@ pub trait EdgeMaterializer<T: Timestamp, D: Send + 'static>: Send {
     /// Used by callers to validate consistency and size shared structures
     /// (e.g., `SharedWakeRegistry`).
     fn num_workers(&self) -> usize {
+        // SAFETY: worker counts validated during graph construction
         assert_eq!(
             self.num_source_workers(),
             self.num_target_workers(),
@@ -109,6 +110,7 @@ pub trait EdgeMaterializer<T: Timestamp, D: Send + 'static>: Send {
         &mut self,
         worker_idx: usize,
     ) -> Result<(Vec<Box<dyn Push<T, D, ()>>>, Vec<Box<dyn Pull<T, D, ()>>>)> {
+        // SAFETY: worker counts validated during graph construction
         assert_eq!(
             self.num_source_workers(),
             self.num_target_workers(),

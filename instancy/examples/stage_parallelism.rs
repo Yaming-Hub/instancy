@@ -64,7 +64,7 @@ fn main() {
             "stage-par-demo",
             num_workers,
             |builder: &mut DataflowBuilder<u64>| {
-                let input = builder.input::<i32>("numbers");
+                let input = builder.input::<i32>("numbers").unwrap();
 
                 // Stage 0: transform pipeline (all fused into one task)
                 input
@@ -73,6 +73,7 @@ fn main() {
                     // Exchange creates a stage boundary. parallelism=2 means the
                     // downstream stage expects 2 workers (matches our spawn_multi).
                     .exchange_by_hash_to("partition", num_workers, |x: &i32| *x as u64)
+                    .unwrap()
                     // Stage 1: aggregate after exchange
                     .unary("sum_by_parity", {
                         let mut sums: HashMap<u64, HashMap<String, i64>> = HashMap::new();
@@ -96,7 +97,7 @@ fn main() {
                             Ok(())
                         }
                     })
-                    .output("results");
+                    .output("results").unwrap();
 
                 Ok(())
             },
@@ -144,13 +145,14 @@ fn main() {
         "stage-par-mismatch",
         num_workers,
         |builder: &mut DataflowBuilder<u64>| {
-            let input = builder.input::<i32>("data");
+            let input = builder.input::<i32>("data").unwrap();
             input
                 .map("inc", |_t, x| x + 1)
                 // Mismatch! Declaring parallelism=4 but only 2 workers exist.
                 .exchange_by_hash_to("repartition", 4, |x: &i32| *x as u64)
+                .unwrap()
                 .map("noop", |_t, x| x)
-                .output("out");
+                .output("out").unwrap();
             Ok(())
         },
         SpawnOptions::new().per_stage_parallelism(false), // also disables auto_parallelism
@@ -176,12 +178,12 @@ fn main() {
             "single-stage",
             num_workers,
             |builder: &mut DataflowBuilder<u64>| {
-                let input = builder.input::<i32>("vals");
+                let input = builder.input::<i32>("vals").unwrap();
                 // All operators stay in the same stage (pipeline edges only).
                 input
                     .map("triple", |_t, x| x * 3)
                     .map("add_one", |_t, x| x + 1)
-                    .output("out");
+                    .output("out").unwrap();
                 Ok(())
             },
             SpawnOptions::default(),

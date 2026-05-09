@@ -167,7 +167,9 @@ pub type OperatorFactory = Box<dyn OperatorBlueprint>;
 /// The resulting factory can be called exactly once during materialization;
 /// a second call returns an error.
 pub fn single_use_factory(
-    f: impl FnOnce(&WorkerContext, ChannelEndpoints) -> crate::Result<Box<dyn SchedulableOperator>> + Send + 'static,
+    f: impl FnOnce(&WorkerContext, ChannelEndpoints) -> crate::Result<Box<dyn SchedulableOperator>>
+    + Send
+    + 'static,
 ) -> OperatorFactory {
     Box::new(SingleUseFactory(Some(Box::new(f))))
 }
@@ -179,14 +181,23 @@ pub fn single_use_factory(
 /// an error.
 pub struct SingleUseFactory(
     Option<
-        Box<dyn FnOnce(&WorkerContext, ChannelEndpoints) -> crate::Result<Box<dyn SchedulableOperator>> + Send>,
+        Box<
+            dyn FnOnce(
+                    &WorkerContext,
+                    ChannelEndpoints,
+                ) -> crate::Result<Box<dyn SchedulableOperator>>
+                + Send,
+        >,
     >,
 );
 
 impl SingleUseFactory {
     /// Create a new single-use factory from a `FnOnce` closure.
     pub fn new(
-        factory: impl FnOnce(&WorkerContext, ChannelEndpoints) -> crate::Result<Box<dyn SchedulableOperator>>
+        factory: impl FnOnce(
+            &WorkerContext,
+            ChannelEndpoints,
+        ) -> crate::Result<Box<dyn SchedulableOperator>>
         + Send
         + 'static,
     ) -> Self {
@@ -205,10 +216,9 @@ impl OperatorBlueprint for SingleUseFactory {
         ctx: &WorkerContext,
         endpoints: ChannelEndpoints,
     ) -> crate::Result<Box<dyn SchedulableOperator>> {
-        let factory = self
-            .0
-            .take()
-            .ok_or_else(|| crate::Error::Custom("SingleUseFactory::build() called more than once".into()))?;
+        let factory = self.0.take().ok_or_else(|| {
+            crate::Error::Custom("SingleUseFactory::build() called more than once".into())
+        })?;
         factory(ctx, endpoints)
     }
 
@@ -232,13 +242,19 @@ impl OperatorBlueprint for SingleUseFactory {
 /// })
 /// ```
 pub struct ReplayableFactory(
-    Box<dyn FnMut(&WorkerContext, ChannelEndpoints) -> crate::Result<Box<dyn SchedulableOperator>> + Send>,
+    Box<
+        dyn FnMut(&WorkerContext, ChannelEndpoints) -> crate::Result<Box<dyn SchedulableOperator>>
+            + Send,
+    >,
 );
 
 impl ReplayableFactory {
     /// Create a new replayable factory from a `FnMut` closure.
     pub fn new(
-        factory: impl FnMut(&WorkerContext, ChannelEndpoints) -> crate::Result<Box<dyn SchedulableOperator>>
+        factory: impl FnMut(
+            &WorkerContext,
+            ChannelEndpoints,
+        ) -> crate::Result<Box<dyn SchedulableOperator>>
         + Send
         + 'static,
     ) -> Self {

@@ -89,7 +89,6 @@ pub enum ErrorPolicy {
     },
 }
 
-
 /// Configuration for a physical node (OS process) in the cluster.
 ///
 /// This is a **physical** concept — each `NodeConfig` corresponds to one

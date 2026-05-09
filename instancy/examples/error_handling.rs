@@ -24,15 +24,15 @@ fn main() {
     println!("Keeping only readings in the 32..=100°F operating range.\n");
 
     let builder = DataflowBuilder::<u64>::new("error_handling");
-    let input = builder.input::<Result<i32, String>>("sensor_readings");
+    let input = builder.input::<Result<i32, String>>("sensor_readings").unwrap();
     let processed = input
         .map_ok("celsius_to_f", |_t, c| c * 9 / 5 + 32)
         .filter_ok("valid_range", |_t, f| *f >= 32 && *f <= 100);
 
-    processed.clone().output("processed");
+    processed.clone().output("processed").unwrap();
     let (good, bad) = processed.branch_result("split");
-    good.output("results");
-    bad.output("errors");
+    good.output("results").unwrap();
+    bad.output("errors").unwrap();
 
     let dataflow = builder.build().expect("build failed");
     let rt = RuntimeHandle::new(RuntimeConfig::default()).expect("runtime creation failed");

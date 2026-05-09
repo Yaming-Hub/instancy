@@ -53,10 +53,7 @@ impl FrameSender {
     ///
     /// Returns `Ok(())` on success, `Err(TrySendError)` if the channel is
     /// full or closed.
-    pub fn try_send(
-        &self,
-        frame: Frame,
-    ) -> Result<(), tokio_mpsc::error::TrySendError<Frame>> {
+    pub fn try_send(&self, frame: Frame) -> Result<(), tokio_mpsc::error::TrySendError<Frame>> {
         match self {
             Self::Direct(tx) => tx.try_send(frame),
             Self::Shared(tx) => tx.try_send(frame),
@@ -64,10 +61,7 @@ impl FrameSender {
     }
 
     /// Send a frame asynchronously (waits if the channel is full).
-    pub async fn send(
-        &self,
-        frame: Frame,
-    ) -> Result<(), tokio_mpsc::error::SendError<Frame>> {
+    pub async fn send(&self, frame: Frame) -> Result<(), tokio_mpsc::error::SendError<Frame>> {
         match self {
             Self::Direct(tx) => tx.send(frame).await,
             Self::Shared(tx) => tx.send(frame).await,
@@ -113,9 +107,9 @@ impl ClusterTransport {
             Self::Dedicated(session) => session
                 .data_sender(peer_node_id)
                 .map(|tx| FrameSender::Direct(tx.clone())),
-            Self::Shared { session, .. } => session
-                .data_sender(peer_node_id)
-                .map(FrameSender::Shared),
+            Self::Shared { session, .. } => {
+                session.data_sender(peer_node_id).map(FrameSender::Shared)
+            }
         }
     }
 
@@ -147,9 +141,7 @@ impl ClusterTransport {
     /// Returns the set of peer node IDs this transport has connections to.
     pub fn peer_node_ids(&self) -> Vec<String> {
         match self {
-            Self::Dedicated(session) => {
-                session.peer_node_ids().map(|s| s.to_string()).collect()
-            }
+            Self::Dedicated(session) => session.peer_node_ids().map(|s| s.to_string()).collect(),
             Self::Shared { session, .. } => {
                 session.peer_node_ids().map(|s| s.to_string()).collect()
             }
@@ -164,11 +156,14 @@ impl ClusterTransport {
     /// calls return `None`.
     pub fn take_error_receivers(
         &mut self,
-    ) -> Option<HashMap<String, tokio_mpsc::Receiver<crate::communication::transport::TransportError>>>
-    {
+    ) -> Option<
+        HashMap<String, tokio_mpsc::Receiver<crate::communication::transport::TransportError>>,
+    > {
         match self {
             Self::Dedicated(_) => None,
-            Self::Shared { error_receivers, .. } => error_receivers.take(),
+            Self::Shared {
+                error_receivers, ..
+            } => error_receivers.take(),
         }
     }
 }
@@ -211,7 +206,8 @@ pub enum ClusterSpawnTransport<R = tokio::io::DuplexStream, W = tokio::io::Duple
     /// dataflow, preventing premature task abortion.
     Shared {
         /// Map of peer_node_id → SharedPeerManager (must match topology peers).
-        peer_managers: Arc<HashMap<String, crate::communication::shared_transport::SharedPeerManager>>,
+        peer_managers:
+            Arc<HashMap<String, crate::communication::shared_transport::SharedPeerManager>>,
         /// Buffer capacity for per-channel receivers.
         capacity: usize,
     },
@@ -224,7 +220,10 @@ impl<R, W> ClusterSpawnTransport<R, W> {
         connections: Vec<crate::communication::transport_session::PeerConnection<R, W>>,
         capacity: usize,
     ) -> Self {
-        Self::Dedicated { connections, capacity }
+        Self::Dedicated {
+            connections,
+            capacity,
+        }
     }
 }
 
@@ -235,9 +234,14 @@ impl ClusterSpawnTransport {
     /// The `Arc` ownership ensures peer managers stay alive for the duration of
     /// the dataflow, preventing the background tasks from being aborted prematurely.
     pub fn shared(
-        peer_managers: Arc<HashMap<String, crate::communication::shared_transport::SharedPeerManager>>,
+        peer_managers: Arc<
+            HashMap<String, crate::communication::shared_transport::SharedPeerManager>,
+        >,
         capacity: usize,
     ) -> Self {
-        Self::Shared { peer_managers, capacity }
+        Self::Shared {
+            peer_managers,
+            capacity,
+        }
     }
 }

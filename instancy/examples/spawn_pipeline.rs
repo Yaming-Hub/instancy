@@ -27,11 +27,11 @@ fn main() {
 
     // Phase 1: Build the logical dataflow graph (no execution yet)
     let builder = DataflowBuilder::<u64>::new("spawn_demo");
-    let input = builder.input::<i32>("numbers");
+    let input = builder.input::<i32>("numbers").unwrap();
     input
         .map("double", |_t, x| x * 2)
         .filter("div_by_3", |_t, x| x % 3 == 0)
-        .output("results");
+        .output("results").unwrap();
 
     let dataflow = builder.build().expect("build failed");
     println!(

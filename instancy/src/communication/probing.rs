@@ -42,6 +42,7 @@ use tokio::sync::mpsc;
 use tokio::time::Instant;
 
 use super::shared_pool::{ConnectionMetrics, PeerPool, ScalingDecision, SharedConnectionConfig};
+use crate::wire;
 
 // ─── Probe Wire Format ───────────────────────────────────────────────────────
 
@@ -120,10 +121,8 @@ impl ProbeMessage {
             PROBE_REPLY_TYPE => ProbeKind::Reply,
             _ => return None,
         };
-        let probe_seq =
-            u64::from_le_bytes(data[1..9].try_into().expect("probe sequence is 8 bytes"));
-        let send_ts =
-            u64::from_le_bytes(data[9..17].try_into().expect("probe timestamp is 8 bytes"));
+        let probe_seq = wire::read_u64(data, 1).ok()?;
+        let send_ts = wire::read_u64(data, 9).ok()?;
         Some(Self {
             kind,
             probe_seq,
@@ -514,7 +513,7 @@ mod tests {
             rtt_scale_up_threshold: Duration::from_millis(5),
             ..Default::default()
         };
-        let pool = PeerPool::new(1, config.clone());
+        let pool = PeerPool::new(1, config.clone()).unwrap();
 
         let (driver, mut event_rx) = ScalingDriver::new(config);
 
@@ -539,7 +538,7 @@ mod tests {
             rtt_scale_up_threshold: Duration::from_millis(10),
             ..Default::default()
         };
-        let pool = PeerPool::new(1, config.clone());
+        let pool = PeerPool::new(1, config.clone()).unwrap();
 
         let (driver, mut event_rx) = ScalingDriver::new(config);
 

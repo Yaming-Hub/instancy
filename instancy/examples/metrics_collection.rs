@@ -16,11 +16,11 @@ fn main() {
     let rt = RuntimeHandle::new(RuntimeConfig::default()).expect("runtime creation failed");
 
     let builder = DataflowBuilder::<u64>::new("metrics_collection");
-    let input = builder.input::<i32>("data");
+    let input = builder.input::<i32>("data").unwrap();
     input
         .map("double", |_t, x| x * 2)
         .filter("positive", |_t, x| *x > 0)
-        .output("results");
+        .output("results").unwrap();
 
     let dataflow = builder.build().expect("build failed");
     let mut handle = rt
@@ -43,7 +43,10 @@ fn main() {
     let results = receiver.collect_data();
     handle.join_blocking().expect("dataflow execution failed");
 
-    assert_eq!(results, vec![(0, vec![2, 6]), (1, vec![8, 12]), (2, vec![16, 18])]);
+    assert_eq!(
+        results,
+        vec![(0, vec![2, 6]), (1, vec![8, 12]), (2, vec![16, 18])]
+    );
 
     print_metrics_summary(metrics.as_ref());
 }
@@ -55,7 +58,10 @@ fn print_metrics_summary(metrics: &DataflowMetrics) {
     println!("=== Dataflow Metrics ===");
     println!("Wall time: {}", format_duration(metrics.wall_time()));
     println!("Total activations: {}", metrics.total_activations());
-    println!("Total CPU time: {}", format_duration(metrics.total_cpu_time()));
+    println!(
+        "Total CPU time: {}",
+        format_duration(metrics.total_cpu_time())
+    );
     println!(
         "Total records processed: {}",
         metrics.total_records_processed()
@@ -63,7 +69,10 @@ fn print_metrics_summary(metrics: &DataflowMetrics) {
 
     println!();
     println!("Per-operator breakdown:");
-    println!("  {:<20} {:>11}  {:>10}  {:>7}", "Operator", "Activations", "CPU Time", "Records");
+    println!(
+        "  {:<20} {:>11}  {:>10}  {:>7}",
+        "Operator", "Activations", "CPU Time", "Records"
+    );
     println!("  {}", "─".repeat(56));
 
     for op in operators {

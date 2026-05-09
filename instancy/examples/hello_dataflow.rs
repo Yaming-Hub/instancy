@@ -21,7 +21,7 @@ fn main() {
                 (1u64, vec!["from", "instancy!"]),
             ],
         )
-        .output("output");
+        .output("output").unwrap();
 
     let dataflow = builder.build().expect("graph construction failed");
 

@@ -14,12 +14,12 @@ use std::time::Duration;
 
 use tokio::net::{TcpListener, TcpStream};
 
-use instancy::communication::shared_pool::SharedConnectionConfig;
-use instancy::communication::shared_transport::{DynConnectionFactory, SharedPeerManager};
-use instancy::communication::ClusterSpawnTransport;
 use instancy::DataflowBuilder;
 use instancy::DataflowId;
 use instancy::Result;
+use instancy::communication::ClusterSpawnTransport;
+use instancy::communication::shared_pool::SharedConnectionConfig;
+use instancy::communication::shared_transport::{DynConnectionFactory, SharedPeerManager};
 use instancy::{ClusterTopology, NodeConfig};
 use instancy::{RuntimeConfig, RuntimeHandle};
 
@@ -93,8 +93,9 @@ async fn make_tcp_shared_managers(
         conns_b.push((rb, wb));
     }
 
-    let manager_a = SharedPeerManager::new("node-b".to_string(), config.clone(), conns_a, None, handle);
-    let manager_b = SharedPeerManager::new("node-a".to_string(), config, conns_b, None, handle);
+    let manager_a =
+        SharedPeerManager::new("node-b".to_string(), config.clone(), conns_a, None, handle).unwrap();
+    let manager_b = SharedPeerManager::new("node-a".to_string(), config, conns_b, None, handle).unwrap();
 
     let mut managers_a = HashMap::new();
     managers_a.insert("node-b".to_string(), manager_a);
@@ -127,9 +128,9 @@ async fn shared_two_nodes_no_exchange() {
 
     let build = |builder: &mut DataflowBuilder<u64>| -> Result<()> {
         builder
-            .input::<i32>("data")
+            .input::<i32>("data").unwrap()
             .map("double", |_t, x| x * 2)
-            .output("results");
+            .output("results").unwrap();
         Ok(())
     };
 
@@ -228,9 +229,9 @@ async fn shared_two_nodes_with_exchange() {
     let managers_b = Arc::new(managers_b);
 
     let build = |builder: &mut DataflowBuilder<u64>| -> Result<()> {
-        let input = builder.input::<i64>("data");
+        let input = builder.input::<i64>("data").unwrap();
         let exchanged = input.exchange("by_val", |x: &i64| *x as u64);
-        exchanged.map("identity", |_t, x| x).output("results");
+        exchanged.map("identity", |_t, x| x).output("results").unwrap();
         Ok(())
     };
 
@@ -325,11 +326,11 @@ async fn shared_multiple_dataflows_same_connections() {
     let managers_b = Arc::new(managers_b);
 
     let build = |builder: &mut DataflowBuilder<u64>| -> Result<()> {
-        let input = builder.input::<u64>("data");
+        let input = builder.input::<u64>("data").unwrap();
         input
             .exchange("route", |x: &u64| *x)
             .map("inc", |_t, x| x + 1)
-            .output("results");
+            .output("results").unwrap();
         Ok(())
     };
 
@@ -464,9 +465,9 @@ async fn shared_dropping_arc_after_spawn_does_not_kill_transport() {
     let managers_b = Arc::new(managers_b);
 
     let build = |builder: &mut DataflowBuilder<u64>| -> Result<()> {
-        let input = builder.input::<i64>("data");
+        let input = builder.input::<i64>("data").unwrap();
         let exchanged = input.exchange("by_val", |x: &i64| *x as u64);
-        exchanged.map("identity", |_t, x| x).output("results");
+        exchanged.map("identity", |_t, x| x).output("results").unwrap();
         Ok(())
     };
 
@@ -567,9 +568,9 @@ async fn shared_join_async_keeps_bridges_alive() {
     let managers_b = Arc::new(managers_b);
 
     let build = |builder: &mut DataflowBuilder<u64>| -> Result<()> {
-        let input = builder.input::<u64>("data");
+        let input = builder.input::<u64>("data").unwrap();
         let exchanged = input.exchange("by_val", |x: &u64| *x);
-        exchanged.map("inc", |_t, x| x + 1).output("results");
+        exchanged.map("inc", |_t, x| x + 1).output("results").unwrap();
         Ok(())
     };
 
@@ -632,13 +633,12 @@ async fn shared_join_async_keeps_bridges_alive() {
     drop(sb);
 
     // Use the async join() path — this was previously broken.
-    let completion_a = ca.join();
-    let completion_b = cb.join();
+    let completion_a = ca.join().unwrap();
+    let completion_b = cb.join().unwrap();
 
-    let (res_a, res_b) = tokio::time::timeout(
-        TEST_TIMEOUT,
-        async { tokio::join!(completion_a, completion_b) },
-    )
+    let (res_a, res_b) = tokio::time::timeout(TEST_TIMEOUT, async {
+        tokio::join!(completion_a, completion_b)
+    })
     .await
     .expect("cluster did not complete within timeout");
     res_a.unwrap();
@@ -769,12 +769,11 @@ async fn shared_reconnect_after_transient_network_failure() {
         vec![(reader, writer)],
         Some(factory),
         &rt,
-    );
+    ).unwrap();
 
     // ---------- register a dataflow and verify initial data flow ----------
     let df_id = DataflowId::new();
-    let (mut receivers, _error_rx) =
-        manager.register_dataflow(df_id, &[1], 64).await;
+    let (mut receivers, _error_rx) = manager.register_dataflow(df_id, &[1], 64).await;
     let data_rx = receivers.get_mut(&1).unwrap();
 
     // Send a frame — the echo server reflects it back
@@ -836,4 +835,3 @@ async fn shared_reconnect_after_transient_network_failure() {
     echo_task.abort();
     drop(manager);
 }
-

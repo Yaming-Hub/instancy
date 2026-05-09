@@ -20,16 +20,15 @@ mod tests {
         let stage = StageId::new(0);
 
         // Create operators
-        let mut unary =
-            UnaryOperator::<u64, i32, i32>::new("double", 0, stage, |input, output| {
-                while let Some((time, data)) = input.next() {
-                    let mut session = output.session(time);
-                    for item in data {
-                        session.give(item * 2);
-                    }
+        let mut unary = UnaryOperator::<u64, i32, i32>::new("double", 0, stage, |input, output| {
+            while let Some((time, data)) = input.next() {
+                let mut session = output.session(time);
+                for item in data {
+                    session.give(item * 2);
                 }
-                Ok(())
-            });
+            }
+            Ok(())
+        });
 
         let collected = Arc::new(Mutex::new(Vec::new()));
         let collected_clone = Arc::clone(&collected);
@@ -467,9 +466,7 @@ mod tests {
         let stage = StageId::new(0);
 
         let mut delay =
-            DelayBatchOperator::<u64, i32, _>::new("delay_by_10", 0, stage, |time: &u64| {
-                time + 10
-            });
+            DelayBatchOperator::<u64, i32, _>::new("delay_by_10", 0, stage, |time: &u64| time + 10);
 
         let collected = Arc::new(Mutex::new(Vec::new()));
         let collected_clone = Arc::clone(&collected);
@@ -579,6 +576,7 @@ mod tests {
         let handle = stream
             .exchange(|r: &(u64, i32)| r.0)
             .exchange_to(16, |r: &(u64, i32)| r.0)
+            .unwrap()
             .unary("process", |input, output| {
                 while let Some((time, data)) = input.next() {
                     let mut session = output.session(time);
@@ -612,6 +610,7 @@ mod tests {
         // Chain: rebalance_to(8) → broadcast → broadcast_local → inspect
         let _output = stream
             .rebalance_to(8)
+            .unwrap()
             .broadcast()
             .broadcast_local()
             .inspect("observe", |_time, _data| {});
@@ -640,7 +639,7 @@ mod tests {
         assert_eq!(s1.stage_id(), r0);
 
         // exchange_to different parallelism → new stage
-        let s2 = s1.exchange_to(8, |x: &i32| *x);
+        let s2 = s1.exchange_to(8, |x: &i32| *x).unwrap();
         let r1 = s2.stage_id();
         assert_ne!(r1, r0);
         assert_eq!(scope.stage_parallelism(r1), Some(8));
@@ -656,7 +655,7 @@ mod tests {
         assert_eq!(scope.stage_parallelism(r2), Some(1));
 
         // rebalance_to(4) from gather → new stage
-        let s5 = s4.rebalance_to(4);
+        let s5 = s4.rebalance_to(4).unwrap();
         let r3 = s5.stage_id();
         assert_ne!(r3, r2);
         assert_eq!(scope.stage_parallelism(r3), Some(4));

@@ -45,6 +45,8 @@ use std::time::Duration;
 
 use tokio::sync::Mutex;
 
+use crate::error::LockResultExt;
+
 // ─── Configuration ───────────────────────────────────────────────────────────
 
 /// Configuration for the shared connection pool.
@@ -374,17 +376,21 @@ impl PeerPool {
     /// # Panics
     ///
     /// Panics if `config.min_connections < 1` or `config.min_connections > config.max_connections`.
-    pub fn new(initial_connections: usize, config: SharedConnectionConfig) -> Self {
-        assert!(
-            config.min_connections >= 1,
-            "min_connections must be at least 1"
-        );
-        assert!(
-            config.min_connections <= config.max_connections,
-            "min_connections ({}) must be <= max_connections ({})",
-            config.min_connections,
-            config.max_connections
-        );
+    pub fn new(
+        initial_connections: usize,
+        config: SharedConnectionConfig,
+    ) -> crate::Result<Self> {
+        if config.min_connections < 1 {
+            return Err(crate::Error::InvalidConfig(
+                "min_connections must be at least 1".into(),
+            ));
+        }
+        if config.min_connections > config.max_connections {
+            return Err(crate::Error::InvalidConfig(format!(
+                "min_connections ({}) must be <= max_connections ({})",
+                config.min_connections, config.max_connections
+            )));
+        }
 
         let count = initial_connections
             .max(config.min_connections)
@@ -397,12 +403,12 @@ impl PeerPool {
             );
         }
 
-        Self {
+        Ok(Self {
             next_id: AtomicUsize::new(count),
             connections: RwLock::new(connections),
             config,
             cooldown_start: Mutex::new(None),
-        }
+        })
     }
 
     /// Select a connection and atomically reserve it.
@@ -422,14 +428,17 @@ impl PeerPool {
     /// The caller must call `dequeue()` after the frame has been written,
     /// or `rollback_reservation()` if the send could not be completed.
     pub fn select_and_reserve(&self) -> Option<Arc<ConnectionMetrics>> {
-        let live: Vec<_> = self
-            .connections
-            .read()
-            .expect("peer pool connections lock poisoned")
-            .values()
-            .filter(|c| c.is_alive())
-            .cloned()
-            .collect();
+        let live: Vec<_> = match self.connections.read().or_poison("peer pool connections") {
+            Ok(connections) => connections
+                .values()
+                .filter(|c| c.is_alive())
+                .cloned()
+                .collect(),
+            Err(_) => {
+                // TODO: propagate poisoned pool locks once these accessors can return Result.
+                return None;
+            }
+        };
 
         if live.is_empty() {
             return None;
@@ -444,11 +453,13 @@ impl PeerPool {
                     let (pending, rtt) = c.load_score();
                     (pending, std::cmp::Reverse(rtt))
                 })
+                // SAFETY: emptiness checked above while holding the same lock
                 .expect("live connection set is non-empty after empty check")
         } else {
             // High load — spread across connections.
             live.into_iter()
                 .min_by_key(|c| c.load_score())
+                // SAFETY: emptiness checked above while holding the same lock
                 .expect("live connection set is non-empty after empty check")
         };
 
@@ -462,9 +473,14 @@ impl PeerPool {
     /// concurrent senders all choosing the same connection.
     /// This method is useful for read-only inspection or diagnostics.
     pub fn select_connection(&self) -> Option<Arc<ConnectionMetrics>> {
-        self.connections
-            .read()
-            .expect("peer pool connections lock poisoned")
+        let connections = match self.connections.read().or_poison("peer pool connections") {
+            Ok(connections) => connections,
+            Err(_) => {
+                // TODO: propagate poisoned pool locks once these accessors can return Result.
+                return None;
+            }
+        };
+        connections
             .values()
             .filter(|c| c.is_alive())
             .min_by_key(|c| c.load_score())
@@ -476,9 +492,14 @@ impl PeerPool {
         &self,
         exclude: &HashSet<usize>,
     ) -> Option<Arc<ConnectionMetrics>> {
-        self.connections
-            .read()
-            .expect("peer pool connections lock poisoned")
+        let connections = match self.connections.read().or_poison("peer pool connections") {
+            Ok(connections) => connections,
+            Err(_) => {
+                // TODO: propagate poisoned pool locks once these accessors can return Result.
+                return None;
+            }
+        };
+        connections
             .values()
             .filter(|c| c.is_alive() && !exclude.contains(&c.id))
             .min_by_key(|c| c.load_score())
@@ -487,38 +508,50 @@ impl PeerPool {
 
     /// Count of live (non-dead) connections.
     pub fn live_connection_count(&self) -> usize {
-        self.connections
-            .read()
-            .expect("peer pool connections lock poisoned")
-            .values()
-            .filter(|c| c.is_alive())
-            .count()
+        let connections = match self.connections.read().or_poison("peer pool connections") {
+            Ok(connections) => connections,
+            Err(_) => {
+                // TODO: propagate poisoned pool locks once these accessors can return Result.
+                return 0;
+            }
+        };
+        connections.values().filter(|c| c.is_alive()).count()
     }
 
     /// Get metrics for a specific connection by ID.
     pub fn connection(&self, id: usize) -> Option<Arc<ConnectionMetrics>> {
-        self.connections
-            .read()
-            .expect("peer pool connections lock poisoned")
-            .get(&id)
-            .cloned()
+        let connections = match self.connections.read().or_poison("peer pool connections") {
+            Ok(connections) => connections,
+            Err(_) => {
+                // TODO: propagate poisoned pool locks once these accessors can return Result.
+                return None;
+            }
+        };
+        connections.get(&id).cloned()
     }
 
     /// Current number of tracked connections.
     pub fn connection_count(&self) -> usize {
-        self.connections
-            .read()
-            .expect("peer pool connections lock poisoned")
-            .len()
+        let connections = match self.connections.read().or_poison("peer pool connections") {
+            Ok(connections) => connections,
+            Err(_) => {
+                // TODO: propagate poisoned pool locks once these accessors can return Result.
+                return 0;
+            }
+        };
+        connections.len()
     }
 
     /// Add a new connection to the pool. Returns its metrics handle,
     /// or `None` if already at `max_connections` live connections.
     pub fn add_connection(&self) -> Option<Arc<ConnectionMetrics>> {
-        let mut connections = self
-            .connections
-            .write()
-            .expect("peer pool connections lock poisoned");
+        let mut connections = match self.connections.write().or_poison("peer pool connections") {
+            Ok(connections) => connections,
+            Err(_) => {
+                // TODO: propagate poisoned pool locks once these accessors can return Result.
+                return None;
+            }
+        };
         let live_count = connections.values().filter(|c| c.is_alive()).count();
         if live_count >= self.config.max_connections {
             return None;
@@ -534,15 +567,19 @@ impl PeerPool {
     /// Returns true if removed, false if ID not found or removing it would put
     /// the live connection count below `min_connections`.
     pub fn remove_connection(&self, id: usize) -> bool {
-        let mut connections = self
-            .connections
-            .write()
-            .expect("peer pool connections lock poisoned");
+        let mut connections = match self.connections.write().or_poison("peer pool connections") {
+            Ok(connections) => connections,
+            Err(_) => {
+                // TODO: propagate poisoned pool locks once these accessors can return Result.
+                return false;
+            }
+        };
         let Some(metrics) = connections.get(&id) else {
             return false;
         };
         if metrics.is_alive()
-            && connections.values().filter(|conn| conn.is_alive()).count() <= self.config.min_connections
+            && connections.values().filter(|conn| conn.is_alive()).count()
+                <= self.config.min_connections
         {
             return false;
         }
@@ -559,14 +596,17 @@ impl PeerPool {
     pub async fn evaluate_scaling(&self) -> ScalingDecision {
         let threshold_up = self.config.rtt_scale_up_threshold;
         let threshold_down = self.config.rtt_scale_down_threshold;
-        let live: Vec<_> = self
-            .connections
-            .read()
-            .expect("peer pool connections lock poisoned")
-            .values()
-            .filter(|c| c.is_alive())
-            .cloned()
-            .collect();
+        let live: Vec<_> = match self.connections.read().or_poison("peer pool connections") {
+            Ok(connections) => connections
+                .values()
+                .filter(|c| c.is_alive())
+                .cloned()
+                .collect(),
+            Err(_) => {
+                // TODO: propagate poisoned pool locks once evaluate_scaling can return Result.
+                return ScalingDecision::None;
+            }
+        };
         let live_count = live.len();
 
         // Check if any live connection with measurements exceeds the scale-up threshold
@@ -608,6 +648,7 @@ impl PeerPool {
 
         let all_underloaded = live.iter().all(|c| {
             c.average_rtt()
+                // SAFETY: RTT is recorded for every connection upon creation
                 .expect("all live connections have RTT measurements")
                 < threshold_down
         });
@@ -646,10 +687,14 @@ impl PeerPool {
 
     /// Get a snapshot of all connection metrics for diagnostics.
     pub fn metrics_snapshot(&self) -> Vec<ConnectionSnapshot> {
-        let mut snaps: Vec<_> = self
-            .connections
-            .read()
-            .expect("peer pool connections lock poisoned")
+        let connections = match self.connections.read().or_poison("peer pool connections") {
+            Ok(connections) => connections,
+            Err(_) => {
+                // TODO: propagate poisoned pool locks once these accessors can return Result.
+                return Vec::new();
+            }
+        };
+        let mut snaps: Vec<_> = connections
             .values()
             .map(|c| ConnectionSnapshot {
                 id: c.id,
@@ -750,7 +795,7 @@ mod tests {
             max_connections: 8,
             ..Default::default()
         };
-        let pool = PeerPool::new(3, config);
+        let pool = PeerPool::new(3, config).unwrap();
 
         // Connection 0: 3 pending
         pool.connection(0).unwrap().enqueue();
@@ -771,7 +816,7 @@ mod tests {
             max_connections: 8,
             ..Default::default()
         };
-        let pool = PeerPool::new(2, config);
+        let pool = PeerPool::new(2, config).unwrap();
 
         // Both have 0 pending, but different RTT
         pool.connection(0)
@@ -793,7 +838,7 @@ mod tests {
             rtt_scale_up_threshold: Duration::from_millis(5),
             ..Default::default()
         };
-        let pool = PeerPool::new(1, config);
+        let pool = PeerPool::new(1, config).unwrap();
 
         // No RTT yet — no scaling
         assert_eq!(pool.evaluate_scaling().await, ScalingDecision::None);
@@ -813,7 +858,7 @@ mod tests {
             rtt_scale_up_threshold: Duration::from_millis(5),
             ..Default::default()
         };
-        let pool = PeerPool::new(2, config);
+        let pool = PeerPool::new(2, config).unwrap();
 
         pool.connection(0)
             .unwrap()
@@ -831,7 +876,7 @@ mod tests {
             cooldown_period: Duration::from_millis(10),
             ..Default::default()
         };
-        let pool = PeerPool::new(2, config);
+        let pool = PeerPool::new(2, config).unwrap();
 
         // Both connections have low RTT
         pool.connection(0)
@@ -861,7 +906,7 @@ mod tests {
             cooldown_period: Duration::from_millis(1),
             ..Default::default()
         };
-        let pool = PeerPool::new(1, config);
+        let pool = PeerPool::new(1, config).unwrap();
         pool.connection(0)
             .unwrap()
             .record_rtt(Duration::from_millis(1));
@@ -880,7 +925,7 @@ mod tests {
             cooldown_period: Duration::from_millis(1),
             ..Default::default()
         };
-        let pool = PeerPool::new(2, config);
+        let pool = PeerPool::new(2, config).unwrap();
         // No RTT recorded on either connection
 
         tokio::time::sleep(Duration::from_millis(5)).await;
@@ -895,7 +940,7 @@ mod tests {
             max_connections: 4,
             ..Default::default()
         };
-        let pool = PeerPool::new(1, config);
+        let pool = PeerPool::new(1, config).unwrap();
         assert_eq!(pool.connection_count(), 1);
 
         let new_conn = pool.add_connection().unwrap();
@@ -921,7 +966,7 @@ mod tests {
             max_connections: 2,
             ..Default::default()
         };
-        let pool = PeerPool::new(2, config);
+        let pool = PeerPool::new(2, config).unwrap();
         assert_eq!(pool.connection_count(), 2);
 
         // Already at max — returns None
@@ -935,7 +980,7 @@ mod tests {
             max_connections: 8,
             ..Default::default()
         };
-        let pool = PeerPool::new(2, config);
+        let pool = PeerPool::new(2, config).unwrap();
 
         // Connection 0: load up
         pool.connection(0).unwrap().enqueue();
@@ -954,7 +999,7 @@ mod tests {
             max_connections: 8,
             ..Default::default()
         };
-        let pool = PeerPool::new(3, config);
+        let pool = PeerPool::new(3, config).unwrap();
 
         // All connections idle (total_pending=0 < 3 connections) → low-load packing.
         // First select should pick ONE connection and keep using it.
@@ -987,7 +1032,7 @@ mod tests {
             max_connections: 8,
             ..Default::default()
         };
-        let pool = PeerPool::new(3, config);
+        let pool = PeerPool::new(3, config).unwrap();
 
         // Remove middle connection (id=1)
         pool.remove_connection(1);
@@ -1001,7 +1046,7 @@ mod tests {
     #[test]
     fn peer_pool_metrics_snapshot() {
         let config = SharedConnectionConfig::default();
-        let pool = PeerPool::new(2, config);
+        let pool = PeerPool::new(2, config).unwrap();
 
         pool.connection(0).unwrap().enqueue();
         pool.connection(0)
@@ -1047,7 +1092,7 @@ mod tests {
             idle_timeout: Some(Duration::from_millis(10)),
             ..Default::default()
         };
-        let pool = PeerPool::new(2, config);
+        let pool = PeerPool::new(2, config).unwrap();
 
         // Both connections are freshly created — not yet idle
         assert_eq!(pool.evaluate_scaling().await, ScalingDecision::None);
@@ -1071,7 +1116,7 @@ mod tests {
             idle_timeout: Some(Duration::from_millis(20)),
             ..Default::default()
         };
-        let pool = PeerPool::new(2, config);
+        let pool = PeerPool::new(2, config).unwrap();
 
         // Wait a bit but keep one connection active
         tokio::time::sleep(Duration::from_millis(25)).await;
@@ -1094,7 +1139,7 @@ mod tests {
             idle_timeout: Some(Duration::from_millis(10)),
             ..Default::default()
         };
-        let pool = PeerPool::new(1, config);
+        let pool = PeerPool::new(1, config).unwrap();
 
         tokio::time::sleep(Duration::from_millis(15)).await;
 
@@ -1110,7 +1155,7 @@ mod tests {
             idle_timeout: None,
             ..Default::default()
         };
-        let pool = PeerPool::new(2, config);
+        let pool = PeerPool::new(2, config).unwrap();
 
         tokio::time::sleep(Duration::from_millis(15)).await;
 
@@ -1125,7 +1170,7 @@ mod tests {
             max_connections: 4,
             ..Default::default()
         };
-        let pool = PeerPool::new(3, config);
+        let pool = PeerPool::new(3, config).unwrap();
 
         // Mark connection 0 as dead
         pool.connection(0).unwrap().mark_dead();
@@ -1139,7 +1184,7 @@ mod tests {
     #[test]
     fn mark_dead_idempotent() {
         let config = SharedConnectionConfig::default();
-        let pool = PeerPool::new(1, config);
+        let pool = PeerPool::new(1, config).unwrap();
 
         let conn = pool.connection(0).unwrap();
         assert!(conn.is_alive());
@@ -1155,7 +1200,7 @@ mod tests {
     #[test]
     fn select_and_reserve_returns_none_all_dead() {
         let config = SharedConnectionConfig::default();
-        let pool = PeerPool::new(2, config);
+        let pool = PeerPool::new(2, config).unwrap();
 
         pool.connection(0).unwrap().mark_dead();
         pool.connection(1).unwrap().mark_dead();
@@ -1168,7 +1213,7 @@ mod tests {
     #[test]
     fn rollback_reservation_decrements_pending() {
         let config = SharedConnectionConfig::default();
-        let pool = PeerPool::new(1, config);
+        let pool = PeerPool::new(1, config).unwrap();
 
         let conn = pool.connection(0).unwrap();
         conn.enqueue();
@@ -1187,7 +1232,7 @@ mod tests {
     #[test]
     fn select_connection_excluding_skips_specified() {
         let config = SharedConnectionConfig::default();
-        let pool = PeerPool::new(3, config);
+        let pool = PeerPool::new(3, config).unwrap();
 
         let mut exclude = HashSet::new();
         exclude.insert(0);

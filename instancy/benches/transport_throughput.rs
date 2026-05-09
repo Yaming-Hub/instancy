@@ -5,7 +5,7 @@
 
 use std::time::Duration;
 
-use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
+use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
 use tokio::runtime::Runtime;
 
 use instancy::communication::shared_pool::SharedConnectionConfig;
@@ -81,7 +81,10 @@ fn bench_dedicated_single_dataflow(c: &mut Criterion) {
                             match tokio::io::AsyncReadExt::read(&mut reader, &mut buf).await {
                                 Ok(0) => break,
                                 Ok(n) => {
-                                    if tokio::io::AsyncWriteExt::write_all(&mut writer, &buf[..n]).await.is_err() {
+                                    if tokio::io::AsyncWriteExt::write_all(&mut writer, &buf[..n])
+                                        .await
+                                        .is_err()
+                                    {
                                         break;
                                     }
                                 }
@@ -102,11 +105,18 @@ fn bench_dedicated_single_dataflow(c: &mut Criterion) {
                     };
 
                     let handle = tokio::runtime::Handle::current();
-                    let (session, mut receivers) =
-                        TransportSession::new(dataflow_id, vec![conn], &data_channels, &[], 4096, &handle);
+                    let (session, mut receivers) = TransportSession::new(
+                        dataflow_id,
+                        vec![conn],
+                        &data_channels,
+                        &[],
+                        4096,
+                        &handle,
+                    );
 
                     let peer_rxs = receivers.remove("peer").unwrap();
-                    let mut data_rx = peer_rxs.into_iter()
+                    let mut data_rx = peer_rxs
+                        .into_iter()
                         .find(|(id, _)| *id == CHANNEL_ID)
                         .map(|(_, rx)| rx)
                         .unwrap();
@@ -172,7 +182,10 @@ fn bench_shared_single_dataflow(c: &mut Criterion) {
                             match tokio::io::AsyncReadExt::read(&mut reader, &mut buf).await {
                                 Ok(0) => break,
                                 Ok(n) => {
-                                    if tokio::io::AsyncWriteExt::write_all(&mut writer, &buf[..n]).await.is_err() {
+                                    if tokio::io::AsyncWriteExt::write_all(&mut writer, &buf[..n])
+                                        .await
+                                        .is_err()
+                                    {
                                         break;
                                     }
                                 }
@@ -190,7 +203,7 @@ fn bench_shared_single_dataflow(c: &mut Criterion) {
                         vec![(local_read, local_write)],
                         None,
                         &handle,
-                    );
+                    ).unwrap();
 
                     let (mut receivers, _error_rx) = manager
                         .register_dataflow(dataflow_id, &[CHANNEL_ID], 4096)
@@ -266,7 +279,13 @@ fn bench_dedicated_multi_dataflow(c: &mut Criterion) {
                                 match tokio::io::AsyncReadExt::read(&mut reader, &mut buf).await {
                                     Ok(0) => break,
                                     Ok(n) => {
-                                        if tokio::io::AsyncWriteExt::write_all(&mut writer, &buf[..n]).await.is_err() {
+                                        if tokio::io::AsyncWriteExt::write_all(
+                                            &mut writer,
+                                            &buf[..n],
+                                        )
+                                        .await
+                                        .is_err()
+                                        {
                                             break;
                                         }
                                     }
@@ -286,11 +305,18 @@ fn bench_dedicated_multi_dataflow(c: &mut Criterion) {
                             writer: local_write,
                         };
 
-                        let (session, mut receivers) =
-                            TransportSession::new(dataflow_id, vec![conn], &data_channels, &[], 4096, &handle);
+                        let (session, mut receivers) = TransportSession::new(
+                            dataflow_id,
+                            vec![conn],
+                            &data_channels,
+                            &[],
+                            4096,
+                            &handle,
+                        );
 
                         let peer_rxs = receivers.remove("peer").unwrap();
-                        let mut data_rx = peer_rxs.into_iter()
+                        let mut data_rx = peer_rxs
+                            .into_iter()
                             .find(|(id, _)| *id == CHANNEL_ID)
                             .map(|(_, rx)| rx)
                             .unwrap();
@@ -387,7 +413,13 @@ fn bench_shared_multi_dataflow(c: &mut Criterion) {
                                 match tokio::io::AsyncReadExt::read(&mut reader, &mut buf).await {
                                     Ok(0) => break,
                                     Ok(n) => {
-                                        if tokio::io::AsyncWriteExt::write_all(&mut writer, &buf[..n]).await.is_err() {
+                                        if tokio::io::AsyncWriteExt::write_all(
+                                            &mut writer,
+                                            &buf[..n],
+                                        )
+                                        .await
+                                        .is_err()
+                                        {
                                             break;
                                         }
                                     }
@@ -403,7 +435,7 @@ fn bench_shared_multi_dataflow(c: &mut Criterion) {
                         connections,
                         None,
                         &handle,
-                    );
+                    ).unwrap();
 
                     let mut send_tasks = Vec::new();
                     let mut recv_tasks = Vec::new();
@@ -496,7 +528,13 @@ fn bench_shared_scaling_connections(c: &mut Criterion) {
                                 match tokio::io::AsyncReadExt::read(&mut reader, &mut buf).await {
                                     Ok(0) => break,
                                     Ok(n) => {
-                                        if tokio::io::AsyncWriteExt::write_all(&mut writer, &buf[..n]).await.is_err() {
+                                        if tokio::io::AsyncWriteExt::write_all(
+                                            &mut writer,
+                                            &buf[..n],
+                                        )
+                                        .await
+                                        .is_err()
+                                        {
                                             break;
                                         }
                                     }
@@ -512,7 +550,7 @@ fn bench_shared_scaling_connections(c: &mut Criterion) {
                         connections,
                         None,
                         &handle,
-                    );
+                    ).unwrap();
 
                     let (mut receivers, _err_rx) = manager
                         .register_dataflow(dataflow_id, &[CHANNEL_ID], 4096)
@@ -564,4 +602,3 @@ criterion_group!(
     bench_shared_scaling_connections,
 );
 criterion_main!(benches);
-

@@ -13,7 +13,7 @@
 
 use std::hint::black_box;
 
-use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
+use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
 use tokio::runtime::Runtime;
 
 use instancy::{DataflowBuilder, RuntimeConfig, RuntimeHandle, SpawnOptions};
@@ -48,7 +48,9 @@ fn bench_pipeline_throughput(c: &mut Criterion) {
                         .map("add1", |_t, x| x + 1)
                         .map("mul2", |_t, x| x * 2)
                         .map("sub1", |_t, x| x - 1)
-                        .for_each("sink", |_t, v| { black_box(v); });
+                        .for_each("sink", |_t, v| {
+                            black_box(v);
+                        });
 
                     let dataflow = builder.build().unwrap();
                     instancy_rt
@@ -71,7 +73,9 @@ fn bench_pipeline_throughput(c: &mut Criterion) {
                     for i in 0..10 {
                         pipe = pipe.map(format!("step{i}"), |_t, x| x + 1);
                     }
-                    pipe.for_each("sink", |_t, v| { black_box(v); });
+                    pipe.for_each("sink", |_t, v| {
+                        black_box(v);
+                    });
 
                     let dataflow = builder.build().unwrap();
                     instancy_rt
@@ -123,7 +127,9 @@ fn bench_exchange_throughput(c: &mut Criterion) {
                                         .source("src", data)
                                         .exchange("partition", |v: &i64| *v as u64)
                                         .map("inc", |_t, x| x + 1)
-                                        .for_each("sink", |_t, v| { black_box(v); });
+                                        .for_each("sink", |_t, v| {
+                                            black_box(v);
+                                        });
                                     Ok(())
                                 },
                                 SpawnOptions::default(),
@@ -161,7 +167,9 @@ fn bench_spawn_latency(c: &mut Criterion) {
             let builder = DataflowBuilder::<u64>::new("bench-spawn");
             builder
                 .source("src", vec![(0u64, vec![1i32])])
-                .for_each("sink", |_t, v| { black_box(v); });
+                .for_each("sink", |_t, v| {
+                    black_box(v);
+                });
 
             let dataflow = builder.build().unwrap();
             instancy_rt
@@ -177,7 +185,9 @@ fn bench_spawn_latency(c: &mut Criterion) {
             let builder = DataflowBuilder::<u64>::new("bench-empty");
             builder
                 .source::<i32>("src", vec![])
-                .for_each("sink", |_t, v| { black_box(v); });
+                .for_each("sink", |_t, v| {
+                    black_box(v);
+                });
 
             let dataflow = builder.build().unwrap();
             instancy_rt
@@ -195,9 +205,12 @@ fn bench_spawn_latency(c: &mut Criterion) {
                     "bench-multi",
                     2,
                     |builder| {
-                        builder
-                            .source("src", vec![(0u64, vec![1i32])])
-                            .for_each("sink", |_t, v| { black_box(v); });
+                        builder.source("src", vec![(0u64, vec![1i32])]).for_each(
+                            "sink",
+                            |_t, v| {
+                                black_box(v);
+                            },
+                        );
                         Ok(())
                     },
                     SpawnOptions::default(),
@@ -255,7 +268,9 @@ fn bench_stateful_operator(c: &mut Criterion) {
                                 Ok(())
                             }
                         })
-                        .for_each("sink", |_t, v| { black_box(v); });
+                        .for_each("sink", |_t, v| {
+                            black_box(v);
+                        });
 
                     let dataflow = builder.build().unwrap();
                     instancy_rt
@@ -277,7 +292,9 @@ fn bench_stateful_operator(c: &mut Criterion) {
                     builder
                         .source("src", data)
                         .reduce("sum", |a, b| a + b)
-                        .for_each("sink", |_t, v| { black_box(v); });
+                        .for_each("sink", |_t, v| {
+                            black_box(v);
+                        });
 
                     let dataflow = builder.build().unwrap();
                     instancy_rt
@@ -319,12 +336,15 @@ fn bench_branching(c: &mut Criterion) {
                 b.iter(|| {
                     let builder = DataflowBuilder::<u64>::new("bench-branch");
                     let data: Vec<(u64, Vec<i64>)> = vec![(0, (0..count as i64).collect())];
-                    let (evens, odds) =
-                        builder.source("src", data).branch("split", |_t, v| v % 2 == 0);
+                    let (evens, odds) = builder
+                        .source("src", data)
+                        .branch("split", |_t, v| v % 2 == 0);
                     let merged = evens
                         .map("double_even", |_t, x| x * 2)
                         .merge(odds.map("triple_odd", |_t, x| x * 3));
-                    merged.for_each("sink", |_t, v| { black_box(v); });
+                    merged.for_each("sink", |_t, v| {
+                        black_box(v);
+                    });
 
                     let dataflow = builder.build().unwrap();
                     instancy_rt

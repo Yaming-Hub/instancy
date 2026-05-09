@@ -34,7 +34,7 @@ async fn iterate_doubling_until_threshold() {
     .unwrap();
 
     let builder = DataflowBuilder::<u64>::new("doubling-loop");
-    let input = builder.input::<i64>("data");
+    let input = builder.input::<i64>("data").unwrap();
     let output = input.iterate::<u32>("double-loop", 1u32, |iter_var| {
         let doubled = iter_var.map("double", |_t: &Product<u64, u32>, x| x * 2);
         let done = doubled.clone().filter("done", |_t, x| *x >= 100);
@@ -44,7 +44,7 @@ async fn iterate_doubling_until_threshold() {
             output: done,
         }
     });
-    output.output("results");
+    output.output("results").unwrap();
     let logical = builder.build().unwrap();
 
     let mut spawned = rt.spawn(logical, SpawnOptions::default()).unwrap();
@@ -80,7 +80,7 @@ async fn iterate_immediate_exit() {
     .unwrap();
 
     let builder = DataflowBuilder::<u64>::new("immediate-exit");
-    let input = builder.input::<i32>("data");
+    let input = builder.input::<i32>("data").unwrap();
     let output = input.iterate::<u32>("no-loop", 1u32, |iter_var| {
         // Everything passes the threshold immediately — nothing feeds back.
         let done = iter_var.clone().filter("done", |_t, x| *x >= 0);
@@ -90,7 +90,7 @@ async fn iterate_immediate_exit() {
             output: done,
         }
     });
-    output.output("results");
+    output.output("results").unwrap();
     let logical = builder.build().unwrap();
 
     let mut spawned = rt.spawn(logical, SpawnOptions::default()).unwrap();
@@ -125,7 +125,7 @@ async fn iterate_multiple_epochs() {
     .unwrap();
 
     let builder = DataflowBuilder::<u64>::new("multi-epoch-loop");
-    let input = builder.input::<i64>("data");
+    let input = builder.input::<i64>("data").unwrap();
     // Increment by 10 until >= 50
     let output = input.iterate::<u32>("inc-loop", 1u32, |iter_var| {
         let incremented = iter_var.map("add10", |_t: &Product<u64, u32>, x| x + 10);
@@ -136,7 +136,7 @@ async fn iterate_multiple_epochs() {
             output: done,
         }
     });
-    output.output("results");
+    output.output("results").unwrap();
     let logical = builder.build().unwrap();
 
     let mut spawned = rt.spawn(logical, SpawnOptions::default()).unwrap();
@@ -174,7 +174,7 @@ async fn iterate_empty_input() {
     .unwrap();
 
     let builder = DataflowBuilder::<u64>::new("empty-loop");
-    let input = builder.input::<i32>("data");
+    let input = builder.input::<i32>("data").unwrap();
     let output = input.iterate::<u32>("empty-loop", 1u32, |iter_var| {
         let done = iter_var.clone().filter("done", |_t, x| *x >= 10);
         let again = iter_var.filter("again", |_t, x| *x < 10);
@@ -183,7 +183,7 @@ async fn iterate_empty_input() {
             output: done,
         }
     });
-    output.output("results");
+    output.output("results").unwrap();
     let logical = builder.build().unwrap();
 
     let mut spawned = rt.spawn(logical, SpawnOptions::default()).unwrap();
@@ -215,7 +215,7 @@ async fn iterate_with_downstream_operators() {
     .unwrap();
 
     let builder = DataflowBuilder::<u64>::new("loop-then-map");
-    let input = builder.input::<i64>("data");
+    let input = builder.input::<i64>("data").unwrap();
     // Loop: double until >= 64
     let after_loop = input.iterate::<u32>("double-loop", 1u32, |iter_var| {
         let doubled = iter_var.map("double", |_t: &Product<u64, u32>, x| x * 2);
@@ -227,9 +227,7 @@ async fn iterate_with_downstream_operators() {
         }
     });
     // Post-loop: negate all results
-    after_loop
-        .map("negate", |_t, x: i64| -x)
-        .output("results");
+    after_loop.map("negate", |_t, x: i64| -x).output("results").unwrap();
     let logical = builder.build().unwrap();
 
     let mut spawned = rt.spawn(logical, SpawnOptions::default()).unwrap();
@@ -267,12 +265,15 @@ async fn iterate_collatz_sequence() {
     .unwrap();
 
     let builder = DataflowBuilder::<u64>::new("collatz");
-    let input = builder.input::<i64>("data");
+    let input = builder.input::<i64>("data").unwrap();
     let output = input.iterate::<u32>("collatz-loop", 1u32, |iter_var| {
         // Apply collatz step
-        let stepped = iter_var.map("collatz-step", |_t: &Product<u64, u32>, x| {
-            if x % 2 == 0 { x / 2 } else { 3 * x + 1 }
-        });
+        let stepped = iter_var.map(
+            "collatz-step",
+            |_t: &Product<u64, u32>, x| {
+                if x % 2 == 0 { x / 2 } else { 3 * x + 1 }
+            },
+        );
         let done = stepped.clone().filter("reached-1", |_t, x| *x == 1);
         let again = stepped.filter("continue", |_t, x| *x != 1);
         IterateResult {
@@ -280,7 +281,7 @@ async fn iterate_collatz_sequence() {
             output: done,
         }
     });
-    output.output("results");
+    output.output("results").unwrap();
     let logical = builder.build().unwrap();
 
     let mut spawned = rt.spawn(logical, SpawnOptions::default()).unwrap();

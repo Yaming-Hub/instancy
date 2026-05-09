@@ -22,7 +22,9 @@ fn concurrent_spawn_four_dataflows() {
     let rt = RuntimeHandle::new(RuntimeConfig {
         worker_threads: 2,
         schedule_policy: None,
-        name: "concurrent-4".into(), ..Default::default() })
+        name: "concurrent-4".into(),
+        ..Default::default()
+    })
     .unwrap();
 
     let mut handles = Vec::new();
@@ -32,8 +34,8 @@ fn concurrent_spawn_four_dataflows() {
     // Spawn 4 dataflows: input → map(triple) → output
     for i in 0..4u32 {
         let builder = DataflowBuilder::<u64>::new(format!("df_{i}"));
-        let input = builder.input::<i32>("data");
-        input.map("triple", |_t, x| x * 3).output("results");
+        let input = builder.input::<i32>("data").unwrap();
+        input.map("triple", |_t, x| x * 3).output("results").unwrap();
         let dataflow = builder.build().unwrap();
 
         let mut handle = rt.spawn(dataflow, SpawnOptions::default()).unwrap();
@@ -84,7 +86,9 @@ fn eight_dataflows_on_two_threads_no_starvation() {
     let rt = RuntimeHandle::new(RuntimeConfig {
         worker_threads: 2,
         schedule_policy: None,
-        name: "starvation-8".into(), ..Default::default() })
+        name: "starvation-8".into(),
+        ..Default::default()
+    })
     .unwrap();
 
     let mut handles = Vec::new();
@@ -95,7 +99,7 @@ fn eight_dataflows_on_two_threads_no_starvation() {
         builder
             .source("src", data)
             .map("inc", |_t, x| x + 1)
-            .output("out");
+            .output("out").unwrap();
         let dataflow = builder.build().unwrap();
         handles.push(rt.spawn(dataflow, SpawnOptions::default()).unwrap().join());
     }
@@ -123,7 +127,9 @@ fn mixed_workload_fairness() {
     let rt = RuntimeHandle::new(RuntimeConfig {
         worker_threads: 2,
         schedule_policy: None,
-        name: "mixed-workload".into(), ..Default::default() })
+        name: "mixed-workload".into(),
+        ..Default::default()
+    })
     .unwrap();
 
     // 2 "heavy" dataflows: receive multiple rounds of data
@@ -132,8 +138,8 @@ fn mixed_workload_fairness() {
 
     for i in 0..2 {
         let builder = DataflowBuilder::<u64>::new(format!("heavy_{i}"));
-        let input = builder.input::<i32>("data");
-        input.map("square", |_t, x| x * x).output("out");
+        let input = builder.input::<i32>("data").unwrap();
+        input.map("square", |_t, x| x * x).output("out").unwrap();
         let dataflow = builder.build().unwrap();
 
         let mut handle = rt.spawn(dataflow, SpawnOptions::default()).unwrap();
@@ -149,7 +155,7 @@ fn mixed_workload_fairness() {
         let builder = DataflowBuilder::<u64>::new(format!("light_{i}"));
         builder
             .source("src", vec![(0u64, vec![1i32, 2, 3])])
-            .output("out");
+            .output("out").unwrap();
         let dataflow = builder.build().unwrap();
         light_completions.push(rt.spawn(dataflow, SpawnOptions::default()).unwrap().join());
     }
@@ -198,7 +204,9 @@ fn shutdown_cancels_all_running_dataflows() {
     let rt = RuntimeHandle::new(RuntimeConfig {
         worker_threads: 2,
         schedule_policy: None,
-        name: "shutdown-test".into(), ..Default::default() })
+        name: "shutdown-test".into(),
+        ..Default::default()
+    })
     .unwrap();
 
     let mut spawned = Vec::new();
@@ -206,8 +214,8 @@ fn shutdown_cancels_all_running_dataflows() {
     // Spawn 4 dataflows with open input ports (will block waiting for data)
     for i in 0..4 {
         let builder = DataflowBuilder::<u64>::new(format!("blocked_{i}"));
-        let input = builder.input::<i32>("data");
-        input.output("out");
+        let input = builder.input::<i32>("data").unwrap();
+        input.output("out").unwrap();
         let dataflow = builder.build().unwrap();
         let handle = rt.spawn(dataflow, SpawnOptions::default()).unwrap();
         spawned.push(handle);
@@ -243,7 +251,9 @@ fn individual_cancel_preserves_siblings() {
     let rt = RuntimeHandle::new(RuntimeConfig {
         worker_threads: 2,
         schedule_policy: None,
-        name: "individual-cancel".into(), ..Default::default() })
+        name: "individual-cancel".into(),
+        ..Default::default()
+    })
     .unwrap();
 
     // Spawn 3 dataflows with input ports
@@ -252,8 +262,8 @@ fn individual_cancel_preserves_siblings() {
 
     for i in 0..3 {
         let builder = DataflowBuilder::<u64>::new(format!("df_{i}"));
-        let input = builder.input::<i32>("data");
-        input.map("inc", |_t, x| x + 1).output("out");
+        let input = builder.input::<i32>("data").unwrap();
+        input.map("inc", |_t, x| x + 1).output("out").unwrap();
         let dataflow = builder.build().unwrap();
 
         let mut handle = rt.spawn(dataflow, SpawnOptions::default()).unwrap();
@@ -304,7 +314,9 @@ fn stress_spawn_twenty_dataflows() {
     let rt = RuntimeHandle::new(RuntimeConfig {
         worker_threads: 4,
         schedule_policy: None,
-        name: "stress-20".into(), ..Default::default() })
+        name: "stress-20".into(),
+        ..Default::default()
+    })
     .unwrap();
 
     let mut completions = Vec::new();
@@ -314,7 +326,7 @@ fn stress_spawn_twenty_dataflows() {
         builder
             .source("src", vec![(0u64, vec![i])])
             .map("double", |_t, x| x * 2)
-            .output("out");
+            .output("out").unwrap();
         let dataflow = builder.build().unwrap();
         completions.push(rt.spawn(dataflow, SpawnOptions::default()).unwrap().join());
     }
@@ -338,12 +350,14 @@ fn concurrent_input_from_multiple_threads() {
     let rt = RuntimeHandle::new(RuntimeConfig {
         worker_threads: 2,
         schedule_policy: None,
-        name: "concurrent-input".into(), ..Default::default() })
+        name: "concurrent-input".into(),
+        ..Default::default()
+    })
     .unwrap();
 
     let builder = DataflowBuilder::<u64>::new("multi-sender");
-    let input = builder.input::<i32>("data");
-    input.map("inc", |_t, x| x + 1).output("out");
+    let input = builder.input::<i32>("data").unwrap();
+    input.map("inc", |_t, x| x + 1).output("out").unwrap();
     let dataflow = builder.build().unwrap();
 
     let mut handle = rt.spawn(dataflow, SpawnOptions::default()).unwrap();
@@ -407,7 +421,9 @@ fn operator_panic_propagates_error() {
     let rt = RuntimeHandle::new(RuntimeConfig {
         worker_threads: 2,
         schedule_policy: None,
-        name: "panic-test".into(), ..Default::default() })
+        name: "panic-test".into(),
+        ..Default::default()
+    })
     .unwrap();
 
     // Spawn a "good" dataflow alongside the failing one
@@ -415,7 +431,7 @@ fn operator_panic_propagates_error() {
     good_builder
         .source("src", vec![(0u64, vec![1i32, 2, 3])])
         .map("double", |_t, x| x * 2)
-        .output("out");
+        .output("out").unwrap();
     let good_df = good_builder.build().unwrap();
     let good_completion = rt.spawn(good_df, SpawnOptions::default()).unwrap().join();
 
@@ -426,7 +442,7 @@ fn operator_panic_propagates_error() {
         .map("boom", |_t, _x: i32| -> i32 {
             panic!("intentional test panic")
         })
-        .output("out");
+        .output("out").unwrap();
     let bad_df = bad_builder.build().unwrap();
     let bad_completion = rt.spawn(bad_df, SpawnOptions::default()).unwrap().join();
 
@@ -456,12 +472,14 @@ fn drop_runtime_cancels_active_dataflows() {
         let rt = RuntimeHandle::new(RuntimeConfig {
             worker_threads: 2,
             schedule_policy: None,
-            name: "drop-cancel".into(), ..Default::default() })
+            name: "drop-cancel".into(),
+            ..Default::default()
+        })
         .unwrap();
 
         let builder = DataflowBuilder::<u64>::new("blocked");
-        let input = builder.input::<i32>("data");
-        input.output("out");
+        let input = builder.input::<i32>("data").unwrap();
+        input.output("out").unwrap();
         let dataflow = builder.build().unwrap();
 
         let spawned = rt.spawn(dataflow, SpawnOptions::default()).unwrap();

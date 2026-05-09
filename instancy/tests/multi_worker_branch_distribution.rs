@@ -174,11 +174,11 @@ async fn multi_worker_branch_even_odd() {
         "mw-branch-even-odd",
         2,
         |builder| {
-            let input = builder.input::<i64>("data");
+            let input = builder.input::<i64>("data").unwrap();
             let exchanged = input.exchange_by_hash("distribute", |x| *x as u64);
             let (evens, odds) = exchanged.branch("parity", |_t, x| x % 2 == 0);
-            evens.output("evens");
-            odds.output("odds");
+            evens.output("evens").unwrap();
+            odds.output("odds").unwrap();
         },
         vec![(0, (1..=10).collect())],
         "evens",
@@ -197,16 +197,13 @@ async fn multi_worker_branch_multi_epoch() {
         "mw-branch-multi-epoch",
         2,
         |builder| {
-            let input = builder.input::<i64>("data");
+            let input = builder.input::<i64>("data").unwrap();
             let exchanged = input.exchange_by_hash("distribute", |x| *x as u64);
             let (pos, non_pos) = exchanged.branch("sign", |_t, x| *x > 0);
-            pos.output("positives");
-            non_pos.output("non_positives");
+            pos.output("positives").unwrap();
+            non_pos.output("non_positives").unwrap();
         },
-        vec![
-            (0, vec![-3, -1, 0, 1, 3]),
-            (1, vec![-5, 2, 4]),
-        ],
+        vec![(0, vec![-3, -1, 0, 1, 3]), (1, vec![-5, 2, 4])],
         "positives",
         "non_positives",
     )
@@ -223,11 +220,13 @@ async fn multi_worker_branch_then_reduce() {
         "mw-branch-reduce",
         2,
         |builder| {
-            let input = builder.input::<i64>("data");
+            let input = builder.input::<i64>("data").unwrap();
             let exchanged = input.exchange_by_hash("distribute", |x| *x as u64);
             let (evens, odds) = exchanged.branch("parity", |_t, x| x % 2 == 0);
-            evens.reduce("sum-evens", |acc, x| acc + x).output("even_sums");
-            odds.reduce("sum-odds", |acc, x| acc + x).output("odd_sums");
+            evens
+                .reduce("sum-evens", |acc, x| acc + x)
+                .output("even_sums").unwrap();
+            odds.reduce("sum-odds", |acc, x| acc + x).output("odd_sums").unwrap();
         },
         vec![(0, (1..=10).collect())],
         "even_sums",
@@ -248,11 +247,11 @@ async fn multi_worker_branch_three_workers() {
         "mw-branch-3w",
         3,
         |builder| {
-            let input = builder.input::<i64>("data");
+            let input = builder.input::<i64>("data").unwrap();
             let exchanged = input.exchange_by_hash("distribute", |x| *x as u64);
             let (big, small) = exchanged.branch("threshold", |_t, x| *x > 5);
-            big.output("big");
-            small.output("small");
+            big.output("big").unwrap();
+            small.output("small").unwrap();
         },
         vec![(0, (1..=10).collect())],
         "big",
@@ -271,11 +270,11 @@ async fn multi_worker_branch_all_true() {
         "mw-branch-all-true",
         2,
         |builder| {
-            let input = builder.input::<i64>("data");
+            let input = builder.input::<i64>("data").unwrap();
             let exchanged = input.exchange_by_hash("distribute", |x| *x as u64);
             let (matched, unmatched) = exchanged.branch("always-true", |_t, _x| true);
-            matched.output("matched");
-            unmatched.output("unmatched");
+            matched.output("matched").unwrap();
+            unmatched.output("unmatched").unwrap();
         },
         vec![(0, vec![1, 2, 3, 4, 5])],
         "matched",
@@ -301,11 +300,11 @@ async fn multi_worker_gather_collects_all() {
             "mw-gather",
             2,
             |builder| {
-                let input = builder.input::<i64>("data");
+                let input = builder.input::<i64>("data").unwrap();
                 let gathered = input
                     .exchange_by_hash("distribute", |x| *x as u64)
                     .gather("collect");
-                gathered.output("results");
+                gathered.output("results").unwrap();
                 Ok(())
             },
             SpawnOptions::default(),
@@ -349,7 +348,10 @@ async fn multi_worker_gather_collects_all() {
         .collect();
 
     assert_eq!(w0_data, (1..=10).collect::<Vec<_>>());
-    assert!(w1_data.is_empty(), "worker 1 should have no data after gather");
+    assert!(
+        w1_data.is_empty(),
+        "worker 1 should have no data after gather"
+    );
 }
 
 /// gather → reduce: all data gathered to worker 0 then reduced.
@@ -359,12 +361,12 @@ async fn multi_worker_gather_then_reduce() {
         "mw-gather-reduce",
         2,
         |builder| {
-            let input = builder.input::<i64>("data");
+            let input = builder.input::<i64>("data").unwrap();
             input
                 .exchange_by_hash("distribute", |x| *x as u64)
                 .gather("collect")
                 .reduce("sum", |acc, x| acc + x)
-                .output("results");
+                .output("results").unwrap();
         },
         vec![(0, (1..=10).collect())],
         "results",
@@ -388,8 +390,8 @@ async fn multi_worker_rebalance_preserves_all() {
         "mw-rebalance-all",
         2,
         |builder| {
-            let input = builder.input::<i64>("data");
-            input.rebalance("redistribute").output("results");
+            let input = builder.input::<i64>("data").unwrap();
+            input.rebalance("redistribute").output("results").unwrap();
         },
         vec![(0, (1..=20).collect())],
         "results",
@@ -406,11 +408,11 @@ async fn multi_worker_rebalance_then_fold() {
         "mw-rebalance-fold",
         2,
         |builder| {
-            let input = builder.input::<i64>("data");
+            let input = builder.input::<i64>("data").unwrap();
             input
                 .rebalance("redistribute")
                 .fold("count", 0i64, |acc, _x| acc + 1)
-                .output("results");
+                .output("results").unwrap();
         },
         vec![(0, (1..=20).collect())],
         "results",
@@ -431,8 +433,8 @@ async fn multi_worker_rebalance_three_workers() {
         "mw-rebalance-3w",
         3,
         |builder| {
-            let input = builder.input::<i64>("data");
-            input.rebalance("redistribute").output("results");
+            let input = builder.input::<i64>("data").unwrap();
+            input.rebalance("redistribute").output("results").unwrap();
         },
         vec![(0, (1..=30).collect())],
         "results",
@@ -452,8 +454,8 @@ async fn multi_worker_rebalance_per_worker_distribution() {
             "mw-rebalance-perw",
             2,
             |builder| {
-                let input = builder.input::<i64>("data");
-                input.rebalance("redistribute").output("results");
+                let input = builder.input::<i64>("data").unwrap();
+                input.rebalance("redistribute").output("results").unwrap();
                 Ok(())
             },
             SpawnOptions::default(),
@@ -483,12 +485,26 @@ async fn multi_worker_rebalance_per_worker_distribution() {
         Err(_) => panic!("dataflow did not complete within {TEST_TIMEOUT:?}"),
     }
 
-    let w0_data: Vec<i64> = recv0.collect_data().into_iter().flat_map(|(_, d)| d).collect();
-    let w1_data: Vec<i64> = recv1.collect_data().into_iter().flat_map(|(_, d)| d).collect();
+    let w0_data: Vec<i64> = recv0
+        .collect_data()
+        .into_iter()
+        .flat_map(|(_, d)| d)
+        .collect();
+    let w1_data: Vec<i64> = recv1
+        .collect_data()
+        .into_iter()
+        .flat_map(|(_, d)| d)
+        .collect();
 
     // Both workers should have received data (not all on one worker)
-    assert!(!w0_data.is_empty(), "worker 0 should have data from rebalance");
-    assert!(!w1_data.is_empty(), "worker 1 should have data from rebalance");
+    assert!(
+        !w0_data.is_empty(),
+        "worker 0 should have data from rebalance"
+    );
+    assert!(
+        !w1_data.is_empty(),
+        "worker 1 should have data from rebalance"
+    );
     // Total should be 20
     assert_eq!(w0_data.len() + w1_data.len(), 20);
     // All original values present
@@ -510,9 +526,9 @@ async fn multi_worker_rebalance_to_matching() {
         "mw-rebalance-to",
         2,
         |builder| {
-            let input = builder.input::<i64>("data");
+            let input = builder.input::<i64>("data").unwrap();
             // rebalance_to(2) with 2 workers — same as rebalance() but explicit
-            input.rebalance_to("redistribute", 2).output("results");
+            input.rebalance_to("redistribute", 2).unwrap().output("results").unwrap();
         },
         vec![(0, (1..=12).collect())],
         "results",
@@ -533,8 +549,8 @@ async fn multi_worker_rebalance_to_distributes() {
             "mw-rebalance-to-dist",
             2,
             |builder| {
-                let input = builder.input::<i64>("data");
-                input.rebalance_to("redistribute", 2).output("results");
+                let input = builder.input::<i64>("data").unwrap();
+                input.rebalance_to("redistribute", 2).unwrap().output("results").unwrap();
                 Ok(())
             },
             SpawnOptions::default(),
@@ -563,8 +579,16 @@ async fn multi_worker_rebalance_to_distributes() {
         Err(_) => panic!("dataflow did not complete within {TEST_TIMEOUT:?}"),
     }
 
-    let w0_data: Vec<i64> = recv0.collect_data().into_iter().flat_map(|(_, d)| d).collect();
-    let w1_data: Vec<i64> = recv1.collect_data().into_iter().flat_map(|(_, d)| d).collect();
+    let w0_data: Vec<i64> = recv0
+        .collect_data()
+        .into_iter()
+        .flat_map(|(_, d)| d)
+        .collect();
+    let w1_data: Vec<i64> = recv1
+        .collect_data()
+        .into_iter()
+        .flat_map(|(_, d)| d)
+        .collect();
 
     // Both workers should receive data
     assert!(!w0_data.is_empty(), "worker 0 should have data");
@@ -583,11 +607,11 @@ async fn multi_worker_branch_empty_input() {
         "mw-branch-empty",
         2,
         |builder| {
-            let input = builder.input::<i64>("data");
+            let input = builder.input::<i64>("data").unwrap();
             let exchanged = input.exchange_by_hash("distribute", |x| *x as u64);
             let (m, u) = exchanged.branch("split", |_t, _x| true);
-            m.output("matched");
-            u.output("unmatched");
+            m.output("matched").unwrap();
+            u.output("unmatched").unwrap();
         },
         vec![], // no data
         "matched",
@@ -606,11 +630,11 @@ async fn multi_worker_branch_all_false() {
         "mw-branch-all-false",
         2,
         |builder| {
-            let input = builder.input::<i64>("data");
+            let input = builder.input::<i64>("data").unwrap();
             let exchanged = input.exchange_by_hash("distribute", |x| *x as u64);
             let (m, u) = exchanged.branch("never", |_t, _x| false);
-            m.output("matched");
-            u.output("unmatched");
+            m.output("matched").unwrap();
+            u.output("unmatched").unwrap();
         },
         vec![(0, vec![1, 2, 3, 4, 5])],
         "matched",
@@ -633,11 +657,11 @@ async fn multi_worker_exchange_branch_gather() {
         "mw-ex-branch-gather",
         2,
         |builder| {
-            let input = builder.input::<i64>("data");
+            let input = builder.input::<i64>("data").unwrap();
             let exchanged = input.exchange_by_hash("distribute", |x| *x as u64);
             let (evens, odds) = exchanged.branch("parity", |_t, x| x % 2 == 0);
-            evens.gather("gather-evens").output("evens");
-            odds.gather("gather-odds").output("odds");
+            evens.gather("gather-evens").output("evens").unwrap();
+            odds.gather("gather-odds").output("odds").unwrap();
         },
         vec![(0, (1..=10).collect())],
         "evens",
@@ -656,11 +680,16 @@ async fn multi_worker_branch_rebalance_count() {
         "mw-branch-rebalance-count",
         2,
         |builder| {
-            let input = builder.input::<i64>("data");
+            let input = builder.input::<i64>("data").unwrap();
             let exchanged = input.exchange_by_hash("distribute", |x| *x as u64);
             let (evens, odds) = exchanged.branch("parity", |_t, x| x % 2 == 0);
-            evens.rebalance("rebal-evens").count("count-evens").output("even_counts");
-            odds.rebalance("rebal-odds").count("count-odds").output("odd_counts");
+            evens
+                .rebalance("rebal-evens")
+                .count("count-evens")
+                .output("even_counts").unwrap();
+            odds.rebalance("rebal-odds")
+                .count("count-odds")
+                .output("odd_counts").unwrap();
         },
         vec![(0, (1..=10).collect())],
         "even_counts",
@@ -681,11 +710,11 @@ async fn multi_worker_map_branch_map() {
         "mw-map-branch-map",
         2,
         |builder| {
-            let input = builder.input::<i64>("data");
+            let input = builder.input::<i64>("data").unwrap();
             let exchanged = input.exchange_by_hash("distribute", |x| *x as u64);
             let (evens, odds) = exchanged.branch("parity", |_t, x| x % 2 == 0);
-            evens.map("double", |_t, x| x * 2).output("doubled_evens");
-            odds.map("triple", |_t, x| x * 3).output("tripled_odds");
+            evens.map("double", |_t, x| x * 2).output("doubled_evens").unwrap();
+            odds.map("triple", |_t, x| x * 3).output("tripled_odds").unwrap();
         },
         vec![(0, (1..=6).collect())],
         "doubled_evens",

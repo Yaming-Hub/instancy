@@ -530,13 +530,17 @@ pub struct PoolGuard<'pool, M: ConnectionManager> {
 
 impl<'pool, M: ConnectionManager> PoolGuard<'pool, M> {
     /// Get a reference to the underlying connection.
-    pub fn connection(&self) -> &M::Connection {
-        self.connection.as_ref().expect("guard already consumed")
+    pub fn connection(&self) -> crate::Result<&M::Connection> {
+        self.connection
+            .as_ref()
+            .ok_or_else(|| crate::Error::Custom("connection guard already consumed".into()))
     }
 
     /// Get a mutable reference to the underlying connection.
-    pub fn connection_mut(&mut self) -> &mut M::Connection {
-        self.connection.as_mut().expect("guard already consumed")
+    pub fn connection_mut(&mut self) -> crate::Result<&mut M::Connection> {
+        self.connection
+            .as_mut()
+            .ok_or_else(|| crate::Error::Custom("connection guard already consumed".into()))
     }
 
     /// Explicitly discard this connection (e.g., after detecting it's broken).
@@ -890,12 +894,12 @@ mod tests {
         let mut guard = pool.acquire(PeerId(1)).await.unwrap();
 
         // Can access connection via guard
-        let conn = guard.connection();
+        let conn = guard.connection().unwrap();
         assert!(conn.healthy);
 
-        let conn_mut = guard.connection_mut();
+        let conn_mut = guard.connection_mut().unwrap();
         conn_mut.healthy = false;
-        assert!(!guard.connection().healthy);
+        assert!(!guard.connection().unwrap().healthy);
     }
 
     #[test]

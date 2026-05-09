@@ -218,23 +218,27 @@ impl WorkerPool {
     /// ready queue alongside one-shot tasks from the injector.
     ///
     /// Panics if a registry is already set (call only once per pool).
-    pub fn create_registry(&self, schedule_policy: Option<Arc<dyn SchedulePolicy>>) -> Arc<ExecutorRegistry> {
+    pub fn create_registry(
+        &self,
+        schedule_policy: Option<Arc<dyn SchedulePolicy>>,
+    ) -> crate::Result<Arc<ExecutorRegistry>> {
         let mut guard = self
             .state
             .executor_registry
             .lock()
             .unwrap_or_else(|e| e.into_inner());
-        assert!(
-            guard.is_none(),
-            "ExecutorRegistry already set for this pool"
-        );
+        if guard.is_some() {
+            return Err(crate::Error::Custom(
+                "ExecutorRegistry already set for this pool".into(),
+            ));
+        }
         // Share the pool's condvar so executor wakeups unpark worker threads.
         let registry = Arc::new(ExecutorRegistry::new(
             Arc::clone(&self.state.park_condvar),
             schedule_policy,
         ));
         *guard = Some(Arc::clone(&registry));
-        registry
+        Ok(registry)
     }
 
     /// Get the executor registry, if one has been created.
@@ -748,7 +752,7 @@ mod tests {
             yield_limit: 10,
         };
         let pool = WorkerPool::new(config).unwrap();
-        let registry = pool.create_registry(None);
+        let registry = pool.create_registry(None).unwrap();
 
         let (completion, notifier) = DataflowCompletion::new();
         registry.register(
@@ -797,7 +801,7 @@ mod tests {
             yield_limit: 10,
         };
         let pool = WorkerPool::new(config).unwrap();
-        let registry = pool.create_registry(None);
+        let registry = pool.create_registry(None).unwrap();
 
         let (comp1, notifier1) = DataflowCompletion::new();
         let (comp2, notifier2) = DataflowCompletion::new();

@@ -900,17 +900,13 @@ mod tests {
 
         // Collect all data frames
         let mut data_received = Vec::new();
-        while let Ok(Some(payload)) =
-            tokio::time::timeout(timeout, data_rx.recv()).await
-        {
+        while let Ok(Some(payload)) = tokio::time::timeout(timeout, data_rx.recv()).await {
             data_received.push(u32::from_le_bytes(payload[..4].try_into().unwrap()));
         }
 
         // Collect all progress frames
         let mut progress_received = Vec::new();
-        while let Ok(Some(payload)) =
-            tokio::time::timeout(timeout, progress_rx.recv()).await
-        {
+        while let Ok(Some(payload)) = tokio::time::timeout(timeout, progress_rx.recv()).await {
             progress_received.push(u32::from_le_bytes(payload[..4].try_into().unwrap()));
         }
 

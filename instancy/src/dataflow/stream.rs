@@ -135,14 +135,15 @@ impl<D> StreamConnection<D> {
     /// - Stages differ but the strategy is Pipeline (must use a repartition).
     pub fn validate(&self) -> crate::error::Result<()> {
         if self.source_stage != self.target_stage
-            && matches!(&self.strategy, PartitionStrategy::Pipeline) {
-                return Err(crate::error::Error::Custom(format!(
-                    "Cannot connect {} in {} to {} in {} with Pipeline strategy. \
+            && matches!(&self.strategy, PartitionStrategy::Pipeline)
+        {
+            return Err(crate::error::Error::Custom(format!(
+                "Cannot connect {} in {} to {} in {} with Pipeline strategy. \
                      Use an explicit repartition operator (exchange, rebalance, gather, broadcast) \
                      when crossing stage boundaries.",
-                    self.source, self.source_stage, self.target, self.target_stage,
-                )));
-            }
+                self.source, self.source_stage, self.target, self.target_stage,
+            )));
+        }
         Ok(())
     }
 }

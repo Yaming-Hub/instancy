@@ -12,8 +12,8 @@ use tokio::net::{TcpListener, TcpStream};
 use instancy::DataflowBuilder;
 use instancy::DataflowId;
 use instancy::Result;
-use instancy::communication::transport_session::PeerConnection;
 use instancy::communication::ClusterSpawnTransport;
+use instancy::communication::transport_session::PeerConnection;
 use instancy::{ClusterTopology, NodeConfig};
 use instancy::{RuntimeConfig, RuntimeHandle, SpawnOptions};
 
@@ -55,9 +55,9 @@ async fn shared_pool_parallel_dataflows_no_exchange() {
     for i in 0..num_dataflows {
         let builder = DataflowBuilder::<u64>::new(format!("df-{i}"));
         builder
-            .input::<i64>("data")
+            .input::<i64>("data").unwrap()
             .map("double", |_t, x| x * 2)
-            .output("results");
+            .output("results").unwrap();
         let logical = builder.build().unwrap();
         let spawned = rt.spawn(logical, SpawnOptions::default()).unwrap();
         dataflows.push(spawned);
@@ -150,10 +150,10 @@ async fn shared_pool_parallel_dataflows_with_exchange() {
                 &format!("ex-df-{i}"),
                 num_workers,
                 |builder| {
-                    let input = builder.input::<i64>("data");
+                    let input = builder.input::<i64>("data").unwrap();
                     // Use exchange_by_hash for deterministic routing: hash % num_workers.
                     let exchanged = input.exchange_by_hash("by_val", |x: &i64| *x as u64);
-                    exchanged.map("pass", |_t, x| x).output("results");
+                    exchanged.map("pass", |_t, x| x).output("results").unwrap();
                     Ok(())
                 },
                 SpawnOptions::default(),
@@ -254,9 +254,9 @@ async fn stress_shared_pool_many_dataflows() {
     for i in 0..num_dataflows {
         let builder = DataflowBuilder::<u64>::new(format!("stress-{i}"));
         builder
-            .input::<i64>("data")
+            .input::<i64>("data").unwrap()
             .map("triple", |_t, x| x * 3)
-            .output("results");
+            .output("results").unwrap();
         let logical = builder.build().unwrap();
         dataflows.push(rt.spawn(logical, SpawnOptions::default()).unwrap());
     }
@@ -391,10 +391,10 @@ async fn shared_transport_parallel_cluster_dataflows() {
         let dataflow_id = DataflowId::new();
 
         let build = |builder: &mut DataflowBuilder<u64>| -> Result<()> {
-            let input = builder.input::<i64>("data");
+            let input = builder.input::<i64>("data").unwrap();
             // Use exchange_by_hash for deterministic routing: hash % num_nodes.
             let exchanged = input.exchange_by_hash("by_val", |x: &i64| *x as u64);
-            exchanged.map("pass", |_t, x| x).output("results");
+            exchanged.map("pass", |_t, x| x).output("results").unwrap();
             Ok(())
         };
 
@@ -569,9 +569,9 @@ async fn stress_parallel_cluster_dataflows() {
         let dataflow_id = DataflowId::new();
 
         let build = |builder: &mut DataflowBuilder<u64>| -> Result<()> {
-            let input = builder.input::<i64>("data");
+            let input = builder.input::<i64>("data").unwrap();
             let exchanged = input.exchange_by_hash("by_val", |x: &i64| *x as u64);
-            exchanged.map("pass", |_t, x| x).output("results");
+            exchanged.map("pass", |_t, x| x).output("results").unwrap();
             Ok(())
         };
 

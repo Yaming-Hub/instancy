@@ -72,13 +72,21 @@ impl BatchingPolicy {
     /// # Panics
     ///
     /// Panics if `max_count` is zero.
-    pub fn custom(max_count: usize, max_bytes: Option<usize>, max_wait: Duration) -> Self {
-        assert!(max_count > 0, "max_batch_count must be positive");
-        Self {
+    pub fn custom(
+        max_count: usize,
+        max_bytes: Option<usize>,
+        max_wait: Duration,
+    ) -> crate::Result<Self> {
+        if max_count == 0 {
+            return Err(crate::Error::InvalidConfig(
+                "max_batch_count must be positive".into(),
+            ));
+        }
+        Ok(Self {
             max_batch_count: max_count,
             max_batch_bytes: max_bytes,
             max_batch_wait: max_wait,
-        }
+        })
     }
 }
 
@@ -349,7 +357,7 @@ mod tests {
 
     #[test]
     fn custom_policy() {
-        let policy = BatchingPolicy::custom(512, Some(128 * 1024), Duration::from_millis(5));
+        let policy = BatchingPolicy::custom(512, Some(128 * 1024), Duration::from_millis(5)).unwrap();
         assert_eq!(policy.max_batch_count, 512);
         assert_eq!(policy.max_batch_bytes, Some(128 * 1024));
         assert_eq!(policy.max_batch_wait, Duration::from_millis(5));
@@ -388,7 +396,7 @@ mod tests {
             1_000_000,               // very high count
             Some(100),               // low byte threshold
             Duration::from_secs(60), // long wait
-        );
+        ).unwrap();
         let mut acc = BatchAccumulator::new();
 
         // Add messages with size info
@@ -404,7 +412,7 @@ mod tests {
 
     #[test]
     fn byte_size_ignored_without_size_info() {
-        let policy = BatchingPolicy::custom(1_000_000, Some(100), Duration::from_secs(60));
+        let policy = BatchingPolicy::custom(1_000_000, Some(100), Duration::from_secs(60)).unwrap();
         let mut acc = BatchAccumulator::new();
 
         // Record many messages without size info
@@ -418,7 +426,7 @@ mod tests {
 
     #[test]
     fn time_threshold_triggers_dispatch() {
-        let policy = BatchingPolicy::custom(1_000_000, None, Duration::from_millis(10));
+        let policy = BatchingPolicy::custom(1_000_000, None, Duration::from_millis(10)).unwrap();
         let mut acc = BatchAccumulator::new();
         acc.record_message(None);
 
@@ -440,7 +448,7 @@ mod tests {
 
     #[test]
     fn first_threshold_wins_count_before_bytes() {
-        let policy = BatchingPolicy::custom(5, Some(1000), Duration::from_secs(60));
+        let policy = BatchingPolicy::custom(5, Some(1000), Duration::from_secs(60)).unwrap();
         let mut acc = BatchAccumulator::new();
         for _ in 0..5 {
             acc.record_message(Some(10)); // total bytes = 50 < 1000
@@ -452,7 +460,7 @@ mod tests {
 
     #[test]
     fn first_threshold_wins_bytes_before_count() {
-        let policy = BatchingPolicy::custom(1000, Some(50), Duration::from_secs(60));
+        let policy = BatchingPolicy::custom(1000, Some(50), Duration::from_secs(60)).unwrap();
         let mut acc = BatchAccumulator::new();
         for _ in 0..3 {
             acc.record_message(Some(20)); // total bytes = 60 >= 50
@@ -481,7 +489,7 @@ mod tests {
 
     #[test]
     fn deadline_computation() {
-        let policy = BatchingPolicy::custom(100, None, Duration::from_millis(5));
+        let policy = BatchingPolicy::custom(100, None, Duration::from_millis(5)).unwrap();
         let mut acc = BatchAccumulator::new();
 
         assert_eq!(acc.deadline(&policy), None);
@@ -494,7 +502,7 @@ mod tests {
 
     #[test]
     fn should_dispatch_at_uses_provided_time() {
-        let policy = BatchingPolicy::custom(1_000_000, None, Duration::from_millis(10));
+        let policy = BatchingPolicy::custom(1_000_000, None, Duration::from_millis(10)).unwrap();
         let mut acc = BatchAccumulator::new();
         acc.record_message(None);
         let first = acc.first_message_at().unwrap();
@@ -630,7 +638,7 @@ mod tests {
             1_000_000, // very high count
             None,
             Duration::from_millis(5), // low time threshold
-        );
+        ).unwrap();
         let mut acc = BatchAccumulator::new();
 
         // Single message arrives under low throughput
@@ -643,14 +651,13 @@ mod tests {
     }
 
     #[test]
-    #[should_panic(expected = "max_batch_count must be positive")]
     fn zero_max_batch_count_panics() {
-        BatchingPolicy::custom(0, None, Duration::from_millis(1));
+        assert!(BatchingPolicy::custom(0, None, Duration::from_millis(1)).is_err());
     }
 
     #[test]
     fn should_dispatch_at_with_earlier_now_does_not_panic() {
-        let policy = BatchingPolicy::custom(1_000_000, None, Duration::from_millis(10));
+        let policy = BatchingPolicy::custom(1_000_000, None, Duration::from_millis(10)).unwrap();
         let mut acc = BatchAccumulator::new();
 
         // Record a message, then pass a "now" that is earlier (simulated via subtraction)
@@ -681,3 +688,4 @@ mod tests {
         assert_eq!(v.message_size(), 11);
     }
 }
+

@@ -45,7 +45,7 @@ fn main() {
             let output = incremented.filter("done", move |_t, &x| x >= iterations);
             IterateResult { feedback, output }
         })
-        .output("results");
+        .output("results").unwrap();
 
     let dataflow = builder.build().expect("graph construction failed");
 

@@ -17,9 +17,7 @@ use instancy::{DataflowBuilder, Pipe, RuntimeConfig, RuntimeHandle, SpawnOptions
 
 /// Helper: create a runtime, build and spawn a dataflow, return join result.
 #[allow(dead_code)]
-fn run_dataflow_blocking(
-    builder: DataflowBuilder<u64>,
-) -> instancy::Result<()> {
+fn run_dataflow_blocking(builder: DataflowBuilder<u64>) -> instancy::Result<()> {
     let rt = RuntimeHandle::new(RuntimeConfig::default()).unwrap();
     let dataflow = builder.build().unwrap();
     let handle = rt.spawn(dataflow, SpawnOptions::new()).unwrap();
@@ -38,8 +36,8 @@ fn run_dataflow_blocking(
 fn empty_input_completes_cleanly() {
     let rt = RuntimeHandle::new(RuntimeConfig::default()).unwrap();
     let builder = DataflowBuilder::<u64>::new("empty-input");
-    let input = builder.input::<i32>("data");
-    input.map("double", |_t, v| v * 2).output("results");
+    let input = builder.input::<i32>("data").unwrap();
+    input.map("double", |_t, v| v * 2).output("results").unwrap();
     let dataflow = builder.build().unwrap();
 
     let mut handle = rt.spawn(dataflow, SpawnOptions::new()).unwrap();
@@ -64,11 +62,11 @@ fn empty_input_completes_cleanly() {
 fn single_record_per_timestamp() {
     let rt = RuntimeHandle::new(RuntimeConfig::default()).unwrap();
     let builder = DataflowBuilder::<u64>::new("single-record");
-    let input = builder.input::<i32>("data");
+    let input = builder.input::<i32>("data").unwrap();
     input
         .map("increment", |_t, v| v + 1)
         .filter("positive", |_t, v| *v > 0)
-        .output("results");
+        .output("results").unwrap();
     let dataflow = builder.build().unwrap();
 
     let mut handle = rt.spawn(dataflow, SpawnOptions::new()).unwrap();
@@ -99,9 +97,9 @@ fn single_record_per_timestamp() {
 fn mixed_empty_and_nonempty_timestamps() {
     let rt = RuntimeHandle::new(RuntimeConfig::default()).unwrap();
     let builder = DataflowBuilder::<u64>::new("mixed-timestamps");
-    let input = builder.input::<i32>("data");
+    let input = builder.input::<i32>("data").unwrap();
     let (stream, probe) = input.map("pass", |_t, v| v).probe();
-    stream.output("results");
+    stream.output("results").unwrap();
     let dataflow = builder.build().unwrap();
 
     let mut handle = rt.spawn(dataflow, SpawnOptions::new()).unwrap();
@@ -138,11 +136,9 @@ fn mixed_empty_and_nonempty_timestamps() {
 fn filter_drops_all_records() {
     let rt = RuntimeHandle::new(RuntimeConfig::default()).unwrap();
     let builder = DataflowBuilder::<u64>::new("filter-all");
-    let input = builder.input::<i32>("data");
-    let (stream, probe) = input
-        .filter("reject-all", |_t, _v| false)
-        .probe();
-    stream.output("results");
+    let input = builder.input::<i32>("data").unwrap();
+    let (stream, probe) = input.filter("reject-all", |_t, _v| false).probe();
+    stream.output("results").unwrap();
     let dataflow = builder.build().unwrap();
 
     let mut handle = rt.spawn(dataflow, SpawnOptions::new()).unwrap();
@@ -168,8 +164,8 @@ fn filter_drops_all_records() {
 fn large_batch_single_timestamp() {
     let rt = RuntimeHandle::new(RuntimeConfig::default()).unwrap();
     let builder = DataflowBuilder::<u64>::new("large-batch");
-    let input = builder.input::<i32>("data");
-    input.map("double", |_t, v| v * 2).output("results");
+    let input = builder.input::<i32>("data").unwrap();
+    input.map("double", |_t, v| v * 2).output("results").unwrap();
     let dataflow = builder.build().unwrap();
 
     let mut handle = rt.spawn(dataflow, SpawnOptions::new()).unwrap();
@@ -199,9 +195,9 @@ fn large_batch_single_timestamp() {
 async fn rapid_advance_no_data() {
     let rt = RuntimeHandle::new(RuntimeConfig::default()).unwrap();
     let builder = DataflowBuilder::<u64>::new("rapid-advance");
-    let input = builder.input::<i32>("data");
+    let input = builder.input::<i32>("data").unwrap();
     let (stream, probe) = input.map("pass", |_t, v| v).probe();
-    stream.output("results");
+    stream.output("results").unwrap();
     let dataflow = builder.build().unwrap();
 
     let mut handle = rt.spawn(dataflow, SpawnOptions::new()).unwrap();
@@ -243,14 +239,14 @@ async fn rapid_advance_no_data() {
 fn deep_operator_pipeline() {
     let rt = RuntimeHandle::new(RuntimeConfig::default()).unwrap();
     let builder = DataflowBuilder::<u64>::new("deep-pipeline");
-    let input = builder.input::<i32>("data");
+    let input = builder.input::<i32>("data").unwrap();
 
     // Chain 50 map operators
     let mut pipe = input.map("map-0", |_t, v| v + 1);
     for i in 1..50 {
         pipe = pipe.map(format!("map-{i}"), |_t, v| v + 1);
     }
-    pipe.output("results");
+    pipe.output("results").unwrap();
     let dataflow = builder.build().unwrap();
 
     let mut handle = rt.spawn(dataflow, SpawnOptions::new()).unwrap();
@@ -277,7 +273,7 @@ fn deep_operator_pipeline() {
 fn notify_fires_without_data_at_time() {
     let rt = RuntimeHandle::new(RuntimeConfig::default()).unwrap();
     let builder = DataflowBuilder::<u64>::new("notify-empty");
-    let input = builder.input::<i32>("data");
+    let input = builder.input::<i32>("data").unwrap();
 
     let notifications_fired = Arc::new(Mutex::new(Vec::new()));
     let notifications_clone = Arc::clone(&notifications_fired);
@@ -301,7 +297,7 @@ fn notify_fires_without_data_at_time() {
                 Ok(())
             }
         })
-        .output("results");
+        .output("results").unwrap();
     let dataflow = builder.build().unwrap();
 
     let mut handle = rt.spawn(dataflow, SpawnOptions::new()).unwrap();
@@ -318,9 +314,18 @@ fn notify_fires_without_data_at_time() {
     let mut fired = notifications_fired.lock().unwrap().clone();
     fired.sort();
     // All three notifications should have fired (plus possibly time 0)
-    assert!(fired.contains(&5), "notification at 5 should fire, got: {fired:?}");
-    assert!(fired.contains(&10), "notification at 10 should fire, got: {fired:?}");
-    assert!(fired.contains(&15), "notification at 15 should fire, got: {fired:?}");
+    assert!(
+        fired.contains(&5),
+        "notification at 5 should fire, got: {fired:?}"
+    );
+    assert!(
+        fired.contains(&10),
+        "notification at 10 should fire, got: {fired:?}"
+    );
+    assert!(
+        fired.contains(&15),
+        "notification at 15 should fire, got: {fired:?}"
+    );
 }
 
 // ===========================================================================
@@ -335,7 +340,7 @@ fn notify_fires_without_data_at_time() {
 fn flat_map_variable_output() {
     let rt = RuntimeHandle::new(RuntimeConfig::default()).unwrap();
     let builder = DataflowBuilder::<u64>::new("flat-map-variable");
-    let input = builder.input::<i32>("data");
+    let input = builder.input::<i32>("data").unwrap();
     input
         .flat_map("expand", |_t, v| {
             if v < 0 {
@@ -346,7 +351,7 @@ fn flat_map_variable_output() {
                 vec![v; v as usize]
             }
         })
-        .output("results");
+        .output("results").unwrap();
     let dataflow = builder.build().unwrap();
 
     let mut handle = rt.spawn(dataflow, SpawnOptions::new()).unwrap();
@@ -373,16 +378,17 @@ fn flat_map_variable_output() {
 fn concat_multiple_inputs() {
     let rt = RuntimeHandle::new(RuntimeConfig::default()).unwrap();
     let builder = DataflowBuilder::<u64>::new("concat-inputs");
-    let input_a = builder.input::<i32>("a");
-    let input_b = builder.input::<i32>("b");
-    let input_c = builder.input::<i32>("c");
+    let input_a = builder.input::<i32>("a").unwrap();
+    let input_b = builder.input::<i32>("b").unwrap();
+    let input_c = builder.input::<i32>("c").unwrap();
 
     let merged = Pipe::concat(vec![
         input_a.map("tag-a", |_t, v| v * 10),
         input_b.map("tag-b", |_t, v| v * 100),
         input_c.map("tag-c", |_t, v| v * 1000),
-    ]);
-    merged.output("results");
+    ])
+    .unwrap();
+    merged.output("results").unwrap();
     let dataflow = builder.build().unwrap();
 
     let mut handle = rt.spawn(dataflow, SpawnOptions::new()).unwrap();

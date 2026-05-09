@@ -19,13 +19,17 @@ fn main() {
     let rt_fast = RuntimeHandle::new(RuntimeConfig {
         worker_threads: 4,
         schedule_policy: None,
-        name: "fast-pipeline".to_string(), ..Default::default() })
+        name: "fast-pipeline".to_string(),
+        ..Default::default()
+    })
     .expect("failed to create fast runtime");
 
     let rt_batch = RuntimeHandle::new(RuntimeConfig {
         worker_threads: 2,
         schedule_policy: None,
-        name: "batch-pipeline".to_string(), ..Default::default() })
+        name: "batch-pipeline".to_string(),
+        ..Default::default()
+    })
     .expect("failed to create batch runtime");
 
     println!("Created runtime '{}' (4 threads)", rt_fast.name());
@@ -35,8 +39,8 @@ fn main() {
 
     // Fast runtime: spawn a pipeline with external input
     let builder = DataflowBuilder::<u64>::new("fast-double");
-    let input = builder.input::<i32>("numbers");
-    input.map("double", |_t, x| x * 2).output("results");
+    let input = builder.input::<i32>("numbers").unwrap();
+    input.map("double", |_t, x| x * 2).output("results").unwrap();
     let dataflow = builder.build().expect("build failed");
 
     let mut fast_handle = rt_fast
@@ -60,7 +64,7 @@ fn main() {
     let out = builder
         .source("data", vec![(0u64, vec![1i32, 2, 3]), (1, vec![4, 5, 6])])
         .map("square", |_t, x| x * x)
-        .output("results");
+        .output("results").unwrap();
     let dataflow = builder.build().expect("build failed");
 
     rt_batch
@@ -96,7 +100,7 @@ fn main() {
     let builder = DataflowBuilder::<u64>::new("batch-extra");
     builder
         .source("src", vec![(0u64, vec![100i32])])
-        .output("out");
+        .output("out").unwrap();
     let dataflow = builder.build().expect("build failed");
     rt_batch
         .spawn(dataflow, SpawnOptions::default())

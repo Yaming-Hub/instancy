@@ -69,7 +69,7 @@ async fn main() {
     }
 
     // Create shared peer manager for node-a → node-b
-    let manager = SharedPeerManager::new("node-b".to_string(), config, connections, None, &handle);
+    let manager = SharedPeerManager::new("node-b".to_string(), config, connections, None, &handle).unwrap();
 
     println!(
         "Created SharedPeerManager with {} connections to node-b\n",
@@ -179,13 +179,27 @@ async fn main() {
     }
 
     // Verify correctness: each dataflow only receives its own messages
-    assert_eq!(messages_1.len(), 5, "dataflow-1 should receive exactly 5 messages");
-    assert_eq!(messages_2.len(), 5, "dataflow-2 should receive exactly 5 messages");
+    assert_eq!(
+        messages_1.len(),
+        5,
+        "dataflow-1 should receive exactly 5 messages"
+    );
+    assert_eq!(
+        messages_2.len(),
+        5,
+        "dataflow-2 should receive exactly 5 messages"
+    );
     for msg in &messages_1 {
-        assert!(msg.starts_with("DF1-"), "dataflow-1 got wrong message: {msg}");
+        assert!(
+            msg.starts_with("DF1-"),
+            "dataflow-1 got wrong message: {msg}"
+        );
     }
     for msg in &messages_2 {
-        assert!(msg.starts_with("DF2-"), "dataflow-2 got wrong message: {msg}");
+        assert!(
+            msg.starts_with("DF2-"),
+            "dataflow-2 got wrong message: {msg}"
+        );
     }
 
     // Verify ordering within each dataflow
@@ -198,7 +212,10 @@ async fn main() {
 
     println!("\n✓ Both dataflows correctly received their messages in order");
     println!("✓ Messages were isolated (no cross-dataflow contamination)");
-    println!("✓ All data shared {} pooled connections", manager.connection_count());
+    println!(
+        "✓ All data shared {} pooled connections",
+        manager.connection_count()
+    );
 
     // Cleanup
     manager.unregister_dataflow(&dataflow_1).await;
@@ -210,4 +227,3 @@ async fn main() {
 
     println!("\n=== done ===");
 }
-

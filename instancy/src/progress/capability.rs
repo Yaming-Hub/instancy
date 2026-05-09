@@ -224,8 +224,10 @@ impl<T: Timestamp> CapabilitySet<T> {
                 .elements
                 .iter()
                 .find(|c| c.time.less_equal(&t))
+                // SAFETY: frontier_times validated against existing capabilities in the loop above
                 .expect("validated above")
                 .delayed(&t)
+                // SAFETY: frontier_times validated against existing capabilities in the loop above
                 .expect("validated above");
             new_caps.push(cap);
         }

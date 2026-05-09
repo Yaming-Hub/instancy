@@ -27,8 +27,8 @@ use tokio::net::{TcpListener, TcpStream};
 use instancy::DataflowBuilder;
 use instancy::DataflowId;
 use instancy::Result;
-use instancy::communication::transport_session::PeerConnection;
 use instancy::communication::ClusterSpawnTransport;
+use instancy::communication::transport_session::PeerConnection;
 use instancy::{ClusterTopology, NodeConfig};
 use instancy::{RuntimeConfig, RuntimeHandle};
 
@@ -112,7 +112,7 @@ async fn parallel_tcp_dataflows_shared_pool() {
         df_idx: usize,
     ) -> impl Fn(&mut DataflowBuilder<u64>) -> Result<()> + Clone + Send + 'static {
         move |builder: &mut DataflowBuilder<u64>| -> Result<()> {
-            let input = builder.input::<i64>("data");
+            let input = builder.input::<i64>("data").unwrap();
             let exchanged = input.exchange("by_val", |x: &i64| *x as u64);
             let mapped = match df_idx {
                 0 => exchanged.map("transform", |_t, x| x * 2),
@@ -120,7 +120,7 @@ async fn parallel_tcp_dataflows_shared_pool() {
                 2 => exchanged.map("transform", |_t, x| x + 1000),
                 _ => unreachable!(),
             };
-            mapped.output("results");
+            mapped.output("results").unwrap();
             Ok(())
         }
     }
@@ -293,9 +293,9 @@ async fn parallel_tcp_dataflows_multi_epoch() {
     let topology2 = topology.clone();
 
     let build = |builder: &mut DataflowBuilder<u64>| -> Result<()> {
-        let input = builder.input::<i64>("data");
+        let input = builder.input::<i64>("data").unwrap();
         let exchanged = input.exchange("by_val", |x: &i64| *x as u64);
-        exchanged.map("double", |_t, x| x * 2).output("results");
+        exchanged.map("double", |_t, x| x * 2).output("results").unwrap();
         Ok(())
     };
 

@@ -459,7 +459,9 @@ impl CancellationToken {
     }
 
     /// Await notification from an ancestor node and its parents.
-    fn await_ancestor_notify(node: &Arc<TokenInner>) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + '_>> {
+    fn await_ancestor_notify(
+        node: &Arc<TokenInner>,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + '_>> {
         Box::pin(async move {
             let notified = node.async_notify.notified();
             tokio::pin!(notified);
@@ -506,8 +508,10 @@ impl CancellationGuard {
     /// Disarm the guard — the token will NOT be cancelled on drop.
     ///
     /// Returns the inner token for continued use.
-    pub fn disarm(mut self) -> CancellationToken {
-        self.token.take().expect("guard already disarmed")
+    pub fn disarm(mut self) -> crate::Result<CancellationToken> {
+        self.token
+            .take()
+            .ok_or_else(|| crate::Error::Custom("cancellation guard already disarmed".into()))
     }
 }
 
@@ -639,7 +643,7 @@ mod tests {
         let clone = token.clone();
 
         let guard = clone.drop_guard();
-        let _recovered = guard.disarm();
+        let _recovered = guard.disarm().unwrap();
 
         assert!(!token.is_cancelled());
     }

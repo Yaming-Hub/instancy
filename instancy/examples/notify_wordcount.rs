@@ -75,7 +75,7 @@ fn main() {
             "notify-wordcount",
             num_workers,
             |builder: &mut DataflowBuilder<u64>| {
-                let input = builder.input::<String>("lines");
+                let input = builder.input::<String>("lines").unwrap();
 
                 input
                     // Split lines into individual words.
@@ -118,7 +118,7 @@ fn main() {
                             Ok(())
                         }
                     })
-                    .output("counts");
+                    .output("counts").unwrap();
 
                 Ok(())
             },

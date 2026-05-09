@@ -59,6 +59,7 @@ pub mod progress;
 pub mod providers;
 pub mod runtime;
 pub mod scheduler;
+pub(crate) mod wire;
 pub mod worker;
 pub mod worker_pool;
 
@@ -78,16 +79,16 @@ pub use dataflow::{
 pub use dataflow::{InputSender, OutputReceiver};
 
 // Runtime
-pub use runtime::{
-    DataflowCompletion, IoMode, MultiDataflowCompletion, MultiSpawnedDataflow, RuntimeConfig,
-    RuntimeHandle, SpawnOptions, SpawnedDataflow, TokioMode,
-};
 #[cfg(feature = "transport")]
 pub use runtime::ClusterCompletion;
 #[cfg(feature = "transport")]
 pub use runtime::ClusterSpawnedDataflow;
 #[cfg(feature = "test-utils")]
 pub use runtime::SimpleRuntime;
+pub use runtime::{
+    DataflowCompletion, IoMode, MultiDataflowCompletion, MultiSpawnedDataflow, RuntimeConfig,
+    RuntimeHandle, SpawnOptions, SpawnedDataflow, TokioMode,
+};
 
 // Execution / cluster topology
 pub use execute::{ClusterTopology, NodeConfig};

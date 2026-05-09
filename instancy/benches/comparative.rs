@@ -105,7 +105,10 @@ fn partition_round_robin<T: Clone>(items: &[T], workers: usize) -> Vec<Vec<T>> {
     partitions
 }
 
-fn build_join_inputs(items: &[data::LineItem], workers: usize) -> (Vec<Vec<(u64, i64)>>, Vec<Vec<u64>>, Vec<Vec<JoinEvent>>) {
+fn build_join_inputs(
+    items: &[data::LineItem],
+    workers: usize,
+) -> (Vec<Vec<(u64, i64)>>, Vec<Vec<u64>>, Vec<Vec<JoinEvent>>) {
     let left: Vec<(u64, i64)> = items
         .iter()
         .filter(|item| item.ship_date < 11_200)
@@ -124,11 +127,18 @@ fn build_join_inputs(items: &[data::LineItem], workers: usize) -> (Vec<Vec<(u64,
         .zip(right_partitions.iter())
         .map(|(left_part, right_part)| {
             let mut events = Vec::with_capacity(left_part.len() + right_part.len());
-            events.extend(left_part.iter().cloned().map(|(order_key, revenue)| JoinEvent::Left {
-                order_key,
-                revenue,
-            }));
-            events.extend(right_part.iter().copied().map(|order_key| JoinEvent::Right { order_key }));
+            events.extend(
+                left_part
+                    .iter()
+                    .cloned()
+                    .map(|(order_key, revenue)| JoinEvent::Left { order_key, revenue }),
+            );
+            events.extend(
+                right_part
+                    .iter()
+                    .copied()
+                    .map(|order_key| JoinEvent::Right { order_key }),
+            );
             events
         })
         .collect();
@@ -191,7 +201,11 @@ fn compute_pagerank(edges: &[data::Edge], num_vertices: u64, iterations: usize) 
         ranks = next;
     }
 
-    ranks.into_iter().enumerate().map(|(idx, rank)| (idx as u64, rank)).collect()
+    ranks
+        .into_iter()
+        .enumerate()
+        .map(|(idx, rank)| (idx as u64, rank))
+        .collect()
 }
 
 fn instancy_q1(rt: &RuntimeHandle, items: &[data::LineItem], cutoff: u64) {
@@ -278,17 +292,22 @@ fn timely_q1(items: &[data::LineItem], cutoff: u64) {
     });
 }
 
-fn instancy_q2(rt: &RuntimeHandle, left_partitions: &[Vec<(u64, i64)>], right_partitions: &[Vec<u64>], workers: usize) {
+fn instancy_q2(
+    rt: &RuntimeHandle,
+    left_partitions: &[Vec<(u64, i64)>],
+    right_partitions: &[Vec<u64>],
+    workers: usize,
+) {
     let mut handle = rt
         .spawn_multi(
             "q2-instancy",
             workers,
             |builder| {
                 let left = builder
-                    .input::<(u64, i64)>("left")
+                    .input::<(u64, i64)>("left").unwrap()
                     .exchange_by_hash("left_exchange", |(order_key, _)| *order_key);
                 let right = builder
-                    .input::<u64>("right")
+                    .input::<u64>("right").unwrap()
                     .exchange_by_hash("right_exchange", |order_key| *order_key);
 
                 left.binary::<u64, (u64, i64), _>(right, "join", {
@@ -314,7 +333,12 @@ fn instancy_q2(rt: &RuntimeHandle, left_partitions: &[Vec<(u64, i64)>], right_pa
                             let mut matched = Vec::new();
                             for order_key in data {
                                 if let Some(revenues) = left_state.get(&order_key) {
-                                    matched.extend(revenues.iter().copied().map(|revenue| (order_key, revenue)));
+                                    matched.extend(
+                                        revenues
+                                            .iter()
+                                            .copied()
+                                            .map(|revenue| (order_key, revenue)),
+                                    );
                                 }
                                 *right_counts.entry(order_key).or_default() += 1;
                             }
@@ -385,7 +409,9 @@ fn timely_q2(event_partitions: &[Vec<JoinEvent>], config: &timely::Config) {
             let (input, stream) = scope.new_input::<JoinEvent>();
             let probe = stream
                 .exchange(|event| match event {
-                    JoinEvent::Left { order_key, .. } | JoinEvent::Right { order_key } => *order_key,
+                    JoinEvent::Left { order_key, .. } | JoinEvent::Right { order_key } => {
+                        *order_key
+                    }
                 })
                 .unary_notify(Pipeline, "join", None, {
                     let mut left_state: HashMap<u64, Vec<i64>> = HashMap::new();
@@ -406,7 +432,10 @@ fn timely_q2(event_partitions: &[Vec<JoinEvent>], config: &timely::Config) {
                                     JoinEvent::Right { order_key } => {
                                         if let Some(revenues) = left_state.get(&order_key) {
                                             matched.extend(
-                                                revenues.iter().copied().map(|revenue| (order_key, revenue)),
+                                                revenues
+                                                    .iter()
+                                                    .copied()
+                                                    .map(|revenue| (order_key, revenue)),
                                             );
                                         }
                                         *right_counts.entry(order_key).or_default() += 1;
@@ -453,7 +482,15 @@ fn timely_q2(event_partitions: &[Vec<JoinEvent>], config: &timely::Config) {
     .unwrap();
 }
 
-fn instancy_q3(rt: &RuntimeHandle, items: &[data::LineItem], min_ship: u64, max_ship: u64, min_discount: i64, max_discount: i64, qty_threshold: i64) {
+fn instancy_q3(
+    rt: &RuntimeHandle,
+    items: &[data::LineItem],
+    min_ship: u64,
+    max_ship: u64,
+    min_discount: i64,
+    max_discount: i64,
+    qty_threshold: i64,
+) {
     let builder = DataflowBuilder::<u64>::new("q3-instancy");
     builder
         .source("src", vec![(0, items.to_vec())])
@@ -477,7 +514,14 @@ fn instancy_q3(rt: &RuntimeHandle, items: &[data::LineItem], min_ship: u64, max_
         .unwrap();
 }
 
-fn timely_q3(items: &[data::LineItem], min_ship: u64, max_ship: u64, min_discount: i64, max_discount: i64, qty_threshold: i64) {
+fn timely_q3(
+    items: &[data::LineItem],
+    min_ship: u64,
+    max_ship: u64,
+    min_discount: i64,
+    max_discount: i64,
+    qty_threshold: i64,
+) {
     let items = items.to_vec();
     timely::execute_directly(move |worker| {
         let (mut input, probe) = worker.dataflow::<u64, _, _>(|scope| {
@@ -688,7 +732,7 @@ fn instancy_q7(rt: &RuntimeHandle, partitions: &[Vec<u64>], workers: usize) {
             workers,
             |builder| {
                 builder
-                    .input::<u64>("data")
+                    .input::<u64>("data").unwrap()
                     .exchange_by_hash("route", |value| *value)
                     .reduce("sum", |a, b| a + b)
                     .for_each("sink", |_t, value| {
@@ -784,12 +828,17 @@ fn bench_q2(c: &mut Criterion) {
         let items = data::generate_lineitems(count as usize);
         group.throughput(Throughput::Elements(count));
         for &workers in &[2usize, 4] {
-            let (left_partitions, right_partitions, event_partitions) = build_join_inputs(&items, workers);
+            let (left_partitions, right_partitions, event_partitions) =
+                build_join_inputs(&items, workers);
             let timely_config = timely::Config::process(workers);
             group.bench_with_input(
                 BenchmarkId::new(format!("instancy_{workers}w"), count),
                 &count,
-                |b, _| b.iter(|| instancy_q2(&instancy_rt, &left_partitions, &right_partitions, workers)),
+                |b, _| {
+                    b.iter(|| {
+                        instancy_q2(&instancy_rt, &left_partitions, &right_partitions, workers)
+                    })
+                },
             );
             group.bench_with_input(
                 BenchmarkId::new(format!("timely_{workers}w"), count),
@@ -848,12 +897,16 @@ fn bench_q5(c: &mut Criterion) {
     for &(vertices, edges_count) in &[(1_000u64, 10_000usize), (10_000, 100_000)] {
         let edges = data::generate_graph(vertices, edges_count);
         group.throughput(Throughput::Elements(edges_count as u64));
-        group.bench_with_input(BenchmarkId::new("instancy", edges_count), &edges_count, |b, _| {
-            b.iter(|| instancy_q5(&instancy_rt, &edges, vertices))
-        });
-        group.bench_with_input(BenchmarkId::new("timely", edges_count), &edges_count, |b, _| {
-            b.iter(|| timely_q5(&edges, vertices))
-        });
+        group.bench_with_input(
+            BenchmarkId::new("instancy", edges_count),
+            &edges_count,
+            |b, _| b.iter(|| instancy_q5(&instancy_rt, &edges, vertices)),
+        );
+        group.bench_with_input(
+            BenchmarkId::new("timely", edges_count),
+            &edges_count,
+            |b, _| b.iter(|| timely_q5(&edges, vertices)),
+        );
     }
     group.finish();
 }
@@ -906,5 +959,7 @@ fn bench_q7(c: &mut Criterion) {
     group.finish();
 }
 
-criterion_group!(benches, bench_q1, bench_q2, bench_q3, bench_q4, bench_q5, bench_q6, bench_q7);
+criterion_group!(
+    benches, bench_q1, bench_q2, bench_q3, bench_q4, bench_q5, bench_q6, bench_q7
+);
 criterion_main!(benches);

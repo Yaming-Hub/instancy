@@ -277,7 +277,6 @@ impl<T: Timestamp, D: Send + 'static> ExchangeChannelSet<T, D> {
 
         Ok(pullers)
     }
-
 }
 
 // ---------------------------------------------------------------------------
@@ -1130,11 +1129,7 @@ where
                 params.runtime_handle,
             ),
         ));
-        build_broadcast_factories(
-            params.num_workers,
-            params.num_workers,
-            materializer,
-        )
+        build_broadcast_factories(params.num_workers, params.num_workers, materializer)
     }
 }
 
@@ -1167,6 +1162,7 @@ where
     // Validate consistency.
     {
         let mat = materializer.lock().unwrap_or_else(|e| e.into_inner());
+        // SAFETY: worker counts validated during graph construction
         assert_eq!(
             mat.num_source_workers(),
             num_source_workers,
@@ -1174,6 +1170,7 @@ where
             mat.num_source_workers(),
             num_source_workers
         );
+        // SAFETY: worker counts validated during graph construction
         assert_eq!(
             mat.num_target_workers(),
             num_target_workers,
@@ -1201,9 +1198,7 @@ where
                     let slot = worker_slot;
                     wakes.register(slot, wake);
 
-                    let mut mat = materializer
-                        .lock()
-                        .unwrap_or_else(|e| e.into_inner());
+                    let mut mat = materializer.lock().unwrap_or_else(|e| e.into_inner());
 
                     let pushers: Vec<Box<dyn crate::dataflow::channels::Push<T, D, ()>>> =
                         if slot < m {
@@ -1275,7 +1270,9 @@ where
 {
     {
         let mat = materializer.lock().unwrap_or_else(|e| e.into_inner());
+        // SAFETY: worker counts validated during graph construction
         assert_eq!(mat.num_source_workers(), num_source_workers);
+        // SAFETY: worker counts validated during graph construction
         assert_eq!(mat.num_target_workers(), num_target_workers);
     }
 
@@ -1294,9 +1291,7 @@ where
                     let slot = worker_slot;
                     wakes.register(slot, wake);
 
-                    let mut mat = materializer
-                        .lock()
-                        .unwrap_or_else(|e| e.into_inner());
+                    let mut mat = materializer.lock().unwrap_or_else(|e| e.into_inner());
 
                     let pushers: Vec<Box<dyn crate::dataflow::channels::Push<T, D, ()>>> =
                         if slot < m {

@@ -18,13 +18,13 @@ fn main() {
         .clone()
         .filter("keep_even", |_t, x| x % 2 == 0)
         .map("double", |_t, x| x * 2);
-    let evens_port = evens.output("doubled_evens");
+    let evens_port = evens.output("doubled_evens").unwrap();
 
     // Branch 2: odd numbers, squared
     let odds = numbers
         .filter("keep_odd", |_t, x| x % 2 != 0)
         .map("square", |_t, x| x * x);
-    let odds_port = odds.output("squared_odds");
+    let odds_port = odds.output("squared_odds").unwrap();
 
     // Build and run
     let dataflow = builder.build().expect("graph construction failed");

@@ -11,6 +11,7 @@ use std::sync::{Arc, Mutex};
 
 use crate::communication::interprocess::ChannelId;
 use crate::dataflow::id::DataflowId;
+use crate::error::LockResultExt;
 use crate::execute::ClusterTopology;
 use crate::worker::WorkerId;
 
@@ -129,13 +130,14 @@ impl DataflowSession {
 
     /// Get all remote channels (cross-node).
     pub fn remote_channels(&self) -> Vec<ChannelInfo> {
-        self.channels
-            .lock()
-            .expect("channel registry lock poisoned")
-            .values()
-            .filter(|c| !c.is_local)
-            .cloned()
-            .collect()
+        let channels = match self.channels.lock().or_poison("channel registry") {
+            Ok(channels) => channels,
+            Err(_) => {
+                // TODO: propagate poisoned channel-registry locks once accessors can return Result.
+                return Vec::new();
+            }
+        };
+        channels.values().filter(|c| !c.is_local).cloned().collect()
     }
 
     /// Get a specific channel's info.

@@ -33,7 +33,7 @@ fn main() {
 
     // Build: input → filter(high values) → format → output
     let builder = DataflowBuilder::<u64>::new("sensor_pipeline");
-    let input = builder.input::<SensorReading>("readings");
+    let input = builder.input::<SensorReading>("readings").unwrap();
 
     input
         // Only keep readings above threshold
@@ -45,7 +45,7 @@ fn main() {
                 r.sensor_id, r.value
             )
         })
-        .output("alerts");
+        .output("alerts").unwrap();
 
     let dataflow = builder.build().expect("build failed");
     println!(

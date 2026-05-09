@@ -14,27 +14,29 @@ fn main() {
     );
     let scores = builder.source("scores", vec![(0u64, vec![95i32, 87])]);
 
-    let paired = names.binary::<i32, String, _>(scores, "pair", |names_in, scores_in, out| {
-        let mut ns = Vec::new();
-        while let Some((_t, data)) = names_in.next() {
-            ns.extend(data.iter().cloned());
-        }
-        let mut ss = Vec::new();
-        while let Some((_t, data)) = scores_in.next() {
-            ss.extend(data.iter().cloned());
-        }
-        if !ns.is_empty() {
-            let pairs: Vec<String> = ns
-                .iter()
-                .zip(ss.iter())
-                .map(|(n, s)| format!("{n}: {s}"))
-                .collect();
-            out.push_vec(0, pairs);
-        }
-        Ok(())
-    });
+    let paired = names
+        .binary::<i32, String, _>(scores, "pair", |names_in, scores_in, out| {
+            let mut ns = Vec::new();
+            while let Some((_t, data)) = names_in.next() {
+                ns.extend(data.iter().cloned());
+            }
+            let mut ss = Vec::new();
+            while let Some((_t, data)) = scores_in.next() {
+                ss.extend(data.iter().cloned());
+            }
+            if !ns.is_empty() {
+                let pairs: Vec<String> = ns
+                    .iter()
+                    .zip(ss.iter())
+                    .map(|(n, s)| format!("{n}: {s}"))
+                    .collect();
+                out.push_vec(0, pairs);
+            }
+            Ok(())
+        })
+        .unwrap();
 
-    let binary_out = paired.output("binary_results");
+    let binary_out = paired.output("binary_results").unwrap();
 
     let dataflow = builder.build().unwrap();
     rt.spawn(dataflow, SpawnOptions::default())
@@ -59,8 +61,8 @@ fn main() {
     );
     let info = builder.source("info", vec![(0u64, vec!["[INFO] started".to_string()])]);
 
-    let all_logs = Pipe::concat(vec![critical, warnings, info]);
-    let concat_out = all_logs.output("all_logs");
+    let all_logs = Pipe::concat(vec![critical, warnings, info]).unwrap();
+    let concat_out = all_logs.output("all_logs").unwrap();
 
     let dataflow = builder.build().unwrap();
     rt.spawn(dataflow, SpawnOptions::default())
@@ -80,8 +82,9 @@ fn main() {
 
     let all = evens
         .merge(odds)
+        .unwrap()
         .map("sort_label", |_t, x| format!("num={x}"));
-    let merge_out = all.output("sorted");
+    let merge_out = all.output("sorted").unwrap();
 
     let dataflow = builder.build().unwrap();
     rt.spawn(dataflow, SpawnOptions::default())

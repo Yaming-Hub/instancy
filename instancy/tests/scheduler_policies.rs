@@ -4,7 +4,9 @@ use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use instancy::scheduler::policy::{PriorityPolicy, PriorityWithAgingPolicy};
-use instancy::{DataflowBuilder, InputSender, RuntimeConfig, RuntimeHandle, SpawnOptions, SpawnedDataflow};
+use instancy::{
+    DataflowBuilder, InputSender, RuntimeConfig, RuntimeHandle, SpawnOptions, SpawnedDataflow,
+};
 
 const TEST_TIMEOUT: Duration = Duration::from_secs(5);
 const LONG_TIMEOUT: Duration = Duration::from_secs(20);
@@ -47,12 +49,15 @@ fn build_recording_dataflow(
     let completed_at_slot = Arc::clone(&probe.completed_at_ms);
 
     builder
-        .input::<u64>("input")
+        .input::<u64>("input").unwrap()
         .map("work", |_t, value| value + 1)
         .map("record-completion", move |_t, value| {
             if value == final_value + 1 {
                 completed_at_slot.store(now_ms(), Ordering::SeqCst);
-                order_slot.store(sequence.fetch_add(1, Ordering::SeqCst) + 1, Ordering::SeqCst);
+                order_slot.store(
+                    sequence.fetch_add(1, Ordering::SeqCst) + 1,
+                    Ordering::SeqCst,
+                );
             }
             value
         });
@@ -62,9 +67,9 @@ fn build_recording_dataflow(
 fn build_simple_dataflow(name: &str) -> instancy::LogicalDataflow<u64> {
     let builder = DataflowBuilder::<u64>::new(name);
     builder
-        .input::<u64>("input")
+        .input::<u64>("input").unwrap()
         .map("double", |_t, value| value * 2)
-        .output("output");
+        .output("output").unwrap();
     builder.build().unwrap()
 }
 
@@ -124,7 +129,9 @@ fn priority_policy_schedules_high_priority_first() {
     let rt = RuntimeHandle::new(RuntimeConfig {
         worker_threads: 1,
         schedule_policy: Some(Box::new(PriorityPolicy)),
-        name: "priority-policy-test".into(), ..Default::default() })
+        name: "priority-policy-test".into(),
+        ..Default::default()
+    })
     .unwrap();
 
     let sequence = Arc::new(AtomicU64::new(0));
@@ -143,12 +150,7 @@ fn priority_policy_schedules_high_priority_first() {
     );
     let mut high = spawn_pending(
         &rt,
-        build_recording_dataflow(
-            "high",
-            PRIORITY_BATCHES - 1,
-            sequence,
-            high_probe.clone(),
-        ),
+        build_recording_dataflow("high", PRIORITY_BATCHES - 1, sequence, high_probe.clone()),
         100,
     );
 
@@ -185,7 +187,9 @@ fn fifo_policy_is_fair_regardless_of_priority() {
     let rt = RuntimeHandle::new(RuntimeConfig {
         worker_threads: 1,
         schedule_policy: None,
-        name: "fifo-policy-test".into(), ..Default::default() })
+        name: "fifo-policy-test".into(),
+        ..Default::default()
+    })
     .unwrap();
 
     let sequence = Arc::new(AtomicU64::new(0));
@@ -204,12 +208,7 @@ fn fifo_policy_is_fair_regardless_of_priority() {
     );
     let mut high = spawn_pending(
         &rt,
-        build_recording_dataflow(
-            "high",
-            PRIORITY_BATCHES - 1,
-            sequence,
-            high_probe.clone(),
-        ),
+        build_recording_dataflow("high", PRIORITY_BATCHES - 1, sequence, high_probe.clone()),
         100,
     );
 
@@ -244,7 +243,9 @@ fn aging_prevents_starvation() {
     let rt = RuntimeHandle::new(RuntimeConfig {
         worker_threads: 1,
         schedule_policy: Some(Box::new(PriorityWithAgingPolicy { aging_rate: 10.0 })),
-        name: "aging-policy-test".into(), ..Default::default() })
+        name: "aging-policy-test".into(),
+        ..Default::default()
+    })
     .unwrap();
 
     let sequence = Arc::new(AtomicU64::new(0));
@@ -285,11 +286,17 @@ fn aging_prevents_starvation() {
     low.wait(TEST_TIMEOUT, "low-priority aging dataflow");
     low_feed.join().unwrap();
 
-    assert!(low_probe.order() >= 1, "low-priority dataflow never completed");
+    assert!(
+        low_probe.order() >= 1,
+        "low-priority dataflow never completed"
+    );
 
     high.wait(LONG_TIMEOUT, "high-priority aging dataflow");
     high_feed.join().unwrap();
-    assert!(high_probe.order() >= 1, "high-priority dataflow never completed");
+    assert!(
+        high_probe.order() >= 1,
+        "high-priority dataflow never completed"
+    );
 }
 
 #[test]
@@ -315,6 +322,10 @@ fn multiple_dataflows_share_worker_pool() {
         handle.join_blocking().unwrap();
         let data = receiver.collect_data();
         assert_eq!(data.len(), 1, "dataflow {idx} should emit one batch");
-        assert_eq!(data[0].1, vec![idx * 2], "dataflow {idx} produced wrong output");
+        assert_eq!(
+            data[0].1,
+            vec![idx * 2],
+            "dataflow {idx} produced wrong output"
+        );
     }
 }

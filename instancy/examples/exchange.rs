@@ -32,13 +32,13 @@ fn main() {
             "exchange_demo",
             num_workers,
             |builder| {
-                let input = builder.input::<u64>("data");
+                let input = builder.input::<u64>("data").unwrap();
 
                 // Exchange by value — routes each element to worker (value % num_workers).
                 let exchanged = input.exchange_by_hash("by_val", |x: &u64| *x);
 
                 // Pass through to output for verification.
-                exchanged.map("pass", |_t, x| x).output("results");
+                exchanged.map("pass", |_t, x| x).output("results").unwrap();
 
                 Ok(())
             },

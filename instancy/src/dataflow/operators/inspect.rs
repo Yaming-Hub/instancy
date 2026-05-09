@@ -11,7 +11,7 @@ use crate::dataflow::operators::handles::{InputHandle, OutputHandle};
 use crate::dataflow::scope::Scope;
 use crate::dataflow::stage::StageId;
 use crate::dataflow::stream::{Slot, StreamEdge};
-use crate::error::Result;
+use crate::error::{LockResultExt, Result};
 use crate::progress::timestamp::Timestamp;
 
 /// A registered inspect operator.
@@ -155,6 +155,7 @@ impl<S: Scope, D: 'static> InspectExt<S, D> for StreamEdge<S, D> {
             .register_operator(crate::dataflow::graph::OperatorInfo::new(
                 op_index, name, stage_id, 1, 1,
             ))
+            // SAFETY: operator index freshly allocated by allocate_operator_index()
             .expect("operator index should be unique");
         scope.add_edge(crate::dataflow::graph::EdgeInfo::new(
             *self.source(),
@@ -188,9 +189,13 @@ impl<S: Scope, D: 'static> InspectExt<S, D> for StreamEdge<S, D> {
         let collected_clone = Arc::clone(&collected);
 
         let stream = self.inspect(name, move |time, data| {
-            let mut guard = collected_clone
-                .lock()
-                .expect("inspect collection lock poisoned");
+            let mut guard = match collected_clone.lock().or_poison("inspect collection") {
+                Ok(guard) => guard,
+                Err(_) => {
+                    // TODO: propagate poisoned inspect locks once inspect closures can return Result.
+                    return;
+                }
+            };
             for item in data {
                 guard.push((time.clone(), item.clone()));
             }

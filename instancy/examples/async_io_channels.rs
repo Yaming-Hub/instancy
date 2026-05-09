@@ -34,17 +34,19 @@ async fn main() {
     let rt = RuntimeHandle::new(RuntimeConfig {
         worker_threads: 2,
         schedule_policy: None,
-        name: "async-demo".into(), ..Default::default() })
+        name: "async-demo".into(),
+        ..Default::default()
+    })
     .expect("failed to create runtime");
 
     // --- Pipeline 1: async input/output with async SpawnOptions ---
 
     let builder = DataflowBuilder::<u64>::new("double-pipeline");
-    let input = builder.input::<i32>("numbers");
+    let input = builder.input::<i32>("numbers").unwrap();
     input
         .map("double", |_t, x| x * 2)
         .filter("positive", |_t, x| x > &0)
-        .output("results");
+        .output("results").unwrap();
     let dataflow = builder.build().expect("build failed");
 
     // Async SpawnOptions wires tokio::sync::mpsc channels for I/O
@@ -90,7 +92,7 @@ async fn main() {
     let out = builder
         .source("data", vec![(0u64, vec![1i32, 2, 3, 4, 5])])
         .map("square", |_t, x| x * x)
-        .output("results");
+        .output("results").unwrap();
     let dataflow = builder.build().expect("build failed");
 
     // spawn() is sync — join() returns DataflowCompletion which IS a real Future
@@ -117,12 +119,9 @@ async fn main() {
     for i in 0..3 {
         let builder = DataflowBuilder::<u64>::new(format!("concurrent_{i}"));
         builder
-            .source(
-                "src",
-                vec![(0u64, vec![i * 10 + 1, i * 10 + 2])],
-            )
+            .source("src", vec![(0u64, vec![i * 10 + 1, i * 10 + 2])])
             .map("inc", |_t, x| x + 100)
-            .output("out");
+            .output("out").unwrap();
         let dataflow = builder.build().expect("build failed");
         // spawn() returns sync, join() yields a real Future
         completions.push(

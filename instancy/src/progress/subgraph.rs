@@ -139,6 +139,7 @@ impl<T: Timestamp> SubgraphBuilder<T> {
         Ok(self
             .progress_buffers
             .get(&index)
+            // SAFETY: key was just inserted via progress_buffers.insert() above
             .expect("operator progress exists after registration"))
     }
 
@@ -165,6 +166,7 @@ impl<T: Timestamp> SubgraphBuilder<T> {
         Ok(self
             .progress_buffers
             .get(&index)
+            // SAFETY: key was just inserted via progress_buffers.insert() above
             .expect("operator progress exists after registration"))
     }
 
@@ -247,13 +249,20 @@ impl<T: Timestamp> SubgraphBuilder<T> {
             let conn = self
                 .connectivity
                 .get(&index)
+                // SAFETY: connectivity inserted alongside progress_buffers in add_operator
                 .expect("connectivity missing for registered operator");
-            reachability_builder.add_node(index, shape.inputs, shape.outputs, conn.clone());
+            // SAFETY: operator was just registered with matching port counts
+            reachability_builder
+                .add_node(index, shape.inputs, shape.outputs, conn.clone())
+                .expect("registered operator should satisfy reachability invariants");
         }
 
         // Add all edges.
         for (source, target) in &self.edges {
-            reachability_builder.add_edge(source.clone(), target.clone());
+            // SAFETY: edges reference ports validated during add_edge
+            reachability_builder
+                .add_edge(source.clone(), target.clone())
+                .expect("stored edge should reference a registered source port");
         }
 
         let (tracker, scope_summary) = reachability_builder.build();
@@ -397,8 +406,12 @@ impl<T: Timestamp> ProgressTracker<T> {
     /// the initial capabilities to all peer workers and absorbs peers'
     /// initial capabilities. This ensures every worker's tracker starts
     /// with a global view of all capabilities across all workers.
-    pub fn initialize(&mut self) {
-        assert!(!self.initialized, "ProgressTracker already initialized");
+    pub fn initialize(&mut self) -> Result<(), crate::Error> {
+        if self.initialized {
+            return Err(crate::Error::InvalidConfig(
+                "ProgressTracker already initialized".into(),
+            ));
+        }
         self.initialized = true;
 
         // Seed initial capabilities from the builder.
@@ -430,6 +443,7 @@ impl<T: Timestamp> ProgressTracker<T> {
 
         // Check initial completion.
         self.completed = !self.tracker.tracking_anything();
+        Ok(())
     }
 
     /// Returns whether this tracker has been initialized.
@@ -446,8 +460,10 @@ impl<T: Timestamp> ProgressTracker<T> {
     /// This makes the completion check reflect GLOBAL state across all workers.
     ///
     /// Returns the list of operator indices whose frontiers changed.
-    pub fn propagate(&mut self) -> &[usize] {
-        assert!(self.initialized, "must call initialize() first");
+    pub fn propagate(&mut self) -> Result<&[usize], crate::Error> {
+        if !self.initialized {
+            return Err(crate::Error::InvalidConfig("must call initialize() first".into()));
+        }
 
         // 1. Collect local capability changes from operators.
         //    Also accumulates changes into local_changes_buffer for broadcasting.
@@ -468,7 +484,7 @@ impl<T: Timestamp> ProgressTracker<T> {
         // 6. Check completion — now reflects global state if channels are attached.
         self.completed = !self.tracker.tracking_anything();
 
-        &self.dirty_operators
+        Ok(&self.dirty_operators)
     }
 
     /// Returns `true` if the dataflow has completed (no outstanding capabilities).
@@ -485,15 +501,20 @@ impl<T: Timestamp> ProgressTracker<T> {
     ///
     /// Must be called before [`initialize()`](Self::initialize) so that
     /// initial capabilities are broadcast to peers during initialization.
-    pub fn set_progress_channels(&mut self, channels: WorkerProgressChannels<T>) {
-        assert!(
-            !self.initialized,
-            "set_progress_channels must be called before initialize()"
-        );
+    pub fn set_progress_channels(
+        &mut self,
+        channels: WorkerProgressChannels<T>,
+    ) -> Result<(), crate::Error> {
+        if self.initialized {
+            return Err(crate::Error::InvalidConfig(
+                "set_progress_channels must be called before initialize()".into(),
+            ));
+        }
         // Initialize peer tracking: mark peers with receivers as "not yet heard from".
         // Slots with `None` (self or non-existent peers) are pre-marked as heard.
         self.peers_heard_from = channels.receivers.iter().map(|r| r.is_none()).collect();
         self.progress_channels = Some(channels);
+        Ok(())
     }
 
     /// Returns `true` if any peer worker (logical worker in the same
@@ -713,6 +734,7 @@ impl<T: Timestamp> ProgressTracker<T> {
             let state = self
                 .operator_frontiers
                 .get_mut(&index)
+                // SAFETY: frontier_states populated for all operators during initialize()
                 .expect("frontier state exists for tracked operator");
             let mut changed = false;
 
@@ -770,7 +792,9 @@ mod tests {
 
         // Register N operators with identity connectivity.
         for i in 1..=n {
-            builder.add_operator(i, format!("op{i}"), 1, 1, PortConnectivity::identity(0u64)).unwrap();
+            builder
+                .add_operator(i, format!("op{i}"), 1, 1, PortConnectivity::identity(0u64))
+                .unwrap();
         }
 
         // Wire: scope_input → op1 → op2 → ... → opN → scope_output
@@ -788,8 +812,12 @@ mod tests {
     #[test]
     fn builder_register_and_count() {
         let mut builder = SubgraphBuilder::<u64>::new(0, 0);
-        builder.add_operator(1, "op1", 1, 1, PortConnectivity::identity(0u64)).unwrap();
-        builder.add_operator(2, "op2", 2, 1, PortConnectivity::new(2, 1)).unwrap();
+        builder
+            .add_operator(1, "op1", 1, 1, PortConnectivity::identity(0u64))
+            .unwrap();
+        builder
+            .add_operator(2, "op2", 2, 1, PortConnectivity::new(2, 1))
+            .unwrap();
         assert_eq!(builder.operator_count(), 2);
     }
 
@@ -804,16 +832,25 @@ mod tests {
     #[test]
     fn builder_duplicate_index_returns_error() {
         let mut builder = SubgraphBuilder::<u64>::new(0, 0);
-        builder.add_operator(1, "op1", 1, 1, PortConnectivity::identity(0u64)).unwrap();
+        builder
+            .add_operator(1, "op1", 1, 1, PortConnectivity::identity(0u64))
+            .unwrap();
         let result = builder.add_operator(1, "op1_dup", 1, 1, PortConnectivity::identity(0u64));
         assert!(result.is_err());
-        assert!(result.unwrap_err().to_string().contains("already registered"));
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("already registered")
+        );
     }
 
     #[test]
     fn builder_operator_progress_returned() {
         let mut builder = SubgraphBuilder::<u64>::new(0, 0);
-        let progress = builder.add_operator(1, "op1", 2, 3, PortConnectivity::new(2, 3)).unwrap();
+        let progress = builder
+            .add_operator(1, "op1", 2, 3, PortConnectivity::new(2, 3))
+            .unwrap();
         assert_eq!(progress.consumed.len(), 2);
         assert_eq!(progress.produced.len(), 3);
         assert_eq!(progress.internal.len(), 3);
@@ -824,14 +861,16 @@ mod tests {
         let mut builder = SubgraphBuilder::<u64>::new(1, 0);
         let mut cap_batch = ChangeBatch::new();
         cap_batch.update(0u64, 1);
-        builder.add_operator_with_capabilities(
-            1,
-            "source",
-            0,
-            1,
-            PortConnectivity::new(0, 1),
-            vec![cap_batch],
-        ).unwrap();
+        builder
+            .add_operator_with_capabilities(
+                1,
+                "source",
+                0,
+                1,
+                PortConnectivity::new(0, 1),
+                vec![cap_batch],
+            )
+            .unwrap();
         assert_eq!(builder.operator_count(), 1);
     }
 
@@ -842,12 +881,20 @@ mod tests {
         cap.update(0u64, 1);
         // Operator has 2 outputs but only 1 initial_caps batch
         let result = builder.add_operator_with_capabilities(
-            1, "bad", 0, 2,
+            1,
+            "bad",
+            0,
+            2,
             PortConnectivity::new(0, 2),
             vec![cap],
         );
         assert!(result.is_err());
-        assert!(result.unwrap_err().to_string().contains("initial_caps length"));
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("initial_caps length")
+        );
     }
 
     // --- ProgressTracker: linear pipeline ---
@@ -856,7 +903,7 @@ mod tests {
     fn tracker_linear_capability_advance() {
         let builder = linear_pipeline(3);
         let mut tracker = builder.build();
-        tracker.initialize();
+        tracker.initialize().unwrap();
 
         // No capabilities yet — should be completed.
         assert!(tracker.is_completed());
@@ -866,25 +913,29 @@ mod tests {
     fn tracker_linear_with_capability_hold() {
         // Build a 2-operator pipeline with initial capability on op1.
         let mut builder = SubgraphBuilder::new(1, 1);
-        builder.add_operator_with_capabilities(
-            1,
-            "source",
-            1,
-            1,
-            PortConnectivity::identity(0u64),
-            vec![{
-                let mut b = ChangeBatch::new();
-                b.update(0u64, 1);
-                b
-            }],
-        ).unwrap();
-        builder.add_operator(2, "sink", 1, 1, PortConnectivity::identity(0u64)).unwrap();
+        builder
+            .add_operator_with_capabilities(
+                1,
+                "source",
+                1,
+                1,
+                PortConnectivity::identity(0u64),
+                vec![{
+                    let mut b = ChangeBatch::new();
+                    b.update(0u64, 1);
+                    b
+                }],
+            )
+            .unwrap();
+        builder
+            .add_operator(2, "sink", 1, 1, PortConnectivity::identity(0u64))
+            .unwrap();
         builder.add_edge(Location::source(0, 0), Location::target(1, 0));
         builder.add_edge(Location::source(1, 0), Location::target(2, 0));
         builder.add_edge(Location::source(2, 0), Location::target(0, 0));
 
         let mut tracker = builder.build();
-        tracker.initialize();
+        tracker.initialize().unwrap();
 
         // Capability at time 0 is held → not completed.
         assert!(!tracker.is_completed());
@@ -902,13 +953,15 @@ mod tests {
     fn tracker_capability_via_reporter() {
         // Build a simple 1-operator graph.
         let mut builder = SubgraphBuilder::<u64>::new(1, 1);
-        let progress = builder.add_operator(1, "op1", 1, 1, PortConnectivity::identity(0u64)).unwrap();
+        let progress = builder
+            .add_operator(1, "op1", 1, 1, PortConnectivity::identity(0u64))
+            .unwrap();
         let reporter = progress.reporter(0).clone();
         builder.add_edge(Location::source(0, 0), Location::target(1, 0));
         builder.add_edge(Location::source(1, 0), Location::target(0, 0));
 
         let mut tracker = builder.build();
-        tracker.initialize();
+        tracker.initialize().unwrap();
 
         // Initially empty — no capabilities.
         assert!(tracker.is_completed());
@@ -917,33 +970,37 @@ mod tests {
         let _cap = Capability::new(5u64, reporter.clone());
 
         // Propagate — should see the capability.
-        tracker.propagate();
+        tracker.propagate().unwrap();
         assert!(!tracker.is_completed());
 
         // Drop the capability.
         drop(_cap);
 
         // Propagate — should be completed again.
-        tracker.propagate();
+        tracker.propagate().unwrap();
         assert!(tracker.is_completed());
     }
 
     #[test]
     fn tracker_capability_downgrade_advances_frontier() {
         let mut builder = SubgraphBuilder::<u64>::new(1, 1);
-        let progress = builder.add_operator(1, "op1", 1, 1, PortConnectivity::identity(0u64)).unwrap();
+        let progress = builder
+            .add_operator(1, "op1", 1, 1, PortConnectivity::identity(0u64))
+            .unwrap();
         let reporter = progress.reporter(0).clone();
-        builder.add_operator(2, "op2", 1, 1, PortConnectivity::identity(0u64)).unwrap();
+        builder
+            .add_operator(2, "op2", 1, 1, PortConnectivity::identity(0u64))
+            .unwrap();
         builder.add_edge(Location::source(0, 0), Location::target(1, 0));
         builder.add_edge(Location::source(1, 0), Location::target(2, 0));
         builder.add_edge(Location::source(2, 0), Location::target(0, 0));
 
         let mut tracker = builder.build();
-        tracker.initialize();
+        tracker.initialize().unwrap();
 
         // Hold capability at time 0.
         let mut cap = Capability::new(0u64, reporter.clone());
-        tracker.propagate();
+        tracker.propagate().unwrap();
 
         // Op2 frontier should include time 0.
         let f1 = tracker.input_frontier(2, 0);
@@ -952,7 +1009,7 @@ mod tests {
 
         // Downgrade to time 5.
         cap.downgrade(&5).unwrap();
-        tracker.propagate();
+        tracker.propagate().unwrap();
 
         let f2 = tracker.input_frontier(2, 0);
         assert!(!f2.less_equal(&4), "frontier should have advanced past 4");
@@ -960,7 +1017,7 @@ mod tests {
 
         // Drop capability entirely.
         drop(cap);
-        tracker.propagate();
+        tracker.propagate().unwrap();
 
         let f3 = tracker.input_frontier(2, 0);
         assert!(f3.is_empty(), "frontier should be empty after cap drop");
@@ -971,10 +1028,16 @@ mod tests {
     fn tracker_fan_out() {
         // One source, two consumers.
         let mut builder = SubgraphBuilder::<u64>::new(1, 1);
-        let progress = builder.add_operator(1, "source", 1, 1, PortConnectivity::identity(0u64)).unwrap();
+        let progress = builder
+            .add_operator(1, "source", 1, 1, PortConnectivity::identity(0u64))
+            .unwrap();
         let reporter = progress.reporter(0).clone();
-        builder.add_operator(2, "sink_a", 1, 1, PortConnectivity::identity(0u64)).unwrap();
-        builder.add_operator(3, "sink_b", 1, 1, PortConnectivity::identity(0u64)).unwrap();
+        builder
+            .add_operator(2, "sink_a", 1, 1, PortConnectivity::identity(0u64))
+            .unwrap();
+        builder
+            .add_operator(3, "sink_b", 1, 1, PortConnectivity::identity(0u64))
+            .unwrap();
 
         builder.add_edge(Location::source(0, 0), Location::target(1, 0));
         // Fan-out: op1 output → both op2 and op3 inputs.
@@ -984,10 +1047,10 @@ mod tests {
         // op3 output is a dead end for scope output (doesn't feed scope output).
 
         let mut tracker = builder.build();
-        tracker.initialize();
+        tracker.initialize().unwrap();
 
         let _cap = Capability::new(10u64, reporter.clone());
-        tracker.propagate();
+        tracker.propagate().unwrap();
 
         // Both sinks should see the capability.
         assert!(!tracker.input_frontier(2, 0).is_empty());
@@ -995,7 +1058,7 @@ mod tests {
 
         // Drop capability.
         drop(_cap);
-        tracker.propagate();
+        tracker.propagate().unwrap();
 
         assert!(tracker.input_frontier(2, 0).is_empty());
         assert!(tracker.input_frontier(3, 0).is_empty());
@@ -1005,63 +1068,75 @@ mod tests {
     #[test]
     fn tracker_dirty_operators_reported() {
         let mut builder = SubgraphBuilder::<u64>::new(1, 1);
-        let progress = builder.add_operator(1, "op1", 1, 1, PortConnectivity::identity(0u64)).unwrap();
+        let progress = builder
+            .add_operator(1, "op1", 1, 1, PortConnectivity::identity(0u64))
+            .unwrap();
         let reporter = progress.reporter(0).clone();
-        builder.add_operator(2, "op2", 1, 1, PortConnectivity::identity(0u64)).unwrap();
+        builder
+            .add_operator(2, "op2", 1, 1, PortConnectivity::identity(0u64))
+            .unwrap();
         builder.add_edge(Location::source(0, 0), Location::target(1, 0));
         builder.add_edge(Location::source(1, 0), Location::target(2, 0));
         builder.add_edge(Location::source(2, 0), Location::target(0, 0));
 
         let mut tracker = builder.build();
-        tracker.initialize();
+        tracker.initialize().unwrap();
 
         // Add a capability — should dirty both operators.
         let _cap = Capability::new(0u64, reporter.clone());
-        let dirty = tracker.propagate();
+        let dirty = tracker.propagate().unwrap();
         assert!(
             dirty.contains(&1) || dirty.contains(&2),
             "at least one operator should be dirty"
         );
 
         // Propagate again with no changes — no dirty operators.
-        let dirty2 = tracker.propagate();
+        let dirty2 = tracker.propagate().unwrap();
         assert!(dirty2.is_empty(), "no changes, no dirty operators");
     }
 
     #[test]
     fn tracker_multiple_capabilities() {
         let mut builder = SubgraphBuilder::<u64>::new(1, 1);
-        let progress = builder.add_operator(1, "op1", 1, 1, PortConnectivity::identity(0u64)).unwrap();
+        let progress = builder
+            .add_operator(1, "op1", 1, 1, PortConnectivity::identity(0u64))
+            .unwrap();
         let reporter = progress.reporter(0).clone();
         builder.add_edge(Location::source(0, 0), Location::target(1, 0));
         builder.add_edge(Location::source(1, 0), Location::target(0, 0));
 
         let mut tracker = builder.build();
-        tracker.initialize();
+        tracker.initialize().unwrap();
 
         // Hold capabilities at times 5 and 10.
         let cap5 = Capability::new(5u64, reporter.clone());
         let cap10 = Capability::new(10u64, reporter.clone());
-        tracker.propagate();
+        tracker.propagate().unwrap();
         assert!(!tracker.is_completed());
 
         // Drop cap at 5 — should still be tracking (cap at 10 remains).
         drop(cap5);
-        tracker.propagate();
+        tracker.propagate().unwrap();
         assert!(!tracker.is_completed());
 
         // Drop cap at 10 — now completed.
         drop(cap10);
-        tracker.propagate();
+        tracker.propagate().unwrap();
         assert!(tracker.is_completed());
     }
 
     #[test]
     fn tracker_operator_indices_sorted() {
         let mut builder = SubgraphBuilder::<u64>::new(0, 0);
-        builder.add_operator(5, "op5", 1, 1, PortConnectivity::identity(0u64)).unwrap();
-        builder.add_operator(2, "op2", 1, 1, PortConnectivity::identity(0u64)).unwrap();
-        builder.add_operator(8, "op8", 1, 1, PortConnectivity::identity(0u64)).unwrap();
+        builder
+            .add_operator(5, "op5", 1, 1, PortConnectivity::identity(0u64))
+            .unwrap();
+        builder
+            .add_operator(2, "op2", 1, 1, PortConnectivity::identity(0u64))
+            .unwrap();
+        builder
+            .add_operator(8, "op8", 1, 1, PortConnectivity::identity(0u64))
+            .unwrap();
         let tracker = builder.build();
         assert_eq!(tracker.operator_indices(), &[2, 5, 8]);
     }
@@ -1069,7 +1144,9 @@ mod tests {
     #[test]
     fn tracker_operator_shape() {
         let mut builder = SubgraphBuilder::<u64>::new(0, 0);
-        builder.add_operator(1, "my_op", 2, 3, PortConnectivity::new(2, 3)).unwrap();
+        builder
+            .add_operator(1, "my_op", 2, 3, PortConnectivity::new(2, 3))
+            .unwrap();
         let tracker = builder.build();
         let shape = tracker.operator_shape(1).unwrap();
         assert_eq!(shape.name, "my_op");

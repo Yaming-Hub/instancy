@@ -80,7 +80,7 @@ pub trait EnterExt<S: Scope, D> {
     fn enter<TInner: Timestamp>(
         &self,
         child: &ChildScope<Product<S::Timestamp, TInner>>,
-    ) -> StreamEdge<ChildScope<Product<S::Timestamp, TInner>>, D>
+    ) -> crate::Result<StreamEdge<ChildScope<Product<S::Timestamp, TInner>>, D>>
     where
         Product<S::Timestamp, TInner>: Timestamp;
 }
@@ -89,7 +89,7 @@ impl<S: Scope, D: 'static> EnterExt<S, D> for StreamEdge<S, D> {
     fn enter<TInner: Timestamp>(
         &self,
         child: &ChildScope<Product<S::Timestamp, TInner>>,
-    ) -> StreamEdge<ChildScope<Product<S::Timestamp, TInner>>, D>
+    ) -> crate::Result<StreamEdge<ChildScope<Product<S::Timestamp, TInner>>, D>>
     where
         Product<S::Timestamp, TInner>: Timestamp,
     {
@@ -104,7 +104,9 @@ impl<S: Scope, D: 'static> EnterExt<S, D> for StreamEdge<S, D> {
             .parts()
             .last()
             .copied()
-            .expect("enter() called on scope with no parent address — this is a bug");
+            .ok_or_else(|| {
+                crate::Error::InvalidConfig("enter() requires a parent scope address".into())
+            })?;
         let mut parent_scope = self.scope().clone();
         parent_scope.increment_operator_input_count(child_index);
         let parent_stage = parent_scope.current_stage_id();
@@ -115,7 +117,7 @@ impl<S: Scope, D: 'static> EnterExt<S, D> for StreamEdge<S, D> {
             parent_stage,
         ));
 
-        StreamEdge::new(child.clone(), ingress_source, stage_id)
+        Ok(StreamEdge::new(child.clone(), ingress_source, stage_id))
     }
 }
 
@@ -135,7 +137,7 @@ where
     ///
     /// Creates an egress boundary operator in the child scope and
     /// produces a stream in the parent scope.
-    fn leave<P: Scope<Timestamp = TOuter>>(&self, parent: &P) -> StreamEdge<P, D>;
+    fn leave<P: Scope<Timestamp = TOuter>>(&self, parent: &P) -> crate::Result<StreamEdge<P, D>>;
 }
 
 impl<TOuter, TInner, D> LeaveExt<TOuter, TInner, D>
@@ -146,7 +148,7 @@ where
     Product<TOuter, TInner>: Timestamp,
     D: 'static,
 {
-    fn leave<P: Scope<Timestamp = TOuter>>(&self, parent: &P) -> StreamEdge<P, D> {
+    fn leave<P: Scope<Timestamp = TOuter>>(&self, parent: &P) -> crate::Result<StreamEdge<P, D>> {
         // Each leave() call gets a unique egress slot on the scope boundary operator.
         let slot_index = self.scope().clone().allocate_egress_slot();
 
@@ -158,7 +160,9 @@ where
             .parts()
             .last()
             .copied()
-            .expect("leave() called on scope with no parent address — this is a bug");
+            .ok_or_else(|| {
+                crate::Error::InvalidConfig("leave() requires a parent scope address".into())
+            })?;
         let parent_source = Slot::new(parent_op_index, slot_index);
         let stage_id = parent.current_stage_id();
 
@@ -176,7 +180,7 @@ where
             child_scope.current_stage_id(),
         ));
 
-        StreamEdge::new(parent.clone(), parent_source, stage_id)
+        Ok(StreamEdge::new(parent.clone(), parent_source, stage_id))
     }
 }
 
@@ -318,6 +322,7 @@ where
             1,
             1,
         ))
+        // SAFETY: operator index freshly allocated by allocate_operator_index()
         .expect("feedback operator index was just allocated, cannot conflict");
 
         // Lift the inner summary to a Product summary:
@@ -442,7 +447,7 @@ mod tests {
         let parent_stream: StreamEdge<RootScope<u64>, i32> =
             StreamEdge::new(root.clone(), source, stage_id);
 
-        let child_stream = parent_stream.enter(&child);
+        let child_stream = parent_stream.enter(&child).unwrap();
 
         // Stream is now in child scope
         assert_eq!(child_stream.scope().name(), "loop");
@@ -460,7 +465,7 @@ mod tests {
         let parent_stream: StreamEdge<RootScope<u64>, i32> =
             StreamEdge::new(root.clone(), source, stage_id);
 
-        let child_stream = parent_stream.enter(&child);
+        let child_stream = parent_stream.enter(&child).unwrap();
         assert_eq!(child_stream.stage_id(), child.current_stage_id());
     }
 
@@ -475,8 +480,8 @@ mod tests {
         let stream2: StreamEdge<RootScope<u64>, String> =
             StreamEdge::new(root.clone(), Slot::new(1, 0), stage_id);
 
-        let in1 = stream1.enter(&child);
-        let in2 = stream2.enter(&child);
+        let in1 = stream1.enter(&child).unwrap();
+        let in2 = stream2.enter(&child).unwrap();
 
         // Both use operator 0 (boundary) but different slot indices
         assert_eq!(in1.source().operator_index, 0);
@@ -500,8 +505,8 @@ mod tests {
         let s2: StreamEdge<ChildScope<Product<u64, u32>>, String> =
             StreamEdge::new(child.clone(), Slot::new(op2, 0), child_stage);
 
-        let out1 = s1.leave(&root);
-        let out2 = s2.leave(&root);
+        let out1 = s1.leave(&root).unwrap();
+        let out2 = s2.leave(&root).unwrap();
 
         // Both reference the same parent operator (subscope) but different slots
         assert_eq!(out1.source().operator_index, out2.source().operator_index);
@@ -522,7 +527,7 @@ mod tests {
         let child_stream: StreamEdge<ChildScope<Product<u64, u32>>, i32> =
             StreamEdge::new(child.clone(), Slot::new(op_idx, 0), child_stage);
 
-        let parent_stream = child_stream.leave(&root);
+        let parent_stream = child_stream.leave(&root).unwrap();
 
         assert_eq!(parent_stream.scope().name(), "root");
     }
@@ -537,7 +542,7 @@ mod tests {
         let child_stream: StreamEdge<ChildScope<Product<u64, u32>>, i32> =
             StreamEdge::new(child.clone(), Slot::new(op_idx, 0), child_stage);
 
-        let parent_stream = child_stream.leave(&root);
+        let parent_stream = child_stream.leave(&root).unwrap();
 
         // The parent stream's source operator index corresponds to the child scope's
         // position in the parent (last part of child's address).
@@ -665,7 +670,7 @@ mod tests {
         let parent_stage = root.current_stage_id();
         let input: StreamEdge<RootScope<u64>, i32> =
             StreamEdge::new(root.clone(), parent_source, parent_stage);
-        let input_in_loop = input.enter(&child);
+        let input_in_loop = input.enter(&child).unwrap();
 
         // Both streams exist in the child scope
         assert_eq!(input_in_loop.scope().name(), "my_loop");
@@ -684,7 +689,7 @@ mod tests {
         let output_source = Slot::new(child.allocate_operator_index(), 0);
         let output: StreamEdge<ChildScope<Product<u64, u32>>, i32> =
             StreamEdge::new(child.clone(), output_source, child_stage);
-        let _parent_output = output.leave(&root);
+        let _parent_output = output.leave(&root).unwrap();
     }
 
     // --- Edge cases ---
@@ -699,8 +704,8 @@ mod tests {
         let stream: StreamEdge<RootScope<u64>, i32> = StreamEdge::new(root.clone(), source, stage);
 
         // Enter and immediately leave
-        let in_child = stream.enter(&child);
-        let back_in_parent = in_child.leave(&root);
+        let in_child = stream.enter(&child).unwrap();
+        let back_in_parent = in_child.leave(&root).unwrap();
 
         assert_eq!(back_in_parent.scope().name(), "root");
     }

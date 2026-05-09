@@ -96,7 +96,7 @@ fn main() {
         Ok(())
     });
 
-    let output = merges.output("merges");
+    let output = merges.output("merges").unwrap();
 
     let dataflow = builder.build().expect("graph construction failed");
 

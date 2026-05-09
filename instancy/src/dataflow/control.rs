@@ -286,12 +286,13 @@ impl ControlBroadcast {
         num_workers: usize,
         wake_handles: &[WakeHandle],
         dataflow_cancel: CancellationToken,
-    ) -> (Vec<ControlSender>, Vec<ControlReceiver>) {
-        assert_eq!(
-            wake_handles.len(),
-            num_workers,
-            "wake_handles length must match num_workers"
-        );
+    ) -> crate::Result<(Vec<ControlSender>, Vec<ControlReceiver>)> {
+        if wake_handles.len() != num_workers {
+            return Err(crate::Error::InvalidConfig(format!(
+                "wake_handles length ({}) must match num_workers ({num_workers})",
+                wake_handles.len()
+            )));
+        }
 
         let inner = Arc::new(Mutex::new(BroadcastInner {
             signals: Vec::new(),
@@ -315,7 +316,7 @@ impl ControlBroadcast {
             })
             .collect();
 
-        (senders, receivers)
+        Ok((senders, receivers))
     }
 }
 
@@ -331,7 +332,7 @@ mod tests {
         let parent = CancellationToken::new();
         let df_cancel = parent.child_token();
         let wakes: Vec<WakeHandle> = (0..n).map(|_| WakeHandle::new()).collect();
-        let (senders, receivers) = ControlBroadcast::new(n, &wakes, df_cancel.clone());
+        let (senders, receivers) = ControlBroadcast::new(n, &wakes, df_cancel.clone()).unwrap();
         (senders, receivers, df_cancel)
     }
 

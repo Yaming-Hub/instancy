@@ -193,27 +193,28 @@ impl<T: Timestamp> Builder<T> {
         inputs: usize,
         outputs: usize,
         summary: PortConnectivity<T::Summary>,
-    ) {
-        assert_eq!(
-            summary.inputs(),
-            inputs,
-            "PortConnectivity inputs ({}) don't match declared inputs ({}) for node {}",
-            summary.inputs(),
-            inputs,
-            index
-        );
-        assert_eq!(
-            summary.outputs(),
-            outputs,
-            "PortConnectivity outputs ({}) don't match declared outputs ({}) for node {}",
-            summary.outputs(),
-            outputs,
-            index
-        );
+    ) -> crate::Result<()> {
+        if summary.inputs() != inputs {
+            return Err(crate::Error::InvalidConfig(format!(
+                "PortConnectivity inputs ({}) don't match declared inputs ({}) for node {}",
+                summary.inputs(),
+                inputs,
+                index
+            )));
+        }
+        if summary.outputs() != outputs {
+            return Err(crate::Error::InvalidConfig(format!(
+                "PortConnectivity outputs ({}) don't match declared outputs ({}) for node {}",
+                summary.outputs(),
+                outputs,
+                index
+            )));
+        }
         self.ensure_node(index);
         self.shape[index] = (inputs, outputs);
         self.edges[index] = vec![Vec::new(); outputs];
         self.nodes[index] = Some(summary);
+        Ok(())
     }
 
     /// Connects an operator's output port to another operator's input port.
@@ -222,22 +223,23 @@ impl<T: Timestamp> Builder<T> {
     ///
     /// Panics if the source is not a `Location::Source`, or if the source node
     /// hasn't been registered yet, or if the port is out of bounds.
-    pub fn add_edge(&mut self, source: Location, target: Location) {
+    pub fn add_edge(&mut self, source: Location, target: Location) -> crate::Result<()> {
         if let Location::Source { node, port } = source {
-            assert!(
-                node < self.shape.len() && port < self.edges[node].len(),
-                "add_edge: source node {} port {} is invalid (node has {} output ports). \
-                 Register the node with add_node() before adding edges.",
-                node,
-                port,
-                if node < self.edges.len() {
-                    self.edges[node].len()
-                } else {
-                    0
-                }
-            );
+            if !(node < self.shape.len() && port < self.edges[node].len()) {
+                return Err(crate::Error::InvalidConfig(format!(
+                    "add_edge: source node {} port {} is invalid (node has {} output ports). Register the node with add_node() before adding edges.",
+                    node,
+                    port,
+                    if node < self.edges.len() {
+                        self.edges[node].len()
+                    } else {
+                        0
+                    }
+                )));
+            }
             self.edges[node][port].push(target);
         }
+        Ok(())
     }
 
     /// Compiles the builder into a live [`Tracker`] and the scope-level summary.
@@ -723,6 +725,7 @@ impl<T: Timestamp> Tracker<T> {
                 diff += self
                     .worklist
                     .pop()
+                    // SAFETY: peek().is_some_and() confirmed entry exists on the line above
                     .expect("worklist entry exists after peek")
                     .0
                     .diff;
@@ -990,11 +993,11 @@ mod tests {
         // Scope with 1 input, 1 output.
         // Operator 1: 1 input, 1 output, identity summary.
         let mut builder = Builder::<u64>::new(1, 1);
-        builder.add_node(1, 1, 1, PortConnectivity::identity(0u64));
+        let _ = builder.add_node(1, 1, 1, PortConnectivity::identity(0u64));
 
         // Wire: scope_input(0) → op1_input(0), op1_output(0) → scope_output(0)
-        builder.add_edge(Location::source(0, 0), Location::target(1, 0));
-        builder.add_edge(Location::source(1, 0), Location::target(0, 0));
+        let _ = builder.add_edge(Location::source(0, 0), Location::target(1, 0));
+        let _ = builder.add_edge(Location::source(1, 0), Location::target(0, 0));
 
         let (_tracker, summary) = builder.build();
         // Scope summary: input 0 → output 0 with identity (0)
@@ -1008,14 +1011,14 @@ mod tests {
         // A → B: two operators in sequence.
         let mut builder = Builder::<u64>::new(1, 1);
         // Op1: 1 input, 1 output, identity.
-        builder.add_node(1, 1, 1, PortConnectivity::identity(0u64));
+        let _ = builder.add_node(1, 1, 1, PortConnectivity::identity(0u64));
         // Op2: 1 input, 1 output, identity.
-        builder.add_node(2, 1, 1, PortConnectivity::identity(0u64));
+        let _ = builder.add_node(2, 1, 1, PortConnectivity::identity(0u64));
 
         // scope_input → op1_input → op1_output → op2_input → op2_output → scope_output
-        builder.add_edge(Location::source(0, 0), Location::target(1, 0));
-        builder.add_edge(Location::source(1, 0), Location::target(2, 0));
-        builder.add_edge(Location::source(2, 0), Location::target(0, 0));
+        let _ = builder.add_edge(Location::source(0, 0), Location::target(1, 0));
+        let _ = builder.add_edge(Location::source(1, 0), Location::target(2, 0));
+        let _ = builder.add_edge(Location::source(2, 0), Location::target(0, 0));
 
         let (mut tracker, _) = builder.build();
 
@@ -1039,20 +1042,20 @@ mod tests {
     fn tracker_diamond_graph() {
         // scope_in → [op1, op2] → op3 → scope_out
         let mut builder = Builder::<u64>::new(1, 1);
-        builder.add_node(1, 1, 1, PortConnectivity::identity(0u64));
-        builder.add_node(2, 1, 1, PortConnectivity::identity(0u64));
+        let _ = builder.add_node(1, 1, 1, PortConnectivity::identity(0u64));
+        let _ = builder.add_node(2, 1, 1, PortConnectivity::identity(0u64));
 
         // Op3: 2 inputs, 1 output, both inputs connect to output 0.
         let mut conn3 = PortConnectivity::new(2, 1);
         conn3.path_mut(0, 0).insert(0u64);
         conn3.path_mut(1, 0).insert(0u64);
-        builder.add_node(3, 2, 1, conn3);
+        let _ = builder.add_node(3, 2, 1, conn3);
 
-        builder.add_edge(Location::source(0, 0), Location::target(1, 0));
-        builder.add_edge(Location::source(0, 0), Location::target(2, 0));
-        builder.add_edge(Location::source(1, 0), Location::target(3, 0));
-        builder.add_edge(Location::source(2, 0), Location::target(3, 1));
-        builder.add_edge(Location::source(3, 0), Location::target(0, 0));
+        let _ = builder.add_edge(Location::source(0, 0), Location::target(1, 0));
+        let _ = builder.add_edge(Location::source(0, 0), Location::target(2, 0));
+        let _ = builder.add_edge(Location::source(1, 0), Location::target(3, 0));
+        let _ = builder.add_edge(Location::source(2, 0), Location::target(3, 1));
+        let _ = builder.add_edge(Location::source(3, 0), Location::target(0, 0));
 
         let (mut tracker, _) = builder.build();
 
@@ -1080,11 +1083,11 @@ mod tests {
         let mut builder = Builder::<u64>::new(1, 1);
         let mut conn = PortConnectivity::new(1, 1);
         conn.path_mut(0, 0).insert(1u64); // +1 summary
-        builder.add_node(1, 1, 1, conn);
+        let _ = builder.add_node(1, 1, 1, conn);
 
-        builder.add_edge(Location::source(0, 0), Location::target(1, 0));
-        builder.add_edge(Location::source(1, 0), Location::target(1, 0)); // self-loop
-        builder.add_edge(Location::source(1, 0), Location::target(0, 0));
+        let _ = builder.add_edge(Location::source(0, 0), Location::target(1, 0));
+        let _ = builder.add_edge(Location::source(1, 0), Location::target(1, 0)); // self-loop
+        let _ = builder.add_edge(Location::source(1, 0), Location::target(0, 0));
 
         let (mut tracker, _) = builder.build();
 
@@ -1104,10 +1107,10 @@ mod tests {
         let mut conn = PortConnectivity::new(1, 2);
         conn.path_mut(0, 0).insert(0u64);
         // No path from input to output 1.
-        builder.add_node(1, 1, 2, conn);
+        let _ = builder.add_node(1, 1, 2, conn);
 
-        builder.add_edge(Location::source(0, 0), Location::target(1, 0));
-        builder.add_edge(Location::source(1, 0), Location::target(0, 0));
+        let _ = builder.add_edge(Location::source(0, 0), Location::target(1, 0));
+        let _ = builder.add_edge(Location::source(1, 0), Location::target(0, 0));
         // output 1 is not connected
 
         let (mut tracker, _) = builder.build();
@@ -1123,9 +1126,9 @@ mod tests {
     #[test]
     fn tracker_total_counts() {
         let mut builder = Builder::<u64>::new(1, 1);
-        builder.add_node(1, 1, 1, PortConnectivity::identity(0u64));
-        builder.add_edge(Location::source(0, 0), Location::target(1, 0));
-        builder.add_edge(Location::source(1, 0), Location::target(0, 0));
+        let _ = builder.add_node(1, 1, 1, PortConnectivity::identity(0u64));
+        let _ = builder.add_edge(Location::source(0, 0), Location::target(1, 0));
+        let _ = builder.add_edge(Location::source(1, 0), Location::target(0, 0));
 
         let (mut tracker, _) = builder.build();
         assert!(!tracker.tracking_anything());
@@ -1147,10 +1150,10 @@ mod tests {
         let mut builder = Builder::<Product<u64, u64>>::new(1, 1);
 
         let summary = <Product<u64, u64> as Timestamp>::Summary::default();
-        builder.add_node(1, 1, 1, PortConnectivity::identity(summary));
+        let _ = builder.add_node(1, 1, 1, PortConnectivity::identity(summary));
 
-        builder.add_edge(Location::source(0, 0), Location::target(1, 0));
-        builder.add_edge(Location::source(1, 0), Location::target(0, 0));
+        let _ = builder.add_edge(Location::source(0, 0), Location::target(1, 0));
+        let _ = builder.add_edge(Location::source(1, 0), Location::target(0, 0));
 
         let (mut tracker, _) = builder.build();
 
@@ -1167,9 +1170,9 @@ mod tests {
     #[test]
     fn tracker_drain_pushed() {
         let mut builder = Builder::<u64>::new(1, 1);
-        builder.add_node(1, 1, 1, PortConnectivity::identity(0u64));
-        builder.add_edge(Location::source(0, 0), Location::target(1, 0));
-        builder.add_edge(Location::source(1, 0), Location::target(0, 0));
+        let _ = builder.add_node(1, 1, 1, PortConnectivity::identity(0u64));
+        let _ = builder.add_edge(Location::source(0, 0), Location::target(1, 0));
+        let _ = builder.add_edge(Location::source(1, 0), Location::target(0, 0));
 
         let (mut tracker, _) = builder.build();
 
@@ -1187,9 +1190,9 @@ mod tests {
     #[test]
     fn tracker_scope_output_changes() {
         let mut builder = Builder::<u64>::new(1, 1);
-        builder.add_node(1, 1, 1, PortConnectivity::identity(0u64));
-        builder.add_edge(Location::source(0, 0), Location::target(1, 0));
-        builder.add_edge(Location::source(1, 0), Location::target(0, 0));
+        let _ = builder.add_node(1, 1, 1, PortConnectivity::identity(0u64));
+        let _ = builder.add_edge(Location::source(0, 0), Location::target(1, 0));
+        let _ = builder.add_edge(Location::source(1, 0), Location::target(0, 0));
 
         let (mut tracker, _) = builder.build();
 

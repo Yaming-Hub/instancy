@@ -36,15 +36,15 @@ pub use interprocess::{
     ChannelId, DataBatch, PROGRESS_CHANNEL_ID, ProgressMessage, RemoteEndpoint, RoutingTable,
     decode_data_batch, decode_progress, encode_data_batch, encode_progress,
 };
-pub use progress_exchange::{PeerProgressSender, ProgressExchange, ProgressExchangeConfig};
 pub use probing::{
     PROBE_MESSAGE_SIZE, PROBE_REPLY_TYPE, PROBE_REQUEST_TYPE, ProbeCounter, ProbeKind,
     ProbeMessage, ProbeTimestamp, ScalingDriver, ScalingEvent,
 };
+pub use progress_exchange::{PeerProgressSender, ProgressExchange, ProgressExchangeConfig};
 pub use remote_push::{FrameReceiver, FrameSender, OutboundFrame, RemotePush, RemotePushConfig};
 pub use sequencing::{
-    BufferOverflow, InsertResult, ReorderBuffer, ReorderError, SequenceCounter, SequencedFrame,
-    SEQUENCED_HEADER_SIZE, decode_sequenced_header, encode_sequenced_header,
+    BufferOverflow, InsertResult, ReorderBuffer, ReorderError, SEQUENCED_HEADER_SIZE,
+    SequenceCounter, SequencedFrame, decode_sequenced_header, encode_sequenced_header,
 };
 pub use session::{ChannelInfo, DataflowSession, DataflowSessionBuilder, SharedSession};
 pub use shared_pool::{
@@ -67,9 +67,8 @@ pub use transport_session::{
 
 #[cfg(feature = "transport")]
 pub use shared_transport::{
-    ConnectionFactory, DataframeSender, PROBE_CHANNEL_ID, SharedPeerManager,
-    SharedTransportSession,
+    ConnectionFactory, DataframeSender, PROBE_CHANNEL_ID, SharedPeerManager, SharedTransportSession,
 };
 
 #[cfg(feature = "transport")]
-pub use cluster_transport::{ClusterTransport, ClusterSpawnTransport};
+pub use cluster_transport::{ClusterSpawnTransport, ClusterTransport};

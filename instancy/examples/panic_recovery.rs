@@ -24,7 +24,7 @@ fn spawn_divide_flow(rt: &RuntimeHandle, name: &str, catch_panics: bool) -> Spaw
     let builder = DataflowBuilder::<u64>::new(name.to_string());
     builder.catch_panics(catch_panics);
 
-    let input = builder.input::<i32>("data");
+    let input = builder.input::<i32>("data").unwrap();
     input
         .map("divide", |_t, x| {
             if x == 0 {
@@ -32,7 +32,7 @@ fn spawn_divide_flow(rt: &RuntimeHandle, name: &str, catch_panics: bool) -> Spaw
             }
             100 / x
         })
-        .output("results");
+        .output("results").unwrap();
 
     let dataflow = builder.build().expect("build failed");
     rt.spawn(dataflow, SpawnOptions::default())

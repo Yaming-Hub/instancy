@@ -62,13 +62,17 @@ impl<T: Timestamp, D: Clone + Send + 'static, M: Clone + Default + Send + 'stati
     /// # Panics
     ///
     /// Panics if `targets` is empty.
-    pub fn new(targets: Vec<Box<dyn Push<T, D, M>>>) -> Self {
-        assert!(!targets.is_empty(), "TeePush requires at least one target");
-        Self {
+    pub fn new(targets: Vec<Box<dyn Push<T, D, M>>>) -> Result<Self> {
+        if targets.is_empty() {
+            return Err(Error::InvalidConfig(
+                "TeePush requires at least one target".into(),
+            ));
+        }
+        Ok(Self {
             targets,
             pending: None,
             closed: false,
-        }
+        })
     }
 
     /// Returns the number of downstream targets.
@@ -195,12 +199,15 @@ pub fn tee_or_single<
     M: Clone + Default + Send + 'static,
 >(
     mut pushers: Vec<Box<dyn Push<T, D, M>>>,
-) -> Option<Box<dyn Push<T, D, M>>> {
-    match pushers.len() {
+) -> Result<Option<Box<dyn Push<T, D, M>>>> {
+    Ok(match pushers.len() {
         0 => None,
-        1 => Some(pushers.pop().expect("single pusher exists when len is 1")),
-        _ => Some(Box::new(TeePush::new(pushers))),
-    }
+        1 => {
+            // SAFETY: match arm guarantees exactly one element in the vec
+            Some(pushers.pop().expect("single pusher exists when len is 1"))
+        }
+        _ => Some(Box::new(TeePush::new(pushers)?)),
+    })
 }
 
 #[cfg(test)]
@@ -263,7 +270,7 @@ mod tests {
     fn tee_push_single_target() {
         let records = Arc::new(Mutex::new(Vec::new()));
         let target = RecordingPush::<u64, i32>::new(Arc::clone(&records));
-        let mut tee = TeePush::new(vec![Box::new(target)]);
+        let mut tee = TeePush::new(vec![Box::new(target)]).unwrap();
 
         tee.push(Envelope::data(0, vec![1, 2, 3])).unwrap();
         tee.push(Envelope::data(1, vec![4, 5])).unwrap();
@@ -281,7 +288,7 @@ mod tests {
         let target_a = RecordingPush::<u64, i32>::new(Arc::clone(&records_a));
         let target_b = RecordingPush::<u64, i32>::new(Arc::clone(&records_b));
 
-        let mut tee = TeePush::new(vec![Box::new(target_a), Box::new(target_b)]);
+        let mut tee = TeePush::new(vec![Box::new(target_a), Box::new(target_b)]).unwrap();
         assert_eq!(tee.target_count(), 2);
 
         tee.push(Envelope::data(0, vec![10, 20])).unwrap();
@@ -306,7 +313,7 @@ mod tests {
             .map(|r| Box::new(RecordingPush::new(Arc::clone(r))) as Box<dyn Push<u64, i32>>)
             .collect();
 
-        let mut tee = TeePush::new(targets);
+        let mut tee = TeePush::new(targets).unwrap();
         tee.push(Envelope::data(5, vec![100])).unwrap();
 
         for r in &records {
@@ -323,7 +330,7 @@ mod tests {
         let target_a = RecordingPush::<u64, i32>::new(Arc::clone(&records_a));
         let target_b = RecordingPush::<u64, i32>::new(Arc::clone(&records_b));
 
-        let mut tee = TeePush::new(vec![Box::new(target_a), Box::new(target_b)]);
+        let mut tee = TeePush::new(vec![Box::new(target_a), Box::new(target_b)]).unwrap();
         assert!(!tee.is_closed());
 
         tee.close();
@@ -336,7 +343,7 @@ mod tests {
 
     #[test]
     fn tee_or_single_empty() {
-        let result = tee_or_single::<u64, i32, ()>(vec![]);
+        let result = tee_or_single::<u64, i32, ()>(vec![]).unwrap();
         assert!(result.is_none());
     }
 
@@ -344,7 +351,9 @@ mod tests {
     fn tee_or_single_one() {
         let records = Arc::new(Mutex::new(Vec::new()));
         let target = RecordingPush::<u64, i32>::new(Arc::clone(&records));
-        let mut pusher = tee_or_single(vec![Box::new(target) as Box<dyn Push<u64, i32>>]).unwrap();
+        let mut pusher = tee_or_single(vec![Box::new(target) as Box<dyn Push<u64, i32>>])
+            .unwrap()
+            .unwrap();
 
         pusher.push(Envelope::data(0, vec![42])).unwrap();
         assert_eq!(records.lock().unwrap().len(), 1);
@@ -358,7 +367,7 @@ mod tests {
             Box::new(RecordingPush::new(Arc::clone(&records_a))),
             Box::new(RecordingPush::new(Arc::clone(&records_b))),
         ];
-        let mut pusher = tee_or_single(targets).unwrap();
+        let mut pusher = tee_or_single(targets).unwrap().unwrap();
 
         pusher.push(Envelope::data(0, vec![7, 8])).unwrap();
         assert_eq!(records_a.lock().unwrap()[0], (0, vec![7, 8]));

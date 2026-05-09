@@ -50,6 +50,7 @@ use std::collections::VecDeque;
 use std::sync::{Arc, Mutex};
 
 use crate::dataflow::channels::wake::WakeHandle;
+use crate::error::LockResultExt;
 use crate::progress::timestamp::Timestamp;
 
 /// A single progress change: (operator_index, output_port, timestamp, diff).
@@ -151,7 +152,13 @@ impl<T: Timestamp> ProgressSender<T> {
                 target_wake,
             } => {
                 {
-                    let mut buf = buffer.lock().expect("progress channel lock poisoned");
+                    let mut buf = match buffer.lock().or_poison("progress channel") {
+                        Ok(buf) => buf,
+                        Err(_) => {
+                            // TODO: propagate poisoned progress locks once ProgressSender::send returns Result.
+                            return;
+                        }
+                    };
                     buf.queue.push_back(changes);
                 }
                 target_wake.notify();
@@ -175,13 +182,25 @@ impl<T: Timestamp> ProgressReceiver<T> {
     /// Returns an iterator over batches in FIFO order.
     /// Each batch is a `Vec<ProgressChange<T>>` as sent by the peer.
     pub fn drain_all(&self) -> Vec<Vec<ProgressChange<T>>> {
-        let mut buf = self.buffer.lock().expect("progress channel lock poisoned");
+        let mut buf = match self.buffer.lock().or_poison("progress channel") {
+            Ok(buf) => buf,
+            Err(_) => {
+                // TODO: propagate poisoned progress locks once ProgressReceiver APIs return Result.
+                return Vec::new();
+            }
+        };
         buf.queue.drain(..).collect()
     }
 
     /// Returns `true` if there are queued progress updates.
     pub fn has_pending(&self) -> bool {
-        let buf = self.buffer.lock().expect("progress channel lock poisoned");
+        let buf = match self.buffer.lock().or_poison("progress channel") {
+            Ok(buf) => buf,
+            Err(_) => {
+                // TODO: propagate poisoned progress locks once ProgressReceiver APIs return Result.
+                return false;
+            }
+        };
         !buf.queue.is_empty()
     }
 }
@@ -201,8 +220,13 @@ impl<T: Timestamp> ProgressReceiver<T> {
 pub fn create_progress_channels<T: Timestamp>(
     num_workers: usize,
     wake_handles: &[WakeHandle],
-) -> Vec<WorkerProgressChannels<T>> {
-    assert_eq!(wake_handles.len(), num_workers);
+) -> crate::Result<Vec<WorkerProgressChannels<T>>> {
+    if wake_handles.len() != num_workers {
+        return Err(crate::Error::InvalidConfig(format!(
+            "wake_handles length ({}) must match num_workers ({num_workers})",
+            wake_handles.len()
+        )));
+    }
 
     // Initialize per-worker channel collections.
     let mut all_channels: Vec<WorkerProgressChannels<T>> = (0..num_workers)
@@ -231,7 +255,7 @@ pub fn create_progress_channels<T: Timestamp>(
         }
     }
 
-    all_channels
+    Ok(all_channels)
 }
 
 #[cfg(test)]
@@ -241,7 +265,7 @@ mod tests {
     #[test]
     fn send_and_receive_progress() {
         let wakes: Vec<WakeHandle> = (0..3).map(|_| WakeHandle::new()).collect();
-        let channels = create_progress_channels::<u64>(3, &wakes);
+        let channels = create_progress_channels::<u64>(3, &wakes).unwrap();
 
         // Worker 0 sends to Worker 1.
         let w0 = &channels[0];
@@ -262,7 +286,7 @@ mod tests {
     #[test]
     fn empty_send_does_not_wake() {
         let wakes: Vec<WakeHandle> = (0..2).map(|_| WakeHandle::new()).collect();
-        let channels = create_progress_channels::<u64>(2, &wakes);
+        let channels = create_progress_channels::<u64>(2, &wakes).unwrap();
 
         // Empty send — should not enqueue.
         channels[0].senders[1].as_ref().unwrap().send(vec![]);
@@ -274,7 +298,7 @@ mod tests {
     #[test]
     fn fifo_ordering_preserved() {
         let wakes: Vec<WakeHandle> = (0..2).map(|_| WakeHandle::new()).collect();
-        let channels = create_progress_channels::<u64>(2, &wakes);
+        let channels = create_progress_channels::<u64>(2, &wakes).unwrap();
 
         let sender = channels[0].senders[1].as_ref().unwrap();
         for i in 0..10 {
@@ -291,7 +315,7 @@ mod tests {
     #[test]
     fn self_channels_are_none() {
         let wakes: Vec<WakeHandle> = (0..3).map(|_| WakeHandle::new()).collect();
-        let channels = create_progress_channels::<u64>(3, &wakes);
+        let channels = create_progress_channels::<u64>(3, &wakes).unwrap();
 
         for (i, ch) in channels.iter().enumerate() {
             assert!(ch.senders[i].is_none());
@@ -302,7 +326,7 @@ mod tests {
     #[test]
     fn has_pending_reflects_state() {
         let wakes: Vec<WakeHandle> = (0..2).map(|_| WakeHandle::new()).collect();
-        let channels = create_progress_channels::<u64>(2, &wakes);
+        let channels = create_progress_channels::<u64>(2, &wakes).unwrap();
 
         let recv = channels[1].receivers[0].as_ref().unwrap();
         assert!(!recv.has_pending());

@@ -29,6 +29,10 @@ use std::time::Duration;
 
 use tokio::time::Instant;
 
+use crate::dataflow::id::DataflowId;
+use crate::error::Error;
+use crate::wire;
+
 // ─── SequenceCounter ─────────────────────────────────────────────────────────
 
 /// A thread-safe monotonically increasing sequence counter.
@@ -317,7 +321,6 @@ impl<T> ReorderBuffer<T> {
 // ─── SequencedFrame ──────────────────────────────────────────────────────────
 
 use crate::communication::transport::Frame;
-use crate::dataflow::id::DataflowId;
 
 /// A frame with an attached sequence ID for ordering in shared connection mode.
 ///
@@ -370,6 +373,7 @@ pub const SEQUENCED_HEADER_SIZE: usize = 36;
 /// Panics if `payload.len() > u32::MAX`. Callers should validate payload size
 /// upstream (the transport layer already rejects payloads > MAX_MESSAGE_SIZE).
 pub fn encode_sequenced_header(frame: &SequencedFrame) -> [u8; SEQUENCED_HEADER_SIZE] {
+    // SAFETY: transport layer enforces the wire-format payload size bound before encoding
     assert!(
         frame.frame.payload.len() <= u32::MAX as usize,
         "payload too large for wire format: {} bytes",
@@ -388,18 +392,12 @@ pub fn encode_sequenced_header(frame: &SequencedFrame) -> [u8; SEQUENCED_HEADER_
 /// Returns `(dataflow_id, channel_id, sequence_id, payload_length)`.
 pub fn decode_sequenced_header(
     header: &[u8; SEQUENCED_HEADER_SIZE],
-) -> (DataflowId, u64, u64, u32) {
-    let dataflow_id =
-        DataflowId::from_bytes(header[..16].try_into().expect("dataflow ID is 16 bytes"));
-    let channel_id = u64::from_le_bytes(header[16..24].try_into().expect("channel ID is 8 bytes"));
-    let sequence_id =
-        u64::from_le_bytes(header[24..32].try_into().expect("sequence ID is 8 bytes"));
-    let length = u32::from_le_bytes(
-        header[32..36]
-            .try_into()
-            .expect("payload length is 4 bytes"),
-    );
-    (dataflow_id, channel_id, sequence_id, length)
+) -> Result<(DataflowId, u64, u64, u32), Error> {
+    let dataflow_id = DataflowId::from_bytes(wire::read_array::<16>(header, 0)?);
+    let channel_id = wire::read_u64(header, 16)?;
+    let sequence_id = wire::read_u64(header, 24)?;
+    let length = wire::read_u32(header, 32)?;
+    Ok((dataflow_id, channel_id, sequence_id, length))
 }
 
 // ─── Tests ───────────────────────────────────────────────────────────────────
@@ -610,7 +608,7 @@ mod tests {
         };
 
         let header = encode_sequenced_header(&frame);
-        let (df_id, ch_id, seq_id, len) = decode_sequenced_header(&header);
+        let (df_id, ch_id, seq_id, len) = decode_sequenced_header(&header).unwrap();
 
         assert_eq!(df_id, frame.frame.dataflow_id);
         assert_eq!(ch_id, 42);

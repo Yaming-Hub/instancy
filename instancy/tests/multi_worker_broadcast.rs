@@ -97,7 +97,8 @@ where
     D: Clone + Send + Sync + Ord + 'static,
     F: Fn(&mut DataflowBuilder<u64>) + Send + Sync + 'static,
 {
-    let per_worker = run_broadcast_per_worker(name, num_workers, build_fn, input_data, output_name).await;
+    let per_worker =
+        run_broadcast_per_worker(name, num_workers, build_fn, input_data, output_name).await;
     let mut all: Vec<D> = per_worker.into_iter().flatten().collect();
     all.sort();
     all
@@ -112,9 +113,9 @@ async fn broadcast_delivers_to_all_workers() {
         "broadcast_all",
         3,
         |builder| {
-            let input = builder.input::<i64>("data");
+            let input = builder.input::<i64>("data").unwrap();
             let broadcast = input.broadcast("bcast");
-            broadcast.output("out");
+            broadcast.output("out").unwrap();
         },
         vec![(0, vec![10, 20, 30])],
         "out",
@@ -125,11 +126,7 @@ async fn broadcast_delivers_to_all_workers() {
     for (w, data) in per_worker.iter().enumerate() {
         let mut sorted: Vec<i64> = data.clone();
         sorted.sort();
-        assert_eq!(
-            sorted,
-            vec![10, 20, 30],
-            "worker {w} should have all items"
-        );
+        assert_eq!(sorted, vec![10, 20, 30], "worker {w} should have all items");
     }
 }
 
@@ -142,9 +139,9 @@ async fn broadcast_multiplies_data_by_worker_count() {
         "broadcast_4w",
         4,
         |builder| {
-            let input = builder.input::<i64>("data");
+            let input = builder.input::<i64>("data").unwrap();
             let broadcast = input.broadcast("bcast");
-            broadcast.output("out");
+            broadcast.output("out").unwrap();
         },
         vec![(0, vec![1, 2, 3, 4, 5])],
         "out",
@@ -172,15 +169,11 @@ async fn broadcast_multiple_epochs() {
         "broadcast_epochs",
         2,
         |builder| {
-            let input = builder.input::<i64>("data");
+            let input = builder.input::<i64>("data").unwrap();
             let broadcast = input.broadcast("bcast");
-            broadcast.output("out");
+            broadcast.output("out").unwrap();
         },
-        vec![
-            (0, vec![100, 200]),
-            (1, vec![300, 400]),
-            (2, vec![500]),
-        ],
+        vec![(0, vec![100, 200]), (1, vec![300, 400]), (2, vec![500])],
         "out",
     )
     .await;
@@ -206,16 +199,19 @@ async fn broadcast_empty_input() {
         "broadcast_empty",
         3,
         |builder| {
-            let input = builder.input::<i64>("data");
+            let input = builder.input::<i64>("data").unwrap();
             let broadcast = input.broadcast("bcast");
-            broadcast.output("out");
+            broadcast.output("out").unwrap();
         },
         vec![(0, vec![])],
         "out",
     )
     .await;
 
-    assert!(all.is_empty(), "no data should come through on broadcast of empty input");
+    assert!(
+        all.is_empty(),
+        "no data should come through on broadcast of empty input"
+    );
 }
 
 // ============================================================
@@ -227,10 +223,10 @@ async fn broadcast_then_map() {
         "broadcast_map",
         2,
         |builder| {
-            let input = builder.input::<i64>("data");
+            let input = builder.input::<i64>("data").unwrap();
             let broadcast = input.broadcast("bcast");
             let doubled = broadcast.map("double", |_t, x| x * 2);
-            doubled.output("out");
+            doubled.output("out").unwrap();
         },
         vec![(0, vec![1, 2, 3])],
         "out",
@@ -258,10 +254,10 @@ async fn broadcast_then_gather() {
         "broadcast_gather",
         3,
         |builder| {
-            let input = builder.input::<i64>("data");
+            let input = builder.input::<i64>("data").unwrap();
             let broadcast = input.broadcast("bcast");
             let gathered = broadcast.gather("collect");
-            gathered.output("out");
+            gathered.output("out").unwrap();
         },
         vec![(0, vec![7, 8])],
         "out",
@@ -276,10 +272,7 @@ async fn broadcast_then_gather() {
 
     // Other workers have nothing after gather.
     for (w, data) in per_worker.iter().enumerate().skip(1) {
-        assert!(
-            data.is_empty(),
-            "worker {w} should be empty after gather"
-        );
+        assert!(data.is_empty(), "worker {w} should be empty after gather");
     }
 }
 
@@ -292,9 +285,9 @@ async fn broadcast_single_item() {
         "broadcast_single",
         2,
         |builder| {
-            let input = builder.input::<i64>("data");
+            let input = builder.input::<i64>("data").unwrap();
             let broadcast = input.broadcast("bcast");
-            broadcast.output("out");
+            broadcast.output("out").unwrap();
         },
         vec![(0, vec![42])],
         "out",
@@ -316,9 +309,9 @@ async fn broadcast_large_batch() {
         "broadcast_large",
         4,
         |builder| {
-            let input = builder.input::<i64>("data");
+            let input = builder.input::<i64>("data").unwrap();
             let broadcast = input.broadcast("bcast");
-            broadcast.output("out");
+            broadcast.output("out").unwrap();
         },
         vec![(0, input_data.clone())],
         "out",
