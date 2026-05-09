@@ -30,6 +30,13 @@ use super::wake::WakeHandle;
 /// Default channel capacity when not specified.
 pub const DEFAULT_CHANNEL_CAPACITY: usize = 1024;
 
+/// Initial physical allocation for channel buffers.
+///
+/// Channels start with a small allocation to cover typical minimum traffic
+/// (data + progress + control messages) and grow via doubling as needed.
+/// This avoids both zero-allocation churn and wasteful pre-allocation.
+const INITIAL_BUFFER_CAPACITY: usize = 4;
+
 /// Shared state between push and pull endpoints.
 struct SharedState<T: Timestamp, D, M> {
     buffer: VecDeque<Envelope<T, D, M>>,
@@ -58,7 +65,7 @@ pub fn bounded_channel_with_wake<T: Timestamp, D: Send + 'static, M: Send + 'sta
     wake: Option<WakeHandle>,
 ) -> (BoundedPush<T, D, M>, BoundedPull<T, D, M>) {
     let state = Arc::new(Mutex::new(SharedState {
-        buffer: VecDeque::new(),
+        buffer: VecDeque::with_capacity(INITIAL_BUFFER_CAPACITY),
         capacity,
     }));
     let closed = Arc::new(AtomicBool::new(false));
