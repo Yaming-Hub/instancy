@@ -188,6 +188,7 @@ fn bench_shared_single_dataflow(c: &mut Criterion) {
                         "peer".to_string(),
                         shared_config(1),
                         vec![(local_read, local_write)],
+                        None,
                         &handle,
                     );
 
@@ -400,6 +401,7 @@ fn bench_shared_multi_dataflow(c: &mut Criterion) {
                         "peer".to_string(),
                         shared_config(num_conns),
                         connections,
+                        None,
                         &handle,
                     );
 
@@ -508,6 +510,7 @@ fn bench_shared_scaling_connections(c: &mut Criterion) {
                         "peer".to_string(),
                         shared_config(n_conns),
                         connections,
+                        None,
                         &handle,
                     );
 
@@ -561,3 +564,4 @@ criterion_group!(
     bench_shared_scaling_connections,
 );
 criterion_main!(benches);
+

@@ -91,8 +91,8 @@ async fn make_tcp_shared_managers(
         conns_b.push((rb, wb));
     }
 
-    let manager_a = SharedPeerManager::new("node-b".to_string(), config.clone(), conns_a, handle);
-    let manager_b = SharedPeerManager::new("node-a".to_string(), config, conns_b, handle);
+    let manager_a = SharedPeerManager::new("node-b".to_string(), config.clone(), conns_a, None, handle);
+    let manager_b = SharedPeerManager::new("node-a".to_string(), config, conns_b, None, handle);
 
     let mut managers_a = HashMap::new();
     managers_a.insert("node-b".to_string(), manager_a);
@@ -652,3 +652,4 @@ async fn shared_join_async_keeps_bridges_alive() {
     all_results.sort();
     assert_eq!(all_results, vec![1, 2, 3, 4, 5]);
 }
+
