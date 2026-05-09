@@ -453,13 +453,13 @@ impl PeerPool {
                     let (pending, rtt) = c.load_score();
                     (pending, std::cmp::Reverse(rtt))
                 })
-                // SAFETY: emptiness checked above while holding the same lock
+                // SAFETY: live vec confirmed non-empty on line above
                 .expect("live connection set is non-empty after empty check")
         } else {
             // High load — spread across connections.
             live.into_iter()
                 .min_by_key(|c| c.load_score())
-                // SAFETY: emptiness checked above while holding the same lock
+                // SAFETY: live vec confirmed non-empty on line above
                 .expect("live connection set is non-empty after empty check")
         };
 

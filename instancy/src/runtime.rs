@@ -4050,21 +4050,22 @@ pub struct ClusterSpawnedDataflow<T: Timestamp> {
 #[cfg(feature = "transport")]
 impl<T: Timestamp> ClusterSpawnedDataflow<T> {
     /// Get the dataflow name.
-    pub fn name(&self) -> Result<&str> {
-        Ok(self
-            .inner
+    pub fn name(&self) -> &str {
+        // SAFETY: inner is always Some until join() consumes it via take(),
+        // and join(mut self) takes ownership preventing further access.
+        self.inner
             .as_ref()
-            .ok_or_else(|| Error::Custom("dataflow already joined".into()))?
-            .name())
+            .expect("dataflow already joined")
+            .name()
     }
 
     /// Number of LOCAL workers on this node.
-    pub fn num_local_workers(&self) -> Result<usize> {
-        Ok(self
-            .inner
+    pub fn num_local_workers(&self) -> usize {
+        // SAFETY: inner is always Some until join() consumes it.
+        self.inner
             .as_ref()
-            .ok_or_else(|| Error::Custom("dataflow already joined".into()))?
-            .num_workers())
+            .expect("dataflow already joined")
+            .num_workers()
     }
 
     /// Total worker count across all nodes in the cluster.

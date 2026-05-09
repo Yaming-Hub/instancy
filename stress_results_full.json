@@ -1,0 +1,180 @@
+{
+  "duration_secs": 3000.0,
+  "worker_threads": 8,
+  "max_concurrent": 50,
+  "total_queries": 48751,
+  "total_errors": 0,
+  "correctness_failures": 0,
+  "average_throughput": 16.250333333333334,
+  "peak_throughput": 40.03351363775527,
+  "queries": [
+    {
+      "name": "ScanFilterAggregate",
+      "count": 7268,
+      "errors": 0,
+      "correctness_failures": 0,
+      "avg_latency_ms": 19.663635525591634,
+      "p50_latency_ms": 19.339,
+      "p95_latency_ms": 22.05,
+      "p99_latency_ms": 24.469,
+      "max_latency_ms": 39.708,
+      "top_operators": [
+        {
+          "name": "aggregate",
+          "total_cpu_ms": 45976.705,
+          "activations": 21804,
+          "records": 0
+        },
+        {
+          "name": "ship_date",
+          "total_cpu_ms": 32788.763,
+          "activations": 7268,
+          "records": 0
+        },
+        {
+          "name": "src",
+          "total_cpu_ms": 33.237,
+          "activations": 7268,
+          "records": 0
+        }
+      ]
+    },
+    {
+      "name": "MapChain",
+      "count": 12203,
+      "errors": 0,
+      "correctness_failures": 0,
+      "avg_latency_ms": 1.1766792591985578,
+      "p50_latency_ms": 1.092,
+      "p95_latency_ms": 1.608,
+      "p99_latency_ms": 2.059,
+      "max_latency_ms": 12.231,
+      "top_operators": [
+        {
+          "name": "map_0",
+          "total_cpu_ms": 817.877,
+          "activations": 12203,
+          "records": 0
+        },
+        {
+          "name": "map_1",
+          "total_cpu_ms": 255.905,
+          "activations": 12203,
+          "records": 0
+        },
+        {
+          "name": "map_4",
+          "total_cpu_ms": 242.188,
+          "activations": 12203,
+          "records": 0
+        }
+      ]
+    },
+    {
+      "name": "SmallFilter",
+      "count": 16952,
+      "errors": 0,
+      "correctness_failures": 0,
+      "avg_latency_ms": 0.31064004247286453,
+      "p50_latency_ms": 0.284,
+      "p95_latency_ms": 0.441,
+      "p99_latency_ms": 0.774,
+      "max_latency_ms": 9.091,
+      "top_operators": [
+        {
+          "name": "threshold",
+          "total_cpu_ms": 81.574,
+          "activations": 16952,
+          "records": 0
+        },
+        {
+          "name": "src",
+          "total_cpu_ms": 70.501,
+          "activations": 16952,
+          "records": 0
+        },
+        {
+          "name": "results",
+          "total_cpu_ms": 20.999,
+          "activations": 16952,
+          "records": 0
+        }
+      ]
+    },
+    {
+      "name": "MultiWorkerJoin",
+      "count": 7381,
+      "errors": 0,
+      "correctness_failures": 0,
+      "avg_latency_ms": 4.174516867633113,
+      "p50_latency_ms": 3.939,
+      "p95_latency_ms": 5.573,
+      "p99_latency_ms": 7.051,
+      "max_latency_ms": 22.393,
+      "top_operators": [
+        {
+          "name": "join",
+          "total_cpu_ms": 35250.51,
+          "activations": 144397,
+          "records": 0
+        },
+        {
+          "name": "sum_revenue",
+          "total_cpu_ms": 4529.361,
+          "activations": 923115,
+          "records": 0
+        },
+        {
+          "name": "left",
+          "total_cpu_ms": 1838.59,
+          "activations": 131688,
+          "records": 0
+        }
+      ]
+    },
+    {
+      "name": "PageRankBatch",
+      "count": 4947,
+      "errors": 0,
+      "correctness_failures": 0,
+      "avg_latency_ms": 2.051925005053568,
+      "p50_latency_ms": 1.951,
+      "p95_latency_ms": 2.593,
+      "p99_latency_ms": 3.236,
+      "max_latency_ms": 8.343,
+      "top_operators": [
+        {
+          "name": "pagerank",
+          "total_cpu_ms": 6754.683,
+          "activations": 14841,
+          "records": 0
+        },
+        {
+          "name": "src",
+          "total_cpu_ms": 20.166,
+          "activations": 4947,
+          "records": 0
+        },
+        {
+          "name": "results",
+          "total_cpu_ms": 11.581,
+          "activations": 14841,
+          "records": 0
+        }
+      ]
+    }
+  ],
+  "memory": {
+    "baseline_mb": 40.16531181335449,
+    "peak_mb": 111.609375,
+    "peak_phase": "Sustained",
+    "post_idle_mb": 60.29296875,
+    "leak_detected": true
+  },
+  "bottleneck": {
+    "slowest_query": "ScanFilterAggregate",
+    "slowest_p99_ms": 24.469,
+    "most_variable_query": "SmallFilter",
+    "most_variable_ratio": 2.7253521126760565
+  }
+}

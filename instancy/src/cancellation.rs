@@ -508,10 +508,12 @@ impl CancellationGuard {
     /// Disarm the guard — the token will NOT be cancelled on drop.
     ///
     /// Returns the inner token for continued use.
-    pub fn disarm(mut self) -> crate::Result<CancellationToken> {
+    pub fn disarm(mut self) -> CancellationToken {
+        // SAFETY: token is always Some until disarm() or Drop consumes it,
+        // and disarm(self) takes ownership preventing double-call.
         self.token
             .take()
-            .ok_or_else(|| crate::Error::Custom("cancellation guard already disarmed".into()))
+            .expect("guard already disarmed")
     }
 }
 
@@ -643,7 +645,7 @@ mod tests {
         let clone = token.clone();
 
         let guard = clone.drop_guard();
-        let _recovered = guard.disarm().unwrap();
+        let _recovered = guard.disarm();
 
         assert!(!token.is_cancelled());
     }

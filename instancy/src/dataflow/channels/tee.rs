@@ -59,9 +59,9 @@ impl<T: Timestamp, D: Clone + Send + 'static, M: Clone + Default + Send + 'stati
 {
     /// Create a new `TeePush` distributing to the given targets.
     ///
-    /// # Panics
+    /// # Errors
     ///
-    /// Panics if `targets` is empty.
+    /// Returns `Error::InvalidConfig` if `targets` is empty.
     pub fn new(targets: Vec<Box<dyn Push<T, D, M>>>) -> Result<Self> {
         if targets.is_empty() {
             return Err(Error::InvalidConfig(

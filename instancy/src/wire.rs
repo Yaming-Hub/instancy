@@ -8,7 +8,7 @@ use crate::Error;
 
 /// Read a `u32` in little-endian from `buf` at `offset`.
 pub(crate) fn read_u32(buf: &[u8], offset: usize) -> Result<u32, Error> {
-    let end = offset + 4;
+    let end = offset.saturating_add(4);
     buf.get(offset..end)
         .and_then(|s| <[u8; 4]>::try_from(s).ok())
         .map(u32::from_le_bytes)
@@ -25,7 +25,7 @@ pub(crate) fn read_u32(buf: &[u8], offset: usize) -> Result<u32, Error> {
 
 /// Read a `u64` in little-endian from `buf` at `offset`.
 pub(crate) fn read_u64(buf: &[u8], offset: usize) -> Result<u64, Error> {
-    let end = offset + 8;
+    let end = offset.saturating_add(8);
     buf.get(offset..end)
         .and_then(|s| <[u8; 8]>::try_from(s).ok())
         .map(u64::from_le_bytes)
@@ -42,7 +42,7 @@ pub(crate) fn read_u64(buf: &[u8], offset: usize) -> Result<u64, Error> {
 
 /// Read an `i64` in little-endian from `buf` at `offset`.
 pub(crate) fn read_i64(buf: &[u8], offset: usize) -> Result<i64, Error> {
-    let end = offset + 8;
+    let end = offset.saturating_add(8);
     buf.get(offset..end)
         .and_then(|s| <[u8; 8]>::try_from(s).ok())
         .map(i64::from_le_bytes)
@@ -59,7 +59,7 @@ pub(crate) fn read_i64(buf: &[u8], offset: usize) -> Result<i64, Error> {
 
 /// Read a fixed-size byte array from `buf` at `offset`.
 pub(crate) fn read_array<const N: usize>(buf: &[u8], offset: usize) -> Result<[u8; N], Error> {
-    let end = offset + N;
+    let end = offset.saturating_add(N);
     buf.get(offset..end)
         .and_then(|s| <[u8; N]>::try_from(s).ok())
         .ok_or_else(|| {
@@ -141,3 +141,5 @@ mod tests {
         assert!(read_array::<4>(&[], 0).is_err());
     }
 }
+
+
