@@ -239,7 +239,7 @@ let topology = ClusterTopology::multi_node(vec![
 ])?;
 
 // Application provides pre-established connections between nodes.
-// See tests/cluster_tcp.rs for complete working examples.
+// See instancy/tests/cluster_tcp.rs for complete working examples.
 let handle = rt.spawn_cluster(
     "my-cluster-df", topology, "node-a", dataflow_id,
     connections, capacity, handshake_timeout,
@@ -423,60 +423,70 @@ instancy's shared async worker pool shines for high-throughput small queries —
 
 ```bash
 # Run all tests
-cargo test --all-features -- --test-threads=4
+cargo test -p instancy --all-features -- --test-threads=4
 
 # Run without transport feature
-cargo test --no-default-features --features tracing
+cargo test -p instancy --no-default-features --features tracing
 
 # Run a specific integration test
-cargo test --all-features --test cluster_tcp
+cargo test -p instancy --all-features --test cluster_tcp
 ```
 
 ### Test Organization
 
 | File | Description |
 |---|---|
-| `tests/cluster.rs` | Multi-node cluster tests with in-memory transport |
-| `tests/cluster_tcp.rs` | TCP-based cluster integration tests |
-| `tests/cluster_shared_transport.rs` | Shared transport connection tests |
-| `tests/parallel_dataflows.rs` | Shared worker pool correctness |
-| `tests/parallel_cluster_tcp.rs` | Parallel TCP dataflows on shared connections |
-| `tests/multi_dataflow.rs` | Multiple dataflows on one runtime |
-| `tests/multi_worker_aggregation.rs` | Multi-worker reduce/fold/distinct/count |
-| `tests/multi_worker_broadcast.rs` | Multi-worker broadcast operator |
-| `tests/multi_worker_branch_distribution.rs` | Branch and distribution operators |
-| `tests/multi_worker_iterate.rs` | Multi-worker iteration loops |
-| `tests/delay_operator.rs` | Delay and delay_batch operators |
-| `tests/feedback_loops.rs` | Feedback loop correctness |
-| `tests/progress_tracking.rs` | Frontier and progress tracking |
-| `tests/edge_cases.rs` | Edge cases and boundary conditions |
-| `tests/inter_process.rs` | Cross-process communication |
-| `tests/observability.rs` | Metrics and tracing |
-| `tests/scheduler_policies.rs` | Task scheduler policy tests |
-| `tests/timeout.rs` | Timeout and cancellation tests |
-| `tests/graceful_drain.rs` | Graceful drain on cancellation tests |
+| `instancy/tests/cluster.rs` | Multi-node cluster tests with in-memory transport |
+| `instancy/tests/cluster_tcp.rs` | TCP-based cluster integration tests |
+| `instancy/tests/cluster_shared_transport.rs` | Shared transport connection tests |
+| `instancy/tests/parallel_dataflows.rs` | Shared worker pool correctness |
+| `instancy/tests/parallel_cluster_tcp.rs` | Parallel TCP dataflows on shared connections |
+| `instancy/tests/multi_dataflow.rs` | Multiple dataflows on one runtime |
+| `instancy/tests/multi_worker_aggregation.rs` | Multi-worker reduce/fold/distinct/count |
+| `instancy/tests/multi_worker_broadcast.rs` | Multi-worker broadcast operator |
+| `instancy/tests/multi_worker_branch_distribution.rs` | Branch and distribution operators |
+| `instancy/tests/multi_worker_iterate.rs` | Multi-worker iteration loops |
+| `instancy/tests/delay_operator.rs` | Delay and delay_batch operators |
+| `instancy/tests/feedback_loops.rs` | Feedback loop correctness |
+| `instancy/tests/progress_tracking.rs` | Frontier and progress tracking |
+| `instancy/tests/edge_cases.rs` | Edge cases and boundary conditions |
+| `instancy/tests/inter_process.rs` | Cross-process communication |
+| `instancy/tests/observability.rs` | Metrics and tracing |
+| `instancy/tests/scheduler_policies.rs` | Task scheduler policy tests |
+| `instancy/tests/timeout.rs` | Timeout and cancellation tests |
+| `instancy/tests/graceful_drain.rs` | Graceful drain on cancellation tests |
+| `instancy/tests/spawn_dataflow.rs` | Spawn and auto-parallelism tests |
+| `instancy/tests/staged_parallelism.rs` | Per-stage parallelism tests |
 
 ## Project Structure
 
 ```
 instancy/
 ├── src/
-│   ├── lib.rs                    # Public API
-│   ├── runtime.rs                # RuntimeHandle, SpawnOptions, test-only SimpleRuntime, spawn_cluster
+│   ├── lib.rs                    # Public API and re-exports
+│   ├── runtime.rs                # RuntimeHandle, SpawnOptions, spawn_cluster
+│   ├── error.rs                  # Error enum and Result type
+│   ├── cancellation.rs           # CancellationToken and CancellationReason
+│   ├── metrics.rs                # Per-operator metrics collection
+│   ├── worker.rs                 # WorkerId and OperatorActivation
+│   ├── order.rs                  # Timestamp types (Product for nested scopes)
+│   ├── wire.rs                   # Safe byte-parsing helpers
 │   ├── dataflow/
 │   │   ├── dataflow_builder.rs   # DataflowBuilder — operator chaining API
 │   │   ├── executor.rs           # Async sweep-based executor
-│   │   └── channels/             # Exchange, network, pact channels
+│   │   ├── operators/            # Input, output, and operator handle types
+│   │   └── channels/             # Exchange, bounded, network channels
 │   ├── progress/
 │   │   ├── subgraph.rs           # ProgressTracker — capability/frontier tracking
-│   │   └── frontier.rs           # MutableAntichain
+│   │   ├── frontier.rs           # MutableAntichain
+│   │   └── reachability.rs       # Pointstamp reachability analysis
 │   ├── communication/
-│   │   ├── transport_session.rs  # TCP muxer/demuxer per peer
+│   │   ├── shared_transport.rs   # Multiplexed TCP transport per peer
 │   │   ├── control_protocol.rs   # Fingerprint exchange + ready barrier
 │   │   └── codec.rs              # Codec trait + built-in implementations
-│   └── order.rs                  # Timestamp types (Product for nested scopes)
-├── examples/                     # 34 runnable examples
-├── tests/                        # Integration tests
+│   └── scheduler/                # Task scheduling and priority policies
+├── examples/                     # 35 runnable examples
+├── tests/                        # 21 integration test files
 └── Cargo.toml
 ```
 
