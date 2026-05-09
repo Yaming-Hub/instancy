@@ -12,3 +12,4 @@ pub mod coordinator;
 pub mod dataflows;
 pub mod node_actor;
 pub mod protocol;
+pub mod test_helpers;

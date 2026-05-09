@@ -11,13 +11,18 @@ use instancy::error::Result;
 use crate::protocol::DataflowType;
 
 /// Get port names for a dataflow type without building it.
-pub fn port_names(dataflow_type: DataflowType) -> (Vec<String>, String) {
+pub fn port_names(dataflow_type: &DataflowType) -> (Vec<String>, String) {
     match dataflow_type {
-        DataflowType::PassThrough => (vec!["data".into()], "results".into()),
-        DataflowType::ExchangeRoundTrip => (vec!["data".into()], "results".into()),
-        DataflowType::MultiEpochExchange => (vec!["data".into()], "results".into()),
+        DataflowType::PassThrough
+        | DataflowType::ExchangeRoundTrip
+        | DataflowType::MultiEpochExchange
+        | DataflowType::IterativeFilter
+        | DataflowType::StagedFanOutFanIn { .. }
+        | DataflowType::FilterAggregate { .. }
+        | DataflowType::BranchMerge
+        | DataflowType::DelayedAggregation { .. }
+        | DataflowType::IterativeExchange { .. } => (vec!["data".into()], "results".into()),
         DataflowType::DistributedWordCount => (vec!["sentences".into()], "results".into()),
-        DataflowType::IterativeFilter => (vec!["data".into()], "results".into()),
         DataflowType::DistributedJoin => (vec!["left".into(), "right".into()], "results".into()),
     }
 }
@@ -26,7 +31,7 @@ pub fn port_names(dataflow_type: DataflowType) -> (Vec<String>, String) {
 ///
 /// Returns `(input_port_names, output_port_name)`.
 pub fn build_dataflow(
-    dataflow_type: DataflowType,
+    dataflow_type: &DataflowType,
     builder: &mut DataflowBuilder<u64>,
 ) -> Result<(Vec<String>, String)> {
     match dataflow_type {
@@ -36,6 +41,17 @@ pub fn build_dataflow(
         DataflowType::DistributedWordCount => build_distributed_word_count(builder),
         DataflowType::IterativeFilter => build_iterative_filter(builder),
         DataflowType::DistributedJoin => build_distributed_join(builder),
+        DataflowType::StagedFanOutFanIn {
+            fan_out_parallelism,
+        } => build_staged_fan_out_fan_in(builder, *fan_out_parallelism),
+        DataflowType::FilterAggregate { threshold } => build_filter_aggregate(builder, *threshold),
+        DataflowType::BranchMerge => build_branch_merge(builder),
+        DataflowType::DelayedAggregation { delay_offset } => {
+            build_delayed_aggregation(builder, *delay_offset)
+        }
+        DataflowType::IterativeExchange { threshold } => {
+            build_iterative_exchange(builder, *threshold)
+        }
     }
 }
 
@@ -196,4 +212,104 @@ fn build_distributed_join(
     .output("results");
 
     Ok((vec!["left".into(), "right".into()], "results".into()))
+}
+
+/// StagedFanOutFanIn: source → map → exchange_to(N) → map → gather → output.
+fn build_staged_fan_out_fan_in(
+    builder: &mut DataflowBuilder<u64>,
+    fan_out_parallelism: usize,
+) -> Result<(Vec<String>, String)> {
+    if fan_out_parallelism == 0 {
+        return Err(instancy::error::Error::Custom(
+            "fan_out_parallelism must be > 0".into(),
+        ));
+    }
+
+    let input = builder.input::<i64>("data");
+    input
+        .map("stage_one", |_t, x| x * 2)
+        .exchange_by_hash_to("fan_out", fan_out_parallelism, |x: &i64| *x as u64)
+        .map("stage_two", |_t, x| x + 1)
+        .gather("fan_in")
+        .output("results");
+    Ok((vec!["data".into()], "results".into()))
+}
+
+/// FilterAggregate: source → filter(>threshold) → exchange → reduce(sum) → output.
+fn build_filter_aggregate(
+    builder: &mut DataflowBuilder<u64>,
+    threshold: i64,
+) -> Result<(Vec<String>, String)> {
+    let input = builder.input::<i64>("data");
+    input
+        .filter("gt_threshold", move |_t, x| *x > threshold)
+        .exchange_by_hash("aggregate_route", |_x| 0u64)
+        .reduce("sum", |a, b| a + b)
+        .output("results");
+    Ok((vec!["data".into()], "results".into()))
+}
+
+/// BranchMerge: source → branch(even/odd) → map(path-specific) → merge → exchange → reduce → output.
+fn build_branch_merge(builder: &mut DataflowBuilder<u64>) -> Result<(Vec<String>, String)> {
+    let input = builder.input::<i64>("data");
+    let (evens, odds) = input.branch("split", |_t, x| x % 2 == 0);
+    evens
+        .map("double_even", |_t, x| x * 2)
+        .merge(odds.map("triple_odd", |_t, x| x * 3))
+        .exchange_by_hash("aggregate_route", |_x| 0u64)
+        .reduce("sum", |a, b| a + b)
+        .output("results");
+    Ok((vec!["data".into()], "results".into()))
+}
+
+/// DelayedAggregation: source → delay_batch(+offset) → exchange → unary_notify(sum per epoch) → output.
+fn build_delayed_aggregation(
+    builder: &mut DataflowBuilder<u64>,
+    delay_offset: u64,
+) -> Result<(Vec<String>, String)> {
+    let input = builder.input::<i64>("data");
+    input
+        .delay_batch("delay", move |t| t + delay_offset)
+        .exchange_by_hash("aggregate_route", |_x| 0u64)
+        .unary_notify("epoch_sum", {
+            let mut pending: HashMap<u64, Vec<i64>> = HashMap::new();
+            move |input, output, ctx| {
+                while let Some((time, data)) = input.next() {
+                    pending.entry(time).or_default().extend(data);
+                    ctx.notify_at(time);
+                }
+                while let Some(time) = ctx.next_notification() {
+                    if let Some(items) = pending.remove(&time) {
+                        let sum: i64 = items.into_iter().sum();
+                        output.push_vec(time, vec![sum]);
+                    }
+                }
+                Ok(())
+            }
+        })
+        .output("results");
+    Ok((vec!["data".into()], "results".into()))
+}
+
+/// IterativeExchange: source → iterate(exchange → map(double) → filter(<threshold) → feedback) → output.
+fn build_iterative_exchange(
+    builder: &mut DataflowBuilder<u64>,
+    threshold: i64,
+) -> Result<(Vec<String>, String)> {
+    use instancy::dataflow::dataflow_builder::IterateResult;
+
+    let input = builder.input::<i64>("data");
+    input
+        .iterate::<u32>("loop", 1u32, move |iter_stream| {
+            let processed = iter_stream
+                .exchange_by_hash("shuffle", |x: &i64| *x as u64)
+                .map("double", |_t, x| x * 2);
+            let feedback = processed
+                .clone()
+                .filter("again", move |_t, x| *x < threshold);
+            let output = processed.filter("done", move |_t, x| *x >= threshold);
+            IterateResult { feedback, output }
+        })
+        .output("results");
+    Ok((vec!["data".into()], "results".into()))
 }
