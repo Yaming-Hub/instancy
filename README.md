@@ -482,6 +482,7 @@ instancy/
 │   │   └── reachability.rs       # Pointstamp reachability analysis
 │   ├── communication/
 │   │   ├── shared_transport.rs   # Multiplexed TCP transport per peer
+│   │   ├── transport_session.rs  # Per-peer transport session
 │   │   ├── control_protocol.rs   # Fingerprint exchange + ready barrier
 │   │   └── codec.rs              # Codec trait + built-in implementations
 │   └── scheduler/                # Task scheduling and priority policies
