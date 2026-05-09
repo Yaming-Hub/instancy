@@ -1467,8 +1467,8 @@ When using `SharedTransport` for cluster networking, connection failures are han
 When a TCP connection drops (reader/writer error), `SharedTransport`:
 1. Marks the connection as dead and removes it from the active pool
 2. Invokes the connection factory to establish a new connection
-3. Retries with exponential backoff: 100ms → 200ms → 400ms → 800ms → 1.6s (up to 5 attempts)
-4. On success, the new connection is added to the pool and data flow resumes
+3. Retries with exponential backoff: 100ms → 200ms → 400ms → 800ms (5 attempts total, 4 delays between them)
+4. On success, the new connection is added to the pool and future sends use it
 5. On permanent failure (all retries exhausted with no live connections remaining), affected dataflows receive `TransportError::ConnectionClosed`
 
 **No factory (pre-established connections only):**
@@ -1477,7 +1477,9 @@ If `SharedTransport` is created with pre-established connections and no factory,
 
 **Data loss during reconnection:**
 
-Payload frames in transit when a connection drops may be lost. The `SharedTransport` does **not** buffer or replay lost frames. Applications that require exactly-once delivery should implement their own acknowledgment/retry protocol at the operator level.
+Payload frames sent while no live connection exists are **dropped immediately** — `SharedTransport` does not buffer or replay them. Additionally, frames that were assigned a sequence number before the connection failed can create an unrecoverable gap in the receiver's reorder buffer. When the gap times out, the affected dataflow receives `TransportError::ReorderTimeout`.
+
+In summary, a successful reconnect restores connectivity but does **not** guarantee seamless delivery. Applications that require exactly-once or reliable delivery should implement their own acknowledgment/retry protocol at the operator level.
 
 **`PeerConnection` and `TransportSession`:**
 

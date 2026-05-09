@@ -18,10 +18,10 @@ connection factory retry) but none of this is documented for users. The
 ## Changes
 
 1. **Add "Connection Failure & Reconnection" section to GUIDE.md** covering:
-   - SharedTransport automatic reconnect with backoff (100ms→1.6s, 5 attempts)
+   - SharedTransport automatic reconnect with backoff (100ms→800ms, 5 attempts, 4 delays)
    - Connection factory role (if provided, library retries; if not, failure is permanent)
-   - Application-level handling: `TransportError::ConnectionClosed`
-   - Payload frames may be lost during reconnection window
+   - Application-level errors: `TransportError::ConnectionClosed` and `TransportError::ReorderTimeout`
+   - Payload frames dropped during reconnection; lost sequenced frames cause reorder gaps
 
 2. **Add doc comments to `PeerConnection` and `TransportSession`** noting
    that these are pre-established connections with no built-in reconnection —
