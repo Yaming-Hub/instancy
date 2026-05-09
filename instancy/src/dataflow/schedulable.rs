@@ -31,6 +31,11 @@ pub enum ActivationOutcome {
     /// It should NOT be re-scheduled until new input arrives.
     Idle,
 
+    /// The operator has in-flight async tasks but nothing to process locally.
+    /// It should NOT be re-scheduled until a task completes (via wake handle),
+    /// but the executor must NOT declare quiescence while this state is active.
+    WaitingForAsync,
+
     /// The operator could not push all its output due to downstream backpressure.
     /// It should be re-scheduled once the downstream channel has space.
     BlockedOnBackpressure,
@@ -271,6 +276,10 @@ pub struct ChannelEndpoints {
     /// Output pushers, one per output port. Each entry is a `Vec<Box<dyn Push<T, D, M>>>`
     /// (multiple pushers per port when the output fans out to multiple targets).
     pub output_pushers: Vec<Box<dyn std::any::Any + Send>>,
+    /// Wake handle for operators that need to notify the executor asynchronously
+    /// (e.g., when an in-flight async task completes). Operators that don't need
+    /// async waking can ignore this field.
+    pub wake_handle: Option<crate::dataflow::channels::wake::WakeHandle>,
 }
 
 impl std::fmt::Debug for ChannelEndpoints {

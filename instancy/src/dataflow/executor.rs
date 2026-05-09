@@ -219,7 +219,7 @@ impl FusedStageTask {
     /// Uses multi-pass semantics: keeps iterating until no operator makes progress
     /// or the budget is exhausted. This matches the existing fused activation behavior.
     ///
-    /// Returns `(any_progress, productive_activations)`.
+    /// Returns `(any_progress, productive_activations, async_waiting_positions)`.
     #[allow(clippy::too_many_arguments)]
     fn activate(
         &self,
@@ -230,9 +230,14 @@ impl FusedStageTask {
         control_sender: Option<&ControlSender>,
         catch_panics: bool,
         op_collectors: &[Option<Arc<OperatorMetricsCollector>>],
-    ) -> Result<(bool, usize)> {
+    ) -> Result<(bool, usize, Vec<usize>)> {
         let mut any_progress = false;
         let mut productive_activations = 0usize;
+        // Track which operators are in WaitingForAsync state after their
+        // most recent activation. Using a set avoids stale entries when an
+        // operator transitions from WaitingForAsync to MadeProgress across
+        // multi-pass iterations.
+        let mut async_waiting_set: std::collections::HashSet<usize> = std::collections::HashSet::new();
 
         // Multi-pass: keep iterating until no operator makes progress or budget exhausted.
         let mut made_progress_this_pass = true;
@@ -244,7 +249,7 @@ impl FusedStageTask {
                     continue;
                 }
                 if productive_activations >= budget {
-                    return Ok((any_progress, productive_activations));
+                    return Ok((any_progress, productive_activations, async_waiting_set.into_iter().collect()));
                 }
 
                 let start = if op_collectors.get(pos).and_then(|c| c.as_ref()).is_some() {
@@ -276,9 +281,14 @@ impl FusedStageTask {
                         productive_activations += 1;
                         any_progress = true;
                         made_progress_this_pass = true;
+                        // Don't remove from async set — operator may still
+                        // have in-flight tasks while collecting results.
                     }
                     ActivationOutcome::Idle => {
-                        // No input — will be re-checked if another pass is needed.
+                        async_waiting_set.remove(&pos);
+                    }
+                    ActivationOutcome::WaitingForAsync => {
+                        async_waiting_set.insert(pos);
                     }
                     ActivationOutcome::BlockedOnBackpressure => {
                         productive_activations += 1;
@@ -289,12 +299,13 @@ impl FusedStageTask {
                         productive_activations += 1;
                         done[pos] = true;
                         any_progress = true;
+                        async_waiting_set.remove(&pos);
                     }
                 }
             }
         }
 
-        Ok((any_progress, productive_activations))
+        Ok((any_progress, productive_activations, async_waiting_set.into_iter().collect()))
     }
 
     /// Whether all operators in this task are done.
@@ -351,6 +362,10 @@ pub struct DataflowExecutor<T: Timestamp = u64> {
     /// Persisted across `poll_run` calls so the executor remembers how long
     /// it has been idle.
     consecutive_idle: usize,
+    /// Number of operators currently waiting for async task completion.
+    /// While > 0, the executor must not declare quiescence — in-flight work
+    /// will produce results that need processing.
+    async_waiting: Vec<bool>,
     /// Worker index for error context enrichment.
     worker_index: usize,
     /// Cross-worker control broadcast sender (for reporting errors to siblings).
@@ -522,6 +537,7 @@ impl<T: Timestamp> DataflowExecutor<T> {
             let endpoints = ChannelEndpoints {
                 input_pullers,
                 output_pushers,
+                wake_handle: Some(wake_handle.clone()),
             };
 
             let operator = factory.build(&worker_context, endpoints)?;
@@ -533,6 +549,7 @@ impl<T: Timestamp> DataflowExecutor<T> {
         }
 
         let done = vec![false; operators.len()];
+        let async_waiting = vec![false; operators.len()];
 
         // Initialize per-operator metrics collectors when enabled.
         let (dataflow_metrics, op_collectors) = if config.collect_metrics {
@@ -571,6 +588,7 @@ impl<T: Timestamp> DataflowExecutor<T> {
             external_inputs_open: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             wake_handle,
             consecutive_idle: 0,
+            async_waiting,
             worker_index: worker_context.worker_index(),
             control_sender: None,
             control_receiver: None,
@@ -1065,6 +1083,8 @@ impl<T: Timestamp> DataflowExecutor<T> {
     /// scheduled; data flowing from op A to op B requires multiple sweeps.
     fn run_unfused_activation(&mut self) -> Result<bool> {
         // If the ready queue is empty, re-populate with non-done operators.
+        // Also enqueue any operators waiting for async task completion —
+        // a wake notification means their results may be ready to collect.
         if self.ready_queue.is_empty() {
             for pos in 0..self.operators.len() {
                 if !self.done[pos] {
@@ -1074,6 +1094,15 @@ impl<T: Timestamp> DataflowExecutor<T> {
             }
             if self.ready_queue.is_empty() {
                 return Ok(false);
+            }
+        } else {
+            // Queue not empty, but async-waiting operators may need activation
+            // after a wake notification. Enqueue them if not already queued.
+            for pos in 0..self.async_waiting.len() {
+                if self.async_waiting[pos] && !self.in_queue[pos] && !self.done[pos] {
+                    self.ready_queue.push_back(pos);
+                    self.in_queue[pos] = true;
+                }
             }
         }
 
@@ -1100,9 +1129,21 @@ impl<T: Timestamp> DataflowExecutor<T> {
                     any_progress = true;
                     self.ready_queue.push_back(pos);
                     self.in_queue[pos] = true;
+                    // Don't clear async_waiting here — the operator may still
+                    // have in-flight tasks even while collecting results. The
+                    // flag is only cleared when the operator returns Idle (no
+                    // in-flight work) or Done.
                 }
                 ActivationOutcome::Idle => {
-                    // Don't re-queue until new input arrives.
+                    // No work and no in-flight tasks — safe to clear.
+                    self.async_waiting[pos] = false;
+                }
+                ActivationOutcome::WaitingForAsync => {
+                    // Don't re-queue immediately — wake_handle.notify() will
+                    // wake the executor when a task completes. The per-operator
+                    // async_waiting flag prevents premature quiescence and
+                    // ensures re-enqueue on the next sweep.
+                    self.async_waiting[pos] = true;
                 }
                 ActivationOutcome::BlockedOnBackpressure => {
                     self.ready_queue.push_back(pos);
@@ -1111,6 +1152,7 @@ impl<T: Timestamp> DataflowExecutor<T> {
                 }
                 ActivationOutcome::Done => {
                     self.done[pos] = true;
+                    self.async_waiting[pos] = false;
                     self.propagate_completion(pos);
                     any_progress = true;
                 }
@@ -1173,8 +1215,10 @@ impl<T: Timestamp> DataflowExecutor<T> {
                         made_progress_this_pass = true;
                     }
                     ActivationOutcome::Idle => {
-                        // No input available — will be re-checked if another pass is needed
-                        // (upstream may have produced data later in this pass).
+                        self.async_waiting[pos] = false;
+                    }
+                    ActivationOutcome::WaitingForAsync => {
+                        self.async_waiting[pos] = true;
                     }
                     ActivationOutcome::BlockedOnBackpressure => {
                         productive_activations += 1;
@@ -1184,6 +1228,7 @@ impl<T: Timestamp> DataflowExecutor<T> {
                     ActivationOutcome::Done => {
                         productive_activations += 1;
                         self.done[pos] = true;
+                        self.async_waiting[pos] = false;
                         self.propagate_completion(pos);
                         any_progress = true;
                     }
@@ -1239,7 +1284,7 @@ impl<T: Timestamp> DataflowExecutor<T> {
                 break;
             }
 
-            let (progress, productive) = self.stage_tasks[task_idx].activate(
+            let (progress, productive, async_positions) = self.stage_tasks[task_idx].activate(
                 &mut self.operators,
                 &mut self.done,
                 remaining_budget,
@@ -1250,6 +1295,14 @@ impl<T: Timestamp> DataflowExecutor<T> {
             )?;
 
             total_productive += productive;
+            // Update async_waiting flags for all operators in this task:
+            // set true for positions still waiting, clear for the rest.
+            for &op_pos in &self.stage_tasks[task_idx].operator_positions {
+                self.async_waiting[op_pos] = false;
+            }
+            for pos in async_positions {
+                self.async_waiting[pos] = true;
+            }
 
             if progress {
                 any_progress = true;
@@ -1327,6 +1380,13 @@ impl<T: Timestamp> DataflowExecutor<T> {
         }
 
         if self.consecutive_idle >= self.config.max_idle_sweeps {
+            // If any operators have in-flight async tasks, don't declare
+            // quiescence — results will arrive and trigger a wake notification.
+            if self.async_waiting.iter().any(|&w| w) {
+                self.consecutive_idle = 0;
+                return Ok(SweepOutcome::WaitingForInput);
+            }
+
             // Check if external inputs are still open — if so, don't
             // declare quiescence, but signal the caller to wait.
             // During drain mode, we ignore external inputs (they should
@@ -1608,6 +1668,7 @@ mod tests {
                 external_inputs_open: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
                 wake_handle: WakeHandle::new(),
                 consecutive_idle: 0,
+            async_waiting: vec![false; n],
                 worker_index,
                 control_sender: None,
                 control_receiver: None,
@@ -1726,6 +1787,7 @@ mod tests {
             external_inputs_open: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             wake_handle: WakeHandle::new(),
             consecutive_idle: 0,
+            async_waiting: vec![false],
             worker_index: 0,
             control_sender: None,
             control_receiver: None,
@@ -1771,6 +1833,7 @@ mod tests {
             external_inputs_open: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             wake_handle: WakeHandle::new(),
             consecutive_idle: 0,
+            async_waiting: vec![false],
             worker_index: 0,
             control_sender: None,
             control_receiver: None,
@@ -1820,6 +1883,7 @@ mod tests {
             external_inputs_open: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             wake_handle: WakeHandle::new(),
             consecutive_idle: 0,
+            async_waiting: vec![false, false],
             worker_index: 0,
             control_sender: None,
             control_receiver: None,
@@ -1857,6 +1921,7 @@ mod tests {
             external_inputs_open: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             wake_handle: WakeHandle::new(),
             consecutive_idle: 0,
+            async_waiting: vec![],
             worker_index: 0,
             control_sender: None,
             control_receiver: None,
@@ -1921,6 +1986,7 @@ mod tests {
             external_inputs_open: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             wake_handle: WakeHandle::new(),
             consecutive_idle: 0,
+            async_waiting: vec![false],
             worker_index: 0,
             control_sender: None,
             control_receiver: None,
@@ -2002,6 +2068,7 @@ mod tests {
             external_inputs_open: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             wake_handle: WakeHandle::new(),
             consecutive_idle: 0,
+            async_waiting: vec![false, false, false],
             worker_index: 0,
             control_sender: None,
             control_receiver: None,
@@ -2063,6 +2130,7 @@ mod tests {
             external_inputs_open: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             wake_handle: WakeHandle::new(),
             consecutive_idle: 0,
+            async_waiting: vec![false],
             worker_index: 0,
             control_sender: None,
             control_receiver: None,
@@ -2112,6 +2180,7 @@ mod tests {
             external_inputs_open: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             wake_handle: WakeHandle::new(),
             consecutive_idle: 0,
+            async_waiting: vec![false],
             worker_index: 0,
             control_sender: None,
             control_receiver: None,
@@ -2174,6 +2243,7 @@ mod tests {
             external_inputs_open: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             wake_handle: WakeHandle::new(),
             consecutive_idle: 0,
+            async_waiting: vec![false],
             worker_index: 0,
             control_sender: None,
             control_receiver: None,
@@ -2235,6 +2305,7 @@ mod tests {
             external_inputs_open: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             wake_handle: WakeHandle::new(),
             consecutive_idle: 0,
+            async_waiting: vec![false],
             worker_index: 0,
             control_sender: None,
             control_receiver: None,
@@ -2304,6 +2375,7 @@ mod tests {
             external_inputs_open: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(1)),
             wake_handle: WakeHandle::new(),
             consecutive_idle: 0,
+            async_waiting: vec![false],
             worker_index: 0,
             control_sender: None,
             control_receiver: None,
@@ -2386,6 +2458,7 @@ mod tests {
             external_inputs_open: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(1)),
             wake_handle: WakeHandle::new(),
             consecutive_idle: 0,
+            async_waiting: vec![false],
             worker_index: 0,
             control_sender: None,
             control_receiver: None,
@@ -2456,6 +2529,7 @@ mod tests {
             external_inputs_open: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             wake_handle: WakeHandle::new(),
             consecutive_idle: 0,
+            async_waiting: vec![false],
             worker_index: 0,
             control_sender: None,
             control_receiver: None,
@@ -2610,6 +2684,7 @@ mod tests {
             external_inputs_open: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             wake_handle: wake_handle.clone(),
             consecutive_idle: 0,
+            async_waiting: vec![false],
             worker_index: 0,
             control_sender: None,
             control_receiver: None,
@@ -2684,6 +2759,7 @@ mod tests {
             external_inputs_open: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             wake_handle: WakeHandle::new(),
             consecutive_idle: 0,
+            async_waiting: vec![false],
             worker_index: 0,
             control_sender: None,
             control_receiver: None,
@@ -2735,6 +2811,7 @@ mod tests {
             external_inputs_open: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             wake_handle: WakeHandle::new(),
             consecutive_idle: 0,
+            async_waiting: vec![false],
             worker_index: 0,
             control_sender: None,
             control_receiver: None,
@@ -2798,6 +2875,7 @@ mod tests {
             external_inputs_open: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             wake_handle: WakeHandle::new(),
             consecutive_idle: 0,
+            async_waiting: vec![false, false, false],
             worker_index: 0,
             control_sender: None,
             control_receiver: None,
@@ -2850,6 +2928,7 @@ mod tests {
             external_inputs_open: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             wake_handle: WakeHandle::new(),
             consecutive_idle: 0,
+            async_waiting: vec![false],
             worker_index: 0,
             control_sender: None,
             control_receiver: None,
@@ -2901,6 +2980,7 @@ mod tests {
             external_inputs_open: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             wake_handle: WakeHandle::new(),
             consecutive_idle: 0,
+            async_waiting: vec![false],
             worker_index: 0,
             control_sender: None,
             control_receiver: None,
@@ -2952,6 +3032,7 @@ mod tests {
             external_inputs_open: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             wake_handle: WakeHandle::new(),
             consecutive_idle: 0,
+            async_waiting: vec![false],
             worker_index: 0,
             control_sender: None,
             control_receiver: None,
@@ -3038,6 +3119,7 @@ mod tests {
             external_inputs_open: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             wake_handle: WakeHandle::new(),
             consecutive_idle: 0,
+            async_waiting: vec![false, false, false],
             worker_index: 0,
             control_sender: None,
             control_receiver: None,
@@ -3102,6 +3184,7 @@ mod tests {
             external_inputs_open: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             wake_handle: WakeHandle::new(),
             consecutive_idle: 0,
+            async_waiting: vec![false, false],
             worker_index: 0,
             control_sender: None,
             control_receiver: None,
@@ -3164,6 +3247,7 @@ mod tests {
             external_inputs_open: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             wake_handle: WakeHandle::new(),
             consecutive_idle: 0,
+            async_waiting: vec![false, false, false],
             worker_index: 0,
             control_sender: None,
             control_receiver: None,
@@ -3229,6 +3313,7 @@ mod tests {
             external_inputs_open: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             wake_handle: WakeHandle::new(),
             consecutive_idle: 0,
+            async_waiting: vec![false; 3],
             worker_index: 0,
             control_sender: None,
             control_receiver: None,
@@ -3308,6 +3393,7 @@ mod tests {
             external_inputs_open: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             wake_handle: WakeHandle::new(),
             consecutive_idle: 0,
+            async_waiting: vec![false; 3],
             worker_index: 0,
             control_sender: None,
             control_receiver: None,
@@ -3360,6 +3446,7 @@ mod tests {
             external_inputs_open: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             wake_handle: WakeHandle::new(),
             consecutive_idle: 0,
+            async_waiting: vec![false],
             worker_index: 0,
             control_sender: None,
             control_receiver: None,
