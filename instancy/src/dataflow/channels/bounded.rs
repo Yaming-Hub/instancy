@@ -58,7 +58,7 @@ pub fn bounded_channel_with_wake<T: Timestamp, D: Send + 'static, M: Send + 'sta
     wake: Option<WakeHandle>,
 ) -> (BoundedPush<T, D, M>, BoundedPull<T, D, M>) {
     let state = Arc::new(Mutex::new(SharedState {
-        buffer: VecDeque::with_capacity(capacity),
+        buffer: VecDeque::new(),
         capacity,
     }));
     let closed = Arc::new(AtomicBool::new(false));

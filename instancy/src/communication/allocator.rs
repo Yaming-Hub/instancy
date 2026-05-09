@@ -93,7 +93,7 @@ fn create_local_channel<T: Timestamp, D: Send + 'static, M: Send + 'static>(
     capacity: usize,
 ) -> ChannelPair<T, D, M> {
     let shared = Arc::new(Mutex::new(ChannelState {
-        buffer: VecDeque::with_capacity(capacity),
+        buffer: VecDeque::new(),
         capacity,
         sender_closed: false,
         receiver_dropped: false,
