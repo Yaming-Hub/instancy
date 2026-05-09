@@ -61,7 +61,7 @@ use crate::error::{Error, Result};
 use crate::order::Product;
 use crate::progress::change_batch::ChangeBatch;
 use crate::progress::frontier::Antichain;
-use crate::progress::operate::PortConnectivity;
+use crate::progress::operate::{PortConnectivity, ProgressReporter};
 use crate::progress::reachability::Location;
 use crate::progress::subgraph::SubgraphBuilder;
 use crate::progress::timestamp::Timestamp;
@@ -146,6 +146,8 @@ struct BuilderState<T: Timestamp> {
     contexts: SharedContext,
     /// Whether to catch panics in operator activation.
     catch_panics: bool,
+    /// Errors encountered during graph construction. Checked in `build()`.
+    builder_errors: Vec<Error>,
 }
 
 /// Type-erased closure for wiring an input port during spawn().
@@ -268,6 +270,7 @@ impl<T: Timestamp> DataflowBuilder<T> {
                 channel_capacity: config.channel_capacity,
                 contexts: SharedContext::new(),
                 catch_panics: false,
+                builder_errors: Vec::new(),
             })),
         }
     }
@@ -389,29 +392,35 @@ impl<T: Timestamp> DataflowBuilder<T> {
                 .register_operator(crate::dataflow::graph::OperatorInfo::new(
                     op_idx, &name, stage_id, 0, 1,
                 ))
-                .unwrap_or_else(|_| panic!("operator index unique"));
+                .unwrap_or_else(|e| state.builder_errors.push(e));
 
             // Register in subgraph builder with initial capability.
             // The input source holds a capability at T::minimum() until closed.
             let mut initial_cap = ChangeBatch::new();
             initial_cap.update(T::minimum(), 1);
-            let progress = state.subgraph_builder.add_operator_with_capabilities(
+            let source_reporter = match state.subgraph_builder.add_operator_with_capabilities(
                 op_idx,
                 &name,
                 0,
                 1,
                 PortConnectivity::new(0, 1),
                 vec![initial_cap],
-            );
-
-            // Clone the progress reporter for the source's output port.
-            // The ChannelSourceOperator uses this to release the initial capability
-            // (reporter.update(T::minimum(), -1)) when its channel closes.
-            // Without this, the initial capability would never be released, and
-            // downstream frontiers would be stuck at T::minimum() forever —
-            // preventing frontier-based operators (unary_notify) from ever firing
-            // their notifications.
-            let source_reporter = progress.reporter(0).clone();
+            ) {
+                Ok(progress) => {
+                    // Clone the progress reporter for the source's output port.
+                    // The ChannelSourceOperator uses this to release the initial capability
+                    // (reporter.update(T::minimum(), -1)) when its channel closes.
+                    // Without this, the initial capability would never be released, and
+                    // downstream frontiers would be stuck at T::minimum() forever —
+                    // preventing frontier-based operators (unary_notify) from ever firing
+                    // their notifications.
+                    progress.reporter(0).clone()
+                }
+                Err(e) => {
+                    state.builder_errors.push(e);
+                    ProgressReporter::default()
+                }
+            };
 
             // Record port metadata
             state.input_ports.push(InputPortInfo {
@@ -567,20 +576,25 @@ impl<T: Timestamp> DataflowBuilder<T> {
                 .register_operator(crate::dataflow::graph::OperatorInfo::new(
                     op_idx, &name, stage_id, 0, 1,
                 ))
-                .unwrap_or_else(|_| panic!("operator index unique"));
+                .unwrap_or_else(|e| state.builder_errors.push(e));
 
             // Register in subgraph builder with initial capability.
             let mut initial_cap = ChangeBatch::new();
             initial_cap.update(T::minimum(), 1);
-            let progress = state.subgraph_builder.add_operator_with_capabilities(
+            let reporter = match state.subgraph_builder.add_operator_with_capabilities(
                 op_idx,
                 &name,
                 0,
                 1,
                 PortConnectivity::new(0, 1),
                 vec![initial_cap],
-            );
-            let reporter = progress.reporter(0).clone();
+            ) {
+                Ok(progress) => progress.reporter(0).clone(),
+                Err(e) => {
+                    state.builder_errors.push(e);
+                    ProgressReporter::default()
+                }
+            };
 
             // Create operator factory for pre-loaded source.
             // Handles fan-out: if multiple downstream edges exist (Pipe was
@@ -684,20 +698,25 @@ impl<T: Timestamp> DataflowBuilder<T> {
                 .register_operator(crate::dataflow::graph::OperatorInfo::new(
                     op_idx, &name, stage_id, 0, 1,
                 ))
-                .unwrap_or_else(|_| panic!("operator index unique"));
+                .unwrap_or_else(|e| state.builder_errors.push(e));
 
             // Register in subgraph builder with initial capability.
             let mut initial_cap = ChangeBatch::new();
             initial_cap.update(T::minimum(), 1);
-            let progress = state.subgraph_builder.add_operator_with_capabilities(
+            let source_reporter = match state.subgraph_builder.add_operator_with_capabilities(
                 op_idx,
                 &name,
                 0,
                 1,
                 PortConnectivity::new(0, 1),
                 vec![initial_cap],
-            );
-            let source_reporter = progress.reporter(0).clone();
+            ) {
+                Ok(progress) => progress.reporter(0).clone(),
+                Err(e) => {
+                    state.builder_errors.push(e);
+                    ProgressReporter::default()
+                }
+            };
 
             // Create async source wiring closure. At spawn time, this creates
             // the tokio channel + ChannelSourceOperator + pump task.
@@ -880,6 +899,11 @@ impl<T: Timestamp> DataflowBuilder<T> {
                     edge.target_stage = sid;
                 }
             }
+        }
+
+        // Surface any errors accumulated during graph construction.
+        if let Some(err) = state.builder_errors.into_iter().next() {
+            return Err(err);
         }
 
         // Validate the graph for structural correctness (missing endpoints,
@@ -1201,7 +1225,7 @@ impl<T: Timestamp, D: Clone + Send + 'static> Pipe<T, D> {
             .register_operator(crate::dataflow::graph::OperatorInfo::new(
                 op_idx, &name, stage_id, 1, 0,
             ))
-            .unwrap_or_else(|_| panic!("operator index unique"));
+            .unwrap_or_else(|e| state.builder_errors.push(e));
 
         // Edge from upstream
         state.graph.add_edge(crate::dataflow::graph::EdgeInfo::new(
@@ -1212,9 +1236,11 @@ impl<T: Timestamp, D: Clone + Send + 'static> Pipe<T, D> {
         ));
 
         // Subgraph: sink has 1 input, 0 outputs
-        state
+        if let Err(e) = state
             .subgraph_builder
-            .add_operator(op_idx, &name, 1, 0, PortConnectivity::new(1, 0));
+            .add_operator(op_idx, &name, 1, 0, PortConnectivity::new(1, 0)) {
+            state.builder_errors.push(e);
+        }
         state.subgraph_builder.add_edge(
             Location::source(self.op_idx, self.output_slot),
             Location::target(op_idx, 0),
@@ -1828,7 +1854,7 @@ impl<T: Timestamp, D: Clone + Send + 'static> Pipe<T, D> {
                 .register_operator(crate::dataflow::graph::OperatorInfo::new(
                     op_idx, &name, stage_id, 2, 1,
                 ))
-                .unwrap_or_else(|_| panic!("operator index unique"));
+                .unwrap_or_else(|e| state.builder_errors.push(e));
 
             // Edge from self → slot 0
             state.graph.add_edge(crate::dataflow::graph::EdgeInfo::new(
@@ -1852,9 +1878,11 @@ impl<T: Timestamp, D: Clone + Send + 'static> Pipe<T, D> {
             let mut connectivity = PortConnectivity::new(2, 1);
             connectivity.path_mut(0, 0).insert(T::Summary::default());
             connectivity.path_mut(1, 0).insert(T::Summary::default());
-            state
+            if let Err(e) = state
                 .subgraph_builder
-                .add_operator(op_idx, &name, 2, 1, connectivity);
+                .add_operator(op_idx, &name, 2, 1, connectivity) {
+                state.builder_errors.push(e);
+            }
             state.subgraph_builder.add_edge(
                 Location::source(self.op_idx, self.output_slot),
                 Location::target(op_idx, 0),
@@ -2018,7 +2046,7 @@ impl<T: Timestamp, D: Clone + Send + 'static> Pipe<T, D> {
                     1,
                     1,
                 ))
-                .unwrap_or_else(|_| panic!("operator index unique"));
+                .unwrap_or_else(|e| state.builder_errors.push(e));
             state.graph.add_edge(crate::dataflow::graph::EdgeInfo::new(
                 Slot::new(self.op_idx, self.output_slot),
                 Slot::new(enter_idx, 0),
@@ -2026,13 +2054,15 @@ impl<T: Timestamp, D: Clone + Send + 'static> Pipe<T, D> {
                 stage_id,
             ));
             // Subgraph registration for enter
-            state.subgraph_builder.add_operator(
+            if let Err(e) = state.subgraph_builder.add_operator(
                 enter_idx,
                 format!("{name}::enter"),
                 1,
                 1,
                 PortConnectivity::identity(T::Summary::default()),
-            );
+            ) {
+                state.builder_errors.push(e);
+            }
             state.subgraph_builder.add_edge(
                 Location::source(self.op_idx, self.output_slot),
                 Location::target(enter_idx, 0),
@@ -2097,15 +2127,17 @@ impl<T: Timestamp, D: Clone + Send + 'static> Pipe<T, D> {
                     1,
                     1,
                 ))
-                .unwrap_or_else(|_| panic!("operator index unique"));
+                .unwrap_or_else(|e| state.builder_errors.push(e));
             // Subgraph registration for feedback
-            state.subgraph_builder.add_operator(
+            if let Err(e) = state.subgraph_builder.add_operator(
                 feedback_idx,
                 format!("{name}::feedback"),
                 1,
                 1,
                 PortConnectivity::identity(T::Summary::default()),
-            );
+            ) {
+                state.builder_errors.push(e);
+            }
 
             // Feedback operator factory
             let fb_name = format!("{name}::feedback");
@@ -2155,7 +2187,7 @@ impl<T: Timestamp, D: Clone + Send + 'static> Pipe<T, D> {
                     2,
                     1,
                 ))
-                .unwrap_or_else(|_| panic!("operator index unique"));
+                .unwrap_or_else(|e| state.builder_errors.push(e));
             // Edge: enter → concat input 0
             state.graph.add_edge(crate::dataflow::graph::EdgeInfo::new(
                 Slot::new(enter_idx, 0),
@@ -2181,13 +2213,15 @@ impl<T: Timestamp, D: Clone + Send + 'static> Pipe<T, D> {
             concat_connectivity
                 .path_mut(1, 0)
                 .insert(T::Summary::default());
-            state.subgraph_builder.add_operator(
+            if let Err(e) = state.subgraph_builder.add_operator(
                 concat_idx,
                 format!("{name}::concat"),
                 2,
                 1,
                 concat_connectivity,
-            );
+            ) {
+                state.builder_errors.push(e);
+            }
             state.subgraph_builder.add_edge(
                 Location::source(enter_idx, 0),
                 Location::target(concat_idx, 0),
@@ -2274,15 +2308,17 @@ impl<T: Timestamp, D: Clone + Send + 'static> Pipe<T, D> {
                     1,
                     1,
                 ))
-                .unwrap_or_else(|_| panic!("operator index unique"));
+                .unwrap_or_else(|e| state.builder_errors.push(e));
             // Subgraph registration for leave
-            state.subgraph_builder.add_operator(
+            if let Err(e) = state.subgraph_builder.add_operator(
                 leave_idx,
                 format!("{name}::leave"),
                 1,
                 1,
                 PortConnectivity::identity(T::Summary::default()),
-            );
+            ) {
+                state.builder_errors.push(e);
+            }
 
             // Leave factory will be added after we know the output pipe from body
             // For now, record where the inner builder should start
@@ -2315,6 +2351,7 @@ impl<T: Timestamp, D: Clone + Send + 'static> Pipe<T, D> {
                 channel_capacity: capacity,
                 contexts: parent_contexts,
                 catch_panics: false,
+                builder_errors: Vec::new(),
             }));
 
         // The iteration variable pipe points to concat's output
@@ -2340,7 +2377,18 @@ impl<T: Timestamp, D: Clone + Send + 'static> Pipe<T, D> {
         // Phase 3: Merge inner state into parent state.
         let inner = match Rc::try_unwrap(inner_state) {
             Ok(cell) => cell.into_inner(),
-            Err(_) => panic!("iterate body must not hold Pipe references after returning"),
+            Err(_) => {
+                self.state.borrow_mut().builder_errors.push(Error::Custom(
+                    "iterate body must not hold Pipe references after returning".into(),
+                ));
+                return Pipe {
+                    state: Rc::clone(&self.state),
+                    op_idx: leave_idx,
+                    output_slot: 0,
+                    capacity_override: None,
+                    _phantom: PhantomData,
+                };
+            }
         };
 
         {
@@ -2356,7 +2404,7 @@ impl<T: Timestamp, D: Clone + Send + 'static> Pipe<T, D> {
                 state
                     .graph
                     .register_operator(op.clone())
-                    .unwrap_or_else(|_| panic!("inner operator index conflict"));
+                    .unwrap_or_else(|e| state.builder_errors.push(e));
             }
             // Merge inner edges with offset: inner edge 0 becomes parent edge N
             let inner_edge_offset = state.graph.edges().len();
@@ -2379,13 +2427,15 @@ impl<T: Timestamp, D: Clone + Send + 'static> Pipe<T, D> {
                         conn.path_mut(i, o).insert(T::Summary::default());
                     }
                 }
-                state.subgraph_builder.add_operator(
+                if let Err(e) = state.subgraph_builder.add_operator(
                     shape.index,
                     &shape.name,
                     shape.inputs,
                     shape.outputs,
                     conn,
-                );
+                ) {
+                    state.builder_errors.push(e);
+                }
             }
             for (src, tgt) in inner.subgraph_builder.edges() {
                 state.subgraph_builder.add_edge(src.clone(), tgt.clone());
@@ -2405,6 +2455,7 @@ impl<T: Timestamp, D: Clone + Send + 'static> Pipe<T, D> {
                     .feedback_channel_factories
                     .push((fb_idx + fb_offset, factory));
             }
+            state.builder_errors.extend(inner.builder_errors);
 
             // Wire output: result.output → leave_op input (regular edge)
             // Must be added before feedback edge so indices are sequential.
@@ -2556,7 +2607,7 @@ impl<T: Timestamp, D: Clone + Send + 'static> Pipe<T, D> {
                 .register_operator(crate::dataflow::graph::OperatorInfo::new(
                     op_idx, "concat", stage_id, num_inputs, 1,
                 ))
-                .unwrap_or_else(|_| panic!("operator index unique"));
+                .unwrap_or_else(|e| state.builder_errors.push(e));
 
             // Edges and channel factories for each input
             let mut edge_indices = Vec::with_capacity(num_inputs);
@@ -2575,9 +2626,11 @@ impl<T: Timestamp, D: Clone + Send + 'static> Pipe<T, D> {
             for i in 0..num_inputs {
                 connectivity.path_mut(i, 0).insert(T::Summary::default());
             }
-            state
+            if let Err(e) = state
                 .subgraph_builder
-                .add_operator(op_idx, "concat", num_inputs, 1, connectivity);
+                .add_operator(op_idx, "concat", num_inputs, 1, connectivity) {
+                state.builder_errors.push(e);
+            }
             for (i, s) in streams.iter().enumerate() {
                 state.subgraph_builder.add_edge(
                     Location::source(s.op_idx, s.output_slot),
@@ -2688,7 +2741,7 @@ impl<T: Timestamp, D: Clone + Send + 'static> Pipe<T, D> {
                 .register_operator(crate::dataflow::graph::OperatorInfo::new(
                     op_idx, &name, stage_id, 1, 0,
                 ))
-                .unwrap_or_else(|_| panic!("operator index unique"));
+                .unwrap_or_else(|e| state.builder_errors.push(e));
 
             // Edge from upstream
             state.graph.add_edge(crate::dataflow::graph::EdgeInfo::new(
@@ -2699,9 +2752,11 @@ impl<T: Timestamp, D: Clone + Send + 'static> Pipe<T, D> {
             ));
 
             // Subgraph builder: sink has 1 input, 0 outputs, no connectivity
-            state
+            if let Err(e) = state
                 .subgraph_builder
-                .add_operator(op_idx, &name, 1, 0, PortConnectivity::new(1, 0));
+                .add_operator(op_idx, &name, 1, 0, PortConnectivity::new(1, 0)) {
+                state.builder_errors.push(e);
+            }
             state.subgraph_builder.add_edge(
                 Location::source(self.op_idx, self.output_slot),
                 Location::target(op_idx, 0),
@@ -3468,7 +3523,7 @@ impl<T: Timestamp, D: Clone + Send + 'static> Pipe<T, D> {
                 .register_operator(crate::dataflow::graph::OperatorInfo::new(
                     op_idx, "exchange", stage_id, 1, 1,
                 ))
-                .unwrap_or_else(|_| panic!("operator index unique"));
+                .unwrap_or_else(|e| state.builder_errors.push(e));
 
             // Edge from upstream — marked as Exchange.
             state
@@ -3487,15 +3542,20 @@ impl<T: Timestamp, D: Clone + Send + 'static> Pipe<T, D> {
             // network boundaries where data delivery is asynchronous).
             let mut initial_cap = ChangeBatch::new();
             initial_cap.update(T::minimum(), 1);
-            let progress = state.subgraph_builder.add_operator_with_capabilities(
+            let exchange_reporter = match state.subgraph_builder.add_operator_with_capabilities(
                 op_idx,
                 "exchange",
                 1,
                 1,
                 PortConnectivity::identity(T::Summary::default()),
                 vec![initial_cap],
-            );
-            let exchange_reporter = progress.reporter(0).clone();
+            ) {
+                Ok(progress) => progress.reporter(0).clone(),
+                Err(e) => {
+                    state.builder_errors.push(e);
+                    ProgressReporter::default()
+                }
+            };
 
             state.subgraph_builder.add_edge(
                 Location::source(self.op_idx, self.output_slot),
@@ -3604,7 +3664,7 @@ impl<T: Timestamp, D: Clone + Send + 'static> Pipe<T, D> {
                 .register_operator(crate::dataflow::graph::OperatorInfo::new(
                     op_idx, "broadcast", stage_id, 1, 1,
                 ))
-                .unwrap_or_else(|_| panic!("operator index unique"));
+                .unwrap_or_else(|e| state.builder_errors.push(e));
 
             // Edge from upstream — marked as Exchange (broadcast uses same infrastructure).
             state
@@ -3619,15 +3679,20 @@ impl<T: Timestamp, D: Clone + Send + 'static> Pipe<T, D> {
             // Subgraph connectivity with initial capability.
             let mut initial_cap = ChangeBatch::new();
             initial_cap.update(T::minimum(), 1);
-            let progress = state.subgraph_builder.add_operator_with_capabilities(
+            let exchange_reporter = match state.subgraph_builder.add_operator_with_capabilities(
                 op_idx,
                 "broadcast",
                 1,
                 1,
                 PortConnectivity::identity(T::Summary::default()),
                 vec![initial_cap],
-            );
-            let exchange_reporter = progress.reporter(0).clone();
+            ) {
+                Ok(progress) => progress.reporter(0).clone(),
+                Err(e) => {
+                    state.builder_errors.push(e);
+                    ProgressReporter::default()
+                }
+            };
 
             state.subgraph_builder.add_edge(
                 Location::source(self.op_idx, self.output_slot),
@@ -3764,7 +3829,7 @@ impl<T: Timestamp, D: Clone + Send + 'static> Pipe<T, D> {
                 .register_operator(crate::dataflow::graph::OperatorInfo::new(
                     op_idx, &name, stage_id, 1, 1,
                 ))
-                .unwrap_or_else(|_| panic!("operator index unique"));
+                .unwrap_or_else(|e| state.builder_errors.push(e));
 
             // Edge from upstream
             state.graph.add_edge(crate::dataflow::graph::EdgeInfo::new(
@@ -3775,13 +3840,15 @@ impl<T: Timestamp, D: Clone + Send + 'static> Pipe<T, D> {
             ));
 
             // Subgraph: identity connectivity (timestamps pass through unchanged)
-            state.subgraph_builder.add_operator(
+            if let Err(e) = state.subgraph_builder.add_operator(
                 op_idx,
                 &name,
                 1,
                 1,
                 PortConnectivity::identity(T::Summary::default()),
-            );
+            ) {
+                state.builder_errors.push(e);
+            }
             state.subgraph_builder.add_edge(
                 Location::source(self.op_idx, self.output_slot),
                 Location::target(op_idx, 0),
@@ -3872,7 +3939,7 @@ impl<T: Timestamp, D: Clone + Send + 'static> Pipe<T, D> {
                 .register_operator(crate::dataflow::graph::OperatorInfo::new(
                     op_idx, &name, stage_id, 1, 1,
                 ))
-                .unwrap_or_else(|_| panic!("operator index unique"));
+                .unwrap_or_else(|e| state.builder_errors.push(e));
 
             // Edge from upstream
             state.graph.add_edge(crate::dataflow::graph::EdgeInfo::new(
@@ -3883,13 +3950,15 @@ impl<T: Timestamp, D: Clone + Send + 'static> Pipe<T, D> {
             ));
 
             // Subgraph: identity connectivity
-            state.subgraph_builder.add_operator(
+            if let Err(e) = state.subgraph_builder.add_operator(
                 op_idx,
                 &name,
                 1,
                 1,
                 PortConnectivity::identity(T::Summary::default()),
-            );
+            ) {
+                state.builder_errors.push(e);
+            }
             state.subgraph_builder.add_edge(
                 Location::source(self.op_idx, self.output_slot),
                 Location::target(op_idx, 0),
@@ -3993,7 +4062,7 @@ impl<T: Timestamp, D: Clone + Send + 'static> Pipe<T, D> {
                 .register_operator(crate::dataflow::graph::OperatorInfo::new(
                     op_idx, &name, stage_id, 1, 1,
                 ))
-                .unwrap_or_else(|_| panic!("operator index unique"));
+                .unwrap_or_else(|e| state.builder_errors.push(e));
 
             // Edge from upstream
             state.graph.add_edge(crate::dataflow::graph::EdgeInfo::new(
@@ -4004,21 +4073,27 @@ impl<T: Timestamp, D: Clone + Send + 'static> Pipe<T, D> {
             ));
 
             // Subgraph: identity connectivity (1 input → 1 output, default summary).
-            let progress = state.subgraph_builder.add_operator(
+            let progress_reporter = match state.subgraph_builder.add_operator(
                 op_idx,
                 &name,
                 1,
                 1,
                 PortConnectivity::identity(T::Summary::default()),
-            );
-
-            // Clone the ProgressReporter for output port 0.
-            // This reporter is shared with the ProgressTracker — the tracker drains
-            // changes from it during `collect_operator_progress()`. The operator uses
-            // it via `NotifyContext::notify_at()` to create Capability<T> objects that
-            // write +1/-1 to this reporter, which the tracker sees as pointstamp
-            // changes that hold downstream frontiers.
-            let progress_reporter = progress.reporter(0).clone();
+            ) {
+                Ok(progress) => {
+                    // Clone the ProgressReporter for output port 0.
+                    // This reporter is shared with the ProgressTracker — the tracker drains
+                    // changes from it during `collect_operator_progress()`. The operator uses
+                    // it via `NotifyContext::notify_at()` to create Capability<T> objects that
+                    // write +1/-1 to this reporter, which the tracker sees as pointstamp
+                    // changes that hold downstream frontiers.
+                    progress.reporter(0).clone()
+                }
+                Err(e) => {
+                    state.builder_errors.push(e);
+                    ProgressReporter::default()
+                }
+            };
 
             state.subgraph_builder.add_edge(
                 Location::source(self.op_idx, self.output_slot),
@@ -4133,7 +4208,7 @@ impl<T: Timestamp, D: Clone + Send + 'static> Pipe<T, D> {
                 .register_operator(crate::dataflow::graph::OperatorInfo::new(
                     op_idx, &name, stage_id, 1, 1,
                 ))
-                .unwrap_or_else(|_| panic!("operator index unique"));
+                .unwrap_or_else(|e| state.builder_errors.push(e));
 
             // Edge from upstream
             state.graph.add_edge(crate::dataflow::graph::EdgeInfo::new(
@@ -4144,13 +4219,15 @@ impl<T: Timestamp, D: Clone + Send + 'static> Pipe<T, D> {
             ));
 
             // Subgraph: identity connectivity
-            state.subgraph_builder.add_operator(
+            if let Err(e) = state.subgraph_builder.add_operator(
                 op_idx,
                 &name,
                 1,
                 1,
                 PortConnectivity::identity(T::Summary::default()),
-            );
+            ) {
+                state.builder_errors.push(e);
+            }
             state.subgraph_builder.add_edge(
                 Location::source(self.op_idx, self.output_slot),
                 Location::target(op_idx, 0),

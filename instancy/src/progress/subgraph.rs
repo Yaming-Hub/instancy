@@ -111,14 +111,19 @@ impl<T: Timestamp> SubgraphBuilder<T> {
         inputs: usize,
         outputs: usize,
         connectivity: PortConnectivity<T::Summary>,
-    ) -> &OperatorProgress<T> {
-        assert_ne!(index, 0, "operator index 0 is reserved for scope boundary");
-        assert!(
-            !self.operators.contains_key(&index),
-            "operator index {index} already registered"
-        );
-
+    ) -> Result<&OperatorProgress<T>, crate::Error> {
+        if index == 0 {
+            return Err(crate::Error::Custom(
+                "operator index 0 is reserved for scope boundary".into(),
+            ));
+        }
         let name = name.into();
+        if self.operators.contains_key(&index) {
+            return Err(crate::Error::Custom(format!(
+                "operator index {index} ('{name}') already registered"
+            )));
+        }
+
         self.operators.insert(
             index,
             OperatorShape {
@@ -131,9 +136,10 @@ impl<T: Timestamp> SubgraphBuilder<T> {
         self.connectivity.insert(index, connectivity);
         self.progress_buffers
             .insert(index, OperatorProgress::new(inputs, outputs));
-        self.progress_buffers
+        Ok(self
+            .progress_buffers
             .get(&index)
-            .expect("operator progress exists after registration")
+            .expect("operator progress exists after registration"))
     }
 
     /// Registers an operator with initial capabilities on its output ports.
@@ -147,17 +153,19 @@ impl<T: Timestamp> SubgraphBuilder<T> {
         outputs: usize,
         connectivity: PortConnectivity<T::Summary>,
         initial_caps: Vec<ChangeBatch<T>>,
-    ) -> &OperatorProgress<T> {
-        assert_eq!(
-            initial_caps.len(),
-            outputs,
-            "initial_caps length must match outputs count"
-        );
-        self.add_operator(index, name, inputs, outputs, connectivity);
+    ) -> Result<&OperatorProgress<T>, crate::Error> {
+        if initial_caps.len() != outputs {
+            return Err(crate::Error::Custom(format!(
+                "initial_caps length ({}) must match outputs count ({outputs})",
+                initial_caps.len()
+            )));
+        }
+        self.add_operator(index, name, inputs, outputs, connectivity)?;
         self.initial_capabilities.insert(index, initial_caps);
-        self.progress_buffers
+        Ok(self
+            .progress_buffers
             .get(&index)
-            .expect("operator progress exists after registration")
+            .expect("operator progress exists after registration"))
     }
 
     /// Records an edge from source output to target input.
@@ -762,7 +770,7 @@ mod tests {
 
         // Register N operators with identity connectivity.
         for i in 1..=n {
-            builder.add_operator(i, format!("op{i}"), 1, 1, PortConnectivity::identity(0u64));
+            builder.add_operator(i, format!("op{i}"), 1, 1, PortConnectivity::identity(0u64)).unwrap();
         }
 
         // Wire: scope_input → op1 → op2 → ... → opN → scope_output
@@ -780,30 +788,32 @@ mod tests {
     #[test]
     fn builder_register_and_count() {
         let mut builder = SubgraphBuilder::<u64>::new(0, 0);
-        builder.add_operator(1, "op1", 1, 1, PortConnectivity::identity(0u64));
-        builder.add_operator(2, "op2", 2, 1, PortConnectivity::new(2, 1));
+        builder.add_operator(1, "op1", 1, 1, PortConnectivity::identity(0u64)).unwrap();
+        builder.add_operator(2, "op2", 2, 1, PortConnectivity::new(2, 1)).unwrap();
         assert_eq!(builder.operator_count(), 2);
     }
 
     #[test]
-    #[should_panic(expected = "reserved")]
-    fn builder_index_zero_panics() {
+    fn builder_index_zero_returns_error() {
         let mut builder = SubgraphBuilder::<u64>::new(0, 0);
-        builder.add_operator(0, "bad", 1, 1, PortConnectivity::identity(0u64));
+        let result = builder.add_operator(0, "bad", 1, 1, PortConnectivity::identity(0u64));
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("reserved"));
     }
 
     #[test]
-    #[should_panic(expected = "already registered")]
-    fn builder_duplicate_index_panics() {
+    fn builder_duplicate_index_returns_error() {
         let mut builder = SubgraphBuilder::<u64>::new(0, 0);
-        builder.add_operator(1, "op1", 1, 1, PortConnectivity::identity(0u64));
-        builder.add_operator(1, "op1_dup", 1, 1, PortConnectivity::identity(0u64));
+        builder.add_operator(1, "op1", 1, 1, PortConnectivity::identity(0u64)).unwrap();
+        let result = builder.add_operator(1, "op1_dup", 1, 1, PortConnectivity::identity(0u64));
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("already registered"));
     }
 
     #[test]
     fn builder_operator_progress_returned() {
         let mut builder = SubgraphBuilder::<u64>::new(0, 0);
-        let progress = builder.add_operator(1, "op1", 2, 3, PortConnectivity::new(2, 3));
+        let progress = builder.add_operator(1, "op1", 2, 3, PortConnectivity::new(2, 3)).unwrap();
         assert_eq!(progress.consumed.len(), 2);
         assert_eq!(progress.produced.len(), 3);
         assert_eq!(progress.internal.len(), 3);
@@ -821,8 +831,23 @@ mod tests {
             1,
             PortConnectivity::new(0, 1),
             vec![cap_batch],
-        );
+        ).unwrap();
         assert_eq!(builder.operator_count(), 1);
+    }
+
+    #[test]
+    fn builder_initial_caps_length_mismatch_returns_error() {
+        let mut builder = SubgraphBuilder::<u64>::new(0, 0);
+        let mut cap = ChangeBatch::new();
+        cap.update(0u64, 1);
+        // Operator has 2 outputs but only 1 initial_caps batch
+        let result = builder.add_operator_with_capabilities(
+            1, "bad", 0, 2,
+            PortConnectivity::new(0, 2),
+            vec![cap],
+        );
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("initial_caps length"));
     }
 
     // --- ProgressTracker: linear pipeline ---
@@ -852,8 +877,8 @@ mod tests {
                 b.update(0u64, 1);
                 b
             }],
-        );
-        builder.add_operator(2, "sink", 1, 1, PortConnectivity::identity(0u64));
+        ).unwrap();
+        builder.add_operator(2, "sink", 1, 1, PortConnectivity::identity(0u64)).unwrap();
         builder.add_edge(Location::source(0, 0), Location::target(1, 0));
         builder.add_edge(Location::source(1, 0), Location::target(2, 0));
         builder.add_edge(Location::source(2, 0), Location::target(0, 0));
@@ -877,7 +902,7 @@ mod tests {
     fn tracker_capability_via_reporter() {
         // Build a simple 1-operator graph.
         let mut builder = SubgraphBuilder::<u64>::new(1, 1);
-        let progress = builder.add_operator(1, "op1", 1, 1, PortConnectivity::identity(0u64));
+        let progress = builder.add_operator(1, "op1", 1, 1, PortConnectivity::identity(0u64)).unwrap();
         let reporter = progress.reporter(0).clone();
         builder.add_edge(Location::source(0, 0), Location::target(1, 0));
         builder.add_edge(Location::source(1, 0), Location::target(0, 0));
@@ -906,9 +931,9 @@ mod tests {
     #[test]
     fn tracker_capability_downgrade_advances_frontier() {
         let mut builder = SubgraphBuilder::<u64>::new(1, 1);
-        let progress = builder.add_operator(1, "op1", 1, 1, PortConnectivity::identity(0u64));
+        let progress = builder.add_operator(1, "op1", 1, 1, PortConnectivity::identity(0u64)).unwrap();
         let reporter = progress.reporter(0).clone();
-        builder.add_operator(2, "op2", 1, 1, PortConnectivity::identity(0u64));
+        builder.add_operator(2, "op2", 1, 1, PortConnectivity::identity(0u64)).unwrap();
         builder.add_edge(Location::source(0, 0), Location::target(1, 0));
         builder.add_edge(Location::source(1, 0), Location::target(2, 0));
         builder.add_edge(Location::source(2, 0), Location::target(0, 0));
@@ -946,10 +971,10 @@ mod tests {
     fn tracker_fan_out() {
         // One source, two consumers.
         let mut builder = SubgraphBuilder::<u64>::new(1, 1);
-        let progress = builder.add_operator(1, "source", 1, 1, PortConnectivity::identity(0u64));
+        let progress = builder.add_operator(1, "source", 1, 1, PortConnectivity::identity(0u64)).unwrap();
         let reporter = progress.reporter(0).clone();
-        builder.add_operator(2, "sink_a", 1, 1, PortConnectivity::identity(0u64));
-        builder.add_operator(3, "sink_b", 1, 1, PortConnectivity::identity(0u64));
+        builder.add_operator(2, "sink_a", 1, 1, PortConnectivity::identity(0u64)).unwrap();
+        builder.add_operator(3, "sink_b", 1, 1, PortConnectivity::identity(0u64)).unwrap();
 
         builder.add_edge(Location::source(0, 0), Location::target(1, 0));
         // Fan-out: op1 output → both op2 and op3 inputs.
@@ -980,9 +1005,9 @@ mod tests {
     #[test]
     fn tracker_dirty_operators_reported() {
         let mut builder = SubgraphBuilder::<u64>::new(1, 1);
-        let progress = builder.add_operator(1, "op1", 1, 1, PortConnectivity::identity(0u64));
+        let progress = builder.add_operator(1, "op1", 1, 1, PortConnectivity::identity(0u64)).unwrap();
         let reporter = progress.reporter(0).clone();
-        builder.add_operator(2, "op2", 1, 1, PortConnectivity::identity(0u64));
+        builder.add_operator(2, "op2", 1, 1, PortConnectivity::identity(0u64)).unwrap();
         builder.add_edge(Location::source(0, 0), Location::target(1, 0));
         builder.add_edge(Location::source(1, 0), Location::target(2, 0));
         builder.add_edge(Location::source(2, 0), Location::target(0, 0));
@@ -1006,7 +1031,7 @@ mod tests {
     #[test]
     fn tracker_multiple_capabilities() {
         let mut builder = SubgraphBuilder::<u64>::new(1, 1);
-        let progress = builder.add_operator(1, "op1", 1, 1, PortConnectivity::identity(0u64));
+        let progress = builder.add_operator(1, "op1", 1, 1, PortConnectivity::identity(0u64)).unwrap();
         let reporter = progress.reporter(0).clone();
         builder.add_edge(Location::source(0, 0), Location::target(1, 0));
         builder.add_edge(Location::source(1, 0), Location::target(0, 0));
@@ -1034,9 +1059,9 @@ mod tests {
     #[test]
     fn tracker_operator_indices_sorted() {
         let mut builder = SubgraphBuilder::<u64>::new(0, 0);
-        builder.add_operator(5, "op5", 1, 1, PortConnectivity::identity(0u64));
-        builder.add_operator(2, "op2", 1, 1, PortConnectivity::identity(0u64));
-        builder.add_operator(8, "op8", 1, 1, PortConnectivity::identity(0u64));
+        builder.add_operator(5, "op5", 1, 1, PortConnectivity::identity(0u64)).unwrap();
+        builder.add_operator(2, "op2", 1, 1, PortConnectivity::identity(0u64)).unwrap();
+        builder.add_operator(8, "op8", 1, 1, PortConnectivity::identity(0u64)).unwrap();
         let tracker = builder.build();
         assert_eq!(tracker.operator_indices(), &[2, 5, 8]);
     }
@@ -1044,7 +1069,7 @@ mod tests {
     #[test]
     fn tracker_operator_shape() {
         let mut builder = SubgraphBuilder::<u64>::new(0, 0);
-        builder.add_operator(1, "my_op", 2, 3, PortConnectivity::new(2, 3));
+        builder.add_operator(1, "my_op", 2, 3, PortConnectivity::new(2, 3)).unwrap();
         let tracker = builder.build();
         let shape = tracker.operator_shape(1).unwrap();
         assert_eq!(shape.name, "my_op");

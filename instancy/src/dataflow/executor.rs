@@ -2038,7 +2038,7 @@ mod tests {
             1, // inputs
             1, // outputs
             PortConnectivity::identity(0u64),
-        );
+        ).unwrap();
 
         let mut tracker = builder.build();
         tracker.initialize();
