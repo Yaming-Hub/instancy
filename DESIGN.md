@@ -2296,11 +2296,19 @@ pub struct PoolConfig {
 - When load is low, idle connections above the minimum are reclaimed after `idle_timeout`.
 - The application's `ConnectionManager` is the single point of control for all connection establishment — the pool just tells it when to create or destroy connections.
 
-### 6.3.1 Future: Shared Connection Mode with Sequenced Messages
+> **Design invariant: Factory is always required.** Both dedicated and shared
+> transport modes use the connection factory. In dedicated mode the pool
+> leases a connection exclusively to one dataflow and returns it on
+> completion. In shared mode connections are multiplexed across dataflows.
+> Either way, reconnection and scale-up go through the same factory. The
+> library ships a default `TcpConnectionFactory` for plain TCP; applications
+> that need TLS or custom negotiation implement `ConnectionFactory` directly.
+
+### 6.3.1 Shared Connection Mode with Sequenced Messages
 
 #### Motivation
 
-The **current design** assigns a dedicated TCP connection per (dataflow, peer) pair. This is simple — TCP guarantees FIFO, so message ordering is free. However, it limits scalability:
+Assigning a dedicated TCP connection per (dataflow, peer) pair is simple — TCP guarantees FIFO, so message ordering is free. However, it limits scalability:
 - 100 concurrent dataflows across 10 nodes = 900 TCP connections per node
 - Connection setup latency for each new dataflow
 - Underutilization of connections when dataflows have bursty traffic
@@ -3550,7 +3558,9 @@ Default batch size: 1024 items (configurable).
 
 ### 12.4 Connection Multiplexing
 
-Rather than one TCP connection per (worker, channel) pair, instancy multiplexes all channels to the same peer over a small number of pooled connections. The pool delegates all connection establishment to the application's `ConnectionManager`, so the library never touches sockets directly. This dramatically reduces connection count in large clusters and supports arbitrarily complex networking topologies.
+Rather than one TCP connection per (worker, channel) pair, instancy multiplexes all channels to the same peer over a small number of pooled connections. The pool delegates all connection establishment to the application's `ConnectionFactory`, so the library never touches sockets directly. This dramatically reduces connection count in large clusters and supports arbitrarily complex networking topologies.
+
+Both transport modes — dedicated (exclusive lease per dataflow) and shared (multiplexed across dataflows) — use the same factory and pool. The factory is **required**, not optional: it is the sole mechanism for creating, replacing, and scaling connections. instancy provides a default `TcpConnectionFactory` for plain TCP; applications supply their own for TLS, actor-framework integration, or custom protocols.
 
 ### 12.5 Dynamic Cluster Scaling
 
