@@ -168,11 +168,11 @@ pub enum IoMode {
 #[derive(Clone, Debug)]
 pub struct SpawnOptions {
     /// Channel mode for external I/O ports. Default: [`IoMode::Sync`].
-    pub io_mode: IoMode,
+    pub(crate) io_mode: IoMode,
     /// Whether to collect per-operator metrics. Default: `false`.
-    pub collect_metrics: bool,
+    pub(crate) collect_metrics: bool,
     /// Scheduling priority for this dataflow (higher = scheduled sooner).
-    pub priority: u32,
+    pub(crate) priority: u32,
     /// Optional external cancellation token.
     ///
     /// When this token is cancelled (by the hosting application), the dataflow
@@ -195,7 +195,7 @@ pub struct SpawnOptions {
     /// let opts = SpawnOptions::new().cancellation_token(token);
     /// let handle = rt.spawn(dataflow, opts)?;
     /// ```
-    pub cancellation_token: Option<tokio_util::sync::CancellationToken>,
+    pub(crate) cancellation_token: Option<tokio_util::sync::CancellationToken>,
     /// When set, cancellation triggers a graceful drain phase instead of
     /// immediate termination. The executor closes external inputs and
     /// continues processing in-flight data until all operators complete
@@ -212,7 +212,7 @@ pub struct SpawnOptions {
     /// let opts = SpawnOptions::new()
     ///     .drain_on_cancel(Duration::from_secs(5));
     /// ```
-    pub drain_timeout: Option<std::time::Duration>,
+    pub(crate) drain_timeout: Option<std::time::Duration>,
     /// Enable per-stage parallelism for multi-worker dataflows.
     ///
     /// When `true` (the default), [`spawn_multi`](RuntimeHandle::spawn_multi)
@@ -248,7 +248,7 @@ pub struct SpawnOptions {
     ///     SpawnOptions::new().per_stage_parallelism(true),
     /// )?;
     /// ```
-    pub per_stage_parallelism: bool,
+    pub(crate) per_stage_parallelism: bool,
     /// Enable automatic parallelism detection from graph structure (default: `true`).
     ///
     /// When `true`, stage 0 parallelism is automatically determined by the
@@ -285,7 +285,7 @@ pub struct SpawnOptions {
     ///     SpawnOptions::new(), // auto_parallelism is enabled by default
     /// )?;
     /// ```
-    pub auto_parallelism: bool,
+    pub(crate) auto_parallelism: bool,
 }
 
 impl SpawnOptions {
@@ -823,9 +823,10 @@ impl RuntimeHandle {
     /// The owned tokio runtime (if any) is shut down when this `RuntimeHandle`
     /// is dropped — not by this method. To fully clean up, call `shutdown()`
     /// and then drop the handle.
-    pub fn shutdown(&self) {
+    pub fn shutdown(&self) -> Result<()> {
         self.cancel
             .cancel_with_reason(CancellationReason::RuntimeShutdown);
+        Ok(())
     }
 
     /// Shut down the runtime and wait for all active dataflows to complete.
@@ -4108,6 +4109,34 @@ impl<T: Timestamp> ClusterSpawnedDataflow<T> {
             .take_output(local_idx, name)
     }
 
+    /// Take the async input sender from a local worker.
+    ///
+    /// `local_idx` is 0-based within this node's workers.
+    pub fn take_async_input<D: Clone + Send + 'static>(
+        &mut self,
+        local_idx: usize,
+        name: &str,
+    ) -> Result<crate::dataflow::channel_operators::AsyncInputSender<T, D>> {
+        self.inner
+            .as_mut()
+            .ok_or_else(|| Error::Custom("dataflow already joined".into()))?
+            .take_async_input(local_idx, name)
+    }
+
+    /// Take the async output receiver from a local worker.
+    ///
+    /// `local_idx` is 0-based within this node's workers.
+    pub fn take_async_output<D: Send + 'static>(
+        &mut self,
+        local_idx: usize,
+        name: &str,
+    ) -> Result<crate::dataflow::channel_operators::AsyncOutputReceiver<T, D>> {
+        self.inner
+            .as_mut()
+            .ok_or_else(|| Error::Custom("dataflow already joined".into()))?
+            .take_async_output(local_idx, name)
+    }
+
     /// Cancel all local workers and tear down the cluster.
     pub fn cancel(&self) {
         self._bridge_cancel.cancel();
@@ -4615,7 +4644,7 @@ mod tests {
         })
         .unwrap();
         assert!(!rt.is_shutdown());
-        rt.shutdown();
+        rt.shutdown().unwrap();
         assert!(rt.is_shutdown());
         assert!(rt.cancel_token().is_cancelled());
     }
@@ -4638,7 +4667,7 @@ mod tests {
         .unwrap();
 
         // Shutting down rt1 doesn't affect rt2
-        rt1.shutdown();
+        rt1.shutdown().unwrap();
         assert!(rt1.is_shutdown());
         assert!(!rt2.is_shutdown());
     }
@@ -4781,7 +4810,7 @@ mod tests {
         let dataflow = builder.build().unwrap();
 
         let handle = rt.spawn(dataflow, SpawnOptions::default()).unwrap();
-        rt.shutdown();
+        rt.shutdown().unwrap();
         // Should complete (cancelled), not hang
         let _ = handle.join_blocking();
     }
@@ -6921,7 +6950,7 @@ mod tests {
             Ok(_) => {}
             Err(e) => panic!("spawn_multi failed: {e}"),
         }
-        rt.shutdown();
+        rt.shutdown().unwrap();
     }
 
     #[test]
@@ -6963,7 +6992,7 @@ mod tests {
             }
             Ok(_) => panic!("expected error for parallelism mismatch"),
         }
-        rt.shutdown();
+        rt.shutdown().unwrap();
     }
 
     #[test]
@@ -7003,7 +7032,7 @@ mod tests {
             }
             Ok(_) => panic!("expected error for single-worker parallelism mismatch"),
         }
-        rt.shutdown();
+        rt.shutdown().unwrap();
     }
 
     #[test]
@@ -7035,7 +7064,7 @@ mod tests {
         // Give the callback a moment to fire.
         std::thread::sleep(std::time::Duration::from_millis(50));
         assert_eq!(rt.active_dataflows(), 0);
-        rt.shutdown();
+        rt.shutdown().unwrap();
     }
 
     #[tokio::test]

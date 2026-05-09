@@ -81,7 +81,7 @@ fn main() {
 
     // --- Demonstrate isolation ---
     // Shutting down one runtime doesn't affect the other.
-    rt_fast.shutdown();
+    rt_fast.shutdown().expect("shutdown fast runtime");
     println!("\nShut down '{}':", rt_fast.name());
     println!(
         "  {} is_shutdown: {}",

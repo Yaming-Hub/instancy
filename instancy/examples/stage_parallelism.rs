@@ -210,6 +210,6 @@ fn main() {
     }
     println!();
 
-    rt.shutdown();
+    rt.shutdown().expect("shutdown runtime");
     println!("Done! All examples completed successfully.");
 }
