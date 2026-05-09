@@ -153,7 +153,7 @@ fn main() {
                 .output("out");
             Ok(())
         },
-        SpawnOptions::new().per_stage_parallelism(false),
+        SpawnOptions::new().per_stage_parallelism(false), // also disables auto_parallelism
     );
 
     match result {

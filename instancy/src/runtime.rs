@@ -249,26 +249,30 @@ pub struct SpawnOptions {
     /// )?;
     /// ```
     pub per_stage_parallelism: bool,
-    /// Enable automatic parallelism detection from graph structure.
+    /// Enable automatic parallelism detection from graph structure (default: `true`).
     ///
     /// When `true`, stage 0 parallelism is automatically determined by the
     /// number of physical input sources (`input()` + `source_async()` calls
     /// in stage 0). The `num_workers` parameter to
-    /// [`spawn_multi`](RuntimeHandle::spawn_multi) is ignored — parallelism
-    /// is derived entirely from the graph structure.
+    /// [`spawn_multi`](RuntimeHandle::spawn_multi) acts as a minimum — the
+    /// auto-detected count is used only if it is higher. Pass `num_workers=0`
+    /// to use only the auto-detected parallelism without imposing a minimum.
+    /// Auto-detection always produces at least 1 worker, even with zero inputs.
     ///
     /// Subsequent stages use the parallelism specified at repartition points
     /// (`exchange_to`, `gather`, `rebalance_to`). Stages without explicit
-    /// parallelism inherit stage 0's auto-detected count.
+    /// parallelism inherit the effective stage 0 count (`max(auto, num_workers)`).
+    /// For example, with 1 input and `num_workers=4`, all stages without
+    /// explicit parallelism get 4 workers.
     ///
     /// This implicitly enables per-stage parallelism.
     ///
     /// # Example
     ///
     /// ```ignore
-    /// // Stage 0 par=1 (auto: 1 input), Stage 1 par=4, Stage 2 par=1
+    /// // Stage 0 par=2 (max of auto=1, num_workers=2), Stage 1 par=4
     /// let multi = rt.spawn_multi(
-    ///     "pipeline", 0, // num_workers ignored with auto_parallelism
+    ///     "pipeline", 2,
     ///     |builder| {
     ///         let input = builder.input::<i32>("data");
     ///         input
@@ -278,7 +282,7 @@ pub struct SpawnOptions {
     ///             .output("results");
     ///         Ok(())
     ///     },
-    ///     SpawnOptions::new().auto_parallelism(true),
+    ///     SpawnOptions::new(), // auto_parallelism is enabled by default
     /// )?;
     /// ```
     pub auto_parallelism: bool,
@@ -384,6 +388,9 @@ impl SpawnOptions {
     /// their specified worker count. Pass `false` to force legacy uniform
     /// parallelism where all stages use `num_workers`.
     ///
+    /// Disabling per-stage parallelism also disables auto-parallelism, since
+    /// auto-parallelism relies on per-stage parallelism.
+    ///
     /// # Example
     ///
     /// ```ignore
@@ -391,20 +398,28 @@ impl SpawnOptions {
     /// ```
     pub fn per_stage_parallelism(mut self, enable: bool) -> Self {
         self.per_stage_parallelism = enable;
+        if !enable {
+            self.auto_parallelism = false;
+        }
         self
     }
 
-    /// Enable automatic parallelism detection from graph structure.
+    /// Enable or disable automatic parallelism detection from graph structure.
     ///
-    /// When enabled, stage 0 parallelism is auto-detected from the number
-    /// of `input()` + `source_async()` calls. The `num_workers` parameter
-    /// to `spawn_multi` is ignored. This implicitly enables per-stage
-    /// parallelism.
+    /// When enabled (the default), stage 0 parallelism is auto-detected from
+    /// the number of `input()` + `source_async()` calls. The `num_workers`
+    /// parameter to `spawn_multi` acts as a minimum — auto-detection is used
+    /// only if it yields a higher count. Pass `num_workers=0` to use only
+    /// the auto-detected count. Auto-detection always produces at least 1
+    /// worker. This implicitly enables per-stage parallelism.
+    ///
+    /// Pass `false` to disable and use the explicit `num_workers` argument.
     ///
     /// # Example
     ///
     /// ```ignore
-    /// let opts = SpawnOptions::new().auto_parallelism(true);
+    /// // Disable auto and use explicit 4 workers:
+    /// let opts = SpawnOptions::new().auto_parallelism(false);
     /// ```
     pub fn auto_parallelism(mut self, enable: bool) -> Self {
         self.auto_parallelism = enable;
@@ -424,7 +439,7 @@ impl Default for SpawnOptions {
             cancellation_token: None,
             drain_timeout: None,
             per_stage_parallelism: true,
-            auto_parallelism: false,
+            auto_parallelism: true,
         }
     }
 }
@@ -1011,6 +1026,12 @@ impl RuntimeHandle {
     /// the legacy uniform behavior is used: all stages must have the same
     /// parallelism as `num_workers`, and exchange operators are rejected.
     ///
+    /// With [`SpawnOptions::auto_parallelism(true)`](SpawnOptions::auto_parallelism)
+    /// (the default), stage 0 parallelism is auto-detected from the number of
+    /// input sources, and `num_workers` acts as a minimum floor
+    /// (`max(auto_detected, num_workers)`). Pass `num_workers=0` to let
+    /// auto-detection fully control parallelism.
+    ///
     /// `num_workers` controls **logical** parallelism — the number of
     /// independent executor instances per stage. The runtime's `worker_threads`
     /// configuration controls **physical** parallelism. For example, 4
@@ -1025,7 +1046,7 @@ impl RuntimeHandle {
     ///
     /// # Errors
     ///
-    /// - `num_workers` is 0
+    /// - `num_workers` is 0 (when `auto_parallelism` is disabled)
     /// - `build` closure returns an error
     /// - Replicas have mismatched graph topologies
     /// - With `per_stage_parallelism(false)`: dataflow contains exchange
@@ -1115,7 +1136,9 @@ impl RuntimeHandle {
         if options.auto_parallelism {
             // Auto-parallelism: probe the graph to determine stage 0
             // parallelism from physical input/source_async count.
-            // The num_workers parameter is ignored.
+            // When num_workers > 0, it acts as a minimum — the auto-detected
+            // count is used only if it's higher. Pass num_workers=0 to let
+            // auto-detection fully control parallelism.
             let mut probe_builder = DataflowBuilder::new(format!("{name}/probe"));
             build(&mut probe_builder)?;
             let probe_df = probe_builder.build()?;
@@ -1124,7 +1147,8 @@ impl RuntimeHandle {
             // Stage 0 parallelism = number of input + source_async operators.
             let stage0_input_count =
                 probe_df.input_ports.len() + probe_df.async_source_wiring.len();
-            let default_parallelism = stage0_input_count.max(1);
+            let auto_detected = stage0_input_count.max(1);
+            let default_parallelism = auto_detected.max(num_workers);
             drop(probe_df);
 
             if stages.is_empty() {
@@ -6681,6 +6705,7 @@ mod tests {
     fn validate_stage_parallelism_matching_passes() {
         // Build a dataflow with exchange_by_hash_to(par=2) and spawn with 2 workers.
         // Should succeed because parallelism matches num_workers (legacy uniform path).
+        // auto_parallelism is disabled via per_stage_parallelism(false).
         let rt = RuntimeHandle::new(RuntimeConfig {
             worker_threads: 2,
             schedule_policy: None,
@@ -6721,7 +6746,7 @@ mod tests {
                 .map("noop", |_t, x| x)
                 .output("out");
             Ok(())
-        }, SpawnOptions::new().per_stage_parallelism(false));
+        }, SpawnOptions::new().per_stage_parallelism(false).auto_parallelism(false));
         // Should fail — parallelism (4) != num_workers (2).
         match result {
             Err(e) => {
@@ -6753,7 +6778,7 @@ mod tests {
                 .map("noop", |_t, x| x)
                 .output("out");
             Ok(())
-        }, SpawnOptions::new().per_stage_parallelism(false));
+        }, SpawnOptions::new().per_stage_parallelism(false).auto_parallelism(false));
         match result {
             Err(e) => {
                 let err_msg = format!("{e}");

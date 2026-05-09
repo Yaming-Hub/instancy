@@ -187,7 +187,8 @@ fn staged_increasing_parallelism() {
     multi.join_blocking().unwrap();
 }
 
-/// Validates that spawn_multi with per_stage_parallelism rejects num_workers of 0.
+/// Validates that spawn_multi with per_stage_parallelism rejects num_workers of 0
+/// when auto_parallelism is disabled (in auto mode, 0 means "let auto-detect decide").
 #[test]
 fn staged_zero_parallelism_rejected() {
     let rt = test_runtime();
@@ -198,7 +199,7 @@ fn staged_zero_parallelism_rejected() {
             builder.input::<i32>("data").for_each("sink", |_t, _v| {});
             Ok(())
         },
-        staged_opts(),
+        staged_opts().auto_parallelism(false),
     );
     assert!(result.is_err());
 }
