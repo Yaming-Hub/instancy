@@ -215,6 +215,31 @@ impl TestCoordinator {
         }
     }
 
+    /// Wait for a response from a specific node without panicking on disconnects.
+    async fn recv_response_tolerant(
+        &mut self,
+        node_id: &str,
+    ) -> std::result::Result<NodeResponse, String> {
+        let conn = self
+            .connections
+            .get_mut(node_id)
+            .ok_or_else(|| format!("no connection to node {node_id}"))?;
+
+        loop {
+            match read_envelope(&mut conn.reader).await {
+                Ok(Some(env)) => match env.kind {
+                    MessageKind::Response(r) => return Ok(r),
+                    MessageKind::Event(_) => continue,
+                    MessageKind::Command(_) => {
+                        return Err(format!("received command from node {node_id}"));
+                    }
+                },
+                Ok(None) => return Err(format!("node {node_id} closed connection")),
+                Err(e) => return Err(format!("failed to read from {node_id}: {e}")),
+            }
+        }
+    }
+
     /// Try to capture stderr from a node process (best-effort).
     async fn capture_stderr(&mut self, node_id: &str) -> String {
         if let Some(child) = self.processes.get_mut(node_id) {
@@ -533,6 +558,67 @@ impl TestCoordinator {
             }
         }
         all_success
+    }
+
+    /// Kill a specific node process (simulates node crash).
+    /// Removes the process and connection, so subsequent commands to this node will fail.
+    pub async fn kill_node(&mut self, node_id: &str) {
+        if let Some(mut child) = self.processes.remove(node_id) {
+            let _ = child.start_kill();
+            let _ = child.wait().await;
+        }
+        self.connections.remove(node_id);
+    }
+
+    /// Wait for dataflow completion, tolerating errors from crashed/failed nodes.
+    /// Returns Ok(true) if all alive nodes completed, Ok(false) if cancelled or failed,
+    /// Err(msg) if an unexpected protocol error occurred.
+    pub async fn wait_for_completion_tolerant(
+        &mut self,
+        dataflow_id: &str,
+    ) -> std::result::Result<bool, String> {
+        let node_ids: Vec<String> = self.connections.keys().cloned().collect();
+        for node_id in &node_ids {
+            self.send_command_fire(
+                node_id,
+                NodeCommand::WaitForCompletion {
+                    dataflow_id: dataflow_id.into(),
+                },
+            )
+            .await;
+        }
+
+        let mut all_success = true;
+        for node_id in &node_ids {
+            match timeout(WAIT_TIMEOUT, self.recv_response_tolerant(node_id)).await {
+                Ok(Ok(NodeResponse::DataflowCompleted { success, .. })) => {
+                    if !success {
+                        all_success = false;
+                    }
+                }
+                Ok(Ok(NodeResponse::Error { .. })) => {
+                    all_success = false;
+                }
+                Ok(Ok(other)) => {
+                    return Err(format!(
+                        "unexpected WaitForCompletion response from {node_id}: {other:?}"
+                    ));
+                }
+                Ok(Err(_)) | Err(_) => {
+                    all_success = false;
+                }
+            }
+        }
+
+        Ok(all_success)
+    }
+
+    /// Backward-compatible alias for tolerant completion waits that allow node errors.
+    pub async fn wait_for_completion_allow_error(
+        &mut self,
+        dataflow_id: &str,
+    ) -> std::result::Result<bool, String> {
+        self.wait_for_completion_tolerant(dataflow_id).await
     }
 
     /// Send shutdown to all nodes and wait for processes to exit.
