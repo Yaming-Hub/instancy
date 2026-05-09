@@ -125,7 +125,7 @@ fn spawn_node<F>(
     )>,
 >
 where
-    F: Fn(usize, &mut DataflowBuilder<u64>) -> Result<()> + Send + 'static,
+    F: Fn(&mut DataflowBuilder<u64>) -> Result<()> + Send + 'static,
 {
     let node_id = node_id.to_string();
     tokio::task::spawn_blocking(move || {
@@ -163,7 +163,7 @@ async fn tcp_two_nodes_no_exchange() {
     let mut conns = make_tcp_connections(&["node-a", "node-b"]).await;
     let tokio_handle = tokio::runtime::Handle::current();
 
-    let build = |_worker_idx: usize, builder: &mut DataflowBuilder<u64>| -> Result<()> {
+    let build = |builder: &mut DataflowBuilder<u64>| -> Result<()> {
         builder
             .input::<i32>("data")
             .map("double", |_t, x| x * 2)
@@ -238,7 +238,7 @@ async fn tcp_two_nodes_with_exchange() {
     let mut conns = make_tcp_connections(&["node-a", "node-b"]).await;
     let tokio_handle = tokio::runtime::Handle::current();
 
-    let build = |_worker_idx: usize, builder: &mut DataflowBuilder<u64>| -> Result<()> {
+    let build = |builder: &mut DataflowBuilder<u64>| -> Result<()> {
         let input = builder.input::<i64>("data");
         let exchanged = input.exchange("by_val", |x: &i64| *x as u64);
         exchanged.map("identity", |_t, x| x).output("results");
@@ -306,7 +306,7 @@ async fn tcp_three_nodes_exchange() {
     let mut conns = make_tcp_connections(&["alpha", "beta", "gamma"]).await;
     let tokio_handle = tokio::runtime::Handle::current();
 
-    let build = |_worker_idx: usize, builder: &mut DataflowBuilder<u64>| -> Result<()> {
+    let build = |builder: &mut DataflowBuilder<u64>| -> Result<()> {
         let input = builder.input::<i64>("data");
         let exchanged = input.exchange("by_val", |x: &i64| *x as u64);
         exchanged.map("pass", |_t, x| x).output("results");
@@ -385,7 +385,7 @@ async fn tcp_multi_worker_exchange() {
     let mut conns = make_tcp_connections(&["node-a", "node-b"]).await;
     let tokio_handle = tokio::runtime::Handle::current();
 
-    let build = |_worker_idx: usize, builder: &mut DataflowBuilder<u64>| -> Result<()> {
+    let build = |builder: &mut DataflowBuilder<u64>| -> Result<()> {
         let input = builder.input::<i64>("data");
         let exchanged = input.exchange("by_val", |x: &i64| *x as u64);
         exchanged.map("pass", |_t, x| x).output("results");
@@ -454,7 +454,7 @@ async fn tcp_multi_epoch_exchange() {
     let mut conns = make_tcp_connections(&["node-a", "node-b"]).await;
     let tokio_handle = tokio::runtime::Handle::current();
 
-    let build = |_worker_idx: usize, builder: &mut DataflowBuilder<u64>| -> Result<()> {
+    let build = |builder: &mut DataflowBuilder<u64>| -> Result<()> {
         let input = builder.input::<i64>("data");
         let exchanged = input.exchange("by_val", |x: &i64| *x as u64);
         exchanged.map("pass", |_t, x| x).output("results");
@@ -542,7 +542,7 @@ async fn stress_tcp_exchange_high_volume() {
     let mut conns = make_tcp_connections(&["node-a", "node-b"]).await;
     let tokio_handle = tokio::runtime::Handle::current();
 
-    let build = |_worker_idx: usize, builder: &mut DataflowBuilder<u64>| -> Result<()> {
+    let build = |builder: &mut DataflowBuilder<u64>| -> Result<()> {
         let input = builder.input::<i64>("data");
         let exchanged = input.exchange("by_val", |x: &i64| *x as u64);
         exchanged.map("pass", |_t, x| x).output("results");
@@ -618,7 +618,7 @@ async fn stress_tcp_repeated_creation() {
         let mut conns = make_tcp_connections(&["node-a", "node-b"]).await;
         let tokio_handle = tokio::runtime::Handle::current();
 
-        let build = |_worker_idx: usize, builder: &mut DataflowBuilder<u64>| -> Result<()> {
+        let build = |builder: &mut DataflowBuilder<u64>| -> Result<()> {
             builder
                 .input::<i32>("data")
                 .map("double", |_t, x| x * 2)
@@ -683,7 +683,7 @@ async fn stress_tcp_three_nodes_high_volume() {
     let mut conns = make_tcp_connections(&["alpha", "beta", "gamma"]).await;
     let tokio_handle = tokio::runtime::Handle::current();
 
-    let build = |_worker_idx: usize, builder: &mut DataflowBuilder<u64>| -> Result<()> {
+    let build = |builder: &mut DataflowBuilder<u64>| -> Result<()> {
         let input = builder.input::<i64>("data");
         let exchanged = input.exchange("by_val", |x: &i64| *x as u64);
         exchanged.map("pass", |_t, x| x).output("results");
@@ -772,7 +772,7 @@ async fn stress_tcp_many_epochs() {
     let mut conns = make_tcp_connections(&["node-a", "node-b"]).await;
     let tokio_handle = tokio::runtime::Handle::current();
 
-    let build = |_worker_idx: usize, builder: &mut DataflowBuilder<u64>| -> Result<()> {
+    let build = |builder: &mut DataflowBuilder<u64>| -> Result<()> {
         let input = builder.input::<i64>("data");
         let exchanged = input.exchange("by_val", |x: &i64| *x as u64);
         exchanged.map("pass", |_t, x| x).output("results");
@@ -864,7 +864,7 @@ async fn tcp_iterate_with_exchange() {
 
     let threshold = 5u64;
 
-    let build = move |_worker_idx: usize, builder: &mut DataflowBuilder<u64>| -> Result<()> {
+    let build = move |builder: &mut DataflowBuilder<u64>| -> Result<()> {
         let input = builder.input::<u64>("data");
 
         let result = input.iterate::<u32>("loop", 1u32, move |stream| {

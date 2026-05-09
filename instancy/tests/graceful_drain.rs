@@ -110,7 +110,7 @@ async fn drain_with_multi_worker() {
         .spawn_multi(
             "drain-multi",
             2,
-            |_worker_idx, builder: &mut DataflowBuilder<u64>| {
+            |builder: &mut DataflowBuilder<u64>| {
                 let input = builder.input::<i32>("data");
                 input.map("triple", |_t, v| v * 3).output("results");
                 Ok(())

@@ -33,7 +33,7 @@ where
             num_workers,
             {
                 let build_fn = build_fn.clone();
-                move |_worker_idx, builder| {
+                move |builder| {
                     build_fn(builder);
                     Ok(())
                 }
@@ -284,7 +284,7 @@ async fn multi_worker_iterate_input_from_all_workers() {
         .spawn_multi(
             "mw-all-inputs",
             2,
-            |_worker_idx, builder| {
+            |builder| {
                 let input = builder.input::<i64>("data");
                 let output = input.iterate::<u32>("double-loop", 1u32, |iter_var| {
                     let doubled = iter_var

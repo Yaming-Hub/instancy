@@ -31,7 +31,7 @@ fn main() {
         .spawn_multi(
             "exchange_demo",
             num_workers,
-            |_worker_idx, builder| {
+            |builder| {
                 let input = builder.input::<u64>("data");
 
                 // Exchange by value — routes each element to worker (value % num_workers).

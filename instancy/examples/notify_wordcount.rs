@@ -74,7 +74,7 @@ fn main() {
         .spawn_multi(
             "notify-wordcount",
             num_workers,
-            |_worker_idx, builder: &mut DataflowBuilder<u64>| {
+            |builder: &mut DataflowBuilder<u64>| {
                 let input = builder.input::<String>("lines");
 
                 input

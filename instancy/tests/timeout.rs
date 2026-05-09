@@ -110,7 +110,7 @@ async fn spawn_multi_cancelled_by_external_token() {
         .spawn_multi(
             "multi-cancel",
             2,
-            |_worker_idx, builder: &mut DataflowBuilder<u64>| {
+            |builder: &mut DataflowBuilder<u64>| {
                 let input = builder.input::<i32>("data");
                 input.map("identity", |_t, v| v);
                 Ok(())

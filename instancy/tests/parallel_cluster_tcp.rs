@@ -110,8 +110,8 @@ async fn parallel_tcp_dataflows_shared_pool() {
     // Build closures per dataflow index.
     fn build_df(
         df_idx: usize,
-    ) -> impl Fn(usize, &mut DataflowBuilder<u64>) -> Result<()> + Clone + Send + 'static {
-        move |_worker_idx: usize, builder: &mut DataflowBuilder<u64>| -> Result<()> {
+    ) -> impl Fn(&mut DataflowBuilder<u64>) -> Result<()> + Clone + Send + 'static {
+        move |builder: &mut DataflowBuilder<u64>| -> Result<()> {
             let input = builder.input::<i64>("data");
             let exchanged = input.exchange("by_val", |x: &i64| *x as u64);
             let mapped = match df_idx {
@@ -292,7 +292,7 @@ async fn parallel_tcp_dataflows_multi_epoch() {
     .unwrap();
     let topology2 = topology.clone();
 
-    let build = |_worker_idx: usize, builder: &mut DataflowBuilder<u64>| -> Result<()> {
+    let build = |builder: &mut DataflowBuilder<u64>| -> Result<()> {
         let input = builder.input::<i64>("data");
         let exchanged = input.exchange("by_val", |x: &i64| *x as u64);
         exchanged.map("double", |_t, x| x * 2).output("results");

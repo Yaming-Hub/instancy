@@ -116,7 +116,7 @@ fn bench_exchange_throughput(c: &mut Criterion) {
                             .spawn_multi(
                                 "bench-exchange",
                                 num_workers,
-                                move |_worker_idx, builder| {
+                                move |builder| {
                                     let data: Vec<(u64, Vec<i64>)> =
                                         vec![(0, (0..count as i64).collect())];
                                     builder
@@ -194,7 +194,7 @@ fn bench_spawn_latency(c: &mut Criterion) {
                 .spawn_multi(
                     "bench-multi",
                     2,
-                    |_worker_idx, builder| {
+                    |builder| {
                         builder
                             .source("src", vec![(0u64, vec![1i32])])
                             .for_each("sink", |_t, v| { black_box(v); });

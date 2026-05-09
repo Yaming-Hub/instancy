@@ -51,13 +51,12 @@ fn main() {
 
     // --- Spawn replicated workers ---
     // The build closure is called once per worker. Every worker gets an
-    // identical graph topology. The worker_idx is available for logging
-    // or per-worker configuration, but the graph structure must match.
+    // identical logical graph topology.
     let mut multi = rt
         .spawn_multi(
             "partitioned-double",
             num_workers,
-            |_worker_idx, builder: &mut DataflowBuilder<u64>| {
+            |builder: &mut DataflowBuilder<u64>| {
                 let input = builder.input::<i32>("data");
                 input.map("double", |_t, x| x * 2).output("results");
                 Ok(())

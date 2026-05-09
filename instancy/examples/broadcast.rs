@@ -10,39 +10,25 @@
 //! cargo run --example broadcast
 //! ```
 
-use std::collections::BTreeMap;
-use std::sync::{Arc, Mutex};
-
 use instancy::DataflowBuilder;
 use instancy::{RuntimeConfig, RuntimeHandle, SpawnOptions};
 
 fn main() {
     let num_workers = 3;
 
-    // Shared collector: worker_index → Vec<(time, data)>
-    type WorkerData = Vec<(u64, Vec<i32>)>;
-    let collected: Arc<Mutex<BTreeMap<usize, WorkerData>>> =
-        Arc::new(Mutex::new(BTreeMap::new()));
-
     println!("=== broadcast to {num_workers} workers ===\n");
 
     let rt = RuntimeHandle::new(RuntimeConfig::default()).unwrap();
 
-    let collected_clone = collected.clone();
     let mut multi = rt
         .spawn_multi(
             "broadcast_demo",
             num_workers,
-            move |worker_idx, builder: &mut DataflowBuilder<u64>| {
-                let input = builder.input::<i32>("data");
-                let wid = worker_idx;
-                let coll = collected_clone.clone();
-                input
+            |builder: &mut DataflowBuilder<u64>| {
+                builder
+                    .input::<i32>("data")
                     .broadcast("replicate")
-                    .for_each_batch("collect", move |time, batch| {
-                        let mut map = coll.lock().unwrap();
-                        map.entry(wid).or_default().push((*time, batch.to_vec()));
-                    });
+                    .output("results");
                 Ok(())
             },
             SpawnOptions::default(),
@@ -60,14 +46,18 @@ fn main() {
         drop(multi.take_input::<i32>(i, "data").unwrap());
     }
 
+    let mut receivers = Vec::new();
+    for worker in 0..num_workers {
+        receivers.push((worker, multi.take_output::<i32>(worker, "results").unwrap()));
+    }
+
     multi.join_blocking().expect("execution failed");
 
     // Show results: each worker received all data
-    let map = collected.lock().unwrap();
     println!("Data received by each worker:\n");
-    for (worker, batches) in map.iter() {
+    for (worker, receiver) in receivers {
         println!("  Worker {worker}:");
-        for (time, batch) in batches {
+        for (time, batch) in receiver.collect_data() {
             println!("    t={time}: {batch:?}");
         }
     }

@@ -28,7 +28,7 @@ fn auto_par_single_input_single_stage() {
         .spawn_multi(
             "simple",
             0, // ignored with auto_parallelism
-            |_worker_idx, builder: &mut DataflowBuilder<u64>| {
+            |builder: &mut DataflowBuilder<u64>| {
                 let input = builder.input::<i32>("data");
                 input.map("double", |_t, x| x * 2).output("results");
                 Ok(())
@@ -66,7 +66,7 @@ fn auto_par_fan_out() {
         .spawn_multi(
             "fan-out",
             0,
-            move |_worker_idx, builder: &mut DataflowBuilder<u64>| {
+            move |builder: &mut DataflowBuilder<u64>| {
                 let c = c.clone();
                 let input = builder.input::<i32>("data");
                 input
@@ -102,7 +102,7 @@ fn auto_par_fan_out_fan_in() {
         .spawn_multi(
             "fan-out-fan-in",
             0,
-            |_worker_idx, builder: &mut DataflowBuilder<u64>| {
+            |builder: &mut DataflowBuilder<u64>| {
                 let input = builder.input::<i32>("data");
                 input
                     .exchange_to("scatter", 4, |v: &i32| *v as u64)
@@ -145,7 +145,7 @@ fn auto_par_multiple_inputs() {
         .spawn_multi(
             "multi-input",
             0,
-            |_worker_idx, builder: &mut DataflowBuilder<u64>| {
+            |builder: &mut DataflowBuilder<u64>| {
                 let a = builder.input::<i32>("stream_a");
                 let b = builder.input::<i32>("stream_b");
                 a.map("inc_a", |_t, x| x + 1).for_each("sink_a", |_t, _v| {});
@@ -184,7 +184,7 @@ fn auto_par_increasing_parallelism() {
         .spawn_multi(
             "increasing",
             0,
-            move |_worker_idx, builder: &mut DataflowBuilder<u64>| {
+            move |builder: &mut DataflowBuilder<u64>| {
                 let c = c.clone();
                 let input = builder.input::<i32>("data");
                 input
@@ -223,7 +223,7 @@ fn auto_par_decreasing_parallelism() {
         .spawn_multi(
             "decrease",
             0,
-            |_worker_idx, builder: &mut DataflowBuilder<u64>| {
+            |builder: &mut DataflowBuilder<u64>| {
                 let input = builder.input::<i32>("data");
                 input
                     .exchange_to("scatter", 4, |v: &i32| *v as u64)
@@ -263,7 +263,7 @@ fn auto_par_trivial_graph() {
         .spawn_multi(
             "trivial",
             0,
-            |_worker_idx, builder: &mut DataflowBuilder<u64>| {
+            |builder: &mut DataflowBuilder<u64>| {
                 let input = builder.input::<i32>("data");
                 input.for_each("sink", |_t, _v| {});
                 Ok(())
@@ -289,7 +289,7 @@ fn auto_par_uniform_fallback() {
         .spawn_multi(
             "uniform",
             0,
-            |_worker_idx, builder: &mut DataflowBuilder<u64>| {
+            |builder: &mut DataflowBuilder<u64>| {
                 let input = builder.input::<i32>("data");
                 input
                     .map("inc", |_t, x| x + 1)
@@ -334,7 +334,7 @@ fn auto_par_cross_stage_frontier() {
         .spawn_multi(
             "frontier",
             0,
-            |_worker_idx, builder: &mut DataflowBuilder<u64>| {
+            |builder: &mut DataflowBuilder<u64>| {
                 let input = builder.input::<i32>("data");
                 input
                     .exchange_to("scatter", 2, |v: &i32| *v as u64)

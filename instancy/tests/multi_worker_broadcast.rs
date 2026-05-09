@@ -35,7 +35,7 @@ where
             num_workers,
             {
                 let build_fn = build_fn.clone();
-                move |_worker_idx, builder| {
+                move |builder| {
                     build_fn(builder);
                     Ok(())
                 }

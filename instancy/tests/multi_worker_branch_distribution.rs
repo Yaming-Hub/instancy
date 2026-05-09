@@ -33,7 +33,7 @@ where
             num_workers,
             {
                 let build_fn = build_fn.clone();
-                move |_worker_idx, builder| {
+                move |builder| {
                     build_fn(builder);
                     Ok(())
                 }
@@ -104,7 +104,7 @@ where
             num_workers,
             {
                 let build_fn = build_fn.clone();
-                move |_worker_idx, builder| {
+                move |builder| {
                     build_fn(builder);
                     Ok(())
                 }
@@ -300,7 +300,7 @@ async fn multi_worker_gather_collects_all() {
         .spawn_multi(
             "mw-gather",
             2,
-            |_worker_idx, builder| {
+            |builder| {
                 let input = builder.input::<i64>("data");
                 let gathered = input
                     .exchange_by_hash("distribute", |x| *x as u64)
@@ -451,7 +451,7 @@ async fn multi_worker_rebalance_per_worker_distribution() {
         .spawn_multi(
             "mw-rebalance-perw",
             2,
-            |_worker_idx, builder| {
+            |builder| {
                 let input = builder.input::<i64>("data");
                 input.rebalance("redistribute").output("results");
                 Ok(())
@@ -532,7 +532,7 @@ async fn multi_worker_rebalance_to_distributes() {
         .spawn_multi(
             "mw-rebalance-to-dist",
             2,
-            |_worker_idx, builder| {
+            |builder| {
                 let input = builder.input::<i64>("data");
                 input.rebalance_to("redistribute", 2).output("results");
                 Ok(())

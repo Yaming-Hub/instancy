@@ -125,7 +125,7 @@ async fn shared_two_nodes_no_exchange() {
     let managers_a = Arc::new(managers_a);
     let managers_b = Arc::new(managers_b);
 
-    let build = |_worker_idx: usize, builder: &mut DataflowBuilder<u64>| -> Result<()> {
+    let build = |builder: &mut DataflowBuilder<u64>| -> Result<()> {
         builder
             .input::<i32>("data")
             .map("double", |_t, x| x * 2)
@@ -227,7 +227,7 @@ async fn shared_two_nodes_with_exchange() {
     let managers_a = Arc::new(managers_a);
     let managers_b = Arc::new(managers_b);
 
-    let build = |_worker_idx: usize, builder: &mut DataflowBuilder<u64>| -> Result<()> {
+    let build = |builder: &mut DataflowBuilder<u64>| -> Result<()> {
         let input = builder.input::<i64>("data");
         let exchanged = input.exchange("by_val", |x: &i64| *x as u64);
         exchanged.map("identity", |_t, x| x).output("results");
@@ -324,7 +324,7 @@ async fn shared_multiple_dataflows_same_connections() {
     let managers_a = Arc::new(managers_a);
     let managers_b = Arc::new(managers_b);
 
-    let build = |_worker_idx: usize, builder: &mut DataflowBuilder<u64>| -> Result<()> {
+    let build = |builder: &mut DataflowBuilder<u64>| -> Result<()> {
         let input = builder.input::<u64>("data");
         input
             .exchange("route", |x: &u64| *x)
@@ -463,7 +463,7 @@ async fn shared_dropping_arc_after_spawn_does_not_kill_transport() {
     let managers_a = Arc::new(managers_a);
     let managers_b = Arc::new(managers_b);
 
-    let build = |_worker_idx: usize, builder: &mut DataflowBuilder<u64>| -> Result<()> {
+    let build = |builder: &mut DataflowBuilder<u64>| -> Result<()> {
         let input = builder.input::<i64>("data");
         let exchanged = input.exchange("by_val", |x: &i64| *x as u64);
         exchanged.map("identity", |_t, x| x).output("results");
@@ -566,7 +566,7 @@ async fn shared_join_async_keeps_bridges_alive() {
     let managers_a = Arc::new(managers_a);
     let managers_b = Arc::new(managers_b);
 
-    let build = |_worker_idx: usize, builder: &mut DataflowBuilder<u64>| -> Result<()> {
+    let build = |builder: &mut DataflowBuilder<u64>| -> Result<()> {
         let input = builder.input::<u64>("data");
         let exchanged = input.exchange("by_val", |x: &u64| *x);
         exchanged.map("inc", |_t, x| x + 1).output("results");
