@@ -61,10 +61,27 @@ let output = builder
 ```
 
 The parallelism flows like this:
-- **Stage 0**: inherits from `spawn_cluster` topology total workers (cluster-wide)
+- **Stage 0**: auto-detected from input sources (with `auto_parallelism`, the default), or inherited from `num_workers` / cluster topology
 - **Stage 1**: set by `exchange(..., 4)` — the repartition specifies downstream parallelism
 - **Stage 2**: set by `gather()` — always parallelism=1
 - **Stage 3**: set by `rebalance(8)` — explicit downstream parallelism
+
+### Auto-Parallelism (Default)
+
+With `SpawnOptions::auto_parallelism(true)` (the default), stage 0 parallelism is automatically detected from the number of `input()` + `source_async()` calls in the graph. The `num_workers` argument to `spawn_multi` acts as a minimum floor:
+
+```
+effective_parallelism = max(auto_detected, num_workers)
+```
+
+This means:
+- A graph with 3 inputs and `num_workers=2` gets `max(3, 2) = 3` stage 0 workers
+- A graph with 1 input and `num_workers=4` gets `max(1, 4) = 4` stage 0 workers
+- Pass `num_workers=0` to let auto-detection fully control stage 0 parallelism
+
+Stages without explicit parallelism (no exchange/gather/rebalance) inherit the effective stage 0 count.
+
+Disable with `SpawnOptions::new().auto_parallelism(false)` to use the exact `num_workers` value for stage 0. To force uniform parallelism across *all* stages, also set `per_stage_parallelism(false)`.
 
 **Important: parallelism is always cluster-wide total.** The hosting application controls how workers are distributed across nodes via the `ClusterTopology` (e.g., node A: 6 workers, node B: 2 workers for a total of 8 — because node A has more local data). Pipeline edges within a stage are local-only (no network traffic). Exchange/gather/rebalance edges cross node boundaries.
 
