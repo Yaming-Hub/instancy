@@ -1,3 +1,13 @@
+//! Comparative benchmarks for Instancy and Timely.
+//!
+//! Each benchmark iteration builds the dataflow graph and runs it to completion in both
+//! frameworks. Instancy reuses a pre-created async runtime across iterations, while Timely
+//! recreates its execution context per iteration; for single-worker cases this uses
+//! `execute_directly`, which is lightweight and avoids thread spawning. Inputs are fed to both
+//! frameworks in batch form. Q5 (`Q5_pagerank_batch`) intentionally uses a shared sequential
+//! PageRank implementation instead of either framework's native iteration operators so both sides
+//! execute the same batch-style algorithm.
+
 use std::collections::HashMap;
 use std::hint::black_box;
 use std::sync::Arc;
@@ -140,18 +150,34 @@ fn line_revenue(item: &data::LineItem) -> i64 {
     item.price * item.discount
 }
 
+fn timely_process_config(template: &timely::Config) -> timely::Config {
+    match template.communication {
+        timely::CommunicationConfig::Process(threads) => timely::Config::process(threads),
+        _ => unreachable!("benchmark templates use timely::Config::process"),
+    }
+}
+
 fn compute_pagerank(edges: &[data::Edge], num_vertices: u64, iterations: usize) -> Vec<(u64, f64)> {
-    let mut adjacency = vec![Vec::new(); num_vertices as usize];
+    let n = num_vertices as usize;
+    let mut adjacency = vec![Vec::new(); n];
     for edge in edges {
         adjacency[edge.src as usize].push(edge.dst);
     }
 
-    let base_rank = 1.0 / num_vertices as f64;
-    let mut ranks = vec![base_rank; num_vertices as usize];
-    let teleport = (1.0 - 0.85) / num_vertices as f64;
+    let base_rank = 1.0 / n as f64;
+    let mut ranks = vec![base_rank; n];
 
     for _ in 0..iterations {
-        let mut next = vec![teleport; num_vertices as usize];
+        let dangling_sum: f64 = adjacency
+            .iter()
+            .enumerate()
+            .filter(|(_, outs)| outs.is_empty())
+            .map(|(src, _)| ranks[src])
+            .sum();
+        let dangling_contrib = dangling_sum * 0.85 / n as f64;
+        let teleport = (1.0 - 0.85) / n as f64;
+        let mut next = vec![teleport + dangling_contrib; n];
+
         for (src, outs) in adjacency.iter().enumerate() {
             if outs.is_empty() {
                 continue;
@@ -161,6 +187,7 @@ fn compute_pagerank(edges: &[data::Edge], num_vertices: u64, iterations: usize) 
                 next[dst as usize] += share;
             }
         }
+
         ranks = next;
     }
 
@@ -207,6 +234,8 @@ fn instancy_q1(rt: &RuntimeHandle, items: &[data::LineItem], cutoff: u64) {
 fn timely_q1(items: &[data::LineItem], cutoff: u64) {
     let items = items.to_vec();
     timely::execute_directly(move |worker| {
+        // `execute_directly` includes lightweight per-iteration worker setup. Instancy also
+        // measures dataflow build/spawn/join inside the iteration, so both sides include setup.
         let (mut input, probe) = worker.dataflow::<u64, _, _>(|scope| {
             use timely::dataflow::channels::pact::Pipeline;
             use timely::dataflow::operators::generic::Operator;
@@ -242,9 +271,8 @@ fn timely_q1(items: &[data::LineItem], cutoff: u64) {
             (input, probe)
         });
 
-        for item in items {
-            input.send(item);
-        }
+        let mut batch = items;
+        input.send_batch(&mut batch);
         input.close();
         worker.step_while(|| !probe.done());
     });
@@ -344,9 +372,9 @@ fn instancy_q2(rt: &RuntimeHandle, left_partitions: &[Vec<(u64, i64)>], right_pa
     handle.join_blocking().unwrap();
 }
 
-fn timely_q2(event_partitions: &[Vec<JoinEvent>], workers: usize) {
+fn timely_q2(event_partitions: &[Vec<JoinEvent>], config: &timely::Config) {
     let event_partitions = Arc::new(event_partitions.to_vec());
-    timely::execute(timely::Config::process(workers), move |worker| {
+    timely::execute(timely_process_config(config), move |worker| {
         use timely::dataflow::channels::pact::Pipeline;
         use timely::dataflow::operators::generic::Operator;
         use timely::dataflow::operators::{Exchange, Input, Inspect, Probe};
@@ -359,26 +387,46 @@ fn timely_q2(event_partitions: &[Vec<JoinEvent>], workers: usize) {
                 .exchange(|event| match event {
                     JoinEvent::Left { order_key, .. } | JoinEvent::Right { order_key } => *order_key,
                 })
-                .unary_notify(Pipeline, "join_sum", None, {
+                .unary_notify(Pipeline, "join", None, {
                     let mut left_state: HashMap<u64, Vec<i64>> = HashMap::new();
                     let mut right_counts: HashMap<u64, usize> = HashMap::new();
-                    let mut sums: HashMap<u64, i64> = HashMap::new();
                     move |input, output, notificator| {
                         input.for_each(|time, data| {
+                            let mut matched = Vec::new();
                             for event in data.iter().cloned() {
                                 match event {
                                     JoinEvent::Left { order_key, revenue } => {
-                                        let matches = right_counts.get(&order_key).copied().unwrap_or(0) as i64;
-                                        *sums.entry(order_key).or_default() += revenue * matches;
+                                        if let Some(count) = right_counts.get(&order_key) {
+                                            for _ in 0..*count {
+                                                matched.push((order_key, revenue));
+                                            }
+                                        }
                                         left_state.entry(order_key).or_default().push(revenue);
                                     }
                                     JoinEvent::Right { order_key } => {
                                         if let Some(revenues) = left_state.get(&order_key) {
-                                            *sums.entry(order_key).or_default() += revenues.iter().sum::<i64>();
+                                            matched.extend(
+                                                revenues.iter().copied().map(|revenue| (order_key, revenue)),
+                                            );
                                         }
                                         *right_counts.entry(order_key).or_default() += 1;
                                     }
                                 }
+                            }
+                            if !matched.is_empty() {
+                                output.session(&time).give_vec(&mut matched);
+                            }
+                            notificator.notify_at(time.retain());
+                        });
+                        notificator.for_each(|_, _, _| {});
+                    }
+                })
+                .unary_notify(Pipeline, "sum_revenue", None, {
+                    let mut sums: HashMap<u64, i64> = HashMap::new();
+                    move |input, output, notificator| {
+                        input.for_each(|time, data| {
+                            for (order_key, revenue) in data.iter() {
+                                *sums.entry(*order_key).or_default() += *revenue;
                             }
                             notificator.notify_at(time.retain());
                         });
@@ -397,9 +445,8 @@ fn timely_q2(event_partitions: &[Vec<JoinEvent>], workers: usize) {
             (input, probe)
         });
 
-        for event in partitions[worker_index].iter().cloned() {
-            input.send(event);
-        }
+        let mut batch = partitions[worker_index].clone();
+        input.send_batch(&mut batch);
         input.close();
         worker.step_while(|| !probe.done());
     })
@@ -471,9 +518,8 @@ fn timely_q3(items: &[data::LineItem], min_ship: u64, max_ship: u64, min_discoun
             (input, probe)
         });
 
-        for item in items {
-            input.send(item);
-        }
+        let mut batch = items;
+        input.send_batch(&mut batch);
         input.close();
         worker.step_while(|| !probe.done());
     });
@@ -514,9 +560,8 @@ fn timely_q4(values: &[i64]) {
             (input, probe)
         });
 
-        for value in values {
-            input.send(value);
-        }
+        let mut batch = values;
+        input.send_batch(&mut batch);
         input.close();
         worker.step_while(|| !probe.done());
     });
@@ -587,9 +632,8 @@ fn timely_q5(edges: &[data::Edge], num_vertices: u64) {
             (input, probe)
         });
 
-        for edge in edges {
-            input.send(edge);
-        }
+        let mut batch = edges;
+        input.send_batch(&mut batch);
         input.close();
         worker.step_while(|| !probe.done());
     });
@@ -629,9 +673,8 @@ fn timely_q6(batches: &[(u64, Vec<u64>)], threshold: u64) {
 
         for (time, batch) in batches {
             input.advance_to(time);
-            for value in batch {
-                input.send(value);
-            }
+            let mut batch = batch;
+            input.send_batch(&mut batch);
         }
         input.close();
         worker.step_while(|| !probe.done());
@@ -667,9 +710,9 @@ fn instancy_q7(rt: &RuntimeHandle, partitions: &[Vec<u64>], workers: usize) {
     handle.join_blocking().unwrap();
 }
 
-fn timely_q7(partitions: &[Vec<u64>], workers: usize) {
+fn timely_q7(partitions: &[Vec<u64>], config: &timely::Config) {
     let partitions = Arc::new(partitions.to_vec());
-    timely::execute(timely::Config::process(workers), move |worker| {
+    timely::execute(timely_process_config(config), move |worker| {
         use timely::dataflow::channels::pact::Pipeline;
         use timely::dataflow::operators::generic::Operator;
         use timely::dataflow::operators::{Exchange, Input, Inspect, Probe};
@@ -703,9 +746,8 @@ fn timely_q7(partitions: &[Vec<u64>], workers: usize) {
             (input, probe)
         });
 
-        for value in partitions[worker_index].iter().copied() {
-            input.send(value);
-        }
+        let mut batch = partitions[worker_index].clone();
+        input.send_batch(&mut batch);
         input.close();
         worker.step_while(|| !probe.done());
     })
@@ -718,7 +760,7 @@ fn bench_q1(c: &mut Criterion) {
     let instancy_rt = build_runtime(2);
 
     let mut group = c.benchmark_group("Q1_scan_filter_agg");
-    for &count in &[10_000u64, 100_000, 1_000_000] {
+    for &count in &[10_000u64, 100_000, 1_000_000, 10_000_000] {
         let items = data::generate_lineitems(count as usize);
         let cutoff = 11_000u64;
         group.throughput(Throughput::Elements(count));
@@ -743,6 +785,7 @@ fn bench_q2(c: &mut Criterion) {
         group.throughput(Throughput::Elements(count));
         for &workers in &[2usize, 4] {
             let (left_partitions, right_partitions, event_partitions) = build_join_inputs(&items, workers);
+            let timely_config = timely::Config::process(workers);
             group.bench_with_input(
                 BenchmarkId::new(format!("instancy_{workers}w"), count),
                 &count,
@@ -751,7 +794,7 @@ fn bench_q2(c: &mut Criterion) {
             group.bench_with_input(
                 BenchmarkId::new(format!("timely_{workers}w"), count),
                 &count,
-                |b, _| b.iter(|| timely_q2(&event_partitions, workers)),
+                |b, _| b.iter(|| timely_q2(&event_partitions, &timely_config)),
             );
         }
     }
@@ -764,7 +807,7 @@ fn bench_q3(c: &mut Criterion) {
     let instancy_rt = build_runtime(2);
 
     let mut group = c.benchmark_group("Q3_multistage_pipeline");
-    for &count in &[10_000u64, 100_000, 1_000_000] {
+    for &count in &[10_000u64, 100_000, 1_000_000, 10_000_000] {
         let items = data::generate_lineitems(count as usize);
         group.throughput(Throughput::Elements(count));
         group.bench_with_input(BenchmarkId::new("instancy", count), &count, |b, _| {
@@ -783,7 +826,7 @@ fn bench_q4(c: &mut Criterion) {
     let instancy_rt = build_runtime(2);
 
     let mut group = c.benchmark_group("Q4_map_chain");
-    for &count in &[1_000u64, 10_000, 100_000] {
+    for &count in &[1_000u64, 10_000, 100_000, 1_000_000] {
         let values: Vec<i64> = (0..count as i64).collect();
         group.throughput(Throughput::Elements(count));
         group.bench_with_input(BenchmarkId::new("instancy", count), &count, |b, _| {
@@ -801,7 +844,7 @@ fn bench_q5(c: &mut Criterion) {
     let _guard = rt_tokio.enter();
     let instancy_rt = build_runtime(2);
 
-    let mut group = c.benchmark_group("Q5_pagerank");
+    let mut group = c.benchmark_group("Q5_pagerank_batch");
     for &(vertices, edges_count) in &[(1_000u64, 10_000usize), (10_000, 100_000)] {
         let edges = data::generate_graph(vertices, edges_count);
         group.throughput(Throughput::Elements(edges_count as u64));
@@ -842,11 +885,12 @@ fn bench_q7(c: &mut Criterion) {
     let instancy_rt = build_runtime(4);
 
     let mut group = c.benchmark_group("Q7_exchange_reduce");
-    for &count in &[10_000u64, 100_000] {
+    for &count in &[10_000u64, 100_000, 1_000_000] {
         let values: Vec<u64> = (0..count).collect();
         group.throughput(Throughput::Elements(count));
         for &workers in &[2usize, 4] {
             let partitions = partition_round_robin(&values, workers);
+            let timely_config = timely::Config::process(workers);
             group.bench_with_input(
                 BenchmarkId::new(format!("instancy_{workers}w"), count),
                 &count,
@@ -855,7 +899,7 @@ fn bench_q7(c: &mut Criterion) {
             group.bench_with_input(
                 BenchmarkId::new(format!("timely_{workers}w"), count),
                 &count,
-                |b, _| b.iter(|| timely_q7(&partitions, workers)),
+                |b, _| b.iter(|| timely_q7(&partitions, &timely_config)),
             );
         }
     }
