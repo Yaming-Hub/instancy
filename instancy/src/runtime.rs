@@ -168,11 +168,11 @@ pub enum IoMode {
 #[derive(Clone, Debug)]
 pub struct SpawnOptions {
     /// Channel mode for external I/O ports. Default: [`IoMode::Sync`].
-    pub io_mode: IoMode,
+    pub(crate) io_mode: IoMode,
     /// Whether to collect per-operator metrics. Default: `false`.
-    pub collect_metrics: bool,
+    pub(crate) collect_metrics: bool,
     /// Scheduling priority for this dataflow (higher = scheduled sooner).
-    pub priority: u32,
+    pub(crate) priority: u32,
     /// Optional external cancellation token.
     ///
     /// When this token is cancelled (by the hosting application), the dataflow
@@ -195,7 +195,7 @@ pub struct SpawnOptions {
     /// let opts = SpawnOptions::new().cancellation_token(token);
     /// let handle = rt.spawn(dataflow, opts)?;
     /// ```
-    pub cancellation_token: Option<tokio_util::sync::CancellationToken>,
+    pub(crate) cancellation_token: Option<tokio_util::sync::CancellationToken>,
     /// When set, cancellation triggers a graceful drain phase instead of
     /// immediate termination. The executor closes external inputs and
     /// continues processing in-flight data until all operators complete
@@ -212,7 +212,7 @@ pub struct SpawnOptions {
     /// let opts = SpawnOptions::new()
     ///     .drain_on_cancel(Duration::from_secs(5));
     /// ```
-    pub drain_timeout: Option<std::time::Duration>,
+    pub(crate) drain_timeout: Option<std::time::Duration>,
     /// Enable per-stage parallelism for multi-worker dataflows.
     ///
     /// When `true` (the default), [`spawn_multi`](RuntimeHandle::spawn_multi)
@@ -248,7 +248,7 @@ pub struct SpawnOptions {
     ///     SpawnOptions::new().per_stage_parallelism(true),
     /// )?;
     /// ```
-    pub per_stage_parallelism: bool,
+    pub(crate) per_stage_parallelism: bool,
     /// Enable automatic parallelism detection from graph structure (default: `true`).
     ///
     /// When `true`, stage 0 parallelism is automatically determined by the
@@ -285,7 +285,7 @@ pub struct SpawnOptions {
     ///     SpawnOptions::new(), // auto_parallelism is enabled by default
     /// )?;
     /// ```
-    pub auto_parallelism: bool,
+    pub(crate) auto_parallelism: bool,
 }
 
 impl SpawnOptions {
@@ -3442,6 +3442,16 @@ impl<T: Timestamp> SpawnedDataflow<T> {
     ///
     /// Only works when the dataflow was spawned with async I/O (`IoMode::Async`).
     /// Returns an error if the port was wired as sync or does not exist.
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// let opts = SpawnOptions::new().io_mode(IoMode::Async);
+    /// let mut handle = rt.spawn(dataflow, opts)?;
+    /// let sender = handle.take_async_input::<i32>("data")?;
+    /// sender.send(0, vec![1, 2, 3]).await?;
+    /// sender.close().await;
+    /// ```
     pub fn take_async_input<D: Clone + Send + 'static>(
         &mut self,
         name: &str,
@@ -3475,6 +3485,17 @@ impl<T: Timestamp> SpawnedDataflow<T> {
     ///
     /// Only works when the dataflow was spawned with async I/O (`IoMode::Async`).
     /// Returns an error if the port was wired as sync or does not exist.
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// let opts = SpawnOptions::new().io_mode(IoMode::Async);
+    /// let mut handle = rt.spawn(dataflow, opts)?;
+    /// let receiver = handle.take_async_output::<i32>("results")?;
+    /// while let Some((time, data)) = receiver.recv().await {
+    ///     println!("t={time}: {data:?}");
+    /// }
+    /// ```
     pub fn take_async_output<D: Send + 'static>(
         &mut self,
         name: &str,
@@ -3678,6 +3699,16 @@ impl<T: Timestamp> MultiSpawnedDataflow<T> {
     /// Take the input sender from a specific worker.
     ///
     /// Convenience for `worker_mut(idx).take_input(name)`.
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// let mut multi = rt.spawn_multi("ex", 4, |b| {
+    ///     b.input::<i32>("data")?.output("out")?; Ok(())
+    /// })?;
+    /// let sender = multi.take_input::<i32>(0, "data")?;
+    /// sender.send(0, vec![1, 2, 3])?;
+    /// ```
     pub fn take_input<D: Clone + Send + 'static>(
         &mut self,
         worker_idx: usize,
@@ -3695,6 +3726,15 @@ impl<T: Timestamp> MultiSpawnedDataflow<T> {
     /// Take the output receiver from a specific worker.
     ///
     /// Convenience for `worker_mut(idx).take_output(name)`.
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// let mut multi = rt.spawn_multi("ex", 4, |b| {
+    ///     b.input::<i32>("data")?.output("out")?; Ok(())
+    /// })?;
+    /// let receiver = multi.take_output::<i32>(0, "out")?;
+    /// ```
     pub fn take_output<D: Send + 'static>(
         &mut self,
         worker_idx: usize,
@@ -3710,6 +3750,19 @@ impl<T: Timestamp> MultiSpawnedDataflow<T> {
     }
 
     /// Take the async input sender from a specific worker.
+    ///
+    /// Only works when the dataflow was spawned with `IoMode::Async`.
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// let opts = SpawnOptions::new().io_mode(IoMode::Async);
+    /// let mut multi = rt.spawn_multi("ex", 4, |b| {
+    ///     b.input::<i32>("data")?.output("out")?; Ok(())
+    /// }, opts)?;
+    /// let sender = multi.take_async_input::<i32>(0, "data")?;
+    /// sender.send(0, vec![1, 2, 3]).await?;
+    /// ```
     pub fn take_async_input<D: Clone + Send + 'static>(
         &mut self,
         worker_idx: usize,
@@ -3725,6 +3778,21 @@ impl<T: Timestamp> MultiSpawnedDataflow<T> {
     }
 
     /// Take the async output receiver from a specific worker.
+    ///
+    /// Only works when the dataflow was spawned with `IoMode::Async`.
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// let opts = SpawnOptions::new().io_mode(IoMode::Async);
+    /// let mut multi = rt.spawn_multi("ex", 4, |b| {
+    ///     b.input::<i32>("data")?.output("out")?; Ok(())
+    /// }, opts)?;
+    /// let receiver = multi.take_async_output::<i32>(0, "out")?;
+    /// while let Some((time, data)) = receiver.recv().await {
+    ///     println!("t={time}: {data:?}");
+    /// }
+    /// ```
     pub fn take_async_output<D: Send + 'static>(
         &mut self,
         worker_idx: usize,
@@ -4083,6 +4151,16 @@ impl<T: Timestamp> ClusterSpawnedDataflow<T> {
     /// Take the input sender from a local worker.
     ///
     /// `local_idx` is 0-based within this node's workers.
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// let mut cluster = rt.spawn_cluster("ex", config, |b| {
+    ///     b.input::<i32>("data")?.output("out")?; Ok(())
+    /// }, SpawnOptions::new())?;
+    /// let sender = cluster.take_input::<i32>(0, "data")?;
+    /// sender.send(0, vec![1, 2, 3])?;
+    /// ```
     pub fn take_input<D: Clone + Send + 'static>(
         &mut self,
         local_idx: usize,
@@ -4097,6 +4175,15 @@ impl<T: Timestamp> ClusterSpawnedDataflow<T> {
     /// Take the output receiver from a local worker.
     ///
     /// `local_idx` is 0-based within this node's workers.
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// let mut cluster = rt.spawn_cluster("ex", config, |b| {
+    ///     b.input::<i32>("data")?.output("out")?; Ok(())
+    /// }, SpawnOptions::new())?;
+    /// let receiver = cluster.take_output::<i32>(0, "out")?;
+    /// ```
     pub fn take_output<D: Send + 'static>(
         &mut self,
         local_idx: usize,
@@ -4106,6 +4193,60 @@ impl<T: Timestamp> ClusterSpawnedDataflow<T> {
             .as_mut()
             .ok_or_else(|| Error::Custom("dataflow already joined".into()))?
             .take_output(local_idx, name)
+    }
+
+    /// Take the async input sender from a local worker.
+    ///
+    /// `local_idx` is 0-based within this node's workers.
+    /// Only works when the dataflow was spawned with `IoMode::Async`.
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// let opts = SpawnOptions::new().io_mode(IoMode::Async);
+    /// let mut cluster = rt.spawn_cluster("ex", config, |b| {
+    ///     b.input::<i32>("data")?.output("out")?; Ok(())
+    /// }, opts)?;
+    /// let sender = cluster.take_async_input::<i32>(0, "data")?;
+    /// sender.send(0, vec![1, 2, 3]).await?;
+    /// ```
+    pub fn take_async_input<D: Clone + Send + 'static>(
+        &mut self,
+        local_idx: usize,
+        name: &str,
+    ) -> Result<crate::dataflow::channel_operators::AsyncInputSender<T, D>> {
+        self.inner
+            .as_mut()
+            .ok_or_else(|| Error::Custom("dataflow already joined".into()))?
+            .take_async_input(local_idx, name)
+    }
+
+    /// Take the async output receiver from a local worker.
+    ///
+    /// `local_idx` is 0-based within this node's workers.
+    /// Only works when the dataflow was spawned with `IoMode::Async`.
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// let opts = SpawnOptions::new().io_mode(IoMode::Async);
+    /// let mut cluster = rt.spawn_cluster("ex", config, |b| {
+    ///     b.input::<i32>("data")?.output("out")?; Ok(())
+    /// }, opts)?;
+    /// let receiver = cluster.take_async_output::<i32>(0, "out")?;
+    /// while let Some((time, data)) = receiver.recv().await {
+    ///     println!("t={time}: {data:?}");
+    /// }
+    /// ```
+    pub fn take_async_output<D: Send + 'static>(
+        &mut self,
+        local_idx: usize,
+        name: &str,
+    ) -> Result<crate::dataflow::channel_operators::AsyncOutputReceiver<T, D>> {
+        self.inner
+            .as_mut()
+            .ok_or_else(|| Error::Custom("dataflow already joined".into()))?
+            .take_async_output(local_idx, name)
     }
 
     /// Cancel all local workers and tear down the cluster.
