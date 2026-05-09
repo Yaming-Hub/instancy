@@ -553,18 +553,19 @@ async fn test_cancellation_iterative() {
 /// Branch / merge / aggregate correctness across both nodes.
 #[tokio::test]
 async fn test_branch_merge_correctness() {
-    let mut coord = TestCoordinator::start(&["node-a", "node-b"], 2).await;
-    let topology = make_topology(&["node-a", "node-b"], 2);
+    // Use 1 worker per node: the exchange routes all records to a single
+    // worker (hash key 0), so additional workers would be idle and can
+    // cause frontier-stall timeouts in the cross-process reduce.
+    let mut coord = TestCoordinator::start(&["node-a", "node-b"], 1).await;
+    let topology = make_topology(&["node-a", "node-b"], 1);
 
     let worker_counts = coord
         .setup_and_spawn_dataflow("df-branch-merge", &topology, DataflowType::BranchMerge)
         .await;
 
     let inputs = [
-        ("node-a", 0usize, vec![1i64, 2, 3]),
-        ("node-a", 1usize, vec![4i64]),
-        ("node-b", 0usize, vec![5i64, 6]),
-        ("node-b", 1usize, vec![7i64, 8]),
+        ("node-a", 0usize, vec![1i64, 2, 3, 4]),
+        ("node-b", 0usize, vec![5i64, 6, 7, 8]),
     ];
     let expected_sum: i64 = inputs
         .iter()

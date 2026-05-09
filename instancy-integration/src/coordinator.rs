@@ -13,9 +13,14 @@ use std::time::Duration;
 use tokio::io::{BufReader, BufWriter};
 use tokio::net::TcpListener;
 use tokio::process::{Child, Command};
+use tokio::sync::OnceCell;
 use tokio::time::timeout;
 
 use crate::protocol::*;
+
+/// Cached path to the built `instancy-test-node` binary.
+/// Built once per test process and reused across all coordinators.
+static NODE_BINARY: OnceCell<PathBuf> = OnceCell::const_new();
 
 /// Manages node processes and control connections for a test.
 ///
@@ -36,48 +41,53 @@ struct ControlConn {
 }
 
 impl TestCoordinator {
-    /// Build the `instancy-test-node` binary and return its path.
+    /// Build the `instancy-test-node` binary (once per process) and return its path.
     pub async fn build_node_binary() -> PathBuf {
-        let output = Command::new("cargo")
-            .args([
-                "build",
-                "-p",
-                "instancy-integration",
-                "--bin",
-                "instancy-test-node",
-            ])
-            .env(
-                "PROTOC",
-                format!(
-                    "{}/.local/protoc/bin/protoc.exe",
-                    std::env::var("USERPROFILE").unwrap_or_default()
-                ),
-            )
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .output()
+        NODE_BINARY
+            .get_or_init(|| async {
+                let output = Command::new("cargo")
+                    .args([
+                        "build",
+                        "-p",
+                        "instancy-integration",
+                        "--bin",
+                        "instancy-test-node",
+                    ])
+                    .env(
+                        "PROTOC",
+                        format!(
+                            "{}/.local/protoc/bin/protoc.exe",
+                            std::env::var("USERPROFILE").unwrap_or_default()
+                        ),
+                    )
+                    .stdout(Stdio::piped())
+                    .stderr(Stdio::piped())
+                    .output()
+                    .await
+                    .expect("failed to run cargo build");
+
+                if !output.status.success() {
+                    let stderr = String::from_utf8_lossy(&output.stderr);
+                    panic!("Failed to build instancy-test-node:\n{stderr}");
+                }
+
+                // Find the binary in the target directory
+                let target_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                    .parent()
+                    .unwrap()
+                    .join("target")
+                    .join("debug");
+
+                #[cfg(windows)]
+                let binary = target_dir.join("instancy-test-node.exe");
+                #[cfg(not(windows))]
+                let binary = target_dir.join("instancy-test-node");
+
+                assert!(binary.exists(), "Binary not found at {}", binary.display());
+                binary
+            })
             .await
-            .expect("failed to run cargo build");
-
-        if !output.status.success() {
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            panic!("Failed to build instancy-test-node:\n{stderr}");
-        }
-
-        // Find the binary in the target directory
-        let target_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .parent()
-            .unwrap()
-            .join("target")
-            .join("debug");
-
-        #[cfg(windows)]
-        let binary = target_dir.join("instancy-test-node.exe");
-        #[cfg(not(windows))]
-        let binary = target_dir.join("instancy-test-node");
-
-        assert!(binary.exists(), "Binary not found at {}", binary.display());
-        binary
+            .clone()
     }
 
     /// Start a coordinator with N node processes.
