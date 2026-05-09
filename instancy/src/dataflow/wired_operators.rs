@@ -25,6 +25,7 @@ use std::sync::Arc;
 
 use crate::dataflow::channels::envelope::{Envelope, Payload};
 use crate::dataflow::channels::pushpull::{Pull, Push};
+use crate::dataflow::channels::wake::WakeHandle;
 use crate::dataflow::operators::handles::{InputHandle, NotifyContext, OutputHandle};
 use crate::dataflow::schedulable::{ActivationOutcome, SchedulableOperator};
 use crate::dataflow::stage::StageId;
@@ -1758,6 +1759,11 @@ pub struct WiredUnaryAsyncOperator<T: Timestamp, D1: Send + 'static, D2: Send + 
     /// Tokio runtime handle for spawning async tasks.
     tokio_handle: tokio::runtime::Handle,
 
+    /// Wake handle for notifying the executor when an async task completes.
+    /// When a spawned task finishes, it calls `wake_handle.notify()` so the
+    /// executor wakes up and re-activates this operator to collect the result.
+    wake_handle: Option<WakeHandle>,
+
     /// Whether the input channel is exhausted.
     input_exhausted: bool,
     /// Whether this operator has completed.
@@ -1776,6 +1782,7 @@ impl<T: Timestamp, D1: Send + 'static, D2: Send + 'static> WiredUnaryAsyncOperat
         input_puller: Box<dyn Pull<T, D1>>,
         output_pusher: Box<dyn Push<T, D2>>,
         tokio_handle: tokio::runtime::Handle,
+        wake_handle: Option<WakeHandle>,
     ) -> Self {
         let (result_tx, result_rx) = tokio::sync::mpsc::unbounded_channel();
         let name = name.into();
@@ -1794,6 +1801,7 @@ impl<T: Timestamp, D1: Send + 'static, D2: Send + 'static> WiredUnaryAsyncOperat
             output_pusher,
             pending_output: VecDeque::new(),
             tokio_handle,
+            wake_handle,
             input_exhausted: false,
             done: false,
         }
@@ -1849,6 +1857,7 @@ impl<T: Timestamp, D1: Send + 'static, D2: Send + 'static> WiredUnaryAsyncOperat
                 let logic = Arc::clone(&self.logic);
                 let tx = self.result_tx.clone();
                 let time_for_logic = time.clone();
+                let wake = self.wake_handle.clone();
                 // Use a nested spawn to catch panics: the outer task awaits the
                 // inner JoinHandle, which converts panics into JoinError.
                 let handle = self.tokio_handle.clone();
@@ -1863,6 +1872,12 @@ impl<T: Timestamp, D1: Send + 'static, D2: Send + 'static> WiredUnaryAsyncOperat
                         ))),
                     };
                     let _ = tx.send(result.map(|output| (time, output)));
+                    // Wake the executor so it re-activates this operator to
+                    // collect the completed result. Without this, the executor
+                    // would only discover the result on its next scheduled sweep.
+                    if let Some(w) = wake {
+                        w.notify();
+                    }
                 });
                 self.in_flight += 1;
             } else {
@@ -1936,13 +1951,17 @@ impl<T: Timestamp, D1: Send + 'static, D2: Send + 'static> SchedulableOperator
         }
 
         // Step 7: Determine outcome.
-        // TODO: When in-flight tasks exist but no results were collected this activation,
-        // returning MadeProgress causes the executor to re-poll. A proper wake-based
-        // approach (passing WakeHandle to spawned tasks) would allow returning Idle here
-        // and getting woken when results arrive. For now, MadeProgress is correct but
-        // slightly less efficient (bounded by poll budget).
-        if collected || !self.pending_input.is_empty() || self.in_flight > 0 {
+        // When in-flight tasks exist but no results were collected, we return
+        // WaitingForAsync instead of MadeProgress. The spawned tasks will call
+        // wake_handle.notify() when they complete, which wakes the executor to
+        // re-activate this operator. This avoids unnecessary busy-polling between
+        // task completions while preventing the executor from declaring quiescence.
+        if collected || !self.pending_input.is_empty() {
             Ok(ActivationOutcome::MadeProgress)
+        } else if self.in_flight > 0 {
+            // Tasks are running but nothing to process right now.
+            // The wake handle will notify the executor when results arrive.
+            Ok(ActivationOutcome::WaitingForAsync)
         } else {
             Ok(ActivationOutcome::Idle)
         }

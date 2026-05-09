@@ -4270,6 +4270,7 @@ impl<T: Timestamp, D: Clone + Send + 'static> Pipe<T, D> {
                         input_puller,
                         output_pusher,
                         handle,
+                        endpoints.wake_handle,
                     )) as Box<dyn SchedulableOperator>)
                 });
             state.operator_factories.push((op_idx, factory));
