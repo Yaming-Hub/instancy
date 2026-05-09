@@ -515,7 +515,13 @@ impl ExecutorRegistry {
         priority: u32,
     ) -> Arc<ExecutorTask> {
         let id = self.next_task_id();
-        let task = Arc::new(ExecutorTask::new(id, dataflow_id, priority, executor, notifier));
+        let task = Arc::new(ExecutorTask::new(
+            id,
+            dataflow_id,
+            priority,
+            executor,
+            notifier,
+        ));
         self.enqueue(Arc::clone(&task));
         task
     }
@@ -532,7 +538,11 @@ impl ExecutorRegistry {
                 Ok(mut queue) => match &mut *queue {
                     ReadyQueue::Fifo(deque) => deque.push_back(task),
                     ReadyQueue::Heap(heap) => {
-                        let policy = self.schedule_policy.as_ref().unwrap().clone();
+                        let policy = self
+                            .schedule_policy
+                            .as_ref()
+                            .expect("heap ready queue requires a scheduling policy")
+                            .clone();
                         heap.push(PolicyEntry { task, policy });
                     }
                 },
@@ -627,14 +637,26 @@ mod tests {
     #[test]
     fn task_starts_in_queued_state() {
         let (_, notifier) = make_notifier();
-        let task = ExecutorTask::new(TaskId(0), DataflowId::new(), 0, Box::pin(PendingForever), notifier);
+        let task = ExecutorTask::new(
+            TaskId(0),
+            DataflowId::new(),
+            0,
+            Box::pin(PendingForever),
+            notifier,
+        );
         assert_eq!(task.state(), TASK_QUEUED);
     }
 
     #[test]
     fn try_start_poll_transitions_queued_to_polling() {
         let (_, notifier) = make_notifier();
-        let task = ExecutorTask::new(TaskId(0), DataflowId::new(), 0, Box::pin(PendingForever), notifier);
+        let task = ExecutorTask::new(
+            TaskId(0),
+            DataflowId::new(),
+            0,
+            Box::pin(PendingForever),
+            notifier,
+        );
         assert!(task.try_start_poll());
         assert_eq!(task.state(), TASK_POLLING);
     }
@@ -642,7 +664,13 @@ mod tests {
     #[test]
     fn try_start_poll_fails_when_not_queued() {
         let (_, notifier) = make_notifier();
-        let task = ExecutorTask::new(TaskId(0), DataflowId::new(), 0, Box::pin(PendingForever), notifier);
+        let task = ExecutorTask::new(
+            TaskId(0),
+            DataflowId::new(),
+            0,
+            Box::pin(PendingForever),
+            notifier,
+        );
         // First claim succeeds
         assert!(task.try_start_poll());
         // Second claim from another "thread" fails
@@ -652,7 +680,13 @@ mod tests {
     #[test]
     fn poll_pending_transitions_to_idle() {
         let (_, notifier) = make_notifier();
-        let task = ExecutorTask::new(TaskId(0), DataflowId::new(), 0, Box::pin(PendingForever), notifier);
+        let task = ExecutorTask::new(
+            TaskId(0),
+            DataflowId::new(),
+            0,
+            Box::pin(PendingForever),
+            notifier,
+        );
         assert!(task.try_start_poll());
 
         let (waker, _) = noop_cx();
@@ -688,7 +722,13 @@ mod tests {
     #[test]
     fn try_wake_from_idle_returns_true() {
         let (_, notifier) = make_notifier();
-        let task = ExecutorTask::new(TaskId(0), DataflowId::new(), 0, Box::pin(PendingForever), notifier);
+        let task = ExecutorTask::new(
+            TaskId(0),
+            DataflowId::new(),
+            0,
+            Box::pin(PendingForever),
+            notifier,
+        );
         // Start poll, then return Pending → IDLE
         assert!(task.try_start_poll());
         let (waker, _) = noop_cx();
@@ -704,7 +744,13 @@ mod tests {
     #[test]
     fn try_wake_from_queued_returns_false_dedup() {
         let (_, notifier) = make_notifier();
-        let task = ExecutorTask::new(TaskId(0), DataflowId::new(), 0, Box::pin(PendingForever), notifier);
+        let task = ExecutorTask::new(
+            TaskId(0),
+            DataflowId::new(),
+            0,
+            Box::pin(PendingForever),
+            notifier,
+        );
         // Already QUEUED — duplicate wake should be suppressed
         assert!(!task.try_wake());
         assert_eq!(task.state(), TASK_QUEUED);
@@ -713,7 +759,13 @@ mod tests {
     #[test]
     fn try_wake_during_polling_sets_queued() {
         let (_, notifier) = make_notifier();
-        let task = ExecutorTask::new(TaskId(0), DataflowId::new(), 0, Box::pin(PendingForever), notifier);
+        let task = ExecutorTask::new(
+            TaskId(0),
+            DataflowId::new(),
+            0,
+            Box::pin(PendingForever),
+            notifier,
+        );
         assert!(task.try_start_poll());
         assert_eq!(task.state(), TASK_POLLING);
 
@@ -797,10 +849,7 @@ mod tests {
         let condvar = Arc::new(std::sync::Condvar::new());
         let policy = PriorityWithAgingPolicy { aging_rate: 1000.0 };
 
-        let registry = Arc::new(ExecutorRegistry::new(
-            condvar,
-            Some(Arc::new(policy)),
-        ));
+        let registry = Arc::new(ExecutorRegistry::new(condvar, Some(Arc::new(policy))));
 
         let (_, n1) = make_notifier();
         let (_, n2) = make_notifier();
@@ -817,7 +866,10 @@ mod tests {
         let second = registry.dequeue().unwrap();
 
         assert_eq!(first.id, low.id, "aged low-priority should dequeue first");
-        assert_eq!(second.id, high.id, "fresh high-priority should dequeue second");
+        assert_eq!(
+            second.id, high.id,
+            "fresh high-priority should dequeue second"
+        );
     }
 
     #[test]

@@ -146,7 +146,7 @@ pub fn decode_progress_batch<T: Timestamp + ExchangeData>(
 
     // Verify CRC32: last 4 bytes are the checksum of everything before them.
     let (payload, crc_bytes) = data.split_at(data.len() - 4);
-    let expected_crc = u32::from_le_bytes(crc_bytes.try_into().unwrap());
+    let expected_crc = u32::from_le_bytes(crc_bytes.try_into().expect("CRC trailer is 4 bytes"));
     let actual_crc = crc32fast::hash(payload);
     if actual_crc != expected_crc {
         return Err(CodecError::InvalidData(format!(
@@ -155,7 +155,11 @@ pub fn decode_progress_batch<T: Timestamp + ExchangeData>(
     }
 
     // Now decode the verified payload.
-    let count = u32::from_le_bytes(payload[..4].try_into().unwrap()) as usize;
+    let count = u32::from_le_bytes(
+        payload[..4]
+            .try_into()
+            .expect("batch count prefix is 4 bytes"),
+    ) as usize;
 
     if count > max_batch_size {
         return Err(CodecError::InvalidData(format!(
@@ -175,7 +179,11 @@ pub fn decode_progress_batch<T: Timestamp + ExchangeData>(
                 available: payload.len(),
             });
         }
-        let op_idx = u64::from_le_bytes(payload[offset..offset + 8].try_into().unwrap()) as usize;
+        let op_idx = u64::from_le_bytes(
+            payload[offset..offset + 8]
+                .try_into()
+                .expect("operator index is 8 bytes"),
+        ) as usize;
         offset += 8;
 
         // output_port (u64)
@@ -185,8 +193,11 @@ pub fn decode_progress_batch<T: Timestamp + ExchangeData>(
                 available: payload.len(),
             });
         }
-        let output_port =
-            u64::from_le_bytes(payload[offset..offset + 8].try_into().unwrap()) as usize;
+        let output_port = u64::from_le_bytes(
+            payload[offset..offset + 8]
+                .try_into()
+                .expect("output port is 8 bytes"),
+        ) as usize;
         offset += 8;
 
         // timestamp (variable size via codec)
@@ -200,7 +211,11 @@ pub fn decode_progress_batch<T: Timestamp + ExchangeData>(
                 available: payload.len(),
             });
         }
-        let diff = i64::from_le_bytes(payload[offset..offset + 8].try_into().unwrap());
+        let diff = i64::from_le_bytes(
+            payload[offset..offset + 8]
+                .try_into()
+                .expect("diff is 8 bytes"),
+        );
         offset += 8;
 
         changes.push((op_idx, output_port, time, diff));

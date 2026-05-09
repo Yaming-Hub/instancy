@@ -256,7 +256,11 @@ where
         });
     }
 
-    let source_worker = u32::from_le_bytes(bytes[0..4].try_into().unwrap()) as usize;
+    let source_worker = u32::from_le_bytes(
+        bytes[0..4]
+            .try_into()
+            .expect("source worker prefix is 4 bytes"),
+    ) as usize;
     let mut offset = 4;
 
     // Decode timestamp
@@ -266,7 +270,11 @@ where
             available: bytes.len(),
         });
     }
-    let time_len = u32::from_le_bytes(bytes[offset..offset + 4].try_into().unwrap()) as usize;
+    let time_len = u32::from_le_bytes(
+        bytes[offset..offset + 4]
+            .try_into()
+            .expect("timestamp length prefix is 4 bytes"),
+    ) as usize;
     offset += 4;
 
     if offset + time_len > bytes.len() {
@@ -290,7 +298,11 @@ where
             available: bytes.len(),
         });
     }
-    let num_records = u32::from_le_bytes(bytes[offset..offset + 4].try_into().unwrap()) as usize;
+    let num_records = u32::from_le_bytes(
+        bytes[offset..offset + 4]
+            .try_into()
+            .expect("record count prefix is 4 bytes"),
+    ) as usize;
     offset += 4;
 
     // Cap pre-allocation to prevent DoS from malicious count.
@@ -305,7 +317,11 @@ where
                 available: bytes.len(),
             });
         }
-        let rec_len = u32::from_le_bytes(bytes[offset..offset + 4].try_into().unwrap()) as usize;
+        let rec_len = u32::from_le_bytes(
+            bytes[offset..offset + 4]
+                .try_into()
+                .expect("record length prefix is 4 bytes"),
+        ) as usize;
         offset += 4;
 
         if offset + rec_len > bytes.len() {
@@ -407,7 +423,11 @@ where
     }
 
     // Read source_node_id (length-prefixed string)
-    let node_len = u32::from_le_bytes(bytes[0..4].try_into().unwrap()) as usize;
+    let node_len = u32::from_le_bytes(
+        bytes[0..4]
+            .try_into()
+            .expect("node ID length prefix is 4 bytes"),
+    ) as usize;
     // Cap node_id length to prevent DoS from malicious peers
     const MAX_NODE_ID_LEN: usize = 512;
     if node_len > MAX_NODE_ID_LEN {
@@ -433,7 +453,11 @@ where
             available: bytes.len(),
         });
     }
-    let count = u32::from_le_bytes(bytes[offset..offset + 4].try_into().unwrap()) as usize;
+    let count = u32::from_le_bytes(
+        bytes[offset..offset + 4]
+            .try_into()
+            .expect("change count prefix is 4 bytes"),
+    ) as usize;
     offset += 4;
 
     // Cap pre-allocation: each change needs at least 4+4+time+8 bytes (min ~16)
@@ -447,7 +471,11 @@ where
                 available: bytes.len(),
             });
         }
-        let op_idx = u32::from_le_bytes(bytes[offset..offset + 4].try_into().unwrap()) as usize;
+        let op_idx = u32::from_le_bytes(
+            bytes[offset..offset + 4]
+                .try_into()
+                .expect("operator index is 4 bytes"),
+        ) as usize;
         offset += 4;
 
         if offset + 4 > bytes.len() {
@@ -456,7 +484,11 @@ where
                 available: bytes.len(),
             });
         }
-        let time_len = u32::from_le_bytes(bytes[offset..offset + 4].try_into().unwrap()) as usize;
+        let time_len = u32::from_le_bytes(
+            bytes[offset..offset + 4]
+                .try_into()
+                .expect("timestamp length prefix is 4 bytes"),
+        ) as usize;
         offset += 4;
 
         if offset + time_len > bytes.len() {
@@ -479,7 +511,11 @@ where
                 available: bytes.len(),
             });
         }
-        let delta = i64::from_le_bytes(bytes[offset..offset + 8].try_into().unwrap());
+        let delta = i64::from_le_bytes(
+            bytes[offset..offset + 8]
+                .try_into()
+                .expect("progress delta is 8 bytes"),
+        );
         offset += 8;
 
         changes.push((op_idx, time, delta));

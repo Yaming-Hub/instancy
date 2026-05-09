@@ -34,8 +34,8 @@
 //! 3. Evaluates scaling decisions
 //! 4. Notifies the caller of scale-up/scale-down actions via a channel
 
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use tokio::sync::mpsc;
@@ -120,8 +120,10 @@ impl ProbeMessage {
             PROBE_REPLY_TYPE => ProbeKind::Reply,
             _ => return None,
         };
-        let probe_seq = u64::from_le_bytes(data[1..9].try_into().unwrap());
-        let send_ts = u64::from_le_bytes(data[9..17].try_into().unwrap());
+        let probe_seq =
+            u64::from_le_bytes(data[1..9].try_into().expect("probe sequence is 8 bytes"));
+        let send_ts =
+            u64::from_le_bytes(data[9..17].try_into().expect("probe timestamp is 8 bytes"));
         Some(Self {
             kind,
             probe_seq,
@@ -221,9 +223,7 @@ impl ScalingDriver {
     /// Returns the driver and a receiver for scaling events.
     pub fn new(config: SharedConnectionConfig) -> (Self, mpsc::Receiver<ScalingEvent>) {
         let (event_tx, event_rx) = mpsc::channel(16);
-        let probe_timestamps = (0..PROBE_WINDOW)
-            .map(|_| AtomicU64::new(0))
-            .collect();
+        let probe_timestamps = (0..PROBE_WINDOW).map(|_| AtomicU64::new(0)).collect();
         (
             Self {
                 config,
@@ -519,7 +519,9 @@ mod tests {
         let (driver, mut event_rx) = ScalingDriver::new(config);
 
         // Inject high RTT directly
-        pool.connection(0).unwrap().record_rtt(Duration::from_millis(10));
+        pool.connection(0)
+            .unwrap()
+            .record_rtt(Duration::from_millis(10));
 
         // Evaluate
         driver.evaluate_and_emit(&pool).await;
@@ -542,7 +544,9 @@ mod tests {
         let (driver, mut event_rx) = ScalingDriver::new(config);
 
         // Healthy RTT
-        pool.connection(0).unwrap().record_rtt(Duration::from_millis(2));
+        pool.connection(0)
+            .unwrap()
+            .record_rtt(Duration::from_millis(2));
 
         driver.evaluate_and_emit(&pool).await;
 

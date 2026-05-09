@@ -188,7 +188,9 @@ impl<S: Scope, D: 'static> InspectExt<S, D> for StreamEdge<S, D> {
         let collected_clone = Arc::clone(&collected);
 
         let stream = self.inspect(name, move |time, data| {
-            let mut guard = collected_clone.lock().unwrap();
+            let mut guard = collected_clone
+                .lock()
+                .expect("inspect collection lock poisoned");
             for item in data {
                 guard.push((time.clone(), item.clone()));
             }

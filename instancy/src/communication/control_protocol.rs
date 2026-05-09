@@ -93,7 +93,7 @@ pub fn decode_control_message(data: &[u8]) -> Result<ControlMessage, String> {
 
     // Verify CRC32
     let (payload, crc_bytes) = data.split_at(data.len() - 4);
-    let expected_crc = u32::from_le_bytes(crc_bytes.try_into().unwrap());
+    let expected_crc = u32::from_le_bytes(crc_bytes.try_into().expect("CRC trailer is 4 bytes"));
     let actual_crc = crc32fast::hash(payload);
     if actual_crc != expected_crc {
         return Err(format!(
@@ -110,7 +110,8 @@ pub fn decode_control_message(data: &[u8]) -> Result<ControlMessage, String> {
                     payload.len()
                 ));
             }
-            let fingerprint = u64::from_le_bytes(payload[1..9].try_into().unwrap());
+            let fingerprint =
+                u64::from_le_bytes(payload[1..9].try_into().expect("fingerprint is 8 bytes"));
             let df_bytes: [u8; 16] = payload[9..25]
                 .try_into()
                 .map_err(|_| "invalid dataflow_id bytes in handshake".to_string())?;
@@ -125,7 +126,11 @@ pub fn decode_control_message(data: &[u8]) -> Result<ControlMessage, String> {
             if payload.len() < 5 {
                 return Err("ready payload too short".to_string());
             }
-            let id_len = u32::from_le_bytes(payload[1..5].try_into().unwrap()) as usize;
+            let id_len = u32::from_le_bytes(
+                payload[1..5]
+                    .try_into()
+                    .expect("node ID length prefix is 4 bytes"),
+            ) as usize;
             if payload.len() != 5 + id_len {
                 return Err(format!(
                     "ready payload size mismatch: expected {}, got {}",

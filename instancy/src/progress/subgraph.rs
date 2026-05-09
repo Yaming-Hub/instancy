@@ -131,7 +131,9 @@ impl<T: Timestamp> SubgraphBuilder<T> {
         self.connectivity.insert(index, connectivity);
         self.progress_buffers
             .insert(index, OperatorProgress::new(inputs, outputs));
-        self.progress_buffers.get(&index).unwrap()
+        self.progress_buffers
+            .get(&index)
+            .expect("operator progress exists after registration")
     }
 
     /// Registers an operator with initial capabilities on its output ports.
@@ -153,7 +155,9 @@ impl<T: Timestamp> SubgraphBuilder<T> {
         );
         self.add_operator(index, name, inputs, outputs, connectivity);
         self.initial_capabilities.insert(index, initial_caps);
-        self.progress_buffers.get(&index).unwrap()
+        self.progress_buffers
+            .get(&index)
+            .expect("operator progress exists after registration")
     }
 
     /// Records an edge from source output to target input.
@@ -195,11 +199,11 @@ impl<T: Timestamp> SubgraphBuilder<T> {
     pub fn retain_operators(&mut self, keep: &std::collections::HashSet<usize>) {
         self.operators.retain(|idx, _| keep.contains(idx));
         self.connectivity.retain(|idx, _| keep.contains(idx));
-        self.initial_capabilities.retain(|idx, _| keep.contains(idx));
+        self.initial_capabilities
+            .retain(|idx, _| keep.contains(idx));
         self.progress_buffers.retain(|idx, _| keep.contains(idx));
-        self.edges.retain(|(src, tgt)| {
-            keep.contains(&src.node()) && keep.contains(&tgt.node())
-        });
+        self.edges
+            .retain(|(src, tgt)| keep.contains(&src.node()) && keep.contains(&tgt.node()));
     }
 
     /// Mark operators as "ghost" — present in the reachability graph for
@@ -216,7 +220,8 @@ impl<T: Timestamp> SubgraphBuilder<T> {
     /// operators during local progress collection but accept peer updates
     /// for them, enabling correct cross-stage frontier propagation.
     pub fn mark_ghost_operators(&mut self, ghost: &std::collections::HashSet<usize>) {
-        self.initial_capabilities.retain(|idx, _| !ghost.contains(idx));
+        self.initial_capabilities
+            .retain(|idx, _| !ghost.contains(idx));
         self.progress_buffers.retain(|idx, _| !ghost.contains(idx));
     }
 
@@ -697,7 +702,10 @@ impl<T: Timestamp> ProgressTracker<T> {
 
         for &index in &self.operator_indices {
             let shape = &self.operators[&index];
-            let state = self.operator_frontiers.get_mut(&index).unwrap();
+            let state = self
+                .operator_frontiers
+                .get_mut(&index)
+                .expect("frontier state exists for tracked operator");
             let mut changed = false;
 
             for input in 0..shape.inputs {

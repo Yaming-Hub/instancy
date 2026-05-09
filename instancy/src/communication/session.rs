@@ -131,7 +131,7 @@ impl DataflowSession {
     pub fn remote_channels(&self) -> Vec<ChannelInfo> {
         self.channels
             .lock()
-            .unwrap()
+            .expect("channel registry lock poisoned")
             .values()
             .filter(|c| !c.is_local)
             .cloned()

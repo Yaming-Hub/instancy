@@ -169,7 +169,11 @@ impl std::fmt::Display for BufferOverflow {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::TooManyPending { count, max } => {
-                write!(f, "reorder buffer overflow: {} pending (max {})", count, max)
+                write!(
+                    f,
+                    "reorder buffer overflow: {} pending (max {})",
+                    count, max
+                )
             }
         }
     }
@@ -382,11 +386,19 @@ pub fn encode_sequenced_header(frame: &SequencedFrame) -> [u8; SEQUENCED_HEADER_
 /// Decode a sequenced frame header from bytes.
 ///
 /// Returns `(dataflow_id, channel_id, sequence_id, payload_length)`.
-pub fn decode_sequenced_header(header: &[u8; SEQUENCED_HEADER_SIZE]) -> (DataflowId, u64, u64, u32) {
-    let dataflow_id = DataflowId::from_bytes(header[..16].try_into().unwrap());
-    let channel_id = u64::from_le_bytes(header[16..24].try_into().unwrap());
-    let sequence_id = u64::from_le_bytes(header[24..32].try_into().unwrap());
-    let length = u32::from_le_bytes(header[32..36].try_into().unwrap());
+pub fn decode_sequenced_header(
+    header: &[u8; SEQUENCED_HEADER_SIZE],
+) -> (DataflowId, u64, u64, u32) {
+    let dataflow_id =
+        DataflowId::from_bytes(header[..16].try_into().expect("dataflow ID is 16 bytes"));
+    let channel_id = u64::from_le_bytes(header[16..24].try_into().expect("channel ID is 8 bytes"));
+    let sequence_id =
+        u64::from_le_bytes(header[24..32].try_into().expect("sequence ID is 8 bytes"));
+    let length = u32::from_le_bytes(
+        header[32..36]
+            .try_into()
+            .expect("payload length is 4 bytes"),
+    );
     (dataflow_id, channel_id, sequence_id, length)
 }
 
@@ -568,10 +580,7 @@ mod tests {
 
         // 4th should fail
         let err = buf.insert(4, "d").unwrap_err();
-        assert_eq!(
-            err,
-            BufferOverflow::TooManyPending { count: 3, max: 3 }
-        );
+        assert_eq!(err, BufferOverflow::TooManyPending { count: 3, max: 3 });
     }
 
     #[test]
