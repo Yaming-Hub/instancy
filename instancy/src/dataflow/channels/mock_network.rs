@@ -222,7 +222,9 @@ where
                     available: rest.len(),
                 });
             }
-            let count = u32::from_le_bytes(rest[..4].try_into().unwrap()) as usize;
+            let count =
+                u32::from_le_bytes(rest[..4].try_into().expect("batch count prefix is 4 bytes"))
+                    as usize;
             // Guard against unreasonable allocation from malformed data.
             const MAX_BATCH_SIZE: usize = 10_000_000;
             if count > MAX_BATCH_SIZE {
@@ -262,7 +264,11 @@ where
                     available: rest.len(),
                 });
             }
-            let src_len = u32::from_le_bytes(rest[..4].try_into().unwrap()) as usize;
+            let src_len = u32::from_le_bytes(
+                rest[..4]
+                    .try_into()
+                    .expect("source length prefix is 4 bytes"),
+            ) as usize;
             if rest.len() < 4 + src_len + 4 {
                 return Err(CodecError::InsufficientData {
                     needed: 4 + src_len + 4,
@@ -274,8 +280,11 @@ where
                     CodecError::InvalidData(format!("invalid UTF-8 in source_operator: {e}"))
                 })?;
             let msg_offset = 4 + src_len;
-            let msg_len =
-                u32::from_le_bytes(rest[msg_offset..msg_offset + 4].try_into().unwrap()) as usize;
+            let msg_len = u32::from_le_bytes(
+                rest[msg_offset..msg_offset + 4]
+                    .try_into()
+                    .expect("message length prefix is 4 bytes"),
+            ) as usize;
             if rest.len() < msg_offset + 4 + msg_len {
                 return Err(CodecError::InsufficientData {
                     needed: msg_offset + 4 + msg_len,

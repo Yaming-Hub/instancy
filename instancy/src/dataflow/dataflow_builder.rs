@@ -1068,11 +1068,14 @@ impl<T: Timestamp, D: Clone + Send + 'static> Pipe<T, D> {
 
         let pred_true = predicate.clone();
         let true_pipe = self.clone().filter(true_name, move |t, x| {
-            (pred_true.lock().unwrap())(t, x)
+            // Lock poisoning indicates a prior panic in the predicate — propagate it.
+            let mut guard = pred_true.lock().expect("branch predicate lock poisoned");
+            guard(t, x)
         });
         let pred_false = predicate;
         let false_pipe = self.filter(false_name, move |t, x| {
-            !(pred_false.lock().unwrap())(t, x)
+            let mut guard = pred_false.lock().expect("branch predicate lock poisoned");
+            !guard(t, x)
         });
 
         (true_pipe, false_pipe)

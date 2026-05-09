@@ -720,7 +720,12 @@ impl<T: Timestamp> Tracker<T> {
                 .peek()
                 .is_some_and(|Reverse(e)| e.time == entry.time && e.location == entry.location)
             {
-                diff += self.worklist.pop().unwrap().0.diff;
+                diff += self
+                    .worklist
+                    .pop()
+                    .expect("worklist entry exists after peek")
+                    .0
+                    .diff;
             }
 
             if diff == 0 {

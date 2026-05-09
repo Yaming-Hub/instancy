@@ -179,7 +179,10 @@ impl TaskScheduler {
                 let stage_id = *stage_id;
                 let permit = self.ensure_permit(&mut permits, stage_id);
                 if permit.try_acquire() {
-                    let (activation, stage_id) = queue.queue.pop_front().unwrap();
+                    let (activation, stage_id) = queue
+                        .queue
+                        .pop_front()
+                        .expect("front task still exists after readiness check");
                     queue.has_in_flight = true;
                     let _ = stage_id; // already used above
                     ready.push(ComputeTask {

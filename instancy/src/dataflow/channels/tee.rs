@@ -198,7 +198,7 @@ pub fn tee_or_single<
 ) -> Option<Box<dyn Push<T, D, M>>> {
     match pushers.len() {
         0 => None,
-        1 => Some(pushers.pop().unwrap()),
+        1 => Some(pushers.pop().expect("single pusher exists when len is 1")),
         _ => Some(Box::new(TeePush::new(pushers))),
     }
 }
@@ -230,7 +230,9 @@ mod tests {
                 // We need to move data out of envelope, so we match the payload
                 let _ = (time, data); // just to reference
             }
-            if let crate::dataflow::channels::envelope::Payload::Data { time, data } = envelope.payload {
+            if let crate::dataflow::channels::envelope::Payload::Data { time, data } =
+                envelope.payload
+            {
                 self.records.lock().unwrap().push((time, data));
             }
             Ok(())

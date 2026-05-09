@@ -210,9 +210,15 @@ mod tokio_impl {
                 }
             }
 
-            let dataflow_id = DataflowId::from_bytes(header[..16].try_into().unwrap());
-            let channel_id = u64::from_le_bytes(header[16..24].try_into().unwrap());
-            let length = u32::from_le_bytes(header[24..28].try_into().unwrap()) as usize;
+            // These conversions are infallible: `header` is exactly HEADER_SIZE (28)
+            // bytes, so the sub-slices are guaranteed to match [u8; 16/8/4].
+            let dataflow_id =
+                DataflowId::from_bytes(header[..16].try_into().expect("header[..16] is 16 bytes"));
+            let channel_id =
+                u64::from_le_bytes(header[16..24].try_into().expect("header[16..24] is 8 bytes"));
+            let length =
+                u32::from_le_bytes(header[24..28].try_into().expect("header[24..28] is 4 bytes"))
+                    as usize;
 
             if length > MAX_MESSAGE_SIZE {
                 return Err(TransportError::PayloadTooLarge {

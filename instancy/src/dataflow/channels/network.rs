@@ -178,7 +178,9 @@ where
                     available: rest.len(),
                 });
             }
-            let count = u32::from_le_bytes(rest[..4].try_into().unwrap()) as usize;
+            let count =
+                u32::from_le_bytes(rest[..4].try_into().expect("batch count prefix is 4 bytes"))
+                    as usize;
             const MAX_BATCH_SIZE: usize = 10_000_000;
             if count > MAX_BATCH_SIZE {
                 return Err(CodecError::InvalidData(format!(
@@ -217,7 +219,11 @@ where
                     available: rest.len(),
                 });
             }
-            let src_len = u32::from_le_bytes(rest[..4].try_into().unwrap()) as usize;
+            let src_len = u32::from_le_bytes(
+                rest[..4]
+                    .try_into()
+                    .expect("source length prefix is 4 bytes"),
+            ) as usize;
             if rest.len() < 4 + src_len + 4 {
                 return Err(CodecError::InsufficientData {
                     needed: 4 + src_len + 4,
@@ -227,8 +233,11 @@ where
             let source_operator = String::from_utf8(rest[4..4 + src_len].to_vec())
                 .map_err(|e| CodecError::InvalidData(format!("invalid UTF-8: {e}")))?;
             let msg_offset = 4 + src_len;
-            let msg_len =
-                u32::from_le_bytes(rest[msg_offset..msg_offset + 4].try_into().unwrap()) as usize;
+            let msg_len = u32::from_le_bytes(
+                rest[msg_offset..msg_offset + 4]
+                    .try_into()
+                    .expect("message length prefix is 4 bytes"),
+            ) as usize;
             let total_consumed = msg_offset + 4 + msg_len;
             if rest.len() < total_consumed {
                 return Err(CodecError::InsufficientData {
@@ -771,15 +780,11 @@ impl<T: Timestamp + ExchangeData, D: ExchangeData> EdgeMaterializer<T, D>
                 })?;
                 pushers.push(Box::new(push));
             } else {
-                let sender = self
-                    .transport
-                    .data_sender(dst_node)
-                    .ok_or_else(|| {
-                        Error::Custom(format!("no connection to peer node '{dst_node}'"))
-                    })?;
+                let sender = self.transport.data_sender(dst_node).ok_or_else(|| {
+                    Error::Custom(format!("no connection to peer node '{dst_node}'"))
+                })?;
 
-                let channel_id =
-                    Self::channel_id(self.edge_index, src_idx, dst, self.num_workers);
+                let channel_id = Self::channel_id(self.edge_index, src_idx, dst, self.num_workers);
                 pushers.push(Box::new(NetworkPush::<T, D> {
                     time_codec: T::codec(),
                     data_codec: D::codec(),

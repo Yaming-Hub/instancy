@@ -96,7 +96,6 @@ pub enum ChannelKind {
     Exchange,
 }
 
-
 /// A directed edge connecting an output port of one operator to an input
 /// port of another operator.
 ///
@@ -617,11 +616,17 @@ impl DataflowGraph {
         use std::fmt::Write;
 
         let mut out = String::new();
-        writeln!(out, "digraph \"{}\" {{", dot_escape(name)).unwrap();
-        writeln!(out, "    rankdir=TB;").unwrap();
-        writeln!(out, "    node [shape=box, style=rounded, fontname=\"Helvetica\"];").unwrap();
-        writeln!(out, "    edge [fontname=\"Helvetica\", fontsize=10];").unwrap();
-        writeln!(out).unwrap();
+        writeln!(out, "digraph \"{}\" {{", dot_escape(name))
+            .expect("write to String is infallible");
+        writeln!(out, "    rankdir=TB;").expect("write to String is infallible");
+        writeln!(
+            out,
+            "    node [shape=box, style=rounded, fontname=\"Helvetica\"];"
+        )
+        .expect("write to String is infallible");
+        writeln!(out, "    edge [fontname=\"Helvetica\", fontsize=10];")
+            .expect("write to String is infallible");
+        writeln!(out).expect("write to String is infallible");
 
         // Group operators by stage.
         let mut stages: HashMap<StageId, Vec<&OperatorInfo>> = HashMap::new();
@@ -634,14 +639,18 @@ impl DataflowGraph {
         stage_ids.sort_by_key(|s| s.0);
 
         for stage_id in &stage_ids {
-            let ops = stages.get(stage_id).unwrap();
+            let ops = stages
+                .get(stage_id)
+                .expect("stage IDs were collected from the stages map");
             let mut sorted_ops: Vec<&&OperatorInfo> = ops.iter().collect();
             sorted_ops.sort_by_key(|op| op.index);
 
-            writeln!(out, "    subgraph cluster_stage_{} {{", stage_id.0).unwrap();
-            writeln!(out, "        label=\"Stage {}\";", stage_id.0).unwrap();
-            writeln!(out, "        style=dashed;").unwrap();
-            writeln!(out, "        color=gray;").unwrap();
+            writeln!(out, "    subgraph cluster_stage_{} {{", stage_id.0)
+                .expect("write to String is infallible");
+            writeln!(out, "        label=\"Stage {}\";", stage_id.0)
+                .expect("write to String is infallible");
+            writeln!(out, "        style=dashed;").expect("write to String is infallible");
+            writeln!(out, "        color=gray;").expect("write to String is infallible");
 
             for op in sorted_ops {
                 writeln!(
@@ -651,10 +660,10 @@ impl DataflowGraph {
                     dot_escape(&op.name),
                     op.index,
                 )
-                .unwrap();
+                .expect("write to String is infallible");
             }
-            writeln!(out, "    }}").unwrap();
-            writeln!(out).unwrap();
+            writeln!(out, "    }}").expect("write to String is infallible");
+            writeln!(out).expect("write to String is infallible");
         }
 
         // Regular edges.
@@ -669,7 +678,7 @@ impl DataflowGraph {
                 "    op_{} -> op_{}{};",
                 edge.source.operator_index, edge.target.operator_index, style
             )
-            .unwrap();
+            .expect("write to String is infallible");
         }
 
         // Feedback edges.
@@ -679,10 +688,10 @@ impl DataflowGraph {
                 "    op_{} -> op_{} [style=bold, color=red, label=\"feedback\"];",
                 edge.source.operator_index, edge.target.operator_index
             )
-            .unwrap();
+            .expect("write to String is infallible");
         }
 
-        writeln!(out, "}}").unwrap();
+        writeln!(out, "}}").expect("write to String is infallible");
         out
     }
 }
@@ -762,24 +771,14 @@ mod tests {
 
     #[test]
     fn edge_info_creation() {
-        let edge = EdgeInfo::new(
-            Slot::new(0, 0),
-            Slot::new(1, 0),
-            make_stage(),
-            make_stage(),
-        );
+        let edge = EdgeInfo::new(Slot::new(0, 0), Slot::new(1, 0), make_stage(), make_stage());
         assert_eq!(edge.source.operator_index, 0);
         assert_eq!(edge.target.operator_index, 1);
     }
 
     #[test]
     fn edge_info_display() {
-        let edge = EdgeInfo::new(
-            Slot::new(2, 0),
-            Slot::new(3, 1),
-            make_stage(),
-            make_stage(),
-        );
+        let edge = EdgeInfo::new(Slot::new(2, 0), Slot::new(3, 1), make_stage(), make_stage());
         let s = format!("{edge}");
         assert!(s.contains("Op2:Slot0"));
         assert!(s.contains("Op3:Slot1"));
@@ -1175,24 +1174,14 @@ mod tests {
 
     #[test]
     fn edge_info_new_creates_pipeline() {
-        let edge = EdgeInfo::new(
-            Slot::new(0, 0),
-            Slot::new(1, 0),
-            make_stage(),
-            make_stage(),
-        );
+        let edge = EdgeInfo::new(Slot::new(0, 0), Slot::new(1, 0), make_stage(), make_stage());
         assert_eq!(edge.channel_kind, ChannelKind::Pipeline);
         assert!(!edge.is_exchange());
     }
 
     #[test]
     fn edge_info_exchange_creates_exchange() {
-        let edge = EdgeInfo::exchange(
-            Slot::new(0, 0),
-            Slot::new(1, 0),
-            make_stage(),
-            make_stage(),
-        );
+        let edge = EdgeInfo::exchange(Slot::new(0, 0), Slot::new(1, 0), make_stage(), make_stage());
         assert_eq!(edge.channel_kind, ChannelKind::Exchange);
         assert!(edge.is_exchange());
     }
@@ -1253,9 +1242,15 @@ mod tests {
     fn to_dot_simple_pipeline() {
         let r = make_stage();
         let mut graph = DataflowGraph::new();
-        graph.register_operator(OperatorInfo::new(0, "source", r, 0, 1)).unwrap();
-        graph.register_operator(OperatorInfo::new(1, "map", r, 1, 1)).unwrap();
-        graph.register_operator(OperatorInfo::new(2, "sink", r, 1, 0)).unwrap();
+        graph
+            .register_operator(OperatorInfo::new(0, "source", r, 0, 1))
+            .unwrap();
+        graph
+            .register_operator(OperatorInfo::new(1, "map", r, 1, 1))
+            .unwrap();
+        graph
+            .register_operator(OperatorInfo::new(2, "sink", r, 1, 0))
+            .unwrap();
         graph.add_edge(EdgeInfo::new(Slot::new(0, 0), Slot::new(1, 0), r, r));
         graph.add_edge(EdgeInfo::new(Slot::new(1, 0), Slot::new(2, 0), r, r));
 
@@ -1275,8 +1270,12 @@ mod tests {
         let s0 = StageId::new(0);
         let s1 = StageId::new(1);
         let mut graph = DataflowGraph::new();
-        graph.register_operator(OperatorInfo::new(0, "parse", s0, 0, 1)).unwrap();
-        graph.register_operator(OperatorInfo::new(1, "aggregate", s1, 1, 0)).unwrap();
+        graph
+            .register_operator(OperatorInfo::new(0, "parse", s0, 0, 1))
+            .unwrap();
+        graph
+            .register_operator(OperatorInfo::new(1, "aggregate", s1, 1, 0))
+            .unwrap();
         graph.add_edge(EdgeInfo::exchange(Slot::new(0, 0), Slot::new(1, 0), s0, s1));
 
         let dot = graph.to_dot();
@@ -1290,7 +1289,9 @@ mod tests {
     fn to_dot_with_feedback_edge() {
         let r = make_stage();
         let mut graph = DataflowGraph::new();
-        graph.register_operator(OperatorInfo::new(0, "iterate", r, 1, 1)).unwrap();
+        graph
+            .register_operator(OperatorInfo::new(0, "iterate", r, 1, 1))
+            .unwrap();
         graph.add_feedback_edge(EdgeInfo::new(Slot::new(0, 0), Slot::new(0, 0), r, r));
 
         let dot = graph.to_dot();
@@ -1302,7 +1303,9 @@ mod tests {
     fn to_dot_named_custom_name() {
         let r = make_stage();
         let mut graph = DataflowGraph::new();
-        graph.register_operator(OperatorInfo::new(0, "op", r, 0, 0)).unwrap();
+        graph
+            .register_operator(OperatorInfo::new(0, "op", r, 0, 0))
+            .unwrap();
 
         let dot = graph.to_dot_named("my_pipeline");
         assert!(dot.starts_with("digraph \"my_pipeline\" {"));

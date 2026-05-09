@@ -44,8 +44,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use tokio::io::{AsyncRead, AsyncWrite};
-use tokio::sync::mpsc as tokio_mpsc;
 use tokio::sync::Mutex as TokioMutex;
+use tokio::sync::mpsc as tokio_mpsc;
 
 use crate::communication::probing::{
     ProbeCounter, ProbeKind, ProbeMessage, ScalingDriver, ScalingEvent,
@@ -86,7 +86,9 @@ pub trait ConnectionFactory: Send + Sync + 'static {
     fn establish(
         &self,
         peer_node_id: &str,
-    ) -> impl std::future::Future<Output = Result<(Self::Reader, Self::Writer), Box<dyn std::error::Error + Send + Sync>>> + Send;
+    ) -> impl std::future::Future<
+        Output = Result<(Self::Reader, Self::Writer), Box<dyn std::error::Error + Send + Sync>>,
+    > + Send;
 }
 
 // ---------------------------------------------------------------------------
@@ -425,7 +427,10 @@ impl SharedPeerManager {
         // few (typically 1-2: one Handshake and/or one Ready).
         {
             let mut state = self.reg_state.lock().await;
-            let pending = state.pending_control.remove(&dataflow_id).unwrap_or_default();
+            let pending = state
+                .pending_control
+                .remove(&dataflow_id)
+                .unwrap_or_default();
             state.registered.insert(dataflow_id, reg);
 
             // Deliver buffered frames while still holding the lock.
@@ -694,9 +699,7 @@ impl SharedPeerManager {
                         let tx = {
                             let mut state = reg_state.lock().await;
                             match state.registered.get(&frame.dataflow_id) {
-                                Some(reg) => {
-                                    reg.channel_senders.get(&CONTROL_CHANNEL_ID).cloned()
-                                }
+                                Some(reg) => reg.channel_senders.get(&CONTROL_CHANNEL_ID).cloned(),
                                 None => {
                                     // Drop frames for completed dataflows instead
                                     // of buffering them indefinitely.
@@ -704,7 +707,8 @@ impl SharedPeerManager {
                                         continue;
                                     }
                                     // Dataflow not registered yet — buffer for later
-                                    state.pending_control
+                                    state
+                                        .pending_control
                                         .entry(frame.dataflow_id)
                                         .or_default()
                                         .push(frame.payload);
@@ -722,8 +726,11 @@ impl SharedPeerManager {
                     if frame.payload.len() < 8 {
                         continue; // malformed
                     }
-                    let seq_id =
-                        u64::from_le_bytes(frame.payload[..8].try_into().unwrap());
+                    let seq_id = u64::from_le_bytes(
+                        frame.payload[..8]
+                            .try_into()
+                            .expect("sequence prefix is 8 bytes"),
+                    );
                     let inner_payload = frame.payload[8..].to_vec();
 
                     let inner_frame = Frame {
@@ -749,7 +756,9 @@ impl SharedPeerManager {
                                 // Clone senders under lock, then release before awaiting
                                 let senders = {
                                     let state = reg_state.lock().await;
-                                    state.registered.get(&frame.dataflow_id)
+                                    state
+                                        .registered
+                                        .get(&frame.dataflow_id)
                                         .map(|reg| reg.channel_senders.clone())
                                 };
 
@@ -955,15 +964,11 @@ impl SharedPeerManager {
             if live_count == 0 && !all_failed_notified {
                 all_failed_notified = true;
                 #[cfg(feature = "tracing")]
-                tracing::error!(
-                    "All connections to peer are dead — notifying dataflows"
-                );
+                tracing::error!("All connections to peer are dead — notifying dataflows");
 
                 let state = reg_state.lock().await;
                 for (_df_id, reg) in state.registered.iter() {
-                    let _ = reg
-                        .error_tx
-                        .try_send(TransportError::ConnectionClosed);
+                    let _ = reg.error_tx.try_send(TransportError::ConnectionClosed);
                 }
             }
         }
@@ -1000,9 +1005,7 @@ impl SharedPeerManager {
                 let state = reg_state.lock().await;
                 for df_id in timed_out_dataflows {
                     if let Some(reg) = state.registered.get(&df_id) {
-                        let _ = reg
-                            .error_tx
-                            .try_send(TransportError::ReorderTimeout);
+                        let _ = reg.error_tx.try_send(TransportError::ReorderTimeout);
                     }
                 }
             }
@@ -1084,35 +1087,26 @@ impl SharedTransportSession {
     ///
     /// Returns the shared payload sender. Data and progress share the same
     /// sequenced lane to preserve the timely ordering invariant.
-    pub fn data_sender(
-        &self,
-        peer_node_id: &str,
-    ) -> Option<DataframeSender> {
-        self.payload_senders.get(peer_node_id).map(|tx| {
-            DataframeSender {
+    pub fn data_sender(&self, peer_node_id: &str) -> Option<DataframeSender> {
+        self.payload_senders
+            .get(peer_node_id)
+            .map(|tx| DataframeSender {
                 dataflow_id: self.dataflow_id,
                 tx: tx.clone(),
-            }
-        })
+            })
     }
 
     /// Get a progress sender for a peer.
     ///
     /// Returns the same shared payload sender as [`data_sender`](Self::data_sender).
-    pub fn progress_sender(
-        &self,
-        peer_node_id: &str,
-    ) -> Option<DataframeSender> {
+    pub fn progress_sender(&self, peer_node_id: &str) -> Option<DataframeSender> {
         self.data_sender(peer_node_id)
     }
 
     /// Get a control-priority sender for a peer.
     ///
     /// Control frames bypass sequencing and have highest priority.
-    pub fn control_sender(
-        &self,
-        peer_node_id: &str,
-    ) -> Option<&tokio_mpsc::Sender<Frame>> {
+    pub fn control_sender(&self, peer_node_id: &str) -> Option<&tokio_mpsc::Sender<Frame>> {
         self.control_senders.get(peer_node_id)
     }
 
@@ -1174,21 +1168,18 @@ impl DataframeSender {
     }
 
     /// Try to send a frame without blocking.
-    pub fn try_send(
-        &self,
-        mut frame: Frame,
-    ) -> Result<(), tokio_mpsc::error::TrySendError<Frame>> {
+    pub fn try_send(&self, mut frame: Frame) -> Result<(), tokio_mpsc::error::TrySendError<Frame>> {
         frame.dataflow_id = self.dataflow_id;
-        self.tx.try_send((self.dataflow_id, frame)).map_err(|e| {
-            match e {
+        self.tx
+            .try_send((self.dataflow_id, frame))
+            .map_err(|e| match e {
                 tokio_mpsc::error::TrySendError::Full(v) => {
                     tokio_mpsc::error::TrySendError::Full(v.1)
                 }
                 tokio_mpsc::error::TrySendError::Closed(v) => {
                     tokio_mpsc::error::TrySendError::Closed(v.1)
                 }
-            }
-        })
+            })
     }
 }
 
@@ -1220,9 +1211,9 @@ pub async fn check_reorder_timeouts(
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use super::super::shared_pool::ScalingDecision;
-    use tokio::io::{duplex, DuplexStream};
+    use super::*;
+    use tokio::io::{DuplexStream, duplex};
 
     /// Helper: create N duplex connection pairs (read, write) for each side.
     fn make_connections(n: usize) -> Vec<(DuplexStream, DuplexStream)> {
@@ -1232,20 +1223,13 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn shared_peer_manager_creates_with_connections() {
         let pairs = make_connections(2);
-        let (readers, writers): (Vec<_>, Vec<_>) = pairs
-            .into_iter()
-            .unzip();
+        let (readers, writers): (Vec<_>, Vec<_>) = pairs.into_iter().unzip();
 
         let config = SharedConnectionConfig::default();
         let connections: Vec<_> = readers.into_iter().zip(writers).collect();
 
         let rt = tokio::runtime::Handle::current();
-        let manager = SharedPeerManager::new(
-            "peer-1".to_string(),
-            config,
-            connections,
-            &rt,
-        );
+        let manager = SharedPeerManager::new("peer-1".to_string(), config, connections, &rt);
 
         assert_eq!(manager.peer_node_id(), "peer-1");
         assert_eq!(manager.connection_count(), 2);
@@ -1258,12 +1242,7 @@ mod tests {
 
         let config = SharedConnectionConfig::default();
         let rt = tokio::runtime::Handle::current();
-        let manager = SharedPeerManager::new(
-            "peer-1".to_string(),
-            config,
-            connections,
-            &rt,
-        );
+        let manager = SharedPeerManager::new("peer-1".to_string(), config, connections, &rt);
 
         let df_id = DataflowId::new();
         let channel_ids = vec![1, 2, 3];
@@ -1305,13 +1284,7 @@ mod tests {
         );
 
         let df_id = DataflowId::new();
-        let session = SharedTransportSession::new(
-            df_id,
-            &managers,
-            &[1, 2],
-            16,
-        )
-        .await;
+        let session = SharedTransportSession::new(df_id, &managers, &[1, 2], 16).await;
 
         // API surface matches TransportSession
         assert!(session.data_sender("peer-1").is_some());
@@ -1367,12 +1340,8 @@ mod tests {
 
         // Manager writes via mgr_write; test reads from test_stream
         let connections = vec![(mgr_read, mgr_write)];
-        let manager = SharedPeerManager::new(
-            "peer-1".to_string(),
-            config.clone(),
-            connections,
-            &rt,
-        );
+        let manager =
+            SharedPeerManager::new("peer-1".to_string(), config.clone(), connections, &rt);
 
         let df_id = DataflowId::new();
         let _receivers = manager.register_dataflow(df_id, &[1], 16).await;
@@ -1384,11 +1353,7 @@ mod tests {
             payload: b"hello world".to_vec(),
         };
 
-        manager
-            .payload_sender()
-            .send((df_id, frame))
-            .await
-            .unwrap();
+        manager.payload_sender().send((df_id, frame)).await.unwrap();
 
         // Read the frame from the test side
         let mut reader = FramedReader::new(test_stream);
@@ -1419,12 +1384,7 @@ mod tests {
         let rt = tokio::runtime::Handle::current();
 
         let connections = vec![(mgr_read, mgr_write)];
-        let manager = SharedPeerManager::new(
-            "peer-1".to_string(),
-            config,
-            connections,
-            &rt,
-        );
+        let manager = SharedPeerManager::new("peer-1".to_string(), config, connections, &rt);
 
         let df_id = DataflowId::new();
         let _receivers = manager.register_dataflow(df_id, &[1, 2], 16).await;
@@ -1461,14 +1421,11 @@ mod tests {
 
         let config = SharedConnectionConfig::default();
         let rt = tokio::runtime::Handle::current();
-        let manager =
-            SharedPeerManager::new("test-peer".into(), config, connections, &rt);
+        let manager = SharedPeerManager::new("test-peer".into(), config, connections, &rt);
 
         let df_id = DataflowId::new();
         let wrong_id = DataflowId::new();
-        manager
-            .register_dataflow(df_id, &[1], 16)
-            .await;
+        manager.register_dataflow(df_id, &[1], 16).await;
 
         let sender = DataframeSender {
             dataflow_id: df_id,
@@ -1498,12 +1455,8 @@ mod tests {
 
         let config = SharedConnectionConfig::default();
         let rt = tokio::runtime::Handle::current();
-        let manager = SharedPeerManager::new(
-            "test-peer".into(),
-            config,
-            vec![(mgr_read, mgr_write)],
-            &rt,
-        );
+        let manager =
+            SharedPeerManager::new("test-peer".into(), config, vec![(mgr_read, mgr_write)], &rt);
 
         // Send a probe request FROM the test side TO the manager's reader
         let probe_req = ProbeMessage::new_request(42, 1000);
@@ -1547,12 +1500,8 @@ mod tests {
 
         let config = SharedConnectionConfig::default();
         let rt = tokio::runtime::Handle::current();
-        let manager = SharedPeerManager::new(
-            "test-peer".into(),
-            config,
-            vec![(mgr_read, mgr_write)],
-            &rt,
-        );
+        let manager =
+            SharedPeerManager::new("test-peer".into(), config, vec![(mgr_read, mgr_write)], &rt);
 
         let df_id = DataflowId::new();
         let (mut receivers, _error_rx) = manager.register_dataflow(df_id, &[1], 16).await;
@@ -1570,8 +1519,7 @@ mod tests {
         writer.write_frame(&control_frame).await.unwrap();
 
         // The reader should deliver the raw payload without stripping sequence bytes
-        let result =
-            tokio::time::timeout(Duration::from_secs(2), control_rx.recv()).await;
+        let result = tokio::time::timeout(Duration::from_secs(2), control_rx.recv()).await;
 
         match result {
             Ok(Some(payload)) => {
@@ -1591,8 +1539,7 @@ mod tests {
         let (client_read, server_write) = duplex(8192);
         let (server_read, client_write) = duplex(8192);
 
-        let connections: Vec<(DuplexStream, DuplexStream)> =
-            vec![(client_read, client_write)];
+        let connections: Vec<(DuplexStream, DuplexStream)> = vec![(client_read, client_write)];
 
         let config = SharedConnectionConfig {
             min_connections: 1,
@@ -1602,12 +1549,7 @@ mod tests {
         };
 
         let rt = tokio::runtime::Handle::current();
-        let manager = SharedPeerManager::new(
-            "peer-fail".into(),
-            config,
-            connections,
-            &rt,
-        );
+        let manager = SharedPeerManager::new("peer-fail".into(), config, connections, &rt);
 
         // Drop the remote side to cause write failures
         drop(server_read);
@@ -1629,8 +1571,7 @@ mod tests {
         let (client_read, _server_write) = duplex(8192);
         let (_server_read, client_write) = duplex(8192);
 
-        let connections: Vec<(DuplexStream, DuplexStream)> =
-            vec![(client_read, client_write)];
+        let connections: Vec<(DuplexStream, DuplexStream)> = vec![(client_read, client_write)];
 
         let config = SharedConnectionConfig {
             min_connections: 1,
@@ -1640,12 +1581,7 @@ mod tests {
         };
 
         let rt = tokio::runtime::Handle::current();
-        let manager = SharedPeerManager::new(
-            "peer-monitor".into(),
-            config,
-            connections,
-            &rt,
-        );
+        let manager = SharedPeerManager::new("peer-monitor".into(), config, connections, &rt);
 
         // Drop remote sides
         drop(_server_write);
@@ -1667,8 +1603,7 @@ mod tests {
         let (client_read, server_write) = duplex(8192);
         let (server_read, client_write) = duplex(8192);
 
-        let connections: Vec<(DuplexStream, DuplexStream)> =
-            vec![(client_read, client_write)];
+        let connections: Vec<(DuplexStream, DuplexStream)> = vec![(client_read, client_write)];
 
         let config = SharedConnectionConfig {
             min_connections: 1,
@@ -1678,29 +1613,18 @@ mod tests {
         };
 
         let rt = tokio::runtime::Handle::current();
-        let manager = SharedPeerManager::new(
-            "peer-notify".into(),
-            config,
-            connections,
-            &rt,
-        );
+        let manager = SharedPeerManager::new("peer-notify".into(), config, connections, &rt);
 
         // Register a dataflow
         let df_id = DataflowId::new();
-        let (_receivers, mut error_rx) = manager
-            .register_dataflow(df_id, &[1, 2], 16)
-            .await;
+        let (_receivers, mut error_rx) = manager.register_dataflow(df_id, &[1, 2], 16).await;
 
         // Kill the connection
         drop(server_read);
         drop(server_write);
 
         // Wait for error notification
-        let result = tokio::time::timeout(
-            Duration::from_secs(2),
-            error_rx.recv(),
-        )
-        .await;
+        let result = tokio::time::timeout(Duration::from_secs(2), error_rx.recv()).await;
 
         match result {
             Ok(Some(err)) => {
@@ -1795,7 +1719,11 @@ mod tests {
 
         // Verify each dataflow receives its 10 messages in order (no arbitrary sleep;
         // the 2s timeout per recv is sufficient synchronization)
-        for (name, rx) in [("df1", &mut rx_b1), ("df2", &mut rx_b2), ("df3", &mut rx_b3)] {
+        for (name, rx) in [
+            ("df1", &mut rx_b1),
+            ("df2", &mut rx_b2),
+            ("df3", &mut rx_b3),
+        ] {
             let ch_rx = rx.get_mut(&1).unwrap();
             for expected in 0u32..10 {
                 let result = tokio::time::timeout(Duration::from_secs(2), ch_rx.recv()).await;
@@ -1837,21 +1765,12 @@ mod tests {
 
         // Manager A: connection 0 uses (a_from_b_1, a_to_b_1), connection 1 uses (a_from_b_2, a_to_b_2)
         let a_connections = vec![(a_from_b_1, a_to_b_1), (a_from_b_2, a_to_b_2)];
-        let manager_a = SharedPeerManager::new(
-            "node-b".to_string(),
-            config.clone(),
-            a_connections,
-            &rt,
-        );
+        let manager_a =
+            SharedPeerManager::new("node-b".to_string(), config.clone(), a_connections, &rt);
 
         // Manager B: connection 0 uses (b_from_a_1, b_to_a_1), connection 1 uses (b_from_a_2, b_to_a_2)
         let b_connections = vec![(b_from_a_1, b_to_a_1), (b_from_a_2, b_to_a_2)];
-        let manager_b = SharedPeerManager::new(
-            "node-a".to_string(),
-            config,
-            b_connections,
-            &rt,
-        );
+        let manager_b = SharedPeerManager::new("node-a".to_string(), config, b_connections, &rt);
 
         let df_id = DataflowId::new();
         let _reg_a = manager_a.register_dataflow(df_id, &[1], 64).await;
@@ -1943,7 +1862,9 @@ mod tests {
         let pool = PeerPool::new(1, config.clone());
 
         // Simulate high RTT
-        pool.connection(0).unwrap().record_rtt(Duration::from_millis(10));
+        pool.connection(0)
+            .unwrap()
+            .record_rtt(Duration::from_millis(10));
 
         // Evaluate scaling — should recommend scale up
         let decision = pool.evaluate_scaling().await;
@@ -1985,13 +1906,7 @@ mod tests {
         managers.insert("peer-2".to_string(), mgr2);
 
         let df_id = DataflowId::new();
-        let mut session = SharedTransportSession::new(
-            df_id,
-            &managers,
-            &[1, 2],
-            16,
-        )
-        .await;
+        let mut session = SharedTransportSession::new(df_id, &managers, &[1, 2], 16).await;
 
         // Verify API surface
         assert!(session.data_sender("peer-1").is_some());

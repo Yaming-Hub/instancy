@@ -38,8 +38,8 @@
 //!   (down to `min_connections`).
 
 use std::collections::{HashMap, HashSet};
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::time::Duration;
 
 use tokio::sync::Mutex;
@@ -390,7 +390,10 @@ impl PeerPool {
             .min(config.max_connections);
         let mut connections = HashMap::new();
         for id in 0..count {
-            connections.insert(id, Arc::new(ConnectionMetrics::new(id, config.rtt_ema_alpha)));
+            connections.insert(
+                id,
+                Arc::new(ConnectionMetrics::new(id, config.rtt_ema_alpha)),
+            );
         }
 
         Self {
@@ -433,12 +436,12 @@ impl PeerPool {
                     let (pending, rtt) = c.load_score();
                     (pending, std::cmp::Reverse(rtt))
                 })
-                .unwrap()
+                .expect("live connection set is non-empty after empty check")
         } else {
             // High load — spread across connections.
             live.into_iter()
                 .min_by_key(|c| c.load_score())
-                .unwrap()
+                .expect("live connection set is non-empty after empty check")
         };
 
         conn.enqueue(); // Atomic reservation
@@ -520,10 +523,9 @@ impl PeerPool {
         let live_count = live.len();
 
         // Check if any live connection with measurements exceeds the scale-up threshold
-        let any_overloaded = live.iter().any(|c| {
-            c.average_rtt()
-                .is_some_and(|rtt| rtt > threshold_up)
-        });
+        let any_overloaded = live
+            .iter()
+            .any(|c| c.average_rtt().is_some_and(|rtt| rtt > threshold_up));
 
         if any_overloaded && self.connections.len() < self.config.max_connections {
             // Reset cooldown since we're scaling up
@@ -551,17 +553,17 @@ impl PeerPool {
         }
 
         // Check if ALL live connections have measurements and are below scale-down threshold.
-        let all_measured = live
-            .iter()
-            .all(|c| c.average_rtt().is_some());
+        let all_measured = live.iter().all(|c| c.average_rtt().is_some());
 
         if !all_measured {
             return ScalingDecision::None;
         }
 
-        let all_underloaded = live
-            .iter()
-            .all(|c| c.average_rtt().unwrap() < threshold_down);
+        let all_underloaded = live.iter().all(|c| {
+            c.average_rtt()
+                .expect("all live connections have RTT measurements")
+                < threshold_down
+        });
 
         if all_underloaded && live_count > self.config.min_connections {
             let mut cooldown = self.cooldown_start.lock().await;
@@ -723,8 +725,12 @@ mod tests {
         let pool = PeerPool::new(2, config);
 
         // Both have 0 pending, but different RTT
-        pool.connection(0).unwrap().record_rtt(Duration::from_millis(5));
-        pool.connection(1).unwrap().record_rtt(Duration::from_millis(2));
+        pool.connection(0)
+            .unwrap()
+            .record_rtt(Duration::from_millis(5));
+        pool.connection(1)
+            .unwrap()
+            .record_rtt(Duration::from_millis(2));
 
         let selected = pool.select_connection().unwrap();
         assert_eq!(selected.id, 1); // lower RTT
@@ -744,7 +750,9 @@ mod tests {
         assert_eq!(pool.evaluate_scaling().await, ScalingDecision::None);
 
         // Record high RTT
-        pool.connection(0).unwrap().record_rtt(Duration::from_millis(10));
+        pool.connection(0)
+            .unwrap()
+            .record_rtt(Duration::from_millis(10));
         assert_eq!(pool.evaluate_scaling().await, ScalingDecision::ScaleUp);
     }
 
@@ -758,7 +766,9 @@ mod tests {
         };
         let pool = PeerPool::new(2, config);
 
-        pool.connection(0).unwrap().record_rtt(Duration::from_millis(10));
+        pool.connection(0)
+            .unwrap()
+            .record_rtt(Duration::from_millis(10));
         // Already at max — no scale up
         assert_eq!(pool.evaluate_scaling().await, ScalingDecision::None);
     }
@@ -775,8 +785,12 @@ mod tests {
         let pool = PeerPool::new(2, config);
 
         // Both connections have low RTT
-        pool.connection(0).unwrap().record_rtt(Duration::from_millis(1));
-        pool.connection(1).unwrap().record_rtt(Duration::from_millis(2));
+        pool.connection(0)
+            .unwrap()
+            .record_rtt(Duration::from_millis(1));
+        pool.connection(1)
+            .unwrap()
+            .record_rtt(Duration::from_millis(2));
 
         // First evaluation starts cooldown
         assert_eq!(pool.evaluate_scaling().await, ScalingDecision::None);
@@ -799,7 +813,9 @@ mod tests {
             ..Default::default()
         };
         let pool = PeerPool::new(1, config);
-        pool.connection(0).unwrap().record_rtt(Duration::from_millis(1));
+        pool.connection(0)
+            .unwrap()
+            .record_rtt(Duration::from_millis(1));
 
         tokio::time::sleep(Duration::from_millis(5)).await;
         // Already at min — no scale down
@@ -897,13 +913,22 @@ mod tests {
         let first_id = first.id;
         // Now total_pending=1 < 3 → still low-load → pack onto same connection
         let second = pool.select_and_reserve().unwrap();
-        assert_eq!(second.id, first_id, "low-load packing should reuse same connection");
+        assert_eq!(
+            second.id, first_id,
+            "low-load packing should reuse same connection"
+        );
         // Now total_pending=2 < 3 → still low-load
         let third = pool.select_and_reserve().unwrap();
-        assert_eq!(third.id, first_id, "low-load packing should still reuse same connection");
+        assert_eq!(
+            third.id, first_id,
+            "low-load packing should still reuse same connection"
+        );
         // Now total_pending=3 >= 3 → high-load → spreads to least-loaded
         let fourth = pool.select_and_reserve().unwrap();
-        assert_ne!(fourth.id, first_id, "high-load should spread to a different connection");
+        assert_ne!(
+            fourth.id, first_id,
+            "high-load should spread to a different connection"
+        );
     }
 
     #[test]
@@ -930,7 +955,9 @@ mod tests {
         let pool = PeerPool::new(2, config);
 
         pool.connection(0).unwrap().enqueue();
-        pool.connection(0).unwrap().record_rtt(Duration::from_millis(3));
+        pool.connection(0)
+            .unwrap()
+            .record_rtt(Duration::from_millis(3));
         pool.connection(1).unwrap().enqueue();
         pool.connection(1).unwrap().enqueue();
 
@@ -944,7 +971,10 @@ mod tests {
 
     #[test]
     fn connection_mode_default_is_dedicated() {
-        assert!(matches!(ConnectionMode::default(), ConnectionMode::Dedicated));
+        assert!(matches!(
+            ConnectionMode::default(),
+            ConnectionMode::Dedicated
+        ));
     }
 
     #[test]

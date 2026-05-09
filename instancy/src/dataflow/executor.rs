@@ -449,8 +449,12 @@ impl<T: Timestamp> DataflowExecutor<T> {
 
         // Process regular edges
         for (edge_idx, edge) in edges.iter().enumerate() {
-            let pull = pull_ends[edge_idx].take().unwrap();
-            let push = push_ends[edge_idx].take().unwrap();
+            let pull = pull_ends[edge_idx]
+                .take()
+                .expect("edge pull endpoint is materialized once");
+            let push = push_ends[edge_idx]
+                .take()
+                .expect("edge push endpoint is materialized once");
 
             op_input_pullers
                 .entry(edge.target.operator_index)
@@ -466,8 +470,12 @@ impl<T: Timestamp> DataflowExecutor<T> {
         // Process feedback edges (same as regular edges for materialization purposes)
         for (i, edge) in feedback_edges.iter().enumerate() {
             let edge_idx = edges.len() + i;
-            let pull = pull_ends[edge_idx].take().unwrap();
-            let push = push_ends[edge_idx].take().unwrap();
+            let pull = pull_ends[edge_idx]
+                .take()
+                .expect("edge pull endpoint is materialized once");
+            let push = push_ends[edge_idx]
+                .take()
+                .expect("edge push endpoint is materialized once");
 
             op_input_pullers
                 .entry(edge.target.operator_index)
@@ -964,7 +972,10 @@ impl<T: Timestamp> DataflowExecutor<T> {
 
         // Update registered probes with current frontiers.
         if !self.probes.is_empty() {
-            let tracker = self.progress_tracker.as_ref().unwrap();
+            let tracker = self
+                .progress_tracker
+                .as_ref()
+                .expect("progress tracker exists when probes are registered");
             for (i, (op_idx, probe)) in self.probes.iter().enumerate() {
                 let frontier = tracker.operator_input_frontier_meet(*op_idx);
                 probe.update_frontier(&frontier);
@@ -1608,8 +1619,8 @@ mod tests {
                 wall_start: None,
                 op_collectors: Vec::new(),
                 _phantom: PhantomData,
-            draining: false,
-            drain_deadline: None,
+                draining: false,
+                drain_deadline: None,
             }
         }
     }
@@ -1726,8 +1737,8 @@ mod tests {
             wall_start: None,
             op_collectors: Vec::new(),
             _phantom: PhantomData,
-        draining: false,
-        drain_deadline: None,
+            draining: false,
+            drain_deadline: None,
         };
 
         let result = executor.run();
@@ -1771,8 +1782,8 @@ mod tests {
             wall_start: None,
             op_collectors: Vec::new(),
             _phantom: PhantomData,
-        draining: false,
-        drain_deadline: None,
+            draining: false,
+            drain_deadline: None,
         };
 
         let result = executor.run();
@@ -1820,8 +1831,8 @@ mod tests {
             wall_start: None,
             op_collectors: Vec::new(),
             _phantom: PhantomData,
-        draining: false,
-        drain_deadline: None,
+            draining: false,
+            drain_deadline: None,
         };
 
         let result = executor.run();
@@ -1857,8 +1868,8 @@ mod tests {
             wall_start: None,
             op_collectors: Vec::new(),
             _phantom: PhantomData,
-        draining: false,
-        drain_deadline: None,
+            draining: false,
+            drain_deadline: None,
         };
 
         let result = executor.run();
@@ -1900,7 +1911,7 @@ mod tests {
                 max_sweeps_per_poll: 0,
                 catch_panics: false,
                 collect_metrics: false,
-            drain_timeout: None,
+                drain_timeout: None,
             },
             cancel: CancellationToken::new(),
             progress_tracker: None,
@@ -1921,8 +1932,8 @@ mod tests {
             wall_start: None,
             op_collectors: Vec::new(),
             _phantom: PhantomData,
-        draining: false,
-        drain_deadline: None,
+            draining: false,
+            drain_deadline: None,
         };
 
         // Should terminate via quiescence, not infinite loop.
@@ -2002,8 +2013,8 @@ mod tests {
             wall_start: None,
             op_collectors: Vec::new(),
             _phantom: PhantomData,
-        draining: false,
-        drain_deadline: None,
+            draining: false,
+            drain_deadline: None,
         };
 
         let result = executor.run();
@@ -2063,8 +2074,8 @@ mod tests {
             wall_start: None,
             op_collectors: Vec::new(),
             _phantom: PhantomData,
-        draining: false,
-        drain_deadline: None,
+            draining: false,
+            drain_deadline: None,
         };
 
         // Attach progress tracker
@@ -2112,8 +2123,8 @@ mod tests {
             wall_start: None,
             op_collectors: Vec::new(),
             _phantom: PhantomData,
-        draining: false,
-        drain_deadline: None,
+            draining: false,
+            drain_deadline: None,
         };
 
         // Request notification at time 5
@@ -2174,8 +2185,8 @@ mod tests {
             wall_start: None,
             op_collectors: Vec::new(),
             _phantom: PhantomData,
-        draining: false,
-        drain_deadline: None,
+            draining: false,
+            drain_deadline: None,
         };
 
         // Request notification at time 3 — frontier already past, fires immediately
@@ -2235,8 +2246,8 @@ mod tests {
             wall_start: None,
             op_collectors: Vec::new(),
             _phantom: PhantomData,
-        draining: false,
-        drain_deadline: None,
+            draining: false,
+            drain_deadline: None,
         };
 
         // Poll the Future — should complete in one poll since all operators finish.
@@ -2283,7 +2294,7 @@ mod tests {
                 max_sweeps_per_poll: 0, // no budget limit for this test
                 catch_panics: false,
                 collect_metrics: false,
-            drain_timeout: None,
+                drain_timeout: None,
             },
             cancel: CancellationToken::new(),
             progress_tracker: None,
@@ -2304,8 +2315,8 @@ mod tests {
             wall_start: None,
             op_collectors: Vec::new(),
             _phantom: PhantomData,
-        draining: false,
-        drain_deadline: None,
+            draining: false,
+            drain_deadline: None,
         };
 
         // IdleOperator always returns Idle → hits idle threshold → WaitingForInput.
@@ -2365,7 +2376,7 @@ mod tests {
                 max_sweeps_per_poll: 0,
                 catch_panics: false,
                 collect_metrics: false,
-            drain_timeout: None,
+                drain_timeout: None,
             },
             cancel: CancellationToken::new(),
             progress_tracker: None,
@@ -2386,8 +2397,8 @@ mod tests {
             wall_start: None,
             op_collectors: Vec::new(),
             _phantom: PhantomData,
-        draining: false,
-        drain_deadline: None,
+            draining: false,
+            drain_deadline: None,
         };
 
         let wake = executor.wake_handle();
@@ -2456,8 +2467,8 @@ mod tests {
             wall_start: None,
             op_collectors: Vec::new(),
             _phantom: PhantomData,
-        draining: false,
-        drain_deadline: None,
+            draining: false,
+            drain_deadline: None,
         };
 
         let result = Pin::new(&mut executor).poll(&mut cx);
@@ -2589,7 +2600,7 @@ mod tests {
                 max_sweeps_per_poll: budget,
                 catch_panics: false,
                 collect_metrics: false,
-            drain_timeout: None,
+                drain_timeout: None,
             },
             cancel: CancellationToken::new(),
             progress_tracker: None,
@@ -2610,8 +2621,8 @@ mod tests {
             wall_start: None,
             op_collectors: Vec::new(),
             _phantom: PhantomData,
-        draining: false,
-        drain_deadline: None,
+            draining: false,
+            drain_deadline: None,
         };
 
         // First poll: should yield after `budget` sweeps (Pending, not Ready)
@@ -2663,7 +2674,7 @@ mod tests {
                 max_sweeps_per_poll: 0, // unlimited
                 catch_panics: false,
                 collect_metrics: false,
-            drain_timeout: None,
+                drain_timeout: None,
             },
             cancel: CancellationToken::new(),
             progress_tracker: None,
@@ -2684,8 +2695,8 @@ mod tests {
             wall_start: None,
             op_collectors: Vec::new(),
             _phantom: PhantomData,
-        draining: false,
-        drain_deadline: None,
+            draining: false,
+            drain_deadline: None,
         };
 
         // Should run to completion without yielding
@@ -2735,8 +2746,8 @@ mod tests {
             wall_start: None,
             op_collectors: Vec::new(),
             _phantom: PhantomData,
-        draining: false,
-        drain_deadline: None,
+            draining: false,
+            drain_deadline: None,
         };
 
         // Enable fusion with topological order.
@@ -2798,8 +2809,8 @@ mod tests {
             wall_start: None,
             op_collectors: Vec::new(),
             _phantom: PhantomData,
-        draining: false,
-        drain_deadline: None,
+            draining: false,
+            drain_deadline: None,
         };
 
         // Topological order: source → transform → sink
@@ -2850,8 +2861,8 @@ mod tests {
             wall_start: None,
             op_collectors: Vec::new(),
             _phantom: PhantomData,
-        draining: false,
-        drain_deadline: None,
+            draining: false,
+            drain_deadline: None,
         };
 
         executor.enable_fusion(FusedActivationOrder::new(vec![0]));
@@ -2901,8 +2912,8 @@ mod tests {
             wall_start: None,
             op_collectors: Vec::new(),
             _phantom: PhantomData,
-        draining: false,
-        drain_deadline: None,
+            draining: false,
+            drain_deadline: None,
         };
 
         executor.enable_fusion(FusedActivationOrder::new(vec![0]));
@@ -2952,8 +2963,8 @@ mod tests {
             wall_start: None,
             op_collectors: Vec::new(),
             _phantom: PhantomData,
-        draining: false,
-        drain_deadline: None,
+            draining: false,
+            drain_deadline: None,
         };
 
         executor.enable_fusion(FusedActivationOrder::new(vec![0]));
@@ -3038,8 +3049,8 @@ mod tests {
             wall_start: None,
             op_collectors: Vec::new(),
             _phantom: PhantomData,
-        draining: false,
-        drain_deadline: None,
+            draining: false,
+            drain_deadline: None,
         };
 
         // Should succeed and enable fusion.
@@ -3102,8 +3113,8 @@ mod tests {
             wall_start: None,
             op_collectors: Vec::new(),
             _phantom: PhantomData,
-        draining: false,
-        drain_deadline: None,
+            draining: false,
+            drain_deadline: None,
         };
 
         // Should return error, not panic.
@@ -3164,8 +3175,8 @@ mod tests {
             wall_start: None,
             op_collectors: Vec::new(),
             _phantom: PhantomData,
-        draining: false,
-        drain_deadline: None,
+            draining: false,
+            drain_deadline: None,
         };
 
         executor.enable_fusion(FusedActivationOrder::new(vec![0, 1, 2]));
@@ -3229,8 +3240,8 @@ mod tests {
             wall_start: None,
             op_collectors: Vec::new(),
             _phantom: PhantomData,
-        draining: false,
-        drain_deadline: None,
+            draining: false,
+            drain_deadline: None,
         };
 
         // Create stage info for two stages.
@@ -3308,8 +3319,8 @@ mod tests {
             wall_start: None,
             op_collectors: Vec::new(),
             _phantom: PhantomData,
-        draining: false,
-        drain_deadline: None,
+            draining: false,
+            drain_deadline: None,
         };
 
         use crate::dataflow::stage::{FusedActivationOrder, StageId, StageInfo};
@@ -3360,8 +3371,8 @@ mod tests {
             wall_start: None,
             op_collectors: Vec::new(),
             _phantom: PhantomData,
-        draining: false,
-        drain_deadline: None,
+            draining: false,
+            drain_deadline: None,
         };
 
         use crate::dataflow::stage::{FusedActivationOrder, StageId, StageInfo};
@@ -3524,8 +3535,7 @@ mod tests {
             collect_metrics: false,
             drain_timeout: Some(std::time::Duration::from_secs(5)),
         };
-        let mut executor =
-            DataflowExecutor::new_test(vec![Box::new(op)], config, 0);
+        let mut executor = DataflowExecutor::new_test(vec![Box::new(op)], config, 0);
 
         // Cancel before running.
         executor.cancel.cancel();
@@ -3553,8 +3563,7 @@ mod tests {
             collect_metrics: false,
             drain_timeout: None,
         };
-        let mut executor =
-            DataflowExecutor::new_test(vec![Box::new(op)], config, 0);
+        let mut executor = DataflowExecutor::new_test(vec![Box::new(op)], config, 0);
         executor.cancel.cancel();
 
         let result = executor.run();
@@ -3573,13 +3582,19 @@ mod tests {
             fn activate(&mut self) -> Result<ActivationOutcome> {
                 Ok(ActivationOutcome::MadeProgress)
             }
-            fn name(&self) -> &str { "infinite" }
-            fn index(&self) -> usize { 0 }
+            fn name(&self) -> &str {
+                "infinite"
+            }
+            fn index(&self) -> usize {
+                0
+            }
             fn stage_id(&self) -> crate::dataflow::stage::StageId {
                 crate::dataflow::stage::StageId(0)
             }
             fn close_inputs(&mut self) {}
-            fn is_done(&self) -> bool { false }
+            fn is_done(&self) -> bool {
+                false
+            }
         }
 
         let config = ExecutorConfig {
@@ -3591,8 +3606,7 @@ mod tests {
             // Very short timeout so test doesn't hang.
             drain_timeout: Some(std::time::Duration::from_millis(50)),
         };
-        let mut executor =
-            DataflowExecutor::new_test(vec![Box::new(InfiniteOperator)], config, 0);
+        let mut executor = DataflowExecutor::new_test(vec![Box::new(InfiniteOperator)], config, 0);
         executor.cancel.cancel();
 
         let result = executor.run();
@@ -3621,8 +3635,7 @@ mod tests {
             collect_metrics: false,
             drain_timeout: Some(std::time::Duration::from_secs(5)),
         };
-        let mut executor =
-            DataflowExecutor::new_test(vec![Box::new(op)], config, 0);
+        let mut executor = DataflowExecutor::new_test(vec![Box::new(op)], config, 0);
 
         // Simulate external input being open.
         executor
@@ -3642,5 +3655,3 @@ mod tests {
         );
     }
 }
-
-
