@@ -226,6 +226,8 @@ let handle = rt.spawn_multi("my-dataflow", 2, |builder| {
 }, SpawnOptions::default())?;
 ```
 
+By default, **auto-parallelism** is enabled — stage 0 parallelism is detected from the number of `input()` / `source_async()` calls, and `num_workers` acts as a minimum floor. Disable with `SpawnOptions::new().auto_parallelism(false)` to use the exact `num_workers` for stage 0. To force uniform parallelism across *all* stages, also set `per_stage_parallelism(false)`.
+
 `SimpleRuntime` still exists for tests behind the `test-utils` feature, but production code should use `RuntimeHandle`.
 
 **Cluster mode** — multi-node distributed execution over TCP:

@@ -1030,6 +1030,22 @@ let mut multi = rt.spawn_multi("wordcount", 2, |builder| {
 
 Each worker independently builds and runs the same graph. The `exchange_by_hash` operator is what makes this powerful: it repartitions data across workers by key, ensuring all occurrences of the same word end up at the same worker regardless of which input they came from.
 
+#### Auto-Parallelism
+
+By default, `SpawnOptions` enables **auto-parallelism** — stage 0 parallelism is automatically detected from the number of `input()` and `source_async()` calls in the graph. The `num_workers` argument acts as a minimum floor: `effective = max(auto_detected, num_workers)`.
+
+```rust
+// Auto-parallelism: 1 input → auto_detected=1, effective = max(1, 4) = 4 workers
+let multi = rt.spawn_multi("pipeline", 4, |builder| {
+    builder.input::<i32>("data")
+        .map("inc", |_t, x| x + 1)
+        .output("out");
+    Ok(())
+}, SpawnOptions::default()).unwrap();
+```
+
+Pass `num_workers=0` to use only the auto-detected count. Disable auto-parallelism with `SpawnOptions::new().auto_parallelism(false)` to use the exact `num_workers` for stage 0. To force uniform parallelism across *all* stages, also set `per_stage_parallelism(false)`.
+
 ### Exchange Operators
 
 Exchange operators physically move data between workers based on a routing function:

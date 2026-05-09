@@ -9,6 +9,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+#### Scheduling
+- Wake-based scheduling for `unary_async` operators (#207)
+  - `WakeHandle` integration — spawned async tasks notify the executor on completion
+  - New `ActivationOutcome::WaitingForAsync` variant — tells executor not to declare
+    quiescence while in-flight async tasks exist
+  - Per-operator `async_waiting` tracking in `DataflowExecutor` (unfused, fused, and stage-task modes)
+  - Eliminates 10ms polling delay for async task result collection
+
 #### Communication
 - `sequencing` module — message sequencing primitives for shared connection mode
   - `SequenceCounter` — thread-safe monotonic sequence ID generator per logical stream
@@ -37,6 +45,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - Payload lane sequencing: data + progress share one sequence per (dataflow_id, peer) for FIFO ordering
   - `PROBE_CHANNEL_ID` — reserved channel for RTT probes using standard Frame wire format
   - `check_reorder_timeouts()` — periodic timeout sweeper for gap detection
+
+### Changed
+
+#### Runtime
+- `SpawnOptions::auto_parallelism` now defaults to `true` (#208)
+  - Stage 0 parallelism is auto-detected from `input()` + `source_async()` count
+  - `num_workers` acts as a minimum floor: `effective = max(auto_detected, num_workers)`
+  - Pass `num_workers=0` to use only the auto-detected count
+  - `per_stage_parallelism(false)` now also disables auto-parallelism for legacy mode
 
 ## [0.2.0] - 2026-05-05
 
