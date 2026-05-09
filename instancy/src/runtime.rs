@@ -1197,6 +1197,61 @@ impl RuntimeHandle {
         }
     }
 
+    /// Spawn a dataflow with automatic parallelism derived from the graph.
+    ///
+    /// Unlike [`spawn_multi`](Self::spawn_multi), the build closure does **not**
+    /// receive a `worker_idx` — the graph is purely logical and independent
+    /// of physical worker count. Parallelism is determined automatically:
+    ///
+    /// - **Stage 0** parallelism = number of physical input sources
+    ///   ([`input()`](crate::dataflow::DataflowBuilder::input) +
+    ///   [`source_async()`](crate::dataflow::DataflowBuilder::source_async)
+    ///   calls), minimum 1.
+    /// - **Subsequent stages** use the parallelism specified at repartition
+    ///   points ([`exchange_to`](crate::dataflow::Pipe::exchange_to),
+    ///   [`gather`](crate::dataflow::Pipe::gather),
+    ///   [`rebalance_to`](crate::dataflow::Pipe::rebalance_to)).
+    /// - Stages without explicit parallelism inherit stage 0's count.
+    ///
+    /// The closure is called once to probe the graph structure, then once per
+    /// worker to build replicated copies. It should be free of one-time side
+    /// effects.
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// // 1 input → stage 0 (par=1) → exchange → stage 1 (par=4) → gather → stage 2 (par=1)
+    /// let mut multi = rt.spawn_dataflow("pipeline", |builder| {
+    ///     let input = builder.input::<i32>("data");
+    ///     input
+    ///         .exchange_to("scatter", 4, |v: &i32| *v as u64)
+    ///         .map("process", |_t, x| x * 2)
+    ///         .gather("collect")
+    ///         .output("results");
+    ///     Ok(())
+    /// }, SpawnOptions::new())?;
+    /// ```
+    pub fn spawn_dataflow<T, F>(
+        &self,
+        name: &str,
+        build: F,
+        options: SpawnOptions,
+    ) -> Result<MultiSpawnedDataflow<T>>
+    where
+        T: Timestamp,
+        F: Fn(&mut DataflowBuilder<T>) -> Result<()>,
+    {
+        // Force auto-parallelism — the whole point of spawn_dataflow is that
+        // parallelism is derived from the graph, not from a user-supplied
+        // worker count.
+        let options = SpawnOptions {
+            auto_parallelism: true,
+            per_stage_parallelism: true,
+            ..options
+        };
+        self.spawn_multi(name, 0, |_worker_idx, builder| build(builder), options)
+    }
+
     // -- Private sync implementations --
 
     #[allow(clippy::too_many_arguments)]

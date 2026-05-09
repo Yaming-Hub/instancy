@@ -1,10 +1,11 @@
-//! Integration tests for `spawn_multi` with `auto_parallelism` enabled.
+//! Integration tests for `spawn_dataflow` and `spawn_multi` with `auto_parallelism`.
 //!
-//! These tests validate that `SpawnOptions::auto_parallelism(true)` correctly:
-//! - Auto-detects stage 0 parallelism from input/source_async count
-//! - Routes data through heterogeneous stages
-//! - Works with the uniform fallback path
-//! - Properly collects output data
+//! These tests validate that:
+//! - `spawn_dataflow` builds the graph without worker_idx and auto-detects parallelism
+//! - `SpawnOptions::auto_parallelism(true)` correctly auto-detects stage 0 parallelism
+//! - Data routes through heterogeneous stages
+//! - Uniform fallback path works
+//! - Output data is properly collected
 
 use instancy::dataflow::DataflowBuilder;
 use instancy::runtime::{RuntimeConfig, RuntimeHandle, SpawnOptions};
@@ -316,6 +317,165 @@ fn auto_par_uniform_fallback() {
         .collect();
     results.sort();
     assert_eq!(results, vec![11, 21]);
+
+    multi.join_blocking().unwrap();
+}
+
+// ===========================================================================
+// spawn_dataflow tests — build closure takes &mut DataflowBuilder (no worker_idx)
+// ===========================================================================
+
+/// Single input → map → output via spawn_dataflow.
+/// Verifies the no-worker-idx API works for a trivial pipeline.
+#[test]
+fn spawn_dataflow_single_input() {
+    let rt = test_runtime();
+
+    let mut multi = rt
+        .spawn_dataflow(
+            "sd-simple",
+            |builder: &mut DataflowBuilder<u64>| {
+                let input = builder.input::<i32>("data");
+                input.map("double", |_t, x| x * 2).output("results");
+                Ok(())
+            },
+            SpawnOptions::new(),
+        )
+        .unwrap();
+
+    assert_eq!(multi.num_workers(), 1);
+
+    let sender = multi.take_input::<i32>(0, "data").unwrap();
+    let receiver = multi.take_output::<i32>(0, "results").unwrap();
+
+    sender.send(0, vec![5, 10, 15]).unwrap();
+    drop(sender);
+
+    let mut results: Vec<i32> = receiver
+        .collect_data()
+        .into_iter()
+        .flat_map(|(_, d)| d)
+        .collect();
+    results.sort();
+    assert_eq!(results, vec![10, 20, 30]);
+
+    multi.join_blocking().unwrap();
+}
+
+/// Fan-out via spawn_dataflow: 1 input → exchange_to(4) → for_each.
+#[test]
+fn spawn_dataflow_fan_out() {
+    let rt = test_runtime();
+    let collected = Arc::new(Mutex::new(Vec::new()));
+    let c = collected.clone();
+
+    let mut multi = rt
+        .spawn_dataflow(
+            "sd-fan-out",
+            move |builder: &mut DataflowBuilder<u64>| {
+                let c = c.clone();
+                let input = builder.input::<i32>("data");
+                input
+                    .exchange_to("scatter", 4, |v: &i32| *v as u64)
+                    .map("triple", |_t, x| x * 3)
+                    .for_each("collect", move |_t, item: &i32| {
+                        c.lock().unwrap().push(*item);
+                    });
+                Ok(())
+            },
+            SpawnOptions::new(),
+        )
+        .unwrap();
+
+    assert_eq!(multi.num_workers(), 4);
+
+    let sender = multi.take_input::<i32>(0, "data").unwrap();
+    sender.send(0, vec![1, 2, 3, 4]).unwrap();
+    drop(sender);
+
+    multi.join_blocking().unwrap();
+
+    let mut result = collected.lock().unwrap().clone();
+    result.sort();
+    assert_eq!(result, vec![3, 6, 9, 12]);
+}
+
+/// Fan-out-fan-in via spawn_dataflow: 1 → exchange(4) → gather → output.
+#[test]
+fn spawn_dataflow_fan_out_fan_in() {
+    let rt = test_runtime();
+
+    let mut multi = rt
+        .spawn_dataflow(
+            "sd-fan-out-in",
+            |builder: &mut DataflowBuilder<u64>| {
+                let input = builder.input::<i32>("data");
+                input
+                    .exchange_to("scatter", 4, |v: &i32| *v as u64)
+                    .map("inc", |_t, x| x + 100)
+                    .gather("collect")
+                    .output("results");
+                Ok(())
+            },
+            SpawnOptions::new(),
+        )
+        .unwrap();
+
+    assert_eq!(multi.num_workers(), 4);
+
+    let sender = multi.take_input::<i32>(0, "data").unwrap();
+    let receiver = multi.take_output::<i32>(0, "results").unwrap();
+
+    sender.send(0, vec![1, 2, 3, 4]).unwrap();
+    drop(sender);
+
+    let mut results: Vec<i32> = receiver
+        .collect_data()
+        .into_iter()
+        .flat_map(|(_, d)| d)
+        .collect();
+    results.sort();
+    assert_eq!(results, vec![101, 102, 103, 104]);
+
+    multi.join_blocking().unwrap();
+}
+
+/// Verify spawn_dataflow forces auto_parallelism even if the user doesn't set it.
+#[test]
+fn spawn_dataflow_ignores_num_workers() {
+    let rt = test_runtime();
+
+    // The user doesn't set auto_parallelism or per_stage_parallelism —
+    // spawn_dataflow should force both on internally.
+    let mut multi = rt
+        .spawn_dataflow(
+            "sd-auto",
+            |builder: &mut DataflowBuilder<u64>| {
+                let input = builder.input::<i32>("in");
+                input.output("out");
+                Ok(())
+            },
+            SpawnOptions::new()
+                .per_stage_parallelism(false)
+                .auto_parallelism(false),
+        )
+        .unwrap();
+
+    // 1 input → 1 worker regardless of what the user set
+    assert_eq!(multi.num_workers(), 1);
+
+    let sender = multi.take_input::<i32>(0, "in").unwrap();
+    let receiver = multi.take_output::<i32>(0, "out").unwrap();
+
+    sender.send(0, vec![42]).unwrap();
+    drop(sender);
+
+    let results: Vec<i32> = receiver
+        .collect_data()
+        .into_iter()
+        .flat_map(|(_, d)| d)
+        .collect();
+    assert_eq!(results, vec![42]);
 
     multi.join_blocking().unwrap();
 }
