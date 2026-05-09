@@ -104,9 +104,57 @@ struct DataflowRegistration {
     error_tx: tokio_mpsc::Sender<TransportError>,
 }
 
-/// Combined registration + pending-control state, guarded by a single lock
-/// so that the reader_task can atomically check registration and buffer
-/// control frames for not-yet-registered dataflows.
+/// Combined registration + pending-control state, guarded by a **single** lock
+/// to prevent a TOCTOU race between `reader_task` and `register_dataflow`.
+///
+/// # Race condition (why a single lock is required)
+///
+/// When multiple dataflows share pooled connections, the remote peer may
+/// register a new dataflow and send its Handshake *before* the local peer
+/// has registered that dataflow. For example:
+///
+/// ```text
+/// Node-A (fast)                 TCP               Node-B (slow)
+/// ─────────────                 ───               ─────────────
+/// 1. df1 completes
+/// 2. register(df2)
+/// 3. send df2 Handshake ────────────────►  reader_task receives
+///                                          df2 Handshake
+///
+///                                          registrations[df2] → NOT FOUND
+///                                          → frame DROPPED silently ✗
+///
+///                                       4. register(df2)
+///                                       5. send df2 Handshake to node-A
+///                                       6. wait for df2 Handshake from node-A
+///                                          → never arrives → timeout ✗
+/// ```
+///
+/// The fix: `reader_task` buffers unregistered control frames in
+/// `pending_control`, and `register_dataflow` drains the buffer. Both
+/// operations happen under this single lock. If two separate locks were
+/// used (one for `registered`, one for `pending_control`), the following
+/// TOCTOU race would still be possible:
+///
+/// ```text
+/// reader_task                       register_dataflow
+/// ───────────                       ─────────────────
+/// lock(registrations)
+///   df2 not found
+/// unlock(registrations)
+///                                   lock(pending_control)
+///                                     drain → empty (nothing buffered yet)
+///                                   unlock(pending_control)
+///                                   lock(registrations)
+///                                     insert df2
+///                                   unlock(registrations)
+/// lock(pending_control)
+///   buffer Handshake frame        ← buffered AFTER drain already ran
+/// unlock(pending_control)           → frame is never delivered
+/// ```
+///
+/// With a single lock, both "check + buffer" and "drain + register" are
+/// atomic, eliminating this window entirely.
 struct RegistrationState {
     /// Active dataflow registrations.
     registered: HashMap<DataflowId, DataflowRegistration>,
@@ -362,11 +410,19 @@ impl SharedPeerManager {
             error_tx,
         };
 
-        // Atomically: drain pending control frames + insert registration +
-        // deliver buffered frames. The reader_task uses the same lock, so
-        // there is no window where a frame could be buffered after we drain
-        // but before we register, and no ordering inversion where reader_task
-        // delivers a newer frame before we finish delivering buffered ones.
+        // Atomically under one lock:
+        //   1. Drain any control frames that arrived before this registration
+        //   2. Insert the registration so future frames are routed directly
+        //   3. Deliver drained frames into the new control channel
+        //
+        // All three steps happen while holding `reg_state`, so reader_task
+        // cannot interleave between drain and register (see RegistrationState
+        // doc comment for the full race condition explanation).
+        //
+        // Buffered frames are delivered with try_send (not async send) so we
+        // don't yield while holding the lock. This is safe because the channel
+        // was just created with channel_capacity slots and pending frames are
+        // few (typically 1-2: one Handshake and/or one Ready).
         {
             let mut state = self.reg_state.lock().await;
             let pending = state.pending_control.remove(&dataflow_id).unwrap_or_default();
@@ -623,9 +679,17 @@ impl SharedPeerManager {
                         continue;
                     }
 
-                    // Control frames bypass sequencing — deliver raw payload directly.
-                    // If the dataflow isn't registered yet, buffer the frame so it
-                    // can be delivered when registration occurs (atomic under one lock).
+                    // Control frames (Handshake, Ready) bypass sequencing — deliver
+                    // the raw payload directly to the control channel.
+                    //
+                    // Race condition handling: the remote peer may send a control
+                    // frame for a dataflow that hasn't been registered locally yet
+                    // (e.g., node-A finishes df1 and starts df2's handshake before
+                    // node-B has registered df2). Instead of dropping the frame, we
+                    // buffer it in `pending_control` so that `register_dataflow()`
+                    // can drain it upon registration. Both the "check registration +
+                    // buffer" here and the "drain + register" in register_dataflow()
+                    // hold the same `reg_state` lock, preventing TOCTOU races.
                     if frame.channel_id == CONTROL_CHANNEL_ID {
                         let tx = {
                             let mut state = reg_state.lock().await;
