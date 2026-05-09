@@ -39,6 +39,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
+use std::sync::RwLock;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::time::Duration;
 
@@ -357,9 +358,9 @@ pub enum ScalingDecision {
 /// added or removed.
 pub struct PeerPool {
     /// Connection metrics keyed by stable connection ID.
-    connections: HashMap<usize, Arc<ConnectionMetrics>>,
+    connections: RwLock<HashMap<usize, Arc<ConnectionMetrics>>>,
     /// Next ID to assign.
-    next_id: usize,
+    next_id: AtomicUsize,
     /// Configuration for scaling decisions.
     config: SharedConnectionConfig,
     /// Timestamp when all connections dropped below scale-down threshold.
@@ -397,8 +398,8 @@ impl PeerPool {
         }
 
         Self {
-            next_id: count,
-            connections,
+            next_id: AtomicUsize::new(count),
+            connections: RwLock::new(connections),
             config,
             cooldown_start: Mutex::new(None),
         }
@@ -420,8 +421,15 @@ impl PeerPool {
     /// Atomically increments `pending_writes` on the selected connection.
     /// The caller must call `dequeue()` after the frame has been written,
     /// or `rollback_reservation()` if the send could not be completed.
-    pub fn select_and_reserve(&self) -> Option<&Arc<ConnectionMetrics>> {
-        let live: Vec<_> = self.connections.values().filter(|c| c.is_alive()).collect();
+    pub fn select_and_reserve(&self) -> Option<Arc<ConnectionMetrics>> {
+        let live: Vec<_> = self
+            .connections
+            .read()
+            .expect("peer pool connections lock poisoned")
+            .values()
+            .filter(|c| c.is_alive())
+            .cloned()
+            .collect();
 
         if live.is_empty() {
             return None;
@@ -453,60 +461,92 @@ impl PeerPool {
     /// Use [`Self::select_and_reserve`] for production send paths to avoid
     /// concurrent senders all choosing the same connection.
     /// This method is useful for read-only inspection or diagnostics.
-    pub fn select_connection(&self) -> Option<&Arc<ConnectionMetrics>> {
+    pub fn select_connection(&self) -> Option<Arc<ConnectionMetrics>> {
         self.connections
+            .read()
+            .expect("peer pool connections lock poisoned")
             .values()
             .filter(|c| c.is_alive())
             .min_by_key(|c| c.load_score())
+            .cloned()
     }
 
     /// Select a live connection with the lowest load, excluding specified IDs.
     pub fn select_connection_excluding(
         &self,
         exclude: &HashSet<usize>,
-    ) -> Option<&Arc<ConnectionMetrics>> {
+    ) -> Option<Arc<ConnectionMetrics>> {
         self.connections
+            .read()
+            .expect("peer pool connections lock poisoned")
             .values()
             .filter(|c| c.is_alive() && !exclude.contains(&c.id))
             .min_by_key(|c| c.load_score())
+            .cloned()
     }
 
     /// Count of live (non-dead) connections.
     pub fn live_connection_count(&self) -> usize {
-        self.connections.values().filter(|c| c.is_alive()).count()
+        self.connections
+            .read()
+            .expect("peer pool connections lock poisoned")
+            .values()
+            .filter(|c| c.is_alive())
+            .count()
     }
 
     /// Get metrics for a specific connection by ID.
-    pub fn connection(&self, id: usize) -> Option<&Arc<ConnectionMetrics>> {
-        self.connections.get(&id)
+    pub fn connection(&self, id: usize) -> Option<Arc<ConnectionMetrics>> {
+        self.connections
+            .read()
+            .expect("peer pool connections lock poisoned")
+            .get(&id)
+            .cloned()
     }
 
-    /// Current number of active connections.
+    /// Current number of tracked connections.
     pub fn connection_count(&self) -> usize {
-        self.connections.len()
+        self.connections
+            .read()
+            .expect("peer pool connections lock poisoned")
+            .len()
     }
 
     /// Add a new connection to the pool. Returns its metrics handle,
-    /// or `None` if already at `max_connections`.
-    pub fn add_connection(&mut self) -> Option<Arc<ConnectionMetrics>> {
-        if self.connections.len() >= self.config.max_connections {
+    /// or `None` if already at `max_connections` live connections.
+    pub fn add_connection(&self) -> Option<Arc<ConnectionMetrics>> {
+        let mut connections = self
+            .connections
+            .write()
+            .expect("peer pool connections lock poisoned");
+        let live_count = connections.values().filter(|c| c.is_alive()).count();
+        if live_count >= self.config.max_connections {
             return None;
         }
-        let id = self.next_id;
-        self.next_id += 1;
+        let id = self.next_id.fetch_add(1, Ordering::Relaxed);
         let metrics = Arc::new(ConnectionMetrics::new(id, self.config.rtt_ema_alpha));
-        self.connections.insert(id, metrics.clone());
+        connections.insert(id, metrics.clone());
         Some(metrics)
     }
 
     /// Remove a connection from the pool by ID.
     ///
-    /// Returns true if removed, false if ID not found or at min_connections.
-    pub fn remove_connection(&mut self, id: usize) -> bool {
-        if self.connections.len() <= self.config.min_connections {
+    /// Returns true if removed, false if ID not found or removing it would put
+    /// the live connection count below `min_connections`.
+    pub fn remove_connection(&self, id: usize) -> bool {
+        let mut connections = self
+            .connections
+            .write()
+            .expect("peer pool connections lock poisoned");
+        let Some(metrics) = connections.get(&id) else {
+            return false;
+        };
+        if metrics.is_alive()
+            && connections.values().filter(|conn| conn.is_alive()).count() <= self.config.min_connections
+        {
             return false;
         }
-        self.connections.remove(&id).is_some()
+        connections.remove(&id).is_some()
     }
 
     /// Evaluate whether scaling is needed based on current RTT and idle state.
@@ -519,7 +559,14 @@ impl PeerPool {
     pub async fn evaluate_scaling(&self) -> ScalingDecision {
         let threshold_up = self.config.rtt_scale_up_threshold;
         let threshold_down = self.config.rtt_scale_down_threshold;
-        let live: Vec<_> = self.connections.values().filter(|c| c.is_alive()).collect();
+        let live: Vec<_> = self
+            .connections
+            .read()
+            .expect("peer pool connections lock poisoned")
+            .values()
+            .filter(|c| c.is_alive())
+            .cloned()
+            .collect();
         let live_count = live.len();
 
         // Check if any live connection with measurements exceeds the scale-up threshold
@@ -527,7 +574,7 @@ impl PeerPool {
             .iter()
             .any(|c| c.average_rtt().is_some_and(|rtt| rtt > threshold_up));
 
-        if any_overloaded && self.connections.len() < self.config.max_connections {
+        if any_overloaded && live_count < self.config.max_connections {
             // Reset cooldown since we're scaling up
             *self.cooldown_start.lock().await = None;
             return ScalingDecision::ScaleUp;
@@ -601,6 +648,8 @@ impl PeerPool {
     pub fn metrics_snapshot(&self) -> Vec<ConnectionSnapshot> {
         let mut snaps: Vec<_> = self
             .connections
+            .read()
+            .expect("peer pool connections lock poisoned")
             .values()
             .map(|c| ConnectionSnapshot {
                 id: c.id,
@@ -846,7 +895,7 @@ mod tests {
             max_connections: 4,
             ..Default::default()
         };
-        let mut pool = PeerPool::new(1, config);
+        let pool = PeerPool::new(1, config);
         assert_eq!(pool.connection_count(), 1);
 
         let new_conn = pool.add_connection().unwrap();
@@ -872,7 +921,7 @@ mod tests {
             max_connections: 2,
             ..Default::default()
         };
-        let mut pool = PeerPool::new(2, config);
+        let pool = PeerPool::new(2, config);
         assert_eq!(pool.connection_count(), 2);
 
         // Already at max — returns None
@@ -938,7 +987,7 @@ mod tests {
             max_connections: 8,
             ..Default::default()
         };
-        let mut pool = PeerPool::new(3, config);
+        let pool = PeerPool::new(3, config);
 
         // Remove middle connection (id=1)
         pool.remove_connection(1);

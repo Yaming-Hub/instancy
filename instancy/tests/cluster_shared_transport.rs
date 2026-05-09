@@ -7,13 +7,15 @@
 #![cfg(feature = "transport")]
 
 use std::collections::HashMap;
+use std::future::Future;
+use std::pin::Pin;
 use std::sync::Arc;
 use std::time::Duration;
 
 use tokio::net::{TcpListener, TcpStream};
 
 use instancy::communication::shared_pool::SharedConnectionConfig;
-use instancy::communication::shared_transport::SharedPeerManager;
+use instancy::communication::shared_transport::{DynConnectionFactory, SharedPeerManager};
 use instancy::communication::ClusterSpawnTransport;
 use instancy::DataflowBuilder;
 use instancy::DataflowId;
@@ -91,8 +93,8 @@ async fn make_tcp_shared_managers(
         conns_b.push((rb, wb));
     }
 
-    let manager_a = SharedPeerManager::new("node-b".to_string(), config.clone(), conns_a, handle);
-    let manager_b = SharedPeerManager::new("node-a".to_string(), config, conns_b, handle);
+    let manager_a = SharedPeerManager::new("node-b".to_string(), config.clone(), conns_a, None, handle);
+    let manager_b = SharedPeerManager::new("node-a".to_string(), config, conns_b, None, handle);
 
     let mut managers_a = HashMap::new();
     managers_a.insert("node-b".to_string(), manager_a);
@@ -652,3 +654,186 @@ async fn shared_join_async_keeps_bridges_alive() {
     all_results.sort();
     assert_eq!(all_results, vec![1, 2, 3, 4, 5]);
 }
+
+// ===========================================================================
+// Reconnect integration tests
+// ===========================================================================
+
+/// TCP-based connection factory that creates new connections to a fixed
+/// listener address. Used to test reconnect after transient network failure.
+struct TcpReconnectFactory {
+    /// Address of the listener that accepts new connections.
+    listener_addr: std::net::SocketAddr,
+}
+
+impl DynConnectionFactory for TcpReconnectFactory {
+    fn establish_dyn<'a>(
+        &'a self,
+        _peer_node_id: &'a str,
+    ) -> Pin<
+        Box<
+            dyn Future<
+                    Output = std::result::Result<
+                        (
+                            Box<dyn tokio::io::AsyncRead + Unpin + Send>,
+                            Box<dyn tokio::io::AsyncWrite + Unpin + Send>,
+                        ),
+                        Box<dyn std::error::Error + Send + Sync>,
+                    >,
+                > + Send
+                + 'a,
+        >,
+    > {
+        Box::pin(async move {
+            let stream = TcpStream::connect(self.listener_addr).await?;
+            stream.set_nodelay(true)?;
+            let (r, w) = stream.into_split();
+            Ok((
+                Box::new(r) as Box<dyn tokio::io::AsyncRead + Unpin + Send>,
+                Box::new(w) as Box<dyn tokio::io::AsyncWrite + Unpin + Send>,
+            ))
+        })
+    }
+}
+
+/// Simulates a transient network interruption at the SharedPeerManager level:
+/// creates a manager with a real TCP connection, kills that connection by
+/// dropping the remote peer side, and verifies the manager reconnects via the
+/// factory and that data continues flowing on the new connection.
+///
+/// This is a lower-level test than `shared_two_nodes_exchange` — it directly
+/// exercises the reconnect path without a full cluster.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn shared_reconnect_after_transient_network_failure() {
+    use instancy::communication::transport::Frame;
+
+    // ---------- set up a persistent TCP listener for reconnect ----------
+    // The listener runs an echo server: it accepts connections and copies
+    // all received bytes back to the sender. This works with the frame-based
+    // protocol because the reader_task will parse echoed bytes as frames.
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let listener_addr = listener.local_addr().unwrap();
+
+    let echo_task = tokio::spawn(async move {
+        loop {
+            let Ok((stream, _)) = listener.accept().await else {
+                break;
+            };
+            stream.set_nodelay(true).ok();
+            tokio::spawn(async move {
+                let (mut reader, mut writer) = stream.into_split();
+                let _ = tokio::io::copy(&mut reader, &mut writer).await;
+            });
+        }
+    });
+
+    let config = SharedConnectionConfig {
+        min_connections: 1,
+        max_connections: 2,
+        probe_interval: Duration::from_secs(3600),
+        rtt_scale_up_threshold: Duration::from_secs(3600),
+        rtt_scale_down_threshold: Duration::from_secs(3600),
+        cooldown_period: Duration::from_secs(3600),
+        reorder_timeout: Duration::from_secs(10),
+        rtt_ema_alpha: 0.2,
+        idle_timeout: None,
+    };
+
+    // ---------- create initial TCP connection to the echo server ----------
+    // We keep the remote side (echo_remote) so we can kill it to simulate
+    // a network failure.
+    let echo_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let echo_addr = echo_listener.local_addr().unwrap();
+
+    // Spawn a task that accepts and echoes on the first connection only.
+    // We'll hold the remote handle so we can abort it later.
+    let echo_remote = tokio::spawn(async move {
+        let (stream, _) = echo_listener.accept().await.unwrap();
+        stream.set_nodelay(true).unwrap();
+        let (mut r, mut w) = stream.into_split();
+        let _ = tokio::io::copy(&mut r, &mut w).await;
+    });
+
+    let stream = TcpStream::connect(echo_addr).await.unwrap();
+    stream.set_nodelay(true).unwrap();
+    let (reader, writer) = stream.into_split();
+
+    // The reconnect factory connects to the persistent listener (not the
+    // one-shot echo_listener we used for the initial connection).
+    let factory: Arc<dyn DynConnectionFactory> = Arc::new(TcpReconnectFactory { listener_addr });
+
+    let rt = tokio::runtime::Handle::current();
+    let manager = SharedPeerManager::new(
+        "echo-peer".to_string(),
+        config,
+        vec![(reader, writer)],
+        Some(factory),
+        &rt,
+    );
+
+    // ---------- register a dataflow and verify initial data flow ----------
+    let df_id = DataflowId::new();
+    let (mut receivers, _error_rx) =
+        manager.register_dataflow(df_id, &[1], 64).await;
+    let data_rx = receivers.get_mut(&1).unwrap();
+
+    // Send a frame — the echo server reflects it back
+    let frame1 = Frame {
+        dataflow_id: df_id,
+        channel_id: 1,
+        payload: b"before-interrupt".to_vec(),
+    };
+    manager
+        .payload_sender()
+        .send((df_id, frame1))
+        .await
+        .unwrap();
+
+    let payload = tokio::time::timeout(Duration::from_secs(5), data_rx.recv())
+        .await
+        .expect("timed out waiting for initial echo")
+        .expect("data channel closed");
+    assert_eq!(payload, b"before-interrupt".to_vec());
+
+    // ---------- simulate transient network failure ----------
+    // Abort the echo remote task — this closes the remote side of the TCP
+    // connection, causing the manager's reader_task to detect EOF and report
+    // the connection as failed.
+    echo_remote.abort();
+
+    // ---------- wait for reconnect to complete ----------
+    // The failure detection → connection_monitor → scaling_event_handler →
+    // reconnect path takes a small amount of time. We wait to ensure:
+    //   1. The dead connection is detected and marked dead
+    //   2. The scaling_event_handler establishes a new connection via factory
+    //   3. New reader/writer tasks are spawned and ready
+    //
+    // Without this wait, frames sent immediately after abort might be routed
+    // to the dying connection (still momentarily "alive" in the pool), which
+    // consumes a sequence number but never echoes back — creating an
+    // irrecoverable gap in the reorder buffer.
+    tokio::time::sleep(Duration::from_secs(2)).await;
+
+    // ---------- verify data flows on the reconnected connection ----------
+    let frame2 = Frame {
+        dataflow_id: df_id,
+        channel_id: 1,
+        payload: b"after-reconnect".to_vec(),
+    };
+    manager
+        .payload_sender()
+        .send((df_id, frame2))
+        .await
+        .unwrap();
+
+    let payload = tokio::time::timeout(Duration::from_secs(5), data_rx.recv())
+        .await
+        .expect("timed out waiting for post-reconnect echo")
+        .expect("data channel closed after reconnect");
+    assert_eq!(payload, b"after-reconnect".to_vec());
+
+    // ---------- cleanup ----------
+    echo_task.abort();
+    drop(manager);
+}
+

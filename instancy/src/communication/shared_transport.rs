@@ -40,7 +40,10 @@
 //! `PROBE_CHANNEL_ID` to avoid mixing wire formats on the same TCP stream.
 
 use std::collections::{HashMap, HashSet};
+use std::future::Future;
+use std::pin::Pin;
 use std::sync::Arc;
+use std::sync::Mutex;
 use std::time::Duration;
 
 use tokio::io::{AsyncRead, AsyncWrite};
@@ -86,9 +89,43 @@ pub trait ConnectionFactory: Send + Sync + 'static {
     fn establish(
         &self,
         peer_node_id: &str,
-    ) -> impl std::future::Future<
+    ) -> impl Future<
         Output = Result<(Self::Reader, Self::Writer), Box<dyn std::error::Error + Send + Sync>>,
     > + Send;
+}
+
+/// Type-erased reader half used by reconnect support.
+type DynReader = Box<dyn AsyncRead + Unpin + Send>;
+/// Type-erased writer half used by reconnect support.
+type DynWriter = Box<dyn AsyncWrite + Unpin + Send>;
+/// Type-erased connection establishment result.
+type DynConnectionResult = Result<
+    (DynReader, DynWriter),
+    Box<dyn std::error::Error + Send + Sync>,
+>;
+
+/// Type-erased connection factory for reconnect support.
+pub trait DynConnectionFactory: Send + Sync + 'static {
+    /// Establish a new connection to the specified peer.
+    fn establish_dyn<'a>(
+        &'a self,
+        peer_node_id: &'a str,
+    ) -> Pin<Box<dyn Future<Output = DynConnectionResult> + Send + 'a>>;
+}
+
+impl<F> DynConnectionFactory for F
+where
+    F: ConnectionFactory,
+{
+    fn establish_dyn<'a>(
+        &'a self,
+        peer_node_id: &'a str,
+    ) -> Pin<Box<dyn Future<Output = DynConnectionResult> + Send + 'a>> {
+        Box::pin(async move {
+            let (reader, writer) = self.establish(peer_node_id).await?;
+            Ok((Box::new(reader) as DynReader, Box::new(writer) as DynWriter))
+        })
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -203,8 +240,12 @@ pub struct SharedPeerManager {
     scaling_driver: Arc<ScalingDriver>,
     /// Probe counter for generating probe sequence IDs.
     probe_counter: Arc<ProbeCounter>,
+    /// Optional factory used to establish replacement or scaled-up connections.
+    connection_factory: Option<Arc<dyn DynConnectionFactory>>,
+    /// Runtime handle used to spawn replacement connection tasks.
+    runtime_handle: tokio::runtime::Handle,
     /// Background task handles (aborted on drop).
-    _task_handles: Vec<tokio::task::JoinHandle<()>>,
+    task_handles: Arc<Mutex<Vec<tokio::task::JoinHandle<()>>>>,
     /// Payload sender: frames from any dataflow go here for sequencing + pool routing.
     payload_tx: tokio_mpsc::Sender<(DataflowId, Frame)>,
     /// Control sender: high-priority frames bypass sequencing.
@@ -215,8 +256,10 @@ pub struct SharedPeerManager {
 
 impl Drop for SharedPeerManager {
     fn drop(&mut self) {
-        for handle in &self._task_handles {
-            handle.abort();
+        if let Ok(handles) = self.task_handles.lock() {
+            for handle in handles.iter() {
+                handle.abort();
+            }
         }
     }
 }
@@ -233,6 +276,7 @@ impl SharedPeerManager {
         peer_node_id: String,
         config: SharedConnectionConfig,
         connections: Vec<(R, W)>,
+        connection_factory: Option<Arc<dyn DynConnectionFactory>>,
         runtime_handle: &tokio::runtime::Handle,
     ) -> Self
     where
@@ -267,8 +311,7 @@ impl SharedPeerManager {
                 completed: HashSet::new(),
             }));
         let reorder_buffers = Arc::new(TokioMutex::new(HashMap::new()));
-
-        let mut task_handles = Vec::new();
+        let task_handles = Arc::new(Mutex::new(Vec::new()));
         let mut readers = Vec::new();
 
         // Set up per-connection writer tasks and collect readers
@@ -276,10 +319,7 @@ impl SharedPeerManager {
             let (tx, rx) = tokio_mpsc::channel::<Frame>(256);
             writer_channel_map.insert(conn_id, tx);
 
-            // Get connection metrics for accurate dequeue tracking
-            let conn_metrics = pool.connection(conn_id).cloned();
-
-            // Spawn per-connection writer task
+            let conn_metrics = pool.connection(conn_id);
             let handle = runtime_handle.spawn(Self::writer_task(
                 conn_id,
                 writer,
@@ -287,14 +327,16 @@ impl SharedPeerManager {
                 conn_metrics,
                 failure_tx.clone(),
             ));
-            task_handles.push(handle);
+            task_handles
+                .lock()
+                .expect("task handle lock poisoned")
+                .push(handle);
 
             readers.push((conn_id, reader));
         }
 
         let writer_channels = Arc::new(TokioMutex::new(writer_channel_map));
 
-        // Spawn per-connection reader tasks (need writer_channels for probe replies)
         for (conn_id, reader) in readers {
             let reader_handle = runtime_handle.spawn(Self::reader_task(
                 conn_id,
@@ -306,10 +348,12 @@ impl SharedPeerManager {
                 writer_channels.clone(),
                 failure_tx.clone(),
             ));
-            task_handles.push(reader_handle);
+            task_handles
+                .lock()
+                .expect("task handle lock poisoned")
+                .push(reader_handle);
         }
 
-        // Spawn the bridge task (sequences payload frames and routes to connections)
         let bridge_handle = runtime_handle.spawn(Self::bridge_task(
             pool.clone(),
             writer_channels.clone(),
@@ -317,9 +361,11 @@ impl SharedPeerManager {
             payload_rx,
             control_rx,
         ));
-        task_handles.push(bridge_handle);
+        task_handles
+            .lock()
+            .expect("task handle lock poisoned")
+            .push(bridge_handle);
 
-        // Spawn probe loop
         let probe_handle = runtime_handle.spawn(Self::probe_loop(
             scaling_driver.clone(),
             probe_counter.clone(),
@@ -327,30 +373,49 @@ impl SharedPeerManager {
             pool.clone(),
             config.probe_interval,
         ));
-        task_handles.push(probe_handle);
+        task_handles
+            .lock()
+            .expect("task handle lock poisoned")
+            .push(probe_handle);
 
-        // Spawn scaling event handler
-        let scale_handle =
-            runtime_handle.spawn(Self::scaling_event_handler(scaling_event_rx, pool.clone()));
-        task_handles.push(scale_handle);
+        let scale_handle = runtime_handle.spawn(Self::scaling_event_handler(
+            scaling_event_rx,
+            peer_node_id.clone(),
+            connection_factory.clone(),
+            runtime_handle.clone(),
+            pool.clone(),
+            writer_channels.clone(),
+            reg_state.clone(),
+            reorder_buffers.clone(),
+            scaling_driver.clone(),
+            failure_tx.clone(),
+            task_handles.clone(),
+        ));
+        task_handles
+            .lock()
+            .expect("task handle lock poisoned")
+            .push(scale_handle);
 
-        // Spawn connection failure monitor
         let monitor_handle = runtime_handle.spawn(Self::connection_monitor(
             failure_rx,
             pool.clone(),
             writer_channels.clone(),
             scaling_driver.clone(),
-            reg_state.clone(),
         ));
-        task_handles.push(monitor_handle);
+        task_handles
+            .lock()
+            .expect("task handle lock poisoned")
+            .push(monitor_handle);
 
-        // Spawn periodic reorder buffer timeout sweeper
         let sweep_handle = runtime_handle.spawn(Self::timeout_sweeper(
             reorder_buffers.clone(),
             reg_state.clone(),
             config.reorder_timeout,
         ));
-        task_handles.push(sweep_handle);
+        task_handles
+            .lock()
+            .expect("task handle lock poisoned")
+            .push(sweep_handle);
 
         Self {
             peer_node_id,
@@ -361,7 +426,9 @@ impl SharedPeerManager {
             reorder_buffers,
             scaling_driver,
             probe_counter,
-            _task_handles: task_handles,
+            connection_factory,
+            runtime_handle: runtime_handle.clone(),
+            task_handles,
             payload_tx,
             control_tx,
             failure_tx,
@@ -490,6 +557,54 @@ impl SharedPeerManager {
         self.pool.connection_count()
     }
 
+    /// Establish a replacement or additional connection and spawn its tasks.
+    #[allow(clippy::too_many_arguments)]
+    async fn reconnect_connection(
+        peer_node_id: &str,
+        connection_factory: Arc<dyn DynConnectionFactory>,
+        runtime_handle: tokio::runtime::Handle,
+        pool: Arc<PeerPool>,
+        writer_channels: Arc<TokioMutex<HashMap<usize, tokio_mpsc::Sender<Frame>>>>,
+        reg_state: Arc<TokioMutex<RegistrationState>>,
+        reorder_buffers: Arc<TokioMutex<HashMap<DataflowId, ReorderBuffer<Frame>>>>,
+        scaling_driver: Arc<ScalingDriver>,
+        failure_tx: tokio_mpsc::Sender<usize>,
+        task_handles: Arc<Mutex<Vec<tokio::task::JoinHandle<()>>>>,
+    ) -> Result<usize, Box<dyn std::error::Error + Send + Sync>> {
+        let (reader, writer) = connection_factory.establish_dyn(peer_node_id).await?;
+        let conn_metrics = pool.add_connection().ok_or_else(|| {
+            Box::<dyn std::error::Error + Send + Sync>::from(std::io::Error::other(
+                "peer pool is already at max live connections",
+            ))
+        })?;
+        let conn_id = conn_metrics.id;
+        let (tx, rx) = tokio_mpsc::channel::<Frame>(256);
+        writer_channels.lock().await.insert(conn_id, tx);
+
+        let writer_handle = runtime_handle.spawn(Self::writer_task(
+            conn_id,
+            writer,
+            rx,
+            Some(conn_metrics),
+            failure_tx.clone(),
+        ));
+        let reader_handle = runtime_handle.spawn(Self::reader_task(
+            conn_id,
+            reader,
+            reg_state,
+            reorder_buffers,
+            scaling_driver,
+            pool,
+            writer_channels,
+            failure_tx,
+        ));
+
+        let mut handles = task_handles.lock().expect("task handle lock poisoned");
+        handles.push(writer_handle);
+        handles.push(reader_handle);
+        Ok(conn_id)
+    }
+
     // -----------------------------------------------------------------------
     // Background tasks
     // -----------------------------------------------------------------------
@@ -569,13 +684,44 @@ impl SharedPeerManager {
                 result = payload_rx.recv(), if payload_open => {
                     match result {
                         Some((dataflow_id, mut frame)) => {
-                            // Assign sequence_id from the dataflow's counter
+                            // Verify dataflow is still registered before proceeding
+                            {
+                                let state = reg_state.lock().await;
+                                if !state.registered.contains_key(&dataflow_id) {
+                                    continue; // dataflow unregistered, drop frame
+                                }
+                            }
+
+                            // Select a live connection first — only assign a sequence
+                            // number AFTER confirming we can actually send. This prevents
+                            // sequence gaps in the reorder buffer when frames are dropped
+                            // due to no available connections (e.g., during reconnect).
+                            let mut exclude = HashSet::new();
+                            let first_conn = match pool.select_connection_excluding(&exclude) {
+                                Some(c) => {
+                                    c.enqueue();
+                                    c
+                                }
+                                None => {
+                                    // No live connections available — drop frame
+                                    // WITHOUT consuming a sequence number.
+                                    #[cfg(feature = "tracing")]
+                                    tracing::error!(
+                                        "No live connections for payload frame, dropping"
+                                    );
+                                    continue;
+                                }
+                            };
+
+                            // Now assign sequence_id — we know at least one connection
+                            // is available so this frame will be attempted.
                             let seq_id = {
                                 let state = reg_state.lock().await;
                                 if let Some(reg) = state.registered.get(&dataflow_id) {
                                     reg.sequence_counter.next_seq()
                                 } else {
-                                    continue; // dataflow unregistered, drop frame
+                                    first_conn.rollback_reservation();
+                                    continue; // dataflow unregistered between check and here
                                 }
                             };
 
@@ -585,24 +731,10 @@ impl SharedPeerManager {
                             sequenced_payload.extend_from_slice(&frame.payload);
                             frame.payload = sequenced_payload;
 
-                            // Select a live connection; retry on a different one if send fails
-                            let mut exclude = HashSet::new();
+                            // Try sending on the selected connection; retry on others if needed
                             let mut current_frame = frame;
+                            let mut conn = first_conn;
                             loop {
-                                let conn = match pool.select_connection_excluding(&exclude) {
-                                    Some(c) => {
-                                        c.enqueue();
-                                        c
-                                    }
-                                    None => {
-                                        // No live connections available
-                                        #[cfg(feature = "tracing")]
-                                        tracing::error!(
-                                            "No live connections for payload frame, dropping"
-                                        );
-                                        break;
-                                    }
-                                };
                                 let conn_id = conn.id;
 
                                 // Clone sender under lock, then release before await
@@ -624,7 +756,6 @@ impl SharedPeerManager {
                                                 tracing::warn!(
                                                     "Writer channel closed for conn {conn_id}, retrying"
                                                 );
-                                                continue;
                                             }
                                         }
                                     }
@@ -632,9 +763,27 @@ impl SharedPeerManager {
                                         // Writer channel already removed (monitor cleaned it up)
                                         conn.rollback_reservation();
                                         exclude.insert(conn_id);
-                                        continue;
                                     }
                                 }
+
+                                // Try the next connection
+                                conn = match pool.select_connection_excluding(&exclude) {
+                                    Some(c) => {
+                                        c.enqueue();
+                                        c
+                                    }
+                                    None => {
+                                        // Exhausted all connections after seq was assigned.
+                                        // The frame is lost — this creates a sequence gap,
+                                        // but it's unavoidable at this point since the seq
+                                        // was already committed.
+                                        #[cfg(feature = "tracing")]
+                                        tracing::error!(
+                                            "All connections exhausted after seq assignment, frame lost"
+                                        );
+                                        break;
+                                    }
+                                };
                             }
                         }
                         None => { payload_open = false; }
@@ -825,7 +974,7 @@ impl SharedPeerManager {
                 ProbeKind::Reply => {
                     // Process the reply — updates RTT on the connection
                     if let Some(conn) = pool.connection(conn_id) {
-                        scaling_driver.process_probe_reply(&probe, conn);
+                        scaling_driver.process_probe_reply(&probe, &conn);
                     }
                 }
                 ProbeKind::Request => {
@@ -886,27 +1035,147 @@ impl SharedPeerManager {
         }
     }
 
-    /// Handles scaling events (log only for v1; factory integration is future).
+    /// Handles scaling and failure-recovery events.
+    #[allow(clippy::too_many_arguments)]
     async fn scaling_event_handler(
         mut event_rx: tokio_mpsc::Receiver<ScalingEvent>,
-        _pool: Arc<PeerPool>,
+        peer_node_id: String,
+        connection_factory: Option<Arc<dyn DynConnectionFactory>>,
+        runtime_handle: tokio::runtime::Handle,
+        pool: Arc<PeerPool>,
+        writer_channels: Arc<TokioMutex<HashMap<usize, tokio_mpsc::Sender<Frame>>>>,
+        reg_state: Arc<TokioMutex<RegistrationState>>,
+        reorder_buffers: Arc<TokioMutex<HashMap<DataflowId, ReorderBuffer<Frame>>>>,
+        scaling_driver: Arc<ScalingDriver>,
+        failure_tx: tokio_mpsc::Sender<usize>,
+        task_handles: Arc<Mutex<Vec<tokio::task::JoinHandle<()>>>>,
     ) {
         while let Some(event) = event_rx.recv().await {
             match event {
                 ScalingEvent::ScaleUp => {
-                    #[cfg(feature = "tracing")]
-                    tracing::info!("Scaling event: ScaleUp requested");
-                    // Future: call ConnectionFactory to establish new connection
+                    let Some(factory) = connection_factory.clone() else {
+                        #[cfg(feature = "tracing")]
+                        tracing::debug!("ScaleUp ignored for {peer_node_id}: no connection factory");
+                        continue;
+                    };
+
+                    match Self::reconnect_connection(
+                        &peer_node_id,
+                        factory,
+                        runtime_handle.clone(),
+                        pool.clone(),
+                        writer_channels.clone(),
+                        reg_state.clone(),
+                        reorder_buffers.clone(),
+                        scaling_driver.clone(),
+                        failure_tx.clone(),
+                        task_handles.clone(),
+                    )
+                    .await
+                    {
+                        Ok(conn_id) => {
+                            #[cfg(feature = "tracing")]
+                            tracing::info!(
+                                "ScaleUp established new connection {conn_id} for peer {peer_node_id}"
+                            );
+                        }
+                        Err(error) => {
+                            #[cfg(feature = "tracing")]
+                            tracing::warn!(
+                                "ScaleUp failed for peer {peer_node_id}: {error}"
+                            );
+                        }
+                    }
                 }
                 ScalingEvent::ScaleDown { connection_id } => {
                     #[cfg(feature = "tracing")]
                     tracing::info!("Scaling event: ScaleDown conn {connection_id}");
-                    // Future: drain and remove connection
+                    {
+                        let mut wc = writer_channels.lock().await;
+                        wc.remove(&connection_id);
+                    }
+                    if let Some(metrics) = pool.connection(connection_id) {
+                        metrics.mark_dead();
+                    }
+                    let _ = pool.remove_connection(connection_id);
                 }
                 ScalingEvent::ConnectionFailed { connection_id } => {
-                    #[cfg(feature = "tracing")]
-                    tracing::warn!("Scaling event: ConnectionFailed conn {connection_id}");
-                    // Future: call ConnectionFactory to replace dead connection
+                    // Remove the dead connection from the pool to avoid
+                    // accumulating stale entries over time.
+                    let _ = pool.remove_connection(connection_id);
+
+                    let Some(factory) = connection_factory.clone() else {
+                        #[cfg(feature = "tracing")]
+                        tracing::warn!(
+                            "ConnectionFailed for {peer_node_id} conn {connection_id} without reconnect factory"
+                        );
+                        // No factory — notify dataflows if all connections are dead
+                        if pool.live_connection_count() == 0 {
+                            let state = reg_state.lock().await;
+                            for (_df_id, reg) in state.registered.iter() {
+                                let _ = reg.error_tx.try_send(TransportError::ConnectionClosed);
+                            }
+                        }
+                        continue;
+                    };
+
+                    // Exponential backoff reconnect: 100ms → 200ms → 400ms → 800ms → 1.6s
+                    // (up to 5 attempts). If the peer is temporarily unavailable,
+                    // this gives ~3s total window for recovery.
+                    let max_attempts = 5u32;
+                    let mut delay = Duration::from_millis(100);
+                    let mut recovered = false;
+                    for attempt in 1..=max_attempts {
+                        match Self::reconnect_connection(
+                            &peer_node_id,
+                            factory.clone(),
+                            runtime_handle.clone(),
+                            pool.clone(),
+                            writer_channels.clone(),
+                            reg_state.clone(),
+                            reorder_buffers.clone(),
+                            scaling_driver.clone(),
+                            failure_tx.clone(),
+                            task_handles.clone(),
+                        )
+                        .await
+                        {
+                            Ok(new_conn_id) => {
+                                recovered = true;
+                                #[cfg(feature = "tracing")]
+                                tracing::info!(
+                                    "Recovered peer {peer_node_id} after conn {connection_id} failed; new conn {new_conn_id}"
+                                );
+                                break;
+                            }
+                            Err(error) => {
+                                #[cfg(feature = "tracing")]
+                                tracing::warn!(
+                                    "Reconnect attempt {attempt}/{max_attempts} failed for peer {peer_node_id} after conn {connection_id} failed: {error}"
+                                );
+                                if attempt < max_attempts {
+                                    tokio::time::sleep(delay).await;
+                                    delay = std::cmp::min(
+                                        delay.saturating_mul(2),
+                                        Duration::from_secs(5),
+                                    );
+                                }
+                            }
+                        }
+                    }
+
+                    // Only notify dataflows after all reconnect attempts are
+                    // exhausted AND there are still no live connections.
+                    if !recovered && pool.live_connection_count() == 0 {
+                        #[cfg(feature = "tracing")]
+                        tracing::error!(
+                            "Failed to recover peer {peer_node_id} after conn {connection_id} failed — notifying dataflows"
+                        );
+                        let state = reg_state.lock().await;
+                        for (_df_id, reg) in state.registered.iter() {
+                            let _ = reg.error_tx.try_send(TransportError::ConnectionClosed);
+                        }
+                    }
                 }
             }
         }
@@ -918,17 +1187,16 @@ impl SharedPeerManager {
     /// Deduplicates notifications (both writer and reader may report the same
     /// connection) — only processes each connection_id once.
     ///
-    /// When all connections are dead, notifies all registered dataflows with
-    /// a `TransportError::ConnectionClosed` error.
+    /// Does NOT immediately notify dataflows when all connections die — the
+    /// `scaling_event_handler` attempts reconnect first and only surfaces
+    /// `TransportError::ConnectionClosed` after reconnect is exhausted.
     async fn connection_monitor(
         mut failure_rx: tokio_mpsc::Receiver<usize>,
         pool: Arc<PeerPool>,
         writer_channels: Arc<TokioMutex<HashMap<usize, tokio_mpsc::Sender<Frame>>>>,
         scaling_driver: Arc<ScalingDriver>,
-        reg_state: Arc<TokioMutex<RegistrationState>>,
     ) {
         let mut processed = HashSet::new();
-        let mut all_failed_notified = false;
         while let Some(conn_id) = failure_rx.recv().await {
             if !processed.insert(conn_id) {
                 continue; // Already handled this connection
@@ -948,29 +1216,13 @@ impl SharedPeerManager {
                 wc.remove(&conn_id);
             }
 
-            // Emit scaling event for external handling
+            // Emit scaling event — the scaling_event_handler will attempt
+            // reconnect and notify dataflows only if recovery fails.
             scaling_driver
                 .emit_event(ScalingEvent::ConnectionFailed {
                     connection_id: conn_id,
                 })
                 .await;
-
-            // Reset notification flag if connections were re-established
-            if live_count > 0 && all_failed_notified {
-                all_failed_notified = false;
-            }
-
-            // If all connections are dead, notify all registered dataflows
-            if live_count == 0 && !all_failed_notified {
-                all_failed_notified = true;
-                #[cfg(feature = "tracing")]
-                tracing::error!("All connections to peer are dead — notifying dataflows");
-
-                let state = reg_state.lock().await;
-                for (_df_id, reg) in state.registered.iter() {
-                    let _ = reg.error_tx.try_send(TransportError::ConnectionClosed);
-                }
-            }
         }
     }
 
@@ -1213,11 +1465,67 @@ pub async fn check_reorder_timeouts(
 mod tests {
     use super::super::shared_pool::ScalingDecision;
     use super::*;
-    use tokio::io::{DuplexStream, duplex};
+    use tokio::io::{
+        AsyncReadExt, AsyncWriteExt, DuplexStream, ReadHalf, WriteHalf, duplex,
+    };
+    use tokio::task::JoinHandle;
 
     /// Helper: create N duplex connection pairs (read, write) for each side.
     fn make_connections(n: usize) -> Vec<(DuplexStream, DuplexStream)> {
         (0..n).map(|_| duplex(8192)).collect()
+    }
+
+    fn make_echo_connection() -> (ReadHalf<DuplexStream>, WriteHalf<DuplexStream>, JoinHandle<()>) {
+        let (manager_stream, remote_stream) = duplex(65536);
+        let (manager_read, manager_write) = tokio::io::split(manager_stream);
+        let (mut remote_read, mut remote_write) = tokio::io::split(remote_stream);
+        let handle = tokio::spawn(async move {
+            let mut buf = vec![0u8; 64 * 1024];
+            loop {
+                match remote_read.read(&mut buf).await {
+                    Ok(0) => break,
+                    Ok(n) => {
+                        if remote_write.write_all(&buf[..n]).await.is_err() {
+                            break;
+                        }
+                    }
+                    Err(_) => break,
+                }
+            }
+        });
+        (manager_read, manager_write, handle)
+    }
+
+    #[derive(Default)]
+    struct EchoConnectionFactory {
+        remote_tasks: Mutex<Vec<JoinHandle<()>>>,
+    }
+
+    impl EchoConnectionFactory {
+        fn abort_all(&self) {
+            if let Ok(handles) = self.remote_tasks.lock() {
+                for handle in handles.iter() {
+                    handle.abort();
+                }
+            }
+        }
+    }
+
+    impl ConnectionFactory for EchoConnectionFactory {
+        type Reader = ReadHalf<DuplexStream>;
+        type Writer = WriteHalf<DuplexStream>;
+
+        async fn establish(
+            &self,
+            _peer_node_id: &str,
+        ) -> Result<(Self::Reader, Self::Writer), Box<dyn std::error::Error + Send + Sync>> {
+            let (reader, writer, remote_task) = make_echo_connection();
+            self.remote_tasks
+                .lock()
+                .expect("echo factory task lock poisoned")
+                .push(remote_task);
+            Ok((reader, writer))
+        }
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -1229,7 +1537,7 @@ mod tests {
         let connections: Vec<_> = readers.into_iter().zip(writers).collect();
 
         let rt = tokio::runtime::Handle::current();
-        let manager = SharedPeerManager::new("peer-1".to_string(), config, connections, &rt);
+        let manager = SharedPeerManager::new("peer-1".to_string(), config, connections, None, &rt);
 
         assert_eq!(manager.peer_node_id(), "peer-1");
         assert_eq!(manager.connection_count(), 2);
@@ -1242,7 +1550,7 @@ mod tests {
 
         let config = SharedConnectionConfig::default();
         let rt = tokio::runtime::Handle::current();
-        let manager = SharedPeerManager::new("peer-1".to_string(), config, connections, &rt);
+        let manager = SharedPeerManager::new("peer-1".to_string(), config, connections, None, &rt);
 
         let df_id = DataflowId::new();
         let channel_ids = vec![1, 2, 3];
@@ -1280,7 +1588,7 @@ mod tests {
         let mut managers = HashMap::new();
         managers.insert(
             "peer-1".to_string(),
-            SharedPeerManager::new("peer-1".to_string(), config, connections, &rt),
+            SharedPeerManager::new("peer-1".to_string(), config, connections, None, &rt),
         );
 
         let df_id = DataflowId::new();
@@ -1341,7 +1649,7 @@ mod tests {
         // Manager writes via mgr_write; test reads from test_stream
         let connections = vec![(mgr_read, mgr_write)];
         let manager =
-            SharedPeerManager::new("peer-1".to_string(), config.clone(), connections, &rt);
+            SharedPeerManager::new("peer-1".to_string(), config.clone(), connections, None, &rt);
 
         let df_id = DataflowId::new();
         let _receivers = manager.register_dataflow(df_id, &[1], 16).await;
@@ -1384,7 +1692,7 @@ mod tests {
         let rt = tokio::runtime::Handle::current();
 
         let connections = vec![(mgr_read, mgr_write)];
-        let manager = SharedPeerManager::new("peer-1".to_string(), config, connections, &rt);
+        let manager = SharedPeerManager::new("peer-1".to_string(), config, connections, None, &rt);
 
         let df_id = DataflowId::new();
         let _receivers = manager.register_dataflow(df_id, &[1, 2], 16).await;
@@ -1421,7 +1729,7 @@ mod tests {
 
         let config = SharedConnectionConfig::default();
         let rt = tokio::runtime::Handle::current();
-        let manager = SharedPeerManager::new("test-peer".into(), config, connections, &rt);
+        let manager = SharedPeerManager::new("test-peer".into(), config, connections, None, &rt);
 
         let df_id = DataflowId::new();
         let wrong_id = DataflowId::new();
@@ -1456,7 +1764,7 @@ mod tests {
         let config = SharedConnectionConfig::default();
         let rt = tokio::runtime::Handle::current();
         let manager =
-            SharedPeerManager::new("test-peer".into(), config, vec![(mgr_read, mgr_write)], &rt);
+            SharedPeerManager::new("test-peer".into(), config, vec![(mgr_read, mgr_write)], None, &rt);
 
         // Send a probe request FROM the test side TO the manager's reader
         let probe_req = ProbeMessage::new_request(42, 1000);
@@ -1501,7 +1809,7 @@ mod tests {
         let config = SharedConnectionConfig::default();
         let rt = tokio::runtime::Handle::current();
         let manager =
-            SharedPeerManager::new("test-peer".into(), config, vec![(mgr_read, mgr_write)], &rt);
+            SharedPeerManager::new("test-peer".into(), config, vec![(mgr_read, mgr_write)], None, &rt);
 
         let df_id = DataflowId::new();
         let (mut receivers, _error_rx) = manager.register_dataflow(df_id, &[1], 16).await;
@@ -1549,7 +1857,7 @@ mod tests {
         };
 
         let rt = tokio::runtime::Handle::current();
-        let manager = SharedPeerManager::new("peer-fail".into(), config, connections, &rt);
+        let manager = SharedPeerManager::new("peer-fail".into(), config, connections, None, &rt);
 
         // Drop the remote side to cause write failures
         drop(server_read);
@@ -1581,7 +1889,7 @@ mod tests {
         };
 
         let rt = tokio::runtime::Handle::current();
-        let manager = SharedPeerManager::new("peer-monitor".into(), config, connections, &rt);
+        let manager = SharedPeerManager::new("peer-monitor".into(), config, connections, None, &rt);
 
         // Drop remote sides
         drop(_server_write);
@@ -1613,7 +1921,7 @@ mod tests {
         };
 
         let rt = tokio::runtime::Handle::current();
-        let manager = SharedPeerManager::new("peer-notify".into(), config, connections, &rt);
+        let manager = SharedPeerManager::new("peer-notify".into(), config, connections, None, &rt);
 
         // Register a dataflow
         let df_id = DataflowId::new();
@@ -1667,12 +1975,14 @@ mod tests {
             "node-b".to_string(), // A's peer is B
             config.clone(),
             a_connections,
+            None,
             rt,
         );
         let manager_b = SharedPeerManager::new(
             "node-a".to_string(), // B's peer is A
             config,
             b_connections,
+            None,
             rt,
         );
 
@@ -1766,11 +2076,11 @@ mod tests {
         // Manager A: connection 0 uses (a_from_b_1, a_to_b_1), connection 1 uses (a_from_b_2, a_to_b_2)
         let a_connections = vec![(a_from_b_1, a_to_b_1), (a_from_b_2, a_to_b_2)];
         let manager_a =
-            SharedPeerManager::new("node-b".to_string(), config.clone(), a_connections, &rt);
+            SharedPeerManager::new("node-b".to_string(), config.clone(), a_connections, None, &rt);
 
         // Manager B: connection 0 uses (b_from_a_1, b_to_a_1), connection 1 uses (b_from_a_2, b_to_a_2)
         let b_connections = vec![(b_from_a_1, b_to_a_1), (b_from_a_2, b_to_a_2)];
-        let manager_b = SharedPeerManager::new("node-a".to_string(), config, b_connections, &rt);
+        let manager_b = SharedPeerManager::new("node-a".to_string(), config, b_connections, None, &rt);
 
         let df_id = DataflowId::new();
         let _reg_a = manager_a.register_dataflow(df_id, &[1], 64).await;
@@ -1849,6 +2159,67 @@ mod tests {
         drop(manager_b);
     }
 
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn failed_connection_is_reconnected() {
+        let config = SharedConnectionConfig {
+            min_connections: 2,
+            max_connections: 2,
+            probe_interval: Duration::from_secs(999),
+            ..Default::default()
+        };
+        let factory = Arc::new(EchoConnectionFactory::default());
+        let reconnect_factory: Arc<dyn DynConnectionFactory> = factory.clone();
+        let (reader_a, writer_a, remote_a) = make_echo_connection();
+        let (reader_b, writer_b, remote_b) = make_echo_connection();
+        let rt = tokio::runtime::Handle::current();
+        let manager = SharedPeerManager::new(
+            "peer-reconnect".into(),
+            config,
+            vec![(reader_a, writer_a), (reader_b, writer_b)],
+            Some(reconnect_factory),
+            &rt,
+        );
+
+        let df_id = DataflowId::new();
+        let (mut receivers, _error_rx) = manager.register_dataflow(df_id, &[1], 64).await;
+        let data_rx = receivers.get_mut(&1).unwrap();
+
+        remote_a.abort();
+
+        tokio::time::timeout(Duration::from_secs(3), async {
+            loop {
+                let writer_ids: Vec<_> = {
+                    let wc = manager.writer_channels.lock().await;
+                    wc.keys().copied().collect()
+                };
+                if writer_ids.len() == 2 && writer_ids.iter().any(|conn_id| *conn_id >= 2) {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("timed out waiting for reconnect");
+
+        let frame = Frame {
+            dataflow_id: df_id,
+            channel_id: 1,
+            payload: b"reconnected".to_vec(),
+        };
+        manager.payload_sender().send((df_id, frame)).await.unwrap();
+
+        let payload = tokio::time::timeout(Duration::from_secs(2), data_rx.recv())
+            .await
+            .expect("timed out waiting for echoed payload")
+            .expect("channel closed unexpectedly");
+        assert_eq!(payload, b"reconnected".to_vec());
+        assert_eq!(manager.pool.live_connection_count(), 2);
+
+        remote_b.abort();
+        factory.abort_all();
+        drop(manager);
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn high_rtt_triggers_scale_up_event() {
         // Verify that when RTT exceeds threshold, ScaleUp event is generated
@@ -1892,12 +2263,14 @@ mod tests {
             "peer-1".to_string(),
             config.clone(),
             vec![(stream_1a, stream_1b)],
+            None,
             &rt,
         );
         let mgr2 = SharedPeerManager::new(
             "peer-2".to_string(),
             config,
             vec![(stream_2a, stream_2b)],
+            None,
             &rt,
         );
 
@@ -1930,3 +2303,4 @@ mod tests {
         drop(managers);
     }
 }
+

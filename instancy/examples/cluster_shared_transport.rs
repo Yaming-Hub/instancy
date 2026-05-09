@@ -69,7 +69,7 @@ async fn main() {
     }
 
     // Create shared peer manager for node-a → node-b
-    let manager = SharedPeerManager::new("node-b".to_string(), config, connections, &handle);
+    let manager = SharedPeerManager::new("node-b".to_string(), config, connections, None, &handle);
 
     println!(
         "Created SharedPeerManager with {} connections to node-b\n",
@@ -210,3 +210,4 @@ async fn main() {
 
     println!("\n=== done ===");
 }
+
