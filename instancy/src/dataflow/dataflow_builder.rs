@@ -4186,20 +4186,18 @@ impl<T: Timestamp, D: Clone + Send + 'static> Pipe<T, D> {
         let stage_id = StageId::new(0);
         // Capture the tokio handle at builder time. This requires that the caller
         // is within a tokio runtime context (e.g., inside #[tokio::main] or an async task).
-        // If no runtime is available, fall back to trying at factory build time.
-        let tokio_handle = tokio::runtime::Handle::try_current()
-            .unwrap_or_else(|_| {
-                // Deferred: will be resolved at factory build time (during spawn).
-                // This path is hit when building outside tokio context.
-                // We store a dummy handle that will be overwritten.
-                panic!(
-                    "unary_async requires a tokio runtime context. \
-                     Call from within #[tokio::main], #[tokio::test], or similar."
-                )
-            });
+        let tokio_handle = tokio::runtime::Handle::try_current();
 
         {
             let mut state = self.state.borrow_mut();
+
+            if let Err(ref e) = tokio_handle {
+                state.builder_errors.push(Error::Custom(format!(
+                    "unary_async requires a tokio runtime context: {e}. \
+                     Call from within #[tokio::main], #[tokio::test], or similar."
+                )));
+            }
+
             op_idx = state.allocate_operator_index();
 
             // Register in graph (1 input, 1 output)
@@ -4256,6 +4254,13 @@ impl<T: Timestamp, D: Clone + Send + 'static> Pipe<T, D> {
                         tee_or_single(pushers).unwrap_or_else(|| Box::new(NullPush))
                     };
 
+                    // tokio_handle is Ok if we had a runtime context at build time.
+                    // If Err, build() will have returned the error before this factory
+                    // runs. We use `?` as defense-in-depth to avoid panicking even in
+                    // edge cases (e.g., if a future refactor changes the error-check order).
+                    let handle = tokio_handle.map_err(|e| Error::Custom(format!(
+                        "tokio runtime context missing at factory invocation: {e}"
+                    )))?;
                     Ok(Box::new(WiredUnaryAsyncOperator::new(
                         name_clone,
                         op_idx,
@@ -4264,7 +4269,7 @@ impl<T: Timestamp, D: Clone + Send + 'static> Pipe<T, D> {
                         max_concurrency,
                         input_puller,
                         output_pusher,
-                        tokio_handle,
+                        handle,
                     )) as Box<dyn SchedulableOperator>)
                 });
             state.operator_factories.push((op_idx, factory));
