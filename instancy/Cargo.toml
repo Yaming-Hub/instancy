@@ -29,6 +29,7 @@ crc32fast = { version = "1.5.0", optional = true }
 
 [dev-dependencies]
 serde = { version = "1", features = ["derive"] }
+serde_json = "1"
 timely = { version = "0.12", features = ["bincode"] }
 tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros", "time", "io-util", "sync", "net"] }
 tokio-util = "0.7"
@@ -65,6 +66,9 @@ required-features = ["transport"]
 [[example]]
 name = "cluster_shared_transport"
 required-features = ["transport"]
+
+[[example]]
+name = "stress_test"
 
 [dev-dependencies.criterion]
 version = "0.5"

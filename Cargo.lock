@@ -647,6 +647,7 @@ dependencies = [
  "crossbeam-deque",
  "crossbeam-utils",
  "serde",
+ "serde_json",
  "thiserror",
  "timely",
  "tokio",
