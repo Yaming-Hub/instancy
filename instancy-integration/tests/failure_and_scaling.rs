@@ -129,10 +129,13 @@ async fn test_node_crash_before_data() {
 
     coord.kill_node("node-b").await;
     coord.close_all_inputs("df-node-crash-before-data").await;
-    coord
+    let result = coord
         .wait_for_completion_tolerant("df-node-crash-before-data")
         .await
         .expect("tolerant completion wait should return even if a node is gone");
+    // PassThrough has no exchange, so node-a should complete successfully
+    // regardless of node-b being killed.
+    assert!(result, "surviving node should complete a no-exchange dataflow");
 
     coord.shutdown().await;
 }

@@ -563,11 +563,14 @@ impl TestCoordinator {
     /// Kill a specific node process (simulates node crash).
     /// Removes the process and connection, so subsequent commands to this node will fail.
     pub async fn kill_node(&mut self, node_id: &str) {
+        // Drop the connection first (flushes/closes the TCP stream)
+        if let Some(conn) = self.connections.remove(node_id) {
+            drop(conn);
+        }
         if let Some(mut child) = self.processes.remove(node_id) {
             let _ = child.start_kill();
             let _ = child.wait().await;
         }
-        self.connections.remove(node_id);
     }
 
     /// Wait for dataflow completion, tolerating errors from crashed/failed nodes.
@@ -604,7 +607,23 @@ impl TestCoordinator {
                         "unexpected WaitForCompletion response from {node_id}: {other:?}"
                     ));
                 }
-                Ok(Err(_)) | Err(_) => {
+                Ok(Err(e)) => {
+                    // I/O error, EOF, or missing connection — expected when a node has crashed.
+                    // Only propagate as Err for genuine protocol violations (e.g., receiving a
+                    // Command message instead of a Response).
+                    if e.contains("closed connection")
+                        || e.contains("no connection")
+                        || e.contains("failed to read")
+                    {
+                        all_success = false;
+                    } else {
+                        return Err(format!(
+                            "protocol error from {node_id}: {e}"
+                        ));
+                    }
+                }
+                Err(_) => {
+                    // Timeout — node is likely dead or hung
                     all_success = false;
                 }
             }
