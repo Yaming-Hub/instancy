@@ -393,9 +393,9 @@ impl DataflowAgent {
                 df_id,
                 ClusterSpawnTransport::dedicated(connections, 64),
                 Duration::from_secs(15),
-                move |worker_idx, builder| {
+                move |builder| {
                     let (_inputs, _output) =
-                        dataflows::build_dataflow(dataflow_type, worker_idx, builder)?;
+                        dataflows::build_dataflow(dataflow_type, builder)?;
                     Ok(())
                 },
                 &tokio_handle,

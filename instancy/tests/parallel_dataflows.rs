@@ -149,7 +149,7 @@ async fn shared_pool_parallel_dataflows_with_exchange() {
             .spawn_multi(
                 &format!("ex-df-{i}"),
                 num_workers,
-                |_worker_idx, builder| {
+                |builder| {
                     let input = builder.input::<i64>("data");
                     // Use exchange_by_hash for deterministic routing: hash % num_workers.
                     let exchanged = input.exchange_by_hash("by_val", |x: &i64| *x as u64);
@@ -390,7 +390,7 @@ async fn shared_transport_parallel_cluster_dataflows() {
         let (conn_a, conn_b) = make_tcp_pair().await;
         let dataflow_id = DataflowId::new();
 
-        let build = |_worker_idx: usize, builder: &mut DataflowBuilder<u64>| -> Result<()> {
+        let build = |builder: &mut DataflowBuilder<u64>| -> Result<()> {
             let input = builder.input::<i64>("data");
             // Use exchange_by_hash for deterministic routing: hash % num_nodes.
             let exchanged = input.exchange_by_hash("by_val", |x: &i64| *x as u64);
@@ -568,7 +568,7 @@ async fn stress_parallel_cluster_dataflows() {
         let (conn_a, conn_b) = make_tcp_pair().await;
         let dataflow_id = DataflowId::new();
 
-        let build = |_worker_idx: usize, builder: &mut DataflowBuilder<u64>| -> Result<()> {
+        let build = |builder: &mut DataflowBuilder<u64>| -> Result<()> {
             let input = builder.input::<i64>("data");
             let exchanged = input.exchange_by_hash("by_val", |x: &i64| *x as u64);
             exchanged.map("pass", |_t, x| x).output("results");

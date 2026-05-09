@@ -63,7 +63,7 @@ fn main() {
         .spawn_multi(
             "stage-par-demo",
             num_workers,
-            |_worker_idx, builder: &mut DataflowBuilder<u64>| {
+            |builder: &mut DataflowBuilder<u64>| {
                 let input = builder.input::<i32>("numbers");
 
                 // Stage 0: transform pipeline (all fused into one task)
@@ -143,7 +143,7 @@ fn main() {
     let result = rt.spawn_multi(
         "stage-par-mismatch",
         num_workers,
-        |_worker_idx, builder: &mut DataflowBuilder<u64>| {
+        |builder: &mut DataflowBuilder<u64>| {
             let input = builder.input::<i32>("data");
             input
                 .map("inc", |_t, x| x + 1)
@@ -175,7 +175,7 @@ fn main() {
         .spawn_multi(
             "single-stage",
             num_workers,
-            |_worker_idx, builder: &mut DataflowBuilder<u64>| {
+            |builder: &mut DataflowBuilder<u64>| {
                 let input = builder.input::<i32>("vals");
                 // All operators stay in the same stage (pipeline edges only).
                 input

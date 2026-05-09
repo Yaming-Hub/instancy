@@ -40,7 +40,7 @@ fn make_duplex_pair(
     (conn_a, conn_b)
 }
 
-fn build_dataflow(_worker_idx: usize, builder: &mut DataflowBuilder<u64>) -> Result<()> {
+fn build_dataflow(builder: &mut DataflowBuilder<u64>) -> Result<()> {
     builder
         .input::<i32>("data")
         .exchange_by_hash("route", |x: &i32| *x as u64)

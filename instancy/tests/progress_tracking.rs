@@ -236,7 +236,7 @@ fn multi_worker_frontier_coordination() {
         .spawn_multi(
             "exchange-frontier-coordination",
             2,
-            |_worker_idx, builder| {
+            |builder| {
                 let input = builder.input::<i32>("data");
                 input
                     .exchange_by_hash("distribute", |value: &i32| *value as u64)

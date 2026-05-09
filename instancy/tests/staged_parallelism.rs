@@ -28,7 +28,7 @@ fn staged_fan_out() {
         .spawn_multi(
             "fan-out",
             1, // default parallelism = 1
-            |_worker_idx, builder: &mut DataflowBuilder<u64>| {
+            |builder: &mut DataflowBuilder<u64>| {
                 let input = builder.input::<i32>("data");
                 // Stage 0 (par=1): source → exchange_to(4) boundary
                 // Stage 1 (par=4): process in parallel
@@ -62,7 +62,7 @@ fn staged_fan_in() {
         .spawn_multi(
             "fan-in",
             4, // default parallelism = 4
-            |_worker_idx, builder: &mut DataflowBuilder<u64>| {
+            |builder: &mut DataflowBuilder<u64>| {
                 let input = builder.input::<i32>("data");
                 // Stage 0 (par=4): parallel processing
                 // → gather() → Stage 1 (par=1): single aggregator
@@ -103,7 +103,7 @@ fn staged_fan_out_fan_in() {
         .spawn_multi(
             "fan-out-fan-in",
             1, // default = 1 worker
-            |_worker_idx, builder: &mut DataflowBuilder<u64>| {
+            |builder: &mut DataflowBuilder<u64>| {
                 let input = builder.input::<i32>("data");
                 input
                     .exchange_to("scatter", 4, |v: &i32| *v as u64)
@@ -135,7 +135,7 @@ fn staged_uniform_parallelism_fallback() {
         .spawn_multi(
             "uniform",
             2, // all stages default to 2
-            |_worker_idx, builder: &mut DataflowBuilder<u64>| {
+            |builder: &mut DataflowBuilder<u64>| {
                 let input = builder.input::<i32>("data");
                 input
                     .exchange("repartition", |v: &i32| *v as u64)
@@ -166,7 +166,7 @@ fn staged_increasing_parallelism() {
         .spawn_multi(
             "increasing",
             1, // stage 0: 1 worker
-            |_worker_idx, builder: &mut DataflowBuilder<u64>| {
+            |builder: &mut DataflowBuilder<u64>| {
                 let input = builder.input::<i32>("data");
                 input
                     .exchange_to("first-expand", 2, |v: &i32| *v as u64)
@@ -194,7 +194,7 @@ fn staged_zero_parallelism_rejected() {
     let result = rt.spawn_multi(
         "zero",
         0,
-        |_worker_idx, builder: &mut DataflowBuilder<u64>| {
+        |builder: &mut DataflowBuilder<u64>| {
             builder.input::<i32>("data").for_each("sink", |_t, _v| {});
             Ok(())
         },

@@ -27,7 +27,6 @@ pub fn port_names(dataflow_type: DataflowType) -> (Vec<String>, String) {
 /// Returns `(input_port_names, output_port_name)`.
 pub fn build_dataflow(
     dataflow_type: DataflowType,
-    worker_idx: usize,
     builder: &mut DataflowBuilder<u64>,
 ) -> Result<(Vec<String>, String)> {
     match dataflow_type {
@@ -36,7 +35,7 @@ pub fn build_dataflow(
         DataflowType::MultiEpochExchange => build_multi_epoch_exchange(builder),
         DataflowType::DistributedWordCount => build_distributed_word_count(builder),
         DataflowType::IterativeFilter => build_iterative_filter(builder),
-        DataflowType::DistributedJoin => build_distributed_join(worker_idx, builder),
+        DataflowType::DistributedJoin => build_distributed_join(builder),
     }
 }
 
@@ -150,7 +149,6 @@ fn build_iterative_filter(builder: &mut DataflowBuilder<u64>) -> Result<(Vec<Str
 
 /// DistributedJoin: two inputs → exchange both → binary join on key → output.
 fn build_distributed_join(
-    _worker_idx: usize,
     builder: &mut DataflowBuilder<u64>,
 ) -> Result<(Vec<String>, String)> {
     let left_input = builder.input::<(u64, String)>("left");

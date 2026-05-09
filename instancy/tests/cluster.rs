@@ -70,7 +70,7 @@ async fn cluster_two_nodes_no_exchange() {
 
     let tokio_handle = tokio::runtime::Handle::current();
 
-    let build = |_worker_idx: usize, builder: &mut DataflowBuilder<u64>| -> Result<()> {
+    let build = |builder: &mut DataflowBuilder<u64>| -> Result<()> {
         let input = builder.input::<i32>("data");
         input.map("double", |_t, x| x * 2).output("results");
         Ok(())
@@ -182,7 +182,7 @@ async fn cluster_two_nodes_with_exchange() {
 
     let tokio_handle = tokio::runtime::Handle::current();
 
-    let build = |_worker_idx: usize, builder: &mut DataflowBuilder<u64>| -> Result<()> {
+    let build = |builder: &mut DataflowBuilder<u64>| -> Result<()> {
         let input = builder.input::<i64>("data");
         // Exchange by value — each record goes to worker (value % num_workers).
         let exchanged = input.exchange("by_val", |x: &i64| *x as u64);
@@ -289,7 +289,7 @@ async fn cluster_fingerprint_mismatch() {
     let tokio_handle = tokio::runtime::Handle::current();
 
     // Node A: input → map → output (2 operators + source)
-    let build_a = |_: usize, builder: &mut DataflowBuilder<u64>| -> Result<()> {
+    let build_a = |builder: &mut DataflowBuilder<u64>| -> Result<()> {
         builder
             .input::<i32>("data")
             .map("double", |_t, x| x * 2)
@@ -298,7 +298,7 @@ async fn cluster_fingerprint_mismatch() {
     };
 
     // Node B: input → output (1 operator + source) — different graph!
-    let build_b = |_: usize, builder: &mut DataflowBuilder<u64>| -> Result<()> {
+    let build_b = |builder: &mut DataflowBuilder<u64>| -> Result<()> {
         builder.input::<i32>("data").output("results");
         Ok(())
     };
@@ -387,7 +387,7 @@ async fn cluster_missing_connection() {
         DataflowId::new(),
         ClusterSpawnTransport::dedicated(vec![conn_a], 1024),
         Duration::from_secs(1),
-        |_, builder: &mut DataflowBuilder<u64>| {
+        |builder: &mut DataflowBuilder<u64>| {
             builder.input::<i32>("data").output("out");
             Ok(())
         },
