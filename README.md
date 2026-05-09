@@ -467,7 +467,7 @@ instancy/
 │   ├── runtime.rs                # RuntimeHandle, SpawnOptions, spawn_cluster
 │   ├── error.rs                  # Error enum and Result type
 │   ├── cancellation.rs           # CancellationToken and CancellationReason
-│   ├── metrics.rs                # Per-operator metrics collection
+│   ├── metrics/                   # Per-operator metrics collection
 │   ├── worker.rs                 # WorkerId and OperatorActivation
 │   ├── order.rs                  # Timestamp types (Product for nested scopes)
 │   ├── wire.rs                   # Safe byte-parsing helpers
