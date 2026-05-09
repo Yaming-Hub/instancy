@@ -442,7 +442,7 @@ fn spawn_dataflow_fan_out_fan_in() {
 
 /// Verify spawn_dataflow forces auto_parallelism even if the user doesn't set it.
 #[test]
-fn spawn_dataflow_ignores_num_workers() {
+fn spawn_dataflow_forces_auto_parallelism() {
     let rt = test_runtime();
 
     // The user doesn't set auto_parallelism or per_stage_parallelism —

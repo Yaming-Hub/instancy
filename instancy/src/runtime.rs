@@ -1213,9 +1213,9 @@ impl RuntimeHandle {
     ///   [`rebalance_to`](crate::dataflow::Pipe::rebalance_to)).
     /// - Stages without explicit parallelism inherit stage 0's count.
     ///
-    /// The closure is called once to probe the graph structure, then once per
-    /// worker to build replicated copies. It should be free of one-time side
-    /// effects.
+    /// The closure may be called multiple times: once to probe the graph
+    /// structure, then once per worker to build replicated copies. It should
+    /// be free of one-time side effects.
     ///
     /// # Example
     ///
