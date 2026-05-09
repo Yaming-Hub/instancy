@@ -28,6 +28,7 @@ use crate::communication::codec::{Codec, CodecError};
 use crate::communication::connection::PeerId;
 use crate::execute::ClusterTopology;
 use crate::progress::timestamp::Timestamp;
+use crate::wire;
 use crate::worker::WorkerId;
 
 /// A unique identifier for a logical channel on the wire.
@@ -104,11 +105,12 @@ impl RoutingTable {
         local_node_id: impl Into<String>,
         base_channel_id: ChannelId,
         peer_map: &HashMap<String, PeerId>,
-    ) -> Self {
-        assert!(
-            base_channel_id > PROGRESS_CHANNEL_ID,
-            "base_channel_id must be > 0 (channel 0 is reserved for progress)"
-        );
+    ) -> crate::Result<Self> {
+        if base_channel_id == PROGRESS_CHANNEL_ID {
+            return Err(crate::Error::InvalidConfig(
+                "base_channel_id must be > 0 (channel 0 is reserved for progress)".into(),
+            ));
+        }
 
         let local_node_id = local_node_id.into();
         let mut remote_targets = HashMap::new();
@@ -132,11 +134,11 @@ impl RoutingTable {
             }
         }
 
-        Self {
+        Ok(Self {
             local_node_id,
             remote_targets,
             total_workers: topology.total_workers(),
-        }
+        })
     }
 
     /// Check if a target worker is remote (on a different physical node).
@@ -256,11 +258,8 @@ where
         });
     }
 
-    let source_worker = u32::from_le_bytes(
-        bytes[0..4]
-            .try_into()
-            .expect("source worker prefix is 4 bytes"),
-    ) as usize;
+    let source_worker =
+        wire::read_u32(bytes, 0).map_err(|e| CodecError::InvalidData(e.to_string()))? as usize;
     let mut offset = 4;
 
     // Decode timestamp
@@ -270,11 +269,8 @@ where
             available: bytes.len(),
         });
     }
-    let time_len = u32::from_le_bytes(
-        bytes[offset..offset + 4]
-            .try_into()
-            .expect("timestamp length prefix is 4 bytes"),
-    ) as usize;
+    let time_len =
+        wire::read_u32(bytes, offset).map_err(|e| CodecError::InvalidData(e.to_string()))? as usize;
     offset += 4;
 
     if offset + time_len > bytes.len() {
@@ -298,11 +294,8 @@ where
             available: bytes.len(),
         });
     }
-    let num_records = u32::from_le_bytes(
-        bytes[offset..offset + 4]
-            .try_into()
-            .expect("record count prefix is 4 bytes"),
-    ) as usize;
+    let num_records =
+        wire::read_u32(bytes, offset).map_err(|e| CodecError::InvalidData(e.to_string()))? as usize;
     offset += 4;
 
     // Cap pre-allocation to prevent DoS from malicious count.
@@ -317,11 +310,8 @@ where
                 available: bytes.len(),
             });
         }
-        let rec_len = u32::from_le_bytes(
-            bytes[offset..offset + 4]
-                .try_into()
-                .expect("record length prefix is 4 bytes"),
-        ) as usize;
+        let rec_len = wire::read_u32(bytes, offset)
+            .map_err(|e| CodecError::InvalidData(e.to_string()))? as usize;
         offset += 4;
 
         if offset + rec_len > bytes.len() {
@@ -423,11 +413,8 @@ where
     }
 
     // Read source_node_id (length-prefixed string)
-    let node_len = u32::from_le_bytes(
-        bytes[0..4]
-            .try_into()
-            .expect("node ID length prefix is 4 bytes"),
-    ) as usize;
+    let node_len =
+        wire::read_u32(bytes, 0).map_err(|e| CodecError::InvalidData(e.to_string()))? as usize;
     // Cap node_id length to prevent DoS from malicious peers
     const MAX_NODE_ID_LEN: usize = 512;
     if node_len > MAX_NODE_ID_LEN {
@@ -453,11 +440,8 @@ where
             available: bytes.len(),
         });
     }
-    let count = u32::from_le_bytes(
-        bytes[offset..offset + 4]
-            .try_into()
-            .expect("change count prefix is 4 bytes"),
-    ) as usize;
+    let count =
+        wire::read_u32(bytes, offset).map_err(|e| CodecError::InvalidData(e.to_string()))? as usize;
     offset += 4;
 
     // Cap pre-allocation: each change needs at least 4+4+time+8 bytes (min ~16)
@@ -471,11 +455,8 @@ where
                 available: bytes.len(),
             });
         }
-        let op_idx = u32::from_le_bytes(
-            bytes[offset..offset + 4]
-                .try_into()
-                .expect("operator index is 4 bytes"),
-        ) as usize;
+        let op_idx = wire::read_u32(bytes, offset)
+            .map_err(|e| CodecError::InvalidData(e.to_string()))? as usize;
         offset += 4;
 
         if offset + 4 > bytes.len() {
@@ -484,11 +465,8 @@ where
                 available: bytes.len(),
             });
         }
-        let time_len = u32::from_le_bytes(
-            bytes[offset..offset + 4]
-                .try_into()
-                .expect("timestamp length prefix is 4 bytes"),
-        ) as usize;
+        let time_len = wire::read_u32(bytes, offset)
+            .map_err(|e| CodecError::InvalidData(e.to_string()))? as usize;
         offset += 4;
 
         if offset + time_len > bytes.len() {
@@ -511,11 +489,8 @@ where
                 available: bytes.len(),
             });
         }
-        let delta = i64::from_le_bytes(
-            bytes[offset..offset + 8]
-                .try_into()
-                .expect("progress delta is 8 bytes"),
-        );
+        let delta =
+            wire::read_i64(bytes, offset).map_err(|e| CodecError::InvalidData(e.to_string()))?;
         offset += 8;
 
         changes.push((op_idx, time, delta));
@@ -541,7 +516,7 @@ mod tests {
     fn routing_table_single_node_no_remotes() {
         let topology = ClusterTopology::single_node(4);
         let peer_map = HashMap::new();
-        let table = RoutingTable::new(&topology, "local", 100, &peer_map);
+        let table = RoutingTable::new(&topology, "local", 100, &peer_map).unwrap();
 
         assert_eq!(table.total_workers(), 4);
         assert_eq!(table.local_node_id(), "local");
@@ -564,7 +539,7 @@ mod tests {
         peer_map.insert("node-1".into(), PeerId(100));
         peer_map.insert("node-2".into(), PeerId(200));
 
-        let table = RoutingTable::new(&topology, "node-0", 1000, &peer_map);
+        let table = RoutingTable::new(&topology, "node-0", 1000, &peer_map).unwrap();
 
         assert_eq!(table.total_workers(), 6);
 
@@ -614,7 +589,7 @@ mod tests {
         peer_map.insert("node-0".into(), PeerId(10));
 
         // We are node 1
-        let table = RoutingTable::new(&topology, "node-1", 500, &peer_map);
+        let table = RoutingTable::new(&topology, "node-1", 500, &peer_map).unwrap();
 
         // Workers 0,1 are remote (node 0, peer 10)
         assert!(table.is_remote(0));
@@ -643,14 +618,13 @@ mod tests {
         let mut peer_map = HashMap::new();
         peer_map.insert("node-1".into(), PeerId(42));
 
-        let table = RoutingTable::new(&topology, "node-0", 1, &peer_map);
+        let table = RoutingTable::new(&topology, "node-0", 1, &peer_map).unwrap();
 
         let endpoints: Vec<_> = table.remote_endpoints().collect();
         assert_eq!(endpoints.len(), 2);
     }
 
     #[test]
-    #[should_panic(expected = "base_channel_id must be > 0")]
     fn routing_table_rejects_channel_id_zero() {
         let topology = ClusterTopology::multi_node(vec![
             NodeConfig::new("node-0", 1),
@@ -659,7 +633,7 @@ mod tests {
         .unwrap();
         let mut peer_map = HashMap::new();
         peer_map.insert("node-1".into(), PeerId(42));
-        let _table = RoutingTable::new(&topology, "node-0", 0, &peer_map);
+        assert!(RoutingTable::new(&topology, "node-0", 0, &peer_map).is_err());
     }
 
     // --- Data batch encode/decode tests ---

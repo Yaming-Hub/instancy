@@ -28,7 +28,7 @@ fn main() {
 
     // Attach a probe to observe the frontier after this point.
     let (stream, probe) = stream.probe();
-    let port = stream.output("sink");
+    let port = stream.output("sink").unwrap();
 
     let dataflow = builder.build().expect("build failed");
     let rt = RuntimeHandle::new(RuntimeConfig::default()).unwrap();

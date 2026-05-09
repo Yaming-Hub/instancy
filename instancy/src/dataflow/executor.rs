@@ -237,7 +237,8 @@ impl FusedStageTask {
         // most recent activation. Using a set avoids stale entries when an
         // operator transitions from WaitingForAsync to MadeProgress across
         // multi-pass iterations.
-        let mut async_waiting_set: std::collections::HashSet<usize> = std::collections::HashSet::new();
+        let mut async_waiting_set: std::collections::HashSet<usize> =
+            std::collections::HashSet::new();
 
         // Multi-pass: keep iterating until no operator makes progress or budget exhausted.
         let mut made_progress_this_pass = true;
@@ -249,7 +250,11 @@ impl FusedStageTask {
                     continue;
                 }
                 if productive_activations >= budget {
-                    return Ok((any_progress, productive_activations, async_waiting_set.into_iter().collect()));
+                    return Ok((
+                        any_progress,
+                        productive_activations,
+                        async_waiting_set.into_iter().collect(),
+                    ));
                 }
 
                 let start = if op_collectors.get(pos).and_then(|c| c.as_ref()).is_some() {
@@ -305,7 +310,11 @@ impl FusedStageTask {
             }
         }
 
-        Ok((any_progress, productive_activations, async_waiting_set.into_iter().collect()))
+        Ok((
+            any_progress,
+            productive_activations,
+            async_waiting_set.into_iter().collect(),
+        ))
     }
 
     /// Whether all operators in this task are done.
@@ -464,12 +473,12 @@ impl<T: Timestamp> DataflowExecutor<T> {
 
         // Process regular edges
         for (edge_idx, edge) in edges.iter().enumerate() {
-            let pull = pull_ends[edge_idx]
-                .take()
-                .expect("edge pull endpoint is materialized once");
-            let push = push_ends[edge_idx]
-                .take()
-                .expect("edge push endpoint is materialized once");
+            let pull = pull_ends[edge_idx].take().ok_or_else(|| {
+                Error::Custom("edge endpoint missing or already materialized".into())
+            })?;
+            let push = push_ends[edge_idx].take().ok_or_else(|| {
+                Error::Custom("edge endpoint missing or already materialized".into())
+            })?;
 
             op_input_pullers
                 .entry(edge.target.operator_index)
@@ -485,12 +494,12 @@ impl<T: Timestamp> DataflowExecutor<T> {
         // Process feedback edges (same as regular edges for materialization purposes)
         for (i, edge) in feedback_edges.iter().enumerate() {
             let edge_idx = edges.len() + i;
-            let pull = pull_ends[edge_idx]
-                .take()
-                .expect("edge pull endpoint is materialized once");
-            let push = push_ends[edge_idx]
-                .take()
-                .expect("edge push endpoint is materialized once");
+            let pull = pull_ends[edge_idx].take().ok_or_else(|| {
+                Error::Custom("edge endpoint missing or already materialized".into())
+            })?;
+            let push = push_ends[edge_idx].take().ok_or_else(|| {
+                Error::Custom("edge endpoint missing or already materialized".into())
+            })?;
 
             op_input_pullers
                 .entry(edge.target.operator_index)
@@ -669,6 +678,7 @@ impl<T: Timestamp> DataflowExecutor<T> {
     ///
     /// Panics if the tracker has not been initialized via `initialize()`.
     pub fn set_progress_tracker(&mut self, tracker: ProgressTracker<T>) {
+        // SAFETY: ProgressTracker::initialize establishes this structural invariant before attach
         assert!(
             tracker.is_initialized(),
             "ProgressTracker must be initialized before attaching to executor"
@@ -737,6 +747,7 @@ impl<T: Timestamp> DataflowExecutor<T> {
     ///
     /// Panics if the order length doesn't match the operator count.
     pub fn enable_fusion(&mut self, order: FusedActivationOrder) {
+        // SAFETY: fused order is constructed from this executor's operators
         assert_eq!(
             order.len(),
             self.operators.len(),
@@ -872,13 +883,13 @@ impl<T: Timestamp> DataflowExecutor<T> {
     /// 4. Re-enqueues operators that have ready notifications.
     ///
     /// Returns true if any operator was newly activated.
-    fn propagate_progress(&mut self) -> bool {
+    fn propagate_progress(&mut self) -> Result<bool> {
         let tracker = match &mut self.progress_tracker {
             Some(t) => t,
-            None => return false,
+            None => return Ok(false),
         };
 
-        let dirty: Vec<usize> = tracker.propagate().to_vec();
+        let dirty: Vec<usize> = tracker.propagate()?.to_vec();
 
         // Collect frontier updates for dirty operators before releasing tracker borrow.
         let frontier_updates: Vec<(usize, _)> = dirty
@@ -990,10 +1001,9 @@ impl<T: Timestamp> DataflowExecutor<T> {
 
         // Update registered probes with current frontiers.
         if !self.probes.is_empty() {
-            let tracker = self
-                .progress_tracker
-                .as_ref()
-                .expect("progress tracker exists when probes are registered");
+            let tracker = self.progress_tracker.as_ref().ok_or_else(|| {
+                Error::Custom("progress tracker missing while probes are registered".into())
+            })?;
             for (i, (op_idx, probe)) in self.probes.iter().enumerate() {
                 let frontier = tracker.operator_input_frontier_meet(*op_idx);
                 probe.update_frontier(&frontier);
@@ -1003,7 +1013,7 @@ impl<T: Timestamp> DataflowExecutor<T> {
             }
         }
 
-        activated
+        Ok(activated)
     }
 
     /// Run the dataflow to completion or cancellation using a simple single-threaded
@@ -1183,7 +1193,7 @@ impl<T: Timestamp> DataflowExecutor<T> {
         let positions = self
             .fused_order
             .as_ref()
-            .expect("run_fused_activation called without fused_order")
+            .ok_or_else(|| Error::Custom("executor fused order missing".into()))?
             .positions()
             .to_vec();
 
@@ -1375,7 +1385,7 @@ impl<T: Timestamp> DataflowExecutor<T> {
         }
 
         // After each batch, propagate progress and enqueue dirty operators.
-        if self.propagate_progress() {
+        if self.propagate_progress()? {
             self.consecutive_idle = 0;
         }
 
@@ -1668,7 +1678,7 @@ mod tests {
                 external_inputs_open: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
                 wake_handle: WakeHandle::new(),
                 consecutive_idle: 0,
-            async_waiting: vec![false; n],
+                async_waiting: vec![false; n],
                 worker_index,
                 control_sender: None,
                 control_receiver: None,
@@ -2099,16 +2109,18 @@ mod tests {
 
         // Build a minimal subgraph with one operator
         let mut builder = SubgraphBuilder::<u64>::new(0, 0);
-        builder.add_operator(
-            1, // operator index
-            "op",
-            1, // inputs
-            1, // outputs
-            PortConnectivity::identity(0u64),
-        ).unwrap();
+        builder
+            .add_operator(
+                1, // operator index
+                "op",
+                1, // inputs
+                1, // outputs
+                PortConnectivity::identity(0u64),
+            )
+            .unwrap();
 
         let mut tracker = builder.build();
-        tracker.initialize();
+        tracker.initialize().unwrap();
 
         let mut executor: DataflowExecutor<u64> = DataflowExecutor {
             operators: vec![Box::new(CountingOperator {

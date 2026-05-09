@@ -340,6 +340,7 @@ where
             .register_operator(crate::dataflow::graph::OperatorInfo::new(
                 op_index, name, stage_id, 1, 1,
             ))
+            // SAFETY: operator index freshly allocated by allocate_operator_index()
             .expect("operator index should be unique");
         scope.add_edge(crate::dataflow::graph::EdgeInfo::new(
             *self.source(),
@@ -368,6 +369,7 @@ where
             .register_operator(crate::dataflow::graph::OperatorInfo::new(
                 op_index, name, stage_id, 1, 1,
             ))
+            // SAFETY: operator index freshly allocated by allocate_operator_index()
             .expect("operator index should be unique");
         scope.add_edge(crate::dataflow::graph::EdgeInfo::new(
             *self.source(),

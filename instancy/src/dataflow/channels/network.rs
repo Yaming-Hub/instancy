@@ -68,6 +68,7 @@ use crate::dataflow::id::DataflowId;
 use crate::error::{Error, Result};
 use crate::execute::ClusterTopology;
 use crate::progress::timestamp::Timestamp;
+use crate::wire;
 use crate::worker::WorkerId;
 
 #[cfg(feature = "transport")]
@@ -178,9 +179,9 @@ where
                     available: rest.len(),
                 });
             }
-            let count =
-                u32::from_le_bytes(rest[..4].try_into().expect("batch count prefix is 4 bytes"))
-                    as usize;
+            let count = wire::read_u32(rest, 0)
+                .map_err(|e| CodecError::InvalidData(e.to_string()))?
+                as usize;
             const MAX_BATCH_SIZE: usize = 10_000_000;
             if count > MAX_BATCH_SIZE {
                 return Err(CodecError::InvalidData(format!(
@@ -219,11 +220,9 @@ where
                     available: rest.len(),
                 });
             }
-            let src_len = u32::from_le_bytes(
-                rest[..4]
-                    .try_into()
-                    .expect("source length prefix is 4 bytes"),
-            ) as usize;
+            let src_len = wire::read_u32(rest, 0)
+                .map_err(|e| CodecError::InvalidData(e.to_string()))?
+                as usize;
             if rest.len() < 4 + src_len + 4 {
                 return Err(CodecError::InsufficientData {
                     needed: 4 + src_len + 4,
@@ -233,11 +232,9 @@ where
             let source_operator = String::from_utf8(rest[4..4 + src_len].to_vec())
                 .map_err(|e| CodecError::InvalidData(format!("invalid UTF-8: {e}")))?;
             let msg_offset = 4 + src_len;
-            let msg_len = u32::from_le_bytes(
-                rest[msg_offset..msg_offset + 4]
-                    .try_into()
-                    .expect("message length prefix is 4 bytes"),
-            ) as usize;
+            let msg_len = wire::read_u32(rest, msg_offset)
+                .map_err(|e| CodecError::InvalidData(e.to_string()))?
+                as usize;
             let total_consumed = msg_offset + 4 + msg_len;
             if rest.len() < total_consumed {
                 return Err(CodecError::InsufficientData {
@@ -765,14 +762,22 @@ impl<T: Timestamp + ExchangeData, D: ExchangeData> EdgeMaterializer<T, D>
         let worker_node = self
             .topology
             .node_for_worker(WorkerId::new(src_idx))
-            .expect("worker index valid for topology");
+            .ok_or_else(|| {
+                Error::InvalidConfig(format!(
+                    "topology missing worker mapping for source worker {src_idx}"
+                ))
+            })?;
 
         let mut pushers: Vec<Box<dyn Push<T, D, ()>>> = Vec::with_capacity(self.num_workers);
         for dst in 0..self.num_workers {
             let dst_node = self
                 .topology
                 .node_for_worker(WorkerId::new(dst))
-                .expect("worker index valid for topology");
+                .ok_or_else(|| {
+                    Error::InvalidConfig(format!(
+                        "topology missing worker mapping for target worker {dst}"
+                    ))
+                })?;
 
             if worker_node == dst_node && worker_node == self.local_node_id {
                 let push = self.local_push[src_idx][dst].take().ok_or_else(|| {
@@ -819,14 +824,22 @@ impl<T: Timestamp + ExchangeData, D: ExchangeData> EdgeMaterializer<T, D>
         let worker_node = self
             .topology
             .node_for_worker(WorkerId::new(dst_idx))
-            .expect("worker index valid for topology");
+            .ok_or_else(|| {
+                Error::InvalidConfig(format!(
+                    "topology missing worker mapping for target worker {dst_idx}"
+                ))
+            })?;
 
         let mut pullers: Vec<Box<dyn Pull<T, D, ()>>> = Vec::with_capacity(self.num_workers);
         for src in 0..self.num_workers {
             let src_node = self
                 .topology
                 .node_for_worker(WorkerId::new(src))
-                .expect("worker index valid for topology");
+                .ok_or_else(|| {
+                    Error::InvalidConfig(format!(
+                        "topology missing worker mapping for source worker {src}"
+                    ))
+                })?;
 
             if src_node == worker_node && src_node == self.local_node_id {
                 let pull = self.local_pull[src][dst_idx].take().ok_or_else(|| {

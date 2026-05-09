@@ -28,9 +28,9 @@ where
 async fn frontier_advances_after_input_close() {
     let rt = RuntimeHandle::new(RuntimeConfig::default()).unwrap();
     let builder = DataflowBuilder::<u64>::new("frontier-close");
-    let input = builder.input::<i32>("data");
+    let input = builder.input::<i32>("data").unwrap();
     let (stream, probe) = input.map("identity", |_time, value| value).probe();
-    stream.output("results");
+    stream.output("results").unwrap();
     let dataflow = builder.build().unwrap();
 
     let mut handle = rt.spawn(dataflow, SpawnOptions::new()).unwrap();
@@ -63,8 +63,10 @@ async fn frontier_advances_after_input_close() {
 fn advance_to_moves_frontier() {
     let rt = RuntimeHandle::new(RuntimeConfig::default()).unwrap();
     let builder = DataflowBuilder::<u64>::new("advance-frontier");
-    let input = builder.input::<i32>("data");
-    input.map("identity", |_time, value| value).output("results");
+    let input = builder.input::<i32>("data").unwrap();
+    input
+        .map("identity", |_time, value| value)
+        .output("results").unwrap();
     let dataflow = builder.build().unwrap();
 
     let mut handle = rt.spawn(dataflow, SpawnOptions::new()).unwrap();
@@ -79,14 +81,17 @@ fn advance_to_moves_frontier() {
 
     handle.join_blocking().unwrap();
 
-    assert_eq!(receiver.collect_data(), vec![(0, vec![1, 2]), (5, vec![3, 4])]);
+    assert_eq!(
+        receiver.collect_data(),
+        vec![(0, vec![1, 2]), (5, vec![3, 4])]
+    );
 }
 
 #[test]
 fn notification_fires_at_correct_time() {
     let rt = RuntimeHandle::new(RuntimeConfig::default()).unwrap();
     let builder = DataflowBuilder::<u64>::new("notify-order");
-    let input = builder.input::<i32>("data");
+    let input = builder.input::<i32>("data").unwrap();
     input
         .unary_notify("aggregate", {
             let mut stash: HashMap<u64, Vec<i32>> = HashMap::new();
@@ -104,7 +109,7 @@ fn notification_fires_at_correct_time() {
                 Ok(())
             }
         })
-        .output("results");
+        .output("results").unwrap();
     let dataflow = builder.build().unwrap();
 
     let mut handle = rt.spawn(dataflow, SpawnOptions::new()).unwrap();
@@ -130,7 +135,7 @@ fn notification_fires_at_correct_time() {
 fn notification_waits_for_all_input() {
     let rt = RuntimeHandle::new(RuntimeConfig::default()).unwrap();
     let builder = DataflowBuilder::<u64>::new("notify-waits");
-    let input = builder.input::<i32>("data");
+    let input = builder.input::<i32>("data").unwrap();
     input
         .unary_notify("buffer", {
             let mut stash: HashMap<u64, Vec<i32>> = HashMap::new();
@@ -148,7 +153,7 @@ fn notification_waits_for_all_input() {
                 Ok(())
             }
         })
-        .output("results");
+        .output("results").unwrap();
     let dataflow = builder.build().unwrap();
 
     let mut handle = rt.spawn(dataflow, SpawnOptions::new()).unwrap();
@@ -176,9 +181,9 @@ fn notification_waits_for_all_input() {
 async fn probe_reflects_progress() {
     let rt = RuntimeHandle::new(RuntimeConfig::default()).unwrap();
     let builder = DataflowBuilder::<u64>::new("probe-progress");
-    let input = builder.input::<i32>("data");
+    let input = builder.input::<i32>("data").unwrap();
     let (stream, probe) = input.map("identity", |_time, value| value).probe();
-    stream.output("results");
+    stream.output("results").unwrap();
     let dataflow = builder.build().unwrap();
 
     let mut handle = rt.spawn(dataflow, SpawnOptions::new()).unwrap();
@@ -191,12 +196,14 @@ async fn probe_reflects_progress() {
     sender.send(0, vec![10, 20]).unwrap();
     assert!(probe.frontier().less_than(&1));
 
-    assert!(tokio::time::timeout(
-        Duration::from_millis(200),
-        probe.clone().wait_until_done_with(&0),
-    )
-    .await
-    .is_err());
+    assert!(
+        tokio::time::timeout(
+            Duration::from_millis(200),
+            probe.clone().wait_until_done_with(&0),
+        )
+        .await
+        .is_err()
+    );
 
     sender.advance_to(1).unwrap();
     tokio::time::timeout(Duration::from_secs(5), probe.wait_until_done_with(&0))
@@ -237,7 +244,7 @@ fn multi_worker_frontier_coordination() {
             "exchange-frontier-coordination",
             2,
             |builder| {
-                let input = builder.input::<i32>("data");
+                let input = builder.input::<i32>("data").unwrap();
                 input
                     .exchange_by_hash("distribute", |value: &i32| *value as u64)
                     .unary_notify("aggregate", {
@@ -256,7 +263,7 @@ fn multi_worker_frontier_coordination() {
                             Ok(())
                         }
                     })
-                    .output("results");
+                    .output("results").unwrap();
                 Ok(())
             },
             SpawnOptions::new(),
@@ -305,7 +312,7 @@ fn nested_loop_timestamps() {
     let seen_times = Arc::new(Mutex::new(Vec::<Product<u64, u32>>::new()));
 
     let builder = DataflowBuilder::<u64>::new("nested-loop-timestamps");
-    let input = builder.input::<i32>("data");
+    let input = builder.input::<i32>("data").unwrap();
     let seen_for_loop = Arc::clone(&seen_times);
     input
         .iterate::<u32>("loop", 1u32, move |iter_var| {
@@ -321,7 +328,7 @@ fn nested_loop_timestamps() {
                 output: done,
             }
         })
-        .output("results");
+        .output("results").unwrap();
     let dataflow = builder.build().unwrap();
 
     let mut handle = rt.spawn(dataflow, SpawnOptions::new()).unwrap();

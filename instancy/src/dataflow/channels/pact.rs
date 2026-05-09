@@ -167,16 +167,17 @@ impl<D> Router<D> {
     ///
     /// # Panics
     /// Panics if `num_targets` is 0.
-    pub fn new(strategy: PartitionStrategy<D>, num_targets: usize) -> Self {
-        assert!(
-            num_targets > 0,
-            "Router requires at least one target worker"
-        );
-        Self {
+    pub fn new(strategy: PartitionStrategy<D>, num_targets: usize) -> crate::Result<Self> {
+        if num_targets == 0 {
+            return Err(crate::Error::InvalidConfig(
+                "Router requires at least one target worker".into(),
+            ));
+        }
+        Ok(Self {
             strategy,
             num_targets,
             rr_counter: 0,
-        }
+        })
     }
 
     /// Route a single record. Returns the list of target worker indices.
@@ -243,7 +244,7 @@ mod tests {
             PartitionStrategy::exchange("mod 4", |x: &i32| *x as u64);
         assert!(strat.requires_exchange());
 
-        let mut router = Router::new(strat, 4);
+        let mut router = Router::new(strat, 4).unwrap();
         // Record with value 0 → worker 0
         assert_eq!(router.route(&0), vec![0]);
         // Record with value 5 → worker 5 % 4 = 1
@@ -264,7 +265,7 @@ mod tests {
         let strat: PartitionStrategy<Record> =
             PartitionStrategy::exchange_by_key("by key field", |r: &Record| r.key.clone());
 
-        let mut router = Router::new(strat, 8);
+        let mut router = Router::new(strat, 8).unwrap();
         let record = Record {
             key: "hello".to_string(),
             value: 42,
@@ -279,7 +280,7 @@ mod tests {
     #[test]
     fn rebalance_round_robins() {
         let strat: PartitionStrategy<i32> = PartitionStrategy::Rebalance;
-        let mut router = Router::new(strat, 3);
+        let mut router = Router::new(strat, 3).unwrap();
 
         assert_eq!(router.route(&100), vec![0]);
         assert_eq!(router.route(&200), vec![1]);
@@ -290,7 +291,7 @@ mod tests {
     #[test]
     fn gather_sends_to_zero() {
         let strat: PartitionStrategy<i32> = PartitionStrategy::Gather;
-        let mut router = Router::new(strat, 8);
+        let mut router = Router::new(strat, 8).unwrap();
 
         assert_eq!(router.route(&1), vec![0]);
         assert_eq!(router.route(&2), vec![0]);
@@ -300,7 +301,7 @@ mod tests {
     #[test]
     fn broadcast_sends_to_all() {
         let strat: PartitionStrategy<i32> = PartitionStrategy::Broadcast;
-        let mut router = Router::new(strat, 4);
+        let mut router = Router::new(strat, 4).unwrap();
 
         assert_eq!(router.route(&42), vec![0, 1, 2, 3]);
     }
@@ -308,7 +309,7 @@ mod tests {
     #[test]
     fn broadcast_local_sends_to_all() {
         let strat: PartitionStrategy<i32> = PartitionStrategy::BroadcastLocal;
-        let mut router = Router::new(strat, 3);
+        let mut router = Router::new(strat, 3).unwrap();
 
         assert_eq!(router.route(&99), vec![0, 1, 2]);
     }
@@ -317,7 +318,7 @@ mod tests {
     fn route_batch_distributes_correctly() {
         let strat: PartitionStrategy<i32> =
             PartitionStrategy::exchange("mod 3", |x: &i32| *x as u64);
-        let mut router = Router::new(strat, 3);
+        let mut router = Router::new(strat, 3).unwrap();
 
         let batch = vec![0, 1, 2, 3, 4, 5];
         let buckets = router.route_batch(&batch);
@@ -347,16 +348,15 @@ mod tests {
         let cloned = strat.clone();
 
         // Both should route the same way
-        let mut router1 = Router::new(strat, 4);
-        let mut router2 = Router::new(cloned, 4);
+        let mut router1 = Router::new(strat, 4).unwrap();
+        let mut router2 = Router::new(cloned, 4).unwrap();
         assert_eq!(router1.route(&7), router2.route(&7));
         assert_eq!(router1.route(&12), router2.route(&12));
     }
 
     #[test]
-    #[should_panic(expected = "Router requires at least one target worker")]
     fn router_panics_on_zero_targets() {
         let strat: PartitionStrategy<i32> = PartitionStrategy::Rebalance;
-        let _ = Router::new(strat, 0);
+        assert!(Router::new(strat, 0).is_err());
     }
 }

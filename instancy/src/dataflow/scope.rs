@@ -150,6 +150,7 @@ impl<T: Timestamp> RootScope<T> {
         let stage_id = self.current_stage_id();
         let parallelism = self
             .stage_parallelism(stage_id)
+            // SAFETY: current_stage_id() returns a stage registered in this scope's state
             .expect("current stage must exist in scope state");
 
         self.register_operator(OperatorInfo::new(
@@ -159,6 +160,7 @@ impl<T: Timestamp> RootScope<T> {
             0,
             0,
         ))
+        // SAFETY: index was freshly allocated by allocate_operator_index() on the previous line
         .expect("child scope operator index was just allocated, cannot conflict");
 
         ChildScope::new(name, &self.addr(), child_index, parallelism)
@@ -299,6 +301,7 @@ impl<T: Timestamp> ChildScope<T> {
                 0,
                 0,
             ))
+            // SAFETY: graph is freshly created, index 0 cannot conflict
             .expect("scope-boundary registration on fresh graph cannot fail");
 
         Self {
@@ -321,6 +324,7 @@ impl<T: Timestamp> ChildScope<T> {
         let stage_id = self.current_stage_id();
         let parallelism = self
             .stage_parallelism(stage_id)
+            // SAFETY: current_stage_id() returns a stage registered in this scope's state
             .expect("current stage must exist in scope state");
 
         self.register_operator(OperatorInfo::new(
@@ -330,6 +334,7 @@ impl<T: Timestamp> ChildScope<T> {
             0,
             0,
         ))
+        // SAFETY: index was freshly allocated by allocate_operator_index() on the previous line
         .expect("child scope operator index was just allocated, cannot conflict");
 
         ChildScope::new(name, &self.addr(), child_index, parallelism)

@@ -459,7 +459,9 @@ impl CancellationToken {
     }
 
     /// Await notification from an ancestor node and its parents.
-    fn await_ancestor_notify(node: &Arc<TokenInner>) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + '_>> {
+    fn await_ancestor_notify(
+        node: &Arc<TokenInner>,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + '_>> {
         Box::pin(async move {
             let notified = node.async_notify.notified();
             tokio::pin!(notified);
@@ -507,7 +509,11 @@ impl CancellationGuard {
     ///
     /// Returns the inner token for continued use.
     pub fn disarm(mut self) -> CancellationToken {
-        self.token.take().expect("guard already disarmed")
+        // SAFETY: token is always Some until disarm() or Drop consumes it,
+        // and disarm(self) takes ownership preventing double-call.
+        self.token
+            .take()
+            .expect("guard already disarmed")
     }
 }
 

@@ -113,13 +113,13 @@ pub trait ExchangeExt<S: Scope, D> {
     /// Creates a new execution stage if `target_parallelism` differs from the
     /// current stage's parallelism; otherwise reuses the current stage.
     ///
-    /// # Panics
-    /// Panics if `target_parallelism` is 0.
+    /// # Errors
+    /// Returns [`crate::Error::InvalidConfig`] if `target_parallelism` is 0.
     fn exchange_to<K: Hash + 'static>(
         &self,
         target_parallelism: usize,
         key_fn: impl Fn(&D) -> K + Send + Sync + 'static,
-    ) -> StreamEdge<S, D>;
+    ) -> crate::Result<StreamEdge<S, D>>;
 
     /// Repartition data using a direct hash function (returns u64).
     ///
@@ -135,13 +135,13 @@ pub trait ExchangeExt<S: Scope, D> {
     /// Creates a new execution stage if `target_parallelism` differs from the
     /// current stage's parallelism; otherwise reuses the current stage.
     ///
-    /// # Panics
-    /// Panics if `target_parallelism` is 0.
+    /// # Errors
+    /// Returns [`crate::Error::InvalidConfig`] if `target_parallelism` is 0.
     fn exchange_by_hash_to(
         &self,
         target_parallelism: usize,
         hash_fn: impl Fn(&D) -> u64 + Send + Sync + 'static,
-    ) -> StreamEdge<S, D>;
+    ) -> crate::Result<StreamEdge<S, D>>;
 }
 
 impl<S: Scope, D: 'static> ExchangeExt<S, D> for StreamEdge<S, D> {
@@ -164,16 +164,20 @@ impl<S: Scope, D: 'static> ExchangeExt<S, D> for StreamEdge<S, D> {
         &self,
         target_parallelism: usize,
         key_fn: impl Fn(&D) -> K + Send + Sync + 'static,
-    ) -> StreamEdge<S, D> {
-        assert!(target_parallelism > 0, "target_parallelism must be > 0");
+    ) -> crate::Result<StreamEdge<S, D>> {
+        if target_parallelism == 0 {
+            return Err(crate::Error::InvalidConfig(
+                "target_parallelism must be > 0".into(),
+            ));
+        }
         let scope = self.scope().clone();
         let source_stage = self.stage_id();
-        self.build_exchange(
+        Ok(self.build_exchange(
             scope,
             source_stage,
             target_parallelism,
             PartitionStrategy::exchange_by_key("exchange", key_fn),
-        )
+        ))
     }
 
     fn exchange_by_hash(
@@ -195,16 +199,20 @@ impl<S: Scope, D: 'static> ExchangeExt<S, D> for StreamEdge<S, D> {
         &self,
         target_parallelism: usize,
         hash_fn: impl Fn(&D) -> u64 + Send + Sync + 'static,
-    ) -> StreamEdge<S, D> {
-        assert!(target_parallelism > 0, "target_parallelism must be > 0");
+    ) -> crate::Result<StreamEdge<S, D>> {
+        if target_parallelism == 0 {
+            return Err(crate::Error::InvalidConfig(
+                "target_parallelism must be > 0".into(),
+            ));
+        }
         let scope = self.scope().clone();
         let source_stage = self.stage_id();
-        self.build_exchange(
+        Ok(self.build_exchange(
             scope,
             source_stage,
             target_parallelism,
             PartitionStrategy::exchange("exchange_hash", hash_fn),
-        )
+        ))
     }
 }
 
@@ -237,6 +245,7 @@ impl<S: Scope, D: 'static> StreamEdge<S, D> {
                 1,
                 1,
             ))
+            // SAFETY: operator index freshly allocated by allocate_operator_index()
             .expect("operator index should be unique");
         scope.add_edge(crate::dataflow::graph::EdgeInfo::exchange(
             *self.source(),
@@ -285,20 +294,20 @@ mod tests {
         let source = Slot::new(0, 0);
         let stream: StreamEdge<RootScope<u64>, i32> = StreamEdge::new(scope, source, stage_id);
 
-        let exchanged = stream.exchange_to(8, |record: &i32| *record);
+        let exchanged = stream.exchange_to(8, |record: &i32| *record).unwrap();
         // Different parallelism → new stage
         assert_ne!(exchanged.stage_id(), stage_id);
     }
 
     #[test]
-    #[should_panic(expected = "target_parallelism must be > 0")]
-    fn exchange_to_zero_parallelism_panics() {
+    fn exchange_to_zero_parallelism_errors() {
         let scope = RootScope::<u64>::new("test", 4);
         let stage_id = scope.current_stage_id();
         let source = Slot::new(0, 0);
         let stream: StreamEdge<RootScope<u64>, i32> = StreamEdge::new(scope, source, stage_id);
 
-        let _ = stream.exchange_to(0, |record: &i32| *record);
+        let err = stream.exchange_to(0, |record: &i32| *record).err().unwrap();
+        assert!(matches!(err, crate::Error::InvalidConfig(_)));
     }
 
     #[test]
@@ -319,7 +328,9 @@ mod tests {
         let source = Slot::new(0, 0);
         let stream: StreamEdge<RootScope<u64>, i32> = StreamEdge::new(scope, source, stage_id);
 
-        let exchanged = stream.exchange_by_hash_to(16, |record: &i32| *record as u64);
+        let exchanged = stream
+            .exchange_by_hash_to(16, |record: &i32| *record as u64)
+            .unwrap();
         assert_ne!(exchanged.stage_id(), stage_id);
     }
 

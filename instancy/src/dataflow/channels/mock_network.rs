@@ -45,6 +45,7 @@ use crate::dataflow::channels::pushpull::{Pull, Push};
 use crate::error::{Error, Result};
 use crate::execute::ClusterTopology;
 use crate::progress::timestamp::Timestamp;
+use crate::wire;
 
 // ---------------------------------------------------------------------------
 // ByteChannel — bounded in-memory byte transport
@@ -222,9 +223,9 @@ where
                     available: rest.len(),
                 });
             }
-            let count =
-                u32::from_le_bytes(rest[..4].try_into().expect("batch count prefix is 4 bytes"))
-                    as usize;
+            let count = wire::read_u32(rest, 0)
+                .map_err(|e| CodecError::InvalidData(e.to_string()))?
+                as usize;
             // Guard against unreasonable allocation from malformed data.
             const MAX_BATCH_SIZE: usize = 10_000_000;
             if count > MAX_BATCH_SIZE {
@@ -264,11 +265,9 @@ where
                     available: rest.len(),
                 });
             }
-            let src_len = u32::from_le_bytes(
-                rest[..4]
-                    .try_into()
-                    .expect("source length prefix is 4 bytes"),
-            ) as usize;
+            let src_len = wire::read_u32(rest, 0)
+                .map_err(|e| CodecError::InvalidData(e.to_string()))?
+                as usize;
             if rest.len() < 4 + src_len + 4 {
                 return Err(CodecError::InsufficientData {
                     needed: 4 + src_len + 4,
@@ -280,11 +279,9 @@ where
                     CodecError::InvalidData(format!("invalid UTF-8 in source_operator: {e}"))
                 })?;
             let msg_offset = 4 + src_len;
-            let msg_len = u32::from_le_bytes(
-                rest[msg_offset..msg_offset + 4]
-                    .try_into()
-                    .expect("message length prefix is 4 bytes"),
-            ) as usize;
+            let msg_len = wire::read_u32(rest, msg_offset)
+                .map_err(|e| CodecError::InvalidData(e.to_string()))?
+                as usize;
             if rest.len() < msg_offset + 4 + msg_len {
                 return Err(CodecError::InsufficientData {
                     needed: msg_offset + 4 + msg_len,
@@ -416,17 +413,22 @@ impl<T: Timestamp + ExchangeData, D: ExchangeData> DeserializingPull<T, D> {
             receiver,
         }
     }
+
+    fn decode(&self, bytes: &[u8]) -> std::result::Result<Envelope<T, D, ()>, CodecError> {
+        decode_envelope(&self.time_codec, &self.data_codec, bytes)
+    }
 }
 
 impl<T: Timestamp + ExchangeData, D: ExchangeData> Pull<T, D, ()> for DeserializingPull<T, D> {
     fn pull(&mut self) -> Option<Envelope<T, D, ()>> {
         let bytes = self.receiver.recv()?;
-        // Panic on decode error: this is a test mock, so a decode failure
-        // always indicates a codec bug that must be surfaced immediately.
-        Some(
-            decode_envelope(&self.time_codec, &self.data_codec, &bytes)
-                .expect("MockNetworkEdgeMaterializer: decode error indicates a codec bug"),
-        )
+        match self.decode(&bytes) {
+            Ok(env) => Some(env),
+            Err(err) => Some(Envelope::error(
+                "MockNetworkEdgeMaterializer",
+                format!("decode error: {err}"),
+            )),
+        }
     }
 
     fn is_exhausted(&self) -> bool {

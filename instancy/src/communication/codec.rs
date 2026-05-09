@@ -319,7 +319,7 @@ macro_rules! impl_fixed_codec {
                             available: buf.len(),
                         });
                     }
-                    // SAFETY: length check above guarantees buf[..SIZE] is exactly SIZE bytes
+                    // Length validated above; map_err handles the impossible case defensively.
                     let bytes: [u8; SIZE] = buf[..SIZE].try_into()
                         .map_err(|_| CodecError::InvalidData("slice length mismatch".into()))?;
                     let value = <$ty>::from_le_bytes(bytes);

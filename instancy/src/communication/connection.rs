@@ -531,11 +531,14 @@ pub struct PoolGuard<'pool, M: ConnectionManager> {
 impl<'pool, M: ConnectionManager> PoolGuard<'pool, M> {
     /// Get a reference to the underlying connection.
     pub fn connection(&self) -> &M::Connection {
+        // SAFETY: connection is always Some until discard()/Drop consumes the guard,
+        // both of which take ownership preventing further access.
         self.connection.as_ref().expect("guard already consumed")
     }
 
     /// Get a mutable reference to the underlying connection.
     pub fn connection_mut(&mut self) -> &mut M::Connection {
+        // SAFETY: connection is always Some until discard()/Drop consumes the guard.
         self.connection.as_mut().expect("guard already consumed")
     }
 

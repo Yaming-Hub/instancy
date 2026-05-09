@@ -106,9 +106,9 @@ pub trait BroadcastExt<S: Scope, D> {
     /// Creates a new execution stage if `target_parallelism` differs from the
     /// current stage's parallelism; otherwise reuses the current stage.
     ///
-    /// # Panics
-    /// Panics if `target_parallelism` is 0.
-    fn broadcast_to(&self, target_parallelism: usize) -> StreamEdge<S, D>;
+    /// # Errors
+    /// Returns [`crate::Error::InvalidConfig`] if `target_parallelism` is 0.
+    fn broadcast_to(&self, target_parallelism: usize) -> crate::Result<StreamEdge<S, D>>;
 
     /// Broadcast each record to all workers in the same process only.
     ///
@@ -121,9 +121,9 @@ pub trait BroadcastExt<S: Scope, D> {
     /// Creates a new execution stage if `target_parallelism` differs from the
     /// current stage's parallelism; otherwise reuses the current stage.
     ///
-    /// # Panics
-    /// Panics if `target_parallelism` is 0.
-    fn broadcast_local_to(&self, target_parallelism: usize) -> StreamEdge<S, D>;
+    /// # Errors
+    /// Returns [`crate::Error::InvalidConfig`] if `target_parallelism` is 0.
+    fn broadcast_local_to(&self, target_parallelism: usize) -> crate::Result<StreamEdge<S, D>>;
 }
 
 impl<S: Scope, D: 'static> BroadcastExt<S, D> for StreamEdge<S, D> {
@@ -139,16 +139,20 @@ impl<S: Scope, D: 'static> BroadcastExt<S, D> for StreamEdge<S, D> {
         )
     }
 
-    fn broadcast_to(&self, target_parallelism: usize) -> StreamEdge<S, D> {
-        assert!(target_parallelism > 0, "target_parallelism must be > 0");
+    fn broadcast_to(&self, target_parallelism: usize) -> crate::Result<StreamEdge<S, D>> {
+        if target_parallelism == 0 {
+            return Err(crate::Error::InvalidConfig(
+                "target_parallelism must be > 0".into(),
+            ));
+        }
         let scope = self.scope().clone();
         let source_stage = self.stage_id();
-        self.build_broadcast(
+        Ok(self.build_broadcast(
             scope,
             source_stage,
             target_parallelism,
             PartitionStrategy::Broadcast,
-        )
+        ))
     }
 
     fn broadcast_local(&self) -> StreamEdge<S, D> {
@@ -163,16 +167,20 @@ impl<S: Scope, D: 'static> BroadcastExt<S, D> for StreamEdge<S, D> {
         )
     }
 
-    fn broadcast_local_to(&self, target_parallelism: usize) -> StreamEdge<S, D> {
-        assert!(target_parallelism > 0, "target_parallelism must be > 0");
+    fn broadcast_local_to(&self, target_parallelism: usize) -> crate::Result<StreamEdge<S, D>> {
+        if target_parallelism == 0 {
+            return Err(crate::Error::InvalidConfig(
+                "target_parallelism must be > 0".into(),
+            ));
+        }
         let scope = self.scope().clone();
         let source_stage = self.stage_id();
-        self.build_broadcast(
+        Ok(self.build_broadcast(
             scope,
             source_stage,
             target_parallelism,
             PartitionStrategy::BroadcastLocal,
-        )
+        ))
     }
 }
 
@@ -205,6 +213,7 @@ impl<S: Scope, D: 'static> StreamEdge<S, D> {
                 1,
                 1,
             ))
+            // SAFETY: operator index freshly allocated by allocate_operator_index()
             .expect("operator index should be unique");
         scope.add_edge(crate::dataflow::graph::EdgeInfo::exchange(
             *self.source(),
@@ -252,21 +261,21 @@ mod tests {
         let stream: StreamEdge<RootScope<u64>, i32> =
             StreamEdge::new(scope.clone(), source, stage_id);
 
-        let broadcasted = stream.broadcast_to(8);
+        let broadcasted = stream.broadcast_to(8).unwrap();
         assert_ne!(broadcasted.stage_id(), stage_id);
         let new_parallelism = scope.stage_parallelism(broadcasted.stage_id()).unwrap();
         assert_eq!(new_parallelism, 8);
     }
 
     #[test]
-    #[should_panic(expected = "target_parallelism must be > 0")]
-    fn broadcast_to_zero_panics() {
+    fn broadcast_to_zero_parallelism_errors() {
         let scope = RootScope::<u64>::new("test", 4);
         let stage_id = scope.current_stage_id();
         let source = Slot::new(0, 0);
         let stream: StreamEdge<RootScope<u64>, i32> = StreamEdge::new(scope, source, stage_id);
 
-        let _ = stream.broadcast_to(0);
+        let err = stream.broadcast_to(0).err().unwrap();
+        assert!(matches!(err, crate::Error::InvalidConfig(_)));
     }
 
     #[test]
@@ -288,21 +297,21 @@ mod tests {
         let stream: StreamEdge<RootScope<u64>, i32> =
             StreamEdge::new(scope.clone(), source, stage_id);
 
-        let broadcasted = stream.broadcast_local_to(12);
+        let broadcasted = stream.broadcast_local_to(12).unwrap();
         assert_ne!(broadcasted.stage_id(), stage_id);
         let new_parallelism = scope.stage_parallelism(broadcasted.stage_id()).unwrap();
         assert_eq!(new_parallelism, 12);
     }
 
     #[test]
-    #[should_panic(expected = "target_parallelism must be > 0")]
-    fn broadcast_local_to_zero_panics() {
+    fn broadcast_local_to_zero_parallelism_errors() {
         let scope = RootScope::<u64>::new("test", 4);
         let stage_id = scope.current_stage_id();
         let source = Slot::new(0, 0);
         let stream: StreamEdge<RootScope<u64>, i32> = StreamEdge::new(scope, source, stage_id);
 
-        let _ = stream.broadcast_local_to(0);
+        let err = stream.broadcast_local_to(0).err().unwrap();
+        assert!(matches!(err, crate::Error::InvalidConfig(_)));
     }
 
     #[test]

@@ -26,13 +26,13 @@ use std::sync::{Arc, Condvar, Mutex};
 use std::task::{Context, Poll, Waker};
 
 use crate::cancellation::{CancellationReason, CancellationToken};
+use crate::dataflow::DataflowId;
 use crate::dataflow::channel_operators::ChannelMode;
 use crate::dataflow::channels::wake::WakeHandle;
 use crate::dataflow::control::{ControlBroadcast, ControlReceiver, ControlSender};
 use crate::dataflow::dataflow_builder::{DataflowBuilder, LogicalDataflow};
 use crate::dataflow::executor::{DataflowExecutor, ExecutorConfig};
 use crate::dataflow::graph::OperatorInfo;
-use crate::dataflow::DataflowId;
 use crate::error::{Error, Result};
 use crate::progress::progress_channel::{WorkerProgressChannels, create_progress_channels};
 use crate::progress::timestamp::Timestamp;
@@ -483,10 +483,7 @@ impl ClusterCancelHandle {
     /// via `cancel_with_reason` or parent token propagation.
     fn is_cancelled(&self) -> bool {
         self.bridge_cancel.is_cancelled()
-            || self
-                .worker_tokens
-                .first()
-                .is_some_and(|t| t.is_cancelled())
+            || self.worker_tokens.first().is_some_and(|t| t.is_cancelled())
     }
 }
 
@@ -724,9 +721,10 @@ impl RuntimeHandle {
         };
         let worker_pool =
             WorkerPool::new(pool_config).map_err(|e| crate::error::Error::Custom(e.to_string()))?;
-        let schedule_policy: Option<Arc<dyn SchedulePolicy>> =
-            config.schedule_policy.map(|p| Arc::from(p) as Arc<dyn SchedulePolicy>);
-        let registry = worker_pool.create_registry(schedule_policy.clone());
+        let schedule_policy: Option<Arc<dyn SchedulePolicy>> = config
+            .schedule_policy
+            .map(|p| Arc::from(p) as Arc<dyn SchedulePolicy>);
+        let registry = worker_pool.create_registry(schedule_policy.clone())?;
 
         // Resolve the tokio runtime handle.
         let (tokio_handle, owned_runtime) = match config.tokio_mode {
@@ -746,9 +744,7 @@ impl RuntimeHandle {
                     .thread_name(format!("{}-tokio", config.name))
                     .build()
                     .map_err(|e| {
-                        crate::error::Error::Custom(format!(
-                            "failed to create tokio runtime: {e}"
-                        ))
+                        crate::error::Error::Custom(format!("failed to create tokio runtime: {e}"))
                     })?;
                 let handle = rt.handle().clone();
                 (handle, Some(rt))
@@ -1085,9 +1081,9 @@ impl RuntimeHandle {
     ///     "partitioned-sum",
     ///     num_workers,
     ///     |builder: &mut DataflowBuilder<u64>| {
-    ///         let input = builder.input::<i32>("data");
+    ///         let input = builder.input::<i32>("data").unwrap();
     ///         // Each worker independently doubles its partition's values.
-    ///         input.map("double", |_t, x| x * 2).output("results");
+    ///         input.map("double", |_t, x| x * 2).output("results").unwrap();
     ///         Ok(())
     ///     },
     ///     SpawnOptions::default(),
@@ -1510,7 +1506,7 @@ impl RuntimeHandle {
         let wake_handles: Vec<WakeHandle> = (0..num_workers).map(|_| WakeHandle::new()).collect();
 
         let mut progress_channels = if num_workers > 1 {
-            create_progress_channels::<T>(num_workers, &wake_handles)
+            create_progress_channels::<T>(num_workers, &wake_handles)?
         } else {
             Vec::new()
         };
@@ -1525,8 +1521,13 @@ impl RuntimeHandle {
             None
         };
         let mut control_pairs: Vec<Option<(ControlSender, ControlReceiver)>> = if num_workers > 1 {
-            let df_cancel = dataflow_cancel.as_ref().expect("dataflow_cancel set for multi-worker").clone();
-            let (senders, receivers) = ControlBroadcast::new(num_workers, &wake_handles, df_cancel);
+            // SAFETY: dataflow_cancel is unconditionally set before entering multi-worker spawn
+            let df_cancel = dataflow_cancel
+                .as_ref()
+                .expect("dataflow_cancel set for multi-worker")
+                .clone();
+            let (senders, receivers) =
+                ControlBroadcast::new(num_workers, &wake_handles, df_cancel)?;
             senders
                 .into_iter()
                 .zip(receivers)
@@ -1552,7 +1553,7 @@ impl RuntimeHandle {
         let mut spawned_count = 0usize;
 
         for (worker_idx, dataflow) in dataflows.into_iter().enumerate() {
-            let ctx = WorkerContext::new(worker_idx, num_workers);
+            let ctx = WorkerContext::new(worker_idx, num_workers)?;
             let pc = if !progress_channels.is_empty() {
                 // Take this worker's progress channels (replace with empty placeholder).
                 Some(std::mem::replace(
@@ -1700,7 +1701,10 @@ impl RuntimeHandle {
             .map(|s| s.parallelism.unwrap_or(default_parallelism))
             .collect();
 
-        let num_workers = *stage_parallelism.iter().max().unwrap_or(&default_parallelism);
+        let num_workers = *stage_parallelism
+            .iter()
+            .max()
+            .unwrap_or(&default_parallelism);
 
         if num_workers == 0 {
             return Err(Error::Custom("computed num_workers must be >= 1".into()));
@@ -1823,7 +1827,7 @@ impl RuntimeHandle {
         let wake_handles: Vec<WakeHandle> = (0..num_workers).map(|_| WakeHandle::new()).collect();
 
         let mut progress_channels = if num_workers > 1 {
-            create_progress_channels::<T>(num_workers, &wake_handles)
+            create_progress_channels::<T>(num_workers, &wake_handles)?
         } else {
             Vec::new()
         };
@@ -1835,8 +1839,13 @@ impl RuntimeHandle {
             None
         };
         let mut control_pairs: Vec<Option<(ControlSender, ControlReceiver)>> = if num_workers > 1 {
-            let df_cancel = dataflow_cancel.as_ref().expect("dataflow_cancel set for multi-worker").clone();
-            let (senders, receivers) = ControlBroadcast::new(num_workers, &wake_handles, df_cancel);
+            // SAFETY: dataflow_cancel is unconditionally set before entering multi-worker spawn
+            let df_cancel = dataflow_cancel
+                .as_ref()
+                .expect("dataflow_cancel set for multi-worker")
+                .clone();
+            let (senders, receivers) =
+                ControlBroadcast::new(num_workers, &wake_handles, df_cancel)?;
             senders
                 .into_iter()
                 .zip(receivers)
@@ -1852,7 +1861,7 @@ impl RuntimeHandle {
         let mut spawned_count = 0usize;
 
         for (worker_idx, dataflow) in dataflows.into_iter().enumerate() {
-            let ctx = WorkerContext::new(worker_idx, num_workers);
+            let ctx = WorkerContext::new(worker_idx, num_workers)?;
             let pc = if !progress_channels.is_empty() {
                 Some(std::mem::replace(
                     &mut progress_channels[worker_idx],
@@ -1995,7 +2004,7 @@ impl RuntimeHandle {
         R: tokio::io::AsyncRead + Unpin + Send + 'static,
         W: tokio::io::AsyncWrite + Unpin + Send + 'static,
     {
-        use crate::communication::cluster_transport::{ClusterTransport, ClusterSpawnTransport};
+        use crate::communication::cluster_transport::{ClusterSpawnTransport, ClusterTransport};
         use crate::communication::control_protocol::{
             compute_fingerprint, perform_handshake, perform_handshake_with_transport,
             perform_ready_barrier, perform_ready_barrier_with_transport,
@@ -2063,10 +2072,20 @@ impl RuntimeHandle {
             >,
         >;
         // Shared peer managers Arc (keeps managers alive for the dataflow lifetime).
-        let shared_managers_arc: Option<Arc<std::collections::HashMap<String, crate::communication::shared_transport::SharedPeerManager>>>;
+        let shared_managers_arc: Option<
+            Arc<
+                std::collections::HashMap<
+                    String,
+                    crate::communication::shared_transport::SharedPeerManager,
+                >,
+            >,
+        >;
 
         match transport_config {
-            ClusterSpawnTransport::Dedicated { connections, capacity } => {
+            ClusterSpawnTransport::Dedicated {
+                connections,
+                capacity,
+            } => {
                 // Validate connections match topology.
                 {
                     let mut expected_peers: std::collections::HashSet<&str> = topology
@@ -2105,11 +2124,20 @@ impl RuntimeHandle {
                             continue;
                         }
                         let peer_id = &node.node_id;
-                        let (peer_start, peer_end) = topology.worker_range(peer_id).expect("topology node must have worker range");
+                        let (peer_start, peer_end) = topology
+                            .worker_range(peer_id)
+                            .ok_or_else(|| {
+                                Error::InvalidConfig(format!(
+                                    "topology missing worker range for node {peer_id:?}"
+                                ))
+                            })?;
                         for src in peer_start..peer_end {
                             for dst in local_start..local_end {
                                 let channel_id = NetworkEdgeMaterializer::<T, u8>::channel_id(
-                                    edge_order, src, dst, total_workers,
+                                    edge_order,
+                                    src,
+                                    dst,
+                                    total_workers,
                                 );
                                 data_regs.push(ChannelRegistration {
                                     peer_node_id: peer_id.clone(),
@@ -2126,10 +2154,16 @@ impl RuntimeHandle {
                         continue;
                     }
                     let peer_id = &node.node_id;
-                    let (peer_start, peer_end) = topology.worker_range(peer_id).expect("topology node must have worker range");
+                    let (peer_start, peer_end) = topology
+                        .worker_range(peer_id)
+                        .ok_or_else(|| {
+                            Error::InvalidConfig(format!(
+                                "topology missing worker range for node {peer_id:?}"
+                            ))
+                        })?;
                     for src in peer_start..peer_end {
                         for dst in local_start..local_end {
-                            let ch_id = progress_channel_id(src, dst, total_workers);
+                            let ch_id = progress_channel_id(src, dst, total_workers)?;
                             progress_regs.push(ChannelRegistration {
                                 peer_node_id: peer_id.clone(),
                                 channel_id: ch_id,
@@ -2161,7 +2195,10 @@ impl RuntimeHandle {
                 shared_managers_arc = None;
             }
 
-            ClusterSpawnTransport::Shared { peer_managers, capacity } => {
+            ClusterSpawnTransport::Shared {
+                peer_managers,
+                capacity,
+            } => {
                 // Validate peer_managers match topology.
                 {
                     let mut expected_peers: std::collections::HashSet<&str> = topology
@@ -2192,12 +2229,21 @@ impl RuntimeHandle {
                         if node.node_id == local_node_id {
                             continue;
                         }
-                        let (peer_start, peer_end) =
-                            topology.worker_range(&node.node_id).expect("topology node must have worker range");
+                        let (peer_start, peer_end) = topology
+                            .worker_range(&node.node_id)
+                            .ok_or_else(|| {
+                                Error::InvalidConfig(format!(
+                                    "topology missing worker range for node {:?}",
+                                    node.node_id
+                                ))
+                            })?;
                         for src in peer_start..peer_end {
                             for dst in local_start..local_end {
                                 let ch_id = NetworkEdgeMaterializer::<T, u8>::channel_id(
-                                    edge_order, src, dst, total_workers,
+                                    edge_order,
+                                    src,
+                                    dst,
+                                    total_workers,
                                 );
                                 all_channel_ids.push(ch_id);
                             }
@@ -2208,10 +2254,17 @@ impl RuntimeHandle {
                     if node.node_id == local_node_id {
                         continue;
                     }
-                    let (peer_start, peer_end) = topology.worker_range(&node.node_id).expect("topology node must have worker range");
+                    let (peer_start, peer_end) = topology
+                        .worker_range(&node.node_id)
+                        .ok_or_else(|| {
+                            Error::InvalidConfig(format!(
+                                "topology missing worker range for node {:?}",
+                                node.node_id
+                            ))
+                        })?;
                     for src in peer_start..peer_end {
                         for dst in local_start..local_end {
-                            let ch_id = progress_channel_id(src, dst, total_workers);
+                            let ch_id = progress_channel_id(src, dst, total_workers)?;
                             all_channel_ids.push(ch_id);
                         }
                     }
@@ -2294,7 +2347,13 @@ impl RuntimeHandle {
                     continue;
                 }
                 let peer_id = &node.node_id;
-                let (peer_start, peer_end) = topology.worker_range(peer_id).expect("topology node must have worker range");
+                let (peer_start, peer_end) = topology
+                    .worker_range(peer_id)
+                    .ok_or_else(|| {
+                        Error::InvalidConfig(format!(
+                            "topology missing worker range for node {peer_id:?}"
+                        ))
+                    })?;
                 let mut extracted = std::collections::HashMap::new();
                 if let Some(peer_map) = receivers.get_mut(peer_id) {
                     for src in peer_start..peer_end {
@@ -2367,7 +2426,7 @@ impl RuntimeHandle {
         // Phase 6: Create progress channels (wake handles already created in Phase 5).
 
         // Create local progress channels between local workers.
-        let all_local_progress = create_progress_channels::<T>(total_workers, &wake_handles);
+        let all_local_progress = create_progress_channels::<T>(total_workers, &wake_handles)?;
 
         // Extract only local workers' progress channels.
         let local_progress: Vec<_> = all_local_progress
@@ -2382,10 +2441,17 @@ impl RuntimeHandle {
             .iter()
             .filter(|n| n.node_id != local_node_id)
             .map(|n| {
-                let (s, e) = topology.worker_range(&n.node_id).expect("topology node must have worker range");
-                (n.node_id.clone(), s, e)
+                let (s, e) = topology
+                    .worker_range(&n.node_id)
+                    .ok_or_else(|| {
+                        Error::InvalidConfig(format!(
+                            "topology missing worker range for node {:?}",
+                            n.node_id
+                        ))
+                    })?;
+                Ok((n.node_id.clone(), s, e))
             })
-            .collect();
+            .collect::<Result<_>>()?;
 
         // Create a dataflow-level cancel token for local workers. When any local
         // worker fails, this cascades cancellation to all siblings.
@@ -2395,7 +2461,11 @@ impl RuntimeHandle {
 
         // Spawn error monitoring tasks for shared transport mode.
         if let Some(error_rxs) = shared_error_receivers {
-            let df_cancel = dataflow_cancel.as_ref().expect("dataflow_cancel always set for cluster dataflows").clone();
+            // SAFETY: dataflow_cancel is unconditionally set for cluster dataflows
+            let df_cancel = dataflow_cancel
+                .as_ref()
+                .expect("dataflow_cancel always set for cluster dataflows")
+                .clone();
             let bc = bridge_cancel.clone();
             for (peer_id, mut error_rx) in error_rxs {
                 let cancel = df_cancel.clone();
@@ -2410,9 +2480,9 @@ impl RuntimeHandle {
                             "shared transport error received, cancelling dataflow"
                         );
                         cancel.cancel_with_reason(
-                            crate::cancellation::CancellationReason::WorkerFailed(
-                                format!("shared transport failure from peer {peer}")
-                            )
+                            crate::cancellation::CancellationReason::WorkerFailed(format!(
+                                "shared transport failure from peer {peer}"
+                            )),
                         );
                         bridge.cancel();
                     }
@@ -2425,9 +2495,13 @@ impl RuntimeHandle {
             .map(|i| wake_handles[i].clone())
             .collect();
         let mut control_pairs: Vec<Option<(ControlSender, ControlReceiver)>> = if num_local > 1 {
-            let df_cancel = dataflow_cancel.as_ref().expect("dataflow_cancel always set for cluster dataflows").clone();
+            // SAFETY: dataflow_cancel is unconditionally set for cluster dataflows
+            let df_cancel = dataflow_cancel
+                .as_ref()
+                .expect("dataflow_cancel always set for cluster dataflows")
+                .clone();
             let (senders, receivers) =
-                ControlBroadcast::new(num_local, &local_wake_handles, df_cancel);
+                ControlBroadcast::new(num_local, &local_wake_handles, df_cancel)?;
             senders
                 .into_iter()
                 .zip(receivers)
@@ -2460,7 +2534,7 @@ impl RuntimeHandle {
 
         for (local_idx, dataflow) in dataflows.into_iter().enumerate() {
             let global_idx = local_start + local_idx;
-            let ctx = WorkerContext::new(global_idx, total_workers);
+            let ctx = WorkerContext::new(global_idx, total_workers)?;
             let pc = progress_channels_iter.next().map(Some).unwrap_or(None);
             let wh = wake_handles[global_idx].clone();
             let ctrl = control_pairs[local_idx].take();
@@ -2544,8 +2618,10 @@ impl RuntimeHandle {
                 worker_tokens,
                 bridge_cancel: bridge_cancel.clone(),
             };
-            Some(self.peer_registry
-                .register(&remote_peer_ids, name, cancel_handle))
+            Some(
+                self.peer_registry
+                    .register(&remote_peer_ids, name, cancel_handle),
+            )
         } else {
             None
         };
@@ -2976,7 +3052,7 @@ impl SimpleRuntime {
         let mut spawned_count = 0usize;
 
         for (worker_idx, dataflow) in dataflows.into_iter().enumerate() {
-            let ctx = WorkerContext::new(worker_idx, num_workers);
+            let ctx = WorkerContext::new(worker_idx, num_workers)?;
             match self.spawn_with_context(dataflow, ctx) {
                 Ok(spawned) => {
                     workers.push(spawned);
@@ -3142,7 +3218,11 @@ impl DataflowCompletion {
             shared: Arc::clone(&shared),
             condvar: Arc::clone(&condvar),
         };
-        let notifier = CompletionNotifier { shared, condvar, on_complete: None };
+        let notifier = CompletionNotifier {
+            shared,
+            condvar,
+            on_complete: None,
+        };
         (completion, notifier)
     }
 
@@ -3171,7 +3251,12 @@ impl DataflowCompletion {
                 .wait(state)
                 .map_err(|_| Error::Custom("completion mutex poisoned during wait".into()))?;
         }
-        interpret_completion(state.result.take().expect("result available after wait loop"))
+        interpret_completion(
+            state
+                .result
+                .take()
+                .ok_or_else(|| Error::Custom("internal: result missing after wait loop".into()))?,
+        )
     }
 }
 
@@ -3670,7 +3755,7 @@ impl<T: Timestamp> MultiSpawnedDataflow<T> {
     /// use instancy::SimpleRuntime;
     /// let rt = SimpleRuntime::new();
     /// let mut multi = rt.spawn_multi("ex", 4, |b: &mut DataflowBuilder<u64>| {
-    ///     b.input::<i32>("data").output("out"); Ok(())
+    ///     b.input::<i32>("data").unwrap().output("out").unwrap(); Ok(())
     /// }).unwrap();
     /// let senders = multi.take_all_inputs::<i32>("data").unwrap();
     /// assert_eq!(senders.len(), 4);
@@ -3695,6 +3780,7 @@ impl<T: Timestamp> MultiSpawnedDataflow<T> {
         let mut senders = Vec::with_capacity(self.num_workers);
         for w in &mut self.workers {
             senders.push(
+                // SAFETY: port names were validated to exist in the preceding loop
                 w.take_input::<D>(name)
                     .expect("take_all_inputs: pre-validated port disappeared"),
             );
@@ -3723,6 +3809,7 @@ impl<T: Timestamp> MultiSpawnedDataflow<T> {
         let mut receivers = Vec::with_capacity(self.num_workers);
         for w in &mut self.workers {
             receivers.push(
+                // SAFETY: port names were validated to exist in the preceding loop
                 w.take_output::<D>(name)
                     .expect("take_all_outputs: pre-validated port disappeared"),
             );
@@ -3751,6 +3838,7 @@ impl<T: Timestamp> MultiSpawnedDataflow<T> {
         let mut senders = Vec::with_capacity(self.num_workers);
         for w in &mut self.workers {
             senders.push(
+                // SAFETY: port names were validated to exist in the preceding loop
                 w.take_async_input::<D>(name)
                     .expect("take_all_async_inputs: pre-validated port disappeared"),
             );
@@ -3779,6 +3867,7 @@ impl<T: Timestamp> MultiSpawnedDataflow<T> {
         let mut receivers = Vec::with_capacity(self.num_workers);
         for w in &mut self.workers {
             receivers.push(
+                // SAFETY: port names were validated to exist in the preceding loop
                 w.take_async_output::<D>(name)
                     .expect("take_all_async_outputs: pre-validated port disappeared"),
             );
@@ -3942,7 +4031,14 @@ pub struct ClusterSpawnedDataflow<T: Timestamp> {
     /// Keeps transport alive (background Muxer/Demuxer tasks).
     _transport: Arc<crate::communication::cluster_transport::ClusterTransport>,
     /// Keeps shared peer managers alive (prevents task abort on drop).
-    _shared_managers: Option<Arc<std::collections::HashMap<String, crate::communication::shared_transport::SharedPeerManager>>>,
+    _shared_managers: Option<
+        Arc<
+            std::collections::HashMap<
+                String,
+                crate::communication::shared_transport::SharedPeerManager,
+            >,
+        >,
+    >,
     /// Keeps progress bridge tasks alive.
     _progress_handles: Option<crate::progress::network_progress::NetworkProgressHandles>,
     /// Cancels bridge tasks on drop.
@@ -3955,12 +4051,21 @@ pub struct ClusterSpawnedDataflow<T: Timestamp> {
 impl<T: Timestamp> ClusterSpawnedDataflow<T> {
     /// Get the dataflow name.
     pub fn name(&self) -> &str {
-        self.inner.as_ref().expect("not yet joined").name()
+        // SAFETY: inner is always Some until join() consumes it via take(),
+        // and join(mut self) takes ownership preventing further access.
+        self.inner
+            .as_ref()
+            .expect("dataflow already joined")
+            .name()
     }
 
     /// Number of LOCAL workers on this node.
     pub fn num_local_workers(&self) -> usize {
-        self.inner.as_ref().expect("not yet joined").num_workers()
+        // SAFETY: inner is always Some until join() consumes it.
+        self.inner
+            .as_ref()
+            .expect("dataflow already joined")
+            .num_workers()
     }
 
     /// Total worker count across all nodes in the cluster.
@@ -3983,7 +4088,10 @@ impl<T: Timestamp> ClusterSpawnedDataflow<T> {
         local_idx: usize,
         name: &str,
     ) -> Result<crate::dataflow::channel_operators::InputSender<T, D>> {
-        self.inner.as_mut().expect("not yet joined").take_input(local_idx, name)
+        self.inner
+            .as_mut()
+            .ok_or_else(|| Error::Custom("dataflow already joined".into()))?
+            .take_input(local_idx, name)
     }
 
     /// Take the output receiver from a local worker.
@@ -3994,7 +4102,10 @@ impl<T: Timestamp> ClusterSpawnedDataflow<T> {
         local_idx: usize,
         name: &str,
     ) -> Result<crate::dataflow::channel_operators::OutputReceiver<T, D>> {
-        self.inner.as_mut().expect("not yet joined").take_output(local_idx, name)
+        self.inner
+            .as_mut()
+            .ok_or_else(|| Error::Custom("dataflow already joined".into()))?
+            .take_output(local_idx, name)
     }
 
     /// Cancel all local workers and tear down the cluster.
@@ -4025,19 +4136,23 @@ impl<T: Timestamp> ClusterSpawnedDataflow<T> {
     ///
     /// The returned handle implements [`Future`] and can be `.await`ed in
     /// async code, or blocked on via [`.wait()`](ClusterCompletion::wait).
-    pub fn join(mut self) -> ClusterCompletion<T> {
-        let completion = self.inner.take().expect("join called after move").join();
+    pub fn join(mut self) -> Result<ClusterCompletion<T>> {
+        let completion = self
+            .inner
+            .take()
+            .ok_or_else(|| Error::Custom("dataflow already joined".into()))?
+            .join();
         // Transfer all resources to ClusterCompletion so bridges stay alive.
         // Setting _bridge_cancel_moved prevents Drop from firing it early.
         self._bridge_cancel_moved = true;
-        ClusterCompletion {
+        Ok(ClusterCompletion {
             completion: Some(completion),
             _transport: self._transport.clone(),
             _shared_managers: self._shared_managers.take(),
             _progress_handles: self._progress_handles.take(),
             _bridge_cancel: self._bridge_cancel.clone(),
             _phantom: PhantomData,
-        }
+        })
     }
 
     /// Block until all local workers complete.
@@ -4046,7 +4161,7 @@ impl<T: Timestamp> ClusterSpawnedDataflow<T> {
     /// remote data and progress. They are cancelled only after all
     /// workers have finished.
     pub fn join_blocking(self) -> Result<()> {
-        self.join().wait()
+        self.join()?.wait()
     }
 }
 
@@ -4075,7 +4190,14 @@ pub struct ClusterCompletion<T: Timestamp> {
     /// Keeps transport alive (background Muxer/Demuxer tasks).
     _transport: Arc<crate::communication::cluster_transport::ClusterTransport>,
     /// Keeps shared peer managers alive (prevents task abort on drop).
-    _shared_managers: Option<Arc<std::collections::HashMap<String, crate::communication::shared_transport::SharedPeerManager>>>,
+    _shared_managers: Option<
+        Arc<
+            std::collections::HashMap<
+                String,
+                crate::communication::shared_transport::SharedPeerManager,
+            >,
+        >,
+    >,
     /// Progress handle keepalive (None if not transferrable).
     _progress_handles: Option<crate::progress::network_progress::NetworkProgressHandles>,
     /// Cancels bridge tasks when this completion drops.
@@ -4091,7 +4213,10 @@ impl<T: Timestamp> ClusterCompletion<T> {
     /// remaining workers and returns that error. Bridges are cancelled
     /// after this method returns (when `self` drops).
     pub fn wait(mut self) -> Result<()> {
-        let completion = self.completion.take().expect("wait called after poll completed");
+        let completion = self
+            .completion
+            .take()
+            .ok_or_else(|| Error::Custom("cluster completion already consumed".into()))?;
         let result = completion.wait();
         // Cancel bridges eagerly so cleanup doesn't wait for handle drop.
         self._bridge_cancel.cancel();
@@ -4108,7 +4233,11 @@ impl<T: Timestamp> Future for ClusterCompletion<T> {
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         let this = self.get_mut();
-        let completion = this.completion.as_mut().expect("polled after completion");
+        let Some(completion) = this.completion.as_mut() else {
+            return Poll::Ready(Err(Error::Custom(
+                "cluster completion already consumed".into(),
+            )));
+        };
         let result = Pin::new(completion).poll(cx);
         if result.is_ready() {
             // Cancel bridges eagerly so cleanup doesn't wait for handle drop.
@@ -4427,9 +4556,9 @@ fn materialize_executor<T: Timestamp>(
     // remote changes. This makes is_completed() reflect global state.
     let mut tracker = subgraph_builder.build();
     if let Some(channels) = progress_channels {
-        tracker.set_progress_channels(channels);
+        tracker.set_progress_channels(channels)?;
     }
-    tracker.initialize();
+    tracker.initialize()?;
     executor.set_progress_tracker(tracker);
 
     // Register probes
@@ -4468,7 +4597,9 @@ mod tests {
         let config = RuntimeConfig {
             worker_threads: 2,
             schedule_policy: None,
-            name: "test-runtime".to_string(), ..Default::default() };
+            name: "test-runtime".to_string(),
+            ..Default::default()
+        };
         let rt = RuntimeHandle::new(config).unwrap();
         assert_eq!(rt.name(), "test-runtime");
         assert!(!rt.is_shutdown());
@@ -4479,7 +4610,9 @@ mod tests {
         let rt = RuntimeHandle::new(RuntimeConfig {
             worker_threads: 1,
             schedule_policy: None,
-            name: "shutdown-test".to_string(), ..Default::default() })
+            name: "shutdown-test".to_string(),
+            ..Default::default()
+        })
         .unwrap();
         assert!(!rt.is_shutdown());
         rt.shutdown();
@@ -4492,12 +4625,16 @@ mod tests {
         let rt1 = RuntimeHandle::new(RuntimeConfig {
             worker_threads: 1,
             schedule_policy: None,
-            name: "rt1".to_string(), ..Default::default() })
+            name: "rt1".to_string(),
+            ..Default::default()
+        })
         .unwrap();
         let rt2 = RuntimeHandle::new(RuntimeConfig {
             worker_threads: 1,
             schedule_policy: None,
-            name: "rt2".to_string(), ..Default::default() })
+            name: "rt2".to_string(),
+            ..Default::default()
+        })
         .unwrap();
 
         // Shutting down rt1 doesn't affect rt2
@@ -4516,7 +4653,7 @@ mod tests {
         let port = builder
             .source("nums", vec![(0u64, vec![1i32, 2, 3])])
             .map("double", |_t, x| x * 2)
-            .output("results");
+            .output("results").unwrap();
         let dataflow = builder.build().unwrap();
 
         SimpleRuntime::new().run(dataflow).unwrap();
@@ -4531,7 +4668,7 @@ mod tests {
         use crate::dataflow::DataflowBuilder;
 
         let builder = DataflowBuilder::<u64>::new("reject_test");
-        let _ = builder.input::<i32>("data").output("out");
+        let _ = builder.input::<i32>("data").unwrap().output("out").unwrap();
         let dataflow = builder.build().unwrap();
 
         let result = SimpleRuntime::new().run(dataflow);
@@ -4544,8 +4681,8 @@ mod tests {
         use crate::dataflow::DataflowBuilder;
 
         let builder = DataflowBuilder::<u64>::new("rt_spawn");
-        let input = builder.input::<i32>("data");
-        input.map("inc", |_t, x| x + 1).output("out");
+        let input = builder.input::<i32>("data").unwrap();
+        input.map("inc", |_t, x| x + 1).output("out").unwrap();
         let dataflow = builder.build().unwrap();
 
         let mut handle = SimpleRuntime::new().spawn(dataflow).unwrap();
@@ -4565,8 +4702,8 @@ mod tests {
 
         let rt = SimpleRuntime::new();
         let builder = DataflowBuilder::<u64>::new("cancel_rt");
-        let input = builder.input::<i32>("data");
-        input.output("out");
+        let input = builder.input::<i32>("data").unwrap();
+        input.output("out").unwrap();
         let dataflow = builder.build().unwrap();
 
         let handle = rt.spawn(dataflow).unwrap();
@@ -4592,7 +4729,7 @@ mod tests {
         builder
             .source("nums", vec![(0u64, vec![1i32, 2, 3])])
             .map("double", |_t, x| x * 2)
-            .output("results");
+            .output("results").unwrap();
         let dataflow = builder.build().unwrap();
 
         let mut handle = rt.spawn(dataflow, SpawnOptions::default()).unwrap();
@@ -4613,8 +4750,8 @@ mod tests {
         .unwrap();
 
         let builder = DataflowBuilder::<u64>::new("rt_spawn");
-        let input = builder.input::<i32>("data");
-        input.map("double", |_t, x| x * 2).output("results");
+        let input = builder.input::<i32>("data").unwrap();
+        input.map("double", |_t, x| x * 2).output("results").unwrap();
         let dataflow = builder.build().unwrap();
 
         let mut handle = rt.spawn(dataflow, SpawnOptions::default()).unwrap();
@@ -4639,8 +4776,8 @@ mod tests {
         .unwrap();
 
         let builder = DataflowBuilder::<u64>::new("rt_cancel");
-        let input = builder.input::<i32>("data");
-        input.output("out");
+        let input = builder.input::<i32>("data").unwrap();
+        input.output("out").unwrap();
         let dataflow = builder.build().unwrap();
 
         let handle = rt.spawn(dataflow, SpawnOptions::default()).unwrap();
@@ -4661,11 +4798,12 @@ mod tests {
 
         for i in 0..3 {
             let builder = DataflowBuilder::<u64>::new(format!("df_{i}"));
-            builder
-                .source("data", vec![(0u64, vec![i])])
-                .output("out");
+            builder.source("data", vec![(0u64, vec![i])]).output("out").unwrap();
             let dataflow = builder.build().unwrap();
-            rt.spawn(dataflow, SpawnOptions::default()).unwrap().join_blocking().unwrap();
+            rt.spawn(dataflow, SpawnOptions::default())
+                .unwrap()
+                .join_blocking()
+                .unwrap();
         }
     }
 
@@ -4680,8 +4818,8 @@ mod tests {
         .unwrap();
 
         let builder = DataflowBuilder::<u64>::new("spawn_with_inputs");
-        let input = builder.input::<i32>("x");
-        input.map("inc", |_t, x| x + 1).output("y");
+        let input = builder.input::<i32>("x").unwrap();
+        input.map("inc", |_t, x| x + 1).output("y").unwrap();
         let dataflow = builder.build().unwrap();
 
         let mut handle = rt.spawn(dataflow, SpawnOptions::default()).unwrap();
@@ -4752,7 +4890,7 @@ mod tests {
         let builder = DataflowBuilder::<u64>::new("await_test");
         builder
             .source("nums", vec![(0u64, vec![1i32, 2, 3])])
-            .output("out");
+            .output("out").unwrap();
         let dataflow = builder.build().unwrap();
 
         // Exercise the async completion path: .await on DataflowCompletion
@@ -4771,8 +4909,8 @@ mod tests {
         .unwrap();
 
         let builder = DataflowBuilder::<u64>::new("drop_cancel");
-        let input = builder.input::<i32>("data");
-        input.output("out");
+        let input = builder.input::<i32>("data").unwrap();
+        input.output("out").unwrap();
         let dataflow = builder.build().unwrap();
 
         // Drop without calling join() — should cancel and not hang
@@ -4791,11 +4929,13 @@ mod tests {
         .unwrap();
 
         let builder = DataflowBuilder::<u64>::new("async_roundtrip");
-        let input = builder.input::<i32>("data");
-        input.map("mul10", |_t, x| x * 10).output("out");
+        let input = builder.input::<i32>("data").unwrap();
+        input.map("mul10", |_t, x| x * 10).output("out").unwrap();
         let dataflow = builder.build().unwrap();
 
-        let mut handle = rt.spawn(dataflow, SpawnOptions::new().io_mode(IoMode::Async)).unwrap();
+        let mut handle = rt
+            .spawn(dataflow, SpawnOptions::new().io_mode(IoMode::Async))
+            .unwrap();
         let sender = handle.take_async_input::<i32>("data").unwrap();
         let mut receiver = handle.take_async_output::<i32>("out").unwrap();
 
@@ -4824,11 +4964,13 @@ mod tests {
         .unwrap();
 
         let builder = DataflowBuilder::<u64>::new("cross_mode_err");
-        let input = builder.input::<i32>("data");
-        input.output("out");
+        let input = builder.input::<i32>("data").unwrap();
+        input.output("out").unwrap();
         let dataflow = builder.build().unwrap();
 
-        let mut handle = rt.spawn(dataflow, SpawnOptions::new().io_mode(IoMode::Async)).unwrap();
+        let mut handle = rt
+            .spawn(dataflow, SpawnOptions::new().io_mode(IoMode::Async))
+            .unwrap();
 
         // Using sync take_input on an async-wired port should give a helpful error
         let err = handle.take_input::<i32>("data").unwrap_err();
@@ -4857,11 +4999,13 @@ mod tests {
         .unwrap();
 
         let builder = DataflowBuilder::<u64>::new("async_multi_ts");
-        let input = builder.input::<i32>("data");
-        input.output("out");
+        let input = builder.input::<i32>("data").unwrap();
+        input.output("out").unwrap();
         let dataflow = builder.build().unwrap();
 
-        let mut handle = rt.spawn(dataflow, SpawnOptions::new().io_mode(IoMode::Async)).unwrap();
+        let mut handle = rt
+            .spawn(dataflow, SpawnOptions::new().io_mode(IoMode::Async))
+            .unwrap();
         let sender = handle.take_async_input::<i32>("data").unwrap();
         let mut receiver = handle.take_async_output::<i32>("out").unwrap();
 
@@ -4891,11 +5035,13 @@ mod tests {
         .unwrap();
 
         let builder = DataflowBuilder::<u64>::new("clone_sender");
-        let input = builder.input::<i32>("data");
-        input.output("out");
+        let input = builder.input::<i32>("data").unwrap();
+        input.output("out").unwrap();
         let dataflow = builder.build().unwrap();
 
-        let mut handle = rt.spawn(dataflow, SpawnOptions::new().io_mode(IoMode::Async)).unwrap();
+        let mut handle = rt
+            .spawn(dataflow, SpawnOptions::new().io_mode(IoMode::Async))
+            .unwrap();
         let sender1 = handle.take_async_input::<i32>("data").unwrap();
         let sender2 = sender1.clone();
 
@@ -4924,15 +5070,11 @@ mod tests {
     fn spawn_multi_single_worker_matches_spawn() {
         let rt = SimpleRuntime::new();
         let mut multi = rt
-            .spawn_multi(
-                "test",
-                1,
-                |builder: &mut DataflowBuilder<u64>| {
-                    let input = builder.input::<i32>("data");
-                    input.map("double", |_t, x| x * 2).output("out");
-                    Ok(())
-                },
-            )
+            .spawn_multi("test", 1, |builder: &mut DataflowBuilder<u64>| {
+                let input = builder.input::<i32>("data").unwrap();
+                input.map("double", |_t, x| x * 2).output("out").unwrap();
+                Ok(())
+            })
             .unwrap();
 
         assert_eq!(multi.num_workers(), 1);
@@ -4955,15 +5097,11 @@ mod tests {
         let rt = SimpleRuntime::new();
         let num = 4;
         let mut multi = rt
-            .spawn_multi(
-                "parallel",
-                num,
-                |builder: &mut DataflowBuilder<u64>| {
-                    let input = builder.input::<i32>("data");
-                    input.map("triple", |_t, x| x * 3).output("out");
-                    Ok(())
-                },
-            )
+            .spawn_multi("parallel", num, |builder: &mut DataflowBuilder<u64>| {
+                let input = builder.input::<i32>("data").unwrap();
+                input.map("triple", |_t, x| x * 3).output("out").unwrap();
+                Ok(())
+            })
             .unwrap();
 
         assert_eq!(multi.num_workers(), num);
@@ -5012,15 +5150,11 @@ mod tests {
     fn spawn_multi_cancel_stops_all() {
         let rt = SimpleRuntime::new();
         let mut multi = rt
-            .spawn_multi(
-                "cancel-test",
-                3,
-                |builder: &mut DataflowBuilder<u64>| {
-                    let input = builder.input::<i32>("data");
-                    input.output("out");
-                    Ok(())
-                },
-            )
+            .spawn_multi("cancel-test", 3, |builder: &mut DataflowBuilder<u64>| {
+                let input = builder.input::<i32>("data").unwrap();
+                input.output("out").unwrap();
+                Ok(())
+            })
             .unwrap();
 
         // Take senders to keep workers alive (inputs open).
@@ -5044,8 +5178,8 @@ mod tests {
                 "pool-test",
                 2,
                 |builder: &mut DataflowBuilder<u64>| {
-                    let input = builder.input::<i32>("data");
-                    input.map("inc", |_t, x| x + 1).output("out");
+                    let input = builder.input::<i32>("data").unwrap();
+                    input.map("inc", |_t, x| x + 1).output("out").unwrap();
                     Ok(())
                 },
                 SpawnOptions::default(),
@@ -5076,14 +5210,10 @@ mod tests {
     fn spawn_multi_join_returns_completion() {
         let rt = SimpleRuntime::new();
         let multi = rt
-            .spawn_multi(
-                "join-test",
-                2,
-                |builder: &mut DataflowBuilder<u64>| {
-                    builder.source::<i32>("src", vec![]);
-                    Ok(())
-                },
-            )
+            .spawn_multi("join-test", 2, |builder: &mut DataflowBuilder<u64>| {
+                builder.source::<i32>("src", vec![]);
+                Ok(())
+            })
             .unwrap();
 
         let completion = multi.join();
@@ -5095,8 +5225,8 @@ mod tests {
         let rt = SimpleRuntime::new();
         let mut multi = rt
             .spawn_multi("range-test", 2, |builder: &mut DataflowBuilder<u64>| {
-                let input = builder.input::<i32>("data");
-                input.output("out");
+                let input = builder.input::<i32>("data").unwrap();
+                input.output("out").unwrap();
                 Ok(())
             })
             .unwrap();
@@ -5116,8 +5246,8 @@ mod tests {
         let n = 3;
         let mut multi = rt
             .spawn_multi("all-in", n, |builder: &mut DataflowBuilder<u64>| {
-                let input = builder.input::<i32>("data");
-                input.output("out");
+                let input = builder.input::<i32>("data").unwrap();
+                input.output("out").unwrap();
                 Ok(())
             })
             .unwrap();
@@ -5151,8 +5281,8 @@ mod tests {
         let n = 4;
         let mut multi = rt
             .spawn_multi("all-out", n, |builder: &mut DataflowBuilder<u64>| {
-                let input = builder.input::<i32>("nums");
-                input.map("double", |_t, x| x * 2).output("results");
+                let input = builder.input::<i32>("nums").unwrap();
+                input.map("double", |_t, x| x * 2).output("results").unwrap();
                 Ok(())
             })
             .unwrap();
@@ -5179,8 +5309,8 @@ mod tests {
         let rt = SimpleRuntime::new();
         let mut multi = rt
             .spawn_multi("type-err", 2, |builder: &mut DataflowBuilder<u64>| {
-                let input = builder.input::<i32>("data");
-                input.output("out");
+                let input = builder.input::<i32>("data").unwrap();
+                input.output("out").unwrap();
                 Ok(())
             })
             .unwrap();
@@ -5202,8 +5332,8 @@ mod tests {
         let rt = SimpleRuntime::new();
         let mut multi = rt
             .spawn_multi("missing", 2, |builder: &mut DataflowBuilder<u64>| {
-                let input = builder.input::<i32>("data");
-                input.output("out");
+                let input = builder.input::<i32>("data").unwrap();
+                input.output("out").unwrap();
                 Ok(())
             })
             .unwrap();
@@ -5225,8 +5355,8 @@ mod tests {
         let rt = SimpleRuntime::new();
         let mut multi = rt
             .spawn_multi("idem", 2, |builder: &mut DataflowBuilder<u64>| {
-                let input = builder.input::<i32>("data");
-                input.output("out");
+                let input = builder.input::<i32>("data").unwrap();
+                input.output("out").unwrap();
                 Ok(())
             })
             .unwrap();
@@ -5248,10 +5378,10 @@ mod tests {
         let n = 4;
         let mut multi = rt
             .spawn_multi("e2e", n, |builder: &mut DataflowBuilder<u64>| {
-                let input = builder.input::<String>("words");
+                let input = builder.input::<String>("words").unwrap();
                 input
                     .map("upper", |_t, s: String| s.to_uppercase())
-                    .output("results");
+                    .output("results").unwrap();
                 Ok(())
             })
             .unwrap();
@@ -5259,10 +5389,12 @@ mod tests {
         let senders = multi.take_all_inputs::<String>("words").unwrap();
         let receivers = multi.take_all_outputs::<String>("results").unwrap();
 
-        let partitions = [vec!["hello".to_string()],
+        let partitions = [
+            vec!["hello".to_string()],
             vec!["world".to_string()],
             vec!["foo".to_string(), "bar".to_string()],
-            vec![]];
+            vec![],
+        ];
 
         for (i, partition) in partitions.iter().enumerate() {
             if !partition.is_empty() {
@@ -5289,8 +5421,8 @@ mod tests {
         let rt = SimpleRuntime::new();
         let mut multi = rt
             .spawn_multi("mode-err", 2, |builder: &mut DataflowBuilder<u64>| {
-                let input = builder.input::<i32>("data");
-                input.output("out");
+                let input = builder.input::<i32>("data").unwrap();
+                input.output("out").unwrap();
                 Ok(())
             })
             .unwrap();
@@ -5318,14 +5450,19 @@ mod tests {
         // Even numbers go to worker 0, odd numbers go to worker 1.
         let rt = RuntimeHandle::new(RuntimeConfig::default()).unwrap();
         let mut multi = rt
-            .spawn_multi("exchange_test", 2, |builder| {
-                let input = builder.input::<i32>("data");
-                // Use exchange_by_hash for direct u64 routing (no extra hashing).
-                input
-                    .exchange_by_hash("mod2", |x: &i32| *x as u64)
-                    .output("results");
-                Ok(())
-            }, SpawnOptions::default())
+            .spawn_multi(
+                "exchange_test",
+                2,
+                |builder| {
+                    let input = builder.input::<i32>("data").unwrap();
+                    // Use exchange_by_hash for direct u64 routing (no extra hashing).
+                    input
+                        .exchange_by_hash("mod2", |x: &i32| *x as u64)
+                        .output("results").unwrap();
+                    Ok(())
+                },
+                SpawnOptions::default(),
+            )
             .unwrap();
 
         // Get per-worker outputs and inputs.
@@ -5377,11 +5514,16 @@ mod tests {
         // With 1 worker, exchange degenerates to a pass-through.
         let rt = RuntimeHandle::new(RuntimeConfig::default()).unwrap();
         let mut multi = rt
-            .spawn_multi("exchange_1w", 1, |builder| {
-                let input = builder.input::<i32>("data");
-                input.exchange("by_key", |x: &i32| *x as u64).output("out");
-                Ok(())
-            }, SpawnOptions::default())
+            .spawn_multi(
+                "exchange_1w",
+                1,
+                |builder| {
+                    let input = builder.input::<i32>("data").unwrap();
+                    input.exchange("by_key", |x: &i32| *x as u64).output("out").unwrap();
+                    Ok(())
+                },
+                SpawnOptions::default(),
+            )
             .unwrap();
 
         let out = multi.take_output::<i32>(0, "out").unwrap();
@@ -5406,15 +5548,20 @@ mod tests {
         // Tests that computation works both before and after exchange.
         let rt = RuntimeHandle::new(RuntimeConfig::default()).unwrap();
         let mut multi = rt
-            .spawn_multi("exchange_compute", 2, |builder| {
-                let input = builder.input::<i32>("data");
-                input
-                    .map("double", |_t, x| x * 2)
-                    .exchange_by_hash("mod2", |x: &i32| *x as u64)
-                    .map("add100", |_t, x| x + 100)
-                    .output("results");
-                Ok(())
-            }, SpawnOptions::default())
+            .spawn_multi(
+                "exchange_compute",
+                2,
+                |builder| {
+                    let input = builder.input::<i32>("data").unwrap();
+                    input
+                        .map("double", |_t, x| x * 2)
+                        .exchange_by_hash("mod2", |x: &i32| *x as u64)
+                        .map("add100", |_t, x| x + 100)
+                        .output("results").unwrap();
+                    Ok(())
+                },
+                SpawnOptions::default(),
+            )
             .unwrap();
 
         let out0 = multi.take_output::<i32>(0, "results").unwrap();
@@ -5458,13 +5605,18 @@ mod tests {
         // Tests that data flows correctly in both directions.
         let rt = RuntimeHandle::new(RuntimeConfig::default()).unwrap();
         let mut multi = rt
-            .spawn_multi("exchange_bidir", 2, |builder| {
-                let input = builder.input::<i32>("data");
-                input
-                    .exchange_by_hash("mod2", |x: &i32| *x as u64)
-                    .output("out");
-                Ok(())
-            }, SpawnOptions::default())
+            .spawn_multi(
+                "exchange_bidir",
+                2,
+                |builder| {
+                    let input = builder.input::<i32>("data").unwrap();
+                    input
+                        .exchange_by_hash("mod2", |x: &i32| *x as u64)
+                        .output("out").unwrap();
+                    Ok(())
+                },
+                SpawnOptions::default(),
+            )
             .unwrap();
 
         let out0 = multi.take_output::<i32>(0, "out").unwrap();
@@ -5528,30 +5680,35 @@ mod tests {
         // Evens go to worker 0, odds to worker 1. Each worker sums its partition.
         let rt = RuntimeHandle::new(RuntimeConfig::default()).unwrap();
         let mut multi = rt
-            .spawn_multi("exchange_notify_basic", 2, |builder| {
-                let input = builder.input::<i32>("data");
-                input
-                    .exchange_by_hash("mod2", |x: &i32| *x as u64)
-                    .unary_notify("sum", {
-                        let mut stash: std::collections::HashMap<u64, Vec<i32>> =
-                            std::collections::HashMap::new();
-                        move |input, output, ctx| {
-                            while let Some((time, data)) = input.next() {
-                                stash.entry(time).or_default().extend(data);
-                                ctx.notify_at(time);
-                            }
-                            while let Some(time) = ctx.next_notification() {
-                                if let Some(data) = stash.remove(&time) {
-                                    let sum: i32 = data.iter().sum();
-                                    output.push_vec(time, vec![sum]);
+            .spawn_multi(
+                "exchange_notify_basic",
+                2,
+                |builder| {
+                    let input = builder.input::<i32>("data").unwrap();
+                    input
+                        .exchange_by_hash("mod2", |x: &i32| *x as u64)
+                        .unary_notify("sum", {
+                            let mut stash: std::collections::HashMap<u64, Vec<i32>> =
+                                std::collections::HashMap::new();
+                            move |input, output, ctx| {
+                                while let Some((time, data)) = input.next() {
+                                    stash.entry(time).or_default().extend(data);
+                                    ctx.notify_at(time);
                                 }
+                                while let Some(time) = ctx.next_notification() {
+                                    if let Some(data) = stash.remove(&time) {
+                                        let sum: i32 = data.iter().sum();
+                                        output.push_vec(time, vec![sum]);
+                                    }
+                                }
+                                Ok(())
                             }
-                            Ok(())
-                        }
-                    })
-                    .output("results");
-                Ok(())
-            }, SpawnOptions::default())
+                        })
+                        .output("results").unwrap();
+                    Ok(())
+                },
+                SpawnOptions::default(),
+            )
             .unwrap();
 
         let out0 = multi.take_output::<i32>(0, "results").unwrap();
@@ -5585,30 +5742,35 @@ mod tests {
         // Each epoch's data is aggregated independently.
         let rt = RuntimeHandle::new(RuntimeConfig::default()).unwrap();
         let mut multi = rt
-            .spawn_multi("exchange_notify_epochs", 2, |builder| {
-                let input = builder.input::<i32>("data");
-                input
-                    .exchange_by_hash("mod2", |x: &i32| *x as u64)
-                    .unary_notify("sum_per_epoch", {
-                        let mut stash: std::collections::HashMap<u64, Vec<i32>> =
-                            std::collections::HashMap::new();
-                        move |input, output, ctx| {
-                            while let Some((time, data)) = input.next() {
-                                stash.entry(time).or_default().extend(data);
-                                ctx.notify_at(time);
-                            }
-                            while let Some(time) = ctx.next_notification() {
-                                if let Some(data) = stash.remove(&time) {
-                                    let sum: i32 = data.iter().sum();
-                                    output.push_vec(time, vec![sum]);
+            .spawn_multi(
+                "exchange_notify_epochs",
+                2,
+                |builder| {
+                    let input = builder.input::<i32>("data").unwrap();
+                    input
+                        .exchange_by_hash("mod2", |x: &i32| *x as u64)
+                        .unary_notify("sum_per_epoch", {
+                            let mut stash: std::collections::HashMap<u64, Vec<i32>> =
+                                std::collections::HashMap::new();
+                            move |input, output, ctx| {
+                                while let Some((time, data)) = input.next() {
+                                    stash.entry(time).or_default().extend(data);
+                                    ctx.notify_at(time);
                                 }
+                                while let Some(time) = ctx.next_notification() {
+                                    if let Some(data) = stash.remove(&time) {
+                                        let sum: i32 = data.iter().sum();
+                                        output.push_vec(time, vec![sum]);
+                                    }
+                                }
+                                Ok(())
                             }
-                            Ok(())
-                        }
-                    })
-                    .output("results");
-                Ok(())
-            }, SpawnOptions::default())
+                        })
+                        .output("results").unwrap();
+                    Ok(())
+                },
+                SpawnOptions::default(),
+            )
             .unwrap();
 
         let out0 = multi.take_output::<i32>(0, "results").unwrap();
@@ -5653,30 +5815,35 @@ mod tests {
         // Tests computation before exchange combined with notification after.
         let rt = RuntimeHandle::new(RuntimeConfig::default()).unwrap();
         let mut multi = rt
-            .spawn_multi("exchange_notify_chain", 2, |builder| {
-                let input = builder.input::<i32>("data");
-                input
-                    .map("double", |_t, x| x * 2)
-                    .exchange_by_hash("mod2", |x: &i32| *x as u64)
-                    .unary_notify("count", {
-                        let mut stash: std::collections::HashMap<u64, usize> =
-                            std::collections::HashMap::new();
-                        move |input, output, ctx| {
-                            while let Some((time, data)) = input.next() {
-                                *stash.entry(time).or_default() += data.len();
-                                ctx.notify_at(time);
-                            }
-                            while let Some(time) = ctx.next_notification() {
-                                if let Some(count) = stash.remove(&time) {
-                                    output.push_vec(time, vec![count as i32]);
+            .spawn_multi(
+                "exchange_notify_chain",
+                2,
+                |builder| {
+                    let input = builder.input::<i32>("data").unwrap();
+                    input
+                        .map("double", |_t, x| x * 2)
+                        .exchange_by_hash("mod2", |x: &i32| *x as u64)
+                        .unary_notify("count", {
+                            let mut stash: std::collections::HashMap<u64, usize> =
+                                std::collections::HashMap::new();
+                            move |input, output, ctx| {
+                                while let Some((time, data)) = input.next() {
+                                    *stash.entry(time).or_default() += data.len();
+                                    ctx.notify_at(time);
                                 }
+                                while let Some(time) = ctx.next_notification() {
+                                    if let Some(count) = stash.remove(&time) {
+                                        output.push_vec(time, vec![count as i32]);
+                                    }
+                                }
+                                Ok(())
                             }
-                            Ok(())
-                        }
-                    })
-                    .output("results");
-                Ok(())
-            }, SpawnOptions::default())
+                        })
+                        .output("results").unwrap();
+                    Ok(())
+                },
+                SpawnOptions::default(),
+            )
             .unwrap();
 
         let out0 = multi.take_output::<i32>(0, "results").unwrap();
@@ -5713,30 +5880,35 @@ mod tests {
         // worker should emit exactly one sum at t=0 after all batches are collected.
         let rt = RuntimeHandle::new(RuntimeConfig::default()).unwrap();
         let mut multi = rt
-            .spawn_multi("exchange_notify_multibatch", 2, |builder| {
-                let input = builder.input::<i32>("data");
-                input
-                    .exchange_by_hash("mod2", |x: &i32| *x as u64)
-                    .unary_notify("sum", {
-                        let mut stash: std::collections::HashMap<u64, Vec<i32>> =
-                            std::collections::HashMap::new();
-                        move |input, output, ctx| {
-                            while let Some((time, data)) = input.next() {
-                                stash.entry(time).or_default().extend(data);
-                                ctx.notify_at(time);
-                            }
-                            while let Some(time) = ctx.next_notification() {
-                                if let Some(data) = stash.remove(&time) {
-                                    let sum: i32 = data.iter().sum();
-                                    output.push_vec(time, vec![sum]);
+            .spawn_multi(
+                "exchange_notify_multibatch",
+                2,
+                |builder| {
+                    let input = builder.input::<i32>("data").unwrap();
+                    input
+                        .exchange_by_hash("mod2", |x: &i32| *x as u64)
+                        .unary_notify("sum", {
+                            let mut stash: std::collections::HashMap<u64, Vec<i32>> =
+                                std::collections::HashMap::new();
+                            move |input, output, ctx| {
+                                while let Some((time, data)) = input.next() {
+                                    stash.entry(time).or_default().extend(data);
+                                    ctx.notify_at(time);
                                 }
+                                while let Some(time) = ctx.next_notification() {
+                                    if let Some(data) = stash.remove(&time) {
+                                        let sum: i32 = data.iter().sum();
+                                        output.push_vec(time, vec![sum]);
+                                    }
+                                }
+                                Ok(())
                             }
-                            Ok(())
-                        }
-                    })
-                    .output("results");
-                Ok(())
-            }, SpawnOptions::default())
+                        })
+                        .output("results").unwrap();
+                    Ok(())
+                },
+                SpawnOptions::default(),
+            )
             .unwrap();
 
         let out0 = multi.take_output::<i32>(0, "results").unwrap();
@@ -5776,30 +5948,35 @@ mod tests {
         let rt = RuntimeHandle::new(RuntimeConfig::default()).unwrap();
         let num_workers = 4;
         let mut multi = rt
-            .spawn_multi("exchange_notify_4w", num_workers, |builder| {
-                let input = builder.input::<i32>("data");
-                input
-                    .exchange_by_hash("mod4", |x: &i32| *x as u64)
-                    .unary_notify("collect", {
-                        let mut stash: std::collections::HashMap<u64, Vec<i32>> =
-                            std::collections::HashMap::new();
-                        move |input, output, ctx| {
-                            while let Some((time, data)) = input.next() {
-                                stash.entry(time).or_default().extend(data);
-                                ctx.notify_at(time);
-                            }
-                            while let Some(time) = ctx.next_notification() {
-                                if let Some(mut data) = stash.remove(&time) {
-                                    data.sort();
-                                    output.push_vec(time, data);
+            .spawn_multi(
+                "exchange_notify_4w",
+                num_workers,
+                |builder| {
+                    let input = builder.input::<i32>("data").unwrap();
+                    input
+                        .exchange_by_hash("mod4", |x: &i32| *x as u64)
+                        .unary_notify("collect", {
+                            let mut stash: std::collections::HashMap<u64, Vec<i32>> =
+                                std::collections::HashMap::new();
+                            move |input, output, ctx| {
+                                while let Some((time, data)) = input.next() {
+                                    stash.entry(time).or_default().extend(data);
+                                    ctx.notify_at(time);
                                 }
+                                while let Some(time) = ctx.next_notification() {
+                                    if let Some(mut data) = stash.remove(&time) {
+                                        data.sort();
+                                        output.push_vec(time, data);
+                                    }
+                                }
+                                Ok(())
                             }
-                            Ok(())
-                        }
-                    })
-                    .output("results");
-                Ok(())
-            }, SpawnOptions::default())
+                        })
+                        .output("results").unwrap();
+                    Ok(())
+                },
+                SpawnOptions::default(),
+            )
             .unwrap();
 
         // Each worker sends values 0..8 — exchange routes each value to
@@ -5941,13 +6118,18 @@ mod tests {
         // Hash routing: even values → worker 0, odd values → worker 1.
         let rt = RuntimeHandle::new(RuntimeConfig::default()).unwrap();
         let mut multi = rt
-            .spawn_multi("no_ser_exchange", 2, |builder| {
-                let input = builder.input::<NonSerializable>("data");
-                input
-                    .exchange_by_hash("by_val", |x: &NonSerializable| x.value as u64)
-                    .output("out");
-                Ok(())
-            }, SpawnOptions::default())
+            .spawn_multi(
+                "no_ser_exchange",
+                2,
+                |builder| {
+                    let input = builder.input::<NonSerializable>("data").unwrap();
+                    input
+                        .exchange_by_hash("by_val", |x: &NonSerializable| x.value as u64)
+                        .output("out").unwrap();
+                    Ok(())
+                },
+                SpawnOptions::default(),
+            )
             .unwrap();
 
         let out0 = multi.take_output::<NonSerializable>(0, "out").unwrap();
@@ -5991,13 +6173,18 @@ mod tests {
         let rt = RuntimeHandle::new(RuntimeConfig::default()).unwrap();
         let num_workers = 4;
         let mut multi = rt
-            .spawn_multi("integrity", num_workers, |builder| {
-                let input = builder.input::<NonSerializable>("data");
-                input
-                    .exchange_by_hash("route", |x: &NonSerializable| x.value as u64)
-                    .output("out");
-                Ok(())
-            }, SpawnOptions::default())
+            .spawn_multi(
+                "integrity",
+                num_workers,
+                |builder| {
+                    let input = builder.input::<NonSerializable>("data").unwrap();
+                    input
+                        .exchange_by_hash("route", |x: &NonSerializable| x.value as u64)
+                        .output("out").unwrap();
+                    Ok(())
+                },
+                SpawnOptions::default(),
+            )
             .unwrap();
 
         let outputs: Vec<_> = (0..num_workers)
@@ -6046,17 +6233,22 @@ mod tests {
         // Proves NonSerializable flows through map + filter in multi-worker.
         let rt = RuntimeHandle::new(RuntimeConfig::default()).unwrap();
         let mut multi = rt
-            .spawn_multi("no_ser_pipe", 2, |builder| {
-                let input = builder.input::<NonSerializable>("data");
-                input
-                    .map("transform", |_t, mut x| {
-                        x.value *= 2;
-                        x
-                    })
-                    .filter("positive", |_t, x| x.value > 0)
-                    .output("out");
-                Ok(())
-            }, SpawnOptions::default())
+            .spawn_multi(
+                "no_ser_pipe",
+                2,
+                |builder| {
+                    let input = builder.input::<NonSerializable>("data").unwrap();
+                    input
+                        .map("transform", |_t, mut x| {
+                            x.value *= 2;
+                            x
+                        })
+                        .filter("positive", |_t, x| x.value > 0)
+                        .output("out").unwrap();
+                    Ok(())
+                },
+                SpawnOptions::default(),
+            )
             .unwrap();
 
         let outputs: Vec<_> = (0..2)
@@ -6131,8 +6323,8 @@ mod tests {
         let builder = DataflowBuilder::<u64>::new("ctx-build");
         builder.with_context(TestConfig { multiplier: 7 });
 
-        let input = builder.input::<i32>("data");
-        let _out = input.output("sink");
+        let input = builder.input::<i32>("data").unwrap();
+        let _out = input.output("sink").unwrap();
         let dataflow = builder.build().unwrap();
 
         // Context is accessible on the LogicalDataflow
@@ -6148,10 +6340,10 @@ mod tests {
         builder.with_context(TestConfig { multiplier: 3 });
 
         let cfg = builder.get_context::<TestConfig>().unwrap();
-        let input = builder.input::<i32>("data");
+        let input = builder.input::<i32>("data").unwrap();
         let _out = input
             .map("multiply", move |_t, x| x * cfg.multiplier)
-            .output("result");
+            .output("result").unwrap();
 
         let dataflow = builder.build().unwrap();
         let mut handle = rt.spawn(dataflow, SpawnOptions::default()).unwrap();
@@ -6177,16 +6369,21 @@ mod tests {
         let rt = RuntimeHandle::new(RuntimeConfig::default()).unwrap();
 
         let mut handle = rt
-            .spawn_multi("ctx-multi-worker", 3, move |builder| {
-                builder.with_context(TestConfig { multiplier: 5 });
+            .spawn_multi(
+                "ctx-multi-worker",
+                3,
+                move |builder| {
+                    builder.with_context(TestConfig { multiplier: 5 });
 
-                let cfg = builder.get_context::<TestConfig>().unwrap();
-                let input = builder.input::<i32>("data");
-                input
-                    .map("multiply", move |_t, x| x * cfg.multiplier)
-                    .output("result");
-                Ok(())
-            }, SpawnOptions::default())
+                    let cfg = builder.get_context::<TestConfig>().unwrap();
+                    let input = builder.input::<i32>("data").unwrap();
+                    input
+                        .map("multiply", move |_t, x| x * cfg.multiplier)
+                        .output("result").unwrap();
+                    Ok(())
+                },
+                SpawnOptions::default(),
+            )
             .unwrap();
 
         // Send to worker 0
@@ -6246,7 +6443,7 @@ mod tests {
         let builder = DataflowBuilder::<u64>::new("ctx-iterate");
         builder.with_context(TestConfig { multiplier: 2 });
 
-        let input = builder.input::<i32>("data");
+        let input = builder.input::<i32>("data").unwrap();
 
         // Context captured outside iterate should work, AND the inner scope
         // should also have the context available via the shared BuilderState.
@@ -6261,7 +6458,7 @@ mod tests {
                 output: result,
             }
         });
-        out.output("result");
+        out.output("result").unwrap();
 
         let dataflow = builder.build().unwrap();
 
@@ -6282,23 +6479,19 @@ mod tests {
         let fail_clone = fail_flag.clone();
 
         let mut multi = rt
-            .spawn_multi(
-                "ctrl-err",
-                2,
-                move |builder: &mut DataflowBuilder<u64>| {
-                    let input = builder.input::<i32>("data");
-                    let flag = fail_clone.clone();
-                    input
-                        .map("process", move |_t, x: i32| -> i32 {
-                            if flag.load(std::sync::atomic::Ordering::Relaxed) {
-                                panic!("intentional failure from worker");
-                            }
-                            x + 1
-                        })
-                        .output("out");
-                    Ok(())
-                },
-            )
+            .spawn_multi("ctrl-err", 2, move |builder: &mut DataflowBuilder<u64>| {
+                let input = builder.input::<i32>("data").unwrap();
+                let flag = fail_clone.clone();
+                input
+                    .map("process", move |_t, x: i32| -> i32 {
+                        if flag.load(std::sync::atomic::Ordering::Relaxed) {
+                            panic!("intentional failure from worker");
+                        }
+                        x + 1
+                    })
+                    .output("out").unwrap();
+                Ok(())
+            })
             .unwrap();
 
         // Set the flag so worker 0 fails when it processes data
@@ -6336,15 +6529,11 @@ mod tests {
         // Single-worker spawn works without any control broadcast.
         let rt = SimpleRuntime::new();
         let mut multi = rt
-            .spawn_multi(
-                "single",
-                1,
-                |builder: &mut DataflowBuilder<u64>| {
-                    let input = builder.input::<i32>("data");
-                    input.map("inc", |_t, x: i32| x + 1).output("out");
-                    Ok(())
-                },
-            )
+            .spawn_multi("single", 1, |builder: &mut DataflowBuilder<u64>| {
+                let input = builder.input::<i32>("data").unwrap();
+                input.map("inc", |_t, x: i32| x + 1).output("out").unwrap();
+                Ok(())
+            })
             .unwrap();
 
         assert_eq!(multi.num_workers(), 1);
@@ -6369,7 +6558,7 @@ mod tests {
         let parent = CancellationToken::new();
         let df_cancel = parent.child_token();
         let wakes: Vec<WakeHandle> = (0..3).map(|_| WakeHandle::new()).collect();
-        let (senders, mut receivers) = ControlBroadcast::new(3, &wakes, df_cancel.clone());
+        let (senders, mut receivers) = ControlBroadcast::new(3, &wakes, df_cancel.clone()).unwrap();
 
         // Broadcast error from worker 1
         senders[1].broadcast_error("Map".into(), "boom".into());
@@ -6397,7 +6586,7 @@ mod tests {
         let parent = CancellationToken::new();
         let df_cancel = parent.child_token();
         let wakes: Vec<WakeHandle> = (0..2).map(|_| WakeHandle::new()).collect();
-        let (senders, _receivers) = ControlBroadcast::new(2, &wakes, df_cancel.clone());
+        let (senders, _receivers) = ControlBroadcast::new(2, &wakes, df_cancel.clone()).unwrap();
 
         senders[0].broadcast_limit("row budget exceeded".into());
 
@@ -6420,7 +6609,7 @@ mod tests {
             sender.send(1, vec![4, 5]).await?;
             Ok(())
         });
-        pipe.map("double", |_t, x| x * 2).output("out");
+        pipe.map("double", |_t, x| x * 2).output("out").unwrap();
         let dataflow = builder.build().unwrap();
 
         let mut handle = rt.spawn(dataflow).unwrap();
@@ -6447,7 +6636,7 @@ mod tests {
             // Produce nothing — just return immediately.
             Ok(())
         });
-        pipe.output("out");
+        pipe.output("out").unwrap();
         let dataflow = builder.build().unwrap();
 
         let mut handle = rt.spawn(dataflow).unwrap();
@@ -6474,7 +6663,7 @@ mod tests {
             }
             Ok(())
         });
-        pipe.output("out");
+        pipe.output("out").unwrap();
         let dataflow = builder.build().unwrap();
 
         let handle = rt.spawn(dataflow).unwrap();
@@ -6502,7 +6691,7 @@ mod tests {
             }
             Ok(())
         });
-        pipe.map("inc", |_t, x| x + 100).output("out");
+        pipe.map("inc", |_t, x| x + 100).output("out").unwrap();
         let dataflow = builder.build().unwrap();
 
         let mut handle = rt.spawn(dataflow, SpawnOptions::default()).unwrap();
@@ -6533,7 +6722,7 @@ mod tests {
             sender.send(2, vec![30]).await?;
             Ok(())
         });
-        pipe.output("out");
+        pipe.output("out").unwrap();
         let dataflow = builder.build().unwrap();
 
         let mut handle = rt.spawn(dataflow).unwrap();
@@ -6709,17 +6898,24 @@ mod tests {
         let rt = RuntimeHandle::new(RuntimeConfig {
             worker_threads: 2,
             schedule_policy: None,
-            name: "par-match".to_string(), ..Default::default() })
+            name: "par-match".to_string(),
+            ..Default::default()
+        })
         .unwrap();
 
-        let result = rt.spawn_multi("par-match-df", 2, |builder| {
-            builder
-                .source("src", vec![(0u64, vec![1i32, 2, 3])])
-                .exchange_by_hash_to("ex", 2, |x: &i32| *x as u64)
-                .map("noop", |_t, x| x)
-                .output("out");
-            Ok(())
-        }, SpawnOptions::new().per_stage_parallelism(false));
+        let result = rt.spawn_multi(
+            "par-match-df",
+            2,
+            |builder| {
+                builder
+                    .source("src", vec![(0u64, vec![1i32, 2, 3])])
+                    .exchange_by_hash_to("ex", 2, |x: &i32| *x as u64).unwrap()
+                    .map("noop", |_t, x| x)
+                    .output("out").unwrap();
+                Ok(())
+            },
+            SpawnOptions::new().per_stage_parallelism(false),
+        );
         // Should succeed — parallelism matches worker count.
         match &result {
             Ok(_) => {}
@@ -6736,17 +6932,26 @@ mod tests {
         let rt = RuntimeHandle::new(RuntimeConfig {
             worker_threads: 2,
             schedule_policy: None,
-            name: "par-mismatch".to_string(), ..Default::default() })
+            name: "par-mismatch".to_string(),
+            ..Default::default()
+        })
         .unwrap();
 
-        let result = rt.spawn_multi("par-mismatch-df", 2, |builder| {
-            builder
-                .source("src", vec![(0u64, vec![1i32, 2, 3])])
-                .exchange_by_hash_to("ex", 4, |x: &i32| *x as u64)
-                .map("noop", |_t, x| x)
-                .output("out");
-            Ok(())
-        }, SpawnOptions::new().per_stage_parallelism(false).auto_parallelism(false));
+        let result = rt.spawn_multi(
+            "par-mismatch-df",
+            2,
+            |builder| {
+                builder
+                    .source("src", vec![(0u64, vec![1i32, 2, 3])])
+                    .exchange_by_hash_to("ex", 4, |x: &i32| *x as u64).unwrap()
+                    .map("noop", |_t, x| x)
+                    .output("out").unwrap();
+                Ok(())
+            },
+            SpawnOptions::new()
+                .per_stage_parallelism(false)
+                .auto_parallelism(false),
+        );
         // Should fail — parallelism (4) != num_workers (2).
         match result {
             Err(e) => {
@@ -6768,17 +6973,26 @@ mod tests {
         let rt = RuntimeHandle::new(RuntimeConfig {
             worker_threads: 1,
             schedule_policy: None,
-            name: "par-single".to_string(), ..Default::default() })
+            name: "par-single".to_string(),
+            ..Default::default()
+        })
         .unwrap();
 
-        let result = rt.spawn_multi("par-single-df", 1, |builder| {
-            builder
-                .source("src", vec![(0u64, vec![1i32, 2, 3])])
-                .exchange_by_hash_to("ex", 4, |x: &i32| *x as u64)
-                .map("noop", |_t, x| x)
-                .output("out");
-            Ok(())
-        }, SpawnOptions::new().per_stage_parallelism(false).auto_parallelism(false));
+        let result = rt.spawn_multi(
+            "par-single-df",
+            1,
+            |builder| {
+                builder
+                    .source("src", vec![(0u64, vec![1i32, 2, 3])])
+                    .exchange_by_hash_to("ex", 4, |x: &i32| *x as u64).unwrap()
+                    .map("noop", |_t, x| x)
+                    .output("out").unwrap();
+                Ok(())
+            },
+            SpawnOptions::new()
+                .per_stage_parallelism(false)
+                .auto_parallelism(false),
+        );
         match result {
             Err(e) => {
                 let err_msg = format!("{e}");
@@ -6805,8 +7019,8 @@ mod tests {
 
         // Spawn a dataflow with an input port (stays alive until input closes).
         let builder = DataflowBuilder::<u64>::new("active-count-test");
-        let input = builder.input::<i32>("data");
-        input.output("out");
+        let input = builder.input::<i32>("data").unwrap();
+        input.output("out").unwrap();
         let dataflow = builder.build().unwrap();
         let mut handle = rt.spawn(dataflow, SpawnOptions::default()).unwrap();
         let sender = handle.take_input::<i32>("data").unwrap();
@@ -6835,8 +7049,8 @@ mod tests {
         .unwrap();
 
         let builder = DataflowBuilder::<u64>::new("shutdown-async-test");
-        let input = builder.input::<i32>("data");
-        input.output("out");
+        let input = builder.input::<i32>("data").unwrap();
+        input.output("out").unwrap();
         let dataflow = builder.build().unwrap();
         let mut handle = rt.spawn(dataflow, SpawnOptions::default()).unwrap();
         let sender = handle.take_input::<i32>("data").unwrap();
@@ -6875,11 +7089,16 @@ mod tests {
         .unwrap();
 
         let mut handle = rt
-            .spawn_multi("idle-multi", 3, |builder: &mut DataflowBuilder<u64>| {
-                let input = builder.input::<i32>("data");
-                input.output("out");
-                Ok(())
-            }, SpawnOptions::default())
+            .spawn_multi(
+                "idle-multi",
+                3,
+                |builder: &mut DataflowBuilder<u64>| {
+                    let input = builder.input::<i32>("data").unwrap();
+                    input.output("out").unwrap();
+                    Ok(())
+                },
+                SpawnOptions::default(),
+            )
             .unwrap();
 
         // 3 workers = 3 active.
@@ -6909,8 +7128,8 @@ mod tests {
                 "multi-future",
                 3,
                 |builder: &mut DataflowBuilder<u64>| {
-                    let input = builder.input::<i32>("data");
-                    input.output("out");
+                    let input = builder.input::<i32>("data").unwrap();
+                    input.output("out").unwrap();
                     Ok(())
                 },
                 SpawnOptions::default(),
@@ -6942,8 +7161,8 @@ mod tests {
                 "multi-error",
                 2,
                 |builder: &mut DataflowBuilder<u64>| {
-                    let input = builder.input::<i32>("data");
-                    input.output("out");
+                    let input = builder.input::<i32>("data").unwrap();
+                    input.output("out").unwrap();
                     Ok(())
                 },
                 SpawnOptions::default(),
@@ -6974,7 +7193,7 @@ mod tests {
         .unwrap();
 
         let builder = DataflowBuilder::<u64>::new("async_pipeline");
-        let input = builder.input::<i32>("data");
+        let input = builder.input::<i32>("data").unwrap();
 
         // Async operator that doubles each item with a simulated async delay
         let logic = Arc::new(|_time: u64, batch: Vec<i32>| async move {
@@ -6982,7 +7201,9 @@ mod tests {
             Ok(batch.into_iter().map(|x| x * 2).collect::<Vec<i32>>())
         });
 
-        let _output = input.unary_async("double_async", 4, logic).output("results");
+        let _output = input
+            .unary_async("double_async", 4, logic)
+            .output("results").unwrap();
         let df = builder.build().unwrap();
         let mut handle = rt.spawn(df, SpawnOptions::default()).unwrap();
 
@@ -7015,7 +7236,7 @@ mod tests {
         .unwrap();
 
         let builder = DataflowBuilder::<u64>::new("concurrency_test");
-        let input = builder.input::<i32>("data");
+        let input = builder.input::<i32>("data").unwrap();
 
         let peak_concurrency = Arc::new(AtomicUsize::new(0));
         let current = Arc::new(AtomicUsize::new(0));
@@ -7035,7 +7256,7 @@ mod tests {
         });
 
         // max_concurrency = 2
-        let _output = input.unary_async("limited", 2, logic).output("out");
+        let _output = input.unary_async("limited", 2, logic).output("out").unwrap();
         let df = builder.build().unwrap();
         let mut handle = rt.spawn(df, SpawnOptions::default()).unwrap();
 
@@ -7062,7 +7283,7 @@ mod tests {
         .unwrap();
 
         let builder = DataflowBuilder::<u64>::new("error_test");
-        let input = builder.input::<i32>("data");
+        let input = builder.input::<i32>("data").unwrap();
 
         let logic = Arc::new(|_time: u64, _batch: Vec<i32>| async move {
             Err(crate::error::Error::Custom("async failure".into()))
@@ -7070,7 +7291,7 @@ mod tests {
 
         let _output = input
             .unary_async::<i32, _, _>("failing", 4, logic)
-            .output("out");
+            .output("out").unwrap();
         let df = builder.build().unwrap();
         let mut handle = rt.spawn(df, SpawnOptions::default()).unwrap();
 
@@ -7093,7 +7314,7 @@ mod tests {
         .unwrap();
 
         let builder = DataflowBuilder::<u64>::new("panic_test");
-        let input = builder.input::<i32>("data");
+        let input = builder.input::<i32>("data").unwrap();
 
         let logic = Arc::new(|_time: u64, _batch: Vec<i32>| async move {
             panic!("intentional panic in async logic");
@@ -7103,7 +7324,7 @@ mod tests {
 
         let _output = input
             .unary_async::<i32, _, _>("panicking", 4, logic)
-            .output("out");
+            .output("out").unwrap();
         let df = builder.build().unwrap();
         let mut handle = rt.spawn(df, SpawnOptions::default()).unwrap();
 
@@ -7115,6 +7336,9 @@ mod tests {
         let result = handle.join().await;
         assert!(result.is_err());
         let err_msg = format!("{}", result.unwrap_err());
-        assert!(err_msg.contains("panic"), "error should mention panic: {err_msg}");
+        assert!(
+            err_msg.contains("panic"),
+            "error should mention panic: {err_msg}"
+        );
     }
 }

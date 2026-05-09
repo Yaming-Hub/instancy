@@ -138,6 +138,7 @@ impl<S: Scope, D: 'static> ConcatExt<S, D> for StreamEdge<S, D> {
             .register_operator(crate::dataflow::graph::OperatorInfo::new(
                 op_index, "concat", stage_id, 2, 1,
             ))
+            // SAFETY: operator index freshly allocated by allocate_operator_index()
             .expect("operator index should be unique");
         scope.add_edge(crate::dataflow::graph::EdgeInfo::new(
             *self.source(),
@@ -161,11 +162,14 @@ impl<S: Scope, D: 'static> ConcatExt<S, D> for StreamEdge<S, D> {
 /// Concatenate a vector of streams into one.
 ///
 /// All streams must belong to the same scope and stage.
-pub fn concatenate<S: Scope, D: 'static>(streams: &[StreamEdge<S, D>]) -> StreamEdge<S, D> {
-    assert!(
-        !streams.is_empty(),
-        "concatenate requires at least one stream"
-    );
+pub fn concatenate<S: Scope, D: 'static>(
+    streams: &[StreamEdge<S, D>],
+) -> crate::Result<StreamEdge<S, D>> {
+    if streams.is_empty() {
+        return Err(crate::Error::InvalidConfig(
+            "concatenate requires at least one stream".into(),
+        ));
+    }
 
     let stage_id = streams[0].stage_id();
     for (i, s) in streams.iter().enumerate().skip(1) {
@@ -189,6 +193,7 @@ pub fn concatenate<S: Scope, D: 'static>(streams: &[StreamEdge<S, D>]) -> Stream
             streams.len(),
             1,
         ))
+        // SAFETY: operator index freshly allocated by allocate_operator_index()
         .expect("operator index should be unique");
     for (i, s) in streams.iter().enumerate() {
         scope.add_edge(crate::dataflow::graph::EdgeInfo::new(
@@ -202,7 +207,7 @@ pub fn concatenate<S: Scope, D: 'static>(streams: &[StreamEdge<S, D>]) -> Stream
     let _operator =
         ConcatOperator::<S::Timestamp, D>::new("concatenate", op_index, stage_id, streams.len());
 
-    StreamEdge::new(scope, output_slot, stage_id)
+    Ok(StreamEdge::new(scope, output_slot, stage_id))
 }
 
 #[cfg(test)]
@@ -324,15 +329,14 @@ mod tests {
             })
             .collect();
 
-        let output = concatenate(&streams);
+        let output = concatenate(&streams).unwrap();
         assert_eq!(output.source().operator_index, 4); // 1,2,3 for sources, 4 for concat
     }
 
     #[test]
-    #[should_panic(expected = "at least one stream")]
     fn concatenate_panics_on_empty() {
         let streams: Vec<StreamEdge<RootScope<u64>, i32>> = vec![];
-        let _output = concatenate(&streams);
+        assert!(concatenate(&streams).is_err());
     }
 
     #[test]

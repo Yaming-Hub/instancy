@@ -615,6 +615,7 @@ impl DataflowGraph {
     pub fn to_dot_named(&self, name: &str) -> String {
         use std::fmt::Write;
 
+        // SAFETY: all fmt::Write calls below target a String, which is infallible.
         let mut out = String::new();
         writeln!(out, "digraph \"{}\" {{", dot_escape(name))
             .expect("write to String is infallible");
@@ -641,6 +642,7 @@ impl DataflowGraph {
         for stage_id in &stage_ids {
             let ops = stages
                 .get(stage_id)
+                // SAFETY: stage_ids collected from self.stages iterator above
                 .expect("stage IDs were collected from the stages map");
             let mut sorted_ops: Vec<&&OperatorInfo> = ops.iter().collect();
             sorted_ops.sort_by_key(|op| op.index);

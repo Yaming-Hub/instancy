@@ -502,7 +502,10 @@ async fn schedule_queries(
             next_fire += Duration::from_secs_f64(1.0 / rate);
 
             // Backpressure: wait for a permit before spawning to avoid unbounded task queue
-            let permit = semaphore.clone().acquire_owned().await
+            let permit = semaphore
+                .clone()
+                .acquire_owned()
+                .await
                 .expect("semaphore closed unexpectedly");
 
             // Check time again after potentially waiting for permit
@@ -626,7 +629,7 @@ fn run_q1(
                 Ok(())
             }
         })
-        .output("results");
+        .output("results").unwrap();
 
     let dataflow = builder.build()?;
     let mut handle = runtime.spawn(dataflow, SpawnOptions::new().collect_metrics(true))?;
@@ -655,7 +658,7 @@ fn run_q2(
     for idx in 0..10 {
         pipe = pipe.map(format!("map_{idx}"), |_t, value| value + 1);
     }
-    pipe.output("results");
+    pipe.output("results").unwrap();
 
     let dataflow = builder.build()?;
     let mut handle = runtime.spawn(dataflow, SpawnOptions::new().collect_metrics(true))?;
@@ -686,7 +689,7 @@ fn run_q3(
             let threshold = context.q3_threshold;
             move |_t, value| *value > threshold
         })
-        .output("results");
+        .output("results").unwrap();
 
     let dataflow = builder.build()?;
     let mut handle = runtime.spawn(dataflow, SpawnOptions::new().collect_metrics(true))?;
@@ -715,10 +718,10 @@ fn run_q4(
         JOIN_WORKERS,
         |builder| {
             let left = builder
-                .input::<(u64, i64)>("left")
+                .input::<(u64, i64)>("left").unwrap()
                 .exchange_by_hash("left_exchange", |(order_key, _)| *order_key);
             let right = builder
-                .input::<u64>("right")
+                .input::<u64>("right").unwrap()
                 .exchange_by_hash("right_exchange", |order_key| *order_key);
 
             left.binary::<u64, (u64, i64), _>(right, "join", {
@@ -757,6 +760,7 @@ fn run_q4(
                     Ok(())
                 }
             })
+            .unwrap()
             .unary_notify::<(u64, i64), _>("sum_revenue", {
                 let mut sums: HashMap<u64, i64> = HashMap::new();
                 move |input, output, ctx| {
@@ -775,7 +779,7 @@ fn run_q4(
                     Ok(())
                 }
             })
-            .output("results");
+            .output("results").unwrap();
             Ok(())
         },
         SpawnOptions::new().collect_metrics(true),
@@ -852,7 +856,7 @@ fn run_q5(
                 Ok(())
             }
         })
-        .output("results");
+        .output("results").unwrap();
 
     let dataflow = builder.build()?;
     let mut handle = runtime.spawn(dataflow, SpawnOptions::new().collect_metrics(true))?;
@@ -1441,7 +1445,11 @@ fn print_final_report(total_duration: Duration, shared: &SharedState) {
     println!(
         "  Leak detected: {} (post-idle {} baseline)",
         if leak_detected { "YES" } else { "NO" },
-        if leak_detected { "> 1.5x" } else { "within 1.5x" }
+        if leak_detected {
+            "> 1.5x"
+        } else {
+            "within 1.5x"
+        }
     );
 
     println!();

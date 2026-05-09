@@ -73,7 +73,7 @@ fn main() {
                 Ok(())
             }
         })
-        .output("counts");
+        .output("counts").unwrap();
 
     let dataflow = builder.build().expect("build failed");
     println!(

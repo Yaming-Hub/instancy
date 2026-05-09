@@ -274,6 +274,7 @@ impl<S: Scope, D: 'static> BranchExt<S, D> for StreamEdge<S, D> {
             .register_operator(crate::dataflow::graph::OperatorInfo::new(
                 op_index, "branch", stage_id, 1, 2,
             ))
+            // SAFETY: operator index freshly allocated by allocate_operator_index()
             .expect("operator index should be unique");
         scope.add_edge(crate::dataflow::graph::EdgeInfo::new(
             *self.source(),
@@ -310,6 +311,7 @@ impl<S: Scope, D: 'static> OkErrExt<S, D> for StreamEdge<S, D> {
             .register_operator(crate::dataflow::graph::OperatorInfo::new(
                 op_index, "ok_err", stage_id, 1, 2,
             ))
+            // SAFETY: operator index freshly allocated by allocate_operator_index()
             .expect("operator index should be unique");
         scope.add_edge(crate::dataflow::graph::EdgeInfo::new(
             *self.source(),

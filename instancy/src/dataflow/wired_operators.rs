@@ -203,10 +203,9 @@ impl<T: Timestamp, D1: Send + 'static, D2: Send + 'static> SchedulableOperator
         }
 
         // Step 1: Try to flush any pending output first.
-        if !self.pending_output.is_empty()
-            && !self.flush_pending_output()? {
-                return Ok(ActivationOutcome::BlockedOnBackpressure);
-            }
+        if !self.pending_output.is_empty() && !self.flush_pending_output()? {
+            return Ok(ActivationOutcome::BlockedOnBackpressure);
+        }
 
         // Step 2: Pull from input channel.
         self.pull_input();
@@ -675,10 +674,9 @@ impl<T: Timestamp, D1: Send + 'static, D2: Send + 'static, D3: Send + 'static> S
         }
 
         // Step 1: Flush pending output from previous activation.
-        if !self.pending_output.is_empty()
-            && !self.flush_pending_output()? {
-                return Ok(ActivationOutcome::BlockedOnBackpressure);
-            }
+        if !self.pending_output.is_empty() && !self.flush_pending_output()? {
+            return Ok(ActivationOutcome::BlockedOnBackpressure);
+        }
 
         // Step 2: Pull from both input channels.
         self.pull_input1();
@@ -810,10 +808,9 @@ impl<T: Timestamp, D: Send + 'static> SchedulableOperator for WiredConcatOperato
         }
 
         // Flush pending output.
-        if !self.pending_output.is_empty()
-            && !self.flush_pending_output()? {
-                return Ok(ActivationOutcome::BlockedOnBackpressure);
-            }
+        if !self.pending_output.is_empty() && !self.flush_pending_output()? {
+            return Ok(ActivationOutcome::BlockedOnBackpressure);
+        }
 
         // Pull from all inputs and forward directly to output.
         let mut made_progress = false;
@@ -837,10 +834,9 @@ impl<T: Timestamp, D: Send + 'static> SchedulableOperator for WiredConcatOperato
         }
 
         // Push to output.
-        if !self.pending_output.is_empty()
-            && !self.flush_pending_output()? {
-                return Ok(ActivationOutcome::BlockedOnBackpressure);
-            }
+        if !self.pending_output.is_empty() && !self.flush_pending_output()? {
+            return Ok(ActivationOutcome::BlockedOnBackpressure);
+        }
 
         // Check if all inputs are exhausted.
         if self.inputs_exhausted.iter().all(|e| *e) {
@@ -952,10 +948,9 @@ where
             return Ok(ActivationOutcome::Done);
         }
 
-        if !self.pending_output.is_empty()
-            && !self.flush_pending_output()? {
-                return Ok(ActivationOutcome::BlockedOnBackpressure);
-            }
+        if !self.pending_output.is_empty() && !self.flush_pending_output()? {
+            return Ok(ActivationOutcome::BlockedOnBackpressure);
+        }
 
         let mut made_progress = false;
         loop {
@@ -978,10 +973,9 @@ where
             }
         }
 
-        if !self.pending_output.is_empty()
-            && !self.flush_pending_output()? {
-                return Ok(ActivationOutcome::BlockedOnBackpressure);
-            }
+        if !self.pending_output.is_empty() && !self.flush_pending_output()? {
+            return Ok(ActivationOutcome::BlockedOnBackpressure);
+        }
 
         if self.input_exhausted && self.pending_output.is_empty() {
             self.output_pusher.close();
@@ -1088,10 +1082,9 @@ where
             return Ok(ActivationOutcome::Done);
         }
 
-        if !self.pending_output.is_empty()
-            && !self.flush_pending_output()? {
-                return Ok(ActivationOutcome::BlockedOnBackpressure);
-            }
+        if !self.pending_output.is_empty() && !self.flush_pending_output()? {
+            return Ok(ActivationOutcome::BlockedOnBackpressure);
+        }
 
         let mut made_progress = false;
         loop {
@@ -1114,10 +1107,9 @@ where
             }
         }
 
-        if !self.pending_output.is_empty()
-            && !self.flush_pending_output()? {
-                return Ok(ActivationOutcome::BlockedOnBackpressure);
-            }
+        if !self.pending_output.is_empty() && !self.flush_pending_output()? {
+            return Ok(ActivationOutcome::BlockedOnBackpressure);
+        }
 
         if self.input_exhausted && self.pending_output.is_empty() {
             self.output_pusher.close();
@@ -1231,10 +1223,9 @@ where
             return Ok(ActivationOutcome::Done);
         }
 
-        if !self.pending_output.is_empty()
-            && !self.flush_pending_output()? {
-                return Ok(ActivationOutcome::BlockedOnBackpressure);
-            }
+        if !self.pending_output.is_empty() && !self.flush_pending_output()? {
+            return Ok(ActivationOutcome::BlockedOnBackpressure);
+        }
 
         let mut made_progress = false;
         loop {
@@ -1261,10 +1252,9 @@ where
             }
         }
 
-        if !self.pending_output.is_empty()
-            && !self.flush_pending_output()? {
-                return Ok(ActivationOutcome::BlockedOnBackpressure);
-            }
+        if !self.pending_output.is_empty() && !self.flush_pending_output()? {
+            return Ok(ActivationOutcome::BlockedOnBackpressure);
+        }
 
         if self.input_exhausted && self.pending_output.is_empty() {
             self.output_pusher.close();
@@ -1543,10 +1533,9 @@ impl<T: Timestamp, D1: Send + 'static, D2: Send + 'static> SchedulableOperator
         }
 
         // Step 1: Flush pending output from previous activation (backpressure retry).
-        if !self.pending_output.is_empty()
-            && !self.flush_pending_output()? {
-                return Ok(ActivationOutcome::BlockedOnBackpressure);
-            }
+        if !self.pending_output.is_empty() && !self.flush_pending_output()? {
+            return Ok(ActivationOutcome::BlockedOnBackpressure);
+        }
 
         // Step 2: Pull from input channel → feed InputHandle.
         self.pull_input();
@@ -1688,11 +1677,8 @@ impl<T: Timestamp, D1: Send + 'static, D2: Send + 'static> SchedulableOperator
 ///
 /// The closure receives a timestamp and a batch of input items, and returns
 /// a future that produces a `Result<Vec<D2>>` (the output items for that batch).
-pub type AsyncLogicFn<T, D1, D2> = Arc<
-    dyn Fn(T, Vec<D1>) -> Pin<Box<dyn Future<Output = Result<Vec<D2>>> + Send>>
-        + Send
-        + Sync,
->;
+pub type AsyncLogicFn<T, D1, D2> =
+    Arc<dyn Fn(T, Vec<D1>) -> Pin<Box<dyn Future<Output = Result<Vec<D2>>> + Send>> + Send + Sync>;
 
 /// A fully-wired async unary operator that spawns tokio tasks for batch processing.
 ///
@@ -1862,8 +1848,7 @@ impl<T: Timestamp, D1: Send + 'static, D2: Send + 'static> WiredUnaryAsyncOperat
                 // inner JoinHandle, which converts panics into JoinError.
                 let handle = self.tokio_handle.clone();
                 self.tokio_handle.spawn(async move {
-                    let inner =
-                        handle.spawn(async move { logic(time_for_logic, data).await });
+                    let inner = handle.spawn(async move { logic(time_for_logic, data).await });
                     let result = match inner.await {
                         Ok(Ok(output)) => Ok(output),
                         Ok(Err(e)) => Err(e),

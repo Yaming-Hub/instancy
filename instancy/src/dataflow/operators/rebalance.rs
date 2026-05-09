@@ -99,9 +99,9 @@ pub trait RebalanceExt<S: Scope, D> {
     /// Creates a new execution stage if `target_parallelism` differs from the
     /// current stage's parallelism; otherwise reuses the current stage.
     ///
-    /// # Panics
-    /// Panics if `target_parallelism` is 0.
-    fn rebalance_to(&self, target_parallelism: usize) -> StreamEdge<S, D>;
+    /// # Errors
+    /// Returns [`crate::Error::InvalidConfig`] if `target_parallelism` is 0.
+    fn rebalance_to(&self, target_parallelism: usize) -> crate::Result<StreamEdge<S, D>>;
 }
 
 impl<S: Scope, D: 'static> RebalanceExt<S, D> for StreamEdge<S, D> {
@@ -112,11 +112,15 @@ impl<S: Scope, D: 'static> RebalanceExt<S, D> for StreamEdge<S, D> {
         self.build_rebalance(scope, source_stage, parallelism)
     }
 
-    fn rebalance_to(&self, target_parallelism: usize) -> StreamEdge<S, D> {
-        assert!(target_parallelism > 0, "target_parallelism must be > 0");
+    fn rebalance_to(&self, target_parallelism: usize) -> crate::Result<StreamEdge<S, D>> {
+        if target_parallelism == 0 {
+            return Err(crate::Error::InvalidConfig(
+                "target_parallelism must be > 0".into(),
+            ));
+        }
         let scope = self.scope().clone();
         let source_stage = self.stage_id();
-        self.build_rebalance(scope, source_stage, target_parallelism)
+        Ok(self.build_rebalance(scope, source_stage, target_parallelism))
     }
 }
 
@@ -147,6 +151,7 @@ impl<S: Scope, D: 'static> StreamEdge<S, D> {
                 1,
                 1,
             ))
+            // SAFETY: operator index freshly allocated by allocate_operator_index()
             .expect("operator index should be unique");
         scope.add_edge(crate::dataflow::graph::EdgeInfo::exchange(
             *self.source(),
@@ -192,19 +197,19 @@ mod tests {
         let source = Slot::new(0, 0);
         let stream: StreamEdge<RootScope<u64>, i32> = StreamEdge::new(scope, source, stage_id);
 
-        let rebalanced = stream.rebalance_to(16);
+        let rebalanced = stream.rebalance_to(16).unwrap();
         assert_ne!(rebalanced.stage_id(), stage_id);
     }
 
     #[test]
-    #[should_panic(expected = "target_parallelism must be > 0")]
-    fn rebalance_to_zero_panics() {
+    fn rebalance_to_zero_parallelism_errors() {
         let scope = RootScope::<u64>::new("test", 4);
         let stage_id = scope.current_stage_id();
         let source = Slot::new(0, 0);
         let stream: StreamEdge<RootScope<u64>, i32> = StreamEdge::new(scope, source, stage_id);
 
-        let _ = stream.rebalance_to(0);
+        let err = stream.rebalance_to(0).err().unwrap();
+        assert!(matches!(err, crate::Error::InvalidConfig(_)));
     }
 
     #[test]

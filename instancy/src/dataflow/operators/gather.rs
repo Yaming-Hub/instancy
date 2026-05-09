@@ -115,6 +115,7 @@ impl<S: Scope, D: 'static> GatherExt<S, D> for StreamEdge<S, D> {
                 1,
                 1,
             ))
+            // SAFETY: operator index freshly allocated by allocate_operator_index()
             .expect("operator index should be unique");
         scope.add_edge(crate::dataflow::graph::EdgeInfo::exchange(
             *self.source(),

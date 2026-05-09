@@ -22,13 +22,13 @@ fn main() {
     {
         let rt = RuntimeHandle::new(RuntimeConfig::default()).unwrap();
         let builder = DataflowBuilder::<u64>::new("windowed_count");
-        let input = builder.input::<i32>("events");
+        let input = builder.input::<i32>("events").unwrap();
 
         // All events in [0,10) → t=10, [10,20) → t=20, etc.
         input
             .delay_batch("window_10", |t| (t / 10 + 1) * 10)
             .count("per_window")
-            .output("counts");
+            .output("counts").unwrap();
 
         let dataflow = builder.build().expect("build failed");
         let mut handle = rt.spawn(dataflow, SpawnOptions::default()).unwrap();
@@ -62,7 +62,7 @@ fn main() {
     {
         let rt = RuntimeHandle::new(RuntimeConfig::default()).unwrap();
         let builder = DataflowBuilder::<u64>::new("priority_delay");
-        let input = builder.input::<(&str, i32)>("tasks");
+        let input = builder.input::<(&str, i32)>("tasks").unwrap();
 
         // Urgent items stay at t=0, normal → t=5, low → t=10
         input
@@ -71,7 +71,7 @@ fn main() {
                 "normal" => *t + 5,
                 _ => *t + 10,
             })
-            .output("prioritized");
+            .output("prioritized").unwrap();
 
         let dataflow = builder.build().expect("build failed");
         let mut handle = rt.spawn(dataflow, SpawnOptions::default()).unwrap();
@@ -82,12 +82,7 @@ fn main() {
         sender
             .send(
                 0,
-                vec![
-                    ("urgent", 10),
-                    ("normal", 20),
-                    ("urgent", 30),
-                    ("low", 40),
-                ],
+                vec![("urgent", 10), ("normal", 20), ("urgent", 30), ("low", 40)],
             )
             .unwrap();
         drop(sender);
@@ -112,13 +107,13 @@ fn main() {
     {
         let rt = RuntimeHandle::new(RuntimeConfig::default()).unwrap();
         let builder = DataflowBuilder::<u64>::new("shifted_sum");
-        let input = builder.input::<i32>("data");
+        let input = builder.input::<i32>("data").unwrap();
 
         // Shift everything forward by 100 time units, then sum
         input
             .delay_batch("shift", |t| t + 100)
             .reduce("sum", |a, b| a + b)
-            .output("sums");
+            .output("sums").unwrap();
 
         let dataflow = builder.build().expect("build failed");
         let mut handle = rt.spawn(dataflow, SpawnOptions::default()).unwrap();

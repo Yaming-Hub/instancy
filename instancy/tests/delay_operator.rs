@@ -21,8 +21,8 @@ use std::collections::HashMap;
 fn delay_batch_identity_preserves_data() {
     let rt = RuntimeHandle::new(RuntimeConfig::default()).unwrap();
     let builder = DataflowBuilder::<u64>::new("delay_identity");
-    let input = builder.input::<i64>("data");
-    input.delay_batch("identity", |t| *t).output("out");
+    let input = builder.input::<i64>("data").unwrap();
+    input.delay_batch("identity", |t| *t).output("out").unwrap();
     let dataflow = builder.build().unwrap();
 
     let mut handle = rt.spawn(dataflow, SpawnOptions::new()).unwrap();
@@ -53,8 +53,8 @@ fn delay_batch_identity_preserves_data() {
 fn delay_batch_shifts_timestamps() {
     let rt = RuntimeHandle::new(RuntimeConfig::default()).unwrap();
     let builder = DataflowBuilder::<u64>::new("delay_shift");
-    let input = builder.input::<i64>("data");
-    input.delay_batch("shift10", |t| t + 10).output("out");
+    let input = builder.input::<i64>("data").unwrap();
+    input.delay_batch("shift10", |t| t + 10).output("out").unwrap();
     let dataflow = builder.build().unwrap();
 
     let mut handle = rt.spawn(dataflow, SpawnOptions::new()).unwrap();
@@ -93,10 +93,10 @@ fn delay_batch_windowing() {
     // epoch 0,3,7 → window 10; epoch 12,15 → window 20
     let rt = RuntimeHandle::new(RuntimeConfig::default()).unwrap();
     let builder = DataflowBuilder::<u64>::new("delay_window");
-    let input = builder.input::<i64>("data");
+    let input = builder.input::<i64>("data").unwrap();
     input
         .delay_batch("window10", |t| (t / 10 + 1) * 10)
-        .output("out");
+        .output("out").unwrap();
     let dataflow = builder.build().unwrap();
 
     let mut handle = rt.spawn(dataflow, SpawnOptions::new()).unwrap();
@@ -132,8 +132,8 @@ fn delay_batch_windowing() {
 fn delay_batch_empty_input() {
     let rt = RuntimeHandle::new(RuntimeConfig::default()).unwrap();
     let builder = DataflowBuilder::<u64>::new("delay_empty");
-    let input = builder.input::<i64>("data");
-    input.delay_batch("noop", |t| *t).output("out");
+    let input = builder.input::<i64>("data").unwrap();
+    input.delay_batch("noop", |t| *t).output("out").unwrap();
     let dataflow = builder.build().unwrap();
 
     let mut handle = rt.spawn(dataflow, SpawnOptions::new()).unwrap();
@@ -159,12 +159,10 @@ fn delay_per_item_routes_by_content() {
     // Items > 100 go to timestamp t+10, others stay at t.
     let rt = RuntimeHandle::new(RuntimeConfig::default()).unwrap();
     let builder = DataflowBuilder::<u64>::new("delay_per_item");
-    let input = builder.input::<i64>("data");
+    let input = builder.input::<i64>("data").unwrap();
     input
-        .delay("by_value", |t, item| {
-            if *item > 100 { *t + 10 } else { *t }
-        })
-        .output("out");
+        .delay("by_value", |t, item| if *item > 100 { *t + 10 } else { *t })
+        .output("out").unwrap();
     let dataflow = builder.build().unwrap();
 
     let mut handle = rt.spawn(dataflow, SpawnOptions::new()).unwrap();
@@ -197,11 +195,11 @@ fn delay_followed_by_reduce() {
     // Delay all to same timestamp, then reduce (sum).
     let rt = RuntimeHandle::new(RuntimeConfig::default()).unwrap();
     let builder = DataflowBuilder::<u64>::new("delay_reduce");
-    let input = builder.input::<i64>("data");
+    let input = builder.input::<i64>("data").unwrap();
     input
         .delay_batch("merge", |_t| 0u64)
         .reduce("sum", |a, b| a + b)
-        .output("out");
+        .output("out").unwrap();
     let dataflow = builder.build().unwrap();
 
     let mut handle = rt.spawn(dataflow, SpawnOptions::new()).unwrap();
@@ -214,7 +212,11 @@ fn delay_followed_by_reduce() {
 
     handle.join_blocking().unwrap();
 
-    let all: Vec<i64> = receiver.collect_data().into_iter().flat_map(|(_, d)| d).collect();
+    let all: Vec<i64> = receiver
+        .collect_data()
+        .into_iter()
+        .flat_map(|(_, d)| d)
+        .collect();
     assert_eq!(all, vec![15]); // 1+2+3+4+5
 }
 
@@ -223,8 +225,8 @@ fn delay_batch_multiple_inputs_same_target() {
     // Multiple source timestamps map to the same delayed timestamp.
     let rt = RuntimeHandle::new(RuntimeConfig::default()).unwrap();
     let builder = DataflowBuilder::<u64>::new("delay_merge_ts");
-    let input = builder.input::<i64>("data");
-    input.delay_batch("merge", |_t| 100u64).output("out");
+    let input = builder.input::<i64>("data").unwrap();
+    input.delay_batch("merge", |_t| 100u64).output("out").unwrap();
     let dataflow = builder.build().unwrap();
 
     let mut handle = rt.spawn(dataflow, SpawnOptions::new()).unwrap();
@@ -255,8 +257,8 @@ fn delay_per_item_identity() {
     // Per-item identity: delay(|t, _| *t) should behave like delay_batch identity.
     let rt = RuntimeHandle::new(RuntimeConfig::default()).unwrap();
     let builder = DataflowBuilder::<u64>::new("delay_item_identity");
-    let input = builder.input::<i64>("data");
-    input.delay("id", |t, _| *t).output("out");
+    let input = builder.input::<i64>("data").unwrap();
+    input.delay("id", |t, _| *t).output("out").unwrap();
     let dataflow = builder.build().unwrap();
 
     let mut handle = rt.spawn(dataflow, SpawnOptions::new()).unwrap();

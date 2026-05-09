@@ -20,13 +20,13 @@ fn main() {
     let rt = RuntimeHandle::new(RuntimeConfig::default()).expect("runtime");
     let builder = DataflowBuilder::<u64>::new("drain_demo");
 
-    let input = builder.input::<i32>("numbers");
+    let input = builder.input::<i32>("numbers").unwrap();
     input
         .map("square", |_t, x| {
             println!("  Processing: {x} → {}", x * x);
             x * x
         })
-        .output("results");
+        .output("results").unwrap();
 
     let dataflow = builder.build().expect("build");
 
@@ -67,13 +67,15 @@ fn main() {
     let rt2 = RuntimeHandle::new(RuntimeConfig::default()).expect("runtime");
     let builder2 = DataflowBuilder::<u64>::new("no_drain_demo");
 
-    let input2 = builder2.input::<i32>("numbers");
+    let input2 = builder2.input::<i32>("numbers").unwrap();
     input2.map("identity", |_t, x| x);
 
     let dataflow2 = builder2.build().expect("build");
 
     // No drain — default behavior.
-    let mut handle2 = rt2.spawn(dataflow2, SpawnOptions::default()).expect("spawn");
+    let mut handle2 = rt2
+        .spawn(dataflow2, SpawnOptions::default())
+        .expect("spawn");
     let _sender2 = handle2.take_input::<i32>("numbers").unwrap();
 
     // Cancel immediately (input still open).
@@ -82,7 +84,10 @@ fn main() {
     match handle2.join_blocking() {
         Ok(()) => println!("  Completed (unexpected)"),
         Err(instancy::Error::Cancelled { reason }) => {
-            println!("  ✓ Cancelled immediately: {}", reason.map_or("(no reason)".to_string(), |r| r.to_string()));
+            println!(
+                "  ✓ Cancelled immediately: {}",
+                reason.map_or("(no reason)".to_string(), |r| r.to_string())
+            );
         }
         Err(e) => println!("  Error: {e}"),
     }
@@ -95,7 +100,7 @@ fn main() {
     let rt3 = RuntimeHandle::new(RuntimeConfig::default()).expect("runtime");
     let builder3 = DataflowBuilder::<u64>::new("drain_timeout_demo");
 
-    let input3 = builder3.input::<i32>("numbers");
+    let input3 = builder3.input::<i32>("numbers").unwrap();
     input3.map("identity", |_t, x| x);
 
     let dataflow3 = builder3.build().expect("build");

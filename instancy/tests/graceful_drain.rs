@@ -18,8 +18,8 @@ async fn drain_completes_inflight_data() {
     let rt = RuntimeHandle::new(RuntimeConfig::default()).unwrap();
     let builder = DataflowBuilder::<u64>::new("drain-complete");
 
-    let input = builder.input::<i32>("data");
-    input.map("double", |_t, v| v * 2).output("results");
+    let input = builder.input::<i32>("data").unwrap();
+    input.map("double", |_t, v| v * 2).output("results").unwrap();
 
     let dataflow = builder.build().unwrap();
 
@@ -56,7 +56,7 @@ async fn no_drain_cancels_immediately() {
     let rt = RuntimeHandle::new(RuntimeConfig::default()).unwrap();
     let builder = DataflowBuilder::<u64>::new("no-drain");
 
-    let input = builder.input::<i32>("data");
+    let input = builder.input::<i32>("data").unwrap();
     input.map("identity", |_t, v| v);
 
     let dataflow = builder.build().unwrap();
@@ -80,7 +80,7 @@ async fn drain_timeout_returns_cancelled() {
     let builder = DataflowBuilder::<u64>::new("drain-timeout");
 
     // Input port that we never close — dataflow can't finish.
-    let input = builder.input::<i32>("data");
+    let input = builder.input::<i32>("data").unwrap();
     input.map("identity", |_t, v| v);
 
     let dataflow = builder.build().unwrap();
@@ -111,8 +111,8 @@ async fn drain_with_multi_worker() {
             "drain-multi",
             2,
             |builder: &mut DataflowBuilder<u64>| {
-                let input = builder.input::<i32>("data");
-                input.map("triple", |_t, v| v * 3).output("results");
+                let input = builder.input::<i32>("data").unwrap();
+                input.map("triple", |_t, v| v * 3).output("results").unwrap();
                 Ok(())
             },
             opts,
@@ -132,10 +132,9 @@ async fn drain_with_multi_worker() {
     multi.cancel();
 
     let completion = multi.join();
-    let result =
-        tokio::task::spawn_blocking(move || completion.wait())
-            .await
-            .unwrap();
+    let result = tokio::task::spawn_blocking(move || completion.wait())
+        .await
+        .unwrap();
 
     assert!(
         result.is_ok(),

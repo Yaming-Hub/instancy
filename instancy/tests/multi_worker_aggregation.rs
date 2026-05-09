@@ -97,15 +97,13 @@ async fn multi_worker_reduce_sum() {
         "mw-reduce-sum",
         2,
         |builder| {
-            let input = builder.input::<i64>("data");
+            let input = builder.input::<i64>("data").unwrap();
             let summed = input
                 .exchange_by_hash("distribute", |x: &i64| *x as u64)
                 .reduce("sum", |acc, x| acc + x);
-            summed.output("results");
+            summed.output("results").unwrap();
         },
-        vec![
-            (0, vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10]),
-        ],
+        vec![(0, vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10])],
     )
     .await;
 
@@ -121,22 +119,25 @@ async fn multi_worker_reduce_multi_epoch() {
         "mw-reduce-epoch",
         2,
         |builder| {
-            let input = builder.input::<i64>("data");
+            let input = builder.input::<i64>("data").unwrap();
             let summed = input
                 .exchange_by_hash("distribute", |x: &i64| *x as u64)
                 .reduce("sum", |acc, x| acc + x);
-            summed.output("results");
+            summed.output("results").unwrap();
         },
         vec![
-            (0, vec![1, 2, 3]),       // sum = 6
-            (1, vec![10, 20, 30]),    // sum = 60
-            (2, vec![100, 200]),      // sum = 300
+            (0, vec![1, 2, 3]),    // sum = 6
+            (1, vec![10, 20, 30]), // sum = 60
+            (2, vec![100, 200]),   // sum = 300
         ],
     )
     .await;
 
     let total: i64 = results.iter().sum();
-    assert_eq!(total, 366, "total across all epochs should be 366, got {total}");
+    assert_eq!(
+        total, 366,
+        "total across all epochs should be 366, got {total}"
+    );
 }
 
 /// Multi-worker reduce with 3 workers: validates correct progress tracking.
@@ -146,15 +147,13 @@ async fn multi_worker_reduce_three_workers() {
         "mw-reduce-3w",
         3,
         |builder| {
-            let input = builder.input::<i64>("data");
+            let input = builder.input::<i64>("data").unwrap();
             let max = input
                 .exchange_by_hash("distribute", |x: &i64| *x as u64)
                 .reduce("max", |acc, x| if x > acc { x } else { acc });
-            max.output("results");
+            max.output("results").unwrap();
         },
-        vec![
-            (0, vec![3, 7, 1, 9, 2, 8, 4, 6, 5, 10]),
-        ],
+        vec![(0, vec![3, 7, 1, 9, 2, 8, 4, 6, 5, 10])],
     )
     .await;
 
@@ -174,15 +173,13 @@ async fn multi_worker_fold_count() {
         "mw-fold-count",
         2,
         |builder| {
-            let input = builder.input::<i64>("data");
+            let input = builder.input::<i64>("data").unwrap();
             let counted = input
                 .exchange_by_hash("distribute", |x: &i64| *x as u64)
                 .fold("count", 0i64, |acc, _x| acc + 1);
-            counted.output("results");
+            counted.output("results").unwrap();
         },
-        vec![
-            (0, vec![10, 20, 30, 40, 50, 60, 70, 80]),
-        ],
+        vec![(0, vec![10, 20, 30, 40, 50, 60, 70, 80])],
     )
     .await;
 
@@ -202,14 +199,14 @@ async fn multi_worker_fold_product() {
         "mw-fold-product",
         2,
         |builder| {
-            let input = builder.input::<i64>("data");
+            let input = builder.input::<i64>("data").unwrap();
             let product = input
                 .exchange_by_hash("distribute", |x: &i64| *x as u64)
                 .fold("product", 1i64, |acc, x| acc * x);
-            product.output("results");
+            product.output("results").unwrap();
         },
         vec![
-            (0, vec![2, 3, 5]),  // total product = 30
+            (0, vec![2, 3, 5]), // total product = 30
         ],
     )
     .await;
@@ -230,20 +227,22 @@ async fn multi_worker_distinct() {
         "mw-distinct",
         2,
         |builder| {
-            let input = builder.input::<i64>("data");
+            let input = builder.input::<i64>("data").unwrap();
             // Exchange by value so same values go to same worker, then distinct
             let unique = input
                 .exchange_by_hash("distribute", |x: &i64| *x as u64)
                 .distinct("dedup");
-            unique.output("results");
+            unique.output("results").unwrap();
         },
-        vec![
-            (0, vec![1, 2, 3, 2, 1, 4, 3, 5, 1, 2, 3, 4, 5]),
-        ],
+        vec![(0, vec![1, 2, 3, 2, 1, 4, 3, 5, 1, 2, 3, 4, 5])],
     )
     .await;
 
-    assert_eq!(results, vec![1, 2, 3, 4, 5], "distinct should produce [1,2,3,4,5]");
+    assert_eq!(
+        results,
+        vec![1, 2, 3, 4, 5],
+        "distinct should produce [1,2,3,4,5]"
+    );
 }
 
 /// Multi-worker distinct with multiple epochs: dedup is per-timestamp.
@@ -253,16 +252,16 @@ async fn multi_worker_distinct_multi_epoch() {
         "mw-distinct-epoch",
         2,
         |builder| {
-            let input = builder.input::<i64>("data");
+            let input = builder.input::<i64>("data").unwrap();
             let unique = input
                 .exchange_by_hash("distribute", |x: &i64| *x as u64)
                 .distinct("dedup");
-            unique.output("results");
+            unique.output("results").unwrap();
         },
         vec![
-            (0, vec![1, 1, 2, 2, 3]),  // distinct: [1, 2, 3]
-            (1, vec![1, 1, 1]),         // distinct: [1] (same value OK in different epoch)
-            (2, vec![5, 5, 6]),         // distinct: [5, 6]
+            (0, vec![1, 1, 2, 2, 3]), // distinct: [1, 2, 3]
+            (1, vec![1, 1, 1]),       // distinct: [1] (same value OK in different epoch)
+            (2, vec![5, 5, 6]),       // distinct: [5, 6]
         ],
     )
     .await;
@@ -278,15 +277,13 @@ async fn multi_worker_distinct_three_workers() {
         "mw-distinct-3w",
         3,
         |builder| {
-            let input = builder.input::<i64>("data");
+            let input = builder.input::<i64>("data").unwrap();
             let unique = input
                 .exchange_by_hash("distribute", |x: &i64| *x as u64)
                 .distinct("dedup");
-            unique.output("results");
+            unique.output("results").unwrap();
         },
-        vec![
-            (0, vec![1, 2, 3, 1, 2, 3, 1, 2, 3, 4, 5, 6, 4, 5, 6]),
-        ],
+        vec![(0, vec![1, 2, 3, 1, 2, 3, 1, 2, 3, 4, 5, 6, 4, 5, 6])],
     )
     .await;
 
@@ -304,15 +301,13 @@ async fn multi_worker_count() {
         "mw-count",
         2,
         |builder| {
-            let input = builder.input::<i64>("data");
+            let input = builder.input::<i64>("data").unwrap();
             let counted = input
                 .exchange_by_hash("distribute", |x: &i64| *x as u64)
                 .count("counter");
-            counted.output("results");
+            counted.output("results").unwrap();
         },
-        vec![
-            (0, vec![10, 20, 30, 40, 50]),
-        ],
+        vec![(0, vec![10, 20, 30, 40, 50])],
     )
     .await;
 
@@ -327,22 +322,25 @@ async fn multi_worker_count_multi_epoch() {
         "mw-count-epoch",
         2,
         |builder| {
-            let input = builder.input::<i64>("data");
+            let input = builder.input::<i64>("data").unwrap();
             let counted = input
                 .exchange_by_hash("distribute", |x: &i64| *x as u64)
                 .count("counter");
-            counted.output("results");
+            counted.output("results").unwrap();
         },
         vec![
-            (0, vec![1, 2, 3]),             // count = 3
-            (1, vec![10, 20, 30, 40]),      // count = 4
-            (2, vec![100]),                 // count = 1
+            (0, vec![1, 2, 3]),        // count = 3
+            (1, vec![10, 20, 30, 40]), // count = 4
+            (2, vec![100]),            // count = 1
         ],
     )
     .await;
 
     let total: usize = results.iter().sum();
-    assert_eq!(total, 8, "total count across all epochs should be 8, got {total}");
+    assert_eq!(
+        total, 8,
+        "total count across all epochs should be 8, got {total}"
+    );
 }
 
 // =============================================================================
@@ -356,15 +354,13 @@ async fn multi_worker_reduce_single_element() {
         "mw-reduce-single",
         2,
         |builder| {
-            let input = builder.input::<i64>("data");
+            let input = builder.input::<i64>("data").unwrap();
             let summed = input
                 .exchange_by_hash("distribute", |x: &i64| *x as u64)
                 .reduce("sum", |acc, x| acc + x);
-            summed.output("results");
+            summed.output("results").unwrap();
         },
-        vec![
-            (0, vec![42]),
-        ],
+        vec![(0, vec![42])],
     )
     .await;
 
@@ -379,21 +375,22 @@ async fn multi_worker_fold_single_element() {
         "mw-fold-single",
         2,
         |builder| {
-            let input = builder.input::<i64>("data");
+            let input = builder.input::<i64>("data").unwrap();
             let summed = input
                 .exchange_by_hash("distribute", |x: &i64| *x as u64)
                 .fold("sum", 0i64, |acc, x| acc + x);
-            summed.output("results");
+            summed.output("results").unwrap();
         },
-        vec![
-            (0, vec![42]),
-        ],
+        vec![(0, vec![42])],
     )
     .await;
 
     // Only one worker receives data, only that worker emits
     let total: i64 = results.iter().sum();
-    assert_eq!(total, 42, "fold of single element should be 42, got {total}");
+    assert_eq!(
+        total, 42,
+        "fold of single element should be 42, got {total}"
+    );
 }
 
 /// Fold with non-distributive operation: collect into sorted vec.
@@ -404,18 +401,16 @@ async fn multi_worker_fold_collect_vec() {
         "mw-fold-vec",
         2,
         |builder| {
-            let input = builder.input::<i64>("data");
+            let input = builder.input::<i64>("data").unwrap();
             let collected = input
                 .exchange_by_hash("distribute", |x: &i64| *x as u64)
                 .fold("collect", Vec::<i64>::new(), |mut acc, x| {
                     acc.push(x);
                     acc
                 });
-            collected.output("results");
+            collected.output("results").unwrap();
         },
-        vec![
-            (0, vec![5, 3, 1, 4, 2]),
-        ],
+        vec![(0, vec![5, 3, 1, 4, 2])],
     )
     .await;
 
@@ -436,16 +431,14 @@ async fn multi_worker_distinct_then_count() {
         "mw-distinct-count",
         2,
         |builder| {
-            let input = builder.input::<i64>("data");
+            let input = builder.input::<i64>("data").unwrap();
             let unique_count = input
                 .exchange_by_hash("distribute", |x: &i64| *x as u64)
                 .distinct("dedup")
                 .count("count-unique");
-            unique_count.output("results");
+            unique_count.output("results").unwrap();
         },
-        vec![
-            (0, vec![1, 1, 2, 2, 3, 3, 4, 4, 5, 5]),
-        ],
+        vec![(0, vec![1, 1, 2, 2, 3, 3, 4, 4, 5, 5])],
     )
     .await;
 
@@ -460,12 +453,12 @@ async fn multi_worker_reduce_then_filter() {
         "mw-reduce-filter",
         2,
         |builder| {
-            let input = builder.input::<i64>("data");
+            let input = builder.input::<i64>("data").unwrap();
             let large_sums = input
                 .exchange_by_hash("distribute", |x: &i64| *x as u64)
                 .reduce("sum", |acc, x| acc + x)
                 .filter("large-only", |_t, x| *x > 10);
-            large_sums.output("results");
+            large_sums.output("results").unwrap();
         },
         vec![
             // Epoch 0: sum across workers, some worker sums may be > 10
@@ -495,20 +488,22 @@ async fn multi_worker_gather_then_reduce() {
         "mw-gather-reduce",
         3,
         |builder| {
-            let input = builder.input::<i64>("data");
+            let input = builder.input::<i64>("data").unwrap();
             let global_sum = input
                 .gather("collect-all")
                 .reduce("global-sum", |acc, x| acc + x);
-            global_sum.output("results");
+            global_sum.output("results").unwrap();
         },
-        vec![
-            (0, vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10]),
-        ],
+        vec![(0, vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10])],
     )
     .await;
 
     // Gather sends everything to worker 0, so reduce produces exactly one result
-    assert_eq!(results, vec![55], "gather → reduce should produce single sum 55");
+    assert_eq!(
+        results,
+        vec![55],
+        "gather → reduce should produce single sum 55"
+    );
 }
 
 /// Multi-worker rebalance: data is evenly distributed, all items processed.
@@ -518,15 +513,11 @@ async fn multi_worker_rebalance_preserves_all() {
         "mw-rebalance",
         3,
         |builder| {
-            let input = builder.input::<i64>("data");
-            let processed = input
-                .rebalance("spread")
-                .map("double", |_t, x| x * 2);
-            processed.output("results");
+            let input = builder.input::<i64>("data").unwrap();
+            let processed = input.rebalance("spread").map("double", |_t, x| x * 2);
+            processed.output("results").unwrap();
         },
-        vec![
-            (0, vec![1, 2, 3, 4, 5, 6, 7, 8, 9]),
-        ],
+        vec![(0, vec![1, 2, 3, 4, 5, 6, 7, 8, 9])],
     )
     .await;
 
@@ -541,20 +532,20 @@ async fn multi_worker_rebalance_then_fold() {
         "mw-rebalance-fold",
         2,
         |builder| {
-            let input = builder.input::<i64>("data");
+            let input = builder.input::<i64>("data").unwrap();
             let sums = input
                 .rebalance("spread")
                 .fold("sum", 0i64, |acc, x| acc + x);
-            sums.output("results");
+            sums.output("results").unwrap();
         },
-        vec![
-            (0, vec![1, 2, 3, 4, 5, 6]),
-        ],
+        vec![(0, vec![1, 2, 3, 4, 5, 6])],
     )
     .await;
 
     // Sum of per-worker folds should equal total sum
     let total: i64 = results.iter().sum();
-    assert_eq!(total, 21, "rebalance → fold total should be 21, got {total}");
+    assert_eq!(
+        total, 21,
+        "rebalance → fold total should be 21, got {total}"
+    );
 }
-

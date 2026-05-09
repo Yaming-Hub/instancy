@@ -79,6 +79,10 @@ pub enum Error {
     #[error("{0}")]
     Custom(String),
 
+    /// A configuration or topology error detected at build time.
+    #[error("Configuration error: {0}")]
+    InvalidConfig(String),
+
     /// A remote node was lost (disconnected or removed from cluster).
     /// Contains the node identity that departed.
     #[error("Node lost: node '{node_id}' departed ({reason})")]
@@ -173,6 +177,18 @@ impl Error {
 /// A convenience type alias for `Result<T, Error>`.
 pub type Result<T> = std::result::Result<T, Error>;
 
+/// Extension trait to convert `PoisonError` into `Error`.
+pub(crate) trait LockResultExt<T> {
+    /// Convert a poisoned lock result into an `Error::Custom`.
+    fn or_poison(self, context: &str) -> std::result::Result<T, Error>;
+}
+
+impl<T> LockResultExt<T> for std::result::Result<T, std::sync::PoisonError<T>> {
+    fn or_poison(self, context: &str) -> std::result::Result<T, Error> {
+        self.map_err(|_| Error::Custom(format!("lock poisoned: {context}")))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -219,10 +235,7 @@ mod tests {
 
     #[test]
     fn error_display_operator() {
-        let err = Error::operator(
-            "my_filter",
-            std::io::Error::other("oops"),
-        );
+        let err = Error::operator("my_filter", std::io::Error::other("oops"));
         let msg = err.to_string();
         assert!(msg.contains("my_filter"));
         assert!(msg.contains("oops"));
@@ -232,6 +245,13 @@ mod tests {
     fn error_display_custom() {
         let err = Error::Custom("something went wrong".into());
         assert_eq!(err.to_string(), "something went wrong");
+    }
+
+    #[test]
+    fn lock_result_ext_ok() {
+        let mutex = std::sync::Mutex::new(42);
+        let val = mutex.lock().or_poison("test").unwrap();
+        assert_eq!(*val, 42);
     }
 
     #[test]
@@ -278,11 +298,8 @@ mod tests {
 
     #[test]
     fn error_operator_with_context() {
-        let err = Error::operator_with_context(
-            "hash_join",
-            3,
-            std::io::Error::other("key mismatch"),
-        );
+        let err =
+            Error::operator_with_context("hash_join", 3, std::io::Error::other("key mismatch"));
         let msg = err.to_string();
         assert!(msg.contains("hash_join"), "should contain operator name");
         assert!(msg.contains("worker 3"), "should contain worker index");
@@ -305,10 +322,7 @@ mod tests {
     #[test]
     fn error_with_operator_context_preserves_existing_operator() {
         // Existing Operator with worker_index: None gets backfilled
-        let err = Error::operator(
-            "original_op",
-            std::io::Error::other("original cause"),
-        );
+        let err = Error::operator("original_op", std::io::Error::other("original cause"));
         let wrapped = err.with_operator_context("wrapper_op", 5);
         let msg = wrapped.to_string();
         assert!(
@@ -325,11 +339,8 @@ mod tests {
     #[test]
     fn error_with_operator_context_preserves_existing_worker_index() {
         // Existing Operator with worker_index already set is fully preserved
-        let err = Error::operator_with_context(
-            "original_op",
-            7,
-            std::io::Error::other("original cause"),
-        );
+        let err =
+            Error::operator_with_context("original_op", 7, std::io::Error::other("original cause"));
         let wrapped = err.with_operator_context("wrapper_op", 99);
         let msg = wrapped.to_string();
         assert!(
@@ -349,10 +360,7 @@ mod tests {
     #[test]
     fn error_operator_no_worker_index() {
         // Error::operator() without context should not show worker info
-        let err = Error::operator(
-            "my_filter",
-            std::io::Error::other("oops"),
-        );
+        let err = Error::operator("my_filter", std::io::Error::other("oops"));
         let msg = err.to_string();
         assert!(!msg.contains("worker"), "no worker info without context");
         assert!(msg.contains("my_filter"));

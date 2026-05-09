@@ -86,16 +86,19 @@ impl WorkerContext {
     /// Panics if `worker_index >= num_workers` or `num_workers == 0`.
     /// This is `pub(crate)` because only the runtime constructs worker contexts;
     /// callers should never need to create one directly.
-    pub(crate) fn new(worker_index: usize, num_workers: usize) -> Self {
-        assert!(num_workers > 0, "num_workers must be >= 1");
-        assert!(
-            worker_index < num_workers,
-            "worker_index ({worker_index}) must be < num_workers ({num_workers})"
-        );
-        Self {
+    pub(crate) fn new(worker_index: usize, num_workers: usize) -> crate::Result<Self> {
+        if num_workers == 0 {
+            return Err(crate::Error::InvalidConfig("num_workers must be >= 1".into()));
+        }
+        if worker_index >= num_workers {
+            return Err(crate::Error::InvalidConfig(format!(
+                "worker_index ({worker_index}) must be < num_workers ({num_workers})"
+            )));
+        }
+        Ok(Self {
             worker_index,
             num_workers,
-        }
+        })
     }
 
     /// Create a context for a single-worker dataflow (index=0, count=1).
@@ -252,7 +255,7 @@ mod tests {
 
     #[test]
     fn worker_context_multi() {
-        let ctx = WorkerContext::new(2, 4);
+        let ctx = WorkerContext::new(2, 4).unwrap();
         assert_eq!(ctx.worker_index(), 2);
         assert_eq!(ctx.num_workers(), 4);
         assert!(!ctx.is_single_worker());
@@ -262,32 +265,30 @@ mod tests {
     #[test]
     fn worker_context_boundary_values() {
         // worker 0 of 1 (single worker)
-        let ctx = WorkerContext::new(0, 1);
+        let ctx = WorkerContext::new(0, 1).unwrap();
         assert!(ctx.is_single_worker());
 
         // last worker
-        let ctx = WorkerContext::new(7, 8);
+        let ctx = WorkerContext::new(7, 8).unwrap();
         assert_eq!(ctx.worker_index(), 7);
         assert_eq!(ctx.num_workers(), 8);
     }
 
     #[test]
-    #[should_panic(expected = "num_workers must be >= 1")]
     fn worker_context_zero_workers_panics() {
-        WorkerContext::new(0, 0);
+        assert!(WorkerContext::new(0, 0).is_err());
     }
 
     #[test]
-    #[should_panic(expected = "worker_index (3) must be < num_workers (3)")]
     fn worker_context_index_out_of_range_panics() {
-        WorkerContext::new(3, 3);
+        assert!(WorkerContext::new(3, 3).is_err());
     }
 
     #[test]
     fn worker_context_equality() {
-        let a = WorkerContext::new(1, 4);
-        let b = WorkerContext::new(1, 4);
-        let c = WorkerContext::new(2, 4);
+        let a = WorkerContext::new(1, 4).unwrap();
+        let b = WorkerContext::new(1, 4).unwrap();
+        let c = WorkerContext::new(2, 4).unwrap();
         assert_eq!(a, b);
         assert_ne!(a, c);
     }

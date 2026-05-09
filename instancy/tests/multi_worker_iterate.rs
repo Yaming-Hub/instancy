@@ -92,7 +92,7 @@ async fn multi_worker_iterate_doubling() {
         "mw-doubling",
         2,
         |builder| {
-            let input = builder.input::<i64>("data");
+            let input = builder.input::<i64>("data").unwrap();
             let output = input.iterate::<u32>("double-loop", 1u32, |iter_var| {
                 let doubled = iter_var
                     .map("double", |_t: &Product<u64, u32>, x| x * 2)
@@ -104,7 +104,7 @@ async fn multi_worker_iterate_doubling() {
                     output: done,
                 }
             });
-            output.output("results");
+            output.output("results").unwrap();
         },
         vec![(0, vec![1, 2, 3, 5, 10, 50])],
     )
@@ -122,10 +122,9 @@ async fn multi_worker_iterate_immediate_exit() {
         "mw-immediate-exit",
         2,
         |builder| {
-            let input = builder.input::<i64>("data");
+            let input = builder.input::<i64>("data").unwrap();
             let output = input.iterate::<u32>("no-loop", 1u32, |iter_var| {
-                let redistributed =
-                    iter_var.exchange_by_hash("redistribute", |x: &i64| *x as u64);
+                let redistributed = iter_var.exchange_by_hash("redistribute", |x: &i64| *x as u64);
                 let done = redistributed.clone().filter("done", |_t, _x| true);
                 let again = redistributed.filter("again", |_t, _x| false);
                 IterateResult {
@@ -133,7 +132,7 @@ async fn multi_worker_iterate_immediate_exit() {
                     output: done,
                 }
             });
-            output.output("results");
+            output.output("results").unwrap();
         },
         vec![(0, vec![10, 20, 30])],
     )
@@ -149,10 +148,9 @@ async fn multi_worker_iterate_empty_input() {
         "mw-empty",
         2,
         |builder| {
-            let input = builder.input::<i64>("data");
+            let input = builder.input::<i64>("data").unwrap();
             let output = input.iterate::<u32>("empty-loop", 1u32, |iter_var| {
-                let redistributed =
-                    iter_var.exchange_by_hash("redistribute", |x: &i64| *x as u64);
+                let redistributed = iter_var.exchange_by_hash("redistribute", |x: &i64| *x as u64);
                 let done = redistributed.clone().filter("done", |_t, x| *x >= 10);
                 let again = redistributed.filter("again", |_t, x| *x < 10);
                 IterateResult {
@@ -160,7 +158,7 @@ async fn multi_worker_iterate_empty_input() {
                     output: done,
                 }
             });
-            output.output("results");
+            output.output("results").unwrap();
         },
         vec![],
     )
@@ -179,16 +177,15 @@ async fn multi_worker_iterate_collatz() {
         "mw-collatz",
         2,
         |builder| {
-            let input = builder.input::<i64>("data");
+            let input = builder.input::<i64>("data").unwrap();
             let output = input.iterate::<u32>("collatz-loop", 1u32, |iter_var| {
                 let stepped = iter_var
-                    .map("collatz-step", |_t: &Product<u64, u32>, x| {
-                        if x % 2 == 0 {
-                            x / 2
-                        } else {
-                            3 * x + 1
-                        }
-                    })
+                    .map(
+                        "collatz-step",
+                        |_t: &Product<u64, u32>, x| {
+                            if x % 2 == 0 { x / 2 } else { 3 * x + 1 }
+                        },
+                    )
                     .exchange_by_hash("redistribute", |x: &i64| *x as u64);
                 let done = stepped.clone().filter("reached-1", |_t, x| *x == 1);
                 let again = stepped.filter("continue", |_t, x| *x != 1);
@@ -197,7 +194,7 @@ async fn multi_worker_iterate_collatz() {
                     output: done,
                 }
             });
-            output.output("results");
+            output.output("results").unwrap();
         },
         vec![(0, vec![6, 7, 12])],
     )
@@ -217,7 +214,7 @@ async fn multi_worker_iterate_multiple_epochs() {
         "mw-multi-epoch",
         2,
         |builder| {
-            let input = builder.input::<i64>("data");
+            let input = builder.input::<i64>("data").unwrap();
             let output = input.iterate::<u32>("inc-loop", 1u32, |iter_var| {
                 let incremented = iter_var
                     .map("add10", |_t: &Product<u64, u32>, x| x + 10)
@@ -229,7 +226,7 @@ async fn multi_worker_iterate_multiple_epochs() {
                     output: done,
                 }
             });
-            output.output("results");
+            output.output("results").unwrap();
         },
         vec![(0, vec![0]), (1, vec![35]), (2, vec![45])],
     )
@@ -246,7 +243,7 @@ async fn multi_worker_iterate_three_workers() {
         "mw-3-workers",
         3,
         |builder| {
-            let input = builder.input::<i64>("data");
+            let input = builder.input::<i64>("data").unwrap();
             let output = input.iterate::<u32>("triple-loop", 1u32, |iter_var| {
                 let tripled = iter_var
                     .map("triple", |_t: &Product<u64, u32>, x| x * 3)
@@ -258,7 +255,7 @@ async fn multi_worker_iterate_three_workers() {
                     output: done,
                 }
             });
-            output.output("results");
+            output.output("results").unwrap();
         },
         // 1 → 3 → 9 → 27 → 81 → 243
         // 5 → 15 → 45 → 135
@@ -285,7 +282,7 @@ async fn multi_worker_iterate_input_from_all_workers() {
             "mw-all-inputs",
             2,
             |builder| {
-                let input = builder.input::<i64>("data");
+                let input = builder.input::<i64>("data").unwrap();
                 let output = input.iterate::<u32>("double-loop", 1u32, |iter_var| {
                     let doubled = iter_var
                         .map("double", |_t: &Product<u64, u32>, x| x * 2)
@@ -297,7 +294,7 @@ async fn multi_worker_iterate_input_from_all_workers() {
                         output: done,
                     }
                 });
-                output.output("results");
+                output.output("results").unwrap();
                 Ok(())
             },
             SpawnOptions::default(),

@@ -8,7 +8,7 @@
 use std::time::Duration;
 
 use instancy::{
-    cancellation::CancellationReason, DataflowBuilder, RuntimeConfig, RuntimeHandle, SpawnOptions,
+    DataflowBuilder, RuntimeConfig, RuntimeHandle, SpawnOptions, cancellation::CancellationReason,
 };
 use tokio_util::sync::CancellationToken;
 
@@ -18,7 +18,7 @@ async fn dataflow_cancelled_by_external_token() {
     let builder = DataflowBuilder::<u64>::new("cancel-test");
 
     // Create a dataflow with an input port that we never close.
-    let input = builder.input::<i32>("data");
+    let input = builder.input::<i32>("data").unwrap();
     input.map("identity", |_t, v| v);
 
     let dataflow = builder.build().unwrap();
@@ -60,8 +60,8 @@ async fn dataflow_completes_before_token_cancelled() {
     let rt = RuntimeHandle::new(RuntimeConfig::default()).unwrap();
     let builder = DataflowBuilder::<u64>::new("no-cancel-test");
 
-    let input = builder.input::<i32>("data");
-    input.map("double", |_t, v| v * 2).output("results");
+    let input = builder.input::<i32>("data").unwrap();
+    input.map("double", |_t, v| v * 2).output("results").unwrap();
 
     let dataflow = builder.build().unwrap();
 
@@ -111,7 +111,7 @@ async fn spawn_multi_cancelled_by_external_token() {
             "multi-cancel",
             2,
             |builder: &mut DataflowBuilder<u64>| {
-                let input = builder.input::<i32>("data");
+                let input = builder.input::<i32>("data").unwrap();
                 input.map("identity", |_t, v| v);
                 Ok(())
             },

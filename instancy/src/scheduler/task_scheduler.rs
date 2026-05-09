@@ -181,6 +181,7 @@ impl TaskScheduler {
                 if permit.try_acquire() {
                     let (activation, stage_id) = queue
                         .queue
+                        // SAFETY: front() confirmed non-empty on line 178, no concurrent mutation
                         .pop_front()
                         .expect("front task still exists after readiness check");
                     queue.has_in_flight = true;

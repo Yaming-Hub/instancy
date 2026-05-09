@@ -123,15 +123,13 @@ impl SchedulePolicy for PriorityWithAgingPolicy {
         // constant regardless of when compare is called:
         //   (a.age - b.age) = (b.created_at - a.created_at), always the same.
         let now = Instant::now();
-        let score_a = a.priority as f64
-            + now.duration_since(a.created_at).as_secs_f64() * self.aging_rate;
-        let score_b = b.priority as f64
-            + now.duration_since(b.created_at).as_secs_f64() * self.aging_rate;
+        let score_a =
+            a.priority as f64 + now.duration_since(a.created_at).as_secs_f64() * self.aging_rate;
+        let score_b =
+            b.priority as f64 + now.duration_since(b.created_at).as_secs_f64() * self.aging_rate;
 
         // Higher effective priority → scheduled first
-        score_b
-            .partial_cmp(&score_a)
-            .unwrap_or(Ordering::Equal)
+        score_b.partial_cmp(&score_a).unwrap_or(Ordering::Equal)
     }
 }
 

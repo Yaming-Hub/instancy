@@ -10,8 +10,8 @@ use std::time::Duration;
 use instancy::DataflowBuilder;
 use instancy::DataflowId;
 use instancy::Result;
-use instancy::communication::transport_session::PeerConnection;
 use instancy::communication::ClusterSpawnTransport;
+use instancy::communication::transport_session::PeerConnection;
 use instancy::{ClusterTopology, NodeConfig};
 use instancy::{RuntimeConfig, RuntimeHandle};
 
@@ -71,8 +71,8 @@ async fn cluster_two_nodes_no_exchange() {
     let tokio_handle = tokio::runtime::Handle::current();
 
     let build = |builder: &mut DataflowBuilder<u64>| -> Result<()> {
-        let input = builder.input::<i32>("data");
-        input.map("double", |_t, x| x * 2).output("results");
+        let input = builder.input::<i32>("data").unwrap();
+        input.map("double", |_t, x| x * 2).output("results").unwrap();
         Ok(())
     };
 
@@ -183,10 +183,10 @@ async fn cluster_two_nodes_with_exchange() {
     let tokio_handle = tokio::runtime::Handle::current();
 
     let build = |builder: &mut DataflowBuilder<u64>| -> Result<()> {
-        let input = builder.input::<i64>("data");
+        let input = builder.input::<i64>("data").unwrap();
         // Exchange by value — each record goes to worker (value % num_workers).
         let exchanged = input.exchange("by_val", |x: &i64| *x as u64);
-        exchanged.map("identity", |_t, x| x).output("results");
+        exchanged.map("identity", |_t, x| x).output("results").unwrap();
         Ok(())
     };
 
@@ -291,15 +291,15 @@ async fn cluster_fingerprint_mismatch() {
     // Node A: input → map → output (2 operators + source)
     let build_a = |builder: &mut DataflowBuilder<u64>| -> Result<()> {
         builder
-            .input::<i32>("data")
+            .input::<i32>("data").unwrap()
             .map("double", |_t, x| x * 2)
-            .output("results");
+            .output("results").unwrap();
         Ok(())
     };
 
     // Node B: input → output (1 operator + source) — different graph!
     let build_b = |builder: &mut DataflowBuilder<u64>| -> Result<()> {
-        builder.input::<i32>("data").output("results");
+        builder.input::<i32>("data").unwrap().output("results").unwrap();
         Ok(())
     };
 
@@ -388,7 +388,7 @@ async fn cluster_missing_connection() {
         ClusterSpawnTransport::dedicated(vec![conn_a], 1024),
         Duration::from_secs(1),
         |builder: &mut DataflowBuilder<u64>| {
-            builder.input::<i32>("data").output("out");
+            builder.input::<i32>("data").unwrap().output("out").unwrap();
             Ok(())
         },
         &tokio_handle,

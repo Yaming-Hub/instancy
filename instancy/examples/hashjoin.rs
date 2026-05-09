@@ -102,9 +102,9 @@ fn main() {
 
             Ok(())
         },
-    );
+    ).unwrap();
 
-    let output = joined.output("results");
+    let output = joined.output("results").unwrap();
 
     let dataflow = builder.build().unwrap();
     rt.spawn(dataflow, SpawnOptions::default())
@@ -194,9 +194,9 @@ fn main() {
 
             Ok(())
         },
-    );
+    ).unwrap();
 
-    let graph_output = two_hop.output("two_hop_paths");
+    let graph_output = two_hop.output("two_hop_paths").unwrap();
 
     let dataflow = builder.build().unwrap();
     rt.spawn(dataflow, SpawnOptions::default())

@@ -8,8 +8,8 @@
 
 use std::time::Duration;
 
-use instancy::communication::transport_session::PeerConnection;
 use instancy::communication::ClusterSpawnTransport;
+use instancy::communication::transport_session::PeerConnection;
 use instancy::{
     ClusterTopology, DataflowBuilder, DataflowId, NodeConfig, Result, RuntimeConfig, RuntimeHandle,
 };
@@ -41,9 +41,9 @@ fn make_duplex_pair(
 
 fn build_dataflow(builder: &mut DataflowBuilder<u64>) -> Result<()> {
     builder
-        .input::<i32>("data")
+        .input::<i32>("data").unwrap()
         .map("double", |_t, x| x * 2)
-        .output("results");
+        .output("results").unwrap();
     Ok(())
 }
 

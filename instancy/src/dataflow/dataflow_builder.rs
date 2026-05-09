@@ -54,9 +54,10 @@ use crate::dataflow::stage::StageId;
 use crate::dataflow::stream::Slot;
 use crate::dataflow::wired_operators::{
     AsyncLogicFn, WiredBinaryOperator, WiredConcatOperator, WiredEnterOperator,
-    WiredFeedbackOperator, WiredLeaveOperator, WiredSourceOperator,
-    WiredUnaryAsyncOperator, WiredUnaryNotifyOperator, WiredUnaryOperator,
+    WiredFeedbackOperator, WiredLeaveOperator, WiredSourceOperator, WiredUnaryAsyncOperator,
+    WiredUnaryNotifyOperator, WiredUnaryOperator,
 };
+use crate::error::LockResultExt;
 use crate::error::{Error, Result};
 use crate::order::Product;
 use crate::progress::change_batch::ChangeBatch;
@@ -370,7 +371,10 @@ impl<T: Timestamp> DataflowBuilder<T> {
     /// # Panics
     ///
     /// Panics if an input with the same name already exists.
-    pub fn input<D: Clone + Send + 'static>(&self, name: impl Into<String>) -> Pipe<T, D> {
+    pub fn input<D: Clone + Send + 'static>(
+        &self,
+        name: impl Into<String>,
+    ) -> Result<Pipe<T, D>> {
         let name = name.into();
         let op_idx;
         let stage_id = StageId::new(0);
@@ -379,10 +383,11 @@ impl<T: Timestamp> DataflowBuilder<T> {
             let mut state = self.state.borrow_mut();
 
             // Validate unique name
-            assert!(
-                !state.input_ports.iter().any(|p| p.name == name),
-                "duplicate input port name: {name}"
-            );
+            if state.input_ports.iter().any(|p| p.name == name) {
+                return Err(Error::InvalidConfig(format!(
+                    "duplicate input port name: {name}"
+                )));
+            }
 
             op_idx = state.allocate_operator_index();
 
@@ -433,8 +438,8 @@ impl<T: Timestamp> DataflowBuilder<T> {
             // spawn() to create the ChannelSourceOperator factory and InputSender.
             // The closure captures the concrete data type D.
             let wiring_name = name.clone();
-            let wiring: InputPortWiring =
-                Box::new(move |external_inputs_open, wake_handle, mode| {
+            let wiring: InputPortWiring = Box::new(
+                move |external_inputs_open, wake_handle, mode| {
                     use crate::dataflow::channel_operators::{
                         ChannelSourceOperator, InputRecv, InputSender,
                     };
@@ -451,8 +456,8 @@ impl<T: Timestamp> DataflowBuilder<T> {
                             let ext_counter = Arc::clone(&external_inputs_open);
                             let factory_name = wiring_name.clone();
                             let reporter = source_reporter.clone();
-                            let factory: OperatorFactory =
-                                single_use_factory(move |_ctx, endpoints| {
+                            let factory: OperatorFactory = single_use_factory(
+                                move |_ctx, endpoints| {
                                     let output_pusher: Box<dyn Push<T, D>> = {
                                         let pushers: Vec<Box<dyn Push<T, D>>> = endpoints
                                             .output_pushers
@@ -469,7 +474,7 @@ impl<T: Timestamp> DataflowBuilder<T> {
                                                     })
                                             })
                                             .collect::<Result<_>>()?;
-                                        tee_or_single(pushers).unwrap_or_else(|| Box::new(NullPush))
+                                        tee_or_single(pushers)?.unwrap_or_else(|| Box::new(NullPush))
                                     };
                                     let op = ChannelSourceOperator::new(
                                         factory_name,
@@ -481,7 +486,8 @@ impl<T: Timestamp> DataflowBuilder<T> {
                                         ext_counter,
                                     );
                                     Ok(Box::new(op) as Box<dyn SchedulableOperator>)
-                                });
+                                },
+                            );
 
                             let sender_any: Box<dyn std::any::Any + Send> = Box::new(sender);
                             (factory, sender_any)
@@ -495,8 +501,8 @@ impl<T: Timestamp> DataflowBuilder<T> {
                             let ext_counter = Arc::clone(&external_inputs_open);
                             let factory_name = wiring_name.clone();
                             let reporter = source_reporter.clone();
-                            let factory: OperatorFactory =
-                                single_use_factory(move |_ctx, endpoints| {
+                            let factory: OperatorFactory = single_use_factory(
+                                move |_ctx, endpoints| {
                                     let output_pusher: Box<dyn Push<T, D>> = {
                                         let pushers: Vec<Box<dyn Push<T, D>>> = endpoints
                                             .output_pushers
@@ -513,7 +519,7 @@ impl<T: Timestamp> DataflowBuilder<T> {
                                                     })
                                             })
                                             .collect::<Result<_>>()?;
-                                        tee_or_single(pushers).unwrap_or_else(|| Box::new(NullPush))
+                                        tee_or_single(pushers)?.unwrap_or_else(|| Box::new(NullPush))
                                     };
                                     let op = ChannelSourceOperator::new(
                                         factory_name,
@@ -525,23 +531,25 @@ impl<T: Timestamp> DataflowBuilder<T> {
                                         ext_counter,
                                     );
                                     Ok(Box::new(op) as Box<dyn SchedulableOperator>)
-                                });
+                                },
+                            );
 
                             let sender_any: Box<dyn std::any::Any + Send> = Box::new(sender);
                             (factory, sender_any)
                         }
                     }
-                });
+                },
+            );
             state.input_port_wiring.push(wiring);
         }
 
-        Pipe {
+        Ok(Pipe {
             state: Rc::clone(&self.state),
             op_idx,
             output_slot: 0,
             capacity_override: None,
             _phantom: PhantomData,
-        }
+        })
     }
 
     /// Declare a pre-loaded source that emits data immediately (for testing/simple use).
@@ -615,7 +623,7 @@ impl<T: Timestamp> DataflowBuilder<T> {
                                     })
                             })
                             .collect::<Result<_>>()?;
-                        tee_or_single(pushers).unwrap_or_else(|| Box::new(NullPush))
+                        tee_or_single(pushers)?.unwrap_or_else(|| Box::new(NullPush))
                     };
 
                     Ok(Box::new(WiredSourceOperator::with_progress(
@@ -740,12 +748,17 @@ impl<T: Timestamp> DataflowBuilder<T> {
                                 .output_pushers
                                 .into_iter()
                                 .map(|any_box| {
-                                any_box
+                                    any_box
                                         .downcast::<Box<dyn Push<T, D>>>()
-                                        .map(|boxed| *boxed).map_err(|_| Error::Custom("async source output pusher type mismatch".into()))
-                            })
-                            .collect::<Result<_>>()?;
-                            tee_or_single(pushers).unwrap_or_else(|| Box::new(NullPush))
+                                        .map(|boxed| *boxed)
+                                        .map_err(|_| {
+                                            Error::Custom(
+                                                "async source output pusher type mismatch".into(),
+                                            )
+                                        })
+                                })
+                                .collect::<Result<_>>()?;
+                            tee_or_single(pushers)?.unwrap_or_else(|| Box::new(NullPush))
                         };
                         let op = ChannelSourceOperator::new(
                             factory_name,
@@ -1011,10 +1024,12 @@ impl<T: Timestamp, D: Clone + Send + 'static> Pipe<T, D> {
     ///     // filter's output edge uses the default (1024)
     ///     .output("results");
     /// ```
-    pub fn with_capacity(mut self, capacity: usize) -> Self {
-        assert!(capacity > 0, "channel capacity must be greater than 0");
+    pub fn with_capacity(mut self, capacity: usize) -> Result<Self> {
+        if capacity == 0 {
+            return Err(Error::InvalidConfig("channel capacity must be > 0".into()));
+        }
         self.capacity_override = Some(capacity);
-        self
+        Ok(self)
     }
 
     /// Resolve the effective channel capacity for the next edge.
@@ -1092,13 +1107,24 @@ impl<T: Timestamp, D: Clone + Send + 'static> Pipe<T, D> {
 
         let pred_true = predicate.clone();
         let true_pipe = self.clone().filter(true_name, move |t, x| {
-            // Lock poisoning indicates a prior panic in the predicate — propagate it.
-            let mut guard = pred_true.lock().expect("branch predicate lock poisoned");
+            let mut guard = match pred_true.lock().or_poison("branch predicate") {
+                Ok(guard) => guard,
+                Err(_) => {
+                    // TODO: propagate poisoned branch predicates once filter closures can return Result.
+                    return false;
+                }
+            };
             guard(t, x)
         });
         let pred_false = predicate;
         let false_pipe = self.filter(false_name, move |t, x| {
-            let mut guard = pred_false.lock().expect("branch predicate lock poisoned");
+            let mut guard = match pred_false.lock().or_poison("branch predicate") {
+                Ok(guard) => guard,
+                Err(_) => {
+                    // TODO: propagate poisoned branch predicates once filter closures can return Result.
+                    return false;
+                }
+            };
             !guard(t, x)
         });
 
@@ -1236,9 +1262,11 @@ impl<T: Timestamp, D: Clone + Send + 'static> Pipe<T, D> {
         ));
 
         // Subgraph: sink has 1 input, 0 outputs
-        if let Err(e) = state
-            .subgraph_builder
-            .add_operator(op_idx, &name, 1, 0, PortConnectivity::new(1, 0)) {
+        if let Err(e) =
+            state
+                .subgraph_builder
+                .add_operator(op_idx, &name, 1, 0, PortConnectivity::new(1, 0))
+        {
             state.builder_errors.push(e);
         }
         state.subgraph_builder.add_edge(
@@ -1253,8 +1281,10 @@ impl<T: Timestamp, D: Clone + Send + 'static> Pipe<T, D> {
                 let input_puller: Box<dyn Pull<T, D>> = *endpoints
                     .input_pullers
                     .into_iter()
-                    .next().ok_or_else(|| Error::Custom("for_each sink must have input puller".into()))?
-                    .downcast::<Box<dyn Pull<T, D>>>().map_err(|_| Error::Custom("for_each input puller type mismatch".into()))?;
+                    .next()
+                    .ok_or_else(|| Error::Custom("for_each sink must have input puller".into()))?
+                    .downcast::<Box<dyn Pull<T, D>>>()
+                    .map_err(|_| Error::Custom("for_each input puller type mismatch".into()))?;
 
                 Ok(Box::new(ForEachSink::new(
                     name_clone,
@@ -1270,8 +1300,7 @@ impl<T: Timestamp, D: Clone + Send + 'static> Pipe<T, D> {
         let edge_idx = state.graph.edges().len() - 1;
         let chan_factory: ChannelFactory =
             channel_factory(move |_ctx, wake: Option<WakeHandle>| {
-                let (push, pull) =
-                    bounded_channel_with_wake::<T, D, ()>(capacity, wake.clone());
+                let (push, pull) = bounded_channel_with_wake::<T, D, ()>(capacity, wake.clone());
                 Ok((
                     Box::new(Box::new(push) as Box<dyn Push<T, D>>)
                         as Box<dyn std::any::Any + Send>,
@@ -1308,25 +1337,21 @@ impl<T: Timestamp, D: Clone + Send + 'static> Pipe<T, D> {
     {
         let capacity = self.resolve_capacity();
         let mut stash: std::collections::BTreeMap<T, Vec<D>> = std::collections::BTreeMap::new();
-        self.add_unary_notify_internal(
-            name,
-            capacity,
-            move |input, output, ctx| {
-                while let Some((time, data)) = input.next() {
-                    stash.entry(time.clone()).or_default().extend(data);
-                    ctx.notify_at(time);
-                }
-                while let Some(time) = ctx.next_notification() {
-                    if let Some(data) = stash.remove(&time) {
-                        let reduced = data.into_iter().reduce(&mut reducer);
-                        if let Some(value) = reduced {
-                            output.push_vec(time, vec![value]);
-                        }
+        self.add_unary_notify_internal(name, capacity, move |input, output, ctx| {
+            while let Some((time, data)) = input.next() {
+                stash.entry(time.clone()).or_default().extend(data);
+                ctx.notify_at(time);
+            }
+            while let Some(time) = ctx.next_notification() {
+                if let Some(data) = stash.remove(&time) {
+                    let reduced = data.into_iter().reduce(&mut reducer);
+                    if let Some(value) = reduced {
+                        output.push_vec(time, vec![value]);
                     }
                 }
-                Ok(())
-            },
-        )
+            }
+            Ok(())
+        })
     }
 
     /// Fold all elements at each timestamp into an accumulator.
@@ -1344,34 +1369,25 @@ impl<T: Timestamp, D: Clone + Send + 'static> Pipe<T, D> {
     /// // Collect into a sorted vec
     /// let sorted = input.fold("sort", Vec::new(), |mut v, x| { v.push(x); v.sort(); v });
     /// ```
-    pub fn fold<D2, F>(
-        mut self,
-        name: impl Into<String>,
-        init: D2,
-        mut folder: F,
-    ) -> Pipe<T, D2>
+    pub fn fold<D2, F>(mut self, name: impl Into<String>, init: D2, mut folder: F) -> Pipe<T, D2>
     where
         D2: Clone + Send + 'static,
         F: FnMut(D2, D) -> D2 + Send + 'static,
     {
         let capacity = self.resolve_capacity();
         let mut stash: std::collections::BTreeMap<T, Vec<D>> = std::collections::BTreeMap::new();
-        self.add_unary_notify_internal(
-            name,
-            capacity,
-            move |input, output, ctx| {
-                while let Some((time, data)) = input.next() {
-                    stash.entry(time.clone()).or_default().extend(data);
-                    ctx.notify_at(time);
-                }
-                while let Some(time) = ctx.next_notification() {
-                    let data = stash.remove(&time).unwrap_or_default();
-                    let result = data.into_iter().fold(init.clone(), &mut folder);
-                    output.push_vec(time, vec![result]);
-                }
-                Ok(())
-            },
-        )
+        self.add_unary_notify_internal(name, capacity, move |input, output, ctx| {
+            while let Some((time, data)) = input.next() {
+                stash.entry(time.clone()).or_default().extend(data);
+                ctx.notify_at(time);
+            }
+            while let Some(time) = ctx.next_notification() {
+                let data = stash.remove(&time).unwrap_or_default();
+                let result = data.into_iter().fold(init.clone(), &mut folder);
+                output.push_vec(time, vec![result]);
+            }
+            Ok(())
+        })
     }
 
     /// Remove duplicate elements within each timestamp.
@@ -1398,29 +1414,25 @@ impl<T: Timestamp, D: Clone + Send + 'static> Pipe<T, D> {
     {
         let capacity = self.resolve_capacity();
         let mut stash: std::collections::BTreeMap<T, Vec<D>> = std::collections::BTreeMap::new();
-        self.add_unary_notify_internal(
-            name,
-            capacity,
-            move |input, output, ctx| {
-                while let Some((time, data)) = input.next() {
-                    stash.entry(time.clone()).or_default().extend(data);
-                    ctx.notify_at(time);
-                }
-                while let Some(time) = ctx.next_notification() {
-                    if let Some(data) = stash.remove(&time) {
-                        let mut seen = std::collections::HashSet::with_capacity(data.len());
-                        let unique: Vec<D> = data
-                            .into_iter()
-                            .filter(|item| seen.insert(item.clone()))
-                            .collect();
-                        if !unique.is_empty() {
-                            output.push_vec(time, unique);
-                        }
+        self.add_unary_notify_internal(name, capacity, move |input, output, ctx| {
+            while let Some((time, data)) = input.next() {
+                stash.entry(time.clone()).or_default().extend(data);
+                ctx.notify_at(time);
+            }
+            while let Some(time) = ctx.next_notification() {
+                if let Some(data) = stash.remove(&time) {
+                    let mut seen = std::collections::HashSet::with_capacity(data.len());
+                    let unique: Vec<D> = data
+                        .into_iter()
+                        .filter(|item| seen.insert(item.clone()))
+                        .collect();
+                    if !unique.is_empty() {
+                        output.push_vec(time, unique);
                     }
                 }
-                Ok(())
-            },
-        )
+            }
+            Ok(())
+        })
     }
 
     /// Count elements per timestamp.
@@ -1463,29 +1475,26 @@ impl<T: Timestamp, D: Clone + Send + 'static> Pipe<T, D> {
     {
         let capacity = self.resolve_capacity();
         let mut stash: std::collections::BTreeMap<T, Vec<D>> = std::collections::BTreeMap::new();
-        self.add_unary_notify_internal(
-            name,
-            capacity,
-            move |input, output, ctx| {
-                while let Some((time, data)) = input.next() {
-                    for item in data {
-                        let new_time = delay_fn(&time, &item);
-                        assert!(
-                            new_time >= time,
-                            "delay_fn must not return a timestamp earlier than the input"
-                        );
-                        stash.entry(new_time.clone()).or_default().push(item);
-                        ctx.notify_at(new_time);
+        self.add_unary_notify_internal(name, capacity, move |input, output, ctx| {
+            while let Some((time, data)) = input.next() {
+                for item in data {
+                    let new_time = delay_fn(&time, &item);
+                    if new_time < time {
+                        return Err(Error::InvalidConfig(
+                            "delay_fn must not return a timestamp earlier than the input".into(),
+                        ));
                     }
+                    stash.entry(new_time.clone()).or_default().push(item);
+                    ctx.notify_at(new_time);
                 }
-                while let Some(time) = ctx.next_notification() {
-                    if let Some(data) = stash.remove(&time) {
-                        output.push_vec(time, data);
-                    }
+            }
+            while let Some(time) = ctx.next_notification() {
+                if let Some(data) = stash.remove(&time) {
+                    output.push_vec(time, data);
                 }
-                Ok(())
-            },
-        )
+            }
+            Ok(())
+        })
     }
 
     /// Delay data by re-assigning timestamps according to a per-timestamp function.
@@ -1514,27 +1523,24 @@ impl<T: Timestamp, D: Clone + Send + 'static> Pipe<T, D> {
     {
         let capacity = self.resolve_capacity();
         let mut stash: std::collections::BTreeMap<T, Vec<D>> = std::collections::BTreeMap::new();
-        self.add_unary_notify_internal(
-            name,
-            capacity,
-            move |input, output, ctx| {
-                while let Some((time, data)) = input.next() {
-                    let new_time = delay_fn(&time);
-                    assert!(
-                        new_time >= time,
-                        "delay_fn must not return a timestamp earlier than the input"
-                    );
-                    stash.entry(new_time.clone()).or_default().extend(data);
-                    ctx.notify_at(new_time);
+        self.add_unary_notify_internal(name, capacity, move |input, output, ctx| {
+            while let Some((time, data)) = input.next() {
+                let new_time = delay_fn(&time);
+                if new_time < time {
+                    return Err(Error::InvalidConfig(
+                        "delay_fn must not return a timestamp earlier than the input".into(),
+                    ));
                 }
-                while let Some(time) = ctx.next_notification() {
-                    if let Some(data) = stash.remove(&time) {
-                        output.push_vec(time, data);
-                    }
+                stash.entry(new_time.clone()).or_default().extend(data);
+                ctx.notify_at(new_time);
+            }
+            while let Some(time) = ctx.next_notification() {
+                if let Some(data) = stash.remove(&time) {
+                    output.push_vec(time, data);
                 }
-                Ok(())
-            },
-        )
+            }
+            Ok(())
+        })
     }
 
     /// Pass through the first `count` elements, then stop.
@@ -1819,7 +1825,7 @@ impl<T: Timestamp, D: Clone + Send + 'static> Pipe<T, D> {
         mut other: Pipe<T, D2>,
         name: impl Into<String>,
         logic: L,
-    ) -> Pipe<T, D3>
+    ) -> Result<Pipe<T, D3>>
     where
         D2: Clone + Send + 'static,
         D3: Clone + Send + 'static,
@@ -1832,10 +1838,11 @@ impl<T: Timestamp, D: Clone + Send + 'static> Pipe<T, D> {
             + 'static,
     {
         // Both streams must share the same builder state.
-        assert!(
-            Rc::ptr_eq(&self.state, &other.state),
-            "binary operator streams must belong to the same DataflowBuilder"
-        );
+        if !Rc::ptr_eq(&self.state, &other.state) {
+            return Err(Error::InvalidConfig(
+                "binary operator streams must belong to the same DataflowBuilder".into(),
+            ));
+        }
 
         let capacity1 = self.resolve_capacity();
         let capacity2 = other.resolve_capacity();
@@ -1880,7 +1887,8 @@ impl<T: Timestamp, D: Clone + Send + 'static> Pipe<T, D> {
             connectivity.path_mut(1, 0).insert(T::Summary::default());
             if let Err(e) = state
                 .subgraph_builder
-                .add_operator(op_idx, &name, 2, 1, connectivity) {
+                .add_operator(op_idx, &name, 2, 1, connectivity)
+            {
                 state.builder_errors.push(e);
             }
             state.subgraph_builder.add_edge(
@@ -1899,12 +1907,16 @@ impl<T: Timestamp, D: Clone + Send + 'static> Pipe<T, D> {
                     let mut pullers = endpoints.input_pullers.into_iter();
 
                     let input1_puller: Box<dyn Pull<T, D>> = *pullers
-                        .next().ok_or_else(|| Error::Custom("binary must have input puller 0".into()))?
-                        .downcast::<Box<dyn Pull<T, D>>>().map_err(|_| Error::Custom("binary input1 puller type mismatch".into()))?;
+                        .next()
+                        .ok_or_else(|| Error::Custom("binary must have input puller 0".into()))?
+                        .downcast::<Box<dyn Pull<T, D>>>()
+                        .map_err(|_| Error::Custom("binary input1 puller type mismatch".into()))?;
 
                     let input2_puller: Box<dyn Pull<T, D2>> = *pullers
-                        .next().ok_or_else(|| Error::Custom("binary must have input puller 1".into()))?
-                        .downcast::<Box<dyn Pull<T, D2>>>().map_err(|_| Error::Custom("binary input2 puller type mismatch".into()))?;
+                        .next()
+                        .ok_or_else(|| Error::Custom("binary must have input puller 1".into()))?
+                        .downcast::<Box<dyn Pull<T, D2>>>()
+                        .map_err(|_| Error::Custom("binary input2 puller type mismatch".into()))?;
 
                     let output_pusher: Box<dyn Push<T, D3>> = {
                         let pushers: Vec<Box<dyn Push<T, D3>>> = endpoints
@@ -1913,10 +1925,13 @@ impl<T: Timestamp, D: Clone + Send + 'static> Pipe<T, D> {
                             .map(|any_box| {
                                 any_box
                                     .downcast::<Box<dyn Push<T, D3>>>()
-                                    .map(|boxed| *boxed).map_err(|_| Error::Custom("binary output pusher type mismatch".into()))
+                                    .map(|boxed| *boxed)
+                                    .map_err(|_| {
+                                        Error::Custom("binary output pusher type mismatch".into())
+                                    })
                             })
                             .collect::<Result<_>>()?;
-                        tee_or_single(pushers).unwrap_or_else(|| Box::new(NullPush))
+                        tee_or_single(pushers)?.unwrap_or_else(|| Box::new(NullPush))
                     };
 
                     Ok(Box::new(WiredBinaryOperator::new(
@@ -1959,13 +1974,13 @@ impl<T: Timestamp, D: Clone + Send + 'static> Pipe<T, D> {
             state.channel_factories.push((edge2_idx, channel_factory2));
         }
 
-        Pipe {
+        Ok(Pipe {
             state: Rc::clone(&self.state),
             op_idx,
             output_slot: 0,
             capacity_override: None,
             _phantom: PhantomData,
-        }
+        })
     }
 
     /// Merge this Pipe with another same-typed Pipe.
@@ -1979,7 +1994,7 @@ impl<T: Timestamp, D: Clone + Send + 'static> Pipe<T, D> {
     /// let merged = evens.merge(odds);
     /// merged.output("all_numbers");
     /// ```
-    pub fn merge(self, other: Pipe<T, D>) -> Pipe<T, D> {
+    pub fn merge(self, other: Pipe<T, D>) -> Result<Pipe<T, D>> {
         Pipe::concat(vec![self, other])
     }
 
@@ -2075,8 +2090,10 @@ impl<T: Timestamp, D: Clone + Send + 'static> Pipe<T, D> {
                     let input_puller: Box<dyn Pull<T, D>> = *endpoints
                         .input_pullers
                         .into_iter()
-                        .next().ok_or_else(|| Error::Custom("enter must have input puller".into()))?
-                        .downcast::<Box<dyn Pull<T, D>>>().map_err(|_| Error::Custom("enter input puller type mismatch".into()))?;
+                        .next()
+                        .ok_or_else(|| Error::Custom("enter must have input puller".into()))?
+                        .downcast::<Box<dyn Pull<T, D>>>()
+                        .map_err(|_| Error::Custom("enter input puller type mismatch".into()))?;
 
                     let output_pusher: Box<dyn Push<PT<T, TInner>, D>> = {
                         let pushers: Vec<Box<dyn Push<PT<T, TInner>, D>>> = endpoints
@@ -2085,10 +2102,13 @@ impl<T: Timestamp, D: Clone + Send + 'static> Pipe<T, D> {
                             .map(|any_box| {
                                 any_box
                                     .downcast::<Box<dyn Push<PT<T, TInner>, D>>>()
-                                    .map(|boxed| *boxed).map_err(|_| Error::Custom("enter output pusher type mismatch".into()))
+                                    .map(|boxed| *boxed)
+                                    .map_err(|_| {
+                                        Error::Custom("enter output pusher type mismatch".into())
+                                    })
                             })
                             .collect::<Result<_>>()?;
-                        tee_or_single(pushers).unwrap_or_else(|| Box::new(NullPush))
+                        tee_or_single(pushers)?.unwrap_or_else(|| Box::new(NullPush))
                     };
 
                     Ok(Box::new(WiredEnterOperator::<T, TInner, D>::new(
@@ -2104,16 +2124,15 @@ impl<T: Timestamp, D: Clone + Send + 'static> Pipe<T, D> {
             // Channel factory for enter's input edge (uses per-edge override if set)
             let enter_edge_idx = state.graph.edges().len() - 1;
             let cap = enter_capacity;
-            let cf: ChannelFactory =
-                channel_factory(move |_ctx, wake: Option<WakeHandle>| {
-                    let (push, pull) = bounded_channel_with_wake::<T, D, ()>(cap, wake.clone());
-                    Ok((
-                        Box::new(Box::new(push) as Box<dyn Push<T, D>>)
-                            as Box<dyn std::any::Any + Send>,
-                        Box::new(Box::new(pull) as Box<dyn Pull<T, D>>)
-                            as Box<dyn std::any::Any + Send>,
-                    ))
-                });
+            let cf: ChannelFactory = channel_factory(move |_ctx, wake: Option<WakeHandle>| {
+                let (push, pull) = bounded_channel_with_wake::<T, D, ()>(cap, wake.clone());
+                Ok((
+                    Box::new(Box::new(push) as Box<dyn Push<T, D>>)
+                        as Box<dyn std::any::Any + Send>,
+                    Box::new(Box::new(pull) as Box<dyn Pull<T, D>>)
+                        as Box<dyn std::any::Any + Send>,
+                ))
+            });
             state.channel_factories.push((enter_edge_idx, cf));
 
             // Feedback operator: 1 input (Product<T,TInner>,D), 1 output (Product<T,TInner>,D)
@@ -2147,8 +2166,10 @@ impl<T: Timestamp, D: Clone + Send + 'static> Pipe<T, D> {
                     let input_puller: Box<dyn Pull<PT<T, TInner>, D>> = *endpoints
                         .input_pullers
                         .into_iter()
-                        .next().ok_or_else(|| Error::Custom("feedback must have input puller".into()))?
-                        .downcast::<Box<dyn Pull<PT<T, TInner>, D>>>().map_err(|_| Error::Custom("feedback input puller type mismatch".into()))?;
+                        .next()
+                        .ok_or_else(|| Error::Custom("feedback must have input puller".into()))?
+                        .downcast::<Box<dyn Pull<PT<T, TInner>, D>>>()
+                        .map_err(|_| Error::Custom("feedback input puller type mismatch".into()))?;
 
                     let output_pusher: Box<dyn Push<PT<T, TInner>, D>> = {
                         let pushers: Vec<Box<dyn Push<PT<T, TInner>, D>>> = endpoints
@@ -2157,10 +2178,13 @@ impl<T: Timestamp, D: Clone + Send + 'static> Pipe<T, D> {
                             .map(|any_box| {
                                 any_box
                                     .downcast::<Box<dyn Push<PT<T, TInner>, D>>>()
-                                    .map(|boxed| *boxed).map_err(|_| Error::Custom("feedback output pusher type mismatch".into()))
+                                    .map(|boxed| *boxed)
+                                    .map_err(|_| {
+                                        Error::Custom("feedback output pusher type mismatch".into())
+                                    })
                             })
                             .collect::<Result<_>>()?;
-                        tee_or_single(pushers).unwrap_or_else(|| Box::new(NullPush))
+                        tee_or_single(pushers)?.unwrap_or_else(|| Box::new(NullPush))
                     };
 
                     Ok(Box::new(WiredFeedbackOperator::<T, TInner, D>::new(
@@ -2239,11 +2263,14 @@ impl<T: Timestamp, D: Clone + Send + 'static> Pipe<T, D> {
                         .input_pullers
                         .into_iter()
                         .map(|any_box| {
-                                any_box
+                            any_box
                                 .downcast::<Box<dyn Pull<PT<T, TInner>, D>>>()
-                                .map(|boxed| *boxed).map_err(|_| Error::Custom("concat input puller type mismatch".into()))
-                            })
-                            .collect::<Result<_>>()?;
+                                .map(|boxed| *boxed)
+                                .map_err(|_| {
+                                    Error::Custom("concat input puller type mismatch".into())
+                                })
+                        })
+                        .collect::<Result<_>>()?;
 
                     let output_pusher: Box<dyn Push<PT<T, TInner>, D>> = {
                         let pushers: Vec<Box<dyn Push<PT<T, TInner>, D>>> = endpoints
@@ -2252,10 +2279,13 @@ impl<T: Timestamp, D: Clone + Send + 'static> Pipe<T, D> {
                             .map(|any_box| {
                                 any_box
                                     .downcast::<Box<dyn Push<PT<T, TInner>, D>>>()
-                                    .map(|boxed| *boxed).map_err(|_| Error::Custom("concat output pusher type mismatch".into()))
+                                    .map(|boxed| *boxed)
+                                    .map_err(|_| {
+                                        Error::Custom("concat output pusher type mismatch".into())
+                                    })
                             })
                             .collect::<Result<_>>()?;
-                        tee_or_single(pushers).unwrap_or_else(|| Box::new(NullPush))
+                        tee_or_single(pushers)?.unwrap_or_else(|| Box::new(NullPush))
                     };
 
                     Ok(Box::new(WiredConcatOperator::new(
@@ -2270,31 +2300,29 @@ impl<T: Timestamp, D: Clone + Send + 'static> Pipe<T, D> {
 
             // Channel factories for concat inputs
             let cap = capacity;
-            let cf1: ChannelFactory =
-                channel_factory(move |_ctx, wake: Option<WakeHandle>| {
-                    let (push, pull) =
-                        bounded_channel_with_wake::<PT<T, TInner>, D, ()>(cap, wake.clone());
-                    Ok((
-                        Box::new(Box::new(push) as Box<dyn Push<PT<T, TInner>, D>>)
-                            as Box<dyn std::any::Any + Send>,
-                        Box::new(Box::new(pull) as Box<dyn Pull<PT<T, TInner>, D>>)
-                            as Box<dyn std::any::Any + Send>,
-                    ))
-                });
+            let cf1: ChannelFactory = channel_factory(move |_ctx, wake: Option<WakeHandle>| {
+                let (push, pull) =
+                    bounded_channel_with_wake::<PT<T, TInner>, D, ()>(cap, wake.clone());
+                Ok((
+                    Box::new(Box::new(push) as Box<dyn Push<PT<T, TInner>, D>>)
+                        as Box<dyn std::any::Any + Send>,
+                    Box::new(Box::new(pull) as Box<dyn Pull<PT<T, TInner>, D>>)
+                        as Box<dyn std::any::Any + Send>,
+                ))
+            });
             state.channel_factories.push((enter_concat_edge_idx, cf1));
 
             let cap = capacity;
-            let cf2: ChannelFactory =
-                channel_factory(move |_ctx, wake: Option<WakeHandle>| {
-                    let (push, pull) =
-                        bounded_channel_with_wake::<PT<T, TInner>, D, ()>(cap, wake.clone());
-                    Ok((
-                        Box::new(Box::new(push) as Box<dyn Push<PT<T, TInner>, D>>)
-                            as Box<dyn std::any::Any + Send>,
-                        Box::new(Box::new(pull) as Box<dyn Pull<PT<T, TInner>, D>>)
-                            as Box<dyn std::any::Any + Send>,
-                    ))
-                });
+            let cf2: ChannelFactory = channel_factory(move |_ctx, wake: Option<WakeHandle>| {
+                let (push, pull) =
+                    bounded_channel_with_wake::<PT<T, TInner>, D, ()>(cap, wake.clone());
+                Ok((
+                    Box::new(Box::new(push) as Box<dyn Push<PT<T, TInner>, D>>)
+                        as Box<dyn std::any::Any + Send>,
+                    Box::new(Box::new(pull) as Box<dyn Pull<PT<T, TInner>, D>>)
+                        as Box<dyn std::any::Any + Send>,
+                ))
+            });
             state.channel_factories.push((fb_concat_edge_idx, cf2));
 
             // Leave operator: 1 input (Product<T,TInner>,D), 1 output (T,D)
@@ -2492,17 +2520,16 @@ impl<T: Timestamp, D: Clone + Send + 'static> Pipe<T, D> {
             // Index by position in feedback_edges (0-based).
             let fb_position = state.graph.feedback_edges().len() - 1;
             let cap = feedback_capacity;
-            let cf_fb: ChannelFactory =
-                channel_factory(move |_ctx, wake: Option<WakeHandle>| {
-                    let (push, pull) =
-                        bounded_channel_with_wake::<PT<T, TInner>, D, ()>(cap, wake.clone());
-                    Ok((
-                        Box::new(Box::new(push) as Box<dyn Push<PT<T, TInner>, D>>)
-                            as Box<dyn std::any::Any + Send>,
-                        Box::new(Box::new(pull) as Box<dyn Pull<PT<T, TInner>, D>>)
-                            as Box<dyn std::any::Any + Send>,
-                    ))
-                });
+            let cf_fb: ChannelFactory = channel_factory(move |_ctx, wake: Option<WakeHandle>| {
+                let (push, pull) =
+                    bounded_channel_with_wake::<PT<T, TInner>, D, ()>(cap, wake.clone());
+                Ok((
+                    Box::new(Box::new(push) as Box<dyn Push<PT<T, TInner>, D>>)
+                        as Box<dyn std::any::Any + Send>,
+                    Box::new(Box::new(pull) as Box<dyn Pull<PT<T, TInner>, D>>)
+                        as Box<dyn std::any::Any + Send>,
+                ))
+            });
             state.feedback_channel_factories.push((fb_position, cf_fb));
 
             // Leave operator factory
@@ -2512,8 +2539,10 @@ impl<T: Timestamp, D: Clone + Send + 'static> Pipe<T, D> {
                     let input_puller: Box<dyn Pull<PT<T, TInner>, D>> = *endpoints
                         .input_pullers
                         .into_iter()
-                        .next().ok_or_else(|| Error::Custom("leave must have input puller".into()))?
-                        .downcast::<Box<dyn Pull<PT<T, TInner>, D>>>().map_err(|_| Error::Custom("leave input puller type mismatch".into()))?;
+                        .next()
+                        .ok_or_else(|| Error::Custom("leave must have input puller".into()))?
+                        .downcast::<Box<dyn Pull<PT<T, TInner>, D>>>()
+                        .map_err(|_| Error::Custom("leave input puller type mismatch".into()))?;
 
                     let output_pusher: Box<dyn Push<T, D>> = {
                         let pushers: Vec<Box<dyn Push<T, D>>> = endpoints
@@ -2522,10 +2551,13 @@ impl<T: Timestamp, D: Clone + Send + 'static> Pipe<T, D> {
                             .map(|any_box| {
                                 any_box
                                     .downcast::<Box<dyn Push<T, D>>>()
-                                    .map(|boxed| *boxed).map_err(|_| Error::Custom("leave output pusher type mismatch".into()))
+                                    .map(|boxed| *boxed)
+                                    .map_err(|_| {
+                                        Error::Custom("leave output pusher type mismatch".into())
+                                    })
                             })
                             .collect::<Result<_>>()?;
-                        tee_or_single(pushers).unwrap_or_else(|| Box::new(NullPush))
+                        tee_or_single(pushers)?.unwrap_or_else(|| Box::new(NullPush))
                     };
 
                     Ok(Box::new(WiredLeaveOperator::<T, TInner, D>::new(
@@ -2578,15 +2610,18 @@ impl<T: Timestamp, D: Clone + Send + 'static> Pipe<T, D> {
     /// ```ignore
     /// let merged = Pipe::concat(vec![evens, odds, zeros]);
     /// ```
-    pub fn concat(mut streams: Vec<Pipe<T, D>>) -> Pipe<T, D> {
-        assert!(!streams.is_empty(), "concat requires at least one Pipe");
+    pub fn concat(mut streams: Vec<Pipe<T, D>>) -> Result<Pipe<T, D>> {
+        if streams.is_empty() {
+            return Err(Error::InvalidConfig("concat requires at least one Pipe".into()));
+        }
 
         // Verify all streams share the same builder.
         for s in &streams[1..] {
-            assert!(
-                Rc::ptr_eq(&streams[0].state, &s.state),
-                "concat streams must belong to the same DataflowBuilder"
-            );
+            if !Rc::ptr_eq(&streams[0].state, &s.state) {
+                return Err(Error::InvalidConfig(
+                    "concat streams must belong to the same DataflowBuilder".into(),
+                ));
+            }
         }
 
         // Resolve per-edge capacity for each input before borrowing state.
@@ -2626,9 +2661,11 @@ impl<T: Timestamp, D: Clone + Send + 'static> Pipe<T, D> {
             for i in 0..num_inputs {
                 connectivity.path_mut(i, 0).insert(T::Summary::default());
             }
-            if let Err(e) = state
-                .subgraph_builder
-                .add_operator(op_idx, "concat", num_inputs, 1, connectivity) {
+            if let Err(e) =
+                state
+                    .subgraph_builder
+                    .add_operator(op_idx, "concat", num_inputs, 1, connectivity)
+            {
                 state.builder_errors.push(e);
             }
             for (i, s) in streams.iter().enumerate() {
@@ -2645,11 +2682,14 @@ impl<T: Timestamp, D: Clone + Send + 'static> Pipe<T, D> {
                         .input_pullers
                         .into_iter()
                         .map(|any_box| {
-                                any_box
+                            any_box
                                 .downcast::<Box<dyn Pull<T, D>>>()
-                                .map(|boxed| *boxed).map_err(|_| Error::Custom("concat input puller type mismatch".into()))
-                            })
-                            .collect::<Result<_>>()?;
+                                .map(|boxed| *boxed)
+                                .map_err(|_| {
+                                    Error::Custom("concat input puller type mismatch".into())
+                                })
+                        })
+                        .collect::<Result<_>>()?;
 
                     let output_pusher: Box<dyn Push<T, D>> = {
                         let pushers: Vec<Box<dyn Push<T, D>>> = endpoints
@@ -2658,10 +2698,13 @@ impl<T: Timestamp, D: Clone + Send + 'static> Pipe<T, D> {
                             .map(|any_box| {
                                 any_box
                                     .downcast::<Box<dyn Push<T, D>>>()
-                                    .map(|boxed| *boxed).map_err(|_| Error::Custom("concat output pusher type mismatch".into()))
+                                    .map(|boxed| *boxed)
+                                    .map_err(|_| {
+                                        Error::Custom("concat output pusher type mismatch".into())
+                                    })
                             })
                             .collect::<Result<_>>()?;
-                        tee_or_single(pushers).unwrap_or_else(|| Box::new(NullPush))
+                        tee_or_single(pushers)?.unwrap_or_else(|| Box::new(NullPush))
                     };
 
                     Ok(Box::new(WiredConcatOperator::new(
@@ -2691,13 +2734,13 @@ impl<T: Timestamp, D: Clone + Send + 'static> Pipe<T, D> {
             }
         }
 
-        Pipe {
+        Ok(Pipe {
             state: state_rc,
             op_idx,
             output_slot: 0,
             capacity_override: None,
             _phantom: PhantomData,
-        }
+        })
     }
 
     /// Declare this Pipe as a named output port.
@@ -2717,7 +2760,7 @@ impl<T: Timestamp, D: Clone + Send + 'static> Pipe<T, D> {
     ///     println!("t={time}: {batch:?}");
     /// }
     /// ```
-    pub fn output(mut self, name: impl Into<String>) -> OutputPort<T, D> {
+    pub fn output(mut self, name: impl Into<String>) -> Result<OutputPort<T, D>> {
         let name = name.into();
         let collector = Arc::new(Mutex::new(Vec::new()));
         let op_idx;
@@ -2727,10 +2770,11 @@ impl<T: Timestamp, D: Clone + Send + 'static> Pipe<T, D> {
             let mut state = self.state.borrow_mut();
 
             // Validate unique name
-            assert!(
-                !state.output_ports.iter().any(|p| p.name == name),
-                "duplicate output port name: {name}"
-            );
+            if state.output_ports.iter().any(|p| p.name == name) {
+                return Err(Error::InvalidConfig(format!(
+                    "duplicate output port name: {name}"
+                )));
+            }
 
             op_idx = state.allocate_operator_index();
             let stage_id = StageId::new(0);
@@ -2752,9 +2796,13 @@ impl<T: Timestamp, D: Clone + Send + 'static> Pipe<T, D> {
             ));
 
             // Subgraph builder: sink has 1 input, 0 outputs, no connectivity
-            if let Err(e) = state
-                .subgraph_builder
-                .add_operator(op_idx, &name, 1, 0, PortConnectivity::new(1, 0)) {
+            if let Err(e) = state.subgraph_builder.add_operator(
+                op_idx,
+                &name,
+                1,
+                0,
+                PortConnectivity::new(1, 0),
+            ) {
                 state.builder_errors.push(e);
             }
             state.subgraph_builder.add_edge(
@@ -2777,8 +2825,10 @@ impl<T: Timestamp, D: Clone + Send + 'static> Pipe<T, D> {
                     let input_puller: Box<dyn Pull<T, D>> = *endpoints
                         .input_pullers
                         .into_iter()
-                        .next().ok_or_else(|| Error::Custom("sink must have input puller".into()))?
-                        .downcast::<Box<dyn Pull<T, D>>>().map_err(|_| Error::Custom("sink input puller type mismatch".into()))?;
+                        .next()
+                        .ok_or_else(|| Error::Custom("sink must have input puller".into()))?
+                        .downcast::<Box<dyn Pull<T, D>>>()
+                        .map_err(|_| Error::Custom("sink input puller type mismatch".into()))?;
 
                     Ok(Box::new(CollectingSink::new(
                         name_clone,
@@ -2811,8 +2861,14 @@ impl<T: Timestamp, D: Clone + Send + 'static> Pipe<T, D> {
                                 let input_puller: Box<dyn Pull<T, D>> = *endpoints
                                     .input_pullers
                                     .into_iter()
-                                    .next().ok_or_else(|| Error::Custom("sink must have input puller".into()))?
-                                    .downcast::<Box<dyn Pull<T, D>>>().map_err(|_| Error::Custom("sink input puller type mismatch".into()))?;
+                                    .next()
+                                    .ok_or_else(|| {
+                                        Error::Custom("sink must have input puller".into())
+                                    })?
+                                    .downcast::<Box<dyn Pull<T, D>>>()
+                                    .map_err(|_| {
+                                        Error::Custom("sink input puller type mismatch".into())
+                                    })?;
 
                                 Ok(Box::new(ChannelSinkOperator::new(
                                     sink_name_inner,
@@ -2820,7 +2876,8 @@ impl<T: Timestamp, D: Clone + Send + 'static> Pipe<T, D> {
                                     StageId::new(0),
                                     input_puller,
                                     OutputSend::Std(tx),
-                                )) as Box<dyn SchedulableOperator>)
+                                ))
+                                    as Box<dyn SchedulableOperator>)
                             });
 
                         let receiver_any: Box<dyn std::any::Any + Send> = Box::new(receiver);
@@ -2842,8 +2899,14 @@ impl<T: Timestamp, D: Clone + Send + 'static> Pipe<T, D> {
                                 let input_puller: Box<dyn Pull<T, D>> = *endpoints
                                     .input_pullers
                                     .into_iter()
-                                    .next().ok_or_else(|| Error::Custom("sink must have input puller".into()))?
-                                    .downcast::<Box<dyn Pull<T, D>>>().map_err(|_| Error::Custom("sink input puller type mismatch".into()))?;
+                                    .next()
+                                    .ok_or_else(|| {
+                                        Error::Custom("sink must have input puller".into())
+                                    })?
+                                    .downcast::<Box<dyn Pull<T, D>>>()
+                                    .map_err(|_| {
+                                        Error::Custom("sink input puller type mismatch".into())
+                                    })?;
 
                                 Ok(Box::new(ChannelSinkOperator::new(
                                     sink_name_inner,
@@ -2851,7 +2914,8 @@ impl<T: Timestamp, D: Clone + Send + 'static> Pipe<T, D> {
                                     StageId::new(0),
                                     input_puller,
                                     OutputSend::Tokio(tx),
-                                )) as Box<dyn SchedulableOperator>)
+                                ))
+                                    as Box<dyn SchedulableOperator>)
                             });
 
                         let receiver_any: Box<dyn std::any::Any + Send> = Box::new(receiver);
@@ -2877,11 +2941,11 @@ impl<T: Timestamp, D: Clone + Send + 'static> Pipe<T, D> {
             state.channel_factories.push((edge_idx, chan_factory));
         }
 
-        OutputPort {
+        Ok(OutputPort {
             name,
             collector,
             _phantom: PhantomData,
-        }
+        })
     }
 
     /// Convenience: collect output into a shared vector (for testing).
@@ -2906,7 +2970,10 @@ impl<T: Timestamp, D: Clone + Send + 'static> Pipe<T, D> {
             state.next_collect_index += 1;
             format!("__collect_{idx}")
         };
-        self.output(name).collector
+        // SAFETY: collect output port was just created by add_output_port above
+        self.output(name)
+            .expect("internal collect output should be valid")
+            .collector
     }
 }
 
@@ -3097,8 +3164,10 @@ impl<
         name: impl Into<String>,
         target_parallelism: usize,
         key_fn: impl Fn(&D) -> K + Send + Sync + 'static,
-    ) -> Pipe<T, D> {
-        assert!(target_parallelism > 0, "target_parallelism must be > 0");
+    ) -> Result<Pipe<T, D>> {
+        if target_parallelism == 0 {
+            return Err(Error::InvalidConfig("target_parallelism must be > 0".into()));
+        }
         let capacity = self.resolve_capacity();
         let exchange_fn = crate::dataflow::channels::pact::ExchangeFn::by_key(name.into(), key_fn);
         let pipe = self.add_exchange_internal_networked(exchange_fn, capacity);
@@ -3108,7 +3177,7 @@ impl<
             .borrow_mut()
             .graph
             .set_exchange_parallelism(exchange_op_idx, target_parallelism);
-        pipe
+        Ok(pipe)
     }
 
     /// Repartition data using a direct hash function (returns u64).
@@ -3146,8 +3215,10 @@ impl<
         name: impl Into<String>,
         target_parallelism: usize,
         hash_fn: impl Fn(&D) -> u64 + Send + Sync + 'static,
-    ) -> Pipe<T, D> {
-        assert!(target_parallelism > 0, "target_parallelism must be > 0");
+    ) -> Result<Pipe<T, D>> {
+        if target_parallelism == 0 {
+            return Err(Error::InvalidConfig("target_parallelism must be > 0".into()));
+        }
         let capacity = self.resolve_capacity();
         let exchange_fn = crate::dataflow::channels::pact::ExchangeFn::new(name, hash_fn);
         let pipe = self.add_exchange_internal_networked(exchange_fn, capacity);
@@ -3156,7 +3227,7 @@ impl<
             .borrow_mut()
             .graph
             .set_exchange_parallelism(exchange_op_idx, target_parallelism);
-        pipe
+        Ok(pipe)
     }
 
     /// Internal: add an exchange operator with network-capable factory creator.
@@ -3241,8 +3312,14 @@ impl<
     ///     .rebalance_to("fan-out", 8)
     ///     .map("process", |_t, x| expensive_computation(x));
     /// ```
-    pub fn rebalance_to(self, name: impl Into<String>, target_parallelism: usize) -> Pipe<T, D> {
-        assert!(target_parallelism > 0, "target_parallelism must be > 0");
+    pub fn rebalance_to(
+        self,
+        name: impl Into<String>,
+        target_parallelism: usize,
+    ) -> Result<Pipe<T, D>> {
+        if target_parallelism == 0 {
+            return Err(Error::InvalidConfig("target_parallelism must be > 0".into()));
+        }
         let counter = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
         self.exchange_by_hash_to(name, target_parallelism, move |_| {
             counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
@@ -3341,8 +3418,10 @@ impl<T: Timestamp, D: Clone + Send + 'static> Pipe<T, D> {
         name: impl Into<String>,
         target_parallelism: usize,
         key_fn: impl Fn(&D) -> K + Send + Sync + 'static,
-    ) -> Pipe<T, D> {
-        assert!(target_parallelism > 0, "target_parallelism must be > 0");
+    ) -> Result<Pipe<T, D>> {
+        if target_parallelism == 0 {
+            return Err(Error::InvalidConfig("target_parallelism must be > 0".into()));
+        }
         let capacity = self.resolve_capacity();
         let exchange_fn = crate::dataflow::channels::pact::ExchangeFn::by_key(&name.into(), key_fn);
         let pipe = self.add_exchange_internal(exchange_fn, capacity);
@@ -3351,7 +3430,7 @@ impl<T: Timestamp, D: Clone + Send + 'static> Pipe<T, D> {
             .borrow_mut()
             .graph
             .set_exchange_parallelism(exchange_op_idx, target_parallelism);
-        pipe
+        Ok(pipe)
     }
 
     /// Repartition data using a direct hash function (returns u64).
@@ -3389,8 +3468,10 @@ impl<T: Timestamp, D: Clone + Send + 'static> Pipe<T, D> {
         name: impl Into<String>,
         target_parallelism: usize,
         hash_fn: impl Fn(&D) -> u64 + Send + Sync + 'static,
-    ) -> Pipe<T, D> {
-        assert!(target_parallelism > 0, "target_parallelism must be > 0");
+    ) -> Result<Pipe<T, D>> {
+        if target_parallelism == 0 {
+            return Err(Error::InvalidConfig("target_parallelism must be > 0".into()));
+        }
         let capacity = self.resolve_capacity();
         let exchange_fn = crate::dataflow::channels::pact::ExchangeFn::new(name, hash_fn);
         let pipe = self.add_exchange_internal(exchange_fn, capacity);
@@ -3399,7 +3480,7 @@ impl<T: Timestamp, D: Clone + Send + 'static> Pipe<T, D> {
             .borrow_mut()
             .graph
             .set_exchange_parallelism(exchange_op_idx, target_parallelism);
-        pipe
+        Ok(pipe)
     }
 
     /// Route all data to worker 0 (global aggregation pattern).
@@ -3456,8 +3537,14 @@ impl<T: Timestamp, D: Clone + Send + 'static> Pipe<T, D> {
     ///     .rebalance_to("fan-out", 8)
     ///     .map("process", |_t, x| expensive_computation(x));
     /// ```
-    pub fn rebalance_to(self, name: impl Into<String>, target_parallelism: usize) -> Pipe<T, D> {
-        assert!(target_parallelism > 0, "target_parallelism must be > 0");
+    pub fn rebalance_to(
+        self,
+        name: impl Into<String>,
+        target_parallelism: usize,
+    ) -> Result<Pipe<T, D>> {
+        if target_parallelism == 0 {
+            return Err(Error::InvalidConfig("target_parallelism must be > 0".into()));
+        }
         let counter = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
         self.exchange_by_hash_to(name, target_parallelism, move |_| {
             counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
@@ -3569,8 +3656,10 @@ impl<T: Timestamp, D: Clone + Send + 'static> Pipe<T, D> {
                     let input_puller: Box<dyn Pull<T, D>> = *endpoints
                         .input_pullers
                         .into_iter()
-                        .next().ok_or_else(|| Error::Custom("exchange must have input puller".into()))?
-                        .downcast::<Box<dyn Pull<T, D>>>().map_err(|_| Error::Custom("exchange input puller type mismatch".into()))?;
+                        .next()
+                        .ok_or_else(|| Error::Custom("exchange must have input puller".into()))?
+                        .downcast::<Box<dyn Pull<T, D>>>()
+                        .map_err(|_| Error::Custom("exchange input puller type mismatch".into()))?;
 
                     let output_pusher: Box<dyn Push<T, D>> = {
                         let pushers: Vec<Box<dyn Push<T, D>>> = endpoints
@@ -3579,10 +3668,13 @@ impl<T: Timestamp, D: Clone + Send + 'static> Pipe<T, D> {
                             .map(|any_box| {
                                 any_box
                                     .downcast::<Box<dyn Push<T, D>>>()
-                                    .map(|boxed| *boxed).map_err(|_| Error::Custom("exchange output pusher type mismatch".into()))
+                                    .map(|boxed| *boxed)
+                                    .map_err(|_| {
+                                        Error::Custom("exchange output pusher type mismatch".into())
+                                    })
                             })
                             .collect::<Result<_>>()?;
-                        tee_or_single(pushers).unwrap_or_else(|| Box::new(NullPush))
+                        tee_or_single(pushers)?.unwrap_or_else(|| Box::new(NullPush))
                     };
 
                     Ok(Box::new(WiredUnaryOperator::with_reporter(
@@ -3634,11 +3726,7 @@ impl<T: Timestamp, D: Clone + Send + 'static> Pipe<T, D> {
     ///
     /// Like `add_exchange_internal` but uses `BroadcastPush` which clones
     /// each item to ALL target workers instead of routing to one.
-    fn add_broadcast_internal(
-        &self,
-        name: impl Into<String>,
-        capacity: usize,
-    ) -> Pipe<T, D> {
+    fn add_broadcast_internal(&self, name: impl Into<String>, capacity: usize) -> Pipe<T, D> {
         let _name = name.into();
         let op_idx;
         let stage_id = StageId::new(0);
@@ -3662,7 +3750,11 @@ impl<T: Timestamp, D: Clone + Send + 'static> Pipe<T, D> {
             state
                 .graph
                 .register_operator(crate::dataflow::graph::OperatorInfo::new(
-                    op_idx, "broadcast", stage_id, 1, 1,
+                    op_idx,
+                    "broadcast",
+                    stage_id,
+                    1,
+                    1,
                 ))
                 .unwrap_or_else(|e| state.builder_errors.push(e));
 
@@ -3706,8 +3798,12 @@ impl<T: Timestamp, D: Clone + Send + 'static> Pipe<T, D> {
                     let input_puller: Box<dyn Pull<T, D>> = *endpoints
                         .input_pullers
                         .into_iter()
-                        .next().ok_or_else(|| Error::Custom("broadcast must have input puller".into()))?
-                        .downcast::<Box<dyn Pull<T, D>>>().map_err(|_| Error::Custom("broadcast input puller type mismatch".into()))?;
+                        .next()
+                        .ok_or_else(|| Error::Custom("broadcast must have input puller".into()))?
+                        .downcast::<Box<dyn Pull<T, D>>>()
+                        .map_err(|_| {
+                            Error::Custom("broadcast input puller type mismatch".into())
+                        })?;
 
                     let output_pusher: Box<dyn Push<T, D>> = {
                         let pushers: Vec<Box<dyn Push<T, D>>> = endpoints
@@ -3716,10 +3812,15 @@ impl<T: Timestamp, D: Clone + Send + 'static> Pipe<T, D> {
                             .map(|any_box| {
                                 any_box
                                     .downcast::<Box<dyn Push<T, D>>>()
-                                    .map(|boxed| *boxed).map_err(|_| Error::Custom("broadcast output pusher type mismatch".into()))
+                                    .map(|boxed| *boxed)
+                                    .map_err(|_| {
+                                        Error::Custom(
+                                            "broadcast output pusher type mismatch".into(),
+                                        )
+                                    })
                             })
                             .collect::<Result<_>>()?;
-                        tee_or_single(pushers).unwrap_or_else(|| Box::new(NullPush))
+                        tee_or_single(pushers)?.unwrap_or_else(|| Box::new(NullPush))
                     };
 
                     Ok(Box::new(WiredUnaryOperator::with_reporter(
@@ -3751,7 +3852,8 @@ impl<T: Timestamp, D: Clone + Send + 'static> Pipe<T, D> {
 
             // Store broadcast factory creator for multi-worker.
             let creator =
-                crate::dataflow::channels::exchange_channel::create_broadcast_factory_creator::<T, D>();
+                crate::dataflow::channels::exchange_channel::create_broadcast_factory_creator::<T, D>(
+                );
             state.exchange_creators.push((edge_idx, capacity, creator));
         }
 
@@ -3862,8 +3964,10 @@ impl<T: Timestamp, D: Clone + Send + 'static> Pipe<T, D> {
                     let input_puller: Box<dyn Pull<T, D>> = *endpoints
                         .input_pullers
                         .into_iter()
-                        .next().ok_or_else(|| Error::Custom("unary must have input puller".into()))?
-                        .downcast::<Box<dyn Pull<T, D>>>().map_err(|_| Error::Custom("unary input puller type mismatch".into()))?;
+                        .next()
+                        .ok_or_else(|| Error::Custom("unary must have input puller".into()))?
+                        .downcast::<Box<dyn Pull<T, D>>>()
+                        .map_err(|_| Error::Custom("unary input puller type mismatch".into()))?;
 
                     let output_pusher: Box<dyn Push<T, D2>> = {
                         let pushers: Vec<Box<dyn Push<T, D2>>> = endpoints
@@ -3872,10 +3976,13 @@ impl<T: Timestamp, D: Clone + Send + 'static> Pipe<T, D> {
                             .map(|any_box| {
                                 any_box
                                     .downcast::<Box<dyn Push<T, D2>>>()
-                                    .map(|boxed| *boxed).map_err(|_| Error::Custom("unary output pusher type mismatch".into()))
+                                    .map(|boxed| *boxed)
+                                    .map_err(|_| {
+                                        Error::Custom("unary output pusher type mismatch".into())
+                                    })
                             })
                             .collect::<Result<_>>()?;
-                        tee_or_single(pushers).unwrap_or_else(|| Box::new(NullPush))
+                        tee_or_single(pushers)?.unwrap_or_else(|| Box::new(NullPush))
                     };
 
                     Ok(Box::new(WiredUnaryOperator::new(
@@ -3971,8 +4078,10 @@ impl<T: Timestamp, D: Clone + Send + 'static> Pipe<T, D> {
                     let input_puller: Box<dyn Pull<T, D>> = *endpoints
                         .input_pullers
                         .into_iter()
-                        .next().ok_or_else(|| Error::Custom("unary must have input puller".into()))?
-                        .downcast::<Box<dyn Pull<T, D>>>().map_err(|_| Error::Custom("unary input puller type mismatch".into()))?;
+                        .next()
+                        .ok_or_else(|| Error::Custom("unary must have input puller".into()))?
+                        .downcast::<Box<dyn Pull<T, D>>>()
+                        .map_err(|_| Error::Custom("unary input puller type mismatch".into()))?;
 
                     let output_pusher: Box<dyn Push<T, D2>> = {
                         let pushers: Vec<Box<dyn Push<T, D2>>> = endpoints
@@ -3981,10 +4090,13 @@ impl<T: Timestamp, D: Clone + Send + 'static> Pipe<T, D> {
                             .map(|any_box| {
                                 any_box
                                     .downcast::<Box<dyn Push<T, D2>>>()
-                                    .map(|boxed| *boxed).map_err(|_| Error::Custom("unary output pusher type mismatch".into()))
+                                    .map(|boxed| *boxed)
+                                    .map_err(|_| {
+                                        Error::Custom("unary output pusher type mismatch".into())
+                                    })
                             })
                             .collect::<Result<_>>()?;
-                        tee_or_single(pushers).unwrap_or_else(|| Box::new(NullPush))
+                        tee_or_single(pushers)?.unwrap_or_else(|| Box::new(NullPush))
                     };
 
                     Ok(Box::new(WiredUnaryOperator::new(
@@ -4110,8 +4222,12 @@ impl<T: Timestamp, D: Clone + Send + 'static> Pipe<T, D> {
                     let input_puller: Box<dyn Pull<T, D>> = *endpoints
                         .input_pullers
                         .into_iter()
-                        .next().ok_or_else(|| Error::Custom("unary_notify must have input puller".into()))?
-                        .downcast::<Box<dyn Pull<T, D>>>().map_err(|_| Error::Custom("unary_notify input puller type mismatch".into()))?;
+                        .next()
+                        .ok_or_else(|| Error::Custom("unary_notify must have input puller".into()))?
+                        .downcast::<Box<dyn Pull<T, D>>>()
+                        .map_err(|_| {
+                            Error::Custom("unary_notify input puller type mismatch".into())
+                        })?;
 
                     let output_pusher: Box<dyn Push<T, D2>> = {
                         let pushers: Vec<Box<dyn Push<T, D2>>> = endpoints
@@ -4120,10 +4236,15 @@ impl<T: Timestamp, D: Clone + Send + 'static> Pipe<T, D> {
                             .map(|any_box| {
                                 any_box
                                     .downcast::<Box<dyn Push<T, D2>>>()
-                                    .map(|boxed| *boxed).map_err(|_| Error::Custom("unary_notify output pusher type mismatch".into()))
+                                    .map(|boxed| *boxed)
+                                    .map_err(|_| {
+                                        Error::Custom(
+                                            "unary_notify output pusher type mismatch".into(),
+                                        )
+                                    })
                             })
                             .collect::<Result<_>>()?;
-                        tee_or_single(pushers).unwrap_or_else(|| Box::new(NullPush))
+                        tee_or_single(pushers)?.unwrap_or_else(|| Box::new(NullPush))
                     };
 
                     // The initial frontier is [T::minimum()] — the operator starts with
@@ -4238,8 +4359,12 @@ impl<T: Timestamp, D: Clone + Send + 'static> Pipe<T, D> {
                     let input_puller: Box<dyn Pull<T, D>> = *endpoints
                         .input_pullers
                         .into_iter()
-                        .next().ok_or_else(|| Error::Custom("unary_async must have input puller".into()))?
-                        .downcast::<Box<dyn Pull<T, D>>>().map_err(|_| Error::Custom("unary_async input puller type mismatch".into()))?;
+                        .next()
+                        .ok_or_else(|| Error::Custom("unary_async must have input puller".into()))?
+                        .downcast::<Box<dyn Pull<T, D>>>()
+                        .map_err(|_| {
+                            Error::Custom("unary_async input puller type mismatch".into())
+                        })?;
 
                     let output_pusher: Box<dyn Push<T, D2>> = {
                         let pushers: Vec<Box<dyn Push<T, D2>>> = endpoints
@@ -4248,19 +4373,26 @@ impl<T: Timestamp, D: Clone + Send + 'static> Pipe<T, D> {
                             .map(|any_box| {
                                 any_box
                                     .downcast::<Box<dyn Push<T, D2>>>()
-                                    .map(|boxed| *boxed).map_err(|_| Error::Custom("unary_async output pusher type mismatch".into()))
+                                    .map(|boxed| *boxed)
+                                    .map_err(|_| {
+                                        Error::Custom(
+                                            "unary_async output pusher type mismatch".into(),
+                                        )
+                                    })
                             })
                             .collect::<Result<_>>()?;
-                        tee_or_single(pushers).unwrap_or_else(|| Box::new(NullPush))
+                        tee_or_single(pushers)?.unwrap_or_else(|| Box::new(NullPush))
                     };
 
                     // tokio_handle is Ok if we had a runtime context at build time.
                     // If Err, build() will have returned the error before this factory
                     // runs. We use `?` as defense-in-depth to avoid panicking even in
                     // edge cases (e.g., if a future refactor changes the error-check order).
-                    let handle = tokio_handle.map_err(|e| Error::Custom(format!(
-                        "tokio runtime context missing at factory invocation: {e}"
-                    )))?;
+                    let handle = tokio_handle.map_err(|e| {
+                        Error::Custom(format!(
+                            "tokio runtime context missing at factory invocation: {e}"
+                        ))
+                    })?;
                     Ok(Box::new(WiredUnaryAsyncOperator::new(
                         name_clone,
                         op_idx,
@@ -4481,7 +4613,10 @@ impl<T: Timestamp> LogicalDataflow<T> {
     ///
     /// This is used for per-stage materialization: each worker only
     /// materializes operators for stages it participates in.
-    pub fn retain_stages(&mut self, participating_stage_ids: &std::collections::HashSet<crate::dataflow::stage::StageId>) {
+    pub fn retain_stages(
+        &mut self,
+        participating_stage_ids: &std::collections::HashSet<crate::dataflow::stage::StageId>,
+    ) {
         use std::collections::HashSet;
 
         // Collect operator indices belonging to participating stages.
@@ -4515,7 +4650,8 @@ impl<T: Timestamp> LogicalDataflow<T> {
 
         // Build old_idx → new_idx remapping for regular edges.
         let new_regular_count = kept_old_indices.len();
-        let mut old_to_new: std::collections::HashMap<usize, usize> = std::collections::HashMap::new();
+        let mut old_to_new: std::collections::HashMap<usize, usize> =
+            std::collections::HashMap::new();
         for (new_idx, &old_idx) in kept_old_indices.iter().enumerate() {
             old_to_new.insert(old_idx, new_idx);
         }
@@ -4555,8 +4691,8 @@ impl<T: Timestamp> LogicalDataflow<T> {
             .retain(|(idx, _)| participating_ops.contains(idx));
 
         // Filter input port wiring: only keep if stage 0 is participating.
-        let stage0_participating = participating_stage_ids
-            .contains(&crate::dataflow::stage::StageId::new(0));
+        let stage0_participating =
+            participating_stage_ids.contains(&crate::dataflow::stage::StageId::new(0));
 
         if !stage0_participating {
             self.input_ports.clear();
@@ -4720,9 +4856,7 @@ struct ForEachSink<T: Timestamp, D: Send + 'static, F: FnMut(&T, &[D]) + Send + 
     done: bool,
 }
 
-impl<T: Timestamp, D: Send + 'static, F: FnMut(&T, &[D]) + Send + 'static>
-    ForEachSink<T, D, F>
-{
+impl<T: Timestamp, D: Send + 'static, F: FnMut(&T, &[D]) + Send + 'static> ForEachSink<T, D, F> {
     fn new(
         name: impl Into<String>,
         index: usize,
@@ -4742,8 +4876,8 @@ impl<T: Timestamp, D: Send + 'static, F: FnMut(&T, &[D]) + Send + 'static>
     }
 }
 
-impl<T: Timestamp, D: Send + 'static, F: FnMut(&T, &[D]) + Send + 'static>
-    SchedulableOperator for ForEachSink<T, D, F>
+impl<T: Timestamp, D: Send + 'static, F: FnMut(&T, &[D]) + Send + 'static> SchedulableOperator
+    for ForEachSink<T, D, F>
 {
     fn activate(
         &mut self,
@@ -4859,7 +4993,7 @@ mod tests {
     fn test_source_to_output() {
         let builder = DataflowBuilder::<u64>::new("source_to_output");
         let stream = builder.source("nums", vec![(0u64, vec![1i32, 2, 3])]);
-        let port = stream.output("results");
+        let port = stream.output("results").unwrap();
         let dataflow = builder.build().unwrap();
         rt().run(dataflow).unwrap();
 
@@ -4874,7 +5008,7 @@ mod tests {
         let builder = DataflowBuilder::<u64>::new("map_test");
         let stream = builder.source("nums", vec![(0u64, vec![1i32, 2, 3, 4, 5])]);
         let doubled = stream.map("double", |_t, x| x * 2);
-        let port = doubled.output("results");
+        let port = doubled.output("results").unwrap();
         let dataflow = builder.build().unwrap();
         rt().run(dataflow).unwrap();
 
@@ -4889,7 +5023,7 @@ mod tests {
         let builder = DataflowBuilder::<u64>::new("filter_test");
         let stream = builder.source("nums", vec![(0u64, vec![1i32, 2, 3, 4, 5, 6])]);
         let evens = stream.filter("evens", |_t, x| x % 2 == 0);
-        let port = evens.output("results");
+        let port = evens.output("results").unwrap();
         let dataflow = builder.build().unwrap();
         rt().run(dataflow).unwrap();
 
@@ -4906,7 +5040,7 @@ mod tests {
             .map("double", |_t, x| x * 2)
             .filter("div_by_3", |_t, x| x % 3 == 0)
             .map("to_string", |_t, x| format!("{x}"))
-            .output("results");
+            .output("results").unwrap();
         let dataflow = builder.build().unwrap();
         rt().run(dataflow).unwrap();
 
@@ -4927,7 +5061,7 @@ mod tests {
             .flat_map("split", |_t, line| {
                 line.split_whitespace().map(|w| w.to_string()).collect()
             })
-            .output("words");
+            .output("words").unwrap();
         let dataflow = builder.build().unwrap();
         rt().run(dataflow).unwrap();
 
@@ -4950,8 +5084,8 @@ mod tests {
         let evens_port = stream
             .clone()
             .filter("evens", |_t, x| x % 2 == 0)
-            .output("evens");
-        let odds_port = stream.filter("odds", |_t, x| x % 2 != 0).output("odds");
+            .output("evens").unwrap();
+        let odds_port = stream.filter("odds", |_t, x| x % 2 != 0).output("odds").unwrap();
 
         let dataflow = builder.build().unwrap();
         rt().run(dataflow).unwrap();
@@ -4971,8 +5105,8 @@ mod tests {
         let a = builder.source("a", vec![(0u64, vec![10i32, 20])]);
         let b = builder.source("b", vec![(0u64, vec![100i32, 200])]);
 
-        let port_a = a.map("inc_a", |_t, x| x + 1).output("out_a");
-        let port_b = b.map("inc_b", |_t, x| x + 1).output("out_b");
+        let port_a = a.map("inc_a", |_t, x| x + 1).output("out_a").unwrap();
+        let port_b = b.map("inc_b", |_t, x| x + 1).output("out_b").unwrap();
 
         let dataflow = builder.build().unwrap();
         rt().run(dataflow).unwrap();
@@ -4992,7 +5126,7 @@ mod tests {
             .source("nums", vec![(0u64, vec![1i32, 2, 3])])
             .map("to_f64", |_t, x| x as f64 * 1.5)
             .map("to_string", |_t, x| format!("{x:.1}"))
-            .output("results");
+            .output("results").unwrap();
         let dataflow = builder.build().unwrap();
         rt().run(dataflow).unwrap();
 
@@ -5007,7 +5141,7 @@ mod tests {
         let port = builder
             .source::<i32>("nums", vec![(0u64, vec![])])
             .map("double", |_t, x| x * 2)
-            .output("results");
+            .output("results").unwrap();
         let dataflow = builder.build().unwrap();
         rt().run(dataflow).unwrap();
 
@@ -5025,7 +5159,7 @@ mod tests {
                 vec![(0u64, vec![1i32, 2]), (1u64, vec![3, 4]), (2u64, vec![5])],
             )
             .map("double", |_t, x| x * 2)
-            .output("results");
+            .output("results").unwrap();
         let dataflow = builder.build().unwrap();
         rt().run(dataflow).unwrap();
 
@@ -5056,7 +5190,7 @@ mod tests {
         let builder = DataflowBuilder::<u64>::new("cancel_test");
         let _port = builder
             .source("nums", vec![(0u64, vec![1i32, 2, 3])])
-            .output("results");
+            .output("results").unwrap();
         let dataflow = builder.build().unwrap();
         let result = SimpleRuntime::with_cancel(cancel).run(dataflow);
         assert!(result.is_err());
@@ -5067,7 +5201,7 @@ mod tests {
         let builder = DataflowBuilder::<u64>::new("meta_test");
         let _a = builder.source::<i32>("src_a", vec![]);
         let b = builder.source::<i32>("src_b", vec![]);
-        let _port = b.map("transform", |_t, x| x).output("out");
+        let _port = b.map("transform", |_t, x| x).output("out").unwrap();
         drop(_a); // release Rc reference before build
         let dataflow = builder.build().unwrap();
 
@@ -5083,8 +5217,8 @@ mod tests {
         let builder = DataflowBuilder::<u64>::new("dup_test");
         let s1 = builder.source("src1", vec![(0u64, vec![1i32])]);
         let s2 = builder.source("src2", vec![(0u64, vec![2i32])]);
-        let _p1 = s1.output("results");
-        let _p2 = s2.output("results"); // should panic: duplicate name
+        let _p1 = s1.output("results").unwrap();
+        let _p2 = s2.output("results").unwrap(); // should panic: duplicate name
     }
 
     #[test]
@@ -5092,7 +5226,7 @@ mod tests {
         let builder = DataflowBuilder::<u64>::new("probe_test");
         let stream = builder.source("nums", vec![(0u64, vec![1i32, 2, 3])]);
         let (stream, _probe) = stream.probe();
-        let _port = stream.output("results");
+        let _port = stream.output("results").unwrap();
         let dataflow = builder.build().unwrap();
         rt().run(dataflow).unwrap();
     }
@@ -5109,7 +5243,7 @@ mod tests {
                 }
                 Ok(())
             })
-            .output("results");
+            .output("results").unwrap();
         let dataflow = builder.build().unwrap();
         rt().run(dataflow).unwrap();
 
@@ -5121,7 +5255,7 @@ mod tests {
     #[test]
     fn test_input_port_rejected_by_run() {
         let builder = DataflowBuilder::<u64>::new("input_test");
-        let _port = builder.input::<i32>("data").output("results");
+        let _port = builder.input::<i32>("data").unwrap().output("results").unwrap();
         let dataflow = builder.build().unwrap();
         let result = rt().run(dataflow);
         assert!(result.is_err());
@@ -5132,8 +5266,8 @@ mod tests {
     #[test]
     fn test_spawn_basic_pipeline() {
         let builder = DataflowBuilder::<u64>::new("spawn_test");
-        let input = builder.input::<i32>("numbers");
-        input.map("double", |_t, x| x * 2).output("results");
+        let input = builder.input::<i32>("numbers").unwrap();
+        input.map("double", |_t, x| x * 2).output("results").unwrap();
         let dataflow = builder.build().unwrap();
 
         let mut handle = rt().spawn(dataflow).unwrap();
@@ -5159,8 +5293,8 @@ mod tests {
     #[test]
     fn test_spawn_filter_pipeline() {
         let builder = DataflowBuilder::<u64>::new("filter_spawn");
-        let input = builder.input::<i32>("src");
-        input.filter("evens", |_t, x| x % 2 == 0).output("evens");
+        let input = builder.input::<i32>("src").unwrap();
+        input.filter("evens", |_t, x| x % 2 == 0).output("evens").unwrap();
         let dataflow = builder.build().unwrap();
 
         let mut handle = rt().spawn(dataflow).unwrap();
@@ -5179,8 +5313,8 @@ mod tests {
     #[test]
     fn test_spawn_type_mismatch_error() {
         let builder = DataflowBuilder::<u64>::new("type_test");
-        let input = builder.input::<i32>("numbers");
-        input.output("out");
+        let input = builder.input::<i32>("numbers").unwrap();
+        input.output("out").unwrap();
         let dataflow = builder.build().unwrap();
 
         let mut handle = rt().spawn(dataflow).unwrap();
@@ -5192,8 +5326,8 @@ mod tests {
     #[test]
     fn test_spawn_cancel() {
         let builder = DataflowBuilder::<u64>::new("cancel_test");
-        let input = builder.input::<i32>("data");
-        input.output("out");
+        let input = builder.input::<i32>("data").unwrap();
+        input.output("out").unwrap();
         let dataflow = builder.build().unwrap();
 
         let handle = rt().spawn(dataflow).unwrap();
@@ -5204,8 +5338,8 @@ mod tests {
     #[test]
     fn test_spawn_drop_cancels() {
         let builder = DataflowBuilder::<u64>::new("drop_test");
-        let input = builder.input::<i32>("data");
-        input.output("out");
+        let input = builder.input::<i32>("data").unwrap();
+        input.output("out").unwrap();
         let dataflow = builder.build().unwrap();
 
         let _handle = rt().spawn(dataflow).unwrap();
@@ -5247,7 +5381,8 @@ mod tests {
                 }
                 Ok(())
             })
-            .output("results");
+            .unwrap()
+            .output("results").unwrap();
 
         let dataflow = builder.build().unwrap();
         rt().run(dataflow).unwrap();
@@ -5282,7 +5417,8 @@ mod tests {
                 }
                 Ok(())
             })
-            .output("out");
+            .unwrap()
+            .output("out").unwrap();
 
         let dataflow = builder.build().unwrap();
         rt().run(dataflow).unwrap();
@@ -5305,7 +5441,7 @@ mod tests {
         let a = builder.source("a", vec![(0u64, vec![1i32, 2])]);
         let b = builder.source("b", vec![(0u64, vec![3i32, 4])]);
 
-        let port = Pipe::concat(vec![a, b]).output("merged");
+        let port = Pipe::concat(vec![a, b]).unwrap().output("merged").unwrap();
         let dataflow = builder.build().unwrap();
         rt().run(dataflow).unwrap();
 
@@ -5323,7 +5459,7 @@ mod tests {
         let b = builder.source("b", vec![(0u64, vec![2i32])]);
         let c = builder.source("c", vec![(0u64, vec![3i32])]);
 
-        let port = Pipe::concat(vec![a, b, c]).output("merged");
+        let port = Pipe::concat(vec![a, b, c]).unwrap().output("merged").unwrap();
         let dataflow = builder.build().unwrap();
         rt().run(dataflow).unwrap();
 
@@ -5340,7 +5476,7 @@ mod tests {
         let evens = builder.source("evens", vec![(0u64, vec![2i32, 4, 6])]);
         let odds = builder.source("odds", vec![(0u64, vec![1i32, 3, 5])]);
 
-        let port = evens.merge(odds).output("all");
+        let port = evens.merge(odds).unwrap().output("all").unwrap();
         let dataflow = builder.build().unwrap();
         rt().run(dataflow).unwrap();
 
@@ -5358,9 +5494,9 @@ mod tests {
         let a = builder.source("a", vec![(0u64, vec![1i32, 2])]);
         let b = builder.source("b", vec![(0u64, vec![3i32, 4])]);
 
-        let port = Pipe::concat(vec![a, b])
+        let port = Pipe::concat(vec![a, b]).unwrap()
             .map("double", |_t, x| x * 2)
-            .output("results");
+            .output("results").unwrap();
         let dataflow = builder.build().unwrap();
         rt().run(dataflow).unwrap();
 
@@ -5377,7 +5513,7 @@ mod tests {
         let a = builder.source("a", vec![(0u64, vec![1i32]), (1u64, vec![10])]);
         let b = builder.source("b", vec![(0u64, vec![2i32]), (1u64, vec![20])]);
 
-        let port = Pipe::concat(vec![a, b]).output("merged");
+        let port = Pipe::concat(vec![a, b]).unwrap().output("merged").unwrap();
         let dataflow = builder.build().unwrap();
         rt().run(dataflow).unwrap();
 
@@ -5416,7 +5552,7 @@ mod tests {
                     output: done,
                 }
             })
-            .output("results");
+            .output("results").unwrap();
         let dataflow = builder.build().unwrap();
         rt().run(dataflow).unwrap();
 
@@ -5446,7 +5582,7 @@ mod tests {
                     output: done,
                 }
             })
-            .output("results");
+            .output("results").unwrap();
         let dataflow = builder.build().unwrap();
         rt().run(dataflow).unwrap();
 
@@ -5474,7 +5610,7 @@ mod tests {
                     output: done,
                 }
             })
-            .output("results");
+            .output("results").unwrap();
         let dataflow = builder.build().unwrap();
         rt().run(dataflow).unwrap();
 
@@ -5504,7 +5640,7 @@ mod tests {
                     output: done,
                 }
             })
-            .output("results");
+            .output("results").unwrap();
         let dataflow = builder.build().unwrap();
         rt().run(dataflow).unwrap();
 
@@ -5543,7 +5679,7 @@ mod tests {
                     Ok(())
                 }
             })
-            .output("results");
+            .output("results").unwrap();
         let dataflow = builder.build().unwrap();
         rt().run(dataflow).unwrap();
 
@@ -5584,7 +5720,7 @@ mod tests {
                     Ok(())
                 }
             })
-            .output("results");
+            .output("results").unwrap();
         let dataflow = builder.build().unwrap();
         rt().run(dataflow).unwrap();
 
@@ -5624,7 +5760,7 @@ mod tests {
                 }
             })
             .map("format", |_t, x| format!("sum={x}"))
-            .output("results");
+            .output("results").unwrap();
         let dataflow = builder.build().unwrap();
         rt().run(dataflow).unwrap();
 
@@ -5651,7 +5787,7 @@ mod tests {
                     Ok(())
                 }
             })
-            .output("results");
+            .output("results").unwrap();
         let dataflow = builder.build().unwrap();
         rt().run(dataflow).unwrap();
 
@@ -5689,7 +5825,7 @@ mod tests {
                     Ok(())
                 }
             })
-            .output("results");
+            .output("results").unwrap();
         let dataflow = builder.build().unwrap();
         rt().run(dataflow).unwrap();
 
@@ -5718,9 +5854,9 @@ mod tests {
         let builder = DataflowBuilder::<u64>::new("cap_basic");
         let port = builder
             .source("nums", vec![(0u64, vec![1i32, 2, 3])])
-            .with_capacity(4)
+            .with_capacity(4).unwrap()
             .map("double", |_t, x| x * 2)
-            .output("results");
+            .output("results").unwrap();
         let dataflow = builder.build().unwrap();
         rt().run(dataflow).unwrap();
 
@@ -5735,12 +5871,12 @@ mod tests {
         let builder = DataflowBuilder::<u64>::new("cap_chain");
         let port = builder
             .source("nums", vec![(0u64, vec![1i32, 2, 3, 4])])
-            .with_capacity(8)
+            .with_capacity(8).unwrap()
             .map("double", |_t, x| x * 2)
             // no with_capacity here → default capacity
             .filter("positive", |_t, &x| x > 0)
-            .with_capacity(16)
-            .output("results");
+            .with_capacity(16).unwrap()
+            .output("results").unwrap();
         let dataflow = builder.build().unwrap();
         rt().run(dataflow).unwrap();
 
@@ -5750,12 +5886,12 @@ mod tests {
     }
 
     #[test]
-    #[should_panic(expected = "channel capacity must be greater than 0")]
     fn test_with_capacity_zero_panics() {
         let builder = DataflowBuilder::<u64>::new("cap_zero");
-        builder
+        assert!(builder
             .source("nums", vec![(0u64, vec![1i32])])
-            .with_capacity(0);
+            .with_capacity(0)
+            .is_err());
     }
 
     #[test]
@@ -5764,12 +5900,12 @@ mod tests {
         let builder = DataflowBuilder::<u64>::new("cap_clone");
         let s = builder
             .source("nums", vec![(0u64, vec![1i32, 2, 3])])
-            .with_capacity(4);
+            .with_capacity(4).unwrap();
         let s2 = s.clone();
 
         // s still has the override, s2 does not
-        let port1 = s.map("double", |_t, x| x * 2).output("out1");
-        let port2 = s2.map("triple", |_t, x| x * 3).output("out2");
+        let port1 = s.map("double", |_t, x| x * 2).output("out1").unwrap();
+        let port2 = s2.map("triple", |_t, x| x * 3).output("out2").unwrap();
 
         let dataflow = builder.build().unwrap();
         rt().run(dataflow).unwrap();
@@ -5789,12 +5925,12 @@ mod tests {
         let builder = DataflowBuilder::<u64>::new("cap_small");
         let port = builder
             .source("nums", vec![(0u64, vec![1i32, 2, 3, 4, 5, 6, 7, 8, 9, 10])])
-            .with_capacity(1)
+            .with_capacity(1).unwrap()
             .map("inc", |_t, x| x + 1)
-            .with_capacity(1)
+            .with_capacity(1).unwrap()
             .filter("even", |_t, &x| x % 2 == 0)
-            .with_capacity(1)
-            .output("results");
+            .with_capacity(1).unwrap()
+            .output("results").unwrap();
         let dataflow = builder.build().unwrap();
         rt().run(dataflow).unwrap();
 
@@ -5810,7 +5946,7 @@ mod tests {
         let builder = DataflowBuilder::<u64>::new("cap_unary");
         let port = builder
             .source("nums", vec![(0u64, vec![1i32, 2, 3])])
-            .with_capacity(2)
+            .with_capacity(2).unwrap()
             .unary("sum", |input, output| {
                 while let Some((time, data)) = input.next() {
                     let sum: i32 = data.iter().sum();
@@ -5818,7 +5954,7 @@ mod tests {
                 }
                 Ok(())
             })
-            .output("results");
+            .output("results").unwrap();
         let dataflow = builder.build().unwrap();
         rt().run(dataflow).unwrap();
 
@@ -5832,11 +5968,11 @@ mod tests {
         let builder = DataflowBuilder::<u64>::new("cap_concat");
         let a = builder
             .source("a", vec![(0u64, vec![1i32, 2])])
-            .with_capacity(4);
+            .with_capacity(4).unwrap();
         let b = builder
             .source("b", vec![(0u64, vec![3i32, 4])])
-            .with_capacity(8);
-        let port = Pipe::concat(vec![a, b]).output("merged");
+            .with_capacity(8).unwrap();
+        let port = Pipe::concat(vec![a, b]).unwrap().output("merged").unwrap();
         let dataflow = builder.build().unwrap();
         rt().run(dataflow).unwrap();
 
@@ -5856,7 +5992,7 @@ mod tests {
             "data",
             vec![(0u64, vec![Ok(1), Err("bad".into()), Ok(3)])],
         );
-        let port = stream.map_ok("double", |_t, v| v * 2).output("results");
+        let port = stream.map_ok("double", |_t, v| v * 2).output("results").unwrap();
         let dataflow = builder.build().unwrap();
         rt().run(dataflow).unwrap();
 
@@ -5874,7 +6010,7 @@ mod tests {
         );
         let port = stream
             .filter_ok("even", |_t, v| v % 2 == 0)
-            .output("results");
+            .output("results").unwrap();
         let dataflow = builder.build().unwrap();
         rt().run(dataflow).unwrap();
 
@@ -5901,7 +6037,7 @@ mod tests {
             .and_then("parse", |_t, s: String| {
                 s.parse::<i32>().map_err(|e| e.to_string())
             })
-            .output("results");
+            .output("results").unwrap();
         let dataflow = builder.build().unwrap();
         rt().run(dataflow).unwrap();
 
@@ -5921,8 +6057,8 @@ mod tests {
             vec![(0u64, vec![Ok(1), Err("a".into()), Ok(2), Err("b".into())])],
         );
         let (ok_pipe, err_pipe) = stream.branch_result("split");
-        let ok_port = ok_pipe.output("goods");
-        let err_port = err_pipe.output("bads");
+        let ok_port = ok_pipe.output("goods").unwrap();
+        let err_port = err_pipe.output("bads").unwrap();
         let dataflow = builder.build().unwrap();
         rt().run(dataflow).unwrap();
 
@@ -5950,7 +6086,7 @@ mod tests {
         let port = stream
             .map_ok("double", |_t, v| v * 2)
             .filter_ok("big", |_t, v| *v > 4)
-            .output("results");
+            .output("results").unwrap();
         let dataflow = builder.build().unwrap();
         rt().run(dataflow).unwrap();
 
@@ -5964,7 +6100,7 @@ mod tests {
         let builder = DataflowBuilder::<u64>::new("all_ok");
         let stream = builder
             .source::<std::result::Result<i32, String>>("data", vec![(0u64, vec![Ok(10), Ok(20)])]);
-        let port = stream.map_ok("inc", |_t, v| v + 1).output("results");
+        let port = stream.map_ok("inc", |_t, v| v + 1).output("results").unwrap();
         let dataflow = builder.build().unwrap();
         rt().run(dataflow).unwrap();
 
@@ -5980,7 +6116,7 @@ mod tests {
             "data",
             vec![(0u64, vec![Err("a".into()), Err("b".into())])],
         );
-        let port = stream.map_ok("inc", |_t, v: i32| v + 1).output("results");
+        let port = stream.map_ok("inc", |_t, v: i32| v + 1).output("results").unwrap();
         let dataflow = builder.build().unwrap();
         rt().run(dataflow).unwrap();
 
@@ -5995,7 +6131,7 @@ mod tests {
     fn test_take_fewer_than_available() {
         let builder = DataflowBuilder::<u64>::new("take_fewer");
         let stream = builder.source("nums", vec![(0u64, vec![1i32, 2, 3, 4, 5])]);
-        let port = stream.take("first3", 3).output("out");
+        let port = stream.take("first3", 3).output("out").unwrap();
         let dataflow = builder.build().unwrap();
         rt().run(dataflow).unwrap();
 
@@ -6009,7 +6145,7 @@ mod tests {
     fn test_take_more_than_available() {
         let builder = DataflowBuilder::<u64>::new("take_more");
         let stream = builder.source("nums", vec![(0u64, vec![1i32, 2, 3])]);
-        let port = stream.take("first10", 10).output("out");
+        let port = stream.take("first10", 10).output("out").unwrap();
         let dataflow = builder.build().unwrap();
         rt().run(dataflow).unwrap();
 
@@ -6023,7 +6159,7 @@ mod tests {
     fn test_take_zero() {
         let builder = DataflowBuilder::<u64>::new("take_zero");
         let stream = builder.source("nums", vec![(0u64, vec![1i32, 2, 3])]);
-        let port = stream.take("none", 0).output("out");
+        let port = stream.take("none", 0).output("out").unwrap();
         let dataflow = builder.build().unwrap();
         rt().run(dataflow).unwrap();
 
@@ -6044,7 +6180,7 @@ mod tests {
                 (2u64, vec![5, 6]),
             ],
         );
-        let port = stream.take("first3", 3).output("out");
+        let port = stream.take("first3", 3).output("out").unwrap();
         let dataflow = builder.build().unwrap();
         rt().run(dataflow).unwrap();
 
@@ -6058,7 +6194,7 @@ mod tests {
     fn test_take_while_stops_at_predicate() {
         let builder = DataflowBuilder::<u64>::new("take_while_stop");
         let stream = builder.source("nums", vec![(0u64, vec![1i32, 2, 3, 4, 5])]);
-        let port = stream.take_while("small", |_t, x| *x < 4).output("out");
+        let port = stream.take_while("small", |_t, x| *x < 4).output("out").unwrap();
         let dataflow = builder.build().unwrap();
         rt().run(dataflow).unwrap();
 
@@ -6072,7 +6208,7 @@ mod tests {
     fn test_take_while_all_pass() {
         let builder = DataflowBuilder::<u64>::new("take_while_all");
         let stream = builder.source("nums", vec![(0u64, vec![1i32, 2, 3])]);
-        let port = stream.take_while("always", |_t, _x| true).output("out");
+        let port = stream.take_while("always", |_t, _x| true).output("out").unwrap();
         let dataflow = builder.build().unwrap();
         rt().run(dataflow).unwrap();
 
@@ -6086,7 +6222,7 @@ mod tests {
     fn test_take_while_none_pass() {
         let builder = DataflowBuilder::<u64>::new("take_while_none");
         let stream = builder.source("nums", vec![(0u64, vec![1i32, 2, 3])]);
-        let port = stream.take_while("never", |_t, _x| false).output("out");
+        let port = stream.take_while("never", |_t, _x| false).output("out").unwrap();
         let dataflow = builder.build().unwrap();
         rt().run(dataflow).unwrap();
 
@@ -6103,7 +6239,7 @@ mod tests {
             "nums",
             vec![(0u64, vec![1i32, 2]), (1u64, vec![3, 10]), (2u64, vec![20])],
         );
-        let port = stream.take_while("under10", |_t, x| *x < 10).output("out");
+        let port = stream.take_while("under10", |_t, x| *x < 10).output("out").unwrap();
         let dataflow = builder.build().unwrap();
         rt().run(dataflow).unwrap();
 
@@ -6120,7 +6256,7 @@ mod tests {
         let port = stream
             .take("first2", 2)
             .map("double", |_t, x| x * 2)
-            .output("out");
+            .output("out").unwrap();
         let dataflow = builder.build().unwrap();
         rt().run(dataflow).unwrap();
 
@@ -6136,7 +6272,7 @@ mod tests {
     fn test_collect_metrics_disabled_by_default() {
         let builder = DataflowBuilder::<u64>::new("no_metrics");
         let stream = builder.source("nums", vec![(0u64, vec![1i32])]);
-        stream.output("out");
+        stream.output("out").unwrap();
         let dataflow = builder.build().unwrap();
         assert!(!dataflow.collect_metrics);
     }
@@ -6145,7 +6281,7 @@ mod tests {
     fn test_collect_metrics_records_activations() {
         let builder = DataflowBuilder::<u64>::new("metrics_test");
         let stream = builder.source("nums", vec![(0u64, vec![1i32, 2, 3])]);
-        stream.map("double", |_t, x| x * 2).output("out");
+        stream.map("double", |_t, x| x * 2).output("out").unwrap();
         let dataflow = builder.build().unwrap();
 
         let metrics = rt().run_with_metrics(dataflow).unwrap();
@@ -6170,7 +6306,7 @@ mod tests {
     fn test_collect_metrics_not_enabled() {
         let builder = DataflowBuilder::<u64>::new("no_metrics");
         let stream = builder.source("nums", vec![(0u64, vec![1i32, 2])]);
-        stream.output("out");
+        stream.output("out").unwrap();
         let mut dataflow = builder.build().unwrap();
         // Explicitly disable (should already be false by default)
         dataflow.collect_metrics = false;
@@ -6192,7 +6328,7 @@ mod tests {
             .inspect("spy", move |_t, x| {
                 seen_clone.lock().unwrap().push(*x);
             })
-            .output("results");
+            .output("results").unwrap();
         let dataflow = builder.build().unwrap();
         rt().run(dataflow).unwrap();
 
@@ -6219,7 +6355,7 @@ mod tests {
             .inspect_batch("batch-spy", move |_t, batch| {
                 batch_sizes_clone.lock().unwrap().push(batch.len());
             })
-            .output("results");
+            .output("results").unwrap();
         let dataflow = builder.build().unwrap();
         rt().run(dataflow).unwrap();
 
@@ -6246,7 +6382,7 @@ mod tests {
             .filter("even", |_t, x| x % 2 == 0)
             .inspect("tap2", |_t, _x| { /* no-op */ })
             .map("double", |_t, x| x * 2)
-            .output("results");
+            .output("results").unwrap();
         let dataflow = builder.build().unwrap();
         rt().run(dataflow).unwrap();
 
@@ -6262,14 +6398,11 @@ mod tests {
 
         let builder = DataflowBuilder::<u64>::new("inspect_ts");
         let port = builder
-            .source(
-                "nums",
-                vec![(10u64, vec![1i32]), (20u64, vec![2i32])],
-            )
+            .source("nums", vec![(10u64, vec![1i32]), (20u64, vec![2i32])])
             .inspect("ts-spy", move |t, _x| {
                 ts_clone.lock().unwrap().push(*t);
             })
-            .output("results");
+            .output("results").unwrap();
         let dataflow = builder.build().unwrap();
         rt().run(dataflow).unwrap();
 
@@ -6326,10 +6459,7 @@ mod tests {
 
         let builder = DataflowBuilder::<u64>::new("for_each_ts_test");
         builder
-            .source(
-                "nums",
-                vec![(10u64, vec![1i32]), (20u64, vec![2i32])],
-            )
+            .source("nums", vec![(10u64, vec![1i32]), (20u64, vec![2i32])])
             .for_each("check-ts", move |t, _x| {
                 ts_clone.lock().unwrap().push(*t);
             });
@@ -6365,13 +6495,10 @@ mod tests {
         let port = builder
             .source(
                 "nums",
-                vec![
-                    (0u64, vec![1i32, 2, 3]),
-                    (1u64, vec![10i32, 20]),
-                ],
+                vec![(0u64, vec![1i32, 2, 3]), (1u64, vec![10i32, 20])],
             )
             .reduce("sum", |a, b| a + b)
-            .output("results");
+            .output("results").unwrap();
         let dataflow = builder.build().unwrap();
         rt().run(dataflow).unwrap();
 
@@ -6391,7 +6518,7 @@ mod tests {
         let port = builder
             .source("nums", vec![(0u64, vec![42i32])])
             .reduce("id", |a, b| a + b)
-            .output("results");
+            .output("results").unwrap();
         let dataflow = builder.build().unwrap();
         rt().run(dataflow).unwrap();
 
@@ -6406,7 +6533,7 @@ mod tests {
         let port = builder
             .source::<i32>("nums", vec![])
             .reduce("sum", |a, b| a + b)
-            .output("results");
+            .output("results").unwrap();
         let dataflow = builder.build().unwrap();
         rt().run(dataflow).unwrap();
 
@@ -6422,13 +6549,10 @@ mod tests {
         let port = builder
             .source(
                 "nums",
-                vec![
-                    (0u64, vec![10i32, 20, 30]),
-                    (1u64, vec![40i32, 50]),
-                ],
+                vec![(0u64, vec![10i32, 20, 30]), (1u64, vec![40i32, 50])],
             )
             .fold("count", 0usize, |acc, _item| acc + 1)
-            .output("results");
+            .output("results").unwrap();
         let dataflow = builder.build().unwrap();
         rt().run(dataflow).unwrap();
 
@@ -6454,7 +6578,7 @@ mod tests {
                 acc.push_str(&x.to_string());
                 acc
             })
-            .output("results");
+            .output("results").unwrap();
         let dataflow = builder.build().unwrap();
         rt().run(dataflow).unwrap();
 
@@ -6470,7 +6594,7 @@ mod tests {
             .source("nums", vec![(0u64, vec![1i32, 2, 3, 4])])
             .reduce("sum", |a, b| a + b)
             .map("negate", |_t, x| -x)
-            .output("results");
+            .output("results").unwrap();
         let dataflow = builder.build().unwrap();
         rt().run(dataflow).unwrap();
 
@@ -6485,7 +6609,7 @@ mod tests {
         let port = builder
             .source("nums", vec![(0u64, vec![1i32, 2, 2, 3, 1, 3, 4])])
             .distinct("dedup")
-            .output("results");
+            .output("results").unwrap();
         let dataflow = builder.build().unwrap();
         rt().run(dataflow).unwrap();
 
@@ -6502,13 +6626,10 @@ mod tests {
         let port = builder
             .source(
                 "nums",
-                vec![
-                    (0u64, vec![1i32, 1, 2]),
-                    (1u64, vec![2i32, 2, 3]),
-                ],
+                vec![(0u64, vec![1i32, 1, 2]), (1u64, vec![2i32, 2, 3])],
             )
             .distinct("dedup")
-            .output("results");
+            .output("results").unwrap();
         let dataflow = builder.build().unwrap();
         rt().run(dataflow).unwrap();
 
@@ -6537,7 +6658,7 @@ mod tests {
         let port = builder
             .source("nums", vec![(0u64, vec![1i32, 2, 3, 4, 5])])
             .distinct("dedup")
-            .output("results");
+            .output("results").unwrap();
         let dataflow = builder.build().unwrap();
         rt().run(dataflow).unwrap();
 
@@ -6554,7 +6675,7 @@ mod tests {
         let port = builder
             .source::<i32>("nums", vec![])
             .distinct("dedup")
-            .output("results");
+            .output("results").unwrap();
         let dataflow = builder.build().unwrap();
         rt().run(dataflow).unwrap();
 
@@ -6569,13 +6690,10 @@ mod tests {
         let port = builder
             .source(
                 "nums",
-                vec![
-                    (0u64, vec![10i32, 20, 30]),
-                    (1u64, vec![40i32, 50]),
-                ],
+                vec![(0u64, vec![10i32, 20, 30]), (1u64, vec![40i32, 50])],
             )
             .count("count")
-            .output("results");
+            .output("results").unwrap();
         let dataflow = builder.build().unwrap();
         rt().run(dataflow).unwrap();
 
@@ -6596,7 +6714,7 @@ mod tests {
             .source("nums", vec![(0u64, vec![1i32, 1, 2, 2, 3])])
             .distinct("dedup")
             .count("count")
-            .output("results");
+            .output("results").unwrap();
         let dataflow = builder.build().unwrap();
         rt().run(dataflow).unwrap();
 
@@ -6613,7 +6731,7 @@ mod tests {
         let port = builder
             .source("nums", vec![(0u64, vec![1i32, 2, 3, 4, 5])])
             .gather("collect-all")
-            .output("results");
+            .output("results").unwrap();
         let dataflow = builder.build().unwrap();
         rt().run(dataflow).unwrap();
 
@@ -6631,7 +6749,7 @@ mod tests {
             .source("nums", vec![(0u64, vec![10i32, 20, 30])])
             .gather("collect")
             .reduce("sum", |acc, x| acc + x)
-            .output("results");
+            .output("results").unwrap();
         let dataflow = builder.build().unwrap();
         rt().run(dataflow).unwrap();
 
@@ -6648,7 +6766,7 @@ mod tests {
         let port = builder
             .source("nums", vec![(0u64, vec![1i32, 2, 3, 4, 5, 6])])
             .rebalance("spread")
-            .output("results");
+            .output("results").unwrap();
         let dataflow = builder.build().unwrap();
         rt().run(dataflow).unwrap();
 
@@ -6666,7 +6784,7 @@ mod tests {
             .source("nums", vec![(0u64, vec![1i32, 2, 3])])
             .rebalance("distribute")
             .map("double", |_t, x| x * 2)
-            .output("results");
+            .output("results").unwrap();
         let dataflow = builder.build().unwrap();
         rt().run(dataflow).unwrap();
 
@@ -6681,15 +6799,9 @@ mod tests {
         // gather preserves data across multiple epochs.
         let builder = DataflowBuilder::<u64>::new("gather_epochs");
         let port = builder
-            .source(
-                "nums",
-                vec![
-                    (0u64, vec![1i32, 2]),
-                    (1u64, vec![10, 20]),
-                ],
-            )
+            .source("nums", vec![(0u64, vec![1i32, 2]), (1u64, vec![10, 20])])
             .gather("collect")
-            .output("results");
+            .output("results").unwrap();
         let dataflow = builder.build().unwrap();
         rt().run(dataflow).unwrap();
 
@@ -6705,8 +6817,8 @@ mod tests {
         let builder = DataflowBuilder::<u64>::new("rebalance_to_test");
         let port = builder
             .source("nums", vec![(0u64, vec![1i32, 2, 3, 4])])
-            .rebalance_to("fan-out", 4)
-            .output("results");
+            .rebalance_to("fan-out", 4).unwrap()
+            .output("results").unwrap();
         let dataflow = builder.build().unwrap();
         rt().run(dataflow).unwrap();
 
@@ -6722,7 +6834,7 @@ mod tests {
         let builder = DataflowBuilder::<u64>::new("rebalance_to_zero");
         builder
             .source("nums", vec![(0u64, vec![1i32])])
-            .rebalance_to("bad", 0);
+            .rebalance_to("bad", 0).unwrap();
     }
 
     #[test]
@@ -6735,7 +6847,7 @@ mod tests {
                 batch.sort();
                 batch
             })
-            .output("results");
+            .output("results").unwrap();
         let dataflow = builder.build().unwrap();
         rt().run(dataflow).unwrap();
 
@@ -6752,9 +6864,13 @@ mod tests {
         let port = builder
             .source("nums", vec![(0u64, vec![1i32, 2, 3, 4, 5, 6])])
             .map_batch("even_doubled", |_t, batch| {
-                batch.into_iter().filter(|x| x % 2 == 0).map(|x| x * 2).collect()
+                batch
+                    .into_iter()
+                    .filter(|x| x % 2 == 0)
+                    .map(|x| x * 2)
+                    .collect()
             })
-            .output("results");
+            .output("results").unwrap();
         let dataflow = builder.build().unwrap();
         rt().run(dataflow).unwrap();
 
@@ -6771,7 +6887,7 @@ mod tests {
         let port = builder
             .source("nums", vec![(0u64, vec![1i32, 2, 3])])
             .map_batch("drop-all", |_t, _batch| Vec::<i32>::new())
-            .output("results");
+            .output("results").unwrap();
         let dataflow = builder.build().unwrap();
         rt().run(dataflow).unwrap();
 
@@ -6790,7 +6906,7 @@ mod tests {
             .map_batch("to_string", |_t, batch| {
                 batch.into_iter().map(|x| format!("v{x}")).collect()
             })
-            .output("results");
+            .output("results").unwrap();
         let dataflow = builder.build().unwrap();
         rt().run(dataflow).unwrap();
 
@@ -6807,16 +6923,13 @@ mod tests {
         let port = builder
             .source(
                 "nums",
-                vec![
-                    (0u64, vec![3i32, 1, 2]),
-                    (1u64, vec![6, 4, 5]),
-                ],
+                vec![(0u64, vec![3i32, 1, 2]), (1u64, vec![6, 4, 5])],
             )
             .map_batch("sort", |_t, mut batch| {
                 batch.sort();
                 batch
             })
-            .output("results");
+            .output("results").unwrap();
         let dataflow = builder.build().unwrap();
         rt().run(dataflow).unwrap();
 
@@ -6833,8 +6946,8 @@ mod tests {
         let (evens, odds) = builder
             .source("nums", vec![(0u64, vec![1i32, 2, 3, 4, 5, 6])])
             .branch("parity", |_t, x| x % 2 == 0);
-        let even_port = evens.output("evens");
-        let odd_port = odds.output("odds");
+        let even_port = evens.output("evens").unwrap();
+        let odd_port = odds.output("odds").unwrap();
         let dataflow = builder.build().unwrap();
         rt().run(dataflow).unwrap();
 
@@ -6855,8 +6968,8 @@ mod tests {
         let (matched, unmatched) = builder
             .source("nums", vec![(0u64, vec![10i32, 20, 30])])
             .branch("all", |_t, _x| true);
-        let matched_port = matched.output("matched");
-        let unmatched_port = unmatched.output("unmatched");
+        let matched_port = matched.output("matched").unwrap();
+        let unmatched_port = unmatched.output("unmatched").unwrap();
         let dataflow = builder.build().unwrap();
         rt().run(dataflow).unwrap();
 
@@ -6877,8 +6990,8 @@ mod tests {
         let (matched, unmatched) = builder
             .source("nums", vec![(0u64, vec![1i32, 2, 3])])
             .branch("none", |_t, _x| false);
-        let matched_port = matched.output("matched");
-        let unmatched_port = unmatched.output("unmatched");
+        let matched_port = matched.output("matched").unwrap();
+        let unmatched_port = unmatched.output("unmatched").unwrap();
         let dataflow = builder.build().unwrap();
         rt().run(dataflow).unwrap();
 
@@ -6900,8 +7013,8 @@ mod tests {
         let (big, small) = builder
             .source("nums", vec![(0u64, vec![1i32, 5, 10, 15, 20])])
             .branch("threshold", |_t, x| *x >= 10);
-        let big_port = big.map("negate", |_t, x| -x).output("big");
-        let small_port = small.map("double", |_t, x| x * 2).output("small");
+        let big_port = big.map("negate", |_t, x| -x).output("big").unwrap();
+        let small_port = small.map("double", |_t, x| x * 2).output("small").unwrap();
         let dataflow = builder.build().unwrap();
         rt().run(dataflow).unwrap();
 
@@ -6922,14 +7035,11 @@ mod tests {
         let (pos, neg) = builder
             .source(
                 "nums",
-                vec![
-                    (0u64, vec![-2i32, -1, 0, 1, 2]),
-                    (1u64, vec![-10, 10]),
-                ],
+                vec![(0u64, vec![-2i32, -1, 0, 1, 2]), (1u64, vec![-10, 10])],
             )
             .branch("sign", |_t, x| *x >= 0);
-        let pos_port = pos.output("positive");
-        let neg_port = neg.output("negative");
+        let pos_port = pos.output("positive").unwrap();
+        let neg_port = neg.output("negative").unwrap();
         let dataflow = builder.build().unwrap();
         rt().run(dataflow).unwrap();
 

@@ -46,11 +46,15 @@ use crate::dataflow::channels::wake::WakeHandle;
 #[cfg(feature = "transport")]
 use crate::dataflow::id::DataflowId;
 #[cfg(feature = "transport")]
+use crate::error::LockResultExt;
+#[cfg(feature = "transport")]
 use crate::progress::progress_channel::{
     ProgressChange, ProgressReceiver, ProgressSender, SharedBuffer, WorkerProgressChannels,
 };
 #[cfg(feature = "transport")]
 use crate::progress::timestamp::Timestamp;
+#[cfg(feature = "transport")]
+use crate::wire;
 
 // ---------------------------------------------------------------------------
 // Serialization: Vec<ProgressChange<T>> ↔ bytes
@@ -88,7 +92,7 @@ pub fn encode_progress_batch<T: Timestamp + ExchangeData>(
     changes: &[ProgressChange<T>],
     bufs: &mut Vec<Vec<u8>>,
     max_batch_size: usize,
-) {
+) -> Result<(), CodecError> {
     // Cap at u32::MAX since the wire format uses a u32 count field.
     let effective_max = max_batch_size.min(u32::MAX as usize).max(1);
 
@@ -99,7 +103,7 @@ pub fn encode_progress_batch<T: Timestamp + ExchangeData>(
         let crc = crc32fast::hash(&buf);
         buf.extend_from_slice(&crc.to_le_bytes());
         bufs.push(buf);
-        return;
+        return Ok(());
     }
 
     for chunk in changes.chunks(effective_max) {
@@ -112,9 +116,7 @@ pub fn encode_progress_batch<T: Timestamp + ExchangeData>(
         for (op_idx, output_port, time, diff) in chunk {
             buf.extend_from_slice(&(*op_idx as u64).to_le_bytes());
             buf.extend_from_slice(&(*output_port as u64).to_le_bytes());
-            codec
-                .encode(time, &mut buf)
-                .expect("progress timestamp encode should not fail");
+            codec.encode(time, &mut buf)?;
             buf.extend_from_slice(&diff.to_le_bytes());
         }
 
@@ -124,6 +126,8 @@ pub fn encode_progress_batch<T: Timestamp + ExchangeData>(
 
         bufs.push(buf);
     }
+
+    Ok(())
 }
 
 /// Decode a batch of progress changes from bytes.
@@ -146,7 +150,8 @@ pub fn decode_progress_batch<T: Timestamp + ExchangeData>(
 
     // Verify CRC32: last 4 bytes are the checksum of everything before them.
     let (payload, crc_bytes) = data.split_at(data.len() - 4);
-    let expected_crc = u32::from_le_bytes(crc_bytes.try_into().expect("CRC trailer is 4 bytes"));
+    let expected_crc =
+        wire::read_u32(crc_bytes, 0).map_err(|e| CodecError::InvalidData(e.to_string()))?;
     let actual_crc = crc32fast::hash(payload);
     if actual_crc != expected_crc {
         return Err(CodecError::InvalidData(format!(
@@ -155,11 +160,8 @@ pub fn decode_progress_batch<T: Timestamp + ExchangeData>(
     }
 
     // Now decode the verified payload.
-    let count = u32::from_le_bytes(
-        payload[..4]
-            .try_into()
-            .expect("batch count prefix is 4 bytes"),
-    ) as usize;
+    let count =
+        wire::read_u32(payload, 0).map_err(|e| CodecError::InvalidData(e.to_string()))? as usize;
 
     if count > max_batch_size {
         return Err(CodecError::InvalidData(format!(
@@ -179,11 +181,8 @@ pub fn decode_progress_batch<T: Timestamp + ExchangeData>(
                 available: payload.len(),
             });
         }
-        let op_idx = u64::from_le_bytes(
-            payload[offset..offset + 8]
-                .try_into()
-                .expect("operator index is 8 bytes"),
-        ) as usize;
+        let op_idx = wire::read_u64(payload, offset)
+            .map_err(|e| CodecError::InvalidData(e.to_string()))? as usize;
         offset += 8;
 
         // output_port (u64)
@@ -193,11 +192,9 @@ pub fn decode_progress_batch<T: Timestamp + ExchangeData>(
                 available: payload.len(),
             });
         }
-        let output_port = u64::from_le_bytes(
-            payload[offset..offset + 8]
-                .try_into()
-                .expect("output port is 8 bytes"),
-        ) as usize;
+        let output_port = wire::read_u64(payload, offset)
+            .map_err(|e| CodecError::InvalidData(e.to_string()))?
+            as usize;
         offset += 8;
 
         // timestamp (variable size via codec)
@@ -211,11 +208,8 @@ pub fn decode_progress_batch<T: Timestamp + ExchangeData>(
                 available: payload.len(),
             });
         }
-        let diff = i64::from_le_bytes(
-            payload[offset..offset + 8]
-                .try_into()
-                .expect("diff is 8 bytes"),
-        );
+        let diff =
+            wire::read_i64(payload, offset).map_err(|e| CodecError::InvalidData(e.to_string()))?;
         offset += 8;
 
         changes.push((op_idx, output_port, time, diff));
@@ -308,8 +302,14 @@ async fn progress_recv_bridge<T: Timestamp + ExchangeData>(
                         Ok(changes) => {
                             if !changes.is_empty() {
                                 {
-                                    let mut buf = buffer.lock()
-                                        .expect("progress buffer lock poisoned");
+                                    let mut buf = match buffer.lock().or_poison("progress buffer") {
+                                        Ok(buf) => buf,
+                                        Err(_) => {
+                                            // TODO: propagate poisoned progress-buffer locks once bridge tasks can return Result.
+                                            cancel.cancel();
+                                            break;
+                                        }
+                                    };
                                     buf.queue.push_back(changes);
                                 }
                                 wake_handle.notify();
@@ -356,14 +356,20 @@ async fn progress_recv_bridge<T: Timestamp + ExchangeData>(
 ///
 /// Panics if the arithmetic overflows (extremely large worker counts).
 #[cfg(feature = "transport")]
-pub fn progress_channel_id(source: usize, target: usize, num_workers: usize) -> u64 {
+pub fn progress_channel_id(
+    source: usize,
+    target: usize,
+    num_workers: usize,
+) -> Result<u64, crate::Error> {
     let offset = (source as u64)
         .checked_mul(num_workers as u64)
         .and_then(|v| v.checked_add(target as u64))
-        .expect("progress_channel_id overflow: too many workers");
-    PROGRESS_CHANNEL_BASE
-        .checked_add(offset)
-        .expect("progress_channel_id overflow: exceeds u64 range")
+        .ok_or_else(|| {
+            crate::Error::InvalidConfig("progress_channel_id overflow: too many workers".into())
+        })?;
+    PROGRESS_CHANNEL_BASE.checked_add(offset).ok_or_else(|| {
+        crate::Error::InvalidConfig("progress_channel_id overflow: exceeds u64 range".into())
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -516,7 +522,8 @@ pub fn create_network_progress_channels<T: Timestamp + ExchangeData>(
         for local_w in local_start..local_end {
             let local_idx = local_w - local_start;
             for remote_w in *peer_start..*peer_end {
-                let ch_id = progress_channel_id(local_w, remote_w, num_workers);
+                let ch_id = progress_channel_id(local_w, remote_w, num_workers)
+                    .map_err(|e| e.to_string())?;
                 let df_id = dataflow_id;
                 let tx = unbounded_tx.clone();
                 let cancel_for_closure = cancel.clone();
@@ -536,7 +543,16 @@ pub fn create_network_progress_channels<T: Timestamp + ExchangeData>(
                         return;
                     }
                     let mut bufs = Vec::new();
-                    encode_progress_batch::<T>(&changes, &mut bufs, max_batch_size);
+                    if let Err(e) = encode_progress_batch::<T>(&changes, &mut bufs, max_batch_size) {
+                        #[cfg(feature = "tracing")]
+                        tracing::error!(
+                            peer = %peer_id_for_closure,
+                            channel_id = ch_id,
+                            "progress send: encode error {e}, cancelling dataflow"
+                        );
+                        cancel_for_closure.cancel();
+                        return;
+                    }
                     for buf in bufs {
                         let frame = Frame {
                             dataflow_id: df_id,
@@ -570,7 +586,8 @@ pub fn create_network_progress_channels<T: Timestamp + ExchangeData>(
         for remote_w in *peer_start..*peer_end {
             for local_w in local_start..local_end {
                 let local_idx = local_w - local_start;
-                let ch_id = progress_channel_id(remote_w, local_w, num_workers);
+                let ch_id = progress_channel_id(remote_w, local_w, num_workers)
+                    .map_err(|e| e.to_string())?;
 
                 let rx = peer_map.remove(&ch_id).ok_or_else(|| {
                     format!(
@@ -652,7 +669,7 @@ mod tests {
             vec![(0, 0, 42u64, 1), (1, 2, 100u64, -1), (3, 0, 0u64, 5)];
 
         let mut bufs = Vec::new();
-        encode_progress_batch(&changes, &mut bufs, DEFAULT_MAX_BATCH_SIZE);
+        encode_progress_batch(&changes, &mut bufs, DEFAULT_MAX_BATCH_SIZE).unwrap();
         assert_eq!(bufs.len(), 1);
 
         let decoded = decode_progress_batch::<u64>(&bufs[0], DEFAULT_MAX_BATCH_SIZE).unwrap();
@@ -663,7 +680,7 @@ mod tests {
     fn encode_decode_empty_batch() {
         let changes: Vec<ProgressChange<u64>> = vec![];
         let mut bufs = Vec::new();
-        encode_progress_batch(&changes, &mut bufs, DEFAULT_MAX_BATCH_SIZE);
+        encode_progress_batch(&changes, &mut bufs, DEFAULT_MAX_BATCH_SIZE).unwrap();
         assert_eq!(bufs.len(), 1);
 
         let decoded = decode_progress_batch::<u64>(&bufs[0], DEFAULT_MAX_BATCH_SIZE).unwrap();
@@ -674,7 +691,7 @@ mod tests {
     fn decode_rejects_truncated_data() {
         let changes: Vec<ProgressChange<u64>> = vec![(0, 0, 42u64, 1)];
         let mut bufs = Vec::new();
-        encode_progress_batch(&changes, &mut bufs, DEFAULT_MAX_BATCH_SIZE);
+        encode_progress_batch(&changes, &mut bufs, DEFAULT_MAX_BATCH_SIZE).unwrap();
 
         // Truncate the buffer (removes part of CRC or payload).
         let buf = &bufs[0];
@@ -686,7 +703,7 @@ mod tests {
     fn decode_rejects_trailing_bytes() {
         let changes: Vec<ProgressChange<u64>> = vec![(0, 0, 42u64, 1)];
         let mut bufs = Vec::new();
-        encode_progress_batch(&changes, &mut bufs, DEFAULT_MAX_BATCH_SIZE);
+        encode_progress_batch(&changes, &mut bufs, DEFAULT_MAX_BATCH_SIZE).unwrap();
         let mut buf = bufs.into_iter().next().unwrap();
         buf.push(0xFF); // trailing byte after CRC
 
@@ -704,7 +721,7 @@ mod tests {
     fn decode_detects_crc32_corruption() {
         let changes: Vec<ProgressChange<u64>> = vec![(0, 0, 42u64, 1), (1, 0, 100u64, -1)];
         let mut bufs = Vec::new();
-        encode_progress_batch(&changes, &mut bufs, DEFAULT_MAX_BATCH_SIZE);
+        encode_progress_batch(&changes, &mut bufs, DEFAULT_MAX_BATCH_SIZE).unwrap();
         let mut buf = bufs.into_iter().next().unwrap();
 
         // Flip a bit in the payload (not the CRC).
@@ -725,7 +742,7 @@ mod tests {
 
         // max_batch_size=2 → should produce 3 frames (2+2+1).
         let mut bufs = Vec::new();
-        encode_progress_batch(&changes, &mut bufs, 2);
+        encode_progress_batch(&changes, &mut bufs, 2).unwrap();
         assert_eq!(bufs.len(), 3);
 
         // Decode each and reassemble.
@@ -740,8 +757,8 @@ mod tests {
     #[test]
     fn progress_channel_id_formula() {
         // 4 workers total, src=1, dst=3 → PROGRESS_CHANNEL_BASE + 1*4 + 3 = 1_000_007
-        assert_eq!(progress_channel_id(1, 3, 4), PROGRESS_CHANNEL_BASE + 7);
-        assert_eq!(progress_channel_id(0, 0, 4), PROGRESS_CHANNEL_BASE);
+        assert_eq!(progress_channel_id(1, 3, 4).unwrap(), PROGRESS_CHANNEL_BASE + 7);
+        assert_eq!(progress_channel_id(0, 0, 4).unwrap(), PROGRESS_CHANNEL_BASE);
     }
 
     #[tokio::test]
@@ -837,7 +854,7 @@ mod tests {
         // Serialize a batch and send it.
         let changes: Vec<ProgressChange<u64>> = vec![(0, 0, 42u64, 1), (1, 0, 100u64, -1)];
         let mut bufs = Vec::new();
-        encode_progress_batch(&changes, &mut bufs, DEFAULT_MAX_BATCH_SIZE);
+        encode_progress_batch(&changes, &mut bufs, DEFAULT_MAX_BATCH_SIZE).unwrap();
         tx.send(bufs.into_iter().next().unwrap()).await.unwrap();
 
         // Wait for the bridge to process.
@@ -924,7 +941,7 @@ mod tests {
         let tx_clone = unbounded_tx.clone();
         let sender = ProgressSender::<u64>::network(move |changes: Vec<ProgressChange<u64>>| {
             let mut bufs = Vec::new();
-            encode_progress_batch::<u64>(&changes, &mut bufs, DEFAULT_MAX_BATCH_SIZE);
+            encode_progress_batch::<u64>(&changes, &mut bufs, DEFAULT_MAX_BATCH_SIZE).unwrap();
             for buf in bufs {
                 let frame = Frame {
                     dataflow_id: df_id,
@@ -950,7 +967,7 @@ mod tests {
         let tx_clone = unbounded_tx.clone();
         let sender = ProgressSender::<u64>::network(move |changes: Vec<ProgressChange<u64>>| {
             let mut bufs = Vec::new();
-            encode_progress_batch::<u64>(&changes, &mut bufs, DEFAULT_MAX_BATCH_SIZE);
+            encode_progress_batch::<u64>(&changes, &mut bufs, DEFAULT_MAX_BATCH_SIZE).unwrap();
             for buf in bufs {
                 let frame = Frame {
                     dataflow_id: DataflowId::new(),
@@ -996,7 +1013,7 @@ mod tests {
             for dst in 2..4 {
                 b_progress_regs.push(ChannelRegistration {
                     peer_node_id: "node-a".into(),
-                    channel_id: progress_channel_id(src, dst, num_workers),
+                    channel_id: progress_channel_id(src, dst, num_workers).unwrap(),
                 });
             }
         }
@@ -1006,7 +1023,7 @@ mod tests {
             for dst in 0..2 {
                 a_progress_regs.push(ChannelRegistration {
                     peer_node_id: "node-b".into(),
-                    channel_id: progress_channel_id(src, dst, num_workers),
+                    channel_id: progress_channel_id(src, dst, num_workers).unwrap(),
                 });
             }
         }
@@ -1051,7 +1068,8 @@ mod tests {
         let local_a = crate::progress::progress_channel::create_progress_channels::<u64>(
             num_workers,
             &wake_handles,
-        );
+        )
+        .unwrap();
         // Take only node-A's workers (0 and 1).
         let a_worker_channels: Vec<WorkerProgressChannels<u64>> =
             local_a.into_iter().take(2).collect();
@@ -1075,7 +1093,8 @@ mod tests {
         let local_b = crate::progress::progress_channel::create_progress_channels::<u64>(
             num_workers,
             &wake_handles,
-        );
+        )
+        .unwrap();
         let b_worker_channels: Vec<WorkerProgressChannels<u64>> =
             local_b.into_iter().skip(2).take(2).collect();
 
@@ -1145,7 +1164,7 @@ mod tests {
         let cancel_for_closure = cancel.clone();
         let sender = ProgressSender::<u64>::network(move |changes: Vec<ProgressChange<u64>>| {
             let mut bufs = Vec::new();
-            encode_progress_batch::<u64>(&changes, &mut bufs, DEFAULT_MAX_BATCH_SIZE);
+            encode_progress_batch::<u64>(&changes, &mut bufs, DEFAULT_MAX_BATCH_SIZE).unwrap();
             for buf in bufs {
                 let frame = Frame {
                     dataflow_id: DataflowId::new(),
