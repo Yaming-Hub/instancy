@@ -74,27 +74,32 @@ Both modes get:
 
 ### API Changes
 
-#### 1. `SharedPeerManager::new` — factory becomes required
+#### 1. `SharedPeerManager::new` — factory required, no pre-established connections
 
 ```rust
-// Before
+// Before: caller pre-creates connections, factory optional
 pub fn new<R, W>(
     peer_node_id: String,
     config: SharedConnectionConfig,
     connections: Vec<(R, W)>,
-    connection_factory: Option<Arc<dyn DynConnectionFactory>>,  // optional
+    connection_factory: Option<Arc<dyn DynConnectionFactory>>,
     runtime_handle: &tokio::runtime::Handle,
 ) -> Result<Self>
 
-// After
-pub fn new<R, W>(
+// After: factory required, no pre-established connections
+pub fn new(
     peer_node_id: String,
     config: SharedConnectionConfig,
-    connections: Vec<(R, W)>,
-    connection_factory: Arc<dyn DynConnectionFactory>,  // required
+    connection_factory: Arc<dyn DynConnectionFactory>,
     runtime_handle: &tokio::runtime::Handle,
 ) -> Result<Self>
 ```
+
+Initial connections are created **lazily** — the constructor stores the
+factory but does not call it. When the first dataflow registers or sends
+data, the manager calls `connection_factory.establish_dyn(&peer_node_id)`
+to create `config.min_connections` connections on demand. This keeps the
+constructor synchronous and defers connection cost until actually needed.
 
 #### 2. `ClusterSpawnTransport::Dedicated` — uses factory + pool
 
@@ -144,23 +149,31 @@ simpler code, no silent ignore paths.
 
 ### What Stays the Same
 
-- `PeerConnection` struct — still used for pre-established connections in
-  `TransportSession` (internal / test usage)
-- `TransportSession` — remains as an internal component, may be used
-  by dedicated mode under the hood
+- `TransportSession` — remains as an internal component used by dedicated
+  mode under the hood (connections obtained from factory, not caller)
 - `ClusterTransport` enum with Dedicated/Shared variants — the variants
   stay, but both now have reconnection
 - `FrameSender::Direct` / `FrameSender::Shared` — stays, as the send
   mechanics differ between modes
 
+### What Gets Removed
+
+- `PeerConnection` struct — no longer needed since callers never provide
+  pre-established connections. Internal code uses raw `(reader, writer)`
+  pairs returned by the factory.
+- `connections` parameter from `SharedPeerManager::new`
+- `Option` wrapper on `connection_factory` throughout `shared_transport.rs`
+
 ### Test Strategy
 
-- Tests using in-memory duplex streams: create a mock factory that wraps
-  pre-created duplex pairs, or use a local TCP listener on 127.0.0.1
+- Tests using in-memory duplex streams: implement a mock `ConnectionFactory`
+  that creates `tokio::io::duplex()` pairs internally (each `establish()`
+  call creates a new duplex pair and sends the other half to the peer's
+  factory via a shared channel)
 - Tests using real TCP: instantiate `TcpConnectionFactory` with a static
-  address resolver
-- `cluster_shared_transport.rs`: update `SharedPeerManager::new` calls to
-  pass a factory (currently passes `None`)
+  address resolver pointing to `127.0.0.1`
+- `cluster_shared_transport.rs`: update `SharedPeerManager::new` calls —
+  remove pre-created connections, pass factory instead
 
 ## Files to Change
 
