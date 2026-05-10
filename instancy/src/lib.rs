@@ -103,7 +103,9 @@ pub use membership::{
 pub use cancellation::{CancellationReason, CancellationToken};
 
 // Error handling
-pub use error::{Error, Result};
+pub use error::{
+    CommunicationError, DataflowError, Error, Result, RuntimeError, TopologyError,
+};
 
 // Worker types
 pub use worker::WorkerId;

@@ -20,7 +20,7 @@
 
 use crate::dataflow::channels::envelope::Envelope;
 use crate::dataflow::channels::pushpull::Push;
-use crate::error::{Error, Result};
+use crate::error::{DataflowError, Error, Result};
 use crate::progress::timestamp::Timestamp;
 
 /// A fan-out push adapter that clones envelopes to multiple downstream targets.
@@ -64,9 +64,9 @@ impl<T: Timestamp, D: Clone + Send + 'static, M: Clone + Default + Send + 'stati
     /// Returns `Error::InvalidConfig` if `targets` is empty.
     pub fn new(targets: Vec<Box<dyn Push<T, D, M>>>) -> Result<Self> {
         if targets.is_empty() {
-            return Err(Error::InvalidConfig(
+            return Err(Error::Dataflow(DataflowError::InvalidConfig(
                 "TeePush requires at least one target".into(),
-            ));
+            )));
         }
         Ok(Self {
             targets,
@@ -114,7 +114,7 @@ impl<T: Timestamp, D: Clone + Send + 'static, M: Clone + Default + Send + 'stati
 {
     fn push(&mut self, envelope: Envelope<T, D, M>) -> Result<()> {
         if self.closed {
-            return Err(Error::Custom("TeePush is closed".into()));
+            return Err(Error::ChannelClosed);
         }
 
         // First drain any partially-delivered envelope from a previous call.
@@ -129,7 +129,7 @@ impl<T: Timestamp, D: Clone + Send + 'static, M: Clone + Default + Send + 'stati
         envelope: Envelope<T, D, M>,
     ) -> std::result::Result<(), (Error, Envelope<T, D, M>)> {
         if self.closed {
-            return Err((Error::Custom("TeePush is closed".into()), envelope));
+            return Err((Error::ChannelClosed, envelope));
         }
 
         // Drain pending first; if that fails, return the NEW envelope untouched.

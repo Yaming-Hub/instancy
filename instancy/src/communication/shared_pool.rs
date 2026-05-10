@@ -45,7 +45,7 @@ use std::time::Duration;
 
 use tokio::sync::Mutex;
 
-use crate::error::LockResultExt;
+use crate::error::{LockResultExt, RuntimeError};
 
 // ─── Configuration ───────────────────────────────────────────────────────────
 
@@ -389,15 +389,15 @@ impl PeerPool {
     /// Panics if `config.min_connections < 1` or `config.min_connections > config.max_connections`.
     pub fn new(initial_connections: usize, config: SharedConnectionConfig) -> crate::Result<Self> {
         if config.min_connections < 1 {
-            return Err(crate::Error::InvalidConfig(
+            return Err(crate::Error::Runtime(RuntimeError::InvalidConfig(
                 "min_connections must be at least 1".into(),
-            ));
+            )));
         }
         if config.min_connections > config.max_connections {
-            return Err(crate::Error::InvalidConfig(format!(
+            return Err(crate::Error::Runtime(RuntimeError::InvalidConfig(format!(
                 "min_connections ({}) must be <= max_connections ({})",
                 config.min_connections, config.max_connections
-            )));
+            ))));
         }
 
         // Only pre-create slots for connections that actually exist.

@@ -25,7 +25,7 @@ use std::fmt;
 
 use crate::dataflow::stage::StageId;
 use crate::dataflow::stream::Slot;
-use crate::error::{Error, Result};
+use crate::error::{DataflowError, Error, Result};
 
 // ---------------------------------------------------------------------------
 // OperatorInfo — metadata about a registered operator
@@ -206,10 +206,10 @@ impl DataflowGraph {
     /// Returns an error if an operator with the same index is already registered.
     pub fn register_operator(&mut self, info: OperatorInfo) -> Result<()> {
         if self.operators.contains_key(&info.index) {
-            return Err(Error::Custom(format!(
+            return Err(Error::Dataflow(DataflowError::InvalidGraph(format!(
                 "Duplicate operator index {}: '{}' conflicts with existing '{}'",
                 info.index, info.name, self.operators[&info.index].name,
-            )));
+            ))));
         }
         self.operators.insert(info.index, info);
         Ok(())
@@ -486,11 +486,11 @@ impl DataflowGraph {
         }
 
         if order.len() != self.operators.len() {
-            return Err(Error::Custom(format!(
+            return Err(Error::Dataflow(DataflowError::InvalidGraph(format!(
                 "Cycle detected in dataflow graph: processed {} of {} operators",
                 order.len(),
                 self.operators.len(),
-            )));
+            ))));
         }
 
         Ok(order)
@@ -514,29 +514,29 @@ impl DataflowGraph {
             let tgt_idx = edge.target.operator_index;
 
             let src_op = self.operators.get(&src_idx).ok_or_else(|| {
-                Error::Custom(format!(
+                Error::Dataflow(DataflowError::InvalidGraph(format!(
                     "Edge {i}: source operator {src_idx} is not registered"
-                ))
+                )))
             })?;
 
             let tgt_op = self.operators.get(&tgt_idx).ok_or_else(|| {
-                Error::Custom(format!(
+                Error::Dataflow(DataflowError::InvalidGraph(format!(
                     "Edge {i}: target operator {tgt_idx} is not registered"
-                ))
+                )))
             })?;
 
             // Check port bounds.
             if edge.source.slot_index >= src_op.output_count {
-                return Err(Error::Custom(format!(
+                return Err(Error::Dataflow(DataflowError::InvalidGraph(format!(
                     "Edge {i}: source port {} exceeds operator '{}' output count {}",
                     edge.source.slot_index, src_op.name, src_op.output_count,
-                )));
+                ))));
             }
             if edge.target.slot_index >= tgt_op.input_count {
-                return Err(Error::Custom(format!(
+                return Err(Error::Dataflow(DataflowError::InvalidGraph(format!(
                     "Edge {i}: target port {} exceeds operator '{}' input count {}",
                     edge.target.slot_index, tgt_op.name, tgt_op.input_count,
-                )));
+                ))));
             }
         }
 
@@ -546,28 +546,28 @@ impl DataflowGraph {
             let tgt_idx = edge.target.operator_index;
 
             let src_op = self.operators.get(&src_idx).ok_or_else(|| {
-                Error::Custom(format!(
+                Error::Dataflow(DataflowError::InvalidGraph(format!(
                     "Feedback edge {i}: source operator {src_idx} is not registered"
-                ))
+                )))
             })?;
 
             let tgt_op = self.operators.get(&tgt_idx).ok_or_else(|| {
-                Error::Custom(format!(
+                Error::Dataflow(DataflowError::InvalidGraph(format!(
                     "Feedback edge {i}: target operator {tgt_idx} is not registered"
-                ))
+                )))
             })?;
 
             if edge.source.slot_index >= src_op.output_count {
-                return Err(Error::Custom(format!(
+                return Err(Error::Dataflow(DataflowError::InvalidGraph(format!(
                     "Feedback edge {i}: source port {} exceeds operator '{}' output count {}",
                     edge.source.slot_index, src_op.name, src_op.output_count,
-                )));
+                ))));
             }
             if edge.target.slot_index >= tgt_op.input_count {
-                return Err(Error::Custom(format!(
+                return Err(Error::Dataflow(DataflowError::InvalidGraph(format!(
                     "Feedback edge {i}: target port {} exceeds operator '{}' input count {}",
                     edge.target.slot_index, tgt_op.name, tgt_op.input_count,
-                )));
+                ))));
             }
         }
 
@@ -576,10 +576,10 @@ impl DataflowGraph {
         for (i, edge) in self.edges.iter().enumerate() {
             let key = (edge.source, edge.target);
             if !seen.insert(key) {
-                return Err(Error::Custom(format!(
+                return Err(Error::Dataflow(DataflowError::InvalidGraph(format!(
                     "Duplicate edge: {} → {} at position {i}",
                     edge.source, edge.target,
-                )));
+                ))));
             }
         }
 

@@ -126,7 +126,9 @@ impl<T: Timestamp, D: Send, M: Send> Push<T, D, M> for LocalPush<T, D, M> {
         let mut state = self
             .shared
             .lock()
-            .map_err(|_| Error::Custom("channel mutex poisoned".into()))?;
+            .map_err(|_| Error::LockPoisoned {
+                context: "channel mutex poisoned".into(),
+            })?;
         if state.sender_closed || state.receiver_dropped {
             return Err(Error::ChannelClosed);
         }
@@ -143,7 +145,14 @@ impl<T: Timestamp, D: Send, M: Send> Push<T, D, M> for LocalPush<T, D, M> {
     ) -> std::result::Result<(), (Error, Envelope<T, D, M>)> {
         let mut state = match self.shared.lock() {
             Ok(s) => s,
-            Err(_) => return Err((Error::Custom("channel mutex poisoned".into()), envelope)),
+            Err(_) => {
+                return Err((
+                    Error::LockPoisoned {
+                        context: "channel mutex poisoned".into(),
+                    },
+                    envelope,
+                ))
+            }
         };
         if state.sender_closed || state.receiver_dropped {
             return Err((Error::ChannelClosed, envelope));

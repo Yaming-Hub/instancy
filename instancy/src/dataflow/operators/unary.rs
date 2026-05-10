@@ -290,7 +290,7 @@ mod tests {
             |input, _output| {
                 while let Some((_time, data)) = input.next() {
                     if data.contains(&-1) {
-                        return Err(Error::Custom("negative value".into()));
+                        return Err(Error::operator("failing_op", std::io::Error::other("negative value")));
                     }
                 }
                 Ok(())

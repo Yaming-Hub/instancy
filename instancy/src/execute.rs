@@ -6,7 +6,7 @@
 use std::time::Duration;
 
 use crate::cancellation::CancellationToken;
-use crate::error::Error;
+use crate::error::{Error, TopologyError};
 use crate::scheduler::batching::BatchingPolicy;
 use crate::worker::WorkerId;
 use crate::worker_pool::WorkerPoolConfig;
@@ -140,14 +140,16 @@ impl ClusterTopology {
     /// Nodes are sorted by `node_id` to ensure consistent worker range assignment.
     pub fn multi_node(mut configs: Vec<NodeConfig>) -> Result<Self, Error> {
         if configs.is_empty() {
-            return Err(Error::Custom("cluster must have at least one node".into()));
+            return Err(Error::Topology(TopologyError::EmptyTopology {
+                reason: "cluster must have at least one node".into(),
+            }));
         }
         for config in &configs {
             if config.logical_workers == 0 {
-                return Err(Error::Custom(format!(
-                    "node '{}' must have at least 1 worker",
-                    config.node_id
-                )));
+                return Err(Error::Topology(TopologyError::InvalidNodeConfig {
+                    node_id: config.node_id.clone(),
+                    reason: "must have at least 1 worker".into(),
+                }));
             }
         }
         configs.sort_by(|a, b| a.node_id.cmp(&b.node_id));
@@ -210,16 +212,15 @@ impl ClusterTopology {
     /// Only subsequent `spawn_cluster` calls will include the new node.
     pub fn add_node(&mut self, config: NodeConfig) -> Result<(), Error> {
         if config.logical_workers == 0 {
-            return Err(Error::Custom(format!(
-                "node '{}' must have at least 1 worker",
-                config.node_id
-            )));
+            return Err(Error::Topology(TopologyError::InvalidNodeConfig {
+                node_id: config.node_id.clone(),
+                reason: "must have at least 1 worker".into(),
+            }));
         }
         if self.contains_node(&config.node_id) {
-            return Err(Error::Custom(format!(
-                "node '{}' already exists in topology",
-                config.node_id
-            )));
+            return Err(Error::Topology(TopologyError::NodeAlreadyExists {
+                node_id: config.node_id.clone(),
+            }));
         }
         self.nodes.push(config);
         self.nodes.sort_by(|a, b| a.node_id.cmp(&b.node_id));
@@ -239,12 +240,14 @@ impl ClusterTopology {
             .iter()
             .position(|n| n.node_id == node_id)
             .ok_or_else(|| {
-                Error::Custom(format!("node '{node_id}' not found in topology"))
+                Error::Topology(TopologyError::NodeNotFound {
+                    node_id: node_id.into(),
+                })
             })?;
         if self.nodes.len() == 1 {
-            return Err(Error::Custom(
-                "cannot remove the last node from topology".into(),
-            ));
+            return Err(Error::Topology(TopologyError::EmptyTopology {
+                reason: "cannot remove the last node from topology".into(),
+            }));
         }
         Ok(self.nodes.remove(idx))
     }
@@ -274,12 +277,12 @@ fn execute(
     runtime_config
         .worker_pool
         .validate()
-        .map_err(|e| Error::Custom(e.to_string()))?;
+        .map_err(|e| Error::Runtime(crate::error::RuntimeError::InvalidConfig(e.to_string())))?;
 
     if dataflow_config.topology.total_workers() == 0 {
-        return Err(Error::Custom(
+        return Err(Error::Runtime(crate::error::RuntimeError::InvalidConfig(
             "dataflow must have at least one worker".into(),
-        ));
+        )));
     }
 
     Ok(dataflow_config.name)

@@ -148,10 +148,7 @@ impl<T: Timestamp> ProbeHandle<T> {
                     if !rx.borrow().less_equal(time) {
                         return Ok(());
                     }
-                    return Err(crate::error::Error::Custom(
-                        "probe notifier dropped before frontier advanced past requested time"
-                            .to_string(),
-                    ));
+                    return Err(crate::error::Error::ChannelClosed);
                 }
             }
         }
@@ -180,9 +177,7 @@ impl<T: Timestamp> ProbeHandle<T> {
                     if rx.borrow().is_empty() {
                         return Ok(());
                     }
-                    return Err(crate::error::Error::Custom(
-                        "probe notifier dropped before dataflow completed".to_string(),
-                    ));
+                    return Err(crate::error::Error::ChannelClosed);
                 }
             }
         }

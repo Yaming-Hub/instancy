@@ -50,7 +50,7 @@ use std::collections::VecDeque;
 use std::sync::{Arc, Mutex};
 
 use crate::dataflow::channels::wake::WakeHandle;
-use crate::error::LockResultExt;
+use crate::error::{DataflowError, LockResultExt};
 use crate::progress::timestamp::Timestamp;
 
 /// A single progress change: (operator_index, output_port, timestamp, diff).
@@ -222,10 +222,10 @@ pub fn create_progress_channels<T: Timestamp>(
     wake_handles: &[WakeHandle],
 ) -> crate::Result<Vec<WorkerProgressChannels<T>>> {
     if wake_handles.len() != num_workers {
-        return Err(crate::Error::InvalidConfig(format!(
+        return Err(crate::Error::Dataflow(DataflowError::InvalidConfig(format!(
             "wake_handles length ({}) must match num_workers ({num_workers})",
             wake_handles.len()
-        )));
+        ))));
     }
 
     // Initialize per-worker channel collections.

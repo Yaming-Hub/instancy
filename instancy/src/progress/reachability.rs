@@ -56,6 +56,7 @@ use std::cmp::Reverse;
 use std::collections::BinaryHeap;
 use std::fmt::Debug;
 
+use crate::error::DataflowError;
 use crate::progress::change_batch::ChangeBatch;
 use crate::progress::frontier::Antichain;
 use crate::progress::mutable_antichain::MutableAntichain;
@@ -195,20 +196,20 @@ impl<T: Timestamp> Builder<T> {
         summary: PortConnectivity<T::Summary>,
     ) -> crate::Result<()> {
         if summary.inputs() != inputs {
-            return Err(crate::Error::InvalidConfig(format!(
+            return Err(crate::Error::Dataflow(DataflowError::InvalidConfig(format!(
                 "PortConnectivity inputs ({}) don't match declared inputs ({}) for node {}",
                 summary.inputs(),
                 inputs,
                 index
-            )));
+            ))));
         }
         if summary.outputs() != outputs {
-            return Err(crate::Error::InvalidConfig(format!(
+            return Err(crate::Error::Dataflow(DataflowError::InvalidConfig(format!(
                 "PortConnectivity outputs ({}) don't match declared outputs ({}) for node {}",
                 summary.outputs(),
                 outputs,
                 index
-            )));
+            ))));
         }
         self.ensure_node(index);
         self.shape[index] = (inputs, outputs);
@@ -226,7 +227,7 @@ impl<T: Timestamp> Builder<T> {
     pub fn add_edge(&mut self, source: Location, target: Location) -> crate::Result<()> {
         if let Location::Source { node, port } = source {
             if !(node < self.shape.len() && port < self.edges[node].len()) {
-                return Err(crate::Error::InvalidConfig(format!(
+                return Err(crate::Error::Dataflow(DataflowError::InvalidGraph(format!(
                     "add_edge: source node {} port {} is invalid (node has {} output ports). Register the node with add_node() before adding edges.",
                     node,
                     port,
@@ -235,7 +236,7 @@ impl<T: Timestamp> Builder<T> {
                     } else {
                         0
                     }
-                )));
+                ))));
             }
             self.edges[node][port].push(target);
         }

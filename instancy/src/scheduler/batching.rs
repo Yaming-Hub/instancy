@@ -22,6 +22,8 @@
 
 use std::time::{Duration, Instant};
 
+use crate::error::RuntimeError;
+
 /// Policy controlling when accumulated messages trigger an operator activation.
 ///
 /// A dispatch is triggered when **any** threshold is met (first-threshold-wins).
@@ -78,9 +80,9 @@ impl BatchingPolicy {
         max_wait: Duration,
     ) -> crate::Result<Self> {
         if max_count == 0 {
-            return Err(crate::Error::InvalidConfig(
+            return Err(crate::Error::Runtime(RuntimeError::InvalidConfig(
                 "max_batch_count must be positive".into(),
-            ));
+            )));
         }
         Ok(Self {
             max_batch_count: max_count,

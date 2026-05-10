@@ -111,11 +111,11 @@ mod tests {
     impl<T: Timestamp, D: Send, M: Send> Push<T, D, M> for VecPush<T, D, M> {
         fn push(&mut self, envelope: Envelope<T, D, M>) -> Result<()> {
             if self.closed {
-                return Err(crate::error::Error::Custom("channel closed".into()));
+                return Err(crate::error::Error::ChannelClosed);
             }
             self.buffer
                 .lock()
-                .map_err(|_| crate::error::Error::Custom("channel mutex poisoned".into()))?
+                .map_err(|_| crate::error::Error::LockPoisoned { context: "VecPush buffer".into() })?
                 .push(envelope);
             Ok(())
         }
@@ -126,7 +126,7 @@ mod tests {
         ) -> std::result::Result<(), (crate::error::Error, Envelope<T, D, M>)> {
             if self.closed {
                 return Err((
-                    crate::error::Error::Custom("channel closed".into()),
+                    crate::error::Error::ChannelClosed,
                     envelope,
                 ));
             }
@@ -134,7 +134,7 @@ mod tests {
                 Ok(mut buf) => buf.push(envelope),
                 Err(_) => {
                     return Err((
-                        crate::error::Error::Custom("channel mutex poisoned".into()),
+                        crate::error::Error::LockPoisoned { context: "VecPush buffer".into() },
                         envelope,
                     ));
                 }
