@@ -33,7 +33,7 @@ use crate::dataflow::control::{ControlBroadcast, ControlReceiver, ControlSender}
 use crate::dataflow::dataflow_builder::{DataflowBuilder, LogicalDataflow};
 use crate::dataflow::executor::{DataflowExecutor, ExecutorConfig};
 use crate::dataflow::graph::OperatorInfo;
-use crate::error::{Error, Result};
+use crate::error::{Error, Result, RuntimeError, TopologyError};
 use crate::progress::progress_channel::{WorkerProgressChannels, create_progress_channels};
 use crate::progress::timestamp::Timestamp;
 use crate::scheduler::policy::SchedulePolicy;
@@ -730,7 +730,7 @@ impl RuntimeHandle {
             ..Default::default()
         };
         let worker_pool =
-            WorkerPool::new(pool_config).map_err(|e| crate::error::Error::Custom(e.to_string()))?;
+            WorkerPool::new(pool_config).map_err(|e| Error::Runtime(RuntimeError::InvalidConfig(e.to_string())))?;
         let schedule_policy: Option<Arc<dyn SchedulePolicy>> = config
             .schedule_policy
             .map(|p| Arc::from(p) as Arc<dyn SchedulePolicy>);
@@ -740,13 +740,13 @@ impl RuntimeHandle {
         let (tokio_handle, owned_runtime) = match config.tokio_mode {
             TokioMode::Create { worker_threads } => {
                 if tokio::runtime::Handle::try_current().is_ok() {
-                    return Err(crate::error::Error::Custom(
+                    return Err(Error::Runtime(RuntimeError::InvalidConfig(
                         "TokioMode::Create cannot be used inside an existing tokio context \
                          (dropping the owned runtime would panic). \
                          Use TokioMode::Auto, TokioMode::CurrentContext, or \
                          TokioMode::External instead."
                             .to_string(),
-                    ));
+                    )));
                 }
                 let rt = tokio::runtime::Builder::new_multi_thread()
                     .worker_threads(worker_threads)
@@ -754,7 +754,7 @@ impl RuntimeHandle {
                     .thread_name(format!("{}-tokio", config.name))
                     .build()
                     .map_err(|e| {
-                        crate::error::Error::Custom(format!("failed to create tokio runtime: {e}"))
+                        Error::Runtime(RuntimeError::SpawnFailed(format!("failed to create tokio runtime: {e}")))
                     })?;
                 let handle = rt.handle().clone();
                 (handle, Some(rt))
@@ -762,11 +762,11 @@ impl RuntimeHandle {
             TokioMode::External(handle) => (handle, None),
             TokioMode::CurrentContext => {
                 let handle = tokio::runtime::Handle::try_current().map_err(|_| {
-                    crate::error::Error::Custom(
+                    Error::Runtime(RuntimeError::InvalidConfig(
                         "TokioMode::CurrentContext requires an active tokio runtime; \
                          use TokioMode::Create or TokioMode::External instead"
                             .to_string(),
-                    )
+                    ))
                 })?;
                 (handle, None)
             }
@@ -781,9 +781,9 @@ impl RuntimeHandle {
                             .thread_name(format!("{}-tokio", config.name))
                             .build()
                             .map_err(|e| {
-                                crate::error::Error::Custom(format!(
+                                Error::Runtime(RuntimeError::SpawnFailed(format!(
                                     "failed to create tokio runtime: {e}"
-                                ))
+                                )))
                             })?;
                         let handle = rt.handle().clone();
                         (handle, Some(rt))
@@ -1034,9 +1034,7 @@ impl RuntimeHandle {
         use crate::membership::MembershipEvent;
 
         let mut rx = membership.events().ok_or_else(|| {
-            Error::Custom(
-                "membership provider already consumed (events() returned None)".into(),
-            )
+            Error::Runtime(RuntimeError::AlreadyConsumed { resource: "membership provider events".into() })
         })?;
 
         // Cancel any previous membership listener by cancelling its token.
@@ -1522,7 +1520,7 @@ impl RuntimeHandle {
             && dataflow.input_port_wiring.is_empty()
             && !has_async_sources
         {
-            return Err(Error::Custom("cannot spawn an empty dataflow".into()));
+            return Err(Error::Runtime(RuntimeError::EmptyDataflow));
         }
 
         let parent = parent_cancel.unwrap_or_else(|| self.cancel.clone());
@@ -1625,7 +1623,7 @@ impl RuntimeHandle {
             std::thread::Builder::new()
                 .name(format!("source-pump-{}-{}", name, pump_idx))
                 .spawn(pump)
-                .map_err(|e| Error::Custom(format!("failed to spawn pump thread: {e}")))?;
+                .map_err(|e| Error::Runtime(RuntimeError::SpawnFailed(format!("failed to spawn pump thread: {e}"))))?;
         }
 
         let spawned = SpawnedDataflow {
@@ -1658,7 +1656,7 @@ impl RuntimeHandle {
         F: Fn(&mut DataflowBuilder<T>) -> Result<()>,
     {
         if num_workers == 0 {
-            return Err(Error::Custom("num_workers must be >= 1".into()));
+            return Err(Error::Runtime(RuntimeError::InvalidConfig("num_workers must be >= 1".into())));
         }
 
         // Phase 1: Build all N dataflows from the closure.
@@ -1693,19 +1691,19 @@ impl RuntimeHandle {
             for (edge_idx, edge_capacity, creator) in creators {
                 let shared_factories = creator(num_workers, num_workers, edge_capacity);
                 if shared_factories.len() != num_workers {
-                    return Err(Error::Custom(format!(
+                    return Err(Error::Runtime(RuntimeError::InvalidConfig(format!(
                         "exchange factory creator for edge {edge_idx} produced {} factories, expected {num_workers}",
                         shared_factories.len()
-                    )));
+                    ))));
                 }
                 for (worker_idx, factory) in shared_factories.into_iter().enumerate() {
                     let pos = dataflows[worker_idx]
                         .channel_factories
                         .iter()
                         .position(|(idx, _)| *idx == edge_idx)
-                        .ok_or_else(|| Error::Custom(format!(
+                        .ok_or_else(|| Error::Runtime(RuntimeError::InvalidConfig(format!(
                             "exchange edge {edge_idx} not found in worker {worker_idx}'s channel factories"
-                        )))?;
+                        ))))?;
                     dataflows[worker_idx].channel_factories[pos].1 = factory;
                 }
             }
@@ -1805,9 +1803,9 @@ impl RuntimeHandle {
                                 "sibling worker {spawned_count} failed to spawn"
                             )));
                     }
-                    return Err(Error::Custom(format!(
+                    return Err(Error::Runtime(RuntimeError::SpawnFailed(format!(
                         "failed to spawn worker {spawned_count}: {e}"
-                    )));
+                    ))));
                 }
             }
         }
@@ -1887,7 +1885,7 @@ impl RuntimeHandle {
         F: Fn(&mut DataflowBuilder<T>) -> Result<()>,
     {
         if default_parallelism == 0 {
-            return Err(Error::Custom("default_parallelism must be >= 1".into()));
+            return Err(Error::Runtime(RuntimeError::InvalidConfig("default_parallelism must be >= 1".into())));
         }
 
         // Phase 1: Build one dataflow to analyze stage structure.
@@ -1922,7 +1920,7 @@ impl RuntimeHandle {
             .unwrap_or(&default_parallelism);
 
         if num_workers == 0 {
-            return Err(Error::Custom("computed num_workers must be >= 1".into()));
+            return Err(Error::Runtime(RuntimeError::InvalidConfig("computed num_workers must be >= 1".into())));
         }
 
         // If all stages have the same parallelism, use normal spawn_multi.
@@ -1987,14 +1985,14 @@ impl RuntimeHandle {
                 let shared_factories = creator(source_par, target_par, edge_capacity);
                 let expected_count = std::cmp::max(source_par, target_par);
                 if shared_factories.len() != expected_count {
-                    return Err(Error::Custom(format!(
+                    return Err(Error::Runtime(RuntimeError::InvalidConfig(format!(
                         "exchange factory creator for edge {edge_idx} produced {} factories, \
                          expected {} (max of source_par={}, target_par={})",
                         shared_factories.len(),
                         expected_count,
                         source_par,
                         target_par
-                    )));
+                    ))));
                 }
 
                 // Distribute factories to workers. Workers beyond max(M,N)
@@ -2006,10 +2004,10 @@ impl RuntimeHandle {
                             .iter()
                             .position(|(idx, _)| *idx == edge_idx)
                             .ok_or_else(|| {
-                                Error::Custom(format!(
+                                Error::Runtime(RuntimeError::InvalidConfig(format!(
                                     "exchange edge {edge_idx} not found in worker {slot_idx}'s \
                                      channel factories"
-                                ))
+                                )))
                             })?;
                         dataflows[slot_idx].channel_factories[pos].1 = factory;
                     }
@@ -2110,9 +2108,9 @@ impl RuntimeHandle {
                                 "sibling worker {spawned_count} failed to spawn"
                             )));
                     }
-                    return Err(Error::Custom(format!(
+                    return Err(Error::Runtime(RuntimeError::SpawnFailed(format!(
                         "failed to spawn worker {spawned_count}: {e}"
-                    )));
+                    ))));
                 }
             }
         }
@@ -2235,9 +2233,7 @@ impl RuntimeHandle {
 
         let total_workers = topology.total_workers();
         let (local_start, local_end) = topology.worker_range(local_node_id).ok_or_else(|| {
-            Error::Custom(format!(
-                "local_node_id '{local_node_id}' not found in topology"
-            ))
+            Error::Topology(TopologyError::NodeNotFound { node_id: local_node_id.to_string() })
         })?;
         let num_local = local_end - local_start;
 
@@ -2311,23 +2307,23 @@ impl RuntimeHandle {
                         .collect();
                     for conn in &connections {
                         if conn.node_id == local_node_id {
-                            return Err(Error::Custom(format!(
+                            return Err(Error::Runtime(RuntimeError::InvalidConfig(format!(
                                 "connection to self ('{local_node_id}') is not allowed"
-                            )));
+                            ))));
                         }
                         if !expected_peers.remove(conn.node_id.as_str()) {
-                            return Err(Error::Custom(format!(
+                            return Err(Error::Runtime(RuntimeError::InvalidConfig(format!(
                                 "unexpected or duplicate connection to peer '{}'",
                                 conn.node_id
-                            )));
+                            ))));
                         }
                     }
                     if !expected_peers.is_empty() {
                         let missing: Vec<_> = expected_peers.into_iter().collect();
-                        return Err(Error::Custom(format!(
+                        return Err(Error::Runtime(RuntimeError::InvalidConfig(format!(
                             "missing connections to peers: {:?}",
                             missing
-                        )));
+                        ))));
                     }
                 }
 
@@ -2341,9 +2337,7 @@ impl RuntimeHandle {
                         let peer_id = &node.node_id;
                         let (peer_start, peer_end) =
                             topology.worker_range(peer_id).ok_or_else(|| {
-                                Error::InvalidConfig(format!(
-                                    "topology missing worker range for node {peer_id:?}"
-                                ))
+                                Error::Topology(TopologyError::NodeNotFound { node_id: peer_id.clone() })
                             })?;
                         for src in peer_start..peer_end {
                             for dst in local_start..local_end {
@@ -2370,9 +2364,7 @@ impl RuntimeHandle {
                     let peer_id = &node.node_id;
                     let (peer_start, peer_end) =
                         topology.worker_range(peer_id).ok_or_else(|| {
-                            Error::InvalidConfig(format!(
-                                "topology missing worker range for node {peer_id:?}"
-                            ))
+                            Error::Topology(TopologyError::NodeNotFound { node_id: peer_id.clone() })
                         })?;
                     for src in peer_start..peer_end {
                         for dst in local_start..local_end {
@@ -2422,16 +2414,16 @@ impl RuntimeHandle {
                         .collect();
                     for peer_id in peer_managers.keys() {
                         if !expected_peers.remove(peer_id.as_str()) {
-                            return Err(Error::Custom(format!(
+                            return Err(Error::Runtime(RuntimeError::InvalidConfig(format!(
                                 "unexpected peer_manager for '{peer_id}' not in topology"
-                            )));
+                            ))));
                         }
                     }
                     if !expected_peers.is_empty() {
-                        return Err(Error::Custom(format!(
+                        return Err(Error::Runtime(RuntimeError::InvalidConfig(format!(
                             "missing peer_managers for: {:?}",
                             expected_peers
-                        )));
+                        ))));
                     }
                 }
 
@@ -2444,10 +2436,7 @@ impl RuntimeHandle {
                         }
                         let (peer_start, peer_end) =
                             topology.worker_range(&node.node_id).ok_or_else(|| {
-                                Error::InvalidConfig(format!(
-                                    "topology missing worker range for node {:?}",
-                                    node.node_id
-                                ))
+                                Error::Topology(TopologyError::NodeNotFound { node_id: node.node_id.clone() })
                             })?;
                         for src in peer_start..peer_end {
                             for dst in local_start..local_end {
@@ -2468,10 +2457,7 @@ impl RuntimeHandle {
                     }
                     let (peer_start, peer_end) =
                         topology.worker_range(&node.node_id).ok_or_else(|| {
-                            Error::InvalidConfig(format!(
-                                "topology missing worker range for node {:?}",
-                                node.node_id
-                            ))
+                            Error::Topology(TopologyError::NodeNotFound { node_id: node.node_id.clone() })
                         })?;
                     for src in peer_start..peer_end {
                         for dst in local_start..local_end {
@@ -2493,7 +2479,7 @@ impl RuntimeHandle {
 
                 let mut raw_receivers = session
                     .take_receivers()
-                    .ok_or_else(|| Error::Custom("receivers already taken".into()))?;
+                    .ok_or_else(|| Error::Runtime(RuntimeError::AlreadyConsumed { resource: "receivers".into() }))?;
                 let error_rxs = session.take_error_receivers();
 
                 transport = Arc::new(ClusterTransport::Shared {
@@ -2524,7 +2510,7 @@ impl RuntimeHandle {
                     dataflow_id,
                     handshake_timeout,
                 ))
-                .map_err(|e| Error::Custom(format!("cluster handshake failed: {e}")))?;
+                .map_err(|e| Error::Runtime(RuntimeError::ClusterSetup(format!("cluster handshake failed: {e}"))))?;
         } else {
             runtime_handle
                 .block_on(perform_handshake_with_transport(
@@ -2534,7 +2520,7 @@ impl RuntimeHandle {
                     dataflow_id,
                     handshake_timeout,
                 ))
-                .map_err(|e| Error::Custom(format!("cluster handshake failed: {e}")))?;
+                .map_err(|e| Error::Runtime(RuntimeError::ClusterSetup(format!("cluster handshake failed: {e}"))))?;
         }
 
         // Phase 5: Wire exchange channels using network-backed factories.
@@ -2559,9 +2545,7 @@ impl RuntimeHandle {
                 }
                 let peer_id = &node.node_id;
                 let (peer_start, peer_end) = topology.worker_range(peer_id).ok_or_else(|| {
-                    Error::InvalidConfig(format!(
-                        "topology missing worker range for node {peer_id:?}"
-                    ))
+                    Error::Topology(TopologyError::NodeNotFound { node_id: peer_id.clone() })
                 })?;
                 let mut extracted = std::collections::HashMap::new();
                 if let Some(peer_map) = receivers.get_mut(peer_id) {
@@ -2599,10 +2583,10 @@ impl RuntimeHandle {
             let all_factories = creator.create(params);
 
             if all_factories.len() != total_workers {
-                return Err(Error::Custom(format!(
+                return Err(Error::Runtime(RuntimeError::InvalidConfig(format!(
                     "network exchange factory for edge {edge_idx} produced {} factories, expected {total_workers}",
                     all_factories.len()
-                )));
+                ))));
             }
 
             // Install only local workers' factories.
@@ -2617,10 +2601,10 @@ impl RuntimeHandle {
                     .iter()
                     .position(|(idx, _)| *idx == edge_idx)
                     .ok_or_else(|| {
-                        Error::Custom(format!(
+                        Error::Runtime(RuntimeError::InvalidConfig(format!(
                             "exchange edge {edge_idx} not found in worker {}'s channel factories",
                             local_start + local_idx
-                        ))
+                        )))
                     })?;
                 dataflows[local_idx].channel_factories[pos].1 = factory;
             }
@@ -2651,10 +2635,10 @@ impl RuntimeHandle {
             .filter(|n| n.node_id != local_node_id)
             .map(|n| {
                 let (s, e) = topology.worker_range(&n.node_id).ok_or_else(|| {
-                    Error::InvalidConfig(format!(
+                    Error::Runtime(RuntimeError::InvalidConfig(format!(
                         "topology missing worker range for node {:?}",
                         n.node_id
-                    ))
+                    )))
                 })?;
                 Ok((n.node_id.clone(), s, e))
             })
@@ -2731,7 +2715,7 @@ impl RuntimeHandle {
             DEFAULT_MAX_BATCH_SIZE,
             runtime_handle,
         )
-        .map_err(|e| Error::Custom(format!("failed to create network progress channels: {e}")))?;
+        .map_err(|e| Error::Runtime(RuntimeError::ClusterSetup(format!("failed to create network progress channels: {e}"))))?;
 
         // Phase 7: Materialize all local workers (without registering).
         let mode = ChannelMode::Sync;
@@ -2762,9 +2746,9 @@ impl RuntimeHandle {
                                 "cluster worker {global_idx} failed to spawn"
                             )));
                     }
-                    return Err(Error::Custom(format!(
+                    return Err(Error::Runtime(RuntimeError::SpawnFailed(format!(
                         "failed to spawn cluster worker {global_idx}: {e}"
-                    )));
+                    ))));
                 }
             }
         }
@@ -2779,7 +2763,7 @@ impl RuntimeHandle {
                     dataflow_id,
                     handshake_timeout,
                 ))
-                .map_err(|e| Error::Custom(format!("cluster ready barrier failed: {e}")))?;
+                .map_err(|e| Error::Runtime(RuntimeError::ClusterSetup(format!("cluster ready barrier failed: {e}"))))?;
         } else {
             runtime_handle
                 .block_on(perform_ready_barrier_with_transport(
@@ -2789,7 +2773,7 @@ impl RuntimeHandle {
                     dataflow_id,
                     handshake_timeout,
                 ))
-                .map_err(|e| Error::Custom(format!("cluster ready barrier failed: {e}")))?;
+                .map_err(|e| Error::Runtime(RuntimeError::ClusterSetup(format!("cluster ready barrier failed: {e}"))))?;
         }
 
         // Phase 9: Register all workers for execution.
@@ -2967,11 +2951,11 @@ impl SimpleRuntime {
     /// encounters an error during execution.
     pub fn run<T: Timestamp>(&self, dataflow: LogicalDataflow<T>) -> Result<()> {
         if dataflow.has_input_ports() {
-            return Err(Error::Custom(
+            return Err(Error::Runtime(RuntimeError::InvalidConfig(
                 "cannot run() a dataflow with declared input ports — \
                  use spawn() for dataflows that receive external data."
                     .into(),
-            ));
+            )));
         }
 
         if dataflow.operator_factories.is_empty() {
@@ -2990,9 +2974,9 @@ impl SimpleRuntime {
 
         let completed = executor.run()?;
         if !completed {
-            return Err(Error::Custom(
+            return Err(Error::Runtime(RuntimeError::InvalidConfig(
                 "dataflow did not complete (quiescence without termination)".into(),
-            ));
+            )));
         }
 
         Ok(())
@@ -3007,11 +2991,11 @@ impl SimpleRuntime {
         mut dataflow: LogicalDataflow<T>,
     ) -> Result<Option<std::sync::Arc<crate::metrics::DataflowMetrics>>> {
         if dataflow.has_input_ports() {
-            return Err(Error::Custom(
+            return Err(Error::Runtime(RuntimeError::InvalidConfig(
                 "cannot run() a dataflow with declared input ports — \
                  use spawn() for dataflows that receive external data."
                     .into(),
-            ));
+            )));
         }
 
         if dataflow.operator_factories.is_empty() {
@@ -3032,9 +3016,9 @@ impl SimpleRuntime {
 
         let completed = executor.run()?;
         if !completed {
-            return Err(Error::Custom(
+            return Err(Error::Runtime(RuntimeError::InvalidConfig(
                 "dataflow did not complete (quiescence without termination)".into(),
-            ));
+            )));
         }
 
         Ok(executor.metrics().cloned())
@@ -3079,7 +3063,7 @@ impl SimpleRuntime {
             && dataflow.input_port_wiring.is_empty()
             && dataflow.async_source_wiring.is_empty()
         {
-            return Err(Error::Custom("cannot spawn an empty dataflow".into()));
+            return Err(Error::Runtime(RuntimeError::EmptyDataflow));
         }
 
         let cancel = self.cancel.child_token();
@@ -3167,7 +3151,7 @@ impl SimpleRuntime {
             std::thread::Builder::new()
                 .name(format!("source-pump-{}-{}", name, pump_idx))
                 .spawn(pump)
-                .map_err(|e| Error::Custom(format!("failed to spawn pump thread: {e}")))?;
+                .map_err(|e| Error::Runtime(RuntimeError::SpawnFailed(format!("failed to spawn pump thread: {e}"))))?;
         }
 
         std::thread::Builder::new()
@@ -3176,7 +3160,7 @@ impl SimpleRuntime {
                 let result = executor.run();
                 notifier.complete(result);
             })
-            .map_err(|e| Error::Custom(format!("failed to spawn dataflow thread: {e}")))?;
+            .map_err(|e| Error::Runtime(RuntimeError::SpawnFailed(format!("failed to spawn dataflow thread: {e}"))))?;
 
         Ok(SpawnedDataflow {
             name,
@@ -3206,7 +3190,7 @@ impl SimpleRuntime {
         F: Fn(&mut DataflowBuilder<T>) -> Result<()>,
     {
         if num_workers == 0 {
-            return Err(Error::Custom("num_workers must be >= 1".into()));
+            return Err(Error::Runtime(RuntimeError::InvalidConfig("num_workers must be >= 1".into())));
         }
 
         // Phase 1: Build all N dataflows.
@@ -3233,19 +3217,19 @@ impl SimpleRuntime {
             for (edge_idx, edge_capacity, creator) in creators {
                 let shared_factories = creator(num_workers, num_workers, edge_capacity);
                 if shared_factories.len() != num_workers {
-                    return Err(Error::Custom(format!(
+                    return Err(Error::Runtime(RuntimeError::InvalidConfig(format!(
                         "exchange factory creator for edge {edge_idx} produced {} factories, expected {num_workers}",
                         shared_factories.len()
-                    )));
+                    ))));
                 }
                 for (worker_idx, factory) in shared_factories.into_iter().enumerate() {
                     let pos = dataflows[worker_idx]
                         .channel_factories
                         .iter()
                         .position(|(idx, _)| *idx == edge_idx)
-                        .ok_or_else(|| Error::Custom(format!(
+                        .ok_or_else(|| Error::Runtime(RuntimeError::InvalidConfig(format!(
                             "exchange edge {edge_idx} not found in worker {worker_idx}'s channel factories"
-                        )))?;
+                        ))))?;
                     dataflows[worker_idx].channel_factories[pos].1 = factory;
                 }
             }
@@ -3275,9 +3259,9 @@ impl SimpleRuntime {
                     for w in workers {
                         let _ = w.join_blocking();
                     }
-                    return Err(Error::Custom(format!(
+                    return Err(Error::Runtime(RuntimeError::SpawnFailed(format!(
                         "failed to spawn worker {spawned_count}: {e}"
-                    )));
+                    ))));
                 }
             }
         }
@@ -3359,9 +3343,9 @@ impl Drop for CompletionNotifier {
             Err(e) => e.into_inner(),
         };
         if state.result.is_none() {
-            state.result = Some(Err(Error::Custom(
+            state.result = Some(Err(Error::Runtime(RuntimeError::InvalidConfig(
                 "dataflow executor terminated unexpectedly (possible panic)".into(),
-            )));
+            ))));
             if let Some(waker) = state.waker.take() {
                 waker.wake();
             }
@@ -3451,18 +3435,18 @@ impl DataflowCompletion {
         let mut state = self
             .shared
             .lock()
-            .map_err(|_| Error::Custom("completion mutex poisoned".into()))?;
+            .map_err(|_| Error::LockPoisoned { context: "completion mutex poisoned".into() })?;
         while state.result.is_none() {
             state = self
                 .condvar
                 .wait(state)
-                .map_err(|_| Error::Custom("completion mutex poisoned during wait".into()))?;
+                .map_err(|_| Error::LockPoisoned { context: "completion mutex poisoned during wait".into() })?;
         }
         interpret_completion(
             state
                 .result
                 .take()
-                .ok_or_else(|| Error::Custom("internal: result missing after wait loop".into()))?,
+                .ok_or_else(|| Error::Runtime(RuntimeError::InvalidConfig("internal: result missing after wait loop".into())))?,
         )
     }
 }
@@ -3473,7 +3457,7 @@ impl Future for DataflowCompletion {
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         let mut state = match self.shared.lock() {
             Ok(s) => s,
-            Err(_) => return Poll::Ready(Err(Error::Custom("completion mutex poisoned".into()))),
+            Err(_) => return Poll::Ready(Err(Error::LockPoisoned { context: "completion mutex poisoned".into() })),
         };
         if let Some(result) = state.result.take() {
             Poll::Ready(interpret_completion(result))
@@ -3488,11 +3472,11 @@ impl Future for DataflowCompletion {
 fn interpret_completion(result: Result<bool>) -> Result<()> {
     match result {
         Ok(true) => Ok(()),
-        Ok(false) => Err(Error::Custom(
+        Ok(false) => Err(Error::Runtime(RuntimeError::InvalidConfig(
             "dataflow reached quiescence without completing — \
              some operators could not make progress"
                 .into(),
-        )),
+        ))),
         Err(e) => Err(e),
     }
 }
@@ -3584,22 +3568,22 @@ impl<T: Timestamp> SpawnedDataflow<T> {
             .input_senders
             .iter()
             .position(|(n, _, _)| n == name)
-            .ok_or_else(|| Error::Custom(format!("no input port named '{name}'")))?;
+            .ok_or_else(|| Error::Runtime(RuntimeError::InvalidConfig(format!("no input port named '{name}'"))))?;
 
         let (_, port_type, _) = &self.input_senders[pos];
         if *port_type != type_name {
-            return Err(Error::Custom(format!(
+            return Err(Error::Runtime(RuntimeError::InvalidConfig(format!(
                 "input port '{name}' has type {port_type}, but requested {type_name}"
-            )));
+            ))));
         }
 
         let (_, _, sender_any) = self.input_senders.remove(pos);
         sender_any
             .downcast::<crate::dataflow::channel_operators::InputSender<T, D>>()
             .map(|boxed| *boxed)
-            .map_err(|_| Error::Custom(format!(
+            .map_err(|_| Error::Runtime(RuntimeError::InvalidConfig(format!(
                 "input port '{name}' type downcast failed — if spawned with IoMode::Async, use take_async_input()"
-            )))
+            ))))
     }
 
     /// Take the output receiver for the named port (consumes it from the handle).
@@ -3627,22 +3611,22 @@ impl<T: Timestamp> SpawnedDataflow<T> {
             .output_receivers
             .iter()
             .position(|(n, _, _)| n == name)
-            .ok_or_else(|| Error::Custom(format!("no output port named '{name}'")))?;
+            .ok_or_else(|| Error::Runtime(RuntimeError::InvalidConfig(format!("no output port named '{name}'"))))?;
 
         let (_, port_type, _) = &self.output_receivers[pos];
         if *port_type != type_name {
-            return Err(Error::Custom(format!(
+            return Err(Error::Runtime(RuntimeError::InvalidConfig(format!(
                 "output port '{name}' has type {port_type}, but requested {type_name}"
-            )));
+            ))));
         }
 
         let (_, _, receiver_any) = self.output_receivers.remove(pos);
         receiver_any
             .downcast::<crate::dataflow::channel_operators::OutputReceiver<T, D>>()
             .map(|boxed| *boxed)
-            .map_err(|_| Error::Custom(format!(
+            .map_err(|_| Error::Runtime(RuntimeError::InvalidConfig(format!(
                 "output port '{name}' type downcast failed — if spawned with IoMode::Async, use take_async_output()"
-            )))
+            ))))
     }
 
     /// Take the async input sender for the named port (consumes it).
@@ -3668,13 +3652,13 @@ impl<T: Timestamp> SpawnedDataflow<T> {
             .input_senders
             .iter()
             .position(|(n, _, _)| n == name)
-            .ok_or_else(|| Error::Custom(format!("no input port named '{name}'")))?;
+            .ok_or_else(|| Error::Runtime(RuntimeError::InvalidConfig(format!("no input port named '{name}'"))))?;
 
         let (_, port_type, _) = &self.input_senders[pos];
         if *port_type != type_name {
-            return Err(Error::Custom(format!(
+            return Err(Error::Runtime(RuntimeError::InvalidConfig(format!(
                 "input port '{name}' has type {port_type}, but requested {type_name}"
-            )));
+            ))));
         }
 
         let (_, _, sender_any) = self.input_senders.remove(pos);
@@ -3682,9 +3666,9 @@ impl<T: Timestamp> SpawnedDataflow<T> {
             .downcast::<crate::dataflow::channel_operators::AsyncInputSender<T, D>>()
             .map(|boxed| *boxed)
             .map_err(|_| {
-                Error::Custom(format!(
+                Error::Runtime(RuntimeError::InvalidConfig(format!(
                     "input port '{name}' was not wired for async I/O (spawn with IoMode::Async)"
-                ))
+                )))
             })
     }
 
@@ -3712,13 +3696,13 @@ impl<T: Timestamp> SpawnedDataflow<T> {
             .output_receivers
             .iter()
             .position(|(n, _, _)| n == name)
-            .ok_or_else(|| Error::Custom(format!("no output port named '{name}'")))?;
+            .ok_or_else(|| Error::Runtime(RuntimeError::InvalidConfig(format!("no output port named '{name}'"))))?;
 
         let (_, port_type, _) = &self.output_receivers[pos];
         if *port_type != type_name {
-            return Err(Error::Custom(format!(
+            return Err(Error::Runtime(RuntimeError::InvalidConfig(format!(
                 "output port '{name}' has type {port_type}, but requested {type_name}"
-            )));
+            ))));
         }
 
         let (_, _, receiver_any) = self.output_receivers.remove(pos);
@@ -3726,9 +3710,9 @@ impl<T: Timestamp> SpawnedDataflow<T> {
             .downcast::<crate::dataflow::channel_operators::AsyncOutputReceiver<T, D>>()
             .map(|boxed| *boxed)
             .map_err(|_| {
-                Error::Custom(format!(
+                Error::Runtime(RuntimeError::InvalidConfig(format!(
                     "output port '{name}' was not wired for async I/O (spawn with IoMode::Async)"
-                ))
+                )))
             })
     }
 
@@ -3922,10 +3906,10 @@ impl<T: Timestamp> MultiSpawnedDataflow<T> {
         name: &str,
     ) -> Result<crate::dataflow::channel_operators::InputSender<T, D>> {
         if worker_idx >= self.num_workers {
-            return Err(Error::Custom(format!(
+            return Err(Error::Runtime(RuntimeError::InvalidConfig(format!(
                 "worker index {worker_idx} out of range (num_workers={})",
                 self.num_workers
-            )));
+            ))));
         }
         self.workers[worker_idx].take_input(name)
     }
@@ -3948,10 +3932,10 @@ impl<T: Timestamp> MultiSpawnedDataflow<T> {
         name: &str,
     ) -> Result<crate::dataflow::channel_operators::OutputReceiver<T, D>> {
         if worker_idx >= self.num_workers {
-            return Err(Error::Custom(format!(
+            return Err(Error::Runtime(RuntimeError::InvalidConfig(format!(
                 "worker index {worker_idx} out of range (num_workers={})",
                 self.num_workers
-            )));
+            ))));
         }
         self.workers[worker_idx].take_output(name)
     }
@@ -3976,10 +3960,10 @@ impl<T: Timestamp> MultiSpawnedDataflow<T> {
         name: &str,
     ) -> Result<crate::dataflow::channel_operators::AsyncInputSender<T, D>> {
         if worker_idx >= self.num_workers {
-            return Err(Error::Custom(format!(
+            return Err(Error::Runtime(RuntimeError::InvalidConfig(format!(
                 "worker index {worker_idx} out of range (num_workers={})",
                 self.num_workers
-            )));
+            ))));
         }
         self.workers[worker_idx].take_async_input(name)
     }
@@ -4006,10 +3990,10 @@ impl<T: Timestamp> MultiSpawnedDataflow<T> {
         name: &str,
     ) -> Result<crate::dataflow::channel_operators::AsyncOutputReceiver<T, D>> {
         if worker_idx >= self.num_workers {
-            return Err(Error::Custom(format!(
+            return Err(Error::Runtime(RuntimeError::InvalidConfig(format!(
                 "worker index {worker_idx} out of range (num_workers={})",
                 self.num_workers
-            )));
+            ))));
         }
         self.workers[worker_idx].take_async_output(name)
     }
@@ -4162,16 +4146,16 @@ impl<T: Timestamp> MultiSpawnedDataflow<T> {
         direction: &str,
     ) -> Result<()> {
         match ports.iter().find(|(n, _, _)| n == name) {
-            None => Err(Error::Custom(format!(
+            None => Err(Error::Runtime(RuntimeError::InvalidConfig(format!(
                 "worker {worker_idx} has no {direction} port named '{name}'"
-            ))),
-            Some((_, port_type, _)) if *port_type != type_name => Err(Error::Custom(format!(
+            )))),
+            Some((_, port_type, _)) if *port_type != type_name => Err(Error::Runtime(RuntimeError::InvalidConfig(format!(
                 "worker {worker_idx} {direction} port '{name}' has type {port_type}, but requested {type_name}"
-            ))),
-            Some((_, _, any_box)) if !any_box.is::<C>() => Err(Error::Custom(format!(
+            )))),
+            Some((_, _, any_box)) if !any_box.is::<C>() => Err(Error::Runtime(RuntimeError::InvalidConfig(format!(
                 "worker {worker_idx} {direction} port '{name}' channel mode mismatch \
                      (sync port with async take, or vice versa)"
-            ))),
+            )))),
             _ => Ok(()),
         }
     }
@@ -4372,7 +4356,7 @@ impl<T: Timestamp> ClusterSpawnedDataflow<T> {
     ) -> Result<crate::dataflow::channel_operators::InputSender<T, D>> {
         self.inner
             .as_mut()
-            .ok_or_else(|| Error::Custom("dataflow already joined".into()))?
+            .ok_or_else(|| Error::Runtime(RuntimeError::AlreadyConsumed { resource: "dataflow join handle".into() }))?
             .take_input(local_idx, name)
     }
 
@@ -4395,7 +4379,7 @@ impl<T: Timestamp> ClusterSpawnedDataflow<T> {
     ) -> Result<crate::dataflow::channel_operators::OutputReceiver<T, D>> {
         self.inner
             .as_mut()
-            .ok_or_else(|| Error::Custom("dataflow already joined".into()))?
+            .ok_or_else(|| Error::Runtime(RuntimeError::AlreadyConsumed { resource: "dataflow join handle".into() }))?
             .take_output(local_idx, name)
     }
 
@@ -4421,7 +4405,7 @@ impl<T: Timestamp> ClusterSpawnedDataflow<T> {
     ) -> Result<crate::dataflow::channel_operators::AsyncInputSender<T, D>> {
         self.inner
             .as_mut()
-            .ok_or_else(|| Error::Custom("dataflow already joined".into()))?
+            .ok_or_else(|| Error::Runtime(RuntimeError::AlreadyConsumed { resource: "dataflow join handle".into() }))?
             .take_async_input(local_idx, name)
     }
 
@@ -4449,7 +4433,7 @@ impl<T: Timestamp> ClusterSpawnedDataflow<T> {
     ) -> Result<crate::dataflow::channel_operators::AsyncOutputReceiver<T, D>> {
         self.inner
             .as_mut()
-            .ok_or_else(|| Error::Custom("dataflow already joined".into()))?
+            .ok_or_else(|| Error::Runtime(RuntimeError::AlreadyConsumed { resource: "dataflow join handle".into() }))?
             .take_async_output(local_idx, name)
     }
 
@@ -4485,7 +4469,7 @@ impl<T: Timestamp> ClusterSpawnedDataflow<T> {
         let completion = self
             .inner
             .take()
-            .ok_or_else(|| Error::Custom("dataflow already joined".into()))?
+            .ok_or_else(|| Error::Runtime(RuntimeError::AlreadyConsumed { resource: "dataflow join handle".into() }))?
             .join();
         // Transfer all resources to ClusterCompletion so bridges stay alive.
         // Setting _bridge_cancel_moved prevents Drop from firing it early.
@@ -4561,7 +4545,7 @@ impl<T: Timestamp> ClusterCompletion<T> {
         let completion = self
             .completion
             .take()
-            .ok_or_else(|| Error::Custom("cluster completion already consumed".into()))?;
+            .ok_or_else(|| Error::Runtime(RuntimeError::AlreadyConsumed { resource: "cluster completion".into() }))?;
         let result = completion.wait();
         // Cancel bridges eagerly so cleanup doesn't wait for handle drop.
         self._bridge_cancel.cancel();
@@ -4579,9 +4563,7 @@ impl<T: Timestamp> Future for ClusterCompletion<T> {
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         let this = self.get_mut();
         let Some(completion) = this.completion.as_mut() else {
-            return Poll::Ready(Err(Error::Custom(
-                "cluster completion already consumed".into(),
-            )));
+            return Poll::Ready(Err(Error::Runtime(RuntimeError::AlreadyConsumed { resource: "cluster completion".into() })));
         };
         let result = Pin::new(completion).poll(cx);
         if result.is_ready() {
@@ -4723,75 +4705,75 @@ fn validate_multi_worker_topologies<T: Timestamp>(dataflows: &[LogicalDataflow<T
         let mut ops: Vec<&OperatorInfo> = graph.operators().collect();
         ops.sort_by_key(|op| op.index);
         if ops.len() != ref_ops.len() {
-            return Err(Error::Custom(format!(
+            return Err(Error::Runtime(RuntimeError::InvalidConfig(format!(
                 "worker {i} has {} operators but worker 0 has {}",
                 ops.len(),
                 ref_ops.len()
-            )));
+            ))));
         }
 
         // Operator names, stages, and port counts must match at each index.
         for (j, (a, b)) in ref_ops.iter().zip(ops.iter()).enumerate() {
             if a.name != b.name {
-                return Err(Error::Custom(format!(
+                return Err(Error::Runtime(RuntimeError::InvalidConfig(format!(
                     "worker {i} operator {j} is named '{}' but worker 0 has '{}'",
                     b.name, a.name
-                )));
+                ))));
             }
             if a.stage_id != b.stage_id {
-                return Err(Error::Custom(format!(
+                return Err(Error::Runtime(RuntimeError::InvalidConfig(format!(
                     "worker {i} operator {j} ('{}') has stage {:?} but worker 0 has {:?}",
                     a.name, b.stage_id, a.stage_id
-                )));
+                ))));
             }
             if a.input_count != b.input_count || a.output_count != b.output_count {
-                return Err(Error::Custom(format!(
+                return Err(Error::Runtime(RuntimeError::InvalidConfig(format!(
                     "worker {i} operator {j} ('{}') has {}/{} in/out ports but worker 0 has {}/{}",
                     a.name, b.input_count, b.output_count, a.input_count, a.output_count
-                )));
+                ))));
             }
         }
 
         // Edge count and endpoints.
         let edges = graph.edges();
         if edges.len() != ref_edges.len() {
-            return Err(Error::Custom(format!(
+            return Err(Error::Runtime(RuntimeError::InvalidConfig(format!(
                 "worker {i} has {} edges but worker 0 has {}",
                 edges.len(),
                 ref_edges.len()
-            )));
+            ))));
         }
         for (j, (a, b)) in ref_edges.iter().zip(edges.iter()).enumerate() {
             if a.source != b.source || a.target != b.target {
-                return Err(Error::Custom(format!(
+                return Err(Error::Runtime(RuntimeError::InvalidConfig(format!(
                     "worker {i} edge {j} has {:?}->{:?} but worker 0 has {:?}->{:?}",
                     b.source, b.target, a.source, a.target
-                )));
+                ))));
             }
         }
 
         // Feedback edges.
         if graph.feedback_edges().len() != ref_feedback_count {
-            return Err(Error::Custom(format!(
+            return Err(Error::Runtime(RuntimeError::InvalidConfig(format!(
                 "worker {i} has {} feedback edges but worker 0 has {ref_feedback_count}",
                 graph.feedback_edges().len()
-            )));
+            ))));
         }
 
         // Input/output port names.
         let inputs = df.input_names();
         if inputs != ref_inputs {
-            return Err(Error::Custom(format!(
+            return Err(Error::Runtime(RuntimeError::InvalidConfig(format!(
                 "worker {i} has different input ports than worker 0: \
                  expected {ref_inputs:?}, got {inputs:?}"
-            )));
+            ))));
         }
         let outputs = df.output_names();
         if outputs != ref_outputs {
-            return Err(Error::Custom(format!(
+            return Err(Error::Runtime(RuntimeError::InvalidConfig(format!(
                 "worker {i} has different output ports than worker 0: \
                  expected {ref_outputs:?}, got {outputs:?}"
-            )));
+            ))));
         }
     }
     Ok(())
@@ -4824,13 +4806,13 @@ fn validate_stage_parallelism<T: Timestamp>(
     for stage in stages {
         if let Some(parallelism) = stage.parallelism {
             if parallelism != num_workers {
-                return Err(Error::Custom(format!(
+                return Err(Error::Runtime(RuntimeError::InvalidConfig(format!(
                     "stage {} has explicit parallelism {} but the runtime is spawning \
                      {} workers. Use `spawn_staged()` for heterogeneous per-stage \
                      parallelism, or set all explicit parallelism values equal to \
                      the spawned worker count.",
                     stage.id.0, parallelism, num_workers
-                )));
+                ))));
             }
         }
     }
@@ -7671,7 +7653,7 @@ mod tests {
         let input = builder.input::<i32>("data").unwrap();
 
         let logic = Arc::new(|_time: u64, _batch: Vec<i32>| async move {
-            Err(crate::error::Error::Custom("async failure".into()))
+            Err(Error::Runtime(RuntimeError::InvalidConfig("async failure".into())))
         });
 
         let _output = input

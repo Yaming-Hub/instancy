@@ -11,6 +11,8 @@
 
 use std::fmt;
 
+use crate::error::RuntimeError;
+
 /// A globally unique logical worker identity.
 ///
 /// Workers are numbered sequentially across all nodes in the cluster.
@@ -88,14 +90,14 @@ impl WorkerContext {
     /// callers should never need to create one directly.
     pub(crate) fn new(worker_index: usize, num_workers: usize) -> crate::Result<Self> {
         if num_workers == 0 {
-            return Err(crate::Error::InvalidConfig(
+            return Err(crate::Error::Runtime(RuntimeError::InvalidConfig(
                 "num_workers must be >= 1".into(),
-            ));
+            )));
         }
         if worker_index >= num_workers {
-            return Err(crate::Error::InvalidConfig(format!(
+            return Err(crate::Error::Runtime(RuntimeError::InvalidConfig(format!(
                 "worker_index ({worker_index}) must be < num_workers ({num_workers})"
-            )));
+            ))));
         }
         Ok(Self {
             worker_index,

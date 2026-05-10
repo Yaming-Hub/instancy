@@ -493,7 +493,7 @@ impl<T: Timestamp, D: Send + 'static> InputSender<T, D> {
     pub fn send(&self, time: T, data: Vec<D>) -> Result<()> {
         self.sender
             .send(InputEvent::data(time, data))
-            .map_err(|_| crate::error::Error::Custom("dataflow has terminated".into()))?;
+            .map_err(|_| crate::error::Error::ChannelClosed)?;
         if let Some(wh) = &self.wake_handle {
             wh.notify();
         }
@@ -518,7 +518,7 @@ impl<T: Timestamp, D: Send + 'static> InputSender<T, D> {
     pub fn advance_to(&self, time: T) -> Result<()> {
         self.sender
             .send(InputEvent::frontier(time))
-            .map_err(|_| crate::error::Error::Custom("dataflow has terminated".into()))?;
+            .map_err(|_| crate::error::Error::ChannelClosed)?;
         if let Some(wh) = &self.wake_handle {
             wh.notify();
         }
@@ -634,7 +634,7 @@ impl<T: Timestamp, D: Send + 'static> AsyncInputSender<T, D> {
         self.sender
             .send(InputEvent::data(time, data))
             .await
-            .map_err(|_| crate::error::Error::Custom("dataflow has terminated".into()))?;
+            .map_err(|_| crate::error::Error::ChannelClosed)?;
         if let Some(wh) = &self.wake_handle {
             wh.notify();
         }
@@ -660,7 +660,7 @@ impl<T: Timestamp, D: Send + 'static> AsyncInputSender<T, D> {
         self.sender
             .send(InputEvent::frontier(time))
             .await
-            .map_err(|_| crate::error::Error::Custom("dataflow has terminated".into()))?;
+            .map_err(|_| crate::error::Error::ChannelClosed)?;
         if let Some(wh) = &self.wake_handle {
             wh.notify();
         }

@@ -305,7 +305,7 @@ mod tests {
             |input1, _input2, _output| {
                 while let Some((_t, data)) = input1.next() {
                     if data.contains(&-1) {
-                        return Err(Error::Custom("bad value".into()));
+                        return Err(Error::operator("failing", std::io::Error::other("bad value")));
                     }
                 }
                 Ok(())

@@ -26,6 +26,7 @@ use std::collections::HashMap;
 
 use crate::communication::codec::{Codec, CodecError};
 use crate::communication::connection::PeerId;
+use crate::error::RuntimeError;
 use crate::execute::ClusterTopology;
 use crate::progress::timestamp::Timestamp;
 use crate::wire;
@@ -107,9 +108,9 @@ impl RoutingTable {
         peer_map: &HashMap<String, PeerId>,
     ) -> crate::Result<Self> {
         if base_channel_id == PROGRESS_CHANNEL_ID {
-            return Err(crate::Error::InvalidConfig(
+            return Err(crate::Error::Runtime(RuntimeError::ClusterSetup(
                 "base_channel_id must be > 0 (channel 0 is reserved for progress)".into(),
-            ));
+            )));
         }
 
         let local_node_id = local_node_id.into();

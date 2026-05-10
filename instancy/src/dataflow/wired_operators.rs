@@ -1844,6 +1844,7 @@ impl<T: Timestamp, D1: Send + 'static, D2: Send + 'static> WiredUnaryAsyncOperat
                 let tx = self.result_tx.clone();
                 let time_for_logic = time.clone();
                 let wake = self.wake_handle.clone();
+                let operator_name = self.name.clone();
                 // Use a nested spawn to catch panics: the outer task awaits the
                 // inner JoinHandle, which converts panics into JoinError.
                 let handle = self.tokio_handle.clone();
@@ -1852,9 +1853,11 @@ impl<T: Timestamp, D1: Send + 'static, D2: Send + 'static> WiredUnaryAsyncOperat
                     let result = match inner.await {
                         Ok(Ok(output)) => Ok(output),
                         Ok(Err(e)) => Err(e),
-                        Err(join_err) => Err(Error::Custom(format!(
-                            "unary_async task panicked: {join_err}"
-                        ))),
+                        Err(join_err) => Err(Error::OperatorPanic {
+                            operator: operator_name,
+                            worker_index: None,
+                            message: format!("unary_async task panicked: {join_err}"),
+                        }),
                     };
                     let _ = tx.send(result.map(|output| (time, output)));
                     // Wake the executor so it re-activates this operator to

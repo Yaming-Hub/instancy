@@ -42,7 +42,7 @@ use crate::communication::codec::{Codec, CodecError, ExchangeData};
 use crate::dataflow::channels::edge_materializer::EdgeMaterializer;
 use crate::dataflow::channels::envelope::{ControlSignal, Envelope, Payload};
 use crate::dataflow::channels::pushpull::{Pull, Push};
-use crate::error::{Error, Result};
+use crate::error::{DataflowError, Error, Result};
 use crate::execute::ClusterTopology;
 use crate::progress::timestamp::Timestamp;
 use crate::wire;
@@ -95,7 +95,7 @@ impl ByteSender {
         let mut state = self
             .state
             .lock()
-            .map_err(|_| Error::Custom("poisoned".into()))?;
+            .map_err(|_| Error::LockPoisoned { context: "mock network byte channel".into() })?;
         if state.closed {
             return Err(Error::ChannelClosed);
         }
@@ -337,7 +337,7 @@ impl<T: Timestamp + ExchangeData, D: ExchangeData> SerializingPush<T, D> {
     ) -> std::result::Result<Vec<u8>, Error> {
         let mut buf = Vec::new();
         encode_envelope(&self.time_codec, &self.data_codec, envelope, &mut buf)
-            .map_err(|e| Error::Custom(format!("mock network encode: {e}")))?;
+            .map_err(|e| Error::Dataflow(DataflowError::InvalidGraph(format!("mock network encode: {e}"))))?;
         Ok(buf)
     }
 }
@@ -533,17 +533,17 @@ impl<T: Timestamp + ExchangeData, D: ExchangeData> EdgeMaterializer<T, D>
         src_idx: usize,
     ) -> Result<Vec<Box<dyn Push<T, D, ()>>>> {
         if src_idx >= self.num_workers {
-            return Err(Error::Custom(format!(
+            return Err(Error::Dataflow(DataflowError::InvalidGraph(format!(
                 "source index {src_idx} out of range (num_workers={})",
                 self.num_workers
-            )));
+            ))));
         }
 
         let mut pushers: Vec<Box<dyn Push<T, D, ()>>> = Vec::with_capacity(self.num_workers);
         for dst in 0..self.num_workers {
             let sender = self.senders[src_idx][dst]
                 .take()
-                .ok_or_else(|| Error::Custom(format!("sender [{src_idx}][{dst}] already taken")))?;
+                .ok_or_else(|| Error::Dataflow(DataflowError::EndpointTaken(format!("sender [{src_idx}][{dst}] already taken"))))?;
             pushers.push(Box::new(SerializingPush::<T, D>::new(sender)));
         }
         Ok(pushers)
@@ -554,16 +554,16 @@ impl<T: Timestamp + ExchangeData, D: ExchangeData> EdgeMaterializer<T, D>
         dst_idx: usize,
     ) -> Result<Vec<Box<dyn Pull<T, D, ()>>>> {
         if dst_idx >= self.num_workers {
-            return Err(Error::Custom(format!(
+            return Err(Error::Dataflow(DataflowError::InvalidGraph(format!(
                 "target index {dst_idx} out of range (num_workers={})",
                 self.num_workers
-            )));
+            ))));
         }
 
         let mut pullers: Vec<Box<dyn Pull<T, D, ()>>> = Vec::with_capacity(self.num_workers);
         for src in 0..self.num_workers {
             let receiver = self.receivers[src][dst_idx].take().ok_or_else(|| {
-                Error::Custom(format!("receiver [{src}][{dst_idx}] already taken"))
+                Error::Dataflow(DataflowError::EndpointTaken(format!("receiver [{src}][{dst_idx}] already taken")))
             })?;
             pullers.push(Box::new(DeserializingPull::<T, D>::new(receiver)));
         }
@@ -575,15 +575,15 @@ impl<T: Timestamp + ExchangeData, D: ExchangeData> EdgeMaterializer<T, D>
         worker_idx: usize,
     ) -> Result<(Vec<Box<dyn Push<T, D, ()>>>, Vec<Box<dyn Pull<T, D, ()>>>)> {
         if worker_idx >= self.num_workers {
-            return Err(Error::Custom(format!(
+            return Err(Error::Dataflow(DataflowError::InvalidGraph(format!(
                 "worker index {worker_idx} out of range (num_workers={})",
                 self.num_workers
-            )));
+            ))));
         }
         if self.taken[worker_idx] {
-            return Err(Error::Custom(format!(
+            return Err(Error::Dataflow(DataflowError::InvalidGraph(format!(
                 "worker {worker_idx} already materialized"
-            )));
+            ))));
         }
         self.taken[worker_idx] = true;
 

@@ -7,7 +7,7 @@
 use std::fmt;
 use std::sync::{Arc, Mutex};
 
-use crate::error::Result;
+use crate::error::{DataflowError, Result};
 use crate::order::Product;
 use crate::progress::timestamp::Timestamp;
 
@@ -131,10 +131,10 @@ impl<T: Timestamp> RootScope<T> {
             state.current_stage_id = id;
             Ok(())
         } else {
-            Err(crate::error::Error::Custom(format!(
+            Err(crate::error::Error::Dataflow(DataflowError::InvalidGraph(format!(
                 "Stage {} not found in scope '{}'",
                 id, self.name
-            )))
+            ))))
         }
     }
 

@@ -32,7 +32,7 @@ fn dataflow_result_success() {
 fn dataflow_result_failure() {
     let metrics = Arc::new(DataflowMetrics::new("fail_df"));
     let result: DataflowResult<()> = DataflowResult::new(
-        Err(instancy::error::Error::Custom("boom".into())),
+        Err(instancy::error::RuntimeError::EmptyDataflow.into()),
         metrics.clone(),
     );
     assert!(!result.is_ok());

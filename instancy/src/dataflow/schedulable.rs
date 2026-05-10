@@ -11,7 +11,7 @@
 //! dataflow materialization and owned by the [`DataflowExecutor`](super::executor::DataflowExecutor).
 
 use crate::dataflow::stage::StageId;
-use crate::error::Result;
+use crate::error::{Result, RuntimeError};
 use crate::worker::WorkerContext;
 
 // ---------------------------------------------------------------------------
@@ -217,7 +217,7 @@ impl OperatorBlueprint for SingleUseFactory {
         endpoints: ChannelEndpoints,
     ) -> crate::Result<Box<dyn SchedulableOperator>> {
         let factory = self.0.take().ok_or_else(|| {
-            crate::Error::Custom("SingleUseFactory::build() called more than once".into())
+            crate::Error::Runtime(RuntimeError::AlreadyConsumed { resource: "SingleUseFactory".into() })
         })?;
         factory(ctx, endpoints)
     }

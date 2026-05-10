@@ -46,7 +46,7 @@ use crate::dataflow::channels::wake::WakeHandle;
 #[cfg(feature = "transport")]
 use crate::dataflow::id::DataflowId;
 #[cfg(feature = "transport")]
-use crate::error::LockResultExt;
+use crate::error::{DataflowError, LockResultExt};
 #[cfg(feature = "transport")]
 use crate::progress::progress_channel::{
     ProgressChange, ProgressReceiver, ProgressSender, SharedBuffer, WorkerProgressChannels,
@@ -365,10 +365,14 @@ pub fn progress_channel_id(
         .checked_mul(num_workers as u64)
         .and_then(|v| v.checked_add(target as u64))
         .ok_or_else(|| {
-            crate::Error::InvalidConfig("progress_channel_id overflow: too many workers".into())
+            crate::Error::Dataflow(DataflowError::InvalidConfig(
+                "progress_channel_id overflow: too many workers".into(),
+            ))
         })?;
     PROGRESS_CHANNEL_BASE.checked_add(offset).ok_or_else(|| {
-        crate::Error::InvalidConfig("progress_channel_id overflow: exceeds u64 range".into())
+        crate::Error::Dataflow(DataflowError::InvalidConfig(
+            "progress_channel_id overflow: exceeds u64 range".into(),
+        ))
     })
 }
 

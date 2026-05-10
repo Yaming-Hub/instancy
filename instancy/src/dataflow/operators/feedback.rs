@@ -31,6 +31,7 @@ use crate::dataflow::stage::StageId;
 use crate::dataflow::stream::{Slot, StreamEdge};
 use crate::order::Product;
 use crate::progress::timestamp::Timestamp;
+use crate::error::DataflowError;
 
 // ============================================================================
 // Scope boundary metadata
@@ -100,7 +101,9 @@ impl<S: Scope, D: 'static> EnterExt<S, D> for StreamEdge<S, D> {
 
         // Update the parent graph: the child scope operator receives this data.
         let child_index = child.addr().parts().last().copied().ok_or_else(|| {
-            crate::Error::InvalidConfig("enter() requires a parent scope address".into())
+            crate::Error::Dataflow(DataflowError::InvalidConfig(
+                "enter() requires a parent scope address".into(),
+            ))
         })?;
         let mut parent_scope = self.scope().clone();
         parent_scope.increment_operator_input_count(child_index);
@@ -150,7 +153,9 @@ where
         // In the parent, the stream comes from the subscope operator (identified by
         // the child scope's position in the parent's operator index space).
         let parent_op_index = self.scope().addr().parts().last().copied().ok_or_else(|| {
-            crate::Error::InvalidConfig("leave() requires a parent scope address".into())
+            crate::Error::Dataflow(DataflowError::InvalidConfig(
+                "leave() requires a parent scope address".into(),
+            ))
         })?;
         let parent_source = Slot::new(parent_op_index, slot_index);
         let stage_id = parent.current_stage_id();
