@@ -972,7 +972,9 @@ impl<T: Timestamp> DataflowBuilder<T> {
             stages,
             catch_panics: state.catch_panics,
             collect_metrics: false,
+            channel_counters: false,
             drain_timeout: None,
+            channel_metrics_collectors: Vec::new(),
         })
     }
 }
@@ -4765,9 +4767,18 @@ pub struct LogicalDataflow<T: Timestamp> {
     /// Whether to collect per-operator metrics (see [`ExecutorConfig::collect_metrics`]).
     /// Set by SpawnOptions at spawn time.
     pub(crate) collect_metrics: bool,
+    /// Whether to collect per-exchange-edge channel counters
+    /// (see [`ExecutorConfig::channel_counters`]). Set by SpawnOptions at spawn time.
+    pub(crate) channel_counters: bool,
     /// Graceful drain timeout (see [`ExecutorConfig::drain_timeout`]).
     /// Set by SpawnOptions at spawn time.
     pub(crate) drain_timeout: Option<std::time::Duration>,
+    /// Pre-created channel metrics collectors for exchange edges.
+    /// Populated by `spawn_multi` Phase 3 when `channel_counters` is enabled.
+    /// These are shared across all workers and registered in each worker's
+    /// `DataflowMetrics` during executor materialization.
+    pub(crate) channel_metrics_collectors:
+        Vec<std::sync::Arc<crate::metrics::ChannelMetricsCollector>>,
 }
 
 impl<T: Timestamp> LogicalDataflow<T> {

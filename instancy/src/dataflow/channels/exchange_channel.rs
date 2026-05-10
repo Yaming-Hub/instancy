@@ -313,6 +313,8 @@ pub struct ExchangePush<T: Timestamp, D: Send + 'static> {
     closed: bool,
     /// Reusable per-target buckets to avoid allocation on every push.
     buckets: Vec<Vec<D>>,
+    /// Optional channel metrics collector (enabled via `MetricsConfig::channel_counters`).
+    channel_metrics: Option<Arc<crate::metrics::ChannelMetricsCollector>>,
 }
 
 impl<T: Timestamp, D: Send + 'static> ExchangePush<T, D> {
@@ -331,6 +333,27 @@ impl<T: Timestamp, D: Send + 'static> ExchangePush<T, D> {
             wakes,
             closed: false,
             buckets,
+            channel_metrics: None,
+        }
+    }
+
+    /// Create a new exchange push endpoint with channel metrics collection.
+    pub(crate) fn with_metrics(
+        targets: Vec<Box<dyn Push<T, D, ()>>>,
+        exchange_fn: ExchangeFn<D>,
+        wakes: Arc<SharedWakeRegistry>,
+        channel_metrics: Arc<crate::metrics::ChannelMetricsCollector>,
+    ) -> Self {
+        let num_targets = targets.len();
+        let buckets = (0..num_targets).map(|_| Vec::new()).collect();
+        Self {
+            targets,
+            exchange_fn,
+            num_targets,
+            wakes,
+            closed: false,
+            buckets,
+            channel_metrics: Some(channel_metrics),
         }
     }
 }
@@ -348,6 +371,9 @@ impl<T: Timestamp, D: Clone + Send + 'static> Push<T, D> for ExchangePush<T, D> 
 
         match envelope.payload {
             Payload::Data { time, data } => {
+                // Count items before partitioning (data is consumed by the loop).
+                let data_len = data.len();
+
                 // Partition records into reusable per-target buckets.
                 for record in data {
                     let hash = self.exchange_fn.route(&record);
@@ -371,6 +397,13 @@ impl<T: Timestamp, D: Clone + Send + 'static> Push<T, D> for ExchangePush<T, D> 
                             }
                         }
                     }
+                }
+
+                // Record channel metrics after successful delivery.
+                if let Some(ref metrics) = self.channel_metrics {
+                    let items = data_len as u64;
+                    let bytes = (items as usize * std::mem::size_of::<D>()) as u64;
+                    metrics.record_push(items, bytes);
                 }
             }
             Payload::Control(signal) => {
@@ -470,6 +503,13 @@ impl<T: Timestamp, D: Clone + Send + 'static> Push<T, D> for ExchangePush<T, D> 
                             }
                         }
                     }
+                }
+
+                // Record channel metrics after successful delivery.
+                if let Some(ref metrics) = self.channel_metrics {
+                    let items = data.len() as u64;
+                    let bytes = (items as usize * std::mem::size_of::<D>()) as u64;
+                    metrics.record_push(items, bytes);
                 }
             }
             Payload::Control(signal) => {
@@ -1000,10 +1040,18 @@ impl<T: Timestamp, D: Send + 'static> Pull<T, D> for ExchangePull<T, D> {
 /// [`LogicalDataflow`], and consumed by `spawn_multi` to produce channel
 /// factories that all reference the same underlying channel infrastructure.
 ///
-/// Parameters: `(num_source_workers, num_target_workers, capacity)`.
+/// Parameters: `(num_source_workers, num_target_workers, capacity, channel_metrics)`.
 /// For symmetric exchanges (most common), pass the same value for both counts.
-pub(crate) type ExchangeFactoryCreatorFn =
-    Box<dyn FnOnce(usize, usize, usize) -> Vec<super::super::schedulable::ChannelFactory> + Send>;
+/// Pass `None` for `channel_metrics` when channel counters are disabled.
+pub(crate) type ExchangeFactoryCreatorFn = Box<
+    dyn FnOnce(
+            usize,
+            usize,
+            usize,
+            Option<Arc<crate::metrics::ChannelMetricsCollector>>,
+        ) -> Vec<super::super::schedulable::ChannelFactory>
+        + Send,
+>;
 
 /// Create a type-erased exchange factory creator using the default local
 /// transport ([`LocalEdgeMaterializer`]).
@@ -1019,7 +1067,10 @@ where
     D: Clone + Send + 'static,
 {
     Box::new(
-        move |num_source_workers: usize, num_target_workers: usize, capacity: usize| {
+        move |num_source_workers: usize,
+              num_target_workers: usize,
+              capacity: usize,
+              channel_metrics: Option<Arc<crate::metrics::ChannelMetricsCollector>>| {
             let materializer = Arc::new(Mutex::new(
                 super::edge_materializer::LocalEdgeMaterializer::<T, D>::new_asymmetric(
                     num_source_workers,
@@ -1032,6 +1083,7 @@ where
                 num_target_workers,
                 exchange_fn,
                 materializer,
+                channel_metrics,
             )
         },
     )
@@ -1061,6 +1113,8 @@ pub(crate) struct NetworkMaterializerParams {
     pub wake_handles: Vec<crate::dataflow::channels::wake::WakeHandle>,
     /// Tokio runtime handle for spawning bridge tasks.
     pub runtime_handle: tokio::runtime::Handle,
+    /// Optional channel metrics collector for this exchange edge.
+    pub channel_metrics: Option<Arc<crate::metrics::ChannelMetricsCollector>>,
 }
 
 /// Trait for creating network-backed exchange channel factories.
@@ -1117,6 +1171,7 @@ where
             params.num_workers,
             self.exchange_fn,
             materializer,
+            params.channel_metrics,
         )
     }
 }
@@ -1182,6 +1237,7 @@ fn build_exchange_factories<T, D>(
     num_target_workers: usize,
     exchange_fn: ExchangeFn<D>,
     materializer: Arc<Mutex<dyn super::edge_materializer::EdgeMaterializer<T, D>>>,
+    channel_metrics: Option<Arc<crate::metrics::ChannelMetricsCollector>>,
 ) -> Vec<super::super::schedulable::ChannelFactory>
 where
     T: Timestamp,
@@ -1219,6 +1275,7 @@ where
             let wakes = wakes.clone();
             let materializer = materializer.clone();
             let exchange_fn = exchange_fn.clone();
+            let ch_metrics = channel_metrics.clone();
             let m = num_source_workers;
             let n = num_target_workers;
             super::super::schedulable::channel_factory(
@@ -1245,7 +1302,16 @@ where
                     drop(mat);
 
                     let _ = ctx;
-                    let push = ExchangePush::new(pushers, exchange_fn.clone(), wakes.clone());
+                    let push = if let Some(ref metrics) = ch_metrics {
+                        ExchangePush::with_metrics(
+                            pushers,
+                            exchange_fn.clone(),
+                            wakes.clone(),
+                            Arc::clone(metrics),
+                        )
+                    } else {
+                        ExchangePush::new(pushers, exchange_fn.clone(), wakes.clone())
+                    };
                     let pull = ExchangePull::new(pullers, wakes.clone());
 
                     Ok((
@@ -1270,7 +1336,10 @@ where
     D: Clone + Send + 'static,
 {
     Box::new(
-        move |num_source_workers: usize, num_target_workers: usize, capacity: usize| {
+        move |num_source_workers: usize,
+              num_target_workers: usize,
+              capacity: usize,
+              _channel_metrics: Option<Arc<crate::metrics::ChannelMetricsCollector>>| {
             let materializer = Arc::new(Mutex::new(
                 super::edge_materializer::LocalEdgeMaterializer::<T, D>::new_asymmetric(
                     num_source_workers,
