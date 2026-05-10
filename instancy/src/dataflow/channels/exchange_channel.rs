@@ -307,6 +307,8 @@ pub struct ExchangePush<T: Timestamp, D: Send + 'static> {
     wakes: Arc<SharedWakeRegistry>,
     /// Whether this push endpoint has been closed.
     closed: bool,
+    /// Reusable per-target buckets to avoid allocation on every push.
+    buckets: Vec<Vec<D>>,
 }
 
 impl<T: Timestamp, D: Send + 'static> ExchangePush<T, D> {
@@ -317,12 +319,14 @@ impl<T: Timestamp, D: Send + 'static> ExchangePush<T, D> {
         wakes: Arc<SharedWakeRegistry>,
     ) -> Self {
         let num_targets = targets.len();
+        let buckets = (0..num_targets).map(|_| Vec::new()).collect();
         Self {
             targets,
             exchange_fn,
             num_targets,
             wakes,
             closed: false,
+            buckets,
         }
     }
 }
@@ -340,17 +344,17 @@ impl<T: Timestamp, D: Clone + Send + 'static> Push<T, D> for ExchangePush<T, D> 
 
         match envelope.payload {
             Payload::Data { time, data } => {
-                // Partition records by target worker.
-                let mut buckets: Vec<Vec<D>> = (0..self.num_targets).map(|_| Vec::new()).collect();
+                // Partition records into reusable per-target buckets.
                 for record in data {
                     let hash = self.exchange_fn.route(&record);
                     let target = ExchangeFn::<D>::target_worker(hash, self.num_targets);
-                    buckets[target].push(record);
+                    self.buckets[target].push(record);
                 }
 
                 // Push non-empty buckets and wake target workers.
-                for (target_idx, bucket) in buckets.into_iter().enumerate() {
-                    if !bucket.is_empty() {
+                for target_idx in 0..self.num_targets {
+                    if !self.buckets[target_idx].is_empty() {
+                        let bucket = std::mem::take(&mut self.buckets[target_idx]);
                         self.targets[target_idx].push(Envelope::data(time.clone(), bucket))?;
                         self.wakes.wake(target_idx);
                     }
@@ -394,12 +398,11 @@ impl<T: Timestamp, D: Clone + Send + 'static> Push<T, D> for ExchangePush<T, D> 
 
         match &envelope.payload {
             Payload::Data { time, data } => {
-                // Partition records by target worker.
-                let mut buckets: Vec<Vec<D>> = (0..self.num_targets).map(|_| Vec::new()).collect();
+                // Partition records into reusable per-target buckets.
                 for record in data {
                     let hash = self.exchange_fn.route(record);
                     let target = ExchangeFn::<D>::target_worker(hash, self.num_targets);
-                    buckets[target].push(record.clone());
+                    self.buckets[target].push(record.clone());
                 }
 
                 // Pre-check ALL targets for capacity before pushing anything.
@@ -411,15 +414,18 @@ impl<T: Timestamp, D: Clone + Send + 'static> Push<T, D> for ExchangePush<T, D> 
                 // future network channels) are assumed to have capacity.
                 // This is safe because network-backed Push implementations
                 // buffer internally and their try_push handles backpressure.
-                for (target_idx, bucket) in buckets.iter().enumerate() {
-                    if bucket.is_empty() {
+                for target_idx in 0..self.num_targets {
+                    if self.buckets[target_idx].is_empty() {
                         continue;
                     }
                     if self.targets[target_idx].is_closed() {
+                        // Clear buckets before returning.
+                        for b in &mut self.buckets { b.clear(); }
                         return Err((Error::ChannelClosed, envelope));
                     }
                     if let Some(available) = self.targets[target_idx].available_capacity() {
                         if available == 0 {
+                            for b in &mut self.buckets { b.clear(); }
                             return Err((Error::Backpressure, envelope));
                         }
                     }
@@ -431,13 +437,16 @@ impl<T: Timestamp, D: Clone + Send + 'static> Push<T, D> for ExchangePush<T, D> 
                 // this is effectively atomic. If it fails anyway (e.g.,
                 // future concurrent access), we accept partial delivery
                 // as a last resort.
-                for (target_idx, bucket) in buckets.into_iter().enumerate() {
-                    if !bucket.is_empty() {
+                for target_idx in 0..self.num_targets {
+                    if !self.buckets[target_idx].is_empty() {
+                        let bucket = std::mem::take(&mut self.buckets[target_idx]);
                         match self.targets[target_idx]
                             .try_push(Envelope::data(time.clone(), bucket))
                         {
                             Ok(()) => self.wakes.wake(target_idx),
                             Err((err, _sub)) => {
+                                // Clear remaining buckets.
+                                for b in &mut self.buckets { b.clear(); }
                                 return Err((err, envelope));
                             }
                         }
