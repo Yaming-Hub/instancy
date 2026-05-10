@@ -306,6 +306,10 @@ pub struct SharedPeerManager {
     reg_state: Arc<TokioMutex<RegistrationState>>,
     /// Reorder buffers keyed by (dataflow_id) — one per payload lane.
     reorder_buffers: Arc<TokioMutex<HashMap<DataflowId, ReorderBuffer<Frame>>>>,
+    /// Per-dataflow dispatch locks — serializes "drain reorder buffer → send to
+    /// channel" so two reader_tasks cannot interleave dispatches for the same
+    /// dataflow (which would break delivery order).
+    dispatch_locks: Arc<TokioMutex<HashMap<DataflowId, Arc<TokioMutex<()>>>>>,
     /// Scaling driver for RTT probing.
     scaling_driver: Arc<ScalingDriver>,
     /// Probe counter for generating probe sequence IDs.
@@ -366,6 +370,8 @@ impl SharedPeerManager {
                 completed: HashSet::new(),
             }));
         let reorder_buffers = Arc::new(TokioMutex::new(HashMap::new()));
+        let dispatch_locks: Arc<TokioMutex<HashMap<DataflowId, Arc<TokioMutex<()>>>>> =
+            Arc::new(TokioMutex::new(HashMap::new()));
         let init_lock = Arc::new(TokioMutex::new(()));
         let task_handles = Arc::new(Mutex::new(Vec::new()));
         let writer_channels = Arc::new(TokioMutex::new(HashMap::new()));
@@ -397,6 +403,7 @@ impl SharedPeerManager {
             writer_channels.clone(),
             reg_state.clone(),
             reorder_buffers.clone(),
+            dispatch_locks.clone(),
             scaling_driver.clone(),
             failure_tx.clone(),
             task_handles.clone(),
@@ -425,6 +432,7 @@ impl SharedPeerManager {
             writer_channels,
             reg_state,
             reorder_buffers,
+            dispatch_locks,
             scaling_driver,
             probe_counter,
             connection_factory,
@@ -532,11 +540,15 @@ impl SharedPeerManager {
             }
         }
 
-        // Create reorder buffer for this dataflow's payload lane
+        // Create reorder buffer and dispatch lock for this dataflow's payload lane
         self.reorder_buffers.lock().await.insert(
             dataflow_id,
             ReorderBuffer::with_capacity(self.config.reorder_timeout, 4096),
         );
+        self.dispatch_locks
+            .lock()
+            .await
+            .insert(dataflow_id, Arc::new(TokioMutex::new(())));
 
         (receivers, error_rx)
     }
@@ -567,6 +579,7 @@ impl SharedPeerManager {
                 self.writer_channels.clone(),
                 self.reg_state.clone(),
                 self.reorder_buffers.clone(),
+                self.dispatch_locks.clone(),
                 self.scaling_driver.clone(),
                 self.failure_tx.clone(),
                 self.task_handles.clone(),
@@ -602,6 +615,7 @@ impl SharedPeerManager {
             state.completed.insert(*dataflow_id);
         }
         self.reorder_buffers.lock().await.remove(dataflow_id);
+        self.dispatch_locks.lock().await.remove(dataflow_id);
     }
 
     /// Get the payload sender for submitting data/progress frames.
@@ -634,6 +648,7 @@ impl SharedPeerManager {
         writer_channels: Arc<TokioMutex<HashMap<usize, tokio_mpsc::Sender<Frame>>>>,
         reg_state: Arc<TokioMutex<RegistrationState>>,
         reorder_buffers: Arc<TokioMutex<HashMap<DataflowId, ReorderBuffer<Frame>>>>,
+        dispatch_locks: Arc<TokioMutex<HashMap<DataflowId, Arc<TokioMutex<()>>>>>,
         scaling_driver: Arc<ScalingDriver>,
         failure_tx: tokio_mpsc::Sender<usize>,
         task_handles: Arc<Mutex<Vec<tokio::task::JoinHandle<()>>>>,
@@ -660,6 +675,7 @@ impl SharedPeerManager {
             reader,
             reg_state,
             reorder_buffers,
+            dispatch_locks,
             scaling_driver,
             pool,
             writer_channels,
@@ -892,6 +908,7 @@ impl SharedPeerManager {
         reader: R,
         reg_state: Arc<TokioMutex<RegistrationState>>,
         reorder_buffers: Arc<TokioMutex<HashMap<DataflowId, ReorderBuffer<Frame>>>>,
+        dispatch_locks: Arc<TokioMutex<HashMap<DataflowId, Arc<TokioMutex<()>>>>>,
         scaling_driver: Arc<ScalingDriver>,
         pool: Arc<PeerPool>,
         writer_channels: Arc<TokioMutex<HashMap<usize, tokio_mpsc::Sender<Frame>>>>,
@@ -981,7 +998,23 @@ impl SharedPeerManager {
                                     ready.len(),
                                     "InsertResult::Ready count must match drain_ready length"
                                 );
-                                drop(buffers); // release lock before dispatching
+
+                                // Acquire per-dataflow dispatch lock BEFORE releasing the
+                                // reorder buffer lock. This guarantees that two reader_tasks
+                                // draining batches for the same dataflow will dispatch in
+                                // the order they drained — preventing the race where a later
+                                // batch (higher seq IDs) is sent to the channel before an
+                                // earlier batch.
+                                let dispatch_guard = {
+                                    let locks = dispatch_locks.lock().await;
+                                    locks.get(&frame.dataflow_id).cloned()
+                                };
+                                let _dispatch = match &dispatch_guard {
+                                    Some(lock) => Some(lock.lock().await),
+                                    None => None,
+                                };
+
+                                drop(buffers); // release reorder lock after dispatch lock acquired
 
                                 // Clone senders under lock, then release before awaiting
                                 let senders = {
@@ -1130,6 +1163,7 @@ impl SharedPeerManager {
         writer_channels: Arc<TokioMutex<HashMap<usize, tokio_mpsc::Sender<Frame>>>>,
         reg_state: Arc<TokioMutex<RegistrationState>>,
         reorder_buffers: Arc<TokioMutex<HashMap<DataflowId, ReorderBuffer<Frame>>>>,
+        dispatch_locks: Arc<TokioMutex<HashMap<DataflowId, Arc<TokioMutex<()>>>>>,
         scaling_driver: Arc<ScalingDriver>,
         failure_tx: tokio_mpsc::Sender<usize>,
         task_handles: Arc<Mutex<Vec<tokio::task::JoinHandle<()>>>>,
@@ -1147,6 +1181,7 @@ impl SharedPeerManager {
                         writer_channels.clone(),
                         reg_state.clone(),
                         reorder_buffers.clone(),
+                        dispatch_locks.clone(),
                         scaling_driver.clone(),
                         failure_tx.clone(),
                         task_handles.clone(),
@@ -1199,6 +1234,7 @@ impl SharedPeerManager {
                             writer_channels.clone(),
                             reg_state.clone(),
                             reorder_buffers.clone(),
+                            dispatch_locks.clone(),
                             scaling_driver.clone(),
                             failure_tx.clone(),
                             task_handles.clone(),
