@@ -54,6 +54,10 @@ fn shared_config(num_connections: usize) -> SharedConnectionConfig {
     }
 }
 
+fn health_tx() -> tokio::sync::broadcast::Sender<instancy::RuntimeEvent> {
+    tokio::sync::broadcast::channel(16).0
+}
+
 struct PreEstablishedFactory {
     connections: Mutex<
         VecDeque<(
@@ -261,6 +265,7 @@ fn bench_shared_single_dataflow(c: &mut Criterion) {
                         shared_config(1),
                         factory,
                         &handle,
+                        health_tx(),
                     )
                     .unwrap();
 
@@ -495,6 +500,7 @@ fn bench_shared_multi_dataflow(c: &mut Criterion) {
                         shared_config(num_conns),
                         factory,
                         &handle,
+                        health_tx(),
                     )
                     .unwrap();
 
@@ -612,6 +618,7 @@ fn bench_shared_scaling_connections(c: &mut Criterion) {
                         shared_config(n_conns),
                         factory,
                         &handle,
+                        health_tx(),
                     )
                     .unwrap();
 

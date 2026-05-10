@@ -19,6 +19,10 @@ use instancy::communication::shared_transport::{
 use instancy::communication::transport::Frame;
 use instancy::dataflow::id::DataflowId;
 
+fn health_tx() -> tokio::sync::broadcast::Sender<instancy::RuntimeEvent> {
+    tokio::sync::broadcast::channel(16).0
+}
+
 #[derive(Default)]
 struct EchoConnectionFactory {
     remote_tasks: Mutex<Vec<tokio::task::JoinHandle<()>>>,
@@ -86,7 +90,7 @@ async fn main() {
 
     // Create shared peer manager for node-a → node-b
     let manager =
-        SharedPeerManager::new("node-b".to_string(), config, connection_factory, &handle).unwrap();
+        SharedPeerManager::new("node-b".to_string(), config, connection_factory, &handle, health_tx()).unwrap();
 
     println!(
         "Created SharedPeerManager with {} eager connections to node-b\n",

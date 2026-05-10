@@ -58,6 +58,7 @@ pub mod order;
 pub mod progress;
 pub mod providers;
 pub mod runtime;
+pub mod runtime_event;
 pub mod scheduler;
 pub(crate) mod wire;
 pub mod worker;
@@ -89,6 +90,7 @@ pub use runtime::{
     DataflowCompletion, IoMode, MultiDataflowCompletion, MultiSpawnedDataflow, RuntimeConfig,
     RuntimeHandle, SpawnOptions, SpawnedDataflow, TokioMode,
 };
+pub use runtime_event::RuntimeEvent;
 
 // Execution / cluster topology / membership
 pub use execute::{

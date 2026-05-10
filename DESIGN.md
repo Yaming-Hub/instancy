@@ -2868,6 +2868,114 @@ When adding new error variants, follow these rules:
 - The `execute()` function collects errors from all worker tasks and returns them.
 - **No panics** in library code. All `unwrap()` calls replaced with `?` or explicit error handling.
 
+### 8.4 Poisoned Lock Handling
+
+Rust `Mutex`/`RwLock` become **poisoned** when a thread panics while holding the
+lock. instancy handles poison errors using five patterns, chosen based on the
+lock's scope and the caller's ability to propagate errors.
+
+#### 8.4.1 `or_poison()` Extension Trait
+
+The `LockResultExt::or_poison(context)` trait method converts
+`PoisonError<T>` → `Error::LockPoisoned { context }`. It is the preferred
+conversion mechanism for all lock sites that can return `Result`.
+
+#### 8.4.2 Handling Patterns
+
+| Pattern | When to use | Example sites |
+|---|---|---|
+| **`or_poison()` + `?`** | API returns `Result`. Poison surfaces to the caller as a typed error. | `Session::allocate_channel`, `PeerPool::select_connection`, `ProgressReceiver::drain_all` |
+| **`or_poison()` + `match` + safe fallback** | Closure signature cannot return `Result` (e.g., `FnMut → bool`). Use a neutral fallback value (`false`, `return`, etc.) and add a `// NOTE:` comment explaining the constraint. | `branch()` predicate → `false`, `inspect_collected` → `return`, `ProgressSender::send` → drop batch |
+| **`or_poison()` + abort** | Fire-and-forget helper storing task handles. On poison, abort the handle to prevent resource leak. | `push_task_handle` in `shared_transport.rs` |
+| **`into_inner()` recovery** | Shared runtime infrastructure where the data is safe to recover (write-once, simple value types). The lock must not block future dataflows. | `PeerRegistry::state`, `live_topology`, `membership_cancel`, `CancellationToken::reason` |
+| **`match lock() { Err(_) ⇒ return default }`** | Background housekeeping that can skip a cycle without harm. | `ConnectionPool::evict_idle`, `health_check`, `stats` |
+
+#### 8.4.3 Isolation Guarantees
+
+**Per-dataflow locks** — `Session`, `ProgressSender/Receiver`, `SharedTransportSession` —
+are created per dataflow and dropped when it completes. A poisoned per-dataflow
+lock affects only that dataflow; it cannot contaminate future submissions.
+
+**Shared runtime locks** — `PeerRegistry`, `live_topology`, `membership_cancel` —
+use `into_inner()` recovery. The data behind these locks is safe to recover
+(registration maps, topology snapshots, cancellation tokens). This ensures that
+a panic in one dataflow never poisons shared runtime state permanently.
+
+**Shared transport locks** — `PeerPool` — propagate poison via `or_poison()` + `?`.
+If a transport thread panics and poisons the pool, subsequent calls to
+`select_connection()` / `add_connection()` return `Err(LockPoisoned)`. The
+transport layer distinguishes poison from normal connection failures using
+`TransportError::LockPoisoned` (instead of `ConnectionClosed`) and emits a
+`RuntimeEvent::TransportDegraded` on the health event channel. Affected
+dataflows are cancelled with `CancellationReason::InternalError`. The hosting
+application monitors `RuntimeHandle::health_events()` and can decide the
+appropriate recovery strategy — e.g., abandon the runtime and create a fresh
+`RuntimeHandle`.
+
+#### 8.4.4 Runtime Health Events
+
+When the runtime encounters an error that may fail **all future dataflow
+submissions** and cannot self-recover, it emits a `RuntimeEvent` on a broadcast
+channel. This is the general notification mechanism for unrecoverable runtime
+degradation — PeerPool poison is one example, but any future unrecoverable
+condition should follow the same pattern.
+
+```rust
+// Hosting application subscribes to health events
+let mut health_rx = runtime.health_events();
+tokio::spawn(async move {
+    while let Ok(event) = health_rx.recv().await {
+        tracing::error!("Runtime degraded: {event}");
+        runtime_handle.shutdown();
+        // Create a fresh RuntimeHandle to replace the degraded one.
+    }
+});
+```
+
+Key design properties:
+
+- **Broadcast** — multiple subscribers can coexist; each gets an independent
+  receiver. If no subscriber exists, events are silently dropped.
+- **Non-blocking** — event emission never blocks the transport or runtime.
+- **Feature-agnostic** — `RuntimeEvent` and `health_events()` are available
+  regardless of feature flags, even though currently only the transport layer
+  emits events.
+- **Composable** — the hosting application owns the recovery policy. The
+  runtime reports the problem but does not auto-restart or self-heal.
+
+#### 8.4.4 Resource Leak Prevention
+
+Poison handling must never leak resources:
+
+- **Task handles**: On poison, `abort()` the handle rather than dropping it silently.
+- **Progress batches**: Dropping a batch on poison is acceptable — data is lost
+  but no resource leak occurs (the dataflow is tearing down).
+- **Connections**: TCP connections are managed by transport tasks, not by the
+  poisoned lock's guard. Connection cleanup proceeds via task cancellation.
+- **Closures returning `()`**: When a closure cannot return `Result`, use `return`
+  to skip work rather than proceeding with potentially corrupt state.
+
+#### 8.4.5 Raw `.unwrap()` on Locks
+
+Raw `.lock().unwrap()` is allowed **only in test code** (`#[cfg(test)]` or
+`tests/` directories). Production code must use one of the five patterns above.
+
+### 8.5 No Global State
+
+The instancy crate contains **zero** `static`, `lazy_static`, `once_cell`,
+`OnceLock`, `LazyLock`, or `thread_local!` variables in production code. All
+mutable state is rooted in `RuntimeHandle` instances. This guarantees:
+
+- **Full isolation** — multiple `RuntimeHandle` instances in the same process
+  share no state and cannot interfere with each other.
+- **Clean shutdown** — dropping a `RuntimeHandle` releases all resources.
+  No leaked state persists in global variables after the runtime is gone.
+- **Restartability** — the hosting application can abandon a poisoned or
+  degraded runtime and create a fresh one with no residual contamination.
+
+`&'static str` references (e.g., type names in port descriptors) and `static`
+items inside `#[cfg(test)]` blocks are permitted — they carry no mutable state.
+
 ---
 
 ## 9. Operators

@@ -718,6 +718,10 @@ pub struct RuntimeHandle {
     /// this token stops only the current listener without affecting the runtime.
     #[cfg(feature = "transport")]
     membership_cancel: std::sync::Mutex<CancellationToken>,
+    /// Health event broadcast sender. Hosting applications subscribe via
+    /// [`health_events()`](Self::health_events). Uses broadcast so multiple
+    /// subscribers can coexist. Capacity 16 — events are rare.
+    health_tx: tokio::sync::broadcast::Sender<crate::runtime_event::RuntimeEvent>,
 }
 
 impl RuntimeHandle {
@@ -821,6 +825,8 @@ impl RuntimeHandle {
         };
 
         let cancel = CancellationToken::new();
+        let (health_tx, _) =
+            tokio::sync::broadcast::channel::<crate::runtime_event::RuntimeEvent>(16);
 
         let handle = Self {
             worker_pool,
@@ -838,6 +844,7 @@ impl RuntimeHandle {
             live_topology: Arc::new(std::sync::RwLock::new(initial_topology)),
             #[cfg(feature = "transport")]
             membership_cancel: std::sync::Mutex::new(cancel.child_token()),
+            health_tx,
         };
 
         // Auto-start membership listener if a provider was attached.
@@ -941,6 +948,46 @@ impl RuntimeHandle {
     /// Returns true if the runtime has been shut down.
     pub fn is_shutdown(&self) -> bool {
         self.cancel.is_cancelled()
+    }
+
+    /// Subscribe to runtime health events.
+    ///
+    /// Returns a receiver that yields [`RuntimeEvent`](crate::RuntimeEvent)
+    /// values when the runtime encounters conditions it cannot self-recover
+    /// from (e.g., poisoned transport locks).
+    ///
+    /// The hosting application should monitor this channel and take appropriate
+    /// action — typically shutting down the runtime and creating a fresh one.
+    ///
+    /// Can be called multiple times — each call returns an independent receiver
+    /// (broadcast semantics). If no subscriber exists, events are silently dropped.
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// let mut health_rx = runtime.health_events();
+    /// tokio::spawn(async move {
+    ///     while let Ok(event) = health_rx.recv().await {
+    ///         eprintln!("Runtime health event: {event}");
+    ///         // Decide whether to shut down and restart the runtime.
+    ///     }
+    /// });
+    /// ```
+    pub fn health_events(
+        &self,
+    ) -> tokio::sync::broadcast::Receiver<crate::runtime_event::RuntimeEvent> {
+        self.health_tx.subscribe()
+    }
+
+    /// Get a clone of the health event sender.
+    ///
+    /// Use this when constructing shared transport components (e.g.,
+    /// [`SharedPeerManager`](crate::communication::shared_transport::SharedPeerManager))
+    /// to enable them to emit runtime health events.
+    pub fn health_tx(
+        &self,
+    ) -> tokio::sync::broadcast::Sender<crate::runtime_event::RuntimeEvent> {
+        self.health_tx.clone()
     }
 
     /// Report that a node has left the cluster (crashed, shut down, or network-partitioned).
@@ -2695,11 +2742,19 @@ impl RuntimeHandle {
                             error = ?err,
                             "shared transport error received, cancelling dataflow"
                         );
-                        cancel.cancel_with_reason(
+                        let reason = if matches!(
+                            err,
+                            crate::communication::transport::TransportError::LockPoisoned { .. }
+                        ) {
+                            crate::cancellation::CancellationReason::InternalError {
+                                detail: format!("transport lock poisoned for peer {peer}"),
+                            }
+                        } else {
                             crate::cancellation::CancellationReason::WorkerFailed {
                                 detail: format!("shared transport failure from peer {peer}"),
-                            },
-                        );
+                            }
+                        };
+                        cancel.cancel_with_reason(reason);
                         bridge.cancel();
                     }
                 });

@@ -681,6 +681,23 @@ pub struct ConnectionSnapshot {
     pub idle_duration: Option<Duration>,
 }
 
+impl PeerPool {
+    /// Poison the pool's connections RwLock for testing.
+    ///
+    /// Spawns a thread that acquires a write guard and panics, leaving
+    /// the lock permanently poisoned. Subsequent calls to `select_connection`
+    /// etc. will return `Err(LockPoisoned)`.
+    #[cfg(test)]
+    pub(crate) fn poison_for_test(self: &Arc<Self>) {
+        let pool = Arc::clone(self);
+        let _ = std::thread::spawn(move || {
+            let _guard = pool.connections.write().unwrap();
+            panic!("intentional poison for test");
+        })
+        .join();
+    }
+}
+
 // ─── Tests ───────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
