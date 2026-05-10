@@ -318,13 +318,13 @@ tx.send(MembershipEvent::NodeJoined {
     logical_workers: 4,
 }).unwrap();
 
-// The live topology is updated — new spawn_cluster calls include node-c.
-let topo = rt.current_topology().unwrap();
-assert_eq!(topo.node_count(), 3);
+// The live topology is updated asynchronously by a background task.
+// Use rt.current_topology() to get the latest snapshot when spawning
+// new cluster dataflows.
 ```
 
 **Key behaviors:**
-- **Node join**: topology expands; new `spawn_cluster` calls include the new node
+- **Node join**: topology expands; callers pass `rt.current_topology()` to `spawn_cluster` to include new nodes
 - **Node leave**: affected dataflows are cancelled; topology contracts
 - **Already-running dataflows are not repartitioned** — only new dataflows use the updated topology
 - **The application is the single source of truth** — the runtime does not perform its own discovery
