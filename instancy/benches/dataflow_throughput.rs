@@ -100,7 +100,7 @@ fn bench_exchange_throughput(c: &mut Criterion) {
     let _guard = rt_tokio.enter();
 
     let instancy_rt = RuntimeHandle::new(RuntimeConfig {
-        worker_threads: 4,
+        worker_threads: 16,
         ..Default::default()
     })
     .unwrap();
@@ -110,7 +110,7 @@ fn bench_exchange_throughput(c: &mut Criterion) {
     for &element_count in &[1_000u64, 10_000, 100_000] {
         group.throughput(Throughput::Elements(element_count));
 
-        for &num_workers in &[2usize, 4] {
+        for &num_workers in &[1usize, 2, 4, 8, 16] {
             group.bench_with_input(
                 BenchmarkId::new(format!("workers_{num_workers}"), element_count),
                 &element_count,
@@ -341,7 +341,8 @@ fn bench_branching(c: &mut Criterion) {
                         .branch("split", |_t, v| v % 2 == 0);
                     let merged = evens
                         .map("double_even", |_t, x| x * 2)
-                        .merge(odds.map("triple_odd", |_t, x| x * 3));
+                        .merge(odds.map("triple_odd", |_t, x| x * 3))
+                        .unwrap();
                     merged.for_each("sink", |_t, v| {
                         black_box(v);
                     });
@@ -360,6 +361,67 @@ fn bench_branching(c: &mut Criterion) {
     group.finish();
 }
 
+// ---------------------------------------------------------------------------
+// Worker scaling: exchange-heavy throughput vs worker count
+// ---------------------------------------------------------------------------
+
+/// Measures how exchange throughput scales with worker count.
+///
+/// Uses a fixed large batch size per worker to highlight Mutex<VecDeque>
+/// contention in bounded exchange channels. Each worker emits the same
+/// volume, so total work scales linearly — throughput-per-worker reveals
+/// contention overhead.
+fn bench_worker_scaling(c: &mut Criterion) {
+    let rt_tokio = Runtime::new().unwrap();
+    let _guard = rt_tokio.enter();
+
+    let instancy_rt = RuntimeHandle::new(RuntimeConfig {
+        worker_threads: 16,
+        ..Default::default()
+    })
+    .unwrap();
+
+    let mut group = c.benchmark_group("worker_scaling");
+    let elements_per_worker: u64 = 50_000;
+
+    for &num_workers in &[1usize, 2, 4, 8, 16] {
+        let total = elements_per_worker * num_workers as u64;
+        group.throughput(Throughput::Elements(total));
+        group.bench_with_input(
+            BenchmarkId::new("exchange_per_worker", num_workers),
+            &num_workers,
+            |b, &nw| {
+                b.iter(|| {
+                    let handle = instancy_rt
+                        .spawn_multi(
+                            "bench-scaling",
+                            nw,
+                            move |builder| {
+                                let data: Vec<(u64, Vec<i64>)> =
+                                    vec![(0, (0..elements_per_worker as i64).collect())];
+                                builder
+                                    .source("src", data)
+                                    .exchange("repartition", |v: &i64| *v as u64)
+                                    .map("work", |_t, x| black_box(x.wrapping_mul(7)))
+                                    .exchange("reshuffle", |v: &i64| (*v as u64).wrapping_add(1))
+                                    .for_each("sink", |_t, v| {
+                                        black_box(v);
+                                    });
+                                Ok(())
+                            },
+                            SpawnOptions::default(),
+                        )
+                        .unwrap();
+
+                    handle.join_blocking().unwrap();
+                });
+            },
+        );
+    }
+
+    group.finish();
+}
+
 criterion_group!(
     benches,
     bench_pipeline_throughput,
@@ -367,5 +429,6 @@ criterion_group!(
     bench_spawn_latency,
     bench_stateful_operator,
     bench_branching,
+    bench_worker_scaling,
 );
 criterion_main!(benches);
