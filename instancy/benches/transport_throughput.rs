@@ -50,6 +50,7 @@ fn shared_config(num_connections: usize) -> SharedConnectionConfig {
         reorder_timeout: Duration::from_secs(60),
         rtt_ema_alpha: 0.2,
         idle_timeout: None, // disable idle cleanup during bench
+        enable_frame_crc: false,
     }
 }
 

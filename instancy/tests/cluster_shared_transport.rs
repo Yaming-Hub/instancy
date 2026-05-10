@@ -38,6 +38,7 @@ fn test_shared_config() -> SharedConnectionConfig {
         reorder_timeout: Duration::from_secs(10),
         rtt_ema_alpha: 0.2,
         idle_timeout: None,
+        enable_frame_crc: false,
     }
 }
 
@@ -807,6 +808,7 @@ async fn shared_reconnect_after_transient_network_failure() {
         reorder_timeout: Duration::from_secs(10),
         rtt_ema_alpha: 0.2,
         idle_timeout: None,
+        enable_frame_crc: false,
     };
 
     let factory = Arc::new(ReconnectEchoFactory::new());
