@@ -18,7 +18,7 @@
 10. **Observability built-in** — per-dataflow CPU time tracking, operator-level metrics, and structured tracing for understanding performance characteristics.
 11. **Checkpointing support** — consumers can add checkpoint operators that persist state at timestamp boundaries, enabling recovery by fast-forwarding input to the stored frontier.
 12. **Per-stage dynamic parallelism** *(partially implemented)* — operators in the same stage share a parallelism level; different stages can have different parallelism. Stage boundaries are auto-inferred from repartition operators (`exchange`, `rebalance`, `gather`, `broadcast`). Operators within a stage are fused into a single schedulable task for reduced scheduling overhead. **Note**: Stage inference and operator fusion are implemented; per-stage parallelism (different worker counts per stage) is not yet implemented — all stages currently share the dataflow's worker count.
-13. **Dynamic cluster scaling** *(roadmap)* — nodes will be able to join or leave the cluster at runtime. The hosting application will be responsible for detecting membership changes and notifying the runtime via a `ClusterMembership` trait. The library will rebuild routing and rebalance work accordingly. **Not yet implemented** — the current runtime uses a static worker count determined at dataflow build time.
+13. **Dynamic cluster scaling** — nodes can join or leave the cluster at runtime. The hosting application detects membership changes and notifies the runtime via a `ClusterMembership` trait (or the imperative `report_node_join`/`report_node_leave` API). The library updates the live topology, cancels affected dataflows on node departure, and makes new nodes available to subsequent `spawn_cluster` calls. Already-running dataflows are not repartitioned.
 14. **No global state** — zero static variables, `lazy_static`, or thread-locals. All state is owned by an explicit `RuntimeHandle`. Multiple isolated clusters can coexist in a single process (e.g., interactive vs batch workloads).
 15. **Pluggable task scheduling** — the task queue accepts a `SchedulePolicy` trait that determines dequeue order based on (dataflow priority, task age). Default policy uses priority-with-aging to prevent starvation of low-priority dataflows.
 
@@ -45,7 +45,7 @@
 | Observability | Limited | Built-in CPU time tracking per dataflow, operator-level metrics |
 | Checkpointing | Not supported | Extensible checkpoint operators using timestamp boundaries |
 | Parallelism | Uniform: all operators share the same worker count | Per-stage: stages can have different parallelism; repartition operators at boundaries. Operators within a stage are fused. |
-| Cluster scaling | Static: all nodes must be known at startup | *(Roadmap)* Dynamic: application notifies runtime of node joins/departures; routing tables rebuild on the fly |
+| Cluster scaling | Static: all nodes must be known at startup | Dynamic: application notifies runtime of node joins/departures via `ClusterMembership` trait; live topology updated for new dataflows |
 | Multi-dataflow | One worker owns its dataflows; implicit isolation via thread-local state | Explicit DataflowId in frame headers; shared connections demux by (dataflow_id, channel_id) |
 
 ---
@@ -3578,11 +3578,11 @@ Rather than one connection per (worker, channel) pair, instancy multiplexes all 
 
 Both transport modes — dedicated (exclusive lease per dataflow) and shared (multiplexed across dataflows) — use the same factory and pool. The factory is **required**, not optional: it is the sole mechanism for creating, replacing, and scaling connections. instancy provides a default `TcpConnectionFactory` for plain TCP; applications supply their own for other transports or custom protocols.
 
-### 12.5 Dynamic Cluster Scaling *(Roadmap)*
+### 12.5 Dynamic Cluster Scaling
 
-> **Status: Not yet implemented.** The design below describes the planned architecture for dynamic cluster scaling. The current runtime uses a static worker count determined at dataflow build time. Nodes must be known at startup.
+> **Status: Implemented.** The `ClusterMembership` trait and `ChannelMembership` convenience type are available. The runtime processes membership events to update the live topology, cancel affected dataflows, and make new nodes available. Mid-dataflow repartitioning (worker rebalancing) is not supported — existing dataflows keep their original topology.
 
-instancy plans to support **dynamic cluster scaling** — nodes can be added to or removed from the cluster at runtime. The hosting application is responsible for detecting node changes (health checks, service discovery, autoscaler events, connection failures) and notifying the timely runtime. The library does **not** perform its own node discovery or health monitoring.
+instancy supports **dynamic cluster scaling** — nodes can be added to or removed from the cluster at runtime. The hosting application is responsible for detecting node changes (health checks, service discovery, autoscaler events, connection failures) and notifying the timely runtime. The library does **not** perform its own node discovery or health monitoring.
 
 #### Responsibilities
 
@@ -4571,7 +4571,7 @@ This section documents the cardinality (how many instances exist) and lifetime (
 |-----------|-------------|----------|-------|
 | `WorkerPool` | 1 per process | Process | Shared across all dataflows in the process |
 | `ConnectionPool` | 1 per process | Process | Manages connections to all peer nodes (via `ConnectionFactory`) |
-| `ClusterTopology` | 1 per process | Process (static) | Set at startup; dynamic updates are roadmap (§12.5) |
+| `ClusterTopology` | 1 per process | Process (mutable via membership events) | Updated on node join/leave; new dataflows use latest topology |
 | `DataflowId` | 1 per dataflow | Dataflow | UUID, created at dataflow start |
 | `DataflowHandle` | 1 per (dataflow, node) | Dataflow | Returned to caller; provides cancel/progress/result |
 | `OutcomeAggregator` | 1 per dataflow on coordinator node | Dataflow | Collects per-node outcomes; host-app managed |
@@ -4648,11 +4648,14 @@ This section documents the cardinality (how many instances exist) and lifetime (
 - Activation deduplication in scheduler
 - Lazy channel allocation with shrink-on-drain
 
-**Phase 7 — Dynamic Cluster Scaling** *(Roadmap)*
+**Phase 7 — Dynamic Cluster Scaling** ✅
 - `ClusterMembership` trait for node join/leave events
-- Routing table rebuild on topology changes
-- Worker rebalancing for departing/joining nodes
-- In-flight data migration
+- `ChannelMembership` convenience implementation
+- `RuntimeHandle::set_membership()` with background event loop
+- `RuntimeHandle::set_topology()` / `current_topology()` for live topology
+- `ClusterTopology::add_node()` / `remove_node()` for dynamic mutation
+- Node join → topology updated, available for new `spawn_cluster` calls
+- Node leave → affected dataflows cancelled, topology updated
 
 ---
 
@@ -4666,4 +4669,4 @@ This section documents the cardinality (how many instances exist) and lifetime (
 
 4. **Container abstraction**: timely-dataflow recently added generic container support beyond `Vec<T>`. Should we support this from the start? **Status**: Deferred — using `Vec<T>` only.
 
-5. **Dynamic cluster scaling**: The `ClusterMembership` trait is designed (§12.5) but not implemented. This requires: worker rebalancing mid-dataflow, routing table rebuild, in-flight data migration, and scope re-analysis. **Status**: Roadmap — will be implemented when there is a concrete use case driving the design.
+5. **Dynamic cluster scaling**: The `ClusterMembership` trait is implemented (§12.5). The runtime processes node join/leave events to update the live topology. **Limitation**: existing dataflows are not repartitioned — only new `spawn_cluster` calls use the updated topology. Mid-dataflow worker rebalancing and in-flight data migration are not supported.

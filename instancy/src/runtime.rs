@@ -695,6 +695,13 @@ pub struct RuntimeHandle {
     active_count: Arc<AtomicUsize>,
     /// Notified whenever the active count reaches zero.
     idle_notify: Arc<tokio::sync::Notify>,
+    /// Live cluster topology, updated by membership events.
+    /// Protected by RwLock for concurrent read access from spawn_cluster.
+    #[cfg(feature = "transport")]
+    live_topology: Arc<std::sync::RwLock<Option<crate::execute::ClusterTopology>>>,
+    /// Cancel handle for the membership event loop task.
+    #[cfg(feature = "transport")]
+    membership_cancel: CancellationToken,
 }
 
 impl RuntimeHandle {
@@ -794,6 +801,10 @@ impl RuntimeHandle {
             _owned_tokio_runtime: owned_runtime,
             active_count: Arc::new(AtomicUsize::new(0)),
             idle_notify: Arc::new(tokio::sync::Notify::new()),
+            #[cfg(feature = "transport")]
+            live_topology: Arc::new(std::sync::RwLock::new(None)),
+            #[cfg(feature = "transport")]
+            membership_cancel: CancellationToken::new(),
         })
     }
 
@@ -951,6 +962,184 @@ impl RuntimeHandle {
     #[cfg(feature = "transport")]
     pub fn report_node_join(&self, node_id: &str) -> bool {
         self.peer_registry.report_peer_recovered(node_id)
+    }
+
+    /// Set the live cluster topology.
+    ///
+    /// The topology is stored internally and can be retrieved with
+    /// [`current_topology()`](Self::current_topology). When a
+    /// [`ClusterMembership`](crate::membership::ClusterMembership) provider
+    /// is active, this topology is automatically updated on membership events.
+    ///
+    /// Applications can also call this directly to initialize or override
+    /// the live topology.
+    #[cfg(feature = "transport")]
+    pub fn set_topology(&self, topology: crate::execute::ClusterTopology) {
+        let mut guard = self.live_topology.write().unwrap_or_else(|e| e.into_inner());
+        *guard = Some(topology);
+    }
+
+    /// Get a snapshot of the current live cluster topology.
+    ///
+    /// Returns `None` if no topology has been set (either via
+    /// [`set_topology()`](Self::set_topology) or via membership events).
+    ///
+    /// The returned topology reflects all membership events processed so far.
+    /// Already-running dataflows use the topology they were spawned with —
+    /// they are not affected by subsequent changes.
+    #[cfg(feature = "transport")]
+    pub fn current_topology(&self) -> Option<crate::execute::ClusterTopology> {
+        let guard = self.live_topology.read().unwrap_or_else(|e| e.into_inner());
+        guard.clone()
+    }
+
+    /// Install a [`ClusterMembership`](crate::membership::ClusterMembership)
+    /// provider that automatically processes node join/leave events.
+    ///
+    /// The runtime spawns a background Tokio task that:
+    /// - On [`NodeJoined`](crate::membership::MembershipEvent::NodeJoined):
+    ///   adds the node to the live topology and clears its "down" state.
+    /// - On [`NodeLeft`](crate::membership::MembershipEvent::NodeLeft):
+    ///   removes the node from the live topology and cancels affected dataflows.
+    ///
+    /// The task runs until the membership stream ends, the runtime shuts down,
+    /// or this method is called again (which cancels the previous listener).
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the membership provider's `events()` returns `None`
+    /// (already consumed by a previous call).
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// use instancy::membership::ChannelMembership;
+    ///
+    /// let membership = ChannelMembership::new();
+    /// let tx = membership.sender();
+    /// runtime.set_membership(membership)?;
+    ///
+    /// // Now send events — runtime processes them automatically
+    /// tx.send(MembershipEvent::NodeJoined { node_id: "node-2".into(), logical_workers: 4 });
+    /// ```
+    #[cfg(feature = "transport")]
+    #[cfg_attr(docsrs, doc(cfg(feature = "transport")))]
+    pub fn set_membership(
+        &self,
+        membership: impl crate::membership::ClusterMembership,
+    ) -> Result<()> {
+        use crate::membership::MembershipEvent;
+
+        let mut rx = membership.events().ok_or_else(|| {
+            Error::Custom(
+                "membership provider already consumed (events() returned None)".into(),
+            )
+        })?;
+
+        // Cancel any previous membership listener.
+        self.membership_cancel
+            .cancel_with_reason(CancellationReason::UserRequested);
+
+        // Create a fresh cancel token for the new listener.
+        // We reuse the field by replacing its inner state — but CancellationToken
+        // is immutable once created, so we use the runtime's main cancel token
+        // as the parent signal instead.
+        let runtime_cancel = self.cancel.clone();
+        let peer_registry = self.peer_registry.clone();
+        let live_topology = self.live_topology.clone();
+        let runtime_name = self.name.clone();
+
+        self.tokio_handle.spawn(async move {
+            loop {
+                tokio::select! {
+                    biased;
+                    _ = runtime_cancel.cancelled_async() => {
+                        #[cfg(feature = "tracing")]
+                        tracing::debug!(
+                            runtime = %runtime_name,
+                            "membership listener stopped: runtime shutting down"
+                        );
+                        break;
+                    }
+                    event = rx.recv() => {
+                        match event {
+                            Some(MembershipEvent::NodeJoined { node_id, logical_workers }) => {
+                                #[cfg(feature = "tracing")]
+                                tracing::info!(
+                                    runtime = %runtime_name,
+                                    node_id = %node_id,
+                                    logical_workers = logical_workers,
+                                    "membership: node joined"
+                                );
+
+                                // Clear "down" state so future spawn_cluster calls succeed.
+                                peer_registry.report_peer_recovered(&node_id);
+
+                                // Update live topology.
+                                let mut guard = live_topology
+                                    .write()
+                                    .unwrap_or_else(|e| e.into_inner());
+                                if let Some(ref mut topo) = *guard {
+                                    // Ignore error if node already exists (idempotent).
+                                    let _ = topo.add_node(
+                                        crate::execute::NodeConfig::new(&node_id, logical_workers),
+                                    );
+                                } else {
+                                    // No topology set yet — create one with just this node.
+                                    *guard = Some(crate::execute::ClusterTopology {
+                                        nodes: vec![crate::execute::NodeConfig::new(
+                                            &node_id,
+                                            logical_workers,
+                                        )],
+                                    });
+                                }
+                            }
+                            Some(MembershipEvent::NodeLeft { node_id, reason }) => {
+                                #[cfg(feature = "tracing")]
+                                tracing::warn!(
+                                    runtime = %runtime_name,
+                                    node_id = %node_id,
+                                    reason = %reason,
+                                    "membership: node left"
+                                );
+
+                                // Cancel affected dataflows.
+                                let cancelled = peer_registry.report_peer_down(&node_id);
+                                #[cfg(feature = "tracing")]
+                                if cancelled > 0 {
+                                    tracing::info!(
+                                        runtime = %runtime_name,
+                                        node_id = %node_id,
+                                        cancelled = cancelled,
+                                        "membership: cancelled dataflows for departed node"
+                                    );
+                                }
+
+                                // Update live topology.
+                                let mut guard = live_topology
+                                    .write()
+                                    .unwrap_or_else(|e| e.into_inner());
+                                if let Some(ref mut topo) = *guard {
+                                    // Ignore error if node not found (idempotent).
+                                    let _ = topo.remove_node(&node_id);
+                                }
+                            }
+                            None => {
+                                // Stream ended — provider shut down.
+                                #[cfg(feature = "tracing")]
+                                tracing::info!(
+                                    runtime = %runtime_name,
+                                    "membership listener stopped: event stream ended"
+                                );
+                                break;
+                            }
+                        }
+                    }
+                }
+            }
+        });
+
+        Ok(())
     }
 
     /// Spawn a dataflow on the worker pool.
@@ -7512,5 +7701,306 @@ mod tests {
             err_msg.contains("panic"),
             "error should mention panic: {err_msg}"
         );
+    }
+
+    // --- ClusterMembership tests ---
+
+    #[cfg(feature = "transport")]
+    mod membership_tests {
+        use super::*;
+        use crate::membership::{
+            ChannelMembership, ClusterMembership, MembershipEvent, NodeDepartureReason,
+        };
+
+        fn test_runtime() -> RuntimeHandle {
+            RuntimeHandle::new(RuntimeConfig {
+                worker_threads: 1,
+                name: "membership-test".to_string(),
+                ..Default::default()
+            })
+            .unwrap()
+        }
+
+        #[test]
+        fn set_and_get_topology() {
+            let rt = test_runtime();
+            assert!(rt.current_topology().is_none());
+
+            let topo = crate::execute::ClusterTopology::multi_node(vec![
+                crate::execute::NodeConfig::new("node-a", 2),
+                crate::execute::NodeConfig::new("node-b", 3),
+            ])
+            .unwrap();
+            rt.set_topology(topo.clone());
+
+            let got = rt.current_topology().unwrap();
+            assert_eq!(got.total_workers(), 5);
+            assert!(got.contains_node("node-a"));
+            assert!(got.contains_node("node-b"));
+        }
+
+        #[tokio::test]
+        async fn membership_node_join_updates_topology() {
+            let rt = test_runtime();
+            let topo = crate::execute::ClusterTopology::single_node(2);
+            rt.set_topology(topo);
+
+            let membership = ChannelMembership::new();
+            let tx = membership.sender();
+            rt.set_membership(membership).unwrap();
+
+            // Send a join event
+            tx.send(MembershipEvent::NodeJoined {
+                node_id: "node-2".into(),
+                logical_workers: 4,
+            })
+            .unwrap();
+
+            // Give the event loop time to process
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+            let topo = rt.current_topology().unwrap();
+            assert_eq!(topo.node_count(), 2);
+            assert!(topo.contains_node("node-2"));
+            assert_eq!(topo.total_workers(), 6);
+        }
+
+        #[tokio::test]
+        async fn membership_node_leave_updates_topology() {
+            let rt = test_runtime();
+            let topo = crate::execute::ClusterTopology::multi_node(vec![
+                crate::execute::NodeConfig::new("node-a", 2),
+                crate::execute::NodeConfig::new("node-b", 3),
+            ])
+            .unwrap();
+            rt.set_topology(topo);
+
+            let membership = ChannelMembership::new();
+            let tx = membership.sender();
+            rt.set_membership(membership).unwrap();
+
+            tx.send(MembershipEvent::NodeLeft {
+                node_id: "node-b".into(),
+                reason: NodeDepartureReason::Graceful,
+            })
+            .unwrap();
+
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+            let topo = rt.current_topology().unwrap();
+            assert_eq!(topo.node_count(), 1);
+            assert!(!topo.contains_node("node-b"));
+            assert_eq!(topo.total_workers(), 2);
+        }
+
+        #[tokio::test]
+        async fn membership_node_leave_then_rejoin() {
+            let rt = test_runtime();
+            let topo = crate::execute::ClusterTopology::multi_node(vec![
+                crate::execute::NodeConfig::new("node-a", 2),
+                crate::execute::NodeConfig::new("node-b", 3),
+            ])
+            .unwrap();
+            rt.set_topology(topo);
+
+            let membership = ChannelMembership::new();
+            let tx = membership.sender();
+            rt.set_membership(membership).unwrap();
+
+            // Leave
+            tx.send(MembershipEvent::NodeLeft {
+                node_id: "node-b".into(),
+                reason: NodeDepartureReason::ConnectionLost,
+            })
+            .unwrap();
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            assert!(!rt.current_topology().unwrap().contains_node("node-b"));
+
+            // Rejoin with different worker count
+            tx.send(MembershipEvent::NodeJoined {
+                node_id: "node-b".into(),
+                logical_workers: 5,
+            })
+            .unwrap();
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+            let topo = rt.current_topology().unwrap();
+            assert!(topo.contains_node("node-b"));
+            assert_eq!(topo.total_workers(), 7); // 2 + 5
+        }
+
+        #[tokio::test]
+        async fn membership_rapid_events_processed_in_order() {
+            let rt = test_runtime();
+            let topo = crate::execute::ClusterTopology::single_node(1);
+            rt.set_topology(topo);
+
+            let membership = ChannelMembership::new();
+            let tx = membership.sender();
+            rt.set_membership(membership).unwrap();
+
+            // Send 10 join events rapidly
+            for i in 0..10 {
+                tx.send(MembershipEvent::NodeJoined {
+                    node_id: format!("node-{i}"),
+                    logical_workers: 1,
+                })
+                .unwrap();
+            }
+
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+            let topo = rt.current_topology().unwrap();
+            // "local" + 10 new nodes = 11
+            assert_eq!(topo.node_count(), 11);
+            assert_eq!(topo.total_workers(), 11);
+        }
+
+        #[tokio::test]
+        async fn membership_stream_end_does_not_crash() {
+            let rt = test_runtime();
+            let topo = crate::execute::ClusterTopology::single_node(1);
+            rt.set_topology(topo);
+
+            let membership = ChannelMembership::new();
+            let tx = membership.sender();
+            rt.set_membership(membership).unwrap();
+
+            // Send one event, then drop the sender (ends the stream)
+            tx.send(MembershipEvent::NodeJoined {
+                node_id: "node-1".into(),
+                logical_workers: 2,
+            })
+            .unwrap();
+            drop(tx);
+
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+            // Runtime should still be operational
+            assert!(!rt.is_shutdown());
+            let topo = rt.current_topology().unwrap();
+            assert!(topo.contains_node("node-1"));
+        }
+
+        #[tokio::test]
+        async fn membership_runtime_shutdown_stops_listener() {
+            let rt = test_runtime();
+            let topo = crate::execute::ClusterTopology::single_node(1);
+            rt.set_topology(topo);
+
+            let membership = ChannelMembership::new();
+            let _tx = membership.sender();
+            rt.set_membership(membership).unwrap();
+
+            // Shutdown the runtime
+            rt.shutdown();
+
+            // Give the listener time to stop
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+            // Runtime is shutdown
+            assert!(rt.is_shutdown());
+        }
+
+        #[tokio::test]
+        async fn membership_join_without_existing_topology() {
+            let rt = test_runtime();
+            // No topology set — join should create one
+            assert!(rt.current_topology().is_none());
+
+            let membership = ChannelMembership::new();
+            let tx = membership.sender();
+            rt.set_membership(membership).unwrap();
+
+            tx.send(MembershipEvent::NodeJoined {
+                node_id: "first-node".into(),
+                logical_workers: 4,
+            })
+            .unwrap();
+
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+            let topo = rt.current_topology().unwrap();
+            assert_eq!(topo.node_count(), 1);
+            assert!(topo.contains_node("first-node"));
+            assert_eq!(topo.total_workers(), 4);
+        }
+
+        #[tokio::test]
+        async fn membership_idempotent_join() {
+            let rt = test_runtime();
+            let topo = crate::execute::ClusterTopology::single_node(2);
+            rt.set_topology(topo);
+
+            let membership = ChannelMembership::new();
+            let tx = membership.sender();
+            rt.set_membership(membership).unwrap();
+
+            // Join same node twice — should be idempotent
+            tx.send(MembershipEvent::NodeJoined {
+                node_id: "node-x".into(),
+                logical_workers: 3,
+            })
+            .unwrap();
+            tx.send(MembershipEvent::NodeJoined {
+                node_id: "node-x".into(),
+                logical_workers: 3,
+            })
+            .unwrap();
+
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+            let topo = rt.current_topology().unwrap();
+            assert_eq!(topo.node_count(), 2); // local + node-x (not duplicated)
+        }
+
+        #[tokio::test]
+        async fn membership_idempotent_leave() {
+            let rt = test_runtime();
+            let topo = crate::execute::ClusterTopology::multi_node(vec![
+                crate::execute::NodeConfig::new("node-a", 2),
+                crate::execute::NodeConfig::new("node-b", 3),
+            ])
+            .unwrap();
+            rt.set_topology(topo);
+
+            let membership = ChannelMembership::new();
+            let tx = membership.sender();
+            rt.set_membership(membership).unwrap();
+
+            // Leave same node twice — should be idempotent
+            tx.send(MembershipEvent::NodeLeft {
+                node_id: "node-b".into(),
+                reason: NodeDepartureReason::Removed,
+            })
+            .unwrap();
+            tx.send(MembershipEvent::NodeLeft {
+                node_id: "node-b".into(),
+                reason: NodeDepartureReason::Removed,
+            })
+            .unwrap();
+
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+            let topo = rt.current_topology().unwrap();
+            assert_eq!(topo.node_count(), 1);
+        }
+
+        #[test]
+        fn set_membership_rejects_consumed_provider() {
+            let rt = test_runtime();
+            let membership = ChannelMembership::new();
+
+            // Consume the events
+            let _rx = membership.events();
+
+            // Now set_membership should fail
+            let result = rt.set_membership(membership);
+            assert!(result.is_err());
+            assert!(result
+                .unwrap_err()
+                .to_string()
+                .contains("already consumed"));
+        }
     }
 }

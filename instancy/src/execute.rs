@@ -194,6 +194,65 @@ impl ClusterTopology {
             Vec::new()
         }
     }
+
+    /// Check whether a node with the given ID is in the topology.
+    pub fn contains_node(&self, node_id: &str) -> bool {
+        self.nodes.iter().any(|n| n.node_id == node_id)
+    }
+
+    /// Add a node to the topology.
+    ///
+    /// The node list is re-sorted after insertion to maintain consistent
+    /// worker range assignment. Returns an error if the node already exists
+    /// or has zero workers.
+    ///
+    /// **Note**: Adding a node does not affect already-running dataflows.
+    /// Only subsequent `spawn_cluster` calls will include the new node.
+    pub fn add_node(&mut self, config: NodeConfig) -> Result<(), Error> {
+        if config.logical_workers == 0 {
+            return Err(Error::Custom(format!(
+                "node '{}' must have at least 1 worker",
+                config.node_id
+            )));
+        }
+        if self.contains_node(&config.node_id) {
+            return Err(Error::Custom(format!(
+                "node '{}' already exists in topology",
+                config.node_id
+            )));
+        }
+        self.nodes.push(config);
+        self.nodes.sort_by(|a, b| a.node_id.cmp(&b.node_id));
+        Ok(())
+    }
+
+    /// Remove a node from the topology by its ID.
+    ///
+    /// Returns the removed [`NodeConfig`], or an error if the node was not found
+    /// or removal would leave the topology empty.
+    ///
+    /// **Note**: Removing a node does not cancel already-running dataflows.
+    /// Use [`RuntimeHandle::report_node_leave`] to cancel affected dataflows.
+    pub fn remove_node(&mut self, node_id: &str) -> Result<NodeConfig, Error> {
+        let idx = self
+            .nodes
+            .iter()
+            .position(|n| n.node_id == node_id)
+            .ok_or_else(|| {
+                Error::Custom(format!("node '{node_id}' not found in topology"))
+            })?;
+        if self.nodes.len() == 1 {
+            return Err(Error::Custom(
+                "cannot remove the last node from topology".into(),
+            ));
+        }
+        Ok(self.nodes.remove(idx))
+    }
+
+    /// Returns the number of nodes in the topology.
+    pub fn node_count(&self) -> usize {
+        self.nodes.len()
+    }
 }
 
 /// Bootstrap a dataflow execution.
@@ -309,6 +368,103 @@ mod tests {
         assert!(ClusterTopology::multi_node(vec![]).is_err());
         // Zero workers
         assert!(ClusterTopology::multi_node(vec![NodeConfig::new("node-0", 0)]).is_err());
+    }
+
+    #[test]
+    fn cluster_topology_contains_node() {
+        let topo = ClusterTopology::multi_node(vec![
+            NodeConfig::new("node-0", 2),
+            NodeConfig::new("node-1", 3),
+        ])
+        .unwrap();
+        assert!(topo.contains_node("node-0"));
+        assert!(topo.contains_node("node-1"));
+        assert!(!topo.contains_node("node-2"));
+    }
+
+    #[test]
+    fn cluster_topology_add_node() {
+        let mut topo = ClusterTopology::single_node(2);
+        assert_eq!(topo.node_count(), 1);
+        assert_eq!(topo.total_workers(), 2);
+
+        // Add a new node
+        topo.add_node(NodeConfig::new("node-b", 3)).unwrap();
+        assert_eq!(topo.node_count(), 2);
+        assert_eq!(topo.total_workers(), 5);
+        assert!(topo.contains_node("node-b"));
+
+        // Worker ranges are recalculated (sorted by node_id)
+        // "local" < "node-b" alphabetically
+        assert_eq!(topo.worker_range("local"), Some((0, 2)));
+        assert_eq!(topo.worker_range("node-b"), Some((2, 5)));
+    }
+
+    #[test]
+    fn cluster_topology_add_node_duplicate() {
+        let mut topo = ClusterTopology::single_node(2);
+        let result = topo.add_node(NodeConfig::new("local", 3));
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("already exists"));
+    }
+
+    #[test]
+    fn cluster_topology_add_node_zero_workers() {
+        let mut topo = ClusterTopology::single_node(2);
+        let result = topo.add_node(NodeConfig::new("node-b", 0));
+        assert!(result.is_err());
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("at least 1 worker"));
+    }
+
+    #[test]
+    fn cluster_topology_remove_node() {
+        let mut topo = ClusterTopology::multi_node(vec![
+            NodeConfig::new("node-a", 2),
+            NodeConfig::new("node-b", 3),
+            NodeConfig::new("node-c", 4),
+        ])
+        .unwrap();
+
+        let removed = topo.remove_node("node-b").unwrap();
+        assert_eq!(removed.node_id, "node-b");
+        assert_eq!(removed.logical_workers, 3);
+        assert_eq!(topo.node_count(), 2);
+        assert_eq!(topo.total_workers(), 6);
+        assert!(!topo.contains_node("node-b"));
+
+        // Worker ranges recalculated
+        assert_eq!(topo.worker_range("node-a"), Some((0, 2)));
+        assert_eq!(topo.worker_range("node-c"), Some((2, 6)));
+    }
+
+    #[test]
+    fn cluster_topology_remove_node_not_found() {
+        let mut topo = ClusterTopology::single_node(2);
+        let result = topo.remove_node("nonexistent");
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("not found"));
+    }
+
+    #[test]
+    fn cluster_topology_remove_last_node() {
+        let mut topo = ClusterTopology::single_node(2);
+        let result = topo.remove_node("local");
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("last node"));
+    }
+
+    #[test]
+    fn cluster_topology_node_count() {
+        let topo = ClusterTopology::multi_node(vec![
+            NodeConfig::new("a", 1),
+            NodeConfig::new("b", 1),
+            NodeConfig::new("c", 1),
+        ])
+        .unwrap();
+        assert_eq!(topo.node_count(), 3);
     }
 
     #[test]
