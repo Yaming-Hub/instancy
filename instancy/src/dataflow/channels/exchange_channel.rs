@@ -355,8 +355,15 @@ impl<T: Timestamp, D: Clone + Send + 'static> Push<T, D> for ExchangePush<T, D> 
                 for target_idx in 0..self.num_targets {
                     if !self.buckets[target_idx].is_empty() {
                         let bucket = std::mem::take(&mut self.buckets[target_idx]);
-                        self.targets[target_idx].push(Envelope::data(time.clone(), bucket))?;
-                        self.wakes.wake(target_idx);
+                        match self.targets[target_idx].push(Envelope::data(time.clone(), bucket)) {
+                            Ok(()) => self.wakes.wake(target_idx),
+                            Err(err) => {
+                                // Clear remaining buckets to prevent stale data
+                                // leaking into the next push call.
+                                for b in &mut self.buckets { b.clear(); }
+                                return Err(err);
+                            }
+                        }
                     }
                 }
             }
