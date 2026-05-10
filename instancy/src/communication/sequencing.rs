@@ -515,31 +515,31 @@ mod tests {
         assert_eq!(ready, vec!["b", "first"]);
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn gap_timeout_detection() {
-        let mut buf = ReorderBuffer::new(Duration::from_millis(10));
+        let mut buf = ReorderBuffer::new(Duration::from_millis(100));
 
         // Create a gap: receive seq 1 but not seq 0
         buf.insert(1, "b").unwrap();
         assert!(buf.check_timeout().is_ok());
 
         // Wait for timeout
-        tokio::time::sleep(Duration::from_millis(15)).await;
+        tokio::time::sleep(Duration::from_millis(150)).await;
 
         let err = buf.check_timeout().unwrap_err();
         assert_eq!(err, ReorderError::GapTimeout { expected_seq: 0 });
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn gap_timeout_resets_when_head_advances() {
-        let mut buf = ReorderBuffer::new(Duration::from_millis(20));
+        let mut buf = ReorderBuffer::new(Duration::from_millis(200));
 
         // Create gap: have seq 1 and 3, missing 0 and 2
         buf.insert(1, "b").unwrap();
         buf.insert(3, "d").unwrap();
 
-        // Wait 10ms (within timeout)
-        tokio::time::sleep(Duration::from_millis(10)).await;
+        // Wait 100ms (within timeout)
+        tokio::time::sleep(Duration::from_millis(100)).await;
         assert!(buf.check_timeout().is_ok());
 
         // Now deliver seq 0 — head advances to 2, timer should reset
@@ -547,12 +547,12 @@ mod tests {
         buf.drain_ready().for_each(drop);
         assert_eq!(buf.next_expected(), 2); // still missing seq 2
 
-        // Timer just reset, so even after 15ms total elapsed, timeout not hit
-        tokio::time::sleep(Duration::from_millis(10)).await;
+        // Timer just reset, so even after 100ms more elapsed, timeout not hit
+        tokio::time::sleep(Duration::from_millis(100)).await;
         assert!(buf.check_timeout().is_ok());
 
         // Wait full timeout from reset point
-        tokio::time::sleep(Duration::from_millis(15)).await;
+        tokio::time::sleep(Duration::from_millis(150)).await;
         let err = buf.check_timeout().unwrap_err();
         assert_eq!(err, ReorderError::GapTimeout { expected_seq: 2 });
     }
