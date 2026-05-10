@@ -20,20 +20,18 @@
 //! # Example
 //!
 //! ```ignore
-//! use instancy::membership::{ClusterMembership, MembershipEvent, NodeDepartureReason};
-//! use tokio::sync::mpsc;
+//! use instancy::membership::{ClusterMembership, MembershipEvent, ChannelMembership};
 //!
-//! struct MyMembership {
-//!     rx: tokio::sync::Mutex<mpsc::UnboundedReceiver<MembershipEvent>>,
-//! }
+//! // Simple channel-based provider:
+//! let membership = ChannelMembership::new();
+//! let tx = membership.sender();
 //!
-//! impl ClusterMembership for MyMembership {
-//!     fn subscribe(
-//!         &self,
-//!     ) -> std::pin::Pin<Box<dyn futures_core::Stream<Item = MembershipEvent> + Send>> {
-//!         // In a real application, this would come from a service discovery system.
-//!         // For simplicity, we use a channel-based approach here.
-//!         unimplemented!("use a real discovery system")
+//! // Or implement the trait for a custom discovery system:
+//! struct K8sMembership { /* ... */ }
+//! impl ClusterMembership for K8sMembership {
+//!     fn events(&self) -> Option<tokio::sync::mpsc::UnboundedReceiver<MembershipEvent>> {
+//!         // Return a receiver fed by a Kubernetes pod watcher
+//!         unimplemented!()
 //!     }
 //! }
 //! ```

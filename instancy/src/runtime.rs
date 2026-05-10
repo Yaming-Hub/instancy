@@ -699,9 +699,12 @@ pub struct RuntimeHandle {
     /// Protected by RwLock for concurrent read access from spawn_cluster.
     #[cfg(feature = "transport")]
     live_topology: Arc<std::sync::RwLock<Option<crate::execute::ClusterTopology>>>,
-    /// Cancel handle for the membership event loop task.
+    /// Cancel token for the current membership event loop task.
+    /// Wrapped in Mutex so `set_membership()` can replace it atomically.
+    /// Each listener gets a child of the runtime cancel token; cancelling
+    /// this token stops only the current listener without affecting the runtime.
     #[cfg(feature = "transport")]
-    membership_cancel: CancellationToken,
+    membership_cancel: std::sync::Mutex<CancellationToken>,
 }
 
 impl RuntimeHandle {
@@ -804,7 +807,7 @@ impl RuntimeHandle {
             #[cfg(feature = "transport")]
             live_topology: Arc::new(std::sync::RwLock::new(None)),
             #[cfg(feature = "transport")]
-            membership_cancel: CancellationToken::new(),
+            membership_cancel: std::sync::Mutex::new(CancellationToken::new()),
         })
     }
 
@@ -1036,15 +1039,19 @@ impl RuntimeHandle {
             )
         })?;
 
-        // Cancel any previous membership listener.
-        self.membership_cancel
-            .cancel_with_reason(CancellationReason::UserRequested);
+        // Cancel any previous membership listener by cancelling its token.
+        // Then create a fresh child token for the new listener.
+        let listener_cancel = {
+            let mut guard = self
+                .membership_cancel
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            guard.cancel_with_reason(CancellationReason::UserRequested);
+            let new_token = self.cancel.child_token();
+            *guard = new_token.clone();
+            new_token
+        };
 
-        // Create a fresh cancel token for the new listener.
-        // We reuse the field by replacing its inner state — but CancellationToken
-        // is immutable once created, so we use the runtime's main cancel token
-        // as the parent signal instead.
-        let runtime_cancel = self.cancel.clone();
         let peer_registry = self.peer_registry.clone();
         let live_topology = self.live_topology.clone();
         let runtime_name = self.name.clone();
@@ -1053,17 +1060,28 @@ impl RuntimeHandle {
             loop {
                 tokio::select! {
                     biased;
-                    _ = runtime_cancel.cancelled_async() => {
+                    _ = listener_cancel.cancelled_async() => {
                         #[cfg(feature = "tracing")]
                         tracing::debug!(
                             runtime = %runtime_name,
-                            "membership listener stopped: runtime shutting down"
+                            "membership listener stopped"
                         );
                         break;
                     }
                     event = rx.recv() => {
                         match event {
                             Some(MembershipEvent::NodeJoined { node_id, logical_workers }) => {
+                                // Validate: skip events with zero workers.
+                                if logical_workers == 0 {
+                                    #[cfg(feature = "tracing")]
+                                    tracing::warn!(
+                                        runtime = %runtime_name,
+                                        node_id = %node_id,
+                                        "membership: ignoring NodeJoined with 0 workers"
+                                    );
+                                    continue;
+                                }
+
                                 #[cfg(feature = "tracing")]
                                 tracing::info!(
                                     runtime = %runtime_name,
@@ -1086,12 +1104,12 @@ impl RuntimeHandle {
                                     );
                                 } else {
                                     // No topology set yet — create one with just this node.
-                                    *guard = Some(crate::execute::ClusterTopology {
-                                        nodes: vec![crate::execute::NodeConfig::new(
-                                            &node_id,
-                                            logical_workers,
-                                        )],
-                                    });
+                                    let topo = crate::execute::ClusterTopology::multi_node(vec![
+                                        crate::execute::NodeConfig::new(&node_id, logical_workers),
+                                    ]);
+                                    if let Ok(t) = topo {
+                                        *guard = Some(t);
+                                    }
                                 }
                             }
                             Some(MembershipEvent::NodeLeft { node_id, reason }) => {
@@ -1104,13 +1122,13 @@ impl RuntimeHandle {
                                 );
 
                                 // Cancel affected dataflows.
-                                let cancelled = peer_registry.report_peer_down(&node_id);
+                                let _cancelled = peer_registry.report_peer_down(&node_id);
                                 #[cfg(feature = "tracing")]
-                                if cancelled > 0 {
+                                if _cancelled > 0 {
                                     tracing::info!(
                                         runtime = %runtime_name,
                                         node_id = %node_id,
-                                        cancelled = cancelled,
+                                        cancelled = _cancelled,
                                         "membership: cancelled dataflows for departed node"
                                     );
                                 }
@@ -1120,8 +1138,16 @@ impl RuntimeHandle {
                                     .write()
                                     .unwrap_or_else(|e| e.into_inner());
                                 if let Some(ref mut topo) = *guard {
-                                    // Ignore error if node not found (idempotent).
-                                    let _ = topo.remove_node(&node_id);
+                                    match topo.remove_node(&node_id) {
+                                        Ok(_) => {}
+                                        Err(_) if topo.contains_node(&node_id) && topo.node_count() == 1 => {
+                                            // Last node departed — clear topology entirely.
+                                            *guard = None;
+                                        }
+                                        Err(_) => {
+                                            // Node not found — idempotent, ignore.
+                                        }
+                                    }
                                 }
                             }
                             None => {
@@ -8001,6 +8027,105 @@ mod tests {
                 .unwrap_err()
                 .to_string()
                 .contains("already consumed"));
+        }
+
+        #[test]
+        fn set_membership_twice_stops_first_listener() {
+            // Calling set_membership() a second time should cancel the first
+            // listener task (no task leak).
+            let rt = test_runtime();
+
+            // First membership provider
+            let m1 = ChannelMembership::new();
+            let tx1 = m1.sender();
+            rt.set_membership(m1).unwrap();
+
+            // Send an event through the first provider.
+            tx1.send(MembershipEvent::NodeJoined {
+                node_id: "old-node".into(),
+                logical_workers: 2,
+            })
+            .unwrap();
+            std::thread::sleep(std::time::Duration::from_millis(100));
+            assert!(rt.current_topology().is_some());
+
+            // Replace with second provider — first listener should stop.
+            let m2 = ChannelMembership::new();
+            let tx2 = m2.sender();
+            rt.set_membership(m2).unwrap();
+
+            // Events from first provider should be ignored (task cancelled).
+            let _ = tx1.send(MembershipEvent::NodeJoined {
+                node_id: "leaked-node".into(),
+                logical_workers: 1,
+            });
+            std::thread::sleep(std::time::Duration::from_millis(100));
+
+            // Reset topology to verify only second provider is active.
+            rt.set_topology(
+                crate::execute::ClusterTopology::multi_node(vec![
+                    crate::execute::NodeConfig::new("base", 1),
+                ])
+                .unwrap(),
+            );
+
+            // Second provider should still work.
+            tx2.send(MembershipEvent::NodeJoined {
+                node_id: "new-node".into(),
+                logical_workers: 3,
+            })
+            .unwrap();
+            std::thread::sleep(std::time::Duration::from_millis(100));
+            let topo = rt.current_topology().unwrap();
+            assert!(topo.contains_node("new-node"));
+            // "leaked-node" should NOT appear (first listener was stopped).
+            assert!(!topo.contains_node("leaked-node"));
+        }
+
+        #[test]
+        fn node_joined_zero_workers_ignored() {
+            let rt = test_runtime();
+            let membership = ChannelMembership::new();
+            let tx = membership.sender();
+            rt.set_membership(membership).unwrap();
+
+            // Send a join event with 0 workers — should be ignored.
+            tx.send(MembershipEvent::NodeJoined {
+                node_id: "bad-node".into(),
+                logical_workers: 0,
+            })
+            .unwrap();
+            std::thread::sleep(std::time::Duration::from_millis(100));
+
+            // Topology should remain None (the zero-workers event was skipped).
+            assert!(rt.current_topology().is_none());
+        }
+
+        #[test]
+        fn node_left_removes_last_node_clears_topology() {
+            let rt = test_runtime();
+
+            // Set a topology with a single node.
+            let topo = crate::execute::ClusterTopology::multi_node(vec![
+                crate::execute::NodeConfig::new("only-node", 2),
+            ])
+            .unwrap();
+            rt.set_topology(topo);
+
+            let membership = ChannelMembership::new();
+            let tx = membership.sender();
+            rt.set_membership(membership).unwrap();
+
+            // Remove the only node.
+            tx.send(MembershipEvent::NodeLeft {
+                node_id: "only-node".into(),
+                reason: NodeDepartureReason::Graceful,
+            })
+            .unwrap();
+            std::thread::sleep(std::time::Duration::from_millis(100));
+
+            // Topology should be cleared to None.
+            assert!(rt.current_topology().is_none());
         }
     }
 }
