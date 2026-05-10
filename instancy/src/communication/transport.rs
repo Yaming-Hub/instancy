@@ -9,11 +9,12 @@
 //! Each frame on the wire has the following layout:
 //!
 //! ```text
-//! ┌────────────────┬────────────────┬─────────────────────┬──────────────┐
-//! │ channel_id: u64│ length: u32    │ payload: [u8; ...]  │ crc32?: u32  │
-//! └────────────────┴────────────────┴─────────────────────┴──────────────┘
+//! ┌─────────────────┬────────────────┬────────────────┬─────────────────────┬──────────────┐
+//! │ dataflow_id:UUID│ channel_id: u64│ length: u32    │ payload: [u8; ...]  │ crc32?: u32  │
+//! └─────────────────┴────────────────┴────────────────┴─────────────────────┴──────────────┘
 //! ```
 //!
+//! - `dataflow_id` (16 bytes, UUID): identifies the dataflow
 //! - `channel_id` (8 bytes, little-endian): identifies the logical channel
 //! - `length` (4 bytes, little-endian): byte length of payload + optional CRC trailer
 //! - `payload` (variable): serialized message data
