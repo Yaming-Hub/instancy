@@ -79,6 +79,10 @@ pub struct ExecutorConfig {
     /// records processed). Overhead is ~1 Instant::now() per activation.
     /// Default: false.
     pub collect_metrics: bool,
+    /// Whether to collect per-exchange-edge channel counters (items and bytes
+    /// transferred). Overhead is ~2 atomic adds per batch push.
+    /// Default: false.
+    pub channel_counters: bool,
     /// When set, cancellation triggers a graceful drain phase instead of
     /// immediate termination. During the drain phase:
     ///
@@ -93,6 +97,10 @@ pub struct ExecutorConfig {
     ///
     /// Default: `None` (immediate cancellation).
     pub drain_timeout: Option<std::time::Duration>,
+    /// Pre-created channel metrics collectors for exchange edges.
+    /// These are shared across workers and registered in `DataflowMetrics`
+    /// during executor materialization. Empty when `channel_counters` is false.
+    pub channel_metrics_collectors: Vec<std::sync::Arc<crate::metrics::ChannelMetricsCollector>>,
 }
 
 impl Default for ExecutorConfig {
@@ -103,7 +111,9 @@ impl Default for ExecutorConfig {
             max_sweeps_per_poll: 64,
             catch_panics: false,
             collect_metrics: false,
+            channel_counters: false,
             drain_timeout: None,
+            channel_metrics_collectors: Vec::new(),
         }
     }
 }
@@ -601,16 +611,25 @@ impl<T: Timestamp> DataflowExecutor<T> {
         let async_waiting = vec![false; operators.len()];
 
         // Initialize per-operator metrics collectors when enabled.
-        let (dataflow_metrics, op_collectors) = if config.collect_metrics {
+        let needs_metrics = config.collect_metrics || !config.channel_metrics_collectors.is_empty();
+        let (dataflow_metrics, op_collectors) = if needs_metrics {
             let mut dm = DataflowMetrics::new("dataflow");
-            let collectors: Vec<Option<Arc<OperatorMetricsCollector>>> = operators
-                .iter()
-                .enumerate()
-                .map(|(pos, op)| {
-                    let c = dm.register_operator(op.name(), pos);
-                    Some(c)
-                })
-                .collect();
+            let collectors: Vec<Option<Arc<OperatorMetricsCollector>>> = if config.collect_metrics {
+                operators
+                    .iter()
+                    .enumerate()
+                    .map(|(pos, op)| {
+                        let c = dm.register_operator(op.name(), pos);
+                        Some(c)
+                    })
+                    .collect()
+            } else {
+                Vec::new()
+            };
+            // Register pre-created channel metrics collectors.
+            for ch_collector in &config.channel_metrics_collectors {
+                dm.register_existing_channel(std::sync::Arc::clone(ch_collector));
+            }
             (Some(Arc::new(dm)), collectors)
         } else {
             (None, Vec::new())
@@ -2076,7 +2095,9 @@ mod tests {
                 max_sweeps_per_poll: 0,
                 catch_panics: false,
                 collect_metrics: false,
-                drain_timeout: None,
+                channel_counters: false,
+            drain_timeout: None,
+                channel_metrics_collectors: Vec::new(),
             },
             cancel: CancellationToken::new(),
             progress_tracker: None,
@@ -2479,7 +2500,9 @@ mod tests {
                 max_sweeps_per_poll: 0, // no budget limit for this test
                 catch_panics: false,
                 collect_metrics: false,
-                drain_timeout: None,
+                channel_counters: false,
+            drain_timeout: None,
+                channel_metrics_collectors: Vec::new(),
             },
             cancel: CancellationToken::new(),
             progress_tracker: None,
@@ -2564,7 +2587,9 @@ mod tests {
                 max_sweeps_per_poll: 0,
                 catch_panics: false,
                 collect_metrics: false,
-                drain_timeout: None,
+                channel_counters: false,
+            drain_timeout: None,
+                channel_metrics_collectors: Vec::new(),
             },
             cancel: CancellationToken::new(),
             progress_tracker: None,
@@ -3075,7 +3100,9 @@ mod tests {
                 max_sweeps_per_poll: budget,
                 catch_panics: false,
                 collect_metrics: false,
-                drain_timeout: None,
+                channel_counters: false,
+            drain_timeout: None,
+                channel_metrics_collectors: Vec::new(),
             },
             cancel: CancellationToken::new(),
             progress_tracker: None,
@@ -3152,7 +3179,9 @@ mod tests {
                 max_sweeps_per_poll: 0, // unlimited
                 catch_panics: false,
                 collect_metrics: false,
-                drain_timeout: None,
+                channel_counters: false,
+            drain_timeout: None,
+                channel_metrics_collectors: Vec::new(),
             },
             cancel: CancellationToken::new(),
             progress_tracker: None,
@@ -4047,7 +4076,9 @@ mod tests {
             max_sweeps_per_poll: 0,
             catch_panics: false,
             collect_metrics: false,
+            channel_counters: false,
             drain_timeout: Some(std::time::Duration::from_secs(5)),
+            channel_metrics_collectors: Vec::new(),
         };
         let mut executor = DataflowExecutor::new_test(vec![Box::new(op)], config, 0);
 
@@ -4075,7 +4106,9 @@ mod tests {
             max_sweeps_per_poll: 0,
             catch_panics: false,
             collect_metrics: false,
+            channel_counters: false,
             drain_timeout: None,
+                channel_metrics_collectors: Vec::new(),
         };
         let mut executor = DataflowExecutor::new_test(vec![Box::new(op)], config, 0);
         executor.cancel.cancel();
@@ -4117,8 +4150,9 @@ mod tests {
             max_sweeps_per_poll: 0,
             catch_panics: false,
             collect_metrics: false,
-            // Very short timeout so test doesn't hang.
+            channel_counters: false,
             drain_timeout: Some(std::time::Duration::from_millis(50)),
+            channel_metrics_collectors: Vec::new(),
         };
         let mut executor = DataflowExecutor::new_test(vec![Box::new(InfiniteOperator)], config, 0);
         executor.cancel.cancel();
@@ -4147,7 +4181,9 @@ mod tests {
             max_sweeps_per_poll: 0,
             catch_panics: false,
             collect_metrics: false,
+            channel_counters: false,
             drain_timeout: Some(std::time::Duration::from_secs(5)),
+            channel_metrics_collectors: Vec::new(),
         };
         let mut executor = DataflowExecutor::new_test(vec![Box::new(op)], config, 0);
 

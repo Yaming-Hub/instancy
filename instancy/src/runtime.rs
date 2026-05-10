@@ -180,8 +180,11 @@ pub enum IoMode {
 pub struct SpawnOptions {
     /// Channel mode for external I/O ports. Default: [`IoMode::Sync`].
     pub(crate) io_mode: IoMode,
-    /// Whether to collect per-operator metrics. Default: `false`.
-    pub(crate) collect_metrics: bool,
+    /// Metrics granularity configuration. Default: `MetricsConfig::none()` (disabled).
+    ///
+    /// Use [`MetricsConfig::summary_only()`] for cheap operator-level stats,
+    /// or [`MetricsConfig::full()`] for operator + channel counters.
+    pub(crate) metrics_config: crate::metrics::MetricsConfig,
     /// Scheduling priority for this dataflow (higher = scheduled sooner).
     pub(crate) priority: u32,
     /// Optional external cancellation token.
@@ -329,8 +332,11 @@ impl SpawnOptions {
 
     /// Enable or disable per-operator metrics collection.
     ///
-    /// When enabled, the runtime records activation counts and durations for
-    /// each operator. Retrieve via `DataflowCompletion` after join.
+    /// Convenience method: `collect_metrics(true)` is equivalent to
+    /// `metrics(MetricsConfig::summary_only())` and `collect_metrics(false)`
+    /// is equivalent to `metrics(MetricsConfig::none())`.
+    ///
+    /// For finer control use [`metrics`](Self::metrics).
     ///
     /// # Example
     ///
@@ -340,7 +346,28 @@ impl SpawnOptions {
     /// let opts = SpawnOptions::new().collect_metrics(true);
     /// ```
     pub fn collect_metrics(mut self, enable: bool) -> Self {
-        self.collect_metrics = enable;
+        if enable {
+            self.metrics_config = crate::metrics::MetricsConfig::summary_only();
+        } else {
+            self.metrics_config = crate::metrics::MetricsConfig::none();
+        }
+        self
+    }
+
+    /// Set the metrics configuration for this dataflow.
+    ///
+    /// Controls which categories of observability data are collected.
+    /// See [`MetricsConfig`](crate::metrics::MetricsConfig) for details.
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// use instancy::{SpawnOptions, metrics::MetricsConfig};
+    ///
+    /// let opts = SpawnOptions::new().metrics(MetricsConfig::full());
+    /// ```
+    pub fn metrics(mut self, config: crate::metrics::MetricsConfig) -> Self {
+        self.metrics_config = config;
         self
     }
 
@@ -445,7 +472,7 @@ impl Default for SpawnOptions {
     fn default() -> Self {
         Self {
             io_mode: IoMode::Sync,
-            collect_metrics: false,
+            metrics_config: crate::metrics::MetricsConfig::none(),
             priority: 0,
             cancellation_token: None,
             drain_timeout: None,
@@ -1247,7 +1274,8 @@ impl RuntimeHandle {
         mut dataflow: LogicalDataflow<T>,
         options: SpawnOptions,
     ) -> Result<SpawnedDataflow<T>> {
-        dataflow.collect_metrics = options.collect_metrics;
+        dataflow.collect_metrics = options.metrics_config.operator_summary;
+        dataflow.channel_counters = options.metrics_config.channel_counters;
         dataflow.drain_timeout = options.drain_timeout;
         self.spawn_internal(
             dataflow,
@@ -1418,7 +1446,7 @@ impl RuntimeHandle {
                     default_parallelism,
                     build,
                     options.io_mode.into(),
-                    options.collect_metrics,
+                    options.metrics_config.clone(),
                     options.priority,
                     options.cancellation_token,
                     options.drain_timeout,
@@ -1438,7 +1466,7 @@ impl RuntimeHandle {
                     stage_pars[0],
                     build,
                     options.io_mode.into(),
-                    options.collect_metrics,
+                    options.metrics_config.clone(),
                     options.priority,
                     options.cancellation_token,
                     options.drain_timeout,
@@ -1449,7 +1477,7 @@ impl RuntimeHandle {
                     default_parallelism,
                     build,
                     options.io_mode.into(),
-                    options.collect_metrics,
+                    options.metrics_config.clone(),
                     options.priority,
                     options.cancellation_token,
                     options.drain_timeout,
@@ -1461,7 +1489,7 @@ impl RuntimeHandle {
                 num_workers,
                 build,
                 options.io_mode.into(),
-                options.collect_metrics,
+                options.metrics_config.clone(),
                 options.priority,
                 options.cancellation_token,
                 options.drain_timeout,
@@ -1472,7 +1500,7 @@ impl RuntimeHandle {
                 num_workers,
                 build,
                 options.io_mode.into(),
-                options.collect_metrics,
+                options.metrics_config.clone(),
                 options.priority,
                 options.cancellation_token,
                 options.drain_timeout,
@@ -1702,7 +1730,7 @@ impl RuntimeHandle {
         num_workers: usize,
         build: F,
         mode: ChannelMode,
-        collect_metrics: bool,
+        metrics_config: crate::metrics::MetricsConfig,
         priority: u32,
         external_cancel: Option<tokio_util::sync::CancellationToken>,
         drain_timeout: Option<std::time::Duration>,
@@ -1723,7 +1751,8 @@ impl RuntimeHandle {
             let mut builder = DataflowBuilder::new(format!("{name}/worker-{worker_idx}"));
             build(&mut builder)?;
             let mut df = builder.build()?;
-            df.collect_metrics = collect_metrics;
+            df.collect_metrics = metrics_config.operator_summary;
+            df.channel_counters = metrics_config.channel_counters;
             df.drain_timeout = drain_timeout;
             dataflows.push(df);
         }
@@ -1746,8 +1775,20 @@ impl RuntimeHandle {
             // Take exchange creators from worker 0 (all workers have identical
             // topology, so worker 0's creators are representative).
             let creators = std::mem::take(&mut dataflows[0].exchange_creators);
+            let mut all_channel_collectors = Vec::new();
             for (edge_idx, edge_capacity, creator) in creators {
-                let shared_factories = creator(num_workers, num_workers, edge_capacity);
+                let ch_metrics = if metrics_config.channel_counters {
+                    let c = std::sync::Arc::new(crate::metrics::ChannelMetricsCollector::new(
+                        edge_idx,
+                        format!("exchange[{edge_idx}]"),
+                    ));
+                    all_channel_collectors.push(std::sync::Arc::clone(&c));
+                    Some(c)
+                } else {
+                    None
+                };
+                let shared_factories =
+                    creator(num_workers, num_workers, edge_capacity, ch_metrics);
                 if shared_factories.len() != num_workers {
                     return Err(Error::Runtime(RuntimeError::InvalidConfig(format!(
                         "exchange factory creator for edge {edge_idx} produced {} factories, expected {num_workers}",
@@ -1763,6 +1804,13 @@ impl RuntimeHandle {
                             "exchange edge {edge_idx} not found in worker {worker_idx}'s channel factories"
                         ))))?;
                     dataflows[worker_idx].channel_factories[pos].1 = factory;
+                }
+            }
+            // Store channel metrics collectors on all worker dataflows so they
+            // can be registered in each worker's DataflowMetrics.
+            if !all_channel_collectors.is_empty() {
+                for df in dataflows.iter_mut() {
+                    df.channel_metrics_collectors = all_channel_collectors.clone();
                 }
             }
             // Drain unused exchange_creators from other workers.
@@ -1934,7 +1982,7 @@ impl RuntimeHandle {
         default_parallelism: usize,
         build: F,
         mode: ChannelMode,
-        collect_metrics: bool,
+        metrics_config: crate::metrics::MetricsConfig,
         priority: u32,
         external_cancel: Option<tokio_util::sync::CancellationToken>,
         drain_timeout: Option<std::time::Duration>,
@@ -1962,7 +2010,7 @@ impl RuntimeHandle {
                 default_parallelism,
                 build,
                 mode,
-                collect_metrics,
+                metrics_config,
                 priority,
                 external_cancel,
                 drain_timeout,
@@ -1993,7 +2041,7 @@ impl RuntimeHandle {
                 num_workers,
                 build,
                 mode,
-                collect_metrics,
+                metrics_config,
                 priority,
                 external_cancel,
                 drain_timeout,
@@ -2008,7 +2056,8 @@ impl RuntimeHandle {
             let mut builder = DataflowBuilder::new(format!("{name}/worker-{worker_idx}"));
             build(&mut builder)?;
             let mut df = builder.build()?;
-            df.collect_metrics = collect_metrics;
+            df.collect_metrics = metrics_config.operator_summary;
+            df.channel_counters = metrics_config.channel_counters;
             df.drain_timeout = drain_timeout;
             dataflows.push(df);
         }
@@ -2024,6 +2073,7 @@ impl RuntimeHandle {
         if num_workers > 1 {
             let edges = dataflows[0].graph.edges().to_vec();
             let creators = std::mem::take(&mut dataflows[0].exchange_creators);
+            let mut all_channel_collectors = Vec::new();
 
             for (edge_idx, edge_capacity, creator) in creators {
                 // edge_idx is the index into graph.edges().
@@ -2045,7 +2095,17 @@ impl RuntimeHandle {
                     (num_workers, num_workers)
                 };
 
-                let shared_factories = creator(source_par, target_par, edge_capacity);
+                let ch_metrics = if metrics_config.channel_counters {
+                    let c = std::sync::Arc::new(crate::metrics::ChannelMetricsCollector::new(
+                        edge_idx,
+                        format!("exchange[{edge_idx}]"),
+                    ));
+                    all_channel_collectors.push(std::sync::Arc::clone(&c));
+                    Some(c)
+                } else {
+                    None
+                };
+                let shared_factories = creator(source_par, target_par, edge_capacity, ch_metrics);
                 let expected_count = std::cmp::max(source_par, target_par);
                 if shared_factories.len() != expected_count {
                     return Err(Error::Runtime(RuntimeError::InvalidConfig(format!(
@@ -2074,6 +2134,12 @@ impl RuntimeHandle {
                             })?;
                         dataflows[slot_idx].channel_factories[pos].1 = factory;
                     }
+                }
+            }
+            // Store channel metrics collectors on all worker dataflows.
+            if !all_channel_collectors.is_empty() {
+                for df in dataflows.iter_mut() {
+                    df.channel_metrics_collectors = all_channel_collectors.clone();
                 }
             }
 
@@ -2658,6 +2724,7 @@ impl RuntimeHandle {
                 edge_index: edge_order,
                 wake_handles: wake_handles.clone(),
                 runtime_handle: runtime_handle.clone(),
+                channel_metrics: None, // TODO: wire metrics_config for cluster
             };
             let all_factories = creator.create(params);
 
@@ -3373,7 +3440,7 @@ impl SimpleRuntime {
         if num_workers > 1 {
             let creators = std::mem::take(&mut dataflows[0].exchange_creators);
             for (edge_idx, edge_capacity, creator) in creators {
-                let shared_factories = creator(num_workers, num_workers, edge_capacity);
+                let shared_factories = creator(num_workers, num_workers, edge_capacity, None);
                 if shared_factories.len() != num_workers {
                     return Err(Error::Runtime(RuntimeError::InvalidConfig(format!(
                         "exchange factory creator for edge {edge_idx} produced {} factories, expected {num_workers}",
@@ -5046,7 +5113,7 @@ fn validate_stage_parallelism<T: Timestamp>(
 /// Automatically enables fused activation (topological operator ordering) for
 /// reduced scheduling overhead.
 fn materialize_executor<T: Timestamp>(
-    dataflow: LogicalDataflow<T>,
+    mut dataflow: LogicalDataflow<T>,
     cancel: CancellationToken,
     wake_handle: Option<WakeHandle>,
     worker_context: WorkerContext,
@@ -5058,7 +5125,9 @@ fn materialize_executor<T: Timestamp>(
         max_sweeps_per_poll: 64,
         catch_panics: dataflow.catch_panics,
         collect_metrics: dataflow.collect_metrics,
+        channel_counters: dataflow.channel_counters,
         drain_timeout: dataflow.drain_timeout,
+        channel_metrics_collectors: std::mem::take(&mut dataflow.channel_metrics_collectors),
     };
 
     // Destructure to allow accessing graph after moving factories.
@@ -8230,5 +8299,54 @@ mod tests {
 
             assert!(rt.current_topology().is_none());
         }
+    }
+
+    #[tokio::test]
+    async fn channel_metrics_collected_with_full_config() {
+        // Spawn a 2-worker exchange dataflow with MetricsConfig::full() and
+        // verify that channel metrics report non-zero items/bytes.
+        let rt = RuntimeHandle::new(RuntimeConfig::default()).unwrap();
+
+        let opts = SpawnOptions::new().metrics(crate::metrics::MetricsConfig::full());
+        let mut spawned = rt
+            .spawn_multi::<u64, _>(
+                "channel-metrics-test",
+                2,
+                |builder: &mut DataflowBuilder<u64>| {
+                    builder
+                        .source::<i32>("src", vec![(0u64, vec![1, 2, 3, 4, 5])])
+                        .exchange("ex", |x: &i32| *x as u64)
+                        .map("add", |_t, x| x + 1)
+                        .output("out")
+                        .unwrap();
+                    Ok(())
+                },
+                opts,
+            )
+            .unwrap();
+
+        // Drain outputs to let the dataflow complete.
+        let receivers = spawned.take_all_outputs::<i32>("out").unwrap();
+        for rx in receivers {
+            while rx.recv().is_some() {}
+        }
+
+        // All workers share the same channel metrics collectors. Verify presence.
+        let mut found_channel_data = false;
+        for w in 0..2 {
+            if let Some(m) = spawned.worker_mut(w).metrics() {
+                if m.channel_count() > 0 && m.total_items_transferred() > 0 {
+                    found_channel_data = true;
+                    break;
+                }
+            }
+        }
+        assert!(
+            found_channel_data,
+            "expected channel metrics with non-zero items transferred"
+        );
+
+        spawned.cancel();
+        let _ = spawned.join_blocking();
     }
 }

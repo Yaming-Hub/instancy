@@ -1572,6 +1572,62 @@ All metrics are also emitted as `tracing` spans and events for integration with 
 //   activation_count=42, cpu_time_us=1234, records=50000
 ```
 
+#### MetricsConfig — Granular Metrics Control
+
+Metrics collection is controlled by `MetricsConfig`, which allows fine-grained
+selection of what data to collect. This avoids the overhead of collecting
+unnecessary metrics in production while keeping full instrumentation available
+for debugging.
+
+```rust
+pub struct MetricsConfig {
+    /// Collect per-operator summary stats (activation count, CPU time, records).
+    /// Overhead: ~1 `Instant::now()` per activation.
+    pub operator_summary: bool,
+    /// Collect per-exchange-edge channel counters (items and bytes transferred).
+    /// Overhead: ~2 atomic adds per batch push (~2-3% when enabled).
+    pub channel_counters: bool,
+}
+```
+
+**Presets**:
+- `MetricsConfig::none()` — all collection disabled (zero overhead, default)
+- `MetricsConfig::summary_only()` — operator stats only (cheap)
+- `MetricsConfig::full()` — operator stats + channel counters
+
+**Usage**:
+```rust
+let opts = SpawnOptions::new().metrics(MetricsConfig::full());
+let mut multi = rt.spawn_multi("df", 4, build_fn, opts)?;
+```
+
+**Channel counters** track per-exchange-edge transfer volumes:
+
+```rust
+pub struct ChannelMetrics {
+    pub edge_index: usize,
+    pub label: String,
+    pub items_transferred: u64,
+    pub bytes_transferred: u64,
+}
+```
+
+Each exchange edge gets a shared `ChannelMetricsCollector` (atomic counters)
+that all source workers push through. The collector is created during exchange
+channel materialization (Phase 3 of `spawn_multi`) and registered in each
+worker's `DataflowMetrics`. Since collectors are `Arc`-shared across workers,
+the counters reflect the total traffic through the edge, not per-worker.
+
+Access channel metrics after the dataflow runs:
+```rust
+if let Some(metrics) = handle.metrics() {
+    for ch in metrics.channel_snapshots() {
+        println!("{}: {} items, {} bytes", ch.label, ch.items_transferred, ch.bytes_transferred);
+    }
+    println!("Total items: {}", metrics.total_items_transferred());
+}
+```
+
 ### 5.8 Message Envelope
 
 Messages flowing through the dataflow carry data, control signals, and optional user-defined metadata in a unified envelope:
