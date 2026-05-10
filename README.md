@@ -11,8 +11,9 @@ instancy retains the core concepts of timely dataflow — timestamps, frontiers,
 | **Execution** | 1 OS thread per worker | Shared async worker pool — multiple dataflows share threads |
 | **Networking** | Fixed TCP hostfile | Application provides connections (supports mTLS, pooling) |
 | **Serialization** | Hardcoded `Abomonation` | Pluggable `Codec` trait |
-| **Error handling** | Panics | `Result<T, Error>` throughout |
+| **Error handling** | Panics | `Result<T, Error>` with module-aligned sub-enums |
 | **Cancellation** | Drop the worker | Cooperative `CancellationToken` |
+| **Cluster scaling** | Static: all nodes known at startup | Dynamic: nodes join/leave at runtime via `ClusterMembership` |
 | **Testing** | Requires multiple OS processes | Single-process multi-node testing via in-memory transport |
 
 ## Quick Start
@@ -286,6 +287,48 @@ pub trait Codec<T>: Send + Sync {
 
 Built-in codecs exist for primitive types, tuples, strings, `Vec<u8>`, and `Product` timestamps. Custom types implement `ExchangeData` to participate in cross-worker exchange.
 
+## Dynamic Cluster Scaling
+
+Nodes can join or leave a running cluster at runtime. The hosting application provides a `ClusterMembership` implementation that produces node join/leave events; the runtime automatically updates the live topology.
+
+```rust
+use instancy::{
+    ChannelMembership, ClusterTopology, MembershipEvent, NodeConfig,
+    RuntimeConfig, RuntimeHandle,
+};
+
+// Create a membership provider and attach it to the topology.
+let membership = ChannelMembership::new();
+let tx = membership.sender();
+
+let topology = ClusterTopology::multi_node(vec![
+    NodeConfig::new("node-a", 4),
+    NodeConfig::new("node-b", 4),
+]).unwrap().with_membership(membership);
+
+// Pass topology via RuntimeConfig — membership listener starts automatically.
+let rt = RuntimeHandle::new(RuntimeConfig {
+    topology: Some(topology),
+    ..Default::default()
+}).unwrap();
+
+// Later: a new node joins (e.g., from a Kubernetes pod watch).
+tx.send(MembershipEvent::NodeJoined {
+    node_id: "node-c".into(),
+    logical_workers: 4,
+}).unwrap();
+
+// The live topology is updated — new spawn_cluster calls include node-c.
+let topo = rt.current_topology().unwrap();
+assert_eq!(topo.node_count(), 3);
+```
+
+**Key behaviors:**
+- **Node join**: topology expands; new `spawn_cluster` calls include the new node
+- **Node leave**: affected dataflows are cancelled; topology contracts
+- **Already-running dataflows are not repartitioned** — only new dataflows use the updated topology
+- **The application is the single source of truth** — the runtime does not perform its own discovery
+
 ## Examples
 
 Run any example with (from the workspace root):
@@ -455,6 +498,7 @@ cargo test -p instancy --all-features --test cluster_tcp
 | `instancy/tests/scheduler_policies.rs` | Task scheduler policy tests |
 | `instancy/tests/timeout.rs` | Timeout and cancellation tests |
 | `instancy/tests/graceful_drain.rs` | Graceful drain on cancellation tests |
+| `instancy/tests/rolling_upgrade.rs` | Dynamic cluster scaling lifecycle tests |
 | `instancy/tests/spawn_dataflow.rs` | Spawn and auto-parallelism tests |
 | `instancy/tests/staged_parallelism.rs` | Per-stage parallelism tests |
 
@@ -465,7 +509,8 @@ instancy/
 ├── src/
 │   ├── lib.rs                    # Public API and re-exports
 │   ├── runtime.rs                # RuntimeHandle, SpawnOptions, spawn_cluster
-│   ├── error.rs                  # Error enum and Result type
+│   ├── error.rs                  # Module-aligned error hierarchy
+│   ├── execute.rs                # ClusterTopology, membership types, execution config
 │   ├── cancellation.rs           # CancellationToken and CancellationReason
 │   ├── metrics/                   # Per-operator metrics collection
 │   ├── worker.rs                 # WorkerId and OperatorActivation
