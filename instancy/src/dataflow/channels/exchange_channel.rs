@@ -50,7 +50,7 @@
 use std::collections::VecDeque;
 use std::sync::{Arc, Mutex};
 
-use crate::dataflow::channels::bounded::{BoundedPull, BoundedPush, bounded_channel};
+use crate::dataflow::channels::spsc::{SpscPull, SpscPush, spsc_channel};
 use crate::dataflow::channels::envelope::{ControlSignal, Envelope, Payload};
 use crate::dataflow::channels::pact::ExchangeFn;
 use crate::dataflow::channels::pushpull::{Pull, Push};
@@ -126,7 +126,7 @@ impl SharedWakeRegistry {
 ///
 /// # Intra-node only
 ///
-/// This implementation uses in-process [`BoundedPush`]/[`BoundedPull`] pairs
+/// This implementation uses in-process [`SpscPush`]/[`SpscPull`] pairs
 /// backed by shared memory (`Arc<Mutex>`), so **all N workers must reside in
 /// the same OS process**. For cross-node (distributed) exchange, the matrix
 /// entries for remote worker pairs would be replaced with network-backed
@@ -151,10 +151,10 @@ pub(crate) struct ExchangeChannelSet<T: Timestamp, D> {
     num_targets: usize,
     /// push_ends\[src\]\[dst\] — source worker pushes to destination worker.
     /// Dimensions: num_sources × num_targets.
-    push_ends: Vec<Vec<Option<BoundedPush<T, D, ()>>>>,
+    push_ends: Vec<Vec<Option<SpscPush<T, D, ()>>>>,
     /// pull_ends\[src\]\[dst\] — destination worker pulls from source worker.
     /// Dimensions: num_sources × num_targets.
-    pull_ends: Vec<Vec<Option<BoundedPull<T, D, ()>>>>,
+    pull_ends: Vec<Vec<Option<SpscPull<T, D, ()>>>>,
 }
 
 impl<T: Timestamp, D: Send + 'static> ExchangeChannelSet<T, D> {
@@ -180,7 +180,7 @@ impl<T: Timestamp, D: Send + 'static> ExchangeChannelSet<T, D> {
             let mut src_pushers = Vec::with_capacity(num_targets);
             let mut src_pullers = Vec::with_capacity(num_targets);
             for _dst in 0..num_targets {
-                let (push, pull) = bounded_channel::<T, D, ()>(capacity);
+                let (push, pull) = spsc_channel::<T, D, ()>(capacity);
                 src_pushers.push(Some(push));
                 src_pullers.push(Some(pull));
             }
@@ -204,7 +204,7 @@ impl<T: Timestamp, D: Send + 'static> ExchangeChannelSet<T, D> {
     ///
     /// Returns boxed trait objects so `ExchangePush`/`ExchangePull` are
     /// transport-agnostic. For this in-process implementation, the concrete
-    /// types behind the boxes are `BoundedPush`/`BoundedPull`.
+    /// types behind the boxes are `SpscPush`/`SpscPull`.
     ///
     /// Each worker's pair can only be taken once.
     ///
