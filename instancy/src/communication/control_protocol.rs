@@ -693,22 +693,33 @@ pub async fn broadcast_cancel_with_transport(
 ///
 /// When any peer sends `Cancel`, the local cancellation token is cancelled with
 /// [`CancellationReason::PeerCancelled`]. The task exits when all receivers are
-/// closed or when the local cancellation token is already cancelled.
+/// closed, the local cancellation token fires, or the `shutdown` token fires
+/// (indicating normal dataflow completion).
+///
+/// # Security
+///
+/// This function assumes all peers in `control_receivers` are authenticated at
+/// the connection layer (e.g., via mTLS in the application's `ConnectionManager`).
+/// The `Cancel` message itself carries no cryptographic signature — peer identity
+/// verification is the responsibility of the transport layer.
 #[cfg(feature = "transport")]
 pub fn spawn_cancel_listener(
     control_receivers: std::collections::HashMap<String, tokio::sync::mpsc::Receiver<Vec<u8>>>,
     cancel_token: CancellationToken,
+    shutdown: tokio_util::sync::CancellationToken,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         let mut set = tokio::task::JoinSet::new();
 
         for (peer_id, mut rx) in control_receivers {
             let token = cancel_token.clone();
+            let shut = shutdown.clone();
             set.spawn(async move {
                 loop {
                     tokio::select! {
                         biased;
                         _ = token.cancelled_async() => return,
+                        _ = shut.cancelled() => return,
                         maybe_data = rx.recv() => {
                             let Some(data) = maybe_data else {
                                 return;
@@ -852,7 +863,11 @@ mod tests {
         let mut control_receivers = std::collections::HashMap::new();
         control_receivers.insert("node-b".to_string(), rx);
 
-        let listener = spawn_cancel_listener(control_receivers, cancel_token.clone());
+        let listener = spawn_cancel_listener(
+            control_receivers,
+            cancel_token.clone(),
+            tokio_util::sync::CancellationToken::new(),
+        );
         tx.send(encode_control_message(&ControlMessage::Cancel {
             reason: "user requested shutdown".to_string(),
         }))
@@ -872,6 +887,27 @@ mod tests {
                 detail: "user requested shutdown".to_string(),
             })
         );
+    }
+
+    #[tokio::test]
+    async fn spawn_cancel_listener_exits_on_shutdown() {
+        let cancel_token = CancellationToken::new();
+        let shutdown = tokio_util::sync::CancellationToken::new();
+        let (_tx, rx) = tokio::sync::mpsc::channel::<Vec<u8>>(1);
+        let mut control_receivers = std::collections::HashMap::new();
+        control_receivers.insert("node-b".to_string(), rx);
+
+        let listener = spawn_cancel_listener(control_receivers, cancel_token.clone(), shutdown.clone());
+
+        // Signal shutdown (normal completion) — listener should exit promptly
+        // without cancelling the dataflow token.
+        shutdown.cancel();
+        tokio::time::timeout(std::time::Duration::from_secs(2), listener)
+            .await
+            .expect("listener should exit on shutdown")
+            .unwrap();
+
+        assert!(!cancel_token.is_cancelled(), "dataflow token should not be cancelled on clean shutdown");
     }
 
     #[tokio::test]

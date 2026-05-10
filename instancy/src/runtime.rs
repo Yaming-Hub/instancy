@@ -472,6 +472,9 @@ impl From<IoMode> for ChannelMode {
 /// of a cluster dataflow. Stored in [`PeerRegistry`].
 #[cfg(feature = "transport")]
 struct ClusterCancelHandle {
+    /// Shared dataflow-level token. Cancelling this propagates to all child
+    /// worker tokens AND triggers the distributed cancel broadcaster.
+    dataflow_cancel: CancellationToken,
     worker_tokens: Vec<CancellationToken>,
     bridge_cancel: tokio_util::sync::CancellationToken,
 }
@@ -479,10 +482,14 @@ struct ClusterCancelHandle {
 #[cfg(feature = "transport")]
 impl ClusterCancelHandle {
     fn cancel_with_reason(&self, reason: CancellationReason) {
-        self.bridge_cancel.cancel();
+        // Cancel the shared dataflow token first — this triggers the
+        // distributed cancel broadcaster (Phase 8.5) which notifies
+        // healthy peer nodes before we tear down bridges.
+        self.dataflow_cancel.cancel_with_reason(reason.clone());
         for token in &self.worker_tokens {
             token.cancel_with_reason(reason.clone());
         }
+        self.bridge_cancel.cancel();
     }
 
     /// Returns true if this dataflow is already cancelled or completed.
@@ -579,6 +586,7 @@ impl PeerRegistry {
                 id,
                 _dataflow_name: dataflow_name.to_string(),
                 cancel_handle: ClusterCancelHandle {
+                    dataflow_cancel: cancel_handle.dataflow_cancel.clone(),
                     worker_tokens: cancel_handle.worker_tokens.clone(),
                     bridge_cancel: cancel_handle.bridge_cancel.clone(),
                 },
@@ -2863,6 +2871,7 @@ impl RuntimeHandle {
                 .as_ref()
                 .expect("dataflow_cancel always set for cluster dataflows")
                 .clone(),
+            bridge_cancel.clone(),
         );
         {
             let broadcast_cancel_token = dataflow_cancel
@@ -2939,6 +2948,10 @@ impl RuntimeHandle {
             let worker_tokens: Vec<CancellationToken> =
                 workers.iter().map(|w| w.cancel.clone()).collect();
             let cancel_handle = ClusterCancelHandle {
+                dataflow_cancel: dataflow_cancel
+                    .as_ref()
+                    .expect("dataflow_cancel always set for cluster dataflows")
+                    .clone(),
                 worker_tokens,
                 bridge_cancel: bridge_cancel.clone(),
             };
@@ -7319,6 +7332,7 @@ mod tests {
 
         // Dataflow 1 uses peers ["node-b", "node-c"]
         let handle1 = ClusterCancelHandle {
+            dataflow_cancel: token1.clone(),
             worker_tokens: vec![token1.clone()],
             bridge_cancel: bridge1.clone(),
         };
@@ -7326,6 +7340,7 @@ mod tests {
 
         // Dataflow 2 uses peers ["node-b", "node-d"]
         let handle2 = ClusterCancelHandle {
+            dataflow_cancel: token2.clone(),
             worker_tokens: vec![token2.clone()],
             bridge_cancel: bridge2.clone(),
         };
@@ -7377,6 +7392,7 @@ mod tests {
         let bridge = tokio_util::sync::CancellationToken::new();
 
         let handle = ClusterCancelHandle {
+            dataflow_cancel: token.clone(),
             worker_tokens: vec![token.clone()],
             bridge_cancel: bridge.clone(),
         };
@@ -7416,6 +7432,7 @@ mod tests {
         let token = CancellationToken::new();
         let bridge = tokio_util::sync::CancellationToken::new();
         let handle = ClusterCancelHandle {
+            dataflow_cancel: token.clone(),
             worker_tokens: vec![token.clone()],
             bridge_cancel: bridge.clone(),
         };
@@ -7449,6 +7466,7 @@ mod tests {
         let token = CancellationToken::new();
         let bridge = tokio_util::sync::CancellationToken::new();
         let handle = ClusterCancelHandle {
+            dataflow_cancel: token.clone(),
             worker_tokens: vec![token.clone()],
             bridge_cancel: bridge.clone(),
         };
