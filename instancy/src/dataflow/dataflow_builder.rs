@@ -975,6 +975,9 @@ impl<T: Timestamp> DataflowBuilder<T> {
             channel_counters: false,
             drain_timeout: None,
             channel_metrics_collectors: Vec::new(),
+            activation_timeline: false,
+            min_activation_duration: std::time::Duration::from_micros(1),
+            max_timeline_events: 0,
         })
     }
 }
@@ -4779,6 +4782,12 @@ pub struct LogicalDataflow<T: Timestamp> {
     /// `DataflowMetrics` during executor materialization.
     pub(crate) channel_metrics_collectors:
         Vec<std::sync::Arc<crate::metrics::ChannelMetricsCollector>>,
+    /// Whether to record activation timeline events.
+    pub(crate) activation_timeline: bool,
+    /// Minimum activation duration to record in the timeline.
+    pub(crate) min_activation_duration: std::time::Duration,
+    /// Maximum timeline events per dataflow (ring buffer cap). 0 = unlimited.
+    pub(crate) max_timeline_events: usize,
 }
 
 impl<T: Timestamp> LogicalDataflow<T> {

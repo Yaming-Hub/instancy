@@ -1587,13 +1587,20 @@ pub struct MetricsConfig {
     /// Collect per-exchange-edge channel counters (items and bytes transferred).
     /// Overhead: ~2 atomic adds per batch push (~2-3% when enabled).
     pub channel_counters: bool,
+    /// Record each operator activation as a timestamped event for timeline replay.
+    /// Overhead: ~5-10% (timestamp capture + Vec push per activation).
+    pub activation_timeline: bool,
+    /// Minimum activation duration to record in the timeline (default: 1µs).
+    pub min_activation_duration: Duration,
+    /// Maximum timeline events per dataflow (ring buffer cap, 0 = unlimited).
+    pub max_timeline_events: usize,
 }
 ```
 
 **Presets**:
 - `MetricsConfig::none()` — all collection disabled (zero overhead, default)
 - `MetricsConfig::summary_only()` — operator stats only (cheap)
-- `MetricsConfig::full()` — operator stats + channel counters
+- `MetricsConfig::full()` — operator stats + channel counters + activation timeline (100K event cap)
 
 **Usage**:
 ```rust
@@ -1627,6 +1634,40 @@ if let Some(metrics) = handle.metrics() {
     println!("Total items: {}", metrics.total_items_transferred());
 }
 ```
+
+#### Activation Timeline — Per-Activation Event Recording
+
+When `activation_timeline` is enabled, the executor records each operator
+activation as a timestamped `ActivationEvent`:
+
+```rust
+pub struct ActivationEvent {
+    pub operator_index: usize,   // position in the dataflow graph
+    pub worker_index: usize,     // which worker executed this activation
+    pub start_us: u64,           // offset from dataflow start, in µs
+    pub duration_us: u64,        // activation wall-clock duration, in µs
+}
+```
+
+Events are collected per-worker in a `TimelineCollector` (thread-safe ring
+buffer behind `Mutex<Vec>`). When `max_timeline_events > 0`, the oldest events
+are evicted when the cap is reached. Activations shorter than
+`min_activation_duration` are filtered at record time (still counted in
+`operator_summary` if enabled).
+
+Access timeline events after the dataflow runs:
+```rust
+if let Some(metrics) = handle.metrics() {
+    let events = metrics.drain_timeline_events(); // sorted by start_us
+    for ev in &events {
+        println!("op[{}] w{}: {}µs @ +{}µs",
+            ev.operator_index, ev.worker_index, ev.duration_us, ev.start_us);
+    }
+}
+```
+
+The timeline data is designed for export to Chrome Trace JSON format (Phase 3),
+enabling post-execution visualization in Perfetto UI or Chrome's `chrome://tracing`.
 
 ### 5.8 Message Envelope
 
