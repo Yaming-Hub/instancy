@@ -55,13 +55,14 @@
 
 use std::fmt;
 use std::marker::PhantomData;
+use std::sync::Arc;
 
 /// Maximum allowed message size (256 MB). Prevents allocation-based DoS from
 /// malicious or corrupted length prefixes.
 pub const MAX_MESSAGE_SIZE: usize = 256 * 1024 * 1024;
 
 /// Errors that can occur during encoding or decoding.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone)]
 pub enum CodecError {
     /// Not enough bytes available to decode a value.
     InsufficientData {
@@ -74,6 +75,24 @@ pub enum CodecError {
     InvalidData(String),
     /// A custom error from a user-defined codec.
     Custom(String),
+    /// CRC32 integrity check failed.
+    CrcMismatch {
+        /// The CRC32 value read from the data.
+        expected: u32,
+        /// The CRC32 value computed from the payload.
+        actual: u32,
+    },
+    /// Payload exceeds the maximum allowed size.
+    PayloadTooLarge {
+        /// Actual payload size in bytes.
+        size: usize,
+        /// Maximum allowed size in bytes.
+        max: usize,
+    },
+    /// An error from an external codec library (e.g., bincode, protobuf).
+    ///
+    /// Wrapped in `Arc` to preserve `Clone` on `CodecError`.
+    External(Arc<dyn std::error::Error + Send + Sync>),
 }
 
 impl fmt::Display for CodecError {
@@ -87,23 +106,85 @@ impl fmt::Display for CodecError {
             }
             Self::InvalidData(msg) => write!(f, "invalid data: {msg}"),
             Self::Custom(msg) => write!(f, "codec error: {msg}"),
+            Self::CrcMismatch { expected, actual } => {
+                write!(
+                    f,
+                    "CRC32 mismatch: expected {expected:#010x}, got {actual:#010x}"
+                )
+            }
+            Self::PayloadTooLarge { size, max } => {
+                write!(f, "payload too large: {size} bytes exceeds maximum {max}")
+            }
+            Self::External(err) => write!(f, "external codec error: {err}"),
         }
     }
 }
 
-impl std::error::Error for CodecError {}
+impl std::error::Error for CodecError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::External(err) => Some(err.as_ref()),
+            _ => None,
+        }
+    }
+}
+
+impl PartialEq for CodecError {
+    fn eq(&self, other: &Self) -> bool {
+        match (self, other) {
+            (
+                Self::InsufficientData {
+                    needed: n1,
+                    available: a1,
+                },
+                Self::InsufficientData {
+                    needed: n2,
+                    available: a2,
+                },
+            ) => n1 == n2 && a1 == a2,
+            (Self::InvalidData(a), Self::InvalidData(b)) => a == b,
+            (Self::Custom(a), Self::Custom(b)) => a == b,
+            (
+                Self::CrcMismatch {
+                    expected: e1,
+                    actual: a1,
+                },
+                Self::CrcMismatch {
+                    expected: e2,
+                    actual: a2,
+                },
+            ) => e1 == e2 && a1 == a2,
+            (
+                Self::PayloadTooLarge {
+                    size: s1,
+                    max: m1,
+                },
+                Self::PayloadTooLarge {
+                    size: s2,
+                    max: m2,
+                },
+            ) => s1 == s2 && m1 == m2,
+            // External errors wrap trait objects — equality is not meaningful.
+            // Two External values are equal only if they point to the same Arc.
+            (Self::External(a), Self::External(b)) => Arc::ptr_eq(a, b),
+            _ => false,
+        }
+    }
+}
+
+impl Eq for CodecError {}
 
 /// Encode a length as a 4-byte little-endian prefix. Returns error if value exceeds u32 or MAX_MESSAGE_SIZE.
 fn encode_length_prefix(len: usize, buf: &mut Vec<u8>) -> Result<(), CodecError> {
     if len > MAX_MESSAGE_SIZE {
-        return Err(CodecError::Custom(format!(
-            "payload too large: {len} bytes exceeds maximum {MAX_MESSAGE_SIZE}"
-        )));
+        return Err(CodecError::PayloadTooLarge {
+            size: len,
+            max: MAX_MESSAGE_SIZE,
+        });
     }
-    let len_u32 = u32::try_from(len).map_err(|_| {
-        CodecError::Custom(format!(
-            "payload too large for u32 length prefix: {len} bytes"
-        ))
+    let len_u32 = u32::try_from(len).map_err(|_| CodecError::PayloadTooLarge {
+        size: len,
+        max: u32::MAX as usize,
     })?;
     buf.extend_from_slice(&len_u32.to_le_bytes());
     Ok(())
@@ -119,9 +200,10 @@ fn decode_length_prefix(buf: &[u8]) -> Result<usize, CodecError> {
     }
     let len = u32::from_le_bytes([buf[0], buf[1], buf[2], buf[3]]) as usize;
     if len > MAX_MESSAGE_SIZE {
-        return Err(CodecError::InvalidData(format!(
-            "length prefix {len} exceeds maximum message size {MAX_MESSAGE_SIZE}"
-        )));
+        return Err(CodecError::PayloadTooLarge {
+            size: len,
+            max: MAX_MESSAGE_SIZE,
+        });
     }
     Ok(len)
 }
@@ -221,7 +303,7 @@ where
 {
     fn encode(&self, value: &T, buf: &mut Vec<u8>) -> Result<(), CodecError> {
         let payload = bincode::serialize(value)
-            .map_err(|e| CodecError::Custom(format!("bincode encode: {e}")))?;
+            .map_err(|e| CodecError::External(Arc::from(e as Box<dyn std::error::Error + Send + Sync>)))?;
         encode_length_prefix(payload.len(), buf)?;
         buf.extend_from_slice(&payload);
         Ok(())
@@ -237,7 +319,7 @@ where
             });
         }
         let value = bincode::deserialize(&buf[4..total])
-            .map_err(|e| CodecError::Custom(format!("bincode decode: {e}")))?;
+            .map_err(|e| CodecError::External(Arc::from(e as Box<dyn std::error::Error + Send + Sync>)))?;
         Ok((value, total))
     }
 }
@@ -822,15 +904,21 @@ mod tests {
         let codec = StringCodec;
         let err = codec.decode(&buf).unwrap_err();
         match err {
-            CodecError::InvalidData(msg) => assert!(msg.contains("exceeds maximum")),
-            other => panic!("expected InvalidData, got {other:?}"),
+            CodecError::PayloadTooLarge { size, max } => {
+                assert_eq!(size, MAX_MESSAGE_SIZE + 1);
+                assert_eq!(max, MAX_MESSAGE_SIZE);
+            }
+            other => panic!("expected PayloadTooLarge, got {other:?}"),
         }
 
         let raw_codec = RawBytesCodec;
         let err = raw_codec.decode(&buf).unwrap_err();
         match err {
-            CodecError::InvalidData(msg) => assert!(msg.contains("exceeds maximum")),
-            other => panic!("expected InvalidData, got {other:?}"),
+            CodecError::PayloadTooLarge { size, max } => {
+                assert_eq!(size, MAX_MESSAGE_SIZE + 1);
+                assert_eq!(max, MAX_MESSAGE_SIZE);
+            }
+            other => panic!("expected PayloadTooLarge, got {other:?}"),
         }
     }
 

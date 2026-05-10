@@ -823,11 +823,11 @@ match handle.join_blocking() {
     Err(instancy::error::Error::Cancelled { reason }) => {
         match reason {
             Some(CancellationReason::UserRequested) => println!("User stopped the dataflow"),
-            Some(CancellationReason::NetworkError(msg)) => println!("Network failure: {msg}"),
-            Some(CancellationReason::WorkerFailed(msg)) => println!("Worker crashed: {msg}"),
+            Some(CancellationReason::NetworkError { detail }) => println!("Network failure: {detail}"),
+            Some(CancellationReason::WorkerFailed { detail }) => println!("Worker crashed: {detail}"),
             Some(CancellationReason::RuntimeShutdown) => println!("Runtime shut down"),
             Some(CancellationReason::HandleDropped) => println!("Handle was dropped"),
-            Some(CancellationReason::OperatorError(msg)) => println!("Operator error: {msg}"),
+            Some(CancellationReason::OperatorError { detail }) => println!("Operator error: {detail}"),
             None => println!("Cancelled (no reason available)"),
         }
     }
@@ -1429,7 +1429,7 @@ println!("Cancelled {cancelled} dataflows due to node-3 failure");
 ```
 
 **What happens:**
-1. All cluster dataflows with workers on `"node-3"` are cancelled with `CancellationReason::PeerDown("node-3")`.
+1. All cluster dataflows with workers on `"node-3"` are cancelled with `CancellationReason::PeerDown { node_id: "node-3".into() }`.
 2. Both the local worker executors and network bridge tasks are stopped.
 3. `DataflowCompletion` resolves with a cancellation error — the application can match on the `PeerDown` reason.
 
@@ -1439,7 +1439,7 @@ println!("Cancelled {cancelled} dataflows due to node-3 failure");
 match cluster_dataflow.join_blocking() {
     Err(e) if e.is_cancelled() => {
         // Check reason
-        if let Some(CancellationReason::PeerDown(node_id)) = e.cancellation_reason() {
+        if let Some(CancellationReason::PeerDown { node_id }) = e.cancellation_reason() {
             println!("Peer {node_id} went down, retrying on healthy nodes...");
             // Rebuild topology without the failed node and re-spawn
         }

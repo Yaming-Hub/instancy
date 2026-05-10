@@ -101,6 +101,8 @@ pub use cancellation::{CancellationReason, CancellationToken};
 
 // Error handling
 pub use error::{CommunicationError, DataflowError, Error, Result, RuntimeError, TopologyError};
+#[cfg(feature = "transport")]
+pub use communication::control_protocol::ControlProtocolError;
 
 // Worker types
 pub use worker::WorkerId;

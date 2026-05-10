@@ -1820,7 +1820,7 @@ instancy provides a notification API that the hosting application calls when it 
 ```rust
 /// Report that a peer node is no longer reachable.
 /// All cluster dataflows with workers on the downed peer are cancelled with
-/// `CancellationReason::PeerDown(peer_node_id)`.
+/// `CancellationReason::PeerDown { node_id: peer_node_id }`.
 /// Returns the number of dataflows that were newly cancelled.
 let cancelled = runtime_handle.report_node_leave("node-3");
 ```
@@ -1848,7 +1848,7 @@ For node leave (`report_node_leave(node_id)`):
 1. The hosting application calls `report_node_leave(node_id)`.
 2. All pooled connections to the departed node are dropped and evicted from the connection pool.
 3. The runtime identifies all active dataflows with workers on that node.
-4. Each affected dataflow's `CancellationToken` is triggered with `CancellationReason::PeerDown(node_id)`.
+4. Each affected dataflow's `CancellationToken` is triggered with `CancellationReason::PeerDown { node_id }`.
 5. Operators observe cancellation, drop capabilities, and exit.
 6. `execute()` / `DataflowHandle` returns with an error indicating peer failure.
 7. The node is recorded as "left" — any future `spawn_cluster` referencing it is immediately cancelled.
@@ -2779,11 +2779,40 @@ enum RuntimeError {
     EmptyDataflow,
 }
 
-// Communication errors (1 variant)
+// Communication errors (4 variants)
 enum CommunicationError {
     Codec(Box<dyn Error + Send + Sync>),
+    Protocol(ControlProtocolError),    // #[cfg(feature = "transport")]
+    InvalidConfig(String),
+    InvalidSetup(String),
+}
+
+// Control protocol errors (6 variants, transport-only)
+enum ControlProtocolError {
+    TooShort { len },
+    CrcMismatch { expected, actual },
+    InvalidPayloadSize { expected, actual },
+    InvalidUtf8 { source: Utf8Error },
+    UnknownMessageType { msg_type },
+    WireRead(Box<Error>),
 }
 ```
+
+**`CodecError`** (separate from the hierarchy, in `communication::codec`):
+
+```rust
+enum CodecError {
+    InsufficientData { needed, available },
+    InvalidData(String),
+    Custom(String),
+    CrcMismatch { expected: u32, actual: u32 },
+    PayloadTooLarge { size: usize, max: usize },
+    External(Box<dyn Error + Send + Sync>),
+}
+```
+
+`CodecError` is intentionally **not** nested under `CommunicationError`. It is used
+directly by the `Codec<T>` trait and user-defined codecs, so it stays independent.
 
 ### 8.2 Error Organization Principles
 

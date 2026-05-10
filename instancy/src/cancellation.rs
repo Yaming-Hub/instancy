@@ -67,25 +67,23 @@ pub enum CancellationReason {
     RuntimeShutdown,
 
     /// A network-level error caused cancellation (e.g., TCP disconnect,
-    /// transport session failure). The string describes the error.
-    NetworkError(String),
+    /// transport session failure).
+    NetworkError { detail: String },
 
     /// A worker in the dataflow failed, causing cascading cancellation
-    /// of peer workers. The string describes which worker or what failed.
-    WorkerFailed(String),
+    /// of peer workers.
+    WorkerFailed { detail: String },
 
     /// The owning handle (e.g., [`crate::SpawnedDataflow`]) was dropped without
     /// calling `join()`, triggering automatic cancellation.
     HandleDropped,
 
     /// An operator produced an error that caused the dataflow to be cancelled.
-    /// The string describes the operator and the error.
-    OperatorError(String),
+    OperatorError { detail: String },
 
     /// A peer node in the cluster was reported as down by the hosting
     /// application via [`crate::RuntimeHandle::report_node_leave()`].
-    /// The string is the peer's `node_id`.
-    PeerDown(String),
+    PeerDown { node_id: String },
 }
 
 impl fmt::Display for CancellationReason {
@@ -93,11 +91,11 @@ impl fmt::Display for CancellationReason {
         match self {
             Self::UserRequested => write!(f, "user requested cancellation"),
             Self::RuntimeShutdown => write!(f, "runtime shutdown"),
-            Self::NetworkError(msg) => write!(f, "network error: {msg}"),
-            Self::WorkerFailed(msg) => write!(f, "worker failed: {msg}"),
+            Self::NetworkError { detail } => write!(f, "network error: {detail}"),
+            Self::WorkerFailed { detail } => write!(f, "worker failed: {detail}"),
             Self::HandleDropped => write!(f, "handle dropped"),
-            Self::OperatorError(msg) => write!(f, "operator error: {msg}"),
-            Self::PeerDown(node_id) => write!(f, "peer node down: {node_id}"),
+            Self::OperatorError { detail } => write!(f, "operator error: {detail}"),
+            Self::PeerDown { node_id } => write!(f, "peer node down: {node_id}"),
         }
     }
 }
@@ -860,20 +858,28 @@ mod tests {
     #[test]
     fn cancel_with_network_error_reason() {
         let token = CancellationToken::new();
-        token.cancel_with_reason(CancellationReason::NetworkError("peer lost".into()));
+        token.cancel_with_reason(CancellationReason::NetworkError {
+            detail: "peer lost".into(),
+        });
         assert_eq!(
             token.reason(),
-            Some(CancellationReason::NetworkError("peer lost".into()))
+            Some(CancellationReason::NetworkError {
+                detail: "peer lost".into(),
+            })
         );
     }
 
     #[test]
     fn cancel_with_worker_failed_reason() {
         let token = CancellationToken::new();
-        token.cancel_with_reason(CancellationReason::WorkerFailed("worker 3 panicked".into()));
+        token.cancel_with_reason(CancellationReason::WorkerFailed {
+            detail: "worker 3 panicked".into(),
+        });
         assert_eq!(
             token.reason(),
-            Some(CancellationReason::WorkerFailed("worker 3 panicked".into()))
+            Some(CancellationReason::WorkerFailed {
+                detail: "worker 3 panicked".into(),
+            })
         );
     }
 
@@ -887,10 +893,14 @@ mod tests {
     #[test]
     fn cancel_with_operator_error_reason() {
         let token = CancellationToken::new();
-        token.cancel_with_reason(CancellationReason::OperatorError("division by zero".into()));
+        token.cancel_with_reason(CancellationReason::OperatorError {
+            detail: "division by zero".into(),
+        });
         assert_eq!(
             token.reason(),
-            Some(CancellationReason::OperatorError("division by zero".into()))
+            Some(CancellationReason::OperatorError {
+                detail: "division by zero".into(),
+            })
         );
     }
 
@@ -903,12 +913,16 @@ mod tests {
     #[test]
     fn first_cancel_wins_semantics() {
         let token = CancellationToken::new();
-        token.cancel_with_reason(CancellationReason::NetworkError("first".into()));
+        token.cancel_with_reason(CancellationReason::NetworkError {
+            detail: "first".into(),
+        });
         token.cancel_with_reason(CancellationReason::UserRequested);
         // First reason wins
         assert_eq!(
             token.reason(),
-            Some(CancellationReason::NetworkError("first".into()))
+            Some(CancellationReason::NetworkError {
+                detail: "first".into(),
+            })
         );
     }
 
@@ -928,11 +942,15 @@ mod tests {
         let parent = gp.child_token();
         let child = parent.child_token();
 
-        gp.cancel_with_reason(CancellationReason::NetworkError("link down".into()));
+        gp.cancel_with_reason(CancellationReason::NetworkError {
+            detail: "link down".into(),
+        });
         assert!(child.is_cancelled());
         assert_eq!(
             child.reason(),
-            Some(CancellationReason::NetworkError("link down".into()))
+            Some(CancellationReason::NetworkError {
+                detail: "link down".into(),
+            })
         );
     }
 
@@ -942,14 +960,18 @@ mod tests {
         let child = parent.child_token();
 
         // Cancel child first with its own reason (before parent)
-        child.cancel_with_reason(CancellationReason::OperatorError("bad op".into()));
+        child.cancel_with_reason(CancellationReason::OperatorError {
+            detail: "bad op".into(),
+        });
         // Then cancel parent
         parent.cancel_with_reason(CancellationReason::RuntimeShutdown);
 
         // Child's own reason takes precedence (check self before walking parent)
         assert_eq!(
             child.reason(),
-            Some(CancellationReason::OperatorError("bad op".into()))
+            Some(CancellationReason::OperatorError {
+                detail: "bad op".into(),
+            })
         );
     }
 
@@ -972,13 +994,17 @@ mod tests {
     #[test]
     fn check_includes_reason_in_error() {
         let token = CancellationToken::new();
-        token.cancel_with_reason(CancellationReason::NetworkError("timeout".into()));
+        token.cancel_with_reason(CancellationReason::NetworkError {
+            detail: "timeout".into(),
+        });
         let err = token.check().unwrap_err();
         match err {
             crate::error::Error::Cancelled { reason } => {
                 assert_eq!(
                     reason,
-                    Some(CancellationReason::NetworkError("timeout".into()))
+                    Some(CancellationReason::NetworkError {
+                        detail: "timeout".into(),
+                    })
                 );
             }
             other => panic!("expected Cancelled, got {:?}", other),
@@ -996,11 +1022,17 @@ mod tests {
             "runtime shutdown"
         );
         assert_eq!(
-            CancellationReason::NetworkError("peer lost".into()).to_string(),
+            CancellationReason::NetworkError {
+                detail: "peer lost".into(),
+            }
+            .to_string(),
             "network error: peer lost"
         );
         assert_eq!(
-            CancellationReason::WorkerFailed("w3".into()).to_string(),
+            CancellationReason::WorkerFailed {
+                detail: "w3".into(),
+            }
+            .to_string(),
             "worker failed: w3"
         );
         assert_eq!(
@@ -1008,11 +1040,17 @@ mod tests {
             "handle dropped"
         );
         assert_eq!(
-            CancellationReason::OperatorError("oops".into()).to_string(),
+            CancellationReason::OperatorError {
+                detail: "oops".into(),
+            }
+            .to_string(),
             "operator error: oops"
         );
         assert_eq!(
-            CancellationReason::PeerDown("node-3".into()).to_string(),
+            CancellationReason::PeerDown {
+                node_id: "node-3".into(),
+            }
+            .to_string(),
             "peer node down: node-3"
         );
     }

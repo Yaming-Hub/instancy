@@ -141,7 +141,7 @@ impl ControlSender {
         };
         self.append_signal(signal);
         self.dataflow_cancel
-            .cancel_with_reason(CancellationReason::OperatorError(message));
+            .cancel_with_reason(CancellationReason::OperatorError { detail: message });
     }
 
     /// Broadcast a cancellation request from this worker.
@@ -349,7 +349,9 @@ mod tests {
         assert!(df_cancel.is_cancelled());
         assert_eq!(
             df_cancel.reason(),
-            Some(CancellationReason::OperatorError("boom".into()))
+            Some(CancellationReason::OperatorError {
+                detail: "boom".into(),
+            })
         );
     }
 
@@ -442,7 +444,9 @@ mod tests {
         // First cancel wins — reason should be "first".
         assert_eq!(
             df_cancel.reason(),
-            Some(CancellationReason::OperatorError("first".into()))
+            Some(CancellationReason::OperatorError {
+                detail: "first".into(),
+            })
         );
     }
 

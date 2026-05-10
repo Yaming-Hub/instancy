@@ -34,6 +34,42 @@ use crate::dataflow::id::DataflowId;
 use crate::wire;
 
 // ---------------------------------------------------------------------------
+// Error type
+// ---------------------------------------------------------------------------
+
+/// Errors that can occur when decoding a control protocol message.
+#[cfg(feature = "transport")]
+#[derive(Debug, thiserror::Error)]
+pub enum ControlProtocolError {
+    /// The message is too short to contain the minimum required fields.
+    #[error("control message too short: {len} bytes (minimum 5)")]
+    TooShort { len: usize },
+
+    /// CRC32 integrity check failed.
+    #[error("CRC32 mismatch: expected {expected:#010x}, got {actual:#010x}")]
+    CrcMismatch { expected: u32, actual: u32 },
+
+    /// The payload size does not match the expected size for the message type.
+    #[error("payload size mismatch: expected {expected}, got {actual}")]
+    InvalidPayloadSize { expected: usize, actual: usize },
+
+    /// The node_id field contains invalid UTF-8.
+    #[error("invalid UTF-8 in node_id: {source}")]
+    InvalidUtf8 {
+        #[from]
+        source: std::str::Utf8Error,
+    },
+
+    /// The message type byte is not recognized.
+    #[error("unknown control message type: {msg_type}")]
+    UnknownMessageType { msg_type: u8 },
+
+    /// An error occurred reading fixed-width fields from the wire.
+    #[error("wire read error: {0}")]
+    WireRead(Box<crate::Error>),
+}
+
+// ---------------------------------------------------------------------------
 // Message types
 // ---------------------------------------------------------------------------
 
@@ -86,34 +122,36 @@ pub fn encode_control_message(msg: &ControlMessage) -> Vec<u8> {
 
 /// Decode a control message from bytes (verifies CRC32 trailer).
 #[cfg(feature = "transport")]
-pub fn decode_control_message(data: &[u8]) -> Result<ControlMessage, String> {
+pub fn decode_control_message(data: &[u8]) -> Result<ControlMessage, ControlProtocolError> {
     // Minimum: 1 byte type + 4 bytes CRC
     if data.len() < 5 {
-        return Err(format!("control message too short: {} bytes", data.len()));
+        return Err(ControlProtocolError::TooShort { len: data.len() });
     }
 
     // Verify CRC32
     let (payload, crc_bytes) = data.split_at(data.len() - 4);
-    let expected_crc = wire::read_u32(crc_bytes, 0).map_err(|e| e.to_string())?;
+    let expected_crc = wire::read_u32(crc_bytes, 0).map_err(|e| ControlProtocolError::WireRead(Box::new(e)))?;
     let actual_crc = crc32fast::hash(payload);
     if actual_crc != expected_crc {
-        return Err(format!(
-            "CRC32 mismatch: expected {expected_crc:#010x}, got {actual_crc:#010x}"
-        ));
+        return Err(ControlProtocolError::CrcMismatch {
+            expected: expected_crc,
+            actual: actual_crc,
+        });
     }
 
     match payload[0] {
         MSG_TYPE_HANDSHAKE => {
             // 1 (type) + 8 (fingerprint) + 16 (dataflow_id UUID) = 25
             if payload.len() != 25 {
-                return Err(format!(
-                    "handshake payload wrong size: expected 25, got {}",
-                    payload.len()
-                ));
+                return Err(ControlProtocolError::InvalidPayloadSize {
+                    expected: 25,
+                    actual: payload.len(),
+                });
             }
-            let fingerprint = wire::read_u64(payload, 1).map_err(|e| e.to_string())?;
+            let fingerprint =
+                wire::read_u64(payload, 1).map_err(|e| ControlProtocolError::WireRead(Box::new(e)))?;
             let dataflow_id = DataflowId::from_bytes(
-                wire::read_array::<16>(payload, 9).map_err(|e| e.to_string())?,
+                wire::read_array::<16>(payload, 9).map_err(|e| ControlProtocolError::WireRead(Box::new(e)))?,
             );
             Ok(ControlMessage::Handshake {
                 fingerprint,
@@ -123,22 +161,23 @@ pub fn decode_control_message(data: &[u8]) -> Result<ControlMessage, String> {
         MSG_TYPE_READY => {
             // 1 (type) + 4 (len) + node_id bytes
             if payload.len() < 5 {
-                return Err("ready payload too short".to_string());
+                return Err(ControlProtocolError::InvalidPayloadSize {
+                    expected: 5,
+                    actual: payload.len(),
+                });
             }
-            let id_len = wire::read_u32(payload, 1).map_err(|e| e.to_string())? as usize;
+            let id_len =
+                wire::read_u32(payload, 1).map_err(|e| ControlProtocolError::WireRead(Box::new(e)))? as usize;
             if payload.len() != 5 + id_len {
-                return Err(format!(
-                    "ready payload size mismatch: expected {}, got {}",
-                    5 + id_len,
-                    payload.len()
-                ));
+                return Err(ControlProtocolError::InvalidPayloadSize {
+                    expected: 5 + id_len,
+                    actual: payload.len(),
+                });
             }
-            let node_id = std::str::from_utf8(&payload[5..5 + id_len])
-                .map_err(|e| format!("invalid UTF-8 in node_id: {e}"))?
-                .to_string();
+            let node_id = std::str::from_utf8(&payload[5..5 + id_len])?.to_string();
             Ok(ControlMessage::Ready { node_id })
         }
-        other => Err(format!("unknown control message type: {other}")),
+        other => Err(ControlProtocolError::UnknownMessageType { msg_type: other }),
     }
 }
 
@@ -501,14 +540,19 @@ mod tests {
         // Flip a bit in the payload.
         encoded[5] ^= 0x01;
         let result = decode_control_message(&encoded);
-        assert!(result.is_err());
-        assert!(result.unwrap_err().contains("CRC32 mismatch"));
+        assert!(matches!(
+            result,
+            Err(ControlProtocolError::CrcMismatch { .. })
+        ));
     }
 
     #[test]
     fn decode_rejects_too_short() {
         let result = decode_control_message(&[1, 2, 3]);
-        assert!(result.is_err());
+        assert!(matches!(
+            result,
+            Err(ControlProtocolError::TooShort { .. })
+        ));
     }
 
     #[test]
@@ -518,8 +562,10 @@ mod tests {
         let crc = crc32fast::hash(&buf);
         buf.extend_from_slice(&crc.to_le_bytes());
         let result = decode_control_message(&buf);
-        assert!(result.is_err());
-        assert!(result.unwrap_err().contains("unknown control message type"));
+        assert!(matches!(
+            result,
+            Err(ControlProtocolError::UnknownMessageType { msg_type: 0xFF })
+        ));
     }
 
     #[test]
