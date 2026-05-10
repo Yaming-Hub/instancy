@@ -2303,6 +2303,15 @@ pub struct PoolConfig {
 > Either way, reconnection and scale-up go through the same factory. The
 > library ships a default `TcpConnectionFactory` for plain TCP; applications
 > that need TLS or custom negotiation implement `ConnectionFactory` directly.
+>
+> **Lazy initialization:** The `SharedPeerManager` constructor is synchronous
+> and creates no connections. Connections are established lazily in
+> `register_dataflow()` — specifically, `ensure_min_connections()` runs
+> **before** the dataflow is registered, guaranteeing that the caller cannot
+> send frames until at least `min_connections` connections exist. Each
+> subsequent registration also tops up the pool to the configured floor.
+> If all connection attempts fail, a `ConnectionClosed` error is immediately
+> delivered on the dataflow's error channel.
 
 ### 6.3.1 Shared Connection Mode with Sequenced Messages
 

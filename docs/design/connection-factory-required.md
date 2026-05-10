@@ -2,7 +2,7 @@
 
 **Item:** `connection-factory-required`
 **Priority:** P1
-**Status:** Design
+**Status:** Implemented (PR #220)
 
 ## Problem
 
@@ -96,10 +96,21 @@ pub fn new(
 ```
 
 Initial connections are created **lazily** — the constructor stores the
-factory but does not call it. When the first dataflow registers or sends
-data, the manager calls `connection_factory.establish_dyn(&peer_node_id)`
+factory but does not call it. When the first dataflow registers,
+`ensure_min_connections()` calls `connection_factory.establish_dyn(&peer_node_id)`
 to create `config.min_connections` connections on demand. This keeps the
 constructor synchronous and defers connection cost until actually needed.
+
+Connection establishment happens **before** the dataflow registration
+completes — `ensure_min_connections()` runs at the start of
+`register_dataflow()`, so the caller cannot send frames before at least
+`min_connections` connections exist. If all connection attempts fail,
+the error is immediately surfaced on the dataflow's `error_rx` channel.
+
+Subsequent `register_dataflow()` calls also check the pool against
+`min_connections` and top up any deficit (e.g., if a connection died
+between registrations). This ensures the configured redundancy floor
+is always maintained.
 
 #### 2. `ClusterSpawnTransport::Dedicated` — uses factory + pool
 
