@@ -853,7 +853,7 @@ async fn shared_reconnect_after_transient_network_failure() {
     let reconnect_deadline = tokio::time::Instant::now() + Duration::from_secs(5);
     loop {
         tokio::time::sleep(Duration::from_millis(10)).await;
-        if manager.live_connection_count() >= 1 {
+        if manager.live_connection_count().unwrap() >= 1 {
             break;
         }
         if tokio::time::Instant::now() >= reconnect_deadline {

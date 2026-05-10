@@ -1432,7 +1432,7 @@ impl<T: Timestamp> DataflowExecutor<T> {
                 // peers AND no peer progress is pending, force-close any
                 // remaining operators (feedback cycles that quiesced).
                 if tracker.is_completed()
-                    && !tracker.has_pending_peer_progress()
+                    && !tracker.has_pending_peer_progress()?
                     && tracker.all_peers_synced()
                 {
                     for pos in 0..self.operators.len() {
@@ -1455,7 +1455,7 @@ impl<T: Timestamp> DataflowExecutor<T> {
                 if !self.draining
                     && (!tracker.is_completed()
                         || !tracker.all_peers_synced()
-                        || tracker.has_pending_peer_progress())
+                        || tracker.has_pending_peer_progress()?)
                 {
                     self.consecutive_idle = 0;
                     return Ok(SweepOutcome::WaitingForInput);

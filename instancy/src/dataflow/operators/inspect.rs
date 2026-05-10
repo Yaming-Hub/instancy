@@ -192,7 +192,10 @@ impl<S: Scope, D: 'static> InspectExt<S, D> for StreamEdge<S, D> {
             let mut guard = match collected_clone.lock().or_poison("inspect collection") {
                 Ok(guard) => guard,
                 Err(_) => {
-                    // TODO: propagate poisoned inspect locks once inspect closures can return Result.
+                    // NOTE: Cannot propagate lock poison here — inspect closures return
+                    // `()` and cannot surface a `Result`. Poisoned lock means another
+                    // thread panicked; dropping the inspection output is acceptable
+                    // because the dataflow will be torn down.
                     return;
                 }
             };

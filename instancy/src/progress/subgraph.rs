@@ -436,7 +436,7 @@ impl<T: Timestamp> ProgressTracker<T> {
 
         // Broadcast initial capabilities to peers and absorb theirs.
         self.broadcast_local_changes();
-        self.receive_peer_changes();
+        self.receive_peer_changes()?;
 
         // Run initial propagation.
         self.tracker.propagate_all();
@@ -478,7 +478,7 @@ impl<T: Timestamp> ProgressTracker<T> {
         self.broadcast_local_changes();
 
         // 3. Receive and apply peer workers' capability changes.
-        self.receive_peer_changes();
+        self.receive_peer_changes()?;
 
         // 4. Propagate all changes through the reachability graph.
         self.tracker.propagate_all();
@@ -533,18 +533,15 @@ impl<T: Timestamp> ProgressTracker<T> {
     /// Used as a defense-in-depth check before force-close: even if
     /// `is_completed()` returns true, pending peer progress could
     /// invalidate that conclusion.
-    pub fn has_pending_peer_progress(&self) -> bool {
+    pub fn has_pending_peer_progress(&self) -> crate::Result<bool> {
         if let Some(ref channels) = self.progress_channels {
-            channels.receivers.iter().any(|r| {
-                if let Some(recv) = r {
-                    recv.has_pending()
-                } else {
-                    false
+            for recv in channels.receivers.iter().flatten() {
+                if recv.has_pending()? {
+                    return Ok(true);
                 }
-            })
-        } else {
-            false
+            }
         }
+        Ok(false)
     }
 
     /// Returns `true` if all peer workers have sent at least one progress
@@ -706,15 +703,15 @@ impl<T: Timestamp> ProgressTracker<T> {
     /// network, or any other transport.
     ///
     /// No-op if no progress channels are attached (single-worker mode).
-    fn receive_peer_changes(&mut self) {
+    fn receive_peer_changes(&mut self) -> crate::Result<()> {
         let channels = match &self.progress_channels {
             Some(c) => c,
-            None => return,
+            None => return Ok(()),
         };
 
         for (idx, receiver) in channels.receivers.iter().enumerate() {
             if let Some(r) = receiver {
-                let batches = r.drain_all();
+                let batches = r.drain_all()?;
                 if !batches.is_empty() {
                     // Mark this peer as heard from (for initial sync tracking).
                     if idx < self.peers_heard_from.len() {
@@ -728,6 +725,7 @@ impl<T: Timestamp> ProgressTracker<T> {
                 }
             }
         }
+        Ok(())
     }
 
     /// Updates per-operator frontiers from the tracker's current state.

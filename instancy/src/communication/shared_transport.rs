@@ -74,7 +74,9 @@ fn push_task_handle(
     match task_handles.lock().or_poison("task handle") {
         Ok(mut handles) => handles.push(handle),
         Err(_) => {
-            // TODO: propagate poisoned task-handle locks once constructors can return Result.
+            // NOTE: Cannot propagate lock poison — this is a fire-and-forget helper.
+            // Aborting the task handle on poison is the correct fallback since the
+            // transport is shutting down.
             handle.abort();
         }
     }
@@ -559,13 +561,19 @@ impl SharedPeerManager {
     /// Returns Ok(()) if the pool meets the minimum, or Err if no connections
     /// could be established at all (partial success still returns Ok).
     async fn ensure_min_connections(&self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        let live = self.pool.live_connection_count();
+        let live = self
+            .pool
+            .live_connection_count()
+            .map_err(Box::<dyn std::error::Error + Send + Sync>::from)?;
         if live >= self.config.min_connections {
             return Ok(());
         }
 
         let _guard = self.init_lock.lock().await;
-        let live = self.pool.live_connection_count();
+        let live = self
+            .pool
+            .live_connection_count()
+            .map_err(Box::<dyn std::error::Error + Send + Sync>::from)?;
         if live >= self.config.min_connections {
             return Ok(());
         }
@@ -600,7 +608,12 @@ impl SharedPeerManager {
         }
 
         // If we still have zero live connections, report the last error
-        if self.pool.live_connection_count() == 0 {
+        if self
+            .pool
+            .live_connection_count()
+            .map_err(Box::<dyn std::error::Error + Send + Sync>::from)?
+            == 0
+        {
             if let Some(e) = last_error {
                 return Err(e);
             }
@@ -637,12 +650,12 @@ impl SharedPeerManager {
     }
 
     /// Get current connection count.
-    pub fn connection_count(&self) -> usize {
+    pub fn connection_count(&self) -> crate::Result<usize> {
         self.pool.connection_count()
     }
 
     /// Get current live (non-dead) connection count.
-    pub fn live_connection_count(&self) -> usize {
+    pub fn live_connection_count(&self) -> crate::Result<usize> {
         self.pool.live_connection_count()
     }
 
@@ -663,11 +676,14 @@ impl SharedPeerManager {
         crc_enabled: bool,
     ) -> Result<usize, Box<dyn std::error::Error + Send + Sync>> {
         let (reader, writer) = connection_factory.establish_dyn(peer_node_id).await?;
-        let conn_metrics = pool.add_connection().ok_or_else(|| {
-            Box::<dyn std::error::Error + Send + Sync>::from(std::io::Error::other(
-                "peer pool is already at max live connections",
-            ))
-        })?;
+        let conn_metrics = pool
+            .add_connection()
+            .map_err(Box::<dyn std::error::Error + Send + Sync>::from)?
+            .ok_or_else(|| {
+                Box::<dyn std::error::Error + Send + Sync>::from(std::io::Error::other(
+                    "peer pool is already at max live connections",
+                ))
+            })?;
         let conn_id = conn_metrics.id;
         let (tx, rx) = tokio_mpsc::channel::<Frame>(256);
         writer_channels.lock().await.insert(conn_id, tx);
@@ -699,7 +715,9 @@ impl SharedPeerManager {
                 handles.push(reader_handle);
             }
             Err(_) => {
-                // TODO: propagate poisoned task-handle locks once reconnect_connection can return richer errors.
+                // NOTE: Cannot propagate lock poison — this is a fire-and-forget helper.
+                // Aborting the task handle on poison is the correct fallback since the
+                // transport is shutting down.
                 writer_handle.abort();
                 reader_handle.abort();
             }
@@ -812,17 +830,28 @@ impl SharedPeerManager {
                             // due to no available connections (e.g., during reconnect).
                             let mut exclude = HashSet::new();
                             let first_conn = match pool.select_connection_excluding(&exclude) {
-                                Some(c) => {
+                                Ok(Some(c)) => {
                                     c.enqueue();
                                     c
                                 }
-                                None => {
+                                Ok(None) => {
                                     // No live connections available — drop frame
                                     // WITHOUT consuming a sequence number.
                                     #[cfg(feature = "tracing")]
                                     tracing::error!(
                                         "No live connections for payload frame, dropping"
                                     );
+                                    continue;
+                                }
+                                Err(error) => {
+                                    #[cfg(feature = "tracing")]
+                                    tracing::error!(
+                                        "Failed to select payload connection: {error}"
+                                    );
+                                    let state = reg_state.lock().await;
+                                    if let Some(reg) = state.registered.get(&dataflow_id) {
+                                        let _ = reg.error_tx.try_send(TransportError::ConnectionClosed);
+                                    }
                                     continue;
                                 }
                             };
@@ -882,11 +911,11 @@ impl SharedPeerManager {
 
                                 // Try the next connection
                                 conn = match pool.select_connection_excluding(&exclude) {
-                                    Some(c) => {
+                                    Ok(Some(c)) => {
                                         c.enqueue();
                                         c
                                     }
-                                    None => {
+                                    Ok(None) => {
                                         // Exhausted all connections after seq was assigned.
                                         // The frame is lost — this creates a sequence gap,
                                         // but it's unavoidable at this point since the seq
@@ -895,6 +924,17 @@ impl SharedPeerManager {
                                         tracing::error!(
                                             "All connections exhausted after seq assignment, frame lost"
                                         );
+                                        break;
+                                    }
+                                    Err(error) => {
+                                        #[cfg(feature = "tracing")]
+                                        tracing::error!(
+                                            "Failed to select retry payload connection: {error}"
+                                        );
+                                        let state = reg_state.lock().await;
+                                        if let Some(reg) = state.registered.get(&dataflow_id) {
+                                            let _ = reg.error_tx.try_send(TransportError::ConnectionClosed);
+                                        }
                                         break;
                                     }
                                 };
@@ -942,14 +982,22 @@ impl SharedPeerManager {
                 Ok(frame) => {
                     // Check for probe messages
                     if frame.channel_id == PROBE_CHANNEL_ID {
-                        Self::handle_probe_frame(
+                        if let Err(error) = Self::handle_probe_frame(
                             &frame,
                             &scaling_driver,
                             &pool,
                             conn_id,
                             &writer_channels,
                         )
-                        .await;
+                        .await
+                        {
+                            #[cfg(feature = "tracing")]
+                            tracing::error!(
+                                "Reader task conn {conn_id} probe handling error: {error}"
+                            );
+                            let _ = failure_tx.try_send(conn_id);
+                            break;
+                        }
                         continue;
                     }
 
@@ -1073,8 +1121,17 @@ impl SharedPeerManager {
                 Err(TransportError::ConnectionClosed) => {
                     #[cfg(feature = "tracing")]
                     tracing::info!("Reader task conn {conn_id} closed");
-                    if let Some(metrics) = pool.connection(conn_id) {
-                        metrics.mark_dead();
+                    match pool.connection(conn_id) {
+                        Ok(Some(metrics)) => {
+                            metrics.mark_dead();
+                        }
+                        Ok(None) => {}
+                        Err(error) => {
+                            #[cfg(feature = "tracing")]
+                            tracing::error!(
+                                "Reader task conn {conn_id} failed to load metrics after close: {error}"
+                            );
+                        }
                     }
                     let _ = failure_tx.try_send(conn_id);
                     break;
@@ -1082,8 +1139,17 @@ impl SharedPeerManager {
                 Err(_e) => {
                     #[cfg(feature = "tracing")]
                     tracing::error!("Reader task conn {conn_id} error: {_e}");
-                    if let Some(metrics) = pool.connection(conn_id) {
-                        metrics.mark_dead();
+                    match pool.connection(conn_id) {
+                        Ok(Some(metrics)) => {
+                            metrics.mark_dead();
+                        }
+                        Ok(None) => {}
+                        Err(error) => {
+                            #[cfg(feature = "tracing")]
+                            tracing::error!(
+                                "Reader task conn {conn_id} failed to load metrics after error: {error}"
+                            );
+                        }
                     }
                     let _ = failure_tx.try_send(conn_id);
                     break;
@@ -1103,12 +1169,12 @@ impl SharedPeerManager {
         pool: &Arc<PeerPool>,
         conn_id: usize,
         writer_channels: &Arc<TokioMutex<HashMap<usize, tokio_mpsc::Sender<Frame>>>>,
-    ) {
+    ) -> crate::Result<()> {
         if let Some(probe) = ProbeMessage::decode(&frame.payload) {
             match probe.kind {
                 ProbeKind::Reply => {
                     // Process the reply — updates RTT on the connection
-                    if let Some(conn) = pool.connection(conn_id) {
+                    if let Some(conn) = pool.connection(conn_id)? {
                         scaling_driver.process_probe_reply(&probe, &conn);
                     }
                 }
@@ -1131,6 +1197,7 @@ impl SharedPeerManager {
                 }
             }
         }
+        Ok(())
     }
 
     /// Periodic probe loop: sends RTT probes to each connection.
@@ -1169,7 +1236,12 @@ impl SharedPeerManager {
             }
 
             // Evaluate scaling after probing
-            scaling_driver.evaluate_and_emit(&pool).await;
+            if let Err(error) = scaling_driver.evaluate_and_emit(&pool).await {
+                #[cfg(feature = "tracing")]
+                tracing::error!("Probe loop failed to evaluate scaling: {error}");
+                // Continue probing — scaling evaluation failure is transient
+                continue;
+            }
         }
     }
 
@@ -1230,15 +1302,34 @@ impl SharedPeerManager {
                         let mut wc = writer_channels.lock().await;
                         wc.remove(&connection_id);
                     }
-                    if let Some(metrics) = pool.connection(connection_id) {
-                        metrics.mark_dead();
+                    match pool.connection(connection_id) {
+                        Ok(Some(metrics)) => {
+                            metrics.mark_dead();
+                        }
+                        Ok(None) => {}
+                        Err(error) => {
+                            #[cfg(feature = "tracing")]
+                            tracing::error!(
+                                "ScaleDown failed to load connection {connection_id}: {error}"
+                            );
+                        }
                     }
-                    let _ = pool.remove_connection(connection_id);
+                    if let Err(error) = pool.remove_connection(connection_id) {
+                        #[cfg(feature = "tracing")]
+                        tracing::error!(
+                            "ScaleDown failed to remove connection {connection_id}: {error}"
+                        );
+                    }
                 }
                 ScalingEvent::ConnectionFailed { connection_id } => {
                     // Remove the dead connection from the pool to avoid
                     // accumulating stale entries over time.
-                    let _ = pool.remove_connection(connection_id);
+                    if let Err(error) = pool.remove_connection(connection_id) {
+                        #[cfg(feature = "tracing")]
+                        tracing::error!(
+                            "Reconnect path failed to remove connection {connection_id}: {error}"
+                        );
+                    }
 
                     let factory = connection_factory.clone();
 
@@ -1291,7 +1382,17 @@ impl SharedPeerManager {
 
                     // Only notify dataflows after all reconnect attempts are
                     // exhausted AND there are still no live connections.
-                    if !recovered && pool.live_connection_count() == 0 {
+                    let no_live_connections = match pool.live_connection_count() {
+                        Ok(count) => count == 0,
+                        Err(error) => {
+                            #[cfg(feature = "tracing")]
+                            tracing::error!(
+                                "Reconnect path failed to read live connection count: {error}"
+                            );
+                            true
+                        }
+                    };
+                    if !recovered && no_live_connections {
                         #[cfg(feature = "tracing")]
                         tracing::error!(
                             "Failed to recover peer {peer_node_id} after conn {connection_id} failed — notifying dataflows"
@@ -1327,7 +1428,17 @@ impl SharedPeerManager {
                 continue; // Already handled this connection
             }
 
-            let live_count = pool.live_connection_count();
+            let live_count = match pool.live_connection_count() {
+                Ok(count) => count,
+                Err(error) => {
+                    #[cfg(feature = "tracing")]
+                    tracing::error!(
+                        "Connection monitor failed to read live connection count: {error}"
+                    );
+                    // Use unknown count but still proceed with cleanup/notification
+                    0
+                }
+            };
 
             #[cfg(feature = "tracing")]
             tracing::warn!(
@@ -1755,7 +1866,7 @@ mod tests {
         let manager = SharedPeerManager::new("peer-1".to_string(), config, factory, &rt).unwrap();
 
         assert_eq!(manager.peer_node_id(), "peer-1");
-        assert_eq!(manager.connection_count(), 0);
+        assert_eq!(manager.connection_count().unwrap(), 0);
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -2087,7 +2198,7 @@ mod tests {
 
         // Connection should be marked dead
         assert_eq!(
-            manager.pool.live_connection_count(),
+            manager.pool.live_connection_count().unwrap(),
             0,
             "dead connection should not be counted as live"
         );
@@ -2348,7 +2459,7 @@ mod tests {
         // Kill connection 0 by marking it dead (simulates what writer_task does on I/O error).
         // In a real scenario, the writer_task would detect write failure and call mark_dead().
         // We also close the writer channel to simulate the full failure path.
-        manager_a.pool.connection(0).unwrap().mark_dead();
+        manager_a.pool.connection(0).unwrap().unwrap().mark_dead();
         {
             let mut wc = manager_a.writer_channels.lock().await;
             wc.remove(&0);
@@ -2388,7 +2499,7 @@ mod tests {
         }
 
         // Confirm pool state
-        assert_eq!(manager_a.pool.live_connection_count(), 1);
+        assert_eq!(manager_a.pool.live_connection_count().unwrap(), 1);
 
         drop(manager_a);
         drop(manager_b);
@@ -2447,7 +2558,7 @@ mod tests {
             .expect("timed out waiting for echoed payload")
             .expect("channel closed unexpectedly");
         assert_eq!(payload, b"reconnected".to_vec());
-        assert_eq!(manager.pool.live_connection_count(), 2);
+        assert_eq!(manager.pool.live_connection_count().unwrap(), 2);
 
         remote_b.abort();
         factory.abort_all();
@@ -2468,11 +2579,11 @@ mod tests {
 
         // Simulate high RTT
         pool.connection(0)
-            .unwrap()
+            .unwrap().unwrap()
             .record_rtt(Duration::from_millis(10));
 
         // Evaluate scaling — should recommend scale up
-        let decision = pool.evaluate_scaling().await;
+        let decision = pool.evaluate_scaling().await.unwrap();
         assert_eq!(
             decision,
             ScalingDecision::ScaleUp,

@@ -295,10 +295,10 @@ impl ScalingDriver {
     }
 
     /// Evaluate the pool and emit a scaling event if needed.
-    pub async fn evaluate_and_emit(&self, pool: &PeerPool) {
-        let decision = pool.evaluate_scaling().await;
+    pub async fn evaluate_and_emit(&self, pool: &PeerPool) -> crate::Result<()> {
+        let decision = pool.evaluate_scaling().await?;
         let event = match decision {
-            ScalingDecision::None => return,
+            ScalingDecision::None => return Ok(()),
             ScalingDecision::ScaleUp => ScalingEvent::ScaleUp,
             ScalingDecision::ScaleDown { connection_id } => {
                 ScalingEvent::ScaleDown { connection_id }
@@ -306,6 +306,7 @@ impl ScalingDriver {
         };
         // Best-effort send — if the receiver is full, skip this cycle
         let _ = self.event_tx.try_send(event);
+        Ok(())
     }
 
     /// Emit a scaling event directly (e.g., connection failure notification).
@@ -519,11 +520,11 @@ mod tests {
 
         // Inject high RTT directly
         pool.connection(0)
-            .unwrap()
+            .unwrap().unwrap()
             .record_rtt(Duration::from_millis(10));
 
         // Evaluate
-        driver.evaluate_and_emit(&pool).await;
+        driver.evaluate_and_emit(&pool).await.unwrap();
 
         // Should receive ScaleUp event
         let event = event_rx.try_recv().unwrap();
@@ -544,10 +545,10 @@ mod tests {
 
         // Healthy RTT
         pool.connection(0)
-            .unwrap()
+            .unwrap().unwrap()
             .record_rtt(Duration::from_millis(2));
 
-        driver.evaluate_and_emit(&pool).await;
+        driver.evaluate_and_emit(&pool).await.unwrap();
 
         // No event
         assert!(event_rx.try_recv().is_err());

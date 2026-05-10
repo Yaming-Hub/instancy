@@ -120,11 +120,11 @@ fn session_wires_local_and_remote_channels() {
     let session = DataflowSession::new(DataflowId::from_bytes([1u8; 16]), topo, "node-0");
 
     // Local: both workers on node 0
-    let ch_local = session.allocate_channel(WorkerId::new(0), WorkerId::new(1));
+    let ch_local = session.allocate_channel(WorkerId::new(0), WorkerId::new(1)).unwrap();
     assert!(ch_local.is_local);
 
     // Remote: worker 0 (node 0) → worker 2 (node 1)
-    let ch_remote = session.allocate_channel(WorkerId::new(0), WorkerId::new(2));
+    let ch_remote = session.allocate_channel(WorkerId::new(0), WorkerId::new(2)).unwrap();
     assert!(!ch_remote.is_local);
 
     // Channel IDs are distinct
@@ -136,11 +136,11 @@ fn session_remote_channels_lists_only_cross_node() {
     let topo = two_node_topology();
     let session = DataflowSession::new(DataflowId::from_bytes([1u8; 16]), topo, "node-0");
 
-    session.allocate_channel(WorkerId::new(0), WorkerId::new(1)); // local
-    session.allocate_channel(WorkerId::new(0), WorkerId::new(2)); // remote
-    session.allocate_channel(WorkerId::new(1), WorkerId::new(3)); // remote
+    session.allocate_channel(WorkerId::new(0), WorkerId::new(1)).unwrap(); // local
+    session.allocate_channel(WorkerId::new(0), WorkerId::new(2)).unwrap(); // remote
+    session.allocate_channel(WorkerId::new(1), WorkerId::new(3)).unwrap(); // remote
 
-    let remote = session.remote_channels();
+    let remote = session.remote_channels().unwrap();
     assert_eq!(remote.len(), 2);
     for ch in &remote {
         assert!(!ch.is_local);

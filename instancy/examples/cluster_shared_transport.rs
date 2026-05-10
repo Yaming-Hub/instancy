@@ -90,7 +90,7 @@ async fn main() {
 
     println!(
         "Created SharedPeerManager with {} eager connections to node-b\n",
-        manager.connection_count()
+        manager.connection_count().unwrap()
     );
 
     // Register two independent dataflows on the same pooled connections
@@ -231,7 +231,7 @@ async fn main() {
     println!("✓ Messages were isolated (no cross-dataflow contamination)");
     println!(
         "✓ All data shared {} pooled connections",
-        manager.connection_count()
+        manager.connection_count().unwrap()
     );
 
     // Cleanup

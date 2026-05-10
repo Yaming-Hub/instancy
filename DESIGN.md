@@ -17,7 +17,7 @@
 9. **Configurable error policy** — each dataflow specifies whether errors should halt the pipeline or be logged and skipped, giving consumers control over fault tolerance.
 10. **Observability built-in** — per-dataflow CPU time tracking, operator-level metrics, and structured tracing for understanding performance characteristics.
 11. **Checkpointing support** — consumers can add checkpoint operators that persist state at timestamp boundaries, enabling recovery by fast-forwarding input to the stored frontier.
-12. **Per-stage dynamic parallelism** *(partially implemented)* — operators in the same stage share a parallelism level; different stages can have different parallelism. Stage boundaries are auto-inferred from repartition operators (`exchange`, `rebalance`, `gather`, `broadcast`). Operators within a stage are fused into a single schedulable task for reduced scheduling overhead. **Note**: Stage inference and operator fusion are implemented; per-stage parallelism (different worker counts per stage) is not yet implemented — all stages currently share the dataflow's worker count.
+12. **Per-stage dynamic parallelism** — operators in the same stage share a parallelism level; different stages can have different parallelism. Stage boundaries are auto-inferred from repartition operators (`exchange`, `rebalance`, `gather`, `broadcast`). Operators within a stage are fused into a single schedulable task for reduced scheduling overhead. Workers only materialize operators for stages they participate in — non-participating operators are kept as "ghost" nodes in the reachability graph for correct cross-stage frontier propagation.
 13. **Dynamic cluster scaling** — nodes can join or leave the cluster at runtime. The hosting application detects membership changes and notifies the runtime via a `ClusterMembership` trait attached to `ClusterTopology`. The library updates the live topology, cancels affected dataflows on node departure, and makes new nodes available to subsequent `spawn_cluster` calls. Already-running dataflows are not repartitioned.
 14. **No global state** — zero static variables, `lazy_static`, or thread-locals. All state is owned by an explicit `RuntimeHandle`. Multiple isolated clusters can coexist in a single process (e.g., interactive vs batch workloads).
 15. **Pluggable task scheduling** — the task queue accepts a `SchedulePolicy` trait that determines dequeue order based on (dataflow priority, task age). Default policy uses priority-with-aging to prevent starvation of low-priority dataflows.
@@ -2067,7 +2067,7 @@ With per-stage parallelism:
 
 The user never specifies "local" vs "global" — the runtime infers it from the cluster topology and stage placement. This keeps the logical API clean and topology-agnostic.
 
-**Current status:** Per-stage parallelism is not yet implemented. Until then, the workaround is to have all workers load data independently (redundant I/O but zero coordination), or use the global `broadcast()` operator which sends to all workers including cross-node.
+**Current status:** Per-stage parallelism is fully implemented. `spawn_multi` with `per_stage_parallelism(true)` (the default) automatically routes to `spawn_staged_internal`, which creates `max(P_i)` workers and strips non-participating operators via `retain_stages()`. Ghost operators maintain correct frontier propagation across stage boundaries.
 
 ---
 
