@@ -1389,6 +1389,55 @@ When cancelled:
 3. The progress tracker drains and shuts down.
 4. `execute()` returns with partial results or a `Cancelled` error.
 
+#### 5.5.1 Distributed Cancellation
+
+In a cluster dataflow, cancellation must propagate across all peer nodes so that
+the entire distributed computation winds down consistently. The control channel
+(channel ID 0) carries a `Cancel` message alongside the existing `Handshake` and
+`Ready` messages.
+
+**Wire format** — `Cancel` is message type `2`:
+
+```
+[type=2][reason_len: u32 LE][reason: UTF-8 bytes][crc32: 4 bytes]
+```
+
+The `reason` field is a human-readable string (e.g., `"user requested shutdown"`,
+`"operator panicked"`).
+
+**Components** — Two tasks are spawned per cluster dataflow during Phase 8.5 of
+`spawn_cluster`:
+
+| Task | Trigger | Action |
+|------|---------|--------|
+| **Cancel broadcaster** | Local `dataflow_cancel` token fires | Sends `Cancel` to every peer's control channel, then exits |
+| **Cancel listener** | Receives `Cancel` on any peer control channel | Fires local `dataflow_cancel` with `CancellationReason::PeerCancelled { peer_id, detail }` |
+
+Both tasks also exit when the `bridge_cancel` token fires (normal completion),
+preventing resource leaks on the happy path.
+
+**First-cancel-wins semantics** — `CancellationToken::cancel_with_reason()` is
+idempotent: once the token is cancelled, subsequent calls are no-ops. This
+prevents infinite echo loops:
+
+```
+Node A cancels → broadcasts Cancel to Node B
+Node B receives → cancels local token → broadcasts Cancel to Node A
+Node A receives → cancel_with_reason() is a no-op (already cancelled) → no broadcast
+```
+
+Each node broadcasts at most once per dataflow.
+
+**Peer-down integration** — When the hosting application reports a node departure
+via `report_node_leave()`, the `ClusterCancelHandle` cancels the shared
+`dataflow_cancel` token (not just individual worker tokens). This ensures the
+broadcaster fires, notifying healthy peers before bridge teardown.
+
+**Security assumption** — `Cancel` messages carry no cryptographic signature.
+Peer identity verification is the responsibility of the transport layer (e.g.,
+mTLS configured in the application's `ConnectionManager`). All peers in a
+cluster session are assumed to be authenticated at connection time.
+
 ### 5.7 Load Control
 
 Since multiple dataflows share the same Worker Thread Pool, we need controls to prevent one dataflow from starving others:

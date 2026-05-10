@@ -28,7 +28,10 @@
 //!
 //! - Handshake (type 0): `[0][fingerprint: u64 LE][dataflow_id: 16 bytes UUID]`
 //! - Ready (type 1): `[1][node_id_len: u32 LE][node_id: UTF-8 bytes]`
+//! - Cancel (type 2): `[2][reason_len: u32 LE][reason: UTF-8 bytes]`
 
+#[cfg(feature = "transport")]
+use crate::cancellation::{CancellationReason, CancellationToken};
 #[cfg(feature = "transport")]
 use crate::dataflow::id::DataflowId;
 use crate::wire;
@@ -124,12 +127,19 @@ pub enum ControlMessage {
     },
     /// Ready signal indicating the node has materialized all workers.
     Ready { node_id: String },
+    /// Cancellation request from a peer node.
+    Cancel {
+        /// Human-readable reason for cancellation.
+        reason: String,
+    },
 }
 
 #[cfg(feature = "transport")]
 const MSG_TYPE_HANDSHAKE: u8 = 0;
 #[cfg(feature = "transport")]
 const MSG_TYPE_READY: u8 = 1;
+#[cfg(feature = "transport")]
+const MSG_TYPE_CANCEL: u8 = 2;
 
 // ---------------------------------------------------------------------------
 // Encode / Decode with CRC32
@@ -153,6 +163,12 @@ pub fn encode_control_message(msg: &ControlMessage) -> Vec<u8> {
             let id_bytes = node_id.as_bytes();
             buf.extend_from_slice(&(id_bytes.len() as u32).to_le_bytes());
             buf.extend_from_slice(id_bytes);
+        }
+        ControlMessage::Cancel { reason } => {
+            buf.push(MSG_TYPE_CANCEL);
+            let reason_bytes = reason.as_bytes();
+            buf.extend_from_slice(&(reason_bytes.len() as u32).to_le_bytes());
+            buf.extend_from_slice(reason_bytes);
         }
     }
     let crc = crc32fast::hash(&buf);
@@ -219,6 +235,25 @@ pub fn decode_control_message(data: &[u8]) -> Result<ControlMessage, ControlProt
             }
             let node_id = std::str::from_utf8(&payload[5..5 + id_len])?.to_string();
             Ok(ControlMessage::Ready { node_id })
+        }
+        MSG_TYPE_CANCEL => {
+            if payload.len() < 5 {
+                return Err(ControlProtocolError::InvalidPayloadSize {
+                    expected: 5,
+                    actual: payload.len(),
+                });
+            }
+            let reason_len = wire::read_u32(payload, 1)
+                .map_err(|e| ControlProtocolError::WireRead(Box::new(e)))?
+                as usize;
+            if payload.len() != 5 + reason_len {
+                return Err(ControlProtocolError::InvalidPayloadSize {
+                    expected: 5 + reason_len,
+                    actual: payload.len(),
+                });
+            }
+            let reason = std::str::from_utf8(&payload[5..5 + reason_len])?.to_string();
+            Ok(ControlMessage::Cancel { reason })
         }
         other => Err(ControlProtocolError::UnknownMessageType { msg_type: other }),
     }
@@ -599,6 +634,113 @@ pub async fn perform_ready_barrier_with_transport(
     Ok(())
 }
 
+/// Broadcast a cancellation message to all peers.
+///
+/// Called when the local dataflow is cancelled. Sending is best-effort: peers
+/// may already have disconnected by the time cancellation propagates.
+#[cfg(feature = "transport")]
+pub async fn broadcast_cancel(
+    session: &super::TransportSession,
+    dataflow_id: DataflowId,
+    reason: &str,
+) {
+    use crate::communication::transport::Frame;
+    use crate::communication::transport_session::CONTROL_CHANNEL_ID;
+
+    let payload = encode_control_message(&ControlMessage::Cancel {
+        reason: reason.to_string(),
+    });
+
+    for peer_id in session.peer_node_ids().collect::<Vec<_>>() {
+        if let Some(sender) = session.control_sender(peer_id) {
+            let frame = Frame {
+                dataflow_id,
+                channel_id: CONTROL_CHANNEL_ID,
+                payload: payload.clone(),
+            };
+            let _ = sender.send(frame).await;
+        }
+    }
+}
+
+/// Broadcast a cancellation message to all peers using a [`ClusterTransport`].
+#[cfg(feature = "transport")]
+pub async fn broadcast_cancel_with_transport(
+    transport: &super::cluster_transport::ClusterTransport,
+    dataflow_id: DataflowId,
+    reason: &str,
+) {
+    use crate::communication::transport::Frame;
+    use crate::communication::transport_session::CONTROL_CHANNEL_ID;
+
+    let payload = encode_control_message(&ControlMessage::Cancel {
+        reason: reason.to_string(),
+    });
+
+    for peer_id in transport.peer_node_ids() {
+        if let Some(sender) = transport.control_sender(&peer_id) {
+            let frame = Frame {
+                dataflow_id,
+                channel_id: CONTROL_CHANNEL_ID,
+                payload: payload.clone(),
+            };
+            let _ = sender.send(frame).await;
+        }
+    }
+}
+
+/// Spawn tasks that listen for peer cancellation messages.
+///
+/// When any peer sends `Cancel`, the local cancellation token is cancelled with
+/// [`CancellationReason::PeerCancelled`]. The task exits when all receivers are
+/// closed, the local cancellation token fires, or the `shutdown` token fires
+/// (indicating normal dataflow completion).
+///
+/// # Security
+///
+/// This function assumes all peers in `control_receivers` are authenticated at
+/// the connection layer (e.g., via mTLS in the application's `ConnectionManager`).
+/// The `Cancel` message itself carries no cryptographic signature — peer identity
+/// verification is the responsibility of the transport layer.
+#[cfg(feature = "transport")]
+pub fn spawn_cancel_listener(
+    control_receivers: std::collections::HashMap<String, tokio::sync::mpsc::Receiver<Vec<u8>>>,
+    cancel_token: CancellationToken,
+    shutdown: tokio_util::sync::CancellationToken,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        let mut set = tokio::task::JoinSet::new();
+
+        for (peer_id, mut rx) in control_receivers {
+            let token = cancel_token.clone();
+            let shut = shutdown.clone();
+            set.spawn(async move {
+                loop {
+                    tokio::select! {
+                        biased;
+                        _ = token.cancelled_async() => return,
+                        _ = shut.cancelled() => return,
+                        maybe_data = rx.recv() => {
+                            let Some(data) = maybe_data else {
+                                return;
+                            };
+                            if let Ok(ControlMessage::Cancel { reason }) = decode_control_message(&data) {
+                                token.cancel_with_reason(CancellationReason::PeerCancelled {
+                                    peer_id,
+                                    detail: reason,
+                                });
+                                return;
+                            }
+                        }
+                    }
+                }
+            });
+        }
+
+        while set.join_next().await.is_some() {}
+    })
+}
+
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
@@ -607,6 +749,9 @@ pub async fn perform_ready_barrier_with_transport(
 #[cfg(feature = "transport")]
 mod tests {
     use super::*;
+
+    use crate::communication::transport::FramedReader;
+    use crate::communication::transport_session::PeerConnection;
 
     #[test]
     fn handshake_roundtrip() {
@@ -623,6 +768,26 @@ mod tests {
     fn ready_roundtrip() {
         let msg = ControlMessage::Ready {
             node_id: "node-42".to_string(),
+        };
+        let encoded = encode_control_message(&msg);
+        let decoded = decode_control_message(&encoded).unwrap();
+        assert_eq!(msg, decoded);
+    }
+
+    #[test]
+    fn cancel_message_roundtrip() {
+        let msg = ControlMessage::Cancel {
+            reason: "operator requested shutdown".to_string(),
+        };
+        let encoded = encode_control_message(&msg);
+        let decoded = decode_control_message(&encoded).unwrap();
+        assert_eq!(msg, decoded);
+    }
+
+    #[test]
+    fn cancel_empty_reason_roundtrip() {
+        let msg = ControlMessage::Cancel {
+            reason: String::new(),
         };
         let encoded = encode_control_message(&msg);
         let decoded = decode_control_message(&encoded).unwrap();
@@ -689,5 +854,112 @@ mod tests {
         let encoded = encode_control_message(&msg);
         let decoded = decode_control_message(&encoded).unwrap();
         assert_eq!(msg, decoded);
+    }
+
+    #[tokio::test]
+    async fn spawn_cancel_listener_cancels_local_token() {
+        let cancel_token = CancellationToken::new();
+        let (tx, rx) = tokio::sync::mpsc::channel(1);
+        let mut control_receivers = std::collections::HashMap::new();
+        control_receivers.insert("node-b".to_string(), rx);
+
+        let listener = spawn_cancel_listener(
+            control_receivers,
+            cancel_token.clone(),
+            tokio_util::sync::CancellationToken::new(),
+        );
+        tx.send(encode_control_message(&ControlMessage::Cancel {
+            reason: "user requested shutdown".to_string(),
+        }))
+        .await
+        .unwrap();
+        drop(tx);
+
+        tokio::time::timeout(std::time::Duration::from_secs(2), cancel_token.cancelled_async())
+            .await
+            .expect("cancel token should be cancelled");
+        listener.await.unwrap();
+
+        assert_eq!(
+            cancel_token.reason(),
+            Some(CancellationReason::PeerCancelled {
+                peer_id: "node-b".to_string(),
+                detail: "user requested shutdown".to_string(),
+            })
+        );
+    }
+
+    #[tokio::test]
+    async fn spawn_cancel_listener_exits_on_shutdown() {
+        let cancel_token = CancellationToken::new();
+        let shutdown = tokio_util::sync::CancellationToken::new();
+        let (_tx, rx) = tokio::sync::mpsc::channel::<Vec<u8>>(1);
+        let mut control_receivers = std::collections::HashMap::new();
+        control_receivers.insert("node-b".to_string(), rx);
+
+        let listener = spawn_cancel_listener(control_receivers, cancel_token.clone(), shutdown.clone());
+
+        // Signal shutdown (normal completion) — listener should exit promptly
+        // without cancelling the dataflow token.
+        shutdown.cancel();
+        tokio::time::timeout(std::time::Duration::from_secs(2), listener)
+            .await
+            .expect("listener should exit on shutdown")
+            .unwrap();
+
+        assert!(!cancel_token.is_cancelled(), "dataflow token should not be cancelled on clean shutdown");
+    }
+
+    #[tokio::test]
+    async fn broadcast_cancel_sends_to_all_peers() {
+        let dataflow_id = DataflowId::new();
+        let runtime = tokio::runtime::Handle::current();
+
+        let (peer_a_local, peer_a_remote) = tokio::io::duplex(64 * 1024);
+        let (peer_b_local, peer_b_remote) = tokio::io::duplex(64 * 1024);
+        let (peer_a_reader, peer_a_writer) = tokio::io::split(peer_a_local);
+        let (peer_b_reader, peer_b_writer) = tokio::io::split(peer_b_local);
+
+        let (session, _) = crate::communication::transport_session::TransportSession::new(
+            dataflow_id,
+            vec![
+                PeerConnection {
+                    node_id: "node-a".into(),
+                    reader: peer_a_reader,
+                    writer: peer_a_writer,
+                },
+                PeerConnection {
+                    node_id: "node-b".into(),
+                    reader: peer_b_reader,
+                    writer: peer_b_writer,
+                },
+            ],
+            &[],
+            &[],
+            16,
+            &runtime,
+        );
+
+        broadcast_cancel(&session, dataflow_id, "worker failed").await;
+
+        let mut remote_a = FramedReader::new(peer_a_remote);
+        let mut remote_b = FramedReader::new(peer_b_remote);
+        let frame_a = remote_a.read_frame().await.unwrap();
+        let frame_b = remote_b.read_frame().await.unwrap();
+
+        assert_eq!(frame_a.dataflow_id, dataflow_id);
+        assert_eq!(frame_b.dataflow_id, dataflow_id);
+        assert_eq!(
+            decode_control_message(&frame_a.payload).unwrap(),
+            ControlMessage::Cancel {
+                reason: "worker failed".to_string(),
+            }
+        );
+        assert_eq!(
+            decode_control_message(&frame_b.payload).unwrap(),
+            ControlMessage::Cancel {
+                reason: "worker failed".to_string(),
+            }
+        );
     }
 }
