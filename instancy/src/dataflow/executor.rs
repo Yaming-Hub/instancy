@@ -451,7 +451,9 @@ impl<T: Timestamp> DataflowExecutor<T> {
 
         for edge_idx in 0..total_edge_count {
             let mut factory = factory_map.remove(&edge_idx).ok_or_else(|| {
-                Error::Dataflow(DataflowError::MissingFactory { edge_index: edge_idx })
+                Error::Dataflow(DataflowError::MissingFactory {
+                    edge_index: edge_idx,
+                })
             })?;
             let (push, pull) = factory.build(&worker_context, Some(wake_handle.clone()))?;
             push_ends.push(Some(push));
@@ -474,10 +476,14 @@ impl<T: Timestamp> DataflowExecutor<T> {
         // Process regular edges
         for (edge_idx, edge) in edges.iter().enumerate() {
             let pull = pull_ends[edge_idx].take().ok_or_else(|| {
-                Error::Dataflow(DataflowError::InvalidGraph("edge endpoint missing or already materialized".into()))
+                Error::Dataflow(DataflowError::InvalidGraph(
+                    "edge endpoint missing or already materialized".into(),
+                ))
             })?;
             let push = push_ends[edge_idx].take().ok_or_else(|| {
-                Error::Dataflow(DataflowError::InvalidGraph("edge endpoint missing or already materialized".into()))
+                Error::Dataflow(DataflowError::InvalidGraph(
+                    "edge endpoint missing or already materialized".into(),
+                ))
             })?;
 
             op_input_pullers
@@ -495,10 +501,14 @@ impl<T: Timestamp> DataflowExecutor<T> {
         for (i, edge) in feedback_edges.iter().enumerate() {
             let edge_idx = edges.len() + i;
             let pull = pull_ends[edge_idx].take().ok_or_else(|| {
-                Error::Dataflow(DataflowError::InvalidGraph("edge endpoint missing or already materialized".into()))
+                Error::Dataflow(DataflowError::InvalidGraph(
+                    "edge endpoint missing or already materialized".into(),
+                ))
             })?;
             let push = push_ends[edge_idx].take().ok_or_else(|| {
-                Error::Dataflow(DataflowError::InvalidGraph("edge endpoint missing or already materialized".into()))
+                Error::Dataflow(DataflowError::InvalidGraph(
+                    "edge endpoint missing or already materialized".into(),
+                ))
             })?;
 
             op_input_pullers
@@ -1002,7 +1012,9 @@ impl<T: Timestamp> DataflowExecutor<T> {
         // Update registered probes with current frontiers.
         if !self.probes.is_empty() {
             let tracker = self.progress_tracker.as_ref().ok_or_else(|| {
-                Error::Dataflow(DataflowError::InvalidGraph("progress tracker missing while probes are registered".into()))
+                Error::Dataflow(DataflowError::InvalidGraph(
+                    "progress tracker missing while probes are registered".into(),
+                ))
             })?;
             for (i, (op_idx, probe)) in self.probes.iter().enumerate() {
                 let frontier = tracker.operator_input_frontier_meet(*op_idx);
@@ -1193,7 +1205,11 @@ impl<T: Timestamp> DataflowExecutor<T> {
         let positions = self
             .fused_order
             .as_ref()
-            .ok_or_else(|| Error::Dataflow(DataflowError::InvalidGraph("executor fused order missing".into())))?
+            .ok_or_else(|| {
+                Error::Dataflow(DataflowError::InvalidGraph(
+                    "executor fused order missing".into(),
+                ))
+            })?
             .positions()
             .to_vec();
 

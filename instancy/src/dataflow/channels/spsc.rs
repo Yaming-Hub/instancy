@@ -18,8 +18,8 @@
 
 use std::cell::UnsafeCell;
 use std::mem::MaybeUninit;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 use crate::error::{Error, Result};
 use crate::progress::timestamp::Timestamp;
@@ -58,9 +58,7 @@ impl<T> RingBuffer<T> {
         assert!(capacity > 0, "SPSC capacity must be > 0");
         // Use next power of two for efficient modulo via bitwise AND.
         // Guard against overflow: capacity + 1 must not wrap.
-        let cap1 = capacity
-            .checked_add(1)
-            .expect("SPSC capacity too large");
+        let cap1 = capacity.checked_add(1).expect("SPSC capacity too large");
         let size = cap1.next_power_of_two();
         assert!(
             size > capacity,
@@ -179,7 +177,9 @@ impl<T: Timestamp, D: Send + 'static, M: Send + 'static> Push<T, D, M> for SpscP
         unsafe {
             (*self.ring.slots[slot].value.get()).write(envelope);
         }
-        self.ring.tail.store(tail.wrapping_add(1), Ordering::Release);
+        self.ring
+            .tail
+            .store(tail.wrapping_add(1), Ordering::Release);
         if let Some(ref wake) = self.wake {
             wake.notify();
         }
@@ -206,7 +206,9 @@ impl<T: Timestamp, D: Send + 'static, M: Send + 'static> Push<T, D, M> for SpscP
         unsafe {
             (*self.ring.slots[slot].value.get()).write(envelope);
         }
-        self.ring.tail.store(tail.wrapping_add(1), Ordering::Release);
+        self.ring
+            .tail
+            .store(tail.wrapping_add(1), Ordering::Release);
         if let Some(ref wake) = self.wake {
             wake.notify();
         }
@@ -231,7 +233,11 @@ impl<T: Timestamp, D: Send + 'static, M: Send + 'static> Push<T, D, M> for SpscP
     fn available_capacity(&self) -> Option<usize> {
         let tail = self.ring.tail.load(Ordering::Relaxed);
         let head = self.ring.head.load(Ordering::Acquire);
-        Some(self.ring.capacity.saturating_sub(self.ring.len_from(head, tail)))
+        Some(
+            self.ring
+                .capacity
+                .saturating_sub(self.ring.len_from(head, tail)),
+        )
     }
 }
 

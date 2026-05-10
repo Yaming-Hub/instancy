@@ -29,9 +29,9 @@ use crate::dataflow::graph::{EdgeInfo, OperatorInfo};
 use crate::dataflow::scope::{ChildScope, Scope};
 use crate::dataflow::stage::StageId;
 use crate::dataflow::stream::{Slot, StreamEdge};
+use crate::error::DataflowError;
 use crate::order::Product;
 use crate::progress::timestamp::Timestamp;
-use crate::error::DataflowError;
 
 // ============================================================================
 // Scope boundary metadata

@@ -220,7 +220,8 @@ fn build_staged_fan_out_fan_in(
     if fan_out_parallelism == 0 {
         return Err(instancy::error::DataflowError::InvalidConfig(
             "fan_out_parallelism must be > 0".into(),
-        ).into());
+        )
+        .into());
     }
 
     let input = builder.input::<i64>("data");

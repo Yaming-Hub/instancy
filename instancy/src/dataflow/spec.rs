@@ -64,7 +64,9 @@ impl<T: Timestamp> DataflowSpec<T> {
     ) -> Result<Self> {
         let name = name.into();
         if self.inputs.contains_key(&name) {
-            return Err(Error::Dataflow(DataflowError::InvalidConfig(format!("duplicate input name: '{name}'"))));
+            return Err(Error::Dataflow(DataflowError::InvalidConfig(format!(
+                "duplicate input name: '{name}'"
+            ))));
         }
         self.input_order.push(name.clone());
         self.inputs.insert(name, Box::new(TypedInput::new(input)));
@@ -127,13 +129,19 @@ impl<T: Timestamp> DataflowSpec<T> {
     /// Validate the dataflow specification.
     pub fn validate(&self) -> Result<()> {
         if self.name.is_empty() {
-            return Err(Error::Dataflow(DataflowError::InvalidConfig("dataflow name cannot be empty".into())));
+            return Err(Error::Dataflow(DataflowError::InvalidConfig(
+                "dataflow name cannot be empty".into(),
+            )));
         }
         if self.initial_workers == 0 {
-            return Err(Error::Dataflow(DataflowError::InvalidConfig("must have at least one worker".into())));
+            return Err(Error::Dataflow(DataflowError::InvalidConfig(
+                "must have at least one worker".into(),
+            )));
         }
         if self.output_buffer_size == 0 {
-            return Err(Error::Dataflow(DataflowError::InvalidConfig("output buffer size must be > 0".into())));
+            return Err(Error::Dataflow(DataflowError::InvalidConfig(
+                "output buffer size must be > 0".into(),
+            )));
         }
         Ok(())
     }

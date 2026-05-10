@@ -120,9 +120,9 @@ impl<T: Timestamp> SubgraphBuilder<T> {
         }
         let name = name.into();
         if self.operators.contains_key(&index) {
-            return Err(crate::Error::Dataflow(DataflowError::InvalidConfig(format!(
-                "operator index {index} ('{name}') already registered"
-            ))));
+            return Err(crate::Error::Dataflow(DataflowError::InvalidConfig(
+                format!("operator index {index} ('{name}') already registered"),
+            )));
         }
 
         self.operators.insert(
@@ -157,10 +157,12 @@ impl<T: Timestamp> SubgraphBuilder<T> {
         initial_caps: Vec<ChangeBatch<T>>,
     ) -> Result<&OperatorProgress<T>, crate::Error> {
         if initial_caps.len() != outputs {
-            return Err(crate::Error::Dataflow(DataflowError::InvalidConfig(format!(
-                "initial_caps length ({}) must match outputs count ({outputs})",
-                initial_caps.len()
-            ))));
+            return Err(crate::Error::Dataflow(DataflowError::InvalidConfig(
+                format!(
+                    "initial_caps length ({}) must match outputs count ({outputs})",
+                    initial_caps.len()
+                ),
+            )));
         }
         self.add_operator(index, name, inputs, outputs, connectivity)?;
         self.initial_capabilities.insert(index, initial_caps);

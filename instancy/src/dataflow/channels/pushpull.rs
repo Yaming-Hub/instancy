@@ -115,7 +115,9 @@ mod tests {
             }
             self.buffer
                 .lock()
-                .map_err(|_| crate::error::Error::LockPoisoned { context: "VecPush buffer".into() })?
+                .map_err(|_| crate::error::Error::LockPoisoned {
+                    context: "VecPush buffer".into(),
+                })?
                 .push(envelope);
             Ok(())
         }
@@ -125,16 +127,15 @@ mod tests {
             envelope: Envelope<T, D, M>,
         ) -> std::result::Result<(), (crate::error::Error, Envelope<T, D, M>)> {
             if self.closed {
-                return Err((
-                    crate::error::Error::ChannelClosed,
-                    envelope,
-                ));
+                return Err((crate::error::Error::ChannelClosed, envelope));
             }
             match self.buffer.lock() {
                 Ok(mut buf) => buf.push(envelope),
                 Err(_) => {
                     return Err((
-                        crate::error::Error::LockPoisoned { context: "VecPush buffer".into() },
+                        crate::error::Error::LockPoisoned {
+                            context: "VecPush buffer".into(),
+                        },
                         envelope,
                     ));
                 }

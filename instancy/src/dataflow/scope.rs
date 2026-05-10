@@ -131,10 +131,9 @@ impl<T: Timestamp> RootScope<T> {
             state.current_stage_id = id;
             Ok(())
         } else {
-            Err(crate::error::Error::Dataflow(DataflowError::InvalidGraph(format!(
-                "Stage {} not found in scope '{}'",
-                id, self.name
-            ))))
+            Err(crate::error::Error::Dataflow(DataflowError::InvalidGraph(
+                format!("Stage {} not found in scope '{}'", id, self.name),
+            )))
         }
     }
 

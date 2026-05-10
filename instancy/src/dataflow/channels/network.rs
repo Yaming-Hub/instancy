@@ -280,8 +280,9 @@ pub struct NetworkPush<T: Timestamp + ExchangeData, D: ExchangeData> {
 impl<T: Timestamp + ExchangeData, D: ExchangeData> NetworkPush<T, D> {
     fn encode(&self, envelope: &Envelope<T, D, ()>) -> std::result::Result<Vec<u8>, Error> {
         let mut buf = Vec::new();
-        encode_envelope(&self.time_codec, &self.data_codec, envelope, &mut buf)
-            .map_err(|e| Error::Dataflow(DataflowError::InvalidGraph(format!("network encode: {e}"))))?;
+        encode_envelope(&self.time_codec, &self.data_codec, envelope, &mut buf).map_err(|e| {
+            Error::Dataflow(DataflowError::InvalidGraph(format!("network encode: {e}")))
+        })?;
         Ok(buf)
     }
 
@@ -781,12 +782,16 @@ impl<T: Timestamp + ExchangeData, D: ExchangeData> EdgeMaterializer<T, D>
 
             if worker_node == dst_node && worker_node == self.local_node_id {
                 let push = self.local_push[src_idx][dst].take().ok_or_else(|| {
-                    Error::Dataflow(DataflowError::EndpointTaken(format!("local push [{src_idx}][{dst}] already taken")))
+                    Error::Dataflow(DataflowError::EndpointTaken(format!(
+                        "local push [{src_idx}][{dst}] already taken"
+                    )))
                 })?;
                 pushers.push(Box::new(push));
             } else {
                 let sender = self.transport.data_sender(dst_node).ok_or_else(|| {
-                    Error::Dataflow(DataflowError::InvalidGraph(format!("no connection to peer node '{dst_node}'")))
+                    Error::Dataflow(DataflowError::InvalidGraph(format!(
+                        "no connection to peer node '{dst_node}'"
+                    )))
                 })?;
 
                 let channel_id = Self::channel_id(self.edge_index, src_idx, dst, self.num_workers);
@@ -843,7 +848,9 @@ impl<T: Timestamp + ExchangeData, D: ExchangeData> EdgeMaterializer<T, D>
 
             if src_node == worker_node && src_node == self.local_node_id {
                 let pull = self.local_pull[src][dst_idx].take().ok_or_else(|| {
-                    Error::Dataflow(DataflowError::EndpointTaken(format!("local pull [{src}][{dst_idx}] already taken")))
+                    Error::Dataflow(DataflowError::EndpointTaken(format!(
+                        "local pull [{src}][{dst_idx}] already taken"
+                    )))
                 })?;
                 pullers.push(Box::new(pull));
             } else {
@@ -851,7 +858,9 @@ impl<T: Timestamp + ExchangeData, D: ExchangeData> EdgeMaterializer<T, D>
                     self.demux_receivers
                         .remove(&(src, dst_idx))
                         .ok_or_else(|| {
-                            Error::Dataflow(DataflowError::InvalidGraph(format!("no demux receiver for [{src}][{dst_idx}]")))
+                            Error::Dataflow(DataflowError::InvalidGraph(format!(
+                                "no demux receiver for [{src}][{dst_idx}]"
+                            )))
                         })?;
 
                 let (std_tx, std_rx) = std::sync::mpsc::channel::<Vec<u8>>();

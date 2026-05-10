@@ -92,10 +92,9 @@ fn byte_channel(capacity: usize) -> (ByteSender, ByteReceiver) {
 
 impl ByteSender {
     fn send(&self, data: Vec<u8>) -> std::result::Result<(), Error> {
-        let mut state = self
-            .state
-            .lock()
-            .map_err(|_| Error::LockPoisoned { context: "mock network byte channel".into() })?;
+        let mut state = self.state.lock().map_err(|_| Error::LockPoisoned {
+            context: "mock network byte channel".into(),
+        })?;
         if state.closed {
             return Err(Error::ChannelClosed);
         }
@@ -336,8 +335,11 @@ impl<T: Timestamp + ExchangeData, D: ExchangeData> SerializingPush<T, D> {
         envelope: &Envelope<T, D, ()>,
     ) -> std::result::Result<Vec<u8>, Error> {
         let mut buf = Vec::new();
-        encode_envelope(&self.time_codec, &self.data_codec, envelope, &mut buf)
-            .map_err(|e| Error::Dataflow(DataflowError::InvalidGraph(format!("mock network encode: {e}"))))?;
+        encode_envelope(&self.time_codec, &self.data_codec, envelope, &mut buf).map_err(|e| {
+            Error::Dataflow(DataflowError::InvalidGraph(format!(
+                "mock network encode: {e}"
+            )))
+        })?;
         Ok(buf)
     }
 }
@@ -541,9 +543,11 @@ impl<T: Timestamp + ExchangeData, D: ExchangeData> EdgeMaterializer<T, D>
 
         let mut pushers: Vec<Box<dyn Push<T, D, ()>>> = Vec::with_capacity(self.num_workers);
         for dst in 0..self.num_workers {
-            let sender = self.senders[src_idx][dst]
-                .take()
-                .ok_or_else(|| Error::Dataflow(DataflowError::EndpointTaken(format!("sender [{src_idx}][{dst}] already taken"))))?;
+            let sender = self.senders[src_idx][dst].take().ok_or_else(|| {
+                Error::Dataflow(DataflowError::EndpointTaken(format!(
+                    "sender [{src_idx}][{dst}] already taken"
+                )))
+            })?;
             pushers.push(Box::new(SerializingPush::<T, D>::new(sender)));
         }
         Ok(pushers)
@@ -563,7 +567,9 @@ impl<T: Timestamp + ExchangeData, D: ExchangeData> EdgeMaterializer<T, D>
         let mut pullers: Vec<Box<dyn Pull<T, D, ()>>> = Vec::with_capacity(self.num_workers);
         for src in 0..self.num_workers {
             let receiver = self.receivers[src][dst_idx].take().ok_or_else(|| {
-                Error::Dataflow(DataflowError::EndpointTaken(format!("receiver [{src}][{dst_idx}] already taken")))
+                Error::Dataflow(DataflowError::EndpointTaken(format!(
+                    "receiver [{src}][{dst_idx}] already taken"
+                )))
             })?;
             pullers.push(Box::new(DeserializingPull::<T, D>::new(receiver)));
         }

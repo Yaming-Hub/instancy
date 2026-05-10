@@ -57,6 +57,13 @@ pub struct RuntimeConfig {
     /// Tokio runtime mode — controls how instancy obtains a tokio runtime
     /// for async operations (bridge tasks, timers, async I/O).
     pub tokio_mode: TokioMode,
+    /// Optional initial cluster topology.
+    ///
+    /// If the topology has a membership provider attached (via
+    /// [`ClusterTopology::with_membership`]), the runtime will automatically
+    /// start a background listener for membership events.
+    #[cfg(feature = "transport")]
+    pub topology: Option<crate::execute::ClusterTopology>,
 }
 
 /// Controls how instancy obtains a tokio runtime for async operations.
@@ -112,12 +119,14 @@ pub enum TokioMode {
 
 impl std::fmt::Debug for RuntimeConfig {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("RuntimeConfig")
-            .field("worker_threads", &self.worker_threads)
+        let mut s = f.debug_struct("RuntimeConfig");
+        s.field("worker_threads", &self.worker_threads)
             .field("schedule_policy", &"<dyn SchedulePolicy>")
             .field("name", &self.name)
-            .field("tokio_mode", &self.tokio_mode)
-            .finish()
+            .field("tokio_mode", &self.tokio_mode);
+        #[cfg(feature = "transport")]
+        s.field("topology", &self.topology);
+        s.finish()
     }
 }
 
@@ -128,6 +137,8 @@ impl Default for RuntimeConfig {
             schedule_policy: None,
             name: "instancy".to_string(),
             tokio_mode: TokioMode::default(),
+            #[cfg(feature = "transport")]
+            topology: None,
         }
     }
 }
@@ -700,7 +711,7 @@ pub struct RuntimeHandle {
     #[cfg(feature = "transport")]
     live_topology: Arc<std::sync::RwLock<Option<crate::execute::ClusterTopology>>>,
     /// Cancel token for the current membership event loop task.
-    /// Wrapped in Mutex so `set_membership()` can replace it atomically.
+    /// Wrapped in Mutex so `start_membership_listener()` can replace it atomically.
     /// Each listener gets a child of the runtime cancel token; cancelling
     /// this token stops only the current listener without affecting the runtime.
     #[cfg(feature = "transport")]
@@ -729,8 +740,8 @@ impl RuntimeHandle {
             max_threads: config.worker_threads,
             ..Default::default()
         };
-        let worker_pool =
-            WorkerPool::new(pool_config).map_err(|e| Error::Runtime(RuntimeError::InvalidConfig(e.to_string())))?;
+        let worker_pool = WorkerPool::new(pool_config)
+            .map_err(|e| Error::Runtime(RuntimeError::InvalidConfig(e.to_string())))?;
         let schedule_policy: Option<Arc<dyn SchedulePolicy>> = config
             .schedule_policy
             .map(|p| Arc::from(p) as Arc<dyn SchedulePolicy>);
@@ -754,7 +765,9 @@ impl RuntimeHandle {
                     .thread_name(format!("{}-tokio", config.name))
                     .build()
                     .map_err(|e| {
-                        Error::Runtime(RuntimeError::SpawnFailed(format!("failed to create tokio runtime: {e}")))
+                        Error::Runtime(RuntimeError::SpawnFailed(format!(
+                            "failed to create tokio runtime: {e}"
+                        )))
                     })?;
                 let handle = rt.handle().clone();
                 (handle, Some(rt))
@@ -792,10 +805,24 @@ impl RuntimeHandle {
             }
         };
 
-        Ok(Self {
+        // Extract topology and membership from config.
+        #[cfg(feature = "transport")]
+        let (initial_topology, membership_provider) = {
+            match config.topology {
+                Some(mut topo) => {
+                    let provider = topo.take_membership();
+                    (Some(topo), provider)
+                }
+                None => (None, None),
+            }
+        };
+
+        let cancel = CancellationToken::new();
+
+        let handle = Self {
             worker_pool,
             _schedule_policy: schedule_policy,
-            cancel: CancellationToken::new(),
+            cancel: cancel.clone(),
             name: config.name,
             registry,
             #[cfg(feature = "transport")]
@@ -805,10 +832,18 @@ impl RuntimeHandle {
             active_count: Arc::new(AtomicUsize::new(0)),
             idle_notify: Arc::new(tokio::sync::Notify::new()),
             #[cfg(feature = "transport")]
-            live_topology: Arc::new(std::sync::RwLock::new(None)),
+            live_topology: Arc::new(std::sync::RwLock::new(initial_topology)),
             #[cfg(feature = "transport")]
-            membership_cancel: std::sync::Mutex::new(CancellationToken::new()),
-        })
+            membership_cancel: std::sync::Mutex::new(cancel.child_token()),
+        };
+
+        // Auto-start membership listener if a provider was attached.
+        #[cfg(feature = "transport")]
+        if let Some(provider) = membership_provider {
+            handle.start_membership_listener(provider)?;
+        }
+
+        Ok(handle)
     }
 
     /// Returns the cancellation token for this runtime.
@@ -967,25 +1002,9 @@ impl RuntimeHandle {
         self.peer_registry.report_peer_recovered(node_id)
     }
 
-    /// Set the live cluster topology.
-    ///
-    /// The topology is stored internally and can be retrieved with
-    /// [`current_topology()`](Self::current_topology). When a
-    /// [`ClusterMembership`](crate::membership::ClusterMembership) provider
-    /// is active, this topology is automatically updated on membership events.
-    ///
-    /// Applications can also call this directly to initialize or override
-    /// the live topology.
-    #[cfg(feature = "transport")]
-    pub fn set_topology(&self, topology: crate::execute::ClusterTopology) {
-        let mut guard = self.live_topology.write().unwrap_or_else(|e| e.into_inner());
-        *guard = Some(topology);
-    }
-
     /// Get a snapshot of the current live cluster topology.
     ///
-    /// Returns `None` if no topology has been set (either via
-    /// [`set_topology()`](Self::set_topology) or via membership events).
+    /// Returns `None` if no topology was provided via [`RuntimeConfig`].
     ///
     /// The returned topology reflects all membership events processed so far.
     /// Already-running dataflows use the topology they were spawned with —
@@ -996,45 +1015,21 @@ impl RuntimeHandle {
         guard.clone()
     }
 
-    /// Install a [`ClusterMembership`](crate::membership::ClusterMembership)
-    /// provider that automatically processes node join/leave events.
+    /// Start a background membership listener that processes node join/leave events.
     ///
-    /// The runtime spawns a background Tokio task that:
-    /// - On [`NodeJoined`](crate::membership::MembershipEvent::NodeJoined):
-    ///   adds the node to the live topology and clears its "down" state.
-    /// - On [`NodeLeft`](crate::membership::MembershipEvent::NodeLeft):
-    ///   removes the node from the live topology and cancels affected dataflows.
-    ///
-    /// The task runs until the membership stream ends, the runtime shuts down,
-    /// or this method is called again (which cancels the previous listener).
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if the membership provider's `events()` returns `None`
-    /// (already consumed by a previous call).
-    ///
-    /// # Example
-    ///
-    /// ```ignore
-    /// use instancy::membership::ChannelMembership;
-    ///
-    /// let membership = ChannelMembership::new();
-    /// let tx = membership.sender();
-    /// runtime.set_membership(membership)?;
-    ///
-    /// // Now send events — runtime processes them automatically
-    /// tx.send(MembershipEvent::NodeJoined { node_id: "node-2".into(), logical_workers: 4 });
-    /// ```
+    /// Called automatically during construction if the topology has a membership
+    /// provider attached.
     #[cfg(feature = "transport")]
-    #[cfg_attr(docsrs, doc(cfg(feature = "transport")))]
-    pub fn set_membership(
+    fn start_membership_listener(
         &self,
-        membership: impl crate::membership::ClusterMembership,
+        membership: Box<dyn crate::execute::ClusterMembership>,
     ) -> Result<()> {
-        use crate::membership::MembershipEvent;
+        use crate::execute::MembershipEvent;
 
         let mut rx = membership.events().ok_or_else(|| {
-            Error::Runtime(RuntimeError::AlreadyConsumed { resource: "membership provider events".into() })
+            Error::Runtime(RuntimeError::AlreadyConsumed {
+                resource: "membership provider events".into(),
+            })
         })?;
 
         // Cancel any previous membership listener by cancelling its token.
@@ -1623,7 +1618,11 @@ impl RuntimeHandle {
             std::thread::Builder::new()
                 .name(format!("source-pump-{}-{}", name, pump_idx))
                 .spawn(pump)
-                .map_err(|e| Error::Runtime(RuntimeError::SpawnFailed(format!("failed to spawn pump thread: {e}"))))?;
+                .map_err(|e| {
+                    Error::Runtime(RuntimeError::SpawnFailed(format!(
+                        "failed to spawn pump thread: {e}"
+                    )))
+                })?;
         }
 
         let spawned = SpawnedDataflow {
@@ -1656,7 +1655,9 @@ impl RuntimeHandle {
         F: Fn(&mut DataflowBuilder<T>) -> Result<()>,
     {
         if num_workers == 0 {
-            return Err(Error::Runtime(RuntimeError::InvalidConfig("num_workers must be >= 1".into())));
+            return Err(Error::Runtime(RuntimeError::InvalidConfig(
+                "num_workers must be >= 1".into(),
+            )));
         }
 
         // Phase 1: Build all N dataflows from the closure.
@@ -1885,7 +1886,9 @@ impl RuntimeHandle {
         F: Fn(&mut DataflowBuilder<T>) -> Result<()>,
     {
         if default_parallelism == 0 {
-            return Err(Error::Runtime(RuntimeError::InvalidConfig("default_parallelism must be >= 1".into())));
+            return Err(Error::Runtime(RuntimeError::InvalidConfig(
+                "default_parallelism must be >= 1".into(),
+            )));
         }
 
         // Phase 1: Build one dataflow to analyze stage structure.
@@ -1920,7 +1923,9 @@ impl RuntimeHandle {
             .unwrap_or(&default_parallelism);
 
         if num_workers == 0 {
-            return Err(Error::Runtime(RuntimeError::InvalidConfig("computed num_workers must be >= 1".into())));
+            return Err(Error::Runtime(RuntimeError::InvalidConfig(
+                "computed num_workers must be >= 1".into(),
+            )));
         }
 
         // If all stages have the same parallelism, use normal spawn_multi.
@@ -2233,7 +2238,9 @@ impl RuntimeHandle {
 
         let total_workers = topology.total_workers();
         let (local_start, local_end) = topology.worker_range(local_node_id).ok_or_else(|| {
-            Error::Topology(TopologyError::NodeNotFound { node_id: local_node_id.to_string() })
+            Error::Topology(TopologyError::NodeNotFound {
+                node_id: local_node_id.to_string(),
+            })
         })?;
         let num_local = local_end - local_start;
 
@@ -2337,7 +2344,9 @@ impl RuntimeHandle {
                         let peer_id = &node.node_id;
                         let (peer_start, peer_end) =
                             topology.worker_range(peer_id).ok_or_else(|| {
-                                Error::Topology(TopologyError::NodeNotFound { node_id: peer_id.clone() })
+                                Error::Topology(TopologyError::NodeNotFound {
+                                    node_id: peer_id.clone(),
+                                })
                             })?;
                         for src in peer_start..peer_end {
                             for dst in local_start..local_end {
@@ -2364,7 +2373,9 @@ impl RuntimeHandle {
                     let peer_id = &node.node_id;
                     let (peer_start, peer_end) =
                         topology.worker_range(peer_id).ok_or_else(|| {
-                            Error::Topology(TopologyError::NodeNotFound { node_id: peer_id.clone() })
+                            Error::Topology(TopologyError::NodeNotFound {
+                                node_id: peer_id.clone(),
+                            })
                         })?;
                     for src in peer_start..peer_end {
                         for dst in local_start..local_end {
@@ -2436,7 +2447,9 @@ impl RuntimeHandle {
                         }
                         let (peer_start, peer_end) =
                             topology.worker_range(&node.node_id).ok_or_else(|| {
-                                Error::Topology(TopologyError::NodeNotFound { node_id: node.node_id.clone() })
+                                Error::Topology(TopologyError::NodeNotFound {
+                                    node_id: node.node_id.clone(),
+                                })
                             })?;
                         for src in peer_start..peer_end {
                             for dst in local_start..local_end {
@@ -2457,7 +2470,9 @@ impl RuntimeHandle {
                     }
                     let (peer_start, peer_end) =
                         topology.worker_range(&node.node_id).ok_or_else(|| {
-                            Error::Topology(TopologyError::NodeNotFound { node_id: node.node_id.clone() })
+                            Error::Topology(TopologyError::NodeNotFound {
+                                node_id: node.node_id.clone(),
+                            })
                         })?;
                     for src in peer_start..peer_end {
                         for dst in local_start..local_end {
@@ -2477,9 +2492,11 @@ impl RuntimeHandle {
                     ),
                 );
 
-                let mut raw_receivers = session
-                    .take_receivers()
-                    .ok_or_else(|| Error::Runtime(RuntimeError::AlreadyConsumed { resource: "receivers".into() }))?;
+                let mut raw_receivers = session.take_receivers().ok_or_else(|| {
+                    Error::Runtime(RuntimeError::AlreadyConsumed {
+                        resource: "receivers".into(),
+                    })
+                })?;
                 let error_rxs = session.take_error_receivers();
 
                 transport = Arc::new(ClusterTransport::Shared {
@@ -2510,7 +2527,11 @@ impl RuntimeHandle {
                     dataflow_id,
                     handshake_timeout,
                 ))
-                .map_err(|e| Error::Runtime(RuntimeError::ClusterSetup(format!("cluster handshake failed: {e}"))))?;
+                .map_err(|e| {
+                    Error::Runtime(RuntimeError::ClusterSetup(format!(
+                        "cluster handshake failed: {e}"
+                    )))
+                })?;
         } else {
             runtime_handle
                 .block_on(perform_handshake_with_transport(
@@ -2520,7 +2541,11 @@ impl RuntimeHandle {
                     dataflow_id,
                     handshake_timeout,
                 ))
-                .map_err(|e| Error::Runtime(RuntimeError::ClusterSetup(format!("cluster handshake failed: {e}"))))?;
+                .map_err(|e| {
+                    Error::Runtime(RuntimeError::ClusterSetup(format!(
+                        "cluster handshake failed: {e}"
+                    )))
+                })?;
         }
 
         // Phase 5: Wire exchange channels using network-backed factories.
@@ -2545,7 +2570,9 @@ impl RuntimeHandle {
                 }
                 let peer_id = &node.node_id;
                 let (peer_start, peer_end) = topology.worker_range(peer_id).ok_or_else(|| {
-                    Error::Topology(TopologyError::NodeNotFound { node_id: peer_id.clone() })
+                    Error::Topology(TopologyError::NodeNotFound {
+                        node_id: peer_id.clone(),
+                    })
                 })?;
                 let mut extracted = std::collections::HashMap::new();
                 if let Some(peer_map) = receivers.get_mut(peer_id) {
@@ -2715,7 +2742,11 @@ impl RuntimeHandle {
             DEFAULT_MAX_BATCH_SIZE,
             runtime_handle,
         )
-        .map_err(|e| Error::Runtime(RuntimeError::ClusterSetup(format!("failed to create network progress channels: {e}"))))?;
+        .map_err(|e| {
+            Error::Runtime(RuntimeError::ClusterSetup(format!(
+                "failed to create network progress channels: {e}"
+            )))
+        })?;
 
         // Phase 7: Materialize all local workers (without registering).
         let mode = ChannelMode::Sync;
@@ -2763,7 +2794,11 @@ impl RuntimeHandle {
                     dataflow_id,
                     handshake_timeout,
                 ))
-                .map_err(|e| Error::Runtime(RuntimeError::ClusterSetup(format!("cluster ready barrier failed: {e}"))))?;
+                .map_err(|e| {
+                    Error::Runtime(RuntimeError::ClusterSetup(format!(
+                        "cluster ready barrier failed: {e}"
+                    )))
+                })?;
         } else {
             runtime_handle
                 .block_on(perform_ready_barrier_with_transport(
@@ -2773,7 +2808,11 @@ impl RuntimeHandle {
                     dataflow_id,
                     handshake_timeout,
                 ))
-                .map_err(|e| Error::Runtime(RuntimeError::ClusterSetup(format!("cluster ready barrier failed: {e}"))))?;
+                .map_err(|e| {
+                    Error::Runtime(RuntimeError::ClusterSetup(format!(
+                        "cluster ready barrier failed: {e}"
+                    )))
+                })?;
         }
 
         // Phase 9: Register all workers for execution.
@@ -3151,7 +3190,11 @@ impl SimpleRuntime {
             std::thread::Builder::new()
                 .name(format!("source-pump-{}-{}", name, pump_idx))
                 .spawn(pump)
-                .map_err(|e| Error::Runtime(RuntimeError::SpawnFailed(format!("failed to spawn pump thread: {e}"))))?;
+                .map_err(|e| {
+                    Error::Runtime(RuntimeError::SpawnFailed(format!(
+                        "failed to spawn pump thread: {e}"
+                    )))
+                })?;
         }
 
         std::thread::Builder::new()
@@ -3160,7 +3203,11 @@ impl SimpleRuntime {
                 let result = executor.run();
                 notifier.complete(result);
             })
-            .map_err(|e| Error::Runtime(RuntimeError::SpawnFailed(format!("failed to spawn dataflow thread: {e}"))))?;
+            .map_err(|e| {
+                Error::Runtime(RuntimeError::SpawnFailed(format!(
+                    "failed to spawn dataflow thread: {e}"
+                )))
+            })?;
 
         Ok(SpawnedDataflow {
             name,
@@ -3190,7 +3237,9 @@ impl SimpleRuntime {
         F: Fn(&mut DataflowBuilder<T>) -> Result<()>,
     {
         if num_workers == 0 {
-            return Err(Error::Runtime(RuntimeError::InvalidConfig("num_workers must be >= 1".into())));
+            return Err(Error::Runtime(RuntimeError::InvalidConfig(
+                "num_workers must be >= 1".into(),
+            )));
         }
 
         // Phase 1: Build all N dataflows.
@@ -3432,22 +3481,19 @@ impl DataflowCompletion {
     /// Returns `Ok(())` if the dataflow ran to completion, or an error if
     /// the executor failed or reached quiescence without completing.
     pub fn wait(self) -> Result<()> {
-        let mut state = self
-            .shared
-            .lock()
-            .map_err(|_| Error::LockPoisoned { context: "completion mutex poisoned".into() })?;
+        let mut state = self.shared.lock().map_err(|_| Error::LockPoisoned {
+            context: "completion mutex poisoned".into(),
+        })?;
         while state.result.is_none() {
-            state = self
-                .condvar
-                .wait(state)
-                .map_err(|_| Error::LockPoisoned { context: "completion mutex poisoned during wait".into() })?;
+            state = self.condvar.wait(state).map_err(|_| Error::LockPoisoned {
+                context: "completion mutex poisoned during wait".into(),
+            })?;
         }
-        interpret_completion(
-            state
-                .result
-                .take()
-                .ok_or_else(|| Error::Runtime(RuntimeError::InvalidConfig("internal: result missing after wait loop".into())))?,
-        )
+        interpret_completion(state.result.take().ok_or_else(|| {
+            Error::Runtime(RuntimeError::InvalidConfig(
+                "internal: result missing after wait loop".into(),
+            ))
+        })?)
     }
 }
 
@@ -3457,7 +3503,11 @@ impl Future for DataflowCompletion {
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         let mut state = match self.shared.lock() {
             Ok(s) => s,
-            Err(_) => return Poll::Ready(Err(Error::LockPoisoned { context: "completion mutex poisoned".into() })),
+            Err(_) => {
+                return Poll::Ready(Err(Error::LockPoisoned {
+                    context: "completion mutex poisoned".into(),
+                }));
+            }
         };
         if let Some(result) = state.result.take() {
             Poll::Ready(interpret_completion(result))
@@ -3568,7 +3618,11 @@ impl<T: Timestamp> SpawnedDataflow<T> {
             .input_senders
             .iter()
             .position(|(n, _, _)| n == name)
-            .ok_or_else(|| Error::Runtime(RuntimeError::InvalidConfig(format!("no input port named '{name}'"))))?;
+            .ok_or_else(|| {
+                Error::Runtime(RuntimeError::InvalidConfig(format!(
+                    "no input port named '{name}'"
+                )))
+            })?;
 
         let (_, port_type, _) = &self.input_senders[pos];
         if *port_type != type_name {
@@ -3611,7 +3665,11 @@ impl<T: Timestamp> SpawnedDataflow<T> {
             .output_receivers
             .iter()
             .position(|(n, _, _)| n == name)
-            .ok_or_else(|| Error::Runtime(RuntimeError::InvalidConfig(format!("no output port named '{name}'"))))?;
+            .ok_or_else(|| {
+                Error::Runtime(RuntimeError::InvalidConfig(format!(
+                    "no output port named '{name}'"
+                )))
+            })?;
 
         let (_, port_type, _) = &self.output_receivers[pos];
         if *port_type != type_name {
@@ -3652,7 +3710,11 @@ impl<T: Timestamp> SpawnedDataflow<T> {
             .input_senders
             .iter()
             .position(|(n, _, _)| n == name)
-            .ok_or_else(|| Error::Runtime(RuntimeError::InvalidConfig(format!("no input port named '{name}'"))))?;
+            .ok_or_else(|| {
+                Error::Runtime(RuntimeError::InvalidConfig(format!(
+                    "no input port named '{name}'"
+                )))
+            })?;
 
         let (_, port_type, _) = &self.input_senders[pos];
         if *port_type != type_name {
@@ -3696,7 +3758,11 @@ impl<T: Timestamp> SpawnedDataflow<T> {
             .output_receivers
             .iter()
             .position(|(n, _, _)| n == name)
-            .ok_or_else(|| Error::Runtime(RuntimeError::InvalidConfig(format!("no output port named '{name}'"))))?;
+            .ok_or_else(|| {
+                Error::Runtime(RuntimeError::InvalidConfig(format!(
+                    "no output port named '{name}'"
+                )))
+            })?;
 
         let (_, port_type, _) = &self.output_receivers[pos];
         if *port_type != type_name {
@@ -4149,13 +4215,17 @@ impl<T: Timestamp> MultiSpawnedDataflow<T> {
             None => Err(Error::Runtime(RuntimeError::InvalidConfig(format!(
                 "worker {worker_idx} has no {direction} port named '{name}'"
             )))),
-            Some((_, port_type, _)) if *port_type != type_name => Err(Error::Runtime(RuntimeError::InvalidConfig(format!(
-                "worker {worker_idx} {direction} port '{name}' has type {port_type}, but requested {type_name}"
-            )))),
-            Some((_, _, any_box)) if !any_box.is::<C>() => Err(Error::Runtime(RuntimeError::InvalidConfig(format!(
-                "worker {worker_idx} {direction} port '{name}' channel mode mismatch \
+            Some((_, port_type, _)) if *port_type != type_name => {
+                Err(Error::Runtime(RuntimeError::InvalidConfig(format!(
+                    "worker {worker_idx} {direction} port '{name}' has type {port_type}, but requested {type_name}"
+                ))))
+            }
+            Some((_, _, any_box)) if !any_box.is::<C>() => {
+                Err(Error::Runtime(RuntimeError::InvalidConfig(format!(
+                    "worker {worker_idx} {direction} port '{name}' channel mode mismatch \
                      (sync port with async take, or vice versa)"
-            )))),
+                ))))
+            }
             _ => Ok(()),
         }
     }
@@ -4356,7 +4426,11 @@ impl<T: Timestamp> ClusterSpawnedDataflow<T> {
     ) -> Result<crate::dataflow::channel_operators::InputSender<T, D>> {
         self.inner
             .as_mut()
-            .ok_or_else(|| Error::Runtime(RuntimeError::AlreadyConsumed { resource: "dataflow join handle".into() }))?
+            .ok_or_else(|| {
+                Error::Runtime(RuntimeError::AlreadyConsumed {
+                    resource: "dataflow join handle".into(),
+                })
+            })?
             .take_input(local_idx, name)
     }
 
@@ -4379,7 +4453,11 @@ impl<T: Timestamp> ClusterSpawnedDataflow<T> {
     ) -> Result<crate::dataflow::channel_operators::OutputReceiver<T, D>> {
         self.inner
             .as_mut()
-            .ok_or_else(|| Error::Runtime(RuntimeError::AlreadyConsumed { resource: "dataflow join handle".into() }))?
+            .ok_or_else(|| {
+                Error::Runtime(RuntimeError::AlreadyConsumed {
+                    resource: "dataflow join handle".into(),
+                })
+            })?
             .take_output(local_idx, name)
     }
 
@@ -4405,7 +4483,11 @@ impl<T: Timestamp> ClusterSpawnedDataflow<T> {
     ) -> Result<crate::dataflow::channel_operators::AsyncInputSender<T, D>> {
         self.inner
             .as_mut()
-            .ok_or_else(|| Error::Runtime(RuntimeError::AlreadyConsumed { resource: "dataflow join handle".into() }))?
+            .ok_or_else(|| {
+                Error::Runtime(RuntimeError::AlreadyConsumed {
+                    resource: "dataflow join handle".into(),
+                })
+            })?
             .take_async_input(local_idx, name)
     }
 
@@ -4433,7 +4515,11 @@ impl<T: Timestamp> ClusterSpawnedDataflow<T> {
     ) -> Result<crate::dataflow::channel_operators::AsyncOutputReceiver<T, D>> {
         self.inner
             .as_mut()
-            .ok_or_else(|| Error::Runtime(RuntimeError::AlreadyConsumed { resource: "dataflow join handle".into() }))?
+            .ok_or_else(|| {
+                Error::Runtime(RuntimeError::AlreadyConsumed {
+                    resource: "dataflow join handle".into(),
+                })
+            })?
             .take_async_output(local_idx, name)
     }
 
@@ -4469,7 +4555,11 @@ impl<T: Timestamp> ClusterSpawnedDataflow<T> {
         let completion = self
             .inner
             .take()
-            .ok_or_else(|| Error::Runtime(RuntimeError::AlreadyConsumed { resource: "dataflow join handle".into() }))?
+            .ok_or_else(|| {
+                Error::Runtime(RuntimeError::AlreadyConsumed {
+                    resource: "dataflow join handle".into(),
+                })
+            })?
             .join();
         // Transfer all resources to ClusterCompletion so bridges stay alive.
         // Setting _bridge_cancel_moved prevents Drop from firing it early.
@@ -4542,10 +4632,11 @@ impl<T: Timestamp> ClusterCompletion<T> {
     /// remaining workers and returns that error. Bridges are cancelled
     /// after this method returns (when `self` drops).
     pub fn wait(mut self) -> Result<()> {
-        let completion = self
-            .completion
-            .take()
-            .ok_or_else(|| Error::Runtime(RuntimeError::AlreadyConsumed { resource: "cluster completion".into() }))?;
+        let completion = self.completion.take().ok_or_else(|| {
+            Error::Runtime(RuntimeError::AlreadyConsumed {
+                resource: "cluster completion".into(),
+            })
+        })?;
         let result = completion.wait();
         // Cancel bridges eagerly so cleanup doesn't wait for handle drop.
         self._bridge_cancel.cancel();
@@ -4563,7 +4654,9 @@ impl<T: Timestamp> Future for ClusterCompletion<T> {
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         let this = self.get_mut();
         let Some(completion) = this.completion.as_mut() else {
-            return Poll::Ready(Err(Error::Runtime(RuntimeError::AlreadyConsumed { resource: "cluster completion".into() })));
+            return Poll::Ready(Err(Error::Runtime(RuntimeError::AlreadyConsumed {
+                resource: "cluster completion".into(),
+            })));
         };
         let result = Pin::new(completion).poll(cx);
         if result.is_ready() {
@@ -7653,7 +7746,9 @@ mod tests {
         let input = builder.input::<i32>("data").unwrap();
 
         let logic = Arc::new(|_time: u64, _batch: Vec<i32>| async move {
-            Err(Error::Runtime(RuntimeError::InvalidConfig("async failure".into())))
+            Err(Error::Runtime(RuntimeError::InvalidConfig(
+                "async failure".into(),
+            )))
         });
 
         let _output = input
@@ -7716,8 +7811,9 @@ mod tests {
     #[cfg(feature = "transport")]
     mod membership_tests {
         use super::*;
-        use crate::membership::{
-            ChannelMembership, ClusterMembership, MembershipEvent, NodeDepartureReason,
+        use crate::execute::{
+            ChannelMembership, ClusterMembership, ClusterTopology, MembershipEvent, NodeConfig,
+            NodeDepartureReason,
         };
 
         fn test_runtime() -> RuntimeHandle {
@@ -7729,19 +7825,49 @@ mod tests {
             .unwrap()
         }
 
+        fn test_runtime_with_topology(topology: ClusterTopology) -> RuntimeHandle {
+            RuntimeHandle::new(RuntimeConfig {
+                worker_threads: 1,
+                name: "membership-test".to_string(),
+                topology: Some(topology),
+                ..Default::default()
+            })
+            .unwrap()
+        }
+
+        fn test_runtime_with_membership(
+            topology: ClusterTopology,
+        ) -> (
+            RuntimeHandle,
+            tokio::sync::mpsc::UnboundedSender<MembershipEvent>,
+        ) {
+            let membership = ChannelMembership::new();
+            let tx = membership.sender();
+            let rt = RuntimeHandle::new(RuntimeConfig {
+                worker_threads: 1,
+                name: "membership-test".to_string(),
+                topology: Some(topology.with_membership(membership)),
+                ..Default::default()
+            })
+            .unwrap();
+            (rt, tx)
+        }
+
         #[test]
         fn set_and_get_topology() {
             let rt = test_runtime();
             assert!(rt.current_topology().is_none());
+            drop(rt);
 
-            let topo = crate::execute::ClusterTopology::multi_node(vec![
-                crate::execute::NodeConfig::new("node-a", 2),
-                crate::execute::NodeConfig::new("node-b", 3),
+            let topo = ClusterTopology::multi_node(vec![
+                NodeConfig::new("node-a", 2),
+                NodeConfig::new("node-b", 3),
             ])
             .unwrap();
-            rt.set_topology(topo.clone());
+            let rt = test_runtime_with_topology(topo.clone());
 
             let got = rt.current_topology().unwrap();
+            assert_eq!(got, topo);
             assert_eq!(got.total_workers(), 5);
             assert!(got.contains_node("node-a"));
             assert!(got.contains_node("node-b"));
@@ -7749,22 +7875,14 @@ mod tests {
 
         #[tokio::test]
         async fn membership_node_join_updates_topology() {
-            let rt = test_runtime();
-            let topo = crate::execute::ClusterTopology::single_node(2);
-            rt.set_topology(topo);
+            let (rt, tx) = test_runtime_with_membership(ClusterTopology::single_node(2));
 
-            let membership = ChannelMembership::new();
-            let tx = membership.sender();
-            rt.set_membership(membership).unwrap();
-
-            // Send a join event
             tx.send(MembershipEvent::NodeJoined {
                 node_id: "node-2".into(),
                 logical_workers: 4,
             })
             .unwrap();
 
-            // Give the event loop time to process
             tokio::time::sleep(std::time::Duration::from_millis(50)).await;
 
             let topo = rt.current_topology().unwrap();
@@ -7775,17 +7893,13 @@ mod tests {
 
         #[tokio::test]
         async fn membership_node_leave_updates_topology() {
-            let rt = test_runtime();
-            let topo = crate::execute::ClusterTopology::multi_node(vec![
-                crate::execute::NodeConfig::new("node-a", 2),
-                crate::execute::NodeConfig::new("node-b", 3),
-            ])
-            .unwrap();
-            rt.set_topology(topo);
-
-            let membership = ChannelMembership::new();
-            let tx = membership.sender();
-            rt.set_membership(membership).unwrap();
+            let (rt, tx) = test_runtime_with_membership(
+                ClusterTopology::multi_node(vec![
+                    NodeConfig::new("node-a", 2),
+                    NodeConfig::new("node-b", 3),
+                ])
+                .unwrap(),
+            );
 
             tx.send(MembershipEvent::NodeLeft {
                 node_id: "node-b".into(),
@@ -7803,19 +7917,14 @@ mod tests {
 
         #[tokio::test]
         async fn membership_node_leave_then_rejoin() {
-            let rt = test_runtime();
-            let topo = crate::execute::ClusterTopology::multi_node(vec![
-                crate::execute::NodeConfig::new("node-a", 2),
-                crate::execute::NodeConfig::new("node-b", 3),
-            ])
-            .unwrap();
-            rt.set_topology(topo);
+            let (rt, tx) = test_runtime_with_membership(
+                ClusterTopology::multi_node(vec![
+                    NodeConfig::new("node-a", 2),
+                    NodeConfig::new("node-b", 3),
+                ])
+                .unwrap(),
+            );
 
-            let membership = ChannelMembership::new();
-            let tx = membership.sender();
-            rt.set_membership(membership).unwrap();
-
-            // Leave
             tx.send(MembershipEvent::NodeLeft {
                 node_id: "node-b".into(),
                 reason: NodeDepartureReason::ConnectionLost,
@@ -7824,7 +7933,6 @@ mod tests {
             tokio::time::sleep(std::time::Duration::from_millis(50)).await;
             assert!(!rt.current_topology().unwrap().contains_node("node-b"));
 
-            // Rejoin with different worker count
             tx.send(MembershipEvent::NodeJoined {
                 node_id: "node-b".into(),
                 logical_workers: 5,
@@ -7834,20 +7942,13 @@ mod tests {
 
             let topo = rt.current_topology().unwrap();
             assert!(topo.contains_node("node-b"));
-            assert_eq!(topo.total_workers(), 7); // 2 + 5
+            assert_eq!(topo.total_workers(), 7);
         }
 
         #[tokio::test]
         async fn membership_rapid_events_processed_in_order() {
-            let rt = test_runtime();
-            let topo = crate::execute::ClusterTopology::single_node(1);
-            rt.set_topology(topo);
+            let (rt, tx) = test_runtime_with_membership(ClusterTopology::single_node(1));
 
-            let membership = ChannelMembership::new();
-            let tx = membership.sender();
-            rt.set_membership(membership).unwrap();
-
-            // Send 10 join events rapidly
             for i in 0..10 {
                 tx.send(MembershipEvent::NodeJoined {
                     node_id: format!("node-{i}"),
@@ -7859,22 +7960,14 @@ mod tests {
             tokio::time::sleep(std::time::Duration::from_millis(100)).await;
 
             let topo = rt.current_topology().unwrap();
-            // "local" + 10 new nodes = 11
             assert_eq!(topo.node_count(), 11);
             assert_eq!(topo.total_workers(), 11);
         }
 
         #[tokio::test]
         async fn membership_stream_end_does_not_crash() {
-            let rt = test_runtime();
-            let topo = crate::execute::ClusterTopology::single_node(1);
-            rt.set_topology(topo);
+            let (rt, tx) = test_runtime_with_membership(ClusterTopology::single_node(1));
 
-            let membership = ChannelMembership::new();
-            let tx = membership.sender();
-            rt.set_membership(membership).unwrap();
-
-            // Send one event, then drop the sender (ends the stream)
             tx.send(MembershipEvent::NodeJoined {
                 node_id: "node-1".into(),
                 logical_workers: 2,
@@ -7884,7 +7977,6 @@ mod tests {
 
             tokio::time::sleep(std::time::Duration::from_millis(50)).await;
 
-            // Runtime should still be operational
             assert!(!rt.is_shutdown());
             let topo = rt.current_topology().unwrap();
             assert!(topo.contains_node("node-1"));
@@ -7892,59 +7984,18 @@ mod tests {
 
         #[tokio::test]
         async fn membership_runtime_shutdown_stops_listener() {
-            let rt = test_runtime();
-            let topo = crate::execute::ClusterTopology::single_node(1);
-            rt.set_topology(topo);
+            let (rt, _tx) = test_runtime_with_membership(ClusterTopology::single_node(1));
 
-            let membership = ChannelMembership::new();
-            let _tx = membership.sender();
-            rt.set_membership(membership).unwrap();
-
-            // Shutdown the runtime
             rt.shutdown();
-
-            // Give the listener time to stop
             tokio::time::sleep(std::time::Duration::from_millis(50)).await;
 
-            // Runtime is shutdown
             assert!(rt.is_shutdown());
         }
 
         #[tokio::test]
-        async fn membership_join_without_existing_topology() {
-            let rt = test_runtime();
-            // No topology set — join should create one
-            assert!(rt.current_topology().is_none());
-
-            let membership = ChannelMembership::new();
-            let tx = membership.sender();
-            rt.set_membership(membership).unwrap();
-
-            tx.send(MembershipEvent::NodeJoined {
-                node_id: "first-node".into(),
-                logical_workers: 4,
-            })
-            .unwrap();
-
-            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-
-            let topo = rt.current_topology().unwrap();
-            assert_eq!(topo.node_count(), 1);
-            assert!(topo.contains_node("first-node"));
-            assert_eq!(topo.total_workers(), 4);
-        }
-
-        #[tokio::test]
         async fn membership_idempotent_join() {
-            let rt = test_runtime();
-            let topo = crate::execute::ClusterTopology::single_node(2);
-            rt.set_topology(topo);
+            let (rt, tx) = test_runtime_with_membership(ClusterTopology::single_node(2));
 
-            let membership = ChannelMembership::new();
-            let tx = membership.sender();
-            rt.set_membership(membership).unwrap();
-
-            // Join same node twice — should be idempotent
             tx.send(MembershipEvent::NodeJoined {
                 node_id: "node-x".into(),
                 logical_workers: 3,
@@ -7959,24 +8010,20 @@ mod tests {
             tokio::time::sleep(std::time::Duration::from_millis(50)).await;
 
             let topo = rt.current_topology().unwrap();
-            assert_eq!(topo.node_count(), 2); // local + node-x (not duplicated)
+            assert_eq!(topo.node_count(), 2);
+            assert_eq!(topo.total_workers(), 5);
         }
 
         #[tokio::test]
         async fn membership_idempotent_leave() {
-            let rt = test_runtime();
-            let topo = crate::execute::ClusterTopology::multi_node(vec![
-                crate::execute::NodeConfig::new("node-a", 2),
-                crate::execute::NodeConfig::new("node-b", 3),
-            ])
-            .unwrap();
-            rt.set_topology(topo);
+            let (rt, tx) = test_runtime_with_membership(
+                ClusterTopology::multi_node(vec![
+                    NodeConfig::new("node-a", 2),
+                    NodeConfig::new("node-b", 3),
+                ])
+                .unwrap(),
+            );
 
-            let membership = ChannelMembership::new();
-            let tx = membership.sender();
-            rt.set_membership(membership).unwrap();
-
-            // Leave same node twice — should be idempotent
             tx.send(MembershipEvent::NodeLeft {
                 node_id: "node-b".into(),
                 reason: NodeDepartureReason::Removed,
@@ -7992,121 +8039,59 @@ mod tests {
 
             let topo = rt.current_topology().unwrap();
             assert_eq!(topo.node_count(), 1);
+            assert_eq!(topo.total_workers(), 2);
         }
 
         #[test]
         fn set_membership_rejects_consumed_provider() {
-            let rt = test_runtime();
             let membership = ChannelMembership::new();
-
-            // Consume the events
             let _rx = membership.events();
+            let topology = ClusterTopology::single_node(1).with_membership(membership);
 
-            // Now set_membership should fail
-            let result = rt.set_membership(membership);
-            assert!(result.is_err());
-            assert!(result
-                .unwrap_err()
-                .to_string()
-                .contains("already consumed"));
-        }
-
-        #[test]
-        fn set_membership_twice_stops_first_listener() {
-            // Calling set_membership() a second time should cancel the first
-            // listener task (no task leak).
-            let rt = test_runtime();
-
-            // First membership provider
-            let m1 = ChannelMembership::new();
-            let tx1 = m1.sender();
-            rt.set_membership(m1).unwrap();
-
-            // Send an event through the first provider.
-            tx1.send(MembershipEvent::NodeJoined {
-                node_id: "old-node".into(),
-                logical_workers: 2,
-            })
-            .unwrap();
-            std::thread::sleep(std::time::Duration::from_millis(100));
-            assert!(rt.current_topology().is_some());
-
-            // Replace with second provider — first listener should stop.
-            let m2 = ChannelMembership::new();
-            let tx2 = m2.sender();
-            rt.set_membership(m2).unwrap();
-
-            // Events from first provider should be ignored (task cancelled).
-            let _ = tx1.send(MembershipEvent::NodeJoined {
-                node_id: "leaked-node".into(),
-                logical_workers: 1,
+            let result = RuntimeHandle::new(RuntimeConfig {
+                worker_threads: 1,
+                name: "membership-test".to_string(),
+                topology: Some(topology),
+                ..Default::default()
             });
-            std::thread::sleep(std::time::Duration::from_millis(100));
 
-            // Reset topology to verify only second provider is active.
-            rt.set_topology(
-                crate::execute::ClusterTopology::multi_node(vec![
-                    crate::execute::NodeConfig::new("base", 1),
-                ])
-                .unwrap(),
-            );
-
-            // Second provider should still work.
-            tx2.send(MembershipEvent::NodeJoined {
-                node_id: "new-node".into(),
-                logical_workers: 3,
-            })
-            .unwrap();
-            std::thread::sleep(std::time::Duration::from_millis(100));
-            let topo = rt.current_topology().unwrap();
-            assert!(topo.contains_node("new-node"));
-            // "leaked-node" should NOT appear (first listener was stopped).
-            assert!(!topo.contains_node("leaked-node"));
+            let err = match result {
+                Ok(_) => panic!("expected runtime construction to fail"),
+                Err(err) => err,
+            };
+            assert!(err.to_string().contains("already consumed"));
         }
 
-        #[test]
-        fn node_joined_zero_workers_ignored() {
-            let rt = test_runtime();
-            let membership = ChannelMembership::new();
-            let tx = membership.sender();
-            rt.set_membership(membership).unwrap();
+        #[tokio::test]
+        async fn node_joined_zero_workers_ignored() {
+            let (rt, tx) = test_runtime_with_membership(ClusterTopology::single_node(1));
 
-            // Send a join event with 0 workers — should be ignored.
             tx.send(MembershipEvent::NodeJoined {
                 node_id: "bad-node".into(),
                 logical_workers: 0,
             })
             .unwrap();
-            std::thread::sleep(std::time::Duration::from_millis(100));
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
 
-            // Topology should remain None (the zero-workers event was skipped).
-            assert!(rt.current_topology().is_none());
+            let topo = rt.current_topology().unwrap();
+            assert_eq!(topo.node_count(), 1);
+            assert_eq!(topo.total_workers(), 1);
+            assert!(!topo.contains_node("bad-node"));
         }
 
-        #[test]
-        fn node_left_removes_last_node_clears_topology() {
-            let rt = test_runtime();
+        #[tokio::test]
+        async fn node_left_removes_last_node_clears_topology() {
+            let (rt, tx) = test_runtime_with_membership(
+                ClusterTopology::multi_node(vec![NodeConfig::new("only-node", 2)]).unwrap(),
+            );
 
-            // Set a topology with a single node.
-            let topo = crate::execute::ClusterTopology::multi_node(vec![
-                crate::execute::NodeConfig::new("only-node", 2),
-            ])
-            .unwrap();
-            rt.set_topology(topo);
-
-            let membership = ChannelMembership::new();
-            let tx = membership.sender();
-            rt.set_membership(membership).unwrap();
-
-            // Remove the only node.
             tx.send(MembershipEvent::NodeLeft {
                 node_id: "only-node".into(),
                 reason: NodeDepartureReason::Graceful,
             })
             .unwrap();
-            std::thread::sleep(std::time::Duration::from_millis(100));
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
 
-            // Topology should be cleared to None.
             assert!(rt.current_topology().is_none());
         }
     }

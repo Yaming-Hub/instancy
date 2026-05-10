@@ -169,9 +169,11 @@ impl<D> Router<D> {
     /// Panics if `num_targets` is 0.
     pub fn new(strategy: PartitionStrategy<D>, num_targets: usize) -> crate::Result<Self> {
         if num_targets == 0 {
-            return Err(crate::Error::Dataflow(crate::error::DataflowError::InvalidConfig(
-                "Router requires at least one target worker".into(),
-            )));
+            return Err(crate::Error::Dataflow(
+                crate::error::DataflowError::InvalidConfig(
+                    "Router requires at least one target worker".into(),
+                ),
+            ));
         }
         Ok(Self {
             strategy,

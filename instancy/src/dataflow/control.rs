@@ -289,10 +289,12 @@ impl ControlBroadcast {
         dataflow_cancel: CancellationToken,
     ) -> crate::Result<(Vec<ControlSender>, Vec<ControlReceiver>)> {
         if wake_handles.len() != num_workers {
-            return Err(crate::Error::Dataflow(DataflowError::InvalidConfig(format!(
-                "wake_handles length ({}) must match num_workers ({num_workers})",
-                wake_handles.len()
-            ))));
+            return Err(crate::Error::Dataflow(DataflowError::InvalidConfig(
+                format!(
+                    "wake_handles length ({}) must match num_workers ({num_workers})",
+                    wake_handles.len()
+                ),
+            )));
         }
 
         let inner = Arc::new(Mutex::new(BroadcastInner {
