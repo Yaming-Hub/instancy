@@ -1269,7 +1269,7 @@ This pattern — iterate with exchange — is the basis for graph algorithms lik
 
 ## 8. Distributed Execution
 
-instancy can distribute computation across multiple machines using TCP connections. Unlike timely-dataflow's fixed hostfile approach, instancy delegates connection establishment to your application.
+instancy can distribute computation across multiple machines using peer-to-peer connections. The library is **transport-agnostic** — it works with any reliable, ordered byte stream: TCP, TLS, Unix sockets, named pipes, QUIC, or even in-memory duplex channels. Unlike timely-dataflow's fixed hostfile approach, instancy delegates connection establishment to your application via a `ConnectionFactory`.
 
 ### Cluster Topology
 
@@ -1286,7 +1286,7 @@ let topology = ClusterTopology::multi_node(vec![
 
 ### Establishing Connections
 
-You provide the TCP connections. This means you control TLS, authentication, and discovery:
+You provide the connections via a `ConnectionFactory`. This means you control the transport, TLS, authentication, and discovery:
 
 ```rust
 // Your application establishes connections however it likes:
@@ -1400,7 +1400,7 @@ let mut cluster_handle = rt.spawn_cluster(
 **Key points:**
 - Every node must call `spawn_cluster` with the same `DataflowId` concurrently
 - The library performs a handshake to verify all nodes agree on the dataflow structure
-- Exchange operators automatically route data across nodes via the TCP connections
+- Exchange operators automatically route data across nodes via the pooled connections
 - Multiple dataflows can share the same node-to-node connections
 
 ### Testing Clusters Locally
@@ -1464,7 +1464,7 @@ When using `SharedTransport` for cluster networking, connection failures are han
 
 **Automatic reconnection (with factory):**
 
-When a TCP connection drops (reader/writer error), `SharedTransport`:
+When a connection drops (reader/writer error), `SharedTransport`:
 1. Marks the connection as dead and removes it from the active pool
 2. Invokes the connection factory to establish a new connection
 3. Retries with exponential backoff: 100ms → 200ms → 400ms → 800ms (5 attempts total, 4 delays between them)
@@ -1473,7 +1473,7 @@ When a TCP connection drops (reader/writer error), `SharedTransport`:
 
 **No factory (pre-established connections only):**
 
-If `SharedTransport` is created with pre-established connections and no factory, a dropped connection is permanent — no reconnection is attempted. Remaining healthy connections continue serving data.
+If `SharedTransport` is created with pre-established connections and no factory, a dropped connection is permanent — no reconnection is attempted. Remaining healthy connections continue serving traffic.
 
 **Data loss during reconnection:**
 
