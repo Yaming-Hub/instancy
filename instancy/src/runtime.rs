@@ -1533,6 +1533,7 @@ impl RuntimeHandle {
             pre_created_wake_handle,
             None,
             None,
+            None, // single worker — no shared start time needed
         )?;
 
         // Track active dataflow count for wait_idle()/shutdown_async().
@@ -1591,6 +1592,7 @@ impl RuntimeHandle {
         pre_created_wake_handle: Option<WakeHandle>,
         parent_cancel: Option<CancellationToken>,
         control_broadcast: Option<(ControlSender, ControlReceiver)>,
+        timeline_start_time: Option<std::time::Instant>,
     ) -> Result<(
         SpawnedDataflow<T>,
         Pin<Box<DataflowExecutor<T>>>,
@@ -1685,6 +1687,7 @@ impl RuntimeHandle {
             Some(wake_handle),
             worker_context,
             progress_channels,
+            timeline_start_time,
         )?;
 
         external_inputs_open.store(input_count, std::sync::atomic::Ordering::SeqCst);
@@ -1877,6 +1880,14 @@ impl RuntimeHandle {
         let mut prepared = Vec::with_capacity(num_workers);
         let mut spawned_count = 0usize;
 
+        // Capture a single timeline start time shared by all workers so that
+        // activation event offsets (start_us) are comparable across workers.
+        let timeline_start = if metrics_config.activation_timeline {
+            Some(std::time::Instant::now())
+        } else {
+            None
+        };
+
         for (worker_idx, dataflow) in dataflows.into_iter().enumerate() {
             let ctx = WorkerContext::new(worker_idx, num_workers)?;
             let pc = if !progress_channels.is_empty() {
@@ -1901,6 +1912,7 @@ impl RuntimeHandle {
                 Some(wh),
                 dataflow_cancel.clone(),
                 ctrl,
+                timeline_start,
             ) {
                 Ok(worker) => {
                     prepared.push(worker);
@@ -2211,6 +2223,13 @@ impl RuntimeHandle {
         let mut prepared = Vec::with_capacity(num_workers);
         let mut spawned_count = 0usize;
 
+        // Shared timeline start for cross-worker comparable offsets.
+        let timeline_start = if metrics_config.activation_timeline {
+            Some(std::time::Instant::now())
+        } else {
+            None
+        };
+
         for (worker_idx, dataflow) in dataflows.into_iter().enumerate() {
             let ctx = WorkerContext::new(worker_idx, num_workers)?;
             let pc = if !progress_channels.is_empty() {
@@ -2234,6 +2253,7 @@ impl RuntimeHandle {
                 Some(wh),
                 dataflow_cancel.clone(),
                 ctrl,
+                timeline_start,
             ) {
                 Ok(worker) => {
                     prepared.push(worker);
@@ -2900,6 +2920,7 @@ impl RuntimeHandle {
                 Some(wh),
                 dataflow_cancel.clone(),
                 ctrl,
+                None, // cluster: timeline start deferred (TODO)
             ) {
                 Ok(worker) => prepared.push(worker),
                 Err(e) => {
@@ -3192,6 +3213,7 @@ impl SimpleRuntime {
             Some(wake_handle),
             WorkerContext::single(),
             None,
+            None,
         )?;
 
         let completed = executor.run()?;
@@ -3233,6 +3255,7 @@ impl SimpleRuntime {
             self.cancel.clone(),
             Some(wake_handle),
             WorkerContext::single(),
+            None,
             None,
         )?;
 
@@ -3360,7 +3383,7 @@ impl SimpleRuntime {
 
         // --- Materialize and run on background thread ---
         let mut executor =
-            materialize_executor(dataflow, cancel, Some(wake_handle), worker_context, None)?;
+            materialize_executor(dataflow, cancel, Some(wake_handle), worker_context, None, None)?;
 
         external_inputs_open.store(input_count, std::sync::atomic::Ordering::SeqCst);
         executor.replace_external_inputs_counter(external_inputs_open);
@@ -5127,6 +5150,7 @@ fn materialize_executor<T: Timestamp>(
     wake_handle: Option<WakeHandle>,
     worker_context: WorkerContext,
     progress_channels: Option<WorkerProgressChannels<T>>,
+    timeline_start_time: Option<std::time::Instant>,
 ) -> Result<DataflowExecutor<T>> {
     let executor_config = ExecutorConfig {
         max_activations_per_step: 1024,
@@ -5140,6 +5164,7 @@ fn materialize_executor<T: Timestamp>(
         activation_timeline: dataflow.activation_timeline,
         min_activation_duration: dataflow.min_activation_duration,
         max_timeline_events: dataflow.max_timeline_events,
+        timeline_start_time,
     };
 
     // Destructure to allow accessing graph after moving factories.

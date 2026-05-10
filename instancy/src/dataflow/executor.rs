@@ -107,8 +107,12 @@ pub struct ExecutorConfig {
     pub activation_timeline: bool,
     /// Minimum activation duration to record in the timeline.
     pub min_activation_duration: std::time::Duration,
-    /// Maximum timeline events per dataflow (ring buffer cap). 0 = unlimited.
+    /// Maximum timeline events per worker (ring buffer cap). 0 = unlimited.
     pub max_timeline_events: usize,
+    /// Shared start time for timeline offset computation. All workers in a
+    /// multi-worker dataflow must use the same reference point so that
+    /// `start_us` values are comparable across workers.
+    pub timeline_start_time: Option<std::time::Instant>,
 }
 
 impl Default for ExecutorConfig {
@@ -125,6 +129,7 @@ impl Default for ExecutorConfig {
             activation_timeline: false,
             min_activation_duration: std::time::Duration::from_micros(1),
             max_timeline_events: 0,
+        timeline_start_time: None,
         }
     }
 }
@@ -659,10 +664,11 @@ impl<T: Timestamp> DataflowExecutor<T> {
         };
 
         // Create timeline collector when activation_timeline is enabled.
+        let timeline_start = config.timeline_start_time.unwrap_or_else(Instant::now);
         let timeline_collector = if config.activation_timeline {
             Some(Arc::new(crate::metrics::TimelineCollector::new(
                 worker_context.worker_index(),
-                Instant::now(),
+                timeline_start,
                 config.min_activation_duration,
                 config.max_timeline_events,
             )))
@@ -2158,6 +2164,7 @@ mod tests {
             activation_timeline: false,
             min_activation_duration: std::time::Duration::from_micros(1),
             max_timeline_events: 0,
+            timeline_start_time: None,
             },
             cancel: CancellationToken::new(),
             progress_tracker: None,
@@ -2572,6 +2579,7 @@ mod tests {
             activation_timeline: false,
             min_activation_duration: std::time::Duration::from_micros(1),
             max_timeline_events: 0,
+            timeline_start_time: None,
             },
             cancel: CancellationToken::new(),
             progress_tracker: None,
@@ -2663,6 +2671,7 @@ mod tests {
             activation_timeline: false,
             min_activation_duration: std::time::Duration::from_micros(1),
             max_timeline_events: 0,
+            timeline_start_time: None,
             },
             cancel: CancellationToken::new(),
             progress_tracker: None,
@@ -3181,6 +3190,7 @@ mod tests {
             activation_timeline: false,
             min_activation_duration: std::time::Duration::from_micros(1),
             max_timeline_events: 0,
+            timeline_start_time: None,
             },
             cancel: CancellationToken::new(),
             progress_tracker: None,
@@ -3264,6 +3274,7 @@ mod tests {
             activation_timeline: false,
             min_activation_duration: std::time::Duration::from_micros(1),
             max_timeline_events: 0,
+            timeline_start_time: None,
             },
             cancel: CancellationToken::new(),
             progress_tracker: None,
@@ -4176,6 +4187,7 @@ mod tests {
         activation_timeline: false,
         min_activation_duration: std::time::Duration::from_micros(1),
         max_timeline_events: 0,
+        timeline_start_time: None,
         };
         let mut executor = DataflowExecutor::new_test(vec![Box::new(op)], config, 0);
 
@@ -4209,6 +4221,7 @@ mod tests {
         activation_timeline: false,
         min_activation_duration: std::time::Duration::from_micros(1),
         max_timeline_events: 0,
+        timeline_start_time: None,
         };
         let mut executor = DataflowExecutor::new_test(vec![Box::new(op)], config, 0);
         executor.cancel.cancel();
@@ -4256,6 +4269,7 @@ mod tests {
         activation_timeline: false,
         min_activation_duration: std::time::Duration::from_micros(1),
         max_timeline_events: 0,
+        timeline_start_time: None,
         };
         let mut executor = DataflowExecutor::new_test(vec![Box::new(InfiniteOperator)], config, 0);
         executor.cancel.cancel();
@@ -4290,6 +4304,7 @@ mod tests {
         activation_timeline: false,
         min_activation_duration: std::time::Duration::from_micros(1),
         max_timeline_events: 0,
+        timeline_start_time: None,
         };
         let mut executor = DataflowExecutor::new_test(vec![Box::new(op)], config, 0);
 

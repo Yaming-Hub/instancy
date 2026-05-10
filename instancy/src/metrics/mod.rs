@@ -70,8 +70,9 @@ pub struct MetricsConfig {
     /// Only applies when `activation_timeline` is true.
     pub min_activation_duration: Duration,
 
-    /// Maximum timeline events to retain per dataflow (ring buffer cap).
+    /// Maximum timeline events to retain per worker (ring buffer cap).
     /// Prevents unbounded memory growth for long-running dataflows.
+    /// Total events across N workers can reach N × this value.
     /// 0 = unlimited.
     pub max_timeline_events: usize,
 }
@@ -350,12 +351,12 @@ pub struct ActivationEvent {
 /// Thread-safe collector for activation timeline events.
 ///
 /// Shared across the executor's activation path via `Arc`. Events are
-/// appended lock-free using a `Mutex<Vec>` (contention is low since each
+/// appended lock-free using a `Mutex<VecDeque>` (contention is low since each
 /// worker has its own collector). When `max_events > 0`, old events are
 /// dropped to cap memory usage.
 #[derive(Debug)]
 pub struct TimelineCollector {
-    events: std::sync::Mutex<Vec<ActivationEvent>>,
+    events: std::sync::Mutex<std::collections::VecDeque<ActivationEvent>>,
     /// Maximum events to retain (0 = unlimited).
     max_events: usize,
     /// Minimum activation duration to record (filter short activations).
@@ -375,7 +376,7 @@ impl TimelineCollector {
         max_events: usize,
     ) -> Self {
         Self {
-            events: std::sync::Mutex::new(Vec::new()),
+            events: std::sync::Mutex::new(std::collections::VecDeque::new()),
             max_events,
             min_duration,
             start_time,
@@ -386,7 +387,7 @@ impl TimelineCollector {
     /// Record an operator activation event.
     ///
     /// Activations shorter than `min_duration` are silently dropped.
-    /// When `max_events` is reached, the oldest event is evicted.
+    /// When `max_events` is reached, the oldest event is evicted (O(1)).
     #[inline]
     pub fn record_activation(
         &self,
@@ -398,7 +399,7 @@ impl TimelineCollector {
             return;
         }
         let start_us = start
-            .duration_since(self.start_time)
+            .saturating_duration_since(self.start_time)
             .as_micros() as u64;
         let duration_us = duration.as_micros() as u64;
         let event = ActivationEvent {
@@ -409,15 +410,15 @@ impl TimelineCollector {
         };
         let mut events = self.events.lock().unwrap_or_else(|e| e.into_inner());
         if self.max_events > 0 && events.len() >= self.max_events {
-            events.remove(0);
+            events.pop_front();
         }
-        events.push(event);
+        events.push_back(event);
     }
 
     /// Drain all recorded events.
     pub fn take_events(&self) -> Vec<ActivationEvent> {
         let mut events = self.events.lock().unwrap_or_else(|e| e.into_inner());
-        std::mem::take(&mut *events)
+        events.drain(..).collect()
     }
 
     /// Number of events currently recorded.
