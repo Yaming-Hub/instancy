@@ -17,8 +17,8 @@
 9. **Configurable error policy** — each dataflow specifies whether errors should halt the pipeline or be logged and skipped, giving consumers control over fault tolerance.
 10. **Observability built-in** — per-dataflow CPU time tracking, operator-level metrics, and structured tracing for understanding performance characteristics.
 11. **Checkpointing support** — consumers can add checkpoint operators that persist state at timestamp boundaries, enabling recovery by fast-forwarding input to the stored frontier.
-12. **Per-stage dynamic parallelism** — operators in the same stage share a parallelism level; different stages can have different parallelism. Stage boundaries are auto-inferred from repartition operators (`exchange`, `rebalance`, `gather`, `broadcast`). Operators within a stage are fused into a single schedulable task for reduced scheduling overhead.
-13. **Dynamic cluster scaling** — nodes can join or leave the cluster at runtime. The hosting application is responsible for detecting membership changes and notifying the runtime via a `ClusterMembership` trait. The library rebuilds routing and rebalances work accordingly.
+12. **Per-stage dynamic parallelism** *(partially implemented)* — operators in the same stage share a parallelism level; different stages can have different parallelism. Stage boundaries are auto-inferred from repartition operators (`exchange`, `rebalance`, `gather`, `broadcast`). Operators within a stage are fused into a single schedulable task for reduced scheduling overhead. **Note**: Stage inference and operator fusion are implemented; per-stage parallelism (different worker counts per stage) is not yet implemented — all stages currently share the dataflow's worker count.
+13. **Dynamic cluster scaling** *(roadmap)* — nodes will be able to join or leave the cluster at runtime. The hosting application will be responsible for detecting membership changes and notifying the runtime via a `ClusterMembership` trait. The library will rebuild routing and rebalance work accordingly. **Not yet implemented** — the current runtime uses a static worker count determined at dataflow build time.
 14. **No global state** — zero static variables, `lazy_static`, or thread-locals. All state is owned by an explicit `RuntimeHandle`. Multiple isolated clusters can coexist in a single process (e.g., interactive vs batch workloads).
 15. **Pluggable task scheduling** — the task queue accepts a `SchedulePolicy` trait that determines dequeue order based on (dataflow priority, task age). Default policy uses priority-with-aging to prevent starvation of low-priority dataflows.
 
@@ -32,7 +32,7 @@
 | Execution | 1 OS thread per worker; worker owns its dataflows and steps through them synchronously | Dual-layer: Custom Worker Thread Pool (sync operator logic) + Tokio I/O runtime (network, input streams); logical `WorkerId`s for FIFO ordering |
 | Worker topology | All nodes must have the same number of workers | Heterogeneous: each node declares its own worker count based on capacity; global worker set is the union |
 | Scheduling | `Worker::step()` loop polls activations | Per-worker FIFO queues → shared task queue → Worker Thread Pool threads (spin/yield/park idle strategy) |
-| Communication (intra-process) | `Rc<RefCell<VecDeque>>` with direct push/pull | Bounded in-memory buffers between operators; I/O via Tokio channels |
+| Communication (intra-process) | `Rc<RefCell<VecDeque>>` with direct push/pull | Lock-free SPSC bounded ring buffers for exchange channels; bounded `Mutex<VecDeque>` for pipeline channels |
 | Communication (inter-process) | Dedicated TCP per worker pair, pre-configured hostfile | Application-provided `ConnectionManager` establishes connections; library pools and reuses them |
 | Testability | Requires multiple OS processes for multi-node tests | Single-process multi-node testing via in-memory transport adapter |
 | Serialization | `Abomonation` / `bincode` hardcoded | Pluggable `Codec` trait |
@@ -45,7 +45,7 @@
 | Observability | Limited | Built-in CPU time tracking per dataflow, operator-level metrics |
 | Checkpointing | Not supported | Extensible checkpoint operators using timestamp boundaries |
 | Parallelism | Uniform: all operators share the same worker count | Per-stage: stages can have different parallelism; repartition operators at boundaries. Operators within a stage are fused. |
-| Cluster scaling | Static: all nodes must be known at startup | Dynamic: application notifies runtime of node joins/departures; routing tables rebuild on the fly |
+| Cluster scaling | Static: all nodes must be known at startup | *(Roadmap)* Dynamic: application notifies runtime of node joins/departures; routing tables rebuild on the fly |
 | Multi-dataflow | One worker owns its dataflows; implicit isolation via thread-local state | Explicit DataflowId in frame headers; shared connections demux by (dataflow_id, channel_id) |
 
 ---
@@ -2077,16 +2077,18 @@ The communication layer implements the physical delivery mechanisms behind the `
 
 ### 6.1 Intra-Process Channels
 
-For operators within the same process (where `TransportProvider::is_local()` returns true), data is exchanged via **bounded in-memory buffers**. No serialization — data moves as owned Rust values. Since operators run on the Custom Worker Thread Pool (not Tokio), channels use a lock-free bounded queue rather than `tokio::sync::mpsc`.
+For operators within the same process (where `TransportProvider::is_local()` returns true), data is exchanged via **bounded in-memory buffers**. No serialization — data moves as owned Rust values. Since operators run on the Custom Worker Thread Pool (not Tokio), exchange channels use a **lock-free SPSC (Single-Producer, Single-Consumer) ring buffer** with atomic head/tail indices, power-of-two masking, and cached indices for minimal contention. Pipeline-local channels use `Mutex<VecDeque>` bounded queues.
 
 ```rust
-/// Intra-process buffer between operators.
-/// Bounded, lock-free SPSC or MPSC queue depending on topology.
-pub struct OperatorBuffer<T: Timestamp, D, M = ()> {
-    /// Bounded queue of envelopes.
-    queue: BoundedQueue<Envelope<T, D, M>>,
-    /// Capacity (backpressure kicks in when full).
-    capacity: usize,
+/// Lock-free SPSC ring buffer for exchange channels.
+/// Power-of-two capacity with bitwise-AND masking.
+/// Producer and consumer each cache the other's index to
+/// minimize atomic loads (refresh only on apparent full/empty).
+pub struct RingBuffer<T> {
+    slots: Box<[UnsafeCell<MaybeUninit<T>>]>,
+    head: AtomicUsize,  // consumer reads here
+    tail: AtomicUsize,  // producer writes here
+    mask: usize,        // capacity - 1 (power-of-two masking)
 }
 ```
 
@@ -2425,7 +2427,7 @@ impl ReorderBuffer {
 
 #### Comparison: Dedicated vs Shared Connection Mode
 
-| Aspect | Dedicated (Current) | Shared + Sequencing (Future) |
+| Aspect | Dedicated | Shared (Current) |
 |--------|---------------------|------------------------------|
 | **Ordering** | Free (TCP FIFO) | Explicit via sequence numbers |
 | **Connection count** | O(dataflows × peers) | O(peers) — bounded by pool size |
@@ -2569,15 +2571,15 @@ A single connection has fundamental throughput limits:
 
 #### Recommendation
 
-**Phase 1 (current):** Keep dedicated connections. Simple, correct, sufficient for moderate scale.
+**Phase 1:** Dedicated connections — each dataflow gets its own connection(s) per peer. Simple and correct.
 
-**Phase 2 (future):** Add shared mode as an opt-in configuration:
+**Phase 2 (current):** Shared mode via `SharedPeerManager` / `PeerPool` — dataflows share adaptive pooled connections managed by `ConnectionFactory`. Frames are sequenced for ordering/dedup. Configured via `SharedConnectionConfig`:
 ```rust
-pub enum ConnectionMode {
-    /// Each dataflow gets its own connection(s) per peer. (Default, current behavior)
-    Dedicated,
-    /// Dataflows share adaptive pooled connections; frames are sequenced for ordering/dedup.
-    Shared(SharedConnectionConfig),
+pub struct SharedConnectionConfig {
+    pub min_connections: usize,
+    pub max_connections: usize,
+    pub enable_frame_crc: bool,
+    // ...
 }
 ```
 
@@ -2589,13 +2591,15 @@ The sequencing and adaptive scaling layers should be implemented **below** the `
 Each connection carries multiplexed channels using a simple framing protocol:
 
 ```
-┌───────────────┬───────────┬───────────┬──────────────────┐
-│ dataflow_id   │ channel_id│ length    │ payload (codec)  │
-│ (UUID, 16B)   │ (u64)     │ (u32)     │ (variable)       │
-└───────────────┴───────────┴───────────┴──────────────────┘
+┌───────────────┬───────────┬───────────┬──────────────────┬──────────────┐
+│ dataflow_id   │ channel_id│ length    │ payload (codec)  │ CRC32 (opt)  │
+│ (UUID, 16B)   │ (u64)     │ (u32)     │ (variable)       │ (4B)         │
+└───────────────┴───────────┴───────────┴──────────────────┴──────────────┘
 ```
 
 Header size: 16 (dataflow_id UUID) + 8 (channel_id) + 4 (length) = **28 bytes**.
+
+When CRC is enabled, a 4-byte CRC32 trailer follows each payload. The `length` field includes the CRC bytes (i.e., `length = payload_len + 4`). CRC is **opt-in** via `SharedConnectionConfig::enable_frame_crc` (default: `false`), letting the hosting application trade performance for integrity on unreliable networks. The reader validates the checksum and returns a `ChecksumMismatch` error on corruption.
 
 The `dataflow_id` field ensures that frames from different dataflows sharing the same pooled connection are never misrouted. Each dataflow is assigned a random UUID at construction time — universally unique without any coordination.
 
@@ -3422,7 +3426,7 @@ All of this works automatically through the capability protocol + progress excha
 A key architectural principle: **progress exchange is a purely logical concept**. The `ProgressTracker` exchanges capability changes between logical workers/executors without any knowledge of whether those workers are:
 - On the same OS thread (in-process shared memory channels)
 - On different threads in the same process (same mechanism)
-- On different machines across a network (future: serialize + network transport)
+- On different machines across a network (serialize + network transport via `SharedTransportSession`)
 
 The `ProgressTracker` interacts with progress channels through a simple interface:
 
@@ -3443,15 +3447,15 @@ The physical layer provides the concrete implementation:
 
 | Scenario | Physical Implementation |
 |----------|----------------------|
-| Same process (current) | `Arc<Mutex<VecDeque>>` + `WakeHandle::notify()` |
-| Cross-process (future) | Serialize `ProgressChange` → wire protocol → TCP/QUIC → deserialize |
+| Same process | `Arc<Mutex<VecDeque>>` + `WakeHandle::notify()` |
+| Cross-process | Serialize `ProgressChange` → wire protocol → TCP/QUIC → deserialize |
 | Testing | In-memory channels with deterministic ordering |
 
 This mirrors the logical/physical separation already established for data channels (§4.5): the `TransportProvider` resolves logical data targets to physical delivery, and the progress exchange resolves logical progress targets to physical progress delivery. The same pluggable architecture applies.
 
-#### 11.5.1 Cross-Process Progress Exchange (Future)
+#### 11.5.1 Cross-Process Progress Exchange
 
-When workers run on different machines, progress exchange uses the same connection infrastructure as data channels (§6.2 ConnectionManager). The wire protocol is defined in `communication/progress_exchange.rs`:
+When workers run on different machines, progress exchange uses the same shared transport infrastructure as data channels. The wire protocol is defined in `communication/progress_exchange.rs`:
 
 ```
 ┌──────────┬────────────────────────────────┐
@@ -3463,7 +3467,7 @@ When workers run on different machines, progress exchange uses the same connecti
 └──────────┴────────────────────────────────┘
 ```
 
-**Critical ordering guarantee for cross-process:** Data messages and progress messages share connections through the `ConnectionManager`. The implementation ensures that data pushed to a channel is transmitted before the corresponding capability release by using a **single FIFO payload channel** per peer in the `TransportSession`. Both data and progress frames are sent through the same bounded `mpsc` channel, preserving the causal order: a worker sends data at time T before releasing its capability for T. The bridge task writes from this shared channel to TCP in FIFO order, with only control messages (handshake, ready barrier) receiving biased priority. This design also prevents cross-dataflow starvation — one dataflow's heavy data cannot block another dataflow's progress messages since they interleave naturally in the shared queue.
+**Critical ordering guarantee for cross-process:** Data messages and progress messages share connections through the `SharedTransportSession`. The implementation ensures that data pushed to a channel is transmitted before the corresponding capability release by using a **single FIFO payload channel** per peer in the `TransportSession`. Both data and progress frames are sent through the same bounded `mpsc` channel, preserving the causal order: a worker sends data at time T before releasing its capability for T. The bridge task writes from this shared channel to TCP in FIFO order, with only control messages (handshake, ready barrier) receiving biased priority. This design also prevents cross-dataflow starvation — one dataflow's heavy data cannot block another dataflow's progress messages since they interleave naturally in the shared queue.
 
 #### 11.5.2 Progress and the Adapter Layer
 
@@ -3488,7 +3492,7 @@ The progress exchange fits naturally into the three-layer architecture (§4.5):
 │                   Physical Layer                                  │
 │                                                                  │
 │  SharedMemoryProgress: Arc<Mutex<VecDeque>> (in-process)         │
-│  NetworkProgress: ConnectionManager + wire protocol (cross-node) │
+│  NetworkProgress: SharedTransportSession + wire protocol (cross-node) │
 │  InMemoryClusterProgress: simulated cross-node (testing)         │
 └─────────────────────────────────────────────────────────────────┘
 ```
@@ -3574,9 +3578,11 @@ Rather than one connection per (worker, channel) pair, instancy multiplexes all 
 
 Both transport modes — dedicated (exclusive lease per dataflow) and shared (multiplexed across dataflows) — use the same factory and pool. The factory is **required**, not optional: it is the sole mechanism for creating, replacing, and scaling connections. instancy provides a default `TcpConnectionFactory` for plain TCP; applications supply their own for other transports or custom protocols.
 
-### 12.5 Dynamic Cluster Scaling
+### 12.5 Dynamic Cluster Scaling *(Roadmap)*
 
-instancy supports **dynamic cluster scaling** — nodes can be added to or removed from the cluster at runtime. The hosting application is responsible for detecting node changes (health checks, service discovery, autoscaler events, connection failures) and notifying the timely runtime. The library does **not** perform its own node discovery or health monitoring.
+> **Status: Not yet implemented.** The design below describes the planned architecture for dynamic cluster scaling. The current runtime uses a static worker count determined at dataflow build time. Nodes must be known at startup.
+
+instancy plans to support **dynamic cluster scaling** — nodes can be added to or removed from the cluster at runtime. The hosting application is responsible for detecting node changes (health checks, service discovery, autoscaler events, connection failures) and notifying the timely runtime. The library does **not** perform its own node discovery or health monitoring.
 
 #### Responsibilities
 
@@ -4564,8 +4570,8 @@ This section documents the cardinality (how many instances exist) and lifetime (
 | Component | Cardinality | Lifetime | Notes |
 |-----------|-------------|----------|-------|
 | `WorkerPool` | 1 per process | Process | Shared across all dataflows in the process |
-| `ConnectionPool` | 1 per process | Process | Manages connections to all peer nodes |
-| `ClusterTopology` | 1 per process | Process (mutable on membership changes) | Updated when nodes join/leave |
+| `ConnectionPool` | 1 per process | Process | Manages connections to all peer nodes (via `ConnectionFactory`) |
+| `ClusterTopology` | 1 per process | Process (static) | Set at startup; dynamic updates are roadmap (§12.5) |
 | `DataflowId` | 1 per dataflow | Dataflow | UUID, created at dataflow start |
 | `DataflowHandle` | 1 per (dataflow, node) | Dataflow | Returned to caller; provides cancel/progress/result |
 | `OutcomeAggregator` | 1 per dataflow on coordinator node | Dataflow | Collects per-node outcomes; host-app managed |
@@ -4592,13 +4598,15 @@ This section documents the cardinality (how many instances exist) and lifetime (
 
 ## 14. Implementation Phases
 
-**Phase 1 — Foundation**
+> **Status**: Phases 1–6 are implemented. See the [README](instancy/README.md) and [API Guide](instancy/docs/guide/) for current capabilities.
+
+**Phase 1 — Foundation** ✅
 - Error types, `PartialOrder`, `Timestamp`, `PathSummary`
 - `Antichain`, `ChangeBatch`, `MutableAntichain`
 - `Capability` and capability management
 - Basic `Scope` trait and `Worker` structure
 
-**Phase 2 — Intra-Process Dataflow**
+**Phase 2 — Intra-Process Dataflow** ✅
 - `mpsc`-based intra-process channels with `Envelope` message type
 - `TimestampedInput`, `InputEvent`, `DataflowSpec`
 - `from_stream` operator (binds async streams as inputs)
@@ -4607,7 +4615,7 @@ This section documents the cardinality (how many instances exist) and lifetime (
 - Progress tracking (single-process)
 - `execute()` bootstrap with dynamic worker pool
 
-**Phase 3 — Async I/O & Robustness**
+**Phase 3 — Async I/O & Robustness** ✅
 - `spawn()` with `SpawnOptions::new().io_mode(IoMode::Async)` for `tokio::sync::mpsc` channel I/O
 - `AsyncInputSender` / `AsyncOutputReceiver` with WakeHandle integration
 - `ChannelMode` enum (Sync | Async) selected at spawn time
@@ -4615,41 +4623,47 @@ This section documents the cardinality (how many instances exist) and lifetime (
 - Panic safety audit: poison-safe mutex patterns in critical paths (channels, worker pool, completion, wake, progress, connection pool)
 - `DataflowCompletion` as real Future (poll + sync wait)
 
-**Phase 4 — Loops & Branching**
+**Phase 4 — Loops & Branching** ✅
 - `feedback` / `loop_variable` / `connect_loop`
 - `enter` / `leave` for nested scopes
 - `branch` / `ok_err`
 - Error handling policy (`ErrorPolicy::Stop` / `ErrorPolicy::Ignore`)
 
-**Phase 5 — Networking**
-- `ConnectionManager` trait + `TcpConnectionManager` default
-- `ConnectionPool` with dynamic scaling (min/max connections)
-- Wire protocol (framing + multiplexing)
+**Phase 5 — Networking** ✅
+- `ConnectionFactory` trait (required) + `TcpConnectionFactory` default
+- `SharedPeerManager` / `PeerPool` with connection pooling
+- Wire protocol (framing + multiplexing) with opt-in CRC32
 - `exchange` operator across processes
 - Inter-process progress tracking
-- **Refactor `ExchangePush`/`ExchangePull` to use `Box<dyn Push/Pull>`** instead of
-  concrete `BoundedPush`/`BoundedPull`, enabling the runtime to provide local (shared
-  memory) or remote (network) transports per worker pair transparently via
-  `TransportProvider` (see §4.5). The dataflow layer must not know whether a
-  target worker is local or remote.
+- Transport-agnostic design: any `AsyncRead + AsyncWrite` byte stream
 
-**Phase 6 — Observability, Checkpointing & Polish**
+**Phase 6 — Observability, Performance & Polish** ✅
 - Per-dataflow CPU time tracking (`DataflowMetrics`, `OperatorMetrics`)
-- `Checkpoint` operator + `CheckpointBackend` trait + fast-forward recovery
 - Cancellation integration
-- Comprehensive error handling review
+- Comprehensive `Result`-based error handling (no panics in library code)
 - Tracing/logging integration
-- Documentation + examples
-- Benchmarks
+- Documentation + examples (35+ runnable examples)
+- Benchmarks (exchange throughput, worker scaling)
+- Lock-free SPSC exchange channels
+- Activation deduplication in scheduler
+- Lazy channel allocation with shrink-on-drain
+
+**Phase 7 — Dynamic Cluster Scaling** *(Roadmap)*
+- `ClusterMembership` trait for node join/leave events
+- Routing table rebuild on topology changes
+- Worker rebalancing for departing/joining nodes
+- In-flight data migration
 
 ---
 
 ## 15. Open Questions
 
-1. **Operator fusion**: Should we automatically fuse pipeline-local operator chains into single tasks? This is a significant optimization but adds complexity. **Recommendation**: defer to a future optimization pass.
+1. **Operator fusion**: Should we automatically fuse pipeline-local operator chains into single tasks? **Status**: Partially addressed — operators within a stage are fused via `infer_stages()`. Cross-stage fusion is deferred to a future optimization pass.
 
-2. **Backpressure propagation across processes**: When an inter-process channel is full, how does backpressure flow back? TCP flow control provides some, but we may need application-level credit-based flow control. **Recommendation**: start with TCP-level backpressure + bounded send buffers; add credit-based flow control if needed.
+2. **Backpressure propagation across processes**: When an inter-process channel is full, how does backpressure flow back? **Status**: TCP-level backpressure + bounded send buffers are implemented. Credit-based flow control is deferred.
 
-3. **Codec at type level vs channel level**: Should `ExchangeData` carry its codec, or should the codec be specified when creating exchange channels? **Recommendation**: channel-level for maximum flexibility, with a convenience trait for types with a "default" codec.
+3. **Codec at type level vs channel level**: Should `ExchangeData` carry its codec, or should the codec be specified when creating exchange channels? **Status**: Resolved — channel-level codec via `Codec` trait. Types can implement a default codec via `ExchangeData`.
 
-4. **Container abstraction**: timely-dataflow recently added generic container support beyond `Vec<T>`. Should we support this from the start? **Recommendation**: start with `Vec<T>` as the only container type; add the generic `Container` trait later.
+4. **Container abstraction**: timely-dataflow recently added generic container support beyond `Vec<T>`. Should we support this from the start? **Status**: Deferred — using `Vec<T>` only.
+
+5. **Dynamic cluster scaling**: The `ClusterMembership` trait is designed (§12.5) but not implemented. This requires: worker rebalancing mid-dataflow, routing table rebuild, in-flight data migration, and scope re-analysis. **Status**: Roadmap — will be implemented when there is a concrete use case driving the design.
