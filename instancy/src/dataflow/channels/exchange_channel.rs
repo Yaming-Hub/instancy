@@ -371,12 +371,8 @@ impl<T: Timestamp, D: Clone + Send + 'static> Push<T, D> for ExchangePush<T, D> 
 
         match envelope.payload {
             Payload::Data { time, data } => {
-                // Record channel metrics before partitioning (count items + bytes).
-                if let Some(ref metrics) = self.channel_metrics {
-                    let items = data.len() as u64;
-                    let bytes = (items as usize * std::mem::size_of::<D>()) as u64;
-                    metrics.record_push(items, bytes);
-                }
+                // Count items before partitioning (data is consumed by the loop).
+                let data_len = data.len();
 
                 // Partition records into reusable per-target buckets.
                 for record in data {
@@ -401,6 +397,13 @@ impl<T: Timestamp, D: Clone + Send + 'static> Push<T, D> for ExchangePush<T, D> 
                             }
                         }
                     }
+                }
+
+                // Record channel metrics after successful delivery.
+                if let Some(ref metrics) = self.channel_metrics {
+                    let items = data_len as u64;
+                    let bytes = (items as usize * std::mem::size_of::<D>()) as u64;
+                    metrics.record_push(items, bytes);
                 }
             }
             Payload::Control(signal) => {
@@ -441,13 +444,6 @@ impl<T: Timestamp, D: Clone + Send + 'static> Push<T, D> for ExchangePush<T, D> 
 
         match &envelope.payload {
             Payload::Data { time, data } => {
-                // Record channel metrics before partitioning (count items + bytes).
-                if let Some(ref metrics) = self.channel_metrics {
-                    let items = data.len() as u64;
-                    let bytes = (items as usize * std::mem::size_of::<D>()) as u64;
-                    metrics.record_push(items, bytes);
-                }
-
                 // Partition records into reusable per-target buckets.
                 for record in data {
                     let hash = self.exchange_fn.route(record);
@@ -507,6 +503,13 @@ impl<T: Timestamp, D: Clone + Send + 'static> Push<T, D> for ExchangePush<T, D> 
                             }
                         }
                     }
+                }
+
+                // Record channel metrics after successful delivery.
+                if let Some(ref metrics) = self.channel_metrics {
+                    let items = data.len() as u64;
+                    let bytes = (items as usize * std::mem::size_of::<D>()) as u64;
+                    metrics.record_push(items, bytes);
                 }
             }
             Payload::Control(signal) => {
