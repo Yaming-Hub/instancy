@@ -28,7 +28,7 @@
 
 | Aspect | timely-dataflow | instancy |
 |---|---|---|
-| Abstraction level | Workers and channels tied to physical threads and TCP connections | Fully logical: workers, streams, and routing are virtual; physical resources provided by adapters |
+| Abstraction level | Workers and channels tied to physical threads and TCP connections | Fully logical: workers, streams, and routing are virtual; physical resources provided by adapters. Transport-agnostic — any `AsyncRead + AsyncWrite` byte stream (TCP, TLS, Unix sockets, pipes, QUIC) |
 | Execution | 1 OS thread per worker; worker owns its dataflows and steps through them synchronously | Dual-layer: Custom Worker Thread Pool (sync operator logic) + Tokio I/O runtime (network, input streams); logical `WorkerId`s for FIFO ordering |
 | Worker topology | All nodes must have the same number of workers | Heterogeneous: each node declares its own worker count based on capacity; global worker set is the union |
 | Scheduling | `Worker::step()` loop polls activations | Per-worker FIFO queues → shared task queue → Worker Thread Pool threads (spin/yield/park idle strategy) |
@@ -2300,9 +2300,12 @@ pub struct PoolConfig {
 > transport modes use the connection factory. In dedicated mode the pool
 > leases a connection exclusively to one dataflow and returns it on
 > completion. In shared mode connections are multiplexed across dataflows.
-> Either way, reconnection and scale-up go through the same factory. The
-> library ships a default `TcpConnectionFactory` for plain TCP; applications
-> that need TLS or custom negotiation implement `ConnectionFactory` directly.
+> Either way, reconnection and scale-up go through the same factory.
+> The library is **transport-agnostic** — `ConnectionFactory` returns
+> `(AsyncRead, AsyncWrite)` byte streams and works with any transport:
+> TCP, TLS, Unix sockets, named pipes, QUIC, etc. instancy ships a default
+> `TcpConnectionFactory` for plain TCP; applications that need other
+> transports implement `ConnectionFactory` directly.
 >
 > **Lazy initialization:** The `SharedPeerManager` constructor is synchronous
 > and creates no connections. Connections are established lazily in
@@ -2317,12 +2320,12 @@ pub struct PoolConfig {
 
 #### Motivation
 
-Assigning a dedicated TCP connection per (dataflow, peer) pair is simple — TCP guarantees FIFO, so message ordering is free. However, it limits scalability:
-- 100 concurrent dataflows across 10 nodes = 900 TCP connections per node
+Assigning a dedicated connection per (dataflow, peer) pair is simple — a single ordered stream guarantees FIFO, so message ordering is free. However, it limits scalability:
+- 100 concurrent dataflows across 10 nodes = 900 connections per node
 - Connection setup latency for each new dataflow
 - Underutilization of connections when dataflows have bursty traffic
 
-A **shared connection mode** would allow multiple dataflows (and multiple workers within a dataflow) to share the same node-to-node TCP connection pool, similar to how HTTP/2 multiplexes streams over a single connection, or how instancy's worker thread pool shares OS threads across dataflows.
+A **shared connection mode** would allow multiple dataflows (and multiple workers within a dataflow) to share the same node-to-node connection pool, similar to how HTTP/2 multiplexes streams over a single connection, or how instancy's worker thread pool shares OS threads across dataflows.
 
 #### The Ordering Challenge
 
@@ -2442,7 +2445,7 @@ impl ReorderBuffer {
 1. **Resource efficiency** — O(peers) base connections instead of O(dataflows × peers). Critical at scale.
 2. **Connection reuse** — new dataflows start instantly on existing pool connections.
 3. **Resilience** — connection failure doesn't kill the dataflow; retry on alternate connection.
-4. **Higher throughput** — parallel connections per peer with independent congestion windows. A single TCP connection cannot fully utilize high-bandwidth links due to bandwidth-delay product limits.
+4. **Higher throughput** — parallel connections per peer with independent congestion windows. A single connection cannot fully utilize high-bandwidth links due to bandwidth-delay product limits.
 5. **Simpler lifecycle** — no need to establish/teardown connections per dataflow.
 6. **Self-tuning latency** — RTT probes detect congestion early; adaptive scaling adds connections to maintain latency target. Under heavy load, shared mode achieves *lower* latency than dedicated mode (which is stuck with a single saturated connection).
 7. **Graceful degradation** — under light load, operates with min_connections (essentially dedicated mode behavior with negligible overhead). Scales up only when measured RTT justifies it.
@@ -2467,7 +2470,7 @@ The original fixed-pool design had real performance concerns. Adaptive scaling a
 | **Throughput ceiling** | Fixed by pool size | Scales dynamically — each new connection adds an independent TCP congestion window |
 | **Connection overhead at rest** | Fixed pool wastes resources | Scales down to min_connections during idle periods |
 
-**Key insight:** Dedicated mode has a fundamental limitation — under heavy load, a single TCP connection saturates with no recovery path. The adaptive shared mode is the only design that maintains latency invariants across all load levels, because it uses measured feedback (RTT probes) to trigger corrective action (add connections) before saturation causes visible delays.
+**Key insight:** Dedicated mode has a fundamental limitation — under heavy load, a single connection saturates with no recovery path. The adaptive shared mode is the only design that maintains latency invariants across all load levels, because it uses measured feedback (RTT probes) to trigger corrective action (add connections) before saturation causes visible delays.
 
 **When does shared mode equal or beat dedicated?**
 - **Light load:** Equivalent (min_connections, no reorder waits, negligible sequence overhead)
@@ -2553,13 +2556,13 @@ Probes are sent at data priority (not control priority) because we want to measu
 When multiple connections exist to the same peer, frames are distributed using a **load-aware packing** strategy:
 
 - **Low load** (total pending writes < connection count): traffic is *concentrated* onto the fewest connections. The busiest connection is selected, packing frames onto it. This leaves other connections idle so they can be cleaned up by the idle timeout, naturally shrinking the pool when demand subsides.
-- **High load** (total pending writes ≥ connection count): traffic is *spread* across connections using least-loaded selection (smallest pending write queue). This maximizes throughput by utilizing all connections' independent TCP congestion windows.
+- **High load** (total pending writes ≥ connection count): traffic is *spread* across connections using least-loaded selection (smallest pending write queue). This maximizes throughput by utilizing all connections' independent congestion windows.
 - Sequence IDs ensure ordering is reconstructed at the receiver regardless of which connection carried each frame.
 
 **Why not just one connection?**
 
-A single TCP connection has fundamental throughput limits:
-- TCP congestion window limits in-flight bytes
+A single connection has fundamental throughput limits:
+- Congestion window limits in-flight bytes (TCP, QUIC, etc.)
 - High-bandwidth links with significant RTT ("bandwidth-delay product") need large windows
 - A single stream cannot fully utilize a 10 Gbps link with 1ms RTT without ~1.25 MB in-flight
 - Multiple connections achieve better utilization by having independent congestion windows
@@ -2615,7 +2618,7 @@ Operators in dataflow A **never** share input/output buffers with operators in d
 
 #### Physical Isolation on Shared Connections
 
-When two dataflows share a pooled TCP connection to the same peer:
+When two dataflows share a pooled connection to the same peer:
 - Each frame includes a `dataflow_id` (UUID) field in its wire header
 - The demuxer dispatches frames to the correct dataflow's channel receivers based on `(dataflow_id, channel_id)` pair
 - A frame with an unknown `dataflow_id` is logged and dropped (e.g., if the dataflow was cancelled but in-flight frames remain)
@@ -3567,9 +3570,9 @@ Default batch size: 1024 items (configurable).
 
 ### 12.4 Connection Multiplexing
 
-Rather than one TCP connection per (worker, channel) pair, instancy multiplexes all channels to the same peer over a small number of pooled connections. The pool delegates all connection establishment to the application's `ConnectionFactory`, so the library never touches sockets directly. This dramatically reduces connection count in large clusters and supports arbitrarily complex networking topologies.
+Rather than one connection per (worker, channel) pair, instancy multiplexes all channels to the same peer over a small number of pooled connections. The pool delegates all connection establishment to the application's `ConnectionFactory`, so the library never touches sockets directly. The library is **transport-agnostic** — any reliable, ordered byte stream works (TCP, TLS, Unix sockets, named pipes, QUIC, etc.). This dramatically reduces connection count in large clusters and supports arbitrarily complex networking topologies.
 
-Both transport modes — dedicated (exclusive lease per dataflow) and shared (multiplexed across dataflows) — use the same factory and pool. The factory is **required**, not optional: it is the sole mechanism for creating, replacing, and scaling connections. instancy provides a default `TcpConnectionFactory` for plain TCP; applications supply their own for TLS, actor-framework integration, or custom protocols.
+Both transport modes — dedicated (exclusive lease per dataflow) and shared (multiplexed across dataflows) — use the same factory and pool. The factory is **required**, not optional: it is the sole mechanism for creating, replacing, and scaling connections. instancy provides a default `TcpConnectionFactory` for plain TCP; applications supply their own for other transports or custom protocols.
 
 ### 12.5 Dynamic Cluster Scaling
 
@@ -4582,7 +4585,7 @@ This section documents the cardinality (how many instances exist) and lifetime (
 **Key patterns:**
 - **Process-lifetime** components are typically created at startup and live until process exit. They are `Arc`-shared.
 - **Dataflow-lifetime** components are created when a dataflow starts and destroyed when it completes or is cancelled.
-- **Connection-lifetime** components are tied to a physical TCP connection; they are recreated on reconnection.
+- **Connection-lifetime** components are tied to a physical connection; they are recreated on reconnection.
 - **Transient** components are created and destroyed within a single operator activation cycle.
 
 ---

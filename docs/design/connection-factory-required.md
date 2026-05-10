@@ -148,8 +148,9 @@ pub trait PeerAddressResolver: Send + Sync + 'static {
 }
 ```
 
-Applications that need TLS, actor-framework integration, or custom
-protocols implement `ConnectionFactory` themselves.
+Applications that need TLS, actor-framework integration, Unix sockets,
+named pipes, QUIC, or any other reliable byte-stream transport implement
+`ConnectionFactory` themselves — the library is transport-agnostic.
 
 #### 4. Remove `Option` checks in scaling handler
 

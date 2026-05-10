@@ -87,11 +87,15 @@ fn push_task_handle(
 // ConnectionFactory — user-provided connection establishment
 // ---------------------------------------------------------------------------
 
-/// Factory for establishing new TCP connections to a peer.
+/// Factory for establishing connections to a peer node.
 ///
-/// The shared transport calls this when the scaling driver emits a
-/// [`ScalingEvent::ScaleUp`]. Implementations can use any mechanism
-/// (direct TCP, TLS, actor framework negotiation, etc.).
+/// The library is **transport-agnostic** — any reliable, ordered byte stream
+/// works: TCP, TLS, Unix sockets, named pipes, QUIC, shared-memory channels,
+/// etc. The factory is called when the pool needs new connections (lazy
+/// initialization, scale-up, or reconnection after failure).
+///
+/// instancy ships a default [`TcpConnectionFactory`] for plain TCP.
+/// Applications that need other transports implement this trait directly.
 ///
 /// Implement using `async fn` in the trait (Rust 1.75+).
 pub trait ConnectionFactory: Send + Sync + 'static {
@@ -109,7 +113,11 @@ pub trait ConnectionFactory: Send + Sync + 'static {
     > + Send;
 }
 
-/// Resolves peer node IDs to socket addresses.
+/// Resolves peer node IDs to socket addresses for TCP connections.
+///
+/// This trait is specific to [`TcpConnectionFactory`]. Custom connection
+/// factories that use non-TCP transports (pipes, Unix sockets, QUIC, etc.)
+/// handle peer resolution internally and do not need this trait.
 pub trait PeerAddressResolver: Send + Sync + 'static {
     /// Resolve a peer node ID to its socket address.
     fn resolve(&self, peer_node_id: &str) -> Option<std::net::SocketAddr>;
@@ -123,9 +131,10 @@ impl PeerAddressResolver for std::collections::HashMap<String, std::net::SocketA
 
 /// Default connection factory using plain TCP (no TLS).
 ///
+/// This is a convenience implementation for applications that use plain TCP.
 /// The application instantiates this with a resolver that maps peer node IDs
-/// to socket addresses. For TLS or custom protocols, implement
-/// [`ConnectionFactory`] directly.
+/// to socket addresses. For TLS, Unix sockets, named pipes, QUIC, or any
+/// other byte-stream transport, implement [`ConnectionFactory`] directly.
 pub struct TcpConnectionFactory {
     resolver: Arc<dyn PeerAddressResolver>,
 }
