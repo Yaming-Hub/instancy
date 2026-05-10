@@ -76,6 +76,16 @@ pub struct SharedConnectionConfig {
     /// for longer than this timeout. Idle connections are removed down to
     /// `min_connections`. Set to `None` to disable idle cleanup.
     pub idle_timeout: Option<Duration>,
+    /// Enable CRC32 checksums on data frames.
+    ///
+    /// When `true`, each data frame written to the wire includes a 4-byte
+    /// CRC32 trailer that the reader verifies on receipt. This catches
+    /// silent data corruption at the cost of ~4 bytes per frame plus a
+    /// small CPU overhead. Both sides of a connection must agree on this
+    /// setting.
+    ///
+    /// Default: `false` (no CRC — maximum throughput).
+    pub enable_frame_crc: bool,
 }
 
 impl Default for SharedConnectionConfig {
@@ -90,6 +100,7 @@ impl Default for SharedConnectionConfig {
             reorder_timeout: Duration::from_millis(50),
             rtt_ema_alpha: 0.2,
             idle_timeout: Some(Duration::from_secs(60)),
+            enable_frame_crc: false,
         }
     }
 }

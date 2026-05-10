@@ -394,6 +394,7 @@ impl SharedPeerManager {
         ));
         push_task_handle(&task_handles, probe_handle);
 
+        let crc_enabled = config.enable_frame_crc;
         let scale_handle = runtime_handle.spawn(Self::scaling_event_handler(
             scaling_event_rx,
             peer_node_id.clone(),
@@ -407,6 +408,7 @@ impl SharedPeerManager {
             scaling_driver.clone(),
             failure_tx.clone(),
             task_handles.clone(),
+            crc_enabled,
         ));
         push_task_handle(&task_handles, scale_handle);
 
@@ -583,6 +585,7 @@ impl SharedPeerManager {
                 self.scaling_driver.clone(),
                 self.failure_tx.clone(),
                 self.task_handles.clone(),
+                self.config.enable_frame_crc,
             )
             .await
             {
@@ -657,6 +660,7 @@ impl SharedPeerManager {
         scaling_driver: Arc<ScalingDriver>,
         failure_tx: tokio_mpsc::Sender<usize>,
         task_handles: Arc<Mutex<Vec<tokio::task::JoinHandle<()>>>>,
+        crc_enabled: bool,
     ) -> Result<usize, Box<dyn std::error::Error + Send + Sync>> {
         let (reader, writer) = connection_factory.establish_dyn(peer_node_id).await?;
         let conn_metrics = pool.add_connection().ok_or_else(|| {
@@ -674,6 +678,7 @@ impl SharedPeerManager {
             rx,
             Some(conn_metrics),
             failure_tx.clone(),
+            crc_enabled,
         ));
         let reader_handle = runtime_handle.spawn(Self::reader_task(
             conn_id,
@@ -685,6 +690,7 @@ impl SharedPeerManager {
             pool,
             writer_channels,
             failure_tx,
+            crc_enabled,
         ));
 
         match task_handles.lock().or_poison("task handle") {
@@ -716,8 +722,13 @@ impl SharedPeerManager {
         mut rx: tokio_mpsc::Receiver<Frame>,
         conn_metrics: Option<Arc<ConnectionMetrics>>,
         failure_tx: tokio_mpsc::Sender<usize>,
+        crc_enabled: bool,
     ) {
-        let mut framed = FramedWriter::new(writer);
+        let mut framed = if crc_enabled {
+            FramedWriter::with_crc(writer)
+        } else {
+            FramedWriter::new(writer)
+        };
         while let Some(frame) = rx.recv().await {
             let payload_size = frame.payload.len();
             let is_user_traffic = frame.channel_id != PROBE_CHANNEL_ID;
@@ -918,8 +929,13 @@ impl SharedPeerManager {
         pool: Arc<PeerPool>,
         writer_channels: Arc<TokioMutex<HashMap<usize, tokio_mpsc::Sender<Frame>>>>,
         failure_tx: tokio_mpsc::Sender<usize>,
+        crc_enabled: bool,
     ) {
-        let mut framed = FramedReader::new(reader);
+        let mut framed = if crc_enabled {
+            FramedReader::with_crc(reader)
+        } else {
+            FramedReader::new(reader)
+        };
 
         loop {
             match framed.read_frame().await {
@@ -1172,6 +1188,7 @@ impl SharedPeerManager {
         scaling_driver: Arc<ScalingDriver>,
         failure_tx: tokio_mpsc::Sender<usize>,
         task_handles: Arc<Mutex<Vec<tokio::task::JoinHandle<()>>>>,
+        crc_enabled: bool,
     ) {
         while let Some(event) = event_rx.recv().await {
             match event {
@@ -1190,6 +1207,7 @@ impl SharedPeerManager {
                         scaling_driver.clone(),
                         failure_tx.clone(),
                         task_handles.clone(),
+                        crc_enabled,
                     )
                     .await
                     {
@@ -1243,6 +1261,7 @@ impl SharedPeerManager {
                             scaling_driver.clone(),
                             failure_tx.clone(),
                             task_handles.clone(),
+                            crc_enabled,
                         )
                         .await
                         {

@@ -78,6 +78,7 @@ async fn main() {
         reorder_timeout: Duration::from_secs(5),
         rtt_ema_alpha: 0.2,
         idle_timeout: None,
+        enable_frame_crc: false,
     };
 
     let factory = Arc::new(EchoConnectionFactory::default());
