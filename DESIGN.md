@@ -928,7 +928,48 @@ I/O Runtime (Tokio) ──► reads input stream ──► enqueues to Worker qu
 5. The operator produces output, which is written to downstream input buffers.
 6. The thread signals task completion; the scheduler dispatches the next task for that worker.
 
-#### 5.4.1 Who Creates Tasks? — The Orchestrator Event Loop
+#### 5.4.1 Completion Propagation
+
+When an operator returns `Done`, the executor marks it as complete and invokes
+**topology-driven completion propagation**. This uses pre-computed adjacency
+lists (built from the `DataflowGraph` edges during materialization) to determine
+which downstream operators should be re-queued immediately.
+
+**Algorithm:**
+
+1. Look up the completed operator's successors from `successors_by_pos`.
+2. For each successor, check whether **all** its predecessors are now done
+   (using `predecessors_by_pos`).
+3. If all predecessors are done and the successor is not already queued,
+   re-queue it so it can process remaining buffered data and detect input
+   exhaustion.
+
+```
+  A ──► B ──► D        When A completes: B is requeued (sole predecessor done).
+        ▲               When C completes: D is NOT requeued (B still running).
+  C ────┘               When B completes: D IS requeued (both B and C done).
+```
+
+**Activation-mode handling:**
+
+| Mode | Requeue target |
+|------|---------------|
+| Unfused | Operator position → `ready_queue` |
+| Fused | Operator position → `ready_queue` (next sweep activates it) |
+| Stage-task | Owning stage task index → `ready_queue` |
+
+This ensures downstream operators are activated promptly instead of waiting for
+the next idle sweep or progress-tracker cycle. The adjacency lists are computed
+once during `DataflowExecutor::materialize()` from both regular and feedback
+edges, deduplicated, and stored for O(1) lookup per completion event.
+
+Without topology-driven propagation, the executor relied solely on channel
+exhaustion: the completed operator drops its push handles, and eventually the
+downstream operator discovers `is_exhausted() = true` on its pull handles.
+While correct, this passive approach could delay completion detection in unfused
+mode where idle operators are not in the ready queue.
+
+#### 5.4.2 Who Creates Tasks? — The Orchestrator Event Loop
 
 The **orchestrator** (also called the runtime event loop) is the component responsible
 for receiving data messages and turning them into compute tasks. It runs on the I/O

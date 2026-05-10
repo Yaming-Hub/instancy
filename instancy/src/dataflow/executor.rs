@@ -2719,6 +2719,237 @@ mod tests {
     }
 
     #[test]
+    fn propagate_completion_diamond_waits_for_all_predecessors() {
+        // Diamond: A→B, A→C, B→D, C→D
+        // D should only be requeued when BOTH B and C are done.
+        let mut executor = DataflowExecutor::<u64>::new_test(
+            vec![
+                Box::new(CountingOperator {
+                    name: "a".into(),
+                    index: 0,
+                    stage_id: crate::dataflow::stage::StageId::new(0),
+                    remaining: 1,
+                }),
+                Box::new(CountingOperator {
+                    name: "b".into(),
+                    index: 1,
+                    stage_id: crate::dataflow::stage::StageId::new(0),
+                    remaining: 1,
+                }),
+                Box::new(CountingOperator {
+                    name: "c".into(),
+                    index: 2,
+                    stage_id: crate::dataflow::stage::StageId::new(0),
+                    remaining: 1,
+                }),
+                Box::new(CountingOperator {
+                    name: "d".into(),
+                    index: 3,
+                    stage_id: crate::dataflow::stage::StageId::new(0),
+                    remaining: 1,
+                }),
+            ],
+            ExecutorConfig::default(),
+            0,
+        );
+        executor.ready_queue.clear();
+        executor.in_queue.fill(false);
+        // A(0)→B(1), A(0)→C(2), B(1)→D(3), C(2)→D(3)
+        executor.successors_by_pos = vec![vec![1, 2], vec![3], vec![3], Vec::new()];
+        executor.predecessors_by_pos = vec![Vec::new(), vec![0], vec![0], vec![1, 2]];
+
+        // A completes → B and C requeued (A is their sole predecessor).
+        executor.done[0] = true;
+        executor.propagate_completion(0);
+        let mut queued: Vec<usize> = executor.ready_queue.iter().copied().collect();
+        queued.sort();
+        assert_eq!(queued, vec![1, 2]);
+        assert!(executor.in_queue[1]);
+        assert!(executor.in_queue[2]);
+        assert!(!executor.in_queue[3]); // D not yet — B and C still running.
+
+        // B completes → D still NOT requeued (C not done yet).
+        executor.ready_queue.clear();
+        executor.in_queue.fill(false);
+        executor.done[1] = true;
+        executor.propagate_completion(1);
+        assert!(executor.ready_queue.is_empty());
+        assert!(!executor.in_queue[3]);
+
+        // C completes → D IS requeued (both predecessors done).
+        executor.done[2] = true;
+        executor.propagate_completion(2);
+        assert_eq!(executor.ready_queue, VecDeque::from([3]));
+        assert!(executor.in_queue[3]);
+    }
+
+    #[test]
+    fn propagate_completion_leaf_operator_no_op() {
+        // Sink operator with no successors — propagate_completion is a no-op.
+        let mut executor = DataflowExecutor::<u64>::new_test(
+            vec![Box::new(CountingOperator {
+                name: "sink".into(),
+                index: 0,
+                stage_id: crate::dataflow::stage::StageId::new(0),
+                remaining: 1,
+            })],
+            ExecutorConfig::default(),
+            0,
+        );
+        executor.ready_queue.clear();
+        executor.in_queue.fill(false);
+        executor.successors_by_pos = vec![Vec::new()];
+        executor.predecessors_by_pos = vec![Vec::new()];
+
+        executor.done[0] = true;
+        executor.propagate_completion(0);
+        assert!(executor.ready_queue.is_empty());
+    }
+
+    #[test]
+    fn propagate_completion_empty_adjacency_is_no_op() {
+        // No graph topology available (empty adjacency) — same as old stub behavior.
+        let mut executor = DataflowExecutor::<u64>::new_test(
+            vec![
+                Box::new(CountingOperator {
+                    name: "a".into(),
+                    index: 0,
+                    stage_id: crate::dataflow::stage::StageId::new(0),
+                    remaining: 1,
+                }),
+                Box::new(CountingOperator {
+                    name: "b".into(),
+                    index: 1,
+                    stage_id: crate::dataflow::stage::StageId::new(0),
+                    remaining: 1,
+                }),
+            ],
+            ExecutorConfig::default(),
+            0,
+        );
+        executor.ready_queue.clear();
+        executor.in_queue.fill(false);
+        // Default: successors_by_pos and predecessors_by_pos are Vec::new()
+
+        executor.done[0] = true;
+        executor.propagate_completion(0);
+        assert!(executor.ready_queue.is_empty());
+    }
+
+    #[test]
+    fn propagate_completion_stage_task_mode_requeues_owning_task() {
+        // In stage-task mode, completion should enqueue the owning task, not the operator.
+        let mut executor = DataflowExecutor::<u64>::new_test(
+            vec![
+                Box::new(CountingOperator {
+                    name: "a".into(),
+                    index: 0,
+                    stage_id: crate::dataflow::stage::StageId::new(0),
+                    remaining: 1,
+                }),
+                Box::new(CountingOperator {
+                    name: "b".into(),
+                    index: 1,
+                    stage_id: crate::dataflow::stage::StageId::new(1),
+                    remaining: 1,
+                }),
+            ],
+            ExecutorConfig::default(),
+            0,
+        );
+        executor.ready_queue.clear();
+        executor.in_queue.fill(false);
+        executor.successors_by_pos = vec![vec![1], Vec::new()];
+        executor.predecessors_by_pos = vec![Vec::new(), vec![0]];
+
+        // Set up stage tasks: op 0 in task 0, op 1 in task 1.
+        executor.stage_tasks = vec![
+            FusedStageTask {
+                operator_positions: vec![0],
+            },
+            FusedStageTask {
+                operator_positions: vec![1],
+            },
+        ];
+        executor.op_pos_to_task = vec![0, 1];
+        executor.task_in_queue = vec![false, false];
+
+        executor.done[0] = true;
+        executor.propagate_completion(0);
+
+        // Task 1 (owning op 1) should be enqueued, not op 1 directly.
+        assert_eq!(executor.ready_queue, VecDeque::from([1])); // task index 1
+        assert!(executor.task_in_queue[1]);
+        assert!(!executor.task_in_queue[0]);
+    }
+
+    #[test]
+    fn propagate_completion_skips_already_done_successor() {
+        // If successor is already done, don't requeue it.
+        let mut executor = DataflowExecutor::<u64>::new_test(
+            vec![
+                Box::new(CountingOperator {
+                    name: "a".into(),
+                    index: 0,
+                    stage_id: crate::dataflow::stage::StageId::new(0),
+                    remaining: 1,
+                }),
+                Box::new(CountingOperator {
+                    name: "b".into(),
+                    index: 1,
+                    stage_id: crate::dataflow::stage::StageId::new(0),
+                    remaining: 1,
+                }),
+            ],
+            ExecutorConfig::default(),
+            0,
+        );
+        executor.ready_queue.clear();
+        executor.in_queue.fill(false);
+        executor.successors_by_pos = vec![vec![1], Vec::new()];
+        executor.predecessors_by_pos = vec![Vec::new(), vec![0]];
+
+        executor.done[0] = true;
+        executor.done[1] = true; // successor already done
+        executor.propagate_completion(0);
+        assert!(executor.ready_queue.is_empty());
+    }
+
+    #[test]
+    fn propagate_completion_skips_already_queued_successor() {
+        // If successor is already in the queue, don't double-enqueue.
+        let mut executor = DataflowExecutor::<u64>::new_test(
+            vec![
+                Box::new(CountingOperator {
+                    name: "a".into(),
+                    index: 0,
+                    stage_id: crate::dataflow::stage::StageId::new(0),
+                    remaining: 1,
+                }),
+                Box::new(CountingOperator {
+                    name: "b".into(),
+                    index: 1,
+                    stage_id: crate::dataflow::stage::StageId::new(0),
+                    remaining: 1,
+                }),
+            ],
+            ExecutorConfig::default(),
+            0,
+        );
+        executor.ready_queue.clear();
+        executor.in_queue.fill(false);
+        executor.successors_by_pos = vec![vec![1], Vec::new()];
+        executor.predecessors_by_pos = vec![Vec::new(), vec![0]];
+
+        executor.done[0] = true;
+        executor.in_queue[1] = true; // already queued
+        executor.ready_queue.push_back(1);
+        executor.propagate_completion(0);
+        // Should still only have one entry, not duplicated.
+        assert_eq!(executor.ready_queue.len(), 1);
+    }
+
+    #[test]
     fn bounded_channel_with_wake_notifies_on_push() {
         // Verify that pushing to a BoundedPush with WakeHandle notifies.
         use crate::dataflow::channels::bounded::bounded_channel_with_wake;
