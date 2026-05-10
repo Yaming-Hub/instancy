@@ -55,9 +55,11 @@ async fn shared_pool_parallel_dataflows_no_exchange() {
     for i in 0..num_dataflows {
         let builder = DataflowBuilder::<u64>::new(format!("df-{i}"));
         builder
-            .input::<i64>("data").unwrap()
+            .input::<i64>("data")
+            .unwrap()
             .map("double", |_t, x| x * 2)
-            .output("results").unwrap();
+            .output("results")
+            .unwrap();
         let logical = builder.build().unwrap();
         let spawned = rt.spawn(logical, SpawnOptions::default()).unwrap();
         dataflows.push(spawned);
@@ -254,9 +256,11 @@ async fn stress_shared_pool_many_dataflows() {
     for i in 0..num_dataflows {
         let builder = DataflowBuilder::<u64>::new(format!("stress-{i}"));
         builder
-            .input::<i64>("data").unwrap()
+            .input::<i64>("data")
+            .unwrap()
             .map("triple", |_t, x| x * 3)
-            .output("results").unwrap();
+            .output("results")
+            .unwrap();
         let logical = builder.build().unwrap();
         dataflows.push(rt.spawn(logical, SpawnOptions::default()).unwrap());
     }

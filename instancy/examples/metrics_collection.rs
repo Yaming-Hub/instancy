@@ -20,7 +20,8 @@ fn main() {
     input
         .map("double", |_t, x| x * 2)
         .filter("positive", |_t, x| *x > 0)
-        .output("results").unwrap();
+        .output("results")
+        .unwrap();
 
     let dataflow = builder.build().expect("build failed");
     let mut handle = rt

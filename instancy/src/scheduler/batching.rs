@@ -357,7 +357,8 @@ mod tests {
 
     #[test]
     fn custom_policy() {
-        let policy = BatchingPolicy::custom(512, Some(128 * 1024), Duration::from_millis(5)).unwrap();
+        let policy =
+            BatchingPolicy::custom(512, Some(128 * 1024), Duration::from_millis(5)).unwrap();
         assert_eq!(policy.max_batch_count, 512);
         assert_eq!(policy.max_batch_bytes, Some(128 * 1024));
         assert_eq!(policy.max_batch_wait, Duration::from_millis(5));
@@ -396,7 +397,8 @@ mod tests {
             1_000_000,               // very high count
             Some(100),               // low byte threshold
             Duration::from_secs(60), // long wait
-        ).unwrap();
+        )
+        .unwrap();
         let mut acc = BatchAccumulator::new();
 
         // Add messages with size info
@@ -638,7 +640,8 @@ mod tests {
             1_000_000, // very high count
             None,
             Duration::from_millis(5), // low time threshold
-        ).unwrap();
+        )
+        .unwrap();
         let mut acc = BatchAccumulator::new();
 
         // Single message arrives under low throughput
@@ -688,4 +691,3 @@ mod tests {
         assert_eq!(v.message_size(), 11);
     }
 }
-

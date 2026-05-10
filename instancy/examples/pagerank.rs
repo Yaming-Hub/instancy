@@ -108,7 +108,8 @@ fn main() {
 
             IterateResult { feedback, output }
         })
-        .output("pagerank_results").unwrap();
+        .output("pagerank_results")
+        .unwrap();
 
     let dataflow = builder.build().expect("graph construction failed");
 

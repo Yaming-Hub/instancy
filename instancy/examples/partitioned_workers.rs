@@ -58,7 +58,10 @@ fn main() {
             num_workers,
             |builder: &mut DataflowBuilder<u64>| {
                 let input = builder.input::<i32>("data").unwrap();
-                input.map("double", |_t, x| x * 2).output("results").unwrap();
+                input
+                    .map("double", |_t, x| x * 2)
+                    .output("results")
+                    .unwrap();
                 Ok(())
             },
             SpawnOptions::default(),

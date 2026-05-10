@@ -25,7 +25,8 @@ fn main() {
         .map("double", |_t, x| x * 2)
         .filter("div_by_3", |_t, x| x % 3 == 0)
         .map("describe", |_t, x| format!("{x} is divisible by 3"))
-        .output("results").unwrap();
+        .output("results")
+        .unwrap();
 
     // Inspect the logical graph before running
     let dataflow = builder.build().expect("graph construction failed");

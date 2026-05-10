@@ -295,7 +295,10 @@ async fn parallel_tcp_dataflows_multi_epoch() {
     let build = |builder: &mut DataflowBuilder<u64>| -> Result<()> {
         let input = builder.input::<i64>("data").unwrap();
         let exchanged = input.exchange("by_val", |x: &i64| *x as u64);
-        exchanged.map("double", |_t, x| x * 2).output("results").unwrap();
+        exchanged
+            .map("double", |_t, x| x * 2)
+            .output("results")
+            .unwrap();
         Ok(())
     };
 

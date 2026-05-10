@@ -2575,7 +2575,8 @@ mod tests {
         // Drain initial notification
         wake.take_notification();
 
-        let (mut push, _pull) = bounded_channel_with_wake::<u64, i32, ()>(4, Some(wake.clone()), None);
+        let (mut push, _pull) =
+            bounded_channel_with_wake::<u64, i32, ()>(4, Some(wake.clone()), None);
 
         // Push should notify
         push.push(Envelope::data(0, vec![1])).unwrap();
@@ -2590,7 +2591,8 @@ mod tests {
         let wake = WakeHandle::new();
         wake.take_notification();
 
-        let (mut push, _pull) = bounded_channel_with_wake::<u64, i32, ()>(4, Some(wake.clone()), None);
+        let (mut push, _pull) =
+            bounded_channel_with_wake::<u64, i32, ()>(4, Some(wake.clone()), None);
 
         push.close();
         assert!(wake.take_notification());
@@ -2617,7 +2619,8 @@ mod tests {
 
         let wake = WakeHandle::new();
 
-        let (mut push, mut pull) = bounded_channel_with_wake::<u64, i32, ()>(2, Some(wake.clone()), None);
+        let (mut push, mut pull) =
+            bounded_channel_with_wake::<u64, i32, ()>(2, Some(wake.clone()), None);
 
         // Fill channel to capacity
         push.push(Envelope::data(0, vec![1])).unwrap();
@@ -2640,7 +2643,8 @@ mod tests {
 
         let wake = WakeHandle::new();
 
-        let (mut push, mut pull) = bounded_channel_with_wake::<u64, i32, ()>(4, Some(wake.clone()), None);
+        let (mut push, mut pull) =
+            bounded_channel_with_wake::<u64, i32, ()>(4, Some(wake.clone()), None);
 
         // Push one item (channel not full)
         push.push(Envelope::data(0, vec![1])).unwrap();

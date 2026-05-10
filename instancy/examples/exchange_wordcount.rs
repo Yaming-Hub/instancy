@@ -117,7 +117,8 @@ fn main() {
                             Ok(())
                         }
                     })
-                    .output("counts").unwrap();
+                    .output("counts")
+                    .unwrap();
 
                 Ok(())
             },

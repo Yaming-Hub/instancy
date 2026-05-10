@@ -543,7 +543,8 @@ pub fn create_network_progress_channels<T: Timestamp + ExchangeData>(
                         return;
                     }
                     let mut bufs = Vec::new();
-                    if let Err(e) = encode_progress_batch::<T>(&changes, &mut bufs, max_batch_size) {
+                    if let Err(e) = encode_progress_batch::<T>(&changes, &mut bufs, max_batch_size)
+                    {
                         #[cfg(feature = "tracing")]
                         tracing::error!(
                             peer = %peer_id_for_closure,
@@ -757,7 +758,10 @@ mod tests {
     #[test]
     fn progress_channel_id_formula() {
         // 4 workers total, src=1, dst=3 → PROGRESS_CHANNEL_BASE + 1*4 + 3 = 1_000_007
-        assert_eq!(progress_channel_id(1, 3, 4).unwrap(), PROGRESS_CHANNEL_BASE + 7);
+        assert_eq!(
+            progress_channel_id(1, 3, 4).unwrap(),
+            PROGRESS_CHANNEL_BASE + 7
+        );
         assert_eq!(progress_channel_id(0, 0, 4).unwrap(), PROGRESS_CHANNEL_BASE);
     }
 

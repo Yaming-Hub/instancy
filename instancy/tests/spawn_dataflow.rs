@@ -30,7 +30,10 @@ fn auto_par_single_input_single_stage() {
             0, // ignored with auto_parallelism
             |builder: &mut DataflowBuilder<u64>| {
                 let input = builder.input::<i32>("data").unwrap();
-                input.map("double", |_t, x| x * 2).output("results").unwrap();
+                input
+                    .map("double", |_t, x| x * 2)
+                    .output("results")
+                    .unwrap();
                 Ok(())
             },
             auto_opts(),
@@ -110,7 +113,8 @@ fn auto_par_fan_out_fan_in() {
                     .unwrap()
                     .map("process", |_t, x| x * 2)
                     .gather("collect")
-                    .output("results").unwrap();
+                    .output("results")
+                    .unwrap();
                 Ok(())
             },
             auto_opts(),
@@ -236,7 +240,8 @@ fn auto_par_decreasing_parallelism() {
                     .unwrap()
                     .map("work", |_t, x| x * 3)
                     .gather("collect")
-                    .output("results").unwrap();
+                    .output("results")
+                    .unwrap();
                 Ok(())
             },
             auto_opts(),
@@ -346,7 +351,8 @@ fn auto_par_cross_stage_frontier() {
                     .unwrap()
                     .delay_batch("hold", |t| *t)
                     .map("inc", |_t, x| x + 100)
-                    .output("results").unwrap();
+                    .output("results")
+                    .unwrap();
                 Ok(())
             },
             auto_opts(),

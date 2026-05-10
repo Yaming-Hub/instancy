@@ -71,7 +71,10 @@ async fn run_exchange_round_trip_case(
         for worker_idx in 0..worker_counts[&node_id] {
             let batch = vec![
                 (next_key, format!("{node_id}-worker-{worker_idx}-record-a")),
-                (next_key + 1, format!("{node_id}-worker-{worker_idx}-record-b")),
+                (
+                    next_key + 1,
+                    format!("{node_id}-worker-{worker_idx}-record-b"),
+                ),
             ];
             coord
                 .feed_data(
@@ -99,7 +102,10 @@ async fn run_exchange_round_trip_case(
     actual.sort_by_key(|(key, _)| *key);
     expected.sort_by_key(|(key, _)| *key);
 
-    assert_eq!(actual, expected, "all exchanged records should be preserved");
+    assert_eq!(
+        actual, expected,
+        "all exchanged records should be preserved"
+    );
 }
 
 /// Two-node ExchangeRoundTrip with one worker per node.
@@ -231,15 +237,19 @@ async fn test_staged_fan_out_fan_in() {
     coord.close_all_inputs("df-staged-fan-out-fan-in").await;
     coord.wait_for_completion("df-staged-fan-out-fan-in").await;
 
-    let mut actual: Vec<i64> = collect_all_records(&mut coord, "df-staged-fan-out-fan-in", &worker_counts)
-        .await
-        .into_iter()
-        .map(|(_, item)| item)
-        .collect();
+    let mut actual: Vec<i64> =
+        collect_all_records(&mut coord, "df-staged-fan-out-fan-in", &worker_counts)
+            .await
+            .into_iter()
+            .map(|(_, item)| item)
+            .collect();
     actual.sort();
     expected.sort();
 
-    assert_eq!(actual, expected, "fan-out/fan-in should preserve all transformed values");
+    assert_eq!(
+        actual, expected,
+        "fan-out/fan-in should preserve all transformed values"
+    );
     coord.shutdown().await;
 }
 
@@ -286,11 +296,12 @@ async fn test_auto_parallelism_filter_aggregate() {
     coord.close_all_inputs("df-filter-aggregate").await;
     coord.wait_for_completion("df-filter-aggregate").await;
 
-    let actual_values: Vec<i64> = collect_all_records(&mut coord, "df-filter-aggregate", &worker_counts)
-        .await
-        .into_iter()
-        .map(|(_, item)| item)
-        .collect();
+    let actual_values: Vec<i64> =
+        collect_all_records(&mut coord, "df-filter-aggregate", &worker_counts)
+            .await
+            .into_iter()
+            .map(|(_, item)| item)
+            .collect();
 
     assert!(!actual_values.is_empty(), "aggregate should emit a result");
     assert_eq!(actual_values.iter().sum::<i64>(), expected_sum);
@@ -347,12 +358,8 @@ async fn test_multi_epoch_many_epochs() {
     coord.wait_for_completion("df-multi-epoch-many").await;
 
     let mut actual: BTreeMap<u64, BTreeMap<u64, i64>> = BTreeMap::new();
-    for (ts, (key, value)) in collect_all_records::<(u64, i64)>(
-        &mut coord,
-        "df-multi-epoch-many",
-        &worker_counts,
-    )
-    .await
+    for (ts, (key, value)) in
+        collect_all_records::<(u64, i64)>(&mut coord, "df-multi-epoch-many", &worker_counts).await
     {
         *actual.entry(ts).or_default().entry(key).or_default() += value;
     }
@@ -400,8 +407,8 @@ async fn test_delayed_aggregation() {
     coord.wait_for_completion("df-delayed-aggregation").await;
 
     let mut actual: BTreeMap<u64, i64> = BTreeMap::new();
-    for (ts, value) in collect_all_records::<i64>(&mut coord, "df-delayed-aggregation", &worker_counts)
-        .await
+    for (ts, value) in
+        collect_all_records::<i64>(&mut coord, "df-delayed-aggregation", &worker_counts).await
     {
         *actual.entry(ts).or_default() += value;
     }
@@ -427,7 +434,10 @@ async fn test_frontier_stall_recovery() {
 
     let mut expected: BTreeMap<u64, BTreeMap<u64, i64>> = BTreeMap::new();
     for epoch in 0..4u64 {
-        let batch = vec![(epoch + 1, (epoch as i64 + 1) * 10), (epoch + 10, epoch as i64)];
+        let batch = vec![
+            (epoch + 1, (epoch as i64 + 1) * 10),
+            (epoch + 10, epoch as i64),
+        ];
         coord
             .feed_data(
                 "node-a",
@@ -446,20 +456,22 @@ async fn test_frontier_stall_recovery() {
     }
 
     coord.close_all_inputs("df-frontier-stall-recovery").await;
-    coord.wait_for_completion("df-frontier-stall-recovery").await;
+    coord
+        .wait_for_completion("df-frontier-stall-recovery")
+        .await;
 
     let mut actual: BTreeMap<u64, BTreeMap<u64, i64>> = BTreeMap::new();
-    for (ts, (key, value)) in collect_all_records::<(u64, i64)>(
-        &mut coord,
-        "df-frontier-stall-recovery",
-        &worker_counts,
-    )
-    .await
+    for (ts, (key, value)) in
+        collect_all_records::<(u64, i64)>(&mut coord, "df-frontier-stall-recovery", &worker_counts)
+            .await
     {
         *actual.entry(ts).or_default().entry(key).or_default() += value;
     }
 
-    assert_eq!(actual, expected, "idle nodes should still advance frontiers and complete");
+    assert_eq!(
+        actual, expected,
+        "idle nodes should still advance frontiers and complete"
+    );
     coord.shutdown().await;
 }
 
@@ -477,12 +489,8 @@ async fn test_cancellation_mid_stream() {
         )
         .await;
 
-    let batch_a: Vec<(u64, String)> = (0..100)
-        .map(|i| (i, format!("node-a-{i}")))
-        .collect();
-    let batch_b: Vec<(u64, String)> = (100..200)
-        .map(|i| (i, format!("node-b-{i}")))
-        .collect();
+    let batch_a: Vec<(u64, String)> = (0..100).map(|i| (i, format!("node-a-{i}"))).collect();
+    let batch_b: Vec<(u64, String)> = (100..200).map(|i| (i, format!("node-b-{i}"))).collect();
 
     coord
         .feed_data(
@@ -546,7 +554,10 @@ async fn test_cancellation_iterative() {
         .wait_for_completion_allow_cancel("df-cancellation-iterative")
         .await;
 
-    assert!(!success, "cancelled iterative dataflow should not report success");
+    assert!(
+        !success,
+        "cancelled iterative dataflow should not report success"
+    );
     coord.shutdown().await;
 }
 
@@ -590,13 +601,17 @@ async fn test_branch_merge_correctness() {
     coord.close_all_inputs("df-branch-merge").await;
     coord.wait_for_completion("df-branch-merge").await;
 
-    let actual_values: Vec<i64> = collect_all_records(&mut coord, "df-branch-merge", &worker_counts)
-        .await
-        .into_iter()
-        .map(|(_, item)| item)
-        .collect();
+    let actual_values: Vec<i64> =
+        collect_all_records(&mut coord, "df-branch-merge", &worker_counts)
+            .await
+            .into_iter()
+            .map(|(_, item)| item)
+            .collect();
 
-    assert!(!actual_values.is_empty(), "branch/merge should emit a reduced sum");
+    assert!(
+        !actual_values.is_empty(),
+        "branch/merge should emit a reduced sum"
+    );
     assert_eq!(actual_values.iter().sum::<i64>(), expected_sum);
     coord.shutdown().await;
 }
@@ -636,8 +651,12 @@ async fn test_iterative_exchange_convergence() {
         )
         .await;
 
-    coord.close_all_inputs("df-iterative-exchange-convergence").await;
-    coord.wait_for_completion("df-iterative-exchange-convergence").await;
+    coord
+        .close_all_inputs("df-iterative-exchange-convergence")
+        .await;
+    coord
+        .wait_for_completion("df-iterative-exchange-convergence")
+        .await;
 
     let mut actual: Vec<i64> = collect_all_records(
         &mut coord,
@@ -683,9 +702,7 @@ async fn test_large_batch_exchange() {
     ];
     let mut expected = Vec::new();
     for (node_id, worker_idx, range) in targets {
-        let batch: Vec<(u64, String)> = range
-            .map(|key| (key, format!("value-{key}")))
-            .collect();
+        let batch: Vec<(u64, String)> = range.map(|key| (key, format!("value-{key}"))).collect();
         expected.extend(batch.iter().cloned());
         coord
             .feed_data(
@@ -702,15 +719,12 @@ async fn test_large_batch_exchange() {
     coord.close_all_inputs("df-large-batch-exchange").await;
     coord.wait_for_completion("df-large-batch-exchange").await;
 
-    let mut actual: Vec<(u64, String)> = collect_all_records(
-        &mut coord,
-        "df-large-batch-exchange",
-        &worker_counts,
-    )
-    .await
-    .into_iter()
-    .map(|(_, item)| item)
-    .collect();
+    let mut actual: Vec<(u64, String)> =
+        collect_all_records(&mut coord, "df-large-batch-exchange", &worker_counts)
+            .await
+            .into_iter()
+            .map(|(_, item)| item)
+            .collect();
     actual.sort_by_key(|(key, _)| *key);
     expected.sort_by_key(|(key, _)| *key);
 
@@ -784,17 +798,11 @@ async fn test_many_epochs_word_count() {
         ),
         (
             1u64,
-            BTreeMap::from([
-                (String::from("delta"), 1u64),
-                (String::from("echo"), 3u64),
-            ]),
+            BTreeMap::from([(String::from("delta"), 1u64), (String::from("echo"), 3u64)]),
         ),
         (
             2u64,
-            BTreeMap::from([
-                (String::from("rust"), 2u64),
-                (String::from("tokio"), 2u64),
-            ]),
+            BTreeMap::from([(String::from("rust"), 2u64), (String::from("tokio"), 2u64)]),
         ),
         (
             3u64,
@@ -806,10 +814,7 @@ async fn test_many_epochs_word_count() {
         ),
         (
             4u64,
-            BTreeMap::from([
-                (String::from("final"), 2u64),
-                (String::from("test"), 2u64),
-            ]),
+            BTreeMap::from([(String::from("final"), 2u64), (String::from("test"), 2u64)]),
         ),
     ]);
 

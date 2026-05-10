@@ -26,9 +26,11 @@ fn main() {
             num_workers,
             |builder: &mut DataflowBuilder<u64>| {
                 builder
-                    .input::<i32>("data").unwrap()
+                    .input::<i32>("data")
+                    .unwrap()
                     .broadcast("replicate")
-                    .output("results").unwrap();
+                    .output("results")
+                    .unwrap();
                 Ok(())
             },
             SpawnOptions::default(),

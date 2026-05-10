@@ -40,7 +40,10 @@ fn main() {
     // Fast runtime: spawn a pipeline with external input
     let builder = DataflowBuilder::<u64>::new("fast-double");
     let input = builder.input::<i32>("numbers").unwrap();
-    input.map("double", |_t, x| x * 2).output("results").unwrap();
+    input
+        .map("double", |_t, x| x * 2)
+        .output("results")
+        .unwrap();
     let dataflow = builder.build().expect("build failed");
 
     let mut fast_handle = rt_fast
@@ -64,7 +67,8 @@ fn main() {
     let out = builder
         .source("data", vec![(0u64, vec![1i32, 2, 3]), (1, vec![4, 5, 6])])
         .map("square", |_t, x| x * x)
-        .output("results").unwrap();
+        .output("results")
+        .unwrap();
     let dataflow = builder.build().expect("build failed");
 
     rt_batch
@@ -100,7 +104,8 @@ fn main() {
     let builder = DataflowBuilder::<u64>::new("batch-extra");
     builder
         .source("src", vec![(0u64, vec![100i32])])
-        .output("out").unwrap();
+        .output("out")
+        .unwrap();
     let dataflow = builder.build().expect("build failed");
     rt_batch
         .spawn(dataflow, SpawnOptions::default())

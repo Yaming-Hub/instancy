@@ -6,10 +6,8 @@
 
 #![cfg(feature = "transport")]
 
-use std::collections::HashMap;
-use std::future::Future;
-use std::pin::Pin;
-use std::sync::Arc;
+use std::collections::{HashMap, VecDeque};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use tokio::net::{TcpListener, TcpStream};
@@ -19,7 +17,9 @@ use instancy::DataflowId;
 use instancy::Result;
 use instancy::communication::ClusterSpawnTransport;
 use instancy::communication::shared_pool::SharedConnectionConfig;
-use instancy::communication::shared_transport::{DynConnectionFactory, SharedPeerManager};
+use instancy::communication::shared_transport::{
+    ConnectionFactory, DynConnectionFactory, SharedPeerManager,
+};
 use instancy::{ClusterTopology, NodeConfig};
 use instancy::{RuntimeConfig, RuntimeHandle};
 
@@ -60,6 +60,50 @@ async fn join_with_timeout(cluster: instancy::runtime::ClusterSpawnedDataflow<u6
 // Connection helpers
 // ---------------------------------------------------------------------------
 
+struct PreEstablishedFactory {
+    connections: Mutex<
+        VecDeque<(
+            tokio::net::tcp::OwnedReadHalf,
+            tokio::net::tcp::OwnedWriteHalf,
+        )>,
+    >,
+}
+
+impl PreEstablishedFactory {
+    fn new(
+        connections: Vec<(
+            tokio::net::tcp::OwnedReadHalf,
+            tokio::net::tcp::OwnedWriteHalf,
+        )>,
+    ) -> Self {
+        Self {
+            connections: Mutex::new(connections.into()),
+        }
+    }
+}
+
+impl ConnectionFactory for PreEstablishedFactory {
+    type Reader = tokio::net::tcp::OwnedReadHalf;
+    type Writer = tokio::net::tcp::OwnedWriteHalf;
+
+    async fn establish(
+        &self,
+        _peer_node_id: &str,
+    ) -> std::result::Result<(Self::Reader, Self::Writer), Box<dyn std::error::Error + Send + Sync>>
+    {
+        self.connections
+            .lock()
+            .expect("pre-established factory lock poisoned")
+            .pop_front()
+            .ok_or_else(|| {
+                Box::<dyn std::error::Error + Send + Sync>::from(std::io::Error::new(
+                    std::io::ErrorKind::NotConnected,
+                    "no more pre-established connections",
+                ))
+            })
+    }
+}
+
 /// Creates SharedPeerManagers for a two-node cluster using real TCP connections.
 async fn make_tcp_shared_managers(
     config: SharedConnectionConfig,
@@ -93,9 +137,13 @@ async fn make_tcp_shared_managers(
         conns_b.push((rb, wb));
     }
 
+    let factory_a: Arc<dyn DynConnectionFactory> = Arc::new(PreEstablishedFactory::new(conns_a));
+    let factory_b: Arc<dyn DynConnectionFactory> = Arc::new(PreEstablishedFactory::new(conns_b));
+
     let manager_a =
-        SharedPeerManager::new("node-b".to_string(), config.clone(), conns_a, None, handle).unwrap();
-    let manager_b = SharedPeerManager::new("node-a".to_string(), config, conns_b, None, handle).unwrap();
+        SharedPeerManager::new("node-b".to_string(), config.clone(), factory_a, handle).unwrap();
+    let manager_b =
+        SharedPeerManager::new("node-a".to_string(), config, factory_b, handle).unwrap();
 
     let mut managers_a = HashMap::new();
     managers_a.insert("node-b".to_string(), manager_a);
@@ -128,9 +176,11 @@ async fn shared_two_nodes_no_exchange() {
 
     let build = |builder: &mut DataflowBuilder<u64>| -> Result<()> {
         builder
-            .input::<i32>("data").unwrap()
+            .input::<i32>("data")
+            .unwrap()
             .map("double", |_t, x| x * 2)
-            .output("results").unwrap();
+            .output("results")
+            .unwrap();
         Ok(())
     };
 
@@ -231,7 +281,10 @@ async fn shared_two_nodes_with_exchange() {
     let build = |builder: &mut DataflowBuilder<u64>| -> Result<()> {
         let input = builder.input::<i64>("data").unwrap();
         let exchanged = input.exchange("by_val", |x: &i64| *x as u64);
-        exchanged.map("identity", |_t, x| x).output("results").unwrap();
+        exchanged
+            .map("identity", |_t, x| x)
+            .output("results")
+            .unwrap();
         Ok(())
     };
 
@@ -330,7 +383,8 @@ async fn shared_multiple_dataflows_same_connections() {
         input
             .exchange("route", |x: &u64| *x)
             .map("inc", |_t, x| x + 1)
-            .output("results").unwrap();
+            .output("results")
+            .unwrap();
         Ok(())
     };
 
@@ -467,7 +521,10 @@ async fn shared_dropping_arc_after_spawn_does_not_kill_transport() {
     let build = |builder: &mut DataflowBuilder<u64>| -> Result<()> {
         let input = builder.input::<i64>("data").unwrap();
         let exchanged = input.exchange("by_val", |x: &i64| *x as u64);
-        exchanged.map("identity", |_t, x| x).output("results").unwrap();
+        exchanged
+            .map("identity", |_t, x| x)
+            .output("results")
+            .unwrap();
         Ok(())
     };
 
@@ -570,7 +627,10 @@ async fn shared_join_async_keeps_bridges_alive() {
     let build = |builder: &mut DataflowBuilder<u64>| -> Result<()> {
         let input = builder.input::<u64>("data").unwrap();
         let exchanged = input.exchange("by_val", |x: &u64| *x);
-        exchanged.map("inc", |_t, x| x + 1).output("results").unwrap();
+        exchanged
+            .map("inc", |_t, x| x + 1)
+            .output("results")
+            .unwrap();
         Ok(())
     };
 
@@ -659,43 +719,6 @@ async fn shared_join_async_keeps_bridges_alive() {
 // Reconnect integration tests
 // ===========================================================================
 
-/// TCP-based connection factory that creates new connections to a fixed
-/// listener address. Used to test reconnect after transient network failure.
-struct TcpReconnectFactory {
-    /// Address of the listener that accepts new connections.
-    listener_addr: std::net::SocketAddr,
-}
-
-impl DynConnectionFactory for TcpReconnectFactory {
-    fn establish_dyn<'a>(
-        &'a self,
-        _peer_node_id: &'a str,
-    ) -> Pin<
-        Box<
-            dyn Future<
-                    Output = std::result::Result<
-                        (
-                            Box<dyn tokio::io::AsyncRead + Unpin + Send>,
-                            Box<dyn tokio::io::AsyncWrite + Unpin + Send>,
-                        ),
-                        Box<dyn std::error::Error + Send + Sync>,
-                    >,
-                > + Send
-                + 'a,
-        >,
-    > {
-        Box::pin(async move {
-            let stream = TcpStream::connect(self.listener_addr).await?;
-            stream.set_nodelay(true)?;
-            let (r, w) = stream.into_split();
-            Ok((
-                Box::new(r) as Box<dyn tokio::io::AsyncRead + Unpin + Send>,
-                Box::new(w) as Box<dyn tokio::io::AsyncWrite + Unpin + Send>,
-            ))
-        })
-    }
-}
-
 /// Simulates a transient network interruption at the SharedPeerManager level:
 /// creates a manager with a real TCP connection, kills that connection by
 /// dropping the remote peer side, and verifies the manager reconnects via the
@@ -754,22 +777,45 @@ async fn shared_reconnect_after_transient_network_failure() {
         let _ = tokio::io::copy(&mut r, &mut w).await;
     });
 
-    let stream = TcpStream::connect(echo_addr).await.unwrap();
-    stream.set_nodelay(true).unwrap();
-    let (reader, writer) = stream.into_split();
+    struct InitialThenReconnectFactory {
+        initial_addr: std::net::SocketAddr,
+        reconnect_addr: std::net::SocketAddr,
+        used_initial: std::sync::atomic::AtomicBool,
+    }
 
-    // The reconnect factory connects to the persistent listener (not the
-    // one-shot echo_listener we used for the initial connection).
-    let factory: Arc<dyn DynConnectionFactory> = Arc::new(TcpReconnectFactory { listener_addr });
+    impl ConnectionFactory for InitialThenReconnectFactory {
+        type Reader = tokio::net::tcp::OwnedReadHalf;
+        type Writer = tokio::net::tcp::OwnedWriteHalf;
+
+        async fn establish(
+            &self,
+            _peer_node_id: &str,
+        ) -> std::result::Result<
+            (Self::Reader, Self::Writer),
+            Box<dyn std::error::Error + Send + Sync>,
+        > {
+            let addr = if self
+                .used_initial
+                .swap(true, std::sync::atomic::Ordering::AcqRel)
+            {
+                self.reconnect_addr
+            } else {
+                self.initial_addr
+            };
+            let stream = TcpStream::connect(addr).await?;
+            stream.set_nodelay(true)?;
+            Ok(stream.into_split())
+        }
+    }
+
+    let factory: Arc<dyn DynConnectionFactory> = Arc::new(InitialThenReconnectFactory {
+        initial_addr: echo_addr,
+        reconnect_addr: listener_addr,
+        used_initial: std::sync::atomic::AtomicBool::new(false),
+    });
 
     let rt = tokio::runtime::Handle::current();
-    let manager = SharedPeerManager::new(
-        "echo-peer".to_string(),
-        config,
-        vec![(reader, writer)],
-        Some(factory),
-        &rt,
-    ).unwrap();
+    let manager = SharedPeerManager::new("echo-peer".to_string(), config, factory, &rt).unwrap();
 
     // ---------- register a dataflow and verify initial data flow ----------
     let df_id = DataflowId::new();

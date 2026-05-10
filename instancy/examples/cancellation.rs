@@ -20,7 +20,8 @@ fn main() {
     let builder = DataflowBuilder::<u64>::new("cancellation_demo");
     let _port = builder
         .source("data", vec![(0u64, vec![1, 2, 3, 4, 5])])
-        .output("output").unwrap();
+        .output("output")
+        .unwrap();
     let dataflow = builder.build().expect("build failed");
 
     // Run with a pre-cancelled runtime — should fail immediately

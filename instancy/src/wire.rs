@@ -141,5 +141,3 @@ mod tests {
         assert!(read_array::<4>(&[], 0).is_err());
     }
 }
-
-

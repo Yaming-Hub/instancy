@@ -2124,9 +2124,8 @@ impl RuntimeHandle {
                             continue;
                         }
                         let peer_id = &node.node_id;
-                        let (peer_start, peer_end) = topology
-                            .worker_range(peer_id)
-                            .ok_or_else(|| {
+                        let (peer_start, peer_end) =
+                            topology.worker_range(peer_id).ok_or_else(|| {
                                 Error::InvalidConfig(format!(
                                     "topology missing worker range for node {peer_id:?}"
                                 ))
@@ -2154,9 +2153,8 @@ impl RuntimeHandle {
                         continue;
                     }
                     let peer_id = &node.node_id;
-                    let (peer_start, peer_end) = topology
-                        .worker_range(peer_id)
-                        .ok_or_else(|| {
+                    let (peer_start, peer_end) =
+                        topology.worker_range(peer_id).ok_or_else(|| {
                             Error::InvalidConfig(format!(
                                 "topology missing worker range for node {peer_id:?}"
                             ))
@@ -2229,9 +2227,8 @@ impl RuntimeHandle {
                         if node.node_id == local_node_id {
                             continue;
                         }
-                        let (peer_start, peer_end) = topology
-                            .worker_range(&node.node_id)
-                            .ok_or_else(|| {
+                        let (peer_start, peer_end) =
+                            topology.worker_range(&node.node_id).ok_or_else(|| {
                                 Error::InvalidConfig(format!(
                                     "topology missing worker range for node {:?}",
                                     node.node_id
@@ -2254,9 +2251,8 @@ impl RuntimeHandle {
                     if node.node_id == local_node_id {
                         continue;
                     }
-                    let (peer_start, peer_end) = topology
-                        .worker_range(&node.node_id)
-                        .ok_or_else(|| {
+                    let (peer_start, peer_end) =
+                        topology.worker_range(&node.node_id).ok_or_else(|| {
                             Error::InvalidConfig(format!(
                                 "topology missing worker range for node {:?}",
                                 node.node_id
@@ -2347,13 +2343,11 @@ impl RuntimeHandle {
                     continue;
                 }
                 let peer_id = &node.node_id;
-                let (peer_start, peer_end) = topology
-                    .worker_range(peer_id)
-                    .ok_or_else(|| {
-                        Error::InvalidConfig(format!(
-                            "topology missing worker range for node {peer_id:?}"
-                        ))
-                    })?;
+                let (peer_start, peer_end) = topology.worker_range(peer_id).ok_or_else(|| {
+                    Error::InvalidConfig(format!(
+                        "topology missing worker range for node {peer_id:?}"
+                    ))
+                })?;
                 let mut extracted = std::collections::HashMap::new();
                 if let Some(peer_map) = receivers.get_mut(peer_id) {
                     for src in peer_start..peer_end {
@@ -2441,14 +2435,12 @@ impl RuntimeHandle {
             .iter()
             .filter(|n| n.node_id != local_node_id)
             .map(|n| {
-                let (s, e) = topology
-                    .worker_range(&n.node_id)
-                    .ok_or_else(|| {
-                        Error::InvalidConfig(format!(
-                            "topology missing worker range for node {:?}",
-                            n.node_id
-                        ))
-                    })?;
+                let (s, e) = topology.worker_range(&n.node_id).ok_or_else(|| {
+                    Error::InvalidConfig(format!(
+                        "topology missing worker range for node {:?}",
+                        n.node_id
+                    ))
+                })?;
                 Ok((n.node_id.clone(), s, e))
             })
             .collect::<Result<_>>()?;
@@ -4121,10 +4113,7 @@ impl<T: Timestamp> ClusterSpawnedDataflow<T> {
     pub fn name(&self) -> &str {
         // SAFETY: inner is always Some until join() consumes it via take(),
         // and join(mut self) takes ownership preventing further access.
-        self.inner
-            .as_ref()
-            .expect("dataflow already joined")
-            .name()
+        self.inner.as_ref().expect("dataflow already joined").name()
     }
 
     /// Number of LOCAL workers on this node.
@@ -4794,7 +4783,8 @@ mod tests {
         let port = builder
             .source("nums", vec![(0u64, vec![1i32, 2, 3])])
             .map("double", |_t, x| x * 2)
-            .output("results").unwrap();
+            .output("results")
+            .unwrap();
         let dataflow = builder.build().unwrap();
 
         SimpleRuntime::new().run(dataflow).unwrap();
@@ -4870,7 +4860,8 @@ mod tests {
         builder
             .source("nums", vec![(0u64, vec![1i32, 2, 3])])
             .map("double", |_t, x| x * 2)
-            .output("results").unwrap();
+            .output("results")
+            .unwrap();
         let dataflow = builder.build().unwrap();
 
         let mut handle = rt.spawn(dataflow, SpawnOptions::default()).unwrap();
@@ -4892,7 +4883,10 @@ mod tests {
 
         let builder = DataflowBuilder::<u64>::new("rt_spawn");
         let input = builder.input::<i32>("data").unwrap();
-        input.map("double", |_t, x| x * 2).output("results").unwrap();
+        input
+            .map("double", |_t, x| x * 2)
+            .output("results")
+            .unwrap();
         let dataflow = builder.build().unwrap();
 
         let mut handle = rt.spawn(dataflow, SpawnOptions::default()).unwrap();
@@ -4939,7 +4933,10 @@ mod tests {
 
         for i in 0..3 {
             let builder = DataflowBuilder::<u64>::new(format!("df_{i}"));
-            builder.source("data", vec![(0u64, vec![i])]).output("out").unwrap();
+            builder
+                .source("data", vec![(0u64, vec![i])])
+                .output("out")
+                .unwrap();
             let dataflow = builder.build().unwrap();
             rt.spawn(dataflow, SpawnOptions::default())
                 .unwrap()
@@ -5031,7 +5028,8 @@ mod tests {
         let builder = DataflowBuilder::<u64>::new("await_test");
         builder
             .source("nums", vec![(0u64, vec![1i32, 2, 3])])
-            .output("out").unwrap();
+            .output("out")
+            .unwrap();
         let dataflow = builder.build().unwrap();
 
         // Exercise the async completion path: .await on DataflowCompletion
@@ -5423,7 +5421,10 @@ mod tests {
         let mut multi = rt
             .spawn_multi("all-out", n, |builder: &mut DataflowBuilder<u64>| {
                 let input = builder.input::<i32>("nums").unwrap();
-                input.map("double", |_t, x| x * 2).output("results").unwrap();
+                input
+                    .map("double", |_t, x| x * 2)
+                    .output("results")
+                    .unwrap();
                 Ok(())
             })
             .unwrap();
@@ -5522,7 +5523,8 @@ mod tests {
                 let input = builder.input::<String>("words").unwrap();
                 input
                     .map("upper", |_t, s: String| s.to_uppercase())
-                    .output("results").unwrap();
+                    .output("results")
+                    .unwrap();
                 Ok(())
             })
             .unwrap();
@@ -5599,7 +5601,8 @@ mod tests {
                     // Use exchange_by_hash for direct u64 routing (no extra hashing).
                     input
                         .exchange_by_hash("mod2", |x: &i32| *x as u64)
-                        .output("results").unwrap();
+                        .output("results")
+                        .unwrap();
                     Ok(())
                 },
                 SpawnOptions::default(),
@@ -5660,7 +5663,10 @@ mod tests {
                 1,
                 |builder| {
                     let input = builder.input::<i32>("data").unwrap();
-                    input.exchange("by_key", |x: &i32| *x as u64).output("out").unwrap();
+                    input
+                        .exchange("by_key", |x: &i32| *x as u64)
+                        .output("out")
+                        .unwrap();
                     Ok(())
                 },
                 SpawnOptions::default(),
@@ -5698,7 +5704,8 @@ mod tests {
                         .map("double", |_t, x| x * 2)
                         .exchange_by_hash("mod2", |x: &i32| *x as u64)
                         .map("add100", |_t, x| x + 100)
-                        .output("results").unwrap();
+                        .output("results")
+                        .unwrap();
                     Ok(())
                 },
                 SpawnOptions::default(),
@@ -5753,7 +5760,8 @@ mod tests {
                     let input = builder.input::<i32>("data").unwrap();
                     input
                         .exchange_by_hash("mod2", |x: &i32| *x as u64)
-                        .output("out").unwrap();
+                        .output("out")
+                        .unwrap();
                     Ok(())
                 },
                 SpawnOptions::default(),
@@ -5845,7 +5853,8 @@ mod tests {
                                 Ok(())
                             }
                         })
-                        .output("results").unwrap();
+                        .output("results")
+                        .unwrap();
                     Ok(())
                 },
                 SpawnOptions::default(),
@@ -5907,7 +5916,8 @@ mod tests {
                                 Ok(())
                             }
                         })
-                        .output("results").unwrap();
+                        .output("results")
+                        .unwrap();
                     Ok(())
                 },
                 SpawnOptions::default(),
@@ -5980,7 +5990,8 @@ mod tests {
                                 Ok(())
                             }
                         })
-                        .output("results").unwrap();
+                        .output("results")
+                        .unwrap();
                     Ok(())
                 },
                 SpawnOptions::default(),
@@ -6045,7 +6056,8 @@ mod tests {
                                 Ok(())
                             }
                         })
-                        .output("results").unwrap();
+                        .output("results")
+                        .unwrap();
                     Ok(())
                 },
                 SpawnOptions::default(),
@@ -6113,7 +6125,8 @@ mod tests {
                                 Ok(())
                             }
                         })
-                        .output("results").unwrap();
+                        .output("results")
+                        .unwrap();
                     Ok(())
                 },
                 SpawnOptions::default(),
@@ -6266,7 +6279,8 @@ mod tests {
                     let input = builder.input::<NonSerializable>("data").unwrap();
                     input
                         .exchange_by_hash("by_val", |x: &NonSerializable| x.value as u64)
-                        .output("out").unwrap();
+                        .output("out")
+                        .unwrap();
                     Ok(())
                 },
                 SpawnOptions::default(),
@@ -6321,7 +6335,8 @@ mod tests {
                     let input = builder.input::<NonSerializable>("data").unwrap();
                     input
                         .exchange_by_hash("route", |x: &NonSerializable| x.value as u64)
-                        .output("out").unwrap();
+                        .output("out")
+                        .unwrap();
                     Ok(())
                 },
                 SpawnOptions::default(),
@@ -6385,7 +6400,8 @@ mod tests {
                             x
                         })
                         .filter("positive", |_t, x| x.value > 0)
-                        .output("out").unwrap();
+                        .output("out")
+                        .unwrap();
                     Ok(())
                 },
                 SpawnOptions::default(),
@@ -6484,7 +6500,8 @@ mod tests {
         let input = builder.input::<i32>("data").unwrap();
         let _out = input
             .map("multiply", move |_t, x| x * cfg.multiplier)
-            .output("result").unwrap();
+            .output("result")
+            .unwrap();
 
         let dataflow = builder.build().unwrap();
         let mut handle = rt.spawn(dataflow, SpawnOptions::default()).unwrap();
@@ -6520,7 +6537,8 @@ mod tests {
                     let input = builder.input::<i32>("data").unwrap();
                     input
                         .map("multiply", move |_t, x| x * cfg.multiplier)
-                        .output("result").unwrap();
+                        .output("result")
+                        .unwrap();
                     Ok(())
                 },
                 SpawnOptions::default(),
@@ -6630,7 +6648,8 @@ mod tests {
                         }
                         x + 1
                     })
-                    .output("out").unwrap();
+                    .output("out")
+                    .unwrap();
                 Ok(())
             })
             .unwrap();
@@ -7050,9 +7069,11 @@ mod tests {
             |builder| {
                 builder
                     .source("src", vec![(0u64, vec![1i32, 2, 3])])
-                    .exchange_by_hash_to("ex", 2, |x: &i32| *x as u64).unwrap()
+                    .exchange_by_hash_to("ex", 2, |x: &i32| *x as u64)
+                    .unwrap()
                     .map("noop", |_t, x| x)
-                    .output("out").unwrap();
+                    .output("out")
+                    .unwrap();
                 Ok(())
             },
             SpawnOptions::new().per_stage_parallelism(false),
@@ -7084,9 +7105,11 @@ mod tests {
             |builder| {
                 builder
                     .source("src", vec![(0u64, vec![1i32, 2, 3])])
-                    .exchange_by_hash_to("ex", 4, |x: &i32| *x as u64).unwrap()
+                    .exchange_by_hash_to("ex", 4, |x: &i32| *x as u64)
+                    .unwrap()
                     .map("noop", |_t, x| x)
-                    .output("out").unwrap();
+                    .output("out")
+                    .unwrap();
                 Ok(())
             },
             SpawnOptions::new()
@@ -7125,9 +7148,11 @@ mod tests {
             |builder| {
                 builder
                     .source("src", vec![(0u64, vec![1i32, 2, 3])])
-                    .exchange_by_hash_to("ex", 4, |x: &i32| *x as u64).unwrap()
+                    .exchange_by_hash_to("ex", 4, |x: &i32| *x as u64)
+                    .unwrap()
                     .map("noop", |_t, x| x)
-                    .output("out").unwrap();
+                    .output("out")
+                    .unwrap();
                 Ok(())
             },
             SpawnOptions::new()
@@ -7344,7 +7369,8 @@ mod tests {
 
         let _output = input
             .unary_async("double_async", 4, logic)
-            .output("results").unwrap();
+            .output("results")
+            .unwrap();
         let df = builder.build().unwrap();
         let mut handle = rt.spawn(df, SpawnOptions::default()).unwrap();
 
@@ -7397,7 +7423,10 @@ mod tests {
         });
 
         // max_concurrency = 2
-        let _output = input.unary_async("limited", 2, logic).output("out").unwrap();
+        let _output = input
+            .unary_async("limited", 2, logic)
+            .output("out")
+            .unwrap();
         let df = builder.build().unwrap();
         let mut handle = rt.spawn(df, SpawnOptions::default()).unwrap();
 
@@ -7432,7 +7461,8 @@ mod tests {
 
         let _output = input
             .unary_async::<i32, _, _>("failing", 4, logic)
-            .output("out").unwrap();
+            .output("out")
+            .unwrap();
         let df = builder.build().unwrap();
         let mut handle = rt.spawn(df, SpawnOptions::default()).unwrap();
 
@@ -7465,7 +7495,8 @@ mod tests {
 
         let _output = input
             .unary_async::<i32, _, _>("panicking", 4, logic)
-            .output("out").unwrap();
+            .output("out")
+            .unwrap();
         let df = builder.build().unwrap();
         let mut handle = rt.spawn(df, SpawnOptions::default()).unwrap();
 

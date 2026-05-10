@@ -227,7 +227,10 @@ async fn iterate_with_downstream_operators() {
         }
     });
     // Post-loop: negate all results
-    after_loop.map("negate", |_t, x: i64| -x).output("results").unwrap();
+    after_loop
+        .map("negate", |_t, x: i64| -x)
+        .output("results")
+        .unwrap();
     let logical = builder.build().unwrap();
 
     let mut spawned = rt.spawn(logical, SpawnOptions::default()).unwrap();

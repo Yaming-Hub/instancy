@@ -9,12 +9,56 @@
 //!
 //! Run with: `cargo run --all-features --example cluster_shared_transport`
 
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use instancy::communication::shared_pool::SharedConnectionConfig;
-use instancy::communication::shared_transport::SharedPeerManager;
+use instancy::communication::shared_transport::{
+    ConnectionFactory, DynConnectionFactory, SharedPeerManager,
+};
 use instancy::communication::transport::Frame;
 use instancy::dataflow::id::DataflowId;
+
+#[derive(Default)]
+struct EchoConnectionFactory {
+    remote_tasks: Mutex<Vec<tokio::task::JoinHandle<()>>>,
+}
+
+impl ConnectionFactory for EchoConnectionFactory {
+    type Reader = tokio::io::ReadHalf<tokio::io::DuplexStream>;
+    type Writer = tokio::io::WriteHalf<tokio::io::DuplexStream>;
+
+    async fn establish(
+        &self,
+        _peer_node_id: &str,
+    ) -> Result<(Self::Reader, Self::Writer), Box<dyn std::error::Error + Send + Sync>> {
+        let (manager_stream, remote_stream) = tokio::io::duplex(256 * 1024);
+        let (manager_read, manager_write) = tokio::io::split(manager_stream);
+        let (mut remote_read, mut remote_write) = tokio::io::split(remote_stream);
+        let handle = tokio::spawn(async move {
+            let mut buf = vec![0u8; 64 * 1024];
+            loop {
+                match tokio::io::AsyncReadExt::read(&mut remote_read, &mut buf).await {
+                    Ok(0) => break,
+                    Ok(n) => {
+                        if tokio::io::AsyncWriteExt::write_all(&mut remote_write, &buf[..n])
+                            .await
+                            .is_err()
+                        {
+                            break;
+                        }
+                    }
+                    Err(_) => break,
+                }
+            }
+        });
+        self.remote_tasks
+            .lock()
+            .expect("echo factory task lock poisoned")
+            .push(handle);
+        Ok((manager_read, manager_write))
+    }
+}
 
 #[tokio::main]
 async fn main() {
@@ -36,43 +80,15 @@ async fn main() {
         idle_timeout: None,
     };
 
-    // Create 2 pooled connections between node-a and node-b (loopback via echo)
-    let mut connections = Vec::new();
-    let mut echo_handles = Vec::new();
-
-    for i in 0..2 {
-        let (s1, s2) = tokio::io::duplex(256 * 1024);
-        let (r1, w1) = tokio::io::split(s1);
-        let (r2, w2) = tokio::io::split(s2);
-        // Manager uses (r2, w2): reads from r2, writes to w2
-        // Echo forwards: reads from r1, writes to w1
-        connections.push((r2, w2));
-        echo_handles.push(tokio::spawn(async move {
-            let mut buf = vec![0u8; 64 * 1024];
-            let (mut reader, mut writer) = (r1, w1);
-            loop {
-                match tokio::io::AsyncReadExt::read(&mut reader, &mut buf).await {
-                    Ok(0) => break,
-                    Ok(n) => {
-                        if tokio::io::AsyncWriteExt::write_all(&mut writer, &buf[..n])
-                            .await
-                            .is_err()
-                        {
-                            break;
-                        }
-                    }
-                    Err(_) => break,
-                }
-            }
-            println!("  [echo-{i}] connection closed");
-        }));
-    }
+    let factory = Arc::new(EchoConnectionFactory::default());
+    let connection_factory: Arc<dyn DynConnectionFactory> = factory.clone();
 
     // Create shared peer manager for node-a → node-b
-    let manager = SharedPeerManager::new("node-b".to_string(), config, connections, None, &handle).unwrap();
+    let manager =
+        SharedPeerManager::new("node-b".to_string(), config, connection_factory, &handle).unwrap();
 
     println!(
-        "Created SharedPeerManager with {} connections to node-b\n",
+        "Created SharedPeerManager with {} eager connections to node-b\n",
         manager.connection_count()
     );
 
@@ -221,8 +237,10 @@ async fn main() {
     manager.unregister_dataflow(&dataflow_1).await;
     manager.unregister_dataflow(&dataflow_2).await;
     drop(manager);
-    for h in echo_handles {
-        h.abort();
+    if let Ok(handles) = factory.remote_tasks.lock() {
+        for handle in handles.iter() {
+            handle.abort();
+        }
     }
 
     println!("\n=== done ===");

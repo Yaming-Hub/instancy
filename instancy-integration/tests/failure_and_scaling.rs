@@ -135,7 +135,10 @@ async fn test_node_crash_before_data() {
         .expect("tolerant completion wait should return even if a node is gone");
     // PassThrough has no exchange, so node-a should complete successfully
     // regardless of node-b being killed.
-    assert!(result, "surviving node should complete a no-exchange dataflow");
+    assert!(
+        result,
+        "surviving node should complete a no-exchange dataflow"
+    );
 
     coord.shutdown().await;
 }
@@ -181,7 +184,10 @@ async fn test_cancellation_then_new_dataflow() {
     let first_success = coord
         .wait_for_completion_allow_cancel("df-cancel-first")
         .await;
-    assert!(!first_success, "cancelled dataflow should not report success");
+    assert!(
+        !first_success,
+        "cancelled dataflow should not report success"
+    );
 
     let worker_counts = coord
         .setup_and_spawn_dataflow(
@@ -218,12 +224,8 @@ async fn test_cancellation_then_new_dataflow() {
     coord.wait_for_completion("df-after-cancel").await;
 
     let mut actual: BTreeMap<String, u64> = BTreeMap::new();
-    for (_, (word, count)) in collect_all_records::<(String, u64)>(
-        &mut coord,
-        "df-after-cancel",
-        &worker_counts,
-    )
-    .await
+    for (_, (word, count)) in
+        collect_all_records::<(String, u64)>(&mut coord, "df-after-cancel", &worker_counts).await
     {
         *actual.entry(word).or_default() += count;
     }
@@ -272,15 +274,12 @@ async fn test_sequential_different_types() {
     coord.close_all_inputs("df-seq-pass").await;
     coord.wait_for_completion("df-seq-pass").await;
 
-    let mut pass_actual: Vec<Vec<u8>> = collect_all_records::<Vec<u8>>(
-        &mut coord,
-        "df-seq-pass",
-        &pass_workers,
-    )
-    .await
-    .into_iter()
-    .map(|(_, item)| item)
-    .collect();
+    let mut pass_actual: Vec<Vec<u8>> =
+        collect_all_records::<Vec<u8>>(&mut coord, "df-seq-pass", &pass_workers)
+            .await
+            .into_iter()
+            .map(|(_, item)| item)
+            .collect();
     pass_actual.sort();
     let mut pass_expected = vec![b"alpha".to_vec(), b"beta".to_vec(), b"gamma".to_vec()];
     pass_expected.sort();
@@ -318,15 +317,12 @@ async fn test_sequential_different_types() {
     coord.close_all_inputs("df-seq-exchange").await;
     coord.wait_for_completion("df-seq-exchange").await;
 
-    let mut exchange_actual: Vec<(u64, String)> = collect_all_records(
-        &mut coord,
-        "df-seq-exchange",
-        &exchange_workers,
-    )
-    .await
-    .into_iter()
-    .map(|(_, item)| item)
-    .collect();
+    let mut exchange_actual: Vec<(u64, String)> =
+        collect_all_records(&mut coord, "df-seq-exchange", &exchange_workers)
+            .await
+            .into_iter()
+            .map(|(_, item)| item)
+            .collect();
     exchange_actual.sort_by_key(|(key, _)| *key);
     let mut exchange_expected = exchange_a;
     exchange_expected.extend(exchange_b);
@@ -365,14 +361,15 @@ async fn test_sequential_different_types() {
     coord.wait_for_completion("df-seq-multi-epoch").await;
 
     let mut multi_epoch_actual: BTreeMap<u64, BTreeMap<u64, i64>> = BTreeMap::new();
-    for (ts, (key, value)) in collect_all_records::<(u64, i64)>(
-        &mut coord,
-        "df-seq-multi-epoch",
-        &multi_epoch_workers,
-    )
-    .await
+    for (ts, (key, value)) in
+        collect_all_records::<(u64, i64)>(&mut coord, "df-seq-multi-epoch", &multi_epoch_workers)
+            .await
     {
-        *multi_epoch_actual.entry(ts).or_default().entry(key).or_default() += value;
+        *multi_epoch_actual
+            .entry(ts)
+            .or_default()
+            .entry(key)
+            .or_default() += value;
     }
     let multi_epoch_expected = BTreeMap::from([
         (0u64, BTreeMap::from([(1u64, 15i64), (2u64, 20i64)])),
@@ -417,7 +414,10 @@ async fn test_sequential_different_types() {
         .into_iter()
         .map(|(_, item)| item)
         .collect();
-    assert!(!filter_actual.is_empty(), "filter aggregate should emit a result");
+    assert!(
+        !filter_actual.is_empty(),
+        "filter aggregate should emit a result"
+    );
     assert_eq!(filter_actual.iter().sum::<i64>(), 43);
 
     coord.shutdown().await;
@@ -583,12 +583,8 @@ async fn test_empty_epoch_handling() {
     coord.wait_for_completion("df-empty-epochs").await;
 
     let mut actual: BTreeMap<u64, BTreeMap<u64, i64>> = BTreeMap::new();
-    for (ts, (key, value)) in collect_all_records::<(u64, i64)>(
-        &mut coord,
-        "df-empty-epochs",
-        &worker_counts,
-    )
-    .await
+    for (ts, (key, value)) in
+        collect_all_records::<(u64, i64)>(&mut coord, "df-empty-epochs", &worker_counts).await
     {
         *actual.entry(ts).or_default().entry(key).or_default() += value;
     }
@@ -611,11 +607,7 @@ async fn test_single_node_cluster() {
     let topology = make_topology(&["node-a"], 1);
 
     let worker_counts = coord
-        .setup_and_spawn_dataflow(
-            "df-single-node",
-            &topology,
-            DataflowType::ExchangeRoundTrip,
-        )
+        .setup_and_spawn_dataflow("df-single-node", &topology, DataflowType::ExchangeRoundTrip)
         .await;
 
     let input_data = vec![
@@ -637,15 +629,12 @@ async fn test_single_node_cluster() {
     coord.close_all_inputs("df-single-node").await;
     coord.wait_for_completion("df-single-node").await;
 
-    let mut actual: Vec<(u64, String)> = collect_all_records(
-        &mut coord,
-        "df-single-node",
-        &worker_counts,
-    )
-    .await
-    .into_iter()
-    .map(|(_, item)| item)
-    .collect();
+    let mut actual: Vec<(u64, String)> =
+        collect_all_records(&mut coord, "df-single-node", &worker_counts)
+            .await
+            .into_iter()
+            .map(|(_, item)| item)
+            .collect();
     actual.sort_by_key(|(key, _)| *key);
 
     let mut expected = input_data;

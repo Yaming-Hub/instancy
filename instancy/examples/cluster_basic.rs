@@ -41,9 +41,11 @@ fn make_duplex_pair(
 
 fn build_dataflow(builder: &mut DataflowBuilder<u64>) -> Result<()> {
     builder
-        .input::<i32>("data").unwrap()
+        .input::<i32>("data")
+        .unwrap()
         .map("double", |_t, x| x * 2)
-        .output("results").unwrap();
+        .output("results")
+        .unwrap();
     Ok(())
 }
 

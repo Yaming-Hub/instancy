@@ -462,7 +462,9 @@ impl<T: Timestamp> ProgressTracker<T> {
     /// Returns the list of operator indices whose frontiers changed.
     pub fn propagate(&mut self) -> Result<&[usize], crate::Error> {
         if !self.initialized {
-            return Err(crate::Error::InvalidConfig("must call initialize() first".into()));
+            return Err(crate::Error::InvalidConfig(
+                "must call initialize() first".into(),
+            ));
         }
 
         // 1. Collect local capability changes from operators.

@@ -165,9 +165,11 @@ async fn tcp_two_nodes_no_exchange() {
 
     let build = |builder: &mut DataflowBuilder<u64>| -> Result<()> {
         builder
-            .input::<i32>("data").unwrap()
+            .input::<i32>("data")
+            .unwrap()
             .map("double", |_t, x| x * 2)
-            .output("results").unwrap();
+            .output("results")
+            .unwrap();
         Ok(())
     };
 
@@ -241,7 +243,10 @@ async fn tcp_two_nodes_with_exchange() {
     let build = |builder: &mut DataflowBuilder<u64>| -> Result<()> {
         let input = builder.input::<i64>("data").unwrap();
         let exchanged = input.exchange("by_val", |x: &i64| *x as u64);
-        exchanged.map("identity", |_t, x| x).output("results").unwrap();
+        exchanged
+            .map("identity", |_t, x| x)
+            .output("results")
+            .unwrap();
         Ok(())
     };
 
@@ -620,9 +625,11 @@ async fn stress_tcp_repeated_creation() {
 
         let build = |builder: &mut DataflowBuilder<u64>| -> Result<()> {
             builder
-                .input::<i32>("data").unwrap()
+                .input::<i32>("data")
+                .unwrap()
                 .map("double", |_t, x| x * 2)
-                .output("results").unwrap();
+                .output("results")
+                .unwrap();
             Ok(())
         };
 

@@ -54,7 +54,10 @@ fn delay_batch_shifts_timestamps() {
     let rt = RuntimeHandle::new(RuntimeConfig::default()).unwrap();
     let builder = DataflowBuilder::<u64>::new("delay_shift");
     let input = builder.input::<i64>("data").unwrap();
-    input.delay_batch("shift10", |t| t + 10).output("out").unwrap();
+    input
+        .delay_batch("shift10", |t| t + 10)
+        .output("out")
+        .unwrap();
     let dataflow = builder.build().unwrap();
 
     let mut handle = rt.spawn(dataflow, SpawnOptions::new()).unwrap();
@@ -96,7 +99,8 @@ fn delay_batch_windowing() {
     let input = builder.input::<i64>("data").unwrap();
     input
         .delay_batch("window10", |t| (t / 10 + 1) * 10)
-        .output("out").unwrap();
+        .output("out")
+        .unwrap();
     let dataflow = builder.build().unwrap();
 
     let mut handle = rt.spawn(dataflow, SpawnOptions::new()).unwrap();
@@ -162,7 +166,8 @@ fn delay_per_item_routes_by_content() {
     let input = builder.input::<i64>("data").unwrap();
     input
         .delay("by_value", |t, item| if *item > 100 { *t + 10 } else { *t })
-        .output("out").unwrap();
+        .output("out")
+        .unwrap();
     let dataflow = builder.build().unwrap();
 
     let mut handle = rt.spawn(dataflow, SpawnOptions::new()).unwrap();
@@ -199,7 +204,8 @@ fn delay_followed_by_reduce() {
     input
         .delay_batch("merge", |_t| 0u64)
         .reduce("sum", |a, b| a + b)
-        .output("out").unwrap();
+        .output("out")
+        .unwrap();
     let dataflow = builder.build().unwrap();
 
     let mut handle = rt.spawn(dataflow, SpawnOptions::new()).unwrap();
@@ -226,7 +232,10 @@ fn delay_batch_multiple_inputs_same_target() {
     let rt = RuntimeHandle::new(RuntimeConfig::default()).unwrap();
     let builder = DataflowBuilder::<u64>::new("delay_merge_ts");
     let input = builder.input::<i64>("data").unwrap();
-    input.delay_batch("merge", |_t| 100u64).output("out").unwrap();
+    input
+        .delay_batch("merge", |_t| 100u64)
+        .output("out")
+        .unwrap();
     let dataflow = builder.build().unwrap();
 
     let mut handle = rt.spawn(dataflow, SpawnOptions::new()).unwrap();

@@ -45,7 +45,8 @@ fn main() {
                 r.sensor_id, r.value
             )
         })
-        .output("alerts").unwrap();
+        .output("alerts")
+        .unwrap();
 
     let dataflow = builder.build().expect("build failed");
     println!(

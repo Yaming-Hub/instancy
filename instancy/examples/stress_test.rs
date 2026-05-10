@@ -629,7 +629,8 @@ fn run_q1(
                 Ok(())
             }
         })
-        .output("results").unwrap();
+        .output("results")
+        .unwrap();
 
     let dataflow = builder.build()?;
     let mut handle = runtime.spawn(dataflow, SpawnOptions::new().collect_metrics(true))?;
@@ -689,7 +690,8 @@ fn run_q3(
             let threshold = context.q3_threshold;
             move |_t, value| *value > threshold
         })
-        .output("results").unwrap();
+        .output("results")
+        .unwrap();
 
     let dataflow = builder.build()?;
     let mut handle = runtime.spawn(dataflow, SpawnOptions::new().collect_metrics(true))?;
@@ -718,10 +720,12 @@ fn run_q4(
         JOIN_WORKERS,
         |builder| {
             let left = builder
-                .input::<(u64, i64)>("left").unwrap()
+                .input::<(u64, i64)>("left")
+                .unwrap()
                 .exchange_by_hash("left_exchange", |(order_key, _)| *order_key);
             let right = builder
-                .input::<u64>("right").unwrap()
+                .input::<u64>("right")
+                .unwrap()
                 .exchange_by_hash("right_exchange", |order_key| *order_key);
 
             left.binary::<u64, (u64, i64), _>(right, "join", {
@@ -779,7 +783,8 @@ fn run_q4(
                     Ok(())
                 }
             })
-            .output("results").unwrap();
+            .output("results")
+            .unwrap();
             Ok(())
         },
         SpawnOptions::new().collect_metrics(true),
@@ -856,7 +861,8 @@ fn run_q5(
                 Ok(())
             }
         })
-        .output("results").unwrap();
+        .output("results")
+        .unwrap();
 
     let dataflow = builder.build()?;
     let mut handle = runtime.spawn(dataflow, SpawnOptions::new().collect_metrics(true))?;

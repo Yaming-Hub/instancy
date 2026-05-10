@@ -35,7 +35,10 @@ fn concurrent_spawn_four_dataflows() {
     for i in 0..4u32 {
         let builder = DataflowBuilder::<u64>::new(format!("df_{i}"));
         let input = builder.input::<i32>("data").unwrap();
-        input.map("triple", |_t, x| x * 3).output("results").unwrap();
+        input
+            .map("triple", |_t, x| x * 3)
+            .output("results")
+            .unwrap();
         let dataflow = builder.build().unwrap();
 
         let mut handle = rt.spawn(dataflow, SpawnOptions::default()).unwrap();
@@ -99,7 +102,8 @@ fn eight_dataflows_on_two_threads_no_starvation() {
         builder
             .source("src", data)
             .map("inc", |_t, x| x + 1)
-            .output("out").unwrap();
+            .output("out")
+            .unwrap();
         let dataflow = builder.build().unwrap();
         handles.push(rt.spawn(dataflow, SpawnOptions::default()).unwrap().join());
     }
@@ -155,7 +159,8 @@ fn mixed_workload_fairness() {
         let builder = DataflowBuilder::<u64>::new(format!("light_{i}"));
         builder
             .source("src", vec![(0u64, vec![1i32, 2, 3])])
-            .output("out").unwrap();
+            .output("out")
+            .unwrap();
         let dataflow = builder.build().unwrap();
         light_completions.push(rt.spawn(dataflow, SpawnOptions::default()).unwrap().join());
     }
@@ -326,7 +331,8 @@ fn stress_spawn_twenty_dataflows() {
         builder
             .source("src", vec![(0u64, vec![i])])
             .map("double", |_t, x| x * 2)
-            .output("out").unwrap();
+            .output("out")
+            .unwrap();
         let dataflow = builder.build().unwrap();
         completions.push(rt.spawn(dataflow, SpawnOptions::default()).unwrap().join());
     }
@@ -431,7 +437,8 @@ fn operator_panic_propagates_error() {
     good_builder
         .source("src", vec![(0u64, vec![1i32, 2, 3])])
         .map("double", |_t, x| x * 2)
-        .output("out").unwrap();
+        .output("out")
+        .unwrap();
     let good_df = good_builder.build().unwrap();
     let good_completion = rt.spawn(good_df, SpawnOptions::default()).unwrap().join();
 
@@ -442,7 +449,8 @@ fn operator_panic_propagates_error() {
         .map("boom", |_t, _x: i32| -> i32 {
             panic!("intentional test panic")
         })
-        .output("out").unwrap();
+        .output("out")
+        .unwrap();
     let bad_df = bad_builder.build().unwrap();
     let bad_completion = rt.spawn(bad_df, SpawnOptions::default()).unwrap().join();
 

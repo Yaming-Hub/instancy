@@ -31,7 +31,8 @@ fn main() {
     input
         .map("double", |_t, x| x * 2)
         .filter("div_by_3", |_t, x| x % 3 == 0)
-        .output("results").unwrap();
+        .output("results")
+        .unwrap();
 
     let dataflow = builder.build().expect("build failed");
     println!(
