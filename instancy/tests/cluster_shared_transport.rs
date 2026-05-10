@@ -719,36 +719,83 @@ async fn shared_join_async_keeps_bridges_alive() {
 // Reconnect integration tests
 // ===========================================================================
 
-/// Simulates a transient network interruption at the SharedPeerManager level:
-/// creates a manager with a real TCP connection, kills that connection by
-/// dropping the remote peer side, and verifies the manager reconnects via the
-/// factory and that data continues flowing on the new connection.
+/// Simulates a transient network interruption at the SharedPeerManager level
+/// using in-memory duplex streams (no TCP). Kills the initial connection by
+/// aborting the echo task, then verifies the manager reconnects via the factory
+/// and data flows on the new connection.
 ///
-/// This is a lower-level test than `shared_two_nodes_exchange` — it directly
-/// exercises the reconnect path without a full cluster.
+/// Uses a polling loop instead of a fixed sleep to detect reconnect completion,
+/// making this test both fast and deterministic.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn shared_reconnect_after_transient_network_failure() {
     use instancy::communication::transport::Frame;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt, DuplexStream, ReadHalf, WriteHalf};
 
-    // ---------- set up a persistent TCP listener for reconnect ----------
-    // The listener runs an echo server: it accepts connections and copies
-    // all received bytes back to the sender. This works with the frame-based
-    // protocol because the reader_task will parse echoed bytes as frames.
-    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let listener_addr = listener.local_addr().unwrap();
+    fn make_echo_connection() -> (
+        ReadHalf<DuplexStream>,
+        WriteHalf<DuplexStream>,
+        tokio::task::JoinHandle<()>,
+    ) {
+        let (manager_stream, remote_stream) = tokio::io::duplex(65536);
+        let (manager_read, manager_write) = tokio::io::split(manager_stream);
+        let (mut remote_read, mut remote_write) = tokio::io::split(remote_stream);
+        let handle = tokio::spawn(async move {
+            let mut buf = vec![0u8; 64 * 1024];
+            loop {
+                match remote_read.read(&mut buf).await {
+                    Ok(0) => break,
+                    Ok(n) => {
+                        if remote_write.write_all(&buf[..n]).await.is_err() {
+                            break;
+                        }
+                    }
+                    Err(_) => break,
+                }
+            }
+        });
+        (manager_read, manager_write, handle)
+    }
 
-    let echo_task = tokio::spawn(async move {
-        loop {
-            let Ok((stream, _)) = listener.accept().await else {
-                break;
-            };
-            stream.set_nodelay(true).ok();
-            tokio::spawn(async move {
-                let (mut reader, mut writer) = stream.into_split();
-                let _ = tokio::io::copy(&mut reader, &mut writer).await;
-            });
+    /// Factory that produces duplex echo connections. The first connection's
+    /// echo task handle is captured so the test can abort it to simulate failure.
+    struct ReconnectEchoFactory {
+        first_echo_task: std::sync::Mutex<Option<tokio::task::JoinHandle<()>>>,
+    }
+
+    impl ReconnectEchoFactory {
+        fn new() -> Self {
+            Self {
+                first_echo_task: std::sync::Mutex::new(None),
+            }
         }
-    });
+
+        fn abort_first_connection(&self) {
+            if let Some(handle) = self.first_echo_task.lock().unwrap().take() {
+                handle.abort();
+            }
+        }
+    }
+
+    impl ConnectionFactory for ReconnectEchoFactory {
+        type Reader = ReadHalf<DuplexStream>;
+        type Writer = WriteHalf<DuplexStream>;
+
+        async fn establish(
+            &self,
+            _peer_node_id: &str,
+        ) -> std::result::Result<
+            (Self::Reader, Self::Writer),
+            Box<dyn std::error::Error + Send + Sync>,
+        > {
+            let (reader, writer, echo_task) = make_echo_connection();
+            let mut guard = self.first_echo_task.lock().unwrap();
+            if guard.is_none() {
+                *guard = Some(echo_task);
+            }
+            // Subsequent echo tasks run independently (dropped handles are fine)
+            Ok((reader, writer))
+        }
+    }
 
     let config = SharedConnectionConfig {
         min_connections: 1,
@@ -762,60 +809,11 @@ async fn shared_reconnect_after_transient_network_failure() {
         idle_timeout: None,
     };
 
-    // ---------- create initial TCP connection to the echo server ----------
-    // We keep the remote side (echo_remote) so we can kill it to simulate
-    // a network failure.
-    let echo_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let echo_addr = echo_listener.local_addr().unwrap();
-
-    // Spawn a task that accepts and echoes on the first connection only.
-    // We'll hold the remote handle so we can abort it later.
-    let echo_remote = tokio::spawn(async move {
-        let (stream, _) = echo_listener.accept().await.unwrap();
-        stream.set_nodelay(true).unwrap();
-        let (mut r, mut w) = stream.into_split();
-        let _ = tokio::io::copy(&mut r, &mut w).await;
-    });
-
-    struct InitialThenReconnectFactory {
-        initial_addr: std::net::SocketAddr,
-        reconnect_addr: std::net::SocketAddr,
-        used_initial: std::sync::atomic::AtomicBool,
-    }
-
-    impl ConnectionFactory for InitialThenReconnectFactory {
-        type Reader = tokio::net::tcp::OwnedReadHalf;
-        type Writer = tokio::net::tcp::OwnedWriteHalf;
-
-        async fn establish(
-            &self,
-            _peer_node_id: &str,
-        ) -> std::result::Result<
-            (Self::Reader, Self::Writer),
-            Box<dyn std::error::Error + Send + Sync>,
-        > {
-            let addr = if self
-                .used_initial
-                .swap(true, std::sync::atomic::Ordering::AcqRel)
-            {
-                self.reconnect_addr
-            } else {
-                self.initial_addr
-            };
-            let stream = TcpStream::connect(addr).await?;
-            stream.set_nodelay(true)?;
-            Ok(stream.into_split())
-        }
-    }
-
-    let factory: Arc<dyn DynConnectionFactory> = Arc::new(InitialThenReconnectFactory {
-        initial_addr: echo_addr,
-        reconnect_addr: listener_addr,
-        used_initial: std::sync::atomic::AtomicBool::new(false),
-    });
+    let factory = Arc::new(ReconnectEchoFactory::new());
+    let dyn_factory: Arc<dyn DynConnectionFactory> = factory.clone();
 
     let rt = tokio::runtime::Handle::current();
-    let manager = SharedPeerManager::new("echo-peer".to_string(), config, factory, &rt).unwrap();
+    let manager = SharedPeerManager::new("echo-peer".to_string(), config, dyn_factory, &rt).unwrap();
 
     // ---------- register a dataflow and verify initial data flow ----------
     let df_id = DataflowId::new();
@@ -841,23 +839,24 @@ async fn shared_reconnect_after_transient_network_failure() {
     assert_eq!(payload, b"before-interrupt".to_vec());
 
     // ---------- simulate transient network failure ----------
-    // Abort the echo remote task — this closes the remote side of the TCP
-    // connection, causing the manager's reader_task to detect EOF and report
-    // the connection as failed.
-    echo_remote.abort();
+    // Abort the echo task — this closes the remote side of the duplex,
+    // causing the manager's reader_task to detect EOF and report failure.
+    factory.abort_first_connection();
 
     // ---------- wait for reconnect to complete ----------
-    // The failure detection → connection_monitor → scaling_event_handler →
-    // reconnect path takes a small amount of time. We wait to ensure:
-    //   1. The dead connection is detected and marked dead
-    //   2. The scaling_event_handler establishes a new connection via factory
-    //   3. New reader/writer tasks are spawned and ready
-    //
-    // Without this wait, frames sent immediately after abort might be routed
-    // to the dying connection (still momentarily "alive" in the pool), which
-    // consumes a sequence number but never echoes back — creating an
-    // irrecoverable gap in the reorder buffer.
-    tokio::time::sleep(Duration::from_secs(2)).await;
+    // Poll until live_connection_count recovers to >= 1 (much faster than
+    // a fixed 2s sleep). The failure → monitor → scaling handler → factory
+    // reconnect pipeline typically completes in <100ms with in-memory streams.
+    let reconnect_deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        if manager.live_connection_count() >= 1 {
+            break;
+        }
+        if tokio::time::Instant::now() >= reconnect_deadline {
+            panic!("reconnect did not complete within 5s");
+        }
+    }
 
     // ---------- verify data flows on the reconnected connection ----------
     let frame2 = Frame {
@@ -878,6 +877,5 @@ async fn shared_reconnect_after_transient_network_failure() {
     assert_eq!(payload, b"after-reconnect".to_vec());
 
     // ---------- cleanup ----------
-    echo_task.abort();
     drop(manager);
 }

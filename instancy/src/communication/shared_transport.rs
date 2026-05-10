@@ -638,6 +638,11 @@ impl SharedPeerManager {
         self.pool.connection_count()
     }
 
+    /// Get current live (non-dead) connection count.
+    pub fn live_connection_count(&self) -> usize {
+        self.pool.live_connection_count()
+    }
+
     /// Establish a replacement or additional connection and spawn its tasks.
     #[allow(clippy::too_many_arguments)]
     async fn reconnect_connection(
