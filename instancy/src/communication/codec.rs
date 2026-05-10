@@ -55,13 +55,14 @@
 
 use std::fmt;
 use std::marker::PhantomData;
+use std::sync::Arc;
 
 /// Maximum allowed message size (256 MB). Prevents allocation-based DoS from
 /// malicious or corrupted length prefixes.
 pub const MAX_MESSAGE_SIZE: usize = 256 * 1024 * 1024;
 
 /// Errors that can occur during encoding or decoding.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub enum CodecError {
     /// Not enough bytes available to decode a value.
     InsufficientData {
@@ -89,7 +90,9 @@ pub enum CodecError {
         max: usize,
     },
     /// An error from an external codec library (e.g., bincode, protobuf).
-    External(Box<dyn std::error::Error + Send + Sync>),
+    ///
+    /// Wrapped in `Arc` to preserve `Clone` on `CodecError`.
+    External(Arc<dyn std::error::Error + Send + Sync>),
 }
 
 impl fmt::Display for CodecError {
@@ -161,8 +164,9 @@ impl PartialEq for CodecError {
                     max: m2,
                 },
             ) => s1 == s2 && m1 == m2,
-            // External errors are compared by Display string (best effort).
-            (Self::External(a), Self::External(b)) => a.to_string() == b.to_string(),
+            // External errors wrap trait objects — equality is not meaningful.
+            // Two External values are equal only if they point to the same Arc.
+            (Self::External(a), Self::External(b)) => Arc::ptr_eq(a, b),
             _ => false,
         }
     }
@@ -299,7 +303,7 @@ where
 {
     fn encode(&self, value: &T, buf: &mut Vec<u8>) -> Result<(), CodecError> {
         let payload = bincode::serialize(value)
-            .map_err(|e| CodecError::External(e.into()))?;
+            .map_err(|e| CodecError::External(Arc::from(e as Box<dyn std::error::Error + Send + Sync>)))?;
         encode_length_prefix(payload.len(), buf)?;
         buf.extend_from_slice(&payload);
         Ok(())
@@ -315,7 +319,7 @@ where
             });
         }
         let value = bincode::deserialize(&buf[4..total])
-            .map_err(|e| CodecError::External(e.into()))?;
+            .map_err(|e| CodecError::External(Arc::from(e as Box<dyn std::error::Error + Send + Sync>)))?;
         Ok((value, total))
     }
 }
