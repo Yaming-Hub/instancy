@@ -84,6 +84,11 @@ pub enum CancellationReason {
     /// A peer node in the cluster was reported as down by the hosting
     /// application via [`crate::RuntimeHandle::report_node_leave()`].
     PeerDown { node_id: String },
+
+    /// An internal runtime error (e.g., poisoned lock on shared state)
+    /// caused the dataflow to be cancelled. The runtime has notified the
+    /// hosting application via the health event channel.
+    InternalError { detail: String },
 }
 
 impl fmt::Display for CancellationReason {
@@ -96,6 +101,7 @@ impl fmt::Display for CancellationReason {
             Self::HandleDropped => write!(f, "handle dropped"),
             Self::OperatorError { detail } => write!(f, "operator error: {detail}"),
             Self::PeerDown { node_id } => write!(f, "peer node down: {node_id}"),
+            Self::InternalError { detail } => write!(f, "internal error: {detail}"),
         }
     }
 }

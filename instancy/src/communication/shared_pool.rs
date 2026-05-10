@@ -435,21 +435,18 @@ impl PeerPool {
     /// Atomically increments `pending_writes` on the selected connection.
     /// The caller must call `dequeue()` after the frame has been written,
     /// or `rollback_reservation()` if the send could not be completed.
-    pub fn select_and_reserve(&self) -> Option<Arc<ConnectionMetrics>> {
+    pub fn select_and_reserve(&self) -> crate::Result<Option<Arc<ConnectionMetrics>>> {
         let live: Vec<_> = match self.connections.read().or_poison("peer pool connections") {
             Ok(connections) => connections
                 .values()
                 .filter(|c| c.is_alive())
                 .cloned()
                 .collect(),
-            Err(_) => {
-                // TODO: propagate poisoned pool locks once these accessors can return Result.
-                return None;
-            }
+            Err(e) => return Err(e),
         };
 
         if live.is_empty() {
-            return None;
+            return Ok(None);
         }
 
         let total_pending: usize = live.iter().map(|c| c.pending_writes()).sum();
@@ -472,7 +469,7 @@ impl PeerPool {
         };
 
         conn.enqueue(); // Atomic reservation
-        Some(conn)
+        Ok(Some(conn))
     }
 
     /// Select the least-loaded live connection without reserving.
@@ -480,118 +477,76 @@ impl PeerPool {
     /// Use [`Self::select_and_reserve`] for production send paths to avoid
     /// concurrent senders all choosing the same connection.
     /// This method is useful for read-only inspection or diagnostics.
-    pub fn select_connection(&self) -> Option<Arc<ConnectionMetrics>> {
-        let connections = match self.connections.read().or_poison("peer pool connections") {
-            Ok(connections) => connections,
-            Err(_) => {
-                // TODO: propagate poisoned pool locks once these accessors can return Result.
-                return None;
-            }
-        };
-        connections
+    pub fn select_connection(&self) -> crate::Result<Option<Arc<ConnectionMetrics>>> {
+        let connections = self.connections.read().or_poison("peer pool connections")?;
+        Ok(connections
             .values()
             .filter(|c| c.is_alive())
             .min_by_key(|c| c.load_score())
-            .cloned()
+            .cloned())
     }
 
     /// Select a live connection with the lowest load, excluding specified IDs.
     pub fn select_connection_excluding(
         &self,
         exclude: &HashSet<usize>,
-    ) -> Option<Arc<ConnectionMetrics>> {
-        let connections = match self.connections.read().or_poison("peer pool connections") {
-            Ok(connections) => connections,
-            Err(_) => {
-                // TODO: propagate poisoned pool locks once these accessors can return Result.
-                return None;
-            }
-        };
-        connections
+    ) -> crate::Result<Option<Arc<ConnectionMetrics>>> {
+        let connections = self.connections.read().or_poison("peer pool connections")?;
+        Ok(connections
             .values()
             .filter(|c| c.is_alive() && !exclude.contains(&c.id))
             .min_by_key(|c| c.load_score())
-            .cloned()
+            .cloned())
     }
 
     /// Count of live (non-dead) connections.
-    pub fn live_connection_count(&self) -> usize {
-        let connections = match self.connections.read().or_poison("peer pool connections") {
-            Ok(connections) => connections,
-            Err(_) => {
-                // TODO: propagate poisoned pool locks once these accessors can return Result.
-                return 0;
-            }
-        };
-        connections.values().filter(|c| c.is_alive()).count()
+    pub fn live_connection_count(&self) -> crate::Result<usize> {
+        let connections = self.connections.read().or_poison("peer pool connections")?;
+        Ok(connections.values().filter(|c| c.is_alive()).count())
     }
 
     /// Get metrics for a specific connection by ID.
-    pub fn connection(&self, id: usize) -> Option<Arc<ConnectionMetrics>> {
-        let connections = match self.connections.read().or_poison("peer pool connections") {
-            Ok(connections) => connections,
-            Err(_) => {
-                // TODO: propagate poisoned pool locks once these accessors can return Result.
-                return None;
-            }
-        };
-        connections.get(&id).cloned()
+    pub fn connection(&self, id: usize) -> crate::Result<Option<Arc<ConnectionMetrics>>> {
+        let connections = self.connections.read().or_poison("peer pool connections")?;
+        Ok(connections.get(&id).cloned())
     }
 
     /// Current number of tracked connections.
-    pub fn connection_count(&self) -> usize {
-        let connections = match self.connections.read().or_poison("peer pool connections") {
-            Ok(connections) => connections,
-            Err(_) => {
-                // TODO: propagate poisoned pool locks once these accessors can return Result.
-                return 0;
-            }
-        };
-        connections.len()
+    pub fn connection_count(&self) -> crate::Result<usize> {
+        let connections = self.connections.read().or_poison("peer pool connections")?;
+        Ok(connections.len())
     }
 
     /// Add a new connection to the pool. Returns its metrics handle,
     /// or `None` if already at `max_connections` live connections.
-    pub fn add_connection(&self) -> Option<Arc<ConnectionMetrics>> {
-        let mut connections = match self.connections.write().or_poison("peer pool connections") {
-            Ok(connections) => connections,
-            Err(_) => {
-                // TODO: propagate poisoned pool locks once these accessors can return Result.
-                return None;
-            }
-        };
+    pub fn add_connection(&self) -> crate::Result<Option<Arc<ConnectionMetrics>>> {
+        let mut connections = self.connections.write().or_poison("peer pool connections")?;
         let live_count = connections.values().filter(|c| c.is_alive()).count();
         if live_count >= self.config.max_connections {
-            return None;
+            return Ok(None);
         }
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
         let metrics = Arc::new(ConnectionMetrics::new(id, self.config.rtt_ema_alpha));
         connections.insert(id, metrics.clone());
-        Some(metrics)
+        Ok(Some(metrics))
     }
 
     /// Remove a connection from the pool by ID.
     ///
     /// Returns true if removed, false if ID not found or removing it would put
     /// the live connection count below `min_connections`.
-    pub fn remove_connection(&self, id: usize) -> bool {
-        let mut connections = match self.connections.write().or_poison("peer pool connections") {
-            Ok(connections) => connections,
-            Err(_) => {
-                // TODO: propagate poisoned pool locks once these accessors can return Result.
-                return false;
-            }
-        };
+    pub fn remove_connection(&self, id: usize) -> crate::Result<bool> {
+        let mut connections = self.connections.write().or_poison("peer pool connections")?;
         let Some(metrics) = connections.get(&id) else {
-            return false;
+            return Ok(false);
         };
         if metrics.is_alive()
             && connections.values().filter(|conn| conn.is_alive()).count()
                 <= self.config.min_connections
         {
-            return false;
+            return Ok(false);
         }
-        connections.remove(&id).is_some()
+        Ok(connections.remove(&id).is_some())
     }
 
     /// Evaluate whether scaling is needed based on current RTT and idle state.
@@ -601,7 +556,7 @@ impl PeerPool {
     /// Connections without any RTT measurement are excluded from RTT-based
     /// scaling decisions. Idle connections (no write activity for longer than
     /// `idle_timeout`) are candidates for removal regardless of RTT.
-    pub async fn evaluate_scaling(&self) -> ScalingDecision {
+    pub async fn evaluate_scaling(&self) -> crate::Result<ScalingDecision> {
         let threshold_up = self.config.rtt_scale_up_threshold;
         let threshold_down = self.config.rtt_scale_down_threshold;
         let live: Vec<_> = match self.connections.read().or_poison("peer pool connections") {
@@ -610,10 +565,7 @@ impl PeerPool {
                 .filter(|c| c.is_alive())
                 .cloned()
                 .collect(),
-            Err(_) => {
-                // TODO: propagate poisoned pool locks once evaluate_scaling can return Result.
-                return ScalingDecision::None;
-            }
+            Err(e) => return Err(e),
         };
         let live_count = live.len();
 
@@ -625,7 +577,7 @@ impl PeerPool {
         if any_overloaded && live_count < self.config.max_connections {
             // Reset cooldown since we're scaling up
             *self.cooldown_start.lock().await = None;
-            return ScalingDecision::ScaleUp;
+            return Ok(ScalingDecision::ScaleUp);
         }
 
         // Check for idle live connections (no traffic for idle_timeout).
@@ -640,9 +592,9 @@ impl PeerPool {
                     .max_by_key(|(_, d)| *d);
 
                 if let Some((conn_id, _)) = longest_idle {
-                    return ScalingDecision::ScaleDown {
+                    return Ok(ScalingDecision::ScaleDown {
                         connection_id: conn_id,
-                    };
+                    });
                 }
             }
         }
@@ -651,7 +603,7 @@ impl PeerPool {
         let all_measured = live.iter().all(|c| c.average_rtt().is_some());
 
         if !all_measured {
-            return ScalingDecision::None;
+            return Ok(ScalingDecision::None);
         }
 
         let all_underloaded = live.iter().all(|c| {
@@ -667,7 +619,7 @@ impl PeerPool {
                 None => {
                     // Start cooldown timer
                     *cooldown = Some(tokio::time::Instant::now());
-                    ScalingDecision::None
+                    Ok(ScalingDecision::None)
                 }
                 Some(start) => {
                     if start.elapsed() >= self.config.cooldown_period {
@@ -678,30 +630,24 @@ impl PeerPool {
                             .max_by_key(|c| c.rtt.average_nanos())
                             .map(|c| c.id)
                             .unwrap_or(0);
-                        ScalingDecision::ScaleDown {
+                        Ok(ScalingDecision::ScaleDown {
                             connection_id: worst,
-                        }
+                        })
                     } else {
-                        ScalingDecision::None
+                        Ok(ScalingDecision::None)
                     }
                 }
             }
         } else {
             // Not all underloaded — reset cooldown
             *self.cooldown_start.lock().await = None;
-            ScalingDecision::None
+            Ok(ScalingDecision::None)
         }
     }
 
     /// Get a snapshot of all connection metrics for diagnostics.
-    pub fn metrics_snapshot(&self) -> Vec<ConnectionSnapshot> {
-        let connections = match self.connections.read().or_poison("peer pool connections") {
-            Ok(connections) => connections,
-            Err(_) => {
-                // TODO: propagate poisoned pool locks once these accessors can return Result.
-                return Vec::new();
-            }
-        };
+    pub fn metrics_snapshot(&self) -> crate::Result<Vec<ConnectionSnapshot>> {
+        let connections = self.connections.read().or_poison("peer pool connections")?;
         let mut snaps: Vec<_> = connections
             .values()
             .map(|c| ConnectionSnapshot {
@@ -714,7 +660,7 @@ impl PeerPool {
             })
             .collect();
         snaps.sort_by_key(|s| s.id);
-        snaps
+        Ok(snaps)
     }
 }
 
@@ -733,6 +679,23 @@ pub struct ConnectionSnapshot {
     pub total_frames: u64,
     /// Duration since the last write activity (None if never used).
     pub idle_duration: Option<Duration>,
+}
+
+impl PeerPool {
+    /// Poison the pool's connections RwLock for testing.
+    ///
+    /// Spawns a thread that acquires a write guard and panics, leaving
+    /// the lock permanently poisoned. Subsequent calls to `select_connection`
+    /// etc. will return `Err(LockPoisoned)`.
+    #[cfg(test)]
+    pub(crate) fn poison_for_test(self: &Arc<Self>) {
+        let pool = Arc::clone(self);
+        let _ = std::thread::spawn(move || {
+            let _guard = pool.connections.write().unwrap();
+            panic!("intentional poison for test");
+        })
+        .join();
+    }
 }
 
 // ─── Tests ───────────────────────────────────────────────────────────────────
@@ -806,14 +769,14 @@ mod tests {
         let pool = PeerPool::new(3, config).unwrap();
 
         // Connection 0: 3 pending
-        pool.connection(0).unwrap().enqueue();
-        pool.connection(0).unwrap().enqueue();
-        pool.connection(0).unwrap().enqueue();
+        pool.connection(0).unwrap().unwrap().enqueue();
+        pool.connection(0).unwrap().unwrap().enqueue();
+        pool.connection(0).unwrap().unwrap().enqueue();
         // Connection 1: 1 pending
-        pool.connection(1).unwrap().enqueue();
+        pool.connection(1).unwrap().unwrap().enqueue();
         // Connection 2: 0 pending
 
-        let selected = pool.select_connection().unwrap();
+        let selected = pool.select_connection().unwrap().unwrap();
         assert_eq!(selected.id, 2); // least loaded
     }
 
@@ -828,13 +791,13 @@ mod tests {
 
         // Both have 0 pending, but different RTT
         pool.connection(0)
-            .unwrap()
+            .unwrap().unwrap()
             .record_rtt(Duration::from_millis(5));
         pool.connection(1)
-            .unwrap()
+            .unwrap().unwrap()
             .record_rtt(Duration::from_millis(2));
 
-        let selected = pool.select_connection().unwrap();
+        let selected = pool.select_connection().unwrap().unwrap();
         assert_eq!(selected.id, 1); // lower RTT
     }
 
@@ -849,13 +812,13 @@ mod tests {
         let pool = PeerPool::new(1, config).unwrap();
 
         // No RTT yet — no scaling
-        assert_eq!(pool.evaluate_scaling().await, ScalingDecision::None);
+        assert_eq!(pool.evaluate_scaling().await.unwrap(), ScalingDecision::None);
 
         // Record high RTT
         pool.connection(0)
-            .unwrap()
+            .unwrap().unwrap()
             .record_rtt(Duration::from_millis(10));
-        assert_eq!(pool.evaluate_scaling().await, ScalingDecision::ScaleUp);
+        assert_eq!(pool.evaluate_scaling().await.unwrap(), ScalingDecision::ScaleUp);
     }
 
     #[tokio::test]
@@ -869,10 +832,10 @@ mod tests {
         let pool = PeerPool::new(2, config).unwrap();
 
         pool.connection(0)
-            .unwrap()
+            .unwrap().unwrap()
             .record_rtt(Duration::from_millis(10));
         // Already at max — no scale up
-        assert_eq!(pool.evaluate_scaling().await, ScalingDecision::None);
+        assert_eq!(pool.evaluate_scaling().await.unwrap(), ScalingDecision::None);
     }
 
     #[tokio::test]
@@ -888,20 +851,20 @@ mod tests {
 
         // Both connections have low RTT
         pool.connection(0)
-            .unwrap()
+            .unwrap().unwrap()
             .record_rtt(Duration::from_millis(1));
         pool.connection(1)
-            .unwrap()
+            .unwrap().unwrap()
             .record_rtt(Duration::from_millis(2));
 
         // First evaluation starts cooldown
-        assert_eq!(pool.evaluate_scaling().await, ScalingDecision::None);
+        assert_eq!(pool.evaluate_scaling().await.unwrap(), ScalingDecision::None);
 
         // Wait for cooldown
         tokio::time::sleep(Duration::from_millis(15)).await;
 
         // Now should scale down (remove highest-RTT connection)
-        let decision = pool.evaluate_scaling().await;
+        let decision = pool.evaluate_scaling().await.unwrap();
         assert_eq!(decision, ScalingDecision::ScaleDown { connection_id: 1 });
     }
 
@@ -916,12 +879,12 @@ mod tests {
         };
         let pool = PeerPool::new(1, config).unwrap();
         pool.connection(0)
-            .unwrap()
+            .unwrap().unwrap()
             .record_rtt(Duration::from_millis(1));
 
         tokio::time::sleep(Duration::from_millis(5)).await;
         // Already at min — no scale down
-        assert_eq!(pool.evaluate_scaling().await, ScalingDecision::None);
+        assert_eq!(pool.evaluate_scaling().await.unwrap(), ScalingDecision::None);
     }
 
     #[tokio::test]
@@ -938,7 +901,7 @@ mod tests {
 
         tokio::time::sleep(Duration::from_millis(5)).await;
         // No measurements — don't make scaling decisions
-        assert_eq!(pool.evaluate_scaling().await, ScalingDecision::None);
+        assert_eq!(pool.evaluate_scaling().await.unwrap(), ScalingDecision::None);
     }
 
     #[test]
@@ -949,21 +912,21 @@ mod tests {
             ..Default::default()
         };
         let pool = PeerPool::new(1, config).unwrap();
-        assert_eq!(pool.connection_count(), 1);
+        assert_eq!(pool.connection_count().unwrap(), 1);
 
-        let new_conn = pool.add_connection().unwrap();
+        let new_conn = pool.add_connection().unwrap().unwrap();
         assert_eq!(new_conn.id, 1);
-        assert_eq!(pool.connection_count(), 2);
+        assert_eq!(pool.connection_count().unwrap(), 2);
 
         // Remove connection 1
-        assert!(pool.remove_connection(1));
-        assert_eq!(pool.connection_count(), 1);
+        assert!(pool.remove_connection(1).unwrap());
+        assert_eq!(pool.connection_count().unwrap(), 1);
 
         // Can't go below min
-        assert!(!pool.remove_connection(0));
+        assert!(!pool.remove_connection(0).unwrap());
 
         // Add another — gets unique ID (2, not reusing 1)
-        let another = pool.add_connection().unwrap();
+        let another = pool.add_connection().unwrap().unwrap();
         assert_eq!(another.id, 2);
     }
 
@@ -975,10 +938,10 @@ mod tests {
             ..Default::default()
         };
         let pool = PeerPool::new(2, config).unwrap();
-        assert_eq!(pool.connection_count(), 2);
+        assert_eq!(pool.connection_count().unwrap(), 2);
 
         // Already at max — returns None
-        assert!(pool.add_connection().is_none());
+        assert!(pool.add_connection().unwrap().is_none());
     }
 
     #[test]
@@ -991,11 +954,11 @@ mod tests {
         let pool = PeerPool::new(2, config).unwrap();
 
         // Connection 0: load up
-        pool.connection(0).unwrap().enqueue();
-        pool.connection(0).unwrap().enqueue();
+        pool.connection(0).unwrap().unwrap().enqueue();
+        pool.connection(0).unwrap().unwrap().enqueue();
 
         // select_and_reserve picks conn 1 (less loaded) AND increments its pending
-        let selected = pool.select_and_reserve().unwrap();
+        let selected = pool.select_and_reserve().unwrap().unwrap();
         assert_eq!(selected.id, 1);
         assert_eq!(selected.pending_writes(), 1); // was 0, now 1 from reservation
     }
@@ -1011,22 +974,22 @@ mod tests {
 
         // All connections idle (total_pending=0 < 3 connections) → low-load packing.
         // First select should pick ONE connection and keep using it.
-        let first = pool.select_and_reserve().unwrap();
+        let first = pool.select_and_reserve().unwrap().unwrap();
         let first_id = first.id;
         // Now total_pending=1 < 3 → still low-load → pack onto same connection
-        let second = pool.select_and_reserve().unwrap();
+        let second = pool.select_and_reserve().unwrap().unwrap();
         assert_eq!(
             second.id, first_id,
             "low-load packing should reuse same connection"
         );
         // Now total_pending=2 < 3 → still low-load
-        let third = pool.select_and_reserve().unwrap();
+        let third = pool.select_and_reserve().unwrap().unwrap();
         assert_eq!(
             third.id, first_id,
             "low-load packing should still reuse same connection"
         );
         // Now total_pending=3 >= 3 → high-load → spreads to least-loaded
-        let fourth = pool.select_and_reserve().unwrap();
+        let fourth = pool.select_and_reserve().unwrap().unwrap();
         assert_ne!(
             fourth.id, first_id,
             "high-load should spread to a different connection"
@@ -1043,12 +1006,12 @@ mod tests {
         let pool = PeerPool::new(3, config).unwrap();
 
         // Remove middle connection (id=1)
-        pool.remove_connection(1);
+        pool.remove_connection(1).unwrap();
 
         // Connection 0 and 2 still accessible by their original IDs
-        assert!(pool.connection(0).is_some());
-        assert!(pool.connection(1).is_none()); // removed
-        assert!(pool.connection(2).is_some());
+        assert!(pool.connection(0).unwrap().is_some());
+        assert!(pool.connection(1).unwrap().is_none()); // removed
+        assert!(pool.connection(2).unwrap().is_some());
     }
 
     #[test]
@@ -1056,14 +1019,14 @@ mod tests {
         let config = SharedConnectionConfig::default();
         let pool = PeerPool::new(2, config).unwrap();
 
-        pool.connection(0).unwrap().enqueue();
+        pool.connection(0).unwrap().unwrap().enqueue();
         pool.connection(0)
-            .unwrap()
+            .unwrap().unwrap()
             .record_rtt(Duration::from_millis(3));
-        pool.connection(1).unwrap().enqueue();
-        pool.connection(1).unwrap().enqueue();
+        pool.connection(1).unwrap().unwrap().enqueue();
+        pool.connection(1).unwrap().unwrap().enqueue();
 
-        let snap = pool.metrics_snapshot();
+        let snap = pool.metrics_snapshot().unwrap();
         assert_eq!(snap.len(), 2);
         assert_eq!(snap[0].pending_writes, 1);
         assert_eq!(snap[0].avg_rtt, Some(Duration::from_millis(3)));
@@ -1103,13 +1066,13 @@ mod tests {
         let pool = PeerPool::new(2, config).unwrap();
 
         // Both connections are freshly created — not yet idle
-        assert_eq!(pool.evaluate_scaling().await, ScalingDecision::None);
+        assert_eq!(pool.evaluate_scaling().await.unwrap(), ScalingDecision::None);
 
         // Wait for the idle timeout to elapse
         tokio::time::sleep(Duration::from_millis(15)).await;
 
         // Now one connection should be identified as idle and removed
-        let decision = pool.evaluate_scaling().await;
+        let decision = pool.evaluate_scaling().await.unwrap();
         assert!(
             matches!(decision, ScalingDecision::ScaleDown { .. }),
             "expected ScaleDown for idle connection, got {decision:?}"
@@ -1128,10 +1091,10 @@ mod tests {
 
         // Wait a bit but keep one connection active
         tokio::time::sleep(Duration::from_millis(25)).await;
-        pool.connection(0).unwrap().dequeue(100, true); // refreshes last_activity
+        pool.connection(0).unwrap().unwrap().dequeue(100, true); // refreshes last_activity
 
         // Connection 0 is active, connection 1 is idle
-        let decision = pool.evaluate_scaling().await;
+        let decision = pool.evaluate_scaling().await.unwrap();
         assert_eq!(
             decision,
             ScalingDecision::ScaleDown { connection_id: 1 },
@@ -1152,7 +1115,7 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(15)).await;
 
         // At min_connections — should not scale down even if idle
-        assert_eq!(pool.evaluate_scaling().await, ScalingDecision::None);
+        assert_eq!(pool.evaluate_scaling().await.unwrap(), ScalingDecision::None);
     }
 
     #[tokio::test]
@@ -1168,7 +1131,7 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(15)).await;
 
         // idle_timeout is None — no idle scale-down
-        assert_eq!(pool.evaluate_scaling().await, ScalingDecision::None);
+        assert_eq!(pool.evaluate_scaling().await.unwrap(), ScalingDecision::None);
     }
 
     #[test]
@@ -1181,12 +1144,12 @@ mod tests {
         let pool = PeerPool::new(3, config).unwrap();
 
         // Mark connection 0 as dead
-        pool.connection(0).unwrap().mark_dead();
+        pool.connection(0).unwrap().unwrap().mark_dead();
 
         // select_connection should skip dead connections
-        let selected = pool.select_connection().unwrap();
+        let selected = pool.select_connection().unwrap().unwrap();
         assert_ne!(selected.id, 0, "dead connection should be skipped");
-        assert_eq!(pool.live_connection_count(), 2);
+        assert_eq!(pool.live_connection_count().unwrap(), 2);
     }
 
     #[test]
@@ -1194,7 +1157,7 @@ mod tests {
         let config = SharedConnectionConfig::default();
         let pool = PeerPool::new(1, config).unwrap();
 
-        let conn = pool.connection(0).unwrap();
+        let conn = pool.connection(0).unwrap().unwrap();
         assert!(conn.is_alive());
 
         // First mark_dead returns true
@@ -1210,12 +1173,12 @@ mod tests {
         let config = SharedConnectionConfig::default();
         let pool = PeerPool::new(2, config).unwrap();
 
-        pool.connection(0).unwrap().mark_dead();
-        pool.connection(1).unwrap().mark_dead();
+        pool.connection(0).unwrap().unwrap().mark_dead();
+        pool.connection(1).unwrap().unwrap().mark_dead();
 
-        assert!(pool.select_and_reserve().is_none());
-        assert!(pool.select_connection().is_none());
-        assert_eq!(pool.live_connection_count(), 0);
+        assert!(pool.select_and_reserve().unwrap().is_none());
+        assert!(pool.select_connection().unwrap().is_none());
+        assert_eq!(pool.live_connection_count().unwrap(), 0);
     }
 
     #[test]
@@ -1223,7 +1186,7 @@ mod tests {
         let config = SharedConnectionConfig::default();
         let pool = PeerPool::new(1, config).unwrap();
 
-        let conn = pool.connection(0).unwrap();
+        let conn = pool.connection(0).unwrap().unwrap();
         conn.enqueue();
         conn.enqueue();
         assert_eq!(conn.pending_writes(), 2);
@@ -1246,12 +1209,12 @@ mod tests {
         exclude.insert(0);
         exclude.insert(1);
 
-        let selected = pool.select_connection_excluding(&exclude).unwrap();
+        let selected = pool.select_connection_excluding(&exclude).unwrap().unwrap();
         assert_eq!(selected.id, 2, "should only select non-excluded connection");
 
         exclude.insert(2);
         assert!(
-            pool.select_connection_excluding(&exclude).is_none(),
+            pool.select_connection_excluding(&exclude).unwrap().is_none(),
             "all excluded should return None"
         );
     }

@@ -92,7 +92,7 @@ impl DataflowSession {
         &self,
         source_worker: WorkerId,
         target_worker: WorkerId,
-    ) -> ChannelInfo {
+    ) -> crate::Result<ChannelInfo> {
         let channel_id = self.next_channel_id.fetch_add(1, Ordering::Relaxed);
 
         let source_node = self.topology.node_for_worker(source_worker);
@@ -108,9 +108,9 @@ impl DataflowSession {
 
         self.channels
             .lock()
-            .unwrap_or_else(|e| e.into_inner())
+            .or_poison("channel registry")?
             .insert(channel_id, info.clone());
-        info
+        Ok(info)
     }
 
     /// Check if a worker is local to this node.
@@ -119,34 +119,30 @@ impl DataflowSession {
     }
 
     /// Get all allocated channels.
-    pub fn channels(&self) -> Vec<ChannelInfo> {
-        self.channels
+    pub fn channels(&self) -> crate::Result<Vec<ChannelInfo>> {
+        Ok(self
+            .channels
             .lock()
-            .unwrap_or_else(|e| e.into_inner())
+            .or_poison("channel registry")?
             .values()
             .cloned()
-            .collect()
+            .collect())
     }
 
     /// Get all remote channels (cross-node).
-    pub fn remote_channels(&self) -> Vec<ChannelInfo> {
-        let channels = match self.channels.lock().or_poison("channel registry") {
-            Ok(channels) => channels,
-            Err(_) => {
-                // TODO: propagate poisoned channel-registry locks once accessors can return Result.
-                return Vec::new();
-            }
-        };
-        channels.values().filter(|c| !c.is_local).cloned().collect()
+    pub fn remote_channels(&self) -> crate::Result<Vec<ChannelInfo>> {
+        let channels = self.channels.lock().or_poison("channel registry")?;
+        Ok(channels.values().filter(|c| !c.is_local).cloned().collect())
     }
 
     /// Get a specific channel's info.
-    pub fn channel_info(&self, channel_id: ChannelId) -> Option<ChannelInfo> {
-        self.channels
+    pub fn channel_info(&self, channel_id: ChannelId) -> crate::Result<Option<ChannelInfo>> {
+        Ok(self
+            .channels
             .lock()
-            .unwrap_or_else(|e| e.into_inner())
+            .or_poison("channel registry")?
             .get(&channel_id)
-            .cloned()
+            .cloned())
     }
 
     /// Get the DataflowId as bytes (for wire protocol frames).
@@ -197,8 +193,8 @@ mod tests {
         let topo = two_node_topology();
         let session = DataflowSession::new(DataflowId::from_bytes([1u8; 16]), topo, "node-0");
 
-        let ch1 = session.allocate_channel(WorkerId::new(0), WorkerId::new(1));
-        let ch2 = session.allocate_channel(WorkerId::new(0), WorkerId::new(2));
+        let ch1 = session.allocate_channel(WorkerId::new(0), WorkerId::new(1)).unwrap();
+        let ch2 = session.allocate_channel(WorkerId::new(0), WorkerId::new(2)).unwrap();
 
         assert_eq!(ch1.channel_id, 1);
         assert_eq!(ch2.channel_id, 2);
@@ -210,11 +206,11 @@ mod tests {
         let session = DataflowSession::new(DataflowId::from_bytes([1u8; 16]), topo, "node-0");
 
         // Both workers on node 0
-        let local = session.allocate_channel(WorkerId::new(0), WorkerId::new(1));
+        let local = session.allocate_channel(WorkerId::new(0), WorkerId::new(1)).unwrap();
         assert!(local.is_local);
 
         // Workers on different nodes
-        let remote = session.allocate_channel(WorkerId::new(0), WorkerId::new(2));
+        let remote = session.allocate_channel(WorkerId::new(0), WorkerId::new(2)).unwrap();
         assert!(!remote.is_local);
     }
 
@@ -234,12 +230,12 @@ mod tests {
         let topo = two_node_topology();
         let session = DataflowSession::new(DataflowId::from_bytes([1u8; 16]), topo, "node-0");
 
-        session.allocate_channel(WorkerId::new(0), WorkerId::new(1));
-        session.allocate_channel(WorkerId::new(0), WorkerId::new(2));
-        session.allocate_channel(WorkerId::new(1), WorkerId::new(3));
+        session.allocate_channel(WorkerId::new(0), WorkerId::new(1)).unwrap();
+        session.allocate_channel(WorkerId::new(0), WorkerId::new(2)).unwrap();
+        session.allocate_channel(WorkerId::new(1), WorkerId::new(3)).unwrap();
 
-        assert_eq!(session.channels().len(), 3);
-        assert_eq!(session.remote_channels().len(), 2);
+        assert_eq!(session.channels().unwrap().len(), 3);
+        assert_eq!(session.remote_channels().unwrap().len(), 2);
     }
 
     #[test]
@@ -247,13 +243,13 @@ mod tests {
         let topo = two_node_topology();
         let session = DataflowSession::new(DataflowId::from_bytes([1u8; 16]), topo, "node-0");
 
-        let ch = session.allocate_channel(WorkerId::new(0), WorkerId::new(2));
-        let info = session.channel_info(ch.channel_id).unwrap();
+        let ch = session.allocate_channel(WorkerId::new(0), WorkerId::new(2)).unwrap();
+        let info = session.channel_info(ch.channel_id).unwrap().unwrap();
         assert_eq!(info.source_worker, WorkerId::new(0));
         assert_eq!(info.target_worker, WorkerId::new(2));
         assert!(!info.is_local);
 
-        assert!(session.channel_info(999).is_none());
+        assert!(session.channel_info(999).unwrap().is_none());
     }
 
     #[test]
@@ -281,7 +277,7 @@ mod tests {
 
         for i in 0..4 {
             for j in 0..4 {
-                let ch = session.allocate_channel(WorkerId::new(i), WorkerId::new(j));
+                let ch = session.allocate_channel(WorkerId::new(i), WorkerId::new(j)).unwrap();
                 assert!(ch.is_local, "workers {i}->{j} should be local");
             }
         }

@@ -1141,7 +1141,10 @@ impl<T: Timestamp, D: Clone + Send + 'static> Pipe<T, D> {
             let mut guard = match pred_true.lock().or_poison("branch predicate") {
                 Ok(guard) => guard,
                 Err(_) => {
-                    // TODO: propagate poisoned branch predicates once filter closures can return Result.
+                    // NOTE: Cannot propagate lock poison here — closure signature is
+                    // `FnMut(&T, &D) -> bool` and cannot return Result. Poisoned lock
+                    // means another thread panicked; returning `false` is acceptable
+                    // because the dataflow will be torn down.
                     return false;
                 }
             };
@@ -1152,7 +1155,10 @@ impl<T: Timestamp, D: Clone + Send + 'static> Pipe<T, D> {
             let mut guard = match pred_false.lock().or_poison("branch predicate") {
                 Ok(guard) => guard,
                 Err(_) => {
-                    // TODO: propagate poisoned branch predicates once filter closures can return Result.
+                    // NOTE: Cannot propagate lock poison here — closure signature is
+                    // `FnMut(&T, &D) -> bool` and cannot return Result. Poisoned lock
+                    // means another thread panicked; returning `false` is acceptable
+                    // because the dataflow will be torn down.
                     return false;
                 }
             };

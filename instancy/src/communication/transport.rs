@@ -94,6 +94,13 @@ pub enum TransportError {
         /// The CRC32 value computed from the received payload.
         actual: u32,
     },
+
+    /// A shared lock was poisoned (another thread panicked while holding it).
+    ///
+    /// This is an unrecoverable transport error — the hosting application
+    /// should be notified via [`RuntimeEvent::TransportDegraded`](crate::RuntimeEvent::TransportDegraded).
+    #[error("transport lock poisoned: {detail}")]
+    LockPoisoned { detail: String },
 }
 
 // ─── Feature-gated implementations using tokio ───────────────────────────────

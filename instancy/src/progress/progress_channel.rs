@@ -155,7 +155,10 @@ impl<T: Timestamp> ProgressSender<T> {
                     let mut buf = match buffer.lock().or_poison("progress channel") {
                         Ok(buf) => buf,
                         Err(_) => {
-                            // TODO: propagate poisoned progress locks once ProgressSender::send returns Result.
+                            // NOTE: Cannot propagate lock poison here — `ProgressSender::send`
+                            // returns `()` and is used as a fire-and-forget notification path.
+                            // Poisoned lock means another thread panicked; dropping this batch is
+                            // acceptable because the surrounding dataflow will be torn down.
                             return;
                         }
                     };
@@ -181,27 +184,15 @@ impl<T: Timestamp> ProgressReceiver<T> {
     ///
     /// Returns an iterator over batches in FIFO order.
     /// Each batch is a `Vec<ProgressChange<T>>` as sent by the peer.
-    pub fn drain_all(&self) -> Vec<Vec<ProgressChange<T>>> {
-        let mut buf = match self.buffer.lock().or_poison("progress channel") {
-            Ok(buf) => buf,
-            Err(_) => {
-                // TODO: propagate poisoned progress locks once ProgressReceiver APIs return Result.
-                return Vec::new();
-            }
-        };
-        buf.queue.drain(..).collect()
+    pub fn drain_all(&self) -> crate::Result<Vec<Vec<ProgressChange<T>>>> {
+        let mut buf = self.buffer.lock().or_poison("progress channel")?;
+        Ok(buf.queue.drain(..).collect())
     }
 
     /// Returns `true` if there are queued progress updates.
-    pub fn has_pending(&self) -> bool {
-        let buf = match self.buffer.lock().or_poison("progress channel") {
-            Ok(buf) => buf,
-            Err(_) => {
-                // TODO: propagate poisoned progress locks once ProgressReceiver APIs return Result.
-                return false;
-            }
-        };
-        !buf.queue.is_empty()
+    pub fn has_pending(&self) -> crate::Result<bool> {
+        let buf = self.buffer.lock().or_poison("progress channel")?;
+        Ok(!buf.queue.is_empty())
     }
 }
 
@@ -279,7 +270,7 @@ mod tests {
 
         // Worker 1 receives from Worker 0.
         let w1 = &channels[1];
-        let batches = w1.receivers[0].as_ref().unwrap().drain_all();
+        let batches = w1.receivers[0].as_ref().unwrap().drain_all().unwrap();
         assert_eq!(batches.len(), 2);
         assert_eq!(batches[0], vec![(0, 0, 42, 1)]);
         assert_eq!(batches[1], vec![(0, 0, 42, -1)]);
@@ -293,7 +284,7 @@ mod tests {
         // Empty send — should not enqueue.
         channels[0].senders[1].as_ref().unwrap().send(vec![]);
 
-        let batches = channels[1].receivers[0].as_ref().unwrap().drain_all();
+        let batches = channels[1].receivers[0].as_ref().unwrap().drain_all().unwrap();
         assert!(batches.is_empty());
     }
 
@@ -307,7 +298,7 @@ mod tests {
             sender.send(vec![(0, 0, i as u64, 1)]);
         }
 
-        let batches = channels[1].receivers[0].as_ref().unwrap().drain_all();
+        let batches = channels[1].receivers[0].as_ref().unwrap().drain_all().unwrap();
         assert_eq!(batches.len(), 10);
         for (i, batch) in batches.iter().enumerate() {
             assert_eq!(batch[0].2, i as u64);
@@ -331,15 +322,15 @@ mod tests {
         let channels = create_progress_channels::<u64>(2, &wakes).unwrap();
 
         let recv = channels[1].receivers[0].as_ref().unwrap();
-        assert!(!recv.has_pending());
+        assert!(!recv.has_pending().unwrap());
 
         channels[0].senders[1]
             .as_ref()
             .unwrap()
             .send(vec![(0, 0, 1u64, 1)]);
-        assert!(recv.has_pending());
+        assert!(recv.has_pending().unwrap());
 
-        recv.drain_all();
-        assert!(!recv.has_pending());
+        recv.drain_all().unwrap();
+        assert!(!recv.has_pending().unwrap());
     }
 }

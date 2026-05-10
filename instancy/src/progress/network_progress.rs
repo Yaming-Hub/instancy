@@ -877,7 +877,7 @@ mod tests {
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
 
         let receiver = ProgressReceiver::<u64>::new(Arc::clone(&shared));
-        let batches = receiver.drain_all();
+        let batches = receiver.drain_all().unwrap();
         assert_eq!(batches.len(), 1);
         assert_eq!(batches[0], changes);
 
@@ -1143,7 +1143,7 @@ mod tests {
         let receiver = b_channels[0].receivers[0]
             .as_ref()
             .expect("should have network receiver for worker 0");
-        let batches = receiver.drain_all();
+        let batches = receiver.drain_all().unwrap();
         assert_eq!(batches.len(), 1, "expected 1 batch, got {}", batches.len());
         assert_eq!(batches[0], vec![(0, 0, 42u64, 1), (1, 0, 100u64, -1)]);
 
