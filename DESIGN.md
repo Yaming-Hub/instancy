@@ -2726,41 +2726,87 @@ where
 
 ## 8. Error Handling
 
-### 8.1 Error Type
+### 8.1 Error Hierarchy
+
+Errors are organized by **source module** using a hierarchical structure. This enables
+hosting applications to pattern-match on specific error categories while keeping the
+root `Error` enum manageable.
 
 ```rust
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
-    #[error("I/O error: {0}")]
-    Io(#[from] std::io::Error),
-    
-    #[error("Serialization error: {0}")]
-    Codec(#[from] Box<dyn std::error::Error + Send + Sync>),
-    
-    #[error("Connection error: peer {peer_id:?}: {source}")]
-    Connection {
-        peer_id: PeerId,
-        source: Box<dyn std::error::Error + Send + Sync>,
-    },
-    
-    #[error("Dataflow cancelled")]
-    Cancelled,
-    
-    #[error("Progress tracking error: {0}")]
+    // ── Cross-cutting (used in 3+ modules) ──
+    Io(std::io::Error),
+    Cancelled { reason: Option<CancellationReason> },
     Progress(String),
-    
-    #[error("Operator error in '{operator}': {source}")]
-    Operator {
-        operator: String,
-        source: Box<dyn std::error::Error + Send + Sync>,
-    },
-    
-    #[error("{0}")]
-    Custom(String),
+    Operator { operator, worker_index, source },
+    OperatorPanic { operator, worker_index, message },
+    Backpressure,
+    ChannelClosed,
+    LockPoisoned { context: String },
+
+    // ── Module sub-enums ──
+    Topology(TopologyError),      // from execute / topology module
+    Dataflow(DataflowError),      // from dataflow module
+    Runtime(RuntimeError),        // from runtime module
+    Communication(CommunicationError), // from communication module
+}
+
+// Topology errors (4 variants)
+enum TopologyError {
+    NodeAlreadyExists { node_id },
+    NodeNotFound { node_id },
+    EmptyTopology { reason },
+    InvalidNodeConfig { node_id, reason },
+}
+
+// Dataflow construction errors (6 variants)
+enum DataflowError {
+    InvalidConfig(String),
+    InvalidGraph(String),
+    MissingEndpoint { operator, port },
+    TypeMismatch { operator, port },
+    EndpointTaken(String),
+    MissingFactory { edge_index },
+}
+
+// Runtime lifecycle errors (5 variants)
+enum RuntimeError {
+    InvalidConfig(String),
+    SpawnFailed(String),
+    ClusterSetup(String),
+    AlreadyConsumed { resource },
+    EmptyDataflow,
+}
+
+// Communication errors (1 variant)
+enum CommunicationError {
+    Codec(Box<dyn Error + Send + Sync>),
 }
 ```
 
-### 8.2 Error Propagation
+### 8.2 Error Organization Principles
+
+When adding new error variants, follow these rules:
+
+1. **Sub-enums correspond to source modules.** If an error originates from a single
+   module (e.g., topology, dataflow, runtime, communication), define it in that
+   module's sub-enum.
+
+2. **Consolidate similar errors with context fields.** Use fields like `operator`,
+   `port`, `node_id` to distinguish instances — do not create a separate variant
+   for every unique error message.
+
+3. **No generic catch-all.** Do not add `Internal(String)`, `Custom(String)`, or
+   similar. Every error must have a specific meaning that callers can match on.
+
+4. **Cross-cutting errors stay at the root.** An error that occurs in 3+ unrelated
+   modules (e.g., `LockPoisoned`, `ChannelClosed`) belongs in the root `Error` enum.
+
+5. **Test-only errors** should be gated with `#[cfg(feature = "test-utils")]` if
+   they exist solely to support test infrastructure.
+
+### 8.3 Error Propagation
 
 - Operators return `Result<(), Error>`.
 - When an operator task fails, it drops its output channels and capabilities.
