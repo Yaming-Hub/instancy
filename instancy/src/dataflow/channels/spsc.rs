@@ -57,7 +57,15 @@ impl<T> RingBuffer<T> {
     fn new(capacity: usize) -> Self {
         assert!(capacity > 0, "SPSC capacity must be > 0");
         // Use next power of two for efficient modulo via bitwise AND.
-        let size = (capacity + 1).next_power_of_two();
+        // Guard against overflow: capacity + 1 must not wrap.
+        let cap1 = capacity
+            .checked_add(1)
+            .expect("SPSC capacity too large");
+        let size = cap1.next_power_of_two();
+        assert!(
+            size > capacity,
+            "SPSC ring size overflow: capacity={capacity}, size={size}"
+        );
         let slots: Vec<Slot<T>> = (0..size)
             .map(|_| Slot {
                 value: UnsafeCell::new(MaybeUninit::uninit()),
