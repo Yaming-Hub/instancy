@@ -69,6 +69,46 @@ pub enum ControlProtocolError {
     WireRead(Box<crate::Error>),
 }
 
+/// Errors that can occur while coordinating control-protocol handshakes.
+#[cfg(feature = "transport")]
+#[derive(Debug, thiserror::Error)]
+pub enum HandshakeError {
+    #[error("handshake/ready timeout waiting for peer {peer_id}")]
+    Timeout { peer_id: String },
+
+    #[error("peer {peer_id} disconnected during handshake/ready barrier")]
+    PeerDisconnected { peer_id: String },
+
+    #[error("failed to send control message to peer {peer_id}")]
+    SendFailed { peer_id: String },
+
+    #[error("no control sender for peer {peer_id}")]
+    NoSender { peer_id: String },
+
+    #[error("fingerprint mismatch with peer {peer_id}: local={local:#018x}, remote={remote:#018x}")]
+    FingerprintMismatch {
+        peer_id: String,
+        local: u64,
+        remote: u64,
+    },
+
+    #[error("dataflow_id mismatch with peer {peer_id}")]
+    DataflowIdMismatch { peer_id: String },
+
+    #[error("unexpected control message from peer {peer_id}: expected {expected}, got {got}")]
+    UnexpectedMessage {
+        peer_id: String,
+        expected: String,
+        got: String,
+    },
+
+    #[error("failed to decode control message from peer {peer_id}: {source}")]
+    Decode {
+        peer_id: String,
+        source: ControlProtocolError,
+    },
+}
+
 // ---------------------------------------------------------------------------
 // Message types
 // ---------------------------------------------------------------------------
@@ -130,7 +170,8 @@ pub fn decode_control_message(data: &[u8]) -> Result<ControlMessage, ControlProt
 
     // Verify CRC32
     let (payload, crc_bytes) = data.split_at(data.len() - 4);
-    let expected_crc = wire::read_u32(crc_bytes, 0).map_err(|e| ControlProtocolError::WireRead(Box::new(e)))?;
+    let expected_crc =
+        wire::read_u32(crc_bytes, 0).map_err(|e| ControlProtocolError::WireRead(Box::new(e)))?;
     let actual_crc = crc32fast::hash(payload);
     if actual_crc != expected_crc {
         return Err(ControlProtocolError::CrcMismatch {
@@ -148,10 +189,11 @@ pub fn decode_control_message(data: &[u8]) -> Result<ControlMessage, ControlProt
                     actual: payload.len(),
                 });
             }
-            let fingerprint =
-                wire::read_u64(payload, 1).map_err(|e| ControlProtocolError::WireRead(Box::new(e)))?;
+            let fingerprint = wire::read_u64(payload, 1)
+                .map_err(|e| ControlProtocolError::WireRead(Box::new(e)))?;
             let dataflow_id = DataflowId::from_bytes(
-                wire::read_array::<16>(payload, 9).map_err(|e| ControlProtocolError::WireRead(Box::new(e)))?,
+                wire::read_array::<16>(payload, 9)
+                    .map_err(|e| ControlProtocolError::WireRead(Box::new(e)))?,
             );
             Ok(ControlMessage::Handshake {
                 fingerprint,
@@ -166,8 +208,9 @@ pub fn decode_control_message(data: &[u8]) -> Result<ControlMessage, ControlProt
                     actual: payload.len(),
                 });
             }
-            let id_len =
-                wire::read_u32(payload, 1).map_err(|e| ControlProtocolError::WireRead(Box::new(e)))? as usize;
+            let id_len = wire::read_u32(payload, 1)
+                .map_err(|e| ControlProtocolError::WireRead(Box::new(e)))?
+                as usize;
             if payload.len() != 5 + id_len {
                 return Err(ControlProtocolError::InvalidPayloadSize {
                     expected: 5 + id_len,
@@ -240,7 +283,7 @@ pub async fn perform_handshake(
     local_fingerprint: u64,
     dataflow_id: DataflowId,
     timeout: std::time::Duration,
-) -> Result<(), String> {
+) -> Result<(), HandshakeError> {
     use crate::communication::transport::Frame;
     use crate::communication::transport_session::CONTROL_CHANNEL_ID;
 
@@ -254,7 +297,9 @@ pub async fn perform_handshake(
     for peer_id in session.peer_node_ids().collect::<Vec<_>>() {
         let sender = session
             .control_sender(peer_id)
-            .ok_or_else(|| format!("no control sender for peer {peer_id}"))?;
+            .ok_or_else(|| HandshakeError::NoSender {
+                peer_id: peer_id.to_string(),
+            })?;
         let frame = Frame {
             dataflow_id,
             channel_id: CONTROL_CHANNEL_ID,
@@ -263,7 +308,9 @@ pub async fn perform_handshake(
         sender
             .send(frame)
             .await
-            .map_err(|_| format!("failed to send handshake to peer {peer_id}"))?;
+            .map_err(|_| HandshakeError::SendFailed {
+                peer_id: peer_id.to_string(),
+            })?;
     }
 
     // Receive handshake from all peers.
@@ -272,11 +319,17 @@ pub async fn perform_handshake(
         let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
         let data = tokio::time::timeout(remaining, rx.recv())
             .await
-            .map_err(|_| format!("handshake timeout waiting for peer {peer_id}"))?
-            .ok_or_else(|| format!("peer {peer_id} disconnected during handshake"))?;
+            .map_err(|_| HandshakeError::Timeout {
+                peer_id: peer_id.clone(),
+            })?
+            .ok_or_else(|| HandshakeError::PeerDisconnected {
+                peer_id: peer_id.clone(),
+            })?;
 
-        let peer_msg = decode_control_message(&data)
-            .map_err(|e| format!("invalid handshake from peer {peer_id}: {e}"))?;
+        let peer_msg = decode_control_message(&data).map_err(|source| HandshakeError::Decode {
+            peer_id: peer_id.clone(),
+            source,
+        })?;
 
         match peer_msg {
             ControlMessage::Handshake {
@@ -284,19 +337,24 @@ pub async fn perform_handshake(
                 dataflow_id: peer_df_id,
             } => {
                 if fingerprint != local_fingerprint {
-                    return Err(format!(
-                        "fingerprint mismatch with peer {peer_id}: \
-                         local={local_fingerprint:#018x}, remote={fingerprint:#018x}"
-                    ));
+                    return Err(HandshakeError::FingerprintMismatch {
+                        peer_id: peer_id.clone(),
+                        local: local_fingerprint,
+                        remote: fingerprint,
+                    });
                 }
                 if peer_df_id != dataflow_id {
-                    return Err(format!("dataflow_id mismatch with peer {peer_id}"));
+                    return Err(HandshakeError::DataflowIdMismatch {
+                        peer_id: peer_id.clone(),
+                    });
                 }
             }
             other => {
-                return Err(format!(
-                    "unexpected control message from peer {peer_id}: expected Handshake, got {other:?}"
-                ));
+                return Err(HandshakeError::UnexpectedMessage {
+                    peer_id: peer_id.clone(),
+                    expected: "Handshake".into(),
+                    got: format!("{other:?}"),
+                });
             }
         }
     }
@@ -316,7 +374,7 @@ pub async fn perform_ready_barrier(
     local_node_id: &str,
     dataflow_id: DataflowId,
     timeout: std::time::Duration,
-) -> Result<(), String> {
+) -> Result<(), HandshakeError> {
     use crate::communication::transport::Frame;
     use crate::communication::transport_session::CONTROL_CHANNEL_ID;
 
@@ -329,7 +387,9 @@ pub async fn perform_ready_barrier(
     for peer_id in session.peer_node_ids().collect::<Vec<_>>() {
         let sender = session
             .control_sender(peer_id)
-            .ok_or_else(|| format!("no control sender for peer {peer_id}"))?;
+            .ok_or_else(|| HandshakeError::NoSender {
+                peer_id: peer_id.to_string(),
+            })?;
         let frame = Frame {
             dataflow_id,
             channel_id: CONTROL_CHANNEL_ID,
@@ -338,7 +398,9 @@ pub async fn perform_ready_barrier(
         sender
             .send(frame)
             .await
-            .map_err(|_| format!("failed to send Ready to peer {peer_id}"))?;
+            .map_err(|_| HandshakeError::SendFailed {
+                peer_id: peer_id.to_string(),
+            })?;
     }
 
     // Receive Ready from all peers.
@@ -347,20 +409,28 @@ pub async fn perform_ready_barrier(
         let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
         let data = tokio::time::timeout(remaining, rx.recv())
             .await
-            .map_err(|_| format!("ready barrier timeout waiting for peer {peer_id}"))?
-            .ok_or_else(|| format!("peer {peer_id} disconnected during ready barrier"))?;
+            .map_err(|_| HandshakeError::Timeout {
+                peer_id: peer_id.clone(),
+            })?
+            .ok_or_else(|| HandshakeError::PeerDisconnected {
+                peer_id: peer_id.clone(),
+            })?;
 
-        let peer_msg = decode_control_message(&data)
-            .map_err(|e| format!("invalid Ready from peer {peer_id}: {e}"))?;
+        let peer_msg = decode_control_message(&data).map_err(|source| HandshakeError::Decode {
+            peer_id: peer_id.clone(),
+            source,
+        })?;
 
         match peer_msg {
             ControlMessage::Ready { .. } => {
                 // Peer is ready.
             }
             other => {
-                return Err(format!(
-                    "unexpected control message from peer {peer_id}: expected Ready, got {other:?}"
-                ));
+                return Err(HandshakeError::UnexpectedMessage {
+                    peer_id: peer_id.clone(),
+                    expected: "Ready".into(),
+                    got: format!("{other:?}"),
+                });
             }
         }
     }
@@ -379,7 +449,7 @@ pub async fn perform_handshake_with_transport(
     local_fingerprint: u64,
     dataflow_id: DataflowId,
     timeout: std::time::Duration,
-) -> Result<(), String> {
+) -> Result<(), HandshakeError> {
     use crate::communication::transport::Frame;
     use crate::communication::transport_session::CONTROL_CHANNEL_ID;
 
@@ -390,9 +460,12 @@ pub async fn perform_handshake_with_transport(
     let payload = encode_control_message(&msg);
 
     for peer_id in transport.peer_node_ids() {
-        let sender = transport
-            .control_sender(&peer_id)
-            .ok_or_else(|| format!("no control sender for peer {peer_id}"))?;
+        let sender =
+            transport
+                .control_sender(&peer_id)
+                .ok_or_else(|| HandshakeError::NoSender {
+                    peer_id: peer_id.clone(),
+                })?;
         let frame = Frame {
             dataflow_id,
             channel_id: CONTROL_CHANNEL_ID,
@@ -401,7 +474,9 @@ pub async fn perform_handshake_with_transport(
         sender
             .send(frame)
             .await
-            .map_err(|_| format!("failed to send handshake to peer {peer_id}"))?;
+            .map_err(|_| HandshakeError::SendFailed {
+                peer_id: peer_id.clone(),
+            })?;
     }
 
     let deadline = tokio::time::Instant::now() + timeout;
@@ -409,11 +484,17 @@ pub async fn perform_handshake_with_transport(
         let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
         let data = tokio::time::timeout(remaining, rx.recv())
             .await
-            .map_err(|_| format!("handshake timeout waiting for peer {peer_id}"))?
-            .ok_or_else(|| format!("peer {peer_id} disconnected during handshake"))?;
+            .map_err(|_| HandshakeError::Timeout {
+                peer_id: peer_id.clone(),
+            })?
+            .ok_or_else(|| HandshakeError::PeerDisconnected {
+                peer_id: peer_id.clone(),
+            })?;
 
-        let peer_msg = decode_control_message(&data)
-            .map_err(|e| format!("invalid handshake from peer {peer_id}: {e}"))?;
+        let peer_msg = decode_control_message(&data).map_err(|source| HandshakeError::Decode {
+            peer_id: peer_id.clone(),
+            source,
+        })?;
 
         match peer_msg {
             ControlMessage::Handshake {
@@ -421,19 +502,24 @@ pub async fn perform_handshake_with_transport(
                 dataflow_id: peer_df_id,
             } => {
                 if fingerprint != local_fingerprint {
-                    return Err(format!(
-                        "fingerprint mismatch with peer {peer_id}: \
-                         local={local_fingerprint:#018x}, remote={fingerprint:#018x}"
-                    ));
+                    return Err(HandshakeError::FingerprintMismatch {
+                        peer_id: peer_id.clone(),
+                        local: local_fingerprint,
+                        remote: fingerprint,
+                    });
                 }
                 if peer_df_id != dataflow_id {
-                    return Err(format!("dataflow_id mismatch with peer {peer_id}"));
+                    return Err(HandshakeError::DataflowIdMismatch {
+                        peer_id: peer_id.clone(),
+                    });
                 }
             }
             other => {
-                return Err(format!(
-                    "unexpected control message from peer {peer_id}: expected Handshake, got {other:?}"
-                ));
+                return Err(HandshakeError::UnexpectedMessage {
+                    peer_id: peer_id.clone(),
+                    expected: "Handshake".into(),
+                    got: format!("{other:?}"),
+                });
             }
         }
     }
@@ -452,7 +538,7 @@ pub async fn perform_ready_barrier_with_transport(
     local_node_id: &str,
     dataflow_id: DataflowId,
     timeout: std::time::Duration,
-) -> Result<(), String> {
+) -> Result<(), HandshakeError> {
     use crate::communication::transport::Frame;
     use crate::communication::transport_session::CONTROL_CHANNEL_ID;
 
@@ -462,9 +548,12 @@ pub async fn perform_ready_barrier_with_transport(
     let payload = encode_control_message(&msg);
 
     for peer_id in transport.peer_node_ids() {
-        let sender = transport
-            .control_sender(&peer_id)
-            .ok_or_else(|| format!("no control sender for peer {peer_id}"))?;
+        let sender =
+            transport
+                .control_sender(&peer_id)
+                .ok_or_else(|| HandshakeError::NoSender {
+                    peer_id: peer_id.clone(),
+                })?;
         let frame = Frame {
             dataflow_id,
             channel_id: CONTROL_CHANNEL_ID,
@@ -473,7 +562,9 @@ pub async fn perform_ready_barrier_with_transport(
         sender
             .send(frame)
             .await
-            .map_err(|_| format!("failed to send Ready to peer {peer_id}"))?;
+            .map_err(|_| HandshakeError::SendFailed {
+                peer_id: peer_id.clone(),
+            })?;
     }
 
     let deadline = tokio::time::Instant::now() + timeout;
@@ -481,18 +572,26 @@ pub async fn perform_ready_barrier_with_transport(
         let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
         let data = tokio::time::timeout(remaining, rx.recv())
             .await
-            .map_err(|_| format!("ready barrier timeout waiting for peer {peer_id}"))?
-            .ok_or_else(|| format!("peer {peer_id} disconnected during ready barrier"))?;
+            .map_err(|_| HandshakeError::Timeout {
+                peer_id: peer_id.clone(),
+            })?
+            .ok_or_else(|| HandshakeError::PeerDisconnected {
+                peer_id: peer_id.clone(),
+            })?;
 
-        let peer_msg = decode_control_message(&data)
-            .map_err(|e| format!("invalid Ready from peer {peer_id}: {e}"))?;
+        let peer_msg = decode_control_message(&data).map_err(|source| HandshakeError::Decode {
+            peer_id: peer_id.clone(),
+            source,
+        })?;
 
         match peer_msg {
             ControlMessage::Ready { .. } => {}
             other => {
-                return Err(format!(
-                    "unexpected control message from peer {peer_id}: expected Ready, got {other:?}"
-                ));
+                return Err(HandshakeError::UnexpectedMessage {
+                    peer_id: peer_id.clone(),
+                    expected: "Ready".into(),
+                    got: format!("{other:?}"),
+                });
             }
         }
     }
@@ -549,10 +648,7 @@ mod tests {
     #[test]
     fn decode_rejects_too_short() {
         let result = decode_control_message(&[1, 2, 3]);
-        assert!(matches!(
-            result,
-            Err(ControlProtocolError::TooShort { .. })
-        ));
+        assert!(matches!(result, Err(ControlProtocolError::TooShort { .. })));
     }
 
     #[test]

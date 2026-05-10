@@ -569,9 +569,7 @@ impl PeerRegistry {
         if let Some(down_peer) = already_down {
             // Release lock before cancelling to avoid nested lock contention.
             drop(state);
-            cancel_handle.cancel_with_reason(CancellationReason::PeerDown {
-                node_id: down_peer,
-            });
+            cancel_handle.cancel_with_reason(CancellationReason::PeerDown { node_id: down_peer });
             return id;
         }
 
@@ -744,8 +742,7 @@ impl RuntimeHandle {
             max_threads: config.worker_threads,
             ..Default::default()
         };
-        let worker_pool = WorkerPool::new(pool_config)
-            .map_err(|e| Error::Runtime(RuntimeError::InvalidConfig(e.to_string())))?;
+        let worker_pool = WorkerPool::new(pool_config).map_err(Error::Runtime)?;
         let schedule_policy: Option<Arc<dyn SchedulePolicy>> = config
             .schedule_policy
             .map(|p| Arc::from(p) as Arc<dyn SchedulePolicy>);
@@ -769,9 +766,10 @@ impl RuntimeHandle {
                     .thread_name(format!("{}-tokio", config.name))
                     .build()
                     .map_err(|e| {
-                        Error::Runtime(RuntimeError::SpawnFailed(format!(
-                            "failed to create tokio runtime: {e}"
-                        )))
+                        Error::Runtime(RuntimeError::SpawnFailed {
+                            context: "failed to create tokio runtime".into(),
+                            source: Some(e),
+                        })
                     })?;
                 let handle = rt.handle().clone();
                 (handle, Some(rt))
@@ -798,9 +796,10 @@ impl RuntimeHandle {
                             .thread_name(format!("{}-tokio", config.name))
                             .build()
                             .map_err(|e| {
-                                Error::Runtime(RuntimeError::SpawnFailed(format!(
-                                    "failed to create tokio runtime: {e}"
-                                )))
+                                Error::Runtime(RuntimeError::SpawnFailed {
+                                    context: "failed to create tokio runtime".into(),
+                                    source: Some(e),
+                                })
                             })?;
                         let handle = rt.handle().clone();
                         (handle, Some(rt))
@@ -1623,9 +1622,10 @@ impl RuntimeHandle {
                 .name(format!("source-pump-{}-{}", name, pump_idx))
                 .spawn(pump)
                 .map_err(|e| {
-                    Error::Runtime(RuntimeError::SpawnFailed(format!(
-                        "failed to spawn pump thread: {e}"
-                    )))
+                    Error::Runtime(RuntimeError::SpawnFailed {
+                        context: "failed to spawn pump thread".into(),
+                        source: Some(e),
+                    })
                 })?;
         }
 
@@ -1808,9 +1808,10 @@ impl RuntimeHandle {
                                 detail: format!("sibling worker {spawned_count} failed to spawn"),
                             });
                     }
-                    return Err(Error::Runtime(RuntimeError::SpawnFailed(format!(
-                        "failed to spawn worker {spawned_count}: {e}"
-                    ))));
+                    return Err(Error::Runtime(RuntimeError::SpawnFailed {
+                        context: format!("failed to spawn worker {spawned_count}"),
+                        source: Some(std::io::Error::other(e.to_string())),
+                    }));
                 }
             }
         }
@@ -2117,9 +2118,10 @@ impl RuntimeHandle {
                                 detail: format!("sibling worker {spawned_count} failed to spawn"),
                             });
                     }
-                    return Err(Error::Runtime(RuntimeError::SpawnFailed(format!(
-                        "failed to spawn worker {spawned_count}: {e}"
-                    ))));
+                    return Err(Error::Runtime(RuntimeError::SpawnFailed {
+                        context: format!("failed to spawn worker {spawned_count}"),
+                        source: Some(std::io::Error::other(e.to_string())),
+                    }));
                 }
             }
         }
@@ -2531,11 +2533,7 @@ impl RuntimeHandle {
                     dataflow_id,
                     handshake_timeout,
                 ))
-                .map_err(|e| {
-                    Error::Runtime(RuntimeError::ClusterSetup(format!(
-                        "cluster handshake failed: {e}"
-                    )))
-                })?;
+                .map_err(|e| Error::Runtime(RuntimeError::Handshake(e)))?;
         } else {
             runtime_handle
                 .block_on(perform_handshake_with_transport(
@@ -2545,11 +2543,7 @@ impl RuntimeHandle {
                     dataflow_id,
                     handshake_timeout,
                 ))
-                .map_err(|e| {
-                    Error::Runtime(RuntimeError::ClusterSetup(format!(
-                        "cluster handshake failed: {e}"
-                    )))
-                })?;
+                .map_err(|e| Error::Runtime(RuntimeError::Handshake(e)))?;
         }
 
         // Phase 5: Wire exchange channels using network-backed factories.
@@ -2746,9 +2740,7 @@ impl RuntimeHandle {
             DEFAULT_MAX_BATCH_SIZE,
             runtime_handle,
         )
-        .map_err(|e| {
-            Error::Communication(e)
-        })?;
+        .map_err(Error::Communication)?;
 
         // Phase 7: Materialize all local workers (without registering).
         let mode = ChannelMode::Sync;
@@ -2779,9 +2771,10 @@ impl RuntimeHandle {
                                 detail: format!("cluster worker {global_idx} failed to spawn"),
                             });
                     }
-                    return Err(Error::Runtime(RuntimeError::SpawnFailed(format!(
-                        "failed to spawn cluster worker {global_idx}: {e}"
-                    ))));
+                    return Err(Error::Runtime(RuntimeError::SpawnFailed {
+                        context: format!("failed to spawn cluster worker {global_idx}"),
+                        source: Some(std::io::Error::other(e.to_string())),
+                    }));
                 }
             }
         }
@@ -2796,11 +2789,7 @@ impl RuntimeHandle {
                     dataflow_id,
                     handshake_timeout,
                 ))
-                .map_err(|e| {
-                    Error::Runtime(RuntimeError::ClusterSetup(format!(
-                        "cluster ready barrier failed: {e}"
-                    )))
-                })?;
+                .map_err(|e| Error::Runtime(RuntimeError::Handshake(e)))?;
         } else {
             runtime_handle
                 .block_on(perform_ready_barrier_with_transport(
@@ -2810,11 +2799,7 @@ impl RuntimeHandle {
                     dataflow_id,
                     handshake_timeout,
                 ))
-                .map_err(|e| {
-                    Error::Runtime(RuntimeError::ClusterSetup(format!(
-                        "cluster ready barrier failed: {e}"
-                    )))
-                })?;
+                .map_err(|e| Error::Runtime(RuntimeError::Handshake(e)))?;
         }
 
         // Phase 9: Register all workers for execution.
@@ -3193,9 +3178,10 @@ impl SimpleRuntime {
                 .name(format!("source-pump-{}-{}", name, pump_idx))
                 .spawn(pump)
                 .map_err(|e| {
-                    Error::Runtime(RuntimeError::SpawnFailed(format!(
-                        "failed to spawn pump thread: {e}"
-                    )))
+                    Error::Runtime(RuntimeError::SpawnFailed {
+                        context: "failed to spawn pump thread".into(),
+                        source: Some(e),
+                    })
                 })?;
         }
 
@@ -3206,9 +3192,10 @@ impl SimpleRuntime {
                 notifier.complete(result);
             })
             .map_err(|e| {
-                Error::Runtime(RuntimeError::SpawnFailed(format!(
-                    "failed to spawn dataflow thread: {e}"
-                )))
+                Error::Runtime(RuntimeError::SpawnFailed {
+                    context: "failed to spawn dataflow thread".into(),
+                    source: Some(e),
+                })
             })?;
 
         Ok(SpawnedDataflow {
@@ -3310,9 +3297,10 @@ impl SimpleRuntime {
                     for w in workers {
                         let _ = w.join_blocking();
                     }
-                    return Err(Error::Runtime(RuntimeError::SpawnFailed(format!(
-                        "failed to spawn worker {spawned_count}: {e}"
-                    ))));
+                    return Err(Error::Runtime(RuntimeError::SpawnFailed {
+                        context: format!("failed to spawn worker {spawned_count}"),
+                        source: Some(std::io::Error::other(e.to_string())),
+                    }));
                 }
             }
         }

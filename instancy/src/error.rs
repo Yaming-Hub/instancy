@@ -31,7 +31,7 @@ pub enum Error {
 
     /// An error in progress tracking.
     #[error("Progress tracking error: {0}")]
-    Progress(String),
+    Progress(#[from] ProgressError),
 
     /// An error produced by an operator.
     #[error("Operator error in '{operator}'{}: {source}",
@@ -166,6 +166,18 @@ impl Error {
 /// A convenience type alias for `Result<T, Error>`.
 pub type Result<T> = std::result::Result<T, Error>;
 
+/// Errors from the progress-tracking subsystem.
+#[derive(Debug, thiserror::Error)]
+pub enum ProgressError {
+    /// Attempted to delay/downgrade a capability to a time that is not `>=` the current time.
+    #[error("cannot advance capability from {from} to {to}: new time is not >= current time")]
+    TimeNotAdvanced { from: String, to: String },
+
+    /// No capability in the set dominates the requested time.
+    #[error("no capability in set dominates time {time}")]
+    NoDominatingCapability { time: String },
+}
+
 /// Errors related to cluster topology management.
 #[derive(Debug, thiserror::Error)]
 pub enum TopologyError {
@@ -214,11 +226,19 @@ pub enum RuntimeError {
     #[error("invalid runtime config: {0}")]
     InvalidConfig(String),
 
-    #[error("spawn failed: {0}")]
-    SpawnFailed(String),
+    #[error("spawn failed: {context}")]
+    SpawnFailed {
+        context: String,
+        #[source]
+        source: Option<std::io::Error>,
+    },
 
     #[error("cluster setup failed: {0}")]
     ClusterSetup(String),
+
+    #[cfg(feature = "transport")]
+    #[error("cluster handshake failed: {0}")]
+    Handshake(#[from] crate::communication::control_protocol::HandshakeError),
 
     #[error("resource already consumed: {resource}")]
     AlreadyConsumed { resource: String },
@@ -318,7 +338,9 @@ mod tests {
 
     #[test]
     fn error_display_progress() {
-        let err = Error::Progress("stalled frontier".into());
+        let err = Error::Progress(ProgressError::NoDominatingCapability {
+            time: "stalled frontier".into(),
+        });
         assert!(err.to_string().contains("stalled frontier"));
     }
 

@@ -55,19 +55,27 @@ impl Default for WorkerPoolConfig {
 }
 
 impl WorkerPoolConfig {
-    /// Validate configuration. Returns an error message if invalid.
-    pub fn validate(&self) -> Result<(), &'static str> {
+    /// Validate configuration.
+    pub fn validate(&self) -> Result<(), RuntimeError> {
         if self.min_threads == 0 {
-            return Err("min_threads must be at least 1");
+            return Err(RuntimeError::InvalidConfig(
+                "min_threads must be at least 1".into(),
+            ));
         }
         if self.max_threads < self.min_threads {
-            return Err("max_threads must be >= min_threads");
+            return Err(RuntimeError::InvalidConfig(
+                "max_threads must be >= min_threads".into(),
+            ));
         }
         if self.spin_limit == 0 {
-            return Err("spin_limit must be at least 1");
+            return Err(RuntimeError::InvalidConfig(
+                "spin_limit must be at least 1".into(),
+            ));
         }
         if self.yield_limit <= self.spin_limit {
-            return Err("yield_limit must be > spin_limit");
+            return Err(RuntimeError::InvalidConfig(
+                "yield_limit must be > spin_limit".into(),
+            ));
         }
         Ok(())
     }
@@ -131,7 +139,7 @@ impl WorkerPool {
     ///
     /// Spawns `min_threads` worker threads immediately. Returns an error if
     /// configuration is invalid or any initial thread fails to spawn.
-    pub fn new(config: WorkerPoolConfig) -> Result<Self, &'static str> {
+    pub fn new(config: WorkerPoolConfig) -> Result<Self, RuntimeError> {
         config.validate()?;
 
         let state = Arc::new(PoolState::new(config.clone()));
@@ -141,8 +149,10 @@ impl WorkerPool {
 
         // Spawn initial min_threads
         for _ in 0..config.min_threads {
-            pool.spawn_thread()
-                .map_err(|_| "failed to spawn initial worker thread")?;
+            pool.spawn_thread().map_err(|e| RuntimeError::SpawnFailed {
+                context: "failed to spawn initial worker thread".into(),
+                source: Some(e),
+            })?;
         }
 
         Ok(pool)
@@ -513,19 +523,31 @@ mod tests {
         let mut config = WorkerPoolConfig::default();
 
         config.min_threads = 0;
-        assert_eq!(config.validate(), Err("min_threads must be at least 1"));
+        assert!(matches!(
+            config.validate(),
+            Err(RuntimeError::InvalidConfig(ref message)) if message == "min_threads must be at least 1"
+        ));
 
         config.min_threads = 4;
         config.max_threads = 2;
-        assert_eq!(config.validate(), Err("max_threads must be >= min_threads"));
+        assert!(matches!(
+            config.validate(),
+            Err(RuntimeError::InvalidConfig(ref message)) if message == "max_threads must be >= min_threads"
+        ));
 
         config.max_threads = 8;
         config.spin_limit = 0;
-        assert_eq!(config.validate(), Err("spin_limit must be at least 1"));
+        assert!(matches!(
+            config.validate(),
+            Err(RuntimeError::InvalidConfig(ref message)) if message == "spin_limit must be at least 1"
+        ));
 
         config.spin_limit = 10;
         config.yield_limit = 5;
-        assert_eq!(config.validate(), Err("yield_limit must be > spin_limit"));
+        assert!(matches!(
+            config.validate(),
+            Err(RuntimeError::InvalidConfig(ref message)) if message == "yield_limit must be > spin_limit"
+        ));
     }
 
     #[test]

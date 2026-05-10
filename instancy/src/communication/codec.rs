@@ -155,14 +155,8 @@ impl PartialEq for CodecError {
                 },
             ) => e1 == e2 && a1 == a2,
             (
-                Self::PayloadTooLarge {
-                    size: s1,
-                    max: m1,
-                },
-                Self::PayloadTooLarge {
-                    size: s2,
-                    max: m2,
-                },
+                Self::PayloadTooLarge { size: s1, max: m1 },
+                Self::PayloadTooLarge { size: s2, max: m2 },
             ) => s1 == s2 && m1 == m2,
             // External errors wrap trait objects — equality is not meaningful.
             // Two External values are equal only if they point to the same Arc.
@@ -302,8 +296,9 @@ where
     T: serde::Serialize + serde::de::DeserializeOwned + Send + Sync,
 {
     fn encode(&self, value: &T, buf: &mut Vec<u8>) -> Result<(), CodecError> {
-        let payload = bincode::serialize(value)
-            .map_err(|e| CodecError::External(Arc::from(e as Box<dyn std::error::Error + Send + Sync>)))?;
+        let payload = bincode::serialize(value).map_err(|e| {
+            CodecError::External(Arc::from(e as Box<dyn std::error::Error + Send + Sync>))
+        })?;
         encode_length_prefix(payload.len(), buf)?;
         buf.extend_from_slice(&payload);
         Ok(())
@@ -318,8 +313,9 @@ where
                 available: buf.len(),
             });
         }
-        let value = bincode::deserialize(&buf[4..total])
-            .map_err(|e| CodecError::External(Arc::from(e as Box<dyn std::error::Error + Send + Sync>)))?;
+        let value = bincode::deserialize(&buf[4..total]).map_err(|e| {
+            CodecError::External(Arc::from(e as Box<dyn std::error::Error + Send + Sync>))
+        })?;
         Ok((value, total))
     }
 }
