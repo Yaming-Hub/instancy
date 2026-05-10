@@ -376,10 +376,7 @@ impl PeerPool {
     /// # Panics
     ///
     /// Panics if `config.min_connections < 1` or `config.min_connections > config.max_connections`.
-    pub fn new(
-        initial_connections: usize,
-        config: SharedConnectionConfig,
-    ) -> crate::Result<Self> {
+    pub fn new(initial_connections: usize, config: SharedConnectionConfig) -> crate::Result<Self> {
         if config.min_connections < 1 {
             return Err(crate::Error::InvalidConfig(
                 "min_connections must be at least 1".into(),
@@ -392,9 +389,9 @@ impl PeerPool {
             )));
         }
 
-        let count = initial_connections
-            .max(config.min_connections)
-            .min(config.max_connections);
+        // Only pre-create slots for connections that actually exist.
+        // When initial_connections is 0 (lazy init), don't create phantom slots.
+        let count = initial_connections.min(config.max_connections);
         let mut connections = HashMap::new();
         for id in 0..count {
             connections.insert(

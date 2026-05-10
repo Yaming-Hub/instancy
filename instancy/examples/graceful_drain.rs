@@ -26,7 +26,8 @@ fn main() {
             println!("  Processing: {x} → {}", x * x);
             x * x
         })
-        .output("results").unwrap();
+        .output("results")
+        .unwrap();
 
     let dataflow = builder.build().expect("build");
 

@@ -88,7 +88,9 @@ impl WorkerContext {
     /// callers should never need to create one directly.
     pub(crate) fn new(worker_index: usize, num_workers: usize) -> crate::Result<Self> {
         if num_workers == 0 {
-            return Err(crate::Error::InvalidConfig("num_workers must be >= 1".into()));
+            return Err(crate::Error::InvalidConfig(
+                "num_workers must be >= 1".into(),
+            ));
         }
         if worker_index >= num_workers {
             return Err(crate::Error::InvalidConfig(format!(

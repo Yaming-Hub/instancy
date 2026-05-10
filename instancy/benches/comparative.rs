@@ -304,10 +304,12 @@ fn instancy_q2(
             workers,
             |builder| {
                 let left = builder
-                    .input::<(u64, i64)>("left").unwrap()
+                    .input::<(u64, i64)>("left")
+                    .unwrap()
                     .exchange_by_hash("left_exchange", |(order_key, _)| *order_key);
                 let right = builder
-                    .input::<u64>("right").unwrap()
+                    .input::<u64>("right")
+                    .unwrap()
                     .exchange_by_hash("right_exchange", |order_key| *order_key);
 
                 left.binary::<u64, (u64, i64), _>(right, "join", {
@@ -732,7 +734,8 @@ fn instancy_q7(rt: &RuntimeHandle, partitions: &[Vec<u64>], workers: usize) {
             workers,
             |builder| {
                 builder
-                    .input::<u64>("data").unwrap()
+                    .input::<u64>("data")
+                    .unwrap()
                     .exchange_by_hash("route", |value| *value)
                     .reduce("sum", |a, b| a + b)
                     .for_each("sink", |_t, value| {

@@ -151,7 +151,8 @@ fn main() {
                 Ok(())
             }
         })
-        .output("stats").unwrap();
+        .output("stats")
+        .unwrap();
 
     let dataflow = builder.build().unwrap();
 

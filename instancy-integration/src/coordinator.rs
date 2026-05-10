@@ -617,9 +617,7 @@ impl TestCoordinator {
                     {
                         all_success = false;
                     } else {
-                        return Err(format!(
-                            "protocol error from {node_id}: {e}"
-                        ));
+                        return Err(format!("protocol error from {node_id}: {e}"));
                     }
                 }
                 Err(_) => {

@@ -28,7 +28,8 @@ fn main() {
         input
             .delay_batch("window_10", |t| (t / 10 + 1) * 10)
             .count("per_window")
-            .output("counts").unwrap();
+            .output("counts")
+            .unwrap();
 
         let dataflow = builder.build().expect("build failed");
         let mut handle = rt.spawn(dataflow, SpawnOptions::default()).unwrap();
@@ -71,7 +72,8 @@ fn main() {
                 "normal" => *t + 5,
                 _ => *t + 10,
             })
-            .output("prioritized").unwrap();
+            .output("prioritized")
+            .unwrap();
 
         let dataflow = builder.build().expect("build failed");
         let mut handle = rt.spawn(dataflow, SpawnOptions::default()).unwrap();
@@ -113,7 +115,8 @@ fn main() {
         input
             .delay_batch("shift", |t| t + 100)
             .reduce("sum", |a, b| a + b)
-            .output("sums").unwrap();
+            .output("sums")
+            .unwrap();
 
         let dataflow = builder.build().expect("build failed");
         let mut handle = rt.spawn(dataflow, SpawnOptions::default()).unwrap();

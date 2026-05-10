@@ -55,7 +55,8 @@ fn main() {
             }
             Ok(())
         })
-        .output("unique_events").unwrap();
+        .output("unique_events")
+        .unwrap();
 
     let dataflow = builder.build().expect("build failed");
     let rt = RuntimeHandle::new(RuntimeConfig::default()).unwrap();

@@ -19,7 +19,10 @@ async fn drain_completes_inflight_data() {
     let builder = DataflowBuilder::<u64>::new("drain-complete");
 
     let input = builder.input::<i32>("data").unwrap();
-    input.map("double", |_t, v| v * 2).output("results").unwrap();
+    input
+        .map("double", |_t, v| v * 2)
+        .output("results")
+        .unwrap();
 
     let dataflow = builder.build().unwrap();
 
@@ -112,7 +115,10 @@ async fn drain_with_multi_worker() {
             2,
             |builder: &mut DataflowBuilder<u64>| {
                 let input = builder.input::<i32>("data").unwrap();
-                input.map("triple", |_t, v| v * 3).output("results").unwrap();
+                input
+                    .map("triple", |_t, v| v * 3)
+                    .output("results")
+                    .unwrap();
                 Ok(())
             },
             opts,

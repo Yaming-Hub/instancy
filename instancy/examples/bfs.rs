@@ -108,7 +108,8 @@ fn main() {
 
             IterateResult { feedback, output }
         })
-        .output("bfs_results").unwrap();
+        .output("bfs_results")
+        .unwrap();
 
     let dataflow = builder.build().expect("graph construction failed");
 

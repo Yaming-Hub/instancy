@@ -66,7 +66,8 @@ fn advance_to_moves_frontier() {
     let input = builder.input::<i32>("data").unwrap();
     input
         .map("identity", |_time, value| value)
-        .output("results").unwrap();
+        .output("results")
+        .unwrap();
     let dataflow = builder.build().unwrap();
 
     let mut handle = rt.spawn(dataflow, SpawnOptions::new()).unwrap();
@@ -109,7 +110,8 @@ fn notification_fires_at_correct_time() {
                 Ok(())
             }
         })
-        .output("results").unwrap();
+        .output("results")
+        .unwrap();
     let dataflow = builder.build().unwrap();
 
     let mut handle = rt.spawn(dataflow, SpawnOptions::new()).unwrap();
@@ -153,7 +155,8 @@ fn notification_waits_for_all_input() {
                 Ok(())
             }
         })
-        .output("results").unwrap();
+        .output("results")
+        .unwrap();
     let dataflow = builder.build().unwrap();
 
     let mut handle = rt.spawn(dataflow, SpawnOptions::new()).unwrap();
@@ -263,7 +266,8 @@ fn multi_worker_frontier_coordination() {
                             Ok(())
                         }
                     })
-                    .output("results").unwrap();
+                    .output("results")
+                    .unwrap();
                 Ok(())
             },
             SpawnOptions::new(),
@@ -328,7 +332,8 @@ fn nested_loop_timestamps() {
                 output: done,
             }
         })
-        .output("results").unwrap();
+        .output("results")
+        .unwrap();
     let dataflow = builder.build().unwrap();
 
     let mut handle = rt.spawn(dataflow, SpawnOptions::new()).unwrap();

@@ -61,7 +61,10 @@ async fn dataflow_completes_before_token_cancelled() {
     let builder = DataflowBuilder::<u64>::new("no-cancel-test");
 
     let input = builder.input::<i32>("data").unwrap();
-    input.map("double", |_t, v| v * 2).output("results").unwrap();
+    input
+        .map("double", |_t, v| v * 2)
+        .output("results")
+        .unwrap();
 
     let dataflow = builder.build().unwrap();
 

@@ -164,9 +164,7 @@ fn build_iterative_filter(builder: &mut DataflowBuilder<u64>) -> Result<(Vec<Str
 }
 
 /// DistributedJoin: two inputs → exchange both → binary join on key → output.
-fn build_distributed_join(
-    builder: &mut DataflowBuilder<u64>,
-) -> Result<(Vec<String>, String)> {
+fn build_distributed_join(builder: &mut DataflowBuilder<u64>) -> Result<(Vec<String>, String)> {
     let left_input = builder.input::<(u64, String)>("left");
     let right_input = builder.input::<(u64, i64)>("right");
 

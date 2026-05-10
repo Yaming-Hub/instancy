@@ -97,7 +97,8 @@ fn main() {
                             Ok(())
                         }
                     })
-                    .output("results").unwrap();
+                    .output("results")
+                    .unwrap();
 
                 Ok(())
             },
@@ -152,7 +153,8 @@ fn main() {
                 .exchange_by_hash_to("repartition", 4, |x: &i32| *x as u64)
                 .unwrap()
                 .map("noop", |_t, x| x)
-                .output("out").unwrap();
+                .output("out")
+                .unwrap();
             Ok(())
         },
         SpawnOptions::new().per_stage_parallelism(false), // also disables auto_parallelism
@@ -183,7 +185,8 @@ fn main() {
                 input
                     .map("triple", |_t, x| x * 3)
                     .map("add_one", |_t, x| x + 1)
-                    .output("out").unwrap();
+                    .output("out")
+                    .unwrap();
                 Ok(())
             },
             SpawnOptions::default(),

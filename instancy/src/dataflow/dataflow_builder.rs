@@ -396,10 +396,7 @@ impl<T: Timestamp> DataflowBuilder<T> {
     /// # Panics
     ///
     /// Panics if an input with the same name already exists.
-    pub fn input<D: Clone + Send + 'static>(
-        &self,
-        name: impl Into<String>,
-    ) -> Result<Pipe<T, D>> {
+    pub fn input<D: Clone + Send + 'static>(&self, name: impl Into<String>) -> Result<Pipe<T, D>> {
         let name = name.into();
         let op_idx;
         let stage_id = StageId::new(0);
@@ -499,7 +496,8 @@ impl<T: Timestamp> DataflowBuilder<T> {
                                                     })
                                             })
                                             .collect::<Result<_>>()?;
-                                        tee_or_single(pushers)?.unwrap_or_else(|| Box::new(NullPush))
+                                        tee_or_single(pushers)?
+                                            .unwrap_or_else(|| Box::new(NullPush))
                                     };
                                     let op = ChannelSourceOperator::new(
                                         factory_name,
@@ -544,7 +542,8 @@ impl<T: Timestamp> DataflowBuilder<T> {
                                                     })
                                             })
                                             .collect::<Result<_>>()?;
-                                        tee_or_single(pushers)?.unwrap_or_else(|| Box::new(NullPush))
+                                        tee_or_single(pushers)?
+                                            .unwrap_or_else(|| Box::new(NullPush))
                                     };
                                     let op = ChannelSourceOperator::new(
                                         factory_name,
@@ -2154,7 +2153,8 @@ impl<T: Timestamp, D: Clone + Send + 'static> Pipe<T, D> {
             let enter_edge_idx = state.graph.edges().len() - 1;
             let cap = enter_capacity;
             let cf: ChannelFactory = channel_factory(move |_ctx, wake: Option<WakeHandle>| {
-                let (push, pull) = bounded_channel_with_wake::<T, D, ()>(cap, wake.clone(), prealloc);
+                let (push, pull) =
+                    bounded_channel_with_wake::<T, D, ()>(cap, wake.clone(), prealloc);
                 Ok((
                     Box::new(Box::new(push) as Box<dyn Push<T, D>>)
                         as Box<dyn std::any::Any + Send>,
@@ -2604,8 +2604,11 @@ impl<T: Timestamp, D: Clone + Send + 'static> Pipe<T, D> {
             let cap = output_capacity;
             let cf_leave: ChannelFactory =
                 channel_factory(move |_ctx, wake: Option<WakeHandle>| {
-                    let (push, pull) =
-                        bounded_channel_with_wake::<PT<T, TInner>, D, ()>(cap, wake.clone(), prealloc);
+                    let (push, pull) = bounded_channel_with_wake::<PT<T, TInner>, D, ()>(
+                        cap,
+                        wake.clone(),
+                        prealloc,
+                    );
                     Ok((
                         Box::new(Box::new(push) as Box<dyn Push<PT<T, TInner>, D>>)
                             as Box<dyn std::any::Any + Send>,
@@ -2642,7 +2645,9 @@ impl<T: Timestamp, D: Clone + Send + 'static> Pipe<T, D> {
     /// ```
     pub fn concat(mut streams: Vec<Pipe<T, D>>) -> Result<Pipe<T, D>> {
         if streams.is_empty() {
-            return Err(Error::InvalidConfig("concat requires at least one Pipe".into()));
+            return Err(Error::InvalidConfig(
+                "concat requires at least one Pipe".into(),
+            ));
         }
 
         // Verify all streams share the same builder.
@@ -3198,7 +3203,9 @@ impl<
         key_fn: impl Fn(&D) -> K + Send + Sync + 'static,
     ) -> Result<Pipe<T, D>> {
         if target_parallelism == 0 {
-            return Err(Error::InvalidConfig("target_parallelism must be > 0".into()));
+            return Err(Error::InvalidConfig(
+                "target_parallelism must be > 0".into(),
+            ));
         }
         let capacity = self.resolve_capacity();
         let exchange_fn = crate::dataflow::channels::pact::ExchangeFn::by_key(name.into(), key_fn);
@@ -3249,7 +3256,9 @@ impl<
         hash_fn: impl Fn(&D) -> u64 + Send + Sync + 'static,
     ) -> Result<Pipe<T, D>> {
         if target_parallelism == 0 {
-            return Err(Error::InvalidConfig("target_parallelism must be > 0".into()));
+            return Err(Error::InvalidConfig(
+                "target_parallelism must be > 0".into(),
+            ));
         }
         let capacity = self.resolve_capacity();
         let exchange_fn = crate::dataflow::channels::pact::ExchangeFn::new(name, hash_fn);
@@ -3350,7 +3359,9 @@ impl<
         target_parallelism: usize,
     ) -> Result<Pipe<T, D>> {
         if target_parallelism == 0 {
-            return Err(Error::InvalidConfig("target_parallelism must be > 0".into()));
+            return Err(Error::InvalidConfig(
+                "target_parallelism must be > 0".into(),
+            ));
         }
         let counter = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
         self.exchange_by_hash_to(name, target_parallelism, move |_| {
@@ -3452,7 +3463,9 @@ impl<T: Timestamp, D: Clone + Send + 'static> Pipe<T, D> {
         key_fn: impl Fn(&D) -> K + Send + Sync + 'static,
     ) -> Result<Pipe<T, D>> {
         if target_parallelism == 0 {
-            return Err(Error::InvalidConfig("target_parallelism must be > 0".into()));
+            return Err(Error::InvalidConfig(
+                "target_parallelism must be > 0".into(),
+            ));
         }
         let capacity = self.resolve_capacity();
         let exchange_fn = crate::dataflow::channels::pact::ExchangeFn::by_key(&name.into(), key_fn);
@@ -3502,7 +3515,9 @@ impl<T: Timestamp, D: Clone + Send + 'static> Pipe<T, D> {
         hash_fn: impl Fn(&D) -> u64 + Send + Sync + 'static,
     ) -> Result<Pipe<T, D>> {
         if target_parallelism == 0 {
-            return Err(Error::InvalidConfig("target_parallelism must be > 0".into()));
+            return Err(Error::InvalidConfig(
+                "target_parallelism must be > 0".into(),
+            ));
         }
         let capacity = self.resolve_capacity();
         let exchange_fn = crate::dataflow::channels::pact::ExchangeFn::new(name, hash_fn);
@@ -3575,7 +3590,9 @@ impl<T: Timestamp, D: Clone + Send + 'static> Pipe<T, D> {
         target_parallelism: usize,
     ) -> Result<Pipe<T, D>> {
         if target_parallelism == 0 {
-            return Err(Error::InvalidConfig("target_parallelism must be > 0".into()));
+            return Err(Error::InvalidConfig(
+                "target_parallelism must be > 0".into(),
+            ));
         }
         let counter = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
         self.exchange_by_hash_to(name, target_parallelism, move |_| {
@@ -5078,7 +5095,8 @@ mod tests {
             .map("double", |_t, x| x * 2)
             .filter("div_by_3", |_t, x| x % 3 == 0)
             .map("to_string", |_t, x| format!("{x}"))
-            .output("results").unwrap();
+            .output("results")
+            .unwrap();
         let dataflow = builder.build().unwrap();
         rt().run(dataflow).unwrap();
 
@@ -5099,7 +5117,8 @@ mod tests {
             .flat_map("split", |_t, line| {
                 line.split_whitespace().map(|w| w.to_string()).collect()
             })
-            .output("words").unwrap();
+            .output("words")
+            .unwrap();
         let dataflow = builder.build().unwrap();
         rt().run(dataflow).unwrap();
 
@@ -5122,8 +5141,12 @@ mod tests {
         let evens_port = stream
             .clone()
             .filter("evens", |_t, x| x % 2 == 0)
-            .output("evens").unwrap();
-        let odds_port = stream.filter("odds", |_t, x| x % 2 != 0).output("odds").unwrap();
+            .output("evens")
+            .unwrap();
+        let odds_port = stream
+            .filter("odds", |_t, x| x % 2 != 0)
+            .output("odds")
+            .unwrap();
 
         let dataflow = builder.build().unwrap();
         rt().run(dataflow).unwrap();
@@ -5164,7 +5187,8 @@ mod tests {
             .source("nums", vec![(0u64, vec![1i32, 2, 3])])
             .map("to_f64", |_t, x| x as f64 * 1.5)
             .map("to_string", |_t, x| format!("{x:.1}"))
-            .output("results").unwrap();
+            .output("results")
+            .unwrap();
         let dataflow = builder.build().unwrap();
         rt().run(dataflow).unwrap();
 
@@ -5179,7 +5203,8 @@ mod tests {
         let port = builder
             .source::<i32>("nums", vec![(0u64, vec![])])
             .map("double", |_t, x| x * 2)
-            .output("results").unwrap();
+            .output("results")
+            .unwrap();
         let dataflow = builder.build().unwrap();
         rt().run(dataflow).unwrap();
 
@@ -5197,7 +5222,8 @@ mod tests {
                 vec![(0u64, vec![1i32, 2]), (1u64, vec![3, 4]), (2u64, vec![5])],
             )
             .map("double", |_t, x| x * 2)
-            .output("results").unwrap();
+            .output("results")
+            .unwrap();
         let dataflow = builder.build().unwrap();
         rt().run(dataflow).unwrap();
 
@@ -5228,7 +5254,8 @@ mod tests {
         let builder = DataflowBuilder::<u64>::new("cancel_test");
         let _port = builder
             .source("nums", vec![(0u64, vec![1i32, 2, 3])])
-            .output("results").unwrap();
+            .output("results")
+            .unwrap();
         let dataflow = builder.build().unwrap();
         let result = SimpleRuntime::with_cancel(cancel).run(dataflow);
         assert!(result.is_err());
@@ -5281,7 +5308,8 @@ mod tests {
                 }
                 Ok(())
             })
-            .output("results").unwrap();
+            .output("results")
+            .unwrap();
         let dataflow = builder.build().unwrap();
         rt().run(dataflow).unwrap();
 
@@ -5293,7 +5321,11 @@ mod tests {
     #[test]
     fn test_input_port_rejected_by_run() {
         let builder = DataflowBuilder::<u64>::new("input_test");
-        let _port = builder.input::<i32>("data").unwrap().output("results").unwrap();
+        let _port = builder
+            .input::<i32>("data")
+            .unwrap()
+            .output("results")
+            .unwrap();
         let dataflow = builder.build().unwrap();
         let result = rt().run(dataflow);
         assert!(result.is_err());
@@ -5305,7 +5337,10 @@ mod tests {
     fn test_spawn_basic_pipeline() {
         let builder = DataflowBuilder::<u64>::new("spawn_test");
         let input = builder.input::<i32>("numbers").unwrap();
-        input.map("double", |_t, x| x * 2).output("results").unwrap();
+        input
+            .map("double", |_t, x| x * 2)
+            .output("results")
+            .unwrap();
         let dataflow = builder.build().unwrap();
 
         let mut handle = rt().spawn(dataflow).unwrap();
@@ -5332,7 +5367,10 @@ mod tests {
     fn test_spawn_filter_pipeline() {
         let builder = DataflowBuilder::<u64>::new("filter_spawn");
         let input = builder.input::<i32>("src").unwrap();
-        input.filter("evens", |_t, x| x % 2 == 0).output("evens").unwrap();
+        input
+            .filter("evens", |_t, x| x % 2 == 0)
+            .output("evens")
+            .unwrap();
         let dataflow = builder.build().unwrap();
 
         let mut handle = rt().spawn(dataflow).unwrap();
@@ -5420,7 +5458,8 @@ mod tests {
                 Ok(())
             })
             .unwrap()
-            .output("results").unwrap();
+            .output("results")
+            .unwrap();
 
         let dataflow = builder.build().unwrap();
         rt().run(dataflow).unwrap();
@@ -5456,7 +5495,8 @@ mod tests {
                 Ok(())
             })
             .unwrap()
-            .output("out").unwrap();
+            .output("out")
+            .unwrap();
 
         let dataflow = builder.build().unwrap();
         rt().run(dataflow).unwrap();
@@ -5497,7 +5537,10 @@ mod tests {
         let b = builder.source("b", vec![(0u64, vec![2i32])]);
         let c = builder.source("c", vec![(0u64, vec![3i32])]);
 
-        let port = Pipe::concat(vec![a, b, c]).unwrap().output("merged").unwrap();
+        let port = Pipe::concat(vec![a, b, c])
+            .unwrap()
+            .output("merged")
+            .unwrap();
         let dataflow = builder.build().unwrap();
         rt().run(dataflow).unwrap();
 
@@ -5532,9 +5575,11 @@ mod tests {
         let a = builder.source("a", vec![(0u64, vec![1i32, 2])]);
         let b = builder.source("b", vec![(0u64, vec![3i32, 4])]);
 
-        let port = Pipe::concat(vec![a, b]).unwrap()
+        let port = Pipe::concat(vec![a, b])
+            .unwrap()
             .map("double", |_t, x| x * 2)
-            .output("results").unwrap();
+            .output("results")
+            .unwrap();
         let dataflow = builder.build().unwrap();
         rt().run(dataflow).unwrap();
 
@@ -5590,7 +5635,8 @@ mod tests {
                     output: done,
                 }
             })
-            .output("results").unwrap();
+            .output("results")
+            .unwrap();
         let dataflow = builder.build().unwrap();
         rt().run(dataflow).unwrap();
 
@@ -5620,7 +5666,8 @@ mod tests {
                     output: done,
                 }
             })
-            .output("results").unwrap();
+            .output("results")
+            .unwrap();
         let dataflow = builder.build().unwrap();
         rt().run(dataflow).unwrap();
 
@@ -5648,7 +5695,8 @@ mod tests {
                     output: done,
                 }
             })
-            .output("results").unwrap();
+            .output("results")
+            .unwrap();
         let dataflow = builder.build().unwrap();
         rt().run(dataflow).unwrap();
 
@@ -5678,7 +5726,8 @@ mod tests {
                     output: done,
                 }
             })
-            .output("results").unwrap();
+            .output("results")
+            .unwrap();
         let dataflow = builder.build().unwrap();
         rt().run(dataflow).unwrap();
 
@@ -5717,7 +5766,8 @@ mod tests {
                     Ok(())
                 }
             })
-            .output("results").unwrap();
+            .output("results")
+            .unwrap();
         let dataflow = builder.build().unwrap();
         rt().run(dataflow).unwrap();
 
@@ -5758,7 +5808,8 @@ mod tests {
                     Ok(())
                 }
             })
-            .output("results").unwrap();
+            .output("results")
+            .unwrap();
         let dataflow = builder.build().unwrap();
         rt().run(dataflow).unwrap();
 
@@ -5798,7 +5849,8 @@ mod tests {
                 }
             })
             .map("format", |_t, x| format!("sum={x}"))
-            .output("results").unwrap();
+            .output("results")
+            .unwrap();
         let dataflow = builder.build().unwrap();
         rt().run(dataflow).unwrap();
 
@@ -5825,7 +5877,8 @@ mod tests {
                     Ok(())
                 }
             })
-            .output("results").unwrap();
+            .output("results")
+            .unwrap();
         let dataflow = builder.build().unwrap();
         rt().run(dataflow).unwrap();
 
@@ -5863,7 +5916,8 @@ mod tests {
                     Ok(())
                 }
             })
-            .output("results").unwrap();
+            .output("results")
+            .unwrap();
         let dataflow = builder.build().unwrap();
         rt().run(dataflow).unwrap();
 
@@ -5892,9 +5946,11 @@ mod tests {
         let builder = DataflowBuilder::<u64>::new("cap_basic");
         let port = builder
             .source("nums", vec![(0u64, vec![1i32, 2, 3])])
-            .with_capacity(4).unwrap()
+            .with_capacity(4)
+            .unwrap()
             .map("double", |_t, x| x * 2)
-            .output("results").unwrap();
+            .output("results")
+            .unwrap();
         let dataflow = builder.build().unwrap();
         rt().run(dataflow).unwrap();
 
@@ -5909,12 +5965,15 @@ mod tests {
         let builder = DataflowBuilder::<u64>::new("cap_chain");
         let port = builder
             .source("nums", vec![(0u64, vec![1i32, 2, 3, 4])])
-            .with_capacity(8).unwrap()
+            .with_capacity(8)
+            .unwrap()
             .map("double", |_t, x| x * 2)
             // no with_capacity here → default capacity
             .filter("positive", |_t, &x| x > 0)
-            .with_capacity(16).unwrap()
-            .output("results").unwrap();
+            .with_capacity(16)
+            .unwrap()
+            .output("results")
+            .unwrap();
         let dataflow = builder.build().unwrap();
         rt().run(dataflow).unwrap();
 
@@ -5926,10 +5985,12 @@ mod tests {
     #[test]
     fn test_with_capacity_zero_panics() {
         let builder = DataflowBuilder::<u64>::new("cap_zero");
-        assert!(builder
-            .source("nums", vec![(0u64, vec![1i32])])
-            .with_capacity(0)
-            .is_err());
+        assert!(
+            builder
+                .source("nums", vec![(0u64, vec![1i32])])
+                .with_capacity(0)
+                .is_err()
+        );
     }
 
     #[test]
@@ -5938,7 +5999,8 @@ mod tests {
         let builder = DataflowBuilder::<u64>::new("cap_clone");
         let s = builder
             .source("nums", vec![(0u64, vec![1i32, 2, 3])])
-            .with_capacity(4).unwrap();
+            .with_capacity(4)
+            .unwrap();
         let s2 = s.clone();
 
         // s still has the override, s2 does not
@@ -5963,12 +6025,16 @@ mod tests {
         let builder = DataflowBuilder::<u64>::new("cap_small");
         let port = builder
             .source("nums", vec![(0u64, vec![1i32, 2, 3, 4, 5, 6, 7, 8, 9, 10])])
-            .with_capacity(1).unwrap()
+            .with_capacity(1)
+            .unwrap()
             .map("inc", |_t, x| x + 1)
-            .with_capacity(1).unwrap()
+            .with_capacity(1)
+            .unwrap()
             .filter("even", |_t, &x| x % 2 == 0)
-            .with_capacity(1).unwrap()
-            .output("results").unwrap();
+            .with_capacity(1)
+            .unwrap()
+            .output("results")
+            .unwrap();
         let dataflow = builder.build().unwrap();
         rt().run(dataflow).unwrap();
 
@@ -5984,7 +6050,8 @@ mod tests {
         let builder = DataflowBuilder::<u64>::new("cap_unary");
         let port = builder
             .source("nums", vec![(0u64, vec![1i32, 2, 3])])
-            .with_capacity(2).unwrap()
+            .with_capacity(2)
+            .unwrap()
             .unary("sum", |input, output| {
                 while let Some((time, data)) = input.next() {
                     let sum: i32 = data.iter().sum();
@@ -5992,7 +6059,8 @@ mod tests {
                 }
                 Ok(())
             })
-            .output("results").unwrap();
+            .output("results")
+            .unwrap();
         let dataflow = builder.build().unwrap();
         rt().run(dataflow).unwrap();
 
@@ -6006,10 +6074,12 @@ mod tests {
         let builder = DataflowBuilder::<u64>::new("cap_concat");
         let a = builder
             .source("a", vec![(0u64, vec![1i32, 2])])
-            .with_capacity(4).unwrap();
+            .with_capacity(4)
+            .unwrap();
         let b = builder
             .source("b", vec![(0u64, vec![3i32, 4])])
-            .with_capacity(8).unwrap();
+            .with_capacity(8)
+            .unwrap();
         let port = Pipe::concat(vec![a, b]).unwrap().output("merged").unwrap();
         let dataflow = builder.build().unwrap();
         rt().run(dataflow).unwrap();
@@ -6030,7 +6100,10 @@ mod tests {
             "data",
             vec![(0u64, vec![Ok(1), Err("bad".into()), Ok(3)])],
         );
-        let port = stream.map_ok("double", |_t, v| v * 2).output("results").unwrap();
+        let port = stream
+            .map_ok("double", |_t, v| v * 2)
+            .output("results")
+            .unwrap();
         let dataflow = builder.build().unwrap();
         rt().run(dataflow).unwrap();
 
@@ -6048,7 +6121,8 @@ mod tests {
         );
         let port = stream
             .filter_ok("even", |_t, v| v % 2 == 0)
-            .output("results").unwrap();
+            .output("results")
+            .unwrap();
         let dataflow = builder.build().unwrap();
         rt().run(dataflow).unwrap();
 
@@ -6075,7 +6149,8 @@ mod tests {
             .and_then("parse", |_t, s: String| {
                 s.parse::<i32>().map_err(|e| e.to_string())
             })
-            .output("results").unwrap();
+            .output("results")
+            .unwrap();
         let dataflow = builder.build().unwrap();
         rt().run(dataflow).unwrap();
 
@@ -6124,7 +6199,8 @@ mod tests {
         let port = stream
             .map_ok("double", |_t, v| v * 2)
             .filter_ok("big", |_t, v| *v > 4)
-            .output("results").unwrap();
+            .output("results")
+            .unwrap();
         let dataflow = builder.build().unwrap();
         rt().run(dataflow).unwrap();
 
@@ -6138,7 +6214,10 @@ mod tests {
         let builder = DataflowBuilder::<u64>::new("all_ok");
         let stream = builder
             .source::<std::result::Result<i32, String>>("data", vec![(0u64, vec![Ok(10), Ok(20)])]);
-        let port = stream.map_ok("inc", |_t, v| v + 1).output("results").unwrap();
+        let port = stream
+            .map_ok("inc", |_t, v| v + 1)
+            .output("results")
+            .unwrap();
         let dataflow = builder.build().unwrap();
         rt().run(dataflow).unwrap();
 
@@ -6154,7 +6233,10 @@ mod tests {
             "data",
             vec![(0u64, vec![Err("a".into()), Err("b".into())])],
         );
-        let port = stream.map_ok("inc", |_t, v: i32| v + 1).output("results").unwrap();
+        let port = stream
+            .map_ok("inc", |_t, v: i32| v + 1)
+            .output("results")
+            .unwrap();
         let dataflow = builder.build().unwrap();
         rt().run(dataflow).unwrap();
 
@@ -6232,7 +6314,10 @@ mod tests {
     fn test_take_while_stops_at_predicate() {
         let builder = DataflowBuilder::<u64>::new("take_while_stop");
         let stream = builder.source("nums", vec![(0u64, vec![1i32, 2, 3, 4, 5])]);
-        let port = stream.take_while("small", |_t, x| *x < 4).output("out").unwrap();
+        let port = stream
+            .take_while("small", |_t, x| *x < 4)
+            .output("out")
+            .unwrap();
         let dataflow = builder.build().unwrap();
         rt().run(dataflow).unwrap();
 
@@ -6246,7 +6331,10 @@ mod tests {
     fn test_take_while_all_pass() {
         let builder = DataflowBuilder::<u64>::new("take_while_all");
         let stream = builder.source("nums", vec![(0u64, vec![1i32, 2, 3])]);
-        let port = stream.take_while("always", |_t, _x| true).output("out").unwrap();
+        let port = stream
+            .take_while("always", |_t, _x| true)
+            .output("out")
+            .unwrap();
         let dataflow = builder.build().unwrap();
         rt().run(dataflow).unwrap();
 
@@ -6260,7 +6348,10 @@ mod tests {
     fn test_take_while_none_pass() {
         let builder = DataflowBuilder::<u64>::new("take_while_none");
         let stream = builder.source("nums", vec![(0u64, vec![1i32, 2, 3])]);
-        let port = stream.take_while("never", |_t, _x| false).output("out").unwrap();
+        let port = stream
+            .take_while("never", |_t, _x| false)
+            .output("out")
+            .unwrap();
         let dataflow = builder.build().unwrap();
         rt().run(dataflow).unwrap();
 
@@ -6277,7 +6368,10 @@ mod tests {
             "nums",
             vec![(0u64, vec![1i32, 2]), (1u64, vec![3, 10]), (2u64, vec![20])],
         );
-        let port = stream.take_while("under10", |_t, x| *x < 10).output("out").unwrap();
+        let port = stream
+            .take_while("under10", |_t, x| *x < 10)
+            .output("out")
+            .unwrap();
         let dataflow = builder.build().unwrap();
         rt().run(dataflow).unwrap();
 
@@ -6294,7 +6388,8 @@ mod tests {
         let port = stream
             .take("first2", 2)
             .map("double", |_t, x| x * 2)
-            .output("out").unwrap();
+            .output("out")
+            .unwrap();
         let dataflow = builder.build().unwrap();
         rt().run(dataflow).unwrap();
 
@@ -6366,7 +6461,8 @@ mod tests {
             .inspect("spy", move |_t, x| {
                 seen_clone.lock().unwrap().push(*x);
             })
-            .output("results").unwrap();
+            .output("results")
+            .unwrap();
         let dataflow = builder.build().unwrap();
         rt().run(dataflow).unwrap();
 
@@ -6393,7 +6489,8 @@ mod tests {
             .inspect_batch("batch-spy", move |_t, batch| {
                 batch_sizes_clone.lock().unwrap().push(batch.len());
             })
-            .output("results").unwrap();
+            .output("results")
+            .unwrap();
         let dataflow = builder.build().unwrap();
         rt().run(dataflow).unwrap();
 
@@ -6420,7 +6517,8 @@ mod tests {
             .filter("even", |_t, x| x % 2 == 0)
             .inspect("tap2", |_t, _x| { /* no-op */ })
             .map("double", |_t, x| x * 2)
-            .output("results").unwrap();
+            .output("results")
+            .unwrap();
         let dataflow = builder.build().unwrap();
         rt().run(dataflow).unwrap();
 
@@ -6440,7 +6538,8 @@ mod tests {
             .inspect("ts-spy", move |t, _x| {
                 ts_clone.lock().unwrap().push(*t);
             })
-            .output("results").unwrap();
+            .output("results")
+            .unwrap();
         let dataflow = builder.build().unwrap();
         rt().run(dataflow).unwrap();
 
@@ -6536,7 +6635,8 @@ mod tests {
                 vec![(0u64, vec![1i32, 2, 3]), (1u64, vec![10i32, 20])],
             )
             .reduce("sum", |a, b| a + b)
-            .output("results").unwrap();
+            .output("results")
+            .unwrap();
         let dataflow = builder.build().unwrap();
         rt().run(dataflow).unwrap();
 
@@ -6556,7 +6656,8 @@ mod tests {
         let port = builder
             .source("nums", vec![(0u64, vec![42i32])])
             .reduce("id", |a, b| a + b)
-            .output("results").unwrap();
+            .output("results")
+            .unwrap();
         let dataflow = builder.build().unwrap();
         rt().run(dataflow).unwrap();
 
@@ -6571,7 +6672,8 @@ mod tests {
         let port = builder
             .source::<i32>("nums", vec![])
             .reduce("sum", |a, b| a + b)
-            .output("results").unwrap();
+            .output("results")
+            .unwrap();
         let dataflow = builder.build().unwrap();
         rt().run(dataflow).unwrap();
 
@@ -6590,7 +6692,8 @@ mod tests {
                 vec![(0u64, vec![10i32, 20, 30]), (1u64, vec![40i32, 50])],
             )
             .fold("count", 0usize, |acc, _item| acc + 1)
-            .output("results").unwrap();
+            .output("results")
+            .unwrap();
         let dataflow = builder.build().unwrap();
         rt().run(dataflow).unwrap();
 
@@ -6616,7 +6719,8 @@ mod tests {
                 acc.push_str(&x.to_string());
                 acc
             })
-            .output("results").unwrap();
+            .output("results")
+            .unwrap();
         let dataflow = builder.build().unwrap();
         rt().run(dataflow).unwrap();
 
@@ -6632,7 +6736,8 @@ mod tests {
             .source("nums", vec![(0u64, vec![1i32, 2, 3, 4])])
             .reduce("sum", |a, b| a + b)
             .map("negate", |_t, x| -x)
-            .output("results").unwrap();
+            .output("results")
+            .unwrap();
         let dataflow = builder.build().unwrap();
         rt().run(dataflow).unwrap();
 
@@ -6647,7 +6752,8 @@ mod tests {
         let port = builder
             .source("nums", vec![(0u64, vec![1i32, 2, 2, 3, 1, 3, 4])])
             .distinct("dedup")
-            .output("results").unwrap();
+            .output("results")
+            .unwrap();
         let dataflow = builder.build().unwrap();
         rt().run(dataflow).unwrap();
 
@@ -6667,7 +6773,8 @@ mod tests {
                 vec![(0u64, vec![1i32, 1, 2]), (1u64, vec![2i32, 2, 3])],
             )
             .distinct("dedup")
-            .output("results").unwrap();
+            .output("results")
+            .unwrap();
         let dataflow = builder.build().unwrap();
         rt().run(dataflow).unwrap();
 
@@ -6696,7 +6803,8 @@ mod tests {
         let port = builder
             .source("nums", vec![(0u64, vec![1i32, 2, 3, 4, 5])])
             .distinct("dedup")
-            .output("results").unwrap();
+            .output("results")
+            .unwrap();
         let dataflow = builder.build().unwrap();
         rt().run(dataflow).unwrap();
 
@@ -6713,7 +6821,8 @@ mod tests {
         let port = builder
             .source::<i32>("nums", vec![])
             .distinct("dedup")
-            .output("results").unwrap();
+            .output("results")
+            .unwrap();
         let dataflow = builder.build().unwrap();
         rt().run(dataflow).unwrap();
 
@@ -6731,7 +6840,8 @@ mod tests {
                 vec![(0u64, vec![10i32, 20, 30]), (1u64, vec![40i32, 50])],
             )
             .count("count")
-            .output("results").unwrap();
+            .output("results")
+            .unwrap();
         let dataflow = builder.build().unwrap();
         rt().run(dataflow).unwrap();
 
@@ -6752,7 +6862,8 @@ mod tests {
             .source("nums", vec![(0u64, vec![1i32, 1, 2, 2, 3])])
             .distinct("dedup")
             .count("count")
-            .output("results").unwrap();
+            .output("results")
+            .unwrap();
         let dataflow = builder.build().unwrap();
         rt().run(dataflow).unwrap();
 
@@ -6769,7 +6880,8 @@ mod tests {
         let port = builder
             .source("nums", vec![(0u64, vec![1i32, 2, 3, 4, 5])])
             .gather("collect-all")
-            .output("results").unwrap();
+            .output("results")
+            .unwrap();
         let dataflow = builder.build().unwrap();
         rt().run(dataflow).unwrap();
 
@@ -6787,7 +6899,8 @@ mod tests {
             .source("nums", vec![(0u64, vec![10i32, 20, 30])])
             .gather("collect")
             .reduce("sum", |acc, x| acc + x)
-            .output("results").unwrap();
+            .output("results")
+            .unwrap();
         let dataflow = builder.build().unwrap();
         rt().run(dataflow).unwrap();
 
@@ -6804,7 +6917,8 @@ mod tests {
         let port = builder
             .source("nums", vec![(0u64, vec![1i32, 2, 3, 4, 5, 6])])
             .rebalance("spread")
-            .output("results").unwrap();
+            .output("results")
+            .unwrap();
         let dataflow = builder.build().unwrap();
         rt().run(dataflow).unwrap();
 
@@ -6822,7 +6936,8 @@ mod tests {
             .source("nums", vec![(0u64, vec![1i32, 2, 3])])
             .rebalance("distribute")
             .map("double", |_t, x| x * 2)
-            .output("results").unwrap();
+            .output("results")
+            .unwrap();
         let dataflow = builder.build().unwrap();
         rt().run(dataflow).unwrap();
 
@@ -6839,7 +6954,8 @@ mod tests {
         let port = builder
             .source("nums", vec![(0u64, vec![1i32, 2]), (1u64, vec![10, 20])])
             .gather("collect")
-            .output("results").unwrap();
+            .output("results")
+            .unwrap();
         let dataflow = builder.build().unwrap();
         rt().run(dataflow).unwrap();
 
@@ -6855,8 +6971,10 @@ mod tests {
         let builder = DataflowBuilder::<u64>::new("rebalance_to_test");
         let port = builder
             .source("nums", vec![(0u64, vec![1i32, 2, 3, 4])])
-            .rebalance_to("fan-out", 4).unwrap()
-            .output("results").unwrap();
+            .rebalance_to("fan-out", 4)
+            .unwrap()
+            .output("results")
+            .unwrap();
         let dataflow = builder.build().unwrap();
         rt().run(dataflow).unwrap();
 
@@ -6872,7 +6990,8 @@ mod tests {
         let builder = DataflowBuilder::<u64>::new("rebalance_to_zero");
         builder
             .source("nums", vec![(0u64, vec![1i32])])
-            .rebalance_to("bad", 0).unwrap();
+            .rebalance_to("bad", 0)
+            .unwrap();
     }
 
     #[test]
@@ -6885,7 +7004,8 @@ mod tests {
                 batch.sort();
                 batch
             })
-            .output("results").unwrap();
+            .output("results")
+            .unwrap();
         let dataflow = builder.build().unwrap();
         rt().run(dataflow).unwrap();
 
@@ -6908,7 +7028,8 @@ mod tests {
                     .map(|x| x * 2)
                     .collect()
             })
-            .output("results").unwrap();
+            .output("results")
+            .unwrap();
         let dataflow = builder.build().unwrap();
         rt().run(dataflow).unwrap();
 
@@ -6925,7 +7046,8 @@ mod tests {
         let port = builder
             .source("nums", vec![(0u64, vec![1i32, 2, 3])])
             .map_batch("drop-all", |_t, _batch| Vec::<i32>::new())
-            .output("results").unwrap();
+            .output("results")
+            .unwrap();
         let dataflow = builder.build().unwrap();
         rt().run(dataflow).unwrap();
 
@@ -6944,7 +7066,8 @@ mod tests {
             .map_batch("to_string", |_t, batch| {
                 batch.into_iter().map(|x| format!("v{x}")).collect()
             })
-            .output("results").unwrap();
+            .output("results")
+            .unwrap();
         let dataflow = builder.build().unwrap();
         rt().run(dataflow).unwrap();
 
@@ -6967,7 +7090,8 @@ mod tests {
                 batch.sort();
                 batch
             })
-            .output("results").unwrap();
+            .output("results")
+            .unwrap();
         let dataflow = builder.build().unwrap();
         rt().run(dataflow).unwrap();
 

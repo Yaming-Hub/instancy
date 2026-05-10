@@ -37,7 +37,10 @@ fn empty_input_completes_cleanly() {
     let rt = RuntimeHandle::new(RuntimeConfig::default()).unwrap();
     let builder = DataflowBuilder::<u64>::new("empty-input");
     let input = builder.input::<i32>("data").unwrap();
-    input.map("double", |_t, v| v * 2).output("results").unwrap();
+    input
+        .map("double", |_t, v| v * 2)
+        .output("results")
+        .unwrap();
     let dataflow = builder.build().unwrap();
 
     let mut handle = rt.spawn(dataflow, SpawnOptions::new()).unwrap();
@@ -66,7 +69,8 @@ fn single_record_per_timestamp() {
     input
         .map("increment", |_t, v| v + 1)
         .filter("positive", |_t, v| *v > 0)
-        .output("results").unwrap();
+        .output("results")
+        .unwrap();
     let dataflow = builder.build().unwrap();
 
     let mut handle = rt.spawn(dataflow, SpawnOptions::new()).unwrap();
@@ -165,7 +169,10 @@ fn large_batch_single_timestamp() {
     let rt = RuntimeHandle::new(RuntimeConfig::default()).unwrap();
     let builder = DataflowBuilder::<u64>::new("large-batch");
     let input = builder.input::<i32>("data").unwrap();
-    input.map("double", |_t, v| v * 2).output("results").unwrap();
+    input
+        .map("double", |_t, v| v * 2)
+        .output("results")
+        .unwrap();
     let dataflow = builder.build().unwrap();
 
     let mut handle = rt.spawn(dataflow, SpawnOptions::new()).unwrap();
@@ -297,7 +304,8 @@ fn notify_fires_without_data_at_time() {
                 Ok(())
             }
         })
-        .output("results").unwrap();
+        .output("results")
+        .unwrap();
     let dataflow = builder.build().unwrap();
 
     let mut handle = rt.spawn(dataflow, SpawnOptions::new()).unwrap();
@@ -351,7 +359,8 @@ fn flat_map_variable_output() {
                 vec![v; v as usize]
             }
         })
-        .output("results").unwrap();
+        .output("results")
+        .unwrap();
     let dataflow = builder.build().unwrap();
 
     let mut handle = rt.spawn(dataflow, SpawnOptions::new()).unwrap();

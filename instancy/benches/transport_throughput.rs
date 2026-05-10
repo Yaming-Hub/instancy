@@ -3,13 +3,17 @@
 //! Each benchmark uses in-memory `tokio::io::DuplexStream` pairs to isolate
 //! transport overhead from actual network I/O.
 
+use std::collections::VecDeque;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
 use tokio::runtime::Runtime;
 
 use instancy::communication::shared_pool::SharedConnectionConfig;
-use instancy::communication::shared_transport::SharedPeerManager;
+use instancy::communication::shared_transport::{
+    ConnectionFactory, DynConnectionFactory, SharedPeerManager,
+};
 use instancy::communication::transport::Frame;
 use instancy::communication::transport_session::{
     ChannelRegistration, PeerConnection, TransportSession,
@@ -46,6 +50,58 @@ fn shared_config(num_connections: usize) -> SharedConnectionConfig {
         reorder_timeout: Duration::from_secs(60),
         rtt_ema_alpha: 0.2,
         idle_timeout: None, // disable idle cleanup during bench
+    }
+}
+
+struct PreEstablishedFactory {
+    connections: Mutex<
+        VecDeque<(
+            Box<dyn tokio::io::AsyncRead + Unpin + Send>,
+            Box<dyn tokio::io::AsyncWrite + Unpin + Send>,
+        )>,
+    >,
+}
+
+impl PreEstablishedFactory {
+    fn new<R, W>(connections: Vec<(R, W)>) -> Self
+    where
+        R: tokio::io::AsyncRead + Unpin + Send + 'static,
+        W: tokio::io::AsyncWrite + Unpin + Send + 'static,
+    {
+        Self {
+            connections: Mutex::new(
+                connections
+                    .into_iter()
+                    .map(|(reader, writer)| {
+                        (
+                            Box::new(reader) as Box<dyn tokio::io::AsyncRead + Unpin + Send>,
+                            Box::new(writer) as Box<dyn tokio::io::AsyncWrite + Unpin + Send>,
+                        )
+                    })
+                    .collect(),
+            ),
+        }
+    }
+}
+
+impl ConnectionFactory for PreEstablishedFactory {
+    type Reader = Box<dyn tokio::io::AsyncRead + Unpin + Send>;
+    type Writer = Box<dyn tokio::io::AsyncWrite + Unpin + Send>;
+
+    async fn establish(
+        &self,
+        _peer_node_id: &str,
+    ) -> Result<(Self::Reader, Self::Writer), Box<dyn std::error::Error + Send + Sync>> {
+        self.connections
+            .lock()
+            .expect("pre-established factory lock poisoned")
+            .pop_front()
+            .ok_or_else(|| {
+                Box::<dyn std::error::Error + Send + Sync>::from(std::io::Error::new(
+                    std::io::ErrorKind::NotConnected,
+                    "no more pre-established connections",
+                ))
+            })
     }
 }
 
@@ -196,14 +252,16 @@ fn bench_shared_single_dataflow(c: &mut Criterion) {
 
                     let handle = tokio::runtime::Handle::current();
 
-                    // SharedPeerManager takes (Reader, Writer) — reader for incoming, writer for outgoing
+                    // SharedPeerManager lazily draws connections from the factory.
+                    let factory: Arc<dyn DynConnectionFactory> =
+                        Arc::new(PreEstablishedFactory::new(vec![(local_read, local_write)]));
                     let manager = SharedPeerManager::new(
                         "peer".to_string(),
                         shared_config(1),
-                        vec![(local_read, local_write)],
-                        None,
+                        factory,
                         &handle,
-                    ).unwrap();
+                    )
+                    .unwrap();
 
                     let (mut receivers, _error_rx) = manager
                         .register_dataflow(dataflow_id, &[CHANNEL_ID], 4096)
@@ -429,13 +487,15 @@ fn bench_shared_multi_dataflow(c: &mut Criterion) {
                         }));
                     }
 
+                    let factory: Arc<dyn DynConnectionFactory> =
+                        Arc::new(PreEstablishedFactory::new(connections));
                     let manager = SharedPeerManager::new(
                         "peer".to_string(),
                         shared_config(num_conns),
-                        connections,
-                        None,
+                        factory,
                         &handle,
-                    ).unwrap();
+                    )
+                    .unwrap();
 
                     let mut send_tasks = Vec::new();
                     let mut recv_tasks = Vec::new();
@@ -544,13 +604,15 @@ fn bench_shared_scaling_connections(c: &mut Criterion) {
                         }));
                     }
 
+                    let factory: Arc<dyn DynConnectionFactory> =
+                        Arc::new(PreEstablishedFactory::new(connections));
                     let manager = SharedPeerManager::new(
                         "peer".to_string(),
                         shared_config(n_conns),
-                        connections,
-                        None,
+                        factory,
                         &handle,
-                    ).unwrap();
+                    )
+                    .unwrap();
 
                     let (mut receivers, _err_rx) = manager
                         .register_dataflow(dataflow_id, &[CHANNEL_ID], 4096)

@@ -49,7 +49,8 @@ fn build_recording_dataflow(
     let completed_at_slot = Arc::clone(&probe.completed_at_ms);
 
     builder
-        .input::<u64>("input").unwrap()
+        .input::<u64>("input")
+        .unwrap()
         .map("work", |_t, value| value + 1)
         .map("record-completion", move |_t, value| {
             if value == final_value + 1 {
@@ -67,9 +68,11 @@ fn build_recording_dataflow(
 fn build_simple_dataflow(name: &str) -> instancy::LogicalDataflow<u64> {
     let builder = DataflowBuilder::<u64>::new(name);
     builder
-        .input::<u64>("input").unwrap()
+        .input::<u64>("input")
+        .unwrap()
         .map("double", |_t, value| value * 2)
-        .output("output").unwrap();
+        .output("output")
+        .unwrap();
     builder.build().unwrap()
 }
 

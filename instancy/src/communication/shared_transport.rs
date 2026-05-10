@@ -109,6 +109,55 @@ pub trait ConnectionFactory: Send + Sync + 'static {
     > + Send;
 }
 
+/// Resolves peer node IDs to socket addresses.
+pub trait PeerAddressResolver: Send + Sync + 'static {
+    /// Resolve a peer node ID to its socket address.
+    fn resolve(&self, peer_node_id: &str) -> Option<std::net::SocketAddr>;
+}
+
+impl PeerAddressResolver for std::collections::HashMap<String, std::net::SocketAddr> {
+    fn resolve(&self, peer_node_id: &str) -> Option<std::net::SocketAddr> {
+        self.get(peer_node_id).copied()
+    }
+}
+
+/// Default connection factory using plain TCP (no TLS).
+///
+/// The application instantiates this with a resolver that maps peer node IDs
+/// to socket addresses. For TLS or custom protocols, implement
+/// [`ConnectionFactory`] directly.
+pub struct TcpConnectionFactory {
+    resolver: Arc<dyn PeerAddressResolver>,
+}
+
+impl TcpConnectionFactory {
+    pub fn new(resolver: impl PeerAddressResolver) -> Self {
+        Self {
+            resolver: Arc::new(resolver),
+        }
+    }
+}
+
+impl ConnectionFactory for TcpConnectionFactory {
+    type Reader = tokio::net::tcp::OwnedReadHalf;
+    type Writer = tokio::net::tcp::OwnedWriteHalf;
+
+    async fn establish(
+        &self,
+        peer_node_id: &str,
+    ) -> Result<(Self::Reader, Self::Writer), Box<dyn std::error::Error + Send + Sync>> {
+        let addr = self.resolver.resolve(peer_node_id).ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                format!("unknown peer: {peer_node_id}"),
+            )
+        })?;
+        let stream = tokio::net::TcpStream::connect(addr).await?;
+        stream.set_nodelay(true)?;
+        Ok(stream.into_split())
+    }
+}
+
 /// Type-erased reader half used by reconnect support.
 type DynReader = Box<dyn AsyncRead + Unpin + Send>;
 /// Type-erased writer half used by reconnect support.
@@ -252,10 +301,12 @@ pub struct SharedPeerManager {
     scaling_driver: Arc<ScalingDriver>,
     /// Probe counter for generating probe sequence IDs.
     probe_counter: Arc<ProbeCounter>,
-    /// Optional factory used to establish replacement or scaled-up connections.
-    connection_factory: Option<Arc<dyn DynConnectionFactory>>,
+    /// Factory used to establish replacement or scaled-up connections.
+    connection_factory: Arc<dyn DynConnectionFactory>,
     /// Runtime handle used to spawn replacement connection tasks.
     runtime_handle: tokio::runtime::Handle,
+    /// Guards lazy connection initialization so concurrent registrations don't over-connect.
+    init_lock: Arc<TokioMutex<()>>,
     /// Background task handles (aborted on drop).
     task_handles: Arc<Mutex<Vec<tokio::task::JoinHandle<()>>>>,
     /// Payload sender: frames from any dataflow go here for sequencing + pool routing.
@@ -277,38 +328,20 @@ impl Drop for SharedPeerManager {
 }
 
 impl SharedPeerManager {
-    /// Create a new shared peer manager with initial connections.
+    /// Create a new shared peer manager.
     ///
-    /// # Arguments
-    /// - `peer_node_id`: Remote peer identifier
-    /// - `config`: Shared connection configuration
-    /// - `connections`: Initial set of connections (must have at least `config.min_connections`)
-    /// - `runtime_handle`: Tokio runtime for spawning background tasks
-    pub fn new<R, W>(
+    /// Connections are established lazily through `connection_factory` when the
+    /// first dataflow registers or when the scaling driver emits a scale-up event.
+    pub fn new(
         peer_node_id: String,
         config: SharedConnectionConfig,
-        connections: Vec<(R, W)>,
-        connection_factory: Option<Arc<dyn DynConnectionFactory>>,
+        connection_factory: Arc<dyn DynConnectionFactory>,
         runtime_handle: &tokio::runtime::Handle,
-    ) -> crate::Result<Self>
-    where
-        R: AsyncRead + Unpin + Send + 'static,
-        W: AsyncWrite + Unpin + Send + 'static,
-    {
-        if connections.len() < config.min_connections {
-            return Err(crate::Error::InvalidConfig(format!(
-                "need at least {} connections, got {}",
-                config.min_connections,
-                connections.len()
-            )));
-        }
-
-        let pool = Arc::new(PeerPool::new(connections.len(), config.clone())?);
+    ) -> crate::Result<Self> {
+        let pool = Arc::new(PeerPool::new(0, config.clone())?);
         let (scaling_driver, scaling_event_rx) = ScalingDriver::new(config.clone());
         let scaling_driver = Arc::new(scaling_driver);
         let probe_counter = Arc::new(ProbeCounter::new());
-
-        let mut writer_channel_map = HashMap::new();
 
         // Payload channel: dataflow tasks send (dataflow_id, frame) here
         let (payload_tx, payload_rx) = tokio_mpsc::channel::<(DataflowId, Frame)>(1024);
@@ -324,42 +357,9 @@ impl SharedPeerManager {
                 completed: HashSet::new(),
             }));
         let reorder_buffers = Arc::new(TokioMutex::new(HashMap::new()));
+        let init_lock = Arc::new(TokioMutex::new(()));
         let task_handles = Arc::new(Mutex::new(Vec::new()));
-        let mut readers = Vec::new();
-
-        // Set up per-connection writer tasks and collect readers
-        for (conn_id, (reader, writer)) in connections.into_iter().enumerate() {
-            let (tx, rx) = tokio_mpsc::channel::<Frame>(256);
-            writer_channel_map.insert(conn_id, tx);
-
-            let conn_metrics = pool.connection(conn_id);
-            let handle = runtime_handle.spawn(Self::writer_task(
-                conn_id,
-                writer,
-                rx,
-                conn_metrics,
-                failure_tx.clone(),
-            ));
-            push_task_handle(&task_handles, handle);
-
-            readers.push((conn_id, reader));
-        }
-
-        let writer_channels = Arc::new(TokioMutex::new(writer_channel_map));
-
-        for (conn_id, reader) in readers {
-            let reader_handle = runtime_handle.spawn(Self::reader_task(
-                conn_id,
-                reader,
-                reg_state.clone(),
-                reorder_buffers.clone(),
-                scaling_driver.clone(),
-                pool.clone(),
-                writer_channels.clone(),
-                failure_tx.clone(),
-            ));
-            push_task_handle(&task_handles, reader_handle);
-        }
+        let writer_channels = Arc::new(TokioMutex::new(HashMap::new()));
 
         let bridge_handle = runtime_handle.spawn(Self::bridge_task(
             pool.clone(),
@@ -420,6 +420,7 @@ impl SharedPeerManager {
             probe_counter,
             connection_factory,
             runtime_handle: runtime_handle.clone(),
+            init_lock,
             task_handles,
             payload_tx,
             control_tx,
@@ -514,7 +515,44 @@ impl SharedPeerManager {
             ReorderBuffer::with_capacity(self.config.reorder_timeout, 4096),
         );
 
+        self.ensure_min_connections().await;
+
         (receivers, error_rx)
+    }
+
+    async fn ensure_min_connections(&self) {
+        if self.pool.live_connection_count() > 0 {
+            return;
+        }
+
+        let _guard = self.init_lock.lock().await;
+        if self.pool.live_connection_count() > 0 {
+            return;
+        }
+
+        for _ in 0..self.config.min_connections {
+            if let Err(error) = Self::reconnect_connection(
+                &self.peer_node_id,
+                self.connection_factory.clone(),
+                self.runtime_handle.clone(),
+                self.pool.clone(),
+                self.writer_channels.clone(),
+                self.reg_state.clone(),
+                self.reorder_buffers.clone(),
+                self.scaling_driver.clone(),
+                self.failure_tx.clone(),
+                self.task_handles.clone(),
+            )
+            .await
+            {
+                #[cfg(feature = "tracing")]
+                tracing::warn!(
+                    "Lazy connection establishment failed for peer {}: {error}",
+                    self.peer_node_id
+                );
+                break;
+            }
+        }
     }
 
     /// Unregister a dataflow, removing its channels, reorder buffer, and pending control frames.
@@ -1007,6 +1045,9 @@ impl SharedPeerManager {
     ) {
         let mut ticker = tokio::time::interval(interval);
         ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        // Skip the immediate first tick — the first probe should fire after
+        // one full interval, giving connections time to be established.
+        ticker.tick().await;
 
         loop {
             ticker.tick().await;
@@ -1039,7 +1080,7 @@ impl SharedPeerManager {
     async fn scaling_event_handler(
         mut event_rx: tokio_mpsc::Receiver<ScalingEvent>,
         peer_node_id: String,
-        connection_factory: Option<Arc<dyn DynConnectionFactory>>,
+        connection_factory: Arc<dyn DynConnectionFactory>,
         runtime_handle: tokio::runtime::Handle,
         pool: Arc<PeerPool>,
         writer_channels: Arc<TokioMutex<HashMap<usize, tokio_mpsc::Sender<Frame>>>>,
@@ -1052,13 +1093,7 @@ impl SharedPeerManager {
         while let Some(event) = event_rx.recv().await {
             match event {
                 ScalingEvent::ScaleUp => {
-                    let Some(factory) = connection_factory.clone() else {
-                        #[cfg(feature = "tracing")]
-                        tracing::debug!(
-                            "ScaleUp ignored for {peer_node_id}: no connection factory"
-                        );
-                        continue;
-                    };
+                    let factory = connection_factory.clone();
 
                     match Self::reconnect_connection(
                         &peer_node_id,
@@ -1103,20 +1138,7 @@ impl SharedPeerManager {
                     // accumulating stale entries over time.
                     let _ = pool.remove_connection(connection_id);
 
-                    let Some(factory) = connection_factory.clone() else {
-                        #[cfg(feature = "tracing")]
-                        tracing::warn!(
-                            "ConnectionFailed for {peer_node_id} conn {connection_id} without reconnect factory"
-                        );
-                        // No factory — notify dataflows if all connections are dead
-                        if pool.live_connection_count() == 0 {
-                            let state = reg_state.lock().await;
-                            for (_df_id, reg) in state.registered.iter() {
-                                let _ = reg.error_tx.try_send(TransportError::ConnectionClosed);
-                            }
-                        }
-                        continue;
-                    };
+                    let factory = connection_factory.clone();
 
                     // Exponential backoff reconnect: 100ms → 200ms → 400ms → 800ms → 1.6s
                     // (up to 5 attempts). If the peer is temporarily unavailable,
@@ -1462,15 +1484,12 @@ pub async fn check_reorder_timeouts(
 
 #[cfg(test)]
 mod tests {
+    use std::collections::VecDeque;
+
     use super::super::shared_pool::ScalingDecision;
     use super::*;
     use tokio::io::{AsyncReadExt, AsyncWriteExt, DuplexStream, ReadHalf, WriteHalf, duplex};
     use tokio::task::JoinHandle;
-
-    /// Helper: create N duplex connection pairs (read, write) for each side.
-    fn make_connections(n: usize) -> Vec<(DuplexStream, DuplexStream)> {
-        (0..n).map(|_| duplex(8192)).collect()
-    }
 
     fn make_echo_connection() -> (
         ReadHalf<DuplexStream>,
@@ -1502,16 +1521,6 @@ mod tests {
         remote_tasks: Mutex<Vec<JoinHandle<()>>>,
     }
 
-    impl EchoConnectionFactory {
-        fn abort_all(&self) {
-            if let Ok(handles) = self.remote_tasks.lock() {
-                for handle in handles.iter() {
-                    handle.abort();
-                }
-            }
-        }
-    }
-
     impl ConnectionFactory for EchoConnectionFactory {
         type Reader = ReadHalf<DuplexStream>;
         type Writer = WriteHalf<DuplexStream>;
@@ -1530,29 +1539,127 @@ mod tests {
         }
     }
 
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn shared_peer_manager_creates_with_connections() {
-        let pairs = make_connections(2);
-        let (readers, writers): (Vec<_>, Vec<_>) = pairs.into_iter().unzip();
+    struct PreEstablishedFactory {
+        connections: Mutex<VecDeque<(DynReader, DynWriter)>>,
+    }
 
+    impl PreEstablishedFactory {
+        fn new<R, W>(connections: Vec<(R, W)>) -> Self
+        where
+            R: AsyncRead + Unpin + Send + 'static,
+            W: AsyncWrite + Unpin + Send + 'static,
+        {
+            let connections = connections
+                .into_iter()
+                .map(|(reader, writer)| {
+                    (Box::new(reader) as DynReader, Box::new(writer) as DynWriter)
+                })
+                .collect();
+            Self {
+                connections: Mutex::new(connections),
+            }
+        }
+    }
+
+    struct PreEstablishedOrEchoFactory {
+        initial: Mutex<VecDeque<(DynReader, DynWriter)>>,
+        remote_tasks: Mutex<Vec<JoinHandle<()>>>,
+    }
+
+    impl PreEstablishedOrEchoFactory {
+        fn new<R, W>(connections: Vec<(R, W)>) -> Self
+        where
+            R: AsyncRead + Unpin + Send + 'static,
+            W: AsyncWrite + Unpin + Send + 'static,
+        {
+            let initial = connections
+                .into_iter()
+                .map(|(reader, writer)| {
+                    (Box::new(reader) as DynReader, Box::new(writer) as DynWriter)
+                })
+                .collect();
+            Self {
+                initial: Mutex::new(initial),
+                remote_tasks: Mutex::new(Vec::new()),
+            }
+        }
+
+        fn abort_all(&self) {
+            if let Ok(handles) = self.remote_tasks.lock() {
+                for handle in handles.iter() {
+                    handle.abort();
+                }
+            }
+        }
+    }
+
+    impl ConnectionFactory for PreEstablishedOrEchoFactory {
+        type Reader = DynReader;
+        type Writer = DynWriter;
+
+        async fn establish(
+            &self,
+            _peer_node_id: &str,
+        ) -> Result<(Self::Reader, Self::Writer), Box<dyn std::error::Error + Send + Sync>>
+        {
+            if let Some(connection) = self
+                .initial
+                .lock()
+                .expect("pre-established echo factory lock poisoned")
+                .pop_front()
+            {
+                return Ok(connection);
+            }
+
+            let (reader, writer, remote_task) = make_echo_connection();
+            self.remote_tasks
+                .lock()
+                .expect("echo factory task lock poisoned")
+                .push(remote_task);
+            Ok((Box::new(reader) as DynReader, Box::new(writer) as DynWriter))
+        }
+    }
+
+    impl ConnectionFactory for PreEstablishedFactory {
+        type Reader = DynReader;
+        type Writer = DynWriter;
+
+        async fn establish(
+            &self,
+            _peer_node_id: &str,
+        ) -> Result<(Self::Reader, Self::Writer), Box<dyn std::error::Error + Send + Sync>>
+        {
+            self.connections
+                .lock()
+                .expect("pre-established factory lock poisoned")
+                .pop_front()
+                .ok_or_else(|| {
+                    Box::<dyn std::error::Error + Send + Sync>::from(std::io::Error::new(
+                        std::io::ErrorKind::NotConnected,
+                        "no more pre-established connections",
+                    ))
+                })
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn shared_peer_manager_starts_without_connections() {
         let config = SharedConnectionConfig::default();
-        let connections: Vec<_> = readers.into_iter().zip(writers).collect();
+        let factory: Arc<dyn DynConnectionFactory> = Arc::new(EchoConnectionFactory::default());
 
         let rt = tokio::runtime::Handle::current();
-        let manager = SharedPeerManager::new("peer-1".to_string(), config, connections, None, &rt).unwrap();
+        let manager = SharedPeerManager::new("peer-1".to_string(), config, factory, &rt).unwrap();
 
         assert_eq!(manager.peer_node_id(), "peer-1");
-        assert_eq!(manager.connection_count(), 2);
+        assert_eq!(manager.connection_count(), 0);
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn register_and_unregister_dataflow() {
-        let pairs = make_connections(1);
-        let connections: Vec<_> = pairs.into_iter().collect();
-
         let config = SharedConnectionConfig::default();
+        let factory: Arc<dyn DynConnectionFactory> = Arc::new(EchoConnectionFactory::default());
         let rt = tokio::runtime::Handle::current();
-        let manager = SharedPeerManager::new("peer-1".to_string(), config, connections, None, &rt).unwrap();
+        let manager = SharedPeerManager::new("peer-1".to_string(), config, factory, &rt).unwrap();
 
         let df_id = DataflowId::new();
         let channel_ids = vec![1, 2, 3];
@@ -1581,16 +1688,14 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn shared_transport_session_api() {
-        let pairs = make_connections(1);
-        let connections: Vec<_> = pairs.into_iter().collect();
-
         let config = SharedConnectionConfig::default();
+        let factory: Arc<dyn DynConnectionFactory> = Arc::new(EchoConnectionFactory::default());
         let rt = tokio::runtime::Handle::current();
 
         let mut managers = HashMap::new();
         managers.insert(
             "peer-1".to_string(),
-            SharedPeerManager::new("peer-1".to_string(), config, connections, None, &rt).unwrap(),
+            SharedPeerManager::new("peer-1".to_string(), config, factory, &rt).unwrap(),
         );
 
         let df_id = DataflowId::new();
@@ -1649,9 +1754,10 @@ mod tests {
         let rt = tokio::runtime::Handle::current();
 
         // Manager writes via mgr_write; test reads from test_stream
-        let connections = vec![(mgr_read, mgr_write)];
+        let factory: Arc<dyn DynConnectionFactory> =
+            Arc::new(PreEstablishedFactory::new(vec![(mgr_read, mgr_write)]));
         let manager =
-            SharedPeerManager::new("peer-1".to_string(), config.clone(), connections, None, &rt).unwrap();
+            SharedPeerManager::new("peer-1".to_string(), config.clone(), factory, &rt).unwrap();
 
         let df_id = DataflowId::new();
         let _receivers = manager.register_dataflow(df_id, &[1], 16).await;
@@ -1693,8 +1799,9 @@ mod tests {
         };
         let rt = tokio::runtime::Handle::current();
 
-        let connections = vec![(mgr_read, mgr_write)];
-        let manager = SharedPeerManager::new("peer-1".to_string(), config, connections, None, &rt).unwrap();
+        let factory: Arc<dyn DynConnectionFactory> =
+            Arc::new(PreEstablishedFactory::new(vec![(mgr_read, mgr_write)]));
+        let manager = SharedPeerManager::new("peer-1".to_string(), config, factory, &rt).unwrap();
 
         let df_id = DataflowId::new();
         let _receivers = manager.register_dataflow(df_id, &[1, 2], 16).await;
@@ -1726,12 +1833,10 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn dataframe_sender_normalizes_dataflow_id() {
         // DataframeSender should overwrite frame.dataflow_id with its own
-        let pairs = make_connections(1);
-        let connections: Vec<_> = pairs.into_iter().collect();
-
         let config = SharedConnectionConfig::default();
+        let factory: Arc<dyn DynConnectionFactory> = Arc::new(EchoConnectionFactory::default());
         let rt = tokio::runtime::Handle::current();
-        let manager = SharedPeerManager::new("test-peer".into(), config, connections, None, &rt).unwrap();
+        let manager = SharedPeerManager::new("test-peer".into(), config, factory, &rt).unwrap();
 
         let df_id = DataflowId::new();
         let wrong_id = DataflowId::new();
@@ -1765,13 +1870,13 @@ mod tests {
 
         let config = SharedConnectionConfig::default();
         let rt = tokio::runtime::Handle::current();
-        let manager = SharedPeerManager::new(
-            "test-peer".into(),
-            config,
-            vec![(mgr_read, mgr_write)],
-            None,
-            &rt,
-        ).unwrap();
+        let factory: Arc<dyn DynConnectionFactory> =
+            Arc::new(PreEstablishedFactory::new(vec![(mgr_read, mgr_write)]));
+        let manager = SharedPeerManager::new("test-peer".into(), config, factory, &rt).unwrap();
+
+        // Register a dataflow to trigger lazy connection establishment
+        let df_id = DataflowId::new();
+        let _reg = manager.register_dataflow(df_id, &[1], 16).await;
 
         // Send a probe request FROM the test side TO the manager's reader
         let probe_req = ProbeMessage::new_request(42, 1000);
@@ -1815,13 +1920,9 @@ mod tests {
 
         let config = SharedConnectionConfig::default();
         let rt = tokio::runtime::Handle::current();
-        let manager = SharedPeerManager::new(
-            "test-peer".into(),
-            config,
-            vec![(mgr_read, mgr_write)],
-            None,
-            &rt,
-        ).unwrap();
+        let factory: Arc<dyn DynConnectionFactory> =
+            Arc::new(PreEstablishedFactory::new(vec![(mgr_read, mgr_write)]));
+        let manager = SharedPeerManager::new("test-peer".into(), config, factory, &rt).unwrap();
 
         let df_id = DataflowId::new();
         let (mut receivers, _error_rx) = manager.register_dataflow(df_id, &[1], 16).await;
@@ -1859,8 +1960,6 @@ mod tests {
         let (client_read, server_write) = duplex(8192);
         let (server_read, client_write) = duplex(8192);
 
-        let connections: Vec<(DuplexStream, DuplexStream)> = vec![(client_read, client_write)];
-
         let config = SharedConnectionConfig {
             min_connections: 1,
             max_connections: 4,
@@ -1868,8 +1967,12 @@ mod tests {
             ..Default::default()
         };
 
+        let factory: Arc<dyn DynConnectionFactory> = Arc::new(PreEstablishedFactory::new(vec![(
+            client_read,
+            client_write,
+        )]));
         let rt = tokio::runtime::Handle::current();
-        let manager = SharedPeerManager::new("peer-fail".into(), config, connections, None, &rt).unwrap();
+        let manager = SharedPeerManager::new("peer-fail".into(), config, factory, &rt).unwrap();
 
         // Drop the remote side to cause write failures
         drop(server_read);
@@ -1891,8 +1994,6 @@ mod tests {
         let (client_read, _server_write) = duplex(8192);
         let (_server_read, client_write) = duplex(8192);
 
-        let connections: Vec<(DuplexStream, DuplexStream)> = vec![(client_read, client_write)];
-
         let config = SharedConnectionConfig {
             min_connections: 1,
             max_connections: 4,
@@ -1900,8 +2001,12 @@ mod tests {
             ..Default::default()
         };
 
+        let factory: Arc<dyn DynConnectionFactory> = Arc::new(PreEstablishedFactory::new(vec![(
+            client_read,
+            client_write,
+        )]));
         let rt = tokio::runtime::Handle::current();
-        let manager = SharedPeerManager::new("peer-monitor".into(), config, connections, None, &rt).unwrap();
+        let manager = SharedPeerManager::new("peer-monitor".into(), config, factory, &rt).unwrap();
 
         // Drop remote sides
         drop(_server_write);
@@ -1923,8 +2028,6 @@ mod tests {
         let (client_read, server_write) = duplex(8192);
         let (server_read, client_write) = duplex(8192);
 
-        let connections: Vec<(DuplexStream, DuplexStream)> = vec![(client_read, client_write)];
-
         let config = SharedConnectionConfig {
             min_connections: 1,
             max_connections: 4,
@@ -1932,8 +2035,12 @@ mod tests {
             ..Default::default()
         };
 
+        let factory: Arc<dyn DynConnectionFactory> = Arc::new(PreEstablishedFactory::new(vec![(
+            client_read,
+            client_write,
+        )]));
         let rt = tokio::runtime::Handle::current();
-        let manager = SharedPeerManager::new("peer-notify".into(), config, connections, None, &rt).unwrap();
+        let manager = SharedPeerManager::new("peer-notify".into(), config, factory, &rt).unwrap();
 
         // Register a dataflow
         let df_id = DataflowId::new();
@@ -1983,20 +2090,24 @@ mod tests {
             b_connections.push((b_from_a, b_to_a));
         }
 
+        let a_factory: Arc<dyn DynConnectionFactory> =
+            Arc::new(PreEstablishedFactory::new(a_connections));
+        let b_factory: Arc<dyn DynConnectionFactory> =
+            Arc::new(PreEstablishedFactory::new(b_connections));
         let manager_a = SharedPeerManager::new(
             "node-b".to_string(), // A's peer is B
             config.clone(),
-            a_connections,
-            None,
+            a_factory,
             rt,
-        ).unwrap();
+        )
+        .unwrap();
         let manager_b = SharedPeerManager::new(
             "node-a".to_string(), // B's peer is A
             config,
-            b_connections,
-            None,
+            b_factory,
             rt,
-        ).unwrap();
+        )
+        .unwrap();
 
         (manager_a, manager_b)
     }
@@ -2008,6 +2119,7 @@ mod tests {
             min_connections: 2,
             max_connections: 4,
             probe_interval: Duration::from_secs(999),
+            reorder_timeout: Duration::from_secs(5),
             ..Default::default()
         };
         let rt = tokio::runtime::Handle::current();
@@ -2078,7 +2190,7 @@ mod tests {
         let (b_to_a_2, a_from_b_2) = duplex(65536);
 
         let config = SharedConnectionConfig {
-            min_connections: 1,
+            min_connections: 2,
             max_connections: 4,
             probe_interval: Duration::from_secs(999),
             ..Default::default()
@@ -2086,19 +2198,20 @@ mod tests {
         let rt = tokio::runtime::Handle::current();
 
         // Manager A: connection 0 uses (a_from_b_1, a_to_b_1), connection 1 uses (a_from_b_2, a_to_b_2)
-        let a_connections = vec![(a_from_b_1, a_to_b_1), (a_from_b_2, a_to_b_2)];
-        let manager_a = SharedPeerManager::new(
-            "node-b".to_string(),
-            config.clone(),
-            a_connections,
-            None,
-            &rt,
-        ).unwrap();
+        let a_factory: Arc<dyn DynConnectionFactory> = Arc::new(PreEstablishedFactory::new(vec![
+            (a_from_b_1, a_to_b_1),
+            (a_from_b_2, a_to_b_2),
+        ]));
+        let manager_a =
+            SharedPeerManager::new("node-b".to_string(), config.clone(), a_factory, &rt).unwrap();
 
         // Manager B: connection 0 uses (b_from_a_1, b_to_a_1), connection 1 uses (b_from_a_2, b_to_a_2)
-        let b_connections = vec![(b_from_a_1, b_to_a_1), (b_from_a_2, b_to_a_2)];
+        let b_factory: Arc<dyn DynConnectionFactory> = Arc::new(PreEstablishedFactory::new(vec![
+            (b_from_a_1, b_to_a_1),
+            (b_from_a_2, b_to_a_2),
+        ]));
         let manager_b =
-            SharedPeerManager::new("node-a".to_string(), config, b_connections, None, &rt).unwrap();
+            SharedPeerManager::new("node-a".to_string(), config, b_factory, &rt).unwrap();
 
         let df_id = DataflowId::new();
         let _reg_a = manager_a.register_dataflow(df_id, &[1], 64).await;
@@ -2185,18 +2298,17 @@ mod tests {
             probe_interval: Duration::from_secs(999),
             ..Default::default()
         };
-        let factory = Arc::new(EchoConnectionFactory::default());
-        let reconnect_factory: Arc<dyn DynConnectionFactory> = factory.clone();
         let (reader_a, writer_a, remote_a) = make_echo_connection();
         let (reader_b, writer_b, remote_b) = make_echo_connection();
+        let factory = Arc::new(PreEstablishedOrEchoFactory::new(vec![
+            (reader_a, writer_a),
+            (reader_b, writer_b),
+        ]));
+        let reconnect_factory: Arc<dyn DynConnectionFactory> = factory.clone();
         let rt = tokio::runtime::Handle::current();
-        let manager = SharedPeerManager::new(
-            "peer-reconnect".into(),
-            config,
-            vec![(reader_a, writer_a), (reader_b, writer_b)],
-            Some(reconnect_factory),
-            &rt,
-        ).unwrap();
+        let manager =
+            SharedPeerManager::new("peer-reconnect".into(), config, reconnect_factory, &rt)
+                .unwrap();
 
         let df_id = DataflowId::new();
         let (mut receivers, _error_rx) = manager.register_dataflow(df_id, &[1], 64).await;
@@ -2277,20 +2389,13 @@ mod tests {
         let (stream_1a, stream_1b) = duplex(65536);
         let (stream_2a, stream_2b) = duplex(65536);
 
-        let mgr1 = SharedPeerManager::new(
-            "peer-1".to_string(),
-            config.clone(),
-            vec![(stream_1a, stream_1b)],
-            None,
-            &rt,
-        ).unwrap();
-        let mgr2 = SharedPeerManager::new(
-            "peer-2".to_string(),
-            config,
-            vec![(stream_2a, stream_2b)],
-            None,
-            &rt,
-        ).unwrap();
+        let factory1: Arc<dyn DynConnectionFactory> =
+            Arc::new(PreEstablishedFactory::new(vec![(stream_1a, stream_1b)]));
+        let factory2: Arc<dyn DynConnectionFactory> =
+            Arc::new(PreEstablishedFactory::new(vec![(stream_2a, stream_2b)]));
+        let mgr1 =
+            SharedPeerManager::new("peer-1".to_string(), config.clone(), factory1, &rt).unwrap();
+        let mgr2 = SharedPeerManager::new("peer-2".to_string(), config, factory2, &rt).unwrap();
 
         let mut managers = HashMap::new();
         managers.insert("peer-1".to_string(), mgr1);

@@ -67,7 +67,8 @@ pub use transport_session::{
 
 #[cfg(feature = "transport")]
 pub use shared_transport::{
-    ConnectionFactory, DataframeSender, PROBE_CHANNEL_ID, SharedPeerManager, SharedTransportSession,
+    ConnectionFactory, DataframeSender, DynConnectionFactory, PROBE_CHANNEL_ID,
+    PeerAddressResolver, SharedPeerManager, SharedTransportSession, TcpConnectionFactory,
 };
 
 #[cfg(feature = "transport")]

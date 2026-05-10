@@ -225,8 +225,11 @@ async fn multi_worker_branch_then_reduce() {
             let (evens, odds) = exchanged.branch("parity", |_t, x| x % 2 == 0);
             evens
                 .reduce("sum-evens", |acc, x| acc + x)
-                .output("even_sums").unwrap();
-            odds.reduce("sum-odds", |acc, x| acc + x).output("odd_sums").unwrap();
+                .output("even_sums")
+                .unwrap();
+            odds.reduce("sum-odds", |acc, x| acc + x)
+                .output("odd_sums")
+                .unwrap();
         },
         vec![(0, (1..=10).collect())],
         "even_sums",
@@ -366,7 +369,8 @@ async fn multi_worker_gather_then_reduce() {
                 .exchange_by_hash("distribute", |x| *x as u64)
                 .gather("collect")
                 .reduce("sum", |acc, x| acc + x)
-                .output("results").unwrap();
+                .output("results")
+                .unwrap();
         },
         vec![(0, (1..=10).collect())],
         "results",
@@ -412,7 +416,8 @@ async fn multi_worker_rebalance_then_fold() {
             input
                 .rebalance("redistribute")
                 .fold("count", 0i64, |acc, _x| acc + 1)
-                .output("results").unwrap();
+                .output("results")
+                .unwrap();
         },
         vec![(0, (1..=20).collect())],
         "results",
@@ -528,7 +533,11 @@ async fn multi_worker_rebalance_to_matching() {
         |builder| {
             let input = builder.input::<i64>("data").unwrap();
             // rebalance_to(2) with 2 workers — same as rebalance() but explicit
-            input.rebalance_to("redistribute", 2).unwrap().output("results").unwrap();
+            input
+                .rebalance_to("redistribute", 2)
+                .unwrap()
+                .output("results")
+                .unwrap();
         },
         vec![(0, (1..=12).collect())],
         "results",
@@ -550,7 +559,11 @@ async fn multi_worker_rebalance_to_distributes() {
             2,
             |builder| {
                 let input = builder.input::<i64>("data").unwrap();
-                input.rebalance_to("redistribute", 2).unwrap().output("results").unwrap();
+                input
+                    .rebalance_to("redistribute", 2)
+                    .unwrap()
+                    .output("results")
+                    .unwrap();
                 Ok(())
             },
             SpawnOptions::default(),
@@ -686,10 +699,12 @@ async fn multi_worker_branch_rebalance_count() {
             evens
                 .rebalance("rebal-evens")
                 .count("count-evens")
-                .output("even_counts").unwrap();
+                .output("even_counts")
+                .unwrap();
             odds.rebalance("rebal-odds")
                 .count("count-odds")
-                .output("odd_counts").unwrap();
+                .output("odd_counts")
+                .unwrap();
         },
         vec![(0, (1..=10).collect())],
         "even_counts",
@@ -713,8 +728,13 @@ async fn multi_worker_map_branch_map() {
             let input = builder.input::<i64>("data").unwrap();
             let exchanged = input.exchange_by_hash("distribute", |x| *x as u64);
             let (evens, odds) = exchanged.branch("parity", |_t, x| x % 2 == 0);
-            evens.map("double", |_t, x| x * 2).output("doubled_evens").unwrap();
-            odds.map("triple", |_t, x| x * 3).output("tripled_odds").unwrap();
+            evens
+                .map("double", |_t, x| x * 2)
+                .output("doubled_evens")
+                .unwrap();
+            odds.map("triple", |_t, x| x * 3)
+                .output("tripled_odds")
+                .unwrap();
         },
         vec![(0, (1..=6).collect())],
         "doubled_evens",

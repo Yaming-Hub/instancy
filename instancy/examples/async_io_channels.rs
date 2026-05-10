@@ -46,7 +46,8 @@ async fn main() {
     input
         .map("double", |_t, x| x * 2)
         .filter("positive", |_t, x| x > &0)
-        .output("results").unwrap();
+        .output("results")
+        .unwrap();
     let dataflow = builder.build().expect("build failed");
 
     // Async SpawnOptions wires tokio::sync::mpsc channels for I/O
@@ -92,7 +93,8 @@ async fn main() {
     let out = builder
         .source("data", vec![(0u64, vec![1i32, 2, 3, 4, 5])])
         .map("square", |_t, x| x * x)
-        .output("results").unwrap();
+        .output("results")
+        .unwrap();
     let dataflow = builder.build().expect("build failed");
 
     // spawn() is sync — join() returns DataflowCompletion which IS a real Future
@@ -121,7 +123,8 @@ async fn main() {
         builder
             .source("src", vec![(0u64, vec![i * 10 + 1, i * 10 + 2])])
             .map("inc", |_t, x| x + 100)
-            .output("out").unwrap();
+            .output("out")
+            .unwrap();
         let dataflow = builder.build().expect("build failed");
         // spawn() returns sync, join() yields a real Future
         completions.push(

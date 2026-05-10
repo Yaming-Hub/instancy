@@ -69,7 +69,9 @@ pub fn bounded_channel_with_wake<T: Timestamp, D: Send + 'static, M: Send + 'sta
     wake: Option<WakeHandle>,
     initial_capacity: Option<usize>,
 ) -> (BoundedPush<T, D, M>, BoundedPull<T, D, M>) {
-    let phys = initial_capacity.unwrap_or(INITIAL_BUFFER_CAPACITY).min(capacity);
+    let phys = initial_capacity
+        .unwrap_or(INITIAL_BUFFER_CAPACITY)
+        .min(capacity);
     let state = Arc::new(Mutex::new(SharedState {
         buffer: VecDeque::with_capacity(phys),
         capacity,

@@ -42,10 +42,12 @@ fn make_duplex_pair(
 
 fn build_dataflow(builder: &mut DataflowBuilder<u64>) -> Result<()> {
     builder
-        .input::<i32>("data").unwrap()
+        .input::<i32>("data")
+        .unwrap()
         .exchange_by_hash("route", |x: &i32| *x as u64)
         .map("square", |_t, x| x * x)
-        .output("results").unwrap();
+        .output("results")
+        .unwrap();
     Ok(())
 }
 

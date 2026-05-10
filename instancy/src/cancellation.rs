@@ -511,9 +511,7 @@ impl CancellationGuard {
     pub fn disarm(mut self) -> CancellationToken {
         // SAFETY: token is always Some until disarm() or Drop consumes it,
         // and disarm(self) takes ownership preventing double-call.
-        self.token
-            .take()
-            .expect("guard already disarmed")
+        self.token.take().expect("guard already disarmed")
     }
 }
 

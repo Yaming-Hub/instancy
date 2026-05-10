@@ -33,7 +33,8 @@ fn staged_fan_out() {
                 // Stage 0 (par=1): source → exchange_to(4) boundary
                 // Stage 1 (par=4): process in parallel
                 input
-                    .exchange_to("scatter", 4, |v: &i32| *v as u64).unwrap()
+                    .exchange_to("scatter", 4, |v: &i32| *v as u64)
+                    .unwrap()
                     .map("double", |_t, x| x * 2)
                     .for_each("sink", |_t, _v| {});
                 Ok(())
@@ -106,7 +107,8 @@ fn staged_fan_out_fan_in() {
             |builder: &mut DataflowBuilder<u64>| {
                 let input = builder.input::<i32>("data").unwrap();
                 input
-                    .exchange_to("scatter", 4, |v: &i32| *v as u64).unwrap()
+                    .exchange_to("scatter", 4, |v: &i32| *v as u64)
+                    .unwrap()
                     .map("process", |_t, x| x * 2)
                     .gather("collect")
                     .for_each("sink", |_t, _v| {});
@@ -167,9 +169,11 @@ fn staged_increasing_parallelism() {
             |builder: &mut DataflowBuilder<u64>| {
                 let input = builder.input::<i32>("data").unwrap();
                 input
-                    .exchange_to("first-expand", 2, |v: &i32| *v as u64).unwrap()
+                    .exchange_to("first-expand", 2, |v: &i32| *v as u64)
+                    .unwrap()
                     .map("stage1-work", |_t, x| x + 1)
-                    .exchange_to("second-expand", 4, |v: &i32| *v as u64).unwrap()
+                    .exchange_to("second-expand", 4, |v: &i32| *v as u64)
+                    .unwrap()
                     .map("stage2-work", |_t, x| x * 2)
                     .for_each("sink", |_t, _v| {});
                 Ok(())
@@ -194,7 +198,10 @@ fn staged_zero_parallelism_rejected() {
         "zero",
         0,
         |builder: &mut DataflowBuilder<u64>| {
-            builder.input::<i32>("data").unwrap().for_each("sink", |_t, _v| {});
+            builder
+                .input::<i32>("data")
+                .unwrap()
+                .for_each("sink", |_t, _v| {});
             Ok(())
         },
         staged_opts().auto_parallelism(false),

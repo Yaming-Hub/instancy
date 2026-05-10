@@ -72,7 +72,10 @@ async fn cluster_two_nodes_no_exchange() {
 
     let build = |builder: &mut DataflowBuilder<u64>| -> Result<()> {
         let input = builder.input::<i32>("data").unwrap();
-        input.map("double", |_t, x| x * 2).output("results").unwrap();
+        input
+            .map("double", |_t, x| x * 2)
+            .output("results")
+            .unwrap();
         Ok(())
     };
 
@@ -186,7 +189,10 @@ async fn cluster_two_nodes_with_exchange() {
         let input = builder.input::<i64>("data").unwrap();
         // Exchange by value — each record goes to worker (value % num_workers).
         let exchanged = input.exchange("by_val", |x: &i64| *x as u64);
-        exchanged.map("identity", |_t, x| x).output("results").unwrap();
+        exchanged
+            .map("identity", |_t, x| x)
+            .output("results")
+            .unwrap();
         Ok(())
     };
 
@@ -291,15 +297,21 @@ async fn cluster_fingerprint_mismatch() {
     // Node A: input → map → output (2 operators + source)
     let build_a = |builder: &mut DataflowBuilder<u64>| -> Result<()> {
         builder
-            .input::<i32>("data").unwrap()
+            .input::<i32>("data")
+            .unwrap()
             .map("double", |_t, x| x * 2)
-            .output("results").unwrap();
+            .output("results")
+            .unwrap();
         Ok(())
     };
 
     // Node B: input → output (1 operator + source) — different graph!
     let build_b = |builder: &mut DataflowBuilder<u64>| -> Result<()> {
-        builder.input::<i32>("data").unwrap().output("results").unwrap();
+        builder
+            .input::<i32>("data")
+            .unwrap()
+            .output("results")
+            .unwrap();
         Ok(())
     };
 

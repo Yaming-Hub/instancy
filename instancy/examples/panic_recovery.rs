@@ -32,7 +32,8 @@ fn spawn_divide_flow(rt: &RuntimeHandle, name: &str, catch_panics: bool) -> Spaw
             }
             100 / x
         })
-        .output("results").unwrap();
+        .output("results")
+        .unwrap();
 
     let dataflow = builder.build().expect("build failed");
     rt.spawn(dataflow, SpawnOptions::default())

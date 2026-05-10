@@ -32,7 +32,8 @@ fn main() {
                 output: done,
             }
         })
-        .output("results").unwrap();
+        .output("results")
+        .unwrap();
 
     let dataflow = builder.build().expect("graph construction failed");
 

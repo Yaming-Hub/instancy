@@ -63,10 +63,8 @@ fn main() {
     let mut user_map: HashMap<u64, Vec<String>> = HashMap::new();
     let mut order_map: HashMap<u64, Vec<String>> = HashMap::new();
 
-    let joined = users.binary::<(u64, String), String, _>(
-        orders,
-        "hash_join",
-        move |users_in, orders_in, out| {
+    let joined = users
+        .binary::<(u64, String), String, _>(orders, "hash_join", move |users_in, orders_in, out| {
             // Drain users: check order_map for matches, then insert into user_map.
             // (order_map may have entries from a previous activation.)
             while let Some((time, data)) = users_in.next() {
@@ -101,8 +99,8 @@ fn main() {
             }
 
             Ok(())
-        },
-    ).unwrap();
+        })
+        .unwrap();
 
     let output = joined.output("results").unwrap();
 
@@ -155,46 +153,48 @@ fn main() {
     let mut left_map: HashMap<u64, Vec<u64>> = HashMap::new(); // keyed by dst
     let mut right_map: HashMap<u64, Vec<u64>> = HashMap::new(); // keyed by src
 
-    let two_hop = edges_left.binary::<(u64, u64), String, _>(
-        edges_right,
-        "two_hop_join",
-        move |left_in, right_in, out| {
-            while let Some((time, data)) = left_in.next() {
-                let mut paths = Vec::new();
-                for (src, dst) in data.iter().cloned() {
-                    // Check if right side has edges starting from dst
-                    // (right_map may have entries from a previous activation.)
-                    if let Some(dsts) = right_map.get(&dst) {
-                        for &final_dst in dsts {
-                            paths.push(format!("{src}→{dst}→{final_dst}"));
+    let two_hop = edges_left
+        .binary::<(u64, u64), String, _>(
+            edges_right,
+            "two_hop_join",
+            move |left_in, right_in, out| {
+                while let Some((time, data)) = left_in.next() {
+                    let mut paths = Vec::new();
+                    for (src, dst) in data.iter().cloned() {
+                        // Check if right side has edges starting from dst
+                        // (right_map may have entries from a previous activation.)
+                        if let Some(dsts) = right_map.get(&dst) {
+                            for &final_dst in dsts {
+                                paths.push(format!("{src}→{dst}→{final_dst}"));
+                            }
                         }
+                        left_map.entry(dst).or_default().push(src);
                     }
-                    left_map.entry(dst).or_default().push(src);
+                    if !paths.is_empty() {
+                        out.push_vec(time, paths);
+                    }
                 }
-                if !paths.is_empty() {
-                    out.push_vec(time, paths);
-                }
-            }
 
-            while let Some((time, data)) = right_in.next() {
-                let mut paths = Vec::new();
-                for (src, dst) in data.iter().cloned() {
-                    // Check if left side has edges ending at src
-                    if let Some(srcs) = left_map.get(&src) {
-                        for &orig_src in srcs {
-                            paths.push(format!("{orig_src}→{src}→{dst}"));
+                while let Some((time, data)) = right_in.next() {
+                    let mut paths = Vec::new();
+                    for (src, dst) in data.iter().cloned() {
+                        // Check if left side has edges ending at src
+                        if let Some(srcs) = left_map.get(&src) {
+                            for &orig_src in srcs {
+                                paths.push(format!("{orig_src}→{src}→{dst}"));
+                            }
                         }
+                        right_map.entry(src).or_default().push(dst);
                     }
-                    right_map.entry(src).or_default().push(dst);
+                    if !paths.is_empty() {
+                        out.push_vec(time, paths);
+                    }
                 }
-                if !paths.is_empty() {
-                    out.push_vec(time, paths);
-                }
-            }
 
-            Ok(())
-        },
-    ).unwrap();
+                Ok(())
+            },
+        )
+        .unwrap();
 
     let graph_output = two_hop.output("two_hop_paths").unwrap();
 
