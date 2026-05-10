@@ -202,6 +202,11 @@ mod tracing_tests {
     use std::sync::Mutex;
     use tracing_subscriber::layer::SubscriberExt;
 
+    /// Serialize tracing tests — `with_default` sets a thread-local subscriber
+    /// that can be overridden by another test running in parallel on the same
+    /// thread, causing log capture to miss events.
+    static TRACING_LOCK: Mutex<()> = Mutex::new(());
+
     /// Simple layer that captures formatted event messages.
     struct CaptureLayer {
         logs: Arc<Mutex<Vec<String>>>,
@@ -236,11 +241,12 @@ mod tracing_tests {
     }
 
     fn with_captured_logs(f: impl FnOnce()) -> Vec<String> {
+        let _guard = TRACING_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let logs = Arc::new(Mutex::new(Vec::new()));
         let layer = CaptureLayer { logs: logs.clone() };
         let subscriber = tracing_subscriber::registry().with(layer);
         tracing::subscriber::with_default(subscriber, f);
-        Arc::try_unwrap(logs).unwrap().into_inner().unwrap()
+        logs.lock().unwrap().clone()
     }
 
     #[test]
