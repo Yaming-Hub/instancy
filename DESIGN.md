@@ -17,7 +17,7 @@
 9. **Configurable error policy** — each dataflow specifies whether errors should halt the pipeline or be logged and skipped, giving consumers control over fault tolerance.
 10. **Observability built-in** — per-dataflow CPU time tracking, operator-level metrics, and structured tracing for understanding performance characteristics.
 11. **Checkpointing support** — consumers can add checkpoint operators that persist state at timestamp boundaries, enabling recovery by fast-forwarding input to the stored frontier.
-12. **Per-stage dynamic parallelism** — operators in the same stage share a parallelism level; different stages can have different parallelism. Stage boundaries are auto-inferred from repartition operators (`exchange`, `rebalance`, `gather`, `broadcast`). Operators within a stage are fused into a single schedulable task for reduced scheduling overhead.
+12. **Per-stage dynamic parallelism** *(partially implemented)* — operators in the same stage share a parallelism level; different stages can have different parallelism. Stage boundaries are auto-inferred from repartition operators (`exchange`, `rebalance`, `gather`, `broadcast`). Operators within a stage are fused into a single schedulable task for reduced scheduling overhead. **Note**: Stage inference and operator fusion are implemented; per-stage parallelism (different worker counts per stage) is not yet implemented — all stages currently share the dataflow's worker count.
 13. **Dynamic cluster scaling** *(roadmap)* — nodes will be able to join or leave the cluster at runtime. The hosting application will be responsible for detecting membership changes and notifying the runtime via a `ClusterMembership` trait. The library will rebuild routing and rebalance work accordingly. **Not yet implemented** — the current runtime uses a static worker count determined at dataflow build time.
 14. **No global state** — zero static variables, `lazy_static`, or thread-locals. All state is owned by an explicit `RuntimeHandle`. Multiple isolated clusters can coexist in a single process (e.g., interactive vs batch workloads).
 15. **Pluggable task scheduling** — the task queue accepts a `SchedulePolicy` trait that determines dequeue order based on (dataflow priority, task age). Default policy uses priority-with-aging to prevent starvation of low-priority dataflows.
@@ -2427,7 +2427,7 @@ impl ReorderBuffer {
 
 #### Comparison: Dedicated vs Shared Connection Mode
 
-| Aspect | Dedicated (Current) | Shared + Sequencing (Future) |
+| Aspect | Dedicated | Shared (Current) |
 |--------|---------------------|------------------------------|
 | **Ordering** | Free (TCP FIFO) | Explicit via sequence numbers |
 | **Connection count** | O(dataflows × peers) | O(peers) — bounded by pool size |
@@ -2571,15 +2571,15 @@ A single connection has fundamental throughput limits:
 
 #### Recommendation
 
-**Phase 1 (current):** Keep dedicated connections. Simple, correct, sufficient for moderate scale.
+**Phase 1:** Dedicated connections — each dataflow gets its own connection(s) per peer. Simple and correct.
 
-**Phase 2 (future):** Add shared mode as an opt-in configuration:
+**Phase 2 (current):** Shared mode via `SharedPeerManager` / `PeerPool` — dataflows share adaptive pooled connections managed by `ConnectionFactory`. Frames are sequenced for ordering/dedup. Configured via `SharedConnectionConfig`:
 ```rust
-pub enum ConnectionMode {
-    /// Each dataflow gets its own connection(s) per peer. (Default, current behavior)
-    Dedicated,
-    /// Dataflows share adaptive pooled connections; frames are sequenced for ordering/dedup.
-    Shared(SharedConnectionConfig),
+pub struct SharedConnectionConfig {
+    pub min_connections: usize,
+    pub max_connections: usize,
+    pub enable_frame_crc: bool,
+    // ...
 }
 ```
 
@@ -3426,7 +3426,7 @@ All of this works automatically through the capability protocol + progress excha
 A key architectural principle: **progress exchange is a purely logical concept**. The `ProgressTracker` exchanges capability changes between logical workers/executors without any knowledge of whether those workers are:
 - On the same OS thread (in-process shared memory channels)
 - On different threads in the same process (same mechanism)
-- On different machines across a network (future: serialize + network transport)
+- On different machines across a network (serialize + network transport via `SharedTransportSession`)
 
 The `ProgressTracker` interacts with progress channels through a simple interface:
 
@@ -3447,15 +3447,15 @@ The physical layer provides the concrete implementation:
 
 | Scenario | Physical Implementation |
 |----------|----------------------|
-| Same process (current) | `Arc<Mutex<VecDeque>>` + `WakeHandle::notify()` |
-| Cross-process (future) | Serialize `ProgressChange` → wire protocol → TCP/QUIC → deserialize |
+| Same process | `Arc<Mutex<VecDeque>>` + `WakeHandle::notify()` |
+| Cross-process | Serialize `ProgressChange` → wire protocol → TCP/QUIC → deserialize |
 | Testing | In-memory channels with deterministic ordering |
 
 This mirrors the logical/physical separation already established for data channels (§4.5): the `TransportProvider` resolves logical data targets to physical delivery, and the progress exchange resolves logical progress targets to physical progress delivery. The same pluggable architecture applies.
 
-#### 11.5.1 Cross-Process Progress Exchange (Future)
+#### 11.5.1 Cross-Process Progress Exchange
 
-When workers run on different machines, progress exchange uses the same connection infrastructure as data channels (§6.2 ConnectionManager). The wire protocol is defined in `communication/progress_exchange.rs`:
+When workers run on different machines, progress exchange uses the same shared transport infrastructure as data channels. The wire protocol is defined in `communication/progress_exchange.rs`:
 
 ```
 ┌──────────┬────────────────────────────────┐
@@ -3467,7 +3467,7 @@ When workers run on different machines, progress exchange uses the same connecti
 └──────────┴────────────────────────────────┘
 ```
 
-**Critical ordering guarantee for cross-process:** Data messages and progress messages share connections through the `ConnectionManager`. The implementation ensures that data pushed to a channel is transmitted before the corresponding capability release by using a **single FIFO payload channel** per peer in the `TransportSession`. Both data and progress frames are sent through the same bounded `mpsc` channel, preserving the causal order: a worker sends data at time T before releasing its capability for T. The bridge task writes from this shared channel to TCP in FIFO order, with only control messages (handshake, ready barrier) receiving biased priority. This design also prevents cross-dataflow starvation — one dataflow's heavy data cannot block another dataflow's progress messages since they interleave naturally in the shared queue.
+**Critical ordering guarantee for cross-process:** Data messages and progress messages share connections through the `SharedTransportSession`. The implementation ensures that data pushed to a channel is transmitted before the corresponding capability release by using a **single FIFO payload channel** per peer in the `TransportSession`. Both data and progress frames are sent through the same bounded `mpsc` channel, preserving the causal order: a worker sends data at time T before releasing its capability for T. The bridge task writes from this shared channel to TCP in FIFO order, with only control messages (handshake, ready barrier) receiving biased priority. This design also prevents cross-dataflow starvation — one dataflow's heavy data cannot block another dataflow's progress messages since they interleave naturally in the shared queue.
 
 #### 11.5.2 Progress and the Adapter Layer
 
@@ -3492,7 +3492,7 @@ The progress exchange fits naturally into the three-layer architecture (§4.5):
 │                   Physical Layer                                  │
 │                                                                  │
 │  SharedMemoryProgress: Arc<Mutex<VecDeque>> (in-process)         │
-│  NetworkProgress: ConnectionManager + wire protocol (cross-node) │
+│  NetworkProgress: SharedTransportSession + wire protocol (cross-node) │
 │  InMemoryClusterProgress: simulated cross-node (testing)         │
 └─────────────────────────────────────────────────────────────────┘
 ```
@@ -4570,8 +4570,8 @@ This section documents the cardinality (how many instances exist) and lifetime (
 | Component | Cardinality | Lifetime | Notes |
 |-----------|-------------|----------|-------|
 | `WorkerPool` | 1 per process | Process | Shared across all dataflows in the process |
-| `ConnectionPool` | 1 per process | Process | Manages connections to all peer nodes |
-| `ClusterTopology` | 1 per process | Process (mutable on membership changes) | Updated when nodes join/leave |
+| `ConnectionPool` | 1 per process | Process | Manages connections to all peer nodes (via `ConnectionFactory`) |
+| `ClusterTopology` | 1 per process | Process (static) | Set at startup; dynamic updates are roadmap (§12.5) |
 | `DataflowId` | 1 per dataflow | Dataflow | UUID, created at dataflow start |
 | `DataflowHandle` | 1 per (dataflow, node) | Dataflow | Returned to caller; provides cancel/progress/result |
 | `OutcomeAggregator` | 1 per dataflow on coordinator node | Dataflow | Collects per-node outcomes; host-app managed |
