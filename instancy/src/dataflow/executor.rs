@@ -340,6 +340,12 @@ pub struct DataflowExecutor<T: Timestamp = u64> {
     in_queue: Vec<bool>,
     /// Tracks which operators are done.
     done: Vec<bool>,
+    /// Pre-computed successors by position: successors_by_pos[pos] = [successor positions].
+    /// Built from graph topology during materialization.
+    successors_by_pos: Vec<Vec<usize>>,
+    /// Pre-computed predecessors by position: predecessors_by_pos[pos] = [predecessor positions].
+    /// Built from graph topology during materialization.
+    predecessors_by_pos: Vec<Vec<usize>>,
     /// Maps operator index → position in the operators vec (used for precise activation).
     index_to_pos: Vec<usize>,
     /// Configuration.
@@ -567,6 +573,30 @@ impl<T: Timestamp> DataflowExecutor<T> {
             operators.push(operator);
         }
 
+        let n = operators.len();
+        let mut successors_by_pos: Vec<Vec<usize>> = vec![Vec::new(); n];
+        let mut predecessors_by_pos: Vec<Vec<usize>> = vec![Vec::new(); n];
+        for edge in edges.iter().chain(feedback_edges.iter()) {
+            let src_idx = edge.source.operator_index;
+            let tgt_idx = edge.target.operator_index;
+            if src_idx < index_to_pos.len() && tgt_idx < index_to_pos.len() {
+                let src_pos = index_to_pos[src_idx];
+                let tgt_pos = index_to_pos[tgt_idx];
+                if src_pos != usize::MAX && tgt_pos != usize::MAX && src_pos < n && tgt_pos < n {
+                    successors_by_pos[src_pos].push(tgt_pos);
+                    predecessors_by_pos[tgt_pos].push(src_pos);
+                }
+            }
+        }
+        for v in &mut successors_by_pos {
+            v.sort_unstable();
+            v.dedup();
+        }
+        for v in &mut predecessors_by_pos {
+            v.sort_unstable();
+            v.dedup();
+        }
+
         let done = vec![false; operators.len()];
         let async_waiting = vec![false; operators.len()];
 
@@ -597,6 +627,8 @@ impl<T: Timestamp> DataflowExecutor<T> {
             ready_queue,
             in_queue,
             done,
+            successors_by_pos,
+            predecessors_by_pos,
             index_to_pos,
             config,
             cancel,
@@ -1585,17 +1617,49 @@ impl<T: Timestamp> DataflowExecutor<T> {
     /// After an operator completes, check if downstream operators should
     /// have their inputs closed.
     fn propagate_completion(&mut self, completed_pos: usize) {
-        let completed_idx = self.operators[completed_pos].index();
+        if completed_pos >= self.successors_by_pos.len() {
+            return;
+        }
 
-        // For each other operator, check if all its upstream operators are done.
-        // This is a simplified approach — a full implementation would use the
-        // graph edge topology. For now, close inputs of operators whose upstream
-        // sources are all done.
-        //
-        // TODO: Use graph topology for precise propagation.
-        // For now, we rely on channels: when the push end is dropped (operator done),
-        // the pull end sees is_exhausted() = true, which the operator handles.
-        let _ = completed_idx;
+        let mut succ_idx = 0;
+        while succ_idx < self.successors_by_pos[completed_pos].len() {
+            let succ_pos = self.successors_by_pos[completed_pos][succ_idx];
+            succ_idx += 1;
+
+            if succ_pos >= self.done.len() || self.done[succ_pos] {
+                continue;
+            }
+
+            let all_preds_done = if succ_pos < self.predecessors_by_pos.len() {
+                self.predecessors_by_pos[succ_pos]
+                    .iter()
+                    .all(|&pred_pos| pred_pos < self.done.len() && self.done[pred_pos])
+            } else {
+                false
+            };
+            if !all_preds_done {
+                continue;
+            }
+
+            if self.stage_tasks.is_empty() {
+                if succ_pos < self.in_queue.len() && !self.in_queue[succ_pos] {
+                    self.ready_queue.push_back(succ_pos);
+                    self.in_queue[succ_pos] = true;
+                }
+                continue;
+            }
+
+            if succ_pos < self.op_pos_to_task.len() {
+                let task_idx = self.op_pos_to_task[succ_pos];
+                if task_idx != usize::MAX
+                    && task_idx < self.task_in_queue.len()
+                    && !self.task_in_queue[task_idx]
+                {
+                    self.ready_queue.push_back(task_idx);
+                    self.task_in_queue[task_idx] = true;
+                }
+            }
+        }
     }
 
     /// Get the number of operators.
@@ -1702,6 +1766,8 @@ mod tests {
                 stage_tasks: Vec::new(),
                 op_pos_to_task: Vec::new(),
                 task_in_queue: Vec::new(),
+                successors_by_pos: Vec::new(),
+                predecessors_by_pos: Vec::new(),
                 dataflow_metrics: None,
                 wall_start: None,
                 op_collectors: Vec::new(),
@@ -1821,6 +1887,8 @@ mod tests {
             stage_tasks: Vec::new(),
             op_pos_to_task: Vec::new(),
             task_in_queue: Vec::new(),
+            successors_by_pos: Vec::new(),
+            predecessors_by_pos: Vec::new(),
             dataflow_metrics: None,
             wall_start: None,
             op_collectors: Vec::new(),
@@ -1867,6 +1935,8 @@ mod tests {
             stage_tasks: Vec::new(),
             op_pos_to_task: Vec::new(),
             task_in_queue: Vec::new(),
+            successors_by_pos: Vec::new(),
+            predecessors_by_pos: Vec::new(),
             dataflow_metrics: None,
             wall_start: None,
             op_collectors: Vec::new(),
@@ -1917,6 +1987,8 @@ mod tests {
             stage_tasks: Vec::new(),
             op_pos_to_task: Vec::new(),
             task_in_queue: Vec::new(),
+            successors_by_pos: Vec::new(),
+            predecessors_by_pos: Vec::new(),
             dataflow_metrics: None,
             wall_start: None,
             op_collectors: Vec::new(),
@@ -1955,6 +2027,8 @@ mod tests {
             stage_tasks: Vec::new(),
             op_pos_to_task: Vec::new(),
             task_in_queue: Vec::new(),
+            successors_by_pos: Vec::new(),
+            predecessors_by_pos: Vec::new(),
             dataflow_metrics: None,
             wall_start: None,
             op_collectors: Vec::new(),
@@ -2020,6 +2094,8 @@ mod tests {
             stage_tasks: Vec::new(),
             op_pos_to_task: Vec::new(),
             task_in_queue: Vec::new(),
+            successors_by_pos: Vec::new(),
+            predecessors_by_pos: Vec::new(),
             dataflow_metrics: None,
             wall_start: None,
             op_collectors: Vec::new(),
@@ -2102,6 +2178,8 @@ mod tests {
             stage_tasks: Vec::new(),
             op_pos_to_task: Vec::new(),
             task_in_queue: Vec::new(),
+            successors_by_pos: Vec::new(),
+            predecessors_by_pos: Vec::new(),
             dataflow_metrics: None,
             wall_start: None,
             op_collectors: Vec::new(),
@@ -2166,6 +2244,8 @@ mod tests {
             stage_tasks: Vec::new(),
             op_pos_to_task: Vec::new(),
             task_in_queue: Vec::new(),
+            successors_by_pos: Vec::new(),
+            predecessors_by_pos: Vec::new(),
             dataflow_metrics: None,
             wall_start: None,
             op_collectors: Vec::new(),
@@ -2216,6 +2296,8 @@ mod tests {
             stage_tasks: Vec::new(),
             op_pos_to_task: Vec::new(),
             task_in_queue: Vec::new(),
+            successors_by_pos: Vec::new(),
+            predecessors_by_pos: Vec::new(),
             dataflow_metrics: None,
             wall_start: None,
             op_collectors: Vec::new(),
@@ -2279,6 +2361,8 @@ mod tests {
             stage_tasks: Vec::new(),
             op_pos_to_task: Vec::new(),
             task_in_queue: Vec::new(),
+            successors_by_pos: Vec::new(),
+            predecessors_by_pos: Vec::new(),
             dataflow_metrics: None,
             wall_start: None,
             op_collectors: Vec::new(),
@@ -2341,6 +2425,8 @@ mod tests {
             stage_tasks: Vec::new(),
             op_pos_to_task: Vec::new(),
             task_in_queue: Vec::new(),
+            successors_by_pos: Vec::new(),
+            predecessors_by_pos: Vec::new(),
             dataflow_metrics: None,
             wall_start: None,
             op_collectors: Vec::new(),
@@ -2411,6 +2497,8 @@ mod tests {
             stage_tasks: Vec::new(),
             op_pos_to_task: Vec::new(),
             task_in_queue: Vec::new(),
+            successors_by_pos: Vec::new(),
+            predecessors_by_pos: Vec::new(),
             dataflow_metrics: None,
             wall_start: None,
             op_collectors: Vec::new(),
@@ -2494,6 +2582,8 @@ mod tests {
             stage_tasks: Vec::new(),
             op_pos_to_task: Vec::new(),
             task_in_queue: Vec::new(),
+            successors_by_pos: Vec::new(),
+            predecessors_by_pos: Vec::new(),
             dataflow_metrics: None,
             wall_start: None,
             op_collectors: Vec::new(),
@@ -2565,6 +2655,8 @@ mod tests {
             stage_tasks: Vec::new(),
             op_pos_to_task: Vec::new(),
             task_in_queue: Vec::new(),
+            successors_by_pos: Vec::new(),
+            predecessors_by_pos: Vec::new(),
             dataflow_metrics: None,
             wall_start: None,
             op_collectors: Vec::new(),
@@ -2578,6 +2670,283 @@ mod tests {
             Poll::Ready(Err(Error::Cancelled { .. })) => {} // expected
             other => panic!("Expected Cancelled error, got {:?}", other),
         }
+    }
+
+    #[test]
+    fn propagate_completion_requeues_when_all_predecessors_complete() {
+        let mut executor = DataflowExecutor::<u64>::new_test(
+            vec![
+                Box::new(CountingOperator {
+                    name: "a".into(),
+                    index: 0,
+                    stage_id: crate::dataflow::stage::StageId::new(0),
+                    remaining: 1,
+                }),
+                Box::new(CountingOperator {
+                    name: "b".into(),
+                    index: 1,
+                    stage_id: crate::dataflow::stage::StageId::new(0),
+                    remaining: 1,
+                }),
+                Box::new(CountingOperator {
+                    name: "c".into(),
+                    index: 2,
+                    stage_id: crate::dataflow::stage::StageId::new(0),
+                    remaining: 1,
+                }),
+            ],
+            ExecutorConfig::default(),
+            0,
+        );
+        executor.ready_queue.clear();
+        executor.in_queue.fill(false);
+        executor.successors_by_pos = vec![vec![1], vec![2], Vec::new()];
+        executor.predecessors_by_pos = vec![Vec::new(), vec![0], vec![1]];
+
+        executor.done[0] = true;
+        executor.propagate_completion(0);
+        assert_eq!(executor.ready_queue, VecDeque::from([1]));
+        assert_eq!(executor.in_queue, vec![false, true, false]);
+
+        let dequeued = executor.ready_queue.pop_front();
+        assert_eq!(dequeued, Some(1));
+        executor.in_queue[1] = false;
+
+        executor.done[1] = true;
+        executor.propagate_completion(1);
+        assert_eq!(executor.ready_queue, VecDeque::from([2]));
+        assert_eq!(executor.in_queue, vec![false, false, true]);
+    }
+
+    #[test]
+    fn propagate_completion_diamond_waits_for_all_predecessors() {
+        // Diamond: A→B, A→C, B→D, C→D
+        // D should only be requeued when BOTH B and C are done.
+        let mut executor = DataflowExecutor::<u64>::new_test(
+            vec![
+                Box::new(CountingOperator {
+                    name: "a".into(),
+                    index: 0,
+                    stage_id: crate::dataflow::stage::StageId::new(0),
+                    remaining: 1,
+                }),
+                Box::new(CountingOperator {
+                    name: "b".into(),
+                    index: 1,
+                    stage_id: crate::dataflow::stage::StageId::new(0),
+                    remaining: 1,
+                }),
+                Box::new(CountingOperator {
+                    name: "c".into(),
+                    index: 2,
+                    stage_id: crate::dataflow::stage::StageId::new(0),
+                    remaining: 1,
+                }),
+                Box::new(CountingOperator {
+                    name: "d".into(),
+                    index: 3,
+                    stage_id: crate::dataflow::stage::StageId::new(0),
+                    remaining: 1,
+                }),
+            ],
+            ExecutorConfig::default(),
+            0,
+        );
+        executor.ready_queue.clear();
+        executor.in_queue.fill(false);
+        // A(0)→B(1), A(0)→C(2), B(1)→D(3), C(2)→D(3)
+        executor.successors_by_pos = vec![vec![1, 2], vec![3], vec![3], Vec::new()];
+        executor.predecessors_by_pos = vec![Vec::new(), vec![0], vec![0], vec![1, 2]];
+
+        // A completes → B and C requeued (A is their sole predecessor).
+        executor.done[0] = true;
+        executor.propagate_completion(0);
+        let mut queued: Vec<usize> = executor.ready_queue.iter().copied().collect();
+        queued.sort();
+        assert_eq!(queued, vec![1, 2]);
+        assert!(executor.in_queue[1]);
+        assert!(executor.in_queue[2]);
+        assert!(!executor.in_queue[3]); // D not yet — B and C still running.
+
+        // B completes → D still NOT requeued (C not done yet).
+        executor.ready_queue.clear();
+        executor.in_queue.fill(false);
+        executor.done[1] = true;
+        executor.propagate_completion(1);
+        assert!(executor.ready_queue.is_empty());
+        assert!(!executor.in_queue[3]);
+
+        // C completes → D IS requeued (both predecessors done).
+        executor.done[2] = true;
+        executor.propagate_completion(2);
+        assert_eq!(executor.ready_queue, VecDeque::from([3]));
+        assert!(executor.in_queue[3]);
+    }
+
+    #[test]
+    fn propagate_completion_leaf_operator_no_op() {
+        // Sink operator with no successors — propagate_completion is a no-op.
+        let mut executor = DataflowExecutor::<u64>::new_test(
+            vec![Box::new(CountingOperator {
+                name: "sink".into(),
+                index: 0,
+                stage_id: crate::dataflow::stage::StageId::new(0),
+                remaining: 1,
+            })],
+            ExecutorConfig::default(),
+            0,
+        );
+        executor.ready_queue.clear();
+        executor.in_queue.fill(false);
+        executor.successors_by_pos = vec![Vec::new()];
+        executor.predecessors_by_pos = vec![Vec::new()];
+
+        executor.done[0] = true;
+        executor.propagate_completion(0);
+        assert!(executor.ready_queue.is_empty());
+    }
+
+    #[test]
+    fn propagate_completion_empty_adjacency_is_no_op() {
+        // No graph topology available (empty adjacency) — same as old stub behavior.
+        let mut executor = DataflowExecutor::<u64>::new_test(
+            vec![
+                Box::new(CountingOperator {
+                    name: "a".into(),
+                    index: 0,
+                    stage_id: crate::dataflow::stage::StageId::new(0),
+                    remaining: 1,
+                }),
+                Box::new(CountingOperator {
+                    name: "b".into(),
+                    index: 1,
+                    stage_id: crate::dataflow::stage::StageId::new(0),
+                    remaining: 1,
+                }),
+            ],
+            ExecutorConfig::default(),
+            0,
+        );
+        executor.ready_queue.clear();
+        executor.in_queue.fill(false);
+        // Default: successors_by_pos and predecessors_by_pos are Vec::new()
+
+        executor.done[0] = true;
+        executor.propagate_completion(0);
+        assert!(executor.ready_queue.is_empty());
+    }
+
+    #[test]
+    fn propagate_completion_stage_task_mode_requeues_owning_task() {
+        // In stage-task mode, completion should enqueue the owning task, not the operator.
+        let mut executor = DataflowExecutor::<u64>::new_test(
+            vec![
+                Box::new(CountingOperator {
+                    name: "a".into(),
+                    index: 0,
+                    stage_id: crate::dataflow::stage::StageId::new(0),
+                    remaining: 1,
+                }),
+                Box::new(CountingOperator {
+                    name: "b".into(),
+                    index: 1,
+                    stage_id: crate::dataflow::stage::StageId::new(1),
+                    remaining: 1,
+                }),
+            ],
+            ExecutorConfig::default(),
+            0,
+        );
+        executor.ready_queue.clear();
+        executor.in_queue.fill(false);
+        executor.successors_by_pos = vec![vec![1], Vec::new()];
+        executor.predecessors_by_pos = vec![Vec::new(), vec![0]];
+
+        // Set up stage tasks: op 0 in task 0, op 1 in task 1.
+        executor.stage_tasks = vec![
+            FusedStageTask {
+                operator_positions: vec![0],
+            },
+            FusedStageTask {
+                operator_positions: vec![1],
+            },
+        ];
+        executor.op_pos_to_task = vec![0, 1];
+        executor.task_in_queue = vec![false, false];
+
+        executor.done[0] = true;
+        executor.propagate_completion(0);
+
+        // Task 1 (owning op 1) should be enqueued, not op 1 directly.
+        assert_eq!(executor.ready_queue, VecDeque::from([1])); // task index 1
+        assert!(executor.task_in_queue[1]);
+        assert!(!executor.task_in_queue[0]);
+    }
+
+    #[test]
+    fn propagate_completion_skips_already_done_successor() {
+        // If successor is already done, don't requeue it.
+        let mut executor = DataflowExecutor::<u64>::new_test(
+            vec![
+                Box::new(CountingOperator {
+                    name: "a".into(),
+                    index: 0,
+                    stage_id: crate::dataflow::stage::StageId::new(0),
+                    remaining: 1,
+                }),
+                Box::new(CountingOperator {
+                    name: "b".into(),
+                    index: 1,
+                    stage_id: crate::dataflow::stage::StageId::new(0),
+                    remaining: 1,
+                }),
+            ],
+            ExecutorConfig::default(),
+            0,
+        );
+        executor.ready_queue.clear();
+        executor.in_queue.fill(false);
+        executor.successors_by_pos = vec![vec![1], Vec::new()];
+        executor.predecessors_by_pos = vec![Vec::new(), vec![0]];
+
+        executor.done[0] = true;
+        executor.done[1] = true; // successor already done
+        executor.propagate_completion(0);
+        assert!(executor.ready_queue.is_empty());
+    }
+
+    #[test]
+    fn propagate_completion_skips_already_queued_successor() {
+        // If successor is already in the queue, don't double-enqueue.
+        let mut executor = DataflowExecutor::<u64>::new_test(
+            vec![
+                Box::new(CountingOperator {
+                    name: "a".into(),
+                    index: 0,
+                    stage_id: crate::dataflow::stage::StageId::new(0),
+                    remaining: 1,
+                }),
+                Box::new(CountingOperator {
+                    name: "b".into(),
+                    index: 1,
+                    stage_id: crate::dataflow::stage::StageId::new(0),
+                    remaining: 1,
+                }),
+            ],
+            ExecutorConfig::default(),
+            0,
+        );
+        executor.ready_queue.clear();
+        executor.in_queue.fill(false);
+        executor.successors_by_pos = vec![vec![1], Vec::new()];
+        executor.predecessors_by_pos = vec![Vec::new(), vec![0]];
+
+        executor.done[0] = true;
+        executor.in_queue[1] = true; // already queued
+        executor.ready_queue.push_back(1);
+        executor.propagate_completion(0);
+        // Should still only have one entry, not duplicated.
+        assert_eq!(executor.ready_queue.len(), 1);
     }
 
     #[test]
@@ -2724,6 +3093,8 @@ mod tests {
             stage_tasks: Vec::new(),
             op_pos_to_task: Vec::new(),
             task_in_queue: Vec::new(),
+            successors_by_pos: Vec::new(),
+            predecessors_by_pos: Vec::new(),
             dataflow_metrics: None,
             wall_start: None,
             op_collectors: Vec::new(),
@@ -2799,6 +3170,8 @@ mod tests {
             stage_tasks: Vec::new(),
             op_pos_to_task: Vec::new(),
             task_in_queue: Vec::new(),
+            successors_by_pos: Vec::new(),
+            predecessors_by_pos: Vec::new(),
             dataflow_metrics: None,
             wall_start: None,
             op_collectors: Vec::new(),
@@ -2851,6 +3224,8 @@ mod tests {
             stage_tasks: Vec::new(),
             op_pos_to_task: Vec::new(),
             task_in_queue: Vec::new(),
+            successors_by_pos: Vec::new(),
+            predecessors_by_pos: Vec::new(),
             dataflow_metrics: None,
             wall_start: None,
             op_collectors: Vec::new(),
@@ -2915,6 +3290,8 @@ mod tests {
             stage_tasks: Vec::new(),
             op_pos_to_task: Vec::new(),
             task_in_queue: Vec::new(),
+            successors_by_pos: Vec::new(),
+            predecessors_by_pos: Vec::new(),
             dataflow_metrics: None,
             wall_start: None,
             op_collectors: Vec::new(),
@@ -2968,6 +3345,8 @@ mod tests {
             stage_tasks: Vec::new(),
             op_pos_to_task: Vec::new(),
             task_in_queue: Vec::new(),
+            successors_by_pos: Vec::new(),
+            predecessors_by_pos: Vec::new(),
             dataflow_metrics: None,
             wall_start: None,
             op_collectors: Vec::new(),
@@ -3020,6 +3399,8 @@ mod tests {
             stage_tasks: Vec::new(),
             op_pos_to_task: Vec::new(),
             task_in_queue: Vec::new(),
+            successors_by_pos: Vec::new(),
+            predecessors_by_pos: Vec::new(),
             dataflow_metrics: None,
             wall_start: None,
             op_collectors: Vec::new(),
@@ -3072,6 +3453,8 @@ mod tests {
             stage_tasks: Vec::new(),
             op_pos_to_task: Vec::new(),
             task_in_queue: Vec::new(),
+            successors_by_pos: Vec::new(),
+            predecessors_by_pos: Vec::new(),
             dataflow_metrics: None,
             wall_start: None,
             op_collectors: Vec::new(),
@@ -3159,6 +3542,8 @@ mod tests {
             stage_tasks: Vec::new(),
             op_pos_to_task: Vec::new(),
             task_in_queue: Vec::new(),
+            successors_by_pos: Vec::new(),
+            predecessors_by_pos: Vec::new(),
             dataflow_metrics: None,
             wall_start: None,
             op_collectors: Vec::new(),
@@ -3224,6 +3609,8 @@ mod tests {
             stage_tasks: Vec::new(),
             op_pos_to_task: Vec::new(),
             task_in_queue: Vec::new(),
+            successors_by_pos: Vec::new(),
+            predecessors_by_pos: Vec::new(),
             dataflow_metrics: None,
             wall_start: None,
             op_collectors: Vec::new(),
@@ -3287,6 +3674,8 @@ mod tests {
             stage_tasks: Vec::new(),
             op_pos_to_task: Vec::new(),
             task_in_queue: Vec::new(),
+            successors_by_pos: Vec::new(),
+            predecessors_by_pos: Vec::new(),
             dataflow_metrics: None,
             wall_start: None,
             op_collectors: Vec::new(),
@@ -3353,6 +3742,8 @@ mod tests {
             stage_tasks: Vec::new(),
             op_pos_to_task: Vec::new(),
             task_in_queue: Vec::new(),
+            successors_by_pos: Vec::new(),
+            predecessors_by_pos: Vec::new(),
             dataflow_metrics: None,
             wall_start: None,
             op_collectors: Vec::new(),
@@ -3433,6 +3824,8 @@ mod tests {
             stage_tasks: Vec::new(),
             op_pos_to_task: Vec::new(),
             task_in_queue: Vec::new(),
+            successors_by_pos: Vec::new(),
+            predecessors_by_pos: Vec::new(),
             dataflow_metrics: None,
             wall_start: None,
             op_collectors: Vec::new(),
@@ -3486,6 +3879,8 @@ mod tests {
             stage_tasks: Vec::new(),
             op_pos_to_task: Vec::new(),
             task_in_queue: Vec::new(),
+            successors_by_pos: Vec::new(),
+            predecessors_by_pos: Vec::new(),
             dataflow_metrics: None,
             wall_start: None,
             op_collectors: Vec::new(),
