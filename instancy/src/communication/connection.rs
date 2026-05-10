@@ -156,19 +156,23 @@ impl Default for PoolConfig {
 }
 
 impl PoolConfig {
-    /// Validate the configuration. Returns error message if invalid.
-    pub fn validate(&self) -> Result<(), String> {
+    /// Validate the configuration. Returns error if invalid.
+    pub fn validate(&self) -> Result<(), crate::error::CommunicationError> {
         if self.min_connections_per_peer == 0 {
-            return Err("min_connections_per_peer must be at least 1".into());
-        }
-        if self.max_connections_per_peer < self.min_connections_per_peer {
-            return Err(format!(
-                "max_connections_per_peer ({}) must be >= min_connections_per_peer ({})",
-                self.max_connections_per_peer, self.min_connections_per_peer
+            return Err(crate::error::CommunicationError::InvalidConfig(
+                "min_connections_per_peer must be at least 1".into(),
             ));
         }
+        if self.max_connections_per_peer < self.min_connections_per_peer {
+            return Err(crate::error::CommunicationError::InvalidConfig(format!(
+                "max_connections_per_peer ({}) must be >= min_connections_per_peer ({})",
+                self.max_connections_per_peer, self.min_connections_per_peer
+            )));
+        }
         if self.connect_timeout.is_zero() {
-            return Err("connect_timeout must be positive".into());
+            return Err(crate::error::CommunicationError::InvalidConfig(
+                "connect_timeout must be positive".into(),
+            ));
         }
         Ok(())
     }
@@ -261,8 +265,8 @@ impl<M: ConnectionManager> ConnectionPool<M> {
     ///
     /// # Errors
     ///
-    /// Returns an error string if the configuration is invalid.
-    pub fn new(manager: M, config: PoolConfig, local_id: PeerId) -> Result<Self, String> {
+    /// Returns an error if the configuration is invalid.
+    pub fn new(manager: M, config: PoolConfig, local_id: PeerId) -> Result<Self, crate::error::CommunicationError> {
         config.validate()?;
         Ok(Self {
             manager: Arc::new(manager),

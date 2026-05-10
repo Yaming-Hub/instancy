@@ -154,9 +154,10 @@ pub fn decode_progress_batch<T: Timestamp + ExchangeData>(
         wire::read_u32(crc_bytes, 0).map_err(|e| CodecError::InvalidData(e.to_string()))?;
     let actual_crc = crc32fast::hash(payload);
     if actual_crc != expected_crc {
-        return Err(CodecError::InvalidData(format!(
-            "CRC32 mismatch: expected {expected_crc:#010x}, got {actual_crc:#010x}"
-        )));
+        return Err(CodecError::CrcMismatch {
+            expected: expected_crc,
+            actual: actual_crc,
+        });
     }
 
     // Now decode the verified payload.
@@ -463,38 +464,38 @@ pub fn create_network_progress_channels<T: Timestamp + ExchangeData>(
     cancel: tokio_util::sync::CancellationToken,
     max_batch_size: usize,
     runtime_handle: &tokio::runtime::Handle,
-) -> Result<(Vec<WorkerProgressChannels<T>>, NetworkProgressHandles), String> {
+) -> Result<(Vec<WorkerProgressChannels<T>>, NetworkProgressHandles), crate::error::CommunicationError> {
     let (local_start, local_end) = local_worker_range;
 
     // --- Input validation ---
     if local_start > local_end {
-        return Err(format!(
+        return Err(crate::error::CommunicationError::InvalidSetup(format!(
             "invalid local_worker_range: start ({local_start}) > end ({local_end})"
-        ));
+        )));
     }
     if local_end > num_workers {
-        return Err(format!(
+        return Err(crate::error::CommunicationError::InvalidSetup(format!(
             "local_worker_range end ({local_end}) exceeds num_workers ({num_workers})"
-        ));
+        )));
     }
     let expected_local = local_end - local_start;
     if local_channels.len() != expected_local {
-        return Err(format!(
+        return Err(crate::error::CommunicationError::InvalidSetup(format!(
             "local_channels.len() ({}) != local_worker_range size ({expected_local})",
             local_channels.len()
-        ));
+        )));
     }
     if wake_handles.len() < num_workers {
-        return Err(format!(
+        return Err(crate::error::CommunicationError::InvalidSetup(format!(
             "wake_handles.len() ({}) < num_workers ({num_workers})",
             wake_handles.len()
-        ));
+        )));
     }
     for (peer_id, peer_start, peer_end) in remote_peers {
         if *peer_start > *peer_end || *peer_end > num_workers {
-            return Err(format!(
+            return Err(crate::error::CommunicationError::InvalidSetup(format!(
                 "invalid peer range for {peer_id}: ({peer_start}, {peer_end}), num_workers={num_workers}"
-            ));
+            )));
         }
     }
 
@@ -506,7 +507,9 @@ pub fn create_network_progress_channels<T: Timestamp + ExchangeData>(
         // Get the transport's progress sender for this peer.
         let session_tx = transport
             .progress_sender(peer_id)
-            .ok_or_else(|| format!("missing progress sender for peer {peer_id}"))?;
+            .ok_or_else(|| crate::error::CommunicationError::InvalidSetup(
+                format!("missing progress sender for peer {peer_id}"),
+            ))?;
 
         // Create unbounded intermediary channel for this peer.
         let (unbounded_tx, unbounded_rx) = tokio_mpsc::unbounded_channel::<Frame>();
@@ -527,7 +530,7 @@ pub fn create_network_progress_channels<T: Timestamp + ExchangeData>(
             let local_idx = local_w - local_start;
             for remote_w in *peer_start..*peer_end {
                 let ch_id = progress_channel_id(local_w, remote_w, num_workers)
-                    .map_err(|e| e.to_string())?;
+                    .map_err(|e| crate::error::CommunicationError::InvalidSetup(e.to_string()))?;
                 let df_id = dataflow_id;
                 let tx = unbounded_tx.clone();
                 let cancel_for_closure = cancel.clone();
@@ -586,19 +589,21 @@ pub fn create_network_progress_channels<T: Timestamp + ExchangeData>(
     for (peer_id, peer_start, peer_end) in remote_peers {
         let peer_map = receivers
             .get_mut(peer_id.as_str())
-            .ok_or_else(|| format!("missing receiver map for peer {peer_id}"))?;
+            .ok_or_else(|| crate::error::CommunicationError::InvalidSetup(
+                format!("missing receiver map for peer {peer_id}"),
+            ))?;
 
         for remote_w in *peer_start..*peer_end {
             for local_w in local_start..local_end {
                 let local_idx = local_w - local_start;
                 let ch_id = progress_channel_id(remote_w, local_w, num_workers)
-                    .map_err(|e| e.to_string())?;
+                    .map_err(|e| crate::error::CommunicationError::InvalidSetup(e.to_string()))?;
 
                 let rx = peer_map.remove(&ch_id).ok_or_else(|| {
-                    format!(
+                    crate::error::CommunicationError::InvalidSetup(format!(
                         "missing receiver for peer {peer_id}, channel {ch_id} \
                          (remote_worker={remote_w} → local_worker={local_w})"
-                    )
+                    ))
                 })?;
 
                 // Create shared buffer + receiver for this (remote→local) pair.

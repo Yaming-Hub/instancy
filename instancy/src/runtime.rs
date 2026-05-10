@@ -569,7 +569,9 @@ impl PeerRegistry {
         if let Some(down_peer) = already_down {
             // Release lock before cancelling to avoid nested lock contention.
             drop(state);
-            cancel_handle.cancel_with_reason(CancellationReason::PeerDown(down_peer));
+            cancel_handle.cancel_with_reason(CancellationReason::PeerDown {
+                node_id: down_peer,
+            });
             return id;
         }
 
@@ -653,7 +655,9 @@ impl PeerRegistry {
         }
 
         // Cancel outside the lock to avoid nested lock contention.
-        let reason = CancellationReason::PeerDown(peer_node_id.to_string());
+        let reason = CancellationReason::PeerDown {
+            node_id: peer_node_id.to_string(),
+        };
         for handle in &to_cancel {
             handle.cancel_with_reason(reason.clone());
         }
@@ -1800,9 +1804,9 @@ impl RuntimeHandle {
                     // been registered, so just cancel their tokens).
                     for (w, _, _) in &prepared {
                         w.cancel
-                            .cancel_with_reason(CancellationReason::WorkerFailed(format!(
-                                "sibling worker {spawned_count} failed to spawn"
-                            )));
+                            .cancel_with_reason(CancellationReason::WorkerFailed {
+                                detail: format!("sibling worker {spawned_count} failed to spawn"),
+                            });
                     }
                     return Err(Error::Runtime(RuntimeError::SpawnFailed(format!(
                         "failed to spawn worker {spawned_count}: {e}"
@@ -2109,9 +2113,9 @@ impl RuntimeHandle {
                 Err(e) => {
                     for (w, _, _) in &prepared {
                         w.cancel
-                            .cancel_with_reason(CancellationReason::WorkerFailed(format!(
-                                "sibling worker {spawned_count} failed to spawn"
-                            )));
+                            .cancel_with_reason(CancellationReason::WorkerFailed {
+                                detail: format!("sibling worker {spawned_count} failed to spawn"),
+                            });
                     }
                     return Err(Error::Runtime(RuntimeError::SpawnFailed(format!(
                         "failed to spawn worker {spawned_count}: {e}"
@@ -2698,9 +2702,9 @@ impl RuntimeHandle {
                             "shared transport error received, cancelling dataflow"
                         );
                         cancel.cancel_with_reason(
-                            crate::cancellation::CancellationReason::WorkerFailed(format!(
-                                "shared transport failure from peer {peer}"
-                            )),
+                            crate::cancellation::CancellationReason::WorkerFailed {
+                                detail: format!("shared transport failure from peer {peer}"),
+                            },
                         );
                         bridge.cancel();
                     }
@@ -2743,9 +2747,7 @@ impl RuntimeHandle {
             runtime_handle,
         )
         .map_err(|e| {
-            Error::Runtime(RuntimeError::ClusterSetup(format!(
-                "failed to create network progress channels: {e}"
-            )))
+            Error::Communication(e)
         })?;
 
         // Phase 7: Materialize all local workers (without registering).
@@ -2773,9 +2775,9 @@ impl RuntimeHandle {
                 Err(e) => {
                     for (w, _, _) in &prepared {
                         w.cancel
-                            .cancel_with_reason(CancellationReason::WorkerFailed(format!(
-                                "cluster worker {global_idx} failed to spawn"
-                            )));
+                            .cancel_with_reason(CancellationReason::WorkerFailed {
+                                detail: format!("cluster worker {global_idx} failed to spawn"),
+                            });
                     }
                     return Err(Error::Runtime(RuntimeError::SpawnFailed(format!(
                         "failed to spawn cluster worker {global_idx}: {e}"
@@ -3301,9 +3303,9 @@ impl SimpleRuntime {
                 Err(e) => {
                     for w in &workers {
                         w.cancel
-                            .cancel_with_reason(CancellationReason::WorkerFailed(format!(
-                                "sibling worker {spawned_count} failed to spawn"
-                            )));
+                            .cancel_with_reason(CancellationReason::WorkerFailed {
+                                detail: format!("sibling worker {spawned_count} failed to spawn"),
+                            });
                     }
                     for w in workers {
                         let _ = w.join_blocking();
@@ -3822,7 +3824,9 @@ impl<T: Timestamp> SpawnedDataflow<T> {
     /// # Example
     ///
     /// ```ignore
-    /// handle.cancel_with_reason(CancellationReason::NetworkError("lost connection".into()));
+    /// handle.cancel_with_reason(CancellationReason::NetworkError {
+    ///     detail: "lost connection".into(),
+    /// });
     /// ```
     pub fn cancel_with_reason(&self, reason: CancellationReason) {
         self.cancel.cancel_with_reason(reason);
@@ -4283,9 +4287,9 @@ impl<T: Timestamp> MultiSpawnedDataflow<T> {
                         // Cancel all remaining workers directly.
                         for w in &workers {
                             w.cancel
-                                .cancel_with_reason(CancellationReason::WorkerFailed(
-                                    "sibling worker failed".into(),
-                                ));
+                                .cancel_with_reason(CancellationReason::WorkerFailed {
+                                    detail: "sibling worker failed".into(),
+                                });
                         }
                     }
                     // Continue draining remaining workers (already cancelled).
@@ -4704,9 +4708,9 @@ impl MultiDataflowCompletion {
                         first_error = Some(e);
                         // Cancel remaining workers directly.
                         for cancel in &self.worker_cancels[idx + 1..] {
-                            cancel.cancel_with_reason(CancellationReason::WorkerFailed(
-                                "sibling worker failed".into(),
-                            ));
+                            cancel.cancel_with_reason(CancellationReason::WorkerFailed {
+                                detail: "sibling worker failed".into(),
+                            });
                         }
                     }
                 }
@@ -4744,9 +4748,9 @@ impl Future for MultiDataflowCompletion {
                         // Cancel remaining unresolved workers.
                         for (j, cancel) in this.worker_cancels.iter().enumerate() {
                             if !this.resolved[j] {
-                                cancel.cancel_with_reason(CancellationReason::WorkerFailed(
-                                    "sibling worker failed".into(),
-                                ));
+                                cancel.cancel_with_reason(CancellationReason::WorkerFailed {
+                                    detail: "sibling worker failed".into(),
+                                });
                             }
                         }
                     }
@@ -7228,7 +7232,9 @@ mod tests {
         assert!(!bridge2.is_cancelled());
         assert_eq!(
             token1.reason(),
-            Some(CancellationReason::PeerDown("node-c".into()))
+            Some(CancellationReason::PeerDown {
+                node_id: "node-c".into(),
+            })
         );
 
         // Report node-b down — df1 already cancelled, only df2 is new.
@@ -7238,7 +7244,9 @@ mod tests {
         assert!(bridge2.is_cancelled());
         assert_eq!(
             token2.reason(),
-            Some(CancellationReason::PeerDown("node-b".into()))
+            Some(CancellationReason::PeerDown {
+                node_id: "node-b".into(),
+            })
         );
 
         // Reporting again is a no-op.
@@ -7310,7 +7318,9 @@ mod tests {
         assert!(bridge.is_cancelled());
         assert_eq!(
             token.reason(),
-            Some(CancellationReason::PeerDown("node-x".into()))
+            Some(CancellationReason::PeerDown {
+                node_id: "node-x".into(),
+            })
         );
     }
 

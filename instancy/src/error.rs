@@ -232,6 +232,16 @@ pub enum RuntimeError {
 pub enum CommunicationError {
     #[error("Serialization error: {0}")]
     Codec(Box<dyn std::error::Error + Send + Sync>),
+
+    #[cfg(feature = "transport")]
+    #[error("Control protocol error: {0}")]
+    Protocol(#[from] crate::communication::control_protocol::ControlProtocolError),
+
+    #[error("Invalid configuration: {0}")]
+    InvalidConfig(String),
+
+    #[error("Setup error: {0}")]
+    InvalidSetup(String),
 }
 
 /// Extension trait to convert `PoisonError` into `Error`.
@@ -353,7 +363,9 @@ mod tests {
     fn error_display_cancelled_with_reason() {
         use crate::cancellation::CancellationReason;
         let err = Error::Cancelled {
-            reason: Some(CancellationReason::NetworkError("timeout".into())),
+            reason: Some(CancellationReason::NetworkError {
+                detail: "timeout".into(),
+            }),
         };
         assert_eq!(
             err.to_string(),
