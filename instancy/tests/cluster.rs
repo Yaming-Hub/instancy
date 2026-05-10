@@ -413,3 +413,96 @@ async fn cluster_missing_connection() {
         "expected 'missing' in error: {msg}"
     );
 }
+
+/// Two-node cluster: cancelling one node propagates cancellation to the other.
+///
+/// Node-a runs a long-running operator that blocks until cancelled.
+/// After both nodes are spawned, we cancel node-a. Node-b should receive
+/// `CancellationReason::PeerCancelled` and complete promptly.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn cluster_cancel_propagates_to_peer() {
+    use instancy::cancellation::CancellationReason;
+
+    let topology = ClusterTopology::multi_node(vec![
+        NodeConfig::new("node-a", 1),
+        NodeConfig::new("node-b", 1),
+    ])
+    .unwrap();
+    let dataflow_id = DataflowId::new();
+    let (conn_a, conn_b) = make_duplex_pair("node-a", "node-b", 64 * 1024);
+
+    let rt_a = RuntimeHandle::new(RuntimeConfig {
+        worker_threads: 2,
+        ..RuntimeConfig::default()
+    })
+    .unwrap();
+    let rt_b = RuntimeHandle::new(RuntimeConfig {
+        worker_threads: 2,
+        ..RuntimeConfig::default()
+    })
+    .unwrap();
+
+    let tokio_handle = tokio::runtime::Handle::current();
+
+    // Build a simple pipeline. The operators themselves don't need to be
+    // long-running — we control the hang by never closing inputs until
+    // after cancel propagates.
+    let build = |builder: &mut DataflowBuilder<u64>| -> Result<()> {
+        let input = builder.input::<i32>("data").unwrap();
+        input.map("identity", |_t, x| x).output("results").unwrap();
+        Ok(())
+    };
+
+    let topo_a = topology.clone();
+    let topo_b = topology.clone();
+    let th_a = tokio_handle.clone();
+    let th_b = tokio_handle.clone();
+
+    let handle_a = tokio::task::spawn_blocking(move || {
+        let cluster = rt_a.spawn_cluster(
+            "cancel_test",
+            topo_a,
+            "node-a",
+            dataflow_id,
+            ClusterSpawnTransport::dedicated(vec![conn_a], 1024),
+            Duration::from_secs(5),
+            build,
+            &th_a,
+        );
+        cluster.map(|c| (rt_a, c))
+    });
+
+    let handle_b = tokio::task::spawn_blocking(move || {
+        let cluster = rt_b.spawn_cluster(
+            "cancel_test",
+            topo_b,
+            "node-b",
+            dataflow_id,
+            ClusterSpawnTransport::dedicated(vec![conn_b], 1024),
+            Duration::from_secs(5),
+            build,
+            &th_b,
+        );
+        cluster.map(|c| (rt_b, c))
+    });
+
+    let (result_a, result_b) = tokio::join!(handle_a, handle_b);
+    let (_rt_a, cluster_a) = result_a.unwrap().unwrap();
+    let (_rt_b, cluster_b) = result_b.unwrap().unwrap();
+
+    // Do NOT close inputs — operators are blocked waiting for data.
+    // Without distributed cancellation, node-b would hang forever.
+
+    // Cancel node-a with a reason.
+    cluster_a.cancel_with_reason(CancellationReason::UserRequested);
+
+    // Node-b should complete within a reasonable timeout — the distributed
+    // cancel broadcaster on node-a sends Cancel, and node-b's listener fires
+    // its dataflow_cancel token.
+    let completion_b = cluster_b.join().unwrap();
+    let result = tokio::time::timeout(Duration::from_secs(5), completion_b).await;
+    assert!(
+        result.is_ok(),
+        "node-b should have completed after node-a cancel propagated"
+    );
+}
