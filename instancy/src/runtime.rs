@@ -1276,6 +1276,9 @@ impl RuntimeHandle {
     ) -> Result<SpawnedDataflow<T>> {
         dataflow.collect_metrics = options.metrics_config.operator_summary;
         dataflow.channel_counters = options.metrics_config.channel_counters;
+        dataflow.activation_timeline = options.metrics_config.activation_timeline;
+        dataflow.min_activation_duration = options.metrics_config.min_activation_duration;
+        dataflow.max_timeline_events = options.metrics_config.max_timeline_events;
         dataflow.drain_timeout = options.drain_timeout;
         self.spawn_internal(
             dataflow,
@@ -1530,6 +1533,7 @@ impl RuntimeHandle {
             pre_created_wake_handle,
             None,
             None,
+            None, // single worker — no shared start time needed
         )?;
 
         // Track active dataflow count for wait_idle()/shutdown_async().
@@ -1588,6 +1592,7 @@ impl RuntimeHandle {
         pre_created_wake_handle: Option<WakeHandle>,
         parent_cancel: Option<CancellationToken>,
         control_broadcast: Option<(ControlSender, ControlReceiver)>,
+        timeline_start_time: Option<std::time::Instant>,
     ) -> Result<(
         SpawnedDataflow<T>,
         Pin<Box<DataflowExecutor<T>>>,
@@ -1682,6 +1687,7 @@ impl RuntimeHandle {
             Some(wake_handle),
             worker_context,
             progress_channels,
+            timeline_start_time,
         )?;
 
         external_inputs_open.store(input_count, std::sync::atomic::Ordering::SeqCst);
@@ -1753,6 +1759,9 @@ impl RuntimeHandle {
             let mut df = builder.build()?;
             df.collect_metrics = metrics_config.operator_summary;
             df.channel_counters = metrics_config.channel_counters;
+            df.activation_timeline = metrics_config.activation_timeline;
+            df.min_activation_duration = metrics_config.min_activation_duration;
+            df.max_timeline_events = metrics_config.max_timeline_events;
             df.drain_timeout = drain_timeout;
             dataflows.push(df);
         }
@@ -1871,6 +1880,14 @@ impl RuntimeHandle {
         let mut prepared = Vec::with_capacity(num_workers);
         let mut spawned_count = 0usize;
 
+        // Capture a single timeline start time shared by all workers so that
+        // activation event offsets (start_us) are comparable across workers.
+        let timeline_start = if metrics_config.activation_timeline {
+            Some(std::time::Instant::now())
+        } else {
+            None
+        };
+
         for (worker_idx, dataflow) in dataflows.into_iter().enumerate() {
             let ctx = WorkerContext::new(worker_idx, num_workers)?;
             let pc = if !progress_channels.is_empty() {
@@ -1895,6 +1912,7 @@ impl RuntimeHandle {
                 Some(wh),
                 dataflow_cancel.clone(),
                 ctrl,
+                timeline_start,
             ) {
                 Ok(worker) => {
                     prepared.push(worker);
@@ -2058,6 +2076,9 @@ impl RuntimeHandle {
             let mut df = builder.build()?;
             df.collect_metrics = metrics_config.operator_summary;
             df.channel_counters = metrics_config.channel_counters;
+            df.activation_timeline = metrics_config.activation_timeline;
+            df.min_activation_duration = metrics_config.min_activation_duration;
+            df.max_timeline_events = metrics_config.max_timeline_events;
             df.drain_timeout = drain_timeout;
             dataflows.push(df);
         }
@@ -2202,6 +2223,13 @@ impl RuntimeHandle {
         let mut prepared = Vec::with_capacity(num_workers);
         let mut spawned_count = 0usize;
 
+        // Shared timeline start for cross-worker comparable offsets.
+        let timeline_start = if metrics_config.activation_timeline {
+            Some(std::time::Instant::now())
+        } else {
+            None
+        };
+
         for (worker_idx, dataflow) in dataflows.into_iter().enumerate() {
             let ctx = WorkerContext::new(worker_idx, num_workers)?;
             let pc = if !progress_channels.is_empty() {
@@ -2225,6 +2253,7 @@ impl RuntimeHandle {
                 Some(wh),
                 dataflow_cancel.clone(),
                 ctrl,
+                timeline_start,
             ) {
                 Ok(worker) => {
                     prepared.push(worker);
@@ -2891,6 +2920,7 @@ impl RuntimeHandle {
                 Some(wh),
                 dataflow_cancel.clone(),
                 ctrl,
+                None, // cluster: timeline start deferred (TODO)
             ) {
                 Ok(worker) => prepared.push(worker),
                 Err(e) => {
@@ -3183,6 +3213,7 @@ impl SimpleRuntime {
             Some(wake_handle),
             WorkerContext::single(),
             None,
+            None,
         )?;
 
         let completed = executor.run()?;
@@ -3224,6 +3255,7 @@ impl SimpleRuntime {
             self.cancel.clone(),
             Some(wake_handle),
             WorkerContext::single(),
+            None,
             None,
         )?;
 
@@ -3351,7 +3383,7 @@ impl SimpleRuntime {
 
         // --- Materialize and run on background thread ---
         let mut executor =
-            materialize_executor(dataflow, cancel, Some(wake_handle), worker_context, None)?;
+            materialize_executor(dataflow, cancel, Some(wake_handle), worker_context, None, None)?;
 
         external_inputs_open.store(input_count, std::sync::atomic::Ordering::SeqCst);
         executor.replace_external_inputs_counter(external_inputs_open);
@@ -5118,6 +5150,7 @@ fn materialize_executor<T: Timestamp>(
     wake_handle: Option<WakeHandle>,
     worker_context: WorkerContext,
     progress_channels: Option<WorkerProgressChannels<T>>,
+    timeline_start_time: Option<std::time::Instant>,
 ) -> Result<DataflowExecutor<T>> {
     let executor_config = ExecutorConfig {
         max_activations_per_step: 1024,
@@ -5128,6 +5161,10 @@ fn materialize_executor<T: Timestamp>(
         channel_counters: dataflow.channel_counters,
         drain_timeout: dataflow.drain_timeout,
         channel_metrics_collectors: std::mem::take(&mut dataflow.channel_metrics_collectors),
+        activation_timeline: dataflow.activation_timeline,
+        min_activation_duration: dataflow.min_activation_duration,
+        max_timeline_events: dataflow.max_timeline_events,
+        timeline_start_time,
     };
 
     // Destructure to allow accessing graph after moving factories.
@@ -8344,6 +8381,62 @@ mod tests {
         assert!(
             found_channel_data,
             "expected channel metrics with non-zero items transferred"
+        );
+
+        spawned.cancel();
+        let _ = spawned.join_blocking();
+    }
+
+    #[tokio::test]
+    async fn activation_timeline_records_events() {
+        // Spawn a 2-worker exchange dataflow with activation_timeline enabled
+        // and verify that timeline events are recorded with valid timestamps.
+        let rt = RuntimeHandle::new(RuntimeConfig::default()).unwrap();
+
+        let opts = SpawnOptions::new().metrics(crate::metrics::MetricsConfig::full());
+        let mut spawned = rt
+            .spawn_multi::<u64, _>(
+                "timeline-test",
+                2,
+                |builder: &mut DataflowBuilder<u64>| {
+                    builder
+                        .source::<i32>("src", vec![(0u64, vec![1, 2, 3, 4, 5])])
+                        .exchange("ex", |x: &i32| *x as u64)
+                        .map("add", |_t, x| x + 1)
+                        .output("out")
+                        .unwrap();
+                    Ok(())
+                },
+                opts,
+            )
+            .unwrap();
+
+        // Drain outputs to let the dataflow complete.
+        let receivers = spawned.take_all_outputs::<i32>("out").unwrap();
+        for rx in receivers {
+            while rx.recv().is_some() {}
+        }
+
+        // Verify activation timeline events were recorded across workers.
+        let mut total_events = 0usize;
+        for w in 0..2 {
+            if let Some(m) = spawned.worker_mut(w).metrics() {
+                let events = m.drain_timeline_events();
+                total_events += events.len();
+                for ev in &events {
+                    // Each event should have a valid duration and a non-zero start offset
+                    // (except possibly the very first activation).
+                    assert!(ev.duration_us > 0 || ev.start_us > 0,
+                        "event should have meaningful timing: start_us={}, duration_us={}",
+                        ev.start_us, ev.duration_us);
+                    assert!(ev.worker_index < 2, "worker_index out of range");
+                }
+            }
+        }
+        // At least some activations should have been recorded.
+        assert!(
+            total_events > 0,
+            "expected activation timeline events to be recorded, got 0"
         );
 
         spawned.cancel();

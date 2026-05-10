@@ -101,6 +101,18 @@ pub struct ExecutorConfig {
     /// These are shared across workers and registered in `DataflowMetrics`
     /// during executor materialization. Empty when `channel_counters` is false.
     pub channel_metrics_collectors: Vec<std::sync::Arc<crate::metrics::ChannelMetricsCollector>>,
+    /// Whether to record activation timeline events. When enabled, each
+    /// operator activation is recorded with a timestamp offset, duration,
+    /// operator/worker indices. Used for Chrome Trace / Perfetto UI export.
+    pub activation_timeline: bool,
+    /// Minimum activation duration to record in the timeline.
+    pub min_activation_duration: std::time::Duration,
+    /// Maximum timeline events per worker (ring buffer cap). 0 = unlimited.
+    pub max_timeline_events: usize,
+    /// Shared start time for timeline offset computation. All workers in a
+    /// multi-worker dataflow must use the same reference point so that
+    /// `start_us` values are comparable across workers.
+    pub timeline_start_time: Option<std::time::Instant>,
 }
 
 impl Default for ExecutorConfig {
@@ -114,6 +126,10 @@ impl Default for ExecutorConfig {
             channel_counters: false,
             drain_timeout: None,
             channel_metrics_collectors: Vec::new(),
+            activation_timeline: false,
+            min_activation_duration: std::time::Duration::from_micros(1),
+            max_timeline_events: 0,
+        timeline_start_time: None,
         }
     }
 }
@@ -240,6 +256,7 @@ impl FusedStageTask {
         control_sender: Option<&ControlSender>,
         catch_panics: bool,
         op_collectors: &[Option<Arc<OperatorMetricsCollector>>],
+        timeline_collector: Option<&crate::metrics::TimelineCollector>,
     ) -> Result<(bool, usize, Vec<usize>)> {
         let mut any_progress = false;
         let mut productive_activations = 0usize;
@@ -267,7 +284,9 @@ impl FusedStageTask {
                     ));
                 }
 
-                let start = if op_collectors.get(pos).and_then(|c| c.as_ref()).is_some() {
+                let need_timing = op_collectors.get(pos).and_then(|c| c.as_ref()).is_some()
+                    || timeline_collector.is_some();
+                let start = if need_timing {
                     Some(Instant::now())
                 } else {
                     None
@@ -284,8 +303,12 @@ impl FusedStageTask {
 
                 // Record metrics regardless of success/failure.
                 if let Some(start) = start {
+                    let elapsed = start.elapsed();
                     if let Some(collector) = op_collectors.get(pos).and_then(|c| c.as_ref()) {
-                        collector.record_activation(start.elapsed(), 0);
+                        collector.record_activation(elapsed, 0);
+                    }
+                    if let Some(tc) = timeline_collector {
+                        tc.record_activation(pos, start, elapsed);
                     }
                 }
 
@@ -417,6 +440,9 @@ pub struct DataflowExecutor<T: Timestamp = u64> {
     wall_start: Option<Instant>,
     /// Per-operator metrics collectors, indexed by position.
     op_collectors: Vec<Option<Arc<OperatorMetricsCollector>>>,
+    /// Per-worker timeline collector for activation events.
+    /// `None` when `config.activation_timeline` is false.
+    timeline_collector: Option<Arc<crate::metrics::TimelineCollector>>,
     /// Phantom for the timestamp type.
     _phantom: PhantomData<T>,
     /// Whether the executor is in the drain phase (cancellation received,
@@ -611,7 +637,9 @@ impl<T: Timestamp> DataflowExecutor<T> {
         let async_waiting = vec![false; operators.len()];
 
         // Initialize per-operator metrics collectors when enabled.
-        let needs_metrics = config.collect_metrics || !config.channel_metrics_collectors.is_empty();
+        let needs_metrics = config.collect_metrics
+            || !config.channel_metrics_collectors.is_empty()
+            || config.activation_timeline;
         let (dataflow_metrics, op_collectors) = if needs_metrics {
             let mut dm = DataflowMetrics::new("dataflow");
             let collectors: Vec<Option<Arc<OperatorMetricsCollector>>> = if config.collect_metrics {
@@ -630,9 +658,32 @@ impl<T: Timestamp> DataflowExecutor<T> {
             for ch_collector in &config.channel_metrics_collectors {
                 dm.register_existing_channel(std::sync::Arc::clone(ch_collector));
             }
-            (Some(Arc::new(dm)), collectors)
+            (Some(dm), collectors)
         } else {
             (None, Vec::new())
+        };
+
+        // Create timeline collector when activation_timeline is enabled.
+        let timeline_start = config.timeline_start_time.unwrap_or_else(Instant::now);
+        let timeline_collector = if config.activation_timeline {
+            Some(Arc::new(crate::metrics::TimelineCollector::new(
+                worker_context.worker_index(),
+                timeline_start,
+                config.min_activation_duration,
+                config.max_timeline_events,
+            )))
+        } else {
+            None
+        };
+
+        // Register timeline collector on DataflowMetrics (before wrapping in Arc).
+        let dataflow_metrics = if let Some(mut dm) = dataflow_metrics {
+            if let Some(ref tc) = timeline_collector {
+                dm.register_timeline(Arc::clone(tc));
+            }
+            Some(Arc::new(dm))
+        } else {
+            None
         };
 
         // Initially, all operators are ready (they may have initial input or
@@ -669,6 +720,7 @@ impl<T: Timestamp> DataflowExecutor<T> {
             dataflow_metrics,
             wall_start,
             op_collectors,
+            timeline_collector,
             _phantom: PhantomData,
             draining: false,
             drain_deadline: None,
@@ -1123,7 +1175,8 @@ impl<T: Timestamp> DataflowExecutor<T> {
     /// Activate an operator and record metrics if enabled.
     #[inline(always)]
     fn activate_with_metrics(&mut self, pos: usize) -> Result<ActivationOutcome> {
-        let start = if self.config.collect_metrics {
+        let need_timing = self.config.collect_metrics || self.timeline_collector.is_some();
+        let start = if need_timing {
             Some(Instant::now())
         } else {
             None
@@ -1142,8 +1195,12 @@ impl<T: Timestamp> DataflowExecutor<T> {
         // Record metrics regardless of success/failure — failed activations
         // still consume CPU time and should be tracked.
         if let Some(start) = start {
+            let elapsed = start.elapsed();
             if let Some(collector) = self.op_collectors.get(pos).and_then(|c| c.as_ref()) {
-                collector.record_activation(start.elapsed(), 0);
+                collector.record_activation(elapsed, 0);
+            }
+            if let Some(ref tc) = self.timeline_collector {
+                tc.record_activation(pos, start, elapsed);
             }
         }
 
@@ -1369,6 +1426,7 @@ impl<T: Timestamp> DataflowExecutor<T> {
                 self.control_sender.as_ref(),
                 self.config.catch_panics,
                 &self.op_collectors,
+                self.timeline_collector.as_deref(),
             )?;
 
             total_productive += productive;
@@ -1790,6 +1848,7 @@ mod tests {
                 dataflow_metrics: None,
                 wall_start: None,
                 op_collectors: Vec::new(),
+                timeline_collector: None,
                 _phantom: PhantomData,
                 draining: false,
                 drain_deadline: None,
@@ -1911,6 +1970,7 @@ mod tests {
             dataflow_metrics: None,
             wall_start: None,
             op_collectors: Vec::new(),
+            timeline_collector: None,
             _phantom: PhantomData,
             draining: false,
             drain_deadline: None,
@@ -1959,6 +2019,7 @@ mod tests {
             dataflow_metrics: None,
             wall_start: None,
             op_collectors: Vec::new(),
+            timeline_collector: None,
             _phantom: PhantomData,
             draining: false,
             drain_deadline: None,
@@ -2011,6 +2072,7 @@ mod tests {
             dataflow_metrics: None,
             wall_start: None,
             op_collectors: Vec::new(),
+            timeline_collector: None,
             _phantom: PhantomData,
             draining: false,
             drain_deadline: None,
@@ -2051,6 +2113,7 @@ mod tests {
             dataflow_metrics: None,
             wall_start: None,
             op_collectors: Vec::new(),
+            timeline_collector: None,
             _phantom: PhantomData,
             draining: false,
             drain_deadline: None,
@@ -2098,6 +2161,10 @@ mod tests {
                 channel_counters: false,
             drain_timeout: None,
                 channel_metrics_collectors: Vec::new(),
+            activation_timeline: false,
+            min_activation_duration: std::time::Duration::from_micros(1),
+            max_timeline_events: 0,
+            timeline_start_time: None,
             },
             cancel: CancellationToken::new(),
             progress_tracker: None,
@@ -2120,6 +2187,7 @@ mod tests {
             dataflow_metrics: None,
             wall_start: None,
             op_collectors: Vec::new(),
+            timeline_collector: None,
             _phantom: PhantomData,
             draining: false,
             drain_deadline: None,
@@ -2204,6 +2272,7 @@ mod tests {
             dataflow_metrics: None,
             wall_start: None,
             op_collectors: Vec::new(),
+            timeline_collector: None,
             _phantom: PhantomData,
             draining: false,
             drain_deadline: None,
@@ -2270,6 +2339,7 @@ mod tests {
             dataflow_metrics: None,
             wall_start: None,
             op_collectors: Vec::new(),
+            timeline_collector: None,
             _phantom: PhantomData,
             draining: false,
             drain_deadline: None,
@@ -2322,6 +2392,7 @@ mod tests {
             dataflow_metrics: None,
             wall_start: None,
             op_collectors: Vec::new(),
+            timeline_collector: None,
             _phantom: PhantomData,
             draining: false,
             drain_deadline: None,
@@ -2387,6 +2458,7 @@ mod tests {
             dataflow_metrics: None,
             wall_start: None,
             op_collectors: Vec::new(),
+            timeline_collector: None,
             _phantom: PhantomData,
             draining: false,
             drain_deadline: None,
@@ -2451,6 +2523,7 @@ mod tests {
             dataflow_metrics: None,
             wall_start: None,
             op_collectors: Vec::new(),
+            timeline_collector: None,
             _phantom: PhantomData,
             draining: false,
             drain_deadline: None,
@@ -2503,6 +2576,10 @@ mod tests {
                 channel_counters: false,
             drain_timeout: None,
                 channel_metrics_collectors: Vec::new(),
+            activation_timeline: false,
+            min_activation_duration: std::time::Duration::from_micros(1),
+            max_timeline_events: 0,
+            timeline_start_time: None,
             },
             cancel: CancellationToken::new(),
             progress_tracker: None,
@@ -2525,6 +2602,7 @@ mod tests {
             dataflow_metrics: None,
             wall_start: None,
             op_collectors: Vec::new(),
+            timeline_collector: None,
             _phantom: PhantomData,
             draining: false,
             drain_deadline: None,
@@ -2590,6 +2668,10 @@ mod tests {
                 channel_counters: false,
             drain_timeout: None,
                 channel_metrics_collectors: Vec::new(),
+            activation_timeline: false,
+            min_activation_duration: std::time::Duration::from_micros(1),
+            max_timeline_events: 0,
+            timeline_start_time: None,
             },
             cancel: CancellationToken::new(),
             progress_tracker: None,
@@ -2612,6 +2694,7 @@ mod tests {
             dataflow_metrics: None,
             wall_start: None,
             op_collectors: Vec::new(),
+            timeline_collector: None,
             _phantom: PhantomData,
             draining: false,
             drain_deadline: None,
@@ -2685,6 +2768,7 @@ mod tests {
             dataflow_metrics: None,
             wall_start: None,
             op_collectors: Vec::new(),
+            timeline_collector: None,
             _phantom: PhantomData,
             draining: false,
             drain_deadline: None,
@@ -3103,6 +3187,10 @@ mod tests {
                 channel_counters: false,
             drain_timeout: None,
                 channel_metrics_collectors: Vec::new(),
+            activation_timeline: false,
+            min_activation_duration: std::time::Duration::from_micros(1),
+            max_timeline_events: 0,
+            timeline_start_time: None,
             },
             cancel: CancellationToken::new(),
             progress_tracker: None,
@@ -3125,6 +3213,7 @@ mod tests {
             dataflow_metrics: None,
             wall_start: None,
             op_collectors: Vec::new(),
+            timeline_collector: None,
             _phantom: PhantomData,
             draining: false,
             drain_deadline: None,
@@ -3182,6 +3271,10 @@ mod tests {
                 channel_counters: false,
             drain_timeout: None,
                 channel_metrics_collectors: Vec::new(),
+            activation_timeline: false,
+            min_activation_duration: std::time::Duration::from_micros(1),
+            max_timeline_events: 0,
+            timeline_start_time: None,
             },
             cancel: CancellationToken::new(),
             progress_tracker: None,
@@ -3204,6 +3297,7 @@ mod tests {
             dataflow_metrics: None,
             wall_start: None,
             op_collectors: Vec::new(),
+            timeline_collector: None,
             _phantom: PhantomData,
             draining: false,
             drain_deadline: None,
@@ -3258,6 +3352,7 @@ mod tests {
             dataflow_metrics: None,
             wall_start: None,
             op_collectors: Vec::new(),
+            timeline_collector: None,
             _phantom: PhantomData,
             draining: false,
             drain_deadline: None,
@@ -3324,6 +3419,7 @@ mod tests {
             dataflow_metrics: None,
             wall_start: None,
             op_collectors: Vec::new(),
+            timeline_collector: None,
             _phantom: PhantomData,
             draining: false,
             drain_deadline: None,
@@ -3379,6 +3475,7 @@ mod tests {
             dataflow_metrics: None,
             wall_start: None,
             op_collectors: Vec::new(),
+            timeline_collector: None,
             _phantom: PhantomData,
             draining: false,
             drain_deadline: None,
@@ -3433,6 +3530,7 @@ mod tests {
             dataflow_metrics: None,
             wall_start: None,
             op_collectors: Vec::new(),
+            timeline_collector: None,
             _phantom: PhantomData,
             draining: false,
             drain_deadline: None,
@@ -3487,6 +3585,7 @@ mod tests {
             dataflow_metrics: None,
             wall_start: None,
             op_collectors: Vec::new(),
+            timeline_collector: None,
             _phantom: PhantomData,
             draining: false,
             drain_deadline: None,
@@ -3576,6 +3675,7 @@ mod tests {
             dataflow_metrics: None,
             wall_start: None,
             op_collectors: Vec::new(),
+            timeline_collector: None,
             _phantom: PhantomData,
             draining: false,
             drain_deadline: None,
@@ -3643,6 +3743,7 @@ mod tests {
             dataflow_metrics: None,
             wall_start: None,
             op_collectors: Vec::new(),
+            timeline_collector: None,
             _phantom: PhantomData,
             draining: false,
             drain_deadline: None,
@@ -3708,6 +3809,7 @@ mod tests {
             dataflow_metrics: None,
             wall_start: None,
             op_collectors: Vec::new(),
+            timeline_collector: None,
             _phantom: PhantomData,
             draining: false,
             drain_deadline: None,
@@ -3776,6 +3878,7 @@ mod tests {
             dataflow_metrics: None,
             wall_start: None,
             op_collectors: Vec::new(),
+            timeline_collector: None,
             _phantom: PhantomData,
             draining: false,
             drain_deadline: None,
@@ -3858,6 +3961,7 @@ mod tests {
             dataflow_metrics: None,
             wall_start: None,
             op_collectors: Vec::new(),
+            timeline_collector: None,
             _phantom: PhantomData,
             draining: false,
             drain_deadline: None,
@@ -3913,6 +4017,7 @@ mod tests {
             dataflow_metrics: None,
             wall_start: None,
             op_collectors: Vec::new(),
+            timeline_collector: None,
             _phantom: PhantomData,
             draining: false,
             drain_deadline: None,
@@ -4079,6 +4184,10 @@ mod tests {
             channel_counters: false,
             drain_timeout: Some(std::time::Duration::from_secs(5)),
             channel_metrics_collectors: Vec::new(),
+        activation_timeline: false,
+        min_activation_duration: std::time::Duration::from_micros(1),
+        max_timeline_events: 0,
+        timeline_start_time: None,
         };
         let mut executor = DataflowExecutor::new_test(vec![Box::new(op)], config, 0);
 
@@ -4109,6 +4218,10 @@ mod tests {
             channel_counters: false,
             drain_timeout: None,
                 channel_metrics_collectors: Vec::new(),
+        activation_timeline: false,
+        min_activation_duration: std::time::Duration::from_micros(1),
+        max_timeline_events: 0,
+        timeline_start_time: None,
         };
         let mut executor = DataflowExecutor::new_test(vec![Box::new(op)], config, 0);
         executor.cancel.cancel();
@@ -4153,6 +4266,10 @@ mod tests {
             channel_counters: false,
             drain_timeout: Some(std::time::Duration::from_millis(50)),
             channel_metrics_collectors: Vec::new(),
+        activation_timeline: false,
+        min_activation_duration: std::time::Duration::from_micros(1),
+        max_timeline_events: 0,
+        timeline_start_time: None,
         };
         let mut executor = DataflowExecutor::new_test(vec![Box::new(InfiniteOperator)], config, 0);
         executor.cancel.cancel();
@@ -4184,6 +4301,10 @@ mod tests {
             channel_counters: false,
             drain_timeout: Some(std::time::Duration::from_secs(5)),
             channel_metrics_collectors: Vec::new(),
+        activation_timeline: false,
+        min_activation_duration: std::time::Duration::from_micros(1),
+        max_timeline_events: 0,
+        timeline_start_time: None,
         };
         let mut executor = DataflowExecutor::new_test(vec![Box::new(op)], config, 0);
 

@@ -135,9 +135,10 @@ If `blocked_duration` keeps growing, the next operator is saturated or the buffe
 
 ```rust
 use instancy::{RuntimeConfig, RuntimeHandle, SpawnOptions};
+use instancy::metrics::MetricsConfig;
 
 let rt = RuntimeHandle::new(RuntimeConfig::default()).unwrap();
-let mut handle = rt.spawn(dataflow, SpawnOptions::new().collect_metrics(true)).unwrap();
+let mut handle = rt.spawn(dataflow, SpawnOptions::new().metrics(MetricsConfig::summary_only())).unwrap();
 let metrics = handle.metrics().unwrap().clone();
 
 handle.join_blocking().unwrap();
@@ -454,9 +455,12 @@ Sort operators by CPU time or backpressure before changing code.
 
 ```rust
 use instancy::{RuntimeConfig, RuntimeHandle, SpawnOptions};
+use instancy::metrics::MetricsConfig;
 
 let rt = RuntimeHandle::new(RuntimeConfig::default()).unwrap();
-let mut handle = rt.spawn(dataflow, SpawnOptions::new().collect_metrics(true)).unwrap();
+// MetricsConfig::full() enables operator summary + channel counters + activation timeline.
+// Use MetricsConfig::summary_only() for lower overhead (operator stats only).
+let mut handle = rt.spawn(dataflow, SpawnOptions::new().metrics(MetricsConfig::full())).unwrap();
 let metrics = handle.metrics().unwrap().clone();
 handle.join_blocking().unwrap();
 
@@ -465,6 +469,45 @@ ops.sort_by_key(|op| std::cmp::Reverse(op.cpu_time));
 for op in ops.iter().take(3) {
     println!("{} cpu={:?} blocked={:?}", op.name, op.cpu_time, op.backpressure.blocked_duration);
 }
+```
+
+### Collect activation timeline for post-execution analysis
+Record per-activation timestamped events for visualization in Perfetto UI or custom tools.
+
+```rust
+use instancy::{DataflowBuilder, RuntimeConfig, RuntimeHandle, SpawnOptions};
+use instancy::metrics::MetricsConfig;
+
+let rt = RuntimeHandle::new(RuntimeConfig::default()).unwrap();
+let config = MetricsConfig {
+    activation_timeline: true,
+    min_activation_duration: std::time::Duration::from_micros(5), // skip tiny activations
+    max_timeline_events: 50_000,  // ring buffer cap per worker
+    ..MetricsConfig::full()
+};
+let mut spawned = rt.spawn_multi::<u64, _>("profiled", 4, build_fn, SpawnOptions::new().metrics(config)).unwrap();
+
+// ... run dataflow ...
+
+for w in 0..4 {
+    if let Some(m) = spawned.worker_mut(w).metrics() {
+        let events = m.drain_timeline_events(); // sorted by start_us
+        for ev in &events {
+            println!("op[{}] w{}: {}µs @ +{}µs", ev.operator_index, ev.worker_index, ev.duration_us, ev.start_us);
+        }
+    }
+}
+```
+
+### Inspect exchange channel traffic
+Check per-edge transfer volumes to identify data-skew hotspots.
+
+```rust
+// Requires MetricsConfig with channel_counters: true (included in full()).
+for ch in metrics.channel_snapshots() {
+    println!("{}: {} items, {} bytes", ch.label, ch.items_transferred, ch.bytes_transferred);
+}
+println!("Total items across all edges: {}", metrics.total_items_transferred());
 ```
 
 ## 7. Timing & Delay

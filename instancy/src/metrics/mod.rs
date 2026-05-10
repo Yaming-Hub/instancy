@@ -8,6 +8,7 @@
 //! - [`MetricsConfig`] — granularity controls (which categories to collect)
 //! - [`OperatorMetricsCollector`] — lock-free per-operator metrics accumulator
 //! - [`ChannelMetricsCollector`] — lock-free per-exchange-edge counters
+//! - [`TimelineCollector`] — per-worker activation timeline event ring buffer
 //! - [`ActivationGuard`] — RAII timer for measuring operator activation cost
 //! - [`DataflowResult`] — execution result bundled with collected metrics
 
@@ -45,6 +46,7 @@ use std::time::Duration;
 /// let cfg = MetricsConfig::full();
 /// assert!(cfg.operator_summary);
 /// assert!(cfg.channel_counters);
+/// assert!(cfg.activation_timeline);
 /// ```
 #[derive(Clone, Debug)]
 pub struct MetricsConfig {
@@ -55,6 +57,24 @@ pub struct MetricsConfig {
     /// Per-edge transfer counters: items and bytes sent through each exchange
     /// channel. ~2-3% overhead (atomic add per batch push).
     pub channel_counters: bool,
+
+    /// Record each operator activation as a timestamped event (start offset,
+    /// duration, operator index, worker index). Enables timeline replay in
+    /// Perfetto UI or similar tools. ~5-10% overhead (timestamp capture +
+    /// Vec push per activation).
+    pub activation_timeline: bool,
+
+    /// Minimum activation duration to record in the timeline. Activations
+    /// shorter than this are still counted in `operator_summary` but not
+    /// logged individually. Reduces timeline size for high-frequency operators.
+    /// Only applies when `activation_timeline` is true.
+    pub min_activation_duration: Duration,
+
+    /// Maximum timeline events to retain per worker (ring buffer cap).
+    /// Prevents unbounded memory growth for long-running dataflows.
+    /// Total events across N workers can reach N × this value.
+    /// 0 = unlimited.
+    pub max_timeline_events: usize,
 }
 
 impl MetricsConfig {
@@ -63,6 +83,9 @@ impl MetricsConfig {
         Self {
             operator_summary: false,
             channel_counters: false,
+            activation_timeline: false,
+            min_activation_duration: Duration::from_micros(1),
+            max_timeline_events: 0,
         }
     }
 
@@ -71,6 +94,9 @@ impl MetricsConfig {
         Self {
             operator_summary: true,
             channel_counters: false,
+            activation_timeline: false,
+            min_activation_duration: Duration::from_micros(1),
+            max_timeline_events: 0,
         }
     }
 
@@ -79,13 +105,16 @@ impl MetricsConfig {
         Self {
             operator_summary: true,
             channel_counters: true,
+            activation_timeline: true,
+            min_activation_duration: Duration::from_micros(1),
+            max_timeline_events: 100_000,
         }
     }
 
     /// Returns `true` if any metrics category is enabled.
     #[inline]
     pub fn any_enabled(&self) -> bool {
-        self.operator_summary || self.channel_counters
+        self.operator_summary || self.channel_counters || self.activation_timeline
     }
 }
 
@@ -298,6 +327,106 @@ impl ChannelMetricsCollector {
     }
 }
 
+// ---------------------------------------------------------------------------
+// TimelineEvent — per-activation timestamped events
+// ---------------------------------------------------------------------------
+
+/// A timestamped event recorded during dataflow execution.
+///
+/// Used for post-execution replay and visualization (e.g., Chrome Trace
+/// format for Perfetto UI). Each event captures an operator activation
+/// with its timing and metadata.
+#[derive(Debug, Clone)]
+pub struct ActivationEvent {
+    /// Operator position index within the dataflow graph.
+    pub operator_index: usize,
+    /// Worker index that executed this activation.
+    pub worker_index: usize,
+    /// Offset from the dataflow start time, in microseconds.
+    pub start_us: u64,
+    /// Duration of this activation, in microseconds.
+    pub duration_us: u64,
+}
+
+/// Thread-safe collector for activation timeline events.
+///
+/// Shared across the executor's activation path via `Arc`. Events are
+/// appended lock-free using a `Mutex<VecDeque>` (contention is low since each
+/// worker has its own collector). When `max_events > 0`, old events are
+/// dropped to cap memory usage.
+#[derive(Debug)]
+pub struct TimelineCollector {
+    events: std::sync::Mutex<std::collections::VecDeque<ActivationEvent>>,
+    /// Maximum events to retain (0 = unlimited).
+    max_events: usize,
+    /// Minimum activation duration to record (filter short activations).
+    min_duration: Duration,
+    /// Reference time for computing offsets.
+    start_time: std::time::Instant,
+    /// Worker index for this collector.
+    worker_index: usize,
+}
+
+impl TimelineCollector {
+    /// Create a new timeline collector.
+    pub fn new(
+        worker_index: usize,
+        start_time: std::time::Instant,
+        min_duration: Duration,
+        max_events: usize,
+    ) -> Self {
+        Self {
+            events: std::sync::Mutex::new(std::collections::VecDeque::new()),
+            max_events,
+            min_duration,
+            start_time,
+            worker_index,
+        }
+    }
+
+    /// Record an operator activation event.
+    ///
+    /// Activations shorter than `min_duration` are silently dropped.
+    /// When `max_events` is reached, the oldest event is evicted (O(1)).
+    #[inline]
+    pub fn record_activation(
+        &self,
+        operator_index: usize,
+        start: std::time::Instant,
+        duration: Duration,
+    ) {
+        if duration < self.min_duration {
+            return;
+        }
+        let start_us = start
+            .saturating_duration_since(self.start_time)
+            .as_micros() as u64;
+        let duration_us = duration.as_micros() as u64;
+        let event = ActivationEvent {
+            operator_index,
+            worker_index: self.worker_index,
+            start_us,
+            duration_us,
+        };
+        let mut events = self.events.lock().unwrap_or_else(|e| e.into_inner());
+        if self.max_events > 0 && events.len() >= self.max_events {
+            events.pop_front();
+        }
+        events.push_back(event);
+    }
+
+    /// Drain all recorded events.
+    pub fn take_events(&self) -> Vec<ActivationEvent> {
+        let mut events = self.events.lock().unwrap_or_else(|e| e.into_inner());
+        events.drain(..).collect()
+    }
+
+    /// Number of events currently recorded.
+    pub fn event_count(&self) -> usize {
+        self.events.lock().unwrap_or_else(|e| e.into_inner()).len()
+    }
+}
+
 /// Aggregate metrics for an entire dataflow execution.
 #[derive(Debug)]
 pub struct DataflowMetrics {
@@ -309,6 +438,8 @@ pub struct DataflowMetrics {
     operators: Vec<Arc<OperatorMetricsCollector>>,
     /// Per-exchange-edge channel metrics collectors.
     channels: Vec<Arc<ChannelMetricsCollector>>,
+    /// Per-worker timeline collectors (activation events).
+    timelines: Vec<Arc<TimelineCollector>>,
 }
 
 impl DataflowMetrics {
@@ -319,6 +450,7 @@ impl DataflowMetrics {
             wall_time_nanos: AtomicU64::new(0),
             operators: Vec::new(),
             channels: Vec::new(),
+            timelines: Vec::new(),
         }
     }
 
@@ -420,6 +552,29 @@ impl DataflowMetrics {
     /// Number of registered channel collectors.
     pub fn channel_count(&self) -> usize {
         self.channels.len()
+    }
+
+    /// Register a timeline collector and return the shared reference.
+    pub fn register_timeline(&mut self, collector: Arc<TimelineCollector>) {
+        self.timelines.push(collector);
+    }
+
+    /// Collect all activation timeline events from all workers.
+    ///
+    /// Events are drained from the collectors (each call returns new events
+    /// since the last drain). The returned events are sorted by `start_us`.
+    pub fn drain_timeline_events(&self) -> Vec<ActivationEvent> {
+        let mut all_events = Vec::new();
+        for tc in &self.timelines {
+            all_events.extend(tc.take_events());
+        }
+        all_events.sort_by_key(|e| e.start_us);
+        all_events
+    }
+
+    /// Total number of timeline events currently recorded (across all workers).
+    pub fn timeline_event_count(&self) -> usize {
+        self.timelines.iter().map(|tc| tc.event_count()).sum()
     }
 }
 
@@ -600,5 +755,140 @@ mod tests {
         // Further pushes via original collector are visible.
         collector.record_push(8, 64);
         assert_eq!(metrics.total_items_transferred(), 50);
+    }
+
+    // -----------------------------------------------------------------------
+    // TimelineCollector tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn timeline_collector_records_events() {
+        let start_time = std::time::Instant::now();
+        let tc = TimelineCollector::new(0, start_time, Duration::ZERO, 0);
+
+        // Simulate two activations at different times.
+        let a1_start = start_time + Duration::from_micros(100);
+        let a1_dur = Duration::from_micros(50);
+        tc.record_activation(0, a1_start, a1_dur);
+
+        let a2_start = start_time + Duration::from_micros(300);
+        let a2_dur = Duration::from_micros(25);
+        tc.record_activation(1, a2_start, a2_dur);
+
+        assert_eq!(tc.event_count(), 2);
+
+        let events = tc.take_events();
+        assert_eq!(events.len(), 2);
+        assert_eq!(events[0].operator_index, 0);
+        assert_eq!(events[0].start_us, 100);
+        assert_eq!(events[0].duration_us, 50);
+        assert_eq!(events[0].worker_index, 0);
+        assert_eq!(events[1].operator_index, 1);
+        assert_eq!(events[1].start_us, 300);
+
+        // After take_events, the collector is empty.
+        assert_eq!(tc.event_count(), 0);
+        assert!(tc.take_events().is_empty());
+    }
+
+    #[test]
+    fn timeline_collector_filters_short_activations() {
+        let start_time = std::time::Instant::now();
+        let min_dur = Duration::from_micros(10);
+        let tc = TimelineCollector::new(0, start_time, min_dur, 0);
+
+        // Below threshold — should be filtered.
+        tc.record_activation(0, start_time + Duration::from_micros(50), Duration::from_micros(5));
+        assert_eq!(tc.event_count(), 0);
+
+        // Exactly at threshold — should be recorded.
+        tc.record_activation(0, start_time + Duration::from_micros(100), Duration::from_micros(10));
+        assert_eq!(tc.event_count(), 1);
+
+        // Above threshold — should be recorded.
+        tc.record_activation(1, start_time + Duration::from_micros(200), Duration::from_micros(50));
+        assert_eq!(tc.event_count(), 2);
+    }
+
+    #[test]
+    fn timeline_collector_ring_buffer_cap() {
+        let start_time = std::time::Instant::now();
+        let tc = TimelineCollector::new(0, start_time, Duration::ZERO, 3);
+
+        // Insert 5 events — only last 3 should remain.
+        for i in 0..5u64 {
+            let offset = Duration::from_micros(i * 100);
+            tc.record_activation(i as usize, start_time + offset, Duration::from_micros(10));
+        }
+
+        assert_eq!(tc.event_count(), 3);
+        let events = tc.take_events();
+        // Oldest events (i=0,1) should have been evicted.
+        assert_eq!(events[0].operator_index, 2);
+        assert_eq!(events[1].operator_index, 3);
+        assert_eq!(events[2].operator_index, 4);
+    }
+
+    #[test]
+    fn timeline_collector_unlimited_cap() {
+        let start_time = std::time::Instant::now();
+        let tc = TimelineCollector::new(0, start_time, Duration::ZERO, 0); // 0 = unlimited
+
+        for i in 0..1000u64 {
+            tc.record_activation(0, start_time + Duration::from_micros(i), Duration::from_micros(1));
+        }
+
+        assert_eq!(tc.event_count(), 1000);
+    }
+
+    #[test]
+    fn dataflow_metrics_timeline_registration() {
+        let mut dm = DataflowMetrics::new("timeline-test");
+        let start_time = std::time::Instant::now();
+
+        let tc0 = Arc::new(TimelineCollector::new(0, start_time, Duration::ZERO, 0));
+        let tc1 = Arc::new(TimelineCollector::new(1, start_time, Duration::ZERO, 0));
+
+        dm.register_timeline(Arc::clone(&tc0));
+        dm.register_timeline(Arc::clone(&tc1));
+
+        // Record events from different workers.
+        tc0.record_activation(0, start_time + Duration::from_micros(200), Duration::from_micros(10));
+        tc1.record_activation(1, start_time + Duration::from_micros(100), Duration::from_micros(20));
+
+        assert_eq!(dm.timeline_event_count(), 2);
+
+        // drain_timeline_events returns sorted by start_us.
+        let events = dm.drain_timeline_events();
+        assert_eq!(events.len(), 2);
+        assert_eq!(events[0].start_us, 100); // worker 1's event first
+        assert_eq!(events[0].worker_index, 1);
+        assert_eq!(events[1].start_us, 200); // worker 0's event second
+        assert_eq!(events[1].worker_index, 0);
+
+        // After drain, events are gone.
+        assert_eq!(dm.timeline_event_count(), 0);
+    }
+
+    #[test]
+    fn metrics_config_presets() {
+        let none = MetricsConfig::none();
+        assert!(!none.activation_timeline);
+        assert!(!none.any_enabled());
+
+        let summary = MetricsConfig::summary_only();
+        assert!(!summary.activation_timeline);
+        assert!(summary.any_enabled());
+
+        let full = MetricsConfig::full();
+        assert!(full.activation_timeline);
+        assert!(full.any_enabled());
+        assert_eq!(full.max_timeline_events, 100_000);
+    }
+
+    #[test]
+    fn timeline_collector_is_send_sync() {
+        fn assert_send_sync<T: Send + Sync>() {}
+        assert_send_sync::<TimelineCollector>();
     }
 }
