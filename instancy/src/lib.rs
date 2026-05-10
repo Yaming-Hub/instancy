@@ -53,7 +53,6 @@ pub mod dataflow;
 pub mod error;
 pub mod execute;
 pub(crate) mod executor_task;
-pub mod membership;
 pub mod metrics;
 pub mod order;
 pub mod progress;
@@ -91,21 +90,17 @@ pub use runtime::{
     RuntimeHandle, SpawnOptions, SpawnedDataflow, TokioMode,
 };
 
-// Execution / cluster topology
-pub use execute::{ClusterTopology, NodeConfig};
-
-// Cluster membership
-pub use membership::{
-    ChannelMembership, ClusterMembership, MembershipEvent, NodeDepartureReason,
+// Execution / cluster topology / membership
+pub use execute::{
+    ChannelMembership, ClusterMembership, ClusterTopology, MembershipEvent, NodeConfig,
+    NodeDepartureReason,
 };
 
 // Cancellation
 pub use cancellation::{CancellationReason, CancellationToken};
 
 // Error handling
-pub use error::{
-    CommunicationError, DataflowError, Error, Result, RuntimeError, TopologyError,
-};
+pub use error::{CommunicationError, DataflowError, Error, Result, RuntimeError, TopologyError};
 
 // Worker types
 pub use worker::WorkerId;

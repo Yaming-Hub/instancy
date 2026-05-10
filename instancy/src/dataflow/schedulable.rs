@@ -217,7 +217,9 @@ impl OperatorBlueprint for SingleUseFactory {
         endpoints: ChannelEndpoints,
     ) -> crate::Result<Box<dyn SchedulableOperator>> {
         let factory = self.0.take().ok_or_else(|| {
-            crate::Error::Runtime(RuntimeError::AlreadyConsumed { resource: "SingleUseFactory".into() })
+            crate::Error::Runtime(RuntimeError::AlreadyConsumed {
+                resource: "SingleUseFactory".into(),
+            })
         })?;
         factory(ctx, endpoints)
     }

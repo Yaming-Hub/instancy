@@ -68,7 +68,6 @@ pub enum Error {
     },
 
     // ── Cross-cutting (occurs in many modules) ─────────────────────────
-
     /// A mutex or RwLock was poisoned because another thread panicked
     /// while holding it.
     #[error("Lock poisoned: {context}")]
@@ -78,7 +77,6 @@ pub enum Error {
     },
 
     // ── Module sub-enums ───────────────────────────────────────────────
-
     /// Cluster topology errors (from `execute` / topology module).
     #[error(transparent)]
     Topology(#[from] TopologyError),
@@ -268,7 +266,10 @@ mod tests {
             std::io::ErrorKind::InvalidData,
             "bad bytes",
         ));
-        assert!(err.to_string().contains("serialization error") || err.to_string().contains("Serialization error"));
+        assert!(
+            err.to_string().contains("serialization error")
+                || err.to_string().contains("Serialization error")
+        );
     }
 
     #[test]

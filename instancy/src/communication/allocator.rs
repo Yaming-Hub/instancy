@@ -123,12 +123,9 @@ struct LocalPush<T: Timestamp, D, M> {
 
 impl<T: Timestamp, D: Send, M: Send> Push<T, D, M> for LocalPush<T, D, M> {
     fn push(&mut self, envelope: Envelope<T, D, M>) -> Result<()> {
-        let mut state = self
-            .shared
-            .lock()
-            .map_err(|_| Error::LockPoisoned {
-                context: "channel mutex poisoned".into(),
-            })?;
+        let mut state = self.shared.lock().map_err(|_| Error::LockPoisoned {
+            context: "channel mutex poisoned".into(),
+        })?;
         if state.sender_closed || state.receiver_dropped {
             return Err(Error::ChannelClosed);
         }
@@ -151,7 +148,7 @@ impl<T: Timestamp, D: Send, M: Send> Push<T, D, M> for LocalPush<T, D, M> {
                         context: "channel mutex poisoned".into(),
                     },
                     envelope,
-                ))
+                ));
             }
         };
         if state.sender_closed || state.receiver_dropped {

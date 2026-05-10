@@ -222,10 +222,12 @@ pub fn create_progress_channels<T: Timestamp>(
     wake_handles: &[WakeHandle],
 ) -> crate::Result<Vec<WorkerProgressChannels<T>>> {
     if wake_handles.len() != num_workers {
-        return Err(crate::Error::Dataflow(DataflowError::InvalidConfig(format!(
-            "wake_handles length ({}) must match num_workers ({num_workers})",
-            wake_handles.len()
-        ))));
+        return Err(crate::Error::Dataflow(DataflowError::InvalidConfig(
+            format!(
+                "wake_handles length ({}) must match num_workers ({num_workers})",
+                wake_handles.len()
+            ),
+        )));
     }
 
     // Initialize per-worker channel collections.

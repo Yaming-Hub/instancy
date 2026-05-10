@@ -50,10 +50,10 @@
 use std::collections::VecDeque;
 use std::sync::{Arc, Mutex};
 
-use crate::dataflow::channels::spsc::{SpscPull, SpscPush, spsc_channel};
 use crate::dataflow::channels::envelope::{ControlSignal, Envelope, Payload};
 use crate::dataflow::channels::pact::ExchangeFn;
 use crate::dataflow::channels::pushpull::{Pull, Push};
+use crate::dataflow::channels::spsc::{SpscPull, SpscPush, spsc_channel};
 use crate::dataflow::channels::wake::WakeHandle;
 use crate::error::{DataflowError, Error, Result};
 #[cfg(test)]
@@ -244,7 +244,9 @@ impl<T: Timestamp, D: Send + 'static> ExchangeChannelSet<T, D> {
         let mut pushers: Vec<Box<dyn Push<T, D, ()>>> = Vec::with_capacity(self.num_targets);
         for dst in 0..self.num_targets {
             let push = self.push_ends[src_idx][dst].take().ok_or_else(|| {
-                Error::Dataflow(DataflowError::EndpointTaken(format!("push end [{src_idx}][{dst}] already taken")))
+                Error::Dataflow(DataflowError::EndpointTaken(format!(
+                    "push end [{src_idx}][{dst}] already taken"
+                )))
             })?;
             pushers.push(Box::new(push));
         }
@@ -270,7 +272,9 @@ impl<T: Timestamp, D: Send + 'static> ExchangeChannelSet<T, D> {
         let mut pullers: Vec<Box<dyn Pull<T, D, ()>>> = Vec::with_capacity(self.num_sources);
         for src in 0..self.num_sources {
             let pull = self.pull_ends[src][dst_idx].take().ok_or_else(|| {
-                Error::Dataflow(DataflowError::EndpointTaken(format!("pull end [{src}][{dst_idx}] already taken")))
+                Error::Dataflow(DataflowError::EndpointTaken(format!(
+                    "pull end [{src}][{dst_idx}] already taken"
+                )))
             })?;
             pullers.push(Box::new(pull));
         }
@@ -360,7 +364,9 @@ impl<T: Timestamp, D: Clone + Send + 'static> Push<T, D> for ExchangePush<T, D> 
                             Err(err) => {
                                 // Clear remaining buckets to prevent stale data
                                 // leaking into the next push call.
-                                for b in &mut self.buckets { b.clear(); }
+                                for b in &mut self.buckets {
+                                    b.clear();
+                                }
                                 return Err(err);
                             }
                         }
@@ -427,12 +433,16 @@ impl<T: Timestamp, D: Clone + Send + 'static> Push<T, D> for ExchangePush<T, D> 
                     }
                     if self.targets[target_idx].is_closed() {
                         // Clear buckets before returning.
-                        for b in &mut self.buckets { b.clear(); }
+                        for b in &mut self.buckets {
+                            b.clear();
+                        }
                         return Err((Error::ChannelClosed, envelope));
                     }
                     if let Some(available) = self.targets[target_idx].available_capacity() {
                         if available == 0 {
-                            for b in &mut self.buckets { b.clear(); }
+                            for b in &mut self.buckets {
+                                b.clear();
+                            }
                             return Err((Error::Backpressure, envelope));
                         }
                     }
@@ -453,7 +463,9 @@ impl<T: Timestamp, D: Clone + Send + 'static> Push<T, D> for ExchangePush<T, D> 
                             Ok(()) => self.wakes.wake(target_idx),
                             Err((err, _sub)) => {
                                 // Clear remaining buckets.
-                                for b in &mut self.buckets { b.clear(); }
+                                for b in &mut self.buckets {
+                                    b.clear();
+                                }
                                 return Err((err, envelope));
                             }
                         }

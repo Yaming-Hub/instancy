@@ -12,8 +12,8 @@ use crate::dataflow::channels::PartitionStrategy;
 use crate::dataflow::scope::Scope;
 use crate::dataflow::stage::StageId;
 use crate::dataflow::stream::{Slot, StreamEdge};
-use crate::progress::timestamp::Timestamp;
 use crate::error::DataflowError;
+use crate::progress::timestamp::Timestamp;
 
 /// A registered exchange (repartition) operator.
 ///
@@ -308,7 +308,10 @@ mod tests {
         let stream: StreamEdge<RootScope<u64>, i32> = StreamEdge::new(scope, source, stage_id);
 
         let err = stream.exchange_to(0, |record: &i32| *record).err().unwrap();
-        assert!(matches!(err, crate::Error::Dataflow(DataflowError::InvalidConfig(_))));
+        assert!(matches!(
+            err,
+            crate::Error::Dataflow(DataflowError::InvalidConfig(_))
+        ));
     }
 
     #[test]

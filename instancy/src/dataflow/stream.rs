@@ -138,12 +138,14 @@ impl<D> StreamConnection<D> {
         if self.source_stage != self.target_stage
             && matches!(&self.strategy, PartitionStrategy::Pipeline)
         {
-            return Err(crate::error::Error::Dataflow(DataflowError::InvalidGraph(format!(
-                "Cannot connect {} in {} to {} in {} with Pipeline strategy. \
+            return Err(crate::error::Error::Dataflow(DataflowError::InvalidGraph(
+                format!(
+                    "Cannot connect {} in {} to {} in {} with Pipeline strategy. \
                      Use an explicit repartition operator (exchange, rebalance, gather, broadcast) \
                      when crossing stage boundaries.",
-                self.source, self.source_stage, self.target, self.target_stage,
-            ))));
+                    self.source, self.source_stage, self.target, self.target_stage,
+                ),
+            )));
         }
         Ok(())
     }

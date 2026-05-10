@@ -815,7 +815,8 @@ async fn shared_reconnect_after_transient_network_failure() {
     let dyn_factory: Arc<dyn DynConnectionFactory> = factory.clone();
 
     let rt = tokio::runtime::Handle::current();
-    let manager = SharedPeerManager::new("echo-peer".to_string(), config, dyn_factory, &rt).unwrap();
+    let manager =
+        SharedPeerManager::new("echo-peer".to_string(), config, dyn_factory, &rt).unwrap();
 
     // ---------- register a dataflow and verify initial data flow ----------
     let df_id = DataflowId::new();
