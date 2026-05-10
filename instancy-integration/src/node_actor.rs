@@ -404,9 +404,10 @@ impl DataflowAgent {
         })
         .await
         .unwrap_or_else(|e| {
-            Err(instancy::error::Error::Custom(format!(
-                "spawn_blocking join: {e}"
-            )))
+            Err(
+                instancy::error::RuntimeError::SpawnFailed(format!("spawn_blocking join: {e}"))
+                    .into(),
+            )
         });
 
         match spawn_result {

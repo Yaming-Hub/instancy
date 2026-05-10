@@ -12,6 +12,7 @@ use crate::dataflow::channels::PartitionStrategy;
 use crate::dataflow::scope::Scope;
 use crate::dataflow::stage::StageId;
 use crate::dataflow::stream::{Slot, StreamEdge};
+use crate::error::DataflowError;
 use crate::progress::timestamp::Timestamp;
 
 /// A registered exchange (repartition) operator.
@@ -166,9 +167,9 @@ impl<S: Scope, D: 'static> ExchangeExt<S, D> for StreamEdge<S, D> {
         key_fn: impl Fn(&D) -> K + Send + Sync + 'static,
     ) -> crate::Result<StreamEdge<S, D>> {
         if target_parallelism == 0 {
-            return Err(crate::Error::InvalidConfig(
+            return Err(crate::Error::Dataflow(DataflowError::InvalidConfig(
                 "target_parallelism must be > 0".into(),
-            ));
+            )));
         }
         let scope = self.scope().clone();
         let source_stage = self.stage_id();
@@ -201,9 +202,9 @@ impl<S: Scope, D: 'static> ExchangeExt<S, D> for StreamEdge<S, D> {
         hash_fn: impl Fn(&D) -> u64 + Send + Sync + 'static,
     ) -> crate::Result<StreamEdge<S, D>> {
         if target_parallelism == 0 {
-            return Err(crate::Error::InvalidConfig(
+            return Err(crate::Error::Dataflow(DataflowError::InvalidConfig(
                 "target_parallelism must be > 0".into(),
-            ));
+            )));
         }
         let scope = self.scope().clone();
         let source_stage = self.stage_id();
@@ -307,7 +308,10 @@ mod tests {
         let stream: StreamEdge<RootScope<u64>, i32> = StreamEdge::new(scope, source, stage_id);
 
         let err = stream.exchange_to(0, |record: &i32| *record).err().unwrap();
-        assert!(matches!(err, crate::Error::InvalidConfig(_)));
+        assert!(matches!(
+            err,
+            crate::Error::Dataflow(DataflowError::InvalidConfig(_))
+        ));
     }
 
     #[test]

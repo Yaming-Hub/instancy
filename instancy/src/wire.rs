@@ -13,13 +13,13 @@ pub(crate) fn read_u32(buf: &[u8], offset: usize) -> Result<u32, Error> {
         .and_then(|s| <[u8; 4]>::try_from(s).ok())
         .map(u32::from_le_bytes)
         .ok_or_else(|| {
-            Error::Codec(Box::new(std::io::Error::new(
+            Error::codec(std::io::Error::new(
                 std::io::ErrorKind::UnexpectedEof,
                 format!(
                     "expected 4 bytes at offset {offset}, got {}",
                     buf.len().saturating_sub(offset)
                 ),
-            )))
+            ))
         })
 }
 
@@ -30,13 +30,13 @@ pub(crate) fn read_u64(buf: &[u8], offset: usize) -> Result<u64, Error> {
         .and_then(|s| <[u8; 8]>::try_from(s).ok())
         .map(u64::from_le_bytes)
         .ok_or_else(|| {
-            Error::Codec(Box::new(std::io::Error::new(
+            Error::codec(std::io::Error::new(
                 std::io::ErrorKind::UnexpectedEof,
                 format!(
                     "expected 8 bytes at offset {offset}, got {}",
                     buf.len().saturating_sub(offset)
                 ),
-            )))
+            ))
         })
 }
 
@@ -47,13 +47,13 @@ pub(crate) fn read_i64(buf: &[u8], offset: usize) -> Result<i64, Error> {
         .and_then(|s| <[u8; 8]>::try_from(s).ok())
         .map(i64::from_le_bytes)
         .ok_or_else(|| {
-            Error::Codec(Box::new(std::io::Error::new(
+            Error::codec(std::io::Error::new(
                 std::io::ErrorKind::UnexpectedEof,
                 format!(
                     "expected 8 bytes at offset {offset}, got {}",
                     buf.len().saturating_sub(offset)
                 ),
-            )))
+            ))
         })
 }
 
@@ -63,13 +63,13 @@ pub(crate) fn read_array<const N: usize>(buf: &[u8], offset: usize) -> Result<[u
     buf.get(offset..end)
         .and_then(|s| <[u8; N]>::try_from(s).ok())
         .ok_or_else(|| {
-            Error::Codec(Box::new(std::io::Error::new(
+            Error::codec(std::io::Error::new(
                 std::io::ErrorKind::UnexpectedEof,
                 format!(
                     "expected {N} bytes at offset {offset}, got {}",
                     buf.len().saturating_sub(offset)
                 ),
-            )))
+            ))
         })
 }
 

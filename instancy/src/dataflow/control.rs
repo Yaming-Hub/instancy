@@ -21,6 +21,7 @@ use std::sync::{Arc, Mutex};
 
 use crate::cancellation::{CancellationReason, CancellationToken};
 use crate::dataflow::channels::wake::WakeHandle;
+use crate::error::DataflowError;
 
 // ---------------------------------------------------------------------------
 // WorkerControl — the signal type
@@ -288,9 +289,11 @@ impl ControlBroadcast {
         dataflow_cancel: CancellationToken,
     ) -> crate::Result<(Vec<ControlSender>, Vec<ControlReceiver>)> {
         if wake_handles.len() != num_workers {
-            return Err(crate::Error::InvalidConfig(format!(
-                "wake_handles length ({}) must match num_workers ({num_workers})",
-                wake_handles.len()
+            return Err(crate::Error::Dataflow(DataflowError::InvalidConfig(
+                format!(
+                    "wake_handles length ({}) must match num_workers ({num_workers})",
+                    wake_handles.len()
+                ),
             )));
         }
 

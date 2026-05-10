@@ -114,10 +114,9 @@ pub struct BoundedPush<T: Timestamp, D, M = ()> {
 
 impl<T: Timestamp, D: Send + 'static, M: Send + 'static> Push<T, D, M> for BoundedPush<T, D, M> {
     fn push(&mut self, envelope: Envelope<T, D, M>) -> Result<()> {
-        let mut state = self
-            .state
-            .lock()
-            .map_err(|_| Error::Custom("channel mutex poisoned".into()))?;
+        let mut state = self.state.lock().map_err(|_| Error::LockPoisoned {
+            context: "bounded channel state".into(),
+        })?;
         if self.closed.load(Ordering::Acquire) {
             return Err(Error::ChannelClosed);
         }
@@ -138,7 +137,14 @@ impl<T: Timestamp, D: Send + 'static, M: Send + 'static> Push<T, D, M> for Bound
     ) -> std::result::Result<(), (Error, Envelope<T, D, M>)> {
         let mut state = match self.state.lock() {
             Ok(s) => s,
-            Err(_) => return Err((Error::Custom("channel mutex poisoned".into()), envelope)),
+            Err(_) => {
+                return Err((
+                    Error::LockPoisoned {
+                        context: "bounded channel state".into(),
+                    },
+                    envelope,
+                ));
+            }
         };
         if self.closed.load(Ordering::Acquire) {
             return Err((Error::ChannelClosed, envelope));

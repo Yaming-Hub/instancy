@@ -39,7 +39,7 @@ use std::task::{Context, Poll, Wake};
 use std::time::Instant;
 
 use crate::dataflow::DataflowId;
-use crate::error::Result;
+use crate::error::{Result, RuntimeError};
 use crate::runtime::CompletionNotifier;
 use crate::scheduler::policy::{SchedulePolicy, TaskMeta};
 
@@ -176,7 +176,9 @@ impl ExecutorTask {
             // (which fires on the Arc's last drop) is the final safety net.
             if let Ok(mut n) = this.notifier.lock() {
                 if let Some(notifier) = n.take() {
-                    notifier.complete(Err(crate::error::Error::Custom(msg.into())));
+                    notifier.complete(Err(crate::error::Error::Runtime(
+                        RuntimeError::SpawnFailed(msg.into()),
+                    )));
                 }
             }
             PollOutcome::Completed

@@ -9,7 +9,7 @@ use crate::dataflow::operators::handles::{InputHandle, OutputHandle};
 use crate::dataflow::scope::Scope;
 use crate::dataflow::stage::StageId;
 use crate::dataflow::stream::{Slot, StreamEdge};
-use crate::error::Result;
+use crate::error::{DataflowError, Result};
 use crate::progress::timestamp::Timestamp;
 
 /// A registered concat operator that merges N inputs into one output.
@@ -166,9 +166,9 @@ pub fn concatenate<S: Scope, D: 'static>(
     streams: &[StreamEdge<S, D>],
 ) -> crate::Result<StreamEdge<S, D>> {
     if streams.is_empty() {
-        return Err(crate::Error::InvalidConfig(
+        return Err(crate::Error::Dataflow(DataflowError::InvalidConfig(
             "concatenate requires at least one stream".into(),
-        ));
+        )));
     }
 
     let stage_id = streams[0].stage_id();

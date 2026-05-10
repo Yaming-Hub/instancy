@@ -58,7 +58,7 @@ use crate::dataflow::wired_operators::{
     WiredUnaryNotifyOperator, WiredUnaryOperator,
 };
 use crate::error::LockResultExt;
-use crate::error::{Error, Result};
+use crate::error::{DataflowError, Error, Result};
 use crate::order::Product;
 use crate::progress::change_batch::ChangeBatch;
 use crate::progress::frontier::Antichain;
@@ -406,9 +406,9 @@ impl<T: Timestamp> DataflowBuilder<T> {
 
             // Validate unique name
             if state.input_ports.iter().any(|p| p.name == name) {
-                return Err(Error::InvalidConfig(format!(
+                return Err(Error::Dataflow(DataflowError::InvalidConfig(format!(
                     "duplicate input port name: {name}"
-                )));
+                ))));
             }
 
             op_idx = state.allocate_operator_index();
@@ -460,8 +460,8 @@ impl<T: Timestamp> DataflowBuilder<T> {
             // spawn() to create the ChannelSourceOperator factory and InputSender.
             // The closure captures the concrete data type D.
             let wiring_name = name.clone();
-            let wiring: InputPortWiring = Box::new(
-                move |external_inputs_open, wake_handle, mode| {
+            let wiring: InputPortWiring =
+                Box::new(move |external_inputs_open, wake_handle, mode| {
                     use crate::dataflow::channel_operators::{
                         ChannelSourceOperator, InputRecv, InputSender,
                     };
@@ -478,8 +478,8 @@ impl<T: Timestamp> DataflowBuilder<T> {
                             let ext_counter = Arc::clone(&external_inputs_open);
                             let factory_name = wiring_name.clone();
                             let reporter = source_reporter.clone();
-                            let factory: OperatorFactory = single_use_factory(
-                                move |_ctx, endpoints| {
+                            let factory: OperatorFactory =
+                                single_use_factory(move |_ctx, endpoints| {
                                     let output_pusher: Box<dyn Push<T, D>> = {
                                         let pushers: Vec<Box<dyn Push<T, D>>> = endpoints
                                             .output_pushers
@@ -489,9 +489,11 @@ impl<T: Timestamp> DataflowBuilder<T> {
                                                     .downcast::<Box<dyn Push<T, D>>>()
                                                     .map(|boxed| *boxed)
                                                     .map_err(|_| {
-                                                        Error::Custom(
-                                                            "channel source output pusher type mismatch"
-                                                                .into(),
+                                                        Error::Dataflow(
+                                                            DataflowError::TypeMismatch {
+                                                                operator: "channel source".into(),
+                                                                port: "output pusher".into(),
+                                                            },
                                                         )
                                                     })
                                             })
@@ -509,8 +511,7 @@ impl<T: Timestamp> DataflowBuilder<T> {
                                         ext_counter,
                                     );
                                     Ok(Box::new(op) as Box<dyn SchedulableOperator>)
-                                },
-                            );
+                                });
 
                             let sender_any: Box<dyn std::any::Any + Send> = Box::new(sender);
                             (factory, sender_any)
@@ -524,8 +525,8 @@ impl<T: Timestamp> DataflowBuilder<T> {
                             let ext_counter = Arc::clone(&external_inputs_open);
                             let factory_name = wiring_name.clone();
                             let reporter = source_reporter.clone();
-                            let factory: OperatorFactory = single_use_factory(
-                                move |_ctx, endpoints| {
+                            let factory: OperatorFactory =
+                                single_use_factory(move |_ctx, endpoints| {
                                     let output_pusher: Box<dyn Push<T, D>> = {
                                         let pushers: Vec<Box<dyn Push<T, D>>> = endpoints
                                             .output_pushers
@@ -535,9 +536,11 @@ impl<T: Timestamp> DataflowBuilder<T> {
                                                     .downcast::<Box<dyn Push<T, D>>>()
                                                     .map(|boxed| *boxed)
                                                     .map_err(|_| {
-                                                        Error::Custom(
-                                                            "channel source output pusher type mismatch"
-                                                                .into(),
+                                                        Error::Dataflow(
+                                                            DataflowError::TypeMismatch {
+                                                                operator: "channel source".into(),
+                                                                port: "output pusher".into(),
+                                                            },
                                                         )
                                                     })
                                             })
@@ -555,15 +558,13 @@ impl<T: Timestamp> DataflowBuilder<T> {
                                         ext_counter,
                                     );
                                     Ok(Box::new(op) as Box<dyn SchedulableOperator>)
-                                },
-                            );
+                                });
 
                             let sender_any: Box<dyn std::any::Any + Send> = Box::new(sender);
                             (factory, sender_any)
                         }
                     }
-                },
-            );
+                });
             state.input_port_wiring.push(wiring);
         }
 
@@ -643,7 +644,10 @@ impl<T: Timestamp> DataflowBuilder<T> {
                                     .downcast::<Box<dyn Push<T, D>>>()
                                     .map(|boxed| *boxed)
                                     .map_err(|_| {
-                                        Error::Custom("source output pusher type mismatch".into())
+                                        Error::Dataflow(DataflowError::TypeMismatch {
+                                            operator: "source".into(),
+                                            port: "output pusher".into(),
+                                        })
                                     })
                             })
                             .collect::<Result<_>>()?;
@@ -776,9 +780,10 @@ impl<T: Timestamp> DataflowBuilder<T> {
                                         .downcast::<Box<dyn Push<T, D>>>()
                                         .map(|boxed| *boxed)
                                         .map_err(|_| {
-                                            Error::Custom(
-                                                "async source output pusher type mismatch".into(),
-                                            )
+                                            Error::Dataflow(DataflowError::TypeMismatch {
+                                                operator: "async source".into(),
+                                                port: "output pusher".into(),
+                                            })
                                         })
                                 })
                                 .collect::<Result<_>>()?;
@@ -893,11 +898,11 @@ impl<T: Timestamp> DataflowBuilder<T> {
         let mut state = match Rc::try_unwrap(self.state) {
             Ok(cell) => cell.into_inner(),
             Err(_) => {
-                return Err(Error::Custom(
+                return Err(Error::Dataflow(DataflowError::InvalidConfig(
                     "cannot build: outstanding Pipe references still exist — \
                      drop all Pipe handles before calling build()"
                         .into(),
-                ));
+                )));
             }
         };
 
@@ -1050,7 +1055,9 @@ impl<T: Timestamp, D: Clone + Send + 'static> Pipe<T, D> {
     /// ```
     pub fn with_capacity(mut self, capacity: usize) -> Result<Self> {
         if capacity == 0 {
-            return Err(Error::InvalidConfig("channel capacity must be > 0".into()));
+            return Err(Error::Dataflow(DataflowError::InvalidConfig(
+                "channel capacity must be > 0".into(),
+            )));
         }
         self.capacity_override = Some(capacity);
         Ok(self)
@@ -1307,9 +1314,19 @@ impl<T: Timestamp, D: Clone + Send + 'static> Pipe<T, D> {
                     .input_pullers
                     .into_iter()
                     .next()
-                    .ok_or_else(|| Error::Custom("for_each sink must have input puller".into()))?
+                    .ok_or_else(|| {
+                        Error::Dataflow(DataflowError::MissingEndpoint {
+                            operator: "for_each sink".into(),
+                            port: "input puller".into(),
+                        })
+                    })?
                     .downcast::<Box<dyn Pull<T, D>>>()
-                    .map_err(|_| Error::Custom("for_each input puller type mismatch".into()))?;
+                    .map_err(|_| {
+                        Error::Dataflow(DataflowError::TypeMismatch {
+                            operator: "for_each sink".into(),
+                            port: "input puller".into(),
+                        })
+                    })?;
 
                 Ok(Box::new(ForEachSink::new(
                     name_clone,
@@ -1506,9 +1523,9 @@ impl<T: Timestamp, D: Clone + Send + 'static> Pipe<T, D> {
                 for item in data {
                     let new_time = delay_fn(&time, &item);
                     if new_time < time {
-                        return Err(Error::InvalidConfig(
+                        return Err(Error::Dataflow(DataflowError::InvalidConfig(
                             "delay_fn must not return a timestamp earlier than the input".into(),
-                        ));
+                        )));
                     }
                     stash.entry(new_time.clone()).or_default().push(item);
                     ctx.notify_at(new_time);
@@ -1553,9 +1570,9 @@ impl<T: Timestamp, D: Clone + Send + 'static> Pipe<T, D> {
             while let Some((time, data)) = input.next() {
                 let new_time = delay_fn(&time);
                 if new_time < time {
-                    return Err(Error::InvalidConfig(
+                    return Err(Error::Dataflow(DataflowError::InvalidConfig(
                         "delay_fn must not return a timestamp earlier than the input".into(),
-                    ));
+                    )));
                 }
                 stash.entry(new_time.clone()).or_default().extend(data);
                 ctx.notify_at(new_time);
@@ -1865,9 +1882,9 @@ impl<T: Timestamp, D: Clone + Send + 'static> Pipe<T, D> {
     {
         // Both streams must share the same builder state.
         if !Rc::ptr_eq(&self.state, &other.state) {
-            return Err(Error::InvalidConfig(
+            return Err(Error::Dataflow(DataflowError::InvalidConfig(
                 "binary operator streams must belong to the same DataflowBuilder".into(),
-            ));
+            )));
         }
 
         let capacity1 = self.resolve_capacity();
@@ -1935,15 +1952,35 @@ impl<T: Timestamp, D: Clone + Send + 'static> Pipe<T, D> {
 
                     let input1_puller: Box<dyn Pull<T, D>> = *pullers
                         .next()
-                        .ok_or_else(|| Error::Custom("binary must have input puller 0".into()))?
+                        .ok_or_else(|| {
+                            Error::Dataflow(DataflowError::MissingEndpoint {
+                                operator: "binary".into(),
+                                port: "input puller 0".into(),
+                            })
+                        })?
                         .downcast::<Box<dyn Pull<T, D>>>()
-                        .map_err(|_| Error::Custom("binary input1 puller type mismatch".into()))?;
+                        .map_err(|_| {
+                            Error::Dataflow(DataflowError::TypeMismatch {
+                                operator: "binary".into(),
+                                port: "input puller 0".into(),
+                            })
+                        })?;
 
                     let input2_puller: Box<dyn Pull<T, D2>> = *pullers
                         .next()
-                        .ok_or_else(|| Error::Custom("binary must have input puller 1".into()))?
+                        .ok_or_else(|| {
+                            Error::Dataflow(DataflowError::MissingEndpoint {
+                                operator: "binary".into(),
+                                port: "input puller 1".into(),
+                            })
+                        })?
                         .downcast::<Box<dyn Pull<T, D2>>>()
-                        .map_err(|_| Error::Custom("binary input2 puller type mismatch".into()))?;
+                        .map_err(|_| {
+                            Error::Dataflow(DataflowError::TypeMismatch {
+                                operator: "binary".into(),
+                                port: "input puller 1".into(),
+                            })
+                        })?;
 
                     let output_pusher: Box<dyn Push<T, D3>> = {
                         let pushers: Vec<Box<dyn Push<T, D3>>> = endpoints
@@ -1954,7 +1991,10 @@ impl<T: Timestamp, D: Clone + Send + 'static> Pipe<T, D> {
                                     .downcast::<Box<dyn Push<T, D3>>>()
                                     .map(|boxed| *boxed)
                                     .map_err(|_| {
-                                        Error::Custom("binary output pusher type mismatch".into())
+                                        Error::Dataflow(DataflowError::TypeMismatch {
+                                            operator: "binary".into(),
+                                            port: "output pusher".into(),
+                                        })
                                     })
                             })
                             .collect::<Result<_>>()?;
@@ -2119,9 +2159,19 @@ impl<T: Timestamp, D: Clone + Send + 'static> Pipe<T, D> {
                         .input_pullers
                         .into_iter()
                         .next()
-                        .ok_or_else(|| Error::Custom("enter must have input puller".into()))?
+                        .ok_or_else(|| {
+                            Error::Dataflow(DataflowError::MissingEndpoint {
+                                operator: "enter".into(),
+                                port: "input puller".into(),
+                            })
+                        })?
                         .downcast::<Box<dyn Pull<T, D>>>()
-                        .map_err(|_| Error::Custom("enter input puller type mismatch".into()))?;
+                        .map_err(|_| {
+                            Error::Dataflow(DataflowError::TypeMismatch {
+                                operator: "enter".into(),
+                                port: "input puller".into(),
+                            })
+                        })?;
 
                     let output_pusher: Box<dyn Push<PT<T, TInner>, D>> = {
                         let pushers: Vec<Box<dyn Push<PT<T, TInner>, D>>> = endpoints
@@ -2132,7 +2182,10 @@ impl<T: Timestamp, D: Clone + Send + 'static> Pipe<T, D> {
                                     .downcast::<Box<dyn Push<PT<T, TInner>, D>>>()
                                     .map(|boxed| *boxed)
                                     .map_err(|_| {
-                                        Error::Custom("enter output pusher type mismatch".into())
+                                        Error::Dataflow(DataflowError::TypeMismatch {
+                                            operator: "enter".into(),
+                                            port: "output pusher".into(),
+                                        })
                                     })
                             })
                             .collect::<Result<_>>()?;
@@ -2196,9 +2249,19 @@ impl<T: Timestamp, D: Clone + Send + 'static> Pipe<T, D> {
                         .input_pullers
                         .into_iter()
                         .next()
-                        .ok_or_else(|| Error::Custom("feedback must have input puller".into()))?
+                        .ok_or_else(|| {
+                            Error::Dataflow(DataflowError::MissingEndpoint {
+                                operator: "feedback".into(),
+                                port: "input puller".into(),
+                            })
+                        })?
                         .downcast::<Box<dyn Pull<PT<T, TInner>, D>>>()
-                        .map_err(|_| Error::Custom("feedback input puller type mismatch".into()))?;
+                        .map_err(|_| {
+                            Error::Dataflow(DataflowError::TypeMismatch {
+                                operator: "feedback".into(),
+                                port: "input puller".into(),
+                            })
+                        })?;
 
                     let output_pusher: Box<dyn Push<PT<T, TInner>, D>> = {
                         let pushers: Vec<Box<dyn Push<PT<T, TInner>, D>>> = endpoints
@@ -2209,7 +2272,10 @@ impl<T: Timestamp, D: Clone + Send + 'static> Pipe<T, D> {
                                     .downcast::<Box<dyn Push<PT<T, TInner>, D>>>()
                                     .map(|boxed| *boxed)
                                     .map_err(|_| {
-                                        Error::Custom("feedback output pusher type mismatch".into())
+                                        Error::Dataflow(DataflowError::TypeMismatch {
+                                            operator: "feedback".into(),
+                                            port: "output pusher".into(),
+                                        })
                                     })
                             })
                             .collect::<Result<_>>()?;
@@ -2296,7 +2362,10 @@ impl<T: Timestamp, D: Clone + Send + 'static> Pipe<T, D> {
                                 .downcast::<Box<dyn Pull<PT<T, TInner>, D>>>()
                                 .map(|boxed| *boxed)
                                 .map_err(|_| {
-                                    Error::Custom("concat input puller type mismatch".into())
+                                    Error::Dataflow(DataflowError::TypeMismatch {
+                                        operator: "concat".into(),
+                                        port: "input puller".into(),
+                                    })
                                 })
                         })
                         .collect::<Result<_>>()?;
@@ -2310,7 +2379,10 @@ impl<T: Timestamp, D: Clone + Send + 'static> Pipe<T, D> {
                                     .downcast::<Box<dyn Push<PT<T, TInner>, D>>>()
                                     .map(|boxed| *boxed)
                                     .map_err(|_| {
-                                        Error::Custom("concat output pusher type mismatch".into())
+                                        Error::Dataflow(DataflowError::TypeMismatch {
+                                            operator: "concat".into(),
+                                            port: "output pusher".into(),
+                                        })
                                     })
                             })
                             .collect::<Result<_>>()?;
@@ -2436,8 +2508,10 @@ impl<T: Timestamp, D: Clone + Send + 'static> Pipe<T, D> {
         let inner = match Rc::try_unwrap(inner_state) {
             Ok(cell) => cell.into_inner(),
             Err(_) => {
-                self.state.borrow_mut().builder_errors.push(Error::Custom(
-                    "iterate body must not hold Pipe references after returning".into(),
+                self.state.borrow_mut().builder_errors.push(Error::Dataflow(
+                    DataflowError::InvalidConfig(
+                        "iterate body must not hold Pipe references after returning".into(),
+                    ),
                 ));
                 return Pipe {
                     state: Rc::clone(&self.state),
@@ -2570,9 +2644,19 @@ impl<T: Timestamp, D: Clone + Send + 'static> Pipe<T, D> {
                         .input_pullers
                         .into_iter()
                         .next()
-                        .ok_or_else(|| Error::Custom("leave must have input puller".into()))?
+                        .ok_or_else(|| {
+                            Error::Dataflow(DataflowError::MissingEndpoint {
+                                operator: "leave".into(),
+                                port: "input puller".into(),
+                            })
+                        })?
                         .downcast::<Box<dyn Pull<PT<T, TInner>, D>>>()
-                        .map_err(|_| Error::Custom("leave input puller type mismatch".into()))?;
+                        .map_err(|_| {
+                            Error::Dataflow(DataflowError::TypeMismatch {
+                                operator: "leave".into(),
+                                port: "input puller".into(),
+                            })
+                        })?;
 
                     let output_pusher: Box<dyn Push<T, D>> = {
                         let pushers: Vec<Box<dyn Push<T, D>>> = endpoints
@@ -2583,7 +2667,10 @@ impl<T: Timestamp, D: Clone + Send + 'static> Pipe<T, D> {
                                     .downcast::<Box<dyn Push<T, D>>>()
                                     .map(|boxed| *boxed)
                                     .map_err(|_| {
-                                        Error::Custom("leave output pusher type mismatch".into())
+                                        Error::Dataflow(DataflowError::TypeMismatch {
+                                            operator: "leave".into(),
+                                            port: "output pusher".into(),
+                                        })
                                     })
                             })
                             .collect::<Result<_>>()?;
@@ -2645,17 +2732,17 @@ impl<T: Timestamp, D: Clone + Send + 'static> Pipe<T, D> {
     /// ```
     pub fn concat(mut streams: Vec<Pipe<T, D>>) -> Result<Pipe<T, D>> {
         if streams.is_empty() {
-            return Err(Error::InvalidConfig(
+            return Err(Error::Dataflow(DataflowError::InvalidConfig(
                 "concat requires at least one Pipe".into(),
-            ));
+            )));
         }
 
         // Verify all streams share the same builder.
         for s in &streams[1..] {
             if !Rc::ptr_eq(&streams[0].state, &s.state) {
-                return Err(Error::InvalidConfig(
+                return Err(Error::Dataflow(DataflowError::InvalidConfig(
                     "concat streams must belong to the same DataflowBuilder".into(),
-                ));
+                )));
             }
         }
 
@@ -2722,7 +2809,10 @@ impl<T: Timestamp, D: Clone + Send + 'static> Pipe<T, D> {
                                 .downcast::<Box<dyn Pull<T, D>>>()
                                 .map(|boxed| *boxed)
                                 .map_err(|_| {
-                                    Error::Custom("concat input puller type mismatch".into())
+                                    Error::Dataflow(DataflowError::TypeMismatch {
+                                        operator: "concat".into(),
+                                        port: "input puller".into(),
+                                    })
                                 })
                         })
                         .collect::<Result<_>>()?;
@@ -2736,7 +2826,10 @@ impl<T: Timestamp, D: Clone + Send + 'static> Pipe<T, D> {
                                     .downcast::<Box<dyn Push<T, D>>>()
                                     .map(|boxed| *boxed)
                                     .map_err(|_| {
-                                        Error::Custom("concat output pusher type mismatch".into())
+                                        Error::Dataflow(DataflowError::TypeMismatch {
+                                            operator: "concat".into(),
+                                            port: "output pusher".into(),
+                                        })
                                     })
                             })
                             .collect::<Result<_>>()?;
@@ -2808,9 +2901,9 @@ impl<T: Timestamp, D: Clone + Send + 'static> Pipe<T, D> {
 
             // Validate unique name
             if state.output_ports.iter().any(|p| p.name == name) {
-                return Err(Error::InvalidConfig(format!(
+                return Err(Error::Dataflow(DataflowError::InvalidConfig(format!(
                     "duplicate output port name: {name}"
-                )));
+                ))));
             }
 
             op_idx = state.allocate_operator_index();
@@ -2863,9 +2956,19 @@ impl<T: Timestamp, D: Clone + Send + 'static> Pipe<T, D> {
                         .input_pullers
                         .into_iter()
                         .next()
-                        .ok_or_else(|| Error::Custom("sink must have input puller".into()))?
+                        .ok_or_else(|| {
+                            Error::Dataflow(DataflowError::MissingEndpoint {
+                                operator: "sink".into(),
+                                port: "input puller".into(),
+                            })
+                        })?
                         .downcast::<Box<dyn Pull<T, D>>>()
-                        .map_err(|_| Error::Custom("sink input puller type mismatch".into()))?;
+                        .map_err(|_| {
+                            Error::Dataflow(DataflowError::TypeMismatch {
+                                operator: "sink".into(),
+                                port: "input puller".into(),
+                            })
+                        })?;
 
                     Ok(Box::new(CollectingSink::new(
                         name_clone,
@@ -2900,11 +3003,17 @@ impl<T: Timestamp, D: Clone + Send + 'static> Pipe<T, D> {
                                     .into_iter()
                                     .next()
                                     .ok_or_else(|| {
-                                        Error::Custom("sink must have input puller".into())
+                                        Error::Dataflow(DataflowError::MissingEndpoint {
+                                            operator: "sink".into(),
+                                            port: "input puller".into(),
+                                        })
                                     })?
                                     .downcast::<Box<dyn Pull<T, D>>>()
                                     .map_err(|_| {
-                                        Error::Custom("sink input puller type mismatch".into())
+                                        Error::Dataflow(DataflowError::TypeMismatch {
+                                            operator: "sink".into(),
+                                            port: "input puller".into(),
+                                        })
                                     })?;
 
                                 Ok(Box::new(ChannelSinkOperator::new(
@@ -2938,11 +3047,17 @@ impl<T: Timestamp, D: Clone + Send + 'static> Pipe<T, D> {
                                     .into_iter()
                                     .next()
                                     .ok_or_else(|| {
-                                        Error::Custom("sink must have input puller".into())
+                                        Error::Dataflow(DataflowError::MissingEndpoint {
+                                            operator: "sink".into(),
+                                            port: "input puller".into(),
+                                        })
                                     })?
                                     .downcast::<Box<dyn Pull<T, D>>>()
                                     .map_err(|_| {
-                                        Error::Custom("sink input puller type mismatch".into())
+                                        Error::Dataflow(DataflowError::TypeMismatch {
+                                            operator: "sink".into(),
+                                            port: "input puller".into(),
+                                        })
                                     })?;
 
                                 Ok(Box::new(ChannelSinkOperator::new(
@@ -3203,9 +3318,9 @@ impl<
         key_fn: impl Fn(&D) -> K + Send + Sync + 'static,
     ) -> Result<Pipe<T, D>> {
         if target_parallelism == 0 {
-            return Err(Error::InvalidConfig(
+            return Err(Error::Dataflow(DataflowError::InvalidConfig(
                 "target_parallelism must be > 0".into(),
-            ));
+            )));
         }
         let capacity = self.resolve_capacity();
         let exchange_fn = crate::dataflow::channels::pact::ExchangeFn::by_key(name.into(), key_fn);
@@ -3256,9 +3371,9 @@ impl<
         hash_fn: impl Fn(&D) -> u64 + Send + Sync + 'static,
     ) -> Result<Pipe<T, D>> {
         if target_parallelism == 0 {
-            return Err(Error::InvalidConfig(
+            return Err(Error::Dataflow(DataflowError::InvalidConfig(
                 "target_parallelism must be > 0".into(),
-            ));
+            )));
         }
         let capacity = self.resolve_capacity();
         let exchange_fn = crate::dataflow::channels::pact::ExchangeFn::new(name, hash_fn);
@@ -3359,9 +3474,9 @@ impl<
         target_parallelism: usize,
     ) -> Result<Pipe<T, D>> {
         if target_parallelism == 0 {
-            return Err(Error::InvalidConfig(
+            return Err(Error::Dataflow(DataflowError::InvalidConfig(
                 "target_parallelism must be > 0".into(),
-            ));
+            )));
         }
         let counter = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
         self.exchange_by_hash_to(name, target_parallelism, move |_| {
@@ -3463,9 +3578,9 @@ impl<T: Timestamp, D: Clone + Send + 'static> Pipe<T, D> {
         key_fn: impl Fn(&D) -> K + Send + Sync + 'static,
     ) -> Result<Pipe<T, D>> {
         if target_parallelism == 0 {
-            return Err(Error::InvalidConfig(
+            return Err(Error::Dataflow(DataflowError::InvalidConfig(
                 "target_parallelism must be > 0".into(),
-            ));
+            )));
         }
         let capacity = self.resolve_capacity();
         let exchange_fn = crate::dataflow::channels::pact::ExchangeFn::by_key(&name.into(), key_fn);
@@ -3515,9 +3630,9 @@ impl<T: Timestamp, D: Clone + Send + 'static> Pipe<T, D> {
         hash_fn: impl Fn(&D) -> u64 + Send + Sync + 'static,
     ) -> Result<Pipe<T, D>> {
         if target_parallelism == 0 {
-            return Err(Error::InvalidConfig(
+            return Err(Error::Dataflow(DataflowError::InvalidConfig(
                 "target_parallelism must be > 0".into(),
-            ));
+            )));
         }
         let capacity = self.resolve_capacity();
         let exchange_fn = crate::dataflow::channels::pact::ExchangeFn::new(name, hash_fn);
@@ -3590,9 +3705,9 @@ impl<T: Timestamp, D: Clone + Send + 'static> Pipe<T, D> {
         target_parallelism: usize,
     ) -> Result<Pipe<T, D>> {
         if target_parallelism == 0 {
-            return Err(Error::InvalidConfig(
+            return Err(Error::Dataflow(DataflowError::InvalidConfig(
                 "target_parallelism must be > 0".into(),
-            ));
+            )));
         }
         let counter = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
         self.exchange_by_hash_to(name, target_parallelism, move |_| {
@@ -3707,9 +3822,19 @@ impl<T: Timestamp, D: Clone + Send + 'static> Pipe<T, D> {
                         .input_pullers
                         .into_iter()
                         .next()
-                        .ok_or_else(|| Error::Custom("exchange must have input puller".into()))?
+                        .ok_or_else(|| {
+                            Error::Dataflow(DataflowError::MissingEndpoint {
+                                operator: "exchange".into(),
+                                port: "input puller".into(),
+                            })
+                        })?
                         .downcast::<Box<dyn Pull<T, D>>>()
-                        .map_err(|_| Error::Custom("exchange input puller type mismatch".into()))?;
+                        .map_err(|_| {
+                            Error::Dataflow(DataflowError::TypeMismatch {
+                                operator: "exchange".into(),
+                                port: "input puller".into(),
+                            })
+                        })?;
 
                     let output_pusher: Box<dyn Push<T, D>> = {
                         let pushers: Vec<Box<dyn Push<T, D>>> = endpoints
@@ -3720,7 +3845,10 @@ impl<T: Timestamp, D: Clone + Send + 'static> Pipe<T, D> {
                                     .downcast::<Box<dyn Push<T, D>>>()
                                     .map(|boxed| *boxed)
                                     .map_err(|_| {
-                                        Error::Custom("exchange output pusher type mismatch".into())
+                                        Error::Dataflow(DataflowError::TypeMismatch {
+                                            operator: "exchange".into(),
+                                            port: "output pusher".into(),
+                                        })
                                     })
                             })
                             .collect::<Result<_>>()?;
@@ -3850,10 +3978,18 @@ impl<T: Timestamp, D: Clone + Send + 'static> Pipe<T, D> {
                         .input_pullers
                         .into_iter()
                         .next()
-                        .ok_or_else(|| Error::Custom("broadcast must have input puller".into()))?
+                        .ok_or_else(|| {
+                            Error::Dataflow(DataflowError::MissingEndpoint {
+                                operator: "broadcast".into(),
+                                port: "input puller".into(),
+                            })
+                        })?
                         .downcast::<Box<dyn Pull<T, D>>>()
                         .map_err(|_| {
-                            Error::Custom("broadcast input puller type mismatch".into())
+                            Error::Dataflow(DataflowError::TypeMismatch {
+                                operator: "broadcast".into(),
+                                port: "input puller".into(),
+                            })
                         })?;
 
                     let output_pusher: Box<dyn Push<T, D>> = {
@@ -3865,9 +4001,10 @@ impl<T: Timestamp, D: Clone + Send + 'static> Pipe<T, D> {
                                     .downcast::<Box<dyn Push<T, D>>>()
                                     .map(|boxed| *boxed)
                                     .map_err(|_| {
-                                        Error::Custom(
-                                            "broadcast output pusher type mismatch".into(),
-                                        )
+                                        Error::Dataflow(DataflowError::TypeMismatch {
+                                            operator: "broadcast".into(),
+                                            port: "output pusher".into(),
+                                        })
                                     })
                             })
                             .collect::<Result<_>>()?;
@@ -4017,9 +4154,19 @@ impl<T: Timestamp, D: Clone + Send + 'static> Pipe<T, D> {
                         .input_pullers
                         .into_iter()
                         .next()
-                        .ok_or_else(|| Error::Custom("unary must have input puller".into()))?
+                        .ok_or_else(|| {
+                            Error::Dataflow(DataflowError::MissingEndpoint {
+                                operator: "unary".into(),
+                                port: "input puller".into(),
+                            })
+                        })?
                         .downcast::<Box<dyn Pull<T, D>>>()
-                        .map_err(|_| Error::Custom("unary input puller type mismatch".into()))?;
+                        .map_err(|_| {
+                            Error::Dataflow(DataflowError::TypeMismatch {
+                                operator: "unary".into(),
+                                port: "input puller".into(),
+                            })
+                        })?;
 
                     let output_pusher: Box<dyn Push<T, D2>> = {
                         let pushers: Vec<Box<dyn Push<T, D2>>> = endpoints
@@ -4030,7 +4177,10 @@ impl<T: Timestamp, D: Clone + Send + 'static> Pipe<T, D> {
                                     .downcast::<Box<dyn Push<T, D2>>>()
                                     .map(|boxed| *boxed)
                                     .map_err(|_| {
-                                        Error::Custom("unary output pusher type mismatch".into())
+                                        Error::Dataflow(DataflowError::TypeMismatch {
+                                            operator: "unary".into(),
+                                            port: "output pusher".into(),
+                                        })
                                     })
                             })
                             .collect::<Result<_>>()?;
@@ -4132,9 +4282,19 @@ impl<T: Timestamp, D: Clone + Send + 'static> Pipe<T, D> {
                         .input_pullers
                         .into_iter()
                         .next()
-                        .ok_or_else(|| Error::Custom("unary must have input puller".into()))?
+                        .ok_or_else(|| {
+                            Error::Dataflow(DataflowError::MissingEndpoint {
+                                operator: "unary".into(),
+                                port: "input puller".into(),
+                            })
+                        })?
                         .downcast::<Box<dyn Pull<T, D>>>()
-                        .map_err(|_| Error::Custom("unary input puller type mismatch".into()))?;
+                        .map_err(|_| {
+                            Error::Dataflow(DataflowError::TypeMismatch {
+                                operator: "unary".into(),
+                                port: "input puller".into(),
+                            })
+                        })?;
 
                     let output_pusher: Box<dyn Push<T, D2>> = {
                         let pushers: Vec<Box<dyn Push<T, D2>>> = endpoints
@@ -4145,7 +4305,10 @@ impl<T: Timestamp, D: Clone + Send + 'static> Pipe<T, D> {
                                     .downcast::<Box<dyn Push<T, D2>>>()
                                     .map(|boxed| *boxed)
                                     .map_err(|_| {
-                                        Error::Custom("unary output pusher type mismatch".into())
+                                        Error::Dataflow(DataflowError::TypeMismatch {
+                                            operator: "unary".into(),
+                                            port: "output pusher".into(),
+                                        })
                                     })
                             })
                             .collect::<Result<_>>()?;
@@ -4277,10 +4440,18 @@ impl<T: Timestamp, D: Clone + Send + 'static> Pipe<T, D> {
                         .input_pullers
                         .into_iter()
                         .next()
-                        .ok_or_else(|| Error::Custom("unary_notify must have input puller".into()))?
+                        .ok_or_else(|| {
+                            Error::Dataflow(DataflowError::MissingEndpoint {
+                                operator: "unary_notify".into(),
+                                port: "input puller".into(),
+                            })
+                        })?
                         .downcast::<Box<dyn Pull<T, D>>>()
                         .map_err(|_| {
-                            Error::Custom("unary_notify input puller type mismatch".into())
+                            Error::Dataflow(DataflowError::TypeMismatch {
+                                operator: "unary_notify".into(),
+                                port: "input puller".into(),
+                            })
                         })?;
 
                     let output_pusher: Box<dyn Push<T, D2>> = {
@@ -4292,9 +4463,10 @@ impl<T: Timestamp, D: Clone + Send + 'static> Pipe<T, D> {
                                     .downcast::<Box<dyn Push<T, D2>>>()
                                     .map(|boxed| *boxed)
                                     .map_err(|_| {
-                                        Error::Custom(
-                                            "unary_notify output pusher type mismatch".into(),
-                                        )
+                                        Error::Dataflow(DataflowError::TypeMismatch {
+                                            operator: "unary_notify".into(),
+                                            port: "output pusher".into(),
+                                        })
                                     })
                             })
                             .collect::<Result<_>>()?;
@@ -4368,10 +4540,12 @@ impl<T: Timestamp, D: Clone + Send + 'static> Pipe<T, D> {
             let mut state = self.state.borrow_mut();
 
             if let Err(ref e) = tokio_handle {
-                state.builder_errors.push(Error::Custom(format!(
-                    "unary_async requires a tokio runtime context: {e}. \
+                state
+                    .builder_errors
+                    .push(Error::Dataflow(DataflowError::InvalidConfig(format!(
+                        "unary_async requires a tokio runtime context: {e}. \
                      Call from within #[tokio::main], #[tokio::test], or similar."
-                )));
+                    ))));
             }
 
             op_idx = state.allocate_operator_index();
@@ -4415,10 +4589,18 @@ impl<T: Timestamp, D: Clone + Send + 'static> Pipe<T, D> {
                         .input_pullers
                         .into_iter()
                         .next()
-                        .ok_or_else(|| Error::Custom("unary_async must have input puller".into()))?
+                        .ok_or_else(|| {
+                            Error::Dataflow(DataflowError::MissingEndpoint {
+                                operator: "unary_async".into(),
+                                port: "input puller".into(),
+                            })
+                        })?
                         .downcast::<Box<dyn Pull<T, D>>>()
                         .map_err(|_| {
-                            Error::Custom("unary_async input puller type mismatch".into())
+                            Error::Dataflow(DataflowError::TypeMismatch {
+                                operator: "unary_async".into(),
+                                port: "input puller".into(),
+                            })
                         })?;
 
                     let output_pusher: Box<dyn Push<T, D2>> = {
@@ -4430,9 +4612,10 @@ impl<T: Timestamp, D: Clone + Send + 'static> Pipe<T, D> {
                                     .downcast::<Box<dyn Push<T, D2>>>()
                                     .map(|boxed| *boxed)
                                     .map_err(|_| {
-                                        Error::Custom(
-                                            "unary_async output pusher type mismatch".into(),
-                                        )
+                                        Error::Dataflow(DataflowError::TypeMismatch {
+                                            operator: "unary_async".into(),
+                                            port: "output pusher".into(),
+                                        })
                                     })
                             })
                             .collect::<Result<_>>()?;
@@ -4444,9 +4627,9 @@ impl<T: Timestamp, D: Clone + Send + 'static> Pipe<T, D> {
                     // runs. We use `?` as defense-in-depth to avoid panicking even in
                     // edge cases (e.g., if a future refactor changes the error-check order).
                     let handle = tokio_handle.map_err(|e| {
-                        Error::Custom(format!(
+                        Error::Dataflow(DataflowError::InvalidConfig(format!(
                             "tokio runtime context missing at factory invocation: {e}"
-                        ))
+                        )))
                     })?;
                     Ok(Box::new(WiredUnaryAsyncOperator::new(
                         name_clone,

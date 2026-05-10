@@ -19,6 +19,7 @@
 use std::collections::HashMap;
 use std::fmt;
 
+use crate::error::DataflowError;
 use crate::progress::change_batch::ChangeBatch;
 use crate::progress::frontier::Antichain;
 use crate::progress::operate::{OperatorProgress, PortConnectivity};
@@ -113,14 +114,14 @@ impl<T: Timestamp> SubgraphBuilder<T> {
         connectivity: PortConnectivity<T::Summary>,
     ) -> Result<&OperatorProgress<T>, crate::Error> {
         if index == 0 {
-            return Err(crate::Error::Custom(
+            return Err(crate::Error::Dataflow(DataflowError::InvalidConfig(
                 "operator index 0 is reserved for scope boundary".into(),
-            ));
+            )));
         }
         let name = name.into();
         if self.operators.contains_key(&index) {
-            return Err(crate::Error::Custom(format!(
-                "operator index {index} ('{name}') already registered"
+            return Err(crate::Error::Dataflow(DataflowError::InvalidConfig(
+                format!("operator index {index} ('{name}') already registered"),
             )));
         }
 
@@ -156,9 +157,11 @@ impl<T: Timestamp> SubgraphBuilder<T> {
         initial_caps: Vec<ChangeBatch<T>>,
     ) -> Result<&OperatorProgress<T>, crate::Error> {
         if initial_caps.len() != outputs {
-            return Err(crate::Error::Custom(format!(
-                "initial_caps length ({}) must match outputs count ({outputs})",
-                initial_caps.len()
+            return Err(crate::Error::Dataflow(DataflowError::InvalidConfig(
+                format!(
+                    "initial_caps length ({}) must match outputs count ({outputs})",
+                    initial_caps.len()
+                ),
             )));
         }
         self.add_operator(index, name, inputs, outputs, connectivity)?;
@@ -408,9 +411,9 @@ impl<T: Timestamp> ProgressTracker<T> {
     /// with a global view of all capabilities across all workers.
     pub fn initialize(&mut self) -> Result<(), crate::Error> {
         if self.initialized {
-            return Err(crate::Error::InvalidConfig(
+            return Err(crate::Error::Dataflow(DataflowError::InvalidConfig(
                 "ProgressTracker already initialized".into(),
-            ));
+            )));
         }
         self.initialized = true;
 
@@ -462,9 +465,9 @@ impl<T: Timestamp> ProgressTracker<T> {
     /// Returns the list of operator indices whose frontiers changed.
     pub fn propagate(&mut self) -> Result<&[usize], crate::Error> {
         if !self.initialized {
-            return Err(crate::Error::InvalidConfig(
+            return Err(crate::Error::Dataflow(DataflowError::InvalidConfig(
                 "must call initialize() first".into(),
-            ));
+            )));
         }
 
         // 1. Collect local capability changes from operators.
@@ -508,9 +511,9 @@ impl<T: Timestamp> ProgressTracker<T> {
         channels: WorkerProgressChannels<T>,
     ) -> Result<(), crate::Error> {
         if self.initialized {
-            return Err(crate::Error::InvalidConfig(
+            return Err(crate::Error::Dataflow(DataflowError::InvalidConfig(
                 "set_progress_channels must be called before initialize()".into(),
-            ));
+            )));
         }
         // Initialize peer tracking: mark peers with receivers as "not yet heard from".
         // Slots with `None` (self or non-existent peers) are pre-marked as heard.

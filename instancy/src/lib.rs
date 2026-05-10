@@ -90,14 +90,17 @@ pub use runtime::{
     RuntimeHandle, SpawnOptions, SpawnedDataflow, TokioMode,
 };
 
-// Execution / cluster topology
-pub use execute::{ClusterTopology, NodeConfig};
+// Execution / cluster topology / membership
+pub use execute::{
+    ChannelMembership, ClusterMembership, ClusterTopology, MembershipEvent, NodeConfig,
+    NodeDepartureReason,
+};
 
 // Cancellation
 pub use cancellation::{CancellationReason, CancellationToken};
 
 // Error handling
-pub use error::{Error, Result};
+pub use error::{CommunicationError, DataflowError, Error, Result, RuntimeError, TopologyError};
 
 // Worker types
 pub use worker::WorkerId;

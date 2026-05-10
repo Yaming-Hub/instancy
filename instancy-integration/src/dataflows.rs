@@ -218,9 +218,10 @@ fn build_staged_fan_out_fan_in(
     fan_out_parallelism: usize,
 ) -> Result<(Vec<String>, String)> {
     if fan_out_parallelism == 0 {
-        return Err(instancy::error::Error::Custom(
+        return Err(instancy::error::DataflowError::InvalidConfig(
             "fan_out_parallelism must be > 0".into(),
-        ));
+        )
+        .into());
     }
 
     let input = builder.input::<i64>("data");

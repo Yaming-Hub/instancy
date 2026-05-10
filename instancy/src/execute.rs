@@ -2,11 +2,20 @@
 //!
 //! Provides [`ClusterTopology`], [`NodeConfig`], [`DataflowConfig`], and
 //! [`ExecutionConfig`] for configuring multi-node dataflow clusters.
+//!
+//! # Dynamic Membership
+//!
+//! [`ClusterTopology`] can optionally hold a [`ClusterMembership`] provider
+//! that feeds node join/leave events to the runtime. When a topology with
+//! membership is passed to [`RuntimeConfig`](crate::RuntimeConfig), the
+//! runtime automatically starts a background listener that keeps the
+//! topology up to date.
 
+use std::fmt;
 use std::time::Duration;
 
 use crate::cancellation::CancellationToken;
-use crate::error::Error;
+use crate::error::{Error, TopologyError};
 use crate::scheduler::batching::BatchingPolicy;
 use crate::worker::WorkerId;
 use crate::worker_pool::WorkerPoolConfig;
@@ -122,17 +131,49 @@ impl NodeConfig {
 ///
 /// **Cardinality**: One per process (updated on membership changes).
 /// **Lifetime**: Process lifetime (mutable via membership events).
-#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ClusterTopology {
     /// Configuration for each physical node in the cluster.
     pub nodes: Vec<NodeConfig>,
+    /// Optional dynamic membership provider.
+    membership: Option<Box<dyn ClusterMembership>>,
 }
+
+impl std::fmt::Debug for ClusterTopology {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ClusterTopology")
+            .field("nodes", &self.nodes)
+            .field("has_membership", &self.membership.is_some())
+            .finish()
+    }
+}
+
+impl Clone for ClusterTopology {
+    /// Clone the topology (without the membership provider).
+    ///
+    /// Membership providers are one-shot and cannot be cloned — the clone
+    /// contains only the static node list.
+    fn clone(&self) -> Self {
+        Self {
+            nodes: self.nodes.clone(),
+            membership: None,
+        }
+    }
+}
+
+impl PartialEq for ClusterTopology {
+    fn eq(&self, other: &Self) -> bool {
+        self.nodes == other.nodes
+    }
+}
+
+impl Eq for ClusterTopology {}
 
 impl ClusterTopology {
     /// Create a single-node topology with the given number of logical workers.
     pub fn single_node(logical_workers: usize) -> Self {
         Self {
             nodes: vec![NodeConfig::new("local", logical_workers)],
+            membership: None,
         }
     }
 
@@ -140,18 +181,23 @@ impl ClusterTopology {
     /// Nodes are sorted by `node_id` to ensure consistent worker range assignment.
     pub fn multi_node(mut configs: Vec<NodeConfig>) -> Result<Self, Error> {
         if configs.is_empty() {
-            return Err(Error::Custom("cluster must have at least one node".into()));
+            return Err(Error::Topology(TopologyError::EmptyTopology {
+                reason: "cluster must have at least one node".into(),
+            }));
         }
         for config in &configs {
             if config.logical_workers == 0 {
-                return Err(Error::Custom(format!(
-                    "node '{}' must have at least 1 worker",
-                    config.node_id
-                )));
+                return Err(Error::Topology(TopologyError::InvalidNodeConfig {
+                    node_id: config.node_id.clone(),
+                    reason: "must have at least 1 worker".into(),
+                }));
             }
         }
         configs.sort_by(|a, b| a.node_id.cmp(&b.node_id));
-        Ok(Self { nodes: configs })
+        Ok(Self {
+            nodes: configs,
+            membership: None,
+        })
     }
 
     /// Total number of logical workers across all physical nodes.
@@ -194,6 +240,254 @@ impl ClusterTopology {
             Vec::new()
         }
     }
+
+    /// Check whether a node with the given ID is in the topology.
+    pub fn contains_node(&self, node_id: &str) -> bool {
+        self.nodes.iter().any(|n| n.node_id == node_id)
+    }
+
+    /// Add a node to the topology.
+    ///
+    /// The node list is re-sorted after insertion to maintain consistent
+    /// worker range assignment. Returns an error if the node already exists
+    /// or has zero workers.
+    ///
+    /// **Note**: Adding a node does not affect already-running dataflows.
+    /// Only subsequent `spawn_cluster` calls will include the new node.
+    pub fn add_node(&mut self, config: NodeConfig) -> Result<(), Error> {
+        if config.logical_workers == 0 {
+            return Err(Error::Topology(TopologyError::InvalidNodeConfig {
+                node_id: config.node_id.clone(),
+                reason: "must have at least 1 worker".into(),
+            }));
+        }
+        if self.contains_node(&config.node_id) {
+            return Err(Error::Topology(TopologyError::NodeAlreadyExists {
+                node_id: config.node_id.clone(),
+            }));
+        }
+        self.nodes.push(config);
+        self.nodes.sort_by(|a, b| a.node_id.cmp(&b.node_id));
+        Ok(())
+    }
+
+    /// Remove a node from the topology by its ID.
+    ///
+    /// Returns the removed [`NodeConfig`], or an error if the node was not found
+    /// or removal would leave the topology empty.
+    ///
+    /// **Note**: Removing a node does not cancel already-running dataflows.
+    /// Use [`RuntimeHandle::report_node_leave`] to cancel affected dataflows.
+    pub fn remove_node(&mut self, node_id: &str) -> Result<NodeConfig, Error> {
+        let idx = self
+            .nodes
+            .iter()
+            .position(|n| n.node_id == node_id)
+            .ok_or_else(|| {
+                Error::Topology(TopologyError::NodeNotFound {
+                    node_id: node_id.into(),
+                })
+            })?;
+        if self.nodes.len() == 1 {
+            return Err(Error::Topology(TopologyError::EmptyTopology {
+                reason: "cannot remove the last node from topology".into(),
+            }));
+        }
+        Ok(self.nodes.remove(idx))
+    }
+
+    /// Returns the number of nodes in the topology.
+    pub fn node_count(&self) -> usize {
+        self.nodes.len()
+    }
+
+    /// Attach a dynamic membership provider to this topology.
+    ///
+    /// When this topology is passed to [`RuntimeConfig`](crate::RuntimeConfig),
+    /// the runtime will start a background listener that processes
+    /// [`MembershipEvent`]s and keeps the topology up to date.
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// use instancy::{ClusterTopology, NodeConfig};
+    /// use instancy::execute::{ChannelMembership, MembershipEvent};
+    ///
+    /// let membership = ChannelMembership::new();
+    /// let tx = membership.sender();
+    ///
+    /// let topology = ClusterTopology::single_node(4)
+    ///     .with_membership(membership);
+    /// ```
+    pub fn with_membership(mut self, provider: impl ClusterMembership) -> Self {
+        self.membership = Some(Box::new(provider));
+        self
+    }
+
+    /// Take the membership provider, if one was attached.
+    ///
+    /// Returns `Some` on the first call; subsequent calls return `None`.
+    /// This is called by the runtime during construction.
+    pub(crate) fn take_membership(&mut self) -> Option<Box<dyn ClusterMembership>> {
+        self.membership.take()
+    }
+
+    /// Returns `true` if a membership provider is attached.
+    pub fn has_membership(&self) -> bool {
+        self.membership.is_some()
+    }
+}
+
+// ── Dynamic Membership ─────────────────────────────────────────────────
+
+/// Events describing changes to the physical cluster topology.
+///
+/// The hosting application produces these events; the runtime consumes them
+/// to update its internal topology, routing tables, and connection state.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MembershipEvent {
+    /// A new physical node has joined the cluster and is ready to host logical workers.
+    ///
+    /// The runtime will:
+    /// 1. Clear any "left" state for this node (if it was previously departed).
+    /// 2. Add the node to the live [`ClusterTopology`].
+    /// 3. Future `spawn_cluster` calls will include this node automatically.
+    ///
+    /// Already-running dataflows are **not** affected.
+    NodeJoined {
+        /// Physical node identity (e.g., hostname, IP:port, pod name).
+        node_id: String,
+        /// Number of logical workers the node will host.
+        logical_workers: usize,
+    },
+
+    /// A physical node has left the cluster (graceful shutdown or detected failure).
+    ///
+    /// The runtime will:
+    /// 1. Cancel all dataflows with workers on this node.
+    /// 2. Remove the node from the live [`ClusterTopology`].
+    /// 3. Mark the node as "left" — future `spawn_cluster` calls that include
+    ///    this node will be immediately cancelled.
+    NodeLeft {
+        /// Physical node identity.
+        node_id: String,
+        /// Why the node departed.
+        reason: NodeDepartureReason,
+    },
+}
+
+impl fmt::Display for MembershipEvent {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::NodeJoined {
+                node_id,
+                logical_workers,
+            } => write!(f, "NodeJoined({node_id}, {logical_workers} workers)"),
+            Self::NodeLeft { node_id, reason } => {
+                write!(f, "NodeLeft({node_id}, {reason})")
+            }
+        }
+    }
+}
+
+/// Why a node departed from the cluster.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum NodeDepartureReason {
+    /// Graceful shutdown — the node drained its work before leaving.
+    Graceful,
+    /// Connection lost or health check failed — unexpected departure.
+    ConnectionLost,
+    /// Application-initiated removal (e.g., scale-down decision).
+    Removed,
+}
+
+impl fmt::Display for NodeDepartureReason {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Graceful => write!(f, "graceful"),
+            Self::ConnectionLost => write!(f, "connection_lost"),
+            Self::Removed => write!(f, "removed"),
+        }
+    }
+}
+
+/// Application-implemented trait for providing cluster membership changes.
+///
+/// The runtime subscribes to the membership event stream when a topology
+/// with membership is provided via [`RuntimeConfig`](crate::RuntimeConfig).
+/// The application is free to use any discovery mechanism: Kubernetes watch,
+/// Consul, ZooKeeper, gossip protocol, or manual operator commands.
+///
+/// # Contract
+///
+/// - The stream may produce events at any time; the runtime processes them
+///   asynchronously.
+/// - If the stream ends (returns `None`), the runtime continues operating
+///   with the last known topology. No error is raised.
+/// - The implementation must be `Send + Sync + 'static` so the runtime can
+///   subscribe from any task.
+pub trait ClusterMembership: Send + Sync + 'static {
+    /// Take the membership event receiver.
+    ///
+    /// Returns `Some(receiver)` on the first call; subsequent calls return `None`
+    /// (the runtime takes ownership of the receiver). This design avoids requiring
+    /// `Stream` trait imports while maintaining a clean async interface.
+    fn events(&self) -> Option<tokio::sync::mpsc::UnboundedReceiver<MembershipEvent>>;
+}
+
+/// A simple channel-based [`ClusterMembership`] implementation.
+///
+/// Create with [`ChannelMembership::new()`], then send events via the
+/// [`sender()`](ChannelMembership::sender). Useful for testing, manual
+/// administration, or bridging from external event sources.
+///
+/// # Example
+///
+/// ```
+/// use instancy::execute::{ChannelMembership, MembershipEvent};
+///
+/// let membership = ChannelMembership::new();
+/// let tx = membership.sender();
+///
+/// // Send a join event (would typically come from service discovery)
+/// tx.send(MembershipEvent::NodeJoined {
+///     node_id: "node-2".into(),
+///     logical_workers: 4,
+/// }).unwrap();
+/// ```
+pub struct ChannelMembership {
+    tx: tokio::sync::mpsc::UnboundedSender<MembershipEvent>,
+    rx: std::sync::Mutex<Option<tokio::sync::mpsc::UnboundedReceiver<MembershipEvent>>>,
+}
+
+impl ChannelMembership {
+    /// Create a new channel-based membership provider.
+    pub fn new() -> Self {
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        Self {
+            tx,
+            rx: std::sync::Mutex::new(Some(rx)),
+        }
+    }
+
+    /// Get a sender for injecting membership events.
+    ///
+    /// The sender can be cloned and shared across threads.
+    pub fn sender(&self) -> tokio::sync::mpsc::UnboundedSender<MembershipEvent> {
+        self.tx.clone()
+    }
+}
+
+impl Default for ChannelMembership {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl ClusterMembership for ChannelMembership {
+    fn events(&self) -> Option<tokio::sync::mpsc::UnboundedReceiver<MembershipEvent>> {
+        self.rx.lock().unwrap_or_else(|e| e.into_inner()).take()
+    }
 }
 
 /// Bootstrap a dataflow execution.
@@ -215,12 +509,12 @@ fn execute(
     runtime_config
         .worker_pool
         .validate()
-        .map_err(|e| Error::Custom(e.to_string()))?;
+        .map_err(|e| Error::Runtime(crate::error::RuntimeError::InvalidConfig(e.to_string())))?;
 
     if dataflow_config.topology.total_workers() == 0 {
-        return Err(Error::Custom(
+        return Err(Error::Runtime(crate::error::RuntimeError::InvalidConfig(
             "dataflow must have at least one worker".into(),
-        ));
+        )));
     }
 
     Ok(dataflow_config.name)
@@ -312,6 +606,105 @@ mod tests {
     }
 
     #[test]
+    fn cluster_topology_contains_node() {
+        let topo = ClusterTopology::multi_node(vec![
+            NodeConfig::new("node-0", 2),
+            NodeConfig::new("node-1", 3),
+        ])
+        .unwrap();
+        assert!(topo.contains_node("node-0"));
+        assert!(topo.contains_node("node-1"));
+        assert!(!topo.contains_node("node-2"));
+    }
+
+    #[test]
+    fn cluster_topology_add_node() {
+        let mut topo = ClusterTopology::single_node(2);
+        assert_eq!(topo.node_count(), 1);
+        assert_eq!(topo.total_workers(), 2);
+
+        // Add a new node
+        topo.add_node(NodeConfig::new("node-b", 3)).unwrap();
+        assert_eq!(topo.node_count(), 2);
+        assert_eq!(topo.total_workers(), 5);
+        assert!(topo.contains_node("node-b"));
+
+        // Worker ranges are recalculated (sorted by node_id)
+        // "local" < "node-b" alphabetically
+        assert_eq!(topo.worker_range("local"), Some((0, 2)));
+        assert_eq!(topo.worker_range("node-b"), Some((2, 5)));
+    }
+
+    #[test]
+    fn cluster_topology_add_node_duplicate() {
+        let mut topo = ClusterTopology::single_node(2);
+        let result = topo.add_node(NodeConfig::new("local", 3));
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("already exists"));
+    }
+
+    #[test]
+    fn cluster_topology_add_node_zero_workers() {
+        let mut topo = ClusterTopology::single_node(2);
+        let result = topo.add_node(NodeConfig::new("node-b", 0));
+        assert!(result.is_err());
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("at least 1 worker")
+        );
+    }
+
+    #[test]
+    fn cluster_topology_remove_node() {
+        let mut topo = ClusterTopology::multi_node(vec![
+            NodeConfig::new("node-a", 2),
+            NodeConfig::new("node-b", 3),
+            NodeConfig::new("node-c", 4),
+        ])
+        .unwrap();
+
+        let removed = topo.remove_node("node-b").unwrap();
+        assert_eq!(removed.node_id, "node-b");
+        assert_eq!(removed.logical_workers, 3);
+        assert_eq!(topo.node_count(), 2);
+        assert_eq!(topo.total_workers(), 6);
+        assert!(!topo.contains_node("node-b"));
+
+        // Worker ranges recalculated
+        assert_eq!(topo.worker_range("node-a"), Some((0, 2)));
+        assert_eq!(topo.worker_range("node-c"), Some((2, 6)));
+    }
+
+    #[test]
+    fn cluster_topology_remove_node_not_found() {
+        let mut topo = ClusterTopology::single_node(2);
+        let result = topo.remove_node("nonexistent");
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("not found"));
+    }
+
+    #[test]
+    fn cluster_topology_remove_last_node() {
+        let mut topo = ClusterTopology::single_node(2);
+        let result = topo.remove_node("local");
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("last node"));
+    }
+
+    #[test]
+    fn cluster_topology_node_count() {
+        let topo = ClusterTopology::multi_node(vec![
+            NodeConfig::new("a", 1),
+            NodeConfig::new("b", 1),
+            NodeConfig::new("c", 1),
+        ])
+        .unwrap();
+        assert_eq!(topo.node_count(), 3);
+    }
+
+    #[test]
     fn error_policy_default_is_stop() {
         assert_eq!(ErrorPolicy::default(), ErrorPolicy::Stop);
     }
@@ -366,25 +759,15 @@ mod tests {
     #[test]
     fn execute_rejects_zero_workers() {
         let runtime = ExecutionConfig::default();
+        // single_node doesn't validate worker count, so we can create 0-worker topologies
         let df = DataflowConfig {
-            topology: ClusterTopology {
-                nodes: vec![NodeConfig::new("node-0", 0)],
-            },
+            topology: ClusterTopology::single_node(0),
             error_policy: ErrorPolicy::Stop,
             cancellation_token: CancellationToken::new(),
             batching_policy: BatchingPolicy::default(),
             name: "bad".into(),
         };
         assert!(execute(&runtime, df).is_err());
-
-        let df2 = DataflowConfig {
-            topology: ClusterTopology { nodes: vec![] },
-            error_policy: ErrorPolicy::Stop,
-            cancellation_token: CancellationToken::new(),
-            batching_policy: BatchingPolicy::default(),
-            name: "empty".into(),
-        };
-        assert!(execute(&runtime, df2).is_err());
     }
 
     #[test]
@@ -411,5 +794,124 @@ mod tests {
             }
             _ => panic!("expected Batched"),
         }
+    }
+
+    // ── Membership type tests (moved from membership.rs) ──
+
+    #[test]
+    fn membership_event_display() {
+        let join = MembershipEvent::NodeJoined {
+            node_id: "node-1".into(),
+            logical_workers: 4,
+        };
+        assert_eq!(join.to_string(), "NodeJoined(node-1, 4 workers)");
+
+        let leave = MembershipEvent::NodeLeft {
+            node_id: "node-2".into(),
+            reason: NodeDepartureReason::ConnectionLost,
+        };
+        assert_eq!(leave.to_string(), "NodeLeft(node-2, connection_lost)");
+    }
+
+    #[test]
+    fn departure_reason_display() {
+        assert_eq!(NodeDepartureReason::Graceful.to_string(), "graceful");
+        assert_eq!(
+            NodeDepartureReason::ConnectionLost.to_string(),
+            "connection_lost"
+        );
+        assert_eq!(NodeDepartureReason::Removed.to_string(), "removed");
+    }
+
+    #[test]
+    fn membership_event_clone_eq() {
+        let event = MembershipEvent::NodeJoined {
+            node_id: "node-1".into(),
+            logical_workers: 2,
+        };
+        assert_eq!(event, event.clone());
+
+        let event2 = MembershipEvent::NodeLeft {
+            node_id: "node-1".into(),
+            reason: NodeDepartureReason::Graceful,
+        };
+        assert_ne!(
+            std::mem::discriminant(&event),
+            std::mem::discriminant(&event2)
+        );
+    }
+
+    #[test]
+    fn channel_membership_basic() {
+        let membership = ChannelMembership::new();
+        let tx = membership.sender();
+
+        // First call returns receiver
+        let rx = membership.events();
+        assert!(rx.is_some());
+
+        // Second call returns None (already taken)
+        assert!(membership.events().is_none());
+
+        // Can still send
+        tx.send(MembershipEvent::NodeJoined {
+            node_id: "n1".into(),
+            logical_workers: 1,
+        })
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn channel_membership_receive() {
+        let membership = ChannelMembership::new();
+        let tx = membership.sender();
+        let mut rx = membership.events().unwrap();
+
+        tx.send(MembershipEvent::NodeJoined {
+            node_id: "node-1".into(),
+            logical_workers: 4,
+        })
+        .unwrap();
+
+        tx.send(MembershipEvent::NodeLeft {
+            node_id: "node-2".into(),
+            reason: NodeDepartureReason::Removed,
+        })
+        .unwrap();
+
+        let e1 = rx.recv().await.unwrap();
+        assert!(
+            matches!(e1, MembershipEvent::NodeJoined { ref node_id, .. } if node_id == "node-1")
+        );
+
+        let e2 = rx.recv().await.unwrap();
+        assert!(matches!(e2, MembershipEvent::NodeLeft { ref node_id, .. } if node_id == "node-2"));
+    }
+
+    #[test]
+    fn channel_membership_default() {
+        let membership = ChannelMembership::default();
+        assert!(membership.events().is_some());
+    }
+
+    #[test]
+    fn cluster_topology_with_membership() {
+        let membership = ChannelMembership::new();
+        let topo = ClusterTopology::single_node(2).with_membership(membership);
+        assert!(topo.has_membership());
+    }
+
+    #[test]
+    fn cluster_topology_take_membership() {
+        let membership = ChannelMembership::new();
+        let mut topo = ClusterTopology::single_node(2).with_membership(membership);
+        assert!(topo.has_membership());
+
+        let taken = topo.take_membership();
+        assert!(taken.is_some());
+        assert!(!topo.has_membership());
+
+        // Second take returns None
+        assert!(topo.take_membership().is_none());
     }
 }

@@ -18,7 +18,7 @@
 10. **Observability built-in** — per-dataflow CPU time tracking, operator-level metrics, and structured tracing for understanding performance characteristics.
 11. **Checkpointing support** — consumers can add checkpoint operators that persist state at timestamp boundaries, enabling recovery by fast-forwarding input to the stored frontier.
 12. **Per-stage dynamic parallelism** *(partially implemented)* — operators in the same stage share a parallelism level; different stages can have different parallelism. Stage boundaries are auto-inferred from repartition operators (`exchange`, `rebalance`, `gather`, `broadcast`). Operators within a stage are fused into a single schedulable task for reduced scheduling overhead. **Note**: Stage inference and operator fusion are implemented; per-stage parallelism (different worker counts per stage) is not yet implemented — all stages currently share the dataflow's worker count.
-13. **Dynamic cluster scaling** *(roadmap)* — nodes will be able to join or leave the cluster at runtime. The hosting application will be responsible for detecting membership changes and notifying the runtime via a `ClusterMembership` trait. The library will rebuild routing and rebalance work accordingly. **Not yet implemented** — the current runtime uses a static worker count determined at dataflow build time.
+13. **Dynamic cluster scaling** — nodes can join or leave the cluster at runtime. The hosting application detects membership changes and notifies the runtime via a `ClusterMembership` trait attached to `ClusterTopology`. The library updates the live topology, cancels affected dataflows on node departure, and makes new nodes available to subsequent `spawn_cluster` calls. Already-running dataflows are not repartitioned.
 14. **No global state** — zero static variables, `lazy_static`, or thread-locals. All state is owned by an explicit `RuntimeHandle`. Multiple isolated clusters can coexist in a single process (e.g., interactive vs batch workloads).
 15. **Pluggable task scheduling** — the task queue accepts a `SchedulePolicy` trait that determines dequeue order based on (dataflow priority, task age). Default policy uses priority-with-aging to prevent starvation of low-priority dataflows.
 
@@ -45,7 +45,7 @@
 | Observability | Limited | Built-in CPU time tracking per dataflow, operator-level metrics |
 | Checkpointing | Not supported | Extensible checkpoint operators using timestamp boundaries |
 | Parallelism | Uniform: all operators share the same worker count | Per-stage: stages can have different parallelism; repartition operators at boundaries. Operators within a stage are fused. |
-| Cluster scaling | Static: all nodes must be known at startup | *(Roadmap)* Dynamic: application notifies runtime of node joins/departures; routing tables rebuild on the fly |
+| Cluster scaling | Static: all nodes must be known at startup | Dynamic: application notifies runtime of node joins/departures via `ClusterMembership` trait attached to `ClusterTopology`; live topology updated for new dataflows |
 | Multi-dataflow | One worker owns its dataflows; implicit isolation via thread-local state | Explicit DataflowId in frame headers; shared connections demux by (dataflow_id, channel_id) |
 
 ---
@@ -2726,41 +2726,87 @@ where
 
 ## 8. Error Handling
 
-### 8.1 Error Type
+### 8.1 Error Hierarchy
+
+Errors are organized by **source module** using a hierarchical structure. This enables
+hosting applications to pattern-match on specific error categories while keeping the
+root `Error` enum manageable.
 
 ```rust
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
-    #[error("I/O error: {0}")]
-    Io(#[from] std::io::Error),
-    
-    #[error("Serialization error: {0}")]
-    Codec(#[from] Box<dyn std::error::Error + Send + Sync>),
-    
-    #[error("Connection error: peer {peer_id:?}: {source}")]
-    Connection {
-        peer_id: PeerId,
-        source: Box<dyn std::error::Error + Send + Sync>,
-    },
-    
-    #[error("Dataflow cancelled")]
-    Cancelled,
-    
-    #[error("Progress tracking error: {0}")]
+    // ── Cross-cutting (used in 3+ modules) ──
+    Io(std::io::Error),
+    Cancelled { reason: Option<CancellationReason> },
     Progress(String),
-    
-    #[error("Operator error in '{operator}': {source}")]
-    Operator {
-        operator: String,
-        source: Box<dyn std::error::Error + Send + Sync>,
-    },
-    
-    #[error("{0}")]
-    Custom(String),
+    Operator { operator, worker_index, source },
+    OperatorPanic { operator, worker_index, message },
+    Backpressure,
+    ChannelClosed,
+    LockPoisoned { context: String },
+
+    // ── Module sub-enums ──
+    Topology(TopologyError),      // from execute / topology module
+    Dataflow(DataflowError),      // from dataflow module
+    Runtime(RuntimeError),        // from runtime module
+    Communication(CommunicationError), // from communication module
+}
+
+// Topology errors (4 variants)
+enum TopologyError {
+    NodeAlreadyExists { node_id },
+    NodeNotFound { node_id },
+    EmptyTopology { reason },
+    InvalidNodeConfig { node_id, reason },
+}
+
+// Dataflow construction errors (6 variants)
+enum DataflowError {
+    InvalidConfig(String),
+    InvalidGraph(String),
+    MissingEndpoint { operator, port },
+    TypeMismatch { operator, port },
+    EndpointTaken(String),
+    MissingFactory { edge_index },
+}
+
+// Runtime lifecycle errors (5 variants)
+enum RuntimeError {
+    InvalidConfig(String),
+    SpawnFailed(String),
+    ClusterSetup(String),
+    AlreadyConsumed { resource },
+    EmptyDataflow,
+}
+
+// Communication errors (1 variant)
+enum CommunicationError {
+    Codec(Box<dyn Error + Send + Sync>),
 }
 ```
 
-### 8.2 Error Propagation
+### 8.2 Error Organization Principles
+
+When adding new error variants, follow these rules:
+
+1. **Sub-enums correspond to source modules.** If an error originates from a single
+   module (e.g., topology, dataflow, runtime, communication), define it in that
+   module's sub-enum.
+
+2. **Consolidate similar errors with context fields.** Use fields like `operator`,
+   `port`, `node_id` to distinguish instances — do not create a separate variant
+   for every unique error message.
+
+3. **No generic catch-all.** Do not add `Internal(String)`, `Custom(String)`, or
+   similar. Every error must have a specific meaning that callers can match on.
+
+4. **Cross-cutting errors stay at the root.** An error that occurs in 3+ unrelated
+   modules (e.g., `LockPoisoned`, `ChannelClosed`) belongs in the root `Error` enum.
+
+5. **Test-only errors** should be gated with `#[cfg(feature = "test-utils")]` if
+   they exist solely to support test infrastructure.
+
+### 8.3 Error Propagation
 
 - Operators return `Result<(), Error>`.
 - When an operator task fails, it drops its output channels and capabilities.
@@ -3578,26 +3624,25 @@ Rather than one connection per (worker, channel) pair, instancy multiplexes all 
 
 Both transport modes — dedicated (exclusive lease per dataflow) and shared (multiplexed across dataflows) — use the same factory and pool. The factory is **required**, not optional: it is the sole mechanism for creating, replacing, and scaling connections. instancy provides a default `TcpConnectionFactory` for plain TCP; applications supply their own for other transports or custom protocols.
 
-### 12.5 Dynamic Cluster Scaling *(Roadmap)*
+### 12.5 Dynamic Cluster Scaling
 
-> **Status: Not yet implemented.** The design below describes the planned architecture for dynamic cluster scaling. The current runtime uses a static worker count determined at dataflow build time. Nodes must be known at startup.
+> **Status: Implemented.** The `ClusterMembership` trait and `ChannelMembership` convenience type are available in the `execute` module. Membership is attached to `ClusterTopology` and passed via `RuntimeConfig` at construction time. The runtime auto-starts a background listener that processes membership events to update the live topology, cancel affected dataflows, and make new nodes available. Mid-dataflow repartitioning (worker rebalancing) is not supported — existing dataflows keep their original topology.
 
-instancy plans to support **dynamic cluster scaling** — nodes can be added to or removed from the cluster at runtime. The hosting application is responsible for detecting node changes (health checks, service discovery, autoscaler events, connection failures) and notifying the timely runtime. The library does **not** perform its own node discovery or health monitoring.
+instancy supports **dynamic cluster scaling** — nodes can be added to or removed from the cluster at runtime. The hosting application is responsible for detecting node changes (health checks, service discovery, autoscaler events, connection failures) and notifying the timely runtime. The library does **not** perform its own node discovery or health monitoring.
 
 #### Responsibilities
 
 | Responsibility | Owner |
 |---|---|
 | Detect node joins, departures, and failures | **Application** (hosting process) |
-| Notify the runtime of topology changes | **Application** → `ClusterMembership` callback |
-| Rebuild routing tables and rebalance logical workers | **Library** (runtime) |
-| Migrate in-flight data for affected workers | **Library** (runtime) |
+| Notify the runtime of topology changes | **Application** → `ClusterMembership` provider attached to `ClusterTopology` |
+| Update live topology and cancel affected dataflows | **Library** (runtime) |
 | Re-establish connections to new nodes | **Application** (via `ConnectionManager`) |
 | Decide whether to retry/abort affected dataflows | **Application** (via error policy) |
 
 #### ClusterMembership Trait
 
-The application implements this trait and passes it to the runtime at startup. The runtime calls `subscribe()` to receive a stream of membership change events.
+The application implements this trait and attaches it to `ClusterTopology` via `with_membership()`. When the topology is passed through `RuntimeConfig`, the runtime automatically takes the membership provider and starts a background event listener.
 
 ```rust
 /// Events describing changes to the physical cluster topology.
@@ -3627,62 +3672,93 @@ pub enum NodeDepartureReason {
 
 /// Application-implemented trait for providing cluster membership changes.
 ///
-/// The runtime subscribes to membership events at startup. The application
-/// is free to use any discovery mechanism: Kubernetes watch, Consul, ZooKeeper,
-/// gossip protocol, or manual operator commands.
+/// The application attaches a membership provider to `ClusterTopology` via
+/// `with_membership()`. The runtime takes ownership of the provider during
+/// construction and calls `events()` to receive membership change events.
 pub trait ClusterMembership: Send + Sync + 'static {
-    /// Returns a stream of membership change events.
-    /// The runtime processes these events to update routing tables,
-    /// rebalance workers, and handle in-flight data for departing nodes.
-    fn subscribe(&self) -> Box<dyn Stream<Item = MembershipEvent> + Send + Unpin>;
+    /// Takes the membership event receiver.
+    /// Returns `Some(receiver)` on the first call; subsequent calls return `None`
+    /// (the runtime takes ownership of the receiver).
+    fn events(&self) -> Option<tokio::sync::mpsc::UnboundedReceiver<MembershipEvent>>;
 }
+```
+
+#### Topology–Membership Integration
+
+`ClusterTopology` owns an optional membership provider. This design keeps topology and membership tightly coupled since both describe the physical cluster layout:
+
+```rust
+let membership = ChannelMembership::new();
+let tx = membership.sender();
+
+let topology = ClusterTopology::multi_node(vec![
+    NodeConfig::new("node-0", 4),
+    NodeConfig::new("node-1", 4),
+])?.with_membership(membership);
+
+let rt = RuntimeHandle::new(RuntimeConfig {
+    topology: Some(topology),
+    ..Default::default()
+})?;
+
+// Runtime auto-starts membership listener — send events via tx
+tx.send(MembershipEvent::NodeJoined { node_id: "node-2".into(), logical_workers: 4 })?;
 ```
 
 #### Scaling-Up (Node Joins)
 
-When the application calls `report_node_join(node_id)`:
+When the runtime receives a `MembershipEvent::NodeJoined` event:
 
-1. **Clear "left" state**: If the node was previously marked as left, it is removed from the left set. This is a no-op for brand-new nodes.
+1. **Clear "down" state**: If the node was previously marked as down, the peer registry clears it. This allows future `spawn_cluster` calls to include the node.
 2. **Connection on demand**: New connections to the node are established lazily — the connection pool calls `ConnectionManager` the first time a dataflow needs to communicate with the node.
-3. **Topology update**: `ClusterTopology` for new dataflows includes the joined node. Already-running dataflows are **not** affected.
+3. **Topology update**: The live `ClusterTopology` is updated with the new node. Already-running dataflows are **not** affected.
 4. **Worker assignment**: New logical worker indices are allocated for the joining node's workers in subsequent `spawn_cluster` calls.
-5. **Routing table rebuild**: All `RoutingTable` instances in new dataflows include the new remote endpoints.
 
 **Important**: Existing in-flight data is NOT migrated. Only new dataflows (or re-spawned dataflows) take advantage of the expanded topology. This ensures progress tracking remains consistent — a timestamp that has already been produced cannot change its routing.
 
 #### Scaling-Down (Node Departures)
 
-When the application calls `report_node_leave(node_id)`:
+When the runtime receives a `MembershipEvent::NodeLeft` event:
 
-1. **Connection teardown**: All pooled connections to the departed node are immediately dropped and evicted from the connection pool.
-2. **Cancel affected dataflows**: All dataflows with workers on the departed node are cancelled with `CancellationReason::PeerDown(node_id)`. instancy does **not** attempt to reschedule work to surviving nodes — the hosting application owns retry logic.
-3. **Progress cleanup**: A departed node's outstanding capabilities are treated as "released" — the frontier advances past any timestamps that only the lost node could produce.
-4. **Record as left**: The node is remembered in the "left" set. Any future `spawn_cluster` that includes this node is immediately cancelled, preventing races.
-5. **Application retry**: The hosting application can resubmit the dataflow targeting only healthy nodes, or call `report_node_join` once the node recovers and then retry.
+1. **Cancel affected dataflows**: All dataflows with workers on the departed node are cancelled via the peer registry. instancy does **not** attempt to reschedule work to surviving nodes — the hosting application owns retry logic.
+2. **Topology update**: The node is removed from the live `ClusterTopology`. If it was the last node, the topology is cleared entirely.
+3. **Application retry**: The hosting application can resubmit the dataflow targeting only healthy nodes, or send a `NodeJoined` event once the node recovers.
 
 #### Consistency Guarantees
 
 - **Progress safety**: A departed node's outstanding capabilities are treated as "released" — the frontier advances past any timestamps that only the lost node could produce. This is safe because no more data at those timestamps will arrive.
 - **At-most-once by default**: If a node fails mid-computation, records being processed by that node may be lost. Applications requiring exactly-once semantics must use the checkpoint/recovery mechanism.
-- **No split-brain**: The application is the single source of truth for cluster membership. The runtime trusts the application's `report_node_leave` / `report_node_join` calls and does not perform its own consensus or health probing.
+- **No split-brain**: The application is the single source of truth for cluster membership. The runtime trusts the membership events and does not perform its own consensus or health probing.
+- **Zero-worker events ignored**: `NodeJoined` events with `logical_workers == 0` are silently dropped.
+- **Idempotent**: Duplicate join events for an existing node or leave events for an unknown node are handled gracefully.
 
 #### Example: Kubernetes Integration
 
 ```rust
 struct K8sClusterMembership {
-    pod_watcher: kube::runtime::watcher::Watcher<Pod>,
+    rx: Mutex<Option<UnboundedReceiver<MembershipEvent>>>,
+    tx: UnboundedSender<MembershipEvent>,
+}
+
+impl K8sClusterMembership {
+    fn new() -> Self {
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        Self { rx: Mutex::new(Some(rx)), tx }
+    }
+
+    /// Spawn a background task that watches Kubernetes pod events
+    /// and converts them into MembershipEvents via self.tx.
+    fn start_watching(&self, client: kube::Client) {
+        let tx = self.tx.clone();
+        tokio::spawn(async move {
+            // Watch pod events and send MembershipEvent::NodeJoined/NodeLeft
+        });
+    }
 }
 
 impl ClusterMembership for K8sClusterMembership {
-    fn subscribe(&self) -> Box<dyn Stream<Item = MembershipEvent> + Send + Unpin> {
-        // Convert Kubernetes pod events into MembershipEvent stream
-        // Pod Ready → NodeJoined
-        // Pod Deleted/Failed → NodeLeft
-        Box::new(self.pod_watcher.map(|event| match event {
-            WatchEvent::Added(pod) => MembershipEvent::NodeJoined { ... },
-            WatchEvent::Deleted(pod) => MembershipEvent::NodeLeft { ... },
-            _ => ...
-        }))
+    fn events(&self) -> Option<UnboundedReceiver<MembershipEvent>> {
+        self.rx.lock().unwrap().take()
     }
 }
 ```
@@ -4571,7 +4647,7 @@ This section documents the cardinality (how many instances exist) and lifetime (
 |-----------|-------------|----------|-------|
 | `WorkerPool` | 1 per process | Process | Shared across all dataflows in the process |
 | `ConnectionPool` | 1 per process | Process | Manages connections to all peer nodes (via `ConnectionFactory`) |
-| `ClusterTopology` | 1 per process | Process (static) | Set at startup; dynamic updates are roadmap (§12.5) |
+| `ClusterTopology` | 1 per process | Process (mutable via membership events) | Updated on node join/leave; new dataflows use latest topology |
 | `DataflowId` | 1 per dataflow | Dataflow | UUID, created at dataflow start |
 | `DataflowHandle` | 1 per (dataflow, node) | Dataflow | Returned to caller; provides cancel/progress/result |
 | `OutcomeAggregator` | 1 per dataflow on coordinator node | Dataflow | Collects per-node outcomes; host-app managed |
@@ -4648,11 +4724,15 @@ This section documents the cardinality (how many instances exist) and lifetime (
 - Activation deduplication in scheduler
 - Lazy channel allocation with shrink-on-drain
 
-**Phase 7 — Dynamic Cluster Scaling** *(Roadmap)*
+**Phase 7 — Dynamic Cluster Scaling** ✅
 - `ClusterMembership` trait for node join/leave events
-- Routing table rebuild on topology changes
-- Worker rebalancing for departing/joining nodes
-- In-flight data migration
+- `ChannelMembership` convenience implementation
+- `ClusterTopology::with_membership()` to attach membership provider
+- Topology (with optional membership) passed via `RuntimeConfig` constructor
+- `RuntimeHandle::current_topology()` for live topology snapshots
+- `ClusterTopology::add_node()` / `remove_node()` for dynamic mutation
+- Node join → topology updated, available for new `spawn_cluster` calls
+- Node leave → affected dataflows cancelled, topology updated
 
 ---
 
@@ -4666,4 +4746,4 @@ This section documents the cardinality (how many instances exist) and lifetime (
 
 4. **Container abstraction**: timely-dataflow recently added generic container support beyond `Vec<T>`. Should we support this from the start? **Status**: Deferred — using `Vec<T>` only.
 
-5. **Dynamic cluster scaling**: The `ClusterMembership` trait is designed (§12.5) but not implemented. This requires: worker rebalancing mid-dataflow, routing table rebuild, in-flight data migration, and scope re-analysis. **Status**: Roadmap — will be implemented when there is a concrete use case driving the design.
+5. **Dynamic cluster scaling**: The `ClusterMembership` trait is implemented (§12.5). Membership is attached to `ClusterTopology` and passed via `RuntimeConfig`; the runtime auto-starts a background listener. **Limitation**: existing dataflows are not repartitioned — only new `spawn_cluster` calls use the updated topology. Mid-dataflow worker rebalancing and in-flight data migration are not supported.

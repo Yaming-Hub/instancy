@@ -19,6 +19,7 @@ use std::time::{Duration, Instant};
 
 use crossbeam_deque::{Injector, Steal};
 
+use crate::error::RuntimeError;
 use crate::executor_task::{ExecutorRegistry, PoolWaker};
 use crate::scheduler::policy::SchedulePolicy;
 use crate::worker::OperatorActivation;
@@ -228,9 +229,9 @@ impl WorkerPool {
             .lock()
             .unwrap_or_else(|e| e.into_inner());
         if guard.is_some() {
-            return Err(crate::Error::Custom(
-                "ExecutorRegistry already set for this pool".into(),
-            ));
+            return Err(crate::Error::Runtime(RuntimeError::AlreadyConsumed {
+                resource: "ExecutorRegistry for this pool".into(),
+            }));
         }
         // Share the pool's condvar so executor wakeups unpark worker threads.
         let registry = Arc::new(ExecutorRegistry::new(

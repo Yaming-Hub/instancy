@@ -65,7 +65,7 @@ use crate::dataflow::channels::envelope::{ControlSignal, Envelope, Payload};
 use crate::dataflow::channels::pushpull::{Pull, Push};
 use crate::dataflow::channels::wake::WakeHandle;
 use crate::dataflow::id::DataflowId;
-use crate::error::{Error, Result};
+use crate::error::{DataflowError, Error, Result};
 use crate::execute::ClusterTopology;
 use crate::progress::timestamp::Timestamp;
 use crate::wire;
@@ -280,8 +280,9 @@ pub struct NetworkPush<T: Timestamp + ExchangeData, D: ExchangeData> {
 impl<T: Timestamp + ExchangeData, D: ExchangeData> NetworkPush<T, D> {
     fn encode(&self, envelope: &Envelope<T, D, ()>) -> std::result::Result<Vec<u8>, Error> {
         let mut buf = Vec::new();
-        encode_envelope(&self.time_codec, &self.data_codec, envelope, &mut buf)
-            .map_err(|e| Error::Custom(format!("network encode: {e}")))?;
+        encode_envelope(&self.time_codec, &self.data_codec, envelope, &mut buf).map_err(|e| {
+            Error::Dataflow(DataflowError::InvalidGraph(format!("network encode: {e}")))
+        })?;
         Ok(buf)
     }
 
@@ -747,15 +748,15 @@ impl<T: Timestamp + ExchangeData, D: ExchangeData> EdgeMaterializer<T, D>
         src_idx: usize,
     ) -> Result<Vec<Box<dyn Push<T, D, ()>>>> {
         if src_idx >= self.num_workers {
-            return Err(Error::Custom(format!(
+            return Err(Error::Dataflow(DataflowError::InvalidGraph(format!(
                 "source worker index {src_idx} out of range (num_workers={})",
                 self.num_workers
-            )));
+            ))));
         }
         if self.taken_push[src_idx] {
-            return Err(Error::Custom(format!(
+            return Err(Error::Dataflow(DataflowError::InvalidGraph(format!(
                 "source worker {src_idx} push already materialized"
-            )));
+            ))));
         }
         self.taken_push[src_idx] = true;
 
@@ -763,9 +764,9 @@ impl<T: Timestamp + ExchangeData, D: ExchangeData> EdgeMaterializer<T, D>
             .topology
             .node_for_worker(WorkerId::new(src_idx))
             .ok_or_else(|| {
-                Error::InvalidConfig(format!(
+                Error::Dataflow(DataflowError::InvalidConfig(format!(
                     "topology missing worker mapping for source worker {src_idx}"
-                ))
+                )))
             })?;
 
         let mut pushers: Vec<Box<dyn Push<T, D, ()>>> = Vec::with_capacity(self.num_workers);
@@ -774,19 +775,23 @@ impl<T: Timestamp + ExchangeData, D: ExchangeData> EdgeMaterializer<T, D>
                 .topology
                 .node_for_worker(WorkerId::new(dst))
                 .ok_or_else(|| {
-                    Error::InvalidConfig(format!(
+                    Error::Dataflow(DataflowError::InvalidConfig(format!(
                         "topology missing worker mapping for target worker {dst}"
-                    ))
+                    )))
                 })?;
 
             if worker_node == dst_node && worker_node == self.local_node_id {
                 let push = self.local_push[src_idx][dst].take().ok_or_else(|| {
-                    Error::Custom(format!("local push [{src_idx}][{dst}] already taken"))
+                    Error::Dataflow(DataflowError::EndpointTaken(format!(
+                        "local push [{src_idx}][{dst}] already taken"
+                    )))
                 })?;
                 pushers.push(Box::new(push));
             } else {
                 let sender = self.transport.data_sender(dst_node).ok_or_else(|| {
-                    Error::Custom(format!("no connection to peer node '{dst_node}'"))
+                    Error::Dataflow(DataflowError::InvalidGraph(format!(
+                        "no connection to peer node '{dst_node}'"
+                    )))
                 })?;
 
                 let channel_id = Self::channel_id(self.edge_index, src_idx, dst, self.num_workers);
@@ -809,15 +814,15 @@ impl<T: Timestamp + ExchangeData, D: ExchangeData> EdgeMaterializer<T, D>
         dst_idx: usize,
     ) -> Result<Vec<Box<dyn Pull<T, D, ()>>>> {
         if dst_idx >= self.num_workers {
-            return Err(Error::Custom(format!(
+            return Err(Error::Dataflow(DataflowError::InvalidGraph(format!(
                 "target worker index {dst_idx} out of range (num_workers={})",
                 self.num_workers
-            )));
+            ))));
         }
         if self.taken_pull[dst_idx] {
-            return Err(Error::Custom(format!(
+            return Err(Error::Dataflow(DataflowError::InvalidGraph(format!(
                 "target worker {dst_idx} pull already materialized"
-            )));
+            ))));
         }
         self.taken_pull[dst_idx] = true;
 
@@ -825,9 +830,9 @@ impl<T: Timestamp + ExchangeData, D: ExchangeData> EdgeMaterializer<T, D>
             .topology
             .node_for_worker(WorkerId::new(dst_idx))
             .ok_or_else(|| {
-                Error::InvalidConfig(format!(
+                Error::Dataflow(DataflowError::InvalidConfig(format!(
                     "topology missing worker mapping for target worker {dst_idx}"
-                ))
+                )))
             })?;
 
         let mut pullers: Vec<Box<dyn Pull<T, D, ()>>> = Vec::with_capacity(self.num_workers);
@@ -836,14 +841,16 @@ impl<T: Timestamp + ExchangeData, D: ExchangeData> EdgeMaterializer<T, D>
                 .topology
                 .node_for_worker(WorkerId::new(src))
                 .ok_or_else(|| {
-                    Error::InvalidConfig(format!(
+                    Error::Dataflow(DataflowError::InvalidConfig(format!(
                         "topology missing worker mapping for source worker {src}"
-                    ))
+                    )))
                 })?;
 
             if src_node == worker_node && src_node == self.local_node_id {
                 let pull = self.local_pull[src][dst_idx].take().ok_or_else(|| {
-                    Error::Custom(format!("local pull [{src}][{dst_idx}] already taken"))
+                    Error::Dataflow(DataflowError::EndpointTaken(format!(
+                        "local pull [{src}][{dst_idx}] already taken"
+                    )))
                 })?;
                 pullers.push(Box::new(pull));
             } else {
@@ -851,7 +858,9 @@ impl<T: Timestamp + ExchangeData, D: ExchangeData> EdgeMaterializer<T, D>
                     self.demux_receivers
                         .remove(&(src, dst_idx))
                         .ok_or_else(|| {
-                            Error::Custom(format!("no demux receiver for [{src}][{dst_idx}]"))
+                            Error::Dataflow(DataflowError::InvalidGraph(format!(
+                                "no demux receiver for [{src}][{dst_idx}]"
+                            )))
                         })?;
 
                 let (std_tx, std_rx) = std::sync::mpsc::channel::<Vec<u8>>();

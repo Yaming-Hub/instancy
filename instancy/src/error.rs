@@ -1,4 +1,19 @@
 //! Error types for instancy.
+//!
+//! # Error Organization
+//!
+//! Errors are organized by **source module**:
+//!
+//! - [`TopologyError`] — cluster topology management (from `execute` module).
+//! - [`DataflowError`] — dataflow construction and wiring (from `dataflow` module).
+//! - [`RuntimeError`] — runtime lifecycle and cluster setup (from `runtime` module).
+//! - [`CommunicationError`] — serialization and wire protocol (from `communication` module).
+//!
+//! Cross-cutting errors that occur in many modules stay as root [`Error`] variants
+//! (e.g., [`Error::LockPoisoned`], [`Error::ChannelClosed`]).
+//!
+//! **Adding new errors**: put them in the sub-enum of the module that produces them.
+//! Only add a root variant if the error genuinely occurs in 3+ unrelated modules.
 
 /// The main error type for instancy operations.
 #[derive(Debug, thiserror::Error)]
@@ -7,24 +22,7 @@ pub enum Error {
     #[error("I/O error: {0}")]
     Io(#[from] std::io::Error),
 
-    /// A serialization or deserialization error.
-    #[error("Serialization error: {0}")]
-    Codec(Box<dyn std::error::Error + Send + Sync>),
-
-    /// A connection-level error.
-    #[error("Connection error: target {target}: {source}")]
-    Connection {
-        /// Description of the target endpoint (e.g., node address or identifier).
-        target: String,
-        /// The underlying error.
-        source: Box<dyn std::error::Error + Send + Sync>,
-    },
-
     /// The dataflow was cancelled via its cancellation token.
-    ///
-    /// The optional [`crate::CancellationReason`] indicates why cancellation occurred.
-    /// Use [`crate::CancellationReason`] variants to distinguish user-initiated
-    /// cancellation from system-level causes (network errors, worker failures, etc.).
     #[error("Dataflow cancelled{}", reason.as_ref().map(|r| format!(": {r}")).unwrap_or_default())]
     Cancelled {
         /// The reason for cancellation, if one was provided.
@@ -48,7 +46,6 @@ pub enum Error {
     },
 
     /// The channel is full and cannot accept more data.
-    /// The scheduler should re-queue the task and retry later.
     #[error("Channel backpressure: buffer is full")]
     Backpressure,
 
@@ -58,12 +55,7 @@ pub enum Error {
 
     /// An operator panicked during activation.
     ///
-    /// This is only returned when `catch_panics` is enabled in `ExecutorConfig`.
-    /// The panic payload is captured as a message string. After a panic, the
-    /// operator is in an unknown state and the dataflow is terminated.
-    ///
-    /// Note: `panic = "abort"` builds will not reach this variant — the process
-    /// exits before the panic can be caught.
+    /// Only returned when `catch_panics` is enabled in `ExecutorConfig`.
     #[error("Operator '{operator}' panicked{}: {message}",
         worker_index.map(|w| format!(" (worker {w})")).unwrap_or_default())]
     OperatorPanic {
@@ -75,40 +67,37 @@ pub enum Error {
         message: String,
     },
 
-    /// A custom error message.
-    #[error("{0}")]
-    Custom(String),
-
-    /// A configuration or topology error detected at build time.
-    #[error("Configuration error: {0}")]
-    InvalidConfig(String),
-
-    /// A remote node was lost (disconnected or removed from cluster).
-    /// Contains the node identity that departed.
-    #[error("Node lost: node '{node_id}' departed ({reason})")]
-    NodeLost {
-        /// The node identity that was lost.
-        node_id: String,
-        /// Human-readable reason for the departure.
-        reason: String,
+    // ── Cross-cutting (occurs in many modules) ─────────────────────────
+    /// A mutex or RwLock was poisoned because another thread panicked
+    /// while holding it.
+    #[error("Lock poisoned: {context}")]
+    LockPoisoned {
+        /// Which lock was poisoned.
+        context: String,
     },
+
+    // ── Module sub-enums ───────────────────────────────────────────────
+    /// Cluster topology errors (from `execute` / topology module).
+    #[error(transparent)]
+    Topology(#[from] TopologyError),
+
+    /// Dataflow construction and wiring errors (from `dataflow` module).
+    #[error(transparent)]
+    Dataflow(#[from] DataflowError),
+
+    /// Runtime lifecycle and cluster setup errors (from `runtime` module).
+    #[error(transparent)]
+    Runtime(#[from] RuntimeError),
+
+    /// Communication / serialization errors (from `communication` module).
+    #[error(transparent)]
+    Communication(#[from] CommunicationError),
 }
 
 impl Error {
     /// Create a codec error from any error type.
     pub fn codec(err: impl std::error::Error + Send + Sync + 'static) -> Self {
-        Self::Codec(Box::new(err))
-    }
-
-    /// Create a connection error.
-    pub fn connection(
-        target: impl Into<String>,
-        err: impl std::error::Error + Send + Sync + 'static,
-    ) -> Self {
-        Self::Connection {
-            target: target.into(),
-            source: Box::new(err),
-        }
+        CommunicationError::Codec(Box::new(err)).into()
     }
 
     /// Create an operator error.
@@ -177,15 +166,85 @@ impl Error {
 /// A convenience type alias for `Result<T, Error>`.
 pub type Result<T> = std::result::Result<T, Error>;
 
+/// Errors related to cluster topology management.
+#[derive(Debug, thiserror::Error)]
+pub enum TopologyError {
+    /// A node with the given ID already exists in the topology.
+    #[error("node '{node_id}' already exists in topology")]
+    NodeAlreadyExists { node_id: String },
+
+    /// A node with the given ID was not found in the topology.
+    #[error("node '{node_id}' not found in topology")]
+    NodeNotFound { node_id: String },
+
+    /// The topology would be empty after this operation.
+    #[error("empty topology: {reason}")]
+    EmptyTopology { reason: String },
+
+    /// A node configuration is invalid.
+    #[error("invalid node config for '{node_id}': {reason}")]
+    InvalidNodeConfig { node_id: String, reason: String },
+}
+
+/// Errors raised during dataflow construction, graph validation, or channel wiring.
+#[derive(Debug, thiserror::Error)]
+pub enum DataflowError {
+    #[error("invalid dataflow config: {0}")]
+    InvalidConfig(String),
+
+    #[error("invalid dataflow graph: {0}")]
+    InvalidGraph(String),
+
+    #[error("missing endpoint for operator '{operator}', port '{port}'")]
+    MissingEndpoint { operator: String, port: String },
+
+    #[error("type mismatch for operator '{operator}', port '{port}'")]
+    TypeMismatch { operator: String, port: String },
+
+    #[error("endpoint already taken: {0}")]
+    EndpointTaken(String),
+
+    #[error("missing factory for edge index {edge_index}")]
+    MissingFactory { edge_index: usize },
+}
+
+/// Errors raised by runtime lifecycle and cluster setup code.
+#[derive(Debug, thiserror::Error)]
+pub enum RuntimeError {
+    #[error("invalid runtime config: {0}")]
+    InvalidConfig(String),
+
+    #[error("spawn failed: {0}")]
+    SpawnFailed(String),
+
+    #[error("cluster setup failed: {0}")]
+    ClusterSetup(String),
+
+    #[error("resource already consumed: {resource}")]
+    AlreadyConsumed { resource: String },
+
+    #[error("empty dataflow")]
+    EmptyDataflow,
+}
+
+/// Errors raised by communication / serialization code.
+#[derive(Debug, thiserror::Error)]
+pub enum CommunicationError {
+    #[error("Serialization error: {0}")]
+    Codec(Box<dyn std::error::Error + Send + Sync>),
+}
+
 /// Extension trait to convert `PoisonError` into `Error`.
 pub(crate) trait LockResultExt<T> {
-    /// Convert a poisoned lock result into an `Error::Custom`.
+    /// Convert a poisoned lock result into an [`Error::LockPoisoned`].
     fn or_poison(self, context: &str) -> std::result::Result<T, Error>;
 }
 
 impl<T> LockResultExt<T> for std::result::Result<T, std::sync::PoisonError<T>> {
     fn or_poison(self, context: &str) -> std::result::Result<T, Error> {
-        self.map_err(|_| Error::Custom(format!("lock poisoned: {context}")))
+        self.map_err(|_| Error::LockPoisoned {
+            context: context.into(),
+        })
     }
 }
 
@@ -207,18 +266,38 @@ mod tests {
             std::io::ErrorKind::InvalidData,
             "bad bytes",
         ));
-        assert!(err.to_string().contains("Serialization error"));
+        assert!(
+            err.to_string().contains("serialization error")
+                || err.to_string().contains("Serialization error")
+        );
     }
 
     #[test]
-    fn error_display_connection() {
-        let err = Error::connection(
-            "node-2:9090",
-            std::io::Error::new(std::io::ErrorKind::ConnectionRefused, "refused"),
-        );
+    fn error_display_topology() {
+        let err: Error = TopologyError::NodeAlreadyExists {
+            node_id: "node-1".into(),
+        }
+        .into();
+        assert!(err.to_string().contains("node-1"));
+        assert!(err.to_string().contains("already exists"));
+    }
+
+    #[test]
+    fn error_display_dataflow() {
+        let err: Error = DataflowError::MissingEndpoint {
+            operator: "my_op".into(),
+            port: "input".into(),
+        }
+        .into();
         let msg = err.to_string();
-        assert!(msg.contains("node-2:9090"));
-        assert!(msg.contains("refused"));
+        assert!(msg.contains("my_op"));
+        assert!(msg.contains("input"));
+    }
+
+    #[test]
+    fn error_display_runtime() {
+        let err: Error = RuntimeError::EmptyDataflow.into();
+        assert!(err.to_string().contains("empty dataflow"));
     }
 
     #[test]
@@ -242,9 +321,12 @@ mod tests {
     }
 
     #[test]
-    fn error_display_custom() {
-        let err = Error::Custom("something went wrong".into());
-        assert_eq!(err.to_string(), "something went wrong");
+    fn error_display_lock_poisoned() {
+        let err = Error::LockPoisoned {
+            context: "test mutex".into(),
+        };
+        assert!(err.to_string().contains("Lock poisoned"));
+        assert!(err.to_string().contains("test mutex"));
     }
 
     #[test]
@@ -308,7 +390,7 @@ mod tests {
 
     #[test]
     fn error_with_operator_context_wraps_non_operator() {
-        let err = Error::Custom("something failed".into());
+        let err: Error = DataflowError::InvalidConfig("something failed".into()).into();
         let wrapped = err.with_operator_context("my_op", 2);
         let msg = wrapped.to_string();
         assert!(msg.contains("my_op"), "should contain operator name");
@@ -364,5 +446,26 @@ mod tests {
         let msg = err.to_string();
         assert!(!msg.contains("worker"), "no worker info without context");
         assert!(msg.contains("my_filter"));
+    }
+
+    #[test]
+    fn topology_error_matches() {
+        let err: Error = TopologyError::NodeNotFound {
+            node_id: "x".into(),
+        }
+        .into();
+        assert!(matches!(
+            err,
+            Error::Topology(TopologyError::NodeNotFound { .. })
+        ));
+    }
+
+    #[test]
+    fn sub_enums_are_send_sync() {
+        fn assert_send_sync<T: Send + Sync>() {}
+        assert_send_sync::<TopologyError>();
+        assert_send_sync::<DataflowError>();
+        assert_send_sync::<RuntimeError>();
+        assert_send_sync::<CommunicationError>();
     }
 }
