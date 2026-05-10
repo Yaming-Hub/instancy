@@ -1,20 +1,38 @@
 //! # Metrics Collection
 //!
-//! Demonstrates enabling per-operator metrics on a production runtime via
-//! `SpawnOptions::collect_metrics(true)` and printing a summary table after
-//! the dataflow completes.
+//! Demonstrates the three levels of metrics collection:
+//!
+//! 1. **Operator summary** — per-operator activation count, CPU time, records processed
+//! 2. **Channel counters** — per-exchange-edge items and bytes transferred
+//! 3. **Activation timeline** — per-activation timestamped events for timeline replay
+//!
+//! Control what is collected via `MetricsConfig` presets:
+//! - `MetricsConfig::none()` — zero overhead
+//! - `MetricsConfig::summary_only()` — operator stats (~1% overhead)
+//! - `MetricsConfig::full()` — all categories including activation timeline
 //!
 //! Run with: `cargo run --example metrics_collection --all-features`
 
 use std::sync::Arc;
 use std::time::Duration;
 
-use instancy::metrics::DataflowMetrics;
+use instancy::metrics::{DataflowMetrics, MetricsConfig};
 use instancy::{DataflowBuilder, RuntimeConfig, RuntimeHandle, SpawnOptions};
 
 fn main() {
     let rt = RuntimeHandle::new(RuntimeConfig::default()).expect("runtime creation failed");
 
+    // --- Single-worker dataflow with operator summary ---
+    println!("=== Single-Worker: Operator Summary ===\n");
+    run_single_worker(&rt);
+
+    // --- Multi-worker dataflow with full metrics (including timeline) ---
+    println!("\n=== Multi-Worker: Full Metrics + Timeline ===\n");
+    run_multi_worker_timeline(&rt);
+}
+
+/// Demonstrates basic operator-level metrics with `collect_metrics(true)`.
+fn run_single_worker(rt: &RuntimeHandle) {
     let builder = DataflowBuilder::<u64>::new("metrics_collection");
     let input = builder.input::<i32>("data").unwrap();
     input
@@ -49,27 +67,106 @@ fn main() {
         vec![(0, vec![2, 6]), (1, vec![8, 12]), (2, vec![16, 18])]
     );
 
-    print_metrics_summary(metrics.as_ref());
+    print_operator_summary(metrics.as_ref());
 }
 
-fn print_metrics_summary(metrics: &DataflowMetrics) {
+/// Demonstrates full metrics collection with `MetricsConfig::full()`:
+/// operator summary + channel counters + activation timeline.
+fn run_multi_worker_timeline(rt: &RuntimeHandle) {
+    // MetricsConfig::full() enables all three categories.
+    // You can also customize individual fields:
+    //
+    //   let config = MetricsConfig {
+    //       operator_summary: true,
+    //       channel_counters: true,
+    //       activation_timeline: true,
+    //       min_activation_duration: Duration::from_micros(5),  // skip <5µs activations
+    //       max_timeline_events: 50_000,                        // ring buffer cap per worker
+    //   };
+    let opts = SpawnOptions::new().metrics(MetricsConfig::full());
+
+    let mut spawned = rt
+        .spawn_multi::<u64, _>(
+            "timeline-demo",
+            2,
+            |builder: &mut DataflowBuilder<u64>| {
+                builder
+                    .source::<i32>("src", vec![(0u64, vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10])])
+                    .exchange("partition", |x: &i32| *x as u64)
+                    .map("square", |_t, x| x * x)
+                    .output("out")
+                    .unwrap();
+                Ok(())
+            },
+            opts,
+        )
+        .expect("spawn_multi failed");
+
+    // Drain outputs to let the dataflow complete.
+    let receivers = spawned.take_all_outputs::<i32>("out").unwrap();
+    for rx in receivers {
+        while rx.recv().is_some() {}
+    }
+
+    // --- Channel counters ---
+    println!("Channel counters:");
+    for w in 0..2 {
+        if let Some(m) = spawned.worker_mut(w).metrics() {
+            for ch in m.channel_snapshots() {
+                println!(
+                    "  worker {w}: edge[{}] '{}' — {} items, {} bytes",
+                    ch.edge_index, ch.label, ch.items_transferred, ch.bytes_transferred
+                );
+            }
+        }
+    }
+
+    // --- Activation timeline ---
+    println!("\nActivation timeline events:");
+    for w in 0..2 {
+        if let Some(m) = spawned.worker_mut(w).metrics() {
+            let events = m.drain_timeline_events();
+            println!("  worker {w}: {} events", events.len());
+            // Print first 5 events as a sample.
+            for ev in events.iter().take(5) {
+                println!(
+                    "    op[{}] w{}: {}µs duration @ +{}µs",
+                    ev.operator_index, ev.worker_index, ev.duration_us, ev.start_us
+                );
+            }
+            if events.len() > 5 {
+                println!("    ... and {} more", events.len() - 5);
+            }
+        }
+    }
+
+    // --- Operator summary (aggregate across workers) ---
+    println!("\nOperator summary (per worker):");
+    for w in 0..2 {
+        if let Some(m) = spawned.worker_mut(w).metrics() {
+            print_operator_summary(m);
+        }
+    }
+
+    spawned.cancel();
+    let _ = spawned.join_blocking();
+}
+
+fn print_operator_summary(metrics: &DataflowMetrics) {
     let mut operators = metrics.operator_snapshots();
     operators.sort_by_key(|op| op.index);
 
-    println!("=== Dataflow Metrics ===");
-    println!("Wall time: {}", format_duration(metrics.wall_time()));
-    println!("Total activations: {}", metrics.total_activations());
+    println!("  Wall time: {}", format_duration(metrics.wall_time()));
+    println!("  Total activations: {}", metrics.total_activations());
     println!(
-        "Total CPU time: {}",
+        "  Total CPU time: {}",
         format_duration(metrics.total_cpu_time())
     );
     println!(
-        "Total records processed: {}",
+        "  Total records processed: {}",
         metrics.total_records_processed()
     );
 
-    println!();
-    println!("Per-operator breakdown:");
     println!(
         "  {:<20} {:>11}  {:>10}  {:>7}",
         "Operator", "Activations", "CPU Time", "Records"

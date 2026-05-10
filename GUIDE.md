@@ -1635,9 +1635,12 @@ impl ExchangeData for MyRecord {
 - Exchange channels may reorder across workers — use `unary_notify` to aggregate per-timestamp
 
 ### How do I know if my dataflow is slow?
-- Enable metrics: `SpawnOptions::new().collect_metrics(true)`
+- Enable metrics: `SpawnOptions::new().metrics(MetricsConfig::full())`
 - Check per-operator CPU time and activation count
 - Look for operators with high backpressure blocked_duration
+- Use `drain_timeline_events()` to see individual activation timing
+- Check `channel_snapshots()` for exchange edge transfer volumes
+- See the [metrics_collection example](./instancy/examples/metrics_collection.rs) for a complete walkthrough
 
 ---
 
