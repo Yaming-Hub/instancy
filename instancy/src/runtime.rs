@@ -984,9 +984,7 @@ impl RuntimeHandle {
     /// Use this when constructing shared transport components (e.g.,
     /// [`SharedPeerManager`](crate::communication::shared_transport::SharedPeerManager))
     /// to enable them to emit runtime health events.
-    pub fn health_tx(
-        &self,
-    ) -> tokio::sync::broadcast::Sender<crate::runtime_event::RuntimeEvent> {
+    pub fn health_tx(&self) -> tokio::sync::broadcast::Sender<crate::runtime_event::RuntimeEvent> {
         self.health_tx.clone()
     }
 
@@ -2277,8 +2275,9 @@ impl RuntimeHandle {
     {
         use crate::communication::cluster_transport::{ClusterSpawnTransport, ClusterTransport};
         use crate::communication::control_protocol::{
-            compute_fingerprint, perform_handshake, perform_handshake_with_transport,
-            perform_ready_barrier, perform_ready_barrier_with_transport,
+            broadcast_cancel, broadcast_cancel_with_transport, compute_fingerprint,
+            perform_handshake, perform_handshake_with_transport, perform_ready_barrier,
+            perform_ready_barrier_with_transport, spawn_cancel_listener,
         };
         use crate::communication::transport_session::{
             CONTROL_CHANNEL_ID, ChannelRegistration, TransportSession,
@@ -2855,6 +2854,59 @@ impl RuntimeHandle {
                     handshake_timeout,
                 ))
                 .map_err(|e| Error::Runtime(RuntimeError::Handshake(e)))?;
+        }
+
+        // Phase 8.5: Keep listening for peer cancellation and broadcast local cancellation.
+        let _cancel_listener = spawn_cancel_listener(
+            std::mem::take(&mut control_receivers),
+            dataflow_cancel
+                .as_ref()
+                .expect("dataflow_cancel always set for cluster dataflows")
+                .clone(),
+        );
+        {
+            let broadcast_cancel_token = dataflow_cancel
+                .as_ref()
+                .expect("dataflow_cancel always set for cluster dataflows")
+                .clone();
+            let broadcast_shutdown = bridge_cancel.clone();
+            let broadcast_dataflow_id = dataflow_id;
+
+            if let Some(session) = dedicated_session.clone() {
+                runtime_handle.spawn(async move {
+                    tokio::select! {
+                        biased;
+                        _ = broadcast_cancel_token.cancelled_async() => {
+                            let reason = broadcast_cancel_token
+                                .reason()
+                                .map(|reason| reason.to_string())
+                                .unwrap_or_else(|| "cancelled".to_string());
+                            broadcast_cancel(&session, broadcast_dataflow_id, &reason).await;
+                        }
+                        _ = broadcast_shutdown.cancelled() => {}
+                    }
+                });
+            } else {
+                let broadcast_transport = Arc::clone(&transport);
+                runtime_handle.spawn(async move {
+                    tokio::select! {
+                        biased;
+                        _ = broadcast_cancel_token.cancelled_async() => {
+                            let reason = broadcast_cancel_token
+                                .reason()
+                                .map(|reason| reason.to_string())
+                                .unwrap_or_else(|| "cancelled".to_string());
+                            broadcast_cancel_with_transport(
+                                &broadcast_transport,
+                                broadcast_dataflow_id,
+                                &reason,
+                            )
+                            .await;
+                        }
+                        _ = broadcast_shutdown.cancelled() => {}
+                    }
+                });
+            }
         }
 
         // Phase 9: Register all workers for execution.
@@ -4572,22 +4624,30 @@ impl<T: Timestamp> ClusterSpawnedDataflow<T> {
 
     /// Cancel all local workers and tear down the cluster.
     pub fn cancel(&self) {
-        self._bridge_cancel.cancel();
         if let Some(ref inner) = self.inner {
-            for i in 0..inner.num_workers() {
-                inner.workers[i].cancel();
+            if let Some(ref dataflow_cancel) = inner._dataflow_cancel {
+                dataflow_cancel.cancel();
+            } else {
+                for i in 0..inner.num_workers() {
+                    inner.workers[i].cancel();
+                }
             }
         }
+        self._bridge_cancel.cancel();
     }
 
     /// Cancel all local workers with a specific reason and tear down the cluster.
     pub fn cancel_with_reason(&self, reason: CancellationReason) {
-        self._bridge_cancel.cancel();
         if let Some(ref inner) = self.inner {
-            for i in 0..inner.num_workers() {
-                inner.workers[i].cancel_with_reason(reason.clone());
+            if let Some(ref dataflow_cancel) = inner._dataflow_cancel {
+                dataflow_cancel.cancel_with_reason(reason);
+            } else {
+                for i in 0..inner.num_workers() {
+                    inner.workers[i].cancel_with_reason(reason.clone());
+                }
             }
         }
+        self._bridge_cancel.cancel();
     }
 
     /// Take the completion handles from all local workers.
@@ -4635,6 +4695,11 @@ impl<T: Timestamp> ClusterSpawnedDataflow<T> {
 impl<T: Timestamp> Drop for ClusterSpawnedDataflow<T> {
     fn drop(&mut self) {
         if !self._bridge_cancel_moved {
+            if let Some(ref inner) = self.inner {
+                if let Some(ref dataflow_cancel) = inner._dataflow_cancel {
+                    dataflow_cancel.cancel_with_reason(CancellationReason::HandleDropped);
+                }
+            }
             self._bridge_cancel.cancel();
         }
     }

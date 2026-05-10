@@ -81,6 +81,14 @@ pub enum CancellationReason {
     /// An operator produced an error that caused the dataflow to be cancelled.
     OperatorError { detail: String },
 
+    /// A peer node in the cluster cancelled the distributed dataflow.
+    PeerCancelled {
+        /// ID of the peer that initiated cancellation.
+        peer_id: String,
+        /// The reason reported by the peer.
+        detail: String,
+    },
+
     /// A peer node in the cluster was reported as down by the hosting
     /// application via [`crate::RuntimeHandle::report_node_leave()`].
     PeerDown { node_id: String },
@@ -100,6 +108,9 @@ impl fmt::Display for CancellationReason {
             Self::WorkerFailed { detail } => write!(f, "worker failed: {detail}"),
             Self::HandleDropped => write!(f, "handle dropped"),
             Self::OperatorError { detail } => write!(f, "operator error: {detail}"),
+            Self::PeerCancelled { peer_id, detail } => {
+                write!(f, "peer {peer_id} cancelled dataflow: {detail}")
+            }
             Self::PeerDown { node_id } => write!(f, "peer node down: {node_id}"),
             Self::InternalError { detail } => write!(f, "internal error: {detail}"),
         }
@@ -911,6 +922,22 @@ mod tests {
     }
 
     #[test]
+    fn cancel_with_peer_cancelled_reason() {
+        let token = CancellationToken::new();
+        token.cancel_with_reason(CancellationReason::PeerCancelled {
+            peer_id: "node-3".into(),
+            detail: "user requested shutdown".into(),
+        });
+        assert_eq!(
+            token.reason(),
+            Some(CancellationReason::PeerCancelled {
+                peer_id: "node-3".into(),
+                detail: "user requested shutdown".into(),
+            })
+        );
+    }
+
+    #[test]
     fn reason_returns_none_when_not_cancelled() {
         let token = CancellationToken::new();
         assert_eq!(token.reason(), None);
@@ -1051,6 +1078,14 @@ mod tests {
             }
             .to_string(),
             "operator error: oops"
+        );
+        assert_eq!(
+            CancellationReason::PeerCancelled {
+                peer_id: "node-2".into(),
+                detail: "operator requested stop".into(),
+            }
+            .to_string(),
+            "peer node-2 cancelled dataflow: operator requested stop"
         );
         assert_eq!(
             CancellationReason::PeerDown {
