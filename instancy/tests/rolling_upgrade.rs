@@ -17,17 +17,14 @@ use std::time::Duration;
 use instancy::dataflow::DataflowBuilder;
 use instancy::runtime::{RuntimeConfig, RuntimeHandle, SpawnOptions};
 use instancy::{
-    ChannelMembership, ClusterTopology, MembershipEvent, NodeConfig,
-    NodeDepartureReason,
+    ChannelMembership, ClusterTopology, MembershipEvent, NodeConfig, NodeDepartureReason,
 };
 
 /// Helper to run a single-node dataflow, feed data, and collect results.
 fn run_local_dataflow(rt: &RuntimeHandle, input: Vec<i32>) -> Vec<i32> {
     let builder = DataflowBuilder::<u64>::new("local-df");
     let inp = builder.input::<i32>("data").unwrap();
-    inp.map("double", |_t, x| x * 2)
-        .output("results")
-        .unwrap();
+    inp.map("double", |_t, x| x * 2).output("results").unwrap();
     let df = builder.build().unwrap();
 
     let mut handle = rt.spawn(df, SpawnOptions::default()).unwrap();
@@ -59,8 +56,7 @@ async fn rolling_upgrade_topology_lifecycle() {
     let membership = ChannelMembership::new();
     let tx = membership.sender();
 
-    let initial_topology =
-        ClusterTopology::multi_node(vec![NodeConfig::new("node-a", 2)]).unwrap();
+    let initial_topology = ClusterTopology::multi_node(vec![NodeConfig::new("node-a", 2)]).unwrap();
 
     let rt = RuntimeHandle::new(RuntimeConfig {
         worker_threads: 2,
@@ -219,8 +215,7 @@ async fn rolling_upgrade_with_node_failure() {
     let membership = ChannelMembership::new();
     let tx = membership.sender();
 
-    let initial_topology =
-        ClusterTopology::multi_node(vec![NodeConfig::new("node-a", 2)]).unwrap();
+    let initial_topology = ClusterTopology::multi_node(vec![NodeConfig::new("node-a", 2)]).unwrap();
 
     let rt = RuntimeHandle::new(RuntimeConfig {
         worker_threads: 2,

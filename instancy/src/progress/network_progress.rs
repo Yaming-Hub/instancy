@@ -464,7 +464,10 @@ pub fn create_network_progress_channels<T: Timestamp + ExchangeData>(
     cancel: tokio_util::sync::CancellationToken,
     max_batch_size: usize,
     runtime_handle: &tokio::runtime::Handle,
-) -> Result<(Vec<WorkerProgressChannels<T>>, NetworkProgressHandles), crate::error::CommunicationError> {
+) -> Result<
+    (Vec<WorkerProgressChannels<T>>, NetworkProgressHandles),
+    crate::error::CommunicationError,
+> {
     let (local_start, local_end) = local_worker_range;
 
     // --- Input validation ---
@@ -505,11 +508,11 @@ pub fn create_network_progress_channels<T: Timestamp + ExchangeData>(
     // --- Send side: one unbounded channel per peer, shared by all local workers ---
     for (peer_id, peer_start, peer_end) in remote_peers {
         // Get the transport's progress sender for this peer.
-        let session_tx = transport
-            .progress_sender(peer_id)
-            .ok_or_else(|| crate::error::CommunicationError::InvalidSetup(
-                format!("missing progress sender for peer {peer_id}"),
-            ))?;
+        let session_tx = transport.progress_sender(peer_id).ok_or_else(|| {
+            crate::error::CommunicationError::InvalidSetup(format!(
+                "missing progress sender for peer {peer_id}"
+            ))
+        })?;
 
         // Create unbounded intermediary channel for this peer.
         let (unbounded_tx, unbounded_rx) = tokio_mpsc::unbounded_channel::<Frame>();
@@ -587,11 +590,11 @@ pub fn create_network_progress_channels<T: Timestamp + ExchangeData>(
 
     // --- Receive side: one bridge task per (remote_src, local_dst) pair ---
     for (peer_id, peer_start, peer_end) in remote_peers {
-        let peer_map = receivers
-            .get_mut(peer_id.as_str())
-            .ok_or_else(|| crate::error::CommunicationError::InvalidSetup(
-                format!("missing receiver map for peer {peer_id}"),
-            ))?;
+        let peer_map = receivers.get_mut(peer_id.as_str()).ok_or_else(|| {
+            crate::error::CommunicationError::InvalidSetup(format!(
+                "missing receiver map for peer {peer_id}"
+            ))
+        })?;
 
         for remote_w in *peer_start..*peer_end {
             for local_w in local_start..local_end {

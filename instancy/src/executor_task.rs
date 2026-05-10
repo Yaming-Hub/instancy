@@ -177,7 +177,10 @@ impl ExecutorTask {
             if let Ok(mut n) = this.notifier.lock() {
                 if let Some(notifier) = n.take() {
                     notifier.complete(Err(crate::error::Error::Runtime(
-                        RuntimeError::SpawnFailed(msg.into()),
+                        RuntimeError::SpawnFailed {
+                            context: msg.into(),
+                            source: None,
+                        },
                     )));
                 }
             }

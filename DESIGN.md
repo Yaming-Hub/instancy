@@ -2738,7 +2738,7 @@ pub enum Error {
     // ── Cross-cutting (used in 3+ modules) ──
     Io(std::io::Error),
     Cancelled { reason: Option<CancellationReason> },
-    Progress(String),
+    Progress(ProgressError),
     Operator { operator, worker_index, source },
     OperatorPanic { operator, worker_index, message },
     Backpressure,
@@ -2750,6 +2750,12 @@ pub enum Error {
     Dataflow(DataflowError),      // from dataflow module
     Runtime(RuntimeError),        // from runtime module
     Communication(CommunicationError), // from communication module
+}
+
+// Progress-tracking errors (2 variants)
+enum ProgressError {
+    TimeNotAdvanced { from, to },
+    NoDominatingCapability { time },
 }
 
 // Topology errors (4 variants)
@@ -2770,11 +2776,12 @@ enum DataflowError {
     MissingFactory { edge_index },
 }
 
-// Runtime lifecycle errors (5 variants)
+// Runtime lifecycle errors (6 variants)
 enum RuntimeError {
     InvalidConfig(String),
-    SpawnFailed(String),
+    SpawnFailed { context, source: Option<io::Error> },
     ClusterSetup(String),
+    Handshake(HandshakeError),       // #[cfg(feature = "transport")]
     AlreadyConsumed { resource },
     EmptyDataflow,
 }
@@ -2834,6 +2841,24 @@ When adding new error variants, follow these rules:
 
 5. **Test-only errors** should be gated with `#[cfg(feature = "test-utils")]` if
    they exist solely to support test infrastructure.
+
+6. **Enum variant vs. `String` field.** Not every error field needs to be a
+   structured type. Prefer an enum (or typed field) over a plain `String` when
+   any of the following apply — listed from most to least important:
+
+   - **Programmatic matching** — callers need to `match` on a specific error
+     case to choose a recovery strategy (e.g., retry on timeout, abort on auth
+     failure). If callers only log the message, a `String` is fine.
+   - **Statistical analysis** — the application aggregates errors as metric
+     labels or error codes in dashboards. Enum discriminants are stable keys;
+     free-form strings are not.
+   - **Readability** — a named variant like `CrcMismatch { expected, actual }`
+     is easier to understand at the call site than `Custom(format!("CRC
+     mismatch: expected {expected}, got {actual}"))`.
+
+   When none of these apply — e.g., the field is a human-readable reason for
+   a validation failure that callers never inspect programmatically — keep it
+   as `String` to avoid unnecessary boilerplate.
 
 ### 8.3 Error Propagation
 

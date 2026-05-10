@@ -266,7 +266,11 @@ impl<M: ConnectionManager> ConnectionPool<M> {
     /// # Errors
     ///
     /// Returns an error if the configuration is invalid.
-    pub fn new(manager: M, config: PoolConfig, local_id: PeerId) -> Result<Self, crate::error::CommunicationError> {
+    pub fn new(
+        manager: M,
+        config: PoolConfig,
+        local_id: PeerId,
+    ) -> Result<Self, crate::error::CommunicationError> {
         config.validate()?;
         Ok(Self {
             manager: Arc::new(manager),

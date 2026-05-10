@@ -509,7 +509,7 @@ fn execute(
     runtime_config
         .worker_pool
         .validate()
-        .map_err(|e| Error::Runtime(crate::error::RuntimeError::InvalidConfig(e.to_string())))?;
+        .map_err(Error::Runtime)?;
 
     if dataflow_config.topology.total_workers() == 0 {
         return Err(Error::Runtime(crate::error::RuntimeError::InvalidConfig(

@@ -16,7 +16,7 @@
 use std::fmt;
 use std::ops::Deref;
 
-use crate::error::{Error, Result};
+use crate::error::{Error, ProgressError, Result};
 use crate::progress::frontier::Antichain;
 use crate::progress::operate::ProgressReporter;
 use crate::progress::timestamp::Timestamp;
@@ -64,10 +64,10 @@ impl<T: Timestamp> Capability<T> {
     /// (including incomparable times in a partial order).
     pub fn delayed(&self, new_time: &T) -> Result<Self> {
         if !self.time.less_equal(new_time) {
-            return Err(Error::Progress(format!(
-                "cannot delay capability from {:?} to {:?}: new time is not >= current time",
-                self.time, new_time
-            )));
+            return Err(Error::Progress(ProgressError::TimeNotAdvanced {
+                from: format!("{:?}", self.time),
+                to: format!("{:?}", new_time),
+            }));
         }
         Ok(Self::new(new_time.clone(), self.reporter.clone()))
     }
@@ -86,10 +86,10 @@ impl<T: Timestamp> Capability<T> {
     /// Returns [`Error::Progress`] if `new_time` is not `>=` the current time.
     pub fn downgrade(&mut self, new_time: &T) -> Result<()> {
         if !self.time.less_equal(new_time) {
-            return Err(Error::Progress(format!(
-                "cannot downgrade capability from {:?} to {:?}: new time is not >= current time",
-                self.time, new_time
-            )));
+            return Err(Error::Progress(ProgressError::TimeNotAdvanced {
+                from: format!("{:?}", self.time),
+                to: format!("{:?}", new_time),
+            }));
         }
         // Atomic paired update: no intermediate state visible.
         self.reporter.downgrade(self.time.clone(), new_time.clone());
@@ -183,7 +183,9 @@ impl<T: Timestamp> CapabilitySet<T> {
     /// Returns [`Error::Progress`] if no capability in the set dominates `time`.
     pub fn delayed(&self, time: &T) -> Result<Capability<T>> {
         self.try_delayed(time).ok_or_else(|| {
-            Error::Progress(format!("no capability in set dominates time {:?}", time))
+            Error::Progress(ProgressError::NoDominatingCapability {
+                time: format!("{:?}", time),
+            })
         })
     }
 
@@ -210,10 +212,9 @@ impl<T: Timestamp> CapabilitySet<T> {
         // Validate: each new time must be dominated by some existing cap.
         for new_time in &frontier_times {
             if !self.elements.iter().any(|c| c.time.less_equal(new_time)) {
-                return Err(Error::Progress(format!(
-                    "cannot downgrade: time {:?} is not dominated by any held capability",
-                    new_time
-                )));
+                return Err(Error::Progress(ProgressError::NoDominatingCapability {
+                    time: format!("{:?}", new_time),
+                }));
             }
         }
 
