@@ -466,6 +466,20 @@ impl SharedPeerManager {
         // Error channel: capacity 4 (failures are rare, one notification is enough)
         let (error_tx, error_rx) = tokio_mpsc::channel(4);
 
+        // Ensure minimum connections exist BEFORE registering the dataflow.
+        // This prevents a race where the caller receives senders and immediately
+        // sends frames before any connection is established — those frames would
+        // be silently dropped by bridge_task.
+        if let Err(e) = self.ensure_min_connections().await {
+            // All connection attempts failed — surface the error immediately.
+            let _ = error_tx.try_send(TransportError::ConnectionClosed);
+            #[cfg(feature = "tracing")]
+            tracing::error!(
+                "Failed to establish connections for peer {} during dataflow registration: {e}",
+                self.peer_node_id
+            );
+        }
+
         let reg = DataflowRegistration {
             sequence_counter: SequenceCounter::new(),
             channel_senders,
@@ -515,22 +529,27 @@ impl SharedPeerManager {
             ReorderBuffer::with_capacity(self.config.reorder_timeout, 4096),
         );
 
-        self.ensure_min_connections().await;
-
         (receivers, error_rx)
     }
 
-    async fn ensure_min_connections(&self) {
-        if self.pool.live_connection_count() > 0 {
-            return;
+    /// Ensure the pool has at least `min_connections` live connections.
+    /// Returns Ok(()) if the pool meets the minimum, or Err if no connections
+    /// could be established at all (partial success still returns Ok).
+    async fn ensure_min_connections(&self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        let live = self.pool.live_connection_count();
+        if live >= self.config.min_connections {
+            return Ok(());
         }
 
         let _guard = self.init_lock.lock().await;
-        if self.pool.live_connection_count() > 0 {
-            return;
+        let live = self.pool.live_connection_count();
+        if live >= self.config.min_connections {
+            return Ok(());
         }
 
-        for _ in 0..self.config.min_connections {
+        let deficit = self.config.min_connections - live;
+        let mut last_error = None;
+        for _ in 0..deficit {
             if let Err(error) = Self::reconnect_connection(
                 &self.peer_node_id,
                 self.connection_factory.clone(),
@@ -550,9 +569,18 @@ impl SharedPeerManager {
                     "Lazy connection establishment failed for peer {}: {error}",
                     self.peer_node_id
                 );
+                last_error = Some(error);
                 break;
             }
         }
+
+        // If we still have zero live connections, report the last error
+        if self.pool.live_connection_count() == 0 {
+            if let Some(e) = last_error {
+                return Err(e);
+            }
+        }
+        Ok(())
     }
 
     /// Unregister a dataflow, removing its channels, reorder buffer, and pending control frames.
@@ -713,6 +741,13 @@ impl SharedPeerManager {
                             };
                             if let Some(tx) = tx {
                                 let _ = tx.send(frame).await;
+                            } else {
+                                // No live connections — notify the dataflow via error channel
+                                // so it fails fast instead of hanging on a handshake timeout.
+                                let state = reg_state.lock().await;
+                                if let Some(reg) = state.registered.get(&frame.dataflow_id) {
+                                    let _ = reg.error_tx.try_send(TransportError::ConnectionClosed);
+                                }
                             }
                         }
                         None => { control_open = false; }
