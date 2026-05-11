@@ -18,11 +18,17 @@ Key methods:
 - `pub fn cancel_token(&self) -> &CancellationToken` — get the runtime-wide cooperative cancellation token.
 - `pub fn tokio_handle(&self) -> &tokio::runtime::Handle` — reuse instancy's Tokio runtime for async support code.
 - `pub fn shutdown(&self)` — cancel all running dataflows with `CancellationReason::RuntimeShutdown`.
+- `pub async fn shutdown_async(&self)` — cancel all running dataflows and wait for them to finish.
+- `pub async fn wait_idle(&self)` — wait for all active dataflows to complete without cancelling them.
+- `pub fn active_dataflows(&self) -> usize` — count currently active dataflows.
+- `pub fn name(&self) -> &str` — get the runtime name.
+- `pub fn worker_pool(&self) -> &WorkerPool` — access the shared worker pool.
+- `pub fn is_shutdown(&self) -> bool` — check whether the runtime has been shut down.
 - `pub fn health_events(&self) -> tokio::sync::broadcast::Receiver<RuntimeEvent>` — subscribe to runtime health events.
 - `pub fn health_tx(&self) -> tokio::sync::broadcast::Sender<RuntimeEvent>` — clone the health-event sender for shared transport components.
 - `pub fn spawn<T: Timestamp>(&self, dataflow: LogicalDataflow<T>, options: SpawnOptions) -> Result<SpawnedDataflow<T>>` — run one logical dataflow.
 - `pub fn spawn_multi<T, F>(&self, name: &str, num_workers: usize, build: F, options: SpawnOptions) -> Result<MultiSpawnedDataflow<T>> where F: Fn(&mut DataflowBuilder<T>) -> Result<()>` — build and run N replicated workers.
-- `#[cfg(feature = "transport")] pub fn spawn_cluster<T, F, R, W>(...) -> Result<ClusterSpawnedDataflow<T>>` — run a distributed dataflow across nodes.
+- `#[cfg(feature = "transport")] pub fn spawn_cluster<T, F, R, W>(...) -> Result<ClusterSpawnedDataflow<T>> where T: Timestamp + ExchangeData, F: Fn(&mut DataflowBuilder<T>) -> Result<()>, R: AsyncRead + Unpin + Send + 'static, W: AsyncWrite + Unpin + Send + 'static` — run a distributed dataflow across nodes.
 - `#[cfg(feature = "transport")] pub fn report_node_leave(&self, node_id: &str) -> usize` — cancel dataflows that depend on a departed peer.
 - `#[cfg(feature = "transport")] pub fn report_node_join(&self, node_id: &str) -> bool` — clear the departed-peer flag for future cluster spawns.
 
@@ -55,6 +61,7 @@ Key methods:
 - `pub fn run<T: Timestamp>(&self, dataflow: LogicalDataflow<T>) -> Result<()>` — run a pre-loaded dataflow to completion (blocking). Dataflow must not have `input()` ports.
 - `pub fn run_with_metrics<T: Timestamp>(&self, dataflow: LogicalDataflow<T>) -> Result<Option<Arc<DataflowMetrics>>>` — run and return collected metrics.
 - `pub fn spawn<T: Timestamp>(&self, dataflow: LogicalDataflow<T>) -> Result<SpawnedDataflow<T>>` — spawn on a background thread with channel-based I/O for feeding data and collecting results.
+- `pub fn spawn_multi<T, F>(&self, name: &str, num_workers: usize, build: F) -> Result<MultiSpawnedDataflow<T>> where F: Fn(&mut DataflowBuilder<T>) -> Result<()>` — build and run N replicated workers on dedicated background threads.
 
 Example:
 
@@ -161,6 +168,13 @@ pub trait SchedulePolicy: Send + Sync {
 
 When no policy is set (default), the scheduler uses plain FIFO with O(1) pop. When a policy is set, it uses a `BinaryHeap` for O(log n) operations.
 
+### `TaskMeta`
+
+Public task metadata passed to `SchedulePolicy::compare`.
+
+- Fields: `dataflow_id: DataflowId`, `priority: u32`, `created_at: Instant`
+- `pub fn new(dataflow_id: DataflowId, priority: u32) -> Self`
+
 ### `PriorityPolicy`
 
 Strict priority scheduling — higher priority always wins. Can starve low-priority dataflows.
@@ -188,12 +202,13 @@ See also: [Design decisions §12.10](../design/decisions.md).
 
 - `name(&self) -> &str`
 - `metrics(&self) -> Option<&Arc<DataflowMetrics>>`
+- `cancel_token(&self) -> &CancellationToken`
 - `take_input<D>(&mut self, name: &str) -> Result<InputSender<T, D>>`
 - `take_output<D>(&mut self, name: &str) -> Result<OutputReceiver<T, D>>`
 - `take_async_input<D>(&mut self, name: &str) -> Result<AsyncInputSender<T, D>>`
 - `take_async_output<D>(&mut self, name: &str) -> Result<AsyncOutputReceiver<T, D>>`
 - `cancel(&self)` / `cancel_with_reason(&self, CancellationReason)`
-- `join(self) -> DataflowCompletion<T>`
+- `join(mut self) -> DataflowCompletion`
 - `join_blocking(self) -> Result<()>`
 
 #### `MultiSpawnedDataflow<T>`
@@ -201,10 +216,17 @@ See also: [Design decisions §12.10](../design/decisions.md).
 - `name(&self) -> &str`
 - `num_workers(&self) -> usize`
 - `worker_mut(&mut self, worker_idx: usize) -> &mut SpawnedDataflow<T>`
-- `take_input`, `take_output`, `take_async_input`, `take_async_output` with an explicit `worker_idx`
+- `take_input<D>(&mut self, worker_idx: usize, name: &str) -> Result<InputSender<T, D>>`
+- `take_output<D>(&mut self, worker_idx: usize, name: &str) -> Result<OutputReceiver<T, D>>`
+- `take_async_input<D>(&mut self, worker_idx: usize, name: &str) -> Result<AsyncInputSender<T, D>>`
+- `take_async_output<D>(&mut self, worker_idx: usize, name: &str) -> Result<AsyncOutputReceiver<T, D>>`
+- `take_all_inputs<D>(&mut self, name: &str) -> Result<Vec<InputSender<T, D>>>`
+- `take_all_outputs<D>(&mut self, name: &str) -> Result<Vec<OutputReceiver<T, D>>>`
+- `take_all_async_inputs<D>(&mut self, name: &str) -> Result<Vec<AsyncInputSender<T, D>>>`
+- `take_all_async_outputs<D>(&mut self, name: &str) -> Result<Vec<AsyncOutputReceiver<T, D>>>`
 - `cancel(&self)` / `cancel_with_reason(&self, CancellationReason)`
-- `join(self) -> MultiDataflowCompletion<T>`
-- `join_blocking(self) -> Result<()>`
+- `join(mut self) -> MultiDataflowCompletion`
+- `join_blocking(mut self) -> Result<()>`
 
 #### `ClusterSpawnedDataflow<T>`
 
@@ -214,10 +236,20 @@ See also: [Design decisions §12.10](../design/decisions.md).
 - `local_worker_range(&self) -> (usize, usize)`
 - `worker_metrics(&self, local_idx: usize) -> Option<&Arc<DataflowMetrics>>`
 - `all_worker_metrics(&self) -> Vec<Option<&Arc<DataflowMetrics>>>`
-- `take_input`, `take_output`, `take_async_input`, `take_async_output` with a local worker index
+- `take_input<D>(&mut self, local_idx: usize, name: &str) -> Result<InputSender<T, D>>`
+- `take_output<D>(&mut self, local_idx: usize, name: &str) -> Result<OutputReceiver<T, D>>`
+- `take_async_input<D>(&mut self, local_idx: usize, name: &str) -> Result<AsyncInputSender<T, D>>`
+- `take_async_output<D>(&mut self, local_idx: usize, name: &str) -> Result<AsyncOutputReceiver<T, D>>`
 - `cancel(&self)` / `cancel_with_reason(&self, CancellationReason)`
-- `join(self) -> Result<ClusterCompletion<T>>`
+- `join(mut self) -> Result<ClusterCompletion<T>>`
 - `join_blocking(self) -> Result<()>`
+
+#### Completion handles
+
+- `DataflowCompletion::new() -> (DataflowCompletion, CompletionNotifier)`
+- `DataflowCompletion::wait(self) -> Result<()>`
+- `MultiDataflowCompletion::wait(self) -> Result<()>`
+- `ClusterCompletion<T>::wait(self) -> Result<()>`
 
 ## Dataflow Construction
 
@@ -235,8 +267,17 @@ Key methods:
 - `pub fn catch_panics(&self, enable: bool) -> &Self`
 - `pub fn input<D: Clone + Send + 'static>(&self, name: impl Into<String>) -> Result<Pipe<T, D>>`
 - `pub fn source<D: Clone + Send + 'static>(&self, name: impl Into<String>, data: Vec<(T, Vec<D>)>) -> Pipe<T, D>`
-- `pub fn source_async<D, F, Fut>(&self, name: impl Into<String>, producer: F) -> Pipe<T, D>`
+- `pub fn source_async<D, F, Fut>(&self, name: impl Into<String>, producer: F) -> Pipe<T, D> where D: Clone + Send + 'static, F: FnOnce(AsyncInputSender<T, D>) -> Fut + Send + 'static, Fut: Future<Output = Result<()>> + Send + 'static`
+- `pub fn operator_count(&self) -> usize`
+- `pub fn name(&self) -> &str`
 - `pub fn build(self) -> Result<LogicalDataflow<T>>`
+
+Related public types:
+
+- `pub struct Pipe<T: Timestamp, D: Clone + Send + 'static>`
+- `pub struct StreamEdge<S: Scope, D>` — lower-level typed edge metadata with `new`, `scope`, `scope_mut`, `source`, `stage_id`, and `in_stage`
+- `pub struct OutputPort<T: Timestamp, D: Send + 'static>` — key methods: `name(&self) -> &str`, `collector(&self) -> Arc<Mutex<Vec<(T, Vec<D>)>>>`
+- `pub struct LogicalDataflow<T: Timestamp>` — key methods: `name(&self) -> &str`, `contexts(&self) -> &SharedContext`, `operator_count(&self) -> usize`, `edge_count(&self) -> usize`, `input_names(&self) -> Vec<&str>`, `output_names(&self) -> Vec<&str>`, `has_input_ports(&self) -> bool`, `graph(&self) -> &DataflowGraph`, `exchange_edge_indices(&self) -> Vec<usize>`, `feedback_edge_count(&self) -> usize`
 
 See also: [Building Dataflows](../guide/building-dataflows.md).
 
@@ -249,7 +290,7 @@ See also: [Building Dataflows](../guide/building-dataflows.md).
 
 ## Streams and Operators
 
-The chaining surface is implemented on `Pipe<T, D>` / `StreamEdge`. The guide pages explain behavior in detail; this section summarizes the main entry points.
+The current operator-chaining surface is implemented on `Pipe<T, D>`. `StreamEdge<S, D>` is the lower-level typed edge metadata type. The guide pages explain behavior in detail; this section summarizes the main entry points.
 
 ### Core transforms
 
@@ -271,7 +312,7 @@ The chaining surface is implemented on `Pipe<T, D>` / `StreamEdge`. The guide pa
 
 - `reduce(name, |D, D| -> D) -> Pipe<T, D>`
 - `fold(name, init, |Acc, D| -> Acc) -> Pipe<T, Acc>`
-- `distinct(name) -> Pipe<T, D>`
+- `distinct(name) -> Pipe<T, D>` (`D: Eq + Hash`)
 - `count(name) -> Pipe<T, usize>`
 - `take(name, count) -> Pipe<T, D>`
 - `take_while(name, |&T, &D| -> bool) -> Pipe<T, D>`
@@ -280,14 +321,19 @@ The chaining surface is implemented on `Pipe<T, D>` / `StreamEdge`. The guide pa
 
 ### Distribution operators
 
-- `exchange(name, |&D| -> K) -> Pipe<T, D>`
-- `exchange_to(name, parallelism, |&D| -> K) -> Pipe<T, D>`
+- `exchange<K: Hash + 'static>(name, |&D| -> K) -> Pipe<T, D>`
+- `exchange_to<K: Hash + 'static>(name, parallelism, |&D| -> K) -> Result<Pipe<T, D>>`
 - `exchange_by_hash(name, |&D| -> u64) -> Pipe<T, D>`
-- `exchange_by_hash_to(name, parallelism, |&D| -> u64) -> Pipe<T, D>`
+- `exchange_by_hash_to(name, parallelism, |&D| -> u64) -> Result<Pipe<T, D>>`
 - `gather(name) -> Pipe<T, D>`
 - `rebalance(name) -> Pipe<T, D>`
-- `rebalance_to(name, parallelism) -> Pipe<T, D>`
+- `rebalance_to(name, parallelism) -> Result<Pipe<T, D>>`
 - `broadcast(name) -> Pipe<T, D>`
+
+Notes:
+
+- In `transport` builds, exchange/repartition operators require `T` and `D` to implement `ExchangeData`.
+- In non-transport builds, these operators are available for `D: Clone + Send + 'static`. 
 
 ### Custom operators and loops
 
@@ -295,12 +341,12 @@ The chaining surface is implemented on `Pipe<T, D>` / `StreamEdge`. The guide pa
 - `unary_notify(name, logic) -> Pipe<T, D2>`
 - `unary_async(name, logic) -> Pipe<T, D2>`
 - `binary(other, name, logic) -> Pipe<T, D3>`
-- `iterate<TInner>(name, step, logic) -> Result<Pipe<T, D>>`
+- `iterate<TInner>(name, summary: TInner::Summary, body) -> Pipe<T, D>`
 
 Notes:
 
 - There is **no public `binary_notify` method** in the current API on this branch.
-- `map_ok` and `filter_ok` are available for `Pipe<T, Result<V, E>>`.
+- `map_ok` and `filter_ok` are available for `Pipe<T, Result<V, E>>`. 
 
 See also: [Building Dataflows](../guide/building-dataflows.md), [Custom Operators](../guide/custom-operators.md), [Iteration](../guide/iteration.md).
 
@@ -318,8 +364,8 @@ Synchronous handle returned by `SpawnedDataflow::take_input`.
 
 Async counterpart used with `IoMode::Async`.
 
-- `send(&self, time: T, data: Vec<D>) -> Result<()>`
-- `advance_to(&self, time: T) -> Result<()>`
+- `async fn send(&self, time: T, data: Vec<D>) -> Result<()>`
+- `async fn advance_to(&self, time: T) -> Result<()>`
 - `close(self)`
 
 ### `OutputReceiver<T, D>`
@@ -331,7 +377,18 @@ Synchronous output handle.
 - `recv_timeout(&self, timeout: Duration) -> Option<OutputEvent<T, D>>`
 - `collect_data(&self) -> Vec<(T, Vec<D>)>`
 
-`AsyncOutputReceiver<T, D>` provides the same role for async receive paths.
+`OutputEvent<T, D>` variants:
+
+- `Data { time: T, data: Vec<D> }`
+- `Frontier(T)`
+
+### `AsyncOutputReceiver<T, D>`
+
+Async output handle used with `IoMode::Async`.
+
+- `async fn recv(&mut self) -> Option<OutputEvent<T, D>>`
+- `fn try_recv(&mut self) -> Option<OutputEvent<T, D>>`
+- `async fn collect_data(&mut self) -> Vec<(T, Vec<D>)>`
 
 ### `ProbeHandle<T>`
 
@@ -340,8 +397,8 @@ Track frontier progress at a point in the graph.
 - `done_with(&self, time: &T) -> bool`
 - `frontier(&self) -> Antichain<T>`
 - `is_done(&self) -> bool`
-- `wait_until_done_with(&self, time: &T) -> Result<(), Error>`
-- `wait_until_done(&self) -> Result<(), Error>`
+- `async fn wait_until_done_with(&self, time: &T) -> Result<(), Error>`
+- `async fn wait_until_done(&self) -> Result<(), Error>`
 - `subscribe(&self) -> tokio::sync::watch::Receiver<Antichain<T>>`
 
 See also: [Core Concepts](../guide/core-concepts.md), [Observability](../guide/observability.md).
@@ -363,6 +420,19 @@ pub trait Timestamp:
 
 Built-in implementations include `()`, `usize`, `u32`, `u64`, `i32`, `i64`, and `Product<TOuter, TInner>`.
 
+### `PathSummary<T>`
+
+Public trait at `instancy::progress::timestamp::PathSummary`.
+
+```rust
+pub trait PathSummary<T: Timestamp>:
+    Clone + Eq + PartialOrder + Debug + Default + Send + Sync + 'static
+{
+    fn results_in(&self, src: &T) -> Option<T>;
+    fn followed_by(&self, other: &Self) -> Option<Self>;
+}
+```
+
 ### `Product<TOuter, TInner>`
 
 Nested-scope timestamp pair.
@@ -377,6 +447,12 @@ Public trait at `instancy::order::PartialOrder`.
 - `fn less_equal(&self, other: &Self) -> bool`
 - `fn less_than(&self, other: &Self) -> bool`
 
+### `TotalOrder`
+
+Public marker trait at `instancy::order::TotalOrder`.
+
+- `pub trait TotalOrder: PartialOrder + Ord {}`
+
 ### `Antichain<T>`
 
 Minimal set of mutually incomparable timestamps.
@@ -385,9 +461,13 @@ Minimal set of mutually incomparable timestamps.
 - `elements() -> &[T]`
 - `is_empty() -> bool`
 - `len() -> usize`
+- `clear(&mut self)`
 - `insert(element) -> bool`
+- `insert_ref(&mut self, element: &T) -> bool where T: Clone`
 - `less_than(&self, time: &T) -> bool`
 - `less_equal(&self, time: &T) -> bool`
+- `as_option(&self) -> Option<&T>` (`T: TotalOrder`)
+- `into_option(self) -> Option<T>` (`T: TotalOrder`)
 
 ### `MutableAntichain<T>`
 
@@ -398,6 +478,8 @@ Incremental frontier tracker with multiplicity.
 - `frontier_antichain() -> Antichain<T>`
 - `is_empty() -> bool`
 - `clear()`
+- `less_than(&self, time: &T) -> bool`
+- `less_equal(&self, time: &T) -> bool`
 - `update_iter(updates) -> Vec<(T, i64)>`
 - `count_for(&self, time: &T) -> i64`
 
@@ -418,7 +500,12 @@ Progress permits for producing data at a time.
 - `insert(cap)`
 - `delayed(&self, time: &T) -> Result<Capability<T>>`
 - `try_delayed(&self, time: &T) -> Option<Capability<T>>`
-- `downgrade(frontier) -> Result<()>`
+- `downgrade(&mut self, frontier: impl IntoIterator<Item = T>) -> Result<()>`
+- `is_empty(&self) -> bool`
+- `len(&self) -> usize`
+- `frontier(&self) -> Antichain<T>`
+- `iter(&self) -> impl Iterator<Item = &Capability<T>>`
+- `retain<F: FnMut(&Capability<T>) -> bool>(&mut self, f: F)`
 
 See also: [Core Concepts](../guide/core-concepts.md), [Iteration](../guide/iteration.md).
 
@@ -462,7 +549,14 @@ Supporting enums:
 - `MembershipEvent::NodeLeft { node_id, reason }`
 - `NodeDepartureReason::{Graceful, ConnectionLost, Removed}`
 
-`ChannelMembership::new()` provides a simple in-memory implementation for tests and manual control.
+### `ChannelMembership`
+
+Simple in-memory `ClusterMembership` implementation.
+
+- `pub fn new() -> Self`
+- `pub fn sender(&self) -> tokio::sync::mpsc::UnboundedSender<MembershipEvent>`
+- `impl Default`
+- `impl ClusterMembership`
 
 ### `ConnectionManager`
 
@@ -501,7 +595,7 @@ Feature-gated shared-transport manager at `instancy::communication::SharedPeerMa
 Key methods:
 
 - `pub fn new(peer_node_id: String, config: SharedConnectionConfig, connection_factory: Arc<dyn DynConnectionFactory>, runtime_handle: &tokio::runtime::Handle, health_tx: broadcast::Sender<RuntimeEvent>) -> Result<Self>`
-- `pub async fn register_dataflow(&self, dataflow_id: DataflowId, channel_ids: &[u64], channel_capacity: usize) -> (HashMap<u64, Receiver<Vec<u8>>>, Receiver<TransportError>)`
+- `pub async fn register_dataflow(&self, dataflow_id: DataflowId, channel_ids: &[u64], channel_capacity: usize) -> (HashMap<u64, tokio::sync::mpsc::Receiver<Vec<u8>>>, tokio::sync::mpsc::Receiver<TransportError>)`
 - `pub async fn unregister_dataflow(&self, dataflow_id: &DataflowId)`
 - `pub fn peer_node_id(&self) -> &str`
 
@@ -517,6 +611,15 @@ pub trait Codec<T>: Send + Sync {
     fn decode(&self, buf: &[u8]) -> Result<(T, usize), CodecError>;
 }
 ```
+
+Related serialization items:
+
+- `pub const MAX_MESSAGE_SIZE: usize = 256 * 1024 * 1024`
+- `CodecError::{InsufficientData, InvalidData, Custom, CrcMismatch, PayloadTooLarge, External}`
+- `RawBytesCodec`
+- `FixedSizeCodec<T: Copy>`
+- `StringCodec`
+- `#[cfg(feature = "bincode-codec")] BincodeCodec<T>`
 
 ### `ExchangeData`
 
@@ -547,7 +650,9 @@ Key methods:
 - `cancel_with_reason(&self, reason: CancellationReason)`
 - `reason(&self) -> Option<CancellationReason>`
 - `is_cancelled(&self) -> bool`
+- `check(&self) -> Result<()>`
 - `register_wake_handle(&self, wake_handle: WakeHandle)`
+- `async fn cancelled_async(&self)`
 
 ### `CancellationReason`
 
@@ -603,8 +708,8 @@ Helper constructors:
 - `ProgressError::{TimeNotAdvanced, NoDominatingCapability}`
 - `TopologyError::{NodeAlreadyExists, NodeNotFound, EmptyTopology, InvalidNodeConfig}`
 - `DataflowError::{InvalidConfig, InvalidGraph, MissingEndpoint, TypeMismatch, EndpointTaken, MissingFactory}`
-- `RuntimeError::{InvalidConfig, SpawnFailed, ClusterSetup, Handshake, AlreadyConsumed, EmptyDataflow}`
-- `CommunicationError::{Codec, Protocol, InvalidConfig, InvalidSetup}`
+- `RuntimeError::{InvalidConfig, SpawnFailed, ClusterSetup, AlreadyConsumed, EmptyDataflow}` plus `#[cfg(feature = "transport")] Handshake`
+- `CommunicationError::{Codec, InvalidConfig, InvalidSetup}` plus `#[cfg(feature = "transport")] Protocol`
 
 See also: [Error Handling](../guide/error-handling.md).
 
