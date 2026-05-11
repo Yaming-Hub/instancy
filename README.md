@@ -16,6 +16,13 @@ instancy retains the core concepts of timely dataflow — timestamps, frontiers,
 | **Cluster scaling** | Static: all nodes known at startup | Dynamic: nodes join/leave at runtime via `ClusterMembership` |
 | **Testing** | Requires multiple OS processes | Single-process multi-node testing via in-memory transport |
 
+## Documentation
+
+- [User Guide](./docs/guide/README.md)
+- [API Reference](./docs/reference/api.md)
+- [Cookbook](./docs/cookbook.md)
+- [Design Docs](./docs/design/README.md)
+
 ## Quick Start
 
 Add to your `Cargo.toml`:
