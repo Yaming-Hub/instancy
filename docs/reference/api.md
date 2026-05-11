@@ -267,7 +267,7 @@ Key methods:
 - `pub fn catch_panics(&self, enable: bool) -> &Self`
 - `pub fn input<D: Clone + Send + 'static>(&self, name: impl Into<String>) -> Result<Pipe<T, D>>`
 - `pub fn source<D: Clone + Send + 'static>(&self, name: impl Into<String>, data: Vec<(T, Vec<D>)>) -> Pipe<T, D>`
-- `pub fn source_async<D, F, Fut>(&self, name: impl Into<String>, producer: F) -> Pipe<T, D> where D: Clone + Send + 'static, F: FnOnce(AsyncInputSender<T, D>) -> Fut + Send + 'static, Fut: Future<Output = Result<()>> + Send + 'static`
+- `pub fn source_async<D, F, Fut>(&self, name: impl Into<String>, producer: F) -> Pipe<T, D> where D: Clone + Send + 'static, F: FnOnce(AsyncInputSender<T, D>) -> Fut + Clone + Send + 'static, Fut: Future<Output = Result<()>> + Send + 'static`
 - `pub fn operator_count(&self) -> usize`
 - `pub fn name(&self) -> &str`
 - `pub fn build(self) -> Result<LogicalDataflow<T>>`

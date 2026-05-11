@@ -1884,7 +1884,7 @@ factories that route data between workers.
 
 ```
 For each exchange edge:
-    creator(num_source_workers, num_target_workers, capacity)
+    creator(num_source_workers, num_target_workers, capacity, channel_metrics)
     → Vec<ChannelFactory>  (one per worker, sharing internal SPSC channels)
 ```
 
