@@ -803,7 +803,7 @@ Operator full identity: (worker_id, operator_index)
 
 **How instantiation works:**
 
-Each worker runs the graph-building code independently (this is the "single program" in SPMD). Each worker's `.unary(name, logic)` call creates a **new OperatorFactory closure** which, when called at materialization time, produces a new operator with fresh state.
+Each worker runs the graph-building code independently (this is the "single program" in SPMD). Each worker's `.unary(name, logic)` call creates a **new `OperatorFactory`** which, when called at materialization time, produces a new operator with fresh state. The factory closure is `FnMut` and clones the user logic on each `build()` call, giving each worker an independent copy.
 
 ```rust
 // This code runs on EACH worker independently:
@@ -816,8 +816,8 @@ stream.unary("word_count", |input, output| {
 
 **Key properties:**
 
-- The `OperatorFactory` is `FnOnce` — called exactly once by the one worker that created it.
-- There is no single factory called N times; there are N workers each creating their own factory from the same source code.
+- The `OperatorFactory` wraps a `FnMut` closure — it can be called multiple times, cloning captured state on each `build()` to give each worker independent state.
+- In the current model, each worker creates its own factory; in the target model (build-once-materialize-N), a single factory is called N times.
 - For stateful operators, each worker's instance accumulates state only for its own data partition (ensured by `exchange()` routing).
 - Operator state is never shared across workers — no locks, no synchronization needed.
 
@@ -867,7 +867,7 @@ fn plan_node_to_factory(node: &LogicalPlan) -> OperatorFactory {
 
 **Design requirements this imposes on instancy:**
 
-- `OperatorFactory` must remain a simple `Box<dyn FnOnce(ChannelEndpoints) -> Box<dyn SchedulableOperator>>` — no complex trait hierarchies that prevent dynamic dispatch
+- `OperatorFactory` must remain a simple concrete struct wrapping `FnMut(&WorkerContext, ChannelEndpoints) -> Result<Box<dyn SchedulableOperator>>` — no complex trait hierarchies that prevent dynamic dispatch
 - `SchedulableOperator` trait must be implementable by external crates (no sealed traits, no unstable associated types)
 - Channel data type `D` must support `RecordBatch` and similar large columnar types efficiently (zero-copy where possible)
 - The `DataflowGraph` metadata must be constructable programmatically (not only via the `.unary()` / `.binary()` extension traits) so query planners can build graphs from plan trees
