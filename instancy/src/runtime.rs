@@ -1295,13 +1295,12 @@ impl RuntimeHandle {
 
     /// Spawn N replicated workers from the same dataflow builder closure.
     ///
-    /// The `build` closure is called once per worker with a fresh
-    /// [`DataflowBuilder`] and the worker index. Each call must construct an
-    /// identical graph topology — the runtime validates that all replicas have
-    /// matching operator/edge/port structure.
+    /// The `build` closure is called once to construct a single
+    /// [`LogicalDataflow`], which the runtime then materializes independently on
+    /// each worker.
     ///
-    /// **Note:** With per-stage parallelism (the default), the closure may be
-    /// called an additional time internally to probe the stage structure. The
+    /// **Note:** With auto-parallelism or per-stage parallelism, the closure may
+    /// be called an additional time internally to probe the stage structure. The
     /// closure should be free of one-time side effects.
     ///
     /// Returns a [`MultiSpawnedDataflow`] with per-worker input senders and
@@ -1518,7 +1517,7 @@ impl RuntimeHandle {
     #[allow(clippy::too_many_arguments)]
     fn spawn_internal<T: Timestamp>(
         &self,
-        dataflow: LogicalDataflow<T>,
+        mut dataflow: LogicalDataflow<T>,
         mode: ChannelMode,
         priority: u32,
         external_cancel: Option<tokio_util::sync::CancellationToken>,
@@ -1528,7 +1527,7 @@ impl RuntimeHandle {
     ) -> Result<SpawnedDataflow<T>> {
         let dataflow_id = DataflowId::new();
         let (spawned, executor, mut notifier) = self.prepare_worker(
-            dataflow,
+            &mut dataflow,
             mode,
             worker_context,
             progress_channels,
@@ -1587,7 +1586,7 @@ impl RuntimeHandle {
     #[allow(clippy::too_many_arguments)]
     fn prepare_worker<T: Timestamp>(
         &self,
-        mut dataflow: LogicalDataflow<T>,
+        dataflow: &mut LogicalDataflow<T>,
         mode: ChannelMode,
         worker_context: WorkerContext,
         progress_channels: Option<WorkerProgressChannels<T>>,
@@ -1614,6 +1613,7 @@ impl RuntimeHandle {
         let cancel_handle = cancel.clone();
         let external_inputs_open = Arc::new(AtomicUsize::new(0));
         let name = dataflow.name().to_string();
+        let base_factory_count = dataflow.operator_factories.len();
 
         // Use pre-created wake handle if provided (for multi-worker with
         // progress channels that already reference it), otherwise create one.
@@ -1627,22 +1627,15 @@ impl RuntimeHandle {
         let mut input_senders: Vec<(String, &'static str, Box<dyn std::any::Any + Send>)> =
             Vec::new();
         let mut input_count = dataflow.input_port_wiring.len();
-
-        // TODO(multi-worker): Input/output port wiring closures are FnMut (callable
-        // N times) but the Vec is still drain()'d here, consuming ownership. PR 39 will
-        // change to &mut iteration so wiring survives across N worker materializations.
-        // Input wiring will also need fan-out (partition/broadcast) to distribute data
-        // across workers; output wiring will need fan-in to merge worker outputs.
-        for (info, mut wiring) in dataflow
-            .input_ports
+        let input_ports = &dataflow.input_ports;
+        let operator_factories = &mut dataflow.operator_factories;
+        for (info, wiring) in input_ports
             .iter()
-            .zip(dataflow.input_port_wiring.drain(..))
+            .zip(dataflow.input_port_wiring.iter_mut())
         {
             let (factory, sender_any) =
                 wiring(Arc::clone(&external_inputs_open), wake_handle.clone(), mode);
-            dataflow
-                .operator_factories
-                .push((info.operator_index, factory));
+            operator_factories.push((info.operator_index, factory));
             input_senders.push((info.name.clone(), info.type_name, sender_any));
         }
 
@@ -1651,13 +1644,14 @@ impl RuntimeHandle {
         {
             let async_count = dataflow.async_source_wiring.len();
             input_count += async_count;
-            for (op_idx, mut wiring) in dataflow.async_source_wiring.drain(..) {
+            let operator_factories = &mut dataflow.operator_factories;
+            for (op_idx, wiring) in dataflow.async_source_wiring.iter_mut() {
                 let (factory, pump) = wiring(
                     Arc::clone(&external_inputs_open),
                     wake_handle.clone(),
                     cancel.clone(),
                 );
-                dataflow.operator_factories.push((op_idx, factory));
+                operator_factories.push((*op_idx, factory));
                 pump_tasks.push(pump);
             }
         }
@@ -1665,32 +1659,34 @@ impl RuntimeHandle {
         // --- Wire output ports ---
         let mut output_receivers: Vec<(String, &'static str, Box<dyn std::any::Any + Send>)> =
             Vec::new();
-
-        for (info, mut wiring) in dataflow
-            .output_ports
+        let output_ports = &dataflow.output_ports;
+        let operator_factories = &mut dataflow.operator_factories;
+        for (info, wiring) in output_ports
             .iter()
-            .zip(dataflow.output_port_wiring.drain(..))
+            .zip(dataflow.output_port_wiring.iter_mut())
         {
             let (replacement_factory, receiver_any) = wiring(mode, Some(wake_handle.clone()));
-            if let Some(pos) = dataflow
-                .operator_factories
+            if let Some(pos) = operator_factories
                 .iter()
                 .position(|(idx, _)| *idx == info.operator_index)
             {
-                dataflow.operator_factories[pos] = (info.operator_index, replacement_factory);
+                operator_factories[pos] = (info.operator_index, replacement_factory);
             }
             output_receivers.push((info.name.clone(), info.type_name, receiver_any));
         }
 
         // --- Materialize executor (but do NOT register yet) ---
-        let mut executor = materialize_executor(
+        let executor_result = materialize_executor(
             dataflow,
             cancel,
             Some(wake_handle),
             worker_context,
             progress_channels,
             timeline_start_time,
-        )?;
+            None,
+        );
+        dataflow.operator_factories.truncate(base_factory_count);
+        let mut executor = executor_result?;
 
         external_inputs_open.store(input_count, std::sync::atomic::Ordering::SeqCst);
         executor.replace_external_inputs_counter(external_inputs_open);
@@ -1753,41 +1749,30 @@ impl RuntimeHandle {
             )));
         }
 
-        // Phase 1: Build all N dataflows from the closure.
-        let mut dataflows = Vec::with_capacity(num_workers);
-        for worker_idx in 0..num_workers {
-            let mut builder = DataflowBuilder::new(format!("{name}/worker-{worker_idx}"));
-            build(&mut builder)?;
-            let mut df = builder.build()?;
-            df.collect_metrics = metrics_config.operator_summary;
-            df.channel_counters = metrics_config.channel_counters;
-            df.activation_timeline = metrics_config.activation_timeline;
-            df.frontier_timeline = metrics_config.frontier_timeline;
-            df.transfer_timeline = metrics_config.transfer_timeline;
-            df.min_activation_duration = metrics_config.min_activation_duration;
-            df.max_timeline_events = metrics_config.max_timeline_events;
-            df.drain_timeout = drain_timeout;
-            dataflows.push(df);
-        }
+        // Phase 1: Build the logical dataflow once.
+        let mut builder = DataflowBuilder::new(name);
+        build(&mut builder)?;
+        let mut dataflow = builder.build()?;
+        dataflow.collect_metrics = metrics_config.operator_summary;
+        dataflow.channel_counters = metrics_config.channel_counters;
+        dataflow.activation_timeline = metrics_config.activation_timeline;
+        dataflow.frontier_timeline = metrics_config.frontier_timeline;
+        dataflow.transfer_timeline = metrics_config.transfer_timeline;
+        dataflow.min_activation_duration = metrics_config.min_activation_duration;
+        dataflow.max_timeline_events = metrics_config.max_timeline_events;
+        dataflow.drain_timeout = drain_timeout;
 
-        // Phase 2: Validate topologies match across workers.
-        if num_workers > 1 {
-            validate_multi_worker_topologies(&dataflows)?;
-        }
-
-        // Phase 2b: Validate per-stage parallelism compatibility.
+        // Phase 2: Validate per-stage parallelism compatibility.
         // All explicit stage parallelism values must equal num_workers because
-        // per-stage executors are not yet implemented. We validate dataflows[0]
-        // since validate_multi_worker_topologies already ensures all replicas
-        // have identical stage metadata.
-        validate_stage_parallelism(&dataflows[0], num_workers)?;
+        // per-stage executors are not yet implemented.
+        validate_stage_parallelism(&dataflow, num_workers)?;
 
-        // Phase 3: Wire up exchange channels (replace placeholder factories
-        // with shared cross-worker exchange channel factories).
+        // Phase 3: Create per-worker exchange channel factories.
+        let mut worker_exchange_factories: Vec<
+            Vec<(usize, crate::dataflow::schedulable::ChannelFactory)>,
+        > = (0..num_workers).map(|_| Vec::new()).collect();
         if num_workers > 1 {
-            // Take exchange creators from worker 0 (all workers have identical
-            // topology, so worker 0's creators are representative).
-            let creators = std::mem::take(&mut dataflows[0].exchange_creators);
+            let creators = std::mem::take(&mut dataflow.exchange_creators);
             let mut all_channel_collectors = Vec::new();
             for (edge_idx, edge_capacity, mut creator) in creators {
                 let ch_metrics = if metrics_config.channel_counters {
@@ -1800,8 +1785,7 @@ impl RuntimeHandle {
                 } else {
                     None
                 };
-                let shared_factories =
-                    creator(num_workers, num_workers, edge_capacity, ch_metrics);
+                let shared_factories = creator(num_workers, num_workers, edge_capacity, ch_metrics);
                 if shared_factories.len() != num_workers {
                     return Err(Error::Runtime(RuntimeError::InvalidConfig(format!(
                         "exchange factory creator for edge {edge_idx} produced {} factories, expected {num_workers}",
@@ -1809,26 +1793,11 @@ impl RuntimeHandle {
                     ))));
                 }
                 for (worker_idx, factory) in shared_factories.into_iter().enumerate() {
-                    let pos = dataflows[worker_idx]
-                        .channel_factories
-                        .iter()
-                        .position(|(idx, _)| *idx == edge_idx)
-                        .ok_or_else(|| Error::Runtime(RuntimeError::InvalidConfig(format!(
-                            "exchange edge {edge_idx} not found in worker {worker_idx}'s channel factories"
-                        ))))?;
-                    dataflows[worker_idx].channel_factories[pos].1 = factory;
+                    worker_exchange_factories[worker_idx].push((edge_idx, factory));
                 }
             }
-            // Store channel metrics collectors on all worker dataflows so they
-            // can be registered in each worker's DataflowMetrics.
             if !all_channel_collectors.is_empty() {
-                for df in dataflows.iter_mut() {
-                    df.channel_metrics_collectors = all_channel_collectors.clone();
-                }
-            }
-            // Drain unused exchange_creators from other workers.
-            for df in dataflows.iter_mut().skip(1) {
-                df.exchange_creators.clear();
+                dataflow.channel_metrics_collectors = all_channel_collectors;
             }
         }
 
@@ -1892,7 +1861,20 @@ impl RuntimeHandle {
             None
         };
 
-        for (worker_idx, dataflow) in dataflows.into_iter().enumerate() {
+        for worker_idx in 0..num_workers {
+            for (edge_idx, factory) in std::mem::take(&mut worker_exchange_factories[worker_idx]) {
+                let pos = dataflow
+                    .channel_factories
+                    .iter()
+                    .position(|(idx, _)| *idx == edge_idx)
+                    .ok_or_else(|| {
+                        Error::Runtime(RuntimeError::InvalidConfig(format!(
+                            "exchange edge {edge_idx} not found in channel factories"
+                        )))
+                    })?;
+                dataflow.channel_factories[pos].1 = factory;
+            }
+
             let ctx = WorkerContext::new(worker_idx, num_workers)?;
             let pc = if !progress_channels.is_empty() {
                 // Take this worker's progress channels (replace with empty placeholder).
@@ -1909,7 +1891,7 @@ impl RuntimeHandle {
             let wh = wake_handles[worker_idx].clone();
             let ctrl = control_pairs[worker_idx].take();
             match self.prepare_worker(
-                dataflow,
+                &mut dataflow,
                 mode,
                 ctx,
                 pc,
@@ -2236,7 +2218,7 @@ impl RuntimeHandle {
             None
         };
 
-        for (worker_idx, dataflow) in dataflows.into_iter().enumerate() {
+        for (worker_idx, dataflow) in dataflows.iter_mut().enumerate() {
             let ctx = WorkerContext::new(worker_idx, num_workers)?;
             let pc = if !progress_channels.is_empty() {
                 Some(std::mem::replace(
@@ -2718,7 +2700,9 @@ impl RuntimeHandle {
 
         // Take network creators from worker 0 (all workers have identical topology).
         let network_creators = std::mem::take(&mut dataflows[0].exchange_network_creators);
-        let mut all_channel_collectors: Vec<std::sync::Arc<crate::metrics::ChannelMetricsCollector>> = Vec::new();
+        let mut all_channel_collectors: Vec<
+            std::sync::Arc<crate::metrics::ChannelMetricsCollector>,
+        > = Vec::new();
 
         for (edge_order, (edge_idx, edge_capacity, creator)) in
             network_creators.into_iter().enumerate()
@@ -2952,7 +2936,7 @@ impl RuntimeHandle {
             None
         };
 
-        for (local_idx, dataflow) in dataflows.into_iter().enumerate() {
+        for (local_idx, dataflow) in dataflows.iter_mut().enumerate() {
             let global_idx = local_start + local_idx;
             let ctx = WorkerContext::new(global_idx, total_workers)?;
             let pc = progress_channels_iter.next().map(Some).unwrap_or(None);
@@ -3272,11 +3256,13 @@ impl SimpleRuntime {
 
         let wake_handle = WakeHandle::new();
         self.cancel.register_wake_handle(wake_handle.clone());
+        let mut dataflow = dataflow;
         let mut executor = materialize_executor(
-            dataflow,
+            &mut dataflow,
             self.cancel.clone(),
             Some(wake_handle),
             WorkerContext::single(),
+            None,
             None,
             None,
         )?;
@@ -3316,10 +3302,11 @@ impl SimpleRuntime {
         let wake_handle = WakeHandle::new();
         self.cancel.register_wake_handle(wake_handle.clone());
         let mut executor = materialize_executor(
-            dataflow,
+            &mut dataflow,
             self.cancel.clone(),
             Some(wake_handle),
             WorkerContext::single(),
+            None,
             None,
             None,
         )?;
@@ -3447,8 +3434,15 @@ impl SimpleRuntime {
         }
 
         // --- Materialize and run on background thread ---
-        let mut executor =
-            materialize_executor(dataflow, cancel, Some(wake_handle), worker_context, None, None)?;
+        let mut executor = materialize_executor(
+            &mut dataflow,
+            cancel,
+            Some(wake_handle),
+            worker_context,
+            None,
+            None,
+            None,
+        )?;
 
         external_inputs_open.store(input_count, std::sync::atomic::Ordering::SeqCst);
         executor.replace_external_inputs_counter(external_inputs_open);
@@ -4706,11 +4700,7 @@ impl<T: Timestamp> ClusterSpawnedDataflow<T> {
         &self,
         local_idx: usize,
     ) -> Option<&Arc<crate::metrics::DataflowMetrics>> {
-        self.inner
-            .as_ref()?
-            .workers
-            .get(local_idx)?
-            .metrics()
+        self.inner.as_ref()?.workers.get(local_idx)?.metrics()
     }
 
     /// Collect metrics from all local workers.
@@ -5267,12 +5257,13 @@ fn validate_stage_parallelism<T: Timestamp>(
 /// Automatically enables fused activation (topological operator ordering) for
 /// reduced scheduling overhead.
 fn materialize_executor<T: Timestamp>(
-    mut dataflow: LogicalDataflow<T>,
+    dataflow: &mut LogicalDataflow<T>,
     cancel: CancellationToken,
     wake_handle: Option<WakeHandle>,
     worker_context: WorkerContext,
     progress_channels: Option<WorkerProgressChannels<T>>,
     timeline_start_time: Option<std::time::Instant>,
+    progress_reporters: Option<Arc<dyn std::any::Any + Send + Sync>>,
 ) -> Result<DataflowExecutor<T>> {
     let executor_config = ExecutorConfig {
         max_activations_per_step: 1024,
@@ -5282,7 +5273,7 @@ fn materialize_executor<T: Timestamp>(
         collect_metrics: dataflow.collect_metrics,
         channel_counters: dataflow.channel_counters,
         drain_timeout: dataflow.drain_timeout,
-        channel_metrics_collectors: std::mem::take(&mut dataflow.channel_metrics_collectors),
+        channel_metrics_collectors: dataflow.channel_metrics_collectors.clone(),
         activation_timeline: dataflow.activation_timeline,
         frontier_timeline: dataflow.frontier_timeline,
         transfer_timeline: dataflow.transfer_timeline,
@@ -5290,37 +5281,33 @@ fn materialize_executor<T: Timestamp>(
         max_timeline_events: dataflow.max_timeline_events,
         timeline_start_time,
     };
-
-    // Destructure to allow accessing graph after moving factories.
-    let LogicalDataflow {
-        graph,
-        operator_factories,
-        channel_factories,
-        subgraph_builder,
-        probes,
-        probe_notifiers,
-        stages,
-        ..
-    } = dataflow;
+    let worker_subgraph_builder = dataflow.subgraph_builder.clone();
+    let progress_reporters = progress_reporters.or_else(|| {
+        Some(
+            Arc::new(worker_subgraph_builder.materialization_reporters())
+                as Arc<dyn std::any::Any + Send + Sync>,
+        )
+    });
 
     let mut executor: DataflowExecutor<T> = DataflowExecutor::materialize(
-        &graph,
-        operator_factories,
-        channel_factories,
+        &dataflow.graph,
+        &mut dataflow.operator_factories,
+        &mut dataflow.channel_factories,
         executor_config,
         cancel,
         wake_handle,
         worker_context,
+        progress_reporters,
     )?;
 
     // Enable stage-task scheduling if stages were inferred.
     // This groups operators by stage and activates them in fused topological
     // order within each stage task, reducing scheduling overhead.
-    if !stages.is_empty() {
-        executor.enable_stage_tasks(&stages);
+    if !dataflow.stages.is_empty() {
+        executor.enable_stage_tasks(&dataflow.stages);
     } else {
         // Fallback: enable whole-graph fused activation.
-        if let Err(e) = executor.enable_fusion_from_graph(&graph) {
+        if let Err(e) = executor.enable_fusion_from_graph(&dataflow.graph) {
             tracing::debug!("Fused activation disabled: {e}");
         }
     }
@@ -5329,20 +5316,32 @@ fn materialize_executor<T: Timestamp>(
     // For multi-worker dataflows, attach cross-worker progress channels
     // so the tracker broadcasts capability changes to peers and absorbs
     // remote changes. This makes is_completed() reflect global state.
-    let mut tracker = subgraph_builder.build();
+    let mut tracker = worker_subgraph_builder.build();
     if let Some(channels) = progress_channels {
         tracker.set_progress_channels(channels)?;
     }
     tracker.initialize()?;
     executor.set_progress_tracker(tracker);
 
-    // Register probes
+    // Register probes.
+    //
+    // TODO(multi-worker): In build-once-materialize-N, all workers clone the
+    // same ProbeHandle/ProbeNotifier pair, so each worker writes its local
+    // frontier to the same watch channel (last-writer-wins). For correct
+    // multi-worker probes, we need per-worker probe notifiers with a
+    // runtime-level aggregation step that computes the global frontier
+    // (pointwise minimum) before updating the user-visible ProbeHandle.
     debug_assert_eq!(
-        probes.len(),
-        probe_notifiers.len(),
+        dataflow.probes.len(),
+        dataflow.probe_notifiers.len(),
         "probes and probe_notifiers must have matching lengths"
     );
-    for ((op_idx, probe), notifier) in probes.into_iter().zip(probe_notifiers) {
+    for ((op_idx, probe), notifier) in dataflow
+        .probes
+        .iter()
+        .cloned()
+        .zip(dataflow.probe_notifiers.iter().cloned())
+    {
         executor.register_probe(op_idx, probe, notifier);
     }
 
@@ -8550,9 +8549,12 @@ mod tests {
                 for ev in &events {
                     // Each event should have a valid duration and a non-zero start offset
                     // (except possibly the very first activation).
-                    assert!(ev.duration_us > 0 || ev.start_us > 0,
+                    assert!(
+                        ev.duration_us > 0 || ev.start_us > 0,
                         "event should have meaningful timing: start_us={}, duration_us={}",
-                        ev.start_us, ev.duration_us);
+                        ev.start_us,
+                        ev.duration_us
+                    );
                     assert!(ev.worker_index < 2, "worker_index out of range");
                 }
             }

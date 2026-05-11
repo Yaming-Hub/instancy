@@ -54,6 +54,7 @@ pub struct ProbeHandle<T: Timestamp> {
 ///
 /// When this is dropped (e.g., the executor shuts down), all async waiters
 /// will receive a channel-closed error and can detect termination.
+#[derive(Clone)]
 pub(crate) struct ProbeNotifier<T: Timestamp> {
     watch_tx: tokio::sync::watch::Sender<Antichain<T>>,
 }

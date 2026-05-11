@@ -118,6 +118,24 @@ impl<T: Timestamp> SubgraphBuilder<T> {
         }
     }
 
+    /// Returns clones of the per-output progress reporters keyed by
+    /// `(operator_index, output_port)` for materialization-time wiring.
+    pub(crate) fn materialization_reporters(
+        &self,
+    ) -> HashMap<(usize, usize), crate::progress::operate::ProgressReporter<T>> {
+        self.progress_buffers
+            .iter()
+            .flat_map(|(op_idx, progress)| {
+                progress
+                    .internal
+                    .iter()
+                    .cloned()
+                    .enumerate()
+                    .map(move |(output, reporter)| ((*op_idx, output), reporter))
+            })
+            .collect()
+    }
+
     /// Registers an operator with its static shape and connectivity.
     ///
     /// Creates shared [`OperatorProgress`] buffers for the operator.
