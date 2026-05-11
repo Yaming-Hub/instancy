@@ -11,7 +11,7 @@
 //! dataflow materialization and owned by the [`DataflowExecutor`](super::executor::DataflowExecutor).
 
 use crate::dataflow::stage::StageId;
-use crate::error::{Result, RuntimeError};
+use crate::error::Result;
 use crate::worker::WorkerContext;
 
 // ---------------------------------------------------------------------------
@@ -127,10 +127,6 @@ pub trait SchedulableOperator: Send {
 /// multi-worker dataflows, `build()` is called N times (once per worker),
 /// each time with fresh channel endpoints. Implementations must produce
 /// independent operator instances on each call.
-///
-/// Use [`SingleUseFactory`] for closures that can only be invoked once
-/// (backward-compatible with existing `FnOnce` factories). Use
-/// [`ReplayableFactory`] for multi-worker-capable factories.
 pub trait OperatorBlueprint: Send {
     /// Create a wired operator instance for the given worker.
     ///
@@ -140,44 +136,24 @@ pub trait OperatorBlueprint: Send {
     ///
     /// # Errors
     ///
-    /// Returns an error if the factory has been exhausted (single-use called
-    /// twice) or if operator construction fails.
+    /// Returns an error if operator construction fails, or if a one-shot
+    /// resource captured by the factory has already been consumed.
     fn build(
         &mut self,
         ctx: &WorkerContext,
         endpoints: ChannelEndpoints,
     ) -> crate::Result<Box<dyn SchedulableOperator>>;
-
-    /// Whether this blueprint can produce multiple operator instances.
-    ///
-    /// Returns `false` for single-use factories (will return `Err` on second `build()`).
-    /// Returns `true` for replayable factories.
-    ///
-    /// Currently unused — will be checked in the multi-worker materialization path
-    /// (PR 39) to validate all factories before attempting N materializations.
-    fn is_replayable(&self) -> bool;
 }
 
 /// Type alias for a boxed operator blueprint.
 pub type OperatorFactory = Box<dyn OperatorBlueprint>;
 
-/// Create an [`OperatorFactory`] from a single-use `FnOnce` closure.
-///
-/// This is the primary way to create operator factories in builder methods.
-/// The resulting factory can be called exactly once during materialization;
-/// a second call returns an error.
-pub fn single_use_factory(
-    f: impl FnOnce(&WorkerContext, ChannelEndpoints) -> crate::Result<Box<dyn SchedulableOperator>>
-    + Send
-    + 'static,
-) -> OperatorFactory {
-    Box::new(SingleUseFactory(Some(Box::new(f))))
-}
-
-/// Create an [`OperatorFactory`] from a replayable `FnMut` closure.
+/// Create an [`OperatorFactory`] from a `FnMut` closure.
 ///
 /// The resulting factory can be called multiple times during materialization,
-/// producing a fresh operator instance on each call.
+/// producing a fresh operator instance on each call. For factories that
+/// capture one-shot resources (e.g., channel endpoints), wrap the resource
+/// in `Option` and use `take()` inside the closure.
 pub fn replayable_factory(
     f: impl FnMut(&WorkerContext, ChannelEndpoints) -> crate::Result<Box<dyn SchedulableOperator>>
     + Send
@@ -186,65 +162,11 @@ pub fn replayable_factory(
     Box::new(ReplayableFactory::new(f))
 }
 
-/// A single-use operator factory wrapping a `FnOnce` closure.
+/// An operator factory that wraps a `FnMut` closure.
 ///
-/// This is the default for all current builder methods. It can produce
-/// exactly one operator instance. Calling `build()` a second time returns
-/// an error.
-pub struct SingleUseFactory(
-    Option<
-        Box<
-            dyn FnOnce(
-                    &WorkerContext,
-                    ChannelEndpoints,
-                ) -> crate::Result<Box<dyn SchedulableOperator>>
-                + Send,
-        >,
-    >,
-);
-
-impl SingleUseFactory {
-    /// Create a new single-use factory from a `FnOnce` closure.
-    pub fn new(
-        factory: impl FnOnce(
-            &WorkerContext,
-            ChannelEndpoints,
-        ) -> crate::Result<Box<dyn SchedulableOperator>>
-        + Send
-        + 'static,
-    ) -> Self {
-        Self(Some(Box::new(factory)))
-    }
-
-    /// Box this factory as an [`OperatorFactory`].
-    pub fn boxed(self) -> OperatorFactory {
-        Box::new(self)
-    }
-}
-
-impl OperatorBlueprint for SingleUseFactory {
-    fn build(
-        &mut self,
-        ctx: &WorkerContext,
-        endpoints: ChannelEndpoints,
-    ) -> crate::Result<Box<dyn SchedulableOperator>> {
-        let factory = self.0.take().ok_or_else(|| {
-            crate::Error::Runtime(RuntimeError::AlreadyConsumed {
-                resource: "SingleUseFactory".into(),
-            })
-        })?;
-        factory(ctx, endpoints)
-    }
-
-    fn is_replayable(&self) -> bool {
-        false
-    }
-}
-
-/// A replayable operator factory that can produce multiple independent instances.
-///
-/// Wraps a `FnMut` that creates a fresh operator on each `build()` call.
-/// Used for multi-worker dataflows where each worker needs its own operator.
+/// Produces a fresh operator on each `build()` call. Used for all operator
+/// factories — user closures are cloned per `build()` to give each worker
+/// independent state.
 ///
 /// # Example
 ///
@@ -288,10 +210,6 @@ impl OperatorBlueprint for ReplayableFactory {
         endpoints: ChannelEndpoints,
     ) -> crate::Result<Box<dyn SchedulableOperator>> {
         (self.0)(ctx, endpoints)
-    }
-
-    fn is_replayable(&self) -> bool {
-        true
     }
 }
 

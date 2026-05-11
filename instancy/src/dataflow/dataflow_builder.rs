@@ -48,7 +48,7 @@ use crate::dataflow::operators::output::OutputEvent;
 use crate::dataflow::probe::ProbeHandle;
 use crate::dataflow::schedulable::{
     ChannelEndpoints, ChannelFactory, OperatorFactory, SchedulableOperator, channel_factory,
-    replayable_factory, single_use_factory,
+    replayable_factory,
 };
 use crate::dataflow::stage::StageId;
 use crate::dataflow::stream::Slot;
@@ -477,8 +477,14 @@ impl<T: Timestamp> DataflowBuilder<T> {
                             let ext_counter = Arc::clone(&external_inputs_open);
                             let factory_name = wiring_name.clone();
                             let reporter = source_reporter.clone();
+                            let mut rx = Some(rx);
                             let factory: OperatorFactory =
-                                single_use_factory(move |_ctx, endpoints| {
+                                replayable_factory(move |_ctx, endpoints| {
+                                    let rx = rx.take().ok_or_else(|| {
+                                        Error::Runtime(crate::error::RuntimeError::AlreadyConsumed {
+                                            resource: "input port channel (sync)".into(),
+                                        })
+                                    })?;
                                     let output_pusher: Box<dyn Push<T, D>> = {
                                         let pushers: Vec<Box<dyn Push<T, D>>> = endpoints
                                             .output_pushers
@@ -501,13 +507,13 @@ impl<T: Timestamp> DataflowBuilder<T> {
                                             .unwrap_or_else(|| Box::new(NullPush))
                                     };
                                     let op = ChannelSourceOperator::new(
-                                        factory_name,
+                                        factory_name.clone(),
                                         op_idx,
                                         StageId::new(0),
                                         InputRecv::Std(rx),
                                         output_pusher,
-                                        Some(reporter),
-                                        ext_counter,
+                                        Some(reporter.clone()),
+                                        ext_counter.clone(),
                                     );
                                     Ok(Box::new(op) as Box<dyn SchedulableOperator>)
                                 });
@@ -524,8 +530,14 @@ impl<T: Timestamp> DataflowBuilder<T> {
                             let ext_counter = Arc::clone(&external_inputs_open);
                             let factory_name = wiring_name.clone();
                             let reporter = source_reporter.clone();
+                            let mut rx = Some(rx);
                             let factory: OperatorFactory =
-                                single_use_factory(move |_ctx, endpoints| {
+                                replayable_factory(move |_ctx, endpoints| {
+                                    let rx = rx.take().ok_or_else(|| {
+                                        Error::Runtime(crate::error::RuntimeError::AlreadyConsumed {
+                                            resource: "input port channel (async)".into(),
+                                        })
+                                    })?;
                                     let output_pusher: Box<dyn Push<T, D>> = {
                                         let pushers: Vec<Box<dyn Push<T, D>>> = endpoints
                                             .output_pushers
@@ -548,13 +560,13 @@ impl<T: Timestamp> DataflowBuilder<T> {
                                             .unwrap_or_else(|| Box::new(NullPush))
                                     };
                                     let op = ChannelSourceOperator::new(
-                                        factory_name,
+                                        factory_name.clone(),
                                         op_idx,
                                         StageId::new(0),
                                         InputRecv::Tokio(rx),
                                         output_pusher,
-                                        Some(reporter),
-                                        ext_counter,
+                                        Some(reporter.clone()),
+                                        ext_counter.clone(),
                                     );
                                     Ok(Box::new(op) as Box<dyn SchedulableOperator>)
                                 });
@@ -772,7 +784,13 @@ impl<T: Timestamp> DataflowBuilder<T> {
                     let ext_counter = std::sync::Arc::clone(&external_inputs_open);
                     let factory_name = wiring_name.clone();
                     let reporter = source_reporter.clone();
-                    let factory: OperatorFactory = single_use_factory(move |_ctx, endpoints| {
+                    let mut rx = Some(rx);
+                    let factory: OperatorFactory = replayable_factory(move |_ctx, endpoints| {
+                        let rx = rx.take().ok_or_else(|| {
+                            Error::Runtime(crate::error::RuntimeError::AlreadyConsumed {
+                                resource: "async source channel".into(),
+                            })
+                        })?;
                         let output_pusher: Box<dyn Push<T, D>> = {
                             let pushers: Vec<Box<dyn Push<T, D>>> = endpoints
                                 .output_pushers
@@ -792,13 +810,13 @@ impl<T: Timestamp> DataflowBuilder<T> {
                             tee_or_single(pushers)?.unwrap_or_else(|| Box::new(NullPush))
                         };
                         let op = ChannelSourceOperator::new(
-                            factory_name,
+                            factory_name.clone(),
                             op_idx,
                             StageId::new(0),
                             InputRecv::Tokio(rx),
                             output_pusher,
-                            Some(reporter),
-                            ext_counter,
+                            Some(reporter.clone()),
+                            ext_counter.clone(),
                         );
                         Ok(Box::new(op) as Box<dyn SchedulableOperator>)
                     });
@@ -3002,8 +3020,14 @@ impl<T: Timestamp, D: Clone + Send + 'static> Pipe<T, D> {
                         let receiver = OutputReceiver::new(rx);
 
                         let sink_name_inner = sink_name.clone();
+                        let mut tx = Some(tx);
                         let factory: OperatorFactory =
-                            single_use_factory(move |_ctx, endpoints: ChannelEndpoints| {
+                            replayable_factory(move |_ctx, endpoints: ChannelEndpoints| {
+                                let tx = tx.take().ok_or_else(|| {
+                                    Error::Runtime(crate::error::RuntimeError::AlreadyConsumed {
+                                        resource: "output port channel (sync)".into(),
+                                    })
+                                })?;
                                 let input_puller: Box<dyn Pull<T, D>> = *endpoints
                                     .input_pullers
                                     .into_iter()
@@ -3023,7 +3047,7 @@ impl<T: Timestamp, D: Clone + Send + 'static> Pipe<T, D> {
                                     })?;
 
                                 Ok(Box::new(ChannelSinkOperator::new(
-                                    sink_name_inner,
+                                    sink_name_inner.clone(),
                                     op_idx,
                                     StageId::new(0),
                                     input_puller,
@@ -3046,8 +3070,14 @@ impl<T: Timestamp, D: Clone + Send + 'static> Pipe<T, D> {
                         };
 
                         let sink_name_inner = sink_name.clone();
+                        let mut tx = Some(tx);
                         let factory: OperatorFactory =
-                            single_use_factory(move |_ctx, endpoints: ChannelEndpoints| {
+                            replayable_factory(move |_ctx, endpoints: ChannelEndpoints| {
+                                let tx = tx.take().ok_or_else(|| {
+                                    Error::Runtime(crate::error::RuntimeError::AlreadyConsumed {
+                                        resource: "output port channel (async)".into(),
+                                    })
+                                })?;
                                 let input_puller: Box<dyn Pull<T, D>> = *endpoints
                                     .input_pullers
                                     .into_iter()
@@ -3067,7 +3097,7 @@ impl<T: Timestamp, D: Clone + Send + 'static> Pipe<T, D> {
                                     })?;
 
                                 Ok(Box::new(ChannelSinkOperator::new(
-                                    sink_name_inner,
+                                    sink_name_inner.clone(),
                                     op_idx,
                                     StageId::new(0),
                                     input_puller,
