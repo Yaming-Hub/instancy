@@ -460,7 +460,7 @@ mod tests {
     fn scope_addr_root() {
         let addr = ScopeAddr::root();
         assert_eq!(addr.depth(), 0);
-        assert_eq!(addr.parts(), &[]);
+        assert_eq!(addr.parts(), &[] as &[usize]);
         assert_eq!(format!("{}", addr), "[]");
     }
 

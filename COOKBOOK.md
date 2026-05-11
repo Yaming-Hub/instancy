@@ -510,6 +510,18 @@ for ch in metrics.channel_snapshots() {
 println!("Total items across all edges: {}", metrics.total_items_transferred());
 ```
 
+### Export Chrome Trace for Perfetto UI
+Save collected metrics as Chrome Trace JSON for visual timeline analysis.
+Requires the `chrome-trace` feature flag.
+
+```rust
+// After dataflow completes, export from any worker's metrics:
+let metrics = handle.metrics(0).unwrap();
+let exporter = metrics.drain_to_chrome_trace("my-dataflow");
+exporter.save("trace.json").unwrap();
+// Drag trace.json onto https://ui.perfetto.dev/ to visualize.
+```
+
 ## 7. Timing & Delay
 
 ### Shift all data forward by a fixed number of epochs

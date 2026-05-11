@@ -1669,6 +1669,56 @@ if let Some(metrics) = handle.metrics() {
 The timeline data is designed for export to Chrome Trace JSON format (Phase 3),
 enabling post-execution visualization in Perfetto UI or Chrome's `chrome://tracing`.
 
+#### Chrome Trace Export (feature: `chrome-trace`)
+
+The `chrome-trace` feature adds `ChromeTraceExporter` for converting collected
+metrics into the [Chrome Trace Event Format](https://docs.google.com/document/d/1CvAClvFfyA5R-PhYUmn5OOQtYMH4h6I0nSsKchNAySU)
+which can be opened in [Perfetto UI](https://ui.perfetto.dev/) or Chrome's
+`chrome://tracing`.
+
+```toml
+[dependencies]
+instancy = { version = "0.1", features = ["chrome-trace"] }
+```
+
+**Convenience method** on `DataflowMetrics`:
+
+```rust
+// After dataflow completes:
+let metrics = handle.metrics(0).unwrap();
+let exporter = metrics.drain_to_chrome_trace("my-dataflow");
+exporter.save("trace.json").unwrap();
+// Open trace.json in https://ui.perfetto.dev/
+```
+
+**Manual builder** for fine-grained control:
+
+```rust
+use instancy::metrics::chrome_trace::ChromeTraceExporter;
+
+let events = metrics.drain_timeline_events();
+let operators: Vec<_> = metrics.operator_snapshots()
+    .into_iter()
+    .map(|op| (op.index, op.name.clone()))
+    .collect();
+let channels = metrics.channel_snapshots();
+
+let exporter = ChromeTraceExporter::new("my-dataflow")
+    .with_activations(&events, &operators)
+    .with_channels(&channels)
+    .with_metadata(num_workers);
+exporter.save("trace.json").unwrap();
+```
+
+**Mapping to Chrome Trace events:**
+
+| Instancy Concept | Chrome Trace Event | Field Mapping |
+|---|---|---|
+| Activation event | `"X"` (complete) | `ts=start_us`, `dur=duration_us`, `tid=worker_index` |
+| Channel metrics | `"i"` (instant) | Summary of items/bytes transferred at `ts=0` |
+| Dataflow name | `"M"` (metadata) | `process_name` on `pid=0` |
+| Worker index | `"M"` (metadata) | `thread_name` "worker-N" on `tid=N` |
+
 ### 5.8 Message Envelope
 
 Messages flowing through the dataflow carry data, control signals, and optional user-defined metadata in a unified envelope:
