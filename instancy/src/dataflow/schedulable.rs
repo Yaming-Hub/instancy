@@ -174,6 +174,18 @@ pub fn single_use_factory(
     Box::new(SingleUseFactory(Some(Box::new(f))))
 }
 
+/// Create an [`OperatorFactory`] from a replayable `FnMut` closure.
+///
+/// The resulting factory can be called multiple times during materialization,
+/// producing a fresh operator instance on each call.
+pub fn replayable_factory(
+    f: impl FnMut(&WorkerContext, ChannelEndpoints) -> crate::Result<Box<dyn SchedulableOperator>>
+    + Send
+    + 'static,
+) -> OperatorFactory {
+    Box::new(ReplayableFactory::new(f))
+}
+
 /// A single-use operator factory wrapping a `FnOnce` closure.
 ///
 /// This is the default for all current builder methods. It can produce

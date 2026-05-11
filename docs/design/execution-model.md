@@ -1828,6 +1828,139 @@ empty progress messages.
 - Updated spawn_multi/MultiSpawnedDataflow docs
 - Updated GUIDE.md, examples, validation tests (PR #198)
 
+## 5.11 Multi-Worker Dataflow Lifecycle
+
+A multi-worker dataflow goes through distinct phases. Understanding this
+lifecycle is important for reasoning about operator state, cloning, and
+when exchange channels become active.
+
+### Phase 1: Build (single thread)
+
+The user's build closure is called once to construct the logical dataflow
+graph. All operators, channels, and exchange boundaries are registered.
+
+```
+build(&mut builder) → LogicalDataflow
+  ├── Operators registered (factories stored, not yet instantiated)
+  ├── Channels registered (factories stored, not yet created)
+  ├── Exchange boundaries identified (creators stored)
+  └── Subgraph topology recorded (for progress tracking)
+```
+
+The result is a single `LogicalDataflow` — a blueprint that describes the
+graph structure and contains replayable factories for all operators and
+channels.
+
+### Phase 2: Materialize (single thread, sequential)
+
+The runtime materializes the logical dataflow N times (once per worker).
+Each materialization clones operator factories to produce independent
+operator instances with their own state.
+
+```
+for worker_idx in 0..N:
+    factory.build(worker_ctx)
+    ├── logic.clone()           ← fresh copy of user's closure
+    ├── create channels         ← new push/pull endpoints
+    ├── wire operator           ← operator owns cloned logic + endpoints
+    └── build progress tracker  ← from cloned SubgraphBuilder
+```
+
+**Key invariant:** All cloning happens here, sequentially, on a single
+thread. No concurrency concerns during materialization.
+
+### Phase 3: Wire exchange channels (single thread)
+
+Exchange channels connect workers across stage boundaries. The runtime
+replaces placeholder channel factories with shared cross-worker exchange
+factories that route data between workers.
+
+```
+For each exchange edge:
+    creator(num_source_workers, num_target_workers, capacity)
+    → Vec<ChannelFactory>  (one per worker, sharing internal SPSC channels)
+```
+
+Progress channels and control broadcast channels are also created here.
+
+### Phase 4: Register and start (transition to concurrent)
+
+All materialized workers are registered with the executor. Only after ALL
+workers are registered does execution begin — this ensures every worker's
+progress channels contain the full set of initial capability broadcasts
+from all peers.
+
+```
+── nothing executes until here ──
+
+register(worker_0)   ← enqueued, not yet polled
+register(worker_1)
+register(worker_2)
+register(worker_N-1)
+
+── executor starts polling all workers ──
+```
+
+### Phase 5: Execution (concurrent)
+
+Workers run concurrently on the async worker thread pool. Each worker:
+- Pulls data from its input channels
+- Executes operator logic (using its own cloned closure)
+- Pushes results to output channels (or exchange channels)
+- Reports progress to peer workers
+
+Workers are fully independent — no shared mutable state between operator
+instances across workers (unless the user explicitly uses `Arc<Mutex<...>>`).
+
+### Operator Factory Model
+
+Operator factories must be **replayable** for multi-worker materialization.
+Each factory is `FnMut` and clones the user's logic on every `build()` call:
+
+```rust
+// User provides: F: FnMut + Clone + Send + 'static
+// Factory wraps it as:
+replayable_factory(move |_ctx, endpoints| {
+    let mut logic = user_logic.clone();  // independent copy per worker
+    // ... wire endpoints ...
+    Ok(Box::new(Operator::new(logic, puller, pusher)))
+})
+```
+
+This requires user closures to implement `Clone`. In practice, closures
+auto-implement `Clone` when all captured variables are `Clone` (primitives,
+`String`, `Vec`, `Arc`, etc.). For non-Clone captures, wrap in `Arc`.
+
+### Current vs Future Worker Model
+
+**Current: Full-graph replication.** Each worker contains ALL operators from
+ALL stages. Exchange channels route data to the correct workers per stage.
+Workers with no data for a stage simply idle for that stage.
+
+```
+spawn_multi("pipeline", 4, |builder| {
+    input.exchange_to("scatter", 4, hash)  // Stage 0→1 boundary
+         .map("process", |t, x| ...)      // Stage 1 (par=4)
+         .gather("collect")               // Stage 1→2 boundary
+         .for_each("sink", |t, x| ...);   // Stage 2 (par=1)
+});
+
+Worker 0: [input ops] → exchange → [process] → gather → [sink]
+Worker 1: [input ops] → exchange → [process] → gather → [sink]
+Worker 2: [input ops] → exchange → [process] → gather → [sink]
+Worker 3: [input ops] → exchange → [process] → gather → [sink]
+
+Data routing:
+  Stage 0: only Worker 0 receives external input
+  Stage 1: exchange distributes to all 4 workers
+  Stage 2: gather funnels to Worker 0 only; Workers 1-3 idle
+```
+
+**Future: Per-stage materialization.** Each worker would only contain
+operators for the stages it participates in. This reduces memory and avoids
+idle operators, but requires a more complex materialization model where
+the runtime selectively instantiates subsets of the graph per worker.
+
 ## Open Questions
 
 1. **Loops/iteration**: All operators within `scope.iterative()` must be in the same stage (no repartition inside loops for v1).

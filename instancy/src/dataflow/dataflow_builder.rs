@@ -48,7 +48,7 @@ use crate::dataflow::operators::output::OutputEvent;
 use crate::dataflow::probe::ProbeHandle;
 use crate::dataflow::schedulable::{
     ChannelEndpoints, ChannelFactory, OperatorFactory, SchedulableOperator, channel_factory,
-    single_use_factory,
+    replayable_factory, single_use_factory,
 };
 use crate::dataflow::stage::StageId;
 use crate::dataflow::stream::Slot;
@@ -634,7 +634,10 @@ impl<T: Timestamp> DataflowBuilder<T> {
             // cloned), wraps all pushers in a TeePush adapter.
             let name_clone = name.clone();
             let factory: OperatorFactory =
-                single_use_factory(move |_ctx, endpoints: ChannelEndpoints| {
+                replayable_factory(move |_ctx, endpoints: ChannelEndpoints| {
+                    let name = name_clone.clone();
+                    let data = data.clone();
+                    let reporter = reporter.clone();
                     let output_pusher: Box<dyn Push<T, D>> = {
                         let pushers: Vec<Box<dyn Push<T, D>>> = endpoints
                             .output_pushers
@@ -655,7 +658,7 @@ impl<T: Timestamp> DataflowBuilder<T> {
                     };
 
                     Ok(Box::new(WiredSourceOperator::with_progress(
-                        name_clone,
+                        name,
                         op_idx,
                         stage_id,
                         data,
@@ -1091,7 +1094,7 @@ impl<T: Timestamp, D: Clone + Send + 'static> Pipe<T, D> {
     pub fn map<D2, F>(mut self, name: impl Into<String>, mut logic: F) -> Pipe<T, D2>
     where
         D2: Clone + Send + 'static,
-        F: FnMut(&T, D) -> D2 + Send + 'static,
+        F: FnMut(&T, D) -> D2 + Clone + Send + 'static,
     {
         let capacity = self.resolve_capacity();
         self.add_unary_internal(name, capacity, move |time, batch| {
@@ -1107,7 +1110,7 @@ impl<T: Timestamp, D: Clone + Send + 'static> Pipe<T, D> {
     /// ```
     pub fn filter<F>(mut self, name: impl Into<String>, mut predicate: F) -> Pipe<T, D>
     where
-        F: FnMut(&T, &D) -> bool + Send + 'static,
+        F: FnMut(&T, &D) -> bool + Clone + Send + 'static,
     {
         let capacity = self.resolve_capacity();
         self.add_unary_internal(name, capacity, move |time, batch| {
@@ -1136,7 +1139,7 @@ impl<T: Timestamp, D: Clone + Send + 'static> Pipe<T, D> {
     /// ```
     pub fn branch<F>(self, name: impl Into<String>, predicate: F) -> (Pipe<T, D>, Pipe<T, D>)
     where
-        F: FnMut(&T, &D) -> bool + Send + 'static,
+        F: FnMut(&T, &D) -> bool + Clone + Send + 'static,
     {
         let name = name.into();
         let true_name = format!("{name}::true");
@@ -1189,7 +1192,7 @@ impl<T: Timestamp, D: Clone + Send + 'static> Pipe<T, D> {
     /// ```
     pub fn inspect<F>(mut self, name: impl Into<String>, mut logic: F) -> Pipe<T, D>
     where
-        F: FnMut(&T, &D) + Send + 'static,
+        F: FnMut(&T, &D) + Clone + Send + 'static,
     {
         let capacity = self.resolve_capacity();
         self.add_unary_internal(name, capacity, move |time, batch| {
@@ -1214,7 +1217,7 @@ impl<T: Timestamp, D: Clone + Send + 'static> Pipe<T, D> {
     /// ```
     pub fn inspect_batch<F>(mut self, name: impl Into<String>, mut logic: F) -> Pipe<T, D>
     where
-        F: FnMut(&T, &[D]) + Send + 'static,
+        F: FnMut(&T, &[D]) + Clone + Send + 'static,
     {
         let capacity = self.resolve_capacity();
         self.add_unary_internal(name, capacity, move |time, batch| {
@@ -1248,7 +1251,7 @@ impl<T: Timestamp, D: Clone + Send + 'static> Pipe<T, D> {
     /// ```
     pub fn for_each<F>(self, name: impl Into<String>, mut logic: F)
     where
-        F: FnMut(&T, &D) + Send + 'static,
+        F: FnMut(&T, &D) + Clone + Send + 'static,
     {
         self.for_each_sink(name, move |time: &T, batch: &[D]| {
             for item in batch {
@@ -1272,7 +1275,7 @@ impl<T: Timestamp, D: Clone + Send + 'static> Pipe<T, D> {
     /// ```
     pub fn for_each_batch<F>(self, name: impl Into<String>, logic: F)
     where
-        F: FnMut(&T, &[D]) + Send + 'static,
+        F: FnMut(&T, &[D]) + Clone + Send + 'static,
     {
         self.for_each_sink(name, logic);
     }
@@ -1280,7 +1283,7 @@ impl<T: Timestamp, D: Clone + Send + 'static> Pipe<T, D> {
     /// Internal: register a terminal sink operator that invokes a batch closure.
     fn for_each_sink<F>(self, name: impl Into<String>, logic: F)
     where
-        F: FnMut(&T, &[D]) + Send + 'static,
+        F: FnMut(&T, &[D]) + Clone + Send + 'static,
     {
         let name = name.into();
         let capacity = self.capacity_override.unwrap_or(1024);
@@ -1322,7 +1325,9 @@ impl<T: Timestamp, D: Clone + Send + 'static> Pipe<T, D> {
         // Operator factory
         let name_clone = name.clone();
         let factory: OperatorFactory =
-            single_use_factory(move |_ctx, endpoints: ChannelEndpoints| {
+            replayable_factory(move |_ctx, endpoints: ChannelEndpoints| {
+                let name = name_clone.clone();
+                let logic = logic.clone();
                 let input_puller: Box<dyn Pull<T, D>> = *endpoints
                     .input_pullers
                     .into_iter()
@@ -1342,7 +1347,7 @@ impl<T: Timestamp, D: Clone + Send + 'static> Pipe<T, D> {
                     })?;
 
                 Ok(Box::new(ForEachSink::new(
-                    name_clone,
+                    name,
                     op_idx,
                     stage_id,
                     input_puller,
@@ -1389,7 +1394,7 @@ impl<T: Timestamp, D: Clone + Send + 'static> Pipe<T, D> {
     /// ```
     pub fn reduce<F>(mut self, name: impl Into<String>, mut reducer: F) -> Pipe<T, D>
     where
-        F: FnMut(D, D) -> D + Send + 'static,
+        F: FnMut(D, D) -> D + Clone + Send + 'static,
     {
         let capacity = self.resolve_capacity();
         let mut stash: std::collections::BTreeMap<T, Vec<D>> = std::collections::BTreeMap::new();
@@ -1428,7 +1433,7 @@ impl<T: Timestamp, D: Clone + Send + 'static> Pipe<T, D> {
     pub fn fold<D2, F>(mut self, name: impl Into<String>, init: D2, mut folder: F) -> Pipe<T, D2>
     where
         D2: Clone + Send + 'static,
-        F: FnMut(D2, D) -> D2 + Send + 'static,
+        F: FnMut(D2, D) -> D2 + Clone + Send + 'static,
     {
         let capacity = self.resolve_capacity();
         let mut stash: std::collections::BTreeMap<T, Vec<D>> = std::collections::BTreeMap::new();
@@ -1527,7 +1532,7 @@ impl<T: Timestamp, D: Clone + Send + 'static> Pipe<T, D> {
     /// ```
     pub fn delay<F>(mut self, name: impl Into<String>, delay_fn: F) -> Pipe<T, D>
     where
-        F: Fn(&T, &D) -> T + Send + 'static,
+        F: Fn(&T, &D) -> T + Clone + Send + 'static,
     {
         let capacity = self.resolve_capacity();
         let mut stash: std::collections::BTreeMap<T, Vec<D>> = std::collections::BTreeMap::new();
@@ -1575,7 +1580,7 @@ impl<T: Timestamp, D: Clone + Send + 'static> Pipe<T, D> {
     /// ```
     pub fn delay_batch<F>(mut self, name: impl Into<String>, delay_fn: F) -> Pipe<T, D>
     where
-        F: Fn(&T) -> T + Send + 'static,
+        F: Fn(&T) -> T + Clone + Send + 'static,
     {
         let capacity = self.resolve_capacity();
         let mut stash: std::collections::BTreeMap<T, Vec<D>> = std::collections::BTreeMap::new();
@@ -1643,7 +1648,7 @@ impl<T: Timestamp, D: Clone + Send + 'static> Pipe<T, D> {
     /// ```
     pub fn take_while<F>(mut self, name: impl Into<String>, mut predicate: F) -> Pipe<T, D>
     where
-        F: FnMut(&T, &D) -> bool + Send + 'static,
+        F: FnMut(&T, &D) -> bool + Clone + Send + 'static,
     {
         let capacity = self.resolve_capacity();
         let mut stopped = false;
@@ -1675,7 +1680,7 @@ impl<T: Timestamp, D: Clone + Send + 'static> Pipe<T, D> {
     pub fn flat_map<D2, F>(mut self, name: impl Into<String>, mut logic: F) -> Pipe<T, D2>
     where
         D2: Clone + Send + 'static,
-        F: FnMut(&T, D) -> Vec<D2> + Send + 'static,
+        F: FnMut(&T, D) -> Vec<D2> + Clone + Send + 'static,
     {
         let capacity = self.resolve_capacity();
         self.add_unary_internal(name, capacity, move |time, batch| {
@@ -1701,7 +1706,7 @@ impl<T: Timestamp, D: Clone + Send + 'static> Pipe<T, D> {
     pub fn map_batch<D2, F>(mut self, name: impl Into<String>, mut logic: F) -> Pipe<T, D2>
     where
         D2: Clone + Send + 'static,
-        F: FnMut(&T, Vec<D>) -> Vec<D2> + Send + 'static,
+        F: FnMut(&T, Vec<D>) -> Vec<D2> + Clone + Send + 'static,
     {
         let capacity = self.resolve_capacity();
         self.add_unary_internal(name, capacity, move |time, batch| logic(&time, batch))
@@ -1726,7 +1731,7 @@ impl<T: Timestamp, D: Clone + Send + 'static> Pipe<T, D> {
     pub fn unary<D2, L>(mut self, name: impl Into<String>, logic: L) -> Pipe<T, D2>
     where
         D2: Clone + Send + 'static,
-        L: FnMut(&mut InputHandle<T, D>, &mut OutputHandle<T, D2>) -> Result<()> + Send + 'static,
+        L: FnMut(&mut InputHandle<T, D>, &mut OutputHandle<T, D2>) -> Result<()> + Clone + Send + 'static,
     {
         let capacity = self.resolve_capacity();
         self.add_unary_with_handles(name, capacity, logic)
@@ -1788,6 +1793,7 @@ impl<T: Timestamp, D: Clone + Send + 'static> Pipe<T, D> {
                 &mut OutputHandle<T, D2>,
                 &mut NotifyContext<'_, T>,
             ) -> Result<()>
+            + Clone
             + Send
             + 'static,
     {
@@ -1890,6 +1896,7 @@ impl<T: Timestamp, D: Clone + Send + 'static> Pipe<T, D> {
                 &mut InputHandle<T, D2>,
                 &mut OutputHandle<T, D3>,
             ) -> Result<()>
+            + Clone
             + Send
             + 'static,
     {
@@ -1960,7 +1967,9 @@ impl<T: Timestamp, D: Clone + Send + 'static> Pipe<T, D> {
             // Operator factory
             let name_clone = name.clone();
             let factory: OperatorFactory =
-                single_use_factory(move |_ctx, endpoints: ChannelEndpoints| {
+                replayable_factory(move |_ctx, endpoints: ChannelEndpoints| {
+                    let name = name_clone.clone();
+                    let logic = logic.clone();
                     let mut pullers = endpoints.input_pullers.into_iter();
 
                     let input1_puller: Box<dyn Pull<T, D>> = *pullers
@@ -2015,7 +2024,7 @@ impl<T: Timestamp, D: Clone + Send + 'static> Pipe<T, D> {
                     };
 
                     Ok(Box::new(WiredBinaryOperator::new(
-                        name_clone,
+                        name,
                         op_idx,
                         stage_id,
                         logic,
@@ -2167,7 +2176,8 @@ impl<T: Timestamp, D: Clone + Send + 'static> Pipe<T, D> {
             // Enter operator factory
             let enter_name = format!("{name}::enter");
             let enter_factory: OperatorFactory =
-                single_use_factory(move |_ctx, endpoints: ChannelEndpoints| {
+                replayable_factory(move |_ctx, endpoints: ChannelEndpoints| {
+                    let enter_name = enter_name.clone();
                     let input_puller: Box<dyn Pull<T, D>> = *endpoints
                         .input_pullers
                         .into_iter()
@@ -2257,7 +2267,9 @@ impl<T: Timestamp, D: Clone + Send + 'static> Pipe<T, D> {
             let fb_name = format!("{name}::feedback");
             let fb_summary = summary.clone();
             let feedback_factory: OperatorFactory =
-                single_use_factory(move |_ctx, endpoints: ChannelEndpoints| {
+                replayable_factory(move |_ctx, endpoints: ChannelEndpoints| {
+                    let fb_name = fb_name.clone();
+                    let fb_summary = fb_summary.clone();
                     let input_puller: Box<dyn Pull<PT<T, TInner>, D>> = *endpoints
                         .input_pullers
                         .into_iter()
@@ -2366,7 +2378,8 @@ impl<T: Timestamp, D: Clone + Send + 'static> Pipe<T, D> {
             // Concat operator factory
             let concat_name = format!("{name}::concat");
             let concat_factory: OperatorFactory =
-                single_use_factory(move |_ctx, endpoints: ChannelEndpoints| {
+                replayable_factory(move |_ctx, endpoints: ChannelEndpoints| {
+                    let concat_name = concat_name.clone();
                     let input_pullers: Vec<Box<dyn Pull<PT<T, TInner>, D>>> = endpoints
                         .input_pullers
                         .into_iter()
@@ -2652,7 +2665,8 @@ impl<T: Timestamp, D: Clone + Send + 'static> Pipe<T, D> {
             // Leave operator factory
             let leave_name = format!("{name}::leave");
             let leave_factory: OperatorFactory =
-                single_use_factory(move |_ctx, endpoints: ChannelEndpoints| {
+                replayable_factory(move |_ctx, endpoints: ChannelEndpoints| {
+                    let leave_name = leave_name.clone();
                     let input_puller: Box<dyn Pull<PT<T, TInner>, D>> = *endpoints
                         .input_pullers
                         .into_iter()
@@ -2813,7 +2827,7 @@ impl<T: Timestamp, D: Clone + Send + 'static> Pipe<T, D> {
 
             // Operator factory
             let factory: OperatorFactory =
-                single_use_factory(move |_ctx, endpoints: ChannelEndpoints| {
+                replayable_factory(move |_ctx, endpoints: ChannelEndpoints| {
                     let input_pullers: Vec<Box<dyn Pull<T, D>>> = endpoints
                         .input_pullers
                         .into_iter()
@@ -2964,7 +2978,9 @@ impl<T: Timestamp, D: Clone + Send + 'static> Pipe<T, D> {
             let collector_clone = Arc::clone(&collector);
             let name_clone = name.clone();
             let factory: OperatorFactory =
-                single_use_factory(move |_ctx, endpoints: ChannelEndpoints| {
+                replayable_factory(move |_ctx, endpoints: ChannelEndpoints| {
+                    let name = name_clone.clone();
+                    let collector = Arc::clone(&collector_clone);
                     let input_puller: Box<dyn Pull<T, D>> = *endpoints
                         .input_pullers
                         .into_iter()
@@ -2984,11 +3000,11 @@ impl<T: Timestamp, D: Clone + Send + 'static> Pipe<T, D> {
                         })?;
 
                     Ok(Box::new(CollectingSink::new(
-                        name_clone,
+                        name,
                         op_idx,
                         stage_id,
                         input_puller,
-                        collector_clone,
+                        collector,
                     )) as Box<dyn SchedulableOperator>)
                 });
             state.operator_factories.push((op_idx, factory));
@@ -3177,7 +3193,7 @@ where
     ) -> Pipe<T, std::result::Result<V2, E>>
     where
         V2: Clone + Send + 'static,
-        F: FnMut(&T, V) -> V2 + Send + 'static,
+        F: FnMut(&T, V) -> V2 + Clone + Send + 'static,
     {
         self.map(name, move |t, item| match item {
             Ok(v) => Ok(f(t, v)),
@@ -3203,7 +3219,7 @@ where
         mut predicate: F,
     ) -> Pipe<T, std::result::Result<V, E>>
     where
-        F: FnMut(&T, &V) -> bool + Send + 'static,
+        F: FnMut(&T, &V) -> bool + Clone + Send + 'static,
     {
         self.filter(name, move |t, item| match item {
             Ok(v) => predicate(t, v),
@@ -3230,7 +3246,7 @@ where
     ) -> Pipe<T, std::result::Result<V2, E>>
     where
         V2: Clone + Send + 'static,
-        F: FnMut(&T, V) -> std::result::Result<V2, E> + Send + 'static,
+        F: FnMut(&T, V) -> std::result::Result<V2, E> + Clone + Send + 'static,
     {
         self.map(name, move |t, item| match item {
             Ok(v) => f(t, v),
@@ -3830,7 +3846,9 @@ impl<T: Timestamp, D: Clone + Send + 'static> Pipe<T, D> {
             // Operator factory — pass-through unary with progress reporter.
             let name_clone = String::from("exchange");
             let factory: OperatorFactory =
-                single_use_factory(move |_ctx, endpoints: ChannelEndpoints| {
+                replayable_factory(move |_ctx, endpoints: ChannelEndpoints| {
+                    let name = name_clone.clone();
+                    let exchange_reporter = exchange_reporter.clone();
                     let input_puller: Box<dyn Pull<T, D>> = *endpoints
                         .input_pullers
                         .into_iter()
@@ -3869,7 +3887,7 @@ impl<T: Timestamp, D: Clone + Send + 'static> Pipe<T, D> {
                     };
 
                     Ok(Box::new(WiredUnaryOperator::with_reporter(
-                        name_clone,
+                        name,
                         op_idx,
                         stage_id,
                         wired_logic,
@@ -3986,7 +4004,9 @@ impl<T: Timestamp, D: Clone + Send + 'static> Pipe<T, D> {
             // Operator factory — same pass-through unary as exchange.
             let name_clone = String::from("broadcast");
             let factory: OperatorFactory =
-                single_use_factory(move |_ctx, endpoints: ChannelEndpoints| {
+                replayable_factory(move |_ctx, endpoints: ChannelEndpoints| {
+                    let name = name_clone.clone();
+                    let exchange_reporter = exchange_reporter.clone();
                     let input_puller: Box<dyn Pull<T, D>> = *endpoints
                         .input_pullers
                         .into_iter()
@@ -4025,7 +4045,7 @@ impl<T: Timestamp, D: Clone + Send + 'static> Pipe<T, D> {
                     };
 
                     Ok(Box::new(WiredUnaryOperator::with_reporter(
-                        name_clone,
+                        name,
                         op_idx,
                         stage_id,
                         wired_logic,
@@ -4101,7 +4121,7 @@ impl<T: Timestamp, D: Clone + Send + 'static> Pipe<T, D> {
         &self,
         name: impl Into<String>,
         capacity: usize,
-        logic: impl FnMut(T, Vec<D>) -> Vec<D2> + Send + 'static,
+        logic: impl FnMut(T, Vec<D>) -> Vec<D2> + Clone + Send + 'static,
     ) -> Pipe<T, D2>
     where
         D2: Clone + Send + 'static,
@@ -4162,7 +4182,9 @@ impl<T: Timestamp, D: Clone + Send + 'static> Pipe<T, D> {
             // pushers in a TeePush adapter when the Pipe was cloned.
             let name_clone = name.clone();
             let factory: OperatorFactory =
-                single_use_factory(move |_ctx, endpoints: ChannelEndpoints| {
+                replayable_factory(move |_ctx, endpoints: ChannelEndpoints| {
+                    let name = name_clone.clone();
+                    let wired_logic = wired_logic.clone();
                     let input_puller: Box<dyn Pull<T, D>> = *endpoints
                         .input_pullers
                         .into_iter()
@@ -4201,7 +4223,7 @@ impl<T: Timestamp, D: Clone + Send + 'static> Pipe<T, D> {
                     };
 
                     Ok(Box::new(WiredUnaryOperator::new(
-                        name_clone,
+                        name,
                         op_idx,
                         stage_id,
                         wired_logic,
@@ -4245,7 +4267,7 @@ impl<T: Timestamp, D: Clone + Send + 'static> Pipe<T, D> {
     ) -> Pipe<T, D2>
     where
         D2: Clone + Send + 'static,
-        L: FnMut(&mut InputHandle<T, D>, &mut OutputHandle<T, D2>) -> Result<()> + Send + 'static,
+        L: FnMut(&mut InputHandle<T, D>, &mut OutputHandle<T, D2>) -> Result<()> + Clone + Send + 'static,
     {
         let name = name.into();
         let op_idx;
@@ -4290,7 +4312,9 @@ impl<T: Timestamp, D: Clone + Send + 'static> Pipe<T, D> {
             // Operator factory — handles fan-out via TeePush
             let name_clone = name.clone();
             let factory: OperatorFactory =
-                single_use_factory(move |_ctx, endpoints: ChannelEndpoints| {
+                replayable_factory(move |_ctx, endpoints: ChannelEndpoints| {
+                    let name = name_clone.clone();
+                    let logic = logic.clone();
                     let input_puller: Box<dyn Pull<T, D>> = *endpoints
                         .input_pullers
                         .into_iter()
@@ -4329,7 +4353,7 @@ impl<T: Timestamp, D: Clone + Send + 'static> Pipe<T, D> {
                     };
 
                     Ok(Box::new(WiredUnaryOperator::new(
-                        name_clone,
+                        name,
                         op_idx,
                         stage_id,
                         logic,
@@ -4386,6 +4410,7 @@ impl<T: Timestamp, D: Clone + Send + 'static> Pipe<T, D> {
                 &mut OutputHandle<T, D2>,
                 &mut NotifyContext<'_, T>,
             ) -> Result<()>
+            + Clone
             + Send
             + 'static,
     {
@@ -4448,7 +4473,10 @@ impl<T: Timestamp, D: Clone + Send + 'static> Pipe<T, D> {
             // the ProgressTracker and operator share the same underlying buffer.
             let name_clone = name.clone();
             let factory: OperatorFactory =
-                single_use_factory(move |_ctx, endpoints: ChannelEndpoints| {
+                replayable_factory(move |_ctx, endpoints: ChannelEndpoints| {
+                    let name = name_clone.clone();
+                    let logic = logic.clone();
+                    let progress_reporter = progress_reporter.clone();
                     let input_puller: Box<dyn Pull<T, D>> = *endpoints
                         .input_pullers
                         .into_iter()
@@ -4493,7 +4521,7 @@ impl<T: Timestamp, D: Clone + Send + 'static> Pipe<T, D> {
                     let initial_frontier = Antichain::from_elem(T::minimum());
 
                     Ok(Box::new(WiredUnaryNotifyOperator::new(
-                        name_clone,
+                        name,
                         op_idx,
                         stage_id,
                         logic,
@@ -4547,18 +4575,24 @@ impl<T: Timestamp, D: Clone + Send + 'static> Pipe<T, D> {
         let prealloc = self.state.borrow().channel_preallocate;
         // Capture the tokio handle at builder time. This requires that the caller
         // is within a tokio runtime context (e.g., inside #[tokio::main] or an async task).
-        let tokio_handle = tokio::runtime::Handle::try_current();
+        let (tokio_handle, tokio_error) = match tokio::runtime::Handle::try_current() {
+            Ok(handle) => (Some(handle), None),
+            Err(e) => (
+                None,
+                Some(format!(
+                    "unary_async requires a tokio runtime context: {e}. \
+                     Call from within #[tokio::main], #[tokio::test], or similar."
+                )),
+            ),
+        };
 
         {
             let mut state = self.state.borrow_mut();
 
-            if let Err(ref e) = tokio_handle {
+            if let Some(ref err) = tokio_error {
                 state
                     .builder_errors
-                    .push(Error::Dataflow(DataflowError::InvalidConfig(format!(
-                        "unary_async requires a tokio runtime context: {e}. \
-                     Call from within #[tokio::main], #[tokio::test], or similar."
-                    ))));
+                    .push(Error::Dataflow(DataflowError::InvalidConfig(err.clone())));
             }
 
             op_idx = state.allocate_operator_index();
@@ -4597,7 +4631,16 @@ impl<T: Timestamp, D: Clone + Send + 'static> Pipe<T, D> {
             // Operator factory — creates a WiredUnaryAsyncOperator
             let name_clone = name.clone();
             let factory: OperatorFactory =
-                single_use_factory(move |_ctx, endpoints: ChannelEndpoints| {
+                replayable_factory(move |_ctx, endpoints: ChannelEndpoints| {
+                    let name = name_clone.clone();
+                    let logic = logic.clone();
+                    let handle = tokio_handle.clone().ok_or_else(|| {
+                        Error::Dataflow(DataflowError::InvalidConfig(
+                            tokio_error.clone().unwrap_or_else(|| {
+                                "tokio runtime context missing at factory invocation".into()
+                            }),
+                        ))
+                    })?;
                     let input_puller: Box<dyn Pull<T, D>> = *endpoints
                         .input_pullers
                         .into_iter()
@@ -4635,17 +4678,8 @@ impl<T: Timestamp, D: Clone + Send + 'static> Pipe<T, D> {
                         tee_or_single(pushers)?.unwrap_or_else(|| Box::new(NullPush))
                     };
 
-                    // tokio_handle is Ok if we had a runtime context at build time.
-                    // If Err, build() will have returned the error before this factory
-                    // runs. We use `?` as defense-in-depth to avoid panicking even in
-                    // edge cases (e.g., if a future refactor changes the error-check order).
-                    let handle = tokio_handle.map_err(|e| {
-                        Error::Dataflow(DataflowError::InvalidConfig(format!(
-                            "tokio runtime context missing at factory invocation: {e}"
-                        )))
-                    })?;
                     Ok(Box::new(WiredUnaryAsyncOperator::new(
-                        name_clone,
+                        name,
                         op_idx,
                         stage_id,
                         logic,
