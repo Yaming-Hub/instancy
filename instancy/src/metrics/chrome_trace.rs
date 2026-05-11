@@ -51,13 +51,17 @@ struct TraceEvent {
     name: String,
     /// Event category.
     cat: String,
-    /// Phase: "X" = complete event, "i" = instant, "C" = counter, "M" = metadata.
+    /// Phase: "X" = complete event, "i" = instant, "C" = counter, "M" = metadata,
+    /// "s" = flow start, "f" = flow finish.
     ph: String,
     /// Timestamp in microseconds.
     ts: u64,
     /// Duration in microseconds (only for "X" events).
     #[serde(skip_serializing_if = "Option::is_none")]
     dur: Option<u64>,
+    /// Flow event ID — links "s" and "f" events into connected arrows.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    id: Option<u64>,
     /// Scope for instant events: "g" = global, "p" = process, "t" = thread.
     #[serde(skip_serializing_if = "Option::is_none")]
     s: Option<String>,
@@ -115,6 +119,7 @@ impl ChromeTraceExporter {
                 ph: "X".to_string(),
                 ts: ev.start_us,
                 dur: Some(ev.duration_us),
+                id: None,
                 s: None,
                 pid: 0,
                 tid: ev.worker_index as u64,
@@ -152,6 +157,7 @@ impl ChromeTraceExporter {
                 ph: "i".to_string(),
                 ts: ev.timestamp_us,
                 dur: None,
+                id: None,
                 s: Some("t".to_string()), // thread scope
                 pid: 0,
                 tid: ev.worker_index as u64,
@@ -179,6 +185,7 @@ impl ChromeTraceExporter {
                 ph: "s".to_string(),
                 ts: ev.timestamp_us,
                 dur: None,
+                id: Some(flow_id),
                 s: None,
                 pid: 0,
                 tid: ev.source_worker as u64,
@@ -186,7 +193,6 @@ impl ChromeTraceExporter {
                     "edge_index": ev.edge_index,
                     "items": ev.items,
                     "bytes": ev.bytes,
-                    "id": flow_id,
                 })),
             });
 
@@ -197,12 +203,11 @@ impl ChromeTraceExporter {
                 ph: "f".to_string(),
                 ts: ev.timestamp_us,
                 dur: None,
+                id: Some(flow_id),
                 s: None,
                 pid: 0,
                 tid: ev.target_worker as u64,
-                args: Some(serde_json::json!({
-                    "id": flow_id,
-                })),
+                args: None,
             });
         }
         self
@@ -220,6 +225,7 @@ impl ChromeTraceExporter {
                 ph: "i".to_string(),
                 ts: 0,
                 dur: None,
+                id: None,
                 s: Some("g".to_string()),
                 pid: 0,
                 tid: 0,
@@ -246,7 +252,8 @@ impl ChromeTraceExporter {
             ph: "M".to_string(),
             ts: 0,
             dur: None,
-            s: None,
+            id: None,
+                s: None,
             pid: 0,
             tid: 0,
             args: Some(serde_json::json!({
@@ -262,6 +269,7 @@ impl ChromeTraceExporter {
                 ph: "M".to_string(),
                 ts: 0,
                 dur: None,
+                id: None,
                 s: None,
                 pid: 0,
                 tid: w as u64,

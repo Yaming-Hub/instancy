@@ -451,6 +451,11 @@ pub struct DataflowExecutor<T: Timestamp = u64> {
     /// Per-worker timeline collector for activation events.
     /// `None` when `config.activation_timeline` is false.
     timeline_collector: Option<Arc<crate::metrics::TimelineCollector>>,
+    /// Cached frontier strings per operator position for change detection.
+    /// Only allocated when `config.frontier_timeline` is true.
+    /// Prevents recording duplicate frontier events when an operator is marked
+    /// dirty for output-only changes.
+    last_recorded_frontiers: Vec<String>,
     /// Phantom for the timestamp type.
     _phantom: PhantomData<T>,
     /// Whether the executor is in the drain phase (cancellation received,
@@ -703,6 +708,8 @@ impl<T: Timestamp> DataflowExecutor<T> {
         // need to produce initial output like sources).
         let ready_queue: VecDeque<usize> = (0..operators.len()).collect();
         let in_queue = vec![true; operators.len()];
+        let num_operators = operators.len();
+        let frontier_timeline_enabled = config.frontier_timeline;
         let wall_start = config.collect_metrics.then(Instant::now);
 
         Ok(Self {
@@ -734,6 +741,11 @@ impl<T: Timestamp> DataflowExecutor<T> {
             wall_start,
             op_collectors,
             timeline_collector,
+            last_recorded_frontiers: if frontier_timeline_enabled {
+                vec![String::new(); num_operators]
+            } else {
+                Vec::new()
+            },
             _phantom: PhantomData,
             draining: false,
             drain_deadline: None,
@@ -1051,10 +1063,18 @@ impl<T: Timestamp> DataflowExecutor<T> {
         }
 
         // Record frontier events for dirty operators when frontier timeline is enabled.
+        // Only record when the input frontier actually changed (dirty operators may
+        // be marked for output-frontier-only changes).
         if self.config.frontier_timeline {
             if let Some(ref tc) = self.timeline_collector {
                 for &(pos, ref frontier) in &frontier_updates {
-                    tc.record_frontier(pos, format!("{:?}", frontier));
+                    let s = format!("{:?}", frontier);
+                    if pos < self.last_recorded_frontiers.len()
+                        && self.last_recorded_frontiers[pos] != s
+                    {
+                        self.last_recorded_frontiers[pos] = s.clone();
+                        tc.record_frontier(pos, s);
+                    }
                 }
             }
         }
@@ -1871,6 +1891,7 @@ mod tests {
                 wall_start: None,
                 op_collectors: Vec::new(),
                 timeline_collector: None,
+                last_recorded_frontiers: Vec::new(),
                 _phantom: PhantomData,
                 draining: false,
                 drain_deadline: None,
@@ -1993,6 +2014,7 @@ mod tests {
             wall_start: None,
             op_collectors: Vec::new(),
             timeline_collector: None,
+            last_recorded_frontiers: Vec::new(),
             _phantom: PhantomData,
             draining: false,
             drain_deadline: None,
@@ -2042,6 +2064,7 @@ mod tests {
             wall_start: None,
             op_collectors: Vec::new(),
             timeline_collector: None,
+            last_recorded_frontiers: Vec::new(),
             _phantom: PhantomData,
             draining: false,
             drain_deadline: None,
@@ -2095,6 +2118,7 @@ mod tests {
             wall_start: None,
             op_collectors: Vec::new(),
             timeline_collector: None,
+            last_recorded_frontiers: Vec::new(),
             _phantom: PhantomData,
             draining: false,
             drain_deadline: None,
@@ -2136,6 +2160,7 @@ mod tests {
             wall_start: None,
             op_collectors: Vec::new(),
             timeline_collector: None,
+            last_recorded_frontiers: Vec::new(),
             _phantom: PhantomData,
             draining: false,
             drain_deadline: None,
@@ -2212,6 +2237,7 @@ mod tests {
             wall_start: None,
             op_collectors: Vec::new(),
             timeline_collector: None,
+            last_recorded_frontiers: Vec::new(),
             _phantom: PhantomData,
             draining: false,
             drain_deadline: None,
@@ -2297,6 +2323,7 @@ mod tests {
             wall_start: None,
             op_collectors: Vec::new(),
             timeline_collector: None,
+            last_recorded_frontiers: Vec::new(),
             _phantom: PhantomData,
             draining: false,
             drain_deadline: None,
@@ -2364,6 +2391,7 @@ mod tests {
             wall_start: None,
             op_collectors: Vec::new(),
             timeline_collector: None,
+            last_recorded_frontiers: Vec::new(),
             _phantom: PhantomData,
             draining: false,
             drain_deadline: None,
@@ -2417,6 +2445,7 @@ mod tests {
             wall_start: None,
             op_collectors: Vec::new(),
             timeline_collector: None,
+            last_recorded_frontiers: Vec::new(),
             _phantom: PhantomData,
             draining: false,
             drain_deadline: None,
@@ -2483,6 +2512,7 @@ mod tests {
             wall_start: None,
             op_collectors: Vec::new(),
             timeline_collector: None,
+            last_recorded_frontiers: Vec::new(),
             _phantom: PhantomData,
             draining: false,
             drain_deadline: None,
@@ -2548,6 +2578,7 @@ mod tests {
             wall_start: None,
             op_collectors: Vec::new(),
             timeline_collector: None,
+            last_recorded_frontiers: Vec::new(),
             _phantom: PhantomData,
             draining: false,
             drain_deadline: None,
@@ -2629,6 +2660,7 @@ mod tests {
             wall_start: None,
             op_collectors: Vec::new(),
             timeline_collector: None,
+            last_recorded_frontiers: Vec::new(),
             _phantom: PhantomData,
             draining: false,
             drain_deadline: None,
@@ -2723,6 +2755,7 @@ mod tests {
             wall_start: None,
             op_collectors: Vec::new(),
             timeline_collector: None,
+            last_recorded_frontiers: Vec::new(),
             _phantom: PhantomData,
             draining: false,
             drain_deadline: None,
@@ -2797,6 +2830,7 @@ mod tests {
             wall_start: None,
             op_collectors: Vec::new(),
             timeline_collector: None,
+            last_recorded_frontiers: Vec::new(),
             _phantom: PhantomData,
             draining: false,
             drain_deadline: None,
@@ -3244,6 +3278,7 @@ mod tests {
             wall_start: None,
             op_collectors: Vec::new(),
             timeline_collector: None,
+            last_recorded_frontiers: Vec::new(),
             _phantom: PhantomData,
             draining: false,
             drain_deadline: None,
@@ -3330,6 +3365,7 @@ mod tests {
             wall_start: None,
             op_collectors: Vec::new(),
             timeline_collector: None,
+            last_recorded_frontiers: Vec::new(),
             _phantom: PhantomData,
             draining: false,
             drain_deadline: None,
@@ -3385,6 +3421,7 @@ mod tests {
             wall_start: None,
             op_collectors: Vec::new(),
             timeline_collector: None,
+            last_recorded_frontiers: Vec::new(),
             _phantom: PhantomData,
             draining: false,
             drain_deadline: None,
@@ -3452,6 +3489,7 @@ mod tests {
             wall_start: None,
             op_collectors: Vec::new(),
             timeline_collector: None,
+            last_recorded_frontiers: Vec::new(),
             _phantom: PhantomData,
             draining: false,
             drain_deadline: None,
@@ -3508,6 +3546,7 @@ mod tests {
             wall_start: None,
             op_collectors: Vec::new(),
             timeline_collector: None,
+            last_recorded_frontiers: Vec::new(),
             _phantom: PhantomData,
             draining: false,
             drain_deadline: None,
@@ -3563,6 +3602,7 @@ mod tests {
             wall_start: None,
             op_collectors: Vec::new(),
             timeline_collector: None,
+            last_recorded_frontiers: Vec::new(),
             _phantom: PhantomData,
             draining: false,
             drain_deadline: None,
@@ -3618,6 +3658,7 @@ mod tests {
             wall_start: None,
             op_collectors: Vec::new(),
             timeline_collector: None,
+            last_recorded_frontiers: Vec::new(),
             _phantom: PhantomData,
             draining: false,
             drain_deadline: None,
@@ -3708,6 +3749,7 @@ mod tests {
             wall_start: None,
             op_collectors: Vec::new(),
             timeline_collector: None,
+            last_recorded_frontiers: Vec::new(),
             _phantom: PhantomData,
             draining: false,
             drain_deadline: None,
@@ -3776,6 +3818,7 @@ mod tests {
             wall_start: None,
             op_collectors: Vec::new(),
             timeline_collector: None,
+            last_recorded_frontiers: Vec::new(),
             _phantom: PhantomData,
             draining: false,
             drain_deadline: None,
@@ -3842,6 +3885,7 @@ mod tests {
             wall_start: None,
             op_collectors: Vec::new(),
             timeline_collector: None,
+            last_recorded_frontiers: Vec::new(),
             _phantom: PhantomData,
             draining: false,
             drain_deadline: None,
@@ -3911,6 +3955,7 @@ mod tests {
             wall_start: None,
             op_collectors: Vec::new(),
             timeline_collector: None,
+            last_recorded_frontiers: Vec::new(),
             _phantom: PhantomData,
             draining: false,
             drain_deadline: None,
@@ -3994,6 +4039,7 @@ mod tests {
             wall_start: None,
             op_collectors: Vec::new(),
             timeline_collector: None,
+            last_recorded_frontiers: Vec::new(),
             _phantom: PhantomData,
             draining: false,
             drain_deadline: None,
@@ -4050,6 +4096,7 @@ mod tests {
             wall_start: None,
             op_collectors: Vec::new(),
             timeline_collector: None,
+            last_recorded_frontiers: Vec::new(),
             _phantom: PhantomData,
             draining: false,
             drain_deadline: None,
