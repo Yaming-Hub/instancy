@@ -3,7 +3,7 @@
 //! This module contains:
 //! - [`TaskScheduler`] — manages FIFO per-worker dispatch with stage concurrency limits.
 //! - [`policy`] — pluggable scheduling policies (FIFO, Priority, PriorityWithAging).
-//! - [`batching`] — time-bounded message batching to reduce scheduling overhead.
+//! - `batching` — time-bounded message batching to reduce scheduling overhead.
 
 #[allow(dead_code)]
 pub(crate) mod batching;

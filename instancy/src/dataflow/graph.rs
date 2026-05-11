@@ -16,7 +16,7 @@
 //! # Relationship to SubgraphBuilder
 //!
 //! [`DataflowGraph`] tracks the *logical* topology (operator metadata + edges).
-//! [`SubgraphBuilder`](crate::progress::subgraph::SubgraphBuilder) tracks
+//! `SubgraphBuilder` tracks
 //! *progress* metadata (port connectivity, summaries, capabilities). Both are
 //! populated during the build phase; the execution engine uses both.
 

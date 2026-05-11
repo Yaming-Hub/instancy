@@ -62,7 +62,7 @@ pub fn bounded_channel<T: Timestamp, D: Send + 'static, M: Send + 'static>(
 /// - Data is pulled from a full channel (upstream backpressure is relieved)
 ///
 /// `initial_capacity` controls the initial physical allocation. When `None`,
-/// defaults to [`INITIAL_BUFFER_CAPACITY`] (4). Pass `Some(capacity)` to
+/// defaults to `INITIAL_BUFFER_CAPACITY` (4). Pass `Some(capacity)` to
 /// pre-allocate the full logical capacity for high-throughput channels.
 pub fn bounded_channel_with_wake<T: Timestamp, D: Send + 'static, M: Send + 'static>(
     capacity: usize,

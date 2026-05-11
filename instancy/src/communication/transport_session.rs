@@ -72,11 +72,10 @@ use crate::dataflow::id::DataflowId;
 /// tasks and Demuxer.
 ///
 /// **Reconnection:** `PeerConnection` itself has no reconnection logic.
-/// For automatic reconnection on failure, use [`SharedTransport`] with a
+/// For automatic reconnection on failure, use `SharedPeerManager` with a
 /// connection factory — it manages retry with exponential backoff.
 ///
 /// [`ConnectionManager`]: crate::communication::connection::ConnectionManager
-/// [`SharedTransport`]: crate::communication::shared_transport::SharedTransport
 #[cfg(feature = "transport")]
 pub struct PeerConnection<R, W> {
     /// Identifier for the remote node (must match [`crate::ClusterTopology`] node IDs).
@@ -111,12 +110,10 @@ pub struct ChannelRegistration {
 /// A transport session managing multiplexed communication with remote peers.
 ///
 /// **Reconnection:** `TransportSession` does not handle connection failure
-/// or reconnection. For managed reconnection, use [`SharedTransport`] which
+/// or reconnection. For managed reconnection, use `SharedPeerManager` which
 /// wraps connections with automatic retry and exponential backoff.
 ///
 /// See [module-level documentation](self) for details on priority and ownership.
-///
-/// [`SharedTransport`]: crate::communication::shared_transport::SharedTransport
 #[cfg(feature = "transport")]
 pub struct TransportSession {
     /// Per-peer payload frame senders (bounded, FIFO for data + progress).
