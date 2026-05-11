@@ -2,7 +2,7 @@
 //!
 //! The [`SchedulePolicy`] trait determines the dequeue order for operator
 //! activation tasks. Different policies trade off latency, throughput, and
-//! fairness. See §12.7 in DESIGN.md.
+//! fairness. See [§12.7 in the decisions doc](../../docs/design/decisions.md).
 
 use std::cmp::Ordering;
 use std::time::Instant;

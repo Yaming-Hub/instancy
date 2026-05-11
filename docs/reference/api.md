@@ -126,6 +126,60 @@ Notes:
 - `IoMode::Sync` — blocking std channels for external I/O.
 - `IoMode::Async` — Tokio channels for async send/recv.
 
+### `RuntimeEvent`
+
+Lifecycle and health events emitted by the runtime. Subscribe via `RuntimeHandle::health_events()`.
+
+Variants:
+
+- `TransportDegraded { peer_id: String, detail: String }` — a shared transport component is permanently degraded (e.g., background thread panicked while holding a lock). Recommended action: shut down the runtime and create a fresh `RuntimeHandle`.
+
+See also: [Observability](../guide/observability.md).
+
+### `WorkerId`
+
+A globally unique logical worker identity (`WorkerId(pub usize)`). Workers are numbered sequentially across all nodes in the cluster. Determines data partitioning (exchange routing) and FIFO ordering for tasks assigned to the same worker.
+
+Key methods:
+
+- `new(index: usize) -> Self`
+- `index(&self) -> usize`
+
+## Scheduling
+
+### `SchedulePolicy`
+
+Trait that determines task ordering in the queue. The scheduler compares two tasks and returns which should run first.
+
+```rust
+pub trait SchedulePolicy: Send + Sync {
+    fn compare(&self, a: &TaskMeta, b: &TaskMeta) -> Ordering;
+}
+```
+
+`TaskMeta` carries `dataflow_id`, `priority: u32`, and `created_at: Instant`.
+
+When no policy is set (default), the scheduler uses plain FIFO with O(1) pop. When a policy is set, it uses a `BinaryHeap` for O(log n) operations.
+
+### `PriorityPolicy`
+
+Strict priority scheduling — higher priority always wins. Can starve low-priority dataflows.
+
+### `PriorityWithAgingPolicy`
+
+Priority with aging — prevents starvation by increasing effective priority based on wait time. Configured with `aging_weight: f64` (default: 1.0). Higher aging weight causes low-priority tasks to be promoted faster.
+
+```rust
+use instancy::{PriorityWithAgingPolicy, RuntimeConfig};
+
+let config = RuntimeConfig {
+    schedule_policy: Some(Box::new(PriorityWithAgingPolicy::new(2.0))),
+    ..Default::default()
+};
+```
+
+See also: [Design decisions §12.10](../design/decisions.md).
+
 ### Join Handles
 
 `RuntimeHandle::spawn`, `spawn_multi`, and `spawn_cluster` return handle types with similar ergonomics.
@@ -496,6 +550,22 @@ Key methods:
 - `register_wake_handle(&self, wake_handle: WakeHandle)`
 
 Common `CancellationReason` variants include `UserRequested`, `RuntimeShutdown`, `NetworkError`, `WorkerFailed`, `HandleDropped`, `OperatorError`, `PeerCancelled`, `PeerDown`, and `InternalError`.
+
+### `CancellationReason`
+
+Enum describing why a dataflow was cancelled. First-cancel-wins semantics — only the first reason is recorded. Child tokens inherit the parent's reason.
+
+| Variant | Description |
+|---|---|
+| `UserRequested` | Explicit user cancellation |
+| `RuntimeShutdown` | Runtime shutting down |
+| `NetworkError { detail }` | TCP disconnect or transport failure |
+| `WorkerFailed { detail }` | Worker failure causing cascading cancellation |
+| `HandleDropped` | `SpawnedDataflow` dropped without `join()` |
+| `OperatorError { detail }` | Operator error caused cancellation |
+| `PeerCancelled { peer_id, detail }` | Remote peer cancelled the distributed dataflow |
+| `PeerDown { node_id }` | Peer reported as down via `report_node_leave()` |
+| `InternalError { detail }` | Internal runtime error (e.g., poisoned lock) |
 
 ### `ErrorPolicy`
 
