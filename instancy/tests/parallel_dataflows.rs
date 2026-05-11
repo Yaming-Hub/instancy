@@ -423,6 +423,7 @@ async fn shared_transport_parallel_cluster_dataflows() {
                     Duration::from_secs(10),
                     build,
                     &th,
+                    SpawnOptions::new(),
                 )?;
                 Ok::<_, instancy::error::Error>((rt, cluster))
             })
@@ -445,6 +446,7 @@ async fn shared_transport_parallel_cluster_dataflows() {
                     Duration::from_secs(10),
                     build,
                     &th,
+                    SpawnOptions::new(),
                 )?;
                 Ok::<_, instancy::error::Error>((rt, cluster))
             })
@@ -599,6 +601,7 @@ async fn stress_parallel_cluster_dataflows() {
                     Duration::from_secs(10),
                     build,
                     &th,
+                    SpawnOptions::new(),
                 )?;
                 Ok::<_, instancy::error::Error>((rt, cluster))
             })
@@ -621,6 +624,7 @@ async fn stress_parallel_cluster_dataflows() {
                     Duration::from_secs(10),
                     build,
                     &th,
+                    SpawnOptions::new(),
                 )?;
                 Ok::<_, instancy::error::Error>((rt, cluster))
             })

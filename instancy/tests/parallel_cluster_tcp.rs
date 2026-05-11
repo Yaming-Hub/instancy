@@ -30,7 +30,7 @@ use instancy::Result;
 use instancy::communication::ClusterSpawnTransport;
 use instancy::communication::transport_session::PeerConnection;
 use instancy::{ClusterTopology, NodeConfig};
-use instancy::{RuntimeConfig, RuntimeHandle};
+use instancy::{RuntimeConfig, RuntimeHandle, SpawnOptions};
 
 const TEST_TIMEOUT: Duration = Duration::from_secs(60);
 
@@ -145,6 +145,7 @@ async fn parallel_tcp_dataflows_shared_pool() {
                 Duration::from_secs(30),
                 build_df(i),
                 &tokio_handle,
+                SpawnOptions::new(),
             )?;
             clusters.push(cluster);
         }
@@ -169,6 +170,7 @@ async fn parallel_tcp_dataflows_shared_pool() {
                 Duration::from_secs(30),
                 build_df(i),
                 &tokio_handle2,
+                SpawnOptions::new(),
             )?;
             clusters.push(cluster);
         }
@@ -318,6 +320,7 @@ async fn parallel_tcp_dataflows_multi_epoch() {
                 Duration::from_secs(30),
                 build,
                 &tokio_handle,
+                SpawnOptions::new(),
             )?;
             clusters.push(cluster);
         }
@@ -340,6 +343,7 @@ async fn parallel_tcp_dataflows_multi_epoch() {
                 Duration::from_secs(30),
                 build,
                 &tokio_handle2,
+                SpawnOptions::new(),
             )?;
             clusters.push(cluster);
         }

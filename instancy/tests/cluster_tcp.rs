@@ -18,7 +18,7 @@ use instancy::Result;
 use instancy::communication::ClusterSpawnTransport;
 use instancy::communication::transport_session::PeerConnection;
 use instancy::{ClusterTopology, NodeConfig};
-use instancy::{RuntimeConfig, RuntimeHandle};
+use instancy::{RuntimeConfig, RuntimeHandle, SpawnOptions};
 
 /// Default timeout for cluster completion in tests.
 const TEST_TIMEOUT: Duration = Duration::from_secs(30);
@@ -142,6 +142,7 @@ where
             Duration::from_secs(10),
             build,
             &tokio_handle,
+            SpawnOptions::new(),
         )?;
         Ok((rt, cluster))
     })

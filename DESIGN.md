@@ -1610,8 +1610,15 @@ pub struct MetricsConfig {
 
 **Usage**:
 ```rust
+// Single-process multi-worker
 let opts = SpawnOptions::new().metrics(MetricsConfig::full());
 let mut multi = rt.spawn_multi("df", 4, build_fn, opts)?;
+
+// Cluster mode — same MetricsConfig applies
+let opts = SpawnOptions::new().metrics(MetricsConfig::full());
+let cluster = rt.spawn_cluster(
+    "df", topology, "node-a", id, transport, timeout, build_fn, &handle, opts,
+)?;
 ```
 
 **Channel counters** track per-exchange-edge transfer volumes:
@@ -1627,9 +1634,17 @@ pub struct ChannelMetrics {
 
 Each exchange edge gets a shared `ChannelMetricsCollector` (atomic counters)
 that all source workers push through. The collector is created during exchange
-channel materialization (Phase 3 of `spawn_multi`) and registered in each
-worker's `DataflowMetrics`. Since collectors are `Arc`-shared across workers,
-the counters reflect the total traffic through the edge, not per-worker.
+channel materialization (Phase 3 of `spawn_multi` / Phase 5 of `spawn_cluster`)
+and registered in each worker's `DataflowMetrics`. Since collectors are
+`Arc`-shared across workers, the counters reflect the total traffic through
+the edge, not per-worker.
+
+**Cluster support**: `spawn_cluster()` accepts `SpawnOptions` (including
+`MetricsConfig`) and wires all observability features identically to
+`spawn_multi()`: operator summary, channel counters (including network exchange
+channels), activation/frontier/transfer timelines, and external cancellation
+tokens. A shared `timeline_start` `Instant` is captured before worker
+materialization so activation timestamps are comparable across local workers.
 
 Access channel metrics after the dataflow runs:
 ```rust

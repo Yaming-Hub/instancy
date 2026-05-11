@@ -21,7 +21,7 @@ use instancy::communication::shared_transport::{
     ConnectionFactory, DynConnectionFactory, SharedPeerManager,
 };
 use instancy::{ClusterTopology, NodeConfig};
-use instancy::{RuntimeConfig, RuntimeHandle};
+use instancy::{RuntimeConfig, RuntimeHandle, SpawnOptions};
 
 /// Default timeout for cluster completion in tests.
 const TEST_TIMEOUT: Duration = Duration::from_secs(30);
@@ -206,6 +206,7 @@ async fn shared_two_nodes_no_exchange() {
             Duration::from_secs(10),
             build,
             &th,
+            SpawnOptions::new(),
         )?;
         Ok::<_, instancy::error::Error>((rt, cluster))
     });
@@ -227,6 +228,7 @@ async fn shared_two_nodes_no_exchange() {
             Duration::from_secs(10),
             build,
             &th2,
+            SpawnOptions::new(),
         )?;
         Ok::<_, instancy::error::Error>((rt, cluster))
     });
@@ -310,6 +312,7 @@ async fn shared_two_nodes_with_exchange() {
             Duration::from_secs(10),
             build,
             &th,
+            SpawnOptions::new(),
         )?;
         Ok::<_, instancy::error::Error>((rt, cluster))
     });
@@ -331,6 +334,7 @@ async fn shared_two_nodes_with_exchange() {
             Duration::from_secs(10),
             build,
             &th2,
+            SpawnOptions::new(),
         )?;
         Ok::<_, instancy::error::Error>((rt, cluster))
     });
@@ -413,6 +417,7 @@ async fn shared_multiple_dataflows_same_connections() {
             Duration::from_secs(10),
             build,
             &th,
+            SpawnOptions::new(),
         )?;
         let c2 = rt.spawn_cluster(
             "shared-multi-2",
@@ -423,6 +428,7 @@ async fn shared_multiple_dataflows_same_connections() {
             Duration::from_secs(10),
             build,
             &th,
+            SpawnOptions::new(),
         )?;
         Ok::<_, instancy::error::Error>((rt, c1, c2))
     });
@@ -444,6 +450,7 @@ async fn shared_multiple_dataflows_same_connections() {
             Duration::from_secs(10),
             build,
             &th2,
+            SpawnOptions::new(),
         )?;
         let c2 = rt.spawn_cluster(
             "shared-multi-2",
@@ -454,6 +461,7 @@ async fn shared_multiple_dataflows_same_connections() {
             Duration::from_secs(10),
             build,
             &th2,
+            SpawnOptions::new(),
         )?;
         Ok::<_, instancy::error::Error>((rt, c1, c2))
     });
@@ -550,6 +558,7 @@ async fn shared_dropping_arc_after_spawn_does_not_kill_transport() {
             Duration::from_secs(10),
             build,
             &th,
+            SpawnOptions::new(),
         )?;
         Ok::<_, instancy::error::Error>((rt, cluster))
     });
@@ -571,6 +580,7 @@ async fn shared_dropping_arc_after_spawn_does_not_kill_transport() {
             Duration::from_secs(10),
             build,
             &th2,
+            SpawnOptions::new(),
         )?;
         Ok::<_, instancy::error::Error>((rt, cluster))
     });
@@ -656,6 +666,7 @@ async fn shared_join_async_keeps_bridges_alive() {
             Duration::from_secs(10),
             build,
             &th,
+            SpawnOptions::new(),
         )?;
         Ok::<_, instancy::error::Error>((rt, cluster))
     });
@@ -677,6 +688,7 @@ async fn shared_join_async_keeps_bridges_alive() {
             Duration::from_secs(10),
             build,
             &th2,
+            SpawnOptions::new(),
         )?;
         Ok::<_, instancy::error::Error>((rt, cluster))
     });
