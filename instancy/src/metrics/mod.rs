@@ -68,6 +68,15 @@ pub struct MetricsConfig {
     /// Vec push per activation).
     pub activation_timeline: bool,
 
+    /// Record frontier advance events for each operator. Enables "see frontiers
+    /// move" replay. ~3% overhead (1 Vec push per frontier change per operator).
+    pub frontier_timeline: bool,
+
+    /// Record data transfer events through exchange channels. Enables "see data
+    /// flow" replay with source/target worker and batch size. ~5-10% overhead
+    /// (1 Vec push per exchange batch).
+    pub transfer_timeline: bool,
+
     /// Minimum activation duration to record in the timeline. Activations
     /// shorter than this are still counted in `operator_summary` but not
     /// logged individually. Reduces timeline size for high-frequency operators.
@@ -77,7 +86,7 @@ pub struct MetricsConfig {
     /// Maximum timeline events to retain per worker (ring buffer cap).
     /// Prevents unbounded memory growth for long-running dataflows.
     /// Total events across N workers can reach N × this value.
-    /// 0 = unlimited.
+    /// 0 = unlimited. Applies to each event category independently.
     pub max_timeline_events: usize,
 }
 
@@ -88,6 +97,8 @@ impl MetricsConfig {
             operator_summary: false,
             channel_counters: false,
             activation_timeline: false,
+            frontier_timeline: false,
+            transfer_timeline: false,
             min_activation_duration: Duration::from_micros(1),
             max_timeline_events: 0,
         }
@@ -99,6 +110,8 @@ impl MetricsConfig {
             operator_summary: true,
             channel_counters: false,
             activation_timeline: false,
+            frontier_timeline: false,
+            transfer_timeline: false,
             min_activation_duration: Duration::from_micros(1),
             max_timeline_events: 0,
         }
@@ -110,6 +123,8 @@ impl MetricsConfig {
             operator_summary: true,
             channel_counters: true,
             activation_timeline: true,
+            frontier_timeline: true,
+            transfer_timeline: true,
             min_activation_duration: Duration::from_micros(1),
             max_timeline_events: 100_000,
         }
@@ -118,7 +133,11 @@ impl MetricsConfig {
     /// Returns `true` if any metrics category is enabled.
     #[inline]
     pub fn any_enabled(&self) -> bool {
-        self.operator_summary || self.channel_counters || self.activation_timeline
+        self.operator_summary
+            || self.channel_counters
+            || self.activation_timeline
+            || self.frontier_timeline
+            || self.transfer_timeline
     }
 }
 
@@ -352,16 +371,55 @@ pub struct ActivationEvent {
     pub duration_us: u64,
 }
 
-/// Thread-safe collector for activation timeline events.
+/// A frontier advance event recorded during dataflow execution.
+///
+/// Recorded when an operator's input frontier changes during progress
+/// propagation. The `new_frontier` is a debug-formatted representation
+/// of the new antichain.
+#[derive(Debug, Clone)]
+pub struct FrontierEvent {
+    /// Operator position index within the dataflow graph.
+    pub operator_index: usize,
+    /// Worker index where this frontier change was observed.
+    pub worker_index: usize,
+    /// Offset from the dataflow start time, in microseconds.
+    pub timestamp_us: u64,
+    /// Debug representation of the new frontier antichain.
+    pub new_frontier: String,
+}
+
+/// A data transfer event recorded when a batch flows through an exchange edge.
+///
+/// Recorded when data is pushed through an exchange channel from one worker
+/// to another (or to itself).
+#[derive(Debug, Clone)]
+pub struct TransferEvent {
+    /// Exchange edge index in the dataflow graph.
+    pub edge_index: usize,
+    /// Source worker that sent the batch.
+    pub source_worker: usize,
+    /// Target worker that received the batch.
+    pub target_worker: usize,
+    /// Offset from the dataflow start time, in microseconds.
+    pub timestamp_us: u64,
+    /// Number of items in the batch.
+    pub items: u64,
+    /// Estimated bytes in the batch.
+    pub bytes: u64,
+}
+
+/// Thread-safe collector for timeline events (activations, frontiers, transfers).
 ///
 /// Shared across the executor's activation path via `Arc`. Events are
-/// appended lock-free using a `Mutex<VecDeque>` (contention is low since each
+/// appended using a `Mutex<VecDeque>` (contention is low since each
 /// worker has its own collector). When `max_events > 0`, old events are
-/// dropped to cap memory usage.
+/// dropped per category to cap memory usage.
 #[derive(Debug)]
 pub struct TimelineCollector {
     events: std::sync::Mutex<std::collections::VecDeque<ActivationEvent>>,
-    /// Maximum events to retain (0 = unlimited).
+    frontier_events: std::sync::Mutex<std::collections::VecDeque<FrontierEvent>>,
+    transfer_events: std::sync::Mutex<std::collections::VecDeque<TransferEvent>>,
+    /// Maximum events to retain per category (0 = unlimited).
     max_events: usize,
     /// Minimum activation duration to record (filter short activations).
     min_duration: Duration,
@@ -381,6 +439,8 @@ impl TimelineCollector {
     ) -> Self {
         Self {
             events: std::sync::Mutex::new(std::collections::VecDeque::new()),
+            frontier_events: std::sync::Mutex::new(std::collections::VecDeque::new()),
+            transfer_events: std::sync::Mutex::new(std::collections::VecDeque::new()),
             max_events,
             min_duration,
             start_time,
@@ -419,15 +479,83 @@ impl TimelineCollector {
         events.push_back(event);
     }
 
-    /// Drain all recorded events.
+    /// Record a frontier advance event for an operator.
+    #[inline]
+    pub fn record_frontier(&self, operator_index: usize, new_frontier: String) {
+        let timestamp_us = std::time::Instant::now()
+            .saturating_duration_since(self.start_time)
+            .as_micros() as u64;
+        let event = FrontierEvent {
+            operator_index,
+            worker_index: self.worker_index,
+            timestamp_us,
+            new_frontier,
+        };
+        let mut events = self.frontier_events.lock().unwrap_or_else(|e| e.into_inner());
+        if self.max_events > 0 && events.len() >= self.max_events {
+            events.pop_front();
+        }
+        events.push_back(event);
+    }
+
+    /// Record a data transfer event through an exchange edge.
+    #[inline]
+    pub fn record_transfer(
+        &self,
+        edge_index: usize,
+        target_worker: usize,
+        items: u64,
+        bytes: u64,
+    ) {
+        let timestamp_us = std::time::Instant::now()
+            .saturating_duration_since(self.start_time)
+            .as_micros() as u64;
+        let event = TransferEvent {
+            edge_index,
+            source_worker: self.worker_index,
+            target_worker,
+            timestamp_us,
+            items,
+            bytes,
+        };
+        let mut events = self.transfer_events.lock().unwrap_or_else(|e| e.into_inner());
+        if self.max_events > 0 && events.len() >= self.max_events {
+            events.pop_front();
+        }
+        events.push_back(event);
+    }
+
+    /// Drain all recorded activation events.
     pub fn take_events(&self) -> Vec<ActivationEvent> {
         let mut events = self.events.lock().unwrap_or_else(|e| e.into_inner());
         events.drain(..).collect()
     }
 
-    /// Number of events currently recorded.
+    /// Drain all recorded frontier events.
+    pub fn take_frontier_events(&self) -> Vec<FrontierEvent> {
+        let mut events = self.frontier_events.lock().unwrap_or_else(|e| e.into_inner());
+        events.drain(..).collect()
+    }
+
+    /// Drain all recorded transfer events.
+    pub fn take_transfer_events(&self) -> Vec<TransferEvent> {
+        let mut events = self.transfer_events.lock().unwrap_or_else(|e| e.into_inner());
+        events.drain(..).collect()
+    }
+
+    /// Number of activation events currently recorded.
     pub fn event_count(&self) -> usize {
         self.events.lock().unwrap_or_else(|e| e.into_inner()).len()
+    }
+
+    /// Number of frontier events currently recorded.
+    pub fn frontier_event_count(&self) -> usize {
+        self.frontier_events.lock().unwrap_or_else(|e| e.into_inner()).len()
+    }
+
+    /// Number of transfer events currently recorded.
+    pub fn transfer_event_count(&self) -> usize {
+        self.transfer_events.lock().unwrap_or_else(|e| e.into_inner()).len()
     }
 }
 
@@ -581,6 +709,48 @@ impl DataflowMetrics {
         self.timelines.iter().map(|tc| tc.event_count()).sum()
     }
 
+    /// Collect all frontier events from all workers, sorted by `timestamp_us`.
+    ///
+    /// Events are drained from the collectors (each call returns new events
+    /// since the last drain).
+    pub fn drain_frontier_events(&self) -> Vec<FrontierEvent> {
+        let mut all = Vec::new();
+        for tc in &self.timelines {
+            all.extend(tc.take_frontier_events());
+        }
+        all.sort_by_key(|e| e.timestamp_us);
+        all
+    }
+
+    /// Total number of frontier events currently recorded (across all workers).
+    pub fn frontier_event_count(&self) -> usize {
+        self.timelines
+            .iter()
+            .map(|tc| tc.frontier_event_count())
+            .sum()
+    }
+
+    /// Collect all transfer events from all workers, sorted by `timestamp_us`.
+    ///
+    /// Events are drained from the collectors (each call returns new events
+    /// since the last drain).
+    pub fn drain_transfer_events(&self) -> Vec<TransferEvent> {
+        let mut all = Vec::new();
+        for tc in &self.timelines {
+            all.extend(tc.take_transfer_events());
+        }
+        all.sort_by_key(|e| e.timestamp_us);
+        all
+    }
+
+    /// Total number of transfer events currently recorded (across all workers).
+    pub fn transfer_event_count(&self) -> usize {
+        self.timelines
+            .iter()
+            .map(|tc| tc.transfer_event_count())
+            .sum()
+    }
+
     /// Build a [`ChromeTraceExporter`] from the collected metrics.
     ///
     /// **Note:** This method *drains* the timeline events (they are removed
@@ -592,6 +762,8 @@ impl DataflowMetrics {
     #[cfg(feature = "chrome-trace")]
     pub fn drain_to_chrome_trace(&self, dataflow_name: impl Into<String>) -> ChromeTraceExporter {
         let events = self.drain_timeline_events();
+        let frontier_events = self.drain_frontier_events();
+        let transfer_events = self.drain_transfer_events();
         let channels = self.channel_snapshots();
         let operators: Vec<(usize, String)> = self
             .operator_snapshots()
@@ -602,6 +774,8 @@ impl DataflowMetrics {
 
         ChromeTraceExporter::new(dataflow_name)
             .with_activations(&events, &operators)
+            .with_frontiers(&frontier_events, &operators)
+            .with_transfers(&transfer_events)
             .with_channels(&channels)
             .with_metadata(num_workers)
     }
@@ -919,5 +1093,152 @@ mod tests {
     fn timeline_collector_is_send_sync() {
         fn assert_send_sync<T: Send + Sync>() {}
         assert_send_sync::<TimelineCollector>();
+    }
+
+    // -----------------------------------------------------------------------
+    // Frontier event tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn timeline_collector_records_frontier_events() {
+        let start_time = std::time::Instant::now();
+        let tc = TimelineCollector::new(0, start_time, Duration::ZERO, 0);
+
+        tc.record_frontier(0, "{5}".to_string());
+        tc.record_frontier(1, "{10}".to_string());
+
+        let events = tc.take_frontier_events();
+        assert_eq!(events.len(), 2);
+        assert_eq!(events[0].operator_index, 0);
+        assert_eq!(events[0].worker_index, 0);
+        assert_eq!(events[0].new_frontier, "{5}");
+        assert_eq!(events[1].operator_index, 1);
+        assert_eq!(events[1].new_frontier, "{10}");
+        assert!(events[0].timestamp_us <= events[1].timestamp_us);
+
+        // After take, empty.
+        assert!(tc.take_frontier_events().is_empty());
+    }
+
+    #[test]
+    fn frontier_events_ring_buffer_cap() {
+        let start_time = std::time::Instant::now();
+        let tc = TimelineCollector::new(0, start_time, Duration::ZERO, 3);
+
+        for i in 0..5 {
+            tc.record_frontier(i, format!("{{{i}}}"));
+        }
+
+        let events = tc.take_frontier_events();
+        assert_eq!(events.len(), 3);
+        assert_eq!(events[0].operator_index, 2);
+        assert_eq!(events[1].operator_index, 3);
+        assert_eq!(events[2].operator_index, 4);
+    }
+
+    // -----------------------------------------------------------------------
+    // Transfer event tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn timeline_collector_records_transfer_events() {
+        let start_time = std::time::Instant::now();
+        let tc = TimelineCollector::new(0, start_time, Duration::ZERO, 0);
+
+        tc.record_transfer(0, 1, 100, 800);
+        tc.record_transfer(1, 2, 50, 400);
+
+        let events = tc.take_transfer_events();
+        assert_eq!(events.len(), 2);
+        assert_eq!(events[0].edge_index, 0);
+        assert_eq!(events[0].source_worker, 0);
+        assert_eq!(events[0].target_worker, 1);
+        assert_eq!(events[0].items, 100);
+        assert_eq!(events[0].bytes, 800);
+        assert_eq!(events[1].edge_index, 1);
+        assert_eq!(events[1].target_worker, 2);
+        assert_eq!(events[1].items, 50);
+        assert!(events[0].timestamp_us <= events[1].timestamp_us);
+
+        // After take, empty.
+        assert!(tc.take_transfer_events().is_empty());
+    }
+
+    #[test]
+    fn transfer_events_ring_buffer_cap() {
+        let start_time = std::time::Instant::now();
+        let tc = TimelineCollector::new(0, start_time, Duration::ZERO, 3);
+
+        for i in 0..5 {
+            tc.record_transfer(i, 0, 10, 80);
+        }
+
+        let events = tc.take_transfer_events();
+        assert_eq!(events.len(), 3);
+        assert_eq!(events[0].edge_index, 2);
+        assert_eq!(events[1].edge_index, 3);
+        assert_eq!(events[2].edge_index, 4);
+    }
+
+    // -----------------------------------------------------------------------
+    // DataflowMetrics drain for frontier/transfer
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn dataflow_metrics_drain_frontier_events() {
+        let mut dm = DataflowMetrics::new("frontier-test");
+        let start_time = std::time::Instant::now();
+
+        let tc0 = Arc::new(TimelineCollector::new(0, start_time, Duration::ZERO, 0));
+        let tc1 = Arc::new(TimelineCollector::new(1, start_time, Duration::ZERO, 0));
+
+        dm.register_timeline(Arc::clone(&tc0));
+        dm.register_timeline(Arc::clone(&tc1));
+
+        tc0.record_frontier(0, "{5}".to_string());
+        tc1.record_frontier(1, "{10}".to_string());
+
+        let events = dm.drain_frontier_events();
+        assert_eq!(events.len(), 2);
+        // Sorted by timestamp_us.
+        assert!(events[0].timestamp_us <= events[1].timestamp_us);
+
+        // After drain, empty.
+        assert!(dm.drain_frontier_events().is_empty());
+    }
+
+    #[test]
+    fn dataflow_metrics_drain_transfer_events() {
+        let mut dm = DataflowMetrics::new("transfer-test");
+        let start_time = std::time::Instant::now();
+
+        let tc0 = Arc::new(TimelineCollector::new(0, start_time, Duration::ZERO, 0));
+        dm.register_timeline(Arc::clone(&tc0));
+
+        tc0.record_transfer(0, 1, 100, 800);
+        tc0.record_transfer(1, 2, 50, 400);
+
+        let events = dm.drain_transfer_events();
+        assert_eq!(events.len(), 2);
+        assert_eq!(events[0].edge_index, 0);
+        assert_eq!(events[1].edge_index, 1);
+        assert!(events[0].timestamp_us <= events[1].timestamp_us);
+
+        assert!(dm.drain_transfer_events().is_empty());
+    }
+
+    #[test]
+    fn metrics_config_frontier_transfer_flags() {
+        let full = MetricsConfig::full();
+        assert!(full.frontier_timeline);
+        assert!(full.transfer_timeline);
+
+        let none = MetricsConfig::none();
+        assert!(!none.frontier_timeline);
+        assert!(!none.transfer_timeline);
+
+        let summary = MetricsConfig::summary_only();
+        assert!(!summary.frontier_timeline);
+        assert!(!summary.transfer_timeline);
     }
 }

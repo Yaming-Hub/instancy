@@ -42,7 +42,7 @@ use serde::Serialize;
 use std::io;
 use std::path::Path;
 
-use super::{ActivationEvent, ChannelMetrics};
+use super::{ActivationEvent, ChannelMetrics, FrontierEvent, TransferEvent};
 
 /// A Chrome Trace JSON event (subset of the spec we use).
 #[derive(Serialize)]
@@ -51,13 +51,17 @@ struct TraceEvent {
     name: String,
     /// Event category.
     cat: String,
-    /// Phase: "X" = complete event, "i" = instant, "C" = counter, "M" = metadata.
+    /// Phase: "X" = complete event, "i" = instant, "C" = counter, "M" = metadata,
+    /// "s" = flow start, "f" = flow finish.
     ph: String,
     /// Timestamp in microseconds.
     ts: u64,
     /// Duration in microseconds (only for "X" events).
     #[serde(skip_serializing_if = "Option::is_none")]
     dur: Option<u64>,
+    /// Flow event ID — links "s" and "f" events into connected arrows.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    id: Option<u64>,
     /// Scope for instant events: "g" = global, "p" = process, "t" = thread.
     #[serde(skip_serializing_if = "Option::is_none")]
     s: Option<String>,
@@ -115,12 +119,95 @@ impl ChromeTraceExporter {
                 ph: "X".to_string(),
                 ts: ev.start_us,
                 dur: Some(ev.duration_us),
+                id: None,
                 s: None,
                 pid: 0,
                 tid: ev.worker_index as u64,
                 args: Some(serde_json::json!({
                     "operator_index": ev.operator_index,
                 })),
+            });
+        }
+        self
+    }
+
+    /// Add frontier advance events as Chrome Trace instant events.
+    ///
+    /// Each frontier advance becomes an instant event on the operator's
+    /// worker track, showing when frontiers change.
+    pub fn with_frontiers(
+        mut self,
+        events: &[FrontierEvent],
+        operator_names: &[(usize, String)],
+    ) -> Self {
+        let name_map: std::collections::HashMap<usize, &str> = operator_names
+            .iter()
+            .map(|(idx, name)| (*idx, name.as_str()))
+            .collect();
+
+        for ev in events {
+            let op_name = name_map
+                .get(&ev.operator_index)
+                .copied()
+                .unwrap_or("unknown");
+
+            self.trace_events.push(TraceEvent {
+                name: format!("frontier: {op_name}"),
+                cat: "frontier".to_string(),
+                ph: "i".to_string(),
+                ts: ev.timestamp_us,
+                dur: None,
+                id: None,
+                s: Some("t".to_string()), // thread scope
+                pid: 0,
+                tid: ev.worker_index as u64,
+                args: Some(serde_json::json!({
+                    "operator_index": ev.operator_index,
+                    "new_frontier": ev.new_frontier,
+                })),
+            });
+        }
+        self
+    }
+
+    /// Add transfer events as Chrome Trace flow events.
+    ///
+    /// Each transfer becomes a pair of flow events: a start ("s") on the
+    /// source worker track and a finish ("f") on the target worker track.
+    pub fn with_transfers(mut self, events: &[TransferEvent]) -> Self {
+        for (i, ev) in events.iter().enumerate() {
+            let flow_id = i as u64;
+
+            // Flow start on source worker.
+            self.trace_events.push(TraceEvent {
+                name: format!("transfer[{}]", ev.edge_index),
+                cat: "transfer".to_string(),
+                ph: "s".to_string(),
+                ts: ev.timestamp_us,
+                dur: None,
+                id: Some(flow_id),
+                s: None,
+                pid: 0,
+                tid: ev.source_worker as u64,
+                args: Some(serde_json::json!({
+                    "edge_index": ev.edge_index,
+                    "items": ev.items,
+                    "bytes": ev.bytes,
+                })),
+            });
+
+            // Flow finish on target worker.
+            self.trace_events.push(TraceEvent {
+                name: format!("transfer[{}]", ev.edge_index),
+                cat: "transfer".to_string(),
+                ph: "f".to_string(),
+                ts: ev.timestamp_us,
+                dur: None,
+                id: Some(flow_id),
+                s: None,
+                pid: 0,
+                tid: ev.target_worker as u64,
+                args: None,
             });
         }
         self
@@ -138,6 +225,7 @@ impl ChromeTraceExporter {
                 ph: "i".to_string(),
                 ts: 0,
                 dur: None,
+                id: None,
                 s: Some("g".to_string()),
                 pid: 0,
                 tid: 0,
@@ -164,7 +252,8 @@ impl ChromeTraceExporter {
             ph: "M".to_string(),
             ts: 0,
             dur: None,
-            s: None,
+            id: None,
+                s: None,
             pid: 0,
             tid: 0,
             args: Some(serde_json::json!({
@@ -180,6 +269,7 @@ impl ChromeTraceExporter {
                 ph: "M".to_string(),
                 ts: 0,
                 dur: None,
+                id: None,
                 s: None,
                 pid: 0,
                 tid: w as u64,

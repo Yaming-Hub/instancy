@@ -1277,6 +1277,8 @@ impl RuntimeHandle {
         dataflow.collect_metrics = options.metrics_config.operator_summary;
         dataflow.channel_counters = options.metrics_config.channel_counters;
         dataflow.activation_timeline = options.metrics_config.activation_timeline;
+        dataflow.frontier_timeline = options.metrics_config.frontier_timeline;
+        dataflow.transfer_timeline = options.metrics_config.transfer_timeline;
         dataflow.min_activation_duration = options.metrics_config.min_activation_duration;
         dataflow.max_timeline_events = options.metrics_config.max_timeline_events;
         dataflow.drain_timeout = options.drain_timeout;
@@ -1760,6 +1762,8 @@ impl RuntimeHandle {
             df.collect_metrics = metrics_config.operator_summary;
             df.channel_counters = metrics_config.channel_counters;
             df.activation_timeline = metrics_config.activation_timeline;
+            df.frontier_timeline = metrics_config.frontier_timeline;
+            df.transfer_timeline = metrics_config.transfer_timeline;
             df.min_activation_duration = metrics_config.min_activation_duration;
             df.max_timeline_events = metrics_config.max_timeline_events;
             df.drain_timeout = drain_timeout;
@@ -2077,6 +2081,8 @@ impl RuntimeHandle {
             df.collect_metrics = metrics_config.operator_summary;
             df.channel_counters = metrics_config.channel_counters;
             df.activation_timeline = metrics_config.activation_timeline;
+            df.frontier_timeline = metrics_config.frontier_timeline;
+            df.transfer_timeline = metrics_config.transfer_timeline;
             df.min_activation_duration = metrics_config.min_activation_duration;
             df.max_timeline_events = metrics_config.max_timeline_events;
             df.drain_timeout = drain_timeout;
@@ -5162,6 +5168,8 @@ fn materialize_executor<T: Timestamp>(
         drain_timeout: dataflow.drain_timeout,
         channel_metrics_collectors: std::mem::take(&mut dataflow.channel_metrics_collectors),
         activation_timeline: dataflow.activation_timeline,
+        frontier_timeline: dataflow.frontier_timeline,
+        transfer_timeline: dataflow.transfer_timeline,
         min_activation_duration: dataflow.min_activation_duration,
         max_timeline_events: dataflow.max_timeline_events,
         timeline_start_time,

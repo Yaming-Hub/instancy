@@ -105,6 +105,12 @@ pub struct ExecutorConfig {
     /// operator activation is recorded with a timestamp offset, duration,
     /// operator/worker indices. Used for Chrome Trace / Perfetto UI export.
     pub activation_timeline: bool,
+    /// Whether to record frontier advance events. When enabled, each operator
+    /// frontier change is recorded with a timestamp and new frontier value.
+    pub frontier_timeline: bool,
+    /// Whether to record data transfer events through exchange channels.
+    /// When enabled, each batch push through an exchange is recorded.
+    pub transfer_timeline: bool,
     /// Minimum activation duration to record in the timeline.
     pub min_activation_duration: std::time::Duration,
     /// Maximum timeline events per worker (ring buffer cap). 0 = unlimited.
@@ -127,6 +133,8 @@ impl Default for ExecutorConfig {
             drain_timeout: None,
             channel_metrics_collectors: Vec::new(),
             activation_timeline: false,
+            frontier_timeline: false,
+            transfer_timeline: false,
             min_activation_duration: std::time::Duration::from_micros(1),
             max_timeline_events: 0,
         timeline_start_time: None,
@@ -443,6 +451,11 @@ pub struct DataflowExecutor<T: Timestamp = u64> {
     /// Per-worker timeline collector for activation events.
     /// `None` when `config.activation_timeline` is false.
     timeline_collector: Option<Arc<crate::metrics::TimelineCollector>>,
+    /// Cached frontier strings per operator position for change detection.
+    /// Only allocated when `config.frontier_timeline` is true.
+    /// Prevents recording duplicate frontier events when an operator is marked
+    /// dirty for output-only changes.
+    last_recorded_frontiers: Vec<String>,
     /// Phantom for the timestamp type.
     _phantom: PhantomData<T>,
     /// Whether the executor is in the drain phase (cancellation received,
@@ -476,6 +489,22 @@ impl<T: Timestamp> DataflowExecutor<T> {
         let edges = graph.edges();
         let feedback_edges = graph.feedback_edges();
         let total_edge_count = edges.len() + feedback_edges.len();
+
+        // Create timeline collector early so exchange channels can capture it.
+        let timeline_start = config.timeline_start_time.unwrap_or_else(Instant::now);
+        let any_timeline = config.activation_timeline
+            || config.frontier_timeline
+            || config.transfer_timeline;
+        let timeline_collector = if any_timeline {
+            Some(Arc::new(crate::metrics::TimelineCollector::new(
+                worker_context.worker_index(),
+                timeline_start,
+                config.min_activation_duration,
+                config.max_timeline_events,
+            )))
+        } else {
+            None
+        };
 
         // Phase 1: Create channels for each edge (regular + feedback).
         // channel_endpoints[edge_index] = (push_end, pull_end)
@@ -639,7 +668,9 @@ impl<T: Timestamp> DataflowExecutor<T> {
         // Initialize per-operator metrics collectors when enabled.
         let needs_metrics = config.collect_metrics
             || !config.channel_metrics_collectors.is_empty()
-            || config.activation_timeline;
+            || config.activation_timeline
+            || config.frontier_timeline
+            || config.transfer_timeline;
         let (dataflow_metrics, op_collectors) = if needs_metrics {
             let mut dm = DataflowMetrics::new("dataflow");
             let collectors: Vec<Option<Arc<OperatorMetricsCollector>>> = if config.collect_metrics {
@@ -663,19 +694,6 @@ impl<T: Timestamp> DataflowExecutor<T> {
             (None, Vec::new())
         };
 
-        // Create timeline collector when activation_timeline is enabled.
-        let timeline_start = config.timeline_start_time.unwrap_or_else(Instant::now);
-        let timeline_collector = if config.activation_timeline {
-            Some(Arc::new(crate::metrics::TimelineCollector::new(
-                worker_context.worker_index(),
-                timeline_start,
-                config.min_activation_duration,
-                config.max_timeline_events,
-            )))
-        } else {
-            None
-        };
-
         // Register timeline collector on DataflowMetrics (before wrapping in Arc).
         let dataflow_metrics = if let Some(mut dm) = dataflow_metrics {
             if let Some(ref tc) = timeline_collector {
@@ -690,6 +708,8 @@ impl<T: Timestamp> DataflowExecutor<T> {
         // need to produce initial output like sources).
         let ready_queue: VecDeque<usize> = (0..operators.len()).collect();
         let in_queue = vec![true; operators.len()];
+        let num_operators = operators.len();
+        let frontier_timeline_enabled = config.frontier_timeline;
         let wall_start = config.collect_metrics.then(Instant::now);
 
         Ok(Self {
@@ -721,6 +741,11 @@ impl<T: Timestamp> DataflowExecutor<T> {
             wall_start,
             op_collectors,
             timeline_collector,
+            last_recorded_frontiers: if frontier_timeline_enabled {
+                vec![String::new(); num_operators]
+            } else {
+                Vec::new()
+            },
             _phantom: PhantomData,
             draining: false,
             drain_deadline: None,
@@ -1035,6 +1060,23 @@ impl<T: Timestamp> DataflowExecutor<T> {
             // New path: operator-owned notificator (WiredUnaryNotifyOperator etc.)
             // The operator downcasts &dyn Any to &Antichain<T> internally.
             self.operators[*pos].update_input_frontier(frontier);
+        }
+
+        // Record frontier events for dirty operators when frontier timeline is enabled.
+        // Only record when the input frontier actually changed (dirty operators may
+        // be marked for output-frontier-only changes).
+        if self.config.frontier_timeline {
+            if let Some(ref tc) = self.timeline_collector {
+                for &(pos, ref frontier) in &frontier_updates {
+                    let s = format!("{:?}", frontier);
+                    if pos < self.last_recorded_frontiers.len()
+                        && self.last_recorded_frontiers[pos] != s
+                    {
+                        self.last_recorded_frontiers[pos] = s.clone();
+                        tc.record_frontier(pos, s);
+                    }
+                }
+            }
         }
 
         let mut activated = false;
@@ -1849,6 +1891,7 @@ mod tests {
                 wall_start: None,
                 op_collectors: Vec::new(),
                 timeline_collector: None,
+                last_recorded_frontiers: Vec::new(),
                 _phantom: PhantomData,
                 draining: false,
                 drain_deadline: None,
@@ -1971,6 +2014,7 @@ mod tests {
             wall_start: None,
             op_collectors: Vec::new(),
             timeline_collector: None,
+            last_recorded_frontiers: Vec::new(),
             _phantom: PhantomData,
             draining: false,
             drain_deadline: None,
@@ -2020,6 +2064,7 @@ mod tests {
             wall_start: None,
             op_collectors: Vec::new(),
             timeline_collector: None,
+            last_recorded_frontiers: Vec::new(),
             _phantom: PhantomData,
             draining: false,
             drain_deadline: None,
@@ -2073,6 +2118,7 @@ mod tests {
             wall_start: None,
             op_collectors: Vec::new(),
             timeline_collector: None,
+            last_recorded_frontiers: Vec::new(),
             _phantom: PhantomData,
             draining: false,
             drain_deadline: None,
@@ -2114,6 +2160,7 @@ mod tests {
             wall_start: None,
             op_collectors: Vec::new(),
             timeline_collector: None,
+            last_recorded_frontiers: Vec::new(),
             _phantom: PhantomData,
             draining: false,
             drain_deadline: None,
@@ -2162,6 +2209,8 @@ mod tests {
             drain_timeout: None,
                 channel_metrics_collectors: Vec::new(),
             activation_timeline: false,
+            frontier_timeline: false,
+            transfer_timeline: false,
             min_activation_duration: std::time::Duration::from_micros(1),
             max_timeline_events: 0,
             timeline_start_time: None,
@@ -2188,6 +2237,7 @@ mod tests {
             wall_start: None,
             op_collectors: Vec::new(),
             timeline_collector: None,
+            last_recorded_frontiers: Vec::new(),
             _phantom: PhantomData,
             draining: false,
             drain_deadline: None,
@@ -2273,6 +2323,7 @@ mod tests {
             wall_start: None,
             op_collectors: Vec::new(),
             timeline_collector: None,
+            last_recorded_frontiers: Vec::new(),
             _phantom: PhantomData,
             draining: false,
             drain_deadline: None,
@@ -2340,6 +2391,7 @@ mod tests {
             wall_start: None,
             op_collectors: Vec::new(),
             timeline_collector: None,
+            last_recorded_frontiers: Vec::new(),
             _phantom: PhantomData,
             draining: false,
             drain_deadline: None,
@@ -2393,6 +2445,7 @@ mod tests {
             wall_start: None,
             op_collectors: Vec::new(),
             timeline_collector: None,
+            last_recorded_frontiers: Vec::new(),
             _phantom: PhantomData,
             draining: false,
             drain_deadline: None,
@@ -2459,6 +2512,7 @@ mod tests {
             wall_start: None,
             op_collectors: Vec::new(),
             timeline_collector: None,
+            last_recorded_frontiers: Vec::new(),
             _phantom: PhantomData,
             draining: false,
             drain_deadline: None,
@@ -2524,6 +2578,7 @@ mod tests {
             wall_start: None,
             op_collectors: Vec::new(),
             timeline_collector: None,
+            last_recorded_frontiers: Vec::new(),
             _phantom: PhantomData,
             draining: false,
             drain_deadline: None,
@@ -2577,6 +2632,8 @@ mod tests {
             drain_timeout: None,
                 channel_metrics_collectors: Vec::new(),
             activation_timeline: false,
+            frontier_timeline: false,
+            transfer_timeline: false,
             min_activation_duration: std::time::Duration::from_micros(1),
             max_timeline_events: 0,
             timeline_start_time: None,
@@ -2603,6 +2660,7 @@ mod tests {
             wall_start: None,
             op_collectors: Vec::new(),
             timeline_collector: None,
+            last_recorded_frontiers: Vec::new(),
             _phantom: PhantomData,
             draining: false,
             drain_deadline: None,
@@ -2669,6 +2727,8 @@ mod tests {
             drain_timeout: None,
                 channel_metrics_collectors: Vec::new(),
             activation_timeline: false,
+            frontier_timeline: false,
+            transfer_timeline: false,
             min_activation_duration: std::time::Duration::from_micros(1),
             max_timeline_events: 0,
             timeline_start_time: None,
@@ -2695,6 +2755,7 @@ mod tests {
             wall_start: None,
             op_collectors: Vec::new(),
             timeline_collector: None,
+            last_recorded_frontiers: Vec::new(),
             _phantom: PhantomData,
             draining: false,
             drain_deadline: None,
@@ -2769,6 +2830,7 @@ mod tests {
             wall_start: None,
             op_collectors: Vec::new(),
             timeline_collector: None,
+            last_recorded_frontiers: Vec::new(),
             _phantom: PhantomData,
             draining: false,
             drain_deadline: None,
@@ -3188,6 +3250,8 @@ mod tests {
             drain_timeout: None,
                 channel_metrics_collectors: Vec::new(),
             activation_timeline: false,
+            frontier_timeline: false,
+            transfer_timeline: false,
             min_activation_duration: std::time::Duration::from_micros(1),
             max_timeline_events: 0,
             timeline_start_time: None,
@@ -3214,6 +3278,7 @@ mod tests {
             wall_start: None,
             op_collectors: Vec::new(),
             timeline_collector: None,
+            last_recorded_frontiers: Vec::new(),
             _phantom: PhantomData,
             draining: false,
             drain_deadline: None,
@@ -3272,6 +3337,8 @@ mod tests {
             drain_timeout: None,
                 channel_metrics_collectors: Vec::new(),
             activation_timeline: false,
+            frontier_timeline: false,
+            transfer_timeline: false,
             min_activation_duration: std::time::Duration::from_micros(1),
             max_timeline_events: 0,
             timeline_start_time: None,
@@ -3298,6 +3365,7 @@ mod tests {
             wall_start: None,
             op_collectors: Vec::new(),
             timeline_collector: None,
+            last_recorded_frontiers: Vec::new(),
             _phantom: PhantomData,
             draining: false,
             drain_deadline: None,
@@ -3353,6 +3421,7 @@ mod tests {
             wall_start: None,
             op_collectors: Vec::new(),
             timeline_collector: None,
+            last_recorded_frontiers: Vec::new(),
             _phantom: PhantomData,
             draining: false,
             drain_deadline: None,
@@ -3420,6 +3489,7 @@ mod tests {
             wall_start: None,
             op_collectors: Vec::new(),
             timeline_collector: None,
+            last_recorded_frontiers: Vec::new(),
             _phantom: PhantomData,
             draining: false,
             drain_deadline: None,
@@ -3476,6 +3546,7 @@ mod tests {
             wall_start: None,
             op_collectors: Vec::new(),
             timeline_collector: None,
+            last_recorded_frontiers: Vec::new(),
             _phantom: PhantomData,
             draining: false,
             drain_deadline: None,
@@ -3531,6 +3602,7 @@ mod tests {
             wall_start: None,
             op_collectors: Vec::new(),
             timeline_collector: None,
+            last_recorded_frontiers: Vec::new(),
             _phantom: PhantomData,
             draining: false,
             drain_deadline: None,
@@ -3586,6 +3658,7 @@ mod tests {
             wall_start: None,
             op_collectors: Vec::new(),
             timeline_collector: None,
+            last_recorded_frontiers: Vec::new(),
             _phantom: PhantomData,
             draining: false,
             drain_deadline: None,
@@ -3676,6 +3749,7 @@ mod tests {
             wall_start: None,
             op_collectors: Vec::new(),
             timeline_collector: None,
+            last_recorded_frontiers: Vec::new(),
             _phantom: PhantomData,
             draining: false,
             drain_deadline: None,
@@ -3744,6 +3818,7 @@ mod tests {
             wall_start: None,
             op_collectors: Vec::new(),
             timeline_collector: None,
+            last_recorded_frontiers: Vec::new(),
             _phantom: PhantomData,
             draining: false,
             drain_deadline: None,
@@ -3810,6 +3885,7 @@ mod tests {
             wall_start: None,
             op_collectors: Vec::new(),
             timeline_collector: None,
+            last_recorded_frontiers: Vec::new(),
             _phantom: PhantomData,
             draining: false,
             drain_deadline: None,
@@ -3879,6 +3955,7 @@ mod tests {
             wall_start: None,
             op_collectors: Vec::new(),
             timeline_collector: None,
+            last_recorded_frontiers: Vec::new(),
             _phantom: PhantomData,
             draining: false,
             drain_deadline: None,
@@ -3962,6 +4039,7 @@ mod tests {
             wall_start: None,
             op_collectors: Vec::new(),
             timeline_collector: None,
+            last_recorded_frontiers: Vec::new(),
             _phantom: PhantomData,
             draining: false,
             drain_deadline: None,
@@ -4018,6 +4096,7 @@ mod tests {
             wall_start: None,
             op_collectors: Vec::new(),
             timeline_collector: None,
+            last_recorded_frontiers: Vec::new(),
             _phantom: PhantomData,
             draining: false,
             drain_deadline: None,
@@ -4185,6 +4264,8 @@ mod tests {
             drain_timeout: Some(std::time::Duration::from_secs(5)),
             channel_metrics_collectors: Vec::new(),
         activation_timeline: false,
+            frontier_timeline: false,
+            transfer_timeline: false,
         min_activation_duration: std::time::Duration::from_micros(1),
         max_timeline_events: 0,
         timeline_start_time: None,
@@ -4219,6 +4300,8 @@ mod tests {
             drain_timeout: None,
                 channel_metrics_collectors: Vec::new(),
         activation_timeline: false,
+            frontier_timeline: false,
+            transfer_timeline: false,
         min_activation_duration: std::time::Duration::from_micros(1),
         max_timeline_events: 0,
         timeline_start_time: None,
@@ -4267,6 +4350,8 @@ mod tests {
             drain_timeout: Some(std::time::Duration::from_millis(50)),
             channel_metrics_collectors: Vec::new(),
         activation_timeline: false,
+            frontier_timeline: false,
+            transfer_timeline: false,
         min_activation_duration: std::time::Duration::from_micros(1),
         max_timeline_events: 0,
         timeline_start_time: None,
@@ -4302,6 +4387,8 @@ mod tests {
             drain_timeout: Some(std::time::Duration::from_secs(5)),
             channel_metrics_collectors: Vec::new(),
         activation_timeline: false,
+            frontier_timeline: false,
+            transfer_timeline: false,
         min_activation_duration: std::time::Duration::from_micros(1),
         max_timeline_events: 0,
         timeline_start_time: None,
