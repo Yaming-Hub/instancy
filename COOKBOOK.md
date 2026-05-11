@@ -789,7 +789,128 @@ let result = handle.join_blocking();
 assert!(result.is_err()); // Drain timed out → Cancelled.
 ```
 
-## 11. Common Pitfalls
+## 11. Cluster Dataflows
+
+### Spawn a two-node cluster with duplex streams
+
+Simulate a multi-node cluster in a single process using `tokio::io::duplex`:
+
+```rust
+use std::time::Duration;
+use instancy::communication::ClusterSpawnTransport;
+use instancy::communication::transport_session::PeerConnection;
+use instancy::{
+    ClusterTopology, DataflowBuilder, DataflowId, NodeConfig, Result,
+    RuntimeConfig, RuntimeHandle, SpawnOptions,
+};
+
+fn make_duplex_pair(
+    node_a: &str,
+    node_b: &str,
+    buffer_size: usize,
+) -> (
+    PeerConnection<tokio::io::DuplexStream, tokio::io::DuplexStream>,
+    PeerConnection<tokio::io::DuplexStream, tokio::io::DuplexStream>,
+) {
+    let (a_to_b, b_from_a) = tokio::io::duplex(buffer_size);
+    let (b_to_a, a_from_b) = tokio::io::duplex(buffer_size);
+    let conn_a = PeerConnection {
+        node_id: node_b.to_string(),
+        reader: a_from_b,
+        writer: a_to_b,
+    };
+    let conn_b = PeerConnection {
+        node_id: node_a.to_string(),
+        reader: b_from_a,
+        writer: b_to_a,
+    };
+    (conn_a, conn_b)
+}
+
+// Both nodes must call spawn_cluster concurrently.
+let topology = ClusterTopology::multi_node(vec![
+    NodeConfig::new("node-a", 1),
+    NodeConfig::new("node-b", 1),
+]).unwrap();
+let dataflow_id = DataflowId::new();
+let (conn_a, conn_b) = make_duplex_pair("node-a", "node-b", 64 * 1024);
+
+let build = |builder: &mut DataflowBuilder<u64>| -> Result<()> {
+    builder.input::<i32>("data").unwrap()
+        .map("double", |_t, x| x * 2)
+        .output("results").unwrap();
+    Ok(())
+};
+
+// Spawn each node on a blocking task (handshake blocks the thread).
+let rt_a = RuntimeHandle::new(RuntimeConfig::default()).unwrap();
+let rt_b = RuntimeHandle::new(RuntimeConfig::default()).unwrap();
+let tokio_handle = tokio::runtime::Handle::current();
+
+// ... spawn_cluster on each node with topology, connections, and a 5s timeout ...
+```
+
+### Cluster startup protocol
+
+`spawn_cluster` follows a strict multi-phase protocol before any operators run:
+
+1. **Build** — each node calls the `build` closure to construct its local dataflow
+2. **Fingerprint** — compute a hash of the dataflow graph (operator count, edge count, exchange indices)
+3. **Handshake** — exchange fingerprints with all peers; fail if any mismatch
+4. **Wire channels** — create exchange channels and progress channels backed by the network transport
+5. **Ready barrier** — each node sends `Ready` and waits for all peers to confirm before proceeding
+6. **Materialize** — create operator tasks and begin execution
+
+Both the handshake and ready barrier use the `handshake_timeout` parameter. If any peer doesn't respond in time, `spawn_cluster` returns an error (the `HandshakeError::Timeout` variant wrapped in the crate's `Error` type). No operators are started, and no resources are leaked.
+
+### Collect metrics from a cluster
+
+Enable observability on cluster dataflows with `SpawnOptions::metrics()`:
+
+```rust
+use instancy::{SpawnOptions, metrics::MetricsConfig};
+
+let opts = SpawnOptions::new().metrics(MetricsConfig::summary_only());
+let mut cluster = rt.spawn_cluster(
+    "monitored", topology, "node-a", dataflow_id,
+    transport, Duration::from_secs(5), build, &tokio_handle, opts,
+).unwrap();
+
+// Access metrics for a specific local worker (0-based).
+if let Some(m) = cluster.worker_metrics(0) {
+    println!("activations: {}", m.total_activations());
+    println!("records: {}", m.total_records_processed());
+}
+
+// Or collect metrics from all local workers at once.
+for (i, m) in cluster.all_worker_metrics().iter().enumerate() {
+    if let Some(m) = m {
+        let snaps = m.operator_snapshots();
+        for snap in &snaps {
+            println!("worker {i} / {}: {} records",
+                snap.name, snap.records_processed);
+        }
+    }
+}
+```
+
+### Cancel a cluster dataflow
+
+Cancelling one node propagates to all peers via the control channel:
+
+```rust
+use instancy::cancellation::CancellationReason;
+
+// Cancel with a reason — all peers receive PeerCancelled.
+cluster_a.cancel_with_reason(CancellationReason::UserRequested);
+
+// Or use an external cancellation token via SpawnOptions:
+let token = tokio_util::sync::CancellationToken::new();
+let opts = SpawnOptions::new().cancellation_token(token.clone());
+// Later: token.cancel() cancels the cluster and propagates to peers.
+```
+
+## 12. Common Pitfalls
 
 ### Pitfall: forgetting to drop the input sender
 If the sender stays alive, the runtime assumes more data may still arrive.
