@@ -2017,7 +2017,7 @@ impl RuntimeHandle {
     /// Internal implementation for [`spawn_staged`](Self::spawn_staged).
     ///
     /// Creates per-stage worker groups with heterogeneous parallelism.
-    /// Exchange edges between stages with different parallelism use MN
+    /// Exchange edges between stages with different parallelism use M×N
     /// asymmetric channels.
     #[allow(clippy::too_many_arguments)]
     fn spawn_staged_internal<T, F>(

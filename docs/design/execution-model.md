@@ -1301,7 +1301,7 @@ With per-stage parallelism:
 
 The user never specifies "local" vs "global" — the runtime infers it from the cluster topology and stage placement. This keeps the logical API clean and topology-agnostic.
 
-**Current status:** Per-stage parallelism is fully implemented. `spawn_multi` with `per_stage_parallelism(true)` (the default) automatically routes to `spawn_staged_internal`, which creates `max(P_i)` workers and strips non-participating operators via `retain_stages()`. Ghost operators maintain correct frontier propagation across stage boundaries.
+**Current status:** Per-stage parallelism is fully implemented. `spawn_multi` with `per_stage_parallelism(true)` (the default) automatically routes to `spawn_staged_internal`, which resolves per-stage parallelism and delegates to `spawn_multi_internal`. The runtime builds the logical dataflow once, creates `max(P_i)` workers, and marks non-participating operators as ghost operators via `mark_ghost_operators()`. Ghost operators maintain correct frontier propagation across stage boundaries without being materialized.
 
 
 ## Per-stage parallelism design notes
@@ -1754,18 +1754,24 @@ on that node.
 
 ### Per-Stage Materialization
 
-Instead of building max(P_i) full copies and patching with NullOperator:
+The runtime builds the logical dataflow **once** and materializes it per worker
+with ghost operator filtering:
 
-1. **Build once** (probe) → LogicalDataflow with stages, parallelism, graph
-2. **Build P_i copies per stage** — call the build closure max(P_i) times,
-   but for each worker only retain the operator/channel factories for its
-   participating stages. Discard (not null) non-participating factories.
-3. **Per-stage SubgraphBuilder** — each worker's progress tracker only covers
-   its participating stages. No leaked capabilities.
-4. **Exchange channels** connect M source workers to N target workers directly.
-   No no-op endpoints — only participating workers have endpoints.
-5. **Per-stage progress exchange** — workers only exchange progress with peers
-   in the same stage. Cross-stage progress flows through exchange channels.
+1. **Build once** — a single `LogicalDataflow` with all stages, operators, and
+   exchange boundaries.
+2. **Compute per-worker ghost sets** — for each worker, operators in stages where
+   `worker_idx >= stage_parallelism` are marked as ghost operators. Their
+   factories are never called; their pipeline channels are never created.
+3. **Asymmetric exchange channels** — exchange edges between stages with
+   parallelism M and N use `creator(M, N, ...)` producing `max(M, N)` factories.
+   Only workers participating in at least one side get a factory.
+4. **Ghost operators in progress tracking** — `SubgraphBuilder::mark_ghost_operators()`
+   keeps operator shapes and connectivity in the reachability graph but removes
+   initial capabilities and progress buffers. Cross-stage frontier propagation
+   works through ghost operators via peer progress broadcasts.
+5. **Global progress exchange** — all `max(P_i)` workers exchange progress
+   together. Ghost operators don't generate progress but relay frontier changes
+   from peers to downstream stages.
 
 ```
 Worker allocation for stages [par=1, par=4, par=1]:
@@ -1807,14 +1813,15 @@ empty progress messages.
 ### Phase 7: `spawn_dataflow` API + stage 0 auto-parallelism ✅
 - `SpawnOptions::auto_parallelism(true)` — build closure `Fn(usize, &mut DataflowBuilder)` 
 - Stage 0 parallelism = count of `input()` + `source_async()` operators in stage 0
-- Internally builds max(P_i) copies via `spawn_staged_internal`
+- Internally resolves per-stage parallelism and delegates to `spawn_multi_internal`
 - Integration tests for auto-parallelism (PR #195)
 
 ### Phase 8: Per-stage executor materialization ✅
-- `LogicalDataflow::retain_stages()` strips non-participating operator/channel factories
-- `SubgraphBuilder::retain_operators()` removes operators from progress tracker
-- Edge index remapping for compacted edge vectors
-- Workers only materialize operators for stages they participate in (PR #196)
+- Ghost operator filtering via `ghost_operators: HashSet<usize>` passed through
+  `prepare_worker` and `materialize_executor`
+- `DataflowExecutor::materialize()` skips factory calls for ghost operators and
+  channels between two ghost operators
+- Workers only materialize operators for stages they participate in (PR #196, updated in PR #255)
 
 ### Phase 9: Ghost operators for cross-stage frontier propagation ✅
 - `SubgraphBuilder::mark_ghost_operators()` — keeps shapes and connectivity in
@@ -1842,7 +1849,7 @@ when exchange channels become active.
 
 ### Phase 1: Build
 
-The user's build closure constructs the logical dataflow graph. All
+The user's build closure constructs the logical dataflow graph once. All
 operators, channels, and exchange boundaries are registered.
 
 ```
@@ -1853,23 +1860,25 @@ build(&mut builder) → LogicalDataflow
   └── Subgraph topology recorded (for progress tracking)
 ```
 
-**Current model:** called N times, producing N independent LogicalDataflows.
-**Target model:** called once, producing a single LogicalDataflow with
-replayable factories that can produce N operator instances.
+The build closure runs once, producing a single `LogicalDataflow` with
+replayable factories (FnMut) that produce independent operator instances
+for each worker during materialization.
 
 ### Phase 2: Materialize (single thread, sequential)
 
-The runtime materializes the logical dataflow N times (once per worker).
-Each materialization clones operator factories to produce independent
-operator instances with their own state.
+The runtime materializes the single logical dataflow N times (once per worker).
+Each materialization calls the replayable factories (FnMut) to produce
+independent operator instances. Non-participating operators are skipped
+(ghost operators).
 
 ```
 for worker_idx in 0..N:
-    factory.build(worker_ctx)
-    ├── logic.clone()           ← fresh copy of user's closure
-    ├── create channels         ← new push/pull endpoints
-    ├── wire operator           ← operator owns cloned logic + endpoints
-    └── build progress tracker  ← from cloned SubgraphBuilder
+    ghost_ops = operators in stages where worker_idx >= stage_parallelism
+    factory.build(worker_ctx)       ← only for non-ghost operators
+    ├── logic.clone()               ← fresh copy of user's closure
+    ├── create channels             ← skip channels between two ghosts
+    ├── wire operator               ← operator owns cloned logic + endpoints
+    └── build progress tracker      ← SubgraphBuilder clone with ghost marks
 ```
 
 **Key invariant:** All cloning happens here, sequentially, on a single
