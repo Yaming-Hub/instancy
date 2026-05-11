@@ -2,7 +2,7 @@
 
 This document defines how instancy serializes data across process boundaries without hard-coding a single wire format.
 
-Back to the overview: [docs/DESIGN.md](./DESIGN.md)
+Back to the overview: [Design Overview](./README.md)
 
 ## 7. Pluggable Serialization
 

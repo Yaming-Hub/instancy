@@ -2,7 +2,7 @@
 
 This document collects the major architectural decisions behind instancy, the trade-offs accepted by the design, and the conventions that shape the public API and implementation model.
 
-Back to the overview: [docs/DESIGN.md](./DESIGN.md)
+Back to the overview: [Design Overview](./README.md)
 
 ## 12. Key Design Decisions & Trade-offs
 

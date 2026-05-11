@@ -2,7 +2,7 @@
 
 This document describes the operator surface of instancy: the built-in operator set, the user-extensible API, the runtime error policy seen by operators, and end-to-end examples of building and driving dataflows.
 
-Back to the overview: [docs/DESIGN.md](./DESIGN.md)
+Back to the overview: [Design Overview](./README.md)
 
 ### 5.9 Error Handling Policy
 

@@ -2,7 +2,7 @@
 
 This document explains how instancy preserves timely-style progress semantics while supporting fused stages, shared worker pools, feedback loops, and distributed execution.
 
-Back to the overview: [docs/DESIGN.md](./DESIGN.md)
+Back to the overview: [Design Overview](./README.md)
 
 ## 11. Progress Tracking Details
 

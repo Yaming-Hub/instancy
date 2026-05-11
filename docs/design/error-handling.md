@@ -2,7 +2,7 @@
 
 This document defines the error model for instancy: typed error hierarchies, propagation rules, poison handling patterns, and the design requirement that library code return errors instead of panicking.
 
-Back to the overview: [docs/DESIGN.md](./DESIGN.md)
+Back to the overview: [Design Overview](./README.md)
 
 ## 8. Error Handling
 

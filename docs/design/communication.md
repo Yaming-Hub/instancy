@@ -2,11 +2,11 @@
 
 This document covers the physical transport layer behind instancy's logical channels: in-process queues, application-provided connection establishment, pooled/shared connections, framing, and dataflow isolation across shared resources.
 
-Back to the overview: [docs/DESIGN.md](./DESIGN.md)
+Back to the overview: [Design Overview](./README.md)
 
 ## 6. Communication Layer
 
-The communication layer implements the physical delivery mechanisms behind the [TransportProvider trait (§4.5)](./DESIGN.md#45-logicalphysical-separation-architecture). At the logical layer, operators only see `Push` and `Pull` endpoints. The communication layer provides the concrete implementations.
+The communication layer implements the physical delivery mechanisms behind the [TransportProvider trait (§4.5)](./README.md#45-logicalphysical-separation-architecture). At the logical layer, operators only see `Push` and `Pull` endpoints. The communication layer provides the concrete implementations.
 
 ### 6.1 Intra-Process Channels
 
@@ -798,7 +798,7 @@ instancy owns retrying and reconnecting transport sessions that were created thr
 
 instancy has reconnection logic in `SharedTransport` (exponential backoff,
 connection factory retry) but none of this is documented for users. The
-`GUIDE.md`, `README.md`, and key struct doc comments are silent on:
+user guide, `README.md`, and key struct doc comments are silent on:
 
 - What happens when a TCP connection drops mid-dataflow
 - Who is responsible for reconnection (library vs application)
@@ -807,7 +807,7 @@ connection factory retry) but none of this is documented for users. The
 
 ### Changes
 
-1. **Add "Connection Failure & Reconnection" section to GUIDE.md** covering:
+1. **Add a "Connection Failure & Reconnection" section to `docs/guide/distributed.md`** covering:
    - SharedTransport automatic reconnect with backoff (100ms→800ms, 5 attempts, 4 delays)
    - Connection factory role (if provided, library retries; if not, failure is permanent)
    - Application-level errors: `TransportError::ConnectionClosed` and `TransportError::ReorderTimeout`

@@ -2,7 +2,7 @@
 
 This document describes how instancy executes logical dataflows: worker-pool scheduling, logical workers, staged execution, external I/O boundaries, and the runtime rules that keep throughput, ordering, and backpressure predictable.
 
-Back to the overview: [docs/DESIGN.md](./DESIGN.md)
+Back to the overview: [Design Overview](./README.md)
 
 ## 5. Execution Model
 

@@ -13,6 +13,7 @@ This document is the entry point for the instancy design set. It keeps the archi
 - [Serialization](./serialization.md) — codec trait, default bincode codec, and data/exchange bounds.
 - [Operators](./operators.md) — core operators, extension model, error policy, and user-facing API examples.
 - [Design decisions & trade-offs](./decisions.md) — major architectural choices, checkpointing, throughput trade-offs, task scheduling policy, and open questions.
+- [DataFusion gap analysis](./datafusion-gap-analysis.md) — feature-by-feature notes on where instancy differs from DataFusion-style execution needs.
 
 > Each topic file links back here. Detailed material has been moved out of the old monolithic root-level design documents.
 

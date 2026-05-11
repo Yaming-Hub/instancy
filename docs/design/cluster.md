@@ -2,7 +2,7 @@
 
 This document collects the distributed-runtime design: cluster startup, distributed cancellation, membership changes, coordinator integration, multi-cluster isolation, and the testing model for true cross-process execution.
 
-Back to the overview: [docs/DESIGN.md](./DESIGN.md)
+Back to the overview: [Design Overview](./README.md)
 
 ### 5.5 Cancellation
 

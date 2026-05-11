@@ -2,7 +2,7 @@
 
 This document covers the built-in observability surface for instancy: per-dataflow metrics, operator metrics, timelines, tracing integration, message envelopes, and the information a host can aggregate across nodes.
 
-Back to the overview: [docs/DESIGN.md](./DESIGN.md)
+Back to the overview: [Design Overview](./README.md)
 
 ### 5.7b Observability & Metrics
 
