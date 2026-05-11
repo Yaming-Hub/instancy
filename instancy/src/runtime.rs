@@ -2375,6 +2375,7 @@ impl RuntimeHandle {
         handshake_timeout: std::time::Duration,
         build: F,
         runtime_handle: &tokio::runtime::Handle,
+        options: SpawnOptions,
     ) -> Result<ClusterSpawnedDataflow<T>>
     where
         T: Timestamp + crate::communication::codec::ExchangeData,
@@ -2406,11 +2407,20 @@ impl RuntimeHandle {
         let num_local = local_end - local_start;
 
         // Phase 1: Build local workers from the closure.
+        let metrics_config = options.metrics_config.clone();
         let mut dataflows = Vec::with_capacity(num_local);
         for worker_idx in local_start..local_end {
             let mut builder = DataflowBuilder::new(format!("{name}/worker-{worker_idx}"));
             build(&mut builder)?;
-            let df = builder.build()?;
+            let mut df = builder.build()?;
+            df.collect_metrics = metrics_config.operator_summary;
+            df.channel_counters = metrics_config.channel_counters;
+            df.activation_timeline = metrics_config.activation_timeline;
+            df.frontier_timeline = metrics_config.frontier_timeline;
+            df.transfer_timeline = metrics_config.transfer_timeline;
+            df.min_activation_duration = metrics_config.min_activation_duration;
+            df.max_timeline_events = metrics_config.max_timeline_events;
+            df.drain_timeout = options.drain_timeout;
             dataflows.push(df);
         }
 
@@ -2708,6 +2718,7 @@ impl RuntimeHandle {
 
         // Take network creators from worker 0 (all workers have identical topology).
         let network_creators = std::mem::take(&mut dataflows[0].exchange_network_creators);
+        let mut all_channel_collectors: Vec<std::sync::Arc<crate::metrics::ChannelMetricsCollector>> = Vec::new();
 
         for (edge_order, (edge_idx, edge_capacity, creator)) in
             network_creators.into_iter().enumerate()
@@ -2748,6 +2759,17 @@ impl RuntimeHandle {
                 }
             }
 
+            let ch_metrics = if metrics_config.channel_counters {
+                let c = std::sync::Arc::new(crate::metrics::ChannelMetricsCollector::new(
+                    edge_idx,
+                    format!("network_exchange[{edge_idx}]"),
+                ));
+                all_channel_collectors.push(std::sync::Arc::clone(&c));
+                Some(c)
+            } else {
+                None
+            };
+
             let params = NetworkMaterializerParams {
                 dataflow_id,
                 topology: topology.clone(),
@@ -2759,7 +2781,7 @@ impl RuntimeHandle {
                 edge_index: edge_order,
                 wake_handles: wake_handles.clone(),
                 runtime_handle: runtime_handle.clone(),
-                channel_metrics: None, // TODO: wire metrics_config for cluster
+                channel_metrics: ch_metrics,
             };
             let all_factories = creator.create(params);
 
@@ -2795,6 +2817,13 @@ impl RuntimeHandle {
         for df in dataflows.iter_mut() {
             df.exchange_creators.clear();
             df.exchange_network_creators.clear();
+        }
+        // Store channel metrics collectors on all worker dataflows so they
+        // can be registered in each worker's DataflowMetrics.
+        if !all_channel_collectors.is_empty() {
+            for df in dataflows.iter_mut() {
+                df.channel_metrics_collectors = all_channel_collectors.clone();
+            }
         }
 
         // Phase 6: Create progress channels (wake handles already created in Phase 5).
@@ -2907,10 +2936,21 @@ impl RuntimeHandle {
         .map_err(Error::Communication)?;
 
         // Phase 7: Materialize all local workers (without registering).
-        let mode = ChannelMode::Sync;
-        let dataflow_priority = 0;
+        let mode: ChannelMode = options.io_mode.into();
+        let dataflow_priority = options.priority;
         let mut prepared = Vec::with_capacity(num_local);
         let mut progress_channels_iter = progress_channels.into_iter();
+
+        // Capture a single timeline start time shared by all local workers
+        // so activation event offsets are comparable across workers.
+        let timeline_start = if metrics_config.activation_timeline
+            || metrics_config.frontier_timeline
+            || metrics_config.transfer_timeline
+        {
+            Some(std::time::Instant::now())
+        } else {
+            None
+        };
 
         for (local_idx, dataflow) in dataflows.into_iter().enumerate() {
             let global_idx = local_start + local_idx;
@@ -2926,7 +2966,7 @@ impl RuntimeHandle {
                 Some(wh),
                 dataflow_cancel.clone(),
                 ctrl,
-                None, // cluster: timeline start deferred (TODO)
+                timeline_start,
             ) {
                 Ok(worker) => prepared.push(worker),
                 Err(e) => {
@@ -3091,6 +3131,25 @@ impl RuntimeHandle {
                 if let Some(managers) = shared_managers {
                     for manager in managers.values() {
                         manager.unregister_dataflow(&cleanup_dataflow_id).await;
+                    }
+                }
+            });
+        }
+
+        // If an external cancellation token was provided, spawn a bridge task
+        // that propagates cancellation to all cluster workers.
+        if let Some(user_token) = options.cancellation_token {
+            let cancel = dataflow_cancel
+                .as_ref()
+                .expect("dataflow_cancel always set for cluster dataflows")
+                .clone();
+            self.tokio_handle.spawn(async move {
+                tokio::select! {
+                    _ = user_token.cancelled() => {
+                        cancel.cancel_with_reason(CancellationReason::UserRequested);
+                    }
+                    _ = cancel.cancelled_async() => {
+                        // Dataflow already cancelled/completed — exit cleanly.
                     }
                 }
             });

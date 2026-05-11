@@ -12,6 +12,7 @@ use instancy::communication::ClusterSpawnTransport;
 use instancy::communication::transport_session::PeerConnection;
 use instancy::{
     ClusterTopology, DataflowBuilder, DataflowId, NodeConfig, Result, RuntimeConfig, RuntimeHandle,
+    SpawnOptions,
 };
 use tokio::io::DuplexStream;
 
@@ -76,6 +77,7 @@ fn spawn_node(
             Duration::from_secs(5),
             build_dataflow,
             &tokio_handle,
+            SpawnOptions::new(),
         )?;
         Ok((rt, cluster))
     })

@@ -13,7 +13,7 @@ use instancy::Result;
 use instancy::communication::ClusterSpawnTransport;
 use instancy::communication::transport_session::PeerConnection;
 use instancy::{ClusterTopology, NodeConfig};
-use instancy::{RuntimeConfig, RuntimeHandle};
+use instancy::{RuntimeConfig, RuntimeHandle, SpawnOptions};
 
 /// Helper: create duplex connections between two nodes.
 ///
@@ -95,6 +95,7 @@ async fn cluster_two_nodes_no_exchange() {
             Duration::from_secs(5),
             build,
             &th_a,
+            SpawnOptions::new(),
         );
         cluster.map(|c| (rt_a, c))
     });
@@ -109,6 +110,7 @@ async fn cluster_two_nodes_no_exchange() {
             Duration::from_secs(5),
             build,
             &th_b,
+            SpawnOptions::new(),
         );
         cluster.map(|c| (rt_b, c))
     });
@@ -211,6 +213,7 @@ async fn cluster_two_nodes_with_exchange() {
             Duration::from_secs(5),
             build,
             &th_a,
+            SpawnOptions::new(),
         );
         cluster.map(|c| (rt_a, c))
     });
@@ -225,6 +228,7 @@ async fn cluster_two_nodes_with_exchange() {
             Duration::from_secs(5),
             build,
             &th_b,
+            SpawnOptions::new(),
         );
         cluster.map(|c| (rt_b, c))
     });
@@ -330,6 +334,7 @@ async fn cluster_fingerprint_mismatch() {
             Duration::from_secs(5),
             build_a,
             &th_a,
+            SpawnOptions::new(),
         )
     });
 
@@ -343,6 +348,7 @@ async fn cluster_fingerprint_mismatch() {
             Duration::from_secs(5),
             build_b,
             &th_b,
+            SpawnOptions::new(),
         )
     });
 
@@ -404,6 +410,7 @@ async fn cluster_missing_connection() {
             Ok(())
         },
         &tokio_handle,
+        SpawnOptions::new(),
     );
 
     assert!(result.is_err());
@@ -468,6 +475,7 @@ async fn cluster_cancel_propagates_to_peer() {
             Duration::from_secs(5),
             build,
             &th_a,
+            SpawnOptions::new(),
         );
         cluster.map(|c| (rt_a, c))
     });
@@ -482,6 +490,7 @@ async fn cluster_cancel_propagates_to_peer() {
             Duration::from_secs(5),
             build,
             &th_b,
+            SpawnOptions::new(),
         );
         cluster.map(|c| (rt_b, c))
     });

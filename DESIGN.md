@@ -1438,6 +1438,82 @@ Peer identity verification is the responsibility of the transport layer (e.g.,
 mTLS configured in the application's `ConnectionManager`). All peers in a
 cluster session are assumed to be authenticated at connection time.
 
+#### 5.5.2 Cluster Startup Protocol
+
+`spawn_cluster()` orchestrates a multi-phase startup sequence that synchronizes
+all participating nodes before any dataflow execution begins. If any phase
+fails or times out, `spawn_cluster()` returns an error — no operators are
+started.
+
+**Phases:**
+
+```
+ Node A                                    Node B
+   │                                         │
+   ├─ Phase 1: Build local dataflows         ├─ Phase 1: Build local dataflows
+   ├─ Phase 2: Validate topologies           ├─ Phase 2: Validate topologies
+   ├─ Phase 3: Compute fingerprint           ├─ Phase 3: Compute fingerprint
+   │                                         │
+   ├─ Phase 4: HANDSHAKE ──────────────────► │
+   │ ◄──────────────────── HANDSHAKE ────────┤
+   │  (verify fingerprints match)            │  (verify fingerprints match)
+   │                                         │
+   ├─ Phase 5: Wire exchange channels        ├─ Phase 5: Wire exchange channels
+   ├─ Phase 6: Create progress channels      ├─ Phase 6: Create progress channels
+   │                                         │
+   ├─ Phase 6.5: READY BARRIER ────────────► │
+   │ ◄──────────────────── READY ────────────┤
+   │  (all channels wired, safe to execute)  │  (all channels wired, safe to execute)
+   │                                         │
+   ├─ Phase 7: Materialize workers           ├─ Phase 7: Materialize workers
+   ├─ Phase 8: Register & start execution    ├─ Phase 8: Register & start execution
+   │                                         │
+   ▼  Dataflow running                       ▼  Dataflow running
+```
+
+1. **Handshake** (Phase 4) — Each node computes a fingerprint from its dataflow
+   graph (operator count, edge count, exchange indices, feedback count, worker
+   count) and exchanges it with all peers. If any peer's fingerprint differs,
+   `spawn_cluster` fails with `HandshakeError::FingerprintMismatch`. This catches
+   bugs where nodes build different dataflow topologies.
+
+2. **Ready Barrier** (Phase 6.5) — After all exchange channels and progress
+   channels are wired, each node sends `Ready` and waits for all peers to
+   respond. This prevents a fast node from starting execution before a slow
+   node has finished channel wiring, which would cause lost messages.
+
+Both phases use the same `handshake_timeout` parameter. Each waits at most
+`handshake_timeout` for peer responses; if any peer doesn't respond in time,
+`spawn_cluster` returns `Err(HandshakeError::Timeout { peer_id })`.
+
+**What happens when one node doesn't call `spawn_cluster`:**
+
+If Node A calls `spawn_cluster` but Node B never does, Node A will block in
+the Handshake phase waiting for B's response. After `handshake_timeout`
+expires, `spawn_cluster` returns an error. No dataflow is materialized, no
+operators are started, and no resources are leaked.
+
+```rust
+// Node A: will fail after 5 seconds if Node B never calls spawn_cluster
+let result = rt.spawn_cluster(
+    "my-dataflow",
+    topology,         // includes Node B
+    "node-a",
+    dataflow_id,
+    transport,
+    Duration::from_secs(5),  // handshake_timeout
+    build_fn,
+    &tokio_handle,
+    SpawnOptions::new(),
+);
+// result = Err(HandshakeError::Timeout { peer_id: "node-b" })
+```
+
+**Control channel** — Handshake, Ready, and Cancel messages share a dedicated
+control channel (channel ID 0) that is separate from data and progress
+channels. Control messages receive biased priority in the transport layer's
+shared FIFO queue.
+
 ### 5.7 Load Control
 
 Since multiple dataflows share the same Worker Thread Pool, we need controls to prevent one dataflow from starving others:
@@ -1610,8 +1686,15 @@ pub struct MetricsConfig {
 
 **Usage**:
 ```rust
+// Single-process multi-worker
 let opts = SpawnOptions::new().metrics(MetricsConfig::full());
 let mut multi = rt.spawn_multi("df", 4, build_fn, opts)?;
+
+// Cluster mode — same MetricsConfig applies
+let opts = SpawnOptions::new().metrics(MetricsConfig::full());
+let cluster = rt.spawn_cluster(
+    "df", topology, "node-a", id, transport, timeout, build_fn, &handle, opts,
+)?;
 ```
 
 **Channel counters** track per-exchange-edge transfer volumes:
@@ -1627,9 +1710,17 @@ pub struct ChannelMetrics {
 
 Each exchange edge gets a shared `ChannelMetricsCollector` (atomic counters)
 that all source workers push through. The collector is created during exchange
-channel materialization (Phase 3 of `spawn_multi`) and registered in each
-worker's `DataflowMetrics`. Since collectors are `Arc`-shared across workers,
-the counters reflect the total traffic through the edge, not per-worker.
+channel materialization (Phase 3 of `spawn_multi` / Phase 5 of `spawn_cluster`)
+and registered in each worker's `DataflowMetrics`. Since collectors are
+`Arc`-shared across workers, the counters reflect the total traffic through
+the edge, not per-worker.
+
+**Cluster support**: `spawn_cluster()` accepts `SpawnOptions` (including
+`MetricsConfig`) and wires all observability features identically to
+`spawn_multi()`: operator summary, channel counters (including network exchange
+channels), activation/frontier/transfer timelines, and external cancellation
+tokens. A shared `timeline_start` `Instant` is captured before worker
+materialization so activation timestamps are comparable across local workers.
 
 Access channel metrics after the dataflow runs:
 ```rust
