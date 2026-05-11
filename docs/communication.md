@@ -6,7 +6,7 @@ Back to the overview: [docs/DESIGN.md](./DESIGN.md)
 
 ## 6. Communication Layer
 
-The communication layer implements the physical delivery mechanisms behind the `TransportProvider` trait (§4.5). At the logical layer, operators only see `Push` and `Pull` endpoints. The communication layer provides the concrete implementations.
+The communication layer implements the physical delivery mechanisms behind the [TransportProvider trait (§4.5)](./DESIGN.md#45-logicalphysical-separation-architecture). At the logical layer, operators only see `Push` and `Pull` endpoints. The communication layer provides the concrete implementations.
 
 ### 6.1 Intra-Process Channels
 
@@ -27,7 +27,7 @@ pub struct RingBuffer<T> {
 
 When an upstream operator produces output, it writes directly into the downstream operator's input buffer. If the buffer is full, the upstream operator's task yields (returns to the scheduler with a "blocked" status), and will be re-dispatched when space becomes available. This provides natural backpressure without async machinery.
 
-`Envelope` (defined in §5.8) carries data batches, control signals, and user-defined metadata through the same buffer.
+`Envelope` (defined in [§5.8](./observability.md#58-message-envelope)) carries data batches, control signals, and user-defined metadata through the same buffer.
 
 #### 6.1.1 Force-Network Mode (Testing Transport Fidelity)
 
@@ -783,36 +783,6 @@ simpler code, no silent ignore paths.
   pairs returned by the factory.
 - `connections` parameter from `SharedPeerManager::new`
 - `Option` wrapper on `connection_factory` throughout `shared_transport.rs`
-
-#### Test Strategy
-
-- Tests using in-memory duplex streams: implement a mock `ConnectionFactory`
-  that creates `tokio::io::duplex()` pairs internally (each `establish()`
-  call creates a new duplex pair and sends the other half to the peer's
-  factory via a shared channel)
-- Tests using real TCP: instantiate `TcpConnectionFactory` with a static
-  address resolver pointing to `127.0.0.1`
-- `cluster_shared_transport.rs`: update `SharedPeerManager::new` calls —
-  remove pre-created connections, pass factory instead
-
-### Files to Change
-
-1. `shared_transport.rs` — `connection_factory` field and constructor: `Option<Arc>` → `Arc`
-2. `shared_transport.rs` — `handle_scaling_events`: remove `Option` unwrap checks
-3. `cluster_transport.rs` — `ClusterSpawnTransport::Dedicated` variant: add factory
-4. `runtime.rs` — `spawn_cluster` Dedicated branch: use factory to establish connections
-5. `shared_transport.rs` — add `TcpConnectionFactory` + `PeerAddressResolver`
-6. Tests: update all `SharedPeerManager::new` calls and Dedicated-mode tests
-7. `GUIDE.md` — update "Connection Failure & Reconnection" section
-8. `DESIGN.md` — update §6.2, §6.3, §6.3.1, §12.4
-
-### Non-Goals
-
-- Removing `ClusterSpawnTransport::Dedicated` variant entirely — the
-  exclusive-lease model is still useful for isolation
-- Changing the `ConnectionFactory` trait signature
-- Implementing connection health checks or idle timeout (future work)
-
 
 ### Reconnection responsibility
 

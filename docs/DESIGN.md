@@ -312,8 +312,6 @@ fn test_distributed_word_count() {
 
 ---
 
-## 5. Execution Model
-
 ## 13. Dependencies
 
 ```toml

@@ -998,7 +998,7 @@ impl<T: Timestamp> DataflowBuilder<T> {
 /// and are consumed when `.build()` produces the `LogicalDataflow`. They do not
 /// exist at runtime.
 ///
-/// See PLAN.md "Conceptual Architecture: Three Layers of a Dataflow" for how Pipe
+/// See docs/DESIGN.md §4.5 "Logical/Physical Separation Architecture" for how Pipe
 /// relates to StreamEdge (Layer 2) and the abstract Dataflow Graph (Layer 1).
 pub struct Pipe<T: Timestamp, D: Clone + Send + 'static> {
     state: Rc<RefCell<BuilderState<T>>>,

@@ -329,7 +329,7 @@ This structured error enables:
 | `exchange` | Repartitions data across workers by a routing function (hash-based); creates a stage boundary when parallelism changes |
 | `rebalance` | Round-robin distribution across target replicas; used at stage boundaries when key doesn't matter |
 | `gather` | Funnels all data to a single replica (parallelism 1); used for global aggregation |
-| `broadcast` | Sends each record to **all** workers (clones data); in a cluster with per-stage parallelism, the runtime automatically uses local channels when source and target stages are on the same node — no separate "local" variant needed (see §5.5 Local Broadcast) |
+| `broadcast` | Sends each record to **all** workers (clones data); in a cluster with per-stage parallelism, the runtime automatically uses local channels when source and target stages are on the same node — no separate "local" variant needed (see [Local Broadcast](./execution-model.md#local-broadcast-via-per-stage-parallelism) in execution-model.md) |
 | `delay` | Holds data until the frontier advances past a specified timestamp; useful for windowing and time-based buffering |
 | `concat` | Merges multiple streams into one |
 | `inspect` | Pass-through side-effect observation (logging, debugging); data continues downstream |

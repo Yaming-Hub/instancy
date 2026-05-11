@@ -258,6 +258,42 @@ When the runtime receives a `MembershipEvent::NodeLeft` event:
 
 - **Progress safety**: A departed node's outstanding capabilities are treated as "released" — the frontier advances past any timestamps that only the lost node could produce. This is safe because no more data at those timestamps will arrive.
 - **At-most-once by default**: If a node fails mid-computation, records being processed by that node may be lost. Applications requiring exactly-once semantics must use the checkpoint/recovery mechanism.
+- **No split-brain**: The application is the single source of truth for cluster membership. The runtime trusts the membership events and does not perform its own consensus or health probing.
+- **Zero-worker events ignored**: `NodeJoined` events with `logical_workers == 0` are silently dropped.
+- **Idempotent**: Duplicate join events for an existing node or leave events for an unknown node are handled gracefully.
+
+#### Example: Kubernetes Integration
+
+```rust
+struct K8sClusterMembership {
+    rx: Mutex<Option<UnboundedReceiver<MembershipEvent>>>,
+    tx: UnboundedSender<MembershipEvent>,
+}
+
+impl K8sClusterMembership {
+    fn new() -> Self {
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        Self { rx: Mutex::new(Some(rx)), tx }
+    }
+
+    /// Spawn a background task that watches Kubernetes pod events
+    /// and converts them into MembershipEvents via self.tx.
+    fn start_watching(&self, client: kube::Client) {
+        let tx = self.tx.clone();
+        tokio::spawn(async move {
+            // Watch pod events and send MembershipEvent::NodeJoined/NodeLeft
+        });
+    }
+}
+
+impl ClusterMembership for K8sClusterMembership {
+    fn events(&self) -> Option<UnboundedReceiver<MembershipEvent>> {
+        self.rx.lock().unwrap().take()
+    }
+}
+```
+
+## 12.6 Coordinator Integration Model
 
 ## 12.6 Coordinator Integration Model
 

@@ -689,7 +689,7 @@ runtime and performs the following for each operator input:
    incoming messages accumulate.
 3. **Feeds the BatchAccumulator** — calls `BatchAccumulator::record_message()` for
    each incoming message. The accumulator tracks count, byte size, and elapsed time
-   since the first message in the current batch (see §12.6.2a).
+   since the first message in the current batch (see [§12.7.2a](./decisions.md#1272a-time-bounded-message-batching) in decisions.md).
 4. **Checks dispatch threshold** — calls `BatchAccumulator::should_dispatch(policy)`.
    When any threshold is met (count, bytes, or time), the batch is ready.
 5. **Creates an OperatorActivation** — wraps a closure that will invoke the operator's
@@ -732,7 +732,7 @@ The orchestrator also manages a **timer wheel** (or per-operator deadlines) for 
 `max_batch_wait` threshold: if no new messages arrive but time expires, the
 orchestrator fires the activation anyway to ensure bounded latency.
 
-#### 5.4.2 Where is Operator State Stored?
+#### 5.4.3 Where is Operator State Stored?
 
 Operator state (e.g., a `HashMap` for aggregation, a running counter, a window buffer)
 lives **inside the operator's closure**. The operator logic is declared as:
@@ -785,7 +785,7 @@ stream.unary("word_count", |input, output| {
   dataflow is dropped or cancelled, the operator struct (and its closure with all captured
   state) is dropped, freeing all resources.
 
-#### 5.4.3 Operator Instantiation & the SPMD Model
+#### 5.4.4 Operator Instantiation & the SPMD Model
 
 In the SPMD model, each logical worker independently builds and runs the same dataflow graph. When a stage has parallelism=5, there are 5 workers, each creating its own instance of every operator in that stage. The **operator index is the same** across all workers — what differs is the **worker ID**.
 
@@ -821,7 +821,7 @@ stream.unary("word_count", |input, output| {
 - For stateful operators, each worker's instance accumulates state only for its own data partition (ensured by `exchange()` routing).
 - Operator state is never shared across workers — no locks, no synchronization needed.
 
-#### 5.4.4 Dynamic Operator Generation (Query Engine Integration)
+#### 5.4.5 Dynamic Operator Generation (Query Engine Integration)
 
 The `OperatorFactory` pattern supports **dynamic operator generation** — operators created at runtime from a query plan or other configuration rather than being statically coded. This is essential for integration with query engines like Apache DataFusion, where SQL logical plans are compiled into physical instancy operators.
 
@@ -872,7 +872,7 @@ fn plan_node_to_factory(node: &LogicalPlan) -> OperatorFactory {
 - Channel data type `D` must support `RecordBatch` and similar large columnar types efficiently (zero-copy where possible)
 - The `DataflowGraph` metadata must be constructable programmatically (not only via the `.unary()` / `.binary()` extension traits) so query planners can build graphs from plan trees
 
-### 5.4.5 Input Streams
+### 5.4.6 Input Streams
 
 The executor accepts a dataflow definition that binds external async streams as inputs. Instead of the caller imperatively calling `input.send()` and `input.advance_to()`, the dataflow is driven by `TimestampedInput` streams — async streams that yield timestamped data. The library reads from these streams, manages capabilities and frontier advancement automatically, and the dataflow makes progress reactively as data arrives.
 

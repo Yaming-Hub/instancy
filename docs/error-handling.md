@@ -223,7 +223,7 @@ Key design properties:
 - **Composable** — the hosting application owns the recovery policy. The
   runtime reports the problem but does not auto-restart or self-heal.
 
-#### 8.4.4 Resource Leak Prevention
+#### 8.4.5 Resource Leak Prevention
 
 Poison handling must never leak resources:
 
@@ -235,7 +235,7 @@ Poison handling must never leak resources:
 - **Closures returning `()`**: When a closure cannot return `Result`, use `return`
   to skip work rather than proceeding with potentially corrupt state.
 
-#### 8.4.5 Raw `.unwrap()` on Locks
+#### 8.4.6 Raw `.unwrap()` on Locks
 
 Raw `.lock().unwrap()` is allowed **only in test code** (`#[cfg(test)]` or
 `tests/` directories). Production code must use one of the five patterns above.
