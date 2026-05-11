@@ -137,7 +137,7 @@ impl Default for ExecutorConfig {
             transfer_timeline: false,
             min_activation_duration: std::time::Duration::from_micros(1),
             max_timeline_events: 0,
-        timeline_start_time: None,
+            timeline_start_time: None,
         }
     }
 }
@@ -477,6 +477,7 @@ impl<T: Timestamp> DataflowExecutor<T> {
     /// If `external_wake_handle` is provided, the executor uses it instead of
     /// creating its own. This allows the runtime to share the same WakeHandle
     /// with InputSenders and CancellationTokens created before materialization.
+    #[allow(clippy::too_many_arguments)]
     pub fn materialize(
         graph: &DataflowGraph,
         operator_factories: &mut [(usize, OperatorFactory)],
@@ -485,6 +486,7 @@ impl<T: Timestamp> DataflowExecutor<T> {
         cancel: CancellationToken,
         external_wake_handle: Option<WakeHandle>,
         worker_context: WorkerContext,
+        progress_reporters: Option<Arc<dyn std::any::Any + Send + Sync>>,
     ) -> Result<Self> {
         let edges = graph.edges();
         let feedback_edges = graph.feedback_edges();
@@ -492,9 +494,8 @@ impl<T: Timestamp> DataflowExecutor<T> {
 
         // Create timeline collector early so exchange channels can capture it.
         let timeline_start = config.timeline_start_time.unwrap_or_else(Instant::now);
-        let any_timeline = config.activation_timeline
-            || config.frontier_timeline
-            || config.transfer_timeline;
+        let any_timeline =
+            config.activation_timeline || config.frontier_timeline || config.transfer_timeline;
         let timeline_collector = if any_timeline {
             Some(Arc::new(crate::metrics::TimelineCollector::new(
                 worker_context.worker_index(),
@@ -635,6 +636,7 @@ impl<T: Timestamp> DataflowExecutor<T> {
                 input_pullers,
                 output_pushers,
                 wake_handle: Some(wake_handle.clone()),
+                progress_reporters: progress_reporters.clone(),
             };
 
             let operator = factory.build(&worker_context, endpoints)?;
@@ -2213,14 +2215,14 @@ mod tests {
                 catch_panics: false,
                 collect_metrics: false,
                 channel_counters: false,
-            drain_timeout: None,
+                drain_timeout: None,
                 channel_metrics_collectors: Vec::new(),
-            activation_timeline: false,
-            frontier_timeline: false,
-            transfer_timeline: false,
-            min_activation_duration: std::time::Duration::from_micros(1),
-            max_timeline_events: 0,
-            timeline_start_time: None,
+                activation_timeline: false,
+                frontier_timeline: false,
+                transfer_timeline: false,
+                min_activation_duration: std::time::Duration::from_micros(1),
+                max_timeline_events: 0,
+                timeline_start_time: None,
             },
             cancel: CancellationToken::new(),
             progress_tracker: None,
@@ -2636,14 +2638,14 @@ mod tests {
                 catch_panics: false,
                 collect_metrics: false,
                 channel_counters: false,
-            drain_timeout: None,
+                drain_timeout: None,
                 channel_metrics_collectors: Vec::new(),
-            activation_timeline: false,
-            frontier_timeline: false,
-            transfer_timeline: false,
-            min_activation_duration: std::time::Duration::from_micros(1),
-            max_timeline_events: 0,
-            timeline_start_time: None,
+                activation_timeline: false,
+                frontier_timeline: false,
+                transfer_timeline: false,
+                min_activation_duration: std::time::Duration::from_micros(1),
+                max_timeline_events: 0,
+                timeline_start_time: None,
             },
             cancel: CancellationToken::new(),
             progress_tracker: None,
@@ -2731,14 +2733,14 @@ mod tests {
                 catch_panics: false,
                 collect_metrics: false,
                 channel_counters: false,
-            drain_timeout: None,
+                drain_timeout: None,
                 channel_metrics_collectors: Vec::new(),
-            activation_timeline: false,
-            frontier_timeline: false,
-            transfer_timeline: false,
-            min_activation_duration: std::time::Duration::from_micros(1),
-            max_timeline_events: 0,
-            timeline_start_time: None,
+                activation_timeline: false,
+                frontier_timeline: false,
+                transfer_timeline: false,
+                min_activation_duration: std::time::Duration::from_micros(1),
+                max_timeline_events: 0,
+                timeline_start_time: None,
             },
             cancel: CancellationToken::new(),
             progress_tracker: None,
@@ -3254,14 +3256,14 @@ mod tests {
                 catch_panics: false,
                 collect_metrics: false,
                 channel_counters: false,
-            drain_timeout: None,
+                drain_timeout: None,
                 channel_metrics_collectors: Vec::new(),
-            activation_timeline: false,
-            frontier_timeline: false,
-            transfer_timeline: false,
-            min_activation_duration: std::time::Duration::from_micros(1),
-            max_timeline_events: 0,
-            timeline_start_time: None,
+                activation_timeline: false,
+                frontier_timeline: false,
+                transfer_timeline: false,
+                min_activation_duration: std::time::Duration::from_micros(1),
+                max_timeline_events: 0,
+                timeline_start_time: None,
             },
             cancel: CancellationToken::new(),
             progress_tracker: None,
@@ -3341,14 +3343,14 @@ mod tests {
                 catch_panics: false,
                 collect_metrics: false,
                 channel_counters: false,
-            drain_timeout: None,
+                drain_timeout: None,
                 channel_metrics_collectors: Vec::new(),
-            activation_timeline: false,
-            frontier_timeline: false,
-            transfer_timeline: false,
-            min_activation_duration: std::time::Duration::from_micros(1),
-            max_timeline_events: 0,
-            timeline_start_time: None,
+                activation_timeline: false,
+                frontier_timeline: false,
+                transfer_timeline: false,
+                min_activation_duration: std::time::Duration::from_micros(1),
+                max_timeline_events: 0,
+                timeline_start_time: None,
             },
             cancel: CancellationToken::new(),
             progress_tracker: None,
@@ -4270,12 +4272,12 @@ mod tests {
             channel_counters: false,
             drain_timeout: Some(std::time::Duration::from_secs(5)),
             channel_metrics_collectors: Vec::new(),
-        activation_timeline: false,
+            activation_timeline: false,
             frontier_timeline: false,
             transfer_timeline: false,
-        min_activation_duration: std::time::Duration::from_micros(1),
-        max_timeline_events: 0,
-        timeline_start_time: None,
+            min_activation_duration: std::time::Duration::from_micros(1),
+            max_timeline_events: 0,
+            timeline_start_time: None,
         };
         let mut executor = DataflowExecutor::new_test(vec![Box::new(op)], config, 0);
 
@@ -4305,13 +4307,13 @@ mod tests {
             collect_metrics: false,
             channel_counters: false,
             drain_timeout: None,
-                channel_metrics_collectors: Vec::new(),
-        activation_timeline: false,
+            channel_metrics_collectors: Vec::new(),
+            activation_timeline: false,
             frontier_timeline: false,
             transfer_timeline: false,
-        min_activation_duration: std::time::Duration::from_micros(1),
-        max_timeline_events: 0,
-        timeline_start_time: None,
+            min_activation_duration: std::time::Duration::from_micros(1),
+            max_timeline_events: 0,
+            timeline_start_time: None,
         };
         let mut executor = DataflowExecutor::new_test(vec![Box::new(op)], config, 0);
         executor.cancel.cancel();
@@ -4356,12 +4358,12 @@ mod tests {
             channel_counters: false,
             drain_timeout: Some(std::time::Duration::from_millis(50)),
             channel_metrics_collectors: Vec::new(),
-        activation_timeline: false,
+            activation_timeline: false,
             frontier_timeline: false,
             transfer_timeline: false,
-        min_activation_duration: std::time::Duration::from_micros(1),
-        max_timeline_events: 0,
-        timeline_start_time: None,
+            min_activation_duration: std::time::Duration::from_micros(1),
+            max_timeline_events: 0,
+            timeline_start_time: None,
         };
         let mut executor = DataflowExecutor::new_test(vec![Box::new(InfiniteOperator)], config, 0);
         executor.cancel.cancel();
@@ -4393,12 +4395,12 @@ mod tests {
             channel_counters: false,
             drain_timeout: Some(std::time::Duration::from_secs(5)),
             channel_metrics_collectors: Vec::new(),
-        activation_timeline: false,
+            activation_timeline: false,
             frontier_timeline: false,
             transfer_timeline: false,
-        min_activation_duration: std::time::Duration::from_micros(1),
-        max_timeline_events: 0,
-        timeline_start_time: None,
+            min_activation_duration: std::time::Duration::from_micros(1),
+            max_timeline_events: 0,
+            timeline_start_time: None,
         };
         let mut executor = DataflowExecutor::new_test(vec![Box::new(op)], config, 0);
 

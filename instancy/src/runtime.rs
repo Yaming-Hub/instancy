@@ -1629,7 +1629,10 @@ impl RuntimeHandle {
         let mut input_count = dataflow.input_port_wiring.len();
         let input_ports = &dataflow.input_ports;
         let operator_factories = &mut dataflow.operator_factories;
-        for (info, wiring) in input_ports.iter().zip(dataflow.input_port_wiring.iter_mut()) {
+        for (info, wiring) in input_ports
+            .iter()
+            .zip(dataflow.input_port_wiring.iter_mut())
+        {
             let (factory, sender_any) =
                 wiring(Arc::clone(&external_inputs_open), wake_handle.clone(), mode);
             operator_factories.push((info.operator_index, factory));
@@ -1658,7 +1661,10 @@ impl RuntimeHandle {
             Vec::new();
         let output_ports = &dataflow.output_ports;
         let operator_factories = &mut dataflow.operator_factories;
-        for (info, wiring) in output_ports.iter().zip(dataflow.output_port_wiring.iter_mut()) {
+        for (info, wiring) in output_ports
+            .iter()
+            .zip(dataflow.output_port_wiring.iter_mut())
+        {
             let (replacement_factory, receiver_any) = wiring(mode, Some(wake_handle.clone()));
             if let Some(pos) = operator_factories
                 .iter()
@@ -1677,6 +1683,7 @@ impl RuntimeHandle {
             worker_context,
             progress_channels,
             timeline_start_time,
+            None,
         );
         dataflow.operator_factories.truncate(base_factory_count);
         let mut executor = executor_result?;
@@ -1761,8 +1768,9 @@ impl RuntimeHandle {
         validate_stage_parallelism(&dataflow, num_workers)?;
 
         // Phase 3: Create per-worker exchange channel factories.
-        let mut worker_exchange_factories: Vec<Vec<(usize, crate::dataflow::schedulable::ChannelFactory)>> =
-            (0..num_workers).map(|_| Vec::new()).collect();
+        let mut worker_exchange_factories: Vec<
+            Vec<(usize, crate::dataflow::schedulable::ChannelFactory)>,
+        > = (0..num_workers).map(|_| Vec::new()).collect();
         if num_workers > 1 {
             let creators = std::mem::take(&mut dataflow.exchange_creators);
             let mut all_channel_collectors = Vec::new();
@@ -1777,8 +1785,7 @@ impl RuntimeHandle {
                 } else {
                     None
                 };
-                let shared_factories =
-                    creator(num_workers, num_workers, edge_capacity, ch_metrics);
+                let shared_factories = creator(num_workers, num_workers, edge_capacity, ch_metrics);
                 if shared_factories.len() != num_workers {
                     return Err(Error::Runtime(RuntimeError::InvalidConfig(format!(
                         "exchange factory creator for edge {edge_idx} produced {} factories, expected {num_workers}",
@@ -1860,9 +1867,11 @@ impl RuntimeHandle {
                     .channel_factories
                     .iter()
                     .position(|(idx, _)| *idx == edge_idx)
-                    .ok_or_else(|| Error::Runtime(RuntimeError::InvalidConfig(format!(
-                        "exchange edge {edge_idx} not found in channel factories"
-                    ))))?;
+                    .ok_or_else(|| {
+                        Error::Runtime(RuntimeError::InvalidConfig(format!(
+                            "exchange edge {edge_idx} not found in channel factories"
+                        )))
+                    })?;
                 dataflow.channel_factories[pos].1 = factory;
             }
 
@@ -2691,7 +2700,9 @@ impl RuntimeHandle {
 
         // Take network creators from worker 0 (all workers have identical topology).
         let network_creators = std::mem::take(&mut dataflows[0].exchange_network_creators);
-        let mut all_channel_collectors: Vec<std::sync::Arc<crate::metrics::ChannelMetricsCollector>> = Vec::new();
+        let mut all_channel_collectors: Vec<
+            std::sync::Arc<crate::metrics::ChannelMetricsCollector>,
+        > = Vec::new();
 
         for (edge_order, (edge_idx, edge_capacity, creator)) in
             network_creators.into_iter().enumerate()
@@ -3253,6 +3264,7 @@ impl SimpleRuntime {
             WorkerContext::single(),
             None,
             None,
+            None,
         )?;
 
         let completed = executor.run()?;
@@ -3294,6 +3306,7 @@ impl SimpleRuntime {
             self.cancel.clone(),
             Some(wake_handle),
             WorkerContext::single(),
+            None,
             None,
             None,
         )?;
@@ -3426,6 +3439,7 @@ impl SimpleRuntime {
             cancel,
             Some(wake_handle),
             worker_context,
+            None,
             None,
             None,
         )?;
@@ -4686,11 +4700,7 @@ impl<T: Timestamp> ClusterSpawnedDataflow<T> {
         &self,
         local_idx: usize,
     ) -> Option<&Arc<crate::metrics::DataflowMetrics>> {
-        self.inner
-            .as_ref()?
-            .workers
-            .get(local_idx)?
-            .metrics()
+        self.inner.as_ref()?.workers.get(local_idx)?.metrics()
     }
 
     /// Collect metrics from all local workers.
@@ -5253,6 +5263,7 @@ fn materialize_executor<T: Timestamp>(
     worker_context: WorkerContext,
     progress_channels: Option<WorkerProgressChannels<T>>,
     timeline_start_time: Option<std::time::Instant>,
+    progress_reporters: Option<Arc<dyn std::any::Any + Send + Sync>>,
 ) -> Result<DataflowExecutor<T>> {
     let executor_config = ExecutorConfig {
         max_activations_per_step: 1024,
@@ -5271,9 +5282,12 @@ fn materialize_executor<T: Timestamp>(
         timeline_start_time,
     };
     let worker_subgraph_builder = dataflow.subgraph_builder.clone();
-    let reporter_guard = crate::progress::operate::install_materialization_reporters(
-        worker_subgraph_builder.materialization_reporters(),
-    );
+    let progress_reporters = progress_reporters.or_else(|| {
+        Some(
+            Arc::new(worker_subgraph_builder.materialization_reporters())
+                as Arc<dyn std::any::Any + Send + Sync>,
+        )
+    });
 
     let mut executor: DataflowExecutor<T> = DataflowExecutor::materialize(
         &dataflow.graph,
@@ -5283,8 +5297,8 @@ fn materialize_executor<T: Timestamp>(
         cancel,
         wake_handle,
         worker_context,
+        progress_reporters,
     )?;
-    drop(reporter_guard);
 
     // Enable stage-task scheduling if stages were inferred.
     // This groups operators by stage and activates them in fused topological
@@ -8528,9 +8542,12 @@ mod tests {
                 for ev in &events {
                     // Each event should have a valid duration and a non-zero start offset
                     // (except possibly the very first activation).
-                    assert!(ev.duration_us > 0 || ev.start_us > 0,
+                    assert!(
+                        ev.duration_us > 0 || ev.start_us > 0,
                         "event should have meaningful timing: start_us={}, duration_us={}",
-                        ev.start_us, ev.duration_us);
+                        ev.start_us,
+                        ev.duration_us
+                    );
                     assert!(ev.worker_index < 2, "worker_index out of range");
                 }
             }

@@ -10,6 +10,10 @@
 //! One `Box<dyn SchedulableOperator>` per operator per worker. Created during
 //! dataflow materialization and owned by the [`DataflowExecutor`](super::executor::DataflowExecutor).
 
+use std::any::Any;
+use std::collections::HashMap;
+use std::sync::Arc;
+
 use crate::dataflow::stage::StageId;
 use crate::error::Result;
 use crate::worker::WorkerContext;
@@ -195,6 +199,29 @@ pub struct ChannelEndpoints {
     /// (e.g., when an in-flight async task completes). Operators that don't need
     /// async waking can ignore this field.
     pub wake_handle: Option<crate::dataflow::channels::wake::WakeHandle>,
+    /// Progress reporters for this operator, keyed by `(operator_index, output_port)`.
+    ///
+    /// Populated during materialization from the `SubgraphBuilder` clone used
+    /// to build the worker's progress tracker, so factories can bind operators
+    /// to the same progress state the executor will later observe.
+    pub progress_reporters: Option<Arc<dyn Any + Send + Sync>>,
+}
+
+impl ChannelEndpoints {
+    /// Returns the progress reporter for the given operator output, if one was
+    /// explicitly passed for this materialization.
+    pub fn progress_reporter<T: crate::progress::timestamp::Timestamp>(
+        &self,
+        operator: usize,
+        output: usize,
+    ) -> Option<crate::progress::operate::ProgressReporter<T>> {
+        self.progress_reporters
+            .as_ref()?
+            .downcast_ref::<HashMap<(usize, usize), crate::progress::operate::ProgressReporter<T>>>(
+            )?
+            .get(&(operator, output))
+            .cloned()
+    }
 }
 
 impl std::fmt::Debug for ChannelEndpoints {
@@ -202,6 +229,7 @@ impl std::fmt::Debug for ChannelEndpoints {
         f.debug_struct("ChannelEndpoints")
             .field("input_count", &self.input_pullers.len())
             .field("output_count", &self.output_pushers.len())
+            .field("has_progress_reporters", &self.progress_reporters.is_some())
             .finish()
     }
 }
