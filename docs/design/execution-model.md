@@ -1834,10 +1834,17 @@ A multi-worker dataflow goes through distinct phases. Understanding this
 lifecycle is important for reasoning about operator state, cloning, and
 when exchange channels become active.
 
-### Phase 1: Build (single thread)
+> **Note:** The current implementation calls the user's build closure N times
+> (once per worker), producing N independent `LogicalDataflow`s that are
+> validated for structural equivalence. The target design (in progress) will
+> call build once and materialize the single `LogicalDataflow` N times using
+> replayable factories. Both models follow the same logical phases below —
+> the difference is whether Phase 1 runs once or N times.
 
-The user's build closure is called once to construct the logical dataflow
-graph. All operators, channels, and exchange boundaries are registered.
+### Phase 1: Build
+
+The user's build closure constructs the logical dataflow graph. All
+operators, channels, and exchange boundaries are registered.
 
 ```
 build(&mut builder) → LogicalDataflow
@@ -1847,9 +1854,9 @@ build(&mut builder) → LogicalDataflow
   └── Subgraph topology recorded (for progress tracking)
 ```
 
-The result is a single `LogicalDataflow` — a blueprint that describes the
-graph structure and contains replayable factories for all operators and
-channels.
+**Current model:** called N times, producing N independent LogicalDataflows.
+**Target model:** called once, producing a single LogicalDataflow with
+replayable factories that can produce N operator instances.
 
 ### Phase 2: Materialize (single thread, sequential)
 

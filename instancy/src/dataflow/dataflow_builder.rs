@@ -57,7 +57,6 @@ use crate::dataflow::wired_operators::{
     WiredFeedbackOperator, WiredLeaveOperator, WiredSourceOperator, WiredUnaryAsyncOperator,
     WiredUnaryNotifyOperator, WiredUnaryOperator,
 };
-use crate::error::LockResultExt;
 use crate::error::{DataflowError, Error, Result};
 use crate::order::Product;
 use crate::progress::change_batch::ChangeBatch;
@@ -1144,36 +1143,14 @@ impl<T: Timestamp, D: Clone + Send + 'static> Pipe<T, D> {
         let name = name.into();
         let true_name = format!("{name}::true");
         let false_name = format!("{name}::false");
-        let predicate = std::sync::Arc::new(std::sync::Mutex::new(predicate));
 
-        let pred_true = predicate.clone();
-        let true_pipe = self.clone().filter(true_name, move |t, x| {
-            let mut guard = match pred_true.lock().or_poison("branch predicate") {
-                Ok(guard) => guard,
-                Err(_) => {
-                    // NOTE: Cannot propagate lock poison here — closure signature is
-                    // `FnMut(&T, &D) -> bool` and cannot return Result. Poisoned lock
-                    // means another thread panicked; returning `false` is acceptable
-                    // because the dataflow will be torn down.
-                    return false;
-                }
-            };
-            guard(t, x)
-        });
-        let pred_false = predicate;
-        let false_pipe = self.filter(false_name, move |t, x| {
-            let mut guard = match pred_false.lock().or_poison("branch predicate") {
-                Ok(guard) => guard,
-                Err(_) => {
-                    // NOTE: Cannot propagate lock poison here — closure signature is
-                    // `FnMut(&T, &D) -> bool` and cannot return Result. Poisoned lock
-                    // means another thread panicked; returning `false` is acceptable
-                    // because the dataflow will be torn down.
-                    return false;
-                }
-            };
-            !guard(t, x)
-        });
+        // Each arm gets its own independent clone of the predicate.
+        // This avoids Arc<Mutex> sharing, which would leak state across
+        // workers in multi-worker materialization.
+        let mut pred_true = predicate.clone();
+        let true_pipe = self.clone().filter(true_name, move |t, x| pred_true(t, x));
+        let mut pred_false = predicate;
+        let false_pipe = self.filter(false_name, move |t, x| !pred_false(t, x));
 
         (true_pipe, false_pipe)
     }
