@@ -22,8 +22,10 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - name: cargo check (all features)
         run: cargo check -p instancy --all-features
-      - name: cargo clippy (all features)
-        run: cargo clippy -p instancy --all-features -- -D warnings
+      - name: cargo clippy (all features, lib + tests)
+        run: cargo clippy -p instancy --all-features --lib --tests -- -D warnings
+      - name: Build examples (all features)
+        run: cargo build -p instancy --examples --all-features
 
   test:
     name: Test
