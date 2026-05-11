@@ -297,3 +297,93 @@ mod tracing_tests {
         assert!(all.contains("progress frontier advanced"), "got: {all}");
     }
 }
+
+// ---------------------------------------------------------------------------
+// Chrome Trace export integration tests
+// ---------------------------------------------------------------------------
+
+#[cfg(feature = "chrome-trace")]
+mod chrome_trace_integration {
+    use std::sync::Arc;
+    use std::time::{Duration, Instant};
+
+    use instancy::metrics::{
+        DataflowMetrics, TimelineCollector,
+    };
+
+    #[test]
+    fn export_from_dataflow_metrics() {
+        let mut metrics = DataflowMetrics::new("integration-df");
+
+        // Register operators.
+        let op0 = metrics.register_operator("source", 0);
+        let op1 = metrics.register_operator("map", 1);
+        op0.record_activation(Duration::from_micros(500), 100);
+        op1.record_activation(Duration::from_micros(300), 100);
+
+        // Register channel.
+        let ch = metrics.register_channel(0, "exchange[0]");
+        ch.record_push(42, 168);
+
+        // Register timeline (simulating one worker).
+        let start_time = Instant::now();
+        let tc = Arc::new(TimelineCollector::new(0, start_time, Duration::ZERO, 100));
+        // Record activations with realistic Instants.
+        tc.record_activation(0, start_time + Duration::from_micros(10), Duration::from_micros(500));
+        tc.record_activation(1, start_time + Duration::from_micros(510), Duration::from_micros(300));
+        metrics.register_timeline(tc);
+
+        let exporter = metrics.to_chrome_trace("integration-df");
+
+        // 2 activations + 1 channel + 1 process_name + 1 thread_name = 5 events.
+        assert_eq!(exporter.event_count(), 5);
+
+        // Verify output is valid JSON parseable by serde_json.
+        let bytes = exporter.to_bytes();
+        let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        let events = json["traceEvents"].as_array().unwrap();
+
+        // Should have activation "X" events.
+        let x_events: Vec<_> = events.iter().filter(|e| e["ph"] == "X").collect();
+        assert_eq!(x_events.len(), 2);
+        assert_eq!(x_events[0]["name"], "source");
+        assert_eq!(x_events[1]["name"], "map");
+
+        // Should have channel instant event.
+        let i_events: Vec<_> = events.iter().filter(|e| e["ph"] == "i").collect();
+        assert_eq!(i_events.len(), 1);
+        assert_eq!(i_events[0]["args"]["items_transferred"], 42);
+
+        // Should have metadata.
+        let m_events: Vec<_> = events.iter().filter(|e| e["ph"] == "M").collect();
+        assert!(m_events.len() >= 2); // process_name + at least 1 thread_name
+    }
+
+    #[test]
+    fn save_and_load_trace_file() {
+        let mut metrics = DataflowMetrics::new("file-test");
+        metrics.register_operator("op", 0);
+
+        let start_time = Instant::now();
+        let tc = Arc::new(TimelineCollector::new(0, start_time, Duration::ZERO, 50));
+        tc.record_activation(0, start_time, Duration::from_micros(100));
+        metrics.register_timeline(tc);
+
+        let exporter = metrics.to_chrome_trace("file-test");
+
+        let dir = std::env::temp_dir().join("instancy-chrome-trace-test");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("integration-trace.json");
+
+        exporter.save(&path).unwrap();
+
+        // Read back and verify structure.
+        let content = std::fs::read_to_string(&path).unwrap();
+        let json: serde_json::Value = serde_json::from_str(&content).unwrap();
+        assert!(!json["traceEvents"].as_array().unwrap().is_empty());
+
+        // Cleanup.
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_dir(&dir);
+    }
+}

@@ -217,7 +217,7 @@ mod tests {
         let ac = Antichain::<u64>::new();
         assert!(ac.is_empty());
         assert_eq!(ac.len(), 0);
-        assert_eq!(ac.elements(), &[]);
+        assert_eq!(ac.elements(), &[] as &[u64]);
     }
 
     #[test]

@@ -13,9 +13,13 @@
 //! - [`DataflowResult`] — execution result bundled with collected metrics
 
 pub mod activation;
+#[cfg(feature = "chrome-trace")]
+pub mod chrome_trace;
 pub mod tracing_integration;
 
 pub use activation::ActivationGuard;
+#[cfg(feature = "chrome-trace")]
+pub use chrome_trace::ChromeTraceExporter;
 pub use tracing_integration::TracingConfig;
 
 use std::sync::Arc;
@@ -575,6 +579,29 @@ impl DataflowMetrics {
     /// Total number of timeline events currently recorded (across all workers).
     pub fn timeline_event_count(&self) -> usize {
         self.timelines.iter().map(|tc| tc.event_count()).sum()
+    }
+
+    /// Build a [`ChromeTraceExporter`] from the collected metrics.
+    ///
+    /// This drains the timeline events and includes channel snapshots,
+    /// operator name metadata, and worker thread labels.
+    ///
+    /// Requires the `chrome-trace` feature.
+    #[cfg(feature = "chrome-trace")]
+    pub fn to_chrome_trace(&self, dataflow_name: impl Into<String>) -> ChromeTraceExporter {
+        let events = self.drain_timeline_events();
+        let channels = self.channel_snapshots();
+        let operators: Vec<(usize, String)> = self
+            .operator_snapshots()
+            .into_iter()
+            .map(|op| (op.index, op.name.clone()))
+            .collect();
+        let num_workers = self.timelines.len().max(1);
+
+        ChromeTraceExporter::new(dataflow_name)
+            .with_activations(&events, &operators)
+            .with_channels(&channels)
+            .with_metadata(num_workers)
     }
 }
 

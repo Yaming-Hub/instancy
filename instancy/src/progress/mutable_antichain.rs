@@ -232,7 +232,7 @@ mod tests {
     fn new_is_empty() {
         let mac = MutableAntichain::<u64>::new();
         assert!(mac.is_empty());
-        assert_eq!(mac.frontier(), &[]);
+        assert_eq!(mac.frontier(), &[] as &[u64]);
     }
 
     #[test]

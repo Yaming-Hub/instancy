@@ -29,6 +29,13 @@ fn main() {
     // --- Multi-worker dataflow with full metrics (including timeline) ---
     println!("\n=== Multi-Worker: Full Metrics + Timeline ===\n");
     run_multi_worker_timeline(&rt);
+
+    // --- Chrome Trace export (requires `chrome-trace` feature) ---
+    #[cfg(feature = "chrome-trace")]
+    {
+        println!("\n=== Chrome Trace Export ===\n");
+        run_chrome_trace_export(&rt);
+    }
 }
 
 /// Demonstrates basic operator-level metrics with `collect_metrics(true)`.
@@ -196,4 +203,49 @@ fn format_duration(duration: Duration) -> String {
     } else {
         format!("{}ns", duration.as_nanos())
     }
+}
+
+/// Demonstrates Chrome Trace JSON export for Perfetto UI visualization.
+///
+/// The exported file can be opened by dragging it onto https://ui.perfetto.dev/
+#[cfg(feature = "chrome-trace")]
+fn run_chrome_trace_export(rt: &RuntimeHandle) {
+    let opts = SpawnOptions::new().metrics(MetricsConfig::full());
+
+    let mut spawned = rt
+        .spawn_multi::<u64, _>(
+            "trace-demo",
+            2,
+            |builder: &mut DataflowBuilder<u64>| {
+                builder
+                    .source::<i32>("src", vec![(0u64, vec![1, 2, 3, 4, 5])])
+                    .exchange("scatter", |x: &i32| *x as u64)
+                    .map("triple", |_t, x| x * 3)
+                    .output("result")
+                    .unwrap();
+                Ok(())
+            },
+            opts,
+        )
+        .expect("spawn failed");
+
+    // Drain to completion.
+    let receivers = spawned.take_all_outputs::<i32>("result").unwrap();
+    for rx in receivers {
+        while rx.recv().is_some() {}
+    }
+
+    // Export Chrome Trace from worker 0's metrics.
+    let metrics = spawned.worker_mut(0).metrics().expect("metrics available");
+    let exporter = metrics.to_chrome_trace("trace-demo");
+
+    let path = std::env::temp_dir().join("instancy-trace-demo.json");
+    exporter.save(&path).expect("write trace file");
+
+    println!(
+        "  Wrote {} trace events to: {}",
+        exporter.event_count(),
+        path.display()
+    );
+    println!("  Open in Perfetto UI: https://ui.perfetto.dev/");
 }
