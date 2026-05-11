@@ -41,6 +41,34 @@ handle.join_blocking()?;
 
 See also: [Getting Started](../guide/getting-started.md), [Distributed Execution](../guide/distributed.md).
 
+### `SimpleRuntime`
+
+*Requires feature `test-utils`.*
+
+Lightweight, single-threaded runtime for unit tests. No Tokio runtime, no worker pool — runs the dataflow synchronously on the calling thread.
+
+Key methods:
+
+- `pub fn new() -> Self` — create a new simple runtime.
+- `pub fn with_cancel(cancel: CancellationToken) -> Self` — create with an existing cancellation token.
+- `pub fn cancel_token(&self) -> &CancellationToken` — get the cancellation token.
+- `pub fn run<T: Timestamp>(&self, dataflow: LogicalDataflow<T>) -> Result<()>` — run a pre-loaded dataflow to completion (blocking). Dataflow must not have `input()` ports.
+- `pub fn run_with_metrics<T: Timestamp>(&self, dataflow: LogicalDataflow<T>) -> Result<Option<Arc<DataflowMetrics>>>` — run and return collected metrics.
+- `pub fn spawn<T: Timestamp>(&self, dataflow: LogicalDataflow<T>) -> Result<SpawnedDataflow<T>>` — spawn on a background thread with channel-based I/O for feeding data and collecting results.
+
+Example:
+
+```rust
+use instancy::{DataflowBuilder, SimpleRuntime};
+
+let rt = SimpleRuntime::new();
+let builder = DataflowBuilder::<u64>::new("test");
+builder.source("nums", vec![(0, vec![1, 2, 3])]).output("out")?;
+rt.run(builder.build()?)?;
+```
+
+See also: [Testing](../guide/testing.md).
+
 ### `RuntimeConfig`
 
 Runtime construction settings.
@@ -154,7 +182,7 @@ Key methods:
 - `pub fn input<D: Clone + Send + 'static>(&self, name: impl Into<String>) -> Result<Pipe<T, D>>`
 - `pub fn source<D: Clone + Send + 'static>(&self, name: impl Into<String>, data: Vec<(T, Vec<D>)>) -> Pipe<T, D>`
 - `pub fn source_async<D, F, Fut>(&self, name: impl Into<String>, producer: F) -> Pipe<T, D>`
-- `pub fn build(&self) -> Result<LogicalDataflow<T>>`
+- `pub fn build(self) -> Result<LogicalDataflow<T>>`
 
 See also: [Building Dataflows](../guide/building-dataflows.md).
 

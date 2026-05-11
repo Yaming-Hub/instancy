@@ -56,7 +56,7 @@ fn counts_across_workers() {
     use instancy::{DataflowBuilder, RuntimeConfig, RuntimeHandle, SpawnOptions};
 
     let rt = RuntimeHandle::new(RuntimeConfig::default()).unwrap();
-    let mut multi = rt.spawn_multi("mw-test", 2, |_w, builder: &mut DataflowBuilder<u64>| {
+    let mut multi = rt.spawn_multi("mw-test", 2, |builder| {
         builder.input::<i32>("data").exchange_by_hash("route", |x| *x as u64).output("out");
         Ok(())
     }, SpawnOptions::default()).unwrap();

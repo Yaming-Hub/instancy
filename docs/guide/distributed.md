@@ -379,5 +379,5 @@ let opts = SpawnOptions::new().cancellation_token(token.clone());
 
 ## Next Steps
 
-- Next: [Serialization](./serialization.md)
-- See also: [Error Handling](./error-handling.md), [Testing](./testing.md)
+- Next: [Error Handling](./error-handling.md)
+- See also: [Serialization](./serialization.md), [Testing](./testing.md)

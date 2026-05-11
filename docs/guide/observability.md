@@ -194,7 +194,7 @@ exporter.save("trace.json").unwrap();
 - Look for operators with high backpressure blocked_duration
 - Use `drain_timeline_events()` to see individual activation timing
 - Check `channel_snapshots()` for exchange edge transfer volumes
-- See the [metrics_collection example](./instancy/examples/metrics_collection.rs) for a complete walkthrough
+- See the [metrics_collection example](../../instancy/examples/metrics_collection.rs) for a complete walkthrough
 
 ## Related Examples
 

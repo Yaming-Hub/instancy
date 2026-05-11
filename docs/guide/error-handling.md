@@ -136,7 +136,7 @@ Cancellation is **cooperative**: it signals operators at their next check point.
 
 #### Cancellation Reasons
 
-Every cancellation carries a [`CancellationReason`](instancy::cancellation::CancellationReason) that explains *why* the dataflow was cancelled. This helps distinguish user-initiated stops from system failures:
+Every cancellation carries a `CancellationReason` that explains *why* the dataflow was cancelled. This helps distinguish user-initiated stops from system failures:
 
 ```rust
 use instancy::{CancellationReason, CancellationToken, SpawnOptions};
