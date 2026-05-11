@@ -24,6 +24,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 #### Error Handling
 - Structured error types: `CodecError`, `ControlProtocolError`, `CommunicationError`,
   `HandshakeError`, `ProgressError`, `SpawnFailed` — replacing string errors (#233, #234)
+- Deferred error collection in dataflow builder — replaces panics (#205)
+- Deferred `unary_async` tokio panic handling — converts to operator error (#206)
 
 #### Progress Tracking
 - Graph-topology completion propagation using graph structure for precise frontier
@@ -34,6 +36,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   plane protocol (#238)
 
 #### Communication
+- Connection failure recovery with automatic reconnect (#202)
 - `sequencing` module — message sequencing primitives for shared connection mode
   - `SequenceCounter`, `ReorderBuffer<T>`, `SequencedFrame`, wire format encode/decode
 - `shared_pool` module — adaptive connection pool for shared connection mode
@@ -63,6 +66,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - 50-minute stress test (#213)
 - Cluster observability integration test (#244)
 - Async I/O cluster test with cross-node exchange (#245)
+- Replace TCP-based reconnect test with in-memory duplex streams (#223)
 
 #### Documentation
 - COOKBOOK §11 Cluster Dataflows recipes (#244)
@@ -70,6 +74,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - GUIDE §8 Distributed Execution updates (#245)
 - `lib.rs` doc comments on all crate-level re-exports (#245)
 - Dynamic cluster scaling in README (#232)
+- Auto-parallelism and wake scheduling docs (#209)
+- Transport-agnostic design clarifications (#221)
+- Document connection failure and reconnection responsibility (#219)
+- DESIGN.md updated to reflect current state (#228)
 
 ### Changed
 
@@ -78,9 +86,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Per-stage parallelism is now the default `SpawnOptions` behavior (#198)
 
 #### API
+- **BREAKING**: Removed `worker_idx` parameter from `spawn_multi` and `spawn_cluster`
+  closure signatures (#204)
 - Unified API naming inconsistencies (#216)
 - Restricted internal types to `pub(crate)` (#215)
 - Removed panics from production code (#214)
+- Code quality cleanup: remove production `.unwrap()` calls and dead code (#199, #201)
+- CI: build all 35 examples and lint test code (#247)
 
 ### Fixed
 - Resolve 24 broken rustdoc intra-doc links (#246)
@@ -89,12 +101,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Observability tracing tests for parallel execution (#224)
 - Shared transport race condition (#200)
 - README inaccuracies (#218)
-
-### Improved
-- CI: build all 35 examples and lint test code (#247)
-- Transport-agnostic design clarifications (#221)
-- Document connection failure and reconnection responsibility (#219)
-- DESIGN.md updated to reflect current state (#228)
 
 ## [0.2.0] - 2026-05-05
 
