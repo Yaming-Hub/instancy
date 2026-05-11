@@ -167,13 +167,13 @@ Strict priority scheduling — higher priority always wins. Can starve low-prior
 
 ### `PriorityWithAgingPolicy`
 
-Priority with aging — prevents starvation by increasing effective priority based on wait time. Configured with `aging_weight: f64` (default: 1.0). Higher aging weight causes low-priority tasks to be promoted faster.
+Priority with aging — prevents starvation by increasing effective priority based on wait time. Configured with `aging_rate: f64` (default: 0.1, i.e., 1 priority level per 10 seconds). Higher aging rate causes low-priority tasks to be promoted faster.
 
 ```rust
 use instancy::{PriorityWithAgingPolicy, RuntimeConfig};
 
 let config = RuntimeConfig {
-    schedule_policy: Some(Box::new(PriorityWithAgingPolicy::new(2.0))),
+    schedule_policy: Some(Box::new(PriorityWithAgingPolicy { aging_rate: 2.0 })),
     ..Default::default()
 };
 ```
@@ -548,8 +548,6 @@ Key methods:
 - `reason(&self) -> Option<CancellationReason>`
 - `is_cancelled(&self) -> bool`
 - `register_wake_handle(&self, wake_handle: WakeHandle)`
-
-Common `CancellationReason` variants include `UserRequested`, `RuntimeShutdown`, `NetworkError`, `WorkerFailed`, `HandleDropped`, `OperatorError`, `PeerCancelled`, `PeerDown`, and `InternalError`.
 
 ### `CancellationReason`
 
