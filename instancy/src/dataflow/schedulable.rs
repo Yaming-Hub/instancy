@@ -249,6 +249,12 @@ pub struct ChannelFactory(
 );
 
 /// Type alias for the channel pair returned by [`ChannelFactory::build`].
+///
+/// The first element is a `Box<dyn Push<T, D, M>>` (the output/sender side),
+/// and the second is a `Box<dyn Pull<T, D, M>>` (the input/receiver side).
+/// Both are type-erased via `Any` because the concrete types depend on the
+/// data type `D` and timestamp type `T`, which are not known at the
+/// factory-storage level.
 pub type ChannelPair = (Box<dyn std::any::Any + Send>, Box<dyn std::any::Any + Send>);
 
 impl ChannelFactory {
