@@ -23,6 +23,9 @@
 //! - [`OperatorCore`] — trait that operators implement to declare their shape and
 //!   initial capabilities.
 
+use std::any::Any;
+use std::cell::RefCell;
+use std::collections::HashMap;
 use std::fmt::Debug;
 use std::sync::{Arc, Mutex};
 
@@ -189,6 +192,43 @@ impl<T: Timestamp> Default for ProgressReporter<T> {
     fn default() -> Self {
         Self::new()
     }
+}
+
+thread_local! {
+    static MATERIALIZATION_REPORTERS: RefCell<Option<Box<dyn Any>>> =
+        RefCell::new(None);
+}
+
+pub(crate) struct MaterializationReporterGuard;
+
+impl Drop for MaterializationReporterGuard {
+    fn drop(&mut self) {
+        MATERIALIZATION_REPORTERS.with(|slot| {
+            *slot.borrow_mut() = None;
+        });
+    }
+}
+
+pub(crate) fn install_materialization_reporters<T: Timestamp>(
+    reporters: HashMap<(usize, usize), ProgressReporter<T>>,
+) -> MaterializationReporterGuard {
+    MATERIALIZATION_REPORTERS.with(|slot| {
+        *slot.borrow_mut() = Some(Box::new(reporters));
+    });
+    MaterializationReporterGuard
+}
+
+pub(crate) fn materialization_reporter<T: Timestamp>(
+    operator: usize,
+    output: usize,
+) -> Option<ProgressReporter<T>> {
+    MATERIALIZATION_REPORTERS.with(|slot| {
+        slot.borrow()
+            .as_ref()?
+            .downcast_ref::<HashMap<(usize, usize), ProgressReporter<T>>>()?
+            .get(&(operator, output))
+            .cloned()
+    })
 }
 
 // ---------------------------------------------------------------------------

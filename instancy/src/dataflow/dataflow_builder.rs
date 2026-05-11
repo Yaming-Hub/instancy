@@ -480,6 +480,8 @@ impl<T: Timestamp> DataflowBuilder<T> {
                             let mut rx = Some(rx);
                             let factory: OperatorFactory =
                                 OperatorFactory::new(move |_ctx, endpoints| {
+                                    let reporter = crate::progress::operate::materialization_reporter(op_idx, 0)
+                                        .unwrap_or_else(|| reporter.clone());
                                     let rx = rx.take().ok_or_else(|| {
                                         Error::Runtime(crate::error::RuntimeError::AlreadyConsumed {
                                             resource: "input port channel (sync)".into(),
@@ -533,6 +535,8 @@ impl<T: Timestamp> DataflowBuilder<T> {
                             let mut rx = Some(rx);
                             let factory: OperatorFactory =
                                 OperatorFactory::new(move |_ctx, endpoints| {
+                                    let reporter = crate::progress::operate::materialization_reporter(op_idx, 0)
+                                        .unwrap_or_else(|| reporter.clone());
                                     let rx = rx.take().ok_or_else(|| {
                                         Error::Runtime(crate::error::RuntimeError::AlreadyConsumed {
                                             resource: "input port channel (async)".into(),
@@ -648,7 +652,8 @@ impl<T: Timestamp> DataflowBuilder<T> {
                 OperatorFactory::new(move |_ctx, endpoints: ChannelEndpoints| {
                     let name = name_clone.clone();
                     let data = data.clone();
-                    let reporter = reporter.clone();
+                    let reporter = crate::progress::operate::materialization_reporter(op_idx, 0)
+                        .unwrap_or_else(|| reporter.clone());
                     let output_pusher: Box<dyn Push<T, D>> = {
                         let pushers: Vec<Box<dyn Push<T, D>>> = endpoints
                             .output_pushers
@@ -791,6 +796,8 @@ impl<T: Timestamp> DataflowBuilder<T> {
                     let reporter = source_reporter.clone();
                     let mut rx = Some(rx);
                     let factory: OperatorFactory = OperatorFactory::new(move |_ctx, endpoints| {
+                        let reporter = crate::progress::operate::materialization_reporter(op_idx, 0)
+                            .unwrap_or_else(|| reporter.clone());
                         let rx = rx.take().ok_or_else(|| {
                             Error::Runtime(crate::error::RuntimeError::AlreadyConsumed {
                                 resource: "async source channel".into(),
@@ -3861,7 +3868,8 @@ impl<T: Timestamp, D: Clone + Send + 'static> Pipe<T, D> {
             let factory: OperatorFactory =
                 OperatorFactory::new(move |_ctx, endpoints: ChannelEndpoints| {
                     let name = name_clone.clone();
-                    let exchange_reporter = exchange_reporter.clone();
+                    let exchange_reporter = crate::progress::operate::materialization_reporter(op_idx, 0)
+                        .unwrap_or_else(|| exchange_reporter.clone());
                     let input_puller: Box<dyn Pull<T, D>> = *endpoints
                         .input_pullers
                         .into_iter()
@@ -4019,7 +4027,8 @@ impl<T: Timestamp, D: Clone + Send + 'static> Pipe<T, D> {
             let factory: OperatorFactory =
                 OperatorFactory::new(move |_ctx, endpoints: ChannelEndpoints| {
                     let name = name_clone.clone();
-                    let exchange_reporter = exchange_reporter.clone();
+                    let exchange_reporter = crate::progress::operate::materialization_reporter(op_idx, 0)
+                        .unwrap_or_else(|| exchange_reporter.clone());
                     let input_puller: Box<dyn Pull<T, D>> = *endpoints
                         .input_pullers
                         .into_iter()
@@ -4489,7 +4498,8 @@ impl<T: Timestamp, D: Clone + Send + 'static> Pipe<T, D> {
                 OperatorFactory::new(move |_ctx, endpoints: ChannelEndpoints| {
                     let name = name_clone.clone();
                     let logic = logic.clone();
-                    let progress_reporter = progress_reporter.clone();
+                    let progress_reporter = crate::progress::operate::materialization_reporter(op_idx, 0)
+                        .unwrap_or_else(|| progress_reporter.clone());
                     let input_puller: Box<dyn Pull<T, D>> = *endpoints
                         .input_pullers
                         .into_iter()
@@ -4766,9 +4776,9 @@ impl<T: Timestamp, D: Send + 'static> OutputPort<T, D> {
 /// to materialize a physical executor.
 ///
 /// `LogicalDataflow` is `Send` and can be submitted to any runtime for
-/// physical materialization and execution. The stored factories are replayable,
-/// but current runtimes still consume the surrounding wiring during spawn, so a
-/// `LogicalDataflow` value remains single-use at the runtime layer.
+/// physical materialization and execution. The stored factories and wiring are
+/// replayable, allowing runtimes to materialize the same logical graph multiple
+/// times for multi-worker execution.
 ///
 /// `LogicalDataflow` is a purely logical artifact — it knows nothing about
 /// threads, channels, or execution strategy. All physical execution goes

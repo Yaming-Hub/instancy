@@ -14,7 +14,7 @@
 //! One `DataflowExecutor` per dataflow execution. Created by [`execute()`](crate::execute)
 //! and runs until completion or cancellation.
 
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::future::Future;
 use std::marker::PhantomData;
 use std::pin::Pin;
@@ -479,8 +479,8 @@ impl<T: Timestamp> DataflowExecutor<T> {
     /// with InputSenders and CancellationTokens created before materialization.
     pub fn materialize(
         graph: &DataflowGraph,
-        mut operator_factories: Vec<(usize, OperatorFactory)>,
-        channel_factories: Vec<(usize, ChannelFactory)>,
+        operator_factories: &mut [(usize, OperatorFactory)],
+        channel_factories: &mut [(usize, ChannelFactory)],
         config: ExecutorConfig,
         cancel: CancellationToken,
         external_wake_handle: Option<WakeHandle>,
@@ -514,18 +514,22 @@ impl<T: Timestamp> DataflowExecutor<T> {
         let mut pull_ends: Vec<Option<Box<dyn std::any::Any + Send>>> = Vec::new();
 
         // Channel factories are indexed by edge index.
-        // Create a map from edge_index → factory.
-        let mut factory_map: std::collections::HashMap<usize, ChannelFactory> =
-            channel_factories.into_iter().collect();
+        // Create a map from edge_index → position in the factory vec.
+        let factory_positions: HashMap<usize, usize> = channel_factories
+            .iter()
+            .enumerate()
+            .map(|(pos, (edge_idx, _))| (*edge_idx, pos))
+            .collect();
 
         let wake_handle = external_wake_handle.unwrap_or_default();
 
         for edge_idx in 0..total_edge_count {
-            let mut factory = factory_map.remove(&edge_idx).ok_or_else(|| {
+            let pos = *factory_positions.get(&edge_idx).ok_or_else(|| {
                 Error::Dataflow(DataflowError::MissingFactory {
                     edge_index: edge_idx,
                 })
             })?;
+            let (_, factory) = &mut channel_factories[pos];
             let (push, pull) = factory.build(&worker_context, Some(wake_handle.clone()))?;
             push_ends.push(Some(push));
             pull_ends.push(Some(pull));
@@ -594,14 +598,16 @@ impl<T: Timestamp> DataflowExecutor<T> {
         }
 
         // Phase 3: Invoke operator factories with their endpoints.
-        // Sort factories by operator index for deterministic creation.
-        operator_factories.sort_by_key(|(idx, _)| *idx);
+        // Sort positions by operator index for deterministic creation without
+        // disturbing the persistent factory order stored on LogicalDataflow.
+        let mut factory_positions: Vec<usize> = (0..operator_factories.len()).collect();
+        factory_positions.sort_by_key(|&pos| operator_factories[pos].0);
 
         let mut operators: Vec<Box<dyn SchedulableOperator>> = Vec::new();
         let mut index_to_pos: Vec<usize> = Vec::new();
-        let max_index = operator_factories
+        let max_index = factory_positions
             .iter()
-            .map(|(idx, _)| *idx)
+            .map(|&pos| operator_factories[pos].0)
             .max()
             .unwrap_or(0);
         index_to_pos.resize(max_index + 1, usize::MAX);
@@ -609,7 +615,10 @@ impl<T: Timestamp> DataflowExecutor<T> {
         // All operator factories are OperatorFactory (FnMut). For
         // build-once-materialize-N, this loop will run N times on the same
         // &mut factories, each producing an independent operator instance.
-        for (op_idx, mut factory) in operator_factories {
+        for factory_pos in factory_positions {
+            let (op_idx, factory) = &mut operator_factories[factory_pos];
+            let op_idx = *op_idx;
+
             // Collect input pullers sorted by port index.
             let mut inputs = op_input_pullers.remove(&op_idx).unwrap_or_default();
             inputs.sort_by_key(|(port, _)| *port);
