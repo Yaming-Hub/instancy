@@ -60,7 +60,7 @@ pub struct StreamTarget {
 /// StreamEdges are created by operators (e.g., `unary`, `binary`) and consumed
 /// by downstream operators or terminal operators (e.g., `output`).
 ///
-/// See docs/DESIGN.md §4.5 "Logical/Physical Separation Architecture" for how
+/// See docs/design/README.md §4.5 "Logical/Physical Separation Architecture" for how
 /// StreamEdge relates to Pipe (Layer 3) and the abstract Dataflow Graph (Layer 1).
 #[derive(Debug, Clone)]
 pub struct StreamEdge<S: Scope, D> {

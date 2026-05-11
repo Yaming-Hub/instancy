@@ -1,6 +1,6 @@
 //! Shared transport layer for pooled, multi-dataflow connections.
 //!
-//! This module implements Phase 4 of the shared connection mode (DESIGN.md §6.3.1).
+//! This module implements Phase 4 of the shared connection mode (docs/design/communication.md §6.3.1).
 //! Unlike [`TransportSession`](super::transport_session::TransportSession) which creates dedicated per-dataflow TCP connections,
 //! `SharedTransportSession` lets multiple dataflows share a pool of connections to
 //! each peer, with sequenced messages for ordering.

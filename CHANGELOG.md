@@ -78,6 +78,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Transport-agnostic design clarifications (#221)
 - Document connection failure and reconnection responsibility (#219)
 - DESIGN.md updated to reflect current state (#228)
+- LICENSE attribution to timely-dataflow (#248)
+- Restructured design docs: split monolithic DESIGN.md into 10 focused topic files
+  under `docs/design/` (#249)
+- Restructured user docs: split GUIDE.md into 11 tutorial pages under `docs/guide/`,
+  new API reference at `docs/reference/api.md`, moved COOKBOOK to `docs/cookbook.md` (#249)
 
 ### Changed
 
@@ -96,6 +101,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 - Resolve 24 broken rustdoc intra-doc links (#246)
+- CHANGELOG: add 8 missing PRs and mark #204 as BREAKING (#248)
 - Chrome Trace flow event `id` field placement and frontier change detection (#242)
 - Two flaky tests: dispatch race condition and timing jitter (#222)
 - Observability tracing tests for parallel execution (#224)
