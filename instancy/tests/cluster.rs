@@ -671,8 +671,9 @@ async fn cluster_observability_metrics_collected() {
 
 /// Verify that async I/O mode works with cluster dataflows.
 ///
-/// Spawns a two-node cluster with `IoMode::Async`, feeds data via
-/// `AsyncInputSender`, and collects results via `AsyncOutputReceiver`.
+/// Spawns a two-node cluster with `IoMode::Async` and an exchange operator,
+/// feeds data via `AsyncInputSender`, and collects results via `AsyncOutputReceiver`.
+/// Data is repartitioned across nodes to exercise cross-node async I/O.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn cluster_async_io_mode() {
     use instancy::IoMode;
@@ -699,8 +700,10 @@ async fn cluster_async_io_mode() {
     let tokio_handle = tokio::runtime::Handle::current();
 
     let build = |builder: &mut DataflowBuilder<u64>| -> Result<()> {
-        let input = builder.input::<i32>("data").unwrap();
+        let input = builder.input::<i64>("data").unwrap();
+        // Exchange by value — repartitions data across nodes.
         input
+            .exchange("by_val", |x: &i64| *x as u64)
             .map("triple", |_t, x| x * 3)
             .output("results")
             .unwrap();
@@ -751,18 +754,19 @@ async fn cluster_async_io_mode() {
     let (_rt_b, mut cluster_b) = result_b.unwrap().unwrap();
 
     // Use async input senders.
-    let sender_a = cluster_a.take_async_input::<i32>(0, "data").unwrap();
-    let sender_b = cluster_b.take_async_input::<i32>(0, "data").unwrap();
+    let sender_a = cluster_a.take_async_input::<i64>(0, "data").unwrap();
+    let sender_b = cluster_b.take_async_input::<i64>(0, "data").unwrap();
 
     // Use async output receivers.
-    let mut receiver_a = cluster_a.take_async_output::<i32>(0, "results").unwrap();
-    let mut receiver_b = cluster_b.take_async_output::<i32>(0, "results").unwrap();
+    let mut receiver_a = cluster_a.take_async_output::<i64>(0, "results").unwrap();
+    let mut receiver_b = cluster_b.take_async_output::<i64>(0, "results").unwrap();
 
-    // Feed data asynchronously.
-    sender_a.send(0, vec![1, 2, 3]).await.unwrap();
+    // Feed values 0..10 to node-a via async send. After exchange(by_val),
+    // data is repartitioned across nodes.
+    sender_a.send(0, (0i64..10).collect()).await.unwrap();
     sender_a.close();
 
-    sender_b.send(0, vec![10, 20]).await.unwrap();
+    // Close node-b's input (empty, but must be closed for dataflow to complete).
     sender_b.close();
 
     // Join and collect.
@@ -772,15 +776,22 @@ async fn cluster_async_io_mode() {
     res_a.unwrap();
     res_b.unwrap();
 
-    // Collect async output.
+    // Collect async output from both nodes.
     let results_a = receiver_a.collect_data().await;
-    let mut data_a: Vec<i32> = results_a.into_iter().flat_map(|(_, d)| d).collect();
-    data_a.sort();
+    let data_a: Vec<i64> = results_a.into_iter().flat_map(|(_, d)| d).collect();
 
     let results_b = receiver_b.collect_data().await;
-    let mut data_b: Vec<i32> = results_b.into_iter().flat_map(|(_, d)| d).collect();
-    data_b.sort();
+    let data_b: Vec<i64> = results_b.into_iter().flat_map(|(_, d)| d).collect();
 
-    assert_eq!(data_a, vec![3, 6, 9], "node-a should triple its inputs");
-    assert_eq!(data_b, vec![30, 60], "node-b should triple its inputs");
+    // All 10 values (tripled) should appear across the two nodes.
+    let mut all: Vec<i64> = data_a.iter().chain(data_b.iter()).copied().collect();
+    all.sort();
+    let expected: Vec<i64> = (0..10).map(|x| x * 3).collect();
+    assert_eq!(all, expected, "all inputs tripled and distributed across nodes");
+
+    // At least one node should have received data from the other (exchange).
+    assert!(
+        !data_a.is_empty() && !data_b.is_empty(),
+        "exchange should distribute data across both nodes, got a={data_a:?} b={data_b:?}"
+    );
 }

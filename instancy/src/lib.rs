@@ -67,7 +67,7 @@ pub(crate) mod worker_pool;
 // ── Crate-level re-exports for ergonomic use ──────────────────────────
 
 // Dataflow construction
-/// Builder for composing dataflow graphs with typed operators and edges.
+/// Result of an iterate closure — specifies which data feeds back and which exits.
 pub use dataflow::dataflow_builder::IterateResult;
 /// The resolved dataflow graph (operators, edges, exchange indices).
 pub use dataflow::graph::DataflowGraph;
