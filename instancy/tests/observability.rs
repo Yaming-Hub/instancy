@@ -386,4 +386,130 @@ mod chrome_trace_integration {
         let _ = std::fs::remove_file(&path);
         let _ = std::fs::remove_dir(&dir);
     }
+
+    #[cfg(feature = "chrome-trace")]
+    #[test]
+    fn frontier_events_in_chrome_trace() {
+        let mut metrics = DataflowMetrics::new("frontier-trace");
+        metrics.register_operator("source", 0);
+        metrics.register_operator("map", 1);
+
+        let start_time = Instant::now();
+        let tc = Arc::new(TimelineCollector::new(0, start_time, Duration::ZERO, 0));
+        tc.record_frontier(0, "{5}".to_string());
+        tc.record_frontier(1, "{10}".to_string());
+        metrics.register_timeline(tc);
+
+        let frontier_events = metrics.drain_frontier_events();
+        assert_eq!(frontier_events.len(), 2);
+
+        let exporter = metrics
+            .drain_to_chrome_trace("frontier-trace")
+            .with_frontiers(&frontier_events, &[(0, "source".to_string()), (1, "map".to_string())]);
+
+        let bytes = exporter.to_bytes().unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        let events = json["traceEvents"].as_array().unwrap();
+
+        // Frontier events are instant ("i") events.
+        let i_events: Vec<_> = events
+            .iter()
+            .filter(|e| e["ph"] == "i" && e["cat"] == "frontier")
+            .collect();
+        assert_eq!(i_events.len(), 2);
+        assert_eq!(i_events[0]["args"]["new_frontier"], "{5}");
+        assert_eq!(i_events[1]["args"]["new_frontier"], "{10}");
+    }
+
+    #[cfg(feature = "chrome-trace")]
+    #[test]
+    fn transfer_events_in_chrome_trace() {
+        let mut metrics = DataflowMetrics::new("transfer-trace");
+        metrics.register_operator("source", 0);
+
+        let start_time = Instant::now();
+        let tc = Arc::new(TimelineCollector::new(0, start_time, Duration::ZERO, 0));
+        tc.record_transfer(0, 1, 100, 800);
+        metrics.register_timeline(tc);
+
+        let transfer_events = metrics.drain_transfer_events();
+        assert_eq!(transfer_events.len(), 1);
+
+        let exporter = metrics
+            .drain_to_chrome_trace("transfer-trace")
+            .with_transfers(&transfer_events);
+
+        let bytes = exporter.to_bytes().unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        let events = json["traceEvents"].as_array().unwrap();
+
+        // Transfer events produce flow event pairs (s + f).
+        let s_events: Vec<_> = events
+            .iter()
+            .filter(|e| e["ph"] == "s" && e["cat"] == "transfer")
+            .collect();
+        let f_events: Vec<_> = events
+            .iter()
+            .filter(|e| e["ph"] == "f" && e["cat"] == "transfer")
+            .collect();
+        assert_eq!(s_events.len(), 1);
+        assert_eq!(f_events.len(), 1);
+        assert_eq!(s_events[0]["args"]["items"], 100);
+        assert_eq!(s_events[0]["args"]["bytes"], 800);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// End-to-end frontier recording via real dataflow
+// ---------------------------------------------------------------------------
+
+#[test]
+fn frontier_events_recorded_in_running_dataflow() {
+    use instancy::dataflow::DataflowBuilder;
+    use instancy::metrics::MetricsConfig;
+    use instancy::runtime::{RuntimeConfig, RuntimeHandle, SpawnOptions};
+
+    let rt = RuntimeHandle::new(RuntimeConfig::default()).unwrap();
+
+    let builder = DataflowBuilder::<u64>::new("frontier-e2e");
+    let input = builder.input::<i32>("data").unwrap();
+    input.map("double", |_t, x| x * 2).output("out").unwrap();
+    let dataflow = builder.build().unwrap();
+
+    let opts = SpawnOptions::new().metrics(MetricsConfig::full());
+    let mut handle = rt.spawn(dataflow, opts).unwrap();
+
+    let sender = handle.take_input::<i32>("data").unwrap();
+    let receiver = handle.take_output::<i32>("out").unwrap();
+
+    sender.send(0, vec![1, 2, 3]).unwrap();
+    drop(sender);
+
+    let results: Vec<i32> = receiver
+        .collect_data()
+        .into_iter()
+        .flat_map(|(_t, v)| v)
+        .collect();
+    assert_eq!(results.len(), 3);
+
+    // Get metrics handle before join (metrics are Arc-shared, stay live).
+    let metrics = handle
+        .metrics()
+        .expect("metrics should be Some with MetricsConfig::full()")
+        .clone();
+
+    // Wait for completion.
+    handle.join_blocking().unwrap();
+
+    // Frontier events should be recorded (operators get frontier advances
+    // as inputs close and timestamps progress).
+    let frontier_events = metrics.drain_frontier_events();
+    assert!(
+        !frontier_events.is_empty(),
+        "expected at least one frontier event, got 0"
+    );
+    // Verify event structure.
+    for ev in &frontier_events {
+        assert!(!ev.new_frontier.is_empty());
+    }
 }

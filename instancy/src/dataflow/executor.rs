@@ -105,6 +105,12 @@ pub struct ExecutorConfig {
     /// operator activation is recorded with a timestamp offset, duration,
     /// operator/worker indices. Used for Chrome Trace / Perfetto UI export.
     pub activation_timeline: bool,
+    /// Whether to record frontier advance events. When enabled, each operator
+    /// frontier change is recorded with a timestamp and new frontier value.
+    pub frontier_timeline: bool,
+    /// Whether to record data transfer events through exchange channels.
+    /// When enabled, each batch push through an exchange is recorded.
+    pub transfer_timeline: bool,
     /// Minimum activation duration to record in the timeline.
     pub min_activation_duration: std::time::Duration,
     /// Maximum timeline events per worker (ring buffer cap). 0 = unlimited.
@@ -127,6 +133,8 @@ impl Default for ExecutorConfig {
             drain_timeout: None,
             channel_metrics_collectors: Vec::new(),
             activation_timeline: false,
+            frontier_timeline: false,
+            transfer_timeline: false,
             min_activation_duration: std::time::Duration::from_micros(1),
             max_timeline_events: 0,
         timeline_start_time: None,
@@ -477,6 +485,22 @@ impl<T: Timestamp> DataflowExecutor<T> {
         let feedback_edges = graph.feedback_edges();
         let total_edge_count = edges.len() + feedback_edges.len();
 
+        // Create timeline collector early so exchange channels can capture it.
+        let timeline_start = config.timeline_start_time.unwrap_or_else(Instant::now);
+        let any_timeline = config.activation_timeline
+            || config.frontier_timeline
+            || config.transfer_timeline;
+        let timeline_collector = if any_timeline {
+            Some(Arc::new(crate::metrics::TimelineCollector::new(
+                worker_context.worker_index(),
+                timeline_start,
+                config.min_activation_duration,
+                config.max_timeline_events,
+            )))
+        } else {
+            None
+        };
+
         // Phase 1: Create channels for each edge (regular + feedback).
         // channel_endpoints[edge_index] = (push_end, pull_end)
         // Regular edges: indices 0..edges.len()
@@ -639,7 +663,9 @@ impl<T: Timestamp> DataflowExecutor<T> {
         // Initialize per-operator metrics collectors when enabled.
         let needs_metrics = config.collect_metrics
             || !config.channel_metrics_collectors.is_empty()
-            || config.activation_timeline;
+            || config.activation_timeline
+            || config.frontier_timeline
+            || config.transfer_timeline;
         let (dataflow_metrics, op_collectors) = if needs_metrics {
             let mut dm = DataflowMetrics::new("dataflow");
             let collectors: Vec<Option<Arc<OperatorMetricsCollector>>> = if config.collect_metrics {
@@ -661,19 +687,6 @@ impl<T: Timestamp> DataflowExecutor<T> {
             (Some(dm), collectors)
         } else {
             (None, Vec::new())
-        };
-
-        // Create timeline collector when activation_timeline is enabled.
-        let timeline_start = config.timeline_start_time.unwrap_or_else(Instant::now);
-        let timeline_collector = if config.activation_timeline {
-            Some(Arc::new(crate::metrics::TimelineCollector::new(
-                worker_context.worker_index(),
-                timeline_start,
-                config.min_activation_duration,
-                config.max_timeline_events,
-            )))
-        } else {
-            None
         };
 
         // Register timeline collector on DataflowMetrics (before wrapping in Arc).
@@ -1035,6 +1048,15 @@ impl<T: Timestamp> DataflowExecutor<T> {
             // New path: operator-owned notificator (WiredUnaryNotifyOperator etc.)
             // The operator downcasts &dyn Any to &Antichain<T> internally.
             self.operators[*pos].update_input_frontier(frontier);
+        }
+
+        // Record frontier events for dirty operators when frontier timeline is enabled.
+        if self.config.frontier_timeline {
+            if let Some(ref tc) = self.timeline_collector {
+                for &(pos, ref frontier) in &frontier_updates {
+                    tc.record_frontier(pos, format!("{:?}", frontier));
+                }
+            }
         }
 
         let mut activated = false;
@@ -2162,6 +2184,8 @@ mod tests {
             drain_timeout: None,
                 channel_metrics_collectors: Vec::new(),
             activation_timeline: false,
+            frontier_timeline: false,
+            transfer_timeline: false,
             min_activation_duration: std::time::Duration::from_micros(1),
             max_timeline_events: 0,
             timeline_start_time: None,
@@ -2577,6 +2601,8 @@ mod tests {
             drain_timeout: None,
                 channel_metrics_collectors: Vec::new(),
             activation_timeline: false,
+            frontier_timeline: false,
+            transfer_timeline: false,
             min_activation_duration: std::time::Duration::from_micros(1),
             max_timeline_events: 0,
             timeline_start_time: None,
@@ -2669,6 +2695,8 @@ mod tests {
             drain_timeout: None,
                 channel_metrics_collectors: Vec::new(),
             activation_timeline: false,
+            frontier_timeline: false,
+            transfer_timeline: false,
             min_activation_duration: std::time::Duration::from_micros(1),
             max_timeline_events: 0,
             timeline_start_time: None,
@@ -3188,6 +3216,8 @@ mod tests {
             drain_timeout: None,
                 channel_metrics_collectors: Vec::new(),
             activation_timeline: false,
+            frontier_timeline: false,
+            transfer_timeline: false,
             min_activation_duration: std::time::Duration::from_micros(1),
             max_timeline_events: 0,
             timeline_start_time: None,
@@ -3272,6 +3302,8 @@ mod tests {
             drain_timeout: None,
                 channel_metrics_collectors: Vec::new(),
             activation_timeline: false,
+            frontier_timeline: false,
+            transfer_timeline: false,
             min_activation_duration: std::time::Duration::from_micros(1),
             max_timeline_events: 0,
             timeline_start_time: None,
@@ -4185,6 +4217,8 @@ mod tests {
             drain_timeout: Some(std::time::Duration::from_secs(5)),
             channel_metrics_collectors: Vec::new(),
         activation_timeline: false,
+            frontier_timeline: false,
+            transfer_timeline: false,
         min_activation_duration: std::time::Duration::from_micros(1),
         max_timeline_events: 0,
         timeline_start_time: None,
@@ -4219,6 +4253,8 @@ mod tests {
             drain_timeout: None,
                 channel_metrics_collectors: Vec::new(),
         activation_timeline: false,
+            frontier_timeline: false,
+            transfer_timeline: false,
         min_activation_duration: std::time::Duration::from_micros(1),
         max_timeline_events: 0,
         timeline_start_time: None,
@@ -4267,6 +4303,8 @@ mod tests {
             drain_timeout: Some(std::time::Duration::from_millis(50)),
             channel_metrics_collectors: Vec::new(),
         activation_timeline: false,
+            frontier_timeline: false,
+            transfer_timeline: false,
         min_activation_duration: std::time::Duration::from_micros(1),
         max_timeline_events: 0,
         timeline_start_time: None,
@@ -4302,6 +4340,8 @@ mod tests {
             drain_timeout: Some(std::time::Duration::from_secs(5)),
             channel_metrics_collectors: Vec::new(),
         activation_timeline: false,
+            frontier_timeline: false,
+            transfer_timeline: false,
         min_activation_duration: std::time::Duration::from_micros(1),
         max_timeline_events: 0,
         timeline_start_time: None,

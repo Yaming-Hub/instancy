@@ -1,15 +1,17 @@
 //! # Metrics Collection
 //!
-//! Demonstrates the three levels of metrics collection:
+//! Demonstrates the five levels of metrics collection:
 //!
 //! 1. **Operator summary** — per-operator activation count, CPU time, records processed
 //! 2. **Channel counters** — per-exchange-edge items and bytes transferred
 //! 3. **Activation timeline** — per-activation timestamped events for timeline replay
+//! 4. **Frontier timeline** — per-operator frontier advance events
+//! 5. **Transfer timeline** — per-exchange-edge data transfer events
 //!
 //! Control what is collected via `MetricsConfig` presets:
 //! - `MetricsConfig::none()` — zero overhead
 //! - `MetricsConfig::summary_only()` — operator stats (~1% overhead)
-//! - `MetricsConfig::full()` — all categories including activation timeline
+//! - `MetricsConfig::full()` — all categories including all timelines
 //!
 //! Run with: `cargo run --example metrics_collection --all-features`
 
@@ -139,6 +141,24 @@ fn run_multi_worker_timeline(rt: &RuntimeHandle) {
                 println!(
                     "    op[{}] w{}: {}µs duration @ +{}µs",
                     ev.operator_index, ev.worker_index, ev.duration_us, ev.start_us
+                );
+            }
+            if events.len() > 5 {
+                println!("    ... and {} more", events.len() - 5);
+            }
+        }
+    }
+
+    // --- Frontier timeline ---
+    println!("\nFrontier timeline events:");
+    for w in 0..2 {
+        if let Some(m) = spawned.worker_mut(w).metrics() {
+            let events = m.drain_frontier_events();
+            println!("  worker {w}: {} events", events.len());
+            for ev in events.iter().take(5) {
+                println!(
+                    "    op[{}] w{}: frontier → {} @ +{}µs",
+                    ev.operator_index, ev.worker_index, ev.new_frontier, ev.timestamp_us
                 );
             }
             if events.len() > 5 {

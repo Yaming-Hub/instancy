@@ -1590,9 +1590,15 @@ pub struct MetricsConfig {
     /// Record each operator activation as a timestamped event for timeline replay.
     /// Overhead: ~5-10% (timestamp capture + Vec push per activation).
     pub activation_timeline: bool,
+    /// Record frontier advance events for each operator.
+    /// Overhead: ~3% (1 Vec push per frontier change per operator).
+    pub frontier_timeline: bool,
+    /// Record data transfer events through exchange channels.
+    /// Overhead: ~5-10% (1 Vec push per exchange batch).
+    pub transfer_timeline: bool,
     /// Minimum activation duration to record in the timeline (default: 1µs).
     pub min_activation_duration: Duration,
-    /// Maximum timeline events per dataflow (ring buffer cap, 0 = unlimited).
+    /// Maximum timeline events per category (ring buffer cap, 0 = unlimited).
     pub max_timeline_events: usize,
 }
 ```
@@ -1600,7 +1606,7 @@ pub struct MetricsConfig {
 **Presets**:
 - `MetricsConfig::none()` — all collection disabled (zero overhead, default)
 - `MetricsConfig::summary_only()` — operator stats only (cheap)
-- `MetricsConfig::full()` — operator stats + channel counters + activation timeline (100K event cap)
+- `MetricsConfig::full()` — operator stats + channel counters + all timelines (100K event cap per category)
 
 **Usage**:
 ```rust
@@ -1669,6 +1675,64 @@ if let Some(metrics) = handle.metrics() {
 The timeline data is designed for export to Chrome Trace JSON format (Phase 3),
 enabling post-execution visualization in Perfetto UI or Chrome's `chrome://tracing`.
 
+#### Frontier Timeline — Frontier Advance Recording
+
+When `frontier_timeline` is enabled, the executor records each operator's
+frontier change as a timestamped `FrontierEvent`:
+
+```rust
+pub struct FrontierEvent {
+    pub operator_index: usize,   // position in the dataflow graph
+    pub worker_index: usize,     // which worker observed the frontier change
+    pub timestamp_us: u64,       // offset from dataflow start, in µs
+    pub new_frontier: String,    // Debug-formatted antichain value
+}
+```
+
+Frontier events are recorded in `propagate_progress()` after
+`update_operator_frontiers()` — whenever an operator's input frontier
+advances, the new value is captured. Events use the same per-worker
+`TimelineCollector` ring buffer as activation events (independent cap per
+category).
+
+Access frontier events after the dataflow runs:
+```rust
+if let Some(metrics) = handle.metrics() {
+    let events = metrics.drain_frontier_events(); // sorted by timestamp_us
+    for ev in &events {
+        println!("op[{}] w{}: frontier → {} @ +{}µs",
+            ev.operator_index, ev.worker_index, ev.new_frontier, ev.timestamp_us);
+    }
+}
+```
+
+#### Transfer Timeline — Data Transfer Recording
+
+When `transfer_timeline` is enabled, each batch push through an exchange
+channel records a `TransferEvent`:
+
+```rust
+pub struct TransferEvent {
+    pub edge_index: usize,       // exchange edge in the dataflow graph
+    pub source_worker: usize,    // worker that sent the batch
+    pub target_worker: usize,    // worker that received the batch
+    pub timestamp_us: u64,       // offset from dataflow start, in µs
+    pub items: u64,              // number of items in the batch
+    pub bytes: u64,              // estimated bytes in the batch
+}
+```
+
+Access transfer events after the dataflow runs:
+```rust
+if let Some(metrics) = handle.metrics() {
+    let events = metrics.drain_transfer_events(); // sorted by timestamp_us
+    for ev in &events {
+        println!("edge[{}] w{}→w{}: {} items @ +{}µs",
+            ev.edge_index, ev.source_worker, ev.target_worker, ev.items, ev.timestamp_us);
+    }
+}
+```
+
 #### Chrome Trace Export (feature: `chrome-trace`)
 
 The `chrome-trace` feature adds `ChromeTraceExporter` for converting collected
@@ -1697,6 +1761,8 @@ exporter.save("trace.json").unwrap();
 use instancy::metrics::chrome_trace::ChromeTraceExporter;
 
 let events = metrics.drain_timeline_events();
+let frontier_events = metrics.drain_frontier_events();
+let transfer_events = metrics.drain_transfer_events();
 let operators: Vec<_> = metrics.operator_snapshots()
     .into_iter()
     .map(|op| (op.index, op.name.clone()))
@@ -1706,6 +1772,8 @@ let channels = metrics.channel_snapshots();
 let exporter = ChromeTraceExporter::new("my-dataflow")
     .with_activations(&events, &operators)
     .with_channels(&channels)
+    .with_frontiers(&frontier_events, &operators)
+    .with_transfers(&transfer_events)
     .with_metadata(num_workers);
 exporter.save("trace.json").unwrap();
 ```
@@ -1716,6 +1784,8 @@ exporter.save("trace.json").unwrap();
 |---|---|---|
 | Activation event | `"X"` (complete) | `ts=start_us`, `dur=duration_us`, `tid=worker_index` |
 | Channel metrics | `"i"` (instant) | Summary of items/bytes transferred at `ts=0` |
+| Frontier event | `"i"` (instant) | `ts=timestamp_us`, `tid=worker_index`, scope `"t"` |
+| Transfer event | `"s"`/`"f"` (flow) | Source→target flow pair with items/bytes in args |
 | Dataflow name | `"M"` (metadata) | `process_name` on `pid=0` |
 | Worker index | `"M"` (metadata) | `thread_name` "worker-N" on `tid=N` |
 

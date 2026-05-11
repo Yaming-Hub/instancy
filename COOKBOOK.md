@@ -458,7 +458,7 @@ use instancy::{RuntimeConfig, RuntimeHandle, SpawnOptions};
 use instancy::metrics::MetricsConfig;
 
 let rt = RuntimeHandle::new(RuntimeConfig::default()).unwrap();
-// MetricsConfig::full() enables operator summary + channel counters + activation timeline.
+// MetricsConfig::full() enables operator summary + channel counters + all timelines.
 // Use MetricsConfig::summary_only() for lower overhead (operator stats only).
 let mut handle = rt.spawn(dataflow, SpawnOptions::new().metrics(MetricsConfig::full())).unwrap();
 let metrics = handle.metrics().unwrap().clone();
@@ -510,16 +510,63 @@ for ch in metrics.channel_snapshots() {
 println!("Total items across all edges: {}", metrics.total_items_transferred());
 ```
 
+### Collect frontier advance events
+Track when each operator's input frontier advances — useful for debugging
+progress stalls or understanding data flow timing.
+
+```rust
+use instancy::{DataflowBuilder, RuntimeConfig, RuntimeHandle, SpawnOptions};
+use instancy::metrics::MetricsConfig;
+
+let rt = RuntimeHandle::new(RuntimeConfig::default()).unwrap();
+let config = MetricsConfig {
+    frontier_timeline: true,
+    ..MetricsConfig::none()
+};
+let mut handle = rt.spawn(dataflow, SpawnOptions::new().metrics(config)).unwrap();
+let metrics = handle.metrics().unwrap().clone();
+// ... send data, close inputs ...
+handle.join_blocking().unwrap();
+
+let events = metrics.drain_frontier_events(); // sorted by timestamp_us
+for ev in &events {
+    println!("op[{}] w{}: frontier → {} @ +{}µs",
+        ev.operator_index, ev.worker_index, ev.new_frontier, ev.timestamp_us);
+}
+```
+
 ### Export Chrome Trace for Perfetto UI
 Save collected metrics as Chrome Trace JSON for visual timeline analysis.
 Requires the `chrome-trace` feature flag.
 
 ```rust
 // After dataflow completes, export from any worker's metrics:
-let metrics = handle.metrics(0).unwrap();
+let metrics = handle.metrics().unwrap();
 let exporter = metrics.drain_to_chrome_trace("my-dataflow");
 exporter.save("trace.json").unwrap();
 // Drag trace.json onto https://ui.perfetto.dev/ to visualize.
+```
+
+For fine-grained control, build the exporter manually with frontiers and transfers:
+
+```rust
+use instancy::metrics::chrome_trace::ChromeTraceExporter;
+
+let activations = metrics.drain_timeline_events();
+let frontiers = metrics.drain_frontier_events();
+let transfers = metrics.drain_transfer_events();
+let operators: Vec<_> = metrics.operator_snapshots()
+    .into_iter()
+    .map(|op| (op.index, op.name.clone()))
+    .collect();
+
+let exporter = ChromeTraceExporter::new("my-dataflow")
+    .with_activations(&activations, &operators)
+    .with_channels(&metrics.channel_snapshots())
+    .with_frontiers(&frontiers, &operators)
+    .with_transfers(&transfers)
+    .with_metadata(num_workers);
+exporter.save("trace.json").unwrap();
 ```
 
 ## 7. Timing & Delay
