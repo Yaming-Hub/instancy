@@ -1297,7 +1297,7 @@ use instancy::communication::transport_session::PeerConnection;
 
 let connections: Vec<PeerConnection<_, _>> = vec![
     PeerConnection {
-        peer_node_id: "node-b".to_string(),
+        node_id: "node-b".to_string(),
         reader: tcp_read_half,
         writer: tcp_write_half,
     },
@@ -1333,7 +1333,7 @@ let (reader, writer) = tokio::io::split(tls_stream);
 
 let connections = vec![
     PeerConnection {
-        peer_node_id: "node-b".to_string(),
+        node_id: "node-b".to_string(),
         reader,
         writer,
     },
@@ -1349,8 +1349,9 @@ and any authentication scheme (one-way TLS, mutual TLS, custom certificate valid
 ### Spawning a Cluster Dataflow
 
 ```rust
-use instancy::{RuntimeConfig, RuntimeHandle};
-use instancy::dataflow::id::DataflowId;
+use instancy::{RuntimeConfig, RuntimeHandle, SpawnOptions};
+use instancy::communication::ClusterSpawnTransport;
+use instancy::DataflowId;
 use std::time::Duration;
 
 let rt = RuntimeHandle::new(RuntimeConfig {
@@ -1362,17 +1363,19 @@ let dataflow_id = DataflowId::new();
 // Requires a Tokio runtime — e.g., use #[tokio::main] or build one manually.
 let tokio_handle = tokio::runtime::Handle::current();
 
+// Wrap connections in a transport config (dedicated = one connection per peer).
+let transport = ClusterSpawnTransport::dedicated(connections, 1024);
+
 let mut cluster_handle = rt.spawn_cluster(
     "my_distributed_df",
     topology,
-    "node-a",          // This node's ID
+    "node-a",                          // This node's ID
     dataflow_id,
-    connections,
-    64,                // Channel capacity
-    Duration::from_secs(10),  // Handshake timeout
+    transport,
+    Duration::from_secs(10),           // Handshake timeout
     |builder| {
         // Build the same graph on every node
-        let input = builder.input::<String>("data");
+        let input = builder.input::<String>("data").unwrap();
         input
             .exchange_by_hash("route", |s: &String| {
                 use std::hash::{Hash, Hasher};
@@ -1390,18 +1393,45 @@ let mut cluster_handle = rt.spawn_cluster(
                     Ok(())
                 }
             })
-            .output("results");
+            .output("results").unwrap();
         Ok(())
     },
     &tokio_handle,
+    SpawnOptions::new(),
 ).unwrap();
 ```
 
 **Key points:**
 - Every node must call `spawn_cluster` with the same `DataflowId` concurrently
 - The library performs a handshake to verify all nodes agree on the dataflow structure
-- Exchange operators automatically route data across nodes via the pooled connections
-- Multiple dataflows can share the same node-to-node connections
+- Exchange operators automatically route data across nodes via the connections
+- `SpawnOptions` controls observability, cancellation, I/O mode, and priority
+
+### Dedicated vs Shared Transport
+
+`ClusterSpawnTransport` supports two modes:
+
+**Dedicated** — each `spawn_cluster` call gets its own exclusive connections. Simple but uses one connection per peer per dataflow:
+
+```rust
+use instancy::communication::ClusterSpawnTransport;
+
+let transport = ClusterSpawnTransport::dedicated(connections, 1024);
+```
+
+**Shared** — multiple dataflows multiplex over pooled connections managed by `SharedPeerManager`s. Ideal when running many concurrent dataflows:
+
+```rust
+use instancy::communication::ClusterSpawnTransport;
+use std::sync::Arc;
+
+// Create peer managers once, share across dataflows.
+// peer_managers: HashMap<String, SharedPeerManager>
+let managers = Arc::new(peer_managers);
+let transport = ClusterSpawnTransport::shared(managers, 1024);
+```
+
+With shared transport, connection pooling, reconnection, and multiplexing are handled automatically. See `tests/cluster_shared_transport.rs` for a complete example.
 
 ### Testing Clusters Locally
 

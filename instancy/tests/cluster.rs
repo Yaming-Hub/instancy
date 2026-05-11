@@ -668,3 +668,119 @@ async fn cluster_observability_metrics_collected() {
     assert!(!data_a.is_empty(), "node-a should have output");
     assert!(!data_b.is_empty(), "node-b should have output");
 }
+
+/// Verify that async I/O mode works with cluster dataflows.
+///
+/// Spawns a two-node cluster with `IoMode::Async`, feeds data via
+/// `AsyncInputSender`, and collects results via `AsyncOutputReceiver`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn cluster_async_io_mode() {
+    use instancy::IoMode;
+
+    let topology = ClusterTopology::multi_node(vec![
+        NodeConfig::new("node-a", 1),
+        NodeConfig::new("node-b", 1),
+    ])
+    .unwrap();
+    let dataflow_id = DataflowId::new();
+    let (conn_a, conn_b) = make_duplex_pair("node-a", "node-b", 64 * 1024);
+
+    let rt_a = RuntimeHandle::new(RuntimeConfig {
+        worker_threads: 2,
+        ..RuntimeConfig::default()
+    })
+    .unwrap();
+    let rt_b = RuntimeHandle::new(RuntimeConfig {
+        worker_threads: 2,
+        ..RuntimeConfig::default()
+    })
+    .unwrap();
+
+    let tokio_handle = tokio::runtime::Handle::current();
+
+    let build = |builder: &mut DataflowBuilder<u64>| -> Result<()> {
+        let input = builder.input::<i32>("data").unwrap();
+        input
+            .map("triple", |_t, x| x * 3)
+            .output("results")
+            .unwrap();
+        Ok(())
+    };
+
+    let opts = SpawnOptions::new().io_mode(IoMode::Async);
+
+    let topo_a = topology.clone();
+    let topo_b = topology.clone();
+    let th_a = tokio_handle.clone();
+    let th_b = tokio_handle.clone();
+    let opts_a = opts.clone();
+    let opts_b = opts.clone();
+
+    let handle_a = tokio::task::spawn_blocking(move || {
+        rt_a.spawn_cluster(
+            "async-io-test",
+            topo_a,
+            "node-a",
+            dataflow_id,
+            ClusterSpawnTransport::dedicated(vec![conn_a], 1024),
+            Duration::from_secs(5),
+            build,
+            &th_a,
+            opts_a,
+        )
+        .map(|c| (rt_a, c))
+    });
+
+    let handle_b = tokio::task::spawn_blocking(move || {
+        rt_b.spawn_cluster(
+            "async-io-test",
+            topo_b,
+            "node-b",
+            dataflow_id,
+            ClusterSpawnTransport::dedicated(vec![conn_b], 1024),
+            Duration::from_secs(5),
+            build,
+            &th_b,
+            opts_b,
+        )
+        .map(|c| (rt_b, c))
+    });
+
+    let (result_a, result_b) = tokio::join!(handle_a, handle_b);
+    let (_rt_a, mut cluster_a) = result_a.unwrap().unwrap();
+    let (_rt_b, mut cluster_b) = result_b.unwrap().unwrap();
+
+    // Use async input senders.
+    let sender_a = cluster_a.take_async_input::<i32>(0, "data").unwrap();
+    let sender_b = cluster_b.take_async_input::<i32>(0, "data").unwrap();
+
+    // Use async output receivers.
+    let mut receiver_a = cluster_a.take_async_output::<i32>(0, "results").unwrap();
+    let mut receiver_b = cluster_b.take_async_output::<i32>(0, "results").unwrap();
+
+    // Feed data asynchronously.
+    sender_a.send(0, vec![1, 2, 3]).await.unwrap();
+    sender_a.close();
+
+    sender_b.send(0, vec![10, 20]).await.unwrap();
+    sender_b.close();
+
+    // Join and collect.
+    let completion_a = cluster_a.join().unwrap();
+    let completion_b = cluster_b.join().unwrap();
+    let (res_a, res_b) = tokio::join!(completion_a, completion_b);
+    res_a.unwrap();
+    res_b.unwrap();
+
+    // Collect async output.
+    let results_a = receiver_a.collect_data().await;
+    let mut data_a: Vec<i32> = results_a.into_iter().flat_map(|(_, d)| d).collect();
+    data_a.sort();
+
+    let results_b = receiver_b.collect_data().await;
+    let mut data_b: Vec<i32> = results_b.into_iter().flat_map(|(_, d)| d).collect();
+    data_b.sort();
+
+    assert_eq!(data_a, vec![3, 6, 9], "node-a should triple its inputs");
+    assert_eq!(data_b, vec![30, 60], "node-b should triple its inputs");
+}

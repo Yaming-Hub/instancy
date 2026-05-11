@@ -67,29 +67,41 @@ pub(crate) mod worker_pool;
 // ── Crate-level re-exports for ergonomic use ──────────────────────────
 
 // Dataflow construction
+/// Builder for composing dataflow graphs with typed operators and edges.
 pub use dataflow::dataflow_builder::IterateResult;
+/// The resolved dataflow graph (operators, edges, exchange indices).
 pub use dataflow::graph::DataflowGraph;
+/// Unique identifier for a dataflow instance (used in cluster coordination).
 pub use dataflow::id::DataflowId;
+/// Handle for probing operator progress (frontier queries).
 pub use dataflow::probe::ProbeHandle;
+/// A typed stream edge in the dataflow graph — chainable operator methods.
 pub use dataflow::stream::StreamEdge;
+/// Async-compatible input sender and output receiver for `IoMode::Async`.
 pub use dataflow::{AsyncInputSender, AsyncOutputReceiver};
+/// Control channel types for inter-operator communication.
 pub use dataflow::{ControlReceiver, ControlSender, WorkerControl};
 pub use dataflow::{
     DataflowBuilder, DataflowBuilderConfig, LogicalDataflow, OutputPort, Pipe, SharedContext,
 };
+/// Synchronous input sender and output receiver for `IoMode::Sync` (default).
 pub use dataflow::{InputSender, OutputReceiver};
 
 // Runtime
 #[cfg(feature = "transport")]
+/// Completion handle for a cluster dataflow (keeps transport alive until done).
 pub use runtime::ClusterCompletion;
 #[cfg(feature = "transport")]
+/// Handle for a cluster-deployed dataflow with per-worker access.
 pub use runtime::ClusterSpawnedDataflow;
 #[cfg(feature = "test-utils")]
+/// Simplified runtime for unit-testing individual operators.
 pub use runtime::SimpleRuntime;
 pub use runtime::{
     DataflowCompletion, IoMode, MultiDataflowCompletion, MultiSpawnedDataflow, RuntimeConfig,
     RuntimeHandle, SpawnOptions, SpawnedDataflow, TokioMode,
 };
+/// Lifecycle events emitted by the runtime (dataflow started, completed, etc.).
 pub use runtime_event::RuntimeEvent;
 
 // Execution / cluster topology / membership
@@ -99,6 +111,7 @@ pub use execute::{
 };
 
 // Cancellation
+/// Cooperative cancellation with diagnosable reasons.
 pub use cancellation::{CancellationReason, CancellationToken};
 
 // Error handling
@@ -109,13 +122,17 @@ pub use error::{
 };
 
 // Worker types
+/// Unique identifier for a logical worker within a dataflow.
 pub use worker::WorkerId;
 
 // Progress tracking
+/// Trait for timestamp types used in progress tracking (must be partially ordered).
 pub use progress::timestamp::Timestamp;
 
 // Scheduler policies
+/// Scheduling policies for multi-dataflow priority management.
 pub use scheduler::policy::{PriorityPolicy, PriorityWithAgingPolicy, SchedulePolicy};
 
 // Timestamp ordering
+/// Product timestamp for nested scopes (outer × inner).
 pub use order::Product;
