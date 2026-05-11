@@ -1834,12 +1834,11 @@ A multi-worker dataflow goes through distinct phases. Understanding this
 lifecycle is important for reasoning about operator state, cloning, and
 when exchange channels become active.
 
-> **Note:** The current implementation calls the user's build closure N times
-> (once per worker), producing N independent `LogicalDataflow`s that are
-> validated for structural equivalence. The target design (in progress) will
-> call build once and materialize the single `LogicalDataflow` N times using
-> replayable factories. Both models follow the same logical phases below —
-> the difference is whether Phase 1 runs once or N times.
+> **Note:** The runtime now builds the `LogicalDataflow` once, creates any
+> cross-worker exchange channels with the source and target stage parallelism,
+> and materializes that shared plan per worker. Workers mark operators from
+> non-participating stages as ghost operators so cross-stage frontier
+> propagation still works without instantiating idle operators.
 
 ### Phase 1: Build
 

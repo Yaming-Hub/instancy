@@ -487,6 +487,7 @@ impl<T: Timestamp> DataflowExecutor<T> {
         external_wake_handle: Option<WakeHandle>,
         worker_context: WorkerContext,
         progress_reporters: Option<Arc<dyn std::any::Any + Send + Sync>>,
+        ghost_operators: &std::collections::HashSet<usize>,
     ) -> Result<Self> {
         let edges = graph.edges();
         let feedback_edges = graph.feedback_edges();
@@ -525,6 +526,19 @@ impl<T: Timestamp> DataflowExecutor<T> {
         let wake_handle = external_wake_handle.unwrap_or_default();
 
         for edge_idx in 0..total_edge_count {
+            let edge = if edge_idx < edges.len() {
+                &edges[edge_idx]
+            } else {
+                &feedback_edges[edge_idx - edges.len()]
+            };
+            if ghost_operators.contains(&edge.source.operator_index)
+                && ghost_operators.contains(&edge.target.operator_index)
+            {
+                push_ends.push(None);
+                pull_ends.push(None);
+                continue;
+            }
+
             let pos = *factory_positions.get(&edge_idx).ok_or_else(|| {
                 Error::Dataflow(DataflowError::MissingFactory {
                     edge_index: edge_idx,
@@ -551,51 +565,49 @@ impl<T: Timestamp> DataflowExecutor<T> {
 
         // Process regular edges
         for (edge_idx, edge) in edges.iter().enumerate() {
-            let pull = pull_ends[edge_idx].take().ok_or_else(|| {
-                Error::Dataflow(DataflowError::InvalidGraph(
-                    "edge endpoint missing or already materialized".into(),
-                ))
-            })?;
-            let push = push_ends[edge_idx].take().ok_or_else(|| {
-                Error::Dataflow(DataflowError::InvalidGraph(
-                    "edge endpoint missing or already materialized".into(),
-                ))
-            })?;
+            match (pull_ends[edge_idx].take(), push_ends[edge_idx].take()) {
+                (Some(pull), Some(push)) => {
+                    op_input_pullers
+                        .entry(edge.target.operator_index)
+                        .or_default()
+                        .push((edge.target.slot_index, pull));
 
-            op_input_pullers
-                .entry(edge.target.operator_index)
-                .or_default()
-                .push((edge.target.slot_index, pull));
-
-            op_output_pushers
-                .entry(edge.source.operator_index)
-                .or_default()
-                .push((edge.source.slot_index, push));
+                    op_output_pushers
+                        .entry(edge.source.operator_index)
+                        .or_default()
+                        .push((edge.source.slot_index, push));
+                }
+                (None, None) => {}
+                _ => {
+                    return Err(Error::Dataflow(DataflowError::InvalidGraph(
+                        "edge endpoint missing or already materialized".into(),
+                    )));
+                }
+            }
         }
 
         // Process feedback edges (same as regular edges for materialization purposes)
         for (i, edge) in feedback_edges.iter().enumerate() {
             let edge_idx = edges.len() + i;
-            let pull = pull_ends[edge_idx].take().ok_or_else(|| {
-                Error::Dataflow(DataflowError::InvalidGraph(
-                    "edge endpoint missing or already materialized".into(),
-                ))
-            })?;
-            let push = push_ends[edge_idx].take().ok_or_else(|| {
-                Error::Dataflow(DataflowError::InvalidGraph(
-                    "edge endpoint missing or already materialized".into(),
-                ))
-            })?;
+            match (pull_ends[edge_idx].take(), push_ends[edge_idx].take()) {
+                (Some(pull), Some(push)) => {
+                    op_input_pullers
+                        .entry(edge.target.operator_index)
+                        .or_default()
+                        .push((edge.target.slot_index, pull));
 
-            op_input_pullers
-                .entry(edge.target.operator_index)
-                .or_default()
-                .push((edge.target.slot_index, pull));
-
-            op_output_pushers
-                .entry(edge.source.operator_index)
-                .or_default()
-                .push((edge.source.slot_index, push));
+                    op_output_pushers
+                        .entry(edge.source.operator_index)
+                        .or_default()
+                        .push((edge.source.slot_index, push));
+                }
+                (None, None) => {}
+                _ => {
+                    return Err(Error::Dataflow(DataflowError::InvalidGraph(
+                        "edge endpoint missing or already materialized".into(),
+                    )));
+                }
+            }
         }
 
         // Phase 3: Invoke operator factories with their endpoints.
@@ -619,6 +631,10 @@ impl<T: Timestamp> DataflowExecutor<T> {
         for factory_pos in factory_positions {
             let (op_idx, factory) = &mut operator_factories[factory_pos];
             let op_idx = *op_idx;
+
+            if ghost_operators.contains(&op_idx) {
+                continue;
+            }
 
             // Collect input pullers sorted by port index.
             let mut inputs = op_input_pullers.remove(&op_idx).unwrap_or_default();
