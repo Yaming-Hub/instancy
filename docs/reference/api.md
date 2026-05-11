@@ -28,7 +28,7 @@ Key methods:
 - `pub fn health_tx(&self) -> tokio::sync::broadcast::Sender<RuntimeEvent>` — clone the health-event sender for shared transport components.
 - `pub fn spawn<T: Timestamp>(&self, dataflow: LogicalDataflow<T>, options: SpawnOptions) -> Result<SpawnedDataflow<T>>` — run one logical dataflow.
 - `pub fn spawn_multi<T, F>(&self, name: &str, num_workers: usize, build: F, options: SpawnOptions) -> Result<MultiSpawnedDataflow<T>> where F: Fn(&mut DataflowBuilder<T>) -> Result<()>` — build and run N replicated workers.
-- `#[cfg(feature = "transport")] pub fn spawn_cluster<T, F, R, W>(...) -> Result<ClusterSpawnedDataflow<T>> where T: Timestamp + ExchangeData, F: Fn(&mut DataflowBuilder<T>) -> Result<()>, R: AsyncRead + Unpin + Send + 'static, W: AsyncWrite + Unpin + Send + 'static` — run a distributed dataflow across nodes.
+- `#[cfg(feature = "transport")] pub fn spawn_cluster<T, F, R, W>(&self, name: &str, topology: ClusterTopology, local_node_id: &str, dataflow_id: DataflowId, transport_config: ClusterSpawnTransport<R, W>, handshake_timeout: Duration, build: F, runtime_handle: &tokio::runtime::Handle, options: SpawnOptions) -> Result<ClusterSpawnedDataflow<T>> where T: Timestamp + ExchangeData, F: Fn(&mut DataflowBuilder<T>) -> Result<()>, R: AsyncRead + Unpin + Send + 'static, W: AsyncWrite + Unpin + Send + 'static` — run a distributed dataflow across nodes.
 - `#[cfg(feature = "transport")] pub fn report_node_leave(&self, node_id: &str) -> usize` — cancel dataflows that depend on a departed peer.
 - `#[cfg(feature = "transport")] pub fn report_node_join(&self, node_id: &str) -> bool` — clear the departed-peer flag for future cluster spawns.
 
