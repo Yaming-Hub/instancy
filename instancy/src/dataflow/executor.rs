@@ -606,7 +606,7 @@ impl<T: Timestamp> DataflowExecutor<T> {
             .unwrap_or(0);
         index_to_pos.resize(max_index + 1, usize::MAX);
 
-        // All operator factories are now ReplayableFactory (FnMut). For
+        // All operator factories are OperatorFactory (FnMut). For
         // build-once-materialize-N, this loop will run N times on the same
         // &mut factories, each producing an independent operator instance.
         for (op_idx, mut factory) in operator_factories {

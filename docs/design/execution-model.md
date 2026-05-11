@@ -1927,7 +1927,7 @@ Each factory is `FnMut` and clones the user's logic on every `build()` call:
 ```rust
 // User provides: F: FnMut + Clone + Send + 'static
 // Factory wraps it as:
-replayable_factory(move |_ctx, endpoints| {
+OperatorFactory::new(move |_ctx, endpoints| {
     let mut logic = user_logic.clone();  // independent copy per worker
     // ... wire endpoints ...
     Ok(Box::new(Operator::new(logic, puller, pusher)))

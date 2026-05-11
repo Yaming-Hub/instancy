@@ -48,7 +48,6 @@ use crate::dataflow::operators::output::OutputEvent;
 use crate::dataflow::probe::ProbeHandle;
 use crate::dataflow::schedulable::{
     ChannelEndpoints, ChannelFactory, OperatorFactory, SchedulableOperator, channel_factory,
-    replayable_factory,
 };
 use crate::dataflow::stage::StageId;
 use crate::dataflow::stream::Slot;
@@ -479,7 +478,7 @@ impl<T: Timestamp> DataflowBuilder<T> {
                             let reporter = source_reporter.clone();
                             let mut rx = Some(rx);
                             let factory: OperatorFactory =
-                                replayable_factory(move |_ctx, endpoints| {
+                                OperatorFactory::new(move |_ctx, endpoints| {
                                     let rx = rx.take().ok_or_else(|| {
                                         Error::Runtime(crate::error::RuntimeError::AlreadyConsumed {
                                             resource: "input port channel (sync)".into(),
@@ -532,7 +531,7 @@ impl<T: Timestamp> DataflowBuilder<T> {
                             let reporter = source_reporter.clone();
                             let mut rx = Some(rx);
                             let factory: OperatorFactory =
-                                replayable_factory(move |_ctx, endpoints| {
+                                OperatorFactory::new(move |_ctx, endpoints| {
                                     let rx = rx.take().ok_or_else(|| {
                                         Error::Runtime(crate::error::RuntimeError::AlreadyConsumed {
                                             resource: "input port channel (async)".into(),
@@ -645,7 +644,7 @@ impl<T: Timestamp> DataflowBuilder<T> {
             // cloned), wraps all pushers in a TeePush adapter.
             let name_clone = name.clone();
             let factory: OperatorFactory =
-                replayable_factory(move |_ctx, endpoints: ChannelEndpoints| {
+                OperatorFactory::new(move |_ctx, endpoints: ChannelEndpoints| {
                     let name = name_clone.clone();
                     let data = data.clone();
                     let reporter = reporter.clone();
@@ -785,7 +784,7 @@ impl<T: Timestamp> DataflowBuilder<T> {
                     let factory_name = wiring_name.clone();
                     let reporter = source_reporter.clone();
                     let mut rx = Some(rx);
-                    let factory: OperatorFactory = replayable_factory(move |_ctx, endpoints| {
+                    let factory: OperatorFactory = OperatorFactory::new(move |_ctx, endpoints| {
                         let rx = rx.take().ok_or_else(|| {
                             Error::Runtime(crate::error::RuntimeError::AlreadyConsumed {
                                 resource: "async source channel".into(),
@@ -1320,7 +1319,7 @@ impl<T: Timestamp, D: Clone + Send + 'static> Pipe<T, D> {
         // Operator factory
         let name_clone = name.clone();
         let factory: OperatorFactory =
-            replayable_factory(move |_ctx, endpoints: ChannelEndpoints| {
+            OperatorFactory::new(move |_ctx, endpoints: ChannelEndpoints| {
                 let name = name_clone.clone();
                 let logic = logic.clone();
                 let input_puller: Box<dyn Pull<T, D>> = *endpoints
@@ -1962,7 +1961,7 @@ impl<T: Timestamp, D: Clone + Send + 'static> Pipe<T, D> {
             // Operator factory
             let name_clone = name.clone();
             let factory: OperatorFactory =
-                replayable_factory(move |_ctx, endpoints: ChannelEndpoints| {
+                OperatorFactory::new(move |_ctx, endpoints: ChannelEndpoints| {
                     let name = name_clone.clone();
                     let logic = logic.clone();
                     let mut pullers = endpoints.input_pullers.into_iter();
@@ -2171,7 +2170,7 @@ impl<T: Timestamp, D: Clone + Send + 'static> Pipe<T, D> {
             // Enter operator factory
             let enter_name = format!("{name}::enter");
             let enter_factory: OperatorFactory =
-                replayable_factory(move |_ctx, endpoints: ChannelEndpoints| {
+                OperatorFactory::new(move |_ctx, endpoints: ChannelEndpoints| {
                     let enter_name = enter_name.clone();
                     let input_puller: Box<dyn Pull<T, D>> = *endpoints
                         .input_pullers
@@ -2262,7 +2261,7 @@ impl<T: Timestamp, D: Clone + Send + 'static> Pipe<T, D> {
             let fb_name = format!("{name}::feedback");
             let fb_summary = summary.clone();
             let feedback_factory: OperatorFactory =
-                replayable_factory(move |_ctx, endpoints: ChannelEndpoints| {
+                OperatorFactory::new(move |_ctx, endpoints: ChannelEndpoints| {
                     let fb_name = fb_name.clone();
                     let fb_summary = fb_summary.clone();
                     let input_puller: Box<dyn Pull<PT<T, TInner>, D>> = *endpoints
@@ -2373,7 +2372,7 @@ impl<T: Timestamp, D: Clone + Send + 'static> Pipe<T, D> {
             // Concat operator factory
             let concat_name = format!("{name}::concat");
             let concat_factory: OperatorFactory =
-                replayable_factory(move |_ctx, endpoints: ChannelEndpoints| {
+                OperatorFactory::new(move |_ctx, endpoints: ChannelEndpoints| {
                     let concat_name = concat_name.clone();
                     let input_pullers: Vec<Box<dyn Pull<PT<T, TInner>, D>>> = endpoints
                         .input_pullers
@@ -2660,7 +2659,7 @@ impl<T: Timestamp, D: Clone + Send + 'static> Pipe<T, D> {
             // Leave operator factory
             let leave_name = format!("{name}::leave");
             let leave_factory: OperatorFactory =
-                replayable_factory(move |_ctx, endpoints: ChannelEndpoints| {
+                OperatorFactory::new(move |_ctx, endpoints: ChannelEndpoints| {
                     let leave_name = leave_name.clone();
                     let input_puller: Box<dyn Pull<PT<T, TInner>, D>> = *endpoints
                         .input_pullers
@@ -2822,7 +2821,7 @@ impl<T: Timestamp, D: Clone + Send + 'static> Pipe<T, D> {
 
             // Operator factory
             let factory: OperatorFactory =
-                replayable_factory(move |_ctx, endpoints: ChannelEndpoints| {
+                OperatorFactory::new(move |_ctx, endpoints: ChannelEndpoints| {
                     let input_pullers: Vec<Box<dyn Pull<T, D>>> = endpoints
                         .input_pullers
                         .into_iter()
@@ -2973,7 +2972,7 @@ impl<T: Timestamp, D: Clone + Send + 'static> Pipe<T, D> {
             let collector_clone = Arc::clone(&collector);
             let name_clone = name.clone();
             let factory: OperatorFactory =
-                replayable_factory(move |_ctx, endpoints: ChannelEndpoints| {
+                OperatorFactory::new(move |_ctx, endpoints: ChannelEndpoints| {
                     let name = name_clone.clone();
                     let collector = Arc::clone(&collector_clone);
                     let input_puller: Box<dyn Pull<T, D>> = *endpoints
@@ -3022,7 +3021,7 @@ impl<T: Timestamp, D: Clone + Send + 'static> Pipe<T, D> {
                         let sink_name_inner = sink_name.clone();
                         let mut tx = Some(tx);
                         let factory: OperatorFactory =
-                            replayable_factory(move |_ctx, endpoints: ChannelEndpoints| {
+                            OperatorFactory::new(move |_ctx, endpoints: ChannelEndpoints| {
                                 let tx = tx.take().ok_or_else(|| {
                                     Error::Runtime(crate::error::RuntimeError::AlreadyConsumed {
                                         resource: "output port channel (sync)".into(),
@@ -3072,7 +3071,7 @@ impl<T: Timestamp, D: Clone + Send + 'static> Pipe<T, D> {
                         let sink_name_inner = sink_name.clone();
                         let mut tx = Some(tx);
                         let factory: OperatorFactory =
-                            replayable_factory(move |_ctx, endpoints: ChannelEndpoints| {
+                            OperatorFactory::new(move |_ctx, endpoints: ChannelEndpoints| {
                                 let tx = tx.take().ok_or_else(|| {
                                     Error::Runtime(crate::error::RuntimeError::AlreadyConsumed {
                                         resource: "output port channel (async)".into(),
@@ -3853,7 +3852,7 @@ impl<T: Timestamp, D: Clone + Send + 'static> Pipe<T, D> {
             // Operator factory — pass-through unary with progress reporter.
             let name_clone = String::from("exchange");
             let factory: OperatorFactory =
-                replayable_factory(move |_ctx, endpoints: ChannelEndpoints| {
+                OperatorFactory::new(move |_ctx, endpoints: ChannelEndpoints| {
                     let name = name_clone.clone();
                     let exchange_reporter = exchange_reporter.clone();
                     let input_puller: Box<dyn Pull<T, D>> = *endpoints
@@ -4011,7 +4010,7 @@ impl<T: Timestamp, D: Clone + Send + 'static> Pipe<T, D> {
             // Operator factory — same pass-through unary as exchange.
             let name_clone = String::from("broadcast");
             let factory: OperatorFactory =
-                replayable_factory(move |_ctx, endpoints: ChannelEndpoints| {
+                OperatorFactory::new(move |_ctx, endpoints: ChannelEndpoints| {
                     let name = name_clone.clone();
                     let exchange_reporter = exchange_reporter.clone();
                     let input_puller: Box<dyn Pull<T, D>> = *endpoints
@@ -4189,7 +4188,7 @@ impl<T: Timestamp, D: Clone + Send + 'static> Pipe<T, D> {
             // pushers in a TeePush adapter when the Pipe was cloned.
             let name_clone = name.clone();
             let factory: OperatorFactory =
-                replayable_factory(move |_ctx, endpoints: ChannelEndpoints| {
+                OperatorFactory::new(move |_ctx, endpoints: ChannelEndpoints| {
                     let name = name_clone.clone();
                     let wired_logic = wired_logic.clone();
                     let input_puller: Box<dyn Pull<T, D>> = *endpoints
@@ -4319,7 +4318,7 @@ impl<T: Timestamp, D: Clone + Send + 'static> Pipe<T, D> {
             // Operator factory — handles fan-out via TeePush
             let name_clone = name.clone();
             let factory: OperatorFactory =
-                replayable_factory(move |_ctx, endpoints: ChannelEndpoints| {
+                OperatorFactory::new(move |_ctx, endpoints: ChannelEndpoints| {
                     let name = name_clone.clone();
                     let logic = logic.clone();
                     let input_puller: Box<dyn Pull<T, D>> = *endpoints
@@ -4480,7 +4479,7 @@ impl<T: Timestamp, D: Clone + Send + 'static> Pipe<T, D> {
             // the ProgressTracker and operator share the same underlying buffer.
             let name_clone = name.clone();
             let factory: OperatorFactory =
-                replayable_factory(move |_ctx, endpoints: ChannelEndpoints| {
+                OperatorFactory::new(move |_ctx, endpoints: ChannelEndpoints| {
                     let name = name_clone.clone();
                     let logic = logic.clone();
                     let progress_reporter = progress_reporter.clone();
@@ -4638,7 +4637,7 @@ impl<T: Timestamp, D: Clone + Send + 'static> Pipe<T, D> {
             // Operator factory — creates a WiredUnaryAsyncOperator
             let name_clone = name.clone();
             let factory: OperatorFactory =
-                replayable_factory(move |_ctx, endpoints: ChannelEndpoints| {
+                OperatorFactory::new(move |_ctx, endpoints: ChannelEndpoints| {
                     let name = name_clone.clone();
                     let logic = logic.clone();
                     let handle = tokio_handle.clone().ok_or_else(|| {

@@ -119,73 +119,37 @@ pub trait SchedulableOperator: Send {
 /// its channel endpoints.
 ///
 /// Stored during the build phase (when concrete types are known) and invoked
-/// during materialization (when channels have been allocated).
+/// during materialization (when channels have been allocated). Wraps a
+/// `FnMut` closure that produces a fresh operator on each call.
 ///
 /// # Single-worker vs. multi-worker
 ///
 /// For single-worker dataflows, `build()` is called exactly once. For
 /// multi-worker dataflows, `build()` is called N times (once per worker),
-/// each time with fresh channel endpoints. Implementations must produce
-/// independent operator instances on each call.
-pub trait OperatorBlueprint: Send {
-    /// Create a wired operator instance for the given worker.
-    ///
-    /// `ctx` provides the worker's identity (index and total count).
-    /// `endpoints` provides the input pullers and output pushers allocated
-    /// for this worker's copy of the operator.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if operator construction fails, or if a one-shot
-    /// resource captured by the factory has already been consumed.
-    fn build(
-        &mut self,
-        ctx: &WorkerContext,
-        endpoints: ChannelEndpoints,
-    ) -> crate::Result<Box<dyn SchedulableOperator>>;
-}
-
-/// Type alias for a boxed operator blueprint.
-pub type OperatorFactory = Box<dyn OperatorBlueprint>;
-
-/// Create an [`OperatorFactory`] from a `FnMut` closure.
+/// each time with fresh channel endpoints. The closure must produce
+/// independent operator instances on each call — user closures are cloned
+/// per invocation to give each worker independent state.
 ///
-/// The resulting factory can be called multiple times during materialization,
-/// producing a fresh operator instance on each call. For factories that
-/// capture one-shot resources (e.g., channel endpoints), wrap the resource
-/// in `Option` and use `take()` inside the closure.
-pub fn replayable_factory(
-    f: impl FnMut(&WorkerContext, ChannelEndpoints) -> crate::Result<Box<dyn SchedulableOperator>>
-    + Send
-    + 'static,
-) -> OperatorFactory {
-    Box::new(ReplayableFactory::new(f))
-}
-
-/// An operator factory that wraps a `FnMut` closure.
-///
-/// Produces a fresh operator on each `build()` call. Used for all operator
-/// factories — user closures are cloned per `build()` to give each worker
-/// independent state.
+/// For factories that capture one-shot resources (e.g., channel endpoints),
+/// wrap the resource in `Option` and use `take()` inside the closure.
 ///
 /// # Example
 ///
 /// ```ignore
-/// ReplayableFactory::new(move |_ctx, endpoints| {
-///     // Create fresh state for this worker
+/// OperatorFactory::new(move |_ctx, endpoints| {
 ///     let logic = logic_factory();
 ///     Ok(Box::new(WiredUnaryOperator::new(name, idx, stage, logic, ...)))
 /// })
 /// ```
-pub struct ReplayableFactory(
+pub struct OperatorFactory(
     Box<
         dyn FnMut(&WorkerContext, ChannelEndpoints) -> crate::Result<Box<dyn SchedulableOperator>>
             + Send,
     >,
 );
 
-impl ReplayableFactory {
-    /// Create a new replayable factory from a `FnMut` closure.
+impl OperatorFactory {
+    /// Create a new operator factory from a `FnMut` closure.
     pub fn new(
         factory: impl FnMut(
             &WorkerContext,
@@ -197,14 +161,17 @@ impl ReplayableFactory {
         Self(Box::new(factory))
     }
 
-    /// Box this factory as an [`OperatorFactory`].
-    pub fn boxed(self) -> OperatorFactory {
-        Box::new(self)
-    }
-}
-
-impl OperatorBlueprint for ReplayableFactory {
-    fn build(
+    /// Create a wired operator instance for the given worker.
+    ///
+    /// `ctx` provides the worker's identity (index and total count).
+    /// `endpoints` provides the input pullers and output pushers allocated
+    /// for this worker's copy of the operator.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if operator construction fails, or if a one-shot
+    /// resource captured by the factory has already been consumed.
+    pub fn build(
         &mut self,
         ctx: &WorkerContext,
         endpoints: ChannelEndpoints,
