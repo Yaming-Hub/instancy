@@ -2936,7 +2936,7 @@ impl RuntimeHandle {
         .map_err(Error::Communication)?;
 
         // Phase 7: Materialize all local workers (without registering).
-        let mode = ChannelMode::Sync;
+        let mode: ChannelMode = options.io_mode.into();
         let dataflow_priority = options.priority;
         let mut prepared = Vec::with_capacity(num_local);
         let mut progress_channels_iter = progress_channels.into_iter();
