@@ -9,51 +9,98 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
-#### Scheduling
-- Wake-based scheduling for `unary_async` operators (#207)
-  - `WakeHandle` integration — spawned async tasks notify the executor on completion
-  - New `ActivationOutcome::WaitingForAsync` variant — tells executor not to declare
-    quiescence while in-flight async tasks exist
-  - Per-operator `async_waiting` tracking in `DataflowExecutor` (unfused, fused, and stage-task modes)
-  - Eliminates 10ms polling delay for async task result collection
+#### Observability
+- `MetricsConfig` granularity controls (`None`, `SummaryOnly`, `Full`) with zero overhead
+  when disabled (#239)
+- Channel counters — per-edge send/receive/drop counts (#239)
+- Activation timeline recording — per-operator activation timestamps and durations (#240)
+- Chrome Trace JSON export for Perfetto UI behind `chrome-trace` feature flag (#241)
+- Frontier and transfer timeline events for dataflow progress visualization (#242)
+- Cluster observability: `SpawnOptions` propagated into `spawn_cluster()` (#243)
+- Cluster metrics accessors: `worker_metrics()` and `all_worker_metrics()` on
+  `ClusterSpawnedDataflow` (#244)
+- Runtime health events for unrecoverable errors (#236)
+
+#### Error Handling
+- Structured error types: `CodecError`, `ControlProtocolError`, `CommunicationError`,
+  `HandshakeError`, `ProgressError`, `SpawnFailed` — replacing string errors (#233, #234)
+- Deferred error collection in dataflow builder — replaces panics (#205)
+- Deferred `unary_async` tokio panic handling — converts to operator error (#206)
+
+#### Progress Tracking
+- Graph-topology completion propagation using graph structure for precise frontier
+  advancement (#237)
+
+#### Cancellation
+- Distributed cancellation across cluster nodes via `ControlMessage::Cancel` control
+  plane protocol (#238)
 
 #### Communication
+- Connection failure recovery with automatic reconnect (#202)
 - `sequencing` module — message sequencing primitives for shared connection mode
-  - `SequenceCounter` — thread-safe monotonic sequence ID generator per logical stream
-  - `ReorderBuffer<T>` — delivers frames in sequence order with gap detection and timeout
-  - `SequencedFrame` — frame with attached sequence ID for wire protocol extension
-  - `encode_sequenced_header` / `decode_sequenced_header` — 36-byte wire format (28 base + 8 seq_id)
+  - `SequenceCounter`, `ReorderBuffer<T>`, `SequencedFrame`, wire format encode/decode
 - `shared_pool` module — adaptive connection pool for shared connection mode
-  - `SharedConnectionConfig` — configuration (min/max connections, RTT thresholds, cooldown, probe interval)
-  - `ConnectionMode` enum — `Dedicated` (default) vs `Shared(SharedConnectionConfig)`
-  - `RttTracker` — exponential moving average RTT measurement per connection
-  - `ConnectionMetrics` — per-connection load tracking (pending writes, RTT, bytes/frames written)
-  - `PeerPool` — per-peer pool with least-loaded selection and adaptive scaling decisions
-  - `ScalingDecision` enum — `None` / `ScaleUp` / `ScaleDown { connection_id }`
+  - `SharedConnectionConfig`, `ConnectionMode`, `RttTracker`, `ConnectionMetrics`, `PeerPool`
 - `probing` module — RTT probing and adaptive scaling driver
-  - `ProbeMessage` — compact 17-byte probe wire format (request/reply) with encode/decode
-  - `ProbeKind` — `Request` / `Reply` discriminant
-  - `ProbeCounter` — atomic probe sequence generator
-  - `ProbeTimestamp` — epoch-relative nanosecond timestamps for accurate RTT measurement
-  - `ScalingDriver` — orchestrates probe tracking, RTT computation, and scaling event emission
-  - `ScalingEvent` enum — `ScaleUp` / `ScaleDown { connection_id }` events via mpsc channel
+  - `ProbeMessage`, `ProbeCounter`, `ProbeTimestamp`, `ScalingDriver`, `ScalingEvent`
 - `shared_transport` module — shared transport session for pooled multi-dataflow connections
-  - `SharedPeerManager` — manages pooled connections to a single peer (pool, bridge, probe, scaling)
-  - `SharedTransportSession` — lightweight per-dataflow handle with same API as `TransportSession`
-  - `DataframeSender` — auto-tags frames with dataflow ID for transparent sequencing
-  - `ConnectionFactory` trait — user-provided connection establishment for scaling
-  - Payload lane sequencing: data + progress share one sequence per (dataflow_id, peer) for FIFO ordering
-  - `PROBE_CHANNEL_ID` — reserved channel for RTT probes using standard Frame wire format
-  - `check_reorder_timeouts()` — periodic timeout sweeper for gap detection
+  - `SharedPeerManager`, `SharedTransportSession`, `DataframeSender`, `ConnectionFactory` trait
+- Dynamic cluster scaling with topology/membership consolidation (#229)
+- `ConnectionFactory` made required; lazy connection initialization (#220)
+
+#### Scheduling
+- Wake-based scheduling for `unary_async` operators (#207)
+  - `WakeHandle` integration, `ActivationOutcome::WaitingForAsync`, per-operator tracking
+
+#### Performance
+- Lock-free SPSC exchange channels (#226)
+- Reuse per-target buckets in `ExchangePush` (#227)
+- Lazy `VecDeque` allocation — defer until first push (#217)
+- Opt-in CRC32 checksums for data frames (#225)
+- Multi-worker scaling benchmark suite (#226)
+- Comparative benchmark suite: instancy vs timely-dataflow (#212)
+
+#### Testing
+- Comprehensive integration tests: Phases 1–5 (#210)
+- Failure handling and scaling integration tests (#211)
+- 50-minute stress test (#213)
+- Cluster observability integration test (#244)
+- Async I/O cluster test with cross-node exchange (#245)
+- Replace TCP-based reconnect test with in-memory duplex streams (#223)
+
+#### Documentation
+- COOKBOOK §11 Cluster Dataflows recipes (#244)
+- DESIGN.md §5.5.2 Cluster Startup Protocol (#243)
+- GUIDE §8 Distributed Execution updates (#245)
+- `lib.rs` doc comments on all crate-level re-exports (#245)
+- Dynamic cluster scaling in README (#232)
+- Auto-parallelism and wake scheduling docs (#209)
+- Transport-agnostic design clarifications (#221)
+- Document connection failure and reconnection responsibility (#219)
+- DESIGN.md updated to reflect current state (#228)
 
 ### Changed
 
 #### Runtime
 - `SpawnOptions::auto_parallelism` now defaults to `true` (#208)
-  - Stage 0 parallelism is auto-detected from `input()` + `source_async()` count
-  - `num_workers` acts as a minimum floor: `effective = max(auto_detected, num_workers)`
-  - Pass `num_workers=0` to use only the auto-detected count
-  - `per_stage_parallelism(false)` now also disables auto-parallelism for legacy mode
+- Per-stage parallelism is now the default `SpawnOptions` behavior (#198)
+
+#### API
+- **BREAKING**: Removed `worker_idx` parameter from `spawn_multi` and `spawn_cluster`
+  closure signatures (#204)
+- Unified API naming inconsistencies (#216)
+- Restricted internal types to `pub(crate)` (#215)
+- Removed panics from production code (#214)
+- Code quality cleanup: remove production `.unwrap()` calls and dead code (#199, #201)
+- CI: build all 35 examples and lint test code (#247)
+
+### Fixed
+- Resolve 24 broken rustdoc intra-doc links (#246)
+- Chrome Trace flow event `id` field placement and frontier change detection (#242)
+- Two flaky tests: dispatch race condition and timing jitter (#222)
+- Observability tracing tests for parallel execution (#224)
+- Shared transport race condition (#200)
+- README inaccuracies (#218)
 
 ## [0.2.0] - 2026-05-05
 

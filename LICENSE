@@ -2,6 +2,15 @@ MIT License
 
 Copyright (c) 2026 Yaming Liu
 
+This project incorporates core concepts and design principles from
+timely-dataflow (https://github.com/TimelyDataflow/timely-dataflow),
+Copyright (c) 2014 Frank McSherry, licensed under the MIT License.
+While instancy is an independent implementation (async runtime, new APIs,
+different error handling, observability, and transport layers), the
+foundational dataflow model — including progress tracking, timestamps,
+capabilities, frontiers, and the operator/scope abstraction — draws
+directly from timely-dataflow's architecture.
+
 Permission is hereby granted, free of charge, to any person obtaining a copy
 of this software and associated documentation files (the "Software"), to deal
 in the Software without restriction, including without limitation the rights
