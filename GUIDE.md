@@ -1679,5 +1679,5 @@ impl ExchangeData for MyRecord {
 - Read the [COOKBOOK.md](./COOKBOOK.md) for copy-paste patterns and troubleshooting-adjacent recipes
 - Browse the [examples/](./instancy/examples/) directory for complete runnable programs
 - Check the [tests/](./instancy/tests/) directory for integration test patterns
-- Read the [DESIGN.md](./DESIGN.md) for architectural details
+- Read the [Design Overview](./docs/DESIGN.md) for architectural details
 - Run `cargo doc --open` to explore the API documentation
