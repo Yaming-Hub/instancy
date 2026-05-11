@@ -277,7 +277,7 @@ impl ClusterTopology {
     /// or removal would leave the topology empty.
     ///
     /// **Note**: Removing a node does not cancel already-running dataflows.
-    /// Use [`RuntimeHandle::report_node_leave`] to cancel affected dataflows.
+    /// Use `RuntimeHandle::report_node_leave` to cancel affected dataflows.
     pub fn remove_node(&mut self, node_id: &str) -> Result<NodeConfig, Error> {
         let idx = self
             .nodes

@@ -7,7 +7,7 @@
 //!
 //! # Invariants
 //!
-//! - Creating a capability increments `+1` in the shared [`ProgressReporter`].
+//! - Creating a capability increments `+1` in the shared `ProgressReporter`.
 //! - Dropping a capability decrements `-1`.
 //! - Cloning a capability increments `+1`.
 //! - Downgrading atomically does `-1` old, `+1` new in a single lock.
@@ -33,7 +33,7 @@ use crate::progress::timestamp::Timestamp;
 ///
 /// # Thread safety
 ///
-/// Capabilities use [`ProgressReporter`] (backed by `Arc<Mutex<>>`) so they
+/// Capabilities use `ProgressReporter` (backed by `Arc<Mutex<>>`) so they
 /// can be safely sent across async task boundaries.
 pub struct Capability<T: Timestamp> {
     time: T,

@@ -115,7 +115,7 @@ pub trait ExchangeExt<S: Scope, D> {
     /// current stage's parallelism; otherwise reuses the current stage.
     ///
     /// # Errors
-    /// Returns [`crate::Error::InvalidConfig`] if `target_parallelism` is 0.
+    /// Returns an error if `target_parallelism` is 0.
     fn exchange_to<K: Hash + 'static>(
         &self,
         target_parallelism: usize,
@@ -137,7 +137,7 @@ pub trait ExchangeExt<S: Scope, D> {
     /// current stage's parallelism; otherwise reuses the current stage.
     ///
     /// # Errors
-    /// Returns [`crate::Error::InvalidConfig`] if `target_parallelism` is 0.
+    /// Returns an error if `target_parallelism` is 0.
     fn exchange_by_hash_to(
         &self,
         target_parallelism: usize,

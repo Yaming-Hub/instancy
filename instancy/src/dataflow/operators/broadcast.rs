@@ -108,7 +108,7 @@ pub trait BroadcastExt<S: Scope, D> {
     /// current stage's parallelism; otherwise reuses the current stage.
     ///
     /// # Errors
-    /// Returns [`crate::Error::InvalidConfig`] if `target_parallelism` is 0.
+    /// Returns an error if `target_parallelism` is 0.
     fn broadcast_to(&self, target_parallelism: usize) -> crate::Result<StreamEdge<S, D>>;
 
     /// Broadcast each record to all workers in the same process only.
@@ -123,7 +123,7 @@ pub trait BroadcastExt<S: Scope, D> {
     /// current stage's parallelism; otherwise reuses the current stage.
     ///
     /// # Errors
-    /// Returns [`crate::Error::InvalidConfig`] if `target_parallelism` is 0.
+    /// Returns an error if `target_parallelism` is 0.
     fn broadcast_local_to(&self, target_parallelism: usize) -> crate::Result<StreamEdge<S, D>>;
 }
 

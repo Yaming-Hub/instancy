@@ -101,7 +101,7 @@ pub trait RebalanceExt<S: Scope, D> {
     /// current stage's parallelism; otherwise reuses the current stage.
     ///
     /// # Errors
-    /// Returns [`crate::Error::InvalidConfig`] if `target_parallelism` is 0.
+    /// Returns an error if `target_parallelism` is 0.
     fn rebalance_to(&self, target_parallelism: usize) -> crate::Result<StreamEdge<S, D>>;
 }
 

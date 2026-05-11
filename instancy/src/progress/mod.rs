@@ -35,7 +35,7 @@
 //!
 //! ## Reachability
 //!
-//! The [`reachability`] module determines which capabilities can influence which ports.
+//! The `reachability` module determines which capabilities can influence which ports.
 //! A capability at `(operator A, time T)` can "reach" operator B's input at time `T'`
 //! if there exists a graph path from A to B whose [`PathSummary`](timestamp::PathSummary)
 //! transforms `T` into `T'`. When no reachable capabilities remain for a timestamp at
@@ -50,10 +50,10 @@
 //! # How It All Fits Together
 //!
 //! 1. **Construction**: The dataflow builder registers operators and edges with the
-//!    reachability [`Builder`](reachability::Builder), recording path summaries for
+//!    reachability `Builder`, recording path summaries for
 //!    each edge (including loop-back edges that increment timestamps).
 //!
-//! 2. **Compilation**: The builder compiles into a [`Tracker`](reachability::Tracker)
+//! 2. **Compilation**: The builder compiles into a `Tracker`
 //!    that can propagate capability changes through the graph.
 //!
 //! 3. **Execution**: As operators produce/consume data:
@@ -72,14 +72,14 @@
 //! | [`timestamp`] | `Timestamp` and `PathSummary` traits |
 //! | [`capability`] | `Capability<T>` — permits for producing data |
 //! | [`frontier`] | `Antichain<T>` — minimal incomparable timestamp sets |
-//! | [`mutable_antichain`] | `MutableAntichain<T>` — incremental frontier maintenance |
+//! | `mutable_antichain` | `MutableAntichain<T>` — incremental frontier maintenance |
 //! | [`change_batch`] | `ChangeBatch<T>` — batched +1/−1 capability updates |
-//! | [`reachability`] | Graph-aware propagation of capability implications |
+//! | `reachability` | Graph-aware propagation of capability implications |
 //! | [`notificator`] | Notification delivery when timestamps complete |
-//! | [`operate`] | `ProgressReporter` — operator interface to the tracker |
-//! | [`progress_channel`] | Cross-worker progress message transport |
-//! | [`network_progress`] | Serializable progress messages for cluster mode |
-//! | [`subgraph`] | Nested scope progress tracking |
+//! | `operate` | `ProgressReporter` — operator interface to the tracker |
+//! | `progress_channel` | Cross-worker progress message transport |
+//! | `network_progress` | Serializable progress messages for cluster mode |
+//! | `subgraph` | Nested scope progress tracking |
 
 pub mod capability;
 pub mod change_batch;

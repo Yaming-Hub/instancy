@@ -63,7 +63,7 @@ pub enum CancellationReason {
     UserRequested,
 
     /// The runtime is shutting down (e.g., [`crate::RuntimeHandle`] dropped or
-    /// [`crate::worker_pool::WorkerPool`] torn down).
+    /// `WorkerPool` torn down).
     RuntimeShutdown,
 
     /// A network-level error caused cancellation (e.g., TCP disconnect,

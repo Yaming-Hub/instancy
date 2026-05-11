@@ -60,7 +60,7 @@ pub struct RuntimeConfig {
     /// Optional initial cluster topology.
     ///
     /// If the topology has a membership provider attached (via
-    /// [`ClusterTopology::with_membership`]), the runtime will automatically
+    /// `ClusterTopology::with_membership`), the runtime will automatically
     /// start a background listener for membership events.
     #[cfg(feature = "transport")]
     pub topology: Option<crate::execute::ClusterTopology>,
