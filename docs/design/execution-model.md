@@ -803,7 +803,7 @@ Operator full identity: (worker_id, operator_index)
 
 **How instantiation works:**
 
-Each worker runs the graph-building code independently (this is the "single program" in SPMD). Each worker's `.unary(name, logic)` call creates a **new OperatorFactory closure** which, when called at materialization time, produces a new operator with fresh state.
+Each worker runs the graph-building code independently (this is the "single program" in SPMD). Each worker's `.unary(name, logic)` call creates a **new `OperatorFactory`** which, when called at materialization time, produces a new operator with fresh state. The factory closure is `FnMut` and clones the user logic on each `build()` call, giving each worker an independent copy.
 
 ```rust
 // This code runs on EACH worker independently:
@@ -816,8 +816,8 @@ stream.unary("word_count", |input, output| {
 
 **Key properties:**
 
-- The `OperatorFactory` is `FnOnce` — called exactly once by the one worker that created it.
-- There is no single factory called N times; there are N workers each creating their own factory from the same source code.
+- The `OperatorFactory` wraps a `FnMut` closure — it can be called multiple times, cloning captured state on each `build()` to give each worker independent state.
+- In the current model, each worker creates its own factory; in the target model (build-once-materialize-N), a single factory is called N times.
 - For stateful operators, each worker's instance accumulates state only for its own data partition (ensured by `exchange()` routing).
 - Operator state is never shared across workers — no locks, no synchronization needed.
 
@@ -867,7 +867,7 @@ fn plan_node_to_factory(node: &LogicalPlan) -> OperatorFactory {
 
 **Design requirements this imposes on instancy:**
 
-- `OperatorFactory` must remain a simple `Box<dyn FnOnce(ChannelEndpoints) -> Box<dyn SchedulableOperator>>` — no complex trait hierarchies that prevent dynamic dispatch
+- `OperatorFactory` must remain a simple concrete struct wrapping `FnMut(&WorkerContext, ChannelEndpoints) -> Result<Box<dyn SchedulableOperator>>` — no complex trait hierarchies that prevent dynamic dispatch
 - `SchedulableOperator` trait must be implementable by external crates (no sealed traits, no unstable associated types)
 - Channel data type `D` must support `RecordBatch` and similar large columnar types efficiently (zero-copy where possible)
 - The `DataflowGraph` metadata must be constructable programmatically (not only via the `.unary()` / `.binary()` extension traits) so query planners can build graphs from plan trees
@@ -1827,6 +1827,146 @@ empty progress messages.
 - `SpawnOptions::default()` sets `per_stage_parallelism: true`
 - Updated spawn_multi/MultiSpawnedDataflow docs
 - Updated GUIDE.md, examples, validation tests (PR #198)
+
+## 5.11 Multi-Worker Dataflow Lifecycle
+
+A multi-worker dataflow goes through distinct phases. Understanding this
+lifecycle is important for reasoning about operator state, cloning, and
+when exchange channels become active.
+
+> **Note:** The current implementation calls the user's build closure N times
+> (once per worker), producing N independent `LogicalDataflow`s that are
+> validated for structural equivalence. The target design (in progress) will
+> call build once and materialize the single `LogicalDataflow` N times using
+> replayable factories. Both models follow the same logical phases below —
+> the difference is whether Phase 1 runs once or N times.
+
+### Phase 1: Build
+
+The user's build closure constructs the logical dataflow graph. All
+operators, channels, and exchange boundaries are registered.
+
+```
+build(&mut builder) → LogicalDataflow
+  ├── Operators registered (factories stored, not yet instantiated)
+  ├── Channels registered (factories stored, not yet created)
+  ├── Exchange boundaries identified (creators stored)
+  └── Subgraph topology recorded (for progress tracking)
+```
+
+**Current model:** called N times, producing N independent LogicalDataflows.
+**Target model:** called once, producing a single LogicalDataflow with
+replayable factories that can produce N operator instances.
+
+### Phase 2: Materialize (single thread, sequential)
+
+The runtime materializes the logical dataflow N times (once per worker).
+Each materialization clones operator factories to produce independent
+operator instances with their own state.
+
+```
+for worker_idx in 0..N:
+    factory.build(worker_ctx)
+    ├── logic.clone()           ← fresh copy of user's closure
+    ├── create channels         ← new push/pull endpoints
+    ├── wire operator           ← operator owns cloned logic + endpoints
+    └── build progress tracker  ← from cloned SubgraphBuilder
+```
+
+**Key invariant:** All cloning happens here, sequentially, on a single
+thread. No concurrency concerns during materialization.
+
+### Phase 3: Wire exchange channels (single thread)
+
+Exchange channels connect workers across stage boundaries. The runtime
+replaces placeholder channel factories with shared cross-worker exchange
+factories that route data between workers.
+
+```
+For each exchange edge:
+    creator(num_source_workers, num_target_workers, capacity)
+    → Vec<ChannelFactory>  (one per worker, sharing internal SPSC channels)
+```
+
+Progress channels and control broadcast channels are also created here.
+
+### Phase 4: Register and start (transition to concurrent)
+
+All materialized workers are registered with the executor. Only after ALL
+workers are registered does execution begin — this ensures every worker's
+progress channels contain the full set of initial capability broadcasts
+from all peers.
+
+```
+── nothing executes until here ──
+
+register(worker_0)   ← enqueued, not yet polled
+register(worker_1)
+register(worker_2)
+register(worker_N-1)
+
+── executor starts polling all workers ──
+```
+
+### Phase 5: Execution (concurrent)
+
+Workers run concurrently on the async worker thread pool. Each worker:
+- Pulls data from its input channels
+- Executes operator logic (using its own cloned closure)
+- Pushes results to output channels (or exchange channels)
+- Reports progress to peer workers
+
+Workers are fully independent — no shared mutable state between operator
+instances across workers (unless the user explicitly uses `Arc<Mutex<...>>`).
+
+### Operator Factory Model
+
+Operator factories must be **replayable** for multi-worker materialization.
+Each factory is `FnMut` and clones the user's logic on every `build()` call:
+
+```rust
+// User provides: F: FnMut + Clone + Send + 'static
+// Factory wraps it as:
+OperatorFactory::new(move |_ctx, endpoints| {
+    let mut logic = user_logic.clone();  // independent copy per worker
+    // ... wire endpoints ...
+    Ok(Box::new(Operator::new(logic, puller, pusher)))
+})
+```
+
+This requires user closures to implement `Clone`. In practice, closures
+auto-implement `Clone` when all captured variables are `Clone` (primitives,
+`String`, `Vec`, `Arc`, etc.). For non-Clone captures, wrap in `Arc`.
+
+### Current vs Future Worker Model
+
+**Current: Full-graph replication.** Each worker contains ALL operators from
+ALL stages. Exchange channels route data to the correct workers per stage.
+Workers with no data for a stage simply idle for that stage.
+
+```
+spawn_multi("pipeline", 4, |builder| {
+    input.exchange_to("scatter", 4, hash)  // Stage 0→1 boundary
+         .map("process", |t, x| ...)      // Stage 1 (par=4)
+         .gather("collect")               // Stage 1→2 boundary
+         .for_each("sink", |t, x| ...);   // Stage 2 (par=1)
+});
+
+Worker 0: [input ops] → exchange → [process] → gather → [sink]
+Worker 1: [input ops] → exchange → [process] → gather → [sink]
+Worker 2: [input ops] → exchange → [process] → gather → [sink]
+Worker 3: [input ops] → exchange → [process] → gather → [sink]
+
+Data routing:
+  Stage 0: only Worker 0 receives external input
+  Stage 1: exchange distributes to all 4 workers
+  Stage 2: gather funnels to Worker 0 only; Workers 1-3 idle
+```
+
+**Future: Per-stage materialization.** Each worker would only contain
+operators for the stages it participates in. This reduces memory and avoids
+idle operators, but requires a more complex materialization model where
+the runtime selectively instantiates subsets of the graph per worker.
 
 ## Open Questions
 

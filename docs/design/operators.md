@@ -537,7 +537,7 @@ input.unary_with_context("transform", |ctx, input, output| {
 
 This requires:
 1. Passing `SharedContext` through `DataflowExecutor::materialize()` to each operator
-2. Adding context to `OperatorBlueprint::build()` or a new `MaterializationContext`
+2. Adding context to `OperatorFactory::build()` or a new `MaterializationContext`
 3. Making context available as a parameter in operator activation callbacks
 4. Keeping `WorkerContext` separate (worker identity only) from `SharedContext` (user data)
 
