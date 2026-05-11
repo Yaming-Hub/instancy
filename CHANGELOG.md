@@ -191,7 +191,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Internal
 - Resolved all clippy warnings across lib, examples, and tests (#135, #142)
-- Removed unused capacity parameter from `ChannelBlueprint::build` (#127)
+- Removed unused capacity parameter from `ChannelFactory::build` (#127)
 - Optimized scheduler queue: BinaryHeap for policy-driven scheduling (#133, #134)
 - `CompletionNotifier` supports `on_complete` callback for active-dataflow tracking (#143)
 

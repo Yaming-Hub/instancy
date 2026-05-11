@@ -47,7 +47,7 @@ use crate::dataflow::operators::input::InputEvent;
 use crate::dataflow::operators::output::OutputEvent;
 use crate::dataflow::probe::ProbeHandle;
 use crate::dataflow::schedulable::{
-    ChannelEndpoints, ChannelFactory, OperatorFactory, SchedulableOperator, channel_factory,
+    ChannelEndpoints, ChannelFactory, OperatorFactory, SchedulableOperator,
 };
 use crate::dataflow::stage::StageId;
 use crate::dataflow::stream::Slot;
@@ -185,11 +185,12 @@ pub(crate) type OutputPortWiring = Box<
 /// - An OperatorFactory for the ChannelSourceOperator
 /// - A pump closure that drives the user's async producer into the channel
 ///
-/// The pump closure is `FnOnce` — the runtime spawns it as a background task.
-/// It captures the user's async producer, the tokio channel sender, and a
-/// `WakeHandle` for notifying the executor.
+/// The outer wiring closure is `FnMut` so materialization can invoke it
+/// multiple times, producing a fresh operator factory and pump task per call.
+/// The returned pump task is still `FnOnce` — each spawned task consumes its
+/// own cloned async producer, tokio channel sender, and `WakeHandle`.
 pub(crate) type AsyncSourceWiring = Box<
-    dyn FnOnce(
+    dyn FnMut(
             std::sync::Arc<std::sync::atomic::AtomicUsize>, // external_inputs_open counter
             WakeHandle,                                     // executor wake handle
             crate::cancellation::CancellationToken,         // cancellation token
@@ -725,10 +726,14 @@ impl<T: Timestamp> DataflowBuilder<T> {
     ///
     /// If the producer returns `Err`, the pump task logs the error and
     /// closes the channel, causing the source operator to finish gracefully.
+    ///
+    /// The producer closure must be `Clone` so repeated materializations can
+    /// spawn one independent pump per worker.
     pub fn source_async<D, F, Fut>(&self, name: impl Into<String>, producer: F) -> Pipe<T, D>
     where
         D: Clone + Send + 'static,
         F: FnOnce(crate::dataflow::channel_operators::AsyncInputSender<T, D>) -> Fut
+            + Clone
             + Send
             + 'static,
         Fut: std::future::Future<Output = crate::error::Result<()>> + Send + 'static,
@@ -777,6 +782,7 @@ impl<T: Timestamp> DataflowBuilder<T> {
                         AsyncInputSender, ChannelSourceOperator, InputRecv,
                     };
 
+                    let producer = producer.clone();
                     let (tx, rx) = tokio::sync::mpsc::channel::<InputEvent<T, D>>(channel_cap);
                     let sender = AsyncInputSender::with_wake_handle(tx, wake_handle.clone());
 
@@ -821,6 +827,7 @@ impl<T: Timestamp> DataflowBuilder<T> {
                     });
 
                     // Build pump task: runs the user's producer in a small tokio runtime.
+                    let pump_name = wiring_name.clone();
                     let pump_wake = wake_handle;
                     let pump: Box<dyn FnOnce() + Send> = Box::new(move || {
                         let rt = match tokio::runtime::Builder::new_current_thread()
@@ -831,7 +838,7 @@ impl<T: Timestamp> DataflowBuilder<T> {
                             Err(err) => {
                                 #[cfg(feature = "tracing")]
                                 tracing::warn!(
-                                    source = %wiring_name,
+                                    source = %pump_name,
                                     error = %err,
                                     "failed to create pump runtime"
                                 );
@@ -855,7 +862,7 @@ impl<T: Timestamp> DataflowBuilder<T> {
                                         // ChannelSourceOperator to finish gracefully.
                                         #[cfg(feature = "tracing")]
                                         tracing::warn!(
-                                            source = %wiring_name,
+                                            source = %pump_name,
                                             error = %e,
                                             "async source producer failed"
                                         );
@@ -1353,7 +1360,7 @@ impl<T: Timestamp, D: Clone + Send + 'static> Pipe<T, D> {
         // Channel factory for the input edge
         let edge_idx = state.graph.edges().len() - 1;
         let chan_factory: ChannelFactory =
-            channel_factory(move |_ctx, wake: Option<WakeHandle>| {
+            ChannelFactory::new(move |_ctx, wake: Option<WakeHandle>| {
                 let (push, pull) =
                     bounded_channel_with_wake::<T, D, ()>(capacity, wake.clone(), prealloc);
                 Ok((
@@ -2031,7 +2038,7 @@ impl<T: Timestamp, D: Clone + Send + 'static> Pipe<T, D> {
 
             // Channel factories for both input edges
             let channel_factory1: ChannelFactory =
-                channel_factory(move |_ctx, wake: Option<WakeHandle>| {
+                ChannelFactory::new(move |_ctx, wake: Option<WakeHandle>| {
                     let (push, pull) =
                         bounded_channel_with_wake::<T, D, ()>(capacity1, wake.clone(), prealloc);
                     Ok((
@@ -2044,7 +2051,7 @@ impl<T: Timestamp, D: Clone + Send + 'static> Pipe<T, D> {
             state.channel_factories.push((edge1_idx, channel_factory1));
 
             let channel_factory2: ChannelFactory =
-                channel_factory(move |_ctx, wake: Option<WakeHandle>| {
+                ChannelFactory::new(move |_ctx, wake: Option<WakeHandle>| {
                     let (push, pull) =
                         bounded_channel_with_wake::<T, D2, ()>(capacity2, wake.clone(), prealloc);
                     Ok((
@@ -2222,7 +2229,7 @@ impl<T: Timestamp, D: Clone + Send + 'static> Pipe<T, D> {
             // Channel factory for enter's input edge (uses per-edge override if set)
             let enter_edge_idx = state.graph.edges().len() - 1;
             let cap = enter_capacity;
-            let cf: ChannelFactory = channel_factory(move |_ctx, wake: Option<WakeHandle>| {
+            let cf: ChannelFactory = ChannelFactory::new(move |_ctx, wake: Option<WakeHandle>| {
                 let (push, pull) =
                     bounded_channel_with_wake::<T, D, ()>(cap, wake.clone(), prealloc);
                 Ok((
@@ -2421,7 +2428,7 @@ impl<T: Timestamp, D: Clone + Send + 'static> Pipe<T, D> {
 
             // Channel factories for concat inputs
             let cap = capacity;
-            let cf1: ChannelFactory = channel_factory(move |_ctx, wake: Option<WakeHandle>| {
+            let cf1: ChannelFactory = ChannelFactory::new(move |_ctx, wake: Option<WakeHandle>| {
                 let (push, pull) =
                     bounded_channel_with_wake::<PT<T, TInner>, D, ()>(cap, wake.clone(), prealloc);
                 Ok((
@@ -2434,7 +2441,7 @@ impl<T: Timestamp, D: Clone + Send + 'static> Pipe<T, D> {
             state.channel_factories.push((enter_concat_edge_idx, cf1));
 
             let cap = capacity;
-            let cf2: ChannelFactory = channel_factory(move |_ctx, wake: Option<WakeHandle>| {
+            let cf2: ChannelFactory = ChannelFactory::new(move |_ctx, wake: Option<WakeHandle>| {
                 let (push, pull) =
                     bounded_channel_with_wake::<PT<T, TInner>, D, ()>(cap, wake.clone(), prealloc);
                 Ok((
@@ -2644,7 +2651,7 @@ impl<T: Timestamp, D: Clone + Send + 'static> Pipe<T, D> {
             // Index by position in feedback_edges (0-based).
             let fb_position = state.graph.feedback_edges().len() - 1;
             let cap = feedback_capacity;
-            let cf_fb: ChannelFactory = channel_factory(move |_ctx, wake: Option<WakeHandle>| {
+            let cf_fb: ChannelFactory = ChannelFactory::new(move |_ctx, wake: Option<WakeHandle>| {
                 let (push, pull) =
                     bounded_channel_with_wake::<PT<T, TInner>, D, ()>(cap, wake.clone(), prealloc);
                 Ok((
@@ -2711,7 +2718,7 @@ impl<T: Timestamp, D: Clone + Send + 'static> Pipe<T, D> {
             // Channel factory for leave's input edge
             let cap = output_capacity;
             let cf_leave: ChannelFactory =
-                channel_factory(move |_ctx, wake: Option<WakeHandle>| {
+                ChannelFactory::new(move |_ctx, wake: Option<WakeHandle>| {
                     let (push, pull) = bounded_channel_with_wake::<PT<T, TInner>, D, ()>(
                         cap,
                         wake.clone(),
@@ -2870,7 +2877,7 @@ impl<T: Timestamp, D: Clone + Send + 'static> Pipe<T, D> {
             // Channel factories for each input edge (per-input capacity)
             for (edge_idx, capacity) in edge_indices.into_iter().zip(capacities) {
                 let chan_factory: ChannelFactory =
-                    channel_factory(move |_ctx, wake: Option<WakeHandle>| {
+                    ChannelFactory::new(move |_ctx, wake: Option<WakeHandle>| {
                         let (push, pull) =
                             bounded_channel_with_wake::<T, D, ()>(capacity, wake.clone(), prealloc);
                         Ok((
@@ -3115,7 +3122,7 @@ impl<T: Timestamp, D: Clone + Send + 'static> Pipe<T, D> {
             // Channel factory for the input edge
             let edge_idx = state.graph.edges().len() - 1;
             let chan_factory: ChannelFactory =
-                channel_factory(move |_ctx, wake: Option<WakeHandle>| {
+                ChannelFactory::new(move |_ctx, wake: Option<WakeHandle>| {
                     let (push, pull) =
                         bounded_channel_with_wake::<T, D, ()>(capacity, wake.clone(), prealloc);
                     Ok((
@@ -3908,7 +3915,7 @@ impl<T: Timestamp, D: Clone + Send + 'static> Pipe<T, D> {
             // spawn_multi replaces this with shared exchange factories.
             let edge_idx = state.graph.edges().len() - 1;
             let chan_factory: ChannelFactory =
-                channel_factory(move |_ctx, wake: Option<WakeHandle>| {
+                ChannelFactory::new(move |_ctx, wake: Option<WakeHandle>| {
                     let (push, pull) =
                         bounded_channel_with_wake::<T, D, ()>(capacity, wake.clone(), prealloc);
                     Ok((
@@ -4065,7 +4072,7 @@ impl<T: Timestamp, D: Clone + Send + 'static> Pipe<T, D> {
             // Channel factory — pipeline placeholder for single-worker.
             let edge_idx = state.graph.edges().len() - 1;
             let chan_factory: ChannelFactory =
-                channel_factory(move |_ctx, wake: Option<WakeHandle>| {
+                ChannelFactory::new(move |_ctx, wake: Option<WakeHandle>| {
                     let (push, pull) =
                         bounded_channel_with_wake::<T, D, ()>(capacity, wake.clone(), prealloc);
                     Ok((
@@ -4242,7 +4249,7 @@ impl<T: Timestamp, D: Clone + Send + 'static> Pipe<T, D> {
             // Channel factory for the input edge
             let edge_idx = state.graph.edges().len() - 1;
             let chan_factory: ChannelFactory =
-                channel_factory(move |_ctx, wake: Option<WakeHandle>| {
+                ChannelFactory::new(move |_ctx, wake: Option<WakeHandle>| {
                     let (push, pull) =
                         bounded_channel_with_wake::<T, D, ()>(capacity, wake.clone(), prealloc);
                     Ok((
@@ -4372,7 +4379,7 @@ impl<T: Timestamp, D: Clone + Send + 'static> Pipe<T, D> {
             // Channel factory for the input edge
             let edge_idx = state.graph.edges().len() - 1;
             let chan_factory: ChannelFactory =
-                channel_factory(move |_ctx, wake: Option<WakeHandle>| {
+                ChannelFactory::new(move |_ctx, wake: Option<WakeHandle>| {
                     let (push, pull) =
                         bounded_channel_with_wake::<T, D, ()>(capacity, wake.clone(), prealloc);
                     Ok((
@@ -4542,7 +4549,7 @@ impl<T: Timestamp, D: Clone + Send + 'static> Pipe<T, D> {
             // Channel factory for the input edge
             let edge_idx = state.graph.edges().len() - 1;
             let chan_factory: ChannelFactory =
-                channel_factory(move |_ctx, wake: Option<WakeHandle>| {
+                ChannelFactory::new(move |_ctx, wake: Option<WakeHandle>| {
                     let (push, pull) =
                         bounded_channel_with_wake::<T, D, ()>(capacity, wake.clone(), prealloc);
                     Ok((
@@ -4701,7 +4708,7 @@ impl<T: Timestamp, D: Clone + Send + 'static> Pipe<T, D> {
             // Channel factory for the input edge
             let edge_idx = state.graph.edges().len() - 1;
             let chan_factory: ChannelFactory =
-                channel_factory(move |_ctx, wake: Option<WakeHandle>| {
+                ChannelFactory::new(move |_ctx, wake: Option<WakeHandle>| {
                     let (push, pull) =
                         bounded_channel_with_wake::<T, D, ()>(capacity, wake.clone(), prealloc);
                     Ok((
@@ -4759,8 +4766,9 @@ impl<T: Timestamp, D: Send + 'static> OutputPort<T, D> {
 /// to materialize a physical executor.
 ///
 /// `LogicalDataflow` is `Send` and can be submitted to any runtime for
-/// physical materialization and execution. It is **single-use** — each
-/// materialization consumes the factories (which may contain `FnOnce` closures).
+/// physical materialization and execution. The stored factories are replayable,
+/// but current runtimes still consume the surrounding wiring during spawn, so a
+/// `LogicalDataflow` value remains single-use at the runtime layer.
 ///
 /// `LogicalDataflow` is a purely logical artifact — it knows nothing about
 /// threads, channels, or execution strategy. All physical execution goes

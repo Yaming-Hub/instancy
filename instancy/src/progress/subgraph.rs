@@ -63,6 +63,7 @@ pub struct OperatorShape {
 ///
 /// Graph node 0 (a vertex in the dataflow graph, not a machine) is reserved
 /// for the scope boundary (timely convention).
+#[derive(Clone)]
 pub struct SubgraphBuilder<T: Timestamp> {
     /// Registered operator shapes.
     operators: HashMap<usize, OperatorShape>,

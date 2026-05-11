@@ -205,7 +205,7 @@ impl<T: Timestamp> Default for ProgressReporter<T> {
 /// operators explicitly report message consumption/production for in-flight
 /// message accounting. Currently, progress tracking relies solely on capability
 /// accounting via the `internal` reporters.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct OperatorProgress<T: Timestamp> {
     /// Per-input consumed changes — reserved for future message-flight accounting.
     pub consumed: Vec<ChangeBatch<T>>,

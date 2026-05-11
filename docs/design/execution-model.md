@@ -1657,7 +1657,7 @@ stream
 ### Phase 5: Cross-stage channels (M×N asymmetric exchange) ✅
 - `ExchangeChannelSet` generalized from N×N to M×N with `new_asymmetric(M, N, capacity)`
 - `EdgeMaterializer` trait extended with `materialize_source_worker()`/`materialize_target_worker()`
-- `ExchangeFactoryCreatorFn` accepts `(num_sources, num_targets, capacity)`
+- Replayable `ExchangeFactoryCreatorFn` accepts `(num_sources, num_targets, capacity)`
 - `ExchangePush` routes using `hash % num_targets` (semantic clarity)
 - Backward compatible: symmetric (M==N) path unchanged
 
