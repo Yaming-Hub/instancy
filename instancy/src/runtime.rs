@@ -5323,7 +5323,14 @@ fn materialize_executor<T: Timestamp>(
     tracker.initialize()?;
     executor.set_progress_tracker(tracker);
 
-    // Register probes
+    // Register probes.
+    //
+    // TODO(multi-worker): In build-once-materialize-N, all workers clone the
+    // same ProbeHandle/ProbeNotifier pair, so each worker writes its local
+    // frontier to the same watch channel (last-writer-wins). For correct
+    // multi-worker probes, we need per-worker probe notifiers with a
+    // runtime-level aggregation step that computes the global frontier
+    // (pointwise minimum) before updating the user-visible ProbeHandle.
     debug_assert_eq!(
         dataflow.probes.len(),
         dataflow.probe_notifiers.len(),

@@ -478,7 +478,7 @@ impl<T: Timestamp> DataflowExecutor<T> {
     /// creating its own. This allows the runtime to share the same WakeHandle
     /// with InputSenders and CancellationTokens created before materialization.
     #[allow(clippy::too_many_arguments)]
-    pub fn materialize(
+    pub(crate) fn materialize(
         graph: &DataflowGraph,
         operator_factories: &mut [(usize, OperatorFactory)],
         channel_factories: &mut [(usize, ChannelFactory)],
