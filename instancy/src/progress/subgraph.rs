@@ -63,7 +63,6 @@ pub struct OperatorShape {
 ///
 /// Graph node 0 (a vertex in the dataflow graph, not a machine) is reserved
 /// for the scope boundary (timely convention).
-#[derive(Clone)]
 pub struct SubgraphBuilder<T: Timestamp> {
     /// Registered operator shapes.
     operators: HashMap<usize, OperatorShape>,
@@ -79,6 +78,28 @@ pub struct SubgraphBuilder<T: Timestamp> {
     scope_inputs: usize,
     /// Number of scope-level outputs.
     scope_outputs: usize,
+}
+
+/// Manual Clone that deep-copies progress buffers so each clone gets
+/// independent [`ProgressReporter`](super::operate::ProgressReporter)s.
+/// A derived Clone would share `Arc`-backed reporters across clones,
+/// causing workers to drain each other's capability changes.
+impl<T: Timestamp> Clone for SubgraphBuilder<T> {
+    fn clone(&self) -> Self {
+        Self {
+            operators: self.operators.clone(),
+            connectivity: self.connectivity.clone(),
+            initial_capabilities: self.initial_capabilities.clone(),
+            edges: self.edges.clone(),
+            progress_buffers: self
+                .progress_buffers
+                .iter()
+                .map(|(k, v)| (*k, v.deep_clone()))
+                .collect(),
+            scope_inputs: self.scope_inputs,
+            scope_outputs: self.scope_outputs,
+        }
+    }
 }
 
 impl<T: Timestamp> SubgraphBuilder<T> {

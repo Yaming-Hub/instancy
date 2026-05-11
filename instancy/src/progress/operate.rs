@@ -225,6 +225,24 @@ impl<T: Timestamp> OperatorProgress<T> {
         }
     }
 
+    /// Creates an independent deep copy with fresh [`ProgressReporter`]s.
+    ///
+    /// Unlike `clone()` (which shares `Arc`-backed reporters), this creates
+    /// new reporters with empty change batches. Used when cloning a
+    /// `SubgraphBuilder` for multi-worker materialization so each worker
+    /// gets independent progress state.
+    pub fn deep_clone(&self) -> Self {
+        Self {
+            consumed: self.consumed.clone(),
+            produced: self.produced.clone(),
+            internal: self
+                .internal
+                .iter()
+                .map(|_| ProgressReporter::new())
+                .collect(),
+        }
+    }
+
     /// Returns the reporter for the given output port.
     ///
     /// Capabilities for this output should be created using this reporter.
