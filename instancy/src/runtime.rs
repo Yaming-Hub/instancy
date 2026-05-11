@@ -4686,10 +4686,11 @@ impl<T: Timestamp> ClusterSpawnedDataflow<T> {
     ///
     /// `local_idx` is 0-based within this node's workers.
     /// Returns `Some` if metrics collection was enabled via
-    /// [`SpawnOptions::metrics`]. Metrics are live — values update as the
-    /// dataflow executes.
+    /// [`SpawnOptions::metrics`] and `local_idx` is in range.
+    /// Metrics are live — values update as the dataflow executes.
     ///
-    /// Returns `None` if metrics collection was not enabled.
+    /// Returns `None` if metrics collection was not enabled, the index is
+    /// out of range, or the dataflow has already been joined.
     ///
     /// # Example
     ///
@@ -4706,9 +4707,9 @@ impl<T: Timestamp> ClusterSpawnedDataflow<T> {
         local_idx: usize,
     ) -> Option<&Arc<crate::metrics::DataflowMetrics>> {
         self.inner
-            .as_ref()
-            .expect("dataflow already joined")
-            .workers[local_idx]
+            .as_ref()?
+            .workers
+            .get(local_idx)?
             .metrics()
     }
 

@@ -861,7 +861,7 @@ let tokio_handle = tokio::runtime::Handle::current();
 5. **Ready barrier** — each node sends `Ready` and waits for all peers to confirm before proceeding
 6. **Materialize** — create operator tasks and begin execution
 
-Both the handshake and ready barrier use the `handshake_timeout` parameter. If any peer doesn't respond in time, `spawn_cluster` returns `Err(HandshakeError::Timeout)`. No operators are started, and no resources are leaked.
+Both the handshake and ready barrier use the `handshake_timeout` parameter. If any peer doesn't respond in time, `spawn_cluster` returns an error (the `HandshakeError::Timeout` variant wrapped in the crate's `Error` type). No operators are started, and no resources are leaked.
 
 ### Collect metrics from a cluster
 

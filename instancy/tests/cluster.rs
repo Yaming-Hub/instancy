@@ -520,7 +520,7 @@ async fn cluster_cancel_propagates_to_peer() {
 /// Verify that cluster observability metrics are collected when enabled via SpawnOptions.
 ///
 /// Two-node cluster with `MetricsConfig::summary_only()` — after running a simple
-/// pipeline, both nodes should report operator metrics (activations, records).
+/// pipeline, both nodes should report operator activations.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn cluster_observability_metrics_collected() {
     let topology = ClusterTopology::multi_node(vec![
@@ -608,7 +608,7 @@ async fn cluster_observability_metrics_collected() {
     let output_a = cluster_a.take_output::<i32>(0, "results").unwrap();
     let output_b = cluster_b.take_output::<i32>(0, "results").unwrap();
 
-    // Verify metrics are accessible before join.
+    // Verify metrics are accessible before join via worker_metrics().
     let metrics_a = cluster_a
         .worker_metrics(0)
         .expect("metrics should be Some when summary_only() is configured")
@@ -620,6 +620,18 @@ async fn cluster_observability_metrics_collected() {
         .clone();
 
     assert_eq!(metrics_a.operator_count(), 3); // source + map + sink
+
+    // Verify all_worker_metrics() returns correct structure.
+    let all_a = cluster_a.all_worker_metrics();
+    assert_eq!(all_a.len(), 1, "node-a has 1 local worker");
+    assert!(all_a[0].is_some(), "metrics should be enabled");
+
+    let all_b = cluster_b.all_worker_metrics();
+    assert_eq!(all_b.len(), 1, "node-b has 1 local worker");
+    assert!(all_b[0].is_some(), "metrics should be enabled");
+
+    // Verify worker_metrics() returns None for out-of-bounds index (no panic).
+    assert!(cluster_a.worker_metrics(99).is_none());
 
     // Wait for completion.
     cluster_a.join_blocking().unwrap();
