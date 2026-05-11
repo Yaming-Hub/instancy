@@ -517,7 +517,7 @@ Requires the `chrome-trace` feature flag.
 ```rust
 // After dataflow completes, export from any worker's metrics:
 let metrics = handle.metrics(0).unwrap();
-let exporter = metrics.to_chrome_trace("my-dataflow");
+let exporter = metrics.drain_to_chrome_trace("my-dataflow");
 exporter.save("trace.json").unwrap();
 // Drag trace.json onto https://ui.perfetto.dev/ to visualize.
 ```

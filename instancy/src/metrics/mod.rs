@@ -583,12 +583,14 @@ impl DataflowMetrics {
 
     /// Build a [`ChromeTraceExporter`] from the collected metrics.
     ///
-    /// This drains the timeline events and includes channel snapshots,
-    /// operator name metadata, and worker thread labels.
+    /// **Note:** This method *drains* the timeline events (they are removed
+    /// from the collectors). Calling it twice yields an exporter with no
+    /// activation events on the second call. Channel and operator snapshots
+    /// are non-destructive reads.
     ///
     /// Requires the `chrome-trace` feature.
     #[cfg(feature = "chrome-trace")]
-    pub fn to_chrome_trace(&self, dataflow_name: impl Into<String>) -> ChromeTraceExporter {
+    pub fn drain_to_chrome_trace(&self, dataflow_name: impl Into<String>) -> ChromeTraceExporter {
         let events = self.drain_timeline_events();
         let channels = self.channel_snapshots();
         let operators: Vec<(usize, String)> = self

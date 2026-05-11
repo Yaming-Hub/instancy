@@ -28,15 +28,14 @@
 //!     .collect();
 //!
 //! let exporter = ChromeTraceExporter::new("my-dataflow")
-//!     .with_activations(&events)
-//!     .with_operators(&operators)
+//!     .with_activations(&events, &operators)
 //!     .with_channels(&channels);
 //!
 //! // Write to file (opens in Perfetto UI via drag-and-drop):
 //! exporter.save("trace.json").unwrap();
 //!
 //! // Or get as bytes:
-//! let json_bytes = exporter.to_bytes();
+//! let json_bytes = exporter.to_bytes().unwrap();
 //! ```
 
 use serde::Serialize;
@@ -59,6 +58,9 @@ struct TraceEvent {
     /// Duration in microseconds (only for "X" events).
     #[serde(skip_serializing_if = "Option::is_none")]
     dur: Option<u64>,
+    /// Scope for instant events: "g" = global, "p" = process, "t" = thread.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    s: Option<String>,
     /// Process ID — we map stage/dataflow to pid.
     pid: u64,
     /// Thread ID — we map worker_index to tid.
@@ -113,6 +115,7 @@ impl ChromeTraceExporter {
                 ph: "X".to_string(),
                 ts: ev.start_us,
                 dur: Some(ev.duration_us),
+                s: None,
                 pid: 0,
                 tid: ev.worker_index as u64,
                 args: Some(serde_json::json!({
@@ -135,6 +138,7 @@ impl ChromeTraceExporter {
                 ph: "i".to_string(),
                 ts: 0,
                 dur: None,
+                s: Some("g".to_string()),
                 pid: 0,
                 tid: 0,
                 args: Some(serde_json::json!({
@@ -160,6 +164,7 @@ impl ChromeTraceExporter {
             ph: "M".to_string(),
             ts: 0,
             dur: None,
+            s: None,
             pid: 0,
             tid: 0,
             args: Some(serde_json::json!({
@@ -175,6 +180,7 @@ impl ChromeTraceExporter {
                 ph: "M".to_string(),
                 ts: 0,
                 dur: None,
+                s: None,
                 pid: 0,
                 tid: w as u64,
                 args: Some(serde_json::json!({
@@ -186,12 +192,12 @@ impl ChromeTraceExporter {
     }
 
     /// Serialize to Chrome Trace JSON bytes.
-    pub fn to_bytes(&self) -> Vec<u8> {
+    pub fn to_bytes(&self) -> Result<Vec<u8>, serde_json::Error> {
         // Chrome Trace format: {"traceEvents": [...]}
         let wrapper = serde_json::json!({
             "traceEvents": self.trace_events,
         });
-        serde_json::to_vec_pretty(&wrapper).unwrap_or_default()
+        serde_json::to_vec_pretty(&wrapper)
     }
 
     /// Write Chrome Trace JSON to a file.
@@ -199,7 +205,9 @@ impl ChromeTraceExporter {
     /// The resulting file can be opened in Perfetto UI (`ui.perfetto.dev`)
     /// via drag-and-drop, or in Chrome's `chrome://tracing`.
     pub fn save(&self, path: impl AsRef<Path>) -> io::Result<()> {
-        let bytes = self.to_bytes();
+        let bytes = self
+            .to_bytes()
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
         std::fs::write(path, bytes)
     }
 
@@ -217,7 +225,7 @@ mod tests {
     #[test]
     fn empty_exporter_produces_valid_json() {
         let exporter = ChromeTraceExporter::new("test-df");
-        let bytes = exporter.to_bytes();
+        let bytes = exporter.to_bytes().unwrap();
         let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
         assert!(json["traceEvents"].is_array());
         assert_eq!(json["traceEvents"].as_array().unwrap().len(), 0);
@@ -246,7 +254,7 @@ mod tests {
 
         assert_eq!(exporter.event_count(), 2);
 
-        let bytes = exporter.to_bytes();
+        let bytes = exporter.to_bytes().unwrap();
         let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
         let trace_events = json["traceEvents"].as_array().unwrap();
 
@@ -272,10 +280,11 @@ mod tests {
         let exporter = ChromeTraceExporter::new("test").with_channels(&channels);
         assert_eq!(exporter.event_count(), 1);
 
-        let bytes = exporter.to_bytes();
+        let bytes = exporter.to_bytes().unwrap();
         let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
         let ev = &json["traceEvents"][0];
         assert_eq!(ev["ph"], "i");
+        assert_eq!(ev["s"], "g"); // global scope required by Chrome Trace spec
         assert_eq!(ev["args"]["items_transferred"], 1000);
     }
 
@@ -286,7 +295,7 @@ mod tests {
         // 1 process_name + 3 thread_names = 4 events.
         assert_eq!(exporter.event_count(), 4);
 
-        let bytes = exporter.to_bytes();
+        let bytes = exporter.to_bytes().unwrap();
         let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
         let events = json["traceEvents"].as_array().unwrap();
 
@@ -372,7 +381,7 @@ mod tests {
         assert_eq!(exporter.event_count(), 7);
 
         // Verify it's valid JSON.
-        let bytes = exporter.to_bytes();
+        let bytes = exporter.to_bytes().unwrap();
         let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
         assert_eq!(json["traceEvents"].as_array().unwrap().len(), 7);
     }

@@ -1686,7 +1686,7 @@ instancy = { version = "0.1", features = ["chrome-trace"] }
 ```rust
 // After dataflow completes:
 let metrics = handle.metrics(0).unwrap();
-let exporter = metrics.to_chrome_trace("my-dataflow");
+let exporter = metrics.drain_to_chrome_trace("my-dataflow");
 exporter.save("trace.json").unwrap();
 // Open trace.json in https://ui.perfetto.dev/
 ```

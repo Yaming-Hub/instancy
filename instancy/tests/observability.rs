@@ -333,13 +333,13 @@ mod chrome_trace_integration {
         tc.record_activation(1, start_time + Duration::from_micros(510), Duration::from_micros(300));
         metrics.register_timeline(tc);
 
-        let exporter = metrics.to_chrome_trace("integration-df");
+        let exporter = metrics.drain_to_chrome_trace("integration-df");
 
         // 2 activations + 1 channel + 1 process_name + 1 thread_name = 5 events.
         assert_eq!(exporter.event_count(), 5);
 
         // Verify output is valid JSON parseable by serde_json.
-        let bytes = exporter.to_bytes();
+        let bytes = exporter.to_bytes().unwrap();
         let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
         let events = json["traceEvents"].as_array().unwrap();
 
@@ -369,7 +369,7 @@ mod chrome_trace_integration {
         tc.record_activation(0, start_time, Duration::from_micros(100));
         metrics.register_timeline(tc);
 
-        let exporter = metrics.to_chrome_trace("file-test");
+        let exporter = metrics.drain_to_chrome_trace("file-test");
 
         let dir = std::env::temp_dir().join("instancy-chrome-trace-test");
         std::fs::create_dir_all(&dir).unwrap();

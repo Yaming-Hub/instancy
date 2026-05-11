@@ -237,7 +237,7 @@ fn run_chrome_trace_export(rt: &RuntimeHandle) {
 
     // Export Chrome Trace from worker 0's metrics.
     let metrics = spawned.worker_mut(0).metrics().expect("metrics available");
-    let exporter = metrics.to_chrome_trace("trace-demo");
+    let exporter = metrics.drain_to_chrome_trace("trace-demo");
 
     let path = std::env::temp_dir().join("instancy-trace-demo.json");
     exporter.save(&path).expect("write trace file");
