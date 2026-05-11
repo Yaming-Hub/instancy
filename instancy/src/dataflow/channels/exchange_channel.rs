@@ -1044,7 +1044,7 @@ impl<T: Timestamp, D: Send + 'static> Pull<T, D> for ExchangePull<T, D> {
 /// For symmetric exchanges (most common), pass the same value for both counts.
 /// Pass `None` for `channel_metrics` when channel counters are disabled.
 pub(crate) type ExchangeFactoryCreatorFn = Box<
-    dyn FnOnce(
+    dyn FnMut(
             usize,
             usize,
             usize,
@@ -1056,9 +1056,9 @@ pub(crate) type ExchangeFactoryCreatorFn = Box<
 /// Create a type-erased exchange factory creator using the default local
 /// transport ([`LocalEdgeMaterializer`]).
 ///
-/// The returned closure captures the `ExchangeFn<D>` and concrete types
-/// `T`, `D`. When called with `(num_source_workers, num_target_workers, capacity)`,
-/// it produces channel factories backed by in-process bounded channels.
+/// The returned `FnMut` closure captures the `ExchangeFn<D>` and concrete types
+/// `T`, `D`. Each call constructs a fresh local materializer, allowing the
+/// creator itself to be replayed across repeated materializations.
 pub(crate) fn create_exchange_factory_creator<T, D>(
     exchange_fn: ExchangeFn<D>,
 ) -> ExchangeFactoryCreatorFn
@@ -1081,7 +1081,7 @@ where
             build_exchange_factories(
                 num_source_workers,
                 num_target_workers,
-                exchange_fn,
+                exchange_fn.clone(),
                 materializer,
                 channel_metrics,
             )
@@ -1278,7 +1278,7 @@ where
             let ch_metrics = channel_metrics.clone();
             let m = num_source_workers;
             let n = num_target_workers;
-            super::super::schedulable::channel_factory(
+            super::super::schedulable::ChannelFactory::new(
                 move |ctx: &crate::worker::WorkerContext, wake: Option<WakeHandle>| {
                     let slot = worker_slot;
                     wakes.register(slot, wake);
@@ -1383,7 +1383,7 @@ where
             let materializer = materializer.clone();
             let m = num_source_workers;
             let n = num_target_workers;
-            super::super::schedulable::channel_factory(
+            super::super::schedulable::ChannelFactory::new(
                 move |ctx: &crate::worker::WorkerContext, wake: Option<WakeHandle>| {
                     let slot = worker_slot;
                     wakes.register(slot, wake);

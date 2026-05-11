@@ -205,7 +205,7 @@ impl<T: Timestamp> Default for ProgressReporter<T> {
 /// operators explicitly report message consumption/production for in-flight
 /// message accounting. Currently, progress tracking relies solely on capability
 /// accounting via the `internal` reporters.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct OperatorProgress<T: Timestamp> {
     /// Per-input consumed changes — reserved for future message-flight accounting.
     pub consumed: Vec<ChangeBatch<T>>,
@@ -222,6 +222,24 @@ impl<T: Timestamp> OperatorProgress<T> {
             consumed: (0..inputs).map(|_| ChangeBatch::new()).collect(),
             produced: (0..outputs).map(|_| ChangeBatch::new()).collect(),
             internal: (0..outputs).map(|_| ProgressReporter::new()).collect(),
+        }
+    }
+
+    /// Creates an independent deep copy with fresh [`ProgressReporter`]s.
+    ///
+    /// Unlike `clone()` (which shares `Arc`-backed reporters), this creates
+    /// new reporters with empty change batches. Used when cloning a
+    /// `SubgraphBuilder` for multi-worker materialization so each worker
+    /// gets independent progress state.
+    pub fn deep_clone(&self) -> Self {
+        Self {
+            consumed: self.consumed.clone(),
+            produced: self.produced.clone(),
+            internal: self
+                .internal
+                .iter()
+                .map(|_| ProgressReporter::new())
+                .collect(),
         }
     }
 

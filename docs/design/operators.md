@@ -622,7 +622,7 @@ pub fn source_async<D, F, Fut>(
 ) -> Pipe<T, D>
 where
     D: Clone + Send + 'static,
-    F: FnOnce(AsyncInputSender<T, D>) -> Fut + Send + 'static,
+    F: FnOnce(AsyncInputSender<T, D>) -> Fut + Clone + Send + 'static,
     Fut: Future<Output = Result<()>> + Send + 'static,
 ```
 

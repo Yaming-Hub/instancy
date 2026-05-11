@@ -227,59 +227,18 @@ pub struct EdgeTypeInfo {
     pub metadata_type_id: std::any::TypeId,
 }
 
-/// A blueprint that creates a typed channel pair for an edge.
+/// A factory that creates a typed channel pair for an edge.
 ///
-/// Takes `(wake_handle)` where:
-/// - `wake_handle` is an optional [`crate::dataflow::channels::WakeHandle`] for async executor notifications.
-///   When provided, channels notify the handle on push, close, drop, and
-///   when pulling frees capacity (backpressure relief).
-///
-/// Returns `Result<(Box<dyn Any + Send>, Box<dyn Any + Send>)>` where the first
-/// element is a `Box<dyn Push<T, D, M>>` and the second is a `Box<dyn Pull<T, D, M>>`.
+/// Stored during the build phase (when concrete edge types are known) and
+/// invoked during materialization (when worker-local channel endpoints are
+/// needed). Wraps a `FnMut` closure that produces a fresh channel pair on each
+/// call.
 ///
 /// Pipeline channel factories are stateless and can be called multiple times.
 /// Exchange channel factories consume shared materializer state and must only
 /// be called once per worker slot — a failed `build()` may leave the factory
 /// in a partially consumed state that cannot be retried.
-pub trait ChannelBlueprint: Send {
-    /// Create a channel pair for the given worker and wake handle.
-    ///
-    /// For pipeline channels, the worker context is ignored (each worker gets
-    /// an independent bounded channel). For exchange channels, the context
-    /// determines which worker's Push/Pull pair to return from the shared
-    /// cross-worker channel set.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if channel materialization fails (e.g., network
-    /// connection unavailable, materializer state already consumed).
-    fn build(
-        &mut self,
-        ctx: &WorkerContext,
-        wake_handle: Option<crate::dataflow::channels::wake::WakeHandle>,
-    ) -> crate::Result<(Box<dyn std::any::Any + Send>, Box<dyn std::any::Any + Send>)>;
-}
-
-/// Type alias for a boxed channel blueprint.
-pub type ChannelFactory = Box<dyn ChannelBlueprint>;
-
-/// Type alias for the channel pair returned by [`ChannelBlueprint::build`].
-pub type ChannelPair = (Box<dyn std::any::Any + Send>, Box<dyn std::any::Any + Send>);
-
-/// Create a [`ChannelFactory`] from a closure.
-pub fn channel_factory(
-    f: impl FnMut(
-        &WorkerContext,
-        Option<crate::dataflow::channels::wake::WakeHandle>,
-    ) -> crate::Result<ChannelPair>
-    + Send
-    + 'static,
-) -> ChannelFactory {
-    Box::new(ChannelBlueprintFn(Box::new(f)))
-}
-
-/// Wraps a `FnMut` as a [`ChannelBlueprint`].
-pub struct ChannelBlueprintFn(
+pub struct ChannelFactory(
     Box<
         dyn FnMut(
                 &WorkerContext,
@@ -289,8 +248,17 @@ pub struct ChannelBlueprintFn(
     >,
 );
 
-impl ChannelBlueprintFn {
-    /// Create a new channel blueprint from a closure.
+/// Type alias for the channel pair returned by [`ChannelFactory::build`].
+///
+/// The first element is a `Box<dyn Push<T, D, M>>` (the output/sender side),
+/// and the second is a `Box<dyn Pull<T, D, M>>` (the input/receiver side).
+/// Both are type-erased via `Any` because the concrete types depend on the
+/// data type `D` and timestamp type `T`, which are not known at the
+/// factory-storage level.
+pub type ChannelPair = (Box<dyn std::any::Any + Send>, Box<dyn std::any::Any + Send>);
+
+impl ChannelFactory {
+    /// Create a new channel factory from a `FnMut` closure.
     pub fn new(
         factory: impl FnMut(
             &WorkerContext,
@@ -302,14 +270,18 @@ impl ChannelBlueprintFn {
         Self(Box::new(factory))
     }
 
-    /// Box this blueprint as a [`ChannelFactory`].
-    pub fn boxed(self) -> ChannelFactory {
-        Box::new(self)
-    }
-}
-
-impl ChannelBlueprint for ChannelBlueprintFn {
-    fn build(
+    /// Create a channel pair for the given worker and wake handle.
+    ///
+    /// For pipeline channels, the worker context is ignored (each worker gets
+    /// an independent bounded channel). For exchange channels, the context
+    /// determines which worker's Push/Pull pair to return from the shared
+    /// cross-worker channel set.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if channel materialization fails (e.g., network
+    /// connection unavailable, materializer state already consumed).
+    pub fn build(
         &mut self,
         ctx: &WorkerContext,
         wake_handle: Option<crate::dataflow::channels::wake::WakeHandle>,

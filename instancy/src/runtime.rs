@@ -1651,7 +1651,7 @@ impl RuntimeHandle {
         {
             let async_count = dataflow.async_source_wiring.len();
             input_count += async_count;
-            for (op_idx, wiring) in dataflow.async_source_wiring.drain(..) {
+            for (op_idx, mut wiring) in dataflow.async_source_wiring.drain(..) {
                 let (factory, pump) = wiring(
                     Arc::clone(&external_inputs_open),
                     wake_handle.clone(),
@@ -1789,7 +1789,7 @@ impl RuntimeHandle {
             // topology, so worker 0's creators are representative).
             let creators = std::mem::take(&mut dataflows[0].exchange_creators);
             let mut all_channel_collectors = Vec::new();
-            for (edge_idx, edge_capacity, creator) in creators {
+            for (edge_idx, edge_capacity, mut creator) in creators {
                 let ch_metrics = if metrics_config.channel_counters {
                     let c = std::sync::Arc::new(crate::metrics::ChannelMetricsCollector::new(
                         edge_idx,
@@ -2102,7 +2102,7 @@ impl RuntimeHandle {
             let creators = std::mem::take(&mut dataflows[0].exchange_creators);
             let mut all_channel_collectors = Vec::new();
 
-            for (edge_idx, edge_capacity, creator) in creators {
+            for (edge_idx, edge_capacity, mut creator) in creators {
                 // edge_idx is the index into graph.edges().
                 let (source_par, target_par) = if edge_idx < edges.len() {
                     let einfo = &edges[edge_idx];
@@ -3415,7 +3415,7 @@ impl SimpleRuntime {
         {
             let async_count = dataflow.async_source_wiring.len();
             input_count += async_count;
-            for (op_idx, wiring) in dataflow.async_source_wiring.drain(..) {
+            for (op_idx, mut wiring) in dataflow.async_source_wiring.drain(..) {
                 let (factory, pump) = wiring(
                     Arc::clone(&external_inputs_open),
                     wake_handle.clone(),
@@ -3536,7 +3536,7 @@ impl SimpleRuntime {
         // with shared cross-worker exchange channel factories).
         if num_workers > 1 {
             let creators = std::mem::take(&mut dataflows[0].exchange_creators);
-            for (edge_idx, edge_capacity, creator) in creators {
+            for (edge_idx, edge_capacity, mut creator) in creators {
                 let shared_factories = creator(num_workers, num_workers, edge_capacity, None);
                 if shared_factories.len() != num_workers {
                     return Err(Error::Runtime(RuntimeError::InvalidConfig(format!(
