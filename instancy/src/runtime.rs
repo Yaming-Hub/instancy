@@ -4682,6 +4682,62 @@ impl<T: Timestamp> ClusterSpawnedDataflow<T> {
         self.local_worker_range
     }
 
+    /// Get collected metrics for a specific local worker.
+    ///
+    /// `local_idx` is 0-based within this node's workers.
+    /// Returns `Some` if metrics collection was enabled via
+    /// [`SpawnOptions::metrics`]. Metrics are live — values update as the
+    /// dataflow executes.
+    ///
+    /// Returns `None` if metrics collection was not enabled.
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// let opts = SpawnOptions::new().metrics(MetricsConfig::full());
+    /// let cluster = rt.spawn_cluster("ex", topology, node_id, df_id,
+    ///     transport, timeout, build, &rt_handle, opts)?;
+    /// if let Some(m) = cluster.worker_metrics(0) {
+    ///     println!("activations: {}", m.total_activations());
+    /// }
+    /// ```
+    pub fn worker_metrics(
+        &self,
+        local_idx: usize,
+    ) -> Option<&Arc<crate::metrics::DataflowMetrics>> {
+        self.inner
+            .as_ref()
+            .expect("dataflow already joined")
+            .workers[local_idx]
+            .metrics()
+    }
+
+    /// Collect metrics from all local workers.
+    ///
+    /// Returns a `Vec` with one entry per local worker. Each entry is `Some`
+    /// if metrics were enabled. Returns an empty vec if the dataflow was
+    /// already joined.
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// let opts = SpawnOptions::new().metrics(MetricsConfig::summary_only());
+    /// let cluster = rt.spawn_cluster("ex", topology, node_id, df_id,
+    ///     transport, timeout, build, &rt_handle, opts)?;
+    /// // ... run dataflow ...
+    /// for (i, m) in cluster.all_worker_metrics().iter().enumerate() {
+    ///     if let Some(m) = m {
+    ///         println!("worker {i}: {} activations", m.total_activations());
+    ///     }
+    /// }
+    /// ```
+    pub fn all_worker_metrics(&self) -> Vec<Option<&Arc<crate::metrics::DataflowMetrics>>> {
+        match self.inner.as_ref() {
+            Some(inner) => inner.workers.iter().map(|w| w.metrics()).collect(),
+            None => Vec::new(),
+        }
+    }
+
     /// Take the input sender from a local worker.
     ///
     /// `local_idx` is 0-based within this node's workers.

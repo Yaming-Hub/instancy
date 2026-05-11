@@ -14,6 +14,7 @@ use instancy::communication::ClusterSpawnTransport;
 use instancy::communication::transport_session::PeerConnection;
 use instancy::{ClusterTopology, NodeConfig};
 use instancy::{RuntimeConfig, RuntimeHandle, SpawnOptions};
+use instancy::metrics::MetricsConfig;
 
 /// Helper: create duplex connections between two nodes.
 ///
@@ -514,4 +515,144 @@ async fn cluster_cancel_propagates_to_peer() {
         result.is_ok(),
         "node-b should have completed after node-a cancel propagated"
     );
+}
+
+/// Verify that cluster observability metrics are collected when enabled via SpawnOptions.
+///
+/// Two-node cluster with `MetricsConfig::summary_only()` — after running a simple
+/// pipeline, both nodes should report operator metrics (activations, records).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn cluster_observability_metrics_collected() {
+    let topology = ClusterTopology::multi_node(vec![
+        NodeConfig::new("node-a", 1),
+        NodeConfig::new("node-b", 1),
+    ])
+    .unwrap();
+    let dataflow_id = DataflowId::new();
+    let (conn_a, conn_b) = make_duplex_pair("node-a", "node-b", 64 * 1024);
+
+    let rt_a = RuntimeHandle::new(RuntimeConfig {
+        worker_threads: 2,
+        ..RuntimeConfig::default()
+    })
+    .unwrap();
+    let rt_b = RuntimeHandle::new(RuntimeConfig {
+        worker_threads: 2,
+        ..RuntimeConfig::default()
+    })
+    .unwrap();
+
+    let tokio_handle = tokio::runtime::Handle::current();
+
+    let build = |builder: &mut DataflowBuilder<u64>| -> Result<()> {
+        let input = builder.input::<i32>("data").unwrap();
+        input
+            .map("double", |_t, x| x * 2)
+            .output("results")
+            .unwrap();
+        Ok(())
+    };
+
+    let opts = SpawnOptions::new().metrics(MetricsConfig::summary_only());
+
+    let topo_a = topology.clone();
+    let topo_b = topology.clone();
+    let th_a = tokio_handle.clone();
+    let th_b = tokio_handle.clone();
+    let opts_a = opts.clone();
+    let opts_b = opts.clone();
+
+    let handle_a = tokio::task::spawn_blocking(move || {
+        let cluster = rt_a.spawn_cluster(
+            "obs-test",
+            topo_a,
+            "node-a",
+            dataflow_id,
+            ClusterSpawnTransport::dedicated(vec![conn_a], 1024),
+            Duration::from_secs(5),
+            build,
+            &th_a,
+            opts_a,
+        );
+        cluster.map(|c| (rt_a, c))
+    });
+
+    let handle_b = tokio::task::spawn_blocking(move || {
+        let cluster = rt_b.spawn_cluster(
+            "obs-test",
+            topo_b,
+            "node-b",
+            dataflow_id,
+            ClusterSpawnTransport::dedicated(vec![conn_b], 1024),
+            Duration::from_secs(5),
+            build,
+            &th_b,
+            opts_b,
+        );
+        cluster.map(|c| (rt_b, c))
+    });
+
+    let (result_a, result_b) = tokio::join!(handle_a, handle_b);
+    let (_rt_a, mut cluster_a) = result_a.unwrap().unwrap();
+    let (_rt_b, mut cluster_b) = result_b.unwrap().unwrap();
+
+    // Feed data and close inputs.
+    let sender_a = cluster_a.take_input::<i32>(0, "data").unwrap();
+    sender_a.send(0, vec![1, 2, 3]).unwrap();
+    drop(sender_a);
+
+    let sender_b = cluster_b.take_input::<i32>(0, "data").unwrap();
+    sender_b.send(0, vec![10, 20]).unwrap();
+    drop(sender_b);
+
+    let output_a = cluster_a.take_output::<i32>(0, "results").unwrap();
+    let output_b = cluster_b.take_output::<i32>(0, "results").unwrap();
+
+    // Verify metrics are accessible before join.
+    let metrics_a = cluster_a
+        .worker_metrics(0)
+        .expect("metrics should be Some when summary_only() is configured")
+        .clone();
+
+    let metrics_b = cluster_b
+        .worker_metrics(0)
+        .expect("metrics should be Some when summary_only() is configured")
+        .clone();
+
+    assert_eq!(metrics_a.operator_count(), 3); // source + map + sink
+
+    // Wait for completion.
+    cluster_a.join_blocking().unwrap();
+    cluster_b.join_blocking().unwrap();
+
+    // After completion, metrics should reflect activations.
+    assert!(
+        metrics_a.total_activations() > 0,
+        "node-a should have activations"
+    );
+    // Verify operator structure is correct.
+    let snap_a = metrics_a.operator_snapshots();
+    assert!(
+        !snap_a.is_empty(),
+        "node-a should have operator snapshots"
+    );
+
+    assert!(
+        metrics_b.total_activations() > 0,
+        "node-b should have activations"
+    );
+
+    // Verify outputs still work.
+    let data_a: Vec<i32> = output_a
+        .collect_data()
+        .into_iter()
+        .flat_map(|(_, d)| d)
+        .collect();
+    let data_b: Vec<i32> = output_b
+        .collect_data()
+        .into_iter()
+        .flat_map(|(_, d)| d)
+        .collect();
+    assert!(!data_a.is_empty(), "node-a should have output");
+    assert!(!data_b.is_empty(), "node-b should have output");
 }
