@@ -2218,6 +2218,222 @@ impl<T: Timestamp, D: Send + 'static> SchedulableOperator for WiredBranchOperato
 }
 
 // ---------------------------------------------------------------------------
+// WiredForkOperator
+// ---------------------------------------------------------------------------
+
+/// A fully-wired fork operator (1 input, 2 outputs, same type, clone-to-both).
+///
+/// Clones each input record and sends one copy to port 0 and one to port 1.
+/// Every downstream consumer sees every record. `D` must implement `Clone`.
+///
+/// # Fork vs Branch
+///
+/// These are complementary 1→2 multi-output operators:
+///
+/// - **Fork** (`WiredForkOperator`): each record is **cloned to both** output
+///   ports. Every downstream sees every record. Use for broadcasting, tapping,
+///   logging, metrics, or multi-consumer fan-out within a dataflow.
+///
+/// - **Branch** (`WiredBranchOperator`): each record goes to **exactly one**
+///   of 2 output ports based on a predicate. No cloning. Use for conditional
+///   splitting (if/else, Result routing).
+///
+/// In short: fork = broadcast (both), branch = selective routing (one-of-two).
+///
+/// Both are 1→2 operators that can be composed to achieve 1→N:
+/// - Fork chain: `fork → fork` on one side gives 3 copies, etc.
+/// - Branch chain: `branch → branch` on one side gives 3-way routing.
+///
+/// # Relationship to `broadcast`
+///
+/// `broadcast` is a **network-level** operator that sends copies to all
+/// **workers** (cross-process). Fork is a **dataflow-level** operator that
+/// duplicates data within a single worker's graph to two downstream operators.
+pub struct WiredForkOperator<T: Timestamp, D: Clone + Send + 'static> {
+    name: String,
+    index: usize,
+    stage_id: StageId,
+    input_puller: Box<dyn Pull<T, D>>,
+    input_handle: InputHandle<T, D>,
+    output_left: OutputHandle<T, D>,
+    output_right: OutputHandle<T, D>,
+    left_pusher: Box<dyn Push<T, D>>,
+    right_pusher: Box<dyn Push<T, D>>,
+    pending_left: VecDeque<Envelope<T, D>>,
+    pending_right: VecDeque<Envelope<T, D>>,
+    input_exhausted: bool,
+    done: bool,
+}
+
+impl<T: Timestamp, D: Clone + Send + 'static> WiredForkOperator<T, D> {
+    /// Create a new wired fork operator.
+    pub fn new(
+        name: impl Into<String>,
+        index: usize,
+        stage_id: StageId,
+        input_puller: Box<dyn Pull<T, D>>,
+        left_pusher: Box<dyn Push<T, D>>,
+        right_pusher: Box<dyn Push<T, D>>,
+    ) -> Self {
+        let name = name.into();
+        Self {
+            input_handle: InputHandle::new(format!("{name}:input")),
+            output_left: OutputHandle::new(format!("{name}:left")),
+            output_right: OutputHandle::new(format!("{name}:right")),
+            name,
+            index,
+            stage_id,
+            input_puller,
+            left_pusher,
+            right_pusher,
+            pending_left: VecDeque::new(),
+            pending_right: VecDeque::new(),
+            input_exhausted: false,
+            done: false,
+        }
+    }
+
+    /// Flush both per-port pending queues independently.
+    fn flush_pending(&mut self) -> Result<bool> {
+        let mut all_flushed = true;
+        while let Some(envelope) = self.pending_left.pop_front() {
+            match self.left_pusher.try_push(envelope) {
+                Ok(()) => {}
+                Err((Error::Backpressure, returned)) => {
+                    self.pending_left.push_front(returned);
+                    all_flushed = false;
+                    break;
+                }
+                Err((e, _)) => return Err(e),
+            }
+        }
+        // Flush right independently — don't let left backpressure starve right.
+        while let Some(envelope) = self.pending_right.pop_front() {
+            match self.right_pusher.try_push(envelope) {
+                Ok(()) => {}
+                Err((Error::Backpressure, returned)) => {
+                    self.pending_right.push_front(returned);
+                    all_flushed = false;
+                    break;
+                }
+                Err((e, _)) => return Err(e),
+            }
+        }
+        Ok(all_flushed)
+    }
+
+    fn pull_input(&mut self) {
+        loop {
+            match self.input_puller.pull() {
+                Some(envelope) => match envelope.payload {
+                    Payload::Data { time, data } => {
+                        self.input_handle.push_vec(time, data);
+                    }
+                    Payload::Control(_) => {}
+                },
+                None => {
+                    if self.input_puller.is_exhausted() {
+                        self.input_exhausted = true;
+                        self.input_handle.mark_exhausted();
+                    }
+                    break;
+                }
+            }
+        }
+    }
+
+    fn push_outputs(&mut self) -> Result<bool> {
+        for (time, data) in self.output_left.drain() {
+            self.pending_left.push_back(Envelope::data(time, data));
+        }
+        for (time, data) in self.output_right.drain() {
+            self.pending_right.push_back(Envelope::data(time, data));
+        }
+        self.flush_pending()
+    }
+
+    fn has_pending(&self) -> bool {
+        !self.pending_left.is_empty() || !self.pending_right.is_empty()
+    }
+
+    fn close_outputs(&mut self) {
+        self.left_pusher.close();
+        self.right_pusher.close();
+    }
+}
+
+impl<T: Timestamp, D: Clone + Send + 'static> SchedulableOperator for WiredForkOperator<T, D> {
+    fn activate(&mut self) -> Result<ActivationOutcome> {
+        if self.done {
+            return Ok(ActivationOutcome::Done);
+        }
+
+        if self.has_pending() && !self.flush_pending()? {
+            return Ok(ActivationOutcome::BlockedOnBackpressure);
+        }
+
+        self.pull_input();
+
+        let had_input = self.input_handle.has_pending();
+        if !had_input && self.input_exhausted {
+            self.close_outputs();
+            self.done = true;
+            return Ok(ActivationOutcome::Done);
+        }
+        if !had_input {
+            return Ok(ActivationOutcome::Idle);
+        }
+
+        // Clone each record to both output ports.
+        while let Some((time, data)) = self.input_handle.next() {
+            let mut left_session = self.output_left.session(time.clone());
+            let mut right_session = self.output_right.session(time);
+            for item in data {
+                left_session.give(item.clone());
+                right_session.give(item);
+            }
+        }
+
+        if !self.push_outputs()? {
+            return Ok(ActivationOutcome::BlockedOnBackpressure);
+        }
+
+        if self.input_exhausted
+            && !self.input_handle.has_pending()
+            && !self.output_left.has_output()
+            && !self.output_right.has_output()
+        {
+            self.close_outputs();
+            self.done = true;
+            return Ok(ActivationOutcome::Done);
+        }
+
+        Ok(ActivationOutcome::MadeProgress)
+    }
+
+    fn is_done(&self) -> bool {
+        self.done
+    }
+
+    fn name(&self) -> &str {
+        &self.name
+    }
+
+    fn index(&self) -> usize {
+        self.index
+    }
+
+    fn stage_id(&self) -> StageId {
+        self.stage_id
+    }
+
+    fn close_inputs(&mut self) {
+        self.input_exhausted = true;
+        self.input_handle.mark_exhausted();
+    }
+}
+
+// ---------------------------------------------------------------------------
 // WiredOkErrOperator
 // ---------------------------------------------------------------------------
 
@@ -2699,5 +2915,73 @@ mod tests {
             Payload::Data { data, .. } => assert_eq!(data, vec![-2, -4]),
             _ => panic!("expected data"),
         }
+    }
+
+    #[test]
+    fn wired_fork_clones_to_both_outputs() {
+        let ch_in = make_channel::<u64, i32>();
+        let ch_left = make_channel::<u64, i32>();
+        let ch_right = make_channel::<u64, i32>();
+
+        let mut pusher_in = ch_in.pusher;
+        let mut puller_left = ch_left.puller;
+        let mut puller_right = ch_right.puller;
+
+        let mut op = WiredForkOperator::new(
+            "dup",
+            0,
+            StageId::new(0),
+            ch_in.puller,
+            ch_left.pusher,
+            ch_right.pusher,
+        );
+
+        pusher_in
+            .push(Envelope::data(1, vec![10, 20, 30]))
+            .unwrap();
+        pusher_in.close();
+
+        let outcome = op.activate().unwrap();
+        assert_eq!(outcome, ActivationOutcome::Done);
+
+        // Both outputs get identical copies.
+        let env_left = puller_left.pull().unwrap();
+        match env_left.payload {
+            Payload::Data { data, .. } => assert_eq!(data, vec![10, 20, 30]),
+            _ => panic!("expected data"),
+        }
+        let env_right = puller_right.pull().unwrap();
+        match env_right.payload {
+            Payload::Data { data, .. } => assert_eq!(data, vec![10, 20, 30]),
+            _ => panic!("expected data"),
+        }
+    }
+
+    #[test]
+    fn wired_fork_empty_input() {
+        let ch_in = make_channel::<u64, i32>();
+        let ch_left = make_channel::<u64, i32>();
+        let ch_right = make_channel::<u64, i32>();
+
+        let mut pusher_in = ch_in.pusher;
+        let mut puller_left = ch_left.puller;
+        let mut puller_right = ch_right.puller;
+
+        let mut op = WiredForkOperator::new(
+            "dup_empty",
+            0,
+            StageId::new(0),
+            ch_in.puller,
+            ch_left.pusher,
+            ch_right.pusher,
+        );
+
+        pusher_in.close();
+
+        let outcome = op.activate().unwrap();
+        assert_eq!(outcome, ActivationOutcome::Done);
+
+        assert!(puller_left.pull().is_none());
+        assert!(puller_right.pull().is_none());
     }
 }

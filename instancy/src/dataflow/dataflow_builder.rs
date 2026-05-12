@@ -53,8 +53,9 @@ use crate::dataflow::stage::StageId;
 use crate::dataflow::stream::Slot;
 use crate::dataflow::wired_operators::{
     AsyncLogicFn, WiredBinaryOperator, WiredBranchOperator, WiredConcatOperator,
-    WiredEnterOperator, WiredFeedbackOperator, WiredLeaveOperator, WiredOkErrOperator,
-    WiredSourceOperator, WiredUnaryAsyncOperator, WiredUnaryNotifyOperator, WiredUnaryOperator,
+    WiredEnterOperator, WiredFeedbackOperator, WiredForkOperator, WiredLeaveOperator,
+    WiredOkErrOperator, WiredSourceOperator, WiredUnaryAsyncOperator, WiredUnaryNotifyOperator,
+    WiredUnaryOperator,
 };
 use crate::error::{DataflowError, Error, Result};
 use crate::order::Product;
@@ -1190,6 +1191,40 @@ impl<T: Timestamp, D: Clone + Send + 'static> Pipe<T, D> {
     {
         let capacity = self.resolve_capacity();
         self.add_branch_internal(name, capacity, predicate)
+    }
+
+    /// Duplicate the stream into two identical copies.
+    ///
+    /// Every record is cloned and sent to both output pipes. This is
+    /// useful for tapping (logging + processing), metrics collection,
+    /// or feeding the same data to two independent downstream graphs.
+    ///
+    /// `D` must implement `Clone`.
+    ///
+    /// # Fork vs Branch
+    ///
+    /// - **Fork**: clones every record to **both** outputs (broadcast).
+    /// - **Branch**: routes each record to **one** output based on a predicate.
+    ///
+    /// Both are 1→2 and can be composed to achieve 1→N.
+    ///
+    /// # Fork vs Broadcast
+    ///
+    /// - **Fork**: duplicates within a single worker's dataflow graph.
+    /// - **Broadcast**: sends copies to all **workers** across the network.
+    ///
+    /// # Example
+    /// ```ignore
+    /// let (logging, processing) = stream.fork("tap");
+    /// logging.inspect("log", |_t, x| println!("{x:?}")).output("log_sink");
+    /// processing.map("transform", |_t, x| x * 2).output("result");
+    /// ```
+    pub fn fork(mut self, name: impl Into<String>) -> (Pipe<T, D>, Pipe<T, D>)
+    where
+        D: Clone,
+    {
+        let capacity = self.resolve_capacity();
+        self.add_fork_internal(name, capacity)
     }
 
     /// Observe each element flowing through without modifying the stream.
@@ -4923,6 +4958,160 @@ impl<T: Timestamp, D: Clone + Send + 'static> Pipe<T, D> {
             _phantom: PhantomData,
         };
         (true_pipe, false_pipe)
+    }
+
+    /// Internal: add a fork operator (1 input, 2 outputs, clone-to-both).
+    fn add_fork_internal(
+        &self,
+        name: impl Into<String>,
+        capacity: usize,
+    ) -> (Pipe<T, D>, Pipe<T, D>)
+    where
+        D: Clone,
+    {
+        let name = name.into();
+        let op_idx;
+        let stage_id = StageId::new(0);
+        let prealloc = self.state.borrow().channel_preallocate;
+
+        {
+            let mut state = self.state.borrow_mut();
+            op_idx = state.allocate_operator_index();
+
+            // Register in graph (1 input, 2 outputs)
+            state
+                .graph
+                .register_operator(crate::dataflow::graph::OperatorInfo::new(
+                    op_idx, &name, stage_id, 1, 2,
+                ))
+                .unwrap_or_else(|e| state.builder_errors.push(e));
+
+            // Edge from upstream → input port 0
+            state.graph.add_edge(crate::dataflow::graph::EdgeInfo::new(
+                Slot::new(self.op_idx, self.output_slot),
+                Slot::new(op_idx, 0),
+                stage_id,
+                stage_id,
+            ));
+
+            // Subgraph: input 0 connects to both output 0 and output 1
+            let mut connectivity = PortConnectivity::new(1, 2);
+            connectivity.path_mut(0, 0).insert(T::Summary::default());
+            connectivity.path_mut(0, 1).insert(T::Summary::default());
+            if let Err(e) = state
+                .subgraph_builder
+                .add_operator(op_idx, &name, 1, 2, connectivity)
+            {
+                state.builder_errors.push(e);
+            }
+            state.subgraph_builder.add_edge(
+                Location::source(self.op_idx, self.output_slot),
+                Location::target(op_idx, 0),
+            );
+
+            // Operator factory
+            let name_clone = name.clone();
+            let factory: OperatorFactory =
+                OperatorFactory::new(move |_ctx, mut endpoints: ChannelEndpoints| {
+                    let name = name_clone.clone();
+                    let input_puller: Box<dyn Pull<T, D>> =
+                        *std::mem::take(&mut endpoints.input_pullers)
+                            .into_iter()
+                            .next()
+                            .ok_or_else(|| {
+                                Error::Dataflow(DataflowError::MissingEndpoint {
+                                    operator: "fork".into(),
+                                    port: "input puller".into(),
+                                })
+                            })?
+                            .downcast::<Box<dyn Pull<T, D>>>()
+                            .map_err(|_| {
+                                Error::Dataflow(DataflowError::TypeMismatch {
+                                    operator: "fork".into(),
+                                    port: "input puller".into(),
+                                })
+                            })?;
+
+                    let left_pusher: Box<dyn Push<T, D>> = {
+                        let pushers: Vec<Box<dyn Push<T, D>>> = endpoints
+                            .take_port_pushers(0)
+                            .into_iter()
+                            .map(|any_box| {
+                                any_box
+                                    .downcast::<Box<dyn Push<T, D>>>()
+                                    .map(|boxed| *boxed)
+                                    .map_err(|_| {
+                                        Error::Dataflow(DataflowError::TypeMismatch {
+                                            operator: "fork".into(),
+                                            port: "left output pusher".into(),
+                                        })
+                                    })
+                            })
+                            .collect::<Result<_>>()?;
+                        tee_or_single(pushers)?.unwrap_or_else(|| Box::new(NullPush))
+                    };
+
+                    let right_pusher: Box<dyn Push<T, D>> = {
+                        let pushers: Vec<Box<dyn Push<T, D>>> = endpoints
+                            .take_port_pushers(1)
+                            .into_iter()
+                            .map(|any_box| {
+                                any_box
+                                    .downcast::<Box<dyn Push<T, D>>>()
+                                    .map(|boxed| *boxed)
+                                    .map_err(|_| {
+                                        Error::Dataflow(DataflowError::TypeMismatch {
+                                            operator: "fork".into(),
+                                            port: "right output pusher".into(),
+                                        })
+                                    })
+                            })
+                            .collect::<Result<_>>()?;
+                        tee_or_single(pushers)?.unwrap_or_else(|| Box::new(NullPush))
+                    };
+
+                    Ok(Box::new(WiredForkOperator::new(
+                        name,
+                        op_idx,
+                        stage_id,
+                        input_puller,
+                        left_pusher,
+                        right_pusher,
+                    )) as Box<dyn SchedulableOperator>)
+                });
+            state.operator_factories.push((op_idx, factory));
+
+            // Channel factory for the input edge
+            let edge_idx = state.graph.edges().len() - 1;
+            let chan_factory: ChannelFactory =
+                ChannelFactory::new(move |_ctx, wake: Option<WakeHandle>| {
+                    let (push, pull) =
+                        bounded_channel_with_wake::<T, D, ()>(capacity, wake.clone(), prealloc);
+                    Ok((
+                        Box::new(Box::new(push) as Box<dyn Push<T, D>>)
+                            as Box<dyn std::any::Any + Send>,
+                        Box::new(Box::new(pull) as Box<dyn Pull<T, D>>)
+                            as Box<dyn std::any::Any + Send>,
+                    ))
+                });
+            state.channel_factories.push((edge_idx, chan_factory));
+        }
+
+        let left_pipe = Pipe {
+            state: Rc::clone(&self.state),
+            op_idx,
+            output_slot: 0,
+            capacity_override: None,
+            _phantom: PhantomData,
+        };
+        let right_pipe = Pipe {
+            state: Rc::clone(&self.state),
+            op_idx,
+            output_slot: 1,
+            capacity_override: None,
+            _phantom: PhantomData,
+        };
+        (left_pipe, right_pipe)
     }
 }
 
