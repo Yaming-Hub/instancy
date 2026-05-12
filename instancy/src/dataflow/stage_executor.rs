@@ -1,7 +1,11 @@
 use std::any::Any;
 use std::collections::{HashMap, HashSet, VecDeque};
+use std::future::Future;
 use std::marker::PhantomData;
+use std::pin::Pin;
+use std::sync::atomic::AtomicUsize;
 use std::sync::Arc;
+use std::task::{Context, Poll};
 
 use crate::cancellation::CancellationToken;
 use crate::dataflow::channels::wake::WakeHandle;
@@ -9,7 +13,7 @@ use crate::dataflow::executor::{ExecutorConfig, SweepOutcome};
 use crate::dataflow::graph::DataflowGraph;
 use crate::dataflow::probe::ProbeHandle;
 use crate::dataflow::schedulable::{
-    ActivationOutcome, ChannelFactory, ChannelEndpoints, OperatorFactory, SchedulableOperator,
+    ActivationOutcome, ChannelEndpoints, ChannelFactory, OperatorFactory, SchedulableOperator,
 };
 use crate::dataflow::stage::StageId;
 use crate::error::{DataflowError, Error, Result};
@@ -60,6 +64,9 @@ pub(crate) struct StageExecutor<T: Timestamp> {
     probe_notifiers: Vec<crate::dataflow::probe::ProbeNotifier<T>>,
     /// Wake handle for async executor notifications.
     wake_handle: WakeHandle,
+    /// Counter of external inputs that are still open. Prevents false
+    /// quiescence while user code might still send data.
+    external_inputs_open: Arc<AtomicUsize>,
     /// Worker index for error context.
     _phantom: PhantomData<T>,
 }
@@ -100,11 +107,12 @@ pub(crate) struct ExchangeOutput<T: Timestamp> {
 /// Exchange channels (cross-stage) are NOT created here — the caller
 /// creates them and provides `ExchangeInput`/`ExchangeOutput` objects.
 ///
-/// **Caller responsibility (PR4):** For boundary operators that have both
-/// intra-stage and exchange ports, the caller must include exchange channel
-/// factories in `channel_factories` so all operator ports get wired.
+/// **Boundary wiring:** For operators at stage boundaries, the caller must
+/// provide pre-built channel endpoints via `boundary_input_pullers` and
+/// `boundary_output_pushers`. These are merged with intra-stage endpoints
+/// before operator construction.
 ///
-/// **TODO(PR4):** Exchange frontier updates bypass the ProgressTracker,
+/// **TODO(PR5):** Exchange frontier updates bypass the ProgressTracker,
 /// so probe updates for exchange-input operators may lag. Either feed
 /// exchange frontiers into the tracker or update probes directly from
 /// exchange input state.
@@ -125,6 +133,9 @@ pub(crate) fn materialize_stage_executor<T: Timestamp>(
     exchange_outputs: Vec<ExchangeOutput<T>>,
     probes: Vec<(usize, ProbeHandle<T>)>,
     probe_notifiers: Vec<crate::dataflow::probe::ProbeNotifier<T>>,
+    boundary_input_pullers: HashMap<usize, Vec<(usize, Box<dyn Any + Send>)>>,
+    boundary_output_pushers: HashMap<usize, Vec<(usize, Box<dyn Any + Send>)>>,
+    external_inputs_open: Arc<AtomicUsize>,
 ) -> Result<StageExecutor<T>> {
     let stage_operator_set: HashSet<usize> = stage_operator_indices.iter().copied().collect();
     subgraph_builder.retain_operators(&stage_operator_set);
@@ -162,9 +173,11 @@ pub(crate) fn materialize_stage_executor<T: Timestamp>(
         .chain(intra_stage_feedback_edges.iter())
         .copied()
     {
-        let pos = *factory_positions
-            .get(&edge_idx)
-            .ok_or_else(|| Error::Dataflow(DataflowError::MissingFactory { edge_index: edge_idx }))?;
+        let pos = *factory_positions.get(&edge_idx).ok_or_else(|| {
+            Error::Dataflow(DataflowError::MissingFactory {
+                edge_index: edge_idx,
+            })
+        })?;
         let (_, factory) = &mut channel_factories[pos];
         let (push, pull) = factory.build(worker_context, Some(wake_handle.clone()))?;
         push_ends.insert(edge_idx, push);
@@ -218,9 +231,16 @@ pub(crate) fn materialize_stage_executor<T: Timestamp>(
             .push((edge.source.slot_index, push));
     }
 
-    let progress_reporters: Option<Arc<dyn Any + Send + Sync>> = Some(
-        Arc::new(subgraph_builder.materialization_reporters()) as Arc<dyn Any + Send + Sync>
-    );
+    // Merge pre-built boundary endpoints from exchange channels.
+    for (op_idx, pullers) in boundary_input_pullers {
+        op_input_pullers.entry(op_idx).or_default().extend(pullers);
+    }
+    for (op_idx, pushers) in boundary_output_pushers {
+        op_output_pushers.entry(op_idx).or_default().extend(pushers);
+    }
+
+    let progress_reporters: Option<Arc<dyn Any + Send + Sync>> =
+        Some(Arc::new(subgraph_builder.materialization_reporters()) as Arc<dyn Any + Send + Sync>);
 
     let mut factory_positions: Vec<usize> = operator_factories
         .iter()
@@ -229,7 +249,8 @@ pub(crate) fn materialize_stage_executor<T: Timestamp>(
         .collect();
     factory_positions.sort_by_key(|&pos| operator_factories[pos].0);
 
-    let mut operators: Vec<Box<dyn SchedulableOperator>> = Vec::with_capacity(factory_positions.len());
+    let mut operators: Vec<Box<dyn SchedulableOperator>> =
+        Vec::with_capacity(factory_positions.len());
     let mut index_to_pos: HashMap<usize, usize> = HashMap::with_capacity(factory_positions.len());
     for factory_pos in factory_positions {
         let (op_idx, factory) = &mut operator_factories[factory_pos];
@@ -271,7 +292,8 @@ pub(crate) fn materialize_stage_executor<T: Timestamp>(
         }
     }
 
-    let mut in_degree: HashMap<usize, usize> = index_to_pos.keys().copied().map(|idx| (idx, 0)).collect();
+    let mut in_degree: HashMap<usize, usize> =
+        index_to_pos.keys().copied().map(|idx| (idx, 0)).collect();
     let mut successors: HashMap<usize, Vec<usize>> = HashMap::new();
     for (source, target) in &edge_set {
         successors.entry(*source).or_default().push(*target);
@@ -335,6 +357,7 @@ pub(crate) fn materialize_stage_executor<T: Timestamp>(
         probes,
         probe_notifiers,
         wake_handle,
+        external_inputs_open,
     ))
 }
 
@@ -355,6 +378,7 @@ impl<T: Timestamp> StageExecutor<T> {
         probes: Vec<(usize, ProbeHandle<T>)>,
         probe_notifiers: Vec<crate::dataflow::probe::ProbeNotifier<T>>,
         wake_handle: WakeHandle,
+        external_inputs_open: Arc<AtomicUsize>,
     ) -> Self {
         assert_eq!(
             fused_order.len(),
@@ -395,6 +419,7 @@ impl<T: Timestamp> StageExecutor<T> {
             probes,
             probe_notifiers,
             wake_handle,
+            external_inputs_open,
             _phantom: PhantomData,
         };
         executor.sync_probes();
@@ -460,7 +485,22 @@ impl<T: Timestamp> StageExecutor<T> {
                 return Ok(SweepOutcome::WaitingForInput);
             }
 
-            if self.exchange_inputs.iter().any(|input| !input.is_all_done()) {
+            // Don't declare quiescence while external inputs (user-facing
+            // InputSender / AsyncInputSender) are still open — more data
+            // may arrive.
+            if self
+                .external_inputs_open
+                .load(std::sync::atomic::Ordering::SeqCst)
+                > 0
+            {
+                return Ok(SweepOutcome::WaitingForInput);
+            }
+
+            if self
+                .exchange_inputs
+                .iter()
+                .any(|input| !input.is_all_done())
+            {
                 Ok(SweepOutcome::WaitingForInput)
             } else {
                 Ok(SweepOutcome::Quiescent)
@@ -521,9 +561,14 @@ impl<T: Timestamp> StageExecutor<T> {
         }
     }
 
-    /// Returns `true` when all local operators are done and all exchange inputs are drained.
+    /// Returns `true` when all local operators are done.
+    ///
+    /// Operators self-report as done when their input channels are exhausted
+    /// (e.g., `is_exhausted()` returns true after the upstream push side drops).
+    /// Exchange input frontier tracking (via `ExchangeInput`) is bookkeeping
+    /// for future inline watermark support and does not gate completion.
     pub(crate) fn is_completed(&self) -> bool {
-        self.done.iter().all(|done| *done) && self.exchange_inputs.iter().all(ExchangeInput::is_all_done)
+        self.done.iter().all(|done| *done)
     }
 
     /// Returns this executor's stage identifier.
@@ -577,9 +622,12 @@ impl<T: Timestamp> StageExecutor<T> {
                         productive_activations += 1;
                         any_progress = true;
                         made_progress_this_pass = true;
-                        self.async_waiting[pos] = false;
+                        // Don't clear async_waiting here — the operator may still
+                        // have in-flight tasks even while collecting results. The
+                        // flag is only cleared on Idle (no in-flight work) or Done.
                     }
                     ActivationOutcome::Idle => {
+                        // No work and no in-flight tasks — safe to clear.
                         self.async_waiting[pos] = false;
                     }
                     ActivationOutcome::WaitingForAsync => {
@@ -708,7 +756,178 @@ impl<T: Timestamp> StageExecutor<T> {
             }
         }
     }
+
+    /// Async poll driver: runs sweeps until completion, quiescence, or budget
+    /// exhaustion, then registers the waker and returns `Poll::Pending`.
+    ///
+    /// Mirrors the protocol in `DataflowExecutor::poll_run`:
+    /// 1. Run sweeps until idle or budget exhausted
+    /// 2. Register the waker
+    /// 3. Re-check for notifications (race-safe)
+    /// 4. Only return Pending if no notification is pending
+    pub(crate) fn poll_run(&mut self, cx: &mut Context<'_>) -> Poll<Result<bool>> {
+        let budget = self.config.max_sweeps_per_poll;
+        let mut sweeps_this_poll: usize = 0;
+
+        loop {
+            match self.run_one_sweep() {
+                Ok(SweepOutcome::Completed) => {
+                    self.wake_handle.clear_waker();
+                    return Poll::Ready(Ok(true));
+                }
+                Ok(SweepOutcome::Quiescent) => {
+                    self.wake_handle.clear_waker();
+                    return Poll::Ready(Ok(false));
+                }
+                Ok(SweepOutcome::MadeProgress) => {
+                    sweeps_this_poll += 1;
+                    if budget > 0 && sweeps_this_poll >= budget {
+                        self.wake_handle.register_waker(cx.waker());
+                        self.wake_handle.notify();
+                        return Poll::Pending;
+                    }
+                    continue;
+                }
+                Ok(SweepOutcome::Idle) => {
+                    sweeps_this_poll += 1;
+                    if budget > 0 && sweeps_this_poll >= budget {
+                        self.wake_handle.register_waker(cx.waker());
+                        self.wake_handle.notify();
+                        return Poll::Pending;
+                    }
+                    continue;
+                }
+                Ok(SweepOutcome::WaitingForInput) => {
+                    self.wake_handle.register_waker(cx.waker());
+                    if self.wake_handle.take_notification() {
+                        continue;
+                    }
+                    return Poll::Pending;
+                }
+                Err(e) => {
+                    self.wake_handle.clear_waker();
+                    return Poll::Ready(Err(e));
+                }
+            }
+        }
+    }
 }
+
+/// `StageExecutor` implements `Future` so it can be registered with the
+/// executor task registry and polled cooperatively by the worker pool.
+///
+/// Resolves to `Ok(true)` on normal completion, `Ok(false)` on quiescence,
+/// or `Err(...)` on error/cancellation.
+impl<T: Timestamp> Future for StageExecutor<T> {
+    type Output = Result<bool>;
+
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        let this = self.get_mut();
+        this.poll_run(cx)
+    }
+}
+
+// StageExecutor is Unpin because all its fields are behind indirection
+// (Arc, Box, Vec) or are plain data. PhantomData<T> does not store T inline.
+impl<T: Timestamp> Unpin for StageExecutor<T> {}
+
+/// Groups all `StageExecutor`s that belong to the **same worker** into a
+/// single async task.  `CombinedStageExecutor` is topology-agnostic: it has
+/// no knowledge of stage identities, exchange wiring, or operator logic.
+/// Its only job is to poll each contained executor and drop it when done.
+///
+/// There is exactly **one** `CombinedStageExecutor` per worker, registered as
+/// one tokio task.  For example, with Stage A (par=2) and Stage B (par=3)
+/// across 3 workers:
+///
+/// ```text
+/// Worker 0:  CombinedStageExecutor { StageExec(A,0), StageExec(B,0) }
+/// Worker 1:  CombinedStageExecutor { StageExec(A,1), StageExec(B,1) }
+/// Worker 2:  CombinedStageExecutor { StageExec(B,2) }     // A's par=2, so no A here
+/// ```
+///
+/// Dropping a completed stage is critical: it releases the stage's
+/// `ExchangePush` endpoints, closing the underlying channels so downstream
+/// stages can detect end-of-input via `is_exhausted()`.
+pub(crate) struct CombinedStageExecutor<T: Timestamp> {
+    /// Each slot is `Some` while running, set to `None` on completion so
+    /// the executor (and its boundary channels) are dropped immediately.
+    stages: Vec<Option<StageExecutor<T>>>,
+    wake_handle: WakeHandle,
+}
+
+impl<T: Timestamp> CombinedStageExecutor<T> {
+    pub(crate) fn new(stages: Vec<StageExecutor<T>>, wake_handle: WakeHandle) -> Self {
+        let stages = stages.into_iter().map(Some).collect();
+        Self {
+            stages,
+            wake_handle,
+        }
+    }
+}
+
+impl<T: Timestamp> Future for CombinedStageExecutor<T> {
+    type Output = Result<bool>;
+
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        let this = self.get_mut();
+        let budget = 64usize;
+        let mut polled = 0usize;
+        let mut any_pending = false;
+        let mut any_completed_this_poll = false;
+        let mut any_quiesced = false;
+
+        for i in 0..this.stages.len() {
+            let Some(stage) = this.stages[i].as_mut() else {
+                continue;
+            };
+
+            polled += 1;
+            match Pin::new(stage).poll(cx) {
+                Poll::Ready(Ok(true)) => {
+                    // Drop the completed stage to release its boundary channels
+                    // (ExchangePush/Pull endpoints), unblocking downstream stages.
+                    this.stages[i] = None;
+                    any_completed_this_poll = true;
+                }
+                Poll::Ready(Ok(false)) => {
+                    // Stage quiesced — drop it but track the quiescence.
+                    this.stages[i] = None;
+                    any_completed_this_poll = true;
+                    any_quiesced = true;
+                }
+                Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
+                Poll::Pending => any_pending = true,
+            }
+
+            if polled >= budget && this.stages.iter().any(|s| s.is_some()) {
+                this.wake_handle.register_waker(cx.waker());
+                this.wake_handle.notify();
+                return Poll::Pending;
+            }
+        }
+
+        let all_done = this.stages.iter().all(|s| s.is_none());
+        if all_done {
+            this.wake_handle.clear_waker();
+            // Propagate quiescence if any stage quiesced rather than completed.
+            Poll::Ready(Ok(!any_quiesced))
+        } else if any_pending || any_completed_this_poll {
+            // If a stage completed this poll, wake immediately so downstream
+            // stages can observe the newly-closed channels.
+            this.wake_handle.register_waker(cx.waker());
+            if any_completed_this_poll || this.wake_handle.take_notification() {
+                this.wake_handle.notify();
+            }
+            Poll::Pending
+        } else {
+            this.wake_handle.clear_waker();
+            Poll::Ready(Ok(false))
+        }
+    }
+}
+
+impl<T: Timestamp> Unpin for CombinedStageExecutor<T> {}
 
 impl<T: Timestamp> ExchangeInput<T> {
     /// Creates a new exchange input for a fixed number of upstream senders.
@@ -968,6 +1187,7 @@ mod tests {
             Vec::new(),
             Vec::new(),
             WakeHandle::new(),
+            Arc::new(AtomicUsize::new(0)),
         );
 
         assert_eq!(executor.stage_id(), StageId::new(7));
@@ -999,6 +1219,9 @@ mod tests {
             Vec::new(),
             Vec::new(),
             Vec::new(),
+            HashMap::new(),
+            HashMap::new(),
+            Arc::new(AtomicUsize::new(0)),
         )
         .unwrap();
 
@@ -1013,7 +1236,8 @@ mod tests {
     fn materialize_stage_executor_single_operator() {
         let stage_id = StageId::new(12);
         let mut graph = DataflowGraph::new();
-        graph.register_operator(OperatorInfo::new(1, "solo", stage_id, 0, 0))
+        graph
+            .register_operator(OperatorInfo::new(1, "solo", stage_id, 0, 0))
             .unwrap();
         graph.validate().unwrap();
 
@@ -1052,6 +1276,9 @@ mod tests {
             Vec::new(),
             Vec::new(),
             Vec::new(),
+            HashMap::new(),
+            HashMap::new(),
+            Arc::new(AtomicUsize::new(0)),
         )
         .unwrap();
 
@@ -1090,6 +1317,7 @@ mod tests {
             Vec::new(),
             Vec::new(),
             WakeHandle::new(),
+            Arc::new(AtomicUsize::new(0)),
         );
 
         assert!(executor.is_completed());
