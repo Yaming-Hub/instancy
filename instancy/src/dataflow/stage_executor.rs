@@ -3,8 +3,8 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::future::Future;
 use std::marker::PhantomData;
 use std::pin::Pin;
-use std::sync::atomic::AtomicUsize;
 use std::sync::Arc;
+use std::sync::atomic::AtomicUsize;
 use std::task::{Context, Poll};
 
 use crate::cancellation::CancellationToken;
@@ -14,6 +14,7 @@ use crate::dataflow::graph::DataflowGraph;
 use crate::dataflow::probe::ProbeHandle;
 use crate::dataflow::schedulable::{
     ActivationOutcome, ChannelEndpoints, ChannelFactory, OperatorFactory, SchedulableOperator,
+    group_by_port,
 };
 use crate::dataflow::stage::StageId;
 use crate::error::{DataflowError, Error, Result};
@@ -267,7 +268,7 @@ pub(crate) fn materialize_stage_executor<T: Timestamp>(
 
         let mut outputs = op_output_pushers.remove(&op_idx).unwrap_or_default();
         outputs.sort_by_key(|(port, _)| *port);
-        let output_pushers = outputs.into_iter().map(|(_, push)| push).collect();
+        let output_pushers = group_by_port(outputs);
 
         let endpoints = ChannelEndpoints {
             input_pullers,
@@ -473,9 +474,7 @@ impl<T: Timestamp> StageExecutor<T> {
         // are still active — more data may arrive through the feedback
         // boundary channel even though the intra-stage tracker sees no
         // remaining capabilities.
-        let fb = self
-            .feedback_deps
-            .load(std::sync::atomic::Ordering::SeqCst);
+        let fb = self.feedback_deps.load(std::sync::atomic::Ordering::SeqCst);
         let all_exchange_done = self.exchange_inputs.iter().all(|input| input.is_all_done());
         if fb == 0 && all_exchange_done {
             if let Some(ref tracker) = self.progress_tracker {
