@@ -192,9 +192,12 @@ impl OperatorFactory {
 pub struct ChannelEndpoints {
     /// Input pullers, one per input port. Each is `Box<dyn Pull<T, D, M>>`.
     pub input_pullers: Vec<Box<dyn std::any::Any + Send>>,
-    /// Output pushers, one per output port. Each entry is a `Vec<Box<dyn Push<T, D, M>>>`
-    /// (multiple pushers per port when the output fans out to multiple targets).
-    pub output_pushers: Vec<Box<dyn std::any::Any + Send>>,
+    /// Output pushers grouped by output port.
+    ///
+    /// `output_pushers[port]` is a `Vec` of all pushers for that port
+    /// (multiple pushers when the output fans out to multiple downstream
+    /// consumers). Each inner element is a `Box<dyn Push<T, D, M>>`.
+    pub output_pushers: Vec<Vec<Box<dyn std::any::Any + Send>>>,
     /// Wake handle for operators that need to notify the executor asynchronously
     /// (e.g., when an in-flight async task completes). Operators that don't need
     /// async waking can ignore this field.
@@ -222,16 +225,45 @@ impl ChannelEndpoints {
             .get(&(operator, output))
             .cloned()
     }
+
+    /// Take all output pushers for the given port, leaving the slot empty.
+    ///
+    /// Returns an empty vec if the port index is out of range.
+    pub fn take_port_pushers(&mut self, port: usize) -> Vec<Box<dyn std::any::Any + Send>> {
+        if port < self.output_pushers.len() {
+            std::mem::take(&mut self.output_pushers[port])
+        } else {
+            Vec::new()
+        }
+    }
 }
 
 impl std::fmt::Debug for ChannelEndpoints {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let total_pushers: usize = self.output_pushers.iter().map(|v| v.len()).sum();
         f.debug_struct("ChannelEndpoints")
             .field("input_count", &self.input_pullers.len())
-            .field("output_count", &self.output_pushers.len())
+            .field("output_ports", &self.output_pushers.len())
+            .field("output_pushers_total", &total_pushers)
             .field("has_progress_reporters", &self.progress_reporters.is_some())
             .finish()
     }
+}
+
+/// Group `(port, item)` tuples into a `Vec<Vec<item>>` indexed by port.
+///
+/// The input must be pre-sorted by port index. Returns one inner vec per
+/// distinct port, ordered by ascending port index.
+pub fn group_by_port<T>(sorted_items: Vec<(usize, T)>) -> Vec<Vec<T>> {
+    let mut result: Vec<Vec<T>> = Vec::new();
+    for (port, item) in sorted_items {
+        // Extend to cover any gaps (e.g., port 0, then port 2 — port 1 gets an empty vec).
+        while result.len() <= port {
+            result.push(Vec::new());
+        }
+        result[port].push(item);
+    }
+    result
 }
 
 // ---------------------------------------------------------------------------

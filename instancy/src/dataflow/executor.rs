@@ -30,6 +30,7 @@ use crate::dataflow::graph::DataflowGraph;
 use crate::dataflow::probe::ProbeHandle;
 use crate::dataflow::schedulable::{
     ActivationOutcome, ChannelEndpoints, ChannelFactory, OperatorFactory, SchedulableOperator,
+    group_by_port,
 };
 use crate::dataflow::stage::FusedActivationOrder;
 use crate::error::{DataflowError, Error, Result};
@@ -626,11 +627,10 @@ impl<T: Timestamp> DataflowExecutor<T> {
             let input_pullers: Vec<Box<dyn std::any::Any + Send>> =
                 inputs.into_iter().map(|(_, pull)| pull).collect();
 
-            // Collect output pushers sorted by port index.
+            // Collect output pushers grouped by port index.
             let mut outputs = op_output_pushers.remove(&op_idx).unwrap_or_default();
             outputs.sort_by_key(|(port, _)| *port);
-            let output_pushers: Vec<Box<dyn std::any::Any + Send>> =
-                outputs.into_iter().map(|(_, push)| push).collect();
+            let output_pushers = group_by_port(outputs);
 
             let endpoints = ChannelEndpoints {
                 input_pullers,

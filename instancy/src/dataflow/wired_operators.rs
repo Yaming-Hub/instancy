@@ -1978,6 +1978,448 @@ impl<T: Timestamp, D1: Send + 'static, D2: Send + 'static> SchedulableOperator
 }
 
 // ---------------------------------------------------------------------------
+// WiredBranchOperator
+// ---------------------------------------------------------------------------
+
+/// A fully-wired boolean branch operator (1 input, 2 outputs, same type).
+///
+/// Routes each input record to either port 0 (true) or port 1 (false) based
+/// on a boolean predicate. Each record is evaluated once and moved (not
+/// cloned) to exactly one output.
+///
+/// # Design rationale: boolean-only branching
+///
+/// This operator intentionally supports only boolean (2-way) branching.
+/// N-way routing (e.g., 3-way enum dispatch) can be composed from multiple
+/// binary branches:
+///
+/// ```text
+/// // 3-way split via two branches:
+/// let (ab, c) = input.branch(|_, x| x.kind != C);
+/// let (a, b)  = ab.branch(|_, x| x.kind == A);
+/// // a: kind==A, b: kind==B, c: kind==C
+/// ```
+///
+/// This keeps the core operator set minimal while supporting arbitrary
+/// N-way routing through composition.
+///
+/// # Branch vs Fork (future)
+///
+/// These are complementary multi-output patterns:
+///
+/// - **Branch** (`WiredBranchOperator`): each record goes to **exactly one**
+///   of 2 output ports. No cloning. The predicate decides which port. Use
+///   for conditional splitting (if/else, Result routing).
+///
+/// - **Fork** (future `WiredForkOperator`): each record is **cloned to all**
+///   output ports. Every downstream consumer sees every record. Use for
+///   broadcasting/tapping (logging, metrics, multi-consumer fan-out).
+///
+/// In short: branch = selective routing (1-of-2), fork = broadcast (all-of-N).
+pub struct WiredBranchOperator<T: Timestamp, D: Send + 'static> {
+    name: String,
+    index: usize,
+    stage_id: StageId,
+    input_puller: Box<dyn Pull<T, D>>,
+    input_handle: InputHandle<T, D>,
+    predicate: Box<dyn FnMut(&T, &D) -> bool + Send>,
+    output_true: OutputHandle<T, D>,
+    output_false: OutputHandle<T, D>,
+    true_pusher: Box<dyn Push<T, D>>,
+    false_pusher: Box<dyn Push<T, D>>,
+    pending_true: VecDeque<Envelope<T, D>>,
+    pending_false: VecDeque<Envelope<T, D>>,
+    input_exhausted: bool,
+    done: bool,
+}
+
+impl<T: Timestamp, D: Send + 'static> WiredBranchOperator<T, D> {
+    /// Create a new wired branch operator.
+    pub fn new(
+        name: impl Into<String>,
+        index: usize,
+        stage_id: StageId,
+        predicate: impl FnMut(&T, &D) -> bool + Send + 'static,
+        input_puller: Box<dyn Pull<T, D>>,
+        true_pusher: Box<dyn Push<T, D>>,
+        false_pusher: Box<dyn Push<T, D>>,
+    ) -> Self {
+        let name = name.into();
+        Self {
+            input_handle: InputHandle::new(format!("{name}:input")),
+            output_true: OutputHandle::new(format!("{name}:true")),
+            output_false: OutputHandle::new(format!("{name}:false")),
+            name,
+            index,
+            stage_id,
+            input_puller,
+            predicate: Box::new(predicate),
+            true_pusher,
+            false_pusher,
+            pending_true: VecDeque::new(),
+            pending_false: VecDeque::new(),
+            input_exhausted: false,
+            done: false,
+        }
+    }
+
+    /// Flush both per-port pending queues independently.
+    ///
+    /// Each port is flushed regardless of whether the other port hit
+    /// backpressure — this prevents a blocked port from starving
+    /// delivery on the other port.
+    fn flush_pending(&mut self) -> Result<bool> {
+        let mut all_flushed = true;
+        // Flush true output.
+        while let Some(envelope) = self.pending_true.pop_front() {
+            match self.true_pusher.try_push(envelope) {
+                Ok(()) => {}
+                Err((Error::Backpressure, returned)) => {
+                    self.pending_true.push_front(returned);
+                    all_flushed = false;
+                    break;
+                }
+                Err((e, _)) => return Err(e),
+            }
+        }
+        // Flush false output independently — don't let port 0 backpressure
+        // starve port 1 delivery.
+        while let Some(envelope) = self.pending_false.pop_front() {
+            match self.false_pusher.try_push(envelope) {
+                Ok(()) => {}
+                Err((Error::Backpressure, returned)) => {
+                    self.pending_false.push_front(returned);
+                    all_flushed = false;
+                    break;
+                }
+                Err((e, _)) => return Err(e),
+            }
+        }
+        Ok(all_flushed)
+    }
+
+    fn pull_input(&mut self) {
+        loop {
+            match self.input_puller.pull() {
+                Some(envelope) => match envelope.payload {
+                    Payload::Data { time, data } => {
+                        self.input_handle.push_vec(time, data);
+                    }
+                    Payload::Control(_) => {}
+                },
+                None => {
+                    if self.input_puller.is_exhausted() {
+                        self.input_exhausted = true;
+                        self.input_handle.mark_exhausted();
+                    }
+                    break;
+                }
+            }
+        }
+    }
+
+    fn push_outputs(&mut self) -> Result<bool> {
+        for (time, data) in self.output_true.drain() {
+            self.pending_true.push_back(Envelope::data(time, data));
+        }
+        for (time, data) in self.output_false.drain() {
+            self.pending_false.push_back(Envelope::data(time, data));
+        }
+        self.flush_pending()
+    }
+
+    fn has_pending(&self) -> bool {
+        !self.pending_true.is_empty() || !self.pending_false.is_empty()
+    }
+
+    fn close_outputs(&mut self) {
+        self.true_pusher.close();
+        self.false_pusher.close();
+    }
+}
+
+impl<T: Timestamp, D: Send + 'static> SchedulableOperator for WiredBranchOperator<T, D> {
+    fn activate(&mut self) -> Result<ActivationOutcome> {
+        if self.done {
+            return Ok(ActivationOutcome::Done);
+        }
+
+        // Step 1: Flush pending output.
+        if self.has_pending() && !self.flush_pending()? {
+            return Ok(ActivationOutcome::BlockedOnBackpressure);
+        }
+
+        // Step 2: Pull input.
+        self.pull_input();
+
+        // Step 3: Check for work.
+        let had_input = self.input_handle.has_pending();
+        if !had_input && self.input_exhausted {
+            self.close_outputs();
+            self.done = true;
+            return Ok(ActivationOutcome::Done);
+        }
+        if !had_input {
+            return Ok(ActivationOutcome::Idle);
+        }
+
+        // Step 4: Split input by predicate.
+        while let Some((time, data)) = self.input_handle.next() {
+            let mut true_session = self.output_true.session(time.clone());
+            let mut false_session = self.output_false.session(time);
+            for item in data {
+                if (self.predicate)(true_session.time(), &item) {
+                    true_session.give(item);
+                } else {
+                    false_session.give(item);
+                }
+            }
+        }
+
+        // Step 5: Push outputs.
+        if !self.push_outputs()? {
+            return Ok(ActivationOutcome::BlockedOnBackpressure);
+        }
+
+        // Step 6: Check completion.
+        if self.input_exhausted
+            && !self.input_handle.has_pending()
+            && !self.output_true.has_output()
+            && !self.output_false.has_output()
+        {
+            self.close_outputs();
+            self.done = true;
+            return Ok(ActivationOutcome::Done);
+        }
+
+        Ok(ActivationOutcome::MadeProgress)
+    }
+
+    fn is_done(&self) -> bool {
+        self.done
+    }
+
+    fn name(&self) -> &str {
+        &self.name
+    }
+
+    fn index(&self) -> usize {
+        self.index
+    }
+
+    fn stage_id(&self) -> StageId {
+        self.stage_id
+    }
+
+    fn close_inputs(&mut self) {
+        self.input_exhausted = true;
+        self.input_handle.mark_exhausted();
+    }
+}
+
+// ---------------------------------------------------------------------------
+// WiredOkErrOperator
+// ---------------------------------------------------------------------------
+
+/// A fully-wired ok/err splitter with one input and two typed outputs.
+///
+/// Applies a splitter function to each input record, routing `Ok(v)` to
+/// port 0 and `Err(e)` to port 1. The two output ports may carry different
+/// types.
+pub struct WiredOkErrOperator<T: Timestamp, D: Send + 'static, O: Send + 'static, E: Send + 'static>
+{
+    name: String,
+    index: usize,
+    stage_id: StageId,
+    input_puller: Box<dyn Pull<T, D>>,
+    input_handle: InputHandle<T, D>,
+    splitter: Box<dyn FnMut(D) -> std::result::Result<O, E> + Send>,
+    output_ok: OutputHandle<T, O>,
+    output_err: OutputHandle<T, E>,
+    ok_pusher: Box<dyn Push<T, O>>,
+    err_pusher: Box<dyn Push<T, E>>,
+    pending_ok: VecDeque<Envelope<T, O>>,
+    pending_err: VecDeque<Envelope<T, E>>,
+    input_exhausted: bool,
+    done: bool,
+}
+
+impl<T: Timestamp, D: Send + 'static, O: Send + 'static, E: Send + 'static>
+    WiredOkErrOperator<T, D, O, E>
+{
+    /// Create a new wired ok/err operator.
+    pub fn new(
+        name: impl Into<String>,
+        index: usize,
+        stage_id: StageId,
+        splitter: impl FnMut(D) -> std::result::Result<O, E> + Send + 'static,
+        input_puller: Box<dyn Pull<T, D>>,
+        ok_pusher: Box<dyn Push<T, O>>,
+        err_pusher: Box<dyn Push<T, E>>,
+    ) -> Self {
+        let name = name.into();
+        Self {
+            input_handle: InputHandle::new(format!("{name}:input")),
+            output_ok: OutputHandle::new(format!("{name}:ok")),
+            output_err: OutputHandle::new(format!("{name}:err")),
+            name,
+            index,
+            stage_id,
+            input_puller,
+            splitter: Box::new(splitter),
+            ok_pusher,
+            err_pusher,
+            pending_ok: VecDeque::new(),
+            pending_err: VecDeque::new(),
+            input_exhausted: false,
+            done: false,
+        }
+    }
+
+    fn flush_pending(&mut self) -> Result<bool> {
+        let mut all_flushed = true;
+        while let Some(envelope) = self.pending_ok.pop_front() {
+            match self.ok_pusher.try_push(envelope) {
+                Ok(()) => {}
+                Err((Error::Backpressure, returned)) => {
+                    self.pending_ok.push_front(returned);
+                    all_flushed = false;
+                    break;
+                }
+                Err((e, _)) => return Err(e),
+            }
+        }
+        // Flush err output independently — don't let ok backpressure
+        // starve err delivery.
+        while let Some(envelope) = self.pending_err.pop_front() {
+            match self.err_pusher.try_push(envelope) {
+                Ok(()) => {}
+                Err((Error::Backpressure, returned)) => {
+                    self.pending_err.push_front(returned);
+                    all_flushed = false;
+                    break;
+                }
+                Err((e, _)) => return Err(e),
+            }
+        }
+        Ok(all_flushed)
+    }
+
+    fn pull_input(&mut self) {
+        loop {
+            match self.input_puller.pull() {
+                Some(envelope) => match envelope.payload {
+                    Payload::Data { time, data } => {
+                        self.input_handle.push_vec(time, data);
+                    }
+                    Payload::Control(_) => {}
+                },
+                None => {
+                    if self.input_puller.is_exhausted() {
+                        self.input_exhausted = true;
+                        self.input_handle.mark_exhausted();
+                    }
+                    break;
+                }
+            }
+        }
+    }
+
+    fn push_outputs(&mut self) -> Result<bool> {
+        for (time, data) in self.output_ok.drain() {
+            self.pending_ok.push_back(Envelope::data(time, data));
+        }
+        for (time, data) in self.output_err.drain() {
+            self.pending_err.push_back(Envelope::data(time, data));
+        }
+        self.flush_pending()
+    }
+
+    fn has_pending(&self) -> bool {
+        !self.pending_ok.is_empty() || !self.pending_err.is_empty()
+    }
+
+    fn close_outputs(&mut self) {
+        self.ok_pusher.close();
+        self.err_pusher.close();
+    }
+}
+
+impl<T: Timestamp, D: Send + 'static, O: Send + 'static, E: Send + 'static> SchedulableOperator
+    for WiredOkErrOperator<T, D, O, E>
+{
+    fn activate(&mut self) -> Result<ActivationOutcome> {
+        if self.done {
+            return Ok(ActivationOutcome::Done);
+        }
+
+        if self.has_pending() && !self.flush_pending()? {
+            return Ok(ActivationOutcome::BlockedOnBackpressure);
+        }
+
+        self.pull_input();
+
+        let had_input = self.input_handle.has_pending();
+        if !had_input && self.input_exhausted {
+            self.close_outputs();
+            self.done = true;
+            return Ok(ActivationOutcome::Done);
+        }
+        if !had_input {
+            return Ok(ActivationOutcome::Idle);
+        }
+
+        while let Some((time, data)) = self.input_handle.next() {
+            let mut ok_session = self.output_ok.session(time.clone());
+            let mut err_session = self.output_err.session(time);
+            for item in data {
+                match (self.splitter)(item) {
+                    Ok(val) => ok_session.give(val),
+                    Err(val) => err_session.give(val),
+                }
+            }
+        }
+
+        if !self.push_outputs()? {
+            return Ok(ActivationOutcome::BlockedOnBackpressure);
+        }
+
+        if self.input_exhausted
+            && !self.input_handle.has_pending()
+            && !self.output_ok.has_output()
+            && !self.output_err.has_output()
+        {
+            self.close_outputs();
+            self.done = true;
+            return Ok(ActivationOutcome::Done);
+        }
+
+        Ok(ActivationOutcome::MadeProgress)
+    }
+
+    fn is_done(&self) -> bool {
+        self.done
+    }
+
+    fn name(&self) -> &str {
+        &self.name
+    }
+
+    fn index(&self) -> usize {
+        self.index
+    }
+
+    fn stage_id(&self) -> StageId {
+        self.stage_id
+    }
+
+    fn close_inputs(&mut self) {
+        self.input_exhausted = true;
+        self.input_handle.mark_exhausted();
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
@@ -2142,5 +2584,120 @@ mod tests {
         assert_eq!(sink.activate().unwrap(), ActivationOutcome::Done);
 
         assert_eq!(sink.collected(), &[(0u64, vec![20, 40, 60])]);
+    }
+
+    #[test]
+    fn wired_branch_splits_by_predicate() {
+        let ch_in = make_channel::<u64, i32>();
+        let ch_true = make_channel::<u64, i32>();
+        let ch_false = make_channel::<u64, i32>();
+
+        let mut pusher_in = ch_in.pusher;
+        let puller_in = ch_in.puller;
+        let pusher_true = ch_true.pusher;
+        let mut puller_true = ch_true.puller;
+        let pusher_false = ch_false.pusher;
+        let mut puller_false = ch_false.puller;
+
+        let mut op = WiredBranchOperator::new(
+            "even_odd",
+            0,
+            StageId::new(0),
+            |_t: &u64, x: &i32| x % 2 == 0,
+            puller_in,
+            pusher_true,
+            pusher_false,
+        );
+
+        pusher_in.push(Envelope::data(1, vec![1, 2, 3, 4, 5, 6])).unwrap();
+        pusher_in.close();
+
+        let outcome = op.activate().unwrap();
+        assert_eq!(outcome, ActivationOutcome::Done);
+
+        // True output: even numbers
+        let env_true = puller_true.pull().unwrap();
+        match env_true.payload {
+            Payload::Data { data, .. } => assert_eq!(data, vec![2, 4, 6]),
+            _ => panic!("expected data"),
+        }
+        // False output: odd numbers
+        let env_false = puller_false.pull().unwrap();
+        match env_false.payload {
+            Payload::Data { data, .. } => assert_eq!(data, vec![1, 3, 5]),
+            _ => panic!("expected data"),
+        }
+    }
+
+    #[test]
+    fn wired_branch_all_true() {
+        let ch_in = make_channel::<u64, i32>();
+        let ch_true = make_channel::<u64, i32>();
+        let ch_false = make_channel::<u64, i32>();
+
+        let mut pusher_in = ch_in.pusher;
+        let mut op = WiredBranchOperator::new(
+            "all_true",
+            0,
+            StageId::new(0),
+            |_t: &u64, _x: &i32| true,
+            ch_in.puller,
+            ch_true.pusher,
+            ch_false.pusher,
+        );
+
+        pusher_in.push(Envelope::data(0, vec![10, 20])).unwrap();
+        pusher_in.close();
+
+        let outcome = op.activate().unwrap();
+        assert_eq!(outcome, ActivationOutcome::Done);
+
+        let mut puller_true = ch_true.puller;
+        let env = puller_true.pull().unwrap();
+        match env.payload {
+            Payload::Data { data, .. } => assert_eq!(data, vec![10, 20]),
+            _ => panic!("expected data"),
+        }
+
+        let mut puller_false = ch_false.puller;
+        assert!(puller_false.pull().is_none());
+    }
+
+    #[test]
+    fn wired_ok_err_splits_results() {
+        let ch_in = make_channel::<u64, i32>();
+        let ch_ok = make_channel::<u64, i32>();
+        let ch_err = make_channel::<u64, i32>();
+
+        let mut pusher_in = ch_in.pusher;
+        let mut op = WiredOkErrOperator::new(
+            "split",
+            0,
+            StageId::new(0),
+            |x: i32| if x >= 0 { Ok(x * 2) } else { Err(x) },
+            ch_in.puller,
+            ch_ok.pusher,
+            ch_err.pusher,
+        );
+
+        pusher_in.push(Envelope::data(1, vec![1, -2, 3, -4])).unwrap();
+        pusher_in.close();
+
+        let outcome = op.activate().unwrap();
+        assert_eq!(outcome, ActivationOutcome::Done);
+
+        let mut puller_ok = ch_ok.puller;
+        let env_ok = puller_ok.pull().unwrap();
+        match env_ok.payload {
+            Payload::Data { data, .. } => assert_eq!(data, vec![2, 6]),
+            _ => panic!("expected data"),
+        }
+
+        let mut puller_err = ch_err.puller;
+        let env_err = puller_err.pull().unwrap();
+        match env_err.payload {
+            Payload::Data { data, .. } => assert_eq!(data, vec![-2, -4]),
+            _ => panic!("expected data"),
+        }
     }
 }
