@@ -259,25 +259,6 @@ impl<T: Timestamp> SubgraphBuilder<T> {
             .retain(|(src, tgt)| keep.contains(&src.node()) && keep.contains(&tgt.node()));
     }
 
-    /// Mark operators as "ghost" — present in the reachability graph for
-    /// frontier propagation, but not materialized on this worker.
-    ///
-    /// Ghost operators keep their shapes, connectivity, and edges in the
-    /// reachability graph so that peer progress updates can propagate
-    /// frontiers across stage boundaries. Their initial capabilities and
-    /// progress buffers are removed because:
-    /// - Initial capabilities: peers provide theirs via progress channels
-    /// - Progress buffers: no local operator writes to them
-    ///
-    /// The [`ProgressTracker`] built from this builder will skip ghost
-    /// operators during local progress collection but accept peer updates
-    /// for them, enabling correct cross-stage frontier propagation.
-    pub fn mark_ghost_operators(&mut self, ghost: &std::collections::HashSet<usize>) {
-        self.initial_capabilities
-            .retain(|idx, _| !ghost.contains(idx));
-        self.progress_buffers.retain(|idx, _| !ghost.contains(idx));
-    }
-
     /// Compiles the subgraph into a live [`ProgressTracker`].
     ///
     /// Consumes the builder and returns the tracker along with per-operator
@@ -326,7 +307,7 @@ impl<T: Timestamp> SubgraphBuilder<T> {
         let mut operator_indices: Vec<usize> = self.operators.keys().copied().collect();
         operator_indices.sort();
 
-        // Materialized indices: operators that have progress buffers (not ghost).
+        // Materialized indices: operators that have progress buffers.
         let materialized_indices: Vec<usize> = operator_indices
             .iter()
             .copied()
@@ -402,8 +383,8 @@ pub struct ProgressTracker<T: Timestamp> {
     operator_frontiers: HashMap<usize, OperatorFrontierState<T>>,
     /// Sorted operator indices for deterministic iteration.
     operator_indices: Vec<usize>,
-    /// Operator indices that have progress buffers (materialized, not ghost).
-    /// Used by `collect_operator_progress` to skip ghost operators.
+    /// Operator indices that have progress buffers (materialized).
+    /// Used by `collect_operator_progress` to iterate active operators.
     materialized_indices: Vec<usize>,
     /// Whether initial capabilities have been seeded.
     initialized: bool,
@@ -686,8 +667,7 @@ impl<T: Timestamp> ProgressTracker<T> {
     fn collect_operator_progress(&mut self) {
         let has_channels = self.progress_channels.is_some();
 
-        // Only iterate materialized operators (not ghost). Ghost operators
-        // have no progress buffers — their progress comes from peers.
+        // Only iterate materialized operators (those with progress buffers).
         for &index in &self.materialized_indices {
             let progress = &self.progress_buffers[&index];
             let shape = &self.operators[&index];
