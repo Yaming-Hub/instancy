@@ -982,6 +982,14 @@ impl<T: Timestamp> DataflowBuilder<T> {
                     edge.target_stage = sid;
                 }
             }
+            for edge in state.graph.feedback_edges_mut() {
+                if let Some(&sid) = op_stage_map.get(&edge.source.operator_index) {
+                    edge.source_stage = sid;
+                }
+                if let Some(&sid) = op_stage_map.get(&edge.target.operator_index) {
+                    edge.target_stage = sid;
+                }
+            }
         }
 
         // Surface any errors accumulated during graph construction.
@@ -2631,6 +2639,23 @@ impl<T: Timestamp, D: Clone + Send + 'static> Pipe<T, D> {
                 state
                     .feedback_channel_factories
                     .push((fb_idx + fb_offset, factory));
+            }
+            // Merge inner exchange creators (offset edge indices to match parent graph)
+            for (edge_idx, capacity, creator) in inner.exchange_creators {
+                state
+                    .exchange_creators
+                    .push((edge_idx + inner_edge_offset, capacity, creator));
+            }
+            // Merge inner network exchange creators for transport/cluster mode
+            #[cfg(feature = "transport")]
+            for (edge_idx, capacity, creator) in inner.exchange_network_creators {
+                state
+                    .exchange_network_creators
+                    .push((edge_idx + inner_edge_offset, capacity, creator));
+            }
+            // Merge inner exchange_parallelism metadata into parent graph
+            for (op_idx, par) in inner.graph.exchange_parallelism_map() {
+                state.graph.set_exchange_parallelism(*op_idx, *par);
             }
             state.builder_errors.extend(inner.builder_errors);
 

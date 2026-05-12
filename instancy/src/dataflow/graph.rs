@@ -246,6 +246,11 @@ impl DataflowGraph {
         self.exchange_parallelism.get(&operator_index).copied()
     }
 
+    /// Get the full exchange parallelism map (for merging inner scopes).
+    pub fn exchange_parallelism_map(&self) -> &HashMap<usize, usize> {
+        &self.exchange_parallelism
+    }
+
     /// All feedback edges.
     pub fn feedback_edges(&self) -> &[EdgeInfo] {
         &self.feedback_edges
@@ -311,6 +316,11 @@ impl DataflowGraph {
     /// Mutable access to all edges.
     pub fn edges_mut(&mut self) -> &mut [EdgeInfo] {
         &mut self.edges
+    }
+
+    /// Mutable access to all feedback edges.
+    pub fn feedback_edges_mut(&mut self) -> &mut [EdgeInfo] {
+        &mut self.feedback_edges
     }
 
     /// Mutable access to registered operators.

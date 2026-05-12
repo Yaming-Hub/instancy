@@ -67,6 +67,10 @@ pub(crate) struct StageExecutor<T: Timestamp> {
     /// Counter of external inputs that are still open. Prevents false
     /// quiescence while user code might still send data.
     external_inputs_open: Arc<AtomicUsize>,
+    /// Number of active cross-stage feedback dependencies. When > 0,
+    /// this stage must not quiesce because another stage may still
+    /// push data through a feedback boundary channel.
+    feedback_deps: Arc<AtomicUsize>,
     /// Worker index for error context.
     _phantom: PhantomData<T>,
 }
@@ -136,6 +140,7 @@ pub(crate) fn materialize_stage_executor<T: Timestamp>(
     boundary_input_pullers: HashMap<usize, Vec<(usize, Box<dyn Any + Send>)>>,
     boundary_output_pushers: HashMap<usize, Vec<(usize, Box<dyn Any + Send>)>>,
     external_inputs_open: Arc<AtomicUsize>,
+    feedback_deps: Arc<AtomicUsize>,
 ) -> Result<StageExecutor<T>> {
     let stage_operator_set: HashSet<usize> = stage_operator_indices.iter().copied().collect();
     subgraph_builder.retain_operators(&stage_operator_set);
@@ -358,6 +363,7 @@ pub(crate) fn materialize_stage_executor<T: Timestamp>(
         probe_notifiers,
         wake_handle,
         external_inputs_open,
+        feedback_deps,
     ))
 }
 
@@ -379,6 +385,7 @@ impl<T: Timestamp> StageExecutor<T> {
         probe_notifiers: Vec<crate::dataflow::probe::ProbeNotifier<T>>,
         wake_handle: WakeHandle,
         external_inputs_open: Arc<AtomicUsize>,
+        feedback_deps: Arc<AtomicUsize>,
     ) -> Self {
         assert_eq!(
             fused_order.len(),
@@ -420,10 +427,17 @@ impl<T: Timestamp> StageExecutor<T> {
             probe_notifiers,
             wake_handle,
             external_inputs_open,
+            feedback_deps,
             _phantom: PhantomData,
         };
         executor.sync_probes();
         executor
+    }
+
+    /// Returns the feedback dependency counter for this stage.
+    /// Decremented by `CombinedStageExecutor` when a feedback-source stage completes.
+    pub(crate) fn feedback_deps(&self) -> &Arc<AtomicUsize> {
+        &self.feedback_deps
     }
 
     /// Runs one executor sweep.
@@ -454,12 +468,23 @@ impl<T: Timestamp> StageExecutor<T> {
         // Force-close operators when the progress tracker reports completion
         // (all capabilities drained). This handles feedback loops that quiesce
         // without operators self-reporting Done.
-        if let Some(ref tracker) = self.progress_tracker {
-            if tracker.is_completed() {
-                for pos in 0..self.operators.len() {
-                    if !self.done[pos] {
-                        self.operators[pos].close_inputs();
-                        self.done[pos] = true;
+        //
+        // Guard: do NOT force-close while cross-stage feedback source stages
+        // are still active — more data may arrive through the feedback
+        // boundary channel even though the intra-stage tracker sees no
+        // remaining capabilities.
+        let fb = self
+            .feedback_deps
+            .load(std::sync::atomic::Ordering::SeqCst);
+        let all_exchange_done = self.exchange_inputs.iter().all(|input| input.is_all_done());
+        if fb == 0 && all_exchange_done {
+            if let Some(ref tracker) = self.progress_tracker {
+                if tracker.is_completed() {
+                    for pos in 0..self.operators.len() {
+                        if !self.done[pos] {
+                            self.operators[pos].close_inputs();
+                            self.done[pos] = true;
+                        }
                     }
                 }
             }
@@ -496,15 +521,19 @@ impl<T: Timestamp> StageExecutor<T> {
                 return Ok(SweepOutcome::WaitingForInput);
             }
 
-            if self
-                .exchange_inputs
-                .iter()
-                .any(|input| !input.is_all_done())
-            {
-                Ok(SweepOutcome::WaitingForInput)
-            } else {
-                Ok(SweepOutcome::Quiescent)
-            }
+            // Report quiescence even when cross-stage dependencies
+            // (exchange_inputs, feedback_deps) are still open.
+            // CombinedStageExecutor detects global quiescence across
+            // all stages and handles coordinated termination.
+            //
+            // NOTE: This is per-worker quiescence, not global. With
+            // in-process channels (single-machine staged execution),
+            // data pushed by another worker is immediately available,
+            // so 64 idle sweeps without activation means all workers
+            // are idle — the loop has converged. With network channels
+            // (cross-process), latency could cause premature quiescence;
+            // cross-worker coordination would be needed in that case.
+            Ok(SweepOutcome::Quiescent)
         } else {
             Ok(SweepOutcome::Idle)
         }
@@ -854,14 +883,24 @@ pub(crate) struct CombinedStageExecutor<T: Timestamp> {
     /// the executor (and its boundary channels) are dropped immediately.
     stages: Vec<Option<StageExecutor<T>>>,
     wake_handle: WakeHandle,
+    /// Maps stage index (in `stages` vec) → list of feedback_deps counters
+    /// that should be decremented when that stage completes or is dropped.
+    /// Populated from cross-stage feedback edges: when stage B feeds back
+    /// to stage A, completing B decrements A's feedback_deps.
+    feedback_release: HashMap<usize, Vec<Arc<AtomicUsize>>>,
 }
 
 impl<T: Timestamp> CombinedStageExecutor<T> {
-    pub(crate) fn new(stages: Vec<StageExecutor<T>>, wake_handle: WakeHandle) -> Self {
+    pub(crate) fn new(
+        stages: Vec<StageExecutor<T>>,
+        wake_handle: WakeHandle,
+        feedback_release: HashMap<usize, Vec<Arc<AtomicUsize>>>,
+    ) -> Self {
         let stages = stages.into_iter().map(Some).collect();
         Self {
             stages,
             wake_handle,
+            feedback_release,
         }
     }
 }
@@ -875,7 +914,7 @@ impl<T: Timestamp> Future for CombinedStageExecutor<T> {
         let mut polled = 0usize;
         let mut any_pending = false;
         let mut any_completed_this_poll = false;
-        let mut any_quiesced = false;
+        let mut all_remaining_quiesced = true;
 
         for i in 0..this.stages.len() {
             let Some(stage) = this.stages[i].as_mut() else {
@@ -885,19 +924,30 @@ impl<T: Timestamp> Future for CombinedStageExecutor<T> {
             polled += 1;
             match Pin::new(stage).poll(cx) {
                 Poll::Ready(Ok(true)) => {
+                    // Release feedback dependencies: stages that were waiting
+                    // for this stage's feedback can now proceed to quiescence.
+                    if let Some(deps) = this.feedback_release.get(&i) {
+                        for dep in deps {
+                            dep.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+                        }
+                    }
                     // Drop the completed stage to release its boundary channels
                     // (ExchangePush/Pull endpoints), unblocking downstream stages.
                     this.stages[i] = None;
                     any_completed_this_poll = true;
                 }
                 Poll::Ready(Ok(false)) => {
-                    // Stage quiesced — drop it but track the quiescence.
-                    this.stages[i] = None;
-                    any_completed_this_poll = true;
-                    any_quiesced = true;
+                    // Stage quiesced — keep it alive.Other stages in this
+                    // CombinedStageExecutor may still produce data for it
+                    // (e.g., cross-stage feedback loops). Only when ALL
+                    // remaining stages quiesce do we know the loop converged.
+                    any_pending = true;
                 }
                 Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
-                Poll::Pending => any_pending = true,
+                Poll::Pending => {
+                    any_pending = true;
+                    all_remaining_quiesced = false;
+                }
             }
 
             if polled >= budget && this.stages.iter().any(|s| s.is_some()) {
@@ -910,8 +960,32 @@ impl<T: Timestamp> Future for CombinedStageExecutor<T> {
         let all_done = this.stages.iter().all(|s| s.is_none());
         if all_done {
             this.wake_handle.clear_waker();
-            // Propagate quiescence if any stage quiesced rather than completed.
-            Poll::Ready(Ok(!any_quiesced))
+            Poll::Ready(Ok(true))
+        } else if any_pending && all_remaining_quiesced && !any_completed_this_poll {
+            // All remaining stages quiesced and none completed this poll —
+            // the dataflow has converged.  Every stage had a chance to pull
+            // from boundary channels during its poll, so no data is in
+            // transit within this worker.
+            //
+            // In staged execution, global quiescence means the dataflow
+            // has converged (e.g., feedback loop terminated). This is normal
+            // completion, not an error condition.
+            // Release all feedback deps before dropping stages.
+            for (i, stage) in this.stages.iter().enumerate() {
+                if stage.is_some() {
+                    if let Some(deps) = this.feedback_release.get(&i) {
+                        for dep in deps {
+                            dep.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+                        }
+                    }
+                }
+            }
+            // Drop all remaining stages to release their channels.
+            for stage in &mut this.stages {
+                *stage = None;
+            }
+            this.wake_handle.clear_waker();
+            Poll::Ready(Ok(true))
         } else if any_pending || any_completed_this_poll {
             // If a stage completed this poll, wake immediately so downstream
             // stages can observe the newly-closed channels.
@@ -1188,6 +1262,7 @@ mod tests {
             Vec::new(),
             WakeHandle::new(),
             Arc::new(AtomicUsize::new(0)),
+            Arc::new(AtomicUsize::new(0)),
         );
 
         assert_eq!(executor.stage_id(), StageId::new(7));
@@ -1221,6 +1296,7 @@ mod tests {
             Vec::new(),
             HashMap::new(),
             HashMap::new(),
+            Arc::new(AtomicUsize::new(0)),
             Arc::new(AtomicUsize::new(0)),
         )
         .unwrap();
@@ -1279,6 +1355,7 @@ mod tests {
             HashMap::new(),
             HashMap::new(),
             Arc::new(AtomicUsize::new(0)),
+            Arc::new(AtomicUsize::new(0)),
         )
         .unwrap();
 
@@ -1317,6 +1394,7 @@ mod tests {
             Vec::new(),
             Vec::new(),
             WakeHandle::new(),
+            Arc::new(AtomicUsize::new(0)),
             Arc::new(AtomicUsize::new(0)),
         );
 

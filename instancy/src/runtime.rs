@@ -2637,6 +2637,74 @@ impl RuntimeHandle {
                 }
             }
 
+            // Wire cross-stage feedback edges as boundary channels.
+            // Feedback edges are pipeline (1:1) channels that may cross stage
+            // boundaries when the loop body contains an exchange. Each worker
+            // participating in both the source and target stages gets its own
+            // feedback channel connecting the two StageExecutors.
+            //
+            // Cross-stage feedback requires equal parallelism between the
+            // source and target stages — otherwise data on workers beyond
+            // min(source_par, target_par) would be silently lost.
+            {
+                let regular_edge_count = dataflow.graph.edges().len();
+                let feedback_edges: Vec<_> =
+                    dataflow.graph.feedback_edges().to_vec();
+                for (fb_idx, edge) in feedback_edges.iter().enumerate() {
+                    if edge.source_stage == edge.target_stage {
+                        continue; // intra-stage feedback handled by materialize_stage_executor
+                    }
+
+                    let edge_idx = regular_edge_count + fb_idx;
+                    let source_par =
+                        *stage_parallelism_by_id
+                            .get(&edge.source_stage)
+                            .ok_or_else(|| {
+                                Error::Runtime(RuntimeError::InvalidConfig(format!(
+                                    "missing source stage parallelism for feedback edge {}",
+                                    edge.source_stage
+                                )))
+                            })?;
+                    let target_par =
+                        *stage_parallelism_by_id
+                            .get(&edge.target_stage)
+                            .ok_or_else(|| {
+                                Error::Runtime(RuntimeError::InvalidConfig(format!(
+                                    "missing target stage parallelism for feedback edge {}",
+                                    edge.target_stage
+                                )))
+                            })?;
+
+                    if source_par != target_par {
+                        return Err(Error::Runtime(RuntimeError::InvalidConfig(format!(
+                            "cross-stage feedback edge from {} (par={}) to {} (par={}) \
+                             requires equal parallelism; feedback is 1:1 per worker",
+                            edge.source_stage, source_par, edge.target_stage, target_par
+                        ))));
+                    }
+
+                    if worker_idx >= source_par {
+                        continue;
+                    }
+
+                    let Some(&factory_pos) = channel_factory_positions.get(&edge_idx) else {
+                        continue;
+                    };
+                    let (_, factory) = &mut dataflow.channel_factories[factory_pos];
+                    let (push, pull) =
+                        factory.build(&global_worker_context, Some(wake_handle.clone()))?;
+
+                    boundary_output_pushers
+                        .entry(edge.source.operator_index)
+                        .or_default()
+                        .push((edge.source.slot_index, push));
+                    boundary_input_pullers
+                        .entry(edge.target.operator_index)
+                        .or_default()
+                        .push((edge.target.slot_index, pull));
+                }
+            }
+
             let executor_config = ExecutorConfig {
                 max_activations_per_step: 1024,
                 max_idle_sweeps: 64,
@@ -2653,6 +2721,27 @@ impl RuntimeHandle {
                 max_timeline_events: dataflow.max_timeline_events,
                 timeline_start_time: timeline_start,
             };
+
+            // Compute cross-stage feedback dependency counters.
+            // For each feedback edge that crosses stages, the target stage gets
+            // a dependency on the source stage. The target won't quiesce until
+            // all its feedback source stages have completed.
+            let mut feedback_target_deps: HashMap<StageId, usize> = HashMap::new();
+            let mut feedback_source_targets: HashMap<StageId, Vec<StageId>> = HashMap::new();
+            for edge in dataflow.graph.feedback_edges() {
+                if edge.source_stage != edge.target_stage {
+                    *feedback_target_deps.entry(edge.target_stage).or_insert(0) += 1;
+                    feedback_source_targets
+                        .entry(edge.source_stage)
+                        .or_default()
+                        .push(edge.target_stage);
+                }
+            }
+            // Create shared counters for each stage that receives feedback.
+            let feedback_deps_by_stage: HashMap<StageId, Arc<AtomicUsize>> = feedback_target_deps
+                .into_iter()
+                .map(|(stage_id, count)| (stage_id, Arc::new(AtomicUsize::new(count))))
+                .collect();
 
             let mut stage_executors = Vec::new();
             for (stage_idx, stage) in stages.iter().enumerate() {
@@ -2702,6 +2791,11 @@ impl RuntimeHandle {
                     }
                 }
 
+                let feedback_deps = feedback_deps_by_stage
+                    .get(&stage.id)
+                    .cloned()
+                    .unwrap_or_else(|| Arc::new(AtomicUsize::new(0)));
+
                 let stage_worker_context = WorkerContext::new(worker_idx, stage_par)?;
                 let stage_executor = materialize_stage_executor(
                     stage.id,
@@ -2722,6 +2816,7 @@ impl RuntimeHandle {
                     stage_boundary_input_pullers,
                     stage_boundary_output_pushers,
                     Arc::clone(&external_inputs_open),
+                    feedback_deps,
                 )?;
                 stage_executors.push(stage_executor);
             }
@@ -2732,8 +2827,25 @@ impl RuntimeHandle {
                 return Err(Error::Runtime(RuntimeError::EmptyDataflow));
             }
 
+            // Build the feedback release map: when a source stage completes,
+            // decrement the feedback_deps of its target stages.
+            let mut feedback_release: HashMap<usize, Vec<Arc<AtomicUsize>>> = HashMap::new();
+            for (exec_idx, executor) in stage_executors.iter().enumerate() {
+                let sid = executor.stage_id();
+                if let Some(targets) = feedback_source_targets.get(&sid) {
+                    for target_sid in targets {
+                        if let Some(deps) = feedback_deps_by_stage.get(target_sid) {
+                            feedback_release
+                                .entry(exec_idx)
+                                .or_default()
+                                .push(Arc::clone(deps));
+                        }
+                    }
+                }
+            }
+
             let executor: Pin<Box<dyn Future<Output = Result<bool>> + Send>> = Box::pin(
-                CombinedStageExecutor::new(stage_executors, wake_handle.clone()),
+                CombinedStageExecutor::new(stage_executors, wake_handle.clone(), feedback_release),
             );
             let (completion, notifier) = DataflowCompletion::new();
 

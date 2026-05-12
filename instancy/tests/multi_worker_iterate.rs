@@ -5,6 +5,7 @@
 //! - Progress tracking across workers inside loop scopes
 //! - Exchange-based data redistribution within iteration bodies
 //! - Correct convergence with parallel workers
+//! - Cross-stage feedback loops with per-stage parallelism
 //! - Edge cases: empty input, immediate exit, many iterations
 
 use instancy::dataflow::dataflow_builder::IterateResult;
@@ -340,4 +341,273 @@ async fn multi_worker_iterate_input_from_all_workers() {
 
     assert_eq!(all_results.len(), 2);
     assert_eq!(all_results, vec![128, 160]);
+}
+
+// ---------------------------------------------------------------------------
+// Staged parallelism: iterate with cross-stage feedback
+// ---------------------------------------------------------------------------
+//
+// These tests use `exchange_to` with explicit target parallelism inside the
+// loop body, creating a stage boundary within the loop. The feedback edge
+// then crosses from the post-exchange stage back to the pre-exchange stage.
+// This exercises cross-stage feedback channel wiring in StageExecutor.
+
+/// Staged iterate: exchange inside loop body creates cross-stage feedback.
+///
+/// Uses default_par=2 with exchange_by_hash inside the loop (both stages
+/// par=2), plus a post-loop gather (exchange_to(1)) to force the staged
+/// path. The feedback edge crosses from the post-exchange stage back to
+/// the pre-exchange stage.
+///
+/// Stage 0 (par=2): input, enter, concat, double
+/// Stage 1 (par=2): exchange target, done/again filters, branch, leave
+/// Stage 2 (par=1): gather results
+/// Feedback: stage 1 → stage 0 (cross-stage, equal parallelism)
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn staged_iterate_cross_stage_feedback() {
+    let rt = RuntimeHandle::new(RuntimeConfig::default()).unwrap();
+
+    let mut multi = rt
+        .spawn_multi(
+            "staged-iterate",
+            2, // default parallelism = 2
+            |builder: &mut DataflowBuilder<u64>| {
+                let input = builder.input::<i64>("data").unwrap();
+                let output = input.iterate::<u32>("double-loop", 1u32, |iter_var| {
+                    let doubled = iter_var
+                        .map("double", |_t: &Product<u64, u32>, x| x * 2)
+                        .exchange_by_hash("redistribute", |x: &i64| *x as u64);
+                    let done = doubled.clone().filter("done", |_t, x| *x >= 100);
+                    let again = doubled.filter("again", |_t, x| *x < 100);
+                    IterateResult {
+                        feedback: again,
+                        output: done,
+                    }
+                });
+                // Gather results to a single worker to force staged path
+                output
+                    .exchange_to("gather", 1, |x: &i64| *x as u64)
+                    .unwrap()
+                    .output("results")
+                    .unwrap();
+                Ok(())
+            },
+            SpawnOptions::new().per_stage_parallelism(true),
+        )
+        .unwrap();
+
+    let sender = multi.take_input::<i64>(0, "data").unwrap();
+    sender.send(0, vec![1, 2, 3, 5, 10, 50]).unwrap();
+    drop(sender);
+    // Close worker 1's input
+    drop(multi.take_input::<i64>(1, "data").unwrap());
+
+    // Collect outputs from all workers
+    let mut receivers = Vec::new();
+    let num_workers = multi.num_workers();
+    for w in 0..num_workers {
+        receivers.push(multi.take_output::<i64>(w, "results").unwrap());
+    }
+
+    let result = tokio::time::timeout(
+        TEST_TIMEOUT,
+        tokio::task::spawn_blocking(move || multi.join_blocking()),
+    )
+    .await;
+
+    match result {
+        Ok(Ok(Ok(()))) => {}
+        Ok(Ok(Err(e))) => panic!("dataflow join failed: {e}"),
+        Ok(Err(e)) => panic!("spawn_blocking panicked: {e}"),
+        Err(_) => panic!("dataflow did not complete within {TEST_TIMEOUT:?}"),
+    }
+
+    let mut all_results: Vec<i64> = Vec::new();
+    for recv in receivers {
+        for (_time, data) in recv.collect_data() {
+            all_results.extend(data);
+        }
+    }
+    all_results.sort();
+
+    // 1 → 2 → 4 → 8 → 16 → 32 → 64 → 128
+    // 3 → 6 → 12 → 24 → 48 → 96 → 192
+    // 5 → 10 → 20 → 40 → 80 → 160
+    // 10 → 20 → 40 → 80 → 160
+    // 50 → 100
+    assert_eq!(all_results.len(), 6);
+    assert_eq!(all_results, vec![100, 128, 128, 160, 160, 192]);
+}
+
+/// Staged iterate with immediate exit: all values already meet the condition.
+///
+/// Tests that cross-stage feedback handles the zero-iteration case correctly.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn staged_iterate_cross_stage_immediate_exit() {
+    let rt = RuntimeHandle::new(RuntimeConfig::default()).unwrap();
+
+    let mut multi = rt
+        .spawn_multi(
+            "staged-iterate-imm",
+            2,
+            |builder: &mut DataflowBuilder<u64>| {
+                let input = builder.input::<i64>("data").unwrap();
+                let output = input.iterate::<u32>("imm-loop", 1u32, |iter_var| {
+                    let processed = iter_var
+                        .map("identity", |_t: &Product<u64, u32>, x| x)
+                        .exchange_by_hash("redistribute", |x: &i64| *x as u64);
+                    let done = processed.clone().filter("done", |_t, x| *x >= 10);
+                    let again = processed.filter("again", |_t, x| *x < 10);
+                    IterateResult {
+                        feedback: again,
+                        output: done,
+                    }
+                });
+                output
+                    .exchange_to("gather", 1, |x: &i64| *x as u64)
+                    .unwrap()
+                    .output("results")
+                    .unwrap();
+                Ok(())
+            },
+            SpawnOptions::new().per_stage_parallelism(true),
+        )
+        .unwrap();
+
+    let sender = multi.take_input::<i64>(0, "data").unwrap();
+    // All values >= 10, so no feedback iterations needed.
+    sender.send(0, vec![100, 200, 300]).unwrap();
+    drop(sender);
+    drop(multi.take_input::<i64>(1, "data").unwrap());
+
+    let mut receivers = Vec::new();
+    for w in 0..multi.num_workers() {
+        receivers.push(multi.take_output::<i64>(w, "results").unwrap());
+    }
+
+    let result = tokio::time::timeout(
+        TEST_TIMEOUT,
+        tokio::task::spawn_blocking(move || multi.join_blocking()),
+    )
+    .await;
+
+    match result {
+        Ok(Ok(Ok(()))) => {}
+        Ok(Ok(Err(e))) => panic!("dataflow join failed: {e}"),
+        Ok(Err(e)) => panic!("spawn_blocking panicked: {e}"),
+        Err(_) => panic!("dataflow did not complete within {TEST_TIMEOUT:?}"),
+    }
+
+    let mut all_results: Vec<i64> = Vec::new();
+    for recv in receivers {
+        for (_time, data) in recv.collect_data() {
+            all_results.extend(data);
+        }
+    }
+    all_results.sort();
+
+    assert_eq!(all_results, vec![100, 200, 300]);
+}
+
+/// Staged iterate with empty input: no data enters the loop at all.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn staged_iterate_cross_stage_empty_input() {
+    let rt = RuntimeHandle::new(RuntimeConfig::default()).unwrap();
+
+    let mut multi = rt
+        .spawn_multi(
+            "staged-iterate-empty",
+            2,
+            |builder: &mut DataflowBuilder<u64>| {
+                let input = builder.input::<i64>("data").unwrap();
+                let output = input.iterate::<u32>("empty-loop", 1u32, |iter_var| {
+                    let processed = iter_var
+                        .map("double", |_t: &Product<u64, u32>, x| x * 2)
+                        .exchange_by_hash("redistribute", |x: &i64| *x as u64);
+                    let done = processed.clone().filter("done", |_t, x| *x >= 100);
+                    let again = processed.filter("again", |_t, x| *x < 100);
+                    IterateResult {
+                        feedback: again,
+                        output: done,
+                    }
+                });
+                output
+                    .exchange_to("gather", 1, |x: &i64| *x as u64)
+                    .unwrap()
+                    .output("results")
+                    .unwrap();
+                Ok(())
+            },
+            SpawnOptions::new().per_stage_parallelism(true),
+        )
+        .unwrap();
+
+    // Send no data, just close both workers' inputs.
+    drop(multi.take_input::<i64>(0, "data").unwrap());
+    drop(multi.take_input::<i64>(1, "data").unwrap());
+
+    let mut receivers = Vec::new();
+    for w in 0..multi.num_workers() {
+        receivers.push(multi.take_output::<i64>(w, "results").unwrap());
+    }
+
+    let result = tokio::time::timeout(
+        TEST_TIMEOUT,
+        tokio::task::spawn_blocking(move || multi.join_blocking()),
+    )
+    .await;
+
+    match result {
+        Ok(Ok(Ok(()))) => {}
+        Ok(Ok(Err(e))) => panic!("dataflow join failed: {e}"),
+        Ok(Err(e)) => panic!("spawn_blocking panicked: {e}"),
+        Err(_) => panic!("dataflow did not complete within {TEST_TIMEOUT:?}"),
+    }
+
+    let mut all_results: Vec<i64> = Vec::new();
+    for recv in receivers {
+        for (_time, data) in recv.collect_data() {
+            all_results.extend(data);
+        }
+    }
+
+    assert!(all_results.is_empty());
+}
+
+/// Staged iterate: validates that cross-stage feedback with unequal
+/// parallelism is rejected (data loss prevention).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn staged_iterate_rejects_unequal_feedback_parallelism() {
+    let rt = RuntimeHandle::new(RuntimeConfig::default()).unwrap();
+
+    let result = rt.spawn_multi(
+        "bad-staged-iterate",
+        1, // default parallelism = 1
+        |builder: &mut DataflowBuilder<u64>| {
+            let input = builder.input::<i64>("data").unwrap();
+            let output = input.iterate::<u32>("loop", 1u32, |iter_var| {
+                // exchange_to(2) inside loop → feedback from par=2 back to par=1
+                let processed = iter_var
+                    .map("identity", |_t: &Product<u64, u32>, x| x)
+                    .exchange_to("redistribute", 2, |x: &i64| *x as u64)
+                    .unwrap();
+                let done = processed.clone().filter("done", |_t, x| *x >= 10);
+                let again = processed.filter("again", |_t, x| *x < 10);
+                IterateResult {
+                    feedback: again,
+                    output: done,
+                }
+            });
+            output.output("results").unwrap();
+            Ok(())
+        },
+        SpawnOptions::new().per_stage_parallelism(true),
+    );
+
+    assert!(result.is_err(), "should reject unequal parallelism feedback");
+    let err_msg = format!("{}", result.err().unwrap());
+    assert!(
+        err_msg.contains("cross-stage feedback") || err_msg.contains("equal parallelism"),
+        "error should mention cross-stage feedback: {err_msg}"
+    );
 }
