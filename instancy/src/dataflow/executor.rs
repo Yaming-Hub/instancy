@@ -163,7 +163,7 @@ impl Default for ExecutorConfig {
 /// `run()` (sync) and `poll_run()` (async) can each decide how to react
 /// between sweeps — sleep, yield, or return `Pending`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum SweepOutcome {
+pub(crate) enum SweepOutcome {
     /// All operators are done — the dataflow completed normally.
     Completed,
     /// No operator made progress for `max_idle_sweeps` consecutive sweeps
