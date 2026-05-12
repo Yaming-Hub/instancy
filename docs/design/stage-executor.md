@@ -531,17 +531,40 @@ struct FrontierAggregator<T: Timestamp> {
    - Exchange input/output port handles
    - A local progress tracker for the stage's operators only
 
-5. **Registration:** All StageExecutors are registered with the worker thread
-   pool. They are polled independently.
+5. **Grouping into CombinedStageExecutor:** All StageExecutors for the same
+   worker are collected into a single `CombinedStageExecutor`. This is a
+   topology-agnostic container — it has no knowledge of stage identities,
+   exchange wiring, or operator logic. Its only responsibilities are:
+   - Poll each contained StageExecutor in a loop
+   - Drop completed stages immediately (setting the slot to `None`)
+   - Complete when all stages are done
 
-6. **Execution:** Each StageExecutor:
+   There is exactly **one CombinedStageExecutor per worker**, registered as
+   one async task. For example, with Stage A (par=2) and Stage B (par=3)
+   across 3 workers:
+
+   ```text
+   Worker 0:  CombinedStageExecutor { StageExec(A,0), StageExec(B,0) }
+   Worker 1:  CombinedStageExecutor { StageExec(A,1), StageExec(B,1) }
+   Worker 2:  CombinedStageExecutor { StageExec(B,2) }  // A's par=2, no A here
+   ```
+
+   Dropping a completed stage is critical: it releases the stage's
+   `ExchangePush` endpoints, closing the underlying channels so downstream
+   stages detect end-of-input via `is_exhausted()`.
+
+6. **Registration:** Each CombinedStageExecutor is registered with the worker
+   thread pool as a single async task.
+
+7. **Execution:** Each StageExecutor (polled by its CombinedStageExecutor):
    - Pulls data from exchange inputs (data batches + frontier updates)
    - Activates local operators in topological order
    - Pushes data to exchange outputs
    - Sends frontier updates when its output frontier advances
 
-7. **Completion:** A StageExecutor completes when all its input frontiers are
-   empty (no more data can arrive) and all operators have drained.
+8. **Completion:** A StageExecutor completes when all its input frontiers are
+   empty (no more data can arrive) and all operators have drained. The
+   CombinedStageExecutor completes when all its StageExecutors are done.
 
 ### Control Plane: Probes, Completion, and Cancellation
 

@@ -33,6 +33,9 @@ use crate::dataflow::control::{ControlBroadcast, ControlReceiver, ControlSender}
 use crate::dataflow::dataflow_builder::{DataflowBuilder, LogicalDataflow};
 use crate::dataflow::executor::{DataflowExecutor, ExecutorConfig};
 use crate::dataflow::graph::OperatorInfo;
+use crate::dataflow::stage_executor::{
+    CombinedStageExecutor, ExchangeInput, ExchangeOutput, materialize_stage_executor,
+};
 use crate::error::{Error, Result, RuntimeError, TopologyError};
 use crate::progress::progress_channel::{WorkerProgressChannels, create_progress_channels};
 use crate::progress::timestamp::Timestamp;
@@ -1476,7 +1479,7 @@ impl RuntimeHandle {
                     options.drain_timeout,
                 )
             } else {
-                self.spawn_staged_internal(
+                self.spawn_staged_se_internal(
                     name,
                     default_parallelism,
                     build,
@@ -1488,7 +1491,7 @@ impl RuntimeHandle {
                 )
             }
         } else if options.per_stage_parallelism {
-            self.spawn_staged_internal(
+            self.spawn_staged_se_internal(
                 name,
                 num_workers,
                 build,
@@ -1979,7 +1982,7 @@ impl RuntimeHandle {
     /// Creates per-stage worker groups with heterogeneous parallelism.
     /// Exchange edges between stages with different parallelism use M×N
     /// asymmetric channels.
-    #[allow(clippy::too_many_arguments)]
+    #[allow(clippy::too_many_arguments, dead_code)]
     fn spawn_staged_internal<T, F>(
         &self,
         name: &str,
@@ -2295,6 +2298,503 @@ impl RuntimeHandle {
             } else {
                 multi.workers[0].cancel.clone()
             };
+            self.tokio_handle.spawn(async move {
+                tokio::select! {
+                    _ = user_token.cancelled() => {
+                        cancel.cancel_with_reason(CancellationReason::UserRequested);
+                    }
+                    _ = cancel.cancelled_async() => {}
+                }
+            });
+        }
+
+        Ok(multi)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn spawn_staged_se_internal<T, F>(
+        &self,
+        name: &str,
+        default_parallelism: usize,
+        build: F,
+        mode: ChannelMode,
+        metrics_config: crate::metrics::MetricsConfig,
+        priority: u32,
+        external_cancel: Option<tokio_util::sync::CancellationToken>,
+        drain_timeout: Option<std::time::Duration>,
+    ) -> Result<MultiSpawnedDataflow<T>>
+    where
+        T: Timestamp,
+        F: Fn(&mut DataflowBuilder<T>) -> Result<()>,
+    {
+        use std::collections::{HashMap, HashSet};
+        use std::sync::atomic::Ordering;
+
+        use crate::dataflow::stage::StageId;
+
+        if default_parallelism == 0 {
+            return Err(Error::Runtime(RuntimeError::InvalidConfig(
+                "default_parallelism must be >= 1".into(),
+            )));
+        }
+
+        let mut probe_builder = DataflowBuilder::new(format!("{name}/probe"));
+        build(&mut probe_builder)?;
+        let probe_df = probe_builder.build()?;
+        let stages = probe_df.stages().to_vec();
+
+        if stages.is_empty() {
+            return self.spawn_multi_internal(
+                name,
+                default_parallelism,
+                build,
+                mode,
+                metrics_config,
+                priority,
+                external_cancel,
+                drain_timeout,
+            );
+        }
+
+        let stage_parallelism: Vec<usize> = stages
+            .iter()
+            .map(|s| s.parallelism.unwrap_or(default_parallelism))
+            .collect();
+
+        let num_workers = *stage_parallelism
+            .iter()
+            .max()
+            .unwrap_or(&default_parallelism);
+
+        if num_workers == 0 {
+            return Err(Error::Runtime(RuntimeError::InvalidConfig(
+                "computed num_workers must be >= 1".into(),
+            )));
+        }
+
+        if stage_parallelism.iter().all(|&p| p == num_workers) {
+            return self.spawn_multi_internal(
+                name,
+                num_workers,
+                build,
+                mode,
+                metrics_config,
+                priority,
+                external_cancel,
+                drain_timeout,
+            );
+        }
+
+        drop(probe_df);
+        let mut dataflows = Vec::with_capacity(num_workers);
+        for worker_idx in 0..num_workers {
+            let mut builder = DataflowBuilder::new(format!("{name}/worker-{worker_idx}"));
+            build(&mut builder)?;
+            let mut df = builder.build()?;
+            df.collect_metrics = metrics_config.operator_summary;
+            df.channel_counters = metrics_config.channel_counters;
+            df.activation_timeline = metrics_config.activation_timeline;
+            df.frontier_timeline = metrics_config.frontier_timeline;
+            df.transfer_timeline = metrics_config.transfer_timeline;
+            df.min_activation_duration = metrics_config.min_activation_duration;
+            df.max_timeline_events = metrics_config.max_timeline_events;
+            df.drain_timeout = drain_timeout;
+            dataflows.push(df);
+        }
+
+        if num_workers > 1 {
+            validate_multi_worker_topologies(&dataflows)?;
+        }
+
+        if num_workers > 1 {
+            let edges = dataflows[0].graph.edges().to_vec();
+            let creators = std::mem::take(&mut dataflows[0].exchange_creators);
+            let mut all_channel_collectors = Vec::new();
+
+            for (edge_idx, edge_capacity, mut creator) in creators {
+                let (source_par, target_par) = if edge_idx < edges.len() {
+                    let einfo = &edges[edge_idx];
+                    let src_stage = einfo.source_stage.index();
+                    let tgt_stage = einfo.target_stage.index();
+                    let src_p = stage_parallelism
+                        .get(src_stage)
+                        .copied()
+                        .unwrap_or(default_parallelism);
+                    let tgt_p = stage_parallelism
+                        .get(tgt_stage)
+                        .copied()
+                        .unwrap_or(default_parallelism);
+                    (src_p, tgt_p)
+                } else {
+                    (num_workers, num_workers)
+                };
+
+                let ch_metrics = if metrics_config.channel_counters {
+                    let c = std::sync::Arc::new(crate::metrics::ChannelMetricsCollector::new(
+                        edge_idx,
+                        format!("exchange[{edge_idx}]"),
+                    ));
+                    all_channel_collectors.push(std::sync::Arc::clone(&c));
+                    Some(c)
+                } else {
+                    None
+                };
+                let shared_factories = creator(source_par, target_par, edge_capacity, ch_metrics);
+                let expected_count = std::cmp::max(source_par, target_par);
+                if shared_factories.len() != expected_count {
+                    return Err(Error::Runtime(RuntimeError::InvalidConfig(format!(
+                        "exchange factory creator for edge {edge_idx} produced {} factories, \
+                         expected {} (max of source_par={}, target_par={})",
+                        shared_factories.len(),
+                        expected_count,
+                        source_par,
+                        target_par
+                    ))));
+                }
+
+                for (slot_idx, factory) in shared_factories.into_iter().enumerate() {
+                    if slot_idx < num_workers {
+                        let pos = dataflows[slot_idx]
+                            .channel_factories
+                            .iter()
+                            .position(|(idx, _)| *idx == edge_idx)
+                            .ok_or_else(|| {
+                                Error::Runtime(RuntimeError::InvalidConfig(format!(
+                                    "exchange edge {edge_idx} not found in worker {slot_idx}'s \
+                                     channel factories"
+                                )))
+                            })?;
+                        dataflows[slot_idx].channel_factories[pos].1 = factory;
+                    }
+                }
+            }
+
+            if !all_channel_collectors.is_empty() {
+                for df in &mut dataflows {
+                    df.channel_metrics_collectors = all_channel_collectors.clone();
+                }
+            }
+
+            for df in dataflows.iter_mut().skip(1) {
+                df.exchange_creators.clear();
+            }
+        }
+
+        let dataflow_cancel = self.cancel.child_token();
+        let dataflow_id = DataflowId::new();
+        let timeline_start = if metrics_config.activation_timeline {
+            Some(std::time::Instant::now())
+        } else {
+            None
+        };
+        let stage_parallelism_by_id: HashMap<StageId, usize> = stages
+            .iter()
+            .enumerate()
+            .map(|(stage_idx, stage)| (stage.id, stage_parallelism[stage_idx]))
+            .collect();
+        let mut prepared: Vec<(
+            SpawnedDataflow<T>,
+            Pin<Box<dyn Future<Output = Result<bool>> + Send>>,
+            CompletionNotifier,
+        )> = Vec::with_capacity(num_workers);
+        let mut spawned_count = 0usize;
+
+        for (worker_idx, dataflow) in dataflows.iter_mut().enumerate() {
+            let has_async_sources = !dataflow.async_source_wiring.is_empty();
+            if dataflow.operator_factories.is_empty()
+                && dataflow.input_port_wiring.is_empty()
+                && !has_async_sources
+            {
+                return Err(Error::Runtime(RuntimeError::EmptyDataflow));
+            }
+
+            let worker_cancel = dataflow_cancel.child_token();
+            let cancel_handle = worker_cancel.clone();
+            let wake_handle = WakeHandle::new();
+            worker_cancel.register_wake_handle(wake_handle.clone());
+            let global_worker_context = WorkerContext::new(worker_idx, num_workers)?;
+            let external_inputs_open = Arc::new(AtomicUsize::new(0));
+            let worker_name = dataflow.name().to_string();
+            let base_factory_count = dataflow.operator_factories.len();
+
+            // TODO(PR6): Filter input/output/async wiring by participating stages.
+            // Currently, all workers get input_senders even for stages they don't
+            // participate in (e.g., worker 1 in a par=1 input stage). This inflates
+            // external_inputs_open and exposes phantom InputSender handles. The old
+            // spawn_staged_internal used retain_stages() to clean these up.
+            let mut input_senders: Vec<(String, &'static str, Box<dyn std::any::Any + Send>)> =
+                Vec::new();
+            let mut input_count = dataflow.input_port_wiring.len();
+            let input_ports = &dataflow.input_ports;
+            let operator_factories = &mut dataflow.operator_factories;
+            for (info, wiring) in input_ports
+                .iter()
+                .zip(dataflow.input_port_wiring.iter_mut())
+            {
+                let (factory, sender_any) =
+                    wiring(Arc::clone(&external_inputs_open), wake_handle.clone(), mode);
+                operator_factories.push((info.operator_index, factory));
+                input_senders.push((info.name.clone(), info.type_name, sender_any));
+            }
+
+            let mut pump_tasks: Vec<Box<dyn FnOnce() + Send>> = Vec::new();
+            {
+                let async_count = dataflow.async_source_wiring.len();
+                input_count += async_count;
+                let operator_factories = &mut dataflow.operator_factories;
+                for (op_idx, wiring) in dataflow.async_source_wiring.iter_mut() {
+                    let (factory, pump) = wiring(
+                        Arc::clone(&external_inputs_open),
+                        wake_handle.clone(),
+                        worker_cancel.clone(),
+                    );
+                    operator_factories.push((*op_idx, factory));
+                    pump_tasks.push(pump);
+                }
+            }
+
+            let mut output_receivers: Vec<(String, &'static str, Box<dyn std::any::Any + Send>)> =
+                Vec::new();
+            let output_ports = &dataflow.output_ports;
+            let operator_factories = &mut dataflow.operator_factories;
+            for (info, wiring) in output_ports
+                .iter()
+                .zip(dataflow.output_port_wiring.iter_mut())
+            {
+                let (replacement_factory, receiver_any) = wiring(mode, Some(wake_handle.clone()));
+                if let Some(pos) = operator_factories
+                    .iter()
+                    .position(|(idx, _)| *idx == info.operator_index)
+                {
+                    operator_factories[pos] = (info.operator_index, replacement_factory);
+                }
+                output_receivers.push((info.name.clone(), info.type_name, receiver_any));
+            }
+
+            external_inputs_open.store(input_count, Ordering::SeqCst);
+
+            let channel_factory_positions: HashMap<usize, usize> = dataflow
+                .channel_factories
+                .iter()
+                .enumerate()
+                .map(|(pos, (edge_idx, _))| (*edge_idx, pos))
+                .collect();
+            let mut boundary_input_pullers: HashMap<
+                usize,
+                Vec<(usize, Box<dyn std::any::Any + Send>)>,
+            > = HashMap::new();
+            let mut boundary_output_pushers: HashMap<
+                usize,
+                Vec<(usize, Box<dyn std::any::Any + Send>)>,
+            > = HashMap::new();
+
+            for (edge_idx, edge) in dataflow.graph.edges().iter().enumerate() {
+                if edge.source_stage == edge.target_stage || !edge.is_exchange() {
+                    continue;
+                }
+
+                let source_par =
+                    *stage_parallelism_by_id
+                        .get(&edge.source_stage)
+                        .ok_or_else(|| {
+                            Error::Runtime(RuntimeError::InvalidConfig(format!(
+                                "missing source stage parallelism for {}",
+                                edge.source_stage
+                            )))
+                        })?;
+                let target_par =
+                    *stage_parallelism_by_id
+                        .get(&edge.target_stage)
+                        .ok_or_else(|| {
+                            Error::Runtime(RuntimeError::InvalidConfig(format!(
+                                "missing target stage parallelism for {}",
+                                edge.target_stage
+                            )))
+                        })?;
+
+                if worker_idx >= source_par && worker_idx >= target_par {
+                    continue;
+                }
+
+                let Some(&factory_pos) = channel_factory_positions.get(&edge_idx) else {
+                    continue;
+                };
+                let (_, factory) = &mut dataflow.channel_factories[factory_pos];
+                let (push, pull) =
+                    factory.build(&global_worker_context, Some(wake_handle.clone()))?;
+
+                if worker_idx < source_par {
+                    boundary_output_pushers
+                        .entry(edge.source.operator_index)
+                        .or_default()
+                        .push((edge.source.slot_index, push));
+                }
+                if worker_idx < target_par {
+                    boundary_input_pullers
+                        .entry(edge.target.operator_index)
+                        .or_default()
+                        .push((edge.target.slot_index, pull));
+                }
+            }
+
+            let executor_config = ExecutorConfig {
+                max_activations_per_step: 1024,
+                max_idle_sweeps: 64,
+                max_sweeps_per_poll: 64,
+                catch_panics: dataflow.catch_panics,
+                collect_metrics: dataflow.collect_metrics,
+                channel_counters: dataflow.channel_counters,
+                drain_timeout: dataflow.drain_timeout,
+                channel_metrics_collectors: dataflow.channel_metrics_collectors.clone(),
+                activation_timeline: dataflow.activation_timeline,
+                frontier_timeline: dataflow.frontier_timeline,
+                transfer_timeline: dataflow.transfer_timeline,
+                min_activation_duration: dataflow.min_activation_duration,
+                max_timeline_events: dataflow.max_timeline_events,
+                timeline_start_time: timeline_start,
+            };
+
+            let mut stage_executors = Vec::new();
+            for (stage_idx, stage) in stages.iter().enumerate() {
+                let stage_par = stage_parallelism[stage_idx];
+                if worker_idx >= stage_par {
+                    continue;
+                }
+
+                let exchange_inputs = dataflow
+                    .graph
+                    .edges()
+                    .iter()
+                    .filter(|edge| edge.is_exchange() && edge.target_stage == stage.id)
+                    .map(|edge| {
+                        let source_parallelism = *stage_parallelism_by_id
+                            .get(&edge.source_stage)
+                            .unwrap_or(&default_parallelism);
+                        ExchangeInput::new(edge.source_stage, source_parallelism)
+                    })
+                    .collect();
+                let exchange_outputs = dataflow
+                    .graph
+                    .edges()
+                    .iter()
+                    .filter(|edge| edge.is_exchange() && edge.source_stage == stage.id)
+                    .map(|edge| ExchangeOutput::new(edge.target_stage))
+                    .collect();
+
+                let stage_operator_set: HashSet<usize> =
+                    stage.operator_indices.iter().copied().collect();
+                let (stage_probes, stage_probe_notifiers): (Vec<_>, Vec<_>) = dataflow
+                    .probes
+                    .iter()
+                    .cloned()
+                    .zip(dataflow.probe_notifiers.iter().cloned())
+                    .filter(|((op_idx, _), _)| stage_operator_set.contains(op_idx))
+                    .unzip();
+
+                let mut stage_boundary_input_pullers = HashMap::new();
+                let mut stage_boundary_output_pushers = HashMap::new();
+                for op_idx in &stage.operator_indices {
+                    if let Some(pullers) = boundary_input_pullers.remove(op_idx) {
+                        stage_boundary_input_pullers.insert(*op_idx, pullers);
+                    }
+                    if let Some(pushers) = boundary_output_pushers.remove(op_idx) {
+                        stage_boundary_output_pushers.insert(*op_idx, pushers);
+                    }
+                }
+
+                let stage_worker_context = WorkerContext::new(worker_idx, stage_par)?;
+                let stage_executor = materialize_stage_executor(
+                    stage.id,
+                    worker_idx,
+                    &dataflow.graph,
+                    &stage.operator_indices,
+                    &mut dataflow.operator_factories,
+                    &mut dataflow.channel_factories,
+                    dataflow.subgraph_builder.clone(),
+                    worker_cancel.clone(),
+                    wake_handle.clone(),
+                    &stage_worker_context,
+                    executor_config.clone(),
+                    exchange_inputs,
+                    exchange_outputs,
+                    stage_probes,
+                    stage_probe_notifiers,
+                    stage_boundary_input_pullers,
+                    stage_boundary_output_pushers,
+                    Arc::clone(&external_inputs_open),
+                )?;
+                stage_executors.push(stage_executor);
+            }
+
+            dataflow.operator_factories.truncate(base_factory_count);
+
+            if stage_executors.is_empty() {
+                return Err(Error::Runtime(RuntimeError::EmptyDataflow));
+            }
+
+            let executor: Pin<Box<dyn Future<Output = Result<bool>> + Send>> = Box::pin(
+                CombinedStageExecutor::new(stage_executors, wake_handle.clone()),
+            );
+            let (completion, notifier) = DataflowCompletion::new();
+
+            for (pump_idx, pump) in pump_tasks.into_iter().enumerate() {
+                std::thread::Builder::new()
+                    .name(format!("source-pump-{}-{}", worker_name, pump_idx))
+                    .spawn(pump)
+                    .map_err(|e| {
+                        Error::Runtime(RuntimeError::SpawnFailed {
+                            context: "failed to spawn pump thread".into(),
+                            source: Some(e),
+                        })
+                    })?;
+            }
+
+            let spawned = SpawnedDataflow {
+                name: worker_name,
+                cancel: cancel_handle,
+                completion: Some(completion),
+                input_senders,
+                output_receivers,
+                metrics: None,
+                _phantom: PhantomData,
+            };
+            prepared.push((spawned, executor, notifier));
+            spawned_count += 1;
+        }
+
+        debug_assert_eq!(spawned_count, prepared.len());
+
+        let mut workers = Vec::with_capacity(num_workers);
+        for (spawned, executor, mut notifier) in prepared {
+            self.active_count
+                .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+            let active_count = Arc::clone(&self.active_count);
+            let idle_notify = Arc::clone(&self.idle_notify);
+            notifier.set_on_complete(Box::new(move || {
+                let prev = active_count.fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
+                if prev == 1 {
+                    idle_notify.notify_waiters();
+                }
+            }));
+            self.registry
+                .register(executor, notifier, dataflow_id, priority);
+            workers.push(spawned);
+        }
+
+        let multi = MultiSpawnedDataflow {
+            name: name.to_string(),
+            num_workers,
+            workers,
+            _dataflow_cancel: Some(dataflow_cancel.clone()),
+            _phantom: PhantomData,
+        };
+
+        if let Some(user_token) = external_cancel {
+            let cancel = multi
+                ._dataflow_cancel
+                .as_ref()
+                .expect("dataflow_cancel is always set for staged stage executors")
+                .clone();
             self.tokio_handle.spawn(async move {
                 tokio::select! {
                     _ = user_token.cancelled() => {
