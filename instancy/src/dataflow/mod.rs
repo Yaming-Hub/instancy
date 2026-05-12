@@ -15,6 +15,8 @@ pub(crate) mod schedulable;
 pub mod scope;
 pub(crate) mod spec;
 pub mod stage;
+#[allow(dead_code)]
+pub(crate) mod stage_executor;
 pub mod stream;
 #[allow(dead_code)]
 pub(crate) mod wired_operators;
