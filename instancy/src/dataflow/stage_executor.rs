@@ -1,17 +1,24 @@
+use std::any::Any;
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::marker::PhantomData;
+use std::sync::Arc;
 
 use crate::cancellation::CancellationToken;
 use crate::dataflow::channels::wake::WakeHandle;
 use crate::dataflow::executor::{ExecutorConfig, SweepOutcome};
+use crate::dataflow::graph::DataflowGraph;
 use crate::dataflow::probe::ProbeHandle;
-use crate::dataflow::schedulable::{ActivationOutcome, SchedulableOperator};
+use crate::dataflow::schedulable::{
+    ActivationOutcome, ChannelFactory, ChannelEndpoints, OperatorFactory, SchedulableOperator,
+};
 use crate::dataflow::stage::StageId;
 use crate::error::{DataflowError, Error, Result};
 use crate::progress::frontier::Antichain;
 use crate::progress::frontier_aggregator::FrontierAggregator;
 use crate::progress::notificator::Notificator;
-use crate::progress::subgraph::ProgressTracker;
+use crate::progress::subgraph::{ProgressTracker, SubgraphBuilder};
 use crate::progress::timestamp::Timestamp;
+use crate::worker::WorkerContext;
 
 /// The runtime execution engine for a single `(stage, worker_index)` pair.
 ///
@@ -79,6 +86,256 @@ pub(crate) struct ExchangeOutput<T: Timestamp> {
     last_sent_frontier: Antichain<T>,
     /// Whether this output has sent SenderDone.
     done_sent: bool,
+}
+
+/// Creates a `StageExecutor` from pre-filtered operator and channel factories.
+///
+/// This is the stage-scoped equivalent of `materialize_executor()`. It:
+/// 1. Builds intra-stage channels from the provided channel factories
+/// 2. Wires channel endpoints to operators
+/// 3. Invokes operator factories to create concrete operators
+/// 4. Builds a per-stage `ProgressTracker` from the `SubgraphBuilder`
+/// 5. Returns a ready-to-run `StageExecutor`
+///
+/// Exchange channels (cross-stage) are NOT created here — the caller
+/// creates them and provides `ExchangeInput`/`ExchangeOutput` objects.
+///
+/// **Caller responsibility (PR4):** For boundary operators that have both
+/// intra-stage and exchange ports, the caller must include exchange channel
+/// factories in `channel_factories` so all operator ports get wired.
+///
+/// **TODO(PR4):** Exchange frontier updates bypass the ProgressTracker,
+/// so probe updates for exchange-input operators may lag. Either feed
+/// exchange frontiers into the tracker or update probes directly from
+/// exchange input state.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn materialize_stage_executor<T: Timestamp>(
+    stage_id: StageId,
+    worker_index: usize,
+    graph: &DataflowGraph,
+    stage_operator_indices: &[usize],
+    operator_factories: &mut [(usize, OperatorFactory)],
+    channel_factories: &mut [(usize, ChannelFactory)],
+    mut subgraph_builder: SubgraphBuilder<T>,
+    cancel: CancellationToken,
+    wake_handle: WakeHandle,
+    worker_context: &WorkerContext,
+    config: ExecutorConfig,
+    exchange_inputs: Vec<ExchangeInput<T>>,
+    exchange_outputs: Vec<ExchangeOutput<T>>,
+    probes: Vec<(usize, ProbeHandle<T>)>,
+    probe_notifiers: Vec<crate::dataflow::probe::ProbeNotifier<T>>,
+) -> Result<StageExecutor<T>> {
+    let stage_operator_set: HashSet<usize> = stage_operator_indices.iter().copied().collect();
+    subgraph_builder.retain_operators(&stage_operator_set);
+
+    let intra_stage_edges: Vec<(usize, &crate::dataflow::graph::EdgeInfo)> = graph
+        .edges()
+        .iter()
+        .enumerate()
+        .filter(|(_, edge)| {
+            stage_operator_set.contains(&edge.source.operator_index)
+                && stage_operator_set.contains(&edge.target.operator_index)
+        })
+        .collect();
+    let intra_stage_feedback_edges: Vec<(usize, &crate::dataflow::graph::EdgeInfo)> = graph
+        .feedback_edges()
+        .iter()
+        .enumerate()
+        .filter(|(_, edge)| {
+            stage_operator_set.contains(&edge.source.operator_index)
+                && stage_operator_set.contains(&edge.target.operator_index)
+        })
+        .map(|(idx, edge)| (graph.edges().len() + idx, edge))
+        .collect();
+
+    let factory_positions: HashMap<usize, usize> = channel_factories
+        .iter()
+        .enumerate()
+        .map(|(pos, (edge_idx, _))| (*edge_idx, pos))
+        .collect();
+    let mut push_ends: HashMap<usize, Box<dyn Any + Send>> = HashMap::new();
+    let mut pull_ends: HashMap<usize, Box<dyn Any + Send>> = HashMap::new();
+
+    for (edge_idx, _) in intra_stage_edges
+        .iter()
+        .chain(intra_stage_feedback_edges.iter())
+        .copied()
+    {
+        let pos = *factory_positions
+            .get(&edge_idx)
+            .ok_or_else(|| Error::Dataflow(DataflowError::MissingFactory { edge_index: edge_idx }))?;
+        let (_, factory) = &mut channel_factories[pos];
+        let (push, pull) = factory.build(worker_context, Some(wake_handle.clone()))?;
+        push_ends.insert(edge_idx, push);
+        pull_ends.insert(edge_idx, pull);
+    }
+
+    let mut op_input_pullers: HashMap<usize, Vec<(usize, Box<dyn Any + Send>)>> = HashMap::new();
+    let mut op_output_pushers: HashMap<usize, Vec<(usize, Box<dyn Any + Send>)>> = HashMap::new();
+
+    for (edge_idx, edge) in &intra_stage_edges {
+        let pull = pull_ends.remove(edge_idx).ok_or_else(|| {
+            Error::Dataflow(DataflowError::InvalidGraph(
+                "edge endpoint missing or already materialized".into(),
+            ))
+        })?;
+        let push = push_ends.remove(edge_idx).ok_or_else(|| {
+            Error::Dataflow(DataflowError::InvalidGraph(
+                "edge endpoint missing or already materialized".into(),
+            ))
+        })?;
+
+        op_input_pullers
+            .entry(edge.target.operator_index)
+            .or_default()
+            .push((edge.target.slot_index, pull));
+        op_output_pushers
+            .entry(edge.source.operator_index)
+            .or_default()
+            .push((edge.source.slot_index, push));
+    }
+
+    for (edge_idx, edge) in &intra_stage_feedback_edges {
+        let pull = pull_ends.remove(edge_idx).ok_or_else(|| {
+            Error::Dataflow(DataflowError::InvalidGraph(
+                "edge endpoint missing or already materialized".into(),
+            ))
+        })?;
+        let push = push_ends.remove(edge_idx).ok_or_else(|| {
+            Error::Dataflow(DataflowError::InvalidGraph(
+                "edge endpoint missing or already materialized".into(),
+            ))
+        })?;
+
+        op_input_pullers
+            .entry(edge.target.operator_index)
+            .or_default()
+            .push((edge.target.slot_index, pull));
+        op_output_pushers
+            .entry(edge.source.operator_index)
+            .or_default()
+            .push((edge.source.slot_index, push));
+    }
+
+    let progress_reporters: Option<Arc<dyn Any + Send + Sync>> = Some(
+        Arc::new(subgraph_builder.materialization_reporters()) as Arc<dyn Any + Send + Sync>
+    );
+
+    let mut factory_positions: Vec<usize> = operator_factories
+        .iter()
+        .enumerate()
+        .filter_map(|(pos, (op_idx, _))| stage_operator_set.contains(op_idx).then_some(pos))
+        .collect();
+    factory_positions.sort_by_key(|&pos| operator_factories[pos].0);
+
+    let mut operators: Vec<Box<dyn SchedulableOperator>> = Vec::with_capacity(factory_positions.len());
+    let mut index_to_pos: HashMap<usize, usize> = HashMap::with_capacity(factory_positions.len());
+    for factory_pos in factory_positions {
+        let (op_idx, factory) = &mut operator_factories[factory_pos];
+        let op_idx = *op_idx;
+
+        let mut inputs = op_input_pullers.remove(&op_idx).unwrap_or_default();
+        inputs.sort_by_key(|(port, _)| *port);
+        let input_pullers = inputs.into_iter().map(|(_, pull)| pull).collect();
+
+        let mut outputs = op_output_pushers.remove(&op_idx).unwrap_or_default();
+        outputs.sort_by_key(|(port, _)| *port);
+        let output_pushers = outputs.into_iter().map(|(_, push)| push).collect();
+
+        let endpoints = ChannelEndpoints {
+            input_pullers,
+            output_pushers,
+            wake_handle: Some(wake_handle.clone()),
+            progress_reporters: progress_reporters.clone(),
+        };
+
+        let operator = factory.build(worker_context, endpoints)?;
+        index_to_pos.insert(op_idx, operators.len());
+        operators.push(operator);
+    }
+
+    let mut tracker = subgraph_builder.build();
+    tracker.initialize()?;
+
+    // Build unique operator-pair edges for topological sort (Kahn's algorithm).
+    // Multiple graph edges between the same operator pair (different ports) must
+    // be counted as a single dependency edge to avoid false cycle detection.
+    let mut edge_set: HashSet<(usize, usize)> = HashSet::new();
+    for edge in &intra_stage_edges {
+        let edge = edge.1;
+        if index_to_pos.contains_key(&edge.source.operator_index)
+            && index_to_pos.contains_key(&edge.target.operator_index)
+        {
+            edge_set.insert((edge.source.operator_index, edge.target.operator_index));
+        }
+    }
+
+    let mut in_degree: HashMap<usize, usize> = index_to_pos.keys().copied().map(|idx| (idx, 0)).collect();
+    let mut successors: HashMap<usize, Vec<usize>> = HashMap::new();
+    for (source, target) in &edge_set {
+        successors.entry(*source).or_default().push(*target);
+        *in_degree.entry(*target).or_insert(0) += 1;
+    }
+    for next in successors.values_mut() {
+        next.sort_unstable();
+    }
+
+    let mut zero_in_degree: Vec<usize> = in_degree
+        .iter()
+        .filter_map(|(idx, degree)| (*degree == 0).then_some(*idx))
+        .collect();
+    zero_in_degree.sort_unstable();
+    let mut queue: VecDeque<usize> = zero_in_degree.into();
+    let mut fused_order = Vec::with_capacity(operators.len());
+
+    while let Some(op_idx) = queue.pop_front() {
+        let pos = *index_to_pos.get(&op_idx).ok_or_else(|| {
+            Error::Dataflow(DataflowError::InvalidGraph(format!(
+                "stage {stage_id} missing materialized operator for index {op_idx}",
+            )))
+        })?;
+        fused_order.push(pos);
+
+        if let Some(targets) = successors.get(&op_idx) {
+            for &target in targets {
+                if let Some(degree) = in_degree.get_mut(&target) {
+                    *degree -= 1;
+                    if *degree == 0 {
+                        queue.push_back(target);
+                    }
+                }
+            }
+        }
+    }
+
+    if fused_order.len() != operators.len() {
+        return Err(Error::Dataflow(DataflowError::InvalidGraph(format!(
+            "Cycle detected in stage {stage_id}: processed {} of {} operators",
+            fused_order.len(),
+            operators.len()
+        ))));
+    }
+
+    let notificators = std::iter::repeat_with(|| None)
+        .take(operators.len())
+        .collect::<Vec<Option<Notificator<T>>>>();
+
+    Ok(StageExecutor::new(
+        stage_id,
+        worker_index,
+        operators,
+        fused_order,
+        cancel,
+        config,
+        exchange_inputs,
+        exchange_outputs,
+        Some(tracker),
+        notificators,
+        probes,
+        probe_notifiers,
+        wake_handle,
+    ))
 }
 
 impl<T: Timestamp> StageExecutor<T> {
@@ -560,6 +817,9 @@ fn extract_panic_message(payload: &Box<dyn std::any::Any + Send>) -> String {
 mod tests {
     use super::*;
 
+    use crate::dataflow::graph::OperatorInfo;
+    use crate::progress::operate::PortConnectivity;
+
     struct MockOperator {
         name: String,
         index: usize,
@@ -716,6 +976,93 @@ mod tests {
         assert_eq!(executor.done, vec![false]);
         assert_eq!(executor.exchange_inputs.len(), 1);
         assert_eq!(executor.exchange_outputs.len(), 1);
+    }
+
+    #[test]
+    fn materialize_stage_executor_empty_stage() {
+        let graph = DataflowGraph::new();
+        graph.validate().unwrap();
+
+        let executor = materialize_stage_executor::<u64>(
+            StageId::new(11),
+            0,
+            &graph,
+            &[],
+            &mut [],
+            &mut [],
+            SubgraphBuilder::new(0, 0),
+            CancellationToken::new(),
+            WakeHandle::new(),
+            &WorkerContext::single(),
+            ExecutorConfig::default(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+        )
+        .unwrap();
+
+        assert_eq!(executor.stage_id(), StageId::new(11));
+        assert!(executor.operators.is_empty());
+        assert!(executor.fused_order.is_empty());
+        assert!(executor.done.is_empty());
+        assert!(executor.progress_tracker.is_some());
+    }
+
+    #[test]
+    fn materialize_stage_executor_single_operator() {
+        let stage_id = StageId::new(12);
+        let mut graph = DataflowGraph::new();
+        graph.register_operator(OperatorInfo::new(1, "solo", stage_id, 0, 0))
+            .unwrap();
+        graph.validate().unwrap();
+
+        let mut operator_factories = [(
+            1usize,
+            OperatorFactory::new(move |_ctx, endpoints| {
+                assert!(endpoints.input_pullers.is_empty());
+                assert!(endpoints.output_pushers.is_empty());
+                assert!(endpoints.progress_reporters.is_some());
+                Ok(Box::new(MockOperator {
+                    name: "solo".to_string(),
+                    index: 1,
+                    stage_id,
+                    done: false,
+                }) as Box<dyn SchedulableOperator>)
+            }),
+        )];
+        let mut subgraph_builder = SubgraphBuilder::new(0, 0);
+        subgraph_builder
+            .add_operator(1, "solo", 0, 0, PortConnectivity::new(0, 0))
+            .unwrap();
+
+        let executor = materialize_stage_executor::<u64>(
+            stage_id,
+            0,
+            &graph,
+            &[1],
+            &mut operator_factories,
+            &mut [],
+            subgraph_builder,
+            CancellationToken::new(),
+            WakeHandle::new(),
+            &WorkerContext::single(),
+            ExecutorConfig::default(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+        )
+        .unwrap();
+
+        assert_eq!(executor.stage_id(), stage_id);
+        assert_eq!(executor.worker_index(), 0);
+        assert_eq!(executor.operators.len(), 1);
+        assert_eq!(executor.fused_order, vec![0]);
+        assert_eq!(executor.done, vec![false]);
+        assert_eq!(executor.notificators.len(), 1);
+        assert!(executor.notificators[0].is_none());
+        assert!(executor.progress_tracker.is_some());
     }
 
     #[test]
