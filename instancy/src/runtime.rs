@@ -1977,339 +1977,6 @@ impl RuntimeHandle {
         Ok(multi)
     }
 
-    /// Internal implementation for [`spawn_staged`](Self::spawn_staged).
-    ///
-    /// Creates per-stage worker groups with heterogeneous parallelism.
-    /// Exchange edges between stages with different parallelism use M×N
-    /// asymmetric channels.
-    #[allow(clippy::too_many_arguments, dead_code)]
-    fn spawn_staged_internal<T, F>(
-        &self,
-        name: &str,
-        default_parallelism: usize,
-        build: F,
-        mode: ChannelMode,
-        metrics_config: crate::metrics::MetricsConfig,
-        priority: u32,
-        external_cancel: Option<tokio_util::sync::CancellationToken>,
-        drain_timeout: Option<std::time::Duration>,
-    ) -> Result<MultiSpawnedDataflow<T>>
-    where
-        T: Timestamp,
-        F: Fn(&mut DataflowBuilder<T>) -> Result<()>,
-    {
-        if default_parallelism == 0 {
-            return Err(Error::Runtime(RuntimeError::InvalidConfig(
-                "default_parallelism must be >= 1".into(),
-            )));
-        }
-
-        // Phase 1: Build one dataflow to analyze stage structure.
-        let mut probe_builder = DataflowBuilder::new(format!("{name}/probe"));
-        build(&mut probe_builder)?;
-        let probe_df = probe_builder.build()?;
-        let stages = probe_df.stages().to_vec();
-
-        if stages.is_empty() {
-            // No stages inferred (trivial graph) — fall back to spawn_multi.
-            return self.spawn_multi_internal(
-                name,
-                default_parallelism,
-                build,
-                mode,
-                metrics_config,
-                priority,
-                external_cancel,
-                drain_timeout,
-            );
-        }
-
-        // Determine per-stage parallelism.
-        let stage_parallelism: Vec<usize> = stages
-            .iter()
-            .map(|s| s.parallelism.unwrap_or(default_parallelism))
-            .collect();
-
-        let num_workers = *stage_parallelism
-            .iter()
-            .max()
-            .unwrap_or(&default_parallelism);
-
-        if num_workers == 0 {
-            return Err(Error::Runtime(RuntimeError::InvalidConfig(
-                "computed num_workers must be >= 1".into(),
-            )));
-        }
-
-        // If all stages have the same parallelism, use normal spawn_multi.
-        if stage_parallelism.iter().all(|&p| p == num_workers) {
-            return self.spawn_multi_internal(
-                name,
-                num_workers,
-                build,
-                mode,
-                metrics_config,
-                priority,
-                external_cancel,
-                drain_timeout,
-            );
-        }
-
-        // Phase 2: Build all num_workers dataflows from the closure.
-        // We drop the probe dataflow and rebuild fresh copies.
-        drop(probe_df);
-        let mut dataflows = Vec::with_capacity(num_workers);
-        for worker_idx in 0..num_workers {
-            let mut builder = DataflowBuilder::new(format!("{name}/worker-{worker_idx}"));
-            build(&mut builder)?;
-            let mut df = builder.build()?;
-            df.collect_metrics = metrics_config.operator_summary;
-            df.channel_counters = metrics_config.channel_counters;
-            df.activation_timeline = metrics_config.activation_timeline;
-            df.frontier_timeline = metrics_config.frontier_timeline;
-            df.transfer_timeline = metrics_config.transfer_timeline;
-            df.min_activation_duration = metrics_config.min_activation_duration;
-            df.max_timeline_events = metrics_config.max_timeline_events;
-            df.drain_timeout = drain_timeout;
-            dataflows.push(df);
-        }
-
-        // Phase 3: Validate topologies match across workers.
-        if num_workers > 1 {
-            validate_multi_worker_topologies(&dataflows)?;
-        }
-
-        // Phase 4: Wire up exchange channels with per-stage parallelism.
-        // For each exchange edge, determine source/target stage parallelism
-        // and create asymmetric M×N channels.
-        if num_workers > 1 {
-            let edges = dataflows[0].graph.edges().to_vec();
-            let creators = std::mem::take(&mut dataflows[0].exchange_creators);
-            let mut all_channel_collectors = Vec::new();
-
-            for (edge_idx, edge_capacity, mut creator) in creators {
-                // edge_idx is the index into graph.edges().
-                let (source_par, target_par) = if edge_idx < edges.len() {
-                    let einfo = &edges[edge_idx];
-                    let src_stage = einfo.source_stage.index();
-                    let tgt_stage = einfo.target_stage.index();
-                    let src_p = stage_parallelism
-                        .get(src_stage)
-                        .copied()
-                        .unwrap_or(default_parallelism);
-                    let tgt_p = stage_parallelism
-                        .get(tgt_stage)
-                        .copied()
-                        .unwrap_or(default_parallelism);
-                    (src_p, tgt_p)
-                } else {
-                    // Fallback: can't determine stages, use num_workers for both.
-                    (num_workers, num_workers)
-                };
-
-                let ch_metrics = if metrics_config.channel_counters {
-                    let c = std::sync::Arc::new(crate::metrics::ChannelMetricsCollector::new(
-                        edge_idx,
-                        format!("exchange[{edge_idx}]"),
-                    ));
-                    all_channel_collectors.push(std::sync::Arc::clone(&c));
-                    Some(c)
-                } else {
-                    None
-                };
-                let shared_factories = creator(source_par, target_par, edge_capacity, ch_metrics);
-                let expected_count = std::cmp::max(source_par, target_par);
-                if shared_factories.len() != expected_count {
-                    return Err(Error::Runtime(RuntimeError::InvalidConfig(format!(
-                        "exchange factory creator for edge {edge_idx} produced {} factories, \
-                         expected {} (max of source_par={}, target_par={})",
-                        shared_factories.len(),
-                        expected_count,
-                        source_par,
-                        target_par
-                    ))));
-                }
-
-                // Distribute factories to workers. Workers beyond max(M,N)
-                // keep their placeholder (no-op) channel factories.
-                for (slot_idx, factory) in shared_factories.into_iter().enumerate() {
-                    if slot_idx < num_workers {
-                        let pos = dataflows[slot_idx]
-                            .channel_factories
-                            .iter()
-                            .position(|(idx, _)| *idx == edge_idx)
-                            .ok_or_else(|| {
-                                Error::Runtime(RuntimeError::InvalidConfig(format!(
-                                    "exchange edge {edge_idx} not found in worker {slot_idx}'s \
-                                     channel factories"
-                                )))
-                            })?;
-                        dataflows[slot_idx].channel_factories[pos].1 = factory;
-                    }
-                }
-            }
-            // Store channel metrics collectors on all worker dataflows.
-            if !all_channel_collectors.is_empty() {
-                for df in dataflows.iter_mut() {
-                    df.channel_metrics_collectors = all_channel_collectors.clone();
-                }
-            }
-
-            // Drain unused exchange_creators from other workers.
-            for df in dataflows.iter_mut().skip(1) {
-                df.exchange_creators.clear();
-            }
-        }
-
-        // Phase 4b: Per-stage materialization — strip non-participating
-        // operators and channels from each worker's dataflow.
-        // Worker `w` participates in stage `s` iff `w < stage_parallelism[s]`.
-        {
-            use crate::dataflow::stage::StageId;
-            for (worker_idx, dataflow) in dataflows.iter_mut().enumerate() {
-                let participating: std::collections::HashSet<StageId> = stages
-                    .iter()
-                    .enumerate()
-                    .filter(|(stage_idx, _)| worker_idx < stage_parallelism[*stage_idx])
-                    .map(|(_, s)| s.id)
-                    .collect();
-                dataflow.retain_stages(&participating);
-            }
-        }
-
-        // Phase 5: Create per-worker wake handles and progress exchange channels.
-        let wake_handles: Vec<WakeHandle> = (0..num_workers).map(|_| WakeHandle::new()).collect();
-
-        let mut progress_channels = if num_workers > 1 {
-            create_progress_channels::<T>(num_workers, &wake_handles)?
-        } else {
-            Vec::new()
-        };
-
-        // Phase 5b: Create cross-worker control broadcast channel.
-        let dataflow_cancel = if num_workers > 1 {
-            Some(self.cancel.child_token())
-        } else {
-            None
-        };
-        let mut control_pairs: Vec<Option<(ControlSender, ControlReceiver)>> = if num_workers > 1 {
-            // SAFETY: dataflow_cancel is unconditionally set before entering multi-worker spawn
-            let df_cancel = dataflow_cancel
-                .as_ref()
-                .expect("dataflow_cancel set for multi-worker")
-                .clone();
-            let (senders, receivers) =
-                ControlBroadcast::new(num_workers, &wake_handles, df_cancel)?;
-            senders
-                .into_iter()
-                .zip(receivers)
-                .map(|(s, r)| Some((s, r)))
-                .collect()
-        } else {
-            (0..num_workers).map(|_| None).collect()
-        };
-
-        // Phase 6: Materialize all workers.
-        let dataflow_id = DataflowId::new();
-        let mut prepared = Vec::with_capacity(num_workers);
-        let mut spawned_count = 0usize;
-
-        // Shared timeline start for cross-worker comparable offsets.
-        let timeline_start = if metrics_config.activation_timeline {
-            Some(std::time::Instant::now())
-        } else {
-            None
-        };
-
-        for (worker_idx, dataflow) in dataflows.iter_mut().enumerate() {
-            let ctx = WorkerContext::new(worker_idx, num_workers)?;
-            let pc = if !progress_channels.is_empty() {
-                Some(std::mem::replace(
-                    &mut progress_channels[worker_idx],
-                    WorkerProgressChannels {
-                        senders: Vec::new(),
-                        receivers: Vec::new(),
-                    },
-                ))
-            } else {
-                None
-            };
-            let wh = wake_handles[worker_idx].clone();
-            let ctrl = control_pairs[worker_idx].take();
-            match self.prepare_worker(
-                dataflow,
-                mode,
-                ctx,
-                pc,
-                Some(wh),
-                dataflow_cancel.clone(),
-                ctrl,
-                timeline_start,
-            ) {
-                Ok(worker) => {
-                    prepared.push(worker);
-                    spawned_count += 1;
-                }
-                Err(e) => {
-                    for (w, _, _) in &prepared {
-                        w.cancel
-                            .cancel_with_reason(CancellationReason::WorkerFailed {
-                                detail: format!("sibling worker {spawned_count} failed to spawn"),
-                            });
-                    }
-                    return Err(Error::Runtime(RuntimeError::SpawnFailed {
-                        context: format!("failed to spawn worker {spawned_count}"),
-                        source: Some(std::io::Error::other(e.to_string())),
-                    }));
-                }
-            }
-        }
-
-        // Phase 7: Register all workers.
-        let mut workers = Vec::with_capacity(num_workers);
-        for (spawned, executor, mut notifier) in prepared {
-            self.active_count
-                .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
-            let active_count = Arc::clone(&self.active_count);
-            let idle_notify = Arc::clone(&self.idle_notify);
-            notifier.set_on_complete(Box::new(move || {
-                let prev = active_count.fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
-                if prev == 1 {
-                    idle_notify.notify_waiters();
-                }
-            }));
-            self.registry
-                .register(executor, notifier, dataflow_id, priority);
-            workers.push(spawned);
-        }
-
-        let multi = MultiSpawnedDataflow {
-            name: name.to_string(),
-            num_workers,
-            workers,
-            _dataflow_cancel: dataflow_cancel.clone(),
-            _phantom: PhantomData,
-        };
-
-        // Bridge external cancellation token.
-        if let Some(user_token) = external_cancel {
-            let cancel = if let Some(ref dc) = multi._dataflow_cancel {
-                dc.clone()
-            } else {
-                multi.workers[0].cancel.clone()
-            };
-            self.tokio_handle.spawn(async move {
-                tokio::select! {
-                    _ = user_token.cancelled() => {
-                        cancel.cancel_with_reason(CancellationReason::UserRequested);
-                    }
-                    _ = cancel.cancelled_async() => {}
-                }
-            });
-        }
-
-        Ok(multi)
-    }
 
     #[allow(clippy::too_many_arguments)]
     fn spawn_staged_se_internal<T, F>(
@@ -2517,32 +2184,52 @@ impl RuntimeHandle {
             let worker_name = dataflow.name().to_string();
             let base_factory_count = dataflow.operator_factories.len();
 
-            // TODO(PR6): Filter input/output/async wiring by participating stages.
-            // Currently, all workers get input_senders even for stages they don't
-            // participate in (e.g., worker 1 in a par=1 input stage). This inflates
-            // external_inputs_open and exposes phantom InputSender handles. The old
-            // spawn_staged_internal used retain_stages() to clean these up.
+            // Build operator → stage_id lookup for filtering I/O ports by participation.
+            let op_to_stage: HashMap<usize, StageId> = stages
+                .iter()
+                .flat_map(|s| s.operator_indices.iter().map(move |&idx| (idx, s.id)))
+                .collect();
+
+            // Wire input ports. All workers get an InputSender handle (so
+            // take_input succeeds), but only participating workers get the
+            // operator factory and count toward external_inputs_open.
             let mut input_senders: Vec<(String, &'static str, Box<dyn std::any::Any + Send>)> =
                 Vec::new();
-            let mut input_count = dataflow.input_port_wiring.len();
+            let mut input_count = 0usize;
             let input_ports = &dataflow.input_ports;
             let operator_factories = &mut dataflow.operator_factories;
             for (info, wiring) in input_ports
                 .iter()
                 .zip(dataflow.input_port_wiring.iter_mut())
             {
+                let stage_id = op_to_stage.get(&info.operator_index).copied();
+                let stage_par = stage_id
+                    .and_then(|sid| stage_parallelism_by_id.get(&sid))
+                    .copied()
+                    .unwrap_or(num_workers);
                 let (factory, sender_any) =
                     wiring(Arc::clone(&external_inputs_open), wake_handle.clone(), mode);
-                operator_factories.push((info.operator_index, factory));
+                if worker_idx < stage_par {
+                    operator_factories.push((info.operator_index, factory));
+                    input_count += 1;
+                }
+                // Always expose the sender handle so take_input works.
+                // Non-participating senders are immediately droppable.
                 input_senders.push((info.name.clone(), info.type_name, sender_any));
             }
 
             let mut pump_tasks: Vec<Box<dyn FnOnce() + Send>> = Vec::new();
             {
-                let async_count = dataflow.async_source_wiring.len();
-                input_count += async_count;
                 let operator_factories = &mut dataflow.operator_factories;
                 for (op_idx, wiring) in dataflow.async_source_wiring.iter_mut() {
+                    let stage_id = op_to_stage.get(op_idx).copied();
+                    let stage_par = stage_id
+                        .and_then(|sid| stage_parallelism_by_id.get(&sid))
+                        .copied()
+                        .unwrap_or(num_workers);
+                    if worker_idx >= stage_par {
+                        continue;
+                    }
                     let (factory, pump) = wiring(
                         Arc::clone(&external_inputs_open),
                         wake_handle.clone(),
@@ -2550,6 +2237,7 @@ impl RuntimeHandle {
                     );
                     operator_factories.push((*op_idx, factory));
                     pump_tasks.push(pump);
+                    input_count += 1;
                 }
             }
 
@@ -2561,12 +2249,22 @@ impl RuntimeHandle {
                 .iter()
                 .zip(dataflow.output_port_wiring.iter_mut())
             {
+                let stage_id = op_to_stage.get(&info.operator_index).copied();
+                let stage_par = stage_id
+                    .and_then(|sid| stage_parallelism_by_id.get(&sid))
+                    .copied()
+                    .unwrap_or(num_workers);
                 let (replacement_factory, receiver_any) = wiring(mode, Some(wake_handle.clone()));
-                if let Some(pos) = operator_factories
-                    .iter()
-                    .position(|(idx, _)| *idx == info.operator_index)
-                {
-                    operator_factories[pos] = (info.operator_index, replacement_factory);
+                // Only install the factory if this worker participates in
+                // the output operator's stage. Non-participating workers
+                // still get the receiver handle (it will simply be empty).
+                if worker_idx < stage_par {
+                    if let Some(pos) = operator_factories
+                        .iter()
+                        .position(|(idx, _)| *idx == info.operator_index)
+                    {
+                        operator_factories[pos] = (info.operator_index, replacement_factory);
+                    }
                 }
                 output_receivers.push((info.name.clone(), info.type_name, receiver_any));
             }

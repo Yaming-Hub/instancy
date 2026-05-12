@@ -1301,7 +1301,7 @@ With per-stage parallelism:
 
 The user never specifies "local" vs "global" — the runtime infers it from the cluster topology and stage placement. This keeps the logical API clean and topology-agnostic.
 
-**Current status:** Per-stage parallelism is fully implemented. `spawn_multi` with `per_stage_parallelism(true)` (the default) automatically routes to `spawn_staged_internal`, which creates `max(P_i)` workers and strips non-participating operators via `retain_stages()`. Ghost operators maintain correct frontier propagation across stage boundaries.
+**Current status:** Per-stage parallelism is fully implemented via `StageExecutor` — each stage×worker combination runs as an independent executor with inline frontier tracking. `spawn_multi` with `per_stage_parallelism(true)` (the default) creates `max(P_i)` workers, each running a `CombinedStageExecutor` that polls only the stages that worker participates in. Cross-stage data flows through boundary exchange channels; cross-stage feedback loops (from `iterate()` with exchange inside the loop body) use 1:1 feedback boundary channels with dependency tracking for quiescence detection.
 
 
 ## Per-stage parallelism design notes
@@ -1816,12 +1816,14 @@ empty progress messages.
 - Edge index remapping for compacted edge vectors
 - Workers only materialize operators for stages they participate in (PR #196)
 
-### Phase 9: Ghost operators for cross-stage frontier propagation ✅
-- `SubgraphBuilder::mark_ghost_operators()` — keeps shapes and connectivity in
-  reachability graph, but removes initial_capabilities and progress_buffers
-- `ProgressTracker::materialized_indices` — `collect_operator_progress` skips ghosts
-- Peer progress broadcasts propagate through ghost operators to downstream stages
-- Frontier-dependent operators (delay, unary_notify) work correctly across stages (PR #197)
+### Phase 9: Ghost operators for cross-stage frontier propagation ✅ (superseded)
+- Originally: `SubgraphBuilder::mark_ghost_operators()` kept shapes and connectivity in
+  reachability graph for non-participating operators
+- **Superseded by StageExecutor architecture** (PRs #256–#260): each stage×worker runs its
+  own `StageExecutor` with a scoped `ProgressTracker`. No ghost operators needed — progress
+  flows inline through exchange boundary channels with `FrontierUpdate`/`SenderDone` messages.
+- Ghost operator infrastructure (`mark_ghost_operators`, `retain_stages`, `spawn_staged_internal`)
+  removed in PR6 cleanup.
 
 ### Phase 10: Make per_stage_parallelism the default ✅
 - `SpawnOptions::default()` sets `per_stage_parallelism: true`

@@ -276,9 +276,10 @@ impl<T: Timestamp> ProbeHandle<T> {
 
 ## Additional stage-aware progress notes
 
-Per-stage execution keeps progress tracking local to each stage's worker group. Cross-stage frontier movement happens through the exchange boundary, and ghost operators preserve reachability information even for workers that do not materialize a stage locally.
+Per-stage execution keeps progress tracking local to each stage's `StageExecutor`. Each executor has its own `ProgressTracker` scoped to its stage's operators. Cross-stage frontier movement happens through boundary exchange channels that embed `FrontierUpdate` and `SenderDone` messages alongside data.
 
-- Workers in the same stage exchange capability updates with their stage peers.
-- Cross-stage frontiers are aggregated at the exchange boundary rather than by a global all-worker protocol.
-- Ghost operators keep graph shape and path summaries so downstream frontiers remain correct even when a worker does not materialize a stage's executable operators.
+- Each `StageExecutor` tracks frontiers independently via its local `ProgressTracker`.
+- Cross-stage frontiers are aggregated at the exchange boundary by `FrontierAggregator`, which computes `min(all senders)` across all incoming channels.
+- `CombinedStageExecutor` polls all stages for a given worker, detecting global quiescence when all remaining stages converge.
+- Cross-stage feedback loops (from `iterate()` with exchange inside the loop body) use feedback boundary channels with dependency tracking to prevent premature quiescence.
 - Loop restrictions remain explicit: parallelism changes inside iterative scopes are intentionally constrained.
