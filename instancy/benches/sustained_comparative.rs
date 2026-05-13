@@ -4,9 +4,11 @@
 //!
 //! - **Large queries:** Compute-heavy scan/filter/aggregate, PageRank, a 10-stage map
 //!   chain, a multi-epoch filter workload, plus an instancy-only 2-node TCP exchange
-//!   + aggregate benchmark.
+//!   + aggregate benchmark. All shared-memory scenarios partition input data across
+//!   `--threads` workers and use exchange operators to force cross-worker transfer.
 //!
 //! - **High-RPS small queries:** Many tiny dataflow executions issued concurrently.
+//!   Each query also runs as an N-worker exchange pipeline where N = `--threads`.
 //!   instancy uses async task fan-out on a shared runtime with bounded in-flight
 //!   concurrency, timely uses a fixed worker-thread pool capped by `--threads`, and
 //!   instancy also includes an instancy-only 2-node TCP exchange small-pipeline run.
@@ -36,8 +38,9 @@ use std::hint::black_box;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use instancy::communication::ClusterSpawnTransport;
+use instancy::communication::codec::{Codec, CodecError};
 use instancy::communication::transport_session::PeerConnection;
+use instancy::communication::{ClusterSpawnTransport, ExchangeData};
 use instancy::{
     ClusterTopology, DataflowBuilder, DataflowId, NodeConfig, Result as InstancyResult,
     RuntimeConfig, RuntimeHandle, SpawnOptions, TokioMode,
@@ -214,6 +217,67 @@ impl<'de> serde::Deserialize<'de> for LineItem {
     }
 }
 
+#[derive(Clone, Default)]
+struct LineItemCodec;
+
+impl Codec<LineItem> for LineItemCodec {
+    fn encode(&self, value: &LineItem, buf: &mut Vec<u8>) -> Result<(), CodecError> {
+        buf.extend_from_slice(&value.order_key.to_le_bytes());
+        buf.extend_from_slice(&value.part_key.to_le_bytes());
+        buf.extend_from_slice(&value.quantity.to_le_bytes());
+        buf.extend_from_slice(&value.price.to_le_bytes());
+        buf.extend_from_slice(&value.discount.to_le_bytes());
+        buf.extend_from_slice(&value.tax.to_le_bytes());
+        buf.extend_from_slice(&value.ship_date.to_le_bytes());
+        buf.push(value.return_flag);
+        buf.push(value.line_status);
+        Ok(())
+    }
+
+    fn decode(&self, buf: &[u8]) -> Result<(LineItem, usize), CodecError> {
+        const LINE_ITEM_BYTES: usize = 58;
+        if buf.len() < LINE_ITEM_BYTES {
+            return Err(CodecError::InsufficientData {
+                needed: LINE_ITEM_BYTES,
+                available: buf.len(),
+            });
+        }
+
+        let mut offset = 0usize;
+        let read_u64 = |bytes: &[u8], offset: &mut usize| {
+            let start = *offset;
+            *offset += 8;
+            u64::from_le_bytes(bytes[start..start + 8].try_into().unwrap())
+        };
+        let read_i64 = |bytes: &[u8], offset: &mut usize| {
+            let start = *offset;
+            *offset += 8;
+            i64::from_le_bytes(bytes[start..start + 8].try_into().unwrap())
+        };
+
+        let item = LineItem {
+            order_key: read_u64(buf, &mut offset),
+            part_key: read_u64(buf, &mut offset),
+            quantity: read_i64(buf, &mut offset),
+            price: read_i64(buf, &mut offset),
+            discount: read_i64(buf, &mut offset),
+            tax: read_i64(buf, &mut offset),
+            ship_date: read_u64(buf, &mut offset),
+            return_flag: buf[offset],
+            line_status: buf[offset + 1],
+        };
+        Ok((item, LINE_ITEM_BYTES))
+    }
+}
+
+impl ExchangeData for LineItem {
+    type CodecType = LineItemCodec;
+
+    fn codec() -> Self::CodecType {
+        LineItemCodec
+    }
+}
+
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 struct Edge {
     src: u64,
@@ -269,6 +333,11 @@ fn make_small_batches(iterations: u64, batch_size: u64) -> Vec<(u64, Vec<u64>)> 
         .collect()
 }
 
+fn partition_data<T: Clone>(data: &[T], num_partitions: usize) -> Vec<Vec<T>> {
+    let chunk_size = (data.len() + num_partitions - 1) / num_partitions;
+    data.chunks(chunk_size).map(|c| c.to_vec()).collect()
+}
+
 fn compute_pagerank(edges: &[Edge], num_vertices: u64, iterations: usize) -> Vec<(u64, f64)> {
     let n = num_vertices as usize;
     let mut adjacency = vec![Vec::new(); n];
@@ -321,6 +390,7 @@ struct RunStats {
     wall_duration: Duration,
     cpu_user_delta_ms: f64,
     cpu_kernel_delta_ms: f64,
+    core_time_ns: u64,
 }
 
 impl RunStats {
@@ -333,6 +403,7 @@ impl RunStats {
             wall_duration: Duration::ZERO,
             cpu_user_delta_ms: 0.0,
             cpu_kernel_delta_ms: 0.0,
+            core_time_ns: 0,
         }
     }
 
@@ -363,6 +434,10 @@ impl RunStats {
             return 0;
         }
         self.latencies_us.iter().sum::<u64>() / self.latencies_us.len() as u64
+    }
+
+    fn core_seconds(&self) -> f64 {
+        self.core_time_ns as f64 / 1_000_000_000.0
     }
 
     fn peak_memory_mb(&self) -> f64 {
@@ -407,6 +482,11 @@ impl RunStats {
             self.cpu_kernel_delta_ms,
             self.cpu_user_delta_ms + self.cpu_kernel_delta_ms,
         );
+        println!(
+            "  Core time: {:.3}s ({:.1} core-sec/query)",
+            self.core_seconds(),
+            self.core_seconds() / self.queries_completed().max(1) as f64,
+        );
         println!("  Wall time: {:.1}s", self.wall_duration.as_secs_f64());
     }
 }
@@ -424,6 +504,7 @@ struct SummaryRow {
     avg_mem_mb: f64,
     peak_mem_mb: f64,
     cpu_total_ms: f64,
+    core_secs: f64,
 }
 
 impl SummaryRow {
@@ -440,6 +521,7 @@ impl SummaryRow {
             avg_mem_mb: stats.avg_memory_mb(),
             peak_mem_mb: stats.peak_memory_mb(),
             cpu_total_ms: stats.cpu_user_delta_ms + stats.cpu_kernel_delta_ms,
+            core_secs: stats.core_seconds(),
         }
     }
 }
@@ -448,7 +530,7 @@ impl fmt::Display for SummaryRow {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(
             f,
-            "  {:<22} {:<9} {:>8} {:>10.1} {:>9} {:>9} {:>9} {:>9} {:>8.1} {:>8.1} {:>12.0}",
+            "  {:<22} {:<9} {:>8} {:>10.1} {:>9} {:>9} {:>9} {:>9} {:>8.1} {:>8.1} {:>12.0} {:>9.3}",
             self.scenario,
             self.library,
             self.queries,
@@ -460,153 +542,295 @@ impl fmt::Display for SummaryRow {
             self.avg_mem_mb,
             self.peak_mem_mb,
             self.cpu_total_ms,
+            self.core_secs,
         )
     }
 }
 
 fn print_summary_table(rows: &[SummaryRow]) {
-    println!("\n{}", "=".repeat(130));
+    println!("\n{}", "=".repeat(141));
     println!("  SUSTAINED BENCHMARK COMPARISON SUMMARY");
-    println!("{}", "=".repeat(130));
+    println!("{}", "=".repeat(141));
     println!(
-        "  {:<22} {:<9} {:>8} {:>10} {:>9} {:>9} {:>9} {:>9} {:>8} {:>8} {:>12}",
-        "Scenario", "Library", "Queries", "QPS", "p50µs", "p95µs", "p99µs", "maxµs", "avgMB", "peakMB", "cpuTotalMs"
+        "  {:<22} {:<9} {:>8} {:>10} {:>9} {:>9} {:>9} {:>9} {:>8} {:>8} {:>12} {:>9}",
+        "Scenario", "Library", "Queries", "QPS", "p50µs", "p95µs", "p99µs", "maxµs", "avgMB", "peakMB", "cpuTotalMs", "coreSec"
     );
-    println!("  {}", "-".repeat(126));
+    println!("  {}", "-".repeat(137));
     for row in rows {
         println!("{row}");
     }
-    println!("{}", "=".repeat(130));
+    println!("{}", "=".repeat(141));
+}
+
+fn collect_multi_worker_metrics(
+    multi: &mut instancy::runtime::MultiSpawnedDataflow<u64>,
+) -> Vec<Arc<instancy::metrics::DataflowMetrics>> {
+    (0..multi.num_workers())
+        .filter_map(|worker_idx| multi.worker_mut(worker_idx).metrics().cloned())
+        .collect()
+}
+
+fn total_metrics_core_time(metrics: &[Arc<instancy::metrics::DataflowMetrics>]) -> Duration {
+    metrics.iter().map(|metrics| metrics.total_cpu_time()).sum()
+}
+
+fn sum_thread_times(thread_times: &Arc<std::sync::Mutex<Vec<Duration>>>) -> Duration {
+    thread_times.lock().unwrap().iter().copied().sum()
 }
 
 // =============================================================================
 // Query implementations — instancy
 // =============================================================================
 
-fn instancy_scan_filter_agg(rt: &RuntimeHandle, items: &[LineItem]) {
+fn instancy_scan_filter_agg(
+    rt: &RuntimeHandle,
+    items: &[LineItem],
+    num_workers: usize,
+) -> Duration {
     let cutoff = 11_000u64;
-    let builder = DataflowBuilder::<u64>::new("scan-filter-agg");
-    builder
-        .source("src", vec![(0, items.to_vec())])
-        .filter("date_filter", move |_t, item| item.ship_date < cutoff)
-        .unary_notify::<((u8, u8), (i64, i64)), _>("aggregate", {
-            let mut groups: HashMap<(u8, u8), (i64, i64)> = HashMap::new();
-            move |input, output, ctx| {
-                while let Some((time, data)) = input.next() {
-                    for item in data {
-                        let key = (item.return_flag, item.line_status);
-                        let entry = groups.entry(key).or_default();
-                        entry.0 += item.quantity;
-                        entry.1 += item.price;
-                    }
-                    ctx.notify_at(time);
-                }
-                while let Some(time) = ctx.next_notification() {
-                    let results: Vec<_> = groups.drain().collect();
-                    if !results.is_empty() {
-                        output.push_vec(time, results);
-                    }
-                }
+    let partitions = partition_data(items, num_workers);
+
+    let mut multi = rt
+        .spawn_multi(
+            "scan-filter-agg",
+            num_workers,
+            |builder| {
+                builder
+                    .input::<LineItem>("data")
+                    .unwrap()
+                    .filter("date_filter", move |_t, item| item.ship_date < cutoff)
+                    .exchange_by_hash("exchange", |item: &LineItem| {
+                        (item.return_flag as u64) * 256 + item.line_status as u64
+                    })
+                    .unary_notify::<((u8, u8), (i64, i64)), _>("aggregate", {
+                        let mut groups: HashMap<(u8, u8), (i64, i64)> = HashMap::new();
+                        move |input, output, ctx| {
+                            while let Some((time, data)) = input.next() {
+                                for item in data {
+                                    let key = (item.return_flag, item.line_status);
+                                    let entry = groups.entry(key).or_default();
+                                    entry.0 += item.quantity;
+                                    entry.1 += item.price;
+                                }
+                                ctx.notify_at(time);
+                            }
+                            while let Some(time) = ctx.next_notification() {
+                                let results: Vec<_> = groups.drain().collect();
+                                if !results.is_empty() {
+                                    output.push_vec(time, results);
+                                }
+                            }
+                            Ok(())
+                        }
+                    })
+                    .for_each("sink", |_t, v| {
+                        black_box(v);
+                    });
                 Ok(())
-            }
-        })
-        .for_each("sink", |_t, v| {
-            black_box(v);
-        });
-
-    let dataflow = builder.build().unwrap();
-    rt.spawn(dataflow, SpawnOptions::default())
-        .unwrap()
-        .join_blocking()
+            },
+            SpawnOptions::default().collect_metrics(true),
+        )
         .unwrap();
-}
 
-fn instancy_pagerank(rt: &RuntimeHandle, edges: &[Edge], num_vertices: u64, iterations: usize) {
-    let builder = DataflowBuilder::<u64>::new("pagerank");
-    builder
-        .source("src", vec![(0, edges.to_vec())])
-        .unary_notify::<(u64, f64), _>("pagerank", {
-            let mut buffered = Vec::new();
-            move |input, output, ctx| {
-                while let Some((time, data)) = input.next() {
-                    buffered.extend(data);
-                    ctx.notify_at(time);
-                }
-                while let Some(time) = ctx.next_notification() {
-                    let mut results = compute_pagerank(&buffered, num_vertices, iterations);
-                    if !results.is_empty() {
-                        output.push_vec(time, std::mem::take(&mut results));
-                    }
-                    buffered.clear();
-                }
-                Ok(())
-            }
-        })
-        .for_each("sink", |_t, v| {
-            black_box(v);
-        });
-
-    let dataflow = builder.build().unwrap();
-    rt.spawn(dataflow, SpawnOptions::default())
-        .unwrap()
-        .join_blocking()
-        .unwrap();
-}
-
-fn instancy_map_chain(rt: &RuntimeHandle, values: &[i64], stages: usize) {
-    let builder = DataflowBuilder::<u64>::new("map-chain");
-    let mut pipe = builder.source("src", vec![(0, values.to_vec())]);
-    for idx in 0..stages {
-        pipe = pipe.map(format!("step_{idx}"), |_t, value| value + 1);
+    let senders: Vec<_> = (0..num_workers)
+        .map(|worker_idx| multi.take_input::<LineItem>(worker_idx, "data").unwrap())
+        .collect();
+    for (worker_idx, partition) in partitions.into_iter().enumerate() {
+        senders[worker_idx].send(0, partition).unwrap();
     }
-    pipe.for_each("sink", |_t, v| {
-        black_box(v);
-    });
+    for sender in senders {
+        sender.close();
+    }
 
-    let dataflow = builder.build().unwrap();
-    rt.spawn(dataflow, SpawnOptions::default())
-        .unwrap()
-        .join_blocking()
+    let worker_metrics = collect_multi_worker_metrics(&mut multi);
+    multi.join_blocking().unwrap();
+    total_metrics_core_time(&worker_metrics)
+}
+
+fn instancy_pagerank(
+    rt: &RuntimeHandle,
+    edges: &[Edge],
+    num_vertices: u64,
+    iterations: usize,
+    num_workers: usize,
+) -> Duration {
+    let partitions = partition_data(edges, num_workers);
+
+    let mut multi = rt
+        .spawn_multi(
+            "pagerank",
+            num_workers,
+            |builder| {
+                builder
+                    .input::<Edge>("data")
+                    .unwrap()
+                    .unary_notify::<(u64, f64), _>("pagerank-local", {
+                        let mut buffered = Vec::new();
+                        move |input, output, ctx| {
+                            while let Some((time, data)) = input.next() {
+                                buffered.extend(data);
+                                ctx.notify_at(time);
+                            }
+                            while let Some(time) = ctx.next_notification() {
+                                let results = compute_pagerank(&buffered, num_vertices, iterations);
+                                if !results.is_empty() {
+                                    output.push_vec(time, results);
+                                }
+                                buffered.clear();
+                            }
+                            Ok(())
+                        }
+                    })
+                    .exchange_by_hash("exchange-ranks", |item: &(u64, f64)| item.0)
+                    .for_each("sink", |_t, v| {
+                        black_box(v);
+                    });
+                Ok(())
+            },
+            SpawnOptions::default().collect_metrics(true),
+        )
         .unwrap();
+
+    let senders: Vec<_> = (0..num_workers)
+        .map(|worker_idx| multi.take_input::<Edge>(worker_idx, "data").unwrap())
+        .collect();
+    for (worker_idx, partition) in partitions.into_iter().enumerate() {
+        senders[worker_idx].send(0, partition).unwrap();
+    }
+    for sender in senders {
+        sender.close();
+    }
+
+    let worker_metrics = collect_multi_worker_metrics(&mut multi);
+    multi.join_blocking().unwrap();
+    total_metrics_core_time(&worker_metrics)
 }
 
-async fn instancy_small_pipeline_async(rt: Arc<RuntimeHandle>, batch: Arc<Vec<i64>>) {
-    let completion = {
-        let builder = DataflowBuilder::<u64>::new("small-pipeline");
-        builder
-            .source("src", vec![(0, batch.as_ref().clone())])
-            .map("add1", |_t, x| x + 1)
-            .map("mul2", |_t, x| x * 2)
-            .map("sub1", |_t, x| x - 1)
-            .for_each("sink", |_t, v| {
-                black_box(v);
-            });
+fn instancy_map_chain(
+    rt: &RuntimeHandle,
+    values: &[i64],
+    stages: usize,
+    num_workers: usize,
+) -> Duration {
+    let partitions = partition_data(values, num_workers);
 
-        let dataflow = builder.build().unwrap();
-        rt.spawn(dataflow, SpawnOptions::default()).unwrap().join()
-    };
+    let mut multi = rt
+        .spawn_multi(
+            "map-chain",
+            num_workers,
+            |builder| {
+                let mut pipe = builder.input::<i64>("data").unwrap();
+                for idx in 0..stages {
+                    pipe = pipe.map(format!("step_{idx}"), |_t, value| value + 1);
+                }
+                pipe.exchange_by_hash("exchange", |value: &i64| *value as u64)
+                    .for_each("sink", |_t, v| {
+                        black_box(v);
+                    });
+                Ok(())
+            },
+            SpawnOptions::default().collect_metrics(true),
+        )
+        .unwrap();
 
-    completion.await.unwrap();
+    let senders: Vec<_> = (0..num_workers)
+        .map(|worker_idx| multi.take_input::<i64>(worker_idx, "data").unwrap())
+        .collect();
+    for (worker_idx, partition) in partitions.into_iter().enumerate() {
+        senders[worker_idx].send(0, partition).unwrap();
+    }
+    for sender in senders {
+        sender.close();
+    }
+
+    let worker_metrics = collect_multi_worker_metrics(&mut multi);
+    multi.join_blocking().unwrap();
+    total_metrics_core_time(&worker_metrics)
 }
 
-fn instancy_multi_epoch(rt: &RuntimeHandle, batches: &[(u64, Vec<u64>)], threshold: u64) {
-    let builder = DataflowBuilder::<u64>::new("multi-epoch-filter");
-    builder
-        .input::<u64>("src")
-        .unwrap()
-        .filter("threshold", move |_t, value| *value > threshold)
-        .for_each("sink", |_t, value| {
-            black_box(value);
-        });
+async fn instancy_small_pipeline_async(
+    rt: Arc<RuntimeHandle>,
+    batch: Arc<Vec<i64>>,
+    num_workers: usize,
+) -> Duration {
+    let partitions = partition_data(batch.as_ref(), num_workers);
+    let mut multi = rt
+        .spawn_multi(
+            "small-pipeline",
+            num_workers,
+            |builder| {
+                builder
+                    .input::<i64>("data")
+                    .unwrap()
+                    .map("add1", |_t, x| x + 1)
+                    .map("mul2", |_t, x| x * 2)
+                    .map("sub1", |_t, x| x - 1)
+                    .exchange_by_hash("exchange", |value: &i64| *value as u64)
+                    .for_each("sink", |_t, v| {
+                        black_box(v);
+                    });
+                Ok(())
+            },
+            SpawnOptions::default().collect_metrics(true),
+        )
+        .unwrap();
 
-    let dataflow = builder.build().unwrap();
-    let mut handle = rt.spawn(dataflow, SpawnOptions::default()).unwrap();
-    let sender = handle.take_input::<u64>("src").unwrap();
+    let senders: Vec<_> = (0..num_workers)
+        .map(|worker_idx| multi.take_input::<i64>(worker_idx, "data").unwrap())
+        .collect();
+    for (worker_idx, partition) in partitions.into_iter().enumerate() {
+        senders[worker_idx].send(0, partition).unwrap();
+    }
+    for sender in senders {
+        sender.close();
+    }
+
+    let worker_metrics = collect_multi_worker_metrics(&mut multi);
+    multi.join().await.unwrap();
+    total_metrics_core_time(&worker_metrics)
+}
+
+fn instancy_multi_epoch(
+    rt: &RuntimeHandle,
+    batches: &[(u64, Vec<u64>)],
+    threshold: u64,
+    num_workers: usize,
+) -> Duration {
+    let mut multi = rt
+        .spawn_multi(
+            "multi-epoch-filter",
+            num_workers,
+            |builder| {
+                builder
+                    .input::<u64>("src")
+                    .unwrap()
+                    .filter("threshold", move |_t, value| *value > threshold)
+                    .exchange_by_hash("exchange", |value: &u64| *value)
+                    .for_each("sink", |_t, value| {
+                        black_box(value);
+                    });
+                Ok(())
+            },
+            SpawnOptions::default().collect_metrics(true),
+        )
+        .unwrap();
+
+    let senders: Vec<_> = (0..num_workers)
+        .map(|worker_idx| multi.take_input::<u64>(worker_idx, "src").unwrap())
+        .collect();
     for (time, batch) in batches.iter() {
-        sender.send(*time, batch.clone()).unwrap();
+        let parts = partition_data(batch, num_workers);
+        for (worker_idx, part) in parts.into_iter().enumerate() {
+            senders[worker_idx].send(*time, part).unwrap();
+        }
     }
-    sender.close();
-    handle.join_blocking().unwrap();
+    for sender in senders {
+        sender.close();
+    }
+
+    let worker_metrics = collect_multi_worker_metrics(&mut multi);
+    multi.join_blocking().unwrap();
+    total_metrics_core_time(&worker_metrics)
 }
 
 type TcpPeerConnection = PeerConnection<tokio::net::tcp::OwnedReadHalf, tokio::net::tcp::OwnedWriteHalf>;
@@ -658,6 +882,8 @@ struct ExchangeCluster {
     probe_b: instancy::ProbeHandle<u64>,
     cluster_a: Option<instancy::runtime::ClusterSpawnedDataflow<u64>>,
     cluster_b: Option<instancy::runtime::ClusterSpawnedDataflow<u64>>,
+    metrics_a: Vec<Arc<instancy::metrics::DataflowMetrics>>,
+    metrics_b: Vec<Arc<instancy::metrics::DataflowMetrics>>,
     _rt_a: RuntimeHandle,
     _rt_b: RuntimeHandle,
     tokio_handle: tokio::runtime::Handle,
@@ -735,7 +961,7 @@ impl ExchangeCluster {
                         Duration::from_secs(10),
                         build_a,
                         &ha,
-                        SpawnOptions::default(),
+                        SpawnOptions::default().collect_metrics(true),
                     )
                     .unwrap();
                 (rt, cluster)
@@ -757,7 +983,7 @@ impl ExchangeCluster {
                         Duration::from_secs(10),
                         build_b,
                         &hb,
-                        SpawnOptions::default(),
+                        SpawnOptions::default().collect_metrics(true),
                     )
                     .unwrap();
                 (rt, cluster)
@@ -768,6 +994,18 @@ impl ExchangeCluster {
             (rt_a, cl_a, rt_b, cl_b)
         });
 
+        let metrics_a = cluster_a
+            .all_worker_metrics()
+            .into_iter()
+            .flatten()
+            .cloned()
+            .collect();
+        let metrics_b = cluster_b
+            .all_worker_metrics()
+            .into_iter()
+            .flatten()
+            .cloned()
+            .collect();
         let sender_a = cluster_a.take_input::<(u64, i64)>(0, "data").unwrap();
         let sender_b = cluster_b.take_input::<(u64, i64)>(0, "data").unwrap();
         let probe_a = probe_slot_a.lock().unwrap().take().unwrap();
@@ -780,6 +1018,8 @@ impl ExchangeCluster {
             probe_b,
             cluster_a: Some(cluster_a),
             cluster_b: Some(cluster_b),
+            metrics_a,
+            metrics_b,
             _rt_a: rt_a,
             _rt_b: rt_b,
             tokio_handle: tokio_handle.clone(),
@@ -809,6 +1049,10 @@ impl ExchangeCluster {
                 panic!("exchange epoch {epoch} timed out after 30s — cluster stalled");
             }
         });
+    }
+
+    fn total_core_time(&self) -> Duration {
+        total_metrics_core_time(&self.metrics_a) + total_metrics_core_time(&self.metrics_b)
     }
 
     /// Tear down the cluster.
@@ -858,6 +1102,7 @@ fn run_exchange_aggregate_benchmark(
     // Measurement
     println!("    Measuring for {:.0}s...", duration.as_secs_f64());
     let cpu_before = system_snapshot();
+    let core_time_before = cluster.total_core_time();
     let measure_start = Instant::now();
     let mut query_count = 0u64;
 
@@ -880,9 +1125,13 @@ fn run_exchange_aggregate_benchmark(
     println!();
 
     let cpu_after = system_snapshot();
+    let core_time_after = cluster.total_core_time();
     stats.wall_duration = measure_start.elapsed();
     stats.cpu_user_delta_ms = cpu_after.cpu_user_ms - cpu_before.cpu_user_ms;
     stats.cpu_kernel_delta_ms = cpu_after.cpu_kernel_ms - cpu_before.cpu_kernel_ms;
+    stats.core_time_ns = core_time_after
+        .saturating_sub(core_time_before)
+        .as_nanos() as u64;
     stats.memory_samples_mb.push(system_snapshot().working_set_mb);
 
     // Tear down
@@ -895,18 +1144,28 @@ fn run_exchange_aggregate_benchmark(
 // Query implementations  timely
 // =============================================================================
 
-fn timely_scan_filter_agg(items: &[LineItem]) {
+fn timely_scan_filter_agg(items: &[LineItem], num_workers: usize) -> Duration {
     let cutoff = 11_000u64;
-    let items = items.to_vec();
-    timely::execute_directly(move |worker| {
+    let partitions = Arc::new(partition_data(items, num_workers));
+    let thread_times: Arc<std::sync::Mutex<Vec<Duration>>> =
+        Arc::new(std::sync::Mutex::new(Vec::with_capacity(num_workers)));
+    let tt = Arc::clone(&thread_times);
+    timely::execute(timely::Config::process(num_workers), move |worker| {
         use timely::dataflow::channels::pact::Pipeline;
         use timely::dataflow::operators::generic::Operator;
-        use timely::dataflow::operators::{Filter, Input, Inspect, Probe};
+        use timely::dataflow::operators::{Exchange, Filter, Input, Inspect, Probe};
 
+        let thread_start = Instant::now();
+        let worker_index = worker.index();
+        let partitions = Arc::clone(&partitions);
+        let tt = Arc::clone(&tt);
         let (mut input, probe) = worker.dataflow::<u64, _, _>(|scope| {
             let (input, stream) = scope.new_input::<LineItem>();
             let probe = stream
                 .filter(move |item| item.ship_date < cutoff)
+                .exchange(|item: &LineItem| {
+                    (item.return_flag as u64) * 256 + item.line_status as u64
+                })
                 .unary_notify(Pipeline, "aggregate", None, {
                     let mut groups: HashMap<(u8, u8), (i64, i64)> = HashMap::new();
                     move |input, output, notificator| {
@@ -934,20 +1193,37 @@ fn timely_scan_filter_agg(items: &[LineItem]) {
             (input, probe)
         });
 
-        let mut batch = items;
-        input.send_batch(&mut batch);
+        if let Some(partition) = partitions.get(worker_index) {
+            let mut batch = partition.clone();
+            input.send_batch(&mut batch);
+        }
         input.close();
         worker.step_while(|| !probe.done());
-    });
+        tt.lock().unwrap().push(thread_start.elapsed());
+    })
+    .unwrap();
+    sum_thread_times(&thread_times)
 }
 
-fn timely_pagerank(edges: &[Edge], num_vertices: u64, iterations: usize) {
-    let edges = edges.to_vec();
-    timely::execute_directly(move |worker| {
+fn timely_pagerank(
+    edges: &[Edge],
+    num_vertices: u64,
+    iterations: usize,
+    num_workers: usize,
+) -> Duration {
+    let partitions = Arc::new(partition_data(edges, num_workers));
+    let thread_times: Arc<std::sync::Mutex<Vec<Duration>>> =
+        Arc::new(std::sync::Mutex::new(Vec::with_capacity(num_workers)));
+    let tt = Arc::clone(&thread_times);
+    timely::execute(timely::Config::process(num_workers), move |worker| {
         use timely::dataflow::channels::pact::Pipeline;
         use timely::dataflow::operators::generic::Operator;
-        use timely::dataflow::operators::{Input, Inspect, Probe};
+        use timely::dataflow::operators::{Exchange, Input, Inspect, Probe};
 
+        let thread_start = Instant::now();
+        let worker_index = worker.index();
+        let partitions = Arc::clone(&partitions);
+        let tt = Arc::clone(&tt);
         let (mut input, probe) = worker.dataflow::<u64, _, _>(|scope| {
             let (input, stream) = scope.new_input::<Edge>();
             let probe = stream
@@ -967,6 +1243,7 @@ fn timely_pagerank(edges: &[Edge], num_vertices: u64, iterations: usize) {
                         });
                     }
                 })
+                .exchange(|item: &(u64, f64)| item.0)
                 .inspect(|v| {
                     black_box(v);
                 })
@@ -974,24 +1251,37 @@ fn timely_pagerank(edges: &[Edge], num_vertices: u64, iterations: usize) {
             (input, probe)
         });
 
-        let mut batch = edges;
-        input.send_batch(&mut batch);
+        if let Some(partition) = partitions.get(worker_index) {
+            let mut batch = partition.clone();
+            input.send_batch(&mut batch);
+        }
         input.close();
         worker.step_while(|| !probe.done());
-    });
+        tt.lock().unwrap().push(thread_start.elapsed());
+    })
+    .unwrap();
+    sum_thread_times(&thread_times)
 }
 
-fn timely_map_chain(values: &[i64], stages: usize) {
-    let values = values.to_vec();
-    timely::execute_directly(move |worker| {
+fn timely_map_chain(values: &[i64], stages: usize, num_workers: usize) -> Duration {
+    let partitions = Arc::new(partition_data(values, num_workers));
+    let thread_times: Arc<std::sync::Mutex<Vec<Duration>>> =
+        Arc::new(std::sync::Mutex::new(Vec::with_capacity(num_workers)));
+    let tt = Arc::clone(&thread_times);
+    timely::execute(timely::Config::process(num_workers), move |worker| {
+        let thread_start = Instant::now();
+        let worker_index = worker.index();
+        let partitions = Arc::clone(&partitions);
+        let tt = Arc::clone(&tt);
         let (mut input, probe) = worker.dataflow::<u64, _, _>(|scope| {
-            use timely::dataflow::operators::{Input, Inspect, Map, Probe};
+            use timely::dataflow::operators::{Exchange, Input, Inspect, Map, Probe};
 
             let (input, mut stream) = scope.new_input::<i64>();
             for _ in 0..stages {
                 stream = stream.map(|value| value + 1);
             }
             let probe = stream
+                .exchange(|value: &i64| *value as u64)
                 .inspect(|value| {
                     black_box(value);
                 })
@@ -999,24 +1289,37 @@ fn timely_map_chain(values: &[i64], stages: usize) {
             (input, probe)
         });
 
-        let mut batch = values;
-        input.send_batch(&mut batch);
+        if let Some(partition) = partitions.get(worker_index) {
+            let mut batch = partition.clone();
+            input.send_batch(&mut batch);
+        }
         input.close();
         worker.step_while(|| !probe.done());
-    });
+        tt.lock().unwrap().push(thread_start.elapsed());
+    })
+    .unwrap();
+    sum_thread_times(&thread_times)
 }
 
-fn timely_small_pipeline(batch: &[i64]) {
-    let batch = batch.to_vec();
-    timely::execute_directly(move |worker| {
-        use timely::dataflow::operators::{Input, Inspect, Map, Probe};
+fn timely_small_pipeline(batch: &[i64], num_workers: usize) -> Duration {
+    let partitions = Arc::new(partition_data(batch, num_workers));
+    let thread_times: Arc<std::sync::Mutex<Vec<Duration>>> =
+        Arc::new(std::sync::Mutex::new(Vec::with_capacity(num_workers)));
+    let tt = Arc::clone(&thread_times);
+    timely::execute(timely::Config::process(num_workers), move |worker| {
+        use timely::dataflow::operators::{Exchange, Input, Inspect, Map, Probe};
 
+        let thread_start = Instant::now();
+        let worker_index = worker.index();
+        let partitions = Arc::clone(&partitions);
+        let tt = Arc::clone(&tt);
         let (mut input, probe) = worker.dataflow::<u64, _, _>(|scope| {
             let (input, stream) = scope.new_input::<i64>();
             let probe = stream
                 .map(|x| x + 1)
                 .map(|x| x * 2)
                 .map(|x| x - 1)
+                .exchange(|value: &i64| *value as u64)
                 .inspect(|v| {
                     black_box(v);
                 })
@@ -1024,22 +1327,40 @@ fn timely_small_pipeline(batch: &[i64]) {
             (input, probe)
         });
 
-        let mut batch = batch;
-        input.send_batch(&mut batch);
+        if let Some(partition) = partitions.get(worker_index) {
+            let mut batch = partition.clone();
+            input.send_batch(&mut batch);
+        }
         input.close();
         worker.step_while(|| !probe.done());
-    });
+        tt.lock().unwrap().push(thread_start.elapsed());
+    })
+    .unwrap();
+    sum_thread_times(&thread_times)
 }
 
-fn timely_multi_epoch(batches: &[(u64, Vec<u64>)], threshold: u64) {
-    let batches = batches.to_vec();
-    timely::execute_directly(move |worker| {
+fn timely_multi_epoch(
+    batches: &[(u64, Vec<u64>)],
+    threshold: u64,
+    num_workers: usize,
+) -> Duration {
+    let batches = Arc::new(batches.to_vec());
+    let thread_times: Arc<std::sync::Mutex<Vec<Duration>>> =
+        Arc::new(std::sync::Mutex::new(Vec::with_capacity(num_workers)));
+    let tt = Arc::clone(&thread_times);
+    timely::execute(timely::Config::process(num_workers), move |worker| {
+        let thread_start = Instant::now();
+        let worker_index = worker.index();
+        let worker_count = worker.peers();
+        let batches = Arc::clone(&batches);
+        let tt = Arc::clone(&tt);
         let (mut input, probe) = worker.dataflow::<u64, _, _>(|scope| {
-            use timely::dataflow::operators::{Filter, Input, Inspect, Probe};
+            use timely::dataflow::operators::{Exchange, Filter, Input, Inspect, Probe};
 
             let (input, stream) = scope.new_input::<u64>();
             let probe = stream
                 .filter(move |value| *value > threshold)
+                .exchange(|value: &u64| *value)
                 .inspect(|value| {
                     black_box(value);
                 })
@@ -1047,14 +1368,22 @@ fn timely_multi_epoch(batches: &[(u64, Vec<u64>)], threshold: u64) {
             (input, probe)
         });
 
-        for (time, batch) in batches {
-            input.advance_to(time);
-            let mut batch = batch;
-            input.send_batch(&mut batch);
+        for (time, batch) in batches.iter() {
+            input.advance_to(*time);
+            let chunk_size = (batch.len() + worker_count - 1) / worker_count;
+            let start = worker_index * chunk_size;
+            let end = (start + chunk_size).min(batch.len());
+            if start < batch.len() {
+                let mut slice = batch[start..end].to_vec();
+                input.send_batch(&mut slice);
+            }
         }
         input.close();
         worker.step_while(|| !probe.done());
-    });
+        tt.lock().unwrap().push(thread_start.elapsed());
+    })
+    .unwrap();
+    sum_thread_times(&thread_times)
 }
 
 // We also need serde impls for timely's LineItem and Edge usage. timely requires
@@ -1077,7 +1406,7 @@ fn run_sustained<F>(
     mut query_fn: F,
 ) -> RunStats
 where
-    F: FnMut(),
+    F: FnMut() -> Duration,
 {
     let mut stats = RunStats::new(name, elements_per_query);
     let memory_sample_interval = 100;
@@ -1086,7 +1415,7 @@ where
     let warmup_start = Instant::now();
     let mut warmup_count = 0u64;
     while warmup_start.elapsed() < warmup {
-        query_fn();
+        let _ = query_fn();
         warmup_count += 1;
     }
     println!("    Warmup done ({warmup_count} queries)");
@@ -1098,8 +1427,9 @@ where
 
     while measure_start.elapsed() < duration {
         let q_start = Instant::now();
-        query_fn();
+        let core_time = query_fn();
         stats.latencies_us.push(q_start.elapsed().as_micros() as u64);
+        stats.core_time_ns = stats.core_time_ns.saturating_add(core_time.as_nanos() as u64);
         query_count += 1;
 
         if query_count % memory_sample_interval as u64 == 0 {
@@ -1123,7 +1453,7 @@ where
 }
 
 enum ConcurrentWorkerMessage {
-    Latency(u64),
+    Latency(u64, u64),
     WorkerDone,
 }
 
@@ -1132,6 +1462,7 @@ async fn warmup_instancy_small_concurrent(
     batch: Arc<Vec<i64>>,
     concurrency: usize,
     warmup: Duration,
+    num_workers: usize,
 ) -> u64 {
     if warmup.is_zero() {
         return 0;
@@ -1156,7 +1487,7 @@ async fn warmup_instancy_small_concurrent(
         let rt = rt.clone();
         let batch = batch.clone();
         join_set.spawn(async move {
-            instancy_small_pipeline_async(rt, batch).await;
+            instancy_small_pipeline_async(rt, batch, num_workers).await;
             drop(permit);
         });
 
@@ -1179,12 +1510,13 @@ async fn measure_instancy_small_concurrent(
     batch: Arc<Vec<i64>>,
     concurrency: usize,
     duration: Duration,
-) -> (Vec<u64>, Vec<f64>, Duration) {
+    num_workers: usize,
+) -> (Vec<u64>, Vec<f64>, Duration, u64) {
     let memory_sample_interval = 100u64;
     let measure_start = Instant::now();
     let deadline = measure_start + duration;
     let semaphore = Arc::new(tokio::sync::Semaphore::new(concurrency));
-    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<u64>();
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<(u64, u64)>();
 
     let producer = tokio::spawn({
         let rt = rt.clone();
@@ -1208,8 +1540,11 @@ async fn measure_instancy_small_concurrent(
                 let tx = tx.clone();
                 join_set.spawn(async move {
                     let query_start = Instant::now();
-                    instancy_small_pipeline_async(rt, batch).await;
-                    let _ = tx.send(query_start.elapsed().as_micros() as u64);
+                    let core_time = instancy_small_pipeline_async(rt, batch, num_workers).await;
+                    let _ = tx.send((
+                        query_start.elapsed().as_micros() as u64,
+                        core_time.as_nanos() as u64,
+                    ));
                     drop(permit);
                 });
 
@@ -1227,8 +1562,10 @@ async fn measure_instancy_small_concurrent(
 
     let mut latencies = Vec::with_capacity(concurrency * 1024);
     let mut memory_samples = Vec::new();
-    while let Some(latency) = rx.recv().await {
+    let mut core_time_ns = 0u64;
+    while let Some((latency, query_core_time_ns)) = rx.recv().await {
         latencies.push(latency);
+        core_time_ns = core_time_ns.saturating_add(query_core_time_ns);
         let query_count = latencies.len() as u64;
         if query_count % memory_sample_interval == 0 {
             memory_samples.push(system_snapshot().working_set_mb);
@@ -1243,7 +1580,7 @@ async fn measure_instancy_small_concurrent(
     println!();
 
     producer.await.expect("instancy small-query producer task panicked");
-    (latencies, memory_samples, measure_start.elapsed())
+    (latencies, memory_samples, measure_start.elapsed(), core_time_ns)
 }
 
 fn warmup_timely_small_concurrent(
@@ -1251,6 +1588,7 @@ fn warmup_timely_small_concurrent(
     concurrency: usize,
     threads: usize,
     warmup: Duration,
+    num_workers: usize,
 ) -> u64 {
     if warmup.is_zero() {
         return 0;
@@ -1266,7 +1604,7 @@ fn warmup_timely_small_concurrent(
         handles.push(std::thread::spawn(move || {
             let mut completed = 0u64;
             while Instant::now() < deadline {
-                timely_small_pipeline(batch.as_ref());
+                timely_small_pipeline(batch.as_ref(), num_workers);
                 completed += 1;
             }
             let _ = tx.send(completed);
@@ -1286,7 +1624,8 @@ fn measure_timely_small_concurrent(
     concurrency: usize,
     threads: usize,
     duration: Duration,
-) -> (Vec<u64>, Vec<f64>, Duration) {
+    num_workers: usize,
+) -> (Vec<u64>, Vec<f64>, Duration, u64) {
     let worker_count = concurrency.min(threads);
     let memory_sample_interval = 100u64;
     let measure_start = Instant::now();
@@ -1300,9 +1639,10 @@ fn measure_timely_small_concurrent(
         handles.push(std::thread::spawn(move || {
             while Instant::now() < deadline {
                 let query_start = Instant::now();
-                timely_small_pipeline(batch.as_ref());
+                let core_time = timely_small_pipeline(batch.as_ref(), num_workers);
                 let _ = tx.send(ConcurrentWorkerMessage::Latency(
                     query_start.elapsed().as_micros() as u64,
+                    core_time.as_nanos() as u64,
                 ));
             }
             let _ = tx.send(ConcurrentWorkerMessage::WorkerDone);
@@ -1313,10 +1653,12 @@ fn measure_timely_small_concurrent(
     let mut completed_workers = 0usize;
     let mut latencies = Vec::with_capacity(worker_count * 1024);
     let mut memory_samples = Vec::new();
+    let mut core_time_ns = 0u64;
     while completed_workers < worker_count {
         match rx.recv_timeout(Duration::from_millis(200)) {
-            Ok(ConcurrentWorkerMessage::Latency(latency)) => {
+            Ok(ConcurrentWorkerMessage::Latency(latency, query_core_time_ns)) => {
                 latencies.push(latency);
+                core_time_ns = core_time_ns.saturating_add(query_core_time_ns);
                 let query_count = latencies.len() as u64;
                 if query_count % memory_sample_interval == 0 {
                     memory_samples.push(system_snapshot().working_set_mb);
@@ -1337,8 +1679,9 @@ fn measure_timely_small_concurrent(
     }
 
     while let Ok(message) = rx.try_recv() {
-        if let ConcurrentWorkerMessage::Latency(latency) = message {
+        if let ConcurrentWorkerMessage::Latency(latency, query_core_time_ns) = message {
             latencies.push(latency);
+            core_time_ns = core_time_ns.saturating_add(query_core_time_ns);
         }
     }
     println!();
@@ -1347,7 +1690,7 @@ fn measure_timely_small_concurrent(
         handle.join().expect("timely small-query worker panicked");
     }
 
-    (latencies, memory_samples, measure_start.elapsed())
+    (latencies, memory_samples, measure_start.elapsed(), core_time_ns)
 }
 
 fn run_sustained_instancy_small_concurrent(
@@ -1356,6 +1699,7 @@ fn run_sustained_instancy_small_concurrent(
     duration: Duration,
     warmup: Duration,
     concurrency: usize,
+    num_workers: usize,
     rt_tokio: &tokio::runtime::Runtime,
     rt: Arc<RuntimeHandle>,
     batch: Arc<Vec<i64>>,
@@ -1368,13 +1712,15 @@ fn run_sustained_instancy_small_concurrent(
         batch.clone(),
         concurrency,
         warmup,
+        num_workers,
     ));
     println!("    Warmup done ({warmup_count} queries)");
 
     println!("    Measuring for {:.0}s...", duration.as_secs_f64());
     let cpu_before = system_snapshot();
-    let (latencies, memory_samples, wall_duration) =
-        rt_tokio.block_on(measure_instancy_small_concurrent(rt, batch, concurrency, duration));
+    let (latencies, memory_samples, wall_duration, core_time_ns) = rt_tokio.block_on(
+        measure_instancy_small_concurrent(rt, batch, concurrency, duration, num_workers),
+    );
     let cpu_after = system_snapshot();
 
     stats.latencies_us = latencies;
@@ -1382,6 +1728,7 @@ fn run_sustained_instancy_small_concurrent(
     stats.wall_duration = wall_duration;
     stats.cpu_user_delta_ms = cpu_after.cpu_user_ms - cpu_before.cpu_user_ms;
     stats.cpu_kernel_delta_ms = cpu_after.cpu_kernel_ms - cpu_before.cpu_kernel_ms;
+    stats.core_time_ns = core_time_ns;
     stats.memory_samples_mb.push(system_snapshot().working_set_mb);
     stats
 }
@@ -1393,18 +1740,20 @@ fn run_sustained_timely_small_concurrent(
     warmup: Duration,
     concurrency: usize,
     threads: usize,
+    num_workers: usize,
     batch: Arc<Vec<i64>>,
 ) -> RunStats {
     let mut stats = RunStats::new(name, elements_per_query);
 
     println!("    Warming up for {:.0}s...", warmup.as_secs_f64());
-    let warmup_count = warmup_timely_small_concurrent(batch.clone(), concurrency, threads, warmup);
+    let warmup_count =
+        warmup_timely_small_concurrent(batch.clone(), concurrency, threads, warmup, num_workers);
     println!("    Warmup done ({warmup_count} queries)");
 
     println!("    Measuring for {:.0}s...", duration.as_secs_f64());
     let cpu_before = system_snapshot();
-    let (latencies, memory_samples, wall_duration) =
-        measure_timely_small_concurrent(batch, concurrency, threads, duration);
+    let (latencies, memory_samples, wall_duration, core_time_ns) =
+        measure_timely_small_concurrent(batch, concurrency, threads, duration, num_workers);
     let cpu_after = system_snapshot();
 
     stats.latencies_us = latencies;
@@ -1412,6 +1761,7 @@ fn run_sustained_timely_small_concurrent(
     stats.wall_duration = wall_duration;
     stats.cpu_user_delta_ms = cpu_after.cpu_user_ms - cpu_before.cpu_user_ms;
     stats.cpu_kernel_delta_ms = cpu_after.cpu_kernel_ms - cpu_before.cpu_kernel_ms;
+    stats.core_time_ns = core_time_ns;
     stats.memory_samples_mb.push(system_snapshot().working_set_mb);
     stats
 }
@@ -1540,11 +1890,9 @@ fn main() {
     println!("");
     println!();
 
-    // Use explicit tokio thread count matching --threads for transparency.
-    // instancy's async worker pool runs on these tokio threads, so the total
-    // compute capacity is bounded by --threads, not doubled.
+    // Tokio only drives async sweep work here, so keep it lightweight.
     let rt_tokio = tokio::runtime::Builder::new_multi_thread()
-        .worker_threads(config.threads)
+        .worker_threads(2)
         .enable_all()
         .build()
         .unwrap();
@@ -1554,22 +1902,32 @@ fn main() {
     println!("Generating test data...");
     let large_items = generate_lineitems(10_000_000);
     let large_item_count = large_items.len() as u64;
-    println!("  Scan-filter-agg: {} line items", large_items.len());
+    println!(
+        "  Scan-filter-agg: {} line items across {} workers with exchange",
+        large_items.len(),
+        config.threads
+    );
 
     let graph_vertices = 50_000u64;
     let pagerank_iterations = 20usize;
     let graph_edges = generate_graph(graph_vertices, 500_000);
     let graph_edge_count = graph_edges.len() as u64;
     println!(
-        "  PageRank: {} vertices, {} edges, {} iterations",
+        "  PageRank: {} vertices, {} edges, {} iterations across {} workers with exchange",
         graph_vertices,
         graph_edges.len(),
-        pagerank_iterations
+        pagerank_iterations,
+        config.threads
     );
 
     let map_chain_values: Vec<i64> = (0..1_000_000).collect();
     let map_chain_count = map_chain_values.len() as u64;
-    println!("  10-stage map chain: {} values, {} stages", map_chain_values.len(), 10);
+    println!(
+        "  10-stage map chain: {} values, {} stages across {} workers with exchange",
+        map_chain_values.len(),
+        10,
+        config.threads
+    );
 
     let multi_epoch_batches = make_small_batches(1_024, 64);
     let multi_epoch_count: u64 = multi_epoch_batches
@@ -1578,9 +1936,10 @@ fn main() {
         .sum();
     let multi_epoch_threshold = multi_epoch_count / 2;
     println!(
-        "  Multi-epoch filter: {} epochs  {} records",
+        "  Multi-epoch filter: {} epochs, {} records/epoch across {} workers with exchange",
         multi_epoch_batches.len(),
-        multi_epoch_batches[0].1.len()
+        multi_epoch_batches[0].1.len(),
+        config.threads
     );
 
     // Exchange data: per-epoch batches for the persistent 2-node cluster.
@@ -1600,7 +1959,7 @@ fn main() {
     let small_batch = Arc::new((0..100).collect::<Vec<i64>>());
     let small_batch_count = small_batch.len() as u64;
     println!(
-        "  Small pipeline: {} elements/query @ concurrency {} on {} threads",
+        "  Small pipeline: {} elements/query @ concurrency {} with {} workers/query and exchange",
         small_batch.len(),
         config.concurrency,
         config.threads
@@ -1631,8 +1990,10 @@ fn main() {
         }
 
         if config.scenario == ScenarioFilter::All || config.scenario == ScenarioFilter::Large {
-            println!("
- Scenario 1A: Large Scan-Filter-Aggregate ({large_item_count} items) ");
+            println!(
+                "\n  Scenario 1A: Large Scan-Filter-Aggregate ({large_item_count} items, {} workers, exchange) ",
+                config.threads
+            );
 
             if config.library == LibraryFilter::Both || config.library == LibraryFilter::Instancy {
                 let stats = run_sustained(
@@ -1640,7 +2001,7 @@ fn main() {
                     large_item_count,
                     duration,
                     warmup,
-                    || instancy_scan_filter_agg(instancy_rt.as_ref(), &large_items),
+                    || instancy_scan_filter_agg(instancy_rt.as_ref(), &large_items, config.threads),
                 );
                 stats.report();
                 all_rows.push(SummaryRow::from_stats("ScanFilterAgg", "instancy", &stats));
@@ -1653,7 +2014,7 @@ fn main() {
                     large_item_count,
                     duration,
                     warmup,
-                    || timely_scan_filter_agg(&large_items),
+                    || timely_scan_filter_agg(&large_items, config.threads),
                 );
                 stats.report();
                 all_rows.push(SummaryRow::from_stats("ScanFilterAgg", "timely", &stats));
@@ -1661,11 +2022,11 @@ fn main() {
             }
 
             println!(
-                "
- Scenario 1B: Large PageRank ({} vertices, {} edges, {} iterations) ",
+                "\n  Scenario 1B: Large PageRank ({} vertices, {} edges, {} iterations, {} workers, exchange) ",
                 graph_vertices,
                 graph_edge_count,
-                pagerank_iterations
+                pagerank_iterations,
+                config.threads
             );
 
             if config.library == LibraryFilter::Both || config.library == LibraryFilter::Instancy {
@@ -1674,7 +2035,15 @@ fn main() {
                     graph_edge_count,
                     duration,
                     warmup,
-                    || instancy_pagerank(instancy_rt.as_ref(), &graph_edges, graph_vertices, pagerank_iterations),
+                    || {
+                        instancy_pagerank(
+                            instancy_rt.as_ref(),
+                            &graph_edges,
+                            graph_vertices,
+                            pagerank_iterations,
+                            config.threads,
+                        )
+                    },
                 );
                 stats.report();
                 all_rows.push(SummaryRow::from_stats("PageRank", "instancy", &stats));
@@ -1687,15 +2056,18 @@ fn main() {
                     graph_edge_count,
                     duration,
                     warmup,
-                    || timely_pagerank(&graph_edges, graph_vertices, pagerank_iterations),
+                    || timely_pagerank(&graph_edges, graph_vertices, pagerank_iterations, config.threads),
                 );
                 stats.report();
                 all_rows.push(SummaryRow::from_stats("PageRank", "timely", &stats));
                 std::thread::sleep(cooldown);
             }
 
-            println!("
- Scenario 1C: Large 10-Stage Map Chain ({} values) ", map_chain_count);
+            println!(
+                "\n  Scenario 1C: Large 10-Stage Map Chain ({} values, {} workers, exchange) ",
+                map_chain_count,
+                config.threads
+            );
 
             if config.library == LibraryFilter::Both || config.library == LibraryFilter::Instancy {
                 let stats = run_sustained(
@@ -1703,7 +2075,7 @@ fn main() {
                     map_chain_count,
                     duration,
                     warmup,
-                    || instancy_map_chain(instancy_rt.as_ref(), &map_chain_values, 10),
+                    || instancy_map_chain(instancy_rt.as_ref(), &map_chain_values, 10, config.threads),
                 );
                 stats.report();
                 all_rows.push(SummaryRow::from_stats("MapChain10", "instancy", &stats));
@@ -1716,7 +2088,7 @@ fn main() {
                     map_chain_count,
                     duration,
                     warmup,
-                    || timely_map_chain(&map_chain_values, 10),
+                    || timely_map_chain(&map_chain_values, 10, config.threads),
                 );
                 stats.report();
                 all_rows.push(SummaryRow::from_stats("MapChain10", "timely", &stats));
@@ -1724,10 +2096,10 @@ fn main() {
             }
 
             println!(
-                "
- Scenario 1D: Multi-Epoch Filter ({} epochs  {} records) ",
+                "\n  Scenario 1D: Multi-Epoch Filter ({} epochs, {} records/epoch, {} workers, exchange) ",
                 multi_epoch_batches.len(),
-                multi_epoch_batches[0].1.len()
+                multi_epoch_batches[0].1.len(),
+                config.threads
             );
 
             if config.library == LibraryFilter::Both || config.library == LibraryFilter::Instancy {
@@ -1736,7 +2108,14 @@ fn main() {
                     multi_epoch_count,
                     duration,
                     warmup,
-                    || instancy_multi_epoch(instancy_rt.as_ref(), &multi_epoch_batches, multi_epoch_threshold),
+                    || {
+                        instancy_multi_epoch(
+                            instancy_rt.as_ref(),
+                            &multi_epoch_batches,
+                            multi_epoch_threshold,
+                            config.threads,
+                        )
+                    },
                 );
                 stats.report();
                 all_rows.push(SummaryRow::from_stats("MultiEpochFilter", "instancy", &stats));
@@ -1749,7 +2128,7 @@ fn main() {
                     multi_epoch_count,
                     duration,
                     warmup,
-                    || timely_multi_epoch(&multi_epoch_batches, multi_epoch_threshold),
+                    || timely_multi_epoch(&multi_epoch_batches, multi_epoch_threshold, config.threads),
                 );
                 stats.report();
                 all_rows.push(SummaryRow::from_stats("MultiEpochFilter", "timely", &stats));
@@ -1779,9 +2158,10 @@ fn main() {
 
         if config.scenario == ScenarioFilter::All || config.scenario == ScenarioFilter::Small {
             println!(
-                "\n── Scenario 2: Concurrent High-RPS Small Pipeline ({} elements/query, concurrency {}) ──",
+                "\n── Scenario 2: Concurrent High-RPS Small Pipeline ({} elements/query, concurrency {}, {} workers/query, exchange) ──",
                 small_batch_count,
-                config.concurrency
+                config.concurrency,
+                config.threads
             );
 
             if config.library == LibraryFilter::Both || config.library == LibraryFilter::Instancy {
@@ -1791,6 +2171,7 @@ fn main() {
                     duration,
                     warmup,
                     config.concurrency,
+                    config.threads,
                     &rt_tokio,
                     instancy_rt.clone(),
                     small_batch.clone(),
@@ -1807,6 +2188,7 @@ fn main() {
                     duration,
                     warmup,
                     config.concurrency,
+                    config.threads,
                     config.threads,
                     small_batch.clone(),
                 );
