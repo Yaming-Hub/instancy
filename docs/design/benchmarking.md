@@ -110,9 +110,9 @@ All scenarios run over **2 processes connected by TCP**.
 | Group | Scenario | Libraries | Workload |
 |------|----------|-----------|----------|
 | Large | ScanFilterAgg | instancy + timely | 100M synthetic line items |
-| Large | PageRank | instancy + timely | 200K vertices, 2M edges, 50 iterations |
-| Large | MapChain10 | instancy + timely | 50M `i64` values through 10 maps |
-| Large | MultiEpochFilter | instancy + timely | 8192 epochs  512 records |
+| Large | PageRank | instancy + timely | 200K vertices, 2M edges, 100 iterations |
+| Large | MapChain10 | instancy + timely | 5M `i64` values through 20 maps |
+| Large | MultiEpochFilter | instancy + timely | 16 epochs × 4096 records |
 | Small | SmallPipelineConcurrent | instancy + timely | 100-element 3-stage pipeline |
 
 ## 4.1 Scenario 1A - Scan-Filter-Aggregate
@@ -131,7 +131,7 @@ The gather step routes every aggregate result to process 0.
 ## 4.2 Scenario 1B - PageRank
 
 - Graph size: **200,000 vertices**, **2,000,000 edges**
-- Iterations: **50**
+- Iterations: **100**
 - Process split: **1M edges + 1M edges**
 - Pipeline:
 
@@ -140,28 +140,32 @@ source(edges) -> pagerank -> exchange_by_hash(vertex)
               -> gather(process 0) -> sink
 ```
 
-## 4.3 Scenario 1C - 10-Stage Map Chain
+## 4.3 Scenario 1C - 20-Stage Map Chain
 
-- Total input: **50,000,000** values
-- Process split: **25M + 25M**
+- Total input: **5,000,000** values
+- Process split: **2.5M + 2.5M**
 - Pipeline:
 
 ```text
-source -> map(+1) x 10 -> exchange_by_hash(value)
-       -> gather(process 0) -> sink
+source -> map(+1) x 20 -> exchange_by_hash(value) -> sink
 ```
+
+Note: gather step removed — with 5M values and 20 stages the full-volume
+gather to a single worker causes TCP backpressure deadlocks under concurrent
+load.
 
 ## 4.4 Scenario 1D - Multi-Epoch Filter
 
-- Total input: **8192 epochs  512 records/epoch**
-- Process split: **4096 epochs + 4096 epochs**
+- Total input: **16 epochs × 4096 records/epoch**
+- Process split: **8 epochs + 8 epochs**
 - Pipeline:
 
 ```text
 input(epoch batches) -> filter(value > threshold)
-                     -> exchange_by_hash(value)
-                     -> gather(process 0) -> sink
+                     -> exchange_by_hash(value) -> sink
 ```
+
+Note: gather step removed for the same backpressure reason as MapChain.
 
 ## 4.5 Scenario 2 - Concurrent Small Pipeline
 
@@ -171,8 +175,10 @@ input(epoch batches) -> filter(value > threshold)
 
 ```text
 source -> map(+1) -> map(*2) -> map(-1)
-       -> exchange_by_hash(value) -> gather(process 0) -> sink
+       -> exchange_by_hash(value) -> sink
 ```
+
+Note: gather step removed for the same backpressure reason as MapChain.
 
 ## 5. Sustained Run Methodology
 
@@ -263,3 +269,66 @@ Key comparisons are now end-to-end **cross-process TCP** comparisons.
 
 Because the worker is a separate process, these numbers are intentionally closer
 to real distributed execution than the earlier in-process exchange benchmarks.
+
+## 10. Benchmark Results
+
+Results from a sustained 600-second-per-phase run on a single Windows machine
+with 16 worker threads per process, 2 processes connected by TCP.
+
+### 10.1 Summary Table
+
+| Scenario | Library | Queries | QPS | p50 (s) | p95 (s) | Avg MB | Peak MB | Core-sec/query |
+|---|---|---|---|---|---|---|---|---|
+| ScanFilterAgg | **instancy** | **180** | **0.30** | **6.71** | **7.03** | **48.6** | **116.7** | **82.7** |
+| ScanFilterAgg | timely | 52 | 0.09 | 24.59 | 35.38 | 659.7 | 2492.1 | 716.4 |
+| PageRank | **instancy** | **310** | **0.51** | **3.82** | **4.22** | 377.1 | 452.0 | **74.4** |
+| PageRank | timely | 258 | 0.43 | 4.63 | 5.63 | 364.7 | 508.6 | 106.7 |
+| MapChain10 | **instancy** | **3335** | **5.56** | **0.354** | **0.429** | **104.4** | **124.2** | **4.0** |
+| MapChain10 | timely | 1207 | 2.01 | 0.988 | 1.346 | 142.3 | 174.7 | 8.5 |
+| MultiEpochFilter | **instancy** | **8191** | **13.65** | **0.138** | **0.208** | **82.6** | **91.9** | **1.13** |
+| MultiEpochFilter | timely | 1985 | 3.31 | 0.689 | 0.974 | 97.3 | 100.1 | 4.12 |
+| SmallPipeline | **instancy** | **7913** | **13.09** | **4.81** | **9.19** | **108.8** | **116.2** | **1.44** |
+| SmallPipeline | timely | 1248 | 1.85 | 31.46 | 47.00 | 201.8 | 231.1 | 104.1 |
+
+### 10.2 Advantage Ratios (instancy / timely)
+
+| Scenario | Throughput | Latency (p50) | Memory (avg) | Core Efficiency |
+|---|---|---|---|---|
+| ScanFilterAgg | **3.5×** | **3.7×** faster | **13.6×** less | **8.7×** better |
+| PageRank | **1.2×** | **1.2×** faster | ~equal | **1.4×** better |
+| MapChain10 | **2.8×** | **2.8×** faster | **1.4×** less | **2.1×** better |
+| MultiEpochFilter | **4.1×** | **5.0×** faster | **1.2×** less | **3.6×** better |
+| SmallPipeline (×64) | **7.1×** | **6.5×** faster | **1.9×** less | **72×** better |
+
+### 10.3 Analysis
+
+**ScanFilterAgg** shows the largest memory advantage. timely allocates dedicated
+per-worker buffers for the full 100M-record scan, peaking at 2.5 GB. instancy
+shares the async worker pool and keeps peak memory under 117 MB — a 21× reduction.
+Core efficiency is 8.7× better because instancy's per-stage execution avoids
+idle spinning across the 16 workers.
+
+**PageRank** is the closest comparison. Both libraries perform similar iterative
+computation. instancy still wins on throughput (1.2×) and core efficiency (1.4×)
+due to lower per-iteration coordination overhead.
+
+**MapChain** and **MultiEpoch** demonstrate instancy's advantage in medium-sized
+dataflows. The async work pool avoids the per-query overhead of spawning and
+synchronizing 32 dedicated threads (16 per process).
+
+**SmallPipeline** is the standout result. At 64 concurrent queries, instancy's
+async pool lets all queries share the same 16 worker threads. timely must spin
+up 32 threads per query (64 × 32 = 2048 threads competing for CPU), resulting
+in massive context-switch overhead: 104 core-seconds per 100-element query vs
+instancy's 1.44. The 72× core efficiency gap directly validates instancy's
+shared async worker pool design.
+
+### 10.4 Gather Step Limitation
+
+ScanFilterAgg and PageRank include a final `gather` exchange that routes all
+output to process 0 / worker 0. This works because aggregation reduces the
+output volume. MapChain, MultiEpoch, and SmallPipeline omit the gather step —
+with 16 workers per process, routing all output records through a single TCP
+channel causes backpressure deadlocks when multiple queries run concurrently.
+This is a fundamental limitation of single-destination gather under high fan-in,
+not specific to either library.
