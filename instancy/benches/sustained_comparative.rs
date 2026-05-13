@@ -788,17 +788,26 @@ impl ExchangeCluster {
 
     /// Send one epoch of data through both nodes, advance frontier,
     /// and wait for both probes to confirm the epoch is processed.
+    /// Panics if probes fail or timeout (30s) to prevent silent data loss.
     fn run_epoch(&self, epoch: u64, left: &[(u64, i64)], right: &[(u64, i64)]) {
         self.sender_a.send(epoch, left.to_vec()).unwrap();
         self.sender_b.send(epoch, right.to_vec()).unwrap();
         self.sender_a.advance_to(epoch + 1).unwrap();
         self.sender_b.advance_to(epoch + 1).unwrap();
-        // Wait for both nodes to finish processing this epoch.
+        // Wait for both nodes to finish processing this epoch with timeout.
         self.tokio_handle.block_on(async {
-            let _ = tokio::join!(
-                self.probe_a.wait_until_done_with(&epoch),
-                self.probe_b.wait_until_done_with(&epoch),
-            );
+            let result = tokio::time::timeout(Duration::from_secs(30), async {
+                let (ra, rb) = tokio::join!(
+                    self.probe_a.wait_until_done_with(&epoch),
+                    self.probe_b.wait_until_done_with(&epoch),
+                );
+                ra.expect("probe_a failed: executor dropped notifier");
+                rb.expect("probe_b failed: executor dropped notifier");
+            })
+            .await;
+            if result.is_err() {
+                panic!("exchange epoch {epoch} timed out after 30s — cluster stalled");
+            }
         });
     }
 
@@ -1531,7 +1540,14 @@ fn main() {
     println!("");
     println!();
 
-    let rt_tokio = tokio::runtime::Runtime::new().unwrap();
+    // Use explicit tokio thread count matching --threads for transparency.
+    // instancy's async worker pool runs on these tokio threads, so the total
+    // compute capacity is bounded by --threads, not doubled.
+    let rt_tokio = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(config.threads)
+        .enable_all()
+        .build()
+        .unwrap();
     let _guard = rt_tokio.enter();
     let tokio_handle = tokio::runtime::Handle::current();
 
