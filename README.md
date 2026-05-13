@@ -410,6 +410,32 @@ cargo run -p instancy --example <name>
 
 ## Benchmarks
 
+### Cross-Process TCP Exchange (Sustained)
+
+Sustained 600-second benchmark with real TCP transport between 2 OS processes, 16 worker threads each. Each query spawns a fresh worker process, establishes TCP connections, and exchanges data — measuring end-to-end distributed execution.
+
+```bash
+cargo bench --bench sustained_comparative -- --duration 600 --warmup 30 --threads 16
+```
+
+| Scenario | instancy | timely | Throughput | Latency (p50) | Memory | Core Efficiency |
+|---|---|---|---|---|---|---|
+| **ScanFilterAgg** (100M records) | 180 q, 6.7s | 52 q, 24.6s | **3.5×** | **3.7×** faster | **13.6×** less | **8.7×** better |
+| **PageRank** (200K vertices, 100 iter) | 310 q, 3.8s | 258 q, 4.6s | **1.2×** | **1.2×** faster | ~equal | **1.4×** better |
+| **MapChain** (5M × 20 stages) | 3335 q, 354ms | 1207 q, 988ms | **2.8×** | **2.8×** faster | **1.4×** less | **2.1×** better |
+| **MultiEpoch** (16 × 4096 records) | 8191 q, 138ms | 1985 q, 689ms | **4.1×** | **5.0×** faster | **1.2×** less | **3.6×** better |
+| **SmallPipeline** (100 vals, ×64 concurrent) | 7913 q, 4.8s | 1248 q, 31.5s | **7.1×** | **6.5×** faster | **1.9×** less | **72×** better |
+
+Key takeaways:
+
+- **SmallPipeline** is the standout: 72× core efficiency. instancy's async pool shares 16 threads across 64 concurrent queries; timely spins up 32 threads per query (2048 total), causing massive context-switch overhead.
+- **ScanFilterAgg** shows 13.6× memory advantage: timely peaks at 2.5 GB vs instancy's 117 MB.
+- **All scenarios** show instancy winning on throughput, latency, and core efficiency in the cross-process TCP setting.
+
+> See [benchmarking.md](./docs/design/benchmarking.md) for full methodology and analysis.
+
+### Single-Process Criterion (Micro-benchmarks)
+
 Comparative benchmarks against [timely-dataflow](https://github.com/TimelyDataflow/timely-dataflow) v0.12 using [Criterion](https://github.com/bheisler/criterion.rs). Both frameworks build and execute a complete dataflow per iteration. Data is fed in batch form to both sides. Run with:
 
 ```bash
