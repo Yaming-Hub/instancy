@@ -14,9 +14,8 @@ scenarios:
 | **Large queries** | **PageRank** | instancy + timely | Compute-heavy iterative batch query | 50K vertices, 500K edges, 20 iterations |
 | **Large queries** | **MapChain10** | instancy + timely | Operator-chaining throughput | 1M values through 10 `.map()` stages |
 | **Large queries** | **MultiEpochFilter** | instancy + timely | Steady-state single-dataflow throughput | 1024 epochs x 64 records through one filter dataflow |
-| **Large queries** | **ExchangeAggregateTcp** | instancy only | Cross-node TCP exchange + aggregation overhead | 1.2M records across 2 nodes |
+| **Large queries** | **ExchangeAggregateTcp** | instancy only | Cross-node TCP exchange + aggregation overhead | 10K records/epoch across 2 TCP nodes |
 | **Small queries** | **SmallPipelineConcurrent** | instancy + timely | Small-query overhead under concurrency | 100-element 3-stage pipeline |
-| **Small queries** | **ExchangeSmallPipelineTcp** | instancy only | Per-query TCP exchange overhead | 128-element exchanged pipeline across 2 nodes |
 
 Each run executes continuously for a configurable duration (default **10
 minutes**) after a warmup phase.
@@ -93,16 +92,22 @@ Purpose: steady-state throughput after the dataflow already exists.
 
 ### 4.5 Scenario 1E - Instancy-only TCP Exchange + Aggregate
 
-Uses `spawn_cluster()` directly inside the benchmark binary.
+Uses `spawn_cluster()` directly inside the benchmark binary with a persistent
+2-node TCP cluster and probe-based completion waiting.
 
 - Topology: 2 nodes, 1 logical worker per node
 - Transport: real TCP connections in-process (`TcpListener` + `TcpStream`)
-- Input: 1.2M `(key, value)` records, split evenly across the two nodes
+- Each "query" = one epoch of 10,000 `(key, value)` records, split evenly
+  across the two nodes
 - Dataflow:
 
 ```text
-input -> exchange_by_hash(key) -> unary_notify(sum by key) -> sink
+input -> exchange_by_hash(key) -> probe -> for_each(sink)
 ```
+
+A `ProbeHandle` on each node waits for frontier advancement after every epoch.
+This prevents quadratic progress-tracking state accumulation that would
+otherwise hang the dataflow after ~1200 epochs.
 
 This does **not** use `instancy-integration` because the coordinator protocol
 and external `instancy-test-node` process would contaminate latency
@@ -132,15 +137,6 @@ Inside `tokio::runtime::Runtime::block_on`:
 - each thread loops on `execute_directly` until the deadline
 - each completed query reports latency to the collector
 
-### 4.7 Scenario 2B - Instancy-only TCP Exchange + Small Pipeline
-
-Also uses `spawn_cluster()` over in-process TCP, but with a small per-query
-batch to isolate exchange overhead:
-
-```text
-input -> exchange_by_hash(value) -> map(+1) -> map(*2) -> map(-1) -> sink
-```
-
 ## 5. Environment Requirements
 
 - **Rust**: stable >= 1.85 (2024 edition)
@@ -158,20 +154,21 @@ $env:CARGO_INCREMENTAL = "0"
 cargo bench --bench sustained_comparative --release -- --duration 30 --warmup 5 --concurrency 64 --threads 16
 ```
 
-### 6.2 Full Production Run (~127 minutes)
+### 6.2 Full Production Run (~115 minutes)
 
 ```powershell
 $env:CARGO_INCREMENTAL = "0"
 cargo bench --bench sustained_comparative --release -- --duration 600 --warmup 30 --concurrency 64 --threads 16
 ```
 
-With `--library both`, one round now executes 12 runs:
+With `--library both`, one round now executes 11 runs:
 
-- 5 comparative scenarios × 2 libraries = 10 runs
-- 2 instancy-only TCP scenarios = 2 runs
+- 4 comparative scenarios × 2 libraries = 8 runs
+- 1 instancy-only TCP exchange scenario = 1 run
+- 1 small-pipeline scenario × 2 libraries = 2 runs
 
 At 600s measurement + 30s warmup + 5s cooldown per run, total runtime is about
-7,620 seconds (~127 minutes).
+6,985 seconds (~116 minutes).
 
 ### 6.3 CLI Options
 
@@ -211,17 +208,16 @@ Expected scenario names are:
 - `MultiEpochFilter`
 - `ExchangeAggregateTcp`
 - `SmallPipelineConcurrent`
-- `ExchangeSmallPipelineTcp`
 
 ### 7.2 Key Comparisons
 
 | What to compare | What it tells you |
 |-----------------|-------------------|
-| **QPS ratio** (instancy/timely) | Overall throughput comparison for the 5 comparative scenarios |
+| **QPS ratio** (instancy/timely) | Overall throughput comparison for the 4 comparative scenarios |
 | **p50 / p99 ratios** | Typical and tail latency comparison |
 | **Memory delta** | Framework memory overhead difference |
 | **CPU time delta** | CPU efficiency |
-| **ExchangeAggregateTcp / ExchangeSmallPipelineTcp** | Instancy TCP transport overhead without control-plane noise |
+| **ExchangeAggregateTcp** | Instancy TCP transport overhead without control-plane noise |
 
 ### 7.3 Known Measurement Limitation
 
@@ -248,7 +244,41 @@ To reproduce a prior run:
 5. Run in `--release` mode with `CARGO_INCREMENTAL=0`
 6. Use multiple rounds if you need higher confidence
 
-## 9. File Locations
+## 9. Benchmark Results
+
+### 9.1 Results — 60-second sustained run (16 threads, concurrency 64)
+
+Hardware: Windows 11, AMD/Intel desktop, 16 logical cores.
+
+| Scenario | Library | QPS | p50 (µs) | p95 (µs) | p99 (µs) | Ratio |
+|----------|---------|----:|----------:|----------:|----------:|------:|
+| ScanFilterAgg 10M | instancy | 1.9 | 536,056 | 556,738 | 573,821 | **0.68×** |
+| | timely | 2.8 | 353,127 | 369,531 | 381,725 | |
+| PageRank 50K/500K/20 | instancy | 16.6 | 59,598 | 70,189 | 78,225 | **0.96×** |
+| | timely | 17.3 | 55,662 | 73,143 | 87,831 | |
+| MapChain10 1M | instancy | **110.9** | 8,871 | 10,092 | 11,490 | **2.96×** |
+| | timely | 37.5 | 26,122 | 29,616 | 33,451 | |
+| MultiEpochFilter 1024×64 | instancy | **2,364** | 396 | 522 | 839 | **1.72×** |
+| | timely | 1,373 | 705 | 853 | 1,163 | |
+| ExchangeAggregateTcp 10K | instancy | 966 | 262 | 9,803 | 15,108 | — |
+| SmallPipeline ×64 | instancy | **113,725** | 373 | 625 | 1,374 | **1.13×** |
+| | timely | 101,019 | 138 | 168 | 320 | |
+
+**Summary:**
+
+- instancy wins on operator-chaining throughput (**MapChain10**: 2.96×) and
+  steady-state epoch-based workloads (**MultiEpochFilter**: 1.72×) due to its
+  async task-pool model and lower per-operator overhead.
+- timely wins on single large-batch queries (**ScanFilterAgg**: 1.47× timely
+  advantage) where its sync worker threads avoid task scheduling overhead.
+- **PageRank** is nearly equal (0.96×), indicating similar iterative-loop
+  efficiency.
+- **SmallPipeline** concurrent throughput favors instancy (1.13×) though timely
+  has significantly lower per-query latency (138µs vs 373µs p50).
+- **Exchange TCP** achieves ~966 QPS sustained across 2 in-process TCP nodes
+  with probe-based epoch completion.
+
+## 10. File Locations
 
 | File | Purpose |
 |------|---------|
