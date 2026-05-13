@@ -3,12 +3,13 @@
 //! Runs two workload groups for a configurable duration (default 10 minutes each):
 //!
 //! - **Large queries:** Compute-heavy scan/filter/aggregate, PageRank, a 10-stage map
-//!   chain, and a multi-epoch filter workload. These runs emphasize framework overhead
-//!   once computation is large enough to dominate setup costs.
+//!   chain, a multi-epoch filter workload, plus an instancy-only 2-node TCP exchange
+//!   + aggregate benchmark.
 //!
 //! - **High-RPS small queries:** Many tiny dataflow executions issued concurrently.
 //!   instancy uses async task fan-out on a shared runtime with bounded in-flight
-//!   concurrency, while timely uses the same concurrency level via a thread pool.
+//!   concurrency, timely uses a fixed worker-thread pool capped by `--threads`, and
+//!   instancy also includes an instancy-only 2-node TCP exchange small-pipeline run.
 //!
 //! Each (library, scenario) pair runs for the configured duration. System metrics
 //! (working set memory, CPU time) are sampled periodically.
@@ -25,7 +26,8 @@
 //!   --scenario <NAME>      Run only: "large", "small", or "all" [default: all]
 //!   --library <NAME>       Run only: "instancy", "timely", or "both" [default: both]
 //!   --cooldown <SECS>      Pause between runs [default: 5]
-//!   --concurrency <N>      In-flight/query-thread concurrency for small queries [default: 64]
+//!   --concurrency <N>      In-flight query cap for small queries [default: 64]
+//!   --threads <N>          Shared worker-thread budget for both libraries [default: 16]
 //! ```
 
 use std::collections::HashMap;
@@ -34,7 +36,13 @@ use std::hint::black_box;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use instancy::{DataflowBuilder, RuntimeConfig, RuntimeHandle, SpawnOptions};
+use instancy::communication::ClusterSpawnTransport;
+use instancy::communication::transport_session::PeerConnection;
+use instancy::{
+    ClusterTopology, DataflowBuilder, DataflowId, NodeConfig, Result as InstancyResult,
+    RuntimeConfig, RuntimeHandle, SpawnOptions, TokioMode,
+};
+use tokio::net::{TcpListener, TcpStream};
 
 // =============================================================================
 // System metrics (platform-specific)
@@ -601,6 +609,279 @@ fn instancy_multi_epoch(rt: &RuntimeHandle, batches: &[(u64, Vec<u64>)], thresho
     handle.join_blocking().unwrap();
 }
 
+type TcpPeerConnection = PeerConnection<tokio::net::tcp::OwnedReadHalf, tokio::net::tcp::OwnedWriteHalf>;
+
+async fn make_tcp_connections(node_ids: &[&str]) -> HashMap<String, Vec<TcpPeerConnection>> {
+    let mut result: HashMap<String, Vec<TcpPeerConnection>> = HashMap::new();
+    for node_id in node_ids {
+        result.insert((*node_id).to_string(), Vec::new());
+    }
+
+    for i in 0..node_ids.len() {
+        for j in (i + 1)..node_ids.len() {
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = listener.local_addr().unwrap();
+            let (accepted, connected) = tokio::try_join!(listener.accept(), TcpStream::connect(addr)).unwrap();
+            let stream_i = accepted.0;
+            let stream_j = connected;
+
+            stream_i.set_nodelay(true).unwrap();
+            stream_j.set_nodelay(true).unwrap();
+
+            let (ri, wi) = stream_i.into_split();
+            let (rj, wj) = stream_j.into_split();
+
+            result.get_mut(node_ids[i]).unwrap().push(PeerConnection {
+                node_id: node_ids[j].to_string(),
+                reader: ri,
+                writer: wi,
+            });
+            result.get_mut(node_ids[j]).unwrap().push(PeerConnection {
+                node_id: node_ids[i].to_string(),
+                reader: rj,
+                writer: wj,
+            });
+        }
+    }
+
+    result
+}
+
+/// Persistent 2-node TCP cluster for exchange benchmarks.
+/// Created once, reused for many epochs. Each epoch = one "query".
+/// Uses probes to wait for each epoch's completion before sending the next,
+/// preventing quadratic progress-tracking accumulation.
+struct ExchangeCluster {
+    sender_a: instancy::InputSender<u64, (u64, i64)>,
+    sender_b: instancy::InputSender<u64, (u64, i64)>,
+    probe_a: instancy::ProbeHandle<u64>,
+    probe_b: instancy::ProbeHandle<u64>,
+    cluster_a: Option<instancy::runtime::ClusterSpawnedDataflow<u64>>,
+    cluster_b: Option<instancy::runtime::ClusterSpawnedDataflow<u64>>,
+    _rt_a: RuntimeHandle,
+    _rt_b: RuntimeHandle,
+    tokio_handle: tokio::runtime::Handle,
+}
+
+impl ExchangeCluster {
+    fn setup(tokio_handle: &tokio::runtime::Handle) -> Self {
+        let topology = ClusterTopology::multi_node(vec![
+            NodeConfig::new("node-a", 1),
+            NodeConfig::new("node-b", 1),
+        ])
+        .unwrap();
+        let dataflow_id = DataflowId::new();
+        let mut connections = tokio_handle.block_on(make_tcp_connections(&["node-a", "node-b"]));
+
+        let conns_a = connections.remove("node-a").unwrap();
+        let conns_b = connections.remove("node-b").unwrap();
+
+        let topo_a = topology.clone();
+        let topo_b = topology;
+        let df_id = dataflow_id;
+        let ha = tokio_handle.clone();
+        let hb = tokio_handle.clone();
+        let h_ext_a = tokio_handle.clone();
+        let h_ext_b = tokio_handle.clone();
+
+        // Shared slots for capturing probe handles from build closures.
+        let probe_slot_a: Arc<std::sync::Mutex<Option<instancy::ProbeHandle<u64>>>> =
+            Arc::new(std::sync::Mutex::new(None));
+        let probe_slot_b: Arc<std::sync::Mutex<Option<instancy::ProbeHandle<u64>>>> =
+            Arc::new(std::sync::Mutex::new(None));
+        let pa = probe_slot_a.clone();
+        let pb = probe_slot_b.clone();
+
+        let build_a = move |builder: &mut DataflowBuilder<u64>| -> InstancyResult<()> {
+            let (pipe, probe) = builder
+                .input::<(u64, i64)>("data")
+                .unwrap()
+                .exchange_by_hash("partition", |item: &(u64, i64)| item.0)
+                .probe();
+            pipe.for_each("sink", |_t, values| {
+                black_box(values);
+            });
+            *pa.lock().unwrap() = Some(probe);
+            Ok(())
+        };
+        let build_b = move |builder: &mut DataflowBuilder<u64>| -> InstancyResult<()> {
+            let (pipe, probe) = builder
+                .input::<(u64, i64)>("data")
+                .unwrap()
+                .exchange_by_hash("partition", |item: &(u64, i64)| item.0)
+                .probe();
+            pipe.for_each("sink", |_t, values| {
+                black_box(values);
+            });
+            *pb.lock().unwrap() = Some(probe);
+            Ok(())
+        };
+
+        let (rt_a, mut cluster_a, rt_b, mut cluster_b) = tokio_handle.block_on(async {
+            let spawn_a = tokio::task::spawn_blocking(move || {
+                let rt = RuntimeHandle::new(RuntimeConfig {
+                    worker_threads: 1,
+                    tokio_mode: TokioMode::External(h_ext_a),
+                    ..RuntimeConfig::default()
+                })
+                .unwrap();
+                let cluster = rt
+                    .spawn_cluster(
+                        "exchange-bench",
+                        topo_a,
+                        "node-a",
+                        df_id,
+                        ClusterSpawnTransport::dedicated(conns_a, 1024),
+                        Duration::from_secs(10),
+                        build_a,
+                        &ha,
+                        SpawnOptions::default(),
+                    )
+                    .unwrap();
+                (rt, cluster)
+            });
+            let spawn_b = tokio::task::spawn_blocking(move || {
+                let rt = RuntimeHandle::new(RuntimeConfig {
+                    worker_threads: 1,
+                    tokio_mode: TokioMode::External(h_ext_b),
+                    ..RuntimeConfig::default()
+                })
+                .unwrap();
+                let cluster = rt
+                    .spawn_cluster(
+                        "exchange-bench",
+                        topo_b,
+                        "node-b",
+                        df_id,
+                        ClusterSpawnTransport::dedicated(conns_b, 1024),
+                        Duration::from_secs(10),
+                        build_b,
+                        &hb,
+                        SpawnOptions::default(),
+                    )
+                    .unwrap();
+                (rt, cluster)
+            });
+            let (res_a, res_b) = tokio::join!(spawn_a, spawn_b);
+            let (rt_a, cl_a) = res_a.unwrap();
+            let (rt_b, cl_b) = res_b.unwrap();
+            (rt_a, cl_a, rt_b, cl_b)
+        });
+
+        let sender_a = cluster_a.take_input::<(u64, i64)>(0, "data").unwrap();
+        let sender_b = cluster_b.take_input::<(u64, i64)>(0, "data").unwrap();
+        let probe_a = probe_slot_a.lock().unwrap().take().unwrap();
+        let probe_b = probe_slot_b.lock().unwrap().take().unwrap();
+
+        ExchangeCluster {
+            sender_a,
+            sender_b,
+            probe_a,
+            probe_b,
+            cluster_a: Some(cluster_a),
+            cluster_b: Some(cluster_b),
+            _rt_a: rt_a,
+            _rt_b: rt_b,
+            tokio_handle: tokio_handle.clone(),
+        }
+    }
+
+    /// Send one epoch of data through both nodes, advance frontier,
+    /// and wait for both probes to confirm the epoch is processed.
+    fn run_epoch(&self, epoch: u64, left: &[(u64, i64)], right: &[(u64, i64)]) {
+        self.sender_a.send(epoch, left.to_vec()).unwrap();
+        self.sender_b.send(epoch, right.to_vec()).unwrap();
+        self.sender_a.advance_to(epoch + 1).unwrap();
+        self.sender_b.advance_to(epoch + 1).unwrap();
+        // Wait for both nodes to finish processing this epoch.
+        self.tokio_handle.block_on(async {
+            let _ = tokio::join!(
+                self.probe_a.wait_until_done_with(&epoch),
+                self.probe_b.wait_until_done_with(&epoch),
+            );
+        });
+    }
+
+    /// Tear down the cluster.
+    fn finish(mut self, tokio_handle: &tokio::runtime::Handle) {
+        drop(self.sender_a);
+        drop(self.sender_b);
+        let cluster_a = self.cluster_a.take().unwrap();
+        let cluster_b = self.cluster_b.take().unwrap();
+        tokio_handle.block_on(async {
+            let ja = tokio::task::spawn_blocking(move || cluster_a.join_blocking());
+            let jb = tokio::task::spawn_blocking(move || cluster_b.join_blocking());
+            let timeout = tokio::time::timeout(Duration::from_secs(10), async {
+                let _ = tokio::join!(ja, jb);
+            });
+            let _ = timeout.await; // ignore timeout — cluster already drained
+        });
+    }
+}
+
+/// Runs the exchange aggregate benchmark with a persistent 2-node TCP cluster.
+fn run_exchange_aggregate_benchmark(
+    name: &str,
+    tokio_handle: &tokio::runtime::Handle,
+    left_data: &[(u64, i64)],
+    right_data: &[(u64, i64)],
+    elements_per_epoch: u64,
+    duration: Duration,
+    warmup: Duration,
+) -> RunStats {
+    let mut stats = RunStats::new(name, elements_per_epoch);
+    let memory_sample_interval = 100u64;
+
+    println!("    Setting up 2-node TCP cluster...");
+    let cluster = ExchangeCluster::setup(tokio_handle);
+    println!("    Cluster ready.");
+
+    // Warmup
+    println!("    Warming up for {:.0}s...", warmup.as_secs_f64());
+    let warmup_start = Instant::now();
+    let mut epoch = 0u64;
+    while warmup_start.elapsed() < warmup {
+        cluster.run_epoch(epoch, left_data, right_data);
+        epoch += 1;
+    }
+    println!("    Warmup done ({epoch} epochs)");
+
+    // Measurement
+    println!("    Measuring for {:.0}s...", duration.as_secs_f64());
+    let cpu_before = system_snapshot();
+    let measure_start = Instant::now();
+    let mut query_count = 0u64;
+
+    while measure_start.elapsed() < duration {
+        let q_start = Instant::now();
+        cluster.run_epoch(epoch, left_data, right_data);
+        epoch += 1;
+        stats.latencies_us.push(q_start.elapsed().as_micros() as u64);
+        query_count += 1;
+
+        if query_count % memory_sample_interval == 0 {
+            stats.memory_samples_mb.push(system_snapshot().working_set_mb);
+        }
+        if query_count % 1000 == 0 {
+            let elapsed = measure_start.elapsed().as_secs();
+            let remaining = duration.as_secs().saturating_sub(elapsed);
+            print!("\r    [{query_count} queries, {remaining}s remaining]     ");
+        }
+    }
+    println!();
+
+    let cpu_after = system_snapshot();
+    stats.wall_duration = measure_start.elapsed();
+    stats.cpu_user_delta_ms = cpu_after.cpu_user_ms - cpu_before.cpu_user_ms;
+    stats.cpu_kernel_delta_ms = cpu_after.cpu_kernel_ms - cpu_before.cpu_kernel_ms;
+    stats.memory_samples_mb.push(system_snapshot().working_set_mb);
+
+    // Tear down
+    cluster.finish(tokio_handle);
+
+    stats
+}
+
 // =============================================================================
 // Query implementations  timely
 // =============================================================================
@@ -956,15 +1237,21 @@ async fn measure_instancy_small_concurrent(
     (latencies, memory_samples, measure_start.elapsed())
 }
 
-fn warmup_timely_small_concurrent(batch: Arc<Vec<i64>>, concurrency: usize, warmup: Duration) -> u64 {
+fn warmup_timely_small_concurrent(
+    batch: Arc<Vec<i64>>,
+    concurrency: usize,
+    threads: usize,
+    warmup: Duration,
+) -> u64 {
     if warmup.is_zero() {
         return 0;
     }
 
+    let worker_count = concurrency.min(threads);
     let deadline = Instant::now() + warmup;
     let (tx, rx) = std::sync::mpsc::channel::<u64>();
-    let mut handles = Vec::with_capacity(concurrency);
-    for _ in 0..concurrency {
+    let mut handles = Vec::with_capacity(worker_count);
+    for _ in 0..worker_count {
         let batch = batch.clone();
         let tx = tx.clone();
         handles.push(std::thread::spawn(move || {
@@ -988,15 +1275,17 @@ fn warmup_timely_small_concurrent(batch: Arc<Vec<i64>>, concurrency: usize, warm
 fn measure_timely_small_concurrent(
     batch: Arc<Vec<i64>>,
     concurrency: usize,
+    threads: usize,
     duration: Duration,
 ) -> (Vec<u64>, Vec<f64>, Duration) {
+    let worker_count = concurrency.min(threads);
     let memory_sample_interval = 100u64;
     let measure_start = Instant::now();
     let deadline = measure_start + duration;
     let (tx, rx) = std::sync::mpsc::channel::<ConcurrentWorkerMessage>();
-    let mut handles = Vec::with_capacity(concurrency);
+    let mut handles = Vec::with_capacity(worker_count);
 
-    for _ in 0..concurrency {
+    for _ in 0..worker_count {
         let batch = batch.clone();
         let tx = tx.clone();
         handles.push(std::thread::spawn(move || {
@@ -1013,9 +1302,9 @@ fn measure_timely_small_concurrent(
     drop(tx);
 
     let mut completed_workers = 0usize;
-    let mut latencies = Vec::with_capacity(concurrency * 1024);
+    let mut latencies = Vec::with_capacity(worker_count * 1024);
     let mut memory_samples = Vec::new();
-    while completed_workers < concurrency {
+    while completed_workers < worker_count {
         match rx.recv_timeout(Duration::from_millis(200)) {
             Ok(ConcurrentWorkerMessage::Latency(latency)) => {
                 latencies.push(latency);
@@ -1094,18 +1383,19 @@ fn run_sustained_timely_small_concurrent(
     duration: Duration,
     warmup: Duration,
     concurrency: usize,
+    threads: usize,
     batch: Arc<Vec<i64>>,
 ) -> RunStats {
     let mut stats = RunStats::new(name, elements_per_query);
 
     println!("    Warming up for {:.0}s...", warmup.as_secs_f64());
-    let warmup_count = warmup_timely_small_concurrent(batch.clone(), concurrency, warmup);
+    let warmup_count = warmup_timely_small_concurrent(batch.clone(), concurrency, threads, warmup);
     println!("    Warmup done ({warmup_count} queries)");
 
     println!("    Measuring for {:.0}s...", duration.as_secs_f64());
     let cpu_before = system_snapshot();
     let (latencies, memory_samples, wall_duration) =
-        measure_timely_small_concurrent(batch, concurrency, duration);
+        measure_timely_small_concurrent(batch, concurrency, threads, duration);
     let cpu_after = system_snapshot();
 
     stats.latencies_us = latencies;
@@ -1129,6 +1419,7 @@ struct Config {
     library: LibraryFilter,
     cooldown_secs: u64,
     concurrency: usize,
+    threads: usize,
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -1156,6 +1447,7 @@ impl Config {
             library: LibraryFilter::Both,
             cooldown_secs: 5,
             concurrency: 64,
+            threads: 16,
         };
 
         let mut i = 1;
@@ -1199,6 +1491,9 @@ impl Config {
                 "--concurrency" => {
                     config.concurrency = next_val("--concurrency").parse().expect("invalid --concurrency");
                 }
+                "--threads" => {
+                    config.threads = next_val("--threads").parse().expect("invalid --threads");
+                }
                 "--bench" => {}
                 other => {
                     eprintln!("Unknown argument: {other}");
@@ -1208,6 +1503,7 @@ impl Config {
         }
 
         assert!(config.concurrency > 0, "--concurrency must be greater than zero");
+        assert!(config.threads > 0, "--threads must be greater than zero");
         config
     }
 }
@@ -1230,12 +1526,14 @@ fn main() {
     println!("  Warmup:      {:>6}s                                  ", config.warmup_secs);
     println!("  Rounds:      {:>6}                                   ", config.rounds);
     println!("  Cooldown:    {:>6}s between runs                     ", config.cooldown_secs);
-    println!("  Concurrency: {:>6} small-query in-flight/tasks        ", config.concurrency);
+    println!("  Concurrency: {:>6} small-query in-flight cap         ", config.concurrency);
+    println!("  Threads:     {:>6} shared worker-thread budget       ", config.threads);
     println!("");
     println!();
 
     let rt_tokio = tokio::runtime::Runtime::new().unwrap();
     let _guard = rt_tokio.enter();
+    let tokio_handle = tokio::runtime::Handle::current();
 
     println!("Generating test data...");
     let large_items = generate_lineitems(10_000_000);
@@ -1269,18 +1567,34 @@ fn main() {
         multi_epoch_batches[0].1.len()
     );
 
+    // Exchange data: per-epoch batches for the persistent 2-node cluster.
+    // Each "query" sends one epoch through both nodes via TCP exchange.
+    let exchange_records_per_epoch = 10_000u64;
+    let exchange_left_epoch: Vec<(u64, i64)> = (0..exchange_records_per_epoch / 2)
+        .map(|i| (i % 1000, (i * 7 + 3) as i64))
+        .collect();
+    let exchange_right_epoch: Vec<(u64, i64)> = (exchange_records_per_epoch / 2..exchange_records_per_epoch)
+        .map(|i| (i % 1000, (i * 11 + 5) as i64))
+        .collect();
+    println!(
+        "  Exchange+aggregate TCP: {} records/epoch across 2 nodes x 1 worker",
+        exchange_records_per_epoch
+    );
+
     let small_batch = Arc::new((0..100).collect::<Vec<i64>>());
     let small_batch_count = small_batch.len() as u64;
     println!(
-        "  Small pipeline: {} elements/query @ concurrency {}",
+        "  Small pipeline: {} elements/query @ concurrency {} on {} threads",
         small_batch.len(),
-        config.concurrency
+        config.concurrency,
+        config.threads
     );
+
     println!();
 
     let instancy_rt = Arc::new(
         RuntimeHandle::new(RuntimeConfig {
-            worker_threads: 2,
+            worker_threads: config.threads,
             ..RuntimeConfig::default()
         })
         .unwrap(),
@@ -1425,12 +1739,31 @@ fn main() {
                 all_rows.push(SummaryRow::from_stats("MultiEpochFilter", "timely", &stats));
                 std::thread::sleep(cooldown);
             }
+
+            if config.library == LibraryFilter::Both || config.library == LibraryFilter::Instancy {
+                println!(
+                    "\n── Scenario 1E: Instancy-only TCP Exchange + Aggregate ({} records/epoch) ──",
+                    exchange_records_per_epoch
+                );
+
+                let stats = run_exchange_aggregate_benchmark(
+                    "instancy/cluster-exchange-aggregate",
+                    &tokio_handle,
+                    &exchange_left_epoch,
+                    &exchange_right_epoch,
+                    exchange_records_per_epoch,
+                    duration,
+                    warmup,
+                );
+                stats.report();
+                all_rows.push(SummaryRow::from_stats("ExchangeAggregateTcp", "instancy", &stats));
+                std::thread::sleep(cooldown);
+            }
         }
 
         if config.scenario == ScenarioFilter::All || config.scenario == ScenarioFilter::Small {
             println!(
-                "
- Scenario 2: Concurrent High-RPS Small Pipeline ({} elements/query, concurrency {}) ",
+                "\n── Scenario 2: Concurrent High-RPS Small Pipeline ({} elements/query, concurrency {}) ──",
                 small_batch_count,
                 config.concurrency
             );
@@ -1458,6 +1791,7 @@ fn main() {
                     duration,
                     warmup,
                     config.concurrency,
+                    config.threads,
                     small_batch.clone(),
                 );
                 stats.report();
@@ -1471,6 +1805,5 @@ fn main() {
         print_summary_table(&all_rows);
     }
 
-    println!("
-Benchmark complete.");
+    println!("\nBenchmark complete.");
 }
