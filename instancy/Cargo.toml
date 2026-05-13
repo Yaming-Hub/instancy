@@ -92,3 +92,7 @@ harness = false
 [[bench]]
 name = "sustained_comparative"
 harness = false
+
+[[bench]]
+name = "stress_test"
+harness = false
