@@ -222,70 +222,77 @@ synchronization, memory allocation), instancy's shared async pool wins.
 ## 2. Single-Process Criterion Micro-Benchmarks
 
 These benchmarks run in a single process using
-[Criterion](https://github.com/bheisler/criterion.rs). Both frameworks build
-and execute a complete dataflow per iteration. Data is fed in batch form. These
-measure per-query latency without network overhead.
+[Criterion](https://github.com/bheisler/criterion.rs). Both frameworks use
+**identical worker counts** (1 worker thread each, `Config::process(1)` for
+timely) to ensure a fair apples-to-apples comparison. Each Criterion iteration
+builds and executes a complete dataflow, feeds data in batch form, and drains
+to completion. There is no query concurrency — iterations run sequentially.
+
+The 5 scenarios match the sustained cross-process benchmark (Section 1) but
+run in a single process with no TCP exchange.
 
 ```bash
 cargo bench -p instancy --bench comparative
 ```
 
-### 2.1 Large-Data Throughput (1M+ records)
+### 2.1 Results
 
-instancy matches timely's throughput on large workloads — async overhead is
-negligible at scale.
-
-| Query | Size | instancy | timely | Ratio |
+| Scenario | Size | instancy | timely | Speedup |
 |---|---|---|---|---|
-| Q1 scan/filter/aggregate | 1M | 35.7 ms | 34.9 ms | 1.02× |
-| Q1 scan/filter/aggregate | 10M | 348 ms | 345 ms | 1.01× |
-| Q3 filter/map/reduce pipeline | 1M | 31.5 ms | 30.1 ms | 1.05× |
-| Q3 filter/map/reduce pipeline | 10M | 307 ms | 296 ms | 1.04× |
-| Q5 PageRank (100K edges) | 100K | 5.75 ms | 5.59 ms | 1.03× |
+| ScanFilterAgg | 100K | 5.10 ms | 5.76 ms | **1.13×** |
+| ScanFilterAgg | 1M | 50.4 ms | 53.6 ms | **1.06×** |
+| ScanFilterAgg | 10M | 502 ms | 525 ms | **1.05×** |
+| PageRank (10 iter) | 10K edges | 430 µs | 698 µs | **1.62×** |
+| PageRank (10 iter) | 100K edges | 5.64 ms | 6.27 ms | **1.11×** |
+| MapChain (20 stages) | 10K | 335 µs | 1.01 ms | **3.01×** |
+| MapChain (20 stages) | 100K | 848 µs | 5.19 ms | **6.12×** |
+| MapChain (20 stages) | 1M | 11.8 ms | 50.5 ms | **4.28×** |
+| MultiEpoch (16 epochs) | 16×256 | 83 µs | 285 µs | **3.43×** |
+| MultiEpoch (16 epochs) | 16×4096 | 225 µs | 443 µs | **1.97×** |
+| SmallPipeline (3 maps) | 1K | 102 µs | 297 µs | **2.91×** |
+| SmallPipeline (3 maps) | 10K | 126 µs | 399 µs | **3.16×** |
+| SmallPipeline (3 maps) | 100K | 368 µs | 1.28 ms | **3.48×** |
 
-### 2.2 Operator-Chain Throughput
+### 2.2 Single-Process Analysis
 
-instancy's batched async execution amortizes per-operator overhead, making
-deep pipelines significantly faster.
+instancy wins **every scenario** in sequential single-process benchmarks with
+equal thread counts:
 
-| Query | Size | instancy | timely | Speedup |
-|---|---|---|---|---|
-| Q4 10-stage map chain | 10K | 236 µs | 331 µs | **1.4×** |
-| Q4 10-stage map chain | 100K | 562 µs | 2.38 ms | **4.2×** |
-| Q4 10-stage map chain | 1M | 6.98 ms | 25.4 ms | **3.6×** |
+- **Large data (ScanFilterAgg 10M):** instancy is **1.05×** faster — at scale
+  the overhead difference is small but still favours instancy's sweep executor
+  which processes batches without global coordination barriers
+- **Deep operator chains (MapChain 20 stages):** instancy is **3–6× faster** —
+  the sweep executor's batch-streaming design amortizes per-operator overhead
+  across stages. timely's per-stage progress tracking adds overhead that
+  compounds across 20 stages
+- **Multi-epoch workloads:** instancy is **2–3× faster** — epoch advancement
+  in instancy is lightweight (frontier update), while timely's progress
+  protocol involves per-worker coordination per epoch
+- **Small pipelines:** instancy is **2.9–3.5× faster** — even with minimal
+  computation, instancy's lower per-dataflow overhead dominates
 
-### 2.3 Multi-Worker / Exchange
+### 2.3 Sequential vs Parallel Comparison
 
-Async runtime reuse gives instancy an edge in multi-worker dataflows,
-converging at very large data sizes.
+Comparing single-process sequential (Section 2) with cross-process parallel
+(Section 1) shows how instancy's advantage **grows under concurrent load**:
 
-| Query | Workers | Size | instancy | timely | Speedup |
-|---|---|---|---|---|---|
-| Q2 two-way join | 2 | 100K | 8.23 ms | 10.7 ms | **1.3×** |
-| Q2 two-way join | 4 | 100K | 4.30 ms | 6.09 ms | **1.4×** |
-| Q7 exchange + reduce | 2 | 10K | 235 µs | 532 µs | **2.3×** |
-| Q7 exchange + reduce | 4 | 100K | 637 µs | 1.10 ms | **1.7×** |
-| Q7 exchange + reduce | 2 | 1M | 8.46 ms | 6.99 ms | 0.83× |
+| Scenario | Sequential (1 thread, 1 query) | Parallel (16 threads × 2 procs) |
+|---|---|---|
+| ScanFilterAgg | **1.05–1.13×** | **3.5× throughput, 8.7× core eff.** |
+| PageRank | **1.11–1.62×** | **1.2× throughput, 1.4× core eff.** |
+| MapChain | **3.01–6.12×** | **2.8× throughput, 2.1× core eff.** |
+| MultiEpoch | **1.97–3.43×** | **4.1× throughput, 3.6× core eff.** |
+| SmallPipeline | **2.91–3.48×** | **7.1× throughput, 72× core eff.** |
 
-### 2.4 High-RPS Small Queries
-
-instancy's shared async worker pool shines for high-throughput small queries.
-
-| Query | Total Records | instancy | timely | Speedup |
-|---|---|---|---|---|
-| Q6 multi-epoch filter | 16K (256×64) | 165 µs | 209 µs | **1.3×** |
-| Q6 multi-epoch filter | 65K (1024×64) | 400 µs | 757 µs | **1.9×** |
-
-### 2.5 Single-Process Summary
-
-- **Large workloads (1M+):** Within ~5% — instancy matches timely's raw
-  throughput
-- **Deep operator chains:** instancy **3–4× faster** due to batched async
-  execution
-- **Multi-worker exchange:** instancy **1.3–2.3× faster** from runtime reuse
-- **High-RPS small queries:** instancy **1.3–1.9× faster**
-- **Very small data (<10K):** timely ~1.3–2× faster due to lower per-dataflow
-  setup cost
+Key observations:
+- **ScanFilterAgg** scales from 1.05× → 8.7× because timely's per-worker
+  buffers and thread synchronization become the bottleneck at 32 threads
+- **SmallPipeline** scales from ~3× → 72× because timely spawns 2048 threads
+  for 64 concurrent queries (64 × 32), while instancy reuses 16 threads
+- **MapChain** is already 3–6× faster sequentially due to sweep executor
+  efficiency; the parallel advantage is similar (2.1× core efficiency)
+- **PageRank** is compute-dominated — framework overhead matters less in both
+  modes
 
 ## 3. How to Run
 
@@ -329,6 +336,16 @@ cargo bench --bench sustained_comparative -- --duration 60 --scenario large
 ```bash
 cargo bench -p instancy --bench comparative
 ```
+
+The Criterion benchmark (`instancy/benches/comparative.rs`) runs the same
+5 scenarios as the sustained cross-process benchmark but in a **single
+process** with **no TCP exchange**. Both libraries use identical worker
+counts — `Config::process(1)` for timely, `RuntimeConfig { worker_threads: 1 }`
+for instancy — ensuring a fair apples-to-apples comparison.
+
+Each Criterion iteration builds a fresh dataflow, feeds data, and drains to
+completion. Iterations are sequential (no concurrent queries). This isolates
+per-query computational overhead from concurrency and networking effects.
 
 ## 4. Methodology Notes
 

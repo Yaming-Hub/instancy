@@ -410,9 +410,31 @@ cargo run -p instancy --example <name>
 
 ## Benchmarks
 
-Sustained 600-second benchmark with real TCP transport between 2 OS processes,
-16 worker threads each. Both libraries use the same cores, same data, same
-dataflow graphs.
+### Single-Process Sequential (Criterion, 1 worker thread each)
+
+Both libraries use identical worker counts (1 thread). Each iteration builds
+a fresh dataflow, feeds data, and drains to completion — no concurrent queries.
+
+| Scenario | Size | instancy | timely | Speedup |
+|---|---|---|---|---|
+| ScanFilterAgg | 100K | 5.10 ms | 5.76 ms | **1.13×** |
+| ScanFilterAgg | 1M | 50.4 ms | 53.6 ms | **1.06×** |
+| ScanFilterAgg | 10M | 502 ms | 525 ms | **1.05×** |
+| PageRank (10 iter) | 10K edges | 430 µs | 698 µs | **1.62×** |
+| PageRank (10 iter) | 100K edges | 5.64 ms | 6.27 ms | **1.11×** |
+| MapChain (20 stages) | 10K | 335 µs | 1.01 ms | **3.01×** |
+| MapChain (20 stages) | 100K | 848 µs | 5.19 ms | **6.12×** |
+| MapChain (20 stages) | 1M | 11.8 ms | 50.5 ms | **4.28×** |
+| MultiEpoch (16 epochs) | 16×256 | 83 µs | 285 µs | **3.43×** |
+| MultiEpoch (16 epochs) | 16×4096 | 225 µs | 443 µs | **1.97×** |
+| SmallPipeline (3 maps) | 1K | 102 µs | 297 µs | **2.91×** |
+| SmallPipeline (3 maps) | 10K | 126 µs | 399 µs | **3.16×** |
+| SmallPipeline (3 maps) | 100K | 368 µs | 1.28 ms | **3.48×** |
+
+### Cross-Process TCP (600s sustained, 16 threads × 2 processes)
+
+Both libraries use the same cores, same data, same dataflow graphs with real
+TCP transport between 2 OS processes.
 
 | Scenario | Throughput | Latency (p50) | Memory | Core Efficiency |
 |---|---|---|---|---|

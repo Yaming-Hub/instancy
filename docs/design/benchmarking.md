@@ -1,7 +1,12 @@
 # Benchmarking Plan: instancy vs timely-dataflow
 
-This document describes the sustained comparative benchmark methodology used by
-`instancy/benches/sustained_comparative.rs`.
+This document describes the comparative benchmark methodology used by the
+instancy benchmark suite:
+
+- **`instancy/benches/sustained_comparative.rs`** — sustained cross-process
+  TCP benchmark (600-second runs, 2 processes, 16 threads each)
+- **`instancy/benches/comparative.rs`** — single-process Criterion
+  micro-benchmarks (same 5 scenarios, 1 worker thread each, sequential)
 
 ## 1. Overview
 
@@ -257,6 +262,27 @@ cargo bench --bench sustained_comparative --release -- --duration 600 --warmup 3
 | `--threads <N>` | 16 | Per-process worker threads |
 | `--role <NAME>` | coordinator | Internal: `coordinator` or `worker` |
 | `--control-addr <ADDR>` | none | Internal worker control socket address |
+
+### 8.4 Criterion Micro-Benchmarks
+
+```powershell
+cargo bench -p instancy --bench comparative
+```
+
+The Criterion benchmark (`instancy/benches/comparative.rs`) runs the same
+5 scenarios as the sustained benchmark but in a **single process** with
+**no TCP exchange**. Both libraries use identical worker counts:
+
+- **instancy**: `RuntimeConfig { worker_threads: 1 }`
+- **timely**: `Config::process(1)` (spawns 1 worker thread, not
+  `execute_directly`)
+
+Each Criterion iteration builds a fresh dataflow, feeds data, and drains to
+completion. Iterations are sequential (no concurrent queries). This isolates
+per-query computational overhead from concurrency and networking effects.
+
+Data sizes are scaled down from the sustained benchmark to keep each
+iteration in the 0.1–500ms range suitable for Criterion's statistical analysis.
 
 ## 9. Result Interpretation
 
