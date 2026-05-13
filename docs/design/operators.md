@@ -662,6 +662,50 @@ allowing the executor to detect quiescence and complete.
 
 ---
 
+### 9.11 Multi-Output Operators
+
+instancy supports operators with multiple output ports for conditional
+data routing and data duplication.
+
+#### Branch (1→2, selective routing)
+
+`Pipe::branch(name, predicate)` splits a stream into two based on a boolean
+predicate. Each record goes to exactly **one** output — no cloning occurs.
+Records where the predicate returns true go to port 0 (first pipe),
+false to port 1 (second pipe).
+
+Implementation: `WiredBranchOperator` with independent per-port backpressure.
+
+N-way routing composes from binary branches:
+```rust
+// 3-way split:
+let (ab, c) = input.branch("not_c", |_, x| x.kind != Kind::C);
+let (a, b) = ab.branch("a_vs_b", |_, x| x.kind == Kind::A);
+```
+
+#### Fork (1→2, clone-to-both)
+
+`Pipe::fork(name)` duplicates every record to both outputs. `D: Clone` required.
+Use for tapping (logging + processing), metrics, multi-consumer fan-out.
+
+Implementation: `WiredForkOperator` with independent per-port backpressure.
+
+#### Ok/Err Split (1→2, typed routing)
+
+`Pipe::branch_result(name)` splits `Result<V, E>` streams: `Ok(v)` to port 0,
+`Err(e)` to port 1. The two output ports carry different types.
+
+#### Fork vs Branch vs Broadcast
+
+| Operator | Semantics | Scope | Clone required |
+|----------|-----------|-------|----------------|
+| Fork | Clone to **both** outputs | Within worker's dataflow | Yes |
+| Branch | Route to **one** output (predicate) | Within worker's dataflow | No |
+| Broadcast | Send to **all workers** | Cross-network | Yes (implicit) |
+
+Fork and branch are 1→2 operators that compose to 1→N.
+Broadcast is a network-level operator for cross-worker distribution.
+
 ## 10. User-Facing API Example
 
 ```rust
