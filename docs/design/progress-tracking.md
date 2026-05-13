@@ -274,12 +274,154 @@ impl<T: Timestamp> ProbeHandle<T> {
 ```
 
 
-## Additional stage-aware progress notes
+### 11.8 Stage-Aware Progress Tracking
 
-Per-stage execution keeps progress tracking local to each stage's `StageExecutor`. Each executor has its own `ProgressTracker` scoped to its stage's operators. Cross-stage frontier movement happens through boundary exchange channels that embed `FrontierUpdate` and `SenderDone` messages alongside data.
+Per-stage execution keeps progress tracking local to each stage's
+`StageExecutor`. Instead of one worker-wide tracker spanning the full
+dataflow graph, instancy creates one `ProgressTracker` per `(stage,
+worker)` pair. That tracker only contains the operators and internal
+pipeline edges for its own stage.
 
-- Each `StageExecutor` tracks frontiers independently via its local `ProgressTracker`.
-- Cross-stage frontiers are aggregated at the exchange boundary by `FrontierAggregator`, which computes `min(all senders)` across all incoming channels.
-- `CombinedStageExecutor` polls all stages for a given worker, detecting global quiescence when all remaining stages converge.
-- Cross-stage feedback loops (from `iterate()` with exchange inside the loop body) use feedback boundary channels with dependency tracking to prevent premature quiescence.
-- Loop restrictions remain explicit: parallelism changes inside iterative scopes are intentionally constrained.
+This means **no global broadcast is needed within a stage**. A stage's
+operators share pipeline channels inside one executor, so frontier changes
+propagate through the local reachability graph exactly as they do today,
+just over a much smaller graph.
+
+#### Local stage tracking
+
+Within a stage:
+
+- Operators hold and drop capabilities locally.
+- The stage-local `ProgressTracker` propagates pointstamp changes through
+  only that stage's operators.
+- Completion of a timestamp inside the stage is determined without any
+  peer-wide broadcast.
+
+Workers in the same stage do **not** exchange progress directly with one
+another. Each worker tracks its own partition independently. The only place
+where those worker-local frontiers must be combined is at an exchange
+boundary leading into another stage.
+
+#### Exchange boundaries and `FrontierAggregator`
+
+At every cross-stage exchange boundary, the receiver maintains a
+`FrontierAggregator`. Each upstream sender contributes its current frontier,
+and the aggregator computes `min(all senders)` for that incoming edge.
+
+Exchange channels therefore carry three kinds of messages inline:
+
+- `DataBatch(timestamp, Vec<D>)`
+- `FrontierUpdate(Antichain<T>)`
+- `SenderDone`
+
+`FrontierUpdate` tells the downstream stage that a sender's output frontier
+has advanced. `SenderDone` is the terminal signal: that sender will never
+produce more data on the channel.
+
+Because the sender count is known statically when the exchange is wired,
+the aggregator can keep one frontier per sender and recompute the aggregate
+minimum whenever any sender advances or finishes.
+
+#### Completion cascading across stage boundaries
+
+Stage completion is no longer a single global tracker saying
+`tracking_anything() == false` for the entire graph. Instead, completion
+cascades downstream:
+
+1. An upstream stage drains its operators and advances its output frontier
+   to empty.
+2. It emits final `FrontierUpdate` messages and then `SenderDone` on all
+   outgoing exchange channels.
+3. The downstream `FrontierAggregator` observes all senders done for that
+   input, so the input frontier eventually becomes empty.
+4. Once that downstream stage has no remaining input frontier and no local
+   buffered work, it completes and repeats the process for its own outputs.
+
+`DataflowCompletionBarrier` coordinates the node-local bookkeeping around
+this cascade: each `StageExecutor` decrements the barrier when it reaches
+local completion, while `SenderDone` and empty frontiers drive completion
+through the stage graph itself.
+
+#### Cross-stage feedback loops
+
+Within-stage feedback works the same way as timely-style local progress
+tracking: the stage-local reachability graph handles the cycle.
+
+Cross-stage feedback loops are treated as exchange boundaries with the same
+message protocol. The feedback edge carries data plus `FrontierUpdate`
+messages back to the earlier stage. That stage combines:
+
+- the frontier from the normal loop-entry input, and
+- the aggregated frontier from the feedback channel.
+
+As the loop body finishes an iteration and advances its feedback frontier,
+that `FrontierUpdate` flows back across the boundary. When all feedback
+senders eventually report `SenderDone`, the earlier stage knows no more
+iterations can arrive, its input frontier can become empty, and completion
+continues cascading forward.
+
+### 11.9 Comparison: instancy vs timely-dataflow Progress Tracking
+
+instancy preserves the core timely-dataflow model inside each stage:
+capabilities, pointstamps, path summaries, antichains, and reachability are
+still the fundamental tools for reasoning about logical time. What changes
+is the **scope** of tracking and how frontier information crosses worker and
+stage boundaries.
+
+| Aspect | timely-dataflow | instancy |
+|--------|----------------|----------|
+| Tracker scope | One per worker, covers entire dataflow graph | One per stage×worker, covers only stage's operators |
+| Progress broadcast | All-to-all broadcast of capability changes to all peer workers | No global broadcast — frontier updates flow inline with data through exchange channels |
+| Ghost operators | Required for stages where a worker has no real operators | Eliminated — each StageExecutor only contains its stage's operators |
+| Frontier propagation | Reachability algorithm across the full graph | Local reachability within stage + FrontierAggregator at exchange boundaries |
+| Completion detection | Single tracker's `tracking_anything() == false` | Per-stage completion cascading via SenderDone, coordinated by DataflowCompletionBarrier |
+| Feedback loops | Handled within the single global tracker | Within-stage: same as timely. Cross-stage: feedback as exchange channel with frontier updates |
+
+#### What instancy preserves from timely
+
+instancy keeps the same logical-time foundations:
+
+- **Capabilities** still represent permission to produce data at a timestamp.
+- **Pointstamps** still summarize outstanding work in the progress graph.
+- **Path summaries** still describe timestamp transformation across edges.
+- **Antichains** still represent frontiers compactly.
+- **Reachability** still determines how progress changes propagate through
+  operators.
+
+For operators inside a single stage, the behavior is intentionally the same
+as the classic timely model — frontier reasoning remains local, precise,
+and incremental.
+
+#### What instancy changes
+
+The major change is that progress tracking becomes **stage-local** instead
+of worker-global.
+
+A timely worker tracks the full graph and learns peer progress via an
+all-to-all broadcast of capability deltas. instancy instead gives each
+`StageExecutor` a small local tracker and pushes cross-stage frontier
+movement through ordinary exchange channels using `FrontierUpdate` and
+`SenderDone` messages.
+
+That change removes the need for ghost operators. If a worker does not
+participate in a stage, there is simply no StageExecutor and no progress
+subgraph for that worker-stage pair.
+
+#### Why instancy's model is better for staged execution
+
+For staged execution with varying per-stage parallelism, the instancy model
+has several advantages:
+
+- **Smaller tracker graphs**: each tracker only contains one stage's
+  operators, which reduces bookkeeping and simplifies reasoning.
+- **No ghost operators**: non-participating workers do not need placeholder
+  nodes just to keep progress connected.
+- **Better isolation**: unrelated stages do not exchange progress traffic or
+  delay one another's frontier visibility.
+- **Natural completion cascade**: `SenderDone` and empty frontiers propagate
+  completion through the actual stage topology.
+
+The result is a design that keeps timely's correctness machinery where it is
+most valuable, while replacing the global broadcast protocol with a
+stage-aware, exchange-driven progress flow better matched to instancy's
+per-stage executor architecture.
