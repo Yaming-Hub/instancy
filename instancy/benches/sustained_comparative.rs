@@ -1360,7 +1360,6 @@ fn instancy_map_chain(
                 pipe = pipe.map(format!("step_{idx}"), |_t, value| value + 1);
             }
             pipe.exchange_by_hash("exchange", |value: &i64| *value as u64)
-                .exchange_by_hash("gather", |_value: &i64| 0u64)
                 .for_each("sink", |_t, batch| {
                     black_box(batch);
                 });
@@ -1401,7 +1400,6 @@ fn instancy_multi_epoch(
                 .unwrap()
                 .filter("threshold", |_t, value| *value > MULTI_EPOCH_THRESHOLD)
                 .exchange_by_hash("exchange", |value: &u64| *value)
-                .exchange_by_hash("gather", |_value: &u64| 0u64)
                 .for_each("sink", |_t, batch| {
                     black_box(batch);
                 });
@@ -1454,7 +1452,6 @@ fn instancy_small_pipeline(
                 .map("mul2", |_t, value| value * 2)
                 .map("sub1", |_t, value| value - 1)
                 .exchange_by_hash("exchange", |value: &i64| *value as u64)
-                .exchange_by_hash("gather", |_value: &i64| 0u64)
                 .for_each("sink", |_t, batch| {
                     black_box(batch);
                 });
@@ -1646,7 +1643,6 @@ fn timely_map_chain(process: usize, threads: usize, port0: u16, port1: u16) -> u
             }
             let probe = stream
                 .exchange(|value: &i64| *value as u64)
-                .exchange(|_value: &i64| 0u64)
                 .inspect(move |batch| {
                     if is_gather_root {
                         black_box(batch);
@@ -1691,7 +1687,6 @@ fn timely_multi_epoch(process: usize, threads: usize, port0: u16, port1: u16) ->
             let probe = stream
                 .filter(|value| *value > MULTI_EPOCH_THRESHOLD)
                 .exchange(|value: &u64| *value)
-                .exchange(|_value: &u64| 0u64)
                 .inspect(move |batch| {
                     if is_gather_root {
                         black_box(batch);
@@ -1737,7 +1732,6 @@ fn timely_small_pipeline(process: usize, threads: usize, port0: u16, port1: u16)
                 .map(|value| value * 2)
                 .map(|value| value - 1)
                 .exchange(|value: &i64| *value as u64)
-                .exchange(|_value: &i64| 0u64)
                 .inspect(move |batch| {
                     if is_gather_root {
                         black_box(batch);
