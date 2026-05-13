@@ -571,7 +571,7 @@ fn collect_multi_worker_metrics(
 }
 
 fn total_metrics_core_time(metrics: &[Arc<instancy::metrics::DataflowMetrics>]) -> Duration {
-    metrics.iter().map(|metrics| metrics.total_cpu_time()).sum()
+    metrics.iter().map(|metrics| metrics.total_core_time()).sum()
 }
 
 fn sum_thread_times(thread_times: &Arc<std::sync::Mutex<Vec<Duration>>>) -> Duration {

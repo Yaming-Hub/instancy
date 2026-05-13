@@ -566,6 +566,13 @@ pub struct DataflowMetrics {
     name: String,
     /// Wall-clock time since the dataflow started.
     wall_time_nanos: AtomicU64,
+    /// Total time spent in executor sweeps (nanoseconds).
+    /// Includes both operator activations and scheduling overhead (queue
+    /// management, progress propagation, cancellation checks, etc.).
+    /// This represents the actual CPU core-seconds consumed by this dataflow.
+    sweep_time_nanos: AtomicU64,
+    /// Number of executor sweeps completed.
+    sweep_count: AtomicU64,
     /// Per-operator metrics collectors.
     operators: Vec<Arc<OperatorMetricsCollector>>,
     /// Per-exchange-edge channel metrics collectors.
@@ -580,6 +587,8 @@ impl DataflowMetrics {
         Self {
             name: name.into(),
             wall_time_nanos: AtomicU64::new(0),
+            sweep_time_nanos: AtomicU64::new(0),
+            sweep_count: AtomicU64::new(0),
             operators: Vec::new(),
             channels: Vec::new(),
             timelines: Vec::new(),
@@ -632,6 +641,46 @@ impl DataflowMetrics {
     /// Total CPU time across all operators.
     pub fn total_cpu_time(&self) -> Duration {
         self.operators.iter().map(|op| op.snapshot().cpu_time).sum()
+    }
+
+    /// Total executor scheduling overhead time.
+    ///
+    /// This is the time spent by the executor outside of operator activations:
+    /// queue management, progress propagation, cancellation checks, etc.
+    /// Computed as total sweep time minus operator CPU time.
+    pub fn scheduling_time(&self) -> Duration {
+        self.sweep_time().saturating_sub(self.total_cpu_time())
+    }
+
+    /// Total time spent in executor sweeps (operator activations + scheduling).
+    ///
+    /// This represents the actual CPU core-seconds consumed by this dataflow,
+    /// excluding any time the async runtime spent idle or scheduling other tasks.
+    pub fn sweep_time(&self) -> Duration {
+        Duration::from_nanos(self.sweep_time_nanos.load(Ordering::Relaxed))
+    }
+
+    /// Total core time = sweep time (operator activations + scheduling overhead).
+    ///
+    /// Alias for [`sweep_time()`](Self::sweep_time) — the complete CPU core
+    /// consumption of this dataflow worker.
+    pub fn total_core_time(&self) -> Duration {
+        self.sweep_time()
+    }
+
+    /// Number of executor sweeps completed.
+    pub fn sweep_count(&self) -> u64 {
+        self.sweep_count.load(Ordering::Relaxed)
+    }
+
+    /// Record the duration of one executor sweep.
+    ///
+    /// Called by the executor after each sweep. The sweep duration includes
+    /// both operator activation time and scheduling overhead.
+    pub fn record_sweep(&self, duration: Duration) {
+        self.sweep_time_nanos
+            .fetch_add(duration.as_nanos() as u64, Ordering::Relaxed);
+        self.sweep_count.fetch_add(1, Ordering::Relaxed);
     }
 
     /// Total activations across all operators.

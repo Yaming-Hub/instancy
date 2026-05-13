@@ -1507,6 +1507,27 @@ impl<T: Timestamp> DataflowExecutor<T> {
     /// This is the core building block for both sync [`run()`](Self::run)
     /// and async [`poll_run()`](#method.poll_run).
     fn run_one_sweep(&mut self) -> Result<SweepOutcome> {
+        // Measure total sweep time when metrics are enabled.
+        let sweep_start = if self.dataflow_metrics.is_some() {
+            Some(Instant::now())
+        } else {
+            None
+        };
+
+        let outcome = self.run_one_sweep_inner()?;
+
+        // Record scheduling overhead = total sweep time - operator activation time.
+        // Operator time is already accumulated via record_activation() inside the
+        // activation methods. The delta here captures queue management, progress
+        // propagation, cancellation checks, and other executor bookkeeping.
+        if let (Some(start), Some(metrics)) = (sweep_start, self.dataflow_metrics.as_ref()) {
+            metrics.record_sweep(start.elapsed());
+        }
+
+        Ok(outcome)
+    }
+
+    fn run_one_sweep_inner(&mut self) -> Result<SweepOutcome> {
         // Drain incoming control signals (non-blocking).
         // This is checked BEFORE the cancellation check so that control
         // signals are consumed even when cancellation is already in flight.
