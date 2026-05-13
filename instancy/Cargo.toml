@@ -88,3 +88,7 @@ harness = false
 [[bench]]
 name = "comparative"
 harness = false
+
+[[bench]]
+name = "sustained_comparative"
+harness = false
