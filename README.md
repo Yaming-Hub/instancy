@@ -410,64 +410,41 @@ cargo run -p instancy --example <name>
 
 ## Benchmarks
 
-Comparative benchmarks against [timely-dataflow](https://github.com/TimelyDataflow/timely-dataflow) v0.12 using [Criterion](https://github.com/bheisler/criterion.rs). Both frameworks build and execute a complete dataflow per iteration. Data is fed in batch form to both sides. Run with:
+### Single-Process Sequential (Criterion, 1 worker thread each)
 
-```bash
-cargo bench -p instancy --bench comparative
-```
+Both libraries use identical worker counts (1 thread). Each iteration builds
+a fresh dataflow, feeds data, and drains to completion — no concurrent queries.
 
-### Large-Data Throughput (1M+ records)
-
-instancy matches timely's throughput on large workloads — the async overhead is negligible at scale.
-
-| Query | Size | instancy | timely | Ratio |
+| Scenario | Size | instancy | timely | Speedup |
 |---|---|---|---|---|
-| Q1 scan/filter/aggregate | 1M | 35.7 ms | 34.9 ms | 1.02× |
-| Q1 scan/filter/aggregate | 10M | 348 ms | 345 ms | 1.01× |
-| Q3 filter/map/reduce pipeline | 1M | 31.5 ms | 30.1 ms | 1.05× |
-| Q3 filter/map/reduce pipeline | 10M | 307 ms | 296 ms | 1.04× |
-| Q5 PageRank (100K edges) | 100K | 5.75 ms | 5.59 ms | 1.03× |
+| ScanFilterAgg | 100K | 5.10 ms | 5.76 ms | **1.13×** |
+| ScanFilterAgg | 1M | 50.4 ms | 53.6 ms | **1.06×** |
+| ScanFilterAgg | 10M | 502 ms | 525 ms | **1.05×** |
+| PageRank (10 iter) | 10K edges | 430 µs | 698 µs | **1.62×** |
+| PageRank (10 iter) | 100K edges | 5.64 ms | 6.27 ms | **1.11×** |
+| MapChain (20 stages) | 10K | 335 µs | 1.01 ms | **3.01×** |
+| MapChain (20 stages) | 100K | 848 µs | 5.19 ms | **6.12×** |
+| MapChain (20 stages) | 1M | 11.8 ms | 50.5 ms | **4.28×** |
+| MultiEpoch (16 epochs) | 16×256 | 83 µs | 285 µs | **3.43×** |
+| MultiEpoch (16 epochs) | 16×4096 | 225 µs | 443 µs | **1.97×** |
+| SmallPipeline (3 maps) | 1K | 102 µs | 297 µs | **2.91×** |
+| SmallPipeline (3 maps) | 10K | 126 µs | 399 µs | **3.16×** |
+| SmallPipeline (3 maps) | 100K | 368 µs | 1.28 ms | **3.48×** |
 
-### Operator-Chain Throughput
+### Cross-Process TCP (600s sustained, 16 threads × 2 processes)
 
-instancy's batched async execution amortizes per-operator overhead, making deep pipelines significantly faster.
+Both libraries use the same cores, same data, same dataflow graphs with real
+TCP transport between 2 OS processes.
 
-| Query | Size | instancy | timely | Speedup |
+| Scenario | Throughput | Latency (p50) | Memory | Core Efficiency |
 |---|---|---|---|---|
-| Q4 10-stage map chain | 10K | 236 µs | 331 µs | **1.4×** |
-| Q4 10-stage map chain | 100K | 562 µs | 2.38 ms | **4.2×** |
-| Q4 10-stage map chain | 1M | 6.98 ms | 25.4 ms | **3.6×** |
+| **ScanFilterAgg** (100M records) | **3.5×** | **3.7×** faster | **13.6×** less | **8.7×** better |
+| **PageRank** (200K vertices, 100 iter) | **1.2×** | **1.2×** faster | ~equal | **1.4×** better |
+| **MapChain** (5M × 20 stages) | **2.8×** | **2.8×** faster | **1.4×** less | **2.1×** better |
+| **MultiEpoch** (16 × 4096 records) | **4.1×** | **5.0×** faster | **1.2×** less | **3.6×** better |
+| **SmallPipeline** (100 vals, ×64 concurrent) | **7.1×** | **6.5×** faster | **1.9×** less | **72×** better |
 
-### Multi-Worker / Exchange
-
-Async runtime reuse gives instancy an edge in multi-worker dataflows, converging at very large data sizes.
-
-| Query | Workers | Size | instancy | timely | Speedup |
-|---|---|---|---|---|---|
-| Q2 two-way join | 2 | 100K | 8.23 ms | 10.7 ms | **1.3×** |
-| Q2 two-way join | 4 | 100K | 4.30 ms | 6.09 ms | **1.4×** |
-| Q7 exchange + reduce | 2 | 10K | 235 µs | 532 µs | **2.3×** |
-| Q7 exchange + reduce | 4 | 100K | 637 µs | 1.10 ms | **1.7×** |
-| Q7 exchange + reduce | 2 | 1M | 8.46 ms | 6.99 ms | 0.83× |
-
-### High-RPS Small Queries
-
-instancy's shared async worker pool shines for high-throughput small queries — the core design goal.
-
-| Query | Total Records | instancy | timely | Speedup |
-|---|---|---|---|---|
-| Q6 multi-epoch filter | 16K (256×64) | 165 µs | 209 µs | **1.3×** |
-| Q6 multi-epoch filter | 65K (1024×64) | 400 µs | 757 µs | **1.9×** |
-
-### Summary
-
-- **Large workloads (1M+):** Both frameworks within ~5% — instancy matches timely's raw throughput.
-- **Deep operator chains:** instancy **3–4× faster** due to batched async execution.
-- **Multi-worker joins/exchange:** instancy **1.3–2.3× faster** from runtime reuse.
-- **High-RPS small queries:** instancy **1.3–1.9× faster** — validates the async pool design.
-- **Very small data (<10K):** timely is ~1.3–2× faster due to lower per-dataflow setup cost (`execute_directly` is zero-overhead vs async spawn).
-
-> **Note:** Results from a single machine (Windows, Criterion default settings, `--sample-size 10`). Your results may vary depending on hardware and OS.
+> **[Full benchmark results, analysis, and methodology →](./docs/benchmark-results.md)**
 
 ## Testing
 
