@@ -23,14 +23,14 @@ use instancy::{
 };
 use tokio::net::{TcpListener, TcpStream};
 
-const SCAN_FILTER_AGG_RECORDS: u64 = 500_000_000;
-const PAGERANK_VERTICES: u64 = 500_000;
-const PAGERANK_EDGES: u64 = 5_000_000;
+const SCAN_FILTER_AGG_RECORDS: u64 = 100_000_000;
+const PAGERANK_VERTICES: u64 = 200_000;
+const PAGERANK_EDGES: u64 = 2_000_000;
 const PAGERANK_ITERATIONS: usize = 100;
-const MAP_CHAIN_VALUES: u64 = 200_000_000;
-const MAP_CHAIN_STAGES: usize = 10;
-const MULTI_EPOCHS: u64 = 32;
-const MULTI_EPOCH_BATCH_SIZE: u64 = 131_072;
+const MAP_CHAIN_VALUES: u64 = 5_000_000;
+const MAP_CHAIN_STAGES: usize = 20;
+const MULTI_EPOCHS: u64 = 16;
+const MULTI_EPOCH_BATCH_SIZE: u64 = 4_096;
 const MULTI_EPOCH_THRESHOLD: u64 = (MULTI_EPOCHS * MULTI_EPOCH_BATCH_SIZE) / 2;
 const SMALL_PIPELINE_VALUES: u64 = 100;
 const LARGE_QUERY_CONCURRENCY: usize = 2;
@@ -675,7 +675,7 @@ impl ScenarioKind {
         match self {
             Self::ScanFilterAgg => "Large Scan-Filter-Aggregate",
             Self::PageRank => "Large PageRank",
-            Self::MapChain10 => "Large 10-Stage Map Chain",
+            Self::MapChain10 => "Large 20-Stage Map Chain",
             Self::MultiEpochFilter => "Multi-Epoch Filter",
             Self::SmallPipeline => "Concurrent High-RPS Small Pipeline",
         }
