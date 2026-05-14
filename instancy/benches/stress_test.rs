@@ -3,7 +3,7 @@ use std::env;
 use std::f64::consts::PI;
 use std::fmt;
 use std::hint::black_box;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -91,11 +91,7 @@ fn system_snapshot() -> SystemSnapshot {
     }
     unsafe extern "system" {
         fn GetCurrentProcess() -> isize;
-        fn K32GetProcessMemoryInfo(
-            h: isize,
-            pmc: *mut ProcessMemoryCounters,
-            cb: u32,
-        ) -> i32;
+        fn K32GetProcessMemoryInfo(h: isize, pmc: *mut ProcessMemoryCounters, cb: u32) -> i32;
         fn GetProcessTimes(
             h: isize,
             creation: *mut FileTime,
@@ -120,21 +116,14 @@ fn system_snapshot() -> SystemSnapshot {
         let mut exit: FileTime = mem::zeroed();
         let mut kernel: FileTime = mem::zeroed();
         let mut user: FileTime = mem::zeroed();
-        let (user_ms, kernel_ms) = if GetProcessTimes(
-            h,
-            &mut creation,
-            &mut exit,
-            &mut kernel,
-            &mut user,
-        ) != 0
-        {
-            let ft_to_ms = |ft: &FileTime| {
-                ((ft.high as u64) << 32 | ft.low as u64) as f64 / 10_000.0
+        let (user_ms, kernel_ms) =
+            if GetProcessTimes(h, &mut creation, &mut exit, &mut kernel, &mut user) != 0 {
+                let ft_to_ms =
+                    |ft: &FileTime| ((ft.high as u64) << 32 | ft.low as u64) as f64 / 10_000.0;
+                (ft_to_ms(&user), ft_to_ms(&kernel))
+            } else {
+                (0.0, 0.0)
             };
-            (ft_to_ms(&user), ft_to_ms(&kernel))
-        } else {
-            (0.0, 0.0)
-        };
         SystemSnapshot {
             working_set_mb: ws,
             peak_working_set_mb: pws,
@@ -213,6 +202,7 @@ enum SizeClass {
 struct QuerySpec {
     query_type: QueryType,
     size_class: Option<SizeClass>,
+    timeout: Option<Duration>,
     map_values: usize,
     map_stages: usize,
     multi_epochs: u64,
@@ -230,6 +220,7 @@ impl QuerySpec {
         Self {
             query_type,
             size_class: None,
+            timeout: None,
             map_values: 0,
             map_stages: 0,
             multi_epochs: 0,
@@ -279,6 +270,7 @@ enum Outcome {
     ExpectedFailure,
     UnexpectedFailure,
     Cancelled,
+    Timeout,
 }
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -289,6 +281,7 @@ struct TypeStats {
     expected_failures: u64,
     unexpected_failures: u64,
     cancelled: u64,
+    timeouts: u64,
 }
 
 #[derive(Clone, Debug)]
@@ -307,6 +300,7 @@ struct SharedMetrics {
     expected_failures: AtomicU64,
     unexpected_failures: AtomicU64,
     cancelled: AtomicU64,
+    timeouts: AtomicU64,
     in_flight: Arc<AtomicU64>,
     per_type: Mutex<HashMap<&'static str, TypeStats>>,
     snapshots: Mutex<Vec<SnapshotSample>>,
@@ -326,6 +320,7 @@ impl SharedMetrics {
             expected_failures: AtomicU64::new(0),
             unexpected_failures: AtomicU64::new(0),
             cancelled: AtomicU64::new(0),
+            timeouts: AtomicU64::new(0),
             in_flight,
             per_type: Mutex::new(per_type),
             snapshots: Mutex::new(Vec::new()),
@@ -368,6 +363,10 @@ impl SharedMetrics {
             Outcome::Cancelled => {
                 self.cancelled.fetch_add(1, Ordering::Relaxed);
                 stats.cancelled += 1;
+            }
+            Outcome::Timeout => {
+                self.timeouts.fetch_add(1, Ordering::Relaxed);
+                stats.timeouts += 1;
             }
         }
     }
@@ -490,7 +489,8 @@ fn main() {
             }
         }
 
-        let should_report = now >= next_report || (stopped_submitting && in_flight.load(Ordering::Relaxed) == 0);
+        let should_report =
+            now >= next_report || (stopped_submitting && in_flight.load(Ordering::Relaxed) == 0);
         if should_report {
             let snapshot = system_snapshot();
             let elapsed_secs = now.saturating_duration_since(start).as_secs();
@@ -506,7 +506,7 @@ fn main() {
             };
 
             println!(
-                "[{}] submitted={} completed={} in_flight={} success={} expected_failure={} unexpected_failure={} cancelled={} rps_5m={:.2} rss_mb={:.1} peak_mb={:.1} cpu={:.1}%",
+                "[{}] submitted={} completed={} in_flight={} success={} expected_failure={} unexpected_failure={} cancelled={} timeout={} rps_5m={:.2} rss_mb={:.1} peak_mb={:.1} cpu={:.1}%",
                 format_hms(elapsed_secs),
                 shared.submitted.load(Ordering::Relaxed),
                 shared.completed.load(Ordering::Relaxed),
@@ -515,6 +515,7 @@ fn main() {
                 shared.expected_failures.load(Ordering::Relaxed),
                 shared.unexpected_failures.load(Ordering::Relaxed),
                 shared.cancelled.load(Ordering::Relaxed),
+                shared.timeouts.load(Ordering::Relaxed),
                 recent_submissions.len() as f64 / REPORT_RPS_WINDOW_SECS as f64,
                 snapshot.working_set_mb,
                 snapshot.peak_working_set_mb,
@@ -532,11 +533,12 @@ fn main() {
             break;
         }
 
-        let sleep_until = if !stopped_submitting && in_flight.load(Ordering::Relaxed) < MAX_IN_FLIGHT {
-            next_submit.min(next_report)
-        } else {
-            next_report
-        };
+        let sleep_until =
+            if !stopped_submitting && in_flight.load(Ordering::Relaxed) < MAX_IN_FLIGHT {
+                next_submit.min(next_report)
+            } else {
+                next_report
+            };
         let now = Instant::now();
         let sleep_for = sleep_until
             .checked_duration_since(now)
@@ -650,7 +652,9 @@ fn choose_query(rng: &mut Rng, config: &Config) -> QuerySpec {
         return QuerySpec::new(QueryType::Cancellation);
     }
     if special < config.cancel_rate + config.failure_rate {
-        return QuerySpec::new(QueryType::FailureInjection);
+        let mut spec = QuerySpec::new(QueryType::FailureInjection);
+        spec.timeout = Some(Duration::from_secs(10));
+        return spec;
     }
 
     let mix = rng.next_f64();
@@ -668,12 +672,14 @@ fn choose_small_query(rng: &mut Rng) -> QuerySpec {
         0 => {
             let mut spec = QuerySpec::new(QueryType::SmallPipeline);
             spec.size_class = Some(SizeClass::Small);
+            spec.timeout = Some(Duration::from_secs(10));
             spec.small_values = rng.range_usize(100, 1_000);
             spec
         }
         1 => {
             let mut spec = QuerySpec::new(QueryType::MultiEpoch);
             spec.size_class = Some(SizeClass::Small);
+            spec.timeout = Some(Duration::from_secs(10));
             spec.multi_epochs = 16;
             spec.multi_batch_size = 256;
             spec.multi_threshold = (spec.multi_epochs * spec.multi_batch_size) / 2;
@@ -682,6 +688,7 @@ fn choose_small_query(rng: &mut Rng) -> QuerySpec {
         _ => {
             let mut spec = QuerySpec::new(QueryType::MapChain20);
             spec.size_class = Some(SizeClass::Small);
+            spec.timeout = Some(Duration::from_secs(10));
             spec.map_values = 1_000;
             spec.map_stages = 5;
             spec
@@ -694,12 +701,14 @@ fn choose_medium_query(rng: &mut Rng) -> QuerySpec {
         0 => {
             let mut spec = QuerySpec::new(QueryType::ScanFilterAgg);
             spec.size_class = Some(SizeClass::Medium);
+            spec.timeout = Some(Duration::from_secs(30));
             spec.scan_records = 100_000;
             spec
         }
         1 => {
             let mut spec = QuerySpec::new(QueryType::MapChain20);
             spec.size_class = Some(SizeClass::Medium);
+            spec.timeout = Some(Duration::from_secs(30));
             spec.map_values = rng.range_usize(MAP_CHAIN_MEDIUM_MIN, MAP_CHAIN_MEDIUM_MAX);
             spec.map_stages = 20;
             spec
@@ -707,6 +716,7 @@ fn choose_medium_query(rng: &mut Rng) -> QuerySpec {
         _ => {
             let mut spec = QuerySpec::new(QueryType::MultiEpoch);
             spec.size_class = Some(SizeClass::Medium);
+            spec.timeout = Some(Duration::from_secs(30));
             spec.multi_epochs = 16;
             spec.multi_batch_size = 4_096;
             spec.multi_threshold = (spec.multi_epochs * spec.multi_batch_size) / 2;
@@ -719,11 +729,13 @@ fn choose_large_query(rng: &mut Rng) -> QuerySpec {
     if rng.next() & 1 == 0 {
         let mut spec = QuerySpec::new(QueryType::ScanFilterAgg);
         spec.size_class = Some(SizeClass::Large);
+        spec.timeout = Some(Duration::from_secs(120));
         spec.scan_records = 1_000_000;
         spec
     } else {
         let mut spec = QuerySpec::new(QueryType::PageRank);
         spec.size_class = Some(SizeClass::Large);
+        spec.timeout = Some(Duration::from_secs(120));
         spec.pagerank_vertices = 10_000;
         spec.pagerank_edges = 100_000;
         spec.pagerank_iterations = PAGERANK_ITERATIONS;
@@ -740,11 +752,50 @@ fn spawn_query_thread(
     let name = format!("stress-query-{}-rt{runtime_idx}", spec.label());
     let label = spec.label();
     let shared_for_thread = Arc::clone(&shared);
+    let timeout = spec.timeout;
+
     let spawn_result = thread::Builder::new().name(name).spawn(move || {
+        let (token, timed_out_flag) = if let Some(duration) = timeout {
+            let token = CancellationToken::new();
+            let timer_token = token.clone();
+            let done = Arc::new(AtomicBool::new(false));
+            let done_for_timer = Arc::clone(&done);
+            let timed_out = Arc::new(AtomicBool::new(false));
+            let timed_out_for_timer = Arc::clone(&timed_out);
+
+            thread::spawn(move || {
+                let start = Instant::now();
+                while start.elapsed() < duration {
+                    if done_for_timer.load(Ordering::Relaxed) {
+                        return;
+                    }
+                    thread::sleep(Duration::from_millis(100));
+                }
+                if !done_for_timer.load(Ordering::Relaxed) {
+                    timed_out_for_timer.store(true, Ordering::Relaxed);
+                    timer_token.cancel();
+                }
+            });
+
+            (Some((token, done)), Some(timed_out))
+        } else {
+            (None, None)
+        };
+
+        let cancel_token = token.as_ref().map(|(token, _)| token.clone());
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            execute_query(runtime.as_ref(), &spec)
+            execute_query(runtime.as_ref(), &spec, cancel_token)
         }));
-        let (outcome, detail) = classify_result(&spec, result);
+
+        if let Some((_, done)) = &token {
+            done.store(true, Ordering::Relaxed);
+        }
+
+        let timed_out = timed_out_flag
+            .as_ref()
+            .map(|flag| flag.load(Ordering::Relaxed))
+            .unwrap_or(false);
+        let (outcome, detail) = classify_result(&spec, result, timed_out);
         shared_for_thread.record_completion(label, outcome, detail);
     });
 
@@ -760,6 +811,7 @@ fn spawn_query_thread(
 fn classify_result(
     spec: &QuerySpec,
     result: Result<instancy::Result<()>, Box<dyn std::any::Any + Send>>,
+    timed_out: bool,
 ) -> (Outcome, Option<String>) {
     match result {
         Ok(Ok(())) => match spec.query_type {
@@ -773,36 +825,43 @@ fn classify_result(
             ),
             _ => (Outcome::Success, None),
         },
-        Ok(Err(err)) => match spec.query_type {
-            QueryType::FailureInjection => {
-                if err.to_string().contains("injected failure") {
-                    (Outcome::ExpectedFailure, None)
-                } else {
-                    (
-                        Outcome::UnexpectedFailure,
-                        Some(format!("expected injected failure, got: {err}")),
-                    )
-                }
+        Ok(Err(err)) => {
+            if timed_out && is_cancelled_error(&err) {
+                return (Outcome::Timeout, None);
             }
-            QueryType::Cancellation => match err {
-                instancy::Error::Cancelled { .. } => (Outcome::Cancelled, None),
-                other => {
-                    let text = other.to_string();
-                    if text.to_ascii_lowercase().contains("cancel") {
+            match spec.query_type {
+                QueryType::FailureInjection => {
+                    if err.to_string().contains("injected failure") {
+                        (Outcome::ExpectedFailure, None)
+                    } else {
+                        (
+                            Outcome::UnexpectedFailure,
+                            Some(format!("expected injected failure, got: {err}")),
+                        )
+                    }
+                }
+                QueryType::Cancellation => {
+                    if matches!(err, instancy::Error::Cancelled { .. })
+                        || err.to_string().to_ascii_lowercase().contains("cancel")
+                    {
                         (Outcome::Cancelled, None)
                     } else {
+                        let text = err.to_string();
                         (
                             Outcome::UnexpectedFailure,
                             Some(format!("expected cancellation, got: {text}")),
                         )
                     }
                 }
-            },
-            _ => (Outcome::UnexpectedFailure, Some(err.to_string())),
-        },
+                _ => (Outcome::UnexpectedFailure, Some(err.to_string())),
+            }
+        }
         Err(payload) => (
             Outcome::UnexpectedFailure,
-            Some(format!("query thread panicked: {}", panic_payload_to_string(payload))),
+            Some(format!(
+                "query thread panicked: {}",
+                panic_payload_to_string(payload)
+            )),
         ),
     }
 }
@@ -817,29 +876,53 @@ fn panic_payload_to_string(payload: Box<dyn std::any::Any + Send>) -> String {
     }
 }
 
-fn execute_query(runtime: &RuntimeHandle, spec: &QuerySpec) -> instancy::Result<()> {
+fn is_cancelled_error(err: &instancy::Error) -> bool {
+    matches!(err, instancy::Error::Cancelled { .. })
+}
+
+fn spawn_options(cancel_token: Option<CancellationToken>) -> SpawnOptions {
+    if let Some(token) = cancel_token {
+        SpawnOptions::new().cancellation_token(token)
+    } else {
+        SpawnOptions::default()
+    }
+}
+
+fn execute_query(
+    runtime: &RuntimeHandle,
+    spec: &QuerySpec,
+    cancel_token: Option<CancellationToken>,
+) -> instancy::Result<()> {
     match spec.query_type {
-        QueryType::ScanFilterAgg => run_scan_filter_agg(runtime, spec.scan_records),
+        QueryType::ScanFilterAgg => run_scan_filter_agg(runtime, spec.scan_records, cancel_token),
         QueryType::PageRank => run_pagerank(
             runtime,
             spec.pagerank_vertices,
             spec.pagerank_edges,
             spec.pagerank_iterations,
+            cancel_token,
         ),
-        QueryType::MapChain20 => run_map_chain(runtime, spec.map_values, spec.map_stages),
+        QueryType::MapChain20 => {
+            run_map_chain(runtime, spec.map_values, spec.map_stages, cancel_token)
+        }
         QueryType::MultiEpoch => run_multi_epoch(
             runtime,
             spec.multi_epochs,
             spec.multi_batch_size,
             spec.multi_threshold,
+            cancel_token,
         ),
-        QueryType::SmallPipeline => run_small_pipeline(runtime, spec.small_values),
-        QueryType::FailureInjection => run_failure_injection(runtime),
+        QueryType::SmallPipeline => run_small_pipeline(runtime, spec.small_values, cancel_token),
+        QueryType::FailureInjection => run_failure_injection(runtime, cancel_token),
         QueryType::Cancellation => run_cancellation(runtime),
     }
 }
 
-fn run_scan_filter_agg(runtime: &RuntimeHandle, records: usize) -> instancy::Result<()> {
+fn run_scan_filter_agg(
+    runtime: &RuntimeHandle,
+    records: usize,
+    cancel_token: Option<CancellationToken>,
+) -> instancy::Result<()> {
     let items = generate_lineitems(records);
     let builder = DataflowBuilder::<u64>::new(format!("scan-filter-agg-{records}"));
     builder
@@ -872,7 +955,7 @@ fn run_scan_filter_agg(runtime: &RuntimeHandle, records: usize) -> instancy::Res
         });
     let dataflow = builder.build()?;
     runtime
-        .spawn(dataflow, SpawnOptions::default())?
+        .spawn(dataflow, spawn_options(cancel_token))?
         .join_blocking()
 }
 
@@ -881,6 +964,7 @@ fn run_pagerank(
     num_vertices: u64,
     num_edges: usize,
     iterations: usize,
+    cancel_token: Option<CancellationToken>,
 ) -> instancy::Result<()> {
     let edges = generate_graph(num_vertices, num_edges);
     let builder = DataflowBuilder::<u64>::new(format!("pagerank-{num_vertices}-{num_edges}"));
@@ -908,7 +992,7 @@ fn run_pagerank(
         });
     let dataflow = builder.build()?;
     runtime
-        .spawn(dataflow, SpawnOptions::default())?
+        .spawn(dataflow, spawn_options(cancel_token))?
         .join_blocking()
 }
 
@@ -916,6 +1000,7 @@ fn run_map_chain(
     runtime: &RuntimeHandle,
     values_count: usize,
     stages: usize,
+    cancel_token: Option<CancellationToken>,
 ) -> instancy::Result<()> {
     let values = generate_values(values_count);
     let builder = DataflowBuilder::<u64>::new(format!("map-chain-{values_count}-{stages}"));
@@ -928,7 +1013,7 @@ fn run_map_chain(
     });
     let dataflow = builder.build()?;
     runtime
-        .spawn(dataflow, SpawnOptions::default())?
+        .spawn(dataflow, spawn_options(cancel_token))?
         .join_blocking()
 }
 
@@ -937,6 +1022,7 @@ fn run_multi_epoch(
     epochs: u64,
     batch_size: u64,
     threshold: u64,
+    cancel_token: Option<CancellationToken>,
 ) -> instancy::Result<()> {
     let batches = generate_multi_epoch_batches(epochs, batch_size);
     let builder = DataflowBuilder::<u64>::new(format!("multi-epoch-{epochs}-{batch_size}"));
@@ -948,11 +1034,15 @@ fn run_multi_epoch(
         });
     let dataflow = builder.build()?;
     runtime
-        .spawn(dataflow, SpawnOptions::default())?
+        .spawn(dataflow, spawn_options(cancel_token))?
         .join_blocking()
 }
 
-fn run_small_pipeline(runtime: &RuntimeHandle, values_count: usize) -> instancy::Result<()> {
+fn run_small_pipeline(
+    runtime: &RuntimeHandle,
+    values_count: usize,
+    cancel_token: Option<CancellationToken>,
+) -> instancy::Result<()> {
     let values = generate_values(values_count);
     let builder = DataflowBuilder::<u64>::new(format!("small-pipeline-{values_count}"));
     builder
@@ -965,11 +1055,14 @@ fn run_small_pipeline(runtime: &RuntimeHandle, values_count: usize) -> instancy:
         });
     let dataflow = builder.build()?;
     runtime
-        .spawn(dataflow, SpawnOptions::default())?
+        .spawn(dataflow, spawn_options(cancel_token))?
         .join_blocking()
 }
 
-fn run_failure_injection(runtime: &RuntimeHandle) -> instancy::Result<()> {
+fn run_failure_injection(
+    runtime: &RuntimeHandle,
+    cancel_token: Option<CancellationToken>,
+) -> instancy::Result<()> {
     let builder = DataflowBuilder::<u64>::new("failure-injection");
     builder
         .source("src", vec![(0u64, vec![1u64, 2, 3, 4])])
@@ -987,16 +1080,18 @@ fn run_failure_injection(runtime: &RuntimeHandle) -> instancy::Result<()> {
         });
     let dataflow = builder.build()?;
     runtime
-        .spawn(dataflow, SpawnOptions::default())?
+        .spawn(dataflow, spawn_options(cancel_token))?
         .join_blocking()
 }
 
 fn run_cancellation(runtime: &RuntimeHandle) -> instancy::Result<()> {
     let builder = DataflowBuilder::<u64>::new("cancelled-query");
     let input = builder.input::<u64>("data")?;
-    input.map("identity", |_t, value| value).for_each("sink", |_t, item| {
-        black_box(item);
-    });
+    input
+        .map("identity", |_t, value| value)
+        .for_each("sink", |_t, item| {
+            black_box(item);
+        });
     let dataflow = builder.build()?;
     let token = CancellationToken::new();
     let mut handle = runtime.spawn(
@@ -1139,11 +1234,15 @@ fn print_final_report(
     let total_cpu_ms = (final_snapshot.cpu_user_ms + final_snapshot.cpu_kernel_ms)
         - (start_snapshot.cpu_user_ms + start_snapshot.cpu_kernel_ms);
     let unexpected = shared.unexpected_failures.load(Ordering::Relaxed);
-    let verdict = if unexpected == 0 && !leak_flag { "PASS" } else { "FAIL" };
+    let verdict = if unexpected == 0 && !leak_flag {
+        "PASS"
+    } else {
+        "FAIL"
+    };
 
     println!("\n=== final report ===");
     println!(
-        "elapsed={} total_queries={} completed={} success={} expected_failure={} unexpected_failure={} cancelled={} in_flight={}",
+        "elapsed={} total_queries={} completed={} success={} expected_failure={} unexpected_failure={} cancelled={} timeout={} in_flight={}",
         format_hms(elapsed_secs),
         shared.submitted.load(Ordering::Relaxed),
         shared.completed.load(Ordering::Relaxed),
@@ -1151,6 +1250,7 @@ fn print_final_report(
         shared.expected_failures.load(Ordering::Relaxed),
         unexpected,
         shared.cancelled.load(Ordering::Relaxed),
+        shared.timeouts.load(Ordering::Relaxed),
         shared.in_flight.load(Ordering::Relaxed),
     );
     println!(
@@ -1181,7 +1281,7 @@ fn print_final_report(
     for name in REPORT_NAMES {
         let stats = per_type.get(name).copied().unwrap_or_default();
         println!(
-            "  {:<17} submitted={:<8} completed={:<8} success={:<8} expected_failure={:<6} unexpected_failure={:<6} cancelled={:<6}",
+            "  {:<17} submitted={:<8} completed={:<8} success={:<8} expected_failure={:<6} unexpected_failure={:<6} cancelled={:<6} timeout={:<6}",
             name,
             stats.submitted,
             stats.completed,
@@ -1189,6 +1289,7 @@ fn print_final_report(
             stats.expected_failures,
             stats.unexpected_failures,
             stats.cancelled,
+            stats.timeouts,
         );
     }
     if !unexpected_messages.is_empty() {
