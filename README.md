@@ -12,6 +12,7 @@ instancy retains the core concepts of timely dataflow — timestamps, frontiers,
 | **Networking** | Fixed TCP hostfile | Application provides connections (supports mTLS, pooling) |
 | **Serialization** | Hardcoded `Abomonation` | Pluggable `Codec` trait |
 | **Error handling** | Panics | `Result<T, Error>` with module-aligned sub-enums |
+| **Progress tracking** | N×N broadcast between all workers | Watermark-based aggregation — scales with dynamic worker parallelism |
 | **Cancellation** | Drop the worker | Cooperative `CancellationToken` |
 | **Cluster scaling** | Static: all nodes known at startup | Dynamic: nodes join/leave at runtime via `ClusterMembership` |
 | **Testing** | Requires multiple OS processes | Single-process multi-node testing via in-memory transport |
