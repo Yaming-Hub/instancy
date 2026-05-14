@@ -248,6 +248,7 @@ struct Config {
     base_rps: f64,
     failure_rate: f64,
     cancel_rate: f64,
+    ramp_to: Option<f64>,
 }
 
 impl Default for Config {
@@ -260,6 +261,7 @@ impl Default for Config {
             base_rps: DEFAULT_BASE_RPS,
             failure_rate: DEFAULT_FAILURE_RATE,
             cancel_rate: DEFAULT_CANCEL_RATE,
+            ramp_to: None,
         }
     }
 }
@@ -408,12 +410,13 @@ fn main() {
     let _guard = tokio_rt.enter();
 
     println!(
-        "starting stress_test duration={} report_interval={} workers={} runtimes={} base_rps={:.1} failure_rate={:.2}% cancel_rate={:.2}% max_in_flight={}",
+        "starting stress_test duration={} report_interval={} workers={} runtimes={} base_rps={:.1}{} failure_rate={:.2}% cancel_rate={:.2}% max_in_flight={}",
         format_hms(config.duration.as_secs()),
         format_hms(config.report_interval.as_secs()),
         config.workers,
         config.runtimes,
         config.base_rps,
+        if let Some(ramp) = config.ramp_to { format!(" ramp_to={ramp:.1}") } else { String::new() },
         config.failure_rate * 100.0,
         config.cancel_rate * 100.0,
         MAX_IN_FLIGHT,
@@ -505,8 +508,9 @@ fn main() {
                 0.0
             };
 
+            let current_rps_target = current_target_rps(now.saturating_duration_since(start), &config);
             println!(
-                "[{}] submitted={} completed={} in_flight={} success={} expected_failure={} unexpected_failure={} cancelled={} timeout={} rps_5m={:.2} rss_mb={:.1} peak_mb={:.1} cpu={:.1}%",
+                "[{}] submitted={} completed={} in_flight={} success={} expected_failure={} unexpected_failure={} cancelled={} timeout={} target_rps={:.1} rps_5m={:.2} rss_mb={:.1} peak_mb={:.1} cpu={:.1}%",
                 format_hms(elapsed_secs),
                 shared.submitted.load(Ordering::Relaxed),
                 shared.completed.load(Ordering::Relaxed),
@@ -516,6 +520,7 @@ fn main() {
                 shared.unexpected_failures.load(Ordering::Relaxed),
                 shared.cancelled.load(Ordering::Relaxed),
                 shared.timeouts.load(Ordering::Relaxed),
+                current_rps_target,
                 recent_submissions.len() as f64 / REPORT_RPS_WINDOW_SECS as f64,
                 snapshot.working_set_mb,
                 snapshot.peak_working_set_mb,
@@ -582,6 +587,9 @@ fn parse_args() -> Result<Config, String> {
             "--cancel-rate" => {
                 config.cancel_rate = parse_value(&mut args, "--cancel-rate")?;
             }
+            "--ramp-to" => {
+                config.ramp_to = Some(parse_value(&mut args, "--ramp-to")?);
+            }
             "--help" | "-h" => {
                 print_usage();
                 std::process::exit(0);
@@ -638,11 +646,18 @@ fn print_usage() {
 }
 
 fn current_target_rps(elapsed: Duration, config: &Config) -> f64 {
-    let t = elapsed.as_secs_f64();
-    if elapsed.as_secs() % BURST_EVERY_SECS < BURST_DURATION_SECS {
-        BURST_RPS
+    if let Some(ramp_to) = config.ramp_to {
+        // Linear ramp from base_rps to ramp_to over the full duration
+        let progress = elapsed.as_secs_f64() / config.duration.as_secs_f64();
+        let progress = progress.min(1.0);
+        (config.base_rps + (ramp_to - config.base_rps) * progress).max(1.0)
     } else {
-        (config.base_rps + RPS_AMPLITUDE * (2.0 * PI * t / RPS_PERIOD_SECS).sin()).max(1.0)
+        let t = elapsed.as_secs_f64();
+        if elapsed.as_secs() % BURST_EVERY_SECS < BURST_DURATION_SECS {
+            BURST_RPS
+        } else {
+            (config.base_rps + RPS_AMPLITUDE * (2.0 * PI * t / RPS_PERIOD_SECS).sin()).max(1.0)
+        }
     }
 }
 
