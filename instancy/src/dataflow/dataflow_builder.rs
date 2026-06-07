@@ -1737,6 +1737,41 @@ impl<T: Timestamp, D: Clone + Send + 'static> Pipe<T, D> {
         })
     }
 
+    /// Fallible flat-map transformation: each element produces zero or more output elements.
+    ///
+    /// This is the fallible equivalent of [`flat_map`](Self::flat_map). If the
+    /// closure returns an error, execution stops and the runtime reports it
+    /// through the operator error path.
+    ///
+    /// # Example
+    /// ```ignore
+    /// let words = lines.try_flat_map("split", |_t, line: String| {
+    ///     let words = line
+    ///         .split_whitespace()
+    ///         .map(|w| w.to_string())
+    ///         .collect::<Vec<_>>();
+    ///     Ok(words)
+    /// });
+    /// ```
+    pub fn try_flat_map<D2, F>(self, name: impl Into<String>, mut logic: F) -> Pipe<T, D2>
+    where
+        D2: Clone + Send + 'static,
+        F: FnMut(&T, D) -> Result<Vec<D2>> + Clone + Send + 'static,
+    {
+        self.unary(name, move |input, output| {
+            while let Some((time, batch)) = input.next() {
+                let mut result = Vec::new();
+                for item in batch {
+                    result.extend(logic(&time, item)?);
+                }
+                if !result.is_empty() {
+                    output.push_vec(time, result);
+                }
+            }
+            Ok(())
+        })
+    }
+
     /// Transform each batch as a whole, producing zero or more output items.
     ///
     /// Unlike [`flat_map`](Self::flat_map) which processes one element at a time,
@@ -1759,6 +1794,37 @@ impl<T: Timestamp, D: Clone + Send + 'static> Pipe<T, D> {
     {
         let capacity = self.resolve_capacity();
         self.add_unary_internal(name, capacity, move |time, batch| logic(&time, batch))
+    }
+
+    /// Fallibly transform each batch as a whole, producing zero or more output items.
+    ///
+    /// This is the fallible equivalent of [`map_batch`](Self::map_batch). If the
+    /// closure returns an error, execution stops and the runtime reports it
+    /// through the operator error path.
+    ///
+    /// # Example
+    /// ```ignore
+    /// let parsed = stream.try_map_batch("parse_batch", |_t, batch: Vec<String>| {
+    ///     batch
+    ///         .into_iter()
+    ///         .map(|s| s.parse::<i64>().map_err(Into::into))
+    ///         .collect()
+    /// });
+    /// ```
+    pub fn try_map_batch<D2, F>(self, name: impl Into<String>, mut logic: F) -> Pipe<T, D2>
+    where
+        D2: Clone + Send + 'static,
+        F: FnMut(&T, Vec<D>) -> Result<Vec<D2>> + Clone + Send + 'static,
+    {
+        self.unary(name, move |input, output| {
+            while let Some((time, batch)) = input.next() {
+                let result = logic(&time, batch)?;
+                if !result.is_empty() {
+                    output.push_vec(time, result);
+                }
+            }
+            Ok(())
+        })
     }
 
     /// General unary operator with full control over input/output handles.
@@ -5790,6 +5856,66 @@ mod tests {
     }
 
     #[test]
+    fn test_try_flat_map_success() {
+        let builder = DataflowBuilder::<u64>::new("try_flat_map_success");
+        let port = builder
+            .source("nums", vec![(0u64, vec![2i32, 0, 3])])
+            .try_flat_map("expand", |time, x| -> Result<Vec<String>> {
+                Ok((0..x).map(|i| format!("{time}:{i}")).collect())
+            })
+            .output("results")
+            .unwrap();
+        let dataflow = builder.build().unwrap();
+        rt().run(dataflow).unwrap();
+
+        let collector = port.collector();
+        let results = collector.lock().unwrap();
+        assert_eq!(
+            results[0].1,
+            vec!["0:0", "0:1", "0:0", "0:1", "0:2"]
+                .into_iter()
+                .map(String::from)
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn test_try_flat_map_error_propagates_as_operator_error() {
+        let builder = DataflowBuilder::<u64>::new("try_flat_map_error");
+        let port = builder
+            .source("nums", vec![(0u64, vec![1i32, -1, 2])])
+            .try_flat_map("fallible_expand", |_time, x| -> Result<Vec<i32>> {
+                if x < 0 {
+                    return Err(Error::Dataflow(DataflowError::InvalidConfig(
+                        "negative item".into(),
+                    )));
+                }
+                Ok(vec![x, x * 10])
+            })
+            .output("results")
+            .unwrap();
+        let dataflow = builder.build().unwrap();
+
+        let err = rt().run(dataflow).unwrap_err();
+        match err {
+            Error::Operator {
+                operator,
+                worker_index,
+                source,
+            } => {
+                assert_eq!(operator, "fallible_expand");
+                assert_eq!(worker_index, Some(0));
+                assert!(source.to_string().contains("negative item"));
+            }
+            other => panic!("expected operator error, got: {other:?}"),
+        }
+
+        let collector = port.collector();
+        let results = collector.lock().unwrap();
+        assert!(results.is_empty());
+    }
+
+    #[test]
     fn test_branching_fan_out() {
         let builder = DataflowBuilder::<u64>::new("branch_test");
         let stream = builder.source("nums", vec![(0u64, vec![1i32, 2, 3, 4, 5, 6])]);
@@ -7669,6 +7795,63 @@ mod tests {
         let r = c.lock().unwrap();
         let results: Vec<i32> = r.iter().flat_map(|(_, d)| d.clone()).collect();
         assert_eq!(results, vec![1, 2, 3, 4, 5]);
+    }
+
+    #[test]
+    fn test_try_map_batch_success() {
+        let builder = DataflowBuilder::<u64>::new("try_map_batch_success");
+        let port = builder
+            .source("nums", vec![(0u64, vec![5i32, 3, 1, 4, 2])])
+            .try_map_batch("sort_and_label", |time, mut batch| -> Result<Vec<String>> {
+                batch.sort();
+                Ok(batch.into_iter().map(|x| format!("{time}:{x}")).collect())
+            })
+            .output("results")
+            .unwrap();
+        let dataflow = builder.build().unwrap();
+        rt().run(dataflow).unwrap();
+
+        let c = port.collector();
+        let r = c.lock().unwrap();
+        let results: Vec<String> = r.iter().flat_map(|(_, d)| d.clone()).collect();
+        assert_eq!(results, vec!["0:1", "0:2", "0:3", "0:4", "0:5"]);
+    }
+
+    #[test]
+    fn test_try_map_batch_error_propagates_as_operator_error() {
+        let builder = DataflowBuilder::<u64>::new("try_map_batch_error");
+        let port = builder
+            .source("nums", vec![(0u64, vec![1i32, -1, 2])])
+            .try_map_batch("fallible_batch", |_time, batch| -> Result<Vec<i32>> {
+                if batch.iter().any(|x| *x < 0) {
+                    return Err(Error::Dataflow(DataflowError::InvalidConfig(
+                        "negative batch".into(),
+                    )));
+                }
+                Ok(batch)
+            })
+            .output("results")
+            .unwrap();
+        let dataflow = builder.build().unwrap();
+
+        let err = rt().run(dataflow).unwrap_err();
+        match err {
+            Error::Operator {
+                operator,
+                worker_index,
+                source,
+            } => {
+                assert_eq!(operator, "fallible_batch");
+                assert_eq!(worker_index, Some(0));
+                assert!(source.to_string().contains("negative batch"));
+            }
+            other => panic!("expected operator error, got: {other:?}"),
+        }
+
+        let c = port.collector();
+        let r = c.lock().unwrap();
+        let results: Vec<i32> = r.iter().flat_map(|(_, d)| d.clone()).collect();
+        assert!(results.is_empty());
     }
 
     #[test]

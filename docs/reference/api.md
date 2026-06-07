@@ -297,7 +297,9 @@ The current operator-chaining surface is implemented on `Pipe<T, D>`. `StreamEdg
 - `map(name, |&T, D| -> D2) -> Pipe<T, D2>`
 - `filter(name, |&T, &D| -> bool) -> Pipe<T, D>`
 - `flat_map(name, |&T, D| -> Vec<D2>) -> Pipe<T, D2>`
+- `try_flat_map(name, |&T, D| -> Result<Vec<D2>>) -> Pipe<T, D2>`
 - `map_batch(name, |&T, Vec<D>| -> Vec<D2>) -> Pipe<T, D2>`
+- `try_map_batch(name, |&T, Vec<D>| -> Result<Vec<D2>>) -> Pipe<T, D2>`
 - `inspect(name, |&T, &D| ...) -> Pipe<T, D>`
 - `inspect_batch(name, |&T, &[D]| ...) -> Pipe<T, D>`
 - `for_each(name, |&T, &D| ...)` / `for_each_batch(name, |&T, &[D]| ...)`

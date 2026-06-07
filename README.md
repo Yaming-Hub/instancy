@@ -174,8 +174,10 @@ instancy provides a focused set of core operators:
 | | `input` | Channel-based external input |
 | **Transform** | `map` | Transform each element |
 | | `flat_map` | Transform each element into zero or more |
+| | `try_flat_map` | Fallible `flat_map` with operator error propagation |
 | | `filter` | Keep elements matching a predicate |
 | | `map_batch` | Transform an entire batch at once |
+| | `try_map_batch` | Fallible batch transform with operator error propagation |
 | | `take` / `take_while` | Limit element count or stop at condition |
 | **Aggregation** | `reduce` | Combine all elements per timestamp |
 | | `fold` | Aggregate with initial value and output type |
