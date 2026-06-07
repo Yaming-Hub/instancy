@@ -536,6 +536,58 @@ impl ClusterCancelHandle {
 }
 
 #[cfg(feature = "transport")]
+struct SharedRegistrationCleanup {
+    dataflow_id: crate::dataflow::id::DataflowId,
+    peer_managers: Option<
+        Arc<
+            std::collections::HashMap<
+                String,
+                crate::communication::shared_transport::SharedPeerManager,
+            >,
+        >,
+    >,
+    runtime_handle: tokio::runtime::Handle,
+}
+
+#[cfg(feature = "transport")]
+impl SharedRegistrationCleanup {
+    fn new(
+        dataflow_id: crate::dataflow::id::DataflowId,
+        peer_managers: Arc<
+            std::collections::HashMap<
+                String,
+                crate::communication::shared_transport::SharedPeerManager,
+            >,
+        >,
+        runtime_handle: &tokio::runtime::Handle,
+    ) -> Self {
+        Self {
+            dataflow_id,
+            peer_managers: Some(peer_managers),
+            runtime_handle: runtime_handle.clone(),
+        }
+    }
+
+    fn disarm(&mut self) {
+        self.peer_managers = None;
+    }
+}
+
+#[cfg(feature = "transport")]
+impl Drop for SharedRegistrationCleanup {
+    fn drop(&mut self) {
+        if let Some(peer_managers) = self.peer_managers.take() {
+            let dataflow_id = self.dataflow_id;
+            self.runtime_handle.spawn(async move {
+                for manager in peer_managers.values() {
+                    manager.unregister_dataflow(&dataflow_id).await;
+                }
+            });
+        }
+    }
+}
+
+#[cfg(feature = "transport")]
 struct PeerRegistration {
     id: u64,
     _dataflow_name: String, // retained for diagnostics
@@ -2655,9 +2707,52 @@ impl RuntimeHandle {
     /// - Build closure fails
     /// - Graph fingerprint mismatch with any peer
     /// - Handshake or ready barrier timeout
+    ///
+    /// This synchronous wrapper blocks on async transport setup, handshake, and
+    /// ready barrier work. Async callers should use
+    /// [`spawn_cluster_async`](Self::spawn_cluster_async) instead.
     #[cfg(feature = "transport")]
     #[allow(clippy::too_many_arguments)]
     pub fn spawn_cluster<T, F, R, W>(
+        &self,
+        name: &str,
+        topology: crate::execute::ClusterTopology,
+        local_node_id: &str,
+        dataflow_id: crate::dataflow::id::DataflowId,
+        transport_config: crate::communication::cluster_transport::ClusterSpawnTransport<R, W>,
+        handshake_timeout: std::time::Duration,
+        build: F,
+        runtime_handle: &tokio::runtime::Handle,
+        options: SpawnOptions,
+    ) -> Result<ClusterSpawnedDataflow<T>>
+    where
+        T: Timestamp + crate::communication::codec::ExchangeData,
+        F: Fn(&mut DataflowBuilder<T>) -> Result<()>,
+        R: tokio::io::AsyncRead + Unpin + Send + 'static,
+        W: tokio::io::AsyncWrite + Unpin + Send + 'static,
+    {
+        runtime_handle.block_on(self.spawn_cluster_async(
+            name,
+            topology,
+            local_node_id,
+            dataflow_id,
+            transport_config,
+            handshake_timeout,
+            build,
+            runtime_handle,
+            options,
+        ))
+    }
+
+    /// Spawn a multi-node cluster dataflow asynchronously.
+    ///
+    /// This async variant preserves the behavior of
+    /// [`spawn_cluster`](Self::spawn_cluster), but awaits transport setup,
+    /// handshake, and ready barrier work directly instead of calling
+    /// [`tokio::runtime::Handle::block_on`].
+    #[cfg(feature = "transport")]
+    #[allow(clippy::too_many_arguments)]
+    pub async fn spawn_cluster_async<T, F, R, W>(
         &self,
         name: &str,
         topology: crate::execute::ClusterTopology,
@@ -2761,6 +2856,7 @@ impl RuntimeHandle {
                 >,
             >,
         >;
+        let mut shared_registration_cleanup = None;
 
         match transport_config {
             ClusterSpawnTransport::Dedicated {
@@ -2946,14 +3042,19 @@ impl RuntimeHandle {
                 }
 
                 // Register with SharedPeerManagers.
-                let mut session = runtime_handle.block_on(
+                shared_registration_cleanup = Some(SharedRegistrationCleanup::new(
+                    dataflow_id,
+                    Arc::clone(&peer_managers),
+                    runtime_handle,
+                ));
+                let mut session =
                     crate::communication::shared_transport::SharedTransportSession::new(
                         dataflow_id,
                         &peer_managers,
                         &all_channel_ids,
                         capacity,
-                    ),
-                );
+                    )
+                    .await;
 
                 let mut raw_receivers = session.take_receivers().ok_or_else(|| {
                     Error::Runtime(RuntimeError::AlreadyConsumed {
@@ -2982,25 +3083,25 @@ impl RuntimeHandle {
 
         // Phase 4: Handshake — exchange fingerprints with all peers.
         if let Some(ref session) = dedicated_session {
-            runtime_handle
-                .block_on(perform_handshake(
-                    session,
-                    &mut control_receivers,
-                    fingerprint,
-                    dataflow_id,
-                    handshake_timeout,
-                ))
-                .map_err(|e| Error::Runtime(RuntimeError::Handshake(e)))?;
+            perform_handshake(
+                session,
+                &mut control_receivers,
+                fingerprint,
+                dataflow_id,
+                handshake_timeout,
+            )
+            .await
+            .map_err(|e| Error::Runtime(RuntimeError::Handshake(e)))?;
         } else {
-            runtime_handle
-                .block_on(perform_handshake_with_transport(
-                    &transport,
-                    &mut control_receivers,
-                    fingerprint,
-                    dataflow_id,
-                    handshake_timeout,
-                ))
-                .map_err(|e| Error::Runtime(RuntimeError::Handshake(e)))?;
+            perform_handshake_with_transport(
+                &transport,
+                &mut control_receivers,
+                fingerprint,
+                dataflow_id,
+                handshake_timeout,
+            )
+            .await
+            .map_err(|e| Error::Runtime(RuntimeError::Handshake(e)))?;
         }
 
         // Phase 5: Wire exchange channels using network-backed factories.
@@ -3280,25 +3381,25 @@ impl RuntimeHandle {
 
         // Phase 8: Ready barrier — wait for all peers to finish materialization.
         if let Some(ref session) = dedicated_session {
-            runtime_handle
-                .block_on(perform_ready_barrier(
-                    session,
-                    &mut control_receivers,
-                    local_node_id,
-                    dataflow_id,
-                    handshake_timeout,
-                ))
-                .map_err(|e| Error::Runtime(RuntimeError::Handshake(e)))?;
+            perform_ready_barrier(
+                session,
+                &mut control_receivers,
+                local_node_id,
+                dataflow_id,
+                handshake_timeout,
+            )
+            .await
+            .map_err(|e| Error::Runtime(RuntimeError::Handshake(e)))?;
         } else {
-            runtime_handle
-                .block_on(perform_ready_barrier_with_transport(
-                    &transport,
-                    &mut control_receivers,
-                    local_node_id,
-                    dataflow_id,
-                    handshake_timeout,
-                ))
-                .map_err(|e| Error::Runtime(RuntimeError::Handshake(e)))?;
+            perform_ready_barrier_with_transport(
+                &transport,
+                &mut control_receivers,
+                local_node_id,
+                dataflow_id,
+                handshake_timeout,
+            )
+            .await
+            .map_err(|e| Error::Runtime(RuntimeError::Handshake(e)))?;
         }
 
         // Phase 8.5: Keep listening for peer cancellation and broadcast local cancellation.
@@ -3428,6 +3529,9 @@ impl RuntimeHandle {
                     }
                 }
             });
+            if let Some(cleanup) = shared_registration_cleanup.as_mut() {
+                cleanup.disarm();
+            }
         }
 
         // If an external cancellation token was provided, spawn a bridge task
@@ -5725,6 +5829,74 @@ mod tests {
         rt1.shutdown();
         assert!(rt1.is_shutdown());
         assert!(!rt2.is_shutdown());
+    }
+
+    #[cfg(feature = "transport")]
+    #[tokio::test]
+    async fn spawn_cluster_async_can_be_awaited_with_dedicated_and_shared_transport() {
+        use std::collections::HashMap;
+
+        use crate::communication::cluster_transport::ClusterSpawnTransport;
+        use crate::communication::transport_session::PeerConnection;
+        use crate::execute::ClusterTopology;
+
+        fn build(builder: &mut DataflowBuilder<u64>) -> Result<()> {
+            builder.input::<i32>("data").unwrap().output("out").unwrap();
+            Ok(())
+        }
+
+        let tokio_handle = tokio::runtime::Handle::current();
+
+        let rt = RuntimeHandle::new(RuntimeConfig {
+            worker_threads: 1,
+            ..RuntimeConfig::default()
+        })
+        .unwrap();
+        let dedicated_connections: Vec<
+            PeerConnection<tokio::io::DuplexStream, tokio::io::DuplexStream>,
+        > = Vec::new();
+        let dedicated = rt
+            .spawn_cluster_async(
+                "async-dedicated",
+                ClusterTopology::single_node(1),
+                "local",
+                DataflowId::new(),
+                ClusterSpawnTransport::dedicated(dedicated_connections, 1024),
+                std::time::Duration::from_secs(1),
+                build,
+                &tokio_handle,
+                SpawnOptions::new(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(dedicated.local_worker_range(), (0, 1));
+        assert_eq!(dedicated.total_workers(), 1);
+        rt.shutdown_async().await;
+        drop(dedicated);
+
+        let rt = RuntimeHandle::new(RuntimeConfig {
+            worker_threads: 1,
+            ..RuntimeConfig::default()
+        })
+        .unwrap();
+        let shared = rt
+            .spawn_cluster_async(
+                "async-shared",
+                ClusterTopology::single_node(1),
+                "local",
+                DataflowId::new(),
+                ClusterSpawnTransport::shared(Arc::new(HashMap::new()), 1024),
+                std::time::Duration::from_secs(1),
+                build,
+                &tokio_handle,
+                SpawnOptions::new(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(shared.local_worker_range(), (0, 1));
+        assert_eq!(shared.total_workers(), 1);
+        rt.shutdown_async().await;
+        drop(shared);
     }
 
     // --- SimpleRuntime tests ---
