@@ -924,6 +924,9 @@ async fn tcp_iterate_with_exchange() {
     // Close node-b input.
     drop(cb.take_input::<u64>(0, "data").unwrap());
 
+    // Give the TCP bridge tasks time to deliver feedback records before joining.
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
     join_with_timeout(ca).await;
     join_with_timeout(cb).await;
 
