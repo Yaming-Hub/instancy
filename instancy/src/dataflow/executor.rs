@@ -2564,15 +2564,9 @@ mod tests {
         // should resolve to Ready(Ok(true)) when polled.
         use std::future::Future;
         use std::pin::Pin;
-        use std::task::{Context, Poll, Wake};
+        use std::task::{Context, Poll};
 
-        struct NoopWaker;
-        impl Wake for NoopWaker {
-            fn wake(self: std::sync::Arc<Self>) {}
-        }
-
-        let waker = std::sync::Arc::new(NoopWaker).into();
-        let mut cx = Context::from_waker(&waker);
+        let mut cx = Context::from_waker(std::task::Waker::noop());
 
         let mut executor: DataflowExecutor<u64> = DataflowExecutor {
             operators: vec![Box::new(CountingOperator {
@@ -2813,18 +2807,12 @@ mod tests {
     fn poll_run_cancelled_returns_error() {
         use std::future::Future;
         use std::pin::Pin;
-        use std::task::{Context, Poll, Wake};
-
-        struct NoopWaker;
-        impl Wake for NoopWaker {
-            fn wake(self: std::sync::Arc<Self>) {}
-        }
+        use std::task::{Context, Poll};
 
         let cancel = CancellationToken::new();
         cancel.cancel();
 
-        let waker = std::sync::Arc::new(NoopWaker).into();
-        let mut cx = Context::from_waker(&waker);
+        let mut cx = Context::from_waker(std::task::Waker::noop());
 
         let mut executor: DataflowExecutor<u64> = DataflowExecutor {
             operators: vec![Box::new(CountingOperator {
@@ -3246,15 +3234,9 @@ mod tests {
         // A CPU-active dataflow (operator always makes progress) should yield
         // after max_sweeps_per_poll sweeps, returning Pending and self-notifying
         // so it gets re-polled later.
-        use std::task::{Context, Wake};
+        use std::task::Context;
 
-        struct NoopWaker;
-        impl Wake for NoopWaker {
-            fn wake(self: std::sync::Arc<Self>) {}
-        }
-
-        let waker: std::task::Waker = std::sync::Arc::new(NoopWaker).into();
-        let mut cx = Context::from_waker(&waker);
+        let mut cx = Context::from_waker(std::task::Waker::noop());
 
         let wake_handle = WakeHandle::new();
         let budget = 4;
@@ -3336,15 +3318,9 @@ mod tests {
     fn poll_budget_zero_means_unlimited() {
         // With max_sweeps_per_poll = 0, the executor should run to completion
         // without yielding, regardless of how many sweeps it takes.
-        use std::task::{Context, Poll, Wake};
+        use std::task::{Context, Poll};
 
-        struct NoopWaker;
-        impl Wake for NoopWaker {
-            fn wake(self: std::sync::Arc<Self>) {}
-        }
-
-        let waker: std::task::Waker = std::sync::Arc::new(NoopWaker).into();
-        let mut cx = Context::from_waker(&waker);
+        let mut cx = Context::from_waker(std::task::Waker::noop());
 
         let mut executor = DataflowExecutor::<u64> {
             operators: vec![Box::new(CountingOperator {

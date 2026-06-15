@@ -629,13 +629,8 @@ mod tests {
         crate::runtime::DataflowCompletion::new()
     }
 
-    struct NoopWaker;
-    impl Wake for NoopWaker {
-        fn wake(self: Arc<Self>) {}
-    }
-
     fn noop_cx() -> (std::task::Waker, ()) {
-        let waker: std::task::Waker = Arc::new(NoopWaker).into();
+        let waker = std::task::Waker::noop().clone();
         (waker, ())
     }
 
