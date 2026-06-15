@@ -22,6 +22,8 @@ use instancy::{RuntimeConfig, RuntimeHandle, SpawnOptions};
 
 /// Default timeout for cluster completion in tests.
 const TEST_TIMEOUT: Duration = Duration::from_secs(30);
+/// Grace period for TCP bridge tasks to deliver iterative feedback records.
+const TCP_FEEDBACK_DELIVERY_GRACE: Duration = Duration::from_millis(50);
 
 /// Join a cluster with a timeout to prevent tests from hanging indefinitely.
 ///
@@ -918,14 +920,13 @@ async fn tcp_iterate_with_exchange() {
 
     // Send 0..10 from node-a.
     let sa = ca.take_input::<u64>(0, "data").unwrap();
+    let sb = cb.take_input::<u64>(0, "data").unwrap();
     sa.send(0u64, (0..10).collect()).unwrap();
+
+    // Keep inputs open briefly so TCP bridge tasks can deliver feedback records.
+    tokio::time::sleep(TCP_FEEDBACK_DELIVERY_GRACE).await;
     drop(sa);
-
-    // Close node-b input.
-    drop(cb.take_input::<u64>(0, "data").unwrap());
-
-    // Give the TCP bridge tasks time to deliver feedback records before joining.
-    tokio::time::sleep(Duration::from_millis(50)).await;
+    drop(sb);
 
     join_with_timeout(ca).await;
     join_with_timeout(cb).await;
