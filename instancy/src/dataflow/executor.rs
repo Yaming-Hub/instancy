@@ -1208,6 +1208,7 @@ impl<T: Timestamp> DataflowExecutor<T> {
                 }
                 SweepOutcome::Idle => {
                     // No progress this sweep but not quiescent yet.
+                    std::thread::yield_now();
                     // During drain, sleep briefly to avoid 100% CPU spin while
                     // waiting for the drain deadline to fire.
                     if self.draining {
