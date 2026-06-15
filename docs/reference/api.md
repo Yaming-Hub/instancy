@@ -310,6 +310,27 @@ The current operator-chaining surface is implemented on `Pipe<T, D>`. `StreamEdg
 - `output(name) -> Result<OutputPort<T, D>>`
 - `probe() -> (Pipe<T, D>, ProbeHandle<T>)`
 
+Fallible transform examples:
+
+```rust
+let words = paths.try_flat_map("read_words", |_time, path: String| {
+    let contents = std::fs::read_to_string(path)?;
+    Ok(contents
+        .split_whitespace()
+        .map(str::to_owned)
+        .collect::<Vec<_>>())
+});
+
+let sorted = paths.try_map_batch("read_and_sort", |_time, paths: Vec<String>| {
+    let mut batch = paths
+        .into_iter()
+        .map(std::fs::read_to_string)
+        .collect::<Result<Vec<_>, _>>()?;
+    batch.sort();
+    Ok(batch)
+});
+```
+
 ### Aggregation and flow control
 
 - `reduce(name, |D, D| -> D) -> Pipe<T, D>`

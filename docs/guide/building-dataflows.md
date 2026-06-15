@@ -162,8 +162,8 @@ stream.flat_map("split_words", |_time, line| {
 });
 ```
 
-Use `try_flat_map` when the transformation can fail and should stop the dataflow
-through the operator error path.
+Use `try_flat_map` when the transformation can fail. If the closure returns an
+error, the dataflow stops and the error is reported via the operator error path.
 
 #### Merge
 
@@ -231,8 +231,9 @@ stream.map_batch("sort_batch", |_time, mut batch| {
 
 The closure receives the timestamp and the full `Vec<D>`, returning a new `Vec<D2>`. This is more efficient than per-item `map` when the transformation benefits from seeing all items together (sorting, dedup, windowed aggregations).
 
-Use `try_map_batch` when the batch transformation can fail and should stop the
-dataflow through the operator error path.
+Use `try_map_batch` when the batch transformation can fail. If the closure
+returns an error, the dataflow stops and the error is reported via the operator
+error path.
 
 #### Inspect — Observing Data
 
