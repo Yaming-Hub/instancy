@@ -96,6 +96,43 @@ fn auto_par_fan_out() {
     assert_eq!(result, vec![2, 4, 6, 8, 10, 12, 14, 16]);
 }
 
+/// Fan-out with records that route to every target worker, including worker 0.
+#[test]
+fn auto_par_fan_out_drains_same_worker_exchange() {
+    let rt = test_runtime();
+    let collected = Arc::new(Mutex::new(Vec::new()));
+    let c = collected.clone();
+
+    let mut multi = rt
+        .spawn_multi(
+            "fan-out-drain",
+            0,
+            move |builder: &mut DataflowBuilder<u64>| {
+                let c = c.clone();
+                let input = builder.input::<i32>("data").unwrap();
+                input
+                    .exchange_to("scatter", 4, |v: &i32| *v as u64)
+                    .unwrap()
+                    .for_each("collect", move |_t, item: &i32| {
+                        c.lock().unwrap().push(*item);
+                    });
+                Ok(())
+            },
+            auto_opts(),
+        )
+        .unwrap();
+
+    let sender = multi.take_input::<i32>(0, "data").unwrap();
+    sender.send(0, (0..16).collect()).unwrap();
+    drop(sender);
+
+    multi.join_blocking().unwrap();
+
+    let mut result = collected.lock().unwrap().clone();
+    result.sort();
+    assert_eq!(result, (0..16).collect::<Vec<_>>());
+}
+
 /// Fan-out-fan-in: 1 → exchange_to(4) → gather → output.
 /// Stage 0 par=1, Stage 1 par=4, Stage 2 par=1.
 #[test]
