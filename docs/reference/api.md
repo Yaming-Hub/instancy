@@ -297,7 +297,9 @@ The current operator-chaining surface is implemented on `Pipe<T, D>`. `StreamEdg
 - `map(name, |&T, D| -> D2) -> Pipe<T, D2>`
 - `filter(name, |&T, &D| -> bool) -> Pipe<T, D>`
 - `flat_map(name, |&T, D| -> Vec<D2>) -> Pipe<T, D2>`
+- `try_flat_map(name, |&T, D| -> Result<Vec<D2>>) -> Pipe<T, D2>`
 - `map_batch(name, |&T, Vec<D>| -> Vec<D2>) -> Pipe<T, D2>`
+- `try_map_batch(name, |&T, Vec<D>| -> Result<Vec<D2>>) -> Pipe<T, D2>`
 - `inspect(name, |&T, &D| ...) -> Pipe<T, D>`
 - `inspect_batch(name, |&T, &[D]| ...) -> Pipe<T, D>`
 - `for_each(name, |&T, &D| ...)` / `for_each_batch(name, |&T, &[D]| ...)`
@@ -307,6 +309,27 @@ The current operator-chaining surface is implemented on `Pipe<T, D>`. `StreamEdg
 - `branch_result(name) -> (Pipe<T, V>, Pipe<T, E>)`
 - `output(name) -> Result<OutputPort<T, D>>`
 - `probe() -> (Pipe<T, D>, ProbeHandle<T>)`
+
+Fallible transform examples:
+
+```rust
+let words = paths.try_flat_map("read_words", |_time, path: String| {
+    let contents = std::fs::read_to_string(path)?;
+    Ok(contents
+        .split_whitespace()
+        .map(str::to_owned)
+        .collect::<Vec<_>>())
+});
+
+let sorted = paths.try_map_batch("read_and_sort", |_time, paths: Vec<String>| {
+    let mut batch = paths
+        .into_iter()
+        .map(std::fs::read_to_string)
+        .collect::<Result<Vec<_>, _>>()?;
+    batch.sort();
+    Ok(batch)
+});
+```
 
 ### Aggregation and flow control
 
