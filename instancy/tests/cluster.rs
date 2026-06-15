@@ -399,20 +399,22 @@ async fn cluster_missing_connection() {
     // Only provide connection to node-b, missing node-c.
     let (conn_a, _conn_b) = make_duplex_pair("node-a", "node-b", 64 * 1024);
 
-    let result = rt.spawn_cluster(
-        "missing",
-        topology,
-        "node-a",
-        DataflowId::new(),
-        ClusterSpawnTransport::dedicated(vec![conn_a], 1024),
-        Duration::from_secs(1),
-        |builder: &mut DataflowBuilder<u64>| {
-            builder.input::<i32>("data").unwrap().output("out").unwrap();
-            Ok(())
-        },
-        &tokio_handle,
-        SpawnOptions::new(),
-    );
+    let result = rt
+        .spawn_cluster_async(
+            "missing",
+            topology,
+            "node-a",
+            DataflowId::new(),
+            ClusterSpawnTransport::dedicated(vec![conn_a], 1024),
+            Duration::from_secs(1),
+            |builder: &mut DataflowBuilder<u64>| {
+                builder.input::<i32>("data").unwrap().output("out").unwrap();
+                Ok(())
+            },
+            &tokio_handle,
+            SpawnOptions::new(),
+        )
+        .await;
 
     assert!(result.is_err());
     let msg = format!("{}", result.err().unwrap());
