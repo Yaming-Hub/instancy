@@ -958,13 +958,19 @@ async fn tcp_iterate_with_exchange() {
                 expected_output_count
             );
         };
-        let value = result_rx.recv_timeout(remaining).unwrap_or_else(|_| {
-            panic!(
+        let value = match result_rx.recv_timeout(remaining) {
+            Ok(value) => value,
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => panic!(
                 "timed out waiting for iterate+exchange output: received {}/{}",
                 all.len(),
                 expected_output_count
-            )
-        });
+            ),
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => panic!(
+                "output collectors disconnected before receiving all expected outputs: received {}/{}",
+                all.len(),
+                expected_output_count
+            ),
+        };
         all.push(value);
     }
 
