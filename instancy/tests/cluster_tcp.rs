@@ -22,8 +22,6 @@ use instancy::{RuntimeConfig, RuntimeHandle, SpawnOptions};
 
 /// Default timeout for cluster completion in tests.
 const TEST_TIMEOUT: Duration = Duration::from_secs(30);
-/// Grace period for TCP bridge tasks to deliver iterative feedback records.
-const TCP_FEEDBACK_DELIVERY_GRACE: Duration = Duration::from_millis(50);
 
 /// Join a cluster with a timeout to prevent tests from hanging indefinitely.
 ///
@@ -917,35 +915,64 @@ async fn tcp_iterate_with_exchange() {
 
     let out_a = ca.take_output::<u64>(0, "results").unwrap();
     let out_b = cb.take_output::<u64>(0, "results").unwrap();
+    let (result_tx, result_rx) = std::sync::mpsc::channel();
+    let collector_a = tokio::task::spawn_blocking({
+        let result_tx = result_tx.clone();
+        move || {
+            while let Some(event) = out_a.recv() {
+                if let instancy::dataflow::OutputEvent::Data { data, .. } = event {
+                    for value in data {
+                        result_tx.send(value).unwrap();
+                    }
+                }
+            }
+        }
+    });
+    let collector_b = tokio::task::spawn_blocking({
+        let result_tx = result_tx.clone();
+        move || {
+            while let Some(event) = out_b.recv() {
+                if let instancy::dataflow::OutputEvent::Data { data, .. } = event {
+                    for value in data {
+                        result_tx.send(value).unwrap();
+                    }
+                }
+            }
+        }
+    });
+    drop(result_tx);
 
     // Send 0..10 from node-a.
     let sa = ca.take_input::<u64>(0, "data").unwrap();
     let sb = cb.take_input::<u64>(0, "data").unwrap();
     sa.send(0u64, (0..10).collect()).unwrap();
 
-    // Keep inputs open briefly so TCP bridge tasks can deliver feedback records.
-    tokio::time::sleep(TCP_FEEDBACK_DELIVERY_GRACE).await;
+    let mut expected: Vec<u64> = (0..10u64)
+        .map(|v| if v < threshold { threshold } else { v + 1 })
+        .collect();
+    let mut all = Vec::with_capacity(expected.len());
+    while all.len() < expected.len() {
+        all.push(
+            result_rx
+                .recv_timeout(TEST_TIMEOUT)
+                .expect("timed out waiting for iterate+exchange output"),
+        );
+    }
+
     drop(sa);
     drop(sb);
 
     join_with_timeout(ca).await;
     join_with_timeout(cb).await;
+    collector_a.await.unwrap();
+    collector_b.await.unwrap();
 
-    // Collect and verify.
-    let mut all: Vec<u64> = out_a
-        .collect_data()
-        .into_iter()
-        .chain(out_b.collect_data().into_iter())
-        .flat_map(|(_, d)| d)
-        .collect();
+    all.extend(result_rx.try_iter());
     all.sort();
 
     // Each value v starts at v, increments by 1 per round.
     // Exits when v + k >= threshold. Final value = threshold for v < threshold,
     // or v + 1 for v >= threshold (exits after 1 increment).
-    let mut expected: Vec<u64> = (0..10u64)
-        .map(|v| if v < threshold { threshold } else { v + 1 })
-        .collect();
     expected.sort();
 
     assert_eq!(
