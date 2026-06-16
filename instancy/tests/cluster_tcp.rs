@@ -945,17 +945,15 @@ async fn tcp_iterate_with_exchange() {
     // Send 0..10 from node-a.
     let sa = ca.take_input::<u64>(0, "data").unwrap();
     let sb = cb.take_input::<u64>(0, "data").unwrap();
-    sa.send(0u64, (0..10).collect()).unwrap();
+    let expected_output_count = 10u64;
+    sa.send(0u64, (0..expected_output_count).collect()).unwrap();
 
-    let mut expected: Vec<u64> = (0..10u64)
-        .map(|v| if v < threshold { threshold } else { v + 1 })
-        .collect();
     let mut all = Vec::new();
     let deadline = Instant::now() + TEST_TIMEOUT;
-    while all.len() < expected.len() {
+    while all.len() < expected_output_count as usize {
         let remaining = deadline
             .checked_duration_since(Instant::now())
-            .expect("timed out waiting for iterate+exchange output");
+            .expect("deadline exceeded while waiting for iterate+exchange output");
         all.push(
             result_rx
                 .recv_timeout(remaining)
@@ -977,6 +975,9 @@ async fn tcp_iterate_with_exchange() {
     // Each value v starts at v, increments by 1 per round.
     // Exits when v + k >= threshold. Final value = threshold for v < threshold,
     // or v + 1 for v >= threshold (exits after 1 increment).
+    let mut expected: Vec<u64> = (0..expected_output_count)
+        .map(|v| if v < threshold { threshold } else { v + 1 })
+        .collect();
     expected.sort();
 
     assert_eq!(
