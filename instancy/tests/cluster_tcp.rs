@@ -951,14 +951,21 @@ async fn tcp_iterate_with_exchange() {
     let mut all = Vec::new();
     let deadline = Instant::now() + TEST_TIMEOUT;
     while all.len() < expected_output_count as usize {
-        let remaining = deadline
-            .checked_duration_since(Instant::now())
-            .expect("deadline exceeded while waiting for iterate+exchange output");
-        all.push(
-            result_rx
-                .recv_timeout(remaining)
-                .expect("timed out waiting for iterate+exchange output"),
-        );
+        let Some(remaining) = deadline.checked_duration_since(Instant::now()) else {
+            panic!(
+                "test deadline exceeded before receiving all expected outputs: received {}/{}",
+                all.len(),
+                expected_output_count
+            );
+        };
+        let value = result_rx.recv_timeout(remaining).unwrap_or_else(|_| {
+            panic!(
+                "timed out waiting for iterate+exchange output: received {}/{}",
+                all.len(),
+                expected_output_count
+            )
+        });
+        all.push(value);
     }
 
     drop(sa);
