@@ -924,7 +924,7 @@ async fn tcp_iterate_with_exchange() {
                     for value in data {
                         result_tx
                             .send(value)
-                            .expect("collector channel unexpectedly closed");
+                            .expect("result receiver dropped before collectors finished");
                     }
                 }
             }
@@ -938,7 +938,7 @@ async fn tcp_iterate_with_exchange() {
                     for value in data {
                         result_tx
                             .send(value)
-                            .expect("collector channel unexpectedly closed");
+                            .expect("result receiver dropped before collectors finished");
                     }
                 }
             }
