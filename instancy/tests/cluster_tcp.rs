@@ -8,7 +8,7 @@
 #![cfg(feature = "transport")]
 
 use std::collections::HashMap;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use tokio::net::{TcpListener, TcpStream};
 
@@ -950,11 +950,15 @@ async fn tcp_iterate_with_exchange() {
     let mut expected: Vec<u64> = (0..10u64)
         .map(|v| if v < threshold { threshold } else { v + 1 })
         .collect();
-    let mut all = Vec::with_capacity(expected.len());
+    let mut all = Vec::new();
+    let deadline = Instant::now() + TEST_TIMEOUT;
     while all.len() < expected.len() {
+        let remaining = deadline
+            .checked_duration_since(Instant::now())
+            .expect("timed out waiting for iterate+exchange output");
         all.push(
             result_rx
-                .recv_timeout(TEST_TIMEOUT)
+                .recv_timeout(remaining)
                 .expect("timed out waiting for iterate+exchange output"),
         );
     }
