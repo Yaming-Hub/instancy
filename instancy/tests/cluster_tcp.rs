@@ -922,7 +922,9 @@ async fn tcp_iterate_with_exchange() {
             while let Some(event) = out_a.recv() {
                 if let instancy::dataflow::OutputEvent::Data { data, .. } = event {
                     for value in data {
-                        result_tx.send(value).unwrap();
+                        result_tx
+                            .send(value)
+                            .expect("collector channel unexpectedly closed");
                     }
                 }
             }
@@ -934,7 +936,9 @@ async fn tcp_iterate_with_exchange() {
             while let Some(event) = out_b.recv() {
                 if let instancy::dataflow::OutputEvent::Data { data, .. } = event {
                     for value in data {
-                        result_tx.send(value).unwrap();
+                        result_tx
+                            .send(value)
+                            .expect("collector channel unexpectedly closed");
                     }
                 }
             }
@@ -951,14 +955,14 @@ async fn tcp_iterate_with_exchange() {
     let mut all = Vec::new();
     let deadline = Instant::now() + TEST_TIMEOUT;
     while all.len() < expected_output_count as usize {
-        let Some(remaining) = deadline.checked_duration_since(Instant::now()) else {
+        let Some(time_until_deadline) = deadline.checked_duration_since(Instant::now()) else {
             panic!(
                 "test deadline exceeded before receiving all expected outputs: received {}/{}",
                 all.len(),
                 expected_output_count
             );
         };
-        let value = match result_rx.recv_timeout(remaining) {
+        let value = match result_rx.recv_timeout(time_until_deadline) {
             Ok(value) => value,
             Err(std::sync::mpsc::RecvTimeoutError::Timeout) => panic!(
                 "timed out waiting for iterate+exchange output: received {}/{}",
