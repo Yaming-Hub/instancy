@@ -988,7 +988,9 @@ impl<T: Timestamp> Future for CombinedStageExecutor<T> {
                 // stages alive so channel closure/data wakeups can drive normal
                 // completion instead of dropping buffered records.
                 this.wake_handle.register_waker(cx.waker());
-                this.wake_handle.notify();
+                if this.wake_handle.take_notification() {
+                    this.wake_handle.notify();
+                }
                 Poll::Pending
             }
         } else if any_pending || any_completed_this_poll {

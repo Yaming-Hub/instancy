@@ -981,10 +981,33 @@ async fn tcp_iterate_with_exchange() {
     drop(sa);
     drop(sb);
 
-    join_with_timeout(ca).await;
-    join_with_timeout(cb).await;
-    collector_a.await.unwrap();
-    collector_b.await.unwrap();
+    let remaining = deadline
+        .checked_duration_since(Instant::now())
+        .unwrap_or(Duration::ZERO);
+    let finish = tokio::time::timeout(remaining, async {
+        let (ra, rb, rc, rd) = tokio::join!(
+            tokio::task::spawn_blocking(move || ca.join_blocking()),
+            tokio::task::spawn_blocking(move || cb.join_blocking()),
+            collector_a,
+            collector_b,
+        );
+        match ra {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => panic!("cluster ca join failed: {e}"),
+            Err(e) => panic!("spawn_blocking panicked for ca: {e}"),
+        }
+        match rb {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => panic!("cluster cb join failed: {e}"),
+            Err(e) => panic!("spawn_blocking panicked for cb: {e}"),
+        }
+        rc.unwrap();
+        rd.unwrap();
+    })
+    .await;
+    if finish.is_err() {
+        panic!("cluster did not complete within deadline");
+    }
 
     all.extend(result_rx.try_iter());
     all.sort();
