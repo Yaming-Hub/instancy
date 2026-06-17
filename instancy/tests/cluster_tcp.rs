@@ -8,7 +8,7 @@
 #![cfg(feature = "transport")]
 
 use std::collections::HashMap;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use tokio::net::{TcpListener, TcpStream};
 
@@ -915,31 +915,107 @@ async fn tcp_iterate_with_exchange() {
 
     let out_a = ca.take_output::<u64>(0, "results").unwrap();
     let out_b = cb.take_output::<u64>(0, "results").unwrap();
+    let (result_tx, result_rx) = std::sync::mpsc::channel();
+    let collector_a = tokio::task::spawn_blocking({
+        let result_tx = result_tx.clone();
+        move || {
+            while let Some(event) = out_a.recv() {
+                if let instancy::dataflow::OutputEvent::Data { data, .. } = event {
+                    for value in data {
+                        result_tx
+                            .send(value)
+                            .expect("result receiver dropped before collectors finished");
+                    }
+                }
+            }
+        }
+    });
+    let collector_b = tokio::task::spawn_blocking({
+        let result_tx = result_tx.clone();
+        move || {
+            while let Some(event) = out_b.recv() {
+                if let instancy::dataflow::OutputEvent::Data { data, .. } = event {
+                    for value in data {
+                        result_tx
+                            .send(value)
+                            .expect("result receiver dropped before collectors finished");
+                    }
+                }
+            }
+        }
+    });
+    drop(result_tx);
 
     // Send 0..10 from node-a.
     let sa = ca.take_input::<u64>(0, "data").unwrap();
-    sa.send(0u64, (0..10).collect()).unwrap();
+    let sb = cb.take_input::<u64>(0, "data").unwrap();
+    let expected_output_count = 10u64;
+    sa.send(0u64, (0..expected_output_count).collect()).unwrap();
+
+    let mut all = Vec::new();
+    let deadline = Instant::now() + TEST_TIMEOUT;
+    while all.len() < expected_output_count as usize {
+        let Some(time_until_deadline) = deadline.checked_duration_since(Instant::now()) else {
+            panic!(
+                "test deadline exceeded before receiving all expected outputs: received {}/{}",
+                all.len(),
+                expected_output_count
+            );
+        };
+        let value = match result_rx.recv_timeout(time_until_deadline) {
+            Ok(value) => value,
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => panic!(
+                "timed out waiting for iterate+exchange output: received {}/{}",
+                all.len(),
+                expected_output_count
+            ),
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => panic!(
+                "output collectors disconnected before receiving all expected outputs: received {}/{}",
+                all.len(),
+                expected_output_count
+            ),
+        };
+        all.push(value);
+    }
+
     drop(sa);
+    drop(sb);
 
-    // Close node-b input.
-    drop(cb.take_input::<u64>(0, "data").unwrap());
+    let remaining = deadline
+        .checked_duration_since(Instant::now())
+        .unwrap_or(Duration::ZERO);
+    let finish = tokio::time::timeout(remaining, async {
+        let (ra, rb, rc, rd) = tokio::join!(
+            tokio::task::spawn_blocking(move || ca.join_blocking()),
+            tokio::task::spawn_blocking(move || cb.join_blocking()),
+            collector_a,
+            collector_b,
+        );
+        match ra {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => panic!("cluster ca join failed: {e}"),
+            Err(e) => panic!("spawn_blocking panicked for ca: {e}"),
+        }
+        match rb {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => panic!("cluster cb join failed: {e}"),
+            Err(e) => panic!("spawn_blocking panicked for cb: {e}"),
+        }
+        rc.unwrap();
+        rd.unwrap();
+    })
+    .await;
+    if finish.is_err() {
+        panic!("cluster did not complete within {remaining:?} remaining deadline");
+    }
 
-    join_with_timeout(ca).await;
-    join_with_timeout(cb).await;
-
-    // Collect and verify.
-    let mut all: Vec<u64> = out_a
-        .collect_data()
-        .into_iter()
-        .chain(out_b.collect_data().into_iter())
-        .flat_map(|(_, d)| d)
-        .collect();
+    all.extend(result_rx.try_iter());
     all.sort();
 
     // Each value v starts at v, increments by 1 per round.
     // Exits when v + k >= threshold. Final value = threshold for v < threshold,
     // or v + 1 for v >= threshold (exits after 1 increment).
-    let mut expected: Vec<u64> = (0..10u64)
+    let mut expected: Vec<u64> = (0..expected_output_count)
         .map(|v| if v < threshold { threshold } else { v + 1 })
         .collect();
     expected.sort();
