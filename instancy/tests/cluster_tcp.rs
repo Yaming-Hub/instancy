@@ -1006,7 +1006,7 @@ async fn tcp_iterate_with_exchange() {
     })
     .await;
     if finish.is_err() {
-        panic!("cluster did not complete within deadline");
+        panic!("cluster did not complete within {remaining:?} remaining deadline");
     }
 
     all.extend(result_rx.try_iter());
