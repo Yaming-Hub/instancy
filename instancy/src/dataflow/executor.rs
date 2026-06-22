@@ -2098,6 +2098,52 @@ mod tests {
     }
 
     #[test]
+    fn pending_peer_progress_resets_idle_even_without_dirty_operator() {
+        use crate::progress::operate::PortConnectivity;
+        use crate::progress::progress_channel::create_progress_channels;
+        use crate::progress::subgraph::SubgraphBuilder;
+
+        let wakes: Vec<WakeHandle> = (0..2).map(|_| WakeHandle::new()).collect();
+        let mut channels = create_progress_channels::<u64>(2, &wakes).unwrap();
+
+        let mut builder = SubgraphBuilder::<u64>::new(0, 0);
+        builder
+            .add_operator(1, "op", 0, 1, PortConnectivity::new(0, 1))
+            .unwrap();
+        let mut tracker = builder.build();
+        tracker.set_progress_channels(channels.remove(1)).unwrap();
+        tracker.initialize().unwrap();
+
+        channels[0].senders[1]
+            .as_ref()
+            .unwrap()
+            .send(vec![(1, 0, 0u64, 1), (1, 0, 0u64, -1)]);
+        wakes[1].take_notification();
+
+        let ops: Vec<Box<dyn SchedulableOperator>> = vec![Box::new(IdleOperator {
+            index: 1,
+            stage_id: crate::dataflow::stage::StageId::new(0),
+            closed: false,
+        })];
+        let config = ExecutorConfig {
+            max_idle_sweeps: 1,
+            ..Default::default()
+        };
+        let mut executor = DataflowExecutor::<u64>::new_test(ops, config, 1);
+        executor.wake_handle = wakes[1].clone();
+        executor.set_progress_tracker(tracker);
+
+        assert!(matches!(
+            executor.run_one_sweep().unwrap(),
+            SweepOutcome::WaitingForInput
+        ));
+        assert!(
+            !executor.done[0],
+            "peer progress consumed this sweep must defer force-close"
+        );
+    }
+
+    #[test]
     fn executor_runs_single_operator_to_completion() {
         let mut executor: DataflowExecutor<u64> = DataflowExecutor {
             operators: vec![Box::new(CountingOperator {
