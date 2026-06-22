@@ -716,9 +716,14 @@ impl<T: Timestamp + ExchangeData, D: ExchangeData> NetworkEdgeMaterializer<T, D>
             for peer_id in &peer_node_ids {
                 if let Some((peer_start, peer_end)) = topology.worker_range(peer_id) {
                     for src in peer_start..peer_end {
-                        for dst in local_start..local_end {
+                        for (dst, wake) in wake_handles
+                            .iter()
+                            .enumerate()
+                            .take(local_end)
+                            .skip(local_start)
+                        {
                             let channel_id = Self::channel_id(0, src, dst, num_workers);
-                            data_wake_handles.insert(channel_id, wake_handles[dst].clone());
+                            data_wake_handles.insert(channel_id, wake.clone());
                         }
                     }
                 }

@@ -2962,14 +2962,19 @@ impl RuntimeHandle {
                                 })
                             })?;
                         for src in peer_start..peer_end {
-                            for dst in local_start..local_end {
+                            for (dst, wake) in wake_handles
+                                .iter()
+                                .enumerate()
+                                .take(local_end)
+                                .skip(local_start)
+                            {
                                 let channel_id = NetworkEdgeMaterializer::<T, u8>::channel_id(
                                     edge_order,
                                     src,
                                     dst,
                                     total_workers,
                                 );
-                                data_wake_handles.insert(channel_id, wake_handles[dst].clone());
+                                data_wake_handles.insert(channel_id, wake.clone());
                             }
                         }
                     }

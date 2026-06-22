@@ -1443,8 +1443,10 @@ mod tests {
             done: false,
         })];
 
-        let mut config = ExecutorConfig::default();
-        config.max_idle_sweeps = 1;
+        let config = ExecutorConfig {
+            max_idle_sweeps: 1,
+            ..Default::default()
+        };
 
         let wake = WakeHandle::new();
         let executor = StageExecutor::<u64>::new(
