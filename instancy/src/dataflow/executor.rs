@@ -2090,6 +2090,10 @@ mod tests {
             !executor.done[0],
             "executor must not force-close operators while a wake is pending"
         );
+        assert!(
+            executor.wake_handle.take_notification(),
+            "deferred completion must leave a wake pending for the next sweep"
+        );
     }
 
     #[test]
