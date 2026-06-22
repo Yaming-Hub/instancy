@@ -1528,6 +1528,11 @@ impl<T: Timestamp> DataflowExecutor<T> {
     }
 
     fn run_one_sweep_inner(&mut self) -> Result<SweepOutcome> {
+        // Drain stale wake tokens at the start of a sweep. A token observed
+        // later in this sweep means some channel became runnable after this
+        // sweep's activation pass, so completion must be deferred.
+        self.wake_handle.take_notification();
+
         // Drain incoming control signals (non-blocking).
         // This is checked BEFORE the cancellation check so that control
         // signals are consumed even when cancellation is already in flight.
@@ -1567,6 +1572,11 @@ impl<T: Timestamp> DataflowExecutor<T> {
         }
 
         // Activate operators — stage-task, fused, or unfused path.
+        let tracker_was_completed = self
+            .progress_tracker
+            .as_ref()
+            .is_some_and(|tracker| tracker.is_completed());
+
         let any_progress = if !self.stage_tasks.is_empty() {
             self.run_stage_task_activation()?
         } else if self.fused_order.is_some() {
@@ -1582,7 +1592,21 @@ impl<T: Timestamp> DataflowExecutor<T> {
         }
 
         // After each batch, propagate progress and enqueue dirty operators.
-        if self.propagate_progress()? {
+        // Peer progress can be meaningful even when it produces no dirty
+        // operator frontier, e.g. a +1/-1 batch that completes global progress.
+        let had_pending_peer_progress = self
+            .progress_tracker
+            .as_ref()
+            .map(|tracker| tracker.has_pending_peer_progress())
+            .transpose()?
+            .unwrap_or(false);
+        let progress_activated = self.propagate_progress()?;
+        let tracker_completed_now = self
+            .progress_tracker
+            .as_ref()
+            .is_some_and(|tracker| tracker.is_completed());
+        let progress_completed_this_sweep = tracker_completed_now && !tracker_was_completed;
+        if progress_activated || had_pending_peer_progress || progress_completed_this_sweep {
             self.consecutive_idle = 0;
         }
 
@@ -1616,6 +1640,11 @@ impl<T: Timestamp> DataflowExecutor<T> {
                     && !tracker.has_pending_peer_progress()?
                     && tracker.all_peers_synced()
                 {
+                    if self.wake_handle.take_notification() {
+                        self.consecutive_idle = 0;
+                        self.wake_handle.notify();
+                        return Ok(SweepOutcome::WaitingForInput);
+                    }
                     for pos in 0..self.operators.len() {
                         if !self.done[pos] {
                             self.operators[pos].close_inputs();
@@ -2006,6 +2035,220 @@ mod tests {
         fn close_inputs(&mut self) {
             self.closed = true;
         }
+    }
+
+    struct NotifyingIdleOperator {
+        index: usize,
+        stage_id: crate::dataflow::stage::StageId,
+        wake: WakeHandle,
+        notified: bool,
+        closed: bool,
+    }
+
+    impl SchedulableOperator for NotifyingIdleOperator {
+        fn activate(&mut self) -> Result<ActivationOutcome> {
+            if self.closed {
+                return Ok(ActivationOutcome::Done);
+            }
+            if !self.notified {
+                self.notified = true;
+                self.wake.notify();
+            }
+            Ok(ActivationOutcome::Idle)
+        }
+
+        fn is_done(&self) -> bool {
+            self.closed
+        }
+
+        fn name(&self) -> &str {
+            "notifying-idle"
+        }
+
+        fn index(&self) -> usize {
+            self.index
+        }
+
+        fn stage_id(&self) -> crate::dataflow::stage::StageId {
+            self.stage_id
+        }
+
+        fn close_inputs(&mut self) {
+            self.closed = true;
+        }
+    }
+
+    struct ReleasingIdleOperator {
+        index: usize,
+        stage_id: crate::dataflow::stage::StageId,
+        reporter: crate::progress::operate::ProgressReporter<u64>,
+        released: bool,
+        closed: bool,
+    }
+
+    impl SchedulableOperator for ReleasingIdleOperator {
+        fn activate(&mut self) -> Result<ActivationOutcome> {
+            if self.closed {
+                return Ok(ActivationOutcome::Done);
+            }
+            if !self.released {
+                self.released = true;
+                self.reporter.update(0, -1);
+            }
+            Ok(ActivationOutcome::Idle)
+        }
+
+        fn is_done(&self) -> bool {
+            self.closed
+        }
+
+        fn name(&self) -> &str {
+            "releasing-idle"
+        }
+
+        fn index(&self) -> usize {
+            self.index
+        }
+
+        fn stage_id(&self) -> crate::dataflow::stage::StageId {
+            self.stage_id
+        }
+
+        fn close_inputs(&mut self) {
+            self.closed = true;
+        }
+    }
+
+    #[test]
+    fn pending_wake_defers_tracker_completion_force_close() {
+        let wake = WakeHandle::new();
+        wake.take_notification();
+
+        let ops: Vec<Box<dyn SchedulableOperator>> = vec![Box::new(NotifyingIdleOperator {
+            index: 0,
+            stage_id: crate::dataflow::stage::StageId::new(0),
+            wake: wake.clone(),
+            notified: false,
+            closed: false,
+        })];
+        let config = ExecutorConfig {
+            max_idle_sweeps: 1,
+            ..Default::default()
+        };
+        let mut executor = DataflowExecutor::<u64>::new_test(ops, config, 0);
+        executor.wake_handle = wake;
+
+        let mut tracker = crate::progress::subgraph::SubgraphBuilder::<u64>::new(0, 0).build();
+        tracker.initialize().unwrap();
+        assert!(tracker.is_completed());
+        executor.set_progress_tracker(tracker);
+
+        assert!(matches!(
+            executor.run_one_sweep().unwrap(),
+            SweepOutcome::WaitingForInput
+        ));
+        assert!(
+            !executor.done[0],
+            "executor must not force-close operators while a wake is pending"
+        );
+        assert!(
+            executor.wake_handle.take_notification(),
+            "deferred completion must leave a wake pending for the next sweep"
+        );
+    }
+
+    #[test]
+    fn pending_peer_progress_resets_idle_even_without_dirty_operator() {
+        use crate::progress::operate::PortConnectivity;
+        use crate::progress::progress_channel::create_progress_channels;
+        use crate::progress::subgraph::SubgraphBuilder;
+
+        let wakes: Vec<WakeHandle> = (0..2).map(|_| WakeHandle::new()).collect();
+        let mut channels = create_progress_channels::<u64>(2, &wakes).unwrap();
+
+        let mut builder = SubgraphBuilder::<u64>::new(0, 0);
+        builder
+            .add_operator(1, "op", 0, 1, PortConnectivity::new(0, 1))
+            .unwrap();
+        let mut tracker = builder.build();
+        tracker.set_progress_channels(channels.remove(1)).unwrap();
+        tracker.initialize().unwrap();
+
+        channels[0].senders[1]
+            .as_ref()
+            .unwrap()
+            .send(vec![(1, 0, 0u64, 1), (1, 0, 0u64, -1)]);
+        wakes[1].take_notification();
+
+        let ops: Vec<Box<dyn SchedulableOperator>> = vec![Box::new(IdleOperator {
+            index: 1,
+            stage_id: crate::dataflow::stage::StageId::new(0),
+            closed: false,
+        })];
+        let config = ExecutorConfig {
+            max_idle_sweeps: 1,
+            ..Default::default()
+        };
+        let mut executor = DataflowExecutor::<u64>::new_test(ops, config, 1);
+        executor.wake_handle = wakes[1].clone();
+        executor.set_progress_tracker(tracker);
+
+        let outcome = executor.run_one_sweep().unwrap();
+        assert!(
+            !matches!(outcome, SweepOutcome::Completed),
+            "peer progress consumed this sweep must defer force-close; got {outcome:?}"
+        );
+        assert!(
+            !executor.done[0],
+            "peer progress consumed this sweep must defer force-close"
+        );
+    }
+
+    #[test]
+    fn progress_completion_transition_resets_idle_without_dirty_operator() {
+        use crate::progress::change_batch::ChangeBatch;
+        use crate::progress::operate::PortConnectivity;
+        use crate::progress::subgraph::SubgraphBuilder;
+
+        let mut builder = SubgraphBuilder::<u64>::new(0, 0);
+        builder
+            .add_operator_with_capabilities(
+                1,
+                "op",
+                0,
+                1,
+                PortConnectivity::new(0, 1),
+                vec![ChangeBatch::new_from(0, 1)],
+            )
+            .unwrap();
+        let reporter = builder.operator_progress(1).unwrap().reporter(0).clone();
+        let mut tracker = builder.build();
+        tracker.initialize().unwrap();
+        assert!(!tracker.is_completed());
+
+        let ops: Vec<Box<dyn SchedulableOperator>> = vec![Box::new(ReleasingIdleOperator {
+            index: 1,
+            stage_id: crate::dataflow::stage::StageId::new(0),
+            reporter,
+            released: false,
+            closed: false,
+        })];
+        let config = ExecutorConfig {
+            max_idle_sweeps: 1,
+            ..Default::default()
+        };
+        let mut executor = DataflowExecutor::<u64>::new_test(ops, config, 0);
+        executor.set_progress_tracker(tracker);
+
+        let outcome = executor.run_one_sweep().unwrap();
+        assert!(
+            !matches!(outcome, SweepOutcome::Completed),
+            "newly completed progress must get a follow-up activation pass; got {outcome:?}"
+        );
+        assert!(
+            !executor.done[0],
+            "newly completed progress must not force-close in the same sweep"
+        );
     }
 
     #[test]

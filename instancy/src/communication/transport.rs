@@ -109,6 +109,7 @@ pub enum TransportError {
 mod tokio_impl {
     use super::*;
     use std::collections::HashMap;
+    use std::sync::Arc;
     use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
     use tokio::sync::mpsc;
 
@@ -390,8 +391,13 @@ mod tokio_impl {
     /// connections per channel or spawn per-channel forwarding tasks.
     pub struct Demuxer<R> {
         reader: FramedReader<R>,
-        channels: HashMap<(DataflowId, u64), mpsc::Sender<Vec<u8>>>,
+        channels: HashMap<(DataflowId, u64), RegisteredChannel>,
         config: DemuxConfig,
+    }
+
+    struct RegisteredChannel {
+        sender: mpsc::Sender<Vec<u8>>,
+        notify: Option<Arc<dyn Fn() + Send + Sync>>,
     }
 
     /// Handle returned when registering a channel with a [`Demuxer`].
@@ -417,9 +423,34 @@ mod tokio_impl {
             dataflow_id: DataflowId,
             channel_id: u64,
         ) -> ChannelReceiver {
+            self.register_channel_with_notify(dataflow_id, channel_id, None)
+        }
+
+        /// Register a channel and invoke `notify` after each delivered frame.
+        pub fn register_channel_with_notify(
+            &mut self,
+            dataflow_id: DataflowId,
+            channel_id: u64,
+            notify: Option<Arc<dyn Fn() + Send + Sync>>,
+        ) -> ChannelReceiver {
             let (tx, rx) = mpsc::channel(self.config.channel_buffer);
-            self.channels.insert((dataflow_id, channel_id), tx);
+            self.channels.insert(
+                (dataflow_id, channel_id),
+                RegisteredChannel { sender: tx, notify },
+            );
             rx
+        }
+
+        fn close_all_channels_and_notify(&mut self) {
+            let callbacks: Vec<_> = self
+                .channels
+                .values()
+                .filter_map(|channel| channel.notify.clone())
+                .collect();
+            self.channels.clear();
+            for notify in callbacks {
+                notify();
+            }
         }
 
         /// Run the demuxer, reading frames until the connection closes or an error occurs.
@@ -432,15 +463,27 @@ mod tokio_impl {
             loop {
                 let frame = match self.reader.read_frame().await {
                     Ok(f) => f,
-                    Err(TransportError::ConnectionClosed) => return Ok(()),
-                    Err(e) => return Err(e),
+                    Err(TransportError::ConnectionClosed) => {
+                        self.close_all_channels_and_notify();
+                        return Ok(());
+                    }
+                    Err(e) => {
+                        self.close_all_channels_and_notify();
+                        return Err(e);
+                    }
                 };
 
                 let key = (frame.dataflow_id, frame.channel_id);
-                if let Some(tx) = self.channels.get(&key) {
+                if let Some((tx, notify)) = self
+                    .channels
+                    .get(&key)
+                    .map(|channel| (channel.sender.clone(), channel.notify.clone()))
+                {
                     // If the receiver is dropped, remove the channel
                     if tx.send(frame.payload).await.is_err() {
                         self.channels.remove(&key);
+                    } else if let Some(notify) = notify {
+                        notify();
                     }
                 }
                 // Frames for unregistered (dataflow, channel) pairs are silently dropped.
@@ -844,6 +887,74 @@ mod transport_tests {
         assert!(rx1.try_recv().is_err());
         assert!(rx2.try_recv().is_err());
         assert!(rx3.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn demuxer_notifies_after_payload_is_visible() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let (client, server) = duplex(8192);
+        let mut writer = FramedWriter::new(client);
+
+        let mut demuxer = Demuxer::new(server, DemuxConfig::default());
+        let notified = Arc::new(AtomicBool::new(false));
+        let notify = {
+            let notified = Arc::clone(&notified);
+            Arc::new(move || {
+                notified.store(true, Ordering::SeqCst);
+            })
+        };
+        let mut rx = demuxer.register_channel_with_notify(
+            DataflowId::from_bytes([1u8; 16]),
+            1,
+            Some(notify),
+        );
+
+        writer
+            .write_frame(&Frame {
+                dataflow_id: DataflowId::from_bytes([1u8; 16]),
+                channel_id: 1,
+                payload: b"visible-before-notify".to_vec(),
+            })
+            .await
+            .unwrap();
+        drop(writer);
+
+        demuxer.run().await.unwrap();
+
+        assert!(notified.load(Ordering::SeqCst));
+        assert_eq!(rx.try_recv().unwrap(), b"visible-before-notify");
+    }
+
+    #[tokio::test]
+    async fn demuxer_notifies_after_channel_senders_are_dropped_on_close() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let (client, server) = duplex(8192);
+        let mut demuxer = Demuxer::new(server, DemuxConfig::default());
+        let notified = Arc::new(AtomicBool::new(false));
+        let notify = {
+            let notified = Arc::clone(&notified);
+            Arc::new(move || {
+                notified.store(true, Ordering::SeqCst);
+            })
+        };
+        let mut rx = demuxer.register_channel_with_notify(
+            DataflowId::from_bytes([1u8; 16]),
+            1,
+            Some(notify),
+        );
+
+        drop(client);
+        demuxer.run().await.unwrap();
+
+        assert!(notified.load(Ordering::SeqCst));
+        assert!(matches!(
+            rx.try_recv(),
+            Err(tokio::sync::mpsc::error::TryRecvError::Disconnected)
+        ));
     }
 
     #[tokio::test]

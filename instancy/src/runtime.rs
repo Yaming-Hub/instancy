@@ -2029,7 +2029,6 @@ impl RuntimeHandle {
         Ok(multi)
     }
 
-
     #[allow(clippy::too_many_arguments)]
     fn spawn_staged_se_internal<T, F>(
         &self,
@@ -2398,8 +2397,7 @@ impl RuntimeHandle {
             // min(source_par, target_par) would be silently lost.
             {
                 let regular_edge_count = dataflow.graph.edges().len();
-                let feedback_edges: Vec<_> =
-                    dataflow.graph.feedback_edges().to_vec();
+                let feedback_edges: Vec<_> = dataflow.graph.feedback_edges().to_vec();
                 for (fb_idx, edge) in feedback_edges.iter().enumerate() {
                     if edge.source_stage == edge.target_stage {
                         continue; // intra-stage feedback handled by materialize_stage_executor
@@ -2858,6 +2856,9 @@ impl RuntimeHandle {
         >;
         let mut shared_registration_cleanup = None;
 
+        // Wake handles for ALL workers (remote ones are placeholders for API compat).
+        let wake_handles: Vec<WakeHandle> = (0..total_workers).map(|_| WakeHandle::new()).collect();
+
         match transport_config {
             ClusterSpawnTransport::Dedicated {
                 connections,
@@ -2947,13 +2948,46 @@ impl RuntimeHandle {
                     }
                 }
 
-                let (session, mut raw_receivers) = TransportSession::new(
+                let mut data_wake_handles = std::collections::HashMap::new();
+                for (edge_order, &_edge_idx) in exchange_indices.iter().enumerate() {
+                    for node in &topology.nodes {
+                        if node.node_id == local_node_id {
+                            continue;
+                        }
+                        let peer_id = &node.node_id;
+                        let (peer_start, peer_end) =
+                            topology.worker_range(peer_id).ok_or_else(|| {
+                                Error::Topology(TopologyError::NodeNotFound {
+                                    node_id: peer_id.clone(),
+                                })
+                            })?;
+                        for src in peer_start..peer_end {
+                            for (dst, wake) in wake_handles
+                                .iter()
+                                .enumerate()
+                                .take(local_end)
+                                .skip(local_start)
+                            {
+                                let channel_id = NetworkEdgeMaterializer::<T, u8>::channel_id(
+                                    edge_order,
+                                    src,
+                                    dst,
+                                    total_workers,
+                                );
+                                data_wake_handles.insert(channel_id, wake.clone());
+                            }
+                        }
+                    }
+                }
+
+                let (session, mut raw_receivers) = TransportSession::new_with_wake_handles(
                     dataflow_id,
                     connections,
                     &data_regs,
                     &progress_regs,
                     capacity,
                     runtime_handle,
+                    &data_wake_handles,
                 );
                 let session = Arc::new(session);
                 transport = Arc::new(ClusterTransport::Dedicated(Arc::clone(&session)));
@@ -3105,9 +3139,8 @@ impl RuntimeHandle {
         }
 
         // Phase 5: Wire exchange channels using network-backed factories.
-        // Create wake handles BEFORE exchange wiring so bridge tasks can use them.
-        // Wake handles for ALL workers (remote ones are placeholders for API compat).
-        let wake_handles: Vec<WakeHandle> = (0..total_workers).map(|_| WakeHandle::new()).collect();
+        // Wake handles were created before transport setup so dedicated demux
+        // callbacks and shared bridge tasks use the same worker wake channels.
 
         // Take network creators from worker 0 (all workers have identical topology).
         let network_creators = std::mem::take(&mut dataflows[0].exchange_network_creators);

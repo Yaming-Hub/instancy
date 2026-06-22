@@ -59,6 +59,8 @@ use tokio::sync::mpsc as tokio_mpsc;
 #[cfg(feature = "transport")]
 use crate::communication::transport::{DemuxConfig, Demuxer, Frame, FramedWriter};
 #[cfg(feature = "transport")]
+use crate::dataflow::channels::wake::WakeHandle;
+#[cfg(feature = "transport")]
 use crate::dataflow::id::DataflowId;
 
 // ---------------------------------------------------------------------------
@@ -126,6 +128,8 @@ pub struct TransportSession {
     payload_senders: HashMap<String, tokio_mpsc::Sender<Frame>>,
     /// Per-peer control frame senders (bounded, highest priority).
     control_senders: HashMap<String, tokio_mpsc::Sender<Frame>>,
+    /// Whether data channels registered demux-level wake callbacks.
+    data_wake_callbacks_enabled: bool,
     /// Shared state keeping background tasks alive (abort on drop).
     _state: std::sync::Arc<SessionState>,
 }
@@ -203,6 +207,34 @@ impl TransportSession {
         R: AsyncRead + Unpin + Send + 'static,
         W: AsyncWrite + Unpin + Send + 'static,
     {
+        Self::new_with_wake_handles(
+            dataflow_id,
+            connections,
+            data_channels,
+            progress_channels,
+            capacity,
+            runtime_handle,
+            &HashMap::new(),
+        )
+    }
+
+    /// Create a new transport session with data-channel wake notifications.
+    pub fn new_with_wake_handles<R, W>(
+        dataflow_id: DataflowId,
+        connections: Vec<PeerConnection<R, W>>,
+        data_channels: &[ChannelRegistration],
+        progress_channels: &[ChannelRegistration],
+        capacity: usize,
+        runtime_handle: &tokio::runtime::Handle,
+        wake_handles: &HashMap<u64, WakeHandle>,
+    ) -> (
+        Self,
+        HashMap<String, HashMap<u64, tokio_mpsc::Receiver<Vec<u8>>>>,
+    )
+    where
+        R: AsyncRead + Unpin + Send + 'static,
+        W: AsyncWrite + Unpin + Send + 'static,
+    {
         let mut payload_senders = HashMap::new();
         let mut control_senders = HashMap::new();
         let mut bridge_handles = Vec::new();
@@ -242,7 +274,12 @@ impl TransportSession {
             // Register data channels from this peer
             for reg in data_channels {
                 if reg.peer_node_id == peer_node_id {
-                    let rx = demuxer.register_channel(dataflow_id, reg.channel_id);
+                    let notify = wake_handles.get(&reg.channel_id).cloned().map(|wake| {
+                        std::sync::Arc::new(move || wake.notify())
+                            as std::sync::Arc<dyn Fn() + Send + Sync>
+                    });
+                    let rx =
+                        demuxer.register_channel_with_notify(dataflow_id, reg.channel_id, notify);
                     all_receivers
                         .entry(peer_node_id.clone())
                         .or_default()
@@ -277,9 +314,16 @@ impl TransportSession {
             demux_handles,
         });
 
+        let data_wake_callbacks_enabled =
+            !wake_handles.is_empty()
+                && data_channels
+                    .iter()
+                    .all(|reg| wake_handles.contains_key(&reg.channel_id));
+
         let session = Self {
             payload_senders,
             control_senders,
+            data_wake_callbacks_enabled,
             _state: state,
         };
 
@@ -302,6 +346,11 @@ impl TransportSession {
     /// time T arrives at the receiver before the frontier advances past T.
     pub fn progress_sender(&self, peer_node_id: &str) -> Option<&tokio_mpsc::Sender<Frame>> {
         self.payload_senders.get(peer_node_id)
+    }
+
+    /// Whether data frames wake target workers directly from the demuxer.
+    pub fn data_wake_callbacks_enabled(&self) -> bool {
+        self.data_wake_callbacks_enabled
     }
 
     /// Get a control-priority sender for a peer (highest priority).
@@ -466,6 +515,99 @@ mod tests {
 
         drop(session_a);
         drop(session_b);
+    }
+
+    #[tokio::test]
+    async fn session_new_keeps_data_wake_callbacks_disabled() {
+        let df_id = make_dataflow_id();
+        let (_a_to_b, b_from_a) = tokio::io::duplex(64 * 1024);
+        let (b_to_a, _a_from_b) = tokio::io::duplex(64 * 1024);
+        let rt = tokio::runtime::Handle::current();
+        let data_regs = vec![ChannelRegistration {
+            peer_node_id: "node-a".into(),
+            channel_id: 1,
+        }];
+
+        let (session, _receivers) = TransportSession::new(
+            df_id,
+            vec![PeerConnection {
+                node_id: "node-a".into(),
+                reader: b_from_a,
+                writer: b_to_a,
+            }],
+            &data_regs,
+            &[],
+            16,
+            &rt,
+        );
+
+        assert!(!session.data_wake_callbacks_enabled());
+    }
+
+    #[tokio::test]
+    async fn session_with_wake_handles_enables_data_wake_callbacks() {
+        let df_id = make_dataflow_id();
+        let (_a_to_b, b_from_a) = tokio::io::duplex(64 * 1024);
+        let (b_to_a, _a_from_b) = tokio::io::duplex(64 * 1024);
+        let rt = tokio::runtime::Handle::current();
+        let data_regs = vec![ChannelRegistration {
+            peer_node_id: "node-a".into(),
+            channel_id: 1,
+        }];
+        let mut wake_handles = HashMap::new();
+        wake_handles.insert(1, WakeHandle::new());
+
+        let (session, _receivers) = TransportSession::new_with_wake_handles(
+            df_id,
+            vec![PeerConnection {
+                node_id: "node-a".into(),
+                reader: b_from_a,
+                writer: b_to_a,
+            }],
+            &data_regs,
+            &[],
+            16,
+            &rt,
+            &wake_handles,
+        );
+
+        assert!(session.data_wake_callbacks_enabled());
+    }
+
+    #[tokio::test]
+    async fn session_with_partial_wake_handles_disables_data_wake_callbacks() {
+        let df_id = make_dataflow_id();
+        let (_a_to_b, b_from_a) = tokio::io::duplex(64 * 1024);
+        let (b_to_a, _a_from_b) = tokio::io::duplex(64 * 1024);
+        let rt = tokio::runtime::Handle::current();
+        let data_regs = vec![
+            ChannelRegistration {
+                peer_node_id: "node-a".into(),
+                channel_id: 1,
+            },
+            ChannelRegistration {
+                peer_node_id: "node-a".into(),
+                channel_id: 2,
+            },
+        ];
+        let mut wake_handles = HashMap::new();
+        wake_handles.insert(1, WakeHandle::new());
+
+        let (session, _receivers) = TransportSession::new_with_wake_handles(
+            df_id,
+            vec![PeerConnection {
+                node_id: "node-a".into(),
+                reader: b_from_a,
+                writer: b_to_a,
+            }],
+            &data_regs,
+            &[],
+            16,
+            &rt,
+            &wake_handles,
+        );
+
+        assert!(!session.data_wake_callbacks_enabled());
     }
 
     #[tokio::test]
