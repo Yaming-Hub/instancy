@@ -710,19 +710,34 @@ impl<T: Timestamp + ExchangeData, D: ExchangeData> NetworkEdgeMaterializer<T, D>
             }
         }
 
-        let (session, receivers) = TransportSession::new(
+        let wake_handles: Vec<WakeHandle> = (0..num_workers).map(|_| WakeHandle::new()).collect();
+        let mut data_wake_handles = std::collections::HashMap::new();
+        if let Some((local_start, local_end)) = local_range {
+            for peer_id in &peer_node_ids {
+                if let Some((peer_start, peer_end)) = topology.worker_range(peer_id) {
+                    for src in peer_start..peer_end {
+                        for dst in local_start..local_end {
+                            let channel_id = Self::channel_id(0, src, dst, num_workers);
+                            data_wake_handles.insert(channel_id, wake_handles[dst].clone());
+                        }
+                    }
+                }
+            }
+        }
+
+        let (session, receivers) = TransportSession::new_with_wake_handles(
             dataflow_id,
             connections,
             &data_regs,
             &[],
             capacity,
             runtime_handle,
+            &data_wake_handles,
         );
 
         let transport = Arc::new(
             crate::communication::cluster_transport::ClusterTransport::Dedicated(Arc::new(session)),
         );
-        let wake_handles: Vec<WakeHandle> = (0..num_workers).map(|_| WakeHandle::new()).collect();
         Self::new(
             dataflow_id,
             topology,
