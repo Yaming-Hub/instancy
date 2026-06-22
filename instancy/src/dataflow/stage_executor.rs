@@ -1111,6 +1111,7 @@ mod tests {
 
     use crate::dataflow::graph::OperatorInfo;
     use crate::progress::operate::PortConnectivity;
+    use std::task::{Wake, Waker};
 
     struct MockOperator {
         name: String,
@@ -1147,6 +1148,26 @@ mod tests {
         fn close_inputs(&mut self) {
             self.done = true;
         }
+    }
+
+    struct CountingWaker {
+        count: Arc<AtomicUsize>,
+    }
+
+    impl Wake for CountingWaker {
+        fn wake(self: Arc<Self>) {
+            self.count
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        }
+
+        fn wake_by_ref(self: &Arc<Self>) {
+            self.count
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+
+    fn counting_waker(count: Arc<AtomicUsize>) -> Waker {
+        Waker::from(Arc::new(CountingWaker { count }))
     }
 
     #[test]
@@ -1398,5 +1419,63 @@ mod tests {
         );
 
         assert!(executor.is_completed());
+    }
+
+    #[test]
+    fn combined_executor_keeps_acyclic_quiescent_stage_alive() {
+        let operators: Vec<Box<dyn SchedulableOperator>> = vec![Box::new(MockOperator {
+            name: "idle".to_string(),
+            index: 0,
+            stage_id: StageId::new(4),
+            done: false,
+        })];
+
+        let mut config = ExecutorConfig::default();
+        config.max_idle_sweeps = 1;
+
+        let wake = WakeHandle::new();
+        let executor = StageExecutor::<u64>::new(
+            StageId::new(4),
+            0,
+            operators,
+            vec![0],
+            CancellationToken::new(),
+            config,
+            vec![ExchangeInput::<u64>::new(StageId::new(1), 1)],
+            Vec::new(),
+            None,
+            vec![None],
+            Vec::new(),
+            Vec::new(),
+            wake.clone(),
+            Arc::new(AtomicUsize::new(0)),
+            Arc::new(AtomicUsize::new(0)),
+        );
+
+        let mut combined = CombinedStageExecutor::new(vec![executor], wake.clone(), HashMap::new());
+        let wake_count = Arc::new(AtomicUsize::new(0));
+        let waker = counting_waker(Arc::clone(&wake_count));
+        let mut cx = Context::from_waker(&waker);
+
+        assert!(matches!(
+            Pin::new(&mut combined).poll(&mut cx),
+            Poll::Pending
+        ));
+        assert!(
+            combined.stages[0].is_some(),
+            "acyclic all-quiescent poll must not drop stages"
+        );
+        assert_eq!(
+            wake_count.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "stale notifications must be drained, not converted into self-wakes"
+        );
+
+        wake.notify();
+        assert_eq!(
+            wake_count.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "shared channel notification must wake the combined executor"
+        );
     }
 }
