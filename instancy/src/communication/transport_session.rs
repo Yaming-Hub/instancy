@@ -278,11 +278,8 @@ impl TransportSession {
                         std::sync::Arc::new(move || wake.notify())
                             as std::sync::Arc<dyn Fn() + Send + Sync>
                     });
-                    let rx = demuxer.register_channel_with_notify(
-                        dataflow_id,
-                        reg.channel_id,
-                        notify,
-                    );
+                    let rx =
+                        demuxer.register_channel_with_notify(dataflow_id, reg.channel_id, notify);
                     all_receivers
                         .entry(peer_node_id.clone())
                         .or_default()

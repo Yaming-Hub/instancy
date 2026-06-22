@@ -1171,13 +1171,11 @@ mod tests {
 
     impl Wake for CountingWaker {
         fn wake(self: Arc<Self>) {
-            self.count
-                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            self.count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         }
 
         fn wake_by_ref(self: &Arc<Self>) {
-            self.count
-                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            self.count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         }
     }
 
