@@ -1623,6 +1623,7 @@ impl<T: Timestamp> DataflowExecutor<T> {
                 {
                     if self.wake_handle.take_notification() {
                         self.consecutive_idle = 0;
+                        self.wake_handle.notify();
                         return Ok(SweepOutcome::WaitingForInput);
                     }
                     for pos in 0..self.operators.len() {
