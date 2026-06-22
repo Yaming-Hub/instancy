@@ -910,92 +910,107 @@ impl<T: Timestamp> Future for CombinedStageExecutor<T> {
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         let this = self.get_mut();
         let budget = 64usize;
-        let mut polled = 0usize;
-        let mut any_pending = false;
-        let mut any_completed_this_poll = false;
-        let mut all_remaining_quiesced = true;
 
-        for i in 0..this.stages.len() {
-            let Some(stage) = this.stages[i].as_mut() else {
-                continue;
-            };
+        loop {
+            let mut polled = 0usize;
+            let mut any_pending = false;
+            let mut any_completed_this_poll = false;
+            let mut all_remaining_quiesced = true;
 
-            polled += 1;
-            match Pin::new(stage).poll(cx) {
-                Poll::Ready(Ok(true)) => {
-                    // Release feedback dependencies: stages that were waiting
-                    // for this stage's feedback can now proceed to quiescence.
-                    if let Some(deps) = this.feedback_release.get(&i) {
-                        for dep in deps {
-                            dep.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+            for i in 0..this.stages.len() {
+                let Some(stage) = this.stages[i].as_mut() else {
+                    continue;
+                };
+
+                polled += 1;
+                match Pin::new(stage).poll(cx) {
+                    Poll::Ready(Ok(true)) => {
+                        // Release feedback dependencies: stages that were waiting
+                        // for this stage's feedback can now proceed to quiescence.
+                        if let Some(deps) = this.feedback_release.get(&i) {
+                            for dep in deps {
+                                dep.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+                            }
                         }
+                        // Drop the completed stage to release its boundary channels
+                        // (ExchangePush/Pull endpoints), unblocking downstream stages.
+                        this.stages[i] = None;
+                        any_completed_this_poll = true;
                     }
-                    // Drop the completed stage to release its boundary channels
-                    // (ExchangePush/Pull endpoints), unblocking downstream stages.
-                    this.stages[i] = None;
-                    any_completed_this_poll = true;
+                    Poll::Ready(Ok(false)) => {
+                        // Stage quiesced — keep it alive.Other stages in this
+                        // CombinedStageExecutor may still produce data for it
+                        // (e.g., cross-stage feedback loops). Only when ALL
+                        // remaining stages quiesce do we know the loop converged.
+                        any_pending = true;
+                    }
+                    Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
+                    Poll::Pending => {
+                        any_pending = true;
+                        all_remaining_quiesced = false;
+                    }
                 }
-                Poll::Ready(Ok(false)) => {
-                    // Stage quiesced — keep it alive.Other stages in this
-                    // CombinedStageExecutor may still produce data for it
-                    // (e.g., cross-stage feedback loops). Only when ALL
-                    // remaining stages quiesce do we know the loop converged.
-                    any_pending = true;
-                }
-                Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
-                Poll::Pending => {
-                    any_pending = true;
-                    all_remaining_quiesced = false;
+
+                if polled >= budget && this.stages.iter().any(|s| s.is_some()) {
+                    this.wake_handle.register_waker(cx.waker());
+                    this.wake_handle.notify();
+                    return Poll::Pending;
                 }
             }
 
-            if polled >= budget && this.stages.iter().any(|s| s.is_some()) {
+            let all_done = this.stages.iter().all(|s| s.is_none());
+            if all_done {
+                this.wake_handle.clear_waker();
+                return Poll::Ready(Ok(true));
+            } else if any_pending && all_remaining_quiesced && !any_completed_this_poll {
+                if !this.feedback_release.is_empty() {
+                    // All remaining stages quiesced and none completed this poll
+                    // while a cross-stage feedback edge is present, so the loop has
+                    // converged. This preserves the existing feedback termination
+                    // behavior; full feedback correctness needs global progress
+                    // tracking rather than local quiescence.
+                    for (i, stage) in this.stages.iter().enumerate() {
+                        if stage.is_some() {
+                            if let Some(deps) = this.feedback_release.get(&i) {
+                                for dep in deps {
+                                    dep.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+                                }
+                            }
+                        }
+                    }
+                    // Drop all remaining stages to release their channels.
+                    for stage in &mut this.stages {
+                        *stage = None;
+                    }
+                    this.wake_handle.clear_waker();
+                    return Poll::Ready(Ok(true));
+                } else {
+                    // Acyclic staged pipelines can have all local stages quiesce
+                    // while upstream workers still own exchange pushers or have
+                    // same-worker boundary data that is not fully drained. Keep the
+                    // stages alive so channel closure/data wakeups can drive normal
+                    // completion instead of dropping buffered records.
+                    this.wake_handle.register_waker(cx.waker());
+                    if this.wake_handle.take_notification() {
+                        // Race-safe wake protocol: if data/closure arrived before
+                        // or during waker registration, re-poll instead of yielding
+                        // and potentially losing the wakeup.
+                        continue;
+                    }
+                    return Poll::Pending;
+                }
+            } else if any_pending || any_completed_this_poll {
+                // If a stage completed this poll, wake immediately so downstream
+                // stages can observe the newly-closed channels.
                 this.wake_handle.register_waker(cx.waker());
-                this.wake_handle.notify();
-                return Poll::Pending;
-            }
-        }
-
-        let all_done = this.stages.iter().all(|s| s.is_none());
-        if all_done {
-            this.wake_handle.clear_waker();
-            Poll::Ready(Ok(true))
-        } else if any_pending && all_remaining_quiesced && !any_completed_this_poll {
-            // All remaining stages quiesced and none completed this poll —
-            // the dataflow has converged.  Every stage had a chance to pull
-            // from boundary channels during its poll, so no data is in
-            // transit within this worker.
-            //
-            // In staged execution, global quiescence means the dataflow
-            // has converged (e.g., feedback loop terminated). This is normal
-            // completion, not an error condition.
-            // Release all feedback deps before dropping stages.
-            for (i, stage) in this.stages.iter().enumerate() {
-                if stage.is_some() {
-                    if let Some(deps) = this.feedback_release.get(&i) {
-                        for dep in deps {
-                            dep.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
-                        }
-                    }
+                if any_completed_this_poll || this.wake_handle.take_notification() {
+                    this.wake_handle.notify();
                 }
+                return Poll::Pending;
+            } else {
+                this.wake_handle.clear_waker();
+                return Poll::Ready(Ok(false));
             }
-            // Drop all remaining stages to release their channels.
-            for stage in &mut this.stages {
-                *stage = None;
-            }
-            this.wake_handle.clear_waker();
-            Poll::Ready(Ok(true))
-        } else if any_pending || any_completed_this_poll {
-            // If a stage completed this poll, wake immediately so downstream
-            // stages can observe the newly-closed channels.
-            this.wake_handle.register_waker(cx.waker());
-            if any_completed_this_poll || this.wake_handle.take_notification() {
-                this.wake_handle.notify();
-            }
-            Poll::Pending
-        } else {
-            this.wake_handle.clear_waker();
-            Poll::Ready(Ok(false))
         }
     }
 }
