@@ -142,6 +142,8 @@ impl ClusterTransport {
     pub fn data_wake_callbacks_enabled(&self) -> bool {
         match self {
             Self::Dedicated(session) => session.data_wake_callbacks_enabled(),
+            // Shared transport does not yet expose per-channel data wake callbacks,
+            // so network pulls stay bridge-backed in shared mode.
             Self::Shared { .. } => false,
         }
     }

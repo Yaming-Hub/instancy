@@ -314,10 +314,16 @@ impl TransportSession {
             demux_handles,
         });
 
+        let data_wake_callbacks_enabled =
+            !wake_handles.is_empty()
+                && data_channels
+                    .iter()
+                    .all(|reg| wake_handles.contains_key(&reg.channel_id));
+
         let session = Self {
             payload_senders,
             control_senders,
-            data_wake_callbacks_enabled: !wake_handles.is_empty(),
+            data_wake_callbacks_enabled,
             _state: state,
         };
 
