@@ -1039,6 +1039,17 @@ mod tests {
             (mat_a, mat_b)
         }
 
+        #[tokio::test]
+        async fn with_connections_enables_data_wake_callbacks() {
+            let topo = two_node_topology();
+            let df_id = DataflowId::new();
+            let rt = tokio::runtime::Handle::current();
+
+            let (_mat_a, mat_b) = create_connected_materializers(df_id, topo, 16, &rt);
+
+            assert!(mat_b.transport.data_wake_callbacks_enabled());
+        }
+
         /// Poll a pull endpoint with timeout, retrying until data arrives or
         /// the deadline expires. Avoids fragile fixed-duration sleeps.
         async fn poll_pull<T, D>(
