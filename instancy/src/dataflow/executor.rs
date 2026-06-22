@@ -1528,6 +1528,11 @@ impl<T: Timestamp> DataflowExecutor<T> {
     }
 
     fn run_one_sweep_inner(&mut self) -> Result<SweepOutcome> {
+        // Drain stale wake tokens at the start of a sweep. A token observed
+        // later in this sweep means some channel became runnable after this
+        // sweep's activation pass, so completion must be deferred.
+        self.wake_handle.take_notification();
+
         // Drain incoming control signals (non-blocking).
         // This is checked BEFORE the cancellation check so that control
         // signals are consumed even when cancellation is already in flight.
@@ -1616,6 +1621,10 @@ impl<T: Timestamp> DataflowExecutor<T> {
                     && !tracker.has_pending_peer_progress()?
                     && tracker.all_peers_synced()
                 {
+                    if self.wake_handle.take_notification() {
+                        self.consecutive_idle = 0;
+                        return Ok(SweepOutcome::WaitingForInput);
+                    }
                     for pos in 0..self.operators.len() {
                         if !self.done[pos] {
                             self.operators[pos].close_inputs();
