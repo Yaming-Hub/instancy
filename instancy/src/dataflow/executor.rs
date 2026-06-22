@@ -1587,7 +1587,15 @@ impl<T: Timestamp> DataflowExecutor<T> {
         }
 
         // After each batch, propagate progress and enqueue dirty operators.
-        if self.propagate_progress()? {
+        // Peer progress can be meaningful even when it produces no dirty
+        // operator frontier, e.g. a +1/-1 batch that completes global progress.
+        let had_pending_peer_progress = self
+            .progress_tracker
+            .as_ref()
+            .map(|tracker| tracker.has_pending_peer_progress())
+            .transpose()?
+            .unwrap_or(false);
+        if self.propagate_progress()? || had_pending_peer_progress {
             self.consecutive_idle = 0;
         }
 
@@ -2133,10 +2141,11 @@ mod tests {
         executor.wake_handle = wakes[1].clone();
         executor.set_progress_tracker(tracker);
 
-        assert!(matches!(
-            executor.run_one_sweep().unwrap(),
-            SweepOutcome::WaitingForInput
-        ));
+        let outcome = executor.run_one_sweep().unwrap();
+        assert!(
+            !matches!(outcome, SweepOutcome::Completed),
+            "peer progress consumed this sweep must defer force-close; got {outcome:?}"
+        );
         assert!(
             !executor.done[0],
             "peer progress consumed this sweep must defer force-close"
