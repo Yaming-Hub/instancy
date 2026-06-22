@@ -1572,6 +1572,11 @@ impl<T: Timestamp> DataflowExecutor<T> {
         }
 
         // Activate operators — stage-task, fused, or unfused path.
+        let tracker_was_completed = self
+            .progress_tracker
+            .as_ref()
+            .is_some_and(|tracker| tracker.is_completed());
+
         let any_progress = if !self.stage_tasks.is_empty() {
             self.run_stage_task_activation()?
         } else if self.fused_order.is_some() {
@@ -1595,7 +1600,13 @@ impl<T: Timestamp> DataflowExecutor<T> {
             .map(|tracker| tracker.has_pending_peer_progress())
             .transpose()?
             .unwrap_or(false);
-        if self.propagate_progress()? || had_pending_peer_progress {
+        let progress_activated = self.propagate_progress()?;
+        let tracker_completed_now = self
+            .progress_tracker
+            .as_ref()
+            .is_some_and(|tracker| tracker.is_completed());
+        let progress_completed_this_sweep = tracker_completed_now && !tracker_was_completed;
+        if progress_activated || had_pending_peer_progress || progress_completed_this_sweep {
             self.consecutive_idle = 0;
         }
 
