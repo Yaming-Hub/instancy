@@ -847,6 +847,74 @@ mod transport_tests {
     }
 
     #[tokio::test]
+    async fn demuxer_notifies_after_payload_is_visible() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let (client, server) = duplex(8192);
+        let mut writer = FramedWriter::new(client);
+
+        let mut demuxer = Demuxer::new(server, DemuxConfig::default());
+        let notified = Arc::new(AtomicBool::new(false));
+        let notify = {
+            let notified = Arc::clone(&notified);
+            Arc::new(move || {
+                notified.store(true, Ordering::SeqCst);
+            })
+        };
+        let mut rx = demuxer.register_channel_with_notify(
+            DataflowId::from_bytes([1u8; 16]),
+            1,
+            Some(notify),
+        );
+
+        writer
+            .write_frame(&Frame {
+                dataflow_id: DataflowId::from_bytes([1u8; 16]),
+                channel_id: 1,
+                payload: b"visible-before-notify".to_vec(),
+            })
+            .await
+            .unwrap();
+        drop(writer);
+
+        demuxer.run().await.unwrap();
+
+        assert!(notified.load(Ordering::SeqCst));
+        assert_eq!(rx.try_recv().unwrap(), b"visible-before-notify");
+    }
+
+    #[tokio::test]
+    async fn demuxer_notifies_after_channel_senders_are_dropped_on_close() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let (client, server) = duplex(8192);
+        let mut demuxer = Demuxer::new(server, DemuxConfig::default());
+        let notified = Arc::new(AtomicBool::new(false));
+        let notify = {
+            let notified = Arc::clone(&notified);
+            Arc::new(move || {
+                notified.store(true, Ordering::SeqCst);
+            })
+        };
+        let mut rx = demuxer.register_channel_with_notify(
+            DataflowId::from_bytes([1u8; 16]),
+            1,
+            Some(notify),
+        );
+
+        drop(client);
+        demuxer.run().await.unwrap();
+
+        assert!(notified.load(Ordering::SeqCst));
+        assert!(matches!(
+            rx.try_recv(),
+            Err(tokio::sync::mpsc::error::TryRecvError::Disconnected)
+        ));
+    }
+
+    #[tokio::test]
     async fn demuxer_unregistered_channel_silently_dropped() {
         let (client, server) = duplex(8192);
         let mut writer = FramedWriter::new(client);

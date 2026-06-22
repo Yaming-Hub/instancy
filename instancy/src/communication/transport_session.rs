@@ -390,6 +390,7 @@ pub const CONTROL_CHANNEL_ID: u64 = 0;
 #[cfg(feature = "transport")]
 mod tests {
     use super::*;
+    use crate::dataflow::channels::wake::WakeHandle;
 
     fn make_dataflow_id() -> DataflowId {
         DataflowId::new()
@@ -466,6 +467,63 @@ mod tests {
 
         drop(session_a);
         drop(session_b);
+    }
+
+    #[tokio::test]
+    async fn session_new_keeps_data_wake_callbacks_disabled() {
+        let df_id = make_dataflow_id();
+        let (_a_to_b, b_from_a) = tokio::io::duplex(64 * 1024);
+        let (b_to_a, _a_from_b) = tokio::io::duplex(64 * 1024);
+        let rt = tokio::runtime::Handle::current();
+        let data_regs = vec![ChannelRegistration {
+            peer_node_id: "node-a".into(),
+            channel_id: 1,
+        }];
+
+        let (session, _receivers) = TransportSession::new(
+            df_id,
+            vec![PeerConnection {
+                node_id: "node-a".into(),
+                reader: b_from_a,
+                writer: b_to_a,
+            }],
+            &data_regs,
+            &[],
+            16,
+            &rt,
+        );
+
+        assert!(!session.data_wake_callbacks_enabled());
+    }
+
+    #[tokio::test]
+    async fn session_with_wake_handles_enables_data_wake_callbacks() {
+        let df_id = make_dataflow_id();
+        let (_a_to_b, b_from_a) = tokio::io::duplex(64 * 1024);
+        let (b_to_a, _a_from_b) = tokio::io::duplex(64 * 1024);
+        let rt = tokio::runtime::Handle::current();
+        let data_regs = vec![ChannelRegistration {
+            peer_node_id: "node-a".into(),
+            channel_id: 1,
+        }];
+        let mut wake_handles = HashMap::new();
+        wake_handles.insert(1, WakeHandle::new());
+
+        let (session, _receivers) = TransportSession::new_with_wake_handles(
+            df_id,
+            vec![PeerConnection {
+                node_id: "node-a".into(),
+                reader: b_from_a,
+                writer: b_to_a,
+            }],
+            &data_regs,
+            &[],
+            16,
+            &rt,
+            &wake_handles,
+        );
+
+        assert!(session.data_wake_callbacks_enabled());
     }
 
     #[tokio::test]
