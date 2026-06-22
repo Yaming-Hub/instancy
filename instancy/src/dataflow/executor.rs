@@ -2008,6 +2008,81 @@ mod tests {
         }
     }
 
+    struct NotifyingIdleOperator {
+        index: usize,
+        stage_id: crate::dataflow::stage::StageId,
+        wake: WakeHandle,
+        notified: bool,
+        closed: bool,
+    }
+
+    impl SchedulableOperator for NotifyingIdleOperator {
+        fn activate(&mut self) -> Result<ActivationOutcome> {
+            if self.closed {
+                return Ok(ActivationOutcome::Done);
+            }
+            if !self.notified {
+                self.notified = true;
+                self.wake.notify();
+            }
+            Ok(ActivationOutcome::Idle)
+        }
+
+        fn is_done(&self) -> bool {
+            self.closed
+        }
+
+        fn name(&self) -> &str {
+            "notifying-idle"
+        }
+
+        fn index(&self) -> usize {
+            self.index
+        }
+
+        fn stage_id(&self) -> crate::dataflow::stage::StageId {
+            self.stage_id
+        }
+
+        fn close_inputs(&mut self) {
+            self.closed = true;
+        }
+    }
+
+    #[test]
+    fn pending_wake_defers_tracker_completion_force_close() {
+        let wake = WakeHandle::new();
+        wake.take_notification();
+
+        let ops: Vec<Box<dyn SchedulableOperator>> = vec![Box::new(NotifyingIdleOperator {
+            index: 0,
+            stage_id: crate::dataflow::stage::StageId::new(0),
+            wake: wake.clone(),
+            notified: false,
+            closed: false,
+        })];
+        let config = ExecutorConfig {
+            max_idle_sweeps: 1,
+            ..Default::default()
+        };
+        let mut executor = DataflowExecutor::<u64>::new_test(ops, config, 0);
+        executor.wake_handle = wake;
+
+        let mut tracker = crate::progress::subgraph::SubgraphBuilder::<u64>::new(0, 0).build();
+        tracker.initialize().unwrap();
+        assert!(tracker.is_completed());
+        executor.set_progress_tracker(tracker);
+
+        assert!(matches!(
+            executor.run_one_sweep().unwrap(),
+            SweepOutcome::WaitingForInput
+        ));
+        assert!(
+            !executor.done[0],
+            "executor must not force-close operators while a wake is pending"
+        );
+    }
+
     #[test]
     fn executor_runs_single_operator_to_completion() {
         let mut executor: DataflowExecutor<u64> = DataflowExecutor {
