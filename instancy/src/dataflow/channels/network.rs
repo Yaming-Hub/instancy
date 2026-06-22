@@ -432,14 +432,16 @@ async fn data_recv_bridge(
 // NetworkPull — Pull<T, D, ()> that receives and deserializes from the wire
 // ---------------------------------------------------------------------------
 
-/// A `Pull` endpoint that receives bytes forwarded by a bridge task and
-/// deserializes them through a [`Codec`] back into typed envelopes.
+/// A `Pull` endpoint that receives bytes from the transport and deserializes
+/// them through a [`Codec`] back into typed envelopes.
 ///
-/// The bridge task receives from the Demuxer's tokio mpsc channel (async)
-/// and forwards to a `std::sync::mpsc` channel (sync), notifying the
-/// executor's WakeHandle on each frame. This allows `NetworkPull` to use
-/// non-blocking `try_recv()` while still waking the executor promptly
-/// when remote data arrives.
+/// In dedicated transport, the demuxer delivers frames directly into the
+/// receiver and notifies the executor wake handle after each frame. This keeps
+/// data visible to `NetworkPull` before later progress frames on the same FIFO
+/// payload lane become visible to the progress tracker.
+///
+/// Shared transport still uses a bridge task for wake notification until shared
+/// data-channel wake callbacks are available.
 ///
 /// When a close-sentinel frame is received, this endpoint marks itself
 /// as exhausted. Since the protocol guarantees FIFO ordering with a single
@@ -448,10 +450,16 @@ async fn data_recv_bridge(
 pub struct NetworkPull<T: Timestamp + ExchangeData, D: ExchangeData> {
     time_codec: T::CodecType,
     data_codec: D::CodecType,
-    receiver: std::sync::mpsc::Receiver<Vec<u8>>,
+    receiver: NetworkReceiver,
     exhausted: bool,
     /// Keeps transport alive (background tasks survive as long as this exists).
     _transport: Arc<crate::communication::cluster_transport::ClusterTransport>,
+}
+
+#[cfg(feature = "transport")]
+enum NetworkReceiver {
+    Direct(tokio_mpsc::Receiver<Vec<u8>>),
+    Bridged(std::sync::mpsc::Receiver<Vec<u8>>),
 }
 
 #[cfg(feature = "transport")]
@@ -460,13 +468,23 @@ impl<T: Timestamp + ExchangeData, D: ExchangeData> Pull<T, D, ()> for NetworkPul
         if self.exhausted {
             return None;
         }
-        let bytes = match self.receiver.try_recv() {
-            Ok(b) => b,
-            Err(std::sync::mpsc::TryRecvError::Empty) => return None,
-            Err(std::sync::mpsc::TryRecvError::Disconnected) => {
-                self.exhausted = true;
-                return None;
-            }
+        let bytes = match &mut self.receiver {
+            NetworkReceiver::Direct(receiver) => match receiver.try_recv() {
+                Ok(bytes) => bytes,
+                Err(tokio_mpsc::error::TryRecvError::Empty) => return None,
+                Err(tokio_mpsc::error::TryRecvError::Disconnected) => {
+                    self.exhausted = true;
+                    return None;
+                }
+            },
+            NetworkReceiver::Bridged(receiver) => match receiver.try_recv() {
+                Ok(bytes) => bytes,
+                Err(std::sync::mpsc::TryRecvError::Empty) => return None,
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                    self.exhausted = true;
+                    return None;
+                }
+            },
         };
         match decode_envelope(&self.time_codec, &self.data_codec, &bytes) {
             Ok(Some(env)) => Some(env),
@@ -863,16 +881,21 @@ impl<T: Timestamp + ExchangeData, D: ExchangeData> EdgeMaterializer<T, D>
                             )))
                         })?;
 
-                let (std_tx, std_rx) = std::sync::mpsc::channel::<Vec<u8>>();
-                let wake = self.wake_handles[dst_idx].clone();
-                self.runtime_handle.spawn(async move {
-                    data_recv_bridge(tokio_receiver, std_tx, wake).await;
-                });
+                let receiver = if self.transport.data_wake_callbacks_enabled() {
+                    NetworkReceiver::Direct(tokio_receiver)
+                } else {
+                    let (std_tx, std_rx) = std::sync::mpsc::channel::<Vec<u8>>();
+                    let wake = self.wake_handles[dst_idx].clone();
+                    self.runtime_handle.spawn(async move {
+                        data_recv_bridge(tokio_receiver, std_tx, wake).await;
+                    });
+                    NetworkReceiver::Bridged(std_rx)
+                };
 
                 pullers.push(Box::new(NetworkPull::<T, D> {
                     time_codec: T::codec(),
                     data_codec: D::codec(),
-                    receiver: std_rx,
+                    receiver,
                     exhausted: false,
                     _transport: self.transport.clone(),
                 }));

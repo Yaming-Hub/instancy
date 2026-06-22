@@ -59,6 +59,8 @@ use tokio::sync::mpsc as tokio_mpsc;
 #[cfg(feature = "transport")]
 use crate::communication::transport::{DemuxConfig, Demuxer, Frame, FramedWriter};
 #[cfg(feature = "transport")]
+use crate::dataflow::channels::wake::WakeHandle;
+#[cfg(feature = "transport")]
 use crate::dataflow::id::DataflowId;
 
 // ---------------------------------------------------------------------------
@@ -126,6 +128,8 @@ pub struct TransportSession {
     payload_senders: HashMap<String, tokio_mpsc::Sender<Frame>>,
     /// Per-peer control frame senders (bounded, highest priority).
     control_senders: HashMap<String, tokio_mpsc::Sender<Frame>>,
+    /// Whether data channels registered demux-level wake callbacks.
+    data_wake_callbacks_enabled: bool,
     /// Shared state keeping background tasks alive (abort on drop).
     _state: std::sync::Arc<SessionState>,
 }
@@ -203,6 +207,34 @@ impl TransportSession {
         R: AsyncRead + Unpin + Send + 'static,
         W: AsyncWrite + Unpin + Send + 'static,
     {
+        Self::new_with_wake_handles(
+            dataflow_id,
+            connections,
+            data_channels,
+            progress_channels,
+            capacity,
+            runtime_handle,
+            &HashMap::new(),
+        )
+    }
+
+    /// Create a new transport session with data-channel wake notifications.
+    pub fn new_with_wake_handles<R, W>(
+        dataflow_id: DataflowId,
+        connections: Vec<PeerConnection<R, W>>,
+        data_channels: &[ChannelRegistration],
+        progress_channels: &[ChannelRegistration],
+        capacity: usize,
+        runtime_handle: &tokio::runtime::Handle,
+        wake_handles: &HashMap<u64, WakeHandle>,
+    ) -> (
+        Self,
+        HashMap<String, HashMap<u64, tokio_mpsc::Receiver<Vec<u8>>>>,
+    )
+    where
+        R: AsyncRead + Unpin + Send + 'static,
+        W: AsyncWrite + Unpin + Send + 'static,
+    {
         let mut payload_senders = HashMap::new();
         let mut control_senders = HashMap::new();
         let mut bridge_handles = Vec::new();
@@ -242,7 +274,15 @@ impl TransportSession {
             // Register data channels from this peer
             for reg in data_channels {
                 if reg.peer_node_id == peer_node_id {
-                    let rx = demuxer.register_channel(dataflow_id, reg.channel_id);
+                    let notify = wake_handles.get(&reg.channel_id).cloned().map(|wake| {
+                        std::sync::Arc::new(move || wake.notify())
+                            as std::sync::Arc<dyn Fn() + Send + Sync>
+                    });
+                    let rx = demuxer.register_channel_with_notify(
+                        dataflow_id,
+                        reg.channel_id,
+                        notify,
+                    );
                     all_receivers
                         .entry(peer_node_id.clone())
                         .or_default()
@@ -280,6 +320,7 @@ impl TransportSession {
         let session = Self {
             payload_senders,
             control_senders,
+            data_wake_callbacks_enabled: !wake_handles.is_empty(),
             _state: state,
         };
 
@@ -302,6 +343,11 @@ impl TransportSession {
     /// time T arrives at the receiver before the frontier advances past T.
     pub fn progress_sender(&self, peer_node_id: &str) -> Option<&tokio_mpsc::Sender<Frame>> {
         self.payload_senders.get(peer_node_id)
+    }
+
+    /// Whether data frames wake target workers directly from the demuxer.
+    pub fn data_wake_callbacks_enabled(&self) -> bool {
+        self.data_wake_callbacks_enabled
     }
 
     /// Get a control-priority sender for a peer (highest priority).
@@ -390,7 +436,6 @@ pub const CONTROL_CHANNEL_ID: u64 = 0;
 #[cfg(feature = "transport")]
 mod tests {
     use super::*;
-    use crate::dataflow::channels::wake::WakeHandle;
 
     fn make_dataflow_id() -> DataflowId {
         DataflowId::new()

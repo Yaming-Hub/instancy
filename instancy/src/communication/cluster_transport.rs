@@ -138,6 +138,14 @@ impl ClusterTransport {
         }
     }
 
+    /// Whether data frames wake target workers directly from demux delivery.
+    pub fn data_wake_callbacks_enabled(&self) -> bool {
+        match self {
+            Self::Dedicated(session) => session.data_wake_callbacks_enabled(),
+            Self::Shared { .. } => false,
+        }
+    }
+
     /// Returns the set of peer node IDs this transport has connections to.
     pub fn peer_node_ids(&self) -> Vec<String> {
         match self {

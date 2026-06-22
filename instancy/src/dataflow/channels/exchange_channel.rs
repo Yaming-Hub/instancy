@@ -1109,9 +1109,9 @@ pub(crate) struct NetworkMaterializerParams {
     pub num_workers: usize,
     pub edge_index: usize,
     /// Wake handles for all workers (indexed by global worker ID).
-    /// Used to notify the executor when remote data arrives.
+    /// Used for shared transport data bridge wakeups.
     pub wake_handles: Vec<crate::dataflow::channels::wake::WakeHandle>,
-    /// Tokio runtime handle for spawning bridge tasks.
+    /// Tokio runtime handle for spawning shared transport data bridge tasks.
     pub runtime_handle: tokio::runtime::Handle,
     /// Optional channel metrics collector for this exchange edge.
     pub channel_metrics: Option<Arc<crate::metrics::ChannelMetricsCollector>>,
