@@ -979,16 +979,29 @@ impl<T: Timestamp> Future for CombinedStageExecutor<T> {
         if all_done {
             this.wake_handle.clear_waker();
             Poll::Ready(Ok(true))
-        } else if any_pending && all_remaining_quiesced && !any_completed_this_poll && loops_drained
+        } else if any_pending
+            && all_remaining_quiesced
+            && !any_completed_this_poll
+            && loops_drained
+            && !this.loop_inflight.is_empty()
         {
-            // All remaining stages quiesced, none completed this poll, and every
-            // feedback loop is globally drained — the dataflow has converged.
-            // Every stage had a chance to pull from boundary channels during its
-            // poll, so no data is in transit within this worker.
+            // Quiescence-based convergence exists ONLY to break feedback loops:
+            // a cycle never reaches input exhaustion on its own, so once every
+            // loop in-flight counter is drained (`loops_drained`) and all stages
+            // are quiescent, the loop has converged and its stages can be
+            // dropped. The `!loop_inflight.is_empty()` guard restricts this to
+            // dataflows that actually contain a loop.
             //
-            // In staged execution, global quiescence means the dataflow
-            // has converged (e.g., feedback loop terminated). This is normal
-            // completion, not an error condition.
+            // ACYCLIC staged dataflows must NOT converge this way. With no loop
+            // counter to prove the cross-stage exchange channels are drained,
+            // local quiescence is unsound: a downstream stage can be idle simply
+            // because an upstream stage on another worker hasn't pushed its data
+            // yet. Dropping it here strands that in-flight gather/scatter data
+            // (issue: premature completion under aggressive quiescence). Acyclic
+            // dataflows instead terminate via the exhaustion cascade — an
+            // upstream stage completes, drops its `ExchangePush`, the downstream
+            // boundary `ExchangePull` becomes exhausted, its operators drain and
+            // finish — which is sound regardless of the idle-sweep budget.
             // Release all feedback deps before dropping stages.
             for (i, stage) in this.stages.iter().enumerate() {
                 if stage.is_some() {
