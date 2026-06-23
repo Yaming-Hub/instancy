@@ -59,6 +59,7 @@ use crate::error::{DataflowError, Error, Result};
 #[cfg(test)]
 use crate::progress::frontier::Antichain;
 use crate::progress::mutable_antichain::MutableAntichain;
+use crate::progress::operate::ProgressReporter;
 use crate::progress::timestamp::Timestamp;
 
 // ---------------------------------------------------------------------------
@@ -315,6 +316,12 @@ pub struct ExchangePush<T: Timestamp, D: Send + 'static> {
     buckets: Vec<Vec<D>>,
     /// Optional channel metrics collector (enabled via `MetricsConfig::channel_counters`).
     channel_metrics: Option<Arc<crate::metrics::ChannelMetricsCollector>>,
+    /// Optional in-flight message reporter. When set, each batch of `n` data
+    /// records sent records `+n` at the batch timestamp, accounting the records
+    /// as in flight toward the exchange's downstream input until they are
+    /// consumed (see [`ExchangePull`]'s reporter). Bound to the same per-worker
+    /// reporter registered on the progress tracker.
+    inflight: Option<ProgressReporter<T>>,
 }
 
 impl<T: Timestamp, D: Send + 'static> ExchangePush<T, D> {
@@ -334,6 +341,7 @@ impl<T: Timestamp, D: Send + 'static> ExchangePush<T, D> {
             closed: false,
             buckets,
             channel_metrics: None,
+            inflight: None,
         }
     }
 
@@ -354,6 +362,7 @@ impl<T: Timestamp, D: Send + 'static> ExchangePush<T, D> {
             closed: false,
             buckets,
             channel_metrics: Some(channel_metrics),
+            inflight: None,
         }
     }
 }
@@ -404,6 +413,12 @@ impl<T: Timestamp, D: Clone + Send + 'static> Push<T, D> for ExchangePush<T, D> 
                     let items = data_len as u64;
                     let bytes = (items as usize * std::mem::size_of::<D>()) as u64;
                     metrics.record_push(items, bytes);
+                }
+
+                // Account the sent records as in flight toward the downstream
+                // input until they are consumed.
+                if let Some(ref inflight) = self.inflight {
+                    inflight.update(time, data_len as i64);
                 }
             }
             Payload::Control(signal) => {
@@ -511,6 +526,12 @@ impl<T: Timestamp, D: Clone + Send + 'static> Push<T, D> for ExchangePush<T, D> 
                     let bytes = (items as usize * std::mem::size_of::<D>()) as u64;
                     metrics.record_push(items, bytes);
                 }
+
+                // Account the sent records as in flight toward the downstream
+                // input until they are consumed.
+                if let Some(ref inflight) = self.inflight {
+                    inflight.update(time.clone(), data.len() as i64);
+                }
             }
             Payload::Control(signal) => {
                 // Pre-check all targets for capacity before broadcasting.
@@ -555,6 +576,10 @@ impl<T: Timestamp, D: Clone + Send + 'static> Push<T, D> for ExchangePush<T, D> 
 
     fn is_closed(&self) -> bool {
         self.closed
+    }
+
+    fn set_inflight_reporter(&mut self, reporter: ProgressReporter<T>) {
+        self.inflight = Some(reporter);
     }
 }
 
@@ -903,6 +928,11 @@ pub struct ExchangePull<T: Timestamp, D> {
     frontier_agg: FrontierAggregator<T>,
     /// Buffered watermark envelopes produced by frontier aggregation.
     pending_watermarks: VecDeque<T>,
+    /// Optional in-flight message reporter. When set, each batch of `n` data
+    /// records delivered to the consumer records `-n` at the batch timestamp,
+    /// retiring the in-flight messages accounted by the sending [`ExchangePush`].
+    /// Bound to the same per-worker reporter registered on the progress tracker.
+    inflight: Option<ProgressReporter<T>>,
 }
 
 impl<T: Timestamp, D> ExchangePull<T, D> {
@@ -920,6 +950,18 @@ impl<T: Timestamp, D> ExchangePull<T, D> {
             wakes,
             frontier_agg,
             pending_watermarks: VecDeque::new(),
+            inflight: None,
+        }
+    }
+
+    /// Record consumed (`-count`) for a delivered data envelope, if a reporter
+    /// is attached.
+    #[inline]
+    fn record_consumed(&self, env: &Envelope<T, D, ()>) {
+        if let Some(ref inflight) = self.inflight {
+            if let Payload::Data { time, data } = &env.payload {
+                inflight.update(time.clone(), -(data.len() as i64));
+            }
         }
     }
 }
@@ -952,7 +994,10 @@ impl<T: Timestamp, D: Send + 'static> Pull<T, D> for ExchangePull<T, D> {
                     self.wakes.wake(idx);
 
                     match env.payload {
-                        Payload::Data { .. } => return Some(env),
+                        Payload::Data { .. } => {
+                            self.record_consumed(&env);
+                            return Some(env);
+                        }
                         Payload::Control(ControlSignal::Watermark(t)) => {
                             // Aggregate: update source frontier, emit only if
                             // the overall frontier advanced.
@@ -1000,6 +1045,7 @@ impl<T: Timestamp, D: Send + 'static> Pull<T, D> for ExchangePull<T, D> {
 
                     match env.payload {
                         Payload::Data { .. } => {
+                            self.record_consumed(&env);
                             buffer.push(env);
                             count += 1;
                         }
@@ -1027,6 +1073,10 @@ impl<T: Timestamp, D: Send + 'static> Pull<T, D> for ExchangePull<T, D> {
 
     fn is_exhausted(&self) -> bool {
         self.sources.iter().all(|s| s.is_exhausted())
+    }
+
+    fn set_inflight_reporter(&mut self, reporter: ProgressReporter<T>) {
+        self.inflight = Some(reporter);
     }
 }
 
@@ -1494,6 +1544,37 @@ mod tests {
         let env = pull1_from0[0].pull().unwrap(); // source 0 → dest 1
         let (_, data) = env.as_data().unwrap();
         assert_eq!(data, &vec![11, 13]);
+    }
+
+    #[test]
+    fn exchange_push_records_produced_and_pull_records_consumed() {
+        use crate::progress::operate::ProgressReporter;
+        // One worker pushing to itself: the same in-flight reporter is shared by
+        // the push (records +count produced) and pull (records -count consumed).
+        let mut set = ExchangeChannelSet::<u64, i32>::new(1, 16);
+        let wakes = Arc::new(SharedWakeRegistry::new(1));
+        let (pushers, pullers) = set.take_pair(0).unwrap();
+
+        let inflight = ProgressReporter::<u64>::new();
+        let exchange_fn = ExchangeFn::new("self", |_x: &i32| 0u64);
+        let mut push = ExchangePush::new(pushers, exchange_fn, wakes.clone());
+        push.set_inflight_reporter(inflight.clone());
+
+        push.push(Envelope::data(5u64, vec![1, 2, 3])).unwrap();
+        assert!(
+            !inflight.is_empty(),
+            "push must record produced messages in flight"
+        );
+
+        let mut pull = ExchangePull::new(pullers, wakes);
+        pull.set_inflight_reporter(inflight.clone());
+        while pull.pull().is_some() {}
+
+        let net: i64 = inflight.drain().into_iter().map(|(_, d)| d).sum();
+        assert_eq!(
+            net, 0,
+            "produced (+3) and consumed (-3) must net to zero once drained"
+        );
     }
 
     #[test]

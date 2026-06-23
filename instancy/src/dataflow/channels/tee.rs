@@ -186,6 +186,14 @@ impl<T: Timestamp, D: Clone + Send + 'static, M: Clone + Default + Send + 'stati
     fn is_closed(&self) -> bool {
         self.closed
     }
+
+    fn set_inflight_reporter(&mut self, reporter: crate::progress::operate::ProgressReporter<T>) {
+        // Propagate to every branch. Only exchange branches record; regular
+        // branches no-op — so in-flight accounting stays tee-safe.
+        for target in &mut self.targets {
+            target.set_inflight_reporter(reporter.clone());
+        }
+    }
 }
 
 /// Wrap multiple pushers for the same output port into a single pusher.

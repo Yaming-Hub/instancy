@@ -11,7 +11,6 @@
 //! dataflow materialization and owned by the [`DataflowExecutor`](super::executor::DataflowExecutor).
 
 use std::any::Any;
-use std::collections::HashMap;
 use std::sync::Arc;
 
 use crate::dataflow::stage::StageId;
@@ -220,10 +219,37 @@ impl ChannelEndpoints {
     ) -> Option<crate::progress::operate::ProgressReporter<T>> {
         self.progress_reporters
             .as_ref()?
-            .downcast_ref::<HashMap<(usize, usize), crate::progress::operate::ProgressReporter<T>>>(
-            )?
-            .get(&(operator, output))
-            .cloned()
+            .downcast_ref::<crate::progress::subgraph::MaterializationReporters>()?
+            .internal::<T>(operator, output)
+    }
+
+    /// Returns the in-flight reporter for a boundary edge whose **source** is
+    /// `(operator, output)` — i.e. the produced reporter the sender's output
+    /// pusher should record into. `T` is the *channel's* timestamp (which is
+    /// `Product<…>` for an exchange inside a loop, not the worker tracker's `T`).
+    pub fn inflight_reporter_by_source<T: crate::progress::timestamp::Timestamp>(
+        &self,
+        operator: usize,
+        output: usize,
+    ) -> Option<crate::progress::operate::ProgressReporter<T>> {
+        self.progress_reporters
+            .as_ref()?
+            .downcast_ref::<crate::progress::subgraph::MaterializationReporters>()?
+            .inflight_by_source::<T>(operator, output)
+    }
+
+    /// Returns the in-flight reporter for a boundary edge whose **target** is
+    /// `(operator, input)` — i.e. the consumed reporter the consumer's input
+    /// puller should record into.
+    pub fn inflight_reporter_by_target<T: crate::progress::timestamp::Timestamp>(
+        &self,
+        operator: usize,
+        input: usize,
+    ) -> Option<crate::progress::operate::ProgressReporter<T>> {
+        self.progress_reporters
+            .as_ref()?
+            .downcast_ref::<crate::progress::subgraph::MaterializationReporters>()?
+            .inflight_by_target::<T>(operator, input)
     }
 
     /// Take all output pushers for the given port, leaving the slot empty.

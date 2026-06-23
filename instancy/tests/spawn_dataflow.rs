@@ -266,6 +266,59 @@ fn auto_par_decreasing_parallelism() {
     multi.join_blocking().unwrap();
 }
 
+/// Regression: an acyclic staged dataflow must not drop in-flight cross-stage
+/// (scatter/gather) data under aggressive quiescence. `max_idle_sweeps(1)` is the
+/// deterministic vehicle — it makes a worker quiesce after a single idle sweep,
+/// the worst case for the completion race. Before the fix, the per-worker
+/// `CombinedStageExecutor` would converge on local quiescence and drop its
+/// stages while an upstream stage on another worker still had gather data in
+/// flight, silently losing records (e.g. 3 of 10 survived). Acyclic dataflows
+/// must instead terminate via the exhaustion cascade, which is sound at any idle
+/// budget; quiescence-based convergence is reserved for feedback loops. Same
+/// topology as `auto_par_decreasing_parallelism`, just with the latency knob
+/// pinned to its most aggressive setting — results must be identical.
+#[test]
+fn auto_par_decreasing_parallelism_eager_quiescence() {
+    let rt = test_runtime();
+
+    let mut multi = rt
+        .spawn_multi(
+            "decrease-eager",
+            0,
+            |builder: &mut DataflowBuilder<u64>| {
+                builder.max_idle_sweeps(1);
+                let input = builder.input::<i32>("data").unwrap();
+                input
+                    .exchange_to("scatter", 4, |v: &i32| *v as u64)
+                    .unwrap()
+                    .map("work", |_t, x| x * 3)
+                    .gather("collect")
+                    .output("results")
+                    .unwrap();
+                Ok(())
+            },
+            auto_opts(),
+        )
+        .unwrap();
+
+    let sender = multi.take_input::<i32>(0, "data").unwrap();
+    let receiver = multi.take_output::<i32>(0, "results").unwrap();
+
+    sender.send(0, (1..=10).collect()).unwrap();
+    drop(sender);
+
+    let mut results: Vec<i32> = receiver
+        .collect_data()
+        .into_iter()
+        .flat_map(|(_, d)| d)
+        .collect();
+    results.sort();
+    let expected: Vec<i32> = (1..=10).map(|x| x * 3).collect();
+    assert_eq!(results, expected);
+
+    multi.join_blocking().unwrap();
+}
+
 /// No-op / empty pipeline still works.
 #[test]
 fn auto_par_trivial_graph() {

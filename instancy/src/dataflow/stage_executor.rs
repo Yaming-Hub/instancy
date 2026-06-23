@@ -887,6 +887,13 @@ pub(crate) struct CombinedStageExecutor<T: Timestamp> {
     /// Populated from cross-stage feedback edges: when stage B feeds back
     /// to stage A, completing B decrements A's feedback_deps.
     feedback_release: HashMap<usize, Vec<Arc<AtomicUsize>>>,
+    /// Shared loop in-flight counters, one per `iterate` scope. A feedback loop
+    /// whose body crosses a stage boundary cannot be tracked by the per-stage
+    /// progress trackers; these counters (recorded by enter/leave operators) let
+    /// convergence wait until the loop is globally drained instead of declaring
+    /// it done on local quiescence — the unsound shortcut that previously dropped
+    /// in-flight loop data.
+    loop_inflight: Vec<Arc<std::sync::atomic::AtomicI64>>,
 }
 
 impl<T: Timestamp> CombinedStageExecutor<T> {
@@ -894,12 +901,14 @@ impl<T: Timestamp> CombinedStageExecutor<T> {
         stages: Vec<StageExecutor<T>>,
         wake_handle: WakeHandle,
         feedback_release: HashMap<usize, Vec<Arc<AtomicUsize>>>,
+        loop_inflight: Vec<Arc<std::sync::atomic::AtomicI64>>,
     ) -> Self {
         let stages = stages.into_iter().map(Some).collect();
         Self {
             stages,
             wake_handle,
             feedback_release,
+            loop_inflight,
         }
     }
 }
@@ -956,19 +965,43 @@ impl<T: Timestamp> Future for CombinedStageExecutor<T> {
             }
         }
 
+        // A feedback loop has truly converged only when every record that
+        // entered it has left — i.e. all loop in-flight counters are zero. Local
+        // quiescence alone is unsound: data may still be buffered in a
+        // cross-stage exchange/feedback channel that no stage has drained yet,
+        // and dropping the stages here would silently lose it.
+        let loops_drained = this
+            .loop_inflight
+            .iter()
+            .all(|c| c.load(std::sync::atomic::Ordering::SeqCst) <= 0);
+
         let all_done = this.stages.iter().all(|s| s.is_none());
         if all_done {
             this.wake_handle.clear_waker();
             Poll::Ready(Ok(true))
-        } else if any_pending && all_remaining_quiesced && !any_completed_this_poll {
-            // All remaining stages quiesced and none completed this poll —
-            // the dataflow has converged.  Every stage had a chance to pull
-            // from boundary channels during its poll, so no data is in
-            // transit within this worker.
+        } else if any_pending
+            && all_remaining_quiesced
+            && !any_completed_this_poll
+            && loops_drained
+            && !this.loop_inflight.is_empty()
+        {
+            // Quiescence-based convergence exists ONLY to break feedback loops:
+            // a cycle never reaches input exhaustion on its own, so once every
+            // loop in-flight counter is drained (`loops_drained`) and all stages
+            // are quiescent, the loop has converged and its stages can be
+            // dropped. The `!loop_inflight.is_empty()` guard restricts this to
+            // dataflows that actually contain a loop.
             //
-            // In staged execution, global quiescence means the dataflow
-            // has converged (e.g., feedback loop terminated). This is normal
-            // completion, not an error condition.
+            // ACYCLIC staged dataflows must NOT converge this way. With no loop
+            // counter to prove the cross-stage exchange channels are drained,
+            // local quiescence is unsound: a downstream stage can be idle simply
+            // because an upstream stage on another worker hasn't pushed its data
+            // yet. Dropping it here strands that in-flight gather/scatter data
+            // (issue: premature completion under aggressive quiescence). Acyclic
+            // dataflows instead terminate via the exhaustion cascade — an
+            // upstream stage completes, drops its `ExchangePush`, the downstream
+            // boundary `ExchangePull` becomes exhausted, its operators drain and
+            // finish — which is sound regardless of the idle-sweep budget.
             // Release all feedback deps before dropping stages.
             for (i, stage) in this.stages.iter().enumerate() {
                 if stage.is_some() {

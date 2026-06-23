@@ -205,6 +205,105 @@ async fn multi_worker_iterate_collatz() {
     assert!(results.iter().all(|&x| x == 1));
 }
 
+/// Regression for issue #277: a multi-worker iterate+exchange loop must not
+/// lose data even under the most aggressive force-close policy
+/// (`max_idle_sweeps = 1`). Correctness is independent of that latency knob — a
+/// converged loop yields the same results at any threshold. Before in-flight
+/// message accounting, eager force-close tore down the loop while exchange data
+/// was still in flight, silently dropping it.
+///
+/// IGNORED — tracks a SEPARATE executor liveness bug, not the #277 data-loss fix
+/// (which this test would otherwise exercise end-to-end). See the data-loss fix's
+/// real coverage below before changing anything here.
+///
+/// ## Why it's ignored
+///
+/// At `max_idle_sweeps = 1` this test HANGS (it does not lose data — the
+/// in-flight accounting correctly refuses to declare completion — it simply
+/// never drains the last record). The hang is a wake/quiescence race in the
+/// executor core, *independent* of the #277 accounting fix:
+///
+/// - With ≥2 workers, one worker can finish its local work and park (its stage
+///   returns `WaitingForInput` → `Poll::Pending`) in the narrow window between a
+///   peer pushing the loop's final record into this worker's exchange channel
+///   and this worker's exchange-consumer operator pulling it. The record sits
+///   buffered in the SPSC ring; the consumer operator is alive (never marked
+///   `done`/exhausted — verified) but is not re-polled to drain it. The
+///   producer's `wakes.wake(target)` fires a present handle, yet the woken
+///   worker does not make progress on the buffered record.
+/// - Empirically the threshold is sharp: `max_idle_sweeps` of 1/2/3 hang,
+///   5/8/64 pass. Production hardcodes 64 (runtime.rs), which is *why* the slack
+///   exists — cross-worker push→wake→pull needs more than one idle sweep to
+///   settle. `idle = 1` is below that coordination floor, i.e. an unsupported
+///   configuration for cross-worker feedback loops, not a data-loss defect.
+///
+/// ## Where the #277 data-loss fix IS verified (do not rely on this test for it)
+///
+/// - `inflight_message_keeps_tracker_incomplete_until_consumed` (lib unit test):
+///   deterministic, no threads — proves the tracker stays incomplete while a
+///   message is in flight. This is the rigorous proof the fix works.
+/// - The full non-eager `multi_worker_iterate` suite (collatz, doubling,
+///   immediate-exit, multi-epoch, three-workers, staged feedback) and the TCP
+///   cross-node test — all green at the production idle budget.
+///
+/// ## What remains to be done to un-ignore this (the actual fix)
+///
+/// Root-cause and fix the wake/quiescence race so `idle = 1` drains
+/// deterministically (timing must stop mattering), WITHOUT regressing throughput
+/// (the fix must live at sweep/quiescence boundaries, never the per-record hot
+/// path). Concretely:
+/// 1. Build a DETERMINISTIC repro first: a `current_thread` tokio runtime (single
+///    threaded) so the wake protocol can be stepped through. Multi-threaded
+///    `eprintln` tracing is unreliable here — output is dropped/reordered while
+///    the process hangs, which is what blocked the live investigation.
+/// 2. Confirm the exact park path. The stuck stage returns `WaitingForInput`
+///    (not `Quiescent`) — so it is gated by `async_waiting` or
+///    `external_inputs_open` (stage_executor.rs `run_one_sweep`). Establish which,
+///    and why the consumer's `pull_input()` returns empty even though the SPSC
+///    ring holds the record (the ring's own Acquire/Release should make the
+///    pushed record visible — verify there isn't a missed re-poll instead).
+/// 3. Enforce the invariant: while the shared loop in-flight counter is > 0
+///    (loop not globally drained), a parked worker MUST be reliably re-roused to
+///    drain its exchange inputs — no lost wakeup. A self-wake gated on
+///    `all_remaining_quiesced && !loops_drained` was tried and did NOT fire
+///    (because the stuck stage returns `Pending`, not `Quiescent`), so the fix
+///    likely belongs on the `WaitingForInput`/`Pending` park path or in the wake
+///    delivery itself, not the convergence branch.
+/// 4. Re-enable BOTH eager tests (this one and
+///    `staged_iterate_cross_stage_feedback_eager_quiescence`) and run each many
+///    times to confirm determinism (no flakiness) before removing `#[ignore]`.
+#[ignore = "idle=1 wake/quiescence race (separate from #277 data-loss fix); see doc comment"]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn multi_worker_iterate_collatz_eager_quiescence() {
+    let results = run_multi_worker_iterate(
+        "mw-collatz-eager",
+        2,
+        |builder| {
+            builder.max_idle_sweeps(1);
+            let input = builder.input::<i64>("data").unwrap();
+            let output = input.iterate::<u32>("collatz-loop", 1u32, |iter_var| {
+                let stepped = iter_var
+                    .map("collatz-step", |_t: &Product<u64, u32>, x| {
+                        if x % 2 == 0 { x / 2 } else { 3 * x + 1 }
+                    })
+                    .exchange_by_hash("redistribute", |x: &i64| *x as u64);
+                let done = stepped.clone().filter("reached-1", |_t, x| *x == 1);
+                let again = stepped.filter("continue", |_t, x| *x != 1);
+                IterateResult {
+                    feedback: again,
+                    output: done,
+                }
+            });
+            output.output("results").unwrap();
+        },
+        vec![(0, vec![6, 7, 12])],
+    )
+    .await;
+
+    assert_eq!(results.len(), 3);
+    assert!(results.iter().all(|&x| x == 1));
+}
+
 /// Multi-worker iteration with multiple epochs.
 ///
 /// Data from different timestamps enters the loop independently,
@@ -435,6 +534,91 @@ async fn staged_iterate_cross_stage_feedback() {
     // 5 → 10 → 20 → 40 → 80 → 160
     // 10 → 20 → 40 → 80 → 160
     // 50 → 100
+    assert_eq!(all_results.len(), 6);
+    assert_eq!(all_results, vec![100, 128, 128, 160, 160, 192]);
+}
+
+/// Regression for issue #277 (staged path): a cross-stage feedback loop must not
+/// lose data even under the most aggressive force-close policy
+/// (`max_idle_sweeps = 1`). The loop body crosses a stage boundary, so the
+/// per-stage progress trackers cannot account it; before the loop in-flight
+/// counter, the staged executor declared convergence on local quiescence and
+/// dropped in-flight loop data. This fails deterministically without the fix.
+///
+/// IGNORED — same `idle = 1` wake/quiescence race as
+/// `multi_worker_iterate_collatz_eager_quiescence`; see that test's doc comment
+/// for the full root-cause analysis and the plan to un-ignore. This is the
+/// staged (cross-stage feedback) variant of the same liveness bug, NOT a
+/// data-loss defect: the staged path's loop in-flight counter correctly refuses
+/// to converge while a record is in flight, so the loop hangs instead of losing
+/// data at this unsupported idle budget. The #277 staged-path fix itself is
+/// verified by `staged_iterate_cross_stage_feedback` (non-eager, green at the
+/// production idle budget).
+#[ignore = "idle=1 wake/quiescence race (separate from #277 data-loss fix); see collatz-eager doc comment"]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn staged_iterate_cross_stage_feedback_eager_quiescence() {
+    let rt = RuntimeHandle::new(RuntimeConfig::default()).unwrap();
+
+    let mut multi = rt
+        .spawn_multi(
+            "staged-iterate-eager",
+            2,
+            |builder: &mut DataflowBuilder<u64>| {
+                builder.max_idle_sweeps(1);
+                let input = builder.input::<i64>("data").unwrap();
+                let output = input.iterate::<u32>("double-loop", 1u32, |iter_var| {
+                    let doubled = iter_var
+                        .map("double", |_t: &Product<u64, u32>, x| x * 2)
+                        .exchange_by_hash("redistribute", |x: &i64| *x as u64);
+                    let done = doubled.clone().filter("done", |_t, x| *x >= 100);
+                    let again = doubled.filter("again", |_t, x| *x < 100);
+                    IterateResult {
+                        feedback: again,
+                        output: done,
+                    }
+                });
+                output
+                    .exchange_to("gather", 1, |x: &i64| *x as u64)
+                    .unwrap()
+                    .output("results")
+                    .unwrap();
+                Ok(())
+            },
+            SpawnOptions::new().per_stage_parallelism(true),
+        )
+        .unwrap();
+
+    let sender = multi.take_input::<i64>(0, "data").unwrap();
+    sender.send(0, vec![1, 2, 3, 5, 10, 50]).unwrap();
+    drop(sender);
+    drop(multi.take_input::<i64>(1, "data").unwrap());
+
+    let mut receivers = Vec::new();
+    for w in 0..multi.num_workers() {
+        receivers.push(multi.take_output::<i64>(w, "results").unwrap());
+    }
+
+    let result = tokio::time::timeout(
+        TEST_TIMEOUT,
+        tokio::task::spawn_blocking(move || multi.join_blocking()),
+    )
+    .await;
+
+    match result {
+        Ok(Ok(Ok(()))) => {}
+        Ok(Ok(Err(e))) => panic!("dataflow join failed: {e}"),
+        Ok(Err(e)) => panic!("spawn_blocking panicked: {e}"),
+        Err(_) => panic!("dataflow did not complete within {TEST_TIMEOUT:?}"),
+    }
+
+    let mut all_results: Vec<i64> = Vec::new();
+    for recv in receivers {
+        for (_time, data) in recv.collect_data() {
+            all_results.extend(data);
+        }
+    }
+    all_results.sort();
+
     assert_eq!(all_results.len(), 6);
     assert_eq!(all_results, vec![100, 128, 128, 160, 160, 192]);
 }

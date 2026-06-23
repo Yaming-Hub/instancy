@@ -14,13 +14,13 @@ Progress tracking is the heart of instancy's execution model. It determines when
 - `diff = +1`: capability acquired (operator can produce at this time)
 - `diff = -1`: capability released (operator will no longer produce at this time)
 
-**Pointstamps.** A pointstamp `(location, timestamp)` represents an outstanding capability at a specific point in the dataflow graph. The reachability `Tracker` maintains counts of all active pointstamps and computes their implications through path summaries.
+**Pointstamps.** A pointstamp `(location, timestamp)` represents outstanding work at a specific point in the dataflow graph. There are two kinds: a **source** pointstamp on an output port (an operator capability — "X may still produce at t") and a **target** pointstamp on an input port (an in-flight message — "a batch for t has been handed to a channel but not yet consumed"; see §11.4.4). The reachability `Tracker` maintains counts of all active pointstamps of both kinds and computes their implications through path summaries.
 
 **Path summaries.** The graph's structure defines summary functions from each output port to reachable downstream input ports. For a simple pipeline, the summary is identity (timestamp passes through unchanged). For a feedback loop, the summary includes a timestamp increment (e.g., `t → t + 1`). The tracker uses these to compute: "if a capability exists at output port A with time T, what is the earliest time data could arrive at input port B?"
 
 **Frontiers.** An operator's input frontier is the set of minimal timestamps that could still arrive. When a time `t` is no longer in the frontier (no pointstamp can reach input at `≤ t`), the operator is notified that `t` is complete. The frontier is an `Antichain<T>` — the incomparable minimal elements under the partial order.
 
-**Completion.** A dataflow is complete when `tracker.tracking_anything() == false` — there are no outstanding capabilities anywhere in the graph. For multi-worker dataflows, "anywhere" must mean across ALL workers, not just the local one.
+**Completion.** A dataflow is complete when `tracker.tracking_anything() == false` — there are no outstanding capabilities **and no unconsumed in-flight messages** anywhere in the graph. For multi-worker dataflows, "anywhere" must mean across ALL workers, not just the local one.
 
 ### 11.2 Single-Worker Progress Flow
 
@@ -85,7 +85,7 @@ Each worker's propagation cycle becomes:
 
 For N workers, we create N × (N-1) unidirectional FIFO channels:
 - Each worker gets (N-1) senders (one to each peer) and (N-1) receivers (one from each peer)
-- Messages are `Vec<ProgressChange<T>>` batches: `(operator_index, output_port, timestamp, diff)`
+- Messages are `Vec<ProgressChange<T>>` batches. Each `ProgressChange` carries a `kind` — `Source` (a capability change on an output port) or `Target` (an in-flight message count on an input port, see §11.4.4) — plus `(node, port, timestamp, diff)`. Both kinds are broadcast over the same channels.
 - FIFO ordering per sender ensures a release (`-1`) is never seen before the corresponding acquire (`+1`)
 - Senders notify the target worker's `WakeHandle`, waking idle workers on progress arrival
 
@@ -155,15 +155,27 @@ Worker 1:  Input ──► Op A ──► Exchange ──► Op B ──┤
 Data from worker 0's Op A may be routed to worker 1's Op B (and vice versa). Feedback from worker 1's Op B arrives at worker 1's Op A. The progress tracking must ensure:
 
 - Worker 0 doesn't conclude iteration N is complete until worker 1 has also finished iteration N.
-- Data in transit via exchange channels is accounted for (capabilities are held until data is pushed).
+- Data in transit via exchange channels is accounted for, even after the sending operator has released its capability.
 - Feedback data at iteration N+1 doesn't cause premature frontier advance at iteration N.
 
-All of this works automatically through the capability protocol + progress exchange:
-1. Before pushing data to exchange, the operator holds a capability at the output timestamp.
-2. The capability is broadcast to all peers.
-3. Peers see the capability and know data may still arrive at that timestamp.
-4. Only when the operator releases the capability (after push completes) do peers see the frontier advance.
-5. For in-process shared memory: data writes happen-before capability release, so data is always visible in the channel buffer when the peer processes the release.
+The first and third points fall out of the capability protocol + progress exchange: a worker only sees the loop-input frontier advance past iteration N once **all** workers have released their iteration-N capabilities (§11.4.2). The second point — data handed to an exchange but not yet consumed — is **not** covered by capabilities alone, because the loop-body operators (enter/concat/map/filter/feedback) are pure pass-throughs that hold no per-timestamp capability across a push. It is covered by explicit in-flight message accounting on the exchange channel, described next.
+
+#### 11.4.4 In-Flight Message Accounting (Exchange Channels)
+
+Capabilities answer "could an operator still *produce* at time t?" They do not, on their own, answer "is there a *message* for t already handed to a channel but not yet consumed?" For pipeline channels inside a single operator that gap is harmless. For **exchange** channels — especially inside a feedback loop, where the loop-body operators hold no capability across a push — it is not: a batch sent to another worker but not yet pulled would be invisible to progress, and the tracker could declare the loop complete while data is still in flight. This was the cause of premature completion / data loss in iterate+exchange dataflows (issue #277).
+
+instancy closes the gap with explicit message accounting on the exchange channel, mirroring timely-dataflow's per-channel message counters:
+
+- `ExchangePush` records `+n` at the downstream input pointstamp `(target_op, target_port, time)` when it sends a batch of `n` records.
+- `ExchangePull` records `-n` at the same pointstamp when it delivers that batch to the consumer.
+- The tracker drains these as **target** (message) pointstamps via `update_target`, alongside the **source** (capability) pointstamps. While the net count at a pointstamp is positive, that input's frontier — and therefore global completion — cannot advance past the message's timestamp.
+
+A few properties make this robust:
+
+- **Tee-safe.** `Push`/`Pull::set_inflight_reporter` is a no-op by default; only `ExchangePush`/`ExchangePull` record. A `TeePush` propagates the reporter to its branches, so a tee'd output accounts only its exchange branch and never double-counts.
+- **Loop-body timestamp projection.** Inside `iterate`, the loop body runs in `Product<T, TInner>` time while the merged parent tracker is `T`. The in-loop exchange's reporter is `ProgressReporter<Product<T, TInner>>`; the tracker drains it through a projection mapping each `(p, diff)` to `(p.outer, diff)`, so an unconsumed in-loop exchange message holds the **outer epoch** incomplete.
+- **Producer/consumer symmetry.** The `+n` and `-n` must always be wired together. The consumer side is wired for every exchange; the producer side must be wired wherever the exchange is *sourced* — not only after a unary operator, but also when an exchange is fed directly by the loop's `concat` (`iter_var.exchange(...)`). A missing producer side records `-n` with no matching `+n`, driving the count negative and hanging the loop.
+- **Cross-worker / cross-process.** Because `+n` and `-n` may be recorded on different workers or nodes, the counts ride the same progress broadcast (and network bridge) as capability changes; the `ProgressChange` `kind` distinguishes source from target pointstamps (§11.3.1, §11.5.1).
 
 ### 11.5 Logical Progress Exchange (Physical-Layer Independence)
 
@@ -202,13 +214,13 @@ This mirrors the logical/physical separation already established for data channe
 When workers run on different machines, progress exchange uses the same shared transport infrastructure as data channels. The wire protocol is defined in `communication/progress_exchange.rs`:
 
 ```
-┌──────────┬────────────────────────────────┐
-│ Header   │ Payload (Vec<ProgressChange>)  │
-│ (8 bytes)│ (Codec-serialized)             │
-├──────────┼────────────────────────────────┤
-│ msg_type │ [(op_idx, port, time, diff)]   │
-│ length   │                                │
-└──────────┴────────────────────────────────┘
+┌──────────┬─────────────────────────────────────┐
+│ Header   │ Payload (Vec<ProgressChange>)       │
+│ (8 bytes)│ (Codec-serialized)                  │
+├──────────┼─────────────────────────────────────┤
+│ msg_type │ [(kind, node, port, time, diff)]    │
+│ length   │  kind: 1 byte (0=source, 1=target)  │
+└──────────┴─────────────────────────────────────┘
 ```
 
 **Critical ordering guarantee for cross-process:** Data messages and progress messages share connections through the `SharedTransportSession`. The implementation ensures that data pushed to a channel is transmitted before the corresponding capability release by using a **single FIFO payload channel** per peer in the `TransportSession`. Both data and progress frames are sent through the same bounded `mpsc` channel, preserving the causal order: a worker sends data at time T before releasing its capability for T. The bridge task writes from this shared channel to TCP in FIFO order, with only control messages (handshake, ready barrier) receiving biased priority. This design also prevents cross-dataflow starvation — one dataflow's heavy data cannot block another dataflow's progress messages since they interleave naturally in the shared queue.
@@ -246,9 +258,10 @@ The progress exchange fits naturally into the three-layer architecture (§4.5):
 When the executor detects that an operator has been idle for many consecutive sweeps (quiescence), it checks whether the progress tracker reports completion. If `is_completed()` returns true AND no remote progress is pending, operators are force-closed:
 
 ```rust
-if consecutive_idle >= MAX_IDLE_SWEEPS {
+if consecutive_idle >= max_idle_sweeps {
     if tracker.is_completed() && !tracker.has_pending_remote() {
-        // All capabilities globally released, no pending remote progress.
+        // All capabilities released AND all in-flight exchange messages
+        // consumed (§11.4.4), no pending remote progress.
         // Safe to force-close remaining operators (feedback cycle quiesced).
         force_close_all_operators();
         return Completed;
@@ -256,7 +269,11 @@ if consecutive_idle >= MAX_IDLE_SWEEPS {
 }
 ```
 
-The `has_pending_remote()` check is defense-in-depth: after 64+ idle sweeps (each draining remote progress), it should always be empty. But checking guards against the narrow race where a peer sends progress between the last `propagate()` and the force-close decision.
+`max_idle_sweeps` is configurable via `DataflowBuilder::max_idle_sweeps` (default 64); it is a latency knob, not a correctness knob — `is_completed()` is the safety gate.
+
+With in-flight message accounting (§11.4.4), `is_completed()` already reflects unconsumed exchange data, so force-close cannot tear down a loop while data is still in flight — the source of the #277 data loss is removed regardless of the idle threshold. The `has_pending_remote()` check remains defense-in-depth: after many idle sweeps (each draining remote progress) it should always be empty, but checking guards against the narrow race where a peer sends progress between the last `propagate()` and the force-close decision.
+
+> **Known limitation (tracked separately).** The idle-sweep heuristic is a *backstop* for declaring quiescence, distinct from the progress-based safety gate above. At a very low `max_idle_sweeps` (≈1–3, well below the default 64) a worker can park in the narrow window between a peer pushing the loop's final record into an exchange channel and the consumer pulling it — the loop then hangs rather than completing. It does **not** lose data (the in-flight accounting correctly refuses completion). Resolving it means deriving quiescence from the progress tracker rather than an idle-sweep count; see the `*_eager_quiescence` tests in `multi_worker_iterate.rs` for the repro and analysis.
 
 ### 11.7 Async Probe
 
@@ -383,6 +400,9 @@ instancy keeps the same logical-time foundations:
 
 - **Capabilities** still represent permission to produce data at a timestamp.
 - **Pointstamps** still summarize outstanding work in the progress graph.
+- **In-flight message counts** on exchange channels (§11.4.4) follow timely's
+  per-channel counter model: a sent-but-unconsumed batch holds the downstream
+  frontier back, independent of capabilities.
 - **Path summaries** still describe timestamp transformation across edges.
 - **Antichains** still represent frontiers compactly.
 - **Reachability** still determines how progress changes propagate through
