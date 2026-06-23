@@ -887,6 +887,13 @@ pub(crate) struct CombinedStageExecutor<T: Timestamp> {
     /// Populated from cross-stage feedback edges: when stage B feeds back
     /// to stage A, completing B decrements A's feedback_deps.
     feedback_release: HashMap<usize, Vec<Arc<AtomicUsize>>>,
+    /// Shared loop in-flight counters, one per `iterate` scope. A feedback loop
+    /// whose body crosses a stage boundary cannot be tracked by the per-stage
+    /// progress trackers; these counters (recorded by enter/leave operators) let
+    /// convergence wait until the loop is globally drained instead of declaring
+    /// it done on local quiescence — the unsound shortcut that previously dropped
+    /// in-flight loop data.
+    loop_inflight: Vec<Arc<std::sync::atomic::AtomicI64>>,
 }
 
 impl<T: Timestamp> CombinedStageExecutor<T> {
@@ -894,12 +901,14 @@ impl<T: Timestamp> CombinedStageExecutor<T> {
         stages: Vec<StageExecutor<T>>,
         wake_handle: WakeHandle,
         feedback_release: HashMap<usize, Vec<Arc<AtomicUsize>>>,
+        loop_inflight: Vec<Arc<std::sync::atomic::AtomicI64>>,
     ) -> Self {
         let stages = stages.into_iter().map(Some).collect();
         Self {
             stages,
             wake_handle,
             feedback_release,
+            loop_inflight,
         }
     }
 }
@@ -956,15 +965,26 @@ impl<T: Timestamp> Future for CombinedStageExecutor<T> {
             }
         }
 
+        // A feedback loop has truly converged only when every record that
+        // entered it has left — i.e. all loop in-flight counters are zero. Local
+        // quiescence alone is unsound: data may still be buffered in a
+        // cross-stage exchange/feedback channel that no stage has drained yet,
+        // and dropping the stages here would silently lose it.
+        let loops_drained = this
+            .loop_inflight
+            .iter()
+            .all(|c| c.load(std::sync::atomic::Ordering::SeqCst) <= 0);
+
         let all_done = this.stages.iter().all(|s| s.is_none());
         if all_done {
             this.wake_handle.clear_waker();
             Poll::Ready(Ok(true))
-        } else if any_pending && all_remaining_quiesced && !any_completed_this_poll {
-            // All remaining stages quiesced and none completed this poll —
-            // the dataflow has converged.  Every stage had a chance to pull
-            // from boundary channels during its poll, so no data is in
-            // transit within this worker.
+        } else if any_pending && all_remaining_quiesced && !any_completed_this_poll && loops_drained
+        {
+            // All remaining stages quiesced, none completed this poll, and every
+            // feedback loop is globally drained — the dataflow has converged.
+            // Every stage had a chance to pull from boundary channels during its
+            // poll, so no data is in transit within this worker.
             //
             // In staged execution, global quiescence means the dataflow
             // has converged (e.g., feedback loop terminated). This is normal

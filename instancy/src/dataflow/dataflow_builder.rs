@@ -147,6 +147,16 @@ struct BuilderState<T: Timestamp> {
     contexts: SharedContext,
     /// Whether to catch panics in operator activation.
     catch_panics: bool,
+    /// Optional override for the executor's `max_idle_sweeps` (force-close
+    /// quiescence threshold). `None` uses the runtime default. Primarily a test
+    /// seam: correctness must hold regardless of how eagerly the executor
+    /// declares quiescence.
+    max_idle_sweeps: Option<usize>,
+    /// Shared loop in-flight counters, one per `iterate` scope. The enter/leave
+    /// operators record `+/-count`; the staged executor waits for all to reach
+    /// zero before declaring a feedback loop converged (its per-stage trackers
+    /// cannot account a loop body that crosses a stage boundary).
+    loop_inflight_counters: Vec<std::sync::Arc<std::sync::atomic::AtomicI64>>,
     /// Errors encountered during graph construction. Checked in `build()`.
     builder_errors: Vec<Error>,
 }
@@ -296,6 +306,8 @@ impl<T: Timestamp> DataflowBuilder<T> {
                 channel_preallocate: config.channel_preallocate,
                 contexts: SharedContext::new(),
                 catch_panics: false,
+                max_idle_sweeps: None,
+                loop_inflight_counters: Vec::new(),
                 builder_errors: Vec::new(),
             })),
         }
@@ -377,6 +389,19 @@ impl<T: Timestamp> DataflowBuilder<T> {
     /// [`Error::OperatorPanic`]: crate::error::Error::OperatorPanic
     pub fn catch_panics(&self, enable: bool) -> &Self {
         self.state.borrow_mut().catch_panics = enable;
+        self
+    }
+
+    /// Override the executor's `max_idle_sweeps` — the number of consecutive
+    /// no-progress sweeps the executor tolerates before force-closing quiescent
+    /// operators (feedback cycles that have converged).
+    ///
+    /// This is a latency/responsiveness knob: lower values shut a completed
+    /// dataflow down sooner at the cost of more eager quiescence checks. Leaving
+    /// it unset uses the runtime default. Correctness is independent of this
+    /// value — a converged dataflow yields the same results at any threshold.
+    pub fn max_idle_sweeps(&self, sweeps: usize) -> &Self {
+        self.state.borrow_mut().max_idle_sweeps = Some(sweeps);
         self
     }
 
@@ -1022,6 +1047,8 @@ impl<T: Timestamp> DataflowBuilder<T> {
             contexts: state.contexts,
             stages,
             catch_panics: state.catch_panics,
+            max_idle_sweeps: state.max_idle_sweeps,
+            loop_inflight_counters: state.loop_inflight_counters,
             collect_metrics: false,
             channel_counters: false,
             drain_timeout: None,
@@ -2241,6 +2268,15 @@ impl<T: Timestamp, D: Clone + Send + 'static> Pipe<T, D> {
         let stage_id = StageId::new(0);
         type PT<T, TInner> = Product<T, TInner>;
 
+        // Shared loop in-flight counter: enter records `+count`, leave `-count`.
+        // Used by the staged executor to keep a feedback loop alive until it is
+        // globally drained (see `BuilderState::loop_inflight_counters`).
+        let loop_counter = std::sync::Arc::new(std::sync::atomic::AtomicI64::new(0));
+        self.state
+            .borrow_mut()
+            .loop_inflight_counters
+            .push(loop_counter.clone());
+
         // Resolve per-edge capacity for the enter edge; internal edges use global default.
         let enter_capacity = self.resolve_capacity();
         let prealloc = self.state.borrow().channel_preallocate;
@@ -2293,6 +2329,7 @@ impl<T: Timestamp, D: Clone + Send + 'static> Pipe<T, D> {
 
             // Enter operator factory
             let enter_name = format!("{name}::enter");
+            let enter_loop_counter = loop_counter.clone();
             let enter_factory: OperatorFactory =
                 OperatorFactory::new(move |_ctx, mut endpoints: ChannelEndpoints| {
                     let enter_name = enter_name.clone();
@@ -2333,13 +2370,15 @@ impl<T: Timestamp, D: Clone + Send + 'static> Pipe<T, D> {
                         tee_or_single(pushers)?.unwrap_or_else(|| Box::new(NullPush))
                     };
 
-                    Ok(Box::new(WiredEnterOperator::<T, TInner, D>::new(
+                    let mut enter_op = WiredEnterOperator::<T, TInner, D>::new(
                         enter_name,
                         enter_idx,
                         stage_id,
                         input_puller,
                         output_pusher,
-                    )) as Box<dyn SchedulableOperator>)
+                    );
+                    enter_op.set_loop_counter(enter_loop_counter.clone());
+                    Ok(Box::new(enter_op) as Box<dyn SchedulableOperator>)
                 });
             state.operator_factories.push((enter_idx, enter_factory));
 
@@ -2514,7 +2553,7 @@ impl<T: Timestamp, D: Clone + Send + 'static> Pipe<T, D> {
                             })
                             .collect::<Result<_>>()?;
 
-                    let output_pusher: Box<dyn Push<PT<T, TInner>, D>> = {
+                    let mut output_pusher: Box<dyn Push<PT<T, TInner>, D>> = {
                         let pushers: Vec<Box<dyn Push<PT<T, TInner>, D>>> = endpoints
                             .take_port_pushers(0)
                             .into_iter()
@@ -2532,6 +2571,19 @@ impl<T: Timestamp, D: Clone + Send + 'static> Pipe<T, D> {
                             .collect::<Result<_>>()?;
                         tee_or_single(pushers)?.unwrap_or_else(|| Box::new(NullPush))
                     };
+
+                    // `iter_var` is the concat's output. When the loop body sends
+                    // it straight into an exchange (`iter_var.exchange(...)` with
+                    // no intervening operator), concat's pusher IS that exchange's
+                    // producing side and must record `+count` to balance the pull
+                    // side's `-count`. Without this the in-flight total goes
+                    // negative and the loop never completes. No-op for
+                    // non-exchange outputs; mirrors the unary-operator wiring.
+                    if let Some(reporter) =
+                        endpoints.inflight_reporter_by_source::<PT<T, TInner>>(concat_idx, 0)
+                    {
+                        output_pusher.set_inflight_reporter(reporter);
+                    }
 
                     Ok(Box::new(WiredConcatOperator::new(
                         concat_name,
@@ -2625,6 +2677,8 @@ impl<T: Timestamp, D: Clone + Send + 'static> Pipe<T, D> {
                 channel_preallocate: None,
                 contexts: parent_contexts,
                 catch_panics: false,
+                max_idle_sweeps: None,
+                loop_inflight_counters: Vec::new(),
                 builder_errors: Vec::new(),
             }));
 
@@ -2716,6 +2770,20 @@ impl<T: Timestamp, D: Clone + Send + 'static> Pipe<T, D> {
             for (src, tgt) in inner.subgraph_builder.edges() {
                 state.subgraph_builder.add_edge(src.clone(), tgt.clone());
             }
+            // Carry in-flight (exchange) accounting bindings from the loop body
+            // into the parent so completion accounts for data in transit on
+            // exchanges inside the loop. The loop body's timestamps are
+            // `Product<T, TInner>`; the parent tracker is `T`, so each binding is
+            // registered with an outer-epoch projection (the shared reporter is
+            // recorded by the loop-body channel and drained, projected, by the
+            // parent tracker). Operator indices are preserved across the merge,
+            // so source/target locations stay valid.
+            let inner_inflight = inner.subgraph_builder.inflight_edges_for_merge();
+            for (source, target, reporter) in inner_inflight {
+                state
+                    .subgraph_builder
+                    .register_loop_inflight_edge::<TInner>(source, target, reporter);
+            }
 
             // Merge factories (offset inner channel factory indices)
             state.operator_factories.extend(inner.operator_factories);
@@ -2805,6 +2873,7 @@ impl<T: Timestamp, D: Clone + Send + 'static> Pipe<T, D> {
 
             // Leave operator factory
             let leave_name = format!("{name}::leave");
+            let leave_loop_counter = loop_counter.clone();
             let leave_factory: OperatorFactory =
                 OperatorFactory::new(move |_ctx, mut endpoints: ChannelEndpoints| {
                     let leave_name = leave_name.clone();
@@ -2845,13 +2914,15 @@ impl<T: Timestamp, D: Clone + Send + 'static> Pipe<T, D> {
                         tee_or_single(pushers)?.unwrap_or_else(|| Box::new(NullPush))
                     };
 
-                    Ok(Box::new(WiredLeaveOperator::<T, TInner, D>::new(
+                    let mut leave_op = WiredLeaveOperator::<T, TInner, D>::new(
                         leave_name,
                         leave_idx,
                         stage_id,
                         input_puller,
                         output_pusher,
-                    )) as Box<dyn SchedulableOperator>)
+                    );
+                    leave_op.set_loop_counter(leave_loop_counter.clone());
+                    Ok(Box::new(leave_op) as Box<dyn SchedulableOperator>)
                 });
             state.operator_factories.push((leave_idx, leave_factory));
 
@@ -3955,42 +4026,42 @@ impl<T: Timestamp, D: Clone + Send + 'static> Pipe<T, D> {
                     stage_id,
                 ));
 
-            // Subgraph connectivity.
-            // Register with an initial capability at T::minimum(). This prevents
-            // the progress tracker from declaring the dataflow complete while
-            // data may be in transit on the exchange channel (especially across
-            // network boundaries where data delivery is asynchronous).
-            let mut initial_cap = ChangeBatch::new();
-            initial_cap.update(T::minimum(), 1);
-            let exchange_reporter = match state.subgraph_builder.add_operator_with_capabilities(
+            // Subgraph connectivity. No placeholder capability is needed: the
+            // in-flight message accounting registered below keeps the dataflow
+            // incomplete while data is in transit on the exchange channel
+            // (including across network boundaries), and — unlike a held
+            // capability — it is released precisely when the channel drains, so
+            // it does not deadlock feedback loops.
+            if let Err(e) = state.subgraph_builder.add_operator(
                 op_idx,
                 "exchange",
                 1,
                 1,
                 PortConnectivity::identity(T::Summary::default()),
-                vec![initial_cap],
             ) {
-                Ok(progress) => progress.reporter(0).clone(),
-                Err(e) => {
-                    state.builder_errors.push(e);
-                    ProgressReporter::default()
-                }
-            };
+                state.builder_errors.push(e);
+            }
 
             state.subgraph_builder.add_edge(
                 Location::source(self.op_idx, self.output_slot),
                 Location::target(op_idx, 0),
             );
 
+            // Account records sent on this exchange edge as in flight toward the
+            // exchange operator's input until they are consumed. The sending
+            // operator's output pusher records `+count` and the exchange pull
+            // side records `-count`; the tracker nets them as a message
+            // pointstamp at the exchange input.
+            state
+                .subgraph_builder
+                .register_inflight_edge((self.op_idx, self.output_slot), (op_idx, 0));
+
             // Operator factory — pass-through unary with progress reporter.
             let name_clone = String::from("exchange");
             let factory: OperatorFactory =
                 OperatorFactory::new(move |_ctx, mut endpoints: ChannelEndpoints| {
                     let name = name_clone.clone();
-                    let exchange_reporter = endpoints
-                        .progress_reporter(op_idx, 0)
-                        .unwrap_or_else(|| exchange_reporter.clone());
-                    let input_puller: Box<dyn Pull<T, D>> =
+                    let mut input_puller: Box<dyn Pull<T, D>> =
                         *std::mem::take(&mut endpoints.input_pullers)
                             .into_iter()
                             .next()
@@ -4007,6 +4078,12 @@ impl<T: Timestamp, D: Clone + Send + 'static> Pipe<T, D> {
                                     port: "input puller".into(),
                                 })
                             })?;
+
+                    // Record consumed messages on the exchange pull side, retiring
+                    // the in-flight count recorded by the sender's push.
+                    if let Some(reporter) = endpoints.inflight_reporter_by_target::<T>(op_idx, 0) {
+                        input_puller.set_inflight_reporter(reporter);
+                    }
 
                     let output_pusher: Box<dyn Push<T, D>> = {
                         let pushers: Vec<Box<dyn Push<T, D>>> = endpoints
@@ -4027,14 +4104,13 @@ impl<T: Timestamp, D: Clone + Send + 'static> Pipe<T, D> {
                         tee_or_single(pushers)?.unwrap_or_else(|| Box::new(NullPush))
                     };
 
-                    Ok(Box::new(WiredUnaryOperator::with_reporter(
+                    Ok(Box::new(WiredUnaryOperator::new(
                         name,
                         op_idx,
                         stage_id,
                         wired_logic,
                         input_puller,
                         output_pusher,
-                        exchange_reporter,
                     )) as Box<dyn SchedulableOperator>)
                 });
             state.operator_factories.push((op_idx, factory));
@@ -4346,7 +4422,7 @@ impl<T: Timestamp, D: Clone + Send + 'static> Pipe<T, D> {
                                 })
                             })?;
 
-                    let output_pusher: Box<dyn Push<T, D2>> = {
+                    let mut output_pusher: Box<dyn Push<T, D2>> = {
                         let pushers: Vec<Box<dyn Push<T, D2>>> = endpoints
                             .take_port_pushers(0)
                             .into_iter()
@@ -4364,6 +4440,13 @@ impl<T: Timestamp, D: Clone + Send + 'static> Pipe<T, D> {
                             .collect::<Result<_>>()?;
                         tee_or_single(pushers)?.unwrap_or_else(|| Box::new(NullPush))
                     };
+
+                    // If this output feeds an exchange edge, record produced
+                    // messages in flight (no-op for non-exchange outputs; the
+                    // tee propagates only to exchange branches).
+                    if let Some(reporter) = endpoints.inflight_reporter_by_source::<T>(op_idx, 0) {
+                        output_pusher.set_inflight_reporter(reporter);
+                    }
 
                     Ok(Box::new(WiredUnaryOperator::new(
                         name,
@@ -5428,6 +5511,13 @@ pub struct LogicalDataflow<T: Timestamp> {
     pub(crate) stages: Vec<crate::dataflow::stage::StageInfo>,
     /// Whether to catch panics in operator activation (see [`ExecutorConfig::catch_panics`]).
     pub(crate) catch_panics: bool,
+    /// Optional override for the executor's `max_idle_sweeps`. `None` uses the
+    /// runtime default. Set via [`DataflowBuilder::max_idle_sweeps`].
+    pub(crate) max_idle_sweeps: Option<usize>,
+    /// Shared loop in-flight counters, one per `iterate` scope (see
+    /// `BuilderState::loop_inflight_counters`). Consulted by the staged executor
+    /// to keep feedback loops alive until globally drained.
+    pub(crate) loop_inflight_counters: Vec<std::sync::Arc<std::sync::atomic::AtomicI64>>,
     /// Whether to collect per-operator metrics (see [`ExecutorConfig::collect_metrics`]).
     /// Set by SpawnOptions at spawn time.
     pub(crate) collect_metrics: bool,

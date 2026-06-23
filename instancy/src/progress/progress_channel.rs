@@ -53,14 +53,59 @@ use crate::dataflow::channels::wake::WakeHandle;
 use crate::error::{DataflowError, LockResultExt};
 use crate::progress::timestamp::Timestamp;
 
-/// A single progress change: (operator_index, output_port, timestamp, diff).
+/// Whether a [`ProgressChange`] is a capability change at an operator output
+/// (a *source* pointstamp) or an in-flight message change at an operator input
+/// (a *target* pointstamp).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ProgressKind {
+    /// Capability change at `(node, output_port)` — applied via `update_source`.
+    Source,
+    /// In-flight message change at `(node, input_port)` — applied via
+    /// `update_target`. Used by boundary (exchange) channels: the sender
+    /// broadcasts `+count` and the consumer `-count`, so every worker's tracker
+    /// observes the global in-flight total.
+    Target,
+}
+
+/// A single progress change broadcast between workers.
 ///
-/// - `diff > 0`: capability acquired (operator now holds a capability at this time)
-/// - `diff < 0`: capability released (operator dropped or downgraded)
-///
-/// These are applied to the reachability tracker via `Tracker::update_source()`,
-/// which propagates implications through the dataflow graph's path summaries.
-pub type ProgressChange<T> = (usize, usize, T, i64);
+/// - `kind`: whether this is a source (capability) or target (in-flight message)
+///   change — selects `Tracker::update_source` vs `update_target` on receipt.
+/// - `node`/`port`: the operator and its output (source) or input (target) port.
+/// - `time`: the timestamp.
+/// - `diff`: `> 0` acquired/produced, `< 0` released/consumed.
+#[derive(Clone, Debug, PartialEq)]
+pub struct ProgressChange<T> {
+    pub kind: ProgressKind,
+    pub node: usize,
+    pub port: usize,
+    pub time: T,
+    pub diff: i64,
+}
+
+impl<T> ProgressChange<T> {
+    /// A capability change at an operator output port.
+    pub fn source(node: usize, port: usize, time: T, diff: i64) -> Self {
+        Self {
+            kind: ProgressKind::Source,
+            node,
+            port,
+            time,
+            diff,
+        }
+    }
+
+    /// An in-flight message change at an operator input port.
+    pub fn target(node: usize, port: usize, time: T, diff: i64) -> Self {
+        Self {
+            kind: ProgressKind::Target,
+            node,
+            port,
+            time,
+            diff,
+        }
+    }
+}
 
 /// Shared buffer between a sender/receiver pair.
 pub(crate) struct SharedBuffer<T> {
@@ -262,18 +307,21 @@ mod tests {
 
         // Worker 0 sends to Worker 1.
         let w0 = &channels[0];
-        w0.senders[1].as_ref().unwrap().send(vec![(0, 0, 42u64, 1)]);
         w0.senders[1]
             .as_ref()
             .unwrap()
-            .send(vec![(0, 0, 42u64, -1)]);
+            .send(vec![ProgressChange::source(0, 0, 42u64, 1)]);
+        w0.senders[1]
+            .as_ref()
+            .unwrap()
+            .send(vec![ProgressChange::source(0, 0, 42u64, -1)]);
 
         // Worker 1 receives from Worker 0.
         let w1 = &channels[1];
         let batches = w1.receivers[0].as_ref().unwrap().drain_all().unwrap();
         assert_eq!(batches.len(), 2);
-        assert_eq!(batches[0], vec![(0, 0, 42, 1)]);
-        assert_eq!(batches[1], vec![(0, 0, 42, -1)]);
+        assert_eq!(batches[0], vec![ProgressChange::source(0, 0, 42u64, 1)]);
+        assert_eq!(batches[1], vec![ProgressChange::source(0, 0, 42u64, -1)]);
     }
 
     #[test]
@@ -295,13 +343,13 @@ mod tests {
 
         let sender = channels[0].senders[1].as_ref().unwrap();
         for i in 0..10 {
-            sender.send(vec![(0, 0, i as u64, 1)]);
+            sender.send(vec![ProgressChange::source(0, 0, i as u64, 1)]);
         }
 
         let batches = channels[1].receivers[0].as_ref().unwrap().drain_all().unwrap();
         assert_eq!(batches.len(), 10);
         for (i, batch) in batches.iter().enumerate() {
-            assert_eq!(batch[0].2, i as u64);
+            assert_eq!(batch[0].time, i as u64);
         }
     }
 
@@ -327,7 +375,7 @@ mod tests {
         channels[0].senders[1]
             .as_ref()
             .unwrap()
-            .send(vec![(0, 0, 1u64, 1)]);
+            .send(vec![ProgressChange::source(0, 0, 1u64, 1)]);
         assert!(recv.has_pending().unwrap());
 
         recv.drain_all().unwrap();

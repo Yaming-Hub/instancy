@@ -2457,7 +2457,7 @@ impl RuntimeHandle {
 
             let executor_config = ExecutorConfig {
                 max_activations_per_step: 1024,
-                max_idle_sweeps: 64,
+                max_idle_sweeps: dataflow.max_idle_sweeps.unwrap_or(64),
                 max_sweeps_per_poll: 64,
                 catch_panics: dataflow.catch_panics,
                 collect_metrics: dataflow.collect_metrics,
@@ -2594,9 +2594,13 @@ impl RuntimeHandle {
                 }
             }
 
-            let executor: Pin<Box<dyn Future<Output = Result<bool>> + Send>> = Box::pin(
-                CombinedStageExecutor::new(stage_executors, wake_handle.clone(), feedback_release),
-            );
+            let executor: Pin<Box<dyn Future<Output = Result<bool>> + Send>> =
+                Box::pin(CombinedStageExecutor::new(
+                    stage_executors,
+                    wake_handle.clone(),
+                    feedback_release,
+                    dataflow.loop_inflight_counters.clone(),
+                ));
             let (completion, notifier) = DataflowCompletion::new();
 
             for (pump_idx, pump) in pump_tasks.into_iter().enumerate() {
@@ -5681,7 +5685,7 @@ fn materialize_executor<T: Timestamp>(
 ) -> Result<DataflowExecutor<T>> {
     let executor_config = ExecutorConfig {
         max_activations_per_step: 1024,
-        max_idle_sweeps: 64,
+        max_idle_sweeps: dataflow.max_idle_sweeps.unwrap_or(64),
         max_sweeps_per_poll: 64,
         catch_panics: dataflow.catch_panics,
         collect_metrics: dataflow.collect_metrics,

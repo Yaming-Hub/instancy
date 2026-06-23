@@ -895,6 +895,11 @@ where
     pending_output: VecDeque<Envelope<crate::order::Product<TOuter, TInner>, D>>,
     input_exhausted: bool,
     done: bool,
+    /// Optional shared loop in-flight counter (`+count` on entry). Used by the
+    /// staged executor, whose per-stage trackers cannot span the stage boundary
+    /// a loop body may cross; the counter is shared across stages/workers so
+    /// convergence waits until the loop is globally drained.
+    loop_counter: Option<std::sync::Arc<std::sync::atomic::AtomicI64>>,
     _phantom: std::marker::PhantomData<TInner>,
 }
 
@@ -919,8 +924,14 @@ where
             pending_output: VecDeque::new(),
             input_exhausted: false,
             done: false,
+            loop_counter: None,
             _phantom: std::marker::PhantomData,
         }
+    }
+
+    /// Attach the shared loop in-flight counter (`+count` on entry).
+    pub fn set_loop_counter(&mut self, counter: std::sync::Arc<std::sync::atomic::AtomicI64>) {
+        self.loop_counter = Some(counter);
     }
 
     fn flush_pending_output(&mut self) -> Result<bool> {
@@ -957,6 +968,14 @@ where
             match self.input_puller.pull() {
                 Some(envelope) => match envelope.payload {
                     Payload::Data { time, data } => {
+                        // Account these records as entering the loop; the leave
+                        // operator retires them on exit (staged executor gate).
+                        if let Some(ref counter) = self.loop_counter {
+                            counter.fetch_add(
+                                data.len() as i64,
+                                std::sync::atomic::Ordering::SeqCst,
+                            );
+                        }
                         let product_time = crate::order::Product::new(time, TInner::minimum());
                         self.pending_output
                             .push_back(Envelope::data(product_time, data));
@@ -1031,6 +1050,9 @@ where
     pending_output: VecDeque<Envelope<TOuter, D>>,
     input_exhausted: bool,
     done: bool,
+    /// Optional shared loop in-flight counter (`-count` on exit) — see
+    /// [`WiredEnterOperator`].
+    loop_counter: Option<std::sync::Arc<std::sync::atomic::AtomicI64>>,
 }
 
 impl<TOuter: Timestamp, TInner: Timestamp, D: Send + 'static> WiredLeaveOperator<TOuter, TInner, D>
@@ -1054,7 +1076,13 @@ where
             pending_output: VecDeque::new(),
             input_exhausted: false,
             done: false,
+            loop_counter: None,
         }
+    }
+
+    /// Attach the shared loop in-flight counter (`-count` on exit).
+    pub fn set_loop_counter(&mut self, counter: std::sync::Arc<std::sync::atomic::AtomicI64>) {
+        self.loop_counter = Some(counter);
     }
 
     fn flush_pending_output(&mut self) -> Result<bool> {
@@ -1092,6 +1120,13 @@ where
                 Some(envelope) => match envelope.payload {
                     Payload::Data { time, data } => {
                         let outer_time = time.outer;
+                        // Retire these records from the loop in-flight count.
+                        if let Some(ref counter) = self.loop_counter {
+                            counter.fetch_add(
+                                -(data.len() as i64),
+                                std::sync::atomic::Ordering::SeqCst,
+                            );
+                        }
                         self.pending_output
                             .push_back(Envelope::data(outer_time, data));
                         made_progress = true;

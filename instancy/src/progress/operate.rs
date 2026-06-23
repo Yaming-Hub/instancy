@@ -201,10 +201,12 @@ impl<T: Timestamp> Default for ProgressReporter<T> {
 /// `internal` (via [`ProgressReporter`]) and the progress tracker drains those
 /// changes during propagation.
 ///
-/// The `consumed` and `produced` buffers are reserved for future use when
-/// operators explicitly report message consumption/production for in-flight
-/// message accounting. Currently, progress tracking relies solely on capability
-/// accounting via the `internal` reporters.
+/// In-flight **message** accounting (for boundary channels such as exchange)
+/// does not flow through these per-operator buffers — it is tracked by
+/// target-bound in-flight reporters registered directly on the
+/// [`ProgressTracker`](crate::progress::subgraph::ProgressTracker), so a message
+/// can be accounted against the specific downstream input it targets regardless
+/// of tee/fan-out on the producing output.
 #[derive(Debug, Clone)]
 pub struct OperatorProgress<T: Timestamp> {
     /// Per-input consumed changes — reserved for future message-flight accounting.

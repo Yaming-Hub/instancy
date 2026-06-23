@@ -56,6 +56,14 @@ pub trait Push<T: Timestamp, D, M = ()>: Send {
     fn available_capacity(&self) -> Option<usize> {
         None
     }
+
+    /// Attach an in-flight message reporter for boundary (exchange) channels.
+    ///
+    /// Default: no-op. [`ExchangePush`](crate::dataflow::channels::exchange_channel::ExchangePush)
+    /// records `+count` produced per batch; tee/fork pushers propagate to all
+    /// branches so only the exchange branch(es) actually account messages,
+    /// keeping in-flight accounting tee-safe regardless of fan-out.
+    fn set_inflight_reporter(&mut self, _reporter: crate::progress::operate::ProgressReporter<T>) {}
 }
 
 /// A trait for pulling messages from a channel.
@@ -83,6 +91,13 @@ pub trait Pull<T: Timestamp, D, M = ()>: Send {
 
     /// Returns `true` if the channel is closed and no more messages will arrive.
     fn is_exhausted(&self) -> bool;
+
+    /// Attach an in-flight message reporter for boundary (exchange) channels.
+    ///
+    /// Default: no-op. [`ExchangePull`](crate::dataflow::channels::exchange_channel::ExchangePull)
+    /// records `-count` consumed per delivered batch, retiring the in-flight
+    /// messages accounted by the sending `ExchangePush`.
+    fn set_inflight_reporter(&mut self, _reporter: crate::progress::operate::ProgressReporter<T>) {}
 }
 
 /// A paired Push + Pull channel for intra-process communication.

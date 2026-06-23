@@ -49,7 +49,8 @@ use crate::dataflow::id::DataflowId;
 use crate::error::{DataflowError, LockResultExt};
 #[cfg(feature = "transport")]
 use crate::progress::progress_channel::{
-    ProgressChange, ProgressReceiver, ProgressSender, SharedBuffer, WorkerProgressChannels,
+    ProgressChange, ProgressKind, ProgressReceiver, ProgressSender, SharedBuffer,
+    WorkerProgressChannels,
 };
 #[cfg(feature = "transport")]
 use crate::progress::timestamp::Timestamp;
@@ -77,8 +78,9 @@ pub const DEFAULT_MAX_BATCH_SIZE: usize = 1_000_000;
 /// ```text
 /// [count: u32]
 /// for each change:
+///   [kind: u8]   ← 0 = Source (capability), 1 = Target (in-flight message)
 ///   [operator_index: u64]
-///   [output_port: u64]
+///   [port: u64]
 ///   [timestamp: T encoded by T::codec()]
 ///   [diff: i64]
 /// [crc32: u32]   ← CRC32 of all preceding bytes
@@ -113,11 +115,16 @@ pub fn encode_progress_batch<T: Timestamp + ExchangeData>(
         buf.extend_from_slice(&count.to_le_bytes());
 
         let codec = T::codec();
-        for (op_idx, output_port, time, diff) in chunk {
-            buf.extend_from_slice(&(*op_idx as u64).to_le_bytes());
-            buf.extend_from_slice(&(*output_port as u64).to_le_bytes());
-            codec.encode(time, &mut buf)?;
-            buf.extend_from_slice(&diff.to_le_bytes());
+        for change in chunk {
+            let kind_byte: u8 = match change.kind {
+                ProgressKind::Source => 0,
+                ProgressKind::Target => 1,
+            };
+            buf.push(kind_byte);
+            buf.extend_from_slice(&(change.node as u64).to_le_bytes());
+            buf.extend_from_slice(&(change.port as u64).to_le_bytes());
+            codec.encode(&change.time, &mut buf)?;
+            buf.extend_from_slice(&change.diff.to_le_bytes());
         }
 
         // Append CRC32 checksum of the payload.
@@ -175,6 +182,24 @@ pub fn decode_progress_batch<T: Timestamp + ExchangeData>(
     let mut offset = 4;
 
     for _ in 0..count {
+        // kind (u8): 0 = Source, 1 = Target
+        if offset + 1 > payload.len() {
+            return Err(CodecError::InsufficientData {
+                needed: offset + 1,
+                available: payload.len(),
+            });
+        }
+        let kind = match payload[offset] {
+            0 => ProgressKind::Source,
+            1 => ProgressKind::Target,
+            other => {
+                return Err(CodecError::InvalidData(format!(
+                    "invalid progress change kind byte: {other}"
+                )));
+            }
+        };
+        offset += 1;
+
         // operator_index (u64)
         if offset + 8 > payload.len() {
             return Err(CodecError::InsufficientData {
@@ -213,7 +238,13 @@ pub fn decode_progress_batch<T: Timestamp + ExchangeData>(
             wire::read_i64(payload, offset).map_err(|e| CodecError::InvalidData(e.to_string()))?;
         offset += 8;
 
-        changes.push((op_idx, output_port, time, diff));
+        changes.push(ProgressChange {
+            kind,
+            node: op_idx,
+            port: output_port,
+            time,
+            diff,
+        });
     }
 
     // Reject trailing bytes (before the CRC32 that we already stripped).
@@ -678,8 +709,11 @@ mod tests {
 
     #[test]
     fn encode_decode_roundtrip_u64() {
-        let changes: Vec<ProgressChange<u64>> =
-            vec![(0, 0, 42u64, 1), (1, 2, 100u64, -1), (3, 0, 0u64, 5)];
+        let changes: Vec<ProgressChange<u64>> = vec![
+            ProgressChange::source(0, 0, 42u64, 1),
+            ProgressChange::target(1, 2, 100u64, -1),
+            ProgressChange::source(3, 0, 0u64, 5),
+        ];
 
         let mut bufs = Vec::new();
         encode_progress_batch(&changes, &mut bufs, DEFAULT_MAX_BATCH_SIZE).unwrap();
@@ -702,7 +736,7 @@ mod tests {
 
     #[test]
     fn decode_rejects_truncated_data() {
-        let changes: Vec<ProgressChange<u64>> = vec![(0, 0, 42u64, 1)];
+        let changes: Vec<ProgressChange<u64>> = vec![ProgressChange::source(0, 0, 42u64, 1)];
         let mut bufs = Vec::new();
         encode_progress_batch(&changes, &mut bufs, DEFAULT_MAX_BATCH_SIZE).unwrap();
 
@@ -714,7 +748,7 @@ mod tests {
 
     #[test]
     fn decode_rejects_trailing_bytes() {
-        let changes: Vec<ProgressChange<u64>> = vec![(0, 0, 42u64, 1)];
+        let changes: Vec<ProgressChange<u64>> = vec![ProgressChange::source(0, 0, 42u64, 1)];
         let mut bufs = Vec::new();
         encode_progress_batch(&changes, &mut bufs, DEFAULT_MAX_BATCH_SIZE).unwrap();
         let mut buf = bufs.into_iter().next().unwrap();
@@ -732,7 +766,10 @@ mod tests {
 
     #[test]
     fn decode_detects_crc32_corruption() {
-        let changes: Vec<ProgressChange<u64>> = vec![(0, 0, 42u64, 1), (1, 0, 100u64, -1)];
+        let changes: Vec<ProgressChange<u64>> = vec![
+            ProgressChange::source(0, 0, 42u64, 1),
+            ProgressChange::source(1, 0, 100u64, -1),
+        ];
         let mut bufs = Vec::new();
         encode_progress_batch(&changes, &mut bufs, DEFAULT_MAX_BATCH_SIZE).unwrap();
         let mut buf = bufs.into_iter().next().unwrap();
@@ -751,7 +788,9 @@ mod tests {
 
     #[test]
     fn encode_splits_large_batches() {
-        let changes: Vec<ProgressChange<u64>> = (0..5).map(|i| (i, 0, i as u64, 1)).collect();
+        let changes: Vec<ProgressChange<u64>> = (0..5)
+            .map(|i| ProgressChange::source(i, 0, i as u64, 1))
+            .collect();
 
         // max_batch_size=2 → should produce 3 frames (2+2+1).
         let mut bufs = Vec::new();
@@ -868,7 +907,10 @@ mod tests {
         ));
 
         // Serialize a batch and send it.
-        let changes: Vec<ProgressChange<u64>> = vec![(0, 0, 42u64, 1), (1, 0, 100u64, -1)];
+        let changes: Vec<ProgressChange<u64>> = vec![
+            ProgressChange::source(0, 0, 42u64, 1),
+            ProgressChange::source(1, 0, 100u64, -1),
+        ];
         let mut bufs = Vec::new();
         encode_progress_batch(&changes, &mut bufs, DEFAULT_MAX_BATCH_SIZE).unwrap();
         tx.send(bufs.into_iter().next().unwrap()).await.unwrap();
@@ -968,12 +1010,12 @@ mod tests {
             }
         });
 
-        sender.send(vec![(0, 0, 99u64, 1)]);
+        sender.send(vec![ProgressChange::source(0, 0, 99u64, 1)]);
 
         let frame = unbounded_rx.recv().await.unwrap();
         assert_eq!(frame.channel_id, ch_id);
         let decoded = decode_progress_batch::<u64>(&frame.payload, DEFAULT_MAX_BATCH_SIZE).unwrap();
-        assert_eq!(decoded, vec![(0, 0, 99u64, 1)]);
+        assert_eq!(decoded, vec![ProgressChange::source(0, 0, 99u64, 1)]);
     }
 
     #[tokio::test]
@@ -1133,7 +1175,10 @@ mod tests {
         let sender = a_channels[0].senders[2]
             .as_ref()
             .expect("should have network sender for remote worker 2");
-        sender.send(vec![(0, 0, 42u64, 1), (1, 0, 100u64, -1)]);
+        sender.send(vec![
+            ProgressChange::source(0, 0, 42u64, 1),
+            ProgressChange::source(1, 0, 100u64, -1),
+        ]);
 
         // Allow bridge + transport to process.
         tokio::time::sleep(std::time::Duration::from_millis(200)).await;
@@ -1145,7 +1190,13 @@ mod tests {
             .expect("should have network receiver for worker 0");
         let batches = receiver.drain_all().unwrap();
         assert_eq!(batches.len(), 1, "expected 1 batch, got {}", batches.len());
-        assert_eq!(batches[0], vec![(0, 0, 42u64, 1), (1, 0, 100u64, -1)]);
+        assert_eq!(
+            batches[0],
+            vec![
+                ProgressChange::source(0, 0, 42u64, 1),
+                ProgressChange::source(1, 0, 100u64, -1),
+            ]
+        );
 
         // Verify no spurious cancellation.
         assert!(!cancel.is_cancelled());
@@ -1198,7 +1249,7 @@ mod tests {
         drop(unbounded_rx);
 
         // Sending should trigger cancellation.
-        sender.send(vec![(0, 0, 1u64, 1)]);
+        sender.send(vec![ProgressChange::source(0, 0, 1u64, 1)]);
         assert!(cancel.is_cancelled(), "should cancel when bridge is gone");
     }
 }
