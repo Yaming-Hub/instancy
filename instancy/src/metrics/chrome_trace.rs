@@ -253,7 +253,7 @@ impl ChromeTraceExporter {
             ts: 0,
             dur: None,
             id: None,
-                s: None,
+            s: None,
             pid: 0,
             tid: 0,
             args: Some(serde_json::json!({
@@ -339,8 +339,7 @@ mod tests {
         ];
         let names = vec![(0, "source".to_string()), (1, "map".to_string())];
 
-        let exporter = ChromeTraceExporter::new("test")
-            .with_activations(&events, &names);
+        let exporter = ChromeTraceExporter::new("test").with_activations(&events, &names);
 
         assert_eq!(exporter.event_count(), 2);
 
@@ -451,10 +450,7 @@ mod tests {
                 duration_us: 90,
             },
         ];
-        let names = vec![
-            (0, "source".to_string()),
-            (1, "exchange".to_string()),
-        ];
+        let names = vec![(0, "source".to_string()), (1, "exchange".to_string())];
         let channels = vec![ChannelMetrics {
             edge_index: 0,
             label: "ex[0]".to_string(),

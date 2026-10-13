@@ -193,8 +193,12 @@ mod tests {
         let topo = two_node_topology();
         let session = DataflowSession::new(DataflowId::from_bytes([1u8; 16]), topo, "node-0");
 
-        let ch1 = session.allocate_channel(WorkerId::new(0), WorkerId::new(1)).unwrap();
-        let ch2 = session.allocate_channel(WorkerId::new(0), WorkerId::new(2)).unwrap();
+        let ch1 = session
+            .allocate_channel(WorkerId::new(0), WorkerId::new(1))
+            .unwrap();
+        let ch2 = session
+            .allocate_channel(WorkerId::new(0), WorkerId::new(2))
+            .unwrap();
 
         assert_eq!(ch1.channel_id, 1);
         assert_eq!(ch2.channel_id, 2);
@@ -206,11 +210,15 @@ mod tests {
         let session = DataflowSession::new(DataflowId::from_bytes([1u8; 16]), topo, "node-0");
 
         // Both workers on node 0
-        let local = session.allocate_channel(WorkerId::new(0), WorkerId::new(1)).unwrap();
+        let local = session
+            .allocate_channel(WorkerId::new(0), WorkerId::new(1))
+            .unwrap();
         assert!(local.is_local);
 
         // Workers on different nodes
-        let remote = session.allocate_channel(WorkerId::new(0), WorkerId::new(2)).unwrap();
+        let remote = session
+            .allocate_channel(WorkerId::new(0), WorkerId::new(2))
+            .unwrap();
         assert!(!remote.is_local);
     }
 
@@ -230,9 +238,15 @@ mod tests {
         let topo = two_node_topology();
         let session = DataflowSession::new(DataflowId::from_bytes([1u8; 16]), topo, "node-0");
 
-        session.allocate_channel(WorkerId::new(0), WorkerId::new(1)).unwrap();
-        session.allocate_channel(WorkerId::new(0), WorkerId::new(2)).unwrap();
-        session.allocate_channel(WorkerId::new(1), WorkerId::new(3)).unwrap();
+        session
+            .allocate_channel(WorkerId::new(0), WorkerId::new(1))
+            .unwrap();
+        session
+            .allocate_channel(WorkerId::new(0), WorkerId::new(2))
+            .unwrap();
+        session
+            .allocate_channel(WorkerId::new(1), WorkerId::new(3))
+            .unwrap();
 
         assert_eq!(session.channels().unwrap().len(), 3);
         assert_eq!(session.remote_channels().unwrap().len(), 2);
@@ -243,7 +257,9 @@ mod tests {
         let topo = two_node_topology();
         let session = DataflowSession::new(DataflowId::from_bytes([1u8; 16]), topo, "node-0");
 
-        let ch = session.allocate_channel(WorkerId::new(0), WorkerId::new(2)).unwrap();
+        let ch = session
+            .allocate_channel(WorkerId::new(0), WorkerId::new(2))
+            .unwrap();
         let info = session.channel_info(ch.channel_id).unwrap().unwrap();
         assert_eq!(info.source_worker, WorkerId::new(0));
         assert_eq!(info.target_worker, WorkerId::new(2));
@@ -277,7 +293,9 @@ mod tests {
 
         for i in 0..4 {
             for j in 0..4 {
-                let ch = session.allocate_channel(WorkerId::new(i), WorkerId::new(j)).unwrap();
+                let ch = session
+                    .allocate_channel(WorkerId::new(i), WorkerId::new(j))
+                    .unwrap();
                 assert!(ch.is_local, "workers {i}->{j} should be local");
             }
         }

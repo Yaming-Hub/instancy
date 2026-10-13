@@ -332,7 +332,11 @@ mod tests {
         // Empty send — should not enqueue.
         channels[0].senders[1].as_ref().unwrap().send(vec![]);
 
-        let batches = channels[1].receivers[0].as_ref().unwrap().drain_all().unwrap();
+        let batches = channels[1].receivers[0]
+            .as_ref()
+            .unwrap()
+            .drain_all()
+            .unwrap();
         assert!(batches.is_empty());
     }
 
@@ -346,7 +350,11 @@ mod tests {
             sender.send(vec![ProgressChange::source(0, 0, i as u64, 1)]);
         }
 
-        let batches = channels[1].receivers[0].as_ref().unwrap().drain_all().unwrap();
+        let batches = channels[1].receivers[0]
+            .as_ref()
+            .unwrap()
+            .drain_all()
+            .unwrap();
         assert_eq!(batches.len(), 10);
         for (i, batch) in batches.iter().enumerate() {
             assert_eq!(batch[0].time, i as u64);

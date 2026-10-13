@@ -307,9 +307,7 @@ mod chrome_trace_integration {
     use std::sync::Arc;
     use std::time::{Duration, Instant};
 
-    use instancy::metrics::{
-        DataflowMetrics, TimelineCollector,
-    };
+    use instancy::metrics::{DataflowMetrics, TimelineCollector};
 
     #[test]
     fn export_from_dataflow_metrics() {
@@ -329,8 +327,16 @@ mod chrome_trace_integration {
         let start_time = Instant::now();
         let tc = Arc::new(TimelineCollector::new(0, start_time, Duration::ZERO, 100));
         // Record activations with realistic Instants.
-        tc.record_activation(0, start_time + Duration::from_micros(10), Duration::from_micros(500));
-        tc.record_activation(1, start_time + Duration::from_micros(510), Duration::from_micros(300));
+        tc.record_activation(
+            0,
+            start_time + Duration::from_micros(10),
+            Duration::from_micros(500),
+        );
+        tc.record_activation(
+            1,
+            start_time + Duration::from_micros(510),
+            Duration::from_micros(300),
+        );
         metrics.register_timeline(tc);
 
         let exporter = metrics.drain_to_chrome_trace("integration-df");
@@ -405,7 +411,10 @@ mod chrome_trace_integration {
 
         let exporter = metrics
             .drain_to_chrome_trace("frontier-trace")
-            .with_frontiers(&frontier_events, &[(0, "source".to_string()), (1, "map".to_string())]);
+            .with_frontiers(
+                &frontier_events,
+                &[(0, "source".to_string()), (1, "map".to_string())],
+            );
 
         let bytes = exporter.to_bytes().unwrap();
         let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();

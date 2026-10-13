@@ -869,9 +869,7 @@ impl<T: Timestamp, D: Send + 'static> SchedulableOperator for WiredConcatOperato
     }
 
     fn close_inputs(&mut self) {
-        for exhausted in &mut self.inputs_exhausted {
-            *exhausted = true;
-        }
+        self.inputs_exhausted.fill(true);
     }
 }
 
@@ -971,10 +969,8 @@ where
                         // Account these records as entering the loop; the leave
                         // operator retires them on exit (staged executor gate).
                         if let Some(ref counter) = self.loop_counter {
-                            counter.fetch_add(
-                                data.len() as i64,
-                                std::sync::atomic::Ordering::SeqCst,
-                            );
+                            counter
+                                .fetch_add(data.len() as i64, std::sync::atomic::Ordering::SeqCst);
                         }
                         let product_time = crate::order::Product::new(time, TInner::minimum());
                         self.pending_output
@@ -2860,7 +2856,9 @@ mod tests {
             pusher_false,
         );
 
-        pusher_in.push(Envelope::data(1, vec![1, 2, 3, 4, 5, 6])).unwrap();
+        pusher_in
+            .push(Envelope::data(1, vec![1, 2, 3, 4, 5, 6]))
+            .unwrap();
         pusher_in.close();
 
         let outcome = op.activate().unwrap();
@@ -2931,7 +2929,9 @@ mod tests {
             ch_err.pusher,
         );
 
-        pusher_in.push(Envelope::data(1, vec![1, -2, 3, -4])).unwrap();
+        pusher_in
+            .push(Envelope::data(1, vec![1, -2, 3, -4]))
+            .unwrap();
         pusher_in.close();
 
         let outcome = op.activate().unwrap();
@@ -2971,9 +2971,7 @@ mod tests {
             ch_right.pusher,
         );
 
-        pusher_in
-            .push(Envelope::data(1, vec![10, 20, 30]))
-            .unwrap();
+        pusher_in.push(Envelope::data(1, vec![10, 20, 30])).unwrap();
         pusher_in.close();
 
         let outcome = op.activate().unwrap();

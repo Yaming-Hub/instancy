@@ -59,7 +59,7 @@ pub enum ControlProtocolError {
     /// The node_id field contains invalid UTF-8.
     #[error("invalid UTF-8 in node_id: {source}")]
     InvalidUtf8 {
-        #[from]
+        #[source]
         source: std::str::Utf8Error,
     },
 
@@ -70,6 +70,13 @@ pub enum ControlProtocolError {
     /// An error occurred reading fixed-width fields from the wire.
     #[error("wire read error: {0}")]
     WireRead(Box<crate::Error>),
+}
+
+#[cfg(feature = "transport")]
+impl From<std::str::Utf8Error> for ControlProtocolError {
+    fn from(source: std::str::Utf8Error) -> Self {
+        Self::InvalidUtf8 { source }
+    }
 }
 
 /// Errors that can occur while coordinating control-protocol handshakes.
@@ -875,9 +882,12 @@ mod tests {
         .unwrap();
         drop(tx);
 
-        tokio::time::timeout(std::time::Duration::from_secs(2), cancel_token.cancelled_async())
-            .await
-            .expect("cancel token should be cancelled");
+        tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            cancel_token.cancelled_async(),
+        )
+        .await
+        .expect("cancel token should be cancelled");
         listener.await.unwrap();
 
         assert_eq!(
@@ -897,7 +907,8 @@ mod tests {
         let mut control_receivers = std::collections::HashMap::new();
         control_receivers.insert("node-b".to_string(), rx);
 
-        let listener = spawn_cancel_listener(control_receivers, cancel_token.clone(), shutdown.clone());
+        let listener =
+            spawn_cancel_listener(control_receivers, cancel_token.clone(), shutdown.clone());
 
         // Signal shutdown (normal completion) — listener should exit promptly
         // without cancelling the dataflow token.
@@ -907,7 +918,10 @@ mod tests {
             .expect("listener should exit on shutdown")
             .unwrap();
 
-        assert!(!cancel_token.is_cancelled(), "dataflow token should not be cancelled on clean shutdown");
+        assert!(
+            !cancel_token.is_cancelled(),
+            "dataflow token should not be cancelled on clean shutdown"
+        );
     }
 
     #[tokio::test]

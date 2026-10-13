@@ -615,7 +615,18 @@ fn print_summary_table(rows: &[SummaryRow]) {
     println!("{}", "=".repeat(141));
     println!(
         "  {:<22} {:<9} {:>8} {:>10} {:>9} {:>9} {:>9} {:>9} {:>8} {:>8} {:>12} {:>9}",
-        "Scenario", "Library", "Queries", "QPS", "p50µs", "p95µs", "p99µs", "maxµs", "avgMB", "peakMB", "cpuTotalMs", "coreSec"
+        "Scenario",
+        "Library",
+        "Queries",
+        "QPS",
+        "p50µs",
+        "p95µs",
+        "p99µs",
+        "maxµs",
+        "avgMB",
+        "peakMB",
+        "cpuTotalMs",
+        "coreSec"
     );
     println!("  {}", "-".repeat(137));
     for row in rows {
@@ -625,7 +636,10 @@ fn print_summary_table(rows: &[SummaryRow]) {
 }
 
 fn total_metrics_core_time(metrics: &[Arc<instancy::metrics::DataflowMetrics>]) -> Duration {
-    metrics.iter().map(|metrics| metrics.total_core_time()).sum()
+    metrics
+        .iter()
+        .map(|metrics| metrics.total_core_time())
+        .sum()
 }
 
 fn sum_thread_times(thread_times: &Arc<Mutex<Vec<Duration>>>) -> Duration {
@@ -749,7 +763,9 @@ impl JsonControlChannel {
         self.writer
             .write_all(b"\n")
             .expect("failed to terminate control JSON line");
-        self.writer.flush().expect("failed to flush control channel");
+        self.writer
+            .flush()
+            .expect("failed to flush control channel");
     }
 
     fn recv<T: serde::de::DeserializeOwned>(&mut self) -> T {
@@ -805,8 +821,8 @@ fn connect_control_socket(control_addr: &str) -> StdTcpStream {
 }
 
 fn run_cross_process_query(library: BenchLibrary, scenario: ScenarioKind, threads: usize) -> u64 {
-    let control_listener = StdTcpListener::bind("127.0.0.1:0")
-        .expect("failed to bind coordinator control listener");
+    let control_listener =
+        StdTcpListener::bind("127.0.0.1:0").expect("failed to bind coordinator control listener");
     let control_addr = control_listener
         .local_addr()
         .expect("control listener missing address");
@@ -819,8 +835,7 @@ fn run_cross_process_query(library: BenchLibrary, scenario: ScenarioKind, thread
 
     let instancy_listener = if library == BenchLibrary::Instancy {
         Some(
-            StdTcpListener::bind("127.0.0.1:0")
-                .expect("failed to bind instancy exchange listener"),
+            StdTcpListener::bind("127.0.0.1:0").expect("failed to bind instancy exchange listener"),
         )
     } else {
         None
@@ -902,9 +917,7 @@ fn run_worker(control_addr: &str) {
                 });
             }
             ControlCommand::Run => {
-                let setup = pending
-                    .clone()
-                    .expect("worker received run before setup");
+                let setup = pending.clone().expect("worker received run before setup");
                 let wall_start = Instant::now();
                 let core_time_ns = execute_process_half(1, &setup, None);
                 channel.send(&ControlStatus::Done {
@@ -949,7 +962,11 @@ where
         };
     }
 
-    let memory_sample_interval = if concurrency <= LARGE_QUERY_CONCURRENCY { 1 } else { 100 };
+    let memory_sample_interval = if concurrency <= LARGE_QUERY_CONCURRENCY {
+        1
+    } else {
+        100
+    };
     let (tx, rx) = std::sync::mpsc::channel::<(u64, u64)>();
     let start = Instant::now();
     let deadline = start + duration;
@@ -967,13 +984,12 @@ where
             active += 1;
             std::thread::spawn(move || {
                 let query_start = Instant::now();
-                let core_time_ns = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                    query_fn()
-                }))
-                .unwrap_or_else(|_| {
-                    eprintln!("query thread panicked");
-                    std::process::exit(1);
-                });
+                let core_time_ns =
+                    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| query_fn()))
+                        .unwrap_or_else(|_| {
+                            eprintln!("query thread panicked");
+                            std::process::exit(1);
+                        });
                 let latency_us = query_start.elapsed().as_micros() as u64;
                 let _ = tx.send((latency_us, core_time_ns));
             });
@@ -1002,9 +1018,7 @@ where
         if last_progress.elapsed() >= Duration::from_secs(60) {
             let elapsed = start.elapsed().as_secs();
             let remaining = duration.as_secs().saturating_sub(elapsed);
-            println!(
-                "    {label}: completed {completed}, active {active}, remaining {remaining}s"
-            );
+            println!("    {label}: completed {completed}, active {active}, remaining {remaining}s");
             last_progress = Instant::now();
         }
     }
@@ -1055,7 +1069,9 @@ where
     stats.cpu_user_delta_ms = cpu_after.cpu_user_ms - cpu_before.cpu_user_ms;
     stats.cpu_kernel_delta_ms = cpu_after.cpu_kernel_ms - cpu_before.cpu_kernel_ms;
     stats.core_time_ns = measure_result.core_time_ns;
-    stats.memory_samples_mb.push(system_snapshot().working_set_mb);
+    stats
+        .memory_samples_mb
+        .push(system_snapshot().working_set_mb);
     stats
 }
 
@@ -1106,7 +1122,8 @@ async fn make_instancy_connections(
         listener
             .set_nonblocking(true)
             .expect("failed to switch listener to nonblocking mode");
-        let listener = TcpListener::from_std(listener).expect("failed to adopt listener into tokio");
+        let listener =
+            TcpListener::from_std(listener).expect("failed to adopt listener into tokio");
         let (stream, _) = listener.accept().await.expect("instancy accept failed");
         stream
     } else {
@@ -1265,14 +1282,20 @@ fn instancy_scan_filter_agg(
     );
 
     let senders: Vec<_> = (0..threads)
-        .map(|worker_idx| ctx.cluster.take_input::<LineItem>(worker_idx, "data").unwrap())
+        .map(|worker_idx| {
+            ctx.cluster
+                .take_input::<LineItem>(worker_idx, "data")
+                .unwrap()
+        })
         .collect();
     for (worker_idx, sender) in senders.into_iter().enumerate() {
         let (start, end) = worker_range(SCAN_FILTER_AGG_RECORDS, process, threads, worker_idx);
         send_generated_batches(sender, start, end, STREAM_BATCH_SIZE, lineitem_at);
     }
 
-    ctx.cluster.join_blocking().expect("instancy scan/filter/agg join failed");
+    ctx.cluster
+        .join_blocking()
+        .expect("instancy scan/filter/agg join failed");
     total_metrics_core_time(&ctx.metrics).as_nanos() as u64
 }
 
@@ -1304,11 +1327,8 @@ fn instancy_pagerank(
                             ctx.notify_at(time);
                         }
                         while let Some(time) = ctx.next_notification() {
-                            let results = compute_pagerank(
-                                &buffered,
-                                PAGERANK_VERTICES,
-                                PAGERANK_ITERATIONS,
-                            );
+                            let results =
+                                compute_pagerank(&buffered, PAGERANK_VERTICES, PAGERANK_ITERATIONS);
                             if !results.is_empty() {
                                 output.push_vec(time, results);
                             }
@@ -1336,7 +1356,9 @@ fn instancy_pagerank(
         sender.close();
     }
 
-    ctx.cluster.join_blocking().expect("instancy pagerank join failed");
+    ctx.cluster
+        .join_blocking()
+        .expect("instancy pagerank join failed");
     total_metrics_core_time(&ctx.metrics).as_nanos() as u64
 }
 
@@ -1375,7 +1397,9 @@ fn instancy_map_chain(
         send_generated_batches(sender, start, end, STREAM_BATCH_SIZE, |index| index as i64);
     }
 
-    ctx.cluster.join_blocking().expect("instancy map chain join failed");
+    ctx.cluster
+        .join_blocking()
+        .expect("instancy map chain join failed");
     total_metrics_core_time(&ctx.metrics).as_nanos() as u64
 }
 
@@ -1499,69 +1523,72 @@ fn timely_local_index(global_index: usize, process: usize, threads: usize) -> us
 fn timely_scan_filter_agg(process: usize, threads: usize, port0: u16, port1: u16) -> u64 {
     let thread_times: Arc<Mutex<Vec<Duration>>> = Arc::new(Mutex::new(Vec::with_capacity(threads)));
     let tt = Arc::clone(&thread_times);
-    timely::execute(timely_cluster_config(threads, process, port0, port1), move |worker| {
-        use timely::dataflow::channels::pact::Pipeline;
-        use timely::dataflow::operators::generic::Operator;
-        use timely::dataflow::operators::{Exchange, Filter, Input, Inspect, Probe};
+    timely::execute(
+        timely_cluster_config(threads, process, port0, port1),
+        move |worker| {
+            use timely::dataflow::channels::pact::Pipeline;
+            use timely::dataflow::operators::generic::Operator;
+            use timely::dataflow::operators::{Exchange, Filter, Input, Inspect, Probe};
 
-        let thread_start = Instant::now();
-        let global_index = worker.index();
-        let local_index = timely_local_index(global_index, process, threads);
-        let is_gather_root = global_index == 0;
-        let (mut input, probe) = worker.dataflow::<u64, _, _>(|scope| {
-            let (input, stream) = scope.new_input::<LineItem>();
-            let probe = stream
-                .filter(|item| item.ship_date < 11_000)
-                .exchange(|item: &LineItem| {
-                    (item.return_flag as u64) * 256 + item.line_status as u64
-                })
-                .unary_notify(Pipeline, "aggregate", None, {
-                    let mut groups: HashMap<(u8, u8), (i64, i64)> = HashMap::new();
-                    move |input, output, notificator| {
-                        input.for_each(|time, data| {
-                            for item in data.iter() {
-                                let key = (item.return_flag, item.line_status);
-                                let entry = groups.entry(key).or_default();
-                                entry.0 += item.quantity;
-                                entry.1 += item.price;
-                            }
-                            notificator.notify_at(time.retain());
-                        });
-                        notificator.for_each(|time, _, _| {
-                            let mut results: Vec<_> = groups.drain().collect();
-                            if !results.is_empty() {
-                                output.session(&time).give_vec(&mut results);
-                            }
-                        });
-                    }
-                })
-                .exchange(|_item: &((u8, u8), (i64, i64))| 0u64)
-                .inspect(move |batch| {
-                    if is_gather_root {
-                        black_box(batch);
-                    }
-                })
-                .probe();
-            (input, probe)
-        });
+            let thread_start = Instant::now();
+            let global_index = worker.index();
+            let local_index = timely_local_index(global_index, process, threads);
+            let is_gather_root = global_index == 0;
+            let (mut input, probe) = worker.dataflow::<u64, _, _>(|scope| {
+                let (input, stream) = scope.new_input::<LineItem>();
+                let probe = stream
+                    .filter(|item| item.ship_date < 11_000)
+                    .exchange(|item: &LineItem| {
+                        (item.return_flag as u64) * 256 + item.line_status as u64
+                    })
+                    .unary_notify(Pipeline, "aggregate", None, {
+                        let mut groups: HashMap<(u8, u8), (i64, i64)> = HashMap::new();
+                        move |input, output, notificator| {
+                            input.for_each(|time, data| {
+                                for item in data.iter() {
+                                    let key = (item.return_flag, item.line_status);
+                                    let entry = groups.entry(key).or_default();
+                                    entry.0 += item.quantity;
+                                    entry.1 += item.price;
+                                }
+                                notificator.notify_at(time.retain());
+                            });
+                            notificator.for_each(|time, _, _| {
+                                let mut results: Vec<_> = groups.drain().collect();
+                                if !results.is_empty() {
+                                    output.session(&time).give_vec(&mut results);
+                                }
+                            });
+                        }
+                    })
+                    .exchange(|_item: &((u8, u8), (i64, i64))| 0u64)
+                    .inspect(move |batch| {
+                        if is_gather_root {
+                            black_box(batch);
+                        }
+                    })
+                    .probe();
+                (input, probe)
+            });
 
-        let (start, end) = worker_range(SCAN_FILTER_AGG_RECORDS, process, threads, local_index);
-        let mut cursor = start;
-        while cursor < end {
-            let upper = (cursor + STREAM_BATCH_SIZE as u64).min(end);
-            let mut batch = Vec::with_capacity((upper - cursor) as usize);
-            for index in cursor..upper {
-                batch.push(lineitem_at(index));
+            let (start, end) = worker_range(SCAN_FILTER_AGG_RECORDS, process, threads, local_index);
+            let mut cursor = start;
+            while cursor < end {
+                let upper = (cursor + STREAM_BATCH_SIZE as u64).min(end);
+                let mut batch = Vec::with_capacity((upper - cursor) as usize);
+                for index in cursor..upper {
+                    batch.push(lineitem_at(index));
+                }
+                if !batch.is_empty() {
+                    input.send_batch(&mut batch);
+                }
+                cursor = upper;
             }
-            if !batch.is_empty() {
-                input.send_batch(&mut batch);
-            }
-            cursor = upper;
-        }
-        input.close();
-        worker.step_while(|| !probe.done());
-        tt.lock().unwrap().push(thread_start.elapsed());
-    })
+            input.close();
+            worker.step_while(|| !probe.done());
+            tt.lock().unwrap().push(thread_start.elapsed());
+        },
+    )
     .expect("timely scan/filter/agg execution failed");
     sum_thread_times(&thread_times).as_nanos() as u64
 }
@@ -1571,57 +1598,63 @@ fn timely_pagerank(process: usize, threads: usize, port0: u16, port1: u16) -> u6
     let partitions = Arc::new(partition_data(&local_edges, threads));
     let thread_times: Arc<Mutex<Vec<Duration>>> = Arc::new(Mutex::new(Vec::with_capacity(threads)));
     let tt = Arc::clone(&thread_times);
-    timely::execute(timely_cluster_config(threads, process, port0, port1), move |worker| {
-        use timely::dataflow::channels::pact::Pipeline;
-        use timely::dataflow::operators::generic::Operator;
-        use timely::dataflow::operators::{Exchange, Input, Inspect, Probe};
+    timely::execute(
+        timely_cluster_config(threads, process, port0, port1),
+        move |worker| {
+            use timely::dataflow::channels::pact::Pipeline;
+            use timely::dataflow::operators::generic::Operator;
+            use timely::dataflow::operators::{Exchange, Input, Inspect, Probe};
 
-        let thread_start = Instant::now();
-        let global_index = worker.index();
-        let local_index = timely_local_index(global_index, process, threads);
-        let partitions = Arc::clone(&partitions);
-        let is_gather_root = global_index == 0;
-        let (mut input, probe) = worker.dataflow::<u64, _, _>(|scope| {
-            let (input, stream) = scope.new_input::<Edge>();
-            let probe = stream
-                .unary_notify(Pipeline, "pagerank", None, {
-                    let mut buffered = Vec::new();
-                    move |input, output, notificator| {
-                        input.for_each(|time, data| {
-                            buffered.extend(data.iter().cloned());
-                            notificator.notify_at(time.retain());
-                        });
-                        notificator.for_each(|time, _, _| {
-                            let mut results =
-                                compute_pagerank(&buffered, PAGERANK_VERTICES, PAGERANK_ITERATIONS);
-                            if !results.is_empty() {
-                                output.session(&time).give_vec(&mut results);
-                            }
-                            buffered.clear();
-                        });
-                    }
-                })
-                .exchange(|item: &(u64, f64)| item.0)
-                .exchange(|_item: &(u64, f64)| 0u64)
-                .inspect(move |batch| {
-                    if is_gather_root {
-                        black_box(batch);
-                    }
-                })
-                .probe();
-            (input, probe)
-        });
+            let thread_start = Instant::now();
+            let global_index = worker.index();
+            let local_index = timely_local_index(global_index, process, threads);
+            let partitions = Arc::clone(&partitions);
+            let is_gather_root = global_index == 0;
+            let (mut input, probe) = worker.dataflow::<u64, _, _>(|scope| {
+                let (input, stream) = scope.new_input::<Edge>();
+                let probe = stream
+                    .unary_notify(Pipeline, "pagerank", None, {
+                        let mut buffered = Vec::new();
+                        move |input, output, notificator| {
+                            input.for_each(|time, data| {
+                                buffered.extend(data.iter().cloned());
+                                notificator.notify_at(time.retain());
+                            });
+                            notificator.for_each(|time, _, _| {
+                                let mut results = compute_pagerank(
+                                    &buffered,
+                                    PAGERANK_VERTICES,
+                                    PAGERANK_ITERATIONS,
+                                );
+                                if !results.is_empty() {
+                                    output.session(&time).give_vec(&mut results);
+                                }
+                                buffered.clear();
+                            });
+                        }
+                    })
+                    .exchange(|item: &(u64, f64)| item.0)
+                    .exchange(|_item: &(u64, f64)| 0u64)
+                    .inspect(move |batch| {
+                        if is_gather_root {
+                            black_box(batch);
+                        }
+                    })
+                    .probe();
+                (input, probe)
+            });
 
-        if let Some(partition) = partitions.get(local_index) {
-            let mut batch = partition.clone();
-            if !batch.is_empty() {
-                input.send_batch(&mut batch);
+            if let Some(partition) = partitions.get(local_index) {
+                let mut batch = partition.clone();
+                if !batch.is_empty() {
+                    input.send_batch(&mut batch);
+                }
             }
-        }
-        input.close();
-        worker.step_while(|| !probe.done());
-        tt.lock().unwrap().push(thread_start.elapsed());
-    })
+            input.close();
+            worker.step_while(|| !probe.done());
+            tt.lock().unwrap().push(thread_start.elapsed());
+        },
+    )
     .expect("timely pagerank execution failed");
     sum_thread_times(&thread_times).as_nanos() as u64
 }
@@ -1629,43 +1662,46 @@ fn timely_pagerank(process: usize, threads: usize, port0: u16, port1: u16) -> u6
 fn timely_map_chain(process: usize, threads: usize, port0: u16, port1: u16) -> u64 {
     let thread_times: Arc<Mutex<Vec<Duration>>> = Arc::new(Mutex::new(Vec::with_capacity(threads)));
     let tt = Arc::clone(&thread_times);
-    timely::execute(timely_cluster_config(threads, process, port0, port1), move |worker| {
-        use timely::dataflow::operators::{Exchange, Input, Inspect, Map, Probe};
+    timely::execute(
+        timely_cluster_config(threads, process, port0, port1),
+        move |worker| {
+            use timely::dataflow::operators::{Exchange, Input, Inspect, Map, Probe};
 
-        let thread_start = Instant::now();
-        let global_index = worker.index();
-        let local_index = timely_local_index(global_index, process, threads);
-        let is_gather_root = global_index == 0;
-        let (mut input, probe) = worker.dataflow::<u64, _, _>(|scope| {
-            let (input, mut stream) = scope.new_input::<i64>();
-            for _ in 0..MAP_CHAIN_STAGES {
-                stream = stream.map(|value| value + 1);
-            }
-            let probe = stream
-                .exchange(|value: &i64| *value as u64)
-                .inspect(move |batch| {
-                    if is_gather_root {
-                        black_box(batch);
-                    }
-                })
-                .probe();
-            (input, probe)
-        });
+            let thread_start = Instant::now();
+            let global_index = worker.index();
+            let local_index = timely_local_index(global_index, process, threads);
+            let is_gather_root = global_index == 0;
+            let (mut input, probe) = worker.dataflow::<u64, _, _>(|scope| {
+                let (input, mut stream) = scope.new_input::<i64>();
+                for _ in 0..MAP_CHAIN_STAGES {
+                    stream = stream.map(|value| value + 1);
+                }
+                let probe = stream
+                    .exchange(|value: &i64| *value as u64)
+                    .inspect(move |batch| {
+                        if is_gather_root {
+                            black_box(batch);
+                        }
+                    })
+                    .probe();
+                (input, probe)
+            });
 
-        let (start, end) = worker_range(MAP_CHAIN_VALUES, process, threads, local_index);
-        let mut cursor = start;
-        while cursor < end {
-            let upper = (cursor + STREAM_BATCH_SIZE as u64).min(end);
-            let mut batch: Vec<i64> = (cursor..upper).map(|value| value as i64).collect();
-            if !batch.is_empty() {
-                input.send_batch(&mut batch);
+            let (start, end) = worker_range(MAP_CHAIN_VALUES, process, threads, local_index);
+            let mut cursor = start;
+            while cursor < end {
+                let upper = (cursor + STREAM_BATCH_SIZE as u64).min(end);
+                let mut batch: Vec<i64> = (cursor..upper).map(|value| value as i64).collect();
+                if !batch.is_empty() {
+                    input.send_batch(&mut batch);
+                }
+                cursor = upper;
             }
-            cursor = upper;
-        }
-        input.close();
-        worker.step_while(|| !probe.done());
-        tt.lock().unwrap().push(thread_start.elapsed());
-    })
+            input.close();
+            worker.step_while(|| !probe.done());
+            tt.lock().unwrap().push(thread_start.elapsed());
+        },
+    )
     .expect("timely map-chain execution failed");
     sum_thread_times(&thread_times).as_nanos() as u64
 }
@@ -1674,40 +1710,43 @@ fn timely_multi_epoch(process: usize, threads: usize, port0: u16, port1: u16) ->
     let batches = Arc::new(make_local_multi_epoch_batches(process));
     let thread_times: Arc<Mutex<Vec<Duration>>> = Arc::new(Mutex::new(Vec::with_capacity(threads)));
     let tt = Arc::clone(&thread_times);
-    timely::execute(timely_cluster_config(threads, process, port0, port1), move |worker| {
-        use timely::dataflow::operators::{Exchange, Filter, Input, Inspect, Probe};
+    timely::execute(
+        timely_cluster_config(threads, process, port0, port1),
+        move |worker| {
+            use timely::dataflow::operators::{Exchange, Filter, Input, Inspect, Probe};
 
-        let thread_start = Instant::now();
-        let global_index = worker.index();
-        let local_index = timely_local_index(global_index, process, threads);
-        let batches = Arc::clone(&batches);
-        let is_gather_root = global_index == 0;
-        let (mut input, probe) = worker.dataflow::<u64, _, _>(|scope| {
-            let (input, stream) = scope.new_input::<u64>();
-            let probe = stream
-                .filter(|value| *value > MULTI_EPOCH_THRESHOLD)
-                .exchange(|value: &u64| *value)
-                .inspect(move |batch| {
-                    if is_gather_root {
-                        black_box(batch);
-                    }
-                })
-                .probe();
-            (input, probe)
-        });
+            let thread_start = Instant::now();
+            let global_index = worker.index();
+            let local_index = timely_local_index(global_index, process, threads);
+            let batches = Arc::clone(&batches);
+            let is_gather_root = global_index == 0;
+            let (mut input, probe) = worker.dataflow::<u64, _, _>(|scope| {
+                let (input, stream) = scope.new_input::<u64>();
+                let probe = stream
+                    .filter(|value| *value > MULTI_EPOCH_THRESHOLD)
+                    .exchange(|value: &u64| *value)
+                    .inspect(move |batch| {
+                        if is_gather_root {
+                            black_box(batch);
+                        }
+                    })
+                    .probe();
+                (input, probe)
+            });
 
-        for (time, batch) in batches.iter() {
-            input.advance_to(*time);
-            let partitions = partition_data(batch, threads);
-            let mut local_batch = partitions[local_index].clone();
-            if !local_batch.is_empty() {
-                input.send_batch(&mut local_batch);
+            for (time, batch) in batches.iter() {
+                input.advance_to(*time);
+                let partitions = partition_data(batch, threads);
+                let mut local_batch = partitions[local_index].clone();
+                if !local_batch.is_empty() {
+                    input.send_batch(&mut local_batch);
+                }
             }
-        }
-        input.close();
-        worker.step_while(|| !probe.done());
-        tt.lock().unwrap().push(thread_start.elapsed());
-    })
+            input.close();
+            worker.step_while(|| !probe.done());
+            tt.lock().unwrap().push(thread_start.elapsed());
+        },
+    )
     .expect("timely multi-epoch execution failed");
     sum_thread_times(&thread_times).as_nanos() as u64
 }
@@ -1717,40 +1756,43 @@ fn timely_small_pipeline(process: usize, threads: usize, port0: u16, port1: u16)
     let partitions = Arc::new(partition_data(&local_batch, threads));
     let thread_times: Arc<Mutex<Vec<Duration>>> = Arc::new(Mutex::new(Vec::with_capacity(threads)));
     let tt = Arc::clone(&thread_times);
-    timely::execute(timely_cluster_config(threads, process, port0, port1), move |worker| {
-        use timely::dataflow::operators::{Exchange, Input, Inspect, Map, Probe};
+    timely::execute(
+        timely_cluster_config(threads, process, port0, port1),
+        move |worker| {
+            use timely::dataflow::operators::{Exchange, Input, Inspect, Map, Probe};
 
-        let thread_start = Instant::now();
-        let global_index = worker.index();
-        let local_index = timely_local_index(global_index, process, threads);
-        let partitions = Arc::clone(&partitions);
-        let is_gather_root = global_index == 0;
-        let (mut input, probe) = worker.dataflow::<u64, _, _>(|scope| {
-            let (input, stream) = scope.new_input::<i64>();
-            let probe = stream
-                .map(|value| value + 1)
-                .map(|value| value * 2)
-                .map(|value| value - 1)
-                .exchange(|value: &i64| *value as u64)
-                .inspect(move |batch| {
-                    if is_gather_root {
-                        black_box(batch);
-                    }
-                })
-                .probe();
-            (input, probe)
-        });
+            let thread_start = Instant::now();
+            let global_index = worker.index();
+            let local_index = timely_local_index(global_index, process, threads);
+            let partitions = Arc::clone(&partitions);
+            let is_gather_root = global_index == 0;
+            let (mut input, probe) = worker.dataflow::<u64, _, _>(|scope| {
+                let (input, stream) = scope.new_input::<i64>();
+                let probe = stream
+                    .map(|value| value + 1)
+                    .map(|value| value * 2)
+                    .map(|value| value - 1)
+                    .exchange(|value: &i64| *value as u64)
+                    .inspect(move |batch| {
+                        if is_gather_root {
+                            black_box(batch);
+                        }
+                    })
+                    .probe();
+                (input, probe)
+            });
 
-        if let Some(partition) = partitions.get(local_index) {
-            let mut batch = partition.clone();
-            if !batch.is_empty() {
-                input.send_batch(&mut batch);
+            if let Some(partition) = partitions.get(local_index) {
+                let mut batch = partition.clone();
+                if !batch.is_empty() {
+                    input.send_batch(&mut batch);
+                }
             }
-        }
-        input.close();
-        worker.step_while(|| !probe.done());
-        tt.lock().unwrap().push(thread_start.elapsed());
-    })
+            input.close();
+            worker.step_while(|| !probe.done());
+            tt.lock().unwrap().push(thread_start.elapsed());
+        },
+    )
     .expect("timely small pipeline execution failed");
     sum_thread_times(&thread_times).as_nanos() as u64
 }
@@ -1906,7 +1948,8 @@ impl Config {
                     config.control_addr = Some(next_val("--control-addr"));
                 }
                 "--duration" => {
-                    config.duration_secs = next_val("--duration").parse().expect("invalid --duration");
+                    config.duration_secs =
+                        next_val("--duration").parse().expect("invalid --duration");
                 }
                 "--warmup" => {
                     config.warmup_secs = next_val("--warmup").parse().expect("invalid --warmup");
@@ -1931,10 +1974,13 @@ impl Config {
                     };
                 }
                 "--cooldown" => {
-                    config.cooldown_secs = next_val("--cooldown").parse().expect("invalid --cooldown");
+                    config.cooldown_secs =
+                        next_val("--cooldown").parse().expect("invalid --cooldown");
                 }
                 "--concurrency" => {
-                    config.concurrency = next_val("--concurrency").parse().expect("invalid --concurrency");
+                    config.concurrency = next_val("--concurrency")
+                        .parse()
+                        .expect("invalid --concurrency");
                 }
                 "--threads" => {
                     config.threads = next_val("--threads").parse().expect("invalid --threads");
@@ -1947,7 +1993,10 @@ impl Config {
             i += 1;
         }
 
-        assert!(config.concurrency > 0, "--concurrency must be greater than zero");
+        assert!(
+            config.concurrency > 0,
+            "--concurrency must be greater than zero"
+        );
         assert!(config.threads > 0, "--threads must be greater than zero");
         if config.role == Role::Worker {
             assert!(
@@ -2027,19 +2076,54 @@ fn main() {
     println!("          instancy vs timely-dataflow                       ");
     println!("");
     println!("  Mode:        2-process cross-TCP exchange                ");
-    println!("  Duration:    {:>6}s per (library, scenario)             ", config.duration_secs);
-    println!("  Warmup:      {:>6}s                                     ", config.warmup_secs);
-    println!("  Rounds:      {:>6}                                      ", config.rounds);
-    println!("  Cooldown:    {:>6}s between runs                        ", config.cooldown_secs);
-    println!("  Concurrency: {:>6} small-query in-flight cap            ", config.concurrency);
-    println!("  Threads:     {:>6} per-process worker threads           ", config.threads);
+    println!(
+        "  Duration:    {:>6}s per (library, scenario)             ",
+        config.duration_secs
+    );
+    println!(
+        "  Warmup:      {:>6}s                                     ",
+        config.warmup_secs
+    );
+    println!(
+        "  Rounds:      {:>6}                                      ",
+        config.rounds
+    );
+    println!(
+        "  Cooldown:    {:>6}s between runs                        ",
+        config.cooldown_secs
+    );
+    println!(
+        "  Concurrency: {:>6} small-query in-flight cap            ",
+        config.concurrency
+    );
+    println!(
+        "  Threads:     {:>6} per-process worker threads           ",
+        config.threads
+    );
     println!();
-    println!("  ScanFilterAgg: {} records total ({} + {})", SCAN_FILTER_AGG_RECORDS, SCAN_FILTER_AGG_RECORDS / 2, SCAN_FILTER_AGG_RECORDS / 2);
-    println!("  PageRank:     {} vertices, {} edges, {} iterations", PAGERANK_VERTICES, PAGERANK_EDGES, PAGERANK_ITERATIONS);
+    println!(
+        "  ScanFilterAgg: {} records total ({} + {})",
+        SCAN_FILTER_AGG_RECORDS,
+        SCAN_FILTER_AGG_RECORDS / 2,
+        SCAN_FILTER_AGG_RECORDS / 2
+    );
+    println!(
+        "  PageRank:     {} vertices, {} edges, {} iterations",
+        PAGERANK_VERTICES, PAGERANK_EDGES, PAGERANK_ITERATIONS
+    );
     println!("  MapChain10:   {} values total", MAP_CHAIN_VALUES);
-    println!("  MultiEpoch:   {} epochs x {} records", MULTI_EPOCHS, MULTI_EPOCH_BATCH_SIZE);
-    println!("  SmallPipeline:{} values/query @ concurrency {}", SMALL_PIPELINE_VALUES, config.concurrency);
-    println!("  Large-query sustained parallelism: {}", LARGE_QUERY_CONCURRENCY);
+    println!(
+        "  MultiEpoch:   {} epochs x {} records",
+        MULTI_EPOCHS, MULTI_EPOCH_BATCH_SIZE
+    );
+    println!(
+        "  SmallPipeline:{} values/query @ concurrency {}",
+        SMALL_PIPELINE_VALUES, config.concurrency
+    );
+    println!(
+        "  Large-query sustained parallelism: {}",
+        LARGE_QUERY_CONCURRENCY
+    );
     println!();
 
     let mut all_rows: Vec<SummaryRow> = Vec::new();

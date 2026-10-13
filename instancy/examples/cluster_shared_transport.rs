@@ -89,8 +89,14 @@ async fn main() {
     let connection_factory: Arc<dyn DynConnectionFactory> = factory.clone();
 
     // Create shared peer manager for node-a → node-b
-    let manager =
-        SharedPeerManager::new("node-b".to_string(), config, connection_factory, &handle, health_tx()).unwrap();
+    let manager = SharedPeerManager::new(
+        "node-b".to_string(),
+        config,
+        connection_factory,
+        &handle,
+        health_tx(),
+    )
+    .unwrap();
 
     println!(
         "Created SharedPeerManager with {} eager connections to node-b\n",

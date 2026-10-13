@@ -520,7 +520,8 @@ mod tests {
 
         // Inject high RTT directly
         pool.connection(0)
-            .unwrap().unwrap()
+            .unwrap()
+            .unwrap()
             .record_rtt(Duration::from_millis(10));
 
         // Evaluate
@@ -545,7 +546,8 @@ mod tests {
 
         // Healthy RTT
         pool.connection(0)
-            .unwrap().unwrap()
+            .unwrap()
+            .unwrap()
             .record_rtt(Duration::from_millis(2));
 
         driver.evaluate_and_emit(&pool).await.unwrap();

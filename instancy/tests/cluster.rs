@@ -12,9 +12,9 @@ use instancy::DataflowId;
 use instancy::Result;
 use instancy::communication::ClusterSpawnTransport;
 use instancy::communication::transport_session::PeerConnection;
+use instancy::metrics::MetricsConfig;
 use instancy::{ClusterTopology, NodeConfig};
 use instancy::{RuntimeConfig, RuntimeHandle, SpawnOptions};
-use instancy::metrics::MetricsConfig;
 
 /// Helper: create duplex connections between two nodes.
 ///
@@ -646,10 +646,7 @@ async fn cluster_observability_metrics_collected() {
     );
     // Verify operator structure is correct.
     let snap_a = metrics_a.operator_snapshots();
-    assert!(
-        !snap_a.is_empty(),
-        "node-a should have operator snapshots"
-    );
+    assert!(!snap_a.is_empty(), "node-a should have operator snapshots");
 
     assert!(
         metrics_b.total_activations() > 0,
@@ -789,7 +786,10 @@ async fn cluster_async_io_mode() {
     let mut all: Vec<i64> = data_a.iter().chain(data_b.iter()).copied().collect();
     all.sort();
     let expected: Vec<i64> = (0..10).map(|x| x * 3).collect();
-    assert_eq!(all, expected, "all inputs tripled and distributed across nodes");
+    assert_eq!(
+        all, expected,
+        "all inputs tripled and distributed across nodes"
+    );
 
     // At least one node should have received data from the other (exchange).
     assert!(
