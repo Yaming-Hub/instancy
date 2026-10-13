@@ -34,7 +34,10 @@ impl<T: Timestamp> FrontierAggregator<T> {
     ///
     /// Panics if `num_senders` is zero.
     pub fn new(num_senders: usize) -> Self {
-        assert!(num_senders > 0, "FrontierAggregator requires at least one sender");
+        assert!(
+            num_senders > 0,
+            "FrontierAggregator requires at least one sender"
+        );
         let sender_frontiers = vec![Antichain::from_elem(T::minimum()); num_senders];
 
         Self {
@@ -70,13 +73,16 @@ impl<T: Timestamp> FrontierAggregator<T> {
         // Monotonicity: every old frontier element must be <= some new element.
         // An empty new frontier (meaning "done") always satisfies this.
         debug_assert!(
-            self.sender_frontiers[sender].elements().iter().all(|old_t| {
-                frontier.elements().is_empty()
-                    || frontier
-                        .elements()
-                        .iter()
-                        .any(|new_t| old_t.less_equal(new_t))
-            }),
+            self.sender_frontiers[sender]
+                .elements()
+                .iter()
+                .all(|old_t| {
+                    frontier.elements().is_empty()
+                        || frontier
+                            .elements()
+                            .iter()
+                            .any(|new_t| old_t.less_equal(new_t))
+                }),
             "frontier must not regress: old={:?}, new={:?}",
             self.sender_frontiers[sender],
             frontier

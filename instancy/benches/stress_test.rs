@@ -416,7 +416,11 @@ fn main() {
         config.workers,
         config.runtimes,
         config.base_rps,
-        if let Some(ramp) = config.ramp_to { format!(" ramp_to={ramp:.1}") } else { String::new() },
+        if let Some(ramp) = config.ramp_to {
+            format!(" ramp_to={ramp:.1}")
+        } else {
+            String::new()
+        },
         config.failure_rate * 100.0,
         config.cancel_rate * 100.0,
         MAX_IN_FLIGHT,
@@ -508,7 +512,8 @@ fn main() {
                 0.0
             };
 
-            let current_rps_target = current_target_rps(now.saturating_duration_since(start), &config);
+            let current_rps_target =
+                current_target_rps(now.saturating_duration_since(start), &config);
             println!(
                 "[{}] submitted={} completed={} in_flight={} success={} expected_failure={} unexpected_failure={} cancelled={} timeout={} target_rps={:.1} rps_5m={:.2} rss_mb={:.1} peak_mb={:.1} cpu={:.1}%",
                 format_hms(elapsed_secs),

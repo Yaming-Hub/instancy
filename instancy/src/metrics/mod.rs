@@ -462,9 +462,7 @@ impl TimelineCollector {
         if duration < self.min_duration {
             return;
         }
-        let start_us = start
-            .saturating_duration_since(self.start_time)
-            .as_micros() as u64;
+        let start_us = start.saturating_duration_since(self.start_time).as_micros() as u64;
         let duration_us = duration.as_micros() as u64;
         let event = ActivationEvent {
             operator_index,
@@ -491,7 +489,10 @@ impl TimelineCollector {
             timestamp_us,
             new_frontier,
         };
-        let mut events = self.frontier_events.lock().unwrap_or_else(|e| e.into_inner());
+        let mut events = self
+            .frontier_events
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         if self.max_events > 0 && events.len() >= self.max_events {
             events.pop_front();
         }
@@ -500,13 +501,7 @@ impl TimelineCollector {
 
     /// Record a data transfer event through an exchange edge.
     #[inline]
-    pub fn record_transfer(
-        &self,
-        edge_index: usize,
-        target_worker: usize,
-        items: u64,
-        bytes: u64,
-    ) {
+    pub fn record_transfer(&self, edge_index: usize, target_worker: usize, items: u64, bytes: u64) {
         let timestamp_us = std::time::Instant::now()
             .saturating_duration_since(self.start_time)
             .as_micros() as u64;
@@ -518,7 +513,10 @@ impl TimelineCollector {
             items,
             bytes,
         };
-        let mut events = self.transfer_events.lock().unwrap_or_else(|e| e.into_inner());
+        let mut events = self
+            .transfer_events
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         if self.max_events > 0 && events.len() >= self.max_events {
             events.pop_front();
         }
@@ -533,13 +531,19 @@ impl TimelineCollector {
 
     /// Drain all recorded frontier events.
     pub fn take_frontier_events(&self) -> Vec<FrontierEvent> {
-        let mut events = self.frontier_events.lock().unwrap_or_else(|e| e.into_inner());
+        let mut events = self
+            .frontier_events
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         events.drain(..).collect()
     }
 
     /// Drain all recorded transfer events.
     pub fn take_transfer_events(&self) -> Vec<TransferEvent> {
-        let mut events = self.transfer_events.lock().unwrap_or_else(|e| e.into_inner());
+        let mut events = self
+            .transfer_events
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         events.drain(..).collect()
     }
 
@@ -550,12 +554,18 @@ impl TimelineCollector {
 
     /// Number of frontier events currently recorded.
     pub fn frontier_event_count(&self) -> usize {
-        self.frontier_events.lock().unwrap_or_else(|e| e.into_inner()).len()
+        self.frontier_events
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .len()
     }
 
     /// Number of transfer events currently recorded.
     pub fn transfer_event_count(&self) -> usize {
-        self.transfer_events.lock().unwrap_or_else(|e| e.into_inner()).len()
+        self.transfer_events
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .len()
     }
 }
 
@@ -1050,15 +1060,27 @@ mod tests {
         let tc = TimelineCollector::new(0, start_time, min_dur, 0);
 
         // Below threshold — should be filtered.
-        tc.record_activation(0, start_time + Duration::from_micros(50), Duration::from_micros(5));
+        tc.record_activation(
+            0,
+            start_time + Duration::from_micros(50),
+            Duration::from_micros(5),
+        );
         assert_eq!(tc.event_count(), 0);
 
         // Exactly at threshold — should be recorded.
-        tc.record_activation(0, start_time + Duration::from_micros(100), Duration::from_micros(10));
+        tc.record_activation(
+            0,
+            start_time + Duration::from_micros(100),
+            Duration::from_micros(10),
+        );
         assert_eq!(tc.event_count(), 1);
 
         // Above threshold — should be recorded.
-        tc.record_activation(1, start_time + Duration::from_micros(200), Duration::from_micros(50));
+        tc.record_activation(
+            1,
+            start_time + Duration::from_micros(200),
+            Duration::from_micros(50),
+        );
         assert_eq!(tc.event_count(), 2);
     }
 
@@ -1087,7 +1109,11 @@ mod tests {
         let tc = TimelineCollector::new(0, start_time, Duration::ZERO, 0); // 0 = unlimited
 
         for i in 0..1000u64 {
-            tc.record_activation(0, start_time + Duration::from_micros(i), Duration::from_micros(1));
+            tc.record_activation(
+                0,
+                start_time + Duration::from_micros(i),
+                Duration::from_micros(1),
+            );
         }
 
         assert_eq!(tc.event_count(), 1000);
@@ -1105,8 +1131,16 @@ mod tests {
         dm.register_timeline(Arc::clone(&tc1));
 
         // Record events from different workers.
-        tc0.record_activation(0, start_time + Duration::from_micros(200), Duration::from_micros(10));
-        tc1.record_activation(1, start_time + Duration::from_micros(100), Duration::from_micros(20));
+        tc0.record_activation(
+            0,
+            start_time + Duration::from_micros(200),
+            Duration::from_micros(10),
+        );
+        tc1.record_activation(
+            1,
+            start_time + Duration::from_micros(100),
+            Duration::from_micros(20),
+        );
 
         assert_eq!(dm.timeline_event_count(), 2);
 

@@ -145,10 +145,17 @@ async fn make_tcp_shared_managers(
     let factory_a: Arc<dyn DynConnectionFactory> = Arc::new(PreEstablishedFactory::new(conns_a));
     let factory_b: Arc<dyn DynConnectionFactory> = Arc::new(PreEstablishedFactory::new(conns_b));
 
-    let manager_a =
-        SharedPeerManager::new("node-b".to_string(), config.clone(), factory_a, handle, health_tx()).unwrap();
+    let manager_a = SharedPeerManager::new(
+        "node-b".to_string(),
+        config.clone(),
+        factory_a,
+        handle,
+        health_tx(),
+    )
+    .unwrap();
     let manager_b =
-        SharedPeerManager::new("node-a".to_string(), config, factory_b, handle, health_tx()).unwrap();
+        SharedPeerManager::new("node-a".to_string(), config, factory_b, handle, health_tx())
+            .unwrap();
 
     let mut managers_a = HashMap::new();
     managers_a.insert("node-b".to_string(), manager_a);
@@ -831,8 +838,14 @@ async fn shared_reconnect_after_transient_network_failure() {
     let dyn_factory: Arc<dyn DynConnectionFactory> = factory.clone();
 
     let rt = tokio::runtime::Handle::current();
-    let manager =
-        SharedPeerManager::new("echo-peer".to_string(), config, dyn_factory, &rt, health_tx()).unwrap();
+    let manager = SharedPeerManager::new(
+        "echo-peer".to_string(),
+        config,
+        dyn_factory,
+        &rt,
+        health_tx(),
+    )
+    .unwrap();
 
     // ---------- register a dataflow and verify initial data flow ----------
     let df_id = DataflowId::new();

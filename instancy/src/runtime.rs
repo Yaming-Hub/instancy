@@ -2029,7 +2029,6 @@ impl RuntimeHandle {
         Ok(multi)
     }
 
-
     #[allow(clippy::too_many_arguments)]
     fn spawn_staged_se_internal<T, F>(
         &self,
@@ -2398,8 +2397,7 @@ impl RuntimeHandle {
             // min(source_par, target_par) would be silently lost.
             {
                 let regular_edge_count = dataflow.graph.edges().len();
-                let feedback_edges: Vec<_> =
-                    dataflow.graph.feedback_edges().to_vec();
+                let feedback_edges: Vec<_> = dataflow.graph.feedback_edges().to_vec();
                 for (fb_idx, edge) in feedback_edges.iter().enumerate() {
                     if edge.source_stage == edge.target_stage {
                         continue; // intra-stage feedback handled by materialize_stage_executor

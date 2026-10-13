@@ -436,14 +436,14 @@ impl PeerPool {
     /// The caller must call `dequeue()` after the frame has been written,
     /// or `rollback_reservation()` if the send could not be completed.
     pub fn select_and_reserve(&self) -> crate::Result<Option<Arc<ConnectionMetrics>>> {
-        let live: Vec<_> = match self.connections.read().or_poison("peer pool connections") {
-            Ok(connections) => connections
-                .values()
-                .filter(|c| c.is_alive())
-                .cloned()
-                .collect(),
-            Err(e) => return Err(e),
-        };
+        let live: Vec<_> = self
+            .connections
+            .read()
+            .or_poison("peer pool connections")?
+            .values()
+            .filter(|c| c.is_alive())
+            .cloned()
+            .collect();
 
         if live.is_empty() {
             return Ok(None);
@@ -520,7 +520,10 @@ impl PeerPool {
     /// Add a new connection to the pool. Returns its metrics handle,
     /// or `None` if already at `max_connections` live connections.
     pub fn add_connection(&self) -> crate::Result<Option<Arc<ConnectionMetrics>>> {
-        let mut connections = self.connections.write().or_poison("peer pool connections")?;
+        let mut connections = self
+            .connections
+            .write()
+            .or_poison("peer pool connections")?;
         let live_count = connections.values().filter(|c| c.is_alive()).count();
         if live_count >= self.config.max_connections {
             return Ok(None);
@@ -536,7 +539,10 @@ impl PeerPool {
     /// Returns true if removed, false if ID not found or removing it would put
     /// the live connection count below `min_connections`.
     pub fn remove_connection(&self, id: usize) -> crate::Result<bool> {
-        let mut connections = self.connections.write().or_poison("peer pool connections")?;
+        let mut connections = self
+            .connections
+            .write()
+            .or_poison("peer pool connections")?;
         let Some(metrics) = connections.get(&id) else {
             return Ok(false);
         };
@@ -791,10 +797,12 @@ mod tests {
 
         // Both have 0 pending, but different RTT
         pool.connection(0)
-            .unwrap().unwrap()
+            .unwrap()
+            .unwrap()
             .record_rtt(Duration::from_millis(5));
         pool.connection(1)
-            .unwrap().unwrap()
+            .unwrap()
+            .unwrap()
             .record_rtt(Duration::from_millis(2));
 
         let selected = pool.select_connection().unwrap().unwrap();
@@ -812,13 +820,20 @@ mod tests {
         let pool = PeerPool::new(1, config).unwrap();
 
         // No RTT yet — no scaling
-        assert_eq!(pool.evaluate_scaling().await.unwrap(), ScalingDecision::None);
+        assert_eq!(
+            pool.evaluate_scaling().await.unwrap(),
+            ScalingDecision::None
+        );
 
         // Record high RTT
         pool.connection(0)
-            .unwrap().unwrap()
+            .unwrap()
+            .unwrap()
             .record_rtt(Duration::from_millis(10));
-        assert_eq!(pool.evaluate_scaling().await.unwrap(), ScalingDecision::ScaleUp);
+        assert_eq!(
+            pool.evaluate_scaling().await.unwrap(),
+            ScalingDecision::ScaleUp
+        );
     }
 
     #[tokio::test]
@@ -832,10 +847,14 @@ mod tests {
         let pool = PeerPool::new(2, config).unwrap();
 
         pool.connection(0)
-            .unwrap().unwrap()
+            .unwrap()
+            .unwrap()
             .record_rtt(Duration::from_millis(10));
         // Already at max — no scale up
-        assert_eq!(pool.evaluate_scaling().await.unwrap(), ScalingDecision::None);
+        assert_eq!(
+            pool.evaluate_scaling().await.unwrap(),
+            ScalingDecision::None
+        );
     }
 
     #[tokio::test]
@@ -851,14 +870,19 @@ mod tests {
 
         // Both connections have low RTT
         pool.connection(0)
-            .unwrap().unwrap()
+            .unwrap()
+            .unwrap()
             .record_rtt(Duration::from_millis(1));
         pool.connection(1)
-            .unwrap().unwrap()
+            .unwrap()
+            .unwrap()
             .record_rtt(Duration::from_millis(2));
 
         // First evaluation starts cooldown
-        assert_eq!(pool.evaluate_scaling().await.unwrap(), ScalingDecision::None);
+        assert_eq!(
+            pool.evaluate_scaling().await.unwrap(),
+            ScalingDecision::None
+        );
 
         // Wait for cooldown
         tokio::time::sleep(Duration::from_millis(15)).await;
@@ -879,12 +903,16 @@ mod tests {
         };
         let pool = PeerPool::new(1, config).unwrap();
         pool.connection(0)
-            .unwrap().unwrap()
+            .unwrap()
+            .unwrap()
             .record_rtt(Duration::from_millis(1));
 
         tokio::time::sleep(Duration::from_millis(5)).await;
         // Already at min — no scale down
-        assert_eq!(pool.evaluate_scaling().await.unwrap(), ScalingDecision::None);
+        assert_eq!(
+            pool.evaluate_scaling().await.unwrap(),
+            ScalingDecision::None
+        );
     }
 
     #[tokio::test]
@@ -901,7 +929,10 @@ mod tests {
 
         tokio::time::sleep(Duration::from_millis(5)).await;
         // No measurements — don't make scaling decisions
-        assert_eq!(pool.evaluate_scaling().await.unwrap(), ScalingDecision::None);
+        assert_eq!(
+            pool.evaluate_scaling().await.unwrap(),
+            ScalingDecision::None
+        );
     }
 
     #[test]
@@ -1021,7 +1052,8 @@ mod tests {
 
         pool.connection(0).unwrap().unwrap().enqueue();
         pool.connection(0)
-            .unwrap().unwrap()
+            .unwrap()
+            .unwrap()
             .record_rtt(Duration::from_millis(3));
         pool.connection(1).unwrap().unwrap().enqueue();
         pool.connection(1).unwrap().unwrap().enqueue();
@@ -1066,7 +1098,10 @@ mod tests {
         let pool = PeerPool::new(2, config).unwrap();
 
         // Both connections are freshly created — not yet idle
-        assert_eq!(pool.evaluate_scaling().await.unwrap(), ScalingDecision::None);
+        assert_eq!(
+            pool.evaluate_scaling().await.unwrap(),
+            ScalingDecision::None
+        );
 
         // Wait for the idle timeout to elapse
         tokio::time::sleep(Duration::from_millis(15)).await;
@@ -1115,7 +1150,10 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(15)).await;
 
         // At min_connections — should not scale down even if idle
-        assert_eq!(pool.evaluate_scaling().await.unwrap(), ScalingDecision::None);
+        assert_eq!(
+            pool.evaluate_scaling().await.unwrap(),
+            ScalingDecision::None
+        );
     }
 
     #[tokio::test]
@@ -1131,7 +1169,10 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(15)).await;
 
         // idle_timeout is None — no idle scale-down
-        assert_eq!(pool.evaluate_scaling().await.unwrap(), ScalingDecision::None);
+        assert_eq!(
+            pool.evaluate_scaling().await.unwrap(),
+            ScalingDecision::None
+        );
     }
 
     #[test]
@@ -1214,7 +1255,9 @@ mod tests {
 
         exclude.insert(2);
         assert!(
-            pool.select_connection_excluding(&exclude).unwrap().is_none(),
+            pool.select_connection_excluding(&exclude)
+                .unwrap()
+                .is_none(),
             "all excluded should return None"
         );
     }

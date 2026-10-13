@@ -283,9 +283,12 @@ async fn multi_worker_iterate_collatz_eager_quiescence() {
             let input = builder.input::<i64>("data").unwrap();
             let output = input.iterate::<u32>("collatz-loop", 1u32, |iter_var| {
                 let stepped = iter_var
-                    .map("collatz-step", |_t: &Product<u64, u32>, x| {
-                        if x % 2 == 0 { x / 2 } else { 3 * x + 1 }
-                    })
+                    .map(
+                        "collatz-step",
+                        |_t: &Product<u64, u32>, x| {
+                            if x % 2 == 0 { x / 2 } else { 3 * x + 1 }
+                        },
+                    )
                     .exchange_by_hash("redistribute", |x: &i64| *x as u64);
                 let done = stepped.clone().filter("reached-1", |_t, x| *x == 1);
                 let again = stepped.filter("continue", |_t, x| *x != 1);
@@ -788,14 +791,16 @@ async fn staged_iterate_rejects_unequal_feedback_parallelism() {
         SpawnOptions::new().per_stage_parallelism(true),
     );
 
-    assert!(result.is_err(), "should reject unequal parallelism feedback");
+    assert!(
+        result.is_err(),
+        "should reject unequal parallelism feedback"
+    );
     let err_msg = format!("{}", result.err().unwrap());
     assert!(
         err_msg.contains("cross-stage feedback") || err_msg.contains("equal parallelism"),
         "error should mention cross-stage feedback: {err_msg}"
     );
 }
-
 
 /// Concern #4 (PR #280 review): a doubly-nested `iterate` with an exchange
 /// **inside the inner loop** would need to project in-flight messages onto the
@@ -841,10 +846,7 @@ async fn multi_worker_nested_iterate_inner_exchange() {
                 // Inner loop: add 1 (with redistribution) until a multiple of 5.
                 let inner_out = outer_var.iterate::<u32>("inner", 1u32, |inner_var| {
                     let stepped = inner_var
-                        .map(
-                            "inner-add",
-                            |_t: &Product<Product<u64, u32>, u32>, x| x + 1,
-                        )
+                        .map("inner-add", |_t: &Product<Product<u64, u32>, u32>, x| x + 1)
                         .exchange_by_hash("inner-redist", |x: &i64| *x as u64);
                     let done = stepped.clone().filter("inner-done", |_t, x| *x % 5 == 0);
                     let again = stepped.filter("inner-again", |_t, x| *x % 5 != 0);
@@ -854,9 +856,10 @@ async fn multi_worker_nested_iterate_inner_exchange() {
                     }
                 });
                 // Outer loop: redistribute then continue until the value reaches 100.
-                let outer_stepped =
-                    inner_out.exchange_by_hash("outer-redist", |x: &i64| *x as u64);
-                let done = outer_stepped.clone().filter("outer-done", |_t, x| *x >= 100);
+                let outer_stepped = inner_out.exchange_by_hash("outer-redist", |x: &i64| *x as u64);
+                let done = outer_stepped
+                    .clone()
+                    .filter("outer-done", |_t, x| *x >= 100);
                 let again = outer_stepped.filter("outer-again", |_t, x| *x < 100);
                 IterateResult {
                     feedback: again,

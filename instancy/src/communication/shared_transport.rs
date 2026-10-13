@@ -1253,7 +1253,7 @@ impl SharedPeerManager {
 
             // Send a probe to each active connection
             let wc = writer_channels.lock().await;
-            for (_conn_id, tx) in wc.iter() {
+            for tx in wc.values() {
                 let seq = probe_counter.next_seq();
                 let send_ts = scaling_driver.timestamp().now_nanos();
 
@@ -1432,7 +1432,7 @@ impl SharedPeerManager {
                             "Failed to recover peer {peer_node_id} after conn {connection_id} failed — notifying dataflows"
                         );
                         let state = reg_state.lock().await;
-                        for (_df_id, reg) in state.registered.iter() {
+                        for reg in state.registered.values() {
                             let _ = reg.error_tx.try_send(TransportError::ConnectionClosed);
                         }
                     }
@@ -1902,7 +1902,9 @@ mod tests {
         let factory: Arc<dyn DynConnectionFactory> = Arc::new(EchoConnectionFactory::default());
 
         let rt = tokio::runtime::Handle::current();
-        let manager = SharedPeerManager::new("peer-1".to_string(), config, factory, &rt, health_tx()).unwrap();
+        let manager =
+            SharedPeerManager::new("peer-1".to_string(), config, factory, &rt, health_tx())
+                .unwrap();
 
         assert_eq!(manager.peer_node_id(), "peer-1");
         assert_eq!(manager.connection_count().unwrap(), 0);
@@ -1913,7 +1915,9 @@ mod tests {
         let config = SharedConnectionConfig::default();
         let factory: Arc<dyn DynConnectionFactory> = Arc::new(EchoConnectionFactory::default());
         let rt = tokio::runtime::Handle::current();
-        let manager = SharedPeerManager::new("peer-1".to_string(), config, factory, &rt, health_tx()).unwrap();
+        let manager =
+            SharedPeerManager::new("peer-1".to_string(), config, factory, &rt, health_tx())
+                .unwrap();
 
         let df_id = DataflowId::new();
         let channel_ids = vec![1, 2, 3];
@@ -2011,8 +2015,14 @@ mod tests {
         // Manager writes via mgr_write; test reads from test_stream
         let factory: Arc<dyn DynConnectionFactory> =
             Arc::new(PreEstablishedFactory::new(vec![(mgr_read, mgr_write)]));
-        let manager =
-            SharedPeerManager::new("peer-1".to_string(), config.clone(), factory, &rt, health_tx()).unwrap();
+        let manager = SharedPeerManager::new(
+            "peer-1".to_string(),
+            config.clone(),
+            factory,
+            &rt,
+            health_tx(),
+        )
+        .unwrap();
 
         let df_id = DataflowId::new();
         let _receivers = manager.register_dataflow(df_id, &[1], 16).await;
@@ -2056,7 +2066,9 @@ mod tests {
 
         let factory: Arc<dyn DynConnectionFactory> =
             Arc::new(PreEstablishedFactory::new(vec![(mgr_read, mgr_write)]));
-        let manager = SharedPeerManager::new("peer-1".to_string(), config, factory, &rt, health_tx()).unwrap();
+        let manager =
+            SharedPeerManager::new("peer-1".to_string(), config, factory, &rt, health_tx())
+                .unwrap();
 
         let df_id = DataflowId::new();
         let _receivers = manager.register_dataflow(df_id, &[1, 2], 16).await;
@@ -2091,7 +2103,8 @@ mod tests {
         let config = SharedConnectionConfig::default();
         let factory: Arc<dyn DynConnectionFactory> = Arc::new(EchoConnectionFactory::default());
         let rt = tokio::runtime::Handle::current();
-        let manager = SharedPeerManager::new("test-peer".into(), config, factory, &rt, health_tx()).unwrap();
+        let manager =
+            SharedPeerManager::new("test-peer".into(), config, factory, &rt, health_tx()).unwrap();
 
         let df_id = DataflowId::new();
         let wrong_id = DataflowId::new();
@@ -2127,7 +2140,8 @@ mod tests {
         let rt = tokio::runtime::Handle::current();
         let factory: Arc<dyn DynConnectionFactory> =
             Arc::new(PreEstablishedFactory::new(vec![(mgr_read, mgr_write)]));
-        let manager = SharedPeerManager::new("test-peer".into(), config, factory, &rt, health_tx()).unwrap();
+        let manager =
+            SharedPeerManager::new("test-peer".into(), config, factory, &rt, health_tx()).unwrap();
 
         // Register a dataflow to trigger lazy connection establishment
         let df_id = DataflowId::new();
@@ -2177,7 +2191,8 @@ mod tests {
         let rt = tokio::runtime::Handle::current();
         let factory: Arc<dyn DynConnectionFactory> =
             Arc::new(PreEstablishedFactory::new(vec![(mgr_read, mgr_write)]));
-        let manager = SharedPeerManager::new("test-peer".into(), config, factory, &rt, health_tx()).unwrap();
+        let manager =
+            SharedPeerManager::new("test-peer".into(), config, factory, &rt, health_tx()).unwrap();
 
         let df_id = DataflowId::new();
         let (mut receivers, _error_rx) = manager.register_dataflow(df_id, &[1], 16).await;
@@ -2227,7 +2242,8 @@ mod tests {
             client_write,
         )]));
         let rt = tokio::runtime::Handle::current();
-        let manager = SharedPeerManager::new("peer-fail".into(), config, factory, &rt, health_tx()).unwrap();
+        let manager =
+            SharedPeerManager::new("peer-fail".into(), config, factory, &rt, health_tx()).unwrap();
 
         // Drop the remote side to cause write failures
         drop(server_read);
@@ -2261,7 +2277,9 @@ mod tests {
             client_write,
         )]));
         let rt = tokio::runtime::Handle::current();
-        let manager = SharedPeerManager::new("peer-monitor".into(), config, factory, &rt, health_tx()).unwrap();
+        let manager =
+            SharedPeerManager::new("peer-monitor".into(), config, factory, &rt, health_tx())
+                .unwrap();
 
         // Drop remote sides
         drop(_server_write);
@@ -2295,7 +2313,9 @@ mod tests {
             client_write,
         )]));
         let rt = tokio::runtime::Handle::current();
-        let manager = SharedPeerManager::new("peer-notify".into(), config, factory, &rt, health_tx()).unwrap();
+        let manager =
+            SharedPeerManager::new("peer-notify".into(), config, factory, &rt, health_tx())
+                .unwrap();
 
         // Register a dataflow
         let df_id = DataflowId::new();
@@ -2343,8 +2363,10 @@ mod tests {
 
         let (htx, mut hrx) = tokio::sync::broadcast::channel::<crate::RuntimeEvent>(16);
 
-        let factory: Arc<dyn DynConnectionFactory> =
-            Arc::new(PreEstablishedFactory::new(vec![(client_read, client_write)]));
+        let factory: Arc<dyn DynConnectionFactory> = Arc::new(PreEstablishedFactory::new(vec![(
+            client_read,
+            client_write,
+        )]));
         let rt = tokio::runtime::Handle::current();
         let manager =
             SharedPeerManager::new("peer-poison".into(), config, factory, &rt, htx).unwrap();
@@ -2370,8 +2392,7 @@ mod tests {
         manager.payload_tx.send((df_id, frame)).await.ok();
 
         // Verify: health event emitted.
-        let health_result =
-            tokio::time::timeout(Duration::from_secs(2), hrx.recv()).await;
+        let health_result = tokio::time::timeout(Duration::from_secs(2), hrx.recv()).await;
         match health_result {
             Ok(Ok(crate::RuntimeEvent::TransportDegraded { peer_id, .. })) => {
                 assert_eq!(peer_id, "peer-poison");
@@ -2380,8 +2401,7 @@ mod tests {
         }
 
         // Verify: dataflow error channel receives LockPoisoned (not ConnectionClosed).
-        let err_result =
-            tokio::time::timeout(Duration::from_secs(2), error_rx.recv()).await;
+        let err_result = tokio::time::timeout(Duration::from_secs(2), error_rx.recv()).await;
         match err_result {
             Ok(Some(TransportError::LockPoisoned { .. })) => {}
             other => panic!("expected TransportError::LockPoisoned, got {other:?}"),
@@ -2527,8 +2547,14 @@ mod tests {
             (a_from_b_1, a_to_b_1),
             (a_from_b_2, a_to_b_2),
         ]));
-        let manager_a =
-            SharedPeerManager::new("node-b".to_string(), config.clone(), a_factory, &rt, health_tx()).unwrap();
+        let manager_a = SharedPeerManager::new(
+            "node-b".to_string(),
+            config.clone(),
+            a_factory,
+            &rt,
+            health_tx(),
+        )
+        .unwrap();
 
         // Manager B: connection 0 uses (b_from_a_1, b_to_a_1), connection 1 uses (b_from_a_2, b_to_a_2)
         let b_factory: Arc<dyn DynConnectionFactory> = Arc::new(PreEstablishedFactory::new(vec![
@@ -2536,7 +2562,8 @@ mod tests {
             (b_from_a_2, b_to_a_2),
         ]));
         let manager_b =
-            SharedPeerManager::new("node-a".to_string(), config, b_factory, &rt, health_tx()).unwrap();
+            SharedPeerManager::new("node-a".to_string(), config, b_factory, &rt, health_tx())
+                .unwrap();
 
         let df_id = DataflowId::new();
         let _reg_a = manager_a.register_dataflow(df_id, &[1], 64).await;
@@ -2631,9 +2658,14 @@ mod tests {
         ]));
         let reconnect_factory: Arc<dyn DynConnectionFactory> = factory.clone();
         let rt = tokio::runtime::Handle::current();
-        let manager =
-            SharedPeerManager::new("peer-reconnect".into(), config, reconnect_factory, &rt, health_tx())
-                .unwrap();
+        let manager = SharedPeerManager::new(
+            "peer-reconnect".into(),
+            config,
+            reconnect_factory,
+            &rt,
+            health_tx(),
+        )
+        .unwrap();
 
         let df_id = DataflowId::new();
         let (mut receivers, _error_rx) = manager.register_dataflow(df_id, &[1], 64).await;
@@ -2689,7 +2721,8 @@ mod tests {
 
         // Simulate high RTT
         pool.connection(0)
-            .unwrap().unwrap()
+            .unwrap()
+            .unwrap()
             .record_rtt(Duration::from_millis(10));
 
         // Evaluate scaling — should recommend scale up
@@ -2718,9 +2751,16 @@ mod tests {
             Arc::new(PreEstablishedFactory::new(vec![(stream_1a, stream_1b)]));
         let factory2: Arc<dyn DynConnectionFactory> =
             Arc::new(PreEstablishedFactory::new(vec![(stream_2a, stream_2b)]));
-        let mgr1 =
-            SharedPeerManager::new("peer-1".to_string(), config.clone(), factory1, &rt, health_tx()).unwrap();
-        let mgr2 = SharedPeerManager::new("peer-2".to_string(), config, factory2, &rt, health_tx()).unwrap();
+        let mgr1 = SharedPeerManager::new(
+            "peer-1".to_string(),
+            config.clone(),
+            factory1,
+            &rt,
+            health_tx(),
+        )
+        .unwrap();
+        let mgr2 = SharedPeerManager::new("peer-2".to_string(), config, factory2, &rt, health_tx())
+            .unwrap();
 
         let mut managers = HashMap::new();
         managers.insert("peer-1".to_string(), mgr1);
