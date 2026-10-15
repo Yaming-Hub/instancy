@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.3] - 2026-10-15
+
 ### Added
 - Async `spawn_cluster` API (#275)
 - Fallible pipe batch combinators (#274)
@@ -17,6 +19,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 - Prevent data loss in iterate-plus-exchange flows by accounting for in-flight messages (#280)
+- Resolve rustfmt and clippy CI failures (#283)
 
 ## [0.1.2] - 2026-05-13
 
