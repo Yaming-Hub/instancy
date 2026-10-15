@@ -8,6 +8,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- Async `spawn_cluster` API (#275)
+- Fallible pipe batch combinators (#274)
+- Stress benchmarks covering endurance, resource-constrained, and ramp-up workloads
+
+#### Documentation
+- Clarify watermark-based progress tracking in the README comparison table (#268)
+
+### Fixed
+- Prevent data loss in iterate-plus-exchange flows by accounting for in-flight messages (#280)
+
+## [0.1.2] - 2026-05-13
+
+### Added
 
 #### Observability
 - `MetricsConfig` granularity controls (`None`, `SummaryOnly`, `Full`) with zero overhead
@@ -107,8 +120,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Observability tracing tests for parallel execution (#224)
 - Shared transport race condition (#200)
 - README inaccuracies (#218)
-
-## [0.2.0] - 2026-05-05
 
 ### Added
 
