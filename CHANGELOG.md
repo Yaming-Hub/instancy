@@ -22,6 +22,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   execution completion with operator context. Clones share one frontier.
 - Make blocking multi-worker joins observe failures across all workers, and
   preserve originating errors instead of masking them with sibling cancellation.
+- Cancel execution-owned producers and sibling workers on failure even when no
+  join is being polled, including heterogeneous stages, dedicated workers, and
+  one-worker-per-node clusters. A failed query does not cancel the shared runtime.
+- Disconnect the last input sender before waking the executor to prevent a lost
+  EOF wakeup. Release completion notifier resources after publishing results.
+- Recheck ancestor cancellation after registering async notifications so failure
+  cleanup cannot miss a parent-token cancellation.
 - Add external-input throughput benchmarks for sync/async batch submission with
   and without per-batch frontier advancement.
 

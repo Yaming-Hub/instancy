@@ -227,6 +227,15 @@ When worker 2's `process` operator panics, instancy:
 2. Cancels the shared dataflow `CancellationToken`.
 3. All other workers see `Err(Cancelled)` on their next sweep and exit.
 
+An executor failure signals its execution's cancellation token before publishing
+the result. This stops async source producers and sibling workers without
+requiring a caller to poll the aggregate join. Cluster failures also trigger the
+existing best-effort peer cancellation protocol, including nodes with one worker.
+The shared runtime and unrelated dataflows are not cancelled. Cleanup remains
+cooperative: a producer or operator that blocks without yielding cannot be
+preempted, and the completion result does not wait for every source-pump thread
+to exit.
+
 Multi-worker completion observes all workers rather than waiting in worker-index
 order, cancels unresolved siblings on error, and drains their completions.
 It returns the first observed non-cancellation error when available, preserving

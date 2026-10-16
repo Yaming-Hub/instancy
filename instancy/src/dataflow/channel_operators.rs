@@ -448,6 +448,23 @@ impl<T: Timestamp, D: Send + 'static> SchedulableOperator for ChannelSinkOperato
 // InputSender / OutputReceiver — user-facing handles
 // ---------------------------------------------------------------------------
 
+#[derive(Clone, Debug)]
+struct WakeOnDrop(Option<WakeHandle>);
+
+impl WakeOnDrop {
+    fn notify(&self) {
+        if let Some(wake) = &self.0 {
+            wake.notify();
+        }
+    }
+}
+
+impl Drop for WakeOnDrop {
+    fn drop(&mut self) {
+        self.notify();
+    }
+}
+
 /// A handle for sending data into a dataflow input port.
 ///
 /// Created by [`crate::SpawnedDataflow::take_input`]. Send [`InputEvent`]s to feed
@@ -468,9 +485,8 @@ impl<T: Timestamp, D: Send + 'static> SchedulableOperator for ChannelSinkOperato
 #[derive(Clone, Debug)]
 pub struct InputSender<T: Timestamp, D: Send + 'static> {
     sender: mpsc::SyncSender<InputEvent<T, D>>,
-    /// Optional wake handle to notify the executor when data is sent.
-    /// Set during runtime spawn; None in standalone / test usage.
-    wake_handle: Option<WakeHandle>,
+    // Fields drop in declaration order: disconnect the channel before notifying.
+    wake_on_drop: WakeOnDrop,
 }
 
 impl<T: Timestamp, D: Send + 'static> InputSender<T, D> {
@@ -478,7 +494,7 @@ impl<T: Timestamp, D: Send + 'static> InputSender<T, D> {
     pub(crate) fn new(sender: mpsc::SyncSender<InputEvent<T, D>>) -> Self {
         Self {
             sender,
-            wake_handle: None,
+            wake_on_drop: WakeOnDrop(None),
         }
     }
 
@@ -489,7 +505,7 @@ impl<T: Timestamp, D: Send + 'static> InputSender<T, D> {
     ) -> Self {
         Self {
             sender,
-            wake_handle: Some(wake_handle),
+            wake_on_drop: WakeOnDrop(Some(wake_handle)),
         }
     }
 
@@ -505,9 +521,7 @@ impl<T: Timestamp, D: Send + 'static> InputSender<T, D> {
         self.sender
             .send(InputEvent::data(time, data))
             .map_err(|_| crate::error::Error::ChannelClosed)?;
-        if let Some(wh) = &self.wake_handle {
-            wh.notify();
-        }
+        self.wake_on_drop.notify();
         Ok(())
     }
 
@@ -535,30 +549,14 @@ impl<T: Timestamp, D: Send + 'static> InputSender<T, D> {
         self.sender
             .send(InputEvent::frontier(time))
             .map_err(|_| crate::error::Error::ChannelClosed)?;
-        if let Some(wh) = &self.wake_handle {
-            wh.notify();
-        }
+        self.wake_on_drop.notify();
         Ok(())
     }
 
     /// Close this input, signaling no more data will arrive.
     ///
     /// Equivalent to dropping the sender.
-    pub fn close(self) {
-        // Drop self — the SyncSender will be dropped, triggering the
-        // Drop impl which notifies the wake handle.
-    }
-}
-
-impl<T: Timestamp, D: Send + 'static> Drop for InputSender<T, D> {
-    fn drop(&mut self) {
-        // Notify the executor that an input sender was dropped. This may
-        // be the last clone, causing the channel to disconnect — the executor
-        // needs to wake up to observe the closed input and potentially complete.
-        if let Some(wh) = &self.wake_handle {
-            wh.notify();
-        }
-    }
+    pub fn close(self) {}
 }
 
 /// A handle for receiving output from a dataflow output port.
@@ -627,7 +625,8 @@ impl<T: Timestamp, D: Send + 'static> OutputReceiver<T, D> {
 #[derive(Clone)]
 pub struct AsyncInputSender<T: Timestamp, D: Send + 'static> {
     sender: tokio::sync::mpsc::Sender<InputEvent<T, D>>,
-    wake_handle: Option<WakeHandle>,
+    // Keep this after sender so the EOF wake cannot precede disconnection.
+    wake_on_drop: WakeOnDrop,
 }
 
 impl<T: Timestamp, D: Send + 'static> AsyncInputSender<T, D> {
@@ -637,7 +636,7 @@ impl<T: Timestamp, D: Send + 'static> AsyncInputSender<T, D> {
     ) -> Self {
         Self {
             sender,
-            wake_handle: Some(wake_handle),
+            wake_on_drop: WakeOnDrop(Some(wake_handle)),
         }
     }
 
@@ -664,9 +663,7 @@ impl<T: Timestamp, D: Send + 'static> AsyncInputSender<T, D> {
             .send(InputEvent::data(time, data))
             .await
             .map_err(|_| crate::error::Error::ChannelClosed)?;
-        if let Some(wh) = &self.wake_handle {
-            wh.notify();
-        }
+        self.wake_on_drop.notify();
         Ok(())
     }
 
@@ -695,26 +692,14 @@ impl<T: Timestamp, D: Send + 'static> AsyncInputSender<T, D> {
             .send(InputEvent::frontier(time))
             .await
             .map_err(|_| crate::error::Error::ChannelClosed)?;
-        if let Some(wh) = &self.wake_handle {
-            wh.notify();
-        }
+        self.wake_on_drop.notify();
         Ok(())
     }
 
     /// Close this input, signaling no more data will arrive.
     ///
     /// Equivalent to dropping the sender.
-    pub fn close(self) {
-        // Drop self — triggers the Drop impl which notifies the wake handle.
-    }
-}
-
-impl<T: Timestamp, D: Send + 'static> Drop for AsyncInputSender<T, D> {
-    fn drop(&mut self) {
-        if let Some(wh) = &self.wake_handle {
-            wh.notify();
-        }
-    }
+    pub fn close(self) {}
 }
 
 /// A handle for receiving output from a dataflow output port asynchronously.
@@ -805,6 +790,77 @@ mod tests {
     use super::*;
     use crate::dataflow::channels::bounded::bounded_channel;
     use crate::dataflow::channels::pushpull::Push;
+
+    #[test]
+    fn last_input_sender_disconnects_before_waking_executor() {
+        use std::sync::Mutex;
+        use std::task::{Wake, Waker};
+
+        struct SourceWake {
+            source: Mutex<ChannelSourceOperator<u64, i32>>,
+            wake: WakeHandle,
+        }
+        impl Wake for SourceWake {
+            fn wake(self: Arc<Self>) {
+                self.wake.take_notification();
+                self.source.lock().unwrap().activate().unwrap();
+            }
+        }
+
+        for async_io in [false, true] {
+            let wake = WakeHandle::new();
+            let (receiver, drop_first, drop_last): (_, Box<dyn FnOnce()>, Box<dyn FnOnce()>) =
+                if async_io {
+                    let (tx, rx) = tokio::sync::mpsc::channel(1);
+                    let first = AsyncInputSender::with_wake_handle(tx, wake.clone());
+                    let last = first.clone();
+                    (
+                        InputRecv::Tokio(rx),
+                        Box::new(move || first.close()),
+                        Box::new(move || drop(last)),
+                    )
+                } else {
+                    let (tx, rx) = mpsc::sync_channel(1);
+                    let first = InputSender::with_wake_handle(tx, wake.clone());
+                    let last = first.clone();
+                    (
+                        InputRecv::Std(rx),
+                        Box::new(move || first.close()),
+                        Box::new(move || drop(last)),
+                    )
+                };
+            let (push, _pull) = bounded_channel::<u64, i32, ()>(1);
+            let counter = Arc::new(AtomicUsize::new(1));
+            let reporter = ProgressReporter::new();
+            reporter.update(0, 1);
+            let executor = Arc::new(SourceWake {
+                source: Mutex::new(ChannelSourceOperator::new(
+                    "data".into(),
+                    0,
+                    StageId::new(0),
+                    receiver,
+                    Box::new(push),
+                    Some(reporter.clone()),
+                    counter.clone(),
+                )),
+                wake: wake.clone(),
+            });
+            wake.take_notification();
+            wake.register_waker(&Waker::from(executor.clone()));
+            drop_first();
+            assert!(!executor.source.lock().unwrap().is_done());
+            drop_last();
+            // Break the test waker cycle even if the assertion below fails.
+            wake.clear_waker();
+            assert!(
+                executor.source.lock().unwrap().is_done() || wake.take_notification(),
+                "EOF must be observed or followed by a fresh wake; async_io={async_io}"
+            );
+            executor.source.lock().unwrap().activate().unwrap();
+            assert_eq!(counter.load(Ordering::SeqCst), 0);
+            assert!(reporter.drain().is_empty());
+        }
+    }
 
     fn frontier_source<T: Timestamp>(
         events: Vec<InputEvent<T, i32>>,

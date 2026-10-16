@@ -170,6 +170,109 @@ async fn make_tcp_shared_managers(
 // Tests
 // ===========================================================================
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn input_protocol_failure_cancels_remote_worker_with_shared_connections_kept_alive() {
+    let topology = ClusterTopology::multi_node(vec![
+        NodeConfig::new("node-a", 1),
+        NodeConfig::new("node-b", 1),
+    ])
+    .unwrap();
+    let handle = tokio::runtime::Handle::current();
+    let (managers_a, managers_b) = make_tcp_shared_managers(test_shared_config(), 1, &handle).await;
+    let managers_a = Arc::new(managers_a);
+    let managers_b = Arc::new(managers_b);
+    let rt_a = RuntimeHandle::new(RuntimeConfig {
+        worker_threads: 1,
+        ..Default::default()
+    })
+    .unwrap();
+    let rt_b = RuntimeHandle::new(RuntimeConfig {
+        worker_threads: 1,
+        ..Default::default()
+    })
+    .unwrap();
+    let id = DataflowId::new();
+    let build = |builder: &mut DataflowBuilder<u64>| -> Result<()> {
+        builder.input::<i32>("data")?.for_each("sink", |_t, _v| {});
+        Ok(())
+    };
+    let (a, b) = tokio::join!(
+        rt_a.spawn_cluster_async(
+            "input-failure",
+            topology.clone(),
+            "node-a",
+            id,
+            ClusterSpawnTransport::shared(managers_a.clone(), 16),
+            TEST_TIMEOUT,
+            build,
+            &handle,
+            SpawnOptions::new(),
+        ),
+        rt_b.spawn_cluster_async(
+            "input-failure",
+            topology,
+            "node-b",
+            id,
+            ClusterSpawnTransport::shared(managers_b.clone(), 16),
+            TEST_TIMEOUT,
+            build,
+            &handle,
+            SpawnOptions::new(),
+        ),
+    );
+    let (mut a, mut b) = (a.unwrap(), b.unwrap());
+    let input_a = a.take_input::<i32>(0, "data").unwrap();
+    let held_input_b = b.take_input::<i32>(0, "data").unwrap();
+    input_a.advance_to(11).unwrap();
+    input_a.send(10, vec![1]).unwrap();
+    drop(input_a);
+    let error = tokio::time::timeout(TEST_TIMEOUT, a.join().unwrap())
+        .await
+        .unwrap()
+        .unwrap_err();
+    let instancy::Error::Operator {
+        source,
+        worker_index,
+        ..
+    } = error
+    else {
+        panic!("expected originating input error, got {error:?}");
+    };
+    assert_eq!(worker_index, Some(0));
+    assert!(matches!(
+        source.downcast_ref::<instancy::Error>(),
+        Some(instancy::Error::Progress(
+            instancy::ProgressError::InputTimeBeforeFrontier { .. }
+        ))
+    ));
+
+    // Observe cleanup before polling B's completion and while its producer remains open.
+    let stopped = tokio::time::timeout(Duration::from_secs(3), rt_b.wait_idle()).await;
+    if stopped.is_err() {
+        b.cancel();
+    }
+    let remote = tokio::time::timeout(TEST_TIMEOUT, b.join().unwrap())
+        .await
+        .unwrap();
+    drop(held_input_b);
+    assert!(
+        stopped.is_ok(),
+        "remote worker must stop despite retained shared connections/input"
+    );
+    assert!(
+        matches!(
+            remote,
+            Err(instancy::Error::Cancelled {
+                reason: Some(instancy::CancellationReason::PeerCancelled { .. }),
+            })
+        ),
+        "remote cancellation should identify the peer, got {remote:?}"
+    );
+    assert!(!rt_a.is_shutdown() && !rt_b.is_shutdown());
+    // Keep shared managers alive until after both results so socket teardown cannot mask failure.
+    drop((managers_a, managers_b));
+}
+
 /// Two-node cluster with shared transport, no exchange edges (just handshake).
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn shared_two_nodes_no_exchange() {

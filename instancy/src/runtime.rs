@@ -1663,7 +1663,7 @@ impl RuntimeHandle {
             return Err(Error::Runtime(RuntimeError::EmptyDataflow));
         }
 
-        let parent = parent_cancel.unwrap_or_else(|| self.cancel.clone());
+        let parent = parent_cancel.as_ref().unwrap_or(&self.cancel);
         let cancel = parent.child_token();
         let cancel_handle = cancel.clone();
         let external_inputs_open = Arc::new(AtomicUsize::new(0));
@@ -1751,7 +1751,8 @@ impl RuntimeHandle {
             executor.set_control_broadcast(sender, receiver);
         }
 
-        let (completion, notifier) = DataflowCompletion::new();
+        let (completion, mut notifier) = DataflowCompletion::new();
+        notifier.cancel_on_failure(parent_cancel.unwrap_or_else(|| cancel_handle.clone()));
 
         // Capture metrics handle before executor is moved into the registry.
         let metrics = executor.metrics().cloned();
@@ -2599,7 +2600,8 @@ impl RuntimeHandle {
                     feedback_release,
                     dataflow.loop_inflight_counters.clone(),
                 ));
-            let (completion, notifier) = DataflowCompletion::new();
+            let (completion, mut notifier) = DataflowCompletion::new();
+            notifier.cancel_on_failure(dataflow_cancel.clone());
 
             for (pump_idx, pump) in pump_tasks.into_iter().enumerate() {
                 std::thread::Builder::new()
@@ -3764,13 +3766,14 @@ impl SimpleRuntime {
     /// handle.join()?;
     /// ```
     pub fn spawn<T: Timestamp>(&self, dataflow: LogicalDataflow<T>) -> Result<SpawnedDataflow<T>> {
-        self.spawn_with_context(dataflow, WorkerContext::single())
+        self.spawn_with_context(dataflow, WorkerContext::single(), None)
     }
 
     fn spawn_with_context<T: Timestamp>(
         &self,
         mut dataflow: LogicalDataflow<T>,
         worker_context: WorkerContext,
+        parent_cancel: Option<CancellationToken>,
     ) -> Result<SpawnedDataflow<T>> {
         if dataflow.operator_factories.is_empty()
             && dataflow.input_port_wiring.is_empty()
@@ -3779,7 +3782,7 @@ impl SimpleRuntime {
             return Err(Error::Runtime(RuntimeError::EmptyDataflow));
         }
 
-        let cancel = self.cancel.child_token();
+        let cancel = parent_cancel.as_ref().unwrap_or(&self.cancel).child_token();
         let cancel_handle = cancel.clone();
         let external_inputs_open = Arc::new(AtomicUsize::new(0));
         let name = dataflow.name().to_string();
@@ -3863,7 +3866,8 @@ impl SimpleRuntime {
         external_inputs_open.store(input_count, std::sync::atomic::Ordering::SeqCst);
         executor.replace_external_inputs_counter(external_inputs_open);
 
-        let (completion, notifier) = DataflowCompletion::new();
+        let (completion, mut notifier) = DataflowCompletion::new();
+        notifier.cancel_on_failure(parent_cancel.unwrap_or_else(|| cancel_handle.clone()));
         let metrics = executor.metrics().cloned();
 
         // --- Spawn async source pump tasks ---
@@ -3971,12 +3975,13 @@ impl SimpleRuntime {
         }
 
         // Phase 4: Spawn all workers on dedicated threads.
+        let dataflow_cancel = self.cancel.child_token();
         let mut workers = Vec::with_capacity(num_workers);
         let mut spawned_count = 0usize;
 
         for (worker_idx, dataflow) in dataflows.into_iter().enumerate() {
             let ctx = WorkerContext::new(worker_idx, num_workers)?;
-            match self.spawn_with_context(dataflow, ctx) {
+            match self.spawn_with_context(dataflow, ctx, Some(dataflow_cancel.clone())) {
                 Ok(spawned) => {
                     workers.push(spawned);
                     spawned_count += 1;
@@ -4003,7 +4008,7 @@ impl SimpleRuntime {
             name: name.to_string(),
             num_workers,
             workers,
-            _dataflow_cancel: None, // SimpleRuntime uses dedicated threads, not shared task pool
+            _dataflow_cancel: Some(dataflow_cancel),
             _phantom: PhantomData,
         })
     }
@@ -4034,9 +4039,16 @@ pub struct CompletionNotifier {
     shared: Arc<Mutex<SharedCompletionState>>,
     condvar: Arc<Condvar>,
     on_complete: Option<Box<dyn FnOnce() + Send>>,
+    failure_cancel: Option<CancellationToken>,
+    completed: bool,
 }
 
 impl CompletionNotifier {
+    /// Stop this execution's producers and siblings even when nobody polls its join.
+    fn cancel_on_failure(&mut self, cancel: CancellationToken) {
+        self.failure_cancel = Some(cancel);
+    }
+
     /// Attach a callback that fires when the notifier completes or is dropped.
     ///
     /// Used by `RuntimeHandle` to track active dataflow count.
@@ -4046,6 +4058,14 @@ impl CompletionNotifier {
 
     /// Publish the executor result and wake any waiting future/condvar.
     pub fn complete(mut self, result: Result<bool>) {
+        if let Err(error) = &result {
+            if let Some(cancel) = &self.failure_cancel {
+                cancel.cancel_with_reason(CancellationReason::WorkerFailed {
+                    detail: error.to_string(),
+                });
+            }
+        }
+        self.completed = true;
         {
             let mut state = match self.shared.lock() {
                 Ok(s) => s,
@@ -4057,19 +4077,23 @@ impl CompletionNotifier {
             }
             self.condvar.notify_all();
         }
-        // Fire on_complete callback before forgetting self.
+        // Fire the lifecycle callback once, then release the notifier's resources.
         if let Some(cb) = self.on_complete.take() {
             cb();
         }
-        // Prevent Drop from publishing a second result.
-        // Safety: shared/condvar Arcs are leaked but the DataflowCompletion
-        // side still holds clones that will clean up.
-        std::mem::forget(self);
     }
 }
 
 impl Drop for CompletionNotifier {
     fn drop(&mut self) {
+        if self.completed {
+            return;
+        }
+        if let Some(cancel) = &self.failure_cancel {
+            cancel.cancel_with_reason(CancellationReason::WorkerFailed {
+                detail: "dataflow executor terminated unexpectedly (possible panic)".into(),
+            });
+        }
         // Executor panicked or was killed without publishing a result.
         let mut state = match self.shared.lock() {
             Ok(s) => s,
@@ -4146,6 +4170,8 @@ impl DataflowCompletion {
             shared,
             condvar,
             on_complete: None,
+            failure_cancel: None,
+            completed: false,
         };
         (completion, notifier)
     }
@@ -6121,6 +6147,38 @@ mod tests {
         let result = completion.wait();
         assert!(result.is_err());
         assert!(format!("{}", result.unwrap_err()).contains("unexpectedly"));
+    }
+
+    #[test]
+    fn completion_publication_releases_resources_and_cancels_only_on_failure() {
+        for failed in [false, true] {
+            let (completion, mut notifier) = DataflowCompletion::new();
+            let shared = Arc::downgrade(&completion.shared);
+            let token = CancellationToken::new();
+            notifier.cancel_on_failure(token.clone());
+            let result = if failed {
+                Err(Error::ChannelClosed)
+            } else {
+                Ok(true)
+            };
+            notifier.complete(result);
+            assert_eq!(token.is_cancelled(), failed);
+            assert_eq!(completion.wait().is_err(), failed);
+            assert!(
+                shared.upgrade().is_none(),
+                "published notifier must not leak completion state"
+            );
+        }
+    }
+
+    #[test]
+    fn dropped_notifier_cancels_failed_execution_without_a_join_waiter() {
+        let (completion, mut notifier) = DataflowCompletion::new();
+        let token = CancellationToken::new();
+        notifier.cancel_on_failure(token.clone());
+        drop(notifier);
+        assert!(token.is_cancelled());
+        assert!(completion.wait().is_err());
     }
 
     #[tokio::test]

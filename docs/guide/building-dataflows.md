@@ -79,6 +79,10 @@ cancellation can stop execution before queued events are examined. Dropping a
 pending async send/advance future does not enqueue that event; cancelling after
 a successful enqueue does not retract it.
 
+An input protocol failure signals cancellation for that execution's source
+producers and sibling workers even before the caller polls a join. It does not
+cancel other queries sharing the runtime. Async producer cleanup is cooperative.
+
 ### Async Sources
 
 An **async source** lets you define the data-producing logic at build time
