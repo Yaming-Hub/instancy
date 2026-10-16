@@ -1,8 +1,8 @@
 //! Input event types and stream-driven input binding.
 //!
-//! The input system bridges external async data sources into the dataflow graph.
-//! External data arrives as [`InputEvent`]s through a [`TimestampedInput`] trait,
-//! which is consumed by the `from_stream` operator.
+//! [`InputEvent`] defines the contract used by channel-backed runtime inputs.
+//! [`TimestampedInput`] and its adapters describe event sources; they do not
+//! independently execute dataflows or validate their progress.
 
 use std::fmt;
 
@@ -12,7 +12,7 @@ use crate::progress::timestamp::Timestamp;
 ///
 /// Input streams produce a sequence of these events. `Data` events carry
 /// timestamped batches of records, while `Frontier` events advance the
-/// input frontier (indicating no more data at or before that timestamp).
+/// input frontier (an inclusive lower bound in the timestamp partial order).
 #[derive(Debug, Clone, PartialEq)]
 pub enum InputEvent<T: Timestamp, D> {
     /// A batch of records at a given timestamp.
@@ -22,8 +22,10 @@ pub enum InputEvent<T: Timestamp, D> {
         /// The records in this batch.
         data: Vec<D>,
     },
-    /// Advance the input frontier past the given timestamp.
-    /// After this event, no `Data` events with `time <= frontier` will arrive.
+    /// Advance the input's inclusive frontier to the given timestamp.
+    /// Every subsequent data time must satisfy `frontier.less_equal(&time)`.
+    /// Equal data times are valid; earlier or incomparable times are not.
+    /// Frontier updates themselves must be monotonic in that partial order.
     Frontier(T),
 }
 

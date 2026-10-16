@@ -874,6 +874,14 @@ fn plan_node_to_factory(node: &LogicalPlan) -> OperatorFactory {
 
 ### 5.4.6 Input Streams
 
+**Implementation contract:** Channel-backed `input()` and `source_async()` sources
+validate data and frontier events in receive order against an inclusive
+partial-order lower bound. Cloned senders share that bound. Invalid events fail
+execution with structured progress errors. See the
+[input frontier contract](../guide/building-dataflows.md#input-frontier-contract).
+The stream-binding API and per-timestamp capability algorithm below describe the
+original design, not an additional implemented `from_stream` execution path.
+
 The executor accepts a dataflow definition that binds external async streams as inputs. Instead of the caller imperatively calling `input.send()` and `input.advance_to()`, the dataflow is driven by `TimestampedInput` streams — async streams that yield timestamped data. The library reads from these streams, manages capabilities and frontier advancement automatically, and the dataflow makes progress reactively as data arrives.
 
 ```rust
@@ -3168,4 +3176,3 @@ The total work scales with `sum(parallelisms)` not `stages × max(parallelism)`.
 For production dataflows with many stages at varying parallelism, this
 eliminates significant wasted computation in ghost operator progress
 tracking.
-

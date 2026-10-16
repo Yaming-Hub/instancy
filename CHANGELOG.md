@@ -7,6 +7,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Input contract hardening
+
+- **BREAKING:** Invalid input/frontier sequences that were previously accepted
+  now fail execution. `ProgressError` gains two variants; downstream exhaustive
+  matches must handle them. The input API and valid timestamp semantics are unchanged.
+- Reject input data below or incomparable with the committed frontier, including
+  empty batches, with `ProgressError::InputTimeBeforeFrontier`.
+- Reject backward or incomparable input frontier updates with
+  `ProgressError::InvalidInputFrontier` instead of only logging a warning.
+  Equal frontiers and equal-time data remain valid.
+- Apply validation in receive order for sync inputs, async inputs, and
+  `source_async`. Sending successfully means enqueued; protocol errors reach
+  execution completion with operator context. Clones share one frontier.
+- Make blocking multi-worker joins observe failures across all workers, and
+  preserve originating errors instead of masking them with sibling cancellation.
+- Add external-input throughput benchmarks for sync/async batch submission with
+  and without per-batch frontier advancement.
+
 ### Added
 
 #### Observability

@@ -227,8 +227,11 @@ When worker 2's `process` operator panics, instancy:
 2. Cancels the shared dataflow `CancellationToken`.
 3. All other workers see `Err(Cancelled)` on their next sweep and exit.
 
-The `join_blocking()` call returns the first error, with full operator and
-worker context attached.
+Multi-worker completion observes all workers rather than waiting in worker-index
+order, cancels unresolved siblings on error, and drains their completions.
+It returns the first observed non-cancellation error when available, preserving
+the originating operator/worker context instead of a sibling's cancellation.
+This applies to `join_blocking()`, `join().wait()`, and `join().await`.
 
 ## Graceful Shutdown Recipes
 

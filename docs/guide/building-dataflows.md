@@ -49,7 +49,35 @@ sender.send(1u64, vec!["goodbye".into()]).unwrap();
 sender.close();  // Signal no more data — this is critical for termination!
 ```
 
-**Important**: Always close your inputs when done. If you forget, the dataflow will wait forever for more data. Dropping the sender also closes the input.
+**Important**: Drop or close every sender when done. Closing one clone does not close the others; the input closes when its last sender is dropped.
+
+#### Input frontier contract
+
+`advance_to(t)` commits an inclusive lower bound: every subsequent data timestamp
+`s` must satisfy `t.less_equal(&s)` in the timestamp's **partial order**. Data at
+`t` is valid. Earlier or incomparable data is invalid, including empty batches.
+Frontier updates must also be monotonic; equal updates are no-ops. This API
+represents a single timestamp frontier, not an arbitrary antichain.
+
+An input batch boundary is not an epoch boundary. Keep repeated timestamps open
+across batches until the source can establish a safe frontier, or close at EOF.
+Data need not arrive sorted while it remains at or beyond the frontier. At a
+maximum timestamp, close the input rather than incrementing the timestamp.
+
+Sync and async senders, including those passed to `source_async`, use the same
+source-side validation. `send`/`advance_to` success means **enqueued**, not
+validated or processed. Invalid events fail execution with
+`ProgressError::InputTimeBeforeFrontier` or `ProgressError::InvalidInputFrontier`,
+wrapped in operator/worker context. Always observe the completion result;
+already delivered output is not rolled back after failure.
+
+Clones are writers to one logical input on one worker, sharing one frontier.
+Coordinate all writers before advancing it; a pending send may not yet be in the
+queue. Events are validated in receive order. Different worker inputs have
+independent frontiers. Backpressure can delay validation, and dataflow
+cancellation can stop execution before queued events are examined. Dropping a
+pending async send/advance future does not enqueue that event; cancelling after
+a successful enqueue does not retract it.
 
 ### Async Sources
 

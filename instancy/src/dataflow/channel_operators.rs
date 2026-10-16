@@ -24,7 +24,7 @@ use crate::dataflow::operators::input::InputEvent;
 use crate::dataflow::operators::output::OutputEvent;
 use crate::dataflow::schedulable::{ActivationOutcome, SchedulableOperator};
 use crate::dataflow::stage::StageId;
-use crate::error::Result;
+use crate::error::{ProgressError, Result};
 use crate::progress::operate::ProgressReporter;
 use crate::progress::timestamp::Timestamp;
 
@@ -131,6 +131,8 @@ pub struct ChannelSourceOperator<T: Timestamp, D: Send + 'static> {
     /// The timestamp of the currently held capability. Starts at T::minimum()
     /// and advances when Frontier events are received.
     current_capability: T,
+    /// Until the first advance, Timestamp::minimum() permits every valid time.
+    frontier_advanced: bool,
     done: bool,
 }
 
@@ -155,6 +157,7 @@ impl<T: Timestamp, D: Send + 'static> ChannelSourceOperator<T, D> {
             progress_reporter,
             external_inputs_open,
             current_capability: T::minimum(),
+            frontier_advanced: false,
             done: false,
         }
     }
@@ -217,6 +220,13 @@ impl<T: Timestamp, D: Send + 'static> SchedulableOperator for ChannelSourceOpera
             }
             match self.receiver.try_recv() {
                 Ok(InputEvent::Data { time, data }) => {
+                    if self.frontier_advanced && !self.current_capability.less_equal(&time) {
+                        return Err(ProgressError::InputTimeBeforeFrontier {
+                            time: format!("{time:?}"),
+                            frontier: format!("{:?}", self.current_capability),
+                        }
+                        .into());
+                    }
                     let envelope = Envelope::data(time, data);
                     match self.output_pusher.try_push(envelope) {
                         Ok(()) => {
@@ -231,27 +241,19 @@ impl<T: Timestamp, D: Send + 'static> SchedulableOperator for ChannelSourceOpera
                     }
                 }
                 Ok(InputEvent::Frontier(time)) => {
-                    // Advance the held capability to the new frontier time.
-                    // This releases the old capability and acquires a new one,
-                    // allowing downstream frontier-sensitive operators (e.g.
-                    // unary_notify) to fire notifications for completed times.
-                    //
-                    // Frontier must advance monotonically: the new time must be
-                    // >= the current capability in the partial order.
-                    if let Some(ref reporter) = self.progress_reporter {
-                        if self.current_capability.less_than(&time) {
-                            reporter.update(self.current_capability.clone(), -1);
-                            reporter.update(time.clone(), 1);
-                            self.current_capability = time;
-                        } else if time != self.current_capability {
-                            // Non-monotonic frontier: new time is incomparable or
-                            // less than current. This is a protocol violation.
-                            #[cfg(feature = "tracing")]
-                            tracing::warn!(
-                                operator = %self.name,
-                                "ignoring non-monotonic frontier advancement"
-                            );
+                    if !self.current_capability.less_equal(&time) {
+                        return Err(ProgressError::InvalidInputFrontier {
+                            from: format!("{:?}", self.current_capability),
+                            to: format!("{time:?}"),
                         }
+                        .into());
+                    }
+                    if time != self.current_capability {
+                        if let Some(ref reporter) = self.progress_reporter {
+                            reporter.downgrade(self.current_capability.clone(), time.clone());
+                        }
+                        self.current_capability = time;
+                        self.frontier_advanced = true;
                     }
                     made_progress = true;
                 }
@@ -450,9 +452,15 @@ impl<T: Timestamp, D: Send + 'static> SchedulableOperator for ChannelSinkOperato
 ///
 /// Created by [`crate::SpawnedDataflow::take_input`]. Send [`InputEvent`]s to feed
 /// data into the running dataflow. `InputSender` is **cloneable** — all
-/// clones share the same underlying channel. The channel closes only when
-/// **all** clones (including the one held by `SpawnedDataflow`) are dropped,
-/// or when [`close()`](Self::close) is called on this instance.
+/// clones share one channel and one input frontier. Producers must coordinate
+/// frontier advancement across all clones. The channel closes only when
+/// **all** senders are dropped; [`close()`](Self::close) drops just this instance.
+///
+/// Data and frontier events are validated in receive order by the source operator.
+/// Success from `send()` or `advance_to()` means enqueued, not validated.
+/// Protocol violations fail execution with an [`crate::Error::Progress`] wrapped
+/// in operator context; observe them through the dataflow's completion handle.
+/// Already delivered output is not rolled back on failure.
 ///
 /// When a `WakeHandle` is wired (set during runtime spawn), every `send()`,
 /// `advance_to()`, and `Drop` notifies the executor's wake handle so
@@ -490,6 +498,9 @@ impl<T: Timestamp, D: Send + 'static> InputSender<T, D> {
     /// # Errors
     ///
     /// Returns an error if the dataflow has already terminated.
+    /// The batch time must be at or beyond the committed frontier in the partial
+    /// order, including for empty batches. Violations are reported by execution,
+    /// not necessarily by this call. Batch timestamps need not arrive sorted.
     pub fn send(&self, time: T, data: Vec<D>) -> Result<()> {
         self.sender
             .send(InputEvent::data(time, data))
@@ -502,10 +513,15 @@ impl<T: Timestamp, D: Send + 'static> InputSender<T, D> {
 
     /// Advance the input frontier to `time`.
     ///
-    /// This declares that all data for timestamps **before** `time` has been
-    /// sent. After this call, only `send()` with timestamps `>= time` is
-    /// valid. Downstream `unary_notify` operators will receive notifications
-    /// for any completed timestamps.
+    /// All subsequent data times `s` must satisfy `time.less_equal(&s)` in the
+    /// partial order. Equality is valid; earlier or incomparable times are not.
+    /// The frontier itself must advance monotonically; repeating it is a no-op.
+    /// Invalid advances fail execution with [`ProgressError::InvalidInputFrontier`].
+    ///
+    /// Coordinate all clones before advancing: pending sends have not necessarily
+    /// been enqueued. This scalar frontier cannot express an antichain of
+    /// incomparable times. At the maximum timestamp, close the input to finish
+    /// rather than trying to increment the timestamp.
     ///
     /// # Example
     ///
@@ -604,6 +620,10 @@ impl<T: Timestamp, D: Send + 'static> OutputReceiver<T, D> {
 /// When a `WakeHandle` is wired (set during runtime spawn), every `send()`,
 /// `advance_to()`, and `Drop` notifies the executor's wake handle so
 /// that a sleeping async executor wakes promptly when external data arrives.
+///
+/// Uses the same shared-frontier and execution-time validation contract as
+/// [`InputSender`]. Clones are writers to one logical input, not independent
+/// progress holders. Only dropping the last sender closes that input.
 #[derive(Clone)]
 pub struct AsyncInputSender<T: Timestamp, D: Send + 'static> {
     sender: tokio::sync::mpsc::Sender<InputEvent<T, D>>,
@@ -630,6 +650,15 @@ impl<T: Timestamp, D: Send + 'static> AsyncInputSender<T, D> {
     /// # Errors
     ///
     /// Returns an error if the dataflow has already terminated.
+    /// The time must be at or beyond the committed frontier in the partial order.
+    /// Success means enqueued; violations surface through execution completion.
+    ///
+    /// # Cancellation
+    ///
+    /// Dropping a pending send future does not enqueue its batch (the batch is
+    /// dropped). Once this call succeeds, cancelling the caller does not retract
+    /// the event. Dataflow cancellation may stop execution before queued events
+    /// are validated.
     pub async fn send(&self, time: T, data: Vec<D>) -> Result<()> {
         self.sender
             .send(InputEvent::data(time, data))
@@ -643,10 +672,15 @@ impl<T: Timestamp, D: Send + 'static> AsyncInputSender<T, D> {
 
     /// Advance the input frontier to `time`.
     ///
-    /// This declares that all data for timestamps **before** `time` has been
-    /// sent. After this call, only `send()` with timestamps `>= time` is
-    /// valid. Downstream `unary_notify` operators will receive notifications
-    /// for any completed timestamps.
+    /// All subsequent data times `s` must satisfy `time.less_equal(&s)` in the
+    /// partial order. Equal updates are no-ops; backward or incomparable advances
+    /// fail execution with [`ProgressError::InvalidInputFrontier`].
+    ///
+    /// Coordinate all writers before advancing; a blocked send is not yet
+    /// enqueued. Dropping a pending advance future does not enqueue its update.
+    /// Success means enqueued, not validated or processed. Backpressure can delay
+    /// validation. This scalar frontier cannot express an antichain of
+    /// incomparable times. Close the last sender to finish at a maximum time.
     ///
     /// # Example
     ///
@@ -771,6 +805,236 @@ mod tests {
     use super::*;
     use crate::dataflow::channels::bounded::bounded_channel;
     use crate::dataflow::channels::pushpull::Push;
+
+    fn frontier_source<T: Timestamp>(
+        events: Vec<InputEvent<T, i32>>,
+        async_io: bool,
+        reporting: bool,
+        capacity: usize,
+    ) -> (
+        ChannelSourceOperator<T, i32>,
+        impl Pull<T, i32>,
+        ProgressReporter<T>,
+    ) {
+        let receiver = if async_io {
+            let (tx, rx) = tokio::sync::mpsc::channel(events.len().max(1));
+            for event in events {
+                tx.try_send(event).unwrap();
+            }
+            InputRecv::Tokio(rx)
+        } else {
+            let (tx, rx) = mpsc::sync_channel(events.len());
+            for event in events {
+                tx.send(event).unwrap();
+            }
+            InputRecv::Std(rx)
+        };
+        let reporter = ProgressReporter::new();
+        reporter.update(T::minimum(), 1);
+        let (push, pull) = bounded_channel::<T, i32, ()>(capacity);
+        let source = ChannelSourceOperator::new(
+            "frontier_input".into(),
+            0,
+            StageId::new(0),
+            receiver,
+            Box::new(push),
+            reporting.then(|| reporter.clone()),
+            Arc::new(AtomicUsize::new(1)),
+        );
+        (source, pull, reporter)
+    }
+
+    #[test]
+    fn input_frontier_rejects_late_data_before_forwarding_even_after_disconnect() {
+        for async_io in [false, true] {
+            for reporting in [false, true] {
+                for late_batch in [vec![2], vec![]] {
+                    let (mut source, mut pull, _) = frontier_source(
+                        vec![
+                            InputEvent::data(10u64, vec![1]),
+                            InputEvent::frontier(11),
+                            InputEvent::data(10, late_batch),
+                        ],
+                        async_io,
+                        reporting,
+                        16,
+                    );
+                    assert!(
+                        matches!(
+                            source.activate(),
+                            Err(crate::Error::Progress(ProgressError::InputTimeBeforeFrontier {
+                                time, frontier
+                            })) if time == "10" && frontier == "11"
+                        ),
+                        "late data must fail execution"
+                    );
+                    assert_eq!(pull.pull().unwrap().as_data(), Some((&10, &vec![1])));
+                    assert!(pull.pull().is_none(), "invalid data must not be forwarded");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn input_frontier_rejects_backward_advance_without_changing_progress() {
+        for async_io in [false, true] {
+            let (mut source, _pull, reporter) = frontier_source(
+                vec![InputEvent::frontier(5u64), InputEvent::frontier(3)],
+                async_io,
+                true,
+                16,
+            );
+            assert!(matches!(
+                source.activate(),
+                Err(crate::Error::Progress(ProgressError::InvalidInputFrontier { from, to }))
+                    if from == "5" && to == "3"
+            ));
+            assert_eq!(reporter.drain(), vec![(5, 1)]);
+        }
+    }
+
+    #[test]
+    fn input_frontier_uses_partial_not_lexicographic_order() {
+        use crate::order::Product;
+        for async_io in [false, true] {
+            for reporting in [false, true] {
+                for invalid in [
+                    InputEvent::data(Product::new(2u64, 2u64), vec![1]),
+                    InputEvent::frontier(Product::new(2u64, 2u64)),
+                ] {
+                    let (mut source, mut pull, _) = frontier_source(
+                        vec![InputEvent::frontier(Product::new(1, 3)), invalid],
+                        async_io,
+                        reporting,
+                        16,
+                    );
+                    assert!(source.activate().is_err(), "incomparable times are invalid");
+                    assert!(pull.pull().is_none());
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn input_frontier_allows_equal_repeated_and_out_of_order_data() {
+        for async_io in [false, true] {
+            let (mut source, mut pull, reporter) = frontier_source(
+                vec![
+                    InputEvent::frontier(i64::MIN),
+                    InputEvent::data(i64::MIN, vec![0]),
+                    InputEvent::frontier(-5),
+                    InputEvent::frontier(-5),
+                    InputEvent::data(10, vec![1]),
+                    InputEvent::data(-5, vec![2]),
+                    InputEvent::data(-5, vec![3]),
+                    InputEvent::frontier(i64::MAX),
+                    InputEvent::data(i64::MAX, vec![4]),
+                ],
+                async_io,
+                true,
+                16,
+            );
+            assert!(matches!(
+                source.activate().unwrap(),
+                ActivationOutcome::Done
+            ));
+            let mut observed = Vec::new();
+            while let Some(envelope) = pull.pull() {
+                let (time, data) = envelope.as_data().unwrap();
+                observed.push((*time, data.clone()));
+            }
+            assert_eq!(
+                observed,
+                vec![
+                    (i64::MIN, vec![0]),
+                    (10, vec![1]),
+                    (-5, vec![2]),
+                    (-5, vec![3]),
+                    (i64::MAX, vec![4])
+                ]
+            );
+            assert!(
+                reporter.drain().is_empty(),
+                "last sender releases the frontier"
+            );
+        }
+    }
+
+    #[test]
+    fn input_frontier_cannot_overtake_backpressured_data() {
+        for async_io in [false, true] {
+            let (mut source, mut pull, reporter) = frontier_source(
+                vec![
+                    InputEvent::data(10u64, vec![1]),
+                    InputEvent::data(10, vec![2]),
+                    InputEvent::frontier(11),
+                    InputEvent::data(10, vec![3]),
+                ],
+                async_io,
+                true,
+                1,
+            );
+            assert!(matches!(
+                source.activate().unwrap(),
+                ActivationOutcome::BlockedOnBackpressure
+            ));
+            assert_eq!(reporter.drain(), vec![(0, 1)]);
+            assert_eq!(pull.pull().unwrap().as_data(), Some((&10, &vec![1])));
+            assert!(source.activate().is_err());
+            assert_eq!(pull.pull().unwrap().as_data(), Some((&10, &vec![2])));
+            assert!(pull.pull().is_none());
+        }
+    }
+
+    #[tokio::test]
+    async fn input_frontier_cancelled_async_calls_do_not_enqueue_events() {
+        use std::future::Future;
+        use std::task::{Context, Poll, Waker};
+
+        let (tx, rx) = tokio::sync::mpsc::channel(1);
+        let sender = AsyncInputSender::with_wake_handle(tx, WakeHandle::new());
+        let (push, mut pull) = bounded_channel::<u64, i32, ()>(4);
+        let reporter = ProgressReporter::new();
+        reporter.update(0, 1);
+        let mut source = ChannelSourceOperator::new(
+            "data".into(),
+            0,
+            StageId::new(0),
+            InputRecv::Tokio(rx),
+            Box::new(push),
+            Some(reporter.clone()),
+            Arc::new(AtomicUsize::new(1)),
+        );
+        sender.send(0, vec![1]).await.unwrap();
+        {
+            let mut advance = Box::pin(sender.advance_to(11));
+            assert!(matches!(
+                advance
+                    .as_mut()
+                    .poll(&mut Context::from_waker(Waker::noop())),
+                Poll::Pending
+            ));
+        }
+        source.activate().unwrap();
+        assert_eq!(reporter.drain(), vec![(0, 1)]);
+        sender.send(10, vec![2]).await.unwrap();
+        {
+            let mut send = Box::pin(sender.send(12, vec![3]));
+            assert!(matches!(
+                send.as_mut().poll(&mut Context::from_waker(Waker::noop())),
+                Poll::Pending
+            ));
+        }
+        drop(sender);
+        assert!(matches!(
+            source.activate().unwrap(),
+            ActivationOutcome::Done
+        ));
+        assert_eq!(pull.pull().unwrap().as_data(), Some((&0, &vec![1])));
+        assert_eq!(pull.pull().unwrap().as_data(), Some((&10, &vec![2])));
+        assert!(pull.pull().is_none());
+        assert_eq!(reporter.drain(), vec![(0, -1)]);
+    }
 
     #[test]
     fn channel_source_receives_data() {
