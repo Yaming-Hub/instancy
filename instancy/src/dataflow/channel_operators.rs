@@ -1042,6 +1042,49 @@ mod tests {
         }
     }
 
+    #[test]
+    fn branched_input_preserves_batches_and_progress_under_backpressure() {
+        use crate::dataflow::channels::tee::TeePush;
+
+        let (tx, rx) = mpsc::sync_channel(4);
+        let (a, mut a_rx) = bounded_channel::<u64, i32, ()>(1);
+        let (mut b, mut b_rx) = bounded_channel::<u64, i32, ()>(1);
+        b.push(Envelope::data(11, vec![-1])).unwrap();
+        let tee = TeePush::new(vec![Box::new(a), Box::new(b)]).unwrap();
+        let reporter = ProgressReporter::new();
+        reporter.update(0, 1);
+        let mut source = ChannelSourceOperator::new(
+            "branched".into(),
+            0,
+            StageId::new(0),
+            InputRecv::Std(rx),
+            Box::new(tee),
+            Some(reporter.clone()),
+            Arc::new(AtomicUsize::new(1)),
+        );
+        tx.send(InputEvent::frontier(11)).unwrap();
+        tx.send(InputEvent::data(11, vec![1, 2])).unwrap();
+        tx.send(InputEvent::frontier(12)).unwrap();
+        drop(tx);
+        assert!(matches!(
+            source.activate().unwrap(),
+            ActivationOutcome::BlockedOnBackpressure
+        ));
+        assert_eq!(reporter.drain(), vec![(11, 1)]);
+        assert_eq!(a_rx.pull().unwrap().as_data(), Some((&11, &vec![1, 2])));
+        assert_eq!(b_rx.pull().unwrap().as_data(), Some((&11, &vec![-1])));
+        assert!(matches!(
+            source.activate().unwrap(),
+            ActivationOutcome::Done
+        ));
+        assert_eq!(b_rx.pull().unwrap().as_data(), Some((&11, &vec![1, 2])));
+        assert!(
+            a_rx.pull().is_none() && b_rx.pull().is_none(),
+            "no duplicate or minimum-time placeholder"
+        );
+        assert_eq!(reporter.drain(), vec![(11, -1)]);
+    }
+
     #[tokio::test]
     async fn input_frontier_cancelled_async_calls_do_not_enqueue_events() {
         use std::future::Future;

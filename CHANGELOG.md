@@ -29,6 +29,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   EOF wakeup. Release completion notifier resources after publishing results.
 - Recheck ancestor cancellation after registering async notifications so failure
   cleanup cannot miss a parent-token cancellation.
+- Fix fan-out retries to return the original envelope and resume at the first
+  undelivered branch instead of losing data or injecting empty minimum-time batches.
+  **BREAKING for custom channel callers:** retry an envelope returned by `try_push`
+  unchanged before submitting another, or close/drop the pusher to abandon it;
+  `TeePush::flush` no longer retries internally retained data.
 - Add external-input throughput benchmarks for sync/async batch submission with
   and without per-batch frontier advancement.
 
