@@ -88,8 +88,8 @@ struct PoolState {
     /// Condition variable for parking idle threads. Arc-wrapped so the
     /// executor registry can share it for unified wake/park.
     park_condvar: Arc<Condvar>,
-    /// Mutex paired with the condvar (only used for waiting, not data protection).
-    park_mutex: Mutex<()>,
+    /// Serializes the final queue check and wait with every queue notification.
+    park_mutex: Arc<Mutex<()>>,
     /// Current number of active (non-idle) threads.
     active_count: AtomicUsize,
     /// Total number of live threads.
@@ -106,6 +106,8 @@ struct PoolState {
     /// When set, worker threads also poll executor tasks from this registry's
     /// ready queue alongside one-shot tasks from the injector.
     executor_registry: Mutex<Option<Arc<ExecutorRegistry>>>,
+    #[cfg(test)]
+    before_park: Mutex<Option<Box<dyn FnOnce() + Send>>>,
 }
 
 impl PoolState {
@@ -113,7 +115,7 @@ impl PoolState {
         Self {
             injector: Injector::new(),
             park_condvar: Arc::new(Condvar::new()),
-            park_mutex: Mutex::new(()),
+            park_mutex: Arc::new(Mutex::new(())),
             active_count: AtomicUsize::new(0),
             thread_count: AtomicUsize::new(0),
             shutdown: AtomicBool::new(false),
@@ -121,6 +123,8 @@ impl PoolState {
             tasks_completed: AtomicUsize::new(0),
             config,
             executor_registry: Mutex::new(None),
+            #[cfg(test)]
+            before_park: Mutex::new(None),
         }
     }
 }
@@ -170,7 +174,12 @@ impl WorkerPool {
             self.try_spawn_thread();
         }
 
-        // Wake a parked thread
+        // Serialize with the worker's final queue check and entry into wait.
+        let _guard = self
+            .state
+            .park_mutex
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         self.state.park_condvar.notify_one();
     }
 
@@ -243,11 +252,11 @@ impl WorkerPool {
                 resource: "ExecutorRegistry for this pool".into(),
             }));
         }
-        // Share the pool's condvar so executor wakeups unpark worker threads.
-        let registry = Arc::new(ExecutorRegistry::new(
-            Arc::clone(&self.state.park_condvar),
-            schedule_policy,
-        ));
+        // Share both halves of the wake/park protocol with executor enqueues.
+        let registry = Arc::new(
+            ExecutorRegistry::new(Arc::clone(&self.state.park_condvar), schedule_policy)
+                .with_pool_park_mutex(Arc::clone(&self.state.park_mutex)),
+        );
         *guard = Some(Arc::clone(&registry));
         Ok(registry)
     }
@@ -448,6 +457,11 @@ fn worker_thread_loop(state: &PoolState) {
 
             let parked_at = Instant::now();
 
+            #[cfg(test)]
+            if let Some(before_park) = state.before_park.lock().unwrap().take() {
+                before_park();
+            }
+
             let guard = match state.park_mutex.lock() {
                 Ok(g) => g,
                 Err(_) => return, // mutex poisoned, exit thread gracefully
@@ -459,6 +473,21 @@ fn worker_thread_loop(state: &PoolState) {
             // see it here (no lost wakeup possible).
             if state.shutdown.load(Ordering::Acquire) {
                 return;
+            }
+
+            // Work can arrive after the dequeue attempts above. Recheck while
+            // holding the same mutex enqueuers acquire before notifying, so a
+            // notification cannot fall between this check and entering wait.
+            let has_injector_work = !state.injector.is_empty();
+            let has_executor_work = state
+                .executor_registry
+                .lock()
+                .ok()
+                .and_then(|g| g.as_ref().map(|r| !r.is_empty()))
+                .unwrap_or(false);
+            if has_injector_work || has_executor_work {
+                idle_cycles = 0;
+                continue;
             }
 
             let _result = match state
@@ -508,6 +537,232 @@ fn worker_thread_loop(state: &PoolState) {
 mod tests {
     use super::*;
     use std::sync::atomic::AtomicU32;
+
+    fn check_enqueue_between_empty_check_and_park(executor: bool) {
+        let state = Arc::new(PoolState::new(WorkerPoolConfig {
+            min_threads: 1,
+            max_threads: 1,
+            idle_shutdown: Duration::from_secs(30),
+            spin_limit: 1,
+            yield_limit: 2,
+        }));
+        let (before_park_tx, before_park_rx) = std::sync::mpsc::sync_channel(1);
+        let (resume_tx, resume_rx) = std::sync::mpsc::sync_channel(0);
+        *state.before_park.lock().unwrap() = Some(Box::new(move || {
+            before_park_tx.send(()).unwrap();
+            resume_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        }));
+        let pool = WorkerPool {
+            state,
+            threads: Mutex::new(Vec::new()),
+        };
+        let registry = pool.create_registry(None).unwrap();
+        pool.spawn_thread().unwrap();
+        before_park_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+
+        let (polled_tx, polled_rx) = std::sync::mpsc::sync_channel(1);
+        if executor {
+            let (_completion, notifier) = crate::runtime::DataflowCompletion::new();
+            registry.register(
+                Box::pin(async move {
+                    polled_tx.send(()).unwrap();
+                    Ok(true)
+                }),
+                notifier,
+                crate::dataflow::DataflowId::new(),
+                0,
+            );
+        } else {
+            pool.submit(OperatorActivation::new(
+                crate::worker::WorkerId::new(0),
+                "queued-before-park",
+                0,
+                move || polled_tx.send(()).unwrap(),
+            ));
+        }
+        resume_tx.send(()).unwrap();
+        let polled = polled_rx.recv_timeout(Duration::from_secs(1));
+        pool.shutdown();
+        assert!(
+            polled.is_ok(),
+            "work queued before parking must not wait for the 30-second idle timeout"
+        );
+    }
+
+    #[test]
+    fn executor_enqueued_between_empty_check_and_park_is_polled() {
+        check_enqueue_between_empty_check_and_park(true);
+    }
+
+    #[test]
+    fn activation_enqueued_between_empty_check_and_park_is_executed() {
+        check_enqueue_between_empty_check_and_park(false);
+    }
+
+    #[cfg(feature = "transport")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn wake_race_shared_cluster_completes_when_registered_before_park() {
+        use crate::communication::ClusterSpawnTransport;
+        use crate::communication::shared_pool::SharedConnectionConfig;
+        use crate::communication::shared_transport::{ConnectionFactory, SharedPeerManager};
+        use crate::{ClusterTopology, DataflowBuilder, DataflowId, NodeConfig};
+        use crate::{RuntimeConfig, RuntimeHandle, SpawnOptions};
+        use std::collections::HashMap;
+        use tokio::io::{DuplexStream, ReadHalf, WriteHalf};
+
+        struct DuplexFactory(Mutex<Option<DuplexStream>>);
+        impl ConnectionFactory for DuplexFactory {
+            type Reader = ReadHalf<DuplexStream>;
+            type Writer = WriteHalf<DuplexStream>;
+
+            async fn establish(
+                &self,
+                _peer_node_id: &str,
+            ) -> Result<(Self::Reader, Self::Writer), Box<dyn std::error::Error + Send + Sync>>
+            {
+                let stream = self
+                    .0
+                    .lock()
+                    .unwrap()
+                    .take()
+                    .ok_or("connection already taken")?;
+                Ok(tokio::io::split(stream))
+            }
+        }
+
+        let handle = tokio::runtime::Handle::current();
+        let config = SharedConnectionConfig {
+            max_connections: 1,
+            probe_interval: Duration::from_secs(3600),
+            idle_timeout: None,
+            ..Default::default()
+        };
+        let manager = |peer: &str, stream| {
+            Arc::new(HashMap::from([(
+                peer.to_string(),
+                SharedPeerManager::new(
+                    peer.to_string(),
+                    config.clone(),
+                    Arc::new(DuplexFactory(Mutex::new(Some(stream)))),
+                    &handle,
+                    tokio::sync::broadcast::channel(16).0,
+                )
+                .unwrap(),
+            )]))
+        };
+        let (stream_a, stream_b) = tokio::io::duplex(65536);
+        let managers_a = manager("node-b", stream_a);
+        let managers_b = manager("node-a", stream_b);
+        let runtime = || {
+            RuntimeHandle::new(RuntimeConfig {
+                worker_threads: 1,
+                ..Default::default()
+            })
+            .unwrap()
+        };
+        let rt_a = runtime();
+        let rt_b = runtime();
+        let pool = rt_a.worker_pool();
+        let (before_park_tx, before_park_rx) = std::sync::mpsc::sync_channel(1);
+        let (resume_tx, resume_rx) = std::sync::mpsc::sync_channel(0);
+        *pool.state.before_park.lock().unwrap() = Some(Box::new(move || {
+            before_park_tx.send(()).unwrap();
+            resume_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+        }));
+
+        // Only the setup loop wakes an already parked worker. Stop waking it
+        // once the hook has captured the empty-check/park gap.
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            {
+                let _guard = pool.state.park_mutex.lock().unwrap();
+                pool.state.park_condvar.notify_one();
+            }
+            if before_park_rx
+                .recv_timeout(Duration::from_millis(10))
+                .is_ok()
+            {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "worker did not reach the park hook"
+            );
+        }
+
+        let topology = ClusterTopology::multi_node(vec![
+            NodeConfig::new("node-a", 1),
+            NodeConfig::new("node-b", 1),
+        ])
+        .unwrap();
+        let dataflow_id = DataflowId::new();
+        let build = |builder: &mut DataflowBuilder<u64>| -> crate::Result<()> {
+            builder
+                .input::<u64>("data")?
+                .map("identity", |_time, value| value)
+                .exchange("by-value", |value| *value)
+                .map("increment", |_time, value| value + 1)
+                .output("results")?;
+            Ok(())
+        };
+        let (ca, cb) = tokio::join!(
+            rt_a.spawn_cluster_async(
+                "park-race",
+                topology.clone(),
+                "node-a",
+                dataflow_id,
+                ClusterSpawnTransport::shared(managers_a.clone(), 1024),
+                Duration::from_secs(5),
+                build,
+                &handle,
+                SpawnOptions::new(),
+            ),
+            rt_b.spawn_cluster_async(
+                "park-race",
+                topology,
+                "node-b",
+                dataflow_id,
+                ClusterSpawnTransport::shared(managers_b.clone(), 1024),
+                Duration::from_secs(5),
+                build,
+                &handle,
+                SpawnOptions::new(),
+            ),
+        );
+        let mut ca = ca.unwrap();
+        let mut cb = cb.unwrap();
+        let out_a = ca.take_output::<u64>(0, "results").unwrap();
+        let out_b = cb.take_output::<u64>(0, "results").unwrap();
+        let input = ca.take_input::<u64>(0, "data").unwrap();
+        input.send(1, vec![0, 1, 2, 3, 4]).unwrap();
+        drop(input);
+        drop(cb.take_input::<u64>(0, "data").unwrap());
+        let completion_a = ca.join().unwrap();
+        let completion_b = cb.join().unwrap();
+        assert_eq!(pool.registry().unwrap().ready_count(), 1);
+
+        // Registration and every input wake have already happened; no timer or
+        // socket shutdown may rescue node-a's missed queue notification.
+        resume_tx.send(()).unwrap();
+        let joined = tokio::time::timeout(Duration::from_secs(2), async {
+            tokio::join!(completion_a, completion_b)
+        })
+        .await;
+        pool.shutdown();
+        rt_b.worker_pool().shutdown();
+        let (a, b) = joined.expect("shared cluster join stalled on work queued before parking");
+        a.unwrap();
+        b.unwrap();
+        let mut records: Vec<_> = out_a
+            .collect_data()
+            .into_iter()
+            .chain(out_b.collect_data())
+            .flat_map(|(_, data)| data)
+            .collect();
+        records.sort_unstable();
+        assert_eq!(records, vec![1, 2, 3, 4, 5]);
+        drop((managers_a, managers_b));
+    }
 
     #[test]
     fn config_default_is_valid() {

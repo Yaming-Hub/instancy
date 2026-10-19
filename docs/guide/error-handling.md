@@ -105,6 +105,20 @@ handle.join_blocking().unwrap();
 
 This is useful when you want to stop a long-running or streaming dataflow without affecting others on the same runtime.
 
+#### Cancelling a Worker in a Multi-Worker Dataflow
+
+Worker handles are not independently removable participants. If
+`multi.worker_mut(i).cancel()` makes that worker complete with
+`Err(Error::Cancelled { .. })`, its completion cancels sibling workers in the
+same dataflow, even before the aggregate join is polled. This prevents dependent
+workers from continuing to wait for a participant that has stopped.
+
+When the shared dataflow token was not already cancelled, this propagation
+records `CancellationReason::WorkerFailed`; the initiating worker retains its
+own cancellation reason. First-cancellation-wins applies to each token, not to
+one global reason across the token hierarchy. Prefer `multi.cancel()` to request
+cancellation of the entire computation. Unrelated dataflows are unaffected.
+
 #### Cancelling All Dataflows (Runtime Shutdown)
 
 To shut down every dataflow on a runtime at once:
@@ -227,8 +241,20 @@ When worker 2's `process` operator panics, instancy:
 2. Cancels the shared dataflow `CancellationToken`.
 3. All other workers see `Err(Cancelled)` on their next sweep and exit.
 
-The `join_blocking()` call returns the first error, with full operator and
-worker context attached.
+An executor failure signals its execution's cancellation token before publishing
+the result. This stops async source producers and sibling workers without
+requiring a caller to poll the aggregate join. Cluster failures also trigger the
+existing best-effort peer cancellation protocol, including nodes with one worker.
+The shared runtime and unrelated dataflows are not cancelled. Cleanup remains
+cooperative: a producer or operator that blocks without yielding cannot be
+preempted, and the completion result does not wait for every source-pump thread
+to exit.
+
+Multi-worker completion observes all workers rather than waiting in worker-index
+order, cancels unresolved siblings on error, and drains their completions.
+It returns the first observed non-cancellation error when available, preserving
+the originating operator/worker context instead of a sibling's cancellation.
+This applies to `join_blocking()`, `join().wait()`, and `join().await`.
 
 ## Graceful Shutdown Recipes
 

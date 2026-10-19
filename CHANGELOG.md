@@ -7,6 +7,36 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Input contract hardening
+
+- **BREAKING:** Invalid input/frontier sequences that were previously accepted
+  now fail execution. `ProgressError` gains two variants; downstream exhaustive
+  matches must handle them. The input API and valid timestamp semantics are unchanged.
+- Reject input data below or incomparable with the committed frontier, including
+  empty batches, with `ProgressError::InputTimeBeforeFrontier`.
+- Reject backward or incomparable input frontier updates with
+  `ProgressError::InvalidInputFrontier` instead of only logging a warning.
+  Equal frontiers and equal-time data remain valid.
+- Apply validation in receive order for sync inputs, async inputs, and
+  `source_async`. Sending successfully means enqueued; protocol errors reach
+  execution completion with operator context. Clones share one frontier.
+- Make blocking multi-worker joins observe failures across all workers, and
+  preserve originating errors instead of masking them with sibling cancellation.
+- Cancel execution-owned producers and sibling workers on failure even when no
+  join is being polled, including heterogeneous stages, dedicated workers, and
+  one-worker-per-node clusters. A failed query does not cancel the shared runtime.
+- Disconnect the last input sender before waking the executor to prevent a lost
+  EOF wakeup. Release completion notifier resources after publishing results.
+- Recheck ancestor cancellation after registering async notifications so failure
+  cleanup cannot miss a parent-token cancellation.
+- Fix fan-out retries to return the original envelope and resume at the first
+  undelivered branch instead of losing data or injecting empty minimum-time batches.
+  **BREAKING for custom channel callers:** retry an envelope returned by `try_push`
+  unchanged before submitting another, or close/drop the pusher to abandon it;
+  `TeePush::flush` no longer retries internally retained data.
+- Add external-input throughput benchmarks for sync/async batch submission with
+  and without per-batch frontier advancement.
+
 ## [0.1.3] - 2026-10-15
 
 ### Added

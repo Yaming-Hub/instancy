@@ -4,19 +4,10 @@
 //! copies to all downstream pushers. The last target receives the original
 //! envelope (avoiding one clone).
 //!
-//! # Backpressure limitation
-//!
-//! Because `TeePush` distributes to multiple independent targets, atomic
-//! `try_push` semantics cannot be guaranteed: if the first target accepts
-//! but the second rejects, the data has already been partially delivered.
-//! For this reason, `try_push` degrades to `push` semantics — the envelope
-//! is always consumed, and any partial-delivery failure returns an error
-//! without the envelope. Callers should not rely on retrieving the envelope
-//! from `try_push` when using `TeePush`.
-//!
-//! This is acceptable for the current synchronous execution model where
-//! backpressure in bounded channels is unlikely. Async execution (Phase C)
-//! will revisit backpressure handling with a proper reserve/commit protocol.
+//! On backpressure, `try_push` returns the original envelope and remembers the
+//! first undelivered target. Retry that envelope before submitting another one.
+//! This preserves order and avoids duplicate delivery without buffering hidden
+//! data or manufacturing a placeholder timestamp.
 
 use crate::dataflow::channels::envelope::Envelope;
 use crate::dataflow::channels::pushpull::Push;
@@ -31,10 +22,12 @@ use crate::progress::timestamp::Timestamp;
 ///
 /// # Backpressure handling
 ///
-/// If a downstream target returns an error (e.g., backpressure) after some
-/// targets have already received data, `TeePush` stores the envelope internally
-/// and retries delivery to remaining targets on the next `push()` or `flush()`
-/// call. This avoids both data loss and duplicate delivery.
+/// `try_push` can partially deliver before returning backpressure. The caller
+/// retains the original envelope and must retry it unchanged until accepted,
+/// or close/drop the pusher to abandon delivery. `flush()` cannot substitute for
+/// retrying: the caller, not the tee, owns the pending data and its progress.
+/// Like other `Push` implementations, the consuming `push()` loses data on
+/// failure; use `try_push()` for recoverable backpressure.
 ///
 /// # Type parameters
 ///
@@ -47,10 +40,8 @@ pub struct TeePush<
     M: Clone + Default + Send + 'static = (),
 > {
     targets: Vec<Box<dyn Push<T, D, M>>>,
-    /// Partially-delivered envelope: (envelope, next_target_index).
-    /// When a target returns an error mid-delivery, we store the envelope
-    /// and the index of the first undelivered target for retry.
-    pending: Option<(Envelope<T, D, M>, usize)>,
+    /// The caller owns the retry envelope; only the delivery cursor stays here.
+    retry_from: Option<usize>,
     closed: bool,
 }
 
@@ -70,7 +61,7 @@ impl<T: Timestamp, D: Clone + Send + 'static, M: Clone + Default + Send + 'stati
         }
         Ok(Self {
             targets,
-            pending: None,
+            retry_from: None,
             closed: false,
         })
     }
@@ -78,34 +69,6 @@ impl<T: Timestamp, D: Clone + Send + 'static, M: Clone + Default + Send + 'stati
     /// Returns the number of downstream targets.
     pub fn target_count(&self) -> usize {
         self.targets.len()
-    }
-
-    /// Drain any pending partial delivery, retrying from where we left off.
-    /// Returns Ok(()) if pending was drained (or there was nothing pending).
-    fn drain_pending(&mut self) -> Result<()> {
-        if let Some((envelope, start_idx)) = self.pending.take() {
-            self.deliver(envelope, start_idx)?
-        }
-        Ok(())
-    }
-
-    /// Deliver an envelope to targets[start_idx..], cloning for all but the last.
-    /// On partial failure, stores remaining work in `self.pending`.
-    fn deliver(&mut self, envelope: Envelope<T, D, M>, start_idx: usize) -> Result<()> {
-        let count = self.targets.len();
-        // Deliver clones to all targets except the last one in range.
-        for i in start_idx..count.saturating_sub(1) {
-            if let Err(e) = self.targets[i].push(envelope.clone()) {
-                self.pending = Some((envelope, i + 1));
-                return Err(e);
-            }
-        }
-        // Deliver original (moved) to the last target.
-        let last_idx = count - 1;
-        if last_idx >= start_idx {
-            self.targets[last_idx].push(envelope)?
-        }
-        Ok(())
     }
 }
 
@@ -117,11 +80,16 @@ impl<T: Timestamp, D: Clone + Send + 'static, M: Clone + Default + Send + 'stati
             return Err(Error::ChannelClosed);
         }
 
-        // First drain any partially-delivered envelope from a previous call.
-        self.drain_pending()?;
-
-        // Deliver to all targets.
-        self.deliver(envelope, 0)
+        if self.retry_from.is_some() {
+            return Err(Error::Dataflow(DataflowError::InvalidConfig(
+                "retry the pending tee envelope with try_push before submitting another".into(),
+            )));
+        }
+        let last = self.targets.len() - 1;
+        for target in &mut self.targets[..last] {
+            target.push(envelope.clone())?;
+        }
+        self.targets[last].push(envelope)
     }
 
     fn try_push(
@@ -132,33 +100,29 @@ impl<T: Timestamp, D: Clone + Send + 'static, M: Clone + Default + Send + 'stati
             return Err((Error::ChannelClosed, envelope));
         }
 
-        // Drain pending first; if that fails, return the NEW envelope untouched.
-        if let Err(e) = self.drain_pending() {
-            return Err((e, envelope));
+        let last = self.targets.len() - 1;
+        for index in self.retry_from.unwrap_or(0)..last {
+            if let Err((error, _)) = self.targets[index].try_push(envelope.clone()) {
+                self.retry_from = Some(index);
+                return Err((error, envelope));
+            }
         }
-
-        // Deliver to all targets. On partial failure, the envelope is stored
-        // in self.pending for retry on next push/flush — no data is lost.
-        // We return a placeholder envelope since the original is consumed
-        // (stored in pending or already delivered). Callers should NOT use
-        // the returned envelope for retry — TeePush handles retry internally.
-        self.deliver(envelope, 0).map_err(|e| {
-            (
-                e,
-                Envelope::with_metadata(
-                    crate::dataflow::channels::envelope::Payload::Data {
-                        time: T::minimum(),
-                        data: vec![],
-                    },
-                    M::default(),
-                ),
-            )
-        })
+        match self.targets[last].try_push(envelope) {
+            Ok(()) => {
+                self.retry_from = None;
+                Ok(())
+            }
+            Err(error) => {
+                self.retry_from = Some(last);
+                Err(error)
+            }
+        }
     }
 
     fn flush(&mut self) -> Result<()> {
-        // Drain any pending partial delivery first.
-        self.drain_pending()?;
+        if self.retry_from.is_some() {
+            return Err(Error::Backpressure);
+        }
 
         let mut first_error: Option<Error> = None;
         for target in &mut self.targets {
@@ -175,8 +139,7 @@ impl<T: Timestamp, D: Clone + Send + 'static, M: Clone + Default + Send + 'stati
     }
 
     fn close(&mut self) {
-        // Best-effort drain of pending data before closing.
-        let _ = self.drain_pending();
+        self.retry_from = None;
         self.closed = true;
         for target in &mut self.targets {
             target.close();
@@ -221,8 +184,76 @@ pub fn tee_or_single<
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::dataflow::channels::bounded::bounded_channel;
     use crate::dataflow::channels::envelope::Envelope;
+    use crate::dataflow::channels::pushpull::Pull;
     use std::sync::{Arc, Mutex};
+
+    #[test]
+    fn tee_retry_preserves_original_envelope_and_delivers_each_branch_once() {
+        for blocked_target in 0..3 {
+            let mut pushers = Vec::new();
+            let mut pullers = Vec::new();
+            for target in 0..3 {
+                let (mut push, pull) = bounded_channel::<u64, i32, ()>(1);
+                if target == blocked_target {
+                    push.push(Envelope::data(11, vec![-1])).unwrap();
+                }
+                pushers.push(Box::new(push) as Box<dyn Push<u64, i32>>);
+                pullers.push(pull);
+            }
+            let mut tee = TeePush::new(pushers).unwrap();
+            let original = Envelope::data(11, vec![1, 2]);
+            let (error, returned) = tee.try_push(original.clone()).unwrap_err();
+            assert!(matches!(error, Error::Backpressure));
+            assert_eq!(
+                returned, original,
+                "retry must not replace the batch or its time"
+            );
+            let (error, returned) = tee.try_push(returned).unwrap_err();
+            assert!(matches!(error, Error::Backpressure));
+            assert_eq!(returned, original);
+            assert!(matches!(tee.flush(), Err(Error::Backpressure)));
+            assert_eq!(
+                pullers[blocked_target].pull().unwrap().as_data(),
+                Some((&11, &vec![-1]))
+            );
+            tee.try_push(returned).unwrap();
+            tee.flush().unwrap();
+            for pull in &mut pullers {
+                assert_eq!(pull.pull(), Some(original.clone()));
+                assert!(
+                    pull.pull().is_none(),
+                    "already-delivered branches must not get retries"
+                );
+            }
+            tee.try_push(Envelope::data(12, vec![3])).unwrap();
+            for pull in &mut pullers {
+                assert_eq!(pull.pull().unwrap().as_data(), Some((&12, &vec![3])));
+                assert!(pull.pull().is_none());
+            }
+        }
+    }
+
+    #[test]
+    fn nested_tee_retries_preserve_control_events_without_duplicate_delivery() {
+        let (a, mut a_rx) = bounded_channel::<u64, i32, ()>(2);
+        let (mut b, mut b_rx) = bounded_channel::<u64, i32, ()>(1);
+        let (c, mut c_rx) = bounded_channel::<u64, i32, ()>(2);
+        b.push(Envelope::data(11, vec![-1])).unwrap();
+        let inner = TeePush::new(vec![Box::new(a), Box::new(b)]).unwrap();
+        let mut outer = TeePush::new(vec![Box::new(inner), Box::new(c)]).unwrap();
+        let watermark = Envelope::watermark(12);
+        let (_, retry) = outer.try_push(watermark.clone()).unwrap_err();
+        assert_eq!(retry, watermark);
+        assert_eq!(a_rx.pull(), Some(watermark.clone()));
+        assert!(c_rx.pull().is_none());
+        assert_eq!(b_rx.pull().unwrap().as_data(), Some((&11, &vec![-1])));
+        outer.try_push(retry).unwrap();
+        assert!(a_rx.pull().is_none());
+        assert_eq!(b_rx.pull(), Some(watermark.clone()));
+        assert_eq!(c_rx.pull(), Some(watermark));
+    }
 
     /// A test push target that records everything pushed to it.
     struct RecordingPush<T: Timestamp, D> {

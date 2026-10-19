@@ -26,8 +26,10 @@ pub trait Push<T: Timestamp, D, M = ()>: Send {
     ///
     /// On success, returns `Ok(())`.
     /// On failure, returns `Err((error, envelope))` so the caller can retry
-    /// without data loss. Implementors must check capacity/state *before*
-    /// consuming the envelope.
+    /// without data loss. Retry the returned envelope unchanged before submitting
+    /// another envelope, or close/drop the pusher to abandon it. Composite pushers
+    /// may have partially delivered and remember where that retry must resume.
+    /// Implementors must not replace the returned data with a placeholder.
     fn try_push(
         &mut self,
         envelope: Envelope<T, D, M>,

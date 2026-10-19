@@ -375,6 +375,11 @@ See also: [Building Dataflows](../guide/building-dataflows.md), [Custom Operator
 
 ## Inputs, Outputs, and Probes
 
+Channel-backed inputs share the [input frontier contract](../guide/building-dataflows.md#input-frontier-contract):
+frontiers are inclusive partial-order lower bounds, clones must coordinate
+advancement, and protocol validation errors are reported through execution
+completion rather than necessarily by `send` or `advance_to`.
+
 ### `InputSender<T, D>`
 
 Synchronous handle returned by `SpawnedDataflow::take_input`.
@@ -728,7 +733,7 @@ Helper constructors:
 
 ### Module-specific error enums
 
-- `ProgressError::{TimeNotAdvanced, NoDominatingCapability}`
+- `ProgressError::{TimeNotAdvanced, NoDominatingCapability, InputTimeBeforeFrontier, InvalidInputFrontier}`
 - `TopologyError::{NodeAlreadyExists, NodeNotFound, EmptyTopology, InvalidNodeConfig}`
 - `DataflowError::{InvalidConfig, InvalidGraph, MissingEndpoint, TypeMismatch, EndpointTaken, MissingFactory}`
 - `RuntimeError::{InvalidConfig, SpawnFailed, ClusterSetup, AlreadyConsumed, EmptyDataflow}` plus `#[cfg(feature = "transport")] Handshake`

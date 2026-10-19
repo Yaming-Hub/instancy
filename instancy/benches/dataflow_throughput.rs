@@ -16,7 +16,84 @@ use std::hint::black_box;
 use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
 use tokio::runtime::Runtime;
 
-use instancy::{DataflowBuilder, RuntimeConfig, RuntimeHandle, SpawnOptions};
+use instancy::{DataflowBuilder, IoMode, RuntimeConfig, RuntimeHandle, SpawnOptions};
+
+/// Exercises the external input path, including one-element batches where
+/// per-batch validation overhead is least amortized.
+fn bench_input_frontier(c: &mut Criterion) {
+    let tokio_rt = Runtime::new().unwrap();
+    let _guard = tokio_rt.enter();
+    let rt = RuntimeHandle::new(RuntimeConfig {
+        worker_threads: 2,
+        ..Default::default()
+    })
+    .unwrap();
+    let mut group = c.benchmark_group("input_frontier");
+    let batches = 16_384u64;
+    for batch_size in [1, 1024] {
+        let batch = vec![1u64; batch_size];
+        group.throughput(Throughput::Elements(batches * batch_size as u64));
+        for io_mode in [IoMode::Sync, IoMode::Async] {
+            for advance in [false, true] {
+                let backend = if matches!(io_mode, IoMode::Sync) {
+                    "sync"
+                } else {
+                    "async"
+                };
+                let progress = if advance {
+                    "advance_each_batch"
+                } else {
+                    "data_only"
+                };
+                group.bench_function(
+                    BenchmarkId::new(format!("{backend}_{progress}"), batch_size),
+                    |b| {
+                        b.iter(|| {
+                            let builder = DataflowBuilder::<u64>::new("input-frontier");
+                            builder.input::<u64>("data").unwrap().for_each_batch(
+                                "sink",
+                                |_t, data| {
+                                    black_box(data);
+                                },
+                            );
+                            let mut handle = rt
+                                .spawn(
+                                    builder.build().unwrap(),
+                                    SpawnOptions::new().io_mode(io_mode),
+                                )
+                                .unwrap();
+                            match io_mode {
+                                IoMode::Sync => {
+                                    let sender = handle.take_input::<u64>("data").unwrap();
+                                    for time in 0..batches {
+                                        sender.send(time, batch.clone()).unwrap();
+                                        if advance {
+                                            sender.advance_to(time + 1).unwrap();
+                                        }
+                                    }
+                                    drop(sender);
+                                    handle.join_blocking().unwrap();
+                                }
+                                IoMode::Async => tokio_rt.block_on(async {
+                                    let sender = handle.take_async_input::<u64>("data").unwrap();
+                                    for time in 0..batches {
+                                        sender.send(time, batch.clone()).await.unwrap();
+                                        if advance {
+                                            sender.advance_to(time + 1).await.unwrap();
+                                        }
+                                    }
+                                    drop(sender);
+                                    handle.join().await.unwrap();
+                                }),
+                            }
+                        });
+                    },
+                );
+            }
+        }
+    }
+    group.finish();
+}
 
 /// Cap worker threads at the machine's available parallelism to avoid
 /// oversubscription noise in benchmarks.
@@ -445,6 +522,7 @@ fn bench_worker_scaling(c: &mut Criterion) {
 
 criterion_group!(
     benches,
+    bench_input_frontier,
     bench_pipeline_throughput,
     bench_exchange_throughput,
     bench_spawn_latency,

@@ -115,6 +115,17 @@ Worker threads follow a **spin → yield → park → shutdown** idle strategy:
 3. **Parking** (condvar wait): Thread parks on a condition variable. Woken by a new task enqueue. Near-zero CPU usage while parked.
 4. **Shutdown**: After `idle_shutdown` duration with no work, threads above `min_threads` exit. The pool shrinks to conserve resources.
 
+Before parking, a worker rechecks both the activation queue and the executor
+registry under a shared park mutex. Both enqueue paths acquire that same mutex
+before notifying the condition variable, after releasing any queue lock. This
+prevents a notification from being lost between the final empty check and the
+wait; queued work must not depend on the idle-shutdown timer to become runnable.
+
+Executor wakes also retry if a concurrent poll changes `POLLING` to `IDLE`
+between compare-and-exchange attempts. A wake that changes `IDLE` to `QUEUED`
+enqueues the task; one that changes `POLLING` to `QUEUED` leaves re-enqueueing
+to the polling worker.
+
 **Growing the pool**: When a task is enqueued and all threads are busy (active_count == current thread count < max_threads), a new thread is spawned immediately.
 
 ```rust
@@ -873,6 +884,14 @@ fn plan_node_to_factory(node: &LogicalPlan) -> OperatorFactory {
 - The `DataflowGraph` metadata must be constructable programmatically (not only via the `.unary()` / `.binary()` extension traits) so query planners can build graphs from plan trees
 
 ### 5.4.6 Input Streams
+
+**Implementation contract:** Channel-backed `input()` and `source_async()` sources
+validate data and frontier events in receive order against an inclusive
+partial-order lower bound. Cloned senders share that bound. Invalid events fail
+execution with structured progress errors. See the
+[input frontier contract](../guide/building-dataflows.md#input-frontier-contract).
+The stream-binding API and per-timestamp capability algorithm below describe the
+original design, not an additional implemented `from_stream` execution path.
 
 The executor accepts a dataflow definition that binds external async streams as inputs. Instead of the caller imperatively calling `input.send()` and `input.advance_to()`, the dataflow is driven by `TimestampedInput` streams — async streams that yield timestamped data. The library reads from these streams, manages capabilities and frontier advancement automatically, and the dataflow makes progress reactively as data arrives.
 
@@ -3168,4 +3187,3 @@ The total work scales with `sum(parallelisms)` not `stages × max(parallelism)`.
 For production dataflows with many stages at varying parallelism, this
 eliminates significant wasted computation in ghost operator progress
 tracking.
-

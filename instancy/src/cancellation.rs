@@ -482,6 +482,11 @@ impl CancellationToken {
             tokio::pin!(notified);
             notified.as_mut().enable();
 
+            // Cancellation may precede this ancestor's notification registration.
+            if node.cancelled.load(Ordering::Acquire) {
+                return;
+            }
+
             match &node.parent {
                 None => notified.await,
                 Some(parent) => {
@@ -541,6 +546,31 @@ impl Drop for CancellationGuard {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn ancestor_cancellation_between_check_and_wait_registration_is_observed() {
+        use std::task::{Context, Waker};
+
+        for depth in [1, 3] {
+            let root = CancellationToken::new();
+            let mut child = root.clone();
+            for _ in 0..depth {
+                child = child.child_token();
+            }
+            assert!(!child.is_cancelled());
+            let mut wait =
+                CancellationToken::await_ancestor_notify(child.inner.parent.as_ref().unwrap());
+            // Model cancellation after cancelled_async's check but before its
+            // ancestor branch is first polled and registers a notification.
+            root.cancel();
+            assert!(
+                wait.as_mut()
+                    .poll(&mut Context::from_waker(Waker::noop()))
+                    .is_ready(),
+                "ancestor notification must not be lost at depth {depth}"
+            );
+        }
+    }
     use std::thread;
 
     #[test]

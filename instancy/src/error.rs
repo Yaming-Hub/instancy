@@ -161,6 +161,16 @@ impl Error {
             },
         }
     }
+
+    pub(crate) fn is_cancellation(&self) -> bool {
+        match self {
+            Self::Cancelled { .. } => true,
+            Self::Operator { source, .. } => source
+                .downcast_ref::<Self>()
+                .is_some_and(Self::is_cancellation),
+            _ => false,
+        }
+    }
 }
 
 /// A convenience type alias for `Result<T, Error>`.
@@ -169,6 +179,16 @@ pub type Result<T> = std::result::Result<T, Error>;
 /// Errors from the progress-tracking subsystem.
 #[derive(Debug, thiserror::Error)]
 pub enum ProgressError {
+    /// An external input batch violates its committed inclusive frontier.
+    #[error("input time {time} is not at or beyond committed frontier {frontier}")]
+    InputTimeBeforeFrontier { time: String, frontier: String },
+
+    /// An external input frontier moved backwards or to an incomparable time.
+    #[error(
+        "cannot advance input frontier from {from} to {to}: new time is not at or beyond the frontier"
+    )]
+    InvalidInputFrontier { from: String, to: String },
+
     /// Attempted to delay/downgrade a capability to a time that is not `>=` the current time.
     #[error("cannot advance capability from {from} to {to}: new time is not >= current time")]
     TimeNotAdvanced { from: String, to: String },

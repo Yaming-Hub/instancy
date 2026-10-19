@@ -1663,7 +1663,7 @@ impl RuntimeHandle {
             return Err(Error::Runtime(RuntimeError::EmptyDataflow));
         }
 
-        let parent = parent_cancel.unwrap_or_else(|| self.cancel.clone());
+        let parent = parent_cancel.as_ref().unwrap_or(&self.cancel);
         let cancel = parent.child_token();
         let cancel_handle = cancel.clone();
         let external_inputs_open = Arc::new(AtomicUsize::new(0));
@@ -1751,7 +1751,8 @@ impl RuntimeHandle {
             executor.set_control_broadcast(sender, receiver);
         }
 
-        let (completion, notifier) = DataflowCompletion::new();
+        let (completion, mut notifier) = DataflowCompletion::new();
+        notifier.cancel_on_failure(parent_cancel.unwrap_or_else(|| cancel_handle.clone()));
 
         // Capture metrics handle before executor is moved into the registry.
         let metrics = executor.metrics().cloned();
@@ -2599,7 +2600,8 @@ impl RuntimeHandle {
                     feedback_release,
                     dataflow.loop_inflight_counters.clone(),
                 ));
-            let (completion, notifier) = DataflowCompletion::new();
+            let (completion, mut notifier) = DataflowCompletion::new();
+            notifier.cancel_on_failure(dataflow_cancel.clone());
 
             for (pump_idx, pump) in pump_tasks.into_iter().enumerate() {
                 std::thread::Builder::new()
@@ -3764,13 +3766,14 @@ impl SimpleRuntime {
     /// handle.join()?;
     /// ```
     pub fn spawn<T: Timestamp>(&self, dataflow: LogicalDataflow<T>) -> Result<SpawnedDataflow<T>> {
-        self.spawn_with_context(dataflow, WorkerContext::single())
+        self.spawn_with_context(dataflow, WorkerContext::single(), None)
     }
 
     fn spawn_with_context<T: Timestamp>(
         &self,
         mut dataflow: LogicalDataflow<T>,
         worker_context: WorkerContext,
+        parent_cancel: Option<CancellationToken>,
     ) -> Result<SpawnedDataflow<T>> {
         if dataflow.operator_factories.is_empty()
             && dataflow.input_port_wiring.is_empty()
@@ -3779,7 +3782,7 @@ impl SimpleRuntime {
             return Err(Error::Runtime(RuntimeError::EmptyDataflow));
         }
 
-        let cancel = self.cancel.child_token();
+        let cancel = parent_cancel.as_ref().unwrap_or(&self.cancel).child_token();
         let cancel_handle = cancel.clone();
         let external_inputs_open = Arc::new(AtomicUsize::new(0));
         let name = dataflow.name().to_string();
@@ -3863,7 +3866,8 @@ impl SimpleRuntime {
         external_inputs_open.store(input_count, std::sync::atomic::Ordering::SeqCst);
         executor.replace_external_inputs_counter(external_inputs_open);
 
-        let (completion, notifier) = DataflowCompletion::new();
+        let (completion, mut notifier) = DataflowCompletion::new();
+        notifier.cancel_on_failure(parent_cancel.unwrap_or_else(|| cancel_handle.clone()));
         let metrics = executor.metrics().cloned();
 
         // --- Spawn async source pump tasks ---
@@ -3971,12 +3975,13 @@ impl SimpleRuntime {
         }
 
         // Phase 4: Spawn all workers on dedicated threads.
+        let dataflow_cancel = self.cancel.child_token();
         let mut workers = Vec::with_capacity(num_workers);
         let mut spawned_count = 0usize;
 
         for (worker_idx, dataflow) in dataflows.into_iter().enumerate() {
             let ctx = WorkerContext::new(worker_idx, num_workers)?;
-            match self.spawn_with_context(dataflow, ctx) {
+            match self.spawn_with_context(dataflow, ctx, Some(dataflow_cancel.clone())) {
                 Ok(spawned) => {
                     workers.push(spawned);
                     spawned_count += 1;
@@ -4003,7 +4008,7 @@ impl SimpleRuntime {
             name: name.to_string(),
             num_workers,
             workers,
-            _dataflow_cancel: None, // SimpleRuntime uses dedicated threads, not shared task pool
+            _dataflow_cancel: Some(dataflow_cancel),
             _phantom: PhantomData,
         })
     }
@@ -4034,9 +4039,16 @@ pub struct CompletionNotifier {
     shared: Arc<Mutex<SharedCompletionState>>,
     condvar: Arc<Condvar>,
     on_complete: Option<Box<dyn FnOnce() + Send>>,
+    failure_cancel: Option<CancellationToken>,
+    completed: bool,
 }
 
 impl CompletionNotifier {
+    /// Stop this execution's producers and siblings even when nobody polls its join.
+    fn cancel_on_failure(&mut self, cancel: CancellationToken) {
+        self.failure_cancel = Some(cancel);
+    }
+
     /// Attach a callback that fires when the notifier completes or is dropped.
     ///
     /// Used by `RuntimeHandle` to track active dataflow count.
@@ -4046,6 +4058,14 @@ impl CompletionNotifier {
 
     /// Publish the executor result and wake any waiting future/condvar.
     pub fn complete(mut self, result: Result<bool>) {
+        if let Err(error) = &result {
+            if let Some(cancel) = &self.failure_cancel {
+                cancel.cancel_with_reason(CancellationReason::WorkerFailed {
+                    detail: error.to_string(),
+                });
+            }
+        }
+        self.completed = true;
         {
             let mut state = match self.shared.lock() {
                 Ok(s) => s,
@@ -4057,19 +4077,23 @@ impl CompletionNotifier {
             }
             self.condvar.notify_all();
         }
-        // Fire on_complete callback before forgetting self.
+        // Fire the lifecycle callback once, then release the notifier's resources.
         if let Some(cb) = self.on_complete.take() {
             cb();
         }
-        // Prevent Drop from publishing a second result.
-        // Safety: shared/condvar Arcs are leaked but the DataflowCompletion
-        // side still holds clones that will clean up.
-        std::mem::forget(self);
     }
 }
 
 impl Drop for CompletionNotifier {
     fn drop(&mut self) {
+        if self.completed {
+            return;
+        }
+        if let Some(cancel) = &self.failure_cancel {
+            cancel.cancel_with_reason(CancellationReason::WorkerFailed {
+                detail: "dataflow executor terminated unexpectedly (possible panic)".into(),
+            });
+        }
         // Executor panicked or was killed without publishing a result.
         let mut state = match self.shared.lock() {
             Ok(s) => s,
@@ -4146,6 +4170,8 @@ impl DataflowCompletion {
             shared,
             condvar,
             on_complete: None,
+            failure_cancel: None,
+            completed: false,
         };
         (completion, notifier)
     }
@@ -4632,6 +4658,12 @@ impl<T: Timestamp> MultiSpawnedDataflow<T> {
 
     /// Get a mutable reference to a worker's handle for taking inputs/outputs.
     ///
+    /// This does not provide isolated worker removal. If cancelling this worker
+    /// makes it complete with an error (including `Error::Cancelled`), its
+    /// completion cancels the other workers in the same dataflow. The shared
+    /// token records `WorkerFailed` unless it already has a cancellation reason.
+    /// Use [`Self::cancel`] to request cancellation of the whole dataflow.
+    ///
     /// # Panics
     ///
     /// Panics if `worker_idx >= num_workers`.
@@ -4948,41 +4980,16 @@ impl<T: Timestamp> MultiSpawnedDataflow<T> {
     /// Wait for all workers to complete, blocking the current thread.
     ///
     /// Returns `Ok(())` if all workers ran to completion. If any worker
-    /// fails, the remaining workers are cancelled and the first error is returned.
+    /// fails, the remaining workers are cancelled. The first observed non-cancellation
+    /// error takes precedence over cancellation errors from sibling workers.
     ///
     /// # Example
     ///
     /// ```ignore
     /// multi.join_blocking().unwrap();
     /// ```
-    pub fn join_blocking(mut self) -> Result<()> {
-        let mut workers: Vec<SpawnedDataflow<T>> = std::mem::take(&mut self.workers);
-        let mut first_error: Option<Error> = None;
-
-        while !workers.is_empty() {
-            let worker = workers.remove(0);
-            match worker.join_blocking() {
-                Ok(()) => {}
-                Err(e) => {
-                    if first_error.is_none() {
-                        first_error = Some(e);
-                        // Cancel all remaining workers directly.
-                        for w in &workers {
-                            w.cancel
-                                .cancel_with_reason(CancellationReason::WorkerFailed {
-                                    detail: "sibling worker failed".into(),
-                                });
-                        }
-                    }
-                    // Continue draining remaining workers (already cancelled).
-                }
-            }
-        }
-
-        match first_error {
-            Some(e) => Err(e),
-            None => Ok(()),
-        }
+    pub fn join_blocking(self) -> Result<()> {
+        self.join().wait()
     }
 
     /// Get completion futures for all workers.
@@ -4992,6 +4999,7 @@ impl<T: Timestamp> MultiSpawnedDataflow<T> {
     ///
     /// The returned future implements [`Future`] and can be `.await`ed in
     /// async code, or blocked on via [`.wait()`](MultiDataflowCompletion::wait).
+    /// Originating failures take precedence over sibling cancellation errors.
     pub fn join(mut self) -> MultiDataflowCompletion {
         let workers = std::mem::take(&mut self.workers);
         // Collect per-worker cancel tokens so MultiDataflowCompletion can
@@ -5381,7 +5389,8 @@ impl<T: Timestamp> ClusterCompletion<T> {
     /// Block the current thread until all workers complete.
     ///
     /// Returns `Ok(())` if all workers succeeded. On first error, cancels
-    /// remaining workers and returns that error. Bridges are cancelled
+    /// remaining workers, preferring an originating failure over cancellation.
+    /// Bridges are cancelled
     /// after this method returns (when `self` drops).
     pub fn wait(mut self) -> Result<()> {
         let completion = self.completion.take().ok_or_else(|| {
@@ -5429,14 +5438,15 @@ impl<T: Timestamp> Drop for ClusterCompletion<T> {
 /// Aggregated completion handle for multiple replicated dataflow workers.
 ///
 /// Waits for all workers to finish. On first error, remaining workers are
-/// cancelled and the error is returned.
+/// cancelled. The first observed non-cancellation error is returned when
+/// available, rather than a sibling's cancellation error.
 pub struct MultiDataflowCompletion {
     /// Per-worker cancellation tokens for direct cancellation.
     worker_cancels: Vec<CancellationToken>,
     completions: Vec<DataflowCompletion>,
     /// Tracks which completions have already resolved (for Future impl).
     resolved: Vec<bool>,
-    /// First error encountered (for Future impl).
+    /// First error encountered, preferring an originating failure over cancellation.
     first_error: Option<Error>,
 }
 
@@ -5444,30 +5454,25 @@ impl MultiDataflowCompletion {
     /// Block the current thread until all workers complete.
     ///
     /// Returns `Ok(())` if all workers succeeded. On first error, cancels
-    /// remaining workers and returns that error.
-    pub fn wait(self) -> Result<()> {
-        let mut first_error: Option<Error> = None;
-
-        for (idx, completion) in self.completions.into_iter().enumerate() {
-            match completion.wait() {
-                Ok(()) => {}
-                Err(e) => {
-                    if first_error.is_none() {
-                        first_error = Some(e);
-                        // Cancel remaining workers directly.
-                        for cancel in &self.worker_cancels[idx + 1..] {
-                            cancel.cancel_with_reason(CancellationReason::WorkerFailed {
-                                detail: "sibling worker failed".into(),
-                            });
-                        }
-                    }
-                }
+    /// remaining workers. Polls all workers so a later worker's failure can
+    /// interrupt an earlier worker that is still waiting for input. Originating
+    /// failures take precedence over sibling cancellation errors.
+    pub fn wait(mut self) -> Result<()> {
+        struct CompletionWake(std::thread::Thread);
+        impl std::task::Wake for CompletionWake {
+            fn wake(self: Arc<Self>) {
+                self.0.unpark();
             }
         }
 
-        match first_error {
-            Some(e) => Err(e),
-            None => Ok(()),
+        let waker = Waker::from(Arc::new(CompletionWake(std::thread::current())));
+        let mut cx = Context::from_waker(&waker);
+        loop {
+            if let Poll::Ready(result) = Pin::new(&mut self).poll(&mut cx) {
+                return result;
+            }
+            // unpark retains a token if a completion wakes us between poll and park.
+            std::thread::park();
         }
     }
 }
@@ -5501,6 +5506,13 @@ impl Future for MultiDataflowCompletion {
                                 });
                             }
                         }
+                    } else if this
+                        .first_error
+                        .as_ref()
+                        .is_some_and(Error::is_cancellation)
+                        && !e.is_cancellation()
+                    {
+                        this.first_error = Some(e);
                     }
                 }
                 Poll::Pending => {
@@ -6141,6 +6153,38 @@ mod tests {
         let result = completion.wait();
         assert!(result.is_err());
         assert!(format!("{}", result.unwrap_err()).contains("unexpectedly"));
+    }
+
+    #[test]
+    fn completion_publication_releases_resources_and_cancels_only_on_failure() {
+        for failed in [false, true] {
+            let (completion, mut notifier) = DataflowCompletion::new();
+            let shared = Arc::downgrade(&completion.shared);
+            let token = CancellationToken::new();
+            notifier.cancel_on_failure(token.clone());
+            let result = if failed {
+                Err(Error::ChannelClosed)
+            } else {
+                Ok(true)
+            };
+            notifier.complete(result);
+            assert_eq!(token.is_cancelled(), failed);
+            assert_eq!(completion.wait().is_err(), failed);
+            assert!(
+                shared.upgrade().is_none(),
+                "published notifier must not leak completion state"
+            );
+        }
+    }
+
+    #[test]
+    fn dropped_notifier_cancels_failed_execution_without_a_join_waiter() {
+        let (completion, mut notifier) = DataflowCompletion::new();
+        let token = CancellationToken::new();
+        notifier.cancel_on_failure(token.clone());
+        drop(notifier);
+        assert!(token.is_cancelled());
+        assert!(completion.wait().is_err());
     }
 
     #[tokio::test]
@@ -8449,6 +8493,140 @@ mod tests {
         // Await the MultiDataflowCompletion as a Future.
         let result = handle.join().await;
         assert!(result.is_ok());
+    }
+
+    fn failing_multi_completion() -> MultiDataflowCompletion {
+        let (cancelled, notifier) = DataflowCompletion::new();
+        notifier.complete(Err(Error::Cancelled {
+            reason: Some(CancellationReason::WorkerFailed {
+                detail: "sibling worker failed".into(),
+            }),
+        }));
+        let (failed, notifier) = DataflowCompletion::new();
+        notifier.complete(Err(crate::error::ProgressError::TimeNotAdvanced {
+            from: "11".into(),
+            to: "10".into(),
+        }
+        .into()));
+        MultiDataflowCompletion {
+            completions: vec![cancelled, failed],
+            worker_cancels: vec![CancellationToken::new(), CancellationToken::new()],
+            resolved: vec![false; 2],
+            first_error: None,
+        }
+    }
+
+    #[test]
+    fn multi_completion_wait_preserves_failure_over_sibling_cancellation() {
+        assert!(matches!(
+            failing_multi_completion().wait(),
+            Err(Error::Progress(
+                crate::error::ProgressError::TimeNotAdvanced { .. }
+            ))
+        ));
+    }
+
+    #[tokio::test]
+    async fn multi_completion_future_preserves_failure_over_sibling_cancellation() {
+        assert!(matches!(
+            failing_multi_completion().await,
+            Err(Error::Progress(
+                crate::error::ProgressError::TimeNotAdvanced { .. }
+            ))
+        ));
+    }
+
+    #[test]
+    fn multi_completion_wait_observes_later_worker_before_waiting_on_earlier_worker() {
+        let (waiting, waiting_notifier) = DataflowCompletion::new();
+        let (failed, failed_notifier) = DataflowCompletion::new();
+        let failed_state = failed.shared.clone();
+        let waiting_cancel = CancellationToken::new();
+        let completion = MultiDataflowCompletion {
+            completions: vec![waiting, failed],
+            worker_cancels: vec![waiting_cancel.clone(), CancellationToken::new()],
+            resolved: vec![false; 2],
+            first_error: None,
+        };
+        let (tx, rx) = std::sync::mpsc::channel();
+        let join = std::thread::spawn(move || tx.send(completion.wait()).unwrap());
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        while failed_state.lock().unwrap().waker.is_none() && std::time::Instant::now() < deadline {
+            std::thread::yield_now();
+        }
+        let registered = failed_state.lock().unwrap().waker.is_some();
+        failed_notifier.complete(Err(crate::error::ProgressError::TimeNotAdvanced {
+            from: "11".into(),
+            to: "10".into(),
+        }
+        .into()));
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        while !waiting_cancel.is_cancelled() && std::time::Instant::now() < deadline {
+            std::thread::yield_now();
+        }
+        let cancelled_before_completion = waiting_cancel.is_cancelled();
+        // Always release the waiter, including on regression, so the test cannot leak a thread.
+        waiting_notifier.complete(Ok(true));
+        let result = rx.recv_timeout(std::time::Duration::from_secs(2)).unwrap();
+        join.join().unwrap();
+        assert!(
+            registered,
+            "wait must register for every worker's completion"
+        );
+        assert!(
+            cancelled_before_completion,
+            "later worker failure must cancel the waiting sibling"
+        );
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn multi_completion_preserves_failure_after_wrapped_cancellation_on_earlier_poll() {
+        for blocking in [false, true] {
+            let (cancelled, notifier) = DataflowCompletion::new();
+            notifier.complete(Err(Error::operator(
+                "wrapper",
+                Error::operator(
+                    "cancelled_op",
+                    Error::Cancelled {
+                        reason: Some(CancellationReason::WorkerFailed {
+                            detail: "sibling failed".into(),
+                        }),
+                    },
+                ),
+            )));
+            let (failed, notifier) = DataflowCompletion::new();
+            let mut completion = MultiDataflowCompletion {
+                completions: vec![cancelled, failed],
+                worker_cancels: vec![CancellationToken::new(), CancellationToken::new()],
+                resolved: vec![false; 2],
+                first_error: None,
+            };
+            assert!(
+                Pin::new(&mut completion)
+                    .poll(&mut Context::from_waker(Waker::noop()))
+                    .is_pending()
+            );
+            notifier.complete(Err(crate::error::ProgressError::InputTimeBeforeFrontier {
+                time: "10".into(),
+                frontier: "11".into(),
+            }
+            .into()));
+            let result = if blocking {
+                completion.wait()
+            } else {
+                completion.await
+            };
+            assert!(
+                matches!(
+                    result,
+                    Err(Error::Progress(
+                        crate::error::ProgressError::InputTimeBeforeFrontier { .. }
+                    ))
+                ),
+                "wrapped cancellation must not hide the later failure: {result:?}"
+            );
+        }
     }
 
     #[tokio::test]

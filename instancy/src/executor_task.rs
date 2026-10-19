@@ -93,6 +93,9 @@ pub struct ExecutorTask {
     /// Atomic task state (IDLE / QUEUED / POLLING / DONE).
     state: AtomicU8,
 
+    #[cfg(test)]
+    after_wake_idle_cas: Mutex<Option<Box<dyn FnOnce() + Send>>>,
+
     /// Unique task identifier within the registry.
     pub(crate) id: TaskId,
 }
@@ -114,6 +117,8 @@ impl ExecutorTask {
             notifier: Mutex::new(Some(notifier)),
             meta: Mutex::new(TaskMeta::new(dataflow_id, priority)),
             state: AtomicU8::new(TASK_QUEUED),
+            #[cfg(test)]
+            after_wake_idle_cas: Mutex::new(None),
             id,
         }
     }
@@ -303,29 +308,38 @@ impl ExecutorTask {
     /// after the current poll completes (the polling thread checks for this).
     pub fn try_wake(&self) -> bool {
         // Fast path: IDLE → QUEUED
-        if self
-            .state
-            .compare_exchange(TASK_IDLE, TASK_QUEUED, Ordering::AcqRel, Ordering::Acquire)
-            .is_ok()
-        {
-            return true;
-        }
-
-        // If currently POLLING, mark QUEUED so the polling thread re-enqueues
-        // after its poll returns Pending. This is NOT an enqueue by us — the
-        // polling thread will handle it. The CAS result is intentionally
-        // discarded: if it fails, the state is either QUEUED (another wake
-        // already set it) or DONE (task finished). Either way, no action needed.
-        // Multiple wakes during poll are safe: only the first POLLING→QUEUED
-        // succeeds; subsequent wakes see QUEUED and are no-ops.
-        let _ = self.state.compare_exchange(
-            TASK_POLLING,
+        let mut state = match self.state.compare_exchange(
+            TASK_IDLE,
             TASK_QUEUED,
             Ordering::AcqRel,
             Ordering::Acquire,
-        );
+        ) {
+            Ok(_) => return true,
+            Err(state) => state,
+        };
 
-        false
+        #[cfg(test)]
+        if let Some(after_cas) = self.after_wake_idle_cas.lock().unwrap().take() {
+            after_cas();
+        }
+
+        // Polling can finish between CAS attempts. Retry the observed state so
+        // POLLING→IDLE cannot discard the wake. Whoever successfully replaces
+        // IDLE owns enqueueing; replacing POLLING leaves it to the poller.
+        loop {
+            if state != TASK_IDLE && state != TASK_POLLING {
+                return false;
+            }
+            match self.state.compare_exchange(
+                state,
+                TASK_QUEUED,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => return state == TASK_IDLE,
+                Err(observed) => state = observed,
+            }
+        }
     }
 
     /// Check if this task is in the DONE state.
@@ -403,6 +417,9 @@ pub struct ExecutorRegistry {
     /// Reference to the pool's condvar for waking parked worker threads.
     /// Set during initialization; None only in tests that don't use a pool.
     pool_condvar: Option<Arc<std::sync::Condvar>>,
+
+    /// Serializes notification with the pool's final queue check and wait.
+    pool_park_mutex: Option<Arc<Mutex<()>>>,
 
     /// Next task ID counter.
     next_id: AtomicUsize,
@@ -489,8 +506,14 @@ impl ExecutorRegistry {
             ready_queue: Mutex::new(ready_queue),
             schedule_policy,
             pool_condvar: Some(pool_condvar),
+            pool_park_mutex: None,
             next_id: AtomicUsize::new(0),
         }
+    }
+
+    pub(crate) fn with_pool_park_mutex(mut self, mutex: Arc<Mutex<()>>) -> Self {
+        self.pool_park_mutex = Some(mutex);
+        self
     }
 
     /// Create a registry without pool integration (for testing).
@@ -500,6 +523,7 @@ impl ExecutorRegistry {
             ready_queue: Mutex::new(ReadyQueue::Fifo(std::collections::VecDeque::new())),
             schedule_policy: None,
             pool_condvar: None,
+            pool_park_mutex: None,
             next_id: AtomicUsize::new(0),
         }
     }
@@ -558,6 +582,12 @@ impl ExecutorRegistry {
         }
         // Notify a parked worker thread that work is available
         if let Some(cv) = &self.pool_condvar {
+            // Release ready_queue before taking this lock: workers check the
+            // queue while holding the park mutex.
+            let _guard = self
+                .pool_park_mutex
+                .as_ref()
+                .map(|mutex| mutex.lock().unwrap_or_else(|e| e.into_inner()));
             cv.notify_one();
         }
     }
@@ -773,6 +803,39 @@ mod tests {
         // (the polling thread will handle re-enqueue)
         assert!(!task.try_wake());
         assert_eq!(task.state(), TASK_QUEUED);
+    }
+
+    #[test]
+    fn wake_race_poll_finishes_between_wake_cas_attempts() {
+        let registry = Arc::new(ExecutorRegistry::new_standalone());
+        let (completion, notifier) = make_notifier();
+        let task = registry.register(
+            Box::pin(CountdownFuture { remaining: 2 }),
+            notifier,
+            DataflowId::new(),
+            0,
+        );
+        let polling = registry.dequeue().unwrap();
+        assert!(polling.try_start_poll());
+        *task.after_wake_idle_cas.lock().unwrap() = Some(Box::new(move || {
+            let mut cx = Context::from_waker(std::task::Waker::noop());
+            assert_eq!(polling.poll(&mut cx), PollOutcome::Pending);
+            assert_eq!(polling.state(), TASK_IDLE);
+        }));
+
+        let waker: std::task::Waker =
+            Arc::new(PoolWaker::new(task.clone(), registry.clone())).into();
+        waker.wake_by_ref();
+
+        let resumed = registry
+            .dequeue()
+            .expect("the wake must enqueue the executor after its poll transitions to IDLE");
+        assert_eq!(resumed.id(), task.id());
+        assert!(resumed.try_start_poll());
+        let mut cx = Context::from_waker(std::task::Waker::noop());
+        assert_eq!(resumed.poll(&mut cx), PollOutcome::Completed);
+        assert!(completion.wait().is_ok());
+        assert!(registry.is_empty());
     }
 
     #[test]
