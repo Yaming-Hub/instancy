@@ -4658,6 +4658,12 @@ impl<T: Timestamp> MultiSpawnedDataflow<T> {
 
     /// Get a mutable reference to a worker's handle for taking inputs/outputs.
     ///
+    /// This does not provide isolated worker removal. If cancelling this worker
+    /// makes it complete with an error (including `Error::Cancelled`), its
+    /// completion cancels the other workers in the same dataflow. The shared
+    /// token records `WorkerFailed` unless it already has a cancellation reason.
+    /// Use [`Self::cancel`] to request cancellation of the whole dataflow.
+    ///
     /// # Panics
     ///
     /// Panics if `worker_idx >= num_workers`.

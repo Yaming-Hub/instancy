@@ -105,6 +105,20 @@ handle.join_blocking().unwrap();
 
 This is useful when you want to stop a long-running or streaming dataflow without affecting others on the same runtime.
 
+#### Cancelling a Worker in a Multi-Worker Dataflow
+
+Worker handles are not independently removable participants. If
+`multi.worker_mut(i).cancel()` makes that worker complete with
+`Err(Error::Cancelled { .. })`, its completion cancels sibling workers in the
+same dataflow, even before the aggregate join is polled. This prevents dependent
+workers from continuing to wait for a participant that has stopped.
+
+When the shared dataflow token was not already cancelled, this propagation
+records `CancellationReason::WorkerFailed`; the initiating worker retains its
+own cancellation reason. First-cancellation-wins applies to each token, not to
+one global reason across the token hierarchy. Prefer `multi.cancel()` to request
+cancellation of the entire computation. Unrelated dataflows are unaffected.
+
 #### Cancelling All Dataflows (Runtime Shutdown)
 
 To shut down every dataflow on a runtime at once:
