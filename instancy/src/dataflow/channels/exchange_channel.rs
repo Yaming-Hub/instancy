@@ -1179,7 +1179,20 @@ pub(crate) trait NetworkExchangeCreator: Send {
     fn create(
         self: Box<Self>,
         params: NetworkMaterializerParams,
-    ) -> Vec<super::super::schedulable::ChannelFactory>;
+    ) -> Result<Vec<super::super::schedulable::ChannelFactory>>;
+
+    /// Routing kind of the edge (`"exchange"` or `"broadcast"`).
+    fn kind(&self) -> &'static str;
+
+    /// User-supplied name of the exchange.
+    fn name(&self) -> &str;
+
+    /// `std::any::type_name` of the records carried by the edge.
+    fn data_type_name(&self) -> &'static str;
+
+    /// `std::any::type_name` of the timestamps carried by the edge (for an
+    /// exchange inside `iterate`, the loop's `Product` timestamp).
+    fn timestamp_type_name(&self) -> &'static str;
 }
 
 /// Concrete implementation of [`NetworkExchangeCreator`] for specific T, D types.
@@ -1202,7 +1215,7 @@ where
     fn create(
         self: Box<Self>,
         params: NetworkMaterializerParams,
-    ) -> Vec<super::super::schedulable::ChannelFactory> {
+    ) -> Result<Vec<super::super::schedulable::ChannelFactory>> {
         let materializer = Arc::new(Mutex::new(
             super::network::NetworkEdgeMaterializer::<T, D>::new(
                 params.dataflow_id,
@@ -1214,15 +1227,31 @@ where
                 params.edge_index,
                 params.wake_handles,
                 params.runtime_handle,
-            ),
+            )?,
         ));
-        build_exchange_factories(
+        Ok(build_exchange_factories(
             params.num_workers,
             params.num_workers,
             self.exchange_fn,
             materializer,
             params.channel_metrics,
-        )
+        ))
+    }
+
+    fn kind(&self) -> &'static str {
+        "exchange"
+    }
+
+    fn name(&self) -> &str {
+        self.exchange_fn.description()
+    }
+
+    fn data_type_name(&self) -> &'static str {
+        std::any::type_name::<D>()
+    }
+
+    fn timestamp_type_name(&self) -> &'static str {
+        std::any::type_name::<T>()
     }
 }
 
@@ -1236,6 +1265,7 @@ where
     T: Timestamp + crate::communication::codec::ExchangeData,
     D: Clone + crate::communication::codec::ExchangeData,
 {
+    pub name: String,
     pub _phantom: std::marker::PhantomData<(T, D)>,
 }
 
@@ -1248,7 +1278,7 @@ where
     fn create(
         self: Box<Self>,
         params: NetworkMaterializerParams,
-    ) -> Vec<super::super::schedulable::ChannelFactory> {
+    ) -> Result<Vec<super::super::schedulable::ChannelFactory>> {
         let materializer = Arc::new(Mutex::new(
             super::network::NetworkEdgeMaterializer::<T, D>::new(
                 params.dataflow_id,
@@ -1260,9 +1290,29 @@ where
                 params.edge_index,
                 params.wake_handles,
                 params.runtime_handle,
-            ),
+            )?,
         ));
-        build_broadcast_factories(params.num_workers, params.num_workers, materializer)
+        Ok(build_broadcast_factories(
+            params.num_workers,
+            params.num_workers,
+            materializer,
+        ))
+    }
+
+    fn kind(&self) -> &'static str {
+        "broadcast"
+    }
+
+    fn name(&self) -> &str {
+        &self.name
+    }
+
+    fn data_type_name(&self) -> &'static str {
+        std::any::type_name::<D>()
+    }
+
+    fn timestamp_type_name(&self) -> &'static str {
+        std::any::type_name::<T>()
     }
 }
 

@@ -1,23 +1,29 @@
 //! Control protocol for cross-node cluster coordination.
 //!
-//! Provides handshake (fingerprint validation) and ready barrier messages
-//! exchanged via [`TransportSession`](super::TransportSession)'s control
-//! channel before dataflow execution begins.
+//! Provides handshake (protocol version, peer identity, and graph fingerprint
+//! validation) and ready barrier messages exchanged via
+//! [`TransportSession`](super::TransportSession)'s control channel before
+//! dataflow execution begins.
 //!
 //! # Protocol Flow
 //!
 //! ```text
-//! Node A                              Node B
-//!   |-- Handshake {fp, df_id} ------->|
-//!   |<------- Handshake {fp, df_id} --|
-//!   |   (both validate fingerprints)  |
-//!   |                                 |
-//!   |   ... materialize workers ...   |
-//!   |                                 |
-//!   |-- Ready {node_id} ------------->|
-//!   |<----------- Ready {node_id} ----|
-//!   |   (both proceed to execution)   |
+//! Node A                                          Node B
+//!   |-- Handshake {version, fp, df_id, "A"} ------->|
+//!   |<------- Handshake {version, fp, df_id, "B"} --|
+//!   |   (both validate version, identity, df_id, fp)|
+//!   |                                               |
+//!   |   ... materialize workers ...                 |
+//!   |                                               |
+//!   |-- Ready {"A"} ------------------------------->|
+//!   |<------------------------------- Ready {"B"} --|
+//!   |   (both validate identity, proceed)           |
 //! ```
+//!
+//! Every node checks that each peer speaks [`PROTOCOL_VERSION`], that the
+//! node id the peer reports matches the id the local node assigned to that
+//! connection, that both run the same dataflow id, and that both built the
+//! same graph for the same topology (see [`graph_fingerprint`]).
 //!
 //! # Wire Format
 //!
@@ -26,7 +32,11 @@
 //! [msg_type: u8][payload...][crc32: u32]
 //! ```
 //!
-//! - Handshake (type 0): `[0][fingerprint: u64 LE][dataflow_id: 16 bytes UUID]`
+//! - Handshake (type 0): `[0][protocol_version: u32 LE][fingerprint: u64 LE]
+//!   [dataflow_id: 16 bytes UUID][node_id_len: u32 LE][node_id: UTF-8 bytes]`.
+//!   The version always comes first so future layouts can be recognised. The
+//!   unversioned 0.1.x handshake (`[0][fingerprint: u64][dataflow_id: 16]`) is
+//!   reported as protocol version 1.
 //! - Ready (type 1): `[1][node_id_len: u32 LE][node_id: UTF-8 bytes]`
 //! - Cancel (type 2): `[2][reason_len: u32 LE][reason: UTF-8 bytes]`
 
@@ -70,7 +80,23 @@ pub enum ControlProtocolError {
     /// An error occurred reading fixed-width fields from the wire.
     #[error("wire read error: {0}")]
     WireRead(Box<crate::Error>),
+
+    /// A handshake uses a cluster protocol version this build does not speak.
+    #[error("unsupported cluster protocol version {version}")]
+    UnsupportedProtocolVersion { version: u32 },
 }
+
+/// Version of the cluster wire protocol.
+///
+/// Covers everything two nodes must agree on to run a dataflow together: the
+/// frame layout, the channel-id namespaces, the control messages, the graph
+/// fingerprint, and the key-routing hash. Nodes reject peers whose version
+/// differs during the handshake. Version 1 is the unversioned 0.1.x protocol.
+pub const PROTOCOL_VERSION: u32 = 2;
+
+/// Protocol version reported for an unversioned (0.1.x) handshake.
+#[cfg(feature = "transport")]
+const LEGACY_PROTOCOL_VERSION: u32 = 1;
 
 #[cfg(feature = "transport")]
 impl From<std::str::Utf8Error> for ControlProtocolError {
@@ -102,6 +128,21 @@ pub enum HandshakeError {
         remote: u64,
     },
 
+    /// The peer speaks a different cluster protocol version.
+    #[error(
+        "cluster protocol version mismatch with peer {peer_id}: local={local}, remote={remote}"
+    )]
+    ProtocolVersionMismatch {
+        peer_id: String,
+        local: u32,
+        remote: u32,
+    },
+
+    /// The node at the other end of the connection the local node assigned to
+    /// `peer_id` identified itself as `reported` (a miswired connection).
+    #[error("peer identity mismatch: connection for {peer_id} is connected to node {reported:?}")]
+    PeerIdentityMismatch { peer_id: String, reported: String },
+
     #[error("dataflow_id mismatch with peer {peer_id}")]
     DataflowIdMismatch { peer_id: String },
 
@@ -127,10 +168,14 @@ pub enum HandshakeError {
 #[cfg(feature = "transport")]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ControlMessage {
-    /// Handshake with graph fingerprint for compatibility validation.
+    /// Handshake with the sender's protocol version, graph fingerprint and
+    /// identity, for compatibility validation.
     Handshake {
+        protocol_version: u32,
         fingerprint: u64,
         dataflow_id: DataflowId,
+        /// Node id of the sender.
+        node_id: String,
     },
     /// Ready signal indicating the node has materialized all workers.
     Ready { node_id: String },
@@ -158,12 +203,18 @@ pub fn encode_control_message(msg: &ControlMessage) -> Vec<u8> {
     let mut buf = Vec::new();
     match msg {
         ControlMessage::Handshake {
+            protocol_version,
             fingerprint,
             dataflow_id,
+            node_id,
         } => {
             buf.push(MSG_TYPE_HANDSHAKE);
+            buf.extend_from_slice(&protocol_version.to_le_bytes());
             buf.extend_from_slice(&fingerprint.to_le_bytes());
             buf.extend_from_slice(dataflow_id.as_bytes());
+            let id_bytes = node_id.as_bytes();
+            buf.extend_from_slice(&(id_bytes.len() as u32).to_le_bytes());
+            buf.extend_from_slice(id_bytes);
         }
         ControlMessage::Ready { node_id } => {
             buf.push(MSG_TYPE_READY);
@@ -205,22 +256,52 @@ pub fn decode_control_message(data: &[u8]) -> Result<ControlMessage, ControlProt
 
     match payload[0] {
         MSG_TYPE_HANDSHAKE => {
-            // 1 (type) + 8 (fingerprint) + 16 (dataflow_id UUID) = 25
-            if payload.len() != 25 {
+            // 1 (type) + 8 (fingerprint) + 16 (dataflow_id): the unversioned
+            // 0.1.x layout. No versioned handshake can be this short.
+            if payload.len() == 25 {
+                return Err(ControlProtocolError::UnsupportedProtocolVersion {
+                    version: LEGACY_PROTOCOL_VERSION,
+                });
+            }
+            // The version comes first so that any future layout is reported
+            // as a version mismatch rather than a malformed message.
+            if payload.len() < 5 {
                 return Err(ControlProtocolError::InvalidPayloadSize {
-                    expected: 25,
+                    expected: 5,
                     actual: payload.len(),
                 });
             }
-            let fingerprint = wire::read_u64(payload, 1)
-                .map_err(|e| ControlProtocolError::WireRead(Box::new(e)))?;
-            let dataflow_id = DataflowId::from_bytes(
-                wire::read_array::<16>(payload, 9)
-                    .map_err(|e| ControlProtocolError::WireRead(Box::new(e)))?,
-            );
+            let wire_err = |e| ControlProtocolError::WireRead(Box::new(e));
+            let protocol_version = wire::read_u32(payload, 1).map_err(wire_err)?;
+            if protocol_version != PROTOCOL_VERSION {
+                return Err(ControlProtocolError::UnsupportedProtocolVersion {
+                    version: protocol_version,
+                });
+            }
+            // 1 (type) + 4 (version) + 8 (fingerprint) + 16 (dataflow_id) + 4 (id len)
+            const FIXED: usize = 33;
+            if payload.len() < FIXED {
+                return Err(ControlProtocolError::InvalidPayloadSize {
+                    expected: FIXED,
+                    actual: payload.len(),
+                });
+            }
+            let fingerprint = wire::read_u64(payload, 5).map_err(wire_err)?;
+            let dataflow_id =
+                DataflowId::from_bytes(wire::read_array::<16>(payload, 13).map_err(wire_err)?);
+            let id_len = wire::read_u32(payload, 29).map_err(wire_err)? as usize;
+            if payload.len() - FIXED != id_len {
+                return Err(ControlProtocolError::InvalidPayloadSize {
+                    expected: FIXED.saturating_add(id_len),
+                    actual: payload.len(),
+                });
+            }
+            let node_id = std::str::from_utf8(&payload[FIXED..])?.to_string();
             Ok(ControlMessage::Handshake {
+                protocol_version,
                 fingerprint,
                 dataflow_id,
+                node_id,
             })
         }
         MSG_TYPE_READY => {
@@ -270,58 +351,231 @@ pub fn decode_control_message(data: &[u8]) -> Result<ControlMessage, ControlProt
 // Fingerprint computation
 // ---------------------------------------------------------------------------
 
-/// Compute a deterministic fingerprint for a dataflow graph.
+/// Stable digest of everything two nodes must agree on to run a dataflow
+/// together.
 ///
-/// The fingerprint captures the structural identity of the graph: operator
-/// count, edges, exchange channels, feedback loops, and total worker count.
-/// Two nodes running compatible dataflows will produce the same fingerprint.
+/// Exchange edges are paired across nodes by position and progress updates
+/// name operators and ports by index, so a node that builds a different graph
+/// or uses a different topology would silently misroute data. The fingerprint
+/// covers:
 ///
-/// This is used during the handshake to detect graph mismatches before
-/// any data is exchanged.
+/// - the timestamp type;
+/// - the topology: every node id, in order, with its worker count;
+/// - every operator, ordered by index: kind (creating builder method), name,
+///   and port counts, plus any explicit exchange parallelism;
+/// - every edge and feedback edge, in order: endpoints and channel kind;
+/// - every network exchange edge, in order: graph edge index, routing kind,
+///   name, timestamp type (the loop's `Product` type inside `iterate`), and
+///   record type;
+/// - every named input and output port with its record type.
+///
+/// It is computed with [`StableHasher`](crate::hash::StableHasher), so it is
+/// identical across platforms and Rust releases. Type names come from
+/// [`std::any::type_name`]; nodes built from different crate versions of a
+/// record type may therefore disagree, which fails the handshake.
 #[cfg(feature = "transport")]
-pub fn compute_fingerprint(
-    operator_count: usize,
-    edge_count: usize,
-    exchange_edge_indices: &[usize],
-    feedback_edge_count: usize,
-    total_workers: usize,
+pub(crate) fn graph_fingerprint<T: crate::progress::timestamp::Timestamp>(
+    dataflow: &crate::dataflow::LogicalDataflow<T>,
+    topology: &crate::execute::ClusterTopology,
 ) -> u64 {
-    use std::collections::hash_map::DefaultHasher;
-    use std::hash::{Hash, Hasher};
+    use crate::hash::StableHasher;
+    use std::hash::Hasher;
 
-    let mut hasher = DefaultHasher::new();
-    operator_count.hash(&mut hasher);
-    edge_count.hash(&mut hasher);
-    feedback_edge_count.hash(&mut hasher);
-    total_workers.hash(&mut hasher);
-    // Sort exchange indices for determinism.
-    let mut sorted_exchanges = exchange_edge_indices.to_vec();
-    sorted_exchanges.sort_unstable();
-    for idx in &sorted_exchanges {
-        idx.hash(&mut hasher);
+    struct Digest(StableHasher);
+    impl Digest {
+        fn num(&mut self, v: usize) {
+            self.0.write_u64(v as u64);
+        }
+        fn text(&mut self, s: &str) {
+            self.0.write(s.as_bytes());
+        }
+        fn section(&mut self, tag: &str, len: usize) {
+            self.text(tag);
+            self.num(len);
+        }
+        fn edge(&mut self, e: &crate::dataflow::graph::EdgeInfo) {
+            self.num(e.source.operator_index);
+            self.num(e.source.slot_index);
+            self.num(e.target.operator_index);
+            self.num(e.target.slot_index);
+            self.num(match e.channel_kind {
+                crate::dataflow::graph::ChannelKind::Pipeline => 0,
+                crate::dataflow::graph::ChannelKind::Exchange => 1,
+            });
+        }
     }
-    hasher.finish()
+
+    let mut d = Digest(StableHasher::new());
+    d.text("instancy-cluster-graph");
+    d.num(PROTOCOL_VERSION as usize);
+    d.text(std::any::type_name::<T>());
+
+    d.section("nodes", topology.nodes.len());
+    for node in &topology.nodes {
+        d.text(&node.node_id);
+        d.num(node.logical_workers);
+    }
+
+    let graph = dataflow.graph();
+    let mut operators: Vec<_> = graph.operators().collect();
+    operators.sort_by_key(|op| op.index);
+    d.section("operators", operators.len());
+    for op in operators {
+        d.num(op.index);
+        d.text(graph.operator_kind(op.index).unwrap_or(""));
+        d.text(&op.name);
+        d.num(op.input_count);
+        d.num(op.output_count);
+        d.num(graph.exchange_parallelism(op.index).map_or(0, |p| p + 1));
+    }
+
+    d.section("edges", graph.edges().len());
+    for e in graph.edges() {
+        d.edge(e);
+    }
+    d.section("feedback", graph.feedback_edges().len());
+    for e in graph.feedback_edges() {
+        d.edge(e);
+    }
+
+    d.section("exchanges", dataflow.exchange_network_creators.len());
+    for (edge_idx, _capacity, creator) in &dataflow.exchange_network_creators {
+        d.num(*edge_idx);
+        d.text(creator.kind());
+        d.text(creator.name());
+        d.text(creator.timestamp_type_name());
+        d.text(creator.data_type_name());
+    }
+
+    d.section("inputs", dataflow.input_ports.len());
+    for port in &dataflow.input_ports {
+        d.text(&port.name);
+        d.num(port.operator_index);
+        d.text(port.type_name);
+    }
+    d.section("outputs", dataflow.output_ports.len());
+    for port in &dataflow.output_ports {
+        d.text(&port.name);
+        d.num(port.operator_index);
+        d.text(port.type_name);
+    }
+
+    d.0.finish()
 }
 
 // ---------------------------------------------------------------------------
 // High-level handshake + ready barrier
 // ---------------------------------------------------------------------------
 
+/// Validate the `Handshake` received on the connection the local node
+/// assigned to `peer_id`.
+#[cfg(feature = "transport")]
+fn validate_peer_handshake(
+    peer_id: &str,
+    data: &[u8],
+    local_fingerprint: u64,
+    dataflow_id: DataflowId,
+) -> Result<(), HandshakeError> {
+    let peer_msg = match decode_control_message(data) {
+        Ok(msg) => msg,
+        Err(ControlProtocolError::UnsupportedProtocolVersion { version }) => {
+            return Err(HandshakeError::ProtocolVersionMismatch {
+                peer_id: peer_id.to_string(),
+                local: PROTOCOL_VERSION,
+                remote: version,
+            });
+        }
+        Err(source) => {
+            return Err(HandshakeError::Decode {
+                peer_id: peer_id.to_string(),
+                source,
+            });
+        }
+    };
+    match peer_msg {
+        ControlMessage::Handshake {
+            protocol_version,
+            fingerprint,
+            dataflow_id: peer_df_id,
+            node_id,
+        } => {
+            if protocol_version != PROTOCOL_VERSION {
+                return Err(HandshakeError::ProtocolVersionMismatch {
+                    peer_id: peer_id.to_string(),
+                    local: PROTOCOL_VERSION,
+                    remote: protocol_version,
+                });
+            }
+            // Identity first: on a miswired connection the other checks
+            // compare against the wrong node.
+            if node_id != peer_id {
+                return Err(HandshakeError::PeerIdentityMismatch {
+                    peer_id: peer_id.to_string(),
+                    reported: node_id,
+                });
+            }
+            if peer_df_id != dataflow_id {
+                return Err(HandshakeError::DataflowIdMismatch {
+                    peer_id: peer_id.to_string(),
+                });
+            }
+            if fingerprint != local_fingerprint {
+                return Err(HandshakeError::FingerprintMismatch {
+                    peer_id: peer_id.to_string(),
+                    local: local_fingerprint,
+                    remote: fingerprint,
+                });
+            }
+            Ok(())
+        }
+        other => Err(HandshakeError::UnexpectedMessage {
+            peer_id: peer_id.to_string(),
+            expected: "Handshake".into(),
+            got: format!("{other:?}"),
+        }),
+    }
+}
+
+/// Validate the `Ready` received on the connection the local node assigned
+/// to `peer_id`.
+#[cfg(feature = "transport")]
+fn validate_peer_ready(peer_id: &str, data: &[u8]) -> Result<(), HandshakeError> {
+    let peer_msg = decode_control_message(data).map_err(|source| HandshakeError::Decode {
+        peer_id: peer_id.to_string(),
+        source,
+    })?;
+    match peer_msg {
+        ControlMessage::Ready { node_id } if node_id == peer_id => Ok(()),
+        ControlMessage::Ready { node_id } => Err(HandshakeError::PeerIdentityMismatch {
+            peer_id: peer_id.to_string(),
+            reported: node_id,
+        }),
+        other => Err(HandshakeError::UnexpectedMessage {
+            peer_id: peer_id.to_string(),
+            expected: "Ready".into(),
+            got: format!("{other:?}"),
+        }),
+    }
+}
+
 /// Perform the control handshake with all remote peers.
 ///
 /// Sends a `Handshake` message to each peer and waits to receive one back.
-/// Validates that all peers report the same fingerprint.
+/// Validates each peer's protocol version, that it identifies as the node the
+/// connection is assigned to, its dataflow id, and its graph fingerprint.
 ///
 /// # Errors
 ///
 /// Returns an error if:
-/// - Any peer's fingerprint doesn't match the local fingerprint
+/// - A peer speaks a different protocol version, reports a different node id,
+///   or reports a different dataflow id or fingerprint
 /// - A timeout expires before all peers respond
 /// - A peer sends an invalid or unexpected message
 #[cfg(feature = "transport")]
 pub async fn perform_handshake(
     session: &super::TransportSession,
     control_receivers: &mut std::collections::HashMap<String, tokio::sync::mpsc::Receiver<Vec<u8>>>,
+    local_node_id: &str,
     local_fingerprint: u64,
     dataflow_id: DataflowId,
     timeout: std::time::Duration,
@@ -330,8 +584,10 @@ pub async fn perform_handshake(
     use crate::communication::transport_session::CONTROL_CHANNEL_ID;
 
     let msg = ControlMessage::Handshake {
+        protocol_version: PROTOCOL_VERSION,
         fingerprint: local_fingerprint,
         dataflow_id,
+        node_id: local_node_id.to_string(),
     };
     let payload = encode_control_message(&msg);
 
@@ -368,37 +624,7 @@ pub async fn perform_handshake(
                 peer_id: peer_id.clone(),
             })?;
 
-        let peer_msg = decode_control_message(&data).map_err(|source| HandshakeError::Decode {
-            peer_id: peer_id.clone(),
-            source,
-        })?;
-
-        match peer_msg {
-            ControlMessage::Handshake {
-                fingerprint,
-                dataflow_id: peer_df_id,
-            } => {
-                if fingerprint != local_fingerprint {
-                    return Err(HandshakeError::FingerprintMismatch {
-                        peer_id: peer_id.clone(),
-                        local: local_fingerprint,
-                        remote: fingerprint,
-                    });
-                }
-                if peer_df_id != dataflow_id {
-                    return Err(HandshakeError::DataflowIdMismatch {
-                        peer_id: peer_id.clone(),
-                    });
-                }
-            }
-            other => {
-                return Err(HandshakeError::UnexpectedMessage {
-                    peer_id: peer_id.clone(),
-                    expected: "Handshake".into(),
-                    got: format!("{other:?}"),
-                });
-            }
-        }
+        validate_peer_handshake(peer_id, &data, local_fingerprint, dataflow_id)?;
     }
 
     Ok(())
@@ -408,7 +634,8 @@ pub async fn perform_handshake(
 ///
 /// Sends a `Ready` signal to each peer and waits to receive one back.
 /// This ensures all nodes have materialized their workers before any
-/// node begins execution.
+/// node begins execution. Each peer's `Ready` must carry the node id the
+/// connection is assigned to.
 #[cfg(feature = "transport")]
 pub async fn perform_ready_barrier(
     session: &super::TransportSession,
@@ -458,23 +685,7 @@ pub async fn perform_ready_barrier(
                 peer_id: peer_id.clone(),
             })?;
 
-        let peer_msg = decode_control_message(&data).map_err(|source| HandshakeError::Decode {
-            peer_id: peer_id.clone(),
-            source,
-        })?;
-
-        match peer_msg {
-            ControlMessage::Ready { .. } => {
-                // Peer is ready.
-            }
-            other => {
-                return Err(HandshakeError::UnexpectedMessage {
-                    peer_id: peer_id.clone(),
-                    expected: "Ready".into(),
-                    got: format!("{other:?}"),
-                });
-            }
-        }
+        validate_peer_ready(peer_id, &data)?;
     }
 
     Ok(())
@@ -488,6 +699,7 @@ pub async fn perform_ready_barrier(
 pub async fn perform_handshake_with_transport(
     transport: &super::cluster_transport::ClusterTransport,
     control_receivers: &mut std::collections::HashMap<String, tokio::sync::mpsc::Receiver<Vec<u8>>>,
+    local_node_id: &str,
     local_fingerprint: u64,
     dataflow_id: DataflowId,
     timeout: std::time::Duration,
@@ -496,8 +708,10 @@ pub async fn perform_handshake_with_transport(
     use crate::communication::transport_session::CONTROL_CHANNEL_ID;
 
     let msg = ControlMessage::Handshake {
+        protocol_version: PROTOCOL_VERSION,
         fingerprint: local_fingerprint,
         dataflow_id,
+        node_id: local_node_id.to_string(),
     };
     let payload = encode_control_message(&msg);
 
@@ -533,37 +747,7 @@ pub async fn perform_handshake_with_transport(
                 peer_id: peer_id.clone(),
             })?;
 
-        let peer_msg = decode_control_message(&data).map_err(|source| HandshakeError::Decode {
-            peer_id: peer_id.clone(),
-            source,
-        })?;
-
-        match peer_msg {
-            ControlMessage::Handshake {
-                fingerprint,
-                dataflow_id: peer_df_id,
-            } => {
-                if fingerprint != local_fingerprint {
-                    return Err(HandshakeError::FingerprintMismatch {
-                        peer_id: peer_id.clone(),
-                        local: local_fingerprint,
-                        remote: fingerprint,
-                    });
-                }
-                if peer_df_id != dataflow_id {
-                    return Err(HandshakeError::DataflowIdMismatch {
-                        peer_id: peer_id.clone(),
-                    });
-                }
-            }
-            other => {
-                return Err(HandshakeError::UnexpectedMessage {
-                    peer_id: peer_id.clone(),
-                    expected: "Handshake".into(),
-                    got: format!("{other:?}"),
-                });
-            }
-        }
+        validate_peer_handshake(peer_id, &data, local_fingerprint, dataflow_id)?;
     }
 
     Ok(())
@@ -621,21 +805,7 @@ pub async fn perform_ready_barrier_with_transport(
                 peer_id: peer_id.clone(),
             })?;
 
-        let peer_msg = decode_control_message(&data).map_err(|source| HandshakeError::Decode {
-            peer_id: peer_id.clone(),
-            source,
-        })?;
-
-        match peer_msg {
-            ControlMessage::Ready { .. } => {}
-            other => {
-                return Err(HandshakeError::UnexpectedMessage {
-                    peer_id: peer_id.clone(),
-                    expected: "Ready".into(),
-                    got: format!("{other:?}"),
-                });
-            }
-        }
+        validate_peer_ready(peer_id, &data)?;
     }
 
     Ok(())
@@ -760,15 +930,134 @@ mod tests {
     use crate::communication::transport::FramedReader;
     use crate::communication::transport_session::PeerConnection;
 
+    fn handshake(fingerprint: u64, dataflow_id: DataflowId, node_id: &str) -> ControlMessage {
+        ControlMessage::Handshake {
+            protocol_version: PROTOCOL_VERSION,
+            fingerprint,
+            dataflow_id,
+            node_id: node_id.to_string(),
+        }
+    }
+
     #[test]
     fn handshake_roundtrip() {
-        let msg = ControlMessage::Handshake {
-            fingerprint: 0xDEADBEEF_CAFEBABE,
-            dataflow_id: DataflowId::new(),
-        };
+        for node_id in ["node-a", "", "ノード-✓"] {
+            let msg = handshake(0xDEADBEEF_CAFEBABE, DataflowId::new(), node_id);
+            let encoded = encode_control_message(&msg);
+            let decoded = decode_control_message(&encoded).unwrap();
+            assert_eq!(msg, decoded);
+        }
+    }
+
+    #[test]
+    fn handshake_from_other_protocol_version_is_reported_as_such() {
+        let mut msg = handshake(1, DataflowId::new(), "node-a");
+        if let ControlMessage::Handshake {
+            protocol_version, ..
+        } = &mut msg
+        {
+            *protocol_version = PROTOCOL_VERSION + 1;
+        }
         let encoded = encode_control_message(&msg);
-        let decoded = decode_control_message(&encoded).unwrap();
-        assert_eq!(msg, decoded);
+        assert!(matches!(
+            decode_control_message(&encoded),
+            Err(ControlProtocolError::UnsupportedProtocolVersion { version })
+                if version == PROTOCOL_VERSION + 1
+        ));
+
+        // A future version may use any layout after the version field.
+        let mut buf = vec![MSG_TYPE_HANDSHAKE];
+        buf.extend_from_slice(&(PROTOCOL_VERSION + 7).to_le_bytes());
+        buf.extend_from_slice(&[0xAA; 3]);
+        let crc = crc32fast::hash(&buf);
+        buf.extend_from_slice(&crc.to_le_bytes());
+        assert!(matches!(
+            decode_control_message(&buf),
+            Err(ControlProtocolError::UnsupportedProtocolVersion { .. })
+        ));
+    }
+
+    /// The unversioned 0.1.x handshake is recognised and rejected as version 1.
+    #[test]
+    fn legacy_unversioned_handshake_is_rejected_as_version_one() {
+        let mut buf = vec![MSG_TYPE_HANDSHAKE];
+        buf.extend_from_slice(&0x1234_u64.to_le_bytes());
+        buf.extend_from_slice(DataflowId::new().as_bytes());
+        let crc = crc32fast::hash(&buf);
+        buf.extend_from_slice(&crc.to_le_bytes());
+        let err = validate_peer_handshake("node-b", &buf, 0x1234, DataflowId::new()).unwrap_err();
+        assert!(
+            matches!(
+                err,
+                HandshakeError::ProtocolVersionMismatch {
+                    local: PROTOCOL_VERSION,
+                    remote: 1,
+                    ..
+                }
+            ),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn handshake_validation_checks_identity_dataflow_and_fingerprint() {
+        let df = DataflowId::new();
+        let ok = encode_control_message(&handshake(7, df, "node-b"));
+        assert!(validate_peer_handshake("node-b", &ok, 7, df).is_ok());
+
+        let err = validate_peer_handshake("node-c", &ok, 7, df).unwrap_err();
+        assert!(
+            matches!(&err, HandshakeError::PeerIdentityMismatch { peer_id, reported }
+                if peer_id == "node-c" && reported == "node-b"),
+            "{err}"
+        );
+        assert!(matches!(
+            validate_peer_handshake("node-b", &ok, 7, DataflowId::new()),
+            Err(HandshakeError::DataflowIdMismatch { .. })
+        ));
+        assert!(matches!(
+            validate_peer_handshake("node-b", &ok, 8, df),
+            Err(HandshakeError::FingerprintMismatch { .. })
+        ));
+        let ready = encode_control_message(&ControlMessage::Ready {
+            node_id: "node-b".into(),
+        });
+        assert!(matches!(
+            validate_peer_handshake("node-b", &ready, 7, df),
+            Err(HandshakeError::UnexpectedMessage { .. })
+        ));
+    }
+
+    #[test]
+    fn ready_validation_checks_identity() {
+        let ready = encode_control_message(&ControlMessage::Ready {
+            node_id: "node-b".into(),
+        });
+        assert!(validate_peer_ready("node-b", &ready).is_ok());
+        assert!(matches!(
+            validate_peer_ready("node-c", &ready),
+            Err(HandshakeError::PeerIdentityMismatch { .. })
+        ));
+    }
+
+    #[test]
+    fn handshake_rejects_truncated_or_padded_node_id() {
+        let encoded = encode_control_message(&handshake(1, DataflowId::new(), "node-a"));
+        // Re-encode the payload with one byte dropped / added, keeping a valid CRC.
+        let payload = &encoded[..encoded.len() - 4];
+        for variant in [payload[..payload.len() - 1].to_vec(), {
+            let mut v = payload.to_vec();
+            v.push(b'x');
+            v
+        }] {
+            let mut buf = variant;
+            let crc = crc32fast::hash(&buf);
+            buf.extend_from_slice(&crc.to_le_bytes());
+            assert!(matches!(
+                decode_control_message(&buf),
+                Err(ControlProtocolError::InvalidPayloadSize { .. })
+            ));
+        }
     }
 
     #[test]
@@ -803,10 +1092,7 @@ mod tests {
 
     #[test]
     fn decode_rejects_corrupted_crc() {
-        let msg = ControlMessage::Handshake {
-            fingerprint: 42,
-            dataflow_id: DataflowId::new(),
-        };
+        let msg = handshake(42, DataflowId::new(), "node-a");
         let mut encoded = encode_control_message(&msg);
         // Flip a bit in the payload.
         encoded[5] ^= 0x01;
@@ -836,21 +1122,233 @@ mod tests {
         ));
     }
 
-    #[test]
-    fn fingerprint_deterministic() {
-        let fp1 = compute_fingerprint(5, 4, &[1, 3], 1, 8);
-        let fp2 = compute_fingerprint(5, 4, &[3, 1], 1, 8); // different order, same set
-        assert_eq!(fp1, fp2);
-    }
+    mod fingerprint {
+        use super::super::graph_fingerprint;
+        use crate::dataflow::{DataflowBuilder, LogicalDataflow};
+        use crate::execute::{ClusterTopology, NodeConfig};
+        use crate::progress::timestamp::Timestamp;
 
-    #[test]
-    fn fingerprint_differs_on_structure_change() {
-        let fp1 = compute_fingerprint(5, 4, &[1, 3], 1, 8);
-        let fp2 = compute_fingerprint(6, 4, &[1, 3], 1, 8); // different operator count
-        assert_ne!(fp1, fp2);
+        fn topo(nodes: &[(&str, usize)]) -> ClusterTopology {
+            ClusterTopology::multi_node(
+                nodes.iter().map(|(n, w)| NodeConfig::new(*n, *w)).collect(),
+            )
+            .unwrap()
+        }
 
-        let fp3 = compute_fingerprint(5, 4, &[1, 3], 1, 4); // different worker count
-        assert_ne!(fp1, fp3);
+        fn build<T: Timestamp>(f: impl Fn(&DataflowBuilder<T>)) -> LogicalDataflow<T> {
+            let b = DataflowBuilder::<T>::new("fp");
+            f(&b);
+            b.build().unwrap()
+        }
+
+        fn fp<T: Timestamp>(f: impl Fn(&DataflowBuilder<T>)) -> u64 {
+            graph_fingerprint(&build(f), &topo(&[("a", 1), ("b", 1)]))
+        }
+
+        fn base(b: &DataflowBuilder<u64>) {
+            b.input::<u64>("in")
+                .unwrap()
+                .map("m", |_t, x| x)
+                .exchange("x", |x: &u64| *x)
+                .output("out")
+                .unwrap();
+        }
+
+        #[test]
+        fn identical_graphs_match() {
+            assert_eq!(fp(base), fp(base));
+            let g = build(base);
+            let t = topo(&[("a", 2), ("b", 3)]);
+            assert_eq!(graph_fingerprint(&g, &t), graph_fingerprint(&g, &t.clone()));
+        }
+
+        #[test]
+        fn topology_changes_are_detected() {
+            let g = build(base);
+            let f = |t: ClusterTopology| graph_fingerprint(&g, &t);
+            let reference = f(topo(&[("a", 2), ("b", 1)]));
+            assert_ne!(reference, f(topo(&[("a", 1), ("b", 2)])), "worker split");
+            assert_ne!(reference, f(topo(&[("a", 2), ("c", 1)])), "node id");
+            let mut reordered = topo(&[("a", 2), ("b", 1)]);
+            reordered.nodes.reverse();
+            assert_ne!(reference, f(reordered), "node order");
+            assert_ne!(
+                reference,
+                f(topo(&[("a", 2), ("b", 1), ("c", 1)])),
+                "extra node"
+            );
+        }
+
+        #[test]
+        fn operator_kind_is_detected() {
+            let filter = |b: &DataflowBuilder<u64>| {
+                b.input::<u64>("in")
+                    .unwrap()
+                    .filter("m", |_t, _x| true)
+                    .exchange("x", |x: &u64| *x)
+                    .output("out")
+                    .unwrap();
+            };
+            assert_ne!(fp(base), fp(filter));
+        }
+
+        #[test]
+        fn operator_name_is_detected() {
+            let renamed = |b: &DataflowBuilder<u64>| {
+                b.input::<u64>("in")
+                    .unwrap()
+                    .map("m2", |_t, x| x)
+                    .exchange("x", |x: &u64| *x)
+                    .output("out")
+                    .unwrap();
+            };
+            assert_ne!(fp(base), fp(renamed));
+        }
+
+        #[test]
+        fn exchange_record_type_is_detected() {
+            let signed = |b: &DataflowBuilder<u64>| {
+                b.input::<u64>("in")
+                    .unwrap()
+                    .map("m", |_t, x| x as i64)
+                    .exchange("x", |x: &i64| *x as u64)
+                    .map("back", |_t, x| x as u64)
+                    .output("out")
+                    .unwrap();
+            };
+            let unsigned = |b: &DataflowBuilder<u64>| {
+                b.input::<u64>("in")
+                    .unwrap()
+                    .map("m", |_t, x| x)
+                    .exchange("x", |x: &u64| *x)
+                    .map("back", |_t, x| x)
+                    .output("out")
+                    .unwrap();
+            };
+            assert_ne!(fp(signed), fp(unsigned));
+        }
+
+        #[test]
+        fn timestamp_type_is_detected() {
+            let small = |b: &DataflowBuilder<u32>| {
+                b.input::<u64>("in")
+                    .unwrap()
+                    .map("m", |_t, x| x)
+                    .exchange("x", |x: &u64| *x)
+                    .output("out")
+                    .unwrap();
+            };
+            assert_ne!(fp(base), fp(small));
+        }
+
+        #[test]
+        fn exchange_vs_broadcast_is_detected() {
+            let bcast = |b: &DataflowBuilder<u64>| {
+                b.input::<u64>("in")
+                    .unwrap()
+                    .map("m", |_t, x| x)
+                    .broadcast("x")
+                    .output("out")
+                    .unwrap();
+            };
+            assert_ne!(fp(base), fp(bcast));
+        }
+
+        #[test]
+        fn edge_endpoints_are_detected() {
+            // Same operators and names; only which input feeds the exchange differs.
+            let wire = |left_exchanged: bool| {
+                move |b: &DataflowBuilder<u64>| {
+                    let l = b.input::<u64>("l").unwrap();
+                    let r = b.input::<u64>("r").unwrap();
+                    let (ex, direct) = if left_exchanged { (l, r) } else { (r, l) };
+                    ex.exchange("x", |x: &u64| *x).output("o1").unwrap();
+                    direct.output("o2").unwrap();
+                }
+            };
+            assert_ne!(fp(wire(true)), fp(wire(false)));
+        }
+
+        #[test]
+        fn branch_order_is_detected() {
+            let branches = |first_even: bool| {
+                move |b: &DataflowBuilder<u64>| {
+                    let input = b.input::<u64>("in").unwrap();
+                    let order = if first_even {
+                        [("evens", true), ("odds", false)]
+                    } else {
+                        [("odds", false), ("evens", true)]
+                    };
+                    for (name, even) in order {
+                        input
+                            .clone()
+                            .filter(name, move |_t, x: &u64| (x % 2 == 0) == even)
+                            .exchange_by_hash(format!("{name}-ex"), |x: &u64| *x)
+                            .output(name)
+                            .unwrap();
+                    }
+                }
+            };
+            assert_ne!(fp(branches(true)), fp(branches(false)));
+        }
+
+        #[test]
+        fn graphs_inside_iterate_are_covered() {
+            let looped = |kind_map: bool| {
+                move |b: &DataflowBuilder<u64>| {
+                    let input = b.input::<u64>("in").unwrap();
+                    input
+                        .iterate::<u32>("loop", 1u32, move |v| {
+                            let body = if kind_map {
+                                v.map("step", |_t, x: u64| x)
+                            } else {
+                                v.filter("step", |_t, _x| true)
+                            };
+                            let (fb, out) = body.branch("split", |_t, x| *x > 0);
+                            crate::dataflow::dataflow_builder::IterateResult {
+                                feedback: fb,
+                                output: out,
+                            }
+                        })
+                        .output("out")
+                        .unwrap();
+                }
+            };
+            assert_eq!(fp(looped(true)), fp(looped(true)));
+            assert_ne!(fp(looped(true)), fp(looped(false)));
+        }
+
+        /// An exchange inside a loop carries `Product<T, TInner>` timestamps on
+        /// the wire, so the inner timestamp type must be part of the fingerprint.
+        #[test]
+        fn loop_timestamp_type_of_inner_exchange_is_detected() {
+            fn looped<TInner>(summary: TInner::Summary) -> impl Fn(&DataflowBuilder<u64>)
+            where
+                TInner: Timestamp + crate::communication::codec::ExchangeData,
+                TInner::Summary: Clone,
+                crate::order::Product<u64, TInner>:
+                    Timestamp + crate::communication::codec::ExchangeData,
+            {
+                move |b: &DataflowBuilder<u64>| {
+                    b.input::<u64>("in")
+                        .unwrap()
+                        .iterate::<TInner>("loop", summary.clone(), |v| {
+                            let (fb, out) = v
+                                .exchange("x", |x: &u64| *x)
+                                .map("dec", |_t, x: u64| x.saturating_sub(1))
+                                .branch("split", |_t, x| *x > 0);
+                            crate::dataflow::dataflow_builder::IterateResult {
+                                feedback: fb,
+                                output: out,
+                            }
+                        })
+                        .output("out")
+                        .unwrap();
+                }
+            }
+            assert_eq!(fp(looped::<u32>(1u32)), fp(looped::<u32>(1u32)));
+            assert_ne!(fp(looped::<u32>(1u32)), fp(looped::<u64>(1u64)));
+        }
     }
 
     #[test]
@@ -952,7 +1450,8 @@ mod tests {
             &[],
             16,
             &runtime,
-        );
+        )
+        .unwrap();
 
         broadcast_cancel(&session, dataflow_id, "worker failed").await;
 

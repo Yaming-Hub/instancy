@@ -553,7 +553,8 @@ Describes the physical cluster layout.
 Key methods:
 
 - `single_node(logical_workers) -> Self`
-- `multi_node(configs) -> Result<Self>`
+- `multi_node(configs) -> Result<Self>` — rejects an empty list, zero-worker nodes, and duplicate node ids
+- `validate() -> Result<()>` — the same checks for a topology whose public `nodes` were edited; `spawn_cluster` calls it
 - `total_workers() -> usize`
 - `worker_range(node_id) -> Option<(usize, usize)>`
 - `node_for_worker(worker_id) -> Option<&str>`
@@ -623,7 +624,7 @@ Feature-gated shared-transport manager at `instancy::communication::SharedPeerMa
 Key methods:
 
 - `pub fn new(peer_node_id: String, config: SharedConnectionConfig, connection_factory: Arc<dyn DynConnectionFactory>, runtime_handle: &tokio::runtime::Handle, health_tx: broadcast::Sender<RuntimeEvent>) -> Result<Self>`
-- `pub async fn register_dataflow(&self, dataflow_id: DataflowId, channel_ids: &[u64], channel_capacity: usize) -> (HashMap<u64, tokio::sync::mpsc::Receiver<Vec<u8>>>, tokio::sync::mpsc::Receiver<TransportError>)`
+- `pub async fn register_dataflow(&self, dataflow_id: DataflowId, channel_ids: &[u64], channel_capacity: usize) -> Result<(HashMap<u64, tokio::sync::mpsc::Receiver<Vec<u8>>>, tokio::sync::mpsc::Receiver<TransportError>), TransportError>` — fails with `TransportError::InvalidRegistration` for a zero capacity, a duplicate or probe channel id, or a dataflow id that is already registered
 - `pub async fn unregister_dataflow(&self, dataflow_id: &DataflowId)`
 - `pub fn peer_node_id(&self) -> &str`
 

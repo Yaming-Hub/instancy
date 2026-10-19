@@ -110,10 +110,12 @@ async fn main() {
 
     let (mut receivers_1, mut err_rx_1) = manager
         .register_dataflow(dataflow_1, &[channel_id], 256)
-        .await;
+        .await
+        .unwrap();
     let (mut receivers_2, mut err_rx_2) = manager
         .register_dataflow(dataflow_2, &[channel_id], 256)
-        .await;
+        .await
+        .unwrap();
 
     let mut rx_1 = receivers_1.remove(&channel_id).unwrap();
     let mut rx_2 = receivers_2.remove(&channel_id).unwrap();

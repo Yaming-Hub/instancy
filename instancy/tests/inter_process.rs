@@ -418,8 +418,10 @@ async fn end_to_end_frame_delivery_through_muxer_demuxer() {
     // Node 1: demuxer reads frames
     let config = DemuxConfig { channel_buffer: 32 };
     let mut demuxer = Demuxer::new(node1_read, config);
-    let mut rx_data = demuxer.register_channel(dataflow_id, 1);
-    let mut rx_progress = demuxer.register_channel(dataflow_id, PROGRESS_CHANNEL_ID);
+    let mut rx_data = demuxer.register_channel(dataflow_id, 1).unwrap();
+    let mut rx_progress = demuxer
+        .register_channel(dataflow_id, PROGRESS_CHANNEL_ID)
+        .unwrap();
 
     let mux_handle = tokio::spawn(async move { muxer.run().await });
     let demux_handle = tokio::spawn(async move { demuxer.run().await });
@@ -467,8 +469,8 @@ async fn end_to_end_two_dataflows_isolated_on_same_connection() {
     let mut demuxer = Demuxer::new(node1_read, config);
 
     // Register same channel_id (1) for two different dataflows
-    let mut rx_a = demuxer.register_channel(id_a, 1);
-    let mut rx_b = demuxer.register_channel(id_b, 1);
+    let mut rx_a = demuxer.register_channel(id_a, 1).unwrap();
+    let mut rx_b = demuxer.register_channel(id_b, 1).unwrap();
 
     let mux_handle = tokio::spawn(async move { muxer.run().await });
     let demux_handle = tokio::spawn(async move { demuxer.run().await });

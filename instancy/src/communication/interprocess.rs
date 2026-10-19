@@ -47,8 +47,9 @@ use crate::worker::WorkerId;
 ///   every node in the cluster. This is guaranteed by the deterministic assignment
 ///   during graph construction — all nodes construct the same graph and therefore
 ///   assign the same IDs.
-/// - **Reserved**: `ChannelId = 0` (`PROGRESS_CHANNEL_ID`) is reserved for the
-///   progress exchange protocol and must not be used for data channels.
+/// - **Reserved**: `ChannelId = 0` is the control channel (handshake, ready
+///   barrier, cancellation), and [`PROGRESS_CHANNEL_ID`] is reserved for the
+///   progress exchange protocol. Neither may be used for data channels.
 ///
 /// # Assignment
 ///
@@ -94,23 +95,33 @@ impl RoutingTable {
     ///
     /// `base_channel_id` is the starting channel ID for this edge.
     /// Each remote worker gets `base_channel_id + target_worker_index`.
-    /// Must be > 0 since channel ID 0 is reserved for progress protocol.
     ///
     /// `peer_map` maps node_id → PeerId for all remote nodes.
     ///
-    /// # Panics
+    /// # Errors
     ///
-    /// Panics if `base_channel_id` is 0 (reserved for progress).
+    /// Fails if the edge's id range `base_channel_id ..
+    /// base_channel_id + total_workers` overflows or contains the control
+    /// channel (0) or [`PROGRESS_CHANNEL_ID`].
     pub fn new(
         topology: &ClusterTopology,
         local_node_id: impl Into<String>,
         base_channel_id: ChannelId,
         peer_map: &HashMap<String, PeerId>,
     ) -> crate::Result<Self> {
-        if base_channel_id == PROGRESS_CHANNEL_ID {
-            return Err(crate::Error::Runtime(RuntimeError::ClusterSetup(
-                "base_channel_id must be > 0 (channel 0 is reserved for progress)".into(),
-            )));
+        let end = base_channel_id
+            .checked_add(topology.total_workers() as u64)
+            .ok_or_else(|| {
+                crate::Error::Runtime(RuntimeError::ClusterSetup(
+                    "base_channel_id + total_workers overflows u64".into(),
+                ))
+            })?;
+        let range = base_channel_id..end;
+        if range.contains(&0) || range.contains(&PROGRESS_CHANNEL_ID) {
+            return Err(crate::Error::Runtime(RuntimeError::ClusterSetup(format!(
+                "channel ids {base_channel_id}..{end} overlap a reserved channel \
+                 (0 = control, {PROGRESS_CHANNEL_ID} = progress)"
+            ))));
         }
 
         let local_node_id = local_node_id.into();
@@ -351,8 +362,14 @@ pub struct ProgressMessage<T> {
     pub changes: Vec<(usize, T, i64)>,
 }
 
-/// Well-known channel ID reserved for progress protocol messages.
-pub const PROGRESS_CHANNEL_ID: ChannelId = 0;
+/// Well-known channel ID reserved for progress protocol messages
+/// ([`ProgressExchange`](super::ProgressExchange)).
+///
+/// It lies in the library-reserved channel-id namespace, so it collides
+/// neither with the control channel (0), which shared transports deliver
+/// outside the sequenced payload lane, nor with
+/// [`DataflowSession`](super::DataflowSession) or `spawn_cluster` channels.
+pub const PROGRESS_CHANNEL_ID: ChannelId = 3 << 62;
 
 /// Encode a progress message into wire bytes.
 pub fn encode_progress<T, TC>(
@@ -797,8 +814,36 @@ mod tests {
     }
 
     #[test]
-    fn progress_channel_id_is_zero() {
-        assert_eq!(PROGRESS_CHANNEL_ID, 0);
+    fn progress_channel_id_is_outside_control_and_session_ranges() {
+        assert_ne!(PROGRESS_CHANNEL_ID, 0, "0 is the control channel");
+        #[cfg(feature = "transport")]
+        assert_eq!(
+            PROGRESS_CHANNEL_ID / crate::communication::transport_session::CHANNEL_NAMESPACE_SIZE,
+            3,
+            "must lie in the library-reserved namespace"
+        );
+        assert_ne!(
+            PROGRESS_CHANNEL_ID,
+            u64::MAX,
+            "u64::MAX is the probe channel"
+        );
+    }
+
+    #[test]
+    fn routing_table_rejects_reserved_or_overflowing_ranges() {
+        let topology = ClusterTopology::multi_node(vec![
+            NodeConfig::new("node-0", 1),
+            NodeConfig::new("node-1", 2),
+        ])
+        .unwrap();
+        let mut peer_map = HashMap::new();
+        peer_map.insert("node-1".to_string(), PeerId(1));
+        // Range ending exactly at the progress channel is fine; covering it is not.
+        assert!(RoutingTable::new(&topology, "node-0", PROGRESS_CHANNEL_ID - 3, &peer_map).is_ok());
+        assert!(
+            RoutingTable::new(&topology, "node-0", PROGRESS_CHANNEL_ID - 2, &peer_map).is_err()
+        );
+        assert!(RoutingTable::new(&topology, "node-0", u64::MAX - 1, &peer_map).is_err());
     }
 
     // --- Round-trip consistency tests ---

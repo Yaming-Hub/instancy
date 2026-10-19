@@ -4,7 +4,7 @@
 //! from an operator's output to downstream operator inputs.
 
 use std::fmt;
-use std::hash::{Hash, Hasher};
+use std::hash::Hash;
 use std::sync::Arc;
 
 /// Describes how data is routed between operators across logical workers.
@@ -61,17 +61,17 @@ impl<D> ExchangeFn<D> {
     }
 
     /// Create an exchange function from a hashable key extractor.
+    ///
+    /// Keys are hashed with [`StableHasher`](crate::hash::StableHasher), so a
+    /// key is routed to the same worker on every node of a cluster regardless
+    /// of platform or Rust release (see [`crate::hash`] for the caveats about
+    /// slices, arrays and `Vec`s of multi-byte integers).
     pub fn by_key<K: Hash>(
         description: impl Into<String>,
         key_fn: impl Fn(&D) -> K + Send + Sync + 'static,
     ) -> Self {
         Self {
-            func: Arc::new(move |d| {
-                let key = key_fn(d);
-                let mut hasher = std::collections::hash_map::DefaultHasher::new();
-                key.hash(&mut hasher);
-                hasher.finish()
-            }),
+            func: Arc::new(move |d| crate::hash::stable_hash(&key_fn(d))),
             description: description.into(),
         }
     }
@@ -79,6 +79,11 @@ impl<D> ExchangeFn<D> {
     /// Route a record: returns the hash value used to select a target worker.
     pub fn route(&self, data: &D) -> u64 {
         (self.func)(data)
+    }
+
+    /// The human-readable description (the exchange's name).
+    pub fn description(&self) -> &str {
+        &self.description
     }
 
     /// Given a hash value and target worker count, returns the target worker index.
@@ -277,6 +282,17 @@ mod tests {
         let target1 = router.route(&record);
         let target2 = router.route(&record);
         assert_eq!(target1, target2);
+    }
+
+    #[test]
+    fn exchange_by_key_uses_the_stable_hash() {
+        let f = ExchangeFn::by_key("by value", |x: &u64| *x);
+        for k in [0u64, 1, 42, u64::MAX] {
+            assert_eq!(f.route(&k), crate::hash::stable_hash(&k));
+        }
+        // Pinned: key 1 routes to the same worker on every node and toolchain.
+        assert_eq!(f.route(&1), 0xd04c_a76a_c679_b738);
+        assert_eq!(ExchangeFn::<u64>::target_worker(f.route(&1), 3), 2);
     }
 
     #[test]

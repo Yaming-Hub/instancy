@@ -53,6 +53,7 @@ pub mod dataflow;
 pub mod error;
 pub mod execute;
 pub(crate) mod executor_task;
+pub mod hash;
 pub mod metrics;
 pub mod order;
 pub mod progress;

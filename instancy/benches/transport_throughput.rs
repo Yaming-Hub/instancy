@@ -173,7 +173,8 @@ fn bench_dedicated_single_dataflow(c: &mut Criterion) {
                         &[],
                         4096,
                         &handle,
-                    );
+                    )
+                    .unwrap();
 
                     let peer_rxs = receivers.remove("peer").unwrap();
                     let mut data_rx = peer_rxs
@@ -271,7 +272,8 @@ fn bench_shared_single_dataflow(c: &mut Criterion) {
 
                     let (mut receivers, _error_rx) = manager
                         .register_dataflow(dataflow_id, &[CHANNEL_ID], 4096)
-                        .await;
+                        .await
+                        .unwrap();
 
                     let mut data_rx = receivers.remove(&CHANNEL_ID).unwrap();
                     let payload_tx = manager.payload_sender().clone();
@@ -376,7 +378,8 @@ fn bench_dedicated_multi_dataflow(c: &mut Criterion) {
                             &[],
                             4096,
                             &handle,
-                        );
+                        )
+                        .unwrap();
 
                         let peer_rxs = receivers.remove("peer").unwrap();
                         let mut data_rx = peer_rxs
@@ -513,7 +516,8 @@ fn bench_shared_multi_dataflow(c: &mut Criterion) {
                         dataflow_ids.push(dataflow_id);
                         let (mut receivers, _err_rx) = manager
                             .register_dataflow(dataflow_id, &[CHANNEL_ID], 4096)
-                            .await;
+                            .await
+                            .unwrap();
                         let mut data_rx = receivers.remove(&CHANNEL_ID).unwrap();
                         let payload_tx = manager.payload_sender().clone();
                         let payload = make_payload(PAYLOAD_SIZE);
@@ -624,7 +628,8 @@ fn bench_shared_scaling_connections(c: &mut Criterion) {
 
                     let (mut receivers, _err_rx) = manager
                         .register_dataflow(dataflow_id, &[CHANNEL_ID], 4096)
-                        .await;
+                        .await
+                        .unwrap();
                     let mut data_rx = receivers.remove(&CHANNEL_ID).unwrap();
                     let payload_tx = manager.payload_sender().clone();
                     let payload = make_payload(PAYLOAD_SIZE);

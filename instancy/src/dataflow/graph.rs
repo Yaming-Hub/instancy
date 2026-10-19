@@ -184,6 +184,10 @@ pub struct DataflowGraph {
     /// Set by exchange_to/rebalance_to/broadcast_to/gather to record the
     /// downstream stage's intended parallelism.
     exchange_parallelism: HashMap<usize, usize>,
+    /// Builder method that created each operator (operator_index → kind, e.g.
+    /// `"map"` or `"exchange"`). Part of the cluster handshake fingerprint, so
+    /// that nodes whose graphs differ only in an operator's kind are rejected.
+    operator_kinds: HashMap<usize, &'static str>,
 }
 
 impl DataflowGraph {
@@ -194,7 +198,19 @@ impl DataflowGraph {
             edges: Vec::new(),
             feedback_edges: Vec::new(),
             exchange_parallelism: HashMap::new(),
+            operator_kinds: HashMap::new(),
         }
+    }
+
+    /// Record the kind (the creating builder method) of an operator.
+    pub(crate) fn set_operator_kind(&mut self, operator_index: usize, kind: &'static str) {
+        self.operator_kinds.insert(operator_index, kind);
+    }
+
+    /// The kind of an operator: the name of the builder method that created
+    /// it (e.g. `"map"`, `"filter"`, `"exchange"`), if recorded.
+    pub fn operator_kind(&self, operator_index: usize) -> Option<&'static str> {
+        self.operator_kinds.get(&operator_index).copied()
     }
 
     // -- Registration (build phase) --

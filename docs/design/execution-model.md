@@ -1418,7 +1418,7 @@ Disable with `SpawnOptions::new().auto_parallelism(false)` to use the exact `num
 
 The hosting application calls `spawn_cluster()` on **every node** with the same `ClusterTopology` and `DataflowId`. The runtime coordinates via:
 
-1. **Handshake** — nodes exchange a fingerprint (hash of graph topology) over the control channel. If any node has a different graph structure → error. This confirms all nodes are running the same dataflow.
+1. **Handshake** — nodes exchange their cluster protocol version, node id, and a fingerprint (stable hash of graph structure, record/timestamp types and cluster topology) over the control channel. If any node speaks another protocol version, is not the node the connection was assigned to, or has a different graph or topology → error. This confirms all nodes are running the same dataflow on the same cluster.
 2. **Ready barrier** — after all local workers are materialized (operators constructed, channels wired), each node waits for ALL peers to also signal "ready." No node begins execution until every node has completed setup. This prevents a fast node from sending data before a slow node's receivers are ready.
 
 ```

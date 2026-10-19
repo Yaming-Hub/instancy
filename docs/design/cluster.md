@@ -111,14 +111,38 @@ started.
    ▼  Dataflow running                       ▼  Dataflow running
 ```
 
-1. **Handshake** (Phase 4) — Each node computes a fingerprint from its dataflow
-   graph (operator count, edge count, exchange indices, feedback count, worker
-   count) and exchanges it with all peers. If any peer's fingerprint differs,
-   `spawn_cluster` fails with `HandshakeError::FingerprintMismatch`. This catches
-   bugs where nodes build different dataflow topologies.
+1. **Handshake** (Phase 4) — Each node sends every peer its cluster protocol
+   version (`CLUSTER_PROTOCOL_VERSION`), its own node id, the dataflow id, and a
+   graph fingerprint. The fingerprint is a stable hash (`instancy::hash::StableHasher`)
+   of everything nodes must agree on: the timestamp type; every topology node id,
+   in order, with its worker count; every operator (kind — the builder method
+   that created it — name, port counts, explicit exchange parallelism); every
+   edge and feedback edge in order (endpoints and channel kind); every network
+   exchange edge in order (routing kind, name, timestamp type — the loop's
+   `Product` type inside `iterate` — and record type); and every named
+   input/output port with its record type. Each node checks, per connection:
+   - the protocol version (`HandshakeError::ProtocolVersionMismatch`; an
+     unversioned 0.1.x handshake is reported as version 1),
+   - that the peer identifies as the node the connection was assigned to
+     (`HandshakeError::PeerIdentityMismatch`; catches miswired connections),
+   - the dataflow id (`HandshakeError::DataflowIdMismatch`),
+   - the fingerprint (`HandshakeError::FingerprintMismatch`).
+
+   Exchange edges are paired across nodes by position and progress updates
+   name operators by index, so any of these differences would otherwise
+   misroute data (e.g. branches declared in a different order, `u64` records
+   read as `i64`, or a different per-node worker split). Record and timestamp
+   types are compared by `std::any::type_name`, so nodes must be built against
+   the same versions of the record types.
+
+   Before the handshake, `spawn_cluster` also validates the topology itself
+   (`ClusterTopology::validate`: no duplicate node ids, no zero-worker nodes)
+   and checks that every data and progress channel id of the cluster fits its
+   namespace (see the channel-id layout in `communication.md`).
 
 2. **Ready Barrier** (Phase 6.5) — After all exchange channels and progress
-   channels are wired, each node sends `Ready` and waits for all peers to
+   channels are wired, each node sends `Ready` (carrying its node id, which is
+   checked against the connection again) and waits for all peers to
    respond. This prevents a fast node from starting execution before a slow
    node has finished channel wiring, which would cause lost messages.
 
@@ -152,7 +176,13 @@ let result = rt.spawn_cluster(
 **Control channel** — Handshake, Ready, and Cancel messages share a dedicated
 control channel (channel ID 0) that is separate from data and progress
 channels. Control messages receive biased priority in the transport layer's
-shared FIFO queue.
+shared FIFO queue. Wire formats (each followed by a CRC32 trailer):
+
+```
+Handshake: [type=0][protocol_version: u32 LE][fingerprint: u64 LE][dataflow_id: 16 bytes]
+           [node_id_len: u32 LE][node_id: UTF-8 bytes]
+Ready:     [type=1][node_id_len: u32 LE][node_id: UTF-8 bytes]
+```
 
 ### 12.5 Dynamic Cluster Scaling
 

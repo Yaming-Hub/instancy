@@ -80,7 +80,9 @@ Exchange operators physically move data between workers based on a routing funct
 // Route by hash of the value
 stream.exchange_by_hash("route", |x: &MyType| compute_hash(x));
 
-// Route by a key function (applies DefaultHasher on top)
+// Route by a key function (hashed with instancy::hash::StableHasher, so integer,
+// string and tuple keys map to the same worker on every node, platform and Rust
+// release; see `instancy::hash` for caveats about integer slices and arrays)
 stream.exchange("route", |x: &MyType| x.key.clone());
 ```
 

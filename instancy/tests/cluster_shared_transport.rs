@@ -952,7 +952,7 @@ async fn shared_reconnect_after_transient_network_failure() {
 
     // ---------- register a dataflow and verify initial data flow ----------
     let df_id = DataflowId::new();
-    let (mut receivers, _error_rx) = manager.register_dataflow(df_id, &[1], 64).await;
+    let (mut receivers, _error_rx) = manager.register_dataflow(df_id, &[1], 64).await.unwrap();
     let data_rx = receivers.get_mut(&1).unwrap();
 
     // Send a frame — the echo server reflects it back

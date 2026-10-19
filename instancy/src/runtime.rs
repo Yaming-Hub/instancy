@@ -1229,10 +1229,37 @@ impl RuntimeHandle {
                                     .write()
                                     .unwrap_or_else(|e| e.into_inner());
                                 if let Some(ref mut topo) = *guard {
-                                    // Ignore error if node already exists (idempotent).
-                                    let _ = topo.add_node(
+                                    if let Some(existing) =
+                                        topo.nodes.iter_mut().find(|n| n.node_id == node_id)
+                                    {
+                                        // A rejoin with the same worker count is
+                                        // idempotent. A changed count means the node
+                                        // restarted with a new configuration: the live
+                                        // topology must reflect it, or later
+                                        // spawn_cluster calls would use stale worker
+                                        // ranges.
+                                        if existing.logical_workers != logical_workers {
+                                            #[cfg(feature = "tracing")]
+                                            tracing::warn!(
+                                                runtime = %runtime_name,
+                                                node_id = %node_id,
+                                                old_workers = existing.logical_workers,
+                                                new_workers = logical_workers,
+                                                "membership: node rejoined with a different worker count"
+                                            );
+                                            existing.logical_workers = logical_workers;
+                                        }
+                                    } else if let Err(_e) = topo.add_node(
                                         crate::execute::NodeConfig::new(&node_id, logical_workers),
-                                    );
+                                    ) {
+                                        #[cfg(feature = "tracing")]
+                                        tracing::warn!(
+                                            runtime = %runtime_name,
+                                            node_id = %node_id,
+                                            error = %_e,
+                                            "membership: failed to add joined node"
+                                        );
+                                    }
                                 } else {
                                     // No topology set yet — create one with just this node.
                                     let topo = crate::execute::ClusterTopology::multi_node(vec![
@@ -2776,7 +2803,7 @@ impl RuntimeHandle {
     {
         use crate::communication::cluster_transport::{ClusterSpawnTransport, ClusterTransport};
         use crate::communication::control_protocol::{
-            broadcast_cancel, broadcast_cancel_with_transport, compute_fingerprint,
+            broadcast_cancel, broadcast_cancel_with_transport, graph_fingerprint,
             perform_handshake, perform_handshake_with_transport, perform_ready_barrier,
             perform_ready_barrier_with_transport, spawn_cancel_listener,
         };
@@ -2788,6 +2815,20 @@ impl RuntimeHandle {
         use crate::progress::network_progress::{
             DEFAULT_MAX_BATCH_SIZE, create_network_progress_channels, progress_channel_id,
         };
+
+        // `nodes` is public, so the topology may not have gone through
+        // `multi_node`: reject duplicate node ids (which would create phantom
+        // workers) and zero-worker nodes before anything indexes into them.
+        topology.validate()?;
+        let transport_capacity = match &transport_config {
+            ClusterSpawnTransport::Dedicated { capacity, .. }
+            | ClusterSpawnTransport::Shared { capacity, .. } => *capacity,
+        };
+        if transport_capacity == 0 {
+            return Err(Error::Runtime(RuntimeError::InvalidConfig(
+                "cluster transport capacity must be at least 1".into(),
+            )));
+        }
 
         let total_workers = topology.total_workers();
         let (local_start, local_end) = topology.worker_range(local_node_id).ok_or_else(|| {
@@ -2823,13 +2864,28 @@ impl RuntimeHandle {
 
         // Phase 3: Compute fingerprint and create transport.
         let exchange_indices = dataflows[0].exchange_edge_indices();
-        let fingerprint = compute_fingerprint(
-            dataflows[0].operator_count(),
-            dataflows[0].edge_count(),
-            &exchange_indices,
-            dataflows[0].feedback_edge_count(),
-            total_workers,
-        );
+        if exchange_indices.len() != dataflows[0].exchange_network_creators.len() {
+            return Err(Error::Runtime(RuntimeError::InvalidConfig(format!(
+                "dataflow has {} exchange edges but {} network exchange creators",
+                exchange_indices.len(),
+                dataflows[0].exchange_network_creators.len()
+            ))));
+        }
+        let fingerprint = graph_fingerprint(&dataflows[0], &topology);
+
+        // Fail fast, before allocating per-worker-pair state, if this cluster's
+        // channel ids do not fit their namespaces (the largest ids are those of
+        // the last worker pair on the last exchange edge).
+        let last_worker = total_workers - 1;
+        progress_channel_id(last_worker, last_worker, total_workers)?;
+        if let Some(last_edge) = exchange_indices.len().checked_sub(1) {
+            NetworkEdgeMaterializer::<T, u8>::channel_id(
+                last_edge,
+                last_worker,
+                last_worker,
+                total_workers,
+            )?;
+        }
 
         // Create transport and extract receivers based on transport mode.
         // After this block: `transport`, `receivers`, `control_receivers` are set.
@@ -2918,7 +2974,7 @@ impl RuntimeHandle {
                                     src,
                                     dst,
                                     total_workers,
-                                );
+                                )?;
                                 data_regs.push(ChannelRegistration {
                                     peer_node_id: peer_id.clone(),
                                     channel_id,
@@ -2958,7 +3014,8 @@ impl RuntimeHandle {
                     &progress_regs,
                     capacity,
                     runtime_handle,
-                );
+                )
+                .map_err(crate::error::CommunicationError::from)?;
                 let session = Arc::new(session);
                 transport = Arc::new(ClusterTransport::Dedicated(Arc::clone(&session)));
 
@@ -3021,7 +3078,7 @@ impl RuntimeHandle {
                                     src,
                                     dst,
                                     total_workers,
-                                );
+                                )?;
                                 all_channel_ids.push(ch_id);
                             }
                         }
@@ -3045,20 +3102,33 @@ impl RuntimeHandle {
                     }
                 }
 
-                // Register with SharedPeerManagers.
+                // Register with SharedPeerManagers. The cleanup guard unregisters
+                // if this future is dropped mid-registration or spawn fails later.
                 shared_registration_cleanup = Some(SharedRegistrationCleanup::new(
                     dataflow_id,
                     Arc::clone(&peer_managers),
                     runtime_handle,
                 ));
                 let mut session =
-                    crate::communication::shared_transport::SharedTransportSession::new(
+                    match crate::communication::shared_transport::SharedTransportSession::new(
                         dataflow_id,
                         &peer_managers,
                         &all_channel_ids,
                         capacity,
                     )
-                    .await;
+                    .await
+                    {
+                        Ok(session) => session,
+                        Err(e) => {
+                            // `new` already rolled back its own registrations. The
+                            // guard must not unregister: the rejection may mean the
+                            // dataflow id is registered by another live session.
+                            if let Some(cleanup) = shared_registration_cleanup.as_mut() {
+                                cleanup.disarm();
+                            }
+                            return Err(Error::Communication(e.into()));
+                        }
+                    };
 
                 let mut raw_receivers = session.take_receivers().ok_or_else(|| {
                     Error::Runtime(RuntimeError::AlreadyConsumed {
@@ -3090,6 +3160,7 @@ impl RuntimeHandle {
             perform_handshake(
                 session,
                 &mut control_receivers,
+                local_node_id,
                 fingerprint,
                 dataflow_id,
                 handshake_timeout,
@@ -3100,6 +3171,7 @@ impl RuntimeHandle {
             perform_handshake_with_transport(
                 &transport,
                 &mut control_receivers,
+                local_node_id,
                 fingerprint,
                 dataflow_id,
                 handshake_timeout,
@@ -3146,7 +3218,7 @@ impl RuntimeHandle {
                                 src,
                                 dst,
                                 total_workers,
-                            );
+                            )?;
                             if let Some(rx) = peer_map.remove(&channel_id) {
                                 extracted.insert(channel_id, rx);
                             }
@@ -3182,7 +3254,7 @@ impl RuntimeHandle {
                 runtime_handle: runtime_handle.clone(),
                 channel_metrics: ch_metrics,
             };
-            let all_factories = creator.create(params);
+            let all_factories = creator.create(params)?;
 
             if all_factories.len() != total_workers {
                 return Err(Error::Runtime(RuntimeError::InvalidConfig(format!(
@@ -9039,6 +9111,29 @@ mod tests {
             let topo = rt.current_topology().unwrap();
             assert_eq!(topo.node_count(), 2);
             assert_eq!(topo.total_workers(), 5);
+        }
+
+        #[tokio::test]
+        async fn membership_rejoin_with_new_worker_count_updates_topology() {
+            let (rt, tx) = test_runtime_with_membership(ClusterTopology::single_node(2));
+
+            tx.send(MembershipEvent::NodeJoined {
+                node_id: "node-x".into(),
+                logical_workers: 3,
+            })
+            .unwrap();
+            tx.send(MembershipEvent::NodeJoined {
+                node_id: "node-x".into(),
+                logical_workers: 5,
+            })
+            .unwrap();
+
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+            let topo = rt.current_topology().unwrap();
+            assert_eq!(topo.node_count(), 2);
+            assert_eq!(topo.worker_range("node-x").map(|(s, e)| e - s), Some(5));
+            assert_eq!(topo.total_workers(), 7);
         }
 
         #[tokio::test]
