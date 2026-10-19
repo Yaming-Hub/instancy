@@ -143,6 +143,10 @@ RESERVED_CHANNEL_BASE, CHANNEL_NAMESPACE_SIZE}`.
   port: the sink keeps consuming and discards its input. Previously the sink
   stopped consuming, livelocking upstream operators and blocking input senders
   (and every peer in multi-worker and cluster runs).
+- `take_input` / `take_output` / `take_async_input` / `take_async_output` no
+  longer consume the port when they fail (for example, a sync take on a port
+  spawned with `IoMode::Async`). Previously the endpoint was dropped, closing
+  the input or abandoning the output, and the corrected call failed.
 - An operator panic (with or without `catch_panics`) now fails the dataflow with
   `Error::OperatorPanic` naming the operator, and tears the executor down so its
   input senders fail and output receivers end. Previously the panic poisoned the

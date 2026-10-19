@@ -4367,6 +4367,9 @@ impl<T: Timestamp> SpawnedDataflow<T> {
     /// same port will return an error. Drop the returned sender (or call
     /// `.close()`) to signal that no more data will arrive on this port.
     ///
+    /// A failed take (unknown name, wrong data type, or a port wired for
+    /// async I/O) leaves the port in place, so a corrected call still works.
+    ///
     /// # Type safety
     ///
     /// The type parameter `D` must match the type used in `builder.input::<D>(name)`.
@@ -4382,31 +4385,53 @@ impl<T: Timestamp> SpawnedDataflow<T> {
         &mut self,
         name: &str,
     ) -> Result<crate::dataflow::channel_operators::InputSender<T, D>> {
-        let type_name = std::any::type_name::<D>();
-        let pos = self
-            .input_senders
+        Self::take_port(
+            &mut self.input_senders,
+            name,
+            std::any::type_name::<D>(),
+            "input",
+            "was wired for async I/O (spawned with IoMode::Async) — use take_async_input()",
+        )
+    }
+
+    /// Remove and return the named port's endpoint as `C`.
+    ///
+    /// Every check — name, data type, and channel mode (sync vs async) —
+    /// runs before the port is removed. A failed take therefore leaves the
+    /// port in place for a corrected call; removing first would drop the
+    /// endpoint, silently closing the input or abandoning the output.
+    fn take_port<C: 'static>(
+        ports: &mut Vec<(String, &'static str, Box<dyn std::any::Any + Send>)>,
+        name: &str,
+        type_name: &str,
+        direction: &str,
+        mode_mismatch: &str,
+    ) -> Result<C> {
+        let pos = ports
             .iter()
             .position(|(n, _, _)| n == name)
             .ok_or_else(|| {
                 Error::Runtime(RuntimeError::InvalidConfig(format!(
-                    "no input port named '{name}'"
+                    "no {direction} port named '{name}'"
                 )))
             })?;
-
-        let (_, port_type, _) = &self.input_senders[pos];
+        let (_, port_type, port) = &ports[pos];
         if *port_type != type_name {
             return Err(Error::Runtime(RuntimeError::InvalidConfig(format!(
-                "input port '{name}' has type {port_type}, but requested {type_name}"
+                "{direction} port '{name}' has type {port_type}, but requested {type_name}"
             ))));
         }
-
-        let (_, _, sender_any) = self.input_senders.remove(pos);
-        sender_any
-            .downcast::<crate::dataflow::channel_operators::InputSender<T, D>>()
-            .map(|boxed| *boxed)
-            .map_err(|_| Error::Runtime(RuntimeError::InvalidConfig(format!(
-                "input port '{name}' type downcast failed — if spawned with IoMode::Async, use take_async_input()"
-            ))))
+        if !port.is::<C>() {
+            return Err(Error::Runtime(RuntimeError::InvalidConfig(format!(
+                "{direction} port '{name}' {mode_mismatch}"
+            ))));
+        }
+        let (_, _, port) = ports.remove(pos);
+        port.downcast::<C>().map(|boxed| *boxed).map_err(|_| {
+            Error::Runtime(RuntimeError::InvalidConfig(format!(
+                "internal: {direction} port '{name}' changed type during take"
+            )))
+        })
     }
 
     /// Take the output receiver for the named port (consumes it from the handle).
@@ -4417,6 +4442,9 @@ impl<T: Timestamp> SpawnedDataflow<T> {
     /// Dropping the receiver (or never taking it before [`join()`](Self::join))
     /// abandons the port: the dataflow keeps running and discards the port's
     /// output rather than blocking upstream operators or input senders.
+    ///
+    /// A failed take (unknown name, wrong data type, or a port wired for
+    /// async I/O) leaves the port in place, so a corrected call still works.
     ///
     /// # Type safety
     ///
@@ -4433,31 +4461,13 @@ impl<T: Timestamp> SpawnedDataflow<T> {
         &mut self,
         name: &str,
     ) -> Result<crate::dataflow::channel_operators::OutputReceiver<T, D>> {
-        let type_name = std::any::type_name::<D>();
-        let pos = self
-            .output_receivers
-            .iter()
-            .position(|(n, _, _)| n == name)
-            .ok_or_else(|| {
-                Error::Runtime(RuntimeError::InvalidConfig(format!(
-                    "no output port named '{name}'"
-                )))
-            })?;
-
-        let (_, port_type, _) = &self.output_receivers[pos];
-        if *port_type != type_name {
-            return Err(Error::Runtime(RuntimeError::InvalidConfig(format!(
-                "output port '{name}' has type {port_type}, but requested {type_name}"
-            ))));
-        }
-
-        let (_, _, receiver_any) = self.output_receivers.remove(pos);
-        receiver_any
-            .downcast::<crate::dataflow::channel_operators::OutputReceiver<T, D>>()
-            .map(|boxed| *boxed)
-            .map_err(|_| Error::Runtime(RuntimeError::InvalidConfig(format!(
-                "output port '{name}' type downcast failed — if spawned with IoMode::Async, use take_async_output()"
-            ))))
+        Self::take_port(
+            &mut self.output_receivers,
+            name,
+            std::any::type_name::<D>(),
+            "output",
+            "was wired for async I/O (spawned with IoMode::Async) — use take_async_output()",
+        )
     }
 
     /// Take the async input sender for the named port (consumes it).
@@ -4478,33 +4488,13 @@ impl<T: Timestamp> SpawnedDataflow<T> {
         &mut self,
         name: &str,
     ) -> Result<crate::dataflow::channel_operators::AsyncInputSender<T, D>> {
-        let type_name = std::any::type_name::<D>();
-        let pos = self
-            .input_senders
-            .iter()
-            .position(|(n, _, _)| n == name)
-            .ok_or_else(|| {
-                Error::Runtime(RuntimeError::InvalidConfig(format!(
-                    "no input port named '{name}'"
-                )))
-            })?;
-
-        let (_, port_type, _) = &self.input_senders[pos];
-        if *port_type != type_name {
-            return Err(Error::Runtime(RuntimeError::InvalidConfig(format!(
-                "input port '{name}' has type {port_type}, but requested {type_name}"
-            ))));
-        }
-
-        let (_, _, sender_any) = self.input_senders.remove(pos);
-        sender_any
-            .downcast::<crate::dataflow::channel_operators::AsyncInputSender<T, D>>()
-            .map(|boxed| *boxed)
-            .map_err(|_| {
-                Error::Runtime(RuntimeError::InvalidConfig(format!(
-                    "input port '{name}' was not wired for async I/O (spawn with IoMode::Async)"
-                )))
-            })
+        Self::take_port(
+            &mut self.input_senders,
+            name,
+            std::any::type_name::<D>(),
+            "input",
+            "was not wired for async I/O (spawn with IoMode::Async, or use take_input())",
+        )
     }
 
     /// Take the async output receiver for the named port (consumes it).
@@ -4526,33 +4516,13 @@ impl<T: Timestamp> SpawnedDataflow<T> {
         &mut self,
         name: &str,
     ) -> Result<crate::dataflow::channel_operators::AsyncOutputReceiver<T, D>> {
-        let type_name = std::any::type_name::<D>();
-        let pos = self
-            .output_receivers
-            .iter()
-            .position(|(n, _, _)| n == name)
-            .ok_or_else(|| {
-                Error::Runtime(RuntimeError::InvalidConfig(format!(
-                    "no output port named '{name}'"
-                )))
-            })?;
-
-        let (_, port_type, _) = &self.output_receivers[pos];
-        if *port_type != type_name {
-            return Err(Error::Runtime(RuntimeError::InvalidConfig(format!(
-                "output port '{name}' has type {port_type}, but requested {type_name}"
-            ))));
-        }
-
-        let (_, _, receiver_any) = self.output_receivers.remove(pos);
-        receiver_any
-            .downcast::<crate::dataflow::channel_operators::AsyncOutputReceiver<T, D>>()
-            .map(|boxed| *boxed)
-            .map_err(|_| {
-                Error::Runtime(RuntimeError::InvalidConfig(format!(
-                    "output port '{name}' was not wired for async I/O (spawn with IoMode::Async)"
-                )))
-            })
+        Self::take_port(
+            &mut self.output_receivers,
+            name,
+            std::any::type_name::<D>(),
+            "output",
+            "was not wired for async I/O (spawn with IoMode::Async, or use take_output())",
+        )
     }
 
     /// Cancel the running dataflow.
