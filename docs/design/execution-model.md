@@ -115,6 +115,17 @@ Worker threads follow a **spin → yield → park → shutdown** idle strategy:
 3. **Parking** (condvar wait): Thread parks on a condition variable. Woken by a new task enqueue. Near-zero CPU usage while parked.
 4. **Shutdown**: After `idle_shutdown` duration with no work, threads above `min_threads` exit. The pool shrinks to conserve resources.
 
+Before parking, a worker rechecks both the activation queue and the executor
+registry under a shared park mutex. Both enqueue paths acquire that same mutex
+before notifying the condition variable, after releasing any queue lock. This
+prevents a notification from being lost between the final empty check and the
+wait; queued work must not depend on the idle-shutdown timer to become runnable.
+
+Executor wakes also retry if a concurrent poll changes `POLLING` to `IDLE`
+between compare-and-exchange attempts. A wake that changes `IDLE` to `QUEUED`
+enqueues the task; one that changes `POLLING` to `QUEUED` leaves re-enqueueing
+to the polling worker.
+
 **Growing the pool**: When a task is enqueued and all threads are busy (active_count == current thread count < max_threads), a new thread is spawned immediately.
 
 ```rust
