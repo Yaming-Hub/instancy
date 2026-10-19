@@ -37,6 +37,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Add external-input throughput benchmarks for sync/async batch submission with
   and without per-batch frontier advancement.
 
+## [0.1.3] - 2026-10-15
+
+### Added
+- Async `spawn_cluster` API (#275)
+- Fallible pipe batch combinators (#274)
+- Stress benchmarks covering endurance, resource-constrained, and ramp-up workloads
+
+#### Documentation
+- Clarify watermark-based progress tracking in the README comparison table (#268)
+
+### Fixed
+- Prevent data loss in iterate-plus-exchange flows by accounting for in-flight messages (#280)
+- Resolve rustfmt and clippy CI failures (#283)
+
+## [0.1.2] - 2026-05-13
+
 ### Added
 
 #### Observability
@@ -137,8 +153,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Observability tracing tests for parallel execution (#224)
 - Shared transport race condition (#200)
 - README inaccuracies (#218)
-
-## [0.2.0] - 2026-05-05
 
 ### Added
 
