@@ -1120,6 +1120,82 @@ mod tests {
     }
 
     #[test]
+    fn panicking_destructor_still_publishes_the_result() {
+        struct BombOnDrop;
+        impl Drop for BombOnDrop {
+            fn drop(&mut self) {
+                panic!("destructor panic");
+            }
+        }
+        struct Finishes(#[allow(dead_code)] BombOnDrop);
+        impl Future for Finishes {
+            type Output = Result<bool>;
+            fn poll(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Self::Output> {
+                Poll::Ready(Ok(true))
+            }
+        }
+
+        let (completion, notifier) = make_notifier();
+        let task = ExecutorTask::new(
+            TaskId(0),
+            DataflowId::new(),
+            0,
+            Box::pin(Finishes(BombOnDrop)),
+            notifier,
+        );
+        assert!(task.try_start_poll());
+        let mut cx = Context::from_waker(std::task::Waker::noop());
+        assert_eq!(task.poll(&mut cx), PollOutcome::Completed);
+        assert!(completion.wait().is_ok());
+    }
+
+    #[test]
+    fn concurrent_wakes_never_resurrect_an_aborted_task() {
+        struct Holds;
+        impl Future for Holds {
+            type Output = Result<bool>;
+            fn poll(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Self::Output> {
+                Poll::Pending
+            }
+        }
+        for _ in 0..200 {
+            let registry = Arc::new(ExecutorRegistry::new_standalone());
+            let (completion, notifier) = make_notifier();
+            let task = registry.register(Box::pin(Holds), notifier, DataflowId::new(), 0);
+            // Park it as IDLE so wakes have something to race with.
+            let queued = registry.dequeue().unwrap();
+            assert!(queued.try_start_poll());
+            let mut cx = Context::from_waker(std::task::Waker::noop());
+            assert_eq!(queued.poll(&mut cx), PollOutcome::Pending);
+
+            let wakers: Vec<_> = (0..4)
+                .map(|_| {
+                    let waker: std::task::Waker =
+                        Arc::new(PoolWaker::new(Arc::clone(&task), Arc::clone(&registry))).into();
+                    std::thread::spawn(move || {
+                        for _ in 0..50 {
+                            waker.wake_by_ref();
+                        }
+                    })
+                })
+                .collect();
+            registry.abort_all();
+            for waker in wakers {
+                waker.join().unwrap();
+            }
+            assert!(task.is_done());
+            // A wake that enqueued before the abort may linger; it must be inert.
+            while let Some(stale) = registry.dequeue() {
+                assert!(!stale.try_start_poll(), "aborted task was polled again");
+            }
+            assert!(matches!(
+                completion.wait(),
+                Err(crate::error::Error::Cancelled { .. })
+            ));
+        }
+    }
+
+    #[test]
     fn abort_all_completes_unpolled_tasks_with_runtime_shutdown() {
         let registry = Arc::new(ExecutorRegistry::new_standalone());
         let alive = Arc::new(());

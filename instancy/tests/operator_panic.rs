@@ -413,6 +413,240 @@ fn concurrent_panics_do_not_leak_executors() {
     assert_eq!(rt.active_dataflows(), 0);
 }
 
+/// A panic inside a notification callback that fires only when the input
+/// closes (end of stream).
+#[test]
+fn panic_in_end_of_stream_notification() {
+    quiet_intentional_panics();
+    for catch_panics in [false, true] {
+        let rt = runtime(1);
+        let builder = DataflowBuilder::<u64>::new("panic-notify");
+        builder.catch_panics(catch_panics);
+        builder
+            .input::<u64>("data")
+            .unwrap()
+            .unary_notify("boom-notify", |input, output, ctx| {
+                while let Some((time, data)) = input.next() {
+                    ctx.notify_at(time);
+                    output.push_vec(time, data);
+                }
+                if ctx.next_notification().is_some() {
+                    panic!("{PANIC_MESSAGE}");
+                }
+                Ok(())
+            })
+            .output("results")
+            .unwrap();
+        let mut handle = rt
+            .spawn(builder.build().unwrap(), SpawnOptions::new())
+            .unwrap();
+        let receiver = handle.take_output::<u64>("results").unwrap();
+        let sender = handle.take_input::<u64>("data").unwrap();
+        sender.send(0, vec![1, 2]).unwrap();
+        std::thread::sleep(Duration::from_millis(50));
+        drop(sender); // the notification fires once the input closes
+        assert_operator_panic(
+            within(TIMEOUT, move || handle.join_blocking()).expect("join stalled"),
+            "boom-notify",
+            &format!("notify catch_panics={catch_panics}"),
+        );
+        within(TIMEOUT, move || receiver.collect_data()).expect("output never closed");
+    }
+}
+
+/// The poison record is processed only after a graceful drain has begun.
+#[test]
+fn panic_during_graceful_drain() {
+    quiet_intentional_panics();
+    const LAST: u64 = 1_999;
+    for catch_panics in [false, true] {
+        let rt = runtime(1);
+        let builder = DataflowBuilder::<u64>::new("panic-drain");
+        builder.catch_panics(catch_panics);
+        builder
+            .input::<u64>("data")
+            .unwrap()
+            .map(
+                "boom-drain",
+                |_t, v| if v == LAST { boom(POISON) } else { v },
+            )
+            .output("results")
+            .unwrap();
+        let mut handle = rt
+            .spawn(
+                builder.build().unwrap(),
+                SpawnOptions::new().drain_on_cancel(Duration::from_secs(120)),
+            )
+            .unwrap();
+        let receiver = handle.take_output::<u64>("results").unwrap();
+        let sender = handle.take_input::<u64>("data").unwrap();
+        // Unread output backs the pipeline up before the poison is reached.
+        for v in 0..=LAST {
+            sender.send(0, vec![v]).unwrap();
+        }
+        std::thread::sleep(Duration::from_millis(100));
+        handle.cancel();
+        std::thread::sleep(Duration::from_millis(100));
+        let completion = handle.join();
+        // Reading lets the drain proceed to the poison record.
+        let reader = std::thread::spawn(move || receiver.collect_data().len());
+        assert_operator_panic(
+            within(TIMEOUT, move || completion.wait()).expect("join stalled"),
+            "boom-drain",
+            &format!("drain catch_panics={catch_panics}"),
+        );
+        within(TIMEOUT, move || reader.join().unwrap()).expect("output never closed");
+        assert!(sender.send(0, vec![0]).is_err());
+    }
+}
+
+/// One panicking dataflow must not disturb others sharing the pool.
+#[test]
+fn panicking_dataflow_does_not_disturb_neighbours() {
+    quiet_intentional_panics();
+    let rt = runtime(1);
+    let mut healthy = Vec::new();
+    for i in 0..8u64 {
+        let mut handle = rt
+            .spawn(
+                {
+                    let builder = DataflowBuilder::<u64>::new(format!("healthy-{i}"));
+                    builder
+                        .input::<u64>("data")
+                        .unwrap()
+                        .map("double", |_t, v| v * 2)
+                        .output("results")
+                        .unwrap();
+                    builder.build().unwrap()
+                },
+                SpawnOptions::new(),
+            )
+            .unwrap();
+        let sender = handle.take_input::<u64>("data").unwrap();
+        let receiver = handle.take_output::<u64>("results").unwrap();
+        healthy.push((sender, receiver, handle));
+    }
+    let builder = DataflowBuilder::<u64>::new("poisoned");
+    builder
+        .input::<u64>("data")
+        .unwrap()
+        .map("boom-neighbour", |_t, v| boom(v))
+        .output("results")
+        .unwrap();
+    let mut poisoned = rt
+        .spawn(builder.build().unwrap(), SpawnOptions::new())
+        .unwrap();
+    let poison_sender = poisoned.take_input::<u64>("data").unwrap();
+    for (sender, _, _) in &healthy {
+        sender.send(0, (0..100).collect()).unwrap();
+    }
+    poison_sender.send(0, vec![POISON]).unwrap();
+    assert_operator_panic(
+        within(TIMEOUT, move || poisoned.join_blocking()).expect("join stalled"),
+        "boom-neighbour",
+        "neighbours",
+    );
+    for (sender, receiver, handle) in healthy {
+        sender.send(1, (100..200).collect()).unwrap();
+        drop(sender);
+        within(TIMEOUT, move || handle.join_blocking())
+            .expect("healthy dataflow stalled")
+            .unwrap();
+        let mut values: Vec<u64> = receiver
+            .collect_data()
+            .into_iter()
+            .flat_map(|(_, d)| d)
+            .collect();
+        values.sort_unstable();
+        assert_eq!(values, (0..200).map(|v| v * 2).collect::<Vec<_>>());
+    }
+}
+
+/// Per-stage parallelism runs a different executor; its panics must surface
+/// the same way.
+#[test]
+fn staged_executor_panic_reports_operator() {
+    quiet_intentional_panics();
+    for catch_panics in [false, true] {
+        let rt = runtime(2);
+        let mut multi = rt
+            .spawn_multi(
+                "staged-panic",
+                1,
+                move |builder: &mut DataflowBuilder<u64>| {
+                    builder.catch_panics(catch_panics);
+                    builder
+                        .input::<u64>("data")?
+                        .exchange_to("scatter", 2, |v: &u64| *v)?
+                        .map("boom-staged", |_t, v| boom(v))
+                        .for_each("sink", |_t, _v| {});
+                    Ok(())
+                },
+                SpawnOptions::new(),
+            )
+            .unwrap();
+        let sender = multi.take_input::<u64>(0, "data").unwrap();
+        sender.send(0, (0..20).collect()).unwrap();
+        let completion = multi.join();
+        let result = within(TIMEOUT, move || completion.wait()).expect("staged join stalled");
+        assert_operator_panic(
+            result,
+            "boom-staged",
+            &format!("staged catch_panics={catch_panics}"),
+        );
+        assert!(sender.send(1, vec![1]).is_err());
+    }
+}
+
+/// Runtime drop racing with operator panics: every completion still resolves
+/// (as the panic or as runtime shutdown) and all I/O is released.
+#[test]
+fn runtime_drop_racing_operator_panics() {
+    quiet_intentional_panics();
+    for round in 0..20 {
+        let rt = runtime(2);
+        let mut completions = Vec::new();
+        let mut io = Vec::new();
+        for i in 0..6u64 {
+            let builder = DataflowBuilder::<u64>::new(format!("race-{i}"));
+            builder.catch_panics(i % 2 == 0);
+            builder
+                .input::<u64>("data")
+                .unwrap()
+                .map("boom-race", |_t, v| boom(v))
+                .output("results")
+                .unwrap();
+            let mut handle = rt
+                .spawn(builder.build().unwrap(), SpawnOptions::new())
+                .unwrap();
+            let sender = handle.take_input::<u64>("data").unwrap();
+            let receiver = handle.take_output::<u64>("results").unwrap();
+            sender.send(0, vec![1, POISON]).unwrap();
+            io.push((sender, receiver));
+            completions.push(handle.join());
+        }
+        if round % 2 == 0 {
+            std::thread::sleep(Duration::from_millis(round as u64));
+        }
+        drop(rt);
+        for completion in completions {
+            let result = within(TIMEOUT, move || completion.wait())
+                .unwrap_or_else(|| panic!("round {round}: completion never resolved"));
+            assert!(
+                matches!(
+                    result,
+                    Err(Error::OperatorPanic { .. }) | Err(Error::Cancelled { .. })
+                ),
+                "round {round}: unexpected {result:?}"
+            );
+        }
+        for (sender, receiver) in io {
+            assert!(sender.send(0, vec![1]).is_err());
+            within(TIMEOUT, move || receiver.collect_data()).expect("output never closed");
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Two-node loopback-TCP clusters (Dedicated and Shared transport)
 // ---------------------------------------------------------------------------

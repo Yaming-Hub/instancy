@@ -414,6 +414,68 @@ fn receiver_dropped_after_completion_and_late_take() {
     drop(receiver);
 }
 
+/// The receiver is dropped at an arbitrary point while the sink is actively
+/// forwarding; repeated to vary the interleaving.
+#[test]
+fn receiver_drop_races_an_active_sink() {
+    for round in 0..20u64 {
+        let rt = runtime(2);
+        let mut handle = rt
+            .spawn(identity_dataflow("drop-race"), SpawnOptions::new())
+            .unwrap();
+        let receiver = handle.take_output::<u64>("results").unwrap();
+        let sender = handle.take_input::<u64>("data").unwrap();
+        let consumer = std::thread::spawn(move || {
+            for _ in 0..round * 37 {
+                if receiver.recv().is_none() {
+                    break;
+                }
+            }
+            drop(receiver);
+        });
+        assert_eq!(send_all(sender), RECORDS as usize, "round {round}");
+        consumer.join().unwrap();
+        join(handle).unwrap_or_else(|e| panic!("round {round}: {e}"));
+    }
+}
+
+/// Dropping the whole handle (without joining) while its sink is blocked on
+/// an unread output cancels the dataflow and releases its senders.
+#[test]
+fn handle_dropped_while_sink_is_blocked() {
+    let rt = runtime(1);
+    let mut handle = rt
+        .spawn(identity_dataflow("handle-drop"), SpawnOptions::new())
+        .unwrap();
+    let receiver = handle.take_output::<u64>("results").unwrap();
+    let sender = handle.take_input::<u64>("data").unwrap();
+    let producer = std::thread::spawn(move || {
+        let mut sent = 0usize;
+        for i in 0..RECORDS {
+            if sender.send(0, vec![i]).is_err() {
+                break;
+            }
+            sent += 1;
+        }
+        sent
+    });
+    std::thread::sleep(Duration::from_millis(200));
+    drop(handle);
+    let sent = within(TIMEOUT, move || producer.join().unwrap())
+        .expect("sender stayed blocked after the handle was dropped");
+    assert!(
+        sent < RECORDS as usize,
+        "the cancelled dataflow kept accepting input"
+    );
+    within(TIMEOUT, move || receiver.collect_data()).expect("output never closed");
+    let idle = within(TIMEOUT, move || {
+        while rt.active_dataflows() > 0 {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    });
+    assert!(idle.is_some(), "cancelled dataflow never finished");
+}
+
 // ---------------------------------------------------------------------------
 // Two-node loopback-TCP clusters (Dedicated and Shared transport)
 // ---------------------------------------------------------------------------

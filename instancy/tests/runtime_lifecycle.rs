@@ -406,6 +406,30 @@ async fn shutdown_async_waits_for_every_in_flight_dataflow() {
 // External cancellation token bridge
 // ---------------------------------------------------------------------------
 
+#[test]
+fn external_token_cancelled_before_spawn_cancels_immediately() {
+    let rt = runtime(1);
+    let token = tokio_util::sync::CancellationToken::new();
+    token.cancel();
+    let mut handle = rt
+        .spawn(
+            idle_dataflow("pre-cancelled"),
+            SpawnOptions::new().cancellation_token(token),
+        )
+        .unwrap();
+    let _input = handle.take_input::<u64>("data").unwrap();
+    let result = within(TIMEOUT, move || handle.join_blocking()).expect("never cancelled");
+    assert!(
+        matches!(
+            result,
+            Err(Error::Cancelled {
+                reason: Some(CancellationReason::UserRequested)
+            })
+        ),
+        "unexpected {result:?}"
+    );
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn external_cancellation_bridge_tasks_exit_when_dataflows_finish() {
     let rt = runtime(2);
@@ -666,8 +690,8 @@ fn drain_delivers_exactly_the_accepted_records_under_racing_senders() {
     }
 }
 
-/// `source_async` producers are stopped by a drain; whatever they managed to
-/// send is delivered.
+/// `source_async` producers are stopped by a drain; exactly what they managed
+/// to send is delivered.
 #[test]
 fn drain_stops_async_sources() {
     let rt = runtime(2);
@@ -679,6 +703,8 @@ fn drain_stops_async_sources() {
             let counter = Arc::clone(&counter);
             async move {
                 let mut v = 0u64;
+                // `send` either enqueues or (if cancelled) does nothing, and the
+                // count update cannot be interrupted, so `counter` is exact.
                 while sender.send(0, vec![v]).await.is_ok() {
                     counter.fetch_add(1, Ordering::SeqCst);
                     v += 1;
@@ -702,14 +728,17 @@ fn drain_stops_async_sources() {
             .map(|(_, d)| d.len())
             .sum::<usize>()
     });
-    std::thread::sleep(Duration::from_millis(100));
+    let started = Instant::now();
+    while produced.load(Ordering::SeqCst) < 100 {
+        assert!(started.elapsed() < TIMEOUT, "async source never produced");
+        std::thread::sleep(Duration::from_millis(5));
+    }
     handle.cancel();
     within(TIMEOUT, move || handle.join_blocking())
         .expect("drain never finished with an endless async source")
         .unwrap();
     let delivered = consumer.join().unwrap();
-    assert!(delivered > 0);
-    assert!(delivered <= produced.load(Ordering::SeqCst));
+    assert_eq!(delivered, produced.load(Ordering::SeqCst));
 }
 
 /// An operator error in one worker must stop drain-configured siblings at
@@ -820,4 +849,101 @@ fn sibling_failure_during_drain_stops_the_drain() {
         "a failed worker fails the dataflow: {result:?}"
     );
     within(TIMEOUT, move || backlog.join().unwrap()).expect("worker 1 input stayed open");
+}
+
+// ---------------------------------------------------------------------------
+// Two-node loopback-TCP clusters (Dedicated and Shared transport)
+// ---------------------------------------------------------------------------
+
+#[cfg(feature = "transport")]
+#[path = "support/cluster_loopback.rs"]
+mod cluster_loopback;
+
+#[cfg(feature = "transport")]
+mod cluster {
+    use super::*;
+
+    use super::cluster_loopback::{Transport, spawn_pair};
+    use instancy::{ClusterTopology, DataflowId, NodeConfig};
+
+    /// Dropping one node's runtime mid-run resolves that node's completion
+    /// and stops the peer instead of leaving it waiting forever.
+    async fn runtime_drop(transport: Transport) {
+        let topology = ClusterTopology::multi_node(vec![
+            NodeConfig::new("node-a", 1),
+            NodeConfig::new("node-b", 1),
+        ])
+        .unwrap();
+        let build = |builder: &mut DataflowBuilder<u64>| -> Result<()> {
+            builder
+                .input::<u64>("data")?
+                .exchange("spread", |v: &u64| *v)
+                .output("results")?;
+            Ok(())
+        };
+        let (nodes, mut a, mut b) = spawn_pair(
+            transport,
+            topology,
+            DataflowId::new(),
+            build,
+            SpawnOptions::new(),
+        )
+        .await;
+        let (sa, sb) = (
+            a.take_input::<u64>(0, "data").unwrap(),
+            b.take_input::<u64>(0, "data").unwrap(),
+        );
+        let (oa, ob) = (
+            a.take_output::<u64>(0, "results").unwrap(),
+            b.take_output::<u64>(0, "results").unwrap(),
+        );
+        sa.send(0, vec![1, 2, 3]).unwrap();
+        sb.send(0, vec![4, 5, 6]).unwrap();
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        // Hold node A's completion unresolved until node B stops: resolving it
+        // tears node A's bridges down, which races the cancellation message to
+        // node B (cluster teardown ordering is out of scope here).
+        let completion_a = a.join().unwrap();
+
+        let rt_a = nodes.rt_a;
+        tokio::task::spawn_blocking(move || drop(rt_a))
+            .await
+            .unwrap();
+        assert!(sa.send(1, vec![1]).is_err());
+        tokio::task::spawn_blocking(move || within(TIMEOUT, move || oa.collect_data()))
+            .await
+            .unwrap()
+            .expect("node-a output never closed");
+
+        // Node B keeps its input open: only node A's departure can stop it.
+        tokio::time::timeout(TIMEOUT, nodes.rt_b.wait_idle())
+            .await
+            .unwrap_or_else(|_| panic!("{transport:?}: node-b kept running"));
+        let ra = tokio::time::timeout(TIMEOUT, completion_a)
+            .await
+            .unwrap_or_else(|_| panic!("{transport:?}: node-a completion never resolved"));
+        assert!(
+            is_runtime_shutdown(&ra),
+            "{transport:?}: node-a should report RuntimeShutdown, got {ra:?}"
+        );
+        let rb = tokio::task::spawn_blocking(move || within(TIMEOUT, move || b.join_blocking()))
+            .await
+            .unwrap()
+            .expect("node-b completion never resolved");
+        assert!(
+            rb.is_err(),
+            "{transport:?}: node-b cannot succeed, got {rb:?}"
+        );
+        drop((sb, ob));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn dedicated_cluster_runtime_drop_stops_both_nodes() {
+        runtime_drop(Transport::Dedicated).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn shared_cluster_runtime_drop_stops_both_nodes() {
+        runtime_drop(Transport::Shared).await;
+    }
 }
