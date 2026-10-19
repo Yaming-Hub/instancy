@@ -1,7 +1,7 @@
 //! # Probe Example
 //!
-//! Demonstrates using a `ProbeHandle` to observe the input frontier of an
-//! operator — tracking progress through the dataflow.
+//! Demonstrates using a `ProbeHandle` to observe the frontier of a stream —
+//! tracking progress through the dataflow.
 //!
 //! ```bash
 //! cargo run --example probe
@@ -22,8 +22,6 @@ fn main() {
         ],
     );
 
-    // Add a pass-through operator so the probe observes an input frontier
-    // that actually advances (probes on source operators never advance).
     let stream = stream.map("pass", |_t, x| x);
 
     // Attach a probe to observe the frontier after this point.

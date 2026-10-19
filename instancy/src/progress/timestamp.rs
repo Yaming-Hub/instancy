@@ -12,6 +12,11 @@ use crate::order::{PartialOrder, Product};
 /// Timestamps must be partially ordered (for progress tracking), totally ordered
 /// (for canonical sorting in antichains and change batches), cloneable, and safe
 /// to send across async task boundaries.
+///
+/// The `Ord` implementation must be a *linear extension* of the partial order:
+/// `a.less_equal(&b)` must imply `a <= b`. Notifications are delivered in `Ord`
+/// order, which is then guaranteed to respect the partial order. All built-in
+/// timestamps (integers and the lexicographic [`Product`]) satisfy this.
 pub trait Timestamp:
     Clone + Eq + PartialOrder + Ord + Debug + Default + Send + Sync + 'static
 {

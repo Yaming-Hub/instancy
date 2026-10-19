@@ -809,33 +809,29 @@ async fn staged_iterate_rejects_unequal_feedback_parallelism() {
 /// would project it onto its outer coordinate `Product<u64, u32>`, and the outer
 /// scope in turn onto the root epoch `u64`.
 ///
-/// IGNORED — nested `iterate` is NOT currently supported, for a reason that is
-/// PRE-EXISTING and INDEPENDENT of this PR's #277 in-flight accounting fix.
+/// IGNORED — hangs with 2 workers, for a reason unrelated to nesting itself.
 ///
-/// ## Root cause (verified)
+/// Nested `iterate` used to fail at materialization (`MissingFactory`) because
+/// the loop-body merge computed the feedback-factory offset after appending the
+/// body's feedback edges, and the in-flight binding of an exchange in a
+/// doubly-nested body was projected through one scope level only (so the
+/// channel silently ran without in-flight accounting). Both are fixed; nested
+/// loops with exchanges in either body are covered by
+/// `tests/iterate_nesting.rs`. This test still hangs deterministically with 2
+/// workers because `outer-redist` consumes the inner loop's `leave` output
+/// directly. Only `map`/`filter`-style unary operators (and the loop concat)
+/// record the producer-side in-flight `+count` for an exchange they feed;
+/// `leave` (like sources, `unary_notify`/`reduce`, `binary`, `concat`, ...)
+/// does not, while the exchange consumer always records `-count`, so the
+/// loop is never recognized as complete (the same `leave -> exchange` shape
+/// hangs with a single loop level). Inserting a `map` between `leave` and the
+/// exchange makes the dataflow complete.
 ///
-/// With two levels of `iterate`, materialization fails before any data flows,
-/// with `MissingFactory { edge_index: N }` ("missing factory for edge index N").
-/// `DataflowBuilder::iterate` builds the loop body in a nested `BuilderState`
-/// and merges it into the parent, re-indexing the body's exchange factory
-/// creators by `inner_edge_offset = parent.graph.edges().len()`
-/// (dataflow_builder.rs ~2740, ~2803). This single-level offset does not compose
-/// correctly through a second nesting level: the middle scope's already-offset
-/// exchange-creator edge indices are offset again by the outer merge and no
-/// longer line up with the flattened parent graph's edge numbering, so an
-/// exchange edge is left without a factory. This reproduces with an exchange in
-/// EITHER the inner OR the outer loop of a nested pair — it is a nested-scope
-/// edge-index composition bug, not specific to the inner-exchange projection.
-///
-/// Because materialization fails first, the single-level nature of the in-flight
-/// projection (`p.outer`, subgraph.rs `drain_inflight_projected`) is not even
-/// exercised here; fixing nested-scope materialization is a prerequisite and is
-/// out of scope for the #277 data-loss fix. Un-ignore once nested-scope exchange
-/// edge indexing composes correctly.
+/// Un-ignore once every exchange-feeding operator sources in-flight counts.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "nested iterate with exchange is unsupported: nested-scope exchange \
-            edge-index composition bug in materialization; pre-existing and \
-            independent of the #277 fix"]
+#[ignore = "hangs with 2 workers: the inner loop's leave feeds an exchange \
+            directly and leave records no producer-side in-flight count; \
+            nested iterate itself works (see doc comment)"]
 async fn multi_worker_nested_iterate_inner_exchange() {
     let results = run_multi_worker_iterate(
         "mw-nested",

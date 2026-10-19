@@ -45,7 +45,7 @@ use crate::dataflow::graph::DataflowGraph;
 use crate::dataflow::operators::handles::{InputHandle, NotifyContext, OutputHandle};
 use crate::dataflow::operators::input::InputEvent;
 use crate::dataflow::operators::output::OutputEvent;
-use crate::dataflow::probe::ProbeHandle;
+use crate::dataflow::probe::{ProbeHandle, ProbeRegistration};
 use crate::dataflow::schedulable::{
     ChannelEndpoints, ChannelFactory, OperatorFactory, SchedulableOperator,
 };
@@ -118,8 +118,9 @@ struct BuilderState<T: Timestamp> {
     /// ChannelSourceOperator + pump task at spawn time.
     /// Tuple: (operator_index, wiring_closure).
     async_source_wiring: Vec<(usize, AsyncSourceWiring)>,
-    probes: Vec<(usize, ProbeHandle<T>)>,
-    probe_notifiers: Vec<crate::dataflow::probe::ProbeNotifier<T>>,
+    /// Probes attached to streams of this scope (including probes declared in
+    /// nested `iterate` bodies, lifted to this scope's timestamp).
+    probes: Vec<ProbeRegistration<T>>,
     /// Type-erased exchange factory creators — one per exchange edge.
     /// Tuple: (edge_index, capacity, creator_fn).
     exchange_creators: Vec<(
@@ -157,9 +158,16 @@ struct BuilderState<T: Timestamp> {
     /// zero before declaring a feedback loop converged (its per-stage trackers
     /// cannot account a loop body that crosses a stage boundary).
     loop_inflight_counters: Vec<std::sync::Arc<std::sync::atomic::AtomicI64>>,
+    /// Projection of this scope's timestamps onto the dataflow's root
+    /// timestamp. `None` at the root; set for `iterate` bodies so outputs
+    /// declared inside a loop report at the root timestamp.
+    root_time_projector: Option<RootTimeProjector<T>>,
     /// Errors encountered during graph construction. Checked in `build()`.
     builder_errors: Vec<Error>,
 }
+
+/// Projects a timestamp onto the dataflow's root timestamp, type-erased.
+type RootTimeProjector<T> = Arc<dyn Fn(&T) -> Box<dyn std::any::Any + Send> + Send + Sync>;
 
 /// Type-erased closure for wiring an input port during spawn().
 /// Captures the data type D and creates:
@@ -296,7 +304,6 @@ impl<T: Timestamp> DataflowBuilder<T> {
                 output_port_wiring: Vec::new(),
                 async_source_wiring: Vec::new(),
                 probes: Vec::new(),
-                probe_notifiers: Vec::new(),
                 exchange_creators: Vec::new(),
                 #[cfg(feature = "transport")]
                 exchange_network_creators: Vec::new(),
@@ -308,6 +315,7 @@ impl<T: Timestamp> DataflowBuilder<T> {
                 catch_panics: false,
                 max_idle_sweeps: None,
                 loop_inflight_counters: Vec::new(),
+                root_time_projector: None,
                 builder_errors: Vec::new(),
             })),
         }
@@ -1057,7 +1065,6 @@ impl<T: Timestamp> DataflowBuilder<T> {
             output_port_wiring: state.output_port_wiring,
             async_source_wiring: state.async_source_wiring,
             probes: state.probes,
-            probe_notifiers: state.probe_notifiers,
             exchange_creators: state.exchange_creators,
             #[cfg(feature = "transport")]
             exchange_network_creators: state.exchange_network_creators,
@@ -1628,8 +1635,9 @@ impl<T: Timestamp, D: Clone + Send + 'static> Pipe<T, D> {
     /// then emitted at that timestamp. This ensures downstream operators see correct
     /// frontier progress.
     ///
-    /// The `delay_fn` must return a timestamp `>= time` (the new timestamp must not
-    /// precede the original). Violating this will panic.
+    /// The `delay_fn` must return a timestamp `>= time` in the partial order (the new
+    /// timestamp must not precede, or be incomparable to, the original). Violating
+    /// this fails the operator with an error.
     ///
     /// # Use cases
     /// - **Per-item windowing**: assign items to windows based on content
@@ -1652,9 +1660,9 @@ impl<T: Timestamp, D: Clone + Send + 'static> Pipe<T, D> {
             while let Some((time, data)) = input.next() {
                 for item in data {
                     let new_time = delay_fn(&time, &item);
-                    if new_time < time {
+                    if !time.less_equal(&new_time) {
                         return Err(Error::Dataflow(DataflowError::InvalidConfig(
-                            "delay_fn must not return a timestamp earlier than the input".into(),
+                            "delay_fn must return a timestamp at or after the input time".into(),
                         )));
                     }
                     stash.entry(new_time.clone()).or_default().push(item);
@@ -1677,8 +1685,9 @@ impl<T: Timestamp, D: Clone + Send + 'static> Pipe<T, D> {
     /// on the original timestamp, not the data content. All items at a given timestamp
     /// are re-assigned to the same new timestamp.
     ///
-    /// The `delay_fn` must return a timestamp `>= t` (the new timestamp must not
-    /// precede the original). Violating this will panic.
+    /// The `delay_fn` must return a timestamp `>= t` in the partial order (the new
+    /// timestamp must not precede, or be incomparable to, the original). Violating
+    /// this fails the operator with an error.
     ///
     /// # Use cases
     /// - **Fixed windowing**: `delay_batch("window", |t| t / 10 * 10)` groups into 10-unit windows
@@ -1700,9 +1709,9 @@ impl<T: Timestamp, D: Clone + Send + 'static> Pipe<T, D> {
         self.add_unary_notify_internal(name, capacity, move |input, output, ctx| {
             while let Some((time, data)) = input.next() {
                 let new_time = delay_fn(&time);
-                if new_time < time {
+                if !time.less_equal(&new_time) {
                     return Err(Error::Dataflow(DataflowError::InvalidConfig(
-                        "delay_fn must not return a timestamp earlier than the input".into(),
+                        "delay_fn must return a timestamp at or after the input time".into(),
                     )));
                 }
                 stash.entry(new_time.clone()).or_default().extend(data);
@@ -1718,12 +1727,18 @@ impl<T: Timestamp, D: Clone + Send + 'static> Pipe<T, D> {
         .with_operator_kind("delay_batch")
     }
 
-    /// Pass through the first `count` elements, then stop.
+    /// Pass through the first `count` elements, then drop the rest.
     ///
-    /// This is the dataflow equivalent of SQL `LIMIT`. After emitting `count`
-    /// items, the operator completes and its output closes. Downstream
-    /// operators in this branch will drain and finish, while other branches
-    /// of the dataflow continue running.
+    /// This is a **per-worker** limit, like the other stateful operators: in a
+    /// multi-worker dataflow each worker passes through the first `count`
+    /// elements it sees, so up to `count × workers` elements are emitted in
+    /// total. For a global limit (the equivalent of SQL `LIMIT`), first route
+    /// the stream to a single worker, e.g. with `exchange("one", |_| 0u8)`.
+    ///
+    /// After the limit is reached the operator keeps consuming (and
+    /// discarding) its input, so upstream operators are never blocked; the
+    /// operator and the operators downstream of it complete when its input
+    /// completes.
     ///
     /// # Example
     /// ```ignore
@@ -1748,14 +1763,13 @@ impl<T: Timestamp, D: Clone + Send + 'static> Pipe<T, D> {
         .with_operator_kind("take")
     }
 
-    /// Pass through elements while a predicate returns `true`, then stop.
+    /// Pass through elements while a predicate returns `true`, then drop the rest.
     ///
-    /// Once the predicate returns `false` for any element, the operator
-    /// stops emitting and completes. Remaining elements in the current
-    /// batch and all future batches are discarded.
-    ///
-    /// This enables condition-based early termination of a branch without
-    /// cancelling the entire dataflow.
+    /// Once the predicate returns `false` for any element, the operator stops
+    /// emitting: the remaining elements of the current batch and all future
+    /// batches are discarded. The decision is made per worker. As with
+    /// [`take`](Self::take), the operator keeps consuming its input and
+    /// completes when its input completes.
     ///
     /// # Example
     /// ```ignore
@@ -2290,17 +2304,23 @@ impl<T: Timestamp, D: Clone + Send + 'static> Pipe<T, D> {
     /// # Type Parameters
     /// - `TInner`: The inner timestamp type for the loop (typically `u32`)
     ///
+    /// # Nested scopes
+    ///
+    /// Loop bodies may contain further `iterate` scopes, probes and named
+    /// outputs. A probe inside a body is tracked at the granularity of the
+    /// enclosing epoch (`(e, i)` is complete once epoch `e` is complete), and a
+    /// named output inside a body delivers each batch at the dataflow's outer
+    /// timestamp.
+    ///
     /// # Limitations
     ///
-    /// **Nested `iterate` scopes are not currently supported when the dataflow
-    /// contains an `exchange`.** A doubly-nested loop (calling `iterate` again
-    /// inside a loop body) fails at materialization with
-    /// [`DataflowError::MissingFactory`] as soon as any `exchange` edge is
-    /// present in either the inner or outer loop. The loop-body merge re-indexes
-    /// exchange factory creators with a single-level `inner_edge_offset`, which
-    /// does not compose correctly through a second nesting level. Use a single
-    /// loop scope (flattening nested iteration into one loop) until nested-scope
-    /// exchange edge indexing is fixed.
+    /// Only `map`/`filter`-style unary operators (and the loop's internal
+    /// concat) record the sending side of the in-flight accounting for an
+    /// `exchange` they feed. When any other operator feeds an `exchange` (for
+    /// example a loop's output, or `reduce`/`unary_notify`, `binary`,
+    /// `concat` or a source inside a loop body), a multi-worker loop may never
+    /// be recognized as complete and the dataflow may not terminate. Insert a
+    /// `map` in front of such an exchange.
     ///
     /// # Example
     /// ```ignore
@@ -2717,6 +2737,14 @@ impl<T: Timestamp, D: Clone + Send + 'static> Pipe<T, D> {
         // Inherit parent context so operators inside loops can access the same
         // context values. SharedContext::clone() is cheap (shares Arc pointers).
         let parent_contexts = self.state.borrow().contexts.clone();
+        let parent_collect_index = self.state.borrow().next_collect_index;
+        let inner_projector: RootTimeProjector<PT<T, TInner>> =
+            match self.state.borrow().root_time_projector.clone() {
+                Some(project) => Arc::new(move |time: &PT<T, TInner>| project(&time.outer)),
+                None => Arc::new(|time: &PT<T, TInner>| {
+                    Box::new(time.outer.clone()) as Box<dyn std::any::Any + Send>
+                }),
+            };
         let inner_state: Rc<RefCell<BuilderState<Product<T, TInner>>>> =
             Rc::new(RefCell::new(BuilderState {
                 graph: DataflowGraph::new(),
@@ -2730,18 +2758,18 @@ impl<T: Timestamp, D: Clone + Send + 'static> Pipe<T, D> {
                 output_port_wiring: Vec::new(),
                 async_source_wiring: Vec::new(),
                 probes: Vec::new(),
-                probe_notifiers: Vec::new(),
                 exchange_creators: Vec::new(),
                 #[cfg(feature = "transport")]
                 exchange_network_creators: Vec::new(),
                 next_operator_index: inner_start_idx,
-                next_collect_index: 0,
+                next_collect_index: parent_collect_index,
                 channel_capacity: capacity,
                 channel_preallocate: None,
                 contexts: parent_contexts,
                 catch_panics: false,
                 max_idle_sweeps: None,
                 loop_inflight_counters: Vec::new(),
+                root_time_projector: Some(inner_projector),
                 builder_errors: Vec::new(),
             }));
 
@@ -2807,6 +2835,9 @@ impl<T: Timestamp, D: Clone + Send + 'static> Pipe<T, D> {
             for edge in inner.graph.edges() {
                 state.graph.add_edge(edge.clone());
             }
+            // Inner feedback edge k becomes parent feedback edge fb_offset + k;
+            // the offset must be taken before the inner edges are appended.
+            let fb_offset = state.graph.feedback_edges().len();
             for edge in inner.graph.feedback_edges() {
                 state.graph.add_feedback_edge(edge.clone());
             }
@@ -2842,13 +2873,13 @@ impl<T: Timestamp, D: Clone + Send + 'static> Pipe<T, D> {
             // `Product<T, TInner>`; the parent tracker is `T`, so each binding is
             // registered with an outer-epoch projection (the shared reporter is
             // recorded by the loop-body channel and drained, projected, by the
-            // parent tracker). Operator indices are preserved across the merge,
-            // so source/target locations stay valid.
-            let inner_inflight = inner.subgraph_builder.inflight_edges_for_merge();
-            for (source, target, reporter) in inner_inflight {
+            // parent tracker). Bindings the body itself carried up from deeper
+            // loops are projected once more. Operator indices are preserved
+            // across the merge, so source/target locations stay valid.
+            for binding in inner.subgraph_builder.inflight_edges_for_merge() {
                 state
                     .subgraph_builder
-                    .register_loop_inflight_edge::<TInner>(source, target, reporter);
+                    .register_loop_inflight_edge::<TInner>(binding);
             }
 
             // Merge factories (offset inner channel factory indices)
@@ -2859,7 +2890,6 @@ impl<T: Timestamp, D: Clone + Send + 'static> Pipe<T, D> {
                     .push((edge_idx + inner_edge_offset, factory));
             }
             // Merge inner feedback channel factories (offset by parent's existing feedback edges)
-            let fb_offset = state.graph.feedback_edges().len();
             for (fb_idx, factory) in inner.feedback_channel_factories {
                 state
                     .feedback_channel_factories
@@ -2884,6 +2914,32 @@ impl<T: Timestamp, D: Clone + Send + 'static> Pipe<T, D> {
             for (op_idx, par) in inner.graph.exchange_parallelism_map() {
                 state.graph.set_exchange_parallelism(*op_idx, *par);
             }
+            // Carry up what the loop body declared for the runtime: nested loop
+            // counters, probes (re-expressed in this scope's timestamp) and
+            // output ports (their sinks already report at the root timestamp).
+            state
+                .loop_inflight_counters
+                .extend(inner.loop_inflight_counters);
+            state.probes.extend(
+                inner
+                    .probes
+                    .into_iter()
+                    .map(ProbeRegistration::lift_to_outer),
+            );
+            for (port, wiring) in inner.output_ports.into_iter().zip(inner.output_port_wiring) {
+                if state.output_ports.iter().any(|p| p.name == port.name) {
+                    state
+                        .builder_errors
+                        .push(Error::Dataflow(DataflowError::InvalidConfig(format!(
+                            "duplicate output port name: {}",
+                            port.name
+                        ))));
+                    continue;
+                }
+                state.output_ports.push(port);
+                state.output_port_wiring.push(wiring);
+            }
+            state.next_collect_index = state.next_collect_index.max(inner.next_collect_index);
             state.builder_errors.extend(inner.builder_errors);
 
             // Wire output: result.output → leave_op input (regular edge)
@@ -3185,6 +3241,12 @@ impl<T: Timestamp, D: Clone + Send + 'static> Pipe<T, D> {
     ///
     /// For immediate testing, use [`collect`](Self::collect) instead.
     ///
+    /// An output declared inside an [`iterate`](Self::iterate) body is exposed
+    /// like any other output (e.g. via `take_output`), with each batch reported
+    /// at the dataflow's outer timestamp: a batch produced at `Product(t, i)`
+    /// is delivered at time `t`. Its [`OutputPort::collector`] (used by
+    /// `run()`) keeps the loop timestamps.
+    ///
     /// # Example
     ///
     /// ```ignore
@@ -3195,8 +3257,14 @@ impl<T: Timestamp, D: Clone + Send + 'static> Pipe<T, D> {
     ///     println!("t={time}: {batch:?}");
     /// }
     /// ```
-    pub fn output(mut self, name: impl Into<String>) -> Result<OutputPort<T, D>> {
-        let name = name.into();
+    pub fn output(self, name: impl Into<String>) -> Result<OutputPort<T, D>> {
+        self.output_port(name.into(), true)
+    }
+
+    /// Shared implementation of [`output`](Self::output) and
+    /// [`collect`](Self::collect). `expose` registers the port so the runtime
+    /// wires it to an external receiver at spawn time.
+    fn output_port(mut self, name: String, expose: bool) -> Result<OutputPort<T, D>> {
         let collector = Arc::new(Mutex::new(Vec::new()));
         let op_idx;
         let capacity = self.resolve_capacity();
@@ -3206,7 +3274,7 @@ impl<T: Timestamp, D: Clone + Send + 'static> Pipe<T, D> {
             let mut state = self.state.borrow_mut();
 
             // Validate unique name
-            if state.output_ports.iter().any(|p| p.name == name) {
+            if expose && state.output_ports.iter().any(|p| p.name == name) {
                 return Err(Error::Dataflow(DataflowError::InvalidConfig(format!(
                     "duplicate output port name: {name}"
                 ))));
@@ -3248,11 +3316,13 @@ impl<T: Timestamp, D: Clone + Send + 'static> Pipe<T, D> {
             );
 
             // Record port metadata
-            state.output_ports.push(OutputPortInfo {
-                name: name.clone(),
-                operator_index: op_idx,
-                type_name: std::any::type_name::<D>(),
-            });
+            if expose {
+                state.output_ports.push(OutputPortInfo {
+                    name: name.clone(),
+                    operator_index: op_idx,
+                    type_name: std::any::type_name::<D>(),
+                });
+            }
 
             // Operator factory: collecting sink (used by run(), replaced by spawn())
             let collector_clone = Arc::clone(&collector);
@@ -3399,7 +3469,16 @@ impl<T: Timestamp, D: Clone + Send + 'static> Pipe<T, D> {
                     }
                 }
             });
-            state.output_port_wiring.push(wiring);
+            // Inside an `iterate` body the sink reports at the root timestamp.
+            let wiring = match &state.root_time_projector {
+                Some(projector) => {
+                    projected_output_wiring::<T, D>(name.clone(), op_idx, Arc::clone(projector))
+                }
+                None => wiring,
+            };
+            if expose {
+                state.output_port_wiring.push(wiring);
+            }
 
             // Channel factory for the input edge
             let edge_idx = state.graph.edges().len() - 1;
@@ -3441,19 +3520,22 @@ impl<T: Timestamp, D: Clone + Send + 'static> Pipe<T, D> {
     /// ```
     pub fn collect(self) -> Arc<Mutex<Vec<(T, Vec<D>)>>> {
         // Skip auto-generated names a user output already took.
-        let name = {
+        let (name, expose) = {
             let mut state = self.state.borrow_mut();
-            loop {
+            let name = loop {
                 let idx = state.next_collect_index;
                 state.next_collect_index += 1;
                 let name = format!("__collect_{idx}");
                 if !state.output_ports.iter().any(|p| p.name == name) {
                     break name;
                 }
-            }
+            };
+            // A collector inside an `iterate` body is read through the returned
+            // vector only; it is not registered as a spawn-time output port.
+            (name, state.root_time_projector.is_none())
         };
         let state = Rc::clone(&self.state);
-        match self.output(name) {
+        match self.output_port(name, expose) {
             Ok(port) => port.collector,
             Err(e) => {
                 // Surface the failure from `build()` instead of panicking here.
@@ -3462,6 +3544,86 @@ impl<T: Timestamp, D: Clone + Send + 'static> Pipe<T, D> {
             }
         }
     }
+}
+
+/// Spawn-time wiring for an output declared inside an `iterate` body: the sink
+/// projects each batch's loop timestamp onto the dataflow's root timestamp
+/// (type-erased, since `D` and the root timestamp are never both known at one
+/// place), and `take_output` turns the erased receiver back into a typed one.
+fn projected_output_wiring<T: Timestamp, D: Send + 'static>(
+    sink_name: String,
+    op_idx: usize,
+    projector: RootTimeProjector<T>,
+) -> OutputPortWiring {
+    use crate::dataflow::channel_operators::{
+        ChannelSinkOperator, ErasedOutputEvent, OutputSend, ProjectedAsyncOutputReceiver,
+        ProjectedOutputReceiver,
+    };
+
+    Box::new(move |mode, wake_handle| {
+        let (sender, receiver_any): (
+            OutputSend<ErasedOutputEvent<D>>,
+            Box<dyn std::any::Any + Send>,
+        ) = match mode {
+            ChannelMode::Sync => {
+                let (tx, rx) = std::sync::mpsc::sync_channel::<ErasedOutputEvent<D>>(256);
+                (
+                    OutputSend::Std(tx),
+                    Box::new(ProjectedOutputReceiver {
+                        receiver: rx,
+                        wake_handle,
+                    }),
+                )
+            }
+            ChannelMode::Async => {
+                let (tx, rx) = tokio::sync::mpsc::channel::<ErasedOutputEvent<D>>(256);
+                (
+                    OutputSend::Tokio(tx),
+                    Box::new(ProjectedAsyncOutputReceiver {
+                        receiver: rx,
+                        wake_handle,
+                    }),
+                )
+            }
+        };
+        let sink_name = sink_name.clone();
+        let projector = Arc::clone(&projector);
+        let mut sender = Some(sender);
+        let factory = OperatorFactory::new(move |_ctx, endpoints: ChannelEndpoints| {
+            let sender = sender.take().ok_or_else(|| {
+                Error::Runtime(crate::error::RuntimeError::AlreadyConsumed {
+                    resource: "output port channel (loop body)".into(),
+                })
+            })?;
+            let input_puller: Box<dyn Pull<T, D>> = *endpoints
+                .input_pullers
+                .into_iter()
+                .next()
+                .ok_or_else(|| {
+                    Error::Dataflow(DataflowError::MissingEndpoint {
+                        operator: "sink".into(),
+                        port: "input puller".into(),
+                    })
+                })?
+                .downcast::<Box<dyn Pull<T, D>>>()
+                .map_err(|_| {
+                    Error::Dataflow(DataflowError::TypeMismatch {
+                        operator: "sink".into(),
+                        port: "input puller".into(),
+                    })
+                })?;
+            let project = Arc::clone(&projector);
+            Ok(Box::new(ChannelSinkOperator::with_event_fn(
+                sink_name.clone(),
+                op_idx,
+                StageId::new(0),
+                input_puller,
+                sender,
+                Box::new(move |time: T, data: Vec<D>| (project(&time), data)),
+            )) as Box<dyn SchedulableOperator>)
+        });
+        (factory, receiver_any)
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -4400,9 +4562,23 @@ impl<T: Timestamp, D: Clone + Send + 'static> Pipe<T, D> {
             _phantom: PhantomData,
         }
     }
+
+    /// Attach a probe that observes the frontier of this stream.
     ///
     /// Returns `(Pipe, ProbeHandle)` — the Pipe continues unchanged,
-    /// and the probe can be queried after execution.
+    /// and the probe can be queried during and after execution.
+    ///
+    /// The probe reports the times that may still appear **on this stream**:
+    /// a time is complete only once the operator producing the stream (and
+    /// everything upstream of it) can no longer emit data at that time. For
+    /// example, a probe after a `unary_notify` operator stays at `t` while that
+    /// operator holds a capability for a pending notification at `t`, and a
+    /// probe placed directly on an input advances as the input advances.
+    ///
+    /// In a multi-worker dataflow the probe is monotone and conservative: it
+    /// reports the meet of the workers' views. Inside an `iterate` body the
+    /// probe is tracked at the granularity of the outer epoch: `(e, i)` is
+    /// complete once epoch `e` is complete.
     ///
     /// The returned `ProbeHandle` supports async waiting via
     /// [`wait_until_done_with`](ProbeHandle::wait_until_done_with) and
@@ -4417,12 +4593,8 @@ impl<T: Timestamp, D: Clone + Send + 'static> Pipe<T, D> {
     /// assert!(probe.is_done());
     /// ```
     pub fn probe(self) -> (Self, ProbeHandle<T>) {
-        let (probe, notifier) = ProbeHandle::new();
-        {
-            let mut state = self.state.borrow_mut();
-            state.probes.push((self.op_idx, probe.clone()));
-            state.probe_notifiers.push(notifier);
-        }
+        let (registration, probe) = ProbeRegistration::new(self.op_idx, self.output_slot);
+        self.state.borrow_mut().probes.push(registration);
         (self, probe)
     }
 
@@ -5584,8 +5756,7 @@ pub struct LogicalDataflow<T: Timestamp> {
     /// Consumed at spawn time to create pump tasks.
     /// Tuple: (operator_index, wiring_closure).
     pub(crate) async_source_wiring: Vec<(usize, AsyncSourceWiring)>,
-    pub(crate) probes: Vec<(usize, ProbeHandle<T>)>,
-    pub(crate) probe_notifiers: Vec<crate::dataflow::probe::ProbeNotifier<T>>,
+    pub(crate) probes: Vec<ProbeRegistration<T>>,
     /// Type-erased exchange factory creators — one per exchange edge.
     /// Consumed by `spawn_multi` to produce shared cross-worker channel factories.
     /// Tuple: (edge_index, capacity, creator_fn).

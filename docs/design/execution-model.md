@@ -2585,10 +2585,11 @@ graph LR
 The probe at C shows "all data through T=5 has been fully processed by
 the entire pipeline" — not just stage C. No global view needed.
 
-**Multi-worker probes** remain an existing limitation: if stage C has
-par=2, two StageExecutors update the same `ProbeHandle`. The frontier
-should be `min(C₀, C₁)`. This is the same probe aggregation issue that
-exists today (documented as a TODO), not a new problem from StageExecutors.
+**Multi-worker probes**: when several executors write the same
+`ProbeHandle` (e.g. the `spawn_multi` workers sharing a probe that was built
+once and materialized N times), each executor owns a writer slot; the handle
+publishes the meet `min(C₀, C₁, …)` of the slots and never moves backwards (a
+regressing view is held back until it catches up).
 
 #### Completion Detection
 

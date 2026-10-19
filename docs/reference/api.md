@@ -420,7 +420,9 @@ Async output handle used with `IoMode::Async`.
 
 ### `ProbeHandle<T>`
 
-Track frontier progress at a point in the graph.
+Track the frontier of the stream a probe is attached to (the times that may
+still appear on it). Monotone; with several workers, reports the meet of their
+views. Inside an `iterate` body, `(e, i)` is complete once epoch `e` is.
 
 - `done_with(&self, time: &T) -> bool`
 - `frontier(&self) -> Antichain<T>`

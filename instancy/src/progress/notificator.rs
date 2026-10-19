@@ -5,10 +5,18 @@
 //! (meaning no more data at that time can arrive), the notification becomes
 //! "ready" and can be delivered to the operator on its next activation.
 //!
-//! Notifications are **capability-backed**: operators request notification by
-//! providing a capability (or a time derived from a capability they hold).
-//! This ensures that only timestamps the operator legitimately participates in
-//! can be requested.
+//! Notifications are **capability-backed** at the operator level:
+//! [`NotifyContext::notify_at`](crate::dataflow::operators::handles::NotifyContext::notify_at)
+//! holds an output capability for every requested time and rejects times the
+//! operator cannot legitimately hold (times the input frontier has already
+//! passed and that are not covered by a held capability or a pending input
+//! batch). The `Notificator` itself is the low-level bookkeeping primitive and
+//! performs no such validation.
+//!
+//! Fired notifications are delivered in timestamp order (`Ord`, a linear
+//! extension of the partial order), so an operator that carries state across
+//! times (e.g. a running total) observes completed times in order even when
+//! several complete in the same frontier update.
 //!
 //! # Usage Pattern
 //!
@@ -106,10 +114,16 @@ impl<T: Timestamp> Notificator<T> {
 
         // If frontier already past this time, fire immediately
         if !self.frontier.less_equal(&time) {
-            self.ready.push_back(FiredNotification { time });
+            self.insert_ready(time);
         } else {
             self.pending.push(time);
         }
+    }
+
+    /// Inserts a fired time into `ready`, keeping it sorted by `Ord`.
+    fn insert_ready(&mut self, time: T) {
+        let pos = self.ready.partition_point(|n| n.time <= time);
+        self.ready.insert(pos, FiredNotification { time });
     }
 
     /// Returns the next ready notification, or `None` if no notifications have fired.
@@ -137,23 +151,51 @@ impl<T: Timestamp> Notificator<T> {
     ///
     /// Called by the executor after progress propagation. Returns the number
     /// of newly fired notifications.
+    ///
+    /// Ready notifications are delivered in timestamp order (`Ord`, which the
+    /// [`Timestamp`] contract requires to be a linear extension of the partial
+    /// order), regardless of the order in which they were requested or fired.
     pub fn update_frontier(&mut self, new_frontier: &Antichain<T>) -> usize {
         self.frontier = new_frontier.clone();
 
-        let mut fired = 0;
-        // Drain pending notifications that are now past the frontier
-        let mut i = 0;
-        while i < self.pending.len() {
-            if !self.frontier.less_equal(&self.pending[i]) {
-                let time = self.pending.swap_remove(i);
-                self.ready.push_back(FiredNotification { time });
-                fired += 1;
-                // Don't increment i — swap_remove moved last element to i
+        let frontier = &self.frontier;
+        let mut fired: Vec<T> = Vec::new();
+        self.pending.retain(|time| {
+            if frontier.less_equal(time) {
+                true
             } else {
-                i += 1;
+                fired.push(time.clone());
+                false
             }
+        });
+        let count = fired.len();
+        if count == 0 {
+            return 0;
         }
-        fired
+
+        fired.sort();
+        debug_assert!(
+            fired.windows(2).all(|w| !w[1].less_than(&w[0])),
+            "Timestamp Ord must be a linear extension of PartialOrder: {fired:?}"
+        );
+        if self.ready.is_empty() {
+            self.ready
+                .extend(fired.into_iter().map(|time| FiredNotification { time }));
+        } else {
+            let mut merged = VecDeque::with_capacity(self.ready.len() + count);
+            let mut new = fired.into_iter().peekable();
+            for existing in self.ready.drain(..) {
+                while new.peek().is_some_and(|t| *t < existing.time) {
+                    if let Some(time) = new.next() {
+                        merged.push_back(FiredNotification { time });
+                    }
+                }
+                merged.push_back(existing);
+            }
+            merged.extend(new.map(|time| FiredNotification { time }));
+            self.ready = merged;
+        }
+        count
     }
 
     /// Returns the current frontier known to this notificator.
@@ -174,6 +216,7 @@ impl<T: Timestamp> Notificator<T> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::order::PartialOrder;
 
     #[test]
     fn notify_at_fires_when_frontier_advances() {
@@ -304,5 +347,80 @@ mod tests {
 
         notificator.next();
         assert!(notificator.is_empty());
+    }
+
+    fn drain_times<T: Timestamp>(n: &mut Notificator<T>) -> Vec<T> {
+        std::iter::from_fn(|| n.next().map(FiredNotification::into_time)).collect()
+    }
+
+    #[test]
+    fn batch_fires_in_timestamp_order() {
+        let mut n = Notificator::new(Antichain::from_elem(0u64));
+        for t in [7u64, 3, 9, 5, 1, 8] {
+            n.notify_at(t);
+        }
+        assert_eq!(n.update_frontier(&Antichain::from_elem(10)), 6);
+        assert_eq!(drain_times(&mut n), vec![1, 3, 5, 7, 8, 9]);
+    }
+
+    #[test]
+    fn product_times_fire_in_a_linear_extension_of_the_partial_order() {
+        use crate::order::Product;
+        let mut n = Notificator::new(Antichain::from_elem(Product::new(0u64, 0u32)));
+        let times = [
+            Product::new(1u64, 0u32),
+            Product::new(0, 3),
+            Product::new(0, 1),
+            Product::new(1, 2),
+            Product::new(0, 2),
+            Product::new(2, 0),
+        ];
+        for t in times {
+            n.notify_at(t);
+        }
+        n.update_frontier(&Antichain::new());
+        let got = drain_times(&mut n);
+        assert_eq!(got.len(), times.len());
+        for i in 0..got.len() {
+            for j in i + 1..got.len() {
+                assert!(
+                    !got[j].less_than(&got[i]),
+                    "{:?} delivered before {:?}: {got:?}",
+                    got[i],
+                    got[j]
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn newly_fired_times_merge_ahead_of_unconsumed_later_times() {
+        use crate::order::Product;
+        // (0,5) fires first and is left unconsumed; then (1,0) and (0,7) fire.
+        let mut n = Notificator::new(Antichain::from_elem(Product::new(0u64, 0u32)));
+        n.notify_at(Product::new(0, 5));
+        n.notify_at(Product::new(0, 7));
+        n.notify_at(Product::new(1, 0));
+        n.update_frontier(&Antichain::from_elem_iter([
+            Product::new(0, 6),
+            Product::new(1, 0),
+        ]));
+        assert_eq!(n.ready_count(), 1);
+        n.update_frontier(&Antichain::new());
+        assert_eq!(
+            drain_times(&mut n),
+            vec![Product::new(0, 5), Product::new(0, 7), Product::new(1, 0)]
+        );
+    }
+
+    #[test]
+    fn immediately_fired_request_is_ordered_among_ready_notifications() {
+        let mut n = Notificator::new(Antichain::from_elem(0u64));
+        n.notify_at(4);
+        n.notify_at(8);
+        n.update_frontier(&Antichain::from_elem(10));
+        // Already complete: fires immediately and must be delivered first.
+        n.notify_at(2);
+        assert_eq!(drain_times(&mut n), vec![2, 4, 8]);
     }
 }

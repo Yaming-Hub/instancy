@@ -108,14 +108,18 @@ impl<T: Ord> ChangeBatch<T> {
     ///
     /// Sorts by key, sums values for identical keys, and removes zero entries.
     pub fn compact(&mut self) {
-        if self.clean < self.updates.len() && self.updates.len() > 1 {
-            self.updates.sort_unstable_by(|a, b| a.0.cmp(&b.0));
-            for i in 0..self.updates.len() - 1 {
-                if self.updates[i].0 == self.updates[i + 1].0 {
-                    self.updates[i + 1].1 += self.updates[i].1;
-                    self.updates[i].1 = 0;
+        if self.clean < self.updates.len() {
+            if self.updates.len() > 1 {
+                self.updates.sort_unstable_by(|a, b| a.0.cmp(&b.0));
+                for i in 0..self.updates.len() - 1 {
+                    if self.updates[i].0 == self.updates[i + 1].0 {
+                        self.updates[i + 1].1 += self.updates[i].1;
+                        self.updates[i].1 = 0;
+                    }
                 }
             }
+            // Also drops a lone zero-valued update, which the merge loop above
+            // never visits.
             self.updates.retain(|x| x.1 != 0);
         }
         self.clean = self.updates.len();
@@ -365,5 +369,24 @@ mod tests {
         assert!(batch.is_dirty());
         batch.compact();
         assert!(!batch.is_dirty());
+    }
+
+    #[test]
+    fn lone_zero_update_is_removed() {
+        let mut batch = ChangeBatch::new();
+        batch.update(5u64, 0);
+        assert!(batch.iter().next().is_none());
+        assert!(batch.is_empty());
+        assert_eq!(batch.len(), 0);
+
+        let mut batch = ChangeBatch::new();
+        batch.update(5u64, 0);
+        assert!(batch.drain().next().is_none());
+
+        // A zero update appended after an already-compacted entry is removed too.
+        let mut batch = ChangeBatch::new_from(1u64, 1);
+        batch.compact();
+        batch.update(2, 0);
+        assert_eq!(batch.iter().cloned().collect::<Vec<_>>(), vec![(1, 1)]);
     }
 }
