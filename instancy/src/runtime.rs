@@ -5789,6 +5789,17 @@ fn materialize_executor<T: Timestamp>(
     // so the tracker broadcasts capability changes to peers and absorbs
     // remote changes. This makes is_completed() reflect global state.
     let mut tracker = worker_subgraph_builder.build();
+    // A tracker attached to cross-worker progress channels has the global view
+    // of every probed stream, so a probe it writes is only fully observed once
+    // every worker's view is in. A worker-local tracker (single worker, or
+    // worker-local materialization such as `SimpleRuntime::spawn_multi`)
+    // observes only its own worker, and each such worker builds its own probes,
+    // so its writer alone covers the probe.
+    let probe_view_workers = if progress_channels.is_some() {
+        worker_context.num_workers()
+    } else {
+        1
+    };
     if let Some(channels) = progress_channels {
         tracker.set_progress_channels(channels)?;
     }
@@ -5798,9 +5809,8 @@ fn materialize_executor<T: Timestamp>(
     // Register probes. Each worker attaches its own writer to every probe; a
     // probe shared by several workers (build-once-materialize-N) reports the
     // monotone meet of their views (see `dataflow::probe`).
-    let total_workers = worker_context.num_workers();
     for registration in &dataflow.probes {
-        executor.register_probe(registration, total_workers);
+        executor.register_probe(registration, probe_view_workers);
     }
 
     Ok(executor)

@@ -16,7 +16,13 @@
 //! ## Guarantees
 //!
 //! - **Conservative**: the probe never reports a time as complete while the
-//!   progress tracker still considers it possible on the stream.
+//!   progress tracker still considers it possible on the stream. A probe
+//!   inside an `iterate` body, where data circulating on the feedback edge is
+//!   invisible to the tracker, stays at the minimum until the workers writing
+//!   it have completed instead (in a cluster it never completes; see
+//!   `Pipe::probe`). (A probe *downstream* of a loop inherits the tracker's
+//!   blind spot and can report an epoch complete while the loop still
+//!   iterates it.)
 //! - **Monotone**: the reported frontier only moves forward. When several
 //!   workers of a multi-worker dataflow observe the same probe, the probe
 //!   reports the *meet* of their views (a time is complete only once every
@@ -121,12 +127,14 @@ struct WriterSlot<T: Timestamp> {
 struct WriterSlots<T: Timestamp> {
     /// Per-writer views. One slot per executor observing this probe.
     slots: Vec<WriterSlot<T>>,
-    /// Number of workers in the dataflow the writers belong to (the largest
-    /// value reported at attach time). When every worker of the dataflow is a
-    /// writer of this probe, a finished writer is dropped from the meet: the
-    /// remaining writers' (global) views fully describe the stream, and once
-    /// all writers have finished no operator instance can produce on it.
-    /// Otherwise (e.g. one writer per node of a cluster) a finished writer's
+    /// Number of workers whose instances of the stream the writers' views
+    /// cover (the largest value reported at attach time): the dataflow's worker
+    /// count for writers with a global (cross-worker) tracker view, 1 for a
+    /// worker-local tracker. When the writers cover all of them, a finished
+    /// writer is dropped from the meet: the remaining writers' views fully
+    /// describe the stream, and once all writers have finished no operator
+    /// instance they cover can produce on it. Otherwise (e.g. one writer per
+    /// worker of a cluster, where every view is global) a finished writer's
     /// final view keeps constraining the probe, so a probe never claims
     /// completion of work that a remote worker may still be doing.
     expected_writers: usize,
@@ -352,40 +360,32 @@ impl<T: Timestamp> ProbeWriter<T> for SlotWriter<T> {
 
 /// Writer for a probe inside an `iterate` body: the executor tracker runs at
 /// the outer timestamp `T`, while the probe handle observes
-/// `Product<T, TInner>`. An outer frontier `F` is reported as
-/// `{ (t, TInner::minimum()) : t ∈ F }`: an inner time `(t, i)` is complete
-/// once the outer epoch `t` is complete, regardless of the iteration `i`.
+/// `Product<T, TInner>`.
+///
+/// Data circulating on a loop's feedback edge is not visible to progress
+/// tracking (enter, feedback and leave hold no capabilities), so the outer
+/// frontier the tracker reports for a loop-body stream passes epoch `e` as soon
+/// as the loop's input does, while `(e, i)` data may still circulate. No
+/// frontier the tracker computes is therefore safe to publish, and the writer
+/// holds its slot at the minimum until its executor completes (when every
+/// operator of the loop on that worker is done). The probe then becomes done
+/// once its writers are finished (see [`WriterSlots`]).
 struct LiftedWriter<T: Timestamp, TInner: Timestamp>
 where
     Product<T, TInner>: Timestamp,
 {
     inner: Box<dyn ProbeWriter<Product<T, TInner>>>,
-}
-
-impl<T: Timestamp, TInner: Timestamp> LiftedWriter<T, TInner>
-where
-    Product<T, TInner>: Timestamp,
-{
-    fn lift(frontier: &Antichain<T>) -> Antichain<Product<T, TInner>> {
-        frontier
-            .elements()
-            .iter()
-            .map(|t| Product::new(t.clone(), TInner::minimum()))
-            .collect()
-    }
+    _outer: std::marker::PhantomData<fn(T)>,
 }
 
 impl<T: Timestamp, TInner: Timestamp> ProbeWriter<T> for LiftedWriter<T, TInner>
 where
     Product<T, TInner>: Timestamp,
 {
-    fn update(&mut self, frontier: &Antichain<T>) {
-        self.inner.update(&Self::lift(frontier));
-    }
+    fn update(&mut self, _frontier: &Antichain<T>) {}
 
-    fn finish(&mut self, final_frontier: Option<&Antichain<T>>) {
-        let lifted = final_frontier.map(Self::lift);
-        self.inner.finish(lifted.as_ref());
+    fn finish(&mut self, _final_frontier: Option<&Antichain<T>>) {
+        self.inner.finish(None);
     }
 }
 
@@ -457,6 +457,7 @@ where
             attach: Arc::new(move |total_workers| {
                 Box::new(LiftedWriter::<T, TInner> {
                     inner: inner(total_workers),
+                    _outer: std::marker::PhantomData,
                 }) as Box<dyn ProbeWriter<T>>
             }),
         }
@@ -629,16 +630,35 @@ mod tests {
     }
 
     #[test]
-    fn lifted_writer_projects_outer_frontier() {
+    fn lifted_writer_holds_at_minimum_until_finished() {
         type P = Product<u64, u32>;
         let (reg, probe) = ProbeRegistration::<P>::new(1, 0);
         let outer = reg.lift_to_outer();
-        let mut w = outer.attach(1);
-        w.update(&elem(3));
-        assert!(probe.done_with(&P::new(2, 1000)));
-        assert!(!probe.done_with(&P::new(3, 0)));
-        w.finish(Some(&Antichain::new()));
+        let mut a = outer.attach(2);
+        let mut b = outer.attach(2);
+        // Outer frontiers never move a loop-body probe: the loop may still be
+        // iterating an epoch the outer frontier has passed.
+        a.update(&elem(3));
+        b.update(&Antichain::new());
+        assert_eq!(probe.frontier(), Antichain::from_elem(P::new(0, 0)));
+        // Even a finishing writer's final view is not trusted.
+        a.finish(Some(&Antichain::new()));
+        assert_eq!(probe.frontier(), Antichain::from_elem(P::new(0, 0)));
+        // Once every worker's writer finished, the probe is done.
+        b.finish(Some(&elem(9)));
         assert!(probe.is_done());
+    }
+
+    #[test]
+    fn lifted_writer_without_full_worker_cover_never_completes() {
+        // One writer for a two-worker dataflow (one node of a cluster): the
+        // remote worker's loop may still iterate.
+        type P = Product<u64, u32>;
+        let (reg, probe) = ProbeRegistration::<P>::new(1, 0);
+        let mut w = reg.lift_to_outer().attach(2);
+        w.update(&elem(3));
+        w.finish(Some(&Antichain::new()));
+        assert_eq!(probe.frontier(), Antichain::from_elem(P::new(0, 0)));
     }
 }
 

@@ -255,7 +255,10 @@ fn spawn_node(
     })
 }
 
-async fn run_cluster(shared: bool, round: u64) {
+/// Runs the cluster and returns the probes that are not done after every node
+/// joined successfully (with their final frontiers and `wait_until_done`
+/// outcome).
+async fn run_cluster(shared: bool, round: u64) -> Vec<String> {
     let topology = ClusterTopology::multi_node(vec![
         NodeConfig::new("node-a", WORKERS_PER_NODE),
         NodeConfig::new("node-b", WORKERS_PER_NODE),
@@ -399,12 +402,23 @@ async fn run_cluster(shared: bool, round: u64) {
             );
         }
     }
-    let violations = state.violations.lock().unwrap();
+    let violations = state.violations.lock().unwrap().clone();
     assert!(
         violations.is_empty(),
         "shared={shared}: probes reported times complete too early: {violations:#?}"
     );
+    let mut not_done = Vec::new();
+    for (name, p) in &probes {
+        let waited = tokio::time::timeout(Duration::from_secs(5), p.wait_until_done()).await;
+        if !p.is_done() || !matches!(waited, Ok(Ok(()))) {
+            not_done.push(format!(
+                "{name}: frontier {:?}, wait_until_done -> {waited:?}",
+                p.frontier().elements()
+            ));
+        }
+    }
     drop((rt_a, rt_b));
+    not_done
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -412,6 +426,46 @@ async fn dedicated_tcp_cluster_probes_are_monotone_conservative_and_live() {
     for round in 0..3 {
         run_cluster(false, round).await;
     }
+}
+
+/// After every node joined successfully, every probe must be done and
+/// `wait_until_done` must succeed.
+///
+/// IGNORED: in a cluster each worker builds its own probe, so a probe has one
+/// writer among several workers and keeps its writer's final view when that
+/// worker completes (it cannot claim remote work is done). A worker's executor
+/// completes once its *local* operators are done, without waiting for the
+/// progress tracker's global completion: a peer's exchange close frame can
+/// arrive before that peer's final progress broadcast (e.g. its input's last
+/// capability drop), so the final view is stale (e.g. `[40]` here) and the
+/// probe never becomes done; `wait_until_done` returns `ChannelClosed` once
+/// the writer is dropped. Measured: 105 of 120 cluster runs (Dedicated 57/60,
+/// Shared 48/60) left at least one probe not done. Un-ignore once executor
+/// completion waits for global tracker completion.
+async fn assert_probes_done_after_join(shared: bool) {
+    for round in 0..3 {
+        let not_done = run_cluster(shared, round).await;
+        assert!(
+            not_done.is_empty(),
+            "shared={shared} round {round}: probes not done after a successful join: {not_done:#?}"
+        );
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "fails in ~88% of cluster runs: worker completion does not wait for global \
+            tracker completion, so a probe keeps a stale final view and never \
+            becomes done (completion predicate, PR5); see doc comment"]
+async fn dedicated_tcp_cluster_probes_are_done_after_join() {
+    assert_probes_done_after_join(false).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "fails in ~88% of cluster runs: worker completion does not wait for global \
+            tracker completion, so a probe keeps a stale final view and never \
+            becomes done (completion predicate, PR5); see doc comment"]
+async fn shared_tcp_cluster_probes_are_done_after_join() {
+    assert_probes_done_after_join(true).await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

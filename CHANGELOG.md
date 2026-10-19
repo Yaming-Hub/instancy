@@ -175,7 +175,14 @@ RESERVED_CHANNEL_BASE, CHANNEL_NAMESPACE_SIZE}`.
   operator's input frontier. A probe on an input now advances, and a probe
   after `unary_notify`/`reduce`/`delay` waits for that operator's output.
 - Probes shared by several workers report the monotone meet of the workers'
-  views instead of the last writer's view, so they never move backwards.
+  views instead of the last writer's view, so they never move backwards. In
+  modes that build the dataflow once per worker with per-worker progress
+  tracking (`spawn_multi` when stages have differing parallelism,
+  `SimpleRuntime::spawn_multi`), each worker's probe becomes done when that
+  worker completes. In a cluster, each worker's probe keeps its last (global)
+  view when that worker completes (worker
+  completion does not yet wait for peers' final progress), so it may not
+  become done after a successful run.
 - Notifications that complete together are delivered in timestamp order (a
   linear extension of the partial order). `Timestamp`'s `Ord` must extend the
   partial order, as the built-in timestamps do.
@@ -192,9 +199,13 @@ RESERVED_CHANNEL_BASE, CHANNEL_NAMESPACE_SIZE}`.
   accounting for an `exchange` in a doubly-nested body is projected through
   every scope level (it previously ran unaccounted, which could complete the
   outer epoch early and drop results with several workers). `probe()` and
-  `output()` inside an `iterate` body are no longer silently dropped: inner
-  probes track the enclosing epoch, and inner outputs deliver batches at the
-  dataflow's outer timestamp.
+  `output()` inside an `iterate` body are no longer silently dropped. Inner
+  outputs deliver batches at the dataflow's outer timestamp. Inner probes stay
+  at the minimum time until the workers writing them have completed, then
+  become done (never, in a cluster): data circulating on a loop's feedback
+  edge is not yet visible to progress tracking, so no earlier answer is safe.
+  Probes downstream of a loop can still report an epoch complete while the
+  loop iterates it (pre-existing).
 - `take`/`take_while` documentation now states their per-worker semantics.
 - `ChangeBatch` drops a lone zero-valued update; the `FrontierAggregator`
   debug monotonicity check no longer rejects valid partial-order advances.

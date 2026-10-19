@@ -346,9 +346,13 @@ pub(crate) fn materialize_stage_executor<T: Timestamp>(
         .take(operators.len())
         .collect::<Vec<Option<Notificator<T>>>>();
 
+    // A stage tracker has no cross-worker progress channels: it observes only
+    // this worker's operators, and on the staged path every worker builds its
+    // own dataflow (and probes), so this executor alone covers each probe it
+    // writes (see `materialize_executor`).
     let probes = probes
         .iter()
-        .map(|registration| AttachedProbe::new(registration, worker_context.num_workers()))
+        .map(|registration| AttachedProbe::new(registration, 1))
         .collect();
 
     Ok(StageExecutor::new(
@@ -1007,8 +1011,13 @@ impl<T: Timestamp> Future for CombinedStageExecutor<T> {
                     }
                 }
             }
-            // Drop all remaining stages to release their channels.
+            // Drop all remaining stages to release their channels. The loop
+            // converged, so this is the stages' completion: report it to their
+            // probes first (otherwise loop-body probes would never finish).
             for stage in &mut this.stages {
+                if let Some(stage) = stage.as_mut() {
+                    stage.finish_probes();
+                }
                 *stage = None;
             }
             this.wake_handle.clear_waker();

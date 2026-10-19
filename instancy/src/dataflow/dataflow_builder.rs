@@ -2307,10 +2307,11 @@ impl<T: Timestamp, D: Clone + Send + 'static> Pipe<T, D> {
     /// # Nested scopes
     ///
     /// Loop bodies may contain further `iterate` scopes, probes and named
-    /// outputs. A probe inside a body is tracked at the granularity of the
-    /// enclosing epoch (`(e, i)` is complete once epoch `e` is complete), and a
-    /// named output inside a body delivers each batch at the dataflow's outer
-    /// timestamp.
+    /// outputs. A named output inside a body delivers each batch at the
+    /// dataflow's outer timestamp. A probe inside a body stays at the minimum
+    /// time until the workers writing it have completed (see
+    /// [`probe`](Self::probe)): progress tracking cannot yet see data
+    /// circulating on the feedback edge, so no earlier answer would be safe.
     ///
     /// # Limitations
     ///
@@ -4576,9 +4577,35 @@ impl<T: Timestamp, D: Clone + Send + 'static> Pipe<T, D> {
     /// probe placed directly on an input advances as the input advances.
     ///
     /// In a multi-worker dataflow the probe is monotone and conservative: it
-    /// reports the meet of the workers' views. Inside an `iterate` body the
-    /// probe is tracked at the granularity of the outer epoch: `(e, i)` is
-    /// complete once epoch `e` is complete.
+    /// reports the meet of the workers' views.
+    ///
+    /// # Limitations
+    ///
+    /// Progress tracking cannot yet see data circulating on an `iterate`
+    /// loop's feedback edge:
+    ///
+    /// - A probe **inside** a loop body therefore stays at the minimum time
+    ///   while the dataflow runs, and becomes done once the workers writing it
+    ///   have completed (except in a cluster, see below). It never reports an
+    ///   iteration complete early, but it reports no per-epoch progress
+    ///   either.
+    /// - A probe **downstream** of a loop (on the loop's output, or anything
+    ///   after it) can report an epoch complete while the loop is still
+    ///   iterating that epoch.
+    ///
+    /// In a cluster (`spawn_cluster`) each worker builds its own probe, so a
+    /// probe has a single writer among several workers, and that writer's
+    /// view is global. When that worker completes, the probe keeps its last
+    /// view rather than claiming remote work is done. A worker completes once
+    /// its local operators are done, without waiting until its view reflects
+    /// every peer's final progress, so after a successful run the probe
+    /// usually stays at a stale frontier and never becomes done (a probe inside
+    /// a loop body never does). Modes that build the dataflow once per worker
+    /// and track progress per worker (`spawn_multi` when stages have
+    /// differing parallelism, `SimpleRuntime::spawn_multi`) give each worker
+    /// its own probe, which reports that worker's view and becomes done when
+    /// that worker completes; a worker that does not run the probed
+    /// operator's stage never writes its probe.
     ///
     /// The returned `ProbeHandle` supports async waiting via
     /// [`wait_until_done_with`](ProbeHandle::wait_until_done_with) and

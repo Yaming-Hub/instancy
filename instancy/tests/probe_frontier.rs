@@ -129,19 +129,19 @@ impl<T: instancy::Timestamp> MonotoneWatcher<T> {
 /// Probes `pipe` and checks, in an operator directly downstream on the same
 /// stream, that the probe never claims a time complete while data at that time
 /// is still flowing on the stream.
-fn checked_probe<D: Clone + Send + 'static>(
-    pipe: Pipe<u64, D>,
+fn checked_probe<T: instancy::Timestamp, D: Clone + Send + 'static>(
+    pipe: Pipe<T, D>,
     name: &str,
     violations: &Arc<Mutex<Vec<String>>>,
-) -> (Pipe<u64, D>, ProbeHandle<u64>) {
+) -> (Pipe<T, D>, ProbeHandle<T>) {
     let (pipe, probe) = pipe.probe();
     let check = probe.clone();
     let violations = Arc::clone(violations);
     let label = name.to_string();
-    let pipe = pipe.inspect_batch(format!("check-{name}"), move |t: &u64, _batch: &[D]| {
+    let pipe = pipe.inspect_batch(format!("check-{name}"), move |t: &T, _batch: &[D]| {
         if check.done_with(t) {
             violations.lock().unwrap().push(format!(
-                "{label}: data at {t} after probe reported done_with({t}) (frontier {:?})",
+                "{label}: data at {t:?} after probe reported done_with({t:?}) (frontier {:?})",
                 check.frontier().elements()
             ));
         }
@@ -406,8 +406,13 @@ fn probes_at_every_graph_position_are_monotone_conservative_and_live() {
         probes.push(("delay_batch", p));
         let inner_probe: ProbeSlot<Product<u64, u32>> = Arc::default();
         let ip = Arc::clone(&inner_probe);
+        let lv = Arc::clone(v);
         let looped = notified.iterate::<u32>("loop", 1u32, move |var| {
-            let (stepped, probe) = var.map("halve", |_t: &Product<u64, u32>, x| x / 2).probe();
+            let (stepped, probe) = checked_probe(
+                var.map("halve", |_t: &Product<u64, u32>, x| x / 2),
+                "loop-body",
+                &lv,
+            );
             *ip.lock().unwrap() = Some(probe);
             let done = stepped.clone().filter("done", |_t, x| *x < 4);
             let again = stepped.filter("again", |_t, x| *x >= 4);
@@ -416,11 +421,12 @@ fn probes_at_every_graph_position_are_monotone_conservative_and_live() {
                 output: done,
             }
         });
-        // Streams leaving (or inside) a loop are only checked for monotonicity,
-        // liveness and completion, not conservativeness: the loop's feedback
-        // edge is not yet visible to progress tracking, so the tracker itself
-        // lets the outer epoch complete while the loop still iterates (tracked
-        // separately from probe correctness).
+        // The stream leaving a loop is only checked for monotonicity, liveness
+        // and completion, not conservativeness: the loop's feedback edge is not
+        // yet visible to progress tracking, so the tracker itself lets the
+        // outer epoch complete downstream of the loop while the loop still
+        // iterates (pre-existing; tracked separately from probe correctness).
+        // The probe inside the loop body is checked for conservativeness.
         let (looped, p) = looped.probe();
         probes.push(("iterate-leave", p));
         let inner_probe = inner_probe.lock().unwrap().take().unwrap();
@@ -901,5 +907,391 @@ fn multi_worker_shared_probe_stress_never_regresses() {
             regressions.len(),
             &regressions[..regressions.len().min(5)]
         );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Adversarial: probes inside iterate bodies
+// ---------------------------------------------------------------------------
+
+type P1 = Product<u64, u32>;
+type P2 = Product<P1, u32>;
+
+/// A loop body `map -> probe -> filter(< N) -> feedback` iterates epoch 0
+/// thousands of times (more than one executor sweep's activation budget)
+/// after the input has already advanced past it. Progress tracking
+/// cannot see data circulating on the feedback edge, so the outer frontier of
+/// the body stream passes epoch 0 after the first sweep; the probe must still
+/// never report `(0, i)` complete while `(0, i)` data appears on the stream.
+#[test]
+fn loop_body_probe_never_reports_an_epoch_complete_while_the_loop_iterates() {
+    const ITERATIONS: u64 = 3000;
+    for round in 0..3u64 {
+        let rt = RuntimeHandle::new(RuntimeConfig::default()).unwrap();
+        let violations: Arc<Mutex<Vec<String>>> = Arc::default();
+        let slot: ProbeSlot<P1> = Arc::default();
+        let (v, s2) = (Arc::clone(&violations), Arc::clone(&slot));
+        let builder = DataflowBuilder::<u64>::new("loop-body-probe");
+        let out = builder
+            .input::<u64>("data")
+            .unwrap()
+            .iterate::<u32>("loop", 1u32, move |var| {
+                let stepped = var.map("inc", |_t: &P1, x: u64| x + 1);
+                let (stepped, probe) = checked_probe(stepped, "loop-body", &v);
+                *s2.lock().unwrap() = Some(probe);
+                IterateResult {
+                    feedback: stepped.clone().filter("again", |_t, x| *x < ITERATIONS),
+                    output: stepped.filter("done", |_t, x| *x >= ITERATIONS),
+                }
+            });
+        out.output("out").unwrap();
+        let probe = slot.lock().unwrap().take().unwrap();
+        let watcher = MonotoneWatcher::start(&probe);
+        let mut h = rt
+            .spawn(builder.build().unwrap(), SpawnOptions::default())
+            .unwrap();
+        let tx = h.take_input::<u64>("data").unwrap();
+        let rx = h.take_output::<u64>("out").unwrap();
+        tx.send(0, vec![round]).unwrap();
+        tx.advance_to(1).unwrap();
+        // While epoch 0 iterates, (0, ITERATIONS / 2) must not be reported
+        // complete.
+        let start = Instant::now();
+        let mut got = None;
+        while got.is_none() && start.elapsed() < Duration::from_secs(10) {
+            if probe.done_with(&P1::new(0, ITERATIONS as u32 / 2)) {
+                violations.lock().unwrap().push(format!(
+                    "done_with((0, ITERATIONS / 2)) before epoch 0 left the loop: {:?}",
+                    probe.frontier()
+                ));
+                break;
+            }
+            got = rx.try_recv();
+            std::thread::yield_now();
+        }
+        tx.send(3, vec![7]).unwrap();
+        drop(tx);
+        with_timeout("join", TIMEOUT, move || h.join_blocking()).unwrap();
+        let mut rest: Vec<(u64, Vec<u64>)> = rx.collect_data();
+        if let Some(instancy::dataflow::OutputEvent::Data { time, data }) = got {
+            rest.push((time, data));
+        }
+        rest.sort();
+        assert_eq!(rest, vec![(0, vec![ITERATIONS]), (3, vec![ITERATIONS])]);
+        watcher.finish("loop-body");
+        assert!(
+            probe.is_done(),
+            "loop-body probe not done: {:?}",
+            probe.frontier()
+        );
+        let violations = violations.lock().unwrap();
+        assert!(
+            violations.is_empty(),
+            "round {round}: loop-body probe reported times complete too early: {violations:#?}"
+        );
+    }
+}
+
+/// Four workers, an exchange inside the loop body, many epochs completing
+/// together, and a probe on the body stream after the exchange (every worker
+/// shares the probe): it must never report a time complete while that time
+/// still appears on any worker's instance of the stream, must be monotone, and
+/// must be done once all workers completed.
+#[test]
+fn multi_worker_loop_body_probe_is_conservative() {
+    for round in 0..3u64 {
+        let workers = 4;
+        let rt = RuntimeHandle::new(RuntimeConfig {
+            worker_threads: 4,
+            ..RuntimeConfig::default()
+        })
+        .unwrap();
+        let violations: Arc<Mutex<Vec<String>>> = Arc::default();
+        let slot: ProbeSlot<P1> = Arc::default();
+        let (v, s2) = (Arc::clone(&violations), Arc::clone(&slot));
+        let mut multi = rt
+            .spawn_multi(
+                "mw-loop-body-probe",
+                workers,
+                move |b: &mut DataflowBuilder<u64>| {
+                    let v = Arc::clone(&v);
+                    let s2 = Arc::clone(&s2);
+                    b.input::<u64>("data")?
+                        .iterate::<u32>("loop", 1u32, move |var| {
+                            let stepped = var
+                                .map("inc", |_t: &P1, x: u64| x + 1)
+                                .exchange_by_hash("redistribute", |x: &u64| *x);
+                            let (stepped, probe) = checked_probe(stepped, "mw-loop-body", &v);
+                            *s2.lock().unwrap() = Some(probe);
+                            IterateResult {
+                                feedback: stepped.clone().filter("again", |_t, x| x % 16 != 0),
+                                output: stepped.filter("done", |_t, x| x % 16 == 0),
+                            }
+                        })
+                        .output("out")?;
+                    Ok(())
+                },
+                SpawnOptions::default(),
+            )
+            .unwrap();
+        let probe = slot.lock().unwrap().take().unwrap();
+        let watcher = MonotoneWatcher::start(&probe);
+        let senders = multi.take_all_inputs::<u64>("data").unwrap();
+        let outs: Vec<_> = multi
+            .take_all_outputs::<u64>("out")
+            .unwrap()
+            .into_iter()
+            .map(|rx| std::thread::spawn(move || rx.collect_data()))
+            .collect();
+        let epochs = 12u64;
+        for (w, tx) in senders.iter().enumerate() {
+            for e in 0..epochs {
+                tx.send(
+                    e,
+                    (0..3)
+                        .map(|i| e * 100 + w as u64 * 10 + i + round)
+                        .collect(),
+                )
+                .unwrap();
+                if e % 4 == 3 {
+                    tx.advance_to(e + 1).unwrap();
+                }
+            }
+        }
+        drop(senders);
+        with_timeout("join", TIMEOUT, move || multi.join_blocking()).unwrap();
+        let total: usize = outs
+            .into_iter()
+            .map(|o| {
+                o.join()
+                    .unwrap()
+                    .iter()
+                    .map(|(_, d)| d.len())
+                    .sum::<usize>()
+            })
+            .sum();
+        watcher.finish("mw loop body");
+        assert_eq!(total, epochs as usize * 3 * workers);
+        assert!(probe.is_done(), "round {round}: {:?}", probe.frontier());
+        let violations = violations.lock().unwrap();
+        assert!(
+            violations.is_empty(),
+            "round {round}: shared loop-body probe reported times complete too early: {:#?}",
+            &violations[..violations.len().min(8)]
+        );
+    }
+}
+
+/// A probe in the inner body of a nested loop, two workers, an exchange in the
+/// inner body: conservative, monotone, done at the end.
+#[test]
+fn nested_loop_body_probe_is_conservative() {
+    for _ in 0..3 {
+        let rt = RuntimeHandle::new(RuntimeConfig {
+            worker_threads: 2,
+            ..RuntimeConfig::default()
+        })
+        .unwrap();
+        let violations: Arc<Mutex<Vec<String>>> = Arc::default();
+        let slot: ProbeSlot<P2> = Arc::default();
+        let (v, s2) = (Arc::clone(&violations), Arc::clone(&slot));
+        let mut multi = rt
+            .spawn_multi(
+                "nested-loop-body-probe",
+                2,
+                move |b: &mut DataflowBuilder<u64>| {
+                    let v = Arc::clone(&v);
+                    let s2 = Arc::clone(&s2);
+                    b.input::<u64>("data")?
+                        .iterate::<u32>("outer", 1u32, move |outer| {
+                            let inner_out = outer.iterate::<u32>("inner", 1u32, move |inner| {
+                                let stepped = inner
+                                    .map("inc", |_t: &P2, x: u64| x + 1)
+                                    .exchange_by_hash("x", |x: &u64| *x);
+                                let (stepped, probe) = checked_probe(stepped, "inner-body", &v);
+                                *s2.lock().unwrap() = Some(probe);
+                                IterateResult {
+                                    feedback: stepped.clone().filter("ia", |_t, x| x % 5 != 0),
+                                    output: stepped.filter("id", |_t, x| x % 5 == 0),
+                                }
+                            });
+                            let s = inner_out.map("plus1", |_t: &P1, x: u64| x + 1);
+                            IterateResult {
+                                feedback: s.clone().filter("oa", |_t, x| *x < 30),
+                                output: s.filter("od", |_t, x| *x >= 30),
+                            }
+                        })
+                        .output("out")?;
+                    Ok(())
+                },
+                SpawnOptions::default(),
+            )
+            .unwrap();
+        let probe = slot.lock().unwrap().take().unwrap();
+        let watcher = MonotoneWatcher::start(&probe);
+        let senders = multi.take_all_inputs::<u64>("data").unwrap();
+        let outs: Vec<_> = multi
+            .take_all_outputs::<u64>("out")
+            .unwrap()
+            .into_iter()
+            .map(|rx| std::thread::spawn(move || rx.collect_data()))
+            .collect();
+        for (w, tx) in senders.iter().enumerate() {
+            for e in 0..4u64 {
+                tx.send(e, vec![w as u64 + e]).unwrap();
+                tx.advance_to(e + 1).unwrap();
+            }
+        }
+        drop(senders);
+        with_timeout("join", TIMEOUT, move || multi.join_blocking()).unwrap();
+        let total: usize = outs
+            .into_iter()
+            .map(|o| {
+                o.join()
+                    .unwrap()
+                    .iter()
+                    .map(|(_, d)| d.len())
+                    .sum::<usize>()
+            })
+            .sum();
+        watcher.finish("nested loop body");
+        assert_eq!(total, 8);
+        assert!(probe.is_done(), "{:?}", probe.frontier());
+        let violations = violations.lock().unwrap();
+        assert!(
+            violations.is_empty(),
+            "nested loop-body probe reported times complete too early: {:#?}",
+            &violations[..violations.len().min(8)]
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Per-stage parallelism path (every worker builds its own dataflow)
+// ---------------------------------------------------------------------------
+
+type NamedProbes<T> = Arc<Mutex<Vec<(String, ProbeHandle<T>)>>>;
+
+/// On the per-stage-parallelism path each worker builds its own dataflow, so
+/// every probe handle has a single writer (the worker's stage executor) whose
+/// tracker only sees that worker. Loop-body probes (held at the minimum while
+/// running) and probes after a gather must still become done after a
+/// successful run, both when the loop stays within one stage and when an
+/// exchange inside the loop body makes it cross a stage boundary (stages then
+/// finish through quiescence-based loop convergence).
+#[test]
+fn staged_path_loop_body_and_gather_probes_complete() {
+    for exchange_in_loop in [false, true] {
+        for _ in 0..3 {
+            let rt = RuntimeHandle::new(RuntimeConfig {
+                worker_threads: 2,
+                ..RuntimeConfig::default()
+            })
+            .unwrap();
+            let violations: Arc<Mutex<Vec<String>>> = Arc::default();
+            let body_probes: NamedProbes<P1> = Arc::default();
+            let gather_probes: NamedProbes<u64> = Arc::default();
+            let (v, bp, gp) = (
+                Arc::clone(&violations),
+                Arc::clone(&body_probes),
+                Arc::clone(&gather_probes),
+            );
+            let mut multi = rt
+                .spawn_multi(
+                    "staged-probes",
+                    2,
+                    move |b: &mut DataflowBuilder<u64>| {
+                        let name = b.name().to_string();
+                        let (v, bp) = (Arc::clone(&v), Arc::clone(&bp));
+                        let body_name = name.clone();
+                        let looped =
+                            b.input::<u64>("data")?
+                                .iterate::<u32>("double", 1u32, move |var| {
+                                    let mut doubled = var.map("double", |_t: &P1, x: u64| x * 2);
+                                    if exchange_in_loop {
+                                        doubled =
+                                            doubled.exchange_by_hash("redistribute", |x: &u64| *x);
+                                    }
+                                    let (doubled, probe) =
+                                        checked_probe(doubled, "staged-body", &v);
+                                    bp.lock().unwrap().push((body_name.clone(), probe));
+                                    IterateResult {
+                                        feedback: doubled.clone().filter("again", |_t, x| *x < 100),
+                                        output: doubled.filter("done", |_t, x| *x >= 100),
+                                    }
+                                });
+                        let (gathered, probe) = looped
+                            .map("id", |_t, x| x)
+                            .exchange_to("gather", 1, |x: &u64| *x)?
+                            .probe();
+                        gp.lock().unwrap().push((name, probe));
+                        gathered.output("results")?;
+                        Ok(())
+                    },
+                    SpawnOptions::new().per_stage_parallelism(true),
+                )
+                .unwrap();
+            let workers = multi.num_workers();
+            let tx = multi.take_input::<u64>(0, "data").unwrap();
+            for w in 1..workers {
+                drop(multi.take_input::<u64>(w, "data").unwrap());
+            }
+            let outs: Vec<_> = (0..workers)
+                .map(|w| {
+                    let rx = multi.take_output::<u64>(w, "results").unwrap();
+                    std::thread::spawn(move || rx.collect_data())
+                })
+                .collect();
+            tx.send(0, vec![1, 2, 3, 5, 10, 50]).unwrap();
+            drop(tx);
+            with_timeout("join", TIMEOUT, move || multi.join_blocking()).unwrap();
+            let mut got: Vec<u64> = outs
+                .into_iter()
+                .flat_map(|o| o.join().unwrap())
+                .flat_map(|(_, d)| d)
+                .collect();
+            got.sort();
+            assert_eq!(
+                got,
+                vec![100, 128, 128, 160, 160, 192],
+                "exchange_in_loop={exchange_in_loop}"
+            );
+
+            // Only the per-worker builds are materialized (the runtime also
+            // calls the build closure to probe the stage structure).
+            let real = |name: &str| name.contains("/worker-");
+            let body: Vec<_> = body_probes
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|(n, _)| real(n))
+                .cloned()
+                .collect();
+            assert_eq!(body.len(), workers);
+            for (name, p) in &body {
+                assert!(
+                    p.is_done(),
+                    "exchange_in_loop={exchange_in_loop}: loop-body probe of {name} not done: {:?}",
+                    p.frontier()
+                );
+            }
+            // The gather stage has parallelism 1: only worker 0 materializes it,
+            // so only worker 0's handle for it has a writer.
+            let gather: Vec<_> = gather_probes
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|(n, _)| n.ends_with("/worker-0"))
+                .cloned()
+                .collect();
+            assert_eq!(gather.len(), 1);
+            assert!(
+                gather[0].1.is_done(),
+                "gather probe not done: {:?}",
+                gather[0].1.frontier()
+            );
+            let violations = violations.lock().unwrap();
+            assert!(violations.is_empty(), "{violations:#?}");
+        }
     }
 }
