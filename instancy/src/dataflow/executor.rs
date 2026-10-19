@@ -294,6 +294,25 @@ fn extract_panic_message(payload: &Box<dyn std::any::Any + Send>) -> String {
 // FusedStageTask
 // ---------------------------------------------------------------------------
 
+/// Whether a sweep that is in progress should stop early because of
+/// cancellation. Only the start of a sweep acts on cancellation (it returns
+/// the error or enters drain mode), so this just ends the current sweep
+/// sooner. While draining, the sweep keeps going until the drain deadline.
+fn sweep_should_stop(
+    cancel: &CancellationToken,
+    draining: bool,
+    drain_deadline: Option<Instant>,
+) -> bool {
+    if !cancel.is_cancelled() {
+        return false;
+    }
+    !draining || drain_deadline.is_some_and(|deadline| Instant::now() >= deadline)
+}
+
+// ---------------------------------------------------------------------------
+// FusedStageTask
+// ---------------------------------------------------------------------------
+
 /// A group of operators from a single stage, activated together in topological order.
 ///
 /// Instead of scheduling individual operators, the executor schedules `FusedStageTask`s.
@@ -318,6 +337,18 @@ impl FusedStageTask {
     /// Uses multi-pass semantics: keeps iterating until no operator makes progress
     /// or the budget is exhausted. This matches the existing fused activation behavior.
     ///
+    /// An operator that returns `BlockedOnBackpressure` keeps the dataflow alive
+    /// (`any_progress`), but it neither starts another pass nor uses up the budget.
+    /// If its output goes to a later operator in this stage, that operator runs
+    /// later in the same pass and its own progress starts the next pass. If the
+    /// output goes to another stage task (exchange edge) or off this executor,
+    /// running this stage again cannot unblock it. Counting it as progress would
+    /// make the stage spin until the sweep budget runs out, so the stage task
+    /// that drains the channel would never run (livelock).
+    ///
+    /// `should_stop` is checked between passes so that cancellation takes
+    /// effect without waiting for the whole budget to be spent.
+    ///
     /// Returns `(any_progress, productive_activations, async_waiting_positions)`.
     #[allow(clippy::too_many_arguments)]
     fn activate(
@@ -330,6 +361,7 @@ impl FusedStageTask {
         catch_panics: bool,
         op_collectors: &[Option<Arc<OperatorMetricsCollector>>],
         timeline_collector: Option<&crate::metrics::TimelineCollector>,
+        should_stop: &dyn Fn() -> bool,
     ) -> Result<(bool, usize, Vec<usize>)> {
         let mut any_progress = false;
         let mut productive_activations = 0usize;
@@ -342,8 +374,15 @@ impl FusedStageTask {
 
         // Multi-pass: keep iterating until no operator makes progress or budget exhausted.
         let mut made_progress_this_pass = true;
+        let mut first_pass = true;
         while made_progress_this_pass {
             made_progress_this_pass = false;
+            // Let cancellation take effect between passes rather than only
+            // after the whole sweep budget is spent.
+            if !first_pass && should_stop() {
+                break;
+            }
+            first_pass = false;
 
             for &pos in &self.operator_positions {
                 if done[pos] {
@@ -402,9 +441,8 @@ impl FusedStageTask {
                         async_waiting_set.insert(pos);
                     }
                     ActivationOutcome::BlockedOnBackpressure => {
-                        productive_activations += 1;
+                        // Not progress on its own; see the method docs.
                         any_progress = true;
-                        made_progress_this_pass = true;
                     }
                     ActivationOutcome::Done => {
                         productive_activations += 1;
@@ -426,6 +464,14 @@ impl FusedStageTask {
     /// Whether all operators in this task are done.
     fn is_done(&self, done: &[bool]) -> bool {
         self.operator_positions.iter().all(|&pos| done[pos])
+    }
+
+    /// Number of operators in this task that are not done yet.
+    fn live_operator_count(&self, done: &[bool]) -> usize {
+        self.operator_positions
+            .iter()
+            .filter(|&&pos| !done[pos])
+            .count()
     }
 }
 
@@ -504,6 +550,14 @@ pub struct DataflowExecutor<T: Timestamp = u64> {
     op_pos_to_task: Vec<usize>,
     /// Per-task queue membership (mirrors `in_queue` but for stage tasks).
     task_in_queue: Vec<bool>,
+    /// Stage task that the next stage-task sweep starts from.
+    ///
+    /// Normally 0 (topological order). When a sweep runs out of activation
+    /// budget before reaching every task, this is set to the first task it
+    /// skipped, so that task runs first in the next sweep. Without this, a
+    /// task early in the order that keeps exhausting the budget would starve
+    /// every later task, including the ones that drain its output.
+    stage_task_cursor: usize,
     /// Aggregate dataflow metrics. None when collect_metrics is false.
     dataflow_metrics: Option<Arc<DataflowMetrics>>,
     /// Start time for live wall-clock metrics when collection is enabled.
@@ -806,6 +860,7 @@ impl<T: Timestamp> DataflowExecutor<T> {
             stage_tasks: Vec::new(),
             op_pos_to_task: Vec::new(),
             task_in_queue: Vec::new(),
+            stage_task_cursor: 0,
             dataflow_metrics,
             wall_start,
             op_collectors,
@@ -1432,8 +1487,10 @@ impl<T: Timestamp> DataflowExecutor<T> {
     /// When an upstream operator produces output, its downstream is activated
     /// immediately in the same sweep — no re-scheduling round-trip needed.
     ///
-    /// Budget limits only *productive* activations (MadeProgress, BlockedOnBackpressure,
-    /// Done). Idle activations are free — they represent operators with no input.
+    /// Budget limits only *productive* activations (MadeProgress, Done). Idle
+    /// activations are free: they are operators with no input. Blocked
+    /// activations (BlockedOnBackpressure) are also free, and they don't start
+    /// another pass on their own. See [`FusedStageTask::activate`] for why.
     fn run_fused_activation(&mut self) -> Result<bool> {
         // Clear queue state at the start — fused mode ignores the ready_queue
         // but propagate_progress() uses in_queue to gate enqueuing. Keep state
@@ -1462,8 +1519,13 @@ impl<T: Timestamp> DataflowExecutor<T> {
         // Multi-pass: keep iterating until no operator makes progress or budget exhausted.
         // This ensures that when op[i] pushes data, op[i+1..] can consume it in the same sweep.
         let mut made_progress_this_pass = true;
+        let mut first_pass = true;
         while made_progress_this_pass {
             made_progress_this_pass = false;
+            if !first_pass && sweep_should_stop(&self.cancel, self.draining, self.drain_deadline) {
+                break;
+            }
+            first_pass = false;
 
             for &pos in &positions {
                 if self.done[pos] {
@@ -1489,9 +1551,7 @@ impl<T: Timestamp> DataflowExecutor<T> {
                         self.async_waiting[pos] = true;
                     }
                     ActivationOutcome::BlockedOnBackpressure => {
-                        productive_activations += 1;
                         any_progress = true;
-                        made_progress_this_pass = true;
                     }
                     ActivationOutcome::Done => {
                         productive_activations += 1;
@@ -1510,9 +1570,15 @@ impl<T: Timestamp> DataflowExecutor<T> {
     /// Stage-task activation: process stage tasks from the ready queue.
     ///
     /// Each task runs its operators in fused topological order (multi-pass).
-    /// All non-done tasks are activated every sweep (matching old fused semantics
-    /// where all operators are considered each sweep). This prevents downstream
-    /// starvation when an upstream stage keeps producing data.
+    /// Every sweep queues all non-done tasks (matching the old fused semantics,
+    /// where every operator is considered each sweep), so downstream stages
+    /// still run while an upstream stage keeps producing data.
+    ///
+    /// The sweep shares one activation budget across all tasks. If the budget
+    /// runs out before every task has run, the next sweep starts with the
+    /// first task that was skipped (see `stage_task_cursor`). Every non-done
+    /// task therefore runs within a bounded number of sweeps, even if a task
+    /// ahead of it keeps using up the whole budget.
     fn run_stage_task_activation(&mut self) -> Result<bool> {
         // Always repopulate with all non-done tasks at the start of each sweep.
         // This ensures downstream stages are activated even when upstream stages
@@ -1521,7 +1587,15 @@ impl<T: Timestamp> DataflowExecutor<T> {
         for flag in self.task_in_queue.iter_mut() {
             *flag = false;
         }
-        for (task_idx, task) in self.stage_tasks.iter().enumerate() {
+        let num_tasks = self.stage_tasks.len();
+        let start = if self.stage_task_cursor < num_tasks {
+            self.stage_task_cursor
+        } else {
+            0
+        };
+        self.stage_task_cursor = 0;
+        for task_idx in (start..num_tasks).chain(0..start) {
+            let task = &self.stage_tasks[task_idx];
             if !task.operator_positions.is_empty() && !task.is_done(&self.done) {
                 self.ready_queue.push_back(task_idx);
                 self.task_in_queue[task_idx] = true;
@@ -1535,6 +1609,9 @@ impl<T: Timestamp> DataflowExecutor<T> {
         let budget = self.config.max_activations_per_step;
         let mut total_productive = 0usize;
         let batch_size = self.ready_queue.len();
+        let (cancel, draining, drain_deadline) = (&self.cancel, self.draining, self.drain_deadline);
+        let should_stop = || sweep_should_stop(cancel, draining, drain_deadline);
+        let mut tasks_run = 0usize;
 
         for _ in 0..batch_size {
             let Some(task_idx) = self.ready_queue.pop_front() else {
@@ -1547,10 +1624,20 @@ impl<T: Timestamp> DataflowExecutor<T> {
             }
 
             let remaining_budget = budget.saturating_sub(total_productive);
-            if remaining_budget == 0 {
-                // Budget exhausted — stop processing more tasks this sweep.
+            // A task that runs after others in this sweep needs enough budget
+            // for one full pass over its operators. Otherwise its last
+            // operators could be cut off every sweep by the tasks ahead of it.
+            let too_little_left = total_productive > 0
+                && remaining_budget < self.stage_tasks[task_idx].live_operator_count(&self.done);
+            if remaining_budget == 0 || too_little_left || (tasks_run > 0 && should_stop()) {
+                // Skip the remaining tasks this sweep, and start the next
+                // sweep with this one so it can't be starved.
+                self.ready_queue.push_front(task_idx);
+                self.task_in_queue[task_idx] = true;
+                self.stage_task_cursor = task_idx;
                 break;
             }
+            tasks_run += 1;
 
             let (progress, productive, async_positions) = self.stage_tasks[task_idx].activate(
                 &mut self.operators,
@@ -1561,6 +1648,7 @@ impl<T: Timestamp> DataflowExecutor<T> {
                 self.config.catch_panics,
                 &self.op_collectors,
                 self.timeline_collector.as_deref(),
+                &should_stop,
             )?;
 
             total_productive += productive;
@@ -2045,6 +2133,7 @@ mod tests {
                 stage_tasks: Vec::new(),
                 op_pos_to_task: Vec::new(),
                 task_in_queue: Vec::new(),
+                stage_task_cursor: 0,
                 successors_by_pos: Vec::new(),
                 predecessors_by_pos: Vec::new(),
                 dataflow_metrics: None,
@@ -2167,6 +2256,7 @@ mod tests {
             stage_tasks: Vec::new(),
             op_pos_to_task: Vec::new(),
             task_in_queue: Vec::new(),
+            stage_task_cursor: 0,
             successors_by_pos: Vec::new(),
             predecessors_by_pos: Vec::new(),
             dataflow_metrics: None,
@@ -2216,6 +2306,7 @@ mod tests {
             stage_tasks: Vec::new(),
             op_pos_to_task: Vec::new(),
             task_in_queue: Vec::new(),
+            stage_task_cursor: 0,
             successors_by_pos: Vec::new(),
             predecessors_by_pos: Vec::new(),
             dataflow_metrics: None,
@@ -2269,6 +2360,7 @@ mod tests {
             stage_tasks: Vec::new(),
             op_pos_to_task: Vec::new(),
             task_in_queue: Vec::new(),
+            stage_task_cursor: 0,
             successors_by_pos: Vec::new(),
             predecessors_by_pos: Vec::new(),
             dataflow_metrics: None,
@@ -2310,6 +2402,7 @@ mod tests {
             stage_tasks: Vec::new(),
             op_pos_to_task: Vec::new(),
             task_in_queue: Vec::new(),
+            stage_task_cursor: 0,
             successors_by_pos: Vec::new(),
             predecessors_by_pos: Vec::new(),
             dataflow_metrics: None,
@@ -2386,6 +2479,7 @@ mod tests {
             stage_tasks: Vec::new(),
             op_pos_to_task: Vec::new(),
             task_in_queue: Vec::new(),
+            stage_task_cursor: 0,
             successors_by_pos: Vec::new(),
             predecessors_by_pos: Vec::new(),
             dataflow_metrics: None,
@@ -2471,6 +2565,7 @@ mod tests {
             stage_tasks: Vec::new(),
             op_pos_to_task: Vec::new(),
             task_in_queue: Vec::new(),
+            stage_task_cursor: 0,
             successors_by_pos: Vec::new(),
             predecessors_by_pos: Vec::new(),
             dataflow_metrics: None,
@@ -2538,6 +2633,7 @@ mod tests {
             stage_tasks: Vec::new(),
             op_pos_to_task: Vec::new(),
             task_in_queue: Vec::new(),
+            stage_task_cursor: 0,
             successors_by_pos: Vec::new(),
             predecessors_by_pos: Vec::new(),
             dataflow_metrics: None,
@@ -2591,6 +2687,7 @@ mod tests {
             stage_tasks: Vec::new(),
             op_pos_to_task: Vec::new(),
             task_in_queue: Vec::new(),
+            stage_task_cursor: 0,
             successors_by_pos: Vec::new(),
             predecessors_by_pos: Vec::new(),
             dataflow_metrics: None,
@@ -2657,6 +2754,7 @@ mod tests {
             stage_tasks: Vec::new(),
             op_pos_to_task: Vec::new(),
             task_in_queue: Vec::new(),
+            stage_task_cursor: 0,
             successors_by_pos: Vec::new(),
             predecessors_by_pos: Vec::new(),
             dataflow_metrics: None,
@@ -2716,6 +2814,7 @@ mod tests {
             stage_tasks: Vec::new(),
             op_pos_to_task: Vec::new(),
             task_in_queue: Vec::new(),
+            stage_task_cursor: 0,
             successors_by_pos: Vec::new(),
             predecessors_by_pos: Vec::new(),
             dataflow_metrics: None,
@@ -2797,6 +2896,7 @@ mod tests {
             stage_tasks: Vec::new(),
             op_pos_to_task: Vec::new(),
             task_in_queue: Vec::new(),
+            stage_task_cursor: 0,
             successors_by_pos: Vec::new(),
             predecessors_by_pos: Vec::new(),
             dataflow_metrics: None,
@@ -2891,6 +2991,7 @@ mod tests {
             stage_tasks: Vec::new(),
             op_pos_to_task: Vec::new(),
             task_in_queue: Vec::new(),
+            stage_task_cursor: 0,
             successors_by_pos: Vec::new(),
             predecessors_by_pos: Vec::new(),
             dataflow_metrics: None,
@@ -2959,6 +3060,7 @@ mod tests {
             stage_tasks: Vec::new(),
             op_pos_to_task: Vec::new(),
             task_in_queue: Vec::new(),
+            stage_task_cursor: 0,
             successors_by_pos: Vec::new(),
             predecessors_by_pos: Vec::new(),
             dataflow_metrics: None,
@@ -3400,6 +3502,7 @@ mod tests {
             stage_tasks: Vec::new(),
             op_pos_to_task: Vec::new(),
             task_in_queue: Vec::new(),
+            stage_task_cursor: 0,
             successors_by_pos: Vec::new(),
             predecessors_by_pos: Vec::new(),
             dataflow_metrics: None,
@@ -3480,6 +3583,7 @@ mod tests {
             stage_tasks: Vec::new(),
             op_pos_to_task: Vec::new(),
             task_in_queue: Vec::new(),
+            stage_task_cursor: 0,
             successors_by_pos: Vec::new(),
             predecessors_by_pos: Vec::new(),
             dataflow_metrics: None,
@@ -3535,6 +3639,7 @@ mod tests {
             stage_tasks: Vec::new(),
             op_pos_to_task: Vec::new(),
             task_in_queue: Vec::new(),
+            stage_task_cursor: 0,
             successors_by_pos: Vec::new(),
             predecessors_by_pos: Vec::new(),
             dataflow_metrics: None,
@@ -3602,6 +3707,7 @@ mod tests {
             stage_tasks: Vec::new(),
             op_pos_to_task: Vec::new(),
             task_in_queue: Vec::new(),
+            stage_task_cursor: 0,
             successors_by_pos: Vec::new(),
             predecessors_by_pos: Vec::new(),
             dataflow_metrics: None,
@@ -3658,6 +3764,7 @@ mod tests {
             stage_tasks: Vec::new(),
             op_pos_to_task: Vec::new(),
             task_in_queue: Vec::new(),
+            stage_task_cursor: 0,
             successors_by_pos: Vec::new(),
             predecessors_by_pos: Vec::new(),
             dataflow_metrics: None,
@@ -3713,6 +3820,7 @@ mod tests {
             stage_tasks: Vec::new(),
             op_pos_to_task: Vec::new(),
             task_in_queue: Vec::new(),
+            stage_task_cursor: 0,
             successors_by_pos: Vec::new(),
             predecessors_by_pos: Vec::new(),
             dataflow_metrics: None,
@@ -3768,6 +3876,7 @@ mod tests {
             stage_tasks: Vec::new(),
             op_pos_to_task: Vec::new(),
             task_in_queue: Vec::new(),
+            stage_task_cursor: 0,
             successors_by_pos: Vec::new(),
             predecessors_by_pos: Vec::new(),
             dataflow_metrics: None,
@@ -3858,6 +3967,7 @@ mod tests {
             stage_tasks: Vec::new(),
             op_pos_to_task: Vec::new(),
             task_in_queue: Vec::new(),
+            stage_task_cursor: 0,
             successors_by_pos: Vec::new(),
             predecessors_by_pos: Vec::new(),
             dataflow_metrics: None,
@@ -3926,6 +4036,7 @@ mod tests {
             stage_tasks: Vec::new(),
             op_pos_to_task: Vec::new(),
             task_in_queue: Vec::new(),
+            stage_task_cursor: 0,
             successors_by_pos: Vec::new(),
             predecessors_by_pos: Vec::new(),
             dataflow_metrics: None,
@@ -3992,6 +4103,7 @@ mod tests {
             stage_tasks: Vec::new(),
             op_pos_to_task: Vec::new(),
             task_in_queue: Vec::new(),
+            stage_task_cursor: 0,
             successors_by_pos: Vec::new(),
             predecessors_by_pos: Vec::new(),
             dataflow_metrics: None,
@@ -4061,6 +4173,7 @@ mod tests {
             stage_tasks: Vec::new(),
             op_pos_to_task: Vec::new(),
             task_in_queue: Vec::new(),
+            stage_task_cursor: 0,
             successors_by_pos: Vec::new(),
             predecessors_by_pos: Vec::new(),
             dataflow_metrics: None,
@@ -4144,6 +4257,7 @@ mod tests {
             stage_tasks: Vec::new(),
             op_pos_to_task: Vec::new(),
             task_in_queue: Vec::new(),
+            stage_task_cursor: 0,
             successors_by_pos: Vec::new(),
             predecessors_by_pos: Vec::new(),
             dataflow_metrics: None,
@@ -4200,6 +4314,7 @@ mod tests {
             stage_tasks: Vec::new(),
             op_pos_to_task: Vec::new(),
             task_in_queue: Vec::new(),
+            stage_task_cursor: 0,
             successors_by_pos: Vec::new(),
             predecessors_by_pos: Vec::new(),
             dataflow_metrics: None,
@@ -4236,6 +4351,421 @@ mod tests {
 
         let result = executor.run().unwrap();
         assert!(result);
+    }
+
+    // -----------------------------------------------------------------------
+    // Stage-task starvation tests
+    // -----------------------------------------------------------------------
+
+    /// One-slot-per-item bounded queue shared by `QueueProducer` (pushes) and
+    /// `QueueConsumer` (drains), modelling an exchange channel between two
+    /// stage tasks on the same worker.
+    #[derive(Default)]
+    struct SharedQueue {
+        len: std::sync::atomic::AtomicUsize,
+        delivered: std::sync::atomic::AtomicUsize,
+        producer_done: std::sync::atomic::AtomicBool,
+    }
+
+    /// Pushes `remaining` items into a queue of `capacity`, returning
+    /// `BlockedOnBackpressure` whenever the queue is full.
+    struct QueueProducer {
+        index: usize,
+        queue: Arc<SharedQueue>,
+        capacity: usize,
+        remaining: usize,
+        activations: Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    impl SchedulableOperator for QueueProducer {
+        fn activate(&mut self) -> Result<ActivationOutcome> {
+            use std::sync::atomic::Ordering::SeqCst;
+            self.activations.fetch_add(1, SeqCst);
+            if self.remaining == 0 {
+                self.queue.producer_done.store(true, SeqCst);
+                return Ok(ActivationOutcome::Done);
+            }
+            let mut pushed = 0;
+            while self.remaining > 0 && self.queue.len.load(SeqCst) < self.capacity {
+                self.queue.len.fetch_add(1, SeqCst);
+                self.remaining -= 1;
+                pushed += 1;
+            }
+            if self.remaining > 0 && pushed == 0 {
+                Ok(ActivationOutcome::BlockedOnBackpressure)
+            } else {
+                Ok(ActivationOutcome::MadeProgress)
+            }
+        }
+        fn is_done(&self) -> bool {
+            self.remaining == 0
+        }
+        fn name(&self) -> &str {
+            "producer"
+        }
+        fn index(&self) -> usize {
+            self.index
+        }
+        fn stage_id(&self) -> crate::dataflow::stage::StageId {
+            crate::dataflow::stage::StageId::new(0)
+        }
+        fn close_inputs(&mut self) {}
+    }
+
+    /// Drains the shared queue; done once the producer is done and the queue
+    /// is empty.
+    struct QueueConsumer {
+        index: usize,
+        queue: Arc<SharedQueue>,
+    }
+
+    impl SchedulableOperator for QueueConsumer {
+        fn activate(&mut self) -> Result<ActivationOutcome> {
+            use std::sync::atomic::Ordering::SeqCst;
+            let n = self.queue.len.swap(0, SeqCst);
+            self.queue.delivered.fetch_add(n, SeqCst);
+            if n > 0 {
+                Ok(ActivationOutcome::MadeProgress)
+            } else if self.queue.producer_done.load(SeqCst) {
+                Ok(ActivationOutcome::Done)
+            } else {
+                Ok(ActivationOutcome::Idle)
+            }
+        }
+        fn is_done(&self) -> bool {
+            false
+        }
+        fn name(&self) -> &str {
+            "consumer"
+        }
+        fn index(&self) -> usize {
+            self.index
+        }
+        fn stage_id(&self) -> crate::dataflow::stage::StageId {
+            crate::dataflow::stage::StageId::new(1)
+        }
+        fn close_inputs(&mut self) {}
+    }
+
+    /// Reports `MadeProgress` on every activation without ever finishing, like
+    /// an operator polling for work it cannot do yet.
+    struct BusyOperator {
+        index: usize,
+    }
+
+    impl SchedulableOperator for BusyOperator {
+        fn activate(&mut self) -> Result<ActivationOutcome> {
+            Ok(ActivationOutcome::MadeProgress)
+        }
+        fn is_done(&self) -> bool {
+            false
+        }
+        fn name(&self) -> &str {
+            "busy"
+        }
+        fn index(&self) -> usize {
+            self.index
+        }
+        fn stage_id(&self) -> crate::dataflow::stage::StageId {
+            crate::dataflow::stage::StageId::new(0)
+        }
+        fn close_inputs(&mut self) {}
+    }
+
+    fn two_stage_tasks(
+        operators: Vec<Box<dyn SchedulableOperator>>,
+        budget: usize,
+    ) -> DataflowExecutor<u64> {
+        stage_task_executor(operators, budget, &[&[0], &[1]])
+    }
+
+    /// Builds an executor whose stage task `i` holds the operator indices in
+    /// `layout[i]`.
+    fn stage_task_executor(
+        operators: Vec<Box<dyn SchedulableOperator>>,
+        budget: usize,
+        layout: &[&[usize]],
+    ) -> DataflowExecutor<u64> {
+        use crate::dataflow::stage::{FusedActivationOrder, StageId, StageInfo};
+        let config = ExecutorConfig {
+            max_activations_per_step: budget,
+            ..ExecutorConfig::default()
+        };
+        let mut executor = DataflowExecutor::new_test(operators, config, 0);
+        let stages: Vec<StageInfo> = layout
+            .iter()
+            .enumerate()
+            .map(|(i, ops)| StageInfo {
+                id: StageId(i),
+                parallelism: None,
+                operator_indices: ops.to_vec(),
+                fused_order: FusedActivationOrder::new(ops.to_vec()),
+            })
+            .collect();
+        executor.enable_stage_tasks(&stages);
+        executor
+    }
+
+    /// Reports `MadeProgress` for `quota` activations in a row, then `Idle`
+    /// once, then repeats.
+    struct QuotaOperator {
+        index: usize,
+        quota: usize,
+        used: usize,
+    }
+
+    impl SchedulableOperator for QuotaOperator {
+        fn activate(&mut self) -> Result<ActivationOutcome> {
+            if self.used == self.quota {
+                self.used = 0;
+                return Ok(ActivationOutcome::Idle);
+            }
+            self.used += 1;
+            Ok(ActivationOutcome::MadeProgress)
+        }
+        fn is_done(&self) -> bool {
+            false
+        }
+        fn name(&self) -> &str {
+            "quota"
+        }
+        fn index(&self) -> usize {
+            self.index
+        }
+        fn stage_id(&self) -> crate::dataflow::stage::StageId {
+            crate::dataflow::stage::StageId::new(1)
+        }
+        fn close_inputs(&mut self) {}
+    }
+
+    /// Runs sweeps until the executor completes; panics after `max_sweeps`
+    /// so a livelock fails the test instead of hanging it.
+    fn run_bounded(executor: &mut DataflowExecutor<u64>, max_sweeps: usize) {
+        for _ in 0..max_sweeps {
+            if executor.run_one_sweep().unwrap() == SweepOutcome::Completed {
+                return;
+            }
+        }
+        panic!("executor did not complete within {max_sweeps} sweeps");
+    }
+
+    #[test]
+    fn blocked_operator_is_activated_once_and_uses_no_budget() {
+        let queue = Arc::new(SharedQueue::default());
+        // Queue already full: the producer can only report backpressure.
+        queue.len.store(4, std::sync::atomic::Ordering::SeqCst);
+        let activations = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let mut operators: Vec<Box<dyn SchedulableOperator>> = vec![Box::new(QueueProducer {
+            index: 0,
+            queue,
+            capacity: 4,
+            remaining: 10,
+            activations: Arc::clone(&activations),
+        })];
+        let mut done = vec![false];
+        let task = FusedStageTask {
+            operator_positions: vec![0],
+        };
+        let (any_progress, productive, async_waiting) = task
+            .activate(
+                &mut operators,
+                &mut done,
+                1024,
+                0,
+                None,
+                false,
+                &[],
+                None,
+                &|| false,
+            )
+            .unwrap();
+        // Still alive (no quiescence), but no budget used and no re-passes.
+        assert!(any_progress);
+        assert_eq!(productive, 0);
+        assert!(async_waiting.is_empty());
+        assert_eq!(activations.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn blocked_upstream_stage_task_lets_downstream_stage_task_drain() {
+        let queue = Arc::new(SharedQueue::default());
+        let activations = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let items = 50_000;
+        let operators: Vec<Box<dyn SchedulableOperator>> = vec![
+            Box::new(QueueProducer {
+                index: 0,
+                queue: Arc::clone(&queue),
+                capacity: 4,
+                remaining: items,
+                activations: Arc::clone(&activations),
+            }),
+            Box::new(QueueConsumer {
+                index: 1,
+                queue: Arc::clone(&queue),
+            }),
+        ];
+        let mut executor = two_stage_tasks(operators, 1024);
+        run_bounded(&mut executor, 100_000);
+        assert_eq!(
+            queue.delivered.load(std::sync::atomic::Ordering::SeqCst),
+            items
+        );
+        // One producer activation per sweep while blocked, not one per
+        // budget unit.
+        assert!(activations.load(std::sync::atomic::Ordering::SeqCst) <= 2 * items);
+    }
+
+    #[test]
+    fn budget_exhaustion_gives_skipped_stage_task_the_next_turn() {
+        let operators: Vec<Box<dyn SchedulableOperator>> = vec![
+            Box::new(BusyOperator { index: 0 }),
+            Box::new(CountingOperator {
+                name: "downstream".into(),
+                index: 1,
+                stage_id: crate::dataflow::stage::StageId::new(1),
+                remaining: 3,
+            }),
+        ];
+        let mut executor = two_stage_tasks(operators, 16);
+
+        // Sweep 1: the busy task uses the whole budget, so task 1 is skipped
+        // and becomes the starting task for the next sweep.
+        assert_eq!(
+            executor.run_one_sweep().unwrap(),
+            SweepOutcome::MadeProgress
+        );
+        assert!(!executor.done[1]);
+        assert_eq!(executor.stage_task_cursor, 1);
+
+        // Task 1 needs three activations; it gets one at least every other sweep.
+        for _ in 0..6 {
+            executor.run_one_sweep().unwrap();
+        }
+        assert!(executor.done[1], "downstream stage task was starved");
+        assert!(!executor.done[0]);
+    }
+
+    #[test]
+    fn stage_task_with_too_little_budget_left_goes_first_next_sweep() {
+        // Task 0 uses the whole budget whenever it runs first. Task 1 uses all
+        // but two activations whenever it runs first. Task 2 has three
+        // operators, so with two activations left it would run only its first
+        // two operators, and its last operator would never run.
+        let operators: Vec<Box<dyn SchedulableOperator>> = vec![
+            Box::new(BusyOperator { index: 0 }),
+            Box::new(QuotaOperator {
+                index: 1,
+                quota: 14,
+                used: 0,
+            }),
+            Box::new(BusyOperator { index: 2 }),
+            Box::new(BusyOperator { index: 3 }),
+            Box::new(CountingOperator {
+                name: "last".into(),
+                index: 4,
+                stage_id: crate::dataflow::stage::StageId::new(2),
+                remaining: 1,
+            }),
+        ];
+        let mut executor = stage_task_executor(operators, 16, &[&[0], &[1], &[2, 3, 4]]);
+        for _ in 0..10 {
+            executor.run_one_sweep().unwrap();
+        }
+        assert!(
+            executor.done[4],
+            "last operator of stage task 2 was starved"
+        );
+    }
+
+    #[test]
+    fn cancellation_stops_a_long_stage_task_sweep_early() {
+        // An operator that keeps making progress and cancels the dataflow on
+        // its third activation. Without a cancellation check inside the
+        // sweep, the sweep would run all 1024 budgeted activations first.
+        struct CancellingOperator {
+            cancel: CancellationToken,
+            activations: Arc<std::sync::atomic::AtomicUsize>,
+        }
+        impl SchedulableOperator for CancellingOperator {
+            fn activate(&mut self) -> Result<ActivationOutcome> {
+                let n = self
+                    .activations
+                    .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+                    + 1;
+                if n == 3 {
+                    self.cancel.cancel();
+                }
+                Ok(ActivationOutcome::MadeProgress)
+            }
+            fn is_done(&self) -> bool {
+                false
+            }
+            fn name(&self) -> &str {
+                "cancelling"
+            }
+            fn index(&self) -> usize {
+                0
+            }
+            fn stage_id(&self) -> crate::dataflow::stage::StageId {
+                crate::dataflow::stage::StageId::new(0)
+            }
+            fn close_inputs(&mut self) {}
+        }
+
+        for drain in [false, true] {
+            let cancel = CancellationToken::new();
+            let activations = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let operators: Vec<Box<dyn SchedulableOperator>> = vec![
+                Box::new(CancellingOperator {
+                    cancel: cancel.clone(),
+                    activations: Arc::clone(&activations),
+                }),
+                Box::new(BusyOperator { index: 1 }),
+            ];
+            let mut executor = stage_task_executor(operators, 1024, &[&[0], &[1]]);
+            executor.cancel = cancel;
+            if drain {
+                executor.config.drain_timeout = Some(std::time::Duration::from_secs(60));
+            }
+            assert_eq!(
+                executor.run_one_sweep().unwrap(),
+                SweepOutcome::MadeProgress
+            );
+            assert_eq!(activations.load(std::sync::atomic::Ordering::SeqCst), 3);
+            if drain {
+                // Draining keeps running full sweeps until the deadline.
+                executor.run_one_sweep().unwrap();
+                executor.run_one_sweep().unwrap();
+                assert!(executor.draining);
+                assert!(activations.load(std::sync::atomic::Ordering::SeqCst) > 100);
+            } else {
+                assert!(executor.run_one_sweep().is_err());
+            }
+        }
+    }
+
+    #[test]
+    fn stage_task_order_returns_to_topological_when_budget_suffices() {
+        let operators: Vec<Box<dyn SchedulableOperator>> = vec![
+            Box::new(CountingOperator {
+                name: "upstream".into(),
+                index: 0,
+                stage_id: crate::dataflow::stage::StageId::new(0),
+                remaining: 40,
+            }),
+            Box::new(CountingOperator {
+                name: "downstream".into(),
+                index: 1,
+                stage_id: crate::dataflow::stage::StageId::new(1),
+                remaining: 40,
+            }),
+        ];
+        let mut executor = two_stage_tasks(operators, 16);
+        executor.run_one_sweep().unwrap();
+        assert_eq!(executor.stage_task_cursor, 1);
+        executor.run_one_sweep().unwrap();
+        run_bounded(&mut executor, 100);
+        assert_eq!(executor.stage_task_cursor, 0);
     }
 
     // -----------------------------------------------------------------------
