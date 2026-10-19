@@ -368,14 +368,8 @@ impl<T: Timestamp + ExchangeData, D: ExchangeData> Push<T, D, ()> for NetworkPus
     }
 
     fn available_capacity(&self) -> Option<usize> {
-        // Report the shared per-peer queue capacity. This is an approximation
-        // since multiple NetworkPush endpoints share the same queue, but it
-        // enables ExchangePush's atomic pre-check to avoid partial delivery.
-        // std::sync::mpsc::SyncSender doesn't expose remaining capacity,
-        // so we probe with a zero-cost try: attempt a dummy check.
-        // Since we can't query capacity directly, return None and let
-        // ExchangePush assume capacity (network buffers internally).
-        // The bridge task drains continuously, so backpressure is transient.
+        // Unknown: the per-peer queue is shared by every channel to that peer,
+        // so any number would be stale by the time it is used.
         None
     }
 }

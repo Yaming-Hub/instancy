@@ -384,7 +384,6 @@ impl<T: Timestamp + ExchangeData, D: ExchangeData> Push<T, D, ()> for Serializin
     }
 
     fn available_capacity(&self) -> Option<usize> {
-        // Report capacity so ExchangePush can do atomic pre-check.
         // Return None on poisoned lock (unknown state).
         match self.sender.state.lock() {
             Ok(state) => Some(state.capacity.saturating_sub(state.buffer.len())),

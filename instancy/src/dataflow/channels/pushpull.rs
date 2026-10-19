@@ -50,11 +50,12 @@ pub trait Push<T: Timestamp, D, M = ()>: Send {
     ///
     /// - `Some(n)`: the channel can accept at least `n` more items right now.
     /// - `None`: capacity is unknown or not applicable (e.g., network channels
-    ///   that buffer internally). Callers should attempt `try_push()` directly.
+    ///   that share one queue per peer). Callers should attempt `try_push()` directly.
     ///
-    /// Used by composite pushers (e.g., [`crate::dataflow::channels::exchange_channel::ExchangePush`]) to pre-check capacity
-    /// across multiple targets before committing to delivery, preserving
-    /// all-or-nothing semantics for `try_push`.
+    /// A hint only: composite pushers such as
+    /// [`ExchangePush`](crate::dataflow::channels::exchange_channel::ExchangePush)
+    /// do not rely on it, because a check-then-push cannot be atomic across
+    /// targets that share a queue. They track partial delivery instead.
     fn available_capacity(&self) -> Option<usize> {
         None
     }

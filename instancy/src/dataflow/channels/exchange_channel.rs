@@ -294,6 +294,16 @@ impl<T: Timestamp, D: Send + 'static> ExchangeChannelSet<T, D> {
 /// the exchange hash function. After pushing, wakes the target worker's
 /// executor via `SharedWakeRegistry`.
 ///
+/// # Backpressure
+///
+/// `try_push` hands each target its sub-batch independently, so some targets
+/// may accept theirs while another pushes back (a remote target's capacity is
+/// only known by trying). The caller gets the original envelope back and must
+/// retry it unchanged; the retry delivers only the sub-batches still owed,
+/// from the partition computed on the first attempt. Each record therefore
+/// reaches its target exactly once, and each delivered sub-batch is accounted
+/// in flight exactly once.
+///
 /// # Transport independence
 ///
 /// Holds `Vec<Box<dyn Push<T, D>>>` — the concrete transport per target
@@ -312,15 +322,24 @@ pub struct ExchangePush<T: Timestamp, D: Send + 'static> {
     wakes: Arc<SharedWakeRegistry>,
     /// Whether this push endpoint has been closed.
     closed: bool,
-    /// Reusable per-target buckets to avoid allocation on every push.
+    /// Per-target sub-batches of the envelope being delivered. Empty between
+    /// envelopes; while `pending` is set they hold exactly the records that
+    /// targets have not accepted yet.
     buckets: Vec<Vec<D>>,
+    /// The envelope a `try_push` delivered only in part. Its retry resumes from
+    /// `buckets` (data) or `owed` (control) instead of re-partitioning:
+    /// targets that accepted their part must not get it again, and routing may
+    /// be stateful (`rebalance` routes round-robin).
+    pending: Option<PendingEnvelope<T>>,
+    /// For a control signal: `owed[t]` while target `t` has not accepted it.
+    owed: Vec<bool>,
     /// Optional channel metrics collector (enabled via `MetricsConfig::channel_counters`).
     channel_metrics: Option<Arc<crate::metrics::ChannelMetricsCollector>>,
-    /// Optional in-flight message reporter. When set, each batch of `n` data
-    /// records sent records `+n` at the batch timestamp, accounting the records
-    /// as in flight toward the exchange's downstream input until they are
-    /// consumed (see [`ExchangePull`]'s reporter). Bound to the same per-worker
-    /// reporter registered on the progress tracker.
+    /// Optional in-flight message reporter. When set, each sub-batch of `n`
+    /// data records handed to a target records `+n` at the batch timestamp,
+    /// accounting the records as in flight toward the exchange's downstream
+    /// input until they are consumed (see [`ExchangePull`]'s reporter). Bound
+    /// to the same per-worker reporter registered on the progress tracker.
     inflight: Option<ProgressReporter<T>>,
 }
 
@@ -340,6 +359,8 @@ impl<T: Timestamp, D: Send + 'static> ExchangePush<T, D> {
             wakes,
             closed: false,
             buckets,
+            pending: None,
+            owed: vec![false; num_targets],
             channel_metrics: None,
             inflight: None,
         }
@@ -352,18 +373,126 @@ impl<T: Timestamp, D: Send + 'static> ExchangePush<T, D> {
         wakes: Arc<SharedWakeRegistry>,
         channel_metrics: Arc<crate::metrics::ChannelMetricsCollector>,
     ) -> Self {
-        let num_targets = targets.len();
-        let buckets = (0..num_targets).map(|_| Vec::new()).collect();
-        Self {
-            targets,
-            exchange_fn,
-            num_targets,
-            wakes,
-            closed: false,
-            buckets,
-            channel_metrics: Some(channel_metrics),
-            inflight: None,
+        let mut push = Self::new(targets, exchange_fn, wakes);
+        push.channel_metrics = Some(channel_metrics);
+        push
+    }
+
+    /// Add `diff` in-flight records at `time` to the attached reporter.
+    fn record_inflight(&self, time: &T, diff: i64) {
+        if let Some(ref inflight) = self.inflight {
+            inflight.update(time.clone(), diff);
         }
+    }
+
+    /// Hand every non-empty bucket to its target. A bucket a target refuses
+    /// stays in place for the retry; accepted buckets are left empty.
+    ///
+    /// Keeps going past targets that push back, so one full peer queue does not
+    /// hold up the other targets. Stops at the first other error.
+    fn deliver_buckets(&mut self, time: &T) -> Result<()> {
+        let mut backpressure = false;
+        for target_idx in 0..self.num_targets {
+            if self.buckets[target_idx].is_empty() {
+                continue;
+            }
+            let bucket = std::mem::take(&mut self.buckets[target_idx]);
+            let count = bucket.len() as i64;
+            // Account the records before the target can consume them, so the
+            // in-flight count never runs ahead negative; retract on refusal.
+            self.record_inflight(time, count);
+            match self.targets[target_idx].try_push(Envelope::data(time.clone(), bucket)) {
+                Ok(()) => self.wakes.wake(target_idx),
+                Err((err, returned)) => {
+                    self.record_inflight(time, -count);
+                    match returned.payload {
+                        Payload::Data { data, .. } => self.buckets[target_idx] = data,
+                        Payload::Control(_) => return Err(returned_wrong_envelope()),
+                    }
+                    if !matches!(err, Error::Backpressure) {
+                        return Err(err);
+                    }
+                    backpressure = true;
+                }
+            }
+        }
+        if backpressure {
+            Err(Error::Backpressure)
+        } else {
+            Ok(())
+        }
+    }
+}
+
+/// Identifies the envelope a fan-out pusher has delivered only in part, so a
+/// retry can be checked against it.
+#[derive(Debug, PartialEq)]
+enum PendingEnvelope<T: Timestamp> {
+    Data { time: T, len: usize },
+    Control(ControlSignal<T>),
+}
+
+impl<T: Timestamp> PendingEnvelope<T> {
+    fn of<D>(envelope: &Envelope<T, D, ()>) -> Self {
+        match &envelope.payload {
+            Payload::Data { time, data } => Self::Data {
+                time: time.clone(),
+                len: data.len(),
+            },
+            Payload::Control(signal) => Self::Control(signal.clone()),
+        }
+    }
+
+    /// Cheap check that `envelope` is the retry of this one.
+    fn matches<D>(&self, envelope: &Envelope<T, D, ()>) -> bool {
+        match (self, &envelope.payload) {
+            (Self::Data { time, len }, Payload::Data { time: t, data }) => {
+                time == t && *len == data.len()
+            }
+            (Self::Control(signal), Payload::Control(s)) => signal == s,
+            _ => false,
+        }
+    }
+}
+
+fn retry_mismatch() -> Error {
+    Error::Dataflow(DataflowError::InvalidConfig(
+        "retry the partially delivered envelope unchanged before submitting another".into(),
+    ))
+}
+
+fn returned_wrong_envelope() -> Error {
+    Error::Dataflow(DataflowError::InvalidGraph(
+        "channel target returned a different envelope from try_push".into(),
+    ))
+}
+
+/// Offer `make()` to every target with `owed[t]` set, clearing it on success.
+/// Keeps going past targets that push back; stops at the first other error.
+fn deliver_to_owed<T: Timestamp, D>(
+    targets: &mut [Box<dyn Push<T, D, ()>>],
+    owed: &mut [bool],
+    wakes: &SharedWakeRegistry,
+    mut make: impl FnMut() -> Envelope<T, D, ()>,
+) -> Result<()> {
+    let mut backpressure = false;
+    for (target_idx, target) in targets.iter_mut().enumerate() {
+        if !owed[target_idx] {
+            continue;
+        }
+        match target.try_push(make()) {
+            Ok(()) => {
+                owed[target_idx] = false;
+                wakes.wake(target_idx);
+            }
+            Err((Error::Backpressure, _)) => backpressure = true,
+            Err((err, _)) => return Err(err),
+        }
+    }
+    if backpressure {
+        Err(Error::Backpressure)
+    } else {
+        Ok(())
     }
 }
 
@@ -371,6 +500,10 @@ impl<T: Timestamp, D: Clone + Send + 'static> Push<T, D> for ExchangePush<T, D> 
     fn push(&mut self, envelope: Envelope<T, D, ()>) -> Result<()> {
         if self.closed {
             return Err(Error::ChannelClosed);
+        }
+
+        if self.pending.is_some() {
+            return Err(retry_mismatch());
         }
 
         // No-op when there are no targets (idle worker in staged execution).
@@ -390,35 +523,19 @@ impl<T: Timestamp, D: Clone + Send + 'static> Push<T, D> for ExchangePush<T, D> 
                     self.buckets[target].push(record);
                 }
 
-                // Push non-empty buckets and wake target workers.
-                for target_idx in 0..self.num_targets {
-                    if !self.buckets[target_idx].is_empty() {
-                        let bucket = std::mem::take(&mut self.buckets[target_idx]);
-                        match self.targets[target_idx].push(Envelope::data(time.clone(), bucket)) {
-                            Ok(()) => self.wakes.wake(target_idx),
-                            Err(err) => {
-                                // Clear remaining buckets to prevent stale data
-                                // leaking into the next push call.
-                                for b in &mut self.buckets {
-                                    b.clear();
-                                }
-                                return Err(err);
-                            }
-                        }
-                    }
+                // `push` consumes the envelope: whatever a target refused is
+                // dropped with it rather than leaking into the next push.
+                let delivered = self.deliver_buckets(&time);
+                for b in &mut self.buckets {
+                    b.clear();
                 }
+                delivered?;
 
                 // Record channel metrics after successful delivery.
                 if let Some(ref metrics) = self.channel_metrics {
                     let items = data_len as u64;
                     let bytes = (items as usize * std::mem::size_of::<D>()) as u64;
                     metrics.record_push(items, bytes);
-                }
-
-                // Account the sent records as in flight toward the downstream
-                // input until they are consumed.
-                if let Some(ref inflight) = self.inflight {
-                    inflight.update(time, data_len as i64);
                 }
             }
             Payload::Control(signal) => {
@@ -457,106 +574,58 @@ impl<T: Timestamp, D: Clone + Send + 'static> Push<T, D> for ExchangePush<T, D> 
             return Err((Error::ChannelClosed, envelope));
         }
 
-        match &envelope.payload {
+        // A partially delivered envelope resumes where it stopped; anything
+        // else must wait until it has been delivered.
+        let resuming = match &self.pending {
+            None => false,
+            Some(pending) if pending.matches(&envelope) => true,
+            Some(_) => return Err((retry_mismatch(), envelope)),
+        };
+
+        if self.num_targets == 0 {
+            return Ok(());
+        }
+
+        let delivered = match &envelope.payload {
             Payload::Data { time, data } => {
-                // Partition records into reusable per-target buckets.
-                for record in data {
-                    let hash = self.exchange_fn.route(record);
-                    let target = ExchangeFn::<D>::target_worker(hash, self.num_targets);
-                    self.buckets[target].push(record.clone());
-                }
-
-                // Pre-check ALL targets for capacity before pushing anything.
-                // This preserves all-or-nothing delivery semantics: if any
-                // target cannot accept its sub-batch, the original envelope
-                // is returned intact for retry — no partial delivery.
-                //
-                // Targets that report available_capacity() == None (e.g.,
-                // future network channels) are assumed to have capacity.
-                // This is safe because network-backed Push implementations
-                // buffer internally and their try_push handles backpressure.
-                for target_idx in 0..self.num_targets {
-                    if self.buckets[target_idx].is_empty() {
-                        continue;
-                    }
-                    if self.targets[target_idx].is_closed() {
-                        // Clear buckets before returning.
-                        for b in &mut self.buckets {
-                            b.clear();
-                        }
-                        return Err((Error::ChannelClosed, envelope));
-                    }
-                    if let Some(available) = self.targets[target_idx].available_capacity() {
-                        if available == 0 {
-                            for b in &mut self.buckets {
-                                b.clear();
-                            }
-                            return Err((Error::Backpressure, envelope));
-                        }
+                if !resuming {
+                    for record in data {
+                        let hash = self.exchange_fn.route(record);
+                        let target = ExchangeFn::<D>::target_worker(hash, self.num_targets);
+                        self.buckets[target].push(record.clone());
                     }
                 }
-
-                // Pre-check passed — push sub-batches. For local channels
-                // (single-producer per exchange matrix slot), no concurrent
-                // writer can fill the channel between check and push, so
-                // this is effectively atomic. If it fails anyway (e.g.,
-                // future concurrent access), we accept partial delivery
-                // as a last resort.
-                for target_idx in 0..self.num_targets {
-                    if !self.buckets[target_idx].is_empty() {
-                        let bucket = std::mem::take(&mut self.buckets[target_idx]);
-                        match self.targets[target_idx]
-                            .try_push(Envelope::data(time.clone(), bucket))
-                        {
-                            Ok(()) => self.wakes.wake(target_idx),
-                            Err((err, _sub)) => {
-                                // Clear remaining buckets.
-                                for b in &mut self.buckets {
-                                    b.clear();
-                                }
-                                return Err((err, envelope));
-                            }
-                        }
-                    }
+                self.deliver_buckets(time)
+            }
+            Payload::Control(signal) => {
+                if !resuming {
+                    self.owed.fill(true);
                 }
+                deliver_to_owed(&mut self.targets, &mut self.owed, &self.wakes, || {
+                    Envelope::control(signal.clone())
+                })
+            }
+        };
 
-                // Record channel metrics after successful delivery.
-                if let Some(ref metrics) = self.channel_metrics {
+        match delivered {
+            Ok(()) => {
+                self.pending = None;
+                if let (Some(metrics), Payload::Data { data, .. }) =
+                    (&self.channel_metrics, &envelope.payload)
+                {
                     let items = data.len() as u64;
                     let bytes = (items as usize * std::mem::size_of::<D>()) as u64;
                     metrics.record_push(items, bytes);
                 }
-
-                // Account the sent records as in flight toward the downstream
-                // input until they are consumed.
-                if let Some(ref inflight) = self.inflight {
-                    inflight.update(time.clone(), data.len() as i64);
-                }
+                Ok(())
             }
-            Payload::Control(signal) => {
-                // Pre-check all targets for capacity before broadcasting.
-                for target in self.targets.iter() {
-                    if target.is_closed() {
-                        return Err((Error::ChannelClosed, envelope));
-                    }
-                    if let Some(available) = target.available_capacity() {
-                        if available == 0 {
-                            return Err((Error::Backpressure, envelope));
-                        }
-                    }
+            Err(err) => {
+                if !resuming {
+                    self.pending = Some(PendingEnvelope::of(&envelope));
                 }
-
-                // All targets ready — broadcast control signal.
-                for (target_idx, target) in self.targets.iter_mut().enumerate() {
-                    match target.try_push(Envelope::control(signal.clone())) {
-                        Ok(()) => self.wakes.wake(target_idx),
-                        Err((err, _)) => return Err((err, envelope)),
-                    }
-                }
+                Err((err, envelope))
             }
         }
-
-        Ok(())
     }
 
     fn flush(&mut self) -> Result<()> {
@@ -568,6 +637,11 @@ impl<T: Timestamp, D: Clone + Send + 'static> Push<T, D> for ExchangePush<T, D> 
 
     fn close(&mut self) {
         self.closed = true;
+        // Closing abandons a partially delivered envelope.
+        self.pending = None;
+        for b in &mut self.buckets {
+            b.clear();
+        }
         for target in &mut self.targets {
             target.close();
         }
@@ -605,6 +679,10 @@ impl<T: Timestamp, D: Send + 'static> Drop for ExchangePush<T, D> {
 /// data, configuration updates, or small datasets to all workers.
 ///
 /// Requires `D: Clone` since each record is duplicated N-1 times.
+///
+/// Like [`ExchangePush`], a `try_push` that some targets accepted and another
+/// pushed back must be retried unchanged; the retry only goes to the targets
+/// still owed the envelope.
 pub struct BroadcastPush<T: Timestamp, D: Clone + Send + 'static> {
     /// One push endpoint per target worker.
     targets: Vec<Box<dyn Push<T, D, ()>>>,
@@ -614,6 +692,11 @@ pub struct BroadcastPush<T: Timestamp, D: Clone + Send + 'static> {
     wakes: Arc<SharedWakeRegistry>,
     /// Whether this push endpoint has been closed.
     closed: bool,
+    /// The envelope a `try_push` delivered only in part; its retry goes only
+    /// to the targets in `owed`.
+    pending: Option<PendingEnvelope<T>>,
+    /// `owed[t]` while target `t` has not accepted the pending envelope.
+    owed: Vec<bool>,
 }
 
 impl<T: Timestamp, D: Clone + Send + 'static> BroadcastPush<T, D> {
@@ -628,6 +711,8 @@ impl<T: Timestamp, D: Clone + Send + 'static> BroadcastPush<T, D> {
             num_targets,
             wakes,
             closed: false,
+            pending: None,
+            owed: vec![false; num_targets],
         }
     }
 }
@@ -636,6 +721,10 @@ impl<T: Timestamp, D: Clone + Send + 'static> Push<T, D> for BroadcastPush<T, D>
     fn push(&mut self, envelope: Envelope<T, D, ()>) -> Result<()> {
         if self.closed {
             return Err(Error::ChannelClosed);
+        }
+
+        if self.pending.is_some() {
+            return Err(retry_mismatch());
         }
 
         // No-op when there are no targets (idle worker in staged execution).
@@ -696,55 +785,34 @@ impl<T: Timestamp, D: Clone + Send + 'static> Push<T, D> for BroadcastPush<T, D>
             return Err((Error::ChannelClosed, envelope));
         }
 
-        match &envelope.payload {
-            Payload::Data { time, data } => {
-                // Pre-check all targets for capacity.
-                for target in self.targets.iter() {
-                    if target.is_closed() {
-                        return Err((Error::ChannelClosed, envelope));
-                    }
-                    if let Some(available) = target.available_capacity() {
-                        if available == 0 {
-                            return Err((Error::Backpressure, envelope));
-                        }
-                    }
-                }
-
-                // All targets ready — broadcast data.
-                for (target_idx, target) in self.targets.iter_mut().enumerate() {
-                    let batch = data.clone();
-                    if !batch.is_empty() {
-                        match target.try_push(Envelope::data(time.clone(), batch)) {
-                            Ok(()) => self.wakes.wake(target_idx),
-                            Err((err, _)) => return Err((err, envelope)),
-                        }
-                    }
-                }
+        // A partially delivered envelope resumes with the targets still owed;
+        // anything else must wait until it has been delivered.
+        let resuming = match &self.pending {
+            None => false,
+            Some(pending) if pending.matches(&envelope) => true,
+            Some(_) => return Err((retry_mismatch(), envelope)),
+        };
+        if !resuming {
+            if matches!(&envelope.payload, Payload::Data { data, .. } if data.is_empty()) {
+                return Ok(());
             }
-            Payload::Control(signal) => {
-                // Pre-check all targets for capacity.
-                for target in self.targets.iter() {
-                    if target.is_closed() {
-                        return Err((Error::ChannelClosed, envelope));
-                    }
-                    if let Some(available) = target.available_capacity() {
-                        if available == 0 {
-                            return Err((Error::Backpressure, envelope));
-                        }
-                    }
-                }
-
-                // All targets ready — broadcast control signal.
-                for (target_idx, target) in self.targets.iter_mut().enumerate() {
-                    match target.try_push(Envelope::control(signal.clone())) {
-                        Ok(()) => self.wakes.wake(target_idx),
-                        Err((err, _)) => return Err((err, envelope)),
-                    }
-                }
-            }
+            self.owed.fill(true);
         }
 
-        Ok(())
+        match deliver_to_owed(&mut self.targets, &mut self.owed, &self.wakes, || {
+            envelope.clone()
+        }) {
+            Ok(()) => {
+                self.pending = None;
+                Ok(())
+            }
+            Err(err) => {
+                if !resuming {
+                    self.pending = Some(PendingEnvelope::of(&envelope));
+                }
+                Err((err, envelope))
+            }
+        }
     }
 
     fn flush(&mut self) -> Result<()> {
@@ -756,6 +824,8 @@ impl<T: Timestamp, D: Clone + Send + 'static> Push<T, D> for BroadcastPush<T, D>
 
     fn close(&mut self) {
         self.closed = true;
+        // Closing abandons a partially delivered envelope.
+        self.pending = None;
         for target in &mut self.targets {
             target.close();
         }
@@ -1647,6 +1717,363 @@ mod tests {
         assert!(matches!(err, Error::Backpressure));
         let (_, data) = env.as_data().unwrap();
         assert_eq!(data, &vec![2]);
+    }
+
+    // -------------------------------------------------------------------
+    // Partial delivery: some targets accept, a later one pushes back
+    // -------------------------------------------------------------------
+
+    /// One bounded frame queue shared by every target on the same peer, like
+    /// the per-peer queue behind `NetworkPush`.
+    struct PeerQueue {
+        capacity: usize,
+        frames: VecDeque<(usize, Envelope<u64, i32>)>,
+    }
+
+    /// A network-like target: capacity unknown up front (like `NetworkPush`),
+    /// `Backpressure` once the shared peer queue is full.
+    struct PeerQueuePush {
+        target: usize,
+        queue: Arc<Mutex<PeerQueue>>,
+        closed: bool,
+    }
+
+    impl Push<u64, i32> for PeerQueuePush {
+        fn push(&mut self, envelope: Envelope<u64, i32>) -> Result<()> {
+            self.try_push(envelope).map_err(|(err, _)| err)
+        }
+
+        fn try_push(
+            &mut self,
+            envelope: Envelope<u64, i32>,
+        ) -> std::result::Result<(), (Error, Envelope<u64, i32>)> {
+            if self.closed {
+                return Err((Error::ChannelClosed, envelope));
+            }
+            let mut queue = self.queue.lock().unwrap();
+            if queue.frames.len() >= queue.capacity {
+                return Err((Error::Backpressure, envelope));
+            }
+            queue.frames.push_back((self.target, envelope));
+            Ok(())
+        }
+
+        fn flush(&mut self) -> Result<()> {
+            Ok(())
+        }
+
+        fn close(&mut self) {
+            self.closed = true;
+        }
+
+        fn is_closed(&self) -> bool {
+            self.closed
+        }
+    }
+
+    fn peer_queue(capacity: usize) -> Arc<Mutex<PeerQueue>> {
+        Arc::new(Mutex::new(PeerQueue {
+            capacity,
+            frames: VecDeque::new(),
+        }))
+    }
+
+    fn peer_target(target: usize, queue: &Arc<Mutex<PeerQueue>>) -> Box<dyn Push<u64, i32>> {
+        Box::new(PeerQueuePush {
+            target,
+            queue: Arc::clone(queue),
+            closed: false,
+        })
+    }
+
+    fn pop_frame(queue: &Arc<Mutex<PeerQueue>>) -> Option<(usize, Envelope<u64, i32>)> {
+        queue.lock().unwrap().frames.pop_front()
+    }
+
+    fn local_target() -> (Box<dyn Push<u64, i32>>, SpscPull<u64, i32, ()>) {
+        let (push, pull) = spsc_channel::<u64, i32, ()>(16);
+        (Box::new(push), pull)
+    }
+
+    fn drain_local(pull: &mut SpscPull<u64, i32, ()>) -> Vec<Envelope<u64, i32>> {
+        let mut out = Vec::new();
+        while let Some(env) = pull.pull() {
+            out.push(env);
+        }
+        out
+    }
+
+    fn mod_exchange(targets: Vec<Box<dyn Push<u64, i32>>>) -> ExchangePush<u64, i32> {
+        let n = targets.len();
+        ExchangePush::new(
+            targets,
+            ExchangeFn::new("mod", |x: &i32| *x as u64),
+            Arc::new(SharedWakeRegistry::new(n)),
+        )
+    }
+
+    #[test]
+    fn exchange_try_push_retry_delivers_each_sub_batch_once() {
+        let queue = peer_queue(1);
+        let (local, mut local_rx) = local_target();
+        let mut push = mod_exchange(vec![local, peer_target(1, &queue), peer_target(2, &queue)]);
+        let original = Envelope::data(7u64, vec![0, 1, 2, 3, 4, 5]);
+
+        // Local target and target 1 accept; target 2 finds the peer queue full.
+        let (err, returned) = push.try_push(original.clone()).unwrap_err();
+        assert!(matches!(err, Error::Backpressure));
+        assert_eq!(returned, original, "the caller must get its envelope back");
+
+        // The peer drains one frame; the retry must only deliver target 2.
+        assert_eq!(pop_frame(&queue), Some((1, Envelope::data(7, vec![1, 4]))));
+        push.try_push(returned).unwrap();
+        assert_eq!(pop_frame(&queue), Some((2, Envelope::data(7, vec![2, 5]))));
+        assert_eq!(pop_frame(&queue), None);
+        assert_eq!(
+            drain_local(&mut local_rx),
+            vec![Envelope::data(7, vec![0, 3])],
+            "the local sub-batch must not be re-delivered by the retry"
+        );
+    }
+
+    #[test]
+    fn exchange_try_push_progresses_when_sub_batches_share_one_slot() {
+        // Every sub-batch needs a slot in the same single-slot peer queue: each
+        // retry gets exactly one freed slot, so it must make progress with it.
+        let queue = peer_queue(1);
+        let targets = (0..3).map(|t| peer_target(t, &queue)).collect();
+        let mut push = mod_exchange(targets);
+        let mut envelope = Envelope::data(1u64, vec![0, 1, 2]);
+        let mut delivered = Vec::new();
+        let mut attempts = 0;
+        loop {
+            attempts += 1;
+            assert!(attempts <= 3, "retries are not making progress (livelock)");
+            match push.try_push(envelope) {
+                Ok(()) => break,
+                Err((Error::Backpressure, returned)) => {
+                    envelope = returned;
+                    delivered.push(pop_frame(&queue).expect("a frame was queued"));
+                }
+                Err((err, _)) => panic!("unexpected error: {err}"),
+            }
+        }
+        delivered.extend(pop_frame(&queue));
+        assert_eq!(
+            delivered,
+            vec![
+                (0, Envelope::data(1, vec![0])),
+                (1, Envelope::data(1, vec![1])),
+                (2, Envelope::data(1, vec![2])),
+            ]
+        );
+    }
+
+    #[test]
+    fn exchange_try_push_retry_keeps_routing_of_stateful_partitioner() {
+        // Round-robin routing (as used by `rebalance`) gives a different
+        // partition on every call, so a retry must not re-partition.
+        let counter = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let route = move |_: &i32| counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let queue = peer_queue(0);
+        let (local, mut local_rx) = local_target();
+        let mut push = ExchangePush::new(
+            vec![local, peer_target(1, &queue)],
+            ExchangeFn::new("round-robin", route),
+            Arc::new(SharedWakeRegistry::new(2)),
+        );
+
+        let (_, returned) = push
+            .try_push(Envelope::data(0u64, vec![10, 20, 30]))
+            .unwrap_err();
+        queue.lock().unwrap().capacity = 1;
+        push.try_push(returned).unwrap();
+
+        let mut seen: Vec<i32> = drain_local(&mut local_rx)
+            .into_iter()
+            .chain(pop_frame(&queue).map(|(_, env)| env))
+            .flat_map(|env| env.as_data().unwrap().1.clone())
+            .collect();
+        seen.sort();
+        assert_eq!(seen, vec![10, 20, 30], "every record exactly once");
+    }
+
+    #[test]
+    fn exchange_try_push_inflight_accounting_is_exactly_once_across_retries() {
+        use crate::progress::operate::ProgressReporter;
+        let inflight = ProgressReporter::<u64>::new();
+        let queue = peer_queue(0);
+        let (local, local_rx) = local_target();
+        let mut push = mod_exchange(vec![local, peer_target(1, &queue)]);
+        push.set_inflight_reporter(inflight.clone());
+        let wakes = Arc::new(SharedWakeRegistry::new(1));
+        let mut consumer =
+            ExchangePull::new(vec![Box::new(local_rx) as Box<dyn Pull<_, _>>], wakes);
+        consumer.set_inflight_reporter(inflight.clone());
+
+        // The running in-flight count may never drop below zero: a record is
+        // accounted (+1) no later than it can be consumed (-1).
+        let mut net = 0i64;
+        let drain = |net: &mut i64| {
+            *net += inflight.drain().into_iter().map(|(_, d)| d).sum::<i64>();
+            assert!(*net >= 0, "in-flight count went negative: {net}");
+        };
+
+        let (_, mut envelope) = push
+            .try_push(Envelope::data(3u64, vec![0, 1, 2, 3]))
+            .unwrap_err();
+        while consumer.pull().is_some() {}
+        drain(&mut net);
+        for _ in 0..3 {
+            envelope = push.try_push(envelope).unwrap_err().1;
+            while consumer.pull().is_some() {}
+            drain(&mut net);
+        }
+        queue.lock().unwrap().capacity = 1;
+        push.try_push(envelope).unwrap();
+        while consumer.pull().is_some() {}
+        drain(&mut net);
+
+        // The remote receiver consumes its sub-batch.
+        let (_, remote) = pop_frame(&queue).unwrap();
+        inflight.update(3, -(remote.as_data().unwrap().1.len() as i64));
+        drain(&mut net);
+        assert_eq!(net, 0, "every produced record is consumed exactly once");
+    }
+
+    #[test]
+    fn exchange_try_push_control_retry_does_not_duplicate_signal() {
+        let queue = peer_queue(0);
+        let (local, mut local_rx) = local_target();
+        let mut push = mod_exchange(vec![local, peer_target(1, &queue)]);
+        let watermark = Envelope::watermark(5u64);
+
+        let (err, returned) = push.try_push(watermark.clone()).unwrap_err();
+        assert!(matches!(err, Error::Backpressure));
+        assert_eq!(returned, watermark);
+        let (_, returned) = push.try_push(returned).unwrap_err();
+        queue.lock().unwrap().capacity = 1;
+        push.try_push(returned).unwrap();
+
+        assert_eq!(drain_local(&mut local_rx), vec![watermark.clone()]);
+        assert_eq!(pop_frame(&queue), Some((1, watermark)));
+        assert_eq!(pop_frame(&queue), None);
+    }
+
+    #[test]
+    fn exchange_rejects_a_different_envelope_while_a_retry_is_pending() {
+        let queue = peer_queue(0);
+        let (local, mut local_rx) = local_target();
+        let mut push = mod_exchange(vec![local, peer_target(1, &queue)]);
+        let (_, pending) = push.try_push(Envelope::data(1u64, vec![0, 1])).unwrap_err();
+
+        let other = Envelope::data(2u64, vec![2, 3]);
+        let (err, returned) = push.try_push(other.clone()).unwrap_err();
+        assert!(!matches!(err, Error::Backpressure), "got {err}");
+        assert_eq!(returned, other);
+        assert!(push.push(other).is_err());
+
+        queue.lock().unwrap().capacity = 1;
+        push.try_push(pending).unwrap();
+        assert_eq!(drain_local(&mut local_rx), vec![Envelope::data(1, vec![0])]);
+        assert_eq!(pop_frame(&queue), Some((1, Envelope::data(1, vec![1]))));
+        assert_eq!(pop_frame(&queue), None);
+    }
+
+    #[test]
+    fn exchange_close_abandons_a_pending_retry() {
+        let queue = peer_queue(0);
+        let (local, _local_rx) = local_target();
+        let mut push = mod_exchange(vec![local, peer_target(1, &queue)]);
+        let (_, pending) = push.try_push(Envelope::data(1u64, vec![0, 1])).unwrap_err();
+        push.close();
+        let (err, _) = push.try_push(pending).unwrap_err();
+        assert!(matches!(err, Error::ChannelClosed));
+    }
+
+    #[test]
+    fn broadcast_try_push_retry_delivers_each_target_once() {
+        let queue = peer_queue(1);
+        let (local, mut local_rx) = local_target();
+        let mut push = BroadcastPush::new(
+            vec![local, peer_target(1, &queue), peer_target(2, &queue)],
+            Arc::new(SharedWakeRegistry::new(3)),
+        );
+        let original = Envelope::data(4u64, vec![7, 8]);
+
+        let (err, returned) = push.try_push(original.clone()).unwrap_err();
+        assert!(matches!(err, Error::Backpressure));
+        assert_eq!(returned, original);
+        assert_eq!(pop_frame(&queue), Some((1, original.clone())));
+        push.try_push(returned).unwrap();
+
+        assert_eq!(pop_frame(&queue), Some((2, original.clone())));
+        assert_eq!(pop_frame(&queue), None);
+        assert_eq!(drain_local(&mut local_rx), vec![original]);
+    }
+
+    #[test]
+    fn broadcast_try_push_progresses_when_copies_share_one_slot() {
+        let queue = peer_queue(1);
+        let targets = (0..4).map(|t| peer_target(t, &queue)).collect();
+        let mut push = BroadcastPush::new(targets, Arc::new(SharedWakeRegistry::new(4)));
+        let mut envelope = Envelope::data(2u64, vec![1]);
+        let mut delivered = Vec::new();
+        let mut attempts = 0;
+        loop {
+            attempts += 1;
+            assert!(attempts <= 4, "retries are not making progress (livelock)");
+            match push.try_push(envelope) {
+                Ok(()) => break,
+                Err((Error::Backpressure, returned)) => {
+                    envelope = returned;
+                    delivered.extend(pop_frame(&queue).map(|(t, _)| t));
+                }
+                Err((err, _)) => panic!("unexpected error: {err}"),
+            }
+        }
+        delivered.extend(pop_frame(&queue).map(|(t, _)| t));
+        assert_eq!(delivered, vec![0, 1, 2, 3]);
+    }
+
+    #[test]
+    fn broadcast_try_push_control_retry_does_not_duplicate_signal() {
+        let queue = peer_queue(0);
+        let (local, mut local_rx) = local_target();
+        let mut push = BroadcastPush::new(
+            vec![local, peer_target(1, &queue)],
+            Arc::new(SharedWakeRegistry::new(2)),
+        );
+        let watermark = Envelope::watermark(9u64);
+        let (_, returned) = push.try_push(watermark.clone()).unwrap_err();
+        let (_, returned) = push.try_push(returned).unwrap_err();
+        queue.lock().unwrap().capacity = 1;
+        push.try_push(returned).unwrap();
+
+        assert_eq!(drain_local(&mut local_rx), vec![watermark.clone()]);
+        assert_eq!(pop_frame(&queue), Some((1, watermark)));
+        assert_eq!(pop_frame(&queue), None);
+    }
+
+    #[test]
+    fn broadcast_rejects_a_different_envelope_while_a_retry_is_pending() {
+        let queue = peer_queue(0);
+        let (local, mut local_rx) = local_target();
+        let mut push = BroadcastPush::new(
+            vec![local, peer_target(1, &queue)],
+            Arc::new(SharedWakeRegistry::new(2)),
+        );
+        let (_, pending) = push.try_push(Envelope::data(1u64, vec![5])).unwrap_err();
+        let other = Envelope::data(1u64, vec![6, 7]);
+        let (err, returned) = push.try_push(other.clone()).unwrap_err();
+        assert!(!matches!(err, Error::Backpressure), "got {err}");
+        assert_eq!(returned, other);
+        assert!(push.push(other).is_err());
+
+        queue.lock().unwrap().capacity = 1;
+        push.try_push(pending.clone()).unwrap();
+        assert_eq!(drain_local(&mut local_rx), vec![pending.clone()]);
+        assert_eq!(pop_frame(&queue), Some((1, pending)));
     }
 
     #[test]
