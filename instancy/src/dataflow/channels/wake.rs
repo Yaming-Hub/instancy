@@ -23,7 +23,7 @@
 //! 3. Only if still not notified, return `Poll::Pending`
 
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, Weak};
 use std::task::Waker;
 
 /// Shared state backing a [`WakeHandle`].
@@ -117,6 +117,34 @@ impl WakeHandle {
         if let Ok(mut guard) = self.inner.waker.lock() {
             *guard = None;
         }
+    }
+
+    /// Create a non-owning reference to this handle's shared state.
+    ///
+    /// Long-lived registries (such as a runtime's root cancellation token)
+    /// hold weak references so that completed dataflows can be reclaimed.
+    pub(crate) fn downgrade(&self) -> WeakWakeHandle {
+        WeakWakeHandle {
+            inner: Arc::downgrade(&self.inner),
+        }
+    }
+}
+
+/// A non-owning reference to a [`WakeHandle`].
+#[derive(Clone)]
+pub(crate) struct WeakWakeHandle {
+    inner: Weak<WakeState>,
+}
+
+impl WeakWakeHandle {
+    /// Upgrade to a strong handle if any owner is still alive.
+    pub(crate) fn upgrade(&self) -> Option<WakeHandle> {
+        self.inner.upgrade().map(|inner| WakeHandle { inner })
+    }
+
+    /// Whether any strong [`WakeHandle`] still refers to this state.
+    pub(crate) fn is_alive(&self) -> bool {
+        self.inner.strong_count() > 0
     }
 }
 

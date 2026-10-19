@@ -13,7 +13,7 @@
 
 use std::collections::VecDeque;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::mpsc;
 use std::time::Duration;
 
@@ -74,6 +74,87 @@ impl<T> InputRecv<T> {
             }),
         }
     }
+
+    /// Refuse further sends where the backend supports it, keeping buffered
+    /// events receivable. `std::sync::mpsc` cannot refuse sends without
+    /// dropping buffered events; [`InputGate`] covers that backend.
+    fn close(&mut self) {
+        if let Self::Tokio(rx) = self {
+            rx.close();
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// InputGate — admission control shared by an input's senders and its source
+// ---------------------------------------------------------------------------
+
+/// Admission gate shared by an external input's senders and its source
+/// operator, so the source can stop accepting input without losing events
+/// that a sender has already been told were accepted.
+///
+/// A sender enters the gate before enqueueing and leaves after the enqueue
+/// completes. Once the gate is closed and no sender is inside, every
+/// accepted event is already in the channel.
+#[derive(Debug, Default)]
+pub(crate) struct InputGate {
+    closed: AtomicBool,
+    in_flight: AtomicUsize,
+}
+
+impl InputGate {
+    /// Admit one send, or `None` if the input no longer accepts events.
+    fn enter(&self) -> Option<InputGatePermit<'_>> {
+        // SeqCst pairs with `close` + `is_idle`: either this sender observes
+        // the close, or the closer observes this sender in flight.
+        self.in_flight.fetch_add(1, Ordering::SeqCst);
+        if self.closed.load(Ordering::SeqCst) {
+            self.in_flight.fetch_sub(1, Ordering::SeqCst);
+            return None;
+        }
+        Some(InputGatePermit(self))
+    }
+
+    fn close(&self) {
+        self.closed.store(true, Ordering::SeqCst);
+    }
+
+    fn is_idle(&self) -> bool {
+        self.in_flight.load(Ordering::SeqCst) == 0
+    }
+}
+
+struct InputGatePermit<'a>(&'a InputGate);
+
+impl Drop for InputGatePermit<'_> {
+    fn drop(&mut self) {
+        self.0.in_flight.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
+/// One admitted enqueue. On exit — success, error, or a dropped async send
+/// future — leaves the gate and then wakes the executor, so a draining source
+/// waiting for in-flight senders re-checks promptly.
+struct Admission<'a> {
+    permit: Option<InputGatePermit<'a>>,
+    wake: &'a WakeOnDrop,
+}
+
+impl<'a> Admission<'a> {
+    fn enter(gate: &'a Option<Arc<InputGate>>, wake: &'a WakeOnDrop) -> Result<Self> {
+        let permit = match gate {
+            Some(gate) => Some(gate.enter().ok_or(crate::error::Error::ChannelClosed)?),
+            None => None,
+        };
+        Ok(Self { permit, wake })
+    }
+}
+
+impl Drop for Admission<'_> {
+    fn drop(&mut self) {
+        drop(self.permit.take());
+        self.wake.notify();
+    }
 }
 
 /// Unified sender for output channels, abstracting over std and tokio backends.
@@ -119,6 +200,13 @@ impl<T> OutputSend<T> {
 /// declaring quiescence by holding a count in `external_inputs_open`.
 /// When the channel is closed (sender dropped or explicit close), the
 /// count is decremented and the operator marks itself as done.
+///
+/// # Graceful drain
+///
+/// [`close_external_input`](SchedulableOperator::close_external_input) closes
+/// the input's admission gate: later sends fail with [`crate::Error::ChannelClosed`],
+/// while every event a sender was already told was accepted is still
+/// delivered before the operator finishes.
 pub struct ChannelSourceOperator<T: Timestamp, D: Send + 'static> {
     name: String,
     index: usize,
@@ -133,6 +221,11 @@ pub struct ChannelSourceOperator<T: Timestamp, D: Send + 'static> {
     current_capability: T,
     /// Until the first advance, Timestamp::minimum() permits every valid time.
     frontier_advanced: bool,
+    /// Admission gate shared with this input's senders (absent in unit tests
+    /// that construct the operator directly).
+    input_gate: Option<Arc<InputGate>>,
+    /// Set once external input is closed for a graceful drain.
+    external_closed: bool,
     done: bool,
 }
 
@@ -158,8 +251,21 @@ impl<T: Timestamp, D: Send + 'static> ChannelSourceOperator<T, D> {
             external_inputs_open,
             current_capability: T::minimum(),
             frontier_advanced: false,
+            input_gate: None,
+            external_closed: false,
             done: false,
         }
+    }
+
+    /// Share an admission gate with this input's senders.
+    pub(crate) fn with_input_gate(mut self, gate: Arc<InputGate>) -> Self {
+        self.input_gate = Some(gate);
+        self
+    }
+
+    /// Whether no sender is between admission and enqueue.
+    fn senders_idle(&self) -> bool {
+        self.input_gate.as_ref().is_none_or(|gate| gate.is_idle())
     }
 
     /// Try to flush pending output to the downstream pusher.
@@ -183,6 +289,11 @@ impl<T: Timestamp, D: Send + 'static> ChannelSourceOperator<T, D> {
         if self.done {
             return;
         }
+        // Senders must not report success for events nobody will read.
+        if let Some(gate) = &self.input_gate {
+            gate.close();
+        }
+        self.receiver.close();
         // Release the currently held capability
         if let Some(ref reporter) = self.progress_reporter {
             reporter.update(self.current_capability.clone(), -1);
@@ -212,6 +323,9 @@ impl<T: Timestamp, D: Send + 'static> SchedulableOperator for ChannelSourceOpera
         const ACTIVATION_BUDGET: usize = 1024;
         let mut made_progress = false;
         let mut data_events = 0usize;
+        // After external input closes: set once no sender is mid-enqueue, so
+        // the channel's contents are final and an empty receive ends the input.
+        let mut drained_inputs_final = false;
 
         loop {
             if data_events >= ACTIVATION_BUDGET {
@@ -258,6 +372,19 @@ impl<T: Timestamp, D: Send + 'static> SchedulableOperator for ChannelSourceOpera
                     made_progress = true;
                 }
                 Err(RecvError::Empty) => {
+                    if self.external_closed {
+                        if drained_inputs_final {
+                            self.finish();
+                            return Ok(ActivationOutcome::Done);
+                        }
+                        if self.senders_idle() {
+                            // The gate is closed and empty: every accepted event
+                            // is enqueued. Receive once more to collect it.
+                            drained_inputs_final = true;
+                            continue;
+                        }
+                        // A sender is mid-enqueue; it notifies when it leaves.
+                    }
                     // No data available right now. Return Idle.
                     break;
                 }
@@ -296,6 +423,18 @@ impl<T: Timestamp, D: Send + 'static> SchedulableOperator for ChannelSourceOpera
         // Channel source has no dataflow inputs — closing means finishing.
         self.finish();
     }
+
+    fn close_external_input(&mut self) {
+        if self.done || self.external_closed {
+            return;
+        }
+        self.external_closed = true;
+        if let Some(gate) = &self.input_gate {
+            gate.close();
+        }
+        // Fail async senders blocked on capacity now; buffered events remain.
+        self.receiver.close();
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -307,6 +446,13 @@ impl<T: Timestamp, D: Send + 'static> SchedulableOperator for ChannelSourceOpera
 /// Created by [`crate::dataflow::DataflowHandle`] for each declared `output()`
 /// port. Data received from upstream is forwarded
 /// as [`OutputEvent`]s to an [`OutputReceiver`].
+///
+/// # Dropped receivers
+///
+/// If the receiver is dropped, the port's output is no longer wanted: the sink
+/// keeps consuming its input and discards it, so upstream operators never
+/// block on the abandoned port and the dataflow completes normally once its
+/// inputs close.
 pub struct ChannelSinkOperator<T: Timestamp, D: Send + 'static> {
     name: String,
     index: usize,
@@ -315,6 +461,8 @@ pub struct ChannelSinkOperator<T: Timestamp, D: Send + 'static> {
     sender: OutputSend<OutputEvent<T, D>>,
     /// Buffered output event that couldn't be sent due to channel full.
     pending_send: Option<OutputEvent<T, D>>,
+    /// The receiver is gone; input is consumed and discarded.
+    receiver_dropped: bool,
     input_exhausted: bool,
     done: bool,
 }
@@ -335,21 +483,28 @@ impl<T: Timestamp, D: Send + 'static> ChannelSinkOperator<T, D> {
             input_puller,
             sender,
             pending_send: None,
+            receiver_dropped: false,
             input_exhausted: false,
             done: false,
         }
     }
 
-    /// Try to send an event, returning false if the channel is full.
-    /// Returns Err if the receiver was dropped (output no longer needed).
-    fn try_send_event(&mut self, event: OutputEvent<T, D>) -> std::result::Result<bool, ()> {
+    /// Forward an event unless the receiver is gone. Returns `false` (and
+    /// keeps the event) if the channel is full.
+    fn forward(&mut self, event: OutputEvent<T, D>) -> bool {
+        if self.receiver_dropped {
+            return true;
+        }
         match self.sender.try_send(event) {
-            Ok(()) => Ok(true),
+            Ok(()) => true,
             Err(SendError::Full(event)) => {
                 self.pending_send = Some(event);
-                Ok(false)
+                false
             }
-            Err(SendError::Disconnected(_)) => Err(()),
+            Err(SendError::Disconnected(_)) => {
+                self.receiver_dropped = true;
+                true
+            }
         }
     }
 }
@@ -362,13 +517,8 @@ impl<T: Timestamp, D: Send + 'static> SchedulableOperator for ChannelSinkOperato
 
         // First, try to drain any pending send from a previous activation.
         if let Some(event) = self.pending_send.take() {
-            match self.try_send_event(event) {
-                Ok(true) => {} // sent successfully
-                Ok(false) => return Ok(ActivationOutcome::BlockedOnBackpressure),
-                Err(()) => {
-                    self.done = true;
-                    return Ok(ActivationOutcome::Done);
-                }
+            if !self.forward(event) {
+                return Ok(ActivationOutcome::BlockedOnBackpressure);
             }
         }
 
@@ -378,26 +528,16 @@ impl<T: Timestamp, D: Send + 'static> SchedulableOperator for ChannelSinkOperato
         loop {
             match self.input_puller.pull() {
                 Some(envelope) => {
+                    made_progress = true;
                     match envelope.payload {
                         crate::dataflow::channels::envelope::Payload::Data { time, data } => {
-                            match self.try_send_event(OutputEvent::data(time, data)) {
-                                Ok(true) => {
-                                    made_progress = true;
-                                }
-                                Ok(false) => {
-                                    // Channel full — stop pulling, will retry next activation
-                                    return Ok(ActivationOutcome::BlockedOnBackpressure);
-                                }
-                                Err(()) => {
-                                    // Receiver dropped — output no longer needed
-                                    self.done = true;
-                                    return Ok(ActivationOutcome::Done);
-                                }
+                            if !self.forward(OutputEvent::data(time, data)) {
+                                // Channel full — stop pulling, will retry next activation
+                                return Ok(ActivationOutcome::BlockedOnBackpressure);
                             }
                         }
                         crate::dataflow::channels::envelope::Payload::Control(_) => {
                             // Control signals are not forwarded to external consumers.
-                            made_progress = true;
                         }
                     }
                 }
@@ -482,9 +622,15 @@ impl Drop for WakeOnDrop {
 /// When a `WakeHandle` is wired (set during runtime spawn), every `send()`,
 /// `advance_to()`, and `Drop` notifies the executor's wake handle so
 /// that a sleeping async executor wakes promptly when external data arrives.
+///
+/// Once the dataflow stops accepting input — it finished, failed, or began a
+/// graceful drain ([`crate::SpawnOptions::drain_on_cancel`]) — `send()` and
+/// `advance_to()` return [`crate::Error::ChannelClosed`]. Every call that
+/// returned `Ok` before that point is still delivered during a drain.
 #[derive(Clone, Debug)]
 pub struct InputSender<T: Timestamp, D: Send + 'static> {
     sender: mpsc::SyncSender<InputEvent<T, D>>,
+    gate: Option<Arc<InputGate>>,
     // Fields drop in declaration order: disconnect the channel before notifying.
     wake_on_drop: WakeOnDrop,
 }
@@ -494,6 +640,7 @@ impl<T: Timestamp, D: Send + 'static> InputSender<T, D> {
     pub(crate) fn new(sender: mpsc::SyncSender<InputEvent<T, D>>) -> Self {
         Self {
             sender,
+            gate: None,
             wake_on_drop: WakeOnDrop(None),
         }
     }
@@ -505,24 +652,35 @@ impl<T: Timestamp, D: Send + 'static> InputSender<T, D> {
     ) -> Self {
         Self {
             sender,
+            gate: None,
             wake_on_drop: WakeOnDrop(Some(wake_handle)),
         }
+    }
+
+    /// Share an admission gate with the input's source operator.
+    pub(crate) fn with_input_gate(mut self, gate: Arc<InputGate>) -> Self {
+        self.gate = Some(gate);
+        self
+    }
+
+    fn enqueue(&self, event: InputEvent<T, D>) -> Result<()> {
+        let _admission = Admission::enter(&self.gate, &self.wake_on_drop)?;
+        self.sender
+            .send(event)
+            .map_err(|_| crate::error::Error::ChannelClosed)
     }
 
     /// Send a batch of data at the given timestamp.
     ///
     /// # Errors
     ///
-    /// Returns an error if the dataflow has already terminated.
+    /// Returns [`crate::Error::ChannelClosed`] if the dataflow no longer
+    /// accepts input (it terminated or is draining after cancellation).
     /// The batch time must be at or beyond the committed frontier in the partial
     /// order, including for empty batches. Violations are reported by execution,
     /// not necessarily by this call. Batch timestamps need not arrive sorted.
     pub fn send(&self, time: T, data: Vec<D>) -> Result<()> {
-        self.sender
-            .send(InputEvent::data(time, data))
-            .map_err(|_| crate::error::Error::ChannelClosed)?;
-        self.wake_on_drop.notify();
-        Ok(())
+        self.enqueue(InputEvent::data(time, data))
     }
 
     /// Advance the input frontier to `time`.
@@ -546,11 +704,7 @@ impl<T: Timestamp, D: Send + 'static> InputSender<T, D> {
     /// sender.advance_to(2).unwrap(); // epoch 1 is now sealed
     /// ```
     pub fn advance_to(&self, time: T) -> Result<()> {
-        self.sender
-            .send(InputEvent::frontier(time))
-            .map_err(|_| crate::error::Error::ChannelClosed)?;
-        self.wake_on_drop.notify();
-        Ok(())
+        self.enqueue(InputEvent::frontier(time))
     }
 
     /// Close this input, signaling no more data will arrive.
@@ -563,13 +717,33 @@ impl<T: Timestamp, D: Send + 'static> InputSender<T, D> {
 ///
 /// Created by [`crate::SpawnedDataflow::take_output`]. Receives [`OutputEvent`]s
 /// containing timestamped batches of results.
+///
+/// Dropping the receiver abandons the port: the dataflow keeps running and
+/// discards the port's output instead of blocking on it. An untaken port is
+/// treated the same way once the handle is joined or dropped.
 pub struct OutputReceiver<T: Timestamp, D: Send + 'static> {
     receiver: mpsc::Receiver<OutputEvent<T, D>>,
+    /// Notifies the executor when the receiver is dropped, so a sink blocked
+    /// on a full channel observes the disconnect promptly.
+    _wake_on_drop: WakeOnDrop,
 }
 
 impl<T: Timestamp, D: Send + 'static> OutputReceiver<T, D> {
     pub(crate) fn new(receiver: mpsc::Receiver<OutputEvent<T, D>>) -> Self {
-        Self { receiver }
+        Self {
+            receiver,
+            _wake_on_drop: WakeOnDrop(None),
+        }
+    }
+
+    pub(crate) fn with_wake_handle(
+        receiver: mpsc::Receiver<OutputEvent<T, D>>,
+        wake_handle: WakeHandle,
+    ) -> Self {
+        Self {
+            receiver,
+            _wake_on_drop: WakeOnDrop(Some(wake_handle)),
+        }
     }
 
     /// Receive the next output event (blocking).
@@ -622,9 +796,14 @@ impl<T: Timestamp, D: Send + 'static> OutputReceiver<T, D> {
 /// Uses the same shared-frontier and execution-time validation contract as
 /// [`InputSender`]. Clones are writers to one logical input, not independent
 /// progress holders. Only dropping the last sender closes that input.
+///
+/// Like [`InputSender`], sends fail with [`crate::Error::ChannelClosed`] once
+/// the dataflow stops accepting input, including when a graceful drain begins;
+/// a send blocked on capacity at that moment fails instead of enqueueing.
 #[derive(Clone)]
 pub struct AsyncInputSender<T: Timestamp, D: Send + 'static> {
     sender: tokio::sync::mpsc::Sender<InputEvent<T, D>>,
+    gate: Option<Arc<InputGate>>,
     // Keep this after sender so the EOF wake cannot precede disconnection.
     wake_on_drop: WakeOnDrop,
 }
@@ -636,8 +815,23 @@ impl<T: Timestamp, D: Send + 'static> AsyncInputSender<T, D> {
     ) -> Self {
         Self {
             sender,
+            gate: None,
             wake_on_drop: WakeOnDrop(Some(wake_handle)),
         }
+    }
+
+    /// Share an admission gate with the input's source operator.
+    pub(crate) fn with_input_gate(mut self, gate: Arc<InputGate>) -> Self {
+        self.gate = Some(gate);
+        self
+    }
+
+    async fn enqueue(&self, event: InputEvent<T, D>) -> Result<()> {
+        let _admission = Admission::enter(&self.gate, &self.wake_on_drop)?;
+        self.sender
+            .send(event)
+            .await
+            .map_err(|_| crate::error::Error::ChannelClosed)
     }
 
     /// Send a batch of data at the given timestamp.
@@ -648,7 +842,8 @@ impl<T: Timestamp, D: Send + 'static> AsyncInputSender<T, D> {
     ///
     /// # Errors
     ///
-    /// Returns an error if the dataflow has already terminated.
+    /// Returns [`crate::Error::ChannelClosed`] if the dataflow no longer
+    /// accepts input (it terminated or is draining after cancellation).
     /// The time must be at or beyond the committed frontier in the partial order.
     /// Success means enqueued; violations surface through execution completion.
     ///
@@ -659,12 +854,7 @@ impl<T: Timestamp, D: Send + 'static> AsyncInputSender<T, D> {
     /// the event. Dataflow cancellation may stop execution before queued events
     /// are validated.
     pub async fn send(&self, time: T, data: Vec<D>) -> Result<()> {
-        self.sender
-            .send(InputEvent::data(time, data))
-            .await
-            .map_err(|_| crate::error::Error::ChannelClosed)?;
-        self.wake_on_drop.notify();
-        Ok(())
+        self.enqueue(InputEvent::data(time, data)).await
     }
 
     /// Advance the input frontier to `time`.
@@ -688,12 +878,7 @@ impl<T: Timestamp, D: Send + 'static> AsyncInputSender<T, D> {
     /// sender.advance_to(2).await?; // epoch 1 is now sealed
     /// ```
     pub async fn advance_to(&self, time: T) -> Result<()> {
-        self.sender
-            .send(InputEvent::frontier(time))
-            .await
-            .map_err(|_| crate::error::Error::ChannelClosed)?;
-        self.wake_on_drop.notify();
-        Ok(())
+        self.enqueue(InputEvent::frontier(time)).await
     }
 
     /// Close this input, signaling no more data will arrive.
@@ -711,6 +896,9 @@ impl<T: Timestamp, D: Send + 'static> AsyncInputSender<T, D> {
 ///
 /// Each successful `recv()` notifies the executor's `WakeHandle`, allowing
 /// a backpressure-blocked sink operator to retry sending.
+///
+/// Dropping the receiver abandons the port: the dataflow keeps running and
+/// discards the port's output instead of blocking on it.
 pub struct AsyncOutputReceiver<T: Timestamp, D: Send + 'static> {
     receiver: tokio::sync::mpsc::Receiver<OutputEvent<T, D>>,
     /// Wake handle to notify when capacity is freed (unblocks backpressured sinks).

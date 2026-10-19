@@ -7,7 +7,12 @@ instancy treats failures as dataflow-level events instead of process-wide panics
 ## Error Patterns
 
 ### Recover from operator panics instead of crashing the process
-Turn panics into `join_blocking()` errors with `catch_panics(true)`.
+An operator panic never crashes the process or the shared worker pool: the
+dataflow fails with `Error::OperatorPanic` (naming the operator), its executor
+is torn down, and every `InputSender` / `OutputReceiver` of that dataflow is
+released (sends fail with `ChannelClosed`, receivers see end-of-stream).
+`catch_panics(true)` additionally catches the panic at the operator boundary,
+so the executor fails through its regular error path.
 
 ```rust
 use instancy::{DataflowBuilder, RuntimeConfig, RuntimeHandle, SpawnOptions};
@@ -207,12 +212,22 @@ let handle = rt.spawn(dataflow, opts).unwrap();
 
 When cancellation is triggered with drain enabled:
 
-1. **External inputs are closed** — no new data is accepted.
+1. **External inputs are closed** — no new data is accepted: `send()` and `advance_to()` return `Err(ChannelClosed)` and `source_async` producers are stopped. Every send that already returned `Ok` is still processed, and the drain does not wait for callers to drop their senders.
 2. **In-flight data continues flowing** through operators normally.
 3. **If all operators complete** within the timeout, the dataflow returns successfully (`Ok`).
 4. **If the timeout expires**, the dataflow returns `Err(Cancelled)` with the original reason.
 
+Cancellation caused by a failure (an operator error, a failed sibling worker, a lost peer) never drains — the computation can no longer succeed, so it stops immediately. A sibling failure reported while a drain is in progress ends that drain at once.
+
 This is useful for ETL pipelines, streaming aggregations, or any workflow where partial results are worse than slightly delayed shutdown.
+
+### Dropped output receivers
+
+Dropping an `OutputReceiver` / `AsyncOutputReceiver` (or never taking one before `join()`) abandons that output port. The dataflow keeps running and discards the port's output; it never blocks upstream operators or input senders, and it completes normally once its inputs close.
+
+### Dropping the runtime
+
+Dropping a `RuntimeHandle` cancels its dataflows with `RuntimeShutdown`. Once its worker threads stop, any dataflow that has not finished (including one still draining) is torn down: its channels close and its completion resolves to `Err(Cancelled { reason: Some(RuntimeShutdown) })`. Call `shutdown_async().await` first to let drains finish.
 
 ## Multi-Worker Failure Propagation
 
@@ -285,7 +300,7 @@ assert!(result.is_ok()); // Data flowed through before shutdown.
 ```
 
 ### Detect drain timeout vs normal completion
-When the drain timeout expires (e.g., input stays open), the result is `Err(Cancelled)`.
+When the drain timeout expires (e.g., a stalled consumer keeps the backlog from draining), the result is `Err(Cancelled)`.
 
 ```rust
 use std::time::Duration;
@@ -300,12 +315,17 @@ let dataflow = builder.build().unwrap();
 let opts = SpawnOptions::new().drain_on_cancel(Duration::from_millis(100));
 let mut handle = rt.spawn(dataflow, opts).unwrap();
 
-// Keep sender alive — dataflow can't finish draining.
-let _sender = handle.take_input::<i32>("data").unwrap();
+let sender = handle.take_input::<i32>("data").unwrap();
+// Hold the receiver without reading: the accepted backlog cannot drain.
+let _stalled = handle.take_output::<i32>("out").unwrap();
+for x in 0..1_000 {
+    sender.send(0, vec![x]).unwrap();
+}
 
 handle.cancel();
 let result = handle.join_blocking();
 assert!(result.is_err()); // Drain timed out → Cancelled.
+assert!(sender.send(0, vec![0]).is_err()); // The drain closed the input.
 ```
 
 ## Troubleshooting Completion

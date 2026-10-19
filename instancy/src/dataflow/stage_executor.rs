@@ -1123,7 +1123,8 @@ fn activate_operator(
         }
     } else {
         let op_name = op.name().to_string();
-        op.activate()
+        // Tags an unwinding panic with the operator name for the task boundary.
+        crate::dataflow::executor::activate_operator(op, false)
             .map_err(|err| err.with_operator_context(op_name, worker_index))
     }
 }

@@ -44,7 +44,7 @@ use std::fmt;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
-use crate::dataflow::channels::wake::WakeHandle;
+use crate::dataflow::channels::wake::{WakeHandle, WeakWakeHandle};
 
 /// The reason a dataflow was cancelled.
 ///
@@ -99,6 +99,23 @@ pub enum CancellationReason {
     InternalError { detail: String },
 }
 
+impl CancellationReason {
+    /// Whether this reason reports a failure rather than a requested stop.
+    ///
+    /// Failure-driven cancellation never enters a graceful drain: the
+    /// computation can no longer produce a correct result.
+    pub(crate) fn is_failure(&self) -> bool {
+        matches!(
+            self,
+            Self::NetworkError { .. }
+                | Self::WorkerFailed { .. }
+                | Self::OperatorError { .. }
+                | Self::PeerDown { .. }
+                | Self::InternalError { .. }
+        )
+    }
+}
+
 impl fmt::Display for CancellationReason {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
@@ -117,6 +134,36 @@ impl fmt::Display for CancellationReason {
     }
 }
 
+/// Weak wake-handle registrations for one token node.
+///
+/// Tokens never own the executors they wake: a long-lived token (such as a
+/// runtime's root token) would otherwise retain one handle per dataflow ever
+/// spawned. Dead entries are pruned when the list doubles past its last live size.
+#[derive(Default)]
+struct WakeRegistrations {
+    handles: Vec<WeakWakeHandle>,
+    prune_at: usize,
+}
+
+impl WakeRegistrations {
+    const MIN_PRUNE_AT: usize = 32;
+
+    fn push(&mut self, handle: &WakeHandle) {
+        if self.handles.len() >= self.prune_at.max(Self::MIN_PRUNE_AT) {
+            self.handles.retain(WeakWakeHandle::is_alive);
+            self.prune_at = self.handles.len().saturating_mul(2);
+        }
+        self.handles.push(handle.downgrade());
+    }
+
+    fn live(&self) -> Vec<WakeHandle> {
+        self.handles
+            .iter()
+            .filter_map(WeakWakeHandle::upgrade)
+            .collect()
+    }
+}
+
 /// Shared state for a cancellation token.
 struct TokenInner {
     /// Whether this token has been cancelled.
@@ -132,7 +179,7 @@ struct TokenInner {
     ///
     /// Only accessed during `register_wake_handle()` (setup) and `cancel()`
     /// (one-shot). The `is_cancelled()` hot path remains lock-free.
-    wake_handles: Mutex<Vec<WakeHandle>>,
+    wake_handles: Mutex<WakeRegistrations>,
     /// Async notification primitive for `cancelled_async()`.
     ///
     /// Signalled when this token is directly cancelled. Waiters on
@@ -164,7 +211,7 @@ impl CancellationToken {
                 cancelled: AtomicBool::new(false),
                 parent: None,
                 reason: Mutex::new(None),
-                wake_handles: Mutex::new(Vec::new()),
+                wake_handles: Mutex::new(WakeRegistrations::default()),
                 async_notify: tokio::sync::Notify::new(),
             }),
         }
@@ -185,7 +232,7 @@ impl CancellationToken {
                 cancelled: AtomicBool::new(false),
                 parent: Some(Arc::clone(&self.inner)),
                 reason: Mutex::new(None),
-                wake_handles: Mutex::new(Vec::new()),
+                wake_handles: Mutex::new(WakeRegistrations::default()),
                 async_notify: tokio::sync::Notify::new(),
             }),
         }
@@ -229,11 +276,16 @@ impl CancellationToken {
         }
         // Now set the flag and notify (only the first swap notifies).
         if !self.inner.cancelled.swap(true, Ordering::AcqRel) {
-            // Wake synchronous executor handles.
-            if let Ok(handles) = self.inner.wake_handles.lock() {
-                for handle in handles.iter() {
-                    handle.notify();
-                }
+            // Wake synchronous executor handles. Notify outside the lock:
+            // waking may enqueue the executor on its pool.
+            let handles = self
+                .inner
+                .wake_handles
+                .lock()
+                .map(|registrations| registrations.live())
+                .unwrap_or_default();
+            for handle in &handles {
+                handle.notify();
             }
             // Wake async waiters on this token.
             self.inner.async_notify.notify_waiters();
@@ -334,13 +386,11 @@ impl CancellationToken {
     /// This method is called once during executor setup — it is not on the
     /// hot path. The `is_cancelled()` check remains lock-free.
     ///
-    /// **Note on lifecycle:** The WakeHandle clones stored in ancestor tokens
-    /// are *not* automatically removed when the child token or executor is
-    /// dropped. After executor completion, `WakeHandle::clear_waker()` should
-    /// be called to break the Waker→Executor reference chain, leaving only a
-    /// lightweight `Arc<WakeState>` (AtomicBool + empty Mutex). For extremely
-    /// long-lived runtimes that spawn millions of dataflows, consider switching
-    /// to `Weak<WakeState>` in the Vec to allow full reclamation.
+    /// **Note on lifecycle:** Tokens hold only weak references to registered
+    /// handles. The caller (the executor) must keep a strong `WakeHandle`
+    /// for as long as it wants cancellation wake-ups; once every strong handle
+    /// is dropped, the registration is pruned on a later registration, so
+    /// long-lived ancestor tokens do not grow with every completed dataflow.
     pub fn register_wake_handle(&self, handle: WakeHandle) {
         // Register on self
         Self::register_on_node(&self.inner, handle.clone());
@@ -364,13 +414,24 @@ impl CancellationToken {
     /// If the node is already cancelled, notify immediately.
     fn register_on_node(node: &Arc<TokenInner>, handle: WakeHandle) {
         if let Ok(mut handles) = node.wake_handles.lock() {
-            handles.push(handle.clone());
+            handles.push(&handle);
         }
         // If this node is already cancelled, notify immediately.
         // This handles the race where cancel() ran before we inserted.
         if node.cancelled.load(Ordering::Acquire) {
             handle.notify();
         }
+    }
+
+    /// Number of wake-handle registrations currently stored on this node
+    /// (live or not yet pruned).
+    #[cfg(test)]
+    pub(crate) fn wake_registration_count(&self) -> usize {
+        self.inner
+            .wake_handles
+            .lock()
+            .map(|registrations| registrations.handles.len())
+            .unwrap_or(0)
     }
 
     /// Returns a [`CancellationGuard`] that cancels this token when dropped.
@@ -866,6 +927,31 @@ mod tests {
         token.cancel();
         assert!(wake1.take_notification());
         assert!(wake2.take_notification());
+    }
+
+    #[test]
+    fn dropped_wake_handles_are_pruned_from_long_lived_ancestors() {
+        let root = CancellationToken::new();
+        let survivor = WakeHandle::new();
+        survivor.take_notification();
+        root.child_token().register_wake_handle(survivor.clone());
+
+        for _ in 0..10_000 {
+            // Each short-lived dataflow registers on its own child token and
+            // every ancestor, then drops its handle on completion.
+            root.child_token().register_wake_handle(WakeHandle::new());
+        }
+        let registered = root.wake_registration_count();
+        assert!(
+            registered <= 64,
+            "root token retained {registered} registrations for dead dataflows"
+        );
+
+        root.cancel();
+        assert!(
+            survivor.take_notification(),
+            "live handles must survive pruning and still be woken"
+        );
     }
 
     #[test]

@@ -102,16 +102,21 @@ fn main() {
     let builder3 = DataflowBuilder::<u64>::new("drain_timeout_demo");
 
     let input3 = builder3.input::<i32>("numbers").unwrap();
-    input3.map("identity", |_t, x| x);
+    input3.map("identity", |_t, x| x).output("results").unwrap();
 
     let dataflow3 = builder3.build().expect("build");
 
-    // Short drain timeout — input never closes so drain can't finish.
+    // Short drain timeout. The drain closes the input, but the consumer never
+    // reads the output, so the accepted backlog cannot drain in time.
     let opts3 = SpawnOptions::new().drain_on_cancel(Duration::from_millis(200));
     let mut handle3 = rt3.spawn(dataflow3, opts3).expect("spawn");
-    let _sender3 = handle3.take_input::<i32>("numbers").unwrap();
+    let sender3 = handle3.take_input::<i32>("numbers").unwrap();
+    let _stalled_consumer = handle3.take_output::<i32>("results").unwrap();
+    for x in 0..1_000 {
+        sender3.send(0, vec![x]).unwrap();
+    }
 
-    println!("  Cancelling with 200ms drain timeout (input never closed)...");
+    println!("  Cancelling with 200ms drain timeout (consumer stalled)...");
     handle3.cancel();
 
     match handle3.join_blocking() {

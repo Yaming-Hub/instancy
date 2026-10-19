@@ -214,12 +214,15 @@ pub struct SpawnOptions {
     /// ```
     pub(crate) cancellation_token: Option<tokio_util::sync::CancellationToken>,
     /// When set, cancellation triggers a graceful drain phase instead of
-    /// immediate termination. The executor closes external inputs and
-    /// continues processing in-flight data until all operators complete
-    /// or the timeout expires.
+    /// immediate termination. The executor closes external inputs (later
+    /// sends fail with [`Error::ChannelClosed`]; everything already accepted
+    /// is still delivered) and continues processing in-flight data until all
+    /// operators complete or the timeout expires.
     ///
     /// If the drain completes before the timeout, the dataflow returns
     /// successfully. If the timeout expires, it returns `Err(Cancelled)`.
+    /// Cancellation caused by a failure (operator error, failed sibling
+    /// worker, lost peer) stops immediately without draining.
     ///
     /// # Example
     ///
@@ -408,6 +411,13 @@ impl SpawnOptions {
     /// executor closes external inputs and continues processing in-flight
     /// data. If all operators complete within `timeout`, the dataflow
     /// returns successfully. Otherwise it returns `Err(Cancelled)`.
+    ///
+    /// Once the drain begins, `send()` / `advance_to()` on the dataflow's
+    /// input senders fail with [`Error::ChannelClosed`]; every call that
+    /// already returned `Ok` is delivered. `source_async` producers are
+    /// stopped. The drain therefore does not wait for callers to drop their
+    /// senders. Failure-driven cancellation (an operator error, a failed
+    /// sibling worker, a lost peer) never drains.
     ///
     /// # Example
     ///
@@ -1025,6 +1035,59 @@ impl RuntimeHandle {
         self.active_count.load(std::sync::atomic::Ordering::Relaxed)
     }
 
+    /// Count every notifier as active before any of them is registered, so
+    /// [`wait_idle`](Self::wait_idle) never observes a partially registered
+    /// multi-worker dataflow as idle.
+    ///
+    /// Returns a token that is cancelled once all of these notifiers have
+    /// completed (or been dropped); per-dataflow helper tasks select on it so
+    /// they exit when the dataflow does.
+    fn track_completion<'a>(
+        &self,
+        notifiers: impl ExactSizeIterator<Item = &'a mut CompletionNotifier>,
+    ) -> tokio_util::sync::CancellationToken {
+        let finished = tokio_util::sync::CancellationToken::new();
+        let all_finished = Arc::new(finished.clone().drop_guard());
+        self.active_count
+            .fetch_add(notifiers.len(), std::sync::atomic::Ordering::AcqRel);
+        for notifier in notifiers {
+            let active_count = Arc::clone(&self.active_count);
+            let idle_notify = Arc::clone(&self.idle_notify);
+            let all_finished = Arc::clone(&all_finished);
+            notifier.set_on_complete(Box::new(move || {
+                let prev = active_count.fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
+                if prev == 1 {
+                    idle_notify.notify_waiters();
+                }
+                drop(all_finished);
+            }));
+        }
+        finished
+    }
+
+    /// Forward cancellation of the caller's token to `cancel` while the
+    /// dataflow runs. The bridge task exits when the user token fires, the
+    /// dataflow is cancelled, or the dataflow finishes (`finished`).
+    fn bridge_external_cancel(
+        &self,
+        user_token: Option<tokio_util::sync::CancellationToken>,
+        cancel: CancellationToken,
+        finished: tokio_util::sync::CancellationToken,
+    ) {
+        let Some(user_token) = user_token else {
+            return;
+        };
+        self.tokio_handle.spawn(async move {
+            tokio::select! {
+                _ = user_token.cancelled() => {
+                    cancel.cancel_with_reason(CancellationReason::UserRequested);
+                }
+                _ = cancel.cancelled_async() => {}
+                _ = finished.cancelled() => {}
+            }
+        });
+    }
+
     /// Returns the runtime name.
     pub fn name(&self) -> &str {
         &self.name
@@ -1620,37 +1683,14 @@ impl RuntimeHandle {
         )?;
 
         // Track active dataflow count for wait_idle()/shutdown_async().
-        self.active_count
-            .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
-        let active_count = Arc::clone(&self.active_count);
-        let idle_notify = Arc::clone(&self.idle_notify);
-        notifier.set_on_complete(Box::new(move || {
-            let prev = active_count.fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
-            if prev == 1 {
-                idle_notify.notify_waiters();
-            }
-        }));
+        let finished = self.track_completion(std::iter::once(&mut notifier));
 
         self.registry
             .register(executor, notifier, dataflow_id, priority);
 
-        // If an external cancellation token was provided, spawn a bridge task
-        // that propagates cancellation from the user's token to our internal one.
-        // The task exits when either the user token fires OR the dataflow
-        // completes/cancels by other means.
-        if let Some(user_token) = external_cancel {
-            let cancel = spawned.cancel.clone();
-            self.tokio_handle.spawn(async move {
-                tokio::select! {
-                    _ = user_token.cancelled() => {
-                        cancel.cancel_with_reason(CancellationReason::UserRequested);
-                    }
-                    _ = cancel.cancelled_async() => {
-                        // Dataflow already cancelled/completed — exit cleanly.
-                    }
-                }
-            });
-        }
+        // If an external cancellation token was provided, bridge it to our
+        // internal token until the dataflow finishes.
+        self.bridge_external_cancel(external_cancel, spawned.cancel.clone(), finished);
 
         Ok(spawned)
     }
@@ -2009,18 +2049,10 @@ impl RuntimeHandle {
         // channels contain the complete initial state from all peers.
         //
         // Track each worker as an active dataflow for wait_idle()/shutdown_async().
+        // All workers are counted before any is registered.
+        let finished = self.track_completion(prepared.iter_mut().map(|(_, _, n)| n));
         let mut workers = Vec::with_capacity(num_workers);
-        for (spawned, executor, mut notifier) in prepared {
-            self.active_count
-                .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
-            let active_count = Arc::clone(&self.active_count);
-            let idle_notify = Arc::clone(&self.idle_notify);
-            notifier.set_on_complete(Box::new(move || {
-                let prev = active_count.fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
-                if prev == 1 {
-                    idle_notify.notify_waiters();
-                }
-            }));
+        for (spawned, executor, notifier) in prepared {
             self.registry
                 .register(executor, notifier, dataflow_id, priority);
             workers.push(spawned);
@@ -2034,25 +2066,14 @@ impl RuntimeHandle {
             _phantom: PhantomData,
         };
 
-        // If an external cancellation token was provided, spawn a bridge task
-        // that propagates cancellation to all workers. Exits when either fires.
-        if let Some(user_token) = external_cancel {
-            let cancel = if let Some(ref dc) = multi._dataflow_cancel {
-                dc.clone()
-            } else {
-                multi.workers[0].cancel.clone()
-            };
-            self.tokio_handle.spawn(async move {
-                tokio::select! {
-                    _ = user_token.cancelled() => {
-                        cancel.cancel_with_reason(CancellationReason::UserRequested);
-                    }
-                    _ = cancel.cancelled_async() => {
-                        // Dataflow already cancelled/completed — exit cleanly.
-                    }
-                }
-            });
-        }
+        // If an external cancellation token was provided, bridge it to all
+        // workers until the dataflow finishes.
+        let cancel = if let Some(ref dc) = multi._dataflow_cancel {
+            dc.clone()
+        } else {
+            multi.workers[0].cancel.clone()
+        };
+        self.bridge_external_cancel(external_cancel, cancel, finished);
 
         Ok(multi)
     }
@@ -2657,18 +2678,9 @@ impl RuntimeHandle {
 
         debug_assert_eq!(spawned_count, prepared.len());
 
+        let finished = self.track_completion(prepared.iter_mut().map(|(_, _, n)| n));
         let mut workers = Vec::with_capacity(num_workers);
-        for (spawned, executor, mut notifier) in prepared {
-            self.active_count
-                .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
-            let active_count = Arc::clone(&self.active_count);
-            let idle_notify = Arc::clone(&self.idle_notify);
-            notifier.set_on_complete(Box::new(move || {
-                let prev = active_count.fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
-                if prev == 1 {
-                    idle_notify.notify_waiters();
-                }
-            }));
+        for (spawned, executor, notifier) in prepared {
             self.registry
                 .register(executor, notifier, dataflow_id, priority);
             workers.push(spawned);
@@ -2682,21 +2694,7 @@ impl RuntimeHandle {
             _phantom: PhantomData,
         };
 
-        if let Some(user_token) = external_cancel {
-            let cancel = multi
-                ._dataflow_cancel
-                .as_ref()
-                .expect("dataflow_cancel is always set for staged stage executors")
-                .clone();
-            self.tokio_handle.spawn(async move {
-                tokio::select! {
-                    _ = user_token.cancelled() => {
-                        cancel.cancel_with_reason(CancellationReason::UserRequested);
-                    }
-                    _ = cancel.cancelled_async() => {}
-                }
-            });
-        }
+        self.bridge_external_cancel(external_cancel, dataflow_cancel, finished);
 
         Ok(multi)
     }
@@ -3533,19 +3531,11 @@ impl RuntimeHandle {
         }
 
         // Phase 9: Register all workers for execution.
-        // Track each worker as an active dataflow for wait_idle()/shutdown_async().
+        // Track each worker as an active dataflow for wait_idle()/shutdown_async();
+        // all workers are counted before any is registered.
+        let finished = self.track_completion(prepared.iter_mut().map(|(_, _, n)| n));
         let mut workers = Vec::with_capacity(num_local);
-        for (spawned, executor, mut notifier) in prepared {
-            self.active_count
-                .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
-            let active_count = Arc::clone(&self.active_count);
-            let idle_notify = Arc::clone(&self.idle_notify);
-            notifier.set_on_complete(Box::new(move || {
-                let prev = active_count.fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
-                if prev == 1 {
-                    idle_notify.notify_waiters();
-                }
-            }));
+        for (spawned, executor, notifier) in prepared {
             self.registry
                 .register(executor, notifier, dataflow_id, dataflow_priority);
             workers.push(spawned);
@@ -3610,23 +3600,14 @@ impl RuntimeHandle {
             }
         }
 
-        // If an external cancellation token was provided, spawn a bridge task
-        // that propagates cancellation to all cluster workers.
-        if let Some(user_token) = options.cancellation_token {
+        // If an external cancellation token was provided, bridge it to all
+        // cluster workers until the dataflow finishes.
+        if options.cancellation_token.is_some() {
             let cancel = dataflow_cancel
                 .as_ref()
                 .expect("dataflow_cancel always set for cluster dataflows")
                 .clone();
-            self.tokio_handle.spawn(async move {
-                tokio::select! {
-                    _ = user_token.cancelled() => {
-                        cancel.cancel_with_reason(CancellationReason::UserRequested);
-                    }
-                    _ = cancel.cancelled_async() => {
-                        // Dataflow already cancelled/completed — exit cleanly.
-                    }
-                }
-            });
+            self.bridge_external_cancel(options.cancellation_token, cancel, finished);
         }
 
         Ok(ClusterSpawnedDataflow {
@@ -3655,11 +3636,17 @@ impl Drop for RuntimeHandle {
     /// still running executor loops, causing a deadlock. Cancelling the token
     /// first ensures executors observe cancellation and exit promptly.
     ///
+    /// Once the pool's threads have stopped, any dataflow that has not
+    /// finished (including one in a graceful drain) is torn down: its executor
+    /// is dropped, closing its input and output channels, and its completion
+    /// resolves to `Err(Cancelled { reason: Some(RuntimeShutdown) })`. Use
+    /// [`shutdown_async`](Self::shutdown_async) first to let drains finish.
+    ///
     /// **Note:** Cancellation is cooperative — executors check the token at the
     /// top of each sweep iteration. If an operator's `activate()` call blocks
     /// for a long time (e.g., heavy computation), the pool join will wait until
-    /// that activation completes and the executor rechecks the token. Operators
-    /// should avoid unbounded blocking in `activate()`.
+    /// that activation completes. Operators should avoid unbounded blocking in
+    /// `activate()`.
     fn drop(&mut self) {
         self.cancel
             .cancel_with_reason(CancellationReason::RuntimeShutdown);
@@ -4426,6 +4413,10 @@ impl<T: Timestamp> SpawnedDataflow<T> {
     ///
     /// Output receivers can only be taken once — subsequent calls for the
     /// same port will return an error.
+    ///
+    /// Dropping the receiver (or never taking it before [`join()`](Self::join))
+    /// abandons the port: the dataflow keeps running and discards the port's
+    /// output rather than blocking upstream operators or input senders.
     ///
     /// # Type safety
     ///
@@ -8532,6 +8523,73 @@ mod tests {
 
         rt.wait_idle().await;
         assert_eq!(rt.active_dataflows(), 0);
+    }
+
+    #[tokio::test]
+    async fn track_completion_counts_every_worker_before_registration() {
+        let rt = RuntimeHandle::new(RuntimeConfig {
+            worker_threads: 1,
+            ..Default::default()
+        })
+        .unwrap();
+        let (mut completions, mut notifiers): (Vec<_>, Vec<_>) =
+            (0..3).map(|_| DataflowCompletion::new()).unzip();
+        let finished = rt.track_completion(notifiers.iter_mut());
+        assert_eq!(rt.active_dataflows(), 3, "all workers counted up front");
+
+        // The first worker finishing must not make the runtime look idle while
+        // its siblings are still pending registration or running.
+        notifiers.remove(0).complete(Ok(true));
+        assert_eq!(rt.active_dataflows(), 2);
+        assert!(!finished.is_cancelled());
+        let idle = rt.wait_idle();
+        tokio::pin!(idle);
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(50), idle.as_mut())
+                .await
+                .is_err(),
+            "wait_idle returned while workers were still active"
+        );
+
+        // A dropped notifier (executor torn down) also counts as finished.
+        drop(notifiers.remove(0));
+        notifiers.remove(0).complete(Ok(true));
+        idle.await;
+        assert_eq!(rt.active_dataflows(), 0);
+        assert!(
+            finished.is_cancelled(),
+            "finished fires after the last worker"
+        );
+        for completion in completions.drain(..) {
+            let _ = completion.wait();
+        }
+    }
+
+    #[test]
+    fn root_token_does_not_retain_completed_dataflows() {
+        use crate::dataflow::DataflowBuilder;
+
+        let rt = RuntimeHandle::new(RuntimeConfig {
+            worker_threads: 1,
+            ..Default::default()
+        })
+        .unwrap();
+        for i in 0..500 {
+            let builder = DataflowBuilder::<u64>::new(format!("short-{i}"));
+            builder
+                .source("src", vec![(0u64, vec![1u64])])
+                .for_each("sink", |_t, _v| {});
+            let df = builder.build().unwrap();
+            rt.spawn(df, SpawnOptions::new())
+                .unwrap()
+                .join_blocking()
+                .unwrap();
+        }
+        let registered = rt.cancel.wake_registration_count();
+        assert!(
+            registered <= 64,
+            "runtime root token retained {registered} wake handles for completed dataflows"
+        );
     }
 
     #[tokio::test]
