@@ -1743,7 +1743,7 @@ impl RuntimeHandle {
 
         // Register wake handle on the cancellation token (and all ancestors)
         // so that cancel() wakes the sleeping executor promptly.
-        cancel.register_wake_handle(wake_handle.clone());
+        cancel.register_wake_handle_weak(&wake_handle);
 
         // --- Wire input ports ---
         let mut input_senders: Vec<(String, &'static str, Box<dyn std::any::Any + Send>)> =
@@ -2278,7 +2278,7 @@ impl RuntimeHandle {
             let worker_cancel = dataflow_cancel.child_token();
             let cancel_handle = worker_cancel.clone();
             let wake_handle = WakeHandle::new();
-            worker_cancel.register_wake_handle(wake_handle.clone());
+            worker_cancel.register_wake_handle_weak(&wake_handle);
             let global_worker_context = WorkerContext::new(worker_idx, num_workers)?;
             let external_inputs_open = Arc::new(AtomicUsize::new(0));
             let worker_name = dataflow.name().to_string();
@@ -3732,7 +3732,7 @@ impl SimpleRuntime {
         }
 
         let wake_handle = WakeHandle::new();
-        self.cancel.register_wake_handle(wake_handle.clone());
+        self.cancel.register_wake_handle_weak(&wake_handle);
         let mut dataflow = dataflow;
         let mut executor = materialize_executor(
             &mut dataflow,
@@ -3777,7 +3777,7 @@ impl SimpleRuntime {
         dataflow.collect_metrics = true;
 
         let wake_handle = WakeHandle::new();
-        self.cancel.register_wake_handle(wake_handle.clone());
+        self.cancel.register_wake_handle_weak(&wake_handle);
         let mut executor = materialize_executor(
             &mut dataflow,
             self.cancel.clone(),
@@ -3852,7 +3852,7 @@ impl SimpleRuntime {
 
         // Register wake handle on the cancellation token so cancel() wakes
         // a sleeping executor.
-        cancel.register_wake_handle(wake_handle.clone());
+        cancel.register_wake_handle_weak(&wake_handle);
 
         // --- Wire input ports ---
         let mut input_senders: Vec<(String, &'static str, Box<dyn std::any::Any + Send>)> =

@@ -105,14 +105,43 @@ impl CancellationReason {
     /// Failure-driven cancellation never enters a graceful drain: the
     /// computation can no longer produce a correct result.
     pub(crate) fn is_failure(&self) -> bool {
-        matches!(
-            self,
+        match self {
             Self::NetworkError { .. }
-                | Self::WorkerFailed { .. }
-                | Self::OperatorError { .. }
-                | Self::PeerDown { .. }
-                | Self::InternalError { .. }
-        )
+            | Self::WorkerFailed { .. }
+            | Self::OperatorError { .. }
+            | Self::PeerDown { .. }
+            | Self::InternalError { .. } => true,
+            // A peer forwards its own reason as its `Display` text.
+            Self::PeerCancelled { detail, .. } => Self::describes_failure(detail),
+            Self::UserRequested | Self::RuntimeShutdown | Self::HandleDropped => false,
+        }
+    }
+
+    /// Whether `detail` is the `Display` text of a failure reason, possibly
+    /// forwarded through further peers ("peer {id} cancelled dataflow: ...").
+    fn describes_failure(mut detail: &str) -> bool {
+        const FAILURE_PREFIXES: [&str; 5] = [
+            "network error: ",
+            "worker failed: ",
+            "operator error: ",
+            "peer node down: ",
+            "internal error: ",
+        ];
+        loop {
+            if FAILURE_PREFIXES
+                .iter()
+                .any(|prefix| detail.starts_with(prefix))
+            {
+                return true;
+            }
+            match detail
+                .strip_prefix("peer ")
+                .and_then(|rest| rest.split_once(" cancelled dataflow: "))
+            {
+                Some((_, forwarded)) => detail = forwarded,
+                None => return false,
+            }
+        }
     }
 }
 
@@ -134,32 +163,55 @@ impl fmt::Display for CancellationReason {
     }
 }
 
-/// Weak wake-handle registrations for one token node.
+/// Wake-handle registrations for one token node.
 ///
-/// Tokens never own the executors they wake: a long-lived token (such as a
-/// runtime's root token) would otherwise retain one handle per dataflow ever
-/// spawned. Dead entries are pruned when the list doubles past its last live size.
+/// Executors register *weakly*: a long-lived token (such as a runtime's root
+/// token) would otherwise retain one handle per dataflow ever spawned. Dead
+/// weak entries are pruned when the list doubles past its last live size.
+/// Handles registered through the public API are owned by the token, as
+/// before.
 #[derive(Default)]
 struct WakeRegistrations {
-    handles: Vec<WeakWakeHandle>,
+    handles: Vec<WakeRegistration>,
     prune_at: usize,
+}
+
+enum WakeRegistration {
+    Owned(WakeHandle),
+    Weak(WeakWakeHandle),
+}
+
+impl WakeRegistration {
+    fn is_live(&self) -> bool {
+        match self {
+            Self::Owned(_) => true,
+            Self::Weak(handle) => handle.is_alive(),
+        }
+    }
+
+    fn get(&self) -> Option<WakeHandle> {
+        match self {
+            Self::Owned(handle) => Some(handle.clone()),
+            Self::Weak(handle) => handle.upgrade(),
+        }
+    }
 }
 
 impl WakeRegistrations {
     const MIN_PRUNE_AT: usize = 32;
 
-    fn push(&mut self, handle: &WakeHandle) {
+    fn push(&mut self, registration: WakeRegistration) {
         if self.handles.len() >= self.prune_at.max(Self::MIN_PRUNE_AT) {
-            self.handles.retain(WeakWakeHandle::is_alive);
+            self.handles.retain(WakeRegistration::is_live);
             self.prune_at = self.handles.len().saturating_mul(2);
         }
-        self.handles.push(handle.downgrade());
+        self.handles.push(registration);
     }
 
     fn live(&self) -> Vec<WakeHandle> {
         self.handles
             .iter()
-            .filter_map(WeakWakeHandle::upgrade)
+            .filter_map(WakeRegistration::get)
             .collect()
     }
 }
@@ -386,20 +438,28 @@ impl CancellationToken {
     /// This method is called once during executor setup — it is not on the
     /// hot path. The `is_cancelled()` check remains lock-free.
     ///
-    /// **Note on lifecycle:** Tokens hold only weak references to registered
-    /// handles. The caller (the executor) must keep a strong `WakeHandle`
-    /// for as long as it wants cancellation wake-ups; once every strong handle
-    /// is dropped, the registration is pruned on a later registration, so
-    /// long-lived ancestor tokens do not grow with every completed dataflow.
+    /// **Note on lifecycle:** The token (and every ancestor) keeps the handle
+    /// alive until the token is dropped; registrations are never removed. The
+    /// runtime registers its executors weakly instead, so long-lived ancestor
+    /// tokens do not grow with every completed dataflow.
     pub fn register_wake_handle(&self, handle: WakeHandle) {
-        // Register on self
-        Self::register_on_node(&self.inner, handle.clone());
+        self.register(&handle, || WakeRegistration::Owned(handle.clone()));
+    }
 
-        // Register on all ancestors so parent.cancel() also wakes us
-        let mut current = &self.inner.parent;
-        while let Some(ancestor) = current {
-            Self::register_on_node(ancestor, handle.clone());
-            current = &ancestor.parent;
+    /// Like [`register_wake_handle`](Self::register_wake_handle), but tokens
+    /// hold only weak references: the caller must keep a strong `WakeHandle`
+    /// for as long as it wants cancellation wake-ups. Dead registrations are
+    /// pruned on later registrations.
+    pub(crate) fn register_wake_handle_weak(&self, handle: &WakeHandle) {
+        self.register(handle, || WakeRegistration::Weak(handle.downgrade()));
+    }
+
+    fn register(&self, handle: &WakeHandle, registration: impl Fn() -> WakeRegistration) {
+        // Register on self and all ancestors so parent.cancel() also wakes us.
+        let mut current = Some(&self.inner);
+        while let Some(node) = current {
+            Self::register_on_node(node, handle, registration());
+            current = node.parent.as_ref();
         }
 
         // Race safety: re-check cancellation after registration. If the token
@@ -412,9 +472,13 @@ impl CancellationToken {
 
     /// Register a wake handle on a single token node.
     /// If the node is already cancelled, notify immediately.
-    fn register_on_node(node: &Arc<TokenInner>, handle: WakeHandle) {
+    fn register_on_node(
+        node: &Arc<TokenInner>,
+        handle: &WakeHandle,
+        registration: WakeRegistration,
+    ) {
         if let Ok(mut handles) = node.wake_handles.lock() {
-            handles.push(&handle);
+            handles.push(registration);
         }
         // If this node is already cancelled, notify immediately.
         // This handles the race where cancel() ran before we inserted.
@@ -934,12 +998,13 @@ mod tests {
         let root = CancellationToken::new();
         let survivor = WakeHandle::new();
         survivor.take_notification();
-        root.child_token().register_wake_handle(survivor.clone());
+        root.child_token().register_wake_handle_weak(&survivor);
 
         for _ in 0..10_000 {
             // Each short-lived dataflow registers on its own child token and
             // every ancestor, then drops its handle on completion.
-            root.child_token().register_wake_handle(WakeHandle::new());
+            root.child_token()
+                .register_wake_handle_weak(&WakeHandle::new());
         }
         let registered = root.wake_registration_count();
         assert!(
@@ -952,6 +1017,62 @@ mod tests {
             survivor.take_notification(),
             "live handles must survive pruning and still be woken"
         );
+    }
+
+    #[test]
+    fn public_registration_keeps_the_handle_alive() {
+        use std::sync::atomic::AtomicUsize;
+        use std::task::{Wake, Waker};
+
+        struct Count(AtomicUsize);
+        impl Wake for Count {
+            fn wake(self: Arc<Self>) {
+                self.0.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+        let woken = Arc::new(Count(AtomicUsize::new(0)));
+        let token = CancellationToken::new();
+        let handle = WakeHandle::new();
+        handle.register_waker(&Waker::from(Arc::clone(&woken)));
+        // The token now owns the only handle.
+        token.register_wake_handle(handle);
+        for _ in 0..100 {
+            token.register_wake_handle_weak(&WakeHandle::new());
+        }
+        token.cancel();
+        assert_eq!(woken.0.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn forwarded_peer_failures_are_failures() {
+        let failures = [
+            CancellationReason::NetworkError { detail: "x".into() },
+            CancellationReason::WorkerFailed { detail: "x".into() },
+            CancellationReason::OperatorError { detail: "x".into() },
+            CancellationReason::PeerDown {
+                node_id: "n".into(),
+            },
+            CancellationReason::InternalError { detail: "x".into() },
+        ];
+        let stops = [
+            CancellationReason::UserRequested,
+            CancellationReason::RuntimeShutdown,
+            CancellationReason::HandleDropped,
+        ];
+        let forward = |reason: &CancellationReason| CancellationReason::PeerCancelled {
+            peer_id: "a".into(),
+            detail: reason.to_string(),
+        };
+        for reason in &failures {
+            assert!(reason.is_failure());
+            assert!(forward(reason).is_failure(), "{reason:?} forwarded");
+            assert!(forward(&forward(reason)).is_failure(), "{reason:?} twice");
+        }
+        for reason in &stops {
+            assert!(!reason.is_failure());
+            assert!(!forward(reason).is_failure(), "{reason:?} forwarded");
+            assert!(!forward(&forward(reason)).is_failure(), "{reason:?} twice");
+        }
     }
 
     #[test]

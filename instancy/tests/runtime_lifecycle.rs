@@ -469,7 +469,10 @@ async fn external_cancellation_bridge_tasks_exit_when_dataflows_finish() {
             .unwrap();
         multi.join().await.unwrap();
     }
-    assert_eq!(rt.active_dataflows(), 0);
+    // Completion is published before the active count drops; wait for both.
+    tokio::time::timeout(TIMEOUT, rt.wait_idle())
+        .await
+        .expect("runtime never became idle");
     tokio::time::sleep(Duration::from_millis(300)).await;
     let after = metrics.num_alive_tasks();
     assert!(
@@ -548,32 +551,48 @@ fn drain_closes_external_inputs() {
     let mut handle = rt
         .spawn(
             idle_dataflow("drain-close"),
-            SpawnOptions::new().drain_on_cancel(Duration::from_secs(10)),
+            SpawnOptions::new().drain_on_cancel(Duration::from_secs(30)),
         )
         .unwrap();
     let sender = handle.take_input::<u64>("data").unwrap();
     let receiver = handle.take_output::<u64>("results").unwrap();
+    let consumer = std::thread::spawn(move || {
+        receiver
+            .collect_data()
+            .into_iter()
+            .flat_map(|(_, d)| d)
+            .collect::<Vec<u64>>()
+    });
     sender.send(0, vec![1]).unwrap();
-    std::thread::sleep(Duration::from_millis(100));
 
-    handle.cancel(); // drain phase begins
-    std::thread::sleep(Duration::from_millis(100));
-
-    let after_cancel = sender.send(0, vec![42]);
-    assert!(
-        matches!(after_cancel, Err(Error::ChannelClosed)),
-        "drain must stop accepting input, got {after_cancel:?}"
-    );
+    handle.cancel(); // the drain begins at the executor's next sweep
+    // Sends racing the start of the drain may still be accepted; once one is
+    // refused, every later send must be refused too.
+    let mut accepted = vec![1];
+    let started = Instant::now();
+    let mut v = 100u64;
+    loop {
+        match sender.send(0, vec![v]) {
+            Ok(()) => accepted.push(v),
+            Err(Error::ChannelClosed) => break,
+            Err(e) => panic!("unexpected send error {e:?}"),
+        }
+        assert!(started.elapsed() < TIMEOUT, "drain never closed the input");
+        v += 1;
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    for _ in 0..10 {
+        assert!(
+            matches!(sender.send(0, vec![42]), Err(Error::ChannelClosed)),
+            "a closed input accepted data again"
+        );
+    }
     // The drain finishes even though the caller still holds the sender.
     within(TIMEOUT, move || handle.join_blocking())
         .expect("drain never finished with the sender still held")
         .expect("drain completes successfully once accepted data is processed");
-    let seen: Vec<u64> = receiver
-        .collect_data()
-        .into_iter()
-        .flat_map(|(_, d)| d)
-        .collect();
-    assert_eq!(seen, vec![1]);
+    let seen = consumer.join().unwrap();
+    assert_eq!(seen, accepted, "exactly the accepted records are delivered");
     drop(sender);
 }
 
@@ -945,5 +964,85 @@ mod cluster {
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn shared_cluster_runtime_drop_stops_both_nodes() {
         runtime_drop(Transport::Shared).await;
+    }
+
+    /// A failure on node A must stop drain-configured node B at once rather
+    /// than letting it drain until the deadline (B can never finish: A's
+    /// workers are gone and B's input stays open).
+    async fn remote_failure_skips_drain(transport: Transport) {
+        let topology = ClusterTopology::multi_node(vec![
+            NodeConfig::new("node-a", 1),
+            NodeConfig::new("node-b", 1),
+        ])
+        .unwrap();
+        let build = |builder: &mut DataflowBuilder<u64>| -> Result<()> {
+            builder
+                .input::<u64>("data")?
+                .unary("fail-on-7", |input, output| {
+                    while let Some((time, data)) = input.next() {
+                        if data.contains(&7) {
+                            return Err(Error::operator(
+                                "fail-on-7",
+                                std::io::Error::other("bad record"),
+                            ));
+                        }
+                        output.push_vec(time, data);
+                    }
+                    Ok(())
+                })
+                .exchange("spread", |v: &u64| *v)
+                .output("results")?;
+            Ok(())
+        };
+        let (nodes, mut a, mut b) = spawn_pair(
+            transport,
+            topology,
+            DataflowId::new(),
+            build,
+            SpawnOptions::new().drain_on_cancel(Duration::from_secs(120)),
+        )
+        .await;
+        let (sa, sb) = (
+            a.take_input::<u64>(0, "data").unwrap(),
+            b.take_input::<u64>(0, "data").unwrap(),
+        );
+        sb.send(0, vec![100]).unwrap();
+        sa.send(0, vec![1, 7]).unwrap();
+        // Hold both completions unresolved (bridges alive) until every worker stops.
+        let started = Instant::now();
+        tokio::time::timeout(TIMEOUT, async {
+            nodes.rt_a.wait_idle().await;
+            nodes.rt_b.wait_idle().await;
+        })
+        .await
+        .unwrap_or_else(|_| panic!("{transport:?}: node-b drained instead of stopping"));
+        assert!(started.elapsed() < Duration::from_secs(15));
+        let ra = tokio::task::spawn_blocking(move || within(TIMEOUT, move || a.join_blocking()))
+            .await
+            .unwrap()
+            .expect("node-a completion never resolved");
+        let rb = tokio::task::spawn_blocking(move || within(TIMEOUT, move || b.join_blocking()))
+            .await
+            .unwrap()
+            .expect("node-b completion never resolved");
+        assert!(
+            matches!(ra, Err(Error::Operator { .. })),
+            "{transport:?}: node-a should report the operator error, got {ra:?}"
+        );
+        assert!(
+            matches!(rb, Err(Error::Cancelled { .. })),
+            "{transport:?}: node-b should be cancelled, got {rb:?}"
+        );
+        drop((sa, sb));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn dedicated_cluster_remote_failure_skips_drain() {
+        remote_failure_skips_drain(Transport::Dedicated).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn shared_cluster_remote_failure_skips_drain() {
+        remote_failure_skips_drain(Transport::Shared).await;
     }
 }
