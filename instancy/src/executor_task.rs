@@ -158,8 +158,14 @@ impl ExecutorTask {
     /// Only one thread may call this at a time.
     ///
     /// After polling, transitions state:
-    /// - `Poll::Ready` → DONE, notifies CompletionNotifier
+    /// - `Poll::Ready` → DONE, drops the future, notifies CompletionNotifier
     /// - `Poll::Pending` → IDLE (or QUEUED if a wake arrived during polling)
+    /// - panic → DONE, drops the future, notifies an [`Error::OperatorPanic`]
+    ///
+    /// Panics from the executor future are contained here rather than
+    /// unwinding into the pool thread: unwinding with the executor lock held
+    /// would poison it, leaving the future (and every channel endpoint it
+    /// owns) alive in a `PoolWaker → task → future → WakeHandle` cycle.
     ///
     /// Returns a [`PollOutcome`] indicating whether the task completed,
     /// is pending-idle, or is pending and needs re-enqueue by the caller.
@@ -170,108 +176,34 @@ impl ExecutorTask {
         // which CAS transitions POLLING → QUEUED. This is benign:
         // the CAS at the end of poll() will detect QUEUED and return
         // PendingNeedsReenqueue, causing the caller to re-enqueue.
-
-        // Helper: complete the task with an error when we detect an
-        // unrecoverable internal problem (poisoned mutex, missing future).
-        // Transitions to DONE and notifies the waiter.
-        let complete_with_error = |this: &Self, msg: &str| {
-            this.state.store(TASK_DONE, Ordering::Release);
-            // Best-effort: try to take notifier and fire error. If the
-            // notifier lock is also poisoned, the NotCompletionNotifier's Drop
-            // (which fires on the Arc's last drop) is the final safety net.
-            if let Ok(mut n) = this.notifier.lock() {
-                if let Some(notifier) = n.take() {
-                    notifier.complete(Err(crate::error::Error::Runtime(
+        let result = {
+            let mut executor_lock = self.executor.lock().unwrap_or_else(|e| e.into_inner());
+            match executor_lock.as_mut() {
+                // Catch inside the lock scope so an unwind never poisons it.
+                Some(executor) => std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    executor.as_mut().poll(cx)
+                })),
+                None => {
+                    // The future was already taken (completed or aborted). The
+                    // CAS state machine should prevent this; report rather than
+                    // panic in core scheduling code.
+                    drop(executor_lock);
+                    return self.finish(Err(crate::error::Error::Runtime(
                         RuntimeError::SpawnFailed {
-                            context: msg.into(),
+                            context: "executor polled after future was already consumed".into(),
                             source: None,
                         },
                     )));
                 }
             }
-            PollOutcome::Completed
         };
-
-        // Panic safety: if the executor panics during poll, transition to DONE
-        // and drop the executor future to break any Arc cycles. Then take the
-        // notifier so its Drop impl fires an error to the waiter.
-        struct PanicGuard<'a> {
-            state: &'a AtomicU8,
-            executor: &'a Mutex<Option<Pin<Box<dyn Future<Output = Result<bool>> + Send>>>>,
-            notifier: &'a Mutex<Option<CompletionNotifier>>,
-        }
-        impl Drop for PanicGuard<'_> {
-            fn drop(&mut self) {
-                self.state.store(TASK_DONE, Ordering::Release);
-                // Drop the future to break PoolWaker→ExecutorTask→future→WakeHandle cycle.
-                // Use into_inner() to recover the data even from a poisoned mutex.
-                if let Ok(mut exec) = self.executor.lock() {
-                    exec.take();
-                }
-                // Take the notifier so its Drop impl fires the error path.
-                if let Ok(mut n) = self.notifier.lock() {
-                    drop(n.take());
-                }
-            }
-        }
-        let guard = PanicGuard {
-            state: &self.state,
-            executor: &self.executor,
-            notifier: &self.notifier,
-        };
-
-        // Acquire executor lock. Poisoned = a prior poll panicked while holding
-        // the lock. The CAS state machine should prevent this (panicked tasks
-        // transition to DONE), but handle gracefully as defense-in-depth.
-        let result = {
-            let mut executor_lock = match self.executor.lock() {
-                Ok(lock) => lock,
-                Err(_poisoned) => {
-                    std::mem::forget(guard);
-                    return complete_with_error(self, "executor mutex poisoned by a prior panic");
-                }
-            };
-            match executor_lock.as_mut() {
-                Some(executor) => executor.as_mut().poll(cx),
-                None => {
-                    // The future was already taken (completed or panicked). This
-                    // should never happen because the CAS state machine prevents
-                    // DONE tasks from reaching POLLING. Treat as an error rather
-                    // than panicking in core scheduling code.
-                    std::mem::forget(guard);
-                    return complete_with_error(
-                        self,
-                        "executor polled after future was already consumed",
-                    );
-                }
-            }
-        };
-
-        // Poll succeeded (no panic) — cancel the guard.
-        std::mem::forget(guard);
 
         match result {
-            Poll::Ready(outcome) => {
-                self.state.store(TASK_DONE, Ordering::Release);
-
-                // Drop the future to break the PoolWaker→ExecutorTask→future
-                // →WakeHandle→Waker→PoolWaker Arc cycle. If the lock is
-                // somehow poisoned here (shouldn't be — we just held it
-                // successfully above), skip the take; the cycle may leak
-                // but we don't panic.
-                if let Ok(mut exec) = self.executor.lock() {
-                    exec.take();
-                }
-
-                // Notify completion. Same defensive lock handling.
-                if let Ok(mut n) = self.notifier.lock() {
-                    if let Some(notifier) = n.take() {
-                        notifier.complete(outcome);
-                    }
-                }
-                PollOutcome::Completed
-            }
-            Poll::Pending => {
+            Ok(Poll::Ready(outcome)) => self.finish(outcome),
+            Err(payload) => self.finish(Err(crate::dataflow::executor::operator_panic_error(
+                payload, None,
+            ))),
+            Ok(Poll::Pending) => {
                 // Try POLLING → IDLE. If a wake arrived during our poll,
                 // PoolWaker CAS'd POLLING → QUEUED, so this CAS fails.
                 // In that case the caller MUST re-enqueue the task.
@@ -297,6 +229,59 @@ impl ExecutorTask {
                 }
             }
         }
+    }
+
+    /// Transition to DONE, release the executor future, then publish `outcome`.
+    ///
+    /// The future is dropped *before* the completion is published so that a
+    /// caller observing the result also observes closed I/O channels.
+    fn finish(&self, outcome: Result<bool>) -> PollOutcome {
+        self.state.store(TASK_DONE, Ordering::Release);
+        self.release(outcome);
+        PollOutcome::Completed
+    }
+
+    fn release(&self, outcome: Result<bool>) {
+        let future = self
+            .executor
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .take();
+        if let Some(future) = future {
+            // A panicking destructor must not prevent publishing the result.
+            let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || drop(future)));
+        }
+        let notifier = self
+            .notifier
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .take();
+        if let Some(notifier) = notifier {
+            notifier.complete(outcome);
+        }
+    }
+
+    /// Terminate a task that will never be polled again (e.g. its pool shut
+    /// down), completing it with `error`.
+    ///
+    /// Returns `false` if the task already finished or is being polled; only
+    /// call this once no pool thread can poll the task.
+    pub(crate) fn abort(&self, error: impl FnOnce() -> crate::error::Error) -> bool {
+        let mut state = self.state.load(Ordering::Acquire);
+        loop {
+            if state == TASK_DONE || state == TASK_POLLING {
+                return false;
+            }
+            match self
+                .state
+                .compare_exchange(state, TASK_DONE, Ordering::AcqRel, Ordering::Acquire)
+            {
+                Ok(_) => break,
+                Err(observed) => state = observed,
+            }
+        }
+        self.release(Err(error()));
+        true
     }
 
     /// Attempt to wake this task: transition IDLE → QUEUED.
@@ -421,8 +406,32 @@ pub struct ExecutorRegistry {
     /// Serializes notification with the pool's final queue check and wait.
     pool_park_mutex: Option<Arc<Mutex<()>>>,
 
+    /// Every task registered and not yet reclaimed, so shutdown can complete
+    /// tasks that will never be polled again. Weak: completed tasks are freed
+    /// normally and pruned when the list doubles past its last live size.
+    live_tasks: Mutex<LiveTasks>,
+
     /// Next task ID counter.
     next_id: AtomicUsize,
+}
+
+#[derive(Default)]
+struct LiveTasks {
+    tasks: Vec<std::sync::Weak<ExecutorTask>>,
+    prune_at: usize,
+}
+
+impl LiveTasks {
+    const MIN_PRUNE_AT: usize = 32;
+
+    fn push(&mut self, task: &Arc<ExecutorTask>) {
+        if self.tasks.len() >= self.prune_at.max(Self::MIN_PRUNE_AT) {
+            self.tasks
+                .retain(|task| task.upgrade().is_some_and(|task| !task.is_done()));
+            self.prune_at = self.tasks.len().saturating_mul(2);
+        }
+        self.tasks.push(Arc::downgrade(task));
+    }
 }
 
 /// Internal queue — either a plain FIFO or a policy-ordered heap.
@@ -507,6 +516,7 @@ impl ExecutorRegistry {
             schedule_policy,
             pool_condvar: Some(pool_condvar),
             pool_park_mutex: None,
+            live_tasks: Mutex::new(LiveTasks::default()),
             next_id: AtomicUsize::new(0),
         }
     }
@@ -524,6 +534,7 @@ impl ExecutorRegistry {
             schedule_policy: None,
             pool_condvar: None,
             pool_park_mutex: None,
+            live_tasks: Mutex::new(LiveTasks::default()),
             next_id: AtomicUsize::new(0),
         }
     }
@@ -551,8 +562,48 @@ impl ExecutorRegistry {
             executor,
             notifier,
         ));
+        self.live_tasks
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .push(&task);
         self.enqueue(Arc::clone(&task));
         task
+    }
+
+    /// Complete every registered task that has not finished with
+    /// [`CancellationReason::RuntimeShutdown`](crate::cancellation::CancellationReason::RuntimeShutdown),
+    /// dropping its executor future so channel endpoints close.
+    ///
+    /// Call only after every thread that polls this registry has stopped:
+    /// such tasks would otherwise never be polled again, leaving their
+    /// completions unresolved forever. Returns the number of aborted tasks.
+    pub(crate) fn abort_all(&self) -> usize {
+        let tasks: Vec<Arc<ExecutorTask>> = self
+            .live_tasks
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .tasks
+            .drain(..)
+            .filter_map(|task| task.upgrade())
+            .collect();
+        // Release queue references (outside the lock: dropping a task may run
+        // completion callbacks); aborted tasks are never dequeued again.
+        let queued = self.ready_queue.lock().ok().map(|mut queue| {
+            let empty = match &*queue {
+                ReadyQueue::Fifo(_) => ReadyQueue::Fifo(std::collections::VecDeque::new()),
+                ReadyQueue::Heap(_) => ReadyQueue::Heap(std::collections::BinaryHeap::new()),
+            };
+            std::mem::replace(&mut *queue, empty)
+        });
+        drop(queued);
+        tasks
+            .iter()
+            .filter(|task| {
+                task.abort(|| crate::error::Error::Cancelled {
+                    reason: Some(crate::cancellation::CancellationReason::RuntimeShutdown),
+                })
+            })
+            .count()
     }
 
     /// Push a task onto the ready queue and notify the pool.
@@ -1023,9 +1074,9 @@ mod tests {
     }
 
     #[test]
-    fn panic_in_executor_transitions_to_done_and_notifies_error() {
+    fn panic_in_executor_completes_with_operator_panic_and_drops_future() {
         /// A future that panics on first poll.
-        struct PanicFuture;
+        struct PanicFuture(#[allow(dead_code)] Arc<()>);
         impl Future for PanicFuture {
             type Output = Result<bool>;
             fn poll(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Self::Output> {
@@ -1035,32 +1086,188 @@ mod tests {
 
         let registry = Arc::new(ExecutorRegistry::new_standalone());
         let (completion, notifier) = make_notifier();
+        let alive = Arc::new(());
         let task = Arc::new(ExecutorTask::new(
             TaskId(0),
             DataflowId::new(),
             0,
-            Box::pin(PanicFuture),
+            Box::pin(PanicFuture(Arc::clone(&alive))),
             notifier,
         ));
 
         assert!(task.try_start_poll());
 
-        // Create a PoolWaker-based waker so the Arc cycle would form
-        // if the future stored the waker before panicking.
         let pool_waker = Arc::new(PoolWaker::new(Arc::clone(&task), Arc::clone(&registry)));
         let waker: std::task::Waker = pool_waker.into();
         let mut cx = Context::from_waker(&waker);
 
-        // Poll should panic — catch it
-        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| task.poll(&mut cx)));
-        assert!(result.is_err(), "expected panic");
-
-        // PanicGuard should have set state to DONE
+        // The panic is contained by the task rather than unwinding into the pool.
+        assert_eq!(task.poll(&mut cx), PollOutcome::Completed);
         assert!(task.is_done());
+        assert!(!task.executor.is_poisoned());
+        assert_eq!(
+            Arc::strong_count(&alive),
+            1,
+            "panicked future must be dropped"
+        );
+        match completion.wait() {
+            Err(crate::error::Error::OperatorPanic { message, .. }) => {
+                assert_eq!(message, "executor panic")
+            }
+            other => panic!("expected OperatorPanic, got {other:?}"),
+        }
+        assert!(!task.try_wake(), "a finished task must not be re-enqueued");
+    }
 
-        // PanicGuard should have dropped the future and taken the notifier,
-        // so DataflowCompletion::wait() returns an error (not hang).
-        assert!(completion.wait().is_err());
+    #[test]
+    fn panicking_destructor_still_publishes_the_result() {
+        struct BombOnDrop;
+        impl Drop for BombOnDrop {
+            fn drop(&mut self) {
+                panic!("destructor panic");
+            }
+        }
+        struct Finishes(#[allow(dead_code)] BombOnDrop);
+        impl Future for Finishes {
+            type Output = Result<bool>;
+            fn poll(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Self::Output> {
+                Poll::Ready(Ok(true))
+            }
+        }
+
+        let (completion, notifier) = make_notifier();
+        let task = ExecutorTask::new(
+            TaskId(0),
+            DataflowId::new(),
+            0,
+            Box::pin(Finishes(BombOnDrop)),
+            notifier,
+        );
+        assert!(task.try_start_poll());
+        let mut cx = Context::from_waker(std::task::Waker::noop());
+        assert_eq!(task.poll(&mut cx), PollOutcome::Completed);
+        assert!(completion.wait().is_ok());
+    }
+
+    #[test]
+    fn concurrent_wakes_never_resurrect_an_aborted_task() {
+        struct Holds;
+        impl Future for Holds {
+            type Output = Result<bool>;
+            fn poll(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Self::Output> {
+                Poll::Pending
+            }
+        }
+        for _ in 0..200 {
+            let registry = Arc::new(ExecutorRegistry::new_standalone());
+            let (completion, notifier) = make_notifier();
+            let task = registry.register(Box::pin(Holds), notifier, DataflowId::new(), 0);
+            // Park it as IDLE so wakes have something to race with.
+            let queued = registry.dequeue().unwrap();
+            assert!(queued.try_start_poll());
+            let mut cx = Context::from_waker(std::task::Waker::noop());
+            assert_eq!(queued.poll(&mut cx), PollOutcome::Pending);
+
+            let wakers: Vec<_> = (0..4)
+                .map(|_| {
+                    let waker: std::task::Waker =
+                        Arc::new(PoolWaker::new(Arc::clone(&task), Arc::clone(&registry))).into();
+                    std::thread::spawn(move || {
+                        for _ in 0..50 {
+                            waker.wake_by_ref();
+                        }
+                    })
+                })
+                .collect();
+            registry.abort_all();
+            for waker in wakers {
+                waker.join().unwrap();
+            }
+            assert!(task.is_done());
+            // A wake that enqueued before the abort may linger; it must be inert.
+            while let Some(stale) = registry.dequeue() {
+                assert!(!stale.try_start_poll(), "aborted task was polled again");
+            }
+            assert!(matches!(
+                completion.wait(),
+                Err(crate::error::Error::Cancelled { .. })
+            ));
+        }
+    }
+
+    #[test]
+    fn abort_all_completes_unpolled_tasks_with_runtime_shutdown() {
+        let registry = Arc::new(ExecutorRegistry::new_standalone());
+        let alive = Arc::new(());
+        struct Holds(#[allow(dead_code)] Arc<()>);
+        impl Future for Holds {
+            type Output = Result<bool>;
+            fn poll(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Self::Output> {
+                Poll::Pending
+            }
+        }
+
+        let mut completions = Vec::new();
+        for _ in 0..3 {
+            let (completion, notifier) = make_notifier();
+            registry.register(
+                Box::pin(Holds(Arc::clone(&alive))),
+                notifier,
+                DataflowId::new(),
+                0,
+            );
+            completions.push(completion);
+        }
+        // Leave one task idle (polled once) and two queued.
+        let idle = registry.dequeue().unwrap();
+        assert!(idle.try_start_poll());
+        let waker: std::task::Waker =
+            Arc::new(PoolWaker::new(Arc::clone(&idle), Arc::clone(&registry))).into();
+        assert_eq!(
+            idle.poll(&mut Context::from_waker(&waker)),
+            PollOutcome::Pending
+        );
+        drop(idle);
+
+        assert_eq!(registry.abort_all(), 3);
+        assert_eq!(registry.ready_count(), 0);
+        assert_eq!(
+            Arc::strong_count(&alive),
+            1,
+            "aborted futures must be dropped"
+        );
+        for completion in completions {
+            assert!(matches!(
+                completion.wait(),
+                Err(crate::error::Error::Cancelled {
+                    reason: Some(crate::cancellation::CancellationReason::RuntimeShutdown)
+                })
+            ));
+        }
+        assert_eq!(registry.abort_all(), 0, "abort_all is idempotent");
+    }
+
+    #[test]
+    fn live_task_list_prunes_finished_tasks() {
+        let registry = Arc::new(ExecutorRegistry::new_standalone());
+        for _ in 0..1000 {
+            let (_completion, notifier) = make_notifier();
+            registry.register(
+                Box::pin(CountdownFuture { remaining: 0 }),
+                notifier,
+                DataflowId::new(),
+                0,
+            );
+            let task = registry.dequeue().unwrap();
+            assert!(task.try_start_poll());
+            let mut cx = Context::from_waker(std::task::Waker::noop());
+            assert_eq!(task.poll(&mut cx), PollOutcome::Completed);
+        }
+        let tracked = registry.live_tasks.lock().unwrap().tasks.len();
+        assert!(
+            tracked <= 64,
+            "finished tasks must be pruned, tracked {tracked}"
+        );
     }
 
     #[test]

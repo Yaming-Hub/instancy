@@ -375,14 +375,19 @@ impl<T: Timestamp> DataflowBuilder<T> {
         self.state.borrow().contexts.get::<C>()
     }
 
-    /// Enable panic recovery for operator activations.
+    /// Enable panic recovery at the operator boundary.
     ///
     /// When enabled, panics in operator `activate()` are caught with
-    /// `std::panic::catch_unwind` and converted to [`Error::OperatorPanic`].
-    /// This prevents a single misbehaving operator from crashing the entire
-    /// process.
+    /// `std::panic::catch_unwind` and converted to [`Error::OperatorPanic`]
+    /// inside the executor, which then fails the dataflow through its normal
+    /// error path.
     ///
-    /// Defaults to `false` (panics propagate normally).
+    /// Defaults to `false`: the panic unwinds out of the executor's sweep.
+    /// A dataflow running on a [`RuntimeHandle`](crate::RuntimeHandle) still
+    /// fails with [`Error::OperatorPanic`] (naming the operator) and its
+    /// executor is torn down, closing every input and output channel; the
+    /// panic never reaches the caller or the worker pool. Only code that
+    /// drives an executor synchronously sees the panic propagate.
     ///
     /// **Note:** This has no effect if the binary is built with `panic = "abort"`.
     ///
@@ -489,7 +494,7 @@ impl<T: Timestamp> DataflowBuilder<T> {
             let wiring: InputPortWiring =
                 Box::new(move |external_inputs_open, wake_handle, mode| {
                     use crate::dataflow::channel_operators::{
-                        ChannelSourceOperator, InputRecv, InputSender,
+                        ChannelSourceOperator, InputGate, InputRecv, InputSender,
                     };
                     use crate::dataflow::channels::tee::tee_or_single;
 
@@ -499,7 +504,9 @@ impl<T: Timestamp> DataflowBuilder<T> {
                     match mode {
                         ChannelMode::Sync => {
                             let (tx, rx) = std::sync::mpsc::sync_channel::<InputEvent<T, D>>(256);
-                            let sender = InputSender::with_wake_handle(tx, wake_handle);
+                            let gate = Arc::new(InputGate::default());
+                            let sender = InputSender::with_wake_handle(tx, wake_handle)
+                                .with_input_gate(Arc::clone(&gate));
 
                             let ext_counter = Arc::clone(&external_inputs_open);
                             let factory_name = wiring_name.clone();
@@ -546,7 +553,8 @@ impl<T: Timestamp> DataflowBuilder<T> {
                                         output_pusher,
                                         Some(reporter.clone()),
                                         ext_counter.clone(),
-                                    );
+                                    )
+                                    .with_input_gate(Arc::clone(&gate));
                                     Ok(Box::new(op) as Box<dyn SchedulableOperator>)
                                 });
 
@@ -557,7 +565,9 @@ impl<T: Timestamp> DataflowBuilder<T> {
                             use crate::dataflow::channel_operators::AsyncInputSender;
 
                             let (tx, rx) = tokio::sync::mpsc::channel::<InputEvent<T, D>>(256);
-                            let sender = AsyncInputSender::with_wake_handle(tx, wake_handle);
+                            let gate = Arc::new(InputGate::default());
+                            let sender = AsyncInputSender::with_wake_handle(tx, wake_handle)
+                                .with_input_gate(Arc::clone(&gate));
 
                             let ext_counter = Arc::clone(&external_inputs_open);
                             let factory_name = wiring_name.clone();
@@ -604,7 +614,8 @@ impl<T: Timestamp> DataflowBuilder<T> {
                                         output_pusher,
                                         Some(reporter.clone()),
                                         ext_counter.clone(),
-                                    );
+                                    )
+                                    .with_input_gate(Arc::clone(&gate));
                                     Ok(Box::new(op) as Box<dyn SchedulableOperator>)
                                 });
 
@@ -820,12 +831,14 @@ impl<T: Timestamp> DataflowBuilder<T> {
             let wiring: AsyncSourceWiring =
                 Box::new(move |external_inputs_open, wake_handle, cancel| {
                     use crate::dataflow::channel_operators::{
-                        AsyncInputSender, ChannelSourceOperator, InputRecv,
+                        AsyncInputSender, ChannelSourceOperator, InputGate, InputRecv,
                     };
 
                     let producer = producer.clone();
                     let (tx, rx) = tokio::sync::mpsc::channel::<InputEvent<T, D>>(channel_cap);
-                    let sender = AsyncInputSender::with_wake_handle(tx, wake_handle.clone());
+                    let gate = std::sync::Arc::new(InputGate::default());
+                    let sender = AsyncInputSender::with_wake_handle(tx, wake_handle.clone())
+                        .with_input_gate(std::sync::Arc::clone(&gate));
 
                     let ext_counter = std::sync::Arc::clone(&external_inputs_open);
                     let factory_name = wiring_name.clone();
@@ -867,7 +880,8 @@ impl<T: Timestamp> DataflowBuilder<T> {
                                 output_pusher,
                                 Some(reporter.clone()),
                                 ext_counter.clone(),
-                            );
+                            )
+                            .with_input_gate(std::sync::Arc::clone(&gate));
                             Ok(Box::new(op) as Box<dyn SchedulableOperator>)
                         });
 
@@ -3288,7 +3302,10 @@ impl<T: Timestamp, D: Clone + Send + 'static> Pipe<T, D> {
                 match mode {
                     ChannelMode::Sync => {
                         let (tx, rx) = std::sync::mpsc::sync_channel::<OutputEvent<T, D>>(256);
-                        let receiver = OutputReceiver::new(rx);
+                        let receiver = match wake_handle {
+                            Some(wh) => OutputReceiver::with_wake_handle(rx, wh),
+                            None => OutputReceiver::new(rx),
+                        };
 
                         let sink_name_inner = sink_name.clone();
                         let mut tx = Some(tx);

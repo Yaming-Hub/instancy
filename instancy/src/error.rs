@@ -55,7 +55,10 @@ pub enum Error {
 
     /// An operator panicked during activation.
     ///
-    /// Only returned when `catch_panics` is enabled in `ExecutorConfig`.
+    /// With `catch_panics` enabled the panic is caught at the operator
+    /// boundary; otherwise the runtime contains it at the executor boundary
+    /// and tears the dataflow down. Either way a dataflow run by the runtime
+    /// reports the panic through this variant.
     #[error("Operator '{operator}' panicked{}: {message}",
         worker_index.map(|w| format!(" (worker {w})")).unwrap_or_default())]
     OperatorPanic {

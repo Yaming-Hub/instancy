@@ -137,6 +137,37 @@ Fixes:
 `transport_session::{data_channel_id, progress_channel_id, DATA_CHANNEL_BASE,
 RESERVED_CHANNEL_BASE, CHANNEL_NAMESPACE_SIZE}`.
 
+### Executor and runtime lifecycle robustness
+
+- Dropping an output receiver (or never taking it before `join()`) abandons the
+  port: the sink keeps consuming and discards its input. Previously the sink
+  stopped consuming, livelocking upstream operators and blocking input senders
+  (and every peer in multi-worker and cluster runs).
+- `take_input` / `take_output` / `take_async_input` / `take_async_output` no
+  longer consume the port when they fail (for example, a sync take on a port
+  spawned with `IoMode::Async`). Previously the endpoint was dropped, closing
+  the input or abandoning the output, and the corrected call failed.
+- An operator panic (with or without `catch_panics`) now fails the dataflow with
+  `Error::OperatorPanic` naming the operator, and tears the executor down so its
+  input senders fail and output receivers end. Previously the panic poisoned the
+  executor lock and leaked the executor, blocking `collect_data()` and `send()`
+  forever, and the error was reported as `RuntimeError::InvalidConfig`.
+- Dropping a `RuntimeHandle` resolves every pending completion with
+  `Cancelled { reason: RuntimeShutdown }` and releases the dataflows' channels,
+  including dataflows that had not been polled since cancellation.
+- **Behavior change:** graceful drain (`drain_on_cancel`) now closes external
+  inputs as documented: sends after the drain begins fail with `ChannelClosed`,
+  every previously accepted event is still delivered, and the drain no longer
+  waits for callers to drop their senders. Failure-driven cancellation (operator
+  error, failed sibling worker, lost peer) no longer drains, and a sibling
+  failure during a drain ends it immediately.
+- The task that forwards a `SpawnOptions::cancellation_token` now exits when the
+  dataflow finishes instead of living as long as the caller's token.
+- `wait_idle()` / `shutdown_async()` no longer return while a multi-worker or
+  cluster dataflow is only partially registered.
+- Cancellation tokens hold weak wake-handle registrations, so a runtime's root
+  token no longer grows with every dataflow ever spawned.
+
 ## [0.1.3] - 2026-10-15
 
 ### Added

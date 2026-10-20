@@ -92,6 +92,13 @@ pub trait SchedulableOperator: Send {
     /// the dataflow is shutting down.
     fn close_inputs(&mut self);
 
+    /// Stop accepting data from outside the dataflow (graceful drain).
+    ///
+    /// Called once when a drain begins. External input sources stop accepting
+    /// new events but still deliver everything already accepted, then finish
+    /// on their own. Operators without external inputs ignore this (default).
+    fn close_external_input(&mut self) {}
+
     /// Update this operator's input frontier from the progress tracker.
     ///
     /// Called by the executor after progress propagation for operators whose

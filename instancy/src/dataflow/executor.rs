@@ -25,7 +25,7 @@ use std::time::Instant;
 
 use crate::cancellation::CancellationToken;
 use crate::dataflow::channels::wake::WakeHandle;
-use crate::dataflow::control::{ControlReceiver, ControlSender};
+use crate::dataflow::control::{ControlReceiver, ControlSender, WorkerControl};
 use crate::dataflow::graph::DataflowGraph;
 use crate::dataflow::probe::ProbeHandle;
 use crate::dataflow::schedulable::{
@@ -64,8 +64,15 @@ pub struct ExecutorConfig {
     /// Whether to catch panics in operator `activate()` calls.
     ///
     /// When enabled, a panicking operator produces an `Error::OperatorPanic`
-    /// instead of unwinding through the executor task. This is useful when
-    /// operators run user-defined functions (UDFs) that may panic.
+    /// at the operator boundary instead of unwinding through the executor.
+    /// This is useful when operators run user-defined functions (UDFs) that
+    /// may panic.
+    ///
+    /// When disabled, the panic unwinds out of the sweep. [`DataflowExecutor::run`]
+    /// propagates it to the caller unchanged; when the executor is polled as a
+    /// future (as the runtime does), the panic is contained at the poll
+    /// boundary and the future resolves to `Error::OperatorPanic`. Either way
+    /// the executor must not be used again.
     ///
     /// **Caveats:**
     /// - After a caught panic, the operator is in an unknown state. The
@@ -74,7 +81,7 @@ pub struct ExecutorConfig {
     /// - The default panic hook still prints the panic message to stderr.
     /// - Partial outputs produced before the panic are not rolled back.
     ///
-    /// Default: `false` (panics unwind normally).
+    /// Default: `false` (panics unwind out of the sweep).
     pub catch_panics: bool,
     /// Whether to collect per-operator metrics (activation count, CPU time,
     /// records processed). Overhead is ~1 Instant::now() per activation.
@@ -87,7 +94,9 @@ pub struct ExecutorConfig {
     /// When set, cancellation triggers a graceful drain phase instead of
     /// immediate termination. During the drain phase:
     ///
-    /// 1. External inputs are closed (no new data accepted).
+    /// 1. External inputs are closed: later sends fail with
+    ///    `Error::ChannelClosed`, while everything already accepted is still
+    ///    delivered.
     /// 2. In-flight data continues to flow through operators.
     /// 3. The executor keeps running sweeps until all operators complete
     ///    or the timeout expires.
@@ -95,6 +104,10 @@ pub struct ExecutorConfig {
     /// If the drain completes before the timeout, the dataflow returns
     /// `Ok(true)` (normal completion). If the timeout expires, the
     /// dataflow returns `Err(Cancelled)` with the original reason.
+    ///
+    /// Cancellation caused by a failure (an operator error, a failed sibling
+    /// worker, a lost peer) never drains: it stops immediately, and a sibling
+    /// failure reported during a drain ends that drain at once.
     ///
     /// Default: `None` (immediate cancellation).
     pub drain_timeout: Option<std::time::Duration>,
@@ -191,8 +204,9 @@ pub(crate) enum SweepOutcome {
 /// panics into `Error::OperatorPanic`. The operator name is captured BEFORE
 /// the activation call to avoid touching poisoned state after a panic.
 ///
-/// When `catch_panics` is false, calls `activate()` directly (zero overhead).
-fn activate_operator(
+/// When `catch_panics` is false, the panic keeps unwinding, re-raised with an
+/// [`OperatorUnwind`] payload so the executor boundary can name the operator.
+pub(crate) fn activate_operator(
     op: &mut Box<dyn SchedulableOperator>,
     catch_panics: bool,
 ) -> Result<ActivationOutcome> {
@@ -211,7 +225,57 @@ fn activate_operator(
             }
         }
     } else {
-        op.activate()
+        match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| op.activate())) {
+            Ok(result) => result,
+            Err(payload) => {
+                let operator = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    op.name().to_string()
+                }))
+                .unwrap_or_else(|_| UNKNOWN_PANIC_SOURCE.to_string());
+                // resume_unwind does not re-run the panic hook.
+                std::panic::resume_unwind(Box::new(OperatorUnwind { operator, payload }))
+            }
+        }
+    }
+}
+
+/// Placeholder operator name for a panic that did not come from an operator
+/// activation (or whose operator name could not be read).
+const UNKNOWN_PANIC_SOURCE: &str = "<dataflow executor>";
+
+/// Panic payload for an operator panic that unwinds through the executor
+/// (`catch_panics == false`), tagged with the operator's name.
+pub(crate) struct OperatorUnwind {
+    operator: String,
+    payload: Box<dyn std::any::Any + Send>,
+}
+
+/// Convert a panic payload caught at an executor boundary into
+/// [`Error::OperatorPanic`].
+pub(crate) fn operator_panic_error(
+    payload: Box<dyn std::any::Any + Send>,
+    worker_index: Option<usize>,
+) -> Error {
+    match payload.downcast::<OperatorUnwind>() {
+        Ok(unwind) => Error::OperatorPanic {
+            operator: unwind.operator,
+            worker_index,
+            message: extract_panic_message(&unwind.payload),
+        },
+        Err(payload) => Error::OperatorPanic {
+            operator: UNKNOWN_PANIC_SOURCE.to_string(),
+            worker_index,
+            message: extract_panic_message(&payload),
+        },
+    }
+}
+
+/// Strip the [`OperatorUnwind`] tag so synchronous callers see the original
+/// panic payload.
+fn original_panic_payload(payload: Box<dyn std::any::Any + Send>) -> Box<dyn std::any::Any + Send> {
+    match payload.downcast::<OperatorUnwind>() {
+        Ok(unwind) => unwind.payload,
+        Err(payload) => payload,
     }
 }
 
@@ -1193,7 +1257,13 @@ impl<T: Timestamp> DataflowExecutor<T> {
     /// Returns `Err(Error::Cancelled { .. })` if the cancellation token fires.
     /// Returns `Err(...)` if any operator produces an error.
     pub fn run(&mut self) -> Result<bool> {
-        let result = self.run_loop();
+        // With catch_panics disabled an operator panic propagates to the
+        // caller unchanged (minus the executor's internal operator tag).
+        let result =
+            match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| self.run_loop())) {
+                Ok(result) => result,
+                Err(payload) => std::panic::resume_unwind(original_panic_payload(payload)),
+            };
         self.update_wall_time_metric();
         result
     }
@@ -1532,31 +1602,48 @@ impl<T: Timestamp> DataflowExecutor<T> {
         // This is checked BEFORE the cancellation check so that control
         // signals are consumed even when cancellation is already in flight.
         if let Some(ref mut rx) = self.control_receiver {
-            // Signals are drained; currently the executor doesn't act on
-            // individual signals beyond what the CancellationToken provides.
-            // Future extensions (LimitReached handling, etc.) hook here.
-            let _signals = rx.try_recv();
+            let signals = rx.try_recv();
+            if signals
+                .iter()
+                .any(|signal| matches!(signal, WorkerControl::WorkerError { .. }))
+            {
+                // A sibling failed, so this computation can no longer succeed:
+                // a drain (current or future) must stop at once. An expired
+                // deadline makes a later drain entry stop on its first check.
+                self.drain_deadline = Some(Instant::now());
+            }
         }
 
         // Check cancellation — either enter drain mode or return error.
         if self.cancel.is_cancelled() {
-            if self.draining {
-                // Already draining — check if deadline expired.
-                if let Some(deadline) = self.drain_deadline {
-                    if Instant::now() >= deadline {
-                        // Drain timed out — propagate the cancellation error.
-                        self.cancel.check()?;
+            if !self.draining {
+                // Drain is a graceful-stop mechanism: failure-driven
+                // cancellation (a sibling's error, a lost peer) stops at once.
+                let failed = self
+                    .cancel
+                    .reason()
+                    .is_some_and(|reason| reason.is_failure());
+                match self.config.drain_timeout {
+                    Some(timeout) if !failed => {
+                        self.draining = true;
+                        let deadline = Instant::now() + timeout;
+                        self.drain_deadline =
+                            Some(self.drain_deadline.map_or(deadline, |d| d.min(deadline)));
+                        // Stop accepting external input; data already accepted
+                        // keeps flowing. Sources then finish on their own,
+                        // releasing their capabilities.
+                        for op in &mut self.operators {
+                            op.close_external_input();
+                        }
                     }
+                    _ => self.cancel.check()?,
                 }
-            } else if let Some(timeout) = self.config.drain_timeout {
-                // Enter drain mode: set deadline. Instead of zeroing the
-                // external_inputs_open counter (which would race with
-                // ChannelSourceOperator::close_inputs() calling fetch_sub),
-                // we skip the external-inputs-open check when draining.
-                self.draining = true;
-                self.drain_deadline = Some(Instant::now() + timeout);
-            } else {
-                // No drain configured — immediate cancellation.
+            }
+            if self
+                .drain_deadline
+                .is_some_and(|deadline| Instant::now() >= deadline)
+            {
+                // Drain timed out (or was aborted) — propagate the cancellation.
                 self.cancel.check()?;
             }
         }
@@ -1865,10 +1952,37 @@ impl<T: Timestamp> DataflowExecutor<T> {
 impl<T: Timestamp> Future for DataflowExecutor<T> {
     type Output = Result<bool>;
 
+    /// Drives [`poll_run`](DataflowExecutor::poll_run).
+    ///
+    /// An operator panic that unwinds out of a sweep (`catch_panics == false`)
+    /// is contained here: the executor stops, siblings are told via the
+    /// control broadcast, and the future resolves to [`Error::OperatorPanic`].
+    /// The caller must not poll again; dropping the executor releases every
+    /// channel endpoint it owns.
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         // SAFETY: DataflowExecutor is Unpin (no self-referential fields).
         let this = self.get_mut();
-        this.poll_run(cx)
+        match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| this.poll_run(cx))) {
+            Ok(poll) => poll,
+            Err(payload) => {
+                this.wake_handle.clear_waker();
+                let error = operator_panic_error(payload, Some(this.worker_index));
+                if let (Some(ctrl), Error::OperatorPanic { operator, .. }) =
+                    (this.control_sender.as_ref(), &error)
+                {
+                    ctrl.broadcast_error(operator.clone(), error.to_string());
+                }
+                Poll::Ready(Err(error))
+            }
+        }
+    }
+}
+
+impl<T: Timestamp> Drop for DataflowExecutor<T> {
+    fn drop(&mut self) {
+        // Break the WakeHandle → Waker → task reference chain even when the
+        // executor is torn down without completing (panic or runtime abort).
+        self.wake_handle.clear_waker();
     }
 }
 
@@ -4215,6 +4329,42 @@ mod tests {
 
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| executor.run()));
         assert!(result.is_err(), "expected panic to propagate");
+        // Synchronous callers see the operator's own payload, not the internal tag.
+        let payload = result.unwrap_err();
+        assert!(
+            extract_panic_message(&payload).contains("exploded"),
+            "original panic payload must be preserved"
+        );
+    }
+
+    #[test]
+    fn catch_panics_disabled_future_resolves_to_operator_panic() {
+        let config = ExecutorConfig {
+            catch_panics: false,
+            ..Default::default()
+        };
+        let ops: Vec<Box<dyn SchedulableOperator>> = vec![Box::new(PanickingOperator {
+            name: "boom".to_string(),
+            index: 0,
+            stage_id: crate::dataflow::stage::StageId::new(0),
+        })];
+        let mut executor = DataflowExecutor::<u64>::new_test(ops, config, 3);
+        let mut cx = Context::from_waker(std::task::Waker::noop());
+        match Pin::new(&mut executor).poll(&mut cx) {
+            Poll::Ready(Err(Error::OperatorPanic {
+                operator,
+                worker_index,
+                message,
+            })) => {
+                assert_eq!(operator, "boom");
+                assert_eq!(worker_index, Some(3));
+                assert!(
+                    message.contains("exploded"),
+                    "unexpected message: {message}"
+                );
+            }
+            other => panic!("expected OperatorPanic, got {other:?}"),
+        }
     }
 
     #[test]
@@ -4417,5 +4567,88 @@ mod tests {
                 .load(std::sync::atomic::Ordering::SeqCst),
             1
         );
+    }
+
+    #[test]
+    fn failure_cancellation_skips_drain() {
+        use crate::cancellation::CancellationReason;
+        for reason in [
+            CancellationReason::OperatorError {
+                detail: "boom".into(),
+            },
+            CancellationReason::WorkerFailed {
+                detail: "sibling".into(),
+            },
+            CancellationReason::PeerDown {
+                node_id: "b".into(),
+            },
+        ] {
+            let op = CountingOperator {
+                name: "work".into(),
+                index: 0,
+                stage_id: crate::dataflow::stage::StageId(0),
+                remaining: 3,
+            };
+            let config = ExecutorConfig {
+                max_sweeps_per_poll: 0,
+                drain_timeout: Some(std::time::Duration::from_secs(60)),
+                ..Default::default()
+            };
+            let mut executor = DataflowExecutor::new_test(vec![Box::new(op)], config, 0);
+            executor.cancel.cancel_with_reason(reason.clone());
+            match executor.run() {
+                Err(Error::Cancelled { reason: Some(r) }) => assert_eq!(r, reason),
+                other => panic!("{reason:?} must stop without draining, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn sibling_worker_error_aborts_an_active_drain() {
+        let wakes = vec![WakeHandle::new(), WakeHandle::new()];
+        let df_cancel = CancellationToken::new();
+        let (senders, mut receivers) =
+            crate::dataflow::control::ControlBroadcast::new(2, &wakes, df_cancel.clone()).unwrap();
+
+        struct Forever;
+        impl SchedulableOperator for Forever {
+            fn activate(&mut self) -> Result<ActivationOutcome> {
+                Ok(ActivationOutcome::MadeProgress)
+            }
+            fn name(&self) -> &str {
+                "forever"
+            }
+            fn index(&self) -> usize {
+                0
+            }
+            fn stage_id(&self) -> crate::dataflow::stage::StageId {
+                crate::dataflow::stage::StageId(0)
+            }
+            fn close_inputs(&mut self) {}
+            fn is_done(&self) -> bool {
+                false
+            }
+        }
+
+        let config = ExecutorConfig {
+            max_sweeps_per_poll: 0,
+            drain_timeout: Some(std::time::Duration::from_secs(60)),
+            ..Default::default()
+        };
+        let mut executor = DataflowExecutor::new_test(vec![Box::new(Forever)], config, 0);
+        executor.cancel = df_cancel.child_token();
+        executor.set_control_broadcast(senders[0].clone(), receivers.remove(0));
+        // A graceful stop begins the drain ...
+        df_cancel.cancel();
+        assert!(matches!(
+            executor.run_one_sweep(),
+            Ok(SweepOutcome::MadeProgress)
+        ));
+        assert!(executor.draining);
+        // ... and a sibling's failure must end it without waiting for the deadline.
+        senders[1].broadcast_error("op".into(), "failed".into());
+        let started = Instant::now();
+        assert!(matches!(executor.run(), Err(Error::Cancelled { .. })));
+        assert!(started.elapsed() < std::time::Duration::from_secs(10));
     }
 }

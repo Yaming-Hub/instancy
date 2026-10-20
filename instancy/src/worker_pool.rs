@@ -204,6 +204,13 @@ impl WorkerPool {
                 let _ = handle.join();
             }
         }
+
+        // No thread will poll executor tasks again. Complete the ones still
+        // pending so their DataflowCompletions resolve and their executors
+        // (and every channel endpoint they own) are released.
+        if let Some(registry) = self.registry() {
+            registry.abort_all();
+        }
     }
 
     /// Returns the number of currently active (executing) threads.
@@ -426,9 +433,8 @@ fn worker_thread_loop(state: &PoolState) {
                             // Pending: task is IDLE, future wakes handle re-enqueue.
                         }
                         Err(_panic) => {
-                            // Executor panicked. PanicGuard transitions to DONE,
-                            // drops the future (breaking Arc cycles), and takes
-                            // the notifier (whose Drop fires the error path).
+                            // ExecutorTask::poll contains executor panics; this
+                            // only guards against a panic in the task machinery.
                         }
                     }
                     continue;

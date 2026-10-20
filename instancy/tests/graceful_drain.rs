@@ -82,25 +82,61 @@ async fn drain_timeout_returns_cancelled() {
     let rt = RuntimeHandle::new(RuntimeConfig::default()).unwrap();
     let builder = DataflowBuilder::<u64>::new("drain-timeout");
 
-    // Input port that we never close — dataflow can't finish.
     let input = builder.input::<i32>("data").unwrap();
-    input.map("identity", |_t, v| v);
+    input.map("identity", |_t, v| v).output("results").unwrap();
 
     let dataflow = builder.build().unwrap();
 
     // Very short drain timeout.
     let opts = SpawnOptions::new().drain_on_cancel(Duration::from_millis(100));
     let mut handle = rt.spawn(dataflow, opts).unwrap();
-    let _sender = handle.take_input::<i32>("data").unwrap();
+    let sender = handle.take_input::<i32>("data").unwrap();
+    // The consumer never reads, so the accepted backlog can never drain.
+    let _stalled_consumer = handle.take_output::<i32>("results").unwrap();
+    for v in 0..1_000 {
+        sender.send(0, vec![v]).unwrap();
+    }
 
-    // Cancel — drain starts but input never closes, so timeout expires.
+    // Cancel — the drain closes the input, but the backlog outlasts the timeout.
     handle.cancel();
 
     let result = handle.join().await;
     assert!(
-        result.is_err(),
+        matches!(result, Err(instancy::Error::Cancelled { .. })),
         "drain timeout should return Cancelled: {result:?}"
     );
+}
+
+/// The drain closes external inputs: later sends fail, and the drain finishes
+/// even while the caller still holds the sender.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn drain_closes_inputs_still_held_by_the_caller() {
+    let rt = RuntimeHandle::new(RuntimeConfig::default()).unwrap();
+    let builder = DataflowBuilder::<u64>::new("drain-held-input");
+    let input = builder.input::<i32>("data").unwrap();
+    input.map("identity", |_t, v| v).output("results").unwrap();
+
+    let opts = SpawnOptions::new().drain_on_cancel(Duration::from_secs(5));
+    let mut handle = rt.spawn(builder.build().unwrap(), opts).unwrap();
+    let sender = handle.take_input::<i32>("data").unwrap();
+    let receiver = handle.take_output::<i32>("results").unwrap();
+    sender.send(0, vec![1, 2]).unwrap();
+
+    handle.cancel();
+    let result = tokio::time::timeout(Duration::from_secs(10), handle.join())
+        .await
+        .expect("drain must not wait for the caller to close the input");
+    assert!(result.is_ok(), "drain should complete: {result:?}");
+    assert!(
+        sender.send(0, vec![3]).is_err(),
+        "input closed by the drain"
+    );
+    let data: Vec<i32> = receiver
+        .collect_data()
+        .into_iter()
+        .flat_map(|(_, d)| d)
+        .collect();
+    assert_eq!(data, vec![1, 2]);
 }
 
 /// Drain works correctly with multi-worker dataflows (spawn_multi).
