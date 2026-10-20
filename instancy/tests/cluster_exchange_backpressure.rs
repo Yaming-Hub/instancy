@@ -7,8 +7,6 @@
 //!
 //! Workarounds for issues tracked separately keep these tests about network
 //! backpressure:
-//! - The local exchange edge gets a large capacity: a same-worker exchange
-//!   channel holding 1024+ envelopes can starve the downstream stage.
 //! - A `map` precedes each exchange: only some producers account their
 //!   records as in flight (the `map` does, which also exercises the
 //!   exchange's in-flight accounting), and without that accounting completion
@@ -27,8 +25,6 @@ use std::time::Duration;
 use instancy::{DataflowBuilder, Result};
 use support::cluster::{self, ClusterSpec, Mode};
 
-const BIG_EDGE: usize = 1 << 22;
-
 /// `input -> map -> exchange(route) -> map -> output`.
 fn exchange_pipeline(
     route: fn(&u64) -> u64,
@@ -36,7 +32,6 @@ fn exchange_pipeline(
     move |b: &mut DataflowBuilder<u64>| {
         b.input::<u64>("in")?
             .map("pre", |_t, x| x)
-            .with_capacity(BIG_EDGE)?
             .exchange_by_hash("route", route)
             .map("post", |_t, x| x)
             .output("out")?;
@@ -195,7 +190,6 @@ async fn rebalance_under_backpressure_delivers_each_record_once() {
     let build = |b: &mut DataflowBuilder<u64>| -> Result<()> {
         b.input::<u64>("in")?
             .map("pre", |_t, x| x)
-            .with_capacity(BIG_EDGE)?
             .rebalance("spread")
             .map("post", |_t, x| x)
             .output("out")?;
@@ -255,10 +249,8 @@ async fn three_node_chained_exchanges_from_every_worker() {
     let build = |b: &mut DataflowBuilder<u64>| -> Result<()> {
         b.input::<u64>("in")?
             .map("pre", |_t, x| x)
-            .with_capacity(BIG_EDGE)?
             .exchange_by_hash("first", |x: &u64| *x)
             .map("between", |_t, x| x)
-            .with_capacity(BIG_EDGE)?
             .exchange_by_hash("second", |x: &u64| x / 3)
             .map("post", |_t, x| x)
             .output("out")?;
