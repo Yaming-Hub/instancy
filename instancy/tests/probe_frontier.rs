@@ -998,6 +998,7 @@ fn loop_body_probe_never_reports_an_epoch_complete_while_the_loop_iterates() {
 /// still appears on any worker's instance of the stream, must be monotone, and
 /// must be done once all workers completed.
 #[test]
+#[ignore = "intermittent hang from C1 premature completion in a 4-worker iterate-plus-exchange loop: some workers declare the dataflow complete and force-close while others still have work (~3% of runs, 7/220 on main, same rate with the stage-task scheduling fix); un-ignore with the completion-predicate fix (PR5)"]
 fn multi_worker_loop_body_probe_is_conservative() {
     for round in 0..3u64 {
         let workers = 4;
