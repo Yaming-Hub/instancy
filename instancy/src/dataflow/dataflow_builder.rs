@@ -445,6 +445,7 @@ impl<T: Timestamp> DataflowBuilder<T> {
                     op_idx, &name, stage_id, 0, 1,
                 ))
                 .unwrap_or_else(|e| state.builder_errors.push(e));
+            state.graph.set_operator_kind(op_idx, "input");
 
             // Register in subgraph builder with initial capability.
             // The input source holds a capability at T::minimum() until closed.
@@ -657,6 +658,7 @@ impl<T: Timestamp> DataflowBuilder<T> {
                     op_idx, &name, stage_id, 0, 1,
                 ))
                 .unwrap_or_else(|e| state.builder_errors.push(e));
+            state.graph.set_operator_kind(op_idx, "source");
 
             // Register in subgraph builder with initial capability.
             let mut initial_cap = ChangeBatch::new();
@@ -791,6 +793,7 @@ impl<T: Timestamp> DataflowBuilder<T> {
                     op_idx, &name, stage_id, 0, 1,
                 ))
                 .unwrap_or_else(|e| state.builder_errors.push(e));
+            state.graph.set_operator_kind(op_idx, "source_async");
 
             // Register in subgraph builder with initial capability.
             let mut initial_cap = ChangeBatch::new();
@@ -1157,6 +1160,16 @@ impl<T: Timestamp, D: Clone + Send + 'static> Pipe<T, D> {
             .unwrap_or_else(|| self.state.borrow().channel_capacity)
     }
 
+    /// Record which builder method created this pipe's operator. The kind is
+    /// part of the cluster handshake fingerprint.
+    fn with_operator_kind(self, kind: &'static str) -> Self {
+        self.state
+            .borrow_mut()
+            .graph
+            .set_operator_kind(self.op_idx, kind);
+        self
+    }
+
     /// Apply a per-element transformation, producing a new Pipe of type `D2`.
     ///
     /// The closure receives a reference to the timestamp and ownership of each element.
@@ -1175,6 +1188,7 @@ impl<T: Timestamp, D: Clone + Send + 'static> Pipe<T, D> {
         self.add_unary_internal(name, capacity, move |time, batch| {
             batch.into_iter().map(|x| logic(&time, x)).collect()
         })
+        .with_operator_kind("map")
     }
 
     /// Filter elements by a predicate, keeping only those that return `true`.
@@ -1191,6 +1205,7 @@ impl<T: Timestamp, D: Clone + Send + 'static> Pipe<T, D> {
         self.add_unary_internal(name, capacity, move |time, batch| {
             batch.into_iter().filter(|x| predicate(&time, x)).collect()
         })
+        .with_operator_kind("filter")
     }
 
     /// Split a stream into two based on a predicate.
@@ -1277,6 +1292,7 @@ impl<T: Timestamp, D: Clone + Send + 'static> Pipe<T, D> {
             }
             batch
         })
+        .with_operator_kind("inspect")
     }
 
     /// Observe each batch of elements flowing through without modifying the stream.
@@ -1300,6 +1316,7 @@ impl<T: Timestamp, D: Clone + Send + 'static> Pipe<T, D> {
             logic(&time, &batch);
             batch
         })
+        .with_operator_kind("inspect_batch")
     }
 
     /// Consume this stream, calling a closure on each element.
@@ -1329,7 +1346,7 @@ impl<T: Timestamp, D: Clone + Send + 'static> Pipe<T, D> {
     where
         F: FnMut(&T, &D) + Clone + Send + 'static,
     {
-        self.for_each_sink(name, move |time: &T, batch: &[D]| {
+        self.for_each_sink("for_each", name, move |time: &T, batch: &[D]| {
             for item in batch {
                 logic(time, item);
             }
@@ -1353,11 +1370,11 @@ impl<T: Timestamp, D: Clone + Send + 'static> Pipe<T, D> {
     where
         F: FnMut(&T, &[D]) + Clone + Send + 'static,
     {
-        self.for_each_sink(name, logic);
+        self.for_each_sink("for_each_batch", name, logic);
     }
 
     /// Internal: register a terminal sink operator that invokes a batch closure.
-    fn for_each_sink<F>(self, name: impl Into<String>, logic: F)
+    fn for_each_sink<F>(self, kind: &'static str, name: impl Into<String>, logic: F)
     where
         F: FnMut(&T, &[D]) + Clone + Send + 'static,
     {
@@ -1376,6 +1393,7 @@ impl<T: Timestamp, D: Clone + Send + 'static> Pipe<T, D> {
                 op_idx, &name, stage_id, 1, 0,
             ))
             .unwrap_or_else(|e| state.builder_errors.push(e));
+        state.graph.set_operator_kind(op_idx, kind);
 
         // Edge from upstream
         state.graph.add_edge(crate::dataflow::graph::EdgeInfo::new(
@@ -1489,6 +1507,7 @@ impl<T: Timestamp, D: Clone + Send + 'static> Pipe<T, D> {
             }
             Ok(())
         })
+        .with_operator_kind("reduce")
     }
 
     /// Fold all elements at each timestamp into an accumulator.
@@ -1525,6 +1544,7 @@ impl<T: Timestamp, D: Clone + Send + 'static> Pipe<T, D> {
             }
             Ok(())
         })
+        .with_operator_kind("fold")
     }
 
     /// Remove duplicate elements within each timestamp.
@@ -1570,6 +1590,7 @@ impl<T: Timestamp, D: Clone + Send + 'static> Pipe<T, D> {
             }
             Ok(())
         })
+        .with_operator_kind("distinct")
     }
 
     /// Count elements per timestamp.
@@ -1583,6 +1604,7 @@ impl<T: Timestamp, D: Clone + Send + 'static> Pipe<T, D> {
     /// ```
     pub fn count(self, name: impl Into<String>) -> Pipe<T, usize> {
         self.fold(name, 0usize, |acc, _item| acc + 1)
+            .with_operator_kind("count")
     }
 
     /// Delay data by re-assigning timestamps according to a per-item function.
@@ -1632,6 +1654,7 @@ impl<T: Timestamp, D: Clone + Send + 'static> Pipe<T, D> {
             }
             Ok(())
         })
+        .with_operator_kind("delay")
     }
 
     /// Delay data by re-assigning timestamps according to a per-timestamp function.
@@ -1678,6 +1701,7 @@ impl<T: Timestamp, D: Clone + Send + 'static> Pipe<T, D> {
             }
             Ok(())
         })
+        .with_operator_kind("delay_batch")
     }
 
     /// Pass through the first `count` elements, then stop.
@@ -1707,6 +1731,7 @@ impl<T: Timestamp, D: Clone + Send + 'static> Pipe<T, D> {
                 taken
             }
         })
+        .with_operator_kind("take")
     }
 
     /// Pass through elements while a predicate returns `true`, then stop.
@@ -1743,6 +1768,7 @@ impl<T: Timestamp, D: Clone + Send + 'static> Pipe<T, D> {
             }
             result
         })
+        .with_operator_kind("take_while")
     }
 
     /// Apply a flat-map transformation: each element produces zero or more output elements.
@@ -1762,6 +1788,7 @@ impl<T: Timestamp, D: Clone + Send + 'static> Pipe<T, D> {
         self.add_unary_internal(name, capacity, move |time, batch| {
             batch.into_iter().flat_map(|x| logic(&time, x)).collect()
         })
+        .with_operator_kind("flat_map")
     }
 
     /// Fallible flat-map transformation: each element produces zero or more output elements.
@@ -1797,6 +1824,7 @@ impl<T: Timestamp, D: Clone + Send + 'static> Pipe<T, D> {
             }
             Ok(())
         })
+        .with_operator_kind("try_flat_map")
     }
 
     /// Transform each batch as a whole, producing zero or more output items.
@@ -1821,6 +1849,7 @@ impl<T: Timestamp, D: Clone + Send + 'static> Pipe<T, D> {
     {
         let capacity = self.resolve_capacity();
         self.add_unary_internal(name, capacity, move |time, batch| logic(&time, batch))
+            .with_operator_kind("map_batch")
     }
 
     /// Fallibly transform each batch as a whole, producing zero or more output items.
@@ -1852,6 +1881,7 @@ impl<T: Timestamp, D: Clone + Send + 'static> Pipe<T, D> {
             }
             Ok(())
         })
+        .with_operator_kind("try_map_batch")
     }
 
     /// General unary operator with full control over input/output handles.
@@ -2071,6 +2101,7 @@ impl<T: Timestamp, D: Clone + Send + 'static> Pipe<T, D> {
                     op_idx, &name, stage_id, 2, 1,
                 ))
                 .unwrap_or_else(|e| state.builder_errors.push(e));
+            state.graph.set_operator_kind(op_idx, "binary");
 
             // Edge from self → slot 0
             state.graph.add_edge(crate::dataflow::graph::EdgeInfo::new(
@@ -2318,6 +2349,7 @@ impl<T: Timestamp, D: Clone + Send + 'static> Pipe<T, D> {
                     1,
                 ))
                 .unwrap_or_else(|e| state.builder_errors.push(e));
+            state.graph.set_operator_kind(enter_idx, "iterate_enter");
             state.graph.add_edge(crate::dataflow::graph::EdgeInfo::new(
                 Slot::new(self.op_idx, self.output_slot),
                 Slot::new(enter_idx, 0),
@@ -2421,6 +2453,9 @@ impl<T: Timestamp, D: Clone + Send + 'static> Pipe<T, D> {
                     1,
                 ))
                 .unwrap_or_else(|e| state.builder_errors.push(e));
+            state
+                .graph
+                .set_operator_kind(feedback_idx, "iterate_feedback");
             // Subgraph registration for feedback
             if let Err(e) = state.subgraph_builder.add_operator(
                 feedback_idx,
@@ -2501,6 +2536,7 @@ impl<T: Timestamp, D: Clone + Send + 'static> Pipe<T, D> {
                     1,
                 ))
                 .unwrap_or_else(|e| state.builder_errors.push(e));
+            state.graph.set_operator_kind(concat_idx, "iterate_concat");
             // Edge: enter → concat input 0
             state.graph.add_edge(crate::dataflow::graph::EdgeInfo::new(
                 Slot::new(enter_idx, 0),
@@ -2646,6 +2682,7 @@ impl<T: Timestamp, D: Clone + Send + 'static> Pipe<T, D> {
                     1,
                 ))
                 .unwrap_or_else(|e| state.builder_errors.push(e));
+            state.graph.set_operator_kind(leave_idx, "iterate_leave");
             // Subgraph registration for leave
             if let Err(e) = state.subgraph_builder.add_operator(
                 leave_idx,
@@ -2747,6 +2784,9 @@ impl<T: Timestamp, D: Clone + Send + 'static> Pipe<T, D> {
                     .graph
                     .register_operator(op.clone())
                     .unwrap_or_else(|e| state.builder_errors.push(e));
+                if let Some(kind) = inner.graph.operator_kind(op.index) {
+                    state.graph.set_operator_kind(op.index, kind);
+                }
             }
             // Merge inner edges with offset: inner edge 0 becomes parent edge N
             let inner_edge_offset = state.graph.edges().len();
@@ -3017,6 +3057,7 @@ impl<T: Timestamp, D: Clone + Send + 'static> Pipe<T, D> {
                     op_idx, "concat", stage_id, num_inputs, 1,
                 ))
                 .unwrap_or_else(|e| state.builder_errors.push(e));
+            state.graph.set_operator_kind(op_idx, "concat");
 
             // Edges and channel factories for each input
             let mut edge_indices = Vec::with_capacity(num_inputs);
@@ -3167,6 +3208,7 @@ impl<T: Timestamp, D: Clone + Send + 'static> Pipe<T, D> {
                     op_idx, &name, stage_id, 1, 0,
                 ))
                 .unwrap_or_else(|e| state.builder_errors.push(e));
+            state.graph.set_operator_kind(op_idx, "output");
 
             // Edge from upstream
             state.graph.add_edge(crate::dataflow::graph::EdgeInfo::new(
@@ -3381,16 +3423,27 @@ impl<T: Timestamp, D: Clone + Send + 'static> Pipe<T, D> {
     /// }
     /// ```
     pub fn collect(self) -> Arc<Mutex<Vec<(T, Vec<D>)>>> {
+        // Skip auto-generated names a user output already took.
         let name = {
             let mut state = self.state.borrow_mut();
-            let idx = state.next_collect_index;
-            state.next_collect_index += 1;
-            format!("__collect_{idx}")
+            loop {
+                let idx = state.next_collect_index;
+                state.next_collect_index += 1;
+                let name = format!("__collect_{idx}");
+                if !state.output_ports.iter().any(|p| p.name == name) {
+                    break name;
+                }
+            }
         };
-        // SAFETY: collect output port was just created by add_output_port above
-        self.output(name)
-            .expect("internal collect output should be valid")
-            .collector
+        let state = Rc::clone(&self.state);
+        match self.output(name) {
+            Ok(port) => port.collector,
+            Err(e) => {
+                // Surface the failure from `build()` instead of panicking here.
+                state.borrow_mut().builder_errors.push(e);
+                Arc::new(Mutex::new(Vec::new()))
+            }
+        }
     }
 }
 
@@ -3435,6 +3488,7 @@ where
             Ok(v) => Ok(f(t, v)),
             Err(e) => Err(e),
         })
+        .with_operator_kind("map_ok")
     }
 
     /// Filter `Ok` values by a predicate, passing `Err` values through unchanged.
@@ -3461,6 +3515,7 @@ where
             Ok(v) => predicate(t, v),
             Err(_) => true,
         })
+        .with_operator_kind("filter_ok")
     }
 
     /// Apply a fallible transformation to `Ok` values.
@@ -3488,6 +3543,7 @@ where
             Ok(v) => f(t, v),
             Err(e) => Err(e),
         })
+        .with_operator_kind("and_then")
     }
 
     /// Split a `Result` stream into separate `Ok` and `Err` streams.
@@ -3582,7 +3638,7 @@ impl<
             .borrow_mut()
             .graph
             .set_exchange_parallelism(exchange_op_idx, target_parallelism);
-        Ok(pipe)
+        Ok(pipe.with_operator_kind("exchange_to"))
     }
 
     /// Repartition data using a direct hash function (returns u64).
@@ -3603,6 +3659,7 @@ impl<
         let capacity = self.resolve_capacity();
         let exchange_fn = crate::dataflow::channels::pact::ExchangeFn::new(name, hash_fn);
         self.add_exchange_internal_networked(exchange_fn, capacity)
+            .with_operator_kind("exchange_by_hash")
     }
 
     /// Repartition with direct hash and explicit downstream parallelism.
@@ -3634,7 +3691,7 @@ impl<
             .borrow_mut()
             .graph
             .set_exchange_parallelism(exchange_op_idx, target_parallelism);
-        Ok(pipe)
+        Ok(pipe.with_operator_kind("exchange_by_hash_to"))
     }
 
     /// Internal: add an exchange operator with network-capable factory creator.
@@ -3681,6 +3738,7 @@ impl<
     /// ```
     pub fn gather(self, name: impl Into<String>) -> Pipe<T, D> {
         self.exchange_by_hash(name, |_| 0u64)
+            .with_operator_kind("gather")
     }
 
     /// Distribute data round-robin across workers for load balancing.
@@ -3702,6 +3760,7 @@ impl<
         self.exchange_by_hash(name, move |_| {
             counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
         })
+        .with_operator_kind("rebalance")
     }
 
     /// Distribute data round-robin with explicit downstream parallelism.
@@ -3733,6 +3792,7 @@ impl<
         self.exchange_by_hash_to(name, target_parallelism, move |_| {
             counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
         })
+        .map(|pipe| pipe.with_operator_kind("rebalance_to"))
     }
 
     /// Broadcast all data to every worker (fan-out).
@@ -3761,7 +3821,8 @@ impl<
         name: impl Into<String>,
         capacity: usize,
     ) -> Pipe<T, D> {
-        let pipe = self.add_broadcast_internal(name, capacity);
+        let name = name.into();
+        let pipe = self.add_broadcast_internal(name.clone(), capacity);
 
         // Store network broadcast creator alongside the local one.
         {
@@ -3771,6 +3832,7 @@ impl<
                 dyn crate::dataflow::channels::exchange_channel::NetworkExchangeCreator,
             > = Box::new(
                 crate::dataflow::channels::exchange_channel::NetworkBroadcastCreatorImpl::<T, D> {
+                    name,
                     _phantom: std::marker::PhantomData,
                 },
             );
@@ -3841,7 +3903,7 @@ impl<T: Timestamp, D: Clone + Send + 'static> Pipe<T, D> {
             .borrow_mut()
             .graph
             .set_exchange_parallelism(exchange_op_idx, target_parallelism);
-        Ok(pipe)
+        Ok(pipe.with_operator_kind("exchange_to"))
     }
 
     /// Repartition data using a direct hash function (returns u64).
@@ -3862,6 +3924,7 @@ impl<T: Timestamp, D: Clone + Send + 'static> Pipe<T, D> {
         let capacity = self.resolve_capacity();
         let exchange_fn = crate::dataflow::channels::pact::ExchangeFn::new(name, hash_fn);
         self.add_exchange_internal(exchange_fn, capacity)
+            .with_operator_kind("exchange_by_hash")
     }
 
     /// Repartition with direct hash and explicit downstream parallelism.
@@ -3893,7 +3956,7 @@ impl<T: Timestamp, D: Clone + Send + 'static> Pipe<T, D> {
             .borrow_mut()
             .graph
             .set_exchange_parallelism(exchange_op_idx, target_parallelism);
-        Ok(pipe)
+        Ok(pipe.with_operator_kind("exchange_by_hash_to"))
     }
 
     /// Route all data to worker 0 (global aggregation pattern).
@@ -3912,6 +3975,7 @@ impl<T: Timestamp, D: Clone + Send + 'static> Pipe<T, D> {
     /// ```
     pub fn gather(self, name: impl Into<String>) -> Pipe<T, D> {
         self.exchange_by_hash(name, |_| 0u64)
+            .with_operator_kind("gather")
     }
 
     /// Distribute data round-robin across workers for load balancing.
@@ -3933,6 +3997,7 @@ impl<T: Timestamp, D: Clone + Send + 'static> Pipe<T, D> {
         self.exchange_by_hash(name, move |_| {
             counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
         })
+        .with_operator_kind("rebalance")
     }
 
     /// Distribute data round-robin with explicit downstream parallelism.
@@ -3964,6 +4029,7 @@ impl<T: Timestamp, D: Clone + Send + 'static> Pipe<T, D> {
         self.exchange_by_hash_to(name, target_parallelism, move |_| {
             counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
         })
+        .map(|pipe| pipe.with_operator_kind("rebalance_to"))
     }
 
     /// Broadcast all data to every worker (fan-out).
@@ -4027,6 +4093,7 @@ impl<T: Timestamp, D: Clone + Send + 'static> Pipe<T, D> {
                     op_idx, "exchange", stage_id, 1, 1,
                 ))
                 .unwrap_or_else(|e| state.builder_errors.push(e));
+            state.graph.set_operator_kind(op_idx, "exchange");
 
             // Edge from upstream — marked as Exchange.
             state
@@ -4194,6 +4261,7 @@ impl<T: Timestamp, D: Clone + Send + 'static> Pipe<T, D> {
                     1,
                 ))
                 .unwrap_or_else(|e| state.builder_errors.push(e));
+            state.graph.set_operator_kind(op_idx, "broadcast");
 
             // Edge from upstream — marked as Exchange (broadcast uses same infrastructure).
             state
@@ -4383,6 +4451,7 @@ impl<T: Timestamp, D: Clone + Send + 'static> Pipe<T, D> {
                     op_idx, &name, stage_id, 1, 1,
                 ))
                 .unwrap_or_else(|e| state.builder_errors.push(e));
+            state.graph.set_operator_kind(op_idx, "unary_fn");
 
             // Edge from upstream
             state.graph.add_edge(crate::dataflow::graph::EdgeInfo::new(
@@ -4522,6 +4591,7 @@ impl<T: Timestamp, D: Clone + Send + 'static> Pipe<T, D> {
                     op_idx, &name, stage_id, 1, 1,
                 ))
                 .unwrap_or_else(|e| state.builder_errors.push(e));
+            state.graph.set_operator_kind(op_idx, "unary");
 
             // Edge from upstream
             state.graph.add_edge(crate::dataflow::graph::EdgeInfo::new(
@@ -4667,6 +4737,7 @@ impl<T: Timestamp, D: Clone + Send + 'static> Pipe<T, D> {
                     op_idx, &name, stage_id, 1, 1,
                 ))
                 .unwrap_or_else(|e| state.builder_errors.push(e));
+            state.graph.set_operator_kind(op_idx, "unary_notify");
 
             // Edge from upstream
             state.graph.add_edge(crate::dataflow::graph::EdgeInfo::new(
@@ -4843,6 +4914,7 @@ impl<T: Timestamp, D: Clone + Send + 'static> Pipe<T, D> {
                     op_idx, &name, stage_id, 1, 1,
                 ))
                 .unwrap_or_else(|e| state.builder_errors.push(e));
+            state.graph.set_operator_kind(op_idx, "unary_async");
 
             // Edge from upstream
             state.graph.add_edge(crate::dataflow::graph::EdgeInfo::new(
@@ -4986,6 +5058,7 @@ impl<T: Timestamp, D: Clone + Send + 'static> Pipe<T, D> {
                     op_idx, &name, stage_id, 1, 2,
                 ))
                 .unwrap_or_else(|e| state.builder_errors.push(e));
+            state.graph.set_operator_kind(op_idx, "branch");
 
             // Edge from upstream → input port 0
             state.graph.add_edge(crate::dataflow::graph::EdgeInfo::new(
@@ -5142,6 +5215,7 @@ impl<T: Timestamp, D: Clone + Send + 'static> Pipe<T, D> {
                     op_idx, &name, stage_id, 1, 2,
                 ))
                 .unwrap_or_else(|e| state.builder_errors.push(e));
+            state.graph.set_operator_kind(op_idx, "fork");
 
             // Edge from upstream → input port 0
             state.graph.add_edge(crate::dataflow::graph::EdgeInfo::new(
@@ -5298,6 +5372,7 @@ impl<T: Timestamp, V: Clone + Send + 'static, E: Clone + Send + 'static>
                     op_idx, &name, stage_id, 1, 2,
                 ))
                 .unwrap_or_else(|e| state.builder_errors.push(e));
+            state.graph.set_operator_kind(op_idx, "branch_result");
 
             // Edge from upstream → input port 0
             state.graph.add_edge(crate::dataflow::graph::EdgeInfo::new(

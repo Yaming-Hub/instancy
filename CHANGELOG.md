@@ -37,6 +37,85 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Add external-input throughput benchmarks for sync/async batch submission with
   and without per-batch frontier advancement.
 
+### Cluster protocol and topology hardening
+
+**BREAKING (wire format):** this release speaks cluster protocol version 2
+(`instancy::communication::CLUSTER_PROTOCOL_VERSION`). Nodes running 0.1.x
+cannot join a cluster with nodes running this release; without frame CRC the
+handshake rejects them with `HandshakeError::ProtocolVersionMismatch` (an
+unversioned 0.1.x handshake is reported as version 1). With
+`enable_frame_crc` the frame layouts already differ, so the mismatch surfaces
+as checksum failures or a handshake timeout. Upgrade all nodes of a cluster
+together. Wire-level changes:
+
+- The handshake carries a protocol version (first field after the message
+  type) and the sender's node id:
+  `[0][version: u32][fingerprint: u64][dataflow_id: 16][node_id_len: u32][node_id]`.
+- The graph fingerprint is a stable hash of the timestamp type, the topology
+  (node ids, order and per-node worker counts), every operator's kind, name and
+  ports, every edge's endpoints and channel kind, every exchange's kind, name,
+  timestamp type (including loop timestamps inside `iterate`) and record type,
+  and the input/output ports. Previously it covered only
+  operator/edge/feedback counts, exchange edge indices and the total worker
+  count, and used `DefaultHasher`, which is not stable across Rust releases or
+  32/64-bit targets.
+- Channel ids live in disjoint `2^62`-id namespaces: progress ids are
+  `PROGRESS_CHANNEL_BASE (2^62) + src * N + dst`, exchange data ids are
+  `DATA_CHANNEL_BASE (2^63) + (edge * N + src) * N + dst`, and
+  `interprocess::PROGRESS_CHANNEL_ID` moved from 0 to `3 * 2^62`. Previously
+  data ids (`edge * N² + src * N + dst + 1`) collided with progress ids
+  (`1_000_000 + ...`), e.g. for 2 × 64 workers with ≥ 15 exchange edges.
+- With `enable_frame_crc`, frames carry a CRC32 of the header right after the
+  header and a CRC32 of header + payload after the payload. Previously the CRC
+  covered only the payload, so a corrupted `channel_id`/`dataflow_id` misrouted
+  a frame and a corrupted `length` desynchronised the stream.
+- **Key routing changed:** `Pipe::exchange` / `exchange_to` and
+  `ExchangeFn::by_key` hash keys with the new `instancy::hash::StableHasher`
+  instead of `DefaultHasher`, so a key may go to a different worker than in
+  0.1.x. For integers, strings, and tuples/structs of them the mapping is now
+  identical on every node, platform and Rust release (`usize`/`isize` values
+  are hashed as 64-bit). Slices, arrays and `Vec`s of multi-byte integers are
+  still hashed by `std` as native-endian bytes; see the `instancy::hash` docs.
+  Hashing is also faster: about 6× for `u64` keys and 2× for 16-byte strings
+  (`benches/exchange_hash.rs`).
+
+Fixes:
+
+- Reject nodes whose graphs or topologies differ during the handshake instead
+  of passing it and then hanging, cross-wiring branch outputs (branches
+  declared in a different order), or reading `u64` records as `i64`.
+- Verify peer identity: a connection whose remote end identifies as a different
+  node than it was assigned to (handshake and `Ready`) fails with
+  `HandshakeError::PeerIdentityMismatch` instead of hanging every node.
+- Reject duplicate node ids: `ClusterTopology::multi_node` returns
+  `TopologyError::NodeAlreadyExists`, and `spawn_cluster` validates the
+  (public) `nodes` list with the new `ClusterTopology::validate`. A duplicate
+  used to create a phantom worker whose records were lost while the run
+  returned `Ok`.
+- A membership `NodeJoined` event for a known node with a different worker
+  count now updates the live topology instead of being ignored.
+- Reject duplicate channel registrations instead of silently replacing a
+  receiver: `Demuxer::register_channel`, `TransportSession::new`, and
+  `SharedPeerManager::register_dataflow` (which also rejects re-registering a
+  live dataflow id) now return `TransportError::InvalidRegistration`.
+- Channel-id arithmetic is overflow-checked; `spawn_cluster` fails fast with an
+  error when a cluster's ids do not fit their namespace.
+- In the shared transport, a payload frame sent on the control or probe channel
+  is rejected with `TransportError::ReservedChannel` instead of consuming a
+  sequence number the receiver never sees, which stalled the dataflow's lane.
+- Return errors instead of panicking for a zero-worker node, a transport
+  capacity of 0 (dedicated and shared), and a `Pipe::collect` whose automatic
+  output name is already taken (it now picks the next free name).
+
+**BREAKING (API):** `TransportSession::new`, `SharedTransportSession::new`,
+`SharedPeerManager::register_dataflow`, `Demuxer::register_channel`,
+`NetworkEdgeMaterializer::new`/`with_connections`/`channel_id` now return
+`Result`. `TransportError`, `HandshakeError`, `ControlProtocolError` and
+`CommunicationError` gain variants. New: `instancy::hash`,
+`ClusterTopology::validate`, `DataflowGraph::operator_kind`,
+`transport_session::{data_channel_id, progress_channel_id, DATA_CHANNEL_BASE,
+RESERVED_CHANNEL_BASE, CHANNEL_NAMESPACE_SIZE}`.
+
 ## [0.1.3] - 2026-10-15
 
 ### Added

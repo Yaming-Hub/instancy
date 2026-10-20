@@ -508,9 +508,9 @@ impl<T: Timestamp + ExchangeData, D: ExchangeData> Pull<T, D, ()> for NetworkPul
 ///
 /// # Channel ID scheme
 ///
-/// Each `(source_worker, target_worker)` pair gets a deterministic channel ID:
-/// `channel_id = source_worker * num_workers + target_worker + 1` (offset by 1
-/// because channel 0 is reserved for control messages).
+/// Each `(edge, source_worker, target_worker)` triple gets a deterministic
+/// channel ID in the data namespace, see [`channel_id`](Self::channel_id) and
+/// [`data_channel_id`](crate::communication::transport_session::data_channel_id).
 ///
 /// # Example
 ///
@@ -520,13 +520,13 @@ impl<T: Timestamp + ExchangeData, D: ExchangeData> Pull<T, D, ()> for NetworkPul
 /// // Create transport session first
 /// let (session, receivers) = TransportSession::new(
 ///     dataflow_id, connections, &data_regs, &[], capacity, &rt,
-/// );
+/// )?;
 /// let session = Arc::new(session);
 ///
 /// // Then create materializer using the session
 /// let mat = NetworkEdgeMaterializer::<u64, String>::new(
 ///     dataflow_id, topology, "node-a", session, receivers, capacity,
-/// );
+/// )?;
 /// ```
 #[cfg(feature = "transport")]
 pub struct NetworkEdgeMaterializer<T: Timestamp + ExchangeData, D: ExchangeData> {
@@ -576,6 +576,11 @@ impl<T: Timestamp + ExchangeData, D: ExchangeData> NetworkEdgeMaterializer<T, D>
     /// - `receivers`: Channel receivers keyed by `peer_node_id → channel_id`.
     ///   Only data channel receivers are consumed here.
     /// - `capacity`: Buffer capacity for local bounded channels.
+    ///
+    /// # Errors
+    ///
+    /// Fails if the edge's channel ids do not fit in the data channel-id
+    /// namespace (see [`channel_id`](Self::channel_id)).
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         dataflow_id: DataflowId,
@@ -590,9 +595,13 @@ impl<T: Timestamp + ExchangeData, D: ExchangeData> NetworkEdgeMaterializer<T, D>
         edge_index: usize,
         wake_handles: Vec<WakeHandle>,
         runtime_handle: tokio::runtime::Handle,
-    ) -> Self {
+    ) -> Result<Self> {
         let local_node_id = local_node_id.into();
         let num_workers = topology.total_workers();
+        if num_workers > 0 {
+            // The largest id of this edge; every other id is smaller.
+            Self::channel_id(edge_index, num_workers - 1, num_workers - 1, num_workers)?;
+        }
 
         // --- Set up local channels for same-node pairs ---
         let mut local_push: Vec<Vec<Option<BoundedPush<T, D, ()>>>> = (0..num_workers)
@@ -623,7 +632,7 @@ impl<T: Timestamp + ExchangeData, D: ExchangeData> NetworkEdgeMaterializer<T, D>
                 if src_node != Some(local_node_id.as_str()) {
                     let peer_id = src_node.unwrap_or("");
                     for dst in local_start..local_end {
-                        let channel_id = Self::channel_id(edge_index, src, dst, num_workers);
+                        let channel_id = Self::channel_id(edge_index, src, dst, num_workers)?;
                         if let Some(peer_map) = receivers.get_mut(peer_id) {
                             if let Some(rx) = peer_map.remove(&channel_id) {
                                 demux_receivers.insert((src, dst), rx);
@@ -634,7 +643,7 @@ impl<T: Timestamp + ExchangeData, D: ExchangeData> NetworkEdgeMaterializer<T, D>
             }
         }
 
-        Self {
+        Ok(Self {
             num_workers,
             local_node_id,
             topology,
@@ -648,13 +657,18 @@ impl<T: Timestamp + ExchangeData, D: ExchangeData> NetworkEdgeMaterializer<T, D>
             taken_pull: vec![false; num_workers],
             wake_handles,
             runtime_handle,
-        }
+        })
     }
 
     /// Convenience constructor that creates a [`TransportSession`] internally.
     ///
     /// Use this when you don't need to share the session with progress channels
     /// or control protocols (e.g., single-dataflow setups or testing).
+    ///
+    /// # Errors
+    ///
+    /// Fails if the transport session rejects its registrations (see
+    /// [`TransportSession::new`]) or the channel ids overflow.
     pub fn with_connections<R, W>(
         dataflow_id: DataflowId,
         topology: ClusterTopology,
@@ -662,7 +676,7 @@ impl<T: Timestamp + ExchangeData, D: ExchangeData> NetworkEdgeMaterializer<T, D>
         connections: Vec<PeerConnection<R, W>>,
         capacity: usize,
         runtime_handle: &tokio::runtime::Handle,
-    ) -> Self
+    ) -> Result<Self>
     where
         R: AsyncRead + Unpin + Send + 'static,
         W: AsyncWrite + Unpin + Send + 'static,
@@ -681,7 +695,7 @@ impl<T: Timestamp + ExchangeData, D: ExchangeData> NetworkEdgeMaterializer<T, D>
                 if let Some((peer_start, peer_end)) = topology.worker_range(peer_id) {
                     for src in peer_start..peer_end {
                         for dst in local_start..local_end {
-                            let channel_id = Self::channel_id(0, src, dst, num_workers);
+                            let channel_id = Self::channel_id(0, src, dst, num_workers)?;
                             data_regs.push(ChannelRegistration {
                                 peer_node_id: peer_id.clone(),
                                 channel_id,
@@ -699,7 +713,8 @@ impl<T: Timestamp + ExchangeData, D: ExchangeData> NetworkEdgeMaterializer<T, D>
             &[],
             capacity,
             runtime_handle,
-        );
+        )
+        .map_err(crate::error::CommunicationError::from)?;
 
         let transport = Arc::new(
             crate::communication::cluster_transport::ClusterTransport::Dedicated(Arc::new(session)),
@@ -718,16 +733,32 @@ impl<T: Timestamp + ExchangeData, D: ExchangeData> NetworkEdgeMaterializer<T, D>
         )
     }
 
-    /// Deterministic channel ID for a (source, target) worker pair on a given exchange edge.
+    /// Deterministic channel ID for a (source, target) worker pair on a given
+    /// exchange edge (`edge_index` is the edge's position among the dataflow's
+    /// exchange edges).
     ///
-    /// Channel 0 is reserved for control messages, so data IDs start at 1.
-    /// Each exchange edge gets its own channel ID space to prevent collisions
-    /// when multiple exchange edges exist in the same dataflow.
+    /// Equivalent to
+    /// [`data_channel_id`](crate::communication::transport_session::data_channel_id):
+    /// `DATA_CHANNEL_BASE + (edge_index * num_workers + source) * num_workers + target`.
+    /// Data ids live in their own namespace, so they can never collide with the
+    /// control, progress, or probe channels.
     ///
-    /// Formula: `edge_index * num_workers² + source * num_workers + target + 1`
-    pub fn channel_id(edge_index: usize, source: usize, target: usize, num_workers: usize) -> u64 {
-        let edge_offset = edge_index * num_workers * num_workers;
-        (edge_offset + source * num_workers + target + 1) as u64
+    /// # Errors
+    ///
+    /// Fails if `source` or `target` is not below `num_workers` or the id does
+    /// not fit in the data namespace.
+    pub fn channel_id(
+        edge_index: usize,
+        source: usize,
+        target: usize,
+        num_workers: usize,
+    ) -> Result<u64> {
+        crate::communication::transport_session::data_channel_id(
+            edge_index,
+            source,
+            target,
+            num_workers,
+        )
     }
 }
 
@@ -794,7 +825,7 @@ impl<T: Timestamp + ExchangeData, D: ExchangeData> EdgeMaterializer<T, D>
                     )))
                 })?;
 
-                let channel_id = Self::channel_id(self.edge_index, src_idx, dst, self.num_workers);
+                let channel_id = Self::channel_id(self.edge_index, src_idx, dst, self.num_workers)?;
                 pushers.push(Box::new(NetworkPush::<T, D> {
                     time_codec: T::codec(),
                     data_codec: D::codec(),
@@ -998,7 +1029,8 @@ mod tests {
                 }],
                 capacity,
                 rt,
-            );
+            )
+            .unwrap();
 
             let mat_b = NetworkEdgeMaterializer::<u64, u64>::with_connections(
                 dataflow_id,
@@ -1011,7 +1043,8 @@ mod tests {
                 }],
                 capacity,
                 rt,
-            );
+            )
+            .unwrap();
 
             (mat_a, mat_b)
         }
@@ -1196,7 +1229,8 @@ mod tests {
                 }],
                 16,
                 &rt,
-            );
+            )
+            .unwrap();
             let mut mat_b = NetworkEdgeMaterializer::<u64, String>::with_connections(
                 df_id,
                 topo,
@@ -1208,7 +1242,8 @@ mod tests {
                 }],
                 16,
                 &rt,
-            );
+            )
+            .unwrap();
 
             let (mut push0, _) = mat_a.materialize_worker(0).unwrap();
             let (_, mut pull1) = mat_b.materialize_worker(1).unwrap();

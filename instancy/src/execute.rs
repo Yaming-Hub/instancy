@@ -179,25 +179,65 @@ impl ClusterTopology {
 
     /// Create a multi-node topology from a list of node configs.
     /// Nodes are sorted by `node_id` to ensure consistent worker range assignment.
+    ///
+    /// # Errors
+    ///
+    /// Fails if the list is empty, a node has zero workers, or two nodes share
+    /// a `node_id` (see [`validate`](Self::validate)).
     pub fn multi_node(mut configs: Vec<NodeConfig>) -> Result<Self, Error> {
-        if configs.is_empty() {
+        configs.sort_by(|a, b| a.node_id.cmp(&b.node_id));
+        let topology = Self {
+            nodes: configs,
+            membership: None,
+        };
+        topology.validate()?;
+        Ok(topology)
+    }
+
+    /// Check that the topology describes a usable cluster.
+    ///
+    /// A valid topology has at least one node, every node hosts at least one
+    /// worker, node ids are unique, and the total worker count fits in a
+    /// `usize`. [`nodes`](Self::nodes) is public, so a topology built or
+    /// edited by hand can violate these rules even though
+    /// [`multi_node`](Self::multi_node) enforces them;
+    /// [`RuntimeHandle::spawn_cluster`](crate::RuntimeHandle::spawn_cluster)
+    /// calls this before using the topology.
+    ///
+    /// # Errors
+    ///
+    /// - [`TopologyError::EmptyTopology`] if there are no nodes.
+    /// - [`TopologyError::InvalidNodeConfig`] if a node has zero workers or
+    ///   the total worker count overflows.
+    /// - [`TopologyError::NodeAlreadyExists`] if a node id appears twice.
+    pub fn validate(&self) -> Result<(), Error> {
+        if self.nodes.is_empty() {
             return Err(Error::Topology(TopologyError::EmptyTopology {
                 reason: "cluster must have at least one node".into(),
             }));
         }
-        for config in &configs {
+        let mut seen = std::collections::HashSet::with_capacity(self.nodes.len());
+        let mut total: usize = 0;
+        for config in &self.nodes {
             if config.logical_workers == 0 {
                 return Err(Error::Topology(TopologyError::InvalidNodeConfig {
                     node_id: config.node_id.clone(),
                     reason: "must have at least 1 worker".into(),
                 }));
             }
+            if !seen.insert(config.node_id.as_str()) {
+                return Err(Error::Topology(TopologyError::NodeAlreadyExists {
+                    node_id: config.node_id.clone(),
+                }));
+            }
+            total = total.checked_add(config.logical_workers).ok_or_else(|| {
+                Error::Topology(TopologyError::InvalidNodeConfig {
+                    node_id: config.node_id.clone(),
+                    reason: "total worker count overflows usize".into(),
+                })
+            })?;
         }
-        configs.sort_by(|a, b| a.node_id.cmp(&b.node_id));
-        Ok(Self {
-            nodes: configs,
-            membership: None,
-        })
+        Ok(())
     }
 
     /// Total number of logical workers across all physical nodes.
@@ -603,6 +643,37 @@ mod tests {
         assert!(ClusterTopology::multi_node(vec![]).is_err());
         // Zero workers
         assert!(ClusterTopology::multi_node(vec![NodeConfig::new("node-0", 0)]).is_err());
+        // Duplicate node ids
+        assert!(matches!(
+            ClusterTopology::multi_node(vec![
+                NodeConfig::new("node-0", 1),
+                NodeConfig::new("node-0", 2),
+            ]),
+            Err(Error::Topology(TopologyError::NodeAlreadyExists { .. }))
+        ));
+    }
+
+    #[test]
+    fn cluster_topology_validate_catches_edits_to_public_nodes() {
+        let mut topo = ClusterTopology::single_node(0);
+        assert!(topo.validate().is_err(), "0-worker single node");
+        topo.nodes[0].logical_workers = 2;
+        assert!(topo.validate().is_ok());
+
+        topo.nodes.push(NodeConfig::new("local", 1));
+        assert!(matches!(
+            topo.validate(),
+            Err(Error::Topology(TopologyError::NodeAlreadyExists { .. }))
+        ));
+
+        topo.nodes.clear();
+        assert!(matches!(
+            topo.validate(),
+            Err(Error::Topology(TopologyError::EmptyTopology { .. }))
+        ));
+
+        topo.nodes = vec![NodeConfig::new("a", usize::MAX), NodeConfig::new("b", 1)];
+        assert!(topo.validate().is_err(), "total worker overflow");
     }
 
     #[test]

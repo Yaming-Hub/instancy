@@ -40,13 +40,11 @@ use crate::communication::codec::{Codec, CodecError, ExchangeData};
 #[cfg(feature = "transport")]
 use crate::communication::transport::Frame;
 #[cfg(feature = "transport")]
-use crate::communication::transport_session::PROGRESS_CHANNEL_BASE;
-#[cfg(feature = "transport")]
 use crate::dataflow::channels::wake::WakeHandle;
 #[cfg(feature = "transport")]
 use crate::dataflow::id::DataflowId;
 #[cfg(feature = "transport")]
-use crate::error::{DataflowError, LockResultExt};
+use crate::error::LockResultExt;
 #[cfg(feature = "transport")]
 use crate::progress::progress_channel::{
     ProgressChange, ProgressKind, ProgressReceiver, ProgressSender, SharedBuffer,
@@ -381,31 +379,17 @@ async fn progress_recv_bridge<T: Timestamp + ExchangeData>(
 
 /// Compute the progress channel ID for a (source, target) worker pair.
 ///
-/// Uses the same formula as data channels but offset by `PROGRESS_CHANNEL_BASE`:
-/// `PROGRESS_CHANNEL_BASE + source * num_workers + target`.
-///
-/// # Panics
-///
-/// Panics if the arithmetic overflows (extremely large worker counts).
+/// Delegates to the public
+/// [`transport_session::progress_channel_id`](crate::communication::transport_session::progress_channel_id):
+/// `PROGRESS_CHANNEL_BASE + source * num_workers + target`, overflow-checked
+/// and confined to the progress namespace.
 #[cfg(feature = "transport")]
 pub fn progress_channel_id(
     source: usize,
     target: usize,
     num_workers: usize,
 ) -> Result<u64, crate::Error> {
-    let offset = (source as u64)
-        .checked_mul(num_workers as u64)
-        .and_then(|v| v.checked_add(target as u64))
-        .ok_or_else(|| {
-            crate::Error::Dataflow(DataflowError::InvalidConfig(
-                "progress_channel_id overflow: too many workers".into(),
-            ))
-        })?;
-    PROGRESS_CHANNEL_BASE.checked_add(offset).ok_or_else(|| {
-        crate::Error::Dataflow(DataflowError::InvalidConfig(
-            "progress_channel_id overflow: exceeds u64 range".into(),
-        ))
-    })
+    crate::communication::transport_session::progress_channel_id(source, target, num_workers)
 }
 
 // ---------------------------------------------------------------------------
@@ -706,6 +690,7 @@ impl<T: Timestamp> ProgressSender<T> {
 #[cfg(feature = "transport")]
 mod tests {
     use super::*;
+    use crate::communication::transport_session::PROGRESS_CHANNEL_BASE;
 
     #[test]
     fn encode_decode_roundtrip_u64() {
@@ -808,7 +793,7 @@ mod tests {
 
     #[test]
     fn progress_channel_id_formula() {
-        // 4 workers total, src=1, dst=3 → PROGRESS_CHANNEL_BASE + 1*4 + 3 = 1_000_007
+        // 4 workers total, src=1, dst=3 → PROGRESS_CHANNEL_BASE + 1*4 + 3
         assert_eq!(
             progress_channel_id(1, 3, 4).unwrap(),
             PROGRESS_CHANNEL_BASE + 7
@@ -1098,7 +1083,8 @@ mod tests {
             &a_progress_regs,
             16,
             &rt,
-        );
+        )
+        .unwrap();
 
         let (session_b, recv_b) = TransportSession::new(
             df_id,
@@ -1111,7 +1097,8 @@ mod tests {
             &b_progress_regs,
             16,
             &rt,
-        );
+        )
+        .unwrap();
 
         let transport_a = ClusterTransport::Dedicated(std::sync::Arc::new(session_a));
         let transport_b = ClusterTransport::Dedicated(std::sync::Arc::new(session_b));

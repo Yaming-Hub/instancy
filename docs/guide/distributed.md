@@ -112,12 +112,10 @@ let mut cluster_handle = rt.spawn_cluster(
         // Build the same graph on every node
         let input = builder.input::<String>("data").unwrap();
         input
-            .exchange_by_hash("route", |s: &String| {
-                use std::hash::{Hash, Hasher};
-                let mut h = std::collections::hash_map::DefaultHasher::new();
-                s.hash(&mut h);
-                h.finish()
-            })
+            // Every node must route a key to the same worker, so use a hash
+            // that is stable across processes, platforms and Rust releases
+            // (`std`'s DefaultHasher is not). `exchange` does this for you.
+            .exchange_by_hash("route", |s: &String| instancy::hash::stable_hash(s))
             .unary("process", {
                 move |input, output| {
                     while let Some((t, data)) = input.next() {
@@ -316,8 +314,8 @@ let tokio_handle = tokio::runtime::Handle::current();
 `spawn_cluster` follows a strict multi-phase protocol before any operators run:
 
 1. **Build** — each node calls the `build` closure to construct its local dataflow
-2. **Fingerprint** — compute a hash of the dataflow graph (operator count, edge count, exchange indices)
-3. **Handshake** — exchange fingerprints with all peers; fail if any mismatch
+2. **Fingerprint** — compute a stable hash of the dataflow graph and topology: timestamp type, node ids/order/worker counts, every operator's kind, name and ports, every edge's endpoints and channel kind, every exchange's kind, name, timestamp and record type, and the input/output ports
+3. **Handshake** — exchange the cluster protocol version, node id, dataflow id and fingerprint with all peers; fail if a peer speaks another protocol version, identifies as a different node than the connection was assigned to (a miswired connection), or reports a different dataflow id or fingerprint
 4. **Wire channels** — create exchange channels and progress channels backed by the network transport
 5. **Ready barrier** — each node sends `Ready` and waits for all peers to confirm before proceeding
 6. **Materialize** — create operator tasks and begin execution

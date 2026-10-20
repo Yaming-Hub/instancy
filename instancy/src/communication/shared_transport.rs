@@ -465,15 +465,54 @@ impl SharedPeerManager {
     /// `pending_control`) are drained into the control channel immediately.
     /// Registration and pending-drain happen under a single lock to prevent
     /// a TOCTOU race with the reader_task.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`TransportError::InvalidRegistration`] without registering
+    /// anything if `channel_capacity` is 0, `channel_ids` contains a duplicate
+    /// or [`PROBE_CHANNEL_ID`], or `dataflow_id` is already registered with
+    /// this manager. (Previously a second registration silently replaced the
+    /// first one's receivers.)
     pub async fn register_dataflow(
         &self,
         dataflow_id: DataflowId,
         channel_ids: &[u64],
         channel_capacity: usize,
-    ) -> (
-        HashMap<u64, tokio_mpsc::Receiver<Vec<u8>>>,
-        tokio_mpsc::Receiver<TransportError>,
-    ) {
+    ) -> Result<
+        (
+            HashMap<u64, tokio_mpsc::Receiver<Vec<u8>>>,
+            tokio_mpsc::Receiver<TransportError>,
+        ),
+        TransportError,
+    > {
+        let invalid = |reason: String| TransportError::InvalidRegistration { reason };
+        if channel_capacity == 0 {
+            return Err(invalid("channel capacity must be at least 1".into()));
+        }
+        let mut seen = HashSet::with_capacity(channel_ids.len());
+        for &ch_id in channel_ids {
+            if ch_id == PROBE_CHANNEL_ID {
+                return Err(invalid(format!(
+                    "channel {PROBE_CHANNEL_ID} is reserved for connection probes"
+                )));
+            }
+            if !seen.insert(ch_id) {
+                return Err(invalid(format!("channel {ch_id} registered twice")));
+            }
+        }
+        if self
+            .reg_state
+            .lock()
+            .await
+            .registered
+            .contains_key(&dataflow_id)
+        {
+            return Err(invalid(format!(
+                "dataflow {dataflow_id} is already registered with peer {}",
+                self.peer_node_id
+            )));
+        }
+
         let mut receivers = HashMap::new();
         let mut channel_senders = HashMap::new();
 
@@ -528,6 +567,14 @@ impl SharedPeerManager {
         // few (typically 1-2: one Handshake and/or one Ready).
         {
             let mut state = self.reg_state.lock().await;
+            // Re-check under the lock: a concurrent registration of the same
+            // dataflow may have completed while connections were established.
+            if state.registered.contains_key(&dataflow_id) {
+                return Err(invalid(format!(
+                    "dataflow {dataflow_id} is already registered with peer {}",
+                    self.peer_node_id
+                )));
+            }
             let pending = state
                 .pending_control
                 .remove(&dataflow_id)
@@ -560,7 +607,7 @@ impl SharedPeerManager {
             .await
             .insert(dataflow_id, Arc::new(TokioMutex::new(())));
 
-        (receivers, error_rx)
+        Ok((receivers, error_rx))
     }
 
     /// Ensure the pool has at least `min_connections` live connections.
@@ -824,6 +871,32 @@ impl SharedPeerManager {
                 result = payload_rx.recv(), if payload_open => {
                     match result {
                         Some((dataflow_id, mut frame)) => {
+                            // The receiver handles the control and probe channels
+                            // outside the sequenced lane. A payload frame on one of
+                            // them would consume a sequence number the receiver
+                            // never sees, stalling the dataflow's lane behind a
+                            // permanent gap — reject it without sequencing.
+                            if frame.channel_id == CONTROL_CHANNEL_ID
+                                || frame.channel_id == PROBE_CHANNEL_ID
+                            {
+                                #[cfg(feature = "tracing")]
+                                tracing::error!(
+                                    channel_id = frame.channel_id,
+                                    "payload frame on a reserved channel rejected"
+                                );
+                                let state = reg_state.lock().await;
+                                if let Some(reg) = state.registered.get(&dataflow_id) {
+                                    let _ = reg.error_tx.try_send(TransportError::ReservedChannel {
+                                        channel_id: frame.channel_id,
+                                    });
+                                }
+                                continue;
+                            }
+                            // The sequence number comes from `dataflow_id`'s counter,
+                            // so the frame must be delivered to that dataflow's
+                            // reorder buffer.
+                            frame.dataflow_id = dataflow_id;
+
                             // Verify dataflow is still registered before proceeding
                             {
                                 let state = reg_state.lock().await;
@@ -1573,12 +1646,17 @@ impl SharedTransportSession {
     /// - `peer_managers`: Map of peer_node_id → SharedPeerManager
     /// - `channel_ids`: Channel IDs to register for each peer
     /// - `channel_capacity`: Buffer capacity for per-channel receivers
+    ///
+    /// # Errors
+    ///
+    /// Returns the first [`SharedPeerManager::register_dataflow`] error. Peers
+    /// that were already registered by this call are unregistered again.
     pub async fn new(
         dataflow_id: DataflowId,
         peer_managers: &HashMap<String, SharedPeerManager>,
         channel_ids: &[u64],
         channel_capacity: usize,
-    ) -> Self {
+    ) -> Result<Self, TransportError> {
         let mut payload_senders = HashMap::new();
         let mut control_senders = HashMap::new();
         let mut all_receivers = HashMap::new();
@@ -1586,9 +1664,20 @@ impl SharedTransportSession {
 
         for (peer_id, manager) in peer_managers {
             // Register this dataflow with the peer manager
-            let (receivers, error_rx) = manager
+            let (receivers, error_rx) = match manager
                 .register_dataflow(dataflow_id, channel_ids, channel_capacity)
-                .await;
+                .await
+            {
+                Ok(registered) => registered,
+                Err(e) => {
+                    for registered_peer in all_receivers.keys() {
+                        if let Some(m) = peer_managers.get::<String>(registered_peer) {
+                            m.unregister_dataflow(&dataflow_id).await;
+                        }
+                    }
+                    return Err(e);
+                }
+            };
 
             payload_senders.insert(peer_id.clone(), manager.payload_sender().clone());
             control_senders.insert(peer_id.clone(), manager.control_sender().clone());
@@ -1596,13 +1685,13 @@ impl SharedTransportSession {
             error_receivers.insert(peer_id.clone(), error_rx);
         }
 
-        Self {
+        Ok(Self {
             dataflow_id,
             payload_senders,
             control_senders,
             receivers: Some(all_receivers),
             error_receivers: Some(error_receivers),
-        }
+        })
     }
 
     /// Get a data sender for a peer.
@@ -1921,7 +2010,10 @@ mod tests {
 
         let df_id = DataflowId::new();
         let channel_ids = vec![1, 2, 3];
-        let (receivers, _error_rx) = manager.register_dataflow(df_id, &channel_ids, 16).await;
+        let (receivers, _error_rx) = manager
+            .register_dataflow(df_id, &channel_ids, 16)
+            .await
+            .unwrap();
 
         // 3 requested + 1 auto-registered control channel (ID 0)
         assert_eq!(receivers.len(), 4);
@@ -1958,7 +2050,9 @@ mod tests {
         );
 
         let df_id = DataflowId::new();
-        let session = SharedTransportSession::new(df_id, &managers, &[1, 2], 16).await;
+        let session = SharedTransportSession::new(df_id, &managers, &[1, 2], 16)
+            .await
+            .unwrap();
 
         // API surface matches TransportSession
         assert!(session.data_sender("peer-1").is_some());
@@ -2025,7 +2119,7 @@ mod tests {
         .unwrap();
 
         let df_id = DataflowId::new();
-        let _receivers = manager.register_dataflow(df_id, &[1], 16).await;
+        let _receivers = manager.register_dataflow(df_id, &[1], 16).await.unwrap();
 
         // Send a frame via the payload channel
         let frame = Frame {
@@ -2071,7 +2165,7 @@ mod tests {
                 .unwrap();
 
         let df_id = DataflowId::new();
-        let _receivers = manager.register_dataflow(df_id, &[1, 2], 16).await;
+        let _receivers = manager.register_dataflow(df_id, &[1, 2], 16).await.unwrap();
 
         // Send 3 frames on different channels — all should share the same sequence lane
         for ch in [1u64, 2, 1] {
@@ -2108,7 +2202,7 @@ mod tests {
 
         let df_id = DataflowId::new();
         let wrong_id = DataflowId::new();
-        manager.register_dataflow(df_id, &[1], 16).await;
+        manager.register_dataflow(df_id, &[1], 16).await.unwrap();
 
         let sender = DataframeSender {
             dataflow_id: df_id,
@@ -2145,7 +2239,7 @@ mod tests {
 
         // Register a dataflow to trigger lazy connection establishment
         let df_id = DataflowId::new();
-        let _reg = manager.register_dataflow(df_id, &[1], 16).await;
+        let _reg = manager.register_dataflow(df_id, &[1], 16).await.unwrap();
 
         // Send a probe request FROM the test side TO the manager's reader
         let probe_req = ProbeMessage::new_request(42, 1000);
@@ -2195,7 +2289,7 @@ mod tests {
             SharedPeerManager::new("test-peer".into(), config, factory, &rt, health_tx()).unwrap();
 
         let df_id = DataflowId::new();
-        let (mut receivers, _error_rx) = manager.register_dataflow(df_id, &[1], 16).await;
+        let (mut receivers, _error_rx) = manager.register_dataflow(df_id, &[1], 16).await.unwrap();
         let mut control_rx = receivers.remove(&CONTROL_CHANNEL_ID).unwrap();
 
         // Send a control frame from the test side (no sequence prefix!)
@@ -2319,7 +2413,8 @@ mod tests {
 
         // Register a dataflow
         let df_id = DataflowId::new();
-        let (_receivers, mut error_rx) = manager.register_dataflow(df_id, &[1, 2], 16).await;
+        let (_receivers, mut error_rx) =
+            manager.register_dataflow(df_id, &[1, 2], 16).await.unwrap();
 
         // Kill the connection
         drop(server_read);
@@ -2373,7 +2468,7 @@ mod tests {
 
         // Register a dataflow so error_tx exists.
         let df_id = DataflowId::new();
-        let (_receivers, mut error_rx) = manager.register_dataflow(df_id, &[1], 16).await;
+        let (_receivers, mut error_rx) = manager.register_dataflow(df_id, &[1], 16).await.unwrap();
 
         // Ensure minimum connections are established.
         manager.ensure_min_connections().await.ok();
@@ -2475,13 +2570,13 @@ mod tests {
         let df2 = DataflowId::new();
         let df3 = DataflowId::new();
 
-        let _reg_a1 = manager_a.register_dataflow(df1, &[1], 64).await;
-        let _reg_a2 = manager_a.register_dataflow(df2, &[1], 64).await;
-        let _reg_a3 = manager_a.register_dataflow(df3, &[1], 64).await;
+        let _reg_a1 = manager_a.register_dataflow(df1, &[1], 64).await.unwrap();
+        let _reg_a2 = manager_a.register_dataflow(df2, &[1], 64).await.unwrap();
+        let _reg_a3 = manager_a.register_dataflow(df3, &[1], 64).await.unwrap();
 
-        let (mut rx_b1, _) = manager_b.register_dataflow(df1, &[1], 64).await;
-        let (mut rx_b2, _) = manager_b.register_dataflow(df2, &[1], 64).await;
-        let (mut rx_b3, _) = manager_b.register_dataflow(df3, &[1], 64).await;
+        let (mut rx_b1, _) = manager_b.register_dataflow(df1, &[1], 64).await.unwrap();
+        let (mut rx_b2, _) = manager_b.register_dataflow(df2, &[1], 64).await.unwrap();
+        let (mut rx_b3, _) = manager_b.register_dataflow(df3, &[1], 64).await.unwrap();
 
         // Send 10 messages per dataflow (interleaved)
         let sender = manager_a.payload_sender().clone();
@@ -2566,8 +2661,8 @@ mod tests {
                 .unwrap();
 
         let df_id = DataflowId::new();
-        let _reg_a = manager_a.register_dataflow(df_id, &[1], 64).await;
-        let (mut rx_b, _) = manager_b.register_dataflow(df_id, &[1], 64).await;
+        let _reg_a = manager_a.register_dataflow(df_id, &[1], 64).await.unwrap();
+        let (mut rx_b, _) = manager_b.register_dataflow(df_id, &[1], 64).await.unwrap();
 
         // Send first batch — both connections alive
         let sender = manager_a.payload_sender().clone();
@@ -2668,7 +2763,7 @@ mod tests {
         .unwrap();
 
         let df_id = DataflowId::new();
-        let (mut receivers, _error_rx) = manager.register_dataflow(df_id, &[1], 64).await;
+        let (mut receivers, _error_rx) = manager.register_dataflow(df_id, &[1], 64).await.unwrap();
         let data_rx = receivers.get_mut(&1).unwrap();
 
         remote_a.abort();
@@ -2767,7 +2862,9 @@ mod tests {
         managers.insert("peer-2".to_string(), mgr2);
 
         let df_id = DataflowId::new();
-        let mut session = SharedTransportSession::new(df_id, &managers, &[1, 2], 16).await;
+        let mut session = SharedTransportSession::new(df_id, &managers, &[1, 2], 16)
+            .await
+            .unwrap();
 
         // Verify API surface
         assert!(session.data_sender("peer-1").is_some());

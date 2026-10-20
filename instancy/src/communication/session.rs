@@ -28,7 +28,7 @@ pub struct DataflowSession {
     topology: ClusterTopology,
     /// This node's identity in the cluster.
     local_node_id: String,
-    /// Next channel ID to allocate (starts at 1; 0 is reserved for progress).
+    /// Next channel ID to allocate (starts at 1; 0 is the reserved control channel).
     next_channel_id: AtomicU64,
     /// Registry of allocated channels and their wiring metadata.
     channels: Mutex<HashMap<ChannelId, ChannelInfo>>,
@@ -64,7 +64,7 @@ impl DataflowSession {
             dataflow_id,
             topology,
             local_node_id: local_node_id.into(),
-            next_channel_id: AtomicU64::new(1), // 0 reserved for progress
+            next_channel_id: AtomicU64::new(1), // 0 is the reserved control channel
             channels: Mutex::new(HashMap::new()),
         }
     }

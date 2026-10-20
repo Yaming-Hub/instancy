@@ -53,6 +53,10 @@ pub use shared_pool::{
 };
 pub use transport::{Frame, TransportError};
 
+/// Version of the cluster wire protocol spoken by this build; nodes reject
+/// peers that speak a different version during the cluster handshake.
+pub use control_protocol::PROTOCOL_VERSION as CLUSTER_PROTOCOL_VERSION;
+
 #[cfg(feature = "transport")]
 pub use transport::{
     ChannelReceiver, DemuxConfig, Demuxer, FramedReader, FramedWriter, MuxConfig, Muxer,
@@ -61,8 +65,9 @@ pub use transport::{
 
 #[cfg(feature = "transport")]
 pub use transport_session::{
-    CONTROL_CHANNEL_ID, ChannelRegistration, PROGRESS_CHANNEL_BASE, PeerConnection,
-    TransportSession,
+    CHANNEL_NAMESPACE_SIZE, CONTROL_CHANNEL_ID, ChannelRegistration, DATA_CHANNEL_BASE,
+    PROGRESS_CHANNEL_BASE, PeerConnection, RESERVED_CHANNEL_BASE, TransportSession,
+    data_channel_id, progress_channel_id,
 };
 
 #[cfg(feature = "transport")]

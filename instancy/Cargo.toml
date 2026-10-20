@@ -86,6 +86,10 @@ name = "dataflow_throughput"
 harness = false
 
 [[bench]]
+name = "exchange_hash"
+harness = false
+
+[[bench]]
 name = "comparative"
 harness = false
 

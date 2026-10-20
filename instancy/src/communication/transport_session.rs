@@ -37,7 +37,7 @@
 //!     &progress_registrations,
 //!     capacity,
 //!     &runtime_handle,
-//! );
+//! )?;
 //!
 //! // Get senders for a peer (both return the same FIFO channel)
 //! let data_tx = session.data_sender("node-b").unwrap();
@@ -57,7 +57,7 @@ use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::sync::mpsc as tokio_mpsc;
 
 #[cfg(feature = "transport")]
-use crate::communication::transport::{DemuxConfig, Demuxer, Frame, FramedWriter};
+use crate::communication::transport::{DemuxConfig, Demuxer, Frame, FramedWriter, TransportError};
 #[cfg(feature = "transport")]
 use crate::dataflow::id::DataflowId;
 
@@ -183,11 +183,19 @@ impl TransportSession {
     ///
     /// # Channel ID Semantics
     ///
-    /// Data and progress channels use separate channel ID spaces. The caller
-    /// is responsible for assigning non-overlapping IDs. Typically:
-    /// - Data: `src * num_workers + dst + 1`
-    /// - Progress: `PROGRESS_CHANNEL_BASE + src * num_workers + dst`
-    /// - Control: channel ID 0 (auto-registered per peer)
+    /// Channel ids must be unique per peer across `data_channels` and
+    /// `progress_channels`, and must not be [`CONTROL_CHANNEL_ID`] (which is
+    /// registered automatically). See [`CHANNEL_NAMESPACE_SIZE`] for the id
+    /// layout used by `spawn_cluster` ([`data_channel_id`] and
+    /// [`progress_channel_id`]).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`TransportError::InvalidRegistration`] — before any task is
+    /// spawned — if `capacity` is 0, two connections name the same peer, a
+    /// registration names a peer without a connection, a registration uses
+    /// the control channel id, or a `(peer, channel_id)` pair is registered
+    /// twice. Previously a duplicate silently replaced the earlier receiver.
     pub fn new<R, W>(
         dataflow_id: DataflowId,
         connections: Vec<PeerConnection<R, W>>,
@@ -195,14 +203,57 @@ impl TransportSession {
         progress_channels: &[ChannelRegistration],
         capacity: usize,
         runtime_handle: &tokio::runtime::Handle,
-    ) -> (
-        Self,
-        HashMap<String, HashMap<u64, tokio_mpsc::Receiver<Vec<u8>>>>,
-    )
+    ) -> Result<
+        (
+            Self,
+            HashMap<String, HashMap<u64, tokio_mpsc::Receiver<Vec<u8>>>>,
+        ),
+        TransportError,
+    >
     where
         R: AsyncRead + Unpin + Send + 'static,
         W: AsyncWrite + Unpin + Send + 'static,
     {
+        let invalid = |reason: String| TransportError::InvalidRegistration { reason };
+        if capacity == 0 {
+            return Err(invalid("transport capacity must be at least 1".into()));
+        }
+
+        // Validate everything up front so a rejected session spawns no tasks.
+        let mut peer_channels: HashMap<&str, std::collections::HashSet<u64>> = HashMap::new();
+        for conn in &connections {
+            if peer_channels
+                .insert(conn.node_id.as_str(), std::collections::HashSet::new())
+                .is_some()
+            {
+                return Err(invalid(format!(
+                    "duplicate connection to peer '{}'",
+                    conn.node_id
+                )));
+            }
+        }
+        for reg in data_channels.iter().chain(progress_channels) {
+            let Some(ids) = peer_channels.get_mut(reg.peer_node_id.as_str()) else {
+                return Err(invalid(format!(
+                    "channel {} registered for peer '{}' which has no connection",
+                    reg.channel_id, reg.peer_node_id
+                )));
+            };
+            if reg.channel_id == CONTROL_CHANNEL_ID {
+                return Err(invalid(format!(
+                    "channel {CONTROL_CHANNEL_ID} is the control channel and is registered \
+                     automatically (peer '{}')",
+                    reg.peer_node_id
+                )));
+            }
+            if !ids.insert(reg.channel_id) {
+                return Err(invalid(format!(
+                    "channel {} registered twice for peer '{}'",
+                    reg.channel_id, reg.peer_node_id
+                )));
+            }
+        }
+
         let mut payload_senders = HashMap::new();
         let mut control_senders = HashMap::new();
         let mut bridge_handles = Vec::new();
@@ -231,34 +282,20 @@ impl TransportSession {
             // --- Receive side: Demuxer per peer ---
             let reader = conn.reader;
             let mut demuxer = Demuxer::new(reader, DemuxConfig::default());
+            let peer_receivers = all_receivers.entry(peer_node_id.clone()).or_default();
 
-            // Auto-register control channel (ID 0) for this peer.
-            let control_recv = demuxer.register_channel(dataflow_id, CONTROL_CHANNEL_ID);
-            all_receivers
-                .entry(peer_node_id.clone())
-                .or_default()
-                .insert(CONTROL_CHANNEL_ID, control_recv);
-
-            // Register data channels from this peer
-            for reg in data_channels {
-                if reg.peer_node_id == peer_node_id {
-                    let rx = demuxer.register_channel(dataflow_id, reg.channel_id);
-                    all_receivers
-                        .entry(peer_node_id.clone())
-                        .or_default()
-                        .insert(reg.channel_id, rx);
-                }
-            }
-
-            // Register progress channels from this peer
-            for reg in progress_channels {
-                if reg.peer_node_id == peer_node_id {
-                    let rx = demuxer.register_channel(dataflow_id, reg.channel_id);
-                    all_receivers
-                        .entry(peer_node_id.clone())
-                        .or_default()
-                        .insert(reg.channel_id, rx);
-                }
+            // Auto-register control channel (ID 0) for this peer. Ids were
+            // validated above, so registration cannot fail.
+            let registrations = std::iter::once(CONTROL_CHANNEL_ID).chain(
+                data_channels
+                    .iter()
+                    .chain(progress_channels)
+                    .filter(|reg| reg.peer_node_id == peer_node_id)
+                    .map(|reg| reg.channel_id),
+            );
+            for channel_id in registrations {
+                let rx = demuxer.register_channel(dataflow_id, channel_id)?;
+                peer_receivers.insert(channel_id, rx);
             }
 
             let demux_handle = runtime_handle.spawn(async move {
@@ -283,7 +320,7 @@ impl TransportSession {
             _state: state,
         };
 
-        (session, all_receivers)
+        Ok((session, all_receivers))
     }
 
     /// Get a data sender for a peer.
@@ -369,18 +406,120 @@ impl TransportSession {
 // Constants
 // ---------------------------------------------------------------------------
 
-/// Base channel ID for progress channels.
+/// Number of ids in each channel-id namespace (`2^62`).
 ///
-/// Data channels use IDs `1..=(num_workers * num_workers)`.
-/// Progress channels use IDs starting at this base:
-/// `PROGRESS_CHANNEL_BASE + src * num_workers + dst`.
-/// Channel ID 0 is reserved for control messages.
+/// The `u64` channel-id space of a dataflow is split into four namespaces so
+/// that ids generated by different subsystems can never collide, whatever the
+/// cluster size:
+///
+/// | Range                                          | Use                                                                   |
+/// |------------------------------------------------|-----------------------------------------------------------------------|
+/// | `0`                                            | [`CONTROL_CHANNEL_ID`] (handshake, ready barrier, cancellation)       |
+/// | `1 .. PROGRESS_CHANNEL_BASE`                   | application channels (e.g. [`DataflowSession`](super::DataflowSession)) |
+/// | `PROGRESS_CHANNEL_BASE .. DATA_CHANNEL_BASE`   | `spawn_cluster` progress channels, see [`progress_channel_id`]          |
+/// | `DATA_CHANNEL_BASE .. RESERVED_CHANNEL_BASE`   | `spawn_cluster` exchange-edge data channels, see [`data_channel_id`]    |
+/// | `RESERVED_CHANNEL_BASE ..= u64::MAX`           | library-internal channels (probes, inter-process progress)            |
 #[cfg(feature = "transport")]
-pub const PROGRESS_CHANNEL_BASE: u64 = 1_000_000;
+pub const CHANNEL_NAMESPACE_SIZE: u64 = 1 << 62;
 
-/// Channel ID for control messages (handshake, shutdown).
+/// First channel id of the progress namespace.
+///
+/// `spawn_cluster` sends progress from global worker `src` to global worker
+/// `dst` on channel `PROGRESS_CHANNEL_BASE + src * num_workers + dst`
+/// (see [`progress_channel_id`]).
+#[cfg(feature = "transport")]
+pub const PROGRESS_CHANNEL_BASE: u64 = CHANNEL_NAMESPACE_SIZE;
+
+/// First channel id of the exchange-edge data namespace (see [`data_channel_id`]).
+#[cfg(feature = "transport")]
+pub const DATA_CHANNEL_BASE: u64 = 2 * CHANNEL_NAMESPACE_SIZE;
+
+/// First channel id of the namespace reserved for library-internal channels
+/// such as [`PROBE_CHANNEL_ID`](super::PROBE_CHANNEL_ID).
+#[cfg(feature = "transport")]
+pub const RESERVED_CHANNEL_BASE: u64 = 3 * CHANNEL_NAMESPACE_SIZE;
+
+/// Channel ID for control messages (handshake, ready barrier, cancellation).
 #[cfg(feature = "transport")]
 pub const CONTROL_CHANNEL_ID: u64 = 0;
+
+#[cfg(feature = "transport")]
+fn namespaced_channel_id(base: u64, offset: Option<u64>, what: &str) -> Result<u64, crate::Error> {
+    match offset {
+        Some(offset) if offset < CHANNEL_NAMESPACE_SIZE => Ok(base + offset),
+        _ => Err(crate::Error::Communication(
+            crate::error::CommunicationError::InvalidConfig(format!(
+                "{what} channel id space exhausted: the cluster has too many workers or \
+                 exchange edges"
+            )),
+        )),
+    }
+}
+
+/// Channel id carrying progress updates from global worker `source` to global
+/// worker `target` in a cluster of `num_workers` workers.
+///
+/// The id is `PROGRESS_CHANNEL_BASE + source * num_workers + target`.
+///
+/// # Errors
+///
+/// Fails if `source` or `target` is not below `num_workers`, or if the id
+/// does not fit in the progress namespace.
+#[cfg(feature = "transport")]
+pub fn progress_channel_id(
+    source: usize,
+    target: usize,
+    num_workers: usize,
+) -> Result<u64, crate::Error> {
+    check_worker_indices(source, target, num_workers)?;
+    let offset = (source as u64)
+        .checked_mul(num_workers as u64)
+        .and_then(|v| v.checked_add(target as u64));
+    namespaced_channel_id(PROGRESS_CHANNEL_BASE, offset, "progress")
+}
+
+/// Channel id carrying data on exchange edge `edge_index` (the position of the
+/// edge among the dataflow's exchange edges) from global worker `source` to
+/// global worker `target` in a cluster of `num_workers` workers.
+///
+/// The id is `DATA_CHANNEL_BASE + (edge_index * num_workers + source) * num_workers + target`.
+///
+/// # Errors
+///
+/// Fails if `source` or `target` is not below `num_workers`, or if the id
+/// does not fit in the data namespace.
+#[cfg(feature = "transport")]
+pub fn data_channel_id(
+    edge_index: usize,
+    source: usize,
+    target: usize,
+    num_workers: usize,
+) -> Result<u64, crate::Error> {
+    check_worker_indices(source, target, num_workers)?;
+    let n = num_workers as u64;
+    let offset = (edge_index as u64)
+        .checked_mul(n)
+        .and_then(|v| v.checked_add(source as u64))
+        .and_then(|v| v.checked_mul(n))
+        .and_then(|v| v.checked_add(target as u64));
+    namespaced_channel_id(DATA_CHANNEL_BASE, offset, "data")
+}
+
+#[cfg(feature = "transport")]
+fn check_worker_indices(
+    source: usize,
+    target: usize,
+    num_workers: usize,
+) -> Result<(), crate::Error> {
+    if source >= num_workers || target >= num_workers {
+        return Err(crate::Error::Communication(
+            crate::error::CommunicationError::InvalidConfig(format!(
+                "worker pair ({source}, {target}) out of range for {num_workers} workers"
+            )),
+        ));
+    }
+    Ok(())
+}
 
 // ---------------------------------------------------------------------------
 // Tests
@@ -432,7 +571,8 @@ mod tests {
             &[],
             16,
             &rt,
-        );
+        )
+        .unwrap();
 
         // Session for node-a (sends to node-b, no incoming channels needed for this test)
         let (session_a, _) = TransportSession::new(
@@ -446,7 +586,8 @@ mod tests {
             &[],
             16,
             &rt,
-        );
+        )
+        .unwrap();
 
         // Send a data frame from node-a → node-b
         let tx = session_a.data_sender("node-b").unwrap();
@@ -492,7 +633,8 @@ mod tests {
             &progress_regs,
             16,
             &rt,
-        );
+        )
+        .unwrap();
 
         let (session_a, _) = TransportSession::new(
             df_id,
@@ -505,7 +647,8 @@ mod tests {
             &[],
             16,
             &rt,
-        );
+        )
+        .unwrap();
 
         // Send progress frame
         let tx = session_a.progress_sender("node-b").unwrap();
@@ -562,7 +705,8 @@ mod tests {
             &progress_regs,
             16,
             &rt,
-        );
+        )
+        .unwrap();
 
         let (session_a, _) = TransportSession::new(
             df_id,
@@ -575,7 +719,8 @@ mod tests {
             &[],
             16,
             &rt,
-        );
+        )
+        .unwrap();
 
         // Queue data first, then progress (both via try_send to avoid awaiting)
         let data_tx = session_a.data_sender("node-b").unwrap();
@@ -656,7 +801,8 @@ mod tests {
             &[],
             16,
             &rt,
-        );
+        )
+        .unwrap();
 
         let (session_b, mut recv_b) = TransportSession::new(
             df_id,
@@ -672,7 +818,8 @@ mod tests {
             &[],
             16,
             &rt,
-        );
+        )
+        .unwrap();
 
         // A → B
         session_a
@@ -726,7 +873,7 @@ mod tests {
 
         let rt = tokio::runtime::Handle::current();
 
-        // Register control channel as a data registration (channel 0)
+        // The control channel (0) is registered automatically.
         let (_session_b, mut recv_b) = TransportSession::new(
             df_id,
             vec![PeerConnection {
@@ -734,14 +881,12 @@ mod tests {
                 reader: b_from_a,
                 writer: b_to_a,
             }],
-            &[ChannelRegistration {
-                peer_node_id: "node-a".into(),
-                channel_id: CONTROL_CHANNEL_ID,
-            }],
+            &[],
             &[],
             16,
             &rt,
-        );
+        )
+        .unwrap();
 
         let (session_a, _) = TransportSession::new(
             df_id,
@@ -754,7 +899,8 @@ mod tests {
             &[],
             16,
             &rt,
-        );
+        )
+        .unwrap();
 
         // Send control frame
         session_a
@@ -803,7 +949,8 @@ mod tests {
             &[],
             16,
             &rt,
-        );
+        )
+        .unwrap();
 
         // Drop the session — bridge tasks terminate when senders close,
         // demux tasks are aborted.
@@ -843,7 +990,8 @@ mod tests {
             &[],
             16,
             &rt,
-        );
+        )
+        .unwrap();
 
         let (_session_b, mut recv_b) = TransportSession::new(
             df_id,
@@ -865,7 +1013,8 @@ mod tests {
             &[],
             16,
             &rt,
-        );
+        )
+        .unwrap();
 
         let data_sender = session_a.data_sender("node-b").unwrap().clone();
         let progress_sender = session_a.progress_sender("node-b").unwrap().clone();
@@ -937,5 +1086,141 @@ mod tests {
             progress_received, expected,
             "progress should be in FIFO order"
         );
+    }
+
+    fn reg(peer: &str, channel_id: u64) -> ChannelRegistration {
+        ChannelRegistration {
+            peer_node_id: peer.into(),
+            channel_id,
+        }
+    }
+
+    fn peer(node_id: &str) -> PeerConnection<tokio::io::DuplexStream, tokio::io::DuplexStream> {
+        let (a, _keep_b) = tokio::io::duplex(1024);
+        let (_keep_c, d) = tokio::io::duplex(1024);
+        PeerConnection {
+            node_id: node_id.into(),
+            reader: d,
+            writer: a,
+        }
+    }
+
+    fn try_session(
+        connections: Vec<PeerConnection<tokio::io::DuplexStream, tokio::io::DuplexStream>>,
+        data: &[ChannelRegistration],
+        progress: &[ChannelRegistration],
+        capacity: usize,
+    ) -> Result<(), TransportError> {
+        TransportSession::new(
+            make_dataflow_id(),
+            connections,
+            data,
+            progress,
+            capacity,
+            &tokio::runtime::Handle::current(),
+        )
+        .map(|_| ())
+    }
+
+    #[tokio::test]
+    async fn invalid_registrations_are_rejected() {
+        let invalid = |r: Result<(), TransportError>| {
+            matches!(r, Err(TransportError::InvalidRegistration { .. }))
+        };
+        assert!(
+            invalid(try_session(vec![peer("b")], &[], &[], 0)),
+            "capacity 0"
+        );
+        assert!(
+            invalid(try_session(vec![peer("b"), peer("b")], &[], &[], 8)),
+            "duplicate peer"
+        );
+        assert!(
+            invalid(try_session(vec![peer("b")], &[reg("c", 5)], &[], 8)),
+            "unknown peer"
+        );
+        assert!(
+            invalid(try_session(
+                vec![peer("b")],
+                &[reg("b", CONTROL_CHANNEL_ID)],
+                &[],
+                8
+            )),
+            "control channel"
+        );
+        assert!(
+            invalid(try_session(
+                vec![peer("b")],
+                &[reg("b", 5)],
+                &[reg("b", 5)],
+                8
+            )),
+            "duplicate across data and progress"
+        );
+        assert!(
+            invalid(try_session(
+                vec![peer("b")],
+                &[reg("b", 5), reg("b", 5)],
+                &[],
+                8
+            )),
+            "duplicate within data"
+        );
+        // The same id from two different peers is fine: receivers are per peer.
+        assert!(
+            try_session(
+                vec![peer("b"), peer("c")],
+                &[reg("b", 5), reg("c", 5)],
+                &[],
+                8
+            )
+            .is_ok()
+        );
+    }
+
+    #[test]
+    fn channel_id_namespaces_are_disjoint() {
+        let n = 7;
+        let mut seen = std::collections::HashSet::new();
+        assert!(seen.insert(CONTROL_CHANNEL_ID));
+        for src in 0..n {
+            for dst in 0..n {
+                let p = progress_channel_id(src, dst, n).unwrap();
+                assert!((PROGRESS_CHANNEL_BASE..DATA_CHANNEL_BASE).contains(&p));
+                assert!(seen.insert(p), "duplicate progress id {p}");
+                for edge in 0..5 {
+                    let d = data_channel_id(edge, src, dst, n).unwrap();
+                    assert!((DATA_CHANNEL_BASE..RESERVED_CHANNEL_BASE).contains(&d));
+                    assert!(seen.insert(d), "duplicate data id {d}");
+                }
+            }
+        }
+        assert!(!seen.contains(&crate::communication::PROBE_CHANNEL_ID));
+    }
+
+    #[test]
+    fn channel_ids_reject_out_of_range_and_overflow() {
+        // Out-of-range worker indices would alias another pair's id.
+        assert!(progress_channel_id(0, 4, 4).is_err());
+        assert!(progress_channel_id(4, 0, 4).is_err());
+        assert!(data_channel_id(0, 0, 4, 4).is_err());
+        assert!(data_channel_id(0, 4, 0, 4).is_err());
+
+        // Largest valid data id for 2^20 workers: (e * N + s) * N + d < 2^62.
+        let n = 1usize << 20;
+        let max_edge = ((CHANNEL_NAMESPACE_SIZE / (n as u64 * n as u64)) - 1) as usize;
+        let top = data_channel_id(max_edge, n - 1, n - 1, n).unwrap();
+        assert_eq!(top, RESERVED_CHANNEL_BASE - 1);
+        assert!(data_channel_id(max_edge + 1, 0, 0, n).is_err());
+        assert!(data_channel_id(usize::MAX, n - 1, n - 1, n).is_err());
+
+        // Progress ids for 2^31 workers fit exactly; beyond does not.
+        let n = 1usize << 31;
+        assert_eq!(
+            progress_channel_id(n - 1, n - 1, n).unwrap(),
+            DATA_CHANNEL_BASE - 1
+        );
+        assert!(progress_channel_id(0, 0, (1usize << 31) + 1).is_ok());
+        assert!(progress_channel_id((1 << 31) + 1, 0, (1usize << 31) + 2).is_err());
     }
 }

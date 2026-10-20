@@ -277,6 +277,10 @@ pub enum CommunicationError {
     #[error("Control protocol error: {0}")]
     Protocol(#[from] crate::communication::control_protocol::ControlProtocolError),
 
+    /// A transport-layer error (framing, channel registration, connection).
+    #[error("Transport error: {0}")]
+    Transport(#[from] crate::communication::transport::TransportError),
+
     #[error("Invalid configuration: {0}")]
     InvalidConfig(String),
 
