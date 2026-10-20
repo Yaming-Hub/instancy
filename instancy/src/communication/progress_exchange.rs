@@ -32,7 +32,7 @@
 //! by data backpressure, preventing deadlocks where data flow stalls because
 //! frontiers cannot advance.
 
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use crate::communication::codec::Codec;
 use crate::communication::interprocess::{
@@ -100,8 +100,25 @@ pub struct ProgressExchange<T, TC> {
     peer_senders: Vec<PeerProgressSender>,
     /// Codec for encoding/decoding timestamps.
     time_codec: Arc<TC>,
+    /// Delivery state shared by every caller of `broadcast_local_changes`.
+    state: Mutex<BroadcastState>,
     /// Type witness for timestamp.
     _phantom: std::marker::PhantomData<T>,
+}
+
+#[derive(Default)]
+struct BroadcastState {
+    /// An update that some peers accepted while others pushed back. Its retry
+    /// goes only to the peers still owed it.
+    pending: Option<PendingBroadcast>,
+    /// A peer's channel closed: no later update can reach every peer.
+    closed: bool,
+}
+
+/// An encoded progress update and the peers that have not accepted it yet.
+struct PendingBroadcast {
+    payload: Vec<u8>,
+    owed: Vec<bool>,
 }
 
 impl<T, TC> ProgressExchange<T, TC>
@@ -128,6 +145,7 @@ where
             local_node_id: local_node_id.into(),
             peer_senders,
             time_codec,
+            state: Mutex::new(BroadcastState::default()),
             _phantom: std::marker::PhantomData,
         }
     }
@@ -135,13 +153,24 @@ where
     /// Broadcast local progress changes to all remote peers.
     ///
     /// Takes a set of frontier changes from the local progress tracker
-    /// and sends them to every peer. Uses try_send — if any peer's progress
-    /// buffer is full, returns `Error::Backpressure` so the caller can
-    /// retry with the same changes later (progress deltas are non-idempotent
-    /// and must not be dropped).
+    /// and sends them to every peer with `try_send`. If a peer's progress
+    /// buffer is full, returns `Error::Backpressure`; the caller must then
+    /// retry with exactly the same changes before broadcasting anything else
+    /// (progress deltas are non-idempotent and must not be dropped, merged
+    /// into later changes, or reordered).
     ///
-    /// Returns the number of peers that accepted the update, or an error
-    /// if delivery failed (backpressure or transport error).
+    /// Peers that accepted the update before the failure are remembered: the
+    /// retry only goes to the peers still owed it, so every peer applies the
+    /// delta exactly once. Until that retry succeeds, other changes (for
+    /// example from another caller sharing this exchange) are refused with
+    /// `Error::Backpressure` and nothing is sent, so no peer sees them ahead
+    /// of the pending update.
+    ///
+    /// If a peer's channel is closed, returns `Error::ChannelClosed`, now and
+    /// for every later call: that peer can no longer receive updates in order.
+    ///
+    /// Returns the number of peers that have accepted the update, or an error
+    /// if delivery is incomplete (backpressure or transport error).
     pub fn broadcast_local_changes(&self, changes: &[(usize, T, i64)]) -> Result<usize, Error> {
         if changes.is_empty() || self.peer_senders.is_empty() {
             return Ok(0);
@@ -155,25 +184,50 @@ where
         let mut buf = Vec::new();
         encode_progress(&msg, self.time_codec.as_ref(), &mut buf).map_err(Error::codec)?;
 
-        let mut accepted = 0;
-        for peer in &self.peer_senders {
+        let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        if state.closed {
+            return Err(Error::ChannelClosed);
+        }
+        let mut owed = match state.pending.take() {
+            None => vec![true; self.peer_senders.len()],
+            Some(p) if p.payload == buf => p.owed,
+            Some(p) => {
+                // Peers must see the pending update before anything newer.
+                state.pending = Some(p);
+                return Err(Error::Backpressure);
+            }
+        };
+
+        let mut backpressure = false;
+        for (peer, owed) in self.peer_senders.iter().zip(owed.iter_mut()) {
+            if !*owed {
+                continue;
+            }
             let frame = OutboundFrame {
                 dataflow_id: self.dataflow_id,
                 channel_id: PROGRESS_CHANNEL_ID,
                 payload: buf.clone(),
             };
             match peer.sender.try_send(frame) {
-                Ok(()) => accepted += 1,
-                Err(Error::Backpressure) => {
-                    // Progress deltas are non-idempotent — cannot drop them.
-                    // Return backpressure so caller retains changes for retry.
-                    return Err(Error::Backpressure);
+                Ok(()) => *owed = false,
+                // Keep offering the update to the other peers.
+                Err(Error::Backpressure) => backpressure = true,
+                Err(err) => {
+                    state.closed = true;
+                    return Err(err);
                 }
-                Err(e) => return Err(e),
             }
         }
 
-        Ok(accepted)
+        if !backpressure {
+            return Ok(self.peer_senders.len());
+        }
+        // Remember who already has the update. If nobody does, there is no
+        // partial delivery to protect and other callers need not wait.
+        if owed.iter().any(|owed| !owed) {
+            state.pending = Some(PendingBroadcast { payload: buf, owed });
+        }
+        Err(Error::Backpressure)
     }
 
     /// Decode a received progress frame payload into a ProgressMessage.
@@ -325,6 +379,167 @@ mod tests {
         // Drain the receiver
         let frame = receiver.recv().unwrap();
         assert_eq!(frame.channel_id, PROGRESS_CHANNEL_ID);
+    }
+
+    fn exchange_with_capacities(
+        capacities: &[usize],
+    ) -> (ProgressExchange<u64, U64Codec>, Vec<FrameReceiver>) {
+        let (senders, receivers) = capacities
+            .iter()
+            .enumerate()
+            .map(|(i, &cap)| PeerProgressSender::new(format!("node-{}", i + 1), cap))
+            .unzip();
+        let exchange = ProgressExchange::new(
+            DataflowId::from_bytes([1u8; 16]),
+            "node-0",
+            senders,
+            Arc::new(U64Codec),
+        );
+        (exchange, receivers)
+    }
+
+    fn received_changes(receiver: &FrameReceiver) -> Vec<Vec<(usize, u64, i64)>> {
+        receiver
+            .drain()
+            .into_iter()
+            .map(|f| {
+                decode_progress::<u64, U64Codec>(&f.payload, &U64Codec)
+                    .unwrap()
+                    .changes
+            })
+            .collect()
+    }
+
+    #[test]
+    fn retry_after_partial_broadcast_delivers_each_peer_once() {
+        let (exchange, receivers) = exchange_with_capacities(&[16, 1, 16]);
+        let fill = [(0usize, 0u64, 1i64)];
+        exchange.broadcast_local_changes(&fill).unwrap();
+        for r in [&receivers[0], &receivers[2]] {
+            assert_eq!(received_changes(r), vec![fill.to_vec()]);
+        }
+
+        // node-2 is full: node-1 and node-3 accept, node-2 pushes back.
+        let delta = [(1usize, 7u64, -1i64)];
+        assert!(matches!(
+            exchange.broadcast_local_changes(&delta),
+            Err(Error::Backpressure)
+        ));
+        assert!(matches!(
+            exchange.broadcast_local_changes(&delta),
+            Err(Error::Backpressure)
+        ));
+        assert_eq!(received_changes(&receivers[1]), vec![fill.to_vec()]);
+
+        // The documented retry with the same changes completes delivery.
+        assert_eq!(exchange.broadcast_local_changes(&delta).unwrap(), 3);
+        for r in &receivers {
+            assert_eq!(
+                received_changes(r),
+                vec![delta.to_vec()],
+                "each peer must apply the non-idempotent delta exactly once"
+            );
+        }
+
+        // Later broadcasts go to every peer again.
+        let next = [(2usize, 8u64, 1i64)];
+        assert_eq!(exchange.broadcast_local_changes(&next).unwrap(), 3);
+        for r in &receivers {
+            assert_eq!(received_changes(r), vec![next.to_vec()]);
+        }
+    }
+
+    #[test]
+    fn retry_resumes_with_every_peer_still_owed() {
+        let (exchange, receivers) = exchange_with_capacities(&[1, 1, 1]);
+        exchange.broadcast_local_changes(&[(0, 0u64, 1)]).unwrap();
+        let delta = [(3usize, 5u64, -1i64)];
+        assert!(exchange.broadcast_local_changes(&delta).is_err());
+
+        // Peers drain one at a time; each retry delivers to whoever has room.
+        for (i, r) in receivers.iter().enumerate() {
+            assert_eq!(received_changes(r).len(), 1);
+            let result = exchange.broadcast_local_changes(&delta);
+            if i + 1 < receivers.len() {
+                assert!(matches!(result, Err(Error::Backpressure)));
+            } else {
+                assert_eq!(result.unwrap(), 3);
+            }
+        }
+        for r in &receivers {
+            assert_eq!(received_changes(r), vec![delta.to_vec()]);
+        }
+    }
+
+    #[test]
+    fn different_changes_wait_while_a_partial_broadcast_is_pending() {
+        let (exchange, receivers) = exchange_with_capacities(&[16, 1]);
+        exchange.broadcast_local_changes(&[(0, 0u64, 1)]).unwrap();
+        let delta = [(1usize, 7u64, -1i64)];
+        assert!(exchange.broadcast_local_changes(&delta).is_err());
+        receivers[0].drain();
+
+        // Another caller sharing the exchange is told to retry later, and
+        // nothing overtakes the pending delta, even once node-2 has room.
+        receivers[1].drain();
+        let other = [(1usize, 9u64, 1i64)];
+        assert!(matches!(
+            exchange.broadcast_local_changes(&other),
+            Err(Error::Backpressure)
+        ));
+        assert!(receivers[0].try_recv().is_none());
+        assert!(receivers[1].try_recv().is_none());
+
+        assert_eq!(exchange.broadcast_local_changes(&delta).unwrap(), 2);
+        assert_eq!(received_changes(&receivers[0]), Vec::<Vec<_>>::new());
+        assert_eq!(received_changes(&receivers[1]), vec![delta.to_vec()]);
+        assert_eq!(exchange.broadcast_local_changes(&other).unwrap(), 2);
+        for r in &receivers {
+            assert_eq!(received_changes(r), vec![other.to_vec()]);
+        }
+    }
+
+    #[test]
+    fn an_update_no_peer_accepted_does_not_hold_back_other_callers() {
+        // A shares the exchange with B. A's update reached nobody, so B's
+        // changes cannot overtake it anywhere and need not wait.
+        let (exchange, receivers) = exchange_with_capacities(&[1, 1]);
+        exchange.broadcast_local_changes(&[(0, 0u64, 1)]).unwrap();
+        let from_a = [(1usize, 1u64, 1i64)];
+        assert!(exchange.broadcast_local_changes(&from_a).is_err());
+        for r in &receivers {
+            r.drain();
+        }
+        let from_b = [(2usize, 2u64, 1i64)];
+        assert_eq!(exchange.broadcast_local_changes(&from_b).unwrap(), 2);
+        for r in &receivers {
+            assert_eq!(received_changes(r), vec![from_b.to_vec()]);
+        }
+        assert_eq!(exchange.broadcast_local_changes(&from_a).unwrap(), 2);
+        for r in &receivers {
+            assert_eq!(received_changes(r), vec![from_a.to_vec()]);
+        }
+    }
+
+    #[test]
+    fn a_closed_peer_closes_the_exchange_for_every_caller() {
+        let (exchange, mut receivers) = exchange_with_capacities(&[16, 16, 16]);
+        drop(receivers.remove(1));
+        let delta = [(0usize, 3u64, 1i64)];
+        assert!(matches!(
+            exchange.broadcast_local_changes(&delta),
+            Err(Error::ChannelClosed)
+        ));
+        // Neither the retry nor anyone else's changes hang on backpressure.
+        assert!(matches!(
+            exchange.broadcast_local_changes(&delta),
+            Err(Error::ChannelClosed)
+        ));
+        assert!(matches!(
+            exchange.broadcast_local_changes(&[(1, 4u64, 1)]),
+            Err(Error::ChannelClosed)
+        ));
+        assert_eq!(received_changes(&receivers[0]), vec![delta.to_vec()]);
     }
 
     #[test]

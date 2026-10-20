@@ -7,6 +7,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Exchange and broadcast retry fixes
+
+- Fix duplicated records when an exchange or broadcast `try_push` is accepted
+  by some targets and pushed back by another (for example a full per-peer
+  network queue). The returned envelope's retry now delivers only the
+  sub-batches or copies still owed, from the partition computed on the first
+  attempt, so `rebalance` and other stateful routing keep each record on one
+  target. This also removes the livelock when several sub-batches compete for
+  one free slot in a peer queue.
+- Account exchange records in flight per delivered sub-batch, so partially
+  delivered envelopes are counted exactly once.
+- `ExchangePush` and `BroadcastPush` reject a different envelope while a
+  partially delivered one is waiting for its retry, instead of duplicating or
+  reordering data. `ProgressExchange::broadcast_local_changes` answers
+  different changes with `Error::Backpressure`, sending nothing, until the
+  partially delivered update has been retried, and reports
+  `Error::ChannelClosed` for every call once a peer's channel has closed.
+- Fix `ProgressExchange::broadcast_local_changes` sending a progress delta
+  again to peers that had already accepted it when the documented retry
+  follows backpressure from another peer.
+
 ### Input contract hardening
 
 - **BREAKING:** Invalid input/frontier sequences that were previously accepted
