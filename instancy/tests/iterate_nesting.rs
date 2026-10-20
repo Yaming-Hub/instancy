@@ -537,6 +537,118 @@ fn with_join(multi: instancy::runtime::MultiSpawnedDataflow<u64>) {
         .unwrap();
 }
 
+/// Loop body that taps every iteration: `3k → 3k+1 → 3k+2 → 3k+3`, so each
+/// record circulates three times and emits three tap batches.
+fn tapped_loop(input: instancy::Pipe<u64, i64>) -> instancy::Pipe<u64, i64> {
+    input.iterate::<u32>("loop", 1u32, |v| {
+        let s = v.map("inc", |_t: &P1, x: i64| x + 1);
+        s.clone().output("tap").unwrap();
+        IterateResult {
+            feedback: s.clone().filter("again", |_t, x| x % 3 != 0),
+            output: s.filter("done", |_t, x| x % 3 == 0),
+        }
+    })
+}
+
+/// A failed take of a loop-body output (wrong I/O mode or data type) leaves
+/// the port in place, and dropping its receiver while the sink is blocked on
+/// a full channel abandons the port: the sink discards instead of stalling
+/// the loop, so the input sender and the dataflow both finish.
+#[test]
+fn loop_body_output_failed_take_keeps_port_and_dropped_receiver_discards() {
+    // Far more tap batches (3 per record) than the 256-slot output channel.
+    const RECORDS: i64 = 2_000;
+    let builder = DataflowBuilder::<u64>::new("loop-tap-drop");
+    let input = builder.input::<i64>("data").unwrap();
+    tapped_loop(input).output("results").unwrap();
+    let rt = rt();
+    let mut spawned = rt
+        .spawn(builder.build().unwrap(), SpawnOptions::default())
+        .unwrap();
+    assert!(spawned.take_async_output::<i64>("tap").is_err());
+    assert!(spawned.take_output::<u64>("tap").is_err());
+    let tap = spawned
+        .take_output::<i64>("tap")
+        .expect("a failed take must leave the loop-body port in place");
+    let results = spawned.take_output::<i64>("results").unwrap();
+    let tx = spawned.take_input::<i64>("data").unwrap();
+    let sender = std::thread::spawn(move || {
+        for i in 0..RECORDS {
+            tx.send(0, vec![i * 3]).unwrap();
+        }
+    });
+    let collector = std::thread::spawn(move || results.collect_data());
+    // Wait until the tap is flowing, give the undrained tap time to fill and
+    // block its sink, then abandon it.
+    assert!(tap.recv_timeout(Duration::from_secs(10)).is_some());
+    std::thread::sleep(Duration::from_millis(200));
+    drop(tap);
+
+    join_spawned(spawned).unwrap();
+    sender.join().expect("input sender failed");
+    let mut got: Vec<i64> = collector
+        .join()
+        .unwrap()
+        .into_iter()
+        .flat_map(|(t, d)| {
+            assert_eq!(t, 0);
+            d
+        })
+        .collect();
+    got.sort();
+    assert_eq!(got, (1..=RECORDS).map(|i| i * 3).collect::<Vec<_>>());
+}
+
+/// `take_all_*` on a loop-body output validates every worker before taking
+/// any: a wrong-mode request fails without consuming the ports.
+#[test]
+fn loop_body_output_take_all_wrong_mode_keeps_ports() {
+    let rt = rt();
+    let mut multi = rt
+        .spawn_multi(
+            "loop-tap-take-all",
+            2,
+            |b| {
+                // `map` before the exchange: an exchange fed directly by a
+                // source hangs multi-worker loops (pre-existing in-flight
+                // accounting gap, tracked separately).
+                let input = b
+                    .input::<i64>("data")?
+                    .map("pre", |_t, x| x)
+                    .exchange_by_hash("x", |x: &i64| *x as u64);
+                tapped_loop(input).output("results")?;
+                Ok(())
+            },
+            SpawnOptions::default(),
+        )
+        .unwrap();
+    assert!(multi.take_all_async_outputs::<i64>("tap").is_err());
+    assert!(multi.take_all_outputs::<u64>("tap").is_err());
+    let taps = multi
+        .take_all_outputs::<i64>("tap")
+        .expect("a failed take_all must leave every worker's port in place");
+    assert_eq!(taps.len(), 2);
+    drop(taps);
+    let results = multi.take_all_outputs::<i64>("results").unwrap();
+    let inputs = multi.take_all_inputs::<i64>("data").unwrap();
+    for (w, tx) in inputs.into_iter().enumerate() {
+        tx.send(0, (0..300).map(|i| (i * 2 + w as i64) * 3).collect())
+            .unwrap();
+    }
+    let collectors: Vec<_> = results
+        .into_iter()
+        .map(|rx| std::thread::spawn(move || rx.collect_data()))
+        .collect();
+    with_join(multi);
+    let mut got: Vec<i64> = collectors
+        .into_iter()
+        .flat_map(|c| c.join().unwrap())
+        .flat_map(|(_, d)| d)
+        .collect();
+    got.sort();
+    assert_eq!(got, (1..=600).map(|i| i * 3).collect::<Vec<_>>());
+}
+
 /// An output name used both inside a loop body and outside it is rejected
 /// at build time, in either declaration order.
 #[test]
