@@ -97,8 +97,8 @@ stream.unary_notify("aggregate", {
 ```
 
 This is the instancy equivalent of timely's `Notificator` pattern. The key methods on `NotifyContext` are:
-- `notify_at(time)` — register interest in a timestamp; the framework will notify you when the frontier passes it
-- `next_notification()` — returns the next completed timestamp (if any)
+- `notify_at(time)` — register interest in a timestamp; the framework will notify you when the frontier passes it. `time` must be one the operator can hold: at or after its input frontier, a capability it held when the activation started (so a notification handler may re-arm or delay the time it is handling), or the time of an input batch it is processing (e.g. the `time` returned by `input.next()`). Requesting an already-completed time fails the operator; `try_notify_at(time)` returns the error instead.
+- `next_notification()` — returns the next completed timestamp (if any). When several timestamps complete at once they are delivered in timestamp order, so state carried across timestamps (e.g. running totals) is updated in order.
 
 Use `unary_notify` when you need to produce output only after all data for a timestamp has arrived — for example, computing aggregates, detecting completeness, or triggering downstream actions.
 

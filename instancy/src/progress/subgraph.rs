@@ -42,14 +42,30 @@ use crate::progress::timestamp::Timestamp;
 /// independent reporters without the parent scope knowing `Inner`.
 type InflightReporterAny = Arc<dyn Any + Send + Sync>;
 /// Drains a type-erased reporter into `(tracker timestamp, diff)` pairs.
-type InflightDrainFn<T> = fn(&(dyn Any + Send + Sync)) -> Vec<(T, i64)>;
+///
+/// A closure rather than a function pointer so that loop-body bindings can be
+/// projected through any number of nested scopes: each `iterate` level wraps
+/// its body's drain with one more `Product::outer` projection.
+type InflightDrainFn<T> = Arc<dyn Fn(&(dyn Any + Send + Sync)) -> Vec<(T, i64)> + Send + Sync>;
 /// Mints a fresh, independent type-erased reporter (for per-worker cloning).
+/// Always mints the reporter type of the channel itself (the innermost scope's
+/// timestamp), regardless of how many scope levels the binding was lifted.
 type InflightFreshFn = fn() -> InflightReporterAny;
 
 /// A boundary in-flight binding: where it lands (`target`), where it is recorded
 /// from (`source`, for the producing channel lookup), the reporter, and the
 /// drain/fresh functions.
 struct InflightBinding<T: Timestamp> {
+    source: (usize, usize),
+    target: (usize, usize),
+    reporter: InflightReporterAny,
+    drain: InflightDrainFn<T>,
+    fresh: InflightFreshFn,
+}
+
+/// A loop body's in-flight binding, handed to the enclosing scope's builder
+/// when the body is merged into it.
+pub(crate) struct LoopInflightBinding<T: Timestamp> {
     source: (usize, usize),
     target: (usize, usize),
     reporter: InflightReporterAny,
@@ -79,42 +95,24 @@ fn fresh_inflight_same<T: Timestamp>() -> InflightReporterAny {
     Arc::new(ProgressReporter::<T>::new())
 }
 
-/// Drain function for a loop-body reporter whose timestamp is `Product<T, I>`:
-/// projects each time onto its outer coordinate `T`.
-fn drain_inflight_projected<T: Timestamp, I: Timestamp>(
-    reporter: &(dyn Any + Send + Sync),
-) -> Vec<(T, i64)>
+/// Lifts a loop body's drain (into the body timestamp `Product<T, I>`) to the
+/// enclosing scope by projecting each time onto its outer coordinate `T`.
+/// Applied once per `iterate` level, so a binding from a doubly-nested body is
+/// projected twice. The body drain keeps downcasting the channel's own
+/// reporter type (and fails loudly in debug builds on a mismatch, see
+/// [`drain_inflight_same`]).
+fn lift_inflight_drain<T: Timestamp, I: Timestamp>(
+    inner: InflightDrainFn<crate::order::Product<T, I>>,
+) -> InflightDrainFn<T>
 where
     crate::order::Product<T, I>: Timestamp,
 {
-    let reporter = reporter.downcast_ref::<ProgressReporter<crate::order::Product<T, I>>>();
-    // A registered loop-body reporter must resolve to
-    // `ProgressReporter<Product<T, I>>`. A failed downcast would silently drop
-    // the projected in-flight message, making an outstanding loop-body exchange
-    // message invisible to the outer epoch and silently reintroducing #277.
-    // Fail loudly in debug/tests instead of dropping data.
-    debug_assert!(
-        reporter.is_some(),
-        "loop-body in-flight reporter failed to downcast to ProgressReporter<{}>; \
-         reporter type does not match the registered loop-body timestamp type",
-        std::any::type_name::<crate::order::Product<T, I>>(),
-    );
-    reporter
-        .map(|r| {
-            r.drain()
-                .into_iter()
-                .map(|(p, d)| (p.outer, d))
-                .collect::<Vec<_>>()
-        })
-        .unwrap_or_default()
-}
-
-/// `fresh` function for a loop-body `Product<T, I>` reporter.
-fn fresh_inflight_projected<T: Timestamp, I: Timestamp>() -> InflightReporterAny
-where
-    crate::order::Product<T, I>: Timestamp,
-{
-    Arc::new(ProgressReporter::<crate::order::Product<T, I>>::new())
+    Arc::new(move |reporter| {
+        inner(reporter)
+            .into_iter()
+            .map(|(p, d)| (p.outer, d))
+            .collect()
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -266,7 +264,7 @@ impl<T: Timestamp> Clone for SubgraphBuilder<T> {
                     source: b.source,
                     target: b.target,
                     reporter: (b.fresh)(),
-                    drain: b.drain,
+                    drain: Arc::clone(&b.drain),
                     fresh: b.fresh,
                 })
                 .collect(),
@@ -310,31 +308,33 @@ impl<T: Timestamp> SubgraphBuilder<T> {
             source,
             target,
             reporter: Arc::new(reporter.clone()),
-            drain: drain_inflight_same::<T>,
+            drain: Arc::new(drain_inflight_same::<T>),
             fresh: fresh_inflight_same::<T>,
         });
         reporter
     }
 
     /// Registers an in-flight binding carried up from a nested loop body, whose
-    /// channel timestamp is `Product<T, I>`. The reporter is shared with the
-    /// channel inside the loop; the tracker drains it by projecting each time
-    /// onto its outer coordinate `T`, so an unconsumed exchange message inside
-    /// the loop keeps the *outer epoch* incomplete.
+    /// timestamp is `Product<T, I>`. `binding` is the body's own binding (from
+    /// [`inflight_edges_for_merge`](Self::inflight_edges_for_merge)): its
+    /// reporter is shared with the channel inside the loop, and its drain (into
+    /// `Product<T, I>`, itself possibly lifted from a deeper body) is lifted
+    /// once more onto the outer coordinate `T`, so an unconsumed exchange
+    /// message at any nesting depth keeps the *outer epoch* incomplete. The
+    /// `fresh` function is kept, so per-worker clones mint reporters of the
+    /// channel's own timestamp type.
     pub(crate) fn register_loop_inflight_edge<I: Timestamp>(
         &mut self,
-        source: (usize, usize),
-        target: (usize, usize),
-        reporter: InflightReporterAny,
+        binding: LoopInflightBinding<crate::order::Product<T, I>>,
     ) where
         crate::order::Product<T, I>: Timestamp,
     {
         self.inflight_edges.push(InflightBinding {
-            source,
-            target,
-            reporter,
-            drain: drain_inflight_projected::<T, I>,
-            fresh: fresh_inflight_projected::<T, I>,
+            source: binding.source,
+            target: binding.target,
+            reporter: binding.reporter,
+            drain: lift_inflight_drain::<T, I>(binding.drain),
+            fresh: binding.fresh,
         });
     }
 
@@ -474,16 +474,21 @@ impl<T: Timestamp> SubgraphBuilder<T> {
         &self.edges
     }
 
-    /// Returns the in-flight edge bindings as `(source, target, reporter)` for
-    /// merging a nested scope's exchange accounting into a parent builder. The
-    /// reporter is shared (cloned `Arc`) so the loop-body channel and the parent
-    /// tracker observe the same in-flight counts.
-    pub(crate) fn inflight_edges_for_merge(
-        &self,
-    ) -> Vec<((usize, usize), (usize, usize), InflightReporterAny)> {
+    /// Returns the in-flight edge bindings for merging a nested scope's
+    /// exchange accounting into a parent builder (see
+    /// [`register_loop_inflight_edge`](Self::register_loop_inflight_edge)).
+    /// The reporter is shared (cloned `Arc`) so the loop-body channel and the
+    /// parent tracker observe the same in-flight counts.
+    pub(crate) fn inflight_edges_for_merge(&self) -> Vec<LoopInflightBinding<T>> {
         self.inflight_edges
             .iter()
-            .map(|b| (b.source, b.target, b.reporter.clone()))
+            .map(|b| LoopInflightBinding {
+                source: b.source,
+                target: b.target,
+                reporter: b.reporter.clone(),
+                drain: Arc::clone(&b.drain),
+                fresh: b.fresh,
+            })
             .collect()
     }
 
@@ -547,7 +552,14 @@ impl<T: Timestamp> SubgraphBuilder<T> {
         let inflight_reporters: Vec<(usize, usize, InflightReporterAny, InflightDrainFn<T>)> = self
             .inflight_edges
             .iter()
-            .map(|b| (b.target.0, b.target.1, b.reporter.clone(), b.drain))
+            .map(|b| {
+                (
+                    b.target.0,
+                    b.target.1,
+                    b.reporter.clone(),
+                    Arc::clone(&b.drain),
+                )
+            })
             .collect();
 
         // Build per-operator frontier state.
@@ -783,7 +795,7 @@ impl<T: Timestamp> ProgressTracker<T> {
             target_op,
             target_port,
             Arc::new(reporter.clone()),
-            drain_inflight_same::<T>,
+            Arc::new(drain_inflight_same::<T>),
         ));
         reporter
     }
@@ -910,6 +922,26 @@ impl<T: Timestamp> ProgressTracker<T> {
             "output_frontier: operator {operator} not registered"
         );
         &self.operator_frontiers[&operator].output_frontiers[output]
+    }
+
+    /// Returns the frontier of the stream produced at output `output` of
+    /// `operator`: the times that may still appear on it. This covers the
+    /// operator's own capabilities (e.g. held notification capabilities) and
+    /// everything upstream that can still reach the stream, which is what a
+    /// probe attached to the stream must report.
+    ///
+    /// Conservatively returns `[T::minimum()]` before initialization or for an
+    /// unknown location, so a caller can never observe premature completion.
+    pub fn stream_frontier(&self, operator: usize, output: usize) -> Antichain<T> {
+        if !self.initialized {
+            return Antichain::from_elem(T::minimum());
+        }
+        match self.operator_frontiers.get(&operator) {
+            Some(state) if output < state.output_frontiers.len() => {
+                state.output_frontiers[output].clone()
+            }
+            _ => Antichain::from_elem(T::minimum()),
+        }
     }
 
     /// Returns the operators whose frontiers changed in the last propagation.

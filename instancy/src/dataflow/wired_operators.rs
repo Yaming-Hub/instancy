@@ -1600,12 +1600,28 @@ impl<T: Timestamp, D1: Send + 'static, D2: Send + 'static> SchedulableOperator
         // - Register notifications via notify_at(time) [creates output capability]
         // - Consume notifications via next_notification() [drops output capability]
         {
+            // Times the operator holds at the start of this activation: the
+            // available input batches and the capabilities it holds. A
+            // notification at or after one of them is legitimate even if the
+            // frontier has already moved past it, including after
+            // `next_notification` dropped that capability in this activation
+            // (the drop and the new capability reach the tracker together).
+            let activation_times: Antichain<T> = self
+                .input_handle
+                .pending_times()
+                .chain(self.held_capabilities.iter().map(|cap| cap.time()))
+                .cloned()
+                .collect();
             let mut ctx = NotifyContext::new(
                 &mut self.notificator,
                 &self.progress_reporter,
                 &mut self.held_capabilities,
+                activation_times,
             );
             (self.logic)(&mut self.input_handle, &mut self.output_handle, &mut ctx)?;
+            if let Some(error) = ctx.take_error() {
+                return Err(error);
+            }
         }
 
         // Step 5: Push output to channel.

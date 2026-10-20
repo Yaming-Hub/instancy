@@ -11,7 +11,7 @@ use crate::cancellation::CancellationToken;
 use crate::dataflow::channels::wake::WakeHandle;
 use crate::dataflow::executor::{ExecutorConfig, SweepOutcome};
 use crate::dataflow::graph::DataflowGraph;
-use crate::dataflow::probe::ProbeHandle;
+use crate::dataflow::probe::{AttachedProbe, ProbeRegistration};
 use crate::dataflow::schedulable::{
     ActivationOutcome, ChannelEndpoints, ChannelFactory, OperatorFactory, SchedulableOperator,
     group_by_port,
@@ -59,10 +59,8 @@ pub(crate) struct StageExecutor<T: Timestamp> {
     consecutive_idle: usize,
     /// Configuration.
     config: ExecutorConfig,
-    /// Probes registered for this stage.
-    probes: Vec<(usize, ProbeHandle<T>)>,
-    /// Probe notifiers for async waiters.
-    probe_notifiers: Vec<crate::dataflow::probe::ProbeNotifier<T>>,
+    /// Probes registered for this stage (drained when the stage completes).
+    probes: Vec<AttachedProbe<T>>,
     /// Wake handle for async executor notifications.
     wake_handle: WakeHandle,
     /// Counter of external inputs that are still open. Prevents false
@@ -136,8 +134,7 @@ pub(crate) fn materialize_stage_executor<T: Timestamp>(
     config: ExecutorConfig,
     exchange_inputs: Vec<ExchangeInput<T>>,
     exchange_outputs: Vec<ExchangeOutput<T>>,
-    probes: Vec<(usize, ProbeHandle<T>)>,
-    probe_notifiers: Vec<crate::dataflow::probe::ProbeNotifier<T>>,
+    probes: Vec<ProbeRegistration<T>>,
     boundary_input_pullers: HashMap<usize, Vec<(usize, Box<dyn Any + Send>)>>,
     boundary_output_pushers: HashMap<usize, Vec<(usize, Box<dyn Any + Send>)>>,
     external_inputs_open: Arc<AtomicUsize>,
@@ -349,6 +346,15 @@ pub(crate) fn materialize_stage_executor<T: Timestamp>(
         .take(operators.len())
         .collect::<Vec<Option<Notificator<T>>>>();
 
+    // A stage tracker has no cross-worker progress channels: it observes only
+    // this worker's operators, and on the staged path every worker builds its
+    // own dataflow (and probes), so this executor alone covers each probe it
+    // writes (see `materialize_executor`).
+    let probes = probes
+        .iter()
+        .map(|registration| AttachedProbe::new(registration, 1))
+        .collect();
+
     Ok(StageExecutor::new(
         stage_id,
         worker_index,
@@ -361,7 +367,6 @@ pub(crate) fn materialize_stage_executor<T: Timestamp>(
         Some(tracker),
         notificators,
         probes,
-        probe_notifiers,
         wake_handle,
         external_inputs_open,
         feedback_deps,
@@ -382,8 +387,7 @@ impl<T: Timestamp> StageExecutor<T> {
         exchange_outputs: Vec<ExchangeOutput<T>>,
         progress_tracker: Option<ProgressTracker<T>>,
         notificators: Vec<Option<Notificator<T>>>,
-        probes: Vec<(usize, ProbeHandle<T>)>,
-        probe_notifiers: Vec<crate::dataflow::probe::ProbeNotifier<T>>,
+        probes: Vec<AttachedProbe<T>>,
         wake_handle: WakeHandle,
         external_inputs_open: Arc<AtomicUsize>,
         feedback_deps: Arc<AtomicUsize>,
@@ -401,11 +405,6 @@ impl<T: Timestamp> StageExecutor<T> {
             "notificators length ({}) must match operator count ({})",
             notificators.len(),
             operators.len()
-        );
-        assert_eq!(
-            probes.len(),
-            probe_notifiers.len(),
-            "probes and probe_notifiers must have matching lengths"
         );
 
         let done = operators.iter().map(|op| op.is_done()).collect();
@@ -425,7 +424,6 @@ impl<T: Timestamp> StageExecutor<T> {
             consecutive_idle: 0,
             config,
             probes,
-            probe_notifiers,
             wake_handle,
             external_inputs_open,
             feedback_deps,
@@ -443,6 +441,14 @@ impl<T: Timestamp> StageExecutor<T> {
 
     /// Runs one executor sweep.
     pub(crate) fn run_one_sweep(&mut self) -> Result<SweepOutcome> {
+        let outcome = self.run_one_sweep_inner()?;
+        if matches!(outcome, SweepOutcome::Completed) {
+            self.finish_probes();
+        }
+        Ok(outcome)
+    }
+
+    fn run_one_sweep_inner(&mut self) -> Result<SweepOutcome> {
         self.cancel.check()?;
 
         if self.is_completed() {
@@ -682,15 +688,14 @@ impl<T: Timestamp> StageExecutor<T> {
             .enumerate()
             .map(|(pos, op)| (op.index(), pos))
             .collect();
-        let probe_indices: Vec<usize> = self.probes.iter().map(|(op_idx, _)| *op_idx).collect();
 
-        let (frontier_updates, probe_frontiers) = {
+        let frontier_updates = {
             let Some(tracker) = self.progress_tracker.as_mut() else {
                 return Ok(false);
             };
 
             let dirty = tracker.propagate()?.to_vec();
-            let frontier_updates = dirty
+            dirty
                 .into_iter()
                 .filter_map(|op_idx| {
                     operator_positions.iter().find_map(|(index, pos)| {
@@ -701,12 +706,7 @@ impl<T: Timestamp> StageExecutor<T> {
                         }
                     })
                 })
-                .collect::<Vec<_>>();
-            let probe_frontiers = probe_indices
-                .iter()
-                .map(|op_idx| tracker.operator_input_frontier_meet(*op_idx))
-                .collect::<Vec<_>>();
-            (frontier_updates, probe_frontiers)
+                .collect::<Vec<_>>()
         };
 
         for (pos, frontier) in &frontier_updates {
@@ -716,14 +716,7 @@ impl<T: Timestamp> StageExecutor<T> {
             self.operators[*pos].update_input_frontier(frontier);
         }
 
-        for (i, frontier) in probe_frontiers.iter().enumerate() {
-            if let Some((_, probe)) = self.probes.get(i) {
-                probe.update_frontier(frontier);
-            }
-            if let Some(notifier) = self.probe_notifiers.get(i) {
-                notifier.notify(frontier);
-            }
-        }
+        self.sync_probes();
 
         let notifications_ready = self
             .notificators
@@ -776,12 +769,18 @@ impl<T: Timestamp> StageExecutor<T> {
             return;
         };
 
-        for (i, (op_idx, probe)) in self.probes.iter().enumerate() {
-            let frontier = tracker.operator_input_frontier_meet(*op_idx);
-            probe.update_frontier(&frontier);
-            if let Some(notifier) = self.probe_notifiers.get(i) {
-                notifier.notify(&frontier);
-            }
+        for probe in &mut self.probes {
+            let frontier = tracker.stream_frontier(probe.operator, probe.output);
+            probe.writer.update(&frontier);
+        }
+    }
+
+    /// Reports this stage executor's completion to its probes (once).
+    fn finish_probes(&mut self) {
+        let tracker = self.progress_tracker.as_ref();
+        for mut probe in self.probes.drain(..) {
+            let last = tracker.map(|tracker| tracker.stream_frontier(probe.operator, probe.output));
+            probe.writer.finish(last.as_ref());
         }
     }
 
@@ -1012,8 +1011,13 @@ impl<T: Timestamp> Future for CombinedStageExecutor<T> {
                     }
                 }
             }
-            // Drop all remaining stages to release their channels.
+            // Drop all remaining stages to release their channels. The loop
+            // converged, so this is the stages' completion: report it to their
+            // probes first (otherwise loop-body probes would never finish).
             for stage in &mut this.stages {
+                if let Some(stage) = stage.as_mut() {
+                    stage.finish_probes();
+                }
                 *stage = None;
             }
             this.wake_handle.clear_waker();
@@ -1292,7 +1296,6 @@ mod tests {
             None,
             vec![None],
             Vec::new(),
-            Vec::new(),
             WakeHandle::new(),
             Arc::new(AtomicUsize::new(0)),
             Arc::new(AtomicUsize::new(0)),
@@ -1323,7 +1326,6 @@ mod tests {
             WakeHandle::new(),
             &WorkerContext::single(),
             ExecutorConfig::default(),
-            Vec::new(),
             Vec::new(),
             Vec::new(),
             Vec::new(),
@@ -1384,7 +1386,6 @@ mod tests {
             Vec::new(),
             Vec::new(),
             Vec::new(),
-            Vec::new(),
             HashMap::new(),
             HashMap::new(),
             Arc::new(AtomicUsize::new(0)),
@@ -1424,7 +1425,6 @@ mod tests {
             Vec::new(),
             None,
             vec![None],
-            Vec::new(),
             Vec::new(),
             WakeHandle::new(),
             Arc::new(AtomicUsize::new(0)),

@@ -2569,13 +2569,12 @@ impl RuntimeHandle {
 
                 let stage_operator_set: HashSet<usize> =
                     stage.operator_indices.iter().copied().collect();
-                let (stage_probes, stage_probe_notifiers): (Vec<_>, Vec<_>) = dataflow
+                let stage_probes: Vec<_> = dataflow
                     .probes
                     .iter()
+                    .filter(|registration| stage_operator_set.contains(&registration.operator))
                     .cloned()
-                    .zip(dataflow.probe_notifiers.iter().cloned())
-                    .filter(|((op_idx, _), _)| stage_operator_set.contains(op_idx))
-                    .unzip();
+                    .collect();
 
                 let mut stage_boundary_input_pullers = HashMap::new();
                 let mut stage_boundary_output_pushers = HashMap::new();
@@ -2609,7 +2608,6 @@ impl RuntimeHandle {
                     exchange_inputs,
                     exchange_outputs,
                     stage_probes,
-                    stage_probe_notifiers,
                     stage_boundary_input_pullers,
                     stage_boundary_output_pushers,
                     Arc::clone(&external_inputs_open),
@@ -4407,6 +4405,20 @@ impl<T: Timestamp> SpawnedDataflow<T> {
         direction: &str,
         mode_mismatch: &str,
     ) -> Result<C> {
+        Self::take_port_or::<C, C>(ports, name, type_name, direction, mode_mismatch, |c| c)
+    }
+
+    /// Like [`take_port`](Self::take_port), but also accepts an endpoint stored
+    /// as `Alt` (an output declared inside an `iterate` body), converted with
+    /// `from_alt`.
+    fn take_port_or<C: 'static, Alt: 'static>(
+        ports: &mut Vec<(String, &'static str, Box<dyn std::any::Any + Send>)>,
+        name: &str,
+        type_name: &str,
+        direction: &str,
+        mode_mismatch: &str,
+        from_alt: impl FnOnce(Alt) -> C,
+    ) -> Result<C> {
         let pos = ports
             .iter()
             .position(|(n, _, _)| n == name)
@@ -4421,17 +4433,24 @@ impl<T: Timestamp> SpawnedDataflow<T> {
                 "{direction} port '{name}' has type {port_type}, but requested {type_name}"
             ))));
         }
-        if !port.is::<C>() {
+        if !port.is::<C>() && !port.is::<Alt>() {
             return Err(Error::Runtime(RuntimeError::InvalidConfig(format!(
                 "{direction} port '{name}' {mode_mismatch}"
             ))));
         }
         let (_, _, port) = ports.remove(pos);
-        port.downcast::<C>().map(|boxed| *boxed).map_err(|_| {
+        let changed_type = || {
             Error::Runtime(RuntimeError::InvalidConfig(format!(
                 "internal: {direction} port '{name}' changed type during take"
             )))
-        })
+        };
+        match port.downcast::<C>() {
+            Ok(boxed) => Ok(*boxed),
+            Err(port) => port
+                .downcast::<Alt>()
+                .map(|boxed| from_alt(*boxed))
+                .map_err(|_| changed_type()),
+        }
     }
 
     /// Take the output receiver for the named port (consumes it from the handle).
@@ -4461,12 +4480,13 @@ impl<T: Timestamp> SpawnedDataflow<T> {
         &mut self,
         name: &str,
     ) -> Result<crate::dataflow::channel_operators::OutputReceiver<T, D>> {
-        Self::take_port(
+        Self::take_port_or(
             &mut self.output_receivers,
             name,
             std::any::type_name::<D>(),
             "output",
             "was wired for async I/O (spawned with IoMode::Async) — use take_async_output()",
+            crate::dataflow::channel_operators::OutputReceiver::from_projected,
         )
     }
 
@@ -4516,12 +4536,13 @@ impl<T: Timestamp> SpawnedDataflow<T> {
         &mut self,
         name: &str,
     ) -> Result<crate::dataflow::channel_operators::AsyncOutputReceiver<T, D>> {
-        Self::take_port(
+        Self::take_port_or(
             &mut self.output_receivers,
             name,
             std::any::type_name::<D>(),
             "output",
             "was not wired for async I/O (spawn with IoMode::Async, or use take_output())",
+            crate::dataflow::channel_operators::AsyncOutputReceiver::from_projected,
         )
     }
 
@@ -4844,13 +4865,10 @@ impl<T: Timestamp> MultiSpawnedDataflow<T> {
         // Pre-validate: every worker must have this port with the right type
         // and correct channel mode (sync).
         for (idx, w) in self.workers.iter().enumerate() {
-            Self::validate_port::<crate::dataflow::channel_operators::InputSender<T, D>>(
-                &w.input_senders,
-                idx,
-                name,
-                type_name,
-                "input",
-            )?;
+            Self::validate_port::<
+                crate::dataflow::channel_operators::InputSender<T, D>,
+                crate::dataflow::channel_operators::InputSender<T, D>,
+            >(&w.input_senders, idx, name, type_name, "input")?;
         }
         // Consume from each worker. After full validation this cannot fail.
         let mut senders = Vec::with_capacity(self.num_workers);
@@ -4874,13 +4892,10 @@ impl<T: Timestamp> MultiSpawnedDataflow<T> {
     ) -> Result<Vec<crate::dataflow::channel_operators::OutputReceiver<T, D>>> {
         let type_name = std::any::type_name::<D>();
         for (idx, w) in self.workers.iter().enumerate() {
-            Self::validate_port::<crate::dataflow::channel_operators::OutputReceiver<T, D>>(
-                &w.output_receivers,
-                idx,
-                name,
-                type_name,
-                "output",
-            )?;
+            Self::validate_port::<
+                crate::dataflow::channel_operators::OutputReceiver<T, D>,
+                crate::dataflow::channel_operators::ProjectedOutputReceiver<D>,
+            >(&w.output_receivers, idx, name, type_name, "output")?;
         }
         let mut receivers = Vec::with_capacity(self.num_workers);
         for w in &mut self.workers {
@@ -4903,13 +4918,10 @@ impl<T: Timestamp> MultiSpawnedDataflow<T> {
     ) -> Result<Vec<crate::dataflow::channel_operators::AsyncInputSender<T, D>>> {
         let type_name = std::any::type_name::<D>();
         for (idx, w) in self.workers.iter().enumerate() {
-            Self::validate_port::<crate::dataflow::channel_operators::AsyncInputSender<T, D>>(
-                &w.input_senders,
-                idx,
-                name,
-                type_name,
-                "input",
-            )?;
+            Self::validate_port::<
+                crate::dataflow::channel_operators::AsyncInputSender<T, D>,
+                crate::dataflow::channel_operators::AsyncInputSender<T, D>,
+            >(&w.input_senders, idx, name, type_name, "input")?;
         }
         let mut senders = Vec::with_capacity(self.num_workers);
         for w in &mut self.workers {
@@ -4932,13 +4944,10 @@ impl<T: Timestamp> MultiSpawnedDataflow<T> {
     ) -> Result<Vec<crate::dataflow::channel_operators::AsyncOutputReceiver<T, D>>> {
         let type_name = std::any::type_name::<D>();
         for (idx, w) in self.workers.iter().enumerate() {
-            Self::validate_port::<crate::dataflow::channel_operators::AsyncOutputReceiver<T, D>>(
-                &w.output_receivers,
-                idx,
-                name,
-                type_name,
-                "output",
-            )?;
+            Self::validate_port::<
+                crate::dataflow::channel_operators::AsyncOutputReceiver<T, D>,
+                crate::dataflow::channel_operators::ProjectedAsyncOutputReceiver<D>,
+            >(&w.output_receivers, idx, name, type_name, "output")?;
         }
         let mut receivers = Vec::with_capacity(self.num_workers);
         for w in &mut self.workers {
@@ -4954,8 +4963,10 @@ impl<T: Timestamp> MultiSpawnedDataflow<T> {
     // -- Validation helpers ------------------------------------------------
 
     /// Check that a worker has a port with the given name, data type, and
-    /// concrete channel type (sync vs async), without consuming it.
-    fn validate_port<C: 'static>(
+    /// concrete channel type (sync vs async), without consuming it. `Alt` is
+    /// an alternative channel type accepted for the same port (the projected
+    /// receiver of an output declared inside an `iterate` body).
+    fn validate_port<C: 'static, Alt: 'static>(
         ports: &[(String, &'static str, Box<dyn std::any::Any + Send>)],
         worker_idx: usize,
         name: &str,
@@ -4971,7 +4982,7 @@ impl<T: Timestamp> MultiSpawnedDataflow<T> {
                     "worker {worker_idx} {direction} port '{name}' has type {port_type}, but requested {type_name}"
                 ))))
             }
-            Some((_, _, any_box)) if !any_box.is::<C>() => {
+            Some((_, _, any_box)) if !any_box.is::<C>() && !any_box.is::<Alt>() => {
                 Err(Error::Runtime(RuntimeError::InvalidConfig(format!(
                     "worker {worker_idx} {direction} port '{name}' channel mode mismatch \
                      (sync port with async take, or vice versa)"
@@ -5778,32 +5789,28 @@ fn materialize_executor<T: Timestamp>(
     // so the tracker broadcasts capability changes to peers and absorbs
     // remote changes. This makes is_completed() reflect global state.
     let mut tracker = worker_subgraph_builder.build();
+    // A tracker attached to cross-worker progress channels has the global view
+    // of every probed stream, so a probe it writes is only fully observed once
+    // every worker's view is in. A worker-local tracker (single worker, or
+    // worker-local materialization such as `SimpleRuntime::spawn_multi`)
+    // observes only its own worker, and each such worker builds its own probes,
+    // so its writer alone covers the probe.
+    let probe_view_workers = if progress_channels.is_some() {
+        worker_context.num_workers()
+    } else {
+        1
+    };
     if let Some(channels) = progress_channels {
         tracker.set_progress_channels(channels)?;
     }
     tracker.initialize()?;
     executor.set_progress_tracker(tracker);
 
-    // Register probes.
-    //
-    // TODO(multi-worker): In build-once-materialize-N, all workers clone the
-    // same ProbeHandle/ProbeNotifier pair, so each worker writes its local
-    // frontier to the same watch channel (last-writer-wins). For correct
-    // multi-worker probes, we need per-worker probe notifiers with a
-    // runtime-level aggregation step that computes the global frontier
-    // (pointwise minimum) before updating the user-visible ProbeHandle.
-    debug_assert_eq!(
-        dataflow.probes.len(),
-        dataflow.probe_notifiers.len(),
-        "probes and probe_notifiers must have matching lengths"
-    );
-    for ((op_idx, probe), notifier) in dataflow
-        .probes
-        .iter()
-        .cloned()
-        .zip(dataflow.probe_notifiers.iter().cloned())
-    {
-        executor.register_probe(op_idx, probe, notifier);
+    // Register probes. Each worker attaches its own writer to every probe; a
+    // probe shared by several workers (build-once-materialize-N) reports the
+    // monotone meet of their views (see `dataflow::probe`).
+    for registration in &dataflow.probes {
+        executor.register_probe(registration, probe_view_workers);
     }
 
     Ok(executor)

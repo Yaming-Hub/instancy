@@ -175,12 +175,18 @@ Unlike `map`, the predicate receives a reference (`&x`), since filter doesn't tr
 Limit the number of elements or stop at a condition:
 
 ```rust
-// Keep only the first 100 elements (across all timestamps)
+// Keep only the first 100 elements (across all timestamps), per worker
 stream.take("first_100", 100);
 
 // Keep elements while a condition holds; stop permanently after first failure
 stream.take_while("positive", |_time, x| *x > 0);
 ```
+
+Both limits apply **per worker**: with several workers, each passes through its
+own first 100 elements. For a global limit, route the stream to one worker
+first (e.g. `stream.exchange("one", |_| 0u8).take("first_100", 100)`). After the
+limit is reached the operator keeps draining its input, so the branch completes
+when its input completes rather than early.
 
 #### Flat Map
 

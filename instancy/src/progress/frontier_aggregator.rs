@@ -1,6 +1,3 @@
-#[cfg(debug_assertions)]
-#[allow(unused_imports)]
-use crate::order::PartialOrder;
 use crate::progress::frontier::Antichain;
 use crate::progress::timestamp::Timestamp;
 
@@ -51,9 +48,9 @@ impl<T: Timestamp> FrontierAggregator<T> {
     /// Replaces the frontier for one sender.
     ///
     /// The new frontier must represent forward progress: every element in the
-    /// old frontier must be `less_equal` to some element in the new frontier.
-    /// In practice, frontiers only advance (timestamps get larger or the
-    /// frontier becomes empty).
+    /// new frontier must be `>=` some element of the old frontier (the set of
+    /// times the sender may still produce can only shrink). An empty new
+    /// frontier (meaning "done") always satisfies this.
     ///
     /// # Panics
     ///
@@ -70,19 +67,12 @@ impl<T: Timestamp> FrontierAggregator<T> {
             "sender {sender} already marked done; cannot update frontier"
         );
 
-        // Monotonicity: every old frontier element must be <= some new element.
-        // An empty new frontier (meaning "done") always satisfies this.
+        // Monotonicity: every new frontier element must be >= some old element.
         debug_assert!(
-            self.sender_frontiers[sender]
+            frontier
                 .elements()
                 .iter()
-                .all(|old_t| {
-                    frontier.elements().is_empty()
-                        || frontier
-                            .elements()
-                            .iter()
-                            .any(|new_t| old_t.less_equal(new_t))
-                }),
+                .all(|new_t| self.sender_frontiers[sender].less_equal(new_t)),
             "frontier must not regress: old={:?}, new={:?}",
             self.sender_frontiers[sender],
             frontier
@@ -262,6 +252,37 @@ mod tests {
 
         aggregator.update_sender(0, Antichain::from_elem(9));
         aggregator.update_sender(0, Antichain::from_elem(3));
+    }
+
+    #[test]
+    fn partial_order_advance_that_drops_an_element_is_accepted() {
+        // {(0,5),(5,0)} -> {(6,0)} is forward progress: (6,0) >= (5,0), and
+        // (0,5) is no longer reachable. The old check rejected this.
+        let mut aggregator = FrontierAggregator::<Product<u64, u64>>::new(1);
+        aggregator.update_sender(
+            0,
+            Antichain::from_elem_iter([Product::new(0, 5), Product::new(5, 0)]),
+        );
+        aggregator.update_sender(0, Antichain::from_elem(Product::new(6, 0)));
+        assert_eq!(
+            aggregator.frontier(),
+            &Antichain::from_elem(Product::new(6, 0))
+        );
+    }
+
+    #[cfg(debug_assertions)]
+    #[test]
+    #[should_panic(expected = "frontier must not regress")]
+    fn partial_order_regression_that_adds_an_incomparable_element_panics() {
+        // {(5,5)} -> {(5,5),(0,10)}: (0,10) is not >= (5,5), so the sender can
+        // suddenly produce times it had already ruled out. The old check
+        // accepted this because every old element is <= some new element.
+        let mut aggregator = FrontierAggregator::<Product<u64, u64>>::new(1);
+        aggregator.update_sender(0, Antichain::from_elem(Product::new(5, 5)));
+        aggregator.update_sender(
+            0,
+            Antichain::from_elem_iter([Product::new(5, 5), Product::new(0, 10)]),
+        );
     }
 
     #[test]

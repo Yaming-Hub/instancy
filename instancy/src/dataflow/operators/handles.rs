@@ -13,6 +13,7 @@
 use std::collections::VecDeque;
 use std::fmt;
 
+use crate::error::{Error, ProgressError, Result};
 use crate::progress::capability::Capability;
 use crate::progress::frontier::Antichain;
 use crate::progress::notificator::Notificator;
@@ -73,6 +74,11 @@ impl<T: Timestamp, D> InputHandle<T, D> {
     /// Number of pending batches.
     pub fn pending_count(&self) -> usize {
         self.pending.len()
+    }
+
+    /// Timestamps of the batches currently pending in this handle.
+    pub(crate) fn pending_times(&self) -> impl Iterator<Item = &T> {
+        self.pending.iter().map(|(time, _)| time)
     }
 
     /// Whether the input is complete (exhausted and no pending data).
@@ -355,6 +361,19 @@ impl<T: Timestamp + fmt::Debug> fmt::Debug for NotificationHandle<T> {
 /// })
 /// ```
 ///
+/// # Which times may be requested
+///
+/// [`notify_at(time)`](Self::notify_at) is only valid for a time the operator
+/// can legitimately hold a capability for: a time at or after (in the partial
+/// order) its current input frontier, a capability it holds (or held when the
+/// activation started, so a notification handler may re-arm or delay the time
+/// it is handling), or the time of an input batch available in this
+/// activation. Any other time has already been passed by the frontier, so
+/// holding a capability for it would move downstream frontiers backwards; such
+/// a request is rejected and fails the operator with
+/// [`ProgressError::InvalidNotificationTime`]. Use
+/// [`try_notify_at`](Self::try_notify_at) to handle the rejection instead.
+///
 /// # Thread safety
 ///
 /// `NotifyContext` is not `Send` or `Sync` — it borrows the operator's internal
@@ -374,6 +393,18 @@ pub struct NotifyContext<'a, T: Timestamp> {
     /// data at that time. Dropping a capability (via next_notification or explicitly)
     /// decrements the pointstamp count, allowing downstream frontiers to advance.
     capabilities: &'a mut Vec<Capability<T>>,
+
+    /// Times the operator held when this activation started: its capabilities
+    /// and the times of the available input batches. Like a held capability,
+    /// an available message at time `t` entitles the operator to a capability
+    /// at any time `>= t`. A capability dropped by `next_notification` during
+    /// the activation still justifies requests, because its drop and the new
+    /// capability are reported to the progress tracker together.
+    activation_times: Antichain<T>,
+
+    /// First invalid `notify_at` request of this activation, reported as the
+    /// activation's error once the operator logic returns.
+    error: Option<Error>,
 }
 
 impl<'a, T: Timestamp> NotifyContext<'a, T> {
@@ -381,15 +412,43 @@ impl<'a, T: Timestamp> NotifyContext<'a, T> {
     ///
     /// Called by `WiredUnaryNotifyOperator::activate()` before invoking the
     /// user closure. The borrows are released when the closure returns.
+    /// `activation_times` are the times of the capabilities held and of the
+    /// input batches available when the activation starts.
     pub(crate) fn new(
         notificator: &'a mut Notificator<T>,
         reporter: &'a ProgressReporter<T>,
         capabilities: &'a mut Vec<Capability<T>>,
+        activation_times: Antichain<T>,
     ) -> Self {
         Self {
             notificator,
             reporter,
             capabilities,
+            activation_times,
+            error: None,
+        }
+    }
+
+    /// Takes the error recorded by an invalid [`notify_at`](Self::notify_at).
+    pub(crate) fn take_error(&mut self) -> Option<Error> {
+        self.error.take()
+    }
+
+    /// Checks that the operator may hold a capability at `time`.
+    fn check_time(&self, time: &T) -> Result<()> {
+        if self.notificator.frontier().less_equal(time)
+            || self
+                .capabilities
+                .iter()
+                .any(|cap| cap.time().less_equal(time))
+            || self.activation_times.less_equal(time)
+        {
+            Ok(())
+        } else {
+            Err(Error::Progress(ProgressError::InvalidNotificationTime {
+                time: format!("{time:?}"),
+                frontier: format!("{:?}", self.notificator.frontier().elements()),
+            }))
         }
     }
 
@@ -423,10 +482,26 @@ impl<'a, T: Timestamp> NotifyContext<'a, T> {
     /// - **Not consuming notifications**: If you call `notify_at()` but never call
     ///   `next_notification()`, capabilities accumulate and downstream operators
     ///   will stall indefinitely.
-    /// - **Late notifications**: Calling `notify_at(time)` when the frontier has
-    ///   already advanced past `time` will cause the notification to fire immediately
-    ///   on the next activation.
+    /// - **Past times**: `time` must be at or after the input frontier, a
+    ///   capability held at the start of the activation, or the time of an
+    ///   input batch available in this activation (see the
+    ///   [type-level docs](Self#which-times-may-be-requested)). A valid request
+    ///   whose time the frontier has already passed (e.g. re-arming the time
+    ///   being handled, or a batch that arrived late) fires on the next
+    ///   activation. An invalid request is ignored and fails the operator once
+    ///   its logic returns; use [`try_notify_at`](Self::try_notify_at) to
+    ///   handle it instead.
     pub fn notify_at(&mut self, time: T) {
+        if let Err(error) = self.try_notify_at(time) {
+            self.error.get_or_insert(error);
+        }
+    }
+
+    /// Like [`notify_at`](Self::notify_at), but returns an error (and requests
+    /// nothing) if `time` is not a time the operator can hold, instead of
+    /// failing the operator.
+    pub fn try_notify_at(&mut self, time: T) -> Result<()> {
+        self.check_time(&time)?;
         // Only create a new capability if we don't already hold one at this time.
         // The notificator deduplicates notification requests internally, but without
         // this guard, repeated calls (e.g., once per data item) would create redundant
@@ -445,6 +520,7 @@ impl<'a, T: Timestamp> NotifyContext<'a, T> {
         // When the input frontier advances past `time`, the notificator will
         // mark this as "ready" and the executor will re-activate the operator.
         self.notificator.notify_at(time);
+        Ok(())
     }
 
     /// Consume the next ready notification, if any.

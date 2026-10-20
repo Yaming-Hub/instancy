@@ -27,7 +27,7 @@ use crate::cancellation::CancellationToken;
 use crate::dataflow::channels::wake::WakeHandle;
 use crate::dataflow::control::{ControlReceiver, ControlSender, WorkerControl};
 use crate::dataflow::graph::DataflowGraph;
-use crate::dataflow::probe::ProbeHandle;
+use crate::dataflow::probe::{AttachedProbe, ProbeRegistration};
 use crate::dataflow::schedulable::{
     ActivationOutcome, ChannelEndpoints, ChannelFactory, OperatorFactory, SchedulableOperator,
     group_by_port,
@@ -463,13 +463,10 @@ pub struct DataflowExecutor<T: Timestamp = u64> {
     /// Per-operator notificators, indexed by position in `operators` vec.
     /// Only populated when a progress tracker is attached.
     notificators: Vec<Option<Notificator<T>>>,
-    /// Registered probes: (operator_index, probe_handle).
-    /// Updated during progress propagation with the operator's input frontier.
-    probes: Vec<(usize, ProbeHandle<T>)>,
-    /// Async notifiers for registered probes.
-    /// Each probe has a corresponding notifier that wakes async waiters.
-    /// Indices correspond 1:1 with `probes`.
-    probe_notifiers: Vec<crate::dataflow::probe::ProbeNotifier<T>>,
+    /// Registered probes, each observing one stream (an operator output).
+    /// Updated during progress propagation with the stream's frontier; drained
+    /// (and told the executor finished) on completion.
+    probes: Vec<AttachedProbe<T>>,
     /// Number of external input sources still open (e.g., channel-based inputs
     /// fed by the caller via `DataflowHandle`). While > 0, the executor will
     /// not declare quiescence — it waits for external data instead.
@@ -798,7 +795,6 @@ impl<T: Timestamp> DataflowExecutor<T> {
             progress_tracker: None,
             notificators: Vec::new(),
             probes: Vec::new(),
-            probe_notifiers: Vec::new(),
             external_inputs_open: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             wake_handle,
             consecutive_idle: 0,
@@ -907,27 +903,43 @@ impl<T: Timestamp> DataflowExecutor<T> {
         self.progress_tracker = Some(tracker);
     }
 
-    /// Register a probe handle to observe the frontier at a specific operator.
+    /// Register a probe observing the stream at `registration.operator`'s
+    /// output `registration.output`.
     ///
     /// The probe's frontier is updated during each progress propagation step
-    /// with the operator's input frontier (the combined frontier of all inputs).
+    /// with the stream's frontier (see [`ProgressTracker::stream_frontier`]).
+    /// `total_workers` is the number of workers in this executor's dataflow;
+    /// the probe uses it to decide whether its writers cover every worker.
     /// On registration, the probe is immediately seeded with the current frontier.
-    ///
-    /// The notifier is stored to send async notifications when the frontier changes.
     pub(crate) fn register_probe(
         &mut self,
-        operator_index: usize,
-        probe: ProbeHandle<T>,
-        notifier: crate::dataflow::probe::ProbeNotifier<T>,
+        registration: &ProbeRegistration<T>,
+        total_workers: usize,
     ) {
-        // Seed the probe with the current frontier from the tracker.
+        let mut probe = AttachedProbe::new(registration, total_workers);
         if let Some(ref tracker) = self.progress_tracker {
-            let frontier = tracker.operator_input_frontier_meet(operator_index);
-            probe.update_frontier(&frontier);
-            notifier.notify(&frontier);
+            if tracker.all_peers_synced() {
+                probe
+                    .writer
+                    .update(&tracker.stream_frontier(probe.operator, probe.output));
+            }
         }
-        self.probes.push((operator_index, probe));
-        self.probe_notifiers.push(notifier);
+        self.probes.push(probe);
+    }
+
+    /// Reports this executor's completion to its probes (once).
+    fn finish_probes(&mut self) {
+        if self.probes.is_empty() {
+            return;
+        }
+        let tracker = self
+            .progress_tracker
+            .as_ref()
+            .filter(|tracker| tracker.all_peers_synced());
+        for mut probe in self.probes.drain(..) {
+            let last = tracker.map(|tracker| tracker.stream_frontier(probe.operator, probe.output));
+            probe.writer.finish(last.as_ref());
+        }
     }
 
     /// Attach cross-worker control broadcast sender and receiver.
@@ -1227,18 +1239,19 @@ impl<T: Timestamp> DataflowExecutor<T> {
             }
         }
 
-        // Update registered probes with current frontiers.
+        // Update registered probes with the frontiers of their streams. Until
+        // every peer's initial capabilities have been absorbed, this worker's
+        // view may be missing remote work, so it is not reported.
         if !self.probes.is_empty() {
             let tracker = self.progress_tracker.as_ref().ok_or_else(|| {
                 Error::Dataflow(DataflowError::InvalidGraph(
                     "progress tracker missing while probes are registered".into(),
                 ))
             })?;
-            for (i, (op_idx, probe)) in self.probes.iter().enumerate() {
-                let frontier = tracker.operator_input_frontier_meet(*op_idx);
-                probe.update_frontier(&frontier);
-                if let Some(notifier) = self.probe_notifiers.get(i) {
-                    notifier.notify(&frontier);
+            if tracker.all_peers_synced() {
+                for probe in &mut self.probes {
+                    let frontier = tracker.stream_frontier(probe.operator, probe.output);
+                    probe.writer.update(&frontier);
                 }
             }
         }
@@ -1585,6 +1598,10 @@ impl<T: Timestamp> DataflowExecutor<T> {
         };
 
         let outcome = self.run_one_sweep_inner()?;
+
+        if matches!(outcome, SweepOutcome::Completed) {
+            self.finish_probes();
+        }
 
         // Record scheduling overhead = total sweep time - operator activation time.
         // Operator time is already accumulated via record_activation() inside the
@@ -2017,7 +2034,6 @@ mod tests {
                 progress_tracker: None,
                 notificators: Vec::new(),
                 probes: Vec::new(),
-                probe_notifiers: Vec::new(),
                 external_inputs_open: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
                 wake_handle: WakeHandle::new(),
                 consecutive_idle: 0,
@@ -2140,7 +2156,6 @@ mod tests {
             progress_tracker: None,
             notificators: Vec::new(),
             probes: Vec::new(),
-            probe_notifiers: Vec::new(),
             external_inputs_open: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             wake_handle: WakeHandle::new(),
             consecutive_idle: 0,
@@ -2190,7 +2205,6 @@ mod tests {
             progress_tracker: None,
             notificators: Vec::new(),
             probes: Vec::new(),
-            probe_notifiers: Vec::new(),
             external_inputs_open: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             wake_handle: WakeHandle::new(),
             consecutive_idle: 0,
@@ -2244,7 +2258,6 @@ mod tests {
             progress_tracker: None,
             notificators: Vec::new(),
             probes: Vec::new(),
-            probe_notifiers: Vec::new(),
             external_inputs_open: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             wake_handle: WakeHandle::new(),
             consecutive_idle: 0,
@@ -2286,7 +2299,6 @@ mod tests {
             progress_tracker: None,
             notificators: Vec::new(),
             probes: Vec::new(),
-            probe_notifiers: Vec::new(),
             external_inputs_open: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             wake_handle: WakeHandle::new(),
             consecutive_idle: 0,
@@ -2363,7 +2375,6 @@ mod tests {
             progress_tracker: None,
             notificators: Vec::new(),
             probes: Vec::new(),
-            probe_notifiers: Vec::new(),
             external_inputs_open: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             wake_handle: WakeHandle::new(),
             consecutive_idle: 0,
@@ -2449,7 +2460,6 @@ mod tests {
             progress_tracker: None,
             notificators: Vec::new(),
             probes: Vec::new(),
-            probe_notifiers: Vec::new(),
             external_inputs_open: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             wake_handle: WakeHandle::new(),
             consecutive_idle: 0,
@@ -2517,7 +2527,6 @@ mod tests {
             progress_tracker: None,
             notificators: Vec::new(),
             probes: Vec::new(),
-            probe_notifiers: Vec::new(),
             external_inputs_open: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             wake_handle: WakeHandle::new(),
             consecutive_idle: 0,
@@ -2571,7 +2580,6 @@ mod tests {
             progress_tracker: None,
             notificators: vec![Some(Notificator::new(Antichain::from_elem(0u64)))],
             probes: Vec::new(),
-            probe_notifiers: Vec::new(),
             external_inputs_open: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             wake_handle: WakeHandle::new(),
             consecutive_idle: 0,
@@ -2638,7 +2646,6 @@ mod tests {
             progress_tracker: None,
             notificators: vec![Some(Notificator::new(Antichain::new()))],
             probes: Vec::new(),
-            probe_notifiers: Vec::new(),
             external_inputs_open: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             wake_handle: WakeHandle::new(),
             consecutive_idle: 0,
@@ -2698,7 +2705,6 @@ mod tests {
             progress_tracker: None,
             notificators: Vec::new(),
             probes: Vec::new(),
-            probe_notifiers: Vec::new(),
             external_inputs_open: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             wake_handle: WakeHandle::new(),
             consecutive_idle: 0,
@@ -2780,7 +2786,6 @@ mod tests {
             progress_tracker: None,
             notificators: Vec::new(),
             probes: Vec::new(),
-            probe_notifiers: Vec::new(),
             external_inputs_open: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(1)),
             wake_handle: WakeHandle::new(),
             consecutive_idle: 0,
@@ -2875,7 +2880,6 @@ mod tests {
             progress_tracker: None,
             notificators: Vec::new(),
             probes: Vec::new(),
-            probe_notifiers: Vec::new(),
             external_inputs_open: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(1)),
             wake_handle: WakeHandle::new(),
             consecutive_idle: 0,
@@ -2944,7 +2948,6 @@ mod tests {
             progress_tracker: None,
             notificators: Vec::new(),
             probes: Vec::new(),
-            probe_notifiers: Vec::new(),
             external_inputs_open: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             wake_handle: WakeHandle::new(),
             consecutive_idle: 0,
@@ -3386,7 +3389,6 @@ mod tests {
             progress_tracker: None,
             notificators: Vec::new(),
             probes: Vec::new(),
-            probe_notifiers: Vec::new(),
             external_inputs_open: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             wake_handle: wake_handle.clone(),
             consecutive_idle: 0,
@@ -3467,7 +3469,6 @@ mod tests {
             progress_tracker: None,
             notificators: Vec::new(),
             probes: Vec::new(),
-            probe_notifiers: Vec::new(),
             external_inputs_open: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             wake_handle: WakeHandle::new(),
             consecutive_idle: 0,
@@ -3523,7 +3524,6 @@ mod tests {
             progress_tracker: None,
             notificators: Vec::new(),
             probes: Vec::new(),
-            probe_notifiers: Vec::new(),
             external_inputs_open: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             wake_handle: WakeHandle::new(),
             consecutive_idle: 0,
@@ -3591,7 +3591,6 @@ mod tests {
             progress_tracker: None,
             notificators: Vec::new(),
             probes: Vec::new(),
-            probe_notifiers: Vec::new(),
             external_inputs_open: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             wake_handle: WakeHandle::new(),
             consecutive_idle: 0,
@@ -3648,7 +3647,6 @@ mod tests {
             progress_tracker: None,
             notificators: Vec::new(),
             probes: Vec::new(),
-            probe_notifiers: Vec::new(),
             external_inputs_open: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             wake_handle: WakeHandle::new(),
             consecutive_idle: 0,
@@ -3704,7 +3702,6 @@ mod tests {
             progress_tracker: None,
             notificators: Vec::new(),
             probes: Vec::new(),
-            probe_notifiers: Vec::new(),
             external_inputs_open: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             wake_handle: WakeHandle::new(),
             consecutive_idle: 0,
@@ -3760,7 +3757,6 @@ mod tests {
             progress_tracker: None,
             notificators: Vec::new(),
             probes: Vec::new(),
-            probe_notifiers: Vec::new(),
             external_inputs_open: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             wake_handle: WakeHandle::new(),
             consecutive_idle: 0,
@@ -3851,7 +3847,6 @@ mod tests {
             progress_tracker: None,
             notificators: Vec::new(),
             probes: Vec::new(),
-            probe_notifiers: Vec::new(),
             external_inputs_open: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             wake_handle: WakeHandle::new(),
             consecutive_idle: 0,
@@ -3920,7 +3915,6 @@ mod tests {
             progress_tracker: None,
             notificators: Vec::new(),
             probes: Vec::new(),
-            probe_notifiers: Vec::new(),
             external_inputs_open: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             wake_handle: WakeHandle::new(),
             consecutive_idle: 0,
@@ -3987,7 +3981,6 @@ mod tests {
             progress_tracker: None,
             notificators: Vec::new(),
             probes: Vec::new(),
-            probe_notifiers: Vec::new(),
             external_inputs_open: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             wake_handle: WakeHandle::new(),
             consecutive_idle: 0,
@@ -4057,7 +4050,6 @@ mod tests {
             progress_tracker: None,
             notificators: Vec::new(),
             probes: Vec::new(),
-            probe_notifiers: Vec::new(),
             external_inputs_open: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             wake_handle: WakeHandle::new(),
             consecutive_idle: 0,
@@ -4141,7 +4133,6 @@ mod tests {
             progress_tracker: None,
             notificators: Vec::new(),
             probes: Vec::new(),
-            probe_notifiers: Vec::new(),
             external_inputs_open: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             wake_handle: WakeHandle::new(),
             consecutive_idle: 0,
@@ -4198,7 +4189,6 @@ mod tests {
             progress_tracker: None,
             notificators: Vec::new(),
             probes: Vec::new(),
-            probe_notifiers: Vec::new(),
             external_inputs_open: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             wake_handle: WakeHandle::new(),
             consecutive_idle: 0,

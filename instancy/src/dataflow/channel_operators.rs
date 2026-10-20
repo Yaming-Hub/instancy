@@ -453,14 +453,24 @@ impl<T: Timestamp, D: Send + 'static> SchedulableOperator for ChannelSourceOpera
 /// keeps consuming its input and discards it, so upstream operators never
 /// block on the abandoned port and the dataflow completes normally once its
 /// inputs close.
-pub struct ChannelSinkOperator<T: Timestamp, D: Send + 'static> {
+///
+/// The event type `E` is `OutputEvent<T, D>` for ordinary outputs. Outputs
+/// declared inside an `iterate` body send events whose timestamp has been
+/// projected onto the dataflow's (root) timestamp and type-erased.
+pub struct ChannelSinkOperator<
+    T: Timestamp,
+    D: Send + 'static,
+    E: Send + 'static = OutputEvent<T, D>,
+> {
     name: String,
     index: usize,
     stage_id: StageId,
     input_puller: Box<dyn Pull<T, D>>,
-    sender: OutputSend<OutputEvent<T, D>>,
+    sender: OutputSend<E>,
+    /// Builds the event sent for a `(time, data)` batch.
+    make_event: Box<dyn Fn(T, Vec<D>) -> E + Send>,
     /// Buffered output event that couldn't be sent due to channel full.
-    pending_send: Option<OutputEvent<T, D>>,
+    pending_send: Option<E>,
     /// The receiver is gone; input is consumed and discarded.
     receiver_dropped: bool,
     input_exhausted: bool,
@@ -476,12 +486,34 @@ impl<T: Timestamp, D: Send + 'static> ChannelSinkOperator<T, D> {
         input_puller: Box<dyn Pull<T, D>>,
         sender: OutputSend<OutputEvent<T, D>>,
     ) -> Self {
+        Self::with_event_fn(
+            name,
+            index,
+            stage_id,
+            input_puller,
+            sender,
+            Box::new(OutputEvent::data),
+        )
+    }
+}
+
+impl<T: Timestamp, D: Send + 'static, E: Send + 'static> ChannelSinkOperator<T, D, E> {
+    /// Create a channel sink operator that builds its events with `make_event`.
+    pub(crate) fn with_event_fn(
+        name: String,
+        index: usize,
+        stage_id: StageId,
+        input_puller: Box<dyn Pull<T, D>>,
+        sender: OutputSend<E>,
+        make_event: Box<dyn Fn(T, Vec<D>) -> E + Send>,
+    ) -> Self {
         Self {
             name,
             index,
             stage_id,
             input_puller,
             sender,
+            make_event,
             pending_send: None,
             receiver_dropped: false,
             input_exhausted: false,
@@ -491,7 +523,7 @@ impl<T: Timestamp, D: Send + 'static> ChannelSinkOperator<T, D> {
 
     /// Forward an event unless the receiver is gone. Returns `false` (and
     /// keeps the event) if the channel is full.
-    fn forward(&mut self, event: OutputEvent<T, D>) -> bool {
+    fn forward(&mut self, event: E) -> bool {
         if self.receiver_dropped {
             return true;
         }
@@ -509,7 +541,9 @@ impl<T: Timestamp, D: Send + 'static> ChannelSinkOperator<T, D> {
     }
 }
 
-impl<T: Timestamp, D: Send + 'static> SchedulableOperator for ChannelSinkOperator<T, D> {
+impl<T: Timestamp, D: Send + 'static, E: Send + 'static> SchedulableOperator
+    for ChannelSinkOperator<T, D, E>
+{
     fn activate(&mut self) -> Result<ActivationOutcome> {
         if self.done {
             return Ok(ActivationOutcome::Done);
@@ -531,7 +565,8 @@ impl<T: Timestamp, D: Send + 'static> SchedulableOperator for ChannelSinkOperato
                     made_progress = true;
                     match envelope.payload {
                         crate::dataflow::channels::envelope::Payload::Data { time, data } => {
-                            if !self.forward(OutputEvent::data(time, data)) {
+                            let event = (self.make_event)(time, data);
+                            if !self.forward(event) {
                                 // Channel full — stop pulling, will retry next activation
                                 return Ok(ActivationOutcome::BlockedOnBackpressure);
                             }
@@ -713,6 +748,40 @@ impl<T: Timestamp, D: Send + 'static> InputSender<T, D> {
     pub fn close(self) {}
 }
 
+/// An output batch whose timestamp has been projected onto the dataflow's root
+/// timestamp and type-erased. Sent by outputs declared inside `iterate`
+/// bodies, whose stream timestamp (`Product<T, _>`) differs from the
+/// dataflow's `T`.
+pub(crate) type ErasedOutputEvent<D> = (Box<dyn std::any::Any + Send>, Vec<D>);
+
+/// Converts an erased batch back into an [`OutputEvent`] at the root timestamp.
+fn unerase_event<T: Timestamp, D>((time, data): ErasedOutputEvent<D>) -> OutputEvent<T, D> {
+    let time = time
+        .downcast::<T>()
+        // The projection is built by `iterate` and always yields the root timestamp.
+        .expect("nested output timestamp must project onto the dataflow timestamp");
+    OutputEvent::data(*time, data)
+}
+
+/// Spawn-time receiver of an output declared inside an `iterate` body (sync mode).
+/// Converted into an [`OutputReceiver`] by `take_output`.
+pub(crate) struct ProjectedOutputReceiver<D> {
+    pub(crate) receiver: mpsc::Receiver<ErasedOutputEvent<D>>,
+    pub(crate) wake_handle: Option<WakeHandle>,
+}
+
+/// Spawn-time receiver of an output declared inside an `iterate` body (async
+/// mode). Converted into an [`AsyncOutputReceiver`] by `take_async_output`.
+pub(crate) struct ProjectedAsyncOutputReceiver<D> {
+    pub(crate) receiver: tokio::sync::mpsc::Receiver<ErasedOutputEvent<D>>,
+    pub(crate) wake_handle: Option<WakeHandle>,
+}
+
+enum OutputRecv<T: Timestamp, D> {
+    Typed(mpsc::Receiver<OutputEvent<T, D>>),
+    Projected(mpsc::Receiver<ErasedOutputEvent<D>>),
+}
+
 /// A handle for receiving output from a dataflow output port.
 ///
 /// Created by [`crate::SpawnedDataflow::take_output`]. Receives [`OutputEvent`]s
@@ -721,17 +790,22 @@ impl<T: Timestamp, D: Send + 'static> InputSender<T, D> {
 /// Dropping the receiver abandons the port: the dataflow keeps running and
 /// discards the port's output instead of blocking on it. An untaken port is
 /// treated the same way once the handle is joined or dropped.
+///
+/// For an output declared inside an `iterate` body, each batch is delivered at
+/// the dataflow's (outer) timestamp: a batch produced at `Product(t, i)`
+/// arrives at time `t`.
 pub struct OutputReceiver<T: Timestamp, D: Send + 'static> {
-    receiver: mpsc::Receiver<OutputEvent<T, D>>,
+    receiver: OutputRecv<T, D>,
     /// Notifies the executor when the receiver is dropped, so a sink blocked
-    /// on a full channel observes the disconnect promptly.
+    /// on a full channel observes the disconnect promptly. Declared after
+    /// `receiver` so the channel disconnects before the wake.
     _wake_on_drop: WakeOnDrop,
 }
 
 impl<T: Timestamp, D: Send + 'static> OutputReceiver<T, D> {
     pub(crate) fn new(receiver: mpsc::Receiver<OutputEvent<T, D>>) -> Self {
         Self {
-            receiver,
+            receiver: OutputRecv::Typed(receiver),
             _wake_on_drop: WakeOnDrop(None),
         }
     }
@@ -741,8 +815,15 @@ impl<T: Timestamp, D: Send + 'static> OutputReceiver<T, D> {
         wake_handle: WakeHandle,
     ) -> Self {
         Self {
-            receiver,
+            receiver: OutputRecv::Typed(receiver),
             _wake_on_drop: WakeOnDrop(Some(wake_handle)),
+        }
+    }
+
+    pub(crate) fn from_projected(receiver: ProjectedOutputReceiver<D>) -> Self {
+        Self {
+            receiver: OutputRecv::Projected(receiver.receiver),
+            _wake_on_drop: WakeOnDrop(receiver.wake_handle),
         }
     }
 
@@ -750,17 +831,26 @@ impl<T: Timestamp, D: Send + 'static> OutputReceiver<T, D> {
     ///
     /// Returns `None` when the dataflow completes and the output channel is closed.
     pub fn recv(&self) -> Option<OutputEvent<T, D>> {
-        self.receiver.recv().ok()
+        match &self.receiver {
+            OutputRecv::Typed(rx) => rx.recv().ok(),
+            OutputRecv::Projected(rx) => rx.recv().ok().map(unerase_event),
+        }
     }
 
     /// Try to receive the next output event (non-blocking).
     pub fn try_recv(&self) -> Option<OutputEvent<T, D>> {
-        self.receiver.try_recv().ok()
+        match &self.receiver {
+            OutputRecv::Typed(rx) => rx.try_recv().ok(),
+            OutputRecv::Projected(rx) => rx.try_recv().ok().map(unerase_event),
+        }
     }
 
     /// Receive with a timeout.
     pub fn recv_timeout(&self, timeout: Duration) -> Option<OutputEvent<T, D>> {
-        self.receiver.recv_timeout(timeout).ok()
+        match &self.receiver {
+            OutputRecv::Typed(rx) => rx.recv_timeout(timeout).ok(),
+            OutputRecv::Projected(rx) => rx.recv_timeout(timeout).ok().map(unerase_event),
+        }
     }
 
     /// Collect all output events into a vector (blocking until completion).
@@ -887,6 +977,11 @@ impl<T: Timestamp, D: Send + 'static> AsyncInputSender<T, D> {
     pub fn close(self) {}
 }
 
+enum AsyncOutputRecv<T: Timestamp, D> {
+    Typed(tokio::sync::mpsc::Receiver<OutputEvent<T, D>>),
+    Projected(tokio::sync::mpsc::Receiver<ErasedOutputEvent<D>>),
+}
+
 /// A handle for receiving output from a dataflow output port asynchronously.
 ///
 /// Created by [`crate::SpawnedDataflow::take_async_output`] when the dataflow was
@@ -899,8 +994,11 @@ impl<T: Timestamp, D: Send + 'static> AsyncInputSender<T, D> {
 ///
 /// Dropping the receiver abandons the port: the dataflow keeps running and
 /// discards the port's output instead of blocking on it.
+///
+/// For an output declared inside an `iterate` body, each batch is delivered at
+/// the dataflow's (outer) timestamp, as for [`OutputReceiver`].
 pub struct AsyncOutputReceiver<T: Timestamp, D: Send + 'static> {
-    receiver: tokio::sync::mpsc::Receiver<OutputEvent<T, D>>,
+    receiver: AsyncOutputRecv<T, D>,
     /// Wake handle to notify when capacity is freed (unblocks backpressured sinks).
     wake_handle: Option<WakeHandle>,
 }
@@ -908,7 +1006,7 @@ pub struct AsyncOutputReceiver<T: Timestamp, D: Send + 'static> {
 impl<T: Timestamp, D: Send + 'static> AsyncOutputReceiver<T, D> {
     pub(crate) fn new(receiver: tokio::sync::mpsc::Receiver<OutputEvent<T, D>>) -> Self {
         Self {
-            receiver,
+            receiver: AsyncOutputRecv::Typed(receiver),
             wake_handle: None,
         }
     }
@@ -918,8 +1016,15 @@ impl<T: Timestamp, D: Send + 'static> AsyncOutputReceiver<T, D> {
         wake_handle: WakeHandle,
     ) -> Self {
         Self {
-            receiver,
+            receiver: AsyncOutputRecv::Typed(receiver),
             wake_handle: Some(wake_handle),
+        }
+    }
+
+    pub(crate) fn from_projected(receiver: ProjectedAsyncOutputReceiver<D>) -> Self {
+        Self {
+            receiver: AsyncOutputRecv::Projected(receiver.receiver),
+            wake_handle: receiver.wake_handle,
         }
     }
 
@@ -929,7 +1034,10 @@ impl<T: Timestamp, D: Send + 'static> AsyncOutputReceiver<T, D> {
     /// closed. Notifies the executor's wake handle after each successful
     /// receive so that backpressure-blocked sinks can retry.
     pub async fn recv(&mut self) -> Option<OutputEvent<T, D>> {
-        let result = self.receiver.recv().await;
+        let result = match &mut self.receiver {
+            AsyncOutputRecv::Typed(rx) => rx.recv().await,
+            AsyncOutputRecv::Projected(rx) => rx.recv().await.map(unerase_event),
+        };
         if result.is_some() {
             if let Some(wh) = &self.wake_handle {
                 wh.notify();
@@ -940,7 +1048,10 @@ impl<T: Timestamp, D: Send + 'static> AsyncOutputReceiver<T, D> {
 
     /// Try to receive the next output event (non-blocking).
     pub fn try_recv(&mut self) -> Option<OutputEvent<T, D>> {
-        let result = self.receiver.try_recv().ok();
+        let result = match &mut self.receiver {
+            AsyncOutputRecv::Typed(rx) => rx.try_recv().ok(),
+            AsyncOutputRecv::Projected(rx) => rx.try_recv().ok().map(unerase_event),
+        };
         if result.is_some() {
             if let Some(wh) = &self.wake_handle {
                 wh.notify();

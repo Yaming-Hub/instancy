@@ -44,6 +44,11 @@ input
 
 ### Track dataflow progress with a probe
 `probe()` returns a handle you can poll from outside the dataflow to check completion.
+The probe reports the frontier of the stream it is attached to: `done_with(&t)` becomes
+true once no more data at time `t` can appear on that stream (including data an
+upstream operator is still holding back, e.g. a `unary_notify` operator with a pending
+notification). With several workers the probe reports the meet of their views and
+never moves backwards.
 
 ```rust
 use instancy::{DataflowBuilder, RuntimeConfig, RuntimeHandle, SpawnOptions};

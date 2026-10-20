@@ -168,6 +168,48 @@ RESERVED_CHANNEL_BASE, CHANNEL_NAMESPACE_SIZE}`.
 - Cancellation tokens hold weak wake-handle registrations, so a runtime's root
   token no longer grows with every dataflow ever spawned.
 
+### Probe, notification, and iterate correctness
+
+- Probes report the frontier of the stream they are attached to (the producing
+  operator's capabilities plus everything upstream), not the producing
+  operator's input frontier. A probe on an input now advances, and a probe
+  after `unary_notify`/`reduce`/`delay` waits for that operator's output.
+- Probes shared by several workers report the monotone meet of the workers'
+  views instead of the last writer's view, so they never move backwards. In
+  modes that build the dataflow once per worker with per-worker progress
+  tracking (`spawn_multi` when stages have differing parallelism,
+  `SimpleRuntime::spawn_multi`), each worker's probe becomes done when that
+  worker completes. In a cluster, each worker's probe keeps its last (global)
+  view when that worker completes (worker
+  completion does not yet wait for peers' final progress), so it may not
+  become done after a successful run.
+- Notifications that complete together are delivered in timestamp order (a
+  linear extension of the partial order). `Timestamp`'s `Ord` must extend the
+  partial order, as the built-in timestamps do.
+- **BREAKING:** `NotifyContext::notify_at` fails the operator with the new
+  `ProgressError::InvalidNotificationTime` when the requested time is neither
+  at/after the input frontier, a capability held at the start of the
+  activation, nor a pending input time, instead of minting a capability that
+  moves downstream frontiers backwards. Re-arming or delaying the time being
+  handled inside a notification handler remains valid.
+  `NotifyContext::try_notify_at` returns the error instead. `delay` rejects
+  delays to incomparable (not only earlier) times.
+- Nested `iterate` scopes build and run (the feedback-factory offset was
+  computed after the body's feedback edges were appended), and in-flight
+  accounting for an `exchange` in a doubly-nested body is projected through
+  every scope level (it previously ran unaccounted, which could complete the
+  outer epoch early and drop results with several workers). `probe()` and
+  `output()` inside an `iterate` body are no longer silently dropped. Inner
+  outputs deliver batches at the dataflow's outer timestamp. Inner probes stay
+  at the minimum time until the workers writing them have completed, then
+  become done (never, in a cluster): data circulating on a loop's feedback
+  edge is not yet visible to progress tracking, so no earlier answer is safe.
+  Probes downstream of a loop can still report an epoch complete while the
+  loop iterates it (pre-existing).
+- `take`/`take_while` documentation now states their per-worker semantics.
+- `ChangeBatch` drops a lone zero-valued update; the `FrontierAggregator`
+  debug monotonicity check no longer rejects valid partial-order advances.
+
 ## [0.1.3] - 2026-10-15
 
 ### Added
