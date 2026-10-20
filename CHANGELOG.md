@@ -73,8 +73,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   tore down, and flushes its queued frames before unregistering, so a peer
   that is still draining receives its final progress.
 - Wire protocol: new progress end-of-stream and acknowledgement frames
-  (reserved progress counts `u32::MAX` and `u32::MAX - 1`); nodes must run
-  the same version.
+  (reserved progress counts `u32::MAX` and `u32::MAX - 1`).
+  `CLUSTER_PROTOCOL_VERSION` is now 3, so the handshake rejects peers that
+  lack them; nodes must run the same version.
 
 ### Input contract hardening
 
@@ -108,8 +109,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Cluster protocol and topology hardening
 
-**BREAKING (wire format):** this release speaks cluster protocol version 2
-(`instancy::communication::CLUSTER_PROTOCOL_VERSION`). Nodes running 0.1.x
+**BREAKING (wire format):** this release speaks cluster protocol version 3
+(`instancy::communication::CLUSTER_PROTOCOL_VERSION`; version 2 added the
+changes below, version 3 the shutdown handshake frames described under
+"Graceful cluster teardown"). Nodes running 0.1.x
 cannot join a cluster with nodes running this release; without frame CRC the
 handshake rejects them with `HandshakeError::ProtocolVersionMismatch` (an
 unversioned 0.1.x handshake is reported as version 1). With

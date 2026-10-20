@@ -158,9 +158,9 @@ async fn run(congest: bool, capacity: usize, pipe: usize) -> (Vec<u64>, Vec<u64>
     valve.open();
     let input_a = feeder.await.unwrap();
 
-    // Keep the inputs open until every record has arrived, so neither node
-    // can finish (and tear down its link) while records are still in transit:
-    // a teardown race tracked separately.
+    // Keep the inputs open until every record has arrived, so no worker can
+    // declare completion early while records are still in transit (audit
+    // C1/H1, tracked separately).
     let deadline = Instant::now() + Duration::from_secs(15);
     while arrived.load(Ordering::SeqCst) < 2 * BATCHES as usize && Instant::now() < deadline {
         tokio::time::sleep(Duration::from_millis(5)).await;

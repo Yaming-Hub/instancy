@@ -794,6 +794,12 @@ async fn peer_cancel_followed_by_local_drain_success_does_not_hang() {
 /// is stuck behind a paused link, and node-b, already draining, does not
 /// echo the Cancel). node-a's workers drain and succeed: having told every
 /// peer the dataflow is cancelled, it must not wait for their goodbyes.
+///
+/// node-a's only worker is busy in the slow map when the cancellation lands,
+/// so the Cancel is broadcast before the worker succeeds. (With an instant
+/// pipeline the drain, which closes the inputs itself, can finish before the
+/// coordinator sees the cancellation; that is a cancellation racing with
+/// success, which is not broadcast.)
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
 async fn local_success_after_broadcasting_cancel_does_not_wait_for_peers() {
     for mode in MODES {
@@ -804,21 +810,26 @@ async fn local_success_after_broadcasting_cancel_does_not_wait_for_peers() {
             1024,
             |_, _| Duration::ZERO,
             drain_on_cancel_at_a,
-            pipeline,
+            slow_pipeline,
         )
         .await;
         let valve = cluster.mesh.valve("b", "a");
         valve.pause();
         let jb = cluster.join("b", Duration::from_secs(15));
-        cluster.send_and_close("b", 0..10);
+        cluster.send_and_close("b", 0..1);
         // node-b finishes; its goodbye to node-a is held by the valve.
         cluster.wait_finished("b", Duration::from_secs(10));
+        // Feed node-a but leave its inputs open: the cancellation's graceful
+        // drain closes them (admission gate) and then succeeds.
+        for input in &cluster.node("a").inputs {
+            input.send(0, vec![1]).unwrap();
+        }
         let a = cluster.node("a").cluster.take().unwrap();
         a.cancel();
         // node-b receives the Cancel (a -> b is open) and stops waiting for us.
         tokio::time::sleep(Duration::from_millis(300)).await;
         let ja = join_with_timeout(a, Duration::from_secs(5));
-        cluster.send_and_close("a", 0..10);
+        cluster.node("a").inputs.clear();
         let ra = ja.await.unwrap();
         valve.resume();
         let rb = jb.await.unwrap();

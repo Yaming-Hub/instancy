@@ -95,8 +95,12 @@ pub enum ControlProtocolError {
 /// Covers everything two nodes must agree on to run a dataflow together: the
 /// frame layout, the channel-id namespaces, the control messages, the graph
 /// fingerprint, and the key-routing hash. Nodes reject peers whose version
-/// differs during the handshake. Version 1 is the unversioned 0.1.x protocol.
-pub const PROTOCOL_VERSION: u32 = 2;
+/// differs during the handshake. Version 1 is the unversioned 0.1.x protocol;
+/// version 2 added the versioned handshake, namespaced channel ids and header
+/// CRCs; version 3 adds the in-band progress end-of-stream and acknowledgement
+/// frames of the clean shutdown handshake (see `docs/design/cluster.md`
+/// §5.5.3).
+pub const PROTOCOL_VERSION: u32 = 3;
 
 /// Protocol version reported for an unversioned (0.1.x) handshake.
 #[cfg(feature = "transport")]

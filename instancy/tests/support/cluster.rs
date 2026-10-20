@@ -58,8 +58,9 @@ pub struct ClusterSpec {
     /// the timeout passes), so no node can finish while records are still on
     /// their way to another node.
     ///
-    /// Sidesteps a known teardown race, tracked separately, in which the node
-    /// that finishes first drops frames still queued for its peers.
+    /// Sidesteps a known premature-completion bug, tracked separately (audit
+    /// C1/H1): once the inputs close, a worker can declare completion while
+    /// records are still in flight or held by a blocked operator.
     pub hold_inputs_until: Option<usize>,
 }
 
@@ -69,8 +70,6 @@ impl ClusterSpec {
             workers: workers.to_vec(),
             mode,
             capacity,
-            // Shared runs can end in the tolerated teardown hang; don't wait
-            // longer than needed for it.
             timeout: Duration::from_secs(if mode == Mode::Shared { 30 } else { 60 }),
             hold_inputs_until: None,
         }
@@ -125,26 +124,7 @@ impl Outcome {
     }
 
     fn assert_joined(&self, what: &str) {
-        if self.all_joined() {
-            return;
-        }
-        // Shared mode only: after delivering every record exactly once (checked
-        // by the caller), the node that finishes first can drop its last
-        // progress frames on teardown and leave a peer waiting forever. That
-        // race is tracked separately; tolerate exactly that shape and nothing
-        // else. TODO: remove once Shared-mode teardown flushes queued frames.
-        let teardown_race = self.mode == Mode::Shared
-            && self.joins.iter().any(|j| j.is_ok())
-            && self
-                .joins
-                .iter()
-                .all(|j| j.as_ref().map_or_else(|e| e.starts_with(TIMEOUT), |_| true));
-        assert!(teardown_race, "{what}: joins = {:?}", self.joins);
-        eprintln!(
-            "{what}: all records delivered exactly once; tolerating the known Shared-mode \
-             teardown hang: joins = {:?}",
-            self.joins
-        );
+        assert!(self.all_joined(), "{what}: joins = {:?}", self.joins);
     }
 }
 

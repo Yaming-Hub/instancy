@@ -315,7 +315,10 @@ another thread drives the runtime, block normally.
 **Failure paths.** If a local worker fails (or the dataflow is cancelled
 before local completion), the coordinator broadcasts `Cancel` (bounded by
 `handshake_timeout`), waits for the local workers to stop, and tears down
-without sending a goodbye. `Cancel` therefore acts as a terminal goodbye in
+without sending a goodbye. The `Cancel` carries the local cancellation
+reason, and a peer treats a forwarded failure as a failure (it never drains
+into a partial result); a node whose bridges are stopped from outside while
+its workers run reports a network error. `Cancel` therefore acts as a terminal goodbye in
 both directions: a node that receives a peer's `Cancel` (in any phase) stops
 waiting for that peer, and a node that broadcast `Cancel` but whose workers
 still succeed (the cancellation raced with completion) queues its goodbye and

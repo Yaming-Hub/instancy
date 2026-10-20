@@ -867,6 +867,21 @@ async fn sleep_until_opt(deadline: Option<tokio::time::Instant>) {
     }
 }
 
+/// Reason text sent to peers with `Cancel`; peers classify it (a forwarded
+/// failure is itself a failure, so they never drain into a partial result).
+fn cancel_broadcast_reason(dataflow_cancel: &CancellationToken) -> String {
+    match dataflow_cancel.reason() {
+        Some(reason) => reason.to_string(),
+        None if dataflow_cancel.is_cancelled() => "cancelled".to_string(),
+        // Not cancelled: the bridges were stopped from outside while the
+        // workers ran, so this node abandons a running dataflow.
+        None => CancellationReason::NetworkError {
+            detail: "the node stopped its network bridges while its workers were running".into(),
+        }
+        .to_string(),
+    }
+}
+
 /// Everything a cluster dataflow needs until teardown, plus the coordinator
 /// state. Field order matters: `_teardown` is dropped last so waiters resolve
 /// only after every resource has been released.
@@ -983,11 +998,7 @@ impl ClusterLifecycle {
                 false
             }
             Action::BroadcastCancel => {
-                let reason = self
-                    .dataflow_cancel
-                    .reason()
-                    .map(|reason| reason.to_string())
-                    .unwrap_or_else(|| "cluster worker failed".to_string());
+                let reason = cancel_broadcast_reason(&self.dataflow_cancel);
                 let _ = tokio::time::timeout(
                     self.cancel_broadcast_timeout,
                     broadcast_cancel_with_transport(&self.transport, self.dataflow_id, &reason),
@@ -1171,6 +1182,40 @@ mod tests {
 
     fn is_teardown(actions: &[Action], graceful: bool) -> bool {
         matches!(actions.last(), Some(Action::Teardown { graceful: g }) if *g == graceful)
+    }
+
+    #[test]
+    fn broadcast_reasons_are_classified_like_the_local_cause() {
+        let forwarded = |token: &CancellationToken| CancellationReason::PeerCancelled {
+            peer_id: "a".into(),
+            detail: cancel_broadcast_reason(token),
+        };
+        // Abandoning a running dataflow (bridges stopped from outside).
+        let token = CancellationToken::new();
+        assert!(forwarded(&token).is_failure());
+        // Failures this coordinator cancels with stay failures at peers.
+        for reason in [
+            CancellationReason::NetworkError {
+                detail: "data lost".into(),
+            },
+            CancellationReason::InternalError {
+                detail: "lock poisoned".into(),
+            },
+            CancellationReason::WorkerFailed {
+                detail: "boom".into(),
+            },
+        ] {
+            let token = CancellationToken::new();
+            token.cancel_with_reason(reason);
+            assert!(forwarded(&token).is_failure());
+        }
+        // A requested stop lets peers drain.
+        let token = CancellationToken::new();
+        token.cancel_with_reason(CancellationReason::UserRequested);
+        assert!(!forwarded(&token).is_failure());
+        let token = CancellationToken::new();
+        token.cancel();
+        assert!(!forwarded(&token).is_failure());
     }
 
     #[test]

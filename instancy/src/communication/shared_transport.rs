@@ -69,9 +69,21 @@ pub const PROBE_CHANNEL_ID: u64 = u64::MAX;
 
 /// Reserved channel ID for flush barriers on the payload queue.
 ///
-/// Never sent on the wire: the bridge task consumes a barrier when it reaches
-/// it and wakes the matching [`SharedPeerManager::flush_dataflow`] caller.
+/// Lies in the reserved namespace (`RESERVED_CHANNEL_BASE ..= u64::MAX`), next
+/// to [`PROBE_CHANNEL_ID`] and away from the inter-process progress channel
+/// (`RESERVED_CHANNEL_BASE` itself). Never sent on the wire: the bridge task
+/// consumes a barrier when it reaches it and wakes the matching
+/// [`SharedPeerManager::flush_dataflow`] caller, and
+/// [`SharedPeerManager::register_dataflow`] refuses it as a channel.
 const FLUSH_BARRIER_CHANNEL_ID: u64 = u64::MAX - 1;
+
+const _: () = {
+    use crate::communication::transport_session::RESERVED_CHANNEL_BASE;
+    assert!(FLUSH_BARRIER_CHANNEL_ID >= RESERVED_CHANNEL_BASE);
+    assert!(FLUSH_BARRIER_CHANNEL_ID != PROBE_CHANNEL_ID);
+    // The inter-process progress channel is the first reserved id.
+    assert!(FLUSH_BARRIER_CHANNEL_ID != RESERVED_CHANNEL_BASE);
+};
 
 /// Waiters for in-flight flush barriers, keyed by barrier token.
 type FlushBarriers = Arc<Mutex<HashMap<u64, tokio::sync::oneshot::Sender<()>>>>;
@@ -486,10 +498,10 @@ impl SharedPeerManager {
     /// # Errors
     ///
     /// Returns [`TransportError::InvalidRegistration`] without registering
-    /// anything if `channel_capacity` is 0, `channel_ids` contains a duplicate
-    /// or [`PROBE_CHANNEL_ID`], or `dataflow_id` is already registered with
-    /// this manager. (Previously a second registration silently replaced the
-    /// first one's receivers.)
+    /// anything if `channel_capacity` is 0, `channel_ids` contains a duplicate,
+    /// [`PROBE_CHANNEL_ID`] or the local flush-barrier id (`u64::MAX - 1`), or
+    /// `dataflow_id` is already registered with this manager. (Previously a
+    /// second registration silently replaced the first one's receivers.)
     pub async fn register_dataflow(
         &self,
         dataflow_id: DataflowId,
@@ -511,6 +523,11 @@ impl SharedPeerManager {
             if ch_id == PROBE_CHANNEL_ID {
                 return Err(invalid(format!(
                     "channel {PROBE_CHANNEL_ID} is reserved for connection probes"
+                )));
+            }
+            if ch_id == FLUSH_BARRIER_CHANNEL_ID {
+                return Err(invalid(format!(
+                    "channel {FLUSH_BARRIER_CHANNEL_ID} is reserved for flush barriers"
                 )));
             }
             if !seen.insert(ch_id) {
@@ -2148,6 +2165,36 @@ mod tests {
         // Probe channel ID should not conflict with normal channels
         assert_eq!(PROBE_CHANNEL_ID, u64::MAX);
         assert_ne!(PROBE_CHANNEL_ID, 0); // not control
+    }
+
+    #[test]
+    fn flush_barrier_id_collides_with_nothing() {
+        use crate::communication::interprocess::PROGRESS_CHANNEL_ID as INTERPROCESS_PROGRESS;
+        for other in [PROBE_CHANNEL_ID, CONTROL_CHANNEL_ID, INTERPROCESS_PROGRESS] {
+            assert_ne!(FLUSH_BARRIER_CHANNEL_ID, other);
+        }
+    }
+
+    #[tokio::test]
+    async fn register_rejects_the_flush_barrier_channel() {
+        let (manager_stream, _test_stream) = duplex(1 << 16);
+        let (mgr_read, mgr_write) = tokio::io::split(manager_stream);
+        let config = SharedConnectionConfig {
+            probe_interval: Duration::from_secs(999),
+            ..Default::default()
+        };
+        let rt = tokio::runtime::Handle::current();
+        let factory: Arc<dyn DynConnectionFactory> =
+            Arc::new(PreEstablishedFactory::new(vec![(mgr_read, mgr_write)]));
+        let manager =
+            SharedPeerManager::new("peer".to_string(), config, factory, &rt, health_tx()).unwrap();
+        let result = manager
+            .register_dataflow(DataflowId::new(), &[1, FLUSH_BARRIER_CHANNEL_ID], 4)
+            .await;
+        assert!(
+            matches!(result, Err(TransportError::InvalidRegistration { .. })),
+            "the flush-barrier id must not be registrable"
+        );
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
