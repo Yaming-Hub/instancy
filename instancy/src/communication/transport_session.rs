@@ -144,6 +144,9 @@ struct SessionState {
     /// They terminate naturally when all senders close.
     _bridge_handles: Vec<tokio::task::JoinHandle<()>>,
     demux_handles: Vec<tokio::task::JoinHandle<()>>,
+    /// Cancelled when the session is dropped; releases writers parked after
+    /// a write error (see [`TransportSession::bridge_task`]).
+    closed: tokio_util::sync::CancellationToken,
 }
 
 #[cfg(feature = "transport")]
@@ -157,6 +160,7 @@ impl Drop for SessionState {
         for handle in &self.demux_handles {
             handle.abort();
         }
+        self.closed.cancel();
     }
 }
 
@@ -258,6 +262,7 @@ impl TransportSession {
         let mut control_senders = HashMap::new();
         let mut bridge_handles = Vec::new();
         let mut demux_handles = Vec::new();
+        let closed = tokio_util::sync::CancellationToken::new();
         let mut all_receivers: HashMap<String, HashMap<u64, tokio_mpsc::Receiver<Vec<u8>>>> =
             HashMap::new();
 
@@ -274,8 +279,9 @@ impl TransportSession {
             // Spawn bridge task
             let writer = conn.writer;
             let peer_id = peer_node_id.clone();
+            let session_closed = closed.clone();
             let bridge_handle = runtime_handle.spawn(async move {
-                Self::bridge_task(peer_id, writer, control_rx, payload_rx).await;
+                Self::bridge_task(peer_id, writer, control_rx, payload_rx, session_closed).await;
             });
             bridge_handles.push(bridge_handle);
 
@@ -312,6 +318,7 @@ impl TransportSession {
         let state = std::sync::Arc::new(SessionState {
             _bridge_handles: bridge_handles,
             demux_handles,
+            closed,
         });
 
         let session = Self {
@@ -365,11 +372,18 @@ impl TransportSession {
     /// delivery guarantees receivers see data before the frontier advances.
     ///
     /// The task exits when both channels are closed (all senders dropped).
+    ///
+    /// After a write error it stops accepting frames, so senders see the
+    /// failure, but keeps the writer until the session is dropped. Dropping
+    /// a write half can half-close the connection (e.g. `OwnedWriteHalf`),
+    /// and the peer would read that as this node leaving, although only a
+    /// local write failed and this node has not decided anything yet.
     async fn bridge_task<W: AsyncWrite + Unpin>(
         _peer_id: String,
         writer: W,
         mut control_rx: tokio_mpsc::Receiver<Frame>,
         mut payload_rx: tokio_mpsc::Receiver<Frame>,
+        session_closed: tokio_util::sync::CancellationToken,
     ) {
         let mut framed_writer = FramedWriter::new(writer);
         let mut control_open = true;
@@ -396,6 +410,8 @@ impl TransportSession {
             if let Err(_e) = framed_writer.write_frame(&frame).await {
                 #[cfg(feature = "tracing")]
                 tracing::error!("Bridge write error for peer {}: {_e}", _peer_id);
+                drop((control_rx, payload_rx));
+                session_closed.cancelled().await;
                 break;
             }
         }
@@ -958,6 +974,92 @@ mod tests {
 
         // Tasks should clean up promptly. Verify no panic or hang.
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+
+    /// A writer whose every write fails; records when it is dropped.
+    struct FailingWriter(std::sync::Arc<std::sync::atomic::AtomicBool>);
+
+    impl AsyncWrite for FailingWriter {
+        fn poll_write(
+            self: std::pin::Pin<&mut Self>,
+            _: &mut std::task::Context<'_>,
+            _: &[u8],
+        ) -> std::task::Poll<std::io::Result<usize>> {
+            std::task::Poll::Ready(Err(std::io::Error::other("injected write failure")))
+        }
+
+        fn poll_flush(
+            self: std::pin::Pin<&mut Self>,
+            _: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            std::task::Poll::Ready(Ok(()))
+        }
+
+        fn poll_shutdown(
+            self: std::pin::Pin<&mut Self>,
+            _: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            std::task::Poll::Ready(Ok(()))
+        }
+    }
+
+    impl Drop for FailingWriter {
+        fn drop(&mut self) {
+            self.0.store(true, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+
+    /// A local write error must not close the connection (dropping a write
+    /// half such as `OwnedWriteHalf` sends the peer a FIN): senders see the
+    /// failure at once, the peer only when the session is dropped.
+    #[tokio::test]
+    async fn write_failure_keeps_the_writer_until_the_session_drops() {
+        let df_id = make_dataflow_id();
+        let (_peer_end, reader) = tokio::io::duplex(1024);
+        let dropped = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let (session, _receivers) = TransportSession::new(
+            df_id,
+            vec![PeerConnection {
+                node_id: "peer".into(),
+                reader,
+                writer: FailingWriter(std::sync::Arc::clone(&dropped)),
+            }],
+            &[],
+            &[],
+            4,
+            &tokio::runtime::Handle::current(),
+        )
+        .unwrap();
+        let tx = session.data_sender("peer").unwrap().clone();
+        let failed = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                let frame = Frame {
+                    dataflow_id: df_id,
+                    channel_id: 1,
+                    payload: vec![1],
+                };
+                if tx.send(frame).await.is_err() {
+                    return;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            }
+        })
+        .await;
+        assert!(failed.is_ok(), "senders must see the write failure");
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        assert!(
+            !dropped.load(std::sync::atomic::Ordering::SeqCst),
+            "the writer must stay open until the session is dropped"
+        );
+        drop(tx);
+        drop(session);
+        let released = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            while !dropped.load(std::sync::atomic::Ordering::SeqCst) {
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            }
+        })
+        .await;
+        assert!(released.is_ok(), "dropping the session releases the writer");
     }
 
     /// Regression test: verifies that data and progress frames sent by a

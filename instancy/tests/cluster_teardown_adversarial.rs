@@ -180,6 +180,29 @@ impl Cluster {
         join_with_timeout(self.node(name).cluster.take().unwrap(), timeout)
     }
 
+    /// Wait until every worker of `name` has finished and reported its result
+    /// to the node's lifecycle coordinator, instead of guessing with a sleep
+    /// on a loaded machine. Outputs close when the operators are dropped,
+    /// slightly before the result is reported; `active_dataflows` reaches zero
+    /// only after the report has been queued for the coordinator.
+    fn wait_finished(&mut self, name: &str, timeout: Duration) {
+        let deadline = std::time::Instant::now() + timeout;
+        for out in &mut self.node(name).outs {
+            assert!(
+                out.wait_closed(timeout),
+                "{name}'s workers did not finish within {timeout:?}"
+            );
+        }
+        let rt = &self.node(name).rt;
+        while rt.active_dataflows() > 0 {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "{name}'s workers did not report within {timeout:?}"
+            );
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
+
     /// Collect every node's output sum; errors if an output never closed.
     fn total(&mut self) -> std::result::Result<i64, String> {
         let mut total = 0;
@@ -789,7 +812,7 @@ async fn local_success_after_broadcasting_cancel_does_not_wait_for_peers() {
         let jb = cluster.join("b", Duration::from_secs(15));
         cluster.send_and_close("b", 0..10);
         // node-b finishes; its goodbye to node-a is held by the valve.
-        tokio::time::sleep(Duration::from_millis(300)).await;
+        cluster.wait_finished("b", Duration::from_secs(10));
         let a = cluster.node("a").cluster.take().unwrap();
         a.cancel();
         // node-b receives the Cancel (a -> b is open) and stops waiting for us.
@@ -808,6 +831,186 @@ async fn local_success_after_broadcasting_cancel_does_not_wait_for_peers() {
     }
 }
 
+/// A finished and waits for acknowledgements (its outbound links are
+/// paused), B is still running, and C crashes. B must not tear down silently
+/// on C's lost link: it cancels its dataflow and tells A, which stops waiting
+/// for B. A resolves (its workers succeeded), B fails promptly, and nothing
+/// hangs.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn crash_while_a_peer_runs_cancels_it_and_releases_the_draining_node() {
+    for mode in MODES {
+        let spec = [("a", 1), ("b", 1), ("c", 1)];
+        let mut cluster = Cluster::start_with(
+            &spec,
+            mode,
+            1024,
+            |_, _| Duration::ZERO,
+            |_| SpawnOptions::new(),
+            pipeline,
+        )
+        .await;
+        let a_to_b = cluster.mesh.valve("a", "b");
+        let a_to_c = cluster.mesh.valve("a", "c");
+        a_to_b.pause();
+        a_to_c.pause();
+        let ja = cluster.join("a", Duration::from_secs(30));
+        let jb = cluster.join("b", Duration::from_secs(30));
+        let jc = cluster.join("c", Duration::from_secs(30));
+        cluster.send_and_close("a", 0..10);
+        cluster.wait_finished("a", Duration::from_secs(10));
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert!(
+            !ja.is_finished(),
+            "{mode:?}: a cannot complete before its peers acknowledge"
+        );
+
+        let crashed = std::time::Instant::now();
+        cluster.mesh.sever("c", "a");
+        cluster.mesh.sever("c", "b");
+        let rb = jb.await.unwrap();
+        let b_after = crashed.elapsed();
+        let ra = ja.await.unwrap();
+        let a_after = crashed.elapsed();
+        let rc = jc.await.unwrap();
+        a_to_b.resume();
+        a_to_c.resume();
+        let msg = format!(
+            "{mode:?}: a={} after {a_after:?}, b={} after {b_after:?}, c={}",
+            fmt_join(&ra),
+            fmt_join(&rb),
+            fmt_join(&rc)
+        );
+        if ra.is_none() || rb.is_none() || rc.is_none() {
+            cluster.leak();
+            panic!("hang: {msg}");
+        }
+        assert!(matches!(ra, Some(Ok(()))), "{msg}");
+        assert!(
+            matches!(rb, Some(Err(instancy::Error::Cancelled { .. }))),
+            "{msg}"
+        );
+        assert!(matches!(rc, Some(Err(_))), "{msg}");
+        assert!(
+            b_after < Duration::from_secs(15),
+            "b must fail promptly: {msg}"
+        );
+        cluster.shutdown().await;
+    }
+}
+
+/// How [`writer_only_failure_never_hangs_or_passes_silently`] drives node a
+/// after its writer to b broke.
+#[derive(Clone, Copy, Debug)]
+enum AfterBreak {
+    /// Keep every input open: a is still running when the grace period
+    /// expires.
+    StayRunning,
+    /// Run until the failure is noticed, then finish: a's workers succeed
+    /// although its frames to b were dropped.
+    NoticeThenFinish,
+    /// Finish at once: the failure may only be noticed while draining.
+    FinishAtOnce,
+}
+
+/// Node a's writer to b fails on a local error (an oversized frame, say)
+/// while the connection and a's reader stay up. With split stream halves (as
+/// with TLS), b sees nothing at all. A send that failed while a was running
+/// must neither leave the nodes waiting forever (it escalates once the grace
+/// period, the handshake timeout, expires) nor let a report success.
+///
+/// The writer failure is only noticed when a's next frame to b is handed to
+/// the dead writer; a's input epochs advance meanwhile to produce progress
+/// frames. Detecting a writer error by itself is PR 8's failure detection.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn writer_only_failure_never_hangs_or_passes_silently() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    for variant in [
+        AfterBreak::StayRunning,
+        AfterBreak::NoticeThenFinish,
+        AfterBreak::FinishAtOnce,
+    ] {
+        let topology =
+            ClusterTopology::multi_node(vec![NodeConfig::new("a", 1), NodeConfig::new("b", 1)])
+                .unwrap();
+        let mut mesh = Mesh::new(&["a", "b"], 1 << 16, |_, _| Duration::ZERO);
+        let broken = Arc::new(AtomicBool::new(false));
+        let id = DataflowId::new();
+        let ha = spawn_node_with_options(
+            topology.clone(),
+            "a",
+            id,
+            mesh.dedicated_breakable("a", 1024, Arc::clone(&broken)),
+            1,
+            notify_sum,
+            SpawnOptions::new(),
+        );
+        let hb = spawn_node_with_options(
+            topology,
+            "b",
+            id,
+            mesh.dedicated("b", 1024),
+            1,
+            notify_sum,
+            SpawnOptions::new(),
+        );
+        let (rt_a, a) = ha.await.unwrap();
+        let (rt_b, b) = hb.await.unwrap();
+        let (mut a, mut b) = (a.unwrap(), b.unwrap());
+        let outs = [
+            collect(a.take_output::<i64>(0, "out").unwrap()),
+            collect(b.take_output::<i64>(0, "out").unwrap()),
+        ];
+        let in_a = a.take_input::<i64>(0, "data").unwrap();
+        let in_b = b.take_input::<i64>(0, "data").unwrap();
+        let start = std::time::Instant::now();
+        let ja = join_with_timeout(a, Duration::from_secs(60));
+        let jb = join_with_timeout(b, Duration::from_secs(60));
+        broken.store(true, Ordering::SeqCst);
+        in_a.send(0, (0..100).collect()).unwrap();
+        if !matches!(variant, AfterBreak::FinishAtOnce) {
+            for epoch in 1..=50 {
+                let _ = in_a.advance_to(epoch);
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        }
+        let held = if matches!(variant, AfterBreak::StayRunning) {
+            Some((in_a, in_b))
+        } else {
+            drop((in_a, in_b));
+            None
+        };
+        let (ra, rb) = (ja.await.unwrap(), jb.await.unwrap());
+        let elapsed = start.elapsed();
+        drop(held);
+        let msg = format!(
+            "{variant:?}: a={}, b={} after {elapsed:?}",
+            fmt_join(&ra),
+            fmt_join(&rb)
+        );
+        assert!(ra.is_some() && rb.is_some(), "hang: {msg}");
+        match variant {
+            AfterBreak::StayRunning => {
+                // The failed link is fatal; b's own input is still open.
+                assert!(
+                    matches!(ra, Some(Err(instancy::Error::Cancelled { .. }))),
+                    "{msg}"
+                );
+                assert!(matches!(rb, Some(Err(_))), "{msg}");
+            }
+            AfterBreak::NoticeThenFinish => {
+                // b never received a's records; a must not report success.
+                assert!(matches!(ra, Some(Err(_))), "{msg}");
+            }
+            // A failure noticed only while draining makes a declare b lost
+            // and report its own result. Whether b then fails depends on its
+            // completion predicate (C1/C2) and PR 8; here only liveness is
+            // asserted.
+            AfterBreak::FinishAtOnce => {}
+        }
+        drop(outs);
+        drop_runtimes(vec![rt_a, rt_b]).await;
+    }
+}
 /// A node's instancy runtime is dropped (or its dataflow cancelled through the
 /// user token) after its workers finished, while its goodbye is still stuck
 /// on a congested link. That must neither cancel the peers nor lose the
@@ -840,7 +1043,8 @@ async fn local_shutdown_mid_teardown_does_not_cancel_peers() {
             let ja = cluster.join("a", Duration::from_secs(20));
             let jb = cluster.join("b", Duration::from_secs(20));
             cluster.send_and_close("a", 0..10);
-            tokio::time::sleep(Duration::from_millis(500)).await;
+            // a's workers finish; its goodbye is stuck behind the paused link.
+            cluster.wait_finished("a", Duration::from_secs(10));
             if via_token {
                 token.cancel();
             } else {

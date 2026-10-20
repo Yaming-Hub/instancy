@@ -14,10 +14,17 @@
 //! acknowledged our end-of-stream, or we have received the peer's
 //! end-of-stream. Once retired, neither side needs anything more from the
 //! other for this dataflow, so later transport failures on that link are
-//! benign and outbound data for it can be discarded.
+//! benign. Data must never be sent on a retired link: the peer has finished
+//! (or we have), so the data could never be consumed. `NetworkPush` treats
+//! that as data loss and fails the dataflow.
+//!
+//! [`InboundBridges`] tracks the tasks that deliver data frames from peers to
+//! local operators. They report frames that can no longer be delivered (the
+//! receiving operator already finished) as [`LinkEvent::InboundDataLost`],
+//! and teardown lets them finish draining before the dataflow completes.
 
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 use tokio::sync::mpsc as tokio_mpsc;
 
@@ -25,8 +32,6 @@ use crate::communication::cluster_transport::FrameSender;
 use crate::communication::transport::{Frame, TransportError};
 
 /// Why a peer link ended without a clean end-of-stream.
-// Payloads are diagnostics surfaced through `Debug` (tracing, PR8 errors).
-#[allow(dead_code)]
 #[derive(Debug)]
 pub(crate) enum LinkFailure {
     /// A receive channel closed (EOF or connection loss) before its marker.
@@ -41,6 +46,19 @@ pub(crate) enum LinkFailure {
     Encode(String),
     /// The shared transport reported a failure for this peer.
     Transport(TransportError),
+}
+
+impl std::fmt::Display for LinkFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::ChannelClosed => f.write_str("connection closed before end of stream"),
+            Self::Decode(detail) => write!(f, "undecodable frame: {detail}"),
+            Self::LockPoisoned => f.write_str("lock poisoned while delivering a frame"),
+            Self::SendFailed => f.write_str("outbound frame could not be sent"),
+            Self::Encode(detail) => write!(f, "outbound frame could not be encoded: {detail}"),
+            Self::Transport(error) => write!(f, "transport error: {error}"),
+        }
+    }
 }
 
 /// Something observed on the link to one peer.
@@ -62,6 +80,10 @@ pub(crate) enum LinkEvent {
     ControlUndecodable(String),
     /// The shared transport reported an error for this peer.
     TransportError(TransportError),
+    /// A data frame from the peer could not be delivered to the local
+    /// operator it was addressed to (the operator had already finished), or
+    /// arrived after the channel's close marker.
+    InboundDataLost(String),
 }
 
 /// Input to the cluster lifecycle coordinator.
@@ -92,13 +114,18 @@ pub(crate) struct PeerLinkState {
 
 impl PeerLinkState {
     /// Whether the link no longer carries anything either side needs.
+    ///
+    /// Sequentially consistent with [`retire`](Self::retire): a data push
+    /// that enqueues a frame and then still sees the link unretired knows
+    /// the frame was enqueued before anything the coordinator queues after
+    /// retiring the link (such as the acknowledgement).
     pub(crate) fn is_retired(&self) -> bool {
-        self.retired.load(Ordering::Acquire)
+        self.retired.load(Ordering::SeqCst)
     }
 
     /// Mark the link retired. Idempotent.
     pub(crate) fn retire(&self) {
-        self.retired.store(true, Ordering::Release);
+        self.retired.store(true, Ordering::SeqCst);
     }
 }
 
@@ -148,6 +175,93 @@ impl PeerOutbox {
     /// Report an event on this peer's link.
     pub(crate) fn report(&self, event: LinkEvent) {
         report_link_event(&self.events, &self.peer, event);
+    }
+
+    /// A reporting handle for inbound frames from this peer. Unlike the
+    /// outbox it does not keep the outbound lane open.
+    pub(crate) fn monitor(&self) -> PeerMonitor {
+        PeerMonitor {
+            peer: Arc::clone(&self.peer),
+            events: self.events.clone(),
+        }
+    }
+}
+
+/// Reports events about frames received from one peer.
+#[derive(Clone)]
+pub(crate) struct PeerMonitor {
+    peer: Arc<str>,
+    events: LifecycleEventSender,
+}
+
+impl PeerMonitor {
+    /// Report an event on this peer's link.
+    pub(crate) fn report(&self, event: LinkEvent) {
+        report_link_event(&self.events, &self.peer, event);
+    }
+}
+
+/// Tracks the inbound data bridges of one cluster dataflow.
+///
+/// Teardown asks the bridges to deliver (or report) everything already
+/// queued for them and then waits until all of them have exited, so frames
+/// that arrived before the clean-shutdown handshake completed are never
+/// discarded unseen.
+#[derive(Clone, Default)]
+pub(crate) struct InboundBridges {
+    inner: Arc<InboundInner>,
+}
+
+#[derive(Default)]
+struct InboundInner {
+    drain: tokio_util::sync::CancellationToken,
+    active: AtomicUsize,
+    idle: tokio::sync::Notify,
+}
+
+/// Held by one inbound bridge while it runs.
+pub(crate) struct InboundBridgeGuard {
+    inner: Arc<InboundInner>,
+}
+
+impl Drop for InboundBridgeGuard {
+    fn drop(&mut self) {
+        if self.inner.active.fetch_sub(1, Ordering::SeqCst) == 1 {
+            self.inner.idle.notify_waiters();
+        }
+    }
+}
+
+impl InboundBridges {
+    /// Register a bridge before spawning it.
+    pub(crate) fn register(&self) -> InboundBridgeGuard {
+        self.inner.active.fetch_add(1, Ordering::SeqCst);
+        InboundBridgeGuard {
+            inner: Arc::clone(&self.inner),
+        }
+    }
+
+    /// Token cancelled when the bridges should drain what is queued and exit.
+    pub(crate) fn drain_token(&self) -> tokio_util::sync::CancellationToken {
+        self.inner.drain.clone()
+    }
+
+    /// Ask every bridge to drain its queue and exit.
+    pub(crate) fn drain(&self) {
+        self.inner.drain.cancel();
+    }
+
+    /// Wait until every registered bridge has exited.
+    pub(crate) async fn wait_idle(&self) {
+        loop {
+            let notified = self.inner.idle.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            if self.inner.active.load(Ordering::SeqCst) == 0 {
+                return;
+            }
+            notified.await;
+        }
     }
 }
 

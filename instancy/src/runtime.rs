@@ -2806,7 +2806,7 @@ impl RuntimeHandle {
             perform_ready_barrier, perform_ready_barrier_with_transport, spawn_control_dispatcher,
         };
         use crate::communication::peer_link::{
-            LifecycleEvent, LinkEvent, report_link_event, spawn_peer_outbox,
+            InboundBridges, LifecycleEvent, LinkEvent, report_link_event, spawn_peer_outbox,
         };
         use crate::communication::transport_session::{
             CONTROL_CHANNEL_ID, ChannelRegistration, TransportSession,
@@ -3186,8 +3186,9 @@ impl RuntimeHandle {
         // channel. Progress deltas, close sentinels and the end-of-stream
         // markers all travel through these lanes (see cluster_lifecycle).
         let (events_tx, events_rx) = tokio::sync::mpsc::unbounded_channel::<LifecycleEvent>();
+        let inbound_bridges = InboundBridges::default();
         let mut outboxes = std::collections::HashMap::new();
-        let mut forwarders = Vec::new();
+        let mut forwarders = std::collections::HashMap::new();
         for peer_id in transport.peer_node_ids() {
             let payload_sender = transport.progress_sender(&peer_id).ok_or_else(|| {
                 Error::Runtime(RuntimeError::InvalidConfig(format!(
@@ -3196,8 +3197,8 @@ impl RuntimeHandle {
             })?;
             let (outbox, forwarder) =
                 spawn_peer_outbox(&peer_id, payload_sender, events_tx.clone(), runtime_handle);
-            outboxes.insert(peer_id, outbox);
-            forwarders.push(forwarder);
+            outboxes.insert(peer_id.clone(), outbox);
+            forwarders.insert(peer_id, forwarder);
         }
 
         // Phase 5: Wire exchange channels using network-backed factories.
@@ -3274,6 +3275,7 @@ impl RuntimeHandle {
                 runtime_handle: runtime_handle.clone(),
                 channel_metrics: ch_metrics,
                 peer_outboxes: outboxes.clone(),
+                inbound_bridges: inbound_bridges.clone(),
             };
             let all_factories = creator.create(params)?;
 
@@ -3537,7 +3539,7 @@ impl RuntimeHandle {
         // Phase 11: Spawn the lifecycle coordinator. It owns the transport,
         // bridges and registrations and releases them only after the clean
         // shutdown handshake (or a failure), independently of the join handle.
-        let (teardown_notifier, teardown_waiter) = teardown_signal();
+        let (teardown_notifier, teardown_waiter) = teardown_signal(runtime_handle.clone());
         {
             let peer_workers: std::collections::HashMap<String, (usize, usize)> = remote_peers
                 .iter()
@@ -3570,6 +3572,7 @@ impl RuntimeHandle {
                 cancel_broadcast_timeout: handshake_timeout,
                 outboxes,
                 forwarders,
+                inbound: inbound_bridges,
                 progress_handles: Some(progress_handles),
                 dispatcher: Some(dispatcher),
                 peer_registry: Arc::clone(&self.peer_registry),
@@ -5338,7 +5341,9 @@ impl<T: Timestamp> ClusterSpawnedDataflow<T> {
     /// Returns a [`ClusterCompletion`] that resolves once all local workers
     /// have finished **and** the cluster shutdown handshake has completed:
     /// every peer has acknowledged everything this node sent, or has finished
-    /// itself. The result is the local workers' result.
+    /// itself. The result is the local workers' result, except that records
+    /// addressed to this node that arrived after their operator finished
+    /// turn a success into [`CommunicationError::DataLoss`](crate::error::CommunicationError::DataLoss).
     ///
     /// The returned handle implements [`Future`] and can be `.await`ed in
     /// async code, or blocked on via [`.wait()`](ClusterCompletion::wait).
@@ -5370,9 +5375,10 @@ impl<T: Timestamp> ClusterSpawnedDataflow<T> {
     /// handshake has finished. See [`join()`](Self::join).
     ///
     /// The network runs on the tokio runtime passed to `spawn_cluster`, so it
-    /// must be able to make progress while this thread blocks: do not call
-    /// this from the only thread of a `current_thread` runtime that hosts the
-    /// transport (use `spawn_blocking` or `.await` the completion instead).
+    /// must be able to make progress while this thread blocks. If that is a
+    /// `current_thread` runtime driven by this very thread, this returns an
+    /// error instead of deadlocking (see [`ClusterCompletion::wait`]); use
+    /// `.await` on the completion, or block from another thread.
     pub fn join_blocking(self) -> Result<()> {
         self.join()?.wait()
     }
@@ -5420,11 +5426,19 @@ impl<T: Timestamp> ClusterCompletion<T> {
     /// Block the current thread until all workers complete and the cluster
     /// shutdown handshake has finished.
     ///
-    /// Returns `Ok(())` if all workers succeeded. On first error, cancels
-    /// remaining workers, preferring an originating failure over cancellation.
-    /// See [`ClusterSpawnedDataflow::join_blocking`] for the runtime
-    /// requirement.
+    /// Returns `Ok(())` if all workers succeeded and no records addressed to
+    /// this node were lost. On first error, cancels remaining workers,
+    /// preferring an originating failure over cancellation.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RuntimeError::InvalidConfig`] immediately, without waiting,
+    /// if the wait could never finish because the dataflow's transport runs
+    /// on a `current_thread` tokio runtime that is not making progress (for
+    /// example when called from the thread driving that runtime). The
+    /// dataflow keeps running, as if the completion had been dropped.
     pub fn wait(mut self) -> Result<()> {
+        self.teardown.check_blocking_wait()?;
         let result = match self.result.take() {
             Some(result) => result,
             None => self
@@ -5438,7 +5452,17 @@ impl<T: Timestamp> ClusterCompletion<T> {
                 .wait(),
         };
         self.teardown.wait();
-        result
+        merge_data_loss(result, self.teardown.data_loss())
+    }
+}
+
+/// Records lost on the way to this node fail an otherwise successful run;
+/// they also explain a cancellation they caused.
+#[cfg(feature = "transport")]
+fn merge_data_loss(result: Result<()>, loss: Option<cluster_lifecycle::DataLoss>) -> Result<()> {
+    match (result, loss) {
+        (Ok(()), Some(loss)) | (Err(Error::Cancelled { .. }), Some(loss)) => Err(loss.into_error()),
+        (result, _) => result,
     }
 }
 
@@ -5467,7 +5491,7 @@ impl<T: Timestamp> Future for ClusterCompletion<T> {
         }
         match this.teardown.poll_done(cx) {
             Poll::Ready(()) => match this.result.take() {
-                Some(result) => Poll::Ready(result),
+                Some(result) => Poll::Ready(merge_data_loss(result, this.teardown.data_loss())),
                 None => Poll::Ready(Err(Error::Runtime(RuntimeError::AlreadyConsumed {
                     resource: "cluster completion".into(),
                 }))),

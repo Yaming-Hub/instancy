@@ -162,6 +162,106 @@ async fn cluster_two_nodes_no_exchange() {
     assert_eq!(data_b, vec![20, 40]);
 }
 
+/// The original shape of `cluster_two_nodes_no_exchange`: the transport runs
+/// on a `current_thread` runtime and `join_blocking` is called from the
+/// thread driving it. That can never finish (the shutdown handshake needs
+/// this runtime), so it must fail promptly instead of deadlocking, and must
+/// not disturb the dataflow. Blocking from a `spawn_blocking` thread of the
+/// same runtime is fine.
+#[tokio::test(flavor = "current_thread")]
+async fn join_blocking_on_the_thread_driving_the_transport_errors_promptly() {
+    let topology = ClusterTopology::multi_node(vec![
+        NodeConfig::new("node-a", 1),
+        NodeConfig::new("node-b", 1),
+    ])
+    .unwrap();
+    let dataflow_id = DataflowId::new();
+    let (conn_a, conn_b) = make_duplex_pair("node-a", "node-b", 64 * 1024);
+    let tokio_handle = tokio::runtime::Handle::current();
+    let build = |builder: &mut DataflowBuilder<u64>| -> Result<()> {
+        builder
+            .input::<i32>("data")?
+            .map("double", |_t, x| x * 2)
+            .output("results")?;
+        Ok(())
+    };
+    let spawn = |node: &'static str, conn| {
+        let topology = topology.clone();
+        let th = tokio_handle.clone();
+        tokio::task::spawn_blocking(move || {
+            let rt = RuntimeHandle::new(RuntimeConfig {
+                worker_threads: 1,
+                ..RuntimeConfig::default()
+            })
+            .unwrap();
+            let cluster = rt.spawn_cluster(
+                "test",
+                topology,
+                node,
+                dataflow_id,
+                ClusterSpawnTransport::dedicated(vec![conn], 1024),
+                Duration::from_secs(5),
+                build,
+                &th,
+                SpawnOptions::new(),
+            );
+            cluster.map(|c| (rt, c))
+        })
+    };
+    let (result_a, result_b) = tokio::join!(spawn("node-a", conn_a), spawn("node-b", conn_b));
+    let (rt_a, mut cluster_a) = result_a.unwrap().unwrap();
+    let (rt_b, mut cluster_b) = result_b.unwrap().unwrap();
+    let output_a = cluster_a.take_output::<i32>(0, "results").unwrap();
+    let output_b = cluster_b.take_output::<i32>(0, "results").unwrap();
+    let sender_a = cluster_a.take_input::<i32>(0, "data").unwrap();
+    sender_a.send(0, vec![1, 2, 3]).unwrap();
+    drop(sender_a);
+    let sender_b = cluster_b.take_input::<i32>(0, "data").unwrap();
+    sender_b.send(0, vec![10, 20]).unwrap();
+    drop(sender_b);
+
+    let started = std::time::Instant::now();
+    let error = cluster_a
+        .join_blocking()
+        .expect_err("blocking the thread that drives the transport must fail");
+    assert!(error.to_string().contains("deadlock"), "{error}");
+    assert!(
+        started.elapsed() < Duration::from_secs(5),
+        "took {:?}",
+        started.elapsed()
+    );
+
+    // From a blocking-pool thread the runtime keeps running: this works.
+    let joined_b = tokio::time::timeout(
+        Duration::from_secs(20),
+        tokio::task::spawn_blocking(move || cluster_b.join_blocking()),
+    )
+    .await;
+    assert!(matches!(joined_b, Ok(Ok(Ok(())))), "{joined_b:?}");
+
+    // node-a's dataflow was detached, not cancelled: it completes too.
+    let deadline = std::time::Instant::now() + Duration::from_secs(20);
+    while rt_a.active_dataflows() > 0 && std::time::Instant::now() < deadline {
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert_eq!(rt_a.active_dataflows(), 0);
+    let data_a: Vec<i32> = output_a
+        .collect_data()
+        .into_iter()
+        .flat_map(|(_, d)| d)
+        .collect();
+    let data_b: Vec<i32> = output_b
+        .collect_data()
+        .into_iter()
+        .flat_map(|(_, d)| d)
+        .collect();
+    assert_eq!(data_a, vec![2, 4, 6]);
+    assert_eq!(data_b, vec![20, 40]);
+    tokio::task::spawn_blocking(move || drop((rt_a, rt_b)))
+        .await
+        .unwrap();
+}
+
 /// Two-node cluster with exchange — data is repartitioned across nodes.
 ///
 /// Each node runs 1 worker. The dataflow is:

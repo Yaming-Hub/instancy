@@ -36,10 +36,13 @@
 //! coordinator sends one end-of-stream frame
 //! ([`encode_progress_end_of_stream`]) on every progress channel to every
 //! peer, behind everything else on the lane. A receive bridge that sees it
-//! reports [`LinkEvent::ProgressEndOfStream`] and exits. A channel that ends
-//! (EOF), or fails to decode, before its end-of-stream marker is reported as
-//! [`LinkEvent::ProgressChannelEnded`]; the coordinator decides whether that is
-//! benign (the link was already retired) or a failure.
+//! reports [`LinkEvent::ProgressEndOfStream`] and exits. The acknowledgement
+//! of a peer's complete end-of-stream ([`encode_progress_ack`]) also travels
+//! on a progress channel, so it is ordered behind the sender's data; the
+//! receive bridge reports it as [`LinkEvent::AckReceived`]. A channel that
+//! ends (EOF), or fails to decode, before its end-of-stream marker is reported
+//! as [`LinkEvent::ProgressChannelEnded`]; the coordinator decides whether
+//! that is benign (the link was already retired) or a failure.
 
 #[cfg(feature = "transport")]
 use std::collections::{HashMap, VecDeque};
@@ -111,11 +114,9 @@ pub fn encode_progress_batch<T: Timestamp + ExchangeData>(
     bufs: &mut Vec<Vec<u8>>,
     max_batch_size: usize,
 ) -> Result<(), CodecError> {
-    // Cap below u32::MAX: the wire format uses a u32 count field and
-    // `u32::MAX` is reserved for the end-of-stream marker.
-    let effective_max = max_batch_size
-        .min(PROGRESS_END_OF_STREAM_COUNT as usize - 1)
-        .max(1);
+    // Cap below the reserved counts: the wire format uses a u32 count field,
+    // and `u32::MAX` / `u32::MAX - 1` mark end-of-stream / acknowledgement.
+    let effective_max = max_batch_size.min(PROGRESS_ACK_COUNT as usize - 1).max(1);
 
     // Handle empty batch: still emit one frame with count=0 + CRC.
     if changes.is_empty() {
@@ -281,18 +282,38 @@ pub fn decode_progress_batch<T: Timestamp + ExchangeData>(
 #[cfg(feature = "transport")]
 pub(crate) const PROGRESS_END_OF_STREAM_COUNT: u32 = u32::MAX;
 
+/// Count value reserved for the end-of-stream acknowledgement.
+#[cfg(feature = "transport")]
+pub(crate) const PROGRESS_ACK_COUNT: u32 = u32::MAX - 1;
+
+/// Encode a marker frame: `[count][crc32]` with a reserved count.
+#[cfg(feature = "transport")]
+fn encode_progress_marker(count: u32) -> Vec<u8> {
+    let mut buf = count.to_le_bytes().to_vec();
+    let crc = crc32fast::hash(&buf);
+    buf.extend_from_slice(&crc.to_le_bytes());
+    buf
+}
+
 /// Encode the end-of-stream marker for a progress channel.
 ///
 /// Wire format: `[count = u32::MAX][crc32]`. Real batches never use this
-/// count (the encoder caps batches at `u32::MAX - 1` changes), so the marker
+/// count (the encoder caps batches below the reserved counts), so the marker
 /// is unambiguous. It is the last frame a node sends on a progress channel
 /// during a clean shutdown.
 #[cfg(feature = "transport")]
 pub(crate) fn encode_progress_end_of_stream() -> Vec<u8> {
-    let mut buf = PROGRESS_END_OF_STREAM_COUNT.to_le_bytes().to_vec();
-    let crc = crc32fast::hash(&buf);
-    buf.extend_from_slice(&crc.to_le_bytes());
-    buf
+    encode_progress_marker(PROGRESS_END_OF_STREAM_COUNT)
+}
+
+/// Encode the acknowledgement of a peer's complete end-of-stream.
+///
+/// Wire format: `[count = u32::MAX - 1][crc32]`. It travels on the sender's
+/// payload lane, so the receiver sees it only after every data frame the
+/// sender queued before it.
+#[cfg(feature = "transport")]
+pub(crate) fn encode_progress_ack() -> Vec<u8> {
+    encode_progress_marker(PROGRESS_ACK_COUNT)
 }
 
 /// A decoded progress-channel frame.
@@ -303,15 +324,20 @@ pub(crate) enum ProgressFrame<T> {
     Batch(Vec<ProgressChange<T>>),
     /// The sender will send nothing more on this channel.
     EndOfStream,
+    /// The sender has received our complete end-of-stream.
+    Ack,
 }
 
-/// Decode a progress-channel frame: either a batch or the end-of-stream marker.
+/// Decode a progress-channel frame: a batch, the end-of-stream marker or the
+/// acknowledgement.
 #[cfg(feature = "transport")]
 pub(crate) fn decode_progress_frame<T: Timestamp + ExchangeData>(
     data: &[u8],
     max_batch_size: usize,
 ) -> Result<ProgressFrame<T>, CodecError> {
-    if data.len() == 8 && data[..4] == PROGRESS_END_OF_STREAM_COUNT.to_le_bytes() {
+    let marker = |count: u32| data.len() == 8 && data[..4] == count.to_le_bytes();
+    let is_end_of_stream = marker(PROGRESS_END_OF_STREAM_COUNT);
+    if is_end_of_stream || marker(PROGRESS_ACK_COUNT) {
         let expected_crc =
             wire::read_u32(data, 4).map_err(|e| CodecError::InvalidData(e.to_string()))?;
         let actual_crc = crc32fast::hash(&data[..4]);
@@ -321,7 +347,11 @@ pub(crate) fn decode_progress_frame<T: Timestamp + ExchangeData>(
                 actual: actual_crc,
             });
         }
-        return Ok(ProgressFrame::EndOfStream);
+        return Ok(if is_end_of_stream {
+            ProgressFrame::EndOfStream
+        } else {
+            ProgressFrame::Ack
+        });
     }
     decode_progress_batch(data, max_batch_size).map(ProgressFrame::Batch)
 }
@@ -374,6 +404,9 @@ async fn progress_recv_bridge<T: Timestamp + ExchangeData>(
                     Ok(ProgressFrame::EndOfStream) => {
                         report_link_event(&events, &peer_id, LinkEvent::ProgressEndOfStream);
                         return;
+                    }
+                    Ok(ProgressFrame::Ack) => {
+                        report_link_event(&events, &peer_id, LinkEvent::AckReceived);
                     }
                     Err(e) => {
                         #[cfg(feature = "tracing")]
@@ -799,12 +832,20 @@ mod tests {
             decode_progress_frame::<u64>(&eos, DEFAULT_MAX_BATCH_SIZE).unwrap(),
             ProgressFrame::EndOfStream
         );
-        // Legacy batch decoding never accepts the marker as a batch.
+        let ack = encode_progress_ack();
+        assert_eq!(
+            decode_progress_frame::<u64>(&ack, DEFAULT_MAX_BATCH_SIZE).unwrap(),
+            ProgressFrame::Ack
+        );
+        // Legacy batch decoding never accepts the markers as batches.
         assert!(decode_progress_batch::<u64>(&eos, DEFAULT_MAX_BATCH_SIZE).is_err());
+        assert!(decode_progress_batch::<u64>(&ack, DEFAULT_MAX_BATCH_SIZE).is_err());
 
-        let mut corrupted = eos.clone();
-        corrupted[5] ^= 0x01;
-        assert!(decode_progress_frame::<u64>(&corrupted, DEFAULT_MAX_BATCH_SIZE).is_err());
+        for marker in [&eos, &ack] {
+            let mut corrupted = marker.clone();
+            corrupted[5] ^= 0x01;
+            assert!(decode_progress_frame::<u64>(&corrupted, DEFAULT_MAX_BATCH_SIZE).is_err());
+        }
 
         let mut bufs = Vec::new();
         encode_progress_batch(
@@ -820,14 +861,15 @@ mod tests {
     }
 
     #[test]
-    fn encoder_never_emits_the_end_of_stream_count() {
+    fn encoder_never_emits_a_reserved_count() {
         // Even with an unbounded batch limit, the count field stays below the
-        // reserved marker value.
+        // reserved marker values.
         let changes = vec![ProgressChange::source(0, 0, 1u64, 1); 3];
         let mut bufs = Vec::new();
         encode_progress_batch(&changes, &mut bufs, usize::MAX).unwrap();
         for buf in bufs {
             assert_ne!(buf[..4], PROGRESS_END_OF_STREAM_COUNT.to_le_bytes());
+            assert_ne!(buf[..4], PROGRESS_ACK_COUNT.to_le_bytes());
         }
     }
 
@@ -887,6 +929,7 @@ mod tests {
         ];
         let mut bufs = Vec::new();
         encode_progress_batch(&changes, &mut bufs, DEFAULT_MAX_BATCH_SIZE).unwrap();
+        tx.send(encode_progress_ack()).await.unwrap();
         tx.send(bufs.into_iter().next().unwrap()).await.unwrap();
         tx.send(encode_progress_end_of_stream()).await.unwrap();
 
@@ -899,6 +942,14 @@ mod tests {
         let batches = receiver.drain_all().unwrap();
         assert_eq!(batches.len(), 1);
         assert_eq!(batches[0], changes);
+        // The ack does not end the channel.
+        assert!(matches!(
+            events_rx.recv().await,
+            Some(LifecycleEvent::Link {
+                event: LinkEvent::AckReceived,
+                ..
+            })
+        ));
         assert!(matches!(
             events_rx.recv().await,
             Some(LifecycleEvent::Link {

@@ -563,11 +563,18 @@ Both are queued on the sender's ordered per-peer outbox, behind every frame
 that channel carried, so a full transport queue cannot drop them (the outbox is
 unbounded; data itself stays on the bounded, backpressured path). The
 receiver acknowledges a peer's complete set of progress end-of-stream frames
-with `EndOfStreamAck` on the control channel. A channel or connection that
+with an acknowledgement frame (`[0xFFFF_FFFE][crc32]`) on a progress channel,
+queued on its own outbox: unlike a control message it cannot overtake the
+data the acknowledging node sent before it. Records addressed to a peer whose
+link is retired (it finished) fail the push with
+`CommunicationError::DataLoss`, and records that reach a node after the
+operator they are addressed to finished are reported by the inbound bridge as
+data loss; neither is ever dropped silently. A channel or connection that
 ends before its marker, on a link that has not been retired by that handshake,
 is a connection loss rather than a clean close. With shared connections, a
-dataflow that must not lose what it has queued (for example, when it gives up
-on a peer that cancelled) calls `SharedPeerManager::flush_dataflow` before
+dataflow that must not lose what it has queued (its end-of-stream markers and
+acknowledgements, or final progress for a peer that is still draining) calls
+`SharedPeerManager::flush_dataflow` before
 unregistering: it puts a local-only barrier (reserved channel ID
 `u64::MAX - 1`, never sent on the wire) on the payload queue and returns once
 the bridge task reaches it, that is, once every earlier frame has been

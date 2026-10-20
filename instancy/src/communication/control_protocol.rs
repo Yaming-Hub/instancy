@@ -40,10 +40,9 @@
 //! - Ready (type 1): `[1][node_id_len: u32 LE][node_id: UTF-8 bytes]`
 //! - Cancel (type 2): `[2][reason_len: u32 LE][reason: UTF-8 bytes]`
 //!
-//! Shutdown messages (see `docs/design/cluster.md` §5.5.3):
-//!
-//! - EndOfStreamAck (type 0x10): `[0x10]` — "I received every frame you sent
-//!   for this dataflow, including your end-of-stream markers".
+//! The clean-shutdown acknowledgement is not a control message: it travels
+//! in-band on a progress channel, behind the sender's data (see
+//! `docs/design/cluster.md` §5.5.3).
 
 #[cfg(feature = "transport")]
 use crate::cancellation::{CancellationReason, CancellationToken};
@@ -189,10 +188,6 @@ pub enum ControlMessage {
         /// Human-readable reason for cancellation.
         reason: String,
     },
-    /// Shutdown handshake: the sender has received every frame the
-    /// recipient sent for this dataflow, up to and including the recipient's
-    /// end-of-stream markers on all progress channels.
-    EndOfStreamAck,
 }
 
 #[cfg(feature = "transport")]
@@ -201,10 +196,6 @@ const MSG_TYPE_HANDSHAKE: u8 = 0;
 const MSG_TYPE_READY: u8 = 1;
 #[cfg(feature = "transport")]
 const MSG_TYPE_CANCEL: u8 = 2;
-
-// Shutdown handshake messages use a separate type range.
-#[cfg(feature = "transport")]
-const MSG_TYPE_END_OF_STREAM_ACK: u8 = 0x10;
 
 // ---------------------------------------------------------------------------
 // Encode / Decode with CRC32
@@ -240,9 +231,6 @@ pub fn encode_control_message(msg: &ControlMessage) -> Vec<u8> {
             let reason_bytes = reason.as_bytes();
             buf.extend_from_slice(&(reason_bytes.len() as u32).to_le_bytes());
             buf.extend_from_slice(reason_bytes);
-        }
-        ControlMessage::EndOfStreamAck => {
-            buf.push(MSG_TYPE_END_OF_STREAM_ACK);
         }
     }
     let crc = crc32fast::hash(&buf);
@@ -358,15 +346,6 @@ pub fn decode_control_message(data: &[u8]) -> Result<ControlMessage, ControlProt
             }
             let reason = std::str::from_utf8(&payload[5..5 + reason_len])?.to_string();
             Ok(ControlMessage::Cancel { reason })
-        }
-        MSG_TYPE_END_OF_STREAM_ACK => {
-            if payload.len() != 1 {
-                return Err(ControlProtocolError::InvalidPayloadSize {
-                    expected: 1,
-                    actual: payload.len(),
-                });
-            }
-            Ok(ControlMessage::EndOfStreamAck)
         }
         other => Err(ControlProtocolError::UnknownMessageType { msg_type: other }),
     }
@@ -871,14 +850,13 @@ pub async fn broadcast_cancel_with_transport(
 /// - `Cancel` cancels the local token with
 ///   [`CancellationReason::PeerCancelled`] and reports
 ///   [`LinkEvent::CancelReceived`](super::peer_link::LinkEvent::CancelReceived).
-/// - `EndOfStreamAck` reports
-///   [`LinkEvent::AckReceived`](super::peer_link::LinkEvent::AckReceived).
+/// - An undecodable message reports
+///   [`LinkEvent::ControlUndecodable`](super::peer_link::LinkEvent::ControlUndecodable).
 /// - A closed channel reports
 ///   [`LinkEvent::ControlClosed`](super::peer_link::LinkEvent::ControlClosed);
-///   events from one peer are reported in arrival order, so an ack is always
-///   reported before the close that follows it.
+///   events from one peer are reported in arrival order.
 ///
-/// The dispatcher keeps running after local cancellation (acknowledgements
+/// The dispatcher keeps running after local cancellation (a peer's Cancel
 /// may still arrive during the shutdown handshake) and exits when `shutdown`
 /// fires (teardown) or every channel has closed.
 ///
@@ -923,9 +901,6 @@ pub(crate) fn spawn_control_dispatcher(
                                         detail: reason,
                                     });
                                     report_link_event(&events, &peer_id, LinkEvent::CancelReceived);
-                                }
-                                Ok(ControlMessage::EndOfStreamAck) => {
-                                    report_link_event(&events, &peer_id, LinkEvent::AckReceived);
                                 }
                                 // Late handshake/ready duplicates carry no new information.
                                 Ok(_) => {}
@@ -1394,19 +1369,15 @@ mod tests {
     }
 
     #[test]
-    fn end_of_stream_ack_roundtrip_and_strict_size() {
-        let encoded = encode_control_message(&ControlMessage::EndOfStreamAck);
-        assert_eq!(
-            decode_control_message(&encoded).unwrap(),
-            ControlMessage::EndOfStreamAck
-        );
-        // Trailing bytes inside a valid CRC are rejected.
-        let mut payload = vec![MSG_TYPE_END_OF_STREAM_ACK, 0];
+    fn retired_end_of_stream_ack_type_is_unknown() {
+        // 0x10 was a pre-release control-channel ack; acks now travel in-band
+        // on progress channels, so the type must not be accepted.
+        let mut payload = vec![0x10];
         let crc = crc32fast::hash(&payload);
         payload.extend_from_slice(&crc.to_le_bytes());
         assert!(matches!(
             decode_control_message(&payload),
-            Err(ControlProtocolError::InvalidPayloadSize { .. })
+            Err(ControlProtocolError::UnknownMessageType { msg_type: 0x10 })
         ));
     }
 
@@ -1475,15 +1446,18 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn control_dispatcher_reports_acks_in_order_even_after_local_cancel() {
+    async fn control_dispatcher_keeps_reporting_after_local_cancel() {
         use crate::communication::peer_link::{LifecycleEvent, LinkEvent};
 
         let (tx, cancel_token, _shutdown, mut events_rx, dispatcher) = dispatcher_with_peer();
-        // A local cancellation must not stop ack delivery.
+        // A local cancellation must not stop the dispatcher: a peer's Cancel
+        // can still arrive while the shutdown handshake runs.
         cancel_token.cancel();
-        tx.send(encode_control_message(&ControlMessage::EndOfStreamAck))
-            .await
-            .unwrap();
+        tx.send(encode_control_message(&ControlMessage::Cancel {
+            reason: "peer failed".to_string(),
+        }))
+        .await
+        .unwrap();
         drop(tx);
         dispatcher.await.unwrap();
 
@@ -1491,7 +1465,7 @@ mod tests {
         assert!(
             matches!(
                 first,
-                Some(LifecycleEvent::Link { ref peer, event: LinkEvent::AckReceived }) if peer == "node-b"
+                Some(LifecycleEvent::Link { ref peer, event: LinkEvent::CancelReceived }) if peer == "node-b"
             ),
             "got {first:?}"
         );
@@ -1509,7 +1483,9 @@ mod tests {
         use crate::communication::peer_link::{LifecycleEvent, LinkEvent};
 
         let (tx, cancel_token, _shutdown, mut events_rx, dispatcher) = dispatcher_with_peer();
-        let mut corrupted = encode_control_message(&ControlMessage::EndOfStreamAck);
+        let mut corrupted = encode_control_message(&ControlMessage::Cancel {
+            reason: "x".to_string(),
+        });
         corrupted[0] ^= 0xFF;
         tx.send(corrupted).await.unwrap();
         drop(tx);

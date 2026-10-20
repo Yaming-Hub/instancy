@@ -143,6 +143,56 @@ impl Link {
     }
 }
 
+/// Writer that fails every operation once `broken` is set (see
+/// [`Mesh::dedicated_breakable`]).
+pub struct BreakableWriter<W> {
+    inner: W,
+    broken: Arc<AtomicBool>,
+}
+
+impl<W> BreakableWriter<W> {
+    fn check(&self) -> std::io::Result<()> {
+        if self.broken.load(Ordering::SeqCst) {
+            Err(std::io::Error::other("injected write failure"))
+        } else {
+            Ok(())
+        }
+    }
+}
+
+impl<W: tokio::io::AsyncWrite + Unpin> tokio::io::AsyncWrite for BreakableWriter<W> {
+    fn poll_write(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &[u8],
+    ) -> std::task::Poll<std::io::Result<usize>> {
+        if let Err(error) = self.check() {
+            return std::task::Poll::Ready(Err(error));
+        }
+        std::pin::Pin::new(&mut self.inner).poll_write(cx, buf)
+    }
+
+    fn poll_flush(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        if let Err(error) = self.check() {
+            return std::task::Poll::Ready(Err(error));
+        }
+        std::pin::Pin::new(&mut self.inner).poll_flush(cx)
+    }
+
+    fn poll_shutdown(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        if let Err(error) = self.check() {
+            return std::task::Poll::Ready(Err(error));
+        }
+        std::pin::Pin::new(&mut self.inner).poll_shutdown(cx)
+    }
+}
+
 /// A full mesh of in-process links.
 pub struct Mesh {
     ends: HashMap<(String, String), DuplexStream>,
@@ -220,6 +270,35 @@ impl Mesh {
                     node_id: peer,
                     reader,
                     writer,
+                }
+            })
+            .collect();
+        ClusterSpawnTransport::dedicated(conns, capacity)
+    }
+
+    /// [`dedicated`](Self::dedicated) whose writers fail once `broken` is
+    /// set, while the readers and the peers' ends stay open. This is a local
+    /// write error on split stream halves (as with TLS): dropping the failed
+    /// writer sends the peer no EOF.
+    pub fn dedicated_breakable(
+        &mut self,
+        node: &str,
+        capacity: usize,
+        broken: Arc<AtomicBool>,
+    ) -> ClusterSpawnTransport<ReadHalf<DuplexStream>, BreakableWriter<WriteHalf<DuplexStream>>>
+    {
+        let conns = self
+            .take_ends(node)
+            .into_iter()
+            .map(|(peer, stream)| {
+                let (reader, writer) = tokio::io::split(stream);
+                PeerConnection {
+                    node_id: peer,
+                    reader,
+                    writer: BreakableWriter {
+                        inner: writer,
+                        broken: Arc::clone(&broken),
+                    },
                 }
             })
             .collect();
@@ -469,15 +548,27 @@ pub fn fmt_join(r: &Option<Result<()>>) -> String {
 /// Output collected on a background thread.
 pub struct Collector<D> {
     rx: std::sync::mpsc::Receiver<Vec<(u64, D)>>,
+    done: Option<Vec<(u64, D)>>,
 }
 
 impl<D> Collector<D> {
     /// Wait for the output to close; errors (instead of blocking forever) if
     /// the dataflow never closes it.
-    pub fn join(self) -> std::result::Result<Vec<(u64, D)>, String> {
+    pub fn join(mut self) -> std::result::Result<Vec<(u64, D)>, String> {
+        if let Some(done) = self.done.take() {
+            return Ok(done);
+        }
         self.rx
             .recv_timeout(Duration::from_secs(20))
             .map_err(|_| "output never closed (dataflow hung)".to_string())
+    }
+
+    /// Whether the output closed within `timeout` (its worker finished).
+    pub fn wait_closed(&mut self, timeout: Duration) -> bool {
+        if self.done.is_none() {
+            self.done = self.rx.recv_timeout(timeout).ok();
+        }
+        self.done.is_some()
     }
 }
 
@@ -493,7 +584,7 @@ pub fn collect<D: Send + 'static>(output: instancy::OutputReceiver<u64, D>) -> C
         }
         let _ = tx.send(out);
     });
-    Collector { rx }
+    Collector { rx, done: None }
 }
 
 /// Drop instancy runtimes off the async reactor (their drop joins threads).

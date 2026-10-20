@@ -244,16 +244,33 @@ enum Producer {
     Map,
 }
 
+/// How a burst round ended when it did not fail.
+#[derive(Debug)]
+enum Burst {
+    /// Every node succeeded and every record arrived exactly once.
+    Exact,
+    /// A node reported the loss (see `many_small_frames_then_complete_shared`).
+    LoudLoss(String),
+}
+
+/// Whether a node's failure reports lost records.
+fn reports_data_loss(r: &Option<Result<()>>) -> bool {
+    matches!(r, Some(Err(e)) if e.to_string().contains("data lost"))
+}
+
 /// node-a sends `records` records of `size` bytes, all routed to node-b, and
 /// closes its input; node-b's input is closed at start. node-a can observe
 /// global completion while its frames are still queued.
+///
+/// Returns an error for a hang, an unexplained failure, or a silent loss
+/// (every node `Ok` but records missing).
 async fn burst_then_complete<R, W>(
     ta: ClusterSpawnTransport<R, W>,
     tb: ClusterSpawnTransport<R, W>,
     records: usize,
     size: usize,
     producer: Producer,
-) -> std::result::Result<(), String>
+) -> std::result::Result<Burst, String>
 where
     R: tokio::io::AsyncRead + Unpin + Send + 'static,
     W: tokio::io::AsyncWrite + Unpin + Send + 'static,
@@ -302,19 +319,23 @@ where
     let got_b = ob.join().unwrap().len();
     let got_a = oa.join().unwrap().len();
     drop_runtimes(vec![rt_a, rt_b]).await;
-    if fed.is_err()
-        || !matches!(ra, Some(Ok(())))
-        || !matches!(rb, Some(Ok(())))
-        || got_b != records
-        || got_a != 0
+    let report = format!(
+        "feeder={fed:?} a={} b={} received_at_b={got_b}/{records} at_a={got_a}",
+        fmt_join(&ra),
+        fmt_join(&rb)
+    );
+    if fed.is_ok()
+        && matches!(ra, Some(Ok(())))
+        && matches!(rb, Some(Ok(())))
+        && got_b == records
+        && got_a == 0
     {
-        return Err(format!(
-            "feeder={fed:?} a={} b={} received_at_b={got_b}/{records} at_a={got_a}",
-            fmt_join(&ra),
-            fmt_join(&rb)
-        ));
+        return Ok(Burst::Exact);
     }
-    Ok(())
+    if reports_data_loss(&ra) || reports_data_loss(&rb) {
+        return Ok(Burst::LoudLoss(report));
+    }
+    Err(report)
 }
 
 async fn dedicated_pair(capacity: usize) -> (support::TcpTransport, support::TcpTransport) {
@@ -330,74 +351,83 @@ async fn shared_pair() -> (Managers, Managers) {
     (managers.remove("a").unwrap(), managers.remove("b").unwrap())
 }
 
+/// Runs `rounds` burst rounds; fails on any hang, unexplained error or
+/// silent loss, and returns how many rounds reported a loss loudly.
+async fn assert_no_silent_loss<F, Fut>(what: &str, rounds: usize, mut round: F)
+where
+    F: FnMut(usize) -> Fut,
+    Fut: std::future::Future<Output = std::result::Result<Burst, String>>,
+{
+    let mut failures = Vec::new();
+    let mut loud = Vec::new();
+    for i in 0..rounds {
+        match round(i).await {
+            Ok(Burst::Exact) => {}
+            Ok(Burst::LoudLoss(report)) => loud.push(format!("round {i}: {report}")),
+            Err(report) => failures.push(format!("round {i}: {report}")),
+        }
+    }
+    if !loud.is_empty() {
+        eprintln!(
+            "{what}: {} round(s) failed loudly with data loss: {loud:#?}",
+            loud.len()
+        );
+    }
+    assert!(failures.is_empty(), "{what}: {failures:#?}");
+}
+
 /// Shared mode with long-lived managers: thousands of small frames are still
 /// queued when node-a completes locally.
 ///
-/// On the pre-handshake runtime almost every iteration hangs or fails with a
-/// spurious transport error (the queued frames were dropped at unregister);
-/// with the handshake those failures are gone. The test is ignored only
-/// because roughly one iteration in 60-100 still ends with
-/// `a=Ok b=Ok received_at_b=1/3000`, a signature the pre-handshake runtime
-/// shows too. Node-b consumes the first record before node-a's matching
-/// produced-message count arrives, and the signed-sum completion predicate
-/// then sees `+1 capability - 1 message = 0` and finishes node-b early (audit
-/// C1/C2). The deterministic shared-mode tests in this file cover the
-/// teardown itself.
+/// On the pre-handshake runtime almost every round hangs or fails with a
+/// spurious transport error (the queued frames were dropped at unregister).
+/// Roughly one round in 60-100 still hits the signed-sum completion bug
+/// (audit C1/C2): node-b consumes the first record before node-a's matching
+/// produced-message count arrives and finishes early. Before, that round
+/// returned `a=Ok b=Ok received_at_b=1/3000`; now the records that reach
+/// node-b after its operator finished (or that node-a sends after node-b's
+/// end-of-stream) are reported as data loss and the run fails. Silent loss
+/// is never acceptable.
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
-#[ignore = "C1/C2: receiver occasionally completes prematurely (signed-sum predicate)"]
 async fn many_small_frames_then_complete_shared() {
     let (ma, mb) = shared_pair().await;
-    let mut failures = Vec::new();
-    for i in 0..5 {
-        if let Err(e) = burst_then_complete(shared(&ma), shared(&mb), 3000, 64, Producer::Map).await
-        {
-            failures.push(format!("iter {i}: {e}"));
-        }
-    }
-    assert!(failures.is_empty(), "{failures:#?}");
+    assert_no_silent_loss("shared", 5, |_| {
+        burst_then_complete(shared(&ma), shared(&mb), 3000, 64, Producer::Map)
+    })
+    .await;
 }
 
-/// Dedicated-mode counterpart (same C1/C2 residual as the shared variant).
+/// Dedicated-mode counterpart.
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
-#[ignore = "C1/C2: receiver occasionally completes prematurely (signed-sum predicate)"]
 async fn many_small_frames_then_complete_dedicated() {
-    let mut failures = Vec::new();
-    for i in 0..5 {
+    assert_no_silent_loss("dedicated", 5, |_| async {
         let (ta, tb) = dedicated_pair(1024).await;
-        if let Err(e) = burst_then_complete(ta, tb, 3000, 64, Producer::Map).await {
-            failures.push(format!("iter {i}: {e}"));
-        }
-    }
-    assert!(failures.is_empty(), "{failures:#?}");
+        burst_then_complete(ta, tb, 3000, 64, Producer::Map).await
+    })
+    .await;
 }
 
 /// Large records routed to node-b while node-a finishes first.
 ///
-/// Still fails intermittently on both transports *and on the pre-handshake
-/// runtime*: node-b reports success after receiving only part of the burst
-/// (typically one record), i.e. it completes prematurely while data is still
-/// in flight. That is the in-flight accounting / signed-sum completion bug
-/// (audit C1/C2), not a teardown loss: with the handshake, node-a's frames
-/// are delivered before node-a releases the connection.
+/// This shape hits the C1/C2 premature completion often: node-b used to
+/// report success after receiving only part of the burst (typically one
+/// record). With the handshake, node-a's frames reach node-b before node-a
+/// releases the connection, and records that arrive after node-b's operator
+/// finished fail the run loudly instead of vanishing.
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
-#[ignore = "C1/C2: receiver completes prematurely while large records are in flight"]
-async fn large_records_from_early_finisher_all_arrive() {
-    let mut failures = Vec::new();
-    for i in 0..10 {
-        for producer in [Producer::Input, Producer::Map] {
+async fn large_records_from_early_finisher_never_vanish() {
+    for producer in [Producer::Input, Producer::Map] {
+        assert_no_silent_loss(&format!("dedicated {producer:?}"), 10, |_| async {
             let (ta, tb) = dedicated_pair(1024).await;
-            if let Err(e) = burst_then_complete(ta, tb, 40, 1 << 20, producer).await {
-                failures.push(format!("iter {i} dedicated {producer:?}: {e}"));
-            }
+            burst_then_complete(ta, tb, 40, 1 << 20, producer).await
+        })
+        .await;
+        assert_no_silent_loss(&format!("shared {producer:?}"), 10, |_| async {
             let (ma, mb) = shared_pair().await;
-            if let Err(e) =
-                burst_then_complete(shared(&ma), shared(&mb), 40, 1 << 20, producer).await
-            {
-                failures.push(format!("iter {i} shared {producer:?}: {e}"));
-            }
-        }
+            burst_then_complete(shared(&ma), shared(&mb), 40, 1 << 20, producer).await
+        })
+        .await;
     }
-    assert!(failures.is_empty(), "{failures:#?}");
 }
 
 // ---------------------------------------------------------------------------

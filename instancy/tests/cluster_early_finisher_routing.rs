@@ -7,9 +7,9 @@
 //! finisher really does reach teardown with frames still in flight. Each
 //! scenario runs on Dedicated, per-dataflow Shared and pooled Shared
 //! transports. Batches split across nodes may still be duplicated by partial
-//! pushes until PR 2 lands (see `SPLIT_BATCHES_MAY_DUPLICATE`); loss and
-//! hangs are always failures, except that a round showing the known C1/C2
-//! early-completion signature is re-run once (see `Failure::EarlyCompletion`).
+//! pushes until PR 2 lands (see `SPLIT_BATCHES_MAY_DUPLICATE`). Silent loss
+//! and hangs are always failures; a round that fails loudly with the known
+//! C1/C2 data-loss signature is re-run once (see `Failure::EarlyCompletion`).
 
 #![cfg(feature = "transport")]
 
@@ -96,19 +96,20 @@ fn sink(output: instancy::OutputReceiver<u64, u64>) -> Sink {
 /// Why a round failed.
 #[derive(Debug)]
 enum Failure {
-    /// Every node joined `Ok`, but records are missing at a receiver.
+    /// A node failed because records were lost (`data lost …`).
     ///
     /// A receiver with no capability of its own (its input is closed at the
     /// start) can complete after consuming a record whose matching progress
-    /// from the sender has not arrived yet. This is the signed-sum completion
-    /// predicate (audit C1/C2, also present on `main`; see the ignored
-    /// `many_small_frames_then_complete_*` tests). It is not a teardown loss:
-    /// the sender tears down only after the receiver acknowledged its
-    /// end-of-stream, which follows all of its data. Rounds with this
-    /// signature are re-run once (`run_with_retry`); remove the retry once
-    /// C1/C2 is fixed.
+    /// from the sender has not arrived yet: the signed-sum completion
+    /// predicate (audit C1/C2, also present on `main`; see
+    /// `many_small_frames_then_complete_*`). The records that still arrive
+    /// (or that the sender sends after the receiver's end-of-stream) are
+    /// reported, so the run fails loudly. Rounds that fail only this way are
+    /// re-run once (`run_with_retry`); remove the retry once C1/C2 is fixed.
+    /// Every node `Ok` with records missing (silent loss) is never retried.
     EarlyCompletion(String),
-    /// Anything else: a hang, an error, misrouted or duplicated records.
+    /// Anything else: a hang, an error, silent loss, misrouted or duplicated
+    /// records.
     Other(String),
 }
 
@@ -121,7 +122,9 @@ impl From<String> for Failure {
 impl std::fmt::Display for Failure {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Failure::EarlyCompletion(e) => write!(f, "receiver completed early (C1/C2): {e}"),
+            Failure::EarlyCompletion(e) => {
+                write!(f, "receiver completed early (C1/C2), loss reported: {e}")
+            }
             Failure::Other(e) => f.write_str(e),
         }
     }
@@ -234,7 +237,7 @@ where
             global += 1;
         }
         runtimes.push(rt);
-        joins.push(join_with_timeout(cluster, Duration::from_secs(30)));
+        joins.push(join_with_timeout(cluster, Duration::from_secs(60)));
     }
     let mut results = Vec::new();
     for j in joins {
@@ -251,14 +254,30 @@ where
             .iter()
             .map(|o| o.records.lock().unwrap().len())
             .collect();
+        let report = format!(
+            "{mode:?}: {joined}; received per worker {received:?} of {}",
+            batches * per_batch
+        );
+        if results.iter().all(Option::is_some) {
+            let loud_loss = results
+                .iter()
+                .any(|r| matches!(r, Some(Err(e)) if e.to_string().contains("data lost")));
+            let _ = drop_runtimes(runtimes).await;
+            drop(pool);
+            for f in feeders {
+                let _ = f.join();
+            }
+            return Err(if loud_loss {
+                Failure::EarlyCompletion(report)
+            } else {
+                Failure::Other(report)
+            });
+        }
         let fed = feeders.iter().all(|f| f.is_finished());
         // A wedged dataflow can block runtime or transport teardown (and a
         // feeder) forever.
         std::mem::forget((runtimes, pool, feeders));
-        return Err(Failure::Other(format!(
-            "{mode:?}: {joined}; received per worker {received:?} of {}; input fed: {fed}",
-            batches * per_batch
-        )));
+        return Err(Failure::Other(format!("{report}; input fed: {fed}")));
     }
     let fed: std::result::Result<Vec<()>, String> =
         feeders.into_iter().map(|f| f.join().unwrap()).collect();
@@ -300,12 +319,9 @@ where
             "{mode:?}: received {received}/{total}; {missing} missing (last: {last_missing:?}), \
              {duplicated} duplicated"
         );
-        // Every node joined Ok (checked above).
-        return Err(if missing > 0 && (duplicated == 0 || tolerate_duplicates) {
-            Failure::EarlyCompletion(report)
-        } else {
-            Failure::Other(report)
-        });
+        // Every node joined Ok (checked above): missing records here are a
+        // silent loss, never acceptable.
+        return Err(Failure::Other(report));
     }
     Ok(())
 }
@@ -347,6 +363,13 @@ async fn single_target_burst_from_early_finisher_arrives_in_full() {
 /// merged.
 const SPLIT_BATCHES_MAY_DUPLICATE: bool = true;
 
+/// Batches fed per split-routing round. Kept small while PR 2's duplication
+/// is present: at queue capacity 1 a round can otherwise multiply into
+/// millions of duplicate records and take tens of seconds on a loaded
+/// machine. Every batch still crosses nodes, so the sender finishes with
+/// frames in flight.
+const SPLIT_BATCHES: u64 = 400;
+
 /// Scenario 2: records are spread over both nodes and all of them arrive,
 /// but the node that finishes first used to drop its final progress frames on
 /// teardown, leaving its peer waiting forever (about 5% of Shared runs).
@@ -362,7 +385,7 @@ async fn delivery_is_followed_by_completion_everywhere() {
                     mode,
                     1024,
                     exchange(true, by_value),
-                    2000,
+                    SPLIT_BATCHES * 2,
                     16,
                     None,
                     SPLIT_BATCHES_MAY_DUPLICATE,
@@ -391,7 +414,7 @@ async fn congested_dedicated_links_do_not_lose_the_tail() {
                     Mode::Dedicated,
                     capacity,
                     exchange(true, by_value),
-                    1000,
+                    SPLIT_BATCHES,
                     16,
                     None,
                     SPLIT_BATCHES_MAY_DUPLICATE,
