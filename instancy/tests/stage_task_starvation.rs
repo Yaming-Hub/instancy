@@ -1156,3 +1156,201 @@ fn slow_output_consumer_async_single_worker() {
 fn slow_output_consumer_async_two_workers() {
     slow_output_consumer(instancy::IoMode::Async, 2);
 }
+
+// ---------------------------------------------------------------------------
+// Small exchange channels (1, 2 and 4 slots) with every routing pattern.
+// Any full channel, not only a 1024-envelope one, could trip the livelock.
+// Batches hold one record each, so every push has a single target worker.
+// ---------------------------------------------------------------------------
+
+#[derive(Clone, Copy, Debug)]
+enum Route {
+    /// Back to the producing worker.
+    ToSelf,
+    /// To the next worker (wrapping).
+    ToNext,
+    /// Spread by record index.
+    Spread,
+    /// Everything to worker 0.
+    ToZero,
+    /// Never to worker 0.
+    AwayFromZero,
+}
+
+fn producer_of(x: &u64) -> u64 {
+    x >> 32
+}
+
+fn index_of(x: &u64) -> u64 {
+    x & 0xffff_ffff
+}
+
+/// How a small-capacity run ends.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Finish {
+    /// Keep every input open until every record has reached an output, then
+    /// cancel. With inputs open, no worker can declare the dataflow complete,
+    /// so this checks only that the backlog drains.
+    Delivery,
+    /// Close every input and join the dataflow.
+    Join,
+}
+
+/// Every worker sends `PER_WORKER` single-record batches through two
+/// exchanges whose channels hold `capacity` envelopes: the first routed by
+/// `route`, the second spread by index.
+fn small_capacity_exchange(workers: usize, capacity: usize, route: Route, finish: Finish) {
+    const PER_WORKER: u64 = 400;
+    let n = workers as u64;
+    let what = format!("workers={workers} capacity={capacity} route={route:?} {finish:?}");
+    let rt = runtime();
+    let mut multi = rt
+        .spawn_multi(
+            "small-capacity-exchange",
+            workers,
+            move |b: &mut DataflowBuilder<u64>| {
+                b.input::<u64>("data")?
+                    .map("pre", |_t, x| x)
+                    .with_capacity(capacity)?
+                    .exchange_by_hash("hop1", move |x: &u64| match route {
+                        Route::ToSelf => producer_of(x),
+                        Route::ToNext => producer_of(x) + 1,
+                        Route::Spread => index_of(x),
+                        Route::ToZero => 0,
+                        Route::AwayFromZero => 1 + index_of(x) % (n - 1),
+                    })
+                    .map("mid", |_t, x| x)
+                    .with_capacity(capacity)?
+                    .exchange_by_hash("hop2", |x: &u64| index_of(x) / 7)
+                    .map("post", |_t, x| x)
+                    .output("out")?;
+                Ok(())
+            },
+            SpawnOptions::new(),
+        )
+        .unwrap();
+    let total = n * PER_WORKER;
+    let delivered = Arc::new(AtomicU64::new(0));
+    let mut collectors = Vec::new();
+    let mut feeders = Vec::new();
+    for w in 0..workers {
+        let rx = multi.take_output::<u64>(w, "out").unwrap();
+        let delivered = Arc::clone(&delivered);
+        collectors.push(std::thread::spawn(move || {
+            let mut got = Vec::new();
+            match finish {
+                Finish::Join => got.extend(rx.collect_data().into_iter().flat_map(|(_, d)| d)),
+                Finish::Delivery => {
+                    let deadline = std::time::Instant::now() + TIMEOUT;
+                    while delivered.load(Ordering::SeqCst) < total
+                        && std::time::Instant::now() < deadline
+                    {
+                        if let Some(OutputEvent::Data { data, .. }) =
+                            rx.recv_timeout(Duration::from_millis(20))
+                        {
+                            delivered.fetch_add(data.len() as u64, Ordering::SeqCst);
+                            got.extend(data);
+                        }
+                    }
+                }
+            }
+            got.sort_unstable();
+            (got, rx)
+        }));
+        let tx = multi.take_input::<u64>(w, "data").unwrap();
+        let g = w as u64;
+        feeders.push(std::thread::spawn(move || {
+            for i in 0..PER_WORKER {
+                tx.send(i % 3, vec![(g << 32) | i]).unwrap();
+            }
+            (finish == Finish::Delivery).then_some(tx)
+        }));
+    }
+    let multi = match finish {
+        Finish::Join => {
+            with_timeout(&what, move || multi.join_blocking()).unwrap();
+            None
+        }
+        Finish::Delivery => Some(multi),
+    };
+    // Check the outputs before joining the feeders: if the dataflow is stuck,
+    // the feeders are blocked on full input channels.
+    let mut all = Vec::new();
+    let mut outputs = Vec::new();
+    for c in collectors {
+        let (got, rx) = c.join().unwrap();
+        all.extend(got);
+        outputs.push(rx);
+    }
+    all.sort_unstable();
+    let mut expected: Vec<u64> = (0..n)
+        .flat_map(|g| (0..PER_WORKER).map(move |i| (g << 32) | i))
+        .collect();
+    expected.sort_unstable();
+    assert_eq!(all.len(), expected.len(), "{what}: record count");
+    assert!(all == expected, "{what}: records lost or duplicated");
+    let open_inputs: Vec<_> = feeders.into_iter().map(|f| f.join().unwrap()).collect();
+    // Dropping the handle cancels a dataflow that is still running.
+    drop(multi);
+    drop(open_inputs);
+    drop(outputs);
+}
+
+fn small_capacity_matrix(route: Route, finish: Finish) {
+    let min_workers = if matches!(route, Route::AwayFromZero) {
+        2
+    } else {
+        1
+    };
+    for workers in min_workers..=4 {
+        for capacity in [1, 2, 4] {
+            small_capacity_exchange(workers, capacity, route, finish);
+        }
+    }
+}
+
+#[test]
+fn small_capacity_exchange_to_self() {
+    small_capacity_matrix(Route::ToSelf, Finish::Delivery);
+}
+
+#[test]
+fn small_capacity_exchange_to_next_worker() {
+    small_capacity_matrix(Route::ToNext, Finish::Delivery);
+}
+
+#[test]
+fn small_capacity_exchange_spread() {
+    small_capacity_matrix(Route::Spread, Finish::Delivery);
+}
+
+#[test]
+fn small_capacity_exchange_to_worker_zero() {
+    small_capacity_matrix(Route::ToZero, Finish::Delivery);
+}
+
+#[test]
+fn small_capacity_exchange_away_from_worker_zero() {
+    small_capacity_matrix(Route::AwayFromZero, Finish::Delivery);
+}
+
+/// Same matrix, also waiting for the dataflow to complete. With two or more
+/// workers, this occasionally fails, and fails every time with four workers
+/// all routing to worker 0: a worker declares the dataflow complete and
+/// force-closes its operators while records are still held by operators that
+/// are blocked on full channels (their buffered output isn't visible to
+/// progress tracking). With the scheduling fix reverted these cases hang
+/// before reaching that point, so that is a separate progress-tracking bug.
+#[test]
+#[ignore = "premature completion while blocked operators hold records; see doc comment"]
+fn small_capacity_exchange_then_complete() {
+    for route in [
+        Route::ToSelf,
+        Route::ToNext,
+        Route::Spread,
+        Route::ToZero,
+        Route::AwayFromZero,
+    ] {
+        small_capacity_matrix(route, Finish::Join);
+    }
+}
