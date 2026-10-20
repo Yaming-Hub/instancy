@@ -4,12 +4,11 @@
 //! later target's peer queue is full, earlier targets already have theirs, and
 //! the operator's retry must only go to the targets still owed the batch.
 //!
-//! Every pipeline gives the local edge a large capacity so a full same-worker
-//! channel (a scheduler issue tracked separately) cannot stall the run, and
-//! keeps its inputs open until every copy has arrived: broadcast does not yet
-//! account its records as in flight, so completion relies on close sentinels,
-//! which a full queue can drop, and in Shared mode the node that finishes
-//! first can drop frames its peers still need (both tracked separately).
+//! Every pipeline keeps its inputs open until every copy has arrived:
+//! broadcast does not yet account its records as in flight, so completion
+//! relies on close sentinels, which a full queue can drop, and in Shared mode
+//! the node that finishes first can drop frames its peers still need (both
+//! tracked separately).
 
 #![cfg(feature = "transport")]
 
@@ -20,7 +19,6 @@ use support::cluster::{self, ClusterSpec, Mode};
 
 fn broadcast_pipeline(b: &mut DataflowBuilder<u64>) -> Result<()> {
     b.input::<u64>("in")?
-        .with_capacity(1 << 22)?
         .broadcast("bcast")
         .map("post", |_t, x| x)
         .output("out")?;

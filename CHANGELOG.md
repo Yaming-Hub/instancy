@@ -210,6 +210,18 @@ RESERVED_CHANNEL_BASE, CHANNEL_NAMESPACE_SIZE}`.
 - `ChangeBatch` drops a lone zero-valued update; the `FrontierAggregator`
   debug monotonicity check no longer rejects valid partial-order advances.
 
+### Stage-task scheduling
+
+- Fix a livelock where a stage task blocked on a full exchange channel used up
+  the whole sweep budget, so the stage task that drains that channel never ran.
+  Any exchange holding about 1024 queued envelopes hung at 100% CPU, with one
+  worker, several workers, or a multi-node cluster. Operators blocked on
+  backpressure no longer count as progress.
+- A stage task that is skipped because the sweep budget ran out now runs first
+  in the next sweep, so a busy stage task can't starve the ones after it.
+- Cancellation now takes effect between passes of a sweep instead of after the
+  whole sweep budget (up to 1024 activations) is spent.
+
 ## [0.1.3] - 2026-10-15
 
 ### Added

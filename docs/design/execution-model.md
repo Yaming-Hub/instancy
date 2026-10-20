@@ -1542,6 +1542,8 @@ impl FusedStageTask {
   1. No more data to process (pipeline drained)
   2. Poll budget exhausted (fairness with other stage-workers)
   3. Blocked on cross-stage input channel (upstream hasn't produced data yet)
+  4. Only blocked operators are left. An operator blocked on backpressure doesn't count as progress, so the task doesn't poll it again in the same activation. If the full channel feeds another stage task, that task gets to drain it instead of waiting behind a task that keeps polling a blocked operator.
+- **Shared sweep budget**: All stage tasks of a worker share one activation budget per sweep. A task that is skipped because the budget ran out (or because too little was left for one full pass over its operators) runs first in the next sweep, so no stage task can be starved by the tasks ahead of it.
 - **No internal ready queue**: Within a fused task, operators are polled in fixed topological order — no per-operator scheduling decisions.
 
 #### Scheduling overhead reduction
