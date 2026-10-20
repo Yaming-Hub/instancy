@@ -48,7 +48,10 @@ fn make_duplex_pair(
 ///
 /// Each node runs 1 worker. The dataflow is: input → map(double) → output.
 /// No cross-node exchange needed.
-#[tokio::test]
+///
+/// `join_blocking` waits for the cluster shutdown handshake, which runs on
+/// this tokio runtime, so the runtime needs a thread besides the blocked one.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn cluster_two_nodes_no_exchange() {
     let topology = ClusterTopology::multi_node(vec![
         NodeConfig::new("node-a", 1),

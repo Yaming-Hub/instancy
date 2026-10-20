@@ -28,6 +28,36 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   again to peers that had already accepted it when the documented retry
   follows backpressure from another peer.
 
+### Graceful cluster teardown
+
+- A cluster node no longer tears down while peers still need its frames. Each
+  node ends every cross-node stream with an in-band end-of-stream marker
+  (data close sentinels and a new progress end-of-stream frame), peers
+  acknowledge it with a new `EndOfStreamAck` control message, and a
+  per-dataflow lifecycle task owns the transport, bridges and shared-manager
+  registration until every link is retired. Final progress deltas queued
+  behind congestion are no longer dropped, a peer's clean close no longer
+  stops a slower node's bridges to third nodes, and shared mode no longer
+  discards frames queued for a dataflow that finished first.
+- Close sentinels on network data channels are delivered reliably instead of
+  being dropped when the per-peer queue is full (broadcast no longer hangs).
+- `ClusterCompletion` resolves once the local workers have finished and the
+  shutdown handshake has completed (each peer has received this node's
+  frames or has finished itself). Its result is unchanged: the local
+  workers' result. Blocking waits (`join_blocking`, `wait`) therefore need the
+  transport's tokio runtime to keep running; do not call them from the only
+  thread of a `current_thread` runtime that hosts the transport.
+- Dropping an unresolved `ClusterCompletion` now detaches it: the dataflow
+  keeps running with its network intact (previously the network was cut while
+  local workers kept running). Dropping `ClusterSpawnedDataflow` without
+  `join()`, or calling `cancel()`, still cancels the dataflow cluster-wide.
+- A node whose workers still succeed after a cancellation (e.g. with
+  `drain_on_cancel`) no longer waits forever for a peer that cancelled and
+  tore down, and flushes its queued frames before unregistering, so a peer
+  that is still draining receives its final progress.
+- Wire protocol: new progress end-of-stream frame and `EndOfStreamAck`
+  control message (type `0x10`); nodes must run the same version.
+
 ### Input contract hardening
 
 - **BREAKING:** Invalid input/frontier sequences that were previously accepted

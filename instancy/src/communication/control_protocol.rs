@@ -39,6 +39,11 @@
 //!   reported as protocol version 1.
 //! - Ready (type 1): `[1][node_id_len: u32 LE][node_id: UTF-8 bytes]`
 //! - Cancel (type 2): `[2][reason_len: u32 LE][reason: UTF-8 bytes]`
+//!
+//! Shutdown messages (see `docs/design/cluster.md` §5.5.3):
+//!
+//! - EndOfStreamAck (type 0x10): `[0x10]` — "I received every frame you sent
+//!   for this dataflow, including your end-of-stream markers".
 
 #[cfg(feature = "transport")]
 use crate::cancellation::{CancellationReason, CancellationToken};
@@ -184,6 +189,10 @@ pub enum ControlMessage {
         /// Human-readable reason for cancellation.
         reason: String,
     },
+    /// Shutdown handshake: the sender has received every frame the
+    /// recipient sent for this dataflow, up to and including the recipient's
+    /// end-of-stream markers on all progress channels.
+    EndOfStreamAck,
 }
 
 #[cfg(feature = "transport")]
@@ -192,6 +201,10 @@ const MSG_TYPE_HANDSHAKE: u8 = 0;
 const MSG_TYPE_READY: u8 = 1;
 #[cfg(feature = "transport")]
 const MSG_TYPE_CANCEL: u8 = 2;
+
+// Shutdown handshake messages use a separate type range.
+#[cfg(feature = "transport")]
+const MSG_TYPE_END_OF_STREAM_ACK: u8 = 0x10;
 
 // ---------------------------------------------------------------------------
 // Encode / Decode with CRC32
@@ -227,6 +240,9 @@ pub fn encode_control_message(msg: &ControlMessage) -> Vec<u8> {
             let reason_bytes = reason.as_bytes();
             buf.extend_from_slice(&(reason_bytes.len() as u32).to_le_bytes());
             buf.extend_from_slice(reason_bytes);
+        }
+        ControlMessage::EndOfStreamAck => {
+            buf.push(MSG_TYPE_END_OF_STREAM_ACK);
         }
     }
     let crc = crc32fast::hash(&buf);
@@ -342,6 +358,15 @@ pub fn decode_control_message(data: &[u8]) -> Result<ControlMessage, ControlProt
             }
             let reason = std::str::from_utf8(&payload[5..5 + reason_len])?.to_string();
             Ok(ControlMessage::Cancel { reason })
+        }
+        MSG_TYPE_END_OF_STREAM_ACK => {
+            if payload.len() != 1 {
+                return Err(ControlProtocolError::InvalidPayloadSize {
+                    expected: 1,
+                    actual: payload.len(),
+                });
+            }
+            Ok(ControlMessage::EndOfStreamAck)
         }
         other => Err(ControlProtocolError::UnknownMessageType { msg_type: other }),
     }
@@ -811,36 +836,10 @@ pub async fn perform_ready_barrier_with_transport(
     Ok(())
 }
 
-/// Broadcast a cancellation message to all peers.
+/// Broadcast a cancellation message to all peers using a [`ClusterTransport`].
 ///
 /// Called when the local dataflow is cancelled. Sending is best-effort: peers
 /// may already have disconnected by the time cancellation propagates.
-#[cfg(feature = "transport")]
-pub async fn broadcast_cancel(
-    session: &super::TransportSession,
-    dataflow_id: DataflowId,
-    reason: &str,
-) {
-    use crate::communication::transport::Frame;
-    use crate::communication::transport_session::CONTROL_CHANNEL_ID;
-
-    let payload = encode_control_message(&ControlMessage::Cancel {
-        reason: reason.to_string(),
-    });
-
-    for peer_id in session.peer_node_ids().collect::<Vec<_>>() {
-        if let Some(sender) = session.control_sender(peer_id) {
-            let frame = Frame {
-                dataflow_id,
-                channel_id: CONTROL_CHANNEL_ID,
-                payload: payload.clone(),
-            };
-            let _ = sender.send(frame).await;
-        }
-    }
-}
-
-/// Broadcast a cancellation message to all peers using a [`ClusterTransport`].
 #[cfg(feature = "transport")]
 pub async fn broadcast_cancel_with_transport(
     transport: &super::cluster_transport::ClusterTransport,
@@ -866,12 +865,22 @@ pub async fn broadcast_cancel_with_transport(
     }
 }
 
-/// Spawn tasks that listen for peer cancellation messages.
+/// Spawn the per-dataflow control dispatcher on `runtime_handle`.
 ///
-/// When any peer sends `Cancel`, the local cancellation token is cancelled with
-/// [`CancellationReason::PeerCancelled`]. The task exits when all receivers are
-/// closed, the local cancellation token fires, or the `shutdown` token fires
-/// (indicating normal dataflow completion).
+/// For each peer's control channel:
+/// - `Cancel` cancels the local token with
+///   [`CancellationReason::PeerCancelled`] and reports
+///   [`LinkEvent::CancelReceived`](super::peer_link::LinkEvent::CancelReceived).
+/// - `EndOfStreamAck` reports
+///   [`LinkEvent::AckReceived`](super::peer_link::LinkEvent::AckReceived).
+/// - A closed channel reports
+///   [`LinkEvent::ControlClosed`](super::peer_link::LinkEvent::ControlClosed);
+///   events from one peer are reported in arrival order, so an ack is always
+///   reported before the close that follows it.
+///
+/// The dispatcher keeps running after local cancellation (acknowledgements
+/// may still arrive during the shutdown handshake) and exits when `shutdown`
+/// fires (teardown) or every channel has closed.
 ///
 /// # Security
 ///
@@ -880,35 +889,58 @@ pub async fn broadcast_cancel_with_transport(
 /// The `Cancel` message itself carries no cryptographic signature — peer identity
 /// verification is the responsibility of the transport layer.
 #[cfg(feature = "transport")]
-pub fn spawn_cancel_listener(
+pub(crate) fn spawn_control_dispatcher(
     control_receivers: std::collections::HashMap<String, tokio::sync::mpsc::Receiver<Vec<u8>>>,
     cancel_token: CancellationToken,
     shutdown: tokio_util::sync::CancellationToken,
+    events: super::peer_link::LifecycleEventSender,
+    runtime_handle: &tokio::runtime::Handle,
 ) -> tokio::task::JoinHandle<()> {
-    tokio::spawn(async move {
+    use super::peer_link::{LinkEvent, report_link_event};
+
+    runtime_handle.spawn(async move {
         let mut set = tokio::task::JoinSet::new();
 
         for (peer_id, mut rx) in control_receivers {
             let token = cancel_token.clone();
             let shut = shutdown.clone();
+            let events = events.clone();
             set.spawn(async move {
                 loop {
                     tokio::select! {
+                        // Messages first: a Cancel queued before teardown
+                        // must still be applied.
                         biased;
-                        _ = token.cancelled_async() => return,
-                        _ = shut.cancelled() => return,
                         maybe_data = rx.recv() => {
                             let Some(data) = maybe_data else {
+                                report_link_event(&events, &peer_id, LinkEvent::ControlClosed);
                                 return;
                             };
-                            if let Ok(ControlMessage::Cancel { reason }) = decode_control_message(&data) {
-                                token.cancel_with_reason(CancellationReason::PeerCancelled {
-                                    peer_id,
-                                    detail: reason,
-                                });
-                                return;
+                            match decode_control_message(&data) {
+                                Ok(ControlMessage::Cancel { reason }) => {
+                                    token.cancel_with_reason(CancellationReason::PeerCancelled {
+                                        peer_id: peer_id.clone(),
+                                        detail: reason,
+                                    });
+                                    report_link_event(&events, &peer_id, LinkEvent::CancelReceived);
+                                }
+                                Ok(ControlMessage::EndOfStreamAck) => {
+                                    report_link_event(&events, &peer_id, LinkEvent::AckReceived);
+                                }
+                                // Late handshake/ready duplicates carry no new information.
+                                Ok(_) => {}
+                                Err(e) => {
+                                    #[cfg(feature = "tracing")]
+                                    tracing::warn!(peer = %peer_id, "undecodable control message: {e}");
+                                    report_link_event(
+                                        &events,
+                                        &peer_id,
+                                        LinkEvent::ControlUndecodable(e.to_string()),
+                                    );
+                                }
                             }
                         }
+                        _ = shut.cancelled() => return,
                     }
                 }
             });
@@ -1361,18 +1393,49 @@ mod tests {
         assert_eq!(msg, decoded);
     }
 
-    #[tokio::test]
-    async fn spawn_cancel_listener_cancels_local_token() {
-        let cancel_token = CancellationToken::new();
-        let (tx, rx) = tokio::sync::mpsc::channel(1);
-        let mut control_receivers = std::collections::HashMap::new();
-        control_receivers.insert("node-b".to_string(), rx);
-
-        let listener = spawn_cancel_listener(
-            control_receivers,
-            cancel_token.clone(),
-            tokio_util::sync::CancellationToken::new(),
+    #[test]
+    fn end_of_stream_ack_roundtrip_and_strict_size() {
+        let encoded = encode_control_message(&ControlMessage::EndOfStreamAck);
+        assert_eq!(
+            decode_control_message(&encoded).unwrap(),
+            ControlMessage::EndOfStreamAck
         );
+        // Trailing bytes inside a valid CRC are rejected.
+        let mut payload = vec![MSG_TYPE_END_OF_STREAM_ACK, 0];
+        let crc = crc32fast::hash(&payload);
+        payload.extend_from_slice(&crc.to_le_bytes());
+        assert!(matches!(
+            decode_control_message(&payload),
+            Err(ControlProtocolError::InvalidPayloadSize { .. })
+        ));
+    }
+
+    fn dispatcher_with_peer() -> (
+        tokio::sync::mpsc::Sender<Vec<u8>>,
+        CancellationToken,
+        tokio_util::sync::CancellationToken,
+        tokio::sync::mpsc::UnboundedReceiver<crate::communication::peer_link::LifecycleEvent>,
+        tokio::task::JoinHandle<()>,
+    ) {
+        let cancel_token = CancellationToken::new();
+        let shutdown = tokio_util::sync::CancellationToken::new();
+        let (tx, rx) = tokio::sync::mpsc::channel(4);
+        let (events, events_rx) = tokio::sync::mpsc::unbounded_channel();
+        let dispatcher = spawn_control_dispatcher(
+            std::collections::HashMap::from([("node-b".to_string(), rx)]),
+            cancel_token.clone(),
+            shutdown.clone(),
+            events,
+            &tokio::runtime::Handle::current(),
+        );
+        (tx, cancel_token, shutdown, events_rx, dispatcher)
+    }
+
+    #[tokio::test]
+    async fn control_dispatcher_cancels_local_token() {
+        use crate::communication::peer_link::{LifecycleEvent, LinkEvent};
+
+        let (tx, cancel_token, _shutdown, mut events_rx, dispatcher) = dispatcher_with_peer();
         tx.send(encode_control_message(&ControlMessage::Cancel {
             reason: "user requested shutdown".to_string(),
         }))
@@ -1386,7 +1449,7 @@ mod tests {
         )
         .await
         .expect("cancel token should be cancelled");
-        listener.await.unwrap();
+        dispatcher.await.unwrap();
 
         assert_eq!(
             cancel_token.reason(),
@@ -1395,31 +1458,107 @@ mod tests {
                 detail: "user requested shutdown".to_string(),
             })
         );
+        assert!(matches!(
+            events_rx.recv().await,
+            Some(LifecycleEvent::Link {
+                event: LinkEvent::CancelReceived,
+                ..
+            })
+        ));
+        assert!(matches!(
+            events_rx.recv().await,
+            Some(LifecycleEvent::Link {
+                event: LinkEvent::ControlClosed,
+                ..
+            })
+        ));
     }
 
     #[tokio::test]
-    async fn spawn_cancel_listener_exits_on_shutdown() {
-        let cancel_token = CancellationToken::new();
-        let shutdown = tokio_util::sync::CancellationToken::new();
-        let (_tx, rx) = tokio::sync::mpsc::channel::<Vec<u8>>(1);
-        let mut control_receivers = std::collections::HashMap::new();
-        control_receivers.insert("node-b".to_string(), rx);
+    async fn control_dispatcher_reports_acks_in_order_even_after_local_cancel() {
+        use crate::communication::peer_link::{LifecycleEvent, LinkEvent};
 
-        let listener =
-            spawn_cancel_listener(control_receivers, cancel_token.clone(), shutdown.clone());
-
-        // Signal shutdown (normal completion) — listener should exit promptly
-        // without cancelling the dataflow token.
-        shutdown.cancel();
-        tokio::time::timeout(std::time::Duration::from_secs(2), listener)
+        let (tx, cancel_token, _shutdown, mut events_rx, dispatcher) = dispatcher_with_peer();
+        // A local cancellation must not stop ack delivery.
+        cancel_token.cancel();
+        tx.send(encode_control_message(&ControlMessage::EndOfStreamAck))
             .await
-            .expect("listener should exit on shutdown")
+            .unwrap();
+        drop(tx);
+        dispatcher.await.unwrap();
+
+        let first = events_rx.recv().await;
+        assert!(
+            matches!(
+                first,
+                Some(LifecycleEvent::Link { ref peer, event: LinkEvent::AckReceived }) if peer == "node-b"
+            ),
+            "got {first:?}"
+        );
+        assert!(matches!(
+            events_rx.recv().await,
+            Some(LifecycleEvent::Link {
+                event: LinkEvent::ControlClosed,
+                ..
+            })
+        ));
+    }
+
+    #[tokio::test]
+    async fn control_dispatcher_reports_undecodable_messages() {
+        use crate::communication::peer_link::{LifecycleEvent, LinkEvent};
+
+        let (tx, cancel_token, _shutdown, mut events_rx, dispatcher) = dispatcher_with_peer();
+        let mut corrupted = encode_control_message(&ControlMessage::EndOfStreamAck);
+        corrupted[0] ^= 0xFF;
+        tx.send(corrupted).await.unwrap();
+        drop(tx);
+        dispatcher.await.unwrap();
+        assert!(matches!(
+            events_rx.recv().await,
+            Some(LifecycleEvent::Link {
+                event: LinkEvent::ControlUndecodable(_),
+                ..
+            })
+        ));
+        assert!(!cancel_token.is_cancelled());
+    }
+
+    #[tokio::test]
+    async fn control_dispatcher_applies_queued_cancel_before_shutdown() {
+        let (tx, cancel_token, shutdown, _events_rx, dispatcher) = dispatcher_with_peer();
+        tx.send(encode_control_message(&ControlMessage::Cancel {
+            reason: "peer failed".to_string(),
+        }))
+        .await
+        .unwrap();
+        // Teardown races with the queued Cancel; the Cancel must win.
+        shutdown.cancel();
+        tokio::time::timeout(std::time::Duration::from_secs(2), dispatcher)
+            .await
+            .expect("dispatcher should exit")
+            .unwrap();
+        assert!(cancel_token.is_cancelled());
+        drop(tx);
+    }
+
+    #[tokio::test]
+    async fn control_dispatcher_exits_on_shutdown() {
+        let (_tx, cancel_token, shutdown, mut events_rx, dispatcher) = dispatcher_with_peer();
+
+        // Signal teardown — dispatcher should exit promptly without
+        // cancelling the dataflow token or reporting a closed link.
+        shutdown.cancel();
+        tokio::time::timeout(std::time::Duration::from_secs(2), dispatcher)
+            .await
+            .expect("dispatcher should exit on shutdown")
             .unwrap();
 
         assert!(
             !cancel_token.is_cancelled(),
             "dataflow token should not be cancelled on clean shutdown"
         );
+        assert!(events_rx.recv().await.is_none());
     }
 
     #[tokio::test]
@@ -1452,8 +1591,11 @@ mod tests {
             &runtime,
         )
         .unwrap();
+        let transport = crate::communication::cluster_transport::ClusterTransport::Dedicated(
+            std::sync::Arc::new(session),
+        );
 
-        broadcast_cancel(&session, dataflow_id, "worker failed").await;
+        broadcast_cancel_with_transport(&transport, dataflow_id, "worker failed").await;
 
         let mut remote_a = FramedReader::new(peer_a_remote);
         let mut remote_b = FramedReader::new(peer_b_remote);

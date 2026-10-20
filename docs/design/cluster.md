@@ -45,16 +45,19 @@ the entire distributed computation winds down consistently. The control channel
 The `reason` field is a human-readable string (e.g., `"user requested shutdown"`,
 `"operator panicked"`).
 
-**Components** — Two tasks are spawned per cluster dataflow during Phase 8.5 of
-`spawn_cluster`:
+**Components** — Two pieces handle cancellation for each cluster dataflow:
 
-| Task | Trigger | Action |
-|------|---------|--------|
-| **Cancel broadcaster** | Local `dataflow_cancel` token fires | Sends `Cancel` to every peer's control channel, then exits |
-| **Cancel listener** | Receives `Cancel` on any peer control channel | Fires local `dataflow_cancel` with `CancellationReason::PeerCancelled { peer_id, detail }` |
+| Component | Trigger | Action |
+|-----------|---------|--------|
+| **Lifecycle coordinator** (spawned in Phase 11) | Local `dataflow_cancel` token fires while local workers are still running | Sends `Cancel` to every peer's control channel (bounded by `handshake_timeout`), then tears down once the local workers have stopped |
+| **Control dispatcher** (spawned in Phase 8.5) | Receives `Cancel` on any peer control channel | Fires local `dataflow_cancel` with `CancellationReason::PeerCancelled { peer_id, detail }` |
 
-Both tasks also exit when the `bridge_cancel` token fires (normal completion),
-preventing resource leaks on the happy path.
+Both run on the tokio runtime passed to `spawn_cluster`. The dispatcher keeps
+running until teardown (it also receives the shutdown handshake's
+acknowledgements, §5.5.3) and handles any message already queued before it
+exits. A local cancellation that happens *after* this node's workers completed
+successfully is not broadcast: the node's part of the dataflow is done, and
+the shutdown handshake still runs to completion.
 
 **First-cancel-wins semantics** — `CancellationToken::cancel_with_reason()` is
 idempotent: once the token is cancelled, subsequent calls are no-ops. This
@@ -71,7 +74,7 @@ Each node broadcasts at most once per dataflow.
 **Peer-down integration** — When the hosting application reports a node departure
 via `report_node_leave()`, the `ClusterCancelHandle` cancels the shared
 `dataflow_cancel` token (not just individual worker tokens). This ensures the
-broadcaster fires, notifying healthy peers before bridge teardown.
+coordinator broadcasts `Cancel` to healthy peers before bridge teardown.
 
 **Security assumption** — `Cancel` messages carry no cryptographic signature.
 Peer identity verification is the responsibility of the transport layer (e.g.,
@@ -173,16 +176,134 @@ let result = rt.spawn_cluster(
 // result = Err(HandshakeError::Timeout { peer_id: "node-b" })
 ```
 
-**Control channel** — Handshake, Ready, and Cancel messages share a dedicated
-control channel (channel ID 0) that is separate from data and progress
-channels. Control messages receive biased priority in the transport layer's
-shared FIFO queue. Wire formats (each followed by a CRC32 trailer):
+**Control channel** — Handshake, Ready, Cancel and EndOfStreamAck messages
+share a dedicated control channel (channel ID 0) that is separate from data
+and progress channels. Control messages receive biased priority in the
+transport layer's shared FIFO queue. Wire formats (each followed by a CRC32
+trailer):
 
 ```
 Handshake: [type=0][protocol_version: u32 LE][fingerprint: u64 LE][dataflow_id: 16 bytes]
            [node_id_len: u32 LE][node_id: UTF-8 bytes]
 Ready:     [type=1][node_id_len: u32 LE][node_id: UTF-8 bytes]
 ```
+
+#### 5.5.3 Cluster Shutdown Protocol (clean teardown)
+
+A node whose local workers finish first must not tear down while peers still
+need its frames, and a clean close must be distinguishable on the wire from a
+connection loss. Each cluster dataflow therefore runs a **lifecycle
+coordinator** task per node (spawned at the end of `spawn_cluster`). It owns
+the transport session (or the shared-manager registration), the network
+bridges and the peer-registry entry, so their lifetime no longer depends on
+the user's join handle.
+
+**Ordered per-peer lanes.** Data frames go straight to the transport's
+bounded per-peer payload queue (`try_send`, with backpressure). Everything
+that must never be lost — progress deltas, data-channel close sentinels and
+end-of-stream markers — is queued on an unbounded, ordered per-peer *outbox*
+whose forwarder awaits capacity on that same payload queue. The forwarder is
+never cut short by cancellation; it exits once every producer has released
+its outbox. Because both paths feed one FIFO payload lane per peer (dedicated:
+the peer's payload channel; shared: the dataflow's sequenced lane and reorder
+buffer), a marker queued after a frame is delivered after it.
+
+**Wire messages.**
+
+| Message | Channel | Format | Meaning |
+|---|---|---|---|
+| Close sentinel | each data channel (payload lane) | `[0xFF]` | No more data on this channel |
+| Progress end-of-stream | each progress channel (payload lane) | `[count = 0xFFFF_FFFF u32 LE][crc32]` | No more progress on this channel. Real batches are capped at `u32::MAX - 1` changes, so the count is unambiguous |
+| `EndOfStreamAck` | control (ID 0) | `[0x10][crc32]` | "I received everything you sent, including your end-of-stream markers" |
+
+**Protocol.**
+
+1. When every local worker has finished with `Ok(true)` (each worker's
+   executor — and with it every network push and progress sender — is
+   dropped before its completion is reported), the coordinator queues one
+   end-of-stream marker on every progress channel to every peer, behind
+   everything else on the lane. These markers are the node's *goodbye*.
+2. A node that has received the end-of-stream marker on every progress channel
+   from a peer replies with `EndOfStreamAck` — immediately, even if its own
+   workers are still running.
+3. A link is **retired** once either the peer has acknowledged our goodbye
+   (it holds everything we sent) or we have received the peer's goodbye (its
+   workers are done, so it needs nothing from us). Once a link is retired,
+   frames still addressed to that peer are discarded, and transport failures
+   on it (EOF, write errors, reorder timeouts) are benign.
+4. The node tears down — stops its bridges, unregisters from the shared
+   managers and the peer registry, releases the transport — once every link is
+   retired, or once a link that is not retired has ended for good (all its
+   channels closed, a corrupt frame or control message, a transport error, our
+   goodbye could not be handed to the transport, or the peer's `Cancel`).
+   If any link was given up on rather than retired, the node first flushes
+   what it queued (bounded by `handshake_timeout`): it waits for its outbox
+   forwarders to hand their lanes to the transport and, in Shared mode, for a
+   flush barrier on each manager's payload queue
+   (`SharedPeerManager::flush_dataflow`) before unregistering, because the
+   shared bridge drops queued frames of unregistered dataflows. A peer that
+   cancelled may still be draining (`drain_on_cancel`) and need our final
+   progress.
+
+No node waits for another node's *completion*, only for the receipt of its own
+goodbye (one round trip), so sequential joins across nodes cannot deadlock.
+
+```text
+ Node A (done first)                       Node B (still running)
+   │ workers Ok                              │
+   │── progress EOS × (A workers × B workers) ──►│ all EOS received
+   │                                         │   → retire link A, send ack
+   │◄──────────────── EndOfStreamAck ────────│
+   │ every link retired → teardown           │
+   │ (join resolves)                         │ ... workers finish later
+   │                                         │── EOS to A (discarded) ──►
+   │                                         │ link A already retired → teardown
+```
+
+**Completion handles.** `ClusterCompletion` resolves once the local workers
+have finished *and* the coordinator has finished teardown; its result is the
+local workers' result. Dropping an unresolved `ClusterCompletion` detaches it:
+the dataflow keeps running and the handshake still happens. Dropping a
+`ClusterSpawnedDataflow` without calling `join()` cancels the dataflow, and the
+coordinator broadcasts the cancellation to every peer. Blocking waits
+(`join_blocking`, `ClusterCompletion::wait`) need the transport's tokio runtime
+to make progress, so they must not be called from the only thread of a
+`current_thread` runtime that hosts the transport.
+
+**Failure paths.** If a local worker fails (or the dataflow is cancelled
+before local completion), the coordinator broadcasts `Cancel` (bounded by
+`handshake_timeout`), waits for the local workers to stop, and tears down
+without sending a goodbye. `Cancel` therefore acts as a terminal goodbye in
+both directions: a node that receives a peer's `Cancel` (in any phase) stops
+waiting for that peer, and a node that broadcast `Cancel` but whose workers
+still succeed (the cancellation raced with completion) queues its goodbye and
+tears down without waiting for acknowledgements. Otherwise two nodes that
+both finish successfully after a crossing cancellation could each wait for a
+goodbye or ack from a peer that had already torn down; in Shared mode nothing
+else could resolve that wait.
+A link that fails before it is retired while local
+workers still run keeps the pre-handshake behaviour (bridges are torn down; a
+shared-transport error also cancels the dataflow) through a single hook in the
+coordinator, `LinkFailed`, which is where making such losses fatal belongs.
+If the dataflow is already being cancelled, such failures are expected and the
+coordinator simply waits for the local workers to stop.
+A local cancellation or runtime shutdown that happens after the goodbye was
+committed is not broadcast and does not cut the handshake short.
+
+**Residual limits.** The last message of any handshake cannot itself be
+confirmed. If a node's transport is *aborted* (its tokio runtime dropped, or
+the last reference to its shared managers dropped) at the instant its peer
+also finishes, that peer may miss both the goodbye and the ack. It then
+detects the link loss (dedicated: EOF; shared: after reconnect attempts are
+exhausted) and still reports its own local result. Similarly, when a dropped
+`ClusterSpawnedDataflow` releases the last reference to its shared managers,
+the queued `Cancel` can be aborted with the writers; peers are then cancelled
+by the resulting transport failure instead of `PeerCancelled`. A peer that is
+partitioned but whose connection never fails delays the handshake until the
+connection fails. If a `Cancel` broadcast times out (its control queue stayed
+full for `handshake_timeout`) and the local workers then still succeed, a
+Shared-mode peer that never received the `Cancel` may miss the goodbye too,
+because the goodbye is dropped when the dataflow unregisters.
 
 ### 12.5 Dynamic Cluster Scaling
 

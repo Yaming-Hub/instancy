@@ -49,9 +49,14 @@
 //!
 //! # Close semantics
 //!
-//! Each `NetworkPush` sends an explicit close frame (empty payload with a
-//! reserved close-sentinel channel ID) when `close()` is called. The
-//! corresponding `NetworkPull` detects this and marks itself exhausted.
+//! Each `NetworkPush` sends an explicit close frame (a payload consisting of
+//! the close tag) on its channel when `close()` is called or the push is
+//! dropped. The corresponding `NetworkPull` detects this and marks itself
+//! exhausted. In a cluster dataflow the close frame is queued on the peer's
+//! ordered outbox lane (the runtime's per-peer forwarder that awaits queue
+//! capacity), so it is never lost to a full transport queue and still arrives
+//! after all of this push's data. A push without an outbox (standalone use of
+//! [`NetworkEdgeMaterializer`]) falls back to a best-effort `try_send`.
 //!
 //! [`Codec`]: crate::communication::codec::Codec
 //! [`EdgeMaterializer`]: crate::dataflow::channels::edge_materializer::EdgeMaterializer
@@ -273,6 +278,8 @@ pub struct NetworkPush<T: Timestamp + ExchangeData, D: ExchangeData> {
     dataflow_id: DataflowId,
     channel_id: u64,
     sender: crate::communication::cluster_transport::FrameSender,
+    /// Ordered lossless lane to the peer (cluster dataflows only).
+    outbox: Option<crate::communication::peer_link::PeerOutbox>,
     closed: bool,
 }
 
@@ -286,16 +293,58 @@ impl<T: Timestamp + ExchangeData, D: ExchangeData> NetworkPush<T, D> {
         Ok(buf)
     }
 
+    /// Whether the peer's link is retired: it has finished, or it already
+    /// holds everything this node will send. Data for it is discarded.
+    fn peer_retired(&self) -> bool {
+        self.outbox
+            .as_ref()
+            .is_some_and(|outbox| outbox.is_retired())
+    }
+
     fn send_frame(&self, payload: Vec<u8>) -> std::result::Result<(), Error> {
         let frame = Frame {
             dataflow_id: self.dataflow_id,
             channel_id: self.channel_id,
             payload,
         };
-        self.sender.try_send(frame).map_err(|e| match e {
-            tokio_mpsc::error::TrySendError::Full(_) => Error::Backpressure,
-            tokio_mpsc::error::TrySendError::Closed(_) => Error::ChannelClosed,
-        })
+        match self.sender.try_send(frame) {
+            Ok(()) => Ok(()),
+            Err(tokio_mpsc::error::TrySendError::Full(_)) => Err(Error::Backpressure),
+            // The peer tore down after retiring the link; nothing is lost.
+            Err(tokio_mpsc::error::TrySendError::Closed(_)) if self.peer_retired() => Ok(()),
+            Err(tokio_mpsc::error::TrySendError::Closed(_)) => Err(Error::ChannelClosed),
+        }
+    }
+
+    /// Queue the close sentinel behind this push's data.
+    fn send_close(&mut self) {
+        self.closed = true;
+        let mut buf = Vec::new();
+        encode_close(&mut buf);
+        let frame = Frame {
+            dataflow_id: self.dataflow_id,
+            channel_id: self.channel_id,
+            payload: buf,
+        };
+        match &self.outbox {
+            // Unbounded and ordered: the sentinel cannot be lost to a full
+            // queue, and the forwarder enqueues it after the data this push
+            // already handed to the transport.
+            Some(outbox) => {
+                let _ = outbox.send(frame);
+            }
+            // Standalone use without an outbox: best effort. A spin loop could
+            // deadlock a single-threaded runtime, so we do not retry.
+            None => {
+                if let Err(_e) = self.sender.try_send(frame) {
+                    #[cfg(feature = "tracing")]
+                    tracing::warn!(
+                        "close sentinel lost for channel {} (queue full or closed): {_e}",
+                        self.channel_id,
+                    );
+                }
+            }
+        }
     }
 }
 
@@ -304,6 +353,9 @@ impl<T: Timestamp + ExchangeData, D: ExchangeData> Push<T, D, ()> for NetworkPus
     fn push(&mut self, envelope: Envelope<T, D, ()>) -> Result<()> {
         if self.closed {
             return Err(Error::ChannelClosed);
+        }
+        if self.peer_retired() {
+            return Ok(());
         }
         let bytes = self.encode(&envelope)?;
         self.send_frame(bytes)
@@ -315,6 +367,9 @@ impl<T: Timestamp + ExchangeData, D: ExchangeData> Push<T, D, ()> for NetworkPus
     ) -> std::result::Result<(), (Error, Envelope<T, D, ()>)> {
         if self.closed {
             return Err((Error::ChannelClosed, envelope));
+        }
+        if self.peer_retired() {
+            return Ok(());
         }
         let bytes = match self.encode(&envelope) {
             Ok(b) => b,
@@ -333,33 +388,7 @@ impl<T: Timestamp + ExchangeData, D: ExchangeData> Push<T, D, ()> for NetworkPus
 
     fn close(&mut self) {
         if !self.closed {
-            self.closed = true;
-            // Best-effort close sentinel delivery.
-            //
-            // We use try_send (non-blocking) instead of a spin loop because:
-            // - A spin loop with std::thread::yield_now() can deadlock on
-            //   single-threaded tokio runtimes (the bridge task that drains
-            //   the channel can't be scheduled while we hold the thread).
-            // - If the queue is full, the sentinel is lost, but the remote
-            //   side will detect EOF when the TCP connection closes (session
-            //   drop aborts all tasks).
-            //
-            // Callers should ensure the channel is not saturated before close,
-            // or rely on EOF-based exhaustion detection as a fallback.
-            let mut buf = Vec::new();
-            encode_close(&mut buf);
-            let frame = Frame {
-                dataflow_id: self.dataflow_id,
-                channel_id: self.channel_id,
-                payload: buf,
-            };
-            if let Err(_e) = self.sender.try_send(frame) {
-                #[cfg(feature = "tracing")]
-                tracing::warn!(
-                    "close sentinel lost for channel {} (queue full or closed): {_e}",
-                    self.channel_id,
-                );
-            }
+            self.send_close();
         }
     }
 
@@ -378,17 +407,9 @@ impl<T: Timestamp + ExchangeData, D: ExchangeData> Push<T, D, ()> for NetworkPus
 impl<T: Timestamp + ExchangeData, D: ExchangeData> Drop for NetworkPush<T, D> {
     fn drop(&mut self) {
         if !self.closed {
-            self.closed = true;
-            // Best-effort close sentinel in Drop (non-blocking to avoid
-            // blocking in destructor). Callers should call close() explicitly.
-            let mut buf = Vec::new();
-            encode_close(&mut buf);
-            let frame = Frame {
-                dataflow_id: self.dataflow_id,
-                channel_id: self.channel_id,
-                payload: buf,
-            };
-            let _ = self.sender.try_send(frame);
+            // Never blocks: the outbox lane is unbounded and the fallback
+            // path uses try_send. Callers should still call close().
+            self.send_close();
         }
     }
 }
@@ -556,6 +577,9 @@ pub struct NetworkEdgeMaterializer<T: Timestamp + ExchangeData, D: ExchangeData>
     /// Tokio runtime handle for spawning bridge tasks that forward remote
     /// data from tokio mpsc channels and notify the executor's WakeHandle.
     runtime_handle: tokio::runtime::Handle,
+
+    /// Per-peer ordered lanes used for close sentinels (cluster dataflows).
+    peer_outboxes: std::collections::HashMap<String, crate::communication::peer_link::PeerOutbox>,
 }
 
 #[cfg(feature = "transport")]
@@ -651,7 +675,20 @@ impl<T: Timestamp + ExchangeData, D: ExchangeData> NetworkEdgeMaterializer<T, D>
             taken_pull: vec![false; num_workers],
             wake_handles,
             runtime_handle,
+            peer_outboxes: std::collections::HashMap::new(),
         })
+    }
+
+    /// Route close sentinels through the given per-peer ordered lanes.
+    pub(crate) fn with_peer_outboxes(
+        mut self,
+        peer_outboxes: std::collections::HashMap<
+            String,
+            crate::communication::peer_link::PeerOutbox,
+        >,
+    ) -> Self {
+        self.peer_outboxes = peer_outboxes;
+        self
     }
 
     /// Convenience constructor that creates a [`TransportSession`] internally.
@@ -826,6 +863,7 @@ impl<T: Timestamp + ExchangeData, D: ExchangeData> EdgeMaterializer<T, D>
                     dataflow_id: self.dataflow_id,
                     channel_id,
                     sender,
+                    outbox: self.peer_outboxes.get(dst_node).cloned(),
                     closed: false,
                 }));
             }

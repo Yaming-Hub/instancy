@@ -43,6 +43,9 @@ use crate::scheduler::policy::SchedulePolicy;
 use crate::worker::WorkerContext;
 use crate::worker_pool::{WorkerPool, WorkerPoolConfig};
 
+#[cfg(feature = "transport")]
+mod cluster_lifecycle;
+
 /// Configuration for creating a [`RuntimeHandle`].
 ///
 /// Each `RuntimeHandle` gets its own worker pool, task queue, and scheduling
@@ -2799,9 +2802,11 @@ impl RuntimeHandle {
     {
         use crate::communication::cluster_transport::{ClusterSpawnTransport, ClusterTransport};
         use crate::communication::control_protocol::{
-            broadcast_cancel, broadcast_cancel_with_transport, graph_fingerprint,
-            perform_handshake, perform_handshake_with_transport, perform_ready_barrier,
-            perform_ready_barrier_with_transport, spawn_cancel_listener,
+            graph_fingerprint, perform_handshake, perform_handshake_with_transport,
+            perform_ready_barrier, perform_ready_barrier_with_transport, spawn_control_dispatcher,
+        };
+        use crate::communication::peer_link::{
+            LifecycleEvent, LinkEvent, report_link_event, spawn_peer_outbox,
         };
         use crate::communication::transport_session::{
             CONTROL_CHANNEL_ID, ChannelRegistration, TransportSession,
@@ -2811,6 +2816,7 @@ impl RuntimeHandle {
         use crate::progress::network_progress::{
             DEFAULT_MAX_BATCH_SIZE, create_network_progress_channels, progress_channel_id,
         };
+        use cluster_lifecycle::{ClusterLifecycle, LifecycleMachine, teardown_signal};
 
         // `nodes` is public, so the topology may not have gone through
         // `multi_node`: reject duplicate node ids (which would create phantom
@@ -3176,6 +3182,24 @@ impl RuntimeHandle {
             .map_err(|e| Error::Runtime(RuntimeError::Handshake(e)))?;
         }
 
+        // Phase 4.5: Per-peer ordered outbound lanes and the lifecycle event
+        // channel. Progress deltas, close sentinels and the end-of-stream
+        // markers all travel through these lanes (see cluster_lifecycle).
+        let (events_tx, events_rx) = tokio::sync::mpsc::unbounded_channel::<LifecycleEvent>();
+        let mut outboxes = std::collections::HashMap::new();
+        let mut forwarders = Vec::new();
+        for peer_id in transport.peer_node_ids() {
+            let payload_sender = transport.progress_sender(&peer_id).ok_or_else(|| {
+                Error::Runtime(RuntimeError::InvalidConfig(format!(
+                    "missing payload sender for peer {peer_id}"
+                )))
+            })?;
+            let (outbox, forwarder) =
+                spawn_peer_outbox(&peer_id, payload_sender, events_tx.clone(), runtime_handle);
+            outboxes.insert(peer_id, outbox);
+            forwarders.push(forwarder);
+        }
+
         // Phase 5: Wire exchange channels using network-backed factories.
         // Create wake handles BEFORE exchange wiring so bridge tasks can use them.
         // Wake handles for ALL workers (remote ones are placeholders for API compat).
@@ -3249,6 +3273,7 @@ impl RuntimeHandle {
                 wake_handles: wake_handles.clone(),
                 runtime_handle: runtime_handle.clone(),
                 channel_metrics: ch_metrics,
+                peer_outboxes: outboxes.clone(),
             };
             let all_factories = creator.create(params)?;
 
@@ -3324,43 +3349,19 @@ impl RuntimeHandle {
         // Create a dataflow-level cancel token for local workers. When any local
         // worker fails, this cascades cancellation to all siblings.
         let dataflow_cancel = Some(self.cancel.child_token());
-        // Convert to tokio_util CancellationToken for bridge tasks.
+        // Stops the network bridges and the control dispatcher at teardown.
         let bridge_cancel = tokio_util::sync::CancellationToken::new();
 
-        // Spawn error monitoring tasks for shared transport mode.
+        // Shared mode: forward transport errors to the lifecycle coordinator,
+        // which ignores them on retired links (see cluster_lifecycle).
         if let Some(error_rxs) = shared_error_receivers {
-            // SAFETY: dataflow_cancel is unconditionally set for cluster dataflows
-            let df_cancel = dataflow_cancel
-                .as_ref()
-                .expect("dataflow_cancel always set for cluster dataflows")
-                .clone();
-            let bc = bridge_cancel.clone();
             for (peer_id, mut error_rx) in error_rxs {
-                let cancel = df_cancel.clone();
-                let bridge = bc.clone();
-                let peer = peer_id.clone();
+                let events = events_tx.clone();
                 runtime_handle.spawn(async move {
-                    if let Some(err) = error_rx.recv().await {
+                    while let Some(err) = error_rx.recv().await {
                         #[cfg(feature = "tracing")]
-                        tracing::error!(
-                            peer = %peer,
-                            error = ?err,
-                            "shared transport error received, cancelling dataflow"
-                        );
-                        let reason = if matches!(
-                            err,
-                            crate::communication::transport::TransportError::LockPoisoned { .. }
-                        ) {
-                            crate::cancellation::CancellationReason::InternalError {
-                                detail: format!("transport lock poisoned for peer {peer}"),
-                            }
-                        } else {
-                            crate::cancellation::CancellationReason::WorkerFailed {
-                                detail: format!("shared transport failure from peer {peer}"),
-                            }
-                        };
-                        cancel.cancel_with_reason(reason);
-                        bridge.cancel();
+                        tracing::warn!(peer = %peer_id, error = ?err, "shared transport error");
+                        report_link_event(&events, &peer_id, LinkEvent::TransportError(err));
                     }
                 });
             }
@@ -3389,7 +3390,7 @@ impl RuntimeHandle {
 
         let (progress_channels, progress_handles) = create_network_progress_channels::<T>(
             local_progress,
-            &transport,
+            &outboxes,
             receivers,
             dataflow_id,
             (local_start, local_end),
@@ -3397,6 +3398,7 @@ impl RuntimeHandle {
             total_workers,
             &wake_handles,
             bridge_cancel.clone(),
+            events_tx.clone(),
             DEFAULT_MAX_BATCH_SIZE,
             runtime_handle,
         )
@@ -3474,70 +3476,37 @@ impl RuntimeHandle {
             .map_err(|e| Error::Runtime(RuntimeError::Handshake(e)))?;
         }
 
-        // Phase 8.5: Keep listening for peer cancellation and broadcast local cancellation.
-        let _cancel_listener = spawn_cancel_listener(
+        // Phase 8.5: Keep listening on the control channels for peer
+        // cancellation and end-of-stream acknowledgements. Local cancellation
+        // is broadcast by the lifecycle coordinator (Phase 11).
+        let dispatcher = spawn_control_dispatcher(
             std::mem::take(&mut control_receivers),
             dataflow_cancel
                 .as_ref()
                 .expect("dataflow_cancel always set for cluster dataflows")
                 .clone(),
             bridge_cancel.clone(),
+            events_tx.clone(),
+            runtime_handle,
         );
-        {
-            let broadcast_cancel_token = dataflow_cancel
-                .as_ref()
-                .expect("dataflow_cancel always set for cluster dataflows")
-                .clone();
-            let broadcast_shutdown = bridge_cancel.clone();
-            let broadcast_dataflow_id = dataflow_id;
-
-            if let Some(session) = dedicated_session.clone() {
-                runtime_handle.spawn(async move {
-                    tokio::select! {
-                        biased;
-                        _ = broadcast_cancel_token.cancelled_async() => {
-                            let reason = broadcast_cancel_token
-                                .reason()
-                                .map(|reason| reason.to_string())
-                                .unwrap_or_else(|| "cancelled".to_string());
-                            broadcast_cancel(&session, broadcast_dataflow_id, &reason).await;
-                        }
-                        _ = broadcast_shutdown.cancelled() => {}
-                    }
-                });
-            } else {
-                let broadcast_transport = Arc::clone(&transport);
-                runtime_handle.spawn(async move {
-                    tokio::select! {
-                        biased;
-                        _ = broadcast_cancel_token.cancelled_async() => {
-                            let reason = broadcast_cancel_token
-                                .reason()
-                                .map(|reason| reason.to_string())
-                                .unwrap_or_else(|| "cancelled".to_string());
-                            broadcast_cancel_with_transport(
-                                &broadcast_transport,
-                                broadcast_dataflow_id,
-                                &reason,
-                            )
-                            .await;
-                        }
-                        _ = broadcast_shutdown.cancelled() => {}
-                    }
-                });
-            }
-        }
 
         // Phase 9: Register all workers for execution.
         // Track each worker as an active dataflow for wait_idle()/shutdown_async();
-        // all workers are counted before any is registered.
+        // all workers are counted before any is registered. Each worker also
+        // reports its outcome to the lifecycle coordinator; its executor (with
+        // every network push and progress sender) is dropped before that report.
         let finished = self.track_completion(prepared.iter_mut().map(|(_, _, n)| n));
         let mut workers = Vec::with_capacity(num_local);
-        for (spawned, executor, notifier) in prepared {
+        for (spawned, executor, mut notifier) in prepared {
+            let events = events_tx.clone();
+            notifier.set_result_observer(Box::new(move |success| {
+                let _ = events.send(LifecycleEvent::WorkerFinished { success });
+            }));
             self.registry
                 .register(executor, notifier, dataflow_id, dataflow_priority);
             workers.push(spawned);
         }
+        drop(events_tx);
 
         // Phase 10: Register in peer registry for peer-down notification.
         let remote_peer_ids: Vec<String> = topology
@@ -3565,34 +3534,51 @@ impl RuntimeHandle {
             None
         };
 
-        // Phase 11: Spawn completion-triggered cleanup task.
-        // When bridge_cancel fires (dataflow completes or is cancelled), this task
-        // promptly frees all per-dataflow resources from shared state:
-        //   - PeerRegistry registration (peer-down notification)
-        //   - SharedPeerManager registrations + reorder buffers
-        //
-        // Timing: bridge_cancel fires when ClusterCompletion resolves (after all
-        // workers complete) or when ClusterSpawnedDataflow is dropped without join().
+        // Phase 11: Spawn the lifecycle coordinator. It owns the transport,
+        // bridges and registrations and releases them only after the clean
+        // shutdown handshake (or a failure), independently of the join handle.
+        let (teardown_notifier, teardown_waiter) = teardown_signal();
         {
-            let cleanup_cancel = bridge_cancel.clone();
-            let peer_registry = Arc::clone(&self.peer_registry);
-            let shared_managers = shared_managers_arc.clone();
-            let cleanup_dataflow_id = dataflow_id;
-            runtime_handle.spawn(async move {
-                cleanup_cancel.cancelled().await;
-
-                // Unregister from peer registry.
-                if let Some(reg_id) = peer_reg_id {
-                    peer_registry.unregister(reg_id);
-                }
-
-                // Unregister from shared peer managers.
-                if let Some(managers) = shared_managers {
-                    for manager in managers.values() {
-                        manager.unregister_dataflow(&cleanup_dataflow_id).await;
-                    }
-                }
-            });
+            let peer_workers: std::collections::HashMap<String, (usize, usize)> = remote_peers
+                .iter()
+                .map(|(peer, start, end)| (peer.clone(), (*start, *end)))
+                .collect();
+            let machine = LifecycleMachine::new(
+                num_local,
+                remote_peers.iter().filter_map(|(peer, start, end)| {
+                    outboxes.get(peer).map(|outbox| {
+                        (
+                            peer.clone(),
+                            (end - start) * num_local,
+                            Arc::clone(outbox.link()),
+                        )
+                    })
+                }),
+            );
+            let lifecycle = ClusterLifecycle {
+                machine,
+                events: events_rx,
+                dataflow_id,
+                dataflow_cancel: dataflow_cancel
+                    .as_ref()
+                    .expect("dataflow_cancel always set for cluster dataflows")
+                    .clone(),
+                bridge_cancel,
+                local_workers: (local_start, local_end),
+                peer_workers,
+                total_workers,
+                cancel_broadcast_timeout: handshake_timeout,
+                outboxes,
+                forwarders,
+                progress_handles: Some(progress_handles),
+                dispatcher: Some(dispatcher),
+                peer_registry: Arc::clone(&self.peer_registry),
+                peer_registration: peer_reg_id,
+                shared_managers: shared_managers_arc,
+                transport,
+                _teardown: teardown_notifier,
+            };
+            runtime_handle.spawn(lifecycle.run());
             if let Some(cleanup) = shared_registration_cleanup.as_mut() {
                 cleanup.disarm();
             }
@@ -3618,11 +3604,7 @@ impl RuntimeHandle {
             }),
             local_worker_range: (local_start, local_end),
             total_workers,
-            _transport: transport,
-            _shared_managers: shared_managers_arc,
-            _progress_handles: Some(progress_handles),
-            _bridge_cancel: bridge_cancel,
-            _bridge_cancel_moved: false,
+            teardown: Some(teardown_waiter),
         })
     }
 }
@@ -4096,6 +4078,7 @@ pub struct CompletionNotifier {
     shared: Arc<Mutex<SharedCompletionState>>,
     condvar: Arc<Condvar>,
     on_complete: Option<Box<dyn FnOnce() + Send>>,
+    on_result: Option<Box<dyn FnOnce(bool) + Send>>,
     failure_cancel: Option<CancellationToken>,
     completed: bool,
 }
@@ -4113,6 +4096,14 @@ impl CompletionNotifier {
         self.on_complete = Some(f);
     }
 
+    /// Attach a callback that receives whether the executor completed
+    /// successfully (`Ok(true)`). Fires once, from `complete()` or from `Drop`
+    /// (with `false`). The executor future has already been dropped by then.
+    #[cfg(feature = "transport")]
+    pub(crate) fn set_result_observer(&mut self, f: Box<dyn FnOnce(bool) + Send>) {
+        self.on_result = Some(f);
+    }
+
     /// Publish the executor result and wake any waiting future/condvar.
     pub fn complete(mut self, result: Result<bool>) {
         if let Err(error) = &result {
@@ -4121,6 +4112,9 @@ impl CompletionNotifier {
                     detail: error.to_string(),
                 });
             }
+        }
+        if let Some(observer) = self.on_result.take() {
+            observer(matches!(result, Ok(true)));
         }
         self.completed = true;
         {
@@ -4150,6 +4144,9 @@ impl Drop for CompletionNotifier {
             cancel.cancel_with_reason(CancellationReason::WorkerFailed {
                 detail: "dataflow executor terminated unexpectedly (possible panic)".into(),
             });
+        }
+        if let Some(observer) = self.on_result.take() {
+            observer(false);
         }
         // Executor panicked or was killed without publishing a result.
         let mut state = match self.shared.lock() {
@@ -4227,6 +4224,7 @@ impl DataflowCompletion {
             shared,
             condvar,
             on_complete: None,
+            on_result: None,
             failure_cancel: None,
             completed: false,
         };
@@ -5087,31 +5085,21 @@ impl<T: Timestamp> Drop for MultiSpawnedDataflow<T> {
 ///
 /// # Lifetime
 ///
-/// Dropping this handle cancels all local workers and tears down network
-/// resources (transport session, progress bridges). The `bridge_cancel` token
-/// signals all async bridge tasks to shut down.
+/// The network resources (transport session, bridges, shared-manager
+/// registration) are owned by a per-dataflow lifecycle task, not by this
+/// handle. They are released only after the clean shutdown handshake: every
+/// peer has acknowledged this node's end-of-stream or has finished itself
+/// (see `docs/design/cluster.md` §5.5.3).
+///
+/// Dropping this handle without calling [`join()`](Self::join) cancels the
+/// dataflow on this node and broadcasts the cancellation to every peer.
 #[cfg(feature = "transport")]
 pub struct ClusterSpawnedDataflow<T: Timestamp> {
     inner: Option<MultiSpawnedDataflow<T>>,
     local_worker_range: (usize, usize),
     total_workers: usize,
-    /// Keeps transport alive (background Muxer/Demuxer tasks).
-    _transport: Arc<crate::communication::cluster_transport::ClusterTransport>,
-    /// Keeps shared peer managers alive (prevents task abort on drop).
-    _shared_managers: Option<
-        Arc<
-            std::collections::HashMap<
-                String,
-                crate::communication::shared_transport::SharedPeerManager,
-            >,
-        >,
-    >,
-    /// Keeps progress bridge tasks alive.
-    _progress_handles: Option<crate::progress::network_progress::NetworkProgressHandles>,
-    /// Cancels bridge tasks on drop.
-    _bridge_cancel: tokio_util::sync::CancellationToken,
-    /// Set to true when join() transfers bridge_cancel ownership to ClusterCompletion.
-    _bridge_cancel_moved: bool,
+    /// Resolves once the lifecycle task has torn the dataflow down.
+    teardown: Option<cluster_lifecycle::TeardownWaiter>,
 }
 
 #[cfg(feature = "transport")]
@@ -5314,7 +5302,11 @@ impl<T: Timestamp> ClusterSpawnedDataflow<T> {
             .take_async_output(local_idx, name)
     }
 
-    /// Cancel all local workers and tear down the cluster.
+    /// Cancel all local workers and propagate the cancellation to every peer.
+    ///
+    /// The lifecycle task broadcasts the cancellation and releases network
+    /// resources once the local workers have stopped. Has no effect on peers
+    /// once this node's workers have completed successfully.
     pub fn cancel(&self) {
         if let Some(ref inner) = self.inner {
             if let Some(ref dataflow_cancel) = inner._dataflow_cancel {
@@ -5325,10 +5317,10 @@ impl<T: Timestamp> ClusterSpawnedDataflow<T> {
                 }
             }
         }
-        self._bridge_cancel.cancel();
     }
 
-    /// Cancel all local workers with a specific reason and tear down the cluster.
+    /// Cancel all local workers with a specific reason and propagate the
+    /// cancellation to every peer. See [`cancel()`](Self::cancel).
     pub fn cancel_with_reason(&self, reason: CancellationReason) {
         if let Some(ref inner) = self.inner {
             if let Some(ref dataflow_cancel) = inner._dataflow_cancel {
@@ -5339,17 +5331,18 @@ impl<T: Timestamp> ClusterSpawnedDataflow<T> {
                 }
             }
         }
-        self._bridge_cancel.cancel();
     }
 
     /// Take the completion handles from all local workers.
     ///
-    /// Returns a [`ClusterCompletion`] that keeps transport and bridge resources
-    /// alive until all workers finish. Bridges are cancelled only when the
-    /// returned completion handle is dropped (after awaiting or waiting).
+    /// Returns a [`ClusterCompletion`] that resolves once all local workers
+    /// have finished **and** the cluster shutdown handshake has completed:
+    /// every peer has acknowledged everything this node sent, or has finished
+    /// itself. The result is the local workers' result.
     ///
     /// The returned handle implements [`Future`] and can be `.await`ed in
     /// async code, or blocked on via [`.wait()`](ClusterCompletion::wait).
+    /// Dropping it does not stop the dataflow (see [`ClusterCompletion`]).
     pub fn join(mut self) -> Result<ClusterCompletion<T>> {
         let completion = self
             .inner
@@ -5360,24 +5353,26 @@ impl<T: Timestamp> ClusterSpawnedDataflow<T> {
                 })
             })?
             .join();
-        // Transfer all resources to ClusterCompletion so bridges stay alive.
-        // Setting _bridge_cancel_moved prevents Drop from firing it early.
-        self._bridge_cancel_moved = true;
+        let teardown = self.teardown.take().ok_or_else(|| {
+            Error::Runtime(RuntimeError::AlreadyConsumed {
+                resource: "cluster teardown handle".into(),
+            })
+        })?;
         Ok(ClusterCompletion {
             completion: Some(completion),
-            _transport: self._transport.clone(),
-            _shared_managers: self._shared_managers.take(),
-            _progress_handles: self._progress_handles.take(),
-            _bridge_cancel: self._bridge_cancel.clone(),
+            result: None,
+            teardown,
             _phantom: PhantomData,
         })
     }
 
-    /// Block until all local workers complete.
+    /// Block until all local workers complete and the cluster shutdown
+    /// handshake has finished. See [`join()`](Self::join).
     ///
-    /// Bridges stay alive during the wait so workers can still receive
-    /// remote data and progress. They are cancelled only after all
-    /// workers have finished.
+    /// The network runs on the tokio runtime passed to `spawn_cluster`, so it
+    /// must be able to make progress while this thread blocks: do not call
+    /// this from the only thread of a `current_thread` runtime that hosts the
+    /// transport (use `spawn_blocking` or `.await` the completion instead).
     pub fn join_blocking(self) -> Result<()> {
         self.join()?.wait()
     }
@@ -5386,65 +5381,63 @@ impl<T: Timestamp> ClusterSpawnedDataflow<T> {
 #[cfg(feature = "transport")]
 impl<T: Timestamp> Drop for ClusterSpawnedDataflow<T> {
     fn drop(&mut self) {
-        if !self._bridge_cancel_moved {
-            if let Some(ref inner) = self.inner {
-                if let Some(ref dataflow_cancel) = inner._dataflow_cancel {
-                    dataflow_cancel.cancel_with_reason(CancellationReason::HandleDropped);
-                }
+        // Not joined: cancel locally; the lifecycle task tells the peers.
+        if let Some(ref inner) = self.inner {
+            if let Some(ref dataflow_cancel) = inner._dataflow_cancel {
+                dataflow_cancel.cancel_with_reason(CancellationReason::HandleDropped);
             }
-            self._bridge_cancel.cancel();
         }
     }
 }
 
 // ---------------------------------------------------------------------------
-// ClusterCompletion — completion handle with bridge lifetime management
+// ClusterCompletion — local completion plus the cluster shutdown handshake
 // ---------------------------------------------------------------------------
 
 /// Completion handle for a cluster-spawned dataflow.
 ///
-/// Keeps transport and bridge resources alive until all workers finish.
-/// When this handle drops, bridges are cancelled and transport resources
-/// are released. Implements [`Future`] for async usage and provides
-/// [`wait()`](Self::wait) for blocking usage.
+/// Resolves once every local worker has finished and the dataflow's
+/// lifecycle task has completed the clean shutdown handshake and released
+/// the transport. The output is the local workers' result.
+///
+/// Implements [`Future`] for async usage and provides [`wait()`](Self::wait)
+/// for blocking usage. Dropping an unresolved `ClusterCompletion` detaches
+/// it: the dataflow keeps running to completion and the lifecycle task still
+/// performs the handshake, exactly as if the handle had been awaited. Use
+/// [`ClusterSpawnedDataflow::cancel`] (before joining) or the
+/// `SpawnOptions` cancellation token to stop a cluster dataflow.
 #[cfg(feature = "transport")]
 pub struct ClusterCompletion<T: Timestamp> {
     completion: Option<MultiDataflowCompletion>,
-    /// Keeps transport alive (background Muxer/Demuxer tasks).
-    _transport: Arc<crate::communication::cluster_transport::ClusterTransport>,
-    /// Keeps shared peer managers alive (prevents task abort on drop).
-    _shared_managers: Option<
-        Arc<
-            std::collections::HashMap<
-                String,
-                crate::communication::shared_transport::SharedPeerManager,
-            >,
-        >,
-    >,
-    /// Progress handle keepalive (None if not transferrable).
-    _progress_handles: Option<crate::progress::network_progress::NetworkProgressHandles>,
-    /// Cancels bridge tasks when this completion drops.
-    _bridge_cancel: tokio_util::sync::CancellationToken,
+    /// Local workers' result, held until teardown completes.
+    result: Option<Result<()>>,
+    teardown: cluster_lifecycle::TeardownWaiter,
     _phantom: PhantomData<T>,
 }
 
 #[cfg(feature = "transport")]
 impl<T: Timestamp> ClusterCompletion<T> {
-    /// Block the current thread until all workers complete.
+    /// Block the current thread until all workers complete and the cluster
+    /// shutdown handshake has finished.
     ///
     /// Returns `Ok(())` if all workers succeeded. On first error, cancels
     /// remaining workers, preferring an originating failure over cancellation.
-    /// Bridges are cancelled
-    /// after this method returns (when `self` drops).
+    /// See [`ClusterSpawnedDataflow::join_blocking`] for the runtime
+    /// requirement.
     pub fn wait(mut self) -> Result<()> {
-        let completion = self.completion.take().ok_or_else(|| {
-            Error::Runtime(RuntimeError::AlreadyConsumed {
-                resource: "cluster completion".into(),
-            })
-        })?;
-        let result = completion.wait();
-        // Cancel bridges eagerly so cleanup doesn't wait for handle drop.
-        self._bridge_cancel.cancel();
+        let result = match self.result.take() {
+            Some(result) => result,
+            None => self
+                .completion
+                .take()
+                .ok_or_else(|| {
+                    Error::Runtime(RuntimeError::AlreadyConsumed {
+                        resource: "cluster completion".into(),
+                    })
+                })?
+                .wait(),
+        };
+        self.teardown.wait();
         result
     }
 }
@@ -5458,24 +5451,29 @@ impl<T: Timestamp> Future for ClusterCompletion<T> {
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         let this = self.get_mut();
-        let Some(completion) = this.completion.as_mut() else {
-            return Poll::Ready(Err(Error::Runtime(RuntimeError::AlreadyConsumed {
-                resource: "cluster completion".into(),
-            })));
-        };
-        let result = Pin::new(completion).poll(cx);
-        if result.is_ready() {
-            // Cancel bridges eagerly so cleanup doesn't wait for handle drop.
-            this._bridge_cancel.cancel();
+        if this.result.is_none() {
+            let Some(completion) = this.completion.as_mut() else {
+                return Poll::Ready(Err(Error::Runtime(RuntimeError::AlreadyConsumed {
+                    resource: "cluster completion".into(),
+                })));
+            };
+            match Pin::new(completion).poll(cx) {
+                Poll::Ready(result) => {
+                    this.completion = None;
+                    this.result = Some(result);
+                }
+                Poll::Pending => return Poll::Pending,
+            }
         }
-        result
-    }
-}
-
-#[cfg(feature = "transport")]
-impl<T: Timestamp> Drop for ClusterCompletion<T> {
-    fn drop(&mut self) {
-        self._bridge_cancel.cancel();
+        match this.teardown.poll_done(cx) {
+            Poll::Ready(()) => match this.result.take() {
+                Some(result) => Poll::Ready(result),
+                None => Poll::Ready(Err(Error::Runtime(RuntimeError::AlreadyConsumed {
+                    resource: "cluster completion".into(),
+                }))),
+            },
+            Poll::Pending => Poll::Pending,
+        }
     }
 }
 
