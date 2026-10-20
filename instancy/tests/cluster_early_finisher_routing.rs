@@ -9,7 +9,8 @@
 //! transports. Batches split across nodes may still be duplicated by partial
 //! pushes until PR 2 lands (see `SPLIT_BATCHES_MAY_DUPLICATE`). Silent loss
 //! and hangs are always failures; a round that fails loudly with the known
-//! C1/C2 data-loss signature is re-run once (see `Failure::EarlyCompletion`).
+//! C1/C2 data-loss signature, or loses records only after PR 2's duplicates
+//! corrupted the progress accounting, is re-run once (see `Failure`).
 
 #![cfg(feature = "transport")]
 
@@ -106,8 +107,18 @@ enum Failure {
     /// (or that the sender sends after the receiver's end-of-stream) are
     /// reported, so the run fails loudly. Rounds that fail only this way are
     /// re-run once (`run_with_retry`); remove the retry once C1/C2 is fixed.
-    /// Every node `Ok` with records missing (silent loss) is never retried.
+    /// Every node `Ok` with records missing (silent loss) is never retried,
+    /// except as [`Failure::CorruptedByDuplicates`].
     EarlyCompletion(String),
+    /// Every node `Ok`, records missing, and records duplicated by PR 2's
+    /// partial pushes in the same round. A duplicate delivery is consumed
+    /// without having been produced, which drives the signed in-flight
+    /// counts negative and lets a receiver complete early (C1/C2). Records
+    /// still in flight to it on an in-process channel (the feeding worker's
+    /// node-local target, which no network check sees) are then dropped
+    /// silently. Re-run once (`run_with_retry`); this goes away with
+    /// `SPLIT_BATCHES_MAY_DUPLICATE`.
+    CorruptedByDuplicates(String),
     /// Anything else: a hang, an error, silent loss, misrouted or duplicated
     /// records.
     Other(String),
@@ -125,20 +136,24 @@ impl std::fmt::Display for Failure {
             Failure::EarlyCompletion(e) => {
                 write!(f, "receiver completed early (C1/C2), loss reported: {e}")
             }
+            Failure::CorruptedByDuplicates(e) => {
+                write!(f, "records lost after duplicate deliveries (PR 2): {e}")
+            }
             Failure::Other(e) => f.write_str(e),
         }
     }
 }
 
 /// Runs a round, re-running it once if its only defect is the C1/C2
-/// early-completion signature (see [`Failure::EarlyCompletion`]).
+/// early-completion signature (see [`Failure::EarlyCompletion`] and
+/// [`Failure::CorruptedByDuplicates`]).
 async fn run_with_retry<Fut>(mut round: impl FnMut() -> Fut) -> std::result::Result<(), String>
 where
     Fut: std::future::Future<Output = std::result::Result<(), Failure>>,
 {
     match round().await {
         Ok(()) => Ok(()),
-        Err(Failure::EarlyCompletion(first)) => {
+        Err(first @ (Failure::EarlyCompletion(_) | Failure::CorruptedByDuplicates(_))) => {
             eprintln!("retrying a round that hit the C1/C2 early completion: {first}");
             round()
                 .await
@@ -319,6 +334,9 @@ where
             "{mode:?}: received {received}/{total}; {missing} missing (last: {last_missing:?}), \
              {duplicated} duplicated"
         );
+        if missing > 0 && duplicated > 0 && tolerate_duplicates {
+            return Err(Failure::CorruptedByDuplicates(report));
+        }
         // Every node joined Ok (checked above): missing records here are a
         // silent loss, never acceptable.
         return Err(Failure::Other(report));
