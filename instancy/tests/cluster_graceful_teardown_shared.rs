@@ -440,13 +440,17 @@ where
 }
 
 /// Minimum exact rounds out of 5 small-frame rounds (see
-/// `assert_no_silent_loss`). In 24 runs per test (1, 2 and 4 pinned cores and
-/// unpinned) the fewest exact rounds were 4 of 5; fewer than 2 means almost
-/// every round fails loudly, which is a regression.
-const MIN_EXACT_SMALL: usize = 2;
+/// `assert_no_silent_loss`): none. This shape's exact rounds depend on how
+/// often node-b completes early (audit C1/C2), which grows with machine load:
+/// 5 of 5 on an idle machine, as few as 2 of 5 with three test binaries
+/// running at once (same for the code before and after the last review
+/// round), and 1 of 5 on a busy CI runner. The large-record rounds below (and
+/// routing scenarios 1 and 2) catch a regression to "always loud" instead.
+const MIN_EXACT_SMALL: usize = 0;
 /// Minimum exact rounds out of 10 large-record rounds. In 24 runs per
 /// combination the fewest were 5 of 10 and the worst combination lost loudly
-/// in 23% of rounds; at even 50%, two exact rounds fail to appear in about 1%
+/// in 23% of rounds; with three test binaries running at once the fewest
+/// were 6 of 10. Even at 50% loud, two exact rounds fail to appear in about 1%
 /// of runs.
 const MIN_EXACT_LARGE: usize = 2;
 
