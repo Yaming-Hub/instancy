@@ -107,7 +107,11 @@ pub const DEFAULT_MAX_BATCH_SIZE: usize = 1_000_000;
 ///
 /// If `changes.len()` exceeds `max_batch_size`, the batch is split into
 /// multiple frames appended sequentially to `bufs`. Each frame is a
-/// self-contained encoded batch with its own CRC32.
+/// self-contained encoded batch with its own CRC32. A split batch sends its
+/// positive changes first (otherwise in order): a receiver applies each frame
+/// as it arrives, and a capability released in an earlier frame than the one
+/// that replaces it (or an in-flight count) could let its frontier advance
+/// too early. Positives first only ever hold the frontier back.
 #[cfg(feature = "transport")]
 pub fn encode_progress_batch<T: Timestamp + ExchangeData>(
     changes: &[ProgressChange<T>],
@@ -118,43 +122,52 @@ pub fn encode_progress_batch<T: Timestamp + ExchangeData>(
     // and `u32::MAX` / `u32::MAX - 1` mark end-of-stream / acknowledgement.
     let effective_max = max_batch_size.min(PROGRESS_ACK_COUNT as usize - 1).max(1);
 
-    // Handle empty batch: still emit one frame with count=0 + CRC.
-    if changes.is_empty() {
-        let mut buf = Vec::new();
-        buf.extend_from_slice(&0u32.to_le_bytes());
-        let crc = crc32fast::hash(&buf);
-        buf.extend_from_slice(&crc.to_le_bytes());
-        bufs.push(buf);
+    // An empty batch is still one frame (count=0 + CRC).
+    if changes.len() <= effective_max {
+        bufs.push(encode_progress_frame(changes)?);
         return Ok(());
     }
+    let mut ordered = changes
+        .iter()
+        .filter(|change| change.diff > 0)
+        .chain(changes.iter().filter(|change| change.diff <= 0))
+        .peekable();
+    while ordered.peek().is_some() {
+        let chunk: Vec<&ProgressChange<T>> = ordered.by_ref().take(effective_max).collect();
+        bufs.push(encode_progress_frame(chunk)?);
+    }
+    Ok(())
+}
 
-    for chunk in changes.chunks(effective_max) {
-        let mut buf = Vec::new();
-        // Safe: effective_max <= u32::MAX, so chunk.len() <= u32::MAX.
-        let count = chunk.len() as u32;
-        buf.extend_from_slice(&count.to_le_bytes());
+/// Encode one frame (`count` + changes + CRC32); `changes` must fit the
+/// count field (see [`encode_progress_batch`]).
+#[cfg(feature = "transport")]
+fn encode_progress_frame<'a, T: Timestamp + ExchangeData>(
+    changes: impl IntoIterator<Item = &'a ProgressChange<T>, IntoIter: ExactSizeIterator>,
+) -> Result<Vec<u8>, CodecError> {
+    let changes = changes.into_iter();
+    let mut buf = Vec::new();
+    // Callers cap the length below the reserved counts (u32::MAX - 1).
+    let count = changes.len() as u32;
+    buf.extend_from_slice(&count.to_le_bytes());
 
-        let codec = T::codec();
-        for change in chunk {
-            let kind_byte: u8 = match change.kind {
-                ProgressKind::Source => 0,
-                ProgressKind::Target => 1,
-            };
-            buf.push(kind_byte);
-            buf.extend_from_slice(&(change.node as u64).to_le_bytes());
-            buf.extend_from_slice(&(change.port as u64).to_le_bytes());
-            codec.encode(&change.time, &mut buf)?;
-            buf.extend_from_slice(&change.diff.to_le_bytes());
-        }
-
-        // Append CRC32 checksum of the payload.
-        let crc = crc32fast::hash(&buf);
-        buf.extend_from_slice(&crc.to_le_bytes());
-
-        bufs.push(buf);
+    let codec = T::codec();
+    for change in changes {
+        let kind_byte: u8 = match change.kind {
+            ProgressKind::Source => 0,
+            ProgressKind::Target => 1,
+        };
+        buf.push(kind_byte);
+        buf.extend_from_slice(&(change.node as u64).to_le_bytes());
+        buf.extend_from_slice(&(change.port as u64).to_le_bytes());
+        codec.encode(&change.time, &mut buf)?;
+        buf.extend_from_slice(&change.diff.to_le_bytes());
     }
 
-    Ok(())
+    // Append CRC32 checksum of the payload.
+    let crc = crc32fast::hash(&buf);
+    buf.extend_from_slice(&crc.to_le_bytes());
+    Ok(buf)
 }
 
 /// Decode a batch of progress changes from bytes.
@@ -873,6 +886,40 @@ mod tests {
             all.extend(decoded);
         }
         assert_eq!(all, changes);
+    }
+
+    /// A split batch sends its positive changes first, otherwise in order, so
+    /// a receiver applying the frames one by one never releases a capability
+    /// (or an in-flight count) before what replaces it. An unsplit batch is
+    /// sent as is.
+    #[test]
+    fn split_batches_send_positive_changes_first() {
+        let changes: Vec<ProgressChange<u64>> = vec![
+            ProgressChange::source(0, 0, 0, -1),
+            ProgressChange::source(0, 0, 1, 1),
+            ProgressChange::target(1, 0, 0, -1),
+            ProgressChange::target(1, 0, 1, 2),
+            ProgressChange::source(2, 0, 3, 1),
+        ];
+        let decode = |bufs: &[Vec<u8>], max| -> Vec<Vec<ProgressChange<u64>>> {
+            bufs.iter()
+                .map(|buf| decode_progress_batch::<u64>(buf, max).unwrap())
+                .collect()
+        };
+        let mut bufs = Vec::new();
+        encode_progress_batch(&changes, &mut bufs, 2).unwrap();
+        let frames = decode(&bufs, 2);
+        assert_eq!(
+            frames,
+            vec![
+                vec![changes[1].clone(), changes[3].clone()],
+                vec![changes[4].clone(), changes[0].clone()],
+                vec![changes[2].clone()],
+            ]
+        );
+        let mut bufs = Vec::new();
+        encode_progress_batch(&changes, &mut bufs, 5).unwrap();
+        assert_eq!(decode(&bufs, 5), vec![changes.clone()]);
     }
 
     #[test]
