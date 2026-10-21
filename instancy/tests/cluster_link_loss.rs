@@ -585,6 +585,145 @@ async fn peer_connection_loss_is_not_a_clean_end_of_stream() {
     }
 }
 
+/// Every record goes to worker 1 (node-b with one worker per node).
+fn all_to_node_b(builder: &mut DataflowBuilder<u64>) -> Result<()> {
+    builder
+        .input::<u64>("data")?
+        .exchange_by_hash("to_b", |_x: &u64| 1)
+        .map("id", |_t, x| x)
+        .output("out")?;
+    Ok(())
+}
+
+/// Node-b's own input is closed, so it only waits for node-a's records.
+/// node-a's data frames from the `stash_at`-th on never arrive, while its
+/// progress, its goodbye and its teardown do: the records fell behind the
+/// rest of its stream (as when backpressure holds them while progress is
+/// queued) and are then lost with the connection. Node-b's data channel from
+/// node-a closes without its close sentinel. Previously the dedicated bridge
+/// forwarded that as the end of input and `NetworkPull` counted the
+/// disconnect as exhaustion, so node-b finished `Ok` with records missing
+/// (node-a had said goodbye, so its lost link looked benign). It must fail
+/// with `DataLoss` instead, and never hang.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn records_lost_behind_the_senders_goodbye_never_complete_ok() {
+    const BATCHES: u64 = 40;
+    const BATCH: u64 = 100;
+    for stash_at in [1, 2, 20] {
+        let what = format!("stash_at={stash_at}");
+        let names = ["node-a", "node-b"];
+        let mut mesh = FaultMesh::new(&names, 2, false);
+        let a_to_b = mesh.ctl("node-a", "node-b");
+        a_to_b.stash_from(FrameKind::Data, stash_at);
+        let mut nodes = start(&mut mesh, Mode::Dedicated, &names, all_to_node_b).await;
+        let _oa = nodes[0].df().take_output::<u64>(0, "out").unwrap();
+        let ob = nodes[1].df().take_output::<u64>(0, "out").unwrap();
+        drop(nodes[1].df().take_input::<u64>(0, "data").unwrap());
+        let sa = nodes[0].df().take_input::<u64>(0, "data").unwrap();
+        for i in 0..BATCHES {
+            sa.send(0, (i * BATCH..(i + 1) * BATCH).collect()).unwrap();
+            tokio::time::sleep(Duration::from_millis(2)).await;
+        }
+        drop(sa);
+        let ja = nodes[0].join(DETECT);
+        let jb = nodes[1].join(DETECT);
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        // Node-a dies (if its teardown has not closed the link already).
+        mesh.cut("node-a", "node-b");
+        let rb = jb.await.unwrap();
+        let mut got = 0u64;
+        while let Some(event) = ob.try_recv() {
+            if let instancy::dataflow::OutputEvent::Data { data, .. } = event {
+                got += data.len() as u64;
+            }
+        }
+        assert!(
+            a_to_b.stashed() > 0,
+            "{what}: precondition: records withheld"
+        );
+        match &rb {
+            Some(Ok(())) => panic!(
+                "{what}: node-b returned Ok with {got} of {} records",
+                BATCHES * BATCH
+            ),
+            None => panic!("{what}: node-b hung"),
+            Some(Err(_)) => assert!(
+                data_loss_from(&rb, "node-a"),
+                "{what}: node-b must report the lost records: {}",
+                fmt_join(&rb)
+            ),
+        }
+        let ra = ja.await.unwrap();
+        assert!(ra.is_some(), "{what}: node-a hung");
+        shutdown(nodes).await;
+    }
+}
+
+/// Node-b's own input is closed, so it only waits for node-a's records.
+/// Node-a dies while streaming them: the link stops in front of the
+/// `hold_at`-th data frame (part of the stream was delivered) and is then
+/// cut. Node-b's data channel from node-a closes without its close sentinel,
+/// which is never an end of input: node-b must fail, in both transport
+/// modes, and never hang. (Here node-a's held progress also blocks node-b;
+/// see `records_lost_behind_the_senders_goodbye_never_complete_ok` for the
+/// case where only the data channel stands between node-b and `Ok`.)
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn sender_dying_mid_stream_never_lets_a_waiting_receiver_finish_ok() {
+    const BATCHES: u64 = 40;
+    const BATCH: u64 = 100;
+    for mode in MODES {
+        for hold_at in [2, 6] {
+            let what = format!("{mode:?} hold_at={hold_at}");
+            let names = ["node-a", "node-b"];
+            let mut mesh = FaultMesh::new(&names, 2, mode == Mode::Shared);
+            let a_to_b = mesh.ctl("node-a", "node-b");
+            a_to_b.hold_from(FrameKind::Data, hold_at);
+            let mut nodes = start(&mut mesh, mode, &names, all_to_node_b).await;
+            let _oa = nodes[0].df().take_output::<u64>(0, "out").unwrap();
+            let ob = nodes[1].df().take_output::<u64>(0, "out").unwrap();
+            drop(nodes[1].df().take_input::<u64>(0, "data").unwrap());
+            let sa = nodes[0].df().take_input::<u64>(0, "data").unwrap();
+            for i in 0..BATCHES {
+                sa.send(0, (i * BATCH..(i + 1) * BATCH).collect()).unwrap();
+                tokio::time::sleep(Duration::from_millis(2)).await;
+            }
+            let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+            while !a_to_b.held() && tokio::time::Instant::now() < deadline {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+            assert!(a_to_b.held(), "{what}: precondition: the stream was held");
+
+            let jb = nodes[1].join(DETECT);
+            tokio::time::sleep(Duration::from_millis(300)).await;
+            assert!(
+                !jb.is_finished(),
+                "{what}: node-b finished while node-a was still streaming"
+            );
+            // Node-a dies mid-stream; its close sentinel can never arrive.
+            mesh.cut("node-a", "node-b");
+            drop(sa);
+            let rb = jb.await.unwrap();
+            let mut got = 0u64;
+            while let Some(event) = ob.try_recv() {
+                if let instancy::dataflow::OutputEvent::Data { data, .. } = event {
+                    got += data.len() as u64;
+                }
+            }
+            match &rb {
+                Some(Err(_)) => {}
+                Some(Ok(())) => panic!(
+                    "{what}: node-b returned Ok with {got} of {} records",
+                    BATCHES * BATCH
+                ),
+                None => panic!("{what}: node-b hung after losing node-a mid-stream"),
+            }
+            let ra = nodes[0].join(DETECT).await.unwrap();
+            assert!(ra.is_some(), "{what}: node-a hung");
+            shutdown(nodes).await;
+        }
+    }
+}
+
 /// A data frame that cannot be decoded used to become an error envelope that
 /// every operator ignored, silently dropping the batch. It now fails the
 /// receiving node (`DataLoss`) and, through its `Cancel`, every peer that

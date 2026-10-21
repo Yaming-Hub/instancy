@@ -22,9 +22,9 @@ use tokio::sync::Notify;
 use tokio::task::JoinHandle;
 
 use instancy::communication::ClusterSpawnTransport;
-use instancy::communication::PROGRESS_CHANNEL_BASE;
 use instancy::communication::shared_transport::{DynConnectionFactory, SharedPeerManager};
 use instancy::communication::transport_session::PeerConnection;
+use instancy::communication::{PROGRESS_CHANNEL_BASE, RESERVED_CHANNEL_BASE};
 
 use crate::support::{Managers, PreEstablished, shared_config};
 
@@ -36,6 +36,9 @@ pub enum FrameKind {
     Control,
     Progress,
     Data,
+    /// Library-internal frames (reserved namespace, e.g. shared RTT probes):
+    /// relayed untouched, never counted, held or corrupted.
+    Internal,
 }
 
 /// Controls for one direction of a link.
@@ -56,6 +59,9 @@ pub struct DirCtl {
     /// Pause in front of the n-th frame of a kind (1-based).
     hold_at: Mutex<Option<(FrameKind, usize)>>,
     held: AtomicBool,
+    /// Withhold frames of a kind from the n-th on (1-based); others pass.
+    stash_from: Mutex<Option<(FrameKind, usize)>>,
+    stashed: AtomicUsize,
 }
 
 impl DirCtl {
@@ -80,6 +86,21 @@ impl DirCtl {
         self.held.load(Ordering::SeqCst)
     }
 
+    /// Withhold the `n`-th frame of `kind` (1-based) and every later one,
+    /// while frames of other kinds keep flowing: frames of one channel stay
+    /// in order, as if the sender had queued the others first (for example,
+    /// progress overtaking data held back by backpressure). Withheld frames
+    /// are never delivered. Dedicated framing only (shared managers number
+    /// their frames, and a gap blocks the receiver).
+    pub fn stash_from(&self, kind: FrameKind, n: usize) {
+        *self.stash_from.lock().unwrap() = Some((kind, n));
+    }
+
+    /// Frames withheld by [`stash_from`](Self::stash_from).
+    pub fn stashed(&self) -> usize {
+        self.stashed.load(Ordering::SeqCst)
+    }
+
     /// Corrupt the next frame of `kind` so that it fails to decode.
     pub fn corrupt_next(&self, kind: FrameKind) {
         *self.corrupt_next.lock().unwrap() = Some(kind);
@@ -96,6 +117,7 @@ impl DirCtl {
             FrameKind::Control => self.control.load(Ordering::SeqCst),
             FrameKind::Progress => self.progress.load(Ordering::SeqCst),
             FrameKind::Data => self.data.load(Ordering::SeqCst),
+            FrameKind::Internal => 0,
         }
     }
 
@@ -151,6 +173,8 @@ impl Classifier {
             FrameKind::Control
         } else if self.progress.contains(&channel_id) {
             FrameKind::Progress
+        } else if channel_id >= RESERVED_CHANNEL_BASE {
+            FrameKind::Internal
         } else {
             FrameKind::Data
         }
@@ -177,6 +201,7 @@ impl Classifier {
                     *byte = 0x7E;
                 }
             }
+            FrameKind::Internal => {}
         }
     }
 }
@@ -203,6 +228,7 @@ async fn frame_relay(
             FrameKind::Control => ctl.control.fetch_add(1, Ordering::SeqCst),
             FrameKind::Progress => ctl.progress.fetch_add(1, Ordering::SeqCst),
             FrameKind::Data => ctl.data.fetch_add(1, Ordering::SeqCst),
+            FrameKind::Internal => 0,
         } + 1;
         {
             let mut hold = ctl.hold_at.lock().unwrap();
@@ -211,6 +237,10 @@ async fn frame_relay(
                 ctl.paused.store(true, Ordering::SeqCst);
                 ctl.held.store(true, Ordering::SeqCst);
             }
+        }
+        if matches!(*ctl.stash_from.lock().unwrap(), Some((k, n)) if k == kind && seen >= n) {
+            ctl.stashed.fetch_add(1, Ordering::SeqCst);
+            continue;
         }
         {
             let mut corrupt = ctl.corrupt_next.lock().unwrap();
