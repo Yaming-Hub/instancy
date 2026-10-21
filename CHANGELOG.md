@@ -55,15 +55,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   or after `handshake_timeout` if it never does. Frames dropped by a failed
   send are reported as data loss if the peer or the local workers finish
   without them, and a dedicated connection whose writer failed is kept open
-  until teardown instead of being half-closed.
+  until teardown instead of being half-closed. A push whose queue to a peer
+  that has not finished is closed now waits (as for a full queue) for the
+  dataflow to be cancelled with the actual cause (the peer's `Cancel` or the
+  link failure) instead of failing the operator with `ChannelClosed`.
+- Connections are closed without losing their last frames. A node that
+  releases a connection writes what is queued and keeps reading until the
+  peer closes its side (at most 10 s), instead of closing a TCP socket with
+  unread data, which resets the connection and can destroy the frames the
+  peer has not read yet. A per-job shared manager released by a dataflow's
+  teardown first writes everything queued on it (bounded by
+  `handshake_timeout`) instead of aborting its writers.
 - `ClusterCompletion` resolves once the local workers have finished and the
   shutdown handshake has completed (each peer has received this node's
   frames or has finished itself). Its result is the local workers' result,
   or `CommunicationError::DataLoss` (see above). Blocking waits
   (`join_blocking`, `wait`) need the transport's tokio runtime to keep
-  running: when it is a `current_thread` runtime that is not making progress
-  (e.g. the caller is the thread driving it), they now return
-  `RuntimeError::InvalidConfig` promptly instead of deadlocking.
+  running: on a multi-thread runtime's worker thread they use
+  `block_in_place`, so
+  they work with a single worker thread or with every worker waiting; when
+  the caller is inside a `current_thread` runtime, or the transport runs on
+  one, that is not making progress (e.g. the caller is the thread driving
+  it), they return `RuntimeError::InvalidConfig` promptly instead of
+  deadlocking.
 - Dropping an unresolved `ClusterCompletion` now detaches it: the dataflow
   keeps running with its network intact (previously the network was cut while
   local workers kept running). Dropping `ClusterSpawnedDataflow` without

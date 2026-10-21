@@ -181,11 +181,14 @@ async fn cancelled_drain_flushes_final_progress_queued_behind_another_dataflow()
     );
     let ((rt_xa, xa), (rt_xb, xb)) = (hx_a.await.unwrap(), hx_b.await.unwrap());
     let (mut xa, mut xb) = (xa.unwrap(), xb.unwrap());
-    let _x_out = [
+    let x_out = [
         collect(xa.take_output::<u64>(0, "out").unwrap()),
         collect(xb.take_output::<u64>(0, "out").unwrap()),
     ];
-    drop(xb.take_input::<u64>(0, "data").unwrap());
+    // As in `early_finisher_keeps_frames_queued_behind_another_dataflow`, X's
+    // node-b keeps its (unused) input open until X's burst has arrived: X only
+    // generates congestion here (audit C1/C2).
+    let xb_in = xb.take_input::<u64>(0, "data").unwrap();
     let x_in = xa.take_input::<u64>(0, "data").unwrap();
     tokio::time::sleep(Duration::from_millis(300)).await;
 
@@ -218,6 +221,8 @@ async fn cancelled_drain_flushes_final_progress_queued_behind_another_dataflow()
         fmt_join(&rb)
     );
     x_feeder.join().unwrap();
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    drop(xb_in);
     let (rxa, rxb) = (
         join_with_timeout(xa, Duration::from_secs(20)),
         join_with_timeout(xb, Duration::from_secs(20)),
@@ -228,6 +233,12 @@ async fn cancelled_drain_flushes_final_progress_queued_behind_another_dataflow()
         "background dataflow: a={} b={}",
         fmt_join(&rxa),
         fmt_join(&rxb)
+    );
+    let x_counts: Vec<usize> = x_out.into_iter().map(|o| o.join().unwrap().len()).collect();
+    assert_eq!(
+        x_counts.iter().sum::<usize>(),
+        800,
+        "X records per node: {x_counts:?}"
     );
     drop_runtimes(vec![rt_ya, rt_yb, rt_xa, rt_xb]).await;
 }
@@ -253,17 +264,17 @@ enum Burst {
     LoudLoss(String),
 }
 
-/// Whether a node's failure reports lost records.
-fn reports_data_loss(r: &Option<Result<()>>) -> bool {
-    matches!(r, Some(Err(e)) if e.to_string().contains("data lost"))
-}
-
-/// node-a sends `records` records of `size` bytes, all routed to node-b, and
-/// closes its input; node-b's input is closed at start. node-a can observe
-/// global completion while its frames are still queued.
+/// node-a sends `records` records of `size` bytes (at least 8; the first 8
+/// carry the record's index), all routed to node-b, and closes its input;
+/// node-b's input is closed at start. node-a can observe global completion
+/// while its frames are still queued.
 ///
-/// Returns an error for a hang, an unexplained failure, or a silent loss
-/// (every node `Ok` but records missing).
+/// The round is exact if both nodes succeed and node-b received every record
+/// exactly once. It is a loud loss only if every failed node reports a data
+/// loss, node-b received no record twice (and node-a none), at least one
+/// record is missing, and the missing records are the tail of the stream.
+/// Anything else (a hang, an unexplained error, silent loss, a gap) is an
+/// error.
 async fn burst_then_complete<R, W>(
     ta: ClusterSpawnTransport<R, W>,
     tb: ClusterSpawnTransport<R, W>,
@@ -275,6 +286,7 @@ where
     R: tokio::io::AsyncRead + Unpin + Send + 'static,
     W: tokio::io::AsyncWrite + Unpin + Send + 'static,
 {
+    assert!(size >= 8, "records carry their index");
     let topo = two_nodes("a", "b");
     let id = DataflowId::new();
     let build = move |b: &mut DataflowBuilder<u64>| -> Result<()> {
@@ -286,7 +298,9 @@ where
         };
         input
             .exchange_by_hash("to-b", |_x: &Vec<u8>| 1)
-            .map("len", |_t, x: Vec<u8>| x.len() as u64)
+            .map("index", |_t, x: Vec<u8>| {
+                u64::from_le_bytes(x[..8].try_into().expect("8 bytes"))
+            })
             .output("out")?;
         Ok(())
     };
@@ -301,12 +315,16 @@ where
     let oa = collect(ca.take_output::<u64>(0, "out").unwrap());
     drop(cb.take_input::<Vec<u8>>(0, "data").unwrap());
     let sa = ca.take_input::<Vec<u8>>(0, "data").unwrap();
+    // Returns how many records it sent.
     let feeder = std::thread::spawn(move || {
         for k in 0..records {
-            sa.send(0, vec![vec![k as u8; size]])
-                .map_err(|e| format!("send of record {k} failed: {e}"))?;
+            let mut record = vec![k as u8; size];
+            record[..8].copy_from_slice(&(k as u64).to_le_bytes());
+            if let Err(e) = sa.send(0, vec![record]) {
+                return (k, Some(format!("send of record {k} failed: {e}")));
+            }
         }
-        Ok::<_, String>(())
+        (records, None)
     });
     let ja = join_with_timeout(ca, Duration::from_secs(20));
     let jb = join_with_timeout(cb, Duration::from_secs(20));
@@ -315,27 +333,64 @@ where
         std::mem::forget((rt_a, rt_b));
         return Err(format!("a={} b={} (hung)", fmt_join(&ra), fmt_join(&rb)));
     }
-    let fed = feeder.join().unwrap();
-    let got_b = ob.join().unwrap().len();
-    let got_a = oa.join().unwrap().len();
+    let (sent, feed_error) = feeder.join().unwrap();
+    let mut got_b: Vec<u64> = ob.join()?.into_iter().map(|(_, k)| k).collect();
+    let got_a = oa.join()?.len();
     drop_runtimes(vec![rt_a, rt_b]).await;
+    got_b.sort_unstable();
+    let received = got_b.len();
+    got_b.dedup();
+    let duplicated = received - got_b.len();
+    let unknown = got_b.iter().filter(|&&k| k >= sent as u64).count();
+    let missing = sent - (got_b.len() - unknown);
     let report = format!(
-        "feeder={fed:?} a={} b={} received_at_b={got_b}/{records} at_a={got_a}",
+        "a={} b={} fed {sent}/{records} ({feed_error:?}) received_at_b={received} \
+         ({duplicated} duplicated, {unknown} unknown, {missing} missing) at_a={got_a}",
         fmt_join(&ra),
         fmt_join(&rb)
     );
-    if fed.is_ok()
-        && matches!(ra, Some(Ok(())))
-        && matches!(rb, Some(Ok(())))
-        && got_b == records
-        && got_a == 0
+    if duplicated > 0 || unknown > 0 || got_a > 0 {
+        return Err(report);
+    }
+    let error = |r: &Option<Result<()>>| match r {
+        Some(Err(e)) => Some(e.to_string()),
+        _ => None,
+    };
+    let (ea, eb) = (error(&ra), error(&rb));
+    if ea.is_none() && eb.is_none() && feed_error.is_none() {
+        return if missing == 0 {
+            Ok(Burst::Exact)
+        } else {
+            Err(format!("silent loss: {report}"))
+        };
+    }
+    if [&ea, &eb]
+        .iter()
+        .any(|e| e.as_ref().is_some_and(|e| !e.contains("data lost")))
     {
-        return Ok(Burst::Exact);
+        return Err(format!("a failure without a data loss: {report}"));
     }
-    if reports_data_loss(&ra) || reports_data_loss(&rb) {
-        return Ok(Burst::LoudLoss(report));
+    if feed_error.is_some() && ea.is_none() {
+        return Err(format!("node-a succeeded but its input failed: {report}"));
     }
-    Err(report)
+    if missing == 0 {
+        return Err(format!(
+            "a data loss was reported but nothing is missing: {report}"
+        ));
+    }
+    let first_missing = (0..sent as u64).find(|k| got_b.binary_search(k).is_err());
+    // A legitimate loss stops the stream for good (node-a stops at its first
+    // failed push, node-b consumes nothing after it finished, the channel is
+    // FIFO): a gap before a received record is a lost frame. A tail is
+    // explained: by now node-a or node-b failed with a data loss.
+    if let (Some(&last), Some(first)) = (got_b.last(), first_missing) {
+        if last > first {
+            return Err(format!(
+                "records missing before the last received: {report}"
+            ));
+        }
+    }
+    Ok(Burst::LoudLoss(report))
 }
 
 async fn dedicated_pair(capacity: usize) -> (support::TcpTransport, support::TcpTransport) {
@@ -352,8 +407,9 @@ async fn shared_pair() -> (Managers, Managers) {
 }
 
 /// Runs `rounds` burst rounds; fails on any hang, unexplained error or
-/// silent loss, and returns how many rounds reported a loss loudly.
-async fn assert_no_silent_loss<F, Fut>(what: &str, rounds: usize, mut round: F)
+/// silent loss, and unless at least `min_exact` rounds delivered every
+/// record (so a regression that makes every round fail loudly is caught).
+async fn assert_no_silent_loss<F, Fut>(what: &str, rounds: usize, min_exact: usize, mut round: F)
 where
     F: FnMut(usize) -> Fut,
     Fut: std::future::Future<Output = std::result::Result<Burst, String>>,
@@ -367,6 +423,8 @@ where
             Err(report) => failures.push(format!("round {i}: {report}")),
         }
     }
+    let exact = rounds - loud.len() - failures.len();
+    eprintln!("{what}: {exact} of {rounds} rounds delivered every record");
     if !loud.is_empty() {
         eprintln!(
             "{what}: {} round(s) failed loudly with data loss: {loud:#?}",
@@ -374,7 +432,23 @@ where
         );
     }
     assert!(failures.is_empty(), "{what}: {failures:#?}");
+    assert!(
+        exact >= min_exact,
+        "{what}: only {exact} of {rounds} rounds delivered every record \
+         (expected at least {min_exact})"
+    );
 }
+
+/// Minimum exact rounds out of 5 small-frame rounds (see
+/// `assert_no_silent_loss`). In 24 runs per test (1, 2 and 4 pinned cores and
+/// unpinned) the fewest exact rounds were 4 of 5; fewer than 2 means almost
+/// every round fails loudly, which is a regression.
+const MIN_EXACT_SMALL: usize = 2;
+/// Minimum exact rounds out of 10 large-record rounds. In 24 runs per
+/// combination the fewest were 5 of 10 and the worst combination lost loudly
+/// in 23% of rounds; at even 50%, two exact rounds fail to appear in about 1%
+/// of runs.
+const MIN_EXACT_LARGE: usize = 2;
 
 /// Shared mode with long-lived managers: thousands of small frames are still
 /// queued when node-a completes locally.
@@ -391,7 +465,7 @@ where
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
 async fn many_small_frames_then_complete_shared() {
     let (ma, mb) = shared_pair().await;
-    assert_no_silent_loss("shared", 5, |_| {
+    assert_no_silent_loss("shared", 5, MIN_EXACT_SMALL, |_| {
         burst_then_complete(shared(&ma), shared(&mb), 3000, 64, Producer::Map)
     })
     .await;
@@ -400,7 +474,7 @@ async fn many_small_frames_then_complete_shared() {
 /// Dedicated-mode counterpart.
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
 async fn many_small_frames_then_complete_dedicated() {
-    assert_no_silent_loss("dedicated", 5, |_| async {
+    assert_no_silent_loss("dedicated", 5, MIN_EXACT_SMALL, |_| async {
         let (ta, tb) = dedicated_pair(1024).await;
         burst_then_complete(ta, tb, 3000, 64, Producer::Map).await
     })
@@ -417,15 +491,25 @@ async fn many_small_frames_then_complete_dedicated() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
 async fn large_records_from_early_finisher_never_vanish() {
     for producer in [Producer::Input, Producer::Map] {
-        assert_no_silent_loss(&format!("dedicated {producer:?}"), 10, |_| async {
-            let (ta, tb) = dedicated_pair(1024).await;
-            burst_then_complete(ta, tb, 40, 1 << 20, producer).await
-        })
+        assert_no_silent_loss(
+            &format!("dedicated {producer:?}"),
+            10,
+            MIN_EXACT_LARGE,
+            |_| async {
+                let (ta, tb) = dedicated_pair(1024).await;
+                burst_then_complete(ta, tb, 40, 1 << 20, producer).await
+            },
+        )
         .await;
-        assert_no_silent_loss(&format!("shared {producer:?}"), 10, |_| async {
-            let (ma, mb) = shared_pair().await;
-            burst_then_complete(shared(&ma), shared(&mb), 40, 1 << 20, producer).await
-        })
+        assert_no_silent_loss(
+            &format!("shared {producer:?}"),
+            10,
+            MIN_EXACT_LARGE,
+            |_| async {
+                let (ma, mb) = shared_pair().await;
+                burst_then_complete(shared(&ma), shared(&mb), 40, 1 << 20, producer).await
+            },
+        )
         .await;
     }
 }
@@ -515,6 +599,126 @@ async fn per_job_managers_released_by_early_finisher() {
         }
     }
     assert!(failures.is_empty(), "{failures:#?}");
+}
+
+/// Per-job managers (the dataflow holds the last reference) and nodes that
+/// finish close together. node-b finishes first and says goodbye; node-a
+/// retires it, acknowledges, then finishes and tears down at once, while its
+/// acknowledgement and end-of-stream are still queued on its connection
+/// writer (the a -> b link is stalled). Releasing the managers used to abort
+/// that writer: node-b saw a broken connection, reconnected (the factories
+/// here always can, to a peer that never answers) and waited for node-a
+/// forever. With factories that cannot reconnect it fell back to declaring
+/// node-a lost after about 1.5 s.
+///
+/// Now node-a's completion waits until those frames are written (bounded by
+/// the handshake timeout) and node-b gets them promptly. Rounds alternate
+/// between reconnecting factories (the old failure is a hang) and
+/// pre-established connections only (the old failure is the slow fallback).
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn owned_managers_write_queued_frames_before_closing() {
+    let build = |b: &mut DataflowBuilder<u64>| -> Result<()> {
+        b.input::<u64>("data")?.map("id", |_t, x| x).output("out")?;
+        Ok(())
+    };
+    for round in 0..4 {
+        let reconnecting = round % 2 == 0;
+        // A 16-byte in-flight budget: once a -> b stalls, node-a's writer
+        // blocks inside its first frame and the rest stay queued.
+        let mut mesh = Mesh::new(&["a", "b"], 16, |_, _| Duration::ZERO);
+        let a_to_b = mesh.valve("a", "b");
+        let ((ma, fa), (mb, fb)) = if reconnecting {
+            (
+                mesh.managers_reconnecting("a"),
+                mesh.managers_reconnecting("b"),
+            )
+        } else {
+            (
+                (mesh.managers("a"), Vec::new()),
+                (mesh.managers("b"), Vec::new()),
+            )
+        };
+        let topo = two_nodes("a", "b");
+        let id = DataflowId::new();
+        let ha = spawn_node(
+            topo.clone(),
+            "a",
+            id,
+            ClusterSpawnTransport::shared(ma, 1024),
+            1,
+            build,
+        );
+        let hb = spawn_node(
+            topo,
+            "b",
+            id,
+            ClusterSpawnTransport::shared(mb, 1024),
+            1,
+            build,
+        );
+        let ((rt_a, ca), (rt_b, cb)) = (ha.await.unwrap(), hb.await.unwrap());
+        let (mut ca, mut cb) = (ca.unwrap(), cb.unwrap());
+        let mut oa = collect(ca.take_output::<u64>(0, "out").unwrap());
+        let mut ob = collect(cb.take_output::<u64>(0, "out").unwrap());
+        let ia = ca.take_input::<u64>(0, "data").unwrap();
+        let ib = cb.take_input::<u64>(0, "data").unwrap();
+        a_to_b.pause();
+        let ja = join_with_timeout(ca, Duration::from_secs(30));
+        let jb = join_with_timeout(cb, Duration::from_secs(30));
+
+        // node-b finishes; its goodbye reaches node-a, whose ack is stalled.
+        ib.send(0, (10..20).collect()).unwrap();
+        drop(ib);
+        assert!(
+            ob.wait_closed(Duration::from_secs(10)),
+            "node-b did not finish"
+        );
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        // node-a finishes and tears down: every link is retired.
+        ia.send(0, (0..10).collect()).unwrap();
+        drop(ia);
+        assert!(
+            oa.wait_closed(Duration::from_secs(10)),
+            "node-a did not finish"
+        );
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        assert!(
+            !ja.is_finished(),
+            "round {round}: node-a released its connection before writing its queued frames"
+        );
+
+        a_to_b.resume();
+        let resumed = Instant::now();
+        let (ra, rb) = (ja.await.unwrap(), jb.await.unwrap());
+        let settled = resumed.elapsed();
+        // Diagnostics only: once node-a releases its end, node-b's manager
+        // reconnects even after a clean close.
+        let reconnects = |f: &[Arc<support::ReconnectToSilentPeer>]| {
+            f.iter()
+                .map(|f| f.establishes.load(Ordering::SeqCst))
+                .sum::<usize>()
+        };
+        let msg = format!(
+            "round {round} (reconnecting={reconnecting}): a={} b={} {settled:?} after resuming; \
+             connections established a={} b={}",
+            fmt_join(&ra),
+            fmt_join(&rb),
+            reconnects(&fa),
+            reconnects(&fb)
+        );
+        if ra.is_none() || rb.is_none() {
+            std::mem::forget((rt_a, rt_b));
+            panic!("hang: {msg}");
+        }
+        assert!(matches!(ra, Some(Ok(()))), "{msg}");
+        assert!(matches!(rb, Some(Ok(()))), "{msg}");
+        // A broken connection would make node-b retry for about 1.5 s
+        // before declaring node-a lost; a healthy run takes milliseconds.
+        assert!(settled < Duration::from_millis(1200), "slow: {msg}");
+        let got = oa.join().unwrap().len() + ob.join().unwrap().len();
+        assert_eq!(got, 20, "{msg}");
+        drop_runtimes(vec![rt_a, rt_b]).await;
+    }
 }
 
 // ---------------------------------------------------------------------------

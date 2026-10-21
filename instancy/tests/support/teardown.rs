@@ -7,7 +7,7 @@
 #![allow(dead_code)]
 
 use std::collections::{HashMap, VecDeque};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -305,6 +305,39 @@ impl Mesh {
         ClusterSpawnTransport::dedicated(conns, capacity)
     }
 
+    /// Shared-mode peer managers for `node` whose factories hand out the
+    /// mesh connection once and then "reconnect" to a peer that accepts but
+    /// never answers (see [`ReconnectToSilentPeer`]).
+    pub fn managers_reconnecting(
+        &mut self,
+        node: &str,
+    ) -> (Managers, Vec<Arc<ReconnectToSilentPeer>>) {
+        let handle = tokio::runtime::Handle::current();
+        let mut managers = HashMap::new();
+        let mut factories = Vec::new();
+        for (peer, stream) in self.take_ends(node) {
+            let factory = Arc::new(ReconnectToSilentPeer {
+                first: Mutex::new(Some(tokio::io::split(stream))),
+                silent_peers: Mutex::new(Vec::new()),
+                establishes: AtomicUsize::new(0),
+            });
+            factories.push(Arc::clone(&factory));
+            let factory: Arc<dyn DynConnectionFactory> = factory;
+            managers.insert(
+                peer.clone(),
+                SharedPeerManager::new(
+                    peer,
+                    shared_config(1),
+                    factory,
+                    &handle,
+                    tokio::sync::broadcast::channel(16).0,
+                )
+                .unwrap(),
+            );
+        }
+        (Arc::new(managers), factories)
+    }
+
     /// Shared-mode peer managers for `node` (one pooled connection per peer).
     pub fn managers(&mut self, node: &str) -> Managers {
         let handle = tokio::runtime::Handle::current();
@@ -415,6 +448,38 @@ pub async fn tcp_shared_mesh(nodes: &[&str], conns: usize) -> HashMap<String, Ma
 
 /// Connection factory handing out pre-established connections.
 pub struct PreEstablished<R, W>(pub Mutex<VecDeque<(R, W)>>);
+
+/// Connection factory that hands out one pre-established connection and then
+/// "reconnects" to a peer that accepts but never reads or answers, like a
+/// listener whose node has moved on. A manager using it never gives up on a
+/// broken connection, so a peer waiting for frames lost with it waits
+/// forever. Counts every establishment.
+pub struct ReconnectToSilentPeer {
+    first: Mutex<Option<(ReadHalf<DuplexStream>, WriteHalf<DuplexStream>)>>,
+    silent_peers: Mutex<Vec<DuplexStream>>,
+    pub establishes: AtomicUsize,
+}
+
+impl ConnectionFactory for ReconnectToSilentPeer {
+    type Reader = ReadHalf<DuplexStream>;
+    type Writer = WriteHalf<DuplexStream>;
+
+    async fn establish(
+        &self,
+        _peer_node_id: &str,
+    ) -> std::result::Result<
+        (ReadHalf<DuplexStream>, WriteHalf<DuplexStream>),
+        Box<dyn std::error::Error + Send + Sync>,
+    > {
+        self.establishes.fetch_add(1, Ordering::SeqCst);
+        if let Some(conn) = self.first.lock().unwrap().take() {
+            return Ok(conn);
+        }
+        let (ours, silent) = tokio::io::duplex(1 << 16);
+        self.silent_peers.lock().unwrap().push(silent);
+        Ok(tokio::io::split(ours))
+    }
+}
 
 impl<R, W> ConnectionFactory for PreEstablished<R, W>
 where

@@ -162,7 +162,101 @@ async fn cluster_two_nodes_no_exchange() {
     assert_eq!(data_b, vec![20, 40]);
 }
 
-/// The original shape of `cluster_two_nodes_no_exchange`: the transport runs
+/// `join_blocking` from tasks of the multi-thread runtime that hosts the
+/// transport: with one worker thread the first call blocks the only worker,
+/// and with two workers both calls block every worker. The wait must hand
+/// the thread's work over (`block_in_place`) so the network and the
+/// shutdown handshake keep running; both nodes complete.
+#[test]
+fn join_blocking_from_every_worker_of_a_multi_thread_runtime_completes() {
+    for worker_threads in [1, 2] {
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let tokio_rt = tokio::runtime::Builder::new_multi_thread()
+                .worker_threads(worker_threads)
+                .enable_all()
+                .build()
+                .unwrap();
+            let topology = ClusterTopology::multi_node(vec![
+                NodeConfig::new("node-a", 1),
+                NodeConfig::new("node-b", 1),
+            ])
+            .unwrap();
+            let dataflow_id = DataflowId::new();
+            let (conn_a, conn_b) = make_duplex_pair("node-a", "node-b", 64 * 1024);
+            let spawn = |node: &'static str, conn| {
+                let topology = topology.clone();
+                let handle = tokio_rt.handle().clone();
+                std::thread::spawn(move || {
+                    let rt = RuntimeHandle::new(RuntimeConfig {
+                        worker_threads: 1,
+                        ..RuntimeConfig::default()
+                    })
+                    .unwrap();
+                    let cluster = rt
+                        .spawn_cluster(
+                            "test",
+                            topology,
+                            node,
+                            dataflow_id,
+                            ClusterSpawnTransport::dedicated(vec![conn], 1024),
+                            Duration::from_secs(5),
+                            |builder: &mut DataflowBuilder<u64>| -> Result<()> {
+                                builder
+                                    .input::<i32>("data")?
+                                    .map("double", |_t, x| x * 2)
+                                    .output("results")?;
+                                Ok(())
+                            },
+                            &handle,
+                            SpawnOptions::new(),
+                        )
+                        .unwrap();
+                    (rt, cluster)
+                })
+            };
+            let (spawn_a, spawn_b) = (spawn("node-a", conn_a), spawn("node-b", conn_b));
+            let (rt_a, mut cluster_a) = spawn_a.join().unwrap();
+            let (rt_b, mut cluster_b) = spawn_b.join().unwrap();
+            let output_a = cluster_a.take_output::<i32>(0, "results").unwrap();
+            let output_b = cluster_b.take_output::<i32>(0, "results").unwrap();
+            let sender_a = cluster_a.take_input::<i32>(0, "data").unwrap();
+            let sender_b = cluster_b.take_input::<i32>(0, "data").unwrap();
+            let joined = tokio_rt.block_on(async move {
+                let join_a = tokio::spawn(async move { cluster_a.join_blocking() });
+                let join_b = tokio::spawn(async move { cluster_b.join_blocking() });
+                // Inputs close only once both waits are blocking.
+                tokio::time::sleep(Duration::from_millis(200)).await;
+                sender_a.send(0, vec![1, 2, 3]).unwrap();
+                drop(sender_a);
+                sender_b.send(0, vec![10, 20]).unwrap();
+                drop(sender_b);
+                (join_a.await.unwrap(), join_b.await.unwrap())
+            });
+            let data = |output: instancy::OutputReceiver<u64, i32>| -> Vec<i32> {
+                output
+                    .collect_data()
+                    .into_iter()
+                    .flat_map(|(_, d)| d)
+                    .collect()
+            };
+            let outcome = (
+                joined.0.is_ok(),
+                joined.1.is_ok(),
+                data(output_a),
+                data(output_b),
+            );
+            let _ = done_tx.send(outcome);
+            drop((rt_a, rt_b));
+        });
+        let outcome = done_rx.recv_timeout(Duration::from_secs(30));
+        assert_eq!(
+            outcome,
+            Ok((true, true, vec![2, 4, 6], vec![20, 40])),
+            "worker_threads={worker_threads}: the blocking joins deadlocked or failed"
+        );
+    }
+}
 /// on a `current_thread` runtime and `join_blocking` is called from the
 /// thread driving it. That can never finish (the shutdown handshake needs
 /// this runtime), so it must fail promptly instead of deadlocking, and must

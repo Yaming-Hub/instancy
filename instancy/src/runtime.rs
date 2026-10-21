@@ -5375,10 +5375,13 @@ impl<T: Timestamp> ClusterSpawnedDataflow<T> {
     /// handshake has finished. See [`join()`](Self::join).
     ///
     /// The network runs on the tokio runtime passed to `spawn_cluster`, so it
-    /// must be able to make progress while this thread blocks. If that is a
-    /// `current_thread` runtime driven by this very thread, this returns an
-    /// error instead of deadlocking (see [`ClusterCompletion::wait`]); use
-    /// `.await` on the completion, or block from another thread.
+    /// must be able to make progress while this thread blocks. On a
+    /// multi-thread runtime's worker thread that is ensured with
+    /// `block_in_place`; if it is a
+    /// `current_thread` runtime driven by this very thread (or by no thread),
+    /// this returns an error instead of deadlocking (see
+    /// [`ClusterCompletion::wait`]); use `.await` on the completion, or block
+    /// from another thread.
     pub fn join_blocking(self) -> Result<()> {
         self.join()?.wait()
     }
@@ -5430,29 +5433,38 @@ impl<T: Timestamp> ClusterCompletion<T> {
     /// this node were lost. On first error, cancels remaining workers,
     /// preferring an originating failure over cancellation.
     ///
+    /// The network and the shutdown handshake run on the tokio runtime
+    /// passed to `spawn_cluster`. Called from a task on a worker thread of a
+    /// multi-thread tokio runtime, the wait uses
+    /// [`block_in_place`](tokio::task::block_in_place), so the runtime keeps
+    /// making progress even if it has a single worker thread.
+    ///
     /// # Errors
     ///
-    /// Returns [`RuntimeError::InvalidConfig`] immediately, without waiting,
+    /// Returns [`RuntimeError::InvalidConfig`] promptly, without waiting,
     /// if the wait could never finish because the dataflow's transport runs
     /// on a `current_thread` tokio runtime that is not making progress (for
-    /// example when called from the thread driving that runtime). The
-    /// dataflow keeps running, as if the completion had been dropped.
+    /// example when called from the thread driving that runtime, or when no
+    /// thread drives it). The dataflow keeps running, as if the completion
+    /// had been dropped.
     pub fn wait(mut self) -> Result<()> {
-        self.teardown.check_blocking_wait()?;
-        let result = match self.result.take() {
-            Some(result) => result,
-            None => self
-                .completion
-                .take()
-                .ok_or_else(|| {
-                    Error::Runtime(RuntimeError::AlreadyConsumed {
-                        resource: "cluster completion".into(),
-                    })
-                })?
-                .wait(),
-        };
-        self.teardown.wait();
-        merge_data_loss(result, self.teardown.data_loss())
+        let result = self.result.take();
+        let completion = self.completion.take();
+        let teardown = &self.teardown;
+        teardown.block(move || {
+            let result = match result {
+                Some(result) => result,
+                None => completion
+                    .ok_or_else(|| {
+                        Error::Runtime(RuntimeError::AlreadyConsumed {
+                            resource: "cluster completion".into(),
+                        })
+                    })?
+                    .wait(),
+            };
+            teardown.wait();
+            merge_data_loss(result, teardown.data_loss())
+        })?
     }
 }
 

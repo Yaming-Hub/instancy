@@ -530,6 +530,50 @@ mod tokio_impl {
                 }
             }
         }
+
+        /// Like [`run`](Self::run), but keeps reading (and discarding frames
+        /// nobody receives any more) until the peer closes the connection,
+        /// even after every channel is gone, and stops only `linger` after
+        /// `closed` fires.
+        ///
+        /// The read half of a connection must not be released while the peer
+        /// may still be sending: closing a socket with unread data makes the
+        /// OS reset the connection, which can destroy frames this node wrote
+        /// last (an acknowledgement, an end-of-stream marker, a `Cancel`)
+        /// before the peer has read them.
+        pub async fn run_lingering(
+            mut self,
+            closed: tokio_util::sync::CancellationToken,
+            linger: std::time::Duration,
+        ) -> Result<(), TransportError> {
+            let expired = async {
+                closed.cancelled().await;
+                tokio::time::sleep(linger).await;
+            };
+            tokio::pin!(expired);
+            loop {
+                let frame = tokio::select! {
+                    biased;
+                    _ = &mut expired => return Ok(()),
+                    frame = self.reader.read_frame() => match frame {
+                        Ok(f) => f,
+                        Err(TransportError::ConnectionClosed) => return Ok(()),
+                        Err(e) => return Err(e),
+                    },
+                };
+                let key = (frame.dataflow_id, frame.channel_id);
+                if let Some(tx) = self.channels.get(&key) {
+                    let sent = tokio::select! {
+                        biased;
+                        _ = &mut expired => return Ok(()),
+                        sent = tx.send(frame.payload) => sent,
+                    };
+                    if sent.is_err() {
+                        self.channels.remove(&key);
+                    }
+                }
+            }
+        }
     }
 
     /// A multiplexer that collects frames from multiple channel senders and

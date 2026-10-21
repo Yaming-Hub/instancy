@@ -155,27 +155,73 @@ impl TeardownWaiter {
         lock_state(&self.shared).data_loss.clone()
     }
 
-    /// Fail instead of deadlocking when a blocking wait could never finish.
+    /// Run `wait`, a blocking wait for this dataflow's local workers and
+    /// teardown, without deadlocking a tokio runtime that teardown (or the
+    /// network the workers depend on) needs.
     ///
-    /// Teardown needs the coordinator task, which runs on the transport's
-    /// tokio runtime. A `current_thread` runtime only makes progress while
-    /// some thread drives it, so blocking its driving thread (e.g. calling
-    /// `join_blocking` from `#[tokio::main(flavor = "current_thread")]`)
-    /// would wait forever. Only callers inside a `current_thread` runtime
-    /// context can be that thread; for them this spawns a no-op probe on the
-    /// transport runtime and returns an error if it does not run within a
-    /// grace period. A `spawn_blocking` thread whose runtime is driven by
-    /// another thread passes, and callers outside any runtime, or on a
-    /// multi-thread runtime, never fail here.
-    pub(crate) fn check_blocking_wait(&self) -> Result<()> {
-        let caller_on_current_thread_runtime = tokio::runtime::Handle::try_current()
-            .is_ok_and(|h| h.runtime_flavor() == tokio::runtime::RuntimeFlavor::CurrentThread);
-        if lock_state(&self.shared).done
-            || !caller_on_current_thread_runtime
-            || self.shared.runtime.runtime_flavor() != tokio::runtime::RuntimeFlavor::CurrentThread
-        {
-            return Ok(());
+    /// The coordinator and the network bridges run on the transport's tokio
+    /// runtime, so a thread that the runtime needs to make progress must not
+    /// simply block:
+    /// - On a multi-thread runtime's worker thread (a task, even on the only
+    ///   worker), the wait runs in
+    ///   [`block_in_place`](tokio::task::block_in_place), which hands this
+    ///   thread's other work to another thread first. This also covers every
+    ///   worker of the runtime blocking at once. Other threads (a
+    ///   multi-thread runtime's `block_on`, or no runtime at all) are not
+    ///   workers and block directly.
+    /// - A `current_thread` runtime only progresses while some thread drives
+    ///   it, so when the caller is inside a `current_thread` runtime context
+    ///   (it may be that thread), or the transport runtime is a
+    ///   `current_thread` runtime (nobody may be driving it), the wait first
+    ///   spawns a no-op probe on the transport runtime and returns
+    ///   [`RuntimeError::InvalidConfig`] if it does not run within a grace
+    ///   period. A `spawn_blocking` thread whose runtime another thread
+    ///   drives passes.
+    ///
+    /// When `wait` was not run, the dataflow keeps running, as if its
+    /// completion handle had been dropped.
+    pub(crate) fn block<R>(&self, wait: impl FnOnce() -> R) -> Result<R> {
+        use tokio::runtime::RuntimeFlavor;
+        if lock_state(&self.shared).done {
+            return Ok(wait());
         }
+        let caller = tokio::runtime::Handle::try_current()
+            .ok()
+            .map(|handle| handle.runtime_flavor());
+        if caller == Some(RuntimeFlavor::CurrentThread)
+            || self.shared.runtime.runtime_flavor() == RuntimeFlavor::CurrentThread
+        {
+            self.probe_transport_runtime()?;
+        }
+        // Worker threads only run code inside tasks; elsewhere
+        // `block_in_place` would at best just run `wait`, and at worst panic
+        // (in a `current_thread` runtime's `block_on` that has entered a
+        // multi-thread runtime's handle).
+        if caller != Some(RuntimeFlavor::MultiThread) || tokio::task::try_id().is_none() {
+            return Ok(wait());
+        }
+        let mut wait = Some(wait);
+        let blocked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            tokio::task::block_in_place(|| (wait.take().expect("called once"))())
+        }));
+        match blocked {
+            Ok(result) => Ok(result),
+            Err(panic) => match wait.take() {
+                // `block_in_place` refused before running anything: this
+                // thread drives a `current_thread` runtime that has entered a
+                // multi-thread handle. Treat it like any such caller.
+                Some(wait) => {
+                    self.probe_transport_runtime()?;
+                    Ok(wait())
+                }
+                None => std::panic::resume_unwind(panic),
+            },
+        }
+    }
+
+    /// Spawn a no-op on the transport runtime and fail if it does not run
+    /// within [`BLOCKING_WAIT_PROBE`] (see [`Self::block`]).
+    fn probe_transport_runtime(&self) -> Result<()> {
         let (tx, rx) = std::sync::mpsc::channel::<()>();
         let probe = self.shared.runtime.spawn(async move {
             let _ = tx.send(());
@@ -191,7 +237,8 @@ impl TeardownWaiter {
                 Err(Error::Runtime(RuntimeError::InvalidConfig(
                     "blocking wait on a cluster dataflow would deadlock: its transport runs on a \
                      current_thread tokio runtime that is not making progress (is this thread \
-                     driving it?); await the completion instead, or block from another thread"
+                     driving it, or is nothing driving it?); await the completion instead, or \
+                     block from another thread"
                         .into(),
                 )))
             }
@@ -1109,10 +1156,16 @@ impl ClusterLifecycle {
                     }
                 });
             }
-            let _ = tokio::time::timeout(self.cancel_broadcast_timeout, async {
+            let finished = tokio::time::timeout(self.cancel_broadcast_timeout, async {
                 while flushes.join_next().await.is_some() {}
             })
             .await;
+            if finished.is_err() {
+                // Release the managers the unfinished flushes hold before
+                // checking below whether ours is the last reference.
+                flushes.abort_all();
+                while flushes.join_next().await.is_some() {}
+            }
         }
         if drain_inbound {
             let _ =
@@ -1130,6 +1183,20 @@ impl ClusterLifecycle {
         if let Some(managers) = managers {
             for manager in managers.values() {
                 manager.unregister_dataflow(&self.dataflow_id).await;
+            }
+            // If this dataflow holds the last reference (per-job managers),
+            // releasing it closes the connections. Wait (bounded) until what
+            // we queued on them, such as our goodbye, our acknowledgements or
+            // our Cancel, has been written: peers may still be waiting for it.
+            // (`into_inner`, unlike `try_unwrap`, hands the managers to
+            // exactly one of several dataflows releasing them at once.)
+            if let Some(owned) = Arc::into_inner(managers) {
+                let timeout = self.cancel_broadcast_timeout;
+                let mut closes = tokio::task::JoinSet::new();
+                for manager in owned.into_values() {
+                    closes.spawn(manager.close(timeout));
+                }
+                while closes.join_next().await.is_some() {}
             }
         }
         self.progress_handles = None;
@@ -2038,8 +2105,8 @@ mod tests {
     }
 
     /// Blocking from the thread that drives a current_thread transport
-    /// runtime errors promptly; blocking from a thread that does not drive it
-    /// works.
+    /// runtime, or while no thread drives it, errors promptly; blocking from
+    /// a thread that does not drive it, while another one does, works.
     #[test]
     fn blocking_wait_probe_detects_the_thread_driving_the_runtime() {
         let rt = tokio::runtime::Builder::new_current_thread()
@@ -2047,21 +2114,21 @@ mod tests {
             .build()
             .unwrap();
         let (notifier, waiter) = teardown_signal(rt.handle().clone());
-        let started = std::time::Instant::now();
-        let error = rt.block_on(async { waiter.check_blocking_wait() });
-        assert!(
+        let deadlock = |result: &Result<()>| {
             matches!(
-                error,
-                Err(Error::Runtime(RuntimeError::InvalidConfig(ref m))) if m.contains("deadlock")
-            ),
-            "{error:?}"
-        );
+                result,
+                Err(Error::Runtime(RuntimeError::InvalidConfig(m))) if m.contains("deadlock")
+            )
+        };
+        let started = std::time::Instant::now();
+        let error = rt.block_on(async { waiter.block(|| ()) });
+        assert!(deadlock(&error), "{error:?}");
         assert!(started.elapsed() < Duration::from_secs(5));
 
         // A spawn_blocking thread while the main thread drives the runtime.
         let (waiter, result) = rt.block_on(async move {
             tokio::task::spawn_blocking(move || {
-                let result = waiter.check_blocking_wait();
+                let result = waiter.block(|| ());
                 (waiter, result)
             })
             .await
@@ -2069,20 +2136,117 @@ mod tests {
         });
         assert!(result.is_ok(), "{result:?}");
 
-        // Outside any runtime context: never probes (the caller cannot be
-        // the driving thread).
-        assert!(waiter.check_blocking_wait().is_ok());
+        // Outside any runtime context while nothing drives the runtime: the
+        // wait could only finish if some thread started driving it.
+        let result = waiter.block(|| ());
+        assert!(deadlock(&result), "{result:?}");
+
+        // Outside any runtime context while another thread drives it.
+        let waiter = Arc::new(waiter);
+        let blocked = Arc::clone(&waiter);
+        let result = rt.block_on(async move {
+            tokio::task::spawn_blocking(move || {
+                std::thread::spawn(move || blocked.block(|| ()))
+                    .join()
+                    .unwrap()
+            })
+            .await
+            .unwrap()
+        });
+        assert!(result.is_ok(), "{result:?}");
 
         // Done: never probes.
         drop(notifier);
-        assert!(rt.block_on(async { waiter.check_blocking_wait() }).is_ok());
+        assert!(rt.block_on(async { waiter.block(|| ()) }).is_ok());
+    }
 
-        // Multi-thread runtimes are always driven.
-        let mt = tokio::runtime::Builder::new_multi_thread()
-            .worker_threads(1)
-            .build()
-            .unwrap();
-        let (_notifier, waiter) = teardown_signal(mt.handle().clone());
-        assert!(mt.block_on(async { waiter.check_blocking_wait() }).is_ok());
+    /// On a multi-thread runtime the wait hands the thread's work over
+    /// (`block_in_place`): blocking the only worker thread, or the thread in
+    /// `block_on`, does not stop the runtime from completing teardown.
+    #[test]
+    fn blocking_wait_on_a_multi_thread_runtime_keeps_it_running() {
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let mt = tokio::runtime::Builder::new_multi_thread()
+                .worker_threads(1)
+                .enable_all()
+                .build()
+                .unwrap();
+            // From a task on the only worker thread.
+            let (notifier, waiter) = teardown_signal(mt.handle().clone());
+            let from_task = mt.block_on(async move {
+                tokio::spawn(async move {
+                    // Teardown completes on this runtime, later.
+                    tokio::spawn(async move {
+                        tokio::time::sleep(Duration::from_millis(100)).await;
+                        drop(notifier);
+                    });
+                    waiter.block(|| waiter.wait())
+                })
+                .await
+                .unwrap()
+            });
+            // From the thread in block_on.
+            let (notifier, waiter) = teardown_signal(mt.handle().clone());
+            let from_block_on = mt.block_on(async move {
+                tokio::spawn(async move {
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                    drop(notifier);
+                });
+                waiter.block(|| waiter.wait())
+            });
+            let _ = done_tx.send((from_task.is_ok(), from_block_on.is_ok()));
+        });
+        let outcome = done_rx.recv_timeout(Duration::from_secs(20));
+        assert_eq!(outcome, Ok((true, true)), "the blocking wait deadlocked");
+    }
+
+    /// A thread driving a `current_thread` runtime that has entered a
+    /// multi-thread runtime's handle cannot use `block_in_place`; the wait
+    /// must still work (the transport's workers make progress) without
+    /// panicking, both in the `block_on` body and in a task.
+    #[test]
+    fn blocking_wait_in_a_current_thread_runtime_inside_a_multi_thread_handle() {
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let mt = tokio::runtime::Builder::new_multi_thread()
+                .worker_threads(1)
+                .enable_all()
+                .build()
+                .unwrap();
+            let ct = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            let wait_inside = |inside_task: bool| {
+                let (notifier, waiter) = teardown_signal(mt.handle().clone());
+                mt.spawn(async move {
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                    drop(notifier);
+                });
+                let handle = mt.handle().clone();
+                ct.block_on(async move {
+                    let wait = move || {
+                        let _entered = handle.enter();
+                        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                            waiter.block(|| waiter.wait()).is_ok()
+                        }))
+                        .unwrap_or(false)
+                    };
+                    if inside_task {
+                        tokio::spawn(async move { wait() }).await.unwrap()
+                    } else {
+                        wait()
+                    }
+                })
+            };
+            let _ = done_tx.send((wait_inside(false), wait_inside(true)));
+        });
+        let outcome = done_rx.recv_timeout(Duration::from_secs(20));
+        assert_eq!(
+            outcome,
+            Ok((true, true)),
+            "the blocking wait failed or deadlocked"
+        );
     }
 }

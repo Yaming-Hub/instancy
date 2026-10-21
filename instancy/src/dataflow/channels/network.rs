@@ -299,6 +299,8 @@ pub struct NetworkPush<T: Timestamp + ExchangeData, D: ExchangeData> {
     sender: crate::communication::cluster_transport::FrameSender,
     /// Ordered lossless lane to the peer (cluster dataflows only).
     outbox: Option<crate::communication::peer_link::PeerOutbox>,
+    /// The closed transport queue was reported to the coordinator.
+    link_failure_reported: std::sync::atomic::AtomicBool,
     closed: bool,
 }
 
@@ -371,7 +373,26 @@ impl<T: Timestamp + ExchangeData, D: ExchangeData> NetworkPush<T, D> {
                     Ok(())
                 }
             }
-            Err(tokio_mpsc::error::TrySendError::Closed(_)) => Err(Error::ChannelClosed),
+            Err(tokio_mpsc::error::TrySendError::Closed(_)) => match &self.outbox {
+                // The connection to a peer that has not finished is gone while
+                // this dataflow runs. That is not this operator's failure: the
+                // peer may have cancelled (its Cancel may still be unread), it
+                // may have crashed, or a local write failed. The coordinator
+                // finds out which and cancels the dataflow with that reason;
+                // until then the operator waits, as for a full queue.
+                Some(outbox) => {
+                    if !self
+                        .link_failure_reported
+                        .swap(true, std::sync::atomic::Ordering::Relaxed)
+                    {
+                        outbox.report(crate::communication::peer_link::LinkEvent::OutboundFailed(
+                            crate::communication::peer_link::LinkFailure::SendFailed,
+                        ));
+                    }
+                    Err(Error::Backpressure)
+                }
+                None => Err(Error::ChannelClosed),
+            },
         }
     }
 
@@ -1082,6 +1103,7 @@ impl<T: Timestamp + ExchangeData, D: ExchangeData> EdgeMaterializer<T, D>
                     channel_id,
                     sender,
                     outbox: self.peer_outboxes.get(dst_node).cloned(),
+                    link_failure_reported: std::sync::atomic::AtomicBool::new(false),
                     closed: false,
                 }));
             }
@@ -1568,6 +1590,7 @@ mod tests {
                 channel_id: 5,
                 sender: crate::communication::cluster_transport::FrameSender::Direct(sender),
                 outbox: Some(outbox.clone()),
+                link_failure_reported: std::sync::atomic::AtomicBool::new(false),
                 closed: false,
             }
         }
@@ -1603,14 +1626,28 @@ mod tests {
 
         #[tokio::test]
         async fn push_of_records_to_a_retired_closed_link_is_data_loss() {
-            let (outbox, _events, _sink) = monitored_outbox("node-b");
+            let (outbox, mut events, _sink) = monitored_outbox("node-b");
             let (tx, rx) = tokio_mpsc::channel(4);
             drop(rx);
             let mut push = push_to(&outbox, tx);
+            // A closed link to a peer that has not finished is the
+            // coordinator's to judge (reported once); the operator waits.
+            for _ in 0..3 {
+                assert!(matches!(
+                    push.push(Envelope::data(1, vec![1])),
+                    Err(Error::Backpressure)
+                ));
+            }
             assert!(matches!(
-                push.push(Envelope::data(1, vec![1])),
-                Err(Error::ChannelClosed)
+                events.try_recv(),
+                Ok(LifecycleEvent::Link {
+                    event: LinkEvent::OutboundFailed(
+                        crate::communication::peer_link::LinkFailure::SendFailed
+                    ),
+                    ..
+                })
             ));
+            assert!(events.try_recv().is_err(), "reported once");
             outbox.link().retire();
             assert!(matches!(
                 push.push(Envelope::data(1, vec![1])),

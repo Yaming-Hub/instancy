@@ -571,18 +571,14 @@ async fn dropping_handles_at_every_stage() {
         .await;
         drop(cluster.node("a").cluster.take());
         let rb = cluster.join("b", Duration::from_secs(10)).await.unwrap();
-        // Shared mode: when the dropped handle's lifecycle task releases the
-        // last manager reference, the manager aborts its writers and the
-        // queued Cancel can be lost; the peer is then cancelled by the
-        // transport failure instead. Either way it must be cancelled.
+        // Also with per-dataflow Shared managers: the dropped handle's
+        // lifecycle task releases the last manager reference, and closing it
+        // writes the queued Cancel before the connections close.
         let cancelled = matches!(
-            (mode, &rb),
-            (
-                _,
-                Some(Err(instancy::Error::Cancelled {
-                    reason: Some(CancellationReason::PeerCancelled { .. }),
-                })),
-            ) | (Mode::Shared, Some(Err(instancy::Error::Cancelled { .. })))
+            &rb,
+            Some(Err(instancy::Error::Cancelled {
+                reason: Some(CancellationReason::PeerCancelled { .. }),
+            }))
         );
         assert!(
             cancelled,
