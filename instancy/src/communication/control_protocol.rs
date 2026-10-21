@@ -953,7 +953,9 @@ pub(crate) async fn join_all<F: std::future::Future>(futures: Vec<F>) -> Vec<F::
 ///
 /// For each peer's control channel:
 /// - `Cancel` cancels the local token with
-///   [`CancellationReason::PeerCancelled`] and reports
+///   [`CancellationReason::PeerCancelled`] (or, when it forwards a failure
+///   after a requested stop, escalates it so a drain in progress stops) and
+///   reports
 ///   [`LinkEvent::CancelReceived`](super::peer_link::LinkEvent::CancelReceived).
 /// - An undecodable message reports
 ///   [`LinkEvent::ControlUndecodable`](super::peer_link::LinkEvent::ControlUndecodable).
@@ -1001,7 +1003,9 @@ pub(crate) fn spawn_control_dispatcher(
                             };
                             match decode_control_message(&data) {
                                 Ok(ControlMessage::Cancel { reason }) => {
-                                    token.cancel_with_reason(CancellationReason::PeerCancelled {
+                                    // A failure the peer forwards after its
+                                    // requested stop also ends our drain.
+                                    token.escalate(CancellationReason::PeerCancelled {
                                         peer_id: peer_id.clone(),
                                         detail: reason,
                                     });
@@ -1854,16 +1858,12 @@ mod tests {
         async fn unexpected_message_is_rejected() {
             let (tx, mut rx) = peers(&["b"]);
             tx["b"].send(ready("b")).await.unwrap();
-            let err = receive_from_each_peer(
-                &mut rx,
-                in_secs(5),
-                false,
-                |peer_id: &str, data: &[u8]| {
+            let err =
+                receive_from_each_peer(&mut rx, in_secs(5), false, |peer_id: &str, data: &[u8]| {
                     validate_peer_handshake(peer_id, data, 1, DataflowId::new())
-                },
-            )
-            .await
-            .unwrap_err();
+                })
+                .await
+                .unwrap_err();
             assert!(
                 matches!(err, HandshakeError::UnexpectedMessage { .. }),
                 "{err:?}"

@@ -104,7 +104,11 @@ pub(crate) enum LinkEvent {
 #[derive(Debug)]
 pub(crate) enum LifecycleEvent {
     /// A local worker finished; `success` is true only for `Ok(true)`.
-    WorkerFinished { success: bool },
+    /// `failure` describes an error other than a cancellation.
+    WorkerFinished {
+        success: bool,
+        failure: Option<String>,
+    },
     /// An event on the link to `peer`.
     Link { peer: String, event: LinkEvent },
 }
@@ -124,6 +128,12 @@ pub(crate) fn report_link_event(events: &LifecycleEventSender, peer: &str, event
 #[derive(Debug, Default)]
 pub(crate) struct PeerLinkState {
     retired: AtomicBool,
+    /// Inbound data channels from the peer still waiting for their close
+    /// sentinel (see [`OpenInboundChannel`]).
+    open_inbound_data: std::sync::atomic::AtomicUsize,
+    /// A data push to the peer found its queue closed: it backs off on a
+    /// frame that can never leave.
+    push_blocked: AtomicBool,
 }
 
 impl PeerLinkState {
@@ -141,8 +151,49 @@ impl PeerLinkState {
     pub(crate) fn retire(&self) {
         self.retired.store(true, Ordering::SeqCst);
     }
+
+    /// Inbound data channels from the peer whose consumer still waits for
+    /// their close sentinel: a local drain cannot complete without the peer.
+    pub(crate) fn open_inbound_data_channels(&self) -> usize {
+        self.open_inbound_data.load(Ordering::SeqCst)
+    }
+
+    /// Whether a data push to the peer is backing off on a closed queue.
+    pub(crate) fn push_blocked(&self) -> bool {
+        self.push_blocked.load(Ordering::SeqCst)
+    }
+
+    /// A data push to the peer found its queue closed.
+    pub(crate) fn note_push_blocked(&self) {
+        self.push_blocked.store(true, Ordering::SeqCst);
+    }
 }
 
+/// An inbound data channel from a peer, counted in
+/// [`PeerLinkState::open_inbound_data_channels`] until it delivers its close
+/// sentinel or its consumer drops it.
+#[derive(Debug)]
+pub(crate) struct OpenInboundChannel {
+    link: Arc<PeerLinkState>,
+    released: AtomicBool,
+}
+
+impl OpenInboundChannel {
+    pub(crate) fn open(link: Arc<PeerLinkState>) -> Arc<Self> {
+        link.open_inbound_data.fetch_add(1, Ordering::SeqCst);
+        Arc::new(Self {
+            link,
+            released: AtomicBool::new(false),
+        })
+    }
+
+    /// The channel is no longer awaited. Idempotent.
+    pub(crate) fn release(&self) {
+        if !self.released.swap(true, Ordering::SeqCst) {
+            self.link.open_inbound_data.fetch_sub(1, Ordering::SeqCst);
+        }
+    }
+}
 /// Producer handle for the ordered, lossless lane to one peer.
 #[derive(Clone)]
 pub(crate) struct PeerOutbox {

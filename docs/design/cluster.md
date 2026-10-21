@@ -434,8 +434,44 @@ full queue until the coordinator cancels the dataflow with the actual reason
 (the peer's `Cancel`, the link ending, or the grace period). Every failure is
 decided in `LifecycleMachine::on_link_failure` (losses) or
 `LifecycleMachine::on_corruption` (corrupt traffic, see below).
-If the dataflow is already being cancelled, such failures are expected and the
-coordinator simply waits for the local workers to stop.
+If the dataflow is already being cancelled because of a failure, such failures
+are expected and the coordinator simply waits for the local workers to stop.
+
+**A requested stop that can no longer complete.** A cancellation that is not a
+failure (`UserRequested`, `RuntimeShutdown`, `HandleDropped`, or a peer
+forwarding one) is a *requested stop*: nodes with `drain_on_cancel` drain on
+it. A drain can complete only if every peer it needs finishes its part: the
+peer's workers succeed, close their channels and say goodbye. When that can
+no longer happen, the drain stops at once instead of at its deadline:
+
+- A node whose workers do not all succeed after it announced a requested stop
+  (a worker failed during the drain, the drain timed out, the node does not
+  drain, or its runtime was dropped) sends a second `Cancel`
+  (`AnnounceUnfinished`, at most once, and not if its first `Cancel` already
+  described a failure). If it failed (a worker error other than a
+  cancellation, or a failure that stopped its own drain: a peer's, a lost
+  link, lost records) the second `Cancel` carries that failure. Otherwise it
+  repeats the requested stop, marked as unfinished.
+- A failure stops every drain (as if it had come first, nothing would have
+  drained): the receiving node *escalates* its cancellation
+  (`CancellationToken::escalate`). The first reason stays, so workers that are
+  not draining report it unchanged, but a draining executor stops at its next
+  sweep and reports the escalated failure.
+- An unfinished peer stops only the drains that need it (`AbortDrain`): those
+  still waiting for one of its data channels (no close sentinel yet), or with
+  a data push to it that found its queue closed (the push backs off on a frame
+  that can never leave). A drain that needs nothing more from it may still
+  complete, even if other writes to it (progress, say) fail. A peer
+  counts as unfinished after its second `Cancel`, or when its link ends before
+  its goodbye during a requested stop, also after its first `Cancel` (its
+  runtime or process went away before it could say anything). An EOF counts
+  once the whole link has closed, so a `Cancel` queued behind it is applied
+  first.
+- During a requested stop, corrupt traffic and a data channel that ends
+  without its close sentinel also stop the drain (the loss is reported
+  anyway).
+
+The stopped workers then fail, and the node announces that in turn.
 A local cancellation or runtime shutdown that happens after the goodbye was
 committed is not broadcast and does not cut the handshake short. The same
 holds for an external abort of the network bridges (`report_node_leave`,
@@ -540,6 +576,12 @@ read at all; corruption in it is then not seen. Detection of protocol
 violations assumes a peer running this protocol: a peer that sends data on a
 channel after its own goodbye without ever closing it, or acknowledges
 before our goodbye in a race with our last worker result, is not caught.
+If a node's runtime is dropped together with the tokio runtime its coordinator
+runs on, the node cannot announce that its part will not complete; draining
+peers then rely on the link loss, which in Shared mode they see only if the
+shared connections go too (otherwise they drain until their deadline). A
+drain that waits only for an unfinished peer's progress (not its data) is not
+stopped early.
 In Shared mode the reader reduces checksum, oversize and malformed-prefix
 errors to a connection loss (the gap they leave in the dataflow's sequence
 still blocks everything behind it, so a running node fails on the reorder

@@ -3792,8 +3792,8 @@ impl RuntimeHandle {
         for (local_idx, (spawned, executor, mut notifier)) in prepared.into_iter().enumerate() {
             let worker = local_start + local_idx;
             let events = events_tx.clone();
-            notifier.set_result_observer(Box::new(move |success| {
-                let _ = events.send(LifecycleEvent::WorkerFinished { success });
+            notifier.set_result_observer(Box::new(move |success, failure| {
+                let _ = events.send(LifecycleEvent::WorkerFinished { success, failure });
             }));
             let executor = MarkCompleted {
                 inner: executor,
@@ -3874,6 +3874,9 @@ impl RuntimeHandle {
                 peer_registration: peer_reg_id,
                 shared_managers: shared_managers_arc,
                 transport,
+                failure_announced: false,
+                unfinished_announced: false,
+                worker_failure: None,
                 _teardown: teardown_notifier,
             };
             runtime_handle.spawn(lifecycle.run());
@@ -4397,7 +4400,7 @@ pub struct CompletionNotifier {
     shared: Arc<Mutex<SharedCompletionState>>,
     condvar: Arc<Condvar>,
     on_complete: Option<Box<dyn FnOnce() + Send>>,
-    on_result: Option<Box<dyn FnOnce(bool) + Send>>,
+    on_result: Option<Box<dyn FnOnce(bool, Option<String>) + Send>>,
     failure_cancel: Option<CancellationToken>,
     completed: bool,
 }
@@ -4416,10 +4419,12 @@ impl CompletionNotifier {
     }
 
     /// Attach a callback that receives whether the executor completed
-    /// successfully (`Ok(true)`). Fires once, from `complete()` or from `Drop`
-    /// (with `false`). The executor future has already been dropped by then.
+    /// successfully (`Ok(true)`), and the error if it failed for another
+    /// reason than a cancellation. Fires once, from `complete()` or from
+    /// `Drop` (with `false`). The executor future has already been dropped
+    /// by then.
     #[cfg(feature = "transport")]
-    pub(crate) fn set_result_observer(&mut self, f: Box<dyn FnOnce(bool) + Send>) {
+    pub(crate) fn set_result_observer(&mut self, f: Box<dyn FnOnce(bool, Option<String>) + Send>) {
         self.on_result = Some(f);
     }
 
@@ -4433,7 +4438,11 @@ impl CompletionNotifier {
             }
         }
         if let Some(observer) = self.on_result.take() {
-            observer(matches!(result, Ok(true)));
+            let failure = match &result {
+                Err(error) if !matches!(error, Error::Cancelled { .. }) => Some(error.to_string()),
+                _ => None,
+            };
+            observer(matches!(result, Ok(true)), failure);
         }
         self.completed = true;
         {
@@ -4465,7 +4474,10 @@ impl Drop for CompletionNotifier {
             });
         }
         if let Some(observer) = self.on_result.take() {
-            observer(false);
+            observer(
+                false,
+                Some("dataflow executor terminated unexpectedly (possible panic)".into()),
+            );
         }
         // Executor panicked or was killed without publishing a result.
         let mut state = match self.shared.lock() {

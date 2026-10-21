@@ -136,6 +136,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `source_async` producers start only after the ready barrier, so a failed
   `spawn_cluster` never runs them.
 - The cluster `Cancel` broadcast sends to all peers concurrently.
+- A cluster-wide requested stop (`drain_on_cancel`) that can no longer
+  complete ends at once instead of at each node's drain deadline. A node whose
+  workers do not complete after announcing a requested stop (a worker failed
+  during the drain, the drain timed out, the node did not drain, or its
+  runtime was dropped) says so with a second `Cancel`: a failure stops every
+  peer's drain; otherwise only drains that still need the node's data (or
+  whose data push to it is blocked) stop. A draining node also stops when such a peer's
+  link ends before its goodbye (also after that peer's `Cancel`), or when
+  corrupt traffic arrives. Stopped workers report the failure as their
+  cancellation reason; workers that do not drain keep the first reason.
+- A progress batch split over several frames (more than 1,000,000 changes)
+  sends its positive changes first, so a receiver applying the frames one by
+  one never sees a capability released before the one that replaces it.
+
 ### Input contract hardening
 
 - **BREAKING:** Invalid input/frontier sequences that were previously accepted
