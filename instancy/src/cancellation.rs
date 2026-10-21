@@ -119,7 +119,7 @@ impl CancellationReason {
 
     /// Whether `detail` is the `Display` text of a failure reason, possibly
     /// forwarded through further peers ("peer {id} cancelled dataflow: ...").
-    fn describes_failure(mut detail: &str) -> bool {
+    pub(crate) fn describes_failure(mut detail: &str) -> bool {
         const FAILURE_PREFIXES: [&str; 5] = [
             "network error: ",
             "worker failed: ",
@@ -237,6 +237,9 @@ struct TokenInner {
     /// Signalled when this token is directly cancelled. Waiters on
     /// `cancelled_async()` await this instead of polling.
     async_notify: tokio::sync::Notify,
+    /// A failure that arrived after a requested stop (see
+    /// [`CancellationToken::escalate`]); first one wins.
+    escalation: std::sync::OnceLock<CancellationReason>,
 }
 
 /// A cooperative cancellation signal for dataflow shutdown.
@@ -265,6 +268,7 @@ impl CancellationToken {
                 reason: Mutex::new(None),
                 wake_handles: Mutex::new(WakeRegistrations::default()),
                 async_notify: tokio::sync::Notify::new(),
+                escalation: std::sync::OnceLock::new(),
             }),
         }
     }
@@ -286,6 +290,7 @@ impl CancellationToken {
                 reason: Mutex::new(None),
                 wake_handles: Mutex::new(WakeRegistrations::default()),
                 async_notify: tokio::sync::Notify::new(),
+                escalation: std::sync::OnceLock::new(),
             }),
         }
     }
@@ -342,6 +347,47 @@ impl CancellationToken {
             // Wake async waiters on this token.
             self.inner.async_notify.notify_waiters();
         }
+    }
+
+    /// Cancel with a failure `reason`, or, if this token was already
+    /// cancelled for a requested stop (a reason that is not a failure, see
+    /// [`CancellationReason::is_failure`]), record `reason` as an
+    /// escalation and wake the registered executors: a graceful drain in
+    /// progress then stops (see [`escalation`](Self::escalation)).
+    /// [`reason`](Self::reason) keeps the first reason. A reason that is
+    /// not a failure only cancels.
+    pub(crate) fn escalate(&self, reason: CancellationReason) {
+        self.cancel_with_reason(reason.clone());
+        if !reason.is_failure() || self.reason().is_some_and(|first| first.is_failure()) {
+            // Nothing drains on a failure.
+            return;
+        }
+        if self.inner.escalation.set(reason).is_ok() {
+            let handles = self
+                .inner
+                .wake_handles
+                .lock()
+                .map(|registrations| registrations.live())
+                .unwrap_or_default();
+            for handle in &handles {
+                handle.notify();
+            }
+            self.inner.async_notify.notify_waiters();
+        }
+    }
+
+    /// A failure recorded by [`escalate`](Self::escalate) on this token or an
+    /// ancestor after it was cancelled for a requested stop: the stop can no
+    /// longer complete gracefully.
+    pub(crate) fn escalation(&self) -> Option<CancellationReason> {
+        let mut current = Some(&self.inner);
+        while let Some(node) = current {
+            if let Some(reason) = node.escalation.get() {
+                return Some(reason.clone());
+            }
+            current = node.parent.as_ref();
+        }
+        None
     }
 
     /// Returns the reason this token was cancelled, if available.
@@ -1073,6 +1119,50 @@ mod tests {
             assert!(!forward(reason).is_failure(), "{reason:?} forwarded");
             assert!(!forward(&forward(reason)).is_failure(), "{reason:?} twice");
         }
+    }
+
+    /// A failure after a requested stop is recorded for a drain in progress
+    /// (inherited by child tokens) and wakes the executors; the first reason
+    /// stays. Nothing is recorded when the stop was already a failure, for a
+    /// reason that is not a failure, or on a token that was not cancelled.
+    #[test]
+    fn escalation_upgrades_only_a_requested_stop() {
+        let failure = CancellationReason::WorkerFailed {
+            detail: "boom".into(),
+        };
+        let parent = CancellationToken::new();
+        let child = parent.child_token();
+        let wake = WakeHandle::new();
+        child.register_wake_handle(wake.clone());
+        parent.cancel_with_reason(CancellationReason::UserRequested);
+        wake.take_notification();
+        assert_eq!(child.escalation(), None);
+
+        parent.escalate(CancellationReason::HandleDropped);
+        assert_eq!(child.escalation(), None);
+        assert!(!wake.take_notification());
+
+        parent.escalate(failure.clone());
+        assert!(wake.take_notification());
+        assert_eq!(child.escalation(), Some(failure.clone()));
+        assert_eq!(child.reason(), Some(CancellationReason::UserRequested));
+        // First escalation wins, and wakes once.
+        parent.escalate(CancellationReason::PeerDown {
+            node_id: "n".into(),
+        });
+        assert_eq!(parent.escalation(), Some(failure.clone()));
+        assert!(!wake.take_notification());
+
+        // Not cancelled yet: an ordinary (failure) cancellation.
+        let token = CancellationToken::new();
+        token.escalate(failure.clone());
+        assert_eq!(token.reason(), Some(failure.clone()));
+        assert_eq!(token.escalation(), None);
+        // Already a failure: nothing to escalate.
+        let token = CancellationToken::new();
+        token.cancel_with_reason(CancellationReason::OperatorError { detail: "x".into() });
+        token.escalate(failure);
+        assert_eq!(token.escalation(), None);
     }
 
     #[test]

@@ -508,6 +508,175 @@ impl From<IoMode> for ChannelMode {
 }
 
 // ---------------------------------------------------------------------------
+// SourcePumps — deferred async-source pump threads
+// ---------------------------------------------------------------------------
+
+/// The async-source pump threads of a prepared worker, not started yet.
+///
+/// A pump runs user code (the `source_async` producer), so it must not start
+/// before the worker is allowed to run: a cluster dataflow starts its pumps
+/// only after the ready barrier, so a failed spawn never runs them.
+struct SourcePumps {
+    name: String,
+    pumps: Vec<Box<dyn FnOnce() + Send>>,
+}
+
+impl SourcePumps {
+    fn start(self) -> Result<()> {
+        for (pump_idx, pump) in self.pumps.into_iter().enumerate() {
+            std::thread::Builder::new()
+                .name(format!("source-pump-{}-{}", self.name, pump_idx))
+                .spawn(pump)
+                .map_err(|e| {
+                    Error::Runtime(RuntimeError::SpawnFailed {
+                        context: "failed to spawn pump thread".into(),
+                        source: Some(e),
+                    })
+                })?;
+        }
+        Ok(())
+    }
+}
+
+// ---------------------------------------------------------------------------
+// MarkCompleted — record a cluster worker's success before its executor drops
+// ---------------------------------------------------------------------------
+
+/// Wraps a cluster worker's executor future and sets `flag` when the worker
+/// completes successfully, before the task drops the executor.
+#[cfg(feature = "transport")]
+struct MarkCompleted<F: std::future::Future<Output = Result<bool>>> {
+    inner: Pin<Box<F>>,
+    flag: Arc<std::sync::atomic::AtomicBool>,
+}
+
+#[cfg(feature = "transport")]
+impl<F: std::future::Future<Output = Result<bool>>> std::future::Future for MarkCompleted<F> {
+    type Output = Result<bool>;
+
+    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        let poll = self.inner.as_mut().poll(cx);
+        if let Poll::Ready(Ok(true)) = &poll {
+            self.flag.store(true, std::sync::atomic::Ordering::Release);
+        }
+        poll
+    }
+}
+
+// ---------------------------------------------------------------------------
+// SpawnAbortGuard — tell peers when spawn_cluster fails
+// ---------------------------------------------------------------------------
+
+/// Where a failed `spawn_cluster` sends its `Cancel`.
+#[cfg(feature = "transport")]
+enum SpawnAbortTarget {
+    /// Nobody to tell (dedicated connections before the transport exists:
+    /// dropping them is the signal).
+    Nobody,
+    /// Shared managers, before this dataflow registered with them.
+    Managers(
+        Arc<
+            std::collections::HashMap<
+                String,
+                crate::communication::shared_transport::SharedPeerManager,
+            >,
+        >,
+    ),
+    /// The dataflow's transport.
+    Transport(Arc<crate::communication::cluster_transport::ClusterTransport>),
+}
+
+/// Broadcasts `Cancel` to every peer if `spawn_cluster` returns an error or
+/// its future is dropped before the lifecycle coordinator takes over.
+///
+/// Without it, peers still in the handshake or ready barrier wait for their
+/// timeout, and a peer that already passed the ready barrier would run (and
+/// possibly report success) without this node.
+#[cfg(feature = "transport")]
+struct SpawnAbortGuard {
+    target: SpawnAbortTarget,
+    dataflow_id: crate::dataflow::id::DataflowId,
+    local_node_id: String,
+    timeout: std::time::Duration,
+    runtime_handle: tokio::runtime::Handle,
+    reason: Option<String>,
+}
+
+#[cfg(feature = "transport")]
+impl SpawnAbortGuard {
+    /// Record why the spawn failed (forwarded to peers) and pass the error on.
+    fn fail(&mut self, error: Error) -> Error {
+        if self.reason.is_none() {
+            self.reason = Some(error.to_string());
+        }
+        error
+    }
+
+    /// The lifecycle coordinator now owns cancellation.
+    fn disarm(&mut self) {
+        self.target = SpawnAbortTarget::Nobody;
+    }
+}
+
+#[cfg(feature = "transport")]
+impl Drop for SpawnAbortGuard {
+    fn drop(&mut self) {
+        let target = std::mem::replace(&mut self.target, SpawnAbortTarget::Nobody);
+        if matches!(target, SpawnAbortTarget::Nobody) {
+            return;
+        }
+        // Forwarded as a failure, so peers do not treat it as a graceful stop.
+        let reason = CancellationReason::WorkerFailed {
+            detail: format!(
+                "spawn_cluster failed on node {}: {}",
+                self.local_node_id,
+                self.reason
+                    .as_deref()
+                    .unwrap_or("aborted before the dataflow started")
+            ),
+        }
+        .to_string();
+        let dataflow_id = self.dataflow_id;
+        let timeout = self.timeout;
+        self.runtime_handle.spawn(async move {
+            use crate::communication::control_protocol::{
+                ControlMessage, broadcast_cancel_with_transport, encode_control_message, join_all,
+            };
+            let notify = async {
+                match &target {
+                    SpawnAbortTarget::Transport(transport) => {
+                        broadcast_cancel_with_transport(transport, dataflow_id, &reason).await;
+                    }
+                    SpawnAbortTarget::Managers(managers) => {
+                        let payload = encode_control_message(&ControlMessage::Cancel {
+                            reason: reason.clone(),
+                        });
+                        let sends: Vec<_> = managers
+                            .values()
+                            .map(|manager| {
+                                let frame = crate::communication::transport::Frame {
+                                    dataflow_id,
+                                    channel_id:
+                                        crate::communication::transport_session::CONTROL_CHANNEL_ID,
+                                    payload: payload.clone(),
+                                };
+                                manager.send_control_connected(frame)
+                            })
+                            .collect();
+                        join_all(sends).await;
+                    }
+                    SpawnAbortTarget::Nobody => {}
+                }
+            };
+            let _ = tokio::time::timeout(timeout, notify).await;
+            // Releasing the transport now lets a dedicated session flush the
+            // Cancel (its writers drain their queues) and close.
+            drop(target);
+        });
+    }
+}
+
+// ---------------------------------------------------------------------------
 // PeerRegistry — tracks cluster dataflows for peer-down notification
 // ---------------------------------------------------------------------------
 
@@ -1724,6 +1893,40 @@ impl RuntimeHandle {
         Pin<Box<DataflowExecutor<T>>>,
         CompletionNotifier,
     )> {
+        let (spawned, executor, notifier, pumps) = self.prepare_worker_deferred(
+            dataflow,
+            mode,
+            worker_context,
+            progress_channels,
+            pre_created_wake_handle,
+            parent_cancel,
+            control_broadcast,
+            timeline_start_time,
+        )?;
+        pumps.start()?;
+        Ok((spawned, executor, notifier))
+    }
+
+    /// [`prepare_worker`](Self::prepare_worker) without starting the
+    /// async-source pumps: the caller starts them once the worker may run
+    /// (for a cluster dataflow, after the ready barrier).
+    #[allow(clippy::too_many_arguments, clippy::type_complexity)]
+    fn prepare_worker_deferred<T: Timestamp>(
+        &self,
+        dataflow: &mut LogicalDataflow<T>,
+        mode: ChannelMode,
+        worker_context: WorkerContext,
+        progress_channels: Option<WorkerProgressChannels<T>>,
+        pre_created_wake_handle: Option<WakeHandle>,
+        parent_cancel: Option<CancellationToken>,
+        control_broadcast: Option<(ControlSender, ControlReceiver)>,
+        timeline_start_time: Option<std::time::Instant>,
+    ) -> Result<(
+        SpawnedDataflow<T>,
+        Pin<Box<DataflowExecutor<T>>>,
+        CompletionNotifier,
+        SourcePumps,
+    )> {
         let has_async_sources = !dataflow.async_source_wiring.is_empty();
 
         if dataflow.operator_factories.is_empty()
@@ -1769,12 +1972,14 @@ impl RuntimeHandle {
         {
             let async_count = dataflow.async_source_wiring.len();
             input_count += async_count;
+            let drains_on_cancel = dataflow.drain_timeout.is_some();
             let operator_factories = &mut dataflow.operator_factories;
             for (op_idx, wiring) in dataflow.async_source_wiring.iter_mut() {
                 let (factory, pump) = wiring(
                     Arc::clone(&external_inputs_open),
                     wake_handle.clone(),
                     cancel.clone(),
+                    drains_on_cancel,
                 );
                 operator_factories.push((*op_idx, factory));
                 pump_tasks.push(pump);
@@ -1827,18 +2032,10 @@ impl RuntimeHandle {
         // Capture metrics handle before executor is moved into the registry.
         let metrics = executor.metrics().cloned();
 
-        // --- Spawn async source pump tasks ---
-        for (pump_idx, pump) in pump_tasks.into_iter().enumerate() {
-            std::thread::Builder::new()
-                .name(format!("source-pump-{}-{}", name, pump_idx))
-                .spawn(pump)
-                .map_err(|e| {
-                    Error::Runtime(RuntimeError::SpawnFailed {
-                        context: "failed to spawn pump thread".into(),
-                        source: Some(e),
-                    })
-                })?;
-        }
+        let pumps = SourcePumps {
+            name: name.clone(),
+            pumps: pump_tasks,
+        };
 
         let spawned = SpawnedDataflow {
             name,
@@ -1850,7 +2047,7 @@ impl RuntimeHandle {
             _phantom: PhantomData,
         };
 
-        Ok((spawned, Box::pin(executor), notifier))
+        Ok((spawned, Box::pin(executor), notifier, pumps))
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -2323,6 +2520,7 @@ impl RuntimeHandle {
 
             let mut pump_tasks: Vec<Box<dyn FnOnce() + Send>> = Vec::new();
             {
+                let drains_on_cancel = dataflow.drain_timeout.is_some();
                 let operator_factories = &mut dataflow.operator_factories;
                 for (op_idx, wiring) in dataflow.async_source_wiring.iter_mut() {
                     let stage_id = op_to_stage.get(op_idx).copied();
@@ -2337,6 +2535,7 @@ impl RuntimeHandle {
                         Arc::clone(&external_inputs_open),
                         wake_handle.clone(),
                         worker_cancel.clone(),
+                        drains_on_cancel,
                     );
                     operator_factories.push((*op_idx, factory));
                     pump_tasks.push(pump);
@@ -2818,18 +3017,34 @@ impl RuntimeHandle {
         };
         use cluster_lifecycle::{ClusterLifecycle, LifecycleMachine, teardown_signal};
 
+        // Tells the peers if this spawn fails (or this future is dropped)
+        // before the lifecycle coordinator takes over.
+        let mut abort_guard = SpawnAbortGuard {
+            target: match &transport_config {
+                ClusterSpawnTransport::Shared { peer_managers, .. } => {
+                    SpawnAbortTarget::Managers(Arc::clone(peer_managers))
+                }
+                // Dropping the connections closes them, which peers notice.
+                ClusterSpawnTransport::Dedicated { .. } => SpawnAbortTarget::Nobody,
+            },
+            dataflow_id,
+            local_node_id: local_node_id.to_string(),
+            timeout: handshake_timeout,
+            runtime_handle: runtime_handle.clone(),
+            reason: None,
+        };
         // `nodes` is public, so the topology may not have gone through
         // `multi_node`: reject duplicate node ids (which would create phantom
         // workers) and zero-worker nodes before anything indexes into them.
-        topology.validate()?;
+        topology.validate().map_err(|e| abort_guard.fail(e))?;
         let transport_capacity = match &transport_config {
             ClusterSpawnTransport::Dedicated { capacity, .. }
             | ClusterSpawnTransport::Shared { capacity, .. } => *capacity,
         };
         if transport_capacity == 0 {
-            return Err(Error::Runtime(RuntimeError::InvalidConfig(
+            return Err(abort_guard.fail(Error::Runtime(RuntimeError::InvalidConfig(
                 "cluster transport capacity must be at least 1".into(),
-            )));
+            ))));
         }
 
         let total_workers = topology.total_workers();
@@ -2863,8 +3078,8 @@ impl RuntimeHandle {
         let mut dataflows = Vec::with_capacity(num_local);
         for worker_idx in local_start..local_end {
             let mut builder = DataflowBuilder::new(format!("{name}/worker-{worker_idx}"));
-            build(&mut builder)?;
-            let mut df = builder.build()?;
+            build(&mut builder).map_err(|e| abort_guard.fail(e))?;
+            let mut df = builder.build().map_err(|e| abort_guard.fail(e))?;
             df.collect_metrics = metrics_config.operator_summary;
             df.channel_counters = metrics_config.channel_counters;
             df.activation_timeline = metrics_config.activation_timeline;
@@ -2878,9 +3093,10 @@ impl RuntimeHandle {
 
         // Phase 2: Validate topologies match across local workers.
         if num_local > 1 {
-            validate_multi_worker_topologies(&dataflows)?;
+            validate_multi_worker_topologies(&dataflows).map_err(|e| abort_guard.fail(e))?;
         }
-        validate_stage_parallelism(&dataflows[0], total_workers)?;
+        validate_stage_parallelism(&dataflows[0], total_workers)
+            .map_err(|e| abort_guard.fail(e))?;
 
         // Phase 3: Compute fingerprint and create transport.
         let exchange_indices = dataflows[0].exchange_edge_indices();
@@ -2937,6 +3153,8 @@ impl RuntimeHandle {
             >,
         >;
         let mut shared_registration_cleanup = None;
+        // Dedicated mode: per-peer connection events (EOF, read/write failures).
+        let mut dedicated_io_events = None;
 
         match transport_config {
             ClusterSpawnTransport::Dedicated {
@@ -3036,6 +3254,7 @@ impl RuntimeHandle {
                     runtime_handle,
                 )
                 .map_err(crate::error::CommunicationError::from)?;
+                dedicated_io_events = session.take_io_events();
                 let session = Arc::new(session);
                 transport = Arc::new(ClusterTransport::Dedicated(Arc::clone(&session)));
 
@@ -3176,6 +3395,7 @@ impl RuntimeHandle {
         }
 
         // Phase 4: Handshake — exchange fingerprints with all peers.
+        abort_guard.target = SpawnAbortTarget::Transport(Arc::clone(&transport));
         if let Some(ref session) = dedicated_session {
             perform_handshake(
                 session,
@@ -3186,7 +3406,7 @@ impl RuntimeHandle {
                 handshake_timeout,
             )
             .await
-            .map_err(|e| Error::Runtime(RuntimeError::Handshake(e)))?;
+            .map_err(|e| abort_guard.fail(Error::Runtime(RuntimeError::Handshake(e))))?;
         } else {
             perform_handshake_with_transport(
                 &transport,
@@ -3197,7 +3417,7 @@ impl RuntimeHandle {
                 handshake_timeout,
             )
             .await
-            .map_err(|e| Error::Runtime(RuntimeError::Handshake(e)))?;
+            .map_err(|e| abort_guard.fail(Error::Runtime(RuntimeError::Handshake(e))))?;
         }
 
         // Phase 4.5: Per-peer ordered outbound lanes and the lifecycle event
@@ -3223,6 +3443,12 @@ impl RuntimeHandle {
         // Create wake handles BEFORE exchange wiring so bridge tasks can use them.
         // Wake handles for ALL workers (remote ones are placeholders for API compat).
         let wake_handles: Vec<WakeHandle> = (0..total_workers).map(|_| WakeHandle::new()).collect();
+        // Set when a local worker completes successfully, before its executor
+        // (and its network pushes) are dropped: only then do dropped pushes
+        // close their channels cleanly (see `NetworkPush`).
+        let worker_completed: Vec<Arc<std::sync::atomic::AtomicBool>> = (0..total_workers)
+            .map(|_| Arc::new(std::sync::atomic::AtomicBool::new(false)))
+            .collect();
 
         // Take network creators from worker 0 (all workers have identical topology).
         let network_creators = std::mem::take(&mut dataflows[0].exchange_network_creators);
@@ -3294,6 +3520,7 @@ impl RuntimeHandle {
                 channel_metrics: ch_metrics,
                 peer_outboxes: outboxes.clone(),
                 inbound_bridges: inbound_bridges.clone(),
+                worker_completed: worker_completed.clone(),
             };
             let all_factories = creator.create(params)?;
 
@@ -3386,6 +3613,46 @@ impl RuntimeHandle {
                 });
             }
         }
+        // Dedicated mode: forward connection events the same way.
+        if let Some(io_events) = dedicated_io_events {
+            use crate::communication::peer_link::LinkFailure;
+            use crate::communication::transport::TransportError;
+            use crate::communication::transport_session::PeerIoEvent;
+            for (peer_id, mut io_rx) in io_events {
+                let events = events_tx.clone();
+                runtime_handle.spawn(async move {
+                    while let Some(notice) = io_rx.recv().await {
+                        let (io_event, delivered) = notice.into_parts();
+                        let event = match io_event {
+                            PeerIoEvent::Closed => {
+                                LinkEvent::ConnectionFailed(TransportError::ConnectionClosed)
+                            }
+                            PeerIoEvent::ReadFailed(e) => LinkEvent::ConnectionFailed(e),
+                            // The frame being written and everything queued
+                            // behind it are lost: the peer may need them.
+                            PeerIoEvent::WriteFailed(e) => {
+                                #[cfg(feature = "tracing")]
+                                tracing::warn!(peer = %peer_id, error = %e, "writing to the peer failed");
+                                #[cfg(not(feature = "tracing"))]
+                                let _ = e;
+                                LinkEvent::OutboundFailed(LinkFailure::SendFailed)
+                            }
+                            PeerIoEvent::OversizeDropped(e) => {
+                                LinkEvent::OutboundFailed(LinkFailure::Transport(e))
+                            }
+                        };
+                        report_link_event(&events, &peer_id, event);
+                        // Only now may the peer's channels close (see
+                        // `PeerIoNotice`): the coordinator learns why the
+                        // connection ended before it sees them close.
+                        drop(delivered);
+                    }
+                });
+            }
+            if let ClusterTransport::Dedicated(session) = &*transport {
+                session.hold_channels_for_io_events();
+            }
+        }
 
         // Create control broadcast for local workers (error propagation + control signals).
         let local_wake_handles: Vec<WakeHandle> = (local_start..local_end)
@@ -3428,6 +3695,7 @@ impl RuntimeHandle {
         let mode: ChannelMode = options.io_mode.into();
         let dataflow_priority = options.priority;
         let mut prepared = Vec::with_capacity(num_local);
+        let mut source_pumps = Vec::with_capacity(num_local);
         let mut progress_channels_iter = progress_channels.into_iter();
 
         // Capture a single timeline start time shared by all local workers
@@ -3447,7 +3715,8 @@ impl RuntimeHandle {
             let pc = progress_channels_iter.next().map(Some).unwrap_or(None);
             let wh = wake_handles[global_idx].clone();
             let ctrl = control_pairs[local_idx].take();
-            match self.prepare_worker(
+            // Async sources start only after the ready barrier (Phase 9).
+            match self.prepare_worker_deferred(
                 dataflow,
                 mode,
                 ctx,
@@ -3457,7 +3726,10 @@ impl RuntimeHandle {
                 ctrl,
                 timeline_start,
             ) {
-                Ok(worker) => prepared.push(worker),
+                Ok((spawned, executor, notifier, pumps)) => {
+                    prepared.push((spawned, executor, notifier));
+                    source_pumps.push(pumps);
+                }
                 Err(e) => {
                     for (w, _, _) in &prepared {
                         w.cancel
@@ -3465,10 +3737,10 @@ impl RuntimeHandle {
                                 detail: format!("cluster worker {global_idx} failed to spawn"),
                             });
                     }
-                    return Err(Error::Runtime(RuntimeError::SpawnFailed {
+                    return Err(abort_guard.fail(Error::Runtime(RuntimeError::SpawnFailed {
                         context: format!("failed to spawn cluster worker {global_idx}"),
                         source: Some(std::io::Error::other(e.to_string())),
-                    }));
+                    })));
                 }
             }
         }
@@ -3483,7 +3755,7 @@ impl RuntimeHandle {
                 handshake_timeout,
             )
             .await
-            .map_err(|e| Error::Runtime(RuntimeError::Handshake(e)))?;
+            .map_err(|e| abort_guard.fail(Error::Runtime(RuntimeError::Handshake(e))))?;
         } else {
             perform_ready_barrier_with_transport(
                 &transport,
@@ -3493,7 +3765,7 @@ impl RuntimeHandle {
                 handshake_timeout,
             )
             .await
-            .map_err(|e| Error::Runtime(RuntimeError::Handshake(e)))?;
+            .map_err(|e| abort_guard.fail(Error::Runtime(RuntimeError::Handshake(e))))?;
         }
 
         // Phase 8.5: Keep listening on the control channels for peer
@@ -3517,13 +3789,18 @@ impl RuntimeHandle {
         // every network push and progress sender) is dropped before that report.
         let finished = self.track_completion(prepared.iter_mut().map(|(_, _, n)| n));
         let mut workers = Vec::with_capacity(num_local);
-        for (spawned, executor, mut notifier) in prepared {
+        for (local_idx, (spawned, executor, mut notifier)) in prepared.into_iter().enumerate() {
+            let worker = local_start + local_idx;
             let events = events_tx.clone();
-            notifier.set_result_observer(Box::new(move |success| {
-                let _ = events.send(LifecycleEvent::WorkerFinished { success });
+            notifier.set_result_observer(Box::new(move |success, failure| {
+                let _ = events.send(LifecycleEvent::WorkerFinished { success, failure });
             }));
+            let executor = MarkCompleted {
+                inner: executor,
+                flag: Arc::clone(&worker_completed[worker]),
+            };
             self.registry
-                .register(executor, notifier, dataflow_id, dataflow_priority);
+                .register(Box::pin(executor), notifier, dataflow_id, dataflow_priority);
             workers.push(spawned);
         }
         drop(events_tx);
@@ -3597,6 +3874,9 @@ impl RuntimeHandle {
                 peer_registration: peer_reg_id,
                 shared_managers: shared_managers_arc,
                 transport,
+                failure_announced: false,
+                unfinished_announced: false,
+                worker_failure: None,
                 _teardown: teardown_notifier,
             };
             runtime_handle.spawn(lifecycle.run());
@@ -3606,6 +3886,22 @@ impl RuntimeHandle {
         }
         for name in &runtime_thread_names {
             teardown_waiter.remember_runtime_thread(name);
+        }
+
+        // The lifecycle coordinator now broadcasts any cancellation.
+        abort_guard.disarm();
+
+        // Async sources run user code; start them only now that every peer
+        // passed the ready barrier.
+        for pumps in source_pumps {
+            if let Err(e) = pumps.start() {
+                if let Some(cancel) = dataflow_cancel.as_ref() {
+                    cancel.cancel_with_reason(CancellationReason::WorkerFailed {
+                        detail: format!("cluster async source could not start: {e}"),
+                    });
+                }
+                return Err(e);
+            }
         }
 
         // If an external cancellation token was provided, bridge it to all
@@ -3884,11 +4180,13 @@ impl SimpleRuntime {
         {
             let async_count = dataflow.async_source_wiring.len();
             input_count += async_count;
+            let drains_on_cancel = dataflow.drain_timeout.is_some();
             for (op_idx, mut wiring) in dataflow.async_source_wiring.drain(..) {
                 let (factory, pump) = wiring(
                     Arc::clone(&external_inputs_open),
                     wake_handle.clone(),
                     cancel.clone(),
+                    drains_on_cancel,
                 );
                 dataflow.operator_factories.push((op_idx, factory));
                 pump_tasks.push(pump);
@@ -4102,7 +4400,7 @@ pub struct CompletionNotifier {
     shared: Arc<Mutex<SharedCompletionState>>,
     condvar: Arc<Condvar>,
     on_complete: Option<Box<dyn FnOnce() + Send>>,
-    on_result: Option<Box<dyn FnOnce(bool) + Send>>,
+    on_result: Option<Box<dyn FnOnce(bool, Option<String>) + Send>>,
     failure_cancel: Option<CancellationToken>,
     completed: bool,
 }
@@ -4121,10 +4419,12 @@ impl CompletionNotifier {
     }
 
     /// Attach a callback that receives whether the executor completed
-    /// successfully (`Ok(true)`). Fires once, from `complete()` or from `Drop`
-    /// (with `false`). The executor future has already been dropped by then.
+    /// successfully (`Ok(true)`), and the error if it failed for another
+    /// reason than a cancellation. Fires once, from `complete()` or from
+    /// `Drop` (with `false`). The executor future has already been dropped
+    /// by then.
     #[cfg(feature = "transport")]
-    pub(crate) fn set_result_observer(&mut self, f: Box<dyn FnOnce(bool) + Send>) {
+    pub(crate) fn set_result_observer(&mut self, f: Box<dyn FnOnce(bool, Option<String>) + Send>) {
         self.on_result = Some(f);
     }
 
@@ -4138,7 +4438,11 @@ impl CompletionNotifier {
             }
         }
         if let Some(observer) = self.on_result.take() {
-            observer(matches!(result, Ok(true)));
+            let failure = match &result {
+                Err(error) if !matches!(error, Error::Cancelled { .. }) => Some(error.to_string()),
+                _ => None,
+            };
+            observer(matches!(result, Ok(true)), failure);
         }
         self.completed = true;
         {
@@ -4170,7 +4474,10 @@ impl Drop for CompletionNotifier {
             });
         }
         if let Some(observer) = self.on_result.take() {
-            observer(false);
+            observer(
+                false,
+                Some("dataflow executor terminated unexpectedly (possible panic)".into()),
+            );
         }
         // Executor panicked or was killed without publishing a result.
         let mut state = match self.shared.lock() {

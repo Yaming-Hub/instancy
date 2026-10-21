@@ -93,6 +93,68 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `CLUSTER_PROTOCOL_VERSION` is now 3, so the handshake rejects peers that
   lack them; nodes must run the same version.
 
+### Unclean link loss and corruption are fatal
+
+- A dedicated-mode connection loss is no longer treated as a clean end of
+  stream: data channels are exhausted only by their close sentinel, so a
+  node can no longer report success with a peer's records missing. Lost or
+  corrupted progress channels no longer leave the dataflow hanging.
+- A data frame that fails to decode no longer becomes an error envelope that
+  operators silently ignore. Batches with more than 10M records are no longer
+  always dropped by the receiver, and the decoder reserves at most 1 MiB up
+  front, so a corrupt record count cannot trigger a huge allocation. An
+  envelope too large for one transport frame fails with the new
+  `CommunicationError::FrameTooLarge` instead of killing the connection.
+- A standalone `NetworkEdgeMaterializer` (`with_connections`, no cluster
+  coordinator) delivers a channel's close sentinel even when the queue is full
+  as the channel closes; it waits for room on the runtime instead of dropping
+  it (the receiver never counts a disconnect as the end of its input).
+- Corrupt traffic (a frame that fails its CRC or does not decode, a received
+  frame over the size limit, a progress frame after the channel's
+  end-of-stream) fails the dataflow with `CommunicationError::DataLoss` in
+  every phase, even on a retired link and even if every local worker already
+  succeeded; the peers that may still be running are cancelled. A data
+  channel that ends without its close sentinel after the peer finished is
+  data loss too. A data-channel close tag followed by extra bytes is rejected
+  as corrupt instead of being accepted as a clean end of stream.
+- Dedicated transport sessions report EOF, read and write failures, and
+  dropped oversize frames, and keep a peer's channels open until that report
+  reached the lifecycle coordinator; the writer no longer stops on an
+  oversize frame.
+- **BREAKING:** new error variants `CommunicationError::FrameTooLarge` and
+  `HandshakeError::PeerCancelled`.
+- A worker that fails, is cancelled or never runs no longer closes its
+  outgoing exchange and broadcast channels cleanly (network and same-node
+  targets), so peers cannot mistake its truncated streams for complete ones.
+  New `Push::close_on_drop` (defaults to `close()`) lets an endpoint decide
+  how it closes when the composite pusher holding it is dropped.
+- An async source whose producer is cut off by a cancellation (without
+  `drain_on_cancel`), or never started, no longer finishes as if its input
+  had ended.
+- `report_node_leave` works after the peer's connection already dropped
+  (the dataflow stays registered until its workers stop).
+- `spawn_cluster` failures are announced to every peer (`Cancel`), so peers
+  in the handshake or ready barrier fail promptly with
+  `HandshakeError::PeerCancelled`, and a peer that already passed the barrier
+  no longer runs (or reports success) without the failed node. The handshake
+  and barrier wait on all peers at once.
+- `source_async` producers start only after the ready barrier, so a failed
+  `spawn_cluster` never runs them.
+- The cluster `Cancel` broadcast sends to all peers concurrently.
+- A cluster-wide requested stop (`drain_on_cancel`) that can no longer
+  complete ends at once instead of at each node's drain deadline. A node whose
+  workers do not complete after announcing a requested stop (a worker failed
+  during the drain, the drain timed out, the node did not drain, or its
+  runtime was dropped) says so with a second `Cancel`: a failure stops every
+  peer's drain; otherwise only drains that still need the node's data (or
+  whose data push to it is blocked) stop. A draining node also stops when such a peer's
+  link ends before its goodbye (also after that peer's `Cancel`), or when
+  corrupt traffic arrives. Stopped workers report the failure as their
+  cancellation reason; workers that do not drain keep the first reason.
+- A progress batch split over several frames (more than 1,000,000 changes)
+  sends its positive changes first, so a receiver applying the frames one by
+  one never sees a capability released before the one that replaces it.
+
 ### Input contract hardening
 
 - **BREAKING:** Invalid input/frontier sequences that were previously accepted

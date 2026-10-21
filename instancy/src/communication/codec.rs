@@ -205,6 +205,11 @@ fn decode_length_prefix(buf: &[u8]) -> Result<usize, CodecError> {
 /// Trait for encoding and decoding typed values to/from byte buffers.
 ///
 /// A codec is stateless and reusable — it can encode/decode many values.
+/// Decoding a value must not depend on values encoded or decoded before it:
+/// network channels encode and decode every frame independently, with codec
+/// instances obtained separately from [`ExchangeData::codec`] (the cluster
+/// runtime also uses fresh instances to validate frames an operator never
+/// decodes itself).
 /// Implementations must be `Send + Sync` to allow sharing across threads.
 ///
 /// # Protocol

@@ -183,3 +183,154 @@ async fn drain_with_multi_worker() {
         "multi-worker drain should complete: {result:?}"
     );
 }
+
+/// Worker exchange with a drain: closing channels across workers on the
+/// drained (successful) path still exhausts every exchange input, so the
+/// dataflow completes `Ok` with every record (the cluster-only close gate
+/// must not affect single-node dataflows).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn drain_with_multi_worker_exchange() {
+    let rt = RuntimeHandle::new(RuntimeConfig::default()).unwrap();
+    let opts = SpawnOptions::new().drain_on_cancel(Duration::from_secs(5));
+    let mut multi = rt
+        .spawn_multi(
+            "drain-multi-exchange",
+            2,
+            |builder: &mut DataflowBuilder<u64>| {
+                builder
+                    .input::<u64>("data")?
+                    .map("pre", |_t, v| v)
+                    .exchange_by_hash("route", |v: &u64| *v)
+                    .map("post", |_t, v| v)
+                    .output("results")?;
+                Ok(())
+            },
+            opts,
+        )
+        .unwrap();
+    let s0 = multi.take_input::<u64>(0, "data").unwrap();
+    let s1 = multi.take_input::<u64>(1, "data").unwrap();
+    let r0 = multi.take_output::<u64>(0, "results").unwrap();
+    let r1 = multi.take_output::<u64>(1, "results").unwrap();
+    s0.send(0, (0..100).collect()).unwrap();
+    s1.send(0, (100..200).collect()).unwrap();
+    s0.close();
+    s1.close();
+    tokio::time::sleep(Duration::from_millis(20)).await;
+    multi.cancel();
+    let completion = multi.join();
+    let result = tokio::time::timeout(
+        Duration::from_secs(20),
+        tokio::task::spawn_blocking(move || completion.wait()),
+    )
+    .await
+    .expect("drain must not hang")
+    .unwrap();
+    assert!(result.is_ok(), "drained exchange must complete: {result:?}");
+    let total: u64 = [r0, r1]
+        .into_iter()
+        .flat_map(|r| r.collect_data())
+        .flat_map(|(_, batch)| batch)
+        .sum();
+    assert_eq!(total, (0..200).sum::<u64>());
+}
+
+/// A multi-worker exchange whose sibling still has an open input: one
+/// worker's operator fails; the whole dataflow must stop promptly with that
+/// error. (Off the cluster path dropped outputs still close on drop, as
+/// before; the cancellation is what ends the sibling.)
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn multi_worker_failure_terminates_promptly() {
+    let rt = RuntimeHandle::new(RuntimeConfig::default()).unwrap();
+    let mut multi = rt
+        .spawn_multi(
+            "fail-multi-exchange",
+            2,
+            |builder: &mut DataflowBuilder<u64>| {
+                builder
+                    .input::<u64>("data")?
+                    .unary_notify("maybe_fail", |input, output, _ctx| {
+                        while let Some((t, data)) = input.next() {
+                            if data.contains(&u64::MAX) {
+                                return Err(instancy::Error::Runtime(
+                                    instancy::RuntimeError::InvalidConfig(
+                                        "deliberate operator failure".into(),
+                                    ),
+                                ));
+                            }
+                            output.push_vec(t, data);
+                        }
+                        Ok(())
+                    })
+                    .exchange_by_hash("route", |v: &u64| *v)
+                    .map("post", |_t, v| v)
+                    .output("results")?;
+                Ok(())
+            },
+            SpawnOptions::new(),
+        )
+        .unwrap();
+    let s0 = multi.take_input::<u64>(0, "data").unwrap();
+    // Worker 1's input stays open: only the failure can end the dataflow.
+    let _s1 = multi.take_input::<u64>(1, "data").unwrap();
+    let _r0 = multi.take_output::<u64>(0, "results").unwrap();
+    let _r1 = multi.take_output::<u64>(1, "results").unwrap();
+    s0.send(0, (0..50).collect()).unwrap();
+    s0.send(0, vec![u64::MAX]).unwrap();
+    let completion = multi.join();
+    let result = tokio::time::timeout(
+        Duration::from_secs(10),
+        tokio::task::spawn_blocking(move || completion.wait()),
+    )
+    .await
+    .expect("a worker failure must end the dataflow promptly")
+    .unwrap();
+    let err = result.expect_err("the failure must be reported");
+    assert!(
+        err.to_string().contains("deliberate operator failure")
+            || matches!(err, instancy::Error::Cancelled { .. }),
+        "{err}"
+    );
+}
+
+/// Cancelling a multi-worker exchange with open inputs (no drain) ends it
+/// promptly with `Cancelled`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn multi_worker_cancel_terminates_promptly() {
+    let rt = RuntimeHandle::new(RuntimeConfig::default()).unwrap();
+    let mut multi = rt
+        .spawn_multi(
+            "cancel-multi-exchange",
+            2,
+            |builder: &mut DataflowBuilder<u64>| {
+                builder
+                    .input::<u64>("data")?
+                    .map("pre", |_t, v| v)
+                    .exchange_by_hash("route", |v: &u64| *v)
+                    .map("post", |_t, v| v)
+                    .output("results")?;
+                Ok(())
+            },
+            SpawnOptions::new(),
+        )
+        .unwrap();
+    let s0 = multi.take_input::<u64>(0, "data").unwrap();
+    let _s1 = multi.take_input::<u64>(1, "data").unwrap();
+    let _r0 = multi.take_output::<u64>(0, "results").unwrap();
+    let _r1 = multi.take_output::<u64>(1, "results").unwrap();
+    s0.send(0, (0..50).collect()).unwrap();
+    tokio::time::sleep(Duration::from_millis(20)).await;
+    multi.cancel();
+    let completion = multi.join();
+    let result = tokio::time::timeout(
+        Duration::from_secs(10),
+        tokio::task::spawn_blocking(move || completion.wait()),
+    )
+    .await
+    .expect("cancellation must end the dataflow promptly")
+    .unwrap();
+    assert!(
+        matches!(result, Err(instancy::Error::Cancelled { .. })),
+        "{result:?}"
+    );
+}

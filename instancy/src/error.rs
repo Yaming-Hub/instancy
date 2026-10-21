@@ -302,12 +302,23 @@ pub enum CommunicationError {
     InvalidSetup(String),
 
     /// Data sent over a cluster link was lost: it was sent to, or arrived
-    /// at, a node whose receiving operators had already finished. This
-    /// indicates a premature completion somewhere in the cluster; the
-    /// dataflow fails instead of returning an incomplete result.
+    /// at, a node whose receiving operators had already finished, or a peer
+    /// sent traffic that could not be decoded. The dataflow fails instead of
+    /// returning an incomplete result.
     #[cfg(feature = "transport")]
     #[error("data lost on the link to peer {peer_id}: {detail}")]
     DataLoss { peer_id: String, detail: String },
+
+    /// An outbound frame exceeds the transport's frame size limit.
+    #[error(
+        "frame of {size} bytes on channel {channel_id} to peer {peer_id} exceeds the transport limit of {max} bytes"
+    )]
+    FrameTooLarge {
+        peer_id: String,
+        channel_id: u64,
+        size: usize,
+        max: usize,
+    },
 }
 
 /// Extension trait to convert `PoisonError` into `Error`.

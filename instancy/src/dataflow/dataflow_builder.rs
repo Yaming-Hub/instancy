@@ -213,9 +213,29 @@ pub(crate) type AsyncSourceWiring = Box<
             std::sync::Arc<std::sync::atomic::AtomicUsize>, // external_inputs_open counter
             WakeHandle,                                     // executor wake handle
             crate::cancellation::CancellationToken,         // cancellation token
+            bool,                                           // a cancellation drains
         ) -> (OperatorFactory, Box<dyn FnOnce() + Send>) // (factory, pump_task)
         + Send,
 >;
+
+/// An async source's sender until its pump starts the producer. Dropped
+/// before that (the pump failed to start, or was never run because spawning
+/// failed), it marks the source abandoned *before* the channel closes, so the
+/// source does not finish as if its input had ended.
+struct UnstartedPumpInput<T: Timestamp, D: Send + 'static> {
+    sender: Option<crate::dataflow::channel_operators::AsyncInputSender<T, D>>,
+    abandoned: std::sync::Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl<T: Timestamp, D: Send + 'static> Drop for UnstartedPumpInput<T, D> {
+    fn drop(&mut self) {
+        if self.sender.is_some() {
+            self.abandoned
+                .store(true, std::sync::atomic::Ordering::SeqCst);
+        }
+        // `sender` (if still here) is dropped after this, closing the channel.
+    }
+}
 
 impl<T: Timestamp> BuilderState<T> {
     fn allocate_operator_index(&mut self) -> usize {
@@ -836,17 +856,27 @@ impl<T: Timestamp> DataflowBuilder<T> {
             // the tokio channel + ChannelSourceOperator + pump task.
             let wiring_name = name.clone();
             let channel_cap = state.channel_capacity;
-            let wiring: AsyncSourceWiring =
-                Box::new(move |external_inputs_open, wake_handle, cancel| {
+            let wiring: AsyncSourceWiring = Box::new(
+                move |external_inputs_open, wake_handle, cancel, drains_on_cancel| {
                     use crate::dataflow::channel_operators::{
                         AsyncInputSender, ChannelSourceOperator, InputGate, InputRecv,
                     };
 
+                    // Set when the channel closes without the producer having
+                    // ended the input: the pump never ran it, or (without a
+                    // drain) a cancellation cut it off. The source then does
+                    // not finish (and close its output) as if the input ended.
+                    let abandoned = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
                     let producer = producer.clone();
                     let (tx, rx) = tokio::sync::mpsc::channel::<InputEvent<T, D>>(channel_cap);
                     let gate = std::sync::Arc::new(InputGate::default());
-                    let sender = AsyncInputSender::with_wake_handle(tx, wake_handle.clone())
-                        .with_input_gate(std::sync::Arc::clone(&gate));
+                    let pump_input = UnstartedPumpInput {
+                        sender: Some(
+                            AsyncInputSender::with_wake_handle(tx, wake_handle.clone())
+                                .with_input_gate(std::sync::Arc::clone(&gate)),
+                        ),
+                        abandoned: std::sync::Arc::clone(&abandoned),
+                    };
 
                     let ext_counter = std::sync::Arc::clone(&external_inputs_open);
                     let factory_name = wiring_name.clone();
@@ -889,7 +919,8 @@ impl<T: Timestamp> DataflowBuilder<T> {
                                 Some(reporter.clone()),
                                 ext_counter.clone(),
                             )
-                            .with_input_gate(std::sync::Arc::clone(&gate));
+                            .with_input_gate(std::sync::Arc::clone(&gate))
+                            .with_abandon_flag(Some(abandoned.clone()));
                             Ok(Box::new(op) as Box<dyn SchedulableOperator>)
                         });
 
@@ -897,6 +928,7 @@ impl<T: Timestamp> DataflowBuilder<T> {
                     let pump_name = wiring_name.clone();
                     let pump_wake = wake_handle;
                     let pump: Box<dyn FnOnce() + Send> = Box::new(move || {
+                        let mut pump_input = pump_input;
                         let rt = match tokio::runtime::Builder::new_current_thread()
                             .enable_all()
                             .build()
@@ -909,17 +941,41 @@ impl<T: Timestamp> DataflowBuilder<T> {
                                     error = %err,
                                     "failed to create pump runtime"
                                 );
-                                let _ = err;
+                                // The input can never be produced: fail the
+                                // worker rather than let it finish without it.
+                                cancel.cancel_with_reason(
+                                    crate::cancellation::CancellationReason::InternalError {
+                                        detail: format!(
+                                            "async source '{pump_name}': failed to create its \
+                                             pump runtime: {err}"
+                                        ),
+                                    },
+                                );
+                                // Marks the source abandoned, then closes it.
+                                drop(pump_input);
                                 // Notify the executor so it can detect the dropped sender.
                                 pump_wake.notify();
                                 return;
                             }
                         };
+                        let Some(sender) = pump_input.sender.take() else {
+                            return;
+                        };
+                        let pump_abandoned = std::sync::Arc::clone(&pump_input.abandoned);
                         rt.block_on(async move {
                             // Run producer with cancellation support.
                             tokio::select! {
                                 biased;
-                                _ = cancel.cancelled_async() => {
+                                _ = async {
+                                    cancel.cancelled_async().await;
+                                    // Without a drain, flag the cut before the
+                                    // sender is dropped. With a drain the source
+                                    // finishes so the drain can complete.
+                                    if !drains_on_cancel {
+                                        pump_abandoned
+                                            .store(true, std::sync::atomic::Ordering::SeqCst);
+                                    }
+                                } => {
                                     // Dataflow cancelled — drop sender to close channel.
                                 }
                                 result = producer(sender) => {
@@ -945,7 +1001,8 @@ impl<T: Timestamp> DataflowBuilder<T> {
                     });
 
                     (factory, pump)
-                });
+                },
+            );
             state.async_source_wiring.push((op_idx, wiring));
         }
 
@@ -6143,6 +6200,38 @@ mod tests {
 
     fn rt() -> SimpleRuntime {
         SimpleRuntime::new()
+    }
+
+    /// A pump dropped before it starts its producer marks the source
+    /// abandoned before the receiver can observe the closed channel; a
+    /// started pump does not.
+    #[test]
+    fn unstarted_pump_input_marks_the_source_abandoned_before_closing() {
+        for started in [false, true] {
+            let (tx, mut rx) = tokio::sync::mpsc::channel::<InputEvent<u64, u64>>(1);
+            let abandoned = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let mut input = UnstartedPumpInput {
+                sender: Some(
+                    crate::dataflow::channel_operators::AsyncInputSender::with_wake_handle(
+                        tx,
+                        WakeHandle::new(),
+                    ),
+                ),
+                abandoned: std::sync::Arc::clone(&abandoned),
+            };
+            let producer_sender = if started { input.sender.take() } else { None };
+            drop(input);
+            drop(producer_sender);
+            assert!(matches!(
+                rx.try_recv(),
+                Err(tokio::sync::mpsc::error::TryRecvError::Disconnected)
+            ));
+            assert_eq!(
+                abandoned.load(std::sync::atomic::Ordering::SeqCst),
+                !started,
+                "started={started}"
+            );
+        }
     }
 
     #[test]

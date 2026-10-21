@@ -1744,6 +1744,15 @@ impl<T: Timestamp> DataflowExecutor<T> {
                     _ => self.cancel.check()?,
                 }
             }
+            if self.draining {
+                // A failure arrived after the requested stop (a peer's
+                // forwarded failure, a lost link): the drain cannot complete.
+                if let Some(reason) = self.cancel.escalation() {
+                    return Err(crate::error::Error::Cancelled {
+                        reason: Some(reason),
+                    });
+                }
+            }
             if self
                 .drain_deadline
                 .is_some_and(|deadline| Instant::now() >= deadline)
@@ -5121,6 +5130,47 @@ mod tests {
                 other => panic!("{reason:?} must stop without draining, got {other:?}"),
             }
         }
+    }
+
+    /// A failure escalated after a requested stop ends a drain in progress
+    /// with that failure, long before its deadline.
+    #[test]
+    fn escalated_failure_aborts_an_active_drain() {
+        use crate::cancellation::CancellationReason;
+        let op = CountingOperator {
+            name: "work".into(),
+            index: 0,
+            stage_id: crate::dataflow::stage::StageId(0),
+            remaining: usize::MAX,
+        };
+        let config = ExecutorConfig {
+            max_sweeps_per_poll: 0,
+            drain_timeout: Some(std::time::Duration::from_secs(60)),
+            ..Default::default()
+        };
+        let mut executor = DataflowExecutor::new_test(vec![Box::new(op)], config, 0);
+        let parent = CancellationToken::new();
+        executor.cancel = parent.child_token();
+        parent.cancel_with_reason(CancellationReason::UserRequested);
+        let failure = CancellationReason::PeerCancelled {
+            peer_id: "b".into(),
+            detail: "worker failed: boom".into(),
+        };
+        let escalate = {
+            let parent = parent.clone();
+            let failure = failure.clone();
+            std::thread::spawn(move || {
+                std::thread::sleep(std::time::Duration::from_millis(50));
+                parent.escalate(failure);
+            })
+        };
+        let started = std::time::Instant::now();
+        match executor.run() {
+            Err(Error::Cancelled { reason: Some(r) }) => assert_eq!(r, failure),
+            other => panic!("the drain must stop with the escalated failure, got {other:?}"),
+        }
+        assert!(started.elapsed() < std::time::Duration::from_secs(10));
+        escalate.join().unwrap();
     }
 
     #[test]

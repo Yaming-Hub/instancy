@@ -148,9 +148,24 @@ impl ClusterTransport {
         }
     }
 
+    /// Largest frame payload this transport can carry.
+    ///
+    /// Shared connections prefix every payload frame with an 8-byte sequence
+    /// number, which counts against the frame size limit.
+    pub fn max_payload_len(&self) -> usize {
+        use crate::communication::codec::MAX_MESSAGE_SIZE;
+        match self {
+            Self::Dedicated(_) => MAX_MESSAGE_SIZE,
+            Self::Shared { .. } => MAX_MESSAGE_SIZE - 8,
+        }
+    }
+
     /// Take per-peer error receivers (shared mode only).
     ///
-    /// Returns `None` for dedicated mode (failures surface via channel closure).
+    /// Returns `None` for dedicated mode: a dedicated session reports its
+    /// per-peer connection events (EOF, read and write failures, dropped
+    /// oversize frames) through `TransportSession::take_io_events`, which
+    /// `spawn_cluster` forwards to the dataflow's lifecycle coordinator.
     /// For shared mode, returns error receivers that emit `TransportError` on
     /// connection failures or reorder timeouts. Can only be called once — subsequent
     /// calls return `None`.

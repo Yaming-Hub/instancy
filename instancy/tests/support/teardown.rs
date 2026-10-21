@@ -415,6 +415,16 @@ pub async fn tcp_mesh(nodes: &[&str]) -> HashMap<String, Vec<TcpConn>> {
 
 /// Shared-mode managers for a full TCP mesh (`conns` pooled connections per pair).
 pub async fn tcp_shared_mesh(nodes: &[&str], conns: usize) -> HashMap<String, Managers> {
+    tcp_shared_mesh_with(nodes, conns, shared_config(conns)).await
+}
+
+/// [`tcp_shared_mesh`] with an explicit manager configuration. The pool is
+/// pre-established: `config` must not scale beyond `conns` connections.
+pub async fn tcp_shared_mesh_with(
+    nodes: &[&str],
+    conns: usize,
+    config: SharedConnectionConfig,
+) -> HashMap<String, Managers> {
     let handle = tokio::runtime::Handle::current();
     let mut per: HashMap<String, HashMap<String, SharedPeerManager>> = nodes
         .iter()
@@ -433,7 +443,7 @@ pub async fn tcp_shared_mesh(nodes: &[&str], conns: usize) -> HashMap<String, Ma
             let fb: Arc<dyn DynConnectionFactory> = Arc::new(PreEstablished(Mutex::new(cb)));
             let ma = SharedPeerManager::new(
                 b.to_string(),
-                shared_config(conns),
+                config.clone(),
                 fa,
                 &handle,
                 tokio::sync::broadcast::channel(16).0,
@@ -441,7 +451,7 @@ pub async fn tcp_shared_mesh(nodes: &[&str], conns: usize) -> HashMap<String, Ma
             .unwrap();
             let mb = SharedPeerManager::new(
                 a.to_string(),
-                shared_config(conns),
+                config.clone(),
                 fb,
                 &handle,
                 tokio::sync::broadcast::channel(16).0,

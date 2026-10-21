@@ -38,13 +38,17 @@ pub(crate) enum LinkFailure {
     ChannelClosed,
     /// A frame could not be decoded (CRC mismatch or malformed payload).
     Decode(String),
+    /// A frame broke the protocol: it arrived after its channel's end
+    /// marker, or a channel ended without its marker after the peer said
+    /// goodbye. Reported as data loss.
+    ProtocolViolation(String),
     /// A local lock was poisoned while delivering a frame.
     LockPoisoned,
     /// The transport rejected an outbound frame (writer gone).
     SendFailed,
     /// An outbound frame could not be encoded.
     Encode(String),
-    /// The shared transport reported a failure for this peer.
+    /// The transport reported a failure for this peer.
     Transport(TransportError),
 }
 
@@ -53,6 +57,7 @@ impl std::fmt::Display for LinkFailure {
         match self {
             Self::ChannelClosed => f.write_str("connection closed before end of stream"),
             Self::Decode(detail) => write!(f, "undecodable frame: {detail}"),
+            Self::ProtocolViolation(detail) => write!(f, "unexpected frame: {detail}"),
             Self::LockPoisoned => f.write_str("lock poisoned while delivering a frame"),
             Self::SendFailed => f.write_str("outbound frame could not be sent"),
             Self::Encode(detail) => write!(f, "outbound frame could not be encoded: {detail}"),
@@ -66,8 +71,12 @@ impl std::fmt::Display for LinkFailure {
 pub(crate) enum LinkEvent {
     /// One progress channel from the peer delivered its end-of-stream marker.
     ProgressEndOfStream,
-    /// One progress channel from the peer ended without its marker.
+    /// One progress channel from the peer ended without its marker, failed
+    /// to decode, or carried a frame after its marker.
     ProgressChannelEnded(LinkFailure),
+    /// One data channel from the peer ended without its close sentinel,
+    /// failed to decode, or carried a frame after its sentinel.
+    DataChannelEnded(LinkFailure),
     /// An outbound frame to the peer could not be sent or encoded.
     OutboundFailed(LinkFailure),
     /// The peer acknowledged our end-of-stream.
@@ -78,19 +87,28 @@ pub(crate) enum LinkEvent {
     ControlClosed,
     /// A control message from the peer could not be decoded.
     ControlUndecodable(String),
-    /// The shared transport reported an error for this peer.
+    /// The shared transport reported an error for this peer. Its channels
+    /// stay open.
     TransportError(TransportError),
     /// A data frame from the peer could not be delivered to the local
     /// operator it was addressed to (the operator had already finished), or
     /// arrived after the channel's close marker.
     InboundDataLost(String),
+    /// The dedicated connection to the peer ended (EOF) or failed; every
+    /// channel from the peer is closing. Reported before those channels
+    /// close (see `PeerIoNotice`).
+    ConnectionFailed(TransportError),
 }
 
 /// Input to the cluster lifecycle coordinator.
 #[derive(Debug)]
 pub(crate) enum LifecycleEvent {
     /// A local worker finished; `success` is true only for `Ok(true)`.
-    WorkerFinished { success: bool },
+    /// `failure` describes an error other than a cancellation.
+    WorkerFinished {
+        success: bool,
+        failure: Option<String>,
+    },
     /// An event on the link to `peer`.
     Link { peer: String, event: LinkEvent },
 }
@@ -110,6 +128,12 @@ pub(crate) fn report_link_event(events: &LifecycleEventSender, peer: &str, event
 #[derive(Debug, Default)]
 pub(crate) struct PeerLinkState {
     retired: AtomicBool,
+    /// Inbound data channels from the peer still waiting for their close
+    /// sentinel (see [`OpenInboundChannel`]).
+    open_inbound_data: std::sync::atomic::AtomicUsize,
+    /// A data push to the peer found its queue closed: it backs off on a
+    /// frame that can never leave.
+    push_blocked: AtomicBool,
 }
 
 impl PeerLinkState {
@@ -127,8 +151,49 @@ impl PeerLinkState {
     pub(crate) fn retire(&self) {
         self.retired.store(true, Ordering::SeqCst);
     }
+
+    /// Inbound data channels from the peer whose consumer still waits for
+    /// their close sentinel: a local drain cannot complete without the peer.
+    pub(crate) fn open_inbound_data_channels(&self) -> usize {
+        self.open_inbound_data.load(Ordering::SeqCst)
+    }
+
+    /// Whether a data push to the peer is backing off on a closed queue.
+    pub(crate) fn push_blocked(&self) -> bool {
+        self.push_blocked.load(Ordering::SeqCst)
+    }
+
+    /// A data push to the peer found its queue closed.
+    pub(crate) fn note_push_blocked(&self) {
+        self.push_blocked.store(true, Ordering::SeqCst);
+    }
 }
 
+/// An inbound data channel from a peer, counted in
+/// [`PeerLinkState::open_inbound_data_channels`] until it delivers its close
+/// sentinel or its consumer drops it.
+#[derive(Debug)]
+pub(crate) struct OpenInboundChannel {
+    link: Arc<PeerLinkState>,
+    released: AtomicBool,
+}
+
+impl OpenInboundChannel {
+    pub(crate) fn open(link: Arc<PeerLinkState>) -> Arc<Self> {
+        link.open_inbound_data.fetch_add(1, Ordering::SeqCst);
+        Arc::new(Self {
+            link,
+            released: AtomicBool::new(false),
+        })
+    }
+
+    /// The channel is no longer awaited. Idempotent.
+    pub(crate) fn release(&self) {
+        if !self.released.swap(true, Ordering::SeqCst) {
+            self.link.open_inbound_data.fetch_sub(1, Ordering::SeqCst);
+        }
+    }
+}
 /// Producer handle for the ordered, lossless lane to one peer.
 #[derive(Clone)]
 pub(crate) struct PeerOutbox {
@@ -198,6 +263,15 @@ impl PeerMonitor {
     /// Report an event on this peer's link.
     pub(crate) fn report(&self, event: LinkEvent) {
         report_link_event(&self.events, &self.peer, event);
+    }
+
+    /// A monitor for tests.
+    #[cfg(test)]
+    pub(crate) fn for_test(peer: &str, events: LifecycleEventSender) -> Self {
+        Self {
+            peer: Arc::from(peer),
+            events,
+        }
     }
 }
 

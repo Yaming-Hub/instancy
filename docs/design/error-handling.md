@@ -66,12 +66,14 @@ enum RuntimeError {
     EmptyDataflow,
 }
 
-// Communication errors (4 variants)
+// Communication errors (6 variants)
 enum CommunicationError {
     Codec(Box<dyn Error + Send + Sync>),
     Protocol(ControlProtocolError),    // #[cfg(feature = "transport")]
     InvalidConfig(String),
     InvalidSetup(String),
+    DataLoss { peer_id, detail },                        // cluster records lost
+    FrameTooLarge { peer_id, channel_id, size, max },    // over the frame limit
 }
 
 // Control protocol errors (6 variants, transport-only)
