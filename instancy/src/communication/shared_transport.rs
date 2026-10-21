@@ -46,7 +46,7 @@ use std::sync::Arc;
 use std::sync::Mutex;
 use std::time::Duration;
 
-use tokio::io::{AsyncRead, AsyncWrite};
+use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
 use tokio::sync::Mutex as TokioMutex;
 use tokio::sync::mpsc as tokio_mpsc;
 
@@ -995,12 +995,17 @@ impl SharedPeerManager {
                     metrics.mark_dead();
                 }
                 let _ = failure_tx.try_send(conn_id);
-                break;
+                return;
             }
             if let Some(ref metrics) = conn_metrics {
                 metrics.dequeue(payload_size, is_user_traffic);
             }
         }
+        // Nothing more will be written: tell the peer. Only some write halves
+        // do that when dropped (`OwnedWriteHalf`); with others (TLS streams,
+        // pipes, `tokio::io::split`) the peer would not see the end of the
+        // stream until the whole connection is dropped.
+        let _ = tokio::time::timeout(WRITER_DRAIN_GRACE, framed.into_inner().shutdown()).await;
     }
 
     /// Bridge task: receives payload and control frames, sequences payloads,

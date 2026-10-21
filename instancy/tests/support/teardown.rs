@@ -230,14 +230,26 @@ impl Mesh {
 
     /// Kill the link between `a` and `b` (both directions), like a crash.
     pub fn sever(&self, a: &str, b: &str) {
+        for relay in self.link_relays(a, b) {
+            relay.abort();
+        }
+    }
+
+    /// Whether both directions of the link between `a` and `b` have ended:
+    /// each node closed its side for writing (or the link was severed). The
+    /// relays pass each end of stream on, so each node's reader has then seen
+    /// it too.
+    pub fn link_closed(&self, a: &str, b: &str) -> bool {
+        self.link_relays(a, b).iter().all(JoinHandle::is_finished)
+    }
+
+    fn link_relays(&self, a: &str, b: &str) -> &[JoinHandle<()>] {
         let key = if self.relays.contains_key(&(a.to_string(), b.to_string())) {
             (a.to_string(), b.to_string())
         } else {
             (b.to_string(), a.to_string())
         };
-        for relay in &self.relays[&key] {
-            relay.abort();
-        }
+        &self.relays[&key]
     }
 
     fn take_ends(&mut self, node: &str) -> Vec<(String, DuplexStream)> {

@@ -60,8 +60,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   dataflow to be cancelled with the actual cause (the peer's `Cancel` or the
   link failure) instead of failing the operator with `ChannelClosed`.
 - Connections are closed without losing their last frames. A node that
-  releases a connection writes what is queued and keeps reading until the
-  peer closes its side (at most 10 s), instead of closing a TCP socket with
+  releases a connection writes what is queued, shuts its write half down
+  (so the peer sees the end of the stream at once, also over split TLS or
+  pipe halves, whose drop sends nothing) and keeps reading until the peer
+  closes its side (at most 10 s), instead of closing a TCP socket with
   unread data, which resets the connection and can destroy the frames the
   peer has not read yet. A per-job shared manager released by a dataflow's
   teardown first writes everything queued on it (bounded by
@@ -71,8 +73,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   frames or has finished itself). Its result is the local workers' result,
   or `CommunicationError::DataLoss` (see above). Blocking waits
   (`join_blocking`, `wait`) need the transport's tokio runtime to keep
-  running: on a multi-thread runtime's worker thread they use
-  `block_in_place`, so
+  running: on a worker thread of a multi-thread runtime they use
+  `block_in_place` (workers are recognised by their thread names), so
   they work with a single worker thread or with every worker waiting; when
   the caller is inside a `current_thread` runtime, or the transport runs on
   one, that is not making progress (e.g. the caller is the thread driving

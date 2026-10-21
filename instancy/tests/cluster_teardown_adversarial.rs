@@ -1219,3 +1219,54 @@ async fn peer_vanishing_after_retirement_is_benign() {
         cluster.shutdown().await;
     }
 }
+
+/// Once the nodes have released a connection, each closes it for writing, so
+/// the other reads the end of the stream at once. The mesh's connections are
+/// split stream halves (like TLS streams or pipes): dropping such a write
+/// half sends nothing, and both sides kept the connection (and its tasks)
+/// open until their readers gave up waiting for the other's end of stream,
+/// 10 s later. Every finish order; Dedicated and per-dataflow Shared (pooled
+/// managers outlive the dataflow and keep their connections on purpose).
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn released_connections_are_closed_promptly() {
+    for mode in [Mode::Dedicated, Mode::Shared] {
+        for order in [["a", "b"], ["b", "a"]] {
+            let spec = [("a", 1), ("b", 1)];
+            let mut cluster = Cluster::start(
+                &spec,
+                mode,
+                1024,
+                |_, _| Duration::ZERO,
+                |_| SpawnOptions::new(),
+            )
+            .await;
+            let ja = cluster.join("a", Duration::from_secs(20));
+            let jb = cluster.join("b", Duration::from_secs(20));
+            cluster.send_and_close(order[0], 0..50);
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            cluster.send_and_close(order[1], 100..150);
+            let results = vec![
+                ("a".to_string(), ja.await.unwrap()),
+                ("b".to_string(), jb.await.unwrap()),
+            ];
+            assert!(
+                all_ok(&results),
+                "{mode:?} {order:?}: {}",
+                describe(&results)
+            );
+            let joined = std::time::Instant::now();
+            while !cluster.mesh.link_closed("a", "b") && joined.elapsed() < Duration::from_secs(15)
+            {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+            let closed_after = joined.elapsed();
+            assert!(
+                closed_after < Duration::from_secs(1),
+                "{mode:?} {order:?}: the link closed {closed_after:?} after both joins"
+            );
+            let expected = (0..50).sum::<i64>() + (100..150).sum::<i64>();
+            assert_eq!(cluster.total(), Ok(expected), "{mode:?} {order:?}");
+            cluster.shutdown().await;
+        }
+    }
+}

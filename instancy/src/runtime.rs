@@ -2840,6 +2840,24 @@ impl RuntimeHandle {
         })?;
         let num_local = local_end - local_start;
 
+        // A blocking wait from a multi-thread runtime's worker must hand that
+        // worker's work to another thread, and tokio cannot tell such a
+        // worker apart from other threads; learn how the threads of the
+        // transport runtime and of the runtime calling this are named (see
+        // `ClusterCompletion::wait`). Done first, so that dropping this future
+        // here leaves nothing behind.
+        let mut runtime_thread_names = Vec::new();
+        let calling_runtime = tokio::runtime::Handle::try_current().ok();
+        for runtime in std::iter::once(runtime_handle.clone()).chain(calling_runtime) {
+            if runtime.runtime_flavor() != tokio::runtime::RuntimeFlavor::MultiThread {
+                continue;
+            }
+            let name = runtime.spawn(async { std::thread::current().name().map(str::to_owned) });
+            if let Ok(Ok(Some(name))) = tokio::time::timeout(handshake_timeout, name).await {
+                runtime_thread_names.push(name);
+            }
+        }
+
         // Phase 1: Build local workers from the closure.
         let metrics_config = options.metrics_config.clone();
         let mut dataflows = Vec::with_capacity(num_local);
@@ -3585,6 +3603,9 @@ impl RuntimeHandle {
             if let Some(cleanup) = shared_registration_cleanup.as_mut() {
                 cleanup.disarm();
             }
+        }
+        for name in &runtime_thread_names {
+            teardown_waiter.remember_runtime_thread(name);
         }
 
         // If an external cancellation token was provided, bridge it to all
@@ -5435,9 +5456,14 @@ impl<T: Timestamp> ClusterCompletion<T> {
     ///
     /// The network and the shutdown handshake run on the tokio runtime
     /// passed to `spawn_cluster`. Called from a task on a worker thread of a
-    /// multi-thread tokio runtime, the wait uses
+    /// multi-thread runtime (that one or the application's), the wait uses
     /// [`block_in_place`](tokio::task::block_in_place), so the runtime keeps
-    /// making progress even if it has a single worker thread.
+    /// making progress even if it has a single worker thread. Workers are
+    /// recognised by their thread names (tokio's default, or the names of the
+    /// transport runtime's threads and of the runtime that called
+    /// `spawn_cluster`); a runtime that gives every worker its own name may
+    /// have workers that are not recognised, which then block without handing
+    /// their work over.
     ///
     /// # Errors
     ///

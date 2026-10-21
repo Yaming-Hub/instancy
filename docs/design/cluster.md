@@ -270,9 +270,13 @@ TCP socket while inbound data is still unread makes the OS reset the
 connection, and the peer's OS may then discard bytes it has received but not
 yet delivered: our last frames (goodbye, acknowledgements, `Cancel`). A
 released connection therefore closes in two halves: its writers write what is
-queued and close their half, and its readers keep reading (and discarding)
-until the peer closes its half, for at most 10 s. In Dedicated mode the
-session's demultiplexers keep reading after the session is dropped
+queued and then shut their half down explicitly (dropping a write half sends
+the end of stream only for some streams, such as `OwnedWriteHalf`; split
+halves of TLS streams or pipes send nothing), and its readers keep reading
+(and discarding) until the peer closes its half, for at most 10 s. Since both
+sides shut down their write halves, both readers see the end of stream and
+the connection is gone as soon as both nodes have released it. In Dedicated
+mode the session's demultiplexers keep reading after the session is dropped
 (`Demuxer::run_lingering`); in Shared mode a released manager — closed or
 dropped — closes its connections this way in the background.
 
@@ -319,10 +323,25 @@ still happens. Dropping a `ClusterSpawnedDataflow` without calling `join()`
 cancels the dataflow, and the coordinator broadcasts the cancellation to every
 peer. Blocking waits (`join_blocking`, `ClusterCompletion::wait`) need the
 transport's tokio runtime to make progress. On a worker thread of a
-multi-thread runtime (inside a task) the wait runs in
+multi-thread runtime (inside a task; the transport's runtime or the
+application's) the wait runs in
 `tokio::task::block_in_place`, which moves the thread's other work elsewhere
 first, so it works even with a single worker thread or with every worker
-blocked in a wait. When the caller is inside a `current_thread` runtime
+blocked in a wait, and does not strand a task the caller just spawned in the
+worker's LIFO slot. tokio offers no stable way to recognise a worker, and
+`block_in_place` panics on a thread that drives a `current_thread` runtime
+(also one that has entered a multi-thread runtime's handle), so a thread
+counts as a worker if it drives a scheduler (`tokio::task::yield_now` defers
+its wake-up there, and wakes at once on a `block_on` thread, in a `LocalSet`
+it drives, on a `spawn_blocking` thread or outside any runtime) and carries
+the name of a multi-thread runtime's threads: tokio's default name, or a
+name seen on the transport runtime or on the runtime that called
+`spawn_cluster` (learned during `spawn_cluster` and by the coordinator). A
+worker of a runtime that names every thread differently may go
+unrecognised and block without handing its work over; a `current_thread`
+runtime driven by a thread carrying one of these names, with a multi-thread
+handle entered, would make `block_in_place` panic. When the caller is inside a
+`current_thread` runtime
 context, or the transport runs on a `current_thread` runtime, the wait first
 spawns a no-op probe on the transport runtime; if the probe does not run
 within 2 s (typically because the caller is the thread driving that runtime,
@@ -330,9 +349,10 @@ or nothing drives it), the wait returns `RuntimeError::InvalidConfig`
 promptly instead of deadlocking (a thread that drives the transport's
 `current_thread` runtime but pauses for longer than that also gets the
 error). The dataflow keeps running, as if the completion had been dropped.
-Other callers (outside any runtime, in a multi-thread runtime's `block_on`,
-or on a `spawn_blocking` thread) block normally once the probe, if any, has
-passed.
+Other callers (outside any runtime, in a multi-thread runtime's `block_on`
+or a `LocalSet` it drives, a `current_thread` runtime's thread that entered
+a multi-thread handle, or a `spawn_blocking` thread) block normally once the
+probe, if any, has passed.
 
 **Failure paths.** If a local worker fails (or the dataflow is cancelled
 before local completion), the coordinator broadcasts `Cancel` (bounded by

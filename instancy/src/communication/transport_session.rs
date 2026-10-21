@@ -52,7 +52,7 @@
 use std::collections::HashMap;
 
 #[cfg(feature = "transport")]
-use tokio::io::{AsyncRead, AsyncWrite};
+use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
 #[cfg(feature = "transport")]
 use tokio::sync::mpsc as tokio_mpsc;
 
@@ -134,7 +134,8 @@ pub struct TransportSession {
 ///
 /// Bridge tasks (writers) are NOT aborted — they are detached and terminate
 /// naturally when all their input channel senders are dropped. This ensures
-/// pending data frames are flushed to TCP before the bridge exits.
+/// pending data frames are flushed to TCP before the bridge exits; the bridge
+/// then shuts its write half down, so the peer reads the end of the stream.
 ///
 /// Demuxer tasks (readers) are not aborted either: they keep reading until
 /// the peer closes its side, for at most [`DEMUX_LINGER`] after the session
@@ -420,6 +421,12 @@ impl TransportSession {
                 break;
             }
         }
+        // Nothing more will be written: tell the peer. Only some write halves
+        // do that when dropped (`OwnedWriteHalf`); with others (TLS streams,
+        // pipes, `tokio::io::split`) the peer would not see the end of the
+        // stream until the whole connection is dropped, which the lingering
+        // demuxers (ours and the peer's) only do after `DEMUX_LINGER`.
+        let _ = tokio::time::timeout(DEMUX_LINGER, framed_writer.into_inner().shutdown()).await;
     }
 }
 

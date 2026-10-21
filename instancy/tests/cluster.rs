@@ -257,6 +257,139 @@ fn join_blocking_from_every_worker_of_a_multi_thread_runtime_completes() {
         );
     }
 }
+
+/// `join_blocking` from a task of the application's own multi-thread runtime,
+/// which is not the transport's (a dedicated multi-thread runtime, or a
+/// `current_thread` runtime driven by another thread), and whose threads are
+/// named neither like the transport's nor like tokio's default. The task
+/// first spawns the feeder that closes the inputs; it lands in the worker's
+/// LIFO slot, which no other thread can take, and the runtime has a single
+/// worker. The wait must hand the worker's work over (`block_in_place`).
+#[test]
+fn join_blocking_from_an_application_runtime_task_completes() {
+    for transport_multi_thread in [true, false] {
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let app = tokio::runtime::Builder::new_multi_thread()
+                .worker_threads(1)
+                .thread_name("app-worker")
+                .enable_all()
+                .build()
+                .unwrap();
+            let (stop_tx, stop_rx) = tokio::sync::oneshot::channel::<()>();
+            let (transport, transport_rt, driver) = if transport_multi_thread {
+                let rt = tokio::runtime::Builder::new_multi_thread()
+                    .worker_threads(2)
+                    .thread_name("net-worker")
+                    .enable_all()
+                    .build()
+                    .unwrap();
+                (rt.handle().clone(), Some(rt), None)
+            } else {
+                let rt = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .unwrap();
+                let handle = rt.handle().clone();
+                let driver = std::thread::spawn(move || {
+                    rt.block_on(async {
+                        let _ = stop_rx.await;
+                    })
+                });
+                (handle, None, Some(driver))
+            };
+            let topology = ClusterTopology::multi_node(vec![
+                NodeConfig::new("node-a", 1),
+                NodeConfig::new("node-b", 1),
+            ])
+            .unwrap();
+            let dataflow_id = DataflowId::new();
+            let (conn_a, conn_b) = make_duplex_pair("node-a", "node-b", 64 * 1024);
+            let new_runtime = || {
+                RuntimeHandle::new(RuntimeConfig {
+                    worker_threads: 1,
+                    ..RuntimeConfig::default()
+                })
+                .unwrap()
+            };
+            let (rt_a, rt_b) = (new_runtime(), new_runtime());
+            let outcome = app.block_on(async move {
+                let spawn = |rt: RuntimeHandle, node: &'static str, conn| {
+                    let topology = topology.clone();
+                    let transport = transport.clone();
+                    tokio::spawn(async move {
+                        let cluster = rt
+                            .spawn_cluster_async(
+                                "test",
+                                topology,
+                                node,
+                                dataflow_id,
+                                ClusterSpawnTransport::dedicated(vec![conn], 1024),
+                                Duration::from_secs(5),
+                                |builder: &mut DataflowBuilder<u64>| -> Result<()> {
+                                    builder
+                                        .input::<i32>("data")?
+                                        .map("double", |_t, x| x * 2)
+                                        .output("results")?;
+                                    Ok(())
+                                },
+                                &transport,
+                                SpawnOptions::new(),
+                            )
+                            .await
+                            .unwrap();
+                        (rt, cluster)
+                    })
+                };
+                let (spawn_a, spawn_b) =
+                    (spawn(rt_a, "node-a", conn_a), spawn(rt_b, "node-b", conn_b));
+                let (rt_a, mut cluster_a) = spawn_a.await.unwrap();
+                let (rt_b, mut cluster_b) = spawn_b.await.unwrap();
+                let output_a = cluster_a.take_output::<i32>(0, "results").unwrap();
+                let output_b = cluster_b.take_output::<i32>(0, "results").unwrap();
+                let sender_a = cluster_a.take_input::<i32>(0, "data").unwrap();
+                let sender_b = cluster_b.take_input::<i32>(0, "data").unwrap();
+                let joined = tokio::spawn(async move {
+                    tokio::spawn(async move {
+                        sender_a.send(0, vec![1, 2, 3]).unwrap();
+                        drop(sender_a);
+                        sender_b.send(0, vec![10, 20]).unwrap();
+                        drop(sender_b);
+                    });
+                    (
+                        cluster_a.join_blocking().is_ok(),
+                        cluster_b.join_blocking().is_ok(),
+                    )
+                })
+                .await
+                .unwrap();
+                (joined, rt_a, rt_b, output_a, output_b)
+            });
+            let (joined, rt_a, rt_b, output_a, output_b) = outcome;
+            let data = |output: instancy::OutputReceiver<u64, i32>| -> Vec<i32> {
+                output
+                    .collect_data()
+                    .into_iter()
+                    .flat_map(|(_, d)| d)
+                    .collect()
+            };
+            let _ = done_tx.send((joined.0, joined.1, data(output_a), data(output_b)));
+            drop((rt_a, rt_b, transport_rt));
+            let _ = stop_tx.send(());
+            if let Some(driver) = driver {
+                let _ = driver.join();
+            }
+        });
+        let outcome = done_rx.recv_timeout(Duration::from_secs(30));
+        assert_eq!(
+            outcome,
+            Ok((true, true, vec![2, 4, 6], vec![20, 40])),
+            "transport multi-thread={transport_multi_thread}: the blocking joins deadlocked or failed"
+        );
+    }
+}
+
+/// The original shape of `cluster_two_nodes_no_exchange`: the transport runs
 /// on a `current_thread` runtime and `join_blocking` is called from the
 /// thread driving it. That can never finish (the shutdown handshake needs
 /// this runtime), so it must fail promptly instead of deadlocking, and must
