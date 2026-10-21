@@ -52,7 +52,7 @@
 use std::collections::HashMap;
 
 #[cfg(feature = "transport")]
-use tokio::io::{AsyncRead, AsyncWrite};
+use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
 #[cfg(feature = "transport")]
 use tokio::sync::mpsc as tokio_mpsc;
 
@@ -134,17 +134,29 @@ pub struct TransportSession {
 ///
 /// Bridge tasks (writers) are NOT aborted — they are detached and terminate
 /// naturally when all their input channel senders are dropped. This ensures
-/// pending data frames are flushed to TCP before the bridge exits.
+/// pending data frames are flushed to TCP before the bridge exits; the bridge
+/// then shuts its write half down, so the peer reads the end of the stream.
 ///
-/// Demuxer tasks (readers) ARE aborted because they block on TCP reads and
-/// would not terminate until the remote peer closes the connection.
+/// Demuxer tasks (readers) are not aborted either: they keep reading until
+/// the peer closes its side, for at most [`DEMUX_LINGER`] after the session
+/// is dropped (see [`Demuxer::run_lingering`]), so this node's last frames
+/// are not destroyed by a connection reset.
 #[cfg(feature = "transport")]
 struct SessionState {
     /// Kept alive so bridge tasks are not dropped prematurely.
     /// They terminate naturally when all senders close.
     _bridge_handles: Vec<tokio::task::JoinHandle<()>>,
-    demux_handles: Vec<tokio::task::JoinHandle<()>>,
+    _demux_handles: Vec<tokio::task::JoinHandle<()>>,
+    /// Cancelled when the session is dropped; releases writers parked after
+    /// a write error (see [`TransportSession::bridge_task`]) and starts the
+    /// demuxers' linger period.
+    closed: tokio_util::sync::CancellationToken,
 }
+
+/// How long a dropped session's demuxers keep reading while waiting for the
+/// peer to close its side of the connection.
+#[cfg(feature = "transport")]
+const DEMUX_LINGER: std::time::Duration = std::time::Duration::from_secs(10);
 
 #[cfg(feature = "transport")]
 impl Drop for SessionState {
@@ -152,11 +164,8 @@ impl Drop for SessionState {
         // Bridge handles are intentionally NOT aborted. Dropping the JoinHandle
         // detaches the task, letting it drain remaining frames and exit when
         // all senders drop. This prevents data loss from premature cancellation.
-        //
-        // Demuxer handles must be aborted since they block on TCP reads.
-        for handle in &self.demux_handles {
-            handle.abort();
-        }
+        // The demuxers stop on their own (peer closed, or linger expired).
+        self.closed.cancel();
     }
 }
 
@@ -258,6 +267,7 @@ impl TransportSession {
         let mut control_senders = HashMap::new();
         let mut bridge_handles = Vec::new();
         let mut demux_handles = Vec::new();
+        let closed = tokio_util::sync::CancellationToken::new();
         let mut all_receivers: HashMap<String, HashMap<u64, tokio_mpsc::Receiver<Vec<u8>>>> =
             HashMap::new();
 
@@ -274,8 +284,9 @@ impl TransportSession {
             // Spawn bridge task
             let writer = conn.writer;
             let peer_id = peer_node_id.clone();
+            let session_closed = closed.clone();
             let bridge_handle = runtime_handle.spawn(async move {
-                Self::bridge_task(peer_id, writer, control_rx, payload_rx).await;
+                Self::bridge_task(peer_id, writer, control_rx, payload_rx, session_closed).await;
             });
             bridge_handles.push(bridge_handle);
 
@@ -298,8 +309,9 @@ impl TransportSession {
                 peer_receivers.insert(channel_id, rx);
             }
 
+            let demux_closed = closed.clone();
             let demux_handle = runtime_handle.spawn(async move {
-                if let Err(e) = demuxer.run().await {
+                if let Err(e) = demuxer.run_lingering(demux_closed, DEMUX_LINGER).await {
                     #[cfg(feature = "tracing")]
                     tracing::error!("Demuxer error for peer {}: {e}", peer_node_id);
                     #[cfg(not(feature = "tracing"))]
@@ -311,7 +323,8 @@ impl TransportSession {
 
         let state = std::sync::Arc::new(SessionState {
             _bridge_handles: bridge_handles,
-            demux_handles,
+            _demux_handles: demux_handles,
+            closed,
         });
 
         let session = Self {
@@ -365,11 +378,18 @@ impl TransportSession {
     /// delivery guarantees receivers see data before the frontier advances.
     ///
     /// The task exits when both channels are closed (all senders dropped).
+    ///
+    /// After a write error it stops accepting frames, so senders see the
+    /// failure, but keeps the writer until the session is dropped. Dropping
+    /// a write half can half-close the connection (e.g. `OwnedWriteHalf`),
+    /// and the peer would read that as this node leaving, although only a
+    /// local write failed and this node has not decided anything yet.
     async fn bridge_task<W: AsyncWrite + Unpin>(
         _peer_id: String,
         writer: W,
         mut control_rx: tokio_mpsc::Receiver<Frame>,
         mut payload_rx: tokio_mpsc::Receiver<Frame>,
+        session_closed: tokio_util::sync::CancellationToken,
     ) {
         let mut framed_writer = FramedWriter::new(writer);
         let mut control_open = true;
@@ -396,9 +416,17 @@ impl TransportSession {
             if let Err(_e) = framed_writer.write_frame(&frame).await {
                 #[cfg(feature = "tracing")]
                 tracing::error!("Bridge write error for peer {}: {_e}", _peer_id);
+                drop((control_rx, payload_rx));
+                session_closed.cancelled().await;
                 break;
             }
         }
+        // Nothing more will be written: tell the peer. Only some write halves
+        // do that when dropped (`OwnedWriteHalf`); with others (TLS streams,
+        // pipes, `tokio::io::split`) the peer would not see the end of the
+        // stream until the whole connection is dropped, which the lingering
+        // demuxers (ours and the peer's) only do after `DEMUX_LINGER`.
+        let _ = tokio::time::timeout(DEMUX_LINGER, framed_writer.into_inner().shutdown()).await;
     }
 }
 
@@ -958,6 +986,162 @@ mod tests {
 
         // Tasks should clean up promptly. Verify no panic or hang.
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+
+    /// A writer whose every write fails; records when it is dropped.
+    struct FailingWriter(std::sync::Arc<std::sync::atomic::AtomicBool>);
+
+    impl AsyncWrite for FailingWriter {
+        fn poll_write(
+            self: std::pin::Pin<&mut Self>,
+            _: &mut std::task::Context<'_>,
+            _: &[u8],
+        ) -> std::task::Poll<std::io::Result<usize>> {
+            std::task::Poll::Ready(Err(std::io::Error::other("injected write failure")))
+        }
+
+        fn poll_flush(
+            self: std::pin::Pin<&mut Self>,
+            _: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            std::task::Poll::Ready(Ok(()))
+        }
+
+        fn poll_shutdown(
+            self: std::pin::Pin<&mut Self>,
+            _: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            std::task::Poll::Ready(Ok(()))
+        }
+    }
+
+    impl Drop for FailingWriter {
+        fn drop(&mut self) {
+            self.0.store(true, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+
+    /// A local write error must not close the connection (dropping a write
+    /// half such as `OwnedWriteHalf` sends the peer a FIN): senders see the
+    /// failure at once, the peer only when the session is dropped.
+    #[tokio::test]
+    async fn write_failure_keeps_the_writer_until_the_session_drops() {
+        let df_id = make_dataflow_id();
+        let (_peer_end, reader) = tokio::io::duplex(1024);
+        let dropped = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let (session, _receivers) = TransportSession::new(
+            df_id,
+            vec![PeerConnection {
+                node_id: "peer".into(),
+                reader,
+                writer: FailingWriter(std::sync::Arc::clone(&dropped)),
+            }],
+            &[],
+            &[],
+            4,
+            &tokio::runtime::Handle::current(),
+        )
+        .unwrap();
+        let tx = session.data_sender("peer").unwrap().clone();
+        let failed = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                let frame = Frame {
+                    dataflow_id: df_id,
+                    channel_id: 1,
+                    payload: vec![1],
+                };
+                if tx.send(frame).await.is_err() {
+                    return;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            }
+        })
+        .await;
+        assert!(failed.is_ok(), "senders must see the write failure");
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        assert!(
+            !dropped.load(std::sync::atomic::Ordering::SeqCst),
+            "the writer must stay open until the session is dropped"
+        );
+        drop(tx);
+        drop(session);
+        let released = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            while !dropped.load(std::sync::atomic::Ordering::SeqCst) {
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            }
+        })
+        .await;
+        assert!(released.is_ok(), "dropping the session releases the writer");
+    }
+
+    /// A session dropped while its peer is still sending must not destroy
+    /// the frames it wrote last. Releasing the read half with unread data in
+    /// the socket makes the OS reset the connection (instead of closing it),
+    /// and the reset can discard those frames before the peer reads them.
+    /// The session keeps reading until the peer closes (bounded).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn dropped_session_keeps_reading_so_its_last_frames_survive() {
+        use crate::communication::transport::{FramedReader, FramedWriter};
+        for _ in 0..5 {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = listener.local_addr().unwrap();
+            let (accepted, ours) =
+                tokio::try_join!(listener.accept(), tokio::net::TcpStream::connect(addr)).unwrap();
+            let (our_read, our_write) = ours.into_split();
+            let (peer_read, peer_write) = accepted.0.into_split();
+            let df_id = make_dataflow_id();
+            let (session, receivers) = TransportSession::new(
+                df_id,
+                vec![PeerConnection {
+                    node_id: "peer".into(),
+                    reader: our_read,
+                    writer: our_write,
+                }],
+                &[],
+                &[],
+                16,
+                &tokio::runtime::Handle::current(),
+            )
+            .unwrap();
+            // Nothing here consumes what the peer sends.
+            drop(receivers);
+            // The peer keeps sending until the connection fails.
+            let flood = tokio::spawn(async move {
+                let mut writer = FramedWriter::new(peer_write);
+                let frame = Frame {
+                    dataflow_id: df_id,
+                    channel_id: 7,
+                    payload: vec![0; 4096],
+                };
+                while writer.write_frame(&frame).await.is_ok() {}
+            });
+            session
+                .control_sender("peer")
+                .unwrap()
+                .send(Frame {
+                    dataflow_id: df_id,
+                    channel_id: CONTROL_CHANNEL_ID,
+                    payload: b"last".to_vec(),
+                })
+                .await
+                .unwrap();
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            drop(session);
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            let mut reader = FramedReader::new(peer_read);
+            let got_last = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+                loop {
+                    match reader.read_frame().await {
+                        Ok(frame) if frame.payload == b"last" => return true,
+                        Ok(_) => {}
+                        Err(_) => return false,
+                    }
+                }
+            })
+            .await;
+            flood.abort();
+            assert_eq!(got_last, Ok(true), "the session's last frame was lost");
+        }
     }
 
     /// Regression test: verifies that data and progress frames sent by a

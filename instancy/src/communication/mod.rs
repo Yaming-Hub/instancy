@@ -12,6 +12,8 @@ pub mod codec;
 pub mod connection;
 pub(crate) mod control_protocol;
 pub mod interprocess;
+#[cfg(feature = "transport")]
+pub(crate) mod peer_link;
 pub(crate) mod probing;
 pub mod progress_exchange;
 pub mod remote_push;

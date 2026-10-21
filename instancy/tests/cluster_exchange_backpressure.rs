@@ -11,10 +11,11 @@
 //!   records as in flight (the `map` does, which also exercises the
 //!   exchange's in-flight accounting), and without that accounting completion
 //!   relies on close sentinels, which a full peer queue can drop.
-//! - Inputs stay open until every record has arrived: the node that finishes
-//!   first can drop frames still queued for its peers. In Shared mode the
-//!   same race can also leave a node waiting after delivery is complete; the
-//!   harness tolerates exactly that (see `support::cluster`).
+//! - Inputs stay open until every record has arrived: once the inputs close,
+//!   a worker can declare completion early while records are still in flight
+//!   or held by a blocked operator (audit C1/H1, tracked separately). The
+//!   first-finisher teardown race (audit C6) is fixed, so every node must
+//!   join.
 
 #![cfg(feature = "transport")]
 

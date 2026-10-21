@@ -49,9 +49,23 @@
 //!
 //! # Close semantics
 //!
-//! Each `NetworkPush` sends an explicit close frame (empty payload with a
-//! reserved close-sentinel channel ID) when `close()` is called. The
-//! corresponding `NetworkPull` detects this and marks itself exhausted.
+//! Each `NetworkPush` sends an explicit close frame (a payload consisting of
+//! the close tag) on its channel when `close()` is called or the push is
+//! dropped. The corresponding `NetworkPull` detects this and marks itself
+//! exhausted. In a cluster dataflow the close frame is queued on the peer's
+//! ordered outbox lane (the runtime's per-peer forwarder that awaits queue
+//! capacity), so it is never lost to a full transport queue and still arrives
+//! after all of this push's data. A push without an outbox (standalone use of
+//! [`NetworkEdgeMaterializer`]) falls back to a best-effort `try_send`.
+//!
+//! # Data loss
+//!
+//! In a cluster dataflow, records are never dropped silently. A push of
+//! records to a peer whose link is retired (the peer finished) fails with
+//! `CommunicationError::DataLoss`. On the receiving side, records that can no
+//! longer be delivered because the consuming operator finished (or that
+//! arrive after the channel's close frame) are reported to the dataflow's
+//! lifecycle coordinator, which fails the dataflow.
 //!
 //! [`Codec`]: crate::communication::codec::Codec
 //! [`EdgeMaterializer`]: crate::dataflow::channels::edge_materializer::EdgeMaterializer
@@ -142,6 +156,16 @@ where
 /// Encode a close sentinel (TAG_CLOSE with no payload).
 fn encode_close(buf: &mut Vec<u8>) {
     buf.push(TAG_CLOSE);
+}
+
+/// Whether an envelope carries records (as opposed to a control signal).
+fn carries_records<T: Timestamp, D>(envelope: &Envelope<T, D, ()>) -> bool {
+    matches!(&envelope.payload, Payload::Data { data, .. } if !data.is_empty())
+}
+
+/// Whether an encoded frame carries records.
+fn frame_carries_records(bytes: &[u8]) -> bool {
+    bytes.first() == Some(&TAG_DATA)
 }
 
 /// Decode an envelope from bytes, returning `None` for close sentinel.
@@ -273,6 +297,10 @@ pub struct NetworkPush<T: Timestamp + ExchangeData, D: ExchangeData> {
     dataflow_id: DataflowId,
     channel_id: u64,
     sender: crate::communication::cluster_transport::FrameSender,
+    /// Ordered lossless lane to the peer (cluster dataflows only).
+    outbox: Option<crate::communication::peer_link::PeerOutbox>,
+    /// The closed transport queue was reported to the coordinator.
+    link_failure_reported: std::sync::atomic::AtomicBool,
     closed: bool,
 }
 
@@ -286,16 +314,117 @@ impl<T: Timestamp + ExchangeData, D: ExchangeData> NetworkPush<T, D> {
         Ok(buf)
     }
 
-    fn send_frame(&self, payload: Vec<u8>) -> std::result::Result<(), Error> {
+    /// Whether the peer's link is retired: it has finished, or it already
+    /// holds everything this node will send.
+    fn peer_retired(&self) -> bool {
+        self.outbox
+            .as_ref()
+            .is_some_and(|outbox| outbox.is_retired())
+    }
+
+    /// The error for data that can no longer reach the peer.
+    fn data_lost(&self, detail: &str) -> Error {
+        crate::error::CommunicationError::DataLoss {
+            peer_id: self
+                .outbox
+                .as_ref()
+                .map(|outbox| outbox.peer().to_string())
+                .unwrap_or_default(),
+            detail: format!("channel {}: {detail}", self.channel_id),
+        }
+        .into()
+    }
+
+    /// Send one encoded envelope. `is_data` marks envelopes carrying records.
+    ///
+    /// A retired link means the peer finished (we cannot have finished:
+    /// this push still exists), so records sent to it would never be
+    /// consumed: that is data loss, not a benign race, and fails the
+    /// dataflow. Control signals for a finished peer are irrelevant and
+    /// discarded. The link is checked again after enqueueing: a data frame
+    /// that raced with retirement may sit behind the acknowledgement the
+    /// coordinator queued, and the peer may tear down before reading it.
+    fn send_frame(&self, payload: Vec<u8>, is_data: bool) -> std::result::Result<(), Error> {
+        if self.peer_retired() {
+            return if is_data {
+                Err(self.data_lost("records sent after the peer finished"))
+            } else {
+                Ok(())
+            };
+        }
         let frame = Frame {
             dataflow_id: self.dataflow_id,
             channel_id: self.channel_id,
             payload,
         };
-        self.sender.try_send(frame).map_err(|e| match e {
-            tokio_mpsc::error::TrySendError::Full(_) => Error::Backpressure,
-            tokio_mpsc::error::TrySendError::Closed(_) => Error::ChannelClosed,
-        })
+        match self.sender.try_send(frame) {
+            Ok(()) => {
+                std::sync::atomic::fence(std::sync::atomic::Ordering::SeqCst);
+                if is_data && self.peer_retired() {
+                    return Err(self.data_lost("records sent while the peer was finishing"));
+                }
+                Ok(())
+            }
+            Err(tokio_mpsc::error::TrySendError::Full(_)) => Err(Error::Backpressure),
+            Err(tokio_mpsc::error::TrySendError::Closed(_)) if self.peer_retired() => {
+                if is_data {
+                    Err(self.data_lost("records sent after the peer finished"))
+                } else {
+                    Ok(())
+                }
+            }
+            Err(tokio_mpsc::error::TrySendError::Closed(_)) => match &self.outbox {
+                // The connection to a peer that has not finished is gone while
+                // this dataflow runs. That is not this operator's failure: the
+                // peer may have cancelled (its Cancel may still be unread), it
+                // may have crashed, or a local write failed. The coordinator
+                // finds out which and cancels the dataflow with that reason;
+                // until then the operator waits, as for a full queue.
+                Some(outbox) => {
+                    if !self
+                        .link_failure_reported
+                        .swap(true, std::sync::atomic::Ordering::Relaxed)
+                    {
+                        outbox.report(crate::communication::peer_link::LinkEvent::OutboundFailed(
+                            crate::communication::peer_link::LinkFailure::SendFailed,
+                        ));
+                    }
+                    Err(Error::Backpressure)
+                }
+                None => Err(Error::ChannelClosed),
+            },
+        }
+    }
+
+    /// Queue the close sentinel behind this push's data.
+    fn send_close(&mut self) {
+        self.closed = true;
+        let mut buf = Vec::new();
+        encode_close(&mut buf);
+        let frame = Frame {
+            dataflow_id: self.dataflow_id,
+            channel_id: self.channel_id,
+            payload: buf,
+        };
+        match &self.outbox {
+            // Unbounded and ordered: the sentinel cannot be lost to a full
+            // queue, and the forwarder enqueues it after the data this push
+            // already handed to the transport.
+            Some(outbox) => {
+                let _ = outbox.send(frame);
+            }
+            // Standalone use without an outbox: best effort. A spin loop could
+            // deadlock a single-threaded runtime, so we do not retry.
+            None => {
+                if let Err(_e) = self.sender.try_send(frame) {
+                    #[cfg(feature = "tracing")]
+                    tracing::warn!(
+                        "close sentinel lost for channel {} (queue full or closed): {_e}",
+                        self.channel_id,
+                    );
+                }
+            }
+        }
     }
 }
 
@@ -305,8 +434,9 @@ impl<T: Timestamp + ExchangeData, D: ExchangeData> Push<T, D, ()> for NetworkPus
         if self.closed {
             return Err(Error::ChannelClosed);
         }
+        let is_data = carries_records(&envelope);
         let bytes = self.encode(&envelope)?;
-        self.send_frame(bytes)
+        self.send_frame(bytes, is_data)
     }
 
     fn try_push(
@@ -316,11 +446,12 @@ impl<T: Timestamp + ExchangeData, D: ExchangeData> Push<T, D, ()> for NetworkPus
         if self.closed {
             return Err((Error::ChannelClosed, envelope));
         }
+        let is_data = carries_records(&envelope);
         let bytes = match self.encode(&envelope) {
             Ok(b) => b,
             Err(e) => return Err((e, envelope)),
         };
-        match self.send_frame(bytes) {
+        match self.send_frame(bytes, is_data) {
             Ok(()) => Ok(()),
             Err(e) => Err((e, envelope)),
         }
@@ -333,33 +464,7 @@ impl<T: Timestamp + ExchangeData, D: ExchangeData> Push<T, D, ()> for NetworkPus
 
     fn close(&mut self) {
         if !self.closed {
-            self.closed = true;
-            // Best-effort close sentinel delivery.
-            //
-            // We use try_send (non-blocking) instead of a spin loop because:
-            // - A spin loop with std::thread::yield_now() can deadlock on
-            //   single-threaded tokio runtimes (the bridge task that drains
-            //   the channel can't be scheduled while we hold the thread).
-            // - If the queue is full, the sentinel is lost, but the remote
-            //   side will detect EOF when the TCP connection closes (session
-            //   drop aborts all tasks).
-            //
-            // Callers should ensure the channel is not saturated before close,
-            // or rely on EOF-based exhaustion detection as a fallback.
-            let mut buf = Vec::new();
-            encode_close(&mut buf);
-            let frame = Frame {
-                dataflow_id: self.dataflow_id,
-                channel_id: self.channel_id,
-                payload: buf,
-            };
-            if let Err(_e) = self.sender.try_send(frame) {
-                #[cfg(feature = "tracing")]
-                tracing::warn!(
-                    "close sentinel lost for channel {} (queue full or closed): {_e}",
-                    self.channel_id,
-                );
-            }
+            self.send_close();
         }
     }
 
@@ -378,17 +483,9 @@ impl<T: Timestamp + ExchangeData, D: ExchangeData> Push<T, D, ()> for NetworkPus
 impl<T: Timestamp + ExchangeData, D: ExchangeData> Drop for NetworkPush<T, D> {
     fn drop(&mut self) {
         if !self.closed {
-            self.closed = true;
-            // Best-effort close sentinel in Drop (non-blocking to avoid
-            // blocking in destructor). Callers should call close() explicitly.
-            let mut buf = Vec::new();
-            encode_close(&mut buf);
-            let frame = Frame {
-                dataflow_id: self.dataflow_id,
-                channel_id: self.channel_id,
-                payload: buf,
-            };
-            let _ = self.sender.try_send(frame);
+            // Never blocks: the outbox lane is unbounded and the fallback
+            // path uses try_send. Callers should still call close().
+            self.send_close();
         }
     }
 }
@@ -401,8 +498,18 @@ impl<T: Timestamp + ExchangeData, D: ExchangeData> Drop for NetworkPush<T, D> {
 /// `std::sync::mpsc` channel, notifying the executor's `WakeHandle` after
 /// each forwarded frame so the sleeping executor wakes up promptly.
 ///
-/// The bridge terminates when the tokio receiver yields `None` (Demuxer
-/// closed) or when the std sender is disconnected (`NetworkPull` dropped).
+/// Without an [`InboundMonitor`] (standalone use) the bridge terminates when
+/// the tokio receiver yields `None` (Demuxer closed) or when the std sender
+/// is disconnected (`NetworkPull` dropped).
+///
+/// In a cluster dataflow the bridge keeps receiving after the `NetworkPull`
+/// was dropped and reports every record-carrying frame it can no longer
+/// deliver, or that arrives after the channel's close marker, as
+/// [`LinkEvent::InboundDataLost`](crate::communication::peer_link::LinkEvent):
+/// the receiving operator finished while the peer was still sending to it,
+/// so the records would otherwise vanish silently. It exits when the Demuxer
+/// closes the channel or, during teardown, after draining what is queued.
+///
 /// A final wake notification is always sent on exit so the executor can
 /// observe channel exhaustion and react accordingly.
 #[cfg(feature = "transport")]
@@ -410,16 +517,109 @@ async fn data_recv_bridge(
     mut rx: tokio_mpsc::Receiver<Vec<u8>>,
     tx: std::sync::mpsc::Sender<Vec<u8>>,
     wake_handle: WakeHandle,
+    monitor: Option<InboundMonitor>,
 ) {
-    while let Some(bytes) = rx.recv().await {
-        if tx.send(bytes).is_err() {
-            // NetworkPull was dropped — stop forwarding.
-            break;
+    let Some(monitor) = monitor else {
+        while let Some(bytes) = rx.recv().await {
+            if tx.send(bytes).is_err() {
+                // NetworkPull was dropped — stop forwarding.
+                break;
+            }
+            wake_handle.notify();
         }
         wake_handle.notify();
+        return;
+    };
+    let drain = monitor.bridges.drain_token();
+    let _guard = monitor.guard;
+    let mut channel = InboundChannel {
+        tx: Some(tx),
+        wake_handle: &wake_handle,
+        peer: &monitor.peer,
+        channel_id: monitor.channel_id,
+        pull_dropped: &monitor.pull_dropped,
+        closed: false,
+        reported: false,
+    };
+    loop {
+        tokio::select! {
+            biased;
+            bytes = rx.recv() => match bytes {
+                Some(bytes) => channel.deliver(bytes),
+                None => break,
+            },
+            _ = drain.cancelled() => {
+                while let Ok(bytes) = rx.try_recv() {
+                    channel.deliver(bytes);
+                }
+                break;
+            }
+        }
     }
     // Final wake so the executor re-polls and observes channel closure.
     wake_handle.notify();
+}
+
+/// Inbound delivery context of one cluster data channel.
+#[cfg(feature = "transport")]
+pub(crate) struct InboundMonitor {
+    peer: crate::communication::peer_link::PeerMonitor,
+    channel_id: u64,
+    bridges: crate::communication::peer_link::InboundBridges,
+    guard: crate::communication::peer_link::InboundBridgeGuard,
+    /// Set by the `NetworkPull` before it drains and drops its receiver.
+    pull_dropped: Arc<std::sync::atomic::AtomicBool>,
+}
+
+#[cfg(feature = "transport")]
+struct InboundChannel<'a> {
+    /// `None` once the `NetworkPull` has been dropped.
+    tx: Option<std::sync::mpsc::Sender<Vec<u8>>>,
+    wake_handle: &'a WakeHandle,
+    peer: &'a crate::communication::peer_link::PeerMonitor,
+    channel_id: u64,
+    pull_dropped: &'a std::sync::atomic::AtomicBool,
+    closed: bool,
+    reported: bool,
+}
+
+#[cfg(feature = "transport")]
+impl InboundChannel<'_> {
+    fn deliver(&mut self, bytes: Vec<u8>) {
+        let records = frame_carries_records(&bytes);
+        if records && self.closed {
+            self.lost("records arrived after the channel's close marker");
+            return;
+        }
+        if bytes.first() == Some(&TAG_CLOSE) {
+            self.closed = true;
+        }
+        if let Some(tx) = &self.tx {
+            if tx.send(bytes).is_ok() {
+                // The pull may be dropping right now: it may already have
+                // drained its receiver, and this frame would vanish with it.
+                if records && self.pull_dropped.load(std::sync::atomic::Ordering::SeqCst) {
+                    self.lost("records arrived as the receiving operator finished");
+                }
+                self.wake_handle.notify();
+                return;
+            }
+            self.tx = None;
+        }
+        if records {
+            self.lost("records arrived after the receiving operator finished");
+        }
+    }
+
+    fn lost(&mut self, why: &str) {
+        if !self.reported {
+            self.reported = true;
+            self.peer
+                .report(crate::communication::peer_link::LinkEvent::InboundDataLost(
+                    format!("channel {}: {why}", self.channel_id),
+                ));
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -444,8 +644,53 @@ pub struct NetworkPull<T: Timestamp + ExchangeData, D: ExchangeData> {
     data_codec: D::CodecType,
     receiver: std::sync::mpsc::Receiver<Vec<u8>>,
     exhausted: bool,
+    /// Cluster dataflows: reports records left unconsumed when dropped.
+    monitor: Option<PullMonitor>,
     /// Keeps transport alive (background tasks survive as long as this exists).
     _transport: Arc<crate::communication::cluster_transport::ClusterTransport>,
+}
+
+/// Data-loss reporting for a `NetworkPull`.
+#[cfg(feature = "transport")]
+struct PullMonitor {
+    peer: crate::communication::peer_link::PeerMonitor,
+    channel_id: u64,
+    /// Shared with the inbound bridge (see [`InboundMonitor`]).
+    dropped: Arc<std::sync::atomic::AtomicBool>,
+}
+
+// Records still buffered when the consuming operator is dropped never reach
+// it. In a correct run an operator cannot finish while records addressed to
+// it are in flight, so this is reported as data loss (see `data_recv_bridge`).
+#[cfg(feature = "transport")]
+impl<T: Timestamp + ExchangeData, D: ExchangeData> Drop for NetworkPull<T, D> {
+    fn drop(&mut self) {
+        let Some(monitor) = &self.monitor else {
+            return;
+        };
+        // Before draining: a frame the bridge hands over from now on is
+        // reported by the bridge itself.
+        monitor
+            .dropped
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        let mut unconsumed = 0usize;
+        while let Ok(bytes) = self.receiver.try_recv() {
+            if frame_carries_records(&bytes) {
+                unconsumed += 1;
+            }
+        }
+        if unconsumed > 0 {
+            monitor
+                .peer
+                .report(crate::communication::peer_link::LinkEvent::InboundDataLost(
+                    format!(
+                        "channel {}: {unconsumed} frame(s) of records were received but never \
+                         consumed",
+                        monitor.channel_id
+                    ),
+                ));
+        }
+    }
 }
 
 #[cfg(feature = "transport")]
@@ -556,6 +801,13 @@ pub struct NetworkEdgeMaterializer<T: Timestamp + ExchangeData, D: ExchangeData>
     /// Tokio runtime handle for spawning bridge tasks that forward remote
     /// data from tokio mpsc channels and notify the executor's WakeHandle.
     runtime_handle: tokio::runtime::Handle,
+
+    /// Per-peer ordered lanes used for close sentinels (cluster dataflows).
+    peer_outboxes: std::collections::HashMap<String, crate::communication::peer_link::PeerOutbox>,
+
+    /// Inbound bridge tracking (cluster dataflows): undeliverable records are
+    /// reported, and teardown waits for the bridges.
+    inbound_bridges: Option<crate::communication::peer_link::InboundBridges>,
 }
 
 #[cfg(feature = "transport")]
@@ -651,7 +903,31 @@ impl<T: Timestamp + ExchangeData, D: ExchangeData> NetworkEdgeMaterializer<T, D>
             taken_pull: vec![false; num_workers],
             wake_handles,
             runtime_handle,
+            peer_outboxes: std::collections::HashMap::new(),
+            inbound_bridges: None,
         })
+    }
+
+    /// Route close sentinels through the given per-peer ordered lanes.
+    pub(crate) fn with_peer_outboxes(
+        mut self,
+        peer_outboxes: std::collections::HashMap<
+            String,
+            crate::communication::peer_link::PeerOutbox,
+        >,
+    ) -> Self {
+        self.peer_outboxes = peer_outboxes;
+        self
+    }
+
+    /// Track inbound bridges and report records that can no longer be
+    /// delivered (requires the per-peer outboxes for reporting).
+    pub(crate) fn with_inbound_bridges(
+        mut self,
+        inbound_bridges: crate::communication::peer_link::InboundBridges,
+    ) -> Self {
+        self.inbound_bridges = Some(inbound_bridges);
+        self
     }
 
     /// Convenience constructor that creates a [`TransportSession`] internally.
@@ -826,6 +1102,8 @@ impl<T: Timestamp + ExchangeData, D: ExchangeData> EdgeMaterializer<T, D>
                     dataflow_id: self.dataflow_id,
                     channel_id,
                     sender,
+                    outbox: self.peer_outboxes.get(dst_node).cloned(),
+                    link_failure_reported: std::sync::atomic::AtomicBool::new(false),
                     closed: false,
                 }));
             }
@@ -890,8 +1168,24 @@ impl<T: Timestamp + ExchangeData, D: ExchangeData> EdgeMaterializer<T, D>
 
                 let (std_tx, std_rx) = std::sync::mpsc::channel::<Vec<u8>>();
                 let wake = self.wake_handles[dst_idx].clone();
+                let channel_id = Self::channel_id(self.edge_index, src, dst_idx, self.num_workers)?;
+                let peer = self
+                    .peer_outboxes
+                    .get(src_node)
+                    .map(crate::communication::peer_link::PeerOutbox::monitor);
+                let pull_dropped = Arc::new(std::sync::atomic::AtomicBool::new(false));
+                let monitor = match (&self.inbound_bridges, &peer) {
+                    (Some(bridges), Some(peer)) => Some(InboundMonitor {
+                        peer: peer.clone(),
+                        channel_id,
+                        bridges: bridges.clone(),
+                        guard: bridges.register(),
+                        pull_dropped: Arc::clone(&pull_dropped),
+                    }),
+                    _ => None,
+                };
                 self.runtime_handle.spawn(async move {
-                    data_recv_bridge(tokio_receiver, std_tx, wake).await;
+                    data_recv_bridge(tokio_receiver, std_tx, wake, monitor).await;
                 });
 
                 pullers.push(Box::new(NetworkPull::<T, D> {
@@ -899,6 +1193,11 @@ impl<T: Timestamp + ExchangeData, D: ExchangeData> EdgeMaterializer<T, D>
                     data_codec: D::codec(),
                     receiver: std_rx,
                     exhausted: false,
+                    monitor: peer.map(|peer| PullMonitor {
+                        peer,
+                        channel_id,
+                        dropped: pull_dropped,
+                    }),
                     _transport: self.transport.clone(),
                 }));
             }
@@ -1254,6 +1553,229 @@ mod tests {
                 env.as_data(),
                 Some((&7u64, &vec!["hello".to_string(), "world".to_string()]))
             );
+        }
+
+        use crate::communication::peer_link::{
+            InboundBridges, LifecycleEvent, LinkEvent, PeerOutbox, spawn_peer_outbox,
+        };
+
+        /// An outbox for `peer` whose events are observable; the frames it
+        /// forwards go to a sink.
+        fn monitored_outbox(
+            peer: &str,
+        ) -> (
+            PeerOutbox,
+            tokio_mpsc::UnboundedReceiver<LifecycleEvent>,
+            tokio_mpsc::Receiver<Frame>,
+        ) {
+            let (events, events_rx) = tokio_mpsc::unbounded_channel();
+            let (sink_tx, sink_rx) = tokio_mpsc::channel(64);
+            let (outbox, _forwarder) = spawn_peer_outbox(
+                peer,
+                crate::communication::cluster_transport::FrameSender::Direct(sink_tx),
+                events,
+                &tokio::runtime::Handle::current(),
+            );
+            (outbox, events_rx, sink_rx)
+        }
+
+        fn push_to(
+            outbox: &PeerOutbox,
+            sender: tokio_mpsc::Sender<Frame>,
+        ) -> NetworkPush<u64, u64> {
+            NetworkPush {
+                time_codec: u64::codec(),
+                data_codec: u64::codec(),
+                dataflow_id: DataflowId::new(),
+                channel_id: 5,
+                sender: crate::communication::cluster_transport::FrameSender::Direct(sender),
+                outbox: Some(outbox.clone()),
+                link_failure_reported: std::sync::atomic::AtomicBool::new(false),
+                closed: false,
+            }
+        }
+
+        #[tokio::test]
+        async fn push_of_records_to_a_retired_peer_is_data_loss() {
+            let (outbox, _events, _sink) = monitored_outbox("node-b");
+            let (tx, mut rx) = tokio_mpsc::channel(4);
+            let mut push = push_to(&outbox, tx);
+            push.push(Envelope::data(1, vec![1])).unwrap();
+            assert!(rx.try_recv().is_ok());
+
+            outbox.link().retire();
+            let error = push.push(Envelope::data(2, vec![2])).unwrap_err();
+            assert!(
+                matches!(
+                    error,
+                    Error::Communication(crate::error::CommunicationError::DataLoss {
+                        ref peer_id,
+                        ..
+                    }) if peer_id == "node-b"
+                ),
+                "{error:?}"
+            );
+            let (error, returned) = push.try_push(Envelope::data(3, vec![3])).unwrap_err();
+            assert!(matches!(error, Error::Communication(_)));
+            assert_eq!(returned.as_data(), Some((&3u64, &vec![3u64])));
+            assert!(rx.try_recv().is_err(), "nothing sent to a finished peer");
+            // Control signals and empty batches for a finished peer are irrelevant.
+            push.push(Envelope::watermark(4)).unwrap();
+            push.push(Envelope::data(5, Vec::new())).unwrap();
+        }
+
+        #[tokio::test]
+        async fn push_of_records_to_a_retired_closed_link_is_data_loss() {
+            let (outbox, mut events, _sink) = monitored_outbox("node-b");
+            let (tx, rx) = tokio_mpsc::channel(4);
+            drop(rx);
+            let mut push = push_to(&outbox, tx);
+            // A closed link to a peer that has not finished is the
+            // coordinator's to judge (reported once); the operator waits.
+            for _ in 0..3 {
+                assert!(matches!(
+                    push.push(Envelope::data(1, vec![1])),
+                    Err(Error::Backpressure)
+                ));
+            }
+            assert!(matches!(
+                events.try_recv(),
+                Ok(LifecycleEvent::Link {
+                    event: LinkEvent::OutboundFailed(
+                        crate::communication::peer_link::LinkFailure::SendFailed
+                    ),
+                    ..
+                })
+            ));
+            assert!(events.try_recv().is_err(), "reported once");
+            outbox.link().retire();
+            assert!(matches!(
+                push.push(Envelope::data(1, vec![1])),
+                Err(Error::Communication(_))
+            ));
+            push.push(Envelope::watermark(2)).unwrap();
+        }
+
+        fn materializers_with_monitoring(
+            rt: &tokio::runtime::Handle,
+        ) -> (
+            NetworkEdgeMaterializer<u64, u64>,
+            NetworkEdgeMaterializer<u64, u64>,
+            tokio_mpsc::UnboundedReceiver<LifecycleEvent>,
+            InboundBridges,
+        ) {
+            let (mat_a, mat_b) =
+                create_connected_materializers(DataflowId::new(), two_node_topology(), 16, rt);
+            let (outbox, events, sink) = monitored_outbox("node-a");
+            // Keep the outbox's sink open for the rest of the test.
+            std::mem::forget(sink);
+            let bridges = InboundBridges::default();
+            let mat_b = mat_b
+                .with_peer_outboxes(std::collections::HashMap::from([(
+                    "node-a".to_string(),
+                    outbox,
+                )]))
+                .with_inbound_bridges(bridges.clone());
+            (mat_a, mat_b, events, bridges)
+        }
+
+        async fn next_loss(events: &mut tokio_mpsc::UnboundedReceiver<LifecycleEvent>) -> String {
+            let event = tokio::time::timeout(std::time::Duration::from_secs(2), events.recv())
+                .await
+                .expect("a data loss is reported");
+            match event {
+                Some(LifecycleEvent::Link {
+                    peer,
+                    event: LinkEvent::InboundDataLost(detail),
+                }) if peer == "node-a" => detail,
+                other => panic!("unexpected event {other:?}"),
+            }
+        }
+
+        #[tokio::test]
+        async fn records_left_unconsumed_or_arriving_after_the_pull_are_reported() {
+            let rt = tokio::runtime::Handle::current();
+            let (mut mat_a, mut mat_b, mut events, bridges) = materializers_with_monitoring(&rt);
+            let (mut push0, _) = mat_a.materialize_worker(0).unwrap();
+            let _ = mat_a.materialize_worker(1).unwrap();
+            let (_, mut pull2) = mat_b.materialize_worker(2).unwrap();
+            let _ = mat_b.materialize_worker(3).unwrap();
+
+            // Delivered and consumed: no report.
+            push0[2].push(Envelope::data(1, vec![1])).unwrap();
+            let timeout = std::time::Duration::from_secs(2);
+            assert!(poll_pull(pull2[0].as_mut(), timeout).await.is_some());
+
+            // Received but never consumed before the pull is dropped.
+            push0[2].push(Envelope::data(2, vec![2])).unwrap();
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            drop(pull2);
+            assert!(next_loss(&mut events).await.contains("never consumed"));
+
+            // Arriving after the pull was dropped.
+            push0[2].push(Envelope::data(3, vec![3])).unwrap();
+            assert!(
+                next_loss(&mut events)
+                    .await
+                    .contains("after the receiving operator finished")
+            );
+
+            // A close marker after the operator finished is not data loss.
+            drop(push0);
+            bridges.drain();
+            tokio::time::timeout(timeout, bridges.wait_idle())
+                .await
+                .expect("bridges exit on drain");
+            assert!(events.try_recv().is_err(), "one report per channel");
+        }
+
+        #[tokio::test]
+        async fn records_after_the_close_marker_are_reported() {
+            let rt = tokio::runtime::Handle::current();
+            let (mut mat_a, mut mat_b, mut events, _bridges) = materializers_with_monitoring(&rt);
+            let (mut push0, _) = mat_a.materialize_worker(0).unwrap();
+            let _ = mat_a.materialize_worker(1).unwrap();
+            let (_, _pull2) = mat_b.materialize_worker(2).unwrap();
+            let _ = mat_b.materialize_worker(3).unwrap();
+            // Simulate a sender that keeps going after closing the channel.
+            let sender = mat_a.transport.data_sender("node-b").unwrap();
+            push0[2].close();
+            let channel_id = NetworkEdgeMaterializer::<u64, u64>::channel_id(0, 0, 2, 4).unwrap();
+            let mut payload = Vec::new();
+            encode_envelope(
+                &u64::codec(),
+                &u64::codec(),
+                &Envelope::data(9, vec![9]),
+                &mut payload,
+            )
+            .unwrap();
+            sender
+                .try_send(Frame {
+                    dataflow_id: mat_a.dataflow_id,
+                    channel_id,
+                    payload,
+                })
+                .unwrap();
+            assert!(next_loss(&mut events).await.contains("close marker"));
+        }
+
+        #[tokio::test]
+        async fn inbound_bridges_wait_until_every_bridge_drained() {
+            let rt = tokio::runtime::Handle::current();
+            let (_mat_a, mut mat_b, _events, bridges) = materializers_with_monitoring(&rt);
+            let (_, pulls) = mat_b.materialize_worker(2).unwrap();
+            let timeout = std::time::Duration::from_secs(2);
+            assert!(
+                tokio::time::timeout(std::time::Duration::from_millis(100), bridges.wait_idle())
+                    .await
+                    .is_err(),
+                "bridges still running"
+            );
+            bridges.drain();
+            tokio::time::timeout(timeout, bridges.wait_idle())
+                .await
+                .expect("drained bridges exit");
+            drop(pulls);
         }
     }
 }

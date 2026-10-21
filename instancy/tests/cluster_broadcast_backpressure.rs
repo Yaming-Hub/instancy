@@ -5,10 +5,10 @@
 //! the operator's retry must only go to the targets still owed the batch.
 //!
 //! Every pipeline keeps its inputs open until every copy has arrived:
-//! broadcast does not yet account its records as in flight, so completion
-//! relies on close sentinels, which a full queue can drop, and in Shared mode
-//! the node that finishes first can drop frames its peers still need (both
-//! tracked separately).
+//! broadcast does not yet account its records as in flight (audit C2), so
+//! once the inputs close a worker can declare completion while copies are
+//! still in transit (tracked separately). Close sentinels and the first
+//! finisher's queued frames are no longer dropped (audit H9, C6).
 
 #![cfg(feature = "transport")]
 

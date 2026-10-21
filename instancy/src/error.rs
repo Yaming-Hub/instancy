@@ -300,6 +300,14 @@ pub enum CommunicationError {
 
     #[error("Setup error: {0}")]
     InvalidSetup(String),
+
+    /// Data sent over a cluster link was lost: it was sent to, or arrived
+    /// at, a node whose receiving operators had already finished. This
+    /// indicates a premature completion somewhere in the cluster; the
+    /// dataflow fails instead of returning an incomplete result.
+    #[cfg(feature = "transport")]
+    #[error("data lost on the link to peer {peer_id}: {detail}")]
+    DataLoss { peer_id: String, detail: String },
 }
 
 /// Extension trait to convert `PoisonError` into `Error`.

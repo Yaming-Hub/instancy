@@ -88,6 +88,7 @@ For N workers, we create N × (N-1) unidirectional FIFO channels:
 - Messages are `Vec<ProgressChange<T>>` batches. Each `ProgressChange` carries a `kind` — `Source` (a capability change on an output port) or `Target` (an in-flight message count on an input port, see §11.4.4) — plus `(node, port, timestamp, diff)`. Both kinds are broadcast over the same channels.
 - FIFO ordering per sender ensures a release (`-1`) is never seen before the corresponding acquire (`+1`)
 - Senders notify the target worker's `WakeHandle`, waking idle workers on progress arrival
+- Across nodes, progress frames travel on the sender's ordered per-peer outbox, which is never cut short by cancellation, so a node's final deltas (e.g. its last capability release) are delivered even when it finishes first. Each cross-node progress channel ends with an explicit end-of-stream frame on a clean shutdown (see [cluster.md §5.5.3](./cluster.md#553-cluster-shutdown-protocol-clean-teardown)).
 
 #### 11.3.2 Initialization Ordering
 

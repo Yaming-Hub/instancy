@@ -46,7 +46,7 @@ use std::sync::Arc;
 use std::sync::Mutex;
 use std::time::Duration;
 
-use tokio::io::{AsyncRead, AsyncWrite};
+use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
 use tokio::sync::Mutex as TokioMutex;
 use tokio::sync::mpsc as tokio_mpsc;
 
@@ -66,6 +66,101 @@ use crate::wire;
 /// This is distinct from `CONTROL_CHANNEL_ID` (0) and user data/progress channels.
 /// Probe frames carry a [`ProbeMessage`] as their payload.
 pub const PROBE_CHANNEL_ID: u64 = u64::MAX;
+
+/// Reserved channel ID for flush barriers on the payload queue.
+///
+/// Lies in the reserved namespace (`RESERVED_CHANNEL_BASE ..= u64::MAX`), next
+/// to [`PROBE_CHANNEL_ID`] and away from the inter-process progress channel
+/// (`RESERVED_CHANNEL_BASE` itself). Never sent on the wire: the bridge task
+/// consumes a barrier when it reaches it and wakes the matching
+/// [`SharedPeerManager::flush_dataflow`] caller, and
+/// [`SharedPeerManager::register_dataflow`] refuses it as a channel.
+const FLUSH_BARRIER_CHANNEL_ID: u64 = u64::MAX - 1;
+
+const _: () = {
+    use crate::communication::transport_session::RESERVED_CHANNEL_BASE;
+    assert!(FLUSH_BARRIER_CHANNEL_ID >= RESERVED_CHANNEL_BASE);
+    assert!(FLUSH_BARRIER_CHANNEL_ID != PROBE_CHANNEL_ID);
+    // The inter-process progress channel is the first reserved id.
+    assert!(FLUSH_BARRIER_CHANNEL_ID != RESERVED_CHANNEL_BASE);
+};
+
+/// Waiters for in-flight flush barriers, keyed by barrier token.
+type FlushBarriers = Arc<Mutex<HashMap<u64, tokio::sync::oneshot::Sender<()>>>>;
+
+/// How long a released [`SharedPeerManager`] keeps its connections open to
+/// write the frames already queued on them and to wait for the peer to close
+/// its side (see [`linger`]).
+const WRITER_DRAIN_GRACE: Duration = Duration::from_secs(10);
+
+/// Background tasks of a [`SharedPeerManager`].
+///
+/// Connection writers and readers are kept apart from the other tasks:
+/// releasing the manager aborts the other tasks immediately but closes the
+/// connections gracefully (see [`linger`]).
+#[derive(Default)]
+struct TaskHandles {
+    tasks: Mutex<Vec<tokio::task::JoinHandle<()>>>,
+    writers: Mutex<Vec<tokio::task::JoinHandle<()>>>,
+    readers: Mutex<Vec<tokio::task::JoinHandle<()>>>,
+}
+
+impl TaskHandles {
+    fn take(handles: &Mutex<Vec<tokio::task::JoinHandle<()>>>) -> Vec<tokio::task::JoinHandle<()>> {
+        std::mem::take(
+            &mut *handles
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+        )
+    }
+
+    fn abort_tasks(&self) {
+        for handle in self
+            .tasks
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .iter()
+        {
+            handle.abort();
+        }
+    }
+}
+
+/// Wait until every task has finished, aborting the rest at `deadline`.
+async fn drain_tasks(mut tasks: Vec<tokio::task::JoinHandle<()>>, deadline: tokio::time::Instant) {
+    let finished = tokio::time::timeout_at(deadline, async {
+        for task in tasks.iter_mut() {
+            let _ = task.await;
+        }
+    })
+    .await;
+    if finished.is_err() {
+        for task in &tasks {
+            task.abort();
+        }
+    }
+}
+
+/// Close a released manager's connections without losing what is already
+/// queued on them.
+///
+/// Closing the writer queues lets every writer finish the frames queued on
+/// its connection (a dataflow's last frames: its end-of-stream markers,
+/// acknowledgements or `Cancel`) and then close its half of the connection.
+/// The readers keep reading until the peer closes its half too: closing a
+/// socket with unread data makes the OS reset the connection, which can
+/// destroy frames the peer has not read yet. A peer that stops reading, or
+/// never closes, is cut off at the deadlines.
+async fn linger(
+    writer_channels: Arc<TokioMutex<HashMap<usize, tokio_mpsc::Sender<Frame>>>>,
+    writers: Vec<tokio::task::JoinHandle<()>>,
+    readers: Vec<tokio::task::JoinHandle<()>>,
+    deadline: tokio::time::Instant,
+) {
+    writer_channels.lock().await.clear();
+    drain_tasks(writers, deadline).await;
+    drain_tasks(readers, deadline).await;
+}
 
 fn push_task_handle(
     task_handles: &Mutex<Vec<tokio::task::JoinHandle<()>>>,
@@ -322,10 +417,15 @@ pub struct SharedPeerManager {
     runtime_handle: tokio::runtime::Handle,
     /// Guards lazy connection initialization so concurrent registrations don't over-connect.
     init_lock: Arc<TokioMutex<()>>,
-    /// Background task handles (aborted on drop).
-    task_handles: Arc<Mutex<Vec<tokio::task::JoinHandle<()>>>>,
+    /// Background task handles (aborted on drop, except for the connection
+    /// writers, which first write what is already queued).
+    task_handles: Arc<TaskHandles>,
     /// Payload sender: frames from any dataflow go here for sequencing + pool routing.
     payload_tx: tokio_mpsc::Sender<(DataflowId, Frame)>,
+    /// Pending flush barriers (see [`Self::flush_dataflow`]).
+    flush_barriers: FlushBarriers,
+    /// Next flush barrier token.
+    next_flush_barrier: std::sync::atomic::AtomicU64,
     /// Control sender: high-priority frames bypass sequencing.
     control_tx: tokio_mpsc::Sender<Frame>,
     /// Failure notification sender: writer/reader tasks send failed conn IDs here.
@@ -336,10 +436,19 @@ pub struct SharedPeerManager {
 
 impl Drop for SharedPeerManager {
     fn drop(&mut self) {
-        if let Ok(handles) = self.task_handles.lock() {
-            for handle in handles.iter() {
-                handle.abort();
-            }
+        self.task_handles.abort_tasks();
+        // Close the connections gracefully in the background (if the runtime
+        // is shutting down, it ends these tasks itself).
+        let writers = TaskHandles::take(&self.task_handles.writers);
+        let readers = TaskHandles::take(&self.task_handles.readers);
+        if !writers.is_empty() || !readers.is_empty() {
+            let deadline = tokio::time::Instant::now() + WRITER_DRAIN_GRACE;
+            self.runtime_handle.spawn(linger(
+                Arc::clone(&self.writer_channels),
+                writers,
+                readers,
+                deadline,
+            ));
         }
     }
 }
@@ -378,8 +487,9 @@ impl SharedPeerManager {
         let dispatch_locks: Arc<TokioMutex<HashMap<DataflowId, Arc<TokioMutex<()>>>>> =
             Arc::new(TokioMutex::new(HashMap::new()));
         let init_lock = Arc::new(TokioMutex::new(()));
-        let task_handles = Arc::new(Mutex::new(Vec::new()));
+        let task_handles = Arc::new(TaskHandles::default());
         let writer_channels = Arc::new(TokioMutex::new(HashMap::new()));
+        let flush_barriers: FlushBarriers = Arc::new(Mutex::new(HashMap::new()));
 
         let bridge_handle = runtime_handle.spawn(Self::bridge_task(
             pool.clone(),
@@ -389,8 +499,9 @@ impl SharedPeerManager {
             control_rx,
             health_tx.clone(),
             peer_node_id.clone(),
+            flush_barriers.clone(),
         ));
-        push_task_handle(&task_handles, bridge_handle);
+        push_task_handle(&task_handles.tasks, bridge_handle);
 
         let probe_handle = runtime_handle.spawn(Self::probe_loop(
             scaling_driver.clone(),
@@ -399,7 +510,7 @@ impl SharedPeerManager {
             pool.clone(),
             config.probe_interval,
         ));
-        push_task_handle(&task_handles, probe_handle);
+        push_task_handle(&task_handles.tasks, probe_handle);
 
         let crc_enabled = config.enable_frame_crc;
         let scale_handle = runtime_handle.spawn(Self::scaling_event_handler(
@@ -417,7 +528,7 @@ impl SharedPeerManager {
             task_handles.clone(),
             crc_enabled,
         ));
-        push_task_handle(&task_handles, scale_handle);
+        push_task_handle(&task_handles.tasks, scale_handle);
 
         let monitor_handle = runtime_handle.spawn(Self::connection_monitor(
             failure_rx,
@@ -425,14 +536,14 @@ impl SharedPeerManager {
             writer_channels.clone(),
             scaling_driver.clone(),
         ));
-        push_task_handle(&task_handles, monitor_handle);
+        push_task_handle(&task_handles.tasks, monitor_handle);
 
         let sweep_handle = runtime_handle.spawn(Self::timeout_sweeper(
             reorder_buffers.clone(),
             reg_state.clone(),
             config.reorder_timeout,
         ));
-        push_task_handle(&task_handles, sweep_handle);
+        push_task_handle(&task_handles.tasks, sweep_handle);
 
         Ok(Self {
             peer_node_id,
@@ -449,6 +560,8 @@ impl SharedPeerManager {
             init_lock,
             task_handles,
             payload_tx,
+            flush_barriers,
+            next_flush_barrier: std::sync::atomic::AtomicU64::new(0),
             control_tx,
             failure_tx,
             health_tx,
@@ -469,10 +582,10 @@ impl SharedPeerManager {
     /// # Errors
     ///
     /// Returns [`TransportError::InvalidRegistration`] without registering
-    /// anything if `channel_capacity` is 0, `channel_ids` contains a duplicate
-    /// or [`PROBE_CHANNEL_ID`], or `dataflow_id` is already registered with
-    /// this manager. (Previously a second registration silently replaced the
-    /// first one's receivers.)
+    /// anything if `channel_capacity` is 0, `channel_ids` contains a duplicate,
+    /// [`PROBE_CHANNEL_ID`] or the local flush-barrier id (`u64::MAX - 1`), or
+    /// `dataflow_id` is already registered with this manager. (Previously a
+    /// second registration silently replaced the first one's receivers.)
     pub async fn register_dataflow(
         &self,
         dataflow_id: DataflowId,
@@ -494,6 +607,11 @@ impl SharedPeerManager {
             if ch_id == PROBE_CHANNEL_ID {
                 return Err(invalid(format!(
                     "channel {PROBE_CHANNEL_ID} is reserved for connection probes"
+                )));
+            }
+            if ch_id == FLUSH_BARRIER_CHANNEL_ID {
+                return Err(invalid(format!(
+                    "channel {FLUSH_BARRIER_CHANNEL_ID} is reserved for flush barriers"
                 )));
             }
             if !seen.insert(ch_id) {
@@ -674,6 +792,83 @@ impl SharedPeerManager {
         Ok(())
     }
 
+    /// Wait until every payload frame queued before this call has been
+    /// processed by the bridge task (sequenced and handed to a connection
+    /// writer, or dropped because no connection is available).
+    ///
+    /// Unregistering a dataflow drops its payload frames that are still
+    /// queued, so a dataflow that wants its last frames delivered calls this
+    /// first. The barrier waits behind every dataflow's frames queued before
+    /// it; callers should bound the wait.
+    pub(crate) async fn flush_dataflow(&self, dataflow_id: &DataflowId) {
+        /// Removes the waiter even if the caller stops waiting (timeout).
+        struct Registered<'a> {
+            barriers: &'a FlushBarriers,
+            token: u64,
+        }
+        impl Drop for Registered<'_> {
+            fn drop(&mut self) {
+                if let Ok(mut barriers) = self.barriers.lock().or_poison("flush barriers") {
+                    barriers.remove(&self.token);
+                }
+            }
+        }
+
+        let token = self
+            .next_flush_barrier
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        match self.flush_barriers.lock().or_poison("flush barriers") {
+            Ok(mut barriers) => {
+                barriers.insert(token, tx);
+            }
+            Err(_) => return,
+        }
+        let _registered = Registered {
+            barriers: &self.flush_barriers,
+            token,
+        };
+        let barrier = Frame {
+            dataflow_id: *dataflow_id,
+            channel_id: FLUSH_BARRIER_CHANNEL_ID,
+            payload: token.to_le_bytes().to_vec(),
+        };
+        if self.payload_tx.send((*dataflow_id, barrier)).await.is_ok() {
+            let _ = rx.await;
+        }
+    }
+
+    /// Release this manager once everything already queued on it has been
+    /// written to its connections, bounded by `timeout`.
+    ///
+    /// Dropping a manager also closes its connections gracefully in the
+    /// background (see [`linger`]); this waits until the writers are done, so
+    /// the caller knows its frames have been handed to the connections when
+    /// it returns (unless the timeout expired, in which case the remaining
+    /// writers are aborted). The readers keep waiting for the peer to close
+    /// in the background. Control frames are flushed too: the bridge task
+    /// prefers them over the payload barrier.
+    pub(crate) async fn close(self, timeout: Duration) {
+        let deadline = tokio::time::Instant::now() + timeout;
+        let _ = tokio::time::timeout_at(deadline, self.flush_dataflow(&DataflowId::nil())).await;
+        self.task_handles.abort_tasks();
+        let writers = TaskHandles::take(&self.task_handles.writers);
+        let readers = TaskHandles::take(&self.task_handles.readers);
+        let writer_channels = Arc::clone(&self.writer_channels);
+        let runtime = self.runtime_handle.clone();
+        drop(self);
+        if let Ok(mut channels) = tokio::time::timeout_at(deadline, writer_channels.lock()).await {
+            channels.clear();
+        }
+        drain_tasks(writers, deadline).await;
+        runtime.spawn(linger(
+            writer_channels,
+            Vec::new(),
+            readers,
+            tokio::time::Instant::now() + WRITER_DRAIN_GRACE,
+        ));
+    }
+
     /// Unregister a dataflow, removing its channels, reorder buffer, and pending control frames.
     /// The dataflow ID is recorded as completed so late control frames are dropped.
     pub async fn unregister_dataflow(&self, dataflow_id: &DataflowId) {
@@ -725,7 +920,7 @@ impl SharedPeerManager {
         dispatch_locks: Arc<TokioMutex<HashMap<DataflowId, Arc<TokioMutex<()>>>>>,
         scaling_driver: Arc<ScalingDriver>,
         failure_tx: tokio_mpsc::Sender<usize>,
-        task_handles: Arc<Mutex<Vec<tokio::task::JoinHandle<()>>>>,
+        task_handles: Arc<TaskHandles>,
         crc_enabled: bool,
     ) -> Result<usize, Box<dyn std::error::Error + Send + Sync>> {
         let (reader, writer) = connection_factory.establish_dyn(peer_node_id).await?;
@@ -762,19 +957,8 @@ impl SharedPeerManager {
             crc_enabled,
         ));
 
-        match task_handles.lock().or_poison("task handle") {
-            Ok(mut handles) => {
-                handles.push(writer_handle);
-                handles.push(reader_handle);
-            }
-            Err(_) => {
-                // NOTE: Cannot propagate lock poison — this is a fire-and-forget helper.
-                // Aborting the task handle on poison is the correct fallback since the
-                // transport is shutting down.
-                writer_handle.abort();
-                reader_handle.abort();
-            }
-        }
+        push_task_handle(&task_handles.writers, writer_handle);
+        push_task_handle(&task_handles.readers, reader_handle);
         Ok(conn_id)
     }
 
@@ -811,12 +995,17 @@ impl SharedPeerManager {
                     metrics.mark_dead();
                 }
                 let _ = failure_tx.try_send(conn_id);
-                break;
+                return;
             }
             if let Some(ref metrics) = conn_metrics {
                 metrics.dequeue(payload_size, is_user_traffic);
             }
         }
+        // Nothing more will be written: tell the peer. Only some write halves
+        // do that when dropped (`OwnedWriteHalf`); with others (TLS streams,
+        // pipes, `tokio::io::split`) the peer would not see the end of the
+        // stream until the whole connection is dropped.
+        let _ = tokio::time::timeout(WRITER_DRAIN_GRACE, framed.into_inner().shutdown()).await;
     }
 
     /// Bridge task: receives payload and control frames, sequences payloads,
@@ -825,6 +1014,7 @@ impl SharedPeerManager {
     /// Control frames get priority (biased select). Payload frames are assigned
     /// a sequence_id from the per-dataflow counter before being sent to the
     /// least-loaded connection.
+    #[allow(clippy::too_many_arguments)]
     async fn bridge_task(
         pool: Arc<PeerPool>,
         writer_channels: Arc<TokioMutex<HashMap<usize, tokio_mpsc::Sender<Frame>>>>,
@@ -833,6 +1023,7 @@ impl SharedPeerManager {
         mut control_rx: tokio_mpsc::Receiver<Frame>,
         health_tx: tokio::sync::broadcast::Sender<crate::runtime_event::RuntimeEvent>,
         peer_node_id: String,
+        flush_barriers: FlushBarriers,
     ) {
         let mut control_open = true;
         let mut payload_open = true;
@@ -871,32 +1062,45 @@ impl SharedPeerManager {
                 result = payload_rx.recv(), if payload_open => {
                     match result {
                         Some((dataflow_id, mut frame)) => {
+                            // Flush barrier: every frame queued before it has
+                            // been processed. Wake the waiter; never sent.
+                            if frame.channel_id == FLUSH_BARRIER_CHANNEL_ID {
+                                let token = <[u8; 8]>::try_from(frame.payload.as_slice())
+                                    .map(u64::from_le_bytes);
+                                if let (Ok(token), Ok(mut barriers)) =
+                                    (token, flush_barriers.lock().or_poison("flush barriers"))
+                                {
+                                    if let Some(waiter) = barriers.remove(&token) {
+                                        let _ = waiter.send(());
+                                    }
+                                }
+                                continue;
+                            }
                             // The receiver handles the control and probe channels
                             // outside the sequenced lane. A payload frame on one of
                             // them would consume a sequence number the receiver
                             // never sees, stalling the dataflow's lane behind a
                             // permanent gap — reject it without sequencing.
                             if frame.channel_id == CONTROL_CHANNEL_ID
-                                || frame.channel_id == PROBE_CHANNEL_ID
+                                    || frame.channel_id == PROBE_CHANNEL_ID
                             {
-                                #[cfg(feature = "tracing")]
-                                tracing::error!(
-                                    channel_id = frame.channel_id,
-                                    "payload frame on a reserved channel rejected"
-                                );
-                                let state = reg_state.lock().await;
-                                if let Some(reg) = state.registered.get(&dataflow_id) {
-                                    let _ = reg.error_tx.try_send(TransportError::ReservedChannel {
-                                        channel_id: frame.channel_id,
-                                    });
-                                }
-                                continue;
+                                    #[cfg(feature = "tracing")]
+                                    tracing::error!(
+                                        channel_id = frame.channel_id,
+                                        "payload frame on a reserved channel rejected"
+                                    );
+                                    let state = reg_state.lock().await;
+                                    if let Some(reg) = state.registered.get(&dataflow_id) {
+                                        let _ = reg.error_tx.try_send(TransportError::ReservedChannel {
+                                            channel_id: frame.channel_id,
+                                        });
+                                    }
+                                    continue;
                             }
                             // The sequence number comes from `dataflow_id`'s counter,
                             // so the frame must be delivered to that dataflow's
                             // reorder buffer.
                             frame.dataflow_id = dataflow_id;
-
                             // Verify dataflow is still registered before proceeding
                             {
                                 let state = reg_state.lock().await;
@@ -1366,7 +1570,7 @@ impl SharedPeerManager {
         dispatch_locks: Arc<TokioMutex<HashMap<DataflowId, Arc<TokioMutex<()>>>>>,
         scaling_driver: Arc<ScalingDriver>,
         failure_tx: tokio_mpsc::Sender<usize>,
-        task_handles: Arc<Mutex<Vec<tokio::task::JoinHandle<()>>>>,
+        task_handles: Arc<TaskHandles>,
         crc_enabled: bool,
     ) {
         while let Some(event) = event_rx.recv().await {
@@ -2070,6 +2274,242 @@ mod tests {
         // Probe channel ID should not conflict with normal channels
         assert_eq!(PROBE_CHANNEL_ID, u64::MAX);
         assert_ne!(PROBE_CHANNEL_ID, 0); // not control
+    }
+
+    #[test]
+    fn flush_barrier_id_collides_with_nothing() {
+        use crate::communication::interprocess::PROGRESS_CHANNEL_ID as INTERPROCESS_PROGRESS;
+        for other in [PROBE_CHANNEL_ID, CONTROL_CHANNEL_ID, INTERPROCESS_PROGRESS] {
+            assert_ne!(FLUSH_BARRIER_CHANNEL_ID, other);
+        }
+    }
+
+    #[tokio::test]
+    async fn register_rejects_the_flush_barrier_channel() {
+        let (manager_stream, _test_stream) = duplex(1 << 16);
+        let (mgr_read, mgr_write) = tokio::io::split(manager_stream);
+        let config = SharedConnectionConfig {
+            probe_interval: Duration::from_secs(999),
+            ..Default::default()
+        };
+        let rt = tokio::runtime::Handle::current();
+        let factory: Arc<dyn DynConnectionFactory> =
+            Arc::new(PreEstablishedFactory::new(vec![(mgr_read, mgr_write)]));
+        let manager =
+            SharedPeerManager::new("peer".to_string(), config, factory, &rt, health_tx()).unwrap();
+        let result = manager
+            .register_dataflow(DataflowId::new(), &[1, FLUSH_BARRIER_CHANNEL_ID], 4)
+            .await;
+        assert!(
+            matches!(result, Err(TransportError::InvalidRegistration { .. })),
+            "the flush-barrier id must not be registrable"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn flush_then_unregister_delivers_every_queued_frame() {
+        assert_ne!(FLUSH_BARRIER_CHANNEL_ID, PROBE_CHANNEL_ID);
+        assert_ne!(FLUSH_BARRIER_CHANNEL_ID, CONTROL_CHANNEL_ID);
+        let (manager_stream, test_stream) = duplex(1 << 20);
+        let (mgr_read, mgr_write) = tokio::io::split(manager_stream);
+        let config = SharedConnectionConfig {
+            probe_interval: Duration::from_secs(999),
+            ..Default::default()
+        };
+        let rt = tokio::runtime::Handle::current();
+        let factory: Arc<dyn DynConnectionFactory> =
+            Arc::new(PreEstablishedFactory::new(vec![(mgr_read, mgr_write)]));
+        let manager =
+            SharedPeerManager::new("peer-1".to_string(), config, factory, &rt, health_tx())
+                .unwrap();
+        let df_id = DataflowId::new();
+        let _receivers = manager.register_dataflow(df_id, &[1], 16).await;
+        for i in 0..200u8 {
+            let frame = Frame {
+                dataflow_id: df_id,
+                channel_id: 1,
+                payload: vec![i],
+            };
+            manager.payload_sender().send((df_id, frame)).await.unwrap();
+        }
+        manager.flush_dataflow(&df_id).await;
+        manager.unregister_dataflow(&df_id).await;
+
+        let mut reader = FramedReader::new(test_stream);
+        for i in 0..200u8 {
+            let frame = tokio::time::timeout(Duration::from_secs(5), reader.read_frame())
+                .await
+                .expect("frame queued before the flush was dropped")
+                .unwrap();
+            assert_eq!(frame.channel_id, 1);
+            assert_eq!(&frame.payload[8..], &[i]);
+        }
+        // The barrier itself never goes on the wire.
+        assert!(
+            tokio::time::timeout(Duration::from_millis(200), reader.read_frame())
+                .await
+                .is_err()
+        );
+    }
+
+    /// Frames the bridge already handed to a connection writer survive the
+    /// manager being released, whether it is closed (waiting for its writers)
+    /// or simply dropped (writers finish in the background).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn releasing_the_manager_lets_writers_finish_queued_frames() {
+        for close in [true, false] {
+            // A tiny pipe: the writer blocks after a frame or two, so most
+            // frames are still queued on it when the manager is released.
+            let (manager_stream, test_stream) = duplex(64);
+            let (mgr_read, mgr_write) = tokio::io::split(manager_stream);
+            let config = SharedConnectionConfig {
+                probe_interval: Duration::from_secs(999),
+                ..Default::default()
+            };
+            let rt = tokio::runtime::Handle::current();
+            let factory: Arc<dyn DynConnectionFactory> =
+                Arc::new(PreEstablishedFactory::new(vec![(mgr_read, mgr_write)]));
+            let manager =
+                SharedPeerManager::new("peer-1".to_string(), config, factory, &rt, health_tx())
+                    .unwrap();
+            let df_id = DataflowId::new();
+            let _receivers = manager.register_dataflow(df_id, &[1], 16).await;
+            for i in 0..100u8 {
+                let frame = Frame {
+                    dataflow_id: df_id,
+                    channel_id: 1,
+                    payload: vec![i; 32],
+                };
+                manager.payload_sender().send((df_id, frame)).await.unwrap();
+            }
+            manager.flush_dataflow(&df_id).await;
+            manager.unregister_dataflow(&df_id).await;
+            let reading = tokio::spawn(async move {
+                let mut reader = FramedReader::new(test_stream);
+                let mut got = Vec::new();
+                while got.len() < 100 {
+                    match tokio::time::timeout(Duration::from_secs(5), reader.read_frame()).await {
+                        Ok(Ok(frame)) => got.push(frame.payload[8]),
+                        _ => break,
+                    }
+                }
+                got
+            });
+            if close {
+                manager.close(Duration::from_secs(5)).await;
+            } else {
+                drop(manager);
+            }
+            let got = reading.await.unwrap();
+            assert_eq!(
+                got,
+                (0..100u8).collect::<Vec<_>>(),
+                "close={close}: queued frames were lost"
+            );
+        }
+    }
+
+    /// Over TCP, a released manager whose peer is still sending keeps reading
+    /// until the peer closes: releasing the read half with unread data would
+    /// make the OS reset the connection and could destroy the frames the
+    /// manager wrote last before the peer reads them.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn released_manager_keeps_reading_so_its_last_frames_survive() {
+        for close in [true, false, true, false] {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = listener.local_addr().unwrap();
+            let (accepted, ours) =
+                tokio::try_join!(listener.accept(), tokio::net::TcpStream::connect(addr)).unwrap();
+            let (peer_read, peer_write) = accepted.0.into_split();
+            let config = SharedConnectionConfig {
+                probe_interval: Duration::from_secs(999),
+                ..Default::default()
+            };
+            let rt = tokio::runtime::Handle::current();
+            let factory: Arc<dyn DynConnectionFactory> =
+                Arc::new(PreEstablishedFactory::new(vec![ours.into_split()]));
+            let manager =
+                SharedPeerManager::new("peer-1".to_string(), config, factory, &rt, health_tx())
+                    .unwrap();
+            let df_id = DataflowId::new();
+            let _receivers = manager.register_dataflow(df_id, &[1], 16).await;
+            // The peer keeps sending frames nobody here consumes.
+            let flood = tokio::spawn(async move {
+                let mut writer = FramedWriter::new(peer_write);
+                let frame = Frame {
+                    dataflow_id: DataflowId::new(),
+                    channel_id: 7,
+                    payload: vec![0; 4096],
+                };
+                while writer.write_frame(&frame).await.is_ok() {}
+            });
+            manager
+                .payload_sender()
+                .send((
+                    df_id,
+                    Frame {
+                        dataflow_id: df_id,
+                        channel_id: 1,
+                        payload: b"last".to_vec(),
+                    },
+                ))
+                .await
+                .unwrap();
+            manager.flush_dataflow(&df_id).await;
+            manager.unregister_dataflow(&df_id).await;
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            if close {
+                manager.close(Duration::from_secs(5)).await;
+            } else {
+                drop(manager);
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            let mut reader = FramedReader::new(peer_read);
+            let got_last = tokio::time::timeout(Duration::from_secs(5), async {
+                loop {
+                    match reader.read_frame().await {
+                        Ok(frame) if frame.payload.ends_with(b"last") => return true,
+                        Ok(_) => {}
+                        Err(_) => return false,
+                    }
+                }
+            })
+            .await;
+            flood.abort();
+            assert_eq!(
+                got_last,
+                Ok(true),
+                "close={close}: the manager's last frame was lost"
+            );
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn flush_without_connections_returns() {
+        let factory: Arc<dyn DynConnectionFactory> = Arc::new(EchoConnectionFactory::default());
+        let rt = tokio::runtime::Handle::current();
+        let manager = SharedPeerManager::new(
+            "peer-1".to_string(),
+            SharedConnectionConfig::default(),
+            factory,
+            &rt,
+            health_tx(),
+        )
+        .unwrap();
+        let df_id = DataflowId::new();
+        let frame = Frame {
+            dataflow_id: df_id,
+            channel_id: 1,
+            payload: vec![1],
+        };
+        manager.payload_sender().send((df_id, frame)).await.unwrap();
+        tokio::time::timeout(Duration::from_secs(5), manager.flush_dataflow(&df_id))
+            .await
+            .expect("flush must not wait for a connection");
+        assert!(manager.flush_barriers.lock().unwrap().is_empty());
+        // A flush abandoned by its caller leaves no waiter behind.
+        let _ = tokio::time::timeout(Duration::ZERO, manager.flush_dataflow(&df_id)).await;
+        assert!(manager.flush_barriers.lock().unwrap().is_empty());
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

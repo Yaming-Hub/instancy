@@ -530,6 +530,66 @@ mod tokio_impl {
                 }
             }
         }
+
+        /// Like [`run`](Self::run), but keeps reading (and discarding frames
+        /// nobody receives any more) until the peer closes the connection,
+        /// even after every channel is gone, and stops only `linger` after
+        /// `closed` fires.
+        ///
+        /// The read half of a connection must not be released while the peer
+        /// may still be sending: closing a socket with unread data makes the
+        /// OS reset the connection, which can destroy frames this node wrote
+        /// last (an acknowledgement, an end-of-stream marker, a `Cancel`)
+        /// before the peer has read them.
+        pub async fn run_lingering(
+            mut self,
+            closed: tokio_util::sync::CancellationToken,
+            linger: std::time::Duration,
+        ) -> Result<(), TransportError> {
+            /// How often (in frames) a peer that never lets this task block
+            /// is checked against the linger deadline.
+            const CHECK_EVERY: u32 = 64;
+            // The read and the send usually complete at once; `expired` is
+            // only polled (it takes locks) when this task would block anyway.
+            let expired = async {
+                closed.cancelled().await;
+                tokio::time::sleep(linger).await;
+            };
+            tokio::pin!(expired);
+            let mut frames: u32 = 0;
+            let mut deadline = None;
+            loop {
+                let frame = tokio::select! {
+                    biased;
+                    frame = self.reader.read_frame() => match frame {
+                        Ok(f) => f,
+                        Err(TransportError::ConnectionClosed) => return Ok(()),
+                        Err(e) => return Err(e),
+                    },
+                    _ = &mut expired => return Ok(()),
+                };
+                frames = frames.wrapping_add(1);
+                if frames % CHECK_EVERY == 0 {
+                    if deadline.is_none() && closed.is_cancelled() {
+                        deadline = Some(tokio::time::Instant::now() + linger);
+                    }
+                    if deadline.is_some_and(|d| tokio::time::Instant::now() >= d) {
+                        return Ok(());
+                    }
+                }
+                let key = (frame.dataflow_id, frame.channel_id);
+                if let Some(tx) = self.channels.get(&key) {
+                    let sent = tokio::select! {
+                        biased;
+                        sent = tx.send(frame.payload) => sent,
+                        _ = &mut expired => return Ok(()),
+                    };
+                    if sent.is_err() {
+                        self.channels.remove(&key);
+                    }
+                }
+            }
+        }
     }
 
     /// A multiplexer that collects frames from multiple channel senders and
@@ -1194,6 +1254,73 @@ mod transport_tests {
         hb.await.unwrap().unwrap();
         da.await.unwrap().unwrap();
         db.await.unwrap().unwrap();
+    }
+
+    /// A released demuxer must stop `linger` after `closed` even when the
+    /// peer keeps sending so fast that reading never blocks.
+    #[test]
+    fn lingering_demuxer_stops_even_if_reading_never_blocks() {
+        use std::task::Poll;
+        use tokio::io::{AsyncRead, ReadBuf};
+
+        /// Serves the same encoded frame forever, always ready.
+        struct Endless {
+            frame: Vec<u8>,
+            at: usize,
+        }
+
+        impl AsyncRead for Endless {
+            fn poll_read(
+                mut self: std::pin::Pin<&mut Self>,
+                _: &mut std::task::Context<'_>,
+                buf: &mut ReadBuf<'_>,
+            ) -> Poll<std::io::Result<()>> {
+                while buf.remaining() > 0 {
+                    let at = self.at;
+                    let n = buf.remaining().min(self.frame.len() - at);
+                    buf.put_slice(&self.frame[at..at + n]);
+                    self.at = (at + n) % self.frame.len();
+                }
+                Poll::Ready(Ok(()))
+            }
+        }
+
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let rt = tokio::runtime::Builder::new_multi_thread()
+                .worker_threads(2)
+                .enable_all()
+                .build()
+                .unwrap();
+            let result = rt.block_on(async {
+                let mut writer = FramedWriter::new(Vec::new());
+                let frame = Frame {
+                    dataflow_id: DataflowId::from_bytes([1u8; 16]),
+                    channel_id: 1,
+                    payload: vec![0; 16],
+                };
+                writer.write_frame(&frame).await.unwrap();
+                let demuxer = Demuxer::new(
+                    Endless {
+                        frame: writer.into_inner(),
+                        at: 0,
+                    },
+                    DemuxConfig { channel_buffer: 4 },
+                );
+                let closed = tokio_util::sync::CancellationToken::new();
+                closed.cancel();
+                tokio::spawn(demuxer.run_lingering(closed, std::time::Duration::from_millis(100)))
+                    .await
+                    .unwrap()
+            });
+            let _ = done_tx.send(result.is_ok());
+        });
+        let stopped = done_rx.recv_timeout(std::time::Duration::from_secs(10));
+        assert_eq!(
+            stopped,
+            Ok(true),
+            "the demuxer kept reading past its linger"
+        );
     }
 
     #[cfg(feature = "transport")]

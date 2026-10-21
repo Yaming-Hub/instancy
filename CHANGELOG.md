@@ -28,6 +28,71 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   again to peers that had already accepted it when the documented retry
   follows backpressure from another peer.
 
+### Graceful cluster teardown
+
+- A cluster node no longer tears down while peers still need its frames. Each
+  node ends every cross-node stream with an in-band end-of-stream marker
+  (data close sentinels and a new progress end-of-stream frame), peers
+  acknowledge it with a new in-band acknowledgement frame (ordered behind
+  their data), and a per-dataflow lifecycle task owns the transport, bridges
+  and shared-manager registration until every link is retired. Final progress
+  deltas queued behind congestion are no longer dropped, a peer's clean close
+  no longer stops a slower node's bridges to third nodes, and shared mode no
+  longer discards frames queued for a dataflow that finished first.
+- Close sentinels on network data channels are delivered reliably instead of
+  being dropped when the per-peer queue is full (broadcast no longer hangs).
+- **BREAKING:** Cross-node data loss is never silent. Records pushed to a
+  peer that has already finished, and records that reach a node after the
+  operator they are addressed to finished, fail the dataflow with the new
+  `CommunicationError::DataLoss` variant (downstream exhaustive matches must
+  handle it). A premature completion elsewhere in the cluster now makes some
+  node fail instead of every node returning `Ok` with missing output.
+- A link that fails while a node's workers are still running (EOF, corrupt
+  frame or control message, send failure, transport error) now cancels the
+  dataflow on that node and on every reachable peer, instead of silently
+  tearing down the node's network while its workers keep running. An EOF or
+  send failure on part of a link escalates once the whole link has closed,
+  or after `handshake_timeout` if it never does. Frames dropped by a failed
+  send are reported as data loss if the peer or the local workers finish
+  without them, and a dedicated connection whose writer failed is kept open
+  until teardown instead of being half-closed. A push whose queue to a peer
+  that has not finished is closed now waits (as for a full queue) for the
+  dataflow to be cancelled with the actual cause (the peer's `Cancel` or the
+  link failure) instead of failing the operator with `ChannelClosed`.
+- Connections are closed without losing their last frames. A node that
+  releases a connection writes what is queued, shuts its write half down
+  (so the peer sees the end of the stream at once, also over split TLS or
+  pipe halves, whose drop sends nothing) and keeps reading until the peer
+  closes its side (at most 10 s), instead of closing a TCP socket with
+  unread data, which resets the connection and can destroy the frames the
+  peer has not read yet. A per-job shared manager released by a dataflow's
+  teardown first writes everything queued on it (bounded by
+  `handshake_timeout`) instead of aborting its writers.
+- `ClusterCompletion` resolves once the local workers have finished and the
+  shutdown handshake has completed (each peer has received this node's
+  frames or has finished itself). Its result is the local workers' result,
+  or `CommunicationError::DataLoss` (see above). Blocking waits
+  (`join_blocking`, `wait`) need the transport's tokio runtime to keep
+  running: on a worker thread of a multi-thread runtime they use
+  `block_in_place` (workers are recognised by their thread names), so
+  they work with a single worker thread or with every worker waiting; when
+  the caller is inside a `current_thread` runtime, or the transport runs on
+  one, that is not making progress (e.g. the caller is the thread driving
+  it), they return `RuntimeError::InvalidConfig` promptly instead of
+  deadlocking.
+- Dropping an unresolved `ClusterCompletion` now detaches it: the dataflow
+  keeps running with its network intact (previously the network was cut while
+  local workers kept running). Dropping `ClusterSpawnedDataflow` without
+  `join()`, or calling `cancel()`, still cancels the dataflow cluster-wide.
+- A node whose workers still succeed after a cancellation (e.g. with
+  `drain_on_cancel`) no longer waits forever for a peer that cancelled and
+  tore down, and flushes its queued frames before unregistering, so a peer
+  that is still draining receives its final progress.
+- Wire protocol: new progress end-of-stream and acknowledgement frames
+  (reserved progress counts `u32::MAX` and `u32::MAX - 1`).
+  `CLUSTER_PROTOCOL_VERSION` is now 3, so the handshake rejects peers that
+  lack them; nodes must run the same version.
+
 ### Input contract hardening
 
 - **BREAKING:** Invalid input/frontier sequences that were previously accepted
@@ -60,8 +125,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Cluster protocol and topology hardening
 
-**BREAKING (wire format):** this release speaks cluster protocol version 2
-(`instancy::communication::CLUSTER_PROTOCOL_VERSION`). Nodes running 0.1.x
+**BREAKING (wire format):** this release speaks cluster protocol version 3
+(`instancy::communication::CLUSTER_PROTOCOL_VERSION`; version 2 added the
+changes below, version 3 the shutdown handshake frames described under
+"Graceful cluster teardown"). Nodes running 0.1.x
 cannot join a cluster with nodes running this release; without frame CRC the
 handshake rejects them with `HandshakeError::ProtocolVersionMismatch` (an
 unversioned 0.1.x handshake is reported as version 1). With

@@ -1126,6 +1126,29 @@ async fn future_version_peer_is_rejected_with_version_error() {
     );
 }
 
+/// A peer on cluster protocol version 2 (versioned handshake, but no clean
+/// shutdown handshake frames) sends a well-formed handshake: it must be
+/// rejected, since it would neither send nor understand the end-of-stream
+/// markers and acknowledgements that teardown waits for.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn version_2_peer_without_shutdown_handshake_is_rejected() {
+    assert_eq!(instancy::communication::CLUSTER_PROTOCOL_VERSION, 3);
+    let err = spawn_against_fake_peer(|df| {
+        let mut p = vec![0u8];
+        p.extend_from_slice(&2u32.to_le_bytes());
+        p.extend_from_slice(&0u64.to_le_bytes());
+        p.extend_from_slice(df.as_bytes());
+        p.extend_from_slice(&6u32.to_le_bytes());
+        p.extend_from_slice(b"node-b");
+        with_crc(p)
+    })
+    .await;
+    assert!(
+        err.contains("protocol version mismatch") && err.contains("remote=2"),
+        "{err}"
+    );
+}
+
 /// A current-version peer that claims to be a different node.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn peer_claiming_another_identity_is_rejected() {
@@ -1300,7 +1323,6 @@ async fn matching_graphs_three_nodes_complete_dedicated() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
-#[ignore = "flaky until early-finisher teardown is fixed (audit C6): in Shared mode the node that finishes first unregisters the dataflow and drops its queued final frames, so a 3-node peer can hang"]
 async fn matching_graphs_three_nodes_complete_shared() {
     matching_exchange_completes(Mode::Shared, &["node-a", "node-b", "node-c"]).await;
 }

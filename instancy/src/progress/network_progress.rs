@@ -9,8 +9,8 @@
 //! Send path:
 //!   ProgressSender::send()
 //!     → serialize Vec<ProgressChange<T>> into bytes
-//!     → UnboundedSender<Frame> (never fails)
-//!     → [send bridge task] awaits on bounded TransportSession progress channel
+//!     → PeerOutbox (unbounded, ordered per peer; never fails)
+//!     → [outbox forwarder task] awaits on the bounded transport payload channel
 //!     → [TransportSession bridge] writes to TCP with priority ordering
 //!
 //! Receive path:
@@ -23,9 +23,26 @@
 //! # Reliability
 //!
 //! Progress deltas are **non-idempotent** — losing a delta corrupts global
-//! frontier state. The send path uses an unbounded intermediary channel
-//! so `ProgressSender::send()` never drops frames. The bridge task handles
-//! backpressure to the bounded transport layer via async await.
+//! frontier state. The send path queues frames on the per-peer
+//! [`PeerOutbox`](crate::communication::peer_link::PeerOutbox) lane, so
+//! `ProgressSender::send()` never drops frames and the forwarder applies
+//! backpressure to the bounded transport layer via async await. The lane is
+//! drained even after the dataflow completes; it is never cut short by
+//! cancellation.
+//!
+//! # End of stream
+//!
+//! When all local workers have finished successfully, the cluster lifecycle
+//! coordinator sends one end-of-stream frame
+//! ([`encode_progress_end_of_stream`]) on every progress channel to every
+//! peer, behind everything else on the lane. A receive bridge that sees it
+//! reports [`LinkEvent::ProgressEndOfStream`] and exits. The acknowledgement
+//! of a peer's complete end-of-stream ([`encode_progress_ack`]) also travels
+//! on a progress channel, so it is ordered behind the sender's data; the
+//! receive bridge reports it as [`LinkEvent::AckReceived`]. A channel that
+//! ends (EOF), or fails to decode, before its end-of-stream marker is reported
+//! as [`LinkEvent::ProgressChannelEnded`]; the coordinator decides whether
+//! that is benign (the link was already retired) or a failure.
 
 #[cfg(feature = "transport")]
 use std::collections::{HashMap, VecDeque};
@@ -37,6 +54,10 @@ use tokio::sync::mpsc as tokio_mpsc;
 
 #[cfg(feature = "transport")]
 use crate::communication::codec::{Codec, CodecError, ExchangeData};
+#[cfg(feature = "transport")]
+use crate::communication::peer_link::{
+    LifecycleEventSender, LinkEvent, LinkFailure, PeerOutbox, report_link_event,
+};
 #[cfg(feature = "transport")]
 use crate::communication::transport::Frame;
 #[cfg(feature = "transport")]
@@ -93,8 +114,9 @@ pub fn encode_progress_batch<T: Timestamp + ExchangeData>(
     bufs: &mut Vec<Vec<u8>>,
     max_batch_size: usize,
 ) -> Result<(), CodecError> {
-    // Cap at u32::MAX since the wire format uses a u32 count field.
-    let effective_max = max_batch_size.min(u32::MAX as usize).max(1);
+    // Cap below the reserved counts: the wire format uses a u32 count field,
+    // and `u32::MAX` / `u32::MAX - 1` mark end-of-stream / acknowledgement.
+    let effective_max = max_batch_size.min(PROGRESS_ACK_COUNT as usize - 1).max(1);
 
     // Handle empty batch: still emit one frame with count=0 + CRC.
     if changes.is_empty() {
@@ -256,50 +278,87 @@ pub fn decode_progress_batch<T: Timestamp + ExchangeData>(
     Ok(changes)
 }
 
+/// Count value reserved for the progress end-of-stream marker.
+#[cfg(feature = "transport")]
+pub(crate) const PROGRESS_END_OF_STREAM_COUNT: u32 = u32::MAX;
+
+/// Count value reserved for the end-of-stream acknowledgement.
+#[cfg(feature = "transport")]
+pub(crate) const PROGRESS_ACK_COUNT: u32 = u32::MAX - 1;
+
+/// Encode a marker frame: `[count][crc32]` with a reserved count.
+#[cfg(feature = "transport")]
+fn encode_progress_marker(count: u32) -> Vec<u8> {
+    let mut buf = count.to_le_bytes().to_vec();
+    let crc = crc32fast::hash(&buf);
+    buf.extend_from_slice(&crc.to_le_bytes());
+    buf
+}
+
+/// Encode the end-of-stream marker for a progress channel.
+///
+/// Wire format: `[count = u32::MAX][crc32]`. Real batches never use this
+/// count (the encoder caps batches below the reserved counts), so the marker
+/// is unambiguous. It is the last frame a node sends on a progress channel
+/// during a clean shutdown.
+#[cfg(feature = "transport")]
+pub(crate) fn encode_progress_end_of_stream() -> Vec<u8> {
+    encode_progress_marker(PROGRESS_END_OF_STREAM_COUNT)
+}
+
+/// Encode the acknowledgement of a peer's complete end-of-stream.
+///
+/// Wire format: `[count = u32::MAX - 1][crc32]`. It travels on the sender's
+/// payload lane, so the receiver sees it only after every data frame the
+/// sender queued before it.
+#[cfg(feature = "transport")]
+pub(crate) fn encode_progress_ack() -> Vec<u8> {
+    encode_progress_marker(PROGRESS_ACK_COUNT)
+}
+
+/// A decoded progress-channel frame.
+#[cfg(feature = "transport")]
+#[derive(Debug, PartialEq)]
+pub(crate) enum ProgressFrame<T> {
+    /// A batch of progress changes.
+    Batch(Vec<ProgressChange<T>>),
+    /// The sender will send nothing more on this channel.
+    EndOfStream,
+    /// The sender has received our complete end-of-stream.
+    Ack,
+}
+
+/// Decode a progress-channel frame: a batch, the end-of-stream marker or the
+/// acknowledgement.
+#[cfg(feature = "transport")]
+pub(crate) fn decode_progress_frame<T: Timestamp + ExchangeData>(
+    data: &[u8],
+    max_batch_size: usize,
+) -> Result<ProgressFrame<T>, CodecError> {
+    let marker = |count: u32| data.len() == 8 && data[..4] == count.to_le_bytes();
+    let is_end_of_stream = marker(PROGRESS_END_OF_STREAM_COUNT);
+    if is_end_of_stream || marker(PROGRESS_ACK_COUNT) {
+        let expected_crc =
+            wire::read_u32(data, 4).map_err(|e| CodecError::InvalidData(e.to_string()))?;
+        let actual_crc = crc32fast::hash(&data[..4]);
+        if actual_crc != expected_crc {
+            return Err(CodecError::CrcMismatch {
+                expected: expected_crc,
+                actual: actual_crc,
+            });
+        }
+        return Ok(if is_end_of_stream {
+            ProgressFrame::EndOfStream
+        } else {
+            ProgressFrame::Ack
+        });
+    }
+    decode_progress_batch(data, max_batch_size).map(ProgressFrame::Batch)
+}
+
 // ---------------------------------------------------------------------------
 // Bridge tasks
 // ---------------------------------------------------------------------------
-
-/// Bridge task: forwards frames from an unbounded intermediary channel
-/// to the TransportSession's bounded progress channel.
-///
-/// This provides backpressure to the transport layer while keeping
-/// `ProgressSender::send()` non-blocking and reliable.
-///
-/// If the transport session closes (send fails), the dataflow is cancelled
-/// via the shared `CancellationToken` because any frames still queued
-/// represent non-idempotent progress deltas that would be lost.
-#[cfg(feature = "transport")]
-async fn progress_send_bridge(
-    mut rx: tokio_mpsc::UnboundedReceiver<Frame>,
-    session_tx: crate::communication::cluster_transport::FrameSender,
-    cancel: tokio_util::sync::CancellationToken,
-    peer_id: String,
-) {
-    loop {
-        tokio::select! {
-            biased;
-            _ = cancel.cancelled() => break,
-            frame = rx.recv() => match frame {
-                Some(frame) => {
-                    if session_tx.send(frame).await.is_err() {
-                        #[cfg(feature = "tracing")]
-                        tracing::error!(
-                            peer = %peer_id,
-                            "progress send bridge: transport session closed, cancelling dataflow"
-                        );
-                        cancel.cancel();
-                        break;
-                    }
-                }
-                None => {
-                    // All senders dropped — normal shutdown path.
-                    break;
-                }
-            }
-        }
-    }
-}
 
 /// Bridge task: reads serialized progress frames from a Demuxer channel,
 /// deserializes them, and pushes into the local SharedBuffer for the
@@ -308,11 +367,14 @@ async fn progress_send_bridge(
 /// Wakes the target worker on each received batch so the executor
 /// processes the incoming progress updates promptly.
 ///
-/// On decode error or connection drop, cancels the dataflow via the
-/// shared `CancellationToken`. Connection drop (`rx.recv()` returning
-/// `None`) means the peer is gone and any in-flight deltas may be lost,
-/// which is fatal for non-idempotent progress tracking.
+/// Exits after the end-of-stream marker (reported as
+/// [`LinkEvent::ProgressEndOfStream`]). If the channel closes, a frame fails
+/// to decode, or the buffer lock is poisoned before that marker, the bridge
+/// reports [`LinkEvent::ProgressChannelEnded`] and exits; the lifecycle
+/// coordinator decides whether that is a failure. `cancel` stops the bridge
+/// during teardown.
 #[cfg(feature = "transport")]
+#[allow(clippy::too_many_arguments)]
 async fn progress_recv_bridge<T: Timestamp + ExchangeData>(
     mut rx: tokio_mpsc::Receiver<Vec<u8>>,
     buffer: Arc<Mutex<SharedBuffer<T>>>,
@@ -321,56 +383,46 @@ async fn progress_recv_bridge<T: Timestamp + ExchangeData>(
     peer_id: String,
     channel_id: u64,
     max_batch_size: usize,
+    events: LifecycleEventSender,
 ) {
-    loop {
+    let _ = channel_id;
+    let failure = loop {
         tokio::select! {
             biased;
-            _ = cancel.cancelled() => break,
+            _ = cancel.cancelled() => return,
             data = rx.recv() => match data {
-                Some(bytes) => {
-                    match decode_progress_batch::<T>(&bytes, max_batch_size) {
-                        Ok(changes) => {
-                            if !changes.is_empty() {
-                                {
-                                    let mut buf = match buffer.lock().or_poison("progress buffer") {
-                                        Ok(buf) => buf,
-                                        Err(_) => {
-                                            // TODO: propagate poisoned progress-buffer locks once bridge tasks can return Result.
-                                            cancel.cancel();
-                                            break;
-                                        }
-                                    };
-                                    buf.queue.push_back(changes);
-                                }
-                                wake_handle.notify();
+                Some(bytes) => match decode_progress_frame::<T>(&bytes, max_batch_size) {
+                    Ok(ProgressFrame::Batch(changes)) => {
+                        if !changes.is_empty() {
+                            match buffer.lock().or_poison("progress buffer") {
+                                Ok(mut buf) => buf.queue.push_back(changes),
+                                Err(_) => break LinkFailure::LockPoisoned,
                             }
-                        }
-                        Err(e) => {
-                            #[cfg(feature = "tracing")]
-                            tracing::error!(
-                                %peer_id,
-                                channel_id,
-                                "Fatal: progress decode error: {e}"
-                            );
-                            cancel.cancel();
-                            break;
+                            wake_handle.notify();
                         }
                     }
-                }
-                None => {
-                    // Connection to peer lost — progress deltas may have been lost.
-                    #[cfg(feature = "tracing")]
-                    tracing::error!(
-                        %peer_id,
-                        channel_id,
-                        "progress recv bridge: peer connection lost, cancelling dataflow"
-                    );
-                    cancel.cancel();
-                    break;
-                }
+                    Ok(ProgressFrame::EndOfStream) => {
+                        report_link_event(&events, &peer_id, LinkEvent::ProgressEndOfStream);
+                        return;
+                    }
+                    Ok(ProgressFrame::Ack) => {
+                        report_link_event(&events, &peer_id, LinkEvent::AckReceived);
+                    }
+                    Err(e) => {
+                        #[cfg(feature = "tracing")]
+                        tracing::error!(
+                            %peer_id,
+                            channel_id,
+                            "progress recv bridge: decode error: {e}"
+                        );
+                        break LinkFailure::Decode(e.to_string());
+                    }
+                },
+                None => break LinkFailure::ChannelClosed,
             }
         }
-    }
+    };
+    report_link_event(&events, &peer_id, LinkEvent::ProgressChannelEnded(failure));
 }
 
 // ---------------------------------------------------------------------------
@@ -396,11 +448,12 @@ pub fn progress_channel_id(
 // Factory: create network progress channels
 // ---------------------------------------------------------------------------
 
-/// Holds background task handles for network progress bridges.
+/// Holds background task handles for network progress receive bridges.
 ///
 /// On drop, cancels the shared `CancellationToken` (signalling all bridges
-/// to stop) and then aborts any remaining tasks. This ensures graceful
-/// shutdown when the dataflow is still active, and prevents leaked tasks.
+/// to stop) and then aborts any remaining tasks. Send-side forwarding lives
+/// in the per-peer [`PeerOutbox`] forwarders, which are owned separately so
+/// that they can drain after the receive side is torn down.
 ///
 /// # Important
 ///
@@ -410,7 +463,6 @@ pub fn progress_channel_id(
 #[must_use = "dropping NetworkProgressHandles cancels progress exchange"]
 pub struct NetworkProgressHandles {
     cancel: tokio_util::sync::CancellationToken,
-    send_handles: Vec<tokio::task::JoinHandle<()>>,
     recv_handles: Vec<tokio::task::JoinHandle<()>>,
 }
 
@@ -420,9 +472,6 @@ impl Drop for NetworkProgressHandles {
         // Signal all bridges to shut down gracefully first.
         self.cancel.cancel();
         // Then abort any that haven't exited yet.
-        for h in &self.send_handles {
-            h.abort();
-        }
         for h in &self.recv_handles {
             h.abort();
         }
@@ -433,9 +482,10 @@ impl Drop for NetworkProgressHandles {
 /// progress exchange.
 ///
 /// This function creates:
-/// - **Network senders** for each `(local_worker, remote_worker)` pair,
-///   with one send bridge task per remote peer (shared by all local workers
-///   sending to that peer).
+/// - **Network senders** for each `(local_worker, remote_worker)` pair. They
+///   queue frames on the peer's [`PeerOutbox`] (shared by all local workers
+///   sending to that peer), so data, close sentinels and progress to a peer
+///   stay in one ordered lane.
 /// - **Receiver bridges** for each `(remote_worker, local_worker)` pair,
 ///   reading from TransportSession's Demuxer channels, deserializing, and
 ///   pushing into SharedBuffers with wake notification.
@@ -446,7 +496,7 @@ impl Drop for NetworkProgressHandles {
 /// # Arguments
 ///
 /// - `local_channels`: Existing local progress channels (from `create_progress_channels`).
-/// - `session`: The TransportSession providing progress-priority channels.
+/// - `outboxes`: Per-peer ordered outbound lanes (keyed by peer node ID).
 /// - `receivers`: Per-peer channel receivers from `TransportSession::new()`.
 /// - `dataflow_id`: Dataflow ID for frame construction.
 /// - `local_worker_range`: `(start, end)` of local worker indices.
@@ -454,7 +504,8 @@ impl Drop for NetworkProgressHandles {
 /// - `num_workers`: Total worker count across all nodes.
 /// - `wake_handles`: Wake handles for ALL workers (indexed by global worker ID).
 ///   Only local workers' handles are used for receiver bridges.
-/// - `cancel`: CancellationToken for fatal error propagation.
+/// - `cancel`: Stops receive bridges at teardown.
+/// - `events`: Lifecycle events (end-of-stream, channel failures).
 /// - `max_batch_size`: Maximum number of progress changes per serialized
 ///   batch. The encoder splits larger batches into multiple frames; the
 ///   decoder rejects batches exceeding this limit. Use
@@ -467,9 +518,9 @@ impl Drop for NetworkProgressHandles {
 /// TransportSession (indicating misconfigured channel registrations).
 #[cfg(feature = "transport")]
 #[allow(clippy::too_many_arguments, clippy::needless_range_loop)]
-pub fn create_network_progress_channels<T: Timestamp + ExchangeData>(
+pub(crate) fn create_network_progress_channels<T: Timestamp + ExchangeData>(
     mut local_channels: Vec<WorkerProgressChannels<T>>,
-    transport: &crate::communication::cluster_transport::ClusterTransport,
+    outboxes: &HashMap<String, PeerOutbox>,
     mut receivers: HashMap<String, HashMap<u64, tokio_mpsc::Receiver<Vec<u8>>>>,
     dataflow_id: DataflowId,
     local_worker_range: (usize, usize),
@@ -477,6 +528,7 @@ pub fn create_network_progress_channels<T: Timestamp + ExchangeData>(
     num_workers: usize,
     wake_handles: &[WakeHandle],
     cancel: tokio_util::sync::CancellationToken,
+    events: LifecycleEventSender,
     max_batch_size: usize,
     runtime_handle: &tokio::runtime::Handle,
 ) -> Result<
@@ -517,31 +569,15 @@ pub fn create_network_progress_channels<T: Timestamp + ExchangeData>(
         }
     }
 
-    let mut send_handles = Vec::new();
     let mut recv_handles = Vec::new();
 
-    // --- Send side: one unbounded channel per peer, shared by all local workers ---
+    // --- Send side: the peer's ordered outbox, shared by all local workers ---
     for (peer_id, peer_start, peer_end) in remote_peers {
-        // Get the transport's progress sender for this peer.
-        let session_tx = transport.progress_sender(peer_id).ok_or_else(|| {
+        let outbox = outboxes.get(peer_id.as_str()).ok_or_else(|| {
             crate::error::CommunicationError::InvalidSetup(format!(
-                "missing progress sender for peer {peer_id}"
+                "missing outbox for peer {peer_id}"
             ))
         })?;
-
-        // Create unbounded intermediary channel for this peer.
-        let (unbounded_tx, unbounded_rx) = tokio_mpsc::unbounded_channel::<Frame>();
-
-        // Spawn send bridge task for this peer.
-        let cancel_clone = cancel.clone();
-        let peer_id_clone = peer_id.clone();
-        let handle = runtime_handle.spawn(progress_send_bridge(
-            unbounded_rx,
-            session_tx,
-            cancel_clone,
-            peer_id_clone,
-        ));
-        send_handles.push(handle);
 
         // Create network senders for each (local_worker → remote_worker) pair.
         for local_w in local_start..local_end {
@@ -550,21 +586,12 @@ pub fn create_network_progress_channels<T: Timestamp + ExchangeData>(
                 let ch_id = progress_channel_id(local_w, remote_w, num_workers)
                     .map_err(|e| crate::error::CommunicationError::InvalidSetup(e.to_string()))?;
                 let df_id = dataflow_id;
-                let tx = unbounded_tx.clone();
-                let cancel_for_closure = cancel.clone();
-                let peer_id_for_closure = peer_id.clone();
+                let outbox = outbox.clone();
 
                 let sender = ProgressSender::network(move |changes: Vec<ProgressChange<T>>| {
-                    // Pre-check: if bridge is already gone, cancel immediately
-                    // before encoding/sending any frames (prevents partial batch).
-                    if tx.is_closed() {
-                        #[cfg(feature = "tracing")]
-                        tracing::error!(
-                            peer = %peer_id_for_closure,
-                            channel_id = ch_id,
-                            "progress send: bridge closed, cancelling dataflow"
-                        );
-                        cancel_for_closure.cancel();
+                    // A retired peer has finished or already holds everything
+                    // it needs from us; deltas to it are irrelevant.
+                    if outbox.is_retired() {
                         return;
                     }
                     let mut bufs = Vec::new();
@@ -572,11 +599,13 @@ pub fn create_network_progress_channels<T: Timestamp + ExchangeData>(
                     {
                         #[cfg(feature = "tracing")]
                         tracing::error!(
-                            peer = %peer_id_for_closure,
+                            peer = %outbox.peer(),
                             channel_id = ch_id,
-                            "progress send: encode error {e}, cancelling dataflow"
+                            "progress send: encode error {e}"
                         );
-                        cancel_for_closure.cancel();
+                        outbox.report(LinkEvent::OutboundFailed(LinkFailure::Encode(
+                            e.to_string(),
+                        )));
                         return;
                     }
                     for buf in bufs {
@@ -585,14 +614,9 @@ pub fn create_network_progress_channels<T: Timestamp + ExchangeData>(
                             channel_id: ch_id,
                             payload: buf,
                         };
-                        if tx.send(frame).is_err() {
-                            #[cfg(feature = "tracing")]
-                            tracing::error!(
-                                peer = %peer_id_for_closure,
-                                channel_id = ch_id,
-                                "progress send: bridge closed, cancelling dataflow"
-                            );
-                            cancel_for_closure.cancel();
+                        // The lane only closes after its forwarder reported a
+                        // transport failure, or after teardown.
+                        if outbox.send(frame).is_err() {
                             return;
                         }
                     }
@@ -642,6 +666,7 @@ pub fn create_network_progress_channels<T: Timestamp + ExchangeData>(
                     peer_id_clone,
                     ch_id,
                     max_batch_size,
+                    events.clone(),
                 ));
                 recv_handles.push(handle);
 
@@ -652,7 +677,6 @@ pub fn create_network_progress_channels<T: Timestamp + ExchangeData>(
 
     let handles = NetworkProgressHandles {
         cancel: cancel.clone(),
-        send_handles,
         recv_handles,
     };
 
@@ -801,85 +825,91 @@ mod tests {
         assert_eq!(progress_channel_id(0, 0, 4).unwrap(), PROGRESS_CHANNEL_BASE);
     }
 
-    #[tokio::test]
-    async fn send_bridge_forwards_frames() {
-        let (unbounded_tx, unbounded_rx) = tokio_mpsc::unbounded_channel::<Frame>();
-        let (session_tx, mut session_rx) = tokio_mpsc::channel::<Frame>(16);
-        let cancel = tokio_util::sync::CancellationToken::new();
+    #[test]
+    fn end_of_stream_roundtrip_and_is_distinct_from_batches() {
+        let eos = encode_progress_end_of_stream();
+        assert_eq!(
+            decode_progress_frame::<u64>(&eos, DEFAULT_MAX_BATCH_SIZE).unwrap(),
+            ProgressFrame::EndOfStream
+        );
+        let ack = encode_progress_ack();
+        assert_eq!(
+            decode_progress_frame::<u64>(&ack, DEFAULT_MAX_BATCH_SIZE).unwrap(),
+            ProgressFrame::Ack
+        );
+        // Legacy batch decoding never accepts the markers as batches.
+        assert!(decode_progress_batch::<u64>(&eos, DEFAULT_MAX_BATCH_SIZE).is_err());
+        assert!(decode_progress_batch::<u64>(&ack, DEFAULT_MAX_BATCH_SIZE).is_err());
 
-        // Spawn bridge task.
-        let handle = tokio::spawn(progress_send_bridge(
-            unbounded_rx,
-            crate::communication::cluster_transport::FrameSender::Direct(session_tx),
-            cancel.clone(),
-            "test-peer".into(),
-        ));
+        for marker in [&eos, &ack] {
+            let mut corrupted = marker.clone();
+            corrupted[5] ^= 0x01;
+            assert!(decode_progress_frame::<u64>(&corrupted, DEFAULT_MAX_BATCH_SIZE).is_err());
+        }
 
-        // Send a frame through the unbounded channel.
-        let frame = Frame {
-            dataflow_id: DataflowId::new(),
-            channel_id: 42,
-            payload: vec![1, 2, 3],
-        };
-        unbounded_tx.send(frame.clone()).unwrap();
-
-        // Should arrive via the bridge.
-        let received = tokio::time::timeout(std::time::Duration::from_secs(2), session_rx.recv())
-            .await
-            .unwrap()
-            .unwrap();
-        assert_eq!(received.payload, vec![1, 2, 3]);
-        assert_eq!(received.channel_id, 42);
-
-        // No cancellation on normal forwarding.
-        assert!(!cancel.is_cancelled());
-
-        drop(unbounded_tx);
-        let _ = handle.await;
+        let mut bufs = Vec::new();
+        encode_progress_batch(
+            &[ProgressChange::source(0, 0, 1u64, 1)],
+            &mut bufs,
+            DEFAULT_MAX_BATCH_SIZE,
+        )
+        .unwrap();
+        assert_eq!(
+            decode_progress_frame::<u64>(&bufs[0], DEFAULT_MAX_BATCH_SIZE).unwrap(),
+            ProgressFrame::Batch(vec![ProgressChange::source(0, 0, 1u64, 1)])
+        );
     }
 
-    #[tokio::test]
-    async fn send_bridge_cancels_on_transport_close() {
-        let (unbounded_tx, unbounded_rx) = tokio_mpsc::unbounded_channel::<Frame>();
-        let (session_tx, session_rx) = tokio_mpsc::channel::<Frame>(1);
-        let cancel = tokio_util::sync::CancellationToken::new();
+    #[test]
+    fn encoder_never_emits_a_reserved_count() {
+        // Even with an unbounded batch limit, the count field stays below the
+        // reserved marker values.
+        let changes = vec![ProgressChange::source(0, 0, 1u64, 1); 3];
+        let mut bufs = Vec::new();
+        encode_progress_batch(&changes, &mut bufs, usize::MAX).unwrap();
+        for buf in bufs {
+            assert_ne!(buf[..4], PROGRESS_END_OF_STREAM_COUNT.to_le_bytes());
+            assert_ne!(buf[..4], PROGRESS_ACK_COUNT.to_le_bytes());
+        }
+    }
 
-        let handle = tokio::spawn(progress_send_bridge(
-            unbounded_rx,
-            crate::communication::cluster_transport::FrameSender::Direct(session_tx),
+    fn spawn_recv_bridge(
+        rx: tokio_mpsc::Receiver<Vec<u8>>,
+        shared: &Arc<Mutex<SharedBuffer<u64>>>,
+        cancel: &tokio_util::sync::CancellationToken,
+    ) -> (
+        tokio::task::JoinHandle<()>,
+        tokio_mpsc::UnboundedReceiver<crate::communication::peer_link::LifecycleEvent>,
+    ) {
+        let (events, events_rx) = tokio_mpsc::unbounded_channel();
+        let handle = tokio::spawn(progress_recv_bridge::<u64>(
+            rx,
+            Arc::clone(shared),
+            WakeHandle::new(),
             cancel.clone(),
             "test-peer".into(),
+            42,
+            DEFAULT_MAX_BATCH_SIZE,
+            events,
         ));
+        (handle, events_rx)
+    }
 
-        // Drop the session receiver to simulate transport close.
-        drop(session_rx);
-
-        // Send a frame — bridge should detect closed transport and cancel.
-        let frame = Frame {
-            dataflow_id: DataflowId::new(),
-            channel_id: 1,
-            payload: vec![1],
-        };
-        unbounded_tx.send(frame).unwrap();
-
-        let _ = tokio::time::timeout(std::time::Duration::from_secs(2), handle)
-            .await
-            .expect("bridge should exit promptly");
-
-        assert!(
-            cancel.is_cancelled(),
-            "should cancel dataflow on transport close"
-        );
+    fn new_shared() -> Arc<Mutex<SharedBuffer<u64>>> {
+        Arc::new(Mutex::new(SharedBuffer::<u64> {
+            queue: VecDeque::new(),
+        }))
     }
 
     #[tokio::test]
     async fn recv_bridge_deserializes_and_wakes() {
+        use crate::communication::peer_link::LifecycleEvent;
+
         let (tx, rx) = tokio_mpsc::channel::<Vec<u8>>(16);
-        let shared = Arc::new(Mutex::new(SharedBuffer::<u64> {
-            queue: VecDeque::new(),
-        }));
+        let shared = new_shared();
         let wake = WakeHandle::new();
         let cancel = tokio_util::sync::CancellationToken::new();
+        let (events, mut events_rx) = tokio_mpsc::unbounded_channel::<LifecycleEvent>();
 
         let handle = tokio::spawn(progress_recv_bridge::<u64>(
             rx,
@@ -889,90 +919,104 @@ mod tests {
             "test-peer".into(),
             42,
             DEFAULT_MAX_BATCH_SIZE,
+            events,
         ));
 
-        // Serialize a batch and send it.
+        // Serialize a batch and send it, followed by the end-of-stream marker.
         let changes: Vec<ProgressChange<u64>> = vec![
             ProgressChange::source(0, 0, 42u64, 1),
             ProgressChange::source(1, 0, 100u64, -1),
         ];
         let mut bufs = Vec::new();
         encode_progress_batch(&changes, &mut bufs, DEFAULT_MAX_BATCH_SIZE).unwrap();
+        tx.send(encode_progress_ack()).await.unwrap();
         tx.send(bufs.into_iter().next().unwrap()).await.unwrap();
+        tx.send(encode_progress_end_of_stream()).await.unwrap();
 
-        // Wait for the bridge to process.
-        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        tokio::time::timeout(std::time::Duration::from_secs(2), handle)
+            .await
+            .expect("bridge exits after end-of-stream")
+            .unwrap();
 
         let receiver = ProgressReceiver::<u64>::new(Arc::clone(&shared));
         let batches = receiver.drain_all().unwrap();
         assert_eq!(batches.len(), 1);
         assert_eq!(batches[0], changes);
-
-        drop(tx);
-        let _ = handle.await;
+        // The ack does not end the channel.
+        assert!(matches!(
+            events_rx.recv().await,
+            Some(LifecycleEvent::Link {
+                event: LinkEvent::AckReceived,
+                ..
+            })
+        ));
+        assert!(matches!(
+            events_rx.recv().await,
+            Some(LifecycleEvent::Link {
+                event: LinkEvent::ProgressEndOfStream,
+                ..
+            })
+        ));
+        assert!(!cancel.is_cancelled(), "bridge never cancels on its own");
     }
 
     #[tokio::test]
-    async fn recv_bridge_cancels_on_decode_error() {
+    async fn recv_bridge_reports_decode_error() {
+        use crate::communication::peer_link::LifecycleEvent;
+
         let (tx, rx) = tokio_mpsc::channel::<Vec<u8>>(16);
-        let shared = Arc::new(Mutex::new(SharedBuffer::<u64> {
-            queue: VecDeque::new(),
-        }));
-        let wake = WakeHandle::new();
+        let shared = new_shared();
         let cancel = tokio_util::sync::CancellationToken::new();
+        let (handle, mut events_rx) = spawn_recv_bridge(rx, &shared, &cancel);
 
-        let handle = tokio::spawn(progress_recv_bridge::<u64>(
-            rx,
-            Arc::clone(&shared),
-            wake,
-            cancel.clone(),
-            "test-peer".into(),
-            99,
-            DEFAULT_MAX_BATCH_SIZE,
-        ));
-
-        // Send garbage bytes.
         tx.send(vec![0xFF, 0xFF]).await.unwrap();
-
-        // Wait for the bridge to process.
-        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-
-        // Cancellation token should be triggered.
-        assert!(cancel.is_cancelled());
-
-        let _ = handle.await;
+        tokio::time::timeout(std::time::Duration::from_secs(2), handle)
+            .await
+            .expect("bridge should exit promptly")
+            .unwrap();
+        assert!(matches!(
+            events_rx.recv().await,
+            Some(LifecycleEvent::Link {
+                event: LinkEvent::ProgressChannelEnded(LinkFailure::Decode(_)),
+                ..
+            })
+        ));
+        assert!(!cancel.is_cancelled());
     }
 
     #[tokio::test]
-    async fn recv_bridge_cancels_on_connection_drop() {
+    async fn recv_bridge_reports_connection_drop_before_end_of_stream() {
+        use crate::communication::peer_link::LifecycleEvent;
+
         let (tx, rx) = tokio_mpsc::channel::<Vec<u8>>(16);
-        let shared = Arc::new(Mutex::new(SharedBuffer::<u64> {
-            queue: VecDeque::new(),
-        }));
-        let wake = WakeHandle::new();
+        let shared = new_shared();
         let cancel = tokio_util::sync::CancellationToken::new();
+        let (handle, mut events_rx) = spawn_recv_bridge(rx, &shared, &cancel);
 
-        let handle = tokio::spawn(progress_recv_bridge::<u64>(
-            rx,
-            Arc::clone(&shared),
-            wake,
-            cancel.clone(),
-            "test-peer".into(),
-            42,
-            DEFAULT_MAX_BATCH_SIZE,
-        ));
-
-        // Drop sender to simulate connection loss.
         drop(tx);
-
-        let _ = tokio::time::timeout(std::time::Duration::from_secs(2), handle)
+        tokio::time::timeout(std::time::Duration::from_secs(2), handle)
             .await
-            .expect("bridge should exit promptly");
+            .expect("bridge should exit promptly")
+            .unwrap();
+        assert!(matches!(
+            events_rx.recv().await,
+            Some(LifecycleEvent::Link {
+                event: LinkEvent::ProgressChannelEnded(LinkFailure::ChannelClosed),
+                ..
+            })
+        ));
+    }
 
-        assert!(
-            cancel.is_cancelled(),
-            "should cancel dataflow on connection drop"
-        );
+    #[tokio::test]
+    async fn recv_bridge_exits_silently_on_cancel() {
+        let (_tx, rx) = tokio_mpsc::channel::<Vec<u8>>(16);
+        let shared = new_shared();
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let (handle, mut events_rx) = spawn_recv_bridge(rx, &shared, &cancel);
+
+        cancel.cancel();
+        handle.await.unwrap();
+        assert!(events_rx.recv().await.is_none());
     }
 
     #[tokio::test]
@@ -1108,6 +1152,18 @@ mod tests {
         let wake_handles: Vec<WakeHandle> = (0..num_workers).map(|_| WakeHandle::new()).collect();
 
         let cancel = tokio_util::sync::CancellationToken::new();
+        let (events, mut events_rx) = tokio_mpsc::unbounded_channel();
+        let outbox = |transport: &ClusterTransport, peer: &str| {
+            let (outbox, _forwarder) = crate::communication::peer_link::spawn_peer_outbox(
+                peer,
+                transport.progress_sender(peer).unwrap(),
+                events.clone(),
+                &rt,
+            );
+            HashMap::from([(peer.to_string(), outbox)])
+        };
+        let outboxes_a = outbox(&transport_a, "node-b");
+        let outboxes_b = outbox(&transport_b, "node-a");
 
         // --- Node A setup: workers 0,1 ---
         let local_a = crate::progress::progress_channel::create_progress_channels::<u64>(
@@ -1121,7 +1177,7 @@ mod tests {
 
         let (a_channels, _handles_a) = create_network_progress_channels::<u64>(
             a_worker_channels,
-            &transport_a,
+            &outboxes_a,
             recv_a,
             df_id,
             (0, 2),
@@ -1129,6 +1185,7 @@ mod tests {
             num_workers,
             &wake_handles,
             cancel.clone(),
+            events.clone(),
             DEFAULT_MAX_BATCH_SIZE,
             &rt,
         )
@@ -1145,7 +1202,7 @@ mod tests {
 
         let (b_channels, _handles_b) = create_network_progress_channels::<u64>(
             b_worker_channels,
-            &transport_b,
+            &outboxes_b,
             recv_b,
             df_id,
             (2, 4),
@@ -1153,6 +1210,7 @@ mod tests {
             num_workers,
             &wake_handles,
             cancel.clone(),
+            events.clone(),
             DEFAULT_MAX_BATCH_SIZE,
             &rt,
         )
@@ -1185,7 +1243,8 @@ mod tests {
             ]
         );
 
-        // Verify no spurious cancellation.
+        // Verify no spurious failure events.
+        assert!(events_rx.try_recv().is_err());
         assert!(!cancel.is_cancelled());
 
         drop(transport_a);
@@ -1211,32 +1270,52 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn send_closure_cancels_on_bridge_exit() {
-        let (unbounded_tx, unbounded_rx) = tokio_mpsc::unbounded_channel::<Frame>();
-        let cancel = tokio_util::sync::CancellationToken::new();
+    async fn network_sender_discards_progress_for_retired_peer() {
+        let (tx, mut rx) = tokio_mpsc::channel::<Frame>(16);
+        let (events, _events_rx) = tokio_mpsc::unbounded_channel();
+        let (outbox, _forwarder) = crate::communication::peer_link::spawn_peer_outbox(
+            "node-b",
+            crate::communication::cluster_transport::FrameSender::Direct(tx),
+            events.clone(),
+            &tokio::runtime::Handle::current(),
+        );
+        let wake_handles: Vec<WakeHandle> = (0..2).map(|_| WakeHandle::new()).collect();
+        let local =
+            crate::progress::progress_channel::create_progress_channels::<u64>(2, &wake_handles)
+                .unwrap();
+        let (channels, _handles) = create_network_progress_channels::<u64>(
+            local.into_iter().take(1).collect(),
+            &HashMap::from([("node-b".to_string(), outbox.clone())]),
+            HashMap::from([(
+                "node-b".to_string(),
+                HashMap::from([(progress_channel_id(1, 0, 2).unwrap(), {
+                    let (_tx, rx) = tokio_mpsc::channel(1);
+                    rx
+                })]),
+            )]),
+            DataflowId::new(),
+            (0, 1),
+            &[("node-b".to_string(), 1, 2)],
+            2,
+            &wake_handles,
+            tokio_util::sync::CancellationToken::new(),
+            events,
+            DEFAULT_MAX_BATCH_SIZE,
+            &tokio::runtime::Handle::current(),
+        )
+        .unwrap();
+        let sender = channels[0].senders[1].as_ref().unwrap();
 
-        let cancel_for_closure = cancel.clone();
-        let sender = ProgressSender::<u64>::network(move |changes: Vec<ProgressChange<u64>>| {
-            let mut bufs = Vec::new();
-            encode_progress_batch::<u64>(&changes, &mut bufs, DEFAULT_MAX_BATCH_SIZE).unwrap();
-            for buf in bufs {
-                let frame = Frame {
-                    dataflow_id: DataflowId::new(),
-                    channel_id: 1,
-                    payload: buf,
-                };
-                if unbounded_tx.send(frame).is_err() {
-                    cancel_for_closure.cancel();
-                    return;
-                }
-            }
-        });
-
-        // Drop the receiver to simulate bridge exit.
-        drop(unbounded_rx);
-
-        // Sending should trigger cancellation.
         sender.send(vec![ProgressChange::source(0, 0, 1u64, 1)]);
-        assert!(cancel.is_cancelled(), "should cancel when bridge is gone");
+        let first = tokio::time::timeout(std::time::Duration::from_secs(2), rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(first.channel_id, progress_channel_id(0, 1, 2).unwrap());
+
+        outbox.link().retire();
+        sender.send(vec![ProgressChange::source(0, 0, 1u64, -1)]);
+        let second = tokio::time::timeout(std::time::Duration::from_millis(100), rx.recv()).await;
+        assert!(second.is_err(), "no progress to a retired peer");
     }
 }

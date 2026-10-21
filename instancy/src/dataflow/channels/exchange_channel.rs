@@ -1235,6 +1235,11 @@ pub(crate) struct NetworkMaterializerParams {
     pub runtime_handle: tokio::runtime::Handle,
     /// Optional channel metrics collector for this exchange edge.
     pub channel_metrics: Option<Arc<crate::metrics::ChannelMetricsCollector>>,
+    /// Per-peer ordered lanes for close sentinels.
+    pub peer_outboxes:
+        std::collections::HashMap<String, crate::communication::peer_link::PeerOutbox>,
+    /// Inbound bridge tracking for data-loss detection and teardown.
+    pub inbound_bridges: crate::communication::peer_link::InboundBridges,
 }
 
 /// Trait for creating network-backed exchange channel factories.
@@ -1297,7 +1302,9 @@ where
                 params.edge_index,
                 params.wake_handles,
                 params.runtime_handle,
-            )?,
+            )?
+            .with_peer_outboxes(params.peer_outboxes)
+            .with_inbound_bridges(params.inbound_bridges),
         ));
         Ok(build_exchange_factories(
             params.num_workers,
@@ -1360,7 +1367,9 @@ where
                 params.edge_index,
                 params.wake_handles,
                 params.runtime_handle,
-            )?,
+            )?
+            .with_peer_outboxes(params.peer_outboxes)
+            .with_inbound_bridges(params.inbound_bridges),
         ));
         Ok(build_broadcast_factories(
             params.num_workers,

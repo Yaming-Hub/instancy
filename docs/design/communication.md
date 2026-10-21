@@ -554,6 +554,33 @@ The `u64` channel-id space of a dataflow is split into namespaces of `2^62` ids 
 
 The shared transport delivers the control channel and the probe channel outside the per-dataflow sequenced payload lane. A payload frame sent on either of them is rejected (`TransportError::ReservedChannel` on the dataflow's error channel) without consuming a sequence number; previously it consumed one the receiver never saw, stalling the dataflow's lane behind a permanent gap.
 
+#### End of stream and clean close
+
+Every logical channel of a cluster dataflow ends with an explicit in-band
+marker on a clean shutdown: data channels with the close sentinel (`[0xFF]`),
+progress channels with the progress end-of-stream frame (`[0xFFFF_FFFF][crc32]`).
+Both are queued on the sender's ordered per-peer outbox, behind every frame
+that channel carried, so a full transport queue cannot drop them (the outbox is
+unbounded; data itself stays on the bounded, backpressured path). The
+receiver acknowledges a peer's complete set of progress end-of-stream frames
+with an acknowledgement frame (`[0xFFFF_FFFE][crc32]`) on a progress channel,
+queued on its own outbox: unlike a control message it cannot overtake the
+data the acknowledging node sent before it. Records addressed to a peer whose
+link is retired (it finished) fail the push with
+`CommunicationError::DataLoss`, and records that reach a node after the
+operator they are addressed to finished are reported by the inbound bridge as
+data loss; neither is ever dropped silently. A channel or connection that
+ends before its marker, on a link that has not been retired by that handshake,
+is a connection loss rather than a clean close. With shared connections, a
+dataflow that must not lose what it has queued (its end-of-stream markers and
+acknowledgements, or final progress for a peer that is still draining) calls
+`SharedPeerManager::flush_dataflow` before
+unregistering: it puts a local-only barrier (reserved channel ID
+`u64::MAX - 1`, never sent on the wire) on the payload queue and returns once
+the bridge task reaches it, that is, once every earlier frame has been
+sequenced and handed to a connection writer. See
+[cluster.md §5.5.3](./cluster.md#553-cluster-shutdown-protocol-clean-teardown).
+
 ### 6.5 Dataflow Isolation
 
 Multiple dataflows can run concurrently on the same cluster, sharing the same worker thread pool and the same pooled network connections. Isolation between dataflows is maintained at multiple levels:
