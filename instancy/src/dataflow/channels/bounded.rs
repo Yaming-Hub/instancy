@@ -82,6 +82,7 @@ pub fn bounded_channel_with_wake<T: Timestamp, D: Send + 'static, M: Send + 'sta
         state: Arc::clone(&state),
         closed: Arc::clone(&closed),
         wake: wake.clone(),
+        close_gate: None,
     };
     let pull = BoundedPull {
         state,
@@ -110,6 +111,33 @@ pub struct BoundedPush<T: Timestamp, D, M = ()> {
     state: Arc<Mutex<SharedState<T, D, M>>>,
     closed: Arc<AtomicBool>,
     wake: Option<WakeHandle>,
+    /// When set, dropping this push (or [`Push::close_on_drop`]) closes the
+    /// channel only once the flag is `true`; an explicit `close()` always
+    /// closes. Cluster dataflows set it to the sending worker's success flag
+    /// so a failed worker's stream never looks complete to a sibling worker.
+    close_gate: Option<Arc<AtomicBool>>,
+}
+
+impl<T: Timestamp, D, M> BoundedPush<T, D, M> {
+    /// Close on drop only if `gate` is `true` at that time (see `close_gate`).
+    #[cfg_attr(not(feature = "transport"), allow(dead_code))]
+    pub(crate) fn with_close_gate(mut self, gate: Option<Arc<AtomicBool>>) -> Self {
+        self.close_gate = gate;
+        self
+    }
+
+    fn mark_closed(&self) {
+        self.closed.store(true, Ordering::Release);
+        if let Some(ref wake) = self.wake {
+            wake.notify();
+        }
+    }
+
+    fn gate_open(&self) -> bool {
+        self.close_gate
+            .as_ref()
+            .is_none_or(|gate| gate.load(Ordering::Acquire))
+    }
 }
 
 impl<T: Timestamp, D: Send + 'static, M: Send + 'static> Push<T, D, M> for BoundedPush<T, D, M> {
@@ -166,9 +194,12 @@ impl<T: Timestamp, D: Send + 'static, M: Send + 'static> Push<T, D, M> for Bound
     }
 
     fn close(&mut self) {
-        self.closed.store(true, Ordering::Release);
-        if let Some(ref wake) = self.wake {
-            wake.notify();
+        self.mark_closed();
+    }
+
+    fn close_on_drop(&mut self) {
+        if self.gate_open() {
+            self.mark_closed();
         }
     }
 
@@ -196,12 +227,12 @@ pub struct BoundedPull<T: Timestamp, D, M = ()> {
 }
 
 /// Auto-close on drop so the receiver sees exhaustion even if the sender
-/// is dropped without an explicit `close()` call.
+/// is dropped without an explicit `close()` call (unless a close gate says
+/// the sending worker did not complete).
 impl<T: Timestamp, D, M> Drop for BoundedPush<T, D, M> {
     fn drop(&mut self) {
-        self.closed.store(true, Ordering::Release);
-        if let Some(ref wake) = self.wake {
-            wake.notify();
+        if self.gate_open() {
+            self.mark_closed();
         }
     }
 }

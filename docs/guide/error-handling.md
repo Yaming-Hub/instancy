@@ -189,12 +189,14 @@ The built-in reason variants are:
 |---------|-----------|
 | `UserRequested` | Default for `cancel()` — the caller explicitly requested cancellation |
 | `RuntimeShutdown` | The runtime is shutting down (`RuntimeHandle` dropped or `shutdown()` called) |
-| `NetworkError(String)` | A network-level error caused cancellation (TCP disconnect, transport failure) |
+| `NetworkError(String)` | A network-level error caused cancellation (TCP disconnect, transport failure). In a cluster, a link to a peer that ends without its clean end-of-stream, or carries a corrupt or unexpected frame, fails the dataflow with this reason on the detecting node; its peers receive it as `PeerCancelled` |
 | `WorkerFailed(String)` | A sibling worker failed, causing cascading cancellation |
 | `HandleDropped` | The `SpawnedDataflow` handle was dropped without calling `join()` |
 | `OperatorError(String)` | An operator produced an error that caused the dataflow to be cancelled |
 
 Reasons follow **first-cancel-wins** semantics: if a token is cancelled multiple times, only the first reason is recorded. Child tokens inherit their parent's reason.
+
+A cluster dataflow never reports success with data missing: a node whose worker completed successfully but then received data it should have processed, or that received corrupt traffic from a peer, returns `Err(CommunicationError::DataLoss { .. })` from its join, and pushing records to a peer that has already finished fails the same way. A batch too large for one transport frame fails the pushing operator with `CommunicationError::FrameTooLarge`.
 
 ### Graceful Drain on Cancellation
 

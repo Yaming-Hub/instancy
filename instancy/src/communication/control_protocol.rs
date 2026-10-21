@@ -166,6 +166,11 @@ pub enum HandshakeError {
         peer_id: String,
         source: ControlProtocolError,
     },
+
+    /// The peer abandoned the dataflow (it failed to spawn or was cancelled)
+    /// while this node was still in the handshake or ready barrier.
+    #[error("peer {peer_id} cancelled the dataflow during handshake/ready barrier: {reason}")]
+    PeerCancelled { peer_id: String, reason: String },
 }
 
 // ---------------------------------------------------------------------------
@@ -475,6 +480,116 @@ pub(crate) fn graph_fingerprint<T: crate::progress::timestamp::Timestamp>(
 // High-level handshake + ready barrier
 // ---------------------------------------------------------------------------
 
+/// Wait for one control message from every peer, from all peers at once,
+/// until `deadline`.
+///
+/// The first problem ends the wait: a peer's `Cancel`
+/// ([`HandshakeError::PeerCancelled`]), a closed control channel, an
+/// undecodable message, or a message `check` rejects (`check` receives the
+/// raw message: it decodes and validates it). A peer that fails is
+/// therefore noticed at once even while another peer is slow. On timeout the
+/// error names a peer that has not answered.
+///
+/// With `watch_answered`, peers that already answered are still watched for
+/// `Cancel`, a closed channel or an undecodable message (which may have been
+/// a `Cancel`); duplicates of earlier messages are ignored. This is used by
+/// the ready barrier, after which a peer sends nothing else on its control
+/// channel until it cancels. Without it (the handshake), a peer's later
+/// messages stay queued for the next phase.
+#[cfg(feature = "transport")]
+async fn receive_from_each_peer(
+    control_receivers: &mut std::collections::HashMap<String, tokio::sync::mpsc::Receiver<Vec<u8>>>,
+    deadline: tokio::time::Instant,
+    watch_answered: bool,
+    mut check: impl FnMut(&str, &[u8]) -> Result<(), HandshakeError>,
+) -> Result<(), HandshakeError> {
+    use std::task::Poll;
+
+    let mut answered = std::collections::HashSet::new();
+    while answered.len() < control_receivers.len() {
+        let next = tokio::time::timeout_at(
+            deadline,
+            std::future::poll_fn(|cx| {
+                for (peer_id, rx) in control_receivers.iter_mut() {
+                    let done = answered.contains(peer_id);
+                    if done && !watch_answered {
+                        continue;
+                    }
+                    if let Poll::Ready(message) = rx.poll_recv(cx) {
+                        return Poll::Ready((peer_id.clone(), message, done));
+                    }
+                }
+                Poll::Pending
+            }),
+        )
+        .await;
+        let (peer_id, message, already_answered) = match next {
+            Ok(next) => next,
+            Err(_) => {
+                let mut waiting: Vec<&String> = control_receivers
+                    .keys()
+                    .filter(|peer| !answered.contains(*peer))
+                    .collect();
+                waiting.sort();
+                return Err(HandshakeError::Timeout {
+                    peer_id: waiting.first().map(|p| p.to_string()).unwrap_or_default(),
+                });
+            }
+        };
+        let Some(data) = message else {
+            return Err(HandshakeError::PeerDisconnected { peer_id });
+        };
+        match decode_control_message(&data) {
+            Ok(ControlMessage::Cancel { reason }) => {
+                return Err(HandshakeError::PeerCancelled { peer_id, reason });
+            }
+            // A duplicate of an earlier message.
+            Ok(_) if already_answered => {}
+            // It may have been a Cancel.
+            Err(source) if already_answered => {
+                return Err(HandshakeError::Decode { peer_id, source });
+            }
+            _ => {
+                check(&peer_id, &data)?;
+                answered.insert(peer_id);
+            }
+        }
+    }
+    if watch_answered {
+        // Every peer answered. A peer that failed right after answering has
+        // its Cancel (or closed channel) queued already: apply it now rather
+        // than start running without that peer.
+        for (peer_id, rx) in control_receivers.iter_mut() {
+            loop {
+                match rx.try_recv() {
+                    Ok(data) => match decode_control_message(&data) {
+                        Ok(ControlMessage::Cancel { reason }) => {
+                            return Err(HandshakeError::PeerCancelled {
+                                peer_id: peer_id.clone(),
+                                reason,
+                            });
+                        }
+                        Ok(_) => {}
+                        // It may have been a Cancel.
+                        Err(source) => {
+                            return Err(HandshakeError::Decode {
+                                peer_id: peer_id.clone(),
+                                source,
+                            });
+                        }
+                    },
+                    Err(tokio::sync::mpsc::error::TryRecvError::Empty) => break,
+                    Err(tokio::sync::mpsc::error::TryRecvError::Disconnected) => {
+                        return Err(HandshakeError::PeerDisconnected {
+                            peer_id: peer_id.clone(),
+                        });
+                    }
+                }
+            }
+        }
+    }
+    Ok(())
+}
 /// Validate the `Handshake` received on the connection the local node
 /// assigned to `peer_id`.
 #[cfg(feature = "transport")]
@@ -621,21 +736,10 @@ pub async fn perform_handshake(
 
     // Receive handshake from all peers.
     let deadline = tokio::time::Instant::now() + timeout;
-    for (peer_id, rx) in control_receivers.iter_mut() {
-        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
-        let data = tokio::time::timeout(remaining, rx.recv())
-            .await
-            .map_err(|_| HandshakeError::Timeout {
-                peer_id: peer_id.clone(),
-            })?
-            .ok_or_else(|| HandshakeError::PeerDisconnected {
-                peer_id: peer_id.clone(),
-            })?;
-
-        validate_peer_handshake(peer_id, &data, local_fingerprint, dataflow_id)?;
-    }
-
-    Ok(())
+    receive_from_each_peer(control_receivers, deadline, false, |peer_id, data| {
+        validate_peer_handshake(peer_id, data, local_fingerprint, dataflow_id)
+    })
+    .await
 }
 
 /// Perform the ready barrier with all remote peers.
@@ -682,21 +786,7 @@ pub async fn perform_ready_barrier(
 
     // Receive Ready from all peers.
     let deadline = tokio::time::Instant::now() + timeout;
-    for (peer_id, rx) in control_receivers.iter_mut() {
-        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
-        let data = tokio::time::timeout(remaining, rx.recv())
-            .await
-            .map_err(|_| HandshakeError::Timeout {
-                peer_id: peer_id.clone(),
-            })?
-            .ok_or_else(|| HandshakeError::PeerDisconnected {
-                peer_id: peer_id.clone(),
-            })?;
-
-        validate_peer_ready(peer_id, &data)?;
-    }
-
-    Ok(())
+    receive_from_each_peer(control_receivers, deadline, true, validate_peer_ready).await
 }
 
 /// Perform the handshake protocol using a [`ClusterTransport`](super::cluster_transport::ClusterTransport).
@@ -744,21 +834,10 @@ pub async fn perform_handshake_with_transport(
     }
 
     let deadline = tokio::time::Instant::now() + timeout;
-    for (peer_id, rx) in control_receivers.iter_mut() {
-        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
-        let data = tokio::time::timeout(remaining, rx.recv())
-            .await
-            .map_err(|_| HandshakeError::Timeout {
-                peer_id: peer_id.clone(),
-            })?
-            .ok_or_else(|| HandshakeError::PeerDisconnected {
-                peer_id: peer_id.clone(),
-            })?;
-
-        validate_peer_handshake(peer_id, &data, local_fingerprint, dataflow_id)?;
-    }
-
-    Ok(())
+    receive_from_each_peer(control_receivers, deadline, false, |peer_id, data| {
+        validate_peer_handshake(peer_id, data, local_fingerprint, dataflow_id)
+    })
+    .await
 }
 
 /// Perform the ready barrier using a [`ClusterTransport`](super::cluster_transport::ClusterTransport).
@@ -802,27 +881,15 @@ pub async fn perform_ready_barrier_with_transport(
     }
 
     let deadline = tokio::time::Instant::now() + timeout;
-    for (peer_id, rx) in control_receivers.iter_mut() {
-        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
-        let data = tokio::time::timeout(remaining, rx.recv())
-            .await
-            .map_err(|_| HandshakeError::Timeout {
-                peer_id: peer_id.clone(),
-            })?
-            .ok_or_else(|| HandshakeError::PeerDisconnected {
-                peer_id: peer_id.clone(),
-            })?;
-
-        validate_peer_ready(peer_id, &data)?;
-    }
-
-    Ok(())
+    receive_from_each_peer(control_receivers, deadline, true, validate_peer_ready).await
 }
 
 /// Broadcast a cancellation message to all peers using a [`ClusterTransport`].
 ///
 /// Called when the local dataflow is cancelled. Sending is best-effort: peers
-/// may already have disconnected by the time cancellation propagates.
+/// may already have disconnected by the time cancellation propagates. Every
+/// peer is sent to concurrently, so a peer whose control queue is stuck does
+/// not delay the others; callers bound the whole broadcast with a timeout.
 #[cfg(feature = "transport")]
 pub async fn broadcast_cancel_with_transport(
     transport: &super::cluster_transport::ClusterTransport,
@@ -836,16 +903,50 @@ pub async fn broadcast_cancel_with_transport(
         reason: reason.to_string(),
     });
 
-    for peer_id in transport.peer_node_ids() {
-        if let Some(sender) = transport.control_sender(&peer_id) {
+    let sends: Vec<_> = transport
+        .peer_node_ids()
+        .into_iter()
+        .filter_map(|peer_id| transport.control_sender(&peer_id).cloned())
+        .map(|sender| {
             let frame = Frame {
                 dataflow_id,
                 channel_id: CONTROL_CHANNEL_ID,
                 payload: payload.clone(),
             };
-            let _ = sender.send(frame).await;
+            async move {
+                let _ = sender.send(frame).await;
+            }
+        })
+        .collect();
+    join_all(sends).await;
+}
+
+/// Drive every future to completion concurrently and return their outputs in
+/// order.
+#[cfg(feature = "transport")]
+pub(crate) async fn join_all<F: std::future::Future>(futures: Vec<F>) -> Vec<F::Output> {
+    use std::task::Poll;
+
+    let mut futures: Vec<std::pin::Pin<Box<F>>> = futures.into_iter().map(Box::pin).collect();
+    let mut outputs: Vec<Option<F::Output>> = futures.iter().map(|_| None).collect();
+    std::future::poll_fn(|cx| {
+        let mut pending = false;
+        for (future, output) in futures.iter_mut().zip(outputs.iter_mut()) {
+            if output.is_none() {
+                match future.as_mut().poll(cx) {
+                    Poll::Ready(value) => *output = Some(value),
+                    Poll::Pending => pending = true,
+                }
+            }
         }
-    }
+        if pending {
+            Poll::Pending
+        } else {
+            Poll::Ready(())
+        }
+    })
+    .await;
+    outputs.into_iter().flatten().collect()
 }
 
 /// Spawn the per-dataflow control dispatcher on `runtime_handle`.
@@ -1596,5 +1697,177 @@ mod tests {
                 reason: "worker failed".to_string(),
             }
         );
+    }
+
+    // --- Concurrent handshake / barrier receive ---
+
+    mod concurrent_receive {
+        use super::super::*;
+        use std::collections::HashMap;
+        use tokio::sync::mpsc;
+
+        type Senders = HashMap<&'static str, mpsc::Sender<Vec<u8>>>;
+
+        fn peers(names: &[&'static str]) -> (Senders, HashMap<String, mpsc::Receiver<Vec<u8>>>) {
+            let mut senders = HashMap::new();
+            let mut receivers = HashMap::new();
+            for name in names {
+                let (tx, rx) = mpsc::channel(8);
+                senders.insert(*name, tx);
+                receivers.insert(name.to_string(), rx);
+            }
+            (senders, receivers)
+        }
+
+        fn ready(node: &str) -> Vec<u8> {
+            encode_control_message(&ControlMessage::Ready {
+                node_id: node.into(),
+            })
+        }
+
+        fn cancel() -> Vec<u8> {
+            encode_control_message(&ControlMessage::Cancel {
+                reason: "worker failed: boom".into(),
+            })
+        }
+
+        fn in_secs(secs: u64) -> tokio::time::Instant {
+            tokio::time::Instant::now() + std::time::Duration::from_secs(secs)
+        }
+
+        #[tokio::test]
+        async fn completes_when_every_peer_answers() {
+            let (tx, mut rx) = peers(&["b", "c"]);
+            tx["c"].send(ready("c")).await.unwrap();
+            tx["b"].send(ready("b")).await.unwrap();
+            // A later message stays queued for the next phase.
+            tx["b"].send(cancel()).await.unwrap();
+            receive_from_each_peer(&mut rx, in_secs(5), false, validate_peer_ready)
+                .await
+                .unwrap();
+            assert_eq!(rx.get_mut("b").unwrap().recv().await, Some(cancel()));
+        }
+
+        #[tokio::test]
+        async fn peer_cancel_fails_fast_while_another_peer_is_silent() {
+            let (tx, mut rx) = peers(&["b", "c"]);
+            tx["c"].send(cancel()).await.unwrap();
+            let start = tokio::time::Instant::now();
+            let err = receive_from_each_peer(&mut rx, in_secs(30), false, validate_peer_ready)
+                .await
+                .unwrap_err();
+            assert!(
+                matches!(&err, HandshakeError::PeerCancelled { peer_id, .. } if peer_id == "c"),
+                "{err:?}"
+            );
+            assert!(start.elapsed() < std::time::Duration::from_secs(5));
+            drop(tx);
+        }
+
+        #[tokio::test]
+        async fn barrier_watches_peers_that_already_answered() {
+            let (tx, mut rx) = peers(&["b", "c"]);
+            tx["b"].send(ready("b")).await.unwrap();
+            tx["b"].send(cancel()).await.unwrap();
+            let err = receive_from_each_peer(&mut rx, in_secs(30), true, validate_peer_ready)
+                .await
+                .unwrap_err();
+            assert!(
+                matches!(&err, HandshakeError::PeerCancelled { peer_id, .. } if peer_id == "b"),
+                "{err:?}"
+            );
+            // A peer that answered and then disconnected is noticed too.
+            let (tx, mut rx) = peers(&["b", "c"]);
+            tx["b"].send(ready("b")).await.unwrap();
+            let mut tx = tx;
+            tx.remove("b");
+            let err = receive_from_each_peer(&mut rx, in_secs(30), true, validate_peer_ready)
+                .await
+                .unwrap_err();
+            assert!(
+                matches!(&err, HandshakeError::PeerDisconnected { peer_id } if peer_id == "b"),
+                "{err:?}"
+            );
+        }
+
+        #[tokio::test]
+        async fn barrier_fails_on_a_corrupt_message_from_an_answered_peer() {
+            let mut corrupt = cancel();
+            corrupt[2] ^= 0xFF;
+            // While another peer is still awaited...
+            let (tx, mut rx) = peers(&["b", "c"]);
+            tx["b"].send(ready("b")).await.unwrap();
+            tx["b"].send(corrupt.clone()).await.unwrap();
+            let err = receive_from_each_peer(&mut rx, in_secs(30), true, validate_peer_ready)
+                .await
+                .unwrap_err();
+            assert!(
+                matches!(&err, HandshakeError::Decode { peer_id, .. } if peer_id == "b"),
+                "{err:?}"
+            );
+            // ...and queued behind the last answer.
+            let (tx, mut rx) = peers(&["b"]);
+            tx["b"].send(ready("b")).await.unwrap();
+            tx["b"].send(corrupt).await.unwrap();
+            let err = receive_from_each_peer(&mut rx, in_secs(5), true, validate_peer_ready)
+                .await
+                .unwrap_err();
+            assert!(
+                matches!(&err, HandshakeError::Decode { peer_id, .. } if peer_id == "b"),
+                "{err:?}"
+            );
+        }
+
+        #[tokio::test]
+        async fn barrier_applies_a_cancel_queued_behind_the_last_answer() {
+            let (tx, mut rx) = peers(&["b"]);
+            tx["b"].send(ready("b")).await.unwrap();
+            tx["b"].send(cancel()).await.unwrap();
+            let err = receive_from_each_peer(&mut rx, in_secs(5), true, validate_peer_ready)
+                .await
+                .unwrap_err();
+            assert!(
+                matches!(&err, HandshakeError::PeerCancelled { peer_id, .. } if peer_id == "b"),
+                "{err:?}"
+            );
+        }
+
+        #[tokio::test]
+        async fn timeout_names_a_peer_that_did_not_answer() {
+            let (tx, mut rx) = peers(&["b", "c"]);
+            tx["b"].send(ready("b")).await.unwrap();
+            let err = receive_from_each_peer(
+                &mut rx,
+                tokio::time::Instant::now() + std::time::Duration::from_millis(50),
+                true,
+                validate_peer_ready,
+            )
+            .await
+            .unwrap_err();
+            assert!(
+                matches!(&err, HandshakeError::Timeout { peer_id } if peer_id == "c"),
+                "{err:?}"
+            );
+        }
+
+        #[tokio::test]
+        async fn unexpected_message_is_rejected() {
+            let (tx, mut rx) = peers(&["b"]);
+            tx["b"].send(ready("b")).await.unwrap();
+            let err = receive_from_each_peer(
+                &mut rx,
+                in_secs(5),
+                false,
+                |peer_id: &str, data: &[u8]| {
+                    validate_peer_handshake(peer_id, data, 1, DataflowId::new())
+                },
+            )
+            .await
+            .unwrap_err();
+            assert!(
+                matches!(err, HandshakeError::UnexpectedMessage { .. }),
+                "{err:?}"
+            );
+        }
     }
 }

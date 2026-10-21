@@ -571,7 +571,17 @@ link is retired (it finished) fail the push with
 operator they are addressed to finished are reported by the inbound bridge as
 data loss; neither is ever dropped silently. A channel or connection that
 ends before its marker, on a link that has not been retired by that handshake,
-is a connection loss rather than a clean close. With shared connections, a
+is a connection loss rather than a clean close: the receiving endpoint never
+counts it as exhausted, and the dataflow fails cluster-wide (a corrupt or
+undecodable frame too). A dedicated `TransportSession` reports each peer's
+connection events — EOF, read and write failures, and outbound frames dropped
+because they exceed the frame limit (the writer keeps running; nothing was
+written) — to the cluster runtime, and keeps the peer's channels open until
+the event that ended the read side was handed on. `NetworkPush` rejects an
+envelope whose encoding exceeds the transport's frame limit
+(`ClusterTransport::max_payload_len`; shared frames carry an 8-byte sequence
+prefix) with `CommunicationError::FrameTooLarge`, and the data decoder accepts
+any record count the encoder can produce. With shared connections, a
 dataflow that must not lose what it has queued (its end-of-stream markers and
 acknowledgements, or final progress for a peer that is still draining) calls
 `SharedPeerManager::flush_dataflow` before

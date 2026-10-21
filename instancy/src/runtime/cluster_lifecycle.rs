@@ -370,6 +370,41 @@ fn outbound_loss_detail(failure: &LinkFailure) -> String {
     format!("frames to the peer could not be sent ({failure}) while the dataflow ran")
 }
 
+/// Corrupt traffic received from the peer, classified by cause: a frame that
+/// fails to decode or its checksum, a received frame announcing a payload
+/// over the frame limit (`received`; an outbound one is ours), or a frame
+/// that is out of protocol (a progress batch after the channel's
+/// end-of-stream). Unlike a loss — EOF, a frame truncated by a peer's
+/// teardown, a reorder timeout, a shared manager dropping or reconnecting —
+/// this never happens in a healthy run, so it is fatal in every phase and
+/// even on a retired link: whatever the frame carried is lost, and nothing
+/// proves the local result did not need it.
+fn is_inbound_corruption(failure: &LinkFailure, received: bool) -> bool {
+    match failure {
+        LinkFailure::Decode(_) | LinkFailure::ProtocolViolation(_) => true,
+        LinkFailure::Transport(TransportError::ChecksumMismatch { .. }) => true,
+        LinkFailure::Transport(TransportError::PayloadTooLarge { .. }) => received,
+        _ => false,
+    }
+}
+
+/// Whether `event` reports corrupt traffic (see [`is_inbound_corruption`]).
+fn is_corruption_event(event: &LinkEvent) -> bool {
+    match event {
+        LinkEvent::DataChannelEnded(failure) | LinkEvent::ProgressChannelEnded(failure) => {
+            is_inbound_corruption(failure, true)
+        }
+        LinkEvent::ControlUndecodable(_) => true,
+        LinkEvent::ConnectionFailed(error) => matches!(
+            error,
+            TransportError::ChecksumMismatch { .. } | TransportError::PayloadTooLarge { .. }
+        ),
+        LinkEvent::TransportError(error) => {
+            matches!(error, TransportError::ChecksumMismatch { .. })
+        }
+        _ => false,
+    }
+}
 /// Coordinator phase.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Phase {
@@ -420,6 +455,10 @@ struct PeerState {
     lost: bool,
     /// A soft failure waiting for the link to close fully.
     soft_failure: Option<LinkFailure>,
+    /// A data channel from the peer ended without its close sentinel (never
+    /// in a healthy run). If the peer's goodbye completes anyway, records
+    /// may be missing.
+    unclean_data_channel: bool,
     link: Arc<PeerLinkState>,
 }
 
@@ -496,6 +535,7 @@ impl LifecycleMachine {
                             control_closed: false,
                             lost: false,
                             soft_failure: None,
+                            unclean_data_channel: false,
                             link,
                         },
                     )
@@ -518,6 +558,18 @@ impl LifecycleMachine {
     /// worker succeeded.
     pub(crate) fn data_loss(&self) -> Option<&DataLoss> {
         self.data_loss.as_ref()
+    }
+
+    /// A recorded data loss that no `Cancel` has announced to the peers yet
+    /// (it was recorded after the machine finished: queued behind the event
+    /// that finished it). Marks it announced: the caller broadcasts `Cancel`.
+    pub(crate) fn take_unannounced_loss(&mut self) -> Option<DataLoss> {
+        if self.cancel_broadcast {
+            return None;
+        }
+        let loss = self.data_loss.clone()?;
+        self.cancel_broadcast = true;
+        Some(loss)
     }
 
     /// Whether every peer has acknowledged our stream or finished its own.
@@ -690,13 +742,27 @@ impl LifecycleMachine {
                     if phase != Phase::Finished {
                         actions.push(Action::SendAck(peer_id.clone()));
                     }
+                    // A data channel ended without its sentinel before the
+                    // goodbye was complete (the events come from different
+                    // bridge tasks, in either order).
+                    if peer.unclean_data_channel {
+                        actions.extend(self.missing_close_marker(peer_id));
+                    }
                 }
             }
             LinkEvent::AckReceived => {
-                // An ack before our end-of-stream would be a protocol violation.
                 if goodbye_sent {
                     peer.ack_received = true;
                     peer.link.retire();
+                } else {
+                    // A peer acknowledges only our end-of-stream, which we
+                    // queue after deciding to send it: out of protocol.
+                    actions.extend(self.on_corruption(
+                        peer_id,
+                        LinkFailure::ProtocolViolation(
+                            "acknowledgement before our end-of-stream".into(),
+                        ),
+                    ));
                 }
             }
             LinkEvent::CancelReceived => {
@@ -724,16 +790,51 @@ impl LifecycleMachine {
             LinkEvent::ControlUndecodable(detail) => {
                 // A corrupted control message may have been a Cancel: the
                 // link can no longer be trusted.
-                actions.extend(self.on_link_failure(
+                actions.extend(self.on_corruption(
                     peer_id,
                     LinkFailure::Decode(format!("control message: {detail}")),
-                    true,
                 ));
             }
             LinkEvent::ProgressChannelEnded(failure) => {
-                peer.progress_channels_ended += 1;
-                let hard = !matches!(failure, LinkFailure::ChannelClosed);
-                actions.extend(self.on_link_failure(peer_id, failure, hard));
+                // A frame after the end-of-stream comes from a channel that
+                // was already counted.
+                if !matches!(failure, LinkFailure::ProtocolViolation(_)) {
+                    peer.progress_channels_ended += 1;
+                }
+                if is_inbound_corruption(&failure, true) {
+                    actions.extend(self.on_corruption(peer_id, failure));
+                } else {
+                    let hard = !matches!(failure, LinkFailure::ChannelClosed);
+                    actions.extend(self.on_link_failure(peer_id, failure, hard));
+                }
+            }
+            LinkEvent::DataChannelEnded(failure) => {
+                if is_inbound_corruption(&failure, true) {
+                    actions.extend(self.on_corruption(peer_id, failure));
+                } else {
+                    peer.unclean_data_channel = true;
+                    if peer.goodbye_received {
+                        actions.extend(self.missing_close_marker(peer_id));
+                    } else {
+                        // Like an EOF on any other channel: the link has
+                        // failed once all of it has closed — unless the
+                        // goodbye completes after all (see
+                        // `missing_close_marker`).
+                        actions.extend(self.on_link_failure(peer_id, failure, false));
+                    }
+                }
+            }
+            LinkEvent::ConnectionFailed(error) => {
+                // The dedicated connection ended: every channel from the peer
+                // closes right after this (and not before: see
+                // `PeerIoNotice`), so a corrupt or oversize frame is never
+                // mistaken for a clean disconnect.
+                let failure = LinkFailure::Transport(error);
+                if is_inbound_corruption(&failure, true) {
+                    actions.extend(self.on_corruption(peer_id, failure));
+                } else {
+                    actions.extend(self.on_link_failure(peer_id, failure, false));
+                }
             }
             LinkEvent::OutboundFailed(failure) => {
                 // Our end-of-stream is the last frame on the lane, so once we
@@ -748,7 +849,12 @@ impl LifecycleMachine {
                 actions.extend(self.on_link_failure(peer_id, failure, hard));
             }
             LinkEvent::TransportError(error) => {
-                actions.extend(self.on_link_failure(peer_id, LinkFailure::Transport(error), true));
+                let failure = LinkFailure::Transport(error);
+                if is_inbound_corruption(&failure, false) {
+                    actions.extend(self.on_corruption(peer_id, failure));
+                } else {
+                    actions.extend(self.on_link_failure(peer_id, failure, true));
+                }
             }
             LinkEvent::InboundDataLost(_) => unreachable!("handled above"),
         }
@@ -818,6 +924,95 @@ impl LifecycleMachine {
                 .as_ref()
                 .map(ToString::to_string)
                 .unwrap_or_default(),
+        }
+    }
+
+    /// The peer finished (its workers succeeded, and a successful worker
+    /// closes every data channel before its goodbye), yet one of its data
+    /// channels ended without its close marker: records our running workers
+    /// still read may be missing, and that input can never be exhausted.
+    /// After local success our inputs were complete, so it does not matter.
+    /// While the dataflow is being cancelled it counts only if every worker
+    /// still succeeds (drain on cancel), like any other loss.
+    fn missing_close_marker(&mut self, peer_id: String) -> Vec<Action> {
+        if self.phase != Phase::Running {
+            return Vec::new();
+        }
+        let loss = DataLoss {
+            peer: peer_id,
+            detail: "a data channel ended without its close marker although the peer finished"
+                .into(),
+        };
+        if self.cancel_broadcast {
+            self.pending_loss.get_or_insert(loss);
+            return Vec::new();
+        }
+        self.fail_running_with_data_loss(loss)
+    }
+
+    /// Records our running workers need can no longer arrive: fail the
+    /// dataflow on every node now, and report the loss (not deferred: the
+    /// affected input will never be exhausted, so the workers would wait).
+    fn fail_running_with_data_loss(&mut self, loss: DataLoss) -> Vec<Action> {
+        if self.data_loss.is_none() {
+            #[cfg(feature = "tracing")]
+            tracing::error!("{loss}");
+            self.data_loss = Some(loss);
+        }
+        let mut actions = vec![Action::CancelDataflow(self.data_loss_reason())];
+        if !self.cancel_broadcast {
+            self.cancel_broadcast = true;
+            actions.push(Action::BroadcastCancel);
+        }
+        actions
+    }
+
+    /// Corrupt traffic from the peer (see [`is_inbound_corruption`]). Fatal
+    /// in every phase before teardown and regardless of retirement, and
+    /// recorded as data loss so that a local success (one racing with the
+    /// cancellation, or one already reported) still fails: while the
+    /// workers run the dataflow is cancelled everywhere; after they
+    /// succeeded, the peers are cancelled and the completion reports the
+    /// loss.
+    fn on_corruption(&mut self, peer_id: String, failure: LinkFailure) -> Vec<Action> {
+        if self.phase == Phase::Finished {
+            // Seen while tearing down (it was queued behind the event that
+            // finished the machine): still recorded, nobody left to tell.
+            self.data_loss.get_or_insert_with(|| DataLoss {
+                peer: peer_id,
+                detail: format!("corrupt traffic from the peer: {failure}"),
+            });
+            return Vec::new();
+        }
+        if let Some(peer) = self.peers.get_mut(&peer_id) {
+            if !peer.retired() {
+                peer.lost = true;
+            }
+            peer.soft_failure = None;
+        }
+        if self.data_loss.is_none() {
+            let loss = DataLoss {
+                peer: peer_id.clone(),
+                detail: format!("corrupt traffic from the peer: {failure}"),
+            };
+            #[cfg(feature = "tracing")]
+            tracing::error!("{loss}");
+            self.data_loss = Some(loss);
+        }
+        match self.phase {
+            Phase::Running if self.cancel_broadcast => Vec::new(),
+            Phase::Running => {
+                self.cancel_broadcast = true;
+                vec![
+                    Action::LinkFailed {
+                        peer: peer_id,
+                        failure,
+                    },
+                    Action::BroadcastCancel,
+                ]
+            }
+            Phase::Draining => self.abandon_after_data_loss(),
+            Phase::Finished => Vec::new(),
         }
     }
 
@@ -1258,15 +1453,32 @@ impl ClusterLifecycle {
         if drain_inbound {
             let _ =
                 tokio::time::timeout(self.cancel_broadcast_timeout, self.inbound.wait_idle()).await;
-            while let Ok(event) = self.events.try_recv() {
-                if let LifecycleEvent::Link {
-                    event: LinkEvent::InboundDataLost(_),
-                    ..
-                } = &event
-                {
+        }
+        // Reports queued behind the event that finished the machine: data
+        // lost on the way in, and corrupt traffic, still fail the result.
+        while let Ok(event) = self.events.try_recv() {
+            if let LifecycleEvent::Link { event: link, .. } = &event {
+                let lost = drain_inbound && matches!(link, LinkEvent::InboundDataLost(_));
+                if lost || is_corruption_event(link) {
                     let _ = self.machine.on_event(event);
                 }
             }
+        }
+        if let Some(loss) = self.machine.take_unannounced_loss() {
+            // A loss recorded once the machine had finished (in this drain,
+            // or among events applied just before teardown) was announced to
+            // nobody. A peer that only acknowledged us may still be running
+            // on our now-invalid output: tell every peer before the
+            // transport goes.
+            let reason = CancellationReason::NetworkError {
+                detail: loss.to_string(),
+            }
+            .to_string();
+            let _ = tokio::time::timeout(
+                self.cancel_broadcast_timeout,
+                broadcast_cancel_with_transport(&self.transport, self.dataflow_id, &reason),
+            )
+            .await;
         }
         if let Some(managers) = managers {
             for manager in managers.values() {
@@ -1413,15 +1625,43 @@ mod tests {
     }
 
     #[test]
-    fn ack_before_goodbye_is_ignored() {
+    fn ack_before_goodbye_is_a_protocol_violation() {
         let (mut m, links) = machine(1, &[("b", 1)]);
+        let actions = m.on_event(link_event("b", LinkEvent::AckReceived));
         assert!(
-            m.on_event(link_event("b", LinkEvent::AckReceived))
-                .is_empty()
+            matches!(
+                actions.as_slice(),
+                [Action::LinkFailed { .. }, Action::BroadcastCancel]
+            ),
+            "{actions:?}"
         );
         assert!(!links[0].is_retired());
-        let actions = m.on_event(done(true));
-        assert!(matches!(actions.as_slice(), [Action::SendGoodbye]));
+        assert!(m.data_loss().is_some());
+    }
+
+    /// Corrupt traffic queued behind the event that finished the machine is
+    /// still recorded when teardown drains it.
+    #[test]
+    fn corruption_after_the_machine_finished_is_still_recorded() {
+        let (mut m, _) = machine(1, &[("b", 1)]);
+        m.on_event(done(true));
+        assert!(is_teardown(
+            &m.on_event(link_event("b", LinkEvent::AckReceived)),
+            true
+        ));
+        let late = LinkEvent::ProgressChannelEnded(LinkFailure::ProtocolViolation(
+            "frame after end-of-stream".into(),
+        ));
+        assert!(is_corruption_event(&late));
+        assert!(m.on_event(link_event("b", late)).is_empty());
+        assert!(m.data_loss().is_some());
+        // Nobody was told yet: teardown must broadcast, once.
+        assert!(m.take_unannounced_loss().is_some());
+        assert!(m.take_unannounced_loss().is_none());
+        // A plain loss is not.
+        assert!(!is_corruption_event(&LinkEvent::ProgressChannelEnded(
+            LinkFailure::ChannelClosed
+        )));
     }
 
     #[test]
@@ -1928,6 +2168,222 @@ mod tests {
         m.on_event(done(true));
         let actions = m.on_event(link_event("b", LinkEvent::ControlUndecodable("crc".into())));
         assert!(is_teardown(&actions, true));
+        // Corrupt traffic: the local result is not trusted.
+        assert!(m.data_loss().is_some());
+    }
+
+    fn has_cancel_everywhere(actions: &[Action]) -> bool {
+        actions.iter().any(|a| matches!(a, Action::BroadcastCancel))
+    }
+
+    /// Corrupt traffic is fatal and durable in every phase, also on a
+    /// retired link: a worker that races to success still reports it.
+    #[test]
+    fn corrupt_traffic_is_durable_data_loss_in_every_phase() {
+        let corruptions = || {
+            [
+                LinkEvent::ProgressChannelEnded(LinkFailure::Decode("crc".into())),
+                LinkEvent::DataChannelEnded(LinkFailure::Decode("tag".into())),
+                LinkEvent::ControlUndecodable("crc".into()),
+                LinkEvent::ConnectionFailed(TransportError::ChecksumMismatch {
+                    expected: 1,
+                    actual: 2,
+                }),
+                LinkEvent::ConnectionFailed(TransportError::PayloadTooLarge { size: 2, max: 1 }),
+                LinkEvent::TransportError(TransportError::ChecksumMismatch {
+                    expected: 1,
+                    actual: 2,
+                }),
+            ]
+        };
+        // While running: cancel everywhere; a racing success still fails.
+        for event in corruptions() {
+            let (mut m, _) = machine(1, &[("b", 1), ("c", 1)]);
+            let actions = m.on_event(link_event("b", event));
+            assert!(
+                matches!(
+                    actions.as_slice(),
+                    [Action::LinkFailed { .. }, Action::BroadcastCancel]
+                ),
+                "{actions:?}"
+            );
+            assert!(m.data_loss().is_some());
+            let actions = m.on_event(done(true));
+            assert!(
+                !actions.iter().any(|a| matches!(a, Action::SendGoodbye)),
+                "{actions:?}"
+            );
+            assert!(is_teardown(&actions, false), "{actions:?}");
+        }
+        // On a retired link while running.
+        for event in corruptions() {
+            let (mut m, links) = machine(1, &[("b", 1), ("c", 1)]);
+            m.on_event(link_event("b", LinkEvent::ProgressEndOfStream));
+            assert!(links[0].is_retired());
+            let actions = m.on_event(link_event("b", event));
+            assert!(has_cancel_everywhere(&actions), "{actions:?}");
+            assert!(m.data_loss().is_some());
+        }
+        // After local success: the result becomes an error, every peer is
+        // told (also c, which only acknowledged us and may still run), and
+        // nothing waits for them.
+        for event in corruptions() {
+            let (mut m, _) = machine(1, &[("b", 1), ("c", 1)]);
+            m.on_event(done(true));
+            m.on_event(link_event("c", LinkEvent::AckReceived));
+            let actions = m.on_event(link_event("b", event));
+            assert!(has_cancel_everywhere(&actions), "{actions:?}");
+            assert!(is_teardown(&actions, true), "{actions:?}");
+            assert!(m.data_loss().is_some());
+            // Already announced by that broadcast.
+            assert!(m.take_unannounced_loss().is_none());
+        }
+    }
+
+    /// Losses are not corruption: an EOF (also mid-frame), a reorder timeout
+    /// or a shared-transport error keep the loss rules — never durable data
+    /// loss after local success or on a retired link — and our own oversize
+    /// frame is not the peer's corrupt traffic.
+    #[test]
+    fn losses_are_never_durable_after_success_or_on_retired_links() {
+        let losses = || {
+            [
+                LinkEvent::TransportError(TransportError::ReorderTimeout),
+                LinkEvent::TransportError(TransportError::ConnectionClosed),
+                LinkEvent::TransportError(TransportError::PayloadTooLarge { size: 2, max: 1 }),
+                LinkEvent::ConnectionFailed(TransportError::ConnectionClosed),
+                LinkEvent::ConnectionFailed(TransportError::Io(std::io::Error::new(
+                    std::io::ErrorKind::UnexpectedEof,
+                    "frame truncated by the peer's teardown",
+                ))),
+                LinkEvent::ProgressChannelEnded(LinkFailure::ChannelClosed),
+            ]
+        };
+        for event in losses() {
+            let (mut m, _) = machine(1, &[("b", 1)]);
+            m.on_event(done(true));
+            m.on_event(link_event("b", event));
+            assert!(m.data_loss().is_none());
+        }
+        for event in losses() {
+            let (mut m, _) = machine(1, &[("b", 1)]);
+            m.on_event(link_event("b", LinkEvent::ProgressEndOfStream));
+            assert!(m.on_event(link_event("b", event)).is_empty());
+            assert!(m.data_loss().is_none());
+        }
+        // A reorder timeout while running stays fatal, but not durable.
+        let (mut m, _) = machine(1, &[("b", 1)]);
+        let actions = m.on_event(link_event(
+            "b",
+            LinkEvent::TransportError(TransportError::ReorderTimeout),
+        ));
+        assert!(has_cancel_everywhere(&actions), "{actions:?}");
+        assert!(m.data_loss().is_none());
+        // Our own frame over the limit is not the peer's corrupt traffic.
+        let (mut m, _) = machine(1, &[("b", 1)]);
+        m.on_event(done(true));
+        m.on_event(link_event(
+            "b",
+            LinkEvent::OutboundFailed(LinkFailure::Transport(TransportError::PayloadTooLarge {
+                size: 2,
+                max: 1,
+            })),
+        ));
+        assert!(m.data_loss().is_none());
+    }
+
+    /// A peer that said goodbye closed every data channel first (a
+    /// successful worker always does): one ending without its close marker
+    /// while our workers still read it is data loss, at once.
+    #[test]
+    fn data_channel_without_close_marker_after_goodbye_is_data_loss_while_running() {
+        let ended = || link_event("b", LinkEvent::DataChannelEnded(LinkFailure::ChannelClosed));
+        let (mut m, _) = machine(1, &[("b", 1)]);
+        m.on_event(link_event("b", LinkEvent::ProgressEndOfStream));
+        let actions = m.on_event(ended());
+        assert!(
+            matches!(
+                actions.as_slice(),
+                [Action::CancelDataflow(_), Action::BroadcastCancel]
+            ),
+            "{actions:?}"
+        );
+        assert!(m.data_loss().is_some());
+        // Before the goodbye it is an ordinary (soft) loss.
+        let (mut m, _) = machine(1, &[("b", 1)]);
+        assert!(matches!(
+            m.on_event(ended()).as_slice(),
+            [Action::ArmSoftFailureTimer(_)]
+        ));
+        assert!(m.data_loss().is_none());
+        // After local success it is benign (our inputs were complete).
+        let (mut m, _) = machine(1, &[("b", 1)]);
+        m.on_event(link_event("b", LinkEvent::ProgressEndOfStream));
+        m.on_event(done(true));
+        assert!(m.on_event(ended()).is_empty());
+        assert!(m.data_loss().is_none());
+        // The goodbye completing after the channel ended (other bridge task)
+        // is caught too, although the link then counts as retired.
+        let (mut m, _) = machine(1, &[("b", 1)]);
+        assert!(matches!(
+            m.on_event(ended()).as_slice(),
+            [Action::ArmSoftFailureTimer(_)]
+        ));
+        let actions = m.on_event(link_event("b", LinkEvent::ProgressEndOfStream));
+        assert!(
+            actions
+                .iter()
+                .any(|a| matches!(a, Action::CancelDataflow(_))),
+            "{actions:?}"
+        );
+        assert!(m.data_loss().is_some());
+        // While cancelling, it is kept pending: it fails a drained success.
+        let (mut m, _) = machine(1, &[("b", 1)]);
+        m.on_dataflow_cancelled();
+        m.on_event(link_event("b", LinkEvent::ProgressEndOfStream));
+        assert!(m.on_event(ended()).is_empty());
+        let actions = m.on_event(done(true));
+        assert!(is_teardown(&actions, false), "{actions:?}");
+        assert!(m.data_loss().is_some());
+    }
+
+    #[test]
+    fn progress_frame_after_end_of_stream_is_corruption_counted_once() {
+        let (mut m, _) = machine(1, &[("b", 2), ("c", 1)]);
+        m.on_event(link_event("b", LinkEvent::ProgressEndOfStream));
+        m.on_event(link_event("b", LinkEvent::ProgressEndOfStream));
+        let actions = m.on_event(link_event(
+            "b",
+            LinkEvent::ProgressChannelEnded(LinkFailure::ProtocolViolation("after eos".into())),
+        ));
+        assert!(has_cancel_everywhere(&actions), "{actions:?}");
+        assert!(m.data_loss().is_some());
+        assert_eq!(m.peers["b"].progress_channels_ended, 2);
+    }
+
+    /// The dedicated connection's end is a soft loss: decided once the rest
+    /// of the link has closed (so a queued Cancel wins).
+    #[test]
+    fn connection_end_is_a_soft_loss() {
+        let (mut m, _) = machine(1, &[("b", 1)]);
+        assert!(matches!(
+            m.on_event(link_event(
+                "b",
+                LinkEvent::ConnectionFailed(TransportError::ConnectionClosed)
+            ))
+            .as_slice(),
+            [Action::ArmSoftFailureTimer(_)]
+        ));
+        assert!(m.on_event(eof("b")).is_empty());
+        let actions = m.on_event(link_event("b", LinkEvent::ControlClosed));
+        assert!(
+            matches!(
+                actions.as_slice(),
+                [Action::LinkFailed { .. }, Action::BroadcastCancel]
+            ),
+            "{actions:?}"
+        );
+        assert!(m.data_loss().is_none());
     }
 
     fn lost(peer: &str) -> LifecycleEvent {
@@ -2097,8 +2553,8 @@ mod tests {
     fn hard_failure_or_peer_cancel_during_draining_resolves_peer() {
         for event in [
             LinkEvent::TransportError(TransportError::ConnectionClosed),
+            LinkEvent::TransportError(TransportError::ReorderTimeout),
             LinkEvent::CancelReceived,
-            LinkEvent::ProgressChannelEnded(LinkFailure::Decode("crc".into())),
         ] {
             let (mut m, _) = machine(1, &[("b", 1), ("c", 1)]);
             m.on_event(done(true));

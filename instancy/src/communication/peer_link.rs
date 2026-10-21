@@ -38,13 +38,17 @@ pub(crate) enum LinkFailure {
     ChannelClosed,
     /// A frame could not be decoded (CRC mismatch or malformed payload).
     Decode(String),
+    /// A frame broke the protocol: it arrived after its channel's end
+    /// marker, or a channel ended without its marker after the peer said
+    /// goodbye. Reported as data loss.
+    ProtocolViolation(String),
     /// A local lock was poisoned while delivering a frame.
     LockPoisoned,
     /// The transport rejected an outbound frame (writer gone).
     SendFailed,
     /// An outbound frame could not be encoded.
     Encode(String),
-    /// The shared transport reported a failure for this peer.
+    /// The transport reported a failure for this peer.
     Transport(TransportError),
 }
 
@@ -53,6 +57,7 @@ impl std::fmt::Display for LinkFailure {
         match self {
             Self::ChannelClosed => f.write_str("connection closed before end of stream"),
             Self::Decode(detail) => write!(f, "undecodable frame: {detail}"),
+            Self::ProtocolViolation(detail) => write!(f, "unexpected frame: {detail}"),
             Self::LockPoisoned => f.write_str("lock poisoned while delivering a frame"),
             Self::SendFailed => f.write_str("outbound frame could not be sent"),
             Self::Encode(detail) => write!(f, "outbound frame could not be encoded: {detail}"),
@@ -66,8 +71,12 @@ impl std::fmt::Display for LinkFailure {
 pub(crate) enum LinkEvent {
     /// One progress channel from the peer delivered its end-of-stream marker.
     ProgressEndOfStream,
-    /// One progress channel from the peer ended without its marker.
+    /// One progress channel from the peer ended without its marker, failed
+    /// to decode, or carried a frame after its marker.
     ProgressChannelEnded(LinkFailure),
+    /// One data channel from the peer ended without its close sentinel,
+    /// failed to decode, or carried a frame after its sentinel.
+    DataChannelEnded(LinkFailure),
     /// An outbound frame to the peer could not be sent or encoded.
     OutboundFailed(LinkFailure),
     /// The peer acknowledged our end-of-stream.
@@ -78,12 +87,17 @@ pub(crate) enum LinkEvent {
     ControlClosed,
     /// A control message from the peer could not be decoded.
     ControlUndecodable(String),
-    /// The shared transport reported an error for this peer.
+    /// The shared transport reported an error for this peer. Its channels
+    /// stay open.
     TransportError(TransportError),
     /// A data frame from the peer could not be delivered to the local
     /// operator it was addressed to (the operator had already finished), or
     /// arrived after the channel's close marker.
     InboundDataLost(String),
+    /// The dedicated connection to the peer ended (EOF) or failed; every
+    /// channel from the peer is closing. Reported before those channels
+    /// close (see `PeerIoNotice`).
+    ConnectionFailed(TransportError),
 }
 
 /// Input to the cluster lifecycle coordinator.
@@ -198,6 +212,15 @@ impl PeerMonitor {
     /// Report an event on this peer's link.
     pub(crate) fn report(&self, event: LinkEvent) {
         report_link_event(&self.events, &self.peer, event);
+    }
+
+    /// A monitor for tests.
+    #[cfg(test)]
+    pub(crate) fn for_test(peer: &str, events: LifecycleEventSender) -> Self {
+        Self {
+            peer: Arc::from(peer),
+            events,
+        }
     }
 }
 

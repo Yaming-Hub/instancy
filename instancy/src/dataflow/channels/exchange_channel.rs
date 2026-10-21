@@ -659,9 +659,10 @@ impl<T: Timestamp, D: Clone + Send + 'static> Push<T, D> for ExchangePush<T, D> 
 
 impl<T: Timestamp, D: Send + 'static> Drop for ExchangePush<T, D> {
     fn drop(&mut self) {
-        // Ensure all targets are closed so pull sides see exhaustion.
+        // Close every target so pull sides see exhaustion — unless a target
+        // knows its worker did not complete (cluster endpoints).
         for target in &mut self.targets {
-            target.close();
+            target.close_on_drop();
         }
         self.wakes.wake_all();
     }
@@ -840,7 +841,7 @@ impl<T: Timestamp, D: Clone + Send + 'static> Push<T, D> for BroadcastPush<T, D>
 impl<T: Timestamp, D: Clone + Send + 'static> Drop for BroadcastPush<T, D> {
     fn drop(&mut self) {
         for target in &mut self.targets {
-            target.close();
+            target.close_on_drop();
         }
         self.wakes.wake_all();
     }
@@ -1240,6 +1241,10 @@ pub(crate) struct NetworkMaterializerParams {
         std::collections::HashMap<String, crate::communication::peer_link::PeerOutbox>,
     /// Inbound bridge tracking for data-loss detection and teardown.
     pub inbound_bridges: crate::communication::peer_link::InboundBridges,
+    /// Per-worker flags (indexed by global worker ID) set when a local worker
+    /// completes successfully; only then does a dropped network push close
+    /// its channel cleanly.
+    pub worker_completed: Vec<Arc<std::sync::atomic::AtomicBool>>,
 }
 
 /// Trait for creating network-backed exchange channel factories.
@@ -1304,7 +1309,8 @@ where
                 params.runtime_handle,
             )?
             .with_peer_outboxes(params.peer_outboxes)
-            .with_inbound_bridges(params.inbound_bridges),
+            .with_inbound_bridges(params.inbound_bridges)
+            .with_worker_completion(params.worker_completed),
         ));
         Ok(build_exchange_factories(
             params.num_workers,
@@ -1369,7 +1375,8 @@ where
                 params.runtime_handle,
             )?
             .with_peer_outboxes(params.peer_outboxes)
-            .with_inbound_bridges(params.inbound_bridges),
+            .with_inbound_bridges(params.inbound_bridges)
+            .with_worker_completion(params.worker_completed),
         ));
         Ok(build_broadcast_factories(
             params.num_workers,

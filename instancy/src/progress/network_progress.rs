@@ -367,8 +367,11 @@ pub(crate) fn decode_progress_frame<T: Timestamp + ExchangeData>(
 /// Wakes the target worker on each received batch so the executor
 /// processes the incoming progress updates promptly.
 ///
-/// Exits after the end-of-stream marker (reported as
-/// [`LinkEvent::ProgressEndOfStream`]). If the channel closes, a frame fails
+/// Reports [`LinkEvent::ProgressEndOfStream`] on the end-of-stream marker and
+/// then keeps reading until the channel closes: the peer may still
+/// acknowledge our end-of-stream on it, but any other frame after the marker
+/// breaks the protocol ([`LinkEvent::ProgressChannelEnded`] with
+/// `ProtocolViolation` or `Decode`, reported once). If the channel closes, a frame fails
 /// to decode, or the buffer lock is poisoned before that marker, the bridge
 /// reports [`LinkEvent::ProgressChannelEnded`] and exits; the lifecycle
 /// coordinator decides whether that is a failure. `cancel` stops the bridge
@@ -385,7 +388,6 @@ async fn progress_recv_bridge<T: Timestamp + ExchangeData>(
     max_batch_size: usize,
     events: LifecycleEventSender,
 ) {
-    let _ = channel_id;
     let failure = loop {
         tokio::select! {
             biased;
@@ -403,6 +405,15 @@ async fn progress_recv_bridge<T: Timestamp + ExchangeData>(
                     }
                     Ok(ProgressFrame::EndOfStream) => {
                         report_link_event(&events, &peer_id, LinkEvent::ProgressEndOfStream);
+                        watch_after_end_of_stream::<T>(
+                            &mut rx,
+                            &cancel,
+                            &peer_id,
+                            channel_id,
+                            max_batch_size,
+                            &events,
+                        )
+                        .await;
                         return;
                     }
                     Ok(ProgressFrame::Ack) => {
@@ -423,6 +434,55 @@ async fn progress_recv_bridge<T: Timestamp + ExchangeData>(
         }
     };
     report_link_event(&events, &peer_id, LinkEvent::ProgressChannelEnded(failure));
+}
+
+/// After a progress channel's end-of-stream, wait for the channel to close
+/// (or teardown). The peer's acknowledgement of our end-of-stream may still
+/// arrive on it; the first other frame is reported as a protocol violation.
+#[cfg(feature = "transport")]
+async fn watch_after_end_of_stream<T: Timestamp + ExchangeData>(
+    rx: &mut tokio_mpsc::Receiver<Vec<u8>>,
+    cancel: &tokio_util::sync::CancellationToken,
+    peer_id: &str,
+    channel_id: u64,
+    max_batch_size: usize,
+    events: &LifecycleEventSender,
+) {
+    let mut reported = false;
+    loop {
+        tokio::select! {
+            biased;
+            _ = cancel.cancelled() => return,
+            data = rx.recv() => match data {
+                Some(bytes) => {
+                    let failure = match decode_progress_frame::<T>(&bytes, max_batch_size) {
+                        Ok(ProgressFrame::Ack) => {
+                            report_link_event(events, peer_id, LinkEvent::AckReceived);
+                            continue;
+                        }
+                        // Both kinds: the channel was already counted at its
+                        // end-of-stream.
+                        Ok(_) => LinkFailure::ProtocolViolation(format!(
+                            "frame on progress channel {channel_id} after its end-of-stream"
+                        )),
+                        Err(e) => LinkFailure::ProtocolViolation(format!(
+                            "undecodable frame on progress channel {channel_id} after its \
+                             end-of-stream: {e}"
+                        )),
+                    };
+                    if !reported {
+                        reported = true;
+                        report_link_event(
+                            events,
+                            peer_id,
+                            LinkEvent::ProgressChannelEnded(failure),
+                        );
+                    }
+                }
+                None => return,
+            }
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -932,10 +992,13 @@ mod tests {
         tx.send(encode_progress_ack()).await.unwrap();
         tx.send(bufs.into_iter().next().unwrap()).await.unwrap();
         tx.send(encode_progress_end_of_stream()).await.unwrap();
+        // The bridge keeps watching the channel after its end-of-stream and
+        // exits once the channel closes.
+        drop(tx);
 
         tokio::time::timeout(std::time::Duration::from_secs(2), handle)
             .await
-            .expect("bridge exits after end-of-stream")
+            .expect("bridge exits when the channel closes after end-of-stream")
             .unwrap();
 
         let receiver = ProgressReceiver::<u64>::new(Arc::clone(&shared));
@@ -958,6 +1021,47 @@ mod tests {
             })
         ));
         assert!(!cancel.is_cancelled(), "bridge never cancels on its own");
+    }
+
+    #[tokio::test]
+    async fn recv_bridge_reports_frame_after_end_of_stream_once() {
+        use crate::communication::peer_link::LifecycleEvent;
+
+        let (tx, rx) = tokio_mpsc::channel::<Vec<u8>>(16);
+        let shared = new_shared();
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let (handle, mut events_rx) = spawn_recv_bridge(rx, &shared, &cancel);
+
+        let changes = vec![ProgressChange::source(0, 0, 1u64, 1)];
+        let mut bufs = Vec::new();
+        encode_progress_batch(&changes, &mut bufs, DEFAULT_MAX_BATCH_SIZE).unwrap();
+        tx.send(encode_progress_end_of_stream()).await.unwrap();
+        tx.send(bufs[0].clone()).await.unwrap();
+        tx.send(bufs[0].clone()).await.unwrap();
+        drop(tx);
+        tokio::time::timeout(std::time::Duration::from_secs(2), handle)
+            .await
+            .expect("bridge exits when the channel closes")
+            .unwrap();
+        let mut events = Vec::new();
+        while let Ok(LifecycleEvent::Link { event, .. }) = events_rx.try_recv() {
+            events.push(event);
+        }
+        assert!(
+            matches!(
+                events.as_slice(),
+                [
+                    LinkEvent::ProgressEndOfStream,
+                    LinkEvent::ProgressChannelEnded(LinkFailure::ProtocolViolation(_))
+                ]
+            ),
+            "{events:?}"
+        );
+        let receiver = ProgressReceiver::<u64>::new(Arc::clone(&shared));
+        assert!(
+            receiver.drain_all().unwrap().is_empty(),
+            "frames after end-of-stream are not applied"
+        );
     }
 
     #[tokio::test]

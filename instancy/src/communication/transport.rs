@@ -508,11 +508,22 @@ mod tokio_impl {
         /// - An I/O error occurs
         /// - All channel senders are dropped (no one to deliver to)
         pub async fn run(mut self) -> Result<(), TransportError> {
+            match self.run_until_end().await {
+                DemuxEnd::Eof | DemuxEnd::ReceiversDropped | DemuxEnd::Released => Ok(()),
+                DemuxEnd::Failed(e) => Err(e),
+            }
+        }
+
+        /// Like [`run`](Self::run), but tells a peer's EOF apart from every
+        /// receiver having been dropped. The registered channels stay open
+        /// until the demuxer is dropped, so the caller can report why the
+        /// connection ended before anyone sees them close.
+        pub(crate) async fn run_until_end(&mut self) -> DemuxEnd {
             loop {
                 let frame = match self.reader.read_frame().await {
                     Ok(f) => f,
-                    Err(TransportError::ConnectionClosed) => return Ok(()),
-                    Err(e) => return Err(e),
+                    Err(TransportError::ConnectionClosed) => return DemuxEnd::Eof,
+                    Err(e) => return DemuxEnd::Failed(e),
                 };
 
                 let key = (frame.dataflow_id, frame.channel_id);
@@ -526,7 +537,7 @@ mod tokio_impl {
 
                 // If all channels are gone, stop
                 if self.channels.is_empty() {
-                    return Ok(());
+                    return DemuxEnd::ReceiversDropped;
                 }
             }
         }
@@ -546,6 +557,21 @@ mod tokio_impl {
             closed: tokio_util::sync::CancellationToken,
             linger: std::time::Duration,
         ) -> Result<(), TransportError> {
+            match self.run_lingering_until_end(closed, linger).await {
+                DemuxEnd::Failed(e) => Err(e),
+                DemuxEnd::Eof | DemuxEnd::ReceiversDropped | DemuxEnd::Released => Ok(()),
+            }
+        }
+
+        /// Like [`run_lingering`](Self::run_lingering), but tells why it
+        /// stopped, and leaves the registered channels open until the demuxer
+        /// is dropped, so the caller can report why the connection ended
+        /// before anyone sees those channels close.
+        pub(crate) async fn run_lingering_until_end(
+            &mut self,
+            closed: tokio_util::sync::CancellationToken,
+            linger: std::time::Duration,
+        ) -> DemuxEnd {
             /// How often (in frames) a peer that never lets this task block
             /// is checked against the linger deadline.
             const CHECK_EVERY: u32 = 64;
@@ -563,10 +589,10 @@ mod tokio_impl {
                     biased;
                     frame = self.reader.read_frame() => match frame {
                         Ok(f) => f,
-                        Err(TransportError::ConnectionClosed) => return Ok(()),
-                        Err(e) => return Err(e),
+                        Err(TransportError::ConnectionClosed) => return DemuxEnd::Eof,
+                        Err(e) => return DemuxEnd::Failed(e),
                     },
-                    _ = &mut expired => return Ok(()),
+                    _ = &mut expired => return DemuxEnd::Released,
                 };
                 frames = frames.wrapping_add(1);
                 if frames % CHECK_EVERY == 0 {
@@ -574,7 +600,7 @@ mod tokio_impl {
                         deadline = Some(tokio::time::Instant::now() + linger);
                     }
                     if deadline.is_some_and(|d| tokio::time::Instant::now() >= d) {
-                        return Ok(());
+                        return DemuxEnd::Released;
                     }
                 }
                 let key = (frame.dataflow_id, frame.channel_id);
@@ -582,7 +608,7 @@ mod tokio_impl {
                     let sent = tokio::select! {
                         biased;
                         sent = tx.send(frame.payload) => sent,
-                        _ = &mut expired => return Ok(()),
+                        _ = &mut expired => return DemuxEnd::Released,
                     };
                     if sent.is_err() {
                         self.channels.remove(&key);
@@ -590,6 +616,20 @@ mod tokio_impl {
                 }
             }
         }
+    }
+
+    /// Why a [`Demuxer`] stopped.
+    #[derive(Debug)]
+    pub(crate) enum DemuxEnd {
+        /// The peer closed the connection.
+        Eof,
+        /// Every registered receiver was dropped.
+        ReceiversDropped,
+        /// Reading failed (I/O error, corrupt or oversize frame).
+        Failed(TransportError),
+        /// The owner released the connection and the linger period expired
+        /// (see [`Demuxer::run_lingering`]).
+        Released,
     }
 
     /// A multiplexer that collects frames from multiple channel senders and

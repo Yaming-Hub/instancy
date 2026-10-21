@@ -49,8 +49,9 @@ The `reason` field is a human-readable string (e.g., `"user requested shutdown"`
 
 | Component | Trigger | Action |
 |-----------|---------|--------|
-| **Lifecycle coordinator** (spawned in Phase 11) | Local `dataflow_cancel` token fires while local workers are still running | Sends `Cancel` to every peer's control channel (bounded by `handshake_timeout`), then tears down once the local workers have stopped |
+| **Lifecycle coordinator** (spawned in Phase 11) | Local `dataflow_cancel` token fires while local workers are still running, or a link fails before it is retired (§5.5.3) | Sends `Cancel` to every peer's control channel concurrently (bounded by `handshake_timeout`), then tears down once the local workers have stopped |
 | **Control dispatcher** (spawned in Phase 8.5) | Receives `Cancel` on any peer control channel | Fires local `dataflow_cancel` with `CancellationReason::PeerCancelled { peer_id, detail }` |
+| **Spawn abort guard** (Phases 1–9) | `spawn_cluster` fails, or its future is dropped, before the coordinator takes over | Sends `Cancel` to every peer (§5.5.2) |
 
 Both run on the tokio runtime passed to `spawn_cluster`. The dispatcher keeps
 running until teardown (it also receives the shutdown handshake's
@@ -58,6 +59,12 @@ acknowledgements, §5.5.3) and handles any message already queued before it
 exits. A local cancellation that happens *after* this node's workers completed
 successfully is not broadcast: the node's part of the dataflow is done, and
 the shutdown handshake still runs to completion.
+
+The `Cancel` reason is the `Display` text of the local
+`CancellationReason`, so a failure stays recognisable as one on the
+receiving side (`network error: …`, `worker failed: …`). The broadcast sends
+to all peers at once: a peer whose control queue is stuck does not delay the
+others.
 
 **First-cancel-wins semantics** — `CancellationToken::cancel_with_reason()` is
 idempotent: once the token is cancelled, subsequent calls are no-ops. This
@@ -151,7 +158,32 @@ started.
 
 Both phases use the same `handshake_timeout` parameter. Each waits at most
 `handshake_timeout` for peer responses; if any peer doesn't respond in time,
-`spawn_cluster` returns `Err(HandshakeError::Timeout { peer_id })`.
+`spawn_cluster` returns `Err(HandshakeError::Timeout { peer_id })`. Both wait
+on every peer at once, so one slow peer does not hide another peer's failure:
+a peer's `Cancel` ends the wait with `HandshakeError::PeerCancelled`, and a
+closed control channel with `HandshakeError::PeerDisconnected`. The ready
+barrier keeps watching peers that already sent `Ready` (after `Ready` a peer
+sends nothing else on its control channel until it cancels), and before it
+returns it applies a `Cancel` already queued behind a peer's `Ready`.
+
+**Failing to spawn notifies the peers.** If `spawn_cluster` fails on a node
+after it started (or its future is dropped) before the lifecycle coordinator
+takes over, the node sends `Cancel` to every peer with the reason
+`worker failed: spawn_cluster failed on node <id>: <error>`. In dedicated
+mode before the transport exists, dropping the connections is the signal
+(peers see `PeerDisconnected`); shared managers connect first if needed.
+Peers still in the handshake or barrier then fail promptly instead of waiting
+for their timeout, and a peer that already passed the barrier (this node's
+`Ready` reached it before the failure) is cancelled by its dispatcher instead
+of running, and possibly succeeding, without this node. A peer that consumed
+this node's `Handshake` before it failed is only told at the barrier (its
+handshake does not watch peers that already answered, because their `Ready`
+follows), so it may still wait out its handshake timeout on a third node.
+
+**Async sources start after the barrier.** `source_async` producers run user
+code (they may consume an external queue), so their pump threads are started
+only after the ready barrier succeeded; a node whose spawn fails never runs
+them.
 
 **What happens when one node doesn't call `spawn_cluster`:**
 
@@ -399,9 +431,9 @@ push finds the queue to a peer that has not finished closed does not fail
 with `ChannelClosed` either, which would hide why the link closed: the push
 reports the link failure to the coordinator (once) and backs off as for a
 full queue until the coordinator cancels the dataflow with the actual reason
-(the peer's `Cancel`, the link ending, or the grace period). The single hook
-for this is `LifecycleMachine::on_link_failure` (`Action::LinkFailed`); PR8
-extends failure *detection* from there.
+(the peer's `Cancel`, the link ending, or the grace period). Every failure is
+decided in `LifecycleMachine::on_link_failure` (losses) or
+`LifecycleMachine::on_corruption` (corrupt traffic, see below).
 If the dataflow is already being cancelled, such failures are expected and the
 coordinator simply waits for the local workers to stop.
 A local cancellation or runtime shutdown that happens after the goodbye was
@@ -411,6 +443,84 @@ runtime shutdown): after local success the node still tears down gracefully,
 so the bounded flush delivers its queued goodbye and acknowledgements to the
 reachable peers; while its workers still run, it broadcasts `Cancel` first.
 
+**Unclean loss and corruption are fatal.** A link that is not retired ends
+*uncleanly* when one of its channels ends without its marker, or carries a
+frame that cannot be decoded or that breaks the protocol. Every such end is
+reported to the coordinator:
+
+| Signal | Reported by |
+|---|---|
+| A data channel closes before its close sentinel; a data frame fails to decode | the data receive bridge / `NetworkPull` (`DataChannelEnded`) |
+| Records arrive after a data channel's close sentinel, or after the consuming operator finished | the data receive bridge / `NetworkPull` (`InboundDataLost`) |
+| A progress channel closes before its end-of-stream; a progress frame fails its CRC or decode; a frame other than the acknowledgement follows the end-of-stream | the progress receive bridge (`ProgressChannelEnded`) |
+| The control channel closes; a control message fails to decode | the control dispatcher (`ControlClosed`, `ControlUndecodable`) |
+| Dedicated: the peer closes the connection, or reading fails (I/O error, checksum mismatch, a frame announcing a payload over the limit) | the transport session (`ConnectionFailed`) |
+| Dedicated: writing fails, or an outbound frame exceeds the frame limit | the transport session (`OutboundFailed`) |
+| Shared: reconnect attempts exhausted, reorder timeout, poisoned lock | the shared managers (`TransportError`) |
+| Our goodbye or progress could not be handed to the transport | the outbox forwarder (`OutboundFailed`) |
+
+A receive channel that ended uncleanly never counts as exhausted, so no worker
+can complete with missing data while the failure is decided. A dedicated
+session keeps a peer's channels open until the event that ended its read side
+has been handed to the coordinator, so the coordinator always learns *why* a
+connection ended (EOF, I/O error, corrupt or oversize frame) before it sees
+the channels close. *Losses* (EOF, a closed channel, a writer gone, a
+reorder timeout, a shared manager dropping or reconnecting) follow the rules
+above: soft until the whole link has closed, fatal while the workers run,
+benign on a retired link, and only resolving the peer after local success.
+
+*Corrupt traffic* is classified by its cause: a frame that fails to decode or
+its checksum, a received frame announcing a payload over the frame limit, or
+a frame that breaks the protocol (any frame after a data channel's close
+sentinel, a progress frame other than the acknowledgement after a progress
+channel's end-of-stream, or an acknowledgement before our own goodbye). A
+frame truncated by a peer's teardown is an EOF, not corruption. Corrupt traffic never occurs in a healthy run, and whatever the
+frame carried is lost (half of a progress batch that was split across frames,
+say), so nothing proves the local result did not need it. It is therefore
+fatal in every phase before teardown and even on a retired link, and it is
+recorded as data loss: while the workers run, the dataflow is cancelled on
+every node (a worker that completes successfully before it observes the
+cancellation still reports the loss); after local success, the node sends
+`Cancel` to every peer that has not sent its goodbye — including one that
+only acknowledged ours, which may still be running on our now-suspect output
+— stops waiting for them, and its completion returns
+`CommunicationError::DataLoss`. Corruption (or data loss) reported after the
+machine decided to tear down (queued behind the last acknowledgement, say)
+is still applied while teardown drains the remaining events, and the peers
+are then sent `Cancel` before the transport is released. Frames the
+consuming operator never decodes itself (left in its buffer when it
+finishes, or arriving afterwards) are decoded by the runtime, so a corrupt
+one is reported rather than discarded. During the ready barrier an
+undecodable control message from any peer (it may have been a `Cancel`)
+fails `spawn_cluster`.
+
+A data channel that ends without its close sentinel while our workers still
+read it, from a peer that has said (or then says) goodbye, is data loss too:
+a peer says goodbye only after every one of its workers succeeded, and a
+successful worker closes each of its data channels — including those that
+never carried a record — before that. The check does not depend on whether
+the channel's end or the peer's last end-of-stream is processed first.
+
+**Only a successful worker closes its channels cleanly.** An operator closes
+its output channels (sending the close sentinel) when its input is exhausted.
+An async source whose producer is cut off by a cancellation (without
+`drain_on_cancel`), or whose producer never started, does not count its closed
+channel as the end of its input: it neither finishes nor closes its output,
+and the worker stops on the cancellation.
+An exchange or broadcast output that is dropped without being closed —
+operators force-closed at completion, or a worker that fails, is cancelled, or
+never runs (its spawn failed) — closes each target (`Push::close_on_drop`)
+only if its worker completed successfully, which the runtime records before
+it drops the executor. This holds for network targets (no close sentinel) and
+for same-node targets alike. Otherwise a peer, or a sibling worker that then
+closes its own outputs to peers, could treat a truncated stream as complete
+and finish with missing data. A close sentinel is exactly one byte; a close
+tag followed by anything is a decode error, not an end of stream. A push
+whose encoding exceeds the transport's frame limit fails with
+`CommunicationError::FrameTooLarge` (it never reaches the transport). If an
+outbound frame is nevertheless dropped by the transport while draining (it
+exceeded the limit), the peer cannot finish correctly; that is handled like
+any failed send.
 **Residual limits.** The last message of any handshake cannot itself be
 confirmed. If a node's transport is *aborted* (its tokio runtime dropped) at
 the instant its peer also finishes, that peer may miss both the goodbye and
@@ -419,11 +529,25 @@ reconnect attempts are exhausted) and still reports its own local result.
 Frames still waiting in a shared manager's bridge queue (not yet on a
 connection's writer queue) are lost when an application drops the last
 reference to that manager outside a dataflow's teardown. A peer that is
-partitioned but whose connection never fails delays the handshake until the
-connection fails. If a `Cancel` broadcast times out (its control queue stayed
-full for `handshake_timeout`) and the local workers then still succeed, a
-Shared-mode peer that never received the `Cancel` may miss the goodbye too,
-because the goodbye is dropped when the dataflow unregisters.
+partitioned but whose connection never fails is not detected: the dataflow
+waits until the connection fails or the application reports the node down
+(`report_node_leave`). If a `Cancel` broadcast times out (its control queue
+stayed full for `handshake_timeout`) and the local workers then still succeed,
+a Shared-mode peer that never received the `Cancel` may miss the goodbye too,
+because the goodbye is dropped when the dataflow unregisters. A frame that
+arrives while the node tears down (after its last link resolved) may not be
+read at all; corruption in it is then not seen. Detection of protocol
+violations assumes a peer running this protocol: a peer that sends data on a
+channel after its own goodbye without ever closing it, or acknowledges
+before our goodbye in a race with our last worker result, is not caught.
+In Shared mode the reader reduces checksum, oversize and malformed-prefix
+errors to a connection loss (the gap they leave in the dataflow's sequence
+still blocks everything behind it, so a running node fails on the reorder
+timeout), and a connection loss can be reported before a `Cancel` the peer
+queued just before it, so the reason is `NetworkError` instead of
+`PeerCancelled`. Dedicated sessions do not use frame CRCs, so a corrupted
+data payload is detected only if it no longer decodes (progress and control
+frames carry their own CRC).
 
 ### 12.5 Dynamic Cluster Scaling
 

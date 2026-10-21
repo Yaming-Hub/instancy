@@ -43,6 +43,18 @@ pub trait Push<T: Timestamp, D, M = ()>: Send {
     /// Close this push endpoint. No more messages will be sent.
     fn close(&mut self);
 
+    /// Called instead of [`close`](Self::close) by a composite pusher (such
+    /// as an exchange) that is dropped without having been closed, for each
+    /// of its targets. Defaults to `close()`.
+    ///
+    /// Endpoints of a cluster dataflow override it to close only if their
+    /// worker completed successfully: a failed, cancelled or never-run
+    /// worker's stream is incomplete and must not look finished to its
+    /// consumer.
+    fn close_on_drop(&mut self) {
+        self.close();
+    }
+
     /// Returns `true` if this push endpoint has been closed.
     fn is_closed(&self) -> bool;
 

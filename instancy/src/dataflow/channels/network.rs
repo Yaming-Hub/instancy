@@ -163,9 +163,21 @@ fn carries_records<T: Timestamp, D>(envelope: &Envelope<T, D, ()>) -> bool {
     matches!(&envelope.payload, Payload::Data { data, .. } if !data.is_empty())
 }
 
-/// Whether an encoded frame carries records.
+/// Whether an encoded frame carries, or may carry, records: a data frame,
+/// and any frame that is neither a control signal nor exactly the close
+/// sentinel (a corrupt frame may well have carried records).
 fn frame_carries_records(bytes: &[u8]) -> bool {
-    bytes.first() == Some(&TAG_DATA)
+    match bytes.first() {
+        Some(&TAG_WATERMARK) | Some(&TAG_ERROR) => false,
+        Some(&TAG_CLOSE) => bytes.len() != 1,
+        _ => true,
+    }
+}
+
+/// Whether `bytes` is exactly a close sentinel. A close tag followed by
+/// anything is malformed, not an end of stream.
+fn is_close_sentinel(bytes: &[u8]) -> bool {
+    bytes == [TAG_CLOSE]
 }
 
 /// Decode an envelope from bytes, returning `None` for close sentinel.
@@ -192,6 +204,12 @@ where
     match tag {
         TAG_CLOSE => {
             // Close sentinel — no further data on this channel.
+            if !rest.is_empty() {
+                return Err(CodecError::InvalidData(format!(
+                    "close sentinel followed by {} bytes",
+                    rest.len()
+                )));
+            }
             Ok(None)
         }
         TAG_DATA => {
@@ -206,14 +224,11 @@ where
             let count = wire::read_u32(rest, 0)
                 .map_err(|e| CodecError::InvalidData(e.to_string()))?
                 as usize;
-            const MAX_BATCH_SIZE: usize = 10_000_000;
-            if count > MAX_BATCH_SIZE {
-                return Err(CodecError::InvalidData(format!(
-                    "batch size {count} exceeds maximum {MAX_BATCH_SIZE}"
-                )));
-            }
+            // Any count the encoder can produce (up to `u32::MAX`) is valid.
+            // Preallocate no more than the bytes present so a corrupt count
+            // cannot reserve unbounded memory; truncated input fails below.
             let mut pos = 4;
-            let mut data = Vec::with_capacity(count);
+            let mut data = Vec::with_capacity(count.min(rest.len() - pos));
             for _ in 0..count {
                 let (record, consumed) = data_codec.decode(&rest[pos..])?;
                 data.push(record);
@@ -301,16 +316,44 @@ pub struct NetworkPush<T: Timestamp + ExchangeData, D: ExchangeData> {
     outbox: Option<crate::communication::peer_link::PeerOutbox>,
     /// The closed transport queue was reported to the coordinator.
     link_failure_reported: std::sync::atomic::AtomicBool,
+    /// The peer this push sends to (for errors).
+    peer_id: Arc<str>,
+    /// Largest payload the transport carries; larger frames are rejected
+    /// here with a clear error instead of failing in the transport.
+    max_payload: usize,
+    /// Set when this push's worker completed successfully (cluster
+    /// dataflows). A push dropped without `close()` closes its channel
+    /// cleanly only then: a failed, cancelled or never-run worker's stream is
+    /// incomplete, and a sentinel would let the peer treat it as finished.
+    worker_completed: Option<Arc<std::sync::atomic::AtomicBool>>,
     closed: bool,
 }
 
 #[cfg(feature = "transport")]
 impl<T: Timestamp + ExchangeData, D: ExchangeData> NetworkPush<T, D> {
+    /// Whether a push dropped without `close()` may close its channel
+    /// cleanly: its worker completed successfully (or is not tracked).
+    fn worker_succeeded(&self) -> bool {
+        self.worker_completed
+            .as_ref()
+            .is_none_or(|flag| flag.load(std::sync::atomic::Ordering::Acquire))
+    }
+
     fn encode(&self, envelope: &Envelope<T, D, ()>) -> std::result::Result<Vec<u8>, Error> {
         let mut buf = Vec::new();
         encode_envelope(&self.time_codec, &self.data_codec, envelope, &mut buf).map_err(|e| {
             Error::Dataflow(DataflowError::InvalidGraph(format!("network encode: {e}")))
         })?;
+        if buf.len() > self.max_payload {
+            return Err(Error::Communication(
+                crate::error::CommunicationError::FrameTooLarge {
+                    peer_id: self.peer_id.to_string(),
+                    channel_id: self.channel_id,
+                    size: buf.len(),
+                    max: self.max_payload,
+                },
+            ));
+        }
         Ok(buf)
     }
 
@@ -468,6 +511,12 @@ impl<T: Timestamp + ExchangeData, D: ExchangeData> Push<T, D, ()> for NetworkPus
         }
     }
 
+    fn close_on_drop(&mut self) {
+        if !self.closed && self.worker_succeeded() {
+            self.send_close();
+        }
+    }
+
     fn is_closed(&self) -> bool {
         self.closed
     }
@@ -482,7 +531,7 @@ impl<T: Timestamp + ExchangeData, D: ExchangeData> Push<T, D, ()> for NetworkPus
 #[cfg(feature = "transport")]
 impl<T: Timestamp + ExchangeData, D: ExchangeData> Drop for NetworkPush<T, D> {
     fn drop(&mut self) {
-        if !self.closed {
+        if !self.closed && self.worker_succeeded() {
             // Never blocks: the outbox lane is unbounded and the fallback
             // path uses try_send. Callers should still call close().
             self.send_close();
@@ -507,11 +556,14 @@ impl<T: Timestamp + ExchangeData, D: ExchangeData> Drop for NetworkPush<T, D> {
 /// deliver, or that arrives after the channel's close marker, as
 /// [`LinkEvent::InboundDataLost`](crate::communication::peer_link::LinkEvent):
 /// the receiving operator finished while the peer was still sending to it,
-/// so the records would otherwise vanish silently. It exits when the Demuxer
+/// so the records would otherwise vanish silently. A channel that ends before
+/// its close sentinel is reported as
+/// [`LinkEvent::DataChannelEnded`](crate::communication::peer_link::LinkEvent):
+/// a connection loss, not a clean end of stream. It exits when the Demuxer
 /// closes the channel or, during teardown, after draining what is queued.
 ///
 /// A final wake notification is always sent on exit so the executor can
-/// observe channel exhaustion and react accordingly.
+/// observe channel closure.
 #[cfg(feature = "transport")]
 async fn data_recv_bridge(
     mut rx: tokio_mpsc::Receiver<Vec<u8>>,
@@ -538,15 +590,20 @@ async fn data_recv_bridge(
         peer: &monitor.peer,
         channel_id: monitor.channel_id,
         pull_dropped: &monitor.pull_dropped,
+        validate: monitor.validate,
         closed: false,
         reported: false,
+        corrupt_reported: false,
     };
     loop {
         tokio::select! {
             biased;
             bytes = rx.recv() => match bytes {
                 Some(bytes) => channel.deliver(bytes),
-                None => break,
+                None => {
+                    channel.ended();
+                    break;
+                }
             },
             _ = drain.cancelled() => {
                 while let Ok(bytes) = rx.try_recv() {
@@ -569,6 +626,11 @@ pub(crate) struct InboundMonitor {
     guard: crate::communication::peer_link::InboundBridgeGuard,
     /// Set by the `NetworkPull` before it drains and drops its receiver.
     pull_dropped: Arc<std::sync::atomic::AtomicBool>,
+    /// Whether a frame decodes with this channel's codecs; used only for
+    /// frames the consuming operator will never decode itself. Built from
+    /// fresh codec instances, which is equivalent because codecs are
+    /// stateless (see [`Codec`]).
+    validate: fn(&[u8]) -> bool,
 }
 
 #[cfg(feature = "transport")]
@@ -579,35 +641,91 @@ struct InboundChannel<'a> {
     peer: &'a crate::communication::peer_link::PeerMonitor,
     channel_id: u64,
     pull_dropped: &'a std::sync::atomic::AtomicBool,
+    validate: fn(&[u8]) -> bool,
     closed: bool,
     reported: bool,
+    corrupt_reported: bool,
 }
 
 #[cfg(feature = "transport")]
 impl InboundChannel<'_> {
     fn deliver(&mut self, bytes: Vec<u8>) {
         let records = frame_carries_records(&bytes);
-        if records && self.closed {
-            self.lost("records arrived after the channel's close marker");
+        if self.closed {
+            // Nothing follows a close sentinel (one sender per channel): the
+            // sender broke the protocol (a failed sender never closes its
+            // channels). Fatal at once, whatever our workers are doing.
+            if !self.reported {
+                self.reported = true;
+                self.peer.report(
+                    crate::communication::peer_link::LinkEvent::DataChannelEnded(
+                        crate::communication::peer_link::LinkFailure::ProtocolViolation(format!(
+                            "channel {}: a frame arrived after the channel's close marker",
+                            self.channel_id
+                        )),
+                    ),
+                );
+            }
             return;
         }
-        if bytes.first() == Some(&TAG_CLOSE) {
+        if is_close_sentinel(&bytes) {
             self.closed = true;
         }
+        // A frame the operator may never decode itself (it finished, or is
+        // finishing) is checked here; never on the regular path.
+        let unseen =
+            self.tx.is_none() || self.pull_dropped.load(std::sync::atomic::Ordering::SeqCst);
+        if unseen {
+            self.check(&bytes);
+        }
         if let Some(tx) = &self.tx {
-            if tx.send(bytes).is_ok() {
-                // The pull may be dropping right now: it may already have
-                // drained its receiver, and this frame would vanish with it.
-                if records && self.pull_dropped.load(std::sync::atomic::Ordering::SeqCst) {
-                    self.lost("records arrived as the receiving operator finished");
+            match tx.send(bytes) {
+                Ok(()) => {
+                    // The pull may be dropping right now: it may already have
+                    // drained its receiver, and this frame would vanish with it.
+                    if records && self.pull_dropped.load(std::sync::atomic::Ordering::SeqCst) {
+                        self.lost("records arrived as the receiving operator finished");
+                    }
+                    self.wake_handle.notify();
+                    return;
                 }
-                self.wake_handle.notify();
-                return;
+                Err(std::sync::mpsc::SendError(bytes)) => {
+                    self.tx = None;
+                    if !unseen {
+                        self.check(&bytes);
+                    }
+                }
             }
-            self.tx = None;
         }
         if records {
             self.lost("records arrived after the receiving operator finished");
+        }
+    }
+
+    /// Report a frame that does not decode (once).
+    fn check(&mut self, bytes: &[u8]) {
+        if !self.corrupt_reported && !(self.validate)(bytes) {
+            self.corrupt_reported = true;
+            self.peer.report(
+                crate::communication::peer_link::LinkEvent::DataChannelEnded(
+                    crate::communication::peer_link::LinkFailure::Decode(format!(
+                        "data channel {}: undecodable frame",
+                        self.channel_id
+                    )),
+                ),
+            );
+        }
+    }
+
+    /// The channel closed (connection gone): without its close sentinel
+    /// that is a loss, never a clean end of stream.
+    fn ended(&self) {
+        if !self.closed {
+            self.peer.report(
+                crate::communication::peer_link::LinkEvent::DataChannelEnded(
+                    crate::communication::peer_link::LinkFailure::ChannelClosed,
+                ),
+            );
         }
     }
 
@@ -635,19 +753,53 @@ impl InboundChannel<'_> {
 /// non-blocking `try_recv()` while still waking the executor promptly
 /// when remote data arrives.
 ///
-/// When a close-sentinel frame is received, this endpoint marks itself
-/// as exhausted. Since the protocol guarantees FIFO ordering with a single
-/// sender per channel, the close sentinel is always the last frame.
+/// The endpoint is exhausted only by the close sentinel. Since the protocol
+/// guarantees FIFO ordering with a single sender per channel, the close
+/// sentinel is always the last frame. A channel that closes before its
+/// sentinel, or a frame that fails to decode, never counts as exhaustion:
+/// data may be missing, so the endpoint stops delivering and the failure is
+/// reported to the cluster lifecycle coordinator, which fails the dataflow.
+/// Without a coordinator (standalone use of [`NetworkEdgeMaterializer`]) the
+/// endpoint fails closed: it stays unexhausted, so the dataflow cannot
+/// complete with missing data.
 #[cfg(feature = "transport")]
 pub struct NetworkPull<T: Timestamp + ExchangeData, D: ExchangeData> {
     time_codec: T::CodecType,
     data_codec: D::CodecType,
     receiver: std::sync::mpsc::Receiver<Vec<u8>>,
     exhausted: bool,
-    /// Cluster dataflows: reports records left unconsumed when dropped.
+    /// The channel ended without its sentinel or delivered an undecodable
+    /// frame; nothing more is delivered and it is never exhausted.
+    failed: bool,
+    channel_id: u64,
+    /// Cluster dataflows: reports failures and records left unconsumed.
     monitor: Option<PullMonitor>,
     /// Keeps transport alive (background tasks survive as long as this exists).
-    _transport: Arc<crate::communication::cluster_transport::ClusterTransport>,
+    _transport: Option<Arc<crate::communication::cluster_transport::ClusterTransport>>,
+}
+
+#[cfg(feature = "transport")]
+impl<T: Timestamp + ExchangeData, D: ExchangeData> NetworkPull<T, D> {
+    fn fail(&mut self, failure: crate::communication::peer_link::LinkFailure) {
+        self.failed = true;
+        match &self.monitor {
+            Some(monitor) => {
+                monitor
+                    .peer
+                    .report(crate::communication::peer_link::LinkEvent::DataChannelEnded(failure));
+            }
+            None => {
+                #[cfg(feature = "tracing")]
+                tracing::error!(
+                    channel_id = self.channel_id,
+                    %failure,
+                    "network data channel failed; it will never be exhausted"
+                );
+                #[cfg(not(feature = "tracing"))]
+                let _ = failure;
+            }
+        }
+    }
 }
 
 /// Data-loss reporting for a `NetworkPull`.
@@ -674,10 +826,25 @@ impl<T: Timestamp + ExchangeData, D: ExchangeData> Drop for NetworkPull<T, D> {
             .dropped
             .store(true, std::sync::atomic::Ordering::SeqCst);
         let mut unconsumed = 0usize;
+        let mut corrupt = None;
         while let Ok(bytes) = self.receiver.try_recv() {
-            if frame_carries_records(&bytes) {
-                unconsumed += 1;
+            match decode_envelope(&self.time_codec, &self.data_codec, &bytes) {
+                Ok(Some(envelope)) if carries_records(&envelope) => unconsumed += 1,
+                Ok(_) => {}
+                Err(e) => {
+                    corrupt.get_or_insert(e);
+                }
             }
+        }
+        if let Some(e) = corrupt {
+            monitor.peer.report(
+                crate::communication::peer_link::LinkEvent::DataChannelEnded(
+                    crate::communication::peer_link::LinkFailure::Decode(format!(
+                        "data channel {}: {e}",
+                        monitor.channel_id
+                    )),
+                ),
+            );
         }
         if unconsumed > 0 {
             monitor
@@ -696,14 +863,22 @@ impl<T: Timestamp + ExchangeData, D: ExchangeData> Drop for NetworkPull<T, D> {
 #[cfg(feature = "transport")]
 impl<T: Timestamp + ExchangeData, D: ExchangeData> Pull<T, D, ()> for NetworkPull<T, D> {
     fn pull(&mut self) -> Option<Envelope<T, D, ()>> {
-        if self.exhausted {
+        if self.exhausted || self.failed {
             return None;
         }
         let bytes = match self.receiver.try_recv() {
             Ok(b) => b,
             Err(std::sync::mpsc::TryRecvError::Empty) => return None,
             Err(std::sync::mpsc::TryRecvError::Disconnected) => {
-                self.exhausted = true;
+                // The channel closed before its close sentinel (the bridge
+                // already reported it). Not an end of stream: data may be
+                // missing.
+                self.failed = true;
+                #[cfg(feature = "tracing")]
+                tracing::error!(
+                    channel_id = self.channel_id,
+                    "network data channel closed before its close sentinel"
+                );
                 return None;
             }
         };
@@ -716,9 +891,10 @@ impl<T: Timestamp + ExchangeData, D: ExchangeData> Pull<T, D, ()> for NetworkPul
                 None
             }
             Err(e) => {
-                // Propagate decode errors as control signals so the dataflow
-                // can detect and handle data corruption.
-                Some(Envelope::error("NetworkPull", format!("decode error: {e}")))
+                self.fail(crate::communication::peer_link::LinkFailure::Decode(
+                    format!("data channel {}: {e}", self.channel_id),
+                ));
+                None
             }
         }
     }
@@ -808,6 +984,8 @@ pub struct NetworkEdgeMaterializer<T: Timestamp + ExchangeData, D: ExchangeData>
     /// Inbound bridge tracking (cluster dataflows): undeliverable records are
     /// reported, and teardown waits for the bridges.
     inbound_bridges: Option<crate::communication::peer_link::InboundBridges>,
+    /// Per-worker success flags (global index; empty for standalone use).
+    worker_completed: Vec<Arc<std::sync::atomic::AtomicBool>>,
 }
 
 #[cfg(feature = "transport")]
@@ -905,6 +1083,7 @@ impl<T: Timestamp + ExchangeData, D: ExchangeData> NetworkEdgeMaterializer<T, D>
             runtime_handle,
             peer_outboxes: std::collections::HashMap::new(),
             inbound_bridges: None,
+            worker_completed: Vec::new(),
         })
     }
 
@@ -927,6 +1106,17 @@ impl<T: Timestamp + ExchangeData, D: ExchangeData> NetworkEdgeMaterializer<T, D>
         inbound_bridges: crate::communication::peer_link::InboundBridges,
     ) -> Self {
         self.inbound_bridges = Some(inbound_bridges);
+        self
+    }
+
+    /// Per-worker success flags (indexed by global worker ID): a push that is
+    /// dropped without an explicit `close()` sends its close sentinel only if
+    /// its worker completed successfully.
+    pub(crate) fn with_worker_completion(
+        mut self,
+        worker_completed: Vec<Arc<std::sync::atomic::AtomicBool>>,
+    ) -> Self {
+        self.worker_completed = worker_completed;
         self
     }
 
@@ -1087,7 +1277,12 @@ impl<T: Timestamp + ExchangeData, D: ExchangeData> EdgeMaterializer<T, D>
                         "local push [{src_idx}][{dst}] already taken"
                     )))
                 })?;
-                pushers.push(Box::new(push));
+                // A sibling worker must not see a failed worker's stream as
+                // complete either: it would finish (and close its own
+                // outputs to peers cleanly) without that worker's data.
+                pushers.push(Box::new(
+                    push.with_close_gate(self.worker_completed.get(src_idx).cloned()),
+                ));
             } else {
                 let sender = self.transport.data_sender(dst_node).ok_or_else(|| {
                     Error::Dataflow(DataflowError::InvalidGraph(format!(
@@ -1104,6 +1299,9 @@ impl<T: Timestamp + ExchangeData, D: ExchangeData> EdgeMaterializer<T, D>
                     sender,
                     outbox: self.peer_outboxes.get(dst_node).cloned(),
                     link_failure_reported: std::sync::atomic::AtomicBool::new(false),
+                    peer_id: Arc::from(dst_node),
+                    max_payload: self.transport.max_payload_len(),
+                    worker_completed: self.worker_completed.get(src_idx).cloned(),
                     closed: false,
                 }));
             }
@@ -1181,6 +1379,9 @@ impl<T: Timestamp + ExchangeData, D: ExchangeData> EdgeMaterializer<T, D>
                         bridges: bridges.clone(),
                         guard: bridges.register(),
                         pull_dropped: Arc::clone(&pull_dropped),
+                        validate: |bytes: &[u8]| {
+                            decode_envelope::<T, D, _, _>(&T::codec(), &D::codec(), bytes).is_ok()
+                        },
                     }),
                     _ => None,
                 };
@@ -1193,12 +1394,14 @@ impl<T: Timestamp + ExchangeData, D: ExchangeData> EdgeMaterializer<T, D>
                     data_codec: D::codec(),
                     receiver: std_rx,
                     exhausted: false,
+                    failed: false,
+                    channel_id,
                     monitor: peer.map(|peer| PullMonitor {
                         peer,
                         channel_id,
                         dropped: pull_dropped,
                     }),
-                    _transport: self.transport.clone(),
+                    _transport: Some(self.transport.clone()),
                 }));
             }
         }
@@ -1591,6 +1794,9 @@ mod tests {
                 sender: crate::communication::cluster_transport::FrameSender::Direct(sender),
                 outbox: Some(outbox.clone()),
                 link_failure_reported: std::sync::atomic::AtomicBool::new(false),
+                peer_id: Arc::from(outbox.peer()),
+                max_payload: usize::MAX,
+                worker_completed: None,
                 closed: false,
             }
         }
@@ -1756,7 +1962,22 @@ mod tests {
                     payload,
                 })
                 .unwrap();
-            assert!(next_loss(&mut events).await.contains("close marker"));
+            // A protocol violation (corrupt traffic), not a deferred loss.
+            let event = tokio::time::timeout(std::time::Duration::from_secs(2), events.recv())
+                .await
+                .expect("a violation is reported");
+            assert!(
+                matches!(
+                    &event,
+                    Some(LifecycleEvent::Link {
+                        peer,
+                        event: LinkEvent::DataChannelEnded(
+                            crate::communication::peer_link::LinkFailure::ProtocolViolation(detail)
+                        ),
+                    }) if peer == "node-a" && detail.contains("close marker")
+                ),
+                "{event:?}"
+            );
         }
 
         #[tokio::test]
@@ -1776,6 +1997,449 @@ mod tests {
                 .await
                 .expect("drained bridges exit");
             drop(pulls);
+        }
+    }
+
+    // --- Unclean close, corruption and protocol violations (cluster lifecycle) ---
+
+    #[cfg(feature = "transport")]
+    mod link_failures {
+        use super::*;
+        use crate::communication::peer_link::{
+            InboundBridges, LifecycleEvent, LinkEvent, LinkFailure, PeerMonitor,
+        };
+
+        type Events = tokio_mpsc::UnboundedReceiver<LifecycleEvent>;
+
+        fn reporter() -> (PeerMonitor, Events) {
+            let (tx, rx) = tokio_mpsc::unbounded_channel();
+            (PeerMonitor::for_test("peer", tx), rx)
+        }
+
+        fn data_frame(time: u64, records: Vec<u64>) -> Vec<u8> {
+            let mut buf = Vec::new();
+            let env: Envelope<u64, u64, ()> = Envelope::data(time, records);
+            encode_envelope(&u64::codec(), &u64::codec(), &env, &mut buf).unwrap();
+            buf
+        }
+
+        fn close_frame() -> Vec<u8> {
+            let mut buf = Vec::new();
+            encode_close(&mut buf);
+            buf
+        }
+
+        /// Run a bridge over `frames` (the channel then closes) and return
+        /// the events it reported. `drop_consumer` drops the pull side first.
+        async fn run_bridge(frames: Vec<Vec<u8>>, drop_consumer: bool) -> Vec<LinkEvent> {
+            let (tx, rx) = tokio_mpsc::channel(16);
+            let (std_tx, std_rx) = std::sync::mpsc::channel();
+            if drop_consumer {
+                drop(std_rx);
+            } else {
+                std::mem::forget(std_rx);
+            }
+            let (peer, mut events) = reporter();
+            for frame in frames {
+                tx.send(frame).await.unwrap();
+            }
+            drop(tx);
+            let bridges = InboundBridges::default();
+            let monitor = InboundMonitor {
+                peer,
+                channel_id: 7,
+                guard: bridges.register(),
+                bridges,
+                pull_dropped: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+                validate: |bytes: &[u8]| {
+                    decode_envelope::<u64, u64, _, _>(&u64::codec(), &u64::codec(), bytes).is_ok()
+                },
+            };
+            data_recv_bridge(rx, std_tx, WakeHandle::new(), Some(monitor)).await;
+            let mut seen = Vec::new();
+            while let Ok(LifecycleEvent::Link { event, .. }) = events.try_recv() {
+                seen.push(event);
+            }
+            seen
+        }
+
+        #[tokio::test]
+        async fn bridge_is_silent_after_clean_close() {
+            let events = run_bridge(vec![data_frame(1, vec![1, 2]), close_frame()], false).await;
+            assert!(events.is_empty(), "{events:?}");
+        }
+
+        #[tokio::test]
+        async fn bridge_reports_close_without_sentinel() {
+            let events = run_bridge(vec![data_frame(1, vec![1])], false).await;
+            assert!(
+                matches!(
+                    events.as_slice(),
+                    [LinkEvent::DataChannelEnded(LinkFailure::ChannelClosed)]
+                ),
+                "{events:?}"
+            );
+        }
+
+        #[tokio::test]
+        async fn bridge_reports_records_after_sentinel_once() {
+            let events = run_bridge(
+                vec![
+                    close_frame(),
+                    data_frame(1, vec![1]),
+                    data_frame(2, vec![2]),
+                ],
+                false,
+            )
+            .await;
+            assert!(
+                matches!(
+                    events.as_slice(),
+                    [LinkEvent::DataChannelEnded(LinkFailure::ProtocolViolation(
+                        _
+                    ))]
+                ),
+                "{events:?}"
+            );
+        }
+
+        #[tokio::test]
+        async fn bridge_does_not_treat_a_malformed_close_as_the_sentinel() {
+            // A close tag followed by bytes is not an end of stream: the
+            // channel then closes without its sentinel.
+            let events = run_bridge(vec![vec![TAG_CLOSE, 0x01, 0x02]], false).await;
+            assert!(
+                matches!(
+                    events.as_slice(),
+                    [LinkEvent::DataChannelEnded(LinkFailure::ChannelClosed)]
+                ),
+                "{events:?}"
+            );
+            // The pull side rejects it instead of exhausting.
+            let (mut pull, mut events) = pull_with(vec![vec![TAG_CLOSE, 0x01]], true);
+            assert!(pull.pull().is_none());
+            assert!(!pull.is_exhausted());
+            assert!(matches!(
+                events.try_recv(),
+                Ok(LifecycleEvent::Link {
+                    event: LinkEvent::DataChannelEnded(LinkFailure::Decode(_)),
+                    ..
+                })
+            ));
+        }
+
+        #[tokio::test]
+        async fn bridge_reports_records_for_a_finished_consumer() {
+            let events = run_bridge(
+                vec![data_frame(1, vec![]), data_frame(1, vec![5]), close_frame()],
+                true,
+            )
+            .await;
+            assert!(
+                matches!(events.as_slice(), [LinkEvent::InboundDataLost(_)]),
+                "{events:?}"
+            );
+            // Only the sentinel after the consumer finished is benign.
+            let events = run_bridge(vec![close_frame()], true).await;
+            assert!(events.is_empty(), "{events:?}");
+            // A malformed control-tag frame the consumer never decodes is
+            // still reported as corrupt.
+            let events = run_bridge(vec![vec![TAG_WATERMARK], close_frame()], true).await;
+            assert!(
+                matches!(
+                    events.as_slice(),
+                    [LinkEvent::DataChannelEnded(LinkFailure::Decode(_))]
+                ),
+                "{events:?}"
+            );
+        }
+
+        fn pull_with(frames: Vec<Vec<u8>>, close: bool) -> (NetworkPull<u64, u64>, Events) {
+            let (tx, rx) = std::sync::mpsc::channel();
+            for frame in frames {
+                tx.send(frame).unwrap();
+            }
+            if close {
+                drop(tx);
+            } else {
+                std::mem::forget(tx);
+            }
+            let (peer, events) = reporter();
+            let pull = NetworkPull {
+                time_codec: u64::codec(),
+                data_codec: u64::codec(),
+                receiver: rx,
+                exhausted: false,
+                failed: false,
+                channel_id: 7,
+                monitor: Some(PullMonitor {
+                    peer,
+                    channel_id: 7,
+                    dropped: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+                }),
+                _transport: None,
+            };
+            (pull, events)
+        }
+
+        #[test]
+        fn pull_is_not_exhausted_when_channel_closes_without_sentinel() {
+            let (mut pull, _events) = pull_with(vec![data_frame(1, vec![1])], true);
+            assert!(pull.pull().is_some());
+            assert!(pull.pull().is_none());
+            assert!(
+                !pull.is_exhausted(),
+                "an unclean close is not an end of stream"
+            );
+            assert!(pull.pull().is_none());
+            assert!(!pull.is_exhausted());
+        }
+
+        #[test]
+        fn pull_is_exhausted_by_the_sentinel() {
+            let (mut pull, _events) = pull_with(vec![close_frame()], true);
+            assert!(pull.pull().is_none());
+            assert!(pull.is_exhausted());
+        }
+
+        #[test]
+        fn pull_reports_decode_error_and_never_exhausts() {
+            let (mut pull, mut events) = pull_with(
+                vec![vec![0x7E, 1, 2], data_frame(1, vec![1]), close_frame()],
+                true,
+            );
+            assert!(pull.pull().is_none(), "no error envelope is delivered");
+            assert!(pull.pull().is_none(), "nothing after a corrupt frame");
+            assert!(!pull.is_exhausted());
+            assert!(matches!(
+                events.try_recv(),
+                Ok(LifecycleEvent::Link {
+                    event: LinkEvent::DataChannelEnded(LinkFailure::Decode(_)),
+                    ..
+                })
+            ));
+            assert!(events.try_recv().is_err(), "reported once");
+        }
+
+        /// Frames buffered when the consuming operator finishes are decoded:
+        /// a corrupt one (even with a control tag) is reported, not dropped.
+        #[test]
+        fn dropped_pull_reports_corrupt_buffered_frames() {
+            let (pull, mut events) = pull_with(vec![vec![TAG_WATERMARK]], false);
+            drop(pull);
+            assert!(matches!(
+                events.try_recv(),
+                Ok(LifecycleEvent::Link {
+                    event: LinkEvent::DataChannelEnded(LinkFailure::Decode(_)),
+                    ..
+                })
+            ));
+        }
+
+        #[tokio::test]
+        async fn bridge_reports_any_frame_after_sentinel() {
+            let mut watermark = Vec::new();
+            encode_envelope(
+                &u64::codec(),
+                &u64::codec(),
+                &Envelope::<u64, u64, ()>::watermark(3),
+                &mut watermark,
+            )
+            .unwrap();
+            let events = run_bridge(vec![close_frame(), watermark], false).await;
+            assert!(
+                matches!(
+                    events.as_slice(),
+                    [LinkEvent::DataChannelEnded(LinkFailure::ProtocolViolation(
+                        _
+                    ))]
+                ),
+                "{events:?}"
+            );
+        }
+    }
+
+    #[cfg(feature = "transport")]
+    mod frame_limits {
+        use super::*;
+
+        #[test]
+        fn decode_accepts_more_than_ten_million_records() {
+            let n = 10_000_001;
+            let env: Envelope<u64, u8, ()> = Envelope::data(3, vec![7u8; n]);
+            let mut buf = Vec::new();
+            encode_envelope(&u64::codec(), &u8::codec(), &env, &mut buf).unwrap();
+            let decoded = decode_envelope::<u64, u8, _, _>(&u64::codec(), &u8::codec(), &buf)
+                .unwrap()
+                .unwrap();
+            let (time, data) = decoded.as_data().unwrap();
+            assert_eq!((*time, data.len()), (3, n));
+        }
+
+        #[test]
+        fn decode_rejects_a_count_larger_than_the_frame() {
+            let env: Envelope<u64, u64, ()> = Envelope::data(3, vec![1, 2]);
+            let mut buf = Vec::new();
+            encode_envelope(&u64::codec(), &u64::codec(), &env, &mut buf).unwrap();
+            // Claim u32::MAX records: decoding must fail, not reserve memory.
+            buf[9..13].copy_from_slice(&u32::MAX.to_le_bytes());
+            assert!(decode_envelope::<u64, u64, _, _>(&u64::codec(), &u64::codec(), &buf).is_err());
+        }
+
+        #[test]
+        fn push_rejects_frame_over_transport_limit() {
+            let (tx, mut rx) = tokio_mpsc::channel(4);
+            let mut push = NetworkPush::<u64, u64> {
+                time_codec: u64::codec(),
+                data_codec: u64::codec(),
+                dataflow_id: DataflowId::new(),
+                channel_id: 9,
+                sender: crate::communication::cluster_transport::FrameSender::Direct(tx),
+                outbox: None,
+                peer_id: Arc::from("peer"),
+                max_payload: 16,
+                worker_completed: None,
+                link_failure_reported: std::sync::atomic::AtomicBool::new(false),
+                closed: false,
+            };
+            // tag + time + count = 13 bytes: fits.
+            push.push(Envelope::data(1, vec![])).unwrap();
+            let err = push.push(Envelope::data(1, vec![1, 2, 3])).unwrap_err();
+            assert!(
+                matches!(
+                    err,
+                    Error::Communication(crate::error::CommunicationError::FrameTooLarge {
+                        channel_id: 9,
+                        size: 37,
+                        max: 16,
+                        ..
+                    })
+                ),
+                "{err:?}"
+            );
+            let (err, _envelope) = push.try_push(Envelope::data(1, vec![4, 5, 6])).unwrap_err();
+            assert!(matches!(
+                err,
+                Error::Communication(crate::error::CommunicationError::FrameTooLarge { .. })
+            ));
+            assert_eq!(rx.try_recv().unwrap().payload.len(), 13);
+            assert!(
+                rx.try_recv().is_err(),
+                "oversize frames never reach the transport"
+            );
+            push.close();
+        }
+
+        #[test]
+        fn dropped_push_closes_cleanly_only_after_worker_success() {
+            for succeeded in [false, true] {
+                let (tx, mut rx) = tokio_mpsc::channel(4);
+                let flag = Arc::new(std::sync::atomic::AtomicBool::new(succeeded));
+                let push = NetworkPush::<u64, u64> {
+                    time_codec: u64::codec(),
+                    data_codec: u64::codec(),
+                    dataflow_id: DataflowId::new(),
+                    channel_id: 9,
+                    sender: crate::communication::cluster_transport::FrameSender::Direct(tx),
+                    outbox: None,
+                    peer_id: Arc::from("peer"),
+                    max_payload: usize::MAX,
+                    worker_completed: Some(flag),
+                    link_failure_reported: std::sync::atomic::AtomicBool::new(false),
+                    closed: false,
+                };
+                drop(push);
+                let sentinel = rx.try_recv().ok().map(|f| f.payload);
+                if succeeded {
+                    assert_eq!(sentinel, Some(vec![TAG_CLOSE]));
+                } else {
+                    assert_eq!(
+                        sentinel, None,
+                        "a failed or never-run worker must not close its channels cleanly"
+                    );
+                }
+            }
+        }
+
+        /// Workers hold their targets inside an exchange (or broadcast)
+        /// pusher, whose drop closes every target: the worker's outcome must
+        /// still decide, for network and same-node targets alike.
+        #[test]
+        fn dropped_exchange_closes_targets_only_after_worker_success() {
+            use crate::dataflow::channels::exchange_channel::{
+                BroadcastPush, ExchangePush, SharedWakeRegistry,
+            };
+            use crate::dataflow::channels::pact::ExchangeFn;
+
+            for (succeeded, broadcast) in
+                [(false, false), (true, false), (false, true), (true, true)]
+            {
+                let flag = Arc::new(std::sync::atomic::AtomicBool::new(false));
+                let (local, local_pull) = bounded_channel::<u64, u64, ()>(4);
+                let local = local.with_close_gate(Some(Arc::clone(&flag)));
+                let (tx, mut rx) = tokio_mpsc::channel(4);
+                let remote = NetworkPush::<u64, u64> {
+                    time_codec: u64::codec(),
+                    data_codec: u64::codec(),
+                    dataflow_id: DataflowId::new(),
+                    channel_id: 9,
+                    sender: crate::communication::cluster_transport::FrameSender::Direct(tx),
+                    outbox: None,
+                    peer_id: Arc::from("peer"),
+                    max_payload: usize::MAX,
+                    worker_completed: Some(Arc::clone(&flag)),
+                    link_failure_reported: std::sync::atomic::AtomicBool::new(false),
+                    closed: false,
+                };
+                let targets: Vec<Box<dyn Push<u64, u64, ()>>> =
+                    vec![Box::new(local), Box::new(remote)];
+                let wakes = Arc::new(SharedWakeRegistry::new(2));
+                let push: Box<dyn Push<u64, u64>> = if broadcast {
+                    Box::new(BroadcastPush::new(targets, wakes))
+                } else {
+                    Box::new(ExchangePush::new(
+                        targets,
+                        ExchangeFn::new("id", |x: &u64| *x),
+                        wakes,
+                    ))
+                };
+                // The runtime sets the flag before it drops the executor.
+                flag.store(succeeded, std::sync::atomic::Ordering::Release);
+                drop(push);
+                let sentinel = rx.try_recv().ok().map(|f| f.payload);
+                if succeeded {
+                    assert!(local_pull.is_exhausted(), "broadcast={broadcast}");
+                    assert_eq!(sentinel, Some(vec![TAG_CLOSE]), "broadcast={broadcast}");
+                } else {
+                    assert!(!local_pull.is_exhausted(), "broadcast={broadcast}");
+                    assert_eq!(sentinel, None, "broadcast={broadcast}");
+                }
+            }
+        }
+
+        /// An operator closing its output closes every target, whatever its
+        /// worker's eventual outcome: the stream is complete.
+        #[test]
+        fn explicit_close_is_always_clean() {
+            let flag = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let (mut local, local_pull) = bounded_channel::<u64, u64, ()>(4);
+            local = local.with_close_gate(Some(Arc::clone(&flag)));
+            local.close();
+            drop(local);
+            assert!(local_pull.is_exhausted());
+        }
+
+        #[test]
+        fn close_tag_with_trailing_bytes_is_not_a_sentinel() {
+            let bad = vec![TAG_CLOSE, 1, 2, 3];
+            assert!(!is_close_sentinel(&bad));
+            assert!(is_close_sentinel(&[TAG_CLOSE]));
+            assert!(decode_envelope::<u64, u64, _, _>(&u64::codec(), &u64::codec(), &bad).is_err());
+            // Unknown tags and malformed frames may have carried records.
+            assert!(frame_carries_records(&bad));
+            assert!(frame_carries_records(&[0x7E, 1]));
+            assert!(!frame_carries_records(&[TAG_CLOSE]));
+            assert!(!frame_carries_records(&[TAG_WATERMARK, 0]));
         }
     }
 }

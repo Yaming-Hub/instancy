@@ -892,6 +892,15 @@ impl SharedPeerManager {
         &self.control_tx
     }
 
+    /// Send a control frame, first establishing the pool's connections if
+    /// there are none yet (connections are otherwise made when the first
+    /// dataflow registers). Lets a node tell a peer about a dataflow that
+    /// failed before registering here.
+    pub(crate) async fn send_control_connected(&self, frame: Frame) {
+        let _ = self.ensure_min_connections().await;
+        let _ = self.control_tx.send(frame).await;
+    }
+
     /// Get the peer node ID.
     pub fn peer_node_id(&self) -> &str {
         &self.peer_node_id

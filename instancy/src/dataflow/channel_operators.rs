@@ -227,6 +227,9 @@ pub struct ChannelSourceOperator<T: Timestamp, D: Send + 'static> {
     /// Set once external input is closed for a graceful drain.
     external_closed: bool,
     done: bool,
+    /// Set (async sources without a drain) when the producer was cut off by a
+    /// cancellation: the closed channel is then not an end of input.
+    abandoned: Option<Arc<std::sync::atomic::AtomicBool>>,
 }
 
 impl<T: Timestamp, D: Send + 'static> ChannelSourceOperator<T, D> {
@@ -254,6 +257,7 @@ impl<T: Timestamp, D: Send + 'static> ChannelSourceOperator<T, D> {
             input_gate: None,
             external_closed: false,
             done: false,
+            abandoned: None,
         }
     }
 
@@ -266,6 +270,17 @@ impl<T: Timestamp, D: Send + 'static> ChannelSourceOperator<T, D> {
     /// Whether no sender is between admission and enqueue.
     fn senders_idle(&self) -> bool {
         self.input_gate.as_ref().is_none_or(|gate| gate.is_idle())
+    }
+
+    /// A channel that closes after `flag` was set did not end the input (its
+    /// producer was cancelled): the operator then neither finishes nor
+    /// closes its output, and the executor stops on the cancellation.
+    pub(crate) fn with_abandon_flag(
+        mut self,
+        flag: Option<Arc<std::sync::atomic::AtomicBool>>,
+    ) -> Self {
+        self.abandoned = flag;
+        self
     }
 
     /// Try to flush pending output to the downstream pusher.
@@ -389,6 +404,17 @@ impl<T: Timestamp, D: Send + 'static> SchedulableOperator for ChannelSourceOpera
                     break;
                 }
                 Err(RecvError::Disconnected) => {
+                    if self
+                        .abandoned
+                        .as_ref()
+                        .is_some_and(|flag| flag.load(Ordering::SeqCst))
+                    {
+                        // Cut off by a cancellation, not closed: closing the
+                        // output would present a truncated stream as complete
+                        // (to peers, in a cluster) before the executor
+                        // notices the cancellation at its next sweep.
+                        break;
+                    }
                     // Sender dropped — input is closed. Finish up.
                     self.finish();
                     return Ok(ActivationOutcome::Done);
@@ -1496,6 +1522,44 @@ mod tests {
         assert!(matches!(outcome, ActivationOutcome::Done));
         assert!(op.is_done());
         assert_eq!(counter.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn abandoned_source_neither_finishes_nor_closes_its_output() {
+        use crate::dataflow::channels::pushpull::Pull;
+        for abandoned in [false, true] {
+            let (tx, rx) = mpsc::sync_channel::<InputEvent<u64, i32>>(16);
+            let (push, pull) = bounded_channel::<u64, i32, ()>(1024);
+            let counter = Arc::new(AtomicUsize::new(1));
+            let flag = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let mut op = ChannelSourceOperator::new(
+                "async_input".into(),
+                0,
+                StageId::new(0),
+                InputRecv::Std(rx),
+                Box::new(push),
+                None,
+                Arc::clone(&counter),
+            )
+            .with_abandon_flag(Some(Arc::clone(&flag)));
+            // The pump flags a cancellation before it drops the sender.
+            flag.store(abandoned, Ordering::SeqCst);
+            drop(tx);
+            let outcome = op.activate().unwrap();
+            if abandoned {
+                assert!(matches!(outcome, ActivationOutcome::Idle));
+                assert!(!op.is_done());
+                assert!(
+                    !pull.is_exhausted(),
+                    "a cut-off input must not look complete"
+                );
+                assert_eq!(counter.load(Ordering::SeqCst), 1);
+            } else {
+                assert!(matches!(outcome, ActivationOutcome::Done));
+                assert!(pull.is_exhausted());
+                assert_eq!(counter.load(Ordering::SeqCst), 0);
+            }
+        }
     }
 
     #[test]
