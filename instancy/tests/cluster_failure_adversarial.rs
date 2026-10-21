@@ -164,6 +164,13 @@ impl Cluster {
         input.send(0, records.collect()).unwrap();
     }
 
+    /// Like [`send`](Self::send), for tests where the dataflow may already
+    /// have failed (and closed the input) because of an earlier send.
+    fn send_if_open(&mut self, name: &str, records: impl Iterator<Item = u64>) {
+        let input = self.node(name).input.as_ref().unwrap();
+        let _ = input.send(0, records.collect());
+    }
+
     fn close(&mut self, name: &str) {
         self.node(name).input.take();
     }
@@ -537,13 +544,15 @@ async fn corrupt_frame_of_each_kind_fails_every_node() {
             };
             let ctl = cluster.mesh.ctl(from, to);
             ctl.corrupt_next(kind);
+            // The corrupt frame may already fail the dataflow (and close the
+            // other inputs) while the later nodes are being fed.
             for (i, name) in ["a", "b", "c"].iter().enumerate() {
-                cluster.send(name, (i as u64 * 100)..(i as u64 * 100 + 50));
+                cluster.send_if_open(name, (i as u64 * 100)..(i as u64 * 100 + 50));
             }
             if kind == FrameKind::Progress {
                 // Progress frames follow every capability change.
                 let input = cluster.node("a").input.as_ref().unwrap();
-                input.advance_to(5).unwrap();
+                let _ = input.advance_to(5);
             }
             if kind == FrameKind::Control {
                 tokio::time::sleep(Duration::from_millis(100)).await;
@@ -615,8 +624,9 @@ async fn simultaneous_worker_failures_and_cuts_fail_every_node() {
             cluster.send(name, (i as u64 * 100)..(i as u64 * 100 + 50));
         }
         tokio::time::sleep(Duration::from_millis(100)).await;
-        cluster.send("a", std::iter::once(u64::MAX));
-        cluster.send("d", std::iter::once(u64::MAX));
+        // a's failure may cancel d before d's own failing record is sent.
+        cluster.send_if_open("a", std::iter::once(u64::MAX));
+        cluster.send_if_open("d", std::iter::once(u64::MAX));
         cluster.mesh.cut("b", "c");
         cluster.mesh.cut("a", "c");
         let results = cluster.join_all(DETECT).await;

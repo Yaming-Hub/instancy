@@ -101,9 +101,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   corrupted progress channels no longer leave the dataflow hanging.
 - A data frame that fails to decode no longer becomes an error envelope that
   operators silently ignore. Batches with more than 10M records are no longer
-  always dropped by the receiver; an envelope too large for one transport
-  frame fails with the new `CommunicationError::FrameTooLarge` instead of
-  killing the connection.
+  always dropped by the receiver, and the decoder reserves at most 1 MiB up
+  front, so a corrupt record count cannot trigger a huge allocation. An
+  envelope too large for one transport frame fails with the new
+  `CommunicationError::FrameTooLarge` instead of killing the connection.
+- A standalone `NetworkEdgeMaterializer` (`with_connections`, no cluster
+  coordinator) delivers a channel's close sentinel even when the queue is full
+  as the channel closes; it waits for room on the runtime instead of dropping
+  it (the receiver never counts a disconnect as the end of its input).
 - Corrupt traffic (a frame that fails its CRC or does not decode, a received
   frame over the size limit, a progress frame after the channel's
   end-of-stream) fails the dataflow with `CommunicationError::DataLoss` in

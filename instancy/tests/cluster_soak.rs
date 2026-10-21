@@ -39,8 +39,7 @@ enum Mode {
     /// Fresh shared managers (one pooled connection per peer) per dataflow.
     SharedPerJob,
     /// Long-lived shared managers with two pooled connections per peer, the
-    /// default probing and reorder timeout, multiplexing concurrent
-    /// dataflows.
+    /// default probing, multiplexing concurrent dataflows.
     SharedPooled,
 }
 
@@ -54,13 +53,21 @@ enum Shape {
     Pipeline,
 }
 
-/// The default shared configuration (probing every 100 ms, 50 ms reorder
-/// timeout) with a fixed pool of two connections. The test pool is
-/// pre-established, so it cannot scale beyond what it was given.
+/// The default shared configuration (probing every 100 ms) with a fixed pool
+/// of two connections. The test pool is pre-established, so it cannot scale
+/// beyond what it was given.
+///
+/// The reorder timeout is raised from the default 50 ms: with two or more
+/// pooled connections, a starved reader (one CPU core, a loaded CI runner)
+/// times out on a gap that is still in flight on the other connection, and
+/// every node fails with `reorder buffer gap timeout` (audit T5/H7, owned by
+/// PR9; see `pooled_soak_with_the_default_reorder_timeout`). These soaks look
+/// for false failures of the cluster lifecycle, not of the reorder buffer.
 fn pooled_config() -> SharedConnectionConfig {
     SharedConnectionConfig {
         min_connections: 2,
         max_connections: 2,
+        reorder_timeout: Duration::from_secs(20),
         ..SharedConnectionConfig::default()
     }
 }
@@ -368,11 +375,31 @@ async fn idle_routes_never_report_data_loss() {
 /// delivered, no node fails. Pooled managers carry two dataflows at a time.
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
 async fn healthy_soak_every_mode_and_size() {
+    healthy_soak(&MODES, pooled_config()).await;
+}
+
+/// Reproduces audit T5/H7 for PR9: the pooled soak with the *default* 50 ms
+/// reorder timeout on a starved machine. The shared readers time out on a gap
+/// that is still in flight on the other pooled connection, and healthy
+/// dataflows fail with `reorder buffer gap timeout`. Run it pinned to one
+/// core (`start /affinity 1 <test exe> --ignored ...` on Windows,
+/// `taskset -c 0 ...` on Linux): 2 of 3 such runs failed when it was added.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+#[ignore = "H7/T5 spurious ReorderTimeout under CPU starvation; PR9"]
+async fn pooled_soak_with_the_default_reorder_timeout() {
+    let config = SharedConnectionConfig {
+        min_connections: 2,
+        max_connections: 2,
+        ..SharedConnectionConfig::default()
+    };
+    healthy_soak(&[Mode::SharedPooled], config).await;
+}
+async fn healthy_soak(modes: &[Mode], pooled_config: SharedConnectionConfig) {
     let mut failures = Vec::new();
     for n in 2..=4 {
         let names = &NAMES[..n];
-        let pooled = tcp_shared_mesh_with(names, 2, pooled_config()).await;
-        for mode in MODES {
+        let pooled = tcp_shared_mesh_with(names, 2, pooled_config.clone()).await;
+        for &mode in modes {
             for round in 0..8 {
                 let records = move |global: usize| -> Vec<u64> {
                     let start = global as u64 * 10_000;

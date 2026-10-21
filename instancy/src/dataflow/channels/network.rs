@@ -180,6 +180,20 @@ fn is_close_sentinel(bytes: &[u8]) -> bool {
     bytes == [TAG_CLOSE]
 }
 
+/// Most memory a data envelope's decoder reserves up front; a larger batch
+/// grows as its records are decoded.
+const DECODE_PREALLOC_BYTES: usize = 1 << 20;
+
+/// Records to reserve for a batch that announces `count` records in
+/// `available` bytes: never more records than bytes present, nor more than
+/// [`DECODE_PREALLOC_BYTES`] of memory, so a corrupt count cannot reserve a
+/// large allocation whatever the record type's in-memory size.
+fn decode_capacity<D>(count: usize, available: usize) -> usize {
+    count
+        .min(available)
+        .min(DECODE_PREALLOC_BYTES / std::mem::size_of::<D>().max(1))
+}
+
 /// Decode an envelope from bytes, returning `None` for close sentinel.
 fn decode_envelope<T, D, TC, DC>(
     time_codec: &TC,
@@ -225,10 +239,11 @@ where
                 .map_err(|e| CodecError::InvalidData(e.to_string()))?
                 as usize;
             // Any count the encoder can produce (up to `u32::MAX`) is valid.
-            // Preallocate no more than the bytes present so a corrupt count
-            // cannot reserve unbounded memory; truncated input fails below.
+            // The preallocation is bounded (see `decode_capacity`), so a
+            // corrupt count cannot reserve a large allocation; truncated input
+            // fails below.
             let mut pos = 4;
-            let mut data = Vec::with_capacity(count.min(rest.len() - pos));
+            let mut data = Vec::with_capacity(decode_capacity::<D>(count, rest.len() - pos));
             for _ in 0..count {
                 let (record, consumed) = data_codec.decode(&rest[pos..])?;
                 data.push(record);
@@ -327,6 +342,9 @@ pub struct NetworkPush<T: Timestamp + ExchangeData, D: ExchangeData> {
     /// incomplete, and a sentinel would let the peer treat it as finished.
     worker_completed: Option<Arc<std::sync::atomic::AtomicBool>>,
     closed: bool,
+    /// Standalone use (no outbox): the runtime on which the close sentinel
+    /// waits for room in a full queue.
+    close_runtime: Option<tokio::runtime::Handle>,
 }
 
 #[cfg(feature = "transport")]
@@ -459,17 +477,44 @@ impl<T: Timestamp + ExchangeData, D: ExchangeData> NetworkPush<T, D> {
             Some(outbox) => {
                 let _ = outbox.send(frame);
             }
-            // Standalone use without an outbox: best effort. A spin loop could
-            // deadlock a single-threaded runtime, so we do not retry.
-            None => {
-                if let Err(_e) = self.sender.try_send(frame) {
+            // Standalone use without an outbox. The sentinel is the channel's
+            // last frame and the peer never counts a disconnect as the end of
+            // its input, so it must not be dropped for a full queue: wait for
+            // room behind the data already queued, on the runtime (blocking
+            // here could deadlock a single-threaded runtime). The writer keeps
+            // draining until every sender is gone, so this resolves unless the
+            // connection fails (a genuine loss).
+            None => match self.sender.try_send(frame) {
+                Ok(()) => {}
+                Err(tokio_mpsc::error::TrySendError::Full(frame)) => match &self.close_runtime {
+                    Some(runtime) => {
+                        let sender = self.sender.clone();
+                        let _channel_id = self.channel_id;
+                        runtime.spawn(async move {
+                            if let Err(_e) = sender.send(frame).await {
+                                #[cfg(feature = "tracing")]
+                                tracing::warn!(
+                                    "close sentinel lost for channel {_channel_id} (connection closed)"
+                                );
+                            }
+                        });
+                    }
+                    None => {
+                        #[cfg(feature = "tracing")]
+                        tracing::warn!(
+                            "close sentinel lost for channel {} (queue full)",
+                            self.channel_id
+                        );
+                    }
+                },
+                Err(tokio_mpsc::error::TrySendError::Closed(_)) => {
                     #[cfg(feature = "tracing")]
                     tracing::warn!(
-                        "close sentinel lost for channel {} (queue full or closed): {_e}",
-                        self.channel_id,
+                        "close sentinel lost for channel {} (connection closed)",
+                        self.channel_id
                     );
                 }
-            }
+            },
         }
     }
 }
@@ -1317,6 +1362,8 @@ impl<T: Timestamp + ExchangeData, D: ExchangeData> EdgeMaterializer<T, D>
                     max_payload: self.transport.max_payload_len(),
                     worker_completed: self.worker_completed.get(src_idx).cloned(),
                     closed: false,
+                    close_runtime: (!self.peer_outboxes.contains_key(dst_node))
+                        .then(|| self.runtime_handle.clone()),
                 }));
             }
         }
@@ -1694,6 +1741,55 @@ mod tests {
             }
         }
 
+        /// Standalone use (no coordinator): a push whose queue is full when it
+        /// closes still delivers its close sentinel, so the peer's pull is
+        /// exhausted with every record. Capacity 1 and the single-threaded
+        /// test runtime make the queue full at the close: the writer cannot
+        /// run in between.
+        #[tokio::test]
+        async fn standalone_close_sentinel_survives_a_full_queue() {
+            const BATCHES: u64 = 50;
+            let topo = two_node_topology();
+            let df_id = DataflowId::new();
+            let rt = tokio::runtime::Handle::current();
+            let (mut mat_a, mut mat_b) = create_connected_materializers(df_id, topo, 1, &rt);
+            let (mut push0, _) = mat_a.materialize_worker(0).unwrap();
+            let _ = mat_a.materialize_worker(1).unwrap();
+            let (_, mut pull2) = mat_b.materialize_worker(2).unwrap();
+            let _ = mat_b.materialize_worker(3).unwrap();
+
+            for i in 0..BATCHES {
+                loop {
+                    match push0[2].push(Envelope::data(1, vec![i])) {
+                        Ok(()) => break,
+                        Err(Error::Backpressure) => tokio::task::yield_now().await,
+                        Err(e) => panic!("push failed: {e}"),
+                    }
+                }
+            }
+            // The queue holds the last batch: the sentinel cannot go in now.
+            push0[2].close();
+
+            let mut received = Vec::new();
+            let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
+            while !pull2[0].is_exhausted() {
+                assert!(
+                    tokio::time::Instant::now() < deadline,
+                    "never exhausted, with {} of {BATCHES} records",
+                    received.len()
+                );
+                match pull2[0].pull() {
+                    Some(env) => {
+                        if let Some((_, data)) = env.as_data() {
+                            received.extend(data.iter().copied());
+                        }
+                    }
+                    None => tokio::time::sleep(std::time::Duration::from_millis(2)).await,
+                }
+            }
+            assert_eq!(received, (0..BATCHES).collect::<Vec<_>>());
+        }
+
         #[tokio::test]
         async fn network_materializer_bidirectional() {
             let topo = two_node_topology();
@@ -1815,6 +1911,7 @@ mod tests {
                 sender: crate::communication::cluster_transport::FrameSender::Direct(sender),
                 outbox: Some(outbox.clone()),
                 link_failure_reported: std::sync::atomic::AtomicBool::new(false),
+                close_runtime: None,
                 peer_id: Arc::from(outbox.peer()),
                 max_payload: usize::MAX,
                 worker_completed: None,
@@ -2299,6 +2396,38 @@ mod tests {
             assert_eq!((*time, data.len()), (3, n));
         }
 
+        /// A corrupt count reserves at most `DECODE_PREALLOC_BYTES`, whatever
+        /// the record type: a 256 MiB frame claiming `u32::MAX` 24-byte
+        /// records used to reserve 256 Mi of them (6 GiB).
+        #[test]
+        fn decode_preallocation_is_bounded_in_bytes() {
+            let frame = 256 << 20;
+            for (capacity, size) in [
+                (
+                    decode_capacity::<String>(u32::MAX as usize, frame),
+                    std::mem::size_of::<String>(),
+                ),
+                (decode_capacity::<[u64; 64]>(u32::MAX as usize, frame), 512),
+            ] {
+                assert!(capacity > 0);
+                assert!(
+                    capacity * size <= DECODE_PREALLOC_BYTES,
+                    "{capacity} x {size} bytes"
+                );
+            }
+            // Small batches are still reserved exactly.
+            assert_eq!(decode_capacity::<u64>(10, 80), 10);
+            // A garbage count over a real frame fails cleanly.
+            let env: Envelope<u64, String, ()> = Envelope::data(3, vec![String::new(); 1000]);
+            let mut buf = Vec::new();
+            encode_envelope(&u64::codec(), &String::codec(), &env, &mut buf).unwrap();
+            buf[9..13].copy_from_slice(&u32::MAX.to_le_bytes());
+            assert!(
+                decode_envelope::<u64, String, _, _>(&u64::codec(), &String::codec(), &buf)
+                    .is_err()
+            );
+        }
+
         #[test]
         fn decode_rejects_a_count_larger_than_the_frame() {
             let env: Envelope<u64, u64, ()> = Envelope::data(3, vec![1, 2]);
@@ -2323,6 +2452,7 @@ mod tests {
                 max_payload: 16,
                 worker_completed: None,
                 link_failure_reported: std::sync::atomic::AtomicBool::new(false),
+                close_runtime: None,
                 closed: false,
             };
             // tag + time + count = 13 bytes: fits.
@@ -2369,6 +2499,7 @@ mod tests {
                     max_payload: usize::MAX,
                     worker_completed: Some(flag),
                     link_failure_reported: std::sync::atomic::AtomicBool::new(false),
+                    close_runtime: None,
                     closed: false,
                 };
                 drop(push);
@@ -2412,6 +2543,7 @@ mod tests {
                     max_payload: usize::MAX,
                     worker_completed: Some(Arc::clone(&flag)),
                     link_failure_reported: std::sync::atomic::AtomicBool::new(false),
+                    close_runtime: None,
                     closed: false,
                 };
                 let targets: Vec<Box<dyn Push<u64, u64, ()>>> =
