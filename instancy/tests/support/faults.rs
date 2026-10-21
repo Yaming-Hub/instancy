@@ -62,6 +62,9 @@ pub struct DirCtl {
     /// Withhold frames of a kind from the n-th on (1-based); others pass.
     stash_from: Mutex<Option<(FrameKind, usize)>>,
     stashed: AtomicUsize,
+    /// Withhold progress batches; end-of-stream and acknowledgement markers
+    /// still pass.
+    stash_progress_batches: AtomicBool,
 }
 
 impl DirCtl {
@@ -96,7 +99,17 @@ impl DirCtl {
         *self.stash_from.lock().unwrap() = Some((kind, n));
     }
 
-    /// Frames withheld by [`stash_from`](Self::stash_from).
+    /// Withhold every progress batch (capability and in-flight changes) while
+    /// the progress channels' end-of-stream and acknowledgement markers still
+    /// pass: the receiver sees the sender's goodbye but never learns that the
+    /// sender released anything, so its frontier cannot complete. Withheld
+    /// frames count in [`stashed`](Self::stashed). Dedicated framing only.
+    pub fn stash_progress_batches(&self) {
+        self.stash_progress_batches.store(true, Ordering::SeqCst);
+    }
+
+    /// Frames withheld by [`stash_from`](Self::stash_from) and
+    /// [`stash_progress_batches`](Self::stash_progress_batches).
     pub fn stashed(&self) -> usize {
         self.stashed.load(Ordering::SeqCst)
     }
@@ -166,6 +179,15 @@ impl Classifier {
             progress: PROGRESS_CHANNEL_BASE..PROGRESS_CHANNEL_BASE + n * n,
             seq_prefix,
         }
+    }
+
+    /// Whether a progress payload is an end-of-stream or acknowledgement
+    /// marker (count `u32::MAX` or `u32::MAX - 1`) rather than a batch.
+    fn is_progress_marker(&self, payload: &[u8]) -> bool {
+        let start = if self.seq_prefix { 8 } else { 0 };
+        payload
+            .get(start..start + 4)
+            .is_some_and(|count| u32::from_le_bytes(count.try_into().unwrap()) >= u32::MAX - 1)
     }
 
     fn kind(&self, channel_id: u64) -> FrameKind {
@@ -238,7 +260,12 @@ async fn frame_relay(
                 ctl.held.store(true, Ordering::SeqCst);
             }
         }
-        if matches!(*ctl.stash_from.lock().unwrap(), Some((k, n)) if k == kind && seen >= n) {
+        let stash_batch = kind == FrameKind::Progress
+            && ctl.stash_progress_batches.load(Ordering::SeqCst)
+            && !classifier.is_progress_marker(&payload);
+        if stash_batch
+            || matches!(*ctl.stash_from.lock().unwrap(), Some((k, n)) if k == kind && seen >= n)
+        {
             ctl.stashed.fetch_add(1, Ordering::SeqCst);
             continue;
         }

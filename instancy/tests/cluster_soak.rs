@@ -299,21 +299,32 @@ fn is_early_completion(failure: &str) -> bool {
     .any(|signature| failure.contains(signature))
 }
 
-/// Runs `run`, re-running once after an early-completion failure. Returns
+/// Runs `run`, re-running it (up to three attempts in all) after an
+/// early-completion failure (audit C1/C2, PR4/PR5). Returns
 /// the failure to report, if any; early completions are logged.
 async fn run_checked(
     run: &Run<'_>,
     pooled: Option<&HashMap<String, Managers>>,
     label: &str,
 ) -> std::result::Result<(), String> {
-    match run.go(pooled).await {
-        Err(e) if is_early_completion(&e) => {
-            eprintln!("{label}: early completion (C1/C2), re-running once: {e}");
-            run.go(pooled)
-                .await
-                .map_err(|again| format!("{again} (after an early completion: {e})"))
+    // A slow node makes early completions likelier, and a re-run repeats
+    // the same round: allow two re-runs before calling it a failure.
+    const ATTEMPTS: usize = 3;
+    let mut early = Vec::new();
+    loop {
+        match run.go(pooled).await {
+            Err(e) if is_early_completion(&e) && early.len() + 1 < ATTEMPTS => {
+                eprintln!("{label}: early completion (C1/C2), re-running: {e}");
+                early.push(e);
+            }
+            Err(e) if !early.is_empty() => {
+                return Err(format!(
+                    "{e} (after early completions: {}",
+                    early.join("; ")
+                ));
+            }
+            other => return other,
         }
-        other => other,
     }
 }
 

@@ -625,7 +625,7 @@ async fn simultaneous_worker_failures_and_cuts_fail_every_node() {
         }
         tokio::time::sleep(Duration::from_millis(100)).await;
         // a's failure may cancel d before d's own failing record is sent.
-        cluster.send_if_open("a", std::iter::once(u64::MAX));
+        cluster.send("a", std::iter::once(u64::MAX));
         cluster.send_if_open("d", std::iter::once(u64::MAX));
         cluster.mesh.cut("b", "c");
         cluster.mesh.cut("a", "c");

@@ -597,14 +597,20 @@ fn all_to_node_b(builder: &mut DataflowBuilder<u64>) -> Result<()> {
 
 /// Node-b's own input is closed, so it only waits for node-a's records.
 /// node-a's data frames from the `stash_at`-th on never arrive, while its
-/// progress, its goodbye and its teardown do: the records fell behind the
-/// rest of its stream (as when backpressure holds them while progress is
-/// queued) and are then lost with the connection. Node-b's data channel from
-/// node-a closes without its close sentinel. Previously the dedicated bridge
-/// forwarded that as the end of input and `NetworkPull` counted the
-/// disconnect as exhaustion, so node-b finished `Ok` with records missing
-/// (node-a had said goodbye, so its lost link looked benign). It must fail
-/// with `DataLoss` instead, and never hang.
+/// goodbye and its teardown do: the records are lost with the connection.
+/// Node-b's data channel from node-a closes without its close sentinel.
+/// Previously the dedicated bridge forwarded that as the end of input and
+/// `NetworkPull` counted the disconnect as exhaustion, so node-b finished
+/// `Ok` with records missing (node-a had said goodbye, so its lost link
+/// looked benign). It must fail with `DataLoss` instead, and never hang.
+///
+/// node-a's progress batches are withheld too (its markers pass). Otherwise
+/// node-b's frontier would complete as soon as node-a's last batch arrived:
+/// node-a itself finishes with its records unconsumed, which only the
+/// in-flight accounting gap (audit C1/C2, PR4/PR5) allows, and on a starved
+/// machine node-b's executor then completed on that frontier before the lost
+/// channel was even reported. Without those batches node-b can only finish
+/// by its inputs, which is what this test is about.
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
 async fn records_lost_behind_the_senders_goodbye_never_complete_ok() {
     const BATCHES: u64 = 40;
@@ -615,6 +621,7 @@ async fn records_lost_behind_the_senders_goodbye_never_complete_ok() {
         let mut mesh = FaultMesh::new(&names, 2, false);
         let a_to_b = mesh.ctl("node-a", "node-b");
         a_to_b.stash_from(FrameKind::Data, stash_at);
+        a_to_b.stash_progress_batches();
         let mut nodes = start(&mut mesh, Mode::Dedicated, &names, all_to_node_b).await;
         let _oa = nodes[0].df().take_output::<u64>(0, "out").unwrap();
         let ob = nodes[1].df().take_output::<u64>(0, "out").unwrap();

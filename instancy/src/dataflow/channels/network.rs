@@ -56,7 +56,9 @@
 //! ordered outbox lane (the runtime's per-peer forwarder that awaits queue
 //! capacity), so it is never lost to a full transport queue and still arrives
 //! after all of this push's data. A push without an outbox (standalone use of
-//! [`NetworkEdgeMaterializer`]) falls back to a best-effort `try_send`.
+//! [`NetworkEdgeMaterializer`]) sends it directly and, if the transport queue
+//! is full, waits for room on the runtime: it is lost only with the
+//! connection.
 //!
 //! # Data loss
 //!
@@ -814,7 +816,8 @@ impl InboundChannel<'_> {
 /// reported to the cluster lifecycle coordinator, which fails the dataflow.
 /// Without a coordinator (standalone use of [`NetworkEdgeMaterializer`]) the
 /// endpoint fails closed: it stays unexhausted, so the dataflow cannot
-/// complete with missing data.
+/// complete with missing data. That happens only on a genuine loss: a
+/// standalone push never drops its sentinel for a full queue.
 #[cfg(feature = "transport")]
 pub struct NetworkPull<T: Timestamp + ExchangeData, D: ExchangeData> {
     time_codec: T::CodecType,
