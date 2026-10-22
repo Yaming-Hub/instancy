@@ -361,7 +361,8 @@ pub struct OracleStats {
     /// Why checking stopped early (cancellation or failure), if it did.
     pub halted: Option<String>,
     /// Violations found but not logged because the same kind was already
-    /// logged several times for this dataflow.
+    /// logged several times for this dataflow. A lower bound: once a kind of
+    /// V1 or V7 violation has been logged that often, its check is skipped.
     pub suppressed: u64,
 }
 
@@ -761,6 +762,19 @@ struct State<T: Timestamp> {
     stats: OracleStats,
 }
 
+impl<T: Timestamp> State<T> {
+    /// Whether this kind of violation has been logged as often as it ever
+    /// will be for this dataflow. Its check is then skipped: a dataflow that
+    /// breaks an invariant on every record (every loop does today, audit
+    /// O-9) would otherwise spend its time describing violations nobody
+    /// reads.
+    fn saturated(&self, check: Check, kind: &'static str) -> bool {
+        self.logged
+            .get(&(check, kind))
+            .is_some_and(|n| *n >= LOGGED_PER_KIND)
+    }
+}
+
 /// A violation found under the oracle's lock, recorded after releasing it.
 struct Found {
     check: Check,
@@ -944,7 +958,7 @@ impl<T: Timestamp> Oracle<T> {
             if self.partial(state) || state.halted.is_some() {
                 return;
             }
-            if scan {
+            if scan && !state.saturated(Check::V7, "frontier-ahead-of-work") {
                 let v = &state.views[&view];
                 for ((store, loc, owner), times) in &state.counts {
                     if !v.sees(*owner) {
@@ -1177,7 +1191,7 @@ impl<T: Timestamp> Oracle<T> {
                 ),
             });
         }
-        if diff > 0 && now > 0 {
+        if diff > 0 && now > 0 && !state.saturated(Check::V7, "frontier-ahead-of-work") {
             for v in state.views.values().filter(|v| v.sees(owner)) {
                 check_one(v, &state.out_edges, store, loc, time, now, found);
             }
@@ -1203,7 +1217,12 @@ impl<T: Timestamp> Oracle<T> {
             if state.halted.is_some() {
                 return;
             }
-            for v in state.views.values().filter(|v| v.worker == worker) {
+            let check_v1 = !state.saturated(Check::V1, "late-data");
+            for v in state
+                .views
+                .values()
+                .filter(|v| check_v1 && v.worker == worker)
+            {
                 let Some(frontier) = v.targets.get(&loc) else {
                     continue;
                 };
