@@ -583,12 +583,17 @@ pub struct DataflowExecutor<T: Timestamp = u64> {
 }
 
 impl<T: Timestamp> DataflowExecutor<T> {
-    /// Materialize a dataflow from its graph, factories, and channel factories.
+    /// Materialize this worker's part of a dataflow from its graph, factories,
+    /// and channel factories.
     ///
-    /// This is the bridge between the build phase and the execution phase:
-    /// - Creates channels for each edge using the channel factories.
-    /// - Invokes operator factories with their assigned channel endpoints.
-    /// - Returns a ready-to-run executor.
+    /// This is the bridge between the build phase and the execution phase.
+    /// `plan` decides what this worker (`worker_context.worker_index()`) runs:
+    /// - It builds every edge one of whose ends runs here
+    ///   ([`EdgePlan::built_on`](crate::dataflow::plan::EdgePlan::built_on)).
+    ///   A worker-local edge whose source does not run here (its target does)
+    ///   gives the target an input that is already exhausted.
+    /// - It invokes the factory of every operator that runs here, with that
+    ///   operator's worker context (its stage's).
     ///
     /// If `external_wake_handle` is provided, the executor uses it instead of
     /// creating its own. This allows the runtime to share the same WakeHandle
@@ -599,6 +604,7 @@ impl<T: Timestamp> DataflowExecutor<T> {
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn materialize(
         graph: &DataflowGraph,
+        plan: &crate::dataflow::plan::PhysicalPlan,
         operator_factories: &mut [(usize, OperatorFactory)],
         channel_factories: &mut [(usize, ChannelFactory)],
         config: ExecutorConfig,
@@ -611,6 +617,13 @@ impl<T: Timestamp> DataflowExecutor<T> {
         let edges = graph.edges();
         let feedback_edges = graph.feedback_edges();
         let total_edge_count = edges.len() + feedback_edges.len();
+        let worker = worker_context.worker_index();
+        if worker_context.num_workers() != plan.total_workers() {
+            return Err(Error::Dataflow(DataflowError::InvalidGraph(format!(
+                "worker context {worker_context} does not match the plan's {} workers",
+                plan.total_workers()
+            ))));
+        }
 
         // Create timeline collector early so exchange channels can capture it.
         let timeline_start = config.timeline_start_time.unwrap_or_else(Instant::now);
@@ -627,13 +640,6 @@ impl<T: Timestamp> DataflowExecutor<T> {
             None
         };
 
-        // Phase 1: Create channels for each edge (regular + feedback).
-        // channel_endpoints[edge_index] = (push_end, pull_end)
-        // Regular edges: indices 0..edges.len()
-        // Feedback edges: indices edges.len()..total_edge_count
-        let mut push_ends: Vec<Option<Box<dyn std::any::Any + Send>>> = Vec::new();
-        let mut pull_ends: Vec<Option<Box<dyn std::any::Any + Send>>> = Vec::new();
-
         // Channel factories are indexed by edge index.
         // Create a map from edge_index → position in the factory vec.
         let factory_positions: HashMap<usize, usize> = channel_factories
@@ -644,95 +650,84 @@ impl<T: Timestamp> DataflowExecutor<T> {
 
         let wake_handle = external_wake_handle.unwrap_or_default();
 
+        // Phase 1: Create this worker's channels (regular edges at indices
+        // 0..edges.len(), feedback edges after them) and collect their
+        // endpoints per operator:
+        //   - input_pullers: pull ends of edges targeting the operator (by target port)
+        //   - output_pushers: push ends of edges sourced from the operator (by source port)
+        let mut op_input_pullers: HashMap<usize, Vec<(usize, Box<dyn std::any::Any + Send>)>> =
+            HashMap::new();
+        let mut op_output_pushers: HashMap<usize, Vec<(usize, Box<dyn std::any::Any + Send>)>> =
+            HashMap::new();
         for edge_idx in 0..total_edge_count {
-            let pos = *factory_positions.get(&edge_idx).ok_or_else(|| {
-                Error::Dataflow(DataflowError::MissingFactory {
-                    edge_index: edge_idx,
-                })
-            })?;
             let edge = if edge_idx < edges.len() {
                 &edges[edge_idx]
             } else {
                 &feedback_edges[edge_idx - edges.len()]
             };
+            let planned = plan.edge(edge_idx).ok_or_else(|| {
+                Error::Dataflow(DataflowError::InvalidGraph(format!(
+                    "edge {edge_idx} ({edge}) is not in the physical plan"
+                )))
+            })?;
+            if !planned.built_on(worker) {
+                continue;
+            }
+            let pos = *factory_positions.get(&edge_idx).ok_or_else(|| {
+                Error::Dataflow(DataflowError::MissingFactory {
+                    edge_index: edge_idx,
+                })
+            })?;
+            let ctx = plan.channel_context(worker, planned)?;
             let (_, factory) = &mut channel_factories[pos];
+            if planned.routing != crate::dataflow::plan::EdgeRouting::Exchange
+                && !planned.runs_source(worker)
+            {
+                // A worker-local edge whose source does not run here: no
+                // upstream on this worker, so the input is exhausted.
+                let pull = factory.build_exhausted_pull(
+                    &ctx,
+                    Some(wake_handle.clone()),
+                    &check,
+                    edge.source,
+                    edge.target,
+                )?;
+                op_input_pullers
+                    .entry(edge.target.operator_index)
+                    .or_default()
+                    .push((edge.target.slot_index, pull));
+                continue;
+            }
             let (push, pull) = factory.build_checked(
-                &worker_context,
+                &ctx,
                 Some(wake_handle.clone()),
                 &check,
                 edge.source,
                 edge.target,
             )?;
-            push_ends.push(Some(push));
-            pull_ends.push(Some(pull));
+            // An exchange end whose operator does not run here holds no
+            // channels of this worker and is dropped.
+            if planned.runs_target(worker) {
+                op_input_pullers
+                    .entry(edge.target.operator_index)
+                    .or_default()
+                    .push((edge.target.slot_index, pull));
+            }
+            if planned.runs_source(worker) {
+                op_output_pushers
+                    .entry(edge.source.operator_index)
+                    .or_default()
+                    .push((edge.source.slot_index, push));
+            }
         }
 
-        // Phase 2: Collect channel endpoints per operator.
-        // For each operator, gather:
-        //   - input_pullers: pull ends of edges targeting this operator (by target port)
-        //   - output_pushers: push ends of edges sourced from this operator (by source port)
-        let mut op_input_pullers: std::collections::HashMap<
-            usize,
-            Vec<(usize, Box<dyn std::any::Any + Send>)>,
-        > = std::collections::HashMap::new();
-        let mut op_output_pushers: std::collections::HashMap<
-            usize,
-            Vec<(usize, Box<dyn std::any::Any + Send>)>,
-        > = std::collections::HashMap::new();
-
-        // Process regular edges
-        for (edge_idx, edge) in edges.iter().enumerate() {
-            let pull = pull_ends[edge_idx].take().ok_or_else(|| {
-                Error::Dataflow(DataflowError::InvalidGraph(
-                    "edge endpoint missing or already materialized".into(),
-                ))
-            })?;
-            let push = push_ends[edge_idx].take().ok_or_else(|| {
-                Error::Dataflow(DataflowError::InvalidGraph(
-                    "edge endpoint missing or already materialized".into(),
-                ))
-            })?;
-
-            op_input_pullers
-                .entry(edge.target.operator_index)
-                .or_default()
-                .push((edge.target.slot_index, pull));
-
-            op_output_pushers
-                .entry(edge.source.operator_index)
-                .or_default()
-                .push((edge.source.slot_index, push));
-        }
-
-        // Process feedback edges (same as regular edges for materialization purposes)
-        for (i, edge) in feedback_edges.iter().enumerate() {
-            let edge_idx = edges.len() + i;
-            let pull = pull_ends[edge_idx].take().ok_or_else(|| {
-                Error::Dataflow(DataflowError::InvalidGraph(
-                    "edge endpoint missing or already materialized".into(),
-                ))
-            })?;
-            let push = push_ends[edge_idx].take().ok_or_else(|| {
-                Error::Dataflow(DataflowError::InvalidGraph(
-                    "edge endpoint missing or already materialized".into(),
-                ))
-            })?;
-
-            op_input_pullers
-                .entry(edge.target.operator_index)
-                .or_default()
-                .push((edge.target.slot_index, pull));
-
-            op_output_pushers
-                .entry(edge.source.operator_index)
-                .or_default()
-                .push((edge.source.slot_index, push));
-        }
-
-        // Phase 3: Invoke operator factories with their endpoints.
-        // Sort positions by operator index for deterministic creation without
-        // disturbing the persistent factory order stored on LogicalDataflow.
-        let mut factory_positions: Vec<usize> = (0..operator_factories.len()).collect();
+        // Phase 2: Invoke the factories of the operators this worker runs,
+        // with their endpoints. Sort positions by operator index for
+        // deterministic creation without disturbing the persistent factory
+        // order stored on LogicalDataflow.
+        let mut factory_positions: Vec<usize> = (0..operator_factories.len())
+            .filter(|&pos| plan.runs(worker, operator_factories[pos].0))
+            .collect();
         factory_positions.sort_by_key(|&pos| operator_factories[pos].0);
 
         let mut operators: Vec<Box<dyn SchedulableOperator>> = Vec::new();
@@ -769,7 +764,7 @@ impl<T: Timestamp> DataflowExecutor<T> {
                 progress_reporters: progress_reporters.clone(),
             };
 
-            let operator = factory.build(&worker_context, endpoints)?;
+            let operator = factory.build(&plan.operator_context(worker, op_idx)?, endpoints)?;
             let pos = operators.len();
             if op_idx < index_to_pos.len() {
                 index_to_pos[op_idx] = pos;
@@ -978,21 +973,16 @@ impl<T: Timestamp> DataflowExecutor<T> {
     ///
     /// The probe's frontier is updated during each progress propagation step
     /// with the stream's frontier (see [`ProgressTracker::stream_frontier`]).
-    /// `total_workers` is the number of workers in this executor's dataflow;
+    /// `writers` is the number of workers that run the probed operator
+    /// ([`PhysicalPlan::probe_writers`](crate::dataflow::plan::PhysicalPlan::probe_writers));
     /// the probe uses it to decide whether its writers cover every worker.
     /// On registration, the probe is immediately seeded with the current frontier.
-    pub(crate) fn register_probe(
-        &mut self,
-        registration: &ProbeRegistration<T>,
-        total_workers: usize,
-    ) {
-        let mut probe = AttachedProbe::new(registration, total_workers);
+    pub(crate) fn register_probe(&mut self, registration: &ProbeRegistration<T>, writers: usize) {
+        let mut probe = AttachedProbe::new(registration, writers);
         if let Some(ref tracker) = self.progress_tracker {
-            if tracker.all_peers_synced() {
-                probe
-                    .writer
-                    .update(&tracker.stream_frontier(probe.operator, probe.output));
-            }
+            probe
+                .writer
+                .update(&tracker.stream_frontier(probe.operator, probe.output));
         }
         self.probes.push(probe);
     }
@@ -1002,10 +992,7 @@ impl<T: Timestamp> DataflowExecutor<T> {
         if self.probes.is_empty() {
             return;
         }
-        let tracker = self
-            .progress_tracker
-            .as_ref()
-            .filter(|tracker| tracker.all_peers_synced());
+        let tracker = self.progress_tracker.as_ref();
         for mut probe in self.probes.drain(..) {
             let last = tracker.map(|tracker| tracker.stream_frontier(probe.operator, probe.output));
             probe.writer.finish(last.as_ref());
@@ -1103,14 +1090,15 @@ impl<T: Timestamp> DataflowExecutor<T> {
     ///
     /// * `stages` — Stage metadata from `LogicalDataflow.stages()`. Each stage's
     ///   `operator_indices` contains logical graph indices that are mapped to
-    ///   physical executor positions via `index_to_pos`.
+    ///   physical executor positions via `index_to_pos`. A stage none of
+    ///   whose operators run on this worker gets no task.
     pub fn enable_stage_tasks(&mut self, stages: &[crate::dataflow::stage::StageInfo]) {
         let mut tasks = Vec::with_capacity(stages.len());
         let mut op_pos_to_task = vec![usize::MAX; self.operators.len()];
 
-        for (task_idx, stage) in stages.iter().enumerate() {
+        for stage in stages {
             // Map logical operator indices to physical positions, filtering
-            // any indices that don't exist in this executor (defensive).
+            // the operators that do not run on this worker.
             let positions: Vec<usize> = stage
                 .operator_indices
                 .iter()
@@ -1124,8 +1112,12 @@ impl<T: Timestamp> DataflowExecutor<T> {
                     None
                 })
                 .collect();
+            if positions.is_empty() {
+                continue;
+            }
 
             // Record mapping from operator position → task index.
+            let task_idx = tasks.len();
             for &pos in &positions {
                 op_pos_to_task[pos] = task_idx;
             }
@@ -1309,20 +1301,18 @@ impl<T: Timestamp> DataflowExecutor<T> {
             }
         }
 
-        // Update registered probes with the frontiers of their streams. Until
-        // every peer's initial capabilities have been absorbed, this worker's
-        // view may be missing remote work, so it is not reported.
+        // Update registered probes with the frontiers of their streams. Every
+        // view is seeded with every worker's initial capabilities (A4), so it
+        // is never missing a peer's initial state.
         if !self.probes.is_empty() {
             let tracker = self.progress_tracker.as_ref().ok_or_else(|| {
                 Error::Dataflow(DataflowError::InvalidGraph(
                     "progress tracker missing while probes are registered".into(),
                 ))
             })?;
-            if tracker.all_peers_synced() {
-                for probe in &mut self.probes {
-                    let frontier = tracker.stream_frontier(probe.operator, probe.output);
-                    probe.writer.update(&frontier);
-                }
+            for probe in &mut self.probes {
+                let frontier = tracker.stream_frontier(probe.operator, probe.output);
+                probe.writer.update(&frontier);
             }
         }
 
@@ -1836,13 +1826,10 @@ impl<T: Timestamp> DataflowExecutor<T> {
             }
 
             if let Some(ref tracker) = self.progress_tracker {
-                // If the tracker reports completion AND we've heard from all
-                // peers AND no peer progress is pending, force-close any
-                // remaining operators (feedback cycles that quiesced).
-                if tracker.is_completed()
-                    && !tracker.has_pending_peer_progress()?
-                    && tracker.all_peers_synced()
-                {
+                // If the tracker reports completion AND no peer progress is
+                // pending, force-close any remaining operators (feedback
+                // cycles that quiesced).
+                if tracker.is_completed() && !tracker.has_pending_peer_progress()? {
                     #[cfg(any(debug_assertions, feature = "progress-check"))]
                     tracker.check_force_close();
                     for pos in 0..self.operators.len() {
@@ -1857,15 +1844,12 @@ impl<T: Timestamp> DataflowExecutor<T> {
                 // Any of these conditions means the global dataflow is still
                 // active and we should wait rather than declare quiescence:
                 // - Tracker not completed: outstanding capabilities somewhere
-                // - Peers not synced: initial caps still in transit
                 // - Pending peer progress: buffered updates not yet absorbed
                 //
                 // During drain mode, we don't wait — the drain deadline
                 // controls when to give up, not the progress tracker.
                 if !self.draining
-                    && (!tracker.is_completed()
-                        || !tracker.all_peers_synced()
-                        || tracker.has_pending_peer_progress()?)
+                    && (!tracker.is_completed() || tracker.has_pending_peer_progress()?)
                 {
                     self.consecutive_idle = 0;
                     return Ok(SweepOutcome::WaitingForInput);
@@ -4382,9 +4366,9 @@ mod tests {
         ];
 
         executor.enable_stage_tasks(&stages);
-        // Two tasks created, but second has no valid positions.
-        assert_eq!(executor.stage_tasks.len(), 2);
-        assert!(executor.stage_tasks[1].operator_positions.is_empty());
+        // The stage with no operator on this worker gets no task.
+        assert_eq!(executor.stage_tasks.len(), 1);
+        assert_eq!(executor.stage_tasks[0].operator_positions, vec![0]);
 
         let result = executor.run().unwrap();
         assert!(result);

@@ -1132,7 +1132,7 @@ async fn future_version_peer_is_rejected_with_version_error() {
 /// markers and acknowledgements that teardown waits for.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn version_2_peer_without_shutdown_handshake_is_rejected() {
-    assert_eq!(instancy::communication::CLUSTER_PROTOCOL_VERSION, 3);
+    assert_eq!(instancy::communication::CLUSTER_PROTOCOL_VERSION, 4);
     let err = spawn_against_fake_peer(|df| {
         let mut p = vec![0u8];
         p.extend_from_slice(&2u32.to_le_bytes());
@@ -1145,6 +1145,28 @@ async fn version_2_peer_without_shutdown_handshake_is_rejected() {
     .await;
     assert!(
         err.contains("protocol version mismatch") && err.contains("remote=2"),
+        "{err}"
+    );
+}
+
+/// A peer on cluster protocol version 3 sends its initial capabilities on
+/// its progress stream instead of seeding them from the physical plan: it
+/// must be rejected, since this node would count them twice (and the peer
+/// would never see this node's).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn version_3_peer_without_plan_seeding_is_rejected() {
+    let err = spawn_against_fake_peer(|df| {
+        let mut p = vec![0u8];
+        p.extend_from_slice(&3u32.to_le_bytes());
+        p.extend_from_slice(&0u64.to_le_bytes());
+        p.extend_from_slice(df.as_bytes());
+        p.extend_from_slice(&6u32.to_le_bytes());
+        p.extend_from_slice(b"node-b");
+        with_crc(p)
+    })
+    .await;
+    assert!(
+        err.contains("protocol version mismatch") && err.contains("remote=3"),
         "{err}"
     );
 }

@@ -23,7 +23,7 @@
 //!
 //! - **channels**: every channel is wrapped where it is materialized
 //!   ([`DataflowExecutor::materialize`](crate::dataflow::DataflowExecutor),
-//!   the staged executor and the staged boundary wiring). An envelope counts
+//!   the one materialization point of every path). An envelope counts
 //!   from the moment a producer first offers it (so the inside of composite
 //!   pushers, exchange buckets, network queues and receive bridges is all
 //!   covered) until a consumer pulls it. Broadcast edges count one copy per
@@ -586,7 +586,7 @@ impl<S: Timestamp> Port<S> {
     }
 
     /// A port at `loc` for work that belongs to no worker in particular
-    /// (counted for every global view and at the end state).
+    /// (counted for every view and at the end state).
     pub(crate) fn new_shared(
         sink: Arc<dyn Sink>,
         worker: usize,
@@ -662,14 +662,6 @@ pub(crate) trait Sink: Send + Sync + 'static {
 pub(crate) struct Ctx {
     pub(crate) sink: Arc<dyn Sink>,
     pub(crate) worker: usize,
-    typed: Arc<dyn Any + Send + Sync>,
-}
-
-impl Ctx {
-    /// The oracle, typed by the dataflow's root timestamp `T`.
-    pub(crate) fn oracle<T: Timestamp>(&self) -> Option<Arc<Oracle<T>>> {
-        self.typed.clone().downcast::<Oracle<T>>().ok()
-    }
 }
 
 impl fmt::Debug for Ctx {
@@ -774,16 +766,11 @@ const PRUNE_EVERY: u64 = 1024;
 const REGISTRATION_GRACE: std::time::Duration = std::time::Duration::from_secs(5);
 
 /// One worker's view: the frontiers of the last propagation of one tracker.
+/// Every view is global: a multi-worker dataflow's trackers all receive every
+/// worker's progress.
 struct View<T: Timestamp> {
     worker: usize,
     label: &'static str,
-    /// `Some(worker)` while the tracker sees only its own worker (no
-    /// cross-worker progress channels in a multi-worker dataflow: the staged
-    /// executor's per-stage trackers and `SimpleRuntime`). Such a view is
-    /// checked only against its own worker's work: work in a cross-worker
-    /// channel may be bound for another worker, so it is checked for this
-    /// view only when this worker consumes it (V1) and at the end state.
-    local: Option<usize>,
     targets: LocMap<Antichain<T>>,
     sources: LocMap<Antichain<T>>,
     /// Publications with a non-empty frontier at a fully exhausted input,
@@ -793,17 +780,6 @@ struct View<T: Timestamp> {
     /// frontiers. After that, new work is checked as it is counted, and a
     /// publication rescans only the work its changed frontiers constrain.
     scanned: bool,
-}
-
-impl<T: Timestamp> View<T> {
-    /// Whether work owned by `owner` constrains this view.
-    fn sees(&self, owner: Owner) -> bool {
-        match (self.local, owner) {
-            (Some(local), Some(owner)) => local == owner,
-            (Some(_), None) => false,
-            (None, _) => true,
-        }
-    }
 }
 
 type Counts<T> = HashMap<(Store, Loc, Owner), BTreeMap<T, i64>, FastHash>;
@@ -1007,7 +983,6 @@ enum Event<T: Timestamp> {
     },
     Publish {
         view: u64,
-        global: bool,
         targets: Vec<(Loc, Antichain<T>)>,
         sources: Vec<(Loc, Antichain<T>)>,
         at: std::time::Instant,
@@ -1196,11 +1171,10 @@ impl<T: Timestamp> Oracle<T> {
             } => self.consumed_locked(state, loc, owner, &time, n, worker, found),
             Event::Publish {
                 view,
-                global,
                 targets,
                 sources,
                 at,
-            } => self.publish_locked(state, view, global, targets, sources, at, found),
+            } => self.publish_locked(state, view, targets, sources, at, found),
             Event::Exhausted(loc) => *state.exhausted.entry(loc).or_insert(0) += 1,
             Event::ForceClose(view) => self.force_close_locked(state, view, found),
             Event::WorkerFinished { worker, ok } => {
@@ -1296,7 +1270,6 @@ impl<T: Timestamp> Oracle<T> {
         Ctx {
             sink: self.clone(),
             worker,
-            typed: self.clone(),
         }
     }
 
@@ -1317,7 +1290,6 @@ impl<T: Timestamp> Oracle<T> {
             View {
                 worker,
                 label,
-                local: None,
                 targets: LocMap::default(),
                 sources: LocMap::default(),
                 stuck: LocMap::default(),
@@ -1339,18 +1311,15 @@ impl<T: Timestamp> Oracle<T> {
     }
 
     /// Publish a view's frontiers (those that changed) and check the view
-    /// against all counted work (V7) and exhausted inputs (V4). `global`:
-    /// the view includes every worker's progress.
+    /// against all counted work (V7) and exhausted inputs (V4).
     pub(crate) fn publish(
         &self,
         view: u64,
-        global: bool,
         targets: impl IntoIterator<Item = (Loc, Antichain<T>)>,
         sources: impl IntoIterator<Item = (Loc, Antichain<T>)>,
     ) {
         self.enqueue(Event::Publish {
             view,
-            global,
             targets: targets.into_iter().collect(),
             sources: sources.into_iter().collect(),
             at: std::time::Instant::now(),
@@ -1363,7 +1332,6 @@ impl<T: Timestamp> Oracle<T> {
         &self,
         state: &mut State<T>,
         view: u64,
-        global: bool,
         targets: Vec<(Loc, Antichain<T>)>,
         sources: Vec<(Loc, Antichain<T>)>,
         at: std::time::Instant,
@@ -1373,12 +1341,6 @@ impl<T: Timestamp> Oracle<T> {
         let Some(v) = state.views.get_mut(&view) else {
             return;
         };
-        let local = (!global && total_workers > 1).then_some(v.worker);
-        if v.local != local {
-            // The view now sees other work than before.
-            v.local = local;
-            v.scanned = false;
-        }
         let mut changed_targets = Vec::new();
         for (loc, frontier) in targets {
             if v.targets.get(&loc) != Some(&frontier) {
@@ -1411,16 +1373,15 @@ impl<T: Timestamp> Oracle<T> {
         if scan {
             let v = &state.views[&view];
             let mut budget = Budget::new(&state.site_logged);
-            for ((store, loc, owner), times) in &state.counts {
-                if !v.sees(*owner)
-                    || (!full
-                        && !constrained_by(
-                            &state.out_edges,
-                            *store,
-                            *loc,
-                            &changed_targets,
-                            &changed_sources,
-                        ))
+            for ((store, loc, _), times) in &state.counts {
+                if (!full
+                    && !constrained_by(
+                        &state.out_edges,
+                        *store,
+                        *loc,
+                        &changed_targets,
+                        &changed_sources,
+                    ))
                     || v7_saturated(&state.site_logged, &state.out_edges, *store, *loc)
                 {
                     continue;
@@ -1510,7 +1471,7 @@ impl<T: Timestamp> Oracle<T> {
         };
         let mut outstanding = Vec::new();
         for ((store, loc, owner), times) in &state.counts {
-            if !v.sees(*owner) || !view_covers(v, &state.out_edges, *store, *loc) {
+            if !view_covers(v, &state.out_edges, *store, *loc) {
                 continue;
             }
             for (time, &n) in times {
@@ -1669,7 +1630,7 @@ impl<T: Timestamp> Oracle<T> {
         }
         if diff > 0 && now > 0 && !v7_saturated(&state.site_logged, &state.out_edges, store, loc) {
             let mut budget = Budget::new(&state.site_logged);
-            for v in state.views.values().filter(|v| v.sees(owner)) {
+            for v in state.views.values() {
                 check_one(
                     v,
                     &state.out_edges,
@@ -1976,14 +1937,12 @@ impl<T: Timestamp> TrackerCheck<T> {
         }
     }
 
-    /// `global`: the tracker receives every worker's progress.
     pub(crate) fn publish(
         &self,
-        global: bool,
         targets: impl IntoIterator<Item = (Loc, Antichain<T>)>,
         sources: impl IntoIterator<Item = (Loc, Antichain<T>)>,
     ) {
-        self.oracle.publish(self.view, global, targets, sources);
+        self.oracle.publish(self.view, targets, sources);
     }
 
     pub(crate) fn force_close(&self) {
@@ -2393,7 +2352,7 @@ mod tests {
         oracle.count(Store::Channel, (2, 0), None, &0, -5, 0);
         // Records sent to the other process, never pulled here.
         oracle.count(Store::Channel, (2, 0), None, &1, 3, 0);
-        oracle.publish(view, true, [((2, 0), frontier(4))], []);
+        oracle.publish(view, [((2, 0), frontier(4))], []);
         oracle.force_close(view);
         assert!(
             violations_for(id).iter().all(|v| v.check.is_report()),
@@ -2412,7 +2371,7 @@ mod tests {
         let view = oracle.attach_view(0, "worker tracker");
         oracle.count(Store::Channel, (2, 0), None, &0, -5, 0);
         oracle.count(Store::Channel, (2, 0), None, &1, 3, 0);
-        oracle.publish(view, true, [((2, 0), frontier(4))], []);
+        oracle.publish(view, [((2, 0), frontier(4))], []);
         let kinds: Vec<_> = violations_for(id).iter().map(|v| v.kind).collect();
         assert!(kinds.contains(&"negative-occupancy"), "{kinds:?}");
         assert!(kinds.contains(&"frontier-ahead-of-work"), "{kinds:?}");
@@ -2429,11 +2388,11 @@ mod tests {
         oracle.exhausted((2, 0), 0);
         let view = oracle.attach_view(0, "worker tracker");
         for _ in 0..EXHAUSTED_GRACE + 10 {
-            oracle.publish(view, true, [((2, 0), frontier(0))], []);
+            oracle.publish(view, [((2, 0), frontier(0))], []);
         }
         std::thread::sleep(EXHAUSTED_GRACE_TIME);
         for _ in 0..EXHAUSTED_GRACE + 10 {
-            oracle.publish(view, true, [((2, 0), frontier(0))], []);
+            oracle.publish(view, [((2, 0), frontier(0))], []);
         }
         let reported = violations_for(id)
             .iter()
@@ -2453,18 +2412,13 @@ mod tests {
         oracle.register_names([(1, "a".into()), (2, "b".into()), (3, "c".into())]);
         let view = oracle.attach_view(0, "worker tracker");
         // Every record into b is behind b's frontier.
-        oracle.publish(
-            view,
-            true,
-            [((2, 0), frontier(10)), ((3, 0), frontier(0))],
-            [],
-        );
+        oracle.publish(view, [((2, 0), frontier(10)), ((3, 0), frontier(0))], []);
         for _ in 0..100 {
             oracle.count(Store::Channel, (2, 0), None, &1, 1, 0);
             oracle.consumed((2, 0), None, &1, 1, 0);
         }
         // Then one record behind c's frontier.
-        oracle.publish(view, true, [((3, 0), frontier(10))], []);
+        oracle.publish(view, [((3, 0), frontier(10))], []);
         oracle.count(Store::Channel, (3, 0), None, &1, 1, 0);
         let logged = |check: Check, location: &str| {
             violations_for(id)
@@ -2491,7 +2445,6 @@ mod tests {
         let publish = |b: u64, c: u64, a: u64| {
             oracle.publish(
                 view,
-                true,
                 [((2, 0), frontier(b)), ((3, 0), frontier(c))],
                 [((1, 0), frontier(a))],
             );
@@ -2531,7 +2484,6 @@ mod tests {
         let view = oracle.attach_view(0, "worker tracker");
         oracle.publish(
             view,
-            true,
             [
                 ((3, 0), frontier(5)),
                 ((7, 1), frontier(5)),

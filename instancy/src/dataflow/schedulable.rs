@@ -402,6 +402,22 @@ pub struct ChannelFactory {
     /// Whether the channel routes records between workers.
     #[cfg(any(debug_assertions, feature = "progress-check"))]
     check_cross_worker: bool,
+    /// Closes a push end this factory built (monomorphized for its types).
+    close_push: fn(Box<dyn Any + Send>),
+}
+
+/// Closes and drops a type-erased `Box<dyn Push<T, D, M>>`.
+fn close_push<T, D, M>(push: Box<dyn Any + Send>)
+where
+    T: crate::progress::timestamp::Timestamp,
+    D: 'static,
+    M: 'static,
+{
+    if let Ok(mut push) =
+        push.downcast::<Box<dyn crate::dataflow::channels::pushpull::Push<T, D, M>>>()
+    {
+        push.close();
+    }
 }
 
 /// Type alias for the channel pair returned by [`ChannelFactory::build`].
@@ -451,6 +467,7 @@ impl ChannelFactory {
             check_fanout: 1,
             #[cfg(any(debug_assertions, feature = "progress-check"))]
             check_cross_worker: false,
+            close_push: close_push::<T, D, M>,
         }
     }
 
@@ -506,6 +523,23 @@ impl ChannelFactory {
         #[cfg(not(any(debug_assertions, feature = "progress-check")))]
         let _ = (check, source, target);
         Ok(pair)
+    }
+
+    /// [`build_checked`](Self::build_checked) on a worker that runs the
+    /// edge's target but not its source: the push end is closed and dropped
+    /// at once, and the pull end, an input that is already exhausted, is
+    /// returned.
+    pub(crate) fn build_exhausted_pull(
+        &mut self,
+        ctx: &WorkerContext,
+        wake_handle: Option<crate::dataflow::channels::wake::WakeHandle>,
+        check: &crate::progress::CheckCtx,
+        source: crate::dataflow::stream::Slot,
+        target: crate::dataflow::stream::Slot,
+    ) -> crate::Result<Box<dyn Any + Send>> {
+        let (push, pull) = self.build_checked(ctx, wake_handle, check, source, target)?;
+        (self.close_push)(push);
+        Ok(pull)
     }
 
     /// Declare that this channel routes records between workers and that

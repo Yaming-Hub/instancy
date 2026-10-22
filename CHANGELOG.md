@@ -7,6 +7,41 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### One executor core (step 2 of the progress-accounting redesign)
+
+- Every path now runs on one executor core. A **physical plan**, computed
+  once per spawn, decides which workers run which operators: a stage with
+  parallelism `p` runs on workers `0..p`, each operator sees its stage's
+  worker context, and exchanges connect the stages' workers. Stages with
+  different parallelism (`exchange_to`, `gather`, `rebalance_to`) no longer
+  use a separate staged executor with per-stage progress trackers; every
+  worker runs the operators of its stages on the uniform executor, with one
+  progress tracker over the whole graph connected to every other worker.
+  `SimpleRuntime::spawn_multi` workers now exchange progress too.
+- The staged path now honours `SpawnOptions::drain_on_cancel`, and metrics
+  and timelines.
+- **Behaviour change:** a pipeline edge from a stage with more workers into
+  one with fewer now fails at spawn, naming the edge (its records used to be
+  silently dropped). A worker that runs only the target of a pipeline edge
+  (into a stage with more workers) sees that input as already ended; such an
+  edge used to be dropped too. Feedback edges still need equal parallelism.
+- `RuntimeHandle::spawn_multi` calls the `build` closure once per spawn on
+  every path (the per-stage path used to call it once per worker, plus once
+  more). `SimpleRuntime::spawn_multi` still calls it once per worker.
+- Initial capabilities are seeded on every worker from the physical plan
+  instead of being sent on the progress streams, so no worker can compute a
+  frontier before a peer's initial capabilities arrive (audit H13).
+- **BREAKING (wire format):** cluster protocol version 4
+  (`CLUSTER_PROTOCOL_VERSION`): a progress stream no longer carries initial
+  capabilities, and the handshake fingerprint covers the physical plan, so
+  nodes that would seed different capabilities fail the handshake.
+- Remove `ExchangeMessage::FrontierUpdate` and `ExchangeMessage::SenderDone`,
+  which only the staged executor used.
+- Until step 3, the per-stage path and `SimpleRuntime::spawn_multi` share
+  the uniform path's known progress bugs (recorded in the conformance
+  matrix's golden file): for example, a multi-worker loop followed by an
+  exchange from its exit still hangs (audit C2).
+
 ### Progress test harness
 
 - Add a progress invariant checker, `instancy::progress::check`, compiled

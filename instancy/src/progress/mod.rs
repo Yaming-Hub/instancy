@@ -87,8 +87,6 @@ pub mod change_batch;
 pub mod check;
 pub mod frontier;
 #[allow(dead_code)]
-pub(crate) mod frontier_aggregator;
-#[allow(dead_code)]
 pub(crate) mod mutable_antichain;
 pub(crate) mod network_progress;
 pub mod notificator;

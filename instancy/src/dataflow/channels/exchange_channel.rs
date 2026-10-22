@@ -1546,14 +1546,11 @@ where
 /// logic (`ExchangePush`/`ExchangePull`) is identical regardless of
 /// Internal helper: build channel factories from a shared materializer.
 ///
-/// Creates `num_source_workers` factories. In symmetric mode (M==N), each
-/// factory materializes both push and pull endpoints. In asymmetric mode,
-/// source factories get push endpoints, and the first N factories also get
-/// pull endpoints for the target side.
-///
-/// Currently, all callers use symmetric mode (same workers serve as both
-/// source and target). Asymmetric materialization will be activated when
-/// per-stage executors are implemented.
+/// Creates `max(num_source_workers, num_target_workers)` factories, one per
+/// worker slot. Slot `w` materializes the push endpoints of source worker `w`
+/// (if `w < num_source_workers`) and the pull endpoints of target worker `w`
+/// (if `w < num_target_workers`). The two counts differ when the exchange
+/// joins stages with different parallelism.
 fn build_exchange_factories<T, D>(
     num_source_workers: usize,
     num_target_workers: usize,

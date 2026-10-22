@@ -1168,18 +1168,18 @@ fn nested_loop_body_probe_is_conservative() {
 }
 
 // ---------------------------------------------------------------------------
-// Per-stage parallelism path (every worker builds its own dataflow)
+// Per-stage parallelism path (stages with different parallelism)
 // ---------------------------------------------------------------------------
 
 type NamedProbes<T> = Arc<Mutex<Vec<(String, ProbeHandle<T>)>>>;
 
-/// On the per-stage-parallelism path each worker builds its own dataflow, so
-/// every probe handle has a single writer (the worker's stage executor) whose
-/// tracker only sees that worker. Loop-body probes (held at the minimum while
-/// running) and probes after a gather must still become done after a
-/// successful run, both when the loop stays within one stage and when an
-/// exchange inside the loop body makes it cross a stage boundary (stages then
-/// finish through quiescence-based loop convergence).
+/// On the per-stage-parallelism path the dataflow is built once and every
+/// worker runs the operators of its stages, so each probe has one handle,
+/// written by every worker that runs the probed operator. Loop-body probes
+/// (held at the minimum while running) and probes after a gather must still
+/// become done after a successful run, both when the loop stays within one
+/// stage and when an exchange inside the loop body makes it cross a stage
+/// boundary.
 #[test]
 fn staged_path_loop_body_and_gather_probes_complete() {
     for exchange_in_loop in [false, true] {
@@ -1258,17 +1258,9 @@ fn staged_path_loop_body_and_gather_probes_complete() {
                 "exchange_in_loop={exchange_in_loop}"
             );
 
-            // Only the per-worker builds are materialized (the runtime also
-            // calls the build closure to probe the stage structure).
-            let real = |name: &str| name.contains("/worker-");
-            let body: Vec<_> = body_probes
-                .lock()
-                .unwrap()
-                .iter()
-                .filter(|(n, _)| real(n))
-                .cloned()
-                .collect();
-            assert_eq!(body.len(), workers);
+            // The dataflow is built once: one handle per probe.
+            let body = body_probes.lock().unwrap().clone();
+            assert_eq!(body.len(), 1, "one build");
             for (name, p) in &body {
                 assert!(
                     p.is_done(),
@@ -1276,16 +1268,10 @@ fn staged_path_loop_body_and_gather_probes_complete() {
                     p.frontier()
                 );
             }
-            // The gather stage has parallelism 1: only worker 0 materializes it,
-            // so only worker 0's handle for it has a writer.
-            let gather: Vec<_> = gather_probes
-                .lock()
-                .unwrap()
-                .iter()
-                .filter(|(n, _)| n.ends_with("/worker-0"))
-                .cloned()
-                .collect();
-            assert_eq!(gather.len(), 1);
+            // The gather stage has parallelism 1: only worker 0 runs it, so
+            // its probe has worker 0's writer alone.
+            let gather = gather_probes.lock().unwrap().clone();
+            assert_eq!(gather.len(), 1, "one build");
             assert!(
                 gather[0].1.is_done(),
                 "gather probe not done: {:?}",

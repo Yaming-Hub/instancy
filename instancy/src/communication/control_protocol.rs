@@ -94,13 +94,17 @@ pub enum ControlProtocolError {
 ///
 /// Covers everything two nodes must agree on to run a dataflow together: the
 /// frame layout, the channel-id namespaces, the control messages, the graph
-/// fingerprint, and the key-routing hash. Nodes reject peers whose version
-/// differs during the handshake. Version 1 is the unversioned 0.1.x protocol;
-/// version 2 added the versioned handshake, namespaced channel ids and header
-/// CRCs; version 3 adds the in-band progress end-of-stream and acknowledgement
-/// frames of the clean shutdown handshake (see `docs/design/cluster.md`
-/// §5.5.3).
-pub const PROTOCOL_VERSION: u32 = 3;
+/// fingerprint, the key-routing hash, and what a progress stream carries.
+/// Nodes reject peers whose version differs during the handshake. Version 1
+/// is the unversioned 0.1.x protocol; version 2 added the versioned
+/// handshake, namespaced channel ids and header CRCs; version 3 added the
+/// in-band progress end-of-stream and acknowledgement frames of the clean
+/// shutdown handshake (see `docs/design/cluster.md` §5.5.3); version 4 seeds
+/// every worker's initial capabilities from the physical plan instead of
+/// sending them, so a progress stream carries only changes after the initial
+/// state (a version-3 peer would count initial capabilities twice or never),
+/// and the graph fingerprint covers the plan's digest.
+pub const PROTOCOL_VERSION: u32 = 4;
 
 /// Protocol version reported for an unversioned (0.1.x) handshake.
 #[cfg(feature = "transport")]
@@ -380,7 +384,10 @@ pub fn decode_control_message(data: &[u8]) -> Result<ControlMessage, ControlProt
 /// - every network exchange edge, in order: graph edge index, routing kind,
 ///   name, timestamp type (the loop's `Product` type inside `iterate`), and
 ///   record type;
-/// - every named input and output port with its record type.
+/// - every named input and output port with its record type;
+/// - the digest of the physical plan (`plan_digest`, see
+///   `PhysicalPlan::digest`): which workers run each operator, and so how
+///   many copies of each initial capability every worker seeds.
 ///
 /// It is computed with [`StableHasher`](crate::hash::StableHasher), so it is
 /// identical across platforms and Rust releases. Type names come from
@@ -390,6 +397,7 @@ pub fn decode_control_message(data: &[u8]) -> Result<ControlMessage, ControlProt
 pub(crate) fn graph_fingerprint<T: crate::progress::timestamp::Timestamp>(
     dataflow: &crate::dataflow::LogicalDataflow<T>,
     topology: &crate::execute::ClusterTopology,
+    plan_digest: u64,
 ) -> u64 {
     use crate::hash::StableHasher;
     use std::hash::Hasher;
@@ -472,6 +480,9 @@ pub(crate) fn graph_fingerprint<T: crate::progress::timestamp::Timestamp>(
         d.num(port.operator_index);
         d.text(port.type_name);
     }
+
+    d.section("plan", 1);
+    d.0.write_u64(plan_digest);
 
     d.0.finish()
 }
@@ -1240,6 +1251,7 @@ mod tests {
 
     mod fingerprint {
         use super::super::graph_fingerprint;
+        use crate::dataflow::plan::{Parallelism, PhysicalPlan};
         use crate::dataflow::{DataflowBuilder, LogicalDataflow};
         use crate::execute::{ClusterTopology, NodeConfig};
         use crate::progress::timestamp::Timestamp;
@@ -1257,8 +1269,17 @@ mod tests {
             b.build().unwrap()
         }
 
+        /// The fingerprint `spawn_cluster` computes: with the digest of the
+        /// cluster's (uniform) plan.
+        fn cluster_fp<T: Timestamp>(g: &LogicalDataflow<T>, t: &ClusterTopology) -> u64 {
+            let plan =
+                PhysicalPlan::new(&g.graph, &g.stages, Parallelism::Uniform(t.total_workers()))
+                    .unwrap();
+            graph_fingerprint(g, t, plan.digest())
+        }
+
         fn fp<T: Timestamp>(f: impl Fn(&DataflowBuilder<T>)) -> u64 {
-            graph_fingerprint(&build(f), &topo(&[("a", 1), ("b", 1)]))
+            cluster_fp(&build(f), &topo(&[("a", 1), ("b", 1)]))
         }
 
         fn base(b: &DataflowBuilder<u64>) {
@@ -1275,13 +1296,13 @@ mod tests {
             assert_eq!(fp(base), fp(base));
             let g = build(base);
             let t = topo(&[("a", 2), ("b", 3)]);
-            assert_eq!(graph_fingerprint(&g, &t), graph_fingerprint(&g, &t.clone()));
+            assert_eq!(cluster_fp(&g, &t), cluster_fp(&g, &t.clone()));
         }
 
         #[test]
         fn topology_changes_are_detected() {
             let g = build(base);
-            let f = |t: ClusterTopology| graph_fingerprint(&g, &t);
+            let f = |t: ClusterTopology| cluster_fp(&g, &t);
             let reference = f(topo(&[("a", 2), ("b", 1)]));
             assert_ne!(reference, f(topo(&[("a", 1), ("b", 2)])), "worker split");
             assert_ne!(reference, f(topo(&[("a", 2), ("c", 1)])), "node id");
@@ -1292,6 +1313,42 @@ mod tests {
                 reference,
                 f(topo(&[("a", 2), ("b", 1), ("c", 1)])),
                 "extra node"
+            );
+        }
+
+        /// Two nodes with the same graph and topology whose physical plans
+        /// differ would seed different multiplicities: the fingerprints
+        /// differ, so the handshake fails.
+        #[test]
+        fn plan_changes_are_detected() {
+            let staged = |b: &DataflowBuilder<u64>| {
+                b.input::<u64>("in")
+                    .unwrap()
+                    .map("m", |_t, x| x)
+                    .exchange_to("x", 1, |x: &u64| *x)
+                    .unwrap()
+                    .output("out")
+                    .unwrap();
+            };
+            let g = build(staged);
+            let t = topo(&[("a", 1), ("b", 1)]);
+            let digest = |parallelism| {
+                PhysicalPlan::new(&g.graph, &g.stages, parallelism)
+                    .unwrap()
+                    .digest()
+            };
+            // Stage 0 on 2 workers, the exchange's stage on 1, against both
+            // on 1: same graph, same topology, different hosting.
+            let two_to_one = digest(Parallelism::PerStage { default: 2 });
+            let one = digest(Parallelism::Uniform(1));
+            assert_ne!(two_to_one, one);
+            assert_ne!(
+                graph_fingerprint(&g, &t, two_to_one),
+                graph_fingerprint(&g, &t, one)
+            );
+            assert_eq!(
+                graph_fingerprint(&g, &t, two_to_one),
+                graph_fingerprint(&g, &t, digest(Parallelism::PerStage { default: 2 }))
             );
         }
 

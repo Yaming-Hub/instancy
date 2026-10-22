@@ -153,11 +153,6 @@ struct BuilderState<T: Timestamp> {
     /// seam: correctness must hold regardless of how eagerly the executor
     /// declares quiescence.
     max_idle_sweeps: Option<usize>,
-    /// Shared loop in-flight counters, one per `iterate` scope. The enter/leave
-    /// operators record `+/-count`; the staged executor waits for all to reach
-    /// zero before declaring a feedback loop converged (its per-stage trackers
-    /// cannot account a loop body that crosses a stage boundary).
-    loop_inflight_counters: Vec<std::sync::Arc<std::sync::atomic::AtomicI64>>,
     /// Projection of this scope's timestamps onto the dataflow's root
     /// timestamp. `None` at the root; set for `iterate` bodies so outputs
     /// declared inside a loop report at the root timestamp.
@@ -346,7 +341,6 @@ impl<T: Timestamp> DataflowBuilder<T> {
                 contexts: SharedContext::new(),
                 catch_panics: false,
                 max_idle_sweeps: None,
-                loop_inflight_counters: Vec::new(),
                 root_time_projector: None,
                 builder_errors: Vec::new(),
                 #[cfg(any(debug_assertions, feature = "progress-check"))]
@@ -1193,7 +1187,6 @@ impl<T: Timestamp> DataflowBuilder<T> {
             stages,
             catch_panics: state.catch_panics,
             max_idle_sweeps: state.max_idle_sweeps,
-            loop_inflight_counters: state.loop_inflight_counters,
             collect_metrics: false,
             channel_counters: false,
             drain_timeout: None,
@@ -2472,15 +2465,6 @@ impl<T: Timestamp, D: Clone + Send + 'static> Pipe<T, D> {
         let stage_id = StageId::new(0);
         type PT<T, TInner> = Product<T, TInner>;
 
-        // Shared loop in-flight counter: enter records `+count`, leave `-count`.
-        // Used by the staged executor to keep a feedback loop alive until it is
-        // globally drained (see `BuilderState::loop_inflight_counters`).
-        let loop_counter = std::sync::Arc::new(std::sync::atomic::AtomicI64::new(0));
-        self.state
-            .borrow_mut()
-            .loop_inflight_counters
-            .push(loop_counter.clone());
-
         // Resolve per-edge capacity for the enter edge; internal edges use global default.
         let enter_capacity = self.resolve_capacity();
         let prealloc = self.state.borrow().channel_preallocate;
@@ -2545,7 +2529,6 @@ impl<T: Timestamp, D: Clone + Send + 'static> Pipe<T, D> {
 
             // Enter operator factory
             let enter_name = format!("{name}::enter");
-            let enter_loop_counter = loop_counter.clone();
             let enter_factory: OperatorFactory =
                 OperatorFactory::new(move |_ctx, mut endpoints: ChannelEndpoints| {
                     let enter_name = enter_name.clone();
@@ -2586,14 +2569,13 @@ impl<T: Timestamp, D: Clone + Send + 'static> Pipe<T, D> {
                         tee_or_single(pushers)?.unwrap_or_else(|| Box::new(NullPush))
                     };
 
-                    let mut enter_op = WiredEnterOperator::<T, TInner, D>::new(
+                    let enter_op = WiredEnterOperator::<T, TInner, D>::new(
                         enter_name,
                         enter_idx,
                         stage_id,
                         input_puller,
                         output_pusher,
                     );
-                    enter_op.set_loop_counter(enter_loop_counter.clone());
                     Ok(Box::new(enter_op) as Box<dyn SchedulableOperator>)
                 });
             state.operator_factories.push((enter_idx, enter_factory));
@@ -2895,7 +2877,6 @@ impl<T: Timestamp, D: Clone + Send + 'static> Pipe<T, D> {
                 contexts: parent_contexts,
                 catch_panics: false,
                 max_idle_sweeps: None,
-                loop_inflight_counters: Vec::new(),
                 root_time_projector: Some(inner_projector.clone()),
                 builder_errors: Vec::new(),
                 #[cfg(any(debug_assertions, feature = "progress-check"))]
@@ -3070,12 +3051,9 @@ impl<T: Timestamp, D: Clone + Send + 'static> Pipe<T, D> {
             for (op_idx, par) in inner.graph.exchange_parallelism_map() {
                 state.graph.set_exchange_parallelism(*op_idx, *par);
             }
-            // Carry up what the loop body declared for the runtime: nested loop
-            // counters, probes (re-expressed in this scope's timestamp) and
-            // output ports (their sinks already report at the root timestamp).
-            state
-                .loop_inflight_counters
-                .extend(inner.loop_inflight_counters);
+            // Carry up what the loop body declared for the runtime: probes
+            // (re-expressed in this scope's timestamp) and output ports (their
+            // sinks already report at the root timestamp).
             state.probes.extend(
                 inner
                     .probes
@@ -3150,7 +3128,6 @@ impl<T: Timestamp, D: Clone + Send + 'static> Pipe<T, D> {
 
             // Leave operator factory
             let leave_name = format!("{name}::leave");
-            let leave_loop_counter = loop_counter.clone();
             let leave_factory: OperatorFactory =
                 OperatorFactory::new(move |_ctx, mut endpoints: ChannelEndpoints| {
                     let leave_name = leave_name.clone();
@@ -3191,14 +3168,13 @@ impl<T: Timestamp, D: Clone + Send + 'static> Pipe<T, D> {
                         tee_or_single(pushers)?.unwrap_or_else(|| Box::new(NullPush))
                     };
 
-                    let mut leave_op = WiredLeaveOperator::<T, TInner, D>::new(
+                    let leave_op = WiredLeaveOperator::<T, TInner, D>::new(
                         leave_name,
                         leave_idx,
                         stage_id,
                         input_puller,
                         output_pusher,
                     );
-                    leave_op.set_loop_counter(leave_loop_counter.clone());
                     Ok(Box::new(leave_op) as Box<dyn SchedulableOperator>)
                 });
             state.operator_factories.push((leave_idx, leave_factory));
@@ -4738,19 +4714,18 @@ impl<T: Timestamp, D: Clone + Send + 'static> Pipe<T, D> {
     ///   after it) can report an epoch complete while the loop is still
     ///   iterating that epoch.
     ///
-    /// In a cluster (`spawn_cluster`) each worker builds its own probe, so a
-    /// probe has a single writer among several workers, and that writer's
-    /// view is global. When that worker completes, the probe keeps its last
-    /// view rather than claiming remote work is done. A worker completes once
-    /// its local operators are done, without waiting until its view reflects
-    /// every peer's final progress, so after a successful run the probe
-    /// usually stays at a stale frontier and never becomes done (a probe inside
-    /// a loop body never does). Modes that build the dataflow once per worker
-    /// and track progress per worker (`spawn_multi` when stages have
-    /// differing parallelism, `SimpleRuntime::spawn_multi`) give each worker
-    /// its own probe, which reports that worker's view and becomes done when
-    /// that worker completes; a worker that does not run the probed
-    /// operator's stage never writes its probe.
+    /// In a cluster (`spawn_cluster`) and with `SimpleRuntime::spawn_multi`,
+    /// each worker builds its own probe, so a probe has a single writer among
+    /// several workers, and that writer's view is global. When that worker
+    /// completes, the probe keeps its last view rather than claiming remote
+    /// work is done. A worker completes once its local operators are done,
+    /// without waiting until its view reflects every peer's final progress, so
+    /// after a successful run the probe usually stays at a stale frontier and
+    /// never becomes done (a probe inside a loop body never does).
+    /// `RuntimeHandle::spawn_multi` builds the dataflow once: a probe has one
+    /// writer per worker that runs the probed operator (with stages of
+    /// differing parallelism, the workers of that operator's stage), and it
+    /// becomes done once all of them have completed.
     ///
     /// The returned `ProbeHandle` supports async waiting via
     /// [`wait_until_done_with`](ProbeHandle::wait_until_done_with) and
@@ -5943,10 +5918,6 @@ pub struct LogicalDataflow<T: Timestamp> {
     /// Optional override for the executor's `max_idle_sweeps`. `None` uses the
     /// runtime default. Set via [`DataflowBuilder::max_idle_sweeps`].
     pub(crate) max_idle_sweeps: Option<usize>,
-    /// Shared loop in-flight counters, one per `iterate` scope (see
-    /// `BuilderState::loop_inflight_counters`). Consulted by the staged executor
-    /// to keep feedback loops alive until globally drained.
-    pub(crate) loop_inflight_counters: Vec<std::sync::Arc<std::sync::atomic::AtomicI64>>,
     /// Whether to collect per-operator metrics (see [`ExecutorConfig::collect_metrics`]).
     /// Set by SpawnOptions at spawn time.
     pub(crate) collect_metrics: bool,

@@ -127,16 +127,18 @@ struct WriterSlot<T: Timestamp> {
 struct WriterSlots<T: Timestamp> {
     /// Per-writer views. One slot per executor observing this probe.
     slots: Vec<WriterSlot<T>>,
-    /// Number of workers whose instances of the stream the writers' views
-    /// cover (the largest value reported at attach time): the dataflow's worker
-    /// count for writers with a global (cross-worker) tracker view, 1 for a
-    /// worker-local tracker. When the writers cover all of them, a finished
-    /// writer is dropped from the meet: the remaining writers' views fully
-    /// describe the stream, and once all writers have finished no operator
-    /// instance they cover can produce on it. Otherwise (e.g. one writer per
-    /// worker of a cluster, where every view is global) a finished writer's
-    /// final view keeps constraining the probe, so a probe never claims
-    /// completion of work that a remote worker may still be doing.
+    /// Number of writers a probe whose writers all exist would have: the
+    /// number of workers that run the probed operator
+    /// (`PhysicalPlan::probe_writers`; the largest value reported at attach
+    /// time). Every writer's view is global. When the writers cover all of
+    /// them, a finished writer is dropped from the meet: the remaining
+    /// writers' views fully describe the stream, and once all writers have
+    /// finished no operator instance they cover can produce on it. Otherwise
+    /// (one writer per worker of a cluster node or of
+    /// `SimpleRuntime::spawn_multi`, which build the dataflow per worker) a
+    /// finished writer's final view keeps constraining the probe, so a probe
+    /// never claims completion of work that a remote worker may still be
+    /// doing.
     expected_writers: usize,
 }
 
