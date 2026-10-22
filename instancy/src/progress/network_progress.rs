@@ -132,8 +132,30 @@ pub fn encode_progress_batch<T: Timestamp + ExchangeData>(
         .filter(|change| change.diff > 0)
         .chain(changes.iter().filter(|change| change.diff <= 0))
         .peekable();
+    // V6: no fragment may carry a positive change after an earlier fragment
+    // carried a negative one.
+    #[cfg(any(debug_assertions, feature = "progress-check"))]
+    let mut negative_sent = false;
     while ordered.peek().is_some() {
         let chunk: Vec<&ProgressChange<T>> = ordered.by_ref().take(effective_max).collect();
+        #[cfg(any(debug_assertions, feature = "progress-check"))]
+        {
+            if negative_sent && chunk.iter().any(|change| change.diff > 0) {
+                crate::progress::check::record(
+                    crate::progress::check::Check::V6,
+                    "fragment-order",
+                    None,
+                    None,
+                    None,
+                    format!(
+                        "a progress batch of {} changes was split with a positive change \
+                         after a fragment that carried a negative one",
+                        changes.len()
+                    ),
+                );
+            }
+            negative_sent |= chunk.iter().any(|change| change.diff < 0);
+        }
         bufs.push(encode_progress_frame(chunk)?);
     }
     Ok(())
@@ -475,9 +497,26 @@ async fn watch_after_end_of_stream<T: Timestamp + ExchangeData>(
                         }
                         // Both kinds: the channel was already counted at its
                         // end-of-stream.
-                        Ok(_) => LinkFailure::ProtocolViolation(format!(
-                            "frame on progress channel {channel_id} after its end-of-stream"
-                        )),
+                        Ok(frame) => {
+                            #[cfg(any(debug_assertions, feature = "progress-check"))]
+                            if matches!(frame, ProgressFrame::Batch(_)) {
+                                crate::progress::check::record(
+                                    crate::progress::check::Check::V6,
+                                    "batch-after-end-of-stream",
+                                    None,
+                                    None, None,
+                                    format!(
+                                        "peer {peer_id} sent a progress batch on channel \
+                                         {channel_id} after its end-of-stream"
+                                    ),
+                                );
+                            }
+                            #[cfg(not(any(debug_assertions, feature = "progress-check")))]
+                            let _ = frame;
+                            LinkFailure::ProtocolViolation(format!(
+                                "frame on progress channel {channel_id} after its end-of-stream"
+                            ))
+                        }
                         Err(e) => LinkFailure::ProtocolViolation(format!(
                             "undecodable frame on progress channel {channel_id} after its \
                              end-of-stream: {e}"
@@ -894,6 +933,8 @@ mod tests {
     /// sent as is.
     #[test]
     fn split_batches_send_positive_changes_first() {
+        #[cfg(any(debug_assertions, feature = "progress-check"))]
+        let mark = crate::progress::check::mark();
         let changes: Vec<ProgressChange<u64>> = vec![
             ProgressChange::source(0, 0, 0, -1),
             ProgressChange::source(0, 0, 1, 1),
@@ -920,6 +961,15 @@ mod tests {
         let mut bufs = Vec::new();
         encode_progress_batch(&changes, &mut bufs, 5).unwrap();
         assert_eq!(decode(&bufs, 5), vec![changes.clone()]);
+        // The checker's V6 agrees: no fragment carried a positive change
+        // after a negative one.
+        #[cfg(any(debug_assertions, feature = "progress-check"))]
+        assert!(
+            !crate::progress::check::violations_since(mark)
+                .iter()
+                .any(|v| v.kind == "fragment-order"),
+            "V6 flagged a positives-first split"
+        );
     }
 
     #[test]
@@ -1079,6 +1129,8 @@ mod tests {
         let cancel = tokio_util::sync::CancellationToken::new();
         let (handle, mut events_rx) = spawn_recv_bridge(rx, &shared, &cancel);
 
+        #[cfg(any(debug_assertions, feature = "progress-check"))]
+        let mark = crate::progress::check::mark();
         let changes = vec![ProgressChange::source(0, 0, 1u64, 1)];
         let mut bufs = Vec::new();
         encode_progress_batch(&changes, &mut bufs, DEFAULT_MAX_BATCH_SIZE).unwrap();
@@ -1108,6 +1160,15 @@ mod tests {
         assert!(
             receiver.drain_all().unwrap().is_empty(),
             "frames after end-of-stream are not applied"
+        );
+        // The checker's V6 recorded the batch after end-of-stream.
+        #[cfg(any(debug_assertions, feature = "progress-check"))]
+        assert!(
+            crate::progress::check::violations_since(mark)
+                .iter()
+                .any(|v| v.check == crate::progress::check::Check::V6
+                    && v.kind == "batch-after-end-of-stream"),
+            "V6 missed a progress batch after end-of-stream"
         );
     }
 

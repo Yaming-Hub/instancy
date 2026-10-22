@@ -131,6 +131,10 @@ impl<S: Clone + Debug + PartialEq + PartialOrder> PortConnectivity<S> {
 #[derive(Clone, Debug)]
 pub struct ProgressReporter<T: Timestamp> {
     inner: Arc<Mutex<ChangeBatch<T>>>,
+    /// Where the progress checker counts capabilities held through this
+    /// reporter (set when the reporter's tracker is attached to an oracle).
+    #[cfg(any(debug_assertions, feature = "progress-check"))]
+    check: Arc<std::sync::OnceLock<crate::progress::check::Port<T>>>,
 }
 
 impl<T: Timestamp> ProgressReporter<T> {
@@ -138,7 +142,26 @@ impl<T: Timestamp> ProgressReporter<T> {
     pub fn new() -> Self {
         Self {
             inner: Arc::new(Mutex::new(ChangeBatch::new())),
+            #[cfg(any(debug_assertions, feature = "progress-check"))]
+            check: Arc::default(),
         }
+    }
+
+    /// Count `diff` capabilities at `time` held through this reporter, for
+    /// the progress checker's oracle. Called by capability objects and by
+    /// operators that hold a capability without one (input sources); never
+    /// by the accounting itself.
+    #[cfg(any(debug_assertions, feature = "progress-check"))]
+    pub(crate) fn check_hold(&self, time: &T, diff: i64) {
+        if let Some(port) = self.check.get() {
+            port.count(crate::progress::check::Store::Capability, time, diff);
+        }
+    }
+
+    /// Tell the progress checker which output this reporter is for.
+    #[cfg(any(debug_assertions, feature = "progress-check"))]
+    pub(crate) fn set_check_port(&self, port: crate::progress::check::Port<T>) {
+        let _ = self.check.set(port);
     }
 
     /// Records a change: `+1` for a new capability, `-1` for a dropped one.

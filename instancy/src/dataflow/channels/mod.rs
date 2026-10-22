@@ -9,7 +9,14 @@ pub mod edge_materializer;
 pub mod envelope;
 pub mod exchange_channel;
 pub mod exchange_message;
-#[cfg(any(test, feature = "test-utils"))]
+#[cfg(any(
+    test,
+    feature = "test-utils",
+    all(
+        feature = "transport",
+        any(debug_assertions, feature = "progress-check")
+    )
+))]
 pub mod mock_network;
 #[cfg(feature = "transport")]
 pub mod network;

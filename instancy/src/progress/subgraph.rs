@@ -236,7 +236,17 @@ pub struct SubgraphBuilder<T: Timestamp> {
     /// materialization by source (sender's output pusher) and target (consumer's
     /// input puller).
     inflight_edges: Vec<InflightBinding<T>>,
+    /// Attaches the progress checker to the capability reporters of `iterate`
+    /// bodies merged into this scope. Those operators keep their own
+    /// (loop-time) reporters, which no tracker drains (audit H11), so the
+    /// checker binds to them here, independently of the progress graph.
+    #[cfg(any(debug_assertions, feature = "progress-check"))]
+    check_loop_reporters: Vec<LoopCheckAttach>,
 }
+
+/// See [`SubgraphBuilder::adopt_loop_check_reporters`].
+#[cfg(any(debug_assertions, feature = "progress-check"))]
+type LoopCheckAttach = Arc<dyn Fn(&Arc<dyn crate::progress::check::Sink>, usize) + Send + Sync>;
 
 /// Manual Clone that deep-copies progress buffers so each clone gets
 /// independent [`ProgressReporter`](super::operate::ProgressReporter)s.
@@ -268,6 +278,8 @@ impl<T: Timestamp> Clone for SubgraphBuilder<T> {
                     fresh: b.fresh,
                 })
                 .collect(),
+            #[cfg(any(debug_assertions, feature = "progress-check"))]
+            check_loop_reporters: self.check_loop_reporters.clone(),
         }
     }
 }
@@ -286,6 +298,8 @@ impl<T: Timestamp> SubgraphBuilder<T> {
             scope_inputs,
             scope_outputs,
             inflight_edges: Vec::new(),
+            #[cfg(any(debug_assertions, feature = "progress-check"))]
+            check_loop_reporters: Vec::new(),
         }
     }
 
@@ -454,6 +468,65 @@ impl<T: Timestamp> SubgraphBuilder<T> {
         self.progress_buffers.get(&index)
     }
 
+    /// Tell the progress checker which output each capability reporter is
+    /// for, so it can count the capabilities held through them. Must run
+    /// before operators are materialized (before any capability exists).
+    #[cfg(any(debug_assertions, feature = "progress-check"))]
+    pub(crate) fn attach_check_reporters(
+        &self,
+        oracle: &Arc<crate::progress::check::Oracle<T>>,
+        worker: usize,
+    ) {
+        let sink: Arc<dyn crate::progress::check::Sink> = oracle.clone();
+        for (&op, progress) in &self.progress_buffers {
+            for (output, reporter) in progress.internal.iter().enumerate() {
+                reporter.set_check_port(crate::progress::check::Port::new(
+                    sink.clone(),
+                    worker,
+                    (op, output),
+                    None,
+                ));
+            }
+        }
+        for attach in &self.check_loop_reporters {
+            attach(&sink, worker);
+        }
+    }
+
+    /// Keep the capability reporters of the `iterate` body `inner` (merged
+    /// into this scope) visible to the progress checker, with loop times
+    /// projected onto the root time by `project`.
+    ///
+    /// A loop-body operator holds its capabilities through the reporter it
+    /// captured when the body was built; the merged scope tracks the operator
+    /// through a different reporter. The capability is counted for no worker
+    /// in particular (the staged path shares one body across workers).
+    #[cfg(any(debug_assertions, feature = "progress-check"))]
+    pub(crate) fn adopt_loop_check_reporters<S: Timestamp>(
+        &mut self,
+        inner: &SubgraphBuilder<S>,
+        project: &crate::progress::check::Projector<S>,
+    ) {
+        for (&op, progress) in &inner.progress_buffers {
+            for (output, reporter) in progress.internal.iter().enumerate() {
+                let reporter = reporter.clone();
+                let project = Arc::clone(project);
+                self.check_loop_reporters
+                    .push(Arc::new(move |sink, worker| {
+                        reporter.set_check_port(crate::progress::check::Port::new_shared(
+                            Arc::clone(sink),
+                            worker,
+                            (op, output),
+                            Some(Arc::clone(&project)),
+                        ));
+                    }));
+            }
+        }
+        // Bodies of loops nested in `inner` project to the root already.
+        self.check_loop_reporters
+            .extend(inner.check_loop_reporters.iter().cloned());
+    }
+
     /// Returns the number of registered operators (excluding scope boundary).
     pub fn operator_count(&self) -> usize {
         self.operators.len()
@@ -603,6 +676,8 @@ impl<T: Timestamp> SubgraphBuilder<T> {
             inflight_reporters,
             #[cfg(debug_assertions)]
             inflight_net: std::collections::BTreeMap::new(),
+            #[cfg(any(debug_assertions, feature = "progress-check"))]
+            check: None,
         }
     }
 }
@@ -707,6 +782,11 @@ pub struct ProgressTracker<T: Timestamp> {
     /// is merged.
     #[cfg(debug_assertions)]
     inflight_net: std::collections::BTreeMap<(usize, usize, T), i64>,
+    /// The progress checker's view of this tracker (see
+    /// [`check`](crate::progress::check)): every propagation publishes the
+    /// frontiers that changed.
+    #[cfg(any(debug_assertions, feature = "progress-check"))]
+    check: Option<crate::progress::check::TrackerCheck<T>>,
 }
 
 /// Per-operator frontier state tracked by the progress tracker.
@@ -762,6 +842,8 @@ impl<T: Timestamp> ProgressTracker<T> {
 
         // Update frontiers from the initial propagation.
         self.update_operator_frontiers();
+        #[cfg(any(debug_assertions, feature = "progress-check"))]
+        self.check_publish(true);
 
         // Check initial completion.
         self.completed = !self.tracker.tracking_anything();
@@ -831,6 +913,8 @@ impl<T: Timestamp> ProgressTracker<T> {
 
         // 5. Update per-operator frontiers.
         self.update_operator_frontiers();
+        #[cfg(any(debug_assertions, feature = "progress-check"))]
+        self.check_publish(false);
 
         // 6. Check completion — now reflects global state if channels are attached.
         self.completed = !self.tracker.tracking_anything();
@@ -1001,6 +1085,92 @@ impl<T: Timestamp> ProgressTracker<T> {
             }
         }
         combined
+    }
+
+    // -- progress checker --
+
+    /// Attach this tracker to the progress checker's oracle as `worker`'s
+    /// view. Call before [`initialize`](Self::initialize) so the initial
+    /// frontiers are published too.
+    #[cfg(any(debug_assertions, feature = "progress-check"))]
+    pub(crate) fn attach_check(
+        &mut self,
+        oracle: Arc<crate::progress::check::Oracle<T>>,
+        worker: usize,
+        label: &'static str,
+    ) {
+        self.check = Some(crate::progress::check::TrackerCheck::new(
+            oracle, worker, label,
+        ));
+    }
+
+    /// Publish this view's frontiers to the oracle: every operator's, or
+    /// only those that changed in the last propagation.
+    #[cfg(any(debug_assertions, feature = "progress-check"))]
+    fn check_publish(&self, all: bool) {
+        let Some(check) = &self.check else {
+            return;
+        };
+        let operators: &[usize] = if all {
+            &self.operator_indices
+        } else {
+            &self.dirty_operators
+        };
+        let mut targets = Vec::new();
+        let mut sources = Vec::new();
+        for &op in operators {
+            if let Some(state) = self.operator_frontiers.get(&op) {
+                for (port, frontier) in state.input_frontiers.iter().enumerate() {
+                    targets.push(((op, port), frontier.clone()));
+                }
+                for (port, frontier) in state.output_frontiers.iter().enumerate() {
+                    sources.push(((op, port), frontier.clone()));
+                }
+            }
+        }
+        check.publish(self.progress_channels.is_some(), targets, sources);
+    }
+
+    /// The executor is about to force-close its operators because this
+    /// tracker reports completion (V4: nothing may be outstanding).
+    #[cfg(any(debug_assertions, feature = "progress-check"))]
+    pub(crate) fn check_force_close(&self) {
+        if let Some(check) = &self.check {
+            check.force_close();
+        }
+    }
+
+    /// Stop checking this dataflow (cancelled or failed).
+    #[cfg(any(debug_assertions, feature = "progress-check"))]
+    pub(crate) fn check_halt(&self, reason: &str) {
+        if let Some(check) = &self.check {
+            check.halt(reason);
+        }
+    }
+
+    /// This tracker's executor finished (`ok`: successfully). Reports the
+    /// view's residual counts (V5) and retires the view; when
+    /// `report_worker`, also tells the oracle the worker finished.
+    #[cfg(any(debug_assertions, feature = "progress-check"))]
+    pub(crate) fn check_finish(&mut self, ok: bool, report_worker: bool) {
+        let residual: Vec<String> = if ok && self.check.is_some() {
+            self.tracker
+                .nonzero_pointstamps()
+                .into_iter()
+                .map(|(location, time, count)| format!("{location:?}@{time:?}: {count:+}"))
+                .collect()
+        } else {
+            Vec::new()
+        };
+        if let Some(check) = &mut self.check {
+            check.finish(ok, residual, report_worker);
+        }
+    }
+
+    /// The oracle this tracker publishes to, if any.
+    #[cfg(any(debug_assertions, feature = "progress-check"))]
+    pub(crate) fn check_oracle(&self) -> Option<&Arc<crate::progress::check::Oracle<T>>> {
+        self.check.as_ref().map(|c| c.oracle())
     }
 
     // -- internal --
@@ -1622,6 +1792,101 @@ mod tests {
             tracker.is_completed(),
             "once the message is consumed, the tracker completes"
         );
+    }
+
+    /// The same invariant across workers, with no data plane: two trackers
+    /// joined only by in-process progress channels. Worker 0 sends a batch
+    /// toward worker 1's `downstream` input and drops its capability; worker
+    /// 1 has dropped its capability too. Until worker 1 consumes the batch,
+    /// both workers' frontiers at that input must hold at the batch's time
+    /// and neither may complete: the sender's `+n` counts in its own view
+    /// and, through the progress channel, in the receiver's. Then worker 1
+    /// consumes it (`-n`) and both complete.
+    #[test]
+    fn inflight_message_holds_every_workers_frontier_until_consumed() {
+        let t = 3u64;
+        let n = 7i64;
+        let channels = crate::progress::progress_channel::create_progress_channels::<u64>(
+            2,
+            &[
+                crate::dataflow::channels::wake::WakeHandle::new(),
+                crate::dataflow::channels::wake::WakeHandle::new(),
+            ],
+        )
+        .unwrap();
+        // Per worker: its tracker, its in-flight reporter for downstream's
+        // input, and its upstream capability.
+        type Worker = (
+            ProgressTracker<u64>,
+            ProgressReporter<u64>,
+            Option<Capability<u64>>,
+        );
+        let mut workers: Vec<Worker> = Vec::new();
+        for channels in channels {
+            // upstream(op1) --> downstream(op2), as in the single-worker test.
+            let mut builder = SubgraphBuilder::<u64>::new(1, 1);
+            let upstream = builder
+                .add_operator(1, "upstream", 1, 1, PortConnectivity::identity(0u64))
+                .unwrap()
+                .reporter(0)
+                .clone();
+            builder
+                .add_operator(2, "downstream", 1, 1, PortConnectivity::identity(0u64))
+                .unwrap();
+            builder.add_edge(Location::source(0, 0), Location::target(1, 0));
+            builder.add_edge(Location::source(1, 0), Location::target(2, 0));
+            builder.add_edge(Location::source(2, 0), Location::target(0, 0));
+            // Each worker's upstream holds a capability at time 0.
+            let capability = Capability::new(0u64, upstream);
+            let mut tracker = builder.build();
+            let inflight = tracker.register_inflight_reporter(2, 0);
+            tracker.set_progress_channels(channels).unwrap();
+            workers.push((tracker, inflight, Some(capability)));
+        }
+        for (tracker, _, _) in &mut workers {
+            tracker.initialize().unwrap();
+        }
+        // Two rounds, so each worker has absorbed everything the other sent.
+        let exchange = |workers: &mut Vec<Worker>| {
+            for _ in 0..2 {
+                for (tracker, _, _) in workers.iter_mut() {
+                    tracker.propagate().unwrap();
+                }
+            }
+        };
+        exchange(&mut workers);
+
+        // Worker 0 sends n records at t toward worker 1's downstream input,
+        // then both workers release their capabilities.
+        workers[0].1.update(t, n);
+        for (_, _, capability) in &mut workers {
+            drop(capability.take());
+        }
+        exchange(&mut workers);
+        for (w, (tracker, _, _)) in workers.iter().enumerate() {
+            assert!(
+                tracker.input_frontier(2, 0).less_equal(&t),
+                "worker {w}: frontier at the input the batch is bound for passed t={t} while \
+                 the batch is in flight: {:?}",
+                tracker.input_frontier(2, 0)
+            );
+            assert!(
+                !tracker.is_completed(),
+                "worker {w} completed while a batch is in flight"
+            );
+        }
+
+        // Worker 1 consumes the batch.
+        workers[1].1.update(t, -n);
+        exchange(&mut workers);
+        for (w, (tracker, _, _)) in workers.iter().enumerate() {
+            assert!(
+                tracker.input_frontier(2, 0).is_empty(),
+                "worker {w}: frontier {:?} after the batch was consumed",
+                tracker.input_frontier(2, 0)
+            );
+            assert!(tracker.is_completed(), "worker {w} did not complete");
+        }
     }
 
     /// Symmetry invariant: in single-worker mode every `-count` must have a

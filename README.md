@@ -267,6 +267,7 @@ let handle = rt.spawn_cluster(
 | `tracing` | ✅ | Structured logging via the `tracing` crate |
 | `bincode-codec` | ❌ | Bincode-based codec implementation |
 | `test-utils` | ❌ | Test-only helpers, including `SimpleRuntime` |
+| `progress-check` | ❌ | The progress invariant checker in release builds (debug builds always have it); see [Testing](docs/guide/testing.md#progress-invariant-checker) |
 
 Disable default features for a minimal build with no async runtime dependency:
 

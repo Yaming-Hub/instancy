@@ -164,6 +164,18 @@ struct BuilderState<T: Timestamp> {
     root_time_projector: Option<RootTimeProjector<T>>,
     /// Errors encountered during graph construction. Checked in `build()`.
     builder_errors: Vec<Error>,
+    /// Forced activation strategy (progress-checker test knob).
+    #[cfg(any(debug_assertions, feature = "progress-check"))]
+    check_activation: Option<crate::progress::check::Activation>,
+    /// Run without the progress checker (test knob).
+    #[cfg(any(debug_assertions, feature = "progress-check"))]
+    check_skip: bool,
+    /// Use the mock network for exchanges (progress-checker test knob).
+    #[cfg(all(
+        feature = "transport",
+        any(debug_assertions, feature = "progress-check")
+    ))]
+    check_mock_network: bool,
 }
 
 /// Projects a timestamp onto the dataflow's root timestamp, type-erased.
@@ -337,6 +349,15 @@ impl<T: Timestamp> DataflowBuilder<T> {
                 loop_inflight_counters: Vec::new(),
                 root_time_projector: None,
                 builder_errors: Vec::new(),
+                #[cfg(any(debug_assertions, feature = "progress-check"))]
+                check_activation: None,
+                #[cfg(any(debug_assertions, feature = "progress-check"))]
+                check_skip: false,
+                #[cfg(all(
+                    feature = "transport",
+                    any(debug_assertions, feature = "progress-check")
+                ))]
+                check_mock_network: false,
             })),
         }
     }
@@ -435,6 +456,49 @@ impl<T: Timestamp> DataflowBuilder<T> {
     /// value — a converged dataflow yields the same results at any threshold.
     pub fn max_idle_sweeps(&self, sweeps: usize) -> &Self {
         self.state.borrow_mut().max_idle_sweeps = Some(sweeps);
+        self
+    }
+
+    /// Force how the executor activates this dataflow's operators: one at a
+    /// time, in one fused topological pass, or in per-stage tasks (the
+    /// default). A test knob for the progress checker's conformance matrix;
+    /// only available when the checker is compiled in.
+    #[cfg(any(debug_assertions, feature = "progress-check"))]
+    pub fn check_activation(&self, activation: crate::progress::check::Activation) -> &Self {
+        self.state.borrow_mut().check_activation = Some(activation);
+        self
+    }
+
+    /// Run this dataflow without the progress checker, which is on in every
+    /// debug build. A test knob for tests whose outcome the checker's
+    /// timing changes: observing every hook still perturbs the schedule, so
+    /// it can make a timing-dependent bug of today's code likelier. Only
+    /// available when the checker is compiled in.
+    #[cfg(any(debug_assertions, feature = "progress-check"))]
+    pub fn skip_progress_check(&self) -> &Self {
+        self.state.borrow_mut().check_skip = true;
+        self
+    }
+
+    /// Set the capacity of every channel created after this call (exchange
+    /// channels included). A test knob for the progress checker's
+    /// conformance matrix; only available when the checker is compiled in.
+    #[cfg(any(debug_assertions, feature = "progress-check"))]
+    pub fn check_channel_capacity(&self, capacity: usize) -> &Self {
+        self.state.borrow_mut().channel_capacity = capacity.max(1);
+        self
+    }
+
+    /// Run this dataflow's exchanges through the in-memory mock network,
+    /// which encodes and decodes every batch, when spawned with
+    /// `spawn_multi`. A test knob for the progress checker's conformance
+    /// matrix; only available when the checker is compiled in.
+    #[cfg(all(
+        feature = "transport",
+        any(debug_assertions, feature = "progress-check")
+    ))]
+    pub fn check_mock_network(&self, enable: bool) -> &Self {
+        self.state.borrow_mut().check_mock_network = enable;
         self
     }
 
@@ -1139,6 +1203,17 @@ impl<T: Timestamp> DataflowBuilder<T> {
             transfer_timeline: false,
             min_activation_duration: std::time::Duration::from_micros(1),
             max_timeline_events: 0,
+            #[cfg(any(debug_assertions, feature = "progress-check"))]
+            check: None,
+            #[cfg(any(debug_assertions, feature = "progress-check"))]
+            check_activation: state.check_activation,
+            #[cfg(any(debug_assertions, feature = "progress-check"))]
+            check_skip: state.check_skip,
+            #[cfg(all(
+                feature = "transport",
+                any(debug_assertions, feature = "progress-check")
+            ))]
+            check_mock_network: state.check_mock_network,
         })
     }
 }
@@ -1535,10 +1610,8 @@ impl<T: Timestamp, D: Clone + Send + 'static> Pipe<T, D> {
                 let (push, pull) =
                     bounded_channel_with_wake::<T, D, ()>(capacity, wake.clone(), prealloc);
                 Ok((
-                    Box::new(Box::new(push) as Box<dyn Push<T, D>>)
-                        as Box<dyn std::any::Any + Send>,
-                    Box::new(Box::new(pull) as Box<dyn Pull<T, D>>)
-                        as Box<dyn std::any::Any + Send>,
+                    Box::new(push) as Box<dyn Push<T, D>>,
+                    Box::new(pull) as Box<dyn Pull<T, D>>,
                 ))
             });
         state.channel_factories.push((edge_idx, chan_factory));
@@ -2302,10 +2375,8 @@ impl<T: Timestamp, D: Clone + Send + 'static> Pipe<T, D> {
                     let (push, pull) =
                         bounded_channel_with_wake::<T, D, ()>(capacity1, wake.clone(), prealloc);
                     Ok((
-                        Box::new(Box::new(push) as Box<dyn Push<T, D>>)
-                            as Box<dyn std::any::Any + Send>,
-                        Box::new(Box::new(pull) as Box<dyn Pull<T, D>>)
-                            as Box<dyn std::any::Any + Send>,
+                        Box::new(push) as Box<dyn Push<T, D>>,
+                        Box::new(pull) as Box<dyn Pull<T, D>>,
                     ))
                 });
             state.channel_factories.push((edge1_idx, channel_factory1));
@@ -2315,10 +2386,8 @@ impl<T: Timestamp, D: Clone + Send + 'static> Pipe<T, D> {
                     let (push, pull) =
                         bounded_channel_with_wake::<T, D2, ()>(capacity2, wake.clone(), prealloc);
                     Ok((
-                        Box::new(Box::new(push) as Box<dyn Push<T, D2>>)
-                            as Box<dyn std::any::Any + Send>,
-                        Box::new(Box::new(pull) as Box<dyn Pull<T, D2>>)
-                            as Box<dyn std::any::Any + Send>,
+                        Box::new(push) as Box<dyn Push<T, D2>>,
+                        Box::new(pull) as Box<dyn Pull<T, D2>>,
                     ))
                 });
             state.channel_factories.push((edge2_idx, channel_factory2));
@@ -2415,6 +2484,17 @@ impl<T: Timestamp, D: Clone + Send + 'static> Pipe<T, D> {
         // Resolve per-edge capacity for the enter edge; internal edges use global default.
         let enter_capacity = self.resolve_capacity();
         let prealloc = self.state.borrow().channel_preallocate;
+
+        // Projects a loop-body time onto the dataflow's root time (through
+        // every enclosing loop). Used by outputs inside the body and by the
+        // progress checker for the loop's channels.
+        let inner_projector: RootTimeProjector<PT<T, TInner>> =
+            match self.state.borrow().root_time_projector.clone() {
+                Some(project) => Arc::new(move |time: &PT<T, TInner>| project(&time.outer)),
+                None => Arc::new(|time: &PT<T, TInner>| {
+                    Box::new(time.outer.clone()) as Box<dyn std::any::Any + Send>
+                }),
+            };
 
         // Phase 1: Allocate enter, feedback, concat operators in parent state.
         // We also create a separate inner BuilderState for the loop body.
@@ -2525,10 +2605,8 @@ impl<T: Timestamp, D: Clone + Send + 'static> Pipe<T, D> {
                 let (push, pull) =
                     bounded_channel_with_wake::<T, D, ()>(cap, wake.clone(), prealloc);
                 Ok((
-                    Box::new(Box::new(push) as Box<dyn Push<T, D>>)
-                        as Box<dyn std::any::Any + Send>,
-                    Box::new(Box::new(pull) as Box<dyn Pull<T, D>>)
-                        as Box<dyn std::any::Any + Send>,
+                    Box::new(push) as Box<dyn Push<T, D>>,
+                    Box::new(pull) as Box<dyn Pull<T, D>>,
                 ))
             });
             state.channel_factories.push((enter_edge_idx, cf));
@@ -2741,12 +2819,11 @@ impl<T: Timestamp, D: Clone + Send + 'static> Pipe<T, D> {
                 let (push, pull) =
                     bounded_channel_with_wake::<PT<T, TInner>, D, ()>(cap, wake.clone(), prealloc);
                 Ok((
-                    Box::new(Box::new(push) as Box<dyn Push<PT<T, TInner>, D>>)
-                        as Box<dyn std::any::Any + Send>,
-                    Box::new(Box::new(pull) as Box<dyn Pull<PT<T, TInner>, D>>)
-                        as Box<dyn std::any::Any + Send>,
+                    Box::new(push) as Box<dyn Push<PT<T, TInner>, D>>,
+                    Box::new(pull) as Box<dyn Pull<PT<T, TInner>, D>>,
                 ))
-            });
+            })
+            .with_check_projector(&inner_projector);
             state.channel_factories.push((enter_concat_edge_idx, cf1));
 
             let cap = capacity;
@@ -2754,12 +2831,11 @@ impl<T: Timestamp, D: Clone + Send + 'static> Pipe<T, D> {
                 let (push, pull) =
                     bounded_channel_with_wake::<PT<T, TInner>, D, ()>(cap, wake.clone(), prealloc);
                 Ok((
-                    Box::new(Box::new(push) as Box<dyn Push<PT<T, TInner>, D>>)
-                        as Box<dyn std::any::Any + Send>,
-                    Box::new(Box::new(pull) as Box<dyn Pull<PT<T, TInner>, D>>)
-                        as Box<dyn std::any::Any + Send>,
+                    Box::new(push) as Box<dyn Push<PT<T, TInner>, D>>,
+                    Box::new(pull) as Box<dyn Pull<PT<T, TInner>, D>>,
                 ))
-            });
+            })
+            .with_check_projector(&inner_projector);
             state.channel_factories.push((fb_concat_edge_idx, cf2));
 
             // Leave operator: 1 input (Product<T,TInner>,D), 1 output (T,D)
@@ -2796,13 +2872,6 @@ impl<T: Timestamp, D: Clone + Send + 'static> Pipe<T, D> {
         // context values. SharedContext::clone() is cheap (shares Arc pointers).
         let parent_contexts = self.state.borrow().contexts.clone();
         let parent_collect_index = self.state.borrow().next_collect_index;
-        let inner_projector: RootTimeProjector<PT<T, TInner>> =
-            match self.state.borrow().root_time_projector.clone() {
-                Some(project) => Arc::new(move |time: &PT<T, TInner>| project(&time.outer)),
-                None => Arc::new(|time: &PT<T, TInner>| {
-                    Box::new(time.outer.clone()) as Box<dyn std::any::Any + Send>
-                }),
-            };
         let inner_state: Rc<RefCell<BuilderState<Product<T, TInner>>>> =
             Rc::new(RefCell::new(BuilderState {
                 graph: DataflowGraph::new(),
@@ -2827,8 +2896,17 @@ impl<T: Timestamp, D: Clone + Send + 'static> Pipe<T, D> {
                 catch_panics: false,
                 max_idle_sweeps: None,
                 loop_inflight_counters: Vec::new(),
-                root_time_projector: Some(inner_projector),
+                root_time_projector: Some(inner_projector.clone()),
                 builder_errors: Vec::new(),
+                #[cfg(any(debug_assertions, feature = "progress-check"))]
+                check_activation: None,
+                #[cfg(any(debug_assertions, feature = "progress-check"))]
+                check_skip: false,
+                #[cfg(all(
+                    feature = "transport",
+                    any(debug_assertions, feature = "progress-check")
+                ))]
+                check_mock_network: false,
             }));
 
         // The iteration variable pipe points to concat's output
@@ -2939,22 +3017,36 @@ impl<T: Timestamp, D: Clone + Send + 'static> Pipe<T, D> {
                     .subgraph_builder
                     .register_loop_inflight_edge::<TInner>(binding);
             }
+            #[cfg(any(debug_assertions, feature = "progress-check"))]
+            state
+                .subgraph_builder
+                .adopt_loop_check_reporters(&inner.subgraph_builder, &inner_projector);
 
-            // Merge factories (offset inner channel factory indices)
+            // Merge factories (offset inner channel factory indices). Every
+            // inner channel carries the loop's time; the checker needs it
+            // projected onto the root time (channels of deeper loops already
+            // have their own projection).
             state.operator_factories.extend(inner.operator_factories);
-            for (edge_idx, factory) in inner.channel_factories {
+            for (edge_idx, mut factory) in inner.channel_factories {
+                factory.set_check_projector(&inner_projector);
                 state
                     .channel_factories
                     .push((edge_idx + inner_edge_offset, factory));
             }
             // Merge inner feedback channel factories (offset by parent's existing feedback edges)
-            for (fb_idx, factory) in inner.feedback_channel_factories {
+            for (fb_idx, mut factory) in inner.feedback_channel_factories {
+                factory.set_check_projector(&inner_projector);
                 state
                     .feedback_channel_factories
                     .push((fb_idx + fb_offset, factory));
             }
             // Merge inner exchange creators (offset edge indices to match parent graph)
             for (edge_idx, capacity, creator) in inner.exchange_creators {
+                #[cfg(any(debug_assertions, feature = "progress-check"))]
+                let creator = crate::dataflow::channels::exchange_channel::with_check_projector(
+                    creator,
+                    inner_projector.clone(),
+                );
                 state
                     .exchange_creators
                     .push((edge_idx + inner_edge_offset, capacity, creator));
@@ -2962,6 +3054,12 @@ impl<T: Timestamp, D: Clone + Send + 'static> Pipe<T, D> {
             // Merge inner network exchange creators for transport/cluster mode
             #[cfg(feature = "transport")]
             for (edge_idx, capacity, creator) in inner.exchange_network_creators {
+                #[cfg(any(debug_assertions, feature = "progress-check"))]
+                let creator =
+                    crate::dataflow::channels::exchange_channel::network_with_check_projector(
+                        creator,
+                        inner_projector.clone(),
+                    );
                 state.exchange_network_creators.push((
                     edge_idx + inner_edge_offset,
                     capacity,
@@ -3043,12 +3141,11 @@ impl<T: Timestamp, D: Clone + Send + 'static> Pipe<T, D> {
                         prealloc,
                     );
                     Ok((
-                        Box::new(Box::new(push) as Box<dyn Push<PT<T, TInner>, D>>)
-                            as Box<dyn std::any::Any + Send>,
-                        Box::new(Box::new(pull) as Box<dyn Pull<PT<T, TInner>, D>>)
-                            as Box<dyn std::any::Any + Send>,
+                        Box::new(push) as Box<dyn Push<PT<T, TInner>, D>>,
+                        Box::new(pull) as Box<dyn Pull<PT<T, TInner>, D>>,
                     ))
-                });
+                })
+                .with_check_projector(&inner_projector);
             state.feedback_channel_factories.push((fb_position, cf_fb));
 
             // Leave operator factory
@@ -3116,12 +3213,11 @@ impl<T: Timestamp, D: Clone + Send + 'static> Pipe<T, D> {
                         prealloc,
                     );
                     Ok((
-                        Box::new(Box::new(push) as Box<dyn Push<PT<T, TInner>, D>>)
-                            as Box<dyn std::any::Any + Send>,
-                        Box::new(Box::new(pull) as Box<dyn Pull<PT<T, TInner>, D>>)
-                            as Box<dyn std::any::Any + Send>,
+                        Box::new(push) as Box<dyn Push<PT<T, TInner>, D>>,
+                        Box::new(pull) as Box<dyn Pull<PT<T, TInner>, D>>,
                     ))
-                });
+                })
+                .with_check_projector(&inner_projector);
             state.channel_factories.push((leave_edge_idx, cf_leave));
         }
 
@@ -3273,10 +3369,8 @@ impl<T: Timestamp, D: Clone + Send + 'static> Pipe<T, D> {
                         let (push, pull) =
                             bounded_channel_with_wake::<T, D, ()>(capacity, wake.clone(), prealloc);
                         Ok((
-                            Box::new(Box::new(push) as Box<dyn Push<T, D>>)
-                                as Box<dyn std::any::Any + Send>,
-                            Box::new(Box::new(pull) as Box<dyn Pull<T, D>>)
-                                as Box<dyn std::any::Any + Send>,
+                            Box::new(push) as Box<dyn Push<T, D>>,
+                            Box::new(pull) as Box<dyn Pull<T, D>>,
                         ))
                     });
                 state.channel_factories.push((edge_idx, chan_factory));
@@ -3545,10 +3639,8 @@ impl<T: Timestamp, D: Clone + Send + 'static> Pipe<T, D> {
                     let (push, pull) =
                         bounded_channel_with_wake::<T, D, ()>(capacity, wake.clone(), prealloc);
                     Ok((
-                        Box::new(Box::new(push) as Box<dyn Push<T, D>>)
-                            as Box<dyn std::any::Any + Send>,
-                        Box::new(Box::new(pull) as Box<dyn Pull<T, D>>)
-                            as Box<dyn std::any::Any + Send>,
+                        Box::new(push) as Box<dyn Push<T, D>>,
+                        Box::new(pull) as Box<dyn Pull<T, D>>,
                     ))
                 });
             state.channel_factories.push((edge_idx, chan_factory));
@@ -4437,10 +4529,8 @@ impl<T: Timestamp, D: Clone + Send + 'static> Pipe<T, D> {
                     let (push, pull) =
                         bounded_channel_with_wake::<T, D, ()>(capacity, wake.clone(), prealloc);
                     Ok((
-                        Box::new(Box::new(push) as Box<dyn Push<T, D>>)
-                            as Box<dyn std::any::Any + Send>,
-                        Box::new(Box::new(pull) as Box<dyn Pull<T, D>>)
-                            as Box<dyn std::any::Any + Send>,
+                        Box::new(push) as Box<dyn Push<T, D>>,
+                        Box::new(pull) as Box<dyn Pull<T, D>>,
                     ))
                 });
             state.channel_factories.push((edge_idx, chan_factory));
@@ -4597,10 +4687,8 @@ impl<T: Timestamp, D: Clone + Send + 'static> Pipe<T, D> {
                     let (push, pull) =
                         bounded_channel_with_wake::<T, D, ()>(capacity, wake.clone(), prealloc);
                     Ok((
-                        Box::new(Box::new(push) as Box<dyn Push<T, D>>)
-                            as Box<dyn std::any::Any + Send>,
-                        Box::new(Box::new(pull) as Box<dyn Pull<T, D>>)
-                            as Box<dyn std::any::Any + Send>,
+                        Box::new(push) as Box<dyn Push<T, D>>,
+                        Box::new(pull) as Box<dyn Pull<T, D>>,
                     ))
                 });
             state.channel_factories.push((edge_idx, chan_factory));
@@ -4816,10 +4904,8 @@ impl<T: Timestamp, D: Clone + Send + 'static> Pipe<T, D> {
                     let (push, pull) =
                         bounded_channel_with_wake::<T, D, ()>(capacity, wake.clone(), prealloc);
                     Ok((
-                        Box::new(Box::new(push) as Box<dyn Push<T, D>>)
-                            as Box<dyn std::any::Any + Send>,
-                        Box::new(Box::new(pull) as Box<dyn Pull<T, D>>)
-                            as Box<dyn std::any::Any + Send>,
+                        Box::new(push) as Box<dyn Push<T, D>>,
+                        Box::new(pull) as Box<dyn Pull<T, D>>,
                     ))
                 });
             state.channel_factories.push((edge_idx, chan_factory));
@@ -4950,10 +5036,8 @@ impl<T: Timestamp, D: Clone + Send + 'static> Pipe<T, D> {
                     let (push, pull) =
                         bounded_channel_with_wake::<T, D, ()>(capacity, wake.clone(), prealloc);
                     Ok((
-                        Box::new(Box::new(push) as Box<dyn Push<T, D>>)
-                            as Box<dyn std::any::Any + Send>,
-                        Box::new(Box::new(pull) as Box<dyn Pull<T, D>>)
-                            as Box<dyn std::any::Any + Send>,
+                        Box::new(push) as Box<dyn Push<T, D>>,
+                        Box::new(pull) as Box<dyn Pull<T, D>>,
                     ))
                 });
             state.channel_factories.push((edge_idx, chan_factory));
@@ -5123,10 +5207,8 @@ impl<T: Timestamp, D: Clone + Send + 'static> Pipe<T, D> {
                     let (push, pull) =
                         bounded_channel_with_wake::<T, D, ()>(capacity, wake.clone(), prealloc);
                     Ok((
-                        Box::new(Box::new(push) as Box<dyn Push<T, D>>)
-                            as Box<dyn std::any::Any + Send>,
-                        Box::new(Box::new(pull) as Box<dyn Pull<T, D>>)
-                            as Box<dyn std::any::Any + Send>,
+                        Box::new(push) as Box<dyn Push<T, D>>,
+                        Box::new(pull) as Box<dyn Pull<T, D>>,
                     ))
                 });
             state.channel_factories.push((edge_idx, chan_factory));
@@ -5283,10 +5365,8 @@ impl<T: Timestamp, D: Clone + Send + 'static> Pipe<T, D> {
                     let (push, pull) =
                         bounded_channel_with_wake::<T, D, ()>(capacity, wake.clone(), prealloc);
                     Ok((
-                        Box::new(Box::new(push) as Box<dyn Push<T, D>>)
-                            as Box<dyn std::any::Any + Send>,
-                        Box::new(Box::new(pull) as Box<dyn Pull<T, D>>)
-                            as Box<dyn std::any::Any + Send>,
+                        Box::new(push) as Box<dyn Push<T, D>>,
+                        Box::new(pull) as Box<dyn Pull<T, D>>,
                     ))
                 });
             state.channel_factories.push((edge_idx, chan_factory));
@@ -5437,10 +5517,8 @@ impl<T: Timestamp, D: Clone + Send + 'static> Pipe<T, D> {
                     let (push, pull) =
                         bounded_channel_with_wake::<T, D, ()>(capacity, wake.clone(), prealloc);
                     Ok((
-                        Box::new(Box::new(push) as Box<dyn Push<T, D>>)
-                            as Box<dyn std::any::Any + Send>,
-                        Box::new(Box::new(pull) as Box<dyn Pull<T, D>>)
-                            as Box<dyn std::any::Any + Send>,
+                        Box::new(push) as Box<dyn Push<T, D>>,
+                        Box::new(pull) as Box<dyn Pull<T, D>>,
                     ))
                 });
             state.channel_factories.push((edge_idx, chan_factory));
@@ -5592,10 +5670,8 @@ impl<T: Timestamp, D: Clone + Send + 'static> Pipe<T, D> {
                     let (push, pull) =
                         bounded_channel_with_wake::<T, D, ()>(capacity, wake.clone(), prealloc);
                     Ok((
-                        Box::new(Box::new(push) as Box<dyn Push<T, D>>)
-                            as Box<dyn std::any::Any + Send>,
-                        Box::new(Box::new(pull) as Box<dyn Pull<T, D>>)
-                            as Box<dyn std::any::Any + Send>,
+                        Box::new(push) as Box<dyn Push<T, D>>,
+                        Box::new(pull) as Box<dyn Pull<T, D>>,
                     ))
                 });
             state.channel_factories.push((edge_idx, chan_factory));
@@ -5753,10 +5829,8 @@ impl<T: Timestamp, V: Clone + Send + 'static, E: Clone + Send + 'static>
                         prealloc,
                     );
                     Ok((
-                        Box::new(Box::new(push) as Box<dyn Push<T, std::result::Result<V, E>>>)
-                            as Box<dyn std::any::Any + Send>,
-                        Box::new(Box::new(pull) as Box<dyn Pull<T, std::result::Result<V, E>>>)
-                            as Box<dyn std::any::Any + Send>,
+                        Box::new(push) as Box<dyn Push<T, std::result::Result<V, E>>>,
+                        Box::new(pull) as Box<dyn Pull<T, std::result::Result<V, E>>>,
                     ))
                 },
             );
@@ -5898,6 +5972,24 @@ pub struct LogicalDataflow<T: Timestamp> {
     pub(crate) min_activation_duration: std::time::Duration,
     /// Maximum timeline events per dataflow (ring buffer cap). 0 = unlimited.
     pub(crate) max_timeline_events: usize,
+    /// The progress checker's oracle for this dataflow, set at spawn.
+    #[cfg(any(debug_assertions, feature = "progress-check"))]
+    pub(crate) check: Option<std::sync::Arc<crate::progress::check::Oracle<T>>>,
+    /// Forces an operator activation strategy (test knob of the progress
+    /// checker's conformance matrix); `None` keeps the runtime's choice.
+    #[cfg(any(debug_assertions, feature = "progress-check"))]
+    pub(crate) check_activation: Option<crate::progress::check::Activation>,
+    /// Run without the progress checker (see
+    /// [`DataflowBuilder::skip_progress_check`]).
+    #[cfg(any(debug_assertions, feature = "progress-check"))]
+    pub(crate) check_skip: bool,
+    /// Use the mock network for exchanges under `spawn_multi` (test knob of
+    /// the progress checker's conformance matrix).
+    #[cfg(all(
+        feature = "transport",
+        any(debug_assertions, feature = "progress-check")
+    ))]
+    pub(crate) check_mock_network: bool,
 }
 
 impl<T: Timestamp> LogicalDataflow<T> {

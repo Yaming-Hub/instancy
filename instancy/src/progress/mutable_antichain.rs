@@ -205,6 +205,21 @@ impl<T: Clone + PartialOrder + Ord> MutableAntichain<T> {
             .map(|(_, c)| c)
             .sum()
     }
+
+    /// Every timestamp with a non-zero net count (for the progress checker's
+    /// residual report).
+    #[cfg(any(debug_assertions, feature = "progress-check"))]
+    pub(crate) fn nonzero_counts(&self) -> Vec<(T, i64)> {
+        let mut net: Vec<(T, i64)> = Vec::new();
+        for (time, count) in self.updates.unstable_internal_updates() {
+            match net.iter_mut().find(|(t, _)| t == time) {
+                Some((_, c)) => *c += count,
+                None => net.push((time.clone(), *count)),
+            }
+        }
+        net.retain(|(_, c)| *c != 0);
+        net
+    }
 }
 
 impl<T> Default for MutableAntichain<T> {

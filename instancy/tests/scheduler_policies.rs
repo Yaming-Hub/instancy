@@ -109,6 +109,12 @@ fn spawn_pending(
     dataflow: instancy::LogicalDataflow<u64>,
     priority: u32,
 ) -> SpawnedDataflow<u64> {
+    // These tests time scheduling of hundreds of thousands of one-record
+    // batches against wall-clock deadlines. The progress checker (on in debug
+    // builds) costs several microseconds per batch there, so it would time
+    // the checker instead; they check scheduling, not progress.
+    #[cfg(any(debug_assertions, feature = "progress-check"))]
+    instancy::progress::check::set_mode(instancy::progress::check::Mode::Off);
     rt.spawn(dataflow, SpawnOptions::new().priority(priority))
         .unwrap()
 }

@@ -7,6 +7,34 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Progress test harness
+
+- Add a progress invariant checker, `instancy::progress::check`, compiled
+  into every debug build and, with the new `progress-check` feature, into
+  release builds. It checks late data (V1), termination with work outstanding
+  (V4), the progress wire rules (V6), and, with an oracle that measures
+  occupancy from channels, operator queues and capability objects rather than
+  from the progress accounting, that no frontier passes outstanding work
+  (V7). It also reports a worker's residual counts at finish (V5). Select its
+  behaviour with `INSTANCY_PROGRESS_CHECK` (`report`, the default; `verbose`;
+  `panic`; `off`). It never changes how a dataflow runs.
+- Add a progress conformance matrix (`tests/progress_conformance.rs`, a
+  bounded subset in CI) whose golden file records exactly how each case fails
+  today, by operator port, explained by audit finding; and the correctness
+  audit's repro tests (`tests/audit_repros.rs`, on demand). A protocol
+  property test checks the real reachability tracker under random
+  interleavings and catches four protocol mutants, and a two-worker tracker
+  test checks that in-flight counts hold every worker's frontier.
+- Each violation the checker records (`Violation::location`) names the
+  operator port it is about, and the checker's log keeps the newest
+  violations when it is full (`log_complete_since`).
+- The checker does its checking on a background thread
+  (`instancy-progress-check`): hooks on the dataflow's threads only queue
+  events, which keeps it from changing the interleavings it observes. A test
+  can run a dataflow without it with `DataflowBuilder::skip_progress_check`
+  (debug builds only); `tests/multi_worker_iterate.rs` does so for two loops
+  that hit a pre-existing lost-wakeup race (audit M11) more often under it.
+
 ### Exchange and broadcast retry fixes
 
 - Fix duplicated records when an exchange or broadcast `try_push` is accepted

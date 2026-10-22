@@ -1174,6 +1174,22 @@ pub(crate) type ExchangeFactoryCreatorFn = Box<
         + Send,
 >;
 
+/// Wrap a loop body's exchange creator so every channel factory it creates
+/// carries the loop's time projection, for the progress checker.
+#[cfg(any(debug_assertions, feature = "progress-check"))]
+pub(crate) fn with_check_projector<S: Timestamp>(
+    mut creator: ExchangeFactoryCreatorFn,
+    projector: Arc<dyn Fn(&S) -> Box<dyn std::any::Any + Send> + Send + Sync>,
+) -> ExchangeFactoryCreatorFn {
+    Box::new(move |sources, targets, capacity, metrics| {
+        let mut factories = creator(sources, targets, capacity, metrics);
+        for factory in &mut factories {
+            factory.set_check_projector(&projector);
+        }
+        factories
+    })
+}
+
 /// Create a type-erased exchange factory creator using the default local
 /// transport ([`LocalEdgeMaterializer`]).
 ///
@@ -1273,6 +1289,90 @@ pub(crate) trait NetworkExchangeCreator: Send {
     /// `std::any::type_name` of the timestamps carried by the edge (for an
     /// exchange inside `iterate`, the loop's `Product` timestamp).
     fn timestamp_type_name(&self) -> &'static str;
+
+    /// Create exchange channel factories for `num_workers` workers in this
+    /// process that encode and decode every batch through the in-memory mock
+    /// network (a test knob of the progress checker's conformance matrix).
+    #[cfg(any(debug_assertions, feature = "progress-check"))]
+    fn create_mock(
+        self: Box<Self>,
+        num_workers: usize,
+        capacity: usize,
+    ) -> Vec<super::super::schedulable::ChannelFactory>;
+}
+
+/// A loop body's network exchange creator whose channel factories carry the
+/// loop's time projection, for the progress checker.
+#[cfg(all(
+    feature = "transport",
+    any(debug_assertions, feature = "progress-check")
+))]
+struct CheckProjectedCreator<S: Timestamp> {
+    inner: Box<dyn NetworkExchangeCreator>,
+    projector: Arc<dyn Fn(&S) -> Box<dyn std::any::Any + Send> + Send + Sync>,
+}
+
+#[cfg(all(
+    feature = "transport",
+    any(debug_assertions, feature = "progress-check")
+))]
+impl<S: Timestamp> NetworkExchangeCreator for CheckProjectedCreator<S> {
+    fn create(
+        self: Box<Self>,
+        params: NetworkMaterializerParams,
+    ) -> Result<Vec<super::super::schedulable::ChannelFactory>> {
+        let this = *self;
+        let mut factories = this.inner.create(params)?;
+        for factory in &mut factories {
+            factory.set_check_projector(&this.projector);
+        }
+        Ok(factories)
+    }
+
+    fn kind(&self) -> &'static str {
+        self.inner.kind()
+    }
+
+    fn name(&self) -> &str {
+        self.inner.name()
+    }
+
+    fn data_type_name(&self) -> &'static str {
+        self.inner.data_type_name()
+    }
+
+    fn timestamp_type_name(&self) -> &'static str {
+        self.inner.timestamp_type_name()
+    }
+
+    fn create_mock(
+        self: Box<Self>,
+        num_workers: usize,
+        capacity: usize,
+    ) -> Vec<super::super::schedulable::ChannelFactory> {
+        let this = *self;
+        let mut factories = this.inner.create_mock(num_workers, capacity);
+        for factory in &mut factories {
+            factory.set_check_projector(&this.projector);
+        }
+        factories
+    }
+}
+
+/// Wrap a loop body's network exchange creator so every channel factory it
+/// creates carries the loop's time projection, for the progress checker.
+#[cfg(all(
+    feature = "transport",
+    any(debug_assertions, feature = "progress-check")
+))]
+pub(crate) fn network_with_check_projector<S: Timestamp>(
+    creator: Box<dyn NetworkExchangeCreator>,
+    projector: Arc<dyn Fn(&S) -> Box<dyn std::any::Any + Send> + Send + Sync>,
+) -> Box<dyn NetworkExchangeCreator> {
+    Box::new(CheckProjectedCreator {
+        inner: creator,
+        projector,
+    })
 }
 
 /// Concrete implementation of [`NetworkExchangeCreator`] for specific T, D types.
@@ -1335,6 +1435,27 @@ where
 
     fn timestamp_type_name(&self) -> &'static str {
         std::any::type_name::<T>()
+    }
+
+    #[cfg(any(debug_assertions, feature = "progress-check"))]
+    fn create_mock(
+        self: Box<Self>,
+        num_workers: usize,
+        capacity: usize,
+    ) -> Vec<super::super::schedulable::ChannelFactory> {
+        let materializer = Arc::new(Mutex::new(
+            super::mock_network::MockNetworkEdgeMaterializer::<T, D>::new(
+                crate::execute::ClusterTopology::single_node(num_workers),
+                capacity,
+            ),
+        ));
+        build_exchange_factories(
+            num_workers,
+            num_workers,
+            self.exchange_fn,
+            materializer,
+            None,
+        )
     }
 }
 
@@ -1399,6 +1520,21 @@ where
 
     fn timestamp_type_name(&self) -> &'static str {
         std::any::type_name::<T>()
+    }
+
+    #[cfg(any(debug_assertions, feature = "progress-check"))]
+    fn create_mock(
+        self: Box<Self>,
+        num_workers: usize,
+        capacity: usize,
+    ) -> Vec<super::super::schedulable::ChannelFactory> {
+        let materializer = Arc::new(Mutex::new(
+            super::mock_network::MockNetworkEdgeMaterializer::<T, D>::new(
+                crate::execute::ClusterTopology::single_node(num_workers),
+                capacity,
+            ),
+        ));
+        build_broadcast_factories(num_workers, num_workers, materializer)
     }
 }
 
@@ -1501,13 +1637,13 @@ where
                     let pull = ExchangePull::new(pullers, wakes.clone());
 
                     Ok((
-                        Box::new(Box::new(push) as Box<dyn Push<T, D>>)
-                            as Box<dyn std::any::Any + Send>,
-                        Box::new(Box::new(pull) as Box<dyn Pull<T, D>>)
-                            as Box<dyn std::any::Any + Send>,
+                        Box::new(push) as Box<dyn Push<T, D>>,
+                        Box::new(pull) as Box<dyn Pull<T, D>>,
                     ))
                 },
             )
+            // Each record is routed to exactly one target worker.
+            .with_check_cross_worker(1)
         })
         .collect()
 }
@@ -1569,7 +1705,7 @@ where
             let materializer = materializer.clone();
             let m = num_source_workers;
             let n = num_target_workers;
-            super::super::schedulable::ChannelFactory::new(
+            let factory = super::super::schedulable::ChannelFactory::new(
                 move |ctx: &crate::worker::WorkerContext, wake: Option<WakeHandle>| {
                     let slot = worker_slot;
                     wakes.register(slot, wake);
@@ -1597,13 +1733,13 @@ where
                     let pull = ExchangePull::new(pullers, wakes.clone());
 
                     Ok((
-                        Box::new(Box::new(push) as Box<dyn Push<T, D>>)
-                            as Box<dyn std::any::Any + Send>,
-                        Box::new(Box::new(pull) as Box<dyn Pull<T, D>>)
-                            as Box<dyn std::any::Any + Send>,
+                        Box::new(push) as Box<dyn Push<T, D>>,
+                        Box::new(pull) as Box<dyn Pull<T, D>>,
                     ))
                 },
-            )
+            );
+            // Each record pushed is delivered once to every target worker.
+            factory.with_check_cross_worker(num_target_workers)
         })
         .collect()
 }

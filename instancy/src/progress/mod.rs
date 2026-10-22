@@ -83,6 +83,8 @@
 
 pub mod capability;
 pub mod change_batch;
+#[cfg(any(debug_assertions, feature = "progress-check"))]
+pub mod check;
 pub mod frontier;
 #[allow(dead_code)]
 pub(crate) mod frontier_aggregator;
@@ -93,8 +95,33 @@ pub mod notificator;
 #[allow(dead_code)]
 pub(crate) mod operate;
 pub(crate) mod progress_channel;
+#[cfg(test)]
+mod protocol_tests;
 #[allow(dead_code)]
 pub(crate) mod reachability;
 #[allow(dead_code)]
 pub(crate) mod subgraph;
 pub mod timestamp;
+
+/// An operator's output retry queue. With the progress checker compiled in
+/// it is measured by the checker's oracle; otherwise it is a plain
+/// `VecDeque`.
+#[cfg(any(debug_assertions, feature = "progress-check"))]
+pub(crate) use check::PendingOutput;
+/// An operator's output retry queue. With the progress checker compiled in
+/// it is measured by the checker's oracle; otherwise it is a plain
+/// `VecDeque`.
+#[cfg(not(any(debug_assertions, feature = "progress-check")))]
+pub(crate) type PendingOutput<S, D, M = ()> =
+    std::collections::VecDeque<crate::dataflow::channels::envelope::Envelope<S, D, M>>;
+
+/// The checker context passed to materialization: the dataflow's oracle and
+/// the worker being materialized. The unit type when the checker is compiled
+/// out.
+#[cfg(any(debug_assertions, feature = "progress-check"))]
+pub(crate) type CheckCtx = Option<check::Ctx>;
+/// The checker context passed to materialization: the dataflow's oracle and
+/// the worker being materialized. The unit type when the checker is compiled
+/// out.
+#[cfg(not(any(debug_assertions, feature = "progress-check")))]
+pub(crate) type CheckCtx = ();

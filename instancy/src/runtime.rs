@@ -1843,6 +1843,14 @@ impl RuntimeHandle {
         pre_created_wake_handle: Option<WakeHandle>,
     ) -> Result<SpawnedDataflow<T>> {
         let dataflow_id = DataflowId::new();
+        #[cfg(any(debug_assertions, feature = "progress-check"))]
+        {
+            dataflow.check = crate::progress::check::oracle_unless::<T>(
+                dataflow.check_skip,
+                dataflow_id,
+                worker_context.num_workers(),
+            );
+        }
         let (spawned, executor, mut notifier) = self.prepare_worker(
             &mut dataflow,
             mode,
@@ -2094,6 +2102,23 @@ impl RuntimeHandle {
         let mut worker_exchange_factories: Vec<
             Vec<(usize, crate::dataflow::schedulable::ChannelFactory)>,
         > = (0..num_workers).map(|_| Vec::new()).collect();
+        // The progress checker's matrix can route exchanges through the mock
+        // network (every batch encoded and decoded).
+        #[cfg(all(
+            feature = "transport",
+            any(debug_assertions, feature = "progress-check")
+        ))]
+        if dataflow.check_mock_network {
+            dataflow.exchange_creators.clear();
+            for (edge_idx, edge_capacity, creator) in
+                std::mem::take(&mut dataflow.exchange_network_creators)
+            {
+                let factories = creator.create_mock(num_workers, edge_capacity);
+                for (worker_idx, factory) in factories.into_iter().enumerate() {
+                    worker_exchange_factories[worker_idx].push((edge_idx, factory));
+                }
+            }
+        }
         if num_workers > 1 {
             let creators = std::mem::take(&mut dataflow.exchange_creators);
             let mut all_channel_collectors = Vec::new();
@@ -2173,6 +2198,14 @@ impl RuntimeHandle {
         // contain the full set of initial capability broadcasts from all
         // peers before any worker starts executing.
         let dataflow_id = DataflowId::new();
+        #[cfg(any(debug_assertions, feature = "progress-check"))]
+        {
+            dataflow.check = crate::progress::check::oracle_unless::<T>(
+                dataflow.check_skip,
+                dataflow_id,
+                num_workers,
+            );
+        }
         let mut prepared = Vec::with_capacity(num_workers);
         let mut spawned_count = 0usize;
 
@@ -2449,6 +2482,12 @@ impl RuntimeHandle {
 
         let dataflow_cancel = self.cancel.child_token();
         let dataflow_id = DataflowId::new();
+        #[cfg(any(debug_assertions, feature = "progress-check"))]
+        let check_oracle = crate::progress::check::oracle_unless::<T>(
+            dataflows.iter().any(|df| df.check_skip),
+            dataflow_id,
+            num_workers,
+        );
         let timeline_start = if metrics_config.activation_timeline {
             Some(std::time::Instant::now())
         } else {
@@ -2480,6 +2519,11 @@ impl RuntimeHandle {
             let wake_handle = WakeHandle::new();
             worker_cancel.register_wake_handle_weak(&wake_handle);
             let global_worker_context = WorkerContext::new(worker_idx, num_workers)?;
+            #[cfg(any(debug_assertions, feature = "progress-check"))]
+            let check: crate::progress::CheckCtx =
+                check_oracle.as_ref().map(|oracle| oracle.ctx(worker_idx));
+            #[cfg(not(any(debug_assertions, feature = "progress-check")))]
+            let check: crate::progress::CheckCtx = ();
             let external_inputs_open = Arc::new(AtomicUsize::new(0));
             let worker_name = dataflow.name().to_string();
             let base_factory_count = dataflow.operator_factories.len();
@@ -2620,8 +2664,13 @@ impl RuntimeHandle {
                     continue;
                 };
                 let (_, factory) = &mut dataflow.channel_factories[factory_pos];
-                let (push, pull) =
-                    factory.build(&global_worker_context, Some(wake_handle.clone()))?;
+                let (push, pull) = factory.build_checked(
+                    &global_worker_context,
+                    Some(wake_handle.clone()),
+                    &check,
+                    edge.source,
+                    edge.target,
+                )?;
 
                 if worker_idx < source_par {
                     boundary_output_pushers
@@ -2690,8 +2739,13 @@ impl RuntimeHandle {
                         continue;
                     };
                     let (_, factory) = &mut dataflow.channel_factories[factory_pos];
-                    let (push, pull) =
-                        factory.build(&global_worker_context, Some(wake_handle.clone()))?;
+                    let (push, pull) = factory.build_checked(
+                        &global_worker_context,
+                        Some(wake_handle.clone()),
+                        &check,
+                        edge.source,
+                        edge.target,
+                    )?;
 
                     boundary_output_pushers
                         .entry(edge.source.operator_index)
@@ -2814,6 +2868,7 @@ impl RuntimeHandle {
                     stage_boundary_output_pushers,
                     Arc::clone(&external_inputs_open),
                     feedback_deps,
+                    check.clone(),
                 )?;
                 stage_executors.push(stage_executor);
             }
@@ -3712,6 +3767,15 @@ impl RuntimeHandle {
         for (local_idx, dataflow) in dataflows.iter_mut().enumerate() {
             let global_idx = local_start + local_idx;
             let ctx = WorkerContext::new(global_idx, total_workers)?;
+            // All nodes of the cluster in this process share one oracle.
+            #[cfg(any(debug_assertions, feature = "progress-check"))]
+            {
+                dataflow.check = crate::progress::check::oracle_unless::<T>(
+                    dataflow.check_skip,
+                    dataflow_id,
+                    total_workers,
+                );
+            }
             let pc = progress_channels_iter.next().map(Some).unwrap_or(None);
             let wh = wake_handles[global_idx].clone();
             let ctrl = control_pairs[local_idx].take();
@@ -4034,6 +4098,14 @@ impl SimpleRuntime {
         let wake_handle = WakeHandle::new();
         self.cancel.register_wake_handle_weak(&wake_handle);
         let mut dataflow = dataflow;
+        #[cfg(any(debug_assertions, feature = "progress-check"))]
+        {
+            dataflow.check = crate::progress::check::oracle_unless::<T>(
+                dataflow.check_skip,
+                DataflowId::new(),
+                1,
+            );
+        }
         let mut executor = materialize_executor(
             &mut dataflow,
             self.cancel.clone(),
@@ -4078,6 +4150,14 @@ impl SimpleRuntime {
 
         let wake_handle = WakeHandle::new();
         self.cancel.register_wake_handle_weak(&wake_handle);
+        #[cfg(any(debug_assertions, feature = "progress-check"))]
+        {
+            dataflow.check = crate::progress::check::oracle_unless::<T>(
+                dataflow.check_skip,
+                DataflowId::new(),
+                1,
+            );
+        }
         let mut executor = materialize_executor(
             &mut dataflow,
             self.cancel.clone(),
@@ -4214,6 +4294,14 @@ impl SimpleRuntime {
         }
 
         // --- Materialize and run on background thread ---
+        #[cfg(any(debug_assertions, feature = "progress-check"))]
+        if dataflow.check.is_none() {
+            dataflow.check = crate::progress::check::oracle_unless::<T>(
+                dataflow.check_skip,
+                DataflowId::new(),
+                worker_context.num_workers(),
+            );
+        }
         let mut executor = materialize_executor(
             &mut dataflow,
             cancel,
@@ -4339,9 +4427,21 @@ impl SimpleRuntime {
         let dataflow_cancel = self.cancel.child_token();
         let mut workers = Vec::with_capacity(num_workers);
         let mut spawned_count = 0usize;
+        #[cfg(any(debug_assertions, feature = "progress-check"))]
+        let check_oracle = crate::progress::check::oracle_unless::<T>(
+            dataflows.iter().any(|df| df.check_skip),
+            DataflowId::new(),
+            num_workers,
+        );
 
         for (worker_idx, dataflow) in dataflows.into_iter().enumerate() {
             let ctx = WorkerContext::new(worker_idx, num_workers)?;
+            #[cfg(any(debug_assertions, feature = "progress-check"))]
+            let dataflow = {
+                let mut dataflow = dataflow;
+                dataflow.check = check_oracle.clone();
+                dataflow
+            };
             match self.spawn_with_context(dataflow, ctx, Some(dataflow_cancel.clone())) {
                 Ok(spawned) => {
                     workers.push(spawned);
@@ -6121,6 +6221,24 @@ fn materialize_executor<T: Timestamp>(
         timeline_start_time,
     };
     let worker_subgraph_builder = dataflow.subgraph_builder.clone();
+    #[cfg(any(debug_assertions, feature = "progress-check"))]
+    let check_oracle = dataflow.check.clone();
+    #[cfg(any(debug_assertions, feature = "progress-check"))]
+    if let Some(oracle) = &check_oracle {
+        oracle.register_names(
+            dataflow
+                .graph
+                .operators()
+                .map(|op| (op.index, op.name.clone())),
+        );
+        worker_subgraph_builder.attach_check_reporters(oracle, worker_context.worker_index());
+    }
+    #[cfg(any(debug_assertions, feature = "progress-check"))]
+    let check: crate::progress::CheckCtx = check_oracle
+        .as_ref()
+        .map(|oracle| oracle.ctx(worker_context.worker_index()));
+    #[cfg(not(any(debug_assertions, feature = "progress-check")))]
+    let check: crate::progress::CheckCtx = ();
     let progress_reporters = progress_reporters.or_else(|| {
         Some(
             Arc::new(worker_subgraph_builder.materialization_reporters())
@@ -6137,17 +6255,36 @@ fn materialize_executor<T: Timestamp>(
         wake_handle,
         worker_context,
         progress_reporters,
+        check,
     )?;
 
     // Enable stage-task scheduling if stages were inferred.
     // This groups operators by stage and activates them in fused topological
     // order within each stage task, reducing scheduling overhead.
-    if !dataflow.stages.is_empty() {
-        executor.enable_stage_tasks(&dataflow.stages);
-    } else {
-        // Fallback: enable whole-graph fused activation.
-        if let Err(e) = executor.enable_fusion_from_graph(&dataflow.graph) {
-            tracing::debug!("Fused activation disabled: {e}");
+    // (The progress checker's conformance matrix may force a strategy.)
+    #[cfg(any(debug_assertions, feature = "progress-check"))]
+    let forced = match dataflow.check_activation {
+        Some(crate::progress::check::Activation::Unfused) => true,
+        Some(crate::progress::check::Activation::Fused) => {
+            executor.enable_fusion_from_graph(&dataflow.graph)?;
+            true
+        }
+        Some(crate::progress::check::Activation::StageTasks) => {
+            executor.enable_stage_tasks(&dataflow.stages);
+            true
+        }
+        None => false,
+    };
+    #[cfg(not(any(debug_assertions, feature = "progress-check")))]
+    let forced = false;
+    if !forced {
+        if !dataflow.stages.is_empty() {
+            executor.enable_stage_tasks(&dataflow.stages);
+        } else {
+            // Fallback: enable whole-graph fused activation.
+            if let Err(e) = executor.enable_fusion_from_graph(&dataflow.graph) {
+                tracing::debug!("Fused activation disabled: {e}");
+            }
         }
     }
 
@@ -6156,6 +6293,10 @@ fn materialize_executor<T: Timestamp>(
     // so the tracker broadcasts capability changes to peers and absorbs
     // remote changes. This makes is_completed() reflect global state.
     let mut tracker = worker_subgraph_builder.build();
+    #[cfg(any(debug_assertions, feature = "progress-check"))]
+    if let Some(oracle) = check_oracle {
+        tracker.attach_check(oracle, worker_context.worker_index(), "worker tracker");
+    }
     // A tracker attached to cross-worker progress channels has the global view
     // of every probed stream, so a probe it writes is only fully observed once
     // every worker's view is in. A worker-local tracker (single worker, or

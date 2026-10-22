@@ -32,6 +32,10 @@ pub struct InputHandle<T: Timestamp, D> {
     pending: VecDeque<(T, Vec<D>)>,
     /// Whether the input is complete (no more data will arrive).
     exhausted: bool,
+    /// The progress checker's count of `pending` (set when the handle is
+    /// fed by a channel the checker observes).
+    #[cfg(any(debug_assertions, feature = "progress-check"))]
+    check: Option<crate::progress::check::StoreCheck<T>>,
 }
 
 impl<T: Timestamp, D> InputHandle<T, D> {
@@ -41,13 +45,31 @@ impl<T: Timestamp, D> InputHandle<T, D> {
             name: name.into(),
             pending: VecDeque::new(),
             exhausted: false,
+            #[cfg(any(debug_assertions, feature = "progress-check"))]
+            check: None,
         }
+    }
+
+    /// Measure this handle's contents for the progress checker, as data at
+    /// the input `puller` delivers to.
+    #[cfg(any(debug_assertions, feature = "progress-check"))]
+    pub(crate) fn observe(&mut self, puller: &dyn crate::dataflow::channels::pushpull::Pull<T, D>) {
+        self.check = puller.check_port().map(|port| {
+            crate::progress::check::StoreCheck::new(
+                port,
+                crate::progress::check::Store::InputBuffer,
+            )
+        });
     }
 
     /// Push a batch of data for the given timestamp.
     /// Used internally by the runtime to feed data into the operator.
     pub fn push_vec(&mut self, time: T, data: Vec<D>) {
         if !data.is_empty() {
+            #[cfg(any(debug_assertions, feature = "progress-check"))]
+            if let Some(check) = &self.check {
+                check.add(&time, data.len());
+            }
             self.pending.push_back((time, data));
         }
     }
@@ -63,7 +85,12 @@ impl<T: Timestamp, D> InputHandle<T, D> {
     /// `None` if no data is currently pending.
     #[allow(clippy::should_implement_trait)]
     pub fn next(&mut self) -> Option<(T, Vec<D>)> {
-        self.pending.pop_front()
+        let batch = self.pending.pop_front();
+        #[cfg(any(debug_assertions, feature = "progress-check"))]
+        if let (Some(check), Some((time, data))) = (&self.check, &batch) {
+            check.remove(time, data.len());
+        }
+        batch
     }
 
     /// Check if there are any pending batches.

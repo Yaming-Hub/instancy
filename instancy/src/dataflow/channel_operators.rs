@@ -11,7 +11,6 @@
 //! (`tokio::sync::mpsc`) channel backends.
 //! The channel type is chosen at spawn time via `ChannelMode`.
 
-use std::collections::VecDeque;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::mpsc;
@@ -25,6 +24,7 @@ use crate::dataflow::operators::output::OutputEvent;
 use crate::dataflow::schedulable::{ActivationOutcome, SchedulableOperator};
 use crate::dataflow::stage::StageId;
 use crate::error::{ProgressError, Result};
+use crate::progress::PendingOutput;
 use crate::progress::operate::ProgressReporter;
 use crate::progress::timestamp::Timestamp;
 
@@ -213,7 +213,7 @@ pub struct ChannelSourceOperator<T: Timestamp, D: Send + 'static> {
     stage_id: StageId,
     receiver: InputRecv<InputEvent<T, D>>,
     output_pusher: Box<dyn Push<T, D>>,
-    pending_output: VecDeque<Envelope<T, D>>,
+    pending_output: PendingOutput<T, D>,
     progress_reporter: Option<ProgressReporter<T>>,
     external_inputs_open: Arc<AtomicUsize>,
     /// The timestamp of the currently held capability. Starts at T::minimum()
@@ -243,13 +243,17 @@ impl<T: Timestamp, D: Send + 'static> ChannelSourceOperator<T, D> {
         progress_reporter: Option<ProgressReporter<T>>,
         external_inputs_open: Arc<AtomicUsize>,
     ) -> Self {
-        Self {
+        #[cfg_attr(
+            not(any(debug_assertions, feature = "progress-check")),
+            allow(unused_mut)
+        )]
+        let mut op = Self {
             name,
             index,
             stage_id,
             receiver,
             output_pusher,
-            pending_output: VecDeque::new(),
+            pending_output: PendingOutput::new(),
             progress_reporter,
             external_inputs_open,
             current_capability: T::minimum(),
@@ -258,7 +262,17 @@ impl<T: Timestamp, D: Send + 'static> ChannelSourceOperator<T, D> {
             external_closed: false,
             done: false,
             abandoned: None,
+        };
+        // The progress checker counts the retry queue and the capability
+        // this source holds (from the start, at `T::minimum()`).
+        #[cfg(any(debug_assertions, feature = "progress-check"))]
+        {
+            op.pending_output.observe(&*op.output_pusher);
+            if let Some(reporter) = &op.progress_reporter {
+                reporter.check_hold(&op.current_capability, 1);
+            }
         }
+        op
     }
 
     /// Share an admission gate with this input's senders.
@@ -312,6 +326,8 @@ impl<T: Timestamp, D: Send + 'static> ChannelSourceOperator<T, D> {
         // Release the currently held capability
         if let Some(ref reporter) = self.progress_reporter {
             reporter.update(self.current_capability.clone(), -1);
+            #[cfg(any(debug_assertions, feature = "progress-check"))]
+            reporter.check_hold(&self.current_capability, -1);
         }
         self.output_pusher.close();
         self.done = true;
@@ -380,6 +396,11 @@ impl<T: Timestamp, D: Send + 'static> SchedulableOperator for ChannelSourceOpera
                     if time != self.current_capability {
                         if let Some(ref reporter) = self.progress_reporter {
                             reporter.downgrade(self.current_capability.clone(), time.clone());
+                            #[cfg(any(debug_assertions, feature = "progress-check"))]
+                            {
+                                reporter.check_hold(&time, 1);
+                                reporter.check_hold(&self.current_capability, -1);
+                            }
                         }
                         self.current_capability = time;
                         self.frontier_advanced = true;
@@ -501,6 +522,9 @@ pub struct ChannelSinkOperator<
     receiver_dropped: bool,
     input_exhausted: bool,
     done: bool,
+    /// The progress checker's count of `pending_send`, and the batch it holds.
+    #[cfg(any(debug_assertions, feature = "progress-check"))]
+    check_egress: Option<(crate::progress::check::StoreCheck<T>, Option<(T, usize)>)>,
 }
 
 impl<T: Timestamp, D: Send + 'static> ChannelSinkOperator<T, D> {
@@ -533,6 +557,16 @@ impl<T: Timestamp, D: Send + 'static, E: Send + 'static> ChannelSinkOperator<T, 
         sender: OutputSend<E>,
         make_event: Box<dyn Fn(T, Vec<D>) -> E + Send>,
     ) -> Self {
+        #[cfg(any(debug_assertions, feature = "progress-check"))]
+        let check_egress = input_puller.check_port().map(|port| {
+            (
+                crate::progress::check::StoreCheck::new(
+                    port,
+                    crate::progress::check::Store::Egress,
+                ),
+                None,
+            )
+        });
         Self {
             name,
             index,
@@ -544,6 +578,8 @@ impl<T: Timestamp, D: Send + 'static, E: Send + 'static> ChannelSinkOperator<T, 
             receiver_dropped: false,
             input_exhausted: false,
             done: false,
+            #[cfg(any(debug_assertions, feature = "progress-check"))]
+            check_egress,
         }
     }
 
@@ -580,6 +616,12 @@ impl<T: Timestamp, D: Send + 'static, E: Send + 'static> SchedulableOperator
             if !self.forward(event) {
                 return Ok(ActivationOutcome::BlockedOnBackpressure);
             }
+            #[cfg(any(debug_assertions, feature = "progress-check"))]
+            if let Some((check, held)) = &mut self.check_egress {
+                if let Some((time, n)) = held.take() {
+                    check.remove(&time, n);
+                }
+            }
         }
 
         let mut made_progress = false;
@@ -591,8 +633,15 @@ impl<T: Timestamp, D: Send + 'static, E: Send + 'static> SchedulableOperator
                     made_progress = true;
                     match envelope.payload {
                         crate::dataflow::channels::envelope::Payload::Data { time, data } => {
+                            #[cfg(any(debug_assertions, feature = "progress-check"))]
+                            let batch = (time.clone(), data.len());
                             let event = (self.make_event)(time, data);
                             if !self.forward(event) {
+                                #[cfg(any(debug_assertions, feature = "progress-check"))]
+                                if let Some((check, held)) = &mut self.check_egress {
+                                    check.add(&batch.0, batch.1);
+                                    *held = Some(batch);
+                                }
                                 // Channel full — stop pulling, will retry next activation
                                 return Ok(ActivationOutcome::BlockedOnBackpressure);
                             }
