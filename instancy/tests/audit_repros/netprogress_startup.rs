@@ -214,7 +214,7 @@ async fn control_startup_without_payload_delay() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "expected failure (H13); see EXPECTED in tests/audit_repros.rs"]
+#[ignore = "audit repro; run by audit_repros_match_table (tests/audit_repros.rs)"]
 async fn premature_notification_before_peer_initial_capabilities_arrive() {
     assert_eq!(
         scenario(true).await,
