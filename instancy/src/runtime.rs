@@ -1845,8 +1845,11 @@ impl RuntimeHandle {
         let dataflow_id = DataflowId::new();
         #[cfg(any(debug_assertions, feature = "progress-check"))]
         {
-            dataflow.check =
-                crate::progress::check::oracle::<T>(dataflow_id, worker_context.num_workers());
+            dataflow.check = crate::progress::check::oracle_unless::<T>(
+                dataflow.check_skip,
+                dataflow_id,
+                worker_context.num_workers(),
+            );
         }
         let (spawned, executor, mut notifier) = self.prepare_worker(
             &mut dataflow,
@@ -2197,7 +2200,11 @@ impl RuntimeHandle {
         let dataflow_id = DataflowId::new();
         #[cfg(any(debug_assertions, feature = "progress-check"))]
         {
-            dataflow.check = crate::progress::check::oracle::<T>(dataflow_id, num_workers);
+            dataflow.check = crate::progress::check::oracle_unless::<T>(
+                dataflow.check_skip,
+                dataflow_id,
+                num_workers,
+            );
         }
         let mut prepared = Vec::with_capacity(num_workers);
         let mut spawned_count = 0usize;
@@ -2476,7 +2483,11 @@ impl RuntimeHandle {
         let dataflow_cancel = self.cancel.child_token();
         let dataflow_id = DataflowId::new();
         #[cfg(any(debug_assertions, feature = "progress-check"))]
-        let check_oracle = crate::progress::check::oracle::<T>(dataflow_id, num_workers);
+        let check_oracle = crate::progress::check::oracle_unless::<T>(
+            dataflows.iter().any(|df| df.check_skip),
+            dataflow_id,
+            num_workers,
+        );
         let timeline_start = if metrics_config.activation_timeline {
             Some(std::time::Instant::now())
         } else {
@@ -3759,7 +3770,11 @@ impl RuntimeHandle {
             // All nodes of the cluster in this process share one oracle.
             #[cfg(any(debug_assertions, feature = "progress-check"))]
             {
-                dataflow.check = crate::progress::check::oracle::<T>(dataflow_id, total_workers);
+                dataflow.check = crate::progress::check::oracle_unless::<T>(
+                    dataflow.check_skip,
+                    dataflow_id,
+                    total_workers,
+                );
             }
             let pc = progress_channels_iter.next().map(Some).unwrap_or(None);
             let wh = wake_handles[global_idx].clone();
@@ -4085,7 +4100,11 @@ impl SimpleRuntime {
         let mut dataflow = dataflow;
         #[cfg(any(debug_assertions, feature = "progress-check"))]
         {
-            dataflow.check = crate::progress::check::oracle::<T>(DataflowId::new(), 1);
+            dataflow.check = crate::progress::check::oracle_unless::<T>(
+                dataflow.check_skip,
+                DataflowId::new(),
+                1,
+            );
         }
         let mut executor = materialize_executor(
             &mut dataflow,
@@ -4133,7 +4152,11 @@ impl SimpleRuntime {
         self.cancel.register_wake_handle_weak(&wake_handle);
         #[cfg(any(debug_assertions, feature = "progress-check"))]
         {
-            dataflow.check = crate::progress::check::oracle::<T>(DataflowId::new(), 1);
+            dataflow.check = crate::progress::check::oracle_unless::<T>(
+                dataflow.check_skip,
+                DataflowId::new(),
+                1,
+            );
         }
         let mut executor = materialize_executor(
             &mut dataflow,
@@ -4273,7 +4296,8 @@ impl SimpleRuntime {
         // --- Materialize and run on background thread ---
         #[cfg(any(debug_assertions, feature = "progress-check"))]
         if dataflow.check.is_none() {
-            dataflow.check = crate::progress::check::oracle::<T>(
+            dataflow.check = crate::progress::check::oracle_unless::<T>(
+                dataflow.check_skip,
                 DataflowId::new(),
                 worker_context.num_workers(),
             );
@@ -4404,7 +4428,11 @@ impl SimpleRuntime {
         let mut workers = Vec::with_capacity(num_workers);
         let mut spawned_count = 0usize;
         #[cfg(any(debug_assertions, feature = "progress-check"))]
-        let check_oracle = crate::progress::check::oracle::<T>(DataflowId::new(), num_workers);
+        let check_oracle = crate::progress::check::oracle_unless::<T>(
+            dataflows.iter().any(|df| df.check_skip),
+            DataflowId::new(),
+            num_workers,
+        );
 
         for (worker_idx, dataflow) in dataflows.into_iter().enumerate() {
             let ctx = WorkerContext::new(worker_idx, num_workers)?;

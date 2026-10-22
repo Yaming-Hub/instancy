@@ -28,6 +28,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Each violation the checker records (`Violation::location`) names the
   operator port it is about, and the checker's log keeps the newest
   violations when it is full (`log_complete_since`).
+- The checker does its checking on a background thread
+  (`instancy-progress-check`): hooks on the dataflow's threads only queue
+  events, which keeps it from changing the interleavings it observes. A test
+  can run a dataflow without it with `DataflowBuilder::skip_progress_check`
+  (debug builds only); `tests/multi_worker_iterate.rs` does so for two loops
+  that hit a pre-existing lost-wakeup race (audit M11) more often under it.
 
 ### Exchange and broadcast retry fixes
 

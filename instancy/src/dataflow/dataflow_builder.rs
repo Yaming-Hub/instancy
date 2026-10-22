@@ -167,6 +167,9 @@ struct BuilderState<T: Timestamp> {
     /// Forced activation strategy (progress-checker test knob).
     #[cfg(any(debug_assertions, feature = "progress-check"))]
     check_activation: Option<crate::progress::check::Activation>,
+    /// Run without the progress checker (test knob).
+    #[cfg(any(debug_assertions, feature = "progress-check"))]
+    check_skip: bool,
     /// Use the mock network for exchanges (progress-checker test knob).
     #[cfg(all(
         feature = "transport",
@@ -348,6 +351,8 @@ impl<T: Timestamp> DataflowBuilder<T> {
                 builder_errors: Vec::new(),
                 #[cfg(any(debug_assertions, feature = "progress-check"))]
                 check_activation: None,
+                #[cfg(any(debug_assertions, feature = "progress-check"))]
+                check_skip: false,
                 #[cfg(all(
                     feature = "transport",
                     any(debug_assertions, feature = "progress-check")
@@ -461,6 +466,17 @@ impl<T: Timestamp> DataflowBuilder<T> {
     #[cfg(any(debug_assertions, feature = "progress-check"))]
     pub fn check_activation(&self, activation: crate::progress::check::Activation) -> &Self {
         self.state.borrow_mut().check_activation = Some(activation);
+        self
+    }
+
+    /// Run this dataflow without the progress checker, which is on in every
+    /// debug build. A test knob for tests whose outcome the checker's
+    /// timing changes: observing every hook still perturbs the schedule, so
+    /// it can make a timing-dependent bug of today's code likelier. Only
+    /// available when the checker is compiled in.
+    #[cfg(any(debug_assertions, feature = "progress-check"))]
+    pub fn skip_progress_check(&self) -> &Self {
+        self.state.borrow_mut().check_skip = true;
         self
     }
 
@@ -1191,6 +1207,8 @@ impl<T: Timestamp> DataflowBuilder<T> {
             check: None,
             #[cfg(any(debug_assertions, feature = "progress-check"))]
             check_activation: state.check_activation,
+            #[cfg(any(debug_assertions, feature = "progress-check"))]
+            check_skip: state.check_skip,
             #[cfg(all(
                 feature = "transport",
                 any(debug_assertions, feature = "progress-check")
@@ -2882,6 +2900,8 @@ impl<T: Timestamp, D: Clone + Send + 'static> Pipe<T, D> {
                 builder_errors: Vec::new(),
                 #[cfg(any(debug_assertions, feature = "progress-check"))]
                 check_activation: None,
+                #[cfg(any(debug_assertions, feature = "progress-check"))]
+                check_skip: false,
                 #[cfg(all(
                     feature = "transport",
                     any(debug_assertions, feature = "progress-check")
@@ -5959,6 +5979,10 @@ pub struct LogicalDataflow<T: Timestamp> {
     /// checker's conformance matrix); `None` keeps the runtime's choice.
     #[cfg(any(debug_assertions, feature = "progress-check"))]
     pub(crate) check_activation: Option<crate::progress::check::Activation>,
+    /// Run without the progress checker (see
+    /// [`DataflowBuilder::skip_progress_check`]).
+    #[cfg(any(debug_assertions, feature = "progress-check"))]
+    pub(crate) check_skip: bool,
     /// Use the mock network for exchanges under `spawn_multi` (test knob of
     /// the progress checker's conformance matrix).
     #[cfg(all(

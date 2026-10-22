@@ -137,6 +137,13 @@ violation does: `report` (the default: record it and log a `tracing` warning),
 `check::violations_since(mark)` after it. Release builds contain no checker
 unless the `progress-check` feature is enabled.
 
+The checker does its work on a background thread, so it barely changes a
+dataflow's timing, but observing every hook still perturbs it a little. A
+test whose outcome depends on a timing bug of today's code can run its
+dataflow without the checker with `builder.skip_progress_check()` (behind
+`#[cfg(any(debug_assertions, feature = "progress-check"))]`), with a comment
+naming the bug and when to re-enable it.
+
 Two test suites build on it:
 
 - `tests/progress_conformance.rs` runs dataflow shapes on every execution

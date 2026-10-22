@@ -46,6 +46,20 @@
 //! share one oracle, keyed by [`DataflowId`], so work in network transit is
 //! covered too.
 //!
+//! Hooks run on the dataflow's own threads but do no checking there: each
+//! appends an event to its oracle's queue, and a background thread
+//! (`instancy-progress-check`) applies the events in queue order, which is
+//! the order the hooks ran in, so the outcome is the same as checking in
+//! place. Checking in place, under a lock every worker shared, changed the
+//! interleavings of the dataflows being checked enough to make timing bugs
+//! of today's code several times likelier. The functions that read the log
+//! ([`violations_since`], [`oracles_since`], ...) apply every queued event
+//! first. In `panic` mode the hook applies the queue itself, so that the
+//! violating thread panics.
+//!
+//! A test whose outcome the checker's timing still changes can run its
+//! dataflow without it (`DataflowBuilder::skip_progress_check`).
+//!
 //! # Modes
 //!
 //! The environment variable `INSTANCY_PROGRESS_CHECK` selects what happens
@@ -241,8 +255,10 @@ fn next_seq() -> u64 {
 /// A position in the process-wide sequence of log entries and oracles.
 ///
 /// Pass it to [`violations_since`] or [`oracles_since`] to see only what
-/// happened afterwards.
+/// happened afterwards. Every hook that ran before the call is applied
+/// first, so its violations come before the mark.
 pub fn mark() -> u64 {
+    let _settled = settle();
     SEQ.load(Ordering::Relaxed)
 }
 
@@ -265,13 +281,23 @@ fn log() -> MutexGuard<'static, Log> {
         .unwrap_or_else(|e| e.into_inner())
 }
 
+/// Every queued hook applied, and the background thread kept from dropping
+/// an oracle until the guard is released: what a reader sees is complete.
+fn settle() -> MutexGuard<'static, ()> {
+    let pass = pass();
+    drain_all();
+    pass
+}
+
 /// Every violation recorded so far in this process (and still in the log).
 pub fn violations() -> Vec<Violation> {
+    let _settled = settle();
     log().entries.iter().cloned().collect()
 }
 
 /// The violations recorded at or after `mark`.
 pub fn violations_since(mark: u64) -> Vec<Violation> {
+    let _settled = settle();
     log()
         .entries
         .iter()
@@ -282,6 +308,7 @@ pub fn violations_since(mark: u64) -> Vec<Violation> {
 
 /// The violations recorded for one dataflow.
 pub fn violations_for(dataflow: DataflowId) -> Vec<Violation> {
+    let _settled = settle();
     log()
         .entries
         .iter()
@@ -292,12 +319,14 @@ pub fn violations_for(dataflow: DataflowId) -> Vec<Violation> {
 
 /// Number of violations evicted from the log because it was full.
 pub fn dropped_violations() -> u64 {
+    let _settled = settle();
     log().dropped
 }
 
 /// Whether the log still holds every violation recorded at or after
 /// `mark` (none of them was evicted).
 pub fn log_complete_since(mark: u64) -> bool {
+    let _settled = settle();
     log().evicted_through < mark
 }
 
@@ -326,7 +355,17 @@ pub(crate) fn record(
     #[cfg(feature = "tracing")]
     tracing::warn!(target: "instancy::progress::check", "{violation}");
     if mode == Mode::Verbose || (mode == Mode::Panic && !check.is_report()) {
-        eprintln!("instancy progress check: {violation}");
+        if std::thread::current().name() == Some(CHECK_THREAD) {
+            // The background thread inherited the output capture of the
+            // test that started it, which it outlives: write past it.
+            use std::io::Write;
+            let _ = writeln!(
+                std::io::stderr().lock(),
+                "instancy progress check: {violation}"
+            );
+        } else {
+            eprintln!("instancy progress check: {violation}");
+        }
     }
     let message = (mode == Mode::Panic && !check.is_report()).then(|| violation.to_string());
     {
@@ -406,6 +445,7 @@ fn finished_stats() -> MutexGuard<'static, std::collections::VecDeque<OracleStat
 
 /// Statistics of every oracle created at or after `mark`, live or finished.
 pub fn oracles_since(mark: u64) -> Vec<OracleStats> {
+    let _settled = settle();
     let mut stats: Vec<OracleStats> = finished_stats()
         .iter()
         .filter(|s| s.seq >= mark)
@@ -611,6 +651,10 @@ pub(crate) trait Sink: Send + Sync + 'static {
     fn register_channel(&self, source: Loc, target: Loc);
     fn coverage_gap(&self, worker: Option<usize>, what: String);
     fn stats(&self) -> OracleStats;
+    /// Apply the queued events.
+    fn drain(&self);
+    /// Applying the queue panicked (a checker bug): halt and report it.
+    fn failed(&self, what: String);
 }
 
 /// Materialization context: the oracle and the worker being materialized.
@@ -651,6 +695,20 @@ fn registry() -> MutexGuard<'static, HashMap<DataflowId, Entry>> {
         .unwrap_or_else(|e| e.into_inner())
 }
 
+/// [`oracle`], unless the dataflow runs without the checker
+/// (`DataflowBuilder::skip_progress_check`).
+pub(crate) fn oracle_unless<T: Timestamp>(
+    skip: bool,
+    id: DataflowId,
+    total_workers: usize,
+) -> Option<Arc<Oracle<T>>> {
+    if skip {
+        None
+    } else {
+        oracle(id, total_workers)
+    }
+}
+
 /// The oracle for dataflow `id`, created on first use. Every node of a
 /// cluster in this process gets the same one. Returns `None` when checking
 /// is off.
@@ -666,6 +724,8 @@ pub(crate) fn oracle<T: Timestamp>(id: DataflowId, total_workers: usize) -> Opti
             _ => {
                 // Same id, different dataflow shape: keep them apart.
                 let oracle = Arc::new(Oracle::<T>::new(Some(id), total_workers));
+                let sink: Arc<dyn Sink> = oracle.clone();
+                watch(&sink);
                 oracle.coverage_gap(
                     None,
                     "another dataflow with this id and a different shape is running; \
@@ -678,6 +738,7 @@ pub(crate) fn oracle<T: Timestamp>(id: DataflowId, total_workers: usize) -> Opti
     }
     let oracle = Arc::new(Oracle::<T>::new(Some(id), total_workers));
     let sink: Arc<dyn Sink> = oracle.clone();
+    watch(&sink);
     let typed: Arc<dyn Any + Send + Sync> = oracle.clone();
     registry.insert(
         id,
@@ -728,9 +789,9 @@ struct View<T: Timestamp> {
     /// Publications with a non-empty frontier at a fully exhausted input,
     /// and when the first of them happened.
     stuck: LocMap<(u64, std::time::Instant)>,
-    /// Whether all counted work has been checked against the current
-    /// frontiers (new work is checked as it is counted, so a publication
-    /// that changes nothing need not scan again).
+    /// Whether all counted work has been checked against this view's
+    /// frontiers. After that, new work is checked as it is counted, and a
+    /// publication rescans only the work its changed frontiers constrain.
     scanned: bool,
 }
 
@@ -798,6 +859,8 @@ struct State<T: Timestamp> {
     site_logged: SiteCounts,
     /// Operator names, for violation locations.
     names: HashMap<usize, String>,
+    /// An empty event buffer, handed back to the queue (see `Oracle::sync`).
+    spare: Vec<Event<T>>,
     stats: OracleStats,
 }
 
@@ -827,6 +890,9 @@ impl<'a> Budget<'a> {
     fn take(&mut self, check: Check, site: Site) -> bool {
         let key = (check, site);
         let logged = self.logged.get(&key).copied().unwrap_or(0);
+        if logged >= LOGGED_PER_KIND {
+            return false;
+        }
         let pending = self.pending.entry(key).or_insert(0);
         if logged + *pending >= LOGGED_PER_KIND {
             return false;
@@ -853,6 +919,53 @@ fn per_record(check: Check, kind: &'static str) -> bool {
     )
 }
 
+/// Whether `check` described the location at `site` as often as it may.
+fn saturated(logged: &SiteCounts, check: Check, site: Site) -> bool {
+    logged
+        .get(&(check, site))
+        .is_some_and(|n| *n >= LOGGED_PER_KIND)
+}
+
+/// Whether every location work in `(store, loc)` is checked at (see
+/// [`check_one`]) was described as often as it may, so that the work need
+/// not be checked again. A location that breaks V7 on every record (every
+/// loop's feedback input does today, audit O-9) would otherwise cost every
+/// record a lookup in every view.
+fn v7_saturated(
+    logged: &SiteCounts,
+    out_edges: &LocMap<BTreeSet<Loc>>,
+    store: Store,
+    loc: Loc,
+) -> bool {
+    match store {
+        Store::Capability => saturated(logged, Check::V7, (loc, true)),
+        s if s.at_output() => out_edges.get(&loc).is_some_and(|targets| {
+            targets
+                .iter()
+                .all(|t| saturated(logged, Check::V7, (*t, false)))
+        }),
+        _ => saturated(logged, Check::V7, (loc, false)),
+    }
+}
+
+/// Whether work in `(store, loc)` is checked against one of the given
+/// frontiers (see [`check_one`]).
+fn constrained_by(
+    out_edges: &LocMap<BTreeSet<Loc>>,
+    store: Store,
+    loc: Loc,
+    targets: &[Loc],
+    sources: &[Loc],
+) -> bool {
+    match store {
+        Store::Capability => sources.contains(&loc),
+        s if s.at_output() => out_edges
+            .get(&loc)
+            .is_some_and(|edges| edges.iter().any(|t| targets.contains(t))),
+        _ => targets.contains(&loc),
+    }
+}
+
 /// `name[in i]` or `name[out i]`.
 fn site_name(names: &HashMap<usize, String>, ((op, port), output): Site) -> String {
     let direction = if output { "out" } else { "in" };
@@ -863,10 +976,127 @@ fn site_name(names: &HashMap<usize, String>, ((op, port), output): Site) -> Stri
 }
 
 /// The V7 oracle for one dataflow, typed by its root timestamp.
+///
+/// Worker threads only append [`Event`]s to `queue` (a short critical
+/// section); the background thread, or a reader, applies them to `state` in
+/// queue order (see the module docs). Setup and every read of the state
+/// apply the queue first.
 pub(crate) struct Oracle<T: Timestamp> {
     id: Option<DataflowId>,
     total_workers: usize,
+    queue: Mutex<Vec<Event<T>>>,
     state: Mutex<State<T>>,
+}
+
+/// One hook call, queued for the background thread (see [`Oracle`]).
+enum Event<T: Timestamp> {
+    Count {
+        store: Store,
+        loc: Loc,
+        owner: Owner,
+        time: T,
+        diff: i64,
+        worker: usize,
+    },
+    Consumed {
+        loc: Loc,
+        owner: Owner,
+        time: T,
+        n: i64,
+        worker: usize,
+    },
+    Publish {
+        view: u64,
+        global: bool,
+        targets: Vec<(Loc, Antichain<T>)>,
+        sources: Vec<(Loc, Antichain<T>)>,
+        at: std::time::Instant,
+    },
+    Exhausted(Loc),
+    ForceClose(u64),
+    WorkerFinished {
+        worker: usize,
+        ok: bool,
+    },
+    RetireView(u64),
+    Halt(String),
+}
+
+/// Past this many queued events, the hook applies the queue itself (bounds
+/// memory when the background thread falls behind).
+const MAX_QUEUED: usize = 1 << 16;
+
+/// How often the background thread applies the live oracles' queues.
+const POLL_EVERY: std::time::Duration = std::time::Duration::from_millis(1);
+
+/// The oracles the background thread applies queues for.
+fn live() -> MutexGuard<'static, Vec<Weak<dyn Sink>>> {
+    static LIVE: Mutex<Vec<Weak<dyn Sink>>> = Mutex::new(Vec::new());
+    LIVE.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// The background thread's name.
+const CHECK_THREAD: &str = "instancy-progress-check";
+
+/// Have the background thread apply `sink`'s queue (starting the thread on
+/// first use).
+fn watch(sink: &Arc<dyn Sink>) {
+    static POLLER: OnceLock<()> = OnceLock::new();
+    POLLER.get_or_init(|| {
+        std::thread::Builder::new()
+            .name(CHECK_THREAD.into())
+            .spawn(poll)
+            .expect("spawn the progress checker thread");
+    });
+    live().push(Arc::downgrade(sink));
+}
+
+/// The background thread: apply every live oracle's queue, then sleep.
+fn poll() {
+    loop {
+        // In panic mode hooks apply the queue themselves, so that a
+        // violation panics on the thread that caused it.
+        if mode() != Mode::Panic {
+            // Held while this pass holds oracles, so that an oracle this
+            // pass drops last is finished before a reader looks.
+            let _pass = pass();
+            let sinks: Vec<Arc<dyn Sink>> = {
+                let mut live = live();
+                live.retain(|sink| sink.strong_count() > 0);
+                live.iter().filter_map(Weak::upgrade).collect()
+            };
+            for sink in sinks {
+                // A bug in the checker must not stop it checking other
+                // dataflows: the oracle halts and reports it instead.
+                let result =
+                    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| sink.drain()));
+                if let Err(panic) = result {
+                    let what = panic
+                        .downcast_ref::<String>()
+                        .cloned()
+                        .or_else(|| panic.downcast_ref::<&str>().map(|s| s.to_string()))
+                        .unwrap_or_default();
+                    sink.failed(what);
+                }
+            }
+        }
+        std::thread::sleep(POLL_EVERY);
+    }
+}
+
+/// Apply the queues of every live oracle (before reading the log). The
+/// caller holds [`pass`].
+fn drain_all() {
+    let sinks: Vec<Arc<dyn Sink>> = live().iter().filter_map(Weak::upgrade).collect();
+    for sink in sinks {
+        sink.drain();
+    }
+}
+
+/// Excludes the background thread's passes (see [`poll`]).
+fn pass() -> MutexGuard<'static, ()> {
+    static PASS: Mutex<()> = Mutex::new(());
+    PASS.lock().unwrap_or_else(|e| e.into_inner())
 }
 
 impl<T: Timestamp> Oracle<T> {
@@ -880,6 +1110,7 @@ impl<T: Timestamp> Oracle<T> {
         Self {
             id,
             total_workers,
+            queue: Mutex::new(Vec::new()),
             state: Mutex::new(State {
                 created: std::time::Instant::now(),
                 registered: BTreeSet::new(),
@@ -895,6 +1126,7 @@ impl<T: Timestamp> Oracle<T> {
                 logged: HashMap::new(),
                 site_logged: SiteCounts::default(),
                 names: HashMap::new(),
+                spare: Vec::new(),
                 stats,
             }),
         }
@@ -902,6 +1134,88 @@ impl<T: Timestamp> Oracle<T> {
 
     fn lock(&self) -> MutexGuard<'_, State<T>> {
         self.state.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// Queue an event (see [`Oracle`]).
+    fn enqueue(&self, event: Event<T>) {
+        let full = {
+            let mut queue = self.queue.lock().unwrap_or_else(|e| e.into_inner());
+            queue.push(event);
+            queue.len() >= MAX_QUEUED
+        };
+        if full || mode() == Mode::Panic {
+            self.drain();
+        }
+    }
+
+    /// The state, with every queued event applied.
+    fn sync(&self) -> MutexGuard<'_, State<T>> {
+        let mut state = self.lock();
+        loop {
+            // The queue gets the previous batch's (empty) buffer back, so
+            // hooks rarely grow it.
+            let mut events = std::mem::take(&mut state.spare);
+            std::mem::swap(
+                &mut *self.queue.lock().unwrap_or_else(|e| e.into_inner()),
+                &mut events,
+            );
+            if events.is_empty() {
+                state.spare = events;
+                return state;
+            }
+            let mut found = Vec::new();
+            for event in events.drain(..) {
+                self.apply(&mut state, event, &mut found);
+            }
+            state.spare = events;
+            self.emit_locked(&mut state, found);
+        }
+    }
+
+    /// Apply every queued event.
+    fn drain(&self) {
+        drop(self.sync());
+    }
+
+    fn apply(&self, state: &mut State<T>, event: Event<T>, found: &mut Vec<Found>) {
+        match event {
+            Event::Count {
+                store,
+                loc,
+                owner,
+                time,
+                diff,
+                worker,
+            } => self.count_locked(state, store, loc, owner, &time, diff, worker, found),
+            Event::Consumed {
+                loc,
+                owner,
+                time,
+                n,
+                worker,
+            } => self.consumed_locked(state, loc, owner, &time, n, worker, found),
+            Event::Publish {
+                view,
+                global,
+                targets,
+                sources,
+                at,
+            } => self.publish_locked(state, view, global, targets, sources, at, found),
+            Event::Exhausted(loc) => *state.exhausted.entry(loc).or_insert(0) += 1,
+            Event::ForceClose(view) => self.force_close_locked(state, view, found),
+            Event::WorkerFinished { worker, ok } => {
+                self.worker_finished_locked(state, worker, ok, found)
+            }
+            Event::RetireView(view) => {
+                state.views.remove(&view);
+            }
+            Event::Halt(reason) => {
+                if state.halted.is_none() {
+                    state.stats.halted = Some(reason.clone());
+                    state.halted = Some(reason);
+                }
+            }
+        }
     }
 
     /// Whether some of the dataflow's workers have not registered (yet).
@@ -925,35 +1239,28 @@ impl<T: Timestamp> Oracle<T> {
         true
     }
 
-    /// Record findings (after the state lock is released), at most
-    /// [`LOGGED_PER_KIND`] per kind and location.
+    /// Record findings, at most [`LOGGED_PER_KIND`] per kind and location.
     fn emit(&self, found: Vec<Found>) {
-        if found.is_empty() {
-            return;
-        }
-        let keep: Vec<(Found, Option<String>)> = {
-            let mut state = self.lock();
-            let state = &mut *state;
-            let mut keep = Vec::new();
-            for f in found {
-                let logged = state.logged.entry((f.check, f.kind, f.site)).or_insert(0);
-                if *logged < LOGGED_PER_KIND {
-                    *logged += 1;
-                    if let Some(site) = f.site {
-                        if per_record(f.check, f.kind) {
-                            *state.site_logged.entry((f.check, site)).or_insert(0) += 1;
-                        }
+        let mut state = self.sync();
+        self.emit_locked(&mut state, found);
+    }
+
+    /// `emit` under the state lock (recording takes only the log's lock).
+    fn emit_locked(&self, state: &mut State<T>, found: Vec<Found>) {
+        for f in found {
+            let logged = state.logged.entry((f.check, f.kind, f.site)).or_insert(0);
+            if *logged < LOGGED_PER_KIND {
+                *logged += 1;
+                if let Some(site) = f.site {
+                    if per_record(f.check, f.kind) {
+                        *state.site_logged.entry((f.check, site)).or_insert(0) += 1;
                     }
-                    let location = f.site.map(|site| site_name(&state.names, site));
-                    keep.push((f, location));
-                } else {
-                    state.stats.suppressed += 1;
                 }
+                let location = f.site.map(|site| site_name(&state.names, site));
+                record(f.check, f.kind, self.id, f.worker, location, f.detail);
+            } else {
+                state.stats.suppressed += 1;
             }
-            keep
-        };
-        for (f, location) in keep {
-            record(f.check, f.kind, self.id, f.worker, location, f.detail);
         }
     }
 
@@ -961,7 +1268,7 @@ impl<T: Timestamp> Oracle<T> {
     /// registration wins: every worker registers the same graph. Names that
     /// occur more than once get a `(k)` suffix, numbered in operator order.
     pub(crate) fn register_names(&self, operators: impl IntoIterator<Item = (usize, String)>) {
-        let mut state = self.lock();
+        let mut state = self.sync();
         if !state.names.is_empty() {
             return;
         }
@@ -995,14 +1302,14 @@ impl<T: Timestamp> Oracle<T> {
 
     /// Register `worker` as one of this dataflow's workers.
     pub(crate) fn register_worker(&self, worker: usize) {
-        let mut state = self.lock();
+        let mut state = self.sync();
         state.registered.insert(worker);
         state.stats.registered_workers = state.registered.len();
     }
 
     /// Attach a worker's tracker; returns its view id.
     pub(crate) fn attach_view(&self, worker: usize, label: &'static str) -> u64 {
-        let mut state = self.lock();
+        let mut state = self.sync();
         let id = state.next_view;
         state.next_view += 1;
         state.views.insert(
@@ -1023,16 +1330,12 @@ impl<T: Timestamp> Oracle<T> {
 
     /// Detach a view: its frontiers no longer constrain anything.
     pub(crate) fn retire_view(&self, view: u64) {
-        self.lock().views.remove(&view);
+        self.enqueue(Event::RetireView(view));
     }
 
     /// Stop checking this dataflow (it was cancelled or failed).
     pub(crate) fn halt(&self, reason: &str) {
-        let mut state = self.lock();
-        if state.halted.is_none() {
-            state.halted = Some(reason.to_string());
-            state.stats.halted = Some(reason.to_string());
-        }
+        self.enqueue(Event::Halt(reason.to_string()));
     }
 
     /// Publish a view's frontiers (those that changed) and check the view
@@ -1045,212 +1348,257 @@ impl<T: Timestamp> Oracle<T> {
         targets: impl IntoIterator<Item = (Loc, Antichain<T>)>,
         sources: impl IntoIterator<Item = (Loc, Antichain<T>)>,
     ) {
-        let mut found = Vec::new();
-        {
-            let mut state = self.lock();
-            let state = &mut *state;
-            let total_workers = self.total_workers;
-            let Some(v) = state.views.get_mut(&view) else {
-                return;
-            };
-            v.local = (!global && total_workers > 1).then_some(v.worker);
-            let mut changed = false;
-            v.targets
-                .extend(targets.into_iter().inspect(|_| changed = true));
-            v.sources
-                .extend(sources.into_iter().inspect(|_| changed = true));
-            if changed {
-                v.scanned = false;
+        self.enqueue(Event::Publish {
+            view,
+            global,
+            targets: targets.into_iter().collect(),
+            sources: sources.into_iter().collect(),
+            at: std::time::Instant::now(),
+        });
+    }
+
+    /// `publish`, applied (`at`: when it was published).
+    #[allow(clippy::too_many_arguments)]
+    fn publish_locked(
+        &self,
+        state: &mut State<T>,
+        view: u64,
+        global: bool,
+        targets: Vec<(Loc, Antichain<T>)>,
+        sources: Vec<(Loc, Antichain<T>)>,
+        at: std::time::Instant,
+        found: &mut Vec<Found>,
+    ) {
+        let total_workers = self.total_workers;
+        let Some(v) = state.views.get_mut(&view) else {
+            return;
+        };
+        let local = (!global && total_workers > 1).then_some(v.worker);
+        if v.local != local {
+            // The view now sees other work than before.
+            v.local = local;
+            v.scanned = false;
+        }
+        let mut changed_targets = Vec::new();
+        for (loc, frontier) in targets {
+            if v.targets.get(&loc) != Some(&frontier) {
+                v.targets.insert(loc, frontier);
+                changed_targets.push(loc);
             }
-            let scan = !v.scanned;
-            state.stats.publishes += 1;
-            if state.stats.publishes % PRUNE_EVERY == 0 {
-                state.counts.retain(|_, times| {
-                    times.retain(|_, n| *n != 0);
-                    !times.is_empty()
-                });
+        }
+        let mut changed_sources = Vec::new();
+        for (loc, frontier) in sources {
+            if v.sources.get(&loc) != Some(&frontier) {
+                v.sources.insert(loc, frontier);
+                changed_sources.push(loc);
             }
-            if self.partial(state) || state.halted.is_some() {
-                return;
-            }
-            if scan {
-                let v = &state.views[&view];
-                let mut budget = Budget::new(&state.site_logged);
-                for ((store, loc, owner), times) in &state.counts {
-                    if !v.sees(*owner) {
-                        continue;
-                    }
-                    for (time, &n) in times {
-                        if n > 0 {
-                            check_one(
-                                v,
-                                &state.out_edges,
-                                &mut budget,
-                                *store,
-                                *loc,
-                                time,
-                                n,
-                                &mut found,
-                            );
-                        }
+        }
+        // Work is checked against every view when it is counted, so once all
+        // work has been checked against this view, only work whose frontier
+        // changed can have become a violation.
+        let full = !v.scanned;
+        let scan = full || !changed_targets.is_empty() || !changed_sources.is_empty();
+        state.stats.publishes += 1;
+        if state.stats.publishes % PRUNE_EVERY == 0 {
+            state.counts.retain(|_, times| {
+                times.retain(|_, n| *n != 0);
+                !times.is_empty()
+            });
+        }
+        if self.partial(state) || state.halted.is_some() {
+            return;
+        }
+        if scan {
+            let v = &state.views[&view];
+            let mut budget = Budget::new(&state.site_logged);
+            for ((store, loc, owner), times) in &state.counts {
+                if !v.sees(*owner)
+                    || (!full
+                        && !constrained_by(
+                            &state.out_edges,
+                            *store,
+                            *loc,
+                            &changed_targets,
+                            &changed_sources,
+                        ))
+                    || v7_saturated(&state.site_logged, &state.out_edges, *store, *loc)
+                {
+                    continue;
+                }
+                for (time, &n) in times {
+                    if n > 0 {
+                        check_one(
+                            v,
+                            &state.out_edges,
+                            &mut budget,
+                            *store,
+                            *loc,
+                            time,
+                            n,
+                            found,
+                        );
                     }
                 }
-                if let Some(v) = state.views.get_mut(&view) {
-                    v.scanned = true;
-                }
             }
-            // V4: a fully exhausted input must get an empty frontier.
-            if state.registered.len() == total_workers {
-                let exhausted: Vec<Loc> = state
-                    .exhausted
-                    .iter()
-                    .filter(|(loc, n)| {
-                        state
-                            .consumers
-                            .get(*loc)
-                            .is_some_and(|c| *c > 0 && **n >= *c)
-                    })
-                    .map(|(loc, _)| *loc)
-                    .collect();
-                let v = state.views.get_mut(&view).expect("view exists");
-                for loc in exhausted {
-                    let Some(frontier) = v.targets.get(&loc) else {
-                        continue;
-                    };
-                    if frontier.is_empty() {
-                        v.stuck.remove(&loc);
-                        continue;
-                    }
-                    let (count, since) =
-                        v.stuck.entry(loc).or_insert((0, std::time::Instant::now()));
-                    if *count == u64::MAX {
-                        // Already reported.
-                        continue;
-                    }
-                    *count += 1;
-                    if *count >= EXHAUSTED_GRACE && since.elapsed() >= EXHAUSTED_GRACE_TIME {
-                        *count = u64::MAX;
-                        found.push(Found {
-                            check: Check::V4,
-                            kind: "exhausted-input-frontier",
-                            worker: Some(v.worker),
-                            site: Some((loc, false)),
-                            detail: format!(
-                                "every channel into input {loc:?} is exhausted, but the {} \
-                                 view still has frontier {:?} there after {EXHAUSTED_GRACE} \
-                                 propagations and {EXHAUSTED_GRACE_TIME:?}",
-                                v.label,
-                                frontier.elements()
-                            ),
-                        });
-                    }
+            if let Some(v) = state.views.get_mut(&view) {
+                v.scanned = true;
+            }
+        }
+        // V4: a fully exhausted input must get an empty frontier.
+        if state.registered.len() == total_workers {
+            let exhausted: Vec<Loc> = state
+                .exhausted
+                .iter()
+                .filter(|(loc, n)| {
+                    state
+                        .consumers
+                        .get(*loc)
+                        .is_some_and(|c| *c > 0 && **n >= *c)
+                })
+                .map(|(loc, _)| *loc)
+                .collect();
+            let v = state.views.get_mut(&view).expect("view exists");
+            for loc in exhausted {
+                let Some(frontier) = v.targets.get(&loc) else {
+                    continue;
+                };
+                if frontier.is_empty() {
+                    v.stuck.remove(&loc);
+                    continue;
+                }
+                let (count, since) = v.stuck.entry(loc).or_insert((0, at));
+                if *count == u64::MAX {
+                    // Already reported.
+                    continue;
+                }
+                *count += 1;
+                if *count >= EXHAUSTED_GRACE
+                    && at.saturating_duration_since(*since) >= EXHAUSTED_GRACE_TIME
+                {
+                    *count = u64::MAX;
+                    found.push(Found {
+                        check: Check::V4,
+                        kind: "exhausted-input-frontier",
+                        worker: Some(v.worker),
+                        site: Some((loc, false)),
+                        detail: format!(
+                            "every channel into input {loc:?} is exhausted, but the {} \
+                             view still has frontier {:?} there after {EXHAUSTED_GRACE} \
+                             propagations and {EXHAUSTED_GRACE_TIME:?}",
+                            v.label,
+                            frontier.elements()
+                        ),
+                    });
                 }
             }
         }
-        self.emit(found);
     }
 
     /// A worker force-closes its operators because its tracker reports
     /// completion: nothing may still be outstanding in its view's locations.
     pub(crate) fn force_close(&self, view: u64) {
-        let mut found = Vec::new();
-        {
-            let mut state = self.lock();
-            let state = &mut *state;
-            if self.partial(state) || state.halted.is_some() {
-                return;
+        self.enqueue(Event::ForceClose(view));
+    }
+
+    /// `force_close`, applied.
+    fn force_close_locked(&self, state: &mut State<T>, view: u64, found: &mut Vec<Found>) {
+        if self.partial(state) || state.halted.is_some() {
+            return;
+        }
+        let Some(v) = state.views.get(&view) else {
+            return;
+        };
+        let mut outstanding = Vec::new();
+        for ((store, loc, owner), times) in &state.counts {
+            if !v.sees(*owner) || !view_covers(v, &state.out_edges, *store, *loc) {
+                continue;
             }
-            let Some(v) = state.views.get(&view) else {
-                return;
-            };
-            let mut outstanding = Vec::new();
-            for ((store, loc, owner), times) in &state.counts {
-                if !v.sees(*owner) || !view_covers(v, &state.out_edges, *store, *loc) {
-                    continue;
+            for (time, &n) in times {
+                if n > 0 {
+                    outstanding.push(format!(
+                        "{n} in {store:?} at {loc:?}@{time:?}{}",
+                        owner_suffix(*owner)
+                    ));
                 }
-                for (time, &n) in times {
-                    if n > 0 {
-                        outstanding.push(format!(
-                            "{n} in {store:?} at {loc:?}@{time:?}{}",
-                            owner_suffix(*owner)
-                        ));
-                    }
-                }
-            }
-            if !outstanding.is_empty() {
-                outstanding.truncate(8);
-                found.push(Found {
-                    check: Check::V4,
-                    kind: "force-close-with-work",
-                    worker: Some(v.worker),
-                    site: None,
-                    detail: format!(
-                        "its {} reports completion and it force-closes its operators while \
-                         work is outstanding: {}",
-                        v.label,
-                        outstanding.join(", ")
-                    ),
-                });
             }
         }
-        self.emit(found);
+        if !outstanding.is_empty() {
+            outstanding.truncate(8);
+            found.push(Found {
+                check: Check::V4,
+                kind: "force-close-with-work",
+                worker: Some(v.worker),
+                site: None,
+                detail: format!(
+                    "its {} reports completion and it force-closes its operators while \
+                     work is outstanding: {}",
+                    v.label,
+                    outstanding.join(", ")
+                ),
+            });
+        }
     }
 
     /// A worker's executor finished (`ok`: it reports success). Its own
     /// stores must then be empty and it may hold no capability; when every
     /// worker has succeeded, the channels between workers must be empty too.
     pub(crate) fn worker_finished(&self, worker: usize, ok: bool) {
-        let mut found = Vec::new();
-        {
-            let mut state = self.lock();
-            let state = &mut *state;
-            if !ok {
-                if state.halted.is_none() {
-                    state.halted = Some(format!("worker {worker} did not succeed"));
-                    state.stats.halted = state.halted.clone();
-                }
-                return;
+        self.enqueue(Event::WorkerFinished { worker, ok });
+    }
+
+    /// `worker_finished`, applied.
+    fn worker_finished_locked(
+        &self,
+        state: &mut State<T>,
+        worker: usize,
+        ok: bool,
+        found: &mut Vec<Found>,
+    ) {
+        if !ok {
+            if state.halted.is_none() {
+                state.halted = Some(format!("worker {worker} did not succeed"));
+                state.stats.halted = state.halted.clone();
             }
-            if !state.succeeded.insert(worker) {
-                return;
+            return;
+        }
+        if !state.succeeded.insert(worker) {
+            return;
+        }
+        state.stats.succeeded_workers = state.succeeded.len();
+        // This worker's own work: checked now, then forgotten (whatever
+        // its operators still hold can no longer produce anything).
+        let own: Vec<(Store, Loc, Owner)> = state
+            .counts
+            .keys()
+            .filter(|(_, _, owner)| *owner == Some(worker))
+            .copied()
+            .collect();
+        for key in own {
+            let times = state.counts.remove(&key).unwrap_or_default();
+            if state.halted.is_some() {
+                continue;
             }
-            state.stats.succeeded_workers = state.succeeded.len();
-            // This worker's own work: checked now, then forgotten (whatever
-            // its operators still hold can no longer produce anything).
-            let own: Vec<(Store, Loc, Owner)> = state
-                .counts
-                .keys()
-                .filter(|(_, _, owner)| *owner == Some(worker))
-                .copied()
-                .collect();
-            for key in own {
-                let times = state.counts.remove(&key).unwrap_or_default();
-                if state.halted.is_some() {
+            let (store, loc, _) = key;
+            for (time, n) in times {
+                if n == 0 {
                     continue;
                 }
-                let (store, loc, _) = key;
-                for (time, n) in times {
-                    if n == 0 {
-                        continue;
-                    }
-                    found.push(residual(store, loc, Some(worker), &time, n));
-                }
+                found.push(residual(store, loc, Some(worker), &time, n));
             }
-            let all = state.succeeded.len() == self.total_workers
-                && state.registered.len() == self.total_workers;
-            if !all || state.halted.is_some() || state.stats.end_state_checked {
-                return;
-            }
-            state.stats.end_state_checked = true;
-            for ((store, loc, owner), times) in &state.counts {
-                for (time, &n) in times {
-                    if n != 0 {
-                        found.push(residual(*store, *loc, *owner, time, n));
-                    }
+        }
+        let all = state.succeeded.len() == self.total_workers
+            && state.registered.len() == self.total_workers;
+        if !all || state.halted.is_some() || state.stats.end_state_checked {
+            return;
+        }
+        state.stats.end_state_checked = true;
+        for ((store, loc, owner), times) in &state.counts {
+            for (time, &n) in times {
+                if n != 0 {
+                    found.push(residual(*store, *loc, *owner, time, n));
                 }
             }
         }
-        self.emit(found);
     }
 
     /// Typed `count_any`.
@@ -1263,14 +1611,14 @@ impl<T: Timestamp> Oracle<T> {
         diff: i64,
         worker: usize,
     ) {
-        let mut found = Vec::new();
-        {
-            let mut state = self.lock();
-            self.count_locked(
-                &mut state, store, loc, owner, time, diff, worker, &mut found,
-            );
-        }
-        self.emit(found);
+        self.enqueue(Event::Count {
+            store,
+            loc,
+            owner,
+            time: time.clone(),
+            diff,
+            worker,
+        });
     }
 
     /// `count` under the state lock.
@@ -1319,7 +1667,7 @@ impl<T: Timestamp> Oracle<T> {
                 ),
             });
         }
-        if diff > 0 && now > 0 {
+        if diff > 0 && now > 0 && !v7_saturated(&state.site_logged, &state.out_edges, store, loc) {
             let mut budget = Budget::new(&state.site_logged);
             for v in state.views.values().filter(|v| v.sees(owner)) {
                 check_one(
@@ -1338,45 +1686,51 @@ impl<T: Timestamp> Oracle<T> {
 
     /// Typed `consumed_any`.
     fn consumed(&self, loc: Loc, owner: Owner, time: &T, n: i64, worker: usize) {
-        let mut found = Vec::new();
-        {
-            let mut state = self.lock();
-            let state = &mut *state;
-            self.count_locked(
-                state,
-                Store::Channel,
-                loc,
-                owner,
-                time,
-                -n,
-                worker,
-                &mut found,
-            );
-            if state.halted.is_some() {
-                return;
-            }
-            let mut budget = Budget::new(&state.site_logged);
-            for v in state.views.values().filter(|v| v.worker == worker) {
-                let Some(frontier) = v.targets.get(&loc) else {
-                    continue;
-                };
-                if !frontier.less_equal(time) && budget.take(Check::V1, (loc, false)) {
-                    found.push(Found {
-                        check: Check::V1,
-                        kind: "late-data",
-                        worker: Some(worker),
-                        site: Some((loc, false)),
-                        detail: format!(
-                            "consumed {n} record(s) at input {loc:?}@{time:?} behind this \
-                             worker's {} frontier {:?}",
-                            v.label,
-                            frontier.elements()
-                        ),
-                    });
-                }
+        self.enqueue(Event::Consumed {
+            loc,
+            owner,
+            time: time.clone(),
+            n,
+            worker,
+        });
+    }
+
+    /// `consumed`, applied.
+    #[allow(clippy::too_many_arguments)]
+    fn consumed_locked(
+        &self,
+        state: &mut State<T>,
+        loc: Loc,
+        owner: Owner,
+        time: &T,
+        n: i64,
+        worker: usize,
+        found: &mut Vec<Found>,
+    ) {
+        self.count_locked(state, Store::Channel, loc, owner, time, -n, worker, found);
+        if state.halted.is_some() || saturated(&state.site_logged, Check::V1, (loc, false)) {
+            return;
+        }
+        let mut budget = Budget::new(&state.site_logged);
+        for v in state.views.values().filter(|v| v.worker == worker) {
+            let Some(frontier) = v.targets.get(&loc) else {
+                continue;
+            };
+            if !frontier.less_equal(time) && budget.take(Check::V1, (loc, false)) {
+                found.push(Found {
+                    check: Check::V1,
+                    kind: "late-data",
+                    worker: Some(worker),
+                    site: Some((loc, false)),
+                    detail: format!(
+                        "consumed {n} record(s) at input {loc:?}@{time:?} behind this \
+                         worker's {} frontier {:?}",
+                        v.label,
+                        frontier.elements()
+                    ),
+                });
             }
         }
-        self.emit(found);
     }
 }
 
@@ -1536,12 +1890,17 @@ impl<T: Timestamp> Sink for Oracle<T> {
     }
 
     fn exhausted(&self, loc: Loc, _worker: usize) {
-        *self.lock().exhausted.entry(loc).or_insert(0) += 1;
+        self.enqueue(Event::Exhausted(loc));
     }
 
     fn register_channel(&self, source: Loc, target: Loc) {
-        let mut state = self.lock();
-        state.out_edges.entry(source).or_default().insert(target);
+        let mut state = self.sync();
+        if state.out_edges.entry(source).or_default().insert(target) {
+            // Work already at `source` was never checked against `target`.
+            for v in state.views.values_mut() {
+                v.scanned = false;
+            }
+        }
         *state.consumers.entry(target).or_insert(0) += 1;
         state.stats.wrapped_channels += 1;
     }
@@ -1558,17 +1917,33 @@ impl<T: Timestamp> Sink for Oracle<T> {
     }
 
     fn stats(&self) -> OracleStats {
-        self.lock().stats.clone()
+        self.sync().stats.clone()
+    }
+
+    fn drain(&self) {
+        Oracle::drain(self);
+    }
+
+    fn failed(&self, what: String) {
+        let reason = format!("the checker failed: {what}");
+        {
+            let mut state = self.lock();
+            if state.halted.is_none() {
+                state.stats.halted = Some(reason.clone());
+                state.halted = Some(reason.clone());
+            }
+        }
+        self.queue.lock().unwrap_or_else(|e| e.into_inner()).clear();
+        record(Check::V7, "checker-failed", self.id, None, None, reason);
     }
 }
 
 impl<T: Timestamp> Drop for Oracle<T> {
     fn drop(&mut self) {
-        let stats = self
-            .state
-            .get_mut()
-            .map(|s| s.stats.clone())
-            .unwrap_or_else(|e| e.into_inner().stats.clone());
+        if !std::thread::panicking() {
+            self.drain();
+        }
+        let stats = self.lock().stats.clone();
         let mut finished = finished_stats();
         if finished.len() >= LOG_CAPACITY {
             finished.pop_front();

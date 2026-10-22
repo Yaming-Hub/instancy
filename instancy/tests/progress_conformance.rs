@@ -2476,6 +2476,59 @@ fn ci_every_transport() {
     assert_all_matched(&run_matrix(&ci_cases("transports")));
 }
 
+/// `DataflowBuilder::skip_progress_check` (for tests outside the harness
+/// whose outcome the checker's timing changes) runs a dataflow without an
+/// oracle, and only that dataflow.
+#[test]
+fn skip_progress_check_runs_without_the_checker() {
+    let _guard = case_lock();
+    check::set_mode(Mode::Report);
+    let oracles = |skip: bool| {
+        let mark = check::mark();
+        let rt = RuntimeHandle::new(RuntimeConfig {
+            worker_threads: 2,
+            ..RuntimeConfig::default()
+        })
+        .expect("runtime");
+        let mut multi = rt
+            .spawn_multi(
+                "skip-check",
+                2,
+                move |b: &mut DataflowBuilder<u64>| {
+                    if skip {
+                        b.skip_progress_check();
+                    }
+                    b.input::<i64>("in")?
+                        .exchange_by_hash("spread", |x: &i64| *x as u64)
+                        .output("out")?;
+                    Ok(())
+                },
+                SpawnOptions::new().per_stage_parallelism(false),
+            )
+            .expect("spawn");
+        let senders = multi.take_all_inputs::<i64>("in").expect("inputs");
+        let receivers = multi.take_all_outputs::<i64>("out").expect("outputs");
+        senders[0].send(0, vec![1, 2, 3]).expect("send");
+        drop(senders);
+        multi.join_blocking().expect("join");
+        let records: usize = receivers
+            .into_iter()
+            .flat_map(|r| r.collect_data())
+            .map(|(_, data)| data.len())
+            .sum();
+        assert_eq!(records, 3);
+        let oracles = check::oracles_since(mark).len();
+        rt.shutdown();
+        oracles
+    };
+    assert_eq!(oracles(true), 0, "skip_progress_check still made an oracle");
+    assert_eq!(
+        oracles(false),
+        1,
+        "the checker did not observe the dataflow"
+    );
+}
+
 /// The whole matrix (several minutes). See the module docs for the command.
 #[test]
 #[ignore = "full conformance matrix; run explicitly (see module docs)"]
