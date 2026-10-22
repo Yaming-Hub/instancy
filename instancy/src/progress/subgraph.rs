@@ -1794,6 +1794,101 @@ mod tests {
         );
     }
 
+    /// The same invariant across workers, with no data plane: two trackers
+    /// joined only by in-process progress channels. Worker 0 sends a batch
+    /// toward worker 1's `downstream` input and drops its capability; worker
+    /// 1 has dropped its capability too. Until worker 1 consumes the batch,
+    /// both workers' frontiers at that input must hold at the batch's time
+    /// and neither may complete: the sender's `+n` counts in its own view
+    /// and, through the progress channel, in the receiver's. Then worker 1
+    /// consumes it (`-n`) and both complete.
+    #[test]
+    fn inflight_message_holds_every_workers_frontier_until_consumed() {
+        let t = 3u64;
+        let n = 7i64;
+        let channels = crate::progress::progress_channel::create_progress_channels::<u64>(
+            2,
+            &[
+                crate::dataflow::channels::wake::WakeHandle::new(),
+                crate::dataflow::channels::wake::WakeHandle::new(),
+            ],
+        )
+        .unwrap();
+        // Per worker: its tracker, its in-flight reporter for downstream's
+        // input, and its upstream capability.
+        type Worker = (
+            ProgressTracker<u64>,
+            ProgressReporter<u64>,
+            Option<Capability<u64>>,
+        );
+        let mut workers: Vec<Worker> = Vec::new();
+        for channels in channels {
+            // upstream(op1) --> downstream(op2), as in the single-worker test.
+            let mut builder = SubgraphBuilder::<u64>::new(1, 1);
+            let upstream = builder
+                .add_operator(1, "upstream", 1, 1, PortConnectivity::identity(0u64))
+                .unwrap()
+                .reporter(0)
+                .clone();
+            builder
+                .add_operator(2, "downstream", 1, 1, PortConnectivity::identity(0u64))
+                .unwrap();
+            builder.add_edge(Location::source(0, 0), Location::target(1, 0));
+            builder.add_edge(Location::source(1, 0), Location::target(2, 0));
+            builder.add_edge(Location::source(2, 0), Location::target(0, 0));
+            // Each worker's upstream holds a capability at time 0.
+            let capability = Capability::new(0u64, upstream);
+            let mut tracker = builder.build();
+            let inflight = tracker.register_inflight_reporter(2, 0);
+            tracker.set_progress_channels(channels).unwrap();
+            workers.push((tracker, inflight, Some(capability)));
+        }
+        for (tracker, _, _) in &mut workers {
+            tracker.initialize().unwrap();
+        }
+        // Two rounds, so each worker has absorbed everything the other sent.
+        let exchange = |workers: &mut Vec<Worker>| {
+            for _ in 0..2 {
+                for (tracker, _, _) in workers.iter_mut() {
+                    tracker.propagate().unwrap();
+                }
+            }
+        };
+        exchange(&mut workers);
+
+        // Worker 0 sends n records at t toward worker 1's downstream input,
+        // then both workers release their capabilities.
+        workers[0].1.update(t, n);
+        for (_, _, capability) in &mut workers {
+            drop(capability.take());
+        }
+        exchange(&mut workers);
+        for (w, (tracker, _, _)) in workers.iter().enumerate() {
+            assert!(
+                tracker.input_frontier(2, 0).less_equal(&t),
+                "worker {w}: frontier at the input the batch is bound for passed t={t} while \
+                 the batch is in flight: {:?}",
+                tracker.input_frontier(2, 0)
+            );
+            assert!(
+                !tracker.is_completed(),
+                "worker {w} completed while a batch is in flight"
+            );
+        }
+
+        // Worker 1 consumes the batch.
+        workers[1].1.update(t, -n);
+        exchange(&mut workers);
+        for (w, (tracker, _, _)) in workers.iter().enumerate() {
+            assert!(
+                tracker.input_frontier(2, 0).is_empty(),
+                "worker {w}: frontier {:?} after the batch was consumed",
+                tracker.input_frontier(2, 0)
+            );
+            assert!(tracker.is_completed(), "worker {w} did not complete");
+        }
+    }
+
     /// Symmetry invariant: in single-worker mode every `-count` must have a
     /// matching `+count`. A lone `-count` (the "missing producer-side wiring"
     /// failure mode that caused the `iter_var.exchange` hang) drives the

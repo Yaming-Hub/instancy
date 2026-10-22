@@ -6197,6 +6197,12 @@ fn materialize_executor<T: Timestamp>(
     let check_oracle = dataflow.check.clone();
     #[cfg(any(debug_assertions, feature = "progress-check"))]
     if let Some(oracle) = &check_oracle {
+        oracle.register_names(
+            dataflow
+                .graph
+                .operators()
+                .map(|op| (op.index, op.name.clone())),
+        );
         worker_subgraph_builder.attach_check_reporters(oracle, worker_context.worker_index());
     }
     #[cfg(any(debug_assertions, feature = "progress-check"))]

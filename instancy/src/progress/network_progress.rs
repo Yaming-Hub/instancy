@@ -146,6 +146,7 @@ pub fn encode_progress_batch<T: Timestamp + ExchangeData>(
                     "fragment-order",
                     None,
                     None,
+                    None,
                     format!(
                         "a progress batch of {} changes was split with a positive change \
                          after a fragment that carried a negative one",
@@ -503,7 +504,7 @@ async fn watch_after_end_of_stream<T: Timestamp + ExchangeData>(
                                     crate::progress::check::Check::V6,
                                     "batch-after-end-of-stream",
                                     None,
-                                    None,
+                                    None, None,
                                     format!(
                                         "peer {peer_id} sent a progress batch on channel \
                                          {channel_id} after its end-of-stream"

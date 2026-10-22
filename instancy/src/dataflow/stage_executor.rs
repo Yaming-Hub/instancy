@@ -147,6 +147,7 @@ pub(crate) fn materialize_stage_executor<T: Timestamp>(
     let check_oracle = check.as_ref().and_then(|ctx| ctx.oracle::<T>());
     #[cfg(any(debug_assertions, feature = "progress-check"))]
     if let Some(oracle) = &check_oracle {
+        oracle.register_names(graph.operators().map(|op| (op.index, op.name.clone())));
         subgraph_builder.attach_check_reporters(oracle, worker_index);
     }
 

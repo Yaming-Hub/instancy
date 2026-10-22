@@ -141,10 +141,18 @@ Two test suites build on it:
 
 - `tests/progress_conformance.rs` runs dataflow shapes on every execution
   path, transport, worker count and channel capacity, and checks exact
-  outputs plus the checker's findings. Known failures of today's code are
-  listed, by audit finding, in its `EXPECTED_FAILURES` table. CI runs a
-  bounded subset; run the whole matrix with
-  `cargo test -p instancy --all-features --test progress_conformance -- --ignored --test-threads=1`.
+  outputs plus the checker's findings. How each case fails today is
+  recorded in the golden file `tests/progress_conformance.golden`, with
+  violations located at an operator port: a case must fail exactly as
+  recorded, and a case the file does not list must pass. (Frontier
+  findings, V1 `late-data` and V7 `frontier-ahead-of-work`, depend on
+  scheduling: one may be missing, or sit at another port the same shape and
+  path showed; `CONFORMANCE_STRICT=1` judges them exactly too.) The
+  `EXPECTED_FAILURES` table explains every recorded failure by audit
+  finding. CI runs a bounded subset; run the whole matrix with
+  `cargo test -p instancy --all-features --test progress_conformance -- --ignored --test-threads=1 full_conformance_matrix`.
+  The module docs say how to record runs and regenerate the golden file;
+  every change to it must cite the audit finding behind it.
 - `tests/audit_repros.rs` holds the correctness audit's repro tests. They
   are timing-sensitive races, so they run on demand:
   `cargo test -p instancy --all-features --test audit_repros -- --ignored --exact audit_repros_match_table`

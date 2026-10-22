@@ -12,24 +12,60 @@
 //!   was attached, every channel was wrapped, and on success the end-state
 //!   check ran).
 //!
-//! Today's known failures are listed in [`EXPECTED_FAILURES`], keyed by
-//! audit ID. A case covered by an entry must fail *exactly* as listed: if a
-//! later step fixes it, or it starts failing differently (say from a hang to
-//! a loss), the case fails and the table must be updated. Some failures
-//! depend on scheduling; an entry lists those as `allowed` rather than
-//! `required`, and a case is re-run (up to [`ATTEMPTS`] times) only while a
-//! required failure has not shown up yet.
+//! Today's code fails many cases. How each case fails is recorded in the
+//! *golden file*, `tests/progress_conformance.golden`: per case, the
+//! failures every recorded run showed (`always`) and those only some runs
+//! showed (`sometimes`), with violations located at an operator port
+//! (`V7:frontier-ahead-of-work@loop::concat[in 1]`). A case the file does
+//! not list must pass cleanly. A case must show every `always` failure and
+//! nothing outside `always` and `sometimes`, with one exception: per-record
+//! frontier violations (V1 `late-data`, V7 `frontier-ahead-of-work`) are
+//! detected only when an interleaving exposes the frontier passing a record,
+//! so whether and where they occur varies from run to run. They are not
+//! required, and they are accepted at any location where some case of the
+//! same shape and path showed them; a frontier violation at a location no
+//! such case ever showed fails the case. Outcomes (hang, loss, duplicates,
+//! split aggregates, errors) and every other violation are judged exactly.
+//! `CONFORMANCE_STRICT=1` judges frontier violations exactly too.
+//!
+//! So a later step that fixes an outcome, or changes how a case fails (a
+//! hang into a loss, a violation at a new location), fails the matrix until
+//! the golden file is regenerated. A mismatching case is re-run up to
+//! [`ATTEMPTS`] times and passes if any attempt matches (it is then reported
+//! as `FLAKY`): a deterministic change always fails.
+//!
+//! [`EXPECTED_FAILURES`] explains the golden file by audit finding: every
+//! failure the golden file records must be of a kind that a table entry
+//! matching the case lists, and every kind an entry lists must occur in a
+//! case it matches (the `golden_file_agrees_with_the_table` test, which
+//! runs in CI).
 //!
 //! CI runs a bounded subset (the `ci_*` tests below). Run the whole matrix
 //! with:
 //!
 //! ```text
-//! cargo test -p instancy --all-features --test progress_conformance -- --ignored --test-threads=1
+//! cargo test -p instancy --all-features --test progress_conformance -- --ignored --test-threads=1 full_conformance_matrix
 //! ```
 //!
 //! Set `CONFORMANCE_FILTER` to a substring of a case's name (for example
 //! `Iterate/StageTasks`) to run only matching cases, and
 //! `CONFORMANCE_REPORT=1` to print every case's outcome.
+//!
+//! # Regenerating the golden file
+//!
+//! Record at least three full runs (and, for the CI subset, runs pinned to
+//! one core), then merge them:
+//!
+//! ```text
+//! CONFORMANCE_RECORD=run1.txt cargo test -p instancy --all-features --test progress_conformance -- --ignored --test-threads=1 full_conformance_matrix
+//! (repeat for run2.txt, run3.txt, ...)
+//! CONFORMANCE_GOLDEN_INPUTS="run1.txt;run2.txt;run3.txt" cargo test -p instancy --all-features --test progress_conformance -- --ignored --exact regenerate_golden_file
+//! ```
+//!
+//! In recording mode every case runs once and nothing is judged. Merging
+//! refuses blind runs and failures no table entry explains. Every commit that
+//! changes the golden file must cite, in its message, the audit finding that
+//! explains each change.
 #![cfg(all(
     feature = "transport",
     feature = "test-utils",
@@ -244,15 +280,6 @@ impl Case {
         }
     }
 
-    /// Fused or stage-task activation, in-process, one worker, default
-    /// capacity.
-    fn is_default_configuration(&self) -> bool {
-        matches!(self.path, Path::Fused | Path::StageTasks)
-            && self.transport == Transport::InProcess
-            && self.workers == Workers::One
-            && self.cap == Cap::Default
-    }
-
     /// Whether the combination exists.
     fn applicable(&self) -> bool {
         let cluster = matches!(self.transport, Transport::Dedicated | Transport::Shared);
@@ -319,8 +346,11 @@ enum Failure {
     Split,
     /// A run that must fail succeeded.
     NotRejected,
-    /// The progress checker recorded a violation of this kind.
-    Violation(Check, &'static str),
+    /// The progress checker recorded a violation: the check, its kind and
+    /// where (an operator port, as `name[in i]` or `name[out i]`; `None` for
+    /// violations about a whole worker). In the golden file's "sometimes"
+    /// column a location of `*` matches any location.
+    Violation(Check, &'static str, Option<&'static str>),
     /// The progress checker did not observe the run.
     Blind(&'static str),
 }
@@ -329,24 +359,105 @@ impl fmt::Display for Failure {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Failure::Error(signature) => write!(f, "Error:{signature}"),
-            Failure::Violation(check, kind) => write!(f, "{check}:{kind}"),
+            Failure::Violation(check, kind, None) => write!(f, "{check}:{kind}"),
+            Failure::Violation(check, kind, Some(at)) => write!(f, "{check}:{kind}@{at}"),
             Failure::Blind(why) => write!(f, "blind:{why}"),
             other => write!(f, "{other:?}"),
         }
     }
 }
 
-const V1_LATE: Failure = Failure::Violation(Check::V1, "late-data");
-const V7_AHEAD: Failure = Failure::Violation(Check::V7, "frontier-ahead-of-work");
-const V7_RESIDUAL: Failure = Failure::Violation(Check::V7, "end-state-residual");
-const V4_FORCE: Failure = Failure::Violation(Check::V4, "force-close-with-work");
-const V4_EXHAUSTED: Failure = Failure::Violation(Check::V4, "exhausted-input-frontier");
-const V4_HOLDING: Failure = Failure::Violation(Check::V4, "finished-holding-capability");
+impl Failure {
+    /// The failure without its location: what the table explains.
+    fn kind(self) -> Failure {
+        match self {
+            Failure::Violation(check, kind, _) => Failure::Violation(check, kind, None),
+            other => other,
+        }
+    }
+
+    /// Parse the [`Display`](fmt::Display) form.
+    fn parse(text: &str) -> std::result::Result<Failure, String> {
+        let text = text.trim();
+        Ok(match text {
+            "Hang" => Failure::Hang,
+            "Loss" => Failure::Loss,
+            "Extra" => Failure::Extra,
+            "Split" => Failure::Split,
+            "NotRejected" => Failure::NotRejected,
+            _ => {
+                if let Some(signature) = text.strip_prefix("Error:") {
+                    Failure::Error(intern(signature))
+                } else if let Some(why) = text.strip_prefix("blind:") {
+                    Failure::Blind(intern(why))
+                } else {
+                    let (check, rest) = text
+                        .split_once(':')
+                        .ok_or_else(|| format!("not a failure: {text:?}"))?;
+                    let check = [Check::V1, Check::V4, Check::V5, Check::V6, Check::V7]
+                        .into_iter()
+                        .find(|c| c.to_string() == check)
+                        .ok_or_else(|| format!("not a check: {check:?}"))?;
+                    match rest.split_once('@') {
+                        Some((kind, at)) => {
+                            Failure::Violation(check, intern(kind), Some(intern(at)))
+                        }
+                        None => Failure::Violation(check, intern(rest), None),
+                    }
+                }
+            }
+        })
+    }
+
+    /// Whether this is a per-record frontier violation (V1 `late-data` or V7
+    /// `frontier-ahead-of-work`): whether one occurs, and where, depends on
+    /// the interleaving that exposes a frontier passing a record.
+    fn is_frontier(self) -> bool {
+        matches!(
+            self,
+            Failure::Violation(Check::V1, "late-data", _)
+                | Failure::Violation(Check::V7, "frontier-ahead-of-work", _)
+        )
+    }
+
+    /// Whether this (expected) failure accepts the observed failure `seen`.
+    fn accepts(self, seen: Failure) -> bool {
+        match (self, seen) {
+            (Failure::Violation(c1, k1, Some("*")), Failure::Violation(c2, k2, _)) => {
+                c1 == c2 && k1 == k2
+            }
+            _ => self == seen,
+        }
+    }
+}
+
+/// A `&'static str` for `text` (failure kinds and locations are compared
+/// and stored as such).
+fn intern(text: &str) -> &'static str {
+    static INTERNED: OnceLock<Mutex<BTreeSet<&'static str>>> = OnceLock::new();
+    let mut interned = INTERNED
+        .get_or_init(Default::default)
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    if let Some(existing) = interned.get(text) {
+        return existing;
+    }
+    let leaked: &'static str = Box::leak(text.to_string().into_boxed_str());
+    interned.insert(leaked);
+    leaked
+}
+
+const V1_LATE: Failure = Failure::Violation(Check::V1, "late-data", None);
+const V7_AHEAD: Failure = Failure::Violation(Check::V7, "frontier-ahead-of-work", None);
+const V7_RESIDUAL: Failure = Failure::Violation(Check::V7, "end-state-residual", None);
+const V4_FORCE: Failure = Failure::Violation(Check::V4, "force-close-with-work", None);
+const V4_EXHAUSTED: Failure = Failure::Violation(Check::V4, "exhausted-input-frontier", None);
 const HANG: Failure = Failure::Hang;
 const LOSS: Failure = Failure::Loss;
 const SPLIT: Failure = Failure::Split;
 const INFLIGHT_NEGATIVE: Failure = Failure::Error("inflight-negative");
 const WORKER_DIED: Failure = Failure::Error("worker-died");
+const DATA_LOST: Failure = Failure::Error("data-lost");
 
 /// Known errors: text the error contains, and its signature. Anything else
 /// is `Error:other`.
@@ -357,6 +468,9 @@ const ERROR_SIGNATURES: &[(&str, &str)] = &[
     // `SimpleRuntime`: a worker thread died (the same assertion; the panic
     // message does not reach the error).
     ("terminated unexpectedly", "worker-died"),
+    // A cluster node's records reached a peer operator that had finished
+    // (PR8's data-loss detection).
+    ("data lost on the link", "data-lost"),
 ];
 
 fn error_signature(error: &str) -> &'static str {
@@ -366,24 +480,23 @@ fn error_signature(error: &str) -> &'static str {
         .map_or("other", |(_, signature)| signature)
 }
 
-/// One known failure of today's code: which cases it covers (an empty
-/// list matches everything) and how they fail.
+/// One finding of the correctness audit (or design inventory row) and the
+/// kinds of failure it causes in the cases it matches (an empty list matches
+/// everything). The table *explains* the golden file: every failure the
+/// golden file records must be of a kind a matching entry lists, and every
+/// kind an entry lists must occur in some case it matches
+/// ([`golden_file_agrees_with_the_table`]). Exactly how each case fails is
+/// in the golden file.
 struct Expected {
-    /// The audit finding (or design inventory row) that causes it.
+    /// The audit finding (or design inventory row).
     audit: &'static str,
     shapes: &'static [Shape],
     paths: &'static [Path],
     transports: &'static [Transport],
     workers: &'static [Workers],
     caps: &'static [Cap],
-    /// Failures every matching case must show.
-    required: &'static [Failure],
-    /// Failures a matching case may show (they depend on scheduling).
-    allowed: &'static [Failure],
-    /// The entry does not cover the default single-worker configuration
-    /// (fused or stage-task activation, in-process, default capacity), where
-    /// its shapes run clean today: there they must stay clean.
-    except_default: bool,
+    /// The kinds of failure (without location) the finding causes here.
+    failures: &'static [Failure],
     /// Why, in one line.
     why: &'static str,
 }
@@ -393,15 +506,25 @@ impl Expected {
         fn any<T: PartialEq>(list: &[T], value: &T) -> bool {
             list.is_empty() || list.contains(value)
         }
-        if self.except_default && case.is_default_configuration() {
-            return false;
-        }
         any(self.shapes, &case.shape)
             && any(self.paths, &case.path)
             && any(self.transports, &case.transport)
             && any(self.workers, &case.workers)
             && any(self.caps, &case.cap)
     }
+
+    /// Whether this entry explains `failure` in `case`.
+    fn explains(&self, case: &Case, failure: Failure) -> bool {
+        self.matches(case) && self.failures.contains(&failure.kind())
+    }
+}
+
+/// The table entries that explain `failure` in `case`.
+fn explanations(case: &Case, failure: Failure) -> Vec<&'static Expected> {
+    EXPECTED_FAILURES
+        .iter()
+        .filter(|e| e.explains(case, failure))
+        .collect()
 }
 
 const ANY_SHAPE: &[Shape] = &[];
@@ -411,6 +534,7 @@ const ANY_WORKERS: &[Workers] = &[];
 const ANY_CAP: &[Cap] = &[];
 const MULTI: &[Workers] = &[Workers::Two, Workers::Three];
 const UNIFORM: &[Path] = &[Path::Unfused, Path::Fused, Path::StageTasks];
+const UNIFORM_AND_SIMPLE: &[Path] = &[Path::Unfused, Path::Fused, Path::StageTasks, Path::Simple];
 const LOOPS: &[Shape] = &[
     Shape::Iterate,
     Shape::IterateExchange,
@@ -418,38 +542,8 @@ const LOOPS: &[Shape] = &[
     Shape::LoopThenCount,
     Shape::LoopThenFlush,
 ];
-/// Shapes with an exchange whose producer records no `+n` (it is not of
-/// the map family): an input, an exchange, a loop's leave or `unary_async`.
-const UNWIRED_EXCHANGE: &[Shape] = &[
-    Shape::Exchange,
-    Shape::ExchangeTwice,
-    Shape::FanoutExchanges,
-    Shape::NotifySum,
-    Shape::Reduce,
-    Shape::Count,
-    Shape::IterateExchange,
-];
-/// Shapes with a cross-worker exchange (that do not hang first at any
-/// capacity).
-const EXCHANGES: &[Shape] = &[
-    Shape::Exchange,
-    Shape::ExchangeTwice,
-    Shape::FanoutExchanges,
-    Shape::NotifySum,
-    Shape::Reduce,
-    Shape::Count,
-    Shape::Distinct,
-    Shape::UnaryAsync,
-    Shape::IterateExchange,
-];
 
-/// Today's known failures. See the module docs for how entries are judged.
-///
-/// `required` failures are deterministic consequences of the finding;
-/// `allowed` ones are its scheduling-dependent symptoms (a hang whose inputs
-/// are all exhausted also shows as V4 `exhausted-input-frontier`, so that is
-/// allowed wherever a hang is). Every entry must reproduce in the full matrix
-/// ([`assert_table_exercised`]).
+/// Today's known failures, by audit finding. See [`Expected`].
 const EXPECTED_FAILURES: &[Expected] = &[
     Expected {
         audit: "P-9",
@@ -458,293 +552,8 @@ const EXPECTED_FAILURES: &[Expected] = &[
         transports: ANY_TRANSPORT,
         workers: ANY_WORKERS,
         caps: ANY_CAP,
-        required: &[Failure::NotRejected],
-        allowed: &[],
-        except_default: false,
+        failures: &[Failure::NotRejected],
         why: "notify_at accepts a time only the input frontier justifies",
-    },
-    Expected {
-        audit: "C2",
-        shapes: UNWIRED_EXCHANGE,
-        paths: UNIFORM,
-        transports: &[Transport::Mock],
-        workers: &[Workers::One],
-        caps: ANY_CAP,
-        required: &[INFLIGHT_NEGATIVE],
-        allowed: &[V1_LATE, V7_AHEAD, SPLIT, HANG, V4_EXHAUSTED],
-        except_default: false,
-        why: "the network pull records -n but a producer outside the map family never \
-              records +n; one worker trips the in-flight symmetry assertion",
-    },
-    Expected {
-        audit: "C2",
-        shapes: &[Shape::LoopThenCount],
-        paths: UNIFORM,
-        transports: &[Transport::Mock],
-        workers: &[Workers::One],
-        caps: &[Cap::Default],
-        required: &[INFLIGHT_NEGATIVE],
-        allowed: &[],
-        except_default: false,
-        why: "as above, for the exchange after a loop (at capacity 1 the loop hangs first)",
-    },
-    Expected {
-        audit: "P-7",
-        shapes: EXCHANGES,
-        paths: &[Path::Simple],
-        transports: ANY_TRANSPORT,
-        workers: MULTI,
-        caps: ANY_CAP,
-        required: &[WORKER_DIED],
-        allowed: &[V1_LATE, V7_AHEAD, SPLIT],
-        except_default: false,
-        why: "SimpleRuntime wires cross-worker exchanges but no progress channels: one \
-              worker's tracker gets -n for records whose +n another worker recorded",
-    },
-    Expected {
-        audit: "P-7",
-        shapes: &[Shape::LoopThenCount],
-        paths: &[Path::Simple],
-        transports: ANY_TRANSPORT,
-        workers: MULTI,
-        caps: &[Cap::Default],
-        required: &[WORKER_DIED],
-        allowed: &[],
-        except_default: false,
-        why: "as above, for the exchange after a loop (at capacity 1 the loop hangs first)",
-    },
-    Expected {
-        audit: "P-7",
-        shapes: &[Shape::Broadcast],
-        paths: &[Path::Simple],
-        transports: ANY_TRANSPORT,
-        workers: MULTI,
-        caps: ANY_CAP,
-        required: &[],
-        allowed: &[V1_LATE, V7_AHEAD],
-        except_default: false,
-        why: "SimpleRuntime has no cross-worker progress: a worker's frontier ignores \
-              records broadcast by its peers",
-    },
-    Expected {
-        audit: "H12",
-        shapes: &[Shape::FanoutExchanges],
-        paths: UNIFORM,
-        transports: ANY_TRANSPORT,
-        workers: MULTI,
-        caps: ANY_CAP,
-        required: &[HANG],
-        allowed: &[V1_LATE, V7_AHEAD, V4_EXHAUSTED],
-        except_default: false,
-        why: "two exchanges fed by one output share one in-flight key",
-    },
-    Expected {
-        audit: "H14",
-        shapes: ANY_SHAPE,
-        paths: &[Path::Staged],
-        transports: ANY_TRANSPORT,
-        workers: ANY_WORKERS,
-        caps: ANY_CAP,
-        required: &[V7_AHEAD],
-        allowed: &[
-            V1_LATE,
-            SPLIT,
-            LOSS,
-            HANG,
-            V4_FORCE,
-            V7_RESIDUAL,
-            V4_HOLDING,
-            V4_EXHAUSTED,
-        ],
-        except_default: false,
-        why: "the staged executor's per-stage trackers see nothing across stages",
-    },
-    Expected {
-        audit: "O-4/P-2",
-        shapes: &[Shape::UnaryAsync],
-        paths: &[Path::Staged],
-        transports: ANY_TRANSPORT,
-        workers: ANY_WORKERS,
-        caps: ANY_CAP,
-        required: &[LOSS, V4_FORCE],
-        allowed: &[],
-        except_default: false,
-        why: "the staged path force-closes while unary_async tasks still hold records, \
-              and reports success without them",
-    },
-    Expected {
-        audit: "O-9/H11",
-        shapes: LOOPS,
-        paths: ANY_PATH,
-        transports: ANY_TRANSPORT,
-        workers: ANY_WORKERS,
-        caps: ANY_CAP,
-        required: &[V7_AHEAD],
-        allowed: &[
-            V1_LATE,
-            HANG,
-            SPLIT,
-            LOSS,
-            V4_FORCE,
-            V7_RESIDUAL,
-            V4_HOLDING,
-            V4_EXHAUSTED,
-        ],
-        except_default: false,
-        why: "feedback edges are not in the reachability graph: the loop's concat sees an \
-              empty frontier on its feedback input while records circulate",
-    },
-    Expected {
-        audit: "C2",
-        shapes: &[
-            Shape::Iterate,
-            Shape::NestedIterate,
-            Shape::LoopThenCount,
-            Shape::LoopThenFlush,
-        ],
-        paths: &[Path::Unfused, Path::Fused, Path::StageTasks, Path::Simple],
-        transports: ANY_TRANSPORT,
-        workers: ANY_WORKERS,
-        caps: &[Cap::One],
-        required: &[HANG],
-        allowed: &[V4_EXHAUSTED],
-        except_default: false,
-        why: "a loop with one-batch channels never completes (loops hang, C2)",
-    },
-    Expected {
-        audit: "C2",
-        shapes: &[Shape::IterateExchange],
-        paths: &[Path::Unfused, Path::Fused, Path::StageTasks, Path::Staged],
-        transports: ANY_TRANSPORT,
-        workers: MULTI,
-        caps: ANY_CAP,
-        required: &[HANG],
-        allowed: &[V4_EXHAUSTED],
-        except_default: false,
-        why: "a multi-worker loop with an exchange inside, or followed by one from its \
-              leave, never completes",
-    },
-    Expected {
-        audit: "C2",
-        shapes: &[Shape::LoopThenCount],
-        paths: UNIFORM,
-        transports: ANY_TRANSPORT,
-        workers: MULTI,
-        caps: ANY_CAP,
-        required: &[HANG],
-        allowed: &[V4_EXHAUSTED],
-        except_default: false,
-        why: "a multi-worker loop followed by an exchange from its leave never completes",
-    },
-    Expected {
-        audit: "H11",
-        shapes: &[Shape::LoopThenFlush],
-        paths: ANY_PATH,
-        transports: ANY_TRANSPORT,
-        workers: ANY_WORKERS,
-        caps: &[Cap::Default],
-        required: &[],
-        allowed: &[LOSS],
-        except_default: false,
-        why: "a loop does not hold the outer epoch: the frontier after it empties while \
-              records still circulate, so a flush-at-empty-frontier operator flushes early",
-    },
-    Expected {
-        audit: "O-4/H1",
-        shapes: &[Shape::UnaryAsync],
-        paths: ANY_PATH,
-        transports: ANY_TRANSPORT,
-        workers: ANY_WORKERS,
-        caps: ANY_CAP,
-        required: &[],
-        allowed: &[
-            V1_LATE,
-            V7_AHEAD,
-            SPLIT,
-            HANG,
-            LOSS,
-            V4_FORCE,
-            V7_RESIDUAL,
-            INFLIGHT_NEGATIVE,
-            V4_EXHAUSTED,
-        ],
-        except_default: false,
-        why: "unary_async's queued input, running tasks and results are invisible to progress",
-    },
-    Expected {
-        audit: "O-4/H1",
-        shapes: &[Shape::UnaryAsync],
-        paths: ANY_PATH,
-        transports: &[
-            Transport::InProcess,
-            Transport::Dedicated,
-            Transport::Shared,
-        ],
-        workers: ANY_WORKERS,
-        caps: ANY_CAP,
-        required: &[V7_AHEAD],
-        allowed: &[],
-        except_default: false,
-        why: "records held by unary_async are invisible to progress, so the frontier \
-              after it passes them",
-    },
-    Expected {
-        audit: "C2",
-        shapes: &[Shape::UnaryAsync],
-        paths: &[Path::Fused, Path::StageTasks],
-        transports: &[Transport::Mock],
-        workers: &[Workers::One],
-        caps: ANY_CAP,
-        required: &[INFLIGHT_NEGATIVE],
-        allowed: &[],
-        except_default: false,
-        why: "unary_async feeds an exchange without recording +n; one worker trips the \
-              in-flight symmetry assertion",
-    },
-    Expected {
-        audit: "O-4/H1",
-        shapes: &[Shape::AsyncFailure],
-        paths: ANY_PATH,
-        transports: ANY_TRANSPORT,
-        workers: ANY_WORKERS,
-        caps: ANY_CAP,
-        required: &[],
-        allowed: &[V1_LATE, V7_AHEAD],
-        except_default: false,
-        why: "unary_async's queued input and running tasks are invisible to progress",
-    },
-    Expected {
-        audit: "C1/C2",
-        shapes: &[
-            Shape::Exchange,
-            Shape::ExchangeTwice,
-            Shape::FanoutExchanges,
-            Shape::Distinct,
-            Shape::NotifySum,
-            Shape::Reduce,
-            Shape::Count,
-        ],
-        paths: ANY_PATH,
-        transports: ANY_TRANSPORT,
-        workers: ANY_WORKERS,
-        caps: ANY_CAP,
-        required: &[],
-        allowed: &[V1_LATE, V7_AHEAD, SPLIT, HANG, V4_EXHAUSTED],
-        except_default: true,
-        why: "records in an exchange are counted only when the producer is of the map \
-              family, and completion sums signed counts: frontiers pass records in transit",
-    },
-    Expected {
-        audit: "H10",
-        shapes: &[Shape::Broadcast],
-        paths: ANY_PATH,
-        transports: ANY_TRANSPORT,
-        workers: ANY_WORKERS,
-        caps: ANY_CAP,
-        required: &[],
-        allowed: &[V1_LATE, V7_AHEAD, HANG, V4_EXHAUSTED],
-        except_default: true,
-        why: "broadcast records are not counted in flight (a guard capability stands in)",
     },
     Expected {
         audit: "H1/P-2",
@@ -759,12 +568,303 @@ const EXPECTED_FAILURES: &[Expected] = &[
         transports: ANY_TRANSPORT,
         workers: ANY_WORKERS,
         caps: ANY_CAP,
-        required: &[],
-        allowed: &[V1_LATE, V7_AHEAD, HANG, V4_EXHAUSTED],
-        except_default: false,
+        failures: &[V1_LATE, V7_AHEAD],
         why: "pipeline queues and pending_output are invisible to progress: an input \
-              capability downgrades past records still queued downstream; a worker \
-              blocked on a full channel can spin after its peers force-close",
+              capability downgrades past records still queued downstream",
+    },
+    Expected {
+        audit: "H1/P-2",
+        shapes: &[Shape::OkErr],
+        paths: &[Path::Unfused],
+        transports: ANY_TRANSPORT,
+        workers: MULTI,
+        caps: &[Cap::One],
+        failures: &[HANG, V4_EXHAUSTED],
+        why: "a worker blocked on a full channel can spin after its peers force-close",
+    },
+    Expected {
+        audit: "C1/C2",
+        shapes: &[
+            Shape::Exchange,
+            Shape::ExchangeTwice,
+            Shape::FanoutExchanges,
+            Shape::Distinct,
+            Shape::NotifySum,
+            Shape::Reduce,
+            Shape::Count,
+        ],
+        paths: UNIFORM_AND_SIMPLE,
+        transports: ANY_TRANSPORT,
+        workers: ANY_WORKERS,
+        caps: ANY_CAP,
+        failures: &[V1_LATE, V7_AHEAD, SPLIT],
+        why: "records in an exchange are counted only when the producer is of the map \
+              family, and completion sums signed counts: frontiers pass records in transit, \
+              and per-epoch aggregates fire early",
+    },
+    Expected {
+        audit: "C1/C2",
+        shapes: &[
+            Shape::Exchange,
+            Shape::ExchangeTwice,
+            Shape::Distinct,
+            Shape::NotifySum,
+            Shape::Reduce,
+            Shape::Count,
+        ],
+        paths: &[Path::Unfused],
+        transports: ANY_TRANSPORT,
+        workers: MULTI,
+        caps: &[Cap::One],
+        failures: &[HANG, V4_EXHAUSTED],
+        why: "with one-batch channels, a worker whose peers completed early spins on a \
+              full channel",
+    },
+    Expected {
+        audit: "C2",
+        shapes: &[
+            Shape::Exchange,
+            Shape::ExchangeTwice,
+            Shape::FanoutExchanges,
+            Shape::NotifySum,
+            Shape::Reduce,
+            Shape::Count,
+            Shape::UnaryAsync,
+            Shape::IterateExchange,
+            Shape::LoopThenCount,
+        ],
+        paths: UNIFORM,
+        transports: &[Transport::Mock],
+        workers: &[Workers::One],
+        caps: ANY_CAP,
+        failures: &[INFLIGHT_NEGATIVE],
+        why: "the network pull records -n but a producer outside the map family never \
+              records +n; one worker trips the in-flight symmetry assertion",
+    },
+    Expected {
+        audit: "P-7",
+        shapes: &[
+            Shape::Exchange,
+            Shape::ExchangeTwice,
+            Shape::FanoutExchanges,
+            Shape::NotifySum,
+            Shape::Reduce,
+            Shape::Count,
+            Shape::Distinct,
+            Shape::UnaryAsync,
+            Shape::IterateExchange,
+            Shape::LoopThenCount,
+        ],
+        paths: &[Path::Simple],
+        transports: ANY_TRANSPORT,
+        workers: MULTI,
+        caps: ANY_CAP,
+        failures: &[WORKER_DIED],
+        why: "SimpleRuntime wires cross-worker exchanges but no progress channels: one \
+              worker's tracker gets -n for records whose +n another worker recorded",
+    },
+    Expected {
+        audit: "P-7",
+        shapes: &[Shape::Broadcast],
+        paths: &[Path::Simple],
+        transports: ANY_TRANSPORT,
+        workers: MULTI,
+        caps: ANY_CAP,
+        failures: &[V1_LATE, V7_AHEAD],
+        why: "SimpleRuntime has no cross-worker progress: a worker's frontier ignores \
+              records broadcast by its peers",
+    },
+    Expected {
+        audit: "H10",
+        shapes: &[Shape::Broadcast],
+        paths: UNIFORM,
+        transports: ANY_TRANSPORT,
+        workers: ANY_WORKERS,
+        caps: ANY_CAP,
+        failures: &[V1_LATE, V7_AHEAD],
+        why: "broadcast records are not counted in flight (a guard capability stands in)",
+    },
+    Expected {
+        audit: "H10",
+        shapes: &[Shape::Broadcast],
+        paths: &[Path::Unfused],
+        transports: ANY_TRANSPORT,
+        workers: MULTI,
+        caps: &[Cap::One],
+        failures: &[HANG, V4_EXHAUSTED],
+        why: "with one-batch channels the broadcast guard keeps a worker spinning",
+    },
+    Expected {
+        audit: "H12",
+        shapes: &[Shape::FanoutExchanges],
+        paths: UNIFORM,
+        transports: ANY_TRANSPORT,
+        workers: MULTI,
+        caps: ANY_CAP,
+        failures: &[HANG, V4_EXHAUSTED],
+        why: "two exchanges fed by one output share one in-flight key",
+    },
+    Expected {
+        audit: "H14",
+        shapes: ANY_SHAPE,
+        paths: &[Path::Staged],
+        transports: ANY_TRANSPORT,
+        workers: ANY_WORKERS,
+        caps: ANY_CAP,
+        failures: &[V1_LATE, V7_AHEAD],
+        why: "the staged executor's per-stage trackers see nothing across stages",
+    },
+    Expected {
+        audit: "H14",
+        shapes: &[
+            Shape::FanoutExchanges,
+            Shape::NotifySum,
+            Shape::Reduce,
+            Shape::Count,
+            Shape::Distinct,
+        ],
+        paths: &[Path::Staged],
+        transports: ANY_TRANSPORT,
+        workers: ANY_WORKERS,
+        caps: ANY_CAP,
+        failures: &[SPLIT],
+        why: "a downstream stage's notification fires before the upstream stage's records \
+              arrive",
+    },
+    Expected {
+        audit: "H14",
+        shapes: &[Shape::ExchangeTwice, Shape::IterateExchange],
+        paths: &[Path::Staged],
+        transports: ANY_TRANSPORT,
+        workers: ANY_WORKERS,
+        caps: ANY_CAP,
+        failures: &[HANG, V4_EXHAUSTED],
+        why: "a stage between two exchanges, or a loop across stages, never converges",
+    },
+    Expected {
+        audit: "H14/P-2",
+        shapes: &[
+            Shape::FanoutExchanges,
+            Shape::Distinct,
+            Shape::UnaryAsync,
+            Shape::LoopThenCount,
+        ],
+        paths: &[Path::Staged],
+        transports: ANY_TRANSPORT,
+        workers: ANY_WORKERS,
+        caps: ANY_CAP,
+        failures: &[LOSS, V4_FORCE, V7_RESIDUAL],
+        why: "a stage force-closes while records are still in its channels or tasks, and \
+              the run reports success without them",
+    },
+    Expected {
+        audit: "O-9/H11",
+        shapes: LOOPS,
+        paths: ANY_PATH,
+        transports: ANY_TRANSPORT,
+        workers: ANY_WORKERS,
+        caps: ANY_CAP,
+        failures: &[V1_LATE, V7_AHEAD],
+        why: "feedback edges are not in the reachability graph: the loop's concat sees an \
+              empty frontier on its feedback input while records circulate",
+    },
+    Expected {
+        audit: "O-9/P-2",
+        shapes: &[Shape::NestedIterate, Shape::LoopThenCount],
+        paths: &[Path::Unfused],
+        transports: ANY_TRANSPORT,
+        workers: ANY_WORKERS,
+        caps: ANY_CAP,
+        failures: &[V4_FORCE],
+        why: "a worker force-closes while loop records circulate (its tracker sees no \
+              feedback work)",
+    },
+    Expected {
+        audit: "H11",
+        shapes: &[Shape::IterateExchange],
+        paths: UNIFORM_AND_SIMPLE,
+        transports: ANY_TRANSPORT,
+        workers: ANY_WORKERS,
+        caps: ANY_CAP,
+        failures: &[SPLIT],
+        why: "a loop does not hold the outer epoch: the count after it fires while records \
+              still circulate",
+    },
+    Expected {
+        audit: "H11",
+        shapes: &[Shape::LoopThenFlush],
+        paths: ANY_PATH,
+        transports: ANY_TRANSPORT,
+        workers: ANY_WORKERS,
+        caps: &[Cap::Default],
+        failures: &[LOSS],
+        why: "a loop does not hold the outer epoch: the frontier after it empties while \
+              records still circulate, so a flush-at-empty-frontier operator flushes early",
+    },
+    Expected {
+        audit: "C2",
+        shapes: LOOPS,
+        paths: UNIFORM_AND_SIMPLE,
+        transports: ANY_TRANSPORT,
+        workers: ANY_WORKERS,
+        caps: &[Cap::One],
+        failures: &[HANG, V4_EXHAUSTED],
+        why: "a loop with one-batch channels never completes (loops hang, C2)",
+    },
+    Expected {
+        audit: "C2",
+        shapes: &[Shape::IterateExchange, Shape::LoopThenCount],
+        paths: UNIFORM_AND_SIMPLE,
+        transports: ANY_TRANSPORT,
+        workers: MULTI,
+        caps: ANY_CAP,
+        failures: &[HANG, V4_EXHAUSTED],
+        why: "a multi-worker loop with an exchange inside, or followed by one from its \
+              leave, never completes",
+    },
+    Expected {
+        audit: "O-4/H1",
+        shapes: &[Shape::UnaryAsync],
+        paths: UNIFORM_AND_SIMPLE,
+        transports: ANY_TRANSPORT,
+        workers: ANY_WORKERS,
+        caps: ANY_CAP,
+        failures: &[V1_LATE, V7_AHEAD, SPLIT],
+        why: "unary_async's queued input, running tasks and results are invisible to \
+              progress: the count after it fires early",
+    },
+    Expected {
+        audit: "O-4/P-2",
+        shapes: &[Shape::UnaryAsync],
+        paths: &[Path::Unfused],
+        transports: ANY_TRANSPORT,
+        workers: ANY_WORKERS,
+        caps: &[Cap::One],
+        failures: &[HANG, V4_FORCE, V4_EXHAUSTED],
+        why: "with one-batch channels a worker force-closes while tasks hold records, and \
+              its peers spin",
+    },
+    Expected {
+        audit: "O-4/H1",
+        shapes: &[Shape::AsyncFailure],
+        paths: UNIFORM_AND_SIMPLE,
+        transports: ANY_TRANSPORT,
+        workers: ANY_WORKERS,
+        caps: ANY_CAP,
+        failures: &[V1_LATE, V7_AHEAD],
+        why: "unary_async's queued input and running tasks are invisible to progress",
+    },
+    Expected {
+        audit: "C1",
+        shapes: &[Shape::IterateExchange],
+        paths: UNIFORM,
+        transports: &[Transport::Dedicated, Transport::Shared],
+        workers: MULTI,
+        caps: ANY_CAP,
+        failures: &[DATA_LOST, V4_FORCE],
+        why: "a node force-closes while loop records are still in flight to it (completion \
+              sums signed counts); they arrive at finished operators and the cluster fails \
+              with a data-loss error",
     },
 ];
 
@@ -1825,13 +1925,20 @@ fn classify(case: &Case, observed: &Observed, mark: u64) -> Outcome {
             None => true,
         };
         if ours {
-            failures.insert(Failure::Violation(violation.check, violation.kind));
+            failures.insert(Failure::Violation(
+                violation.check,
+                violation.kind,
+                violation.location.as_deref().map(intern),
+            ));
             if details.len() < 12 {
                 details.push(violation.to_string());
             }
         }
     }
     // Did the checker observe the run?
+    if !check::log_complete_since(mark) {
+        failures.insert(Failure::Blind("log overflowed"));
+    }
     if oracles.is_empty() {
         failures.insert(Failure::Blind("no oracle"));
     }
@@ -1851,6 +1958,217 @@ fn classify(case: &Case, observed: &Observed, mark: u64) -> Outcome {
 }
 
 // ---------------------------------------------------------------------------
+// The golden file
+// ---------------------------------------------------------------------------
+
+/// How every case fails today; a case it does not list must pass cleanly.
+/// See the module docs for how it is generated and when it may change.
+const GOLDEN_PATH: &str = concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/tests/progress_conformance.golden"
+);
+
+/// One case's line in the golden file:
+/// `<case> | <always> | <sometimes> | <audit findings>`.
+#[derive(Clone, Debug, Default, PartialEq)]
+struct Golden {
+    /// Failures every recorded run showed: the case must show each of them.
+    always: BTreeSet<Failure>,
+    /// Failures only some recorded runs showed, plus the margin (see
+    /// [`merge_observations`]): the case may show them.
+    sometimes: BTreeSet<Failure>,
+    /// The audit findings that explain the failures (from the table).
+    audits: String,
+}
+
+impl Golden {
+    /// Observed failures this line does not accept. Unless `strict`, a
+    /// per-record frontier violation is also accepted at any location where
+    /// a case of the same shape and path showed it (`frontier`).
+    fn unexpected(
+        &self,
+        observed: &BTreeSet<Failure>,
+        frontier: &BTreeSet<Failure>,
+        strict: bool,
+    ) -> Vec<Failure> {
+        observed
+            .iter()
+            .filter(|f| {
+                !self.always.contains(f)
+                    && !self.sometimes.iter().any(|s| s.accepts(**f))
+                    && (strict || !(f.is_frontier() && frontier.contains(f)))
+            })
+            .copied()
+            .collect()
+    }
+
+    /// Failures this line requires that were not observed. Unless `strict`,
+    /// per-record frontier violations are not required.
+    fn missing(&self, observed: &BTreeSet<Failure>, strict: bool) -> Vec<Failure> {
+        self.always
+            .iter()
+            .filter(|f| !observed.contains(f) && (strict || !f.is_frontier()))
+            .copied()
+            .collect()
+    }
+
+    fn failures(&self) -> impl Iterator<Item = Failure> + '_ {
+        self.always.iter().chain(&self.sometimes).copied()
+    }
+}
+
+fn parse_failures(text: &str) -> std::result::Result<BTreeSet<Failure>, String> {
+    text.split(", ")
+        .map(str::trim)
+        .filter(|f| !f.is_empty())
+        .map(Failure::parse)
+        .collect()
+}
+
+fn parse_golden(text: &str) -> std::result::Result<BTreeMap<String, Golden>, String> {
+    let mut golden = BTreeMap::new();
+    for (number, line) in text.lines().enumerate() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with("//") {
+            continue;
+        }
+        let columns: Vec<&str> = line.split('|').collect();
+        let [case, always, sometimes, audits] = columns[..] else {
+            return Err(format!("line {}: expected 4 columns: {line}", number + 1));
+        };
+        let entry = Golden {
+            always: parse_failures(always).map_err(|e| format!("line {}: {e}", number + 1))?,
+            sometimes: parse_failures(sometimes)
+                .map_err(|e| format!("line {}: {e}", number + 1))?,
+            audits: audits.trim().to_string(),
+        };
+        if golden.insert(case.trim().to_string(), entry).is_some() {
+            return Err(format!(
+                "line {}: {} is listed twice",
+                number + 1,
+                case.trim()
+            ));
+        }
+    }
+    Ok(golden)
+}
+
+fn golden() -> &'static BTreeMap<String, Golden> {
+    static GOLDEN: OnceLock<BTreeMap<String, Golden>> = OnceLock::new();
+    GOLDEN.get_or_init(|| match std::fs::read_to_string(GOLDEN_PATH) {
+        Ok(text) => parse_golden(&text).unwrap_or_else(|e| panic!("{GOLDEN_PATH}: {e}")),
+        Err(_) if recording().is_some() => BTreeMap::new(),
+        Err(e) => panic!("cannot read {GOLDEN_PATH}: {e}"),
+    })
+}
+
+/// The per-record frontier violations, with location, that any case of
+/// `case`'s shape and path shows in the golden file.
+fn frontier_locations(case: &Case) -> BTreeSet<Failure> {
+    static BY_SHAPE_AND_PATH: OnceLock<BTreeMap<(Shape, Path), BTreeSet<Failure>>> =
+        OnceLock::new();
+    let by_shape_and_path = BY_SHAPE_AND_PATH.get_or_init(|| {
+        let mut map: BTreeMap<(Shape, Path), BTreeSet<Failure>> = BTreeMap::new();
+        for other in full_matrix() {
+            if let Some(line) = golden().get(&other.to_string()) {
+                map.entry((other.shape, other.path))
+                    .or_default()
+                    .extend(line.failures().filter(|f| f.is_frontier()));
+            }
+        }
+        map
+    });
+    by_shape_and_path
+        .get(&(case.shape, case.path))
+        .cloned()
+        .unwrap_or_default()
+}
+
+/// `CONFORMANCE_STRICT=1`: judge per-record frontier violations per case,
+/// exactly like every other failure.
+fn strict() -> bool {
+    std::env::var("CONFORMANCE_STRICT").is_ok_and(|v| v != "0")
+}
+
+fn golden_for(case: &Case) -> Golden {
+    golden().get(&case.to_string()).cloned().unwrap_or_default()
+}
+
+/// The audit findings that explain `failures` in `case`, in table order.
+fn audits_for(case: &Case, failures: impl IntoIterator<Item = Failure>) -> String {
+    let failures: Vec<Failure> = failures.into_iter().collect();
+    let mut audits: Vec<&str> = Vec::new();
+    for entry in EXPECTED_FAILURES {
+        if failures.iter().any(|f| entry.explains(case, *f)) && !audits.contains(&entry.audit) {
+            audits.push(entry.audit);
+        }
+    }
+    audits.join(", ")
+}
+
+/// A V4 `exhausted-input-frontier` report, anywhere.
+const V4_EXHAUSTED_ANYWHERE: Failure =
+    Failure::Violation(Check::V4, "exhausted-input-frontier", Some("*"));
+
+/// A case's golden line from the failures each recorded run showed: those
+/// every run showed are `always`, the others `sometimes`. The one margin: a
+/// case that may hang may also report V4 `exhausted-input-frontier`
+/// anywhere, because whether that report (1 s and 256 propagations after
+/// the inputs are exhausted) beats the hang timeout is a matter of timing.
+fn merge_observations(case: &Case, runs: &[BTreeSet<Failure>]) -> Golden {
+    let mut always: BTreeSet<Failure> = runs.first().cloned().unwrap_or_default();
+    for run in runs {
+        always.retain(|f| run.contains(f));
+    }
+    let mut sometimes: BTreeSet<Failure> = runs
+        .iter()
+        .flatten()
+        .filter(|f| !always.contains(f))
+        .copied()
+        .collect();
+    if always.contains(&Failure::Hang) || sometimes.contains(&Failure::Hang) {
+        sometimes.retain(|f| !V4_EXHAUSTED_ANYWHERE.accepts(*f));
+        sometimes.insert(V4_EXHAUSTED_ANYWHERE);
+    }
+    let audits = audits_for(case, always.iter().chain(&sometimes).copied());
+    Golden {
+        always,
+        sometimes,
+        audits,
+    }
+}
+
+fn golden_line(case: &Case, golden: &Golden) -> String {
+    format!(
+        "{case} | {} | {} | {}",
+        join(&golden.always),
+        join(&golden.sometimes),
+        golden.audits
+    )
+}
+
+/// `CONFORMANCE_RECORD=<file>`: run every case once and append what it
+/// showed to `<file>`, instead of judging it.
+fn recording() -> Option<String> {
+    std::env::var("CONFORMANCE_RECORD").ok()
+}
+
+fn record_observation(path: &str, case: &Case, failures: &BTreeSet<Failure>) {
+    use std::io::Write;
+    // The `ci_*` tests run on parallel threads: one line, one write, one
+    // writer at a time.
+    static WRITER: Mutex<()> = Mutex::new(());
+    let _writer = WRITER.lock().unwrap_or_else(|e| e.into_inner());
+    let line = format!("{case} | {}\n", join(failures));
+    std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+        .and_then(|mut file| file.write_all(line.as_bytes()))
+        .unwrap_or_else(|e| panic!("cannot record to {path}: {e}"));
+}
+
+// ---------------------------------------------------------------------------
 // Running and judging cases
 // ---------------------------------------------------------------------------
 
@@ -1862,68 +2180,74 @@ fn case_lock() -> std::sync::MutexGuard<'static, ()> {
         .unwrap_or_else(|e| e.into_inner())
 }
 
-fn expected_for(case: &Case) -> (Vec<&'static Expected>, BTreeSet<Failure>, BTreeSet<Failure>) {
-    let entries: Vec<&Expected> = EXPECTED_FAILURES
-        .iter()
-        .filter(|e| e.matches(case))
-        .collect();
-    let required: BTreeSet<Failure> = entries
-        .iter()
-        .flat_map(|e| e.required.iter().copied())
-        .collect();
-    let allowed: BTreeSet<Failure> = entries
-        .iter()
-        .flat_map(|e| e.required.iter().chain(e.allowed).copied())
-        .collect();
-    (entries, required, allowed)
+/// How long a case may run: short when the golden file says it always
+/// hangs, longer when it or the table says it may, and the normal timeout
+/// otherwise.
+fn timeout_for(case: &Case, expected: &Golden) -> Duration {
+    if expected.always.contains(&Failure::Hang) {
+        HANG_TIMEOUT
+    } else if expected.sometimes.contains(&Failure::Hang)
+        || !explanations(case, Failure::Hang).is_empty()
+    {
+        MAY_HANG_TIMEOUT.min(timeout())
+    } else {
+        timeout()
+    }
 }
 
-/// The result of running one case against the table.
+/// Run `case` once and classify what it showed.
+fn observe_case(case: &Case, timeout: Duration) -> (Outcome, Duration) {
+    let _guard = case_lock();
+    check::set_mode(Mode::Report);
+    let mark = check::mark();
+    let started = std::time::Instant::now();
+    let observed = match case.transport {
+        Transport::InProcess | Transport::Mock => run_local(case, timeout),
+        Transport::Dedicated | Transport::Shared => run_cluster(case, timeout),
+    };
+    // Let late reports of a run that was cut short land in the log.
+    std::thread::sleep(Duration::from_millis(10));
+    (classify(case, &observed, mark), started.elapsed())
+}
+
+/// The result of running one case against the golden file.
 struct Verdict {
-    case: Case,
-    failures: BTreeSet<Failure>,
     ok: bool,
     message: String,
 }
 
 fn run_case(case: Case) -> Verdict {
-    let (entries, required, allowed) = expected_for(&case);
-    let timeout = if required.contains(&Failure::Hang) {
-        HANG_TIMEOUT
-    } else if allowed.contains(&Failure::Hang) {
-        MAY_HANG_TIMEOUT.min(timeout())
-    } else {
-        timeout()
-    };
-    let mut last = None;
-    for _attempt in 0..ATTEMPTS {
-        let _guard = case_lock();
-        check::set_mode(Mode::Report);
-        let mark = check::mark();
-        let started = std::time::Instant::now();
-        let observed = match case.transport {
-            Transport::InProcess | Transport::Mock => run_local(&case, timeout),
-            Transport::Dedicated | Transport::Shared => run_cluster(&case, timeout),
+    let expected = golden_for(&case);
+    let timeout = timeout_for(&case, &expected);
+    if let Some(path) = recording() {
+        let (outcome, elapsed) = observe_case(&case, timeout);
+        record_observation(&path, &case, &outcome.failures);
+        return Verdict {
+            ok: true,
+            message: format!(
+                "{case}: recorded [{}] [{:.1}s]",
+                join(&outcome.failures),
+                elapsed.as_secs_f64()
+            ),
         };
-        // Let late reports of a run that was cut short land in the log.
-        std::thread::sleep(Duration::from_millis(10));
-        let outcome = classify(&case, &observed, mark);
-        let unexpected: Vec<Failure> = outcome
-            .failures
-            .iter()
-            .filter(|f| !allowed.contains(f))
-            .copied()
-            .collect();
-        let missing: Vec<Failure> = required
-            .iter()
-            .filter(|f| !outcome.failures.contains(f))
-            .copied()
-            .collect();
+    }
+    let frontier = frontier_locations(&case);
+    let strict = strict();
+    let mut mismatches = Vec::new();
+    for attempt in 1..=ATTEMPTS {
+        let (outcome, elapsed) = observe_case(&case, timeout);
+        let unexpected = expected.unexpected(&outcome.failures, &frontier, strict);
+        let missing = expected.missing(&outcome.failures, strict);
         let ok = unexpected.is_empty() && missing.is_empty();
         let message = format!(
-            "{case}: got [{}]; expected [{}]{}{}{} [{:.1}s]\n    {}",
+            "{case}: got [{}]; golden [{}]{}{}{}{} [{:.1}s]\n    {}",
             join(&outcome.failures),
-            join(&required),
+            join(&expected.always),
+            if expected.sometimes.is_empty() {
+                String::new()
+            } else {
+                format!(" sometimes [{}]", join(&expected.sometimes))
+            },
             if unexpected.is_empty() {
                 String::new()
             } else {
@@ -1934,33 +2258,31 @@ fn run_case(case: Case) -> Verdict {
             } else {
                 format!("; DID NOT REPRODUCE [{}]", join(&missing))
             },
-            if entries.is_empty() {
+            if expected.audits.is_empty() {
                 String::new()
             } else {
-                format!(
-                    " (audit {})",
-                    entries
-                        .iter()
-                        .map(|e| e.audit)
-                        .collect::<Vec<_>>()
-                        .join(", ")
-                )
+                format!(" (audit {})", expected.audits)
             },
-            started.elapsed().as_secs_f64(),
+            elapsed.as_secs_f64(),
             outcome.details.join("\n    ")
         );
-        let done = ok || !unexpected.is_empty();
-        last = Some(Verdict {
-            case,
-            failures: outcome.failures,
-            ok,
-            message,
-        });
-        if done {
-            break;
+        if ok {
+            let message = if mismatches.is_empty() {
+                message
+            } else {
+                format!(
+                    "{message}\n    FLAKY: matched on attempt {attempt}; earlier attempts:\n    {}",
+                    mismatches.join("\n    ")
+                )
+            };
+            return Verdict { ok, message };
         }
+        mismatches.push(message);
     }
-    last.expect("at least one attempt")
+    Verdict {
+        ok: false,
+        message: mismatches.join("\n  retry: "),
+    }
 }
 
 fn join<'a>(failures: impl IntoIterator<Item = &'a Failure>) -> String {
@@ -1971,7 +2293,7 @@ fn join<'a>(failures: impl IntoIterator<Item = &'a Failure>) -> String {
         .join(", ")
 }
 
-/// Run `cases` and fail with every mismatch.
+/// Run `cases` (those matching `CONFORMANCE_FILTER`).
 fn run_matrix(cases: &[Case]) -> Vec<Verdict> {
     let filter = std::env::var("CONFORMANCE_FILTER").ok();
     let report = std::env::var("CONFORMANCE_REPORT").is_ok();
@@ -1983,7 +2305,7 @@ fn run_matrix(cases: &[Case]) -> Vec<Verdict> {
             }
         }
         let verdict = run_case(*case);
-        if report || !verdict.ok {
+        if report || !verdict.ok || verdict.message.contains("FLAKY") {
             println!(
                 "{}{}",
                 if verdict.ok { "ok   " } else { "FAIL " },
@@ -1995,12 +2317,12 @@ fn run_matrix(cases: &[Case]) -> Vec<Verdict> {
     verdicts
 }
 
-/// Fail with every case that did not match the table.
+/// Fail with every case that did not match the golden file.
 fn assert_all_matched(verdicts: &[Verdict]) {
     let failed: Vec<&Verdict> = verdicts.iter().filter(|v| !v.ok).collect();
     assert!(
         failed.is_empty(),
-        "{} of {} conformance cases did not match EXPECTED_FAILURES:\n{}",
+        "{} of {} conformance cases did not match the golden file:\n{}",
         failed.len(),
         verdicts.len(),
         failed
@@ -2008,42 +2330,6 @@ fn assert_all_matched(verdicts: &[Verdict]) {
             .map(|v| v.message.as_str())
             .collect::<Vec<_>>()
             .join("\n")
-    );
-}
-
-/// Every entry of the table must have matched a run case, and each of its
-/// required failures must have shown up in one (an entry with only allowed
-/// failures must have shown at least one of them somewhere).
-fn assert_table_exercised(verdicts: &[Verdict]) {
-    let mut unexercised = Vec::new();
-    for entry in EXPECTED_FAILURES {
-        let matched: Vec<&Verdict> = verdicts.iter().filter(|v| entry.matches(&v.case)).collect();
-        if matched.is_empty() {
-            unexercised.push(format!("{}: matches no case ({})", entry.audit, entry.why));
-            continue;
-        }
-        for failure in entry.required {
-            if !matched.iter().any(|v| v.failures.contains(failure)) {
-                unexercised.push(format!("{}: {failure} never reproduced", entry.audit));
-            }
-        }
-        if entry.required.is_empty()
-            && !matched
-                .iter()
-                .any(|v| entry.allowed.iter().any(|f| v.failures.contains(f)))
-        {
-            unexercised.push(format!(
-                "{}: none of [{}] ever reproduced ({})",
-                entry.audit,
-                join(entry.allowed),
-                entry.why
-            ));
-        }
-    }
-    assert!(
-        unexercised.is_empty(),
-        "EXPECTED_FAILURES entries not reproduced:\n{}",
-        unexercised.join("\n")
     );
 }
 
@@ -2194,35 +2480,139 @@ fn ci_every_transport() {
 #[test]
 #[ignore = "full conformance matrix; run explicitly (see module docs)"]
 fn full_conformance_matrix() {
-    let verdicts = run_matrix(&full_matrix());
-    let exercised = std::panic::catch_unwind(|| {
-        if std::env::var("CONFORMANCE_FILTER").is_err() {
-            assert_table_exercised(&verdicts);
-        }
-    });
-    assert_all_matched(&verdicts);
-    if let Err(panic) = exercised {
-        std::panic::resume_unwind(panic);
-    }
+    assert_all_matched(&run_matrix(&full_matrix()));
 }
 
-/// The table is well formed: no entry is empty, every required failure is
-/// distinct from its allowed ones.
+/// The golden file and the table agree: every case the golden file lists
+/// exists, every failure it records is explained by a table entry matching
+/// the case, its audit column is current, and every kind of failure a table
+/// entry lists occurs in some case the entry matches.
 #[test]
-fn expected_failures_table_is_well_formed() {
-    for entry in EXPECTED_FAILURES {
-        assert!(!entry.audit.is_empty() && !entry.why.is_empty());
-        assert!(
-            !entry.required.is_empty() || !entry.allowed.is_empty(),
-            "{}: an entry must list a failure",
-            entry.audit
-        );
-        for failure in entry.required {
-            assert!(
-                !entry.allowed.contains(failure),
-                "{}: {failure} is both required and allowed",
-                entry.audit
-            );
+fn golden_file_agrees_with_the_table() {
+    let golden = golden();
+    let cases: BTreeMap<String, Case> = full_matrix()
+        .into_iter()
+        .map(|case| (case.to_string(), case))
+        .collect();
+    let mut problems = Vec::new();
+    for (name, line) in golden {
+        let Some(case) = cases.get(name) else {
+            problems.push(format!("{name}: not a case of the matrix"));
+            continue;
+        };
+        for failure in line.failures() {
+            if matches!(failure, Failure::Blind(_)) {
+                problems.push(format!("{name}: records a blind run ({failure})"));
+            } else if explanations(case, failure).is_empty() {
+                problems.push(format!("{name}: no table entry explains {failure}"));
+            }
+        }
+        if let Some(both) = line.always.intersection(&line.sometimes).next() {
+            problems.push(format!("{name}: {both} is both always and sometimes"));
+        }
+        let audits = audits_for(case, line.failures());
+        if line.audits != audits {
+            problems.push(format!(
+                "{name}: audit column says [{}], the table says [{audits}]",
+                line.audits
+            ));
         }
     }
+    for entry in EXPECTED_FAILURES {
+        if entry.audit.is_empty() || entry.why.is_empty() || entry.failures.is_empty() {
+            problems.push(format!(
+                "{}: an entry needs an audit, a reason and failures",
+                entry.audit
+            ));
+        }
+        for kind in entry.failures {
+            let occurs = golden.iter().any(|(name, line)| {
+                cases.get(name).is_some_and(|case| entry.matches(case))
+                    && line.failures().any(|f| f.kind() == *kind)
+            });
+            if !occurs {
+                problems.push(format!(
+                    "{}: lists {kind}, which no case it matches shows ({})",
+                    entry.audit, entry.why
+                ));
+            }
+        }
+    }
+    assert!(
+        problems.is_empty(),
+        "the golden file ({GOLDEN_PATH}) and EXPECTED_FAILURES disagree:\n{}",
+        problems.join("\n")
+    );
+}
+
+/// Regenerate the golden file from recorded runs. See the module docs.
+#[test]
+#[ignore = "regenerates the golden file from recorded runs (see module docs)"]
+fn regenerate_golden_file() {
+    let inputs = std::env::var("CONFORMANCE_GOLDEN_INPUTS")
+        .expect("set CONFORMANCE_GOLDEN_INPUTS to the recorded runs, separated by ';'");
+    let mut runs: BTreeMap<String, Vec<BTreeSet<Failure>>> = BTreeMap::new();
+    for path in inputs.split(';').map(str::trim).filter(|p| !p.is_empty()) {
+        let text =
+            std::fs::read_to_string(path).unwrap_or_else(|e| panic!("cannot read {path}: {e}"));
+        for line in text.lines().filter(|l| !l.trim().is_empty()) {
+            let (case, failures) = line
+                .split_once('|')
+                .unwrap_or_else(|| panic!("{path}: not a recorded case: {line}"));
+            let failures = parse_failures(failures).unwrap_or_else(|e| panic!("{path}: {e}"));
+            runs.entry(case.trim().to_string())
+                .or_default()
+                .push(failures);
+        }
+    }
+    let mut problems = Vec::new();
+    let mut lines = vec![
+        "// How every case of tests/progress_conformance.rs fails today. Cases not".to_string(),
+        "// listed must pass cleanly. Generated by `regenerate_golden_file` from".to_string(),
+        "// recorded runs; do not edit by hand (see the module docs of".to_string(),
+        "// progress_conformance.rs). Every change to this file must cite, in its".to_string(),
+        "// commit message, the audit finding that explains it.".to_string(),
+        "//".to_string(),
+        "// <case> | <failures every recorded run showed> | <failures some runs".to_string(),
+        "// showed, plus the margin> | <audit findings>".to_string(),
+    ];
+    let (mut exact, mut variable, mut clean) = (0, 0, 0);
+    for case in full_matrix() {
+        let name = case.to_string();
+        let Some(observations) = runs.remove(&name) else {
+            problems.push(format!("{name}: never recorded"));
+            continue;
+        };
+        let line = merge_observations(&case, &observations);
+        for failure in line.failures() {
+            if matches!(failure, Failure::Blind(_)) {
+                problems.push(format!("{name}: a recorded run was blind ({failure})"));
+            } else if explanations(&case, failure).is_empty() {
+                problems.push(format!("{name}: no table entry explains {failure}"));
+            }
+        }
+        if line.always.is_empty() && line.sometimes.is_empty() {
+            clean += 1;
+            continue;
+        }
+        if line.sometimes.is_empty() {
+            exact += 1;
+        } else {
+            variable += 1;
+        }
+        lines.push(golden_line(&case, &line));
+    }
+    for name in runs.keys() {
+        problems.push(format!("{name}: recorded, but not a case of the matrix"));
+    }
+    assert!(
+        problems.is_empty(),
+        "cannot regenerate the golden file:\n{}",
+        problems.join("\n")
+    );
+    std::fs::write(GOLDEN_PATH, lines.join("\n") + "\n").expect("write the golden file");
+    println!(
+        "wrote {GOLDEN_PATH}: {clean} cases clean, {exact} failing the same way in every \
+         run, {variable} varying"
+    );
 }

@@ -61,10 +61,17 @@
 //!
 //! [`set_mode`] overrides the variable for the whole process.
 //!
+//! Each violation names the operator port it is about
+//! ([`Violation::location`]). The same kind of violation is logged at most
+//! four times per location and dataflow; after that, a location's per-record
+//! frontier violations (V1 `late-data`, V7 `frontier-ahead-of-work`) are no
+//! longer described, which keeps a dataflow that breaks an invariant on every
+//! record cheap to check without hiding violations at other locations.
+//!
 //! Known limits: the `OutputHandle` buffer and data inside a user closure are
-//! transient within one activation and are not measured; a capability whose
-//! reporter is not attached to a tracker (inside `iterate`, see audit H11) is
-//! invisible to the capability count.
+//! transient within one activation and are not measured. An oracle checks
+//! one process: a cluster whose nodes run in different processes is checked
+//! by none (see `REGISTRATION_GRACE`).
 
 use std::any::Any;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
@@ -134,13 +141,22 @@ pub struct Violation {
     pub dataflow: Option<DataflowId>,
     /// The worker whose view or store is involved, when known.
     pub worker: Option<usize>,
+    /// The operator port the violation is about, as `name[in i]` or
+    /// `name[out i]` (operator names that occur more than once in a
+    /// dataflow get a `(k)` suffix, in operator order). `None` for
+    /// violations about a whole worker or dataflow.
+    pub location: Option<String>,
     /// Human-readable details.
     pub detail: String,
 }
 
 impl fmt::Display for Violation {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "[{} {}]", self.check, self.kind)?;
+        write!(f, "[{} {}", self.check, self.kind)?;
+        if let Some(location) = &self.location {
+            write!(f, " @ {location}")?;
+        }
+        f.write_str("]")?;
         if let Some(id) = self.dataflow {
             write!(f, " {id}")?;
         }
@@ -230,13 +246,16 @@ pub fn mark() -> u64 {
     SEQ.load(Ordering::Relaxed)
 }
 
-/// Upper bound on the log's length; later entries are counted, not kept.
+/// Upper bound on the log's length; when it is full, the oldest entry is
+/// evicted (and counted in [`dropped_violations`]).
 const LOG_CAPACITY: usize = 100_000;
 
 #[derive(Default)]
 struct Log {
-    entries: Vec<Violation>,
+    entries: std::collections::VecDeque<Violation>,
     dropped: u64,
+    /// The sequence number of the newest evicted entry.
+    evicted_through: u64,
 }
 
 fn log() -> MutexGuard<'static, Log> {
@@ -246,9 +265,9 @@ fn log() -> MutexGuard<'static, Log> {
         .unwrap_or_else(|e| e.into_inner())
 }
 
-/// Every violation recorded so far in this process.
+/// Every violation recorded so far in this process (and still in the log).
 pub fn violations() -> Vec<Violation> {
-    log().entries.clone()
+    log().entries.iter().cloned().collect()
 }
 
 /// The violations recorded at or after `mark`.
@@ -271,9 +290,15 @@ pub fn violations_for(dataflow: DataflowId) -> Vec<Violation> {
         .collect()
 }
 
-/// Number of violations not kept because the log was full.
+/// Number of violations evicted from the log because it was full.
 pub fn dropped_violations() -> u64 {
     log().dropped
+}
+
+/// Whether the log still holds every violation recorded at or after
+/// `mark` (none of them was evicted).
+pub fn log_complete_since(mark: u64) -> bool {
+    log().evicted_through < mark
 }
 
 /// Record a violation (a V5 report is recorded but never panics).
@@ -282,6 +307,7 @@ pub(crate) fn record(
     kind: &'static str,
     dataflow: Option<DataflowId>,
     worker: Option<usize>,
+    location: Option<String>,
     detail: String,
 ) {
     let mode = mode();
@@ -294,6 +320,7 @@ pub(crate) fn record(
         kind,
         dataflow,
         worker,
+        location,
         detail,
     };
     #[cfg(feature = "tracing")]
@@ -304,11 +331,13 @@ pub(crate) fn record(
     let message = (mode == Mode::Panic && !check.is_report()).then(|| violation.to_string());
     {
         let mut log = log();
-        if log.entries.len() < LOG_CAPACITY {
-            log.entries.push(violation);
-        } else {
-            log.dropped += 1;
+        if log.entries.len() >= LOG_CAPACITY {
+            if let Some(evicted) = log.entries.pop_front() {
+                log.evicted_through = evicted.seq;
+                log.dropped += 1;
+            }
         }
+        log.entries.push_back(violation);
     }
     if let Some(message) = message {
         panic!("instancy progress check failed: {message}");
@@ -361,13 +390,14 @@ pub struct OracleStats {
     /// Why checking stopped early (cancellation or failure), if it did.
     pub halted: Option<String>,
     /// Violations found but not logged because the same kind was already
-    /// logged several times for this dataflow. A lower bound: once a kind of
-    /// V1 or V7 violation has been logged that often, its check is skipped.
+    /// logged several times at the same location in this dataflow. A lower
+    /// bound: once a location's V1 or V7 frontier violations have been logged
+    /// that often, they are no longer described.
     pub suppressed: u64,
 }
 
-fn finished_stats() -> MutexGuard<'static, Vec<OracleStats>> {
-    static FINISHED: OnceLock<Mutex<Vec<OracleStats>>> = OnceLock::new();
+fn finished_stats() -> MutexGuard<'static, std::collections::VecDeque<OracleStats>> {
+    static FINISHED: OnceLock<Mutex<std::collections::VecDeque<OracleStats>>> = OnceLock::new();
     FINISHED
         .get_or_init(Default::default)
         .lock()
@@ -401,6 +431,9 @@ pub fn oracles_since(mark: u64) -> Vec<OracleStats> {
 
 /// An operator port: `(operator index, port index)`.
 pub(crate) type Loc = (usize, usize);
+
+/// Where a violation is: an operator port, and whether it is an output.
+type Site = (Loc, bool);
 
 /// Which worker's instance a unit of work belongs to: `Some(worker)` for an
 /// operator's own stores, its capabilities and worker-local (pipeline)
@@ -660,8 +693,8 @@ pub(crate) fn oracle<T: Timestamp>(id: DataflowId, total_workers: usize) -> Opti
 // The oracle
 // ---------------------------------------------------------------------------
 
-/// How many violations of one kind are logged per dataflow; the rest are
-/// counted in [`OracleStats::suppressed`].
+/// How many violations of one kind are logged per location and dataflow;
+/// the rest are counted in [`OracleStats::suppressed`].
 const LOGGED_PER_KIND: u64 = 4;
 
 /// A view may keep a non-empty frontier at a fully exhausted input for at
@@ -758,20 +791,48 @@ struct State<T: Timestamp> {
     consumers: LocMap<usize>,
     exhausted: LocMap<usize>,
     negative_reported: BTreeSet<(Store, Loc)>,
-    logged: HashMap<(Check, &'static str), u64>,
+    /// Violations logged, per kind and location.
+    logged: HashMap<(Check, &'static str, Option<Site>), u64>,
+    /// The same, for the per-record frontier checks (V1 `late-data` and V7
+    /// `frontier-ahead-of-work`), keyed without the kind for speed.
+    site_logged: SiteCounts,
+    /// Operator names, for violation locations.
+    names: HashMap<usize, String>,
     stats: OracleStats,
 }
 
-impl<T: Timestamp> State<T> {
-    /// Whether this kind of violation has been logged as often as it ever
-    /// will be for this dataflow. Its check is then skipped: a dataflow that
-    /// breaks an invariant on every record (every loop does today, audit
-    /// O-9) would otherwise spend its time describing violations nobody
-    /// reads.
-    fn saturated(&self, check: Check, kind: &'static str) -> bool {
-        self.logged
-            .get(&(check, kind))
-            .is_some_and(|n| *n >= LOGGED_PER_KIND)
+type SiteCounts = HashMap<(Check, Site), u64, FastHash>;
+
+/// Which per-record frontier violations may still be described: a location
+/// whose violations were logged [`LOGGED_PER_KIND`] times is not described
+/// again, and one check does not describe a location more often than that
+/// either. A dataflow that breaks an invariant on every record (every loop
+/// does today, audit O-9) would otherwise spend its time describing
+/// violations nobody reads, while one location's violations never hide
+/// another's.
+struct Budget<'a> {
+    logged: &'a SiteCounts,
+    pending: SiteCounts,
+}
+
+impl<'a> Budget<'a> {
+    fn new(logged: &'a SiteCounts) -> Self {
+        Self {
+            logged,
+            pending: SiteCounts::default(),
+        }
+    }
+
+    /// Whether one more violation of `check` at `site` may be described.
+    fn take(&mut self, check: Check, site: Site) -> bool {
+        let key = (check, site);
+        let logged = self.logged.get(&key).copied().unwrap_or(0);
+        let pending = self.pending.entry(key).or_insert(0);
+        if logged + *pending >= LOGGED_PER_KIND {
+            return false;
+        }
+        *pending += 1;
+        true
     }
 }
 
@@ -780,7 +841,25 @@ struct Found {
     check: Check,
     kind: &'static str,
     worker: Option<usize>,
+    site: Option<Site>,
     detail: String,
+}
+
+/// The kinds counted in [`State::site_logged`].
+fn per_record(check: Check, kind: &'static str) -> bool {
+    matches!(
+        (check, kind),
+        (Check::V1, "late-data") | (Check::V7, "frontier-ahead-of-work")
+    )
+}
+
+/// `name[in i]` or `name[out i]`.
+fn site_name(names: &HashMap<usize, String>, ((op, port), output): Site) -> String {
+    let direction = if output { "out" } else { "in" };
+    match names.get(&op) {
+        Some(name) => format!("{name}[{direction} {port}]"),
+        None => format!("op{op}[{direction} {port}]"),
+    }
 }
 
 /// The V7 oracle for one dataflow, typed by its root timestamp.
@@ -814,6 +893,8 @@ impl<T: Timestamp> Oracle<T> {
                 exhausted: LocMap::default(),
                 negative_reported: BTreeSet::new(),
                 logged: HashMap::new(),
+                site_logged: SiteCounts::default(),
+                names: HashMap::new(),
                 stats,
             }),
         }
@@ -845,27 +926,61 @@ impl<T: Timestamp> Oracle<T> {
     }
 
     /// Record findings (after the state lock is released), at most
-    /// [`LOGGED_PER_KIND`] per kind.
+    /// [`LOGGED_PER_KIND`] per kind and location.
     fn emit(&self, found: Vec<Found>) {
         if found.is_empty() {
             return;
         }
-        let keep: Vec<Found> = {
+        let keep: Vec<(Found, Option<String>)> = {
             let mut state = self.lock();
+            let state = &mut *state;
             let mut keep = Vec::new();
             for f in found {
-                let logged = state.logged.entry((f.check, f.kind)).or_insert(0);
+                let logged = state.logged.entry((f.check, f.kind, f.site)).or_insert(0);
                 if *logged < LOGGED_PER_KIND {
                     *logged += 1;
-                    keep.push(f);
+                    if let Some(site) = f.site {
+                        if per_record(f.check, f.kind) {
+                            *state.site_logged.entry((f.check, site)).or_insert(0) += 1;
+                        }
+                    }
+                    let location = f.site.map(|site| site_name(&state.names, site));
+                    keep.push((f, location));
                 } else {
                     state.stats.suppressed += 1;
                 }
             }
             keep
         };
-        for f in keep {
-            record(f.check, f.kind, self.id, f.worker, f.detail);
+        for (f, location) in keep {
+            record(f.check, f.kind, self.id, f.worker, location, f.detail);
+        }
+    }
+
+    /// Name the dataflow's operators (for violation locations). The first
+    /// registration wins: every worker registers the same graph. Names that
+    /// occur more than once get a `(k)` suffix, numbered in operator order.
+    pub(crate) fn register_names(&self, operators: impl IntoIterator<Item = (usize, String)>) {
+        let mut state = self.lock();
+        if !state.names.is_empty() {
+            return;
+        }
+        let mut operators: Vec<(usize, String)> = operators.into_iter().collect();
+        operators.sort();
+        let mut occurrences: HashMap<String, usize> = HashMap::new();
+        for (_, name) in &operators {
+            *occurrences.entry(name.clone()).or_insert(0) += 1;
+        }
+        let mut seen: HashMap<String, usize> = HashMap::new();
+        for (index, name) in operators {
+            let unique = if occurrences[&name] > 1 {
+                let k = seen.entry(name.clone()).or_insert(0);
+                *k += 1;
+                format!("{name}({k})")
+            } else {
+                name
+            };
+            state.names.insert(index, unique);
         }
     }
 
@@ -958,15 +1073,25 @@ impl<T: Timestamp> Oracle<T> {
             if self.partial(state) || state.halted.is_some() {
                 return;
             }
-            if scan && !state.saturated(Check::V7, "frontier-ahead-of-work") {
+            if scan {
                 let v = &state.views[&view];
+                let mut budget = Budget::new(&state.site_logged);
                 for ((store, loc, owner), times) in &state.counts {
                     if !v.sees(*owner) {
                         continue;
                     }
                     for (time, &n) in times {
                         if n > 0 {
-                            check_one(v, &state.out_edges, *store, *loc, time, n, &mut found);
+                            check_one(
+                                v,
+                                &state.out_edges,
+                                &mut budget,
+                                *store,
+                                *loc,
+                                time,
+                                n,
+                                &mut found,
+                            );
                         }
                     }
                 }
@@ -1009,6 +1134,7 @@ impl<T: Timestamp> Oracle<T> {
                             check: Check::V4,
                             kind: "exhausted-input-frontier",
                             worker: Some(v.worker),
+                            site: Some((loc, false)),
                             detail: format!(
                                 "every channel into input {loc:?} is exhausted, but the {} \
                                  view still has frontier {:?} there after {EXHAUSTED_GRACE} \
@@ -1057,6 +1183,7 @@ impl<T: Timestamp> Oracle<T> {
                     check: Check::V4,
                     kind: "force-close-with-work",
                     worker: Some(v.worker),
+                    site: None,
                     detail: format!(
                         "its {} reports completion and it force-closes its operators while \
                          work is outstanding: {}",
@@ -1184,6 +1311,7 @@ impl<T: Timestamp> Oracle<T> {
                 check: Check::V7,
                 kind: "negative-occupancy",
                 worker: Some(worker),
+                site: Some((loc, store.at_output())),
                 detail: format!(
                     "{store:?} at {loc:?}@{time:?}{} went to {now}: work left a store \
                      without entering it, so some producer or store is not observed",
@@ -1191,9 +1319,19 @@ impl<T: Timestamp> Oracle<T> {
                 ),
             });
         }
-        if diff > 0 && now > 0 && !state.saturated(Check::V7, "frontier-ahead-of-work") {
+        if diff > 0 && now > 0 {
+            let mut budget = Budget::new(&state.site_logged);
             for v in state.views.values().filter(|v| v.sees(owner)) {
-                check_one(v, &state.out_edges, store, loc, time, now, found);
+                check_one(
+                    v,
+                    &state.out_edges,
+                    &mut budget,
+                    store,
+                    loc,
+                    time,
+                    now,
+                    found,
+                );
             }
         }
     }
@@ -1217,20 +1355,17 @@ impl<T: Timestamp> Oracle<T> {
             if state.halted.is_some() {
                 return;
             }
-            let check_v1 = !state.saturated(Check::V1, "late-data");
-            for v in state
-                .views
-                .values()
-                .filter(|v| check_v1 && v.worker == worker)
-            {
+            let mut budget = Budget::new(&state.site_logged);
+            for v in state.views.values().filter(|v| v.worker == worker) {
                 let Some(frontier) = v.targets.get(&loc) else {
                     continue;
                 };
-                if !frontier.less_equal(time) {
+                if !frontier.less_equal(time) && budget.take(Check::V1, (loc, false)) {
                     found.push(Found {
                         check: Check::V1,
                         kind: "late-data",
                         worker: Some(worker),
+                        site: Some((loc, false)),
                         detail: format!(
                             "consumed {n} record(s) at input {loc:?}@{time:?} behind this \
                              worker's {} frontier {:?}",
@@ -1277,6 +1412,7 @@ fn residual<T: Timestamp>(store: Store, loc: Loc, owner: Owner, time: &T, n: i64
         check,
         kind,
         worker: owner,
+        site: Some((loc, store.at_output())),
         detail: format!(
             "reported success with {n} unit(s) left in {store:?} at {loc:?}@{time:?}{}: {what}",
             owner_suffix(owner)
@@ -1301,20 +1437,28 @@ fn view_covers<T: Timestamp>(
 }
 
 /// Check one unit of work against one view (V7).
+#[allow(clippy::too_many_arguments)]
 fn check_one<T: Timestamp>(
     v: &View<T>,
     out_edges: &LocMap<BTreeSet<Loc>>,
+    budget: &mut Budget<'_>,
     store: Store,
     loc: Loc,
     time: &T,
     n: i64,
     found: &mut Vec<Found>,
 ) {
-    let mut fail = |at: String, frontier: &Antichain<T>| {
+    let mut fail = |site: Site, frontier: &Antichain<T>| {
+        if !budget.take(Check::V7, site) {
+            return;
+        }
+        let ((op, port), output) = site;
+        let at = format!("{} ({op}, {port})", if output { "output" } else { "input" });
         found.push(Found {
             check: Check::V7,
             kind: "frontier-ahead-of-work",
             worker: Some(v.worker),
+            site: Some(site),
             detail: format!(
                 "{n} unit(s) in {store:?} at {loc:?}@{time:?}, but worker {}'s {} frontier at \
                  {at} is {:?}",
@@ -1328,7 +1472,7 @@ fn check_one<T: Timestamp>(
         Store::Capability => {
             if let Some(frontier) = v.sources.get(&loc) {
                 if !frontier.less_equal(time) {
-                    fail(format!("output {loc:?}"), frontier);
+                    fail((loc, true), frontier);
                 }
             }
         }
@@ -1337,7 +1481,7 @@ fn check_one<T: Timestamp>(
                 for target in targets {
                     if let Some(frontier) = v.targets.get(target) {
                         if !frontier.less_equal(time) {
-                            fail(format!("input {target:?}"), frontier);
+                            fail((*target, false), frontier);
                         }
                     }
                 }
@@ -1346,7 +1490,7 @@ fn check_one<T: Timestamp>(
         _ => {
             if let Some(frontier) = v.targets.get(&loc) {
                 if !frontier.less_equal(time) {
-                    fail(format!("input {loc:?}"), frontier);
+                    fail((loc, false), frontier);
                 }
             }
         }
@@ -1408,6 +1552,7 @@ impl<T: Timestamp> Sink for Oracle<T> {
             check: Check::V7,
             kind: "coverage-gap",
             worker,
+            site: None,
             detail: what,
         }]);
     }
@@ -1426,9 +1571,9 @@ impl<T: Timestamp> Drop for Oracle<T> {
             .unwrap_or_else(|e| e.into_inner().stats.clone());
         let mut finished = finished_stats();
         if finished.len() >= LOG_CAPACITY {
-            finished.remove(0);
+            finished.pop_front();
         }
-        finished.push(stats);
+        finished.push_back(stats);
     }
 }
 
@@ -1489,6 +1634,7 @@ impl<T: Timestamp> TrackerCheck<T> {
                 "residual",
                 self.oracle.id,
                 Some(self.worker),
+                None,
                 format!(
                     "finished with {total} non-zero count(s) in its view (negative: a missing +n; \
                      positive: a leak): {}",
@@ -1919,5 +2065,117 @@ mod tests {
             .filter(|v| v.kind == "exhausted-input-frontier")
             .count();
         assert_eq!(reported, 1);
+    }
+    /// A location whose violations stop being described (it broke an
+    /// invariant on every record) does not hide another location's.
+    #[test]
+    fn a_saturated_location_does_not_hide_another() {
+        let id = DataflowId::new();
+        let oracle = oracle::<u64>(id, 1).expect("checking is on in tests");
+        oracle.register_worker(0);
+        oracle.register_channel((1, 0), (2, 0));
+        oracle.register_channel((2, 0), (3, 0));
+        oracle.register_names([(1, "a".into()), (2, "b".into()), (3, "c".into())]);
+        let view = oracle.attach_view(0, "worker tracker");
+        // Every record into b is behind b's frontier.
+        oracle.publish(
+            view,
+            true,
+            [((2, 0), frontier(10)), ((3, 0), frontier(0))],
+            [],
+        );
+        for _ in 0..100 {
+            oracle.count(Store::Channel, (2, 0), None, &1, 1, 0);
+            oracle.consumed((2, 0), None, &1, 1, 0);
+        }
+        // Then one record behind c's frontier.
+        oracle.publish(view, true, [((3, 0), frontier(10))], []);
+        oracle.count(Store::Channel, (3, 0), None, &1, 1, 0);
+        let logged = |check: Check, location: &str| {
+            violations_for(id)
+                .iter()
+                .filter(|v| v.check == check && v.location.as_deref() == Some(location))
+                .count() as u64
+        };
+        assert_eq!(logged(Check::V7, "b[in 0]"), LOGGED_PER_KIND);
+        assert_eq!(logged(Check::V1, "b[in 0]"), LOGGED_PER_KIND);
+        assert_eq!(logged(Check::V7, "c[in 0]"), 1);
+    }
+
+    /// Work held while frontiers stay put is found once a frontier it is
+    /// checked against advances past it, whichever store holds it.
+    #[test]
+    fn a_frontier_advancing_past_held_work_is_found() {
+        let id = DataflowId::new();
+        let oracle = oracle::<u64>(id, 1).expect("checking is on in tests");
+        oracle.register_worker(0);
+        oracle.register_channel((1, 0), (2, 0));
+        oracle.register_channel((1, 0), (3, 0));
+        oracle.register_names([(1, "a".into()), (2, "b".into()), (3, "c".into())]);
+        let view = oracle.attach_view(0, "worker tracker");
+        let publish = |b: u64, c: u64, a: u64| {
+            oracle.publish(
+                view,
+                true,
+                [((2, 0), frontier(b)), ((3, 0), frontier(c))],
+                [((1, 0), frontier(a))],
+            );
+        };
+        publish(0, 0, 0);
+        oracle.count(Store::InputBuffer, (2, 0), Some(0), &1, 1, 0);
+        oracle.count(Store::PendingOutput, (1, 0), Some(0), &1, 1, 0);
+        oracle.count(Store::Capability, (1, 0), Some(0), &1, 1, 0);
+        let locations = || -> Vec<String> {
+            let locations: BTreeSet<String> = violations_for(id)
+                .iter()
+                .filter_map(|v| v.location.clone())
+                .collect();
+            locations.into_iter().collect()
+        };
+        publish(0, 0, 0);
+        assert!(locations().is_empty(), "{:?}", locations());
+        // c's frontier passes the pending output bound for it.
+        publish(0, 5, 0);
+        assert_eq!(locations(), ["c[in 0]"]);
+        // b's passes the buffered input and the pending output.
+        publish(5, 5, 0);
+        assert_eq!(locations(), ["b[in 0]", "c[in 0]"]);
+        // a's output frontier passes its capability.
+        publish(5, 5, 5);
+        assert_eq!(locations(), ["a[out 0]", "b[in 0]", "c[in 0]"]);
+    }
+
+    /// Operator names that occur more than once are numbered in operator
+    /// order; an unnamed operator is named by its index.
+    #[test]
+    fn violation_locations_name_operators() {
+        let id = DataflowId::new();
+        let oracle = oracle::<u64>(id, 1).expect("checking is on in tests");
+        oracle.register_worker(0);
+        oracle.register_names([(7, "x".into()), (3, "x".into()), (5, "y".into())]);
+        let view = oracle.attach_view(0, "worker tracker");
+        oracle.publish(
+            view,
+            true,
+            [
+                ((3, 0), frontier(5)),
+                ((7, 1), frontier(5)),
+                ((9, 0), frontier(5)),
+            ],
+            [((5, 0), frontier(5))],
+        );
+        for loc in [(3, 0), (7, 1), (9, 0)] {
+            oracle.count(Store::Channel, loc, None, &1, 1, 0);
+        }
+        oracle.count(Store::Capability, (5, 0), Some(0), &1, 1, 0);
+        let locations: BTreeSet<String> = violations_for(id)
+            .into_iter()
+            .filter_map(|v| v.location)
+            .collect();
+        let expected: BTreeSet<String> = ["x(1)[in 0]", "x(2)[in 1]", "op9[in 0]", "y[out 0]"]
+            .into_iter()
+            .map(String::from)
+            .collect();
+        assert_eq!(locations, expected);
     }
 }

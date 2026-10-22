@@ -19,10 +19,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   behaviour with `INSTANCY_PROGRESS_CHECK` (`report`, the default; `verbose`;
   `panic`; `off`). It never changes how a dataflow runs.
 - Add a progress conformance matrix (`tests/progress_conformance.rs`, a
-  bounded subset in CI) and the correctness audit's repro tests
-  (`tests/audit_repros.rs`, on demand), with today's known failures recorded
-  by audit finding; a protocol property test checks the real reachability
-  tracker under random interleavings and catches four protocol mutants.
+  bounded subset in CI) whose golden file records exactly how each case fails
+  today, by operator port, explained by audit finding; and the correctness
+  audit's repro tests (`tests/audit_repros.rs`, on demand). A protocol
+  property test checks the real reachability tracker under random
+  interleavings and catches four protocol mutants, and a two-worker tracker
+  test checks that in-flight counts hold every worker's frontier.
+- Each violation the checker records (`Violation::location`) names the
+  operator port it is about, and the checker's log keeps the newest
+  violations when it is full (`log_complete_since`).
 
 ### Exchange and broadcast retry fixes
 
