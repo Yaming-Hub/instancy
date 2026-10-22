@@ -452,6 +452,7 @@ const V7_AHEAD: Failure = Failure::Violation(Check::V7, "frontier-ahead-of-work"
 const V7_RESIDUAL: Failure = Failure::Violation(Check::V7, "end-state-residual", None);
 const V4_FORCE: Failure = Failure::Violation(Check::V4, "force-close-with-work", None);
 const V4_EXHAUSTED: Failure = Failure::Violation(Check::V4, "exhausted-input-frontier", None);
+const V4_HOLDING: Failure = Failure::Violation(Check::V4, "finished-holding-capability", None);
 const HANG: Failure = Failure::Hang;
 const LOSS: Failure = Failure::Loss;
 const SPLIT: Failure = Failure::Split;
@@ -722,6 +723,8 @@ const EXPECTED_FAILURES: &[Expected] = &[
             Shape::Reduce,
             Shape::Count,
             Shape::Distinct,
+            Shape::UnaryAsync,
+            Shape::LoopThenCount,
         ],
         paths: &[Path::Staged],
         transports: ANY_TRANSPORT,
@@ -729,7 +732,7 @@ const EXPECTED_FAILURES: &[Expected] = &[
         caps: ANY_CAP,
         failures: &[SPLIT],
         why: "a downstream stage's notification fires before the upstream stage's records \
-              arrive",
+              arrive (UnaryAsync and LoopThenCount: when pinned to one or two cores)",
     },
     Expected {
         audit: "H14",
@@ -770,14 +773,14 @@ const EXPECTED_FAILURES: &[Expected] = &[
     },
     Expected {
         audit: "O-9/P-2",
-        shapes: &[Shape::NestedIterate, Shape::LoopThenCount],
+        shapes: LOOPS,
         paths: &[Path::Unfused],
         transports: ANY_TRANSPORT,
         workers: ANY_WORKERS,
         caps: ANY_CAP,
         failures: &[V4_FORCE],
         why: "a worker force-closes while loop records circulate (its tracker sees no \
-              feedback work)",
+              feedback work); Iterate and LoopThenFlush only when pinned to one or two cores",
     },
     Expected {
         audit: "H11",
@@ -845,6 +848,27 @@ const EXPECTED_FAILURES: &[Expected] = &[
               its peers spin",
     },
     Expected {
+        audit: "O-4/P-2",
+        shapes: &[Shape::UnaryAsync],
+        paths: &[Path::Fused],
+        transports: ANY_TRANSPORT,
+        workers: MULTI,
+        caps: &[Cap::One],
+        failures: &[V4_FORCE],
+        why: "as above, fused (seen pinned to one core)",
+    },
+    Expected {
+        audit: "O-4/P-2",
+        shapes: &[Shape::AsyncFailure],
+        paths: &[Path::Unfused],
+        transports: ANY_TRANSPORT,
+        workers: MULTI,
+        caps: &[Cap::One],
+        failures: &[HANG, V4_EXHAUSTED],
+        why: "with one-batch channels a worker spins while unary_async holds records, and \
+              the failure never ends the run (seen pinned to two cores)",
+    },
+    Expected {
         audit: "O-4/H1",
         shapes: &[Shape::AsyncFailure],
         paths: UNIFORM_AND_SIMPLE,
@@ -861,10 +885,11 @@ const EXPECTED_FAILURES: &[Expected] = &[
         transports: &[Transport::Dedicated, Transport::Shared],
         workers: MULTI,
         caps: ANY_CAP,
-        failures: &[DATA_LOST, V4_FORCE],
+        failures: &[DATA_LOST, V4_FORCE, V4_HOLDING],
         why: "a node force-closes while loop records are still in flight to it (completion \
               sums signed counts); they arrive at finished operators and the cluster fails \
-              with a data-loss error",
+              with a data-loss error, or the node finishes holding the count's per-epoch \
+              capabilities (pinned to one core)",
     },
 ];
 
