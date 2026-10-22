@@ -801,6 +801,26 @@ impl<T: Timestamp> Tracker<T> {
             .frontier()
     }
 
+    /// Every pointstamp with a non-zero count in this view (for the progress
+    /// checker's residual report).
+    #[cfg(any(debug_assertions, feature = "progress-check"))]
+    pub(crate) fn nonzero_pointstamps(&self) -> Vec<(Location, T, i64)> {
+        let mut out = Vec::new();
+        for (node, per_op) in self.per_operator.iter().enumerate() {
+            for (port, info) in per_op.targets.iter().enumerate() {
+                for (time, count) in info.pointstamps.nonzero_counts() {
+                    out.push((Location::target(node, port), time, count));
+                }
+            }
+            for (port, info) in per_op.sources.iter().enumerate() {
+                for (time, count) in info.pointstamps.nonzero_counts() {
+                    out.push((Location::source(node, port), time, count));
+                }
+            }
+        }
+        out
+    }
+
     // -- internal --
 
     /// Drains pending target/source changes into pointstamps and seeds the worklist.

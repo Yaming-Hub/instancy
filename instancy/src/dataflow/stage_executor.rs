@@ -139,9 +139,16 @@ pub(crate) fn materialize_stage_executor<T: Timestamp>(
     boundary_output_pushers: HashMap<usize, Vec<(usize, Box<dyn Any + Send>)>>,
     external_inputs_open: Arc<AtomicUsize>,
     feedback_deps: Arc<AtomicUsize>,
+    check: crate::progress::CheckCtx,
 ) -> Result<StageExecutor<T>> {
     let stage_operator_set: HashSet<usize> = stage_operator_indices.iter().copied().collect();
     subgraph_builder.retain_operators(&stage_operator_set);
+    #[cfg(any(debug_assertions, feature = "progress-check"))]
+    let check_oracle = check.as_ref().and_then(|ctx| ctx.oracle::<T>());
+    #[cfg(any(debug_assertions, feature = "progress-check"))]
+    if let Some(oracle) = &check_oracle {
+        subgraph_builder.attach_check_reporters(oracle, worker_index);
+    }
 
     let intra_stage_edges: Vec<(usize, &crate::dataflow::graph::EdgeInfo)> = graph
         .edges()
@@ -171,7 +178,7 @@ pub(crate) fn materialize_stage_executor<T: Timestamp>(
     let mut push_ends: HashMap<usize, Box<dyn Any + Send>> = HashMap::new();
     let mut pull_ends: HashMap<usize, Box<dyn Any + Send>> = HashMap::new();
 
-    for (edge_idx, _) in intra_stage_edges
+    for (edge_idx, edge) in intra_stage_edges
         .iter()
         .chain(intra_stage_feedback_edges.iter())
         .copied()
@@ -182,7 +189,13 @@ pub(crate) fn materialize_stage_executor<T: Timestamp>(
             })
         })?;
         let (_, factory) = &mut channel_factories[pos];
-        let (push, pull) = factory.build(worker_context, Some(wake_handle.clone()))?;
+        let (push, pull) = factory.build_checked(
+            worker_context,
+            Some(wake_handle.clone()),
+            &check,
+            edge.source,
+            edge.target,
+        )?;
         push_ends.insert(edge_idx, push);
         pull_ends.insert(edge_idx, pull);
     }
@@ -280,6 +293,10 @@ pub(crate) fn materialize_stage_executor<T: Timestamp>(
     }
 
     let mut tracker = subgraph_builder.build();
+    #[cfg(any(debug_assertions, feature = "progress-check"))]
+    if let Some(oracle) = check_oracle {
+        tracker.attach_check(oracle, worker_index, "stage tracker");
+    }
     tracker.initialize()?;
 
     // Build unique operator-pair edges for topological sort (Kahn's algorithm).
@@ -441,7 +458,18 @@ impl<T: Timestamp> StageExecutor<T> {
 
     /// Runs one executor sweep.
     pub(crate) fn run_one_sweep(&mut self) -> Result<SweepOutcome> {
-        let outcome = self.run_one_sweep_inner()?;
+        let outcome = self.run_one_sweep_inner();
+        // Retire this stage's view in the progress checker (the worker as a
+        // whole is reported by `CombinedStageExecutor`).
+        #[cfg(any(debug_assertions, feature = "progress-check"))]
+        if let Some(tracker) = &mut self.progress_tracker {
+            match &outcome {
+                Ok(SweepOutcome::Completed) => tracker.check_finish(true, false),
+                Err(_) => tracker.check_finish(false, false),
+                _ => {}
+            }
+        }
+        let outcome = outcome?;
         if matches!(outcome, SweepOutcome::Completed) {
             self.finish_probes();
         }
@@ -484,6 +512,10 @@ impl<T: Timestamp> StageExecutor<T> {
         let all_exchange_done = self.exchange_inputs.iter().all(|input| input.is_all_done());
         if fb == 0 && all_exchange_done {
             if let Some(ref tracker) = self.progress_tracker {
+                #[cfg(any(debug_assertions, feature = "progress-check"))]
+                if tracker.is_completed() && self.done.iter().any(|done| !done) {
+                    tracker.check_force_close();
+                }
                 if tracker.is_completed() {
                     for pos in 0..self.operators.len() {
                         if !self.done[pos] {
@@ -893,6 +925,9 @@ pub(crate) struct CombinedStageExecutor<T: Timestamp> {
     /// it done on local quiescence — the unsound shortcut that previously dropped
     /// in-flight loop data.
     loop_inflight: Vec<Arc<std::sync::atomic::AtomicI64>>,
+    /// The progress checker's oracle and this worker's index.
+    #[cfg(any(debug_assertions, feature = "progress-check"))]
+    check: Option<(Arc<crate::progress::check::Oracle<T>>, usize)>,
 }
 
 impl<T: Timestamp> CombinedStageExecutor<T> {
@@ -902,12 +937,27 @@ impl<T: Timestamp> CombinedStageExecutor<T> {
         feedback_release: HashMap<usize, Vec<Arc<AtomicUsize>>>,
         loop_inflight: Vec<Arc<std::sync::atomic::AtomicI64>>,
     ) -> Self {
+        #[cfg(any(debug_assertions, feature = "progress-check"))]
+        let check = stages.iter().find_map(|stage| {
+            let oracle = stage.progress_tracker.as_ref()?.check_oracle()?;
+            Some((oracle.clone(), stage.worker_index))
+        });
         let stages = stages.into_iter().map(Some).collect();
         Self {
             stages,
             wake_handle,
             feedback_release,
             loop_inflight,
+            #[cfg(any(debug_assertions, feature = "progress-check"))]
+            check,
+        }
+    }
+
+    /// Tell the progress checker this worker finished.
+    #[cfg(any(debug_assertions, feature = "progress-check"))]
+    fn check_worker_finished(&self, ok: bool) {
+        if let Some((oracle, worker)) = &self.check {
+            oracle.worker_finished(*worker, ok);
         }
     }
 }
@@ -950,7 +1000,11 @@ impl<T: Timestamp> Future for CombinedStageExecutor<T> {
                     // remaining stages quiesce do we know the loop converged.
                     any_pending = true;
                 }
-                Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
+                Poll::Ready(Err(e)) => {
+                    #[cfg(any(debug_assertions, feature = "progress-check"))]
+                    this.check_worker_finished(false);
+                    return Poll::Ready(Err(e));
+                }
                 Poll::Pending => {
                     any_pending = true;
                     all_remaining_quiesced = false;
@@ -977,6 +1031,8 @@ impl<T: Timestamp> Future for CombinedStageExecutor<T> {
         let all_done = this.stages.iter().all(|s| s.is_none());
         if all_done {
             this.wake_handle.clear_waker();
+            #[cfg(any(debug_assertions, feature = "progress-check"))]
+            this.check_worker_finished(true);
             Poll::Ready(Ok(true))
         } else if any_pending
             && all_remaining_quiesced
@@ -1016,11 +1072,19 @@ impl<T: Timestamp> Future for CombinedStageExecutor<T> {
             // probes first (otherwise loop-body probes would never finish).
             for stage in &mut this.stages {
                 if let Some(stage) = stage.as_mut() {
+                    // Acting on convergence is acting on completion (V4).
+                    #[cfg(any(debug_assertions, feature = "progress-check"))]
+                    if let Some(tracker) = stage.progress_tracker.as_mut() {
+                        tracker.check_force_close();
+                        tracker.check_finish(true, false);
+                    }
                     stage.finish_probes();
                 }
                 *stage = None;
             }
             this.wake_handle.clear_waker();
+            #[cfg(any(debug_assertions, feature = "progress-check"))]
+            this.check_worker_finished(true);
             Poll::Ready(Ok(true))
         } else if any_pending || any_completed_this_poll {
             // If a stage completed this poll, wake immediately so downstream
@@ -1333,6 +1397,7 @@ mod tests {
             HashMap::new(),
             Arc::new(AtomicUsize::new(0)),
             Arc::new(AtomicUsize::new(0)),
+            Default::default(),
         )
         .unwrap();
 
@@ -1390,6 +1455,7 @@ mod tests {
             HashMap::new(),
             Arc::new(AtomicUsize::new(0)),
             Arc::new(AtomicUsize::new(0)),
+            Default::default(),
         )
         .unwrap();
 

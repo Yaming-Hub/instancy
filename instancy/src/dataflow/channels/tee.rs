@@ -157,6 +157,12 @@ impl<T: Timestamp, D: Clone + Send + 'static, M: Clone + Default + Send + 'stati
             target.set_inflight_reporter(reporter.clone());
         }
     }
+
+    #[cfg(any(debug_assertions, feature = "progress-check"))]
+    fn check_port(&self) -> Option<crate::progress::check::Port<T>> {
+        // Every branch shares the producing output.
+        self.targets.iter().find_map(|target| target.check_port())
+    }
 }
 
 /// Wrap multiple pushers for the same output port into a single pusher.

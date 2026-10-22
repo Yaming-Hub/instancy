@@ -377,15 +377,32 @@ pub struct EdgeTypeInfo {
 /// Exchange channel factories consume shared materializer state and must only
 /// be called once per worker slot — a failed `build()` may leave the factory
 /// in a partially consumed state that cannot be retried.
-pub struct ChannelFactory(
-    Box<
+///
+/// The factory is built from a typed closure, so the progress checker (debug
+/// builds and the `progress-check` feature) can wrap every channel it makes
+/// (see [`build_checked`](Self::build_checked)).
+pub struct ChannelFactory {
+    build: Box<
         dyn FnMut(
                 &WorkerContext,
                 Option<crate::dataflow::channels::wake::WakeHandle>,
             ) -> crate::Result<ChannelPair>
             + Send,
     >,
-);
+    /// Wraps a pair this factory built (monomorphized for its types).
+    #[cfg(any(debug_assertions, feature = "progress-check"))]
+    check_wrap: crate::progress::check::WrapFn,
+    /// Projects the channel's timestamp onto the root timestamp (a
+    /// `check::Projector<S>`); set for channels inside `iterate`.
+    #[cfg(any(debug_assertions, feature = "progress-check"))]
+    check_projector: Option<Arc<dyn Any + Send + Sync>>,
+    /// Copies each pushed record becomes (target workers of a broadcast).
+    #[cfg(any(debug_assertions, feature = "progress-check"))]
+    check_fanout: i64,
+    /// Whether the channel routes records between workers.
+    #[cfg(any(debug_assertions, feature = "progress-check"))]
+    check_cross_worker: bool,
+}
 
 /// Type alias for the channel pair returned by [`ChannelFactory::build`].
 ///
@@ -396,17 +413,45 @@ pub struct ChannelFactory(
 /// factory-storage level.
 pub type ChannelPair = (Box<dyn std::any::Any + Send>, Box<dyn std::any::Any + Send>);
 
+/// The typed channel pair a [`ChannelFactory`] closure returns.
+pub(crate) type TypedChannelPair<T, D, M> = (
+    Box<dyn crate::dataflow::channels::pushpull::Push<T, D, M>>,
+    Box<dyn crate::dataflow::channels::pushpull::Pull<T, D, M>>,
+);
+
 impl ChannelFactory {
-    /// Create a new channel factory from a `FnMut` closure.
-    pub fn new(
-        factory: impl FnMut(
+    /// Create a new channel factory from a `FnMut` closure returning typed
+    /// endpoints.
+    pub(crate) fn new<T, D, M>(
+        mut factory: impl FnMut(
             &WorkerContext,
             Option<crate::dataflow::channels::wake::WakeHandle>,
-        ) -> crate::Result<ChannelPair>
+        ) -> crate::Result<TypedChannelPair<T, D, M>>
         + Send
         + 'static,
-    ) -> Self {
-        Self(Box::new(factory))
+    ) -> Self
+    where
+        T: crate::progress::timestamp::Timestamp,
+        D: 'static,
+        M: 'static,
+    {
+        Self {
+            build: Box::new(move |ctx, wake| {
+                let (push, pull) = factory(ctx, wake)?;
+                Ok((
+                    Box::new(push) as Box<dyn Any + Send>,
+                    Box::new(pull) as Box<dyn Any + Send>,
+                ))
+            }),
+            #[cfg(any(debug_assertions, feature = "progress-check"))]
+            check_wrap: crate::progress::check::wrap_pair::<T, D, M>,
+            #[cfg(any(debug_assertions, feature = "progress-check"))]
+            check_projector: None,
+            #[cfg(any(debug_assertions, feature = "progress-check"))]
+            check_fanout: 1,
+            #[cfg(any(debug_assertions, feature = "progress-check"))]
+            check_cross_worker: false,
+        }
     }
 
     /// Create a channel pair for the given worker and wake handle.
@@ -425,6 +470,84 @@ impl ChannelFactory {
         ctx: &WorkerContext,
         wake_handle: Option<crate::dataflow::channels::wake::WakeHandle>,
     ) -> crate::Result<ChannelPair> {
-        (self.0)(ctx, wake_handle)
+        (self.build)(ctx, wake_handle)
+    }
+
+    /// [`build`](Self::build) for the edge `source -> target`, letting the
+    /// progress checker wrap the pair when `check` holds its context.
+    ///
+    /// Every materialization point builds channels through this method, so
+    /// the checker observes every channel. Without the checker compiled in,
+    /// `check` is `()` and this is exactly `build`.
+    pub(crate) fn build_checked(
+        &mut self,
+        ctx: &WorkerContext,
+        wake_handle: Option<crate::dataflow::channels::wake::WakeHandle>,
+        check: &crate::progress::CheckCtx,
+        source: crate::dataflow::stream::Slot,
+        target: crate::dataflow::stream::Slot,
+    ) -> crate::Result<ChannelPair> {
+        let pair = self.build(ctx, wake_handle)?;
+        #[cfg(any(debug_assertions, feature = "progress-check"))]
+        if let Some(check) = check {
+            let site = crate::progress::check::ChannelSite {
+                ctx: check,
+                source: (source.operator_index, source.slot_index),
+                target: (target.operator_index, target.slot_index),
+            };
+            return Ok((self.check_wrap)(
+                pair,
+                &site,
+                self.check_projector.as_deref(),
+                self.check_fanout,
+                self.check_cross_worker,
+            ));
+        }
+        #[cfg(not(any(debug_assertions, feature = "progress-check")))]
+        let _ = (check, source, target);
+        Ok(pair)
+    }
+
+    /// Declare that this channel routes records between workers and that
+    /// every record pushed into it is delivered `fanout` times (the target
+    /// worker count for a broadcast, 1 for an exchange). Only the progress
+    /// checker uses this; without it compiled in, a no-op.
+    #[cfg_attr(
+        not(any(debug_assertions, feature = "progress-check")),
+        allow(unused_mut)
+    )]
+    pub(crate) fn with_check_cross_worker(mut self, fanout: usize) -> Self {
+        #[cfg(any(debug_assertions, feature = "progress-check"))]
+        {
+            self.check_fanout = fanout.max(1) as i64;
+            self.check_cross_worker = true;
+        }
+        #[cfg(not(any(debug_assertions, feature = "progress-check")))]
+        let _ = fanout;
+        self
+    }
+
+    /// Give the checker the projection of this channel's timestamp onto the
+    /// root timestamp, unless a deeper scope already did. Only the progress
+    /// checker uses this; without it compiled in, a no-op.
+    pub(crate) fn set_check_projector<S: crate::progress::timestamp::Timestamp>(
+        &mut self,
+        projector: &Arc<dyn Fn(&S) -> Box<dyn Any + Send> + Send + Sync>,
+    ) {
+        #[cfg(any(debug_assertions, feature = "progress-check"))]
+        if self.check_projector.is_none() {
+            self.check_projector = Some(Arc::new(projector.clone()));
+        }
+        #[cfg(not(any(debug_assertions, feature = "progress-check")))]
+        let _ = projector;
+    }
+
+    /// [`set_check_projector`](Self::set_check_projector), by value.
+    pub(crate) fn with_check_projector<S: crate::progress::timestamp::Timestamp>(
+        mut self,
+        projector: &Arc<dyn Fn(&S) -> Box<dyn Any + Send> + Send + Sync>,
+    ) -> Self {
+        self.set_check_projector(projector);
+        self
     }
 }

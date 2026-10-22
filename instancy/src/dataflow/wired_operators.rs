@@ -30,6 +30,7 @@ use crate::dataflow::operators::handles::{InputHandle, NotifyContext, OutputHand
 use crate::dataflow::schedulable::{ActivationOutcome, SchedulableOperator};
 use crate::dataflow::stage::StageId;
 use crate::error::{Error, Result};
+use crate::progress::PendingOutput;
 use crate::progress::capability::Capability;
 use crate::progress::frontier::Antichain;
 use crate::progress::notificator::Notificator;
@@ -66,7 +67,7 @@ pub struct WiredUnaryOperator<T: Timestamp, D1: Send + 'static, D2: Send + 'stat
     output_pusher: Box<dyn Push<T, D2>>,
     /// Pending output: batches that have been produced but not yet pushed to channel.
     /// Items are pushed front-to-back; on backpressure, remaining items stay here.
-    pending_output: VecDeque<Envelope<T, D2>>,
+    pending_output: PendingOutput<T, D2>,
     /// Optional progress reporter — when present, the operator holds an
     /// initial capability that is released when inputs close. Used by
     /// exchange pass-through operators to prevent premature completion
@@ -91,7 +92,11 @@ impl<T: Timestamp, D1: Send + 'static, D2: Send + 'static> WiredUnaryOperator<T,
         output_pusher: Box<dyn Push<T, D2>>,
     ) -> Self {
         let name = name.into();
-        Self {
+        #[cfg_attr(
+            not(any(debug_assertions, feature = "progress-check")),
+            allow(unused_mut)
+        )]
+        let mut op = Self {
             input_handle: InputHandle::new(format!("{name}:input")),
             output_handle: OutputHandle::new(format!("{name}:output")),
             name,
@@ -100,11 +105,14 @@ impl<T: Timestamp, D1: Send + 'static, D2: Send + 'static> WiredUnaryOperator<T,
             input_puller,
             logic: Box::new(logic),
             output_pusher,
-            pending_output: VecDeque::new(),
+            pending_output: PendingOutput::new(),
             progress_reporter: None,
             input_exhausted: false,
             done: false,
-        }
+        };
+        #[cfg(any(debug_assertions, feature = "progress-check"))]
+        op.check_observe();
+        op
     }
 
     /// Create a new wired unary operator with a progress reporter.
@@ -125,7 +133,11 @@ impl<T: Timestamp, D1: Send + 'static, D2: Send + 'static> WiredUnaryOperator<T,
         reporter: ProgressReporter<T>,
     ) -> Self {
         let name = name.into();
-        Self {
+        #[cfg_attr(
+            not(any(debug_assertions, feature = "progress-check")),
+            allow(unused_mut)
+        )]
+        let mut op = Self {
             input_handle: InputHandle::new(format!("{name}:input")),
             output_handle: OutputHandle::new(format!("{name}:output")),
             name,
@@ -134,11 +146,14 @@ impl<T: Timestamp, D1: Send + 'static, D2: Send + 'static> WiredUnaryOperator<T,
             input_puller,
             logic: Box::new(logic),
             output_pusher,
-            pending_output: VecDeque::new(),
+            pending_output: PendingOutput::new(),
             progress_reporter: Some(reporter),
             input_exhausted: false,
             done: false,
-        }
+        };
+        #[cfg(any(debug_assertions, feature = "progress-check"))]
+        op.check_observe();
+        op
     }
 
     /// Try to flush pending output envelopes to the output channel.
@@ -296,13 +311,17 @@ pub struct WiredSourceOperator<T: Timestamp, D: Send + 'static> {
     /// Output channel.
     output_pusher: Box<dyn Push<T, D>>,
     /// Pending output envelopes (for backpressure retry).
-    pending_output: VecDeque<Envelope<T, D>>,
+    pending_output: PendingOutput<T, D>,
     /// Optional progress reporter for output port 0.
     /// When present, the source holds a capability at T::minimum() initially
     /// and drops it when all data has been emitted.
     progress_reporter: Option<ProgressReporter<T>>,
     /// Whether all data has been emitted.
     done: bool,
+    /// The progress checker's count of `pending_data` (work held for the
+    /// output).
+    #[cfg(any(debug_assertions, feature = "progress-check"))]
+    check_data: Option<crate::progress::check::StoreCheck<T>>,
 }
 
 impl<T: Timestamp, D: Send + 'static> WiredSourceOperator<T, D> {
@@ -314,16 +333,25 @@ impl<T: Timestamp, D: Send + 'static> WiredSourceOperator<T, D> {
         data: Vec<(T, Vec<D>)>,
         output_pusher: Box<dyn Push<T, D>>,
     ) -> Self {
-        Self {
+        #[cfg_attr(
+            not(any(debug_assertions, feature = "progress-check")),
+            allow(unused_mut)
+        )]
+        let mut op = Self {
             name: name.into(),
             index,
             stage_id,
             pending_data: VecDeque::from(data),
             output_pusher,
-            pending_output: VecDeque::new(),
+            pending_output: PendingOutput::new(),
             progress_reporter: None,
             done: false,
-        }
+            #[cfg(any(debug_assertions, feature = "progress-check"))]
+            check_data: None,
+        };
+        #[cfg(any(debug_assertions, feature = "progress-check"))]
+        op.check_observe();
+        op
     }
 
     /// Create a source operator with progress reporting.
@@ -339,16 +367,25 @@ impl<T: Timestamp, D: Send + 'static> WiredSourceOperator<T, D> {
         output_pusher: Box<dyn Push<T, D>>,
         reporter: ProgressReporter<T>,
     ) -> Self {
-        Self {
+        #[cfg_attr(
+            not(any(debug_assertions, feature = "progress-check")),
+            allow(unused_mut)
+        )]
+        let mut op = Self {
             name: name.into(),
             index,
             stage_id,
             pending_data: VecDeque::from(data),
             output_pusher,
-            pending_output: VecDeque::new(),
+            pending_output: PendingOutput::new(),
             progress_reporter: Some(reporter),
             done: false,
-        }
+            #[cfg(any(debug_assertions, feature = "progress-check"))]
+            check_data: None,
+        };
+        #[cfg(any(debug_assertions, feature = "progress-check"))]
+        op.check_observe();
+        op
     }
 }
 
@@ -372,6 +409,10 @@ impl<T: Timestamp, D: Send + 'static> SchedulableOperator for WiredSourceOperato
 
         // Emit pending data in FIFO order (front-to-back).
         while let Some((time, data)) = self.pending_data.pop_front() {
+            #[cfg(any(debug_assertions, feature = "progress-check"))]
+            if let Some(check) = &self.check_data {
+                check.remove(&time, data.len());
+            }
             let envelope = Envelope::data(time, data);
             match self.output_pusher.try_push(envelope) {
                 Ok(()) => {}
@@ -386,6 +427,8 @@ impl<T: Timestamp, D: Send + 'static> SchedulableOperator for WiredSourceOperato
         // All data emitted — drop capability and close output.
         if let Some(ref reporter) = self.progress_reporter {
             reporter.update(T::minimum(), -1);
+            #[cfg(any(debug_assertions, feature = "progress-check"))]
+            reporter.check_hold(&T::minimum(), -1);
         }
         self.output_pusher.close();
         self.done = true;
@@ -414,6 +457,8 @@ impl<T: Timestamp, D: Send + 'static> SchedulableOperator for WiredSourceOperato
         if !self.done {
             if let Some(ref reporter) = self.progress_reporter {
                 reporter.update(T::minimum(), -1);
+                #[cfg(any(debug_assertions, feature = "progress-check"))]
+                reporter.check_hold(&T::minimum(), -1);
             }
             self.output_pusher.close();
             self.done = true;
@@ -450,7 +495,11 @@ impl<T: Timestamp, D: Send + 'static> WiredSinkOperator<T, D> {
         stage_id: StageId,
         input_puller: Box<dyn Pull<T, D>>,
     ) -> Self {
-        Self {
+        #[cfg_attr(
+            not(any(debug_assertions, feature = "progress-check")),
+            allow(unused_mut)
+        )]
+        let mut op = Self {
             name: name.into(),
             index,
             stage_id,
@@ -458,7 +507,10 @@ impl<T: Timestamp, D: Send + 'static> WiredSinkOperator<T, D> {
             collected: Vec::new(),
             input_exhausted: false,
             done: false,
-        }
+        };
+        #[cfg(any(debug_assertions, feature = "progress-check"))]
+        op.check_observe();
+        op
     }
 
     /// Get all collected data.
@@ -559,7 +611,7 @@ pub struct WiredBinaryOperator<
     >,
     output_handle: OutputHandle<T, D3>,
     output_pusher: Box<dyn Push<T, D3>>,
-    pending_output: VecDeque<Envelope<T, D3>>,
+    pending_output: PendingOutput<T, D3>,
     input1_exhausted: bool,
     input2_exhausted: bool,
     done: bool,
@@ -585,7 +637,11 @@ impl<T: Timestamp, D1: Send + 'static, D2: Send + 'static, D3: Send + 'static>
         output_pusher: Box<dyn Push<T, D3>>,
     ) -> Self {
         let name = name.into();
-        Self {
+        #[cfg_attr(
+            not(any(debug_assertions, feature = "progress-check")),
+            allow(unused_mut)
+        )]
+        let mut op = Self {
             input1_handle: InputHandle::new(format!("{name}:input1")),
             input2_handle: InputHandle::new(format!("{name}:input2")),
             output_handle: OutputHandle::new(format!("{name}:output")),
@@ -596,11 +652,14 @@ impl<T: Timestamp, D1: Send + 'static, D2: Send + 'static, D3: Send + 'static>
             input2_puller,
             logic: Box::new(logic),
             output_pusher,
-            pending_output: VecDeque::new(),
+            pending_output: PendingOutput::new(),
             input1_exhausted: false,
             input2_exhausted: false,
             done: false,
-        }
+        };
+        #[cfg(any(debug_assertions, feature = "progress-check"))]
+        op.check_observe();
+        op
     }
 
     fn flush_pending_output(&mut self) -> Result<bool> {
@@ -760,7 +819,7 @@ pub struct WiredConcatOperator<T: Timestamp, D: Send + 'static> {
     input_pullers: Vec<Box<dyn Pull<T, D>>>,
     inputs_exhausted: Vec<bool>,
     output_pusher: Box<dyn Push<T, D>>,
-    pending_output: VecDeque<Envelope<T, D>>,
+    pending_output: PendingOutput<T, D>,
     done: bool,
 }
 
@@ -774,16 +833,23 @@ impl<T: Timestamp, D: Send + 'static> WiredConcatOperator<T, D> {
         output_pusher: Box<dyn Push<T, D>>,
     ) -> Self {
         let num_inputs = input_pullers.len();
-        Self {
+        #[cfg_attr(
+            not(any(debug_assertions, feature = "progress-check")),
+            allow(unused_mut)
+        )]
+        let mut op = Self {
             name: name.into(),
             index,
             stage_id,
             input_pullers,
             inputs_exhausted: vec![false; num_inputs],
             output_pusher,
-            pending_output: VecDeque::new(),
+            pending_output: PendingOutput::new(),
             done: false,
-        }
+        };
+        #[cfg(any(debug_assertions, feature = "progress-check"))]
+        op.check_observe();
+        op
     }
 
     fn flush_pending_output(&mut self) -> Result<bool> {
@@ -890,7 +956,7 @@ where
     stage_id: StageId,
     input_puller: Box<dyn Pull<TOuter, D>>,
     output_pusher: Box<dyn Push<crate::order::Product<TOuter, TInner>, D>>,
-    pending_output: VecDeque<Envelope<crate::order::Product<TOuter, TInner>, D>>,
+    pending_output: PendingOutput<crate::order::Product<TOuter, TInner>, D>,
     input_exhausted: bool,
     done: bool,
     /// Optional shared loop in-flight counter (`+count` on entry). Used by the
@@ -913,18 +979,25 @@ where
         input_puller: Box<dyn Pull<TOuter, D>>,
         output_pusher: Box<dyn Push<crate::order::Product<TOuter, TInner>, D>>,
     ) -> Self {
-        Self {
+        #[cfg_attr(
+            not(any(debug_assertions, feature = "progress-check")),
+            allow(unused_mut)
+        )]
+        let mut op = Self {
             name: name.into(),
             index,
             stage_id,
             input_puller,
             output_pusher,
-            pending_output: VecDeque::new(),
+            pending_output: PendingOutput::new(),
             input_exhausted: false,
             done: false,
             loop_counter: None,
             _phantom: std::marker::PhantomData,
-        }
+        };
+        #[cfg(any(debug_assertions, feature = "progress-check"))]
+        op.check_observe();
+        op
     }
 
     /// Attach the shared loop in-flight counter (`+count` on entry).
@@ -1043,7 +1116,7 @@ where
     stage_id: StageId,
     input_puller: Box<dyn Pull<crate::order::Product<TOuter, TInner>, D>>,
     output_pusher: Box<dyn Push<TOuter, D>>,
-    pending_output: VecDeque<Envelope<TOuter, D>>,
+    pending_output: PendingOutput<TOuter, D>,
     input_exhausted: bool,
     done: bool,
     /// Optional shared loop in-flight counter (`-count` on exit) — see
@@ -1063,17 +1136,24 @@ where
         input_puller: Box<dyn Pull<crate::order::Product<TOuter, TInner>, D>>,
         output_pusher: Box<dyn Push<TOuter, D>>,
     ) -> Self {
-        Self {
+        #[cfg_attr(
+            not(any(debug_assertions, feature = "progress-check")),
+            allow(unused_mut)
+        )]
+        let mut op = Self {
             name: name.into(),
             index,
             stage_id,
             input_puller,
             output_pusher,
-            pending_output: VecDeque::new(),
+            pending_output: PendingOutput::new(),
             input_exhausted: false,
             done: false,
             loop_counter: None,
-        }
+        };
+        #[cfg(any(debug_assertions, feature = "progress-check"))]
+        op.check_observe();
+        op
     }
 
     /// Attach the shared loop in-flight counter (`-count` on exit).
@@ -1195,7 +1275,7 @@ where
     summary: TInner::Summary,
     input_puller: Box<dyn Pull<crate::order::Product<TOuter, TInner>, D>>,
     output_pusher: Box<dyn Push<crate::order::Product<TOuter, TInner>, D>>,
-    pending_output: VecDeque<Envelope<crate::order::Product<TOuter, TInner>, D>>,
+    pending_output: PendingOutput<crate::order::Product<TOuter, TInner>, D>,
     input_exhausted: bool,
     done: bool,
 }
@@ -1214,17 +1294,24 @@ where
         input_puller: Box<dyn Pull<crate::order::Product<TOuter, TInner>, D>>,
         output_pusher: Box<dyn Push<crate::order::Product<TOuter, TInner>, D>>,
     ) -> Self {
-        Self {
+        #[cfg_attr(
+            not(any(debug_assertions, feature = "progress-check")),
+            allow(unused_mut)
+        )]
+        let mut op = Self {
             name: name.into(),
             index,
             stage_id,
             summary,
             input_puller,
             output_pusher,
-            pending_output: VecDeque::new(),
+            pending_output: PendingOutput::new(),
             input_exhausted: false,
             done: false,
-        }
+        };
+        #[cfg(any(debug_assertions, feature = "progress-check"))]
+        op.check_observe();
+        op
     }
 
     fn flush_pending_output(&mut self) -> Result<bool> {
@@ -1415,7 +1502,7 @@ pub struct WiredUnaryNotifyOperator<T: Timestamp, D1: Send + 'static, D2: Send +
     output_pusher: Box<dyn Push<T, D2>>,
 
     /// Pending output envelopes (for backpressure retry).
-    pending_output: VecDeque<Envelope<T, D2>>,
+    pending_output: PendingOutput<T, D2>,
 
     /// Notificator that tracks when input frontier advances past requested timestamps.
     /// Updated by the executor via `update_input_frontier()` after progress propagation.
@@ -1478,7 +1565,11 @@ impl<T: Timestamp, D1: Send + 'static, D2: Send + 'static> WiredUnaryNotifyOpera
         initial_frontier: Antichain<T>,
     ) -> Self {
         let name = name.into();
-        Self {
+        #[cfg_attr(
+            not(any(debug_assertions, feature = "progress-check")),
+            allow(unused_mut)
+        )]
+        let mut op = Self {
             input_handle: InputHandle::new(format!("{name}:input")),
             output_handle: OutputHandle::new(format!("{name}:output")),
             notificator: Notificator::new(initial_frontier),
@@ -1488,12 +1579,15 @@ impl<T: Timestamp, D1: Send + 'static, D2: Send + 'static> WiredUnaryNotifyOpera
             input_puller,
             logic: Box::new(logic),
             output_pusher,
-            pending_output: VecDeque::new(),
+            pending_output: PendingOutput::new(),
             progress_reporter,
             held_capabilities: Vec::new(),
             input_exhausted: false,
             done: false,
-        }
+        };
+        #[cfg(any(debug_assertions, feature = "progress-check"))]
+        op.check_observe();
+        op
     }
 
     /// Try to flush pending output envelopes to the output channel.
@@ -1787,7 +1881,7 @@ pub struct WiredUnaryAsyncOperator<T: Timestamp, D1: Send + 'static, D2: Send + 
     /// Output channel — pushes envelopes downstream.
     output_pusher: Box<dyn Push<T, D2>>,
     /// Pending output: batches produced but not yet pushed to channel.
-    pending_output: VecDeque<Envelope<T, D2>>,
+    pending_output: PendingOutput<T, D2>,
 
     /// Tokio runtime handle for spawning async tasks.
     tokio_handle: tokio::runtime::Handle,
@@ -1801,6 +1895,12 @@ pub struct WiredUnaryAsyncOperator<T: Timestamp, D1: Send + 'static, D2: Send + 
     input_exhausted: bool,
     /// Whether this operator has completed.
     done: bool,
+    /// The progress checker's counts of `pending_input` (at the input) and
+    /// of running or uncollected tasks (at the output, one unit per task).
+    #[cfg(any(debug_assertions, feature = "progress-check"))]
+    check_input: Option<crate::progress::check::StoreCheck<T>>,
+    #[cfg(any(debug_assertions, feature = "progress-check"))]
+    check_tasks: Option<crate::progress::check::StoreCheck<T>>,
 }
 
 impl<T: Timestamp, D1: Send + 'static, D2: Send + 'static> WiredUnaryAsyncOperator<T, D1, D2> {
@@ -1819,7 +1919,11 @@ impl<T: Timestamp, D1: Send + 'static, D2: Send + 'static> WiredUnaryAsyncOperat
     ) -> Self {
         let (result_tx, result_rx) = tokio::sync::mpsc::unbounded_channel();
         let name = name.into();
-        Self {
+        #[cfg_attr(
+            not(any(debug_assertions, feature = "progress-check")),
+            allow(unused_mut)
+        )]
+        let mut op = Self {
             input_handle: InputHandle::new(format!("{name}:input")),
             name,
             index,
@@ -1832,12 +1936,19 @@ impl<T: Timestamp, D1: Send + 'static, D2: Send + 'static> WiredUnaryAsyncOperat
             result_rx,
             pending_input: VecDeque::new(),
             output_pusher,
-            pending_output: VecDeque::new(),
+            pending_output: PendingOutput::new(),
             tokio_handle,
             wake_handle,
             input_exhausted: false,
             done: false,
-        }
+            #[cfg(any(debug_assertions, feature = "progress-check"))]
+            check_input: None,
+            #[cfg(any(debug_assertions, feature = "progress-check"))]
+            check_tasks: None,
+        };
+        #[cfg(any(debug_assertions, feature = "progress-check"))]
+        op.check_observe();
+        op
     }
 
     /// Try to flush pending output envelopes to the output channel.
@@ -1879,6 +1990,10 @@ impl<T: Timestamp, D1: Send + 'static, D2: Send + 'static> WiredUnaryAsyncOperat
     /// Drain input handle into pending_input buffer.
     fn drain_input_to_pending(&mut self) {
         while let Some((time, data)) = self.input_handle.next() {
+            #[cfg(any(debug_assertions, feature = "progress-check"))]
+            if let Some(check) = &self.check_input {
+                check.add(&time, data.len());
+            }
             self.pending_input.push_back((time, data));
         }
     }
@@ -1887,6 +2002,15 @@ impl<T: Timestamp, D1: Send + 'static, D2: Send + 'static> WiredUnaryAsyncOperat
     fn spawn_pending(&mut self) {
         while self.in_flight < self.max_concurrency {
             if let Some((time, data)) = self.pending_input.pop_front() {
+                #[cfg(any(debug_assertions, feature = "progress-check"))]
+                {
+                    if let Some(check) = &self.check_tasks {
+                        check.add(&time, 1);
+                    }
+                    if let Some(check) = &self.check_input {
+                        check.remove(&time, data.len());
+                    }
+                }
                 let logic = Arc::clone(&self.logic);
                 let tx = self.result_tx.clone();
                 let time_for_logic = time.clone();
@@ -1929,8 +2053,14 @@ impl<T: Timestamp, D1: Send + 'static, D2: Send + 'static> WiredUnaryAsyncOperat
             match self.result_rx.try_recv() {
                 Ok(Ok((time, data))) => {
                     self.in_flight -= 1;
+                    #[cfg(any(debug_assertions, feature = "progress-check"))]
+                    let task_time = time.clone();
                     if !data.is_empty() {
                         self.pending_output.push_back(Envelope::data(time, data));
+                    }
+                    #[cfg(any(debug_assertions, feature = "progress-check"))]
+                    if let Some(check) = &self.check_tasks {
+                        check.remove(&task_time, 1);
                     }
                     collected = true;
                 }
@@ -2074,8 +2204,8 @@ pub struct WiredBranchOperator<T: Timestamp, D: Send + 'static> {
     output_false: OutputHandle<T, D>,
     true_pusher: Box<dyn Push<T, D>>,
     false_pusher: Box<dyn Push<T, D>>,
-    pending_true: VecDeque<Envelope<T, D>>,
-    pending_false: VecDeque<Envelope<T, D>>,
+    pending_true: PendingOutput<T, D>,
+    pending_false: PendingOutput<T, D>,
     input_exhausted: bool,
     done: bool,
 }
@@ -2092,7 +2222,11 @@ impl<T: Timestamp, D: Send + 'static> WiredBranchOperator<T, D> {
         false_pusher: Box<dyn Push<T, D>>,
     ) -> Self {
         let name = name.into();
-        Self {
+        #[cfg_attr(
+            not(any(debug_assertions, feature = "progress-check")),
+            allow(unused_mut)
+        )]
+        let mut op = Self {
             input_handle: InputHandle::new(format!("{name}:input")),
             output_true: OutputHandle::new(format!("{name}:true")),
             output_false: OutputHandle::new(format!("{name}:false")),
@@ -2103,11 +2237,14 @@ impl<T: Timestamp, D: Send + 'static> WiredBranchOperator<T, D> {
             predicate: Box::new(predicate),
             true_pusher,
             false_pusher,
-            pending_true: VecDeque::new(),
-            pending_false: VecDeque::new(),
+            pending_true: PendingOutput::new(),
+            pending_false: PendingOutput::new(),
             input_exhausted: false,
             done: false,
-        }
+        };
+        #[cfg(any(debug_assertions, feature = "progress-check"))]
+        op.check_observe();
+        op
     }
 
     /// Flush both per-port pending queues independently.
@@ -2306,8 +2443,8 @@ pub struct WiredForkOperator<T: Timestamp, D: Clone + Send + 'static> {
     output_right: OutputHandle<T, D>,
     left_pusher: Box<dyn Push<T, D>>,
     right_pusher: Box<dyn Push<T, D>>,
-    pending_left: VecDeque<Envelope<T, D>>,
-    pending_right: VecDeque<Envelope<T, D>>,
+    pending_left: PendingOutput<T, D>,
+    pending_right: PendingOutput<T, D>,
     input_exhausted: bool,
     done: bool,
 }
@@ -2323,7 +2460,11 @@ impl<T: Timestamp, D: Clone + Send + 'static> WiredForkOperator<T, D> {
         right_pusher: Box<dyn Push<T, D>>,
     ) -> Self {
         let name = name.into();
-        Self {
+        #[cfg_attr(
+            not(any(debug_assertions, feature = "progress-check")),
+            allow(unused_mut)
+        )]
+        let mut op = Self {
             input_handle: InputHandle::new(format!("{name}:input")),
             output_left: OutputHandle::new(format!("{name}:left")),
             output_right: OutputHandle::new(format!("{name}:right")),
@@ -2333,11 +2474,14 @@ impl<T: Timestamp, D: Clone + Send + 'static> WiredForkOperator<T, D> {
             input_puller,
             left_pusher,
             right_pusher,
-            pending_left: VecDeque::new(),
-            pending_right: VecDeque::new(),
+            pending_left: PendingOutput::new(),
+            pending_right: PendingOutput::new(),
             input_exhausted: false,
             done: false,
-        }
+        };
+        #[cfg(any(debug_assertions, feature = "progress-check"))]
+        op.check_observe();
+        op
     }
 
     /// Flush both per-port pending queues independently.
@@ -2501,8 +2645,8 @@ pub struct WiredOkErrOperator<T: Timestamp, D: Send + 'static, O: Send + 'static
     output_err: OutputHandle<T, E>,
     ok_pusher: Box<dyn Push<T, O>>,
     err_pusher: Box<dyn Push<T, E>>,
-    pending_ok: VecDeque<Envelope<T, O>>,
-    pending_err: VecDeque<Envelope<T, E>>,
+    pending_ok: PendingOutput<T, O>,
+    pending_err: PendingOutput<T, E>,
     input_exhausted: bool,
     done: bool,
 }
@@ -2521,7 +2665,11 @@ impl<T: Timestamp, D: Send + 'static, O: Send + 'static, E: Send + 'static>
         err_pusher: Box<dyn Push<T, E>>,
     ) -> Self {
         let name = name.into();
-        Self {
+        #[cfg_attr(
+            not(any(debug_assertions, feature = "progress-check")),
+            allow(unused_mut)
+        )]
+        let mut op = Self {
             input_handle: InputHandle::new(format!("{name}:input")),
             output_ok: OutputHandle::new(format!("{name}:ok")),
             output_err: OutputHandle::new(format!("{name}:err")),
@@ -2532,11 +2680,14 @@ impl<T: Timestamp, D: Send + 'static, O: Send + 'static, E: Send + 'static>
             splitter: Box::new(splitter),
             ok_pusher,
             err_pusher,
-            pending_ok: VecDeque::new(),
-            pending_err: VecDeque::new(),
+            pending_ok: PendingOutput::new(),
+            pending_err: PendingOutput::new(),
             input_exhausted: false,
             done: false,
-        }
+        };
+        #[cfg(any(debug_assertions, feature = "progress-check"))]
+        op.check_observe();
+        op
     }
 
     fn flush_pending(&mut self) -> Result<bool> {
@@ -2679,6 +2830,141 @@ impl<T: Timestamp, D: Send + 'static, O: Send + 'static, E: Send + 'static> Sche
     fn close_inputs(&mut self) {
         self.input_exhausted = true;
         self.input_handle.mark_exhausted();
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Progress checker: where each operator's stores are observed
+// ---------------------------------------------------------------------------
+
+/// Connects each operator's stores (input buffers, output retry queues,
+/// async queues, source data) to the progress checker's oracle, through the
+/// checker ports of the channel endpoints the operator was built with.
+/// Called by every constructor.
+#[cfg(any(debug_assertions, feature = "progress-check"))]
+mod check_observe {
+    use super::*;
+    use crate::progress::check::{Store, StoreCheck};
+
+    impl<T: Timestamp, D1: Send + 'static, D2: Send + 'static> WiredUnaryOperator<T, D1, D2> {
+        pub(super) fn check_observe(&mut self) {
+            self.input_handle.observe(&*self.input_puller);
+            self.pending_output.observe(&*self.output_pusher);
+        }
+    }
+
+    impl<T: Timestamp, D: Send + 'static> WiredSourceOperator<T, D> {
+        pub(super) fn check_observe(&mut self) {
+            self.pending_output.observe(&*self.output_pusher);
+            self.check_data = self
+                .output_pusher
+                .check_port()
+                .map(|port| StoreCheck::new(port, Store::PendingOutput));
+            if let Some(check) = &self.check_data {
+                for (time, data) in &self.pending_data {
+                    check.add(time, data.len());
+                }
+            }
+            if let Some(reporter) = &self.progress_reporter {
+                reporter.check_hold(&T::minimum(), 1);
+            }
+        }
+    }
+
+    impl<T: Timestamp, D: Send + 'static> WiredSinkOperator<T, D> {
+        pub(super) fn check_observe(&mut self) {}
+    }
+
+    impl<T: Timestamp, D1: Send + 'static, D2: Send + 'static, D3: Send + 'static>
+        WiredBinaryOperator<T, D1, D2, D3>
+    {
+        pub(super) fn check_observe(&mut self) {
+            self.input1_handle.observe(&*self.input1_puller);
+            self.input2_handle.observe(&*self.input2_puller);
+            self.pending_output.observe(&*self.output_pusher);
+        }
+    }
+
+    impl<T: Timestamp, D: Send + 'static> WiredConcatOperator<T, D> {
+        pub(super) fn check_observe(&mut self) {
+            self.pending_output.observe(&*self.output_pusher);
+        }
+    }
+
+    impl<TOuter: Timestamp, TInner: Timestamp, D: Send + 'static> WiredEnterOperator<TOuter, TInner, D>
+    where
+        crate::order::Product<TOuter, TInner>: Timestamp,
+    {
+        pub(super) fn check_observe(&mut self) {
+            self.pending_output.observe(&*self.output_pusher);
+        }
+    }
+
+    impl<TOuter: Timestamp, TInner: Timestamp, D: Send + 'static> WiredLeaveOperator<TOuter, TInner, D>
+    where
+        crate::order::Product<TOuter, TInner>: Timestamp,
+    {
+        pub(super) fn check_observe(&mut self) {
+            self.pending_output.observe(&*self.output_pusher);
+        }
+    }
+
+    impl<TOuter: Timestamp, TInner: Timestamp, D: Send + 'static>
+        WiredFeedbackOperator<TOuter, TInner, D>
+    where
+        crate::order::Product<TOuter, TInner>: Timestamp,
+    {
+        pub(super) fn check_observe(&mut self) {
+            self.pending_output.observe(&*self.output_pusher);
+        }
+    }
+
+    impl<T: Timestamp, D1: Send + 'static, D2: Send + 'static> WiredUnaryNotifyOperator<T, D1, D2> {
+        pub(super) fn check_observe(&mut self) {
+            self.input_handle.observe(&*self.input_puller);
+            self.pending_output.observe(&*self.output_pusher);
+        }
+    }
+
+    impl<T: Timestamp, D1: Send + 'static, D2: Send + 'static> WiredUnaryAsyncOperator<T, D1, D2> {
+        pub(super) fn check_observe(&mut self) {
+            self.input_handle.observe(&*self.input_puller);
+            self.pending_output.observe(&*self.output_pusher);
+            self.check_input = self
+                .input_puller
+                .check_port()
+                .map(|port| StoreCheck::new(port, Store::AsyncInput));
+            self.check_tasks = self
+                .output_pusher
+                .check_port()
+                .map(|port| StoreCheck::new(port, Store::AsyncTask));
+        }
+    }
+
+    impl<T: Timestamp, D: Send + 'static> WiredBranchOperator<T, D> {
+        pub(super) fn check_observe(&mut self) {
+            self.input_handle.observe(&*self.input_puller);
+            self.pending_true.observe(&*self.true_pusher);
+            self.pending_false.observe(&*self.false_pusher);
+        }
+    }
+
+    impl<T: Timestamp, D: Clone + Send + 'static> WiredForkOperator<T, D> {
+        pub(super) fn check_observe(&mut self) {
+            self.input_handle.observe(&*self.input_puller);
+            self.pending_left.observe(&*self.left_pusher);
+            self.pending_right.observe(&*self.right_pusher);
+        }
+    }
+
+    impl<T: Timestamp, D: Send + 'static, O: Send + 'static, E: Send + 'static>
+        WiredOkErrOperator<T, D, O, E>
+    {
+        pub(super) fn check_observe(&mut self) {
+            self.input_handle.observe(&*self.input_puller);
+            self.pending_ok.observe(&*self.ok_pusher);
+            self.pending_err.observe(&*self.err_pusher);
+        }
     }
 }
 

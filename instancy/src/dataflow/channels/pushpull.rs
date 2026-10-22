@@ -79,6 +79,14 @@ pub trait Push<T: Timestamp, D, M = ()>: Send {
     /// branches so only the exchange branch(es) actually account messages,
     /// keeping in-flight accounting tee-safe regardless of fan-out.
     fn set_inflight_reporter(&mut self, _reporter: crate::progress::operate::ProgressReporter<T>) {}
+
+    /// The progress checker's view of this endpoint's producing output, if
+    /// the channel was wrapped at materialization (checker builds only).
+    #[cfg(any(debug_assertions, feature = "progress-check"))]
+    #[doc(hidden)]
+    fn check_port(&self) -> Option<crate::progress::check::Port<T>> {
+        None
+    }
 }
 
 /// A trait for pulling messages from a channel.
@@ -113,6 +121,14 @@ pub trait Pull<T: Timestamp, D, M = ()>: Send {
     /// records `-count` consumed per delivered batch, retiring the in-flight
     /// messages accounted by the sending `ExchangePush`.
     fn set_inflight_reporter(&mut self, _reporter: crate::progress::operate::ProgressReporter<T>) {}
+
+    /// The progress checker's view of this endpoint's consuming input, if
+    /// the channel was wrapped at materialization (checker builds only).
+    #[cfg(any(debug_assertions, feature = "progress-check"))]
+    #[doc(hidden)]
+    fn check_port(&self) -> Option<crate::progress::check::Port<T>> {
+        None
+    }
 }
 
 /// A paired Push + Pull channel for intra-process communication.

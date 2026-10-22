@@ -7,6 +7,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Progress test harness
+
+- Add a progress invariant checker, `instancy::progress::check`, compiled
+  into every debug build and, with the new `progress-check` feature, into
+  release builds. It checks late data (V1), termination with work outstanding
+  (V4), the progress wire rules (V6), and, with an oracle that measures
+  occupancy from channels, operator queues and capability objects rather than
+  from the progress accounting, that no frontier passes outstanding work
+  (V7). It also reports a worker's residual counts at finish (V5). Select its
+  behaviour with `INSTANCY_PROGRESS_CHECK` (`report`, the default; `verbose`;
+  `panic`; `off`). It never changes how a dataflow runs.
+- Add a progress conformance matrix (`tests/progress_conformance.rs`, a
+  bounded subset in CI) and the correctness audit's repro tests
+  (`tests/audit_repros.rs`, on demand), with today's known failures recorded
+  by audit finding; a protocol property test checks the real reachability
+  tracker under random interleavings and catches four protocol mutants.
+
 ### Exchange and broadcast retry fixes
 
 - Fix duplicated records when an exchange or broadcast `try_push` is accepted

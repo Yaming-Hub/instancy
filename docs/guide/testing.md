@@ -113,6 +113,44 @@ let (b_read, b_write) = tokio::io::split(b_to_a);
 
 This is how instancy's own integration tests work — see `tests/cluster.rs` for examples.
 
+## Progress invariant checker
+
+Every debug build (including every `cargo test` build) contains a progress
+invariant checker, `instancy::progress::check`. It watches progress tracking
+without changing how a dataflow runs, and records a violation when:
+
+- **V1**: an operator consumes data behind its input frontier;
+- **V4**: a worker force-closes or finishes while work is outstanding, or an
+  exhausted input never gets an empty frontier;
+- **V6**: a progress frame breaks the wire rules (a split batch that is not
+  positives-first, a batch after end-of-stream);
+- **V7**: a worker's frontier claims a location is done while records,
+  queued output or capabilities are still there. V7 measures where work is
+  from the channels and operator queues themselves, never from the progress
+  accounting it checks.
+
+It also reports (**V5**) the non-zero counts a worker's tracker holds when it
+finishes. The environment variable `INSTANCY_PROGRESS_CHECK` chooses what a
+violation does: `report` (the default: record it and log a `tracing` warning),
+`verbose` (also print it), `panic`, or `off`. A test can take
+`let mark = check::mark();` before a run and read
+`check::violations_since(mark)` after it. Release builds contain no checker
+unless the `progress-check` feature is enabled.
+
+Two test suites build on it:
+
+- `tests/progress_conformance.rs` runs dataflow shapes on every execution
+  path, transport, worker count and channel capacity, and checks exact
+  outputs plus the checker's findings. Known failures of today's code are
+  listed, by audit finding, in its `EXPECTED_FAILURES` table. CI runs a
+  bounded subset; run the whole matrix with
+  `cargo test -p instancy --all-features --test progress_conformance -- --ignored --test-threads=1`.
+- `tests/audit_repros.rs` holds the correctness audit's repro tests. They
+  are timing-sensitive races, so they run on demand:
+  `cargo test -p instancy --all-features --test audit_repros -- --ignored --exact audit_repros_match_table`
+  runs every repro and checks that the ones listed as failing today still
+  fail exactly as recorded and the rest pass.
+
 ## Related Examples
 
 - [`runtime_isolation.rs`](../../instancy/examples/runtime_isolation.rs)

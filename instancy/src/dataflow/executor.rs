@@ -593,6 +593,9 @@ impl<T: Timestamp> DataflowExecutor<T> {
     /// If `external_wake_handle` is provided, the executor uses it instead of
     /// creating its own. This allows the runtime to share the same WakeHandle
     /// with InputSenders and CancellationTokens created before materialization.
+    ///
+    /// `check` is the progress checker's context (`()` when it is compiled
+    /// out): every channel is built through it, so the checker observes it.
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn materialize(
         graph: &DataflowGraph,
@@ -603,6 +606,7 @@ impl<T: Timestamp> DataflowExecutor<T> {
         external_wake_handle: Option<WakeHandle>,
         worker_context: WorkerContext,
         progress_reporters: Option<Arc<dyn std::any::Any + Send + Sync>>,
+        check: crate::progress::CheckCtx,
     ) -> Result<Self> {
         let edges = graph.edges();
         let feedback_edges = graph.feedback_edges();
@@ -646,8 +650,19 @@ impl<T: Timestamp> DataflowExecutor<T> {
                     edge_index: edge_idx,
                 })
             })?;
+            let edge = if edge_idx < edges.len() {
+                &edges[edge_idx]
+            } else {
+                &feedback_edges[edge_idx - edges.len()]
+            };
             let (_, factory) = &mut channel_factories[pos];
-            let (push, pull) = factory.build(&worker_context, Some(wake_handle.clone()))?;
+            let (push, pull) = factory.build_checked(
+                &worker_context,
+                Some(wake_handle.clone()),
+                &check,
+                edge.source,
+                edge.target,
+            )?;
             push_ends.push(Some(push));
             pull_ends.push(Some(pull));
         }
@@ -1685,7 +1700,18 @@ impl<T: Timestamp> DataflowExecutor<T> {
             None
         };
 
-        let outcome = self.run_one_sweep_inner()?;
+        let outcome = self.run_one_sweep_inner();
+
+        // Tell the progress checker how this worker ended.
+        #[cfg(any(debug_assertions, feature = "progress-check"))]
+        if let Some(tracker) = &mut self.progress_tracker {
+            match &outcome {
+                Ok(SweepOutcome::Completed) => tracker.check_finish(true, true),
+                Ok(SweepOutcome::Quiescent) | Err(_) => tracker.check_finish(false, true),
+                _ => {}
+            }
+        }
+        let outcome = outcome?;
 
         if matches!(outcome, SweepOutcome::Completed) {
             self.finish_probes();
@@ -1817,6 +1843,8 @@ impl<T: Timestamp> DataflowExecutor<T> {
                     && !tracker.has_pending_peer_progress()?
                     && tracker.all_peers_synced()
                 {
+                    #[cfg(any(debug_assertions, feature = "progress-check"))]
+                    tracker.check_force_close();
                     for pos in 0..self.operators.len() {
                         if !self.done[pos] {
                             self.operators[pos].close_inputs();

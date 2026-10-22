@@ -44,6 +44,9 @@ bincode-codec = ["dep:bincode", "dep:serde"]
 chrome-trace = ["dep:serde", "dep:serde_json"]
 transport = ["dep:crc32fast"]
 test-utils = []
+# Compile the progress invariant checker (V1, V4–V7) into release builds.
+# Debug builds (including every `cargo test` build) always include it.
+progress-check = []
 
 [[example]]
 name = "async_io_channels"
