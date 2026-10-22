@@ -182,10 +182,15 @@ async fn cluster_with_many_exchange_edges_spawns() {
         Ok(())
     };
     let mut joins = Vec::new();
+    // Both nodes' spawns return before either cancels: a node that cancels
+    // while its peer is still in the ready barrier fails the peer's spawn,
+    // a race this test is not about.
+    let spawned = std::sync::Arc::new((std::sync::Mutex::new(0usize), std::sync::Condvar::new()));
     for node in ["node-a", "node-b"] {
         let c = conns.remove(node).unwrap();
         let topo = topology.clone();
         let h = handle.clone();
+        let spawned = std::sync::Arc::clone(&spawned);
         joins.push(tokio::task::spawn_blocking(move || {
             let rt = RuntimeHandle::new(RuntimeConfig {
                 worker_threads: 2,
@@ -204,6 +209,15 @@ async fn cluster_with_many_exchange_edges_spawns() {
                 &h,
                 SpawnOptions::new(),
             );
+            {
+                let (count, both) = &*spawned;
+                let mut count = count.lock().unwrap();
+                *count += 1;
+                both.notify_all();
+                let _ = both
+                    .wait_timeout_while(count, Duration::from_secs(60), |n| *n < 2)
+                    .unwrap();
+            }
             let err = r.as_ref().err().map(|e| e.to_string());
             if let Ok(c) = r {
                 c.cancel();
