@@ -450,6 +450,7 @@ fn intern(text: &str) -> &'static str {
 
 const V1_LATE: Failure = Failure::Violation(Check::V1, "late-data", None);
 const V7_AHEAD: Failure = Failure::Violation(Check::V7, "frontier-ahead-of-work", None);
+const V7_RESIDUAL: Failure = Failure::Violation(Check::V7, "end-state-residual", None);
 const V4_FORCE: Failure = Failure::Violation(Check::V4, "force-close-with-work", None);
 const V4_EXHAUSTED: Failure = Failure::Violation(Check::V4, "exhausted-input-frontier", None);
 const V4_HOLDING: Failure = Failure::Violation(Check::V4, "finished-holding-capability", None);
@@ -693,7 +694,7 @@ const EXPECTED_FAILURES: &[Expected] = &[
     Expected {
         audit: "O-9/P-2",
         shapes: LOOPS,
-        paths: &[Path::Unfused],
+        paths: &[Path::Unfused, Path::Staged],
         transports: ANY_TRANSPORT,
         workers: ANY_WORKERS,
         caps: ANY_CAP,
@@ -702,8 +703,34 @@ const EXPECTED_FAILURES: &[Expected] = &[
               feedback work); Iterate and LoopThenFlush only when pinned to one or two cores",
     },
     Expected {
+        audit: "C2/P-2",
+        shapes: &[Shape::Distinct],
+        paths: &[Path::Staged],
+        transports: ANY_TRANSPORT,
+        workers: MULTI,
+        caps: &[Cap::One],
+        failures: &[HANG, V4_EXHAUSTED, V4_FORCE],
+        why: "worker 0, the only host of stage 1, sees an empty view while records it never \
+              counted sit in the exchange (C2) and in worker 1's pending_output (H1); idle \
+              force-close then fires on the empty view (P-2)",
+    },
+    Expected {
+        audit: "C1/C2",
+        shapes: &[Shape::Distinct],
+        paths: UNIFORM,
+        transports: &[Transport::Shared],
+        workers: MULTI,
+        caps: ANY_CAP,
+        failures: &[DATA_LOST, V4_HOLDING, V4_FORCE, LOSS, V7_RESIDUAL],
+        why: "under full-matrix load, Shared's pooled connections let progress overtake \
+              data: a node's view sums to zero through cancellation (the exchange input \
+              holds -n with no +n against distinct's and the input's capabilities; traced, \
+              every peer heard from, no seed missing), it force-closes, and records are lost \
+              or reach finished operators (rare; never seen isolated)",
+    },
+    Expected {
         audit: "H11",
-        shapes: &[Shape::IterateExchange],
+        shapes: &[Shape::IterateExchange, Shape::LoopThenCount],
         paths: UNIFORM_STAGED_AND_SIMPLE,
         transports: ANY_TRANSPORT,
         workers: ANY_WORKERS,
@@ -762,30 +789,20 @@ const EXPECTED_FAILURES: &[Expected] = &[
         transports: ANY_TRANSPORT,
         workers: ANY_WORKERS,
         caps: &[Cap::One],
-        failures: &[HANG, V4_FORCE, V4_EXHAUSTED],
-        why: "with one-batch channels a worker force-closes while tasks hold records, and \
-              its peers spin",
+        failures: &[HANG, V4_EXHAUSTED],
+        why: "with one-batch channels, after a worker force-closes while tasks hold \
+              records, its peers spin",
     },
     Expected {
         audit: "O-4/P-2",
         shapes: &[Shape::UnaryAsync],
-        paths: &[Path::Fused],
+        paths: UNIFORM,
         transports: ANY_TRANSPORT,
         workers: MULTI,
-        caps: &[Cap::One],
+        caps: ANY_CAP,
         failures: &[V4_FORCE],
-        why: "as above, fused (seen pinned to one core)",
-    },
-    Expected {
-        audit: "O-4/P-2",
-        shapes: &[Shape::AsyncFailure],
-        paths: &[Path::Unfused],
-        transports: ANY_TRANSPORT,
-        workers: MULTI,
-        caps: &[Cap::One],
-        failures: &[HANG, V4_EXHAUSTED],
-        why: "with one-batch channels a worker spins while unary_async holds records, and \
-              the failure never ends the run (seen pinned to two cores)",
+        why: "a worker force-closes on its tracker's completion while unary_async tasks \
+              hold records",
     },
     Expected {
         audit: "O-4/H1",
@@ -804,11 +821,10 @@ const EXPECTED_FAILURES: &[Expected] = &[
         transports: &[Transport::Dedicated, Transport::Shared],
         workers: MULTI,
         caps: ANY_CAP,
-        failures: &[DATA_LOST, V4_FORCE, V4_HOLDING],
+        failures: &[V4_FORCE, V4_HOLDING],
         why: "a node force-closes while loop records are still in flight to it (completion \
-              sums signed counts); they arrive at finished operators and the cluster fails \
-              with a data-loss error, or the node finishes holding the count's per-epoch \
-              capabilities (pinned to one core)",
+              sums signed counts) and finishes holding the count's per-epoch capabilities \
+              (pinned to one core)",
     },
 ];
 
