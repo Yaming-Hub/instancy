@@ -1255,14 +1255,13 @@ If no repartition operators with parallelism are used, all operators are in one 
 
 1. **Build time**: `builder.build()` walks the operator graph and groups operators into stages by following Pipeline edges. Each repartition edge starts a new stage.
 2. **Stage metadata**: `LogicalDataflow` carries `Vec<StageInfo>` with each stage's parallelism and operator indices.
-3. **Spawn time**: `spawn_multi` reads stage metadata, creates per-stage executors with fused operators, and wires cross-stage exchange channels (M×N asymmetric routing).
+3. **Spawn time**: `spawn_multi` computes the physical plan from the stage metadata (a stage with parallelism `p` runs on workers `0..p`), materializes each worker's operators on the one executor core, and wires cross-stage exchange channels (M×N asymmetric routing).
 
 #### Progress Tracking with Stages
 
-Each stage's workers form an independent progress-tracking group:
+Every worker runs one progress tracker over the whole graph, connected to every other worker, exactly as on the uniform path. Each worker seeds every operator's initial capabilities once per worker that runs the operator (the physical plan's multiplicities), so its view holds every peer's initial state from the start. See `progress-accounting-design.md` §5.1.8 (step 2), which replaced the per-stage trackers this section used to describe.
 
-- **Within a stage**: Workers exchange progress messages among themselves (same as multi-worker progress tracking today).
-- **At stage boundaries**: The exchange channel aggregates upstream workers' frontiers. A downstream worker's input frontier advances only when **all** upstream workers that can route to it have advanced past that timestamp.
+A pipeline edge between stages must not lead into fewer workers than its source runs on: every worker that runs the source must run the target, or the spawn fails. A worker that runs only the target sees that input as already ended. A feedback edge needs equal parallelism at both ends.
 
 #### Restrictions
 
@@ -1418,7 +1417,7 @@ Disable with `SpawnOptions::new().auto_parallelism(false)` to use the exact `num
 
 The hosting application calls `spawn_cluster()` on **every node** with the same `ClusterTopology` and `DataflowId`. The runtime coordinates via:
 
-1. **Handshake** — nodes exchange their cluster protocol version, node id, and a fingerprint (stable hash of graph structure, record/timestamp types and cluster topology) over the control channel. If any node speaks another protocol version, is not the node the connection was assigned to, or has a different graph or topology → error. This confirms all nodes are running the same dataflow on the same cluster.
+1. **Handshake** — nodes exchange their cluster protocol version, node id, and a fingerprint (stable hash of graph structure, record/timestamp types, cluster topology and physical plan) over the control channel. If any node speaks another protocol version, is not the node the connection was assigned to, or has a different graph or topology → error. This confirms all nodes are running the same dataflow on the same cluster.
 2. **Ready barrier** — after all local workers are materialized (operators constructed, channels wired), each node waits for ALL peers to also signal "ready." No node begins execution until every node has completed setup. This prevents a fast node from sending data before a slow node's receivers are ready.
 
 ```
@@ -1916,9 +1915,10 @@ Progress channels and control broadcast channels are also created here.
 ### Phase 4: Register and start (transition to concurrent)
 
 All materialized workers are registered with the executor. Only after ALL
-workers are registered does execution begin — this ensures every worker's
-progress channels contain the full set of initial capability broadcasts
-from all peers.
+workers are registered does execution begin. (Every worker's tracker is
+seeded with every peer's initial capabilities from the physical plan, so this
+ordering is no longer what keeps a worker from seeing incomplete initial
+state; it keeps a failed materialization from leaving siblings running.)
 
 ```
 ── nothing executes until here ──
@@ -1991,6 +1991,13 @@ operators for the stages it participates in. This reduces memory, eliminates
 idle operators, and is described in §5.12 StageExecutor Architecture.
 
 ## 5.12 StageExecutor Architecture
+
+> **Superseded.** The `StageExecutor`, `CombinedStageExecutor` and per-stage
+> trackers described in this section were removed in step 2 of the
+> progress-accounting redesign (`progress-accounting-design.md` §5.1.8): every
+> path now runs the uniform `DataflowExecutor`, hosting the operators the
+> physical plan assigns to its worker, with one whole-graph progress tracker
+> per worker. The section is kept as a record of the earlier design.
 
 ### Problem
 

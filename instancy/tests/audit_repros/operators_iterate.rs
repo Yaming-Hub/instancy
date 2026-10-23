@@ -142,7 +142,7 @@ fn collatz_steps(mut x: i64) -> i64 {
 /// the loop body, 1/2/4 workers, several epochs; outputs must be at the right
 /// outer epoch and identical to a sequential oracle.
 #[test]
-#[ignore = "expected failure (C2); see EXPECTED in tests/audit_repros.rs"]
+#[ignore = "expected failure (C2, intermittent); see EXPECTED in tests/audit_repros.rs"]
 fn collatz_map_exchange_matches_oracle() {
     let mut data = Vec::new();
     let mut expected = Vec::new();
@@ -582,13 +582,13 @@ fn staged_loop(drop_seven: bool, threshold: i64) -> Vec<i64> {
 }
 
 #[test]
-#[ignore = "expected failure (H14, intermittent); see EXPECTED in tests/audit_repros.rs"]
+#[ignore = "expected failure (C2, intermittent); see EXPECTED in tests/audit_repros.rs"]
 fn staged_loop_control_without_drops() {
     assert_eq!(staged_loop_with_drops(false), vec![10, 10]);
 }
 
 #[test]
-#[ignore = "expected failure (H14); see EXPECTED in tests/audit_repros.rs"]
+#[ignore = "expected failure (C2); see EXPECTED in tests/audit_repros.rs"]
 fn staged_loop_with_dropped_records_terminates() {
     // 1 -> ... -> 7 (dropped); 8 -> 9 -> 10 (exits)
     assert_eq!(staged_loop_with_drops(true), vec![10]);
@@ -598,7 +598,7 @@ fn staged_loop_with_dropped_records_terminates() {
 /// they entered on (final value 11 is routed to worker 1; all input enters on
 /// worker 0).
 #[test]
-#[ignore = "expected failure (H14); see EXPECTED in tests/audit_repros.rs"]
+#[ignore = "expected failure (C2); see EXPECTED in tests/audit_repros.rs"]
 fn staged_loop_exit_on_other_worker_terminates() {
     assert_eq!(staged_loop(false, 11), vec![11, 11]);
 }

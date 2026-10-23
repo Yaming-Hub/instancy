@@ -101,7 +101,7 @@ fn staged_notify_fires_on_frontier_advance_while_input_open() {
 /// output before the frontier passes 0 is a premature notification; a second
 /// batch at epoch 0 then yields a second partial sum for the same epoch.
 #[test]
-#[ignore = "expected failure (H14); see EXPECTED in tests/audit_repros.rs"]
+#[ignore = "audit repro; run by audit_repros_match_table (tests/audit_repros.rs)"]
 fn staged_notify_must_not_fire_before_epoch_sealed() {
     let rt = RuntimeHandle::new(RuntimeConfig::default()).unwrap();
     let mut multi = rt
@@ -228,7 +228,7 @@ fn drain_run(staged: bool) -> (instancy::Result<()>, usize) {
 /// drain_on_cancel must let in-flight data finish after inputs are closed.
 /// Works on the uniform (DataflowExecutor) path; the staged path ignores it.
 #[test]
-#[ignore = "expected failure (H14); see EXPECTED in tests/audit_repros.rs"]
+#[ignore = "audit repro; run by audit_repros_match_table (tests/audit_repros.rs)"]
 fn drain_on_cancel_honoured_by_staged_path() {
     let (uniform, n_uniform) = drain_run(false);
     eprintln!("uniform path: {uniform:?}, delivered {n_uniform}/2000");

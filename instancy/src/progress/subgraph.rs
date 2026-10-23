@@ -565,28 +565,6 @@ impl<T: Timestamp> SubgraphBuilder<T> {
             .collect()
     }
 
-    /// Remove all operators (and their edges/capabilities) not in `keep`.
-    ///
-    /// After calling this, only operators whose index is in `keep` remain.
-    /// Edges where either endpoint references a removed operator are dropped.
-    /// This is used for per-stage materialization: workers only keep the
-    /// operators for stages they participate in.
-    pub fn retain_operators(&mut self, keep: &std::collections::HashSet<usize>) {
-        self.operators.retain(|idx, _| keep.contains(idx));
-        self.connectivity.retain(|idx, _| keep.contains(idx));
-        self.initial_capabilities
-            .retain(|idx, _| keep.contains(idx));
-        self.progress_buffers.retain(|idx, _| keep.contains(idx));
-        self.edges
-            .retain(|(src, tgt)| keep.contains(&src.node()) && keep.contains(&tgt.node()));
-        // Drop in-flight bindings whose source or target operator was removed:
-        // a per-stage tracker can only account locations it contains. Bindings
-        // that span stage boundaries are handled by the stage executor's
-        // boundary accounting, not the per-stage tracker.
-        self.inflight_edges
-            .retain(|b| keep.contains(&b.source.0) && keep.contains(&b.target.0));
-    }
-
     /// Compiles the subgraph into a live [`ProgressTracker`].
     ///
     /// Consumes the builder and returns the tracker along with per-operator
@@ -672,7 +650,6 @@ impl<T: Timestamp> SubgraphBuilder<T> {
             dirty_operators: Vec::new(),
             progress_channels: None,
             local_changes_buffer: Vec::new(),
-            peers_heard_from: Vec::new(),
             inflight_reporters,
             #[cfg(debug_assertions)]
             inflight_net: std::collections::BTreeMap::new(),
@@ -752,13 +729,6 @@ pub struct ProgressTracker<T: Timestamp> {
     /// Populated during `collect_operator_progress()` and drained
     /// during `broadcast_local_changes()`.
     local_changes_buffer: Vec<ProgressChange<T>>,
-    /// Tracks which peer workers have sent at least one progress message.
-    /// Indexed by worker id. `true` for self (no receiver) and for peers
-    /// that have sent data. `false` for peers we haven't heard from yet.
-    /// Used to prevent premature completion: we must hear from all peers
-    /// before declaring the dataflow complete, since their initial
-    /// capabilities may still be in transit over the network.
-    peers_heard_from: Vec<bool>,
     /// In-flight message reporters, each bound to a downstream input
     /// `(target_op, target_port)` with the function that drains it into this
     /// tracker's timestamp `T`. Boundary channels (e.g. exchange) record a
@@ -799,41 +769,100 @@ struct OperatorFrontierState<T: Timestamp> {
 }
 
 impl<T: Timestamp> ProgressTracker<T> {
-    /// Seeds initial capabilities into the reachability tracker.
+    /// Seeds the declared initial capabilities of a single-worker tracker
+    /// (each once) and computes the initial frontiers. See
+    /// [`initialize_for_plan`](Self::initialize_for_plan).
     ///
-    /// Must be called once before the first [`propagate`](Self::propagate) call.
+    /// # Errors
     ///
-    /// If cross-worker progress channels are attached, this also broadcasts
-    /// the initial capabilities to all peer workers and absorbs peers'
-    /// initial capabilities. This ensures every worker's tracker starts
-    /// with a global view of all capabilities across all workers.
+    /// A tracker with progress channels belongs to a multi-worker dataflow:
+    /// seeding each capability once would undercount its peers' instances,
+    /// so it must use `initialize_for_plan`.
     pub fn initialize(&mut self) -> Result<(), crate::Error> {
+        if self.progress_channels.is_some() {
+            return Err(crate::Error::Dataflow(DataflowError::InvalidConfig(
+                "a progress tracker with progress channels belongs to a multi-worker \
+                 dataflow: initialize it from its physical plan (initialize_for_plan), \
+                 not with initialize, which seeds each capability once"
+                    .into(),
+            )));
+        }
+        self.seed_and_initialize(1, |_| 1)
+    }
+
+    /// Seeds the initial capabilities from the physical plan (A4) and
+    /// computes the initial frontiers. Must be called once, after
+    /// [`set_progress_channels`](Self::set_progress_channels) and before the
+    /// first [`propagate`](Self::propagate).
+    ///
+    /// Every operator's declared initial capabilities (see
+    /// [`SubgraphBuilder::add_operator_with_capabilities`]) are seeded once
+    /// per worker that runs the operator
+    /// ([`PhysicalPlan::seed_multiplicity`]), for every operator of the
+    /// graph whether or not this worker runs it. Nothing is broadcast: every
+    /// worker seeds the same counts, so each view holds every peer's initial
+    /// capabilities before any worker runs, and only the releases of those
+    /// capabilities travel. Seeding fewer lets a frontier pass work; seeding
+    /// more never completes.
+    ///
+    /// A tracker of a multi-worker dataflow must have progress channels
+    /// (debug assertion): its view must be global.
+    ///
+    /// In debug builds, no operator may already have reported a capability
+    /// through its reporter: one created at materialization instead of
+    /// declared would reach peers only when broadcast, after they may have
+    /// computed frontiers without it (audit H13).
+    pub(crate) fn initialize_for_plan(
+        &mut self,
+        plan: &crate::dataflow::plan::PhysicalPlan,
+    ) -> Result<(), crate::Error> {
+        self.seed_and_initialize(plan.total_workers(), |op| plan.seed_multiplicity(op))
+    }
+
+    /// Seeds each declared initial capability of `op` `multiplicity(op)`
+    /// times in a `total_workers`-worker dataflow, then computes the
+    /// initial frontiers.
+    fn seed_and_initialize(
+        &mut self,
+        total_workers: usize,
+        multiplicity: impl Fn(usize) -> usize,
+    ) -> Result<(), crate::Error> {
         if self.initialized {
             return Err(crate::Error::Dataflow(DataflowError::InvalidConfig(
                 "ProgressTracker already initialized".into(),
             )));
         }
+        debug_assert!(
+            total_workers <= 1 || self.progress_channels.is_some(),
+            "the progress tracker of a {total_workers}-worker dataflow has no progress \
+             channels: every multi-worker tracker must see every worker's progress"
+        );
         self.initialized = true;
 
-        // Seed initial capabilities from the builder.
+        // Seed every declared initial capability once per worker that runs
+        // its operator.
         let initial_caps = std::mem::take(&mut self.initial_capabilities);
         for (index, mut caps) in initial_caps {
+            let copies = multiplicity(index) as i64;
             for (output, batch) in caps.iter_mut().enumerate() {
                 for (time, diff) in batch.drain() {
                     self.tracker
-                        .update_source(index, output, time.clone(), diff);
-                    // Accumulate for broadcasting to peers.
-                    self.local_changes_buffer
-                        .push(ProgressChange::source(index, output, time, diff));
+                        .update_source(index, output, time, diff * copies);
                 }
             }
         }
 
-        // Drain any capabilities that operators may have already reported
-        // through their ProgressReporter (e.g., from Capability::new).
-        self.collect_operator_progress();
+        // Every initial capability is declared: nothing may have been
+        // reported yet. (Release builds account for it as before.)
+        let undeclared = self.collect_operator_progress();
+        debug_assert!(
+            undeclared == 0,
+            "{undeclared} progress change(s) were reported before the tracker was \
+             initialized: an operator created a capability at materialization instead of \
+             declaring it with `add_operator_with_capabilities` (audit H13)"
+        );
 
-        // Broadcast initial capabilities to peers and absorb theirs.
+        // Absorb anything a peer that already runs has sent.
         self.broadcast_local_changes();
         self.receive_peer_changes()?;
 
@@ -934,8 +963,7 @@ impl<T: Timestamp> ProgressTracker<T> {
 
     /// Attach cross-worker progress exchange channels.
     ///
-    /// Must be called before [`initialize()`](Self::initialize) so that
-    /// initial capabilities are broadcast to peers during initialization.
+    /// Must be called before [`initialize_for_plan()`](Self::initialize_for_plan).
     pub fn set_progress_channels(
         &mut self,
         channels: WorkerProgressChannels<T>,
@@ -945,9 +973,6 @@ impl<T: Timestamp> ProgressTracker<T> {
                 "set_progress_channels must be called before initialize()".into(),
             )));
         }
-        // Initialize peer tracking: mark peers with receivers as "not yet heard from".
-        // Slots with `None` (self or non-existent peers) are pre-marked as heard.
-        self.peers_heard_from = channels.receivers.iter().map(|r| r.is_none()).collect();
         self.progress_channels = Some(channels);
         Ok(())
     }
@@ -972,22 +997,6 @@ impl<T: Timestamp> ProgressTracker<T> {
             }
         }
         Ok(false)
-    }
-
-    /// Returns `true` if all peer workers have sent at least one progress
-    /// message. In multi-node clusters, initial capabilities are broadcast
-    /// during tracker initialization. Until we've received those from all
-    /// peers, we cannot safely declare the dataflow complete — remote
-    /// capabilities may still be in transit over the network.
-    ///
-    /// Returns `true` when:
-    /// - No progress channels are attached (single-worker mode), or
-    /// - Every peer with a receiver has sent at least one progress batch.
-    pub fn all_peers_synced(&self) -> bool {
-        if self.peers_heard_from.is_empty() {
-            return true; // no peers, single-worker mode
-        }
-        self.peers_heard_from.iter().all(|&heard| heard)
     }
 
     /// Returns the current input frontier for an operator.
@@ -1128,7 +1137,7 @@ impl<T: Timestamp> ProgressTracker<T> {
                 }
             }
         }
-        check.publish(self.progress_channels.is_some(), targets, sources);
+        check.publish(targets, sources);
     }
 
     /// The executor is about to force-close its operators because this
@@ -1178,9 +1187,11 @@ impl<T: Timestamp> ProgressTracker<T> {
     /// Drains capability changes from all operators' ProgressReporters into the tracker.
     ///
     /// Also accumulates changes into `local_changes_buffer` for broadcasting
-    /// to peer workers (if progress channels are attached).
-    fn collect_operator_progress(&mut self) {
+    /// to peer workers (if progress channels are attached). Returns the
+    /// number of changes drained.
+    fn collect_operator_progress(&mut self) -> usize {
         let has_channels = self.progress_channels.is_some();
+        let mut collected = 0;
 
         // Only iterate materialized operators (those with progress buffers).
         for &index in &self.materialized_indices {
@@ -1192,6 +1203,7 @@ impl<T: Timestamp> ProgressTracker<T> {
             // reported via Capability::new/clone/drop/downgrade.
             for output in 0..shape.outputs {
                 let changes = progress.internal[output].drain();
+                collected += changes.len();
                 for (time, diff) in changes {
                     self.tracker
                         .update_source(index, output, time.clone(), diff);
@@ -1216,6 +1228,7 @@ impl<T: Timestamp> ProgressTracker<T> {
         // updates are broadcast just like capability changes.
         for (target_op, target_port, reporter, drain) in &self.inflight_reporters {
             for (time, diff) in drain(reporter.as_ref()) {
+                collected += 1;
                 // Single-worker symmetry fail-fast: a running in-flight net that
                 // goes negative means a `-count` was recorded without a matching
                 // `+count` (a missing producer-side wiring), which hangs the
@@ -1248,6 +1261,7 @@ impl<T: Timestamp> ProgressTracker<T> {
                 }
             }
         }
+        collected
     }
 
     /// Broadcasts accumulated local capability changes to all peer workers.
@@ -1290,31 +1304,22 @@ impl<T: Timestamp> ProgressTracker<T> {
             None => return Ok(()),
         };
 
-        for (idx, receiver) in channels.receivers.iter().enumerate() {
-            if let Some(r) = receiver {
-                let batches = r.drain_all()?;
-                if !batches.is_empty() {
-                    // Mark this peer as heard from (for initial sync tracking).
-                    if idx < self.peers_heard_from.len() {
-                        self.peers_heard_from[idx] = true;
-                    }
-                    for batch in batches {
-                        for change in batch {
-                            match change.kind {
-                                ProgressKind::Source => self.tracker.update_source(
-                                    change.node,
-                                    change.port,
-                                    change.time,
-                                    change.diff,
-                                ),
-                                ProgressKind::Target => self.tracker.update_target(
-                                    change.node,
-                                    change.port,
-                                    change.time,
-                                    change.diff,
-                                ),
-                            }
-                        }
+        for receiver in channels.receivers.iter().flatten() {
+            for batch in receiver.drain_all()? {
+                for change in batch {
+                    match change.kind {
+                        ProgressKind::Source => self.tracker.update_source(
+                            change.node,
+                            change.port,
+                            change.time,
+                            change.diff,
+                        ),
+                        ProgressKind::Target => self.tracker.update_target(
+                            change.node,
+                            change.port,
+                            change.time,
+                            change.diff,
+                        ),
                     }
                 }
             }
@@ -1814,19 +1819,31 @@ mod tests {
             ],
         )
         .unwrap();
+        // Both workers run both operators; upstream declares a capability
+        // at time 0, seeded once per worker.
+        let plan = crate::dataflow::plan::PhysicalPlan::for_hosts(2, &[(1, 2), (2, 2)]);
         // Per worker: its tracker, its in-flight reporter for downstream's
-        // input, and its upstream capability.
+        // input, and its upstream capability reporter (while held).
         type Worker = (
             ProgressTracker<u64>,
             ProgressReporter<u64>,
-            Option<Capability<u64>>,
+            Option<ProgressReporter<u64>>,
         );
         let mut workers: Vec<Worker> = Vec::new();
         for channels in channels {
             // upstream(op1) --> downstream(op2), as in the single-worker test.
             let mut builder = SubgraphBuilder::<u64>::new(1, 1);
+            let mut held = ChangeBatch::new();
+            held.update(0u64, 1);
             let upstream = builder
-                .add_operator(1, "upstream", 1, 1, PortConnectivity::identity(0u64))
+                .add_operator_with_capabilities(
+                    1,
+                    "upstream",
+                    1,
+                    1,
+                    PortConnectivity::identity(0u64),
+                    vec![held],
+                )
                 .unwrap()
                 .reporter(0)
                 .clone();
@@ -1836,15 +1853,13 @@ mod tests {
             builder.add_edge(Location::source(0, 0), Location::target(1, 0));
             builder.add_edge(Location::source(1, 0), Location::target(2, 0));
             builder.add_edge(Location::source(2, 0), Location::target(0, 0));
-            // Each worker's upstream holds a capability at time 0.
-            let capability = Capability::new(0u64, upstream);
             let mut tracker = builder.build();
             let inflight = tracker.register_inflight_reporter(2, 0);
             tracker.set_progress_channels(channels).unwrap();
-            workers.push((tracker, inflight, Some(capability)));
+            workers.push((tracker, inflight, Some(upstream)));
         }
         for (tracker, _, _) in &mut workers {
-            tracker.initialize().unwrap();
+            tracker.initialize_for_plan(&plan).unwrap();
         }
         // Two rounds, so each worker has absorbed everything the other sent.
         let exchange = |workers: &mut Vec<Worker>| {
@@ -1860,7 +1875,7 @@ mod tests {
         // then both workers release their capabilities.
         workers[0].1.update(t, n);
         for (_, _, capability) in &mut workers {
-            drop(capability.take());
+            capability.take().unwrap().update(0, -1);
         }
         exchange(&mut workers);
         for (w, (tracker, _, _)) in workers.iter().enumerate() {
@@ -1916,5 +1931,235 @@ mod tests {
         // only mean a producer-side `+count` was never wired. This must panic.
         inflight.update(5u64, -1);
         let _ = tracker.propagate();
+    }
+
+    // --- A4: seeding from the physical plan ---
+
+    /// The plan of [`seeding_scenario`]: `a` (op 1) runs on both workers,
+    /// `b` (op 2) and `sink` (op 3) only on worker 0.
+    fn seeding_plan() -> crate::dataflow::plan::PhysicalPlan {
+        crate::dataflow::plan::PhysicalPlan::for_hosts(2, &[(1, 2), (2, 1), (3, 1)])
+    }
+
+    /// Two trackers of a heterogeneous plan ([`seeding_plan`]), joined by
+    /// in-process progress channels and no data plane. `a` and `b` each
+    /// declare a capability at time 0; `sink` reads `a` on input 0 and `b`
+    /// on input 1. Each tracker is seeded from the plan, or, for a mutant,
+    /// with `mutant(worker, op)` copies of `op`'s capability.
+    ///
+    /// - Before any message is exchanged, every view already holds every
+    ///   running instance's capability.
+    /// - After one instance of `a` releases, both views still hold `a`'s
+    ///   time until the other instance releases too.
+    /// - Once every instance has released, both views are empty.
+    fn seeding_scenario(mutant: Option<&dyn Fn(usize, usize) -> usize>) -> Result<(), String> {
+        use crate::dataflow::channels::wake::WakeHandle;
+        let plan = seeding_plan();
+        let channels = crate::progress::progress_channel::create_progress_channels::<u64>(
+            2,
+            &[WakeHandle::new(), WakeHandle::new()],
+        )
+        .unwrap();
+        let declared = || {
+            let mut batch = ChangeBatch::new();
+            batch.update(0u64, 1);
+            vec![batch]
+        };
+        let mut trackers = Vec::new();
+        // Per worker: the reporters through which its instances of `a` and
+        // `b` release their capabilities.
+        let mut releases = Vec::new();
+        for (worker, channels) in channels.into_iter().enumerate() {
+            let mut builder = SubgraphBuilder::<u64>::new(0, 0);
+            let a = builder
+                .add_operator_with_capabilities(
+                    1,
+                    "a",
+                    0,
+                    1,
+                    PortConnectivity::new(0, 1),
+                    declared(),
+                )
+                .unwrap()
+                .reporter(0)
+                .clone();
+            let b = builder
+                .add_operator_with_capabilities(
+                    2,
+                    "b",
+                    0,
+                    1,
+                    PortConnectivity::new(0, 1),
+                    declared(),
+                )
+                .unwrap()
+                .reporter(0)
+                .clone();
+            builder
+                .add_operator(3, "sink", 2, 0, PortConnectivity::new(2, 0))
+                .unwrap();
+            builder.add_edge(Location::source(1, 0), Location::target(3, 0));
+            builder.add_edge(Location::source(2, 0), Location::target(3, 1));
+            let mut tracker = builder.build();
+            tracker.set_progress_channels(channels).unwrap();
+            match mutant {
+                None => tracker.initialize_for_plan(&plan),
+                Some(seed) => tracker.seed_and_initialize(2, |op| seed(worker, op)),
+            }
+            .map_err(|e| e.to_string())?;
+            trackers.push(tracker);
+            releases.push((a, b));
+        }
+        let exchange = |trackers: &mut Vec<ProgressTracker<u64>>| {
+            for _ in 0..2 {
+                for tracker in trackers.iter_mut() {
+                    tracker.propagate().unwrap();
+                }
+            }
+        };
+        let expect = |trackers: &[ProgressTracker<u64>],
+                      when: &str,
+                      input: usize,
+                      held: bool|
+         -> Result<(), String> {
+            for (w, tracker) in trackers.iter().enumerate() {
+                let frontier = tracker.input_frontier(3, input);
+                let ok = if held {
+                    frontier.less_equal(&0)
+                } else {
+                    frontier.is_empty()
+                };
+                if !ok {
+                    return Err(format!(
+                        "{when}: worker {w}'s frontier at sink input {input} is {frontier:?}, \
+                         expected {}",
+                        if held { "to hold 0" } else { "empty" }
+                    ));
+                }
+            }
+            Ok(())
+        };
+
+        // Nothing exchanged yet: both views hold every instance.
+        expect(&trackers, "before any message", 0, true)?;
+        expect(&trackers, "before any message", 1, true)?;
+
+        // Worker 0's instance of `a` releases; worker 1's still holds.
+        releases[0].0.update(0, -1);
+        exchange(&mut trackers);
+        expect(
+            &trackers,
+            "after one of a's two instances released",
+            0,
+            true,
+        )?;
+
+        // Worker 1's instance of `a` releases.
+        releases[1].0.update(0, -1);
+        exchange(&mut trackers);
+        expect(&trackers, "after both of a's instances released", 0, false)?;
+        expect(&trackers, "while b's only instance holds", 1, true)?;
+
+        // `b` runs only on worker 0, which releases it.
+        releases[0].1.update(0, -1);
+        exchange(&mut trackers);
+        expect(&trackers, "after every instance released", 1, false)?;
+        for (w, tracker) in trackers.iter().enumerate() {
+            if !tracker.is_completed() {
+                return Err(format!("worker {w} did not complete"));
+            }
+        }
+        Ok(())
+    }
+
+    /// A4: seeding from the plan holds every running instance's initial
+    /// capability in every view, from before the first message until that
+    /// instance releases.
+    #[test]
+    fn plan_seeding_holds_every_instance_until_it_releases() {
+        seeding_scenario(None).unwrap();
+    }
+
+    /// The scenario catches both ways of getting the multiplicity wrong
+    /// (the TLA+ scenarios `hetero_localseed` and `hetero_workerseed`).
+    #[test]
+    fn seeding_mutants_fail_the_scenario() {
+        let plan = seeding_plan();
+        // Each worker seeds only the operators it runs, once: unsafe.
+        let local = |worker: usize, op: usize| usize::from(plan.runs(worker, op));
+        let failure = seeding_scenario(Some(&local)).expect_err("local seeding passed");
+        assert!(failure.contains("before any message"), "{failure}");
+        // Every operator seeded once per worker, not per running worker:
+        // `b`'s view never empties.
+        let per_worker = |_worker: usize, _op: usize| plan.total_workers();
+        let failure = seeding_scenario(Some(&per_worker)).expect_err("per-worker seeding passed");
+        assert!(
+            failure.contains("after every instance released"),
+            "{failure}"
+        );
+    }
+
+    /// A capability an operator creates at materialization instead of
+    /// declaring it would miss every peer's seeding (audit H13): `initialize`
+    /// rejects it in debug builds.
+    #[cfg(debug_assertions)]
+    #[test]
+    #[should_panic(expected = "instead of declaring it")]
+    fn undeclared_capability_at_materialization_trips_initialize() {
+        let mut builder = SubgraphBuilder::<u64>::new(0, 0);
+        let reporter = builder
+            .add_operator(1, "source", 0, 1, PortConnectivity::new(0, 1))
+            .unwrap()
+            .reporter(0)
+            .clone();
+        let mut tracker = builder.build();
+        // The operator's factory creates a capability.
+        let _capability = Capability::new(0u64, reporter);
+        let _ = tracker.initialize();
+    }
+
+    /// Every tracker of a multi-worker dataflow sees every worker's
+    /// progress: one without progress channels is rejected in debug builds.
+    #[cfg(debug_assertions)]
+    #[test]
+    #[should_panic(expected = "has no progress channels")]
+    fn multi_worker_tracker_without_progress_channels_trips_initialize() {
+        let mut builder = SubgraphBuilder::<u64>::new(0, 0);
+        builder
+            .add_operator(1, "op", 0, 1, PortConnectivity::new(0, 1))
+            .unwrap();
+        let mut tracker = builder.build();
+        let plan = crate::dataflow::plan::PhysicalPlan::for_hosts(2, &[(1, 2)]);
+        let _ = tracker.initialize_for_plan(&plan);
+    }
+
+    /// `initialize` seeds each capability once: a tracker with progress
+    /// channels belongs to a multi-worker dataflow and would undercount its
+    /// peers' instances, so it is rejected (brief trap T1), in release
+    /// builds too.
+    #[test]
+    fn initialize_rejects_a_tracker_with_progress_channels() {
+        use crate::dataflow::channels::wake::WakeHandle;
+        let mut channels = crate::progress::progress_channel::create_progress_channels::<u64>(
+            2,
+            &[WakeHandle::new(), WakeHandle::new()],
+        )
+        .unwrap();
+        let mut builder = SubgraphBuilder::<u64>::new(0, 0);
+        builder
+            .add_operator_with_capabilities(
+                1,
+                "source",
+                0,
+                1,
+                PortConnectivity::new(0, 1),
+                vec![ChangeBatch::new_from(0u64, 1)],
+            )
+            .unwrap();
+        let mut tracker = builder.build();
+        tracker.set_progress_channels(channels.remove(0)).unwrap();
+        let error = tracker.initialize().unwrap_err().to_string();
+        assert!(error.contains("initialize_for_plan"), "{error}");
+        assert!(!tracker.is_initialized());
     }
 }

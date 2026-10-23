@@ -198,7 +198,8 @@ enum Path {
     Fused,
     /// Uniform executor, per-stage tasks (U-stage-task, the default).
     StageTasks,
-    /// The separate staged executor (S): stages with different parallelism.
+    /// Stages with different parallelism (S): the first exchange changes
+    /// parallelism (2 → 1 or 2 → 3), on the uniform executor core.
     Staged,
     /// `SimpleRuntime` (SR).
     Simple,
@@ -457,7 +458,6 @@ const HANG: Failure = Failure::Hang;
 const LOSS: Failure = Failure::Loss;
 const SPLIT: Failure = Failure::Split;
 const INFLIGHT_NEGATIVE: Failure = Failure::Error("inflight-negative");
-const WORKER_DIED: Failure = Failure::Error("worker-died");
 const DATA_LOST: Failure = Failure::Error("data-lost");
 
 /// Known errors: text the error contains, and its signature. Anything else
@@ -528,7 +528,6 @@ fn explanations(case: &Case, failure: Failure) -> Vec<&'static Expected> {
         .collect()
 }
 
-const ANY_SHAPE: &[Shape] = &[];
 const ANY_PATH: &[Path] = &[];
 const ANY_TRANSPORT: &[Transport] = &[];
 const ANY_WORKERS: &[Workers] = &[];
@@ -536,6 +535,15 @@ const ANY_CAP: &[Cap] = &[];
 const MULTI: &[Workers] = &[Workers::Two, Workers::Three];
 const UNIFORM: &[Path] = &[Path::Unfused, Path::Fused, Path::StageTasks];
 const UNIFORM_AND_SIMPLE: &[Path] = &[Path::Unfused, Path::Fused, Path::StageTasks, Path::Simple];
+/// Every path of the one executor core: the uniform paths, stages with
+/// different parallelism, and `SimpleRuntime`.
+const UNIFORM_STAGED_AND_SIMPLE: &[Path] = &[
+    Path::Unfused,
+    Path::Fused,
+    Path::StageTasks,
+    Path::Staged,
+    Path::Simple,
+];
 const LOOPS: &[Shape] = &[
     Shape::Iterate,
     Shape::IterateExchange,
@@ -594,7 +602,7 @@ const EXPECTED_FAILURES: &[Expected] = &[
             Shape::Reduce,
             Shape::Count,
         ],
-        paths: UNIFORM_AND_SIMPLE,
+        paths: UNIFORM_STAGED_AND_SIMPLE,
         transports: ANY_TRANSPORT,
         workers: ANY_WORKERS,
         caps: ANY_CAP,
@@ -643,42 +651,9 @@ const EXPECTED_FAILURES: &[Expected] = &[
               records +n; one worker trips the in-flight symmetry assertion",
     },
     Expected {
-        audit: "P-7",
-        shapes: &[
-            Shape::Exchange,
-            Shape::ExchangeTwice,
-            Shape::FanoutExchanges,
-            Shape::NotifySum,
-            Shape::Reduce,
-            Shape::Count,
-            Shape::Distinct,
-            Shape::UnaryAsync,
-            Shape::IterateExchange,
-            Shape::LoopThenCount,
-        ],
-        paths: &[Path::Simple],
-        transports: ANY_TRANSPORT,
-        workers: MULTI,
-        caps: ANY_CAP,
-        failures: &[WORKER_DIED],
-        why: "SimpleRuntime wires cross-worker exchanges but no progress channels: one \
-              worker's tracker gets -n for records whose +n another worker recorded",
-    },
-    Expected {
-        audit: "P-7",
-        shapes: &[Shape::Broadcast],
-        paths: &[Path::Simple],
-        transports: ANY_TRANSPORT,
-        workers: MULTI,
-        caps: ANY_CAP,
-        failures: &[V1_LATE, V7_AHEAD],
-        why: "SimpleRuntime has no cross-worker progress: a worker's frontier ignores \
-              records broadcast by its peers",
-    },
-    Expected {
         audit: "H10",
         shapes: &[Shape::Broadcast],
-        paths: UNIFORM,
+        paths: UNIFORM_AND_SIMPLE,
         transports: ANY_TRANSPORT,
         workers: ANY_WORKERS,
         caps: ANY_CAP,
@@ -698,67 +673,12 @@ const EXPECTED_FAILURES: &[Expected] = &[
     Expected {
         audit: "H12",
         shapes: &[Shape::FanoutExchanges],
-        paths: UNIFORM,
+        paths: UNIFORM_STAGED_AND_SIMPLE,
         transports: ANY_TRANSPORT,
         workers: MULTI,
         caps: ANY_CAP,
         failures: &[HANG, V4_EXHAUSTED],
         why: "two exchanges fed by one output share one in-flight key",
-    },
-    Expected {
-        audit: "H14",
-        shapes: ANY_SHAPE,
-        paths: &[Path::Staged],
-        transports: ANY_TRANSPORT,
-        workers: ANY_WORKERS,
-        caps: ANY_CAP,
-        failures: &[V1_LATE, V7_AHEAD],
-        why: "the staged executor's per-stage trackers see nothing across stages",
-    },
-    Expected {
-        audit: "H14",
-        shapes: &[
-            Shape::FanoutExchanges,
-            Shape::NotifySum,
-            Shape::Reduce,
-            Shape::Count,
-            Shape::Distinct,
-            Shape::UnaryAsync,
-            Shape::LoopThenCount,
-        ],
-        paths: &[Path::Staged],
-        transports: ANY_TRANSPORT,
-        workers: ANY_WORKERS,
-        caps: ANY_CAP,
-        failures: &[SPLIT],
-        why: "a downstream stage's notification fires before the upstream stage's records \
-              arrive (UnaryAsync and LoopThenCount: when pinned to one or two cores)",
-    },
-    Expected {
-        audit: "H14",
-        shapes: &[Shape::ExchangeTwice, Shape::IterateExchange],
-        paths: &[Path::Staged],
-        transports: ANY_TRANSPORT,
-        workers: ANY_WORKERS,
-        caps: ANY_CAP,
-        failures: &[HANG, V4_EXHAUSTED],
-        why: "a stage between two exchanges, or a loop across stages, never converges",
-    },
-    Expected {
-        audit: "H14/P-2",
-        shapes: &[
-            Shape::FanoutExchanges,
-            Shape::Distinct,
-            Shape::UnaryAsync,
-            Shape::LoopThenCount,
-        ],
-        paths: &[Path::Staged],
-        transports: ANY_TRANSPORT,
-        workers: ANY_WORKERS,
-        caps: ANY_CAP,
-        failures: &[LOSS, V4_FORCE, V7_RESIDUAL],
-        why: "a stage force-closes while records are still in its channels or tasks, and \
-              the run reports success without them",
     },
     Expected {
         audit: "O-9/H11",
@@ -774,7 +694,7 @@ const EXPECTED_FAILURES: &[Expected] = &[
     Expected {
         audit: "O-9/P-2",
         shapes: LOOPS,
-        paths: &[Path::Unfused],
+        paths: &[Path::Unfused, Path::Staged],
         transports: ANY_TRANSPORT,
         workers: ANY_WORKERS,
         caps: ANY_CAP,
@@ -783,9 +703,35 @@ const EXPECTED_FAILURES: &[Expected] = &[
               feedback work); Iterate and LoopThenFlush only when pinned to one or two cores",
     },
     Expected {
+        audit: "C2/P-2",
+        shapes: &[Shape::Distinct],
+        paths: &[Path::Staged],
+        transports: ANY_TRANSPORT,
+        workers: MULTI,
+        caps: &[Cap::One],
+        failures: &[HANG, V4_EXHAUSTED, V4_FORCE],
+        why: "worker 0, the only host of stage 1, sees an empty view while records it never \
+              counted sit in the exchange (C2) and in worker 1's pending_output (H1); idle \
+              force-close then fires on the empty view (P-2)",
+    },
+    Expected {
+        audit: "C1/C2",
+        shapes: &[Shape::Distinct],
+        paths: UNIFORM,
+        transports: &[Transport::Shared],
+        workers: MULTI,
+        caps: ANY_CAP,
+        failures: &[DATA_LOST, V4_HOLDING, V4_FORCE, LOSS, V7_RESIDUAL],
+        why: "under full-matrix load, Shared's pooled connections let progress overtake \
+              data: a node's view sums to zero through cancellation (the exchange input \
+              holds -n with no +n against distinct's and the input's capabilities; traced, \
+              every peer heard from, no seed missing), it force-closes, and records are lost \
+              or reach finished operators (rare; never seen isolated)",
+    },
+    Expected {
         audit: "H11",
-        shapes: &[Shape::IterateExchange],
-        paths: UNIFORM_AND_SIMPLE,
+        shapes: &[Shape::IterateExchange, Shape::LoopThenCount],
+        paths: UNIFORM_STAGED_AND_SIMPLE,
         transports: ANY_TRANSPORT,
         workers: ANY_WORKERS,
         caps: ANY_CAP,
@@ -807,7 +753,7 @@ const EXPECTED_FAILURES: &[Expected] = &[
     Expected {
         audit: "C2",
         shapes: LOOPS,
-        paths: UNIFORM_AND_SIMPLE,
+        paths: UNIFORM_STAGED_AND_SIMPLE,
         transports: ANY_TRANSPORT,
         workers: ANY_WORKERS,
         caps: &[Cap::One],
@@ -817,7 +763,7 @@ const EXPECTED_FAILURES: &[Expected] = &[
     Expected {
         audit: "C2",
         shapes: &[Shape::IterateExchange, Shape::LoopThenCount],
-        paths: UNIFORM_AND_SIMPLE,
+        paths: UNIFORM_STAGED_AND_SIMPLE,
         transports: ANY_TRANSPORT,
         workers: MULTI,
         caps: ANY_CAP,
@@ -828,7 +774,7 @@ const EXPECTED_FAILURES: &[Expected] = &[
     Expected {
         audit: "O-4/H1",
         shapes: &[Shape::UnaryAsync],
-        paths: UNIFORM_AND_SIMPLE,
+        paths: UNIFORM_STAGED_AND_SIMPLE,
         transports: ANY_TRANSPORT,
         workers: ANY_WORKERS,
         caps: ANY_CAP,
@@ -843,30 +789,20 @@ const EXPECTED_FAILURES: &[Expected] = &[
         transports: ANY_TRANSPORT,
         workers: ANY_WORKERS,
         caps: &[Cap::One],
-        failures: &[HANG, V4_FORCE, V4_EXHAUSTED],
-        why: "with one-batch channels a worker force-closes while tasks hold records, and \
-              its peers spin",
+        failures: &[HANG, V4_EXHAUSTED],
+        why: "with one-batch channels, after a worker force-closes while tasks hold \
+              records, its peers spin",
     },
     Expected {
         audit: "O-4/P-2",
         shapes: &[Shape::UnaryAsync],
-        paths: &[Path::Fused],
+        paths: UNIFORM,
         transports: ANY_TRANSPORT,
         workers: MULTI,
-        caps: &[Cap::One],
+        caps: ANY_CAP,
         failures: &[V4_FORCE],
-        why: "as above, fused (seen pinned to one core)",
-    },
-    Expected {
-        audit: "O-4/P-2",
-        shapes: &[Shape::AsyncFailure],
-        paths: &[Path::Unfused],
-        transports: ANY_TRANSPORT,
-        workers: MULTI,
-        caps: &[Cap::One],
-        failures: &[HANG, V4_EXHAUSTED],
-        why: "with one-batch channels a worker spins while unary_async holds records, and \
-              the failure never ends the run (seen pinned to two cores)",
+        why: "a worker force-closes on its tracker's completion while unary_async tasks \
+              hold records",
     },
     Expected {
         audit: "O-4/H1",
@@ -885,11 +821,10 @@ const EXPECTED_FAILURES: &[Expected] = &[
         transports: &[Transport::Dedicated, Transport::Shared],
         workers: MULTI,
         caps: ANY_CAP,
-        failures: &[DATA_LOST, V4_FORCE, V4_HOLDING],
+        failures: &[V4_FORCE, V4_HOLDING],
         why: "a node force-closes while loop records are still in flight to it (completion \
-              sums signed counts); they arrive at finished operators and the cluster fails \
-              with a data-loss error, or the node finishes holding the count's per-epoch \
-              capabilities (pinned to one core)",
+              sums signed counts) and finishes holding the count's per-epoch capabilities \
+              (pinned to one core)",
     },
 ];
 
@@ -2552,6 +2487,42 @@ fn skip_progress_check_runs_without_the_checker() {
         1,
         "the checker did not observe the dataflow"
     );
+}
+
+/// The staged path and `SimpleRuntime` run every worker with one progress
+/// tracker over the whole graph, attached to every other worker: the
+/// checker gets exactly one view per worker (no per-stage trackers), and
+/// every view is global (a multi-worker tracker without progress channels
+/// trips a debug assertion).
+#[test]
+fn staged_and_simple_workers_have_one_global_view_each() {
+    for path in [Path::Staged, Path::Simple] {
+        let _guard = case_lock();
+        check::set_mode(Mode::Report);
+        let mark = check::mark();
+        let case = Case::new(
+            Shape::Exchange,
+            path,
+            Transport::InProcess,
+            Workers::Three,
+            Cap::Default,
+        );
+        let observed = run_local(&case, timeout());
+        if let RunResult::Err(e) = &observed.result {
+            panic!("{case}: {e}");
+        }
+        assert!(matches!(observed.result, RunResult::Ok), "{case}: hang");
+        let oracles = check::oracles_since(mark);
+        assert_eq!(oracles.len(), 1, "{case}: {oracles:?}");
+        let oracle = &oracles[0];
+        assert_eq!(oracle.total_workers, 3, "{case}: {oracle:?}");
+        assert_eq!(oracle.registered_workers, 3, "{case}: {oracle:?}");
+        assert_eq!(
+            oracle.views, 3,
+            "{case}: one tracker per worker: {oracle:?}"
+        );
+        assert!(oracle.end_state_checked, "{case}: {oracle:?}");
+    }
 }
 
 /// The whole matrix (several minutes). See the module docs for the command.

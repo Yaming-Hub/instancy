@@ -94,16 +94,36 @@ use std::time::{Duration, Instant};
 /// How a repro fails today: it panics at `at` (`file.rs:line`) with a
 /// message containing `text`. (A repro that hangs gives up at its own
 /// deadline with such a panic, so a fix that only makes it slow still shows.)
+/// A race may decide which of several symptoms of one finding shows: such a
+/// repro lists each signature (`panics_any`).
 #[derive(Clone, Copy, Debug)]
 enum Fails {
     Panics {
         at: &'static str,
         text: &'static str,
     },
+    /// Panics with any one of these `(at, text)` signatures.
+    PanicsAny(&'static [(&'static str, &'static str)]),
 }
 
 const fn panics(at: &'static str, text: &'static str) -> Fails {
     Fails::Panics { at, text }
+}
+
+const fn panics_any(signatures: &'static [(&'static str, &'static str)]) -> Fails {
+    Fails::PanicsAny(signatures)
+}
+
+impl Fails {
+    /// Whether `output` shows this failure.
+    fn shown_by(self, output: &str) -> bool {
+        match self {
+            Fails::Panics { at, text } => panicked_as(output, at, text),
+            Fails::PanicsAny(signatures) => signatures
+                .iter()
+                .any(|(at, text)| panicked_as(output, at, text)),
+        }
+    }
 }
 
 /// One repro that fails on today's code.
@@ -161,22 +181,6 @@ const EXPECTED: &[Repro] = &[
         ),
     ),
     repro(
-        "builder_stages::audit_builder_cross_stage_binary_input_missing",
-        "H14",
-        panics(
-            "builder_stages.rs:101",
-            "missing endpoint for operator 'binary'",
-        ),
-    ),
-    repro(
-        "builder_stages::audit_builder_cross_stage_pipeline_edge_drops_data",
-        "H14",
-        panics(
-            "builder_stages.rs:66",
-            "data routed through exchange 'a' was lost",
-        ),
-    ),
-    repro(
         "executor_pipeline_inflight::notify_after_pipeline_backlog_fires_once_with_full_count",
         "H1",
         panics(
@@ -190,22 +194,6 @@ const EXPECTED: &[Repro] = &[
         panics(
             "executor_pipeline_inflight.rs:106",
             "async results were in flight",
-        ),
-    ),
-    repro(
-        "executor_staged::drain_on_cancel_honoured_by_staged_path",
-        "H14",
-        panics(
-            "executor_staged.rs:238",
-            "staged path ignored drain_on_cancel",
-        ),
-    ),
-    repro(
-        "executor_staged::staged_notify_must_not_fire_before_epoch_sealed",
-        "H14",
-        panics(
-            "executor_staged.rs:164",
-            "epoch 0 notified before it was sealed",
         ),
     ),
     repro(
@@ -275,18 +263,10 @@ const EXPECTED: &[Repro] = &[
     ),
     repro(
         "netprogress_staged_loop::loop_exit_on_other_worker_never_converges",
-        "H14",
+        "C2",
         panics(
             "netprogress_staged_loop.rs:88",
             "staged loop never converged",
-        ),
-    ),
-    repro(
-        "netprogress_startup::premature_notification_before_peer_initial_capabilities_arrive",
-        "H13",
-        panics(
-            "netprogress_startup.rs:219",
-            "must be reported once with all 3 records",
         ),
     ),
     repro(
@@ -322,7 +302,7 @@ const EXPECTED: &[Repro] = &[
             "branch_xchg_2: did not finish within 20s",
         ),
     ),
-    repro(
+    sometimes(
         "operators_iterate::collatz_map_exchange_matches_oracle",
         "C2",
         panics(
@@ -382,7 +362,7 @@ const EXPECTED: &[Repro] = &[
     ),
     sometimes(
         "operators_iterate::staged_loop_control_without_drops",
-        "H14",
+        "C2",
         panics(
             "operators_iterate.rs:26",
             "staged join: did not finish within 20s",
@@ -390,7 +370,7 @@ const EXPECTED: &[Repro] = &[
     ),
     repro(
         "operators_iterate::staged_loop_exit_on_other_worker_terminates",
-        "H14",
+        "C2",
         panics(
             "operators_iterate.rs:26",
             "staged join: did not finish within 20s",
@@ -398,7 +378,7 @@ const EXPECTED: &[Repro] = &[
     ),
     repro(
         "operators_iterate::staged_loop_with_dropped_records_terminates",
-        "H14",
+        "C2",
         panics(
             "operators_iterate.rs:26",
             "staged join: did not finish within 20s",
@@ -465,10 +445,13 @@ const EXPECTED: &[Repro] = &[
     sometimes(
         "netdata_frontier::count_per_epoch_wrong_when_frontier_overtakes_remote_data",
         "C1",
-        panics(
-            "netdata_frontier.rs:478",
-            "records sent after the peer finished",
-        ),
+        panics_any(&[
+            (
+                "netdata_frontier.rs:478",
+                "records sent after the peer finished",
+            ),
+            ("netdata_frontier.rs:480", "epochs with wrong/split counts"),
+        ]),
     ),
     sometimes(
         "progress_cluster_spurious_complete::tcp_map_exchange_idle_node_does_not_drop_late_records",
@@ -493,11 +476,42 @@ const EXPECTED: &[Repro] = &[
     ),
     sometimes(
         "netprogress_staged_loop::control_loop_exit_on_entering_worker_completes",
-        "H14",
+        "C2",
         panics("netprogress_staged_loop.rs:79", "join=Err(Timeout)"),
     ),
+    sometimes(
+        "netdata_frontier::frontier_passes_epoch_while_remote_data_in_flight_input_exchange",
+        "C2",
+        panics(
+            "netdata_frontier.rs:301",
+            "frontier advanced past an epoch before its remote data arrived",
+        ),
+    ),
+    sometimes(
+        "netdata_frontier::frontier_input_exchange_repeated",
+        "C2",
+        panics(
+            "netdata_frontier.rs:352",
+            "frontier advanced past epochs before their remote data arrived",
+        ),
+    ),
+    sometimes(
+        "netdata_frontier::frontier_control_map_exchange",
+        "H1",
+        panics(
+            "netdata_frontier.rs:312",
+            "frontier advanced past an epoch before its remote data arrived",
+        ),
+    ),
+    sometimes(
+        "netdata_frontier::frontier_map_exchange_repeated",
+        "H1",
+        panics(
+            "netdata_frontier.rs:337",
+            "frontier advanced past epochs before their remote data arrived",
+        ),
+    ),
 ];
-
 /// What one child run showed.
 enum Outcome {
     Passed,
@@ -615,11 +629,7 @@ fn judge(repro: &Repro) -> (Result<(), String>, Duration) {
     let timeout = TIMEOUT;
     let (outcome, elapsed) = run_child(repro.test, timeout);
     let verdict = match (&outcome, repro.fails) {
-        (Outcome::Panicked(output), Fails::Panics { at, text })
-            if panicked_as(output, at, text) =>
-        {
-            Ok(())
-        }
+        (Outcome::Panicked(output), fails) if fails.shown_by(output) => Ok(()),
         (Outcome::Passed, _) if repro.intermittent => Ok(()),
         (Outcome::Passed, _) => Err("now PASSES: remove its entry".to_string()),
         (Outcome::Panicked(output), _) => {

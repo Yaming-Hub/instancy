@@ -6,6 +6,7 @@
 //! - Dataflow spawn latency
 //! - Stateful operator throughput (unary, reduce)
 //! - Branching (branch + merge) throughput
+//! - Staged exchange (stages with different parallelism) throughput
 //!
 //! **Note:** Each iteration includes graph construction + execution. The
 //! `DataflowBuilder` creates a new graph per iteration because `LogicalDataflow`
@@ -520,6 +521,90 @@ fn bench_worker_scaling(c: &mut Criterion) {
     group.finish();
 }
 
+// ---------------------------------------------------------------------------
+// Staged exchange: stages with different parallelism
+// ---------------------------------------------------------------------------
+
+/// An input on 2 workers feeding a stage of 4 workers through `exchange_to`:
+/// the per-stage parallelism path. Every run checks that every record was
+/// delivered.
+fn bench_staged_exchange(c: &mut Criterion) {
+    let rt_tokio = Runtime::new().unwrap();
+    let _guard = rt_tokio.enter();
+
+    let instancy_rt = RuntimeHandle::new(RuntimeConfig {
+        worker_threads: max_workers().min(4),
+        ..Default::default()
+    })
+    .unwrap();
+
+    let mut group = c.benchmark_group("staged_exchange");
+    let input_workers = 2usize;
+    let batch_size = 1024usize;
+
+    for &element_count in &[10_000u64, 100_000] {
+        group.throughput(Throughput::Elements(element_count));
+        group.bench_with_input(
+            BenchmarkId::new("input_2_to_4", element_count),
+            &element_count,
+            |b, &count| {
+                b.iter(|| {
+                    let mut multi = instancy_rt
+                        .spawn_multi(
+                            "bench-staged",
+                            input_workers,
+                            |builder: &mut DataflowBuilder<u64>| {
+                                builder
+                                    .input::<i64>("in")?
+                                    .map("inc", |_t, x| x + 1)
+                                    .exchange_to("to-4", 4, |v: &i64| *v as u64)?
+                                    .map("double", |_t, x| x * 2)
+                                    .output("out")?;
+                                Ok(())
+                            },
+                            SpawnOptions::default(),
+                        )
+                        .unwrap();
+                    let collectors: Vec<_> = multi
+                        .take_all_outputs::<i64>("out")
+                        .unwrap()
+                        .into_iter()
+                        .map(|receiver| {
+                            std::thread::spawn(move || {
+                                let mut records = 0usize;
+                                while let Some(event) = receiver.recv() {
+                                    if let instancy::dataflow::OutputEvent::Data { data, .. } =
+                                        event
+                                    {
+                                        records += data.len();
+                                    }
+                                }
+                                records
+                            })
+                        })
+                        .collect();
+                    let mut senders = multi.take_all_inputs::<i64>("in").unwrap();
+                    senders.truncate(input_workers);
+                    let per_worker = count as usize / input_workers;
+                    for (w, sender) in senders.iter().enumerate() {
+                        let start = (w * per_worker) as i64;
+                        let values: Vec<i64> = (start..start + per_worker as i64).collect();
+                        for batch in values.chunks(batch_size) {
+                            sender.send(0, batch.to_vec()).unwrap();
+                        }
+                    }
+                    drop(senders);
+                    multi.join_blocking().unwrap();
+                    let delivered: usize = collectors.into_iter().map(|c| c.join().unwrap()).sum();
+                    assert_eq!(delivered, per_worker * input_workers, "records lost");
+                });
+            },
+        );
+    }
+
+    group.finish();
+}
+
 criterion_group!(
     benches,
     bench_input_frontier,
@@ -529,5 +614,6 @@ criterion_group!(
     bench_stateful_operator,
     bench_branching,
     bench_worker_scaling,
+    bench_staged_exchange,
 );
 criterion_main!(benches);

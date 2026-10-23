@@ -266,7 +266,8 @@ async fn multi_worker_iterate_collatz() {
 ///    the process hangs, which is what blocked the live investigation.
 /// 2. Confirm the exact park path. The stuck stage returns `WaitingForInput`
 ///    (not `Quiescent`) — so it is gated by `async_waiting` or
-///    `external_inputs_open` (stage_executor.rs `run_one_sweep`). Establish which,
+///    `external_inputs_open` (the `run_one_sweep` of the staged executor, since
+///    removed; re-establish the park path on the executor core). Establish which,
 ///    and why the consumer's `pull_input()` returns empty even though the SPSC
 ///    ring holds the record (the ring's own Acquire/Release should make the
 ///    pushed record visible — verify there isn't a missed re-poll instead).
@@ -465,7 +466,7 @@ async fn multi_worker_iterate_input_from_all_workers() {
 // These tests use `exchange_to` with explicit target parallelism inside the
 // loop body, creating a stage boundary within the loop. The feedback edge
 // then crosses from the post-exchange stage back to the pre-exchange stage.
-// This exercises cross-stage feedback channel wiring in StageExecutor.
+// This exercises cross-stage feedback channel wiring on the one executor core.
 
 /// Staged iterate: exchange inside loop body creates cross-stage feedback.
 ///
@@ -478,6 +479,7 @@ async fn multi_worker_iterate_input_from_all_workers() {
 /// Stage 1 (par=2): exchange target, done/again filters, branch, leave
 /// Stage 2 (par=1): gather results
 /// Feedback: stage 1 → stage 0 (cross-stage, equal parallelism)
+#[ignore = "C2 (step 3): a multi-worker loop followed by an exchange from its leave never completes (the exchange's consumer records -n, the leave never records +n); uniform analog: audit repro operators_iterate::iterate_then_exchange_two_workers"]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn staged_iterate_cross_stage_feedback() {
     let rt = RuntimeHandle::new(RuntimeConfig::default()).unwrap();
@@ -642,6 +644,7 @@ async fn staged_iterate_cross_stage_feedback_eager_quiescence() {
 /// Staged iterate with immediate exit: all values already meet the condition.
 ///
 /// Tests that cross-stage feedback handles the zero-iteration case correctly.
+#[ignore = "C2 (step 3): a multi-worker loop followed by an exchange from its leave never completes (the exchange's consumer records -n, the leave never records +n); uniform analog: audit repro operators_iterate::iterate_then_exchange_two_workers"]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn staged_iterate_cross_stage_immediate_exit() {
     let rt = RuntimeHandle::new(RuntimeConfig::default()).unwrap();

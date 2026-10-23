@@ -90,23 +90,27 @@ For N workers, we create N × (N-1) unidirectional FIFO channels:
 - Senders notify the target worker's `WakeHandle`, waking idle workers on progress arrival
 - Across nodes, progress frames travel on the sender's ordered per-peer outbox, which is never cut short by cancellation, so a node's final deltas (e.g. its last capability release) are delivered even when it finishes first. Each cross-node progress channel ends with an explicit end-of-stream frame on a clean shutdown (see [cluster.md §5.5.3](./cluster.md#553-cluster-shutdown-protocol-clean-teardown)).
 
-#### 11.3.2 Initialization Ordering
+#### 11.3.2 Initialization: seeding from the physical plan
 
-A subtle correctness requirement: all workers must complete initialization (including broadcasting their initial capabilities) **before any worker starts executing**. Otherwise, a fast worker could see incomplete global state and make incorrect frontier/completion decisions.
+Every worker's view must hold every peer's initial capabilities before it
+computes a frontier; otherwise a fast worker could see incomplete global state
+and make incorrect frontier/completion decisions (audit H13: in a cluster, a
+peer's initial capabilities, if they were sent, could still be in transit).
 
-instancy enforces this via deferred task registration:
+instancy does not send initial capabilities. Every operator declares them at
+build time (`add_operator_with_capabilities`), and the spawn computes a
+**physical plan** (which workers run which operator). `initialize` seeds each
+declared capability once per worker that runs its operator, into every
+worker's tracker, whether or not that worker runs the operator, and sends
+nothing. Each instance's later release (`-1`) travels on the progress
+channels as usual. Seeding fewer copies would let a frontier pass work;
+seeding more would never complete. The plan's digest is part of the cluster
+handshake fingerprint, so two nodes cannot seed different counts, and a debug
+assertion rejects a capability an operator creates at materialization without
+declaring it.
 
-```
-Phase 4: Create wake handles and progress channels for all N workers
-Phase 5: Materialize all workers (builds executor, attaches tracker,
-         calls tracker.initialize() which broadcasts initial caps)
-         ── NO worker is registered on the task pool yet ──
-Phase 6: Register ALL workers on the task pool
-         ── Now workers can be polled; all progress channels contain
-            complete initial state from all peers ──
-```
-
-This two-phase approach guarantees every worker's progress channels contain the full set of initial capability broadcasts from all peers before any worker starts executing.
+The runtime still registers workers on the task pool only after all of them
+are materialized, so a failed materialization never leaves siblings running.
 
 ### 11.4 Progress Tracking in Feedback Loops
 
@@ -308,6 +312,14 @@ impl<T: Timestamp> ProbeHandle<T> {
 
 
 ### 11.8 Stage-Aware Progress Tracking
+
+> **Superseded.** Per-stage trackers were removed in step 2 of the
+> progress-accounting redesign (`progress-accounting-design.md` §5.1.8).
+> Every worker now runs one `ProgressTracker` over the whole graph, attached
+> to every other worker, whatever the stages' parallelism; each worker seeds
+> every operator's initial capabilities once per worker that runs it (the
+> physical plan's multiplicities). The rest of this section records the
+> earlier design.
 
 Per-stage execution keeps progress tracking local to each stage's
 `StageExecutor`. Instead of one worker-wide tracker spanning the full
