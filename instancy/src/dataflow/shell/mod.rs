@@ -24,6 +24,7 @@
 //! module can create.
 
 use std::any::Any;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 use crate::dataflow::channels::envelope::{ControlSignal, Envelope, Payload};
@@ -39,10 +40,6 @@ use crate::progress::change_batch::ChangeBatch;
 use crate::progress::frontier::Antichain;
 use crate::progress::operate::{PortLedger, ProgressReporter};
 use crate::progress::timestamp::Timestamp;
-
-/// Whether the shell rejects unjustified output and capability requests
-/// (V3). An error in every build.
-const V3_ENFORCED: bool = false;
 
 // ---------------------------------------------------------------------------
 // ShellToken
@@ -159,6 +156,17 @@ impl<T: Timestamp> Justify<T> {
         })
     }
 
+    /// Check, without recording, that this call justifies a capability at
+    /// `time` on `output`.
+    pub(crate) fn check(&self, output: usize, time: &T, what: &'static str) -> Result<()> {
+        let state = self.state();
+        if !state.in_call || Self::justifies_locked(&state, output, time) {
+            Ok(())
+        } else {
+            Err(Self::violation(&state, what, output, time))
+        }
+    }
+
     /// Check a capability acquisition or downgrade at `time` on `output`.
     /// A violation is also recorded, and fails the call when it returns.
     pub(crate) fn acquire(&self, output: usize, time: &T, what: &'static str) -> Result<()> {
@@ -215,6 +223,9 @@ pub struct Retained<T: Timestamp> {
     capability: Option<Capability<T>>,
     time: T,
     wake: Option<WakeHandle>,
+    /// The output's count of live `Retained`s, while this one holds its
+    /// capability.
+    live: Option<Arc<AtomicUsize>>,
 }
 
 impl<T: Timestamp> Retained<T> {
@@ -222,11 +233,17 @@ impl<T: Timestamp> Retained<T> {
         capability: Option<Capability<T>>,
         time: T,
         wake: Option<WakeHandle>,
+        live: Option<Arc<AtomicUsize>>,
     ) -> Self {
+        let live = live.filter(|_| capability.is_some());
+        if let Some(live) = &live {
+            live.fetch_add(1, Ordering::SeqCst);
+        }
         Self {
             capability,
             time,
             wake,
+            live,
         }
     }
 
@@ -240,6 +257,9 @@ impl<T: Timestamp> Drop for Retained<T> {
     fn drop(&mut self) {
         if let Some(capability) = self.capability.take() {
             drop(capability);
+            if let Some(live) = self.live.take() {
+                live.fetch_sub(1, Ordering::SeqCst);
+            }
             if let Some(wake) = &self.wake {
                 wake.notify();
             }
@@ -367,6 +387,8 @@ pub(crate) struct CountedOutput<T: Timestamp, D: Send + 'static> {
     ledger: PortLedger<T>,
     reporter: ProgressReporter<T>,
     wake: Option<WakeHandle>,
+    /// How many `Retained`s of this output are alive.
+    retained_live: Arc<AtomicUsize>,
     closed: bool,
 }
 
@@ -394,6 +416,7 @@ impl<T: Timestamp, D: Send + 'static> CountedOutput<T, D> {
             ledger,
             reporter,
             wake,
+            retained_live: Arc::new(AtomicUsize::new(0)),
             closed: false,
         }
     }
@@ -505,7 +528,8 @@ pub(crate) trait InputPorts: Send + 'static {
     fn discard(&mut self, tok: &ShellToken);
 
     /// Set input `port`'s frontier (an `Antichain` of the port's time).
-    fn set_frontier(&mut self, tok: &ShellToken, port: usize, frontier: &dyn Any);
+    /// Returns whether it changed.
+    fn set_frontier(&mut self, tok: &ShellToken, port: usize, frontier: &dyn Any) -> bool;
     /// Connect inputs `first..` to the call's justification (a `Justify` of
     /// the port's time; ports of another time are left out).
     fn attach(&mut self, tok: &ShellToken, justify: &dyn Any, first: usize);
@@ -527,7 +551,9 @@ impl InputPorts for () {
     fn commit(&mut self, _: &ShellToken) {}
     fn discard(&mut self, _: &ShellToken) {}
 
-    fn set_frontier(&mut self, _: &ShellToken, _: usize, _: &dyn Any) {}
+    fn set_frontier(&mut self, _: &ShellToken, _: usize, _: &dyn Any) -> bool {
+        false
+    }
     fn attach(&mut self, _: &ShellToken, _: &dyn Any, _: usize) {}
 }
 
@@ -551,12 +577,11 @@ impl<T: Timestamp, D: Send + 'static> InputPorts for CountedInput<T, D> {
         CountedInput::discard(self, tok);
     }
 
-    fn set_frontier(&mut self, _: &ShellToken, port: usize, frontier: &dyn Any) {
-        if port == 0 {
-            if let Some(frontier) = frontier.downcast_ref::<Antichain<T>>() {
-                self.handle.set_frontier(frontier.clone());
-            }
-        }
+    fn set_frontier(&mut self, _: &ShellToken, port: usize, frontier: &dyn Any) -> bool {
+        port == 0
+            && frontier
+                .downcast_ref::<Antichain<T>>()
+                .is_some_and(|frontier| self.handle.set_frontier(frontier.clone()))
     }
     fn attach(&mut self, _: &ShellToken, justify: &dyn Any, first: usize) {
         if let Some(justify) = justify.downcast_ref::<Justify<T>>() {
@@ -589,12 +614,12 @@ impl<A: InputPorts, B: InputPorts> InputPorts for (A, B) {
         self.1.discard(tok);
     }
 
-    fn set_frontier(&mut self, tok: &ShellToken, port: usize, frontier: &dyn Any) {
+    fn set_frontier(&mut self, tok: &ShellToken, port: usize, frontier: &dyn Any) -> bool {
         let split = self.0.len();
         if port < split {
-            self.0.set_frontier(tok, port, frontier);
+            self.0.set_frontier(tok, port, frontier)
         } else {
-            self.1.set_frontier(tok, port - split, frontier);
+            self.1.set_frontier(tok, port - split, frontier)
         }
     }
     fn attach(&mut self, tok: &ShellToken, justify: &dyn Any, first: usize) {
@@ -630,10 +655,9 @@ impl<T: Timestamp, D: Send + 'static> InputPorts for Vec<CountedInput<T, D>> {
             .for_each(|input| CountedInput::discard(input, tok));
     }
 
-    fn set_frontier(&mut self, tok: &ShellToken, port: usize, frontier: &dyn Any) {
-        if let Some(input) = self.get_mut(port) {
-            InputPorts::set_frontier(input, tok, 0, frontier);
-        }
+    fn set_frontier(&mut self, tok: &ShellToken, port: usize, frontier: &dyn Any) -> bool {
+        self.get_mut(port)
+            .is_some_and(|input| InputPorts::set_frontier(input, tok, 0, frontier))
     }
     fn attach(&mut self, tok: &ShellToken, justify: &dyn Any, first: usize) {
         for (i, input) in self.iter_mut().enumerate() {
@@ -649,8 +673,10 @@ pub(crate) trait OutputPorts: Send + 'static {
     /// Whether output is waiting to go into a channel.
     fn pending(&self) -> bool;
     /// Whether any output holds a capability.
-    #[allow(dead_code)]
     fn holds_capability(&self) -> bool;
+    /// Whether a `Retained` of any output is alive (its drop, on any task,
+    /// wakes the executor).
+    fn retained(&self) -> bool;
     /// Take every output's call output: check it (when `justify` is a
     /// `Justify` of the port's time), count it and queue it.
     fn take_sessions(
@@ -679,6 +705,9 @@ impl OutputPorts for () {
     fn holds_capability(&self) -> bool {
         false
     }
+    fn retained(&self) -> bool {
+        false
+    }
     fn take_sessions(&mut self, _: &ShellToken, _: Option<&dyn Any>, _: usize) -> Result<()> {
         Ok(())
     }
@@ -699,6 +728,9 @@ impl<T: Timestamp, D: Send + 'static> OutputPorts for CountedOutput<T, D> {
     }
     fn holds_capability(&self) -> bool {
         self.reporter.holds_any()
+    }
+    fn retained(&self) -> bool {
+        self.retained_live.load(Ordering::SeqCst) > 0
     }
     fn take_sessions(
         &mut self,
@@ -728,6 +760,7 @@ impl<T: Timestamp, D: Send + 'static> OutputPorts for CountedOutput<T, D> {
                 justify.clone(),
                 self.reporter.clone(),
                 self.wake.clone(),
+                Arc::clone(&self.retained_live),
             );
         }
     }
@@ -742,6 +775,9 @@ impl<A: OutputPorts, B: OutputPorts> OutputPorts for (A, B) {
     }
     fn holds_capability(&self) -> bool {
         self.0.holds_capability() || self.1.holds_capability()
+    }
+    fn retained(&self) -> bool {
+        self.0.retained() || self.1.retained()
     }
     fn take_sessions(
         &mut self,
@@ -835,6 +871,19 @@ pub(crate) trait OperatorLogic: Send + 'static {
     fn checks_justification(&self) -> bool {
         true
     }
+
+    /// The call's justification set (a `Justify` of [`Self::Time`]), for
+    /// logic that acquires capabilities itself (`notify_at`). Called once,
+    /// when the shell is built.
+    fn attach_justify(&mut self, _justify: &dyn Any) {}
+
+    /// Whether the logic must also be called when its input frontier
+    /// changes while one of its outputs' [`Retained`]s is alive: user
+    /// closures that keep work with [`OutputHandle::retain`] flush it then,
+    /// including when the frontier becomes empty.
+    fn calls_on_frontier(&self) -> bool {
+        false
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -854,6 +903,8 @@ pub(crate) struct OperatorShell<L: OperatorLogic> {
     /// Latched (R39): every input ended, nothing is held or left to hand
     /// over. A hint only; it never closes the outputs.
     exhausted: bool,
+    /// An input frontier changed since the logic was last called.
+    frontier_changed: bool,
     shut_down: bool,
 }
 
@@ -869,6 +920,8 @@ impl<L: OperatorLogic> OperatorShell<L> {
     ) -> Self {
         let tok = ShellToken(());
         let justify = Justify::<L::Time>::new(outputs.len());
+        let mut logic = logic;
+        logic.attach_justify(&justify);
         inputs.attach(&tok, &justify, 0);
         outputs.attach(&tok, &justify, 0);
         Self {
@@ -880,6 +933,7 @@ impl<L: OperatorLogic> OperatorShell<L> {
             outputs,
             justify,
             exhausted: false,
+            frontier_changed: false,
             shut_down: false,
         }
     }
@@ -904,7 +958,7 @@ impl<L: OperatorLogic> OperatorShell<L> {
         self.justify.begin();
         let result = self.logic.call(&mut self.inputs, &mut self.outputs);
         let violation = self.justify.finish_call();
-        let checks = V3_ENFORCED && self.logic.checks_justification();
+        let checks = self.logic.checks_justification();
         let result = result.and_then(|did| match violation {
             Some(error) if checks => Err(error),
             _ => Ok(did),
@@ -958,7 +1012,12 @@ impl<L: OperatorLogic> SchedulableOperator for OperatorShell<L> {
 
         self.inputs.pull(&tok)?;
 
-        if self.logic.wants_call(&self.inputs) {
+        // A logic that keeps work under a `Retained` is also called when its
+        // input frontier changed, so it can flush.
+        let frontier_call =
+            self.frontier_changed && self.logic.calls_on_frontier() && self.outputs.retained();
+        if self.logic.wants_call(&self.inputs) || frontier_call {
+            self.frontier_changed = false;
             did |= self.run_call(&tok)?;
             if !self.outputs.flush(&tok)? {
                 return Ok(ActivationOutcome::BlockedOnBackpressure);
@@ -973,7 +1032,9 @@ impl<L: OperatorLogic> SchedulableOperator for OperatorShell<L> {
             Ok(ActivationOutcome::MadeProgress)
         } else if self.logic.blocked() {
             Ok(ActivationOutcome::BlockedOnBackpressure)
-        } else if self.logic.waiting_for_async() {
+        } else if self.logic.waiting_for_async() || self.outputs.retained() {
+            // An async task, or the drop of a `Retained` on another task,
+            // will wake the executor.
             Ok(ActivationOutcome::WaitingForAsync)
         } else {
             Ok(ActivationOutcome::Idle)
@@ -1031,7 +1092,9 @@ impl<L: OperatorLogic> SchedulableOperator for OperatorShell<L> {
 
     fn update_port_frontier(&mut self, port: usize, frontier: &dyn Any) {
         let tok = ShellToken(());
-        self.inputs.set_frontier(&tok, port, frontier);
+        if self.inputs.set_frontier(&tok, port, frontier) {
+            self.frontier_changed = true;
+        }
     }
 
     fn has_ready_notifications(&self) -> bool {

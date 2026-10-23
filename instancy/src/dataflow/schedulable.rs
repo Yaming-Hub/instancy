@@ -137,8 +137,8 @@ pub trait SchedulableOperator: Send {
     /// time), after progress propagation.
     fn update_port_frontier(&mut self, _port: usize, _frontier: &dyn std::any::Any) {}
 
-    /// Whether this operator is an [`OperatorShell`](crate::dataflow::shell::OperatorShell),
-    /// as every production operator must be (design §5.2).
+    /// Whether this operator is an operator shell, as every production
+    /// operator must be (design §5.2).
     fn is_shell(&self) -> bool {
         false
     }
@@ -225,9 +225,8 @@ impl OperatorFactory {
 /// Channel endpoints provided to an operator factory during materialization.
 ///
 /// Each entry is a `Box<dyn Any + Send>` that the factory turns into a
-/// counted port with [`take_input`](Self::take_input) /
-/// [`take_output`](Self::take_output): only the materializer builds counted
-/// ports, so operator logic never sees a raw `Push` or `Pull`.
+/// counted port: only the materializer builds counted ports, so operator
+/// logic never sees a raw `Push` or `Pull`.
 #[derive(Default)]
 pub struct ChannelEndpoints {
     /// The operator these endpoints are for.

@@ -695,15 +695,10 @@ impl<T: Timestamp> DataflowBuilder<T> {
                     if endpoints.progress_reporter::<T>(op_idx, 0).is_none() {
                         output.set_reporter(reporter.clone());
                     }
-                    Ok(wired::source(
-                        name_clone.clone(),
-                        op_idx,
-                        stage_id,
-                        data.clone(),
-                        output,
-                        true,
+                    Ok(
+                        wired::source(name_clone.clone(), op_idx, stage_id, data.clone(), output)
+                            .boxed(),
                     )
-                    .boxed())
                 });
             state.operator_factories.push((op_idx, factory));
         }
@@ -1881,6 +1876,12 @@ impl<T: Timestamp, D: Clone + Send + 'static> Pipe<T, D> {
     /// For simple per-element transformations, prefer [`map`](Self::map) or
     /// [`filter`](Self::filter). Use `unary` when you need batch-level control
     /// or stateful processing.
+    ///
+    /// Each call may emit only at or after the time of a batch it took from
+    /// the input, or of a capability the operator held when the call began.
+    /// To emit data in a later call, hold it with
+    /// [`OutputHandle::retain`]; the closure is then also called whenever its
+    /// input frontier changes. Anything else fails the operator.
     ///
     /// # Example
     /// ```ignore
@@ -4036,23 +4037,17 @@ impl<T: Timestamp, D: Clone + Send + 'static> Pipe<T, D> {
                     stage_id,
                 ));
 
-            // Subgraph connectivity with initial capability.
-            let mut initial_cap = ChangeBatch::new();
-            initial_cap.update(T::minimum(), 1);
-            let exchange_reporter = match state.subgraph_builder.add_operator_with_capabilities(
+            // A pass-through: the records counted on the broadcast edge (one
+            // per target host) keep the downstream frontier at their times.
+            if let Err(e) = state.subgraph_builder.add_operator(
                 op_idx,
                 "broadcast",
                 1,
                 1,
                 PortConnectivity::identity(T::Summary::default()),
-                vec![initial_cap],
             ) {
-                Ok(progress) => progress.reporter(0).clone(),
-                Err(e) => {
-                    state.builder_errors.push(e);
-                    ProgressReporter::default()
-                }
-            };
+                state.builder_errors.push(e);
+            }
 
             state.subgraph_builder.add_edge(
                 Location::source(self.op_idx, self.output_slot),
@@ -4065,14 +4060,8 @@ impl<T: Timestamp, D: Clone + Send + 'static> Pipe<T, D> {
                 OperatorFactory::new(move |_ctx, mut endpoints: ChannelEndpoints| {
                     let name = name_clone.clone();
                     let input = endpoints.take_input::<T, D>(0, &name)?;
-                    let mut output = endpoints.take_output::<T, D>(0, &name)?;
-                    if endpoints.progress_reporter::<T>(op_idx, 0).is_none() {
-                        output.set_reporter(exchange_reporter.clone());
-                    }
-                    Ok(
-                        wired::unary_guarded(name, op_idx, stage_id, wired_logic, input, output)
-                            .boxed(),
-                    )
+                    let output = endpoints.take_output::<T, D>(0, &name)?;
+                    Ok(wired::unary(name, op_idx, stage_id, wired_logic, input, output).boxed())
                 });
             state.operator_factories.push((op_idx, factory));
 
@@ -5153,7 +5142,7 @@ fn channel_source_factory<T: Timestamp, D: Clone + Send + 'static>(
             output.set_reporter(fallback_reporter.clone());
         }
         let mut logic =
-            ChannelSourceLogic::new(receiver, &output, true, Arc::clone(&external_inputs_open))
+            ChannelSourceLogic::new(receiver, &output, Arc::clone(&external_inputs_open))
                 .with_abandon_flag(abandoned.clone());
         if let Some(gate) = &gate {
             logic = logic.with_input_gate(Arc::clone(gate));

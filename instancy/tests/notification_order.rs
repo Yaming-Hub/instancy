@@ -246,7 +246,7 @@ fn product_time_notifications_respect_the_partial_order_end_to_end() {
 /// operator holds nothing at or before) would mint a capability that moves the
 /// downstream frontier backwards after a probe reported `done_with(time)`, and
 /// let the operator emit data at that completed time. It must be rejected:
-/// the operator fails with `InvalidNotificationTime`, the downstream frontier
+/// the operator fails with `Unjustified` (V3), the downstream frontier
 /// never regresses, and no data is emitted at the completed time.
 #[test]
 fn notify_at_past_time_is_rejected_and_never_regresses_downstream_frontier() {
@@ -314,7 +314,7 @@ fn notify_at_past_time_is_rejected_and_never_regresses_downstream_frontier() {
     let err = result.expect_err("an invalid notify_at must fail the dataflow");
     let msg = err.to_string();
     assert!(
-        msg.contains("cannot request a notification at 0"),
+        msg.contains("unjustified notify_at at 0"),
         "unexpected error: {msg}"
     );
 }

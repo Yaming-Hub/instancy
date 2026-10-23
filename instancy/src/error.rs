@@ -200,17 +200,6 @@ pub enum ProgressError {
     #[error("no capability in set dominates time {time}")]
     NoDominatingCapability { time: String },
 
-    /// An operator requested a notification (and output capability) at a time
-    /// it cannot hold: the time is not at or after the operator's input
-    /// frontier, a capability it already holds, or the time of an input batch
-    /// it is processing. Holding such a capability would move downstream
-    /// frontiers backwards.
-    #[error(
-        "cannot request a notification at {time}: not at or after the input frontier \
-         {frontier}, a held capability, or a pending input time"
-    )]
-    InvalidNotificationTime { time: String, frontier: String },
-
     /// An error envelope reached an operator input. Error envelopes are
     /// fatal on every transport: the operator fails the dataflow.
     #[error("operator input received an error from '{source_operator}': {message}")]

@@ -2562,7 +2562,6 @@ mod tests {
             StageId::new(0),
             vec![(0u64, vec![1, 2, 3]), (1u64, vec![10, 20])],
             output(ch1.pusher),
-            false,
         )
         .boxed();
 

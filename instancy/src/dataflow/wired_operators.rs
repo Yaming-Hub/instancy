@@ -15,7 +15,7 @@
 //! internally, operators work with concrete Rust types (no dynamic dispatch on data).
 
 use std::any::Any;
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
@@ -59,12 +59,11 @@ pub(crate) type NotifyFn<T, D1, D2> = Box<
 // Unary
 // ---------------------------------------------------------------------------
 
-/// A unary operator: calls its closure whenever input is waiting.
+/// A unary operator: calls its closure whenever input is waiting, and,
+/// while it holds a capability ([`OutputHandle::retain`]), whenever its
+/// input frontier changes.
 pub(crate) struct UnaryLogic<T: Timestamp, D1: Send + 'static, D2: Send + 'static> {
     logic: UnaryFn<T, D1, D2>,
-    /// A capability at `T::minimum()` held until the input ends (the
-    /// broadcast pass-through's guard).
-    guard: Option<Capability<T>>,
 }
 
 impl<T: Timestamp, D1: Send + 'static, D2: Send + 'static> OperatorLogic for UnaryLogic<T, D1, D2> {
@@ -72,23 +71,13 @@ impl<T: Timestamp, D1: Send + 'static, D2: Send + 'static> OperatorLogic for Una
     type Outputs = CountedOutput<T, D2>;
     type Time = T;
 
-    fn wants_call(&self, input: &Self::Inputs) -> bool {
-        input.has_pending() || (self.guard.is_some() && input.is_exhausted())
-    }
-
     fn call(&mut self, input: &mut Self::Inputs, output: &mut Self::Outputs) -> Result<bool> {
-        let did = input.has_pending();
-        if did {
-            (self.logic)(input.handle(), output.handle())?;
-        }
-        if input.is_exhausted() && !input.has_pending() {
-            self.guard = None;
-        }
-        Ok(did)
+        (self.logic)(input.handle(), output.handle())?;
+        Ok(true)
     }
 
-    fn holds_work(&self) -> bool {
-        self.guard.is_some()
+    fn calls_on_frontier(&self) -> bool {
+        true
     }
 }
 
@@ -107,31 +96,6 @@ pub(crate) fn unary<T: Timestamp, D1: Send + 'static, D2: Send + 'static>(
         stage_id,
         UnaryLogic {
             logic: Box::new(logic),
-            guard: None,
-        },
-        input,
-        output,
-    )
-}
-
-/// A unary operator that holds an initial capability at `T::minimum()`
-/// until its input ends.
-pub(crate) fn unary_guarded<T: Timestamp, D1: Send + 'static, D2: Send + 'static>(
-    name: impl Into<String>,
-    index: usize,
-    stage_id: StageId,
-    logic: impl FnMut(&mut InputHandle<T, D1>, &mut OutputHandle<T, D2>) -> Result<()> + Send + 'static,
-    input: CountedInput<T, D1>,
-    output: CountedOutput<T, D2>,
-) -> OperatorShell<UnaryLogic<T, D1, D2>> {
-    let guard = Capability::seeded(T::minimum(), output.reporter().clone());
-    OperatorShell::new(
-        name,
-        index,
-        stage_id,
-        UnaryLogic {
-            logic: Box::new(logic),
-            guard: Some(guard),
         },
         input,
         output,
@@ -191,9 +155,8 @@ pub(crate) fn source<T: Timestamp, D: Send + 'static>(
     stage_id: StageId,
     data: Vec<(T, Vec<D>)>,
     output: CountedOutput<T, D>,
-    seeded: bool,
 ) -> OperatorShell<SourceLogic<T, D>> {
-    let capability = seeded.then(|| Capability::seeded(T::minimum(), output.reporter().clone()));
+    let capability = Some(Capability::seeded(T::minimum(), output.reporter().clone()));
     #[cfg(any(debug_assertions, feature = "progress-check"))]
     let check = output.check_port().map(|port| {
         crate::progress::check::StoreCheck::new(port, crate::progress::check::Store::PendingOutput)
@@ -292,6 +255,10 @@ impl<T: Timestamp, D1: Send + 'static, D2: Send + 'static, D3: Send + 'static> O
     fn call(&mut self, inputs: &mut Self::Inputs, output: &mut Self::Outputs) -> Result<bool> {
         (self.logic)(inputs.0.handle(), inputs.1.handle(), output.handle())?;
         Ok(true)
+    }
+
+    fn calls_on_frontier(&self) -> bool {
+        true
     }
 }
 
@@ -555,6 +522,9 @@ pub(crate) struct NotifyLogic<T: Timestamp, D1: Send + 'static, D2: Send + 'stat
     notificator: Notificator<T>,
     /// Output capabilities held for requested notifications.
     held_capabilities: Vec<Capability<T>>,
+    /// The shell's justification of each call (V3), which `notify_at`
+    /// requests are checked against.
+    justify: Option<crate::dataflow::shell::Justify<T>>,
 }
 
 impl<T: Timestamp, D1: Send + 'static, D2: Send + 'static> OperatorLogic
@@ -569,26 +539,28 @@ impl<T: Timestamp, D1: Send + 'static, D2: Send + 'static> OperatorLogic
     }
 
     fn call(&mut self, input: &mut Self::Inputs, output: &mut Self::Outputs) -> Result<bool> {
-        // Times the operator holds at the start of this call: the available
-        // input batches and the capabilities it holds.
-        let activation_times: Antichain<T> = input
-            .handle()
-            .pending_times()
-            .chain(self.held_capabilities.iter().map(|cap| cap.time()))
-            .cloned()
-            .collect();
+        let justify = self
+            .justify
+            .clone()
+            .unwrap_or_else(|| crate::dataflow::shell::Justify::new(1));
         let reporter = output.reporter().clone();
         let mut ctx = NotifyContext::new(
             &mut self.notificator,
             &reporter,
             &mut self.held_capabilities,
-            activation_times,
+            justify,
         );
         (self.logic)(input.handle(), output.handle(), &mut ctx)?;
         if let Some(error) = ctx.take_error() {
             return Err(error);
         }
         Ok(true)
+    }
+
+    fn attach_justify(&mut self, justify: &dyn Any) {
+        self.justify = justify
+            .downcast_ref::<crate::dataflow::shell::Justify<T>>()
+            .cloned();
     }
 
     fn holds_work(&self) -> bool {
@@ -605,6 +577,10 @@ impl<T: Timestamp, D1: Send + 'static, D2: Send + 'static> OperatorLogic
 
     fn has_ready_notifications(&self) -> bool {
         self.notificator.has_ready()
+    }
+
+    fn calls_on_frontier(&self) -> bool {
+        true
     }
 }
 
@@ -633,6 +609,7 @@ pub(crate) fn notify<T: Timestamp, D1: Send + 'static, D2: Send + 'static>(
             logic: Box::new(logic),
             notificator: Notificator::new(initial_frontier),
             held_capabilities: Vec::new(),
+            justify: None,
         },
         input,
         output,
@@ -652,21 +629,29 @@ pub type AsyncLogicFn<T, D1, D2> =
 
 /// A unary operator that runs each input batch as a tokio task (at most
 /// `max_concurrency` at once) and emits results in completion order.
+///
+/// Each consumed batch is covered by an output capability at its time from
+/// the call that takes it until the call that hands its result to the
+/// output: while it waits for a task slot, while its task runs, and while
+/// the result waits to be collected. A failed task keeps its capability;
+/// the operator fails.
 pub(crate) struct AsyncLogic<T: Timestamp, D1: Send + 'static, D2: Send + 'static> {
     name: String,
     logic: AsyncLogicFn<T, D1, D2>,
     max_concurrency: usize,
-    /// Tasks spawned and not yet collected.
-    in_flight: usize,
-    result_tx: tokio::sync::mpsc::UnboundedSender<Result<(T, Vec<D2>)>>,
-    result_rx: tokio::sync::mpsc::UnboundedReceiver<Result<(T, Vec<D2>)>>,
-    /// Consumed input waiting for a task slot.
-    pending_input: VecDeque<(T, Vec<D1>)>,
+    /// The capability of each spawned task not yet collected, by task id.
+    in_flight: HashMap<u64, Capability<T>>,
+    next_task: u64,
+    result_tx: tokio::sync::mpsc::UnboundedSender<(u64, Result<Vec<D2>>)>,
+    result_rx: tokio::sync::mpsc::UnboundedReceiver<(u64, Result<Vec<D2>>)>,
+    /// Consumed input waiting for a task slot, with its capability.
+    pending_input: VecDeque<(Capability<T>, Vec<D1>)>,
     tokio_handle: tokio::runtime::Handle,
     /// Woken when a task completes, so the operator collects its result.
     wake_handle: Option<WakeHandle>,
-    /// The progress checker's counts of `pending_input` (at the input) and
-    /// of running or uncollected tasks (at the output, one unit per task).
+    /// The progress checker's counts of `pending_input` and of running or
+    /// uncollected tasks (one unit per task), both at the output: each is
+    /// covered by a capability there.
     #[cfg(any(debug_assertions, feature = "progress-check"))]
     check_input: Option<crate::progress::check::StoreCheck<T>>,
     #[cfg(any(debug_assertions, feature = "progress-check"))]
@@ -676,10 +661,11 @@ pub(crate) struct AsyncLogic<T: Timestamp, D1: Send + 'static, D2: Send + 'stati
 impl<T: Timestamp, D1: Send + 'static, D2: Send + 'static> AsyncLogic<T, D1, D2> {
     /// Spawn tasks for pending input up to the concurrency limit.
     fn spawn_pending(&mut self) {
-        while self.in_flight < self.max_concurrency {
-            let Some((time, data)) = self.pending_input.pop_front() else {
+        while self.in_flight.len() < self.max_concurrency {
+            let Some((capability, data)) = self.pending_input.pop_front() else {
                 break;
             };
+            let time = capability.time().clone();
             #[cfg(any(debug_assertions, feature = "progress-check"))]
             {
                 if let Some(check) = &self.check_tasks {
@@ -689,15 +675,16 @@ impl<T: Timestamp, D1: Send + 'static, D2: Send + 'static> AsyncLogic<T, D1, D2>
                     check.remove(&time, data.len());
                 }
             }
+            let id = self.next_task;
+            self.next_task += 1;
             let logic = Arc::clone(&self.logic);
             let tx = self.result_tx.clone();
-            let time_for_logic = time.clone();
             let wake = self.wake_handle.clone();
             let operator_name = self.name.clone();
             // A nested spawn turns a panic into a JoinError.
             let handle = self.tokio_handle.clone();
             self.tokio_handle.spawn(async move {
-                let inner = handle.spawn(async move { logic(time_for_logic, data).await });
+                let inner = handle.spawn(async move { logic(time, data).await });
                 let result = match inner.await {
                     Ok(Ok(output)) => Ok(output),
                     Ok(Err(e)) => Err(e),
@@ -707,12 +694,12 @@ impl<T: Timestamp, D1: Send + 'static, D2: Send + 'static> AsyncLogic<T, D1, D2>
                         message: format!("unary_async task panicked: {join_err}"),
                     }),
                 };
-                let _ = tx.send(result.map(|output| (time, output)));
+                let _ = tx.send((id, result));
                 if let Some(w) = wake {
                     w.notify();
                 }
             });
-            self.in_flight += 1;
+            self.in_flight.insert(id, capability);
         }
     }
 
@@ -721,19 +708,24 @@ impl<T: Timestamp, D1: Send + 'static, D2: Send + 'static> AsyncLogic<T, D1, D2>
         let mut collected = false;
         loop {
             match self.result_rx.try_recv() {
-                Ok(Ok((time, data))) => {
-                    self.in_flight -= 1;
+                Ok((id, Ok(data))) => {
+                    let Some(capability) = self.in_flight.remove(&id) else {
+                        continue;
+                    };
+                    let time = capability.time().clone();
                     #[cfg(any(debug_assertions, feature = "progress-check"))]
                     if let Some(check) = &self.check_tasks {
                         check.remove(&time, 1);
                     }
+                    // The capability was held when this call began, so it
+                    // justifies the output; dropping it now releases it in
+                    // the same commit as the output.
                     output.push_vec(time, data);
+                    drop(capability);
                     collected = true;
                 }
-                Ok(Err(e)) => {
-                    self.in_flight -= 1;
-                    return Err(e);
-                }
+                // The task's capability stays held: the operator fails.
+                Ok((_, Err(e))) => return Err(e),
                 Err(tokio::sync::mpsc::error::TryRecvError::Empty)
                 | Err(tokio::sync::mpsc::error::TryRecvError::Disconnected) => break,
             }
@@ -748,11 +740,12 @@ impl<T: Timestamp, D1: Send + 'static, D2: Send + 'static> OperatorLogic for Asy
     type Time = T;
 
     fn wants_call(&self, input: &Self::Inputs) -> bool {
-        input.has_pending() || !self.pending_input.is_empty() || self.in_flight > 0
+        input.has_pending() || !self.pending_input.is_empty() || !self.in_flight.is_empty()
     }
 
     fn call(&mut self, input: &mut Self::Inputs, output: &mut Self::Outputs) -> Result<bool> {
         let collected = self.collect_results(output.handle())?;
+        let reporter = output.reporter().clone();
         let handle = input.handle();
         let mut took = false;
         while let Some((time, data)) = handle.next() {
@@ -760,7 +753,9 @@ impl<T: Timestamp, D1: Send + 'static, D2: Send + 'static> OperatorLogic for Asy
             if let Some(check) = &self.check_input {
                 check.add(&time, data.len());
             }
-            self.pending_input.push_back((time, data));
+            // Justified: the call just consumed a batch at `time`.
+            let capability = Capability::new(time, reporter.clone());
+            self.pending_input.push_back((capability, data));
             took = true;
         }
         self.spawn_pending();
@@ -768,15 +763,11 @@ impl<T: Timestamp, D1: Send + 'static, D2: Send + 'static> OperatorLogic for Asy
     }
 
     fn holds_work(&self) -> bool {
-        !self.pending_input.is_empty() || self.in_flight > 0
+        !self.pending_input.is_empty() || !self.in_flight.is_empty()
     }
 
     fn waiting_for_async(&self) -> bool {
-        self.in_flight > 0
-    }
-
-    fn checks_justification(&self) -> bool {
-        false
+        !self.in_flight.is_empty()
     }
 }
 
@@ -795,7 +786,7 @@ pub(crate) fn unary_async<T: Timestamp, D1: Send + 'static, D2: Send + 'static>(
     let name = name.into();
     let (result_tx, result_rx) = tokio::sync::mpsc::unbounded_channel();
     #[cfg(any(debug_assertions, feature = "progress-check"))]
-    let check_input = input.check_port().map(|port| {
+    let check_input = output.check_port().map(|port| {
         crate::progress::check::StoreCheck::new(port, crate::progress::check::Store::AsyncInput)
     });
     #[cfg(any(debug_assertions, feature = "progress-check"))]
@@ -811,7 +802,8 @@ pub(crate) fn unary_async<T: Timestamp, D1: Send + 'static, D2: Send + 'static>(
             name,
             logic,
             max_concurrency: max_concurrency.max(1),
-            in_flight: 0,
+            in_flight: HashMap::new(),
+            next_task: 0,
             result_tx,
             result_rx,
             pending_input: VecDeque::new(),
@@ -1043,7 +1035,6 @@ pub(crate) mod tests {
             StageId::new(0),
             vec![(0u64, vec![1, 2, 3]), (1u64, vec![4, 5])],
             output(ch.pusher),
-            false,
         );
         op.activate().unwrap();
         assert!(op.exhausted());
@@ -1084,6 +1075,289 @@ pub(crate) mod tests {
         assert_eq!(drain(&mut pull_out), vec![(0, vec![2, 4, 6])]);
         assert_eq!(consumed.drain(), vec![(0, 3)]);
         assert_eq!(produced.drain(), vec![(0, 3)]);
+    }
+
+    fn is_unjustified(error: &Error) -> bool {
+        matches!(
+            error,
+            Error::Progress(crate::error::ProgressError::Unjustified { .. })
+        )
+    }
+
+    #[test]
+    fn output_before_the_consumed_time_is_rejected() {
+        let ch_in = make_channel::<u64, i32>();
+        let ch_out = make_channel::<u64, i32>();
+        let mut push_in = ch_in.pusher;
+        let mut pull_out = ch_out.puller;
+        let mut op = unary(
+            "late",
+            1,
+            StageId::new(0),
+            |input: &mut InputHandle<u64, i32>, output: &mut OutputHandle<u64, i32>| {
+                while let Some((time, data)) = input.next() {
+                    output.push_vec(time - 1, data);
+                }
+                Ok(())
+            },
+            input(ch_in.puller),
+            output(ch_out.pusher),
+        );
+        push_in.push(Envelope::data(5, vec![1])).unwrap();
+        let error = op.activate().unwrap_err();
+        assert!(is_unjustified(&error), "{error}");
+        assert!(
+            drain(&mut pull_out).is_empty(),
+            "a failed call emits nothing"
+        );
+    }
+
+    /// R36: `J` is dropped when the call returns, so input consumed in one
+    /// call never justifies output in a later one, even when no commit falls
+    /// between the two calls (no ledger is drained here).
+    #[test]
+    fn stash_emitted_in_a_later_call_without_retain_is_rejected() {
+        let ch_in = make_channel::<u64, i32>();
+        let ch_out = make_channel::<u64, i32>();
+        let mut push_in = ch_in.pusher;
+        let mut stash: Vec<(u64, Vec<i32>)> = Vec::new();
+        let mut op = unary(
+            "stash",
+            1,
+            StageId::new(0),
+            move |input: &mut InputHandle<u64, i32>, output: &mut OutputHandle<u64, i32>| {
+                // One batch per call: emit the previous call's batch.
+                if let Some(batch) = input.next() {
+                    for (time, data) in stash.drain(..) {
+                        output.push_vec(time, data);
+                    }
+                    stash.push(batch);
+                }
+                Ok(())
+            },
+            input(ch_in.puller),
+            output(ch_out.pusher),
+        );
+        push_in.push(Envelope::data(1, vec![1])).unwrap();
+        push_in.push(Envelope::data(2, vec![2])).unwrap();
+        op.activate().unwrap();
+        let error = op.activate().unwrap_err();
+        assert!(is_unjustified(&error), "{error}");
+    }
+
+    #[test]
+    fn retain_justifies_output_in_a_later_call_until_dropped() {
+        let ch_in = make_channel::<u64, i32>();
+        let ch_out = make_channel::<u64, i32>();
+        let mut push_in = ch_in.pusher;
+        let mut pull_out = ch_out.puller;
+        let reporter = ProgressReporter::new();
+        let mut stash: Vec<(crate::dataflow::Retained<u64>, Vec<i32>)> = Vec::new();
+        let mut op = unary(
+            "retain",
+            1,
+            StageId::new(0),
+            move |input: &mut InputHandle<u64, i32>, output: &mut OutputHandle<u64, i32>| {
+                if let Some((time, data)) = input.next() {
+                    for (retained, data) in stash.drain(..) {
+                        output.push_vec(*retained.time(), data);
+                    }
+                    stash.push((output.retain(time), data));
+                }
+                Ok(())
+            },
+            input(ch_in.puller),
+            CountedOutput::new(
+                "out".into(),
+                ch_out.pusher,
+                PortLedger::new(),
+                reporter.clone(),
+                None,
+            ),
+        );
+        push_in.push(Envelope::data(1, vec![1])).unwrap();
+        push_in.push(Envelope::data(2, vec![2])).unwrap();
+        op.activate().unwrap();
+        assert!(reporter.holds_any());
+        op.activate().unwrap();
+        assert_eq!(drain(&mut pull_out), vec![(1, vec![1])]);
+        // The second batch is retained, so the operator is waiting for its
+        // release rather than idle.
+        assert_eq!(op.activate().unwrap(), ActivationOutcome::WaitingForAsync);
+        assert!(reporter.holds_any());
+        assert!(!op.can_shut_down());
+    }
+
+    #[test]
+    fn retain_holder_is_called_when_its_frontier_changes() {
+        let ch_in = make_channel::<u64, i32>();
+        let ch_out = make_channel::<u64, i32>();
+        let mut push_in = ch_in.pusher;
+        let mut pull_out = ch_out.puller;
+        let reporter = ProgressReporter::new();
+        let mut stash: Vec<(crate::dataflow::Retained<u64>, Vec<i32>)> = Vec::new();
+        let mut op = unary(
+            "flush-at-frontier",
+            1,
+            StageId::new(0),
+            move |input: &mut InputHandle<u64, i32>, output: &mut OutputHandle<u64, i32>| {
+                while let Some((time, data)) = input.next() {
+                    stash.push((output.retain(time), data));
+                }
+                let frontier = input.frontier().clone();
+                stash.retain_mut(|(retained, data)| {
+                    if frontier.less_equal(retained.time()) {
+                        return true;
+                    }
+                    output.push_vec(*retained.time(), std::mem::take(data));
+                    false
+                });
+                Ok(())
+            },
+            input(ch_in.puller),
+            CountedOutput::new(
+                "out".into(),
+                ch_out.pusher,
+                PortLedger::new(),
+                reporter.clone(),
+                None,
+            ),
+        );
+        op.update_port_frontier(0, &Antichain::from_elem(0u64));
+        push_in.push(Envelope::data(3, vec![7])).unwrap();
+        op.activate().unwrap();
+        assert!(drain(&mut pull_out).is_empty());
+        assert!(reporter.holds_any());
+        // No input, but the frontier empties: the final flush call.
+        op.update_port_frontier(0, &Antichain::<u64>::new());
+        assert_eq!(op.activate().unwrap(), ActivationOutcome::MadeProgress);
+        assert_eq!(drain(&mut pull_out), vec![(3, vec![7])]);
+        assert!(!reporter.holds_any());
+        // An unchanged frontier does not call the logic again.
+        op.update_port_frontier(0, &Antichain::<u64>::new());
+        assert_eq!(op.activate().unwrap(), ActivationOutcome::Idle);
+    }
+
+    fn counting_notify(
+        ch_in: crate::dataflow::channels::pushpull::ChannelPair<u64, i32, ()>,
+        ch_out: crate::dataflow::channels::pushpull::ChannelPair<u64, i32, ()>,
+        logic: impl FnMut(
+            &mut InputHandle<u64, i32>,
+            &mut OutputHandle<u64, i32>,
+            &mut NotifyContext<'_, u64>,
+        ) -> Result<()>
+        + Send
+        + 'static,
+    ) -> (
+        OperatorShell<NotifyLogic<u64, i32, i32>>,
+        Box<dyn Push<u64, i32>>,
+        Box<dyn Pull<u64, i32>>,
+    ) {
+        let op = notify(
+            "notify",
+            1,
+            StageId::new(0),
+            logic,
+            input(ch_in.puller),
+            output(ch_out.pusher),
+            Antichain::from_elem(0),
+        );
+        (op, ch_in.pusher, ch_out.puller)
+    }
+
+    #[test]
+    fn notify_at_justified_only_by_the_frontier_is_rejected() {
+        let (mut op, mut push_in, _pull) =
+            counting_notify(make_channel(), make_channel(), |input, _output, ctx| {
+                while input.next().is_some() {
+                    // The frontier (0) is at or before 2, but nothing this
+                    // call holds or consumed (5) is.
+                    ctx.notify_at(2);
+                }
+                Ok(())
+            });
+        push_in.push(Envelope::data(5, vec![1])).unwrap();
+        let error = op.activate().unwrap_err();
+        assert!(is_unjustified(&error), "{error}");
+    }
+
+    #[test]
+    fn try_notify_at_reports_an_unjustified_time_without_failing() {
+        let rejected = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let seen = Arc::clone(&rejected);
+        let (mut op, mut push_in, _pull) = counting_notify(
+            make_channel(),
+            make_channel(),
+            move |input, _output, ctx| {
+                while let Some((time, _)) = input.next() {
+                    if ctx.try_notify_at(time - 1).is_err() {
+                        seen.store(true, std::sync::atomic::Ordering::SeqCst);
+                    }
+                    ctx.notify_at(time);
+                }
+                Ok(())
+            },
+        );
+        push_in.push(Envelope::data(5, vec![1])).unwrap();
+        op.activate().unwrap();
+        assert!(rejected.load(std::sync::atomic::Ordering::SeqCst));
+    }
+
+    /// A notification handler may re-arm (or delay) the time it handles:
+    /// the capability `next_notification` dropped stays in `J`.
+    #[test]
+    fn notify_rearm_after_next_notification_is_justified() {
+        let (mut op, mut push_in, mut pull_out) =
+            counting_notify(make_channel(), make_channel(), |input, output, ctx| {
+                while let Some((time, _)) = input.next() {
+                    ctx.notify_at(time);
+                }
+                while let Some(time) = ctx.next_notification() {
+                    if time < 10 {
+                        ctx.notify_at(time + 10);
+                    } else {
+                        output.push_vec(time, vec![time as i32]);
+                    }
+                }
+                Ok(())
+            });
+        push_in.push(Envelope::data(1, vec![1])).unwrap();
+        op.activate().unwrap();
+        op.update_input_frontier(&Antichain::from_elem(2u64));
+        op.activate().unwrap();
+        op.update_input_frontier(&Antichain::<u64>::new());
+        op.activate().unwrap();
+        assert_eq!(drain(&mut pull_out), vec![(11, vec![11])]);
+        assert!(op.can_shut_down());
+    }
+
+    /// A notify closure that keeps work with `retain` is called when its
+    /// frontier changes too, like a unary closure.
+    #[test]
+    fn notify_closure_holding_a_retained_is_called_when_its_frontier_changes() {
+        let mut held: Vec<(crate::dataflow::Retained<u64>, Vec<i32>)> = Vec::new();
+        let (mut op, mut push_in, mut pull_out) = counting_notify(
+            make_channel(),
+            make_channel(),
+            move |input, output, _ctx| {
+                while let Some((time, data)) = input.next() {
+                    held.push((output.retain(time), data));
+                }
+                if input.frontier().is_empty() {
+                    for (retained, data) in held.drain(..) {
+                        output.push_vec(*retained.time(), data);
+                    }
+                }
+                Ok(())
+            },
+        );
+        push_in.push(Envelope::data(4, vec![9])).unwrap();
+        op.activate().unwrap();
+        assert!(drain(&mut pull_out).is_empty());
+        op.update_port_frontier(0, &Antichain::<u64>::new());
+        assert_eq!(op.activate().unwrap(), ActivationOutcome::MadeProgress);
+        assert_eq!(drain(&mut pull_out), vec![(4, vec![9])]);
+        assert!(op.can_shut_down());
     }
 
     #[test]
@@ -1137,7 +1411,6 @@ pub(crate) mod tests {
             StageId::new(0),
             vec![(0u64, vec![10, 20, 30])],
             output(ch1.pusher),
-            false,
         );
         let mut double = unary(
             "double",

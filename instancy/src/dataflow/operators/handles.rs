@@ -13,7 +13,7 @@
 use std::collections::VecDeque;
 use std::fmt;
 
-use crate::error::{Error, ProgressError, Result};
+use crate::error::{Error, Result};
 use crate::progress::capability::Capability;
 use crate::progress::change_batch::ChangeBatch;
 use crate::progress::frontier::Antichain;
@@ -95,9 +95,13 @@ impl<T: Timestamp, D> InputHandle<T, D> {
     }
 
     /// Set the input's frontier (the operator shell does, after each
-    /// progress propagation).
-    pub(crate) fn set_frontier(&mut self, frontier: Antichain<T>) {
+    /// progress propagation). Returns whether it changed.
+    pub(crate) fn set_frontier(&mut self, frontier: Antichain<T>) -> bool {
+        if self.frontier == frontier {
+            return false;
+        }
         self.frontier = frontier;
+        true
     }
 
     /// Attach the justification of this operator's logic calls.
@@ -158,11 +162,6 @@ impl<T: Timestamp, D> InputHandle<T, D> {
     /// Number of pending batches.
     pub fn pending_count(&self) -> usize {
         self.pending.len()
-    }
-
-    /// Timestamps of the batches currently pending in this handle.
-    pub(crate) fn pending_times(&self) -> impl Iterator<Item = &T> {
-        self.pending.iter().map(|(time, _)| time)
     }
 
     /// Whether the input is complete (exhausted and no pending data).
@@ -265,6 +264,7 @@ struct RetainCtx<T: Timestamp> {
     justify: crate::dataflow::shell::Justify<T>,
     reporter: ProgressReporter<T>,
     wake: Option<crate::dataflow::channels::wake::WakeHandle>,
+    live: std::sync::Arc<std::sync::atomic::AtomicUsize>,
 }
 
 impl<T: Timestamp, D> OutputHandle<T, D> {
@@ -284,12 +284,14 @@ impl<T: Timestamp, D> OutputHandle<T, D> {
         justify: crate::dataflow::shell::Justify<T>,
         reporter: ProgressReporter<T>,
         wake: Option<crate::dataflow::channels::wake::WakeHandle>,
+        live: std::sync::Arc<std::sync::atomic::AtomicUsize>,
     ) {
         self.retain = Some(RetainCtx {
             output,
             justify,
             reporter,
             wake,
+            live,
         });
     }
 
@@ -302,13 +304,49 @@ impl<T: Timestamp, D> OutputHandle<T, D> {
     /// pass `time`, and the closure may emit at or after `time` in any later
     /// call; the operator is called again whenever its input frontier
     /// changes, including the call in which it becomes empty (the last
-    /// chance to flush). The `Retained` may be dropped on any thread.
+    /// chance to flush). The `Retained` may be dropped on any thread, so
+    /// while one is alive its worker waits for that drop instead of
+    /// reporting that it can make no further progress: a `Retained` that is
+    /// never dropped keeps the dataflow running.
     ///
     /// `time` must be justified in the current call: at or after a
     /// capability the operator held when the call started (another
     /// `Retained`, for example), or at or after the time of a batch the call
     /// took from an input. Otherwise the operator fails once the call
     /// returns.
+    ///
+    /// Operator closures are `Clone` (one copy per worker, made before any
+    /// call) and `Retained` is not, so keep retained work in a type whose
+    /// `Clone` starts empty:
+    ///
+    /// ```ignore
+    /// #[derive(Default)]
+    /// struct Held(Vec<(Retained<u64>, Vec<u64>)>);
+    /// impl Clone for Held {
+    ///     fn clone(&self) -> Self {
+    ///         Held::default()
+    ///     }
+    /// }
+    ///
+    /// stream.unary("hold", {
+    ///     let mut held = Held::default();
+    ///     move |input, output| {
+    ///         let held = &mut held;
+    ///         while let Some((time, data)) = input.next() {
+    ///             held.0.push((output.retain(time), data));
+    ///         }
+    ///         let frontier = input.frontier().clone();
+    ///         held.0.retain_mut(|(retained, data)| {
+    ///             if frontier.less_equal(retained.time()) {
+    ///                 return true;
+    ///             }
+    ///             output.push_vec(*retained.time(), std::mem::take(data));
+    ///             false
+    ///         });
+    ///         Ok(())
+    ///     }
+    /// })
+    /// ```
     pub fn retain(&mut self, time: T) -> crate::dataflow::Retained<T> {
         match &self.retain {
             Some(ctx) => {
@@ -317,9 +355,14 @@ impl<T: Timestamp, D> OutputHandle<T, D> {
                     .acquire(ctx.output, &time, "retain")
                     .ok()
                     .map(|()| Capability::new(time.clone(), ctx.reporter.clone()));
-                crate::dataflow::Retained::new(capability, time, ctx.wake.clone())
+                crate::dataflow::Retained::new(
+                    capability,
+                    time,
+                    ctx.wake.clone(),
+                    Some(ctx.live.clone()),
+                )
             }
-            None => crate::dataflow::Retained::new(None, time, None),
+            None => crate::dataflow::Retained::new(None, time, None, None),
         }
     }
 
@@ -519,15 +562,16 @@ impl<T: Timestamp + fmt::Debug> fmt::Debug for NotificationHandle<T> {
 ///
 /// # Which times may be requested
 ///
-/// [`notify_at(time)`](Self::notify_at) is only valid for a time the operator
-/// can legitimately hold a capability for: a time at or after (in the partial
-/// order) its current input frontier, a capability it holds (or held when the
-/// activation started, so a notification handler may re-arm or delay the time
-/// it is handling), or the time of an input batch available in this
-/// activation. Any other time has already been passed by the frontier, so
-/// holding a capability for it would move downstream frontiers backwards; such
-/// a request is rejected and fails the operator with
-/// [`ProgressError::InvalidNotificationTime`]. Use
+/// [`notify_at(time)`](Self::notify_at) holds a capability at `time`, so it
+/// must be *justified* in the current call (V3): `time` must be at or after
+/// a capability the operator held when the call started (including one
+/// [`next_notification`](Self::next_notification) dropped during the call,
+/// so a notification handler may re-arm or delay the time it is handling),
+/// or at or after the time of a batch the call took from its input. The
+/// input frontier alone never justifies a request, and neither does a
+/// batch that is waiting but not taken. An unjustified request is rejected
+/// and fails the operator with
+/// [`ProgressError::Unjustified`](crate::error::ProgressError::Unjustified). Use
 /// [`try_notify_at`](Self::try_notify_at) to handle the rejection instead.
 ///
 /// # Thread safety
@@ -550,13 +594,9 @@ pub struct NotifyContext<'a, T: Timestamp> {
     /// decrements the pointstamp count, allowing downstream frontiers to advance.
     capabilities: &'a mut Vec<Capability<T>>,
 
-    /// Times the operator held when this activation started: its capabilities
-    /// and the times of the available input batches. Like a held capability,
-    /// an available message at time `t` entitles the operator to a capability
-    /// at any time `>= t`. A capability dropped by `next_notification` during
-    /// the activation still justifies requests, because its drop and the new
-    /// capability are reported to the progress tracker together.
-    activation_times: Antichain<T>,
+    /// The current call's justification set (see
+    /// [`Justify`](crate::dataflow::shell::Justify)).
+    justify: crate::dataflow::shell::Justify<T>,
 
     /// First invalid `notify_at` request of this activation, reported as the
     /// activation's error once the operator logic returns.
@@ -566,21 +606,21 @@ pub struct NotifyContext<'a, T: Timestamp> {
 impl<'a, T: Timestamp> NotifyContext<'a, T> {
     /// Creates a new `NotifyContext` from operator-internal state.
     ///
-    /// Called by `WiredUnaryNotifyOperator::activate()` before invoking the
-    /// user closure. The borrows are released when the closure returns.
-    /// `activation_times` are the times of the capabilities held and of the
-    /// input batches available when the activation starts.
+    /// Called by the notify operator's logic before invoking the user
+    /// closure. The borrows are released when the closure returns.
+    /// `justify` is the call's justification set; requests are checked
+    /// against it for the operator's output 0.
     pub(crate) fn new(
         notificator: &'a mut Notificator<T>,
         reporter: &'a ProgressReporter<T>,
         capabilities: &'a mut Vec<Capability<T>>,
-        activation_times: Antichain<T>,
+        justify: crate::dataflow::shell::Justify<T>,
     ) -> Self {
         Self {
             notificator,
             reporter,
             capabilities,
-            activation_times,
+            justify,
             error: None,
         }
     }
@@ -590,22 +630,9 @@ impl<'a, T: Timestamp> NotifyContext<'a, T> {
         self.error.take()
     }
 
-    /// Checks that the operator may hold a capability at `time`.
+    /// Checks that the call justifies a capability at `time` (V3).
     fn check_time(&self, time: &T) -> Result<()> {
-        if self.notificator.frontier().less_equal(time)
-            || self
-                .capabilities
-                .iter()
-                .any(|cap| cap.time().less_equal(time))
-            || self.activation_times.less_equal(time)
-        {
-            Ok(())
-        } else {
-            Err(Error::Progress(ProgressError::InvalidNotificationTime {
-                time: format!("{time:?}"),
-                frontier: format!("{:?}", self.notificator.frontier().elements()),
-            }))
-        }
+        self.justify.check(0, time, "notify_at")
     }
 
     /// Request notification when the input frontier advances past `time`.
@@ -638,15 +665,14 @@ impl<'a, T: Timestamp> NotifyContext<'a, T> {
     /// - **Not consuming notifications**: If you call `notify_at()` but never call
     ///   `next_notification()`, capabilities accumulate and downstream operators
     ///   will stall indefinitely.
-    /// - **Past times**: `time` must be at or after the input frontier, a
-    ///   capability held at the start of the activation, or the time of an
-    ///   input batch available in this activation (see the
-    ///   [type-level docs](Self#which-times-may-be-requested)). A valid request
-    ///   whose time the frontier has already passed (e.g. re-arming the time
-    ///   being handled, or a batch that arrived late) fires on the next
-    ///   activation. An invalid request is ignored and fails the operator once
-    ///   its logic returns; use [`try_notify_at`](Self::try_notify_at) to
-    ///   handle it instead.
+    /// - **Unjustified times**: `time` must be at or after a capability held
+    ///   when the call started or the time of a batch the call took from its
+    ///   input (see the [type-level docs](Self#which-times-may-be-requested)).
+    ///   A justified request whose time the frontier has already passed (e.g.
+    ///   re-arming the time being handled) fires on the next call. An
+    ///   unjustified request is ignored and fails the operator once its logic
+    ///   returns; use [`try_notify_at`](Self::try_notify_at) to handle it
+    ///   instead.
     pub fn notify_at(&mut self, time: T) {
         if let Err(error) = self.try_notify_at(time) {
             self.error.get_or_insert(error);
@@ -654,8 +680,8 @@ impl<'a, T: Timestamp> NotifyContext<'a, T> {
     }
 
     /// Like [`notify_at`](Self::notify_at), but returns an error (and requests
-    /// nothing) if `time` is not a time the operator can hold, instead of
-    /// failing the operator.
+    /// nothing) if this call does not justify `time`, instead of failing the
+    /// operator.
     pub fn try_notify_at(&mut self, time: T) -> Result<()> {
         self.check_time(&time)?;
         // Only create a new capability if we don't already hold one at this time.

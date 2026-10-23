@@ -490,7 +490,8 @@ pub(crate) enum Store {
     InputBuffer,
     /// A channel sink's undelivered event (at its input).
     Egress,
-    /// `unary_async` input waiting for a task slot (at its input).
+    /// `unary_async` input waiting for a task slot (at its output: the
+    /// input is consumed, and covered by a capability).
     AsyncInput,
     /// An operator's `pending_output` (at its output).
     PendingOutput,
@@ -506,7 +507,7 @@ impl Store {
     fn at_output(self) -> bool {
         matches!(
             self,
-            Store::PendingOutput | Store::AsyncTask | Store::Capability
+            Store::PendingOutput | Store::AsyncInput | Store::AsyncTask | Store::Capability
         )
     }
 }

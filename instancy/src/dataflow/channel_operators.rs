@@ -2,9 +2,9 @@
 //!
 //! These operators bridge external callers to the dataflow graph:
 //!
-//! - [`ChannelSourceOperator`] receives [`InputEvent`]s from an external
-//!   channel and pushes data into the dataflow as a source operator.
-//! - [`ChannelSinkOperator`] collects data from the dataflow and sends
+//! - a channel source receives [`InputEvent`]s from an external channel and
+//!   pushes data into the dataflow as a source operator;
+//! - a channel sink collects data from the dataflow and sends
 //!   [`OutputEvent`]s to an external channel for consumption.
 //!
 //! Both operators support synchronous (`std::sync::mpsc`) and asynchronous
@@ -233,17 +233,16 @@ pub(crate) struct ChannelSourceLogic<T: Timestamp, D: Send + 'static> {
 }
 
 impl<T: Timestamp, D: Send + 'static> ChannelSourceLogic<T, D> {
-    /// Create the logic of a channel source; with `seeded`, it holds its
-    /// operator's initial capability (on `output`'s reporter).
+    /// Create the logic of a channel source. It holds its operator's
+    /// initial capability (on `output`'s reporter), seeded by the tracker.
     pub(crate) fn new(
         receiver: InputRecv<InputEvent<T, D>>,
         output: &CountedOutput<T, D>,
-        seeded: bool,
         external_inputs_open: Arc<AtomicUsize>,
     ) -> Self {
         Self {
             receiver,
-            capability: seeded.then(|| Capability::seeded(T::minimum(), output.reporter().clone())),
+            capability: Some(Capability::seeded(T::minimum(), output.reporter().clone())),
             external_inputs_open,
             current: T::minimum(),
             frontier_advanced: false,
@@ -1069,7 +1068,7 @@ mod tests {
         if let Some(reporter) = &reporter {
             output.set_reporter(reporter.clone());
         }
-        let logic = ChannelSourceLogic::new(receiver, &output, reporter.is_some(), counter);
+        let logic = ChannelSourceLogic::new(receiver, &output, counter);
         (
             channel_source("data", 0, StageId::new(0), logic, output),
             produced,
@@ -1486,9 +1485,8 @@ mod tests {
                 None,
             );
             output.set_reporter(ProgressReporter::new());
-            let logic =
-                ChannelSourceLogic::new(InputRecv::Std(rx), &output, false, counter.clone())
-                    .with_abandon_flag(Some(Arc::clone(&flag)));
+            let logic = ChannelSourceLogic::new(InputRecv::Std(rx), &output, counter.clone())
+                .with_abandon_flag(Some(Arc::clone(&flag)));
             let mut op = channel_source("async_input", 0, StageId::new(0), logic, output);
             // The pump flags a cancellation before it drops the sender.
             flag.store(abandoned, Ordering::SeqCst);
