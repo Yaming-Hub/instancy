@@ -772,7 +772,21 @@ impl<T: Timestamp> ProgressTracker<T> {
     /// Seeds the declared initial capabilities of a single-worker tracker
     /// (each once) and computes the initial frontiers. See
     /// [`initialize_for_plan`](Self::initialize_for_plan).
+    ///
+    /// # Errors
+    ///
+    /// A tracker with progress channels belongs to a multi-worker dataflow:
+    /// seeding each capability once would undercount its peers' instances,
+    /// so it must use `initialize_for_plan`.
     pub fn initialize(&mut self) -> Result<(), crate::Error> {
+        if self.progress_channels.is_some() {
+            return Err(crate::Error::Dataflow(DataflowError::InvalidConfig(
+                "a progress tracker with progress channels belongs to a multi-worker \
+                 dataflow: initialize it from its physical plan (initialize_for_plan), \
+                 not with initialize, which seeds each capability once"
+                    .into(),
+            )));
+        }
         self.seed_and_initialize(1, |_| 1)
     }
 
@@ -2117,5 +2131,35 @@ mod tests {
         let mut tracker = builder.build();
         let plan = crate::dataflow::plan::PhysicalPlan::for_hosts(2, &[(1, 2)]);
         let _ = tracker.initialize_for_plan(&plan);
+    }
+
+    /// `initialize` seeds each capability once: a tracker with progress
+    /// channels belongs to a multi-worker dataflow and would undercount its
+    /// peers' instances, so it is rejected (brief trap T1), in release
+    /// builds too.
+    #[test]
+    fn initialize_rejects_a_tracker_with_progress_channels() {
+        use crate::dataflow::channels::wake::WakeHandle;
+        let mut channels = crate::progress::progress_channel::create_progress_channels::<u64>(
+            2,
+            &[WakeHandle::new(), WakeHandle::new()],
+        )
+        .unwrap();
+        let mut builder = SubgraphBuilder::<u64>::new(0, 0);
+        builder
+            .add_operator_with_capabilities(
+                1,
+                "source",
+                0,
+                1,
+                PortConnectivity::new(0, 1),
+                vec![ChangeBatch::new_from(0u64, 1)],
+            )
+            .unwrap();
+        let mut tracker = builder.build();
+        tracker.set_progress_channels(channels.remove(0)).unwrap();
+        let error = tracker.initialize().unwrap_err().to_string();
+        assert!(error.contains("initialize_for_plan"), "{error}");
+        assert!(!tracker.is_initialized());
     }
 }

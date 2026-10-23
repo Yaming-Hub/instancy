@@ -270,7 +270,8 @@ fn auto_par_decreasing_parallelism() {
 /// (scatter/gather) data under aggressive quiescence. `max_idle_sweeps(1)` is the
 /// deterministic vehicle — it makes a worker quiesce after a single idle sweep,
 /// the worst case for the completion race. Before the fix, the per-worker
-/// `CombinedStageExecutor` would converge on local quiescence and drop its
+/// staged executor (since removed: every path now runs on the one executor
+/// core) would converge on local quiescence and drop its
 /// stages while an upstream stage on another worker still had gather data in
 /// flight, silently losing records (e.g. 3 of 10 survived). Acyclic dataflows
 /// must instead terminate via the exhaustion cascade, which is sound at any idle

@@ -228,6 +228,12 @@ impl PhysicalPlan {
                 hosts: total_workers,
             });
         }
+        debug_assert!(
+            stage_parallelism.iter().all(|&p| p == total_workers)
+                || operators.values().all(|plan| plan.stage.is_some()),
+            "an operator outside every stage runs on all {total_workers} workers: with stages \
+             of different parallelism every operator must belong to a stage"
+        );
 
         let operator = |op: usize| {
             operators.get(&op).copied().unwrap_or(OperatorPlan {
@@ -561,6 +567,20 @@ mod tests {
                 WorkerContext::new(0, edge.source_hosts).unwrap()
             );
         }
+    }
+
+    /// With stages of different parallelism, an operator outside every
+    /// stage would silently run on all workers.
+    #[cfg(debug_assertions)]
+    #[test]
+    #[should_panic(expected = "every operator must belong to a stage")]
+    fn operator_outside_every_stage_with_differing_parallelism_is_a_bug() {
+        let mut df = exchange_shape(Some(1));
+        let double = op(&df, "double");
+        for stage in &mut df.stages {
+            stage.operator_indices.retain(|&o| o != double);
+        }
+        let _ = PhysicalPlan::new(&df.graph, &df.stages, Parallelism::PerStage { default: 2 });
     }
 
     #[test]

@@ -266,7 +266,8 @@ async fn multi_worker_iterate_collatz() {
 ///    the process hangs, which is what blocked the live investigation.
 /// 2. Confirm the exact park path. The stuck stage returns `WaitingForInput`
 ///    (not `Quiescent`) — so it is gated by `async_waiting` or
-///    `external_inputs_open` (stage_executor.rs `run_one_sweep`). Establish which,
+///    `external_inputs_open` (the `run_one_sweep` of the staged executor, since
+///    removed; re-establish the park path on the executor core). Establish which,
 ///    and why the consumer's `pull_input()` returns empty even though the SPSC
 ///    ring holds the record (the ring's own Acquire/Release should make the
 ///    pushed record visible — verify there isn't a missed re-poll instead).
