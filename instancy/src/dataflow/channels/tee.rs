@@ -187,6 +187,33 @@ pub fn tee_or_single<
     })
 }
 
+/// A push end that discards everything: the output of an operator whose
+/// output has no consumer.
+pub(crate) struct NullPush;
+
+impl<T: Timestamp, D: Send + 'static> Push<T, D> for NullPush {
+    fn push(&mut self, _envelope: super::Envelope<T, D>) -> crate::error::Result<()> {
+        Ok(())
+    }
+
+    fn try_push(
+        &mut self,
+        _envelope: super::Envelope<T, D>,
+    ) -> std::result::Result<(), (crate::error::Error, super::Envelope<T, D>)> {
+        Ok(())
+    }
+
+    fn flush(&mut self) -> crate::error::Result<()> {
+        Ok(())
+    }
+
+    fn close(&mut self) {}
+
+    fn is_closed(&self) -> bool {
+        false
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

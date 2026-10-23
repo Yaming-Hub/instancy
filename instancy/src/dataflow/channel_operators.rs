@@ -16,16 +16,13 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::mpsc;
 use std::time::Duration;
 
-use crate::dataflow::channels::envelope::Envelope;
-use crate::dataflow::channels::pushpull::{Pull, Push};
 use crate::dataflow::channels::wake::WakeHandle;
 use crate::dataflow::operators::input::InputEvent;
 use crate::dataflow::operators::output::OutputEvent;
-use crate::dataflow::schedulable::{ActivationOutcome, SchedulableOperator};
+use crate::dataflow::shell::{CountedInput, CountedOutput, OperatorLogic, OperatorShell};
 use crate::dataflow::stage::StageId;
 use crate::error::{ProgressError, Result};
-use crate::progress::PendingOutput;
-use crate::progress::operate::ProgressReporter;
+use crate::progress::capability::Capability;
 use crate::progress::timestamp::Timestamp;
 
 // ---------------------------------------------------------------------------
@@ -185,40 +182,39 @@ impl<T> OutputSend<T> {
 }
 
 // ---------------------------------------------------------------------------
-// ChannelSourceOperator
+// ChannelSourceLogic
 // ---------------------------------------------------------------------------
 
-/// A source operator that receives data from an external `mpsc` channel.
+/// The logic of a source fed by an external channel: every declared
+/// `input()` port and every `source_async`.
 ///
-/// Created by [`crate::dataflow::DataflowHandle`] for each declared `input()`
-/// port. The caller sends [`InputEvent`]s through
-/// an [`InputSender`], which this operator consumes and pushes downstream.
+/// The caller sends [`InputEvent`]s through an [`InputSender`] (or an
+/// [`AsyncInputSender`]); the source emits the data and downgrades its
+/// capability with each frontier event.
 ///
 /// # Quiescence behavior
 ///
 /// While this operator's channel is open, it prevents the executor from
 /// declaring quiescence by holding a count in `external_inputs_open`.
 /// When the channel is closed (sender dropped or explicit close), the
-/// count is decremented and the operator marks itself as done.
+/// count is decremented and the source releases its capability.
 ///
 /// # Graceful drain
 ///
-/// [`close_external_input`](SchedulableOperator::close_external_input) closes
-/// the input's admission gate: later sends fail with [`crate::Error::ChannelClosed`],
+/// [`close_external_input`](OperatorLogic::close_external_input) closes the
+/// input's admission gate: later sends fail with [`crate::Error::ChannelClosed`],
 /// while every event a sender was already told was accepted is still
-/// delivered before the operator finishes.
-pub struct ChannelSourceOperator<T: Timestamp, D: Send + 'static> {
-    name: String,
-    index: usize,
-    stage_id: StageId,
+/// delivered before the source finishes.
+pub(crate) struct ChannelSourceLogic<T: Timestamp, D: Send + 'static> {
     receiver: InputRecv<InputEvent<T, D>>,
-    output_pusher: Box<dyn Push<T, D>>,
-    pending_output: PendingOutput<T, D>,
-    progress_reporter: Option<ProgressReporter<T>>,
+    /// The source's capability: its operator's initial capability at
+    /// `T::minimum()`, downgraded by frontier events, released at the end
+    /// of input. `None` without progress tracking.
+    capability: Option<Capability<T>>,
     external_inputs_open: Arc<AtomicUsize>,
-    /// The timestamp of the currently held capability. Starts at T::minimum()
-    /// and advances when Frontier events are received.
-    current_capability: T,
+    /// The time of the source's frontier. Starts at T::minimum() and
+    /// advances when Frontier events are received.
+    current: T,
     /// Until the first advance, Timestamp::minimum() permits every valid time.
     frontier_advanced: bool,
     /// Admission gate shared with this input's senders (absent in unit tests
@@ -226,53 +222,37 @@ pub struct ChannelSourceOperator<T: Timestamp, D: Send + 'static> {
     input_gate: Option<Arc<InputGate>>,
     /// Set once external input is closed for a graceful drain.
     external_closed: bool,
-    done: bool,
+    /// Input ended: the capability is released.
+    finished: bool,
     /// Set (async sources without a drain) when the producer was cut off by a
     /// cancellation: the closed channel is then not an end of input.
     abandoned: Option<Arc<std::sync::atomic::AtomicBool>>,
+    /// A protocol violation found after events that were already emitted:
+    /// raised once those are committed.
+    failure: Option<crate::Error>,
 }
 
-impl<T: Timestamp, D: Send + 'static> ChannelSourceOperator<T, D> {
-    /// Create a new channel source operator.
+impl<T: Timestamp, D: Send + 'static> ChannelSourceLogic<T, D> {
+    /// Create the logic of a channel source; with `seeded`, it holds its
+    /// operator's initial capability (on `output`'s reporter).
     pub(crate) fn new(
-        name: String,
-        index: usize,
-        stage_id: StageId,
         receiver: InputRecv<InputEvent<T, D>>,
-        output_pusher: Box<dyn Push<T, D>>,
-        progress_reporter: Option<ProgressReporter<T>>,
+        output: &CountedOutput<T, D>,
+        seeded: bool,
         external_inputs_open: Arc<AtomicUsize>,
     ) -> Self {
-        #[cfg_attr(
-            not(any(debug_assertions, feature = "progress-check")),
-            allow(unused_mut)
-        )]
-        let mut op = Self {
-            name,
-            index,
-            stage_id,
+        Self {
             receiver,
-            output_pusher,
-            pending_output: PendingOutput::new(),
-            progress_reporter,
+            capability: seeded.then(|| Capability::seeded(T::minimum(), output.reporter().clone())),
             external_inputs_open,
-            current_capability: T::minimum(),
+            current: T::minimum(),
             frontier_advanced: false,
             input_gate: None,
             external_closed: false,
-            done: false,
+            finished: false,
             abandoned: None,
-        };
-        // The progress checker counts the retry queue and the capability
-        // this source holds (from the start, at `T::minimum()`).
-        #[cfg(any(debug_assertions, feature = "progress-check"))]
-        {
-            op.pending_output.observe(&*op.output_pusher);
-            if let Some(reporter) = &op.progress_reporter {
-                reporter.check_hold(&op.current_capability, 1);
-            }
+            failure: None,
         }
-        op
     }
 
     /// Share an admission gate with this input's senders.
@@ -281,14 +261,9 @@ impl<T: Timestamp, D: Send + 'static> ChannelSourceOperator<T, D> {
         self
     }
 
-    /// Whether no sender is between admission and enqueue.
-    fn senders_idle(&self) -> bool {
-        self.input_gate.as_ref().is_none_or(|gate| gate.is_idle())
-    }
-
     /// A channel that closes after `flag` was set did not end the input (its
-    /// producer was cancelled): the operator then neither finishes nor
-    /// closes its output, and the executor stops on the cancellation.
+    /// producer was cancelled): the source then neither finishes nor
+    /// releases its capability, and the executor stops on the cancellation.
     pub(crate) fn with_abandon_flag(
         mut self,
         flag: Option<Arc<std::sync::atomic::AtomicBool>>,
@@ -297,25 +272,14 @@ impl<T: Timestamp, D: Send + 'static> ChannelSourceOperator<T, D> {
         self
     }
 
-    /// Try to flush pending output to the downstream pusher.
-    /// Returns true if all pending output was flushed.
-    fn flush_pending(&mut self) -> Result<bool> {
-        while let Some(envelope) = self.pending_output.pop_front() {
-            match self.output_pusher.try_push(envelope) {
-                Ok(()) => {}
-                Err((crate::error::Error::Backpressure, returned)) => {
-                    self.pending_output.push_front(returned);
-                    return Ok(false);
-                }
-                Err((e, _)) => return Err(e),
-            }
-        }
-        Ok(true)
+    /// Whether no sender is between admission and enqueue.
+    fn senders_idle(&self) -> bool {
+        self.input_gate.as_ref().is_none_or(|gate| gate.is_idle())
     }
 
-    /// Mark this operator as done and release resources.
+    /// The input ended: stop accepting events and release the capability.
     fn finish(&mut self) {
-        if self.done {
+        if self.finished {
             return;
         }
         // Senders must not report success for events nobody will read.
@@ -323,86 +287,70 @@ impl<T: Timestamp, D: Send + 'static> ChannelSourceOperator<T, D> {
             gate.close();
         }
         self.receiver.close();
-        // Release the currently held capability
-        if let Some(ref reporter) = self.progress_reporter {
-            reporter.update(self.current_capability.clone(), -1);
-            #[cfg(any(debug_assertions, feature = "progress-check"))]
-            reporter.check_hold(&self.current_capability, -1);
-        }
-        self.output_pusher.close();
-        self.done = true;
+        self.capability = None;
+        self.finished = true;
         // Decrement external input counter so executor can detect quiescence
         self.external_inputs_open.fetch_sub(1, Ordering::SeqCst);
     }
 }
 
-impl<T: Timestamp, D: Send + 'static> SchedulableOperator for ChannelSourceOperator<T, D> {
-    fn activate(&mut self) -> Result<ActivationOutcome> {
-        if self.done {
-            return Ok(ActivationOutcome::Done);
-        }
+impl<T: Timestamp, D: Send + 'static> OperatorLogic for ChannelSourceLogic<T, D> {
+    type Inputs = ();
+    type Outputs = CountedOutput<T, D>;
+    type Time = T;
 
-        // First, try to flush any pending output from previous activation.
-        if !self.flush_pending()? {
-            return Ok(ActivationOutcome::BlockedOnBackpressure);
-        }
+    fn wants_call(&self, _: &()) -> bool {
+        !self.finished || self.failure.is_some()
+    }
 
-        // Poll the channel for new events (non-blocking).
-        // We cap per-activation work to avoid starving other operators in the
-        // cooperative executor. The cap applies to data events; frontier and
-        // control events are lightweight and don't count.
+    fn call(&mut self, _: &mut (), output: &mut Self::Outputs) -> Result<bool> {
+        if let Some(failure) = self.failure.take() {
+            return Err(failure);
+        }
+        // Cap per-call work so other operators get a turn. The cap applies
+        // to data events; frontier events are lightweight and don't count.
         const ACTIVATION_BUDGET: usize = 1024;
+        let output = output.handle();
         let mut made_progress = false;
         let mut data_events = 0usize;
         // After external input closes: set once no sender is mid-enqueue, so
         // the channel's contents are final and an empty receive ends the input.
         let mut drained_inputs_final = false;
 
-        loop {
-            if data_events >= ACTIVATION_BUDGET {
-                // Yield to the scheduler so other operators get a turn.
-                break;
-            }
+        while data_events < ACTIVATION_BUDGET {
             match self.receiver.try_recv() {
                 Ok(InputEvent::Data { time, data }) => {
-                    if self.frontier_advanced && !self.current_capability.less_equal(&time) {
-                        return Err(ProgressError::InputTimeBeforeFrontier {
-                            time: format!("{time:?}"),
-                            frontier: format!("{:?}", self.current_capability),
-                        }
-                        .into());
+                    if self.frontier_advanced && !self.current.less_equal(&time) {
+                        // Emit what came before; fail once it is committed.
+                        self.failure = Some(
+                            ProgressError::InputTimeBeforeFrontier {
+                                time: format!("{time:?}"),
+                                frontier: format!("{:?}", self.current),
+                            }
+                            .into(),
+                        );
+                        return Ok(made_progress);
                     }
-                    let envelope = Envelope::data(time, data);
-                    match self.output_pusher.try_push(envelope) {
-                        Ok(()) => {
-                            made_progress = true;
-                            data_events += 1;
-                        }
-                        Err((crate::error::Error::Backpressure, returned)) => {
-                            self.pending_output.push_back(returned);
-                            return Ok(ActivationOutcome::BlockedOnBackpressure);
-                        }
-                        Err((e, _)) => return Err(e),
-                    }
+                    output.push_vec(time, data);
+                    made_progress = true;
+                    data_events += 1;
                 }
                 Ok(InputEvent::Frontier(time)) => {
-                    if !self.current_capability.less_equal(&time) {
-                        return Err(ProgressError::InvalidInputFrontier {
-                            from: format!("{:?}", self.current_capability),
-                            to: format!("{time:?}"),
-                        }
-                        .into());
-                    }
-                    if time != self.current_capability {
-                        if let Some(ref reporter) = self.progress_reporter {
-                            reporter.downgrade(self.current_capability.clone(), time.clone());
-                            #[cfg(any(debug_assertions, feature = "progress-check"))]
-                            {
-                                reporter.check_hold(&time, 1);
-                                reporter.check_hold(&self.current_capability, -1);
+                    if !self.current.less_equal(&time) {
+                        self.failure = Some(
+                            ProgressError::InvalidInputFrontier {
+                                from: format!("{:?}", self.current),
+                                to: format!("{time:?}"),
                             }
+                            .into(),
+                        );
+                        return Ok(made_progress);
+                    }
+                    if time != self.current {
+                        if let Some(capability) = &mut self.capability {
+                            capability.downgrade(&time)?;
                         }
-                        self.current_capability = time;
+                        self.current = time;
                         self.frontier_advanced = true;
                     }
                     made_progress = true;
@@ -411,7 +359,7 @@ impl<T: Timestamp, D: Send + 'static> SchedulableOperator for ChannelSourceOpera
                     if self.external_closed {
                         if drained_inputs_final {
                             self.finish();
-                            return Ok(ActivationOutcome::Done);
+                            return Ok(true);
                         }
                         if self.senders_idle() {
                             // The gate is closed and empty: every accepted event
@@ -421,7 +369,6 @@ impl<T: Timestamp, D: Send + 'static> SchedulableOperator for ChannelSourceOpera
                         }
                         // A sender is mid-enqueue; it notifies when it leaves.
                     }
-                    // No data available right now. Return Idle.
                     break;
                 }
                 Err(RecvError::Disconnected) => {
@@ -430,49 +377,25 @@ impl<T: Timestamp, D: Send + 'static> SchedulableOperator for ChannelSourceOpera
                         .as_ref()
                         .is_some_and(|flag| flag.load(Ordering::SeqCst))
                     {
-                        // Cut off by a cancellation, not closed: closing the
-                        // output would present a truncated stream as complete
-                        // (to peers, in a cluster) before the executor
-                        // notices the cancellation at its next sweep.
+                        // Cut off by a cancellation, not closed: ending the
+                        // input would present a truncated stream as complete
+                        // before the executor notices the cancellation.
                         break;
                     }
-                    // Sender dropped — input is closed. Finish up.
                     self.finish();
-                    return Ok(ActivationOutcome::Done);
+                    return Ok(true);
                 }
             }
         }
-
-        if made_progress {
-            Ok(ActivationOutcome::MadeProgress)
-        } else {
-            Ok(ActivationOutcome::Idle)
-        }
+        Ok(made_progress)
     }
 
-    fn is_done(&self) -> bool {
-        self.done
-    }
-
-    fn name(&self) -> &str {
-        &self.name
-    }
-
-    fn index(&self) -> usize {
-        self.index
-    }
-
-    fn stage_id(&self) -> StageId {
-        self.stage_id
-    }
-
-    fn close_inputs(&mut self) {
-        // Channel source has no dataflow inputs — closing means finishing.
-        self.finish();
+    fn holds_work(&self) -> bool {
+        !self.finished
     }
 
     fn close_external_input(&mut self) {
-        if self.done || self.external_closed {
+        if self.finished || self.external_closed {
             return;
         }
         self.external_closed = true;
@@ -482,216 +405,179 @@ impl<T: Timestamp, D: Send + 'static> SchedulableOperator for ChannelSourceOpera
         // Fail async senders blocked on capacity now; buffered events remain.
         self.receiver.close();
     }
+
+    fn inputs_closed(&mut self) {
+        self.finish();
+    }
+}
+
+/// A channel source operator: `logic` (see [`ChannelSourceLogic`]) with its
+/// output.
+pub(crate) fn channel_source<T: Timestamp, D: Send + 'static>(
+    name: impl Into<String>,
+    index: usize,
+    stage_id: StageId,
+    logic: ChannelSourceLogic<T, D>,
+    output: CountedOutput<T, D>,
+) -> OperatorShell<ChannelSourceLogic<T, D>> {
+    OperatorShell::new(name, index, stage_id, logic, (), output)
 }
 
 // ---------------------------------------------------------------------------
-// ChannelSinkOperator
+// ChannelSinkLogic
 // ---------------------------------------------------------------------------
 
-/// A sink operator that sends output data to an external `mpsc` channel.
+/// The logic of a sink that sends output data to an external channel: every
+/// declared `output()` port. Data received from upstream is forwarded as
+/// events to an [`OutputReceiver`] (or an [`AsyncOutputReceiver`]).
 ///
-/// Created by [`crate::dataflow::DataflowHandle`] for each declared `output()`
-/// port. Data received from upstream is forwarded
-/// as [`OutputEvent`]s to an [`OutputReceiver`].
+/// # Egress credit
+///
+/// The sink takes each batch on credit
+/// ([`InputHandle::next_on_credit`](crate::dataflow::InputHandle)): the
+/// batch stays counted at the sink's input until the external channel
+/// accepts its event (or the event is explicitly discarded), so a full or
+/// paused external channel holds the input's frontier and no completion can
+/// pass it.
 ///
 /// # Dropped receivers
 ///
 /// If the receiver is dropped, the port's output is no longer wanted: the sink
-/// keeps consuming its input and discards it, so upstream operators never
-/// block on the abandoned port and the dataflow completes normally once its
-/// inputs close.
+/// keeps consuming its input and discards it explicitly, so upstream
+/// operators never block on the abandoned port and the dataflow completes
+/// normally once its inputs close.
 ///
 /// The event type `E` is `OutputEvent<T, D>` for ordinary outputs. Outputs
 /// declared inside an `iterate` body send events whose timestamp has been
 /// projected onto the dataflow's (root) timestamp and type-erased.
-pub struct ChannelSinkOperator<
-    T: Timestamp,
-    D: Send + 'static,
-    E: Send + 'static = OutputEvent<T, D>,
-> {
-    name: String,
-    index: usize,
-    stage_id: StageId,
-    input_puller: Box<dyn Pull<T, D>>,
+pub(crate) struct ChannelSinkLogic<T: Timestamp, D: Send + 'static, E: Send + 'static> {
     sender: OutputSend<E>,
     /// Builds the event sent for a `(time, data)` batch.
     make_event: Box<dyn Fn(T, Vec<D>) -> E + Send>,
-    /// Buffered output event that couldn't be sent due to channel full.
-    pending_send: Option<E>,
+    /// An event the full channel did not accept yet, with the credit of
+    /// its batch.
+    pending_send: Option<(E, (T, i64))>,
     /// The receiver is gone; input is consumed and discarded.
     receiver_dropped: bool,
-    input_exhausted: bool,
-    done: bool,
-    /// The progress checker's count of `pending_send`, and the batch it holds.
+    /// Whether the last call left an event the channel did not accept.
+    blocked: bool,
+    /// The progress checker's count of `pending_send`.
     #[cfg(any(debug_assertions, feature = "progress-check"))]
-    check_egress: Option<(crate::progress::check::StoreCheck<T>, Option<(T, usize)>)>,
+    check_egress: Option<crate::progress::check::StoreCheck<T>>,
 }
 
-impl<T: Timestamp, D: Send + 'static> ChannelSinkOperator<T, D> {
-    /// Create a new channel sink operator.
+impl<T: Timestamp, D: Send + 'static, E: Send + 'static> ChannelSinkLogic<T, D, E> {
+    /// Create the logic of a channel sink that builds its events with
+    /// `make_event`.
     pub(crate) fn new(
-        name: String,
-        index: usize,
-        stage_id: StageId,
-        input_puller: Box<dyn Pull<T, D>>,
-        sender: OutputSend<OutputEvent<T, D>>,
-    ) -> Self {
-        Self::with_event_fn(
-            name,
-            index,
-            stage_id,
-            input_puller,
-            sender,
-            Box::new(OutputEvent::data),
-        )
-    }
-}
-
-impl<T: Timestamp, D: Send + 'static, E: Send + 'static> ChannelSinkOperator<T, D, E> {
-    /// Create a channel sink operator that builds its events with `make_event`.
-    pub(crate) fn with_event_fn(
-        name: String,
-        index: usize,
-        stage_id: StageId,
-        input_puller: Box<dyn Pull<T, D>>,
         sender: OutputSend<E>,
         make_event: Box<dyn Fn(T, Vec<D>) -> E + Send>,
+        input: &CountedInput<T, D>,
     ) -> Self {
-        #[cfg(any(debug_assertions, feature = "progress-check"))]
-        let check_egress = input_puller.check_port().map(|port| {
-            (
-                crate::progress::check::StoreCheck::new(
-                    port,
-                    crate::progress::check::Store::Egress,
-                ),
-                None,
-            )
-        });
+        #[cfg(not(any(debug_assertions, feature = "progress-check")))]
+        let _ = input;
         Self {
-            name,
-            index,
-            stage_id,
-            input_puller,
             sender,
             make_event,
             pending_send: None,
             receiver_dropped: false,
-            input_exhausted: false,
-            done: false,
+            blocked: false,
             #[cfg(any(debug_assertions, feature = "progress-check"))]
-            check_egress,
+            check_egress: input.check_port().map(|port| {
+                crate::progress::check::StoreCheck::new(port, crate::progress::check::Store::Egress)
+            }),
         }
     }
 
-    /// Forward an event unless the receiver is gone. Returns `false` (and
-    /// keeps the event) if the channel is full.
-    fn forward(&mut self, event: E) -> bool {
+    /// Forward an event unless the receiver is gone; the event's credit is
+    /// redeemed once the channel accepts it or it is discarded. Returns
+    /// `false` (and keeps the event) if the channel is full.
+    fn forward(&mut self, input: &mut CountedInput<T, D>, event: E, credit: (T, i64)) -> bool {
         if self.receiver_dropped {
+            input.redeem(credit);
             return true;
         }
         match self.sender.try_send(event) {
-            Ok(()) => true,
+            Ok(()) => {
+                input.redeem(credit);
+                true
+            }
             Err(SendError::Full(event)) => {
-                self.pending_send = Some(event);
+                #[cfg(any(debug_assertions, feature = "progress-check"))]
+                if let Some(check) = &self.check_egress {
+                    check.add(&credit.0, credit.1 as usize);
+                }
+                self.pending_send = Some((event, credit));
                 false
             }
             Err(SendError::Disconnected(_)) => {
+                // Explicitly discarded: the output is no longer wanted.
                 self.receiver_dropped = true;
+                input.redeem(credit);
                 true
             }
         }
     }
 }
 
-impl<T: Timestamp, D: Send + 'static, E: Send + 'static> SchedulableOperator
-    for ChannelSinkOperator<T, D, E>
+impl<T: Timestamp, D: Send + 'static, E: Send + 'static> OperatorLogic
+    for ChannelSinkLogic<T, D, E>
 {
-    fn activate(&mut self) -> Result<ActivationOutcome> {
-        if self.done {
-            return Ok(ActivationOutcome::Done);
-        }
+    type Inputs = CountedInput<T, D>;
+    type Outputs = ();
+    type Time = T;
 
-        // First, try to drain any pending send from a previous activation.
-        if let Some(event) = self.pending_send.take() {
-            if !self.forward(event) {
-                return Ok(ActivationOutcome::BlockedOnBackpressure);
-            }
-            #[cfg(any(debug_assertions, feature = "progress-check"))]
-            if let Some((check, held)) = &mut self.check_egress {
-                if let Some((time, n)) = held.take() {
-                    check.remove(&time, n);
-                }
-            }
-        }
+    fn wants_call(&self, input: &Self::Inputs) -> bool {
+        input.has_pending() || self.pending_send.is_some()
+    }
 
+    fn call(&mut self, input: &mut Self::Inputs, _: &mut ()) -> Result<bool> {
+        self.blocked = false;
         let mut made_progress = false;
-
-        // Pull data from upstream and forward to channel (non-blocking).
-        loop {
-            match self.input_puller.pull() {
-                Some(envelope) => {
-                    made_progress = true;
-                    match envelope.payload {
-                        crate::dataflow::channels::envelope::Payload::Data { time, data } => {
-                            #[cfg(any(debug_assertions, feature = "progress-check"))]
-                            let batch = (time.clone(), data.len());
-                            let event = (self.make_event)(time, data);
-                            if !self.forward(event) {
-                                #[cfg(any(debug_assertions, feature = "progress-check"))]
-                                if let Some((check, held)) = &mut self.check_egress {
-                                    check.add(&batch.0, batch.1);
-                                    *held = Some(batch);
-                                }
-                                // Channel full — stop pulling, will retry next activation
-                                return Ok(ActivationOutcome::BlockedOnBackpressure);
-                            }
-                        }
-                        crate::dataflow::channels::envelope::Payload::Control(_) => {
-                            // Control signals are not forwarded to external consumers.
-                        }
-                    }
-                }
-                None => {
-                    // No more data available right now.
-                    if self.input_puller.is_exhausted() {
-                        self.input_exhausted = true;
-                    }
-                    break;
-                }
+        if let Some((event, credit)) = self.pending_send.take() {
+            #[cfg(any(debug_assertions, feature = "progress-check"))]
+            if let Some(check) = &self.check_egress {
+                check.remove(&credit.0, credit.1 as usize);
+            }
+            if !self.forward(input, event, credit) {
+                self.blocked = true;
+                return Ok(false);
+            }
+            made_progress = true;
+        }
+        while let Some((time, data, credit)) = input.handle().next_on_credit() {
+            made_progress = true;
+            let event = (self.make_event)(time, data);
+            if !self.forward(input, event, credit) {
+                // Channel full: stop taking input, retry next activation.
+                self.blocked = true;
+                break;
             }
         }
-
-        if self.input_exhausted {
-            self.done = true;
-            return Ok(ActivationOutcome::Done);
-        }
-
-        if made_progress {
-            Ok(ActivationOutcome::MadeProgress)
-        } else {
-            Ok(ActivationOutcome::Idle)
-        }
+        Ok(made_progress)
     }
 
-    fn is_done(&self) -> bool {
-        self.done
+    fn holds_work(&self) -> bool {
+        self.pending_send.is_some()
     }
 
-    fn name(&self) -> &str {
-        &self.name
+    fn blocked(&self) -> bool {
+        self.blocked
     }
+}
 
-    fn index(&self) -> usize {
-        self.index
-    }
-
-    fn stage_id(&self) -> StageId {
-        self.stage_id
-    }
-
-    fn close_inputs(&mut self) {
-        self.input_exhausted = true;
-    }
+/// A channel sink operator forwarding its input as events built by
+/// `make_event` to `sender`.
+pub(crate) fn channel_sink<T: Timestamp, D: Send + 'static, E: Send + 'static>(
+    name: impl Into<String>,
+    index: usize,
+    stage_id: StageId,
+    input: CountedInput<T, D>,
+    sender: OutputSend<E>,
+    make_event: Box<dyn Fn(T, Vec<D>) -> E + Send>,
+) -> OperatorShell<ChannelSinkLogic<T, D, E>> {
+    let logic = ChannelSinkLogic::new(sender, make_event, &input);
+    OperatorShell::new(name, index, stage_id, logic, input, ())
 }
 
 // ---------------------------------------------------------------------------
@@ -1163,7 +1049,36 @@ impl<T: Timestamp, D: Send + 'static> Drop for AsyncOutputReceiver<T, D> {
 mod tests {
     use super::*;
     use crate::dataflow::channels::bounded::bounded_channel;
-    use crate::dataflow::channels::pushpull::Push;
+    use crate::dataflow::channels::envelope::Envelope;
+    use crate::dataflow::channels::pushpull::{Pull, Push};
+    use crate::dataflow::schedulable::{ActivationOutcome, SchedulableOperator};
+    use crate::progress::operate::{PortLedger, ProgressReporter};
+
+    /// A source shell on `receiver` emitting into `push`; with `reporter`,
+    /// it holds its initial capability through it.
+    fn test_source<T: Timestamp>(
+        receiver: InputRecv<InputEvent<T, i32>>,
+        push: Box<dyn Push<T, i32>>,
+        reporter: Option<ProgressReporter<T>>,
+        counter: Arc<AtomicUsize>,
+    ) -> (OperatorShell<ChannelSourceLogic<T, i32>>, PortLedger<T>) {
+        let produced = PortLedger::new();
+        let mut output = CountedOutput::new(
+            "test:output".into(),
+            push,
+            produced.clone(),
+            ProgressReporter::new(),
+            None,
+        );
+        if let Some(reporter) = &reporter {
+            output.set_reporter(reporter.clone());
+        }
+        let logic = ChannelSourceLogic::new(receiver, &output, reporter.is_some(), counter);
+        (
+            channel_source("data", 0, StageId::new(0), logic, output),
+            produced,
+        )
+    }
 
     #[test]
     fn last_input_sender_disconnects_before_waking_executor() {
@@ -1171,7 +1086,7 @@ mod tests {
         use std::task::{Wake, Waker};
 
         struct SourceWake {
-            source: Mutex<ChannelSourceOperator<u64, i32>>,
+            source: Mutex<OperatorShell<ChannelSourceLogic<u64, i32>>>,
             wake: WakeHandle,
         }
         impl Wake for SourceWake {
@@ -1206,17 +1121,14 @@ mod tests {
             let (push, _pull) = bounded_channel::<u64, i32, ()>(1);
             let counter = Arc::new(AtomicUsize::new(1));
             let reporter = ProgressReporter::new();
-            reporter.update(0, 1);
+            let (source, _) = test_source(
+                receiver,
+                Box::new(push),
+                Some(reporter.clone()),
+                counter.clone(),
+            );
             let executor = Arc::new(SourceWake {
-                source: Mutex::new(ChannelSourceOperator::new(
-                    "data".into(),
-                    0,
-                    StageId::new(0),
-                    receiver,
-                    Box::new(push),
-                    Some(reporter.clone()),
-                    counter.clone(),
-                )),
+                source: Mutex::new(source),
                 wake: wake.clone(),
             });
             wake.take_notification();
@@ -1232,20 +1144,27 @@ mod tests {
             );
             executor.source.lock().unwrap().activate().unwrap();
             assert_eq!(counter.load(Ordering::SeqCst), 0);
-            assert!(reporter.drain().is_empty());
+            assert_eq!(
+                reporter.drain(),
+                vec![(0, -1)],
+                "the capability is released"
+            );
         }
     }
+
+    type FrontierSource<T> = (
+        OperatorShell<ChannelSourceLogic<T, i32>>,
+        Box<dyn Pull<T, i32>>,
+        ProgressReporter<T>,
+        PortLedger<T>,
+    );
 
     fn frontier_source<T: Timestamp>(
         events: Vec<InputEvent<T, i32>>,
         async_io: bool,
         reporting: bool,
         capacity: usize,
-    ) -> (
-        ChannelSourceOperator<T, i32>,
-        impl Pull<T, i32>,
-        ProgressReporter<T>,
-    ) {
+    ) -> FrontierSource<T> {
         let receiver = if async_io {
             let (tx, rx) = tokio::sync::mpsc::channel(events.len().max(1));
             for event in events {
@@ -1260,18 +1179,14 @@ mod tests {
             InputRecv::Std(rx)
         };
         let reporter = ProgressReporter::new();
-        reporter.update(T::minimum(), 1);
         let (push, pull) = bounded_channel::<T, i32, ()>(capacity);
-        let source = ChannelSourceOperator::new(
-            "frontier_input".into(),
-            0,
-            StageId::new(0),
+        let (source, produced) = test_source(
             receiver,
             Box::new(push),
             reporting.then(|| reporter.clone()),
             Arc::new(AtomicUsize::new(1)),
         );
-        (source, pull, reporter)
+        (source, Box::new(pull), reporter, produced)
     }
 
     #[test]
@@ -1279,7 +1194,7 @@ mod tests {
         for async_io in [false, true] {
             for reporting in [false, true] {
                 for late_batch in [vec![2], vec![]] {
-                    let (mut source, mut pull, _) = frontier_source(
+                    let (mut source, mut pull, _, _) = frontier_source(
                         vec![
                             InputEvent::data(10u64, vec![1]),
                             InputEvent::frontier(11),
@@ -1289,6 +1204,12 @@ mod tests {
                         reporting,
                         16,
                     );
+                    // The valid prefix is emitted and committed; the
+                    // violation then fails the operator.
+                    assert!(matches!(
+                        source.activate(),
+                        Ok(ActivationOutcome::MadeProgress)
+                    ));
                     assert!(
                         matches!(
                             source.activate(),
@@ -1308,18 +1229,19 @@ mod tests {
     #[test]
     fn input_frontier_rejects_backward_advance_without_changing_progress() {
         for async_io in [false, true] {
-            let (mut source, _pull, reporter) = frontier_source(
+            let (mut source, _pull, reporter, _) = frontier_source(
                 vec![InputEvent::frontier(5u64), InputEvent::frontier(3)],
                 async_io,
                 true,
                 16,
             );
+            source.activate().unwrap();
             assert!(matches!(
                 source.activate(),
                 Err(crate::Error::Progress(ProgressError::InvalidInputFrontier { from, to }))
                     if from == "5" && to == "3"
             ));
-            assert_eq!(reporter.drain(), vec![(5, 1)]);
+            assert_eq!(reporter.drain(), vec![(0, -1), (5, 1)]);
         }
     }
 
@@ -1332,13 +1254,17 @@ mod tests {
                     InputEvent::data(Product::new(2u64, 2u64), vec![1]),
                     InputEvent::frontier(Product::new(2u64, 2u64)),
                 ] {
-                    let (mut source, mut pull, _) = frontier_source(
+                    let (mut source, mut pull, _, _) = frontier_source(
                         vec![InputEvent::frontier(Product::new(1, 3)), invalid],
                         async_io,
                         reporting,
                         16,
                     );
-                    assert!(source.activate().is_err(), "incomparable times are invalid");
+                    let first = source.activate();
+                    assert!(
+                        first.is_err() || source.activate().is_err(),
+                        "incomparable times are invalid"
+                    );
                     assert!(pull.pull().is_none());
                 }
             }
@@ -1348,7 +1274,7 @@ mod tests {
     #[test]
     fn input_frontier_allows_equal_repeated_and_out_of_order_data() {
         for async_io in [false, true] {
-            let (mut source, mut pull, reporter) = frontier_source(
+            let (mut source, mut pull, reporter, _) = frontier_source(
                 vec![
                     InputEvent::frontier(i64::MIN),
                     InputEvent::data(i64::MIN, vec![0]),
@@ -1383,17 +1309,22 @@ mod tests {
                     (i64::MAX, vec![4])
                 ]
             );
-            assert!(
-                reporter.drain().is_empty(),
-                "last sender releases the frontier"
+            assert_eq!(
+                reporter.drain(),
+                vec![(i64::MIN, -1)],
+                "last sender releases the capability"
             );
         }
     }
 
     #[test]
-    fn input_frontier_cannot_overtake_backpressured_data() {
+    fn input_frontier_may_pass_counted_backpressured_data() {
+        // The source emits into its output session; the shell counts the
+        // output as produced before it waits in the retry queue, so the
+        // source's frontier may move past data that does not fit into the
+        // channel yet: it is counted at the consuming input.
         for async_io in [false, true] {
-            let (mut source, mut pull, reporter) = frontier_source(
+            let (mut source, mut pull, reporter, produced) = frontier_source(
                 vec![
                     InputEvent::data(10u64, vec![1]),
                     InputEvent::data(10, vec![2]),
@@ -1408,16 +1339,15 @@ mod tests {
                 source.activate().unwrap(),
                 ActivationOutcome::BlockedOnBackpressure
             ));
-            assert_eq!(reporter.drain(), vec![(0, 1)]);
+            assert_eq!(produced.drain(), vec![(10, 2)]);
+            assert_eq!(reporter.drain(), vec![(0, -1), (11, 1)]);
             assert_eq!(pull.pull().unwrap().as_data(), Some((&10, &vec![1])));
-            assert!(source.activate().is_err());
-            assert_eq!(pull.pull().unwrap().as_data(), Some((&10, &vec![2])));
-            assert!(pull.pull().is_none());
+            assert!(source.activate().is_err(), "data at 10 after frontier 11");
         }
     }
 
     #[test]
-    fn branched_input_preserves_batches_and_progress_under_backpressure() {
+    fn branched_input_preserves_batches_and_counts_them_under_backpressure() {
         use crate::dataflow::channels::tee::TeePush;
 
         let (tx, rx) = mpsc::sync_channel(4);
@@ -1426,11 +1356,7 @@ mod tests {
         b.push(Envelope::data(11, vec![-1])).unwrap();
         let tee = TeePush::new(vec![Box::new(a), Box::new(b)]).unwrap();
         let reporter = ProgressReporter::new();
-        reporter.update(0, 1);
-        let mut source = ChannelSourceOperator::new(
-            "branched".into(),
-            0,
-            StageId::new(0),
+        let (mut source, produced) = test_source(
             InputRecv::Std(rx),
             Box::new(tee),
             Some(reporter.clone()),
@@ -1444,7 +1370,9 @@ mod tests {
             source.activate().unwrap(),
             ActivationOutcome::BlockedOnBackpressure
         ));
-        assert_eq!(reporter.drain(), vec![(11, 1)]);
+        // Produced once (the tee's edges each count it), capability gone.
+        assert_eq!(produced.drain(), vec![(11, 2)]);
+        assert_eq!(reporter.drain(), vec![(0, -1)]);
         assert_eq!(a_rx.pull().unwrap().as_data(), Some((&11, &vec![1, 2])));
         assert_eq!(b_rx.pull().unwrap().as_data(), Some((&11, &vec![-1])));
         assert!(matches!(
@@ -1456,7 +1384,6 @@ mod tests {
             a_rx.pull().is_none() && b_rx.pull().is_none(),
             "no duplicate or minimum-time placeholder"
         );
-        assert_eq!(reporter.drain(), vec![(11, -1)]);
     }
 
     #[tokio::test]
@@ -1468,11 +1395,7 @@ mod tests {
         let sender = AsyncInputSender::with_wake_handle(tx, WakeHandle::new());
         let (push, mut pull) = bounded_channel::<u64, i32, ()>(4);
         let reporter = ProgressReporter::new();
-        reporter.update(0, 1);
-        let mut source = ChannelSourceOperator::new(
-            "data".into(),
-            0,
-            StageId::new(0),
+        let (mut source, _) = test_source(
             InputRecv::Tokio(rx),
             Box::new(push),
             Some(reporter.clone()),
@@ -1489,7 +1412,7 @@ mod tests {
             ));
         }
         source.activate().unwrap();
-        assert_eq!(reporter.drain(), vec![(0, 1)]);
+        assert!(reporter.drain().is_empty());
         sender.send(10, vec![2]).await.unwrap();
         {
             let mut send = Box::pin(sender.send(12, vec![3]));
@@ -1514,26 +1437,19 @@ mod tests {
         let (tx, rx) = mpsc::sync_channel(16);
         let (push, mut pull) = bounded_channel::<u64, i32, ()>(1024);
         let counter = Arc::new(AtomicUsize::new(1));
-
-        let mut op = ChannelSourceOperator::new(
-            "test_input".into(),
-            0,
-            StageId::new(0),
+        let (mut op, _) = test_source(
             InputRecv::Std(rx),
             Box::new(push),
             None,
             Arc::clone(&counter),
         );
 
-        // Send data
         tx.send(InputEvent::data(0, vec![1, 2, 3])).unwrap();
         tx.send(InputEvent::data(1, vec![4, 5])).unwrap();
 
-        // Activate — should consume both events
         let outcome = op.activate().unwrap();
         assert!(matches!(outcome, ActivationOutcome::MadeProgress));
 
-        // Pull from output
         let env1 = pull.pull().unwrap();
         let (t, d) = env1.as_data().unwrap();
         assert_eq!(*t, 0);
@@ -1550,23 +1466,16 @@ mod tests {
 
     #[test]
     fn channel_source_finishes_on_disconnect() {
-        let (tx, rx) = mpsc::sync_channel(16);
+        let (tx, rx) = mpsc::sync_channel::<InputEvent<u64, i32>>(16);
         let (push, _pull) = bounded_channel::<u64, i32, ()>(1024);
         let counter = Arc::new(AtomicUsize::new(1));
-
-        let mut op = ChannelSourceOperator::new(
-            "test_input".into(),
-            0,
-            StageId::new(0),
+        let (mut op, _) = test_source(
             InputRecv::Std(rx),
             Box::new(push),
             None,
             Arc::clone(&counter),
         );
-
-        // Drop sender → channel disconnects
         drop(tx);
-
         let outcome = op.activate().unwrap();
         assert!(matches!(outcome, ActivationOutcome::Done));
         assert!(op.is_done());
@@ -1575,22 +1484,23 @@ mod tests {
 
     #[test]
     fn abandoned_source_neither_finishes_nor_closes_its_output() {
-        use crate::dataflow::channels::pushpull::Pull;
         for abandoned in [false, true] {
             let (tx, rx) = mpsc::sync_channel::<InputEvent<u64, i32>>(16);
             let (push, pull) = bounded_channel::<u64, i32, ()>(1024);
             let counter = Arc::new(AtomicUsize::new(1));
             let flag = Arc::new(std::sync::atomic::AtomicBool::new(false));
-            let mut op = ChannelSourceOperator::new(
-                "async_input".into(),
-                0,
-                StageId::new(0),
-                InputRecv::Std(rx),
-                Box::new(push),
+            let mut output = CountedOutput::new(
+                "test:output".into(),
+                Box::new(push) as Box<dyn Push<u64, i32>>,
+                PortLedger::new(),
+                ProgressReporter::new(),
                 None,
-                Arc::clone(&counter),
-            )
-            .with_abandon_flag(Some(Arc::clone(&flag)));
+            );
+            output.set_reporter(ProgressReporter::new());
+            let logic =
+                ChannelSourceLogic::new(InputRecv::Std(rx), &output, false, counter.clone())
+                    .with_abandon_flag(Some(Arc::clone(&flag)));
+            let mut op = channel_source("async_input", 0, StageId::new(0), logic, output);
             // The pump flags a cancellation before it drops the sender.
             flag.store(abandoned, Ordering::SeqCst);
             drop(tx);
@@ -1616,53 +1526,88 @@ mod tests {
         let (_tx, rx) = mpsc::sync_channel::<InputEvent<u64, i32>>(16);
         let (push, _pull) = bounded_channel::<u64, i32, ()>(1024);
         let counter = Arc::new(AtomicUsize::new(1));
-
-        let mut op = ChannelSourceOperator::new(
-            "test_input".into(),
-            0,
-            StageId::new(0),
+        let (mut op, _) = test_source(
             InputRecv::Std(rx),
             Box::new(push),
             None,
             Arc::clone(&counter),
         );
-
         let outcome = op.activate().unwrap();
         assert!(matches!(outcome, ActivationOutcome::Idle));
         assert!(!op.is_done());
+    }
+
+    fn test_sink(
+        pull: Box<dyn Pull<u64, i32>>,
+        sender: OutputSend<OutputEvent<u64, i32>>,
+    ) -> (
+        OperatorShell<ChannelSinkLogic<u64, i32, OutputEvent<u64, i32>>>,
+        PortLedger<u64>,
+    ) {
+        let consumed = PortLedger::new();
+        let input = CountedInput::new("test:input".into(), pull, consumed.clone());
+        (
+            channel_sink(
+                "test_output",
+                0,
+                StageId::new(0),
+                input,
+                sender,
+                Box::new(OutputEvent::data),
+            ),
+            consumed,
+        )
     }
 
     #[test]
     fn channel_sink_forwards_data() {
         let (push, pull) = bounded_channel::<u64, i32, ()>(1024);
         let (tx, rx) = mpsc::sync_channel::<OutputEvent<u64, i32>>(16);
-
-        // Push data into the channel that feeds the sink
         let mut pusher: Box<dyn Push<u64, i32>> = Box::new(push);
         pusher.push(Envelope::data(0, vec![10, 20])).unwrap();
         pusher.push(Envelope::data(1, vec![30])).unwrap();
         pusher.close();
 
-        let mut op = ChannelSinkOperator::new(
-            "test_output".into(),
-            0,
-            StageId::new(0),
-            Box::new(pull),
-            OutputSend::Std(tx),
-        );
-
-        // Activate — should forward data and detect input exhaustion
-        let _outcome = op.activate().unwrap();
-        // May need two activations since close propagates async
+        let (mut op, consumed) = test_sink(Box::new(pull), OutputSend::Std(tx));
+        let _ = op.activate().unwrap();
         if !op.is_done() {
             let _ = op.activate();
         }
+        assert_eq!(rx.recv().unwrap(), OutputEvent::data(0, vec![10, 20]));
+        assert_eq!(rx.recv().unwrap(), OutputEvent::data(1, vec![30]));
+        assert_eq!(consumed.drain(), vec![(0, 2), (1, 1)]);
+    }
 
-        // Receive from channel
-        let event1 = rx.recv().unwrap();
-        assert_eq!(event1, OutputEvent::data(0, vec![10, 20]));
-        let event2 = rx.recv().unwrap();
-        assert_eq!(event2, OutputEvent::data(1, vec![30]));
+    #[test]
+    fn channel_sink_keeps_credit_until_the_receiver_accepts() {
+        let (push, pull) = bounded_channel::<u64, i32, ()>(1024);
+        let (tx, rx) = mpsc::sync_channel::<OutputEvent<u64, i32>>(1);
+        let mut pusher: Box<dyn Push<u64, i32>> = Box::new(push);
+        pusher.push(Envelope::data(0, vec![1])).unwrap();
+        pusher.push(Envelope::data(1, vec![2, 3])).unwrap();
+
+        let (mut op, consumed) = test_sink(Box::new(pull), OutputSend::Std(tx));
+        op.activate().unwrap();
+        // The paused receiver holds the second batch: still counted.
+        assert_eq!(consumed.drain(), vec![(0, 1)]);
+        assert_eq!(rx.recv().unwrap(), OutputEvent::data(0, vec![1]));
+        op.activate().unwrap();
+        assert_eq!(consumed.drain(), vec![(1, 2)]);
+    }
+
+    #[test]
+    fn channel_sink_discards_explicitly_when_the_receiver_is_gone() {
+        let (push, pull) = bounded_channel::<u64, i32, ()>(1024);
+        let (tx, rx) = mpsc::sync_channel::<OutputEvent<u64, i32>>(1);
+        drop(rx);
+        let mut pusher: Box<dyn Push<u64, i32>> = Box::new(push);
+        pusher.push(Envelope::data(0, vec![1, 2])).unwrap();
+        pusher.close();
+        let (mut op, consumed) = test_sink(Box::new(pull), OutputSend::Std(tx));
+        while !op.is_done() {
+            op.activate().unwrap();
+        }
+        assert_eq!(consumed.drain(), vec![(0, 2)], "the discard is recorded");
     }
 
     #[test]
@@ -1672,23 +1617,19 @@ mod tests {
         let (out_tx, out_rx) = mpsc::sync_channel(16);
         let receiver = OutputReceiver::<u64, i32>::new(out_rx);
 
-        // Send input
         sender.send(0, vec![1, 2, 3]).unwrap();
         sender.send(1, vec![4]).unwrap();
         sender.close();
 
-        // Verify input events
         let e1 = rx.recv().unwrap();
         assert!(matches!(e1, InputEvent::Data { time: 0, .. }));
         let e2 = rx.recv().unwrap();
         assert!(matches!(e2, InputEvent::Data { time: 1, .. }));
-        assert!(rx.recv().is_err()); // closed
+        assert!(rx.recv().is_err());
 
-        // Send output
         out_tx.send(OutputEvent::data(0, vec![10])).unwrap();
         drop(out_tx);
 
-        // Receive output
         let data = receiver.collect_data();
         assert_eq!(data, vec![(0, vec![10])]);
     }

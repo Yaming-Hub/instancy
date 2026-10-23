@@ -24,7 +24,7 @@ use std::sync::Arc;
 use crate::error::DataflowError;
 use crate::progress::change_batch::ChangeBatch;
 use crate::progress::frontier::Antichain;
-use crate::progress::operate::{OperatorProgress, PortConnectivity, ProgressReporter};
+use crate::progress::operate::{OperatorProgress, PortConnectivity, PortLedger, ProgressReporter};
 use crate::progress::progress_channel::{ProgressChange, ProgressKind, WorkerProgressChannels};
 use crate::progress::reachability::{Builder as ReachabilityBuilder, Location, Tracker};
 use crate::progress::timestamp::Timestamp;
@@ -149,6 +149,10 @@ pub struct OperatorShape {
 /// concrete `HashMap<(op, output), ProgressReporter<T>>`.
 pub(crate) struct MaterializationReporters {
     internal: Box<dyn Any + Send + Sync>,
+    /// Consumed ledgers, `HashMap<(op, input), PortLedger<T>>`.
+    consumed: Box<dyn Any + Send + Sync>,
+    /// Produced ledgers, `HashMap<(op, output), PortLedger<T>>`.
+    produced: Box<dyn Any + Send + Sync>,
     inflight_by_source: HashMap<(usize, usize), InflightReporterAny>,
     inflight_by_target: HashMap<(usize, usize), InflightReporterAny>,
 }
@@ -162,6 +166,30 @@ impl MaterializationReporters {
     ) -> Option<ProgressReporter<T>> {
         self.internal
             .downcast_ref::<HashMap<(usize, usize), ProgressReporter<T>>>()?
+            .get(&(operator, output))
+            .cloned()
+    }
+
+    /// The consumed ledger of input `input` of `operator`, if present.
+    pub(crate) fn consumed<T: Timestamp>(
+        &self,
+        operator: usize,
+        input: usize,
+    ) -> Option<PortLedger<T>> {
+        self.consumed
+            .downcast_ref::<HashMap<(usize, usize), PortLedger<T>>>()?
+            .get(&(operator, input))
+            .cloned()
+    }
+
+    /// The produced ledger of output `output` of `operator`, if present.
+    pub(crate) fn produced<T: Timestamp>(
+        &self,
+        operator: usize,
+        output: usize,
+    ) -> Option<PortLedger<T>> {
+        self.produced
+            .downcast_ref::<HashMap<(usize, usize), PortLedger<T>>>()?
             .get(&(operator, output))
             .cloned()
     }
@@ -374,8 +402,24 @@ impl<T: Timestamp> SubgraphBuilder<T> {
             inflight_by_source.insert(b.source, b.reporter.clone());
             inflight_by_target.insert(b.target, b.reporter.clone());
         }
+        let ledgers = |pick: fn(&OperatorProgress<T>) -> &Vec<PortLedger<T>>| {
+            let map: HashMap<(usize, usize), PortLedger<T>> = self
+                .progress_buffers
+                .iter()
+                .flat_map(|(op_idx, progress)| {
+                    pick(progress)
+                        .iter()
+                        .cloned()
+                        .enumerate()
+                        .map(move |(port, ledger)| ((*op_idx, port), ledger))
+                })
+                .collect();
+            Box::new(map) as Box<dyn Any + Send + Sync>
+        };
         MaterializationReporters {
             internal: Box::new(internal),
+            consumed: ledgers(|p| &p.consumed),
+            produced: ledgers(|p| &p.produced),
             inflight_by_source,
             inflight_by_target,
         }
@@ -1055,6 +1099,14 @@ impl<T: Timestamp> ProgressTracker<T> {
     /// Returns all registered operator indices (sorted).
     pub fn operator_indices(&self) -> &[usize] {
         &self.operator_indices
+    }
+
+    /// Returns each input's frontier for an operator (empty if unknown).
+    pub fn operator_input_frontiers(&self, operator: usize) -> Vec<Antichain<T>> {
+        self.operator_frontiers
+            .get(&operator)
+            .map(|state| state.input_frontiers.clone())
+            .unwrap_or_default()
     }
 
     /// Returns the meet (intersection) of all input frontiers for an operator.

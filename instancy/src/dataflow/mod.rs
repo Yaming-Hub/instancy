@@ -14,6 +14,7 @@ pub mod probe;
 #[allow(dead_code)]
 pub(crate) mod schedulable;
 pub mod scope;
+pub(crate) mod shell;
 pub(crate) mod spec;
 pub mod stage;
 pub mod stream;
@@ -21,9 +22,7 @@ pub mod stream;
 pub(crate) mod wired_operators;
 
 pub use channel_operators::{AsyncInputSender, AsyncOutputReceiver};
-pub use channel_operators::{
-    ChannelSinkOperator, ChannelSourceOperator, InputSender, OutputReceiver,
-};
+pub use channel_operators::{InputSender, OutputReceiver};
 pub use channels::{ControlSignal, Envelope, PartitionStrategy, Payload};
 pub use context::SharedContext;
 pub use control::{ControlReceiver, ControlSender, WorkerControl};
@@ -38,6 +37,7 @@ pub use operators::input::{ChannelInput, InputEvent, TimestampedInput, VecInput}
 pub use operators::output::{OutputEvent, OutputSender, OutputStream};
 pub use schedulable::{ActivationOutcome, ChannelEndpoints, OperatorFactory, SchedulableOperator};
 pub use scope::{ChildScope, RootScope, Scope, ScopeAddr};
+pub use shell::Retained;
 pub use spec::{DataflowHandle, DataflowInputs, DataflowSpec};
 pub use stage::{FusedActivationOrder, StageId, StageInfo, infer_stages};
 pub use stream::{Slot, StreamConnection, StreamEdge};

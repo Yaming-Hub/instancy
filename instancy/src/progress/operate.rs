@@ -128,23 +128,71 @@ impl<S: Clone + Debug + PartialEq + PartialOrder> PortConnectivity<S> {
 /// Shared between [`Capability`](super::capability::Capability) instances and the
 /// progress tracking system. All capability create/clone/drop/downgrade operations
 /// go through this handle so changes are observed atomically.
+///
+/// Besides the changes the tracker has not drained yet, the reporter keeps
+/// the capabilities its port currently holds (`held`, never drained). The
+/// operator shell reads it to justify output (V3) and to decide whether the
+/// operator still holds a capability (S2a, seals). A release from another
+/// task (a dropped [`Retained`](crate::dataflow::Retained)) lands here too:
+/// the reporter is the port's release mailbox.
 #[derive(Clone, Debug)]
 pub struct ProgressReporter<T: Timestamp> {
-    inner: Arc<Mutex<ChangeBatch<T>>>,
+    inner: Arc<Mutex<ReporterState<T>>>,
     /// Where the progress checker counts capabilities held through this
     /// reporter (set when the reporter's tracker is attached to an oracle).
     #[cfg(any(debug_assertions, feature = "progress-check"))]
     check: Arc<std::sync::OnceLock<crate::progress::check::Port<T>>>,
 }
 
+/// A reporter's changes not yet drained, and the capabilities held.
+#[derive(Debug)]
+struct ReporterState<T: Timestamp> {
+    pending: ChangeBatch<T>,
+    held: ChangeBatch<T>,
+}
+
 impl<T: Timestamp> ProgressReporter<T> {
     /// Creates a new reporter with an empty change batch.
     pub fn new() -> Self {
         Self {
-            inner: Arc::new(Mutex::new(ChangeBatch::new())),
+            inner: Arc::new(Mutex::new(ReporterState {
+                pending: ChangeBatch::new(),
+                held: ChangeBatch::new(),
+            })),
             #[cfg(any(debug_assertions, feature = "progress-check"))]
             check: Arc::default(),
         }
+    }
+
+    fn state(&self) -> std::sync::MutexGuard<'_, ReporterState<T>> {
+        self.inner.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// Record `n` capabilities at `time` as held without reporting them: an
+    /// initial capability, which every tracker seeds from the physical plan
+    /// (A4), is held by the operator from the start.
+    pub(crate) fn seed_held(&self, time: T, n: i64) {
+        self.state().held.update(time, n);
+    }
+
+    /// The times at which this port holds capabilities.
+    pub(crate) fn held_frontier(&self) -> Antichain<T> {
+        let mut state = self.state();
+        state.held.compact();
+        let mut frontier = Antichain::new();
+        for (time, count) in state.held.iter() {
+            if *count > 0 {
+                frontier.insert(time.clone());
+            }
+        }
+        frontier
+    }
+
+    /// Whether this port holds any capability.
+    pub(crate) fn holds_any(&self) -> bool {
+        let mut state = self.state();
+        state.held.compact();
+        !state.held.is_empty()
     }
 
     /// Count `diff` capabilities at `time` held through this reporter, for
@@ -166,10 +214,9 @@ impl<T: Timestamp> ProgressReporter<T> {
 
     /// Records a change: `+1` for a new capability, `-1` for a dropped one.
     pub fn update(&self, time: T, diff: i64) {
-        self.inner
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .update(time, diff);
+        let mut state = self.state();
+        state.pending.update(time.clone(), diff);
+        state.held.update(time, diff);
     }
 
     /// Records a paired update atomically: `-1` at `old_time`, `+1` at `new_time`.
@@ -177,12 +224,78 @@ impl<T: Timestamp> ProgressReporter<T> {
     /// Used by [`Capability::downgrade`](super::capability::Capability::downgrade) to
     /// ensure the frontier never sees an intermediate state.
     pub fn downgrade(&self, old_time: T, new_time: T) {
-        let mut batch = self.inner.lock().unwrap_or_else(|e| e.into_inner());
-        batch.update(old_time, -1);
-        batch.update(new_time, 1);
+        let mut state = self.state();
+        state.pending.update(old_time.clone(), -1);
+        state.pending.update(new_time.clone(), 1);
+        state.held.update(old_time, -1);
+        state.held.update(new_time, 1);
     }
 
     /// Drains all pending changes from this reporter, returning them as a vec.
+    pub fn drain(&self) -> Vec<(T, i64)> {
+        self.state().pending.drain().collect()
+    }
+
+    /// Drains pending changes into the given `ChangeBatch`.
+    pub fn drain_into(&self, target: &mut ChangeBatch<T>) {
+        self.state().pending.drain_into(target);
+    }
+
+    /// Returns `true` if there are no pending (unread) changes.
+    pub fn is_empty(&self) -> bool {
+        self.state().pending.is_empty()
+    }
+}
+
+impl<T: Timestamp> Default for ProgressReporter<T> {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+// ---------------------------------------------------------------------------
+// PortLedger — a port's consumed or produced counts
+// ---------------------------------------------------------------------------
+
+/// The port-count ledger of one operator port: records the operator shell
+/// consumed at an input, or produced at an output, since the tracker last
+/// drained it.
+///
+/// Only the shell writes to it, once per logic call and after the call's
+/// output was validated; the tracker drains it at each commit. Data sitting
+/// between a producing and a consuming port is therefore counted at the
+/// consuming input from the moment the shell takes it from the producer's
+/// logic until the consumer's logic takes it.
+#[derive(Clone, Debug)]
+pub struct PortLedger<T: Timestamp> {
+    inner: Arc<Mutex<ChangeBatch<T>>>,
+}
+
+impl<T: Timestamp> PortLedger<T> {
+    /// An empty ledger.
+    pub fn new() -> Self {
+        Self {
+            inner: Arc::new(Mutex::new(ChangeBatch::new())),
+        }
+    }
+
+    /// Adds every change of `changes` to the ledger, draining `changes`.
+    pub(crate) fn absorb(&self, changes: &mut ChangeBatch<T>) {
+        if changes.is_empty() {
+            return;
+        }
+        changes.drain_into(&mut self.inner.lock().unwrap_or_else(|e| e.into_inner()));
+    }
+
+    /// Adds `diff` records at `time`.
+    pub(crate) fn update(&self, time: T, diff: i64) {
+        self.inner
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .update(time, diff);
+    }
+
+    /// Drains the recorded counts.
     pub fn drain(&self) -> Vec<(T, i64)> {
         self.inner
             .lock()
@@ -191,15 +304,7 @@ impl<T: Timestamp> ProgressReporter<T> {
             .collect()
     }
 
-    /// Drains pending changes into the given `ChangeBatch`.
-    pub fn drain_into(&self, target: &mut ChangeBatch<T>) {
-        self.inner
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .drain_into(target);
-    }
-
-    /// Returns `true` if there are no pending (unread) changes.
+    /// Whether nothing is recorded.
     pub fn is_empty(&self) -> bool {
         self.inner
             .lock()
@@ -208,7 +313,7 @@ impl<T: Timestamp> ProgressReporter<T> {
     }
 }
 
-impl<T: Timestamp> Default for ProgressReporter<T> {
+impl<T: Timestamp> Default for PortLedger<T> {
     fn default() -> Self {
         Self::new()
     }
@@ -220,22 +325,21 @@ impl<T: Timestamp> Default for ProgressReporter<T> {
 
 /// Shared progress buffers between an operator and the progress tracker.
 ///
-/// Each operator has one `OperatorProgress` instance. Capabilities write to
-/// `internal` (via [`ProgressReporter`]) and the progress tracker drains those
-/// changes during propagation.
+/// Each operator has one `OperatorProgress` instance per worker:
+/// - `consumed[i]`: records the operator shell took from input `i`;
+/// - `produced[o]`: records the shell took from the logic at output `o`;
+/// - `internal[o]`: capability changes at output `o` (capabilities write
+///   here through [`ProgressReporter`]).
 ///
-/// In-flight **message** accounting (for boundary channels such as exchange)
-/// does not flow through these per-operator buffers — it is tracked by
-/// target-bound in-flight reporters registered directly on the
-/// [`ProgressTracker`](crate::progress::subgraph::ProgressTracker), so a message
-/// can be accounted against the specific downstream input it targets regardless
-/// of tee/fan-out on the producing output.
+/// The tracker drains all three at each commit: consumed as `-n` at the
+/// input, produced as `+n` at every target of the output's edges, internal
+/// at the output.
 #[derive(Debug, Clone)]
 pub struct OperatorProgress<T: Timestamp> {
-    /// Per-input consumed changes — reserved for future message-flight accounting.
-    pub consumed: Vec<ChangeBatch<T>>,
-    /// Per-output produced changes — reserved for future message-flight accounting.
-    pub produced: Vec<ChangeBatch<T>>,
+    /// Per-input consumed records.
+    pub consumed: Vec<PortLedger<T>>,
+    /// Per-output produced records.
+    pub produced: Vec<PortLedger<T>>,
     /// Per-output capability reporters (capabilities write here via ProgressReporter).
     pub internal: Vec<ProgressReporter<T>>,
 }
@@ -244,28 +348,21 @@ impl<T: Timestamp> OperatorProgress<T> {
     /// Creates progress buffers for an operator with the given port counts.
     pub fn new(inputs: usize, outputs: usize) -> Self {
         Self {
-            consumed: (0..inputs).map(|_| ChangeBatch::new()).collect(),
-            produced: (0..outputs).map(|_| ChangeBatch::new()).collect(),
+            consumed: (0..inputs).map(|_| PortLedger::new()).collect(),
+            produced: (0..outputs).map(|_| PortLedger::new()).collect(),
             internal: (0..outputs).map(|_| ProgressReporter::new()).collect(),
         }
     }
 
-    /// Creates an independent deep copy with fresh [`ProgressReporter`]s.
+    /// Creates an independent deep copy with fresh ledgers and
+    /// [`ProgressReporter`]s.
     ///
     /// Unlike `clone()` (which shares `Arc`-backed reporters), this creates
     /// new reporters with empty change batches. Used when cloning a
     /// `SubgraphBuilder` for multi-worker materialization so each worker
     /// gets independent progress state.
     pub fn deep_clone(&self) -> Self {
-        Self {
-            consumed: self.consumed.clone(),
-            produced: self.produced.clone(),
-            internal: self
-                .internal
-                .iter()
-                .map(|_| ProgressReporter::new())
-                .collect(),
-        }
+        Self::new(self.consumed.len(), self.produced.len())
     }
 
     /// Returns the reporter for the given output port.

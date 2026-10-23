@@ -111,6 +111,16 @@ pub trait SchedulableOperator: Send {
     /// timestamps. Regular operators leave this as a no-op.
     fn update_input_frontier(&mut self, _frontier: &dyn std::any::Any) {}
 
+    /// Update the frontier of input `port` (an `Antichain` of the port's
+    /// time), after progress propagation.
+    fn update_port_frontier(&mut self, _port: usize, _frontier: &dyn std::any::Any) {}
+
+    /// Whether this operator is an [`OperatorShell`](crate::dataflow::shell::OperatorShell),
+    /// as every production operator must be (design §5.2).
+    fn is_shell(&self) -> bool {
+        false
+    }
+
     /// Whether this operator has ready notifications that need processing.
     ///
     /// The executor checks this after progress propagation to re-enqueue
@@ -192,31 +202,145 @@ impl OperatorFactory {
 
 /// Channel endpoints provided to an operator factory during materialization.
 ///
-/// Each entry is a `Box<dyn Any + Send>` that the factory downcasts to the
-/// concrete `Box<dyn Pull<T, D, M>>` or `Box<dyn Push<T, D, M>>` type.
+/// Each entry is a `Box<dyn Any + Send>` that the factory turns into a
+/// counted port with [`take_input`](Self::take_input) /
+/// [`take_output`](Self::take_output): only the materializer builds counted
+/// ports, so operator logic never sees a raw `Push` or `Pull`.
 #[derive(Default)]
 pub struct ChannelEndpoints {
+    /// The operator these endpoints are for.
+    pub(crate) operator: usize,
     /// Input pullers, one per input port. Each is `Box<dyn Pull<T, D, M>>`.
-    pub input_pullers: Vec<Box<dyn std::any::Any + Send>>,
+    pub(crate) input_pullers: Vec<Option<Box<dyn std::any::Any + Send>>>,
     /// Output pushers grouped by output port.
     ///
     /// `output_pushers[port]` is a `Vec` of all pushers for that port
     /// (multiple pushers when the output fans out to multiple downstream
     /// consumers). Each inner element is a `Box<dyn Push<T, D, M>>`.
-    pub output_pushers: Vec<Vec<Box<dyn std::any::Any + Send>>>,
+    pub(crate) output_pushers: Vec<Vec<Box<dyn std::any::Any + Send>>>,
     /// Wake handle for operators that need to notify the executor asynchronously
     /// (e.g., when an in-flight async task completes). Operators that don't need
     /// async waking can ignore this field.
-    pub wake_handle: Option<crate::dataflow::channels::wake::WakeHandle>,
+    pub(crate) wake_handle: Option<crate::dataflow::channels::wake::WakeHandle>,
     /// Progress reporters for this operator, keyed by `(operator_index, output_port)`.
     ///
     /// Populated during materialization from the `SubgraphBuilder` clone used
     /// to build the worker's progress tracker, so factories can bind operators
     /// to the same progress state the executor will later observe.
-    pub progress_reporters: Option<Arc<dyn Any + Send + Sync>>,
+    pub(crate) progress_reporters: Option<Arc<dyn Any + Send + Sync>>,
 }
 
 impl ChannelEndpoints {
+    fn reporters(&self) -> Option<&crate::progress::subgraph::MaterializationReporters> {
+        self.progress_reporters
+            .as_ref()?
+            .downcast_ref::<crate::progress::subgraph::MaterializationReporters>()
+    }
+
+    /// The counted input port `port` of the operator, of time `T` and data
+    /// `D`, bound to the port's consumed ledger.
+    pub(crate) fn take_input<T, D>(
+        &mut self,
+        port: usize,
+        operator: &str,
+    ) -> crate::Result<crate::dataflow::shell::CountedInput<T, D>>
+    where
+        T: crate::progress::timestamp::Timestamp,
+        D: Send + 'static,
+    {
+        use crate::error::{DataflowError, Error};
+        let pull = self
+            .input_pullers
+            .get_mut(port)
+            .and_then(Option::take)
+            .ok_or_else(|| {
+                Error::Dataflow(DataflowError::MissingEndpoint {
+                    operator: operator.into(),
+                    port: format!("input {port}"),
+                })
+            })?;
+        let mut pull = *pull
+            .downcast::<Box<dyn crate::dataflow::channels::pushpull::Pull<T, D>>>()
+            .map_err(|_| {
+                Error::Dataflow(DataflowError::TypeMismatch {
+                    operator: operator.into(),
+                    port: format!("input {port}"),
+                })
+            })?;
+        self.wire_inflight_target::<T, D, ()>(self.operator, port, &mut *pull);
+        let ledger = self
+            .reporters()
+            .and_then(|r| r.consumed::<T>(self.operator, port))
+            .unwrap_or_default();
+        Ok(crate::dataflow::shell::CountedInput::new(
+            format!("{operator}:input{port}"),
+            pull,
+            ledger,
+        ))
+    }
+
+    /// Every remaining input port, in port order (for an operator with a
+    /// list of same-typed inputs).
+    pub(crate) fn take_inputs<T, D>(
+        &mut self,
+        operator: &str,
+    ) -> crate::Result<Vec<crate::dataflow::shell::CountedInput<T, D>>>
+    where
+        T: crate::progress::timestamp::Timestamp,
+        D: Send + 'static,
+    {
+        (0..self.input_pullers.len())
+            .map(|port| self.take_input(port, operator))
+            .collect()
+    }
+
+    /// The counted output port `port` of the operator: every consumer's
+    /// push end (a tee for several), bound to the port's produced ledger
+    /// and capability reporter.
+    pub(crate) fn take_output<T, D>(
+        &mut self,
+        port: usize,
+        operator: &str,
+    ) -> crate::Result<crate::dataflow::shell::CountedOutput<T, D>>
+    where
+        T: crate::progress::timestamp::Timestamp,
+        D: Clone + Send + 'static,
+    {
+        use crate::dataflow::channels::pushpull::Push;
+        use crate::error::{DataflowError, Error};
+        let pushers: Vec<Box<dyn Push<T, D>>> = self
+            .take_port_pushers(port)
+            .into_iter()
+            .map(|any| {
+                any.downcast::<Box<dyn Push<T, D>>>()
+                    .map(|boxed| *boxed)
+                    .map_err(|_| {
+                        Error::Dataflow(DataflowError::TypeMismatch {
+                            operator: operator.into(),
+                            port: format!("output {port}"),
+                        })
+                    })
+            })
+            .collect::<crate::Result<_>>()?;
+        let mut push: Box<dyn Push<T, D>> = crate::dataflow::channels::tee::tee_or_single(pushers)?
+            .unwrap_or_else(|| Box::new(crate::dataflow::channels::NullPush));
+        self.wire_inflight_source::<T, D, ()>(self.operator, port, &mut *push);
+        let ledger = self
+            .reporters()
+            .and_then(|r| r.produced::<T>(self.operator, port))
+            .unwrap_or_default();
+        let reporter = self
+            .progress_reporter::<T>(self.operator, port)
+            .unwrap_or_default();
+        Ok(crate::dataflow::shell::CountedOutput::new(
+            format!("{operator}:output{port}"),
+            push,
+            ledger,
+            reporter,
+            self.wake_handle.clone(),
+        ))
+    }
+
     /// Returns the progress reporter for the given operator output, if one was
     /// explicitly passed for this materialization.
     pub fn progress_reporter<T: crate::progress::timestamp::Timestamp>(
@@ -224,10 +348,7 @@ impl ChannelEndpoints {
         operator: usize,
         output: usize,
     ) -> Option<crate::progress::operate::ProgressReporter<T>> {
-        self.progress_reporters
-            .as_ref()?
-            .downcast_ref::<crate::progress::subgraph::MaterializationReporters>()?
-            .internal::<T>(operator, output)
+        self.reporters()?.internal::<T>(operator, output)
     }
 
     /// Returns the in-flight reporter for a boundary edge whose **source** is

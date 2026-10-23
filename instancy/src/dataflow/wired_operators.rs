@@ -1,1784 +1,659 @@
-//! Wired (materialized) operator implementations.
+//! The logic of every built-in operator.
 //!
-//! A "wired" operator is one that has completed the **materialization phase**:
-//! its input/output channels are physically connected (Push/Pull endpoints attached),
-//! making it ready for execution. This contrasts with the **build phase** where
-//! operators exist only as metadata in the `DataflowGraph` (name, index, port counts,
-//! edges) with no real channels attached.
+//! Each operator is an [`OperatorLogic`] run by an
+//! [`OperatorShell`](crate::dataflow::shell::OperatorShell), which owns its
+//! counted ports and all of their I/O (see [`crate::dataflow::shell`]). The
+//! constructors here are called by operator factories during
+//! materialization, with ports built by
+//! [`ChannelEndpoints`](crate::dataflow::schedulable::ChannelEndpoints).
 //!
 //! **Lifecycle:**
 //! 1. Build phase → logical operator (metadata in DataflowGraph)
-//! 2. Materialize phase → wired operator (channels connected, implements SchedulableOperator)
-//!
-//! When activated, a wired operator:
-//! 1. Pulls envelopes from its input channel(s) → feeds the InputHandle.
-//! 2. Calls the operator's user logic.
-//! 3. Drains the OutputHandle → pushes envelopes to its output channel(s).
+//! 2. Materialize phase → shell with counted ports and its logic
 //!
 //! Type-erasure happens at the outer `SchedulableOperator` boundary only —
 //! internally, operators work with concrete Rust types (no dynamic dispatch on data).
 
+use std::any::Any;
 use std::collections::VecDeque;
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
 
-use crate::dataflow::channels::envelope::{Envelope, Payload};
-use crate::dataflow::channels::pushpull::{Pull, Push};
 use crate::dataflow::channels::wake::WakeHandle;
 use crate::dataflow::operators::handles::{InputHandle, NotifyContext, OutputHandle};
-use crate::dataflow::schedulable::{ActivationOutcome, SchedulableOperator};
+use crate::dataflow::shell::{CountedInput, CountedOutput, OperatorLogic, OperatorShell};
 use crate::dataflow::stage::StageId;
 use crate::error::{Error, Result};
-use crate::progress::PendingOutput;
+use crate::order::Product;
 use crate::progress::capability::Capability;
 use crate::progress::frontier::Antichain;
 use crate::progress::notificator::Notificator;
-use crate::progress::operate::ProgressReporter;
 use crate::progress::timestamp::Timestamp;
 
+/// The closure of a unary operator.
+pub(crate) type UnaryFn<T, D1, D2> =
+    Box<dyn FnMut(&mut InputHandle<T, D1>, &mut OutputHandle<T, D2>) -> Result<()> + Send>;
+
+/// The closure of a binary operator.
+pub(crate) type BinaryFn<T, D1, D2, D3> = Box<
+    dyn FnMut(
+            &mut InputHandle<T, D1>,
+            &mut InputHandle<T, D2>,
+            &mut OutputHandle<T, D3>,
+        ) -> Result<()>
+        + Send,
+>;
+
+/// The closure of a notifying unary operator.
+pub(crate) type NotifyFn<T, D1, D2> = Box<
+    dyn FnMut(
+            &mut InputHandle<T, D1>,
+            &mut OutputHandle<T, D2>,
+            &mut NotifyContext<'_, T>,
+        ) -> Result<()>
+        + Send,
+>;
+
 // ---------------------------------------------------------------------------
-// WiredUnaryOperator
+// Unary
 // ---------------------------------------------------------------------------
 
-/// A fully-wired (materialized) unary operator ready for execution.
-///
-/// "Wired" means its input/output channels are physically connected —
-/// this operator can pull data from upstream and push results downstream.
-///
-/// Owns:
-/// - Input channel (puller) + InputHandle
-/// - User logic closure
-/// - OutputHandle + output channel (pusher)
-/// - Retry buffer for backpressure
-pub struct WiredUnaryOperator<T: Timestamp, D1: Send + 'static, D2: Send + 'static> {
-    name: String,
+/// A unary operator: calls its closure whenever input is waiting.
+pub(crate) struct UnaryLogic<T: Timestamp, D1: Send + 'static, D2: Send + 'static> {
+    logic: UnaryFn<T, D1, D2>,
+    /// A capability at `T::minimum()` held until the input ends (the
+    /// broadcast pass-through's guard).
+    guard: Option<Capability<T>>,
+}
+
+impl<T: Timestamp, D1: Send + 'static, D2: Send + 'static> OperatorLogic for UnaryLogic<T, D1, D2> {
+    type Inputs = CountedInput<T, D1>;
+    type Outputs = CountedOutput<T, D2>;
+    type Time = T;
+
+    fn wants_call(&self, input: &Self::Inputs) -> bool {
+        input.has_pending() || (self.guard.is_some() && input.is_exhausted())
+    }
+
+    fn call(&mut self, input: &mut Self::Inputs, output: &mut Self::Outputs) -> Result<bool> {
+        let did = input.has_pending();
+        if did {
+            (self.logic)(input.handle(), output.handle())?;
+        }
+        if input.is_exhausted() && !input.has_pending() {
+            self.guard = None;
+        }
+        Ok(did)
+    }
+
+    fn holds_work(&self) -> bool {
+        self.guard.is_some()
+    }
+
+    fn inputs_closed(&mut self) {
+        self.guard = None;
+    }
+}
+
+/// A unary operator running `logic`.
+pub(crate) fn unary<T: Timestamp, D1: Send + 'static, D2: Send + 'static>(
+    name: impl Into<String>,
     index: usize,
     stage_id: StageId,
-    /// Input channel — pulls envelopes from upstream.
-    input_puller: Box<dyn Pull<T, D1>>,
-    /// Operator's typed input buffer.
-    input_handle: InputHandle<T, D1>,
-    /// User logic closure.
-    logic: Box<dyn FnMut(&mut InputHandle<T, D1>, &mut OutputHandle<T, D2>) -> Result<()> + Send>,
-    /// Operator's typed output buffer.
-    output_handle: OutputHandle<T, D2>,
-    /// Output channel — pushes envelopes downstream.
-    output_pusher: Box<dyn Push<T, D2>>,
-    /// Pending output: batches that have been produced but not yet pushed to channel.
-    /// Items are pushed front-to-back; on backpressure, remaining items stay here.
-    pending_output: PendingOutput<T, D2>,
-    /// Optional progress reporter — when present, the operator holds an
-    /// initial capability that is released when inputs close. Used by
-    /// exchange pass-through operators to prevent premature completion
-    /// when data is in flight across network boundaries.
-    progress_reporter: Option<ProgressReporter<T>>,
-    /// Whether the input channel is exhausted (sender closed + empty).
-    input_exhausted: bool,
-    /// Whether this operator has completed.
-    done: bool,
-}
-
-impl<T: Timestamp, D1: Send + 'static, D2: Send + 'static> WiredUnaryOperator<T, D1, D2> {
-    /// Create a new wired unary operator.
-    pub fn new(
-        name: impl Into<String>,
-        index: usize,
-        stage_id: StageId,
-        logic: impl FnMut(&mut InputHandle<T, D1>, &mut OutputHandle<T, D2>) -> Result<()>
-        + Send
-        + 'static,
-        input_puller: Box<dyn Pull<T, D1>>,
-        output_pusher: Box<dyn Push<T, D2>>,
-    ) -> Self {
-        let name = name.into();
-        #[cfg_attr(
-            not(any(debug_assertions, feature = "progress-check")),
-            allow(unused_mut)
-        )]
-        let mut op = Self {
-            input_handle: InputHandle::new(format!("{name}:input")),
-            output_handle: OutputHandle::new(format!("{name}:output")),
-            name,
-            index,
-            stage_id,
-            input_puller,
+    logic: impl FnMut(&mut InputHandle<T, D1>, &mut OutputHandle<T, D2>) -> Result<()> + Send + 'static,
+    input: CountedInput<T, D1>,
+    output: CountedOutput<T, D2>,
+) -> OperatorShell<UnaryLogic<T, D1, D2>> {
+    OperatorShell::new(
+        name,
+        index,
+        stage_id,
+        UnaryLogic {
             logic: Box::new(logic),
-            output_pusher,
-            pending_output: PendingOutput::new(),
-            progress_reporter: None,
-            input_exhausted: false,
-            done: false,
-        };
-        #[cfg(any(debug_assertions, feature = "progress-check"))]
-        op.check_observe();
-        op
-    }
-
-    /// Create a new wired unary operator with a progress reporter.
-    ///
-    /// The reporter holds an initial capability that is released when
-    /// `close_inputs()` is called. This prevents the progress tracker
-    /// from declaring the dataflow complete while data may still be
-    /// in flight on the operator's input edge (e.g., cross-node exchange).
-    pub fn with_reporter(
-        name: impl Into<String>,
-        index: usize,
-        stage_id: StageId,
-        logic: impl FnMut(&mut InputHandle<T, D1>, &mut OutputHandle<T, D2>) -> Result<()>
-        + Send
-        + 'static,
-        input_puller: Box<dyn Pull<T, D1>>,
-        output_pusher: Box<dyn Push<T, D2>>,
-        reporter: ProgressReporter<T>,
-    ) -> Self {
-        let name = name.into();
-        #[cfg_attr(
-            not(any(debug_assertions, feature = "progress-check")),
-            allow(unused_mut)
-        )]
-        let mut op = Self {
-            input_handle: InputHandle::new(format!("{name}:input")),
-            output_handle: OutputHandle::new(format!("{name}:output")),
-            name,
-            index,
-            stage_id,
-            input_puller,
-            logic: Box::new(logic),
-            output_pusher,
-            pending_output: PendingOutput::new(),
-            progress_reporter: Some(reporter),
-            input_exhausted: false,
-            done: false,
-        };
-        #[cfg(any(debug_assertions, feature = "progress-check"))]
-        op.check_observe();
-        op
-    }
-
-    /// Try to flush pending output envelopes to the output channel.
-    /// Returns true if all pending output was sent successfully.
-    fn flush_pending_output(&mut self) -> Result<bool> {
-        while let Some(envelope) = self.pending_output.pop_front() {
-            match self.output_pusher.try_push(envelope) {
-                Ok(()) => {}
-                Err((Error::Backpressure, returned)) => {
-                    self.pending_output.push_front(returned);
-                    return Ok(false);
-                }
-                Err((e, _returned)) => return Err(e),
-            }
-        }
-        Ok(true)
-    }
-
-    /// Pull from input channel and feed the InputHandle.
-    fn pull_input(&mut self) {
-        loop {
-            match self.input_puller.pull() {
-                Some(envelope) => match envelope.payload {
-                    Payload::Data { time, data } => {
-                        self.input_handle.push_vec(time, data);
-                    }
-                    Payload::Control(_signal) => {
-                        // Control signals (watermarks, errors) are handled
-                        // by the progress subsystem in PR 22.
-                        // For now, just consume them.
-                    }
-                },
-                None => {
-                    // Check if input is exhausted.
-                    if self.input_puller.is_exhausted() {
-                        self.input_exhausted = true;
-                        self.input_handle.mark_exhausted();
-                    }
-                    break;
-                }
-            }
-        }
-    }
-
-    /// Drain output handle and push to output channel.
-    /// Returns true if all output was sent, false if backpressure hit.
-    fn push_output(&mut self) -> Result<bool> {
-        // Move output handle contents into pending_output.
-        for (time, data) in self.output_handle.drain() {
-            self.pending_output.push_back(Envelope::data(time, data));
-        }
-        self.flush_pending_output()
-    }
+            guard: None,
+        },
+        input,
+        output,
+    )
 }
 
-impl<T: Timestamp, D1: Send + 'static, D2: Send + 'static> SchedulableOperator
-    for WiredUnaryOperator<T, D1, D2>
-{
-    fn activate(&mut self) -> Result<ActivationOutcome> {
-        if self.done {
-            return Ok(ActivationOutcome::Done);
-        }
-
-        // Step 1: Try to flush any pending output first.
-        if !self.pending_output.is_empty() && !self.flush_pending_output()? {
-            return Ok(ActivationOutcome::BlockedOnBackpressure);
-        }
-
-        // Step 2: Pull from input channel.
-        self.pull_input();
-
-        // Step 3: Check if there's work to do.
-        let had_input = self.input_handle.has_pending();
-        if !had_input && self.input_exhausted {
-            // No input and no more coming — we're done.
-            self.output_pusher.close();
-            // Release capability (idempotent via take).
-            if let Some(reporter) = self.progress_reporter.take() {
-                reporter.update(T::minimum(), -1);
-            }
-            self.done = true;
-            return Ok(ActivationOutcome::Done);
-        }
-
-        if !had_input {
-            return Ok(ActivationOutcome::Idle);
-        }
-
-        // Step 4: Run user logic.
-        (self.logic)(&mut self.input_handle, &mut self.output_handle)?;
-
-        // Step 5: Push output to channel.
-        if !self.push_output()? {
-            return Ok(ActivationOutcome::BlockedOnBackpressure);
-        }
-
-        // Step 6: Check if we're done after processing.
-        if self.input_exhausted
-            && !self.input_handle.has_pending()
-            && !self.output_handle.has_output()
-        {
-            self.output_pusher.close();
-            // Release capability (idempotent via take).
-            if let Some(reporter) = self.progress_reporter.take() {
-                reporter.update(T::minimum(), -1);
-            }
-            self.done = true;
-            return Ok(ActivationOutcome::Done);
-        }
-
-        Ok(ActivationOutcome::MadeProgress)
-    }
-
-    fn is_done(&self) -> bool {
-        self.done
-    }
-
-    fn name(&self) -> &str {
-        &self.name
-    }
-
-    fn index(&self) -> usize {
-        self.index
-    }
-
-    fn stage_id(&self) -> StageId {
-        self.stage_id
-    }
-
-    fn close_inputs(&mut self) {
-        self.input_exhausted = true;
-        self.input_handle.mark_exhausted();
-        // Release capability if held (idempotent via take — safe even if
-        // activate() already released it before force-close).
-        if let Some(reporter) = self.progress_reporter.take() {
-            reporter.update(T::minimum(), -1);
-        }
-    }
-}
-
-// ---------------------------------------------------------------------------
-// WiredSourceOperator
-// ---------------------------------------------------------------------------
-
-/// A wired (materialized) source operator that produces data from an iterator.
-///
-/// Has no input channels — generates data from a provided collection and
-/// pushes to its output channel.
-pub struct WiredSourceOperator<T: Timestamp, D: Send + 'static> {
-    name: String,
+/// A unary operator that holds an initial capability at `T::minimum()`
+/// until its input ends.
+pub(crate) fn unary_guarded<T: Timestamp, D1: Send + 'static, D2: Send + 'static>(
+    name: impl Into<String>,
     index: usize,
     stage_id: StageId,
-    /// Data to emit, organized by timestamp (FIFO order).
-    pending_data: VecDeque<(T, Vec<D>)>,
-    /// Output channel.
-    output_pusher: Box<dyn Push<T, D>>,
-    /// Pending output envelopes (for backpressure retry).
-    pending_output: PendingOutput<T, D>,
-    /// Optional progress reporter for output port 0.
-    /// When present, the source holds a capability at T::minimum() initially
-    /// and drops it when all data has been emitted.
-    progress_reporter: Option<ProgressReporter<T>>,
-    /// Whether all data has been emitted.
-    done: bool,
-    /// The progress checker's count of `pending_data` (work held for the
-    /// output).
+    logic: impl FnMut(&mut InputHandle<T, D1>, &mut OutputHandle<T, D2>) -> Result<()> + Send + 'static,
+    input: CountedInput<T, D1>,
+    output: CountedOutput<T, D2>,
+) -> OperatorShell<UnaryLogic<T, D1, D2>> {
+    let guard = Capability::seeded(T::minimum(), output.reporter().clone());
+    OperatorShell::new(
+        name,
+        index,
+        stage_id,
+        UnaryLogic {
+            logic: Box::new(logic),
+            guard: Some(guard),
+        },
+        input,
+        output,
+    )
+}
+
+// ---------------------------------------------------------------------------
+// Source (pre-loaded data)
+// ---------------------------------------------------------------------------
+
+/// A source that emits pre-loaded data, then releases its capability.
+pub(crate) struct SourceLogic<T: Timestamp, D: Send + 'static> {
+    /// Data to emit, in insertion order.
+    pending: VecDeque<(T, Vec<D>)>,
+    /// The source's initial capability, released once `pending` is handed
+    /// to the output.
+    capability: Option<Capability<T>>,
+    /// The progress checker's count of `pending` (work held for the output).
     #[cfg(any(debug_assertions, feature = "progress-check"))]
-    check_data: Option<crate::progress::check::StoreCheck<T>>,
+    check: Option<crate::progress::check::StoreCheck<T>>,
 }
 
-impl<T: Timestamp, D: Send + 'static> WiredSourceOperator<T, D> {
-    /// Create a source operator that emits the given data batches.
-    pub fn new(
-        name: impl Into<String>,
-        index: usize,
-        stage_id: StageId,
-        data: Vec<(T, Vec<D>)>,
-        output_pusher: Box<dyn Push<T, D>>,
-    ) -> Self {
-        #[cfg_attr(
-            not(any(debug_assertions, feature = "progress-check")),
-            allow(unused_mut)
-        )]
-        let mut op = Self {
-            name: name.into(),
-            index,
-            stage_id,
-            pending_data: VecDeque::from(data),
-            output_pusher,
-            pending_output: PendingOutput::new(),
-            progress_reporter: None,
-            done: false,
-            #[cfg(any(debug_assertions, feature = "progress-check"))]
-            check_data: None,
-        };
-        #[cfg(any(debug_assertions, feature = "progress-check"))]
-        op.check_observe();
-        op
+impl<T: Timestamp, D: Send + 'static> OperatorLogic for SourceLogic<T, D> {
+    type Inputs = ();
+    type Outputs = CountedOutput<T, D>;
+    type Time = T;
+
+    fn wants_call(&self, _: &()) -> bool {
+        !self.pending.is_empty() || self.capability.is_some()
     }
 
-    /// Create a source operator with progress reporting.
-    ///
-    /// The source uses the provided reporter to drop its capability at `T::minimum()`
-    /// when all data has been emitted, allowing downstream frontiers to advance.
-    /// The initial capability is seeded by `SubgraphBuilder::add_operator_with_capabilities`.
-    pub fn with_progress(
-        name: impl Into<String>,
-        index: usize,
-        stage_id: StageId,
-        data: Vec<(T, Vec<D>)>,
-        output_pusher: Box<dyn Push<T, D>>,
-        reporter: ProgressReporter<T>,
-    ) -> Self {
-        #[cfg_attr(
-            not(any(debug_assertions, feature = "progress-check")),
-            allow(unused_mut)
-        )]
-        let mut op = Self {
-            name: name.into(),
-            index,
-            stage_id,
-            pending_data: VecDeque::from(data),
-            output_pusher,
-            pending_output: PendingOutput::new(),
-            progress_reporter: Some(reporter),
-            done: false,
+    fn call(&mut self, _: &mut (), output: &mut Self::Outputs) -> Result<bool> {
+        let did = !self.pending.is_empty();
+        while let Some((time, data)) = self.pending.pop_front() {
             #[cfg(any(debug_assertions, feature = "progress-check"))]
-            check_data: None,
-        };
-        #[cfg(any(debug_assertions, feature = "progress-check"))]
-        op.check_observe();
-        op
-    }
-}
-
-impl<T: Timestamp, D: Send + 'static> SchedulableOperator for WiredSourceOperator<T, D> {
-    fn activate(&mut self) -> Result<ActivationOutcome> {
-        if self.done {
-            return Ok(ActivationOutcome::Done);
-        }
-
-        // Try to flush pending output first.
-        while let Some(envelope) = self.pending_output.pop_front() {
-            match self.output_pusher.try_push(envelope) {
-                Ok(()) => {}
-                Err((Error::Backpressure, returned)) => {
-                    self.pending_output.push_front(returned);
-                    return Ok(ActivationOutcome::BlockedOnBackpressure);
-                }
-                Err((e, _)) => return Err(e),
-            }
-        }
-
-        // Emit pending data in FIFO order (front-to-back).
-        while let Some((time, data)) = self.pending_data.pop_front() {
-            #[cfg(any(debug_assertions, feature = "progress-check"))]
-            if let Some(check) = &self.check_data {
+            if let Some(check) = &self.check {
                 check.remove(&time, data.len());
             }
-            let envelope = Envelope::data(time, data);
-            match self.output_pusher.try_push(envelope) {
-                Ok(()) => {}
-                Err((Error::Backpressure, returned)) => {
-                    self.pending_output.push_back(returned);
-                    return Ok(ActivationOutcome::BlockedOnBackpressure);
-                }
-                Err((e, _)) => return Err(e),
-            }
+            output.handle().push_vec(time, data);
         }
-
-        // All data emitted — drop capability and close output.
-        if let Some(ref reporter) = self.progress_reporter {
-            reporter.update(T::minimum(), -1);
-            #[cfg(any(debug_assertions, feature = "progress-check"))]
-            reporter.check_hold(&T::minimum(), -1);
-        }
-        self.output_pusher.close();
-        self.done = true;
-        Ok(ActivationOutcome::Done)
+        // Everything is handed to the output, where it is counted.
+        self.capability = None;
+        Ok(did)
     }
 
-    fn is_done(&self) -> bool {
-        self.done
+    fn holds_work(&self) -> bool {
+        !self.pending.is_empty() || self.capability.is_some()
     }
 
-    fn name(&self) -> &str {
-        &self.name
-    }
-
-    fn index(&self) -> usize {
-        self.index
-    }
-
-    fn stage_id(&self) -> StageId {
-        self.stage_id
-    }
-
-    fn close_inputs(&mut self) {
-        // Source has no inputs, but close_inputs can be called during shutdown.
-        // Drop capability if present to avoid leaking it.
-        if !self.done {
-            if let Some(ref reporter) = self.progress_reporter {
-                reporter.update(T::minimum(), -1);
-                #[cfg(any(debug_assertions, feature = "progress-check"))]
-                reporter.check_hold(&T::minimum(), -1);
-            }
-            self.output_pusher.close();
-            self.done = true;
-        }
+    fn inputs_closed(&mut self) {
+        self.capability = None;
     }
 }
 
-// ---------------------------------------------------------------------------
-// WiredSinkOperator
-// ---------------------------------------------------------------------------
-
-/// A wired (materialized) sink operator that collects data from its input channel.
-///
-/// Has no output channels — accumulates received data for later retrieval.
-pub struct WiredSinkOperator<T: Timestamp, D: Send + 'static> {
-    name: String,
+/// A source emitting `data`. With `seeded`, it holds its operator's
+/// initial capability at `T::minimum()` (declared with the progress
+/// tracker) until all data is emitted.
+pub(crate) fn source<T: Timestamp, D: Send + 'static>(
+    name: impl Into<String>,
     index: usize,
     stage_id: StageId,
-    /// Input channel.
-    input_puller: Box<dyn Pull<T, D>>,
-    /// Collected output.
-    collected: Vec<(T, Vec<D>)>,
-    /// Whether input is exhausted.
-    input_exhausted: bool,
-    /// Whether this operator is done.
-    done: bool,
-}
-
-impl<T: Timestamp, D: Send + 'static> WiredSinkOperator<T, D> {
-    /// Create a sink operator.
-    pub fn new(
-        name: impl Into<String>,
-        index: usize,
-        stage_id: StageId,
-        input_puller: Box<dyn Pull<T, D>>,
-    ) -> Self {
-        #[cfg_attr(
-            not(any(debug_assertions, feature = "progress-check")),
-            allow(unused_mut)
-        )]
-        let mut op = Self {
-            name: name.into(),
-            index,
-            stage_id,
-            input_puller,
-            collected: Vec::new(),
-            input_exhausted: false,
-            done: false,
-        };
-        #[cfg(any(debug_assertions, feature = "progress-check"))]
-        op.check_observe();
-        op
-    }
-
-    /// Get all collected data.
-    pub fn collected(&self) -> &[(T, Vec<D>)] {
-        &self.collected
-    }
-
-    /// Take all collected data, consuming it.
-    pub fn take_collected(&mut self) -> Vec<(T, Vec<D>)> {
-        std::mem::take(&mut self.collected)
-    }
-}
-
-impl<T: Timestamp, D: Send + 'static> SchedulableOperator for WiredSinkOperator<T, D> {
-    fn activate(&mut self) -> Result<ActivationOutcome> {
-        if self.done {
-            return Ok(ActivationOutcome::Done);
-        }
-
-        let mut made_progress = false;
-
-        loop {
-            match self.input_puller.pull() {
-                Some(envelope) => {
-                    if let Payload::Data { time, data } = envelope.payload {
-                        self.collected.push((time, data));
-                        made_progress = true;
-                    }
-                }
-                None => {
-                    if self.input_puller.is_exhausted() {
-                        self.input_exhausted = true;
-                        self.done = true;
-                        return Ok(ActivationOutcome::Done);
-                    }
-                    break;
-                }
-            }
-        }
-
-        if made_progress {
-            Ok(ActivationOutcome::MadeProgress)
-        } else {
-            Ok(ActivationOutcome::Idle)
+    data: Vec<(T, Vec<D>)>,
+    output: CountedOutput<T, D>,
+    seeded: bool,
+) -> OperatorShell<SourceLogic<T, D>> {
+    let capability = seeded.then(|| Capability::seeded(T::minimum(), output.reporter().clone()));
+    #[cfg(any(debug_assertions, feature = "progress-check"))]
+    let check = output.check_port().map(|port| {
+        crate::progress::check::StoreCheck::new(port, crate::progress::check::Store::PendingOutput)
+    });
+    #[cfg(any(debug_assertions, feature = "progress-check"))]
+    if let Some(check) = &check {
+        for (time, batch) in &data {
+            check.add(time, batch.len());
         }
     }
-
-    fn is_done(&self) -> bool {
-        self.done
-    }
-
-    fn name(&self) -> &str {
-        &self.name
-    }
-
-    fn index(&self) -> usize {
-        self.index
-    }
-
-    fn stage_id(&self) -> StageId {
-        self.stage_id
-    }
-
-    fn close_inputs(&mut self) {
-        self.input_exhausted = true;
-        self.done = true;
-    }
+    OperatorShell::new(
+        name,
+        index,
+        stage_id,
+        SourceLogic {
+            pending: VecDeque::from(data),
+            capability,
+            #[cfg(any(debug_assertions, feature = "progress-check"))]
+            check,
+        },
+        (),
+        output,
+    )
 }
 
 // ---------------------------------------------------------------------------
-// WiredBinaryOperator
+// Sink
 // ---------------------------------------------------------------------------
 
-/// A fully-wired (materialized) binary operator with two typed inputs and one output.
-///
-/// The user logic receives two `InputHandle`s and one `OutputHandle`. Data may
-/// arrive on either input independently; the logic must handle partial availability.
-pub struct WiredBinaryOperator<
+/// A sink: hands every batch it takes to `consume`.
+pub(crate) struct SinkLogic<T: Timestamp, D: Send + 'static, F: FnMut(T, Vec<D>) + Send + 'static> {
+    consume: F,
+    _marker: std::marker::PhantomData<fn(T, D)>,
+}
+
+impl<T: Timestamp, D: Send + 'static, F: FnMut(T, Vec<D>) + Send + 'static> OperatorLogic
+    for SinkLogic<T, D, F>
+{
+    type Inputs = CountedInput<T, D>;
+    type Outputs = ();
+    type Time = T;
+
+    fn call(&mut self, input: &mut Self::Inputs, _: &mut ()) -> Result<bool> {
+        let handle = input.handle();
+        let mut did = false;
+        while let Some((time, data)) = handle.next() {
+            (self.consume)(time, data);
+            did = true;
+        }
+        Ok(did)
+    }
+}
+
+/// A sink calling `consume` with every batch.
+pub(crate) fn sink<T: Timestamp, D: Send + 'static, F: FnMut(T, Vec<D>) + Send + 'static>(
+    name: impl Into<String>,
+    index: usize,
+    stage_id: StageId,
+    consume: F,
+    input: CountedInput<T, D>,
+) -> OperatorShell<SinkLogic<T, D, F>> {
+    OperatorShell::new(
+        name,
+        index,
+        stage_id,
+        SinkLogic {
+            consume,
+            _marker: std::marker::PhantomData,
+        },
+        input,
+        (),
+    )
+}
+
+// ---------------------------------------------------------------------------
+// Binary
+// ---------------------------------------------------------------------------
+
+/// A binary operator: calls its closure whenever either input is waiting.
+pub(crate) struct BinaryLogic<
     T: Timestamp,
     D1: Send + 'static,
     D2: Send + 'static,
     D3: Send + 'static,
 > {
-    name: String,
-    index: usize,
-    stage_id: StageId,
-    input1_puller: Box<dyn Pull<T, D1>>,
-    input2_puller: Box<dyn Pull<T, D2>>,
-    input1_handle: InputHandle<T, D1>,
-    input2_handle: InputHandle<T, D2>,
-    logic: Box<
-        dyn FnMut(
-                &mut InputHandle<T, D1>,
-                &mut InputHandle<T, D2>,
-                &mut OutputHandle<T, D3>,
-            ) -> Result<()>
-            + Send,
-    >,
-    output_handle: OutputHandle<T, D3>,
-    output_pusher: Box<dyn Push<T, D3>>,
-    pending_output: PendingOutput<T, D3>,
-    input1_exhausted: bool,
-    input2_exhausted: bool,
-    done: bool,
+    logic: BinaryFn<T, D1, D2, D3>,
 }
 
-impl<T: Timestamp, D1: Send + 'static, D2: Send + 'static, D3: Send + 'static>
-    WiredBinaryOperator<T, D1, D2, D3>
+impl<T: Timestamp, D1: Send + 'static, D2: Send + 'static, D3: Send + 'static> OperatorLogic
+    for BinaryLogic<T, D1, D2, D3>
 {
-    /// Create a new wired binary operator.
-    pub fn new(
-        name: impl Into<String>,
-        index: usize,
-        stage_id: StageId,
-        logic: impl FnMut(
-            &mut InputHandle<T, D1>,
-            &mut InputHandle<T, D2>,
-            &mut OutputHandle<T, D3>,
-        ) -> Result<()>
-        + Send
-        + 'static,
-        input1_puller: Box<dyn Pull<T, D1>>,
-        input2_puller: Box<dyn Pull<T, D2>>,
-        output_pusher: Box<dyn Push<T, D3>>,
-    ) -> Self {
-        let name = name.into();
-        #[cfg_attr(
-            not(any(debug_assertions, feature = "progress-check")),
-            allow(unused_mut)
-        )]
-        let mut op = Self {
-            input1_handle: InputHandle::new(format!("{name}:input1")),
-            input2_handle: InputHandle::new(format!("{name}:input2")),
-            output_handle: OutputHandle::new(format!("{name}:output")),
-            name,
-            index,
-            stage_id,
-            input1_puller,
-            input2_puller,
+    type Inputs = (CountedInput<T, D1>, CountedInput<T, D2>);
+    type Outputs = CountedOutput<T, D3>;
+    type Time = T;
+
+    fn call(&mut self, inputs: &mut Self::Inputs, output: &mut Self::Outputs) -> Result<bool> {
+        (self.logic)(inputs.0.handle(), inputs.1.handle(), output.handle())?;
+        Ok(true)
+    }
+}
+
+/// A binary operator running `logic`.
+pub(crate) fn binary<T: Timestamp, D1: Send + 'static, D2: Send + 'static, D3: Send + 'static>(
+    name: impl Into<String>,
+    index: usize,
+    stage_id: StageId,
+    logic: impl FnMut(
+        &mut InputHandle<T, D1>,
+        &mut InputHandle<T, D2>,
+        &mut OutputHandle<T, D3>,
+    ) -> Result<()>
+    + Send
+    + 'static,
+    input1: CountedInput<T, D1>,
+    input2: CountedInput<T, D2>,
+    output: CountedOutput<T, D3>,
+) -> OperatorShell<BinaryLogic<T, D1, D2, D3>> {
+    OperatorShell::new(
+        name,
+        index,
+        stage_id,
+        BinaryLogic {
             logic: Box::new(logic),
-            output_pusher,
-            pending_output: PendingOutput::new(),
-            input1_exhausted: false,
-            input2_exhausted: false,
-            done: false,
-        };
-        #[cfg(any(debug_assertions, feature = "progress-check"))]
-        op.check_observe();
-        op
-    }
-
-    fn flush_pending_output(&mut self) -> Result<bool> {
-        while let Some(envelope) = self.pending_output.pop_front() {
-            match self.output_pusher.try_push(envelope) {
-                Ok(()) => {}
-                Err((Error::Backpressure, returned)) => {
-                    self.pending_output.push_front(returned);
-                    return Ok(false);
-                }
-                Err((e, _returned)) => return Err(e),
-            }
-        }
-        Ok(true)
-    }
-
-    fn pull_input1(&mut self) {
-        loop {
-            match self.input1_puller.pull() {
-                Some(envelope) => match envelope.payload {
-                    Payload::Data { time, data } => {
-                        self.input1_handle.push_vec(time, data);
-                    }
-                    Payload::Control(_) => {}
-                },
-                None => {
-                    if self.input1_puller.is_exhausted() {
-                        self.input1_exhausted = true;
-                        self.input1_handle.mark_exhausted();
-                    }
-                    break;
-                }
-            }
-        }
-    }
-
-    fn pull_input2(&mut self) {
-        loop {
-            match self.input2_puller.pull() {
-                Some(envelope) => match envelope.payload {
-                    Payload::Data { time, data } => {
-                        self.input2_handle.push_vec(time, data);
-                    }
-                    Payload::Control(_) => {}
-                },
-                None => {
-                    if self.input2_puller.is_exhausted() {
-                        self.input2_exhausted = true;
-                        self.input2_handle.mark_exhausted();
-                    }
-                    break;
-                }
-            }
-        }
-    }
-
-    fn push_output(&mut self) -> Result<bool> {
-        for (time, data) in self.output_handle.drain() {
-            self.pending_output.push_back(Envelope::data(time, data));
-        }
-        self.flush_pending_output()
-    }
-}
-
-impl<T: Timestamp, D1: Send + 'static, D2: Send + 'static, D3: Send + 'static> SchedulableOperator
-    for WiredBinaryOperator<T, D1, D2, D3>
-{
-    fn activate(&mut self) -> Result<ActivationOutcome> {
-        if self.done {
-            return Ok(ActivationOutcome::Done);
-        }
-
-        // Step 1: Flush pending output from previous activation.
-        if !self.pending_output.is_empty() && !self.flush_pending_output()? {
-            return Ok(ActivationOutcome::BlockedOnBackpressure);
-        }
-
-        // Step 2: Pull from both input channels.
-        self.pull_input1();
-        self.pull_input2();
-
-        // Step 3: Check if there's work to do.
-        let has_input = self.input1_handle.has_pending() || self.input2_handle.has_pending();
-        let both_exhausted = self.input1_exhausted && self.input2_exhausted;
-
-        if !has_input && both_exhausted {
-            self.output_pusher.close();
-            self.done = true;
-            return Ok(ActivationOutcome::Done);
-        }
-
-        if !has_input {
-            return Ok(ActivationOutcome::Idle);
-        }
-
-        // Step 4: Run user logic.
-        (self.logic)(
-            &mut self.input1_handle,
-            &mut self.input2_handle,
-            &mut self.output_handle,
-        )?;
-
-        // Step 5: Push output.
-        if !self.push_output()? {
-            return Ok(ActivationOutcome::BlockedOnBackpressure);
-        }
-
-        // Step 6: Check if done.
-        if both_exhausted
-            && !self.input1_handle.has_pending()
-            && !self.input2_handle.has_pending()
-            && !self.output_handle.has_output()
-        {
-            self.output_pusher.close();
-            self.done = true;
-            return Ok(ActivationOutcome::Done);
-        }
-
-        Ok(ActivationOutcome::MadeProgress)
-    }
-
-    fn is_done(&self) -> bool {
-        self.done
-    }
-
-    fn name(&self) -> &str {
-        &self.name
-    }
-
-    fn index(&self) -> usize {
-        self.index
-    }
-
-    fn stage_id(&self) -> StageId {
-        self.stage_id
-    }
-
-    fn close_inputs(&mut self) {
-        self.input1_exhausted = true;
-        self.input1_handle.mark_exhausted();
-        self.input2_exhausted = true;
-        self.input2_handle.mark_exhausted();
-    }
+        },
+        (input1, input2),
+        output,
+    )
 }
 
 // ---------------------------------------------------------------------------
-// WiredConcatOperator
+// Concat
 // ---------------------------------------------------------------------------
 
-/// A fully-wired N-input, 1-output operator that merges data from multiple
-/// same-typed streams into a single output stream. Data order within a
-/// timestamp is preserved per-input but interleaved across inputs.
-pub struct WiredConcatOperator<T: Timestamp, D: Send + 'static> {
-    name: String,
+/// Merges N same-typed inputs into one output. Order within a time is kept
+/// per input.
+pub(crate) struct ConcatLogic<T: Timestamp, D: Send + 'static> {
+    _marker: std::marker::PhantomData<fn(T, D)>,
+}
+
+impl<T: Timestamp, D: Send + 'static> OperatorLogic for ConcatLogic<T, D> {
+    type Inputs = Vec<CountedInput<T, D>>;
+    type Outputs = CountedOutput<T, D>;
+    type Time = T;
+
+    fn call(&mut self, inputs: &mut Self::Inputs, output: &mut Self::Outputs) -> Result<bool> {
+        let output = output.handle();
+        let mut did = false;
+        for input in inputs.iter_mut() {
+            while let Some((time, data)) = input.handle().next() {
+                output.push_vec(time, data);
+                did = true;
+            }
+        }
+        Ok(did)
+    }
+}
+
+/// A concat of `inputs`.
+pub(crate) fn concat<T: Timestamp, D: Send + 'static>(
+    name: impl Into<String>,
     index: usize,
     stage_id: StageId,
-    input_pullers: Vec<Box<dyn Pull<T, D>>>,
-    inputs_exhausted: Vec<bool>,
-    output_pusher: Box<dyn Push<T, D>>,
-    pending_output: PendingOutput<T, D>,
-    done: bool,
-}
-
-impl<T: Timestamp, D: Send + 'static> WiredConcatOperator<T, D> {
-    /// Create a concat operator that merges N input streams.
-    pub fn new(
-        name: impl Into<String>,
-        index: usize,
-        stage_id: StageId,
-        input_pullers: Vec<Box<dyn Pull<T, D>>>,
-        output_pusher: Box<dyn Push<T, D>>,
-    ) -> Self {
-        let num_inputs = input_pullers.len();
-        #[cfg_attr(
-            not(any(debug_assertions, feature = "progress-check")),
-            allow(unused_mut)
-        )]
-        let mut op = Self {
-            name: name.into(),
-            index,
-            stage_id,
-            input_pullers,
-            inputs_exhausted: vec![false; num_inputs],
-            output_pusher,
-            pending_output: PendingOutput::new(),
-            done: false,
-        };
-        #[cfg(any(debug_assertions, feature = "progress-check"))]
-        op.check_observe();
-        op
-    }
-
-    fn flush_pending_output(&mut self) -> Result<bool> {
-        while let Some(envelope) = self.pending_output.pop_front() {
-            match self.output_pusher.try_push(envelope) {
-                Ok(()) => {}
-                Err((Error::Backpressure, returned)) => {
-                    self.pending_output.push_front(returned);
-                    return Ok(false);
-                }
-                Err((e, _returned)) => return Err(e),
-            }
-        }
-        Ok(true)
-    }
-}
-
-impl<T: Timestamp, D: Send + 'static> SchedulableOperator for WiredConcatOperator<T, D> {
-    fn activate(&mut self) -> Result<ActivationOutcome> {
-        if self.done {
-            return Ok(ActivationOutcome::Done);
-        }
-
-        // Flush pending output.
-        if !self.pending_output.is_empty() && !self.flush_pending_output()? {
-            return Ok(ActivationOutcome::BlockedOnBackpressure);
-        }
-
-        // Pull from all inputs and forward directly to output.
-        let mut made_progress = false;
-        for i in 0..self.input_pullers.len() {
-            loop {
-                match self.input_pullers[i].pull() {
-                    Some(envelope) => {
-                        if let Payload::Data { time, data } = envelope.payload {
-                            self.pending_output.push_back(Envelope::data(time, data));
-                            made_progress = true;
-                        }
-                    }
-                    None => {
-                        if self.input_pullers[i].is_exhausted() {
-                            self.inputs_exhausted[i] = true;
-                        }
-                        break;
-                    }
-                }
-            }
-        }
-
-        // Push to output.
-        if !self.pending_output.is_empty() && !self.flush_pending_output()? {
-            return Ok(ActivationOutcome::BlockedOnBackpressure);
-        }
-
-        // Check if all inputs are exhausted.
-        if self.inputs_exhausted.iter().all(|e| *e) {
-            self.output_pusher.close();
-            self.done = true;
-            return Ok(ActivationOutcome::Done);
-        }
-
-        if made_progress {
-            Ok(ActivationOutcome::MadeProgress)
-        } else {
-            Ok(ActivationOutcome::Idle)
-        }
-    }
-
-    fn is_done(&self) -> bool {
-        self.done
-    }
-
-    fn name(&self) -> &str {
-        &self.name
-    }
-
-    fn index(&self) -> usize {
-        self.index
-    }
-
-    fn stage_id(&self) -> StageId {
-        self.stage_id
-    }
-
-    fn close_inputs(&mut self) {
-        self.inputs_exhausted.fill(true);
-    }
+    inputs: Vec<CountedInput<T, D>>,
+    output: CountedOutput<T, D>,
+) -> OperatorShell<ConcatLogic<T, D>> {
+    OperatorShell::new(
+        name,
+        index,
+        stage_id,
+        ConcatLogic {
+            _marker: std::marker::PhantomData,
+        },
+        inputs,
+        output,
+    )
 }
 
 // ---------------------------------------------------------------------------
-// WiredEnterOperator
+// Enter, leave, feedback: a loop's scope boundary
 // ---------------------------------------------------------------------------
 
-/// A wired operator that wraps timestamps for entering a nested loop scope.
-///
-/// Transforms `Envelope<TOuter, D>` → `Envelope<Product<TOuter, TInner>, D>`
-/// by wrapping each timestamp `t` into `Product(t, TInner::minimum())`.
-pub struct WiredEnterOperator<TOuter: Timestamp, TInner: Timestamp, D: Send + 'static>
+/// Enters a loop scope: `t` becomes `Product(t, TInner::minimum())`.
+pub(crate) struct EnterLogic<TOuter: Timestamp, TInner: Timestamp, D: Send + 'static> {
+    _marker: std::marker::PhantomData<fn(TOuter, TInner, D)>,
+}
+
+impl<TOuter: Timestamp, TInner: Timestamp, D: Send + 'static> OperatorLogic
+    for EnterLogic<TOuter, TInner, D>
 where
-    crate::order::Product<TOuter, TInner>: Timestamp,
+    Product<TOuter, TInner>: Timestamp,
 {
-    name: String,
+    type Inputs = CountedInput<TOuter, D>;
+    type Outputs = CountedOutput<Product<TOuter, TInner>, D>;
+    type Time = Product<TOuter, TInner>;
+
+    fn call(&mut self, input: &mut Self::Inputs, output: &mut Self::Outputs) -> Result<bool> {
+        let output = output.handle();
+        let mut did = false;
+        while let Some((time, data)) = input.handle().next() {
+            output.push_vec(Product::new(time, TInner::minimum()), data);
+            did = true;
+        }
+        Ok(did)
+    }
+
+    fn checks_justification(&self) -> bool {
+        false
+    }
+}
+
+/// A loop's enter operator.
+pub(crate) fn enter<TOuter: Timestamp, TInner: Timestamp, D: Send + 'static>(
+    name: impl Into<String>,
     index: usize,
     stage_id: StageId,
-    input_puller: Box<dyn Pull<TOuter, D>>,
-    output_pusher: Box<dyn Push<crate::order::Product<TOuter, TInner>, D>>,
-    pending_output: PendingOutput<crate::order::Product<TOuter, TInner>, D>,
-    input_exhausted: bool,
-    done: bool,
-    _phantom: std::marker::PhantomData<TInner>,
+    input: CountedInput<TOuter, D>,
+    output: CountedOutput<Product<TOuter, TInner>, D>,
+) -> OperatorShell<EnterLogic<TOuter, TInner, D>>
+where
+    Product<TOuter, TInner>: Timestamp,
+{
+    OperatorShell::new(
+        name,
+        index,
+        stage_id,
+        EnterLogic {
+            _marker: std::marker::PhantomData,
+        },
+        input,
+        output,
+    )
 }
 
-impl<TOuter: Timestamp, TInner: Timestamp, D: Send + 'static> WiredEnterOperator<TOuter, TInner, D>
+/// Leaves a loop scope: `Product(outer, inner)` becomes `outer`.
+pub(crate) struct LeaveLogic<TOuter: Timestamp, TInner: Timestamp, D: Send + 'static> {
+    _marker: std::marker::PhantomData<fn(TOuter, TInner, D)>,
+}
+
+impl<TOuter: Timestamp, TInner: Timestamp, D: Send + 'static> OperatorLogic
+    for LeaveLogic<TOuter, TInner, D>
 where
-    crate::order::Product<TOuter, TInner>: Timestamp,
+    Product<TOuter, TInner>: Timestamp,
 {
-    /// Create a new enter operator.
-    pub fn new(
-        name: impl Into<String>,
-        index: usize,
-        stage_id: StageId,
-        input_puller: Box<dyn Pull<TOuter, D>>,
-        output_pusher: Box<dyn Push<crate::order::Product<TOuter, TInner>, D>>,
-    ) -> Self {
-        #[cfg_attr(
-            not(any(debug_assertions, feature = "progress-check")),
-            allow(unused_mut)
-        )]
-        let mut op = Self {
-            name: name.into(),
-            index,
-            stage_id,
-            input_puller,
-            output_pusher,
-            pending_output: PendingOutput::new(),
-            input_exhausted: false,
-            done: false,
-            _phantom: std::marker::PhantomData,
-        };
-        #[cfg(any(debug_assertions, feature = "progress-check"))]
-        op.check_observe();
-        op
+    type Inputs = CountedInput<Product<TOuter, TInner>, D>;
+    type Outputs = CountedOutput<TOuter, D>;
+    type Time = TOuter;
+
+    fn call(&mut self, input: &mut Self::Inputs, output: &mut Self::Outputs) -> Result<bool> {
+        let output = output.handle();
+        let mut did = false;
+        while let Some((time, data)) = input.handle().next() {
+            output.push_vec(time.outer, data);
+            did = true;
+        }
+        Ok(did)
     }
 
-    fn flush_pending_output(&mut self) -> Result<bool> {
-        while let Some(envelope) = self.pending_output.pop_front() {
-            match self.output_pusher.try_push(envelope) {
-                Ok(()) => {}
-                Err((Error::Backpressure, returned)) => {
-                    self.pending_output.push_front(returned);
-                    return Ok(false);
-                }
-                Err((e, _)) => return Err(e),
-            }
-        }
-        Ok(true)
+    fn checks_justification(&self) -> bool {
+        false
     }
 }
 
-impl<TOuter: Timestamp, TInner: Timestamp, D: Send + 'static> SchedulableOperator
-    for WiredEnterOperator<TOuter, TInner, D>
-where
-    crate::order::Product<TOuter, TInner>: Timestamp,
-{
-    fn activate(&mut self) -> Result<ActivationOutcome> {
-        if self.done {
-            return Ok(ActivationOutcome::Done);
-        }
-
-        if !self.pending_output.is_empty() && !self.flush_pending_output()? {
-            return Ok(ActivationOutcome::BlockedOnBackpressure);
-        }
-
-        let mut made_progress = false;
-        loop {
-            match self.input_puller.pull() {
-                Some(envelope) => match envelope.payload {
-                    Payload::Data { time, data } => {
-                        let product_time = crate::order::Product::new(time, TInner::minimum());
-                        self.pending_output
-                            .push_back(Envelope::data(product_time, data));
-                        made_progress = true;
-                    }
-                    Payload::Control(_) => {}
-                },
-                None => {
-                    if self.input_puller.is_exhausted() {
-                        self.input_exhausted = true;
-                    }
-                    break;
-                }
-            }
-        }
-
-        if !self.pending_output.is_empty() && !self.flush_pending_output()? {
-            return Ok(ActivationOutcome::BlockedOnBackpressure);
-        }
-
-        if self.input_exhausted && self.pending_output.is_empty() {
-            self.output_pusher.close();
-            self.done = true;
-            return Ok(ActivationOutcome::Done);
-        }
-
-        if made_progress {
-            Ok(ActivationOutcome::MadeProgress)
-        } else {
-            Ok(ActivationOutcome::Idle)
-        }
-    }
-
-    fn is_done(&self) -> bool {
-        self.done
-    }
-
-    fn name(&self) -> &str {
-        &self.name
-    }
-
-    fn index(&self) -> usize {
-        self.index
-    }
-
-    fn stage_id(&self) -> StageId {
-        self.stage_id
-    }
-
-    fn close_inputs(&mut self) {
-        self.input_exhausted = true;
-    }
-}
-
-// ---------------------------------------------------------------------------
-// WiredLeaveOperator
-// ---------------------------------------------------------------------------
-
-/// A wired operator that strips the inner timestamp when leaving a loop scope.
-///
-/// Transforms `Envelope<Product<TOuter, TInner>, D>` → `Envelope<TOuter, D>`
-/// by extracting the outer component: `Product(outer, _inner)` → `outer`.
-pub struct WiredLeaveOperator<TOuter: Timestamp, TInner: Timestamp, D: Send + 'static>
-where
-    crate::order::Product<TOuter, TInner>: Timestamp,
-{
-    name: String,
+/// A loop's leave operator.
+pub(crate) fn leave<TOuter: Timestamp, TInner: Timestamp, D: Send + 'static>(
+    name: impl Into<String>,
     index: usize,
     stage_id: StageId,
-    input_puller: Box<dyn Pull<crate::order::Product<TOuter, TInner>, D>>,
-    output_pusher: Box<dyn Push<TOuter, D>>,
-    pending_output: PendingOutput<TOuter, D>,
-    input_exhausted: bool,
-    done: bool,
+    input: CountedInput<Product<TOuter, TInner>, D>,
+    output: CountedOutput<TOuter, D>,
+) -> OperatorShell<LeaveLogic<TOuter, TInner, D>>
+where
+    Product<TOuter, TInner>: Timestamp,
+{
+    OperatorShell::new(
+        name,
+        index,
+        stage_id,
+        LeaveLogic {
+            _marker: std::marker::PhantomData,
+        },
+        input,
+        output,
+    )
 }
 
-impl<TOuter: Timestamp, TInner: Timestamp, D: Send + 'static> WiredLeaveOperator<TOuter, TInner, D>
-where
-    crate::order::Product<TOuter, TInner>: Timestamp,
-{
-    /// Create a new leave operator.
-    pub fn new(
-        name: impl Into<String>,
-        index: usize,
-        stage_id: StageId,
-        input_puller: Box<dyn Pull<crate::order::Product<TOuter, TInner>, D>>,
-        output_pusher: Box<dyn Push<TOuter, D>>,
-    ) -> Self {
-        #[cfg_attr(
-            not(any(debug_assertions, feature = "progress-check")),
-            allow(unused_mut)
-        )]
-        let mut op = Self {
-            name: name.into(),
-            index,
-            stage_id,
-            input_puller,
-            output_pusher,
-            pending_output: PendingOutput::new(),
-            input_exhausted: false,
-            done: false,
-        };
-        #[cfg(any(debug_assertions, feature = "progress-check"))]
-        op.check_observe();
-        op
-    }
+/// A loop's feedback: advances the inner time by `summary`. A record whose
+/// inner time would overflow is dropped.
+pub(crate) struct FeedbackLogic<TOuter: Timestamp, TInner: Timestamp, D: Send + 'static> {
+    summary: TInner::Summary,
+    _marker: std::marker::PhantomData<fn(TOuter, D)>,
+}
 
-    fn flush_pending_output(&mut self) -> Result<bool> {
-        while let Some(envelope) = self.pending_output.pop_front() {
-            match self.output_pusher.try_push(envelope) {
-                Ok(()) => {}
-                Err((Error::Backpressure, returned)) => {
-                    self.pending_output.push_front(returned);
-                    return Ok(false);
-                }
-                Err((e, _)) => return Err(e),
+impl<TOuter: Timestamp, TInner: Timestamp, D: Send + 'static> OperatorLogic
+    for FeedbackLogic<TOuter, TInner, D>
+where
+    Product<TOuter, TInner>: Timestamp,
+{
+    type Inputs = CountedInput<Product<TOuter, TInner>, D>;
+    type Outputs = CountedOutput<Product<TOuter, TInner>, D>;
+    type Time = Product<TOuter, TInner>;
+
+    fn call(&mut self, input: &mut Self::Inputs, output: &mut Self::Outputs) -> Result<bool> {
+        use crate::progress::timestamp::PathSummary;
+        let output = output.handle();
+        let mut did = false;
+        while let Some((time, data)) = input.handle().next() {
+            if let Some(inner) = self.summary.results_in(&time.inner) {
+                output.push_vec(Product::new(time.outer, inner), data);
             }
+            did = true;
         }
-        Ok(true)
+        Ok(did)
+    }
+
+    fn checks_justification(&self) -> bool {
+        false
     }
 }
 
-impl<TOuter: Timestamp, TInner: Timestamp, D: Send + 'static> SchedulableOperator
-    for WiredLeaveOperator<TOuter, TInner, D>
-where
-    crate::order::Product<TOuter, TInner>: Timestamp,
-{
-    fn activate(&mut self) -> Result<ActivationOutcome> {
-        if self.done {
-            return Ok(ActivationOutcome::Done);
-        }
-
-        if !self.pending_output.is_empty() && !self.flush_pending_output()? {
-            return Ok(ActivationOutcome::BlockedOnBackpressure);
-        }
-
-        let mut made_progress = false;
-        loop {
-            match self.input_puller.pull() {
-                Some(envelope) => match envelope.payload {
-                    Payload::Data { time, data } => {
-                        let outer_time = time.outer;
-                        self.pending_output
-                            .push_back(Envelope::data(outer_time, data));
-                        made_progress = true;
-                    }
-                    Payload::Control(_) => {}
-                },
-                None => {
-                    if self.input_puller.is_exhausted() {
-                        self.input_exhausted = true;
-                    }
-                    break;
-                }
-            }
-        }
-
-        if !self.pending_output.is_empty() && !self.flush_pending_output()? {
-            return Ok(ActivationOutcome::BlockedOnBackpressure);
-        }
-
-        if self.input_exhausted && self.pending_output.is_empty() {
-            self.output_pusher.close();
-            self.done = true;
-            return Ok(ActivationOutcome::Done);
-        }
-
-        if made_progress {
-            Ok(ActivationOutcome::MadeProgress)
-        } else {
-            Ok(ActivationOutcome::Idle)
-        }
-    }
-
-    fn is_done(&self) -> bool {
-        self.done
-    }
-
-    fn name(&self) -> &str {
-        &self.name
-    }
-
-    fn index(&self) -> usize {
-        self.index
-    }
-
-    fn stage_id(&self) -> StageId {
-        self.stage_id
-    }
-
-    fn close_inputs(&mut self) {
-        self.input_exhausted = true;
-    }
-}
-
-// ---------------------------------------------------------------------------
-// WiredFeedbackOperator
-// ---------------------------------------------------------------------------
-
-/// A wired operator that advances the inner timestamp for feedback edges.
-///
-/// Transforms `Envelope<Product<TOuter, TInner>, D>` by applying the summary
-/// to the inner timestamp: `Product(outer, inner)` → `Product(outer, summary.results_in(inner))`.
-/// If `results_in()` returns `None` (overflow), the data is dropped.
-pub struct WiredFeedbackOperator<TOuter: Timestamp, TInner: Timestamp, D: Send + 'static>
-where
-    crate::order::Product<TOuter, TInner>: Timestamp,
-{
-    name: String,
+/// A loop's feedback operator.
+pub(crate) fn feedback<TOuter: Timestamp, TInner: Timestamp, D: Send + 'static>(
+    name: impl Into<String>,
     index: usize,
     stage_id: StageId,
     summary: TInner::Summary,
-    input_puller: Box<dyn Pull<crate::order::Product<TOuter, TInner>, D>>,
-    output_pusher: Box<dyn Push<crate::order::Product<TOuter, TInner>, D>>,
-    pending_output: PendingOutput<crate::order::Product<TOuter, TInner>, D>,
-    input_exhausted: bool,
-    done: bool,
-}
-
-impl<TOuter: Timestamp, TInner: Timestamp, D: Send + 'static>
-    WiredFeedbackOperator<TOuter, TInner, D>
+    input: CountedInput<Product<TOuter, TInner>, D>,
+    output: CountedOutput<Product<TOuter, TInner>, D>,
+) -> OperatorShell<FeedbackLogic<TOuter, TInner, D>>
 where
-    crate::order::Product<TOuter, TInner>: Timestamp,
+    Product<TOuter, TInner>: Timestamp,
 {
-    /// Create a new feedback operator with the given timestamp advancement summary.
-    pub fn new(
-        name: impl Into<String>,
-        index: usize,
-        stage_id: StageId,
-        summary: TInner::Summary,
-        input_puller: Box<dyn Pull<crate::order::Product<TOuter, TInner>, D>>,
-        output_pusher: Box<dyn Push<crate::order::Product<TOuter, TInner>, D>>,
-    ) -> Self {
-        #[cfg_attr(
-            not(any(debug_assertions, feature = "progress-check")),
-            allow(unused_mut)
-        )]
-        let mut op = Self {
-            name: name.into(),
-            index,
-            stage_id,
+    OperatorShell::new(
+        name,
+        index,
+        stage_id,
+        FeedbackLogic {
             summary,
-            input_puller,
-            output_pusher,
-            pending_output: PendingOutput::new(),
-            input_exhausted: false,
-            done: false,
-        };
-        #[cfg(any(debug_assertions, feature = "progress-check"))]
-        op.check_observe();
-        op
-    }
-
-    fn flush_pending_output(&mut self) -> Result<bool> {
-        while let Some(envelope) = self.pending_output.pop_front() {
-            match self.output_pusher.try_push(envelope) {
-                Ok(()) => {}
-                Err((Error::Backpressure, returned)) => {
-                    self.pending_output.push_front(returned);
-                    return Ok(false);
-                }
-                Err((e, _)) => return Err(e),
-            }
-        }
-        Ok(true)
-    }
-}
-
-impl<TOuter: Timestamp, TInner: Timestamp, D: Send + 'static> SchedulableOperator
-    for WiredFeedbackOperator<TOuter, TInner, D>
-where
-    crate::order::Product<TOuter, TInner>: Timestamp,
-{
-    fn activate(&mut self) -> Result<ActivationOutcome> {
-        use crate::progress::timestamp::PathSummary;
-
-        if self.done {
-            return Ok(ActivationOutcome::Done);
-        }
-
-        if !self.pending_output.is_empty() && !self.flush_pending_output()? {
-            return Ok(ActivationOutcome::BlockedOnBackpressure);
-        }
-
-        let mut made_progress = false;
-        loop {
-            match self.input_puller.pull() {
-                Some(envelope) => match envelope.payload {
-                    Payload::Data { time, data } => {
-                        // Advance inner timestamp by summary
-                        if let Some(new_inner) = self.summary.results_in(&time.inner) {
-                            let new_time = crate::order::Product::new(time.outer, new_inner);
-                            self.pending_output
-                                .push_back(Envelope::data(new_time, data));
-                            made_progress = true;
-                        }
-                        // If results_in returns None, drop the data (overflow)
-                    }
-                    Payload::Control(_) => {}
-                },
-                None => {
-                    if self.input_puller.is_exhausted() {
-                        self.input_exhausted = true;
-                    }
-                    break;
-                }
-            }
-        }
-
-        if !self.pending_output.is_empty() && !self.flush_pending_output()? {
-            return Ok(ActivationOutcome::BlockedOnBackpressure);
-        }
-
-        if self.input_exhausted && self.pending_output.is_empty() {
-            self.output_pusher.close();
-            self.done = true;
-            return Ok(ActivationOutcome::Done);
-        }
-
-        if made_progress {
-            Ok(ActivationOutcome::MadeProgress)
-        } else {
-            Ok(ActivationOutcome::Idle)
-        }
-    }
-
-    fn is_done(&self) -> bool {
-        self.done
-    }
-
-    fn name(&self) -> &str {
-        &self.name
-    }
-
-    fn index(&self) -> usize {
-        self.index
-    }
-
-    fn stage_id(&self) -> StageId {
-        self.stage_id
-    }
-
-    fn close_inputs(&mut self) {
-        self.input_exhausted = true;
-    }
+            _marker: std::marker::PhantomData,
+        },
+        input,
+        output,
+    )
 }
 
 // ---------------------------------------------------------------------------
-// WiredUnaryNotifyOperator
+// Notify
 // ---------------------------------------------------------------------------
 
-/// A fully-wired unary operator that supports frontier-based notifications.
+/// A unary operator with frontier notifications (`unary_notify`, reduce,
+/// fold, count, distinct, delay).
 ///
-/// # Why this exists (vs regular WiredUnaryOperator)
-///
-/// A regular `WiredUnaryOperator` processes data immediately: it pulls input,
-/// runs the user closure, and pushes output — all in the same activation.
-/// This works for stateless operators (map, filter) and simple stateful ones
-/// that can emit partial results incrementally.
-///
-/// However, some operators need to **buffer data and defer emission** until a
-/// timestamp is "complete" — meaning all possible input at that timestamp has
-/// arrived. For example:
-///
-/// - **Aggregation after exchange**: When data for timestamp `t` arrives from
-///   multiple workers in separate batches, the operator must wait until ALL
-///   batches have arrived before emitting the final aggregate. The frontier
-///   advancing past `t` is the signal that no more data at `t` will arrive.
-///
-/// - **Window operators**: Collect all data in a time window, then process.
-///
-/// - **Sort/distinct**: Need all data at a timestamp before producing output.
-///
-/// The `WiredUnaryNotifyOperator` extends the regular unary with:
-///
-/// 1. **A [`Notificator`] that fires when the input frontier advances**, signaling
-///    that specific timestamps are complete.
-///
-/// 2. **Output capabilities** (via [`ProgressReporter`]) that prevent downstream
-///    frontiers from advancing while data is buffered. Without these, the progress
-///    tracker would propagate upstream completion through this operator, making
-///    downstream operators incorrectly believe buffered timestamps are done.
-///
-/// 3. **Frontier-aware activation**: Unlike the regular unary operator which skips
-///    activation when input is exhausted, this operator continues activating as long
-///    as it has pending or ready notifications — ensuring buffered data is eventually
-///    emitted even after all input is consumed.
-///
-/// # Activation flow
-///
-/// ```text
-/// 1. Flush pending output (backpressure retry)
-/// 2. Pull input from channel → feed InputHandle
-/// 3. Determine if there's work:
-///    - has_work = has_input OR notificator.has_ready()
-///    - If !has_work AND exhausted AND no pending notifications → Done
-///    - If !has_work → Idle
-/// 4. Run user logic with (InputHandle, OutputHandle, NotifyContext)
-/// 5. Push output to channel
-/// 6. Check completion
-/// ```
-///
-/// # Progress safety contract
-///
-/// When the user calls `ctx.notify_at(time)`, an output capability is created
-/// at `time`. This capability's existence in the progress tracker prevents
-/// downstream frontiers from advancing past `time`. When `ctx.next_notification()`
-/// returns `time`, the capability is dropped, allowing progress to flow.
-///
-/// The user MUST call `next_notification()` for every `notify_at()` — otherwise
-/// capabilities accumulate and downstream never makes progress. This is enforced
-/// by the notification firing mechanism: a notification only fires when the
-/// input frontier advances past the time, and `next_notification()` is the
-/// only way to consume it.
-pub struct WiredUnaryNotifyOperator<T: Timestamp, D1: Send + 'static, D2: Send + 'static> {
-    name: String,
-    index: usize,
-    stage_id: StageId,
-
-    /// Input channel — pulls envelopes from upstream.
-    input_puller: Box<dyn Pull<T, D1>>,
-    /// Operator's typed input buffer.
-    input_handle: InputHandle<T, D1>,
-
-    /// User logic closure — receives InputHandle, OutputHandle, AND NotifyContext.
-    /// The NotifyContext lets the user register notifications and consume them.
-    logic: Box<
-        dyn FnMut(
-                &mut InputHandle<T, D1>,
-                &mut OutputHandle<T, D2>,
-                &mut NotifyContext<'_, T>,
-            ) -> Result<()>
-            + Send,
-    >,
-
-    /// Operator's typed output buffer.
-    output_handle: OutputHandle<T, D2>,
-    /// Output channel — pushes envelopes downstream.
-    output_pusher: Box<dyn Push<T, D2>>,
-
-    /// Pending output envelopes (for backpressure retry).
-    pending_output: PendingOutput<T, D2>,
-
-    /// Notificator that tracks when input frontier advances past requested timestamps.
-    /// Updated by the executor via `update_input_frontier()` after progress propagation.
-    /// The executor calls `propagate_progress()` → computes new operator input frontier →
-    /// calls `operator.update_input_frontier(&frontier)` → notificator fires ready
-    /// notifications → executor re-enqueues operator if `has_ready_notifications()`.
+/// `ctx.notify_at(t)` holds an output capability at `t` and requests a
+/// notification once the input frontier passes `t`;
+/// `ctx.next_notification()` returns such a time and drops its capability.
+/// The logic is called when input is waiting or a notification is ready.
+pub(crate) struct NotifyLogic<T: Timestamp, D1: Send + 'static, D2: Send + 'static> {
+    logic: NotifyFn<T, D1, D2>,
+    /// Tracks when the input frontier passes requested times.
     notificator: Notificator<T>,
-
-    /// Progress reporter for this operator's output port (port 0).
-    /// Used by NotifyContext to create output capabilities.
-    /// Each Capability::new(time, reporter) increments a pointstamp count at
-    /// (operator_index, output_port=0, time) in the reachability tracker.
-    /// Each Capability::drop decrements it. The reachability tracker uses these
-    /// pointstamps to compute downstream frontiers — a pointstamp at time `t`
-    /// prevents downstream operators from advancing past `t`.
-    progress_reporter: ProgressReporter<T>,
-
-    /// Output capabilities held while data is buffered.
-    /// Created in NotifyContext::notify_at(), dropped in NotifyContext::next_notification().
-    /// Each capability prevents downstream frontier advancement at its timestamp.
-    /// If this vec is non-empty, downstream operators are "held back" at the
-    /// minimum time among the capabilities.
+    /// Output capabilities held for requested notifications.
     held_capabilities: Vec<Capability<T>>,
-
-    /// Whether the input channel is exhausted (sender closed + empty).
-    input_exhausted: bool,
-    /// Whether this operator has completed all work.
-    done: bool,
 }
 
-impl<T: Timestamp, D1: Send + 'static, D2: Send + 'static> WiredUnaryNotifyOperator<T, D1, D2> {
-    /// Create a new wired unary notify operator.
-    ///
-    /// # Arguments
-    ///
-    /// - `progress_reporter`: The [`ProgressReporter`] for this operator's output port.
-    ///   Obtained from `OperatorProgress::reporter(0)` during materialization.
-    ///   Used to create output capabilities that hold downstream frontiers.
-    ///
-    /// - `initial_frontier`: The initial input frontier at construction time.
-    ///   Typically `Antichain::from_elem(T::minimum())` for operators with
-    ///   connected input sources. The notificator uses this to determine which
-    ///   `notify_at` requests should fire immediately (for times already past
-    ///   the frontier).
-    #[allow(clippy::too_many_arguments)]
-    pub fn new(
-        name: impl Into<String>,
-        index: usize,
-        stage_id: StageId,
-        logic: impl FnMut(
-            &mut InputHandle<T, D1>,
-            &mut OutputHandle<T, D2>,
-            &mut NotifyContext<'_, T>,
-        ) -> Result<()>
-        + Send
-        + 'static,
-        input_puller: Box<dyn Pull<T, D1>>,
-        output_pusher: Box<dyn Push<T, D2>>,
-        progress_reporter: ProgressReporter<T>,
-        initial_frontier: Antichain<T>,
-    ) -> Self {
-        let name = name.into();
-        #[cfg_attr(
-            not(any(debug_assertions, feature = "progress-check")),
-            allow(unused_mut)
-        )]
-        let mut op = Self {
-            input_handle: InputHandle::new(format!("{name}:input")),
-            output_handle: OutputHandle::new(format!("{name}:output")),
-            notificator: Notificator::new(initial_frontier),
-            name,
-            index,
-            stage_id,
-            input_puller,
-            logic: Box::new(logic),
-            output_pusher,
-            pending_output: PendingOutput::new(),
-            progress_reporter,
-            held_capabilities: Vec::new(),
-            input_exhausted: false,
-            done: false,
-        };
-        #[cfg(any(debug_assertions, feature = "progress-check"))]
-        op.check_observe();
-        op
+impl<T: Timestamp, D1: Send + 'static, D2: Send + 'static> OperatorLogic
+    for NotifyLogic<T, D1, D2>
+{
+    type Inputs = CountedInput<T, D1>;
+    type Outputs = CountedOutput<T, D2>;
+    type Time = T;
+
+    fn wants_call(&self, input: &Self::Inputs) -> bool {
+        input.has_pending() || self.notificator.has_ready()
     }
 
-    /// Try to flush pending output envelopes to the output channel.
-    fn flush_pending_output(&mut self) -> Result<bool> {
-        while let Some(envelope) = self.pending_output.pop_front() {
-            match self.output_pusher.try_push(envelope) {
-                Ok(()) => {}
-                Err((Error::Backpressure, returned)) => {
-                    self.pending_output.push_front(returned);
-                    return Ok(false);
-                }
-                Err((e, _returned)) => return Err(e),
-            }
+    fn call(&mut self, input: &mut Self::Inputs, output: &mut Self::Outputs) -> Result<bool> {
+        // Times the operator holds at the start of this call: the available
+        // input batches and the capabilities it holds.
+        let activation_times: Antichain<T> = input
+            .handle()
+            .pending_times()
+            .chain(self.held_capabilities.iter().map(|cap| cap.time()))
+            .cloned()
+            .collect();
+        let reporter = output.reporter().clone();
+        let mut ctx = NotifyContext::new(
+            &mut self.notificator,
+            &reporter,
+            &mut self.held_capabilities,
+            activation_times,
+        );
+        (self.logic)(input.handle(), output.handle(), &mut ctx)?;
+        if let Some(error) = ctx.take_error() {
+            return Err(error);
         }
         Ok(true)
     }
 
-    /// Pull from input channel and feed the InputHandle.
-    fn pull_input(&mut self) {
-        loop {
-            match self.input_puller.pull() {
-                Some(envelope) => match envelope.payload {
-                    Payload::Data { time, data } => {
-                        self.input_handle.push_vec(time, data);
-                    }
-                    Payload::Control(_signal) => {
-                        // Control signals handled by progress subsystem.
-                    }
-                },
-                None => {
-                    if self.input_puller.is_exhausted() {
-                        self.input_exhausted = true;
-                        self.input_handle.mark_exhausted();
-                    }
-                    break;
-                }
-            }
-        }
-    }
-
-    /// Drain output handle and push to output channel.
-    fn push_output(&mut self) -> Result<bool> {
-        for (time, data) in self.output_handle.drain() {
-            self.pending_output.push_back(Envelope::data(time, data));
-        }
-        self.flush_pending_output()
-    }
-
-    /// Whether the notificator has any outstanding work (pending or ready).
-    ///
-    /// Used in the completion check: the operator cannot report Done while
-    /// the notificator has pending notifications (the frontier may not have
-    /// advanced far enough yet) or ready notifications (buffered data hasn't
-    /// been emitted yet).
-    fn notificator_has_work(&self) -> bool {
+    fn holds_work(&self) -> bool {
         self.notificator.has_ready()
             || self.notificator.pending_count() > 0
             || !self.held_capabilities.is_empty()
     }
-}
 
-impl<T: Timestamp, D1: Send + 'static, D2: Send + 'static> SchedulableOperator
-    for WiredUnaryNotifyOperator<T, D1, D2>
-{
-    fn activate(&mut self) -> Result<ActivationOutcome> {
-        if self.done {
-            return Ok(ActivationOutcome::Done);
-        }
-
-        // Step 1: Flush pending output from previous activation (backpressure retry).
-        if !self.pending_output.is_empty() && !self.flush_pending_output()? {
-            return Ok(ActivationOutcome::BlockedOnBackpressure);
-        }
-
-        // Step 2: Pull from input channel → feed InputHandle.
-        self.pull_input();
-
-        // Step 3: Determine if the operator has work to do.
-        //
-        // Key difference from regular WiredUnaryOperator: we also check if
-        // the notificator has ready notifications. This allows the operator
-        // to run user logic EVEN WHEN there is no new input data — the user
-        // closure processes ready notifications and emits buffered data.
-        let had_input = self.input_handle.has_pending();
-        let has_notifications = self.notificator.has_ready();
-
-        if !had_input && !has_notifications {
-            if self.input_exhausted && !self.notificator_has_work() {
-                // Input exhausted, no pending/ready notifications, no held
-                // capabilities — the operator is truly done.
-                self.output_pusher.close();
-                self.done = true;
-                return Ok(ActivationOutcome::Done);
-            }
-            // No work right now, but we might get more input or notifications
-            // in a future activation.
-            return Ok(ActivationOutcome::Idle);
-        }
-
-        // Step 4: Build NotifyContext and run user logic.
-        //
-        // The NotifyContext wraps the notificator + progress reporter +
-        // held capabilities, giving the user closure a safe interface to:
-        // - Register notifications via notify_at(time) [creates output capability]
-        // - Consume notifications via next_notification() [drops output capability]
-        {
-            // Times the operator holds at the start of this activation: the
-            // available input batches and the capabilities it holds. A
-            // notification at or after one of them is legitimate even if the
-            // frontier has already moved past it, including after
-            // `next_notification` dropped that capability in this activation
-            // (the drop and the new capability reach the tracker together).
-            let activation_times: Antichain<T> = self
-                .input_handle
-                .pending_times()
-                .chain(self.held_capabilities.iter().map(|cap| cap.time()))
-                .cloned()
-                .collect();
-            let mut ctx = NotifyContext::new(
-                &mut self.notificator,
-                &self.progress_reporter,
-                &mut self.held_capabilities,
-                activation_times,
-            );
-            (self.logic)(&mut self.input_handle, &mut self.output_handle, &mut ctx)?;
-            if let Some(error) = ctx.take_error() {
-                return Err(error);
-            }
-        }
-
-        // Step 5: Push output to channel.
-        if !self.push_output()? {
-            return Ok(ActivationOutcome::BlockedOnBackpressure);
-        }
-
-        // Step 6: Check completion.
-        //
-        // The operator is done only when ALL of these are true:
-        // - Input is exhausted (no more data from upstream)
-        // - No pending input batches in the InputHandle
-        // - No buffered output in the OutputHandle
-        // - No pending/ready notifications (all buffered data has been emitted)
-        // - No held output capabilities (all capabilities have been dropped)
-        //
-        // This is stricter than the regular unary operator, which only checks
-        // input exhaustion + empty handles. We must also wait for all
-        // notifications to fire and be consumed.
-        if self.input_exhausted
-            && !self.input_handle.has_pending()
-            && !self.output_handle.has_output()
-            && !self.notificator_has_work()
-        {
-            self.output_pusher.close();
-            self.done = true;
-            return Ok(ActivationOutcome::Done);
-        }
-
-        Ok(ActivationOutcome::MadeProgress)
-    }
-
-    fn is_done(&self) -> bool {
-        self.done
-    }
-
-    fn name(&self) -> &str {
-        &self.name
-    }
-
-    fn index(&self) -> usize {
-        self.index
-    }
-
-    fn stage_id(&self) -> StageId {
-        self.stage_id
-    }
-
-    fn close_inputs(&mut self) {
-        self.input_exhausted = true;
-        self.input_handle.mark_exhausted();
-
-        // When input is closed, advance the notificator frontier to empty.
-        // An empty frontier means "no more data at ANY timestamp can arrive."
-        // This fires ALL pending notifications immediately, because every
-        // pending timestamp is now past the (empty) frontier.
-        //
-        // This is critical for correctness: without this, pending notifications
-        // would never fire after input exhaustion, and the operator would hang
-        // with buffered data that is never emitted.
-        //
-        // The fired notifications will be consumed in the next activation,
-        // where the user closure calls next_notification() and emits the
-        // buffered data.
-        self.notificator.update_frontier(&Antichain::new());
-    }
-
-    /// Update the operator's input frontier from the progress tracker.
-    ///
-    /// Called by the executor after progress propagation when this operator's
-    /// input frontier changed. The frontier is passed as `&dyn Any` because
-    /// the `SchedulableOperator` trait is type-erased — the concrete type
-    /// is `Antichain<T>` which we downcast here.
-    ///
-    /// This update may cause the notificator to fire notifications for
-    /// timestamps that are now past the frontier. The executor will check
-    /// `has_ready_notifications()` after this call and re-enqueue the
-    /// operator if there are ready notifications.
-    fn update_input_frontier(&mut self, frontier: &dyn std::any::Any) {
-        if let Some(frontier) = frontier.downcast_ref::<Antichain<T>>() {
+    fn update_frontier(&mut self, meet: &dyn Any) {
+        if let Some(frontier) = meet.downcast_ref::<Antichain<T>>() {
             self.notificator.update_frontier(frontier);
         }
     }
 
-    /// Whether this operator has ready notifications that need processing.
-    ///
-    /// The executor calls this after progress propagation to decide whether
-    /// to re-enqueue the operator. Returns true if the notificator has
-    /// fired notifications that haven't been consumed by `next_notification()`.
     fn has_ready_notifications(&self) -> bool {
         self.notificator.has_ready()
     }
+
+    fn inputs_closed(&mut self) {
+        // No more input: every pending notification may fire.
+        self.notificator.update_frontier(&Antichain::new());
+    }
+}
+
+/// A notifying unary operator running `logic`, whose input frontier starts
+/// at `initial_frontier`.
+pub(crate) fn notify<T: Timestamp, D1: Send + 'static, D2: Send + 'static>(
+    name: impl Into<String>,
+    index: usize,
+    stage_id: StageId,
+    logic: impl FnMut(
+        &mut InputHandle<T, D1>,
+        &mut OutputHandle<T, D2>,
+        &mut NotifyContext<'_, T>,
+    ) -> Result<()>
+    + Send
+    + 'static,
+    input: CountedInput<T, D1>,
+    output: CountedOutput<T, D2>,
+    initial_frontier: Antichain<T>,
+) -> OperatorShell<NotifyLogic<T, D1, D2>> {
+    OperatorShell::new(
+        name,
+        index,
+        stage_id,
+        NotifyLogic {
+            logic: Box::new(logic),
+            notificator: Notificator::new(initial_frontier),
+            held_capabilities: Vec::new(),
+        },
+        input,
+        output,
+    )
 }
 
 // ---------------------------------------------------------------------------
-// WiredUnaryAsyncOperator
+// Async
 // ---------------------------------------------------------------------------
 
 /// Type alias for the async logic closure used by `unary_async`.
@@ -1788,80 +663,21 @@ impl<T: Timestamp, D1: Send + 'static, D2: Send + 'static> SchedulableOperator
 pub type AsyncLogicFn<T, D1, D2> =
     Arc<dyn Fn(T, Vec<D1>) -> Pin<Box<dyn Future<Output = Result<Vec<D2>>> + Send>> + Send + Sync>;
 
-/// A fully-wired async unary operator that spawns tokio tasks for batch processing.
-///
-/// Unlike the synchronous `WiredUnaryOperator`, this operator:
-/// 1. Spawns a tokio task for each input batch (bounded by `max_concurrency`)
-/// 2. Collects completed results via an internal mpsc channel
-/// 3. Pushes completed results to the output channel on each `activate()` call
-///
-/// This is ideal for operators that perform async I/O (database lookups, HTTP
-/// requests, RPC calls) where blocking the executor would waste scheduler time.
-///
-/// # Ordering
-///
-/// Output order is **not guaranteed** to match input order — results arrive in
-/// completion order. If strict ordering is required, the user should include
-/// sequence information in the data and sort downstream.
-///
-/// # Concurrency control
-///
-/// `max_concurrency` limits how many tokio tasks can be in-flight simultaneously.
-/// Input that exceeds the limit is buffered internally and dispatched as tasks
-/// complete.
-///
-/// # Limitations
-///
-/// - **Progress tracking**: This operator does not hold output capabilities while
-///   async tasks are in-flight. Downstream frontier advancement is not blocked by
-///   pending async work. For progress-sensitive use cases, use `unary_notify` with
-///   manual async coordination instead.
-/// - **Scheduling**: When tasks are in-flight but no results have arrived, the
-///   operator returns `MadeProgress` causing the executor to re-poll. Future work
-///   will integrate `WakeHandle` for proper wake-based scheduling.
-pub struct WiredUnaryAsyncOperator<T: Timestamp, D1: Send + 'static, D2: Send + 'static> {
+/// A unary operator that runs each input batch as a tokio task (at most
+/// `max_concurrency` at once) and emits results in completion order.
+pub(crate) struct AsyncLogic<T: Timestamp, D1: Send + 'static, D2: Send + 'static> {
     name: String,
-    index: usize,
-    stage_id: StageId,
-
-    /// Input channel — pulls envelopes from upstream.
-    input_puller: Box<dyn Pull<T, D1>>,
-    /// Operator's typed input buffer.
-    input_handle: InputHandle<T, D1>,
-
-    /// Async logic — shared across spawned tasks via Arc.
     logic: AsyncLogicFn<T, D1, D2>,
-
-    /// Maximum number of concurrent in-flight async tasks.
     max_concurrency: usize,
-    /// Current number of in-flight tasks.
+    /// Tasks spawned and not yet collected.
     in_flight: usize,
-
-    /// Sender for spawned tasks to return results.
     result_tx: tokio::sync::mpsc::UnboundedSender<Result<(T, Vec<D2>)>>,
-    /// Receiver for collecting completed task results.
     result_rx: tokio::sync::mpsc::UnboundedReceiver<Result<(T, Vec<D2>)>>,
-
-    /// Buffered input waiting for concurrency slots.
+    /// Consumed input waiting for a task slot.
     pending_input: VecDeque<(T, Vec<D1>)>,
-
-    /// Output channel — pushes envelopes downstream.
-    output_pusher: Box<dyn Push<T, D2>>,
-    /// Pending output: batches produced but not yet pushed to channel.
-    pending_output: PendingOutput<T, D2>,
-
-    /// Tokio runtime handle for spawning async tasks.
     tokio_handle: tokio::runtime::Handle,
-
-    /// Wake handle for notifying the executor when an async task completes.
-    /// When a spawned task finishes, it calls `wake_handle.notify()` so the
-    /// executor wakes up and re-activates this operator to collect the result.
+    /// Woken when a task completes, so the operator collects its result.
     wake_handle: Option<WakeHandle>,
-
-    /// Whether the input channel is exhausted.
-    input_exhausted: bool,
-    /// Whether this operator has completed.
-    done: bool,
     /// The progress checker's counts of `pending_input` (at the input) and
     /// of running or uncollected tasks (at the output, one unit per task).
     #[cfg(any(debug_assertions, feature = "progress-check"))]
@@ -1870,454 +686,183 @@ pub struct WiredUnaryAsyncOperator<T: Timestamp, D1: Send + 'static, D2: Send + 
     check_tasks: Option<crate::progress::check::StoreCheck<T>>,
 }
 
-impl<T: Timestamp, D1: Send + 'static, D2: Send + 'static> WiredUnaryAsyncOperator<T, D1, D2> {
-    /// Create a new wired async unary operator.
-    #[allow(clippy::too_many_arguments)]
-    pub fn new(
-        name: impl Into<String>,
-        index: usize,
-        stage_id: StageId,
-        logic: AsyncLogicFn<T, D1, D2>,
-        max_concurrency: usize,
-        input_puller: Box<dyn Pull<T, D1>>,
-        output_pusher: Box<dyn Push<T, D2>>,
-        tokio_handle: tokio::runtime::Handle,
-        wake_handle: Option<WakeHandle>,
-    ) -> Self {
-        let (result_tx, result_rx) = tokio::sync::mpsc::unbounded_channel();
-        let name = name.into();
-        #[cfg_attr(
-            not(any(debug_assertions, feature = "progress-check")),
-            allow(unused_mut)
-        )]
-        let mut op = Self {
-            input_handle: InputHandle::new(format!("{name}:input")),
-            name,
-            index,
-            stage_id,
-            input_puller,
-            logic,
-            max_concurrency: max_concurrency.max(1),
-            in_flight: 0,
-            result_tx,
-            result_rx,
-            pending_input: VecDeque::new(),
-            output_pusher,
-            pending_output: PendingOutput::new(),
-            tokio_handle,
-            wake_handle,
-            input_exhausted: false,
-            done: false,
-            #[cfg(any(debug_assertions, feature = "progress-check"))]
-            check_input: None,
-            #[cfg(any(debug_assertions, feature = "progress-check"))]
-            check_tasks: None,
-        };
-        #[cfg(any(debug_assertions, feature = "progress-check"))]
-        op.check_observe();
-        op
-    }
-
-    /// Try to flush pending output envelopes to the output channel.
-    fn flush_pending_output(&mut self) -> Result<bool> {
-        while let Some(envelope) = self.pending_output.pop_front() {
-            match self.output_pusher.try_push(envelope) {
-                Ok(()) => {}
-                Err((Error::Backpressure, returned)) => {
-                    self.pending_output.push_front(returned);
-                    return Ok(false);
-                }
-                Err((e, _returned)) => return Err(e),
-            }
-        }
-        Ok(true)
-    }
-
-    /// Pull from input channel and feed the InputHandle.
-    fn pull_input(&mut self) {
-        loop {
-            match self.input_puller.pull() {
-                Some(envelope) => match envelope.payload {
-                    Payload::Data { time, data } => {
-                        self.input_handle.push_vec(time, data);
-                    }
-                    Payload::Control(_signal) => {}
-                },
-                None => {
-                    if self.input_puller.is_exhausted() {
-                        self.input_exhausted = true;
-                        self.input_handle.mark_exhausted();
-                    }
-                    break;
-                }
-            }
-        }
-    }
-
-    /// Drain input handle into pending_input buffer.
-    fn drain_input_to_pending(&mut self) {
-        while let Some((time, data)) = self.input_handle.next() {
-            #[cfg(any(debug_assertions, feature = "progress-check"))]
-            if let Some(check) = &self.check_input {
-                check.add(&time, data.len());
-            }
-            self.pending_input.push_back((time, data));
-        }
-    }
-
+impl<T: Timestamp, D1: Send + 'static, D2: Send + 'static> AsyncLogic<T, D1, D2> {
     /// Spawn tasks for pending input up to the concurrency limit.
     fn spawn_pending(&mut self) {
         while self.in_flight < self.max_concurrency {
-            if let Some((time, data)) = self.pending_input.pop_front() {
-                #[cfg(any(debug_assertions, feature = "progress-check"))]
-                {
-                    if let Some(check) = &self.check_tasks {
-                        check.add(&time, 1);
-                    }
-                    if let Some(check) = &self.check_input {
-                        check.remove(&time, data.len());
-                    }
-                }
-                let logic = Arc::clone(&self.logic);
-                let tx = self.result_tx.clone();
-                let time_for_logic = time.clone();
-                let wake = self.wake_handle.clone();
-                let operator_name = self.name.clone();
-                // Use a nested spawn to catch panics: the outer task awaits the
-                // inner JoinHandle, which converts panics into JoinError.
-                let handle = self.tokio_handle.clone();
-                self.tokio_handle.spawn(async move {
-                    let inner = handle.spawn(async move { logic(time_for_logic, data).await });
-                    let result = match inner.await {
-                        Ok(Ok(output)) => Ok(output),
-                        Ok(Err(e)) => Err(e),
-                        Err(join_err) => Err(Error::OperatorPanic {
-                            operator: operator_name,
-                            worker_index: None,
-                            message: format!("unary_async task panicked: {join_err}"),
-                        }),
-                    };
-                    let _ = tx.send(result.map(|output| (time, output)));
-                    // Wake the executor so it re-activates this operator to
-                    // collect the completed result. Without this, the executor
-                    // would only discover the result on its next scheduled sweep.
-                    if let Some(w) = wake {
-                        w.notify();
-                    }
-                });
-                self.in_flight += 1;
-            } else {
+            let Some((time, data)) = self.pending_input.pop_front() else {
                 break;
+            };
+            #[cfg(any(debug_assertions, feature = "progress-check"))]
+            {
+                if let Some(check) = &self.check_tasks {
+                    check.add(&time, 1);
+                }
+                if let Some(check) = &self.check_input {
+                    check.remove(&time, data.len());
+                }
             }
+            let logic = Arc::clone(&self.logic);
+            let tx = self.result_tx.clone();
+            let time_for_logic = time.clone();
+            let wake = self.wake_handle.clone();
+            let operator_name = self.name.clone();
+            // A nested spawn turns a panic into a JoinError.
+            let handle = self.tokio_handle.clone();
+            self.tokio_handle.spawn(async move {
+                let inner = handle.spawn(async move { logic(time_for_logic, data).await });
+                let result = match inner.await {
+                    Ok(Ok(output)) => Ok(output),
+                    Ok(Err(e)) => Err(e),
+                    Err(join_err) => Err(Error::OperatorPanic {
+                        operator: operator_name,
+                        worker_index: None,
+                        message: format!("unary_async task panicked: {join_err}"),
+                    }),
+                };
+                let _ = tx.send(result.map(|output| (time, output)));
+                if let Some(w) = wake {
+                    w.notify();
+                }
+            });
+            self.in_flight += 1;
         }
     }
 
-    /// Drain completed results from the result channel into pending_output.
-    /// Returns true if any results were collected.
-    fn collect_results(&mut self) -> Result<bool> {
+    /// Collect completed results into the output session.
+    fn collect_results(&mut self, output: &mut OutputHandle<T, D2>) -> Result<bool> {
         let mut collected = false;
         loop {
             match self.result_rx.try_recv() {
                 Ok(Ok((time, data))) => {
                     self.in_flight -= 1;
                     #[cfg(any(debug_assertions, feature = "progress-check"))]
-                    let task_time = time.clone();
-                    if !data.is_empty() {
-                        self.pending_output.push_back(Envelope::data(time, data));
-                    }
-                    #[cfg(any(debug_assertions, feature = "progress-check"))]
                     if let Some(check) = &self.check_tasks {
-                        check.remove(&task_time, 1);
+                        check.remove(&time, 1);
                     }
+                    output.push_vec(time, data);
                     collected = true;
                 }
                 Ok(Err(e)) => {
                     self.in_flight -= 1;
                     return Err(e);
                 }
-                Err(tokio::sync::mpsc::error::TryRecvError::Empty) => break,
-                Err(tokio::sync::mpsc::error::TryRecvError::Disconnected) => break,
+                Err(tokio::sync::mpsc::error::TryRecvError::Empty)
+                | Err(tokio::sync::mpsc::error::TryRecvError::Disconnected) => break,
             }
         }
         Ok(collected)
     }
 }
 
-impl<T: Timestamp, D1: Send + 'static, D2: Send + 'static> SchedulableOperator
-    for WiredUnaryAsyncOperator<T, D1, D2>
-{
-    fn activate(&mut self) -> Result<ActivationOutcome> {
-        if self.done {
-            return Ok(ActivationOutcome::Done);
+impl<T: Timestamp, D1: Send + 'static, D2: Send + 'static> OperatorLogic for AsyncLogic<T, D1, D2> {
+    type Inputs = CountedInput<T, D1>;
+    type Outputs = CountedOutput<T, D2>;
+    type Time = T;
+
+    fn wants_call(&self, input: &Self::Inputs) -> bool {
+        input.has_pending() || !self.pending_input.is_empty() || self.in_flight > 0
+    }
+
+    fn call(&mut self, input: &mut Self::Inputs, output: &mut Self::Outputs) -> Result<bool> {
+        let collected = self.collect_results(output.handle())?;
+        let handle = input.handle();
+        let mut took = false;
+        while let Some((time, data)) = handle.next() {
+            #[cfg(any(debug_assertions, feature = "progress-check"))]
+            if let Some(check) = &self.check_input {
+                check.add(&time, data.len());
+            }
+            self.pending_input.push_back((time, data));
+            took = true;
         }
-
-        // Step 1: Try to flush any pending output first.
-        if !self.pending_output.is_empty() && !self.flush_pending_output()? {
-            return Ok(ActivationOutcome::BlockedOnBackpressure);
-        }
-
-        // Step 2: Collect completed async results.
-        let collected = self.collect_results()?;
-
-        // Step 3: Flush newly collected results.
-        if !self.pending_output.is_empty() && !self.flush_pending_output()? {
-            return Ok(ActivationOutcome::BlockedOnBackpressure);
-        }
-
-        // Step 4: Pull from input channel.
-        self.pull_input();
-        self.drain_input_to_pending();
-
-        // Step 5: Spawn tasks for pending input.
         self.spawn_pending();
-
-        // Step 6: Check completion conditions.
-        if self.input_exhausted
-            && self.pending_input.is_empty()
-            && self.in_flight == 0
-            && self.pending_output.is_empty()
-        {
-            self.output_pusher.close();
-            self.done = true;
-            return Ok(ActivationOutcome::Done);
-        }
-
-        // Step 7: Determine outcome.
-        // When in-flight tasks exist but no results were collected, we return
-        // WaitingForAsync instead of MadeProgress. The spawned tasks will call
-        // wake_handle.notify() when they complete, which wakes the executor to
-        // re-activate this operator. This avoids unnecessary busy-polling between
-        // task completions while preventing the executor from declaring quiescence.
-        if collected || !self.pending_input.is_empty() {
-            Ok(ActivationOutcome::MadeProgress)
-        } else if self.in_flight > 0 {
-            // Tasks are running but nothing to process right now.
-            // The wake handle will notify the executor when results arrive.
-            Ok(ActivationOutcome::WaitingForAsync)
-        } else {
-            Ok(ActivationOutcome::Idle)
-        }
+        Ok(collected || took)
     }
 
-    fn is_done(&self) -> bool {
-        self.done
+    fn holds_work(&self) -> bool {
+        !self.pending_input.is_empty() || self.in_flight > 0
     }
 
-    fn name(&self) -> &str {
-        &self.name
+    fn waiting_for_async(&self) -> bool {
+        self.in_flight > 0
     }
 
-    fn index(&self) -> usize {
-        self.index
-    }
-
-    fn stage_id(&self) -> StageId {
-        self.stage_id
-    }
-
-    fn close_inputs(&mut self) {
-        self.input_exhausted = true;
-        self.input_handle.mark_exhausted();
+    fn checks_justification(&self) -> bool {
+        false
     }
 }
 
-// ---------------------------------------------------------------------------
-// WiredBranchOperator
-// ---------------------------------------------------------------------------
-
-/// A fully-wired boolean branch operator (1 input, 2 outputs, same type).
-///
-/// Routes each input record to either port 0 (true) or port 1 (false) based
-/// on a boolean predicate. Each record is evaluated once and moved (not
-/// cloned) to exactly one output.
-///
-/// # Design rationale: boolean-only branching
-///
-/// This operator intentionally supports only boolean (2-way) branching.
-/// N-way routing (e.g., 3-way enum dispatch) can be composed from multiple
-/// binary branches:
-///
-/// ```text
-/// // 3-way split via two branches:
-/// let (ab, c) = input.branch(|_, x| x.kind != C);
-/// let (a, b)  = ab.branch(|_, x| x.kind == A);
-/// // a: kind==A, b: kind==B, c: kind==C
-/// ```
-///
-/// This keeps the core operator set minimal while supporting arbitrary
-/// N-way routing through composition.
-///
-/// # Branch vs Fork (future)
-///
-/// These are complementary multi-output patterns:
-///
-/// - **Branch** (`WiredBranchOperator`): each record goes to **exactly one**
-///   of 2 output ports. No cloning. The predicate decides which port. Use
-///   for conditional splitting (if/else, Result routing).
-///
-/// - **Fork** (future `WiredForkOperator`): each record is **cloned to all**
-///   output ports. Every downstream consumer sees every record. Use for
-///   broadcasting/tapping (logging, metrics, multi-consumer fan-out).
-///
-/// In short: branch = selective routing (1-of-2), fork = broadcast (all-of-N).
-pub struct WiredBranchOperator<T: Timestamp, D: Send + 'static> {
-    name: String,
+/// A `unary_async` operator.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn unary_async<T: Timestamp, D1: Send + 'static, D2: Send + 'static>(
+    name: impl Into<String>,
     index: usize,
     stage_id: StageId,
-    input_puller: Box<dyn Pull<T, D>>,
-    input_handle: InputHandle<T, D>,
-    predicate: Box<dyn FnMut(&T, &D) -> bool + Send>,
-    output_true: OutputHandle<T, D>,
-    output_false: OutputHandle<T, D>,
-    true_pusher: Box<dyn Push<T, D>>,
-    false_pusher: Box<dyn Push<T, D>>,
-    pending_true: PendingOutput<T, D>,
-    pending_false: PendingOutput<T, D>,
-    input_exhausted: bool,
-    done: bool,
-}
-
-impl<T: Timestamp, D: Send + 'static> WiredBranchOperator<T, D> {
-    /// Create a new wired branch operator.
-    pub fn new(
-        name: impl Into<String>,
-        index: usize,
-        stage_id: StageId,
-        predicate: impl FnMut(&T, &D) -> bool + Send + 'static,
-        input_puller: Box<dyn Pull<T, D>>,
-        true_pusher: Box<dyn Push<T, D>>,
-        false_pusher: Box<dyn Push<T, D>>,
-    ) -> Self {
-        let name = name.into();
-        #[cfg_attr(
-            not(any(debug_assertions, feature = "progress-check")),
-            allow(unused_mut)
-        )]
-        let mut op = Self {
-            input_handle: InputHandle::new(format!("{name}:input")),
-            output_true: OutputHandle::new(format!("{name}:true")),
-            output_false: OutputHandle::new(format!("{name}:false")),
+    logic: AsyncLogicFn<T, D1, D2>,
+    max_concurrency: usize,
+    input: CountedInput<T, D1>,
+    output: CountedOutput<T, D2>,
+    tokio_handle: tokio::runtime::Handle,
+) -> OperatorShell<AsyncLogic<T, D1, D2>> {
+    let name = name.into();
+    let (result_tx, result_rx) = tokio::sync::mpsc::unbounded_channel();
+    #[cfg(any(debug_assertions, feature = "progress-check"))]
+    let check_input = input.check_port().map(|port| {
+        crate::progress::check::StoreCheck::new(port, crate::progress::check::Store::AsyncInput)
+    });
+    #[cfg(any(debug_assertions, feature = "progress-check"))]
+    let check_tasks = output.check_port().map(|port| {
+        crate::progress::check::StoreCheck::new(port, crate::progress::check::Store::AsyncTask)
+    });
+    let wake_handle = output.wake_handle().cloned();
+    OperatorShell::new(
+        name.clone(),
+        index,
+        stage_id,
+        AsyncLogic {
             name,
-            index,
-            stage_id,
-            input_puller,
-            predicate: Box::new(predicate),
-            true_pusher,
-            false_pusher,
-            pending_true: PendingOutput::new(),
-            pending_false: PendingOutput::new(),
-            input_exhausted: false,
-            done: false,
-        };
-        #[cfg(any(debug_assertions, feature = "progress-check"))]
-        op.check_observe();
-        op
-    }
-
-    /// Flush both per-port pending queues independently.
-    ///
-    /// Each port is flushed regardless of whether the other port hit
-    /// backpressure — this prevents a blocked port from starving
-    /// delivery on the other port.
-    fn flush_pending(&mut self) -> Result<bool> {
-        let mut all_flushed = true;
-        // Flush true output.
-        while let Some(envelope) = self.pending_true.pop_front() {
-            match self.true_pusher.try_push(envelope) {
-                Ok(()) => {}
-                Err((Error::Backpressure, returned)) => {
-                    self.pending_true.push_front(returned);
-                    all_flushed = false;
-                    break;
-                }
-                Err((e, _)) => return Err(e),
-            }
-        }
-        // Flush false output independently — don't let port 0 backpressure
-        // starve port 1 delivery.
-        while let Some(envelope) = self.pending_false.pop_front() {
-            match self.false_pusher.try_push(envelope) {
-                Ok(()) => {}
-                Err((Error::Backpressure, returned)) => {
-                    self.pending_false.push_front(returned);
-                    all_flushed = false;
-                    break;
-                }
-                Err((e, _)) => return Err(e),
-            }
-        }
-        Ok(all_flushed)
-    }
-
-    fn pull_input(&mut self) {
-        loop {
-            match self.input_puller.pull() {
-                Some(envelope) => match envelope.payload {
-                    Payload::Data { time, data } => {
-                        self.input_handle.push_vec(time, data);
-                    }
-                    Payload::Control(_) => {}
-                },
-                None => {
-                    if self.input_puller.is_exhausted() {
-                        self.input_exhausted = true;
-                        self.input_handle.mark_exhausted();
-                    }
-                    break;
-                }
-            }
-        }
-    }
-
-    fn push_outputs(&mut self) -> Result<bool> {
-        for (time, data) in self.output_true.drain() {
-            self.pending_true.push_back(Envelope::data(time, data));
-        }
-        for (time, data) in self.output_false.drain() {
-            self.pending_false.push_back(Envelope::data(time, data));
-        }
-        self.flush_pending()
-    }
-
-    fn has_pending(&self) -> bool {
-        !self.pending_true.is_empty() || !self.pending_false.is_empty()
-    }
-
-    fn close_outputs(&mut self) {
-        self.true_pusher.close();
-        self.false_pusher.close();
-    }
+            logic,
+            max_concurrency: max_concurrency.max(1),
+            in_flight: 0,
+            result_tx,
+            result_rx,
+            pending_input: VecDeque::new(),
+            tokio_handle,
+            wake_handle,
+            #[cfg(any(debug_assertions, feature = "progress-check"))]
+            check_input,
+            #[cfg(any(debug_assertions, feature = "progress-check"))]
+            check_tasks,
+        },
+        input,
+        output,
+    )
 }
 
-impl<T: Timestamp, D: Send + 'static> SchedulableOperator for WiredBranchOperator<T, D> {
-    fn activate(&mut self) -> Result<ActivationOutcome> {
-        if self.done {
-            return Ok(ActivationOutcome::Done);
-        }
+// ---------------------------------------------------------------------------
+// Branch, fork, ok/err: one input, two outputs
+// ---------------------------------------------------------------------------
 
-        // Step 1: Flush pending output.
-        if self.has_pending() && !self.flush_pending()? {
-            return Ok(ActivationOutcome::BlockedOnBackpressure);
-        }
+/// Routes each record to output 0 (predicate true) or output 1 (false).
+///
+/// N-way routing composes from several branches. Each record is moved, not
+/// cloned (compare [`ForkLogic`]).
+pub(crate) struct BranchLogic<T: Timestamp, D: Send + 'static> {
+    predicate: Box<dyn FnMut(&T, &D) -> bool + Send>,
+}
 
-        // Step 2: Pull input.
-        self.pull_input();
+impl<T: Timestamp, D: Send + 'static> OperatorLogic for BranchLogic<T, D> {
+    type Inputs = CountedInput<T, D>;
+    type Outputs = (CountedOutput<T, D>, CountedOutput<T, D>);
+    type Time = T;
 
-        // Step 3: Check for work.
-        let had_input = self.input_handle.has_pending();
-        if !had_input && self.input_exhausted {
-            self.close_outputs();
-            self.done = true;
-            return Ok(ActivationOutcome::Done);
-        }
-        if !had_input {
-            return Ok(ActivationOutcome::Idle);
-        }
-
-        // Step 4: Split input by predicate.
-        while let Some((time, data)) = self.input_handle.next() {
-            let mut true_session = self.output_true.session(time.clone());
-            let mut false_session = self.output_false.session(time);
+    fn call(&mut self, input: &mut Self::Inputs, outputs: &mut Self::Outputs) -> Result<bool> {
+        let (yes, no) = outputs;
+        let mut did = false;
+        while let Some((time, data)) = input.handle().next() {
+            let mut true_session = yes.handle().session(time.clone());
+            let mut false_session = no.handle().session(time);
             for item in data {
                 if (self.predicate)(true_session.time(), &item) {
                     true_session.give(item);
@@ -2325,614 +870,131 @@ impl<T: Timestamp, D: Send + 'static> SchedulableOperator for WiredBranchOperato
                     false_session.give(item);
                 }
             }
+            did = true;
         }
-
-        // Step 5: Push outputs.
-        if !self.push_outputs()? {
-            return Ok(ActivationOutcome::BlockedOnBackpressure);
-        }
-
-        // Step 6: Check completion.
-        if self.input_exhausted
-            && !self.input_handle.has_pending()
-            && !self.output_true.has_output()
-            && !self.output_false.has_output()
-        {
-            self.close_outputs();
-            self.done = true;
-            return Ok(ActivationOutcome::Done);
-        }
-
-        Ok(ActivationOutcome::MadeProgress)
-    }
-
-    fn is_done(&self) -> bool {
-        self.done
-    }
-
-    fn name(&self) -> &str {
-        &self.name
-    }
-
-    fn index(&self) -> usize {
-        self.index
-    }
-
-    fn stage_id(&self) -> StageId {
-        self.stage_id
-    }
-
-    fn close_inputs(&mut self) {
-        self.input_exhausted = true;
-        self.input_handle.mark_exhausted();
+        Ok(did)
     }
 }
 
-// ---------------------------------------------------------------------------
-// WiredForkOperator
-// ---------------------------------------------------------------------------
-
-/// A fully-wired fork operator (1 input, 2 outputs, same type, clone-to-both).
-///
-/// Clones each input record and sends one copy to port 0 and one to port 1.
-/// Every downstream consumer sees every record. `D` must implement `Clone`.
-///
-/// # Fork vs Branch
-///
-/// These are complementary 1→2 multi-output operators:
-///
-/// - **Fork** (`WiredForkOperator`): each record is **cloned to both** output
-///   ports. Every downstream sees every record. Use for broadcasting, tapping,
-///   logging, metrics, or multi-consumer fan-out within a dataflow.
-///
-/// - **Branch** (`WiredBranchOperator`): each record goes to **exactly one**
-///   of 2 output ports based on a predicate. No cloning. Use for conditional
-///   splitting (if/else, Result routing).
-///
-/// In short: fork = broadcast (both), branch = selective routing (one-of-two).
-///
-/// Both are 1→2 operators that can be composed to achieve 1→N:
-/// - Fork chain: `fork → fork` on one side gives 3 copies, etc.
-/// - Branch chain: `branch → branch` on one side gives 3-way routing.
-///
-/// # Relationship to `broadcast`
-///
-/// `broadcast` is a **network-level** operator that sends copies to all
-/// **workers** (cross-process). Fork is a **dataflow-level** operator that
-/// duplicates data within a single worker's graph to two downstream operators.
-pub struct WiredForkOperator<T: Timestamp, D: Clone + Send + 'static> {
-    name: String,
+/// A branch by `predicate`.
+pub(crate) fn branch<T: Timestamp, D: Send + 'static>(
+    name: impl Into<String>,
     index: usize,
     stage_id: StageId,
-    input_puller: Box<dyn Pull<T, D>>,
-    input_handle: InputHandle<T, D>,
-    output_left: OutputHandle<T, D>,
-    output_right: OutputHandle<T, D>,
-    left_pusher: Box<dyn Push<T, D>>,
-    right_pusher: Box<dyn Push<T, D>>,
-    pending_left: PendingOutput<T, D>,
-    pending_right: PendingOutput<T, D>,
-    input_exhausted: bool,
-    done: bool,
+    predicate: impl FnMut(&T, &D) -> bool + Send + 'static,
+    input: CountedInput<T, D>,
+    true_output: CountedOutput<T, D>,
+    false_output: CountedOutput<T, D>,
+) -> OperatorShell<BranchLogic<T, D>> {
+    OperatorShell::new(
+        name,
+        index,
+        stage_id,
+        BranchLogic {
+            predicate: Box::new(predicate),
+        },
+        input,
+        (true_output, false_output),
+    )
 }
 
-impl<T: Timestamp, D: Clone + Send + 'static> WiredForkOperator<T, D> {
-    /// Create a new wired fork operator.
-    pub fn new(
-        name: impl Into<String>,
-        index: usize,
-        stage_id: StageId,
-        input_puller: Box<dyn Pull<T, D>>,
-        left_pusher: Box<dyn Push<T, D>>,
-        right_pusher: Box<dyn Push<T, D>>,
-    ) -> Self {
-        let name = name.into();
-        #[cfg_attr(
-            not(any(debug_assertions, feature = "progress-check")),
-            allow(unused_mut)
-        )]
-        let mut op = Self {
-            input_handle: InputHandle::new(format!("{name}:input")),
-            output_left: OutputHandle::new(format!("{name}:left")),
-            output_right: OutputHandle::new(format!("{name}:right")),
-            name,
-            index,
-            stage_id,
-            input_puller,
-            left_pusher,
-            right_pusher,
-            pending_left: PendingOutput::new(),
-            pending_right: PendingOutput::new(),
-            input_exhausted: false,
-            done: false,
-        };
-        #[cfg(any(debug_assertions, feature = "progress-check"))]
-        op.check_observe();
-        op
-    }
+/// Clones every record to both outputs.
+pub(crate) struct ForkLogic<T: Timestamp, D: Clone + Send + 'static> {
+    _marker: std::marker::PhantomData<fn(T, D)>,
+}
 
-    /// Flush both per-port pending queues independently.
-    fn flush_pending(&mut self) -> Result<bool> {
-        let mut all_flushed = true;
-        while let Some(envelope) = self.pending_left.pop_front() {
-            match self.left_pusher.try_push(envelope) {
-                Ok(()) => {}
-                Err((Error::Backpressure, returned)) => {
-                    self.pending_left.push_front(returned);
-                    all_flushed = false;
-                    break;
-                }
-                Err((e, _)) => return Err(e),
-            }
-        }
-        // Flush right independently — don't let left backpressure starve right.
-        while let Some(envelope) = self.pending_right.pop_front() {
-            match self.right_pusher.try_push(envelope) {
-                Ok(()) => {}
-                Err((Error::Backpressure, returned)) => {
-                    self.pending_right.push_front(returned);
-                    all_flushed = false;
-                    break;
-                }
-                Err((e, _)) => return Err(e),
-            }
-        }
-        Ok(all_flushed)
-    }
+impl<T: Timestamp, D: Clone + Send + 'static> OperatorLogic for ForkLogic<T, D> {
+    type Inputs = CountedInput<T, D>;
+    type Outputs = (CountedOutput<T, D>, CountedOutput<T, D>);
+    type Time = T;
 
-    fn pull_input(&mut self) {
-        loop {
-            match self.input_puller.pull() {
-                Some(envelope) => match envelope.payload {
-                    Payload::Data { time, data } => {
-                        self.input_handle.push_vec(time, data);
-                    }
-                    Payload::Control(_) => {}
-                },
-                None => {
-                    if self.input_puller.is_exhausted() {
-                        self.input_exhausted = true;
-                        self.input_handle.mark_exhausted();
-                    }
-                    break;
-                }
-            }
+    fn call(&mut self, input: &mut Self::Inputs, outputs: &mut Self::Outputs) -> Result<bool> {
+        let (left, right) = outputs;
+        let mut did = false;
+        while let Some((time, data)) = input.handle().next() {
+            left.handle().push_vec(time.clone(), data.clone());
+            right.handle().push_vec(time, data);
+            did = true;
         }
-    }
-
-    fn push_outputs(&mut self) -> Result<bool> {
-        for (time, data) in self.output_left.drain() {
-            self.pending_left.push_back(Envelope::data(time, data));
-        }
-        for (time, data) in self.output_right.drain() {
-            self.pending_right.push_back(Envelope::data(time, data));
-        }
-        self.flush_pending()
-    }
-
-    fn has_pending(&self) -> bool {
-        !self.pending_left.is_empty() || !self.pending_right.is_empty()
-    }
-
-    fn close_outputs(&mut self) {
-        self.left_pusher.close();
-        self.right_pusher.close();
+        Ok(did)
     }
 }
 
-impl<T: Timestamp, D: Clone + Send + 'static> SchedulableOperator for WiredForkOperator<T, D> {
-    fn activate(&mut self) -> Result<ActivationOutcome> {
-        if self.done {
-            return Ok(ActivationOutcome::Done);
-        }
-
-        if self.has_pending() && !self.flush_pending()? {
-            return Ok(ActivationOutcome::BlockedOnBackpressure);
-        }
-
-        self.pull_input();
-
-        let had_input = self.input_handle.has_pending();
-        if !had_input && self.input_exhausted {
-            self.close_outputs();
-            self.done = true;
-            return Ok(ActivationOutcome::Done);
-        }
-        if !had_input {
-            return Ok(ActivationOutcome::Idle);
-        }
-
-        // Clone each record to both output ports.
-        while let Some((time, data)) = self.input_handle.next() {
-            let mut left_session = self.output_left.session(time.clone());
-            let mut right_session = self.output_right.session(time);
-            for item in data {
-                left_session.give(item.clone());
-                right_session.give(item);
-            }
-        }
-
-        if !self.push_outputs()? {
-            return Ok(ActivationOutcome::BlockedOnBackpressure);
-        }
-
-        if self.input_exhausted
-            && !self.input_handle.has_pending()
-            && !self.output_left.has_output()
-            && !self.output_right.has_output()
-        {
-            self.close_outputs();
-            self.done = true;
-            return Ok(ActivationOutcome::Done);
-        }
-
-        Ok(ActivationOutcome::MadeProgress)
-    }
-
-    fn is_done(&self) -> bool {
-        self.done
-    }
-
-    fn name(&self) -> &str {
-        &self.name
-    }
-
-    fn index(&self) -> usize {
-        self.index
-    }
-
-    fn stage_id(&self) -> StageId {
-        self.stage_id
-    }
-
-    fn close_inputs(&mut self) {
-        self.input_exhausted = true;
-        self.input_handle.mark_exhausted();
-    }
+/// A fork.
+pub(crate) fn fork<T: Timestamp, D: Clone + Send + 'static>(
+    name: impl Into<String>,
+    index: usize,
+    stage_id: StageId,
+    input: CountedInput<T, D>,
+    left: CountedOutput<T, D>,
+    right: CountedOutput<T, D>,
+) -> OperatorShell<ForkLogic<T, D>> {
+    OperatorShell::new(
+        name,
+        index,
+        stage_id,
+        ForkLogic {
+            _marker: std::marker::PhantomData,
+        },
+        input,
+        (left, right),
+    )
 }
 
-// ---------------------------------------------------------------------------
-// WiredOkErrOperator
-// ---------------------------------------------------------------------------
-
-/// A fully-wired ok/err splitter with one input and two typed outputs.
-///
-/// Applies a splitter function to each input record, routing `Ok(v)` to
-/// port 0 and `Err(e)` to port 1. The two output ports may carry different
-/// types.
-pub struct WiredOkErrOperator<T: Timestamp, D: Send + 'static, O: Send + 'static, E: Send + 'static>
+/// Applies a splitter to each record: `Ok(v)` goes to output 0, `Err(e)` to
+/// output 1.
+pub(crate) struct OkErrLogic<T: Timestamp, D: Send + 'static, O: Send + 'static, E: Send + 'static>
 {
-    name: String,
-    index: usize,
-    stage_id: StageId,
-    input_puller: Box<dyn Pull<T, D>>,
-    input_handle: InputHandle<T, D>,
     splitter: Box<dyn FnMut(D) -> std::result::Result<O, E> + Send>,
-    output_ok: OutputHandle<T, O>,
-    output_err: OutputHandle<T, E>,
-    ok_pusher: Box<dyn Push<T, O>>,
-    err_pusher: Box<dyn Push<T, E>>,
-    pending_ok: PendingOutput<T, O>,
-    pending_err: PendingOutput<T, E>,
-    input_exhausted: bool,
-    done: bool,
+    _marker: std::marker::PhantomData<fn(T)>,
 }
 
-impl<T: Timestamp, D: Send + 'static, O: Send + 'static, E: Send + 'static>
-    WiredOkErrOperator<T, D, O, E>
+impl<T: Timestamp, D: Send + 'static, O: Send + 'static, E: Send + 'static> OperatorLogic
+    for OkErrLogic<T, D, O, E>
 {
-    /// Create a new wired ok/err operator.
-    pub fn new(
-        name: impl Into<String>,
-        index: usize,
-        stage_id: StageId,
-        splitter: impl FnMut(D) -> std::result::Result<O, E> + Send + 'static,
-        input_puller: Box<dyn Pull<T, D>>,
-        ok_pusher: Box<dyn Push<T, O>>,
-        err_pusher: Box<dyn Push<T, E>>,
-    ) -> Self {
-        let name = name.into();
-        #[cfg_attr(
-            not(any(debug_assertions, feature = "progress-check")),
-            allow(unused_mut)
-        )]
-        let mut op = Self {
-            input_handle: InputHandle::new(format!("{name}:input")),
-            output_ok: OutputHandle::new(format!("{name}:ok")),
-            output_err: OutputHandle::new(format!("{name}:err")),
-            name,
-            index,
-            stage_id,
-            input_puller,
-            splitter: Box::new(splitter),
-            ok_pusher,
-            err_pusher,
-            pending_ok: PendingOutput::new(),
-            pending_err: PendingOutput::new(),
-            input_exhausted: false,
-            done: false,
-        };
-        #[cfg(any(debug_assertions, feature = "progress-check"))]
-        op.check_observe();
-        op
-    }
+    type Inputs = CountedInput<T, D>;
+    type Outputs = (CountedOutput<T, O>, CountedOutput<T, E>);
+    type Time = T;
 
-    fn flush_pending(&mut self) -> Result<bool> {
-        let mut all_flushed = true;
-        while let Some(envelope) = self.pending_ok.pop_front() {
-            match self.ok_pusher.try_push(envelope) {
-                Ok(()) => {}
-                Err((Error::Backpressure, returned)) => {
-                    self.pending_ok.push_front(returned);
-                    all_flushed = false;
-                    break;
-                }
-                Err((e, _)) => return Err(e),
-            }
-        }
-        // Flush err output independently — don't let ok backpressure
-        // starve err delivery.
-        while let Some(envelope) = self.pending_err.pop_front() {
-            match self.err_pusher.try_push(envelope) {
-                Ok(()) => {}
-                Err((Error::Backpressure, returned)) => {
-                    self.pending_err.push_front(returned);
-                    all_flushed = false;
-                    break;
-                }
-                Err((e, _)) => return Err(e),
-            }
-        }
-        Ok(all_flushed)
-    }
-
-    fn pull_input(&mut self) {
-        loop {
-            match self.input_puller.pull() {
-                Some(envelope) => match envelope.payload {
-                    Payload::Data { time, data } => {
-                        self.input_handle.push_vec(time, data);
-                    }
-                    Payload::Control(_) => {}
-                },
-                None => {
-                    if self.input_puller.is_exhausted() {
-                        self.input_exhausted = true;
-                        self.input_handle.mark_exhausted();
-                    }
-                    break;
-                }
-            }
-        }
-    }
-
-    fn push_outputs(&mut self) -> Result<bool> {
-        for (time, data) in self.output_ok.drain() {
-            self.pending_ok.push_back(Envelope::data(time, data));
-        }
-        for (time, data) in self.output_err.drain() {
-            self.pending_err.push_back(Envelope::data(time, data));
-        }
-        self.flush_pending()
-    }
-
-    fn has_pending(&self) -> bool {
-        !self.pending_ok.is_empty() || !self.pending_err.is_empty()
-    }
-
-    fn close_outputs(&mut self) {
-        self.ok_pusher.close();
-        self.err_pusher.close();
-    }
-}
-
-impl<T: Timestamp, D: Send + 'static, O: Send + 'static, E: Send + 'static> SchedulableOperator
-    for WiredOkErrOperator<T, D, O, E>
-{
-    fn activate(&mut self) -> Result<ActivationOutcome> {
-        if self.done {
-            return Ok(ActivationOutcome::Done);
-        }
-
-        if self.has_pending() && !self.flush_pending()? {
-            return Ok(ActivationOutcome::BlockedOnBackpressure);
-        }
-
-        self.pull_input();
-
-        let had_input = self.input_handle.has_pending();
-        if !had_input && self.input_exhausted {
-            self.close_outputs();
-            self.done = true;
-            return Ok(ActivationOutcome::Done);
-        }
-        if !had_input {
-            return Ok(ActivationOutcome::Idle);
-        }
-
-        while let Some((time, data)) = self.input_handle.next() {
-            let mut ok_session = self.output_ok.session(time.clone());
-            let mut err_session = self.output_err.session(time);
+    fn call(&mut self, input: &mut Self::Inputs, outputs: &mut Self::Outputs) -> Result<bool> {
+        let (ok, err) = outputs;
+        let mut did = false;
+        while let Some((time, data)) = input.handle().next() {
+            let mut ok_session = ok.handle().session(time.clone());
+            let mut err_session = err.handle().session(time);
             for item in data {
                 match (self.splitter)(item) {
-                    Ok(val) => ok_session.give(val),
-                    Err(val) => err_session.give(val),
+                    Ok(v) => ok_session.give(v),
+                    Err(e) => err_session.give(e),
                 }
             }
+            did = true;
         }
-
-        if !self.push_outputs()? {
-            return Ok(ActivationOutcome::BlockedOnBackpressure);
-        }
-
-        if self.input_exhausted
-            && !self.input_handle.has_pending()
-            && !self.output_ok.has_output()
-            && !self.output_err.has_output()
-        {
-            self.close_outputs();
-            self.done = true;
-            return Ok(ActivationOutcome::Done);
-        }
-
-        Ok(ActivationOutcome::MadeProgress)
-    }
-
-    fn is_done(&self) -> bool {
-        self.done
-    }
-
-    fn name(&self) -> &str {
-        &self.name
-    }
-
-    fn index(&self) -> usize {
-        self.index
-    }
-
-    fn stage_id(&self) -> StageId {
-        self.stage_id
-    }
-
-    fn close_inputs(&mut self) {
-        self.input_exhausted = true;
-        self.input_handle.mark_exhausted();
+        Ok(did)
     }
 }
 
-// ---------------------------------------------------------------------------
-// Progress checker: where each operator's stores are observed
-// ---------------------------------------------------------------------------
-
-/// Connects each operator's stores (input buffers, output retry queues,
-/// async queues, source data) to the progress checker's oracle, through the
-/// checker ports of the channel endpoints the operator was built with.
-/// Called by every constructor.
-#[cfg(any(debug_assertions, feature = "progress-check"))]
-mod check_observe {
-    use super::*;
-    use crate::progress::check::{Store, StoreCheck};
-
-    impl<T: Timestamp, D1: Send + 'static, D2: Send + 'static> WiredUnaryOperator<T, D1, D2> {
-        pub(super) fn check_observe(&mut self) {
-            self.input_handle.observe(&*self.input_puller);
-            self.pending_output.observe(&*self.output_pusher);
-        }
-    }
-
-    impl<T: Timestamp, D: Send + 'static> WiredSourceOperator<T, D> {
-        pub(super) fn check_observe(&mut self) {
-            self.pending_output.observe(&*self.output_pusher);
-            self.check_data = self
-                .output_pusher
-                .check_port()
-                .map(|port| StoreCheck::new(port, Store::PendingOutput));
-            if let Some(check) = &self.check_data {
-                for (time, data) in &self.pending_data {
-                    check.add(time, data.len());
-                }
-            }
-            if let Some(reporter) = &self.progress_reporter {
-                reporter.check_hold(&T::minimum(), 1);
-            }
-        }
-    }
-
-    impl<T: Timestamp, D: Send + 'static> WiredSinkOperator<T, D> {
-        pub(super) fn check_observe(&mut self) {}
-    }
-
-    impl<T: Timestamp, D1: Send + 'static, D2: Send + 'static, D3: Send + 'static>
-        WiredBinaryOperator<T, D1, D2, D3>
-    {
-        pub(super) fn check_observe(&mut self) {
-            self.input1_handle.observe(&*self.input1_puller);
-            self.input2_handle.observe(&*self.input2_puller);
-            self.pending_output.observe(&*self.output_pusher);
-        }
-    }
-
-    impl<T: Timestamp, D: Send + 'static> WiredConcatOperator<T, D> {
-        pub(super) fn check_observe(&mut self) {
-            self.pending_output.observe(&*self.output_pusher);
-        }
-    }
-
-    impl<TOuter: Timestamp, TInner: Timestamp, D: Send + 'static> WiredEnterOperator<TOuter, TInner, D>
-    where
-        crate::order::Product<TOuter, TInner>: Timestamp,
-    {
-        pub(super) fn check_observe(&mut self) {
-            self.pending_output.observe(&*self.output_pusher);
-        }
-    }
-
-    impl<TOuter: Timestamp, TInner: Timestamp, D: Send + 'static> WiredLeaveOperator<TOuter, TInner, D>
-    where
-        crate::order::Product<TOuter, TInner>: Timestamp,
-    {
-        pub(super) fn check_observe(&mut self) {
-            self.pending_output.observe(&*self.output_pusher);
-        }
-    }
-
-    impl<TOuter: Timestamp, TInner: Timestamp, D: Send + 'static>
-        WiredFeedbackOperator<TOuter, TInner, D>
-    where
-        crate::order::Product<TOuter, TInner>: Timestamp,
-    {
-        pub(super) fn check_observe(&mut self) {
-            self.pending_output.observe(&*self.output_pusher);
-        }
-    }
-
-    impl<T: Timestamp, D1: Send + 'static, D2: Send + 'static> WiredUnaryNotifyOperator<T, D1, D2> {
-        pub(super) fn check_observe(&mut self) {
-            self.input_handle.observe(&*self.input_puller);
-            self.pending_output.observe(&*self.output_pusher);
-        }
-    }
-
-    impl<T: Timestamp, D1: Send + 'static, D2: Send + 'static> WiredUnaryAsyncOperator<T, D1, D2> {
-        pub(super) fn check_observe(&mut self) {
-            self.input_handle.observe(&*self.input_puller);
-            self.pending_output.observe(&*self.output_pusher);
-            self.check_input = self
-                .input_puller
-                .check_port()
-                .map(|port| StoreCheck::new(port, Store::AsyncInput));
-            self.check_tasks = self
-                .output_pusher
-                .check_port()
-                .map(|port| StoreCheck::new(port, Store::AsyncTask));
-        }
-    }
-
-    impl<T: Timestamp, D: Send + 'static> WiredBranchOperator<T, D> {
-        pub(super) fn check_observe(&mut self) {
-            self.input_handle.observe(&*self.input_puller);
-            self.pending_true.observe(&*self.true_pusher);
-            self.pending_false.observe(&*self.false_pusher);
-        }
-    }
-
-    impl<T: Timestamp, D: Clone + Send + 'static> WiredForkOperator<T, D> {
-        pub(super) fn check_observe(&mut self) {
-            self.input_handle.observe(&*self.input_puller);
-            self.pending_left.observe(&*self.left_pusher);
-            self.pending_right.observe(&*self.right_pusher);
-        }
-    }
-
-    impl<T: Timestamp, D: Send + 'static, O: Send + 'static, E: Send + 'static>
-        WiredOkErrOperator<T, D, O, E>
-    {
-        pub(super) fn check_observe(&mut self) {
-            self.input_handle.observe(&*self.input_puller);
-            self.pending_ok.observe(&*self.ok_pusher);
-            self.pending_err.observe(&*self.err_pusher);
-        }
-    }
+/// An ok/err split by `splitter`.
+pub(crate) fn ok_err<T: Timestamp, D: Send + 'static, O: Send + 'static, E: Send + 'static>(
+    name: impl Into<String>,
+    index: usize,
+    stage_id: StageId,
+    splitter: impl FnMut(D) -> std::result::Result<O, E> + Send + 'static,
+    input: CountedInput<T, D>,
+    ok_output: CountedOutput<T, O>,
+    err_output: CountedOutput<T, E>,
+) -> OperatorShell<OkErrLogic<T, D, O, E>> {
+    OperatorShell::new(
+        name,
+        index,
+        stage_id,
+        OkErrLogic {
+            splitter: Box::new(splitter),
+            _marker: std::marker::PhantomData,
+        },
+        input,
+        (ok_output, err_output),
+    )
 }
 
 // ---------------------------------------------------------------------------
@@ -2940,9 +1002,13 @@ mod check_observe {
 // ---------------------------------------------------------------------------
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::communication::allocator::ChannelAllocator;
+    use crate::dataflow::channels::envelope::{Envelope, Payload};
+    use crate::dataflow::channels::pushpull::{Pull, Push};
+    use crate::dataflow::schedulable::{ActivationOutcome, SchedulableOperator};
+    use crate::progress::operate::{PortLedger, ProgressReporter};
 
     fn make_channel<T: Timestamp, D: Send + 'static>()
     -> crate::dataflow::channels::pushpull::ChannelPair<T, D, ()> {
@@ -2950,340 +1016,237 @@ mod tests {
         alloc.allocate()
     }
 
-    #[test]
-    fn wired_source_emits_all_data() {
-        let ch = make_channel::<u64, i32>();
-        let pusher = ch.pusher;
-        let mut puller = ch.puller;
+    /// A counted input on `pull` with a fresh ledger.
+    pub(crate) fn input<T: Timestamp, D: Send + 'static>(
+        pull: Box<dyn Pull<T, D>>,
+    ) -> CountedInput<T, D> {
+        CountedInput::new("test:input".into(), pull, PortLedger::new())
+    }
 
-        let mut source = WiredSourceOperator::new(
-            "source",
-            0,
-            StageId::new(0),
-            vec![(0u64, vec![1, 2, 3]), (1u64, vec![4, 5])],
-            pusher,
-        );
+    /// A counted output on `push` with a fresh ledger and reporter.
+    pub(crate) fn output<T: Timestamp, D: Send + 'static>(
+        push: Box<dyn Push<T, D>>,
+    ) -> CountedOutput<T, D> {
+        CountedOutput::new(
+            "test:output".into(),
+            push,
+            PortLedger::new(),
+            ProgressReporter::new(),
+            None,
+        )
+    }
 
-        let outcome = source.activate().unwrap();
-        assert_eq!(outcome, ActivationOutcome::Done);
-        assert!(source.is_done());
-
-        // Check data arrived.
+    fn drain<T: Timestamp, D>(pull: &mut Box<dyn Pull<T, D>>) -> Vec<(T, Vec<D>)> {
         let mut received = Vec::new();
-        while let Some(env) = puller.pull() {
+        while let Some(env) = pull.pull() {
             if let Payload::Data { time, data } = env.payload {
                 received.push((time, data));
             }
         }
-        // Source emits in FIFO order (insertion order).
-        assert_eq!(received.len(), 2);
-        assert_eq!(received[0].0, 0u64); // first inserted batch emitted first
-        assert_eq!(received[1].0, 1u64);
+        received
     }
 
     #[test]
-    fn wired_sink_collects_data() {
+    fn source_emits_all_data_in_order() {
         let ch = make_channel::<u64, i32>();
-        let mut pusher = ch.pusher;
-        let puller = ch.puller;
-
-        let mut sink = WiredSinkOperator::new("sink", 0, StageId::new(0), puller);
-
-        // Push some data.
-        pusher.push(Envelope::data(0, vec![10, 20])).unwrap();
-        pusher.push(Envelope::data(1, vec![30])).unwrap();
-        pusher.close();
-
-        // Activate sink.
-        let outcome = sink.activate().unwrap();
-        assert_eq!(outcome, ActivationOutcome::Done);
-        assert_eq!(sink.collected().len(), 2);
-        assert_eq!(sink.collected()[0], (0, vec![10, 20]));
-        assert_eq!(sink.collected()[1], (1, vec![30]));
+        let mut pull = ch.puller;
+        let mut op = source(
+            "source",
+            1,
+            StageId::new(0),
+            vec![(0u64, vec![1, 2, 3]), (1u64, vec![4, 5])],
+            output(ch.pusher),
+            false,
+        );
+        assert_eq!(op.activate().unwrap(), ActivationOutcome::Done);
+        assert_eq!(drain(&mut pull), vec![(0, vec![1, 2, 3]), (1, vec![4, 5])]);
     }
 
     #[test]
-    fn wired_unary_processes_data() {
+    fn unary_processes_data_and_counts_ports() {
         let ch_in = make_channel::<u64, i32>();
         let ch_out = make_channel::<u64, i32>();
-        let mut pusher_in = ch_in.pusher;
-        let puller_in = ch_in.puller;
-        let pusher_out = ch_out.pusher;
-        let mut puller_out = ch_out.puller;
-
-        let mut op = WiredUnaryOperator::new(
+        let mut push_in = ch_in.pusher;
+        let mut pull_out = ch_out.puller;
+        let consumed = PortLedger::new();
+        let produced = PortLedger::new();
+        let mut op = unary(
             "double",
             1,
             StageId::new(0),
             |input: &mut InputHandle<u64, i32>, output: &mut OutputHandle<u64, i32>| {
                 while let Some((time, data)) = input.next() {
-                    let mut session = output.session(time);
-                    for item in data {
-                        session.give(item * 2);
-                    }
+                    output.push_vec(time, data.into_iter().map(|x| x * 2).collect());
                 }
                 Ok(())
             },
-            puller_in,
-            pusher_out,
+            CountedInput::new("in".into(), ch_in.puller, consumed.clone()),
+            CountedOutput::new(
+                "out".into(),
+                ch_out.pusher,
+                produced.clone(),
+                ProgressReporter::new(),
+                None,
+            ),
         );
-
-        // Push data to input channel.
-        pusher_in.push(Envelope::data(0, vec![1, 2, 3])).unwrap();
-        pusher_in.close();
-
-        // Activate operator.
-        let outcome = op.activate().unwrap();
-        assert_eq!(outcome, ActivationOutcome::Done);
-
-        // Check output.
-        let env = puller_out.pull().unwrap();
-        let (time, data) = env.as_data().unwrap();
-        assert_eq!(*time, 0);
-        assert_eq!(data, &vec![2, 4, 6]);
+        push_in.push(Envelope::data(0, vec![1, 2, 3])).unwrap();
+        push_in.close();
+        assert_eq!(op.activate().unwrap(), ActivationOutcome::Done);
+        assert_eq!(drain(&mut pull_out), vec![(0, vec![2, 4, 6])]);
+        assert_eq!(consumed.drain(), vec![(0, 3)]);
+        assert_eq!(produced.drain(), vec![(0, 3)]);
     }
 
     #[test]
-    fn wired_unary_idle_when_no_input() {
+    fn unary_idle_when_no_input() {
         let ch_in = make_channel::<u64, i32>();
         let ch_out = make_channel::<u64, i32>();
-
-        let mut op = WiredUnaryOperator::new(
+        let mut op = unary(
             "noop",
-            0,
+            1,
             StageId::new(0),
-            |_input: &mut InputHandle<u64, i32>, _output: &mut OutputHandle<u64, i32>| Ok(()),
-            ch_in.puller,
-            ch_out.pusher,
+            |_: &mut InputHandle<u64, i32>, _: &mut OutputHandle<u64, i32>| Ok(()),
+            input(ch_in.puller),
+            output(ch_out.pusher),
         );
+        assert_eq!(op.activate().unwrap(), ActivationOutcome::Idle);
+    }
 
-        let outcome = op.activate().unwrap();
-        assert_eq!(outcome, ActivationOutcome::Idle);
+    #[test]
+    fn error_envelope_fails_the_operator() {
+        let ch_in = make_channel::<u64, i32>();
+        let ch_out = make_channel::<u64, i32>();
+        let mut push_in = ch_in.pusher;
+        let mut op = unary(
+            "map",
+            1,
+            StageId::new(0),
+            |input: &mut InputHandle<u64, i32>, output: &mut OutputHandle<u64, i32>| {
+                while let Some((time, data)) = input.next() {
+                    output.push_vec(time, data);
+                }
+                Ok(())
+            },
+            input(ch_in.puller),
+            output(ch_out.pusher),
+        );
+        push_in
+            .push(Envelope::error("upstream", "decode failed"))
+            .unwrap();
+        let error = op.activate().unwrap_err();
+        assert!(error.to_string().contains("decode failed"), "{error}");
     }
 
     #[test]
     fn source_to_unary_to_sink_pipeline() {
-        // source → double → sink
         let ch1 = make_channel::<u64, i32>();
         let ch2 = make_channel::<u64, i32>();
-
-        let mut source = WiredSourceOperator::new(
+        let collected = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let mut src = source(
             "source",
-            0,
+            1,
             StageId::new(0),
             vec![(0u64, vec![10, 20, 30])],
-            ch1.pusher,
+            output(ch1.pusher),
+            false,
         );
-
-        let mut transform = WiredUnaryOperator::new(
+        let mut double = unary(
             "double",
-            1,
+            2,
             StageId::new(0),
             |input: &mut InputHandle<u64, i32>, output: &mut OutputHandle<u64, i32>| {
                 while let Some((time, data)) = input.next() {
-                    let mut session = output.session(time);
-                    for item in data {
-                        session.give(item * 2);
-                    }
+                    output.push_vec(time, data.into_iter().map(|x| x * 2).collect());
                 }
                 Ok(())
             },
-            ch1.puller,
-            ch2.pusher,
+            input(ch1.puller),
+            output(ch2.pusher),
         );
-
-        let mut sink = WiredSinkOperator::new("sink", 2, StageId::new(0), ch2.puller);
-
-        // Run pipeline manually.
-        assert_eq!(source.activate().unwrap(), ActivationOutcome::Done);
-        assert_eq!(transform.activate().unwrap(), ActivationOutcome::Done);
-        assert_eq!(sink.activate().unwrap(), ActivationOutcome::Done);
-
-        assert_eq!(sink.collected(), &[(0u64, vec![20, 40, 60])]);
+        let sink_collected = Arc::clone(&collected);
+        let mut snk = sink(
+            "sink",
+            3,
+            StageId::new(0),
+            move |time, data| sink_collected.lock().unwrap().push((time, data)),
+            input(ch2.puller),
+        );
+        assert_eq!(src.activate().unwrap(), ActivationOutcome::Done);
+        assert_eq!(double.activate().unwrap(), ActivationOutcome::Done);
+        assert_eq!(snk.activate().unwrap(), ActivationOutcome::Done);
+        assert_eq!(*collected.lock().unwrap(), vec![(0u64, vec![20, 40, 60])]);
     }
 
     #[test]
-    fn wired_branch_splits_by_predicate() {
+    fn branch_splits_by_predicate() {
         let ch_in = make_channel::<u64, i32>();
         let ch_true = make_channel::<u64, i32>();
         let ch_false = make_channel::<u64, i32>();
-
-        let mut pusher_in = ch_in.pusher;
-        let puller_in = ch_in.puller;
-        let pusher_true = ch_true.pusher;
-        let mut puller_true = ch_true.puller;
-        let pusher_false = ch_false.pusher;
-        let mut puller_false = ch_false.puller;
-
-        let mut op = WiredBranchOperator::new(
-            "even_odd",
-            0,
+        let mut push_in = ch_in.pusher;
+        let (mut pull_true, mut pull_false) = (ch_true.puller, ch_false.puller);
+        let mut op = branch(
+            "branch",
+            1,
             StageId::new(0),
             |_t: &u64, x: &i32| x % 2 == 0,
-            puller_in,
-            pusher_true,
-            pusher_false,
+            input(ch_in.puller),
+            output(ch_true.pusher),
+            output(ch_false.pusher),
         );
-
-        pusher_in
-            .push(Envelope::data(1, vec![1, 2, 3, 4, 5, 6]))
-            .unwrap();
-        pusher_in.close();
-
-        let outcome = op.activate().unwrap();
-        assert_eq!(outcome, ActivationOutcome::Done);
-
-        // True output: even numbers
-        let env_true = puller_true.pull().unwrap();
-        match env_true.payload {
-            Payload::Data { data, .. } => assert_eq!(data, vec![2, 4, 6]),
-            _ => panic!("expected data"),
-        }
-        // False output: odd numbers
-        let env_false = puller_false.pull().unwrap();
-        match env_false.payload {
-            Payload::Data { data, .. } => assert_eq!(data, vec![1, 3, 5]),
-            _ => panic!("expected data"),
-        }
+        push_in.push(Envelope::data(0, vec![1, 2, 3, 4])).unwrap();
+        push_in.close();
+        assert_eq!(op.activate().unwrap(), ActivationOutcome::Done);
+        assert_eq!(drain(&mut pull_true), vec![(0, vec![2, 4])]);
+        assert_eq!(drain(&mut pull_false), vec![(0, vec![1, 3])]);
     }
 
     #[test]
-    fn wired_branch_all_true() {
-        let ch_in = make_channel::<u64, i32>();
-        let ch_true = make_channel::<u64, i32>();
-        let ch_false = make_channel::<u64, i32>();
-
-        let mut pusher_in = ch_in.pusher;
-        let mut op = WiredBranchOperator::new(
-            "all_true",
-            0,
-            StageId::new(0),
-            |_t: &u64, _x: &i32| true,
-            ch_in.puller,
-            ch_true.pusher,
-            ch_false.pusher,
-        );
-
-        pusher_in.push(Envelope::data(0, vec![10, 20])).unwrap();
-        pusher_in.close();
-
-        let outcome = op.activate().unwrap();
-        assert_eq!(outcome, ActivationOutcome::Done);
-
-        let mut puller_true = ch_true.puller;
-        let env = puller_true.pull().unwrap();
-        match env.payload {
-            Payload::Data { data, .. } => assert_eq!(data, vec![10, 20]),
-            _ => panic!("expected data"),
-        }
-
-        let mut puller_false = ch_false.puller;
-        assert!(puller_false.pull().is_none());
-    }
-
-    #[test]
-    fn wired_ok_err_splits_results() {
-        let ch_in = make_channel::<u64, i32>();
+    fn ok_err_splits_results() {
+        let ch_in = make_channel::<u64, std::result::Result<i32, String>>();
         let ch_ok = make_channel::<u64, i32>();
-        let ch_err = make_channel::<u64, i32>();
-
-        let mut pusher_in = ch_in.pusher;
-        let mut op = WiredOkErrOperator::new(
-            "split",
-            0,
+        let ch_err = make_channel::<u64, String>();
+        let mut push_in = ch_in.pusher;
+        let (mut pull_ok, mut pull_err) = (ch_ok.puller, ch_err.puller);
+        let mut op = ok_err(
+            "ok_err",
+            1,
             StageId::new(0),
-            |x: i32| if x >= 0 { Ok(x * 2) } else { Err(x) },
-            ch_in.puller,
-            ch_ok.pusher,
-            ch_err.pusher,
+            |r: std::result::Result<i32, String>| r,
+            input(ch_in.puller),
+            output(ch_ok.pusher),
+            output(ch_err.pusher),
         );
-
-        pusher_in
-            .push(Envelope::data(1, vec![1, -2, 3, -4]))
+        push_in
+            .push(Envelope::data(
+                0,
+                vec![Ok(1), Err("bad".to_string()), Ok(3)],
+            ))
             .unwrap();
-        pusher_in.close();
-
-        let outcome = op.activate().unwrap();
-        assert_eq!(outcome, ActivationOutcome::Done);
-
-        let mut puller_ok = ch_ok.puller;
-        let env_ok = puller_ok.pull().unwrap();
-        match env_ok.payload {
-            Payload::Data { data, .. } => assert_eq!(data, vec![2, 6]),
-            _ => panic!("expected data"),
-        }
-
-        let mut puller_err = ch_err.puller;
-        let env_err = puller_err.pull().unwrap();
-        match env_err.payload {
-            Payload::Data { data, .. } => assert_eq!(data, vec![-2, -4]),
-            _ => panic!("expected data"),
-        }
+        push_in.close();
+        assert_eq!(op.activate().unwrap(), ActivationOutcome::Done);
+        assert_eq!(drain(&mut pull_ok), vec![(0, vec![1, 3])]);
+        assert_eq!(drain(&mut pull_err), vec![(0, vec!["bad".to_string()])]);
     }
 
     #[test]
-    fn wired_fork_clones_to_both_outputs() {
+    fn fork_clones_to_both_outputs() {
         let ch_in = make_channel::<u64, i32>();
         let ch_left = make_channel::<u64, i32>();
         let ch_right = make_channel::<u64, i32>();
-
-        let mut pusher_in = ch_in.pusher;
-        let mut puller_left = ch_left.puller;
-        let mut puller_right = ch_right.puller;
-
-        let mut op = WiredForkOperator::new(
-            "dup",
-            0,
+        let mut push_in = ch_in.pusher;
+        let (mut pull_left, mut pull_right) = (ch_left.puller, ch_right.puller);
+        let mut op = fork(
+            "fork",
+            1,
             StageId::new(0),
-            ch_in.puller,
-            ch_left.pusher,
-            ch_right.pusher,
+            input(ch_in.puller),
+            output(ch_left.pusher),
+            output(ch_right.pusher),
         );
-
-        pusher_in.push(Envelope::data(1, vec![10, 20, 30])).unwrap();
-        pusher_in.close();
-
-        let outcome = op.activate().unwrap();
-        assert_eq!(outcome, ActivationOutcome::Done);
-
-        // Both outputs get identical copies.
-        let env_left = puller_left.pull().unwrap();
-        match env_left.payload {
-            Payload::Data { data, .. } => assert_eq!(data, vec![10, 20, 30]),
-            _ => panic!("expected data"),
-        }
-        let env_right = puller_right.pull().unwrap();
-        match env_right.payload {
-            Payload::Data { data, .. } => assert_eq!(data, vec![10, 20, 30]),
-            _ => panic!("expected data"),
-        }
-    }
-
-    #[test]
-    fn wired_fork_empty_input() {
-        let ch_in = make_channel::<u64, i32>();
-        let ch_left = make_channel::<u64, i32>();
-        let ch_right = make_channel::<u64, i32>();
-
-        let mut pusher_in = ch_in.pusher;
-        let mut puller_left = ch_left.puller;
-        let mut puller_right = ch_right.puller;
-
-        let mut op = WiredForkOperator::new(
-            "dup_empty",
-            0,
-            StageId::new(0),
-            ch_in.puller,
-            ch_left.pusher,
-            ch_right.pusher,
-        );
-
-        pusher_in.close();
-
-        let outcome = op.activate().unwrap();
-        assert_eq!(outcome, ActivationOutcome::Done);
-
-        assert!(puller_left.pull().is_none());
-        assert!(puller_right.pull().is_none());
+        push_in.push(Envelope::data(0, vec![1, 2])).unwrap();
+        push_in.close();
+        assert_eq!(op.activate().unwrap(), ActivationOutcome::Done);
+        assert_eq!(drain(&mut pull_left), vec![(0, vec![1, 2])]);
+        assert_eq!(drain(&mut pull_right), vec![(0, vec![1, 2])]);
     }
 }

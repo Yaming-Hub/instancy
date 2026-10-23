@@ -52,6 +52,17 @@ impl<T: Timestamp> Capability<T> {
         Self { time, reporter }
     }
 
+    /// The capability an operator instance holds from the start: one of the
+    /// initial capabilities its operator declares, which every progress
+    /// tracker seeds from the physical plan (A4). Nothing is reported when
+    /// it is created; dropping or downgrading it reports as usual.
+    pub(crate) fn seeded(time: T, reporter: ProgressReporter<T>) -> Self {
+        reporter.seed_held(time.clone(), 1);
+        #[cfg(any(debug_assertions, feature = "progress-check"))]
+        reporter.check_hold(&time, 1);
+        Self { time, reporter }
+    }
+
     /// Returns the timestamp this capability permits.
     pub fn time(&self) -> &T {
         &self.time

@@ -35,6 +35,7 @@ use crate::dataflow::schedulable::{
 use crate::dataflow::stage::FusedActivationOrder;
 use crate::error::{DataflowError, Error, Result};
 use crate::metrics::{DataflowMetrics, OperatorMetricsCollector};
+use crate::progress::frontier::Antichain;
 use crate::progress::notificator::Notificator;
 use crate::progress::subgraph::ProgressTracker;
 use crate::progress::timestamp::Timestamp;
@@ -749,8 +750,8 @@ impl<T: Timestamp> DataflowExecutor<T> {
             // Collect input pullers sorted by port index.
             let mut inputs = op_input_pullers.remove(&op_idx).unwrap_or_default();
             inputs.sort_by_key(|(port, _)| *port);
-            let input_pullers: Vec<Box<dyn std::any::Any + Send>> =
-                inputs.into_iter().map(|(_, pull)| pull).collect();
+            let input_pullers: Vec<Option<Box<dyn std::any::Any + Send>>> =
+                inputs.into_iter().map(|(_, pull)| Some(pull)).collect();
 
             // Collect output pushers grouped by port index.
             let mut outputs = op_output_pushers.remove(&op_idx).unwrap_or_default();
@@ -758,6 +759,7 @@ impl<T: Timestamp> DataflowExecutor<T> {
             let output_pushers = group_by_port(outputs);
 
             let endpoints = ChannelEndpoints {
+                operator: op_idx,
                 input_pullers,
                 output_pushers,
                 wake_handle: Some(wake_handle.clone()),
@@ -1177,14 +1179,16 @@ impl<T: Timestamp> DataflowExecutor<T> {
         let dirty: Vec<usize> = tracker.propagate()?.to_vec();
 
         // Collect frontier updates for dirty operators before releasing tracker borrow.
-        let frontier_updates: Vec<(usize, _)> = dirty
+        #[allow(clippy::type_complexity)]
+        let frontier_updates: Vec<(usize, _, Vec<Antichain<T>>)> = dirty
             .iter()
             .filter_map(|&op_idx| {
                 if op_idx < self.index_to_pos.len() {
                     let pos = self.index_to_pos[op_idx];
                     if pos != usize::MAX && pos < self.operators.len() {
                         let frontier = tracker.operator_input_frontier_meet(op_idx);
-                        return Some((pos, frontier));
+                        let ports = tracker.operator_input_frontiers(op_idx);
+                        return Some((pos, frontier, ports));
                     }
                 }
                 None
@@ -1197,12 +1201,15 @@ impl<T: Timestamp> DataflowExecutor<T> {
         // 2. The operators themselves (for notify-capable operators that manage
         //    their own internal notificator). The default implementation is a no-op,
         //    so this is safe to call on all operators.
-        for (pos, frontier) in &frontier_updates {
+        for (pos, frontier, ports) in &frontier_updates {
             // Legacy path: executor-owned notificator
             if *pos < self.notificators.len() {
                 if let Some(notificator) = &mut self.notificators[*pos] {
                     notificator.update_frontier(frontier);
                 }
+            }
+            for (port, port_frontier) in ports.iter().enumerate() {
+                self.operators[*pos].update_port_frontier(port, port_frontier);
             }
             // New path: operator-owned notificator (WiredUnaryNotifyOperator etc.)
             // The operator downcasts &dyn Any to &Antichain<T> internally.
@@ -1214,7 +1221,8 @@ impl<T: Timestamp> DataflowExecutor<T> {
         // be marked for output-frontier-only changes).
         if self.config.frontier_timeline {
             if let Some(ref tc) = self.timeline_collector {
-                for &(pos, ref frontier) in &frontier_updates {
+                for (pos, frontier, _) in &frontier_updates {
+                    let pos = *pos;
                     let s = format!("{:?}", frontier);
                     if pos < self.last_recorded_frontiers.len()
                         && self.last_recorded_frontiers[pos] != s
@@ -2524,23 +2532,23 @@ mod tests {
         use crate::communication::allocator::ChannelAllocator;
         use crate::dataflow::operators::handles::{InputHandle, OutputHandle};
         use crate::dataflow::stage::StageId;
-        use crate::dataflow::wired_operators::{
-            WiredSinkOperator, WiredSourceOperator, WiredUnaryOperator,
-        };
+        use crate::dataflow::wired_operators::{self as wired, tests::input, tests::output};
 
         let mut alloc = ChannelAllocator::new();
         let ch1 = alloc.allocate::<u64, i32, ()>();
         let ch2 = alloc.allocate::<u64, i32, ()>();
 
-        let source: Box<dyn SchedulableOperator> = Box::new(WiredSourceOperator::new(
+        let source = wired::source(
             "source",
             0,
             StageId::new(0),
             vec![(0u64, vec![1, 2, 3]), (1u64, vec![10, 20])],
-            ch1.pusher,
-        ));
+            output(ch1.pusher),
+            false,
+        )
+        .boxed();
 
-        let double: Box<dyn SchedulableOperator> = Box::new(WiredUnaryOperator::new(
+        let double = wired::unary(
             "double",
             1,
             StageId::new(0),
@@ -2553,16 +2561,12 @@ mod tests {
                 }
                 Ok(())
             },
-            ch1.puller,
-            ch2.pusher,
-        ));
+            input(ch1.puller),
+            output(ch2.pusher),
+        )
+        .boxed();
 
-        let sink: Box<dyn SchedulableOperator> = Box::new(WiredSinkOperator::new(
-            "sink",
-            2,
-            StageId::new(0),
-            ch2.puller,
-        ));
+        let sink = wired::sink("sink", 2, StageId::new(0), |_, _| {}, input(ch2.puller)).boxed();
 
         let mut executor: DataflowExecutor<u64> = DataflowExecutor {
             operators: vec![source, double, sink],
