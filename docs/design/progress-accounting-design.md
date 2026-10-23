@@ -68,16 +68,22 @@ Rev `0286a9d` is the revision under review. It has since been rebased onto `e7ac
     - **Two protocol version bumps, not one.** A4 seeding changes what a progress stream means: initial capabilities are seeded, not sent. A peer still running the old protocol would therefore count them twice or never. So step 2 bumps `PROTOCOL_VERSION` to 4, together with the plan digest. Step 3's seal marker and scope ids then bump it to 5 (§5.5).
     - **M-d is deleted in step 2, not step 3.** Its only reader, `CombinedStageExecutor`, is deleted in step 2 (§5.1.8, §5.7).
     - **Rules for operators hosted on different sets of workers** (§5.1.8):
-      - a pipeline or feedback edge needs every worker that hosts its source to also host its target;
+      - a pipeline edge needs every worker that hosts its source to also host its target; a feedback edge keeps today's rule, equal host sets;
       - each operator keeps its stage's worker context;
       - a probe expects one writer per hosting worker;
-      - the heterogeneous path builds the dataflow once.
+      - `RuntimeHandle::spawn_multi` builds the dataflow once.
     - **Heterogeneous clusters stay rejected in step 2.** Allowing them would be a new feature, which needs the user's decision.
+13. **Benchmark gates dropped for steps 2–4** (user decision, 2026-10-22). Performance testing is deferred until instancy is fully correct, and will then be done against timely. §6 now lists what that later work should measure, and the step-3 exit criteria no longer include an A/B gate.
+14. **Step-3 refinements, while writing the step-3 brief** (`main` @ `6cb3ced`; decision log R26–R37). None changes what the TLA+ models check.
+    - **A failed worker doesn't seal** (R34). Failure is fatal to the dataflow through cancellation, so no peer waits for its seal. Earlier text said sealing happens on failure too (§2.2, §5.1.1, §5.5).
+    - **Broadcast multiplicity has a source** (R35): each planned edge carries a delivery kind, included in the plan digest (§5.1.4).
+    - **`J` lives for one logic call, not until the commit** (R36). One commit batches many calls, so `J` must not leak across them. A logic `Done` is only a hint; only S2a shuts an operator down (§5.1.1, §5.1.3).
+    - **Egress uses a credit token** (R37), and seals wait for release mailboxes (§2.2, §5.1.1).
 
 ---
 
-**Status:** design approved; implementation under way. Step 1 (#293) is merged as `ba1bd37`. Steps 2–4 follow (§5.7). Targeted experiments ran on a local branch, `exp-pcp-verify`, last re-run on `e7ac01e`; §5.9 lists what they verified.
-**Date:** 2026-10-22 (first written 2026-10-20). **instancy base:** `main` @ `ba1bd37`, which includes #285–#293, among them PR7 (#291), PR8 (#292) and step 1 (#293). Line citations elsewhere in this doc were last checked on `e7ac01e`; §5.1.8 is checked on `ba1bd37`.
+**Status:** design approved; implementation under way. Step 1 (#293) is merged as `ba1bd37`, and step 2 (#295) as `6cb3ced`. Steps 3 and 4 follow (§5.7). Targeted experiments ran on a local branch, `exp-pcp-verify`, last re-run on `e7ac01e`; §5.9 lists what they verified.
+**Date:** 2026-10-23 (first written 2026-10-20). **instancy base:** `main` @ `6cb3ced`, which includes #285–#295, among them PR7 (#291), PR8 (#292), step 1 (#293) and step 2 (#295). Line citations elsewhere in this doc were last checked on `e7ac01e`; §5.1.8 is checked on `ba1bd37`. The step-3 brief carries citations checked on `6cb3ced`.
 **timely reference:** `TimelyDataflow/timely-dataflow` `master` @ `3012f8f` (2026-10-16). The latest release is **timely v0.31.0** (2026-07-14). instancy's `timely` 0.12 dev-dependency (2021) is used only to say what changed.
 **Scope:** audit root causes 1, 2 and 4 (fragile counting, opt-in accounting, duplicated paths), and how a new design interacts with root cause 3 (PR7 #291, merged, and PR8 #292). The bug tracker's PR4, PR5, PR6 and PR12 are replaced by the four steps in §5.7.
 
@@ -114,7 +120,7 @@ Back to the overview: [Design Overview](./README.md). Related: [Progress Trackin
    - **Step 2, one executor core:** one executor hosts any subset of operators, with one progress driver per worker and agreed initial state. The staged machinery is deleted. It comes before the redesign so that step 3 is built once.
    - **Step 3, port-counted progress, in one go:** the operator shell, port counting, capabilities, nested loop scopes, the shutdown rule, exact-zero completion and seal markers.
    - **Step 4:** update downstream projects, outside this repository, to the final API.
-7. **Main risk: progress traffic under congestion.** Port counting adds two lock-free `ChangeBatch` updates per batch per edge, plus a *mandatory* worker-wide compaction after edge expansion. It *removes* a mutex lock per exchange sub-batch. Edges whose queues stay non-empty across sweeps add updates to every sweep. One non-cancelling `u64` entry is about 33 bytes per peer, so traffic depends on worker count and batch size. A throwaway prototype with an interleaved A/B benchmark, including a real cluster benchmark, gates step 3 (§6). timely's demand-driven sending is the planned mitigation.
+7. **Main risk: progress traffic under congestion.** Port counting adds two lock-free `ChangeBatch` updates per batch per edge, plus a *mandatory* worker-wide compaction after edge expansion. It *removes* a mutex lock per exchange sub-batch. Edges whose queues stay non-empty across sweeps add updates to every sweep. One non-cancelling `u64` entry is about 33 bytes per peer, so traffic depends on worker count and batch size. Performance is measured once instancy is fully correct, against timely (§6); no step is gated on a benchmark. timely's demand-driven sending is the planned mitigation, if it is needed.
 8. **One limit no design removes.** A user closure can move consumed data into captured state and never emit it. That is indistinguishable from a filter; timely has the same limit. PCP makes *emitting it later* a loud error, and adds an explicit `retain` API so that keeping data is easy to do correctly (§5.1.3, §5.3).
 
 Eight adversarial review rounds have been addressed:
@@ -189,8 +195,8 @@ The correctness audit (kept outside the repository) grouped the progress finding
     - (c) its view holds **no non-zero count** (positive *or* negative) at any location from which one of its hosted locations is reachable in the *data* graph. Reachability here ignores timestamps and includes back-edges, and hosted locations include the locations of every probe handle and output port it serves.
 
     If (c) fails, the worker keeps processing progress; it is *not ready*, not failed. A non-zero count becomes a **proven residual** (an error) only after the *final accounting boundary*: this worker has applied a **seal marker** from every peer and from itself, and the count is still non-zero.
-    - **Sealing is independent of success.** A worker seals its progress stream once it can produce no further updates: all its hosted operators are exhausted or shut down, no capability or input credit is held, and its ledgers and mailboxes are committed.
-    - The seal marker travels *in order* on the worker's progress stream: as a marker entry in the in-process channel, and as a reserved progress frame in a cluster.
+    - **Sealing is independent of success, but not of failure.** A worker seals its progress stream once it can produce no further updates: all its hosted operators are exhausted or shut down, no capability or input credit is held, and its ledgers and release mailboxes are committed. A worker stuck on a residual still seals. A *failed* worker does not seal (R34): failure is fatal to the whole dataflow through cancellation, so no peer waits for its seal, and a seal over a failed worker's live capabilities would make every peer report a misleading residual instead of the original error.
+    - The seal marker travels *in order* on the worker's progress stream: as a marker entry in the in-process channel, and as a reserved progress frame in a cluster. There is no self lane, so a worker records its own seal locally, right after self-applying its final batch.
     - A receiver counts a peer as sealed only when it *applies* that marker, after every earlier batch from that peer. Receiving a frame at the bridge is not enough.
     - So two workers that are both exhausted and both stuck on a genuine residual still reach the boundary, and both report it.
 
@@ -533,15 +539,17 @@ No public builder method accepts a custom factory (✔ grep), so the first break
     - `Control::Watermark` is advisory and never used as a frontier (frontiers come only from the tracker);
     - `Control::Error` is fatal: the operator fails the dataflow, for every transport including MockNetwork (C-16).
 - **`CountedOutput<T, D>`** replaces `OutputHandle` plus raw `Push` plus `pending_output`. When the shell takes the logic's output after the logic returns, it records `produced`. Anything the logic discarded before returning was never counted, which is the same as a filter. The retry queue and the channel beneath it are "on the edge". Logic cannot drain its own counted output.
-- **External egress** (a sink's `pending_send`, C-15). The sink defers recording `consumed` for a batch until the external channel *accepts* the event. Until then its input credit stays in the view, so exact-zero completion cannot pass the pending event. A dropped receiver keeps today's explicit discard semantics (H15 fix), and the discard is recorded, not silent. The same rule applies to any future shell store that holds consumed data off-ledger: keep the input credit until hand-off.
+- **External egress** (a sink's `pending_send`, C-15). The sink defers recording `consumed` for a batch until the external channel *accepts* the event. `CountedInput` hands the sink a **credit token** `(t, n)` with the batch instead of recording `−n`; the sink keeps it next to the pending event in every build, and redeeming it records `−n` (R37). Until then its input credit stays in the view, so exact-zero completion cannot pass the pending event. A dropped receiver keeps today's explicit discard semantics (H15 fix); the discard redeems the token, so it is recorded, not silent. The same rule applies to any future shell store that holds consumed data off-ledger: keep the input credit until hand-off.
 - **The constructor needs the edge identity and the ledger.** Only the materializer can build these types. Logic never sees a `Push` or `Pull`.
-- **Commit protocol (`ActivationTxn`).** The ledger is drained only between activations. Per activation or per sweep are both fine: timely also batches many activations into one send (§2.5). Before the executor acts on `Done`, shutdown (S2a), worker termination (S2b) or a clean end-of-stream, it must, in order:
-  1. drain every hosted ledger, then **compact** worker-wide after expanding edges;
+- **Commit protocol (`ActivationTxn`).** The ledger is drained only between activations. Per activation or per sweep are both fine: timely also batches many activations into one send (§2.5). A commit batches deltas only, never justification state (§5.1.3). Before the executor acts on shutdown (S2a), worker termination (S2b), a seal or a clean end-of-stream, it must, in order:
+  1. drain every hosted ledger and every release mailbox, then **compact** worker-wide after expanding edges;
   2. self-apply the batch;
   3. enqueue every fragment, positives-first, on every peer lane, including any batch held back by demand-driven sending;
   4. only then mark the operator closed or queue the end-of-stream.
 
-  A panicking or failed activation commits nothing. Data it already put on an edge is unmatched, but the activation's consumed input stays counted upstream, so no view can complete early. Since #291 the failure is already fatal cluster-wide: a node whose workers fail broadcasts `Cancel` (`runtime/cluster_lifecycle.rs:590-602`).
+  A logic-level `Done` or exhaustion is only a hint (R36): it never closes outputs or counts toward completion; only S2a shuts an operator down.
+
+  A panicking or failed activation commits nothing. Data it already put on an edge is unmatched, but the activation's consumed input stays counted upstream, so no view can complete early. Capabilities and credit committed by earlier activations are not released, and the failed worker does not seal (R34). Since #291 the failure is already fatal to the dataflow: in-process, a worker that completes with an error cancels its siblings; on a cluster, a node whose workers fail broadcasts `Cancel` (`runtime/cluster_lifecycle.rs:590-602`).
 
 - **One decision module, three decision types.** Every way an executor can report success funnels through one module. Today there are several: natural exhaustion with all operators done (`executor.rs:1753-1756`, P-10), idle force-close, drain completion and staged convergence (`stage_executor.rs:966-1000`). The idle-sweep force-close is deleted. Each decision first requires the commit protocol to be complete. Then:
   - **operator shutdown (S2a, §5.1.5):** the operator's input frontiers are empty, it holds no capability, and it has nothing left to hand over;
@@ -565,11 +573,11 @@ The 13 `Wired*Operator` structs become `OperatorLogic` implementations: unary, n
 
 Anything an operator keeps *across activations* and may later emit at `t` must be backed by a capability at `≤ t`. This is A1 for O-4, O-5 and O-11.
 
-**Acquisition rule (release-enforced, all kinds).** For each activation the shell keeps a **justification set** `J`. It starts with the times of every capability the operator holds at the start of the activation, and grows with:
-- every capability acquired during the activation, under this rule;
-- `summary(in→out)(t′)` for every batch at `t′` actually *consumed* in this activation, using the summary of the input that batch came from. This matters for binary operators.
+**Acquisition rule (release-enforced, all kinds).** For each logic call (one activation of the operator's logic) the shell keeps a **justification set** `J`. It starts with the times of every capability the operator holds when the call starts, and grows with:
+- every capability acquired during the call, under this rule;
+- `summary(in→out)(t′)` for every batch at `t′` actually *consumed* in this call, using the summary of the input that batch came from. This matters for binary operators.
 
-Capabilities dropped during the activation, for example by `next_notification()`, stay in `J` until the activation commits. `J` is cleared at commit. An operator may *acquire*, *downgrade to*, or *emit output at* `t` on an output only if some element of `J` for that output is `≤ t`.
+Capabilities dropped during the call, for example by `next_notification()`, stay in `J` until the call returns. `J` is validated and dropped when the call returns, before the call's delta joins the worker's pending commit. A commit may batch many calls' deltas but never their `J`, so input consumed by one call can never justify output from a later one (R36). An operator may *acquire*, *downgrade to*, or *emit output at* `t` on an output only if some element of `J` for that output is `≤ t`.
 - *Sound:* any emission or acquisition is committed in the same batch as the consumption or capability release that justifies it (A2).
 - *Not frontier-based:* the input frontier alone is never a justification, and neither is a batch that is merely available but not consumed.
 
@@ -610,6 +618,7 @@ A request based only on an earlier activation's data, without a held capability,
   - **Residual at success.** A count still non-zero after the final accounting boundary is an error in every build ("progress residual at completion"), consistent with S3.
 - **Seeding (A4):** every worker seeds every operator's initial capabilities with multiplicity equal to the number of instantiating workers. It then broadcasts only its own releases. Delete `peers_heard_from` (P-3). The multiplicities come from a canonical **physical plan** (the operator-to-worker assignment, pact recipient sets and multiplicities), whose digest is part of the cluster handshake (§5.1.8).
 - **Drain:** consumed goes to `Target(op, in)` as `−n`; produced goes to *every* accounting target of `(op, out)` as `+n·mult`; internal goes to `Source(op, out)`. Everything drained between two commits is compacted into one outgoing batch (§5.1.1).
+  - `mult` comes from the edge's **delivery kind** in the physical plan (R35): 1 for pipeline and partitioning-exchange edges, `|hosts(target)|` for broadcast. Today's plan can't tell the two apart (`EdgeRouting` has one `Exchange` variant for both), so step 3 adds the delivery kind, derived from how the builder creates the edge, and includes it in the plan digest.
 - **Edges are derived from the materialized graph**, so P-8 can't diverge. Produced lands on every data edge of an output, keyed by the edge. Each loop is its own scope (§5.1.7). Its back-edge stays in the scope's graph with a `+1` iteration summary, so no identity cycle arises, and the parent sees the scope as a single node.
 - **Probes and output ports are read-only projections**, not counted targets. A probe on `(op, out)` reports the meet of the input frontiers of the *real* targets of that output. That includes data queued on those edges and everything upstream. It falls back to `F(Source(op, out))` when the output has no consumer. Nothing is ever counted at a probe, so nothing can leak there.
 - **Residuals.** A non-zero count in a worker's scope is *not ready*, not an error, because a peer's batch may still be in transit (FIFO doesn't stop data overtaking its own progress update). It becomes a **proven residual** only once this worker has applied every worker's seal marker (§2.2, S2b), and then it is an error in every build. The in-process progress channel (`progress/progress_channel.rs:109-239`) has no terminal state today; the redesign adds the in-order seal marker.
@@ -682,10 +691,10 @@ Step 2 lands **before** the redesign, so step 3 builds port counting once, in on
   - `hosts(op)` is the set of global workers running `op`: workers `0..par(stage(op))` (`runtime.rs:2575`, `:2802`);
   - each hosted operator keeps its stage's worker context `(worker, par(stage))`, as today (`runtime.rs:2851`); cross-stage exchange channels use `(worker, total)` with `(source_par, target_par)` (`runtime.rs:2442`, `:2521`, `:2659-2668`);
   - an exchange or broadcast edge is built on every worker that hosts either end;
-  - a pipeline or feedback edge needs every worker that hosts its source to also host its target. That is a spawn-time error otherwise, as the docs already promise; today such data is silently dropped (H14). Workers that host only the target get an input that is already exhausted;
+  - a pipeline edge needs every worker that hosts its source to also host its target. That is a spawn-time error otherwise, as the docs already promise; today such data is silently dropped (H14). Workers that host only the target get an input that is already exhausted. A feedback edge keeps today's stricter rule, equal host sets (`runtime.rs:2726`): step 2 accepts no shape it used to reject, and loops that change parallelism are revisited with nested scopes in step 3;
   - the seeding multiplicity of each initial capability is `|hosts(op)|`. Counting fewer is unsafe (TLA scenario `hetero_localseed`); counting more hangs (`hetero_workerseed`);
-  - a probe on `op` expects `|hosts(op)|` writers, not the total worker count (`probe.rs:126-160`);
-  - the heterogeneous path builds the dataflow once and materializes it per worker, like the uniform path, so `build` runs twice, not `N + 1` times;
+  - a probe on `op` expects `|hosts(op)|` writers, not the total worker count (`probe.rs:126-160`). `SimpleRuntime` builds once per worker, so each of its probe handles has one writer but expects N. A finished writer's last view then keeps holding that handle, which is conservative, as on a cluster node; S2b fixes the stale view in step 3;
+  - `RuntimeHandle::spawn_multi` builds the dataflow once and materializes it per worker, on every path, with no separate probe build. The plan reads the built dataflow, so `build` runs once, not `N + 1` times;
   - clusters keep rejecting heterogeneous parallelism in step 2. Allowing it is a feature, which needs the user's decision.
 - **Behaviour after step 2.** Port and in-flight accounting is unchanged; what changes is which book each worker reads, and how it is initialized.
   - The staged path (S) and `SimpleRuntime` multi-worker (SR) both switch to live whole-graph books, so both inherit the uniform path's known accounting bugs (C2, H1, H12 and the rest) until step 3. On a whole-graph view, a `+n` and a `−n` from different workers do cancel, so on S and SR a frontier may move earlier than today wherever today's local view happened to be conservative.
@@ -811,7 +820,7 @@ In §5.9's prototype runs, the completion changes alone (exact zero and no force
 - PR8 extends this to data-frame corruption, and to EOF that is today treated as exhaustion (C5).
 - Peers can't complete early on an activation's uncommitted work, because its consumed input is still counted upstream.
 
-**Clean close.** PR8's `close_on_drop`, under which only a successful worker closes cleanly, fits §5.1.5: shutdown under S2a is a success path. Sealing is separate and happens on failure too, because it is accounting, not a clean close.
+**Clean close.** PR8's `close_on_drop`, under which only a successful worker closes cleanly, fits §5.1.5: shutdown under S2a is a success path. Sealing is separate, because it is accounting, not a clean close: a worker stuck on a residual still seals. A failed worker does not seal; the dataflow fails through cancellation instead (R34).
 
 **No new ordering dependency for safety.** PCP doesn't need data and progress on one FIFO lane (§2.5), so PR9's transport changes can't break progress safety; they can only delay it. The end-of-stream rule above is a teardown rule, not a safety rule.
 
@@ -823,7 +832,7 @@ In §5.9's prototype runs, the completion changes alone (exact zero and no force
 | Link loss and EOF | `NetworkPull` exhausts only on the exact close sentinel. Today a disconnected receiver counts as exhausted (`network.rs:705-708`, C5), and losses are reported to the coordinator. | Under PCP a falsely exhausted channel cannot complete anything: the sender's `+n` is still counted at the target, so the target's frontier holds and S2a can't fire. C5 becomes a hang instead of a loss, and V4 flags the mismatch between exhaustion and frontier. PR7's coordinator cancels on a hard link failure at once, and on a soft one (EOF) once the whole link has closed (`cluster_lifecycle.rs:880-896`). PR8 closes C5. |
 | Progress decode or EOF | The bridge keeps reading after end-of-stream, and a frame after it is a violation. | Already fatal on `e7ac01e`. The seal marker must precede end-of-stream, which it does. |
 | Batch splitting | Previously planned reassembly | Positives-first makes reassembly unnecessary, across scope sections too. |
-| Clean close | `close_on_drop` gated on worker success | Seal marker sent regardless of success |
+| Clean close | `close_on_drop` gated on worker success | Seal marker sent by every worker that doesn't fail, successful or stuck on a residual; a failed worker doesn't seal (R34) |
 | Version | Did not bump `PROTOCOL_VERSION` (still 3 on `ba1bd37`) | Step 2 bumps to v4, step 3 to v5 (above) |
 | Known residual: in Shared mode an end-of-stream ack can overtake payload, so late data is detected only best effort (PR8 description; `docs/design/cluster.md` §5.5.3 on PR8's branch) | Documented, not fixed; needs a wire change | Late data exists only after a premature completion. Step 3's S2b removes premature completion, so PCP makes the residual unreachable. `DataLoss` stays as the assertion. |
 
@@ -862,9 +871,9 @@ There are no compatibility constraints. Nobody depends on instancy yet; downstre
 |---|---|---|---|
 | **1: test harness** | Debug checker V1, V4, V5, V6 and V7 (§5.8). V7 measures physical occupancy independently, at **every** materialization point (`DataflowExecutor::materialize`, `materialize_stage_executor`, the network endpoint materializer) and in every store that exists today (`InputHandle`, `pending_output`, sink `pending_send`, async queues). Conformance matrix in `tests/progress_conformance.rs` with an `EXPECTED_FAILURES` table keyed by audit ID. Protocol property test against `reachability::Tracker`. | none; detection only | The matrix runs in CI on every path and transport. Every listed failure reproduces. Nothing else fails. |
 | **2: one executor core** | §5.1.8. `DataflowExecutor` hosts any subset of operators; the staged wiring moves into it; fusion groups and stage tasks become scheduling groups inside it. One full-graph tracker per worker, with progress channels on every path, `SimpleRuntime` included. A4 seeding from the physical plan, *replacing* the initial-capability broadcast in `initialize()` (`subgraph.rs:810-850` on `ba1bd37`); delete `peers_heard_from` and `all_peers_synced`; the plan digest joins the cluster handshake, and `PROTOCOL_VERSION` goes to 4. Delete `StageExecutor`, `CombinedStageExecutor`, M-d, M-e, M-h, per-stage trackers, and the staged drain logic. Port and in-flight accounting is unchanged; S and SR inherit the uniform path's known bugs until step 3 (§5.1.8). | H14 (per-stage trackers, cross-stage pipeline edges, staged `drain_on_cancel`), H13 (startup race), M12 (staged drain), P-3, P-6, P-7 | `audit_netprogress_startup`, `audit_executor_staged` and `audit_builder_stages` pass. `audit_netprogress_stage_starvation` (C3, fixed by #290) still passes. In the matrix, every S and SR configuration gives the same result as the uniform path on the same shape. A cluster whose nodes disagree on the physical plan fails the handshake. No test that passed after step 1 fails, except S and SR tests recorded as known failures and tied to a uniform-path bug that step 3 fixes. |
-| **3: port-counted progress, in one go** | Everything in §5.1, on the one core: the operator shell, `CountedInput`, `CountedOutput`, the ledger and typed endpoints, with the 13 operators, the channel sink and the source migrated (§5.1.2, §5.2); the tracker consuming ledgers with `produced` keyed by edge (§5.1.4); the commit protocol and the one decision module, with force-close deleted (§5.1.1); capabilities for async work, egress credit, acquisition with justification sets, `retain`, and late output as an error (§5.1.3); nested loop scopes (§5.1.7); S2a, scoped S2b with seal markers, and S2c (§5.1.5); exact-zero completion with proven residuals as errors (§2.4); probes as projections; positives-first fragments across scope sections, with the version bump to v5 (§5.1.6, §5.5); error envelopes fatal on every transport (C-16); drain-path peer sync. Delete M-b, M-c, M-g and the outer-time projection. | C1, C2, H1 (pipeline, `pending_output`, `InputHandle`, exchange buffers, async, external egress), H8 (mock), H10, H11, H12, M10 remainder, M12 (drain peer sync), P-2, P-9, #281, `unary_async` spin, batch fragmentation, "probes after loop", "push into finished local operator" | Every audit repro that Appendix A maps to step 3 passes, and `EXPECTED_FAILURES` is empty: the matrix is green on every path, transport, worker count and capacity. Regressions: the two scope-bridge regressions (§5.1.7); a decode failure plus an injected residual fails promptly; two exhausted workers with an injected residual both report it through seal markers; the shapes in §5.9's table (rows X1a–X1e) become permanent tests, all completing with exact output. `multi_worker_loop_body_probe_is_conservative` and PR2's backpressure tests are un-ignored, and M11 is re-tested. #291's early-finisher oracles are exact, with frontier-observing variants added (§5.5). The A/B gate (§6) is met. If the design changed during implementation, the TLA+ models are updated and re-run (§5.8). |
+| **3: port-counted progress, in one go** | Everything in §5.1, on the one core: the operator shell, `CountedInput`, `CountedOutput`, the ledger and typed endpoints, with the 13 operators, the channel sink and the source migrated (§5.1.2, §5.2); the tracker consuming ledgers with `produced` keyed by edge (§5.1.4); the commit protocol and the one decision module, with force-close deleted (§5.1.1); capabilities for async work, egress credit, acquisition with justification sets, `retain`, and late output as an error (§5.1.3); nested loop scopes (§5.1.7); S2a, scoped S2b with seal markers, and S2c (§5.1.5); exact-zero completion with proven residuals as errors (§2.4); probes as projections; positives-first fragments across scope sections, with the version bump to v5 (§5.1.6, §5.5); error envelopes fatal on every transport (C-16); drain-path peer sync. Delete M-b, M-c, M-g and the outer-time projection. | C1, C2, H1 (pipeline, `pending_output`, `InputHandle`, exchange buffers, async, external egress), H8 (mock), H10, H11, H12, M10 remainder, M12 (drain peer sync), P-2, P-9, #281, `unary_async` spin, batch fragmentation, "probes after loop", "push into finished local operator" | Every audit repro that Appendix A maps to step 3 passes, and `EXPECTED_FAILURES` is empty: the matrix is green on every path, transport, worker count and capacity. Regressions: the two scope-bridge regressions (§5.1.7); a decode failure plus an injected residual fails promptly; two exhausted workers with an injected residual both report it through seal markers; the shapes in §5.9's table (rows X1a–X1e) become permanent tests, all completing with exact output. `multi_worker_loop_body_probe_is_conservative`, PR2's backpressure tests, and step 2's two ignored staged-loop tests (`multi_worker_iterate::staged_iterate_cross_stage_feedback` and `staged_iterate_cross_stage_immediate_exit`, C2) are un-ignored, and M11 is re-tested. `probe_cluster::*_probes_are_done_after_join` is un-ignored, and every probe on `SimpleRuntime::spawn_multi` and on a cluster, including one inside a loop body, is done after a successful run. After step 2 they usually stay at a stale frontier (R15, R16); under S2b a retiring worker's probe writers finish with an empty frontier (§5.1.5). Stage inference places each loop's feedback operator in its loop's stage, so `input → exchange_to(k) → iterate` spawns on any worker count (R18). #291's early-finisher oracles are exact, with frontier-observing variants added (§5.5). Every progress-related ignored test is un-ignored, and the inherited lost-record CI flakes pass at least 300 runs each pinned to 2 cores (R31, R32; the step-3 brief lists both). If the design changed during implementation, the TLA+ models are updated and re-run (§5.8). |
 | **4: update downstream projects** | Outside this repository: update them for the sealed types, `retain` and the new error behaviour. | — | Their test suites pass against step 3's instancy. |
-| later, optional | Demand-driven sends; reachability-filtered broadcast; hierarchical stage summaries (design D as an optimization). | — | Only if A/B or cluster benchmarks require it. |
+| later, optional | Demand-driven sends; reachability-filtered broadcast; hierarchical stage summaries (design D as an optimization). | — | Only if the performance work after correctness (§6) requires it. |
 
 **Inside step 3.** One pull request, reviewed as a series of commits, so the large mechanical diff is read apart from the semantic changes:
 1. the shell, ports, ledger and typed endpoints, with every operator migrated (mechanical);
@@ -902,7 +911,7 @@ Intermediate commits may fail tests; only the merged result is gated.
 | **V3 justification** | Per activation, every output batch at `t` and every capability acquisition or downgrade at `t` must have some element of the activation's justification set `J` at or below `t` (§5.1.3). This is the intent of timely's `validate_progress`, with a stricter local rule. It is a hard error in every build. It cannot see work that is consumed and never emitted. | Per output batch and per acquisition. |
 | **V4 end of stream vs frontier, and commit** | Exhausted input implies an empty frontier within bounded sweeps after all peers' final batches. Data at a shut-down operator panics. No `Done`, shutdown or end-of-stream is acted on with an undrained ledger, and every success passes through the one gate (§5.1.1). | Cheap. |
 | **V5 residual** | A worker's scope (S2b(c)) that is non-zero at the final accounting boundary is a proven residual: negative means a missing `+n`, positive means a leak. Before the boundary, a non-zero scope only means *not ready*. In step 1's harness, V5 is a debug report on today's code; from step 3 it is an error in every build. Limitation: V5 cannot see a `+1` and a `−1` masking each other at the same pointstamp. V7 can. | At worker success. |
-| **V6 wire** | Encoder fragments are positives-first; sequence numbers per sender are monotone; end-of-stream follows every committed fragment. | Per frame. |
+| **V6 wire** | Encoder fragments are positives-first, across scope sections too; each worker's seal marker follows its last committed fragment, and end-of-stream follows the seal. There are no per-sender sequence numbers: per-sender lanes are FIFO by construction (R27). | Per frame. |
 | **V7 oracle** (in-process tests) | A test-only model of the true state that is **independent of the accounting under test**. True occupancy per `(location, t)` comes from the *contents* of every store: channel queues, wrapped at every materialization point; `CountedInput` buffers; `CountedOutput` retry queues; output sessions; egress; async pending, running and finished queues. Ledger calls are never used as input. Capabilities are counted from the capability objects themselves. Oracle reachability comes from the *data* graph, feedback edges included. At every propagation, assert S1 for each worker's view against that model. Cluster tests use a per-node oracle plus an end-state check. Exact output-multiset checks stay in every matrix test. | Test only. |
 
 **Conformance matrix** (`tests/progress_conformance.rs`):
@@ -974,7 +983,7 @@ It does **not** include A4 seeding, positives-first splitting, fatal error envel
 - The `e7ac01e` runs held the machine-wide lock while it was free, on a fairly quiet machine.
 - The "2 cores" columns pin the test process to two logical CPUs (affinity `0x3`) to force congestion.
 - Results are from targeted runs. Where timing matters they are indicative, not statistical.
-- No benchmark has run yet; the §6 gates need a quiet machine.
+- No benchmark has run; performance testing is deferred until instancy is correct (§6).
 
 | # | Claim in this doc | Experiment | Main | PR5 prototype | Verdict |
 |---|---|---|---|---|---|
@@ -1063,52 +1072,24 @@ GPT-6 Astra reviewed the acyclic model, then the loop models, for fidelity. Neit
 - the loop guard edge an earlier plan proposed (no longer planned);
 - the scope bridge's import and internal-only export.
 
-The §6 prototype and the A/B gates will cover the costs once the machine is quiet.
+Costs are measured after correctness, against timely (§6).
 
 ---
 
-## 6. Prototype and benchmark plan (task Phase 5)
+## 6. Performance (deferred until correct)
 
-**Not built yet.** Benchmarks run only under the machine-wide benchmark lock, one at a time.
+**No benchmark gates in steps 2–4** (user decision, 2026-10-22). Performance testing is deferred until instancy is fully correct, and will then be done against timely. Until then, no step is held back by a benchmark, and no step runs one as an acceptance check. Earlier revisions planned a throwaway prototype with an interleaved A/B gate before step 3; that plan is dropped.
 
-**Goal.** Measure PCP's hot-path and progress-traffic cost before step 3 is built.
+**What the later performance work should measure** (kept from the dropped plan, as a starting point):
+- **Hot path:** pipeline and exchange throughput (`dataflow_throughput`: `pipeline_throughput`, `exchange_throughput`, `worker_scaling`, `stateful_operator`, `input_frontier`; `comparative`: `MapChain20`, `SmallPipeline`, `MultiEpoch`, `ScanFilterAgg`), with every row asserting the delivered record count, so a lossy run can't look faster. `staged_exchange` (added in step 2) covers stages with different parallelism.
+- **Progress traffic:** progress bytes per data byte for {2, 4, 8} workers × batch {64, 1024} × distinct timestamps per batch {1, 64}, after worker-wide compaction, including a congested slow consumer.
+- **Worst cases for non-cancelling counts:** a 10-map chain × batch size {1, 16, 1024} × capacity {1, default}, at 1 and 4 workers.
+- **Clusters:** a real `spawn_cluster` on loopback TCP, Dedicated and Shared, 2 nodes × {1, 4} workers, map chain + exchange + reduce, with exact output. `transport_throughput` sends synthetic frames without operators, so it can't measure this.
+- **Frontier latency:** from a source's capability release to the downstream probe advancing.
 
-**Prototype.** A throwaway branch, time-boxed to 2–3 days, on the uniform path only, which has a global view:
-1. `PortLedger` in `WiredUnaryOperator` (map family), `WiredUnaryNotifyOperator` (applying the acquisition rule), `WiredSourceOperator`, `ChannelSinkOperator` (with deferred egress credit) and the exchange pass-through. Record `consumed` at `InputHandle::next` and `produced` when the shell takes the logic's output.
-2. The tracker drains these ledgers, expands `produced` over edges, and **compacts worker-wide before sending**. Turn off M-b for covered edges. Use exact-zero completion.
-3. **Only closed, fully covered shapes are measured.** A benchmark containing an uncovered operator (binary, concat, branch, async, iterate) is excluded, because mixed accounting leaves unmatched entries.
-4. Instrumentation behind a `progress-stats` feature:
-   - ledger updates, before and after worker-wide compaction;
-   - progress entries and encoded progress bytes sent per peer per commit;
-   - commits per second;
-   - `propagate_all` time per commit;
-   - frontier latency: the time from a source's capability release to the downstream probe advancing.
-5. Correctness smoke test on the covered shapes: `audit_executor_pipeline_inflight`, `audit_progress_total_counts`, `audit_netprogress_signed_sum`, `audit_progress_unwired_exchange`.
-
-**A/B.** The project's interleaved A/B runner, `bench-ab.ps1` (kept outside the repository). It holds the machine-wide lock, runs three rounds, and includes timely control rows. Variants `main=<sha>` and `proto=<sha>`:
-
-| Benchmark | Filter | Why |
-|---|---|---|
-| `dataflow_throughput` | `pipeline_throughput` (`map_chain_3`, `map_chain_10`) | Pipeline edges gain counting. |
-| | `exchange_throughput`, `worker_scaling` | Exchange loses its `Mutex`; broadcast volume grows with workers. These rows must first be amended to assert the delivered record count, so a lossy baseline can't look faster. |
-| | `input_frontier`, `stateful_operator` (`reduce_sum` only) | Frontier-sensitive paths. |
-| `comparative` | `MapChain20`, `SmallPipeline`, `MultiEpoch`, `ScanFilterAgg` | Standard set, with timely as the noise control. `ScanFilterAgg` uses `unary_notify`, so the prototype must cover notify. |
-| new `progress_cluster` | a real `spawn_cluster` on loopback TCP, Dedicated and Shared, 2 nodes × {1, 4} workers, map chain + exchange + reduce | Cross-node progress bytes interfering with data. `transport_throughput` sends synthetic frames without dataflow operators (`benches/transport_throughput.rs:117-210`), so it cannot measure this. Exact output verification. |
-| new `progress_overhead` | 10-map chain × batch size {1, 16, 1024} × capacity {1, default} × distinct timestamps per batch {1, 64}, at 1 and 4 workers; plus a slow consumer (congestion) | Worst cases for non-cancelling counts. |
-
-Each scenario keeps its construction and startup time separate from steady-state throughput.
-
-**Decision gates** (per scenario, not just geomean). The per-row rule follows the coordinator's noise-aware gate (2026-10-22): the reference's round-to-round spread has a median of about ×1.05–1.09, so a flat 3% limit sits below the noise.
-- **Per row:** not flagged beyond max(5%, the reference's measured noise), after a 5-round recheck of the flagged groups.
-- **Instancy geomean:** ≤ ×1.02, with the timely control rows within ±3%.
-- **Batch size 1:** ≤ 10%, or a documented reason.
-- Frontier latency p50 no worse than main by more than 10%.
-- **Traffic, as a matrix rather than one ratio.** Report progress bytes per data byte for {2, 4, 8} workers × batch {64, 1024} × distinct timestamps {1, 64}. Gate: ≤ 1% at 4 workers, batch 1024, 1 timestamp, after compaction. Above that, the supported scale is stated in the docs.
-
-If a gate fails, add demand-driven sends to the prototype and re-measure before step 3. Worker-wide compaction is mandatory from the start, not a fallback.
+**Planned mitigations, if the measurements call for them:** demand-driven sends (timely's `is_global` test, §5.1.6), reachability-filtered broadcast, and hierarchical stage summaries (design D). Worker-wide compaction is part of the design from the start (§5.1.1), not a mitigation.
 
 ---
-
 ## 7. Open questions, with recommended answers
 
 The coordinator recommended an answer to each question (✓). Where the reviews changed an answer, the change is stated. All answers still need the user's approval.
@@ -1119,7 +1100,7 @@ The coordinator recommended an answer to each question (✓). Where the reviews 
 4. **No temporary loop restrictions.** *Updated for the four-step plan:* earlier revisions rejected notify-family operators, `retain`, probes and frontier reads inside `iterate` until nested scopes landed, and added a loop guard edge to protect observers downstream of a loop. Nested scopes now ship together with port counting in step 3, so neither is needed. Identity cycles (a loop whose summary doesn't advance the iteration) stay rejected at build time, permanently (§5.1.7).
 5. **Probes include queued data.** ✓ Yes, as read-only projections.
 6. **Use exact-zero completion in the end state.** ✓ Yes. *Amended:* worker success uses exact zero over the worker's scope (S2b). Before the final accounting boundary (every worker's seal marker applied), a non-zero scope means "not ready", not an error. Dataflow completion is all workers succeeding, so no surviving observer is needed (§2.2).
-7. **Demand-driven sends only if the A/B requires them.** ✓ Yes. Worker-wide compaction, however, is mandatory from the start.
+7. **Demand-driven sends only if the later performance work (§6) requires them.** ✓ Yes. Worker-wide compaction, however, is mandatory from the start.
 8. **Broadcast scope all-to-all.** ✓ Yes, with the supported scale stated from the traffic matrix (§6).
 9. **SimpleRuntime gets progress channels.** ✓ Yes. *Updated for the four-step plan:* in step 2, with the executor merge.
 10. **Positives-first here, and PR8 skips reassembly.** ✓ Done: PR8 (#292) shipped positives-first ordering, and step 1's V6 check confirms it. Step 3 extends it across scope sections.

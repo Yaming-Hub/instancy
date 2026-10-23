@@ -7,7 +7,7 @@ This document is the entry point for the instancy design set. It keeps the archi
 - [Execution model](./execution-model.md) — worker pool, logical workers, scheduling, inputs/outputs, load control, and per-stage parallelism.
 - [Communication layer](./communication.md) — intra-process channels, inter-process connections, pooling, shared connection mode, wire protocol, and dataflow isolation.
 - [Progress tracking](./progress-tracking.md) — reachability, frontier computation, notifications, loops, distributed progress exchange, and quiescence.
-- [Progress accounting redesign](./progress-accounting-design.md) — correctness invariants, an inventory of where work can live, candidate designs, and the port-counted progress design with its four-step plan. Approved; step 1 (the test harness) is merged and step 2 is in progress.
+- [Progress accounting redesign](./progress-accounting-design.md) — correctness invariants, an inventory of where work can live, candidate designs, and the port-counted progress design with its four-step plan. Approved; steps 1 (the test harness) and 2 (one executor core) are merged, and step 3 is next.
   - [Decision log](./progress-accounting-decisions.md) — one line per design and plan decision: what, why, and who decided.
   - [TLA+ models](./tla/README.md) — bounded model checks of the design (TLC), with their results and limits.
 - [Error handling](./error-handling.md) — error hierarchy, propagation, poison handling, panic-removal policy, and no-global-state guarantees for failure handling.
