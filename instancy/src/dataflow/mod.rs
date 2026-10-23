@@ -30,7 +30,7 @@ pub use dataflow_builder::{
     DataflowBuilder, DataflowBuilderConfig, LogicalDataflow, OutputPort, Pipe,
 };
 pub use executor::{DataflowExecutor, ExecutorConfig};
-pub use graph::{ChannelKind, DataflowGraph, EdgeInfo, OperatorInfo};
+pub use graph::{ChannelKind, DataflowGraph, Delivery, EdgeInfo, OperatorInfo};
 pub use id::DataflowId;
 pub use operators::handles::{InputHandle, NotificationHandle, OutputHandle, OutputSession};
 pub use operators::input::{ChannelInput, InputEvent, TimestampedInput, VecInput};

@@ -2084,10 +2084,6 @@ impl<S: Timestamp, D: 'static, M: 'static> Push<S, D, M> for CheckedPush<S, D, M
         self.inner.available_capacity()
     }
 
-    fn set_inflight_reporter(&mut self, reporter: crate::progress::operate::ProgressReporter<S>) {
-        self.inner.set_inflight_reporter(reporter);
-    }
-
     fn check_port(&self) -> Option<Port<S>> {
         Some(self.source.clone())
     }
@@ -2118,10 +2114,6 @@ impl<S: Timestamp, D: 'static, M: 'static> Pull<S, D, M> for CheckedPull<S, D, M
                 .exhausted(self.target.loc, self.target.worker);
         }
         exhausted
-    }
-
-    fn set_inflight_reporter(&mut self, reporter: crate::progress::operate::ProgressReporter<S>) {
-        self.inner.set_inflight_reporter(reporter);
     }
 
     fn check_port(&self) -> Option<Port<S>> {

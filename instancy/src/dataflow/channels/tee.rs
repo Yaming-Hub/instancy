@@ -150,14 +150,6 @@ impl<T: Timestamp, D: Clone + Send + 'static, M: Clone + Default + Send + 'stati
         self.closed
     }
 
-    fn set_inflight_reporter(&mut self, reporter: crate::progress::operate::ProgressReporter<T>) {
-        // Propagate to every branch. Only exchange branches record; regular
-        // branches no-op — so in-flight accounting stays tee-safe.
-        for target in &mut self.targets {
-            target.set_inflight_reporter(reporter.clone());
-        }
-    }
-
     #[cfg(any(debug_assertions, feature = "progress-check"))]
     fn check_port(&self) -> Option<crate::progress::check::Port<T>> {
         // Every branch shares the producing output.

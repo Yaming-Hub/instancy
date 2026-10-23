@@ -5608,7 +5608,9 @@ fn materialize_executor<T: Timestamp>(
         max_timeline_events: dataflow.max_timeline_events,
         timeline_start_time,
     };
-    let worker_subgraph_builder = dataflow.subgraph_builder.clone();
+    let mut worker_subgraph_builder = dataflow.subgraph_builder.clone();
+    // Progress edges are the materialized graph's data edges (P-8).
+    worker_subgraph_builder.set_edges_from_graph(&dataflow.graph);
     #[cfg(any(debug_assertions, feature = "progress-check"))]
     let check_oracle = dataflow.check.clone();
     #[cfg(any(debug_assertions, feature = "progress-check"))]
@@ -5691,7 +5693,7 @@ fn materialize_executor<T: Timestamp>(
     }
     // A4: every initial capability is seeded once per worker running its
     // operator; nothing initial is broadcast.
-    tracker.initialize_for_plan(plan)?;
+    tracker.initialize_for_plan(plan, Some(&dataflow.graph), worker_context.worker_index())?;
     executor.set_progress_tracker(tracker);
 
     // Register probes. Each worker that runs a probed operator attaches its

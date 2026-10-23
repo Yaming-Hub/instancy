@@ -90,10 +90,6 @@ impl<T: Timestamp, D1: Send + 'static, D2: Send + 'static> OperatorLogic for Una
     fn holds_work(&self) -> bool {
         self.guard.is_some()
     }
-
-    fn inputs_closed(&mut self) {
-        self.guard = None;
-    }
 }
 
 /// A unary operator running `logic`.
@@ -183,10 +179,6 @@ impl<T: Timestamp, D: Send + 'static> OperatorLogic for SourceLogic<T, D> {
 
     fn holds_work(&self) -> bool {
         !self.pending.is_empty() || self.capability.is_some()
-    }
-
-    fn inputs_closed(&mut self) {
-        self.capability = None;
     }
 }
 
@@ -613,11 +605,6 @@ impl<T: Timestamp, D1: Send + 'static, D2: Send + 'static> OperatorLogic
 
     fn has_ready_notifications(&self) -> bool {
         self.notificator.has_ready()
-    }
-
-    fn inputs_closed(&mut self) {
-        // No more input: every pending notification may fire.
-        self.notificator.update_frontier(&Antichain::new());
     }
 }
 
@@ -1058,7 +1045,8 @@ pub(crate) mod tests {
             output(ch.pusher),
             false,
         );
-        assert_eq!(op.activate().unwrap(), ActivationOutcome::Done);
+        op.activate().unwrap();
+        assert!(op.exhausted());
         assert_eq!(drain(&mut pull), vec![(0, vec![1, 2, 3]), (1, vec![4, 5])]);
     }
 
@@ -1091,7 +1079,8 @@ pub(crate) mod tests {
         );
         push_in.push(Envelope::data(0, vec![1, 2, 3])).unwrap();
         push_in.close();
-        assert_eq!(op.activate().unwrap(), ActivationOutcome::Done);
+        op.activate().unwrap();
+        assert!(op.exhausted());
         assert_eq!(drain(&mut pull_out), vec![(0, vec![2, 4, 6])]);
         assert_eq!(consumed.drain(), vec![(0, 3)]);
         assert_eq!(produced.drain(), vec![(0, 3)]);
@@ -1171,9 +1160,16 @@ pub(crate) mod tests {
             move |time, data| sink_collected.lock().unwrap().push((time, data)),
             input(ch2.puller),
         );
-        assert_eq!(src.activate().unwrap(), ActivationOutcome::Done);
-        assert_eq!(double.activate().unwrap(), ActivationOutcome::Done);
-        assert_eq!(snk.activate().unwrap(), ActivationOutcome::Done);
+        // Each operator ends its stream only when shut down (here by hand;
+        // in a dataflow, by the executor's decision module).
+        src.activate().unwrap();
+        assert!(src.exhausted());
+        src.shut_down();
+        double.activate().unwrap();
+        assert!(double.exhausted());
+        double.shut_down();
+        snk.activate().unwrap();
+        assert!(snk.exhausted());
         assert_eq!(*collected.lock().unwrap(), vec![(0u64, vec![20, 40, 60])]);
     }
 
@@ -1195,7 +1191,8 @@ pub(crate) mod tests {
         );
         push_in.push(Envelope::data(0, vec![1, 2, 3, 4])).unwrap();
         push_in.close();
-        assert_eq!(op.activate().unwrap(), ActivationOutcome::Done);
+        op.activate().unwrap();
+        assert!(op.exhausted());
         assert_eq!(drain(&mut pull_true), vec![(0, vec![2, 4])]);
         assert_eq!(drain(&mut pull_false), vec![(0, vec![1, 3])]);
     }
@@ -1223,7 +1220,8 @@ pub(crate) mod tests {
             ))
             .unwrap();
         push_in.close();
-        assert_eq!(op.activate().unwrap(), ActivationOutcome::Done);
+        op.activate().unwrap();
+        assert!(op.exhausted());
         assert_eq!(drain(&mut pull_ok), vec![(0, vec![1, 3])]);
         assert_eq!(drain(&mut pull_err), vec![(0, vec!["bad".to_string()])]);
     }
@@ -1245,7 +1243,8 @@ pub(crate) mod tests {
         );
         push_in.push(Envelope::data(0, vec![1, 2])).unwrap();
         push_in.close();
-        assert_eq!(op.activate().unwrap(), ActivationOutcome::Done);
+        op.activate().unwrap();
+        assert!(op.exhausted());
         assert_eq!(drain(&mut pull_left), vec![(0, vec![1, 2])]);
         assert_eq!(drain(&mut pull_right), vec![(0, vec![1, 2])]);
     }

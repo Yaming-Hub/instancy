@@ -423,6 +423,10 @@ pub(crate) fn graph_fingerprint<T: crate::progress::timestamp::Timestamp>(
                 crate::dataflow::graph::ChannelKind::Pipeline => 0,
                 crate::dataflow::graph::ChannelKind::Exchange => 1,
             });
+            self.num(match e.delivery {
+                crate::dataflow::graph::Delivery::One => 0,
+                crate::dataflow::graph::Delivery::AllTargetHosts => 1,
+            });
         }
     }
 

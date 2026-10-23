@@ -23,7 +23,9 @@ use crate::worker::WorkerContext;
 
 /// The result of activating an operator once.
 ///
-/// Used by the executor to decide which operators to re-schedule.
+/// Used by the executor to decide which operators to re-schedule. An
+/// operator's own view of its end ([`Done`](Self::Done), or exhaustion) is
+/// only a hint: only the executor's decision module shuts an operator down.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ActivationOutcome {
     /// The operator processed data or made meaningful progress.
@@ -86,11 +88,31 @@ pub trait SchedulableOperator: Send {
     /// The execution stage this operator belongs to.
     fn stage_id(&self) -> StageId;
 
-    /// Close all input channels to signal no more data will arrive.
-    ///
-    /// Called by the executor when upstream operators have completed or
-    /// the dataflow is shutting down.
-    fn close_inputs(&mut self);
+    /// Whether the operator could shut down: it holds no capability and has
+    /// nothing left to hand over (input waiting for its logic, output
+    /// waiting for a channel, external egress, async work). The executor
+    /// shuts it down (S2a) once, in addition, every input frontier is empty
+    /// in its worker's view.
+    fn can_shut_down(&self) -> bool {
+        true
+    }
+
+    /// Shut the operator down (S2a): it closes its outputs and is never
+    /// activated again. Only the executor's decision module calls this.
+    fn shut_down(&mut self) {}
+
+    /// Whether the operator is exhausted (latched, R39): every input has
+    /// reached end of stream, its input buffers are empty, it holds no
+    /// capability and has nothing to hand over. An exhausted operator does
+    /// not close its outputs; only [`shut_down`](Self::shut_down) does.
+    fn exhausted(&self) -> bool {
+        self.is_done()
+    }
+
+    /// After the operator shut down: fail if a record reached it (S3).
+    fn check_after_shutdown(&mut self) -> Result<()> {
+        Ok(())
+    }
 
     /// Stop accepting data from outside the dataflow (graceful drain).
     ///
@@ -259,7 +281,7 @@ impl ChannelEndpoints {
                     port: format!("input {port}"),
                 })
             })?;
-        let mut pull = *pull
+        let pull = *pull
             .downcast::<Box<dyn crate::dataflow::channels::pushpull::Pull<T, D>>>()
             .map_err(|_| {
                 Error::Dataflow(DataflowError::TypeMismatch {
@@ -267,7 +289,7 @@ impl ChannelEndpoints {
                     port: format!("input {port}"),
                 })
             })?;
-        self.wire_inflight_target::<T, D, ()>(self.operator, port, &mut *pull);
+
         let ledger = self
             .reporters()
             .and_then(|r| r.consumed::<T>(self.operator, port))
@@ -322,9 +344,9 @@ impl ChannelEndpoints {
                     })
             })
             .collect::<crate::Result<_>>()?;
-        let mut push: Box<dyn Push<T, D>> = crate::dataflow::channels::tee::tee_or_single(pushers)?
+        let push: Box<dyn Push<T, D>> = crate::dataflow::channels::tee::tee_or_single(pushers)?
             .unwrap_or_else(|| Box::new(crate::dataflow::channels::NullPush));
-        self.wire_inflight_source::<T, D, ()>(self.operator, port, &mut *push);
+
         let ledger = self
             .reporters()
             .and_then(|r| r.produced::<T>(self.operator, port))
@@ -349,81 +371,6 @@ impl ChannelEndpoints {
         output: usize,
     ) -> Option<crate::progress::operate::ProgressReporter<T>> {
         self.reporters()?.internal::<T>(operator, output)
-    }
-
-    /// Returns the in-flight reporter for a boundary edge whose **source** is
-    /// `(operator, output)` — i.e. the produced reporter the sender's output
-    /// pusher should record into. `T` is the *channel's* timestamp (which is
-    /// `Product<…>` for an exchange inside a loop, not the worker tracker's `T`).
-    pub fn inflight_reporter_by_source<T: crate::progress::timestamp::Timestamp>(
-        &self,
-        operator: usize,
-        output: usize,
-    ) -> Option<crate::progress::operate::ProgressReporter<T>> {
-        self.progress_reporters
-            .as_ref()?
-            .downcast_ref::<crate::progress::subgraph::MaterializationReporters>()?
-            .inflight_by_source::<T>(operator, output)
-    }
-
-    /// Returns the in-flight reporter for a boundary edge whose **target** is
-    /// `(operator, input)` — i.e. the consumed reporter the consumer's input
-    /// puller should record into.
-    pub fn inflight_reporter_by_target<T: crate::progress::timestamp::Timestamp>(
-        &self,
-        operator: usize,
-        input: usize,
-    ) -> Option<crate::progress::operate::ProgressReporter<T>> {
-        self.progress_reporters
-            .as_ref()?
-            .downcast_ref::<crate::progress::subgraph::MaterializationReporters>()?
-            .inflight_by_target::<T>(operator, input)
-    }
-
-    /// Wire the **producing** side of a boundary (exchange) edge: if an
-    /// in-flight reporter is registered for the edge sourced at
-    /// `(operator, output)`, attach it to `pusher` so every batch it sends
-    /// records `+count`.
-    ///
-    /// This is the single, canonical place to source an exchange's producing
-    /// side. Centralizing the lookup+attach in one call (instead of the two
-    /// separate steps at each operator factory) means the `set_inflight_reporter`
-    /// can't be forgotten after the lookup: forgetting the `+count` while the
-    /// consumer still records `-count` drives the in-flight net negative and
-    /// hangs the dataflow (the `iter_var.exchange` failure mode). Any future
-    /// exchange-sourcing operator factory should call this rather than re-deriving
-    /// the pattern. No-op for non-exchange outputs.
-    pub fn wire_inflight_source<T, D, M>(
-        &self,
-        operator: usize,
-        output: usize,
-        pusher: &mut (dyn crate::dataflow::channels::pushpull::Push<T, D, M> + '_),
-    ) where
-        T: crate::progress::timestamp::Timestamp,
-    {
-        if let Some(reporter) = self.inflight_reporter_by_source::<T>(operator, output) {
-            pusher.set_inflight_reporter(reporter);
-        }
-    }
-
-    /// Wire the **consuming** side of a boundary (exchange) edge: if an in-flight
-    /// reporter is registered for the edge targeted at `(operator, input)`,
-    /// attach it to `puller` so every delivered batch records `-count`.
-    ///
-    /// Counterpart to [`wire_inflight_source`](Self::wire_inflight_source); the
-    /// producing `+count` and this consuming `-count` must be wired symmetrically.
-    /// No-op for non-exchange inputs.
-    pub fn wire_inflight_target<T, D, M>(
-        &self,
-        operator: usize,
-        input: usize,
-        puller: &mut (dyn crate::dataflow::channels::pushpull::Pull<T, D, M> + '_),
-    ) where
-        T: crate::progress::timestamp::Timestamp,
-    {
-        if let Some(reporter) = self.inflight_reporter_by_target::<T>(operator, input) {
-            puller.set_inflight_reporter(reporter);
-        }
     }
 
     /// Take all output pushers for the given port, leaving the slot empty.

@@ -56,7 +56,7 @@ use crate::progress::timestamp::Timestamp;
 /// Whether a [`ProgressChange`] is a capability change at an operator output
 /// (a *source* pointstamp) or an in-flight message change at an operator input
 /// (a *target* pointstamp).
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum ProgressKind {
     /// Capability change at `(node, output_port)` — applied via `update_source`.
     Source,

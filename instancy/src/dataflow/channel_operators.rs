@@ -405,10 +405,6 @@ impl<T: Timestamp, D: Send + 'static> OperatorLogic for ChannelSourceLogic<T, D>
         // Fail async senders blocked on capacity now; buffered events remain.
         self.receiver.close();
     }
-
-    fn inputs_closed(&mut self) {
-        self.finish();
-    }
 }
 
 /// A channel source operator: `logic` (see [`ChannelSourceLogic`]) with its
@@ -1134,12 +1130,12 @@ mod tests {
             wake.take_notification();
             wake.register_waker(&Waker::from(executor.clone()));
             drop_first();
-            assert!(!executor.source.lock().unwrap().is_done());
+            assert!(!executor.source.lock().unwrap().exhausted());
             drop_last();
             // Break the test waker cycle even if the assertion below fails.
             wake.clear_waker();
             assert!(
-                executor.source.lock().unwrap().is_done() || wake.take_notification(),
+                executor.source.lock().unwrap().exhausted() || wake.take_notification(),
                 "EOF must be observed or followed by a fresh wake; async_io={async_io}"
             );
             executor.source.lock().unwrap().activate().unwrap();
@@ -1290,10 +1286,8 @@ mod tests {
                 true,
                 16,
             );
-            assert!(matches!(
-                source.activate().unwrap(),
-                ActivationOutcome::Done
-            ));
+            source.activate().unwrap();
+            assert!(source.exhausted());
             let mut observed = Vec::new();
             while let Some(envelope) = pull.pull() {
                 let (time, data) = envelope.as_data().unwrap();
@@ -1375,10 +1369,8 @@ mod tests {
         assert_eq!(reporter.drain(), vec![(0, -1)]);
         assert_eq!(a_rx.pull().unwrap().as_data(), Some((&11, &vec![1, 2])));
         assert_eq!(b_rx.pull().unwrap().as_data(), Some((&11, &vec![-1])));
-        assert!(matches!(
-            source.activate().unwrap(),
-            ActivationOutcome::Done
-        ));
+        source.activate().unwrap();
+        assert!(source.exhausted());
         assert_eq!(b_rx.pull().unwrap().as_data(), Some((&11, &vec![1, 2])));
         assert!(
             a_rx.pull().is_none() && b_rx.pull().is_none(),
@@ -1422,10 +1414,8 @@ mod tests {
             ));
         }
         drop(sender);
-        assert!(matches!(
-            source.activate().unwrap(),
-            ActivationOutcome::Done
-        ));
+        source.activate().unwrap();
+        assert!(source.exhausted());
         assert_eq!(pull.pull().unwrap().as_data(), Some((&0, &vec![1])));
         assert_eq!(pull.pull().unwrap().as_data(), Some((&10, &vec![2])));
         assert!(pull.pull().is_none());
@@ -1460,7 +1450,7 @@ mod tests {
         assert_eq!(*t, 1);
         assert_eq!(d, &vec![4, 5]);
 
-        assert!(!op.is_done());
+        assert!(!op.exhausted());
         assert_eq!(counter.load(Ordering::SeqCst), 1);
     }
 
@@ -1476,9 +1466,8 @@ mod tests {
             Arc::clone(&counter),
         );
         drop(tx);
-        let outcome = op.activate().unwrap();
-        assert!(matches!(outcome, ActivationOutcome::Done));
-        assert!(op.is_done());
+        op.activate().unwrap();
+        assert!(op.exhausted());
         assert_eq!(counter.load(Ordering::SeqCst), 0);
     }
 
@@ -1507,14 +1496,15 @@ mod tests {
             let outcome = op.activate().unwrap();
             if abandoned {
                 assert!(matches!(outcome, ActivationOutcome::Idle));
-                assert!(!op.is_done());
+                assert!(!op.exhausted());
                 assert!(
                     !pull.is_exhausted(),
                     "a cut-off input must not look complete"
                 );
                 assert_eq!(counter.load(Ordering::SeqCst), 1);
             } else {
-                assert!(matches!(outcome, ActivationOutcome::Done));
+                assert!(op.exhausted());
+                op.shut_down();
                 assert!(pull.is_exhausted());
                 assert_eq!(counter.load(Ordering::SeqCst), 0);
             }
@@ -1534,7 +1524,7 @@ mod tests {
         );
         let outcome = op.activate().unwrap();
         assert!(matches!(outcome, ActivationOutcome::Idle));
-        assert!(!op.is_done());
+        assert!(!op.exhausted());
     }
 
     fn test_sink(
@@ -1570,7 +1560,7 @@ mod tests {
 
         let (mut op, consumed) = test_sink(Box::new(pull), OutputSend::Std(tx));
         let _ = op.activate().unwrap();
-        if !op.is_done() {
+        if !op.exhausted() {
             let _ = op.activate();
         }
         assert_eq!(rx.recv().unwrap(), OutputEvent::data(0, vec![10, 20]));
@@ -1604,7 +1594,7 @@ mod tests {
         pusher.push(Envelope::data(0, vec![1, 2])).unwrap();
         pusher.close();
         let (mut op, consumed) = test_sink(Box::new(pull), OutputSend::Std(tx));
-        while !op.is_done() {
+        for _ in 0..3 {
             op.activate().unwrap();
         }
         assert_eq!(consumed.drain(), vec![(0, 2)], "the discard is recorded");

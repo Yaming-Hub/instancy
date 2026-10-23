@@ -29,92 +29,6 @@ use crate::progress::progress_channel::{ProgressChange, ProgressKind, WorkerProg
 use crate::progress::reachability::{Builder as ReachabilityBuilder, Location, Tracker};
 use crate::progress::timestamp::Timestamp;
 
-/// A type-erased boundary in-flight reporter (a `ProgressReporter<S>` for some
-/// timestamp type `S`), together with the function that drains it into the
-/// tracker's own timestamp type `T`.
-///
-/// For a boundary channel at the same scope as the tracker, `S == T` and the
-/// drain is the identity. For an exchange **inside a loop**, the channel's
-/// timestamp is `Product<T, Inner>` while the tracker is `T`, so the drain
-/// projects each `Product` time onto its outer coordinate. The reporter is held
-/// as `Arc<dyn Any>` and the drain/`fresh` functions are monomorphized at the
-/// `iterate` call site (which knows `Inner`), so per-worker `deep_clone` can mint
-/// independent reporters without the parent scope knowing `Inner`.
-type InflightReporterAny = Arc<dyn Any + Send + Sync>;
-/// Drains a type-erased reporter into `(tracker timestamp, diff)` pairs.
-///
-/// A closure rather than a function pointer so that loop-body bindings can be
-/// projected through any number of nested scopes: each `iterate` level wraps
-/// its body's drain with one more `Product::outer` projection.
-type InflightDrainFn<T> = Arc<dyn Fn(&(dyn Any + Send + Sync)) -> Vec<(T, i64)> + Send + Sync>;
-/// Mints a fresh, independent type-erased reporter (for per-worker cloning).
-/// Always mints the reporter type of the channel itself (the innermost scope's
-/// timestamp), regardless of how many scope levels the binding was lifted.
-type InflightFreshFn = fn() -> InflightReporterAny;
-
-/// A boundary in-flight binding: where it lands (`target`), where it is recorded
-/// from (`source`, for the producing channel lookup), the reporter, and the
-/// drain/fresh functions.
-struct InflightBinding<T: Timestamp> {
-    source: (usize, usize),
-    target: (usize, usize),
-    reporter: InflightReporterAny,
-    drain: InflightDrainFn<T>,
-    fresh: InflightFreshFn,
-}
-
-/// A loop body's in-flight binding, handed to the enclosing scope's builder
-/// when the body is merged into it.
-pub(crate) struct LoopInflightBinding<T: Timestamp> {
-    source: (usize, usize),
-    target: (usize, usize),
-    reporter: InflightReporterAny,
-    drain: InflightDrainFn<T>,
-    fresh: InflightFreshFn,
-}
-
-/// Drain function for a same-scope reporter (`S == T`): identity.
-fn drain_inflight_same<T: Timestamp>(reporter: &(dyn Any + Send + Sync)) -> Vec<(T, i64)> {
-    let reporter = reporter.downcast_ref::<ProgressReporter<T>>();
-    // A registered same-scope reporter must resolve to `ProgressReporter<T>`. A
-    // failed downcast would silently drop the in-flight message (yielding no
-    // updates), making an outstanding message invisible again and silently
-    // reintroducing the data-loss bug this accounting exists to prevent
-    // (#277). Fail loudly in debug/tests instead of dropping data.
-    debug_assert!(
-        reporter.is_some(),
-        "in-flight reporter failed to downcast to ProgressReporter<{}>; \
-         reporter type does not match the registered timestamp type",
-        std::any::type_name::<T>(),
-    );
-    reporter.map(|r| r.drain()).unwrap_or_default()
-}
-
-/// `fresh` function for a same-scope reporter.
-fn fresh_inflight_same<T: Timestamp>() -> InflightReporterAny {
-    Arc::new(ProgressReporter::<T>::new())
-}
-
-/// Lifts a loop body's drain (into the body timestamp `Product<T, I>`) to the
-/// enclosing scope by projecting each time onto its outer coordinate `T`.
-/// Applied once per `iterate` level, so a binding from a doubly-nested body is
-/// projected twice. The body drain keeps downcasting the channel's own
-/// reporter type (and fails loudly in debug builds on a mismatch, see
-/// [`drain_inflight_same`]).
-fn lift_inflight_drain<T: Timestamp, I: Timestamp>(
-    inner: InflightDrainFn<crate::order::Product<T, I>>,
-) -> InflightDrainFn<T>
-where
-    crate::order::Product<T, I>: Timestamp,
-{
-    Arc::new(move |reporter| {
-        inner(reporter)
-            .into_iter()
-            .map(|(p, d)| (p.outer, d))
-            .collect()
-    })
-}
-
 // ---------------------------------------------------------------------------
 // OperatorShape — static metadata for a registered operator
 // ---------------------------------------------------------------------------
@@ -132,29 +46,20 @@ pub struct OperatorShape {
     pub outputs: usize,
 }
 
-/// Materialization-time progress reporter handles handed to operator factories.
-///
-/// `internal` are per-output capability reporters (keyed by `(op, output)`).
-/// `inflight_by_source`/`inflight_by_target` are the boundary-channel in-flight
-/// reporters, keyed by the exchange edge's source output and target input so the
-/// sender's output pusher and consumer's input puller can each bind to the same
-/// reporter.
+/// Materialization-time progress handles handed to operator factories:
+/// each operator port's capability reporter and port ledger, keyed by
+/// `(operator, port)`.
 ///
 /// This type is **non-generic** on purpose: an operator inside a loop is built
 /// with timestamp `Product<T, _>` while the worker tracker is `T`, so its factory
-/// cannot downcast a `MaterializationReporters<T>`. Keeping the struct
-/// type-erased lets the factory reach the in-flight reporters (each a
-/// `ProgressReporter<S>` for the channel's own `S`) regardless of `T`. The
-/// per-output capability reporters live in `internal`, type-erased as the
-/// concrete `HashMap<(op, output), ProgressReporter<T>>`.
+/// cannot downcast a `MaterializationReporters<T>`. Each map is type-erased as
+/// the concrete `HashMap<(op, port), _<T>>` and looked up by the port's time.
 pub(crate) struct MaterializationReporters {
     internal: Box<dyn Any + Send + Sync>,
     /// Consumed ledgers, `HashMap<(op, input), PortLedger<T>>`.
     consumed: Box<dyn Any + Send + Sync>,
     /// Produced ledgers, `HashMap<(op, output), PortLedger<T>>`.
     produced: Box<dyn Any + Send + Sync>,
-    inflight_by_source: HashMap<(usize, usize), InflightReporterAny>,
-    inflight_by_target: HashMap<(usize, usize), InflightReporterAny>,
 }
 
 impl MaterializationReporters {
@@ -193,34 +98,6 @@ impl MaterializationReporters {
             .get(&(operator, output))
             .cloned()
     }
-
-    /// The in-flight reporter recorded by the producing channel at `(op, output)`,
-    /// downcast to the channel's own timestamp `S`.
-    pub(crate) fn inflight_by_source<S: Timestamp>(
-        &self,
-        operator: usize,
-        output: usize,
-    ) -> Option<ProgressReporter<S>> {
-        self.inflight_by_source
-            .get(&(operator, output))?
-            .as_ref()
-            .downcast_ref::<ProgressReporter<S>>()
-            .cloned()
-    }
-
-    /// The in-flight reporter recorded by the consuming channel at `(op, input)`,
-    /// downcast to the channel's own timestamp `S`.
-    pub(crate) fn inflight_by_target<S: Timestamp>(
-        &self,
-        operator: usize,
-        input: usize,
-    ) -> Option<ProgressReporter<S>> {
-        self.inflight_by_target
-            .get(&(operator, input))?
-            .as_ref()
-            .downcast_ref::<ProgressReporter<S>>()
-            .cloned()
-    }
 }
 
 // ---------------------------------------------------------------------------
@@ -257,13 +134,7 @@ pub struct SubgraphBuilder<T: Timestamp> {
     scope_inputs: usize,
     /// Number of scope-level outputs.
     scope_outputs: usize,
-    /// In-flight message bindings for boundary (exchange) edges. The sending
-    /// channel records `+count` and the consuming channel `-count` on each
-    /// binding's reporter; the tracker drains it (projecting loop-body timestamps
-    /// onto the outer epoch) as message pointstamps at `target`. Looked up at
-    /// materialization by source (sender's output pusher) and target (consumer's
-    /// input puller).
-    inflight_edges: Vec<InflightBinding<T>>,
+
     /// Attaches the progress checker to the capability reporters of `iterate`
     /// bodies merged into this scope. Those operators keep their own
     /// (loop-time) reporters, which no tracker drains (audit H11), so the
@@ -294,18 +165,7 @@ impl<T: Timestamp> Clone for SubgraphBuilder<T> {
                 .collect(),
             scope_inputs: self.scope_inputs,
             scope_outputs: self.scope_outputs,
-            // Freshen reporters so each worker gets independent in-flight state.
-            inflight_edges: self
-                .inflight_edges
-                .iter()
-                .map(|b| InflightBinding {
-                    source: b.source,
-                    target: b.target,
-                    reporter: (b.fresh)(),
-                    drain: Arc::clone(&b.drain),
-                    fresh: b.fresh,
-                })
-                .collect(),
+
             #[cfg(any(debug_assertions, feature = "progress-check"))]
             check_loop_reporters: self.check_loop_reporters.clone(),
         }
@@ -325,59 +185,26 @@ impl<T: Timestamp> SubgraphBuilder<T> {
             progress_buffers: HashMap::new(),
             scope_inputs,
             scope_outputs,
-            inflight_edges: Vec::new(),
+
             #[cfg(any(debug_assertions, feature = "progress-check"))]
             check_loop_reporters: Vec::new(),
         }
     }
 
-    /// Registers an in-flight message binding for a boundary (exchange) edge
-    /// from `source = (op, output)` to `target = (op, input)`, returning a
-    /// clonable reporter handle.
-    ///
-    /// The sending channel (exchange push) records `+count` and the consuming
-    /// channel (exchange pull) records `-count` on this reporter. At
-    /// materialization the same reporter is handed to the sender's output pusher
-    /// (looked up by source) and the consumer's input puller (by target), and
-    /// registered on the [`ProgressTracker`] bound to `target`.
-    pub(crate) fn register_inflight_edge(
-        &mut self,
-        source: (usize, usize),
-        target: (usize, usize),
-    ) -> ProgressReporter<T> {
-        let reporter = ProgressReporter::<T>::new();
-        self.inflight_edges.push(InflightBinding {
-            source,
-            target,
-            reporter: Arc::new(reporter.clone()),
-            drain: Arc::new(drain_inflight_same::<T>),
-            fresh: fresh_inflight_same::<T>,
-        });
-        reporter
-    }
-
-    /// Registers an in-flight binding carried up from a nested loop body, whose
-    /// timestamp is `Product<T, I>`. `binding` is the body's own binding (from
-    /// [`inflight_edges_for_merge`](Self::inflight_edges_for_merge)): its
-    /// reporter is shared with the channel inside the loop, and its drain (into
-    /// `Product<T, I>`, itself possibly lifted from a deeper body) is lifted
-    /// once more onto the outer coordinate `T`, so an unconsumed exchange
-    /// message at any nesting depth keeps the *outer epoch* incomplete. The
-    /// `fresh` function is kept, so per-worker clones mint reporters of the
-    /// channel's own timestamp type.
-    pub(crate) fn register_loop_inflight_edge<I: Timestamp>(
-        &mut self,
-        binding: LoopInflightBinding<crate::order::Product<T, I>>,
-    ) where
-        crate::order::Product<T, I>: Timestamp,
-    {
-        self.inflight_edges.push(InflightBinding {
-            source: binding.source,
-            target: binding.target,
-            reporter: binding.reporter,
-            drain: lift_inflight_drain::<T, I>(binding.drain),
-            fresh: binding.fresh,
-        });
+    /// Replaces the edges with the regular (non-feedback) edges of the
+    /// materialized `graph`, so the progress graph and the data graph can
+    /// never diverge (P-8).
+    pub(crate) fn set_edges_from_graph(&mut self, graph: &crate::dataflow::graph::DataflowGraph) {
+        self.edges = graph
+            .edges()
+            .iter()
+            .map(|edge| {
+                (
+                    Location::source(edge.source.operator_index, edge.source.slot_index),
+                    Location::target(edge.target.operator_index, edge.target.slot_index),
+                )
+            })
+            .collect();
     }
 
     /// Returns clones of the per-output progress reporters keyed by
@@ -396,12 +223,7 @@ impl<T: Timestamp> SubgraphBuilder<T> {
                     .map(move |(output, reporter)| ((*op_idx, output), reporter))
             })
             .collect();
-        let mut inflight_by_source = HashMap::new();
-        let mut inflight_by_target = HashMap::new();
-        for b in &self.inflight_edges {
-            inflight_by_source.insert(b.source, b.reporter.clone());
-            inflight_by_target.insert(b.target, b.reporter.clone());
-        }
+
         let ledgers = |pick: fn(&OperatorProgress<T>) -> &Vec<PortLedger<T>>| {
             let map: HashMap<(usize, usize), PortLedger<T>> = self
                 .progress_buffers
@@ -420,8 +242,6 @@ impl<T: Timestamp> SubgraphBuilder<T> {
             internal: Box::new(internal),
             consumed: ledgers(|p| &p.consumed),
             produced: ledgers(|p| &p.produced),
-            inflight_by_source,
-            inflight_by_target,
         }
     }
 
@@ -591,24 +411,6 @@ impl<T: Timestamp> SubgraphBuilder<T> {
         &self.edges
     }
 
-    /// Returns the in-flight edge bindings for merging a nested scope's
-    /// exchange accounting into a parent builder (see
-    /// [`register_loop_inflight_edge`](Self::register_loop_inflight_edge)).
-    /// The reporter is shared (cloned `Arc`) so the loop-body channel and the
-    /// parent tracker observe the same in-flight counts.
-    pub(crate) fn inflight_edges_for_merge(&self) -> Vec<LoopInflightBinding<T>> {
-        self.inflight_edges
-            .iter()
-            .map(|b| LoopInflightBinding {
-                source: b.source,
-                target: b.target,
-                reporter: b.reporter.clone(),
-                drain: Arc::clone(&b.drain),
-                fresh: b.fresh,
-            })
-            .collect()
-    }
-
     /// Compiles the subgraph into a live [`ProgressTracker`].
     ///
     /// Consumes the builder and returns the tracker along with per-operator
@@ -641,21 +443,24 @@ impl<T: Timestamp> SubgraphBuilder<T> {
 
         let (tracker, scope_summary) = reachability_builder.build();
 
-        // Seed in-flight reporters bound to each boundary edge's target input,
-        // each with its drain function (identity for same-scope channels,
-        // outer-epoch projection for loop-body exchanges).
-        let inflight_reporters: Vec<(usize, usize, InflightReporterAny, InflightDrainFn<T>)> = self
-            .inflight_edges
-            .iter()
-            .map(|b| {
-                (
-                    b.target.0,
-                    b.target.1,
-                    b.reporter.clone(),
-                    Arc::clone(&b.drain),
-                )
-            })
-            .collect();
+        // Every produced record goes to each target of its output's edges,
+        // once per edge (multiplicity 1 until the physical plan says more).
+        let mut routes: HashMap<(usize, usize), Vec<(usize, usize, i64)>> = HashMap::new();
+        for (source, target) in &self.edges {
+            if let (
+                Location::Source { node, port },
+                Location::Target {
+                    node: target_node,
+                    port: target_port,
+                },
+            ) = (source, target)
+            {
+                routes
+                    .entry((*node, *port))
+                    .or_default()
+                    .push((*target_node, *target_port, 1));
+            }
+        }
 
         // Build per-operator frontier state.
         let mut operator_frontiers = HashMap::new();
@@ -684,6 +489,7 @@ impl<T: Timestamp> SubgraphBuilder<T> {
             tracker,
             _scope_summary: scope_summary,
             operators: self.operators,
+            connectivity: self.connectivity,
             progress_buffers: self.progress_buffers,
             initial_capabilities: self.initial_capabilities,
             operator_frontiers,
@@ -693,10 +499,9 @@ impl<T: Timestamp> SubgraphBuilder<T> {
             completed: false,
             dirty_operators: Vec::new(),
             progress_channels: None,
-            local_changes_buffer: Vec::new(),
-            inflight_reporters,
-            #[cfg(debug_assertions)]
-            inflight_net: std::collections::BTreeMap::new(),
+            local_changes: ChangeBatch::new(),
+            routes,
+            scope: Vec::new(),
             #[cfg(any(debug_assertions, feature = "progress-check"))]
             check: None,
         }
@@ -743,6 +548,8 @@ pub struct ProgressTracker<T: Timestamp> {
     tracker: Tracker<T>,
     /// Scope-level summary (retained for introspection).
     _scope_summary: PortConnectivity<T::Summary>,
+    /// Per-operator internal connectivity (for the worker's scope).
+    connectivity: HashMap<usize, PortConnectivity<T::Summary>>,
     /// Registered operator shapes.
     operators: HashMap<usize, OperatorShape>,
     /// Per-operator shared progress buffers.
@@ -769,33 +576,19 @@ pub struct ProgressTracker<T: Timestamp> {
     /// this tracker. This makes `is_completed()` reflect GLOBAL state
     /// across all workers, not just this worker's capabilities.
     progress_channels: Option<WorkerProgressChannels<T>>,
-    /// Buffer for accumulating local changes to broadcast to peers.
-    /// Populated during `collect_operator_progress()` and drained
-    /// during `broadcast_local_changes()`.
-    local_changes_buffer: Vec<ProgressChange<T>>,
-    /// In-flight message reporters, each bound to a downstream input
-    /// `(target_op, target_port)` with the function that drains it into this
-    /// tracker's timestamp `T`. Boundary channels (e.g. exchange) record a
-    /// `+count` when a batch is sent toward that input and a `-count` when it is
-    /// consumed; drained each propagation as `update_target` message pointstamps.
-    /// Loop-body exchanges store a `Product<T, _>` reporter whose drain projects
-    /// each time onto the outer epoch `T`.
-    inflight_reporters: Vec<(usize, usize, InflightReporterAny, InflightDrainFn<T>)>,
-    /// Debug-only cumulative in-flight net per `(target_op, target_port, time)`,
-    /// used ONLY in single-worker mode to fail fast on the producer/consumer
-    /// symmetry invariant ("every `-n` has a matching `+n`").
-    ///
-    /// In single-worker mode the producing and consuming sides of an exchange
-    /// share one reporter, so a running net that goes negative can only mean a
-    /// `-count` was recorded without its matching `+count` — i.e. a missing
-    /// producer-side wiring (the `iter_var.exchange` class of bug), which drives
-    /// the count negative and hangs. Asserting here turns that silent hang into
-    /// a loud panic in tests. NOT applied in multi-worker mode: there the
-    /// `+count` and `-count` land on different per-worker reporters, so a single
-    /// reporter legitimately goes negative before the peer's `+count` broadcast
-    /// is merged.
-    #[cfg(debug_assertions)]
-    inflight_net: std::collections::BTreeMap<(usize, usize, T), i64>,
+    /// This worker's changes since the last commit, compacted worker-wide.
+    /// Filled from the ledgers and reporters by `collect_operator_progress`
+    /// and sent to every peer by `broadcast_local_changes`.
+    local_changes: ChangeBatch<(ProgressKind, usize, usize, T)>,
+    /// Where produced records are counted: for each operator output, the
+    /// target input of each of its data edges and the edge's multiplicity
+    /// (`hosts(target)` for a broadcast, 1 otherwise).
+    routes: HashMap<(usize, usize), Vec<(usize, usize, i64)>>,
+    /// The worker's scope (S2b(c)): every location from which a location
+    /// this worker hosts is reachable in the data graph. Empty until
+    /// `initialize_for_plan`; `None`-like meaning "every location" for a
+    /// single-worker tracker initialized with `initialize`.
+    scope: Vec<Location>,
     /// The progress checker's view of this tracker (see
     /// [`check`](crate::progress::check)): every propagation publishes the
     /// frontiers that changed.
@@ -859,8 +652,94 @@ impl<T: Timestamp> ProgressTracker<T> {
     pub(crate) fn initialize_for_plan(
         &mut self,
         plan: &crate::dataflow::plan::PhysicalPlan,
+        graph: Option<&crate::dataflow::graph::DataflowGraph>,
+        worker: usize,
     ) -> Result<(), crate::Error> {
+        if let Some(graph) = graph {
+            self.set_routes(graph, plan)?;
+            self.set_scope(graph, |op| plan.runs(worker, op));
+        }
         self.seed_and_initialize(plan.total_workers(), |op| plan.seed_multiplicity(op))
+    }
+
+    /// Count produced records at the target of every data edge of the
+    /// materialized graph, regular and feedback alike, with the edge's
+    /// multiplicity from the plan (R35).
+    fn set_routes(
+        &mut self,
+        graph: &crate::dataflow::graph::DataflowGraph,
+        plan: &crate::dataflow::plan::PhysicalPlan,
+    ) -> Result<(), crate::Error> {
+        let mut routes: HashMap<(usize, usize), Vec<(usize, usize, i64)>> = HashMap::new();
+        let edges = graph.edges().iter().chain(graph.feedback_edges());
+        for (index, edge) in edges.enumerate() {
+            let planned = plan.edge(index).ok_or_else(|| {
+                crate::Error::Dataflow(DataflowError::InvalidGraph(format!(
+                    "edge {index} ({edge}) is not in the physical plan"
+                )))
+            })?;
+            routes
+                .entry((edge.source.operator_index, edge.source.slot_index))
+                .or_default()
+                .push((
+                    edge.target.operator_index,
+                    edge.target.slot_index,
+                    planned.multiplicity(),
+                ));
+        }
+        self.routes = routes;
+        Ok(())
+    }
+
+    /// The worker's scope (S2b(c)): every location from which a location
+    /// of an operator `hosted` reports true for is reachable in the data
+    /// graph, feedback edges included and timestamps ignored.
+    fn set_scope(
+        &mut self,
+        graph: &crate::dataflow::graph::DataflowGraph,
+        hosted: impl Fn(usize) -> bool,
+    ) {
+        let mut reverse: HashMap<Location, Vec<Location>> = HashMap::new();
+        for edge in graph.edges().iter().chain(graph.feedback_edges()) {
+            reverse
+                .entry(Location::target(
+                    edge.target.operator_index,
+                    edge.target.slot_index,
+                ))
+                .or_default()
+                .push(Location::source(
+                    edge.source.operator_index,
+                    edge.source.slot_index,
+                ));
+        }
+        for (&op, connectivity) in &self.connectivity {
+            for (input, output, path) in connectivity.iter() {
+                if !path.is_empty() {
+                    reverse
+                        .entry(Location::source(op, output))
+                        .or_default()
+                        .push(Location::target(op, input));
+                }
+            }
+        }
+        let mut seen: std::collections::HashSet<Location> = std::collections::HashSet::new();
+        let mut stack: Vec<Location> = Vec::new();
+        for (&op, shape) in &self.operators {
+            if hosted(op) {
+                stack.extend((0..shape.inputs).map(|i| Location::target(op, i)));
+                stack.extend((0..shape.outputs).map(|o| Location::source(op, o)));
+            }
+        }
+        while let Some(location) = stack.pop() {
+            if seen.insert(location.clone()) {
+                if let Some(upstream) = reverse.get(&location) {
+                    stack.extend(upstream.iter().cloned());
+                }
+            }
+        }
+        let mut scope: Vec<Location> = seen.into_iter().collect();
+        scope.sort();
+        self.scope = scope;
     }
 
     /// Seeds each declared initial capability of `op` `multiplicity(op)`
@@ -919,7 +798,7 @@ impl<T: Timestamp> ProgressTracker<T> {
         self.check_publish(true);
 
         // Check initial completion.
-        self.completed = !self.tracker.tracking_anything();
+        self.completed = self.scope_is_zero();
         Ok(())
     }
 
@@ -928,31 +807,31 @@ impl<T: Timestamp> ProgressTracker<T> {
         self.initialized
     }
 
-    /// Registers an in-flight message reporter bound to a downstream input
-    /// `(target_op, target_port)` and returns a clonable handle.
-    ///
-    /// Boundary channels (e.g. exchange) use this to account data that has been
-    /// handed off but not yet consumed: record `+count` when a batch is sent
-    /// toward the target input and `-count` when it is consumed. Each
-    /// propagation drains the reporter and applies the net change as a message
-    /// pointstamp at the target — so an unconsumed in-flight batch keeps that
-    /// input's frontier (and global completion) from advancing past its
-    /// timestamp. The sender's `+count` and the consumer's `-count` may be
-    /// recorded on different workers/nodes; both are broadcast via the progress
-    /// channels so every tracker observes the global in-flight total.
-    pub fn register_inflight_reporter(
-        &mut self,
-        target_op: usize,
-        target_port: usize,
-    ) -> ProgressReporter<T> {
-        let reporter = ProgressReporter::<T>::new();
-        self.inflight_reporters.push((
-            target_op,
-            target_port,
-            Arc::new(reporter.clone()),
-            Arc::new(drain_inflight_same::<T>),
-        ));
-        reporter
+    /// Whether every count in the worker's scope is exactly zero, with no
+    /// change pending (S2b(c), exact zero). Counts are checked one
+    /// pointstamp at a time, never summed. A tracker initialized without a
+    /// plan checks every location.
+    pub fn scope_is_zero(&self) -> bool {
+        if self.tracker.has_pending() || !self.local_changes.is_empty_clean() {
+            return false;
+        }
+        if self.scope.is_empty() {
+            self.tracker.all_counts_zero()
+        } else {
+            self.scope
+                .iter()
+                .all(|location| self.tracker.counts_zero_at(location))
+        }
+    }
+
+    /// The non-zero counts in the worker's scope (for residual reports).
+    pub(crate) fn scope_residual(&self) -> Vec<String> {
+        self.tracker
+            .nonzero_counts()
+            .into_iter()
+            .filter(|(location, _, _)| self.scope.is_empty() || self.scope.contains(location))
+            .map(|(location, time, count)| format!("{location:?}@{time:?}: {count:+}"))
+            .collect()
     }
 
     /// Collects progress updates from all operators and propagates them.
@@ -971,14 +850,15 @@ impl<T: Timestamp> ProgressTracker<T> {
             )));
         }
 
-        // 1. Collect local capability changes from operators.
-        //    Also accumulates changes into local_changes_buffer for broadcasting.
+        // 1. Collect this worker's changes since the last commit from every
+        //    hosted ledger and reporter, compacted worker-wide, and apply
+        //    them to this view (self-application).
         self.collect_operator_progress();
 
-        // 2. Broadcast local changes to all peer workers.
+        // 2. Send the commit to every peer.
         self.broadcast_local_changes();
 
-        // 3. Receive and apply peer workers' capability changes.
+        // 3. Receive and apply peer workers' changes.
         self.receive_peer_changes()?;
 
         // 4. Propagate all changes through the reachability graph.
@@ -989,15 +869,22 @@ impl<T: Timestamp> ProgressTracker<T> {
         #[cfg(any(debug_assertions, feature = "progress-check"))]
         self.check_publish(false);
 
-        // 6. Check completion — now reflects global state if channels are attached.
-        self.completed = !self.tracker.tracking_anything();
+        // 6. Exact zero over the worker's scope.
+        self.completed = self.scope_is_zero();
 
         Ok(&self.dirty_operators)
     }
 
-    /// Returns `true` if the dataflow has completed (no outstanding capabilities).
+    /// Whether the worker's scope was exactly zero after the last
+    /// propagation (see [`scope_is_zero`](Self::scope_is_zero)).
     pub fn is_completed(&self) -> bool {
         self.completed
+    }
+
+    /// Whether this tracker has progress channels to peers (a multi-worker
+    /// dataflow).
+    pub(crate) fn has_peers(&self) -> bool {
+        self.progress_channels.is_some()
     }
 
     /// Returns `true` if there are any outstanding capabilities or pending changes.
@@ -1019,28 +906,6 @@ impl<T: Timestamp> ProgressTracker<T> {
         }
         self.progress_channels = Some(channels);
         Ok(())
-    }
-
-    /// Returns `true` if any peer worker (logical worker in the same
-    /// dataflow) has sent progress updates that haven't been absorbed yet.
-    ///
-    /// "Peer" means another logical worker/executor running the same
-    /// dataflow graph — it may be on the same thread, a different thread,
-    /// or a different machine. The progress channel abstraction is
-    /// physical-layer independent.
-    ///
-    /// Used as a defense-in-depth check before force-close: even if
-    /// `is_completed()` returns true, pending peer progress could
-    /// invalidate that conclusion.
-    pub fn has_pending_peer_progress(&self) -> crate::Result<bool> {
-        if let Some(ref channels) = self.progress_channels {
-            for recv in channels.receivers.iter().flatten() {
-                if recv.has_pending()? {
-                    return Ok(true);
-                }
-            }
-        }
-        Ok(false)
     }
 
     /// Returns the current input frontier for an operator.
@@ -1236,104 +1101,85 @@ impl<T: Timestamp> ProgressTracker<T> {
 
     // -- internal --
 
-    /// Drains capability changes from all operators' ProgressReporters into the tracker.
+    /// Commits this worker's changes since the last commit: drains every
+    /// hosted operator's ledgers and capability reporters (its release
+    /// mailboxes) into `local_changes`, compacted worker-wide, and applies
+    /// them to this view.
     ///
-    /// Also accumulates changes into `local_changes_buffer` for broadcasting
-    /// to peer workers (if progress channels are attached). Returns the
-    /// number of changes drained.
+    /// - `consumed[in]` becomes `Target(op, in): -n`;
+    /// - `produced[out]` becomes `Target(edge.target): +n * mult` for every
+    ///   data edge of `(op, out)`;
+    /// - `internal[out]` (capabilities) becomes `Source(op, out)`.
+    ///
+    /// Returns the number of changes drained.
     fn collect_operator_progress(&mut self) -> usize {
-        let has_channels = self.progress_channels.is_some();
-        let mut collected = 0;
-
-        // Only iterate materialized operators (those with progress buffers).
+        let mut drained = ChangeBatch::new();
         for &index in &self.materialized_indices {
             let progress = &self.progress_buffers[&index];
-            let shape = &self.operators[&index];
-
-            // Drain internal capability changes (from ProgressReporter).
-            // These are direct capability hold/release on output ports,
-            // reported via Capability::new/clone/drop/downgrade.
-            for output in 0..shape.outputs {
-                let changes = progress.internal[output].drain();
-                collected += changes.len();
-                for (time, diff) in changes {
-                    self.tracker
-                        .update_source(index, output, time.clone(), diff);
-                    // Accumulate for cross-worker broadcast.
-                    if has_channels {
-                        self.local_changes_buffer
-                            .push(ProgressChange::source(index, output, time, diff));
+            for (input, ledger) in progress.consumed.iter().enumerate() {
+                for (time, n) in ledger.drain() {
+                    drained.update((ProgressKind::Target, index, input, time), -n);
+                }
+            }
+            for (output, ledger) in progress.produced.iter().enumerate() {
+                let changes = ledger.drain();
+                if changes.is_empty() {
+                    continue;
+                }
+                let targets = self
+                    .routes
+                    .get(&(index, output))
+                    .map(Vec::as_slice)
+                    .unwrap_or_default();
+                for (time, n) in changes {
+                    for &(target, port, mult) in targets {
+                        drained
+                            .update((ProgressKind::Target, target, port, time.clone()), n * mult);
                     }
                 }
             }
-        }
-
-        // Drain in-flight message reporters. Each is bound to a downstream input
-        // (a boundary-channel target): a `+count` recorded when a batch is sent
-        // and a `-count` when it is consumed. While the net is positive, that
-        // input holds an in-flight message pointstamp — keeping its frontier (and
-        // thus global completion) from advancing past the message's timestamp.
-        // This is what makes completion sound across exchange/boundary channels,
-        // where data is handed between workers/nodes and is invisible to
-        // capability accounting alone. The sender's `+count` and consumer's
-        // `-count` may be recorded on different workers/nodes, so these target
-        // updates are broadcast just like capability changes.
-        for (target_op, target_port, reporter, drain) in &self.inflight_reporters {
-            for (time, diff) in drain(reporter.as_ref()) {
-                collected += 1;
-                // Single-worker symmetry fail-fast: a running in-flight net that
-                // goes negative means a `-count` was recorded without a matching
-                // `+count` (a missing producer-side wiring), which hangs the
-                // dataflow. Only sound single-worker, where one reporter carries
-                // both sides; multi-worker splits them across per-worker reporters.
-                #[cfg(debug_assertions)]
-                if !has_channels {
-                    let key = (*target_op, *target_port, time.clone());
-                    let net = self.inflight_net.entry(key).or_insert(0);
-                    *net += diff;
-                    debug_assert!(
-                        *net >= 0,
-                        "in-flight net for target ({}, {}) went negative ({}): a \
-                         `-count` was recorded without a matching `+count`, \
-                         indicating a missing producer-side in-flight wiring",
-                        target_op,
-                        target_port,
-                        *net,
-                    );
-                }
-                self.tracker
-                    .update_target(*target_op, *target_port, time.clone(), diff);
-                if has_channels {
-                    self.local_changes_buffer.push(ProgressChange::target(
-                        *target_op,
-                        *target_port,
-                        time,
-                        diff,
-                    ));
+            for (output, reporter) in progress.internal.iter().enumerate() {
+                for (time, diff) in reporter.drain() {
+                    drained.update((ProgressKind::Source, index, output, time), diff);
                 }
             }
+        }
+        let mut collected = 0;
+        for ((kind, node, port, time), diff) in drained.drain() {
+            collected += 1;
+            match kind {
+                ProgressKind::Source => self.tracker.update_source(node, port, time.clone(), diff),
+                ProgressKind::Target => self.tracker.update_target(node, port, time.clone(), diff),
+            }
+            self.local_changes.update((kind, node, port, time), diff);
         }
         collected
     }
 
-    /// Broadcasts accumulated local capability changes to all peer workers.
-    ///
-    /// Drains `local_changes_buffer` and sends to each peer's progress channel.
-    /// No-op if no progress channels are attached (single-worker mode).
+    /// Sends this worker's committed changes to every peer worker, as one
+    /// batch per peer. No-op without progress channels (single worker).
     fn broadcast_local_changes(&mut self) {
         let channels = match &self.progress_channels {
             Some(c) => c,
             None => {
-                self.local_changes_buffer.clear();
+                self.local_changes.clear();
                 return;
             }
         };
-
-        if self.local_changes_buffer.is_empty() {
+        let changes: Vec<ProgressChange<T>> = self
+            .local_changes
+            .drain()
+            .map(|((kind, node, port, time), diff)| ProgressChange {
+                kind,
+                node,
+                port,
+                time,
+                diff,
+            })
+            .collect();
+        if changes.is_empty() {
             return;
         }
-
-        let changes = std::mem::take(&mut self.local_changes_buffer);
         for sender in channels.senders.iter().flatten() {
             sender.send(changes.clone());
         }
@@ -1808,59 +1654,167 @@ mod tests {
         assert_eq!(shape.outputs, 3);
     }
 
-    /// An in-flight message bound to a downstream input (sent but not yet
-    /// consumed) must keep the tracker incomplete — even though no operator
-    /// holds a capability. This is the invariant that makes completion sound for
-    /// exchange/boundary channels, where data is handed between workers/nodes and
-    /// is invisible to capability accounting alone.
-    #[test]
-    fn inflight_message_keeps_tracker_incomplete_until_consumed() {
-        // upstream(op1, 1->1) --edge--> downstream(op2, 1->1). A boundary channel
-        // on this edge accounts in-flight messages at op2's input 0.
+    /// upstream(op1) --edge--> downstream(op2), with scope ports.
+    fn upstream_downstream(caps: bool) -> (SubgraphBuilder<u64>, Option<ProgressReporter<u64>>) {
         let mut builder = SubgraphBuilder::<u64>::new(1, 1);
-        builder
-            .add_operator(1, "upstream", 1, 1, PortConnectivity::identity(0u64))
-            .unwrap();
+        let upstream = if caps {
+            let mut held = ChangeBatch::new();
+            held.update(0u64, 1);
+            Some(
+                builder
+                    .add_operator_with_capabilities(
+                        1,
+                        "upstream",
+                        1,
+                        1,
+                        PortConnectivity::identity(0u64),
+                        vec![held],
+                    )
+                    .unwrap()
+                    .reporter(0)
+                    .clone(),
+            )
+        } else {
+            builder
+                .add_operator(1, "upstream", 1, 1, PortConnectivity::identity(0u64))
+                .unwrap();
+            None
+        };
         builder
             .add_operator(2, "downstream", 1, 1, PortConnectivity::identity(0u64))
             .unwrap();
         builder.add_edge(Location::source(0, 0), Location::target(1, 0));
         builder.add_edge(Location::source(1, 0), Location::target(2, 0));
         builder.add_edge(Location::source(2, 0), Location::target(0, 0));
+        (builder, upstream)
+    }
 
+    /// A record produced on an edge and not yet consumed keeps the
+    /// tracker incomplete, even though no operator holds a capability: it
+    /// is counted at the edge's target from the producer's ledger to the
+    /// consumer's.
+    #[test]
+    fn produced_record_keeps_tracker_incomplete_until_consumed() {
+        let (builder, _) = upstream_downstream(false);
         let mut tracker = builder.build();
-        // The boundary channel feeding op2's input 0 registers an in-flight reporter.
-        let inflight = tracker.register_inflight_reporter(2, 0);
         tracker.initialize().unwrap();
         assert!(tracker.is_completed(), "no capabilities: starts completed");
 
-        // A batch is sent toward op2's input at time 5 (not yet consumed).
-        inflight.update(5u64, 1);
+        let produced = tracker.operator_progress(1).unwrap().produced[0].clone();
+        let consumed = tracker.operator_progress(2).unwrap().consumed[0].clone();
+        produced.update(5u64, 1);
         tracker.propagate().unwrap();
         assert!(
             !tracker.is_completed(),
-            "an unconsumed in-flight message must keep the tracker incomplete"
+            "an unconsumed record must keep the tracker incomplete"
         );
+        assert!(tracker.input_frontier(2, 0).less_equal(&5));
 
-        // The batch is consumed.
-        inflight.update(5u64, -1);
+        consumed.update(5u64, 1);
         tracker.propagate().unwrap();
         assert!(
             tracker.is_completed(),
-            "once the message is consumed, the tracker completes"
+            "once consumed, the tracker completes"
+        );
+        assert!(tracker.input_frontier(2, 0).is_empty());
+    }
+
+    /// Exact zero: a `-1` (consumed with no matching produced) and a `+1`
+    /// elsewhere never cancel; neither completes the tracker.
+    #[test]
+    fn exact_zero_never_sums_counts() {
+        let (builder, _) = upstream_downstream(false);
+        let mut tracker = builder.build();
+        tracker.initialize().unwrap();
+        tracker.operator_progress(2).unwrap().consumed[0].update(5u64, 1);
+        tracker.operator_progress(1).unwrap().produced[0].update(7u64, 1);
+        tracker.propagate().unwrap();
+        assert!(!tracker.is_completed());
+        assert_eq!(tracker.scope_residual().len(), 2);
+    }
+
+    /// A produced batch counts once per edge (fan-out) and `mult` times on
+    /// an edge with multiplicity `mult` (broadcast).
+    #[test]
+    fn produced_counts_once_per_edge_with_its_multiplicity() {
+        let mut builder = SubgraphBuilder::<u64>::new(0, 0);
+        for op in 1..=3 {
+            builder
+                .add_operator(
+                    op,
+                    format!("op{op}"),
+                    1,
+                    1,
+                    PortConnectivity::identity(0u64),
+                )
+                .unwrap();
+        }
+        builder.add_edge(Location::source(1, 0), Location::target(2, 0));
+        builder.add_edge(Location::source(1, 0), Location::target(3, 0));
+        let mut tracker = builder.build();
+        tracker.routes.insert((1, 0), vec![(2, 0, 1), (3, 0, 3)]);
+        tracker.initialize().unwrap();
+        tracker.operator_progress(1).unwrap().produced[0].update(4u64, 2);
+        tracker.propagate().unwrap();
+        let mut residual = tracker.scope_residual();
+        residual.sort();
+        assert_eq!(
+            residual,
+            vec![
+                format!("{:?}@4: +2", Location::target(2, 0)),
+                format!("{:?}@4: +6", Location::target(3, 0)),
+            ]
         );
     }
 
-    /// The same invariant across workers, with no data plane: two trackers
-    /// joined only by in-process progress channels. Worker 0 sends a batch
-    /// toward worker 1's `downstream` input and drops its capability; worker
-    /// 1 has dropped its capability too. Until worker 1 consumes the batch,
-    /// both workers' frontiers at that input must hold at the batch's time
-    /// and neither may complete: the sender's `+n` counts in its own view
-    /// and, through the progress channel, in the receiver's. Then worker 1
-    /// consumes it (`-n`) and both complete.
+    /// The worker's scope covers every location a hosted location is
+    /// reachable from, and nothing else: a count downstream of everything
+    /// this worker hosts does not keep it from completing.
     #[test]
-    fn inflight_message_holds_every_workers_frontier_until_consumed() {
+    fn scope_excludes_locations_that_reach_nothing_hosted() {
+        use crate::dataflow::graph::{DataflowGraph, EdgeInfo, OperatorInfo};
+        use crate::dataflow::stage::StageId;
+        use crate::dataflow::stream::Slot;
+        let s = StageId::new(0);
+        let mut graph = DataflowGraph::new();
+        for op in 1..=2 {
+            graph
+                .register_operator(OperatorInfo::new(op, format!("op{op}"), s, 1, 1))
+                .unwrap();
+        }
+        graph.add_edge(EdgeInfo::new(Slot::new(1, 0), Slot::new(2, 0), s, s));
+        let mut builder = SubgraphBuilder::<u64>::new(0, 0);
+        for op in 1..=2 {
+            builder
+                .add_operator(
+                    op,
+                    format!("op{op}"),
+                    1,
+                    1,
+                    PortConnectivity::identity(0u64),
+                )
+                .unwrap();
+        }
+        builder.set_edges_from_graph(&graph);
+        let mut tracker = builder.build();
+        tracker.set_scope(&graph, |op| op == 1);
+        tracker.initialize().unwrap();
+        tracker.operator_progress(2).unwrap().consumed[0].update(1u64, 1);
+        tracker.propagate().unwrap();
+        assert!(tracker.is_completed(), "op2's input is out of op1's scope");
+        tracker.operator_progress(1).unwrap().consumed[0].update(1u64, 1);
+        tracker.propagate().unwrap();
+        assert!(!tracker.is_completed(), "op1's input is in scope");
+    }
+
+    /// Across workers, with no data plane: two trackers joined only by
+    /// in-process progress channels. Worker 0 produces a batch toward
+    /// `downstream` and both workers drop their capabilities. Until worker 1
+    /// consumes the batch, both workers' frontiers at that input must hold at
+    /// the batch's time and neither may complete. Then worker 1 consumes it
+    /// and both complete.
+    #[test]
+    fn produced_record_holds_every_workers_frontier_until_consumed() {
         let t = 3u64;
         let n = 7i64;
         let channels = crate::progress::progress_channel::create_progress_channels::<u64>(
@@ -1871,70 +1825,36 @@ mod tests {
             ],
         )
         .unwrap();
-        // Both workers run both operators; upstream declares a capability
-        // at time 0, seeded once per worker.
         let plan = crate::dataflow::plan::PhysicalPlan::for_hosts(2, &[(1, 2), (2, 2)]);
-        // Per worker: its tracker, its in-flight reporter for downstream's
-        // input, and its upstream capability reporter (while held).
-        type Worker = (
-            ProgressTracker<u64>,
-            ProgressReporter<u64>,
-            Option<ProgressReporter<u64>>,
-        );
+        type Worker = (ProgressTracker<u64>, Option<ProgressReporter<u64>>);
         let mut workers: Vec<Worker> = Vec::new();
         for channels in channels {
-            // upstream(op1) --> downstream(op2), as in the single-worker test.
-            let mut builder = SubgraphBuilder::<u64>::new(1, 1);
-            let mut held = ChangeBatch::new();
-            held.update(0u64, 1);
-            let upstream = builder
-                .add_operator_with_capabilities(
-                    1,
-                    "upstream",
-                    1,
-                    1,
-                    PortConnectivity::identity(0u64),
-                    vec![held],
-                )
-                .unwrap()
-                .reporter(0)
-                .clone();
-            builder
-                .add_operator(2, "downstream", 1, 1, PortConnectivity::identity(0u64))
-                .unwrap();
-            builder.add_edge(Location::source(0, 0), Location::target(1, 0));
-            builder.add_edge(Location::source(1, 0), Location::target(2, 0));
-            builder.add_edge(Location::source(2, 0), Location::target(0, 0));
+            let (builder, upstream) = upstream_downstream(true);
             let mut tracker = builder.build();
-            let inflight = tracker.register_inflight_reporter(2, 0);
             tracker.set_progress_channels(channels).unwrap();
-            workers.push((tracker, inflight, Some(upstream)));
+            workers.push((tracker, upstream));
         }
-        for (tracker, _, _) in &mut workers {
-            tracker.initialize_for_plan(&plan).unwrap();
+        for (w, (tracker, _)) in workers.iter_mut().enumerate() {
+            tracker.initialize_for_plan(&plan, None, w).unwrap();
         }
-        // Two rounds, so each worker has absorbed everything the other sent.
         let exchange = |workers: &mut Vec<Worker>| {
             for _ in 0..2 {
-                for (tracker, _, _) in workers.iter_mut() {
+                for (tracker, _) in workers.iter_mut() {
                     tracker.propagate().unwrap();
                 }
             }
         };
         exchange(&mut workers);
 
-        // Worker 0 sends n records at t toward worker 1's downstream input,
-        // then both workers release their capabilities.
-        workers[0].1.update(t, n);
-        for (_, _, capability) in &mut workers {
+        workers[0].0.operator_progress(1).unwrap().produced[0].update(t, n);
+        for (_, capability) in &mut workers {
             capability.take().unwrap().update(0, -1);
         }
         exchange(&mut workers);
-        for (w, (tracker, _, _)) in workers.iter().enumerate() {
+        for (w, (tracker, _)) in workers.iter().enumerate() {
             assert!(
                 tracker.input_frontier(2, 0).less_equal(&t),
-                "worker {w}: frontier at the input the batch is bound for passed t={t} while \
-                 the batch is in flight: {:?}",
+                "worker {w}: frontier passed t={t} while the batch is in flight: {:?}",
                 tracker.input_frontier(2, 0)
             );
             assert!(
@@ -1943,10 +1863,9 @@ mod tests {
             );
         }
 
-        // Worker 1 consumes the batch.
-        workers[1].1.update(t, -n);
+        workers[1].0.operator_progress(2).unwrap().consumed[0].update(t, n);
         exchange(&mut workers);
-        for (w, (tracker, _, _)) in workers.iter().enumerate() {
+        for (w, (tracker, _)) in workers.iter().enumerate() {
             assert!(
                 tracker.input_frontier(2, 0).is_empty(),
                 "worker {w}: frontier {:?} after the batch was consumed",
@@ -1954,35 +1873,6 @@ mod tests {
             );
             assert!(tracker.is_completed(), "worker {w} did not complete");
         }
-    }
-
-    /// Symmetry invariant: in single-worker mode every `-count` must have a
-    /// matching `+count`. A lone `-count` (the "missing producer-side wiring"
-    /// failure mode that caused the `iter_var.exchange` hang) drives the
-    /// in-flight net negative and must fail fast rather than silently hang.
-    #[cfg(debug_assertions)]
-    #[test]
-    #[should_panic(expected = "went negative")]
-    fn inflight_negative_net_panics_single_worker() {
-        let mut builder = SubgraphBuilder::<u64>::new(1, 1);
-        builder
-            .add_operator(1, "upstream", 1, 1, PortConnectivity::identity(0u64))
-            .unwrap();
-        builder
-            .add_operator(2, "downstream", 1, 1, PortConnectivity::identity(0u64))
-            .unwrap();
-        builder.add_edge(Location::source(0, 0), Location::target(1, 0));
-        builder.add_edge(Location::source(1, 0), Location::target(2, 0));
-        builder.add_edge(Location::source(2, 0), Location::target(0, 0));
-
-        let mut tracker = builder.build();
-        let inflight = tracker.register_inflight_reporter(2, 0);
-        tracker.initialize().unwrap();
-
-        // A `-count` with no matching `+count`: the net goes negative, which can
-        // only mean a producer-side `+count` was never wired. This must panic.
-        inflight.update(5u64, -1);
-        let _ = tracker.propagate();
     }
 
     // --- A4: seeding from the physical plan ---
@@ -2055,7 +1945,7 @@ mod tests {
             let mut tracker = builder.build();
             tracker.set_progress_channels(channels).unwrap();
             match mutant {
-                None => tracker.initialize_for_plan(&plan),
+                None => tracker.initialize_for_plan(&plan, None, worker),
                 Some(seed) => tracker.seed_and_initialize(2, |op| seed(worker, op)),
             }
             .map_err(|e| e.to_string())?;
@@ -2182,7 +2072,7 @@ mod tests {
             .unwrap();
         let mut tracker = builder.build();
         let plan = crate::dataflow::plan::PhysicalPlan::for_hosts(2, &[(1, 2)]);
-        let _ = tracker.initialize_for_plan(&plan);
+        let _ = tracker.initialize_for_plan(&plan, None, 0);
     }
 
     /// `initialize` seeds each capability once: a tracker with progress

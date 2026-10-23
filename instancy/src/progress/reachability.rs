@@ -660,9 +660,10 @@ pub struct Tracker<T: Timestamp> {
     /// a parent scope and needs to report its output frontier to the parent.
     output_changes: Vec<ChangeBatch<T>>,
 
-    /// Total outstanding capability count across ALL locations. When this reaches
-    /// 0 and no pending changes remain, the dataflow is complete (no more data
-    /// can be produced at any timestamp).
+    /// The sum of the sizes of every location's pointstamp frontier, updated
+    /// only on frontier changes (positive semantics, as in timely): a negative
+    /// count never offsets a positive one. Completion is decided by exact
+    /// zero over a worker's scope, not by this count.
     total_counts: i64,
 }
 
@@ -766,7 +767,7 @@ impl<T: Timestamp> Tracker<T> {
     /// Returns `true` if the tracker is still tracking any outstanding capabilities
     /// or has pending unpropagated changes.
     pub fn tracking_anything(&self) -> bool {
-        if self.total_counts != 0 {
+        if self.total_counts > 0 {
             return true;
         }
         // Check for pending changes.
@@ -805,20 +806,59 @@ impl<T: Timestamp> Tracker<T> {
     /// checker's residual report).
     #[cfg(any(debug_assertions, feature = "progress-check"))]
     pub(crate) fn nonzero_pointstamps(&self) -> Vec<(Location, T, i64)> {
+        self.nonzero_counts()
+    }
+
+    /// Every pointstamp with a non-zero count in this view.
+    pub(crate) fn nonzero_counts(&self) -> Vec<(Location, T, i64)> {
         let mut out = Vec::new();
         for (node, per_op) in self.per_operator.iter().enumerate() {
             for (port, info) in per_op.targets.iter().enumerate() {
-                for (time, count) in info.pointstamps.nonzero_counts() {
+                for (time, count) in info.pointstamps.net_counts() {
                     out.push((Location::target(node, port), time, count));
                 }
             }
             for (port, info) in per_op.sources.iter().enumerate() {
-                for (time, count) in info.pointstamps.nonzero_counts() {
+                for (time, count) in info.pointstamps.net_counts() {
                     out.push((Location::source(node, port), time, count));
                 }
             }
         }
         out
+    }
+
+    /// Whether changes are posted but not yet propagated.
+    pub(crate) fn has_pending(&self) -> bool {
+        self.target_changes
+            .iter()
+            .chain(self.source_changes.iter())
+            .any(|ports| ports.iter().any(|batch| !batch.is_empty_clean()))
+            || !self.worklist.is_empty()
+    }
+
+    /// Whether every pointstamp count at `location` is exactly zero.
+    pub(crate) fn counts_zero_at(&self, location: &Location) -> bool {
+        let info = match location {
+            Location::Target { node, port } => self
+                .per_operator
+                .get(*node)
+                .and_then(|op| op.targets.get(*port)),
+            Location::Source { node, port } => self
+                .per_operator
+                .get(*node)
+                .and_then(|op| op.sources.get(*port)),
+        };
+        info.is_none_or(|info| info.pointstamps.net_counts().is_empty())
+    }
+
+    /// Whether every pointstamp count of this view is exactly zero.
+    pub(crate) fn all_counts_zero(&self) -> bool {
+        self.per_operator.iter().all(|op| {
+            op.targets
+                .iter()
+                .chain(op.sources.iter())
+                .all(|info| info.pointstamps.net_counts().is_empty())
+        })
     }
 
     // -- internal --
@@ -828,7 +868,7 @@ impl<T: Timestamp> Tracker<T> {
     /// This is the bridge between external updates (operators creating/dropping
     /// capabilities) and the propagation algorithm. For each pending change:
     ///
-    /// 1. Update `total_counts` (the global outstanding capability count).
+    /// 1. Update `total_counts` (the sum of pointstamp frontier sizes).
     /// 2. Apply the change to the port's `pointstamps` MutableAntichain.
     /// 3. If the pointstamp frontier changed (i.e., the minimal set of active
     ///    timestamps shifted), emit frontier deltas into the worklist.
@@ -844,11 +884,11 @@ impl<T: Timestamp> Tracker<T> {
             for port in 0..inputs {
                 let changes: Vec<(T, i64)> = self.target_changes[node][port].drain().collect();
                 for (time, diff) in changes {
-                    self.total_counts += diff;
                     let frontier_changes = self.per_operator[node].targets[port]
                         .pointstamps
                         .update_iter(std::iter::once((time.clone(), diff)));
                     for (t, d) in frontier_changes {
+                        self.total_counts += d;
                         self.worklist.push(Reverse(WorklistEntry {
                             time: t,
                             location: Location::target(node, port),
@@ -861,11 +901,11 @@ impl<T: Timestamp> Tracker<T> {
             for port in 0..outputs {
                 let changes: Vec<(T, i64)> = self.source_changes[node][port].drain().collect();
                 for (time, diff) in changes {
-                    self.total_counts += diff;
                     let frontier_changes = self.per_operator[node].sources[port]
                         .pointstamps
                         .update_iter(std::iter::once((time.clone(), diff)));
                     for (t, d) in frontier_changes {
+                        self.total_counts += d;
                         self.worklist.push(Reverse(WorklistEntry {
                             time: t,
                             location: Location::source(node, port),

@@ -351,10 +351,6 @@ impl<T: Timestamp, D: Send + 'static> CountedInput<T, D> {
     fn discard(&mut self, _: &ShellToken) {
         self.handle.take_consumed().clear();
     }
-
-    fn close(&mut self, _: &ShellToken) {
-        self.handle.mark_exhausted();
-    }
 }
 
 // ---------------------------------------------------------------------------
@@ -507,8 +503,7 @@ pub(crate) trait InputPorts: Send + 'static {
     fn commit(&mut self, tok: &ShellToken);
     /// Forget the call's consumption (the call failed).
     fn discard(&mut self, tok: &ShellToken);
-    /// Mark every input exhausted.
-    fn close(&mut self, tok: &ShellToken);
+
     /// Set input `port`'s frontier (an `Antichain` of the port's time).
     fn set_frontier(&mut self, tok: &ShellToken, port: usize, frontier: &dyn Any);
     /// Connect inputs `first..` to the call's justification (a `Justify` of
@@ -531,7 +526,7 @@ impl InputPorts for () {
     }
     fn commit(&mut self, _: &ShellToken) {}
     fn discard(&mut self, _: &ShellToken) {}
-    fn close(&mut self, _: &ShellToken) {}
+
     fn set_frontier(&mut self, _: &ShellToken, _: usize, _: &dyn Any) {}
     fn attach(&mut self, _: &ShellToken, _: &dyn Any, _: usize) {}
 }
@@ -555,9 +550,7 @@ impl<T: Timestamp, D: Send + 'static> InputPorts for CountedInput<T, D> {
     fn discard(&mut self, tok: &ShellToken) {
         CountedInput::discard(self, tok);
     }
-    fn close(&mut self, tok: &ShellToken) {
-        CountedInput::close(self, tok);
-    }
+
     fn set_frontier(&mut self, _: &ShellToken, port: usize, frontier: &dyn Any) {
         if port == 0 {
             if let Some(frontier) = frontier.downcast_ref::<Antichain<T>>() {
@@ -595,10 +588,7 @@ impl<A: InputPorts, B: InputPorts> InputPorts for (A, B) {
         self.0.discard(tok);
         self.1.discard(tok);
     }
-    fn close(&mut self, tok: &ShellToken) {
-        self.0.close(tok);
-        self.1.close(tok);
-    }
+
     fn set_frontier(&mut self, tok: &ShellToken, port: usize, frontier: &dyn Any) {
         let split = self.0.len();
         if port < split {
@@ -639,10 +629,7 @@ impl<T: Timestamp, D: Send + 'static> InputPorts for Vec<CountedInput<T, D>> {
         self.iter_mut()
             .for_each(|input| CountedInput::discard(input, tok));
     }
-    fn close(&mut self, tok: &ShellToken) {
-        self.iter_mut()
-            .for_each(|input| CountedInput::close(input, tok));
-    }
+
     fn set_frontier(&mut self, tok: &ShellToken, port: usize, frontier: &dyn Any) {
         if let Some(input) = self.get_mut(port) {
             InputPorts::set_frontier(input, tok, 0, frontier);
@@ -848,9 +835,6 @@ pub(crate) trait OperatorLogic: Send + 'static {
     fn checks_justification(&self) -> bool {
         true
     }
-
-    /// The executor closed the operator's inputs.
-    fn inputs_closed(&mut self) {}
 }
 
 // ---------------------------------------------------------------------------
@@ -867,6 +851,9 @@ pub(crate) struct OperatorShell<L: OperatorLogic> {
     inputs: L::Inputs,
     outputs: L::Outputs,
     justify: Justify<L::Time>,
+    /// Latched (R39): every input ended, nothing is held or left to hand
+    /// over. A hint only; it never closes the outputs.
+    exhausted: bool,
     shut_down: bool,
 }
 
@@ -892,6 +879,7 @@ impl<L: OperatorLogic> OperatorShell<L> {
             inputs,
             outputs,
             justify,
+            exhausted: false,
             shut_down: false,
         }
     }
@@ -901,10 +889,14 @@ impl<L: OperatorLogic> OperatorShell<L> {
         Box::new(self)
     }
 
-    fn shut_down(&mut self) {
-        let tok = ShellToken(());
-        self.outputs.close(&tok);
-        self.shut_down = true;
+    /// Whether the operator holds nothing: no input waiting for its logic,
+    /// no output waiting for a channel, no capability and no work its logic
+    /// keeps.
+    fn holds_nothing(&self) -> bool {
+        !self.inputs.buffered()
+            && !self.outputs.pending()
+            && !self.outputs.holds_capability()
+            && !self.logic.holds_work()
     }
 
     /// Run the logic once, then commit its consumption and output.
@@ -940,6 +932,7 @@ impl<L: OperatorLogic> OperatorShell<L> {
 impl<L: OperatorLogic> SchedulableOperator for OperatorShell<L> {
     fn activate(&mut self) -> Result<ActivationOutcome> {
         if self.shut_down {
+            self.check_after_shutdown()?;
             return Ok(ActivationOutcome::Done);
         }
         let tok = ShellToken(());
@@ -949,23 +942,31 @@ impl<L: OperatorLogic> SchedulableOperator for OperatorShell<L> {
             return Ok(ActivationOutcome::BlockedOnBackpressure);
         }
 
+        // A logic blocked on an external consumer retries before any more
+        // input is pulled, so a full consumer pushes back on the producer.
+        let mut did = false;
+        if self.logic.blocked() {
+            did = self.run_call(&tok)?;
+            if self.logic.blocked() {
+                return Ok(if did {
+                    ActivationOutcome::MadeProgress
+                } else {
+                    ActivationOutcome::BlockedOnBackpressure
+                });
+            }
+        }
+
         self.inputs.pull(&tok)?;
 
-        let mut did = false;
         if self.logic.wants_call(&self.inputs) {
-            did = self.run_call(&tok)?;
+            did |= self.run_call(&tok)?;
             if !self.outputs.flush(&tok)? {
                 return Ok(ActivationOutcome::BlockedOnBackpressure);
             }
         }
 
-        if self.inputs.exhausted()
-            && !self.inputs.buffered()
-            && !self.outputs.pending()
-            && !self.logic.holds_work()
-        {
-            self.shut_down();
-            return Ok(ActivationOutcome::Done);
+        if !self.exhausted && self.inputs.exhausted() && self.holds_nothing() {
+            self.exhausted = true;
         }
 
         if did {
@@ -995,10 +996,29 @@ impl<L: OperatorLogic> SchedulableOperator for OperatorShell<L> {
         self.stage_id
     }
 
-    fn close_inputs(&mut self) {
+    fn can_shut_down(&self) -> bool {
+        self.holds_nothing()
+    }
+
+    fn shut_down(&mut self) {
         let tok = ShellToken(());
-        self.inputs.close(&tok);
-        self.logic.inputs_closed();
+        self.outputs.close(&tok);
+        self.shut_down = true;
+    }
+
+    fn exhausted(&self) -> bool {
+        self.exhausted || self.shut_down
+    }
+
+    fn check_after_shutdown(&mut self) -> Result<()> {
+        let tok = ShellToken(());
+        if self.inputs.pull(&tok)? {
+            return Err(Error::Progress(ProgressError::RecordAfterShutdown {
+                operator: self.name.clone(),
+                time: "(any)".into(),
+            }));
+        }
+        Ok(())
     }
 
     fn close_external_input(&mut self) {

@@ -195,6 +195,17 @@ pub(crate) enum SweepOutcome {
     WaitingForInput,
 }
 
+/// What the decision module decided after a commit.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Decision {
+    /// The worker succeeded (S2b).
+    Succeeded,
+    /// Some operator shut down (S2a); the worker has not succeeded yet.
+    ShutDown,
+    /// Nothing changed: not ready.
+    NotReady,
+}
+
 // ---------------------------------------------------------------------------
 // Panic-guarded operator activation
 // ---------------------------------------------------------------------------
@@ -1327,6 +1338,69 @@ impl<T: Timestamp> DataflowExecutor<T> {
         Ok(activated)
     }
 
+    /// The decision module: the only place that shuts operators down (S2a)
+    /// and the only place that reports this worker's success (S2b). Runs
+    /// right after a commit ([`propagate_progress`](Self::propagate_progress)),
+    /// so it only ever acts on committed state (R26).
+    ///
+    /// - **S2a:** an operator shuts down once every input frontier is empty
+    ///   in this worker's view and it holds nothing (no capability, nothing
+    ///   left to hand over). It then closes its outputs.
+    /// - **S2b:** the worker succeeds once every hosted operator is shut down
+    ///   and every count in its scope is exactly zero.
+    ///
+    /// An operator's own `Done` or exhaustion is only a hint. Without a
+    /// progress tracker (unit tests of the executor), an exhausted operator
+    /// shuts down and the worker succeeds once all have.
+    fn decide(&mut self) -> Result<Decision> {
+        let mut shut_down = false;
+        for pos in 0..self.operators.len() {
+            if self.done[pos] || !self.operators[pos].can_shut_down() {
+                continue;
+            }
+            let ready = match &self.progress_tracker {
+                Some(tracker) => tracker
+                    .operator_input_frontiers(self.operators[pos].index())
+                    .iter()
+                    .all(Antichain::is_empty),
+                None => self.operators[pos].exhausted(),
+            };
+            if ready {
+                self.operators[pos].shut_down();
+                self.done[pos] = true;
+                self.async_waiting[pos] = false;
+                self.propagate_completion(pos);
+                shut_down = true;
+            }
+        }
+
+        if !self.done.iter().all(|&d| d) {
+            return Ok(if shut_down {
+                Decision::ShutDown
+            } else {
+                Decision::NotReady
+            });
+        }
+        let scope_zero = self
+            .progress_tracker
+            .as_ref()
+            .is_none_or(ProgressTracker::is_completed);
+        if !scope_zero {
+            return Ok(if shut_down {
+                Decision::ShutDown
+            } else {
+                Decision::NotReady
+            });
+        }
+        // S3: nothing may have reached a shut-down operator.
+        for op in &mut self.operators {
+            let name = op.name().to_string();
+            op.check_after_shutdown()
+                .map_err(|e| e.with_operator_context(name, self.worker_index))?;
+        }
+        Ok(Decision::Succeeded)
+    }
+
     /// Run the dataflow to completion or cancellation using a simple single-threaded
     /// activation loop. This is a **testing/validation helper** — it does NOT use the
     /// Worker Thread Pool. In production, the orchestrator event loop drives operator
@@ -1786,11 +1860,6 @@ impl<T: Timestamp> DataflowExecutor<T> {
             }
         }
 
-        // If all operators are done, we're finished.
-        if self.done.iter().all(|&d| d) {
-            return Ok(SweepOutcome::Completed);
-        }
-
         // Activate operators — stage-task, fused, or unfused path.
         let any_progress = if !self.stage_tasks.is_empty() {
             self.run_stage_task_activation()?
@@ -1806,85 +1875,43 @@ impl<T: Timestamp> DataflowExecutor<T> {
             self.consecutive_idle += 1;
         }
 
-        // After each batch, propagate progress and enqueue dirty operators.
+        // Commit: drain every hosted ledger and capability reporter, apply
+        // the batch to this worker's view, send it to every peer and absorb
+        // theirs. Then enqueue the operators whose frontiers changed.
         if self.propagate_progress()? {
             self.consecutive_idle = 0;
         }
 
+        // Only now, on committed state, decide.
+        match self.decide()? {
+            Decision::Succeeded => return Ok(SweepOutcome::Completed),
+            Decision::ShutDown => self.consecutive_idle = 0,
+            Decision::NotReady => {}
+        }
+
+        // `max_idle_sweeps` only decides when to park.
         if self.consecutive_idle >= self.config.max_idle_sweeps {
-            // If any operators have in-flight async tasks, don't declare
-            // quiescence — results will arrive and trigger a wake notification.
-            if self.async_waiting.iter().any(|&w| w) {
-                self.consecutive_idle = 0;
-                return Ok(SweepOutcome::WaitingForInput);
-            }
-
-            // Check if external inputs are still open — if so, don't
-            // declare quiescence, but signal the caller to wait.
-            // During drain mode, we ignore external inputs (they should
-            // close naturally; we don't want to wait for them).
-            if !self.draining
-                && self
-                    .external_inputs_open
-                    .load(std::sync::atomic::Ordering::SeqCst)
-                    > 0
-            {
-                self.consecutive_idle = 0;
-                return Ok(SweepOutcome::WaitingForInput);
-            }
-
-            if let Some(ref tracker) = self.progress_tracker {
-                // If the tracker reports completion AND no peer progress is
-                // pending, force-close any remaining operators (feedback
-                // cycles that quiesced).
-                if tracker.is_completed() && !tracker.has_pending_peer_progress()? {
-                    #[cfg(any(debug_assertions, feature = "progress-check"))]
-                    tracker.check_force_close();
-                    for pos in 0..self.operators.len() {
-                        if !self.done[pos] {
-                            self.operators[pos].close_inputs();
-                            self.done[pos] = true;
-                        }
-                    }
-                    return Ok(SweepOutcome::Completed);
-                }
-
-                // Any of these conditions means the global dataflow is still
-                // active and we should wait rather than declare quiescence:
-                // - Tracker not completed: outstanding capabilities somewhere
-                // - Pending peer progress: buffered updates not yet absorbed
-                //
-                // During drain mode, we don't wait — the drain deadline
-                // controls when to give up, not the progress tracker.
-                if !self.draining
-                    && (!tracker.is_completed() || tracker.has_pending_peer_progress()?)
-                {
-                    self.consecutive_idle = 0;
-                    return Ok(SweepOutcome::WaitingForInput);
-                }
-            }
-
-            // Quiescent — no operator made progress.
-            // During drain mode, quiescence means all in-flight data has been
-            // processed — treat this as successful completion, BUT only if the
-            // progress tracker agrees (if present). If the tracker shows
-            // outstanding capabilities, the dataflow isn't truly done — keep
-            // draining until the deadline.
+            self.consecutive_idle = 0;
             if self.draining {
-                let tracker_active = self
-                    .progress_tracker
-                    .as_ref()
-                    .is_some_and(|t| !t.is_completed());
-                if tracker_active {
-                    // Dataflow still has outstanding capabilities but no progress.
-                    // Return Idle to let the drain deadline check fire next sweep.
-                    // In sync mode, run_loop adds a brief sleep to avoid spin-busy.
-                    // In async mode, Idle respects poll budget and self-wakes.
-                    self.consecutive_idle = 0;
-                    return Ok(SweepOutcome::Idle);
-                }
-                return Ok(SweepOutcome::Completed);
+                // Keep sweeping (and exchanging progress) until the worker
+                // succeeds or the drain deadline fails the run (M12).
+                return Ok(SweepOutcome::Idle);
             }
+            // Something can still wake this worker: an async task, an
+            // external input, or a peer's progress.
+            let external_open = self
+                .external_inputs_open
+                .load(std::sync::atomic::Ordering::SeqCst)
+                > 0;
+            let has_peers = self
+                .progress_tracker
+                .as_ref()
+                .is_some_and(ProgressTracker::has_peers);
+            if self.async_waiting.iter().any(|&w| w) || external_open || has_peers {
+                return Ok(SweepOutcome::WaitingForInput);
+            }
+            // A single worker with nothing that can wake it: it cannot make
+            // progress any more.
             return Ok(SweepOutcome::Quiescent);
         }
 
@@ -2213,10 +2240,6 @@ mod tests {
         fn stage_id(&self) -> crate::dataflow::stage::StageId {
             self.stage_id
         }
-
-        fn close_inputs(&mut self) {
-            self.remaining = 0;
-        }
     }
 
     /// An operator that always returns Idle — never makes progress, never finishes.
@@ -2249,10 +2272,6 @@ mod tests {
 
         fn stage_id(&self) -> crate::dataflow::stage::StageId {
             self.stage_id
-        }
-
-        fn close_inputs(&mut self) {
-            self.closed = true;
         }
     }
 
@@ -2468,7 +2487,6 @@ mod tests {
             fn stage_id(&self) -> crate::dataflow::stage::StageId {
                 crate::dataflow::stage::StageId::new(0)
             }
-            fn close_inputs(&mut self) {}
         }
 
         let mut executor: DataflowExecutor<u64> = DataflowExecutor {
@@ -4434,7 +4452,6 @@ mod tests {
         fn stage_id(&self) -> crate::dataflow::stage::StageId {
             crate::dataflow::stage::StageId::new(0)
         }
-        fn close_inputs(&mut self) {}
     }
 
     /// Drains the shared queue; done once the producer is done and the queue
@@ -4469,7 +4486,6 @@ mod tests {
         fn stage_id(&self) -> crate::dataflow::stage::StageId {
             crate::dataflow::stage::StageId::new(1)
         }
-        fn close_inputs(&mut self) {}
     }
 
     /// Reports `MadeProgress` on every activation without ever finishing, like
@@ -4494,7 +4510,6 @@ mod tests {
         fn stage_id(&self) -> crate::dataflow::stage::StageId {
             crate::dataflow::stage::StageId::new(0)
         }
-        fn close_inputs(&mut self) {}
     }
 
     fn two_stage_tasks(
@@ -4560,7 +4575,6 @@ mod tests {
         fn stage_id(&self) -> crate::dataflow::stage::StageId {
             crate::dataflow::stage::StageId::new(1)
         }
-        fn close_inputs(&mut self) {}
     }
 
     /// Runs sweeps until the executor completes; panics after `max_sweeps`
@@ -4734,7 +4748,6 @@ mod tests {
             fn stage_id(&self) -> crate::dataflow::stage::StageId {
                 crate::dataflow::stage::StageId::new(0)
             }
-            fn close_inputs(&mut self) {}
         }
 
         for drain in [false, true] {
@@ -4820,7 +4833,6 @@ mod tests {
         fn stage_id(&self) -> crate::dataflow::stage::StageId {
             self.stage_id
         }
-        fn close_inputs(&mut self) {}
     }
 
     #[test]
@@ -5035,7 +5047,6 @@ mod tests {
             fn stage_id(&self) -> crate::dataflow::stage::StageId {
                 crate::dataflow::stage::StageId(0)
             }
-            fn close_inputs(&mut self) {}
             fn is_done(&self) -> bool {
                 false
             }
@@ -5210,7 +5221,6 @@ mod tests {
             fn stage_id(&self) -> crate::dataflow::stage::StageId {
                 crate::dataflow::stage::StageId(0)
             }
-            fn close_inputs(&mut self) {}
             fn is_done(&self) -> bool {
                 false
             }

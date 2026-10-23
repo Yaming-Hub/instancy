@@ -96,6 +96,22 @@ pub enum ChannelKind {
     Exchange,
 }
 
+/// How many copies of a record an edge delivers (R35): one, to the worker
+/// its routing picks, or one to every worker that hosts the edge's target.
+///
+/// The progress tracker counts a produced batch of `n` records as `+n` at
+/// the target of a [`One`](Delivery::One) edge and `+n · hosts(target)` at
+/// the target of an [`AllTargetHosts`](Delivery::AllTargetHosts) edge.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Hash)]
+pub enum Delivery {
+    /// Each record reaches one target worker (pipeline, partitioning
+    /// exchange, rebalance, gather).
+    #[default]
+    One,
+    /// Each record reaches every worker that hosts the target (broadcast).
+    AllTargetHosts,
+}
+
 /// A directed edge connecting an output port of one operator to an input
 /// port of another operator.
 ///
@@ -114,6 +130,8 @@ pub struct EdgeInfo {
     pub target_stage: StageId,
     /// Whether this edge is a pipeline (worker-local) or exchange (cross-worker).
     pub channel_kind: ChannelKind,
+    /// How many copies of each record the edge delivers.
+    pub delivery: Delivery,
 }
 
 impl EdgeInfo {
@@ -125,6 +143,7 @@ impl EdgeInfo {
             source_stage,
             target_stage,
             channel_kind: ChannelKind::Pipeline,
+            delivery: Delivery::One,
         }
     }
 
@@ -141,6 +160,21 @@ impl EdgeInfo {
             source_stage,
             target_stage,
             channel_kind: ChannelKind::Exchange,
+            delivery: Delivery::One,
+        }
+    }
+
+    /// Create a broadcast edge descriptor: a cross-worker channel that
+    /// delivers every record to every worker hosting the target.
+    pub fn broadcast(
+        source: Slot,
+        target: Slot,
+        source_stage: StageId,
+        target_stage: StageId,
+    ) -> Self {
+        Self {
+            delivery: Delivery::AllTargetHosts,
+            ..Self::exchange(source, target, source_stage, target_stage)
         }
     }
 

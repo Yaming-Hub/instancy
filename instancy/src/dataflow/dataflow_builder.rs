@@ -2648,20 +2648,7 @@ impl<T: Timestamp, D: Clone + Send + 'static> Pipe<T, D> {
             for (src, tgt) in inner.subgraph_builder.edges() {
                 state.subgraph_builder.add_edge(src.clone(), tgt.clone());
             }
-            // Carry in-flight (exchange) accounting bindings from the loop body
-            // into the parent so completion accounts for data in transit on
-            // exchanges inside the loop. The loop body's timestamps are
-            // `Product<T, TInner>`; the parent tracker is `T`, so each binding is
-            // registered with an outer-epoch projection (the shared reporter is
-            // recorded by the loop-body channel and drained, projected, by the
-            // parent tracker). Bindings the body itself carried up from deeper
-            // loops are projected once more. Operator indices are preserved
-            // across the merge, so source/target locations stay valid.
-            for binding in inner.subgraph_builder.inflight_edges_for_merge() {
-                state
-                    .subgraph_builder
-                    .register_loop_inflight_edge::<TInner>(binding);
-            }
+
             #[cfg(any(debug_assertions, feature = "progress-check"))]
             state
                 .subgraph_builder
@@ -3959,15 +3946,6 @@ impl<T: Timestamp, D: Clone + Send + 'static> Pipe<T, D> {
                 Location::target(op_idx, 0),
             );
 
-            // Account records sent on this exchange edge as in flight toward the
-            // exchange operator's input until they are consumed. The sending
-            // operator's output pusher records `+count` and the exchange pull
-            // side records `-count`; the tracker nets them as a message
-            // pointstamp at the exchange input.
-            state
-                .subgraph_builder
-                .register_inflight_edge((self.op_idx, self.output_slot), (op_idx, 0));
-
             // Operator factory — pass-through unary with progress reporter.
             let name_clone = String::from("exchange");
             let factory: OperatorFactory =
@@ -4051,7 +4029,7 @@ impl<T: Timestamp, D: Clone + Send + 'static> Pipe<T, D> {
             // Edge from upstream — marked as Exchange (broadcast uses same infrastructure).
             state
                 .graph
-                .add_edge(crate::dataflow::graph::EdgeInfo::exchange(
+                .add_edge(crate::dataflow::graph::EdgeInfo::broadcast(
                     Slot::new(self.op_idx, self.output_slot),
                     Slot::new(op_idx, 0),
                     stage_id,
