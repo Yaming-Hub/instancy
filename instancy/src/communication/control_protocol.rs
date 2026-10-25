@@ -220,20 +220,6 @@ const MSG_TYPE_READY: u8 = 1;
 #[cfg(feature = "transport")]
 const MSG_TYPE_CANCEL: u8 = 2;
 
-/// Whether an encoded control message is a handshake (without decoding or
-/// checking it): the first message of a dataflow run.
-#[cfg(feature = "transport")]
-pub(crate) fn is_handshake(payload: &[u8]) -> bool {
-    payload.first() == Some(&MSG_TYPE_HANDSHAKE)
-}
-
-/// Whether an encoded control message is a `Cancel` (without decoding or
-/// checking it).
-#[cfg(feature = "transport")]
-pub(crate) fn is_cancel(payload: &[u8]) -> bool {
-    payload.first() == Some(&MSG_TYPE_CANCEL)
-}
-
 // ---------------------------------------------------------------------------
 // Encode / Decode with CRC32
 // ---------------------------------------------------------------------------

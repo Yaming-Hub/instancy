@@ -129,11 +129,9 @@ async fn main() {
     println!("Registered dataflow-1: {dataflow_1}");
     println!("Registered dataflow-2: {dataflow_2}\n");
 
-    // We'll use payload_sender directly for this demo
-    let payload_tx = manager.payload_sender().clone();
-
+    // Each dataflow sends through a sender bound to its registration.
     // Dataflow-1 sends messages tagged with "DF1"
-    let tx1 = payload_tx.clone();
+    let tx1 = manager.dataflow_sender(&dataflow_1).unwrap();
     let df1 = dataflow_1;
     let send_task_1 = tokio::spawn(async move {
         for i in 0..5u32 {
@@ -143,13 +141,13 @@ async fn main() {
                 channel_id,
                 payload,
             };
-            tx1.send((df1, frame)).await.unwrap();
+            tx1.send(frame).await.unwrap();
         }
         println!("  [dataflow-1] sent 5 messages");
     });
 
     // Dataflow-2 sends messages tagged with "DF2"
-    let tx2 = payload_tx.clone();
+    let tx2 = manager.dataflow_sender(&dataflow_2).unwrap();
     let df2 = dataflow_2;
     let send_task_2 = tokio::spawn(async move {
         for i in 0..5u32 {
@@ -159,7 +157,7 @@ async fn main() {
                 channel_id,
                 payload,
             };
-            tx2.send((df2, frame)).await.unwrap();
+            tx2.send(frame).await.unwrap();
         }
         println!("  [dataflow-2] sent 5 messages");
     });

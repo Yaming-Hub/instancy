@@ -14,6 +14,15 @@ use uuid::Uuid;
 /// instance. Multiple dataflows with different IDs can run concurrently on
 /// the same physical infrastructure.
 ///
+/// # One run per id
+///
+/// A `DataflowId` identifies one run: every node of a cluster dataflow
+/// passes the same id, and a retry of a failed run uses a fresh
+/// [`DataflowId::new`], like an execution-attempt id in other distributed
+/// engines. Reusing an id is a contract violation: in Shared transport mode
+/// the late frames of the earlier run could be taken for the new run's, so
+/// a peer manager refuses an id it remembers as finished.
+///
 /// # Uniqueness
 ///
 /// Uses UUID v4 (122 bits of randomness). Collision probability is negligible

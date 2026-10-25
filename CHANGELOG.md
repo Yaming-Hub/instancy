@@ -51,14 +51,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   CRC32 of its header and one of header plus payload. Dedicated sessions
   never checksummed their frames before, so a flipped payload bit was
   accepted unless it broke decoding.
-- A dataflow id registered again after it finished can no longer be
-  unregistered by the first registration's late cleanup, and the peer's
-  handshake for the new run is no longer dropped when it arrives first.
-  A finished run's late control frames (a `Cancel`, say) never reach a
-  later run of the same id. The manager's per-dataflow bookkeeping is
+- **A `DataflowId` identifies one run; a retry needs a fresh id.** Pooled
+  connections outlive dataflows and frames carry only the dataflow id, so a
+  run that reused an earlier run's id could take that run's late frames
+  (data, progress, its seal and end-of-stream) for its own. A
+  `SharedPeerManager` now refuses to register an id it remembers as
+  finished (the most recent 16,384), with
+  `TransportError::InvalidRegistration`, and drops the late frames of such
+  an id. Payload frames queued before a dataflow unregistered are dropped,
+  never numbered into another registration's lane, and a cleanup removes
+  only its own registration (so a reused id's late cleanup cannot
+  unregister the new run). The manager's per-dataflow bookkeeping is
   bounded: control frames of dataflows that never register expire, the set
   of finished dataflow ids is bounded, and the handles of finished
-  connection tasks are released. The runtime's set of departed nodes is bounded too.
+  connection tasks are released. The runtime's set of departed nodes is
+  bounded too.
+- **BREAKING:** `SharedPeerManager::payload_sender()` is replaced by
+  `dataflow_sender(&id)`, a `DataframeSender` bound to the dataflow's
+  registration; flush barriers are internal queue entries, so channel
+  `u64::MAX - 1` is no longer reserved.
 - A corrupt frame on a pooled connection is corruption (fatal in every
   phase) only for the dataflow it belongs to; the other dataflows reading
   from the connection lose the connection, which is fatal only while they

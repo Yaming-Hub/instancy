@@ -949,8 +949,9 @@ async fn shared_pool_recovers_for_new_dataflows_after_a_transient_failure() {
         payload: b"before-interrupt".to_vec(),
     };
     manager
-        .payload_sender()
-        .send((df_id, frame1))
+        .dataflow_sender(&df_id)
+        .unwrap()
+        .send(frame1)
         .await
         .unwrap();
 
@@ -1001,7 +1002,12 @@ async fn shared_pool_recovers_for_new_dataflows_after_a_transient_failure() {
         channel_id: 1,
         payload: b"after-reconnect".to_vec(),
     };
-    manager.payload_sender().send((df2, frame2)).await.unwrap();
+    manager
+        .dataflow_sender(&df2)
+        .unwrap()
+        .send(frame2)
+        .await
+        .unwrap();
 
     let payload = tokio::time::timeout(
         Duration::from_secs(5),

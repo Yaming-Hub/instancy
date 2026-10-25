@@ -151,9 +151,33 @@ async fn spawn(
     managers_a: &Managers,
     managers_b: &Managers,
 ) -> Run {
-    let df = DataflowId::new();
+    let (a, b) = spawn_both(DataflowId::new(), rt_a, rt_b, managers_a, managers_b).await;
+    let (mut a, mut b) = (a.unwrap(), b.unwrap());
+    let out_a = a.take_output::<u64>(0, "results").unwrap();
+    let out_b = b.take_output::<u64>(0, "results").unwrap();
+    let input = a.take_input::<u64>(0, "data").unwrap();
+    drop(b.take_input::<u64>(0, "data").unwrap());
+    Run {
+        a,
+        b,
+        input,
+        out_a,
+        out_b,
+    }
+}
+
+type Spawned = Result<instancy::runtime::ClusterSpawnedDataflow<u64>>;
+
+/// Spawn dataflow `df` on both nodes.
+async fn spawn_both(
+    df: DataflowId,
+    rt_a: &RuntimeHandle,
+    rt_b: &RuntimeHandle,
+    managers_a: &Managers,
+    managers_b: &Managers,
+) -> (Spawned, Spawned) {
     let handle = tokio::runtime::Handle::current();
-    let (a, b) = tokio::join!(
+    tokio::join!(
         rt_a.spawn_cluster_async(
             "pr9",
             topology(),
@@ -176,19 +200,7 @@ async fn spawn(
             &handle,
             SpawnOptions::new(),
         ),
-    );
-    let (mut a, mut b) = (a.unwrap(), b.unwrap());
-    let out_a = a.take_output::<u64>(0, "results").unwrap();
-    let out_b = b.take_output::<u64>(0, "results").unwrap();
-    let input = a.take_input::<u64>(0, "data").unwrap();
-    drop(b.take_input::<u64>(0, "data").unwrap());
-    Run {
-        a,
-        b,
-        input,
-        out_a,
-        out_b,
-    }
+    )
 }
 
 impl Run {
@@ -358,15 +370,13 @@ async fn large_frame_then_small_ones_arrive_in_order_without_failure() {
     let (_ra, mut ea) = mgr_a.register_dataflow(df, &[1], 1024).await.unwrap();
     let (mut rb, mut eb) = mgr_b.register_dataflow(df, &[1], 1024).await.unwrap();
 
+    let sender = mgr_a.dataflow_sender(&df).unwrap();
     let send = |payload: Vec<u8>| {
-        mgr_a.payload_sender().send((
-            df,
-            Frame {
-                dataflow_id: df,
-                channel_id: 1,
-                payload,
-            },
-        ))
+        sender.send(Frame {
+            dataflow_id: df,
+            channel_id: 1,
+            payload,
+        })
     };
     send(vec![7u8; 2 * 1024 * 1024]).await.unwrap();
     tokio::time::sleep(Duration::from_millis(5)).await;
@@ -436,4 +446,54 @@ async fn shared_spawn_against_an_unreachable_peer_respects_the_handshake_timeout
         .await
         .expect("spawn still pending after 5 s with a 1 s handshake timeout");
     assert!(result.is_err());
+}
+
+/// A `DataflowId` identifies one run. Spawning a finished run's id again on
+/// the same managers (a retry that reused the id) fails promptly on both
+/// nodes instead of running with the old run's late frames; a retry with a
+/// fresh id runs normally on the same pool.
+#[tokio::test(flavor = "multi_thread", worker_threads = 6)]
+async fn reusing_a_finished_dataflow_id_fails_the_spawn_loudly() {
+    let (_broker, managers_a, managers_b) = brokered(1);
+    let (rt_a, rt_b) = (runtime(), runtime());
+    let df = DataflowId::new();
+    let (a, b) = spawn_both(df, &rt_a, &rt_b, &managers_a, &managers_b).await;
+    let (mut a, mut b) = (a.unwrap(), b.unwrap());
+    let out_a = a.take_output::<u64>(0, "results").unwrap();
+    let out_b = b.take_output::<u64>(0, "results").unwrap();
+    let input = a.take_input::<u64>(0, "data").unwrap();
+    drop(b.take_input::<u64>(0, "data").unwrap());
+    let first = Run {
+        a,
+        b,
+        input,
+        out_a,
+        out_b,
+    };
+    assert!(first.feed(0, (0..10).collect()));
+    let (ra, rb, got) = first.finish().await;
+    assert!(ra.is_ok() && rb.is_ok(), "a={ra:?} b={rb:?}");
+    assert_eq!(got, (0..10).collect::<Vec<_>>());
+
+    let (a, b) = tokio::time::timeout(
+        BOUND,
+        spawn_both(df, &rt_a, &rt_b, &managers_a, &managers_b),
+    )
+    .await
+    .expect("HANG: re-spawning a finished id");
+    for (node, result) in [("node-a", &a), ("node-b", &b)] {
+        match result {
+            Err(e) => assert!(
+                e.to_string().contains("fresh DataflowId"),
+                "{node}: unexpected error: {e}"
+            ),
+            Ok(_) => panic!("{node}: a finished DataflowId was accepted again"),
+        }
+    }
+
+    let retry = spawn(&rt_a, &rt_b, &managers_a, &managers_b).await;
+    assert!(retry.feed(0, (0..10).collect()));
+    let (ra, rb, got) = retry.finish().await;
+    assert!(ra.is_ok() && rb.is_ok(), "a={ra:?} b={rb:?}");
+    assert_eq!(got, (0..10).collect::<Vec<_>>());
 }

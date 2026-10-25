@@ -1651,14 +1651,13 @@ impl ClusterLifecycle {
             // those frames before unregistering, which would drop them.
             // One task per peer, all bounded together, so an unreachable peer
             // does not hold up the others.
-            let dataflow_id = self.dataflow_id;
             let mut flushes = tokio::task::JoinSet::new();
             for (peer, forwarder) in forwarders {
                 let managers = managers.clone();
                 flushes.spawn(async move {
                     let _ = forwarder.await;
                     if let Some(manager) = managers.as_ref().and_then(|m| m.get(&peer)) {
-                        manager.flush_dataflow(&dataflow_id).await;
+                        manager.flush().await;
                     }
                 });
             }

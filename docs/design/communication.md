@@ -285,7 +285,7 @@ Frames queued on, or in flight in, a connection that fails may be lost, and noth
 
 Both nodes fail the same dataflows: each node pins its own lanes, and a dataflow's frames from the peer arrive on the connection the peer pinned them to, starting with its handshake. With a pool of `connections` connections, one failure fails about `1/connections` of the running dataflows.
 
-There is no background redial. The failed connection leaves the pool, and the next `register_dataflow` re-establishes missing connections through the application's `ConnectionFactory`, each bounded by `connect_timeout`; registration fails if the pool cannot be filled. A dataflow that failed is re-run by the application if it wants a retry (the same applies to Dedicated mode).
+There is no background redial. The failed connection leaves the pool, and the next `register_dataflow` re-establishes missing connections through the application's `ConnectionFactory`, each bounded by `connect_timeout`; registration fails if the pool cannot be filled. A dataflow that failed is re-run by the application if it wants a retry, with a fresh `DataflowId` (see "One run per `DataflowId`" below; the same applies to Dedicated mode).
 
 #### Fixed pool
 
@@ -314,7 +314,17 @@ A connection that silently stops delivering without ever failing makes its dataf
 
 #### Per-dataflow state at scale
 
-A manager may carry thousands of dataflows. Its per-dataflow state is a registration (pinned connection, two sequence counters, channel senders), removed when the dataflow unregisters. Control frames that arrive before their dataflow registers (the peer was faster, also for a reused dataflow id) wait in a buffer bounded in dataflows, frames per dataflow and time (and are dropped if their connection fails; the handshake they start then times out). Unregistered ids are remembered boundedly: a late control frame of a finished run (a `Cancel`, say) is dropped, except a handshake, which starts a new run of a reused id. Registrations carry a token, so the late cleanup of a dataflow cannot remove a later registration of the same id, nor the control frames waiting for it. Connection failures cost a scan of the registrations; nothing is per-frame per-dataflow beyond the sequence check.
+A manager may carry thousands of dataflows. Its per-dataflow state is a registration (pinned connection, two sequence counters, channel senders), removed when the dataflow unregisters. Control frames that arrive before their dataflow registers (the peer was faster) wait in a buffer bounded in dataflows, frames per dataflow and time (and are dropped if their connection fails; the handshake they start then times out). Connection failures cost a scan of the registrations; nothing is per-frame per-dataflow beyond the sequence check.
+
+#### One run per `DataflowId`
+
+A `DataflowId` identifies one run of a dataflow, as an execution-attempt id does in other distributed engines (Flink's `ExecutionAttemptID`, MapReduce's `TaskAttemptID`); timely never reuses a dataflow's identifier either. Frames carry only the `DataflowId`, and pooled connections outlive dataflows, so a run that reused the id of an earlier one could receive that run's late frames as its own: data, progress, a seal, an end-of-stream, numbered from 0 like its own, which is a wrong result no check would catch. A retry therefore needs a fresh `DataflowId`. Shared mode enforces this as far as it can:
+
+- each manager remembers the ids of the dataflows that unregistered (the most recent 16,384), and refuses to register one again (`TransportError::InvalidRegistration`): the spawn fails loudly, and its peers fail through its `Cancel` or the handshake timeout;
+- the late frames of a remembered id are dropped instead of being buffered for a registration;
+- the payload frames a dataflow queued before it unregistered carry its registration token, and the bridge drops them, so they are never numbered into another registration's lane; and a cleanup removes only its own registration.
+
+An id reused after it has left the window (16,384 later dataflows on that peer manager) is not detected: that is a contract violation. Dedicated mode opens fresh connections per run, so nothing crosses between runs there. Linking the runs that are retries of one logical computation (a stable logical id and an attempt number) is planned as a separate feature.
 
 #### Comparison: Dedicated vs Shared Connection Mode
 
@@ -393,9 +403,9 @@ prefix) with `CommunicationError::FrameTooLarge`, and the data decoder accepts
 any record count the encoder can produce. With shared connections, a
 dataflow that must not lose what it has queued (its end-of-stream markers and
 acknowledgements, or final progress for a peer that is still draining) calls
-`SharedPeerManager::flush_dataflow` before
-unregistering: it puts a local-only barrier (reserved channel ID
-`u64::MAX - 1`, never sent on the wire) on the payload queue and returns once
+`SharedPeerManager::flush` before
+unregistering: it puts a local-only barrier (an entry of the manager's own
+queue, never a frame) on the payload queue and returns once
 the bridge task reaches it, that is, once every earlier frame has been
 sequenced and handed to a connection writer. See
 [cluster.md §5.5.3](./cluster.md#553-cluster-shutdown-protocol-clean-teardown).

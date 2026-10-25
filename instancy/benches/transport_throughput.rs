@@ -270,7 +270,7 @@ fn bench_shared_single_dataflow(c: &mut Criterion) {
                         .unwrap();
 
                     let mut data_rx = receivers.remove(&CHANNEL_ID).unwrap();
-                    let payload_tx = manager.payload_sender().clone();
+                    let payload_tx = manager.dataflow_sender(&dataflow_id).unwrap();
 
                     let payload = make_payload(PAYLOAD_SIZE);
 
@@ -278,7 +278,7 @@ fn bench_shared_single_dataflow(c: &mut Criterion) {
                     let send_task = tokio::spawn(async move {
                         for _ in 0..count {
                             let frame = make_frame(dataflow_id, &payload);
-                            payload_tx.send((dataflow_id, frame)).await.unwrap();
+                            payload_tx.send(frame).await.unwrap();
                         }
                     });
 
@@ -513,13 +513,13 @@ fn bench_shared_multi_dataflow(c: &mut Criterion) {
                             .await
                             .unwrap();
                         let mut data_rx = receivers.remove(&CHANNEL_ID).unwrap();
-                        let payload_tx = manager.payload_sender().clone();
+                        let payload_tx = manager.dataflow_sender(&dataflow_id).unwrap();
                         let payload = make_payload(PAYLOAD_SIZE);
 
                         send_tasks.push(tokio::spawn(async move {
                             for _ in 0..msgs_per_df {
                                 let frame = make_frame(dataflow_id, &payload);
-                                payload_tx.send((dataflow_id, frame)).await.unwrap();
+                                payload_tx.send(frame).await.unwrap();
                             }
                         }));
 
@@ -625,13 +625,13 @@ fn bench_shared_scaling_connections(c: &mut Criterion) {
                         .await
                         .unwrap();
                     let mut data_rx = receivers.remove(&CHANNEL_ID).unwrap();
-                    let payload_tx = manager.payload_sender().clone();
+                    let payload_tx = manager.dataflow_sender(&dataflow_id).unwrap();
                     let payload = make_payload(PAYLOAD_SIZE);
 
                     let send_task = tokio::spawn(async move {
                         for _ in 0..msg_count {
                             let frame = make_frame(dataflow_id, &payload);
-                            payload_tx.send((dataflow_id, frame)).await.unwrap();
+                            payload_tx.send(frame).await.unwrap();
                         }
                     });
 

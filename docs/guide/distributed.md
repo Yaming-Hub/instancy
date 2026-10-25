@@ -136,6 +136,7 @@ let mut cluster_handle = rt.spawn_cluster(
 
 **Key points:**
 - Every node must call `spawn_cluster` with the same `DataflowId` concurrently
+- A `DataflowId` identifies one run: a retry uses a fresh `DataflowId::new()` (Shared mode rejects an id that already ran with a peer, because the earlier run's late frames could otherwise be taken for the new run's)
 - The library performs a handshake to verify all nodes agree on the dataflow structure
 - Exchange operators automatically route data across nodes via the connections
 - `SpawnOptions` controls observability, cancellation, I/O mode, and priority
@@ -246,7 +247,7 @@ Both modes are **fail-stop**, like timely: frames on a connection that fails may
 - **Dedicated:** each dataflow has its own connection to each peer; if it fails while the dataflow runs, the dataflow fails on every node.
 - **Shared:** a pooled connection that fails (a write error, or its read side ending) fails exactly the dataflows pinned to it, on both nodes. Other dataflows on the pool's other connections are unaffected. With the default pool of one connection, a failure fails every dataflow running between the two nodes.
 
-The failed connection leaves the pool. instancy does not redial in the background: the next dataflow that registers re-establishes the missing connections through your factory, bounded by `SharedConnectionConfig::connect_timeout` (and the spawn by its handshake timeout). Re-run failed dataflows from your application if you want them retried.
+The failed connection leaves the pool. instancy does not redial in the background: the next dataflow that registers re-establishes the missing connections through your factory, bounded by `SharedConnectionConfig::connect_timeout` (and the spawn by its handshake timeout). Re-run failed dataflows from your application if you want them retried, each retry with a fresh `DataflowId`.
 
 A dataflow whose own frame cannot be sent (one larger than the frame size limit) fails alone; the shared connection and the other dataflows are untouched.
 ## In-Process Cluster Recipes

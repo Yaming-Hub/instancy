@@ -134,25 +134,19 @@ async fn payload_on_control_channel_does_not_break_sequenced_lane() {
     .unwrap();
     let df = DataflowId::new();
     let (mut rxs, _err) = mgr.register_dataflow(df, &[1], 16).await.unwrap();
-    let tx = mgr.payload_sender().clone();
+    let tx = mgr.dataflow_sender(&df).unwrap();
     let _ = tx
-        .send((
-            df,
-            Frame {
-                dataflow_id: df,
-                channel_id: 0,
-                payload: b"P".to_vec(),
-            },
-        ))
-        .await;
-    tx.send((
-        df,
-        Frame {
+        .send(Frame {
             dataflow_id: df,
-            channel_id: 1,
-            payload: b"D".to_vec(),
-        },
-    ))
+            channel_id: 0,
+            payload: b"P".to_vec(),
+        })
+        .await;
+    tx.send(Frame {
+        dataflow_id: df,
+        channel_id: 1,
+        payload: b"D".to_vec(),
+    })
     .await
     .unwrap();
     let ch1 = tokio::time::timeout(Duration::from_secs(2), rxs.get_mut(&1).unwrap().recv())

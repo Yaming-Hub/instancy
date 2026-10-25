@@ -283,7 +283,7 @@ data frame can follow the ack unnoticed.
    On a graceful teardown the node first flushes what it queued (bounded by
    `handshake_timeout`): it waits for its outbox forwarders to hand their
    lanes to the transport and, in Shared mode, for a flush barrier on each
-   manager's payload queue (`SharedPeerManager::flush_dataflow`) before
+   manager's payload queue (`SharedPeerManager::flush`) before
    unregistering, because the shared bridge drops queued frames of
    unregistered dataflows. The lanes can still hold frames peers need: our
    goodbye and our acknowledgements of their goodbyes (a peer whose goodbye
