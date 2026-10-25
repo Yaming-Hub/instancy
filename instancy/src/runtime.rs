@@ -2962,20 +2962,6 @@ impl RuntimeHandle {
 
         // Phase 6: Create progress channels (wake handles already created in Phase 5).
 
-        // A loop's progress travels in its own scope's section, which the
-        // progress wire format does not carry yet.
-        if num_local < total_workers
-            && dataflows
-                .first()
-                .is_some_and(|df| df.subgraph_builder.has_nested_scopes())
-        {
-            return Err(Error::Runtime(RuntimeError::InvalidConfig(
-                "iterate is not supported on a multi-node cluster yet: a loop's progress \
-                 cannot cross the network"
-                    .into(),
-            )));
-        }
-
         // Create local progress channels between local workers.
         let all_local_progress = create_progress_channels::<T>(total_workers, &wake_handles)?;
 
@@ -3097,10 +3083,24 @@ impl RuntimeHandle {
             events_tx.clone(),
             DEFAULT_MAX_BATCH_SIZE,
             runtime_handle,
+            crate::progress::network_progress::ProgressCodecs::new(
+                dataflows
+                    .first()
+                    .map(|df| df.progress_codec_makers.as_slice())
+                    .unwrap_or_default(),
+            ),
         )
         .map_err(Error::Communication)?;
 
         // Phase 7: Materialize all local workers (without registering).
+        let mut worker_nodes = vec![String::new(); total_workers];
+        for node in &topology.nodes {
+            if let Some((start, end)) = topology.worker_range(&node.node_id) {
+                for name in worker_nodes.iter_mut().take(end).skip(start) {
+                    *name = node.node_id.clone();
+                }
+            }
+        }
         let mode: ChannelMode = options.io_mode.into();
         let dataflow_priority = options.priority;
         let mut prepared = Vec::with_capacity(num_local);
@@ -3145,7 +3145,9 @@ impl RuntimeHandle {
                 ctrl,
                 timeline_start,
             ) {
-                Ok((spawned, executor, notifier, pumps)) => {
+                Ok((spawned, mut executor, notifier, pumps)) => {
+                    // A stopped peer is reported by its node's id.
+                    executor.as_mut().set_peer_names(worker_nodes.clone());
                     prepared.push((spawned, executor, notifier));
                     source_pumps.push(pumps);
                 }
@@ -5614,6 +5616,7 @@ fn materialize_executor<T: Timestamp>(
         collect_metrics: dataflow.collect_metrics,
         channel_counters: dataflow.channel_counters,
         drain_timeout: dataflow.drain_timeout,
+        stopped_peer_grace: ExecutorConfig::default().stopped_peer_grace,
         channel_metrics_collectors: dataflow.channel_metrics_collectors.clone(),
         activation_timeline: dataflow.activation_timeline,
         frontier_timeline: dataflow.frontier_timeline,
@@ -5714,6 +5717,26 @@ fn materialize_executor<T: Timestamp>(
     // A4: every initial capability is seeded once per worker running its
     // operator; nothing initial is broadcast.
     tracker.initialize_for_plan(plan, Some(&dataflow.graph), worker_context.worker_index())?;
+    // Injected accounting faults (a test knob): committed with this worker's
+    // first commit, as if the operator had consumed records no channel
+    // delivered.
+    #[cfg(any(debug_assertions, feature = "progress-check"))]
+    for (worker, operator, input, time, diff) in &dataflow.check_faults {
+        if *worker != worker_context.worker_index() {
+            continue;
+        }
+        let op = dataflow
+            .graph
+            .operators()
+            .find(|op| &op.name == operator)
+            .map(|op| op.index);
+        if let Some(ledger) = op
+            .and_then(|op| tracker.operator_progress(op))
+            .and_then(|progress| progress.consumed.get(*input))
+        {
+            ledger.update(time.clone(), -*diff);
+        }
+    }
     executor.set_progress_tracker(tracker);
 
     // Register probes. Each worker that runs a probed operator attaches its

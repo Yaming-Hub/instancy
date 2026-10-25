@@ -640,7 +640,6 @@ async fn data_recv_bridge(
         peer: &monitor.peer,
         channel_id: monitor.channel_id,
         pull_dropped: &monitor.pull_dropped,
-        open: &monitor.open,
         validate: monitor.validate,
         closed: false,
         reported: false,
@@ -677,8 +676,6 @@ pub(crate) struct InboundMonitor {
     guard: crate::communication::peer_link::InboundBridgeGuard,
     /// Set by the `NetworkPull` before it drains and drops its receiver.
     pull_dropped: Arc<std::sync::atomic::AtomicBool>,
-    /// Released on the close sentinel (shared with the `NetworkPull`).
-    open: Arc<crate::communication::peer_link::OpenInboundChannel>,
     /// Whether a frame decodes with this channel's codecs; used only for
     /// frames the consuming operator will never decode itself. Built from
     /// fresh codec instances, which is equivalent because codecs are
@@ -694,7 +691,6 @@ struct InboundChannel<'a> {
     peer: &'a crate::communication::peer_link::PeerMonitor,
     channel_id: u64,
     pull_dropped: &'a std::sync::atomic::AtomicBool,
-    open: &'a crate::communication::peer_link::OpenInboundChannel,
     validate: fn(&[u8]) -> bool,
     closed: bool,
     reported: bool,
@@ -724,7 +720,6 @@ impl InboundChannel<'_> {
         }
         if is_close_sentinel(&bytes) {
             self.closed = true;
-            self.open.release();
         }
         // A frame the operator may never decode itself (it finished, or is
         // finishing) is checked here; never on the regular path.
@@ -865,8 +860,6 @@ struct PullMonitor {
     channel_id: u64,
     /// Shared with the inbound bridge (see [`InboundMonitor`]).
     dropped: Arc<std::sync::atomic::AtomicBool>,
-    /// Released once the channel is exhausted or this endpoint is dropped.
-    open: Arc<crate::communication::peer_link::OpenInboundChannel>,
 }
 
 // Records still buffered when the consuming operator is dropped never reach
@@ -883,7 +876,6 @@ impl<T: Timestamp + ExchangeData, D: ExchangeData> Drop for NetworkPull<T, D> {
         monitor
             .dropped
             .store(true, std::sync::atomic::Ordering::SeqCst);
-        monitor.open.release();
         let mut unconsumed = 0usize;
         let mut corrupt = None;
         while let Ok(bytes) = self.receiver.try_recv() {
@@ -947,9 +939,6 @@ impl<T: Timestamp + ExchangeData, D: ExchangeData> Pull<T, D, ()> for NetworkPul
                 // Close sentinel — single sender per channel, FIFO order,
                 // so no more data follows.
                 self.exhausted = true;
-                if let Some(monitor) = &self.monitor {
-                    monitor.open.release();
-                }
                 None
             }
             Err(e) => {
@@ -1436,19 +1425,13 @@ impl<T: Timestamp + ExchangeData, D: ExchangeData> EdgeMaterializer<T, D>
                     .get(src_node)
                     .map(crate::communication::peer_link::PeerOutbox::monitor);
                 let pull_dropped = Arc::new(std::sync::atomic::AtomicBool::new(false));
-                let open = self.peer_outboxes.get(src_node).map(|outbox| {
-                    crate::communication::peer_link::OpenInboundChannel::open(Arc::clone(
-                        outbox.link(),
-                    ))
-                });
-                let monitor = match (&self.inbound_bridges, &peer, &open) {
-                    (Some(bridges), Some(peer), Some(open)) => Some(InboundMonitor {
+                let monitor = match (&self.inbound_bridges, &peer) {
+                    (Some(bridges), Some(peer)) => Some(InboundMonitor {
                         peer: peer.clone(),
                         channel_id,
                         bridges: bridges.clone(),
                         guard: bridges.register(),
                         pull_dropped: Arc::clone(&pull_dropped),
-                        open: Arc::clone(open),
                         validate: |bytes: &[u8]| {
                             decode_envelope::<T, D, _, _>(&T::codec(), &D::codec(), bytes).is_ok()
                         },
@@ -1466,11 +1449,10 @@ impl<T: Timestamp + ExchangeData, D: ExchangeData> EdgeMaterializer<T, D>
                     exhausted: false,
                     failed: false,
                     channel_id,
-                    monitor: peer.zip(open).map(|(peer, open)| PullMonitor {
+                    monitor: peer.map(|peer| PullMonitor {
                         peer,
                         channel_id,
                         dropped: pull_dropped,
-                        open,
                     }),
                     _transport: Some(self.transport.clone()),
                 }));
@@ -2172,7 +2154,6 @@ mod tests {
                 guard: bridges.register(),
                 bridges,
                 pull_dropped: Arc::new(std::sync::atomic::AtomicBool::new(false)),
-                open: crate::communication::peer_link::OpenInboundChannel::open(Arc::default()),
                 validate: |bytes: &[u8]| {
                     decode_envelope::<u64, u64, _, _>(&u64::codec(), &u64::codec(), bytes).is_ok()
                 },
@@ -2298,7 +2279,6 @@ mod tests {
                     peer,
                     channel_id: 7,
                     dropped: Arc::new(std::sync::atomic::AtomicBool::new(false)),
-                    open: crate::communication::peer_link::OpenInboundChannel::open(Arc::default()),
                 }),
                 _transport: None,
             };

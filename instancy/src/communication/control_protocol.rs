@@ -103,8 +103,11 @@ pub enum ControlProtocolError {
 /// every worker's initial capabilities from the physical plan instead of
 /// sending them, so a progress stream carries only changes after the initial
 /// state (a version-3 peer would count initial capabilities twice or never),
-/// and the graph fingerprint covers the plan's digest.
-pub const PROTOCOL_VERSION: u32 = 4;
+/// and the graph fingerprint covers the plan's digest; version 5 (port-counted
+/// progress) carries a progress scope id on every progress change, so a
+/// loop's progress travels in its own scope's time, and adds the seal marker
+/// (`u32::MAX - 2`), which a worker sends behind its last progress batch.
+pub const PROTOCOL_VERSION: u32 = 5;
 
 /// Protocol version reported for an unversioned (0.1.x) handshake.
 #[cfg(feature = "transport")]

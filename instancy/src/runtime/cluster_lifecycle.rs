@@ -534,6 +534,16 @@ pub(crate) struct LifecycleMachine {
 }
 
 impl LifecycleMachine {
+    /// The peers that stopped without finishing their part during a requested
+    /// stop (`PeerState::stopped`): their progress lanes carry nothing more
+    /// that a drain could use.
+    pub(crate) fn stopped_peers(&self) -> impl Iterator<Item = &str> {
+        self.peers
+            .iter()
+            .filter(|(_, peer)| peer.stopped)
+            .map(|(id, _)| id.as_str())
+    }
+
     /// `peers`: `(peer id, end-of-stream markers expected from it, link state)`.
     /// A peer sends one marker per (peer worker, local worker) progress channel.
     pub(crate) fn new(
@@ -1219,15 +1229,20 @@ impl LifecycleMachine {
         vec![Action::AbortDrain(reason)]
     }
 
-    /// `peer_id` stopped without finishing its part during a requested stop:
-    /// a drain that still waits for one of the peer's data channels, or whose
-    /// data push to the peer found its queue closed (it backs off on a frame
-    /// that can never leave), can never complete. A drain that needs nothing more from
-    /// the peer may still complete, and is left alone.
+    /// `peer_id` stopped without finishing its part during a requested stop.
+    /// A drain whose data push to the peer found its queue closed (it backs
+    /// off on a frame that can never leave) can never complete, and is
+    /// stopped at once. Otherwise the drain is left alone: whether it still
+    /// needs anything from the peer is decided by progress, not by which
+    /// channels are open (under port-counted progress a peer's channels stay
+    /// open until every worker's input upstream of them closes). A draining
+    /// worker fails promptly once no update can arrive and its view still
+    /// holds work (R48, see the executor's drain handling).
     fn abort_drain_without(&mut self, peer_id: &str) -> Vec<Action> {
-        let needed = self.peers.get(peer_id).is_some_and(|peer| {
-            peer.link.open_inbound_data_channels() > 0 || peer.link.push_blocked()
-        });
+        let needed = self
+            .peers
+            .get(peer_id)
+            .is_some_and(|peer| peer.link.push_blocked());
         if !needed {
             return Vec::new();
         }
@@ -1430,6 +1445,17 @@ impl ClusterLifecycle {
                 }
                 if self.perform(action).await {
                     return;
+                }
+            }
+            // A peer that stopped without finishing its part sends no more
+            // progress: its lanes close (after the actions above, so a
+            // forwarded failure or an aborted drain is seen first), and a
+            // draining worker can tell its drain still needs that peer (R48).
+            // In Shared mode nothing else closes them: the shared link outlives
+            // the peer's dataflow.
+            if let Some(handles) = &self.progress_handles {
+                for peer in self.machine.stopped_peers() {
+                    handles.close_peer(peer);
                 }
             }
         }
@@ -2657,21 +2683,19 @@ mod tests {
     }
 
     /// During a requested stop (a drain may be running), a peer whose link
-    /// ends before its goodbye did not finish its part: a drain that still
-    /// waits for one of its data channels is stopped, once. An EOF waits for
+    /// ends before its goodbye did not finish its part: a drain whose push to
+    /// it is blocked is stopped, once. An EOF waits for
     /// the rest of the link (a Cancel queued behind it explains the loss),
     /// and a peer that cancelled is no exception: it may still drain and say
     /// goodbye, but not after its link ended. A drain that needs nothing more
     /// from the peer is left to complete.
     #[test]
     fn link_end_before_goodbye_during_a_cancellation_aborts_the_drain() {
-        use crate::communication::peer_link::OpenInboundChannel;
         let closed = || LinkEvent::TransportError(TransportError::ConnectionClosed);
         let (mut m, links) = machine(1, &[("b", 1), ("c", 1)]);
-        let _open: Vec<_> = links
-            .iter()
-            .map(|l| OpenInboundChannel::open(Arc::clone(l)))
-            .collect();
+        for link in &links {
+            link.note_push_blocked();
+        }
         m.on_dataflow_cancelled(false);
         let actions = m.on_event(link_event("b", closed()));
         assert!(
@@ -2684,7 +2708,7 @@ mod tests {
         assert!(m.on_event(link_event("c", closed())).is_empty());
 
         let (mut m, links) = machine(1, &[("b", 1)]);
-        let _open = OpenInboundChannel::open(Arc::clone(&links[0]));
+        links[0].note_push_blocked();
         m.on_dataflow_cancelled(false);
         assert!(matches!(
             m.on_event(link_event(
@@ -2705,7 +2729,7 @@ mod tests {
         // failed).
         for last in [LinkEvent::ControlClosed, closed()] {
             let (mut m, links) = machine(1, &[("b", 1)]);
-            let _open = OpenInboundChannel::open(Arc::clone(&links[0]));
+            links[0].note_push_blocked();
             m.on_dataflow_cancelled(false);
             assert!(
                 m.on_event(link_event("b", LinkEvent::CancelReceived))
@@ -2719,13 +2743,13 @@ mod tests {
             );
         }
 
-        // Nothing more is needed from the peer (its channels closed, or
-        // there are none): the drain may still complete.
-        for open in [false, true] {
+        // Whether the drain still needs the peer is decided by progress (R48),
+        // not by which of its channels are open; a push blocked on the peer
+        // aborts it.
+        for blocked in [false, true] {
             let (mut m, links) = machine(1, &[("b", 1)]);
-            let channel = OpenInboundChannel::open(Arc::clone(&links[0]));
-            if !open {
-                channel.release();
+            if blocked {
+                links[0].note_push_blocked();
             }
             m.on_dataflow_cancelled(false);
             m.on_event(link_event("b", LinkEvent::CancelReceived));
@@ -2733,14 +2757,14 @@ mod tests {
             let actions = m.on_event(link_event("b", LinkEvent::ControlClosed));
             assert_eq!(
                 matches!(actions.as_slice(), [Action::AbortDrain(_)]),
-                open,
+                blocked,
                 "{actions:?}"
             );
         }
 
         // Not once it said goodbye (it drained and finished).
         let (mut m, links) = machine(1, &[("b", 1)]);
-        let _open = OpenInboundChannel::open(Arc::clone(&links[0]));
+        links[0].note_push_blocked();
         m.on_dataflow_cancelled(false);
         m.on_event(link_event("b", LinkEvent::CancelReceived));
         m.on_event(link_event("b", LinkEvent::ProgressEndOfStream));
@@ -2753,7 +2777,7 @@ mod tests {
         // Nor once the local workers are done, nor for a failure (nothing
         // drains on it).
         let (mut m, links) = machine(1, &[("b", 1)]);
-        let _open = OpenInboundChannel::open(Arc::clone(&links[0]));
+        links[0].note_push_blocked();
         m.on_dataflow_cancelled(false);
         m.on_event(link_event("b", LinkEvent::CancelReceived));
         m.on_event(done(true));
@@ -2763,20 +2787,20 @@ mod tests {
                 .is_empty()
         );
         let (mut m, links) = machine(1, &[("b", 1)]);
-        let _open = OpenInboundChannel::open(Arc::clone(&links[0]));
+        links[0].note_push_blocked();
         m.on_dataflow_cancelled(true);
         assert!(m.on_event(link_event("b", closed())).is_empty());
     }
     /// A second Cancel from a peer means its workers did not complete after
     /// its requested stop: a drain that needs its data stops, also when the
-    /// peer's Cancels were applied before our own cancellation was seen. A
-    /// drain that does not need it is left alone.
+    /// peer's Cancels were applied before our own cancellation was seen (here,
+    /// a drain whose push to it is blocked). A drain that does not need it is
+    /// left alone.
     #[test]
     fn second_cancel_from_a_peer_stops_drains_that_need_it() {
-        use crate::communication::peer_link::OpenInboundChannel;
         for cancelled_first in [true, false] {
             let (mut m, links) = machine(1, &[("b", 1)]);
-            let _open = OpenInboundChannel::open(Arc::clone(&links[0]));
+            links[0].note_push_blocked();
             if cancelled_first {
                 m.on_dataflow_cancelled(false);
             }

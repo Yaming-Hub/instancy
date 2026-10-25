@@ -7,7 +7,13 @@
 //! - a node that stops without finishing its part (it does not drain, or its
 //!   runtime is dropped) says so, which stops the drains that need its data;
 //! - a peer that cancelled and then disconnected before its goodbye stops
-//!   the drains that need its data.
+//!   the drains that need its data;
+//! - outside a drain, a peer that stops mid-run (its worker fails, or its node
+//!   crashes) fails the survivors promptly with the peer failure.
+//!
+//! Whether a drain still needs a stopped peer is decided by progress (R48):
+//! once no update can arrive and the draining worker's view still holds
+//! work, it stops, naming the peer.
 //!
 //! Control: a drain that can complete still succeeds with every record (and
 //! PR7's `peer_cancel_followed_by_local_drain_success_does_not_hang`: a
@@ -22,10 +28,10 @@ mod support;
 mod faults;
 
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::Duration;
 
-use faults::FaultMesh;
+use faults::{FaultMesh, FrameKind};
 use instancy::communication::ClusterSpawnTransport;
 use instancy::dataflow::channel_operators::InputSender;
 use instancy::runtime::ClusterSpawnedDataflow;
@@ -123,6 +129,28 @@ fn late_exchange_pipeline(
     Ok(())
 }
 
+/// Records `counted_pipeline`'s `slow` has emitted (one test uses it).
+static SLOW_RECORDS: AtomicUsize = AtomicUsize::new(0);
+
+/// `pipeline` without the failure switch, counting the records `slow`
+/// emits.
+fn counted_pipeline(builder: &mut DataflowBuilder<u64>, _fail: &Arc<AtomicBool>) -> Result<()> {
+    builder
+        .input::<u64>("data")?
+        .unary("slow", move |input, output| {
+            if let Some((time, data)) = input.next() {
+                std::thread::sleep(Duration::from_millis(20));
+                SLOW_RECORDS.fetch_add(data.len(), Ordering::SeqCst);
+                output.push_vec(time, data);
+            }
+            Ok(())
+        })
+        .exchange_by_hash("to_b", |_x: &u64| 1)
+        .map("id", |_t, x| x)
+        .output("out")?;
+    Ok(())
+}
+
 type Build = fn(&mut DataflowBuilder<u64>, &Arc<AtomicBool>) -> Result<()>;
 
 struct Setup {
@@ -131,6 +159,10 @@ struct Setup {
     drains: [bool; 2],
     /// node-b's input stays open (the drain closes it).
     b_input_open: bool,
+    /// node-a's input stays open after its batches (holding its capability).
+    a_input_open: bool,
+    /// Batches node-a's input gets.
+    a_batches: u64,
 }
 
 impl Default for Setup {
@@ -139,6 +171,8 @@ impl Default for Setup {
             build: pipeline,
             drains: [true, true],
             b_input_open: true,
+            a_input_open: false,
+            a_batches: BATCHES,
         }
     }
 }
@@ -161,8 +195,8 @@ impl Node {
 }
 
 /// node-a and node-b (one worker each), per `setup`. node-a's input gets
-/// `BATCHES` single-record batches (about 2 s of work); both outputs are
-/// collected.
+/// `setup.a_batches` single-record batches (`BATCHES`: about 2 s of work);
+/// both outputs are collected.
 async fn start(
     mesh: &mut FaultMesh,
     mode: Mode,
@@ -220,8 +254,11 @@ async fn start(
         drop(sb);
     }
     let sa = nodes[0].df().take_input::<u64>(0, "data").unwrap();
-    for i in 0..BATCHES {
+    for i in 0..setup.a_batches {
         sa.send(0, vec![i]).unwrap();
+    }
+    if setup.a_input_open {
+        nodes[0]._input = Some(sa);
     }
     (nodes, [oa, ob])
 }
@@ -237,7 +274,10 @@ async fn shutdown(nodes: Vec<Node>) {
     drop_runtimes(rts).await;
 }
 
-/// node-b stopped its drain because node-a stopped without finishing.
+/// node-b stopped (its drain, or its run) because node-a stopped without
+/// finishing its part: never `Ok` and never `DataLoss` (under port-counted
+/// progress node-a's unreleased work keeps node-b's view non-zero, R48), and
+/// within `PROMPT`, not at the drain deadline.
 fn stopped_for_node_a(result: &Option<Result<()>>) -> bool {
     matches!(
         result,
@@ -245,24 +285,6 @@ fn stopped_for_node_a(result: &Option<Result<()>>) -> bool {
             reason: Some(CancellationReason::NetworkError { detail }),
         })) if detail.contains("node-a")
     )
-}
-
-/// node-b did not wait for its drain deadline after node-a stopped without
-/// finishing its part. Usually it stops its drain because of node-a. If
-/// node-a's last progress released everything node-a held before that, node-b's
-/// frontier completes and it finishes its own drain instead: `Ok`, or
-/// `DataLoss` if node-a's records then arrive after its operators finished.
-/// That is not a wait either. (Seen with the process pinned to one core.
-/// Whether such an `Ok` holds every record node-a sent is up to the in-flight
-/// accounting, audit C1/C2, PR4/PR5.)
-fn did_not_wait_for_node_a(result: &Option<Result<()>>) -> bool {
-    stopped_for_node_a(result)
-        || matches!(result, Some(Ok(())))
-        || matches!(
-            result,
-            Some(Err(Error::Communication(instancy::CommunicationError::DataLoss { peer_id, .. })))
-                if peer_id == "node-a"
-        )
 }
 
 /// An early completion (audit C1/C2, PR4/PR5): a node finished while records
@@ -356,12 +378,11 @@ async fn runtime_drop_during_a_drain_releases_draining_peers() {
 
         let rb = jb.await.unwrap();
         assert!(
-            did_not_wait_for_node_a(&rb),
+            stopped_for_node_a(&rb),
             "{mode:?}: node-b must not wait once node-a's runtime is gone: {}",
             fmt_join(&rb)
         );
         let ra = nodes[0].join(PROMPT).await.unwrap();
-        // Cancelled, or (after an early completion at node-b) data loss.
         assert!(
             matches!(ra, Some(Err(_))),
             "{mode:?}: node-a: {}",
@@ -391,7 +412,7 @@ async fn peer_disconnecting_after_its_cancel_stops_the_drain() {
         let rb = nodes[1].join(PROMPT).await.unwrap();
         let ra = ja.await.unwrap();
         assert!(
-            did_not_wait_for_node_a(&rb),
+            stopped_for_node_a(&rb),
             "{mode:?}: node-b must not wait once node-a is gone: {}",
             fmt_join(&rb)
         );
@@ -400,18 +421,29 @@ async fn peer_disconnecting_after_its_cancel_stops_the_drain() {
     }
 }
 
-/// node-a is cancelled but does not drain: its workers stop at once without
-/// closing their channels. node-b drains on node-a's `Cancel` and needs its
-/// data; node-a says it stopped unfinished, so node-b stops at once instead
-/// of after its drain deadline, in both transport modes (in Shared mode the
-/// connection stays up, so nothing else would tell node-b).
+/// node-a is cancelled but does not drain: its workers stop at once,
+/// leaving work node-b's drain needs: records it never consumed, or (with
+/// nothing sent) the capability of its still-open input. node-b drains on
+/// node-a's `Cancel`; node-a's progress lanes close without a seal, and
+/// node-b stops promptly with the peer named instead of after its drain
+/// deadline (R48), in both transport modes (in Shared mode the connection
+/// stays up, so nothing else would tell node-b).
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
 async fn peer_stopping_without_a_drain_releases_drains_that_need_it() {
-    for mode in MODES {
+    let variants = [
+        ("records unconsumed", false, BATCHES),
+        ("capability held", true, 0),
+    ];
+    for (mode, (left, a_input_open, a_batches)) in MODES
+        .into_iter()
+        .flat_map(|mode| variants.map(|v| (mode, v)))
+    {
         let fail = Arc::new(AtomicBool::new(false));
         let mut mesh = FaultMesh::new(&["node-a", "node-b"], 2, mode == Mode::Shared);
         let a_stops = Setup {
             drains: [false, true],
+            a_input_open,
+            a_batches,
             ..Setup::default()
         };
         let (mut nodes, _outputs) = start(&mut mesh, mode, &fail, a_stops).await;
@@ -422,14 +454,13 @@ async fn peer_stopping_without_a_drain_releases_drains_that_need_it() {
         let rb = nodes[1].join(PROMPT).await.unwrap();
         let ra = ja.await.unwrap();
         assert!(
-            did_not_wait_for_node_a(&rb),
-            "{mode:?}: node-b must not wait once node-a stopped: {}",
+            stopped_for_node_a(&rb),
+            "{mode:?} ({left}): node-b must stop promptly, naming node-a: {}",
             fmt_join(&rb)
         );
-        // Cancelled, or (after an early completion at node-b) data loss.
         assert!(
             matches!(ra, Some(Err(_))),
-            "{mode:?}: node-a: {}",
+            "{mode:?} ({left}): node-a: {}",
             fmt_join(&ra)
         );
         shutdown(nodes).await;
@@ -498,6 +529,7 @@ async fn drain_that_needs_nothing_from_a_stopped_peer_still_succeeds() {
             build,
             drains: [true, false],
             b_input_open: false,
+            ..Setup::default()
         };
         let (mut nodes, [oa, _ob]) = start(&mut mesh, mode, &fail, setup).await;
         tokio::time::sleep(Duration::from_millis(200)).await;
@@ -517,4 +549,106 @@ async fn drain_that_needs_nothing_from_a_stopped_peer_still_succeeds() {
         assert!(rb.is_some(), "{mode:?} {shape}: node-b hung");
         shutdown(nodes).await;
     }
+}
+
+/// A peer stops mid-run (no cancellation): its worker fails, or its node
+/// crashes (the link is cut). node-b still holds open inbound channels from
+/// node-a (node-a's exchange is still sending), and must fail promptly with
+/// the peer failure: never a progress residual, never a hang.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn peer_stopping_mid_run_fails_the_survivor_promptly() {
+    for (mode, crash) in MODES
+        .into_iter()
+        .flat_map(|mode| [false, true].map(|crash| (mode, crash)))
+    {
+        let how = if crash { "crash" } else { "worker failure" };
+        let fail = Arc::new(AtomicBool::new(false));
+        let mut mesh = FaultMesh::new(&["node-a", "node-b"], 2, mode == Mode::Shared);
+        let running = Setup {
+            drains: [false, false],
+            ..Setup::default()
+        };
+        let (mut nodes, _outputs) = start(&mut mesh, mode, &fail, running).await;
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        if crash {
+            mesh.cut("node-a", "node-b");
+        } else {
+            fail.store(true, Ordering::SeqCst);
+        }
+
+        let ja = nodes[0].join(PROMPT);
+        let rb = nodes[1].join(PROMPT).await.unwrap();
+        let ra = ja.await.unwrap();
+        let peer_failure = if crash {
+            stopped_for_node_a(&rb)
+        } else {
+            stopped_by_forwarded_failure(&rb)
+        };
+        assert!(
+            peer_failure && !fmt_join(&rb).contains("residual"),
+            "{mode:?} ({how}): node-b must fail promptly with node-a's failure: {}",
+            fmt_join(&rb)
+        );
+        assert!(
+            matches!(ra, Some(Err(_))),
+            "{mode:?} ({how}): node-a: {}",
+            fmt_join(&ra)
+        );
+        shutdown(nodes).await;
+    }
+}
+
+/// R50: node-a stops right after sending, and its records reach node-b after
+/// its stop (node-a's data is held back while its stop announcement and
+/// progress overtake it), within the grace. node-b's drain must wait for
+/// them, then succeed with every record: the grace exists for this window.
+/// Dedicated framing (the fault mesh reorders frames only there).
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn drain_waits_for_a_stopped_peers_records_still_on_their_way() {
+    const SENT: u64 = 20;
+    let fail = Arc::new(AtomicBool::new(false));
+    let mut mesh = FaultMesh::new(&["node-a", "node-b"], 2, false);
+    let a_to_b = mesh.ctl("node-a", "node-b");
+    a_to_b.hold_kind(FrameKind::Data);
+    let a_stops = Setup {
+        build: counted_pipeline,
+        drains: [false, true],
+        a_batches: SENT,
+        ..Setup::default()
+    };
+    let (mut nodes, [_oa, ob]) = start(&mut mesh, Mode::Dedicated, &fail, a_stops).await;
+    // node-a has sent everything: its records all passed `slow`, and the
+    // frames carrying them are parked. (Its exchange cannot close yet:
+    // node-b's input is open, R47.)
+    let deadline = tokio::time::Instant::now() + PROMPT;
+    let mut parked = 0;
+    loop {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "node-a never finished sending"
+        );
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        let now = a_to_b.parked();
+        if SLOW_RECORDS.load(Ordering::SeqCst) as u64 == SENT && now > 0 && now == parked {
+            break;
+        }
+        parked = now;
+    }
+    nodes[0].df().cancel();
+    // node-b learns that node-a stopped while its records are still held,
+    // and releases them well within its grace.
+    tokio::time::sleep(Duration::from_millis(250)).await;
+    a_to_b.release_kind();
+
+    let ja = nodes[0].join(PROMPT);
+    let rb = nodes[1].join(PROMPT).await.unwrap();
+    let ra = ja.await.unwrap();
+    assert!(
+        matches!(rb, Some(Ok(()))),
+        "node-b's drain needs only records already sent: {}",
+        fmt_join(&rb)
+    );
+    assert_eq!(ob.join().unwrap().len() as u64, SENT, "node-b's records");
+    assert!(ra.is_some(), "node-a hung");
+    shutdown(nodes).await;
 }

@@ -146,9 +146,37 @@ impl<T: std::fmt::Debug> std::fmt::Debug for ProgressBatch<T> {
     }
 }
 
-/// Shared buffer between a sender/receiver pair.
+/// Shared buffer between a sender/receiver pair: the lane's queued batches
+/// and how the lane ended.
 pub(crate) struct SharedBuffer<T> {
     pub(crate) queue: VecDeque<ProgressBatch<T>>,
+    /// The sender sealed its stream after the batches queued before it: it
+    /// will send nothing more (design §2.2, seal markers).
+    pub(crate) sealed: bool,
+    /// The lane closed: the sender is gone (in-process: dropped; network:
+    /// its end-of-stream arrived or the link ended). With `sealed`, a clean
+    /// end; without it, the peer stopped without finishing its part.
+    pub(crate) closed: bool,
+}
+
+impl<T> SharedBuffer<T> {
+    /// An empty, open lane.
+    pub(crate) fn new() -> Self {
+        Self {
+            queue: VecDeque::new(),
+            sealed: false,
+            closed: false,
+        }
+    }
+}
+
+/// How a peer's progress lane stands, after the batches drained with it.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct LaneState {
+    /// The peer sealed its stream: nothing follows the drained batches.
+    pub(crate) sealed: bool,
+    /// The lane closed (see [`SharedBuffer::closed`]).
+    pub(crate) closed: bool,
 }
 
 /// Sends progress updates to a single peer worker.
@@ -178,6 +206,13 @@ pub(crate) enum SenderInner<T: Timestamp> {
         /// construction time so ProgressSender<T> doesn't require
         /// T: ExchangeData.
         send_fn: Box<dyn Fn(ProgressBatch<T>) + Send + Sync>,
+        /// Sends the seal marker, in order behind every batch sent before.
+        seal_fn: Box<dyn Fn() + Send + Sync>,
+        /// Sends the abandon marker (the stream ends without a seal), in
+        /// order behind every batch sent before.
+        abandon_fn: Box<dyn Fn() + Send + Sync>,
+        /// The stream was sealed (so dropping the sender abandons nothing).
+        sealed: std::sync::atomic::AtomicBool,
     },
 }
 
@@ -256,8 +291,63 @@ impl<T: Timestamp> ProgressSender<T> {
                 target_wake.notify();
             }
             #[cfg(feature = "transport")]
-            SenderInner::Network { send_fn } => {
+            SenderInner::Network { send_fn, .. } => {
                 send_fn(changes);
+            }
+        }
+    }
+}
+
+impl<T: Timestamp> ProgressSender<T> {
+    /// Seal this worker's progress stream to the peer: the marker travels in
+    /// order behind every batch sent before it, and nothing may follow it.
+    pub(crate) fn seal(&self) {
+        match &self.inner {
+            SenderInner::Local {
+                buffer,
+                target_wake,
+            } => {
+                if let Ok(mut buf) = buffer.lock().or_poison("progress channel") {
+                    debug_assert!(!buf.sealed, "a progress stream was sealed twice");
+                    buf.sealed = true;
+                }
+                target_wake.notify();
+            }
+            #[cfg(feature = "transport")]
+            SenderInner::Network {
+                seal_fn, sealed, ..
+            } => {
+                sealed.store(true, std::sync::atomic::Ordering::SeqCst);
+                seal_fn();
+            }
+        }
+    }
+}
+
+impl<T: Timestamp> Drop for ProgressSender<T> {
+    fn drop(&mut self) {
+        // A lane closes when its sender goes away (the worker finished or
+        // stopped). In-process, the shared buffer records it. On the network,
+        // a sender that never sealed sends the abandon marker behind its last
+        // batch; a sealed one's lane closes with its end-of-stream or the link
+        // (the receive bridge records both).
+        match &self.inner {
+            SenderInner::Local {
+                buffer,
+                target_wake,
+            } => {
+                if let Ok(mut buf) = buffer.lock().or_poison("progress channel") {
+                    buf.closed = true;
+                }
+                target_wake.notify();
+            }
+            #[cfg(feature = "transport")]
+            SenderInner::Network {
+                abandon_fn, sealed, ..
+            } => {
+                if !sealed.load(std::sync::atomic::Ordering::SeqCst) {
+                    abandon_fn();
+                }
             }
         }
     }
@@ -270,9 +360,24 @@ impl<T: Timestamp> ProgressReceiver<T> {
     }
 
     /// Drain all queued progress batches from this peer, in FIFO order.
+    #[cfg(test)]
     pub(crate) fn drain_all(&self) -> crate::Result<Vec<ProgressBatch<T>>> {
+        Ok(self.drain_with_state()?.0)
+    }
+
+    /// Drain all queued progress batches from this peer, in FIFO order, with
+    /// the lane's state after them: a seal (or close) covers exactly the
+    /// batches drained with it, because the sender records it after them.
+    pub(crate) fn drain_with_state(&self) -> crate::Result<(Vec<ProgressBatch<T>>, LaneState)> {
         let mut buf = self.buffer.lock().or_poison("progress channel")?;
-        Ok(buf.queue.drain(..).collect())
+        let batches = buf.queue.drain(..).collect();
+        Ok((
+            batches,
+            LaneState {
+                sealed: buf.sealed,
+                closed: buf.closed,
+            },
+        ))
     }
 
     /// Returns `true` if there are queued progress updates.
@@ -322,9 +427,7 @@ pub fn create_progress_channels<T: Timestamp>(
                 continue; // No self-channel.
             }
 
-            let shared = Arc::new(Mutex::new(SharedBuffer {
-                queue: VecDeque::new(),
-            }));
+            let shared = Arc::new(Mutex::new(SharedBuffer::new()));
 
             let sender = ProgressSender::local(Arc::clone(&shared), wake_handles[dst].clone());
             let receiver = ProgressReceiver::new(shared);

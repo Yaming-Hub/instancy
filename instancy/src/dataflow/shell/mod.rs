@@ -971,8 +971,7 @@ impl<L: OperatorLogic> OperatorShell<L> {
     /// no output waiting for a channel, no capability and no work its logic
     /// keeps.
     fn holds_nothing(&self) -> bool {
-        !self.final_call_due()
-            && !self.inputs.buffered()
+        !self.inputs.buffered()
             && !self.outputs.pending()
             && !self.outputs.holds_capability()
             && !self.logic.holds_work()
@@ -1101,7 +1100,13 @@ impl<L: OperatorLogic> SchedulableOperator for OperatorShell<L> {
     }
 
     fn can_shut_down(&self) -> bool {
-        self.holds_nothing()
+        // A closure is owed exactly one final call when its input frontiers
+        // become empty (R45), and it shuts down only after that call, even
+        // when it is exhausted and holds nothing. There must be no exemption
+        // for exhausted closures: the final call is where stash-and-flush
+        // without `retain` fails loudly (V3) instead of silently losing the
+        // stashed data.
+        self.holds_nothing() && !self.final_call_due()
     }
 
     fn shut_down(&mut self) {

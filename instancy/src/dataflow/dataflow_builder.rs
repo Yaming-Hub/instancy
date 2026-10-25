@@ -155,6 +155,10 @@ struct BuilderState<T: Timestamp> {
     /// The progress checker's oracle constructor of every nested scope.
     #[cfg(any(debug_assertions, feature = "progress-check"))]
     check_scopes: Vec<(usize, crate::progress::check::ScopeOracleFn)>,
+    /// Builds the progress codec of every loop scope nested in this one
+    /// (cluster spawn composes them onto the root time's codec).
+    #[cfg(feature = "transport")]
+    progress_codec_makers: Vec<crate::progress::network_progress::ScopeCodecMaker<T>>,
     /// Errors encountered during graph construction. Checked in `build()`.
     builder_errors: Vec<Error>,
     /// Forced activation strategy (progress-checker test knob).
@@ -163,6 +167,9 @@ struct BuilderState<T: Timestamp> {
     /// Run without the progress checker (test knob).
     #[cfg(any(debug_assertions, feature = "progress-check"))]
     check_skip: bool,
+    /// Injected accounting faults (test knob, see `check_inject_count`).
+    #[cfg(any(debug_assertions, feature = "progress-check"))]
+    check_faults: Vec<CheckFault<T>>,
     /// Use the mock network for exchanges (progress-checker test knob).
     #[cfg(all(
         feature = "transport",
@@ -170,6 +177,11 @@ struct BuilderState<T: Timestamp> {
     ))]
     check_mock_network: bool,
 }
+
+/// An injected accounting fault: `(worker, operator name, input, time,
+/// diff)` (see `DataflowBuilder::check_inject_count`).
+#[cfg(any(debug_assertions, feature = "progress-check"))]
+pub(crate) type CheckFault<T> = (usize, String, usize, T, i64);
 
 /// Projects a timestamp onto the dataflow's root timestamp, type-erased.
 type RootTimeProjector<T> = Arc<dyn Fn(&T) -> Box<dyn std::any::Any + Send> + Send + Sync>;
@@ -362,11 +374,15 @@ impl<T: Timestamp> DataflowBuilder<T> {
                 scope_counter: Rc::new(std::cell::Cell::new(1)),
                 #[cfg(any(debug_assertions, feature = "progress-check"))]
                 check_scopes: Vec::new(),
+                #[cfg(feature = "transport")]
+                progress_codec_makers: Vec::new(),
                 builder_errors: Vec::new(),
                 #[cfg(any(debug_assertions, feature = "progress-check"))]
                 check_activation: None,
                 #[cfg(any(debug_assertions, feature = "progress-check"))]
                 check_skip: false,
+                #[cfg(any(debug_assertions, feature = "progress-check"))]
+                check_faults: Vec::new(),
                 #[cfg(all(
                     feature = "transport",
                     any(debug_assertions, feature = "progress-check")
@@ -491,6 +507,29 @@ impl<T: Timestamp> DataflowBuilder<T> {
     #[cfg(any(debug_assertions, feature = "progress-check"))]
     pub fn skip_progress_check(&self) -> &Self {
         self.state.borrow_mut().check_skip = true;
+        self
+    }
+
+    /// Inject an accounting fault: worker `worker`'s first commit changes
+    /// the count of records at input `input` of the operator named
+    /// `operator` by `diff` at `time`, as if the operator had consumed
+    /// `-diff` records no channel delivered. A test knob for the progress
+    /// checker's fault tests (a missing `+n` is `diff < 0`); only available
+    /// when the checker is compiled in.
+    #[doc(hidden)]
+    #[cfg(any(debug_assertions, feature = "progress-check"))]
+    pub fn check_inject_count(
+        &self,
+        worker: usize,
+        operator: impl Into<String>,
+        input: usize,
+        time: T,
+        diff: i64,
+    ) -> &Self {
+        self.state
+            .borrow_mut()
+            .check_faults
+            .push((worker, operator.into(), input, time, diff));
         self
     }
 
@@ -1067,6 +1106,8 @@ impl<T: Timestamp> DataflowBuilder<T> {
             probes: state.probes,
             #[cfg(any(debug_assertions, feature = "progress-check"))]
             check_scopes: state.check_scopes,
+            #[cfg(feature = "transport")]
+            progress_codec_makers: state.progress_codec_makers,
             exchange_creators: state.exchange_creators,
             #[cfg(feature = "transport")]
             exchange_network_creators: state.exchange_network_creators,
@@ -1089,6 +1130,8 @@ impl<T: Timestamp> DataflowBuilder<T> {
             check_activation: state.check_activation,
             #[cfg(any(debug_assertions, feature = "progress-check"))]
             check_skip: state.check_skip,
+            #[cfg(any(debug_assertions, feature = "progress-check"))]
+            check_faults: state.check_faults,
             #[cfg(all(
                 feature = "transport",
                 any(debug_assertions, feature = "progress-check")
@@ -2638,11 +2681,15 @@ impl<T: Timestamp, D: Clone + Send + 'static> Pipe<T, D> {
                 scope_counter,
                 #[cfg(any(debug_assertions, feature = "progress-check"))]
                 check_scopes: Vec::new(),
+                #[cfg(feature = "transport")]
+                progress_codec_makers: Vec::new(),
                 builder_errors: Vec::new(),
                 #[cfg(any(debug_assertions, feature = "progress-check"))]
                 check_activation: None,
                 #[cfg(any(debug_assertions, feature = "progress-check"))]
                 check_skip: false,
+                #[cfg(any(debug_assertions, feature = "progress-check"))]
+                check_faults: Vec::new(),
                 #[cfg(all(
                     feature = "transport",
                     any(debug_assertions, feature = "progress-check")
@@ -2732,6 +2779,31 @@ impl<T: Timestamp, D: Clone + Send + 'static> Pipe<T, D> {
                     crate::progress::check::scope_oracle_fn::<PT<T, TInner>>(scope_id),
                 ));
                 state.check_scopes.extend(inner.check_scopes);
+            }
+            // The loop scope's progress codec, from its parent's: a loop's
+            // progress crosses the network on a cluster (wire format v5).
+            #[cfg(feature = "transport")]
+            {
+                let inner_makers = inner.progress_codec_makers;
+                state.progress_codec_makers.push(Arc::new(
+                    move |parent: &Arc<dyn crate::progress::network_progress::TimeCodec<T>>,
+                          out: &mut std::collections::HashMap<
+                        usize,
+                        Arc<dyn crate::progress::network_progress::SectionCodec>,
+                    >| {
+                        let codec = crate::progress::network_progress::product_time_codec::<
+                            T,
+                            TInner,
+                        >(Arc::clone(parent));
+                        out.insert(
+                            scope_id,
+                            crate::progress::network_progress::section_codec(Arc::clone(&codec)),
+                        );
+                        for make in &inner_makers {
+                            make(&codec, out);
+                        }
+                    },
+                ));
             }
 
             // Merge factories (offset inner channel factory indices). Every
@@ -5033,6 +5105,9 @@ pub struct LogicalDataflow<T: Timestamp> {
     /// The progress checker's oracle constructor of every nested (loop) scope.
     #[cfg(any(debug_assertions, feature = "progress-check"))]
     pub(crate) check_scopes: Vec<(usize, crate::progress::check::ScopeOracleFn)>,
+    /// Builds the progress codec of every loop scope (see `Pipe::iterate`).
+    #[cfg(feature = "transport")]
+    pub(crate) progress_codec_makers: Vec<crate::progress::network_progress::ScopeCodecMaker<T>>,
     /// Type-erased exchange factory creators — one per exchange edge.
     /// Consumed by `spawn_multi` to produce shared cross-worker channel factories.
     /// Tuple: (edge_index, capacity, creator_fn).
@@ -5097,6 +5172,9 @@ pub struct LogicalDataflow<T: Timestamp> {
     /// [`DataflowBuilder::skip_progress_check`]).
     #[cfg(any(debug_assertions, feature = "progress-check"))]
     pub(crate) check_skip: bool,
+    /// Injected accounting faults (see `DataflowBuilder::check_inject_count`).
+    #[cfg(any(debug_assertions, feature = "progress-check"))]
+    pub(crate) check_faults: Vec<CheckFault<T>>,
     /// Use the mock network for exchanges under `spawn_multi` (test knob of
     /// the progress checker's conformance matrix).
     #[cfg(all(

@@ -33,7 +33,7 @@ use crate::dataflow::schedulable::{
     group_by_port,
 };
 use crate::dataflow::stage::FusedActivationOrder;
-use crate::error::{DataflowError, Error, Result};
+use crate::error::{DataflowError, Error, ProgressError, Result};
 use crate::metrics::{DataflowMetrics, OperatorMetricsCollector};
 use crate::progress::frontier::Antichain;
 use crate::progress::notificator::Notificator;
@@ -112,6 +112,17 @@ pub struct ExecutorConfig {
     ///
     /// Default: `None` (immediate cancellation).
     pub drain_timeout: Option<std::time::Duration>,
+    /// How long a draining worker waits, with its progress view unchanged,
+    /// before it fails because a peer stopped without releasing what the
+    /// drain still needs (R48, R50). The grace covers the window in which a
+    /// stopped peer's records, or its last progress, arrive after its stop
+    /// announcement (they travel on other channels, which it can overtake):
+    /// anything that changes the view restarts it. It can only turn a drain
+    /// that would wait for its deadline into a prompt failure, never into a
+    /// success.
+    ///
+    /// Default: 500 ms.
+    pub stopped_peer_grace: std::time::Duration,
     /// Pre-created channel metrics collectors for exchange edges.
     /// These are shared across workers and registered in `DataflowMetrics`
     /// during executor materialization. Empty when `channel_counters` is false.
@@ -146,6 +157,7 @@ impl Default for ExecutorConfig {
             collect_metrics: false,
             channel_counters: false,
             drain_timeout: None,
+            stopped_peer_grace: std::time::Duration::from_millis(500),
             channel_metrics_collectors: Vec::new(),
             activation_timeline: false,
             frontier_timeline: false,
@@ -1021,6 +1033,14 @@ impl<T: Timestamp> DataflowExecutor<T> {
         }
     }
 
+    /// Name each worker's peer for errors (by worker index; on a cluster,
+    /// its node's id). Unnamed workers are reported as `worker N`.
+    pub(crate) fn set_peer_names(&mut self, names: Vec<String>) {
+        if let Some(tracker) = &mut self.progress_tracker {
+            tracker.set_peer_names(names);
+        }
+    }
+
     /// Attach cross-worker control broadcast sender and receiver.
     ///
     /// When set, the executor will:
@@ -1379,18 +1399,47 @@ impl<T: Timestamp> DataflowExecutor<T> {
             }
         }
 
-        if !self.done.iter().all(|&d| d) {
-            return Ok(if shut_down {
-                Decision::ShutDown
-            } else {
-                Decision::NotReady
-            });
+        // Seal: once every hosted operator is shut down or exhausted (R39),
+        // this worker can produce no further progress update; its last
+        // commit was just sent, and the seal follows it. Exhaustion is read
+        // after the commit, so a release made since (a `Retained` dropped on
+        // another thread) may still be uncollected: the seal then waits for
+        // the next commit, which carries it.
+        let all_exhausted =
+            (0..self.operators.len()).all(|pos| self.done[pos] || self.operators[pos].exhausted());
+        if let Some(tracker) = &mut self.progress_tracker {
+            if all_exhausted && !tracker.is_sealed() {
+                if tracker.uncollected() {
+                    shut_down = true;
+                } else {
+                    tracker.seal();
+                }
+            }
         }
+
+        let all_done = self.done.iter().all(|&d| d);
         let scope_zero = self
             .progress_tracker
             .as_ref()
             .is_none_or(ProgressTracker::is_completed);
-        if !scope_zero {
+        if !all_done || !scope_zero {
+            // Once every worker's seal is applied (its own included), no
+            // further progress update can arrive: a non-zero raw count in
+            // this worker's scope is an accounting bug, never a wait.
+            if let Some(tracker) = &self.progress_tracker {
+                if !scope_zero && tracker.all_sealed() {
+                    let mut residual = tracker.scope_residual();
+                    residual.sort();
+                    let more = residual.len().saturating_sub(16);
+                    residual.truncate(16);
+                    if more > 0 {
+                        residual.push(format!("... and {more} more"));
+                    }
+                    return Err(Error::Progress(ProgressError::Residual {
+                        residual: format!("worker {}: {}", self.worker_index, residual.join(", ")),
+                    }));
+                }
+            }
             return Ok(if shut_down {
                 Decision::ShutDown
             } else {
@@ -1898,6 +1947,43 @@ impl<T: Timestamp> DataflowExecutor<T> {
         if self.consecutive_idle >= self.config.max_idle_sweeps {
             self.consecutive_idle = 0;
             if self.draining {
+                // R48: a peer stopped (its lane closed without a seal) and no
+                // further progress update can arrive, while nothing here can
+                // run and this worker's view still holds work: the drain needs
+                // what the stopped peer never released, so it fails now
+                // rather than at the drain deadline. Once that has held for a
+                // short grace with the view unchanged: records the peer sent
+                // before it stopped may still be arriving.
+                if let Some(tracker) = &mut self.progress_tracker {
+                    let stopped = tracker.stopped_peers();
+                    let waiting = !stopped.is_empty()
+                        && tracker.peer_lanes_final()
+                        && !tracker.is_completed()
+                        && !self.async_waiting.iter().any(|&w| w);
+                    if !waiting {
+                        tracker.not_stopped();
+                    } else if tracker.stopped_and_quiet(self.config.stopped_peer_grace) {
+                        // A failure forwarded during this sweep explains
+                        // the stop better.
+                        if let Some(reason) = self.cancel.escalation() {
+                            return Err(Error::Cancelled {
+                                reason: Some(reason),
+                            });
+                        }
+                        let mut peers: Vec<String> =
+                            stopped.iter().map(|&w| tracker.peer_name(w)).collect();
+                        peers.dedup();
+                        return Err(Error::Cancelled {
+                            reason: Some(crate::cancellation::CancellationReason::NetworkError {
+                                detail: format!(
+                                    "peer {} stopped before finishing its part of the cancelled \
+                                     dataflow, which the drain needs",
+                                    peers.join(", ")
+                                ),
+                            }),
+                        });
+                    }
+                }
                 // Keep sweeping (and exchanging progress) until the worker
                 // succeeds or the drain deadline fails the run (M12).
                 return Ok(SweepOutcome::Idle);
@@ -2503,6 +2589,7 @@ mod tests {
                 collect_metrics: false,
                 channel_counters: false,
                 drain_timeout: None,
+                stopped_peer_grace: std::time::Duration::from_millis(500),
                 channel_metrics_collectors: Vec::new(),
                 activation_timeline: false,
                 frontier_timeline: false,
@@ -2909,6 +2996,7 @@ mod tests {
                 collect_metrics: false,
                 channel_counters: false,
                 drain_timeout: None,
+                stopped_peer_grace: std::time::Duration::from_millis(500),
                 channel_metrics_collectors: Vec::new(),
                 activation_timeline: false,
                 frontier_timeline: false,
@@ -3003,6 +3091,7 @@ mod tests {
                 collect_metrics: false,
                 channel_counters: false,
                 drain_timeout: None,
+                stopped_peer_grace: std::time::Duration::from_millis(500),
                 channel_metrics_collectors: Vec::new(),
                 activation_timeline: false,
                 frontier_timeline: false,
@@ -3512,6 +3601,7 @@ mod tests {
                 collect_metrics: false,
                 channel_counters: false,
                 drain_timeout: None,
+                stopped_peer_grace: std::time::Duration::from_millis(500),
                 channel_metrics_collectors: Vec::new(),
                 activation_timeline: false,
                 frontier_timeline: false,
@@ -3592,6 +3682,7 @@ mod tests {
                 collect_metrics: false,
                 channel_counters: false,
                 drain_timeout: None,
+                stopped_peer_grace: std::time::Duration::from_millis(500),
                 channel_metrics_collectors: Vec::new(),
                 activation_timeline: false,
                 frontier_timeline: false,
@@ -4952,6 +5043,7 @@ mod tests {
             collect_metrics: false,
             channel_counters: false,
             drain_timeout: Some(std::time::Duration::from_secs(5)),
+            stopped_peer_grace: std::time::Duration::from_millis(500),
             channel_metrics_collectors: Vec::new(),
             activation_timeline: false,
             frontier_timeline: false,
@@ -4988,6 +5080,7 @@ mod tests {
             collect_metrics: false,
             channel_counters: false,
             drain_timeout: None,
+            stopped_peer_grace: std::time::Duration::from_millis(500),
             channel_metrics_collectors: Vec::new(),
             activation_timeline: false,
             frontier_timeline: false,
@@ -5037,6 +5130,7 @@ mod tests {
             collect_metrics: false,
             channel_counters: false,
             drain_timeout: Some(std::time::Duration::from_millis(50)),
+            stopped_peer_grace: std::time::Duration::from_millis(500),
             channel_metrics_collectors: Vec::new(),
             activation_timeline: false,
             frontier_timeline: false,
@@ -5074,6 +5168,7 @@ mod tests {
             collect_metrics: false,
             channel_counters: false,
             drain_timeout: Some(std::time::Duration::from_secs(5)),
+            stopped_peer_grace: std::time::Duration::from_millis(500),
             channel_metrics_collectors: Vec::new(),
             activation_timeline: false,
             frontier_timeline: false,
@@ -5125,6 +5220,7 @@ mod tests {
             let config = ExecutorConfig {
                 max_sweeps_per_poll: 0,
                 drain_timeout: Some(std::time::Duration::from_secs(60)),
+                stopped_peer_grace: std::time::Duration::from_millis(500),
                 ..Default::default()
             };
             let mut executor = DataflowExecutor::new_test(vec![Box::new(op)], config, 0);
@@ -5150,6 +5246,7 @@ mod tests {
         let config = ExecutorConfig {
             max_sweeps_per_poll: 0,
             drain_timeout: Some(std::time::Duration::from_secs(60)),
+            stopped_peer_grace: std::time::Duration::from_millis(500),
             ..Default::default()
         };
         let mut executor = DataflowExecutor::new_test(vec![Box::new(op)], config, 0);
@@ -5206,6 +5303,7 @@ mod tests {
         let config = ExecutorConfig {
             max_sweeps_per_poll: 0,
             drain_timeout: Some(std::time::Duration::from_secs(60)),
+            stopped_peer_grace: std::time::Duration::from_millis(500),
             ..Default::default()
         };
         let mut executor = DataflowExecutor::new_test(vec![Box::new(Forever)], config, 0);

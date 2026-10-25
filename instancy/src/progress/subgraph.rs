@@ -53,7 +53,7 @@ use crate::progress::change_batch::ChangeBatch;
 use crate::progress::frontier::Antichain;
 use crate::progress::operate::{OperatorProgress, PortConnectivity, PortLedger, ProgressReporter};
 use crate::progress::progress_channel::{
-    ProgressBatch, ProgressChange, ProgressKind, WorkerProgressChannels,
+    LaneState, ProgressBatch, ProgressChange, ProgressKind, WorkerProgressChannels,
 };
 use crate::progress::reachability::{Builder as ReachabilityBuilder, Location, Tracker};
 use crate::progress::timestamp::Timestamp;
@@ -600,11 +600,6 @@ impl<T: Timestamp> SubgraphBuilder<T> {
         &self.edges
     }
 
-    /// Whether the dataflow has nested (loop) scopes.
-    pub(crate) fn has_nested_scopes(&self) -> bool {
-        !self.children.is_empty()
-    }
-
     /// Compiles the subgraph into a live [`ProgressTracker`].
     ///
     /// # Panics
@@ -775,6 +770,11 @@ impl<T: Timestamp> SubgraphBuilder<T> {
             completed: false,
             dirty_operators: Vec::new(),
             progress_channels: None,
+            peer_lanes: Vec::new(),
+            sealed: false,
+            peer_names: Vec::new(),
+            activity: 0,
+            stopped_quiet: None,
             local_changes: ChangeBatch::new(),
             edges: self.edges,
             routes,
@@ -892,6 +892,17 @@ pub struct ProgressTracker<T: Timestamp> {
     /// workers, and peer workers' changes are absorbed into every scope's
     /// tracker, so every view covers every worker.
     progress_channels: Option<WorkerProgressChannels<T>>,
+    /// Each peer's lane state (by worker index), as of the batches applied.
+    peer_lanes: Vec<Option<LaneState>>,
+    /// This worker sealed its progress stream (the root tracker only).
+    sealed: bool,
+    /// Each worker's name for errors (see `set_peer_names`).
+    peer_names: Vec<String>,
+    /// Commits and peer batches applied so far: any change to the view.
+    activity: u64,
+    /// When a stopped peer was first seen to leave a drain waiting (R48),
+    /// and `activity` then (see [`stopped_and_quiet`](Self::stopped_and_quiet)).
+    stopped_quiet: Option<(std::time::Instant, u64)>,
     /// This worker's raw changes in this scope since the last commit,
     /// compacted worker-wide.
     local_changes: ChangeBatch<(ProgressKind, usize, usize, T)>,
@@ -1285,7 +1296,9 @@ impl<T: Timestamp> ProgressTracker<T> {
 
         // 1. Commit this worker's changes since the last commit, in every
         //    scope, and apply them to this view (self-application).
-        self.collect();
+        if self.collect() > 0 {
+            self.activity += 1;
+        }
 
         // 2. Send the commit to every peer, as one batch.
         self.broadcast_local_changes();
@@ -1402,7 +1415,31 @@ impl<T: Timestamp> ProgressTracker<T> {
         for child in &mut self.children {
             collected += child.collect();
         }
+        debug_assert!(
+            !self.sealed || collected == 0,
+            "{collected} progress update(s) after this worker sealed its progress: \
+             {:?}",
+            self.local_changes
+        );
         collected
+    }
+
+    /// Whether a hosted ledger or capability reporter, in this scope or a
+    /// nested one, holds changes the last commit did not collect. A
+    /// capability released on another thread (a dropped `Retained`) updates
+    /// its reporter's held count and pending change under one lock, so an
+    /// operator seen holding nothing after a commit may still owe that
+    /// release to the next one.
+    pub(crate) fn uncollected(&self) -> bool {
+        self.materialized_indices.iter().any(|index| {
+            let progress = &self.progress_buffers[index];
+            progress.consumed.iter().any(|ledger| !ledger.is_empty())
+                || progress.produced.iter().any(|ledger| !ledger.is_empty())
+                || progress
+                    .internal
+                    .iter()
+                    .any(|reporter| !reporter.is_empty())
+        }) || self.children.iter().any(|child| child.uncollected())
     }
 
     fn collect_operator_progress(&mut self) -> usize {
@@ -1567,9 +1604,15 @@ impl<T: Timestamp> ProgressTracker<T> {
             return Ok(());
         };
         let mut batches = Vec::new();
-        for receiver in channels.receivers.iter().flatten() {
-            batches.extend(receiver.drain_all()?);
+        let mut lanes = Vec::new();
+        for (worker, receiver) in channels.receivers.iter().enumerate() {
+            if let Some(receiver) = receiver {
+                let (drained, state) = receiver.drain_with_state()?;
+                batches.extend(drained);
+                lanes.push((worker, state));
+            }
         }
+        self.activity += batches.len() as u64;
         for batch in batches {
             self.apply_changes(&batch.root);
             for (scope, section) in &batch.scopes {
@@ -1582,7 +1625,120 @@ impl<T: Timestamp> ProgressTracker<T> {
                 }
             }
         }
+        // A peer's seal counts once the batches before it are applied (here,
+        // just above).
+        for (worker, state) in lanes {
+            if self.peer_lanes.len() <= worker {
+                self.peer_lanes.resize(worker + 1, None);
+            }
+            self.peer_lanes[worker] = Some(state);
+        }
         Ok(())
+    }
+
+    // -- seals --
+
+    /// Seal this worker's progress stream (design §2.2): it can produce no
+    /// further progress update. Its last commit was just sent; the seal
+    /// follows it on every peer lane, and the worker's own seal is recorded
+    /// here (there is no self lane).
+    pub(crate) fn seal(&mut self) {
+        debug_assert!(!self.sealed, "a worker sealed its progress twice");
+        debug_assert!(
+            self.local_changes.is_empty_clean(),
+            "a worker sealed with uncommitted progress"
+        );
+        self.sealed = true;
+        if let Some(channels) = &self.progress_channels {
+            for sender in channels.senders.iter().flatten() {
+                sender.seal();
+            }
+        }
+    }
+
+    /// Name each worker for errors (by worker index; on a cluster, its
+    /// node's id).
+    pub(crate) fn set_peer_names(&mut self, names: Vec<String>) {
+        self.peer_names = names;
+    }
+
+    /// Worker `worker`'s name for errors.
+    pub(crate) fn peer_name(&self, worker: usize) -> String {
+        match self.peer_names.get(worker) {
+            Some(name) if !name.is_empty() => name.clone(),
+            _ => format!("worker {worker}"),
+        }
+    }
+
+    /// Whether this worker sealed its progress stream.
+    pub(crate) fn is_sealed(&self) -> bool {
+        self.sealed
+    }
+
+    /// Whether this worker has applied every worker's seal, its own
+    /// included: no further progress update can arrive, so a non-zero raw
+    /// count in its scope is a proven residual.
+    pub(crate) fn all_sealed(&self) -> bool {
+        self.sealed && self.peer_lanes_where(|lane| !lane.sealed).is_empty()
+    }
+
+    /// The peers whose progress lane closed without a seal: they stopped
+    /// before finishing their part (failed, or cancelled without draining).
+    pub(crate) fn stopped_peers(&self) -> Vec<usize> {
+        self.peer_lanes_where(|lane| lane.closed && !lane.sealed)
+    }
+
+    /// Whether no further progress update can arrive from any peer: every
+    /// peer's lane is sealed or closed.
+    pub(crate) fn peer_lanes_final(&self) -> bool {
+        self.peer_lanes_where(|lane| !lane.sealed && !lane.closed)
+            .is_empty()
+    }
+
+    /// R48: a stopped peer leaves this worker's drain waiting. Called while
+    /// that holds; true once it has held for `grace` without any change to
+    /// the view. A stopped peer's records may still be on their way over the
+    /// data path (a separate channel from its progress lane), and frames it
+    /// sent before it stopped may still reach a lane already closed (they are
+    /// applied all the same): either would change the view.
+    pub(crate) fn stopped_and_quiet(&mut self, grace: std::time::Duration) -> bool {
+        let now = std::time::Instant::now();
+        match self.stopped_quiet {
+            Some((since, seen)) if seen == self.activity => now.duration_since(since) >= grace,
+            _ => {
+                self.stopped_quiet = Some((now, self.activity));
+                false
+            }
+        }
+    }
+
+    /// R48 no longer holds (see [`stopped_and_quiet`](Self::stopped_and_quiet)).
+    pub(crate) fn not_stopped(&mut self) {
+        self.stopped_quiet = None;
+    }
+
+    /// The peers (worker indices) whose lane state matches `pred`; a peer
+    /// not heard from yet has an open, unsealed lane.
+    fn peer_lanes_where(&self, pred: impl Fn(&LaneState) -> bool) -> Vec<usize> {
+        let Some(channels) = &self.progress_channels else {
+            return Vec::new();
+        };
+        channels
+            .receivers
+            .iter()
+            .enumerate()
+            .filter(|(_, receiver)| receiver.is_some())
+            .map(|(worker, _)| worker)
+            .filter(|&worker| {
+                let state = self
+                    .peer_lanes
+                    .get(worker)
+                    .copied()
+                    .flatten()
+                    .unwrap_or_default();
+                pred(&state)
+            })
+            .collect()
     }
 
     fn apply_changes(&mut self, changes: &[ProgressChange<T>]) {
@@ -2003,11 +2159,20 @@ impl<T: Timestamp> ProgressTracker<T> {
     }
 
     /// This tracker's executor finished (`ok`: successfully). Reports every
-    /// scope's residual raw counts (V5) and retires the views; when
-    /// `report_worker`, also tells each oracle the worker finished.
+    /// scope's residual raw counts (V5) when they are final (it succeeded, or
+    /// failed with every seal applied: a proven residual) and retires the
+    /// views; when `report_worker`, also tells each oracle the worker
+    /// finished.
     #[cfg(any(debug_assertions, feature = "progress-check"))]
     pub(crate) fn check_finish(&mut self, ok: bool, report_worker: bool) {
-        let residual: Vec<String> = if ok && self.check.is_some() {
+        let proven = ok || self.all_sealed();
+        self.check_finish_with(ok, proven, report_worker);
+    }
+
+    /// [`check_finish`](Self::check_finish), `proven`: the counts are final.
+    #[cfg(any(debug_assertions, feature = "progress-check"))]
+    fn check_finish_with(&mut self, ok: bool, proven: bool, report_worker: bool) {
+        let residual: Vec<String> = if proven && self.check.is_some() {
             self.tracker
                 .nonzero_pointstamps()
                 .into_iter()
@@ -2021,7 +2186,7 @@ impl<T: Timestamp> ProgressTracker<T> {
             check.finish(ok, residual, report_worker);
         }
         for child in &mut self.children {
-            child.check_finish(ok, report_worker);
+            child.check_finish(ok, proven, report_worker);
         }
     }
 
@@ -2083,6 +2248,7 @@ pub(crate) trait ChildScope<TP: Timestamp>: Send {
 
     fn seed(&mut self, multiplicity: &dyn Fn(usize) -> usize);
     fn collect(&mut self) -> usize;
+    fn uncollected(&self) -> bool;
     /// Takes this scope's (and every nested scope's) non-empty section.
     fn take_sections(&mut self, out: &mut Vec<(usize, Arc<dyn Any + Send + Sync>)>);
     fn apply_section(&mut self, scope: usize, section: &(dyn Any + Send + Sync)) -> bool;
@@ -2129,7 +2295,7 @@ pub(crate) trait ChildScope<TP: Timestamp>: Send {
     #[cfg(any(debug_assertions, feature = "progress-check"))]
     fn check_halt(&self, reason: &str);
     #[cfg(any(debug_assertions, feature = "progress-check"))]
-    fn check_finish(&mut self, ok: bool, report_worker: bool);
+    fn check_finish(&mut self, ok: bool, proven: bool, report_worker: bool);
 }
 
 /// The builder of an `iterate` loop's scope, in `Product<TP, TI>` time.
@@ -2250,6 +2416,10 @@ impl<TP: Timestamp, TI: Timestamp> ChildScope<TP> for LoopScope<TP, TI> {
 
     fn collect(&mut self) -> usize {
         self.tracker.collect()
+    }
+
+    fn uncollected(&self) -> bool {
+        self.tracker.uncollected()
     }
 
     fn take_sections(&mut self, out: &mut Vec<(usize, Arc<dyn Any + Send + Sync>)>) {
@@ -2398,8 +2568,8 @@ impl<TP: Timestamp, TI: Timestamp> ChildScope<TP> for LoopScope<TP, TI> {
     }
 
     #[cfg(any(debug_assertions, feature = "progress-check"))]
-    fn check_finish(&mut self, ok: bool, report_worker: bool) {
-        self.tracker.check_finish(ok, report_worker);
+    fn check_finish(&mut self, ok: bool, proven: bool, report_worker: bool) {
+        self.tracker.check_finish_with(ok, proven, report_worker);
     }
 }
 
@@ -3141,6 +3311,124 @@ mod tests {
         Ok(())
     }
 
+    /// Two workers, each hosting an instance of a source `a` (capability at
+    /// 0) that feeds `sink`, joined by in-process progress channels. Returns
+    /// the trackers and, per worker, the reporter through which `a` releases.
+    fn sealing_pair() -> (
+        Vec<ProgressTracker<u64>>,
+        Vec<crate::progress::operate::ProgressReporter<u64>>,
+    ) {
+        use crate::dataflow::channels::wake::WakeHandle;
+        let channels = crate::progress::progress_channel::create_progress_channels::<u64>(
+            2,
+            &[WakeHandle::new(), WakeHandle::new()],
+        )
+        .unwrap();
+        let mut trackers = Vec::new();
+        let mut releases = Vec::new();
+        for channels in channels {
+            let mut builder = SubgraphBuilder::<u64>::new(0, 0);
+            let mut declared = ChangeBatch::new();
+            declared.update(0u64, 1);
+            let a = builder
+                .add_operator_with_capabilities(
+                    1,
+                    "a",
+                    0,
+                    1,
+                    PortConnectivity::new(0, 1),
+                    vec![declared],
+                )
+                .unwrap()
+                .reporter(0)
+                .clone();
+            builder
+                .add_operator(2, "sink", 1, 0, PortConnectivity::new(1, 0))
+                .unwrap();
+            builder.add_edge(Location::source(1, 0), Location::target(2, 0));
+            let mut tracker = builder.build();
+            tracker.set_progress_channels(channels).unwrap();
+            tracker
+                .seed_and_initialize(2, |op| usize::from(op == 1) * 2)
+                .unwrap();
+            trackers.push(tracker);
+            releases.push(a);
+        }
+        (trackers, releases)
+    }
+
+    /// A worker's seal follows its last commit on every lane, and counts at a
+    /// peer only once the batches before it are applied: `all_sealed` means
+    /// no further update can arrive and the view is final.
+    #[test]
+    fn seals_count_after_the_batches_before_them() {
+        let (mut trackers, releases) = sealing_pair();
+        assert!(!trackers[0].uncollected());
+        // A release made after a commit (a `Retained` dropped on another
+        // thread) is uncollected until the next one: no seal before it.
+        releases[0].update(0, -1);
+        assert!(trackers[0].uncollected());
+        trackers[0].propagate().unwrap();
+        assert!(!trackers[0].uncollected());
+        trackers[0].seal();
+        assert!(trackers[0].is_sealed());
+        assert!(!trackers[0].all_sealed(), "worker 1 has not sealed");
+        assert!(!trackers[0].peer_lanes_final());
+
+        // Worker 1 applies worker 0's release with its seal.
+        trackers[1].propagate().unwrap();
+        assert!(!trackers[1].all_sealed(), "worker 1 itself has not sealed");
+        assert!(trackers[1].peer_lanes_final());
+        assert!(trackers[1].input_frontier(2, 0).less_equal(&0));
+        releases[1].update(0, -1);
+        trackers[1].propagate().unwrap();
+        trackers[1].seal();
+        assert!(trackers[1].all_sealed());
+        assert!(trackers[1].is_completed());
+        assert!(trackers[1].stopped_peers().is_empty());
+
+        trackers[0].propagate().unwrap();
+        assert!(trackers[0].all_sealed());
+        assert!(trackers[0].is_completed());
+    }
+
+    /// A worker that stops without sealing (R34: a failed worker never seals)
+    /// closes its lanes: its peers see it stopped, and no further update can
+    /// arrive from it, but nothing is sealed.
+    #[test]
+    fn a_worker_dropped_unsealed_is_a_stopped_peer() {
+        let (mut trackers, _releases) = sealing_pair();
+        trackers[0].propagate().unwrap();
+        assert!(trackers[0].stopped_peers().is_empty());
+        let failed = trackers.pop().unwrap();
+        drop(failed);
+        trackers[0].propagate().unwrap();
+        assert_eq!(trackers[0].stopped_peers(), [1]);
+        assert!(trackers[0].peer_lanes_final());
+        assert!(!trackers[0].all_sealed());
+        assert!(
+            !trackers[0].is_completed(),
+            "worker 1's capability is never released"
+        );
+        assert_eq!(trackers[0].peer_name(1), "worker 1");
+        trackers[0].set_peer_names(vec!["node-a".into(), "node-b".into()]);
+        assert_eq!(trackers[0].peer_name(1), "node-b");
+
+        // R48 waits for the view to stay unchanged for its grace.
+        let grace = std::time::Duration::ZERO;
+        assert!(
+            !trackers[0].stopped_and_quiet(grace),
+            "the first sight starts the grace"
+        );
+        assert!(trackers[0].stopped_and_quiet(grace));
+        trackers[0].not_stopped();
+        assert!(!trackers[0].stopped_and_quiet(grace));
+        // A commit restarts the grace.
+        trackers[0].operator_progress(2).unwrap().consumed[0].update(0, 1);
+        trackers[0].propagate().unwrap();
+        assert!(!trackers[0].stopped_and_quiet(grace));
+        assert!(trackers[0].stopped_and_quiet(grace));
+    }
     /// A4: seeding from the plan holds every running instance's initial
     /// capability in every view, from before the first message until that
     /// instance releases.

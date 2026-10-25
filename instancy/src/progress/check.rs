@@ -1981,13 +1981,13 @@ impl<T: Timestamp> TrackerCheck<T> {
     }
 
     /// The tracker's executor finished; `residual` lists the view's non-zero
-    /// counts (V5 report).
+    /// counts (V5 report), when they are final (empty otherwise).
     pub(crate) fn finish(&mut self, ok: bool, residual: Vec<String>, report_worker: bool) {
         if self.finished {
             return;
         }
         self.finished = true;
-        if ok && !residual.is_empty() {
+        if !residual.is_empty() {
             let total = residual.len();
             let shown: Vec<String> = residual.into_iter().take(8).collect();
             record(
