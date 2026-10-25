@@ -2370,6 +2370,15 @@ fn ci_cases(group: &str) -> Vec<Case> {
                     Workers::Three,
                     Cap::One,
                 ));
+                // Unfused activation with one-batch channels: a blocked
+                // operator must not starve the consumer that would drain it.
+                cases.push(Case::new(
+                    shape,
+                    Path::Unfused,
+                    Transport::InProcess,
+                    Workers::Three,
+                    Cap::One,
+                ));
             }
         }
         "transports" => {

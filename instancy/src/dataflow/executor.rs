@@ -1530,29 +1530,22 @@ impl<T: Timestamp> DataflowExecutor<T> {
     ///
     /// This is the original scheduling strategy. Each operator is independently
     /// scheduled; data flowing from op A to op B requires multiple sweeps.
+    ///
+    /// Every sweep considers every operator that is not done, as the fused
+    /// and stage-task paths do: data arriving on a channel wakes the worker
+    /// but does not enqueue the channel's consumer. Enqueueing only when the
+    /// queue was empty let an operator blocked on a full channel re-queue
+    /// itself every sweep while the consumer that would drain that channel,
+    /// idle when last run, never ran again (a livelock).
     fn run_unfused_activation(&mut self) -> Result<bool> {
-        // If the ready queue is empty, re-populate with non-done operators.
-        // Also enqueue any operators waiting for async task completion —
-        // a wake notification means their results may be ready to collect.
+        for pos in 0..self.operators.len() {
+            if !self.done[pos] && !self.in_queue[pos] {
+                self.ready_queue.push_back(pos);
+                self.in_queue[pos] = true;
+            }
+        }
         if self.ready_queue.is_empty() {
-            for pos in 0..self.operators.len() {
-                if !self.done[pos] {
-                    self.ready_queue.push_back(pos);
-                    self.in_queue[pos] = true;
-                }
-            }
-            if self.ready_queue.is_empty() {
-                return Ok(false);
-            }
-        } else {
-            // Queue not empty, but async-waiting operators may need activation
-            // after a wake notification. Enqueue them if not already queued.
-            for pos in 0..self.async_waiting.len() {
-                if self.async_waiting[pos] && !self.in_queue[pos] && !self.done[pos] {
-                    self.ready_queue.push_back(pos);
-                    self.in_queue[pos] = true;
-                }
-            }
+            return Ok(false);
         }
 
         let mut any_progress = false;
@@ -1588,10 +1581,10 @@ impl<T: Timestamp> DataflowExecutor<T> {
                     self.async_waiting[pos] = false;
                 }
                 ActivationOutcome::WaitingForAsync => {
-                    // Don't re-queue immediately — wake_handle.notify() will
-                    // wake the executor when a task completes. The per-operator
-                    // async_waiting flag prevents premature quiescence and
-                    // ensures re-enqueue on the next sweep.
+                    // Don't re-queue immediately: wake_handle.notify() wakes
+                    // the executor when a task completes, and the next sweep
+                    // enqueues every live operator. The per-operator
+                    // async_waiting flag prevents premature quiescence.
                     self.async_waiting[pos] = true;
                 }
                 ActivationOutcome::BlockedOnBackpressure => {
