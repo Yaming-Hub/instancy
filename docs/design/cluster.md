@@ -237,8 +237,8 @@ end-of-stream markers — is queued on an unbounded, ordered per-peer *outbox*
 whose forwarder awaits capacity on that same payload queue. The forwarder is
 never cut short by cancellation; it exits once every producer has released
 its outbox. Because both paths feed one FIFO payload lane per peer (dedicated:
-the peer's payload channel; shared: the dataflow's sequenced lane and reorder
-buffer), a marker queued after a frame is delivered after it.
+the peer's payload channel; shared: the dataflow's sequenced lane, pinned to
+one pooled connection), a marker queued after a frame is delivered after it.
 
 **Wire messages.**
 
@@ -269,7 +269,7 @@ data frame can follow the ack unnoticed.
 3. A link is **retired** once either the peer has acknowledged our goodbye
    (it holds everything we sent) or we have received the peer's goodbye (its
    workers are done, so it needs nothing from us). Transport failures on a
-   retired link (EOF, write errors, reorder timeouts) are benign. Progress
+   retired link (EOF, write errors) are benign; corrupt traffic is not. Progress
    and control signals still addressed to a retired peer are discarded, but
    *records* are not: a node cannot push data after its own goodbye, so a
    record for a retired peer means that peer finished while data was still
@@ -490,18 +490,18 @@ reported to the coordinator:
 | Records arrive after a data channel's close sentinel, or after the consuming operator finished | the data receive bridge / `NetworkPull` (`InboundDataLost`) |
 | A progress channel closes before its end-of-stream; a progress frame fails its CRC or decode; a frame other than the acknowledgement follows the end-of-stream | the progress receive bridge (`ProgressChannelEnded`) |
 | The control channel closes; a control message fails to decode | the control dispatcher (`ControlClosed`, `ControlUndecodable`) |
-| Dedicated: the peer closes the connection, or reading fails (I/O error, checksum mismatch, a frame announcing a payload over the limit) | the transport session (`ConnectionFailed`) |
-| Dedicated: writing fails, or an outbound frame exceeds the frame limit | the transport session (`OutboundFailed`) |
-| Shared: reconnect attempts exhausted, reorder timeout, poisoned lock | the shared managers (`TransportError`) |
+| The peer closes the connection (Shared: a pooled connection the peer's frames arrive on), or reading fails (I/O error, checksum mismatch, a frame announcing a payload over the limit; Shared: a frame out of sequence or off its lane) | the transport session or shared manager (`ConnectionFailed`) |
+| Writing fails (Shared: on the pooled connection the dataflow is pinned to, or that connection's read side ended), or an outbound frame exceeds the frame limit | the transport session or shared manager (`OutboundFailed`) |
 | Our goodbye or progress could not be handed to the transport | the outbox forwarder (`OutboundFailed`) |
 
 A receive channel that ended uncleanly never counts as exhausted, so no worker
 can complete with missing data while the failure is decided. A dedicated
-session keeps a peer's channels open until the event that ended its read side
+session (and a shared manager, for the dataflows whose frames arrive on the
+connection) keeps a peer's channels open until the event that ended its read side
 has been handed to the coordinator, so the coordinator always learns *why* a
 connection ended (EOF, I/O error, corrupt or oversize frame) before it sees
 the channels close. *Losses* (EOF, a closed channel, a writer gone, a
-reorder timeout, a shared manager dropping or reconnecting) follow the rules
+pooled connection failing) follow the rules
 above: soft until the whole link has closed, fatal while the workers run,
 benign on a retired link, and only resolving the peer after local success.
 
@@ -560,8 +560,8 @@ any failed send.
 **Residual limits.** The last message of any handshake cannot itself be
 confirmed. If a node's transport is *aborted* (its tokio runtime dropped) at
 the instant its peer also finishes, that peer may miss both the goodbye and
-the ack. It then detects the link loss (dedicated: EOF; shared: after
-reconnect attempts are exhausted) and still reports its own local result.
+the ack. It then detects the link loss (EOF on its connection) and still
+reports its own local result.
 Frames still waiting in a shared manager's bridge queue (not yet on a
 connection's writer queue) are lost when an application drops the last
 reference to that manager outside a dataflow's teardown. A peer that is
@@ -582,14 +582,11 @@ peers then rely on the link loss, which in Shared mode they see only if the
 shared connections go too (otherwise they drain until their deadline). A
 drain that waits only for an unfinished peer's progress (not its data) is not
 stopped early.
-In Shared mode the reader reduces checksum, oversize and malformed-prefix
-errors to a connection loss (the gap they leave in the dataflow's sequence
-still blocks everything behind it, so a running node fails on the reorder
-timeout), and a connection loss can be reported before a `Cancel` the peer
-queued just before it, so the reason is `NetworkError` instead of
-`PeerCancelled`. Dedicated sessions do not use frame CRCs, so a corrupted
-data payload is detected only if it no longer decodes (progress and control
-frames carry their own CRC).
+A connection loss can be reported before a `Cancel` the peer queued just
+before it, so the reason may be `NetworkError` instead of `PeerCancelled`.
+Since protocol version 6 every frame is checksummed in both modes, and a
+Shared-mode frame out of sequence (lost or duplicated) or off its pinned
+connection is corrupt traffic, reported at once.
 
 ### 12.5 Dynamic Cluster Scaling
 

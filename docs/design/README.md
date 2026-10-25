@@ -407,8 +407,8 @@ This section documents the cardinality (how many instances exist) and lifetime (
 
 **Phase 5 — Networking** ✅
 - Required `ConnectionFactory` + default `TcpConnectionFactory`
-- `SharedPeerManager` / `PeerPool` with connection pooling
-- Wire protocol with opt-in CRC32
+- `SharedPeerManager` with a fixed connection pool and pinned, sequenced lanes
+- Wire protocol with CRC32 on every frame
 - Cross-process `exchange`
 - Inter-process progress tracking
 - Transport-agnostic runtime over any `AsyncRead + AsyncWrite` byte stream

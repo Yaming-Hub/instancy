@@ -630,9 +630,13 @@ Feature-gated shared-transport manager at `instancy::communication::SharedPeerMa
 Key methods:
 
 - `pub fn new(peer_node_id: String, config: SharedConnectionConfig, connection_factory: Arc<dyn DynConnectionFactory>, runtime_handle: &tokio::runtime::Handle, health_tx: broadcast::Sender<RuntimeEvent>) -> Result<Self>`
-- `pub async fn register_dataflow(&self, dataflow_id: DataflowId, channel_ids: &[u64], channel_capacity: usize) -> Result<(HashMap<u64, tokio::sync::mpsc::Receiver<Vec<u8>>>, tokio::sync::mpsc::Receiver<TransportError>), TransportError>` — fails with `TransportError::InvalidRegistration` for a zero capacity, a duplicate or probe channel id, or a dataflow id that is already registered
+- `pub async fn register_dataflow(&self, dataflow_id: DataflowId, channel_ids: &[u64], channel_capacity: usize) -> Result<(HashMap<u64, tokio::sync::mpsc::Receiver<Vec<u8>>>, tokio::sync::mpsc::Receiver<PeerIoNotice>), TransportError>` — fills the pool first (`SharedConnectionConfig::connections`, each connection bounded by `connect_timeout`) and pins the dataflow's lane to one pooled connection; fails with `TransportError::InvalidRegistration` for a zero capacity, a duplicate or probe channel id, or a dataflow id that is already registered, and with `TransportError::Io` if the pool cannot be filled. The second receiver reports the dataflow's connection events (`PeerIoEvent`: a pooled connection it uses failed, a frame from the peer was out of sequence, or one of its frames was rejected).
 - `pub async fn unregister_dataflow(&self, dataflow_id: &DataflowId)`
 - `pub fn peer_node_id(&self) -> &str`
+- `pub fn connection_count(&self) -> usize`
+- `pub fn metrics_snapshot(&self) -> Vec<ConnectionSnapshot>` — per pooled connection: RTT, queued frames, pinned lanes, bytes and frames written
+
+`SharedConnectionConfig { connections, connect_timeout, probe_interval, rtt_ema_alpha }` configures a fixed pool (default one connection per peer). Shared mode is fail-stop: see the "Transport Contract" and "Connection Failures" sections of [Distributed Execution](../guide/distributed.md).
 
 See also: [Distributed Execution](../guide/distributed.md).
 
