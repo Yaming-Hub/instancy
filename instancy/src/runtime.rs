@@ -1659,7 +1659,7 @@ impl RuntimeHandle {
     ///
     /// # Execution model
     ///
-    /// Each worker runs as an independent [`DataflowExecutor`] on the shared
+    /// Each worker runs as an independent executor on the shared
     /// pool, hosting the operators of the stages it participates in. Every
     /// worker tracks progress over the whole graph and exchanges its progress
     /// with every other worker. Cross-worker data routing is handled by
@@ -1803,11 +1803,8 @@ impl RuntimeHandle {
         let dataflow_id = DataflowId::new();
         #[cfg(any(debug_assertions, feature = "progress-check"))]
         {
-            dataflow.check = crate::progress::check::oracle_unless::<T>(
-                dataflow.check_skip,
-                dataflow_id,
-                worker_context.num_workers(),
-            );
+            dataflow.check =
+                crate::progress::check::oracle::<T>(dataflow_id, worker_context.num_workers());
         }
         let (spawned, executor, mut notifier) = self.prepare_worker(
             &mut dataflow,
@@ -2175,11 +2172,7 @@ impl RuntimeHandle {
         let dataflow_id = DataflowId::new();
         #[cfg(any(debug_assertions, feature = "progress-check"))]
         {
-            dataflow.check = crate::progress::check::oracle_unless::<T>(
-                dataflow.check_skip,
-                dataflow_id,
-                num_workers,
-            );
+            dataflow.check = crate::progress::check::oracle::<T>(dataflow_id, num_workers);
         }
         let mut prepared = Vec::with_capacity(num_workers);
         let mut spawned_count = 0usize;
@@ -3070,6 +3063,13 @@ impl RuntimeHandle {
             vec![None]
         };
 
+        #[cfg(any(debug_assertions, feature = "progress-check"))]
+        let progress_batch_cap = dataflows
+            .first()
+            .and_then(|df| df.check_progress_batch_cap)
+            .unwrap_or(DEFAULT_MAX_BATCH_SIZE);
+        #[cfg(not(any(debug_assertions, feature = "progress-check")))]
+        let progress_batch_cap = DEFAULT_MAX_BATCH_SIZE;
         let (progress_channels, progress_handles) = create_network_progress_channels::<T>(
             local_progress,
             &outboxes,
@@ -3081,7 +3081,7 @@ impl RuntimeHandle {
             &wake_handles,
             bridge_cancel.clone(),
             events_tx.clone(),
-            DEFAULT_MAX_BATCH_SIZE,
+            progress_batch_cap,
             runtime_handle,
             crate::progress::network_progress::ProgressCodecs::new(
                 dataflows
@@ -3124,11 +3124,7 @@ impl RuntimeHandle {
             // All nodes of the cluster in this process share one oracle.
             #[cfg(any(debug_assertions, feature = "progress-check"))]
             {
-                dataflow.check = crate::progress::check::oracle_unless::<T>(
-                    dataflow.check_skip,
-                    dataflow_id,
-                    total_workers,
-                );
+                dataflow.check = crate::progress::check::oracle::<T>(dataflow_id, total_workers);
             }
             let pc = progress_channels_iter.next().map(Some).unwrap_or(None);
             let wh = wake_handles[global_idx].clone();
@@ -3457,11 +3453,7 @@ impl SimpleRuntime {
         let mut dataflow = dataflow;
         #[cfg(any(debug_assertions, feature = "progress-check"))]
         {
-            dataflow.check = crate::progress::check::oracle_unless::<T>(
-                dataflow.check_skip,
-                DataflowId::new(),
-                1,
-            );
+            dataflow.check = crate::progress::check::oracle::<T>(DataflowId::new(), 1);
         }
         let plan = PhysicalPlan::single(&dataflow.graph, &dataflow.stages)?;
         let mut executor = materialize_executor(
@@ -3511,11 +3503,7 @@ impl SimpleRuntime {
         self.cancel.register_wake_handle_weak(&wake_handle);
         #[cfg(any(debug_assertions, feature = "progress-check"))]
         {
-            dataflow.check = crate::progress::check::oracle_unless::<T>(
-                dataflow.check_skip,
-                DataflowId::new(),
-                1,
-            );
+            dataflow.check = crate::progress::check::oracle::<T>(DataflowId::new(), 1);
         }
         let plan = PhysicalPlan::single(&dataflow.graph, &dataflow.stages)?;
         let mut executor = materialize_executor(
@@ -3672,8 +3660,7 @@ impl SimpleRuntime {
         // --- Materialize and run on background thread ---
         #[cfg(any(debug_assertions, feature = "progress-check"))]
         if dataflow.check.is_none() {
-            dataflow.check = crate::progress::check::oracle_unless::<T>(
-                dataflow.check_skip,
+            dataflow.check = crate::progress::check::oracle::<T>(
                 DataflowId::new(),
                 worker_context.num_workers(),
             );
@@ -3823,11 +3810,7 @@ impl SimpleRuntime {
             vec![None]
         };
         #[cfg(any(debug_assertions, feature = "progress-check"))]
-        let check_oracle = crate::progress::check::oracle_unless::<T>(
-            dataflows.iter().any(|df| df.check_skip),
-            DataflowId::new(),
-            num_workers,
-        );
+        let check_oracle = crate::progress::check::oracle::<T>(DataflowId::new(), num_workers);
 
         for (worker_idx, dataflow) in dataflows.into_iter().enumerate() {
             let ctx = WorkerContext::new(worker_idx, num_workers)?;
@@ -5614,7 +5597,6 @@ fn materialize_executor<T: Timestamp>(
         max_sweeps_per_poll: 64,
         catch_panics: dataflow.catch_panics,
         collect_metrics: dataflow.collect_metrics,
-        channel_counters: dataflow.channel_counters,
         drain_timeout: dataflow.drain_timeout,
         stopped_peer_grace: ExecutorConfig::default().stopped_peer_grace,
         channel_metrics_collectors: dataflow.channel_metrics_collectors.clone(),

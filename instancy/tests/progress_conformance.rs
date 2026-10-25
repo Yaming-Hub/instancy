@@ -8,31 +8,21 @@
 //! - the output is the exact expected multiset: nothing lost, nothing
 //!   duplicated, and every per-epoch aggregate emitted once, whole;
 //! - the progress checker ([`instancy::progress::check`]) recorded no V1,
-//!   V4, V6 or V7 violation for the run, and actually observed it (an oracle
-//!   was attached, every channel was wrapped, and on success the end-state
-//!   check ran).
+//!   V4, V5, V6 or V7 violation for the run, and actually observed it (an
+//!   oracle was attached, every channel was wrapped, and on success the
+//!   end-state check ran).
 //!
-//! Today's code fails many cases. How each case fails is recorded in the
-//! *golden file*, `tests/progress_conformance.golden`: per case, the
-//! failures every recorded run showed (`always`) and those only some runs
-//! showed (`sometimes`), with violations located at an operator port
+//! Since step 3 (port-counted progress) every case passes cleanly. The
+//! *golden file*, `tests/progress_conformance.golden`, records how cases
+//! known to fail fail, and it lists none: per case, the failures every
+//! recorded run showed (`always`) and those only some runs showed
+//! (`sometimes`), with violations located at an operator port
 //! (`V7:frontier-ahead-of-work@loop::concat[in 1]`). A case the file does
-//! not list must pass cleanly. A case must show every `always` failure and
-//! nothing outside `always` and `sometimes`, with one exception: per-record
-//! frontier violations (V1 `late-data`, V7 `frontier-ahead-of-work`) are
-//! detected only when an interleaving exposes the frontier passing a record,
-//! so whether and where they occur varies from run to run. They are not
-//! required, and they are accepted at any location where some case of the
-//! same shape and path showed them; a frontier violation at a location no
-//! such case ever showed fails the case. Outcomes (hang, loss, duplicates,
-//! split aggregates, errors) and every other violation are judged exactly.
-//! `CONFORMANCE_STRICT=1` judges frontier violations exactly too.
-//!
-//! So a later step that fixes an outcome, or changes how a case fails (a
-//! hang into a loss, a violation at a new location), fails the matrix until
-//! the golden file is regenerated. A mismatching case is re-run up to
-//! [`ATTEMPTS`] times and passes if any attempt matches (it is then reported
-//! as `FLAKY`): a deterministic change always fails.
+//! not list must pass cleanly; a listed case must show every `always`
+//! failure and nothing outside `always` and `sometimes`. Everything is
+//! judged exactly. A case that hangs at the hard timeout (a starved machine)
+//! is re-run up to [`ATTEMPTS`] times and passes if an attempt matches (it is
+//! then reported as `FLAKY`); any other mismatch fails at once.
 //!
 //! [`EXPECTED_FAILURES`] explains the golden file by audit finding: every
 //! failure the golden file records must be of a kind that a table entry
@@ -74,7 +64,8 @@
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::fmt;
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
 use std::time::Duration;
 
 use instancy::communication::ClusterSpawnTransport;
@@ -84,12 +75,12 @@ use instancy::communication::shared_transport::{
 };
 use instancy::communication::transport_session::PeerConnection;
 use instancy::dataflow::dataflow_builder::IterateResult;
-use instancy::dataflow::{InputSender, OutputReceiver};
+use instancy::dataflow::{InputSender, OutputReceiver, Retained};
 use instancy::execute::NodeConfig;
 use instancy::order::Product;
 use instancy::progress::check::{self, Activation, Check, Mode};
 use instancy::{
-    ClusterTopology, DataflowBuilder, DataflowId, MultiSpawnedDataflow, Pipe, Result,
+    ClusterTopology, DataflowBuilder, DataflowId, MultiSpawnedDataflow, Pipe, ProbeHandle, Result,
     RuntimeConfig, RuntimeHandle, SimpleRuntime, SpawnOptions,
 };
 use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
@@ -145,9 +136,9 @@ enum Shape {
     NestedIterate,
     /// A long loop followed by a per-epoch count (audit H11).
     LoopThenCount,
-    /// A finite loop feeding an operator that holds everything and flushes
-    /// once its input frontier is empty (a stand-in for the planned
-    /// `retain`). Must complete with all records.
+    /// A finite loop feeding an operator that retains each batch it stashes
+    /// and flushes once its input frontier is empty. Must complete with all
+    /// records.
     LoopThenFlush,
     /// The output receiver is read only after a pause (egress is full).
     OutputPaused,
@@ -158,6 +149,34 @@ enum Shape {
     /// An operator acquires a notification at a time justified only by its
     /// input frontier. The design rejects this (audit P-9).
     NotifyAtFrontier,
+    /// input → exchange → probed operator → output, with a probe on the
+    /// probed operator's stream: monotone, never done with a time the
+    /// operator still emits at, done after a successful run. On the staged
+    /// path an upstream-only worker finishes first while the probe is live.
+    ProbeAfterExchange,
+    /// A probe on a loop's output, checked as the loop body emits.
+    ProbeAfterLoop,
+    /// A loop inside a loop, with an exchange in the inner body (#281).
+    NestedIterateExchange,
+    /// One output feeding two exchanges through an identity `map` each; the
+    /// second feeds a per-epoch count (design §5.9, X1b).
+    FanoutMapped,
+    /// A loop followed by a broadcast (X1c).
+    LoopThenBroadcast,
+    /// A loop, then an exchange from its leave, then a broadcast (X1d).
+    LoopExchangeBroadcast,
+    /// Graceful drain on cancellation through an exchange: the workers keep
+    /// exchanging progress until every one has retired (M12).
+    DrainOnCancelExchange,
+    /// A record whose decoding fails crosses the network: the run must fail
+    /// with the decode error.
+    DecodeError,
+    /// `Exchange` on a cluster whose progress frames hold at most two
+    /// changes, so commits are split.
+    SplitCommit,
+    /// `IterateExchange` likewise: commits are split across the parent's
+    /// and the loop scope's sections.
+    SplitLoopCommit,
 }
 
 const ALL_SHAPES: &[Shape] = &[
@@ -187,6 +206,16 @@ const ALL_SHAPES: &[Shape] = &[
     Shape::OutputDropped,
     Shape::DrainOnCancel,
     Shape::NotifyAtFrontier,
+    Shape::ProbeAfterExchange,
+    Shape::ProbeAfterLoop,
+    Shape::NestedIterateExchange,
+    Shape::FanoutMapped,
+    Shape::LoopThenBroadcast,
+    Shape::LoopExchangeBroadcast,
+    Shape::DrainOnCancelExchange,
+    Shape::DecodeError,
+    Shape::SplitCommit,
+    Shape::SplitLoopCommit,
 ];
 
 /// How the dataflow is executed.
@@ -284,6 +313,16 @@ impl Case {
     /// Whether the combination exists.
     fn applicable(&self) -> bool {
         let cluster = matches!(self.transport, Transport::Dedicated | Transport::Shared);
+        // A decode error needs records to cross a (mock) network.
+        if self.shape == Shape::DecodeError
+            && (self.transport == Transport::InProcess || self.workers == Workers::One)
+        {
+            return false;
+        }
+        // Progress frames are split on a cluster only.
+        if matches!(self.shape, Shape::SplitCommit | Shape::SplitLoopCommit) && !cluster {
+            return false;
+        }
         match self.path {
             Path::Staged => {
                 // Two parallelisms need two workers and an exchange to split
@@ -293,13 +332,11 @@ impl Case {
                     && has_stage_boundary(self.shape)
             }
             // `SimpleRuntime` has no drain on cancellation.
-            Path::Simple => {
-                self.transport == Transport::InProcess && self.shape != Shape::DrainOnCancel
-            }
+            Path::Simple => self.transport == Transport::InProcess && !drains_on_cancel(self.shape),
             Path::Unfused | Path::Fused | Path::StageTasks => {
                 if cluster {
                     // A cluster needs two nodes.
-                    self.workers != Workers::One && self.shape != Shape::DrainOnCancel
+                    self.workers != Workers::One && !drains_on_cancel(self.shape)
                 } else {
                     true
                 }
@@ -308,12 +345,19 @@ impl Case {
     }
 }
 
+/// Whether the run is cancelled once everything is fed, with a drain.
+fn drains_on_cancel(shape: Shape) -> bool {
+    matches!(shape, Shape::DrainOnCancel | Shape::DrainOnCancelExchange)
+}
+
 /// Whether the shape has an exchange outside any loop, where the staged
 /// path can change parallelism.
 fn has_stage_boundary(shape: Shape) -> bool {
     matches!(
         shape,
         Shape::Exchange
+            | Shape::ProbeAfterExchange
+            | Shape::FanoutMapped
             | Shape::ExchangeTwice
             | Shape::FanoutExchanges
             | Shape::NotifySum
@@ -354,6 +398,10 @@ enum Failure {
     Violation(Check, &'static str, Option<&'static str>),
     /// The progress checker did not observe the run.
     Blind(&'static str),
+    /// A probe went wrong: `early` (done with a time still emitted at),
+    /// `regressed` (its frontier moved back), or `not-done` (not done after
+    /// a successful run).
+    Probe(&'static str),
 }
 
 impl fmt::Display for Failure {
@@ -363,6 +411,7 @@ impl fmt::Display for Failure {
             Failure::Violation(check, kind, None) => write!(f, "{check}:{kind}"),
             Failure::Violation(check, kind, Some(at)) => write!(f, "{check}:{kind}@{at}"),
             Failure::Blind(why) => write!(f, "blind:{why}"),
+            Failure::Probe(what) => write!(f, "probe:{what}"),
             other => write!(f, "{other:?}"),
         }
     }
@@ -391,6 +440,8 @@ impl Failure {
                     Failure::Error(intern(signature))
                 } else if let Some(why) = text.strip_prefix("blind:") {
                     Failure::Blind(intern(why))
+                } else if let Some(what) = text.strip_prefix("probe:") {
+                    Failure::Probe(intern(what))
                 } else {
                     let (check, rest) = text
                         .split_once(':')
@@ -408,17 +459,6 @@ impl Failure {
                 }
             }
         })
-    }
-
-    /// Whether this is a per-record frontier violation (V1 `late-data` or V7
-    /// `frontier-ahead-of-work`): whether one occurs, and where, depends on
-    /// the interleaving that exposes a frontier passing a record.
-    fn is_frontier(self) -> bool {
-        matches!(
-            self,
-            Failure::Violation(Check::V1, "late-data", _)
-                | Failure::Violation(Check::V7, "frontier-ahead-of-work", _)
-        )
     }
 
     /// Whether this (expected) failure accepts the observed failure `seen`.
@@ -447,18 +487,6 @@ fn intern(text: &str) -> &'static str {
     interned.insert(leaked);
     leaked
 }
-
-const V1_LATE: Failure = Failure::Violation(Check::V1, "late-data", None);
-const V7_AHEAD: Failure = Failure::Violation(Check::V7, "frontier-ahead-of-work", None);
-const V7_RESIDUAL: Failure = Failure::Violation(Check::V7, "end-state-residual", None);
-const V4_FORCE: Failure = Failure::Violation(Check::V4, "force-close-with-work", None);
-const V4_EXHAUSTED: Failure = Failure::Violation(Check::V4, "exhausted-input-frontier", None);
-const V4_HOLDING: Failure = Failure::Violation(Check::V4, "finished-holding-capability", None);
-const HANG: Failure = Failure::Hang;
-const LOSS: Failure = Failure::Loss;
-const SPLIT: Failure = Failure::Split;
-const INFLIGHT_NEGATIVE: Failure = Failure::Error("inflight-negative");
-const DATA_LOST: Failure = Failure::Error("data-lost");
 
 /// Known errors: text the error contains, and its signature. Anything else
 /// is `Error:other`.
@@ -528,305 +556,10 @@ fn explanations(case: &Case, failure: Failure) -> Vec<&'static Expected> {
         .collect()
 }
 
-const ANY_PATH: &[Path] = &[];
-const ANY_TRANSPORT: &[Transport] = &[];
-const ANY_WORKERS: &[Workers] = &[];
-const ANY_CAP: &[Cap] = &[];
-const MULTI: &[Workers] = &[Workers::Two, Workers::Three];
-const UNIFORM: &[Path] = &[Path::Unfused, Path::Fused, Path::StageTasks];
-const UNIFORM_AND_SIMPLE: &[Path] = &[Path::Unfused, Path::Fused, Path::StageTasks, Path::Simple];
-/// Every path of the one executor core: the uniform paths, stages with
-/// different parallelism, and `SimpleRuntime`.
-const UNIFORM_STAGED_AND_SIMPLE: &[Path] = &[
-    Path::Unfused,
-    Path::Fused,
-    Path::StageTasks,
-    Path::Staged,
-    Path::Simple,
-];
-const LOOPS: &[Shape] = &[
-    Shape::Iterate,
-    Shape::IterateExchange,
-    Shape::NestedIterate,
-    Shape::LoopThenCount,
-    Shape::LoopThenFlush,
-];
-
-/// Today's known failures, by audit finding. See [`Expected`].
-const EXPECTED_FAILURES: &[Expected] = &[
-    Expected {
-        audit: "P-9",
-        shapes: &[Shape::NotifyAtFrontier],
-        paths: ANY_PATH,
-        transports: ANY_TRANSPORT,
-        workers: ANY_WORKERS,
-        caps: ANY_CAP,
-        failures: &[Failure::NotRejected],
-        why: "notify_at accepts a time only the input frontier justifies",
-    },
-    Expected {
-        audit: "H1/P-2",
-        shapes: &[
-            Shape::Binary,
-            Shape::Concat,
-            Shape::OkErr,
-            Shape::Delay,
-            Shape::NotifyAtFrontier,
-        ],
-        paths: &[Path::Unfused],
-        transports: ANY_TRANSPORT,
-        workers: ANY_WORKERS,
-        caps: ANY_CAP,
-        failures: &[V1_LATE, V7_AHEAD],
-        why: "pipeline queues and pending_output are invisible to progress: an input \
-              capability downgrades past records still queued downstream",
-    },
-    Expected {
-        audit: "H1/P-2",
-        shapes: &[Shape::OkErr],
-        paths: &[Path::Unfused],
-        transports: ANY_TRANSPORT,
-        workers: MULTI,
-        caps: &[Cap::One],
-        failures: &[HANG, V4_EXHAUSTED],
-        why: "a worker blocked on a full channel can spin after its peers force-close",
-    },
-    Expected {
-        audit: "C1/C2",
-        shapes: &[
-            Shape::Exchange,
-            Shape::ExchangeTwice,
-            Shape::FanoutExchanges,
-            Shape::Distinct,
-            Shape::NotifySum,
-            Shape::Reduce,
-            Shape::Count,
-        ],
-        paths: UNIFORM_STAGED_AND_SIMPLE,
-        transports: ANY_TRANSPORT,
-        workers: ANY_WORKERS,
-        caps: ANY_CAP,
-        failures: &[V1_LATE, V7_AHEAD, SPLIT],
-        why: "records in an exchange are counted only when the producer is of the map \
-              family, and completion sums signed counts: frontiers pass records in transit, \
-              and per-epoch aggregates fire early",
-    },
-    Expected {
-        audit: "C1/C2",
-        shapes: &[
-            Shape::Exchange,
-            Shape::ExchangeTwice,
-            Shape::Distinct,
-            Shape::NotifySum,
-            Shape::Reduce,
-            Shape::Count,
-        ],
-        paths: &[Path::Unfused],
-        transports: ANY_TRANSPORT,
-        workers: MULTI,
-        caps: &[Cap::One],
-        failures: &[HANG, V4_EXHAUSTED],
-        why: "with one-batch channels, a worker whose peers completed early spins on a \
-              full channel",
-    },
-    Expected {
-        audit: "C2",
-        shapes: &[
-            Shape::Exchange,
-            Shape::ExchangeTwice,
-            Shape::FanoutExchanges,
-            Shape::NotifySum,
-            Shape::Reduce,
-            Shape::Count,
-            Shape::UnaryAsync,
-            Shape::IterateExchange,
-            Shape::LoopThenCount,
-        ],
-        paths: UNIFORM,
-        transports: &[Transport::Mock],
-        workers: &[Workers::One],
-        caps: ANY_CAP,
-        failures: &[INFLIGHT_NEGATIVE],
-        why: "the network pull records -n but a producer outside the map family never \
-              records +n; one worker trips the in-flight symmetry assertion",
-    },
-    Expected {
-        audit: "H10",
-        shapes: &[Shape::Broadcast],
-        paths: UNIFORM_AND_SIMPLE,
-        transports: ANY_TRANSPORT,
-        workers: ANY_WORKERS,
-        caps: ANY_CAP,
-        failures: &[V1_LATE, V7_AHEAD],
-        why: "broadcast records are not counted in flight (a guard capability stands in)",
-    },
-    Expected {
-        audit: "H10",
-        shapes: &[Shape::Broadcast],
-        paths: &[Path::Unfused],
-        transports: ANY_TRANSPORT,
-        workers: MULTI,
-        caps: &[Cap::One],
-        failures: &[HANG, V4_EXHAUSTED],
-        why: "with one-batch channels the broadcast guard keeps a worker spinning",
-    },
-    Expected {
-        audit: "H12",
-        shapes: &[Shape::FanoutExchanges],
-        paths: UNIFORM_STAGED_AND_SIMPLE,
-        transports: ANY_TRANSPORT,
-        workers: MULTI,
-        caps: ANY_CAP,
-        failures: &[HANG, V4_EXHAUSTED],
-        why: "two exchanges fed by one output share one in-flight key",
-    },
-    Expected {
-        audit: "O-9/H11",
-        shapes: LOOPS,
-        paths: ANY_PATH,
-        transports: ANY_TRANSPORT,
-        workers: ANY_WORKERS,
-        caps: ANY_CAP,
-        failures: &[V1_LATE, V7_AHEAD],
-        why: "feedback edges are not in the reachability graph: the loop's concat sees an \
-              empty frontier on its feedback input while records circulate",
-    },
-    Expected {
-        audit: "O-9/P-2",
-        shapes: LOOPS,
-        paths: &[Path::Unfused, Path::Staged],
-        transports: ANY_TRANSPORT,
-        workers: ANY_WORKERS,
-        caps: ANY_CAP,
-        failures: &[V4_FORCE],
-        why: "a worker force-closes while loop records circulate (its tracker sees no \
-              feedback work); Iterate and LoopThenFlush only when pinned to one or two cores",
-    },
-    Expected {
-        audit: "C2/P-2",
-        shapes: &[Shape::Distinct],
-        paths: &[Path::Staged],
-        transports: ANY_TRANSPORT,
-        workers: MULTI,
-        caps: &[Cap::One],
-        failures: &[HANG, V4_EXHAUSTED, V4_FORCE],
-        why: "worker 0, the only host of stage 1, sees an empty view while records it never \
-              counted sit in the exchange (C2) and in worker 1's pending_output (H1); idle \
-              force-close then fires on the empty view (P-2)",
-    },
-    Expected {
-        audit: "C1/C2",
-        shapes: &[Shape::Distinct],
-        paths: UNIFORM,
-        transports: &[Transport::Shared],
-        workers: MULTI,
-        caps: ANY_CAP,
-        failures: &[DATA_LOST, V4_HOLDING, V4_FORCE, LOSS, V7_RESIDUAL],
-        why: "under full-matrix load, Shared's pooled connections let progress overtake \
-              data: a node's view sums to zero through cancellation (the exchange input \
-              holds -n with no +n against distinct's and the input's capabilities; traced, \
-              every peer heard from, no seed missing), it force-closes, and records are lost \
-              or reach finished operators (rare; never seen isolated)",
-    },
-    Expected {
-        audit: "H11",
-        shapes: &[Shape::IterateExchange, Shape::LoopThenCount],
-        paths: UNIFORM_STAGED_AND_SIMPLE,
-        transports: ANY_TRANSPORT,
-        workers: ANY_WORKERS,
-        caps: ANY_CAP,
-        failures: &[SPLIT],
-        why: "a loop does not hold the outer epoch: the count after it fires while records \
-              still circulate",
-    },
-    Expected {
-        audit: "H11",
-        shapes: &[Shape::LoopThenFlush],
-        paths: ANY_PATH,
-        transports: ANY_TRANSPORT,
-        workers: ANY_WORKERS,
-        caps: &[Cap::Default],
-        failures: &[LOSS],
-        why: "a loop does not hold the outer epoch: the frontier after it empties while \
-              records still circulate, so a flush-at-empty-frontier operator flushes early",
-    },
-    Expected {
-        audit: "C2",
-        shapes: LOOPS,
-        paths: UNIFORM_STAGED_AND_SIMPLE,
-        transports: ANY_TRANSPORT,
-        workers: ANY_WORKERS,
-        caps: &[Cap::One],
-        failures: &[HANG, V4_EXHAUSTED],
-        why: "a loop with one-batch channels never completes (loops hang, C2)",
-    },
-    Expected {
-        audit: "C2",
-        shapes: &[Shape::IterateExchange, Shape::LoopThenCount],
-        paths: UNIFORM_STAGED_AND_SIMPLE,
-        transports: ANY_TRANSPORT,
-        workers: MULTI,
-        caps: ANY_CAP,
-        failures: &[HANG, V4_EXHAUSTED],
-        why: "a multi-worker loop with an exchange inside, or followed by one from its \
-              leave, never completes",
-    },
-    Expected {
-        audit: "O-4/H1",
-        shapes: &[Shape::UnaryAsync],
-        paths: UNIFORM_STAGED_AND_SIMPLE,
-        transports: ANY_TRANSPORT,
-        workers: ANY_WORKERS,
-        caps: ANY_CAP,
-        failures: &[V1_LATE, V7_AHEAD, SPLIT],
-        why: "unary_async's queued input, running tasks and results are invisible to \
-              progress: the count after it fires early",
-    },
-    Expected {
-        audit: "O-4/P-2",
-        shapes: &[Shape::UnaryAsync],
-        paths: &[Path::Unfused],
-        transports: ANY_TRANSPORT,
-        workers: ANY_WORKERS,
-        caps: &[Cap::One],
-        failures: &[HANG, V4_EXHAUSTED],
-        why: "with one-batch channels, after a worker force-closes while tasks hold \
-              records, its peers spin",
-    },
-    Expected {
-        audit: "O-4/P-2",
-        shapes: &[Shape::UnaryAsync],
-        paths: UNIFORM,
-        transports: ANY_TRANSPORT,
-        workers: MULTI,
-        caps: ANY_CAP,
-        failures: &[V4_FORCE],
-        why: "a worker force-closes on its tracker's completion while unary_async tasks \
-              hold records",
-    },
-    Expected {
-        audit: "O-4/H1",
-        shapes: &[Shape::AsyncFailure],
-        paths: UNIFORM_AND_SIMPLE,
-        transports: ANY_TRANSPORT,
-        workers: ANY_WORKERS,
-        caps: ANY_CAP,
-        failures: &[V1_LATE, V7_AHEAD],
-        why: "unary_async's queued input and running tasks are invisible to progress",
-    },
-    Expected {
-        audit: "C1",
-        shapes: &[Shape::IterateExchange],
-        paths: UNIFORM,
-        transports: &[Transport::Dedicated, Transport::Shared],
-        workers: MULTI,
-        caps: ANY_CAP,
-        failures: &[V4_FORCE, V4_HOLDING],
-        why: "a node force-closes while loop records are still in flight to it (completion \
-              sums signed counts) and finishes holding the count's per-epoch capabilities \
-              (pinned to one core)",
-    },
-];
+/// Known failures, by audit finding. See [`Expected`]. Empty since step 3
+/// (port-counted progress): every case must pass cleanly, and a new entry
+/// needs a ruling from the redesign's design authority.
+const EXPECTED_FAILURES: &[Expected] = &[];
 
 // ===========================================================================
 // Building the shapes
@@ -878,6 +611,8 @@ fn two_outputs(shape: Shape) -> bool {
             | Shape::Fork
             | Shape::OkErr
             | Shape::IterateExchange
+            | Shape::FanoutMapped
+            | Shape::SplitLoopCommit
     )
 }
 
@@ -925,6 +660,140 @@ fn count_per_epoch(pipe: Pipe<u64, i64>) -> Pipe<u64, i64> {
     pipe.count("count").map("count-as-i64", |_t, n| n as i64)
 }
 
+/// A loop that steps each value up to the next multiple of 5.
+fn to_next_multiple_of_5(input: Pipe<u64, i64>) -> Pipe<u64, i64> {
+    input.iterate::<u32>("loop", 1u32, |var| {
+        let stepped = var.map("inc", |_t: &Product<u64, u32>, x| x + 1);
+        let done = stepped.clone().filter("done", |_t, x| x % 5 == 0);
+        let again = stepped.filter("again", |_t, x| x % 5 != 0);
+        IterateResult {
+            feedback: again,
+            output: done,
+        }
+    })
+}
+
+/// A probe the shape checks as the probed stream is produced (the
+/// `Probe*` shapes). Cases run one at a time, so every slot built during a
+/// case is that case's.
+#[derive(Default)]
+struct ProbeSlot {
+    handle: OnceLock<ProbeHandle<u64>>,
+    /// The frontier's minimum (`u64::MAX` once empty) at the last check,
+    /// read and compared under the lock so concurrent checks are ordered.
+    last: Mutex<Option<u64>>,
+    checks: AtomicU64,
+}
+
+fn probe_slots() -> MutexGuard<'static, Vec<Arc<ProbeSlot>>> {
+    static SLOTS: OnceLock<Mutex<Vec<Arc<ProbeSlot>>>> = OnceLock::new();
+    SLOTS
+        .get_or_init(Default::default)
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+}
+
+fn probe_findings() -> MutexGuard<'static, BTreeSet<&'static str>> {
+    static FINDINGS: OnceLock<Mutex<BTreeSet<&'static str>>> = OnceLock::new();
+    FINDINGS
+        .get_or_init(Default::default)
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+}
+
+impl ProbeSlot {
+    fn new() -> Arc<Self> {
+        let slot = Arc::new(Self::default());
+        probe_slots().push(Arc::clone(&slot));
+        slot
+    }
+
+    fn level(handle: &ProbeHandle<u64>) -> u64 {
+        handle
+            .frontier()
+            .elements()
+            .iter()
+            .min()
+            .copied()
+            .unwrap_or(u64::MAX)
+    }
+
+    /// The probed operator emits at `time`: the probe must not be done
+    /// with it (its frontier still includes the record being emitted), and
+    /// must not have moved back.
+    fn check(&self, time: u64) {
+        let Some(handle) = self.handle.get() else {
+            return;
+        };
+        let mut last = self.last.lock().unwrap_or_else(|e| e.into_inner());
+        let level = Self::level(handle);
+        if last.is_some_and(|previous| level < previous) {
+            probe_findings().insert("regressed");
+        }
+        *last = Some(level);
+        if level > time {
+            probe_findings().insert("early");
+        }
+        self.checks.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+/// An identity operator that checks `slot` before emitting each batch.
+fn probed(pipe: Pipe<u64, i64>, slot: &Arc<ProbeSlot>) -> Pipe<u64, i64> {
+    let slot = Arc::clone(slot);
+    pipe.unary("probed", move |input, output| {
+        while let Some((time, data)) = input.next() {
+            slot.check(time);
+            output.push_vec(time, data);
+        }
+        Ok(())
+    })
+}
+
+/// A record whose decoding fails (`BRITTLE`, one of the input values).
+#[derive(Clone, Debug)]
+struct Brittle(i64);
+
+const BRITTLE: i64 = 13;
+
+struct BrittleCodec;
+
+impl instancy::communication::codec::Codec<Brittle> for BrittleCodec {
+    fn encode(
+        &self,
+        value: &Brittle,
+        buf: &mut Vec<u8>,
+    ) -> std::result::Result<(), instancy::communication::codec::CodecError> {
+        buf.extend_from_slice(&value.0.to_le_bytes());
+        Ok(())
+    }
+
+    fn decode(
+        &self,
+        buf: &[u8],
+    ) -> std::result::Result<(Brittle, usize), instancy::communication::codec::CodecError> {
+        use instancy::communication::codec::CodecError;
+        let bytes: [u8; 8] =
+            buf.get(..8)
+                .and_then(|b| b.try_into().ok())
+                .ok_or(CodecError::InsufficientData {
+                    needed: 8,
+                    available: buf.len(),
+                })?;
+        match i64::from_le_bytes(bytes) {
+            BRITTLE => Err(CodecError::InvalidData("brittle record".into())),
+            value => Ok((Brittle(value), 8)),
+        }
+    }
+}
+
+impl instancy::communication::codec::ExchangeData for Brittle {
+    type CodecType = BrittleCodec;
+    fn codec() -> BrittleCodec {
+        BrittleCodec
+    }
+}
+
 fn build_shape(cfg: BuildCfg, b: &mut DataflowBuilder<u64>) -> Result<()> {
     if let Some(activation) = cfg.activation {
         b.check_activation(activation);
@@ -935,12 +804,15 @@ fn build_shape(cfg: BuildCfg, b: &mut DataflowBuilder<u64>) -> Result<()> {
     if cfg.mock {
         b.check_mock_network(true);
     }
+    if matches!(cfg.shape, Shape::SplitCommit | Shape::SplitLoopCommit) {
+        b.check_progress_batch_cap(2);
+    }
     let input = b.input::<i64>("in")?;
     match cfg.shape {
         Shape::Pipeline | Shape::OutputPaused | Shape::OutputDropped | Shape::DrainOnCancel => {
             input.map("inc", |_t, x| x + 1).output("out")?;
         }
-        Shape::Exchange => {
+        Shape::Exchange | Shape::SplitCommit => {
             first_exchange(input, &cfg)?
                 .map("double", |_t, x| x * 2)
                 .output("out")?;
@@ -955,8 +827,73 @@ fn build_shape(cfg: BuildCfg, b: &mut DataflowBuilder<u64>) -> Result<()> {
             first_exchange(shared.clone(), &cfg)?.output("out")?;
             count_per_epoch(shared.exchange_by_hash("to-one", |_x: &i64| 0)).output("out2")?;
         }
+        Shape::FanoutMapped => {
+            let shared = input.map("identity", |_t, x| x);
+            first_exchange(shared.clone().map("left-identity", |_t, x| x), &cfg)?.output("out")?;
+            count_per_epoch(
+                shared
+                    .map("right-identity", |_t, x| x)
+                    .exchange_by_hash("to-one", |_x: &i64| 0),
+            )
+            .output("out2")?;
+        }
         Shape::Broadcast => {
             input.broadcast("broadcast").output("out")?;
+        }
+        Shape::LoopThenBroadcast => {
+            to_next_multiple_of_5(input)
+                .broadcast("broadcast")
+                .output("out")?;
+        }
+        Shape::LoopExchangeBroadcast => {
+            to_next_multiple_of_5(input)
+                .exchange("after-loop", |x: &i64| *x)
+                .broadcast("broadcast")
+                .output("out")?;
+        }
+        Shape::DrainOnCancelExchange => {
+            first_exchange(input, &cfg)?
+                .map("inc", |_t, x| x + 1)
+                .output("out")?;
+        }
+        Shape::DecodeError => {
+            input
+                .map("brittle", |_t, x| Brittle(x))
+                .broadcast("broadcast-brittle")
+                .map("unwrap", |_t, b| b.0)
+                .output("out")?;
+        }
+        Shape::ProbeAfterExchange => {
+            let slot = ProbeSlot::new();
+            let (stream, handle) = probed(first_exchange(input, &cfg)?, &slot).probe();
+            let _ = slot.handle.set(handle);
+            stream.output("out")?;
+        }
+        Shape::ProbeAfterLoop => {
+            let slot = ProbeSlot::new();
+            let check = Arc::clone(&slot);
+            let out = input.iterate::<u32>("loop", 1u32, move |var| {
+                let stepped = var.map("inc", |_t: &Product<u64, u32>, x| x + 1);
+                // Checked as the body emits a record that leaves the loop.
+                let done = stepped.clone().filter("done", |_t, x| x % 5 == 0).unary(
+                    "probed",
+                    move |input, output| {
+                        while let Some((time, data)) = input.next() {
+                            check.check(time.outer);
+                            output.push_vec(time, data);
+                        }
+                        Ok(())
+                    },
+                );
+                let again = stepped.filter("again", |_t, x| x % 5 != 0);
+                IterateResult {
+                    feedback: again,
+                    output: done,
+                }
+            });
+            let (out, handle) = out.probe();
+            let _ = slot.handle.set(handle);
+            out.output("out")?;
         }
         Shape::Binary => {
             let second = b.input::<i64>("in2")?;
@@ -1053,16 +990,18 @@ fn build_shape(cfg: BuildCfg, b: &mut DataflowBuilder<u64>) -> Result<()> {
                 }
             });
             if cfg.shape == Shape::LoopThenFlush {
-                let mut held: Vec<(u64, i64)> = Vec::new();
-                let mut flushed = false;
-                out.unary_notify("hold-then-flush", move |input, output, ctx| {
+                let mut held = Held::default();
+                out.unary("hold-then-flush", move |input, output| {
+                    // The closure captures `held` whole (its `Clone` starts
+                    // empty), not its field.
+                    let held = &mut held;
+                    // Each stashed batch keeps a capability at its time.
                     while let Some((time, data)) = input.next() {
-                        held.extend(data.into_iter().map(|x| (time, x)));
+                        held.0.push((output.retain(time), data));
                     }
-                    if !flushed && ctx.frontier().is_empty() {
-                        flushed = true;
-                        for (time, x) in held.drain(..) {
-                            output.session(time).give(x);
+                    if input.frontier().is_empty() {
+                        for (retained, data) in held.0.drain(..) {
+                            output.push_vec(*retained.time(), data);
                         }
                     }
                     Ok(())
@@ -1072,7 +1011,7 @@ fn build_shape(cfg: BuildCfg, b: &mut DataflowBuilder<u64>) -> Result<()> {
                 out.output("out")?;
             }
         }
-        Shape::IterateExchange => {
+        Shape::IterateExchange | Shape::SplitLoopCommit => {
             let out = input.iterate::<u32>("loop", 1u32, |var| {
                 let stepped = var
                     .map("inc", |_t: &Product<u64, u32>, x| x + 1)
@@ -1087,12 +1026,16 @@ fn build_shape(cfg: BuildCfg, b: &mut DataflowBuilder<u64>) -> Result<()> {
             out.clone().output("out")?;
             count_per_epoch(gather(out, &cfg)?).output("out2")?;
         }
-        Shape::NestedIterate => {
+        Shape::NestedIterate | Shape::NestedIterateExchange => {
+            let inner_exchange = cfg.shape == Shape::NestedIterateExchange;
             input
                 .iterate::<u32>("outer", 1u32, |outer| {
                     let inner_out = outer.iterate::<u32>("inner", 1u32, |inner| {
-                        let stepped =
+                        let mut stepped =
                             inner.map("inner-inc", |_t: &Product<Product<u64, u32>, u32>, x| x + 1);
+                        if inner_exchange {
+                            stepped = stepped.exchange("inner-exchange", |x: &i64| *x);
+                        }
                         let done = stepped.clone().filter("inner-done", |_t, x| x % 5 == 0);
                         let again = stepped.filter("inner-again", |_t, x| x % 5 != 0);
                         IterateResult {
@@ -1128,15 +1071,16 @@ fn build_shape(cfg: BuildCfg, b: &mut DataflowBuilder<u64>) -> Result<()> {
             let mut asked = false;
             input
                 .unary_notify("notify-at-frontier", move |input, output, ctx| {
-                    while input.next().is_some() {}
-                    // No input consumed in this activation and no capability
-                    // held: a time the frontier merely permits.
+                    // On the first call, before taking any input: nothing
+                    // consumed and no capability held, so the time is one
+                    // the frontier merely permits (P-9).
                     if !asked {
                         if let Some(time) = ctx.frontier().elements().first().cloned() {
                             asked = true;
                             ctx.try_notify_at(time)?;
                         }
                     }
+                    while input.next().is_some() {}
                     while let Some(time) = ctx.next_notification() {
                         output.session(time).give(0i64);
                     }
@@ -1146,6 +1090,18 @@ fn build_shape(cfg: BuildCfg, b: &mut DataflowBuilder<u64>) -> Result<()> {
         }
     }
     Ok(())
+}
+
+/// Batches stashed with a capability each (`LoopThenFlush`). Operator
+/// closures are cloned before any call, and `Retained` is not `Clone`: a
+/// clone starts empty.
+#[derive(Default)]
+struct Held(Vec<(Retained<u64>, Vec<i64>)>);
+
+impl Clone for Held {
+    fn clone(&self) -> Self {
+        Held::default()
+    }
 }
 
 /// The exact expected output of ports `out` and `out2`, from every record
@@ -1169,11 +1125,15 @@ fn expected_output(
     let map = |f: &dyn Fn(i64) -> i64| first.iter().map(|(t, x)| (*t, f(*x))).collect::<Vec<_>>();
     let count = per_epoch(&|xs| Some(xs.len() as i64));
     match shape {
-        Shape::Pipeline | Shape::OutputPaused | Shape::DrainOnCancel => [map(&|x| x + 1), vec![]],
-        Shape::OutputDropped => [vec![], vec![]],
-        Shape::Exchange => [map(&|x| x * 2), vec![]],
+        Shape::Pipeline
+        | Shape::OutputPaused
+        | Shape::DrainOnCancel
+        | Shape::DrainOnCancelExchange => [map(&|x| x + 1), vec![]],
+        Shape::OutputDropped | Shape::DecodeError => [vec![], vec![]],
+        Shape::Exchange | Shape::SplitCommit => [map(&|x| x * 2), vec![]],
+        Shape::ProbeAfterExchange => [first.to_vec(), vec![]],
         Shape::ExchangeTwice => [first.to_vec(), vec![]],
-        Shape::FanoutExchanges => [first.to_vec(), count],
+        Shape::FanoutExchanges | Shape::FanoutMapped => [first.to_vec(), count],
         Shape::Broadcast => [
             first
                 .iter()
@@ -1210,9 +1170,20 @@ fn expected_output(
         }
         Shape::Delay => [first.iter().map(|(t, x)| (t + 1, *x)).collect(), vec![]],
         Shape::AsyncFailure | Shape::NotifyAtFrontier => [vec![], vec![]],
-        Shape::Iterate | Shape::LoopThenFlush => [map(&next_multiple_of_5), vec![]],
-        Shape::IterateExchange => [map(&next_multiple_of_5), count],
-        Shape::NestedIterate => [map(&|x| (x / 10 + 1) * 10), vec![]],
+        Shape::Iterate | Shape::LoopThenFlush | Shape::ProbeAfterLoop => {
+            [map(&next_multiple_of_5), vec![]]
+        }
+        Shape::LoopThenBroadcast | Shape::LoopExchangeBroadcast => [
+            map(&next_multiple_of_5)
+                .into_iter()
+                .flat_map(|r| std::iter::repeat_n(r, workers))
+                .collect(),
+            vec![],
+        ],
+        Shape::IterateExchange | Shape::SplitLoopCommit => [map(&next_multiple_of_5), count],
+        Shape::NestedIterate | Shape::NestedIterateExchange => {
+            [map(&|x| (x / 10 + 1) * 10), vec![]]
+        }
     }
 }
 
@@ -1220,7 +1191,10 @@ fn expected_output(
 /// notification shows up as a split).
 fn aggregate_ports(shape: Shape) -> [bool; 2] {
     match shape {
-        Shape::FanoutExchanges | Shape::IterateExchange => [false, true],
+        Shape::FanoutExchanges
+        | Shape::FanoutMapped
+        | Shape::IterateExchange
+        | Shape::SplitLoopCommit => [false, true],
         Shape::NotifySum
         | Shape::Reduce
         | Shape::Count
@@ -1240,6 +1214,7 @@ fn must_fail_with(shape: Shape) -> Option<&'static str> {
     match shape {
         Shape::AsyncFailure => Some("task failed"),
         Shape::NotifyAtFrontier => Some("notify"),
+        Shape::DecodeError => Some("brittle record"),
         _ => None,
     }
 }
@@ -1474,7 +1449,7 @@ fn drive_multi(
         let _ = fed_tx.send((fed, senders, senders2));
     });
     let mut keep_inputs_open = None;
-    if case.shape == Shape::DrainOnCancel {
+    if drains_on_cancel(case.shape) {
         // Cancel once everything is fed, with the inputs still open: the
         // drain closes them and must deliver everything accepted.
         if let Ok(fed) = fed_rx.recv_timeout(timeout) {
@@ -1540,7 +1515,7 @@ fn run_local(case: &Case, timeout: Duration) -> Observed {
                 options = options.per_stage_parallelism(false);
                 (workers, workers)
             };
-            if case.shape == Shape::DrainOnCancel {
+            if drains_on_cancel(case.shape) {
                 options = options.drain_on_cancel(Duration::from_secs(10));
             }
             let spawned = {
@@ -1785,7 +1760,13 @@ fn run_cluster(case: &Case, timeout: Duration) -> Observed {
                     instancy::DataflowError::InvalidConfig("node b panicked".into()),
                 ))
             });
-            a.and(b)
+            match (a, b) {
+                // Both nodes' errors: which node fails first is a race.
+                (Err(ea), Err(eb)) => Err(instancy::Error::Dataflow(
+                    instancy::DataflowError::InvalidConfig(format!("node-a: {ea}; node-b: {eb}")),
+                )),
+                (a, b) => a.and(b),
+            }
         },
         timeout,
         move || token.cancel(),
@@ -1823,7 +1804,7 @@ struct Outcome {
     details: Vec<String>,
 }
 
-fn classify(case: &Case, observed: &Observed, mark: u64) -> Outcome {
+fn classify(case: &Case, observed: &Observed, mark: u64, split: check::SplitCommits) -> Outcome {
     let mut failures = BTreeSet::new();
     let mut details = Vec::new();
     let completed_ok = matches!(observed.result, RunResult::Ok);
@@ -1870,6 +1851,43 @@ fn classify(case: &Case, observed: &Observed, mark: u64) -> Outcome {
                     failures.insert(Failure::Extra);
                 }
             }
+        }
+    }
+
+    // Probes: findings during the run, and done after a successful one.
+    for finding in probe_findings().iter() {
+        failures.insert(Failure::Probe(finding));
+    }
+    if matches!(
+        case.shape,
+        Shape::ProbeAfterExchange | Shape::ProbeAfterLoop
+    ) {
+        let slots = probe_slots();
+        if completed_ok {
+            if slots.iter().all(|s| s.checks.load(Ordering::Relaxed) == 0) {
+                failures.insert(Failure::Blind("probe never checked"));
+            }
+            for slot in slots.iter() {
+                if !slot.handle.get().is_some_and(|h| h.is_done()) {
+                    failures.insert(Failure::Probe("not-done"));
+                    details.push(format!(
+                        "probe frontier after the run: {:?}",
+                        slot.handle.get().map(|h| h.frontier())
+                    ));
+                }
+            }
+        }
+    }
+    // The split-commit shapes must really split commits.
+    if completed_ok {
+        match case.shape {
+            Shape::SplitCommit if split.split == 0 => {
+                failures.insert(Failure::Blind("no commit split"));
+            }
+            Shape::SplitLoopCommit if split.across_sections == 0 => {
+                failures.insert(Failure::Blind("no commit split across sections"));
+            }
+            _ => {}
         }
     }
 
@@ -1942,32 +1960,20 @@ struct Golden {
 }
 
 impl Golden {
-    /// Observed failures this line does not accept. Unless `strict`, a
-    /// per-record frontier violation is also accepted at any location where
-    /// a case of the same shape and path showed it (`frontier`).
-    fn unexpected(
-        &self,
-        observed: &BTreeSet<Failure>,
-        frontier: &BTreeSet<Failure>,
-        strict: bool,
-    ) -> Vec<Failure> {
+    /// Observed failures this line does not accept.
+    fn unexpected(&self, observed: &BTreeSet<Failure>) -> Vec<Failure> {
         observed
             .iter()
-            .filter(|f| {
-                !self.always.contains(f)
-                    && !self.sometimes.iter().any(|s| s.accepts(**f))
-                    && (strict || !(f.is_frontier() && frontier.contains(f)))
-            })
+            .filter(|f| !self.always.contains(f) && !self.sometimes.iter().any(|s| s.accepts(**f)))
             .copied()
             .collect()
     }
 
-    /// Failures this line requires that were not observed. Unless `strict`,
-    /// per-record frontier violations are not required.
-    fn missing(&self, observed: &BTreeSet<Failure>, strict: bool) -> Vec<Failure> {
+    /// Failures this line requires that were not observed.
+    fn missing(&self, observed: &BTreeSet<Failure>) -> Vec<Failure> {
         self.always
             .iter()
-            .filter(|f| !observed.contains(f) && (strict || !f.is_frontier()))
+            .filter(|f| !observed.contains(f))
             .copied()
             .collect()
     }
@@ -2020,34 +2026,6 @@ fn golden() -> &'static BTreeMap<String, Golden> {
         Err(_) if recording().is_some() => BTreeMap::new(),
         Err(e) => panic!("cannot read {GOLDEN_PATH}: {e}"),
     })
-}
-
-/// The per-record frontier violations, with location, that any case of
-/// `case`'s shape and path shows in the golden file.
-fn frontier_locations(case: &Case) -> BTreeSet<Failure> {
-    static BY_SHAPE_AND_PATH: OnceLock<BTreeMap<(Shape, Path), BTreeSet<Failure>>> =
-        OnceLock::new();
-    let by_shape_and_path = BY_SHAPE_AND_PATH.get_or_init(|| {
-        let mut map: BTreeMap<(Shape, Path), BTreeSet<Failure>> = BTreeMap::new();
-        for other in full_matrix() {
-            if let Some(line) = golden().get(&other.to_string()) {
-                map.entry((other.shape, other.path))
-                    .or_default()
-                    .extend(line.failures().filter(|f| f.is_frontier()));
-            }
-        }
-        map
-    });
-    by_shape_and_path
-        .get(&(case.shape, case.path))
-        .cloned()
-        .unwrap_or_default()
-}
-
-/// `CONFORMANCE_STRICT=1`: judge per-record frontier violations per case,
-/// exactly like every other failure.
-fn strict() -> bool {
-    std::env::var("CONFORMANCE_STRICT").is_ok_and(|v| v != "0")
 }
 
 fn golden_for(case: &Case) -> Golden {
@@ -2159,7 +2137,10 @@ fn timeout_for(case: &Case, expected: &Golden) -> Duration {
 fn observe_case(case: &Case, timeout: Duration) -> (Outcome, Duration) {
     let _guard = case_lock();
     check::set_mode(Mode::Report);
+    probe_slots().clear();
+    probe_findings().clear();
     let mark = check::mark();
+    let split_before = check::split_commits();
     let started = std::time::Instant::now();
     let observed = match case.transport {
         Transport::InProcess | Transport::Mock => run_local(case, timeout),
@@ -2167,7 +2148,12 @@ fn observe_case(case: &Case, timeout: Duration) -> (Outcome, Duration) {
     };
     // Let late reports of a run that was cut short land in the log.
     std::thread::sleep(Duration::from_millis(10));
-    (classify(case, &observed, mark), started.elapsed())
+    let split_after = check::split_commits();
+    let split = check::SplitCommits {
+        split: split_after.split - split_before.split,
+        across_sections: split_after.across_sections - split_before.across_sections,
+    };
+    (classify(case, &observed, mark, split), started.elapsed())
 }
 
 /// The result of running one case against the golden file.
@@ -2191,13 +2177,11 @@ fn run_case(case: Case) -> Verdict {
             ),
         };
     }
-    let frontier = frontier_locations(&case);
-    let strict = strict();
     let mut mismatches = Vec::new();
     for attempt in 1..=ATTEMPTS {
         let (outcome, elapsed) = observe_case(&case, timeout);
-        let unexpected = expected.unexpected(&outcome.failures, &frontier, strict);
-        let missing = expected.missing(&outcome.failures, strict);
+        let unexpected = expected.unexpected(&outcome.failures);
+        let missing = expected.missing(&outcome.failures);
         let ok = unexpected.is_empty() && missing.is_empty();
         let message = format!(
             "{case}: got [{}]; golden [{}]{}{}{}{} [{:.1}s]\n    {}",
@@ -2238,6 +2222,11 @@ fn run_case(case: Case) -> Verdict {
             return Verdict { ok, message };
         }
         mismatches.push(message);
+        // Only a hang at the hard timeout (a starved machine) may be retried;
+        // any other mismatch fails at once.
+        if unexpected != [Failure::Hang] || !missing.is_empty() {
+            break;
+        }
     }
     Verdict {
         ok: false,
@@ -2359,6 +2348,8 @@ fn ci_cases(group: &str) -> Vec<Case> {
                 Shape::Count,
                 Shape::IterateExchange,
                 Shape::Broadcast,
+                Shape::ProbeAfterExchange,
+                Shape::ProbeAfterLoop,
             ];
             for shape in core {
                 for path in [Path::Unfused, Path::Fused, Path::Staged, Path::Simple] {
@@ -2389,6 +2380,12 @@ fn ci_cases(group: &str) -> Vec<Case> {
                 Shape::IterateExchange,
                 Shape::Broadcast,
                 Shape::FanoutExchanges,
+                Shape::ProbeAfterExchange,
+                Shape::ProbeAfterLoop,
+                Shape::NestedIterateExchange,
+                Shape::DecodeError,
+                Shape::SplitCommit,
+                Shape::SplitLoopCommit,
             ];
             for shape in core {
                 for transport in [Transport::Mock, Transport::Dedicated, Transport::Shared] {
@@ -2434,59 +2431,6 @@ fn ci_every_path() {
 #[test]
 fn ci_every_transport() {
     assert_all_matched(&run_matrix(&ci_cases("transports")));
-}
-
-/// `DataflowBuilder::skip_progress_check` (for tests outside the harness
-/// whose outcome the checker's timing changes) runs a dataflow without an
-/// oracle, and only that dataflow.
-#[test]
-fn skip_progress_check_runs_without_the_checker() {
-    let _guard = case_lock();
-    check::set_mode(Mode::Report);
-    let oracles = |skip: bool| {
-        let mark = check::mark();
-        let rt = RuntimeHandle::new(RuntimeConfig {
-            worker_threads: 2,
-            ..RuntimeConfig::default()
-        })
-        .expect("runtime");
-        let mut multi = rt
-            .spawn_multi(
-                "skip-check",
-                2,
-                move |b: &mut DataflowBuilder<u64>| {
-                    if skip {
-                        b.skip_progress_check();
-                    }
-                    b.input::<i64>("in")?
-                        .exchange_by_hash("spread", |x: &i64| *x as u64)
-                        .output("out")?;
-                    Ok(())
-                },
-                SpawnOptions::new().per_stage_parallelism(false),
-            )
-            .expect("spawn");
-        let senders = multi.take_all_inputs::<i64>("in").expect("inputs");
-        let receivers = multi.take_all_outputs::<i64>("out").expect("outputs");
-        senders[0].send(0, vec![1, 2, 3]).expect("send");
-        drop(senders);
-        multi.join_blocking().expect("join");
-        let records: usize = receivers
-            .into_iter()
-            .flat_map(|r| r.collect_data())
-            .map(|(_, data)| data.len())
-            .sum();
-        assert_eq!(records, 3);
-        let oracles = check::oracles_since(mark).len();
-        rt.shutdown();
-        oracles
-    };
-    assert_eq!(oracles(true), 0, "skip_progress_check still made an oracle");
-    assert_eq!(
-        oracles(false),
-        1,
-        "the checker did not observe the dataflow"
-    );
 }
 
 /// The staged path and `SimpleRuntime` run every worker with one progress

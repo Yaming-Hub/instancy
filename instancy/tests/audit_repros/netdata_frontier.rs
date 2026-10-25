@@ -295,7 +295,7 @@ async fn run_frontier_race(
 /// `input -> exchange`: no in-flight +n is recorded by the input operator's
 /// ExchangePush, so remote data in transit does not hold the frontier.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "expected failure (C2, intermittent); see EXPECTED in tests/audit_repros.rs"]
+#[ignore = "audit repro; run by audit_repros_match_table (tests/audit_repros.rs)"]
 async fn frontier_passes_epoch_while_remote_data_in_flight_input_exchange() {
     let (n, _v) = run_frontier_race(false, 3000, 4, 1024).await;
     assert_eq!(
@@ -306,7 +306,7 @@ async fn frontier_passes_epoch_while_remote_data_in_flight_input_exchange() {
 
 /// Control: `input -> map -> exchange` (map wires the in-flight reporter).
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "expected failure (H1, intermittent); see EXPECTED in tests/audit_repros.rs"]
+#[ignore = "audit repro; run by audit_repros_match_table (tests/audit_repros.rs)"]
 async fn frontier_control_map_exchange() {
     let (n, _v) = run_frontier_race(true, 3000, 4, 1024).await;
     assert_eq!(
@@ -327,7 +327,7 @@ async fn frontier_map_exchange_huge_transport_capacity() {
 }
 /// Repeat the map->exchange scenario several times (race is timing dependent).
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "expected failure (H1, intermittent); see EXPECTED in tests/audit_repros.rs"]
+#[ignore = "audit repro; run by audit_repros_match_table (tests/audit_repros.rs)"]
 async fn frontier_map_exchange_repeated() {
     let mut total = 0;
     for _ in 0..6 {
@@ -342,7 +342,7 @@ async fn frontier_map_exchange_repeated() {
 
 /// Repeat the input->exchange scenario several times.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "expected failure (C2, intermittent); see EXPECTED in tests/audit_repros.rs"]
+#[ignore = "audit repro; run by audit_repros_match_table (tests/audit_repros.rs)"]
 async fn frontier_input_exchange_repeated() {
     let mut total = 0;
     for _ in 0..6 {
@@ -358,7 +358,7 @@ async fn frontier_input_exchange_repeated() {
 /// downstream of `input -> map -> exchange` across nodes. Each epoch is sent
 /// as two batches of 2 records; every epoch must yield exactly one count of 4.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "expected failure (C1, intermittent); see EXPECTED in tests/audit_repros.rs"]
+#[ignore = "audit repro; run by audit_repros_match_table (tests/audit_repros.rs)"]
 async fn count_per_epoch_wrong_when_frontier_overtakes_remote_data() {
     let topology = ClusterTopology::multi_node(vec![
         NodeConfig::new("node-a", 1),

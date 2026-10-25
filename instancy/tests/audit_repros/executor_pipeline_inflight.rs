@@ -50,7 +50,7 @@ fn run(n: u64, cap: usize) -> Vec<(u64, Vec<u64>)> {
 
 /// Expect exactly one notification output for epoch 0 carrying the total count.
 #[test]
-#[ignore = "expected failure (H1); see EXPECTED in tests/audit_repros.rs"]
+#[ignore = "audit repro; run by audit_repros_match_table (tests/audit_repros.rs)"]
 fn notify_after_pipeline_backlog_fires_once_with_full_count() {
     let n = 3_000u64;
     let out = run(n, 1);
@@ -71,7 +71,7 @@ fn notify_after_pipeline_backlog_fires_once_with_full_count() {
 /// unary_async holds no capability while its tasks are in flight, so the
 /// downstream frontier passes epoch 0 while epoch-0 results are still pending.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[ignore = "expected failure (H1/O-4); see EXPECTED in tests/audit_repros.rs"]
+#[ignore = "audit repro; run by audit_repros_match_table (tests/audit_repros.rs)"]
 async fn notify_after_unary_async_fires_once_with_full_count() {
     let rt = RuntimeHandle::new(RuntimeConfig::default()).unwrap();
     let builder = DataflowBuilder::<u64>::new("async-inflight");

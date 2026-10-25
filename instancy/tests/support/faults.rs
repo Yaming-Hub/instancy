@@ -69,6 +69,10 @@ pub struct DirCtl {
     hold_kind: Mutex<Option<FrameKind>>,
     parked: Mutex<VecDeque<([u8; HEADER], Vec<u8>)>>,
     release: Notify,
+    /// Armed by [`pause_before_handshake`](Self::pause_before_handshake).
+    before_handshake: AtomicBool,
+    /// A frame waits in the relay for the pause to end.
+    in_hand: AtomicBool,
 }
 
 impl DirCtl {
@@ -80,6 +84,22 @@ impl DirCtl {
     pub fn resume(&self) {
         self.paused.store(false, Ordering::SeqCst);
         self.notify.notify_waiters();
+    }
+
+    /// Keep forwarding until the first shutdown-handshake frame (a progress
+    /// channel's end-of-stream marker or acknowledgement), then pause in
+    /// front of it: everything the sender committed before its goodbye gets
+    /// through, the goodbye and what follows is held until
+    /// [`resume`](Self::resume). Works for both framings (nothing is
+    /// reordered).
+    pub fn pause_before_handshake(&self) {
+        self.before_handshake.store(true, Ordering::SeqCst);
+    }
+
+    /// Whether the relay holds something back now: a frame waiting for a
+    /// pause to end, or frames parked by [`hold_kind`](Self::hold_kind).
+    pub fn holding(&self) -> bool {
+        self.in_hand.load(Ordering::SeqCst) || self.parked() > 0
     }
 
     /// Pause forwarding in front of the `n`-th frame of `kind` (1-based), so
@@ -396,6 +416,13 @@ async fn frame_relay(
         if ctl.hold_kind.lock().unwrap().is_none() && !deliver_parked(&mut to, &ctl).await {
             break;
         }
+        if kind == FrameKind::Progress
+            && ctl.before_handshake.load(Ordering::SeqCst)
+            && classifier.is_progress_marker(&payload)
+        {
+            ctl.before_handshake.store(false, Ordering::SeqCst);
+            ctl.paused.store(true, Ordering::SeqCst);
+        }
         {
             let mut corrupt = ctl.corrupt_next.lock().unwrap();
             if *corrupt == Some(kind) {
@@ -404,7 +431,9 @@ async fn frame_relay(
                 ctl.corrupted.store(true, Ordering::SeqCst);
             }
         }
+        ctl.in_hand.store(true, Ordering::SeqCst);
         ctl.wait_open().await;
+        ctl.in_hand.store(false, Ordering::SeqCst);
         if to.write_all(&header).await.is_err() || to.write_all(&payload).await.is_err() {
             break;
         }

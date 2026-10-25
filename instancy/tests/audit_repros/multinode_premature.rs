@@ -179,7 +179,7 @@ async fn multi_case(via_map: bool) -> String {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
-#[ignore = "expected failure (C1/C2); see EXPECTED in tests/audit_repros.rs"]
+#[ignore = "audit repro; run by audit_repros_match_table (tests/audit_repros.rs)"]
 async fn cluster_input_exchange_trickle_loses_data() {
     let s = cluster_case(false).await;
     println!("{s}");
@@ -195,7 +195,7 @@ async fn cluster_input_map_exchange_trickle_loses_data() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
-#[ignore = "expected failure (C1/C2); see EXPECTED in tests/audit_repros.rs"]
+#[ignore = "audit repro; run by audit_repros_match_table (tests/audit_repros.rs)"]
 async fn spawn_multi_input_exchange_trickle_loses_data() {
     let s = multi_case(false).await;
     println!("{s}");

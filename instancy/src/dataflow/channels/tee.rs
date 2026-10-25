@@ -72,6 +72,11 @@ impl<T: Timestamp, D: Clone + Send + 'static, M: Clone + Default + Send + 'stati
     }
 }
 
+impl<T: Timestamp, D: Clone + Send + 'static, M: Clone + Default + Send + 'static>
+    crate::dataflow::channels::pushpull::sealed::Sealed for TeePush<T, D, M>
+{
+}
+
 impl<T: Timestamp, D: Clone + Send + 'static, M: Clone + Default + Send + 'static> Push<T, D, M>
     for TeePush<T, D, M>
 {
@@ -155,6 +160,20 @@ impl<T: Timestamp, D: Clone + Send + 'static, M: Clone + Default + Send + 'stati
         // Every branch shares the producing output.
         self.targets.iter().find_map(|target| target.check_port())
     }
+
+    #[cfg(any(debug_assertions, feature = "progress-check"))]
+    fn check_unreached(&self) -> Option<Vec<crate::progress::check::Port<T>>> {
+        // Branches before the cursor accepted the envelope (R46).
+        match self.retry_from {
+            Some(from) if from > 0 => Some(
+                self.targets[from..]
+                    .iter()
+                    .filter_map(|target| target.check_target())
+                    .collect(),
+            ),
+            _ => None,
+        }
+    }
 }
 
 /// Wrap multiple pushers for the same output port into a single pusher.
@@ -182,6 +201,8 @@ pub fn tee_or_single<
 /// A push end that discards everything: the output of an operator whose
 /// output has no consumer.
 pub(crate) struct NullPush;
+
+impl crate::dataflow::channels::pushpull::sealed::Sealed for NullPush {}
 
 impl<T: Timestamp, D: Send + 'static> Push<T, D> for NullPush {
     fn push(&mut self, _envelope: super::Envelope<T, D>) -> crate::error::Result<()> {
@@ -293,6 +314,11 @@ mod tests {
                 closed: false,
             }
         }
+    }
+
+    impl<T: Timestamp, D: Send + 'static> crate::dataflow::channels::pushpull::sealed::Sealed
+        for RecordingPush<T, D>
+    {
     }
 
     impl<T: Timestamp, D: Send + 'static> Push<T, D> for RecordingPush<T, D> {

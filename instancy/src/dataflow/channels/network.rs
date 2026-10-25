@@ -522,6 +522,11 @@ impl<T: Timestamp + ExchangeData, D: ExchangeData> NetworkPush<T, D> {
 }
 
 #[cfg(feature = "transport")]
+impl<T: Timestamp + ExchangeData, D: ExchangeData>
+    crate::dataflow::channels::pushpull::sealed::Sealed for NetworkPush<T, D>
+{
+}
+
 impl<T: Timestamp + ExchangeData, D: ExchangeData> Push<T, D, ()> for NetworkPush<T, D> {
     fn push(&mut self, envelope: Envelope<T, D, ()>) -> Result<()> {
         if self.closed {
@@ -912,6 +917,11 @@ impl<T: Timestamp + ExchangeData, D: ExchangeData> Drop for NetworkPull<T, D> {
 }
 
 #[cfg(feature = "transport")]
+impl<T: Timestamp + ExchangeData, D: ExchangeData>
+    crate::dataflow::channels::pushpull::sealed::Sealed for NetworkPull<T, D>
+{
+}
+
 impl<T: Timestamp + ExchangeData, D: ExchangeData> Pull<T, D, ()> for NetworkPull<T, D> {
     fn pull(&mut self) -> Option<Envelope<T, D, ()>> {
         if self.exhausted || self.failed {

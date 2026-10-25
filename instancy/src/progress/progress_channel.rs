@@ -85,6 +85,7 @@ pub struct ProgressChange<T> {
 
 impl<T> ProgressChange<T> {
     /// A capability change at an operator output port.
+    #[cfg(test)]
     pub fn source(node: usize, port: usize, time: T, diff: i64) -> Self {
         Self {
             kind: ProgressKind::Source,
@@ -96,6 +97,7 @@ impl<T> ProgressChange<T> {
     }
 
     /// An in-flight message change at an operator input port.
+    #[cfg(test)]
     pub fn target(node: usize, port: usize, time: T, diff: i64) -> Self {
         Self {
             kind: ProgressKind::Target,
@@ -121,6 +123,7 @@ pub(crate) struct ProgressBatch<T> {
 
 impl<T> ProgressBatch<T> {
     /// A batch of root-scope changes only.
+    #[cfg(test)]
     pub(crate) fn flat(root: Vec<ProgressChange<T>>) -> Self {
         Self {
             root,
@@ -261,6 +264,7 @@ impl<T: Timestamp> ProgressSender<T> {
     /// For network senders, the batch is serialized and enqueued into an
     /// unbounded channel for reliable delivery. The send never fails
     /// (unless the bridge task has exited, which indicates a fatal error).
+    #[cfg(test)]
     pub fn send(&self, changes: Vec<ProgressChange<T>>) {
         self.send_batch(ProgressBatch::flat(changes));
     }
@@ -381,6 +385,7 @@ impl<T: Timestamp> ProgressReceiver<T> {
     }
 
     /// Returns `true` if there are queued progress updates.
+    #[cfg(test)]
     pub fn has_pending(&self) -> crate::Result<bool> {
         let buf = self.buffer.lock().or_poison("progress channel")?;
         Ok(!buf.queue.is_empty())

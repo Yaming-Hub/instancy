@@ -120,7 +120,7 @@ fn run_ext(
 }
 
 #[test]
-#[ignore = "expected failure (C1); see EXPECTED in tests/audit_repros.rs"]
+#[ignore = "audit repro; run by audit_repros_match_table (tests/audit_repros.rs)"]
 fn input_exchange_late_records_to_idle_worker_are_delivered() {
     let (got, join) = run(false, 1);
     eprintln!("got {got:?} join {join:?}");
@@ -155,7 +155,7 @@ fn input_exchange_two_initial_records_control() {
 /// Correctly wired `map -> exchange`; worker 0's progress broadcast is delayed
 /// by a slow sibling operator, so worker 1 transiently sums to zero.
 #[test]
-#[ignore = "expected failure (C1, intermittent); see EXPECTED in tests/audit_repros.rs"]
+#[ignore = "audit repro; run by audit_repros_match_table (tests/audit_repros.rs)"]
 fn map_exchange_slow_sibling_late_records_delivered() {
     let mut losses = 0;
     let mut sample = Vec::new();

@@ -431,17 +431,13 @@ async fn dedicated_tcp_cluster_probes_are_monotone_conservative_and_live() {
 /// After every node joined successfully, every probe must be done and
 /// `wait_until_done` must succeed.
 ///
-/// IGNORED: in a cluster each worker builds its own probe, so a probe has one
-/// writer among several workers and keeps its writer's final view when that
-/// worker completes (it cannot claim remote work is done). A worker's executor
-/// completes once its *local* operators are done, without waiting for the
-/// progress tracker's global completion: a peer's exchange close frame can
-/// arrive before that peer's final progress broadcast (e.g. its input's last
-/// capability drop), so the final view is stale (e.g. `[40]` here) and the
-/// probe never becomes done; `wait_until_done` returns `ChannelClosed` once
-/// the writer is dropped. Measured: 105 of 120 cluster runs (Dedicated 57/60,
-/// Shared 48/60) left at least one probe not done. Un-ignore once executor
-/// completion waits for global tracker completion.
+/// In a cluster each worker builds its own probe, so a probe has one writer
+/// among several workers and keeps its writer's final view when that worker
+/// completes. This used to fail in most cluster runs (audit R19): a worker
+/// completed once its *local* operators were done, without waiting for global
+/// tracker completion, so a probe could keep a stale final view and never
+/// become done. Under port-counted progress a worker completes only once the
+/// tracker is globally complete.
 async fn assert_probes_done_after_join(shared: bool) {
     for round in 0..3 {
         let not_done = run_cluster(shared, round).await;
@@ -453,17 +449,11 @@ async fn assert_probes_done_after_join(shared: bool) {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "fails in ~88% of cluster runs: worker completion does not wait for global \
-            tracker completion, so a probe keeps a stale final view and never \
-            becomes done (completion predicate, PR5); see doc comment"]
 async fn dedicated_tcp_cluster_probes_are_done_after_join() {
     assert_probes_done_after_join(false).await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "fails in ~88% of cluster runs: worker completion does not wait for global \
-            tracker completion, so a probe keeps a stale final view and never \
-            becomes done (completion predicate, PR5); see doc comment"]
 async fn shared_tcp_cluster_probes_are_done_after_join() {
     assert_probes_done_after_join(true).await;
 }

@@ -164,9 +164,6 @@ struct BuilderState<T: Timestamp> {
     /// Forced activation strategy (progress-checker test knob).
     #[cfg(any(debug_assertions, feature = "progress-check"))]
     check_activation: Option<crate::progress::check::Activation>,
-    /// Run without the progress checker (test knob).
-    #[cfg(any(debug_assertions, feature = "progress-check"))]
-    check_skip: bool,
     /// Injected accounting faults (test knob, see `check_inject_count`).
     #[cfg(any(debug_assertions, feature = "progress-check"))]
     check_faults: Vec<CheckFault<T>>,
@@ -176,6 +173,13 @@ struct BuilderState<T: Timestamp> {
         any(debug_assertions, feature = "progress-check")
     ))]
     check_mock_network: bool,
+    /// Cap on the changes per progress frame (test knob, see
+    /// `check_progress_batch_cap`).
+    #[cfg(all(
+        feature = "transport",
+        any(debug_assertions, feature = "progress-check")
+    ))]
+    check_progress_batch_cap: Option<usize>,
 }
 
 /// An injected accounting fault: `(worker, operator name, input, time,
@@ -380,14 +384,17 @@ impl<T: Timestamp> DataflowBuilder<T> {
                 #[cfg(any(debug_assertions, feature = "progress-check"))]
                 check_activation: None,
                 #[cfg(any(debug_assertions, feature = "progress-check"))]
-                check_skip: false,
-                #[cfg(any(debug_assertions, feature = "progress-check"))]
                 check_faults: Vec::new(),
                 #[cfg(all(
                     feature = "transport",
                     any(debug_assertions, feature = "progress-check")
                 ))]
                 check_mock_network: false,
+                #[cfg(all(
+                    feature = "transport",
+                    any(debug_assertions, feature = "progress-check")
+                ))]
+                check_progress_batch_cap: None,
             })),
         }
     }
@@ -499,17 +506,6 @@ impl<T: Timestamp> DataflowBuilder<T> {
         self
     }
 
-    /// Run this dataflow without the progress checker, which is on in every
-    /// debug build. A test knob for tests whose outcome the checker's
-    /// timing changes: observing every hook still perturbs the schedule, so
-    /// it can make a timing-dependent bug of today's code likelier. Only
-    /// available when the checker is compiled in.
-    #[cfg(any(debug_assertions, feature = "progress-check"))]
-    pub fn skip_progress_check(&self) -> &Self {
-        self.state.borrow_mut().check_skip = true;
-        self
-    }
-
     /// Inject an accounting fault: worker `worker`'s first commit changes
     /// the count of records at input `input` of the operator named
     /// `operator` by `diff` at `time`, as if the operator had consumed
@@ -552,6 +548,21 @@ impl<T: Timestamp> DataflowBuilder<T> {
     ))]
     pub fn check_mock_network(&self, enable: bool) -> &Self {
         self.state.borrow_mut().check_mock_network = enable;
+        self
+    }
+
+    /// Cap the number of changes in one progress frame on a cluster, so a
+    /// commit of more changes is split into several frames (across the
+    /// parent's and loop scopes' sections, inside a loop). A test knob for
+    /// the progress checker's conformance matrix; only available when the
+    /// checker is compiled in. Every node must set the same cap.
+    #[doc(hidden)]
+    #[cfg(all(
+        feature = "transport",
+        any(debug_assertions, feature = "progress-check")
+    ))]
+    pub fn check_progress_batch_cap(&self, cap: usize) -> &Self {
+        self.state.borrow_mut().check_progress_batch_cap = Some(cap.max(1));
         self
     }
 
@@ -1129,14 +1140,17 @@ impl<T: Timestamp> DataflowBuilder<T> {
             #[cfg(any(debug_assertions, feature = "progress-check"))]
             check_activation: state.check_activation,
             #[cfg(any(debug_assertions, feature = "progress-check"))]
-            check_skip: state.check_skip,
-            #[cfg(any(debug_assertions, feature = "progress-check"))]
             check_faults: state.check_faults,
             #[cfg(all(
                 feature = "transport",
                 any(debug_assertions, feature = "progress-check")
             ))]
             check_mock_network: state.check_mock_network,
+            #[cfg(all(
+                feature = "transport",
+                any(debug_assertions, feature = "progress-check")
+            ))]
+            check_progress_batch_cap: state.check_progress_batch_cap,
         })
     }
 }
@@ -2687,14 +2701,17 @@ impl<T: Timestamp, D: Clone + Send + 'static> Pipe<T, D> {
                 #[cfg(any(debug_assertions, feature = "progress-check"))]
                 check_activation: None,
                 #[cfg(any(debug_assertions, feature = "progress-check"))]
-                check_skip: false,
-                #[cfg(any(debug_assertions, feature = "progress-check"))]
                 check_faults: Vec::new(),
                 #[cfg(all(
                     feature = "transport",
                     any(debug_assertions, feature = "progress-check")
                 ))]
                 check_mock_network: false,
+                #[cfg(all(
+                    feature = "transport",
+                    any(debug_assertions, feature = "progress-check")
+                ))]
+                check_progress_batch_cap: None,
             }));
 
         // The iteration variable pipe points to concat's output
@@ -4240,10 +4257,12 @@ impl<T: Timestamp, D: Clone + Send + 'static> Pipe<T, D> {
     ///
     /// The probe reports the times that may still appear **on this stream**:
     /// a time is complete only once the operator producing the stream (and
-    /// everything upstream of it) can no longer emit data at that time. For
-    /// example, a probe after a `unary_notify` operator stays at `t` while that
-    /// operator holds a capability for a pending notification at `t`, and a
-    /// probe placed directly on an input advances as the input advances.
+    /// everything upstream of it) can no longer emit data at that time, and
+    /// no data at that time is still queued on the stream for the operators
+    /// that consume it. For example, a probe after a `unary_notify` operator
+    /// stays at `t` while that operator holds a capability for a pending
+    /// notification at `t`, and a probe placed directly on an input advances
+    /// as the input advances.
     ///
     /// In a multi-worker dataflow the probe is monotone and conservative: it
     /// reports the meet of the workers' views.
@@ -4256,20 +4275,17 @@ impl<T: Timestamp, D: Clone + Send + 'static> Pipe<T, D> {
     /// records circulating on the loop's feedback edge. A probe **downstream**
     /// of a loop holds each epoch until no record of it remains in the loop.
     ///
-    /// # Limitations
+    /// # Writers
     ///
-    /// In a cluster (`spawn_cluster`) and with `SimpleRuntime::spawn_multi`,
-    /// each worker builds its own probe, so a probe has a single writer among
-    /// several workers, and that writer's view is global. When that worker
-    /// completes, the probe keeps its last view rather than claiming remote
-    /// work is done. A worker completes once its local operators are done,
-    /// without waiting until its view reflects every peer's final progress, so
-    /// after a successful run the probe usually stays at a stale frontier and
-    /// never becomes done.
     /// `RuntimeHandle::spawn_multi` builds the dataflow once: a probe has one
     /// writer per worker that runs the probed operator (with stages of
-    /// differing parallelism, the workers of that operator's stage), and it
-    /// becomes done once all of them have completed.
+    /// differing parallelism, the workers of that operator's stage). In a
+    /// cluster (`spawn_cluster`) and with `SimpleRuntime::spawn_multi`, each
+    /// worker builds its own probe, with that worker as its only writer, and
+    /// every worker's view is global. Either way, a writer finishes with an
+    /// empty frontier when its worker retires, which it does only once its
+    /// view shows no work left that could reach the probed stream: after a
+    /// successful run, every probe is done.
     ///
     /// The returned `ProbeHandle` supports async waiting via
     /// [`wait_until_done_with`](ProbeHandle::wait_until_done_with) and
@@ -5168,10 +5184,6 @@ pub struct LogicalDataflow<T: Timestamp> {
     /// checker's conformance matrix); `None` keeps the runtime's choice.
     #[cfg(any(debug_assertions, feature = "progress-check"))]
     pub(crate) check_activation: Option<crate::progress::check::Activation>,
-    /// Run without the progress checker (see
-    /// [`DataflowBuilder::skip_progress_check`]).
-    #[cfg(any(debug_assertions, feature = "progress-check"))]
-    pub(crate) check_skip: bool,
     /// Injected accounting faults (see `DataflowBuilder::check_inject_count`).
     #[cfg(any(debug_assertions, feature = "progress-check"))]
     pub(crate) check_faults: Vec<CheckFault<T>>,
@@ -5182,6 +5194,13 @@ pub struct LogicalDataflow<T: Timestamp> {
         any(debug_assertions, feature = "progress-check")
     ))]
     pub(crate) check_mock_network: bool,
+    /// Cap on the changes per progress frame on a cluster (see
+    /// `DataflowBuilder::check_progress_batch_cap`).
+    #[cfg(all(
+        feature = "transport",
+        any(debug_assertions, feature = "progress-check")
+    ))]
+    pub(crate) check_progress_batch_cap: Option<usize>,
 }
 
 impl<T: Timestamp> LogicalDataflow<T> {

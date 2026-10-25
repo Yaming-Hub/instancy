@@ -209,6 +209,9 @@ pub struct OutputSession<'a, T: Timestamp, D> {
     buffer: &'a mut Vec<(T, Vec<D>)>,
     /// Accumulated records for this session.
     session_data: Vec<D>,
+    /// The progress checker's measure of the handle's buffer.
+    #[cfg(any(debug_assertions, feature = "progress-check"))]
+    check: Option<&'a crate::progress::check::StoreCheck<T>>,
 }
 
 impl<'a, T: Timestamp + Clone, D> OutputSession<'a, T, D> {
@@ -237,6 +240,10 @@ impl<'a, T: Timestamp + Clone, D> Drop for OutputSession<'a, T, D> {
     fn drop(&mut self) {
         if !self.session_data.is_empty() {
             let data = std::mem::take(&mut self.session_data);
+            #[cfg(any(debug_assertions, feature = "progress-check"))]
+            if let Some(check) = self.check {
+                check.add(&self.time, data.len());
+            }
             self.buffer.push((self.time.clone(), data));
         }
     }
@@ -257,6 +264,10 @@ pub struct OutputHandle<T: Timestamp, D> {
     /// justification, the output's capability reporter and the executor's
     /// wake handle.
     retain: Option<RetainCtx<T>>,
+    /// The progress checker's measure of `buffer` (output a call emitted,
+    /// until its shell takes it).
+    #[cfg(any(debug_assertions, feature = "progress-check"))]
+    check: Option<crate::progress::check::StoreCheck<T>>,
 }
 
 struct RetainCtx<T: Timestamp> {
@@ -274,7 +285,20 @@ impl<T: Timestamp, D> OutputHandle<T, D> {
             name: name.into(),
             buffer: Vec::new(),
             retain: None,
+            #[cfg(any(debug_assertions, feature = "progress-check"))]
+            check: None,
         }
+    }
+
+    /// Measure the buffer as work held for `push`'s output.
+    #[cfg(any(debug_assertions, feature = "progress-check"))]
+    pub(crate) fn observe(&mut self, push: &dyn crate::dataflow::channels::pushpull::Push<T, D>) {
+        self.check = push.check_port().map(|port| {
+            crate::progress::check::StoreCheck::new(
+                port,
+                crate::progress::check::Store::OutputSession,
+            )
+        });
     }
 
     /// Connect the handle to its operator's capabilities (the shell does).
@@ -378,12 +402,18 @@ impl<T: Timestamp, D> OutputHandle<T, D> {
             time,
             buffer: &mut self.buffer,
             session_data: Vec::new(),
+            #[cfg(any(debug_assertions, feature = "progress-check"))]
+            check: self.check.as_ref(),
         }
     }
 
     /// Directly push a batch of records at a given timestamp.
     pub fn push_vec(&mut self, time: T, data: Vec<D>) {
         if !data.is_empty() {
+            #[cfg(any(debug_assertions, feature = "progress-check"))]
+            if let Some(check) = &self.check {
+                check.add(&time, data.len());
+            }
             self.buffer.push((time, data));
         }
     }
@@ -392,8 +422,15 @@ impl<T: Timestamp, D> OutputHandle<T, D> {
     ///
     /// Returns an iterator over `(time, data)` pairs. This is called
     /// by the runtime after the operator completes a step.
-    pub(crate) fn drain(&mut self) -> impl Iterator<Item = (T, Vec<D>)> + '_ {
-        self.buffer.drain(..)
+    pub(crate) fn drain(&mut self) -> std::vec::IntoIter<(T, Vec<D>)> {
+        let batches = std::mem::take(&mut self.buffer);
+        #[cfg(any(debug_assertions, feature = "progress-check"))]
+        if let Some(check) = &self.check {
+            for (time, data) in &batches {
+                check.remove(time, data.len());
+            }
+        }
+        batches.into_iter()
     }
 
     /// Times of the buffered batches.

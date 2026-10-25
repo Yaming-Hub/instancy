@@ -409,8 +409,15 @@ impl<T: Timestamp, D: Send + 'static> CountedOutput<T, D> {
         let mut retry = PendingOutput::new();
         #[cfg(any(debug_assertions, feature = "progress-check"))]
         retry.observe(&*push);
+        #[cfg_attr(
+            not(any(debug_assertions, feature = "progress-check")),
+            allow(unused_mut)
+        )]
+        let mut handle = OutputHandle::new(name);
+        #[cfg(any(debug_assertions, feature = "progress-check"))]
+        handle.observe(&*push);
         Self {
-            handle: OutputHandle::new(name),
+            handle,
             retry,
             push,
             ledger,
@@ -482,7 +489,7 @@ impl<T: Timestamp, D: Send + 'static> CountedOutput<T, D> {
     }
 
     fn discard_session(&mut self, _: &ShellToken) {
-        self.handle.drain().for_each(drop);
+        drop(self.handle.drain());
     }
 
     /// Push the retry queue into the channel. `Ok(false)` on backpressure.
@@ -491,6 +498,10 @@ impl<T: Timestamp, D: Send + 'static> CountedOutput<T, D> {
             match self.push.try_push(envelope) {
                 Ok(()) => {}
                 Err((Error::Backpressure, returned)) => {
+                    #[cfg(any(debug_assertions, feature = "progress-check"))]
+                    self.retry
+                        .push_front_refused(returned, self.push.check_unreached());
+                    #[cfg(not(any(debug_assertions, feature = "progress-check")))]
                     self.retry.push_front(returned);
                     return Ok(false);
                 }
@@ -707,6 +718,12 @@ pub(crate) trait OutputPorts: Send + 'static {
     fn close(&mut self, tok: &ShellToken);
     /// Connect outputs `first..` to the call's justification.
     fn attach(&mut self, tok: &ShellToken, justify: &dyn Any, first: usize);
+    /// Record an unjustified call (V3) with the progress checker, through
+    /// the first output it observes. Whether one did.
+    #[cfg(any(debug_assertions, feature = "progress-check"))]
+    fn check_unjustified(&self, _detail: &str) -> bool {
+        false
+    }
 }
 
 impl OutputPorts for () {
@@ -766,6 +783,16 @@ impl<T: Timestamp, D: Send + 'static> OutputPorts for CountedOutput<T, D> {
     fn close(&mut self, tok: &ShellToken) {
         CountedOutput::close(self, tok);
     }
+    #[cfg(any(debug_assertions, feature = "progress-check"))]
+    fn check_unjustified(&self, detail: &str) -> bool {
+        match self.check_port() {
+            Some(port) => {
+                port.unjustified(detail.to_string());
+                true
+            }
+            None => false,
+        }
+    }
     fn attach(&mut self, _: &ShellToken, justify: &dyn Any, first: usize) {
         if let Some(justify) = justify.downcast_ref::<Justify<T>>() {
             justify.set_reporter(first, self.reporter.clone());
@@ -816,6 +843,10 @@ impl<A: OutputPorts, B: OutputPorts> OutputPorts for (A, B) {
     fn close(&mut self, tok: &ShellToken) {
         self.0.close(tok);
         self.1.close(tok);
+    }
+    #[cfg(any(debug_assertions, feature = "progress-check"))]
+    fn check_unjustified(&self, detail: &str) -> bool {
+        self.0.check_unjustified(detail) || self.1.check_unjustified(detail)
     }
     fn attach(&mut self, tok: &ShellToken, justify: &dyn Any, first: usize) {
         let split = self.0.len();
@@ -1004,6 +1035,15 @@ impl<L: OperatorLogic> OperatorShell<L> {
             self.outputs.take_sessions(tok, justify, 0).map(|()| did)
         });
         self.justify.end();
+        #[cfg(any(debug_assertions, feature = "progress-check"))]
+        if let Err(Error::Progress(crate::error::ProgressError::Unjustified { what, justified })) =
+            &result
+        {
+            self.outputs.check_unjustified(&format!(
+                "operator `{}`: {what}, justified by {justified}",
+                self.name
+            ));
+        }
         match result {
             Ok(did) => {
                 self.inputs.commit(tok);

@@ -6,28 +6,31 @@
 //! fed. No node is held open until its peers have caught up, so the first
 //! finisher really does reach teardown with frames still in flight. Each
 //! scenario runs on Dedicated, per-dataflow Shared and pooled Shared
-//! transports. Every round must deliver every record exactly once or fail
-//! loudly: a receiver can still complete early (audit C1/H1, tracked
-//! separately), and this PR guarantees that the records it then misses are
-//! reported (see `Failure::EarlyCompletion`). Silent loss, duplicates and
-//! hangs are always failures.
+//! transports. Every round must succeed on every node and deliver every
+//! record exactly once to the worker it belongs to: a lost, duplicated or
+//! misrouted record, an error or a hang fails the round.
 //!
-//! The feeding node runs a single worker. With a second worker on it, the
-//! early completion can hit that worker's in-process exchange channel, which
-//! drops the feeder's later records without any error (only cross-node links
-//! report lost records). Add multi-worker senders back once C1/H1 is fixed.
+//! The frontier-observing variants feed the same shapes over several epochs
+//! and watch the receiving side's frontier: a per-epoch count after the
+//! exchange, or a probe on the exchange's output. A receiver must never see
+//! an epoch as complete while records of that epoch are still on their way
+//! to it.
+//!
+//! The feeding node runs a single worker.
 
 #![cfg(feature = "transport")]
 
 #[path = "support/teardown.rs"]
 mod support;
 
-use std::collections::BTreeMap;
-use std::sync::Arc;
+use std::collections::{BTreeMap, BTreeSet};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use instancy::communication::ClusterSpawnTransport;
-use instancy::{ClusterTopology, DataflowBuilder, DataflowId, NodeConfig, Result};
+use instancy::progress::frontier::Antichain;
+use instancy::{ClusterTopology, DataflowBuilder, DataflowId, NodeConfig, ProbeHandle, Result};
 
 use support::{
     Managers, drop_runtimes, fmt_join, join_with_timeout, spawn_node, tcp_mesh, tcp_shared_mesh,
@@ -46,8 +49,7 @@ const MODES: [Mode; 3] = [Mode::Dedicated, Mode::Shared, Mode::SharedPooled];
 
 /// The scenarios run one at a time: each drives several nodes at full speed,
 /// and running them side by side on a small machine (such as a CI runner)
-/// makes the H1/C1 early completion (see [`Failure::EarlyCompletion`])
-/// far more likely without testing anything else.
+/// only makes every round slower without testing anything else.
 static ONE_AT_A_TIME: std::sync::OnceLock<tokio::sync::Mutex<()>> = std::sync::OnceLock::new();
 
 async fn one_at_a_time() -> tokio::sync::MutexGuard<'static, ()> {
@@ -57,11 +59,45 @@ async fn one_at_a_time() -> tokio::sync::MutexGuard<'static, ()> {
         .await
 }
 
-/// `input -> [map] -> exchange(route) -> map -> output`, at the default edge
-/// capacity.
+/// What the receiving side of the exchange computes.
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum Observe {
+    /// Passes the records on: `exchange -> map -> output`. The whole input is
+    /// fed at time 0.
+    Records,
+    /// Counts its records per epoch: `exchange -> count -> map -> output`. A
+    /// count is emitted once the worker's frontier has passed its epoch, so an
+    /// epoch completed while some of its records were still on their way
+    /// shows up as a short count (and a second count, or a failure, for the
+    /// rest).
+    Count,
+    /// Probes the exchange's output: `exchange -> probe -> check -> map ->
+    /// output`. `check` records every batch that arrives at a time its
+    /// worker's probe already reported complete.
+    Probe,
+}
+
+/// Batches per epoch when the receiving side observes frontiers
+/// ([`Observe::Count`] and [`Observe::Probe`]).
+const EPOCH_BATCHES: u64 = 100;
+
+/// The probes of an [`Observe::Probe`] round (each worker builds its own) and
+/// what their checks saw.
+#[derive(Default)]
+struct Probes {
+    handles: Mutex<Vec<ProbeHandle<u64>>>,
+    /// Batches that arrived at a time their worker's probe had reported
+    /// complete.
+    early: Mutex<Vec<String>>,
+}
+
+/// `input -> [map] -> exchange(route) -> ... -> output` (see [`Observe`]), at
+/// the default edge capacity.
 fn exchange(
     pre_map: bool,
-    route: fn(&u64) -> u64,
+    route: Route,
+    observe: Observe,
+    probes: Arc<Probes>,
 ) -> impl Fn(&mut DataflowBuilder<u64>) -> Result<()> + Clone + Send + 'static {
     move |b: &mut DataflowBuilder<u64>| {
         let input = b.input::<u64>("in")?;
@@ -70,13 +106,37 @@ fn exchange(
         } else {
             input
         };
-        input
-            .exchange_by_hash("route", route)
-            .map("post", |_t, x| x)
-            .output("out")?;
+        let exchanged = input.exchange_by_hash("route", route);
+        let out = match observe {
+            Observe::Records => exchanged.map("post", |_t, x| x),
+            Observe::Count => exchanged
+                .count("count")
+                .map("post", |_t, n: usize| n as u64),
+            Observe::Probe => {
+                let (exchanged, probe) = exchanged.probe();
+                probes.handles.lock().unwrap().push(probe.clone());
+                let probes = Arc::clone(&probes);
+                exchanged
+                    .inspect_batch("check", move |t: &u64, batch: &[u64]| {
+                        if probe.done_with(t) {
+                            probes.early.lock().unwrap().push(format!(
+                                "{} records at {t} arrived after the probe reported {t} \
+                                 complete (frontier {:?})",
+                                batch.len(),
+                                probe.frontier().elements()
+                            ));
+                        }
+                    })
+                    .map("post", |_t, x| x)
+            }
+        };
+        out.output("out")?;
         Ok(())
     }
 }
+
+/// Routes a record: it belongs to worker `route(x) % total workers`.
+type Route = fn(&u64) -> u64;
 
 fn to_worker_1(_: &u64) -> u64 {
     1
@@ -86,20 +146,24 @@ fn by_value(x: &u64) -> u64 {
     *x
 }
 
-/// Output records per worker, updated live (for diagnosing hangs).
+/// Output `(time, value)` pairs per worker, updated live (for diagnosing
+/// hangs).
 struct Sink {
-    records: Arc<std::sync::Mutex<Vec<u64>>>,
+    records: Arc<Mutex<Vec<(u64, u64)>>>,
     closed: std::sync::mpsc::Receiver<()>,
 }
 
 fn sink(output: instancy::OutputReceiver<u64, u64>) -> Sink {
-    let records = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let records = Arc::new(Mutex::new(Vec::new()));
     let (tx, closed) = std::sync::mpsc::channel();
     let thread_records = Arc::clone(&records);
     std::thread::spawn(move || {
         while let Some(event) = output.recv() {
-            if let instancy::dataflow::OutputEvent::Data { data, .. } = event {
-                thread_records.lock().unwrap().extend(data);
+            if let instancy::dataflow::OutputEvent::Data { time, data } = event {
+                thread_records
+                    .lock()
+                    .unwrap()
+                    .extend(data.into_iter().map(|x| (time, x)));
             }
         }
         let _ = tx.send(());
@@ -107,111 +171,139 @@ fn sink(output: instancy::OutputReceiver<u64, u64>) -> Sink {
     Sink { records, closed }
 }
 
-/// Why a round failed.
-#[derive(Debug)]
-enum Failure {
-    /// A node failed because records were lost (`data lost …`): a receiver
-    /// completed while records were still on their way to it.
-    ///
-    /// Completion sums signed counts, so a consumer's `-n` seen before the
-    /// producer's `+n` can cancel a capability out (audit C1/C2; see
-    /// `many_small_frames_then_complete_*`), and records held in a blocked
-    /// operator's pending output are invisible to progress tracking (audit
-    /// H1). Both are tracked separately and also present on `main`. Since
-    /// the scheduler stopped re-running blocked operators (#290) this happens
-    /// in many rounds on a small or busy machine (every round of the
-    /// congested scenario on a CI runner), so such a round is counted, not
-    /// failed (`exact_or_loud`), as long as every missing record is
-    /// attributed to a reported loss (see [`run`]). What this PR guarantees
-    /// is that the loss is reported: unexplained missing records, duplicates
-    /// and misrouted records always fail. Require exact rounds once C1/C2/H1
-    /// are fixed.
-    EarlyCompletion(String),
-    /// Anything else: a hang, an error, silent loss, misrouted or duplicated
-    /// records.
-    Other(String),
-}
-
-impl From<String> for Failure {
-    fn from(e: String) -> Self {
-        Failure::Other(e)
-    }
-}
-
-impl std::fmt::Display for Failure {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Failure::EarlyCompletion(e) => {
-                write!(f, "receiver completed early (C1/C2), loss reported: {e}")
+/// Polls a probe until `stop` is set; returns the frontiers it reported, in
+/// order.
+fn watch(
+    probe: ProbeHandle<u64>,
+    stop: Arc<AtomicBool>,
+) -> std::thread::JoinHandle<Vec<Antichain<u64>>> {
+    std::thread::spawn(move || {
+        let mut seen = vec![probe.frontier()];
+        loop {
+            let frontier = probe.frontier();
+            if seen.last() != Some(&frontier) {
+                seen.push(frontier);
             }
-            Failure::Other(e) => f.write_str(e),
+            if stop.load(Ordering::SeqCst) {
+                break;
+            }
+            std::thread::sleep(Duration::from_micros(100));
         }
-    }
-}
-
-/// Runs a round that must deliver every record exactly once or fail loudly
-/// (see [`Failure::EarlyCompletion`]). Returns whether it delivered every
-/// record. Silent loss, duplicates, hangs and other errors are errors.
-async fn exact_or_loud<Fut>(round: impl FnOnce() -> Fut) -> std::result::Result<bool, String>
-where
-    Fut: std::future::Future<Output = std::result::Result<(), Failure>>,
-{
-    match round().await {
-        Ok(()) => Ok(true),
-        Err(e @ Failure::EarlyCompletion(_)) => {
-            eprintln!("accepted a loud early completion (H1/C1): {e}");
-            Ok(false)
-        }
-        Err(e) => Err(e.to_string()),
-    }
-}
-
-/// Whether `text` (a node's error, possibly forwarded through Cancels)
-/// reports records that a sender could not deliver to `node` because `node`
-/// had already finished (or the link to it failed): an outbound data loss.
-fn reports_loss_toward(text: &str, node: &str) -> bool {
-    let marker = format!("data lost on the link to peer {node}: ");
-    text.match_indices(&marker).any(|(at, _)| {
-        let detail = &text[at + marker.len()..];
-        let detail = match detail.strip_prefix("channel ") {
-            Some(rest) => rest.split_once(": ").map_or("", |(_, d)| d),
-            None => detail,
-        };
-        detail.starts_with("records sent") || detail.starts_with("frames to the peer")
+        seen
     })
 }
 
+/// Whether `new` is at or beyond `old`.
+fn dominates(old: &Antichain<u64>, new: &Antichain<u64>) -> bool {
+    new.elements().iter().all(|t| old.less_equal(t))
+}
+
+/// Stops the probe watchers when a round ends, however it ends.
+struct StopOnDrop(Arc<AtomicBool>);
+
+impl Drop for StopOnDrop {
+    fn drop(&mut self) {
+        self.0.store(true, Ordering::SeqCst);
+    }
+}
+
+/// What is wrong with the records the workers received: record `x` (below
+/// `produced`) must reach worker `route(x) % workers` exactly once.
+fn check_records(per_worker: &[Vec<(u64, u64)>], produced: u64, route: Route) -> String {
+    let workers = per_worker.len() as u64;
+    let mut counts: BTreeMap<u64, usize> = BTreeMap::new();
+    let mut misrouted = 0;
+    for (w, out) in per_worker.iter().enumerate() {
+        for &(_, x) in out {
+            if x >= produced || route(&x) % workers != w as u64 {
+                misrouted += 1;
+            }
+            *counts.entry(x).or_default() += 1;
+        }
+    }
+    let duplicated = counts.values().filter(|c| **c > 1).count();
+    let mut missing = vec![0usize; per_worker.len()];
+    for x in (0..produced).filter(|x| !counts.contains_key(x)) {
+        missing[(route(&x) % workers) as usize] += 1;
+    }
+    if duplicated == 0 && misrouted == 0 && missing.iter().all(|m| *m == 0) {
+        return String::new();
+    }
+    format!("missing per worker {missing:?}, {duplicated} duplicated, {misrouted} misrouted")
+}
+
+/// What is wrong with the per-epoch counts: each worker must emit exactly one
+/// count for every epoch it received records at, equal to their number, and
+/// nothing else.
+fn check_counts(
+    per_worker: &[Vec<(u64, u64)>],
+    produced: u64,
+    per_epoch: u64,
+    route: Route,
+) -> String {
+    let workers = per_worker.len() as u64;
+    let mut expected: BTreeMap<(usize, u64), u64> = BTreeMap::new();
+    for x in 0..produced {
+        let worker = (route(&x) % workers) as usize;
+        *expected.entry((worker, x / per_epoch)).or_default() += 1;
+    }
+    let mut got: BTreeMap<(usize, u64), Vec<u64>> = BTreeMap::new();
+    for (w, out) in per_worker.iter().enumerate() {
+        for &(epoch, count) in out {
+            got.entry((w, epoch)).or_default().push(count);
+        }
+    }
+    let keys: BTreeSet<&(usize, u64)> = expected.keys().chain(got.keys()).collect();
+    let wrong: Vec<String> = keys
+        .into_iter()
+        .filter_map(|key| {
+            let want: Vec<u64> = expected.get(key).into_iter().copied().collect();
+            let have = got.get(key).cloned().unwrap_or_default();
+            (want != have).then(|| {
+                format!(
+                    "worker {} epoch {}: counts {have:?}, expected {want:?}",
+                    key.0, key.1
+                )
+            })
+        })
+        .collect();
+    if wrong.is_empty() {
+        return String::new();
+    }
+    format!(
+        "{} wrong per-epoch counts, first: {}",
+        wrong.len(),
+        wrong[..wrong.len().min(5)].join(", ")
+    )
+}
+
 /// Feeds `batches x per_batch` distinct records into global worker 0 through
-/// `input -> [map] -> exchange_by_hash(route) -> map -> output` and closes
-/// every input as soon as it has been fed. Record `x` belongs to worker
-/// `route(x) % total workers`.
+/// `input -> [map] -> exchange_by_hash(route) -> ... -> output` (see
+/// [`Observe`]) and closes every input as soon as it has been fed. Record `x`
+/// belongs to worker `route(x) % total workers`. Batch `b` is fed at epoch
+/// `b / EPOCH_BATCHES` when the receiving side observes frontiers, and at
+/// time 0 otherwise.
 ///
-/// The round is exact if every node succeeds and every worker received
-/// exactly its records. It is a loud early completion
-/// ([`Failure::EarlyCompletion`]) only if all of the following hold, and a
-/// failure ([`Failure::Other`]) otherwise:
-/// - no node hung, and every node that failed reports a data loss (its own,
-///   or a peer's forwarded with its Cancel);
-/// - no record is duplicated or reached a worker it does not belong to;
-/// - at least one record is missing, and every missing record is explained.
-///   Either the node of its worker failed with a data loss, or that node
-///   succeeded: it completed early, which it cannot take back once the loss
-///   happens. Then a sender must have reported records it sent to that node
-///   after it finished, or the feeding node failed with a data loss before
-///   sending everything and, at each of the node's workers, the missing
-///   records are the tail the stopped sender never sent (every received
-///   record precedes every missing one).
+/// The round is exact, and anything else is an error, if every node
+/// succeeds, the whole input was fed, and every worker received exactly its
+/// records. With [`Observe::Count`], every worker emitted exactly one count
+/// per epoch it received records at, equal to their number. With
+/// [`Observe::Probe`], no record arrived at a time its worker's probe had
+/// reported complete, every probe only moved forward, and every probe is
+/// done once the round succeeded.
 #[allow(clippy::too_many_arguments)]
 async fn run(
     workers: &[usize],
     mode: Mode,
     capacity: usize,
     pre_map: bool,
-    route: fn(&u64) -> u64,
+    route: Route,
     batches: u64,
     per_batch: u64,
-) -> std::result::Result<(), Failure> {
-    let build = exchange(pre_map, route);
+    observe: Observe,
+) -> std::result::Result<(), String> {
+    let probes = Arc::new(Probes::default());
+    let build = exchange(pre_map, route, observe, Arc::clone(&probes));
     let names: Vec<String> = (0..workers.len()).map(|i| format!("node-{i}")).collect();
     let name_refs: Vec<&str> = names.iter().map(String::as_str).collect();
     let topology = ClusterTopology::multi_node(
@@ -222,12 +314,7 @@ async fn run(
             .collect(),
     )
     .unwrap();
-    let node_of: Vec<usize> = workers
-        .iter()
-        .enumerate()
-        .flat_map(|(node, &w)| std::iter::repeat_n(node, w))
-        .collect();
-    let total_workers = node_of.len() as u64;
+    let total_workers: usize = workers.iter().sum();
     let id = DataflowId::new();
     let mut pool: Vec<Managers> = Vec::new();
     let mut handles = Vec::new();
@@ -268,31 +355,52 @@ async fn run(
     let mut runtimes = Vec::new();
     let mut outputs = Vec::new();
     let mut joins = Vec::new();
-    let mut feeder = None;
+    let mut feed = None;
     for handle in handles {
         let (rt, cluster) = handle.await.unwrap();
         let mut cluster = cluster.map_err(|e| format!("spawn: {e}"))?;
         for local in 0..cluster.num_local_workers() {
             outputs.push(sink(cluster.take_output::<u64>(local, "out").unwrap()));
             let input = cluster.take_input::<u64>(local, "in").unwrap();
-            if feeder.is_none() {
-                // Global worker 0 feeds; returns how many batches it sent.
-                feeder = Some(std::thread::spawn(move || {
-                    for b in 0..batches {
-                        if let Err(e) =
-                            input.send(0, (b * per_batch..(b + 1) * per_batch).collect())
-                        {
-                            return (b, Some(format!("send of batch {b} failed: {e}")));
-                        }
-                    }
-                    (batches, None)
-                }));
+            // Global worker 0 feeds; every other input closes now.
+            if feed.is_none() {
+                feed = Some(input);
             }
         }
         runtimes.push(rt);
         joins.push(join_with_timeout(cluster, Duration::from_secs(60)));
     }
-    let feeder = feeder.expect("worker 0 exists");
+    let input = feed.expect("worker 0 exists");
+    let stop = Arc::new(AtomicBool::new(false));
+    let _stop_watchers = StopOnDrop(Arc::clone(&stop));
+    let watchers: Vec<_> = probes
+        .handles
+        .lock()
+        .unwrap()
+        .iter()
+        .map(|probe| watch(probe.clone(), Arc::clone(&stop)))
+        .collect();
+    let epoch_batches = if observe == Observe::Records {
+        batches
+    } else {
+        EPOCH_BATCHES
+    };
+    // Returns how many batches it fed.
+    let feeder = std::thread::spawn(move || {
+        for b in 0..batches {
+            let epoch = b / epoch_batches;
+            let advanced = if b > 0 && b % epoch_batches == 0 {
+                input.advance_to(epoch)
+            } else {
+                Ok(())
+            };
+            let batch = (b * per_batch..(b + 1) * per_batch).collect();
+            if let Err(e) = advanced.and_then(|()| input.send(epoch, batch)) {
+                return (b, Some(format!("feeding batch {b} failed: {e}")));
+            }
+        }
+        (batches, None)
+    });
     let mut results = Vec::new();
     for j in joins {
         results.push(j.await.unwrap());
@@ -312,125 +420,88 @@ async fn run(
         // A wedged dataflow can block runtime or transport teardown (and the
         // feeder) forever.
         std::mem::forget((runtimes, pool, feeder));
-        return Err(Failure::Other(format!(
-            "{mode:?}: {joined}; received per worker {received:?}; input fed: {fed}"
-        )));
+        return Err(format!(
+            "{mode:?} {observe:?}: {joined}; received per worker {received:?}; input fed: {fed}"
+        ));
     }
     // Every worker has stopped (successfully or not): its output closes.
     let mut per_worker = Vec::new();
     for (w, out) in outputs.into_iter().enumerate() {
         out.closed
             .recv_timeout(Duration::from_secs(20))
-            .map_err(|_| format!("{mode:?}: {joined}; output of worker {w} never closed"))?;
+            .map_err(|_| {
+                format!("{mode:?} {observe:?}: {joined}; output of worker {w} never closed")
+            })?;
         per_worker.push(std::mem::take(&mut *out.records.lock().unwrap()));
+    }
+    let succeeded = results.iter().all(|r| matches!(r, Some(Ok(()))));
+    let mut problems = Vec::new();
+    if observe == Observe::Probe {
+        let handles = probes.handles.lock().unwrap().clone();
+        if handles.len() != total_workers {
+            problems.push(format!(
+                "{} probes for {total_workers} workers",
+                handles.len()
+            ));
+        }
+        if succeeded {
+            for (i, probe) in handles.iter().enumerate() {
+                let waited =
+                    tokio::time::timeout(Duration::from_secs(5), probe.wait_until_done()).await;
+                if !probe.is_done() || !matches!(waited, Ok(Ok(()))) {
+                    problems.push(format!(
+                        "probe {i} not done after a successful run: frontier {:?}, \
+                         wait_until_done -> {waited:?}",
+                        probe.frontier().elements()
+                    ));
+                }
+            }
+        }
+        stop.store(true, Ordering::SeqCst);
+        for (i, watcher) in watchers.into_iter().enumerate() {
+            let seen = watcher.join().unwrap();
+            if let Some(pair) = seen.windows(2).find(|p| !dominates(&p[0], &p[1])) {
+                problems.push(format!(
+                    "probe {i} moved backwards: {:?} -> {:?}",
+                    pair[0].elements(),
+                    pair[1].elements()
+                ));
+            }
+        }
+        let early = probes.early.lock().unwrap();
+        if !early.is_empty() {
+            problems.push(format!(
+                "{} batches arrived at a time their worker's probe had reported complete, \
+                 first: {}",
+                early.len(),
+                early[..early.len().min(3)].join(", ")
+            ));
+        }
     }
     drop_runtimes(runtimes).await;
     drop(pool);
-    let (sent_batches, feed_error) = feeder.join().unwrap();
-    let produced = sent_batches * per_batch;
-
-    let mut counts: BTreeMap<u64, i64> = BTreeMap::new();
-    let mut misrouted = 0;
-    for (w, out) in per_worker.iter().enumerate() {
-        for &x in out {
-            if x >= produced || route(&x) % total_workers != w as u64 {
-                misrouted += 1;
-            }
-            *counts.entry(x).or_default() += 1;
-        }
+    let (fed_batches, feed_error) = feeder.join().unwrap();
+    let produced = fed_batches * per_batch;
+    if !succeeded {
+        problems.push("a node failed".to_string());
     }
-    let duplicated = counts.values().filter(|c| **c > 1).count();
-    let mut missing_at = vec![0usize; workers.len()];
-    let mut first_missing: Vec<Option<u64>> = vec![None; node_of.len()];
-    for x in 0..produced {
-        if !counts.contains_key(&x) {
-            let w = (route(&x) % total_workers) as usize;
-            missing_at[node_of[w]] += 1;
-            first_missing[w].get_or_insert(x);
-        }
-    }
-    // Every record a worker received precedes every record it is missing.
-    let tail_missing = |w: usize| match (per_worker[w].iter().max(), first_missing[w]) {
-        (Some(&last), Some(first)) => last < first,
-        _ => true,
+    problems.extend(feed_error);
+    let wrong = match observe {
+        Observe::Records | Observe::Probe => check_records(&per_worker, produced, route),
+        Observe::Count => check_counts(&per_worker, produced, epoch_batches * per_batch, route),
     };
-    let missing: usize = missing_at.iter().sum();
+    if !wrong.is_empty() {
+        problems.push(wrong);
+    }
+    if problems.is_empty() {
+        return Ok(());
+    }
     let received: Vec<usize> = per_worker.iter().map(Vec::len).collect();
-    let report = format!(
-        "{mode:?}: {joined}; fed {sent_batches}/{batches} batches ({feed_error:?}); \
-         received per worker {received:?}; missing per node {missing_at:?}; \
-         {duplicated} duplicated, {misrouted} misrouted"
-    );
-    if duplicated > 0 || misrouted > 0 {
-        return Err(Failure::Other(report));
-    }
-    let errors: Vec<Option<String>> = results
-        .iter()
-        .map(|r| match r {
-            Some(Err(e)) => Some(e.to_string()),
-            _ => None,
-        })
-        .collect();
-    if errors.iter().all(Option::is_none) && feed_error.is_none() {
-        return if missing == 0 {
-            Ok(())
-        } else {
-            // Every node succeeded: missing records are a silent loss.
-            Err(Failure::Other(format!("silent loss: {report}")))
-        };
-    }
-    // Some node failed: the round must be a loud early completion.
-    if let Some(i) = errors
-        .iter()
-        .position(|e| e.as_ref().is_some_and(|e| !e.contains("data lost")))
-    {
-        return Err(Failure::Other(format!(
-            "node-{i} failed without a data loss: {report}"
-        )));
-    }
-    if feed_error.is_some() && errors[0].is_none() {
-        return Err(Failure::Other(format!(
-            "the feeding node succeeded but its input failed: {report}"
-        )));
-    }
-    if missing == 0 {
-        return Err(Failure::Other(format!(
-            "a data loss was reported but nothing is missing: {report}"
-        )));
-    }
-    // A legitimate loss stops a stream for good: the single feeding worker
-    // stops at its first failed push, a receiving operator that finished (or
-    // was cancelled) consumes nothing afterwards, and every channel is FIFO.
-    // So whatever a worker is missing must be the tail of what was sent to
-    // it; a gap in the middle is a lost frame, whatever errors were reported.
-    for (node, &lost) in missing_at.iter().enumerate() {
-        if lost == 0 {
-            continue;
-        }
-        if !(0..node_of.len())
-            .filter(|&w| node_of[w] == node)
-            .all(tail_missing)
-        {
-            return Err(Failure::Other(format!(
-                "{lost} records missing at node-{node} include records sent before \
-                 others it received: {report}"
-            )));
-        }
-        let explained = errors[node].is_some()
-            || errors
-                .iter()
-                .flatten()
-                .any(|e| reports_loss_toward(e, &names[node]))
-            || errors[0].is_some();
-        if !explained {
-            return Err(Failure::Other(format!(
-                "{lost} records missing at node-{node}, which succeeded; no sender \
-                 reported losing records sent to it, and the feeding node did not \
-                 stop: {report}"
-            )));
-        }
-    }
-    Err(Failure::EarlyCompletion(report))
+    Err(format!(
+        "{mode:?} {observe:?}: {joined}; fed {fed_batches}/{batches} batches; \
+         outputs per worker {received:?}; {}",
+        problems.join("; ")
+    ))
 }
 
 /// Scenario 1: every record is routed to node-1 while node-0 closes its input
@@ -444,21 +515,25 @@ async fn single_target_burst_from_early_finisher_arrives_in_full() {
     for mode in MODES {
         for pre_map in [false, true] {
             for round in 0..2 {
-                if let Err(e) = exact
-                    .round(exact_or_loud(|| {
-                        run(&[1, 1], mode, 1024, pre_map, to_worker_1, 3000, 7)
-                    }))
-                    .await
-                {
+                let result = run(
+                    &[1, 1],
+                    mode,
+                    1024,
+                    pre_map,
+                    to_worker_1,
+                    3000,
+                    7,
+                    Observe::Records,
+                )
+                .await;
+                if let Err(e) = exact.round(result) {
                     failures.push(format!("pre_map={pre_map} round {round}: {e}"));
                 }
             }
         }
     }
     assert!(failures.is_empty(), "{failures:#?}");
-    // At least 11 of 12 rounds were exact in every soak run, from one core to
-    // unpinned (see `Exact`).
-    exact.require(6);
+    exact.require(12);
 }
 
 /// Batches fed per split-routing round. Every batch crosses nodes, so the
@@ -476,27 +551,30 @@ async fn delivery_is_followed_by_completion_everywhere() {
     for mode in MODES {
         for round in 0..8 {
             let workers: &[usize] = if round % 2 == 0 { &[1, 1] } else { &[1, 2, 2] };
-            if let Err(e) = exact
-                .round(exact_or_loud(|| {
-                    run(workers, mode, 1024, true, by_value, SPLIT_BATCHES * 2, 16)
-                }))
-                .await
-            {
+            let result = run(
+                workers,
+                mode,
+                1024,
+                true,
+                by_value,
+                SPLIT_BATCHES * 2,
+                16,
+                Observe::Records,
+            )
+            .await;
+            if let Err(e) = exact.round(result) {
                 failures.push(format!("{workers:?} round {round}: {e}"));
             }
         }
     }
     assert!(failures.is_empty(), "{failures:#?}");
-    // At least 18 of 24 rounds were exact in every soak run, from one core to
-    // unpinned (see `Exact`).
-    exact.require(12);
+    exact.require(24);
 }
 
 /// Scenario 3: Dedicated transport under sustained back-pressure (tiny
 /// per-peer queues); the tail of the stream (e.g. the last 8 records) used to
 /// be lost silently when the sender finished first. Congested senders hold
-/// records in blocked operators (audit H1), so early completions are most
-/// frequent here.
+/// records in blocked operators until their links drain.
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
 async fn congested_dedicated_links_do_not_lose_the_tail() {
     let _serial = one_at_a_time().await;
@@ -504,20 +582,18 @@ async fn congested_dedicated_links_do_not_lose_the_tail() {
     let mut exact = Exact::default();
     for capacity in [1, 2, 16] {
         for (round, workers) in [&[1usize, 1][..], &[1, 2], &[1, 2, 2]].iter().enumerate() {
-            if let Err(e) = exact
-                .round(exact_or_loud(|| {
-                    run(
-                        workers,
-                        Mode::Dedicated,
-                        capacity,
-                        true,
-                        by_value,
-                        SPLIT_BATCHES,
-                        16,
-                    )
-                }))
-                .await
-            {
+            let result = run(
+                workers,
+                Mode::Dedicated,
+                capacity,
+                true,
+                by_value,
+                SPLIT_BATCHES,
+                16,
+                Observe::Records,
+            )
+            .await;
+            if let Err(e) = exact.round(result) {
                 failures.push(format!(
                     "capacity {capacity} {workers:?} round {round}: {e}"
                 ));
@@ -525,14 +601,74 @@ async fn congested_dedicated_links_do_not_lose_the_tail() {
         }
     }
     assert!(failures.is_empty(), "{failures:#?}");
-    // Not required: congested senders hold records invisible to progress
-    // tracking (H1), so the share of exact rounds depends on the cores
-    // available (soak: 0-2 of 9 on one core, 2-6 on two, 5-7 on four, 8-9
-    // unpinned). Scenarios 1 and 2 catch a regression to "always loud".
-    exact.require(0);
+    exact.require(9);
 }
 
-/// Counts the rounds that delivered every record (the others failed loudly).
+/// The early-finisher scenarios fed over several epochs, with `observe` on
+/// the receiving side: scenario 1's single-target burst and scenario 2's
+/// split routing twice on every transport, then scenario 3's congested
+/// Dedicated links. Unblocked bursts move the receivers' frontiers across
+/// several epochs at once; congested links make them step through every
+/// epoch while later records are still on their way. Every round must be
+/// exact.
+async fn frontier_observing_rounds(observe: Observe) {
+    let _serial = one_at_a_time().await;
+    let mut failures = Vec::new();
+    let mut exact = Exact::default();
+    let shapes: [(&str, &[usize], Route, u64, u64); 2] = [
+        ("single target", &[1, 1], to_worker_1, 3000, 7),
+        ("split", &[1, 2, 2], by_value, SPLIT_BATCHES * 2, 16),
+    ];
+    for mode in MODES {
+        for (shape, workers, route, batches, per_batch) in shapes {
+            for round in 0..2 {
+                let result = run(
+                    workers, mode, 1024, true, route, batches, per_batch, observe,
+                )
+                .await;
+                if let Err(e) = exact.round(result) {
+                    failures.push(format!("{shape} {workers:?} round {round}: {e}"));
+                }
+            }
+        }
+    }
+    for capacity in [1, 2, 16] {
+        let result = run(
+            &[1, 2, 2],
+            Mode::Dedicated,
+            capacity,
+            true,
+            by_value,
+            SPLIT_BATCHES,
+            16,
+            observe,
+        )
+        .await;
+        if let Err(e) = exact.round(result) {
+            failures.push(format!("congested, capacity {capacity}: {e}"));
+        }
+    }
+    assert!(failures.is_empty(), "{failures:#?}");
+    exact.require(15);
+}
+
+/// The receiving side counts its records per epoch after the exchange. A
+/// worker whose frontier passed an epoch while records of that epoch were
+/// still on their way emits a short count; every count must be exact.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn per_epoch_counts_behind_an_early_finisher_are_exact() {
+    frontier_observing_rounds(Observe::Count).await;
+}
+
+/// A probe on the exchange's output, on every worker: it must only move
+/// forward, never report an epoch complete while records of that epoch still
+/// arrive, and be done once the round succeeded. Every record must arrive.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn probe_behind_an_early_finisher_is_monotone_conservative_and_done() {
+    frontier_observing_rounds(Observe::Probe).await;
+}
+
+/// Counts the rounds run and the rounds that were exact.
 #[derive(Default)]
 struct Exact {
     exact: usize,
@@ -540,28 +676,24 @@ struct Exact {
 }
 
 impl Exact {
-    async fn round(
+    fn round(
         &mut self,
-        round: impl std::future::Future<Output = std::result::Result<bool, String>>,
+        result: std::result::Result<(), String>,
     ) -> std::result::Result<(), String> {
-        let exact = round.await?;
         self.rounds += 1;
-        self.exact += usize::from(exact);
-        Ok(())
+        self.exact += usize::from(result.is_ok());
+        result
     }
 
-    /// Report the count and require at least `min` exact rounds, so a
-    /// regression that makes every round fail loudly (see
-    /// [`Failure::EarlyCompletion`]) does not pass. The thresholds are about
-    /// half the minimum seen in soak runs, from one core to unpinned.
-    fn require(&self, min: usize) {
+    /// Require that `rounds` rounds ran and every one of them was exact.
+    fn require(&self, rounds: usize) {
         eprintln!(
-            "{} of {} rounds delivered every record; the others failed loudly",
+            "{} of {} rounds delivered every record",
             self.exact, self.rounds
         );
         assert!(
-            self.exact >= min,
-            "only {} of {} rounds delivered every record (expected at least {min})",
+            self.exact == rounds && self.rounds == rounds,
+            "{} of {} rounds delivered every record (expected all of {rounds})",
             self.exact,
             self.rounds
         );

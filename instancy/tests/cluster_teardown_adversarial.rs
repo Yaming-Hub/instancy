@@ -416,12 +416,19 @@ fn pipeline(builder: &mut DataflowBuilder<u64>) -> Result<()> {
 }
 
 /// A node whose workers have finished resolves its join while a peer is still
-/// running (input open): the peer acknowledges the goodbye without finishing
-/// itself, so sequential joins never deadlock.
+/// running: the peer acknowledges the goodbye without finishing itself, so
+/// sequential joins never deadlock.
+///
+/// On a cluster every node hosts every operator, so a node finishes only once
+/// every node's input has closed (R47), and with two nodes a's goodbye
+/// reaches b only behind a's last progress, after which b can finish too. Old
+/// trigger: two nodes, b's input open. Now three nodes close every input
+/// while b and c cannot hear each other (b ↔ c paused): a gets every release,
+/// finishes and joins; b still waits for c's.
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
 async fn early_finisher_join_does_not_wait_for_peer_completion() {
     for mode in MODES {
-        let spec = [("a", 1), ("b", 1)];
+        let spec = [("a", 1), ("b", 1), ("c", 1)];
         let mut cluster = Cluster::start_with(
             &spec,
             mode,
@@ -431,6 +438,13 @@ async fn early_finisher_join_does_not_wait_for_peer_completion() {
             pipeline,
         )
         .await;
+        let (b_to_c, c_to_b) = (cluster.mesh.valve("b", "c"), cluster.mesh.valve("c", "b"));
+        b_to_c.pause();
+        c_to_b.pause();
+        let jb = cluster.join("b", Duration::from_secs(20));
+        let jc = cluster.join("c", Duration::from_secs(20));
+        cluster.send_and_close("b", 1000..1010);
+        cluster.send_and_close("c", 2000..2010);
         cluster.send_and_close("a", 0..10);
         let a = cluster.node("a").cluster.take().unwrap();
         let blocking = tokio::task::spawn_blocking(move || a.join_blocking());
@@ -441,15 +455,82 @@ async fn early_finisher_join_does_not_wait_for_peer_completion() {
             matches!(ra, Ok(Ok(()))),
             "{mode:?}: a must resolve while b is still running: {ra:?}"
         );
+        assert!(
+            b_to_c.held_bytes() > 0 && c_to_b.held_bytes() > 0,
+            "{mode:?}: the paused links held nothing"
+        );
+        assert!(!jb.is_finished(), "{mode:?}: b must still be running");
         // b is still running; only now does it finish.
-        cluster.send_and_close("b", 1000..1010);
-        let rb = cluster.join("b", Duration::from_secs(10)).await.unwrap();
+        b_to_c.resume();
+        c_to_b.resume();
+        let (rb, rc) = (jb.await.unwrap(), jc.await.unwrap());
         assert!(matches!(rb, Some(Ok(()))), "{mode:?}: b {}", fmt_join(&rb));
+        assert!(matches!(rc, Some(Ok(()))), "{mode:?}: c {}", fmt_join(&rc));
         assert_eq!(
             cluster.total(),
-            Ok((0..10).sum::<i64>() + (1000..1010).sum::<i64>())
+            Ok((0..10).sum::<i64>() + (1000..1010).sum::<i64>() + (2000..2010).sum::<i64>())
         );
         cluster.shutdown().await;
+    }
+}
+
+/// On a cluster every node hosts every operator, and progress is per
+/// location (R41): a node finishes only once every node's input has closed
+/// and every record is consumed, as in timely (R47). Node a's input closes
+/// first: a must not finish while b's input is open, even without an
+/// exchange. Once b's input closes, both finish promptly with exact output.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn uniform_cluster_node_finishes_only_once_every_input_closes() {
+    type Build = fn(&mut DataflowBuilder<u64>) -> Result<()>;
+    let builds: [(&str, Build); 2] = [("pipeline", pipeline), ("notify_sum", notify_sum)];
+    for (shape, build) in builds {
+        for mode in MODES {
+            let what = format!("{shape} {mode:?}");
+            let spec = [("a", 2), ("b", 1)];
+            let mut cluster = Cluster::start_with(
+                &spec,
+                mode,
+                1024,
+                |_, _| Duration::ZERO,
+                |_| SpawnOptions::new(),
+                build,
+            )
+            .await;
+            let ja = cluster.join("a", Duration::from_secs(20));
+            let jb = cluster.join("b", Duration::from_secs(20));
+            cluster.node("b").inputs[0].send(0, vec![1000]).unwrap();
+            cluster.send_and_close("a", 0..10);
+            tokio::time::sleep(Duration::from_millis(500)).await;
+            let a_retired = cluster
+                .node("a")
+                .outs
+                .iter_mut()
+                .any(|out| out.wait_closed(Duration::ZERO));
+            assert!(
+                !a_retired && cluster.node("a").rt.active_dataflows() > 0,
+                "{what}: a's workers finished while b's input was open"
+            );
+            assert!(
+                !ja.is_finished() && !jb.is_finished(),
+                "{what}: no node may complete while b's input is open"
+            );
+            let closed = std::time::Instant::now();
+            cluster.node("b").inputs.clear();
+            let (ra, rb) = (ja.await.unwrap(), jb.await.unwrap());
+            let took = closed.elapsed();
+            assert!(
+                matches!(ra, Some(Ok(()))) && matches!(rb, Some(Ok(()))),
+                "{what}: a {} b {}",
+                fmt_join(&ra),
+                fmt_join(&rb)
+            );
+            assert!(
+                took < Duration::from_secs(5),
+                "{what}: finishing took {took:?} after the last input closed"
+            );
+            assert_eq!(cluster.total(), Ok((0..10).sum::<i64>() + 1000), "{what}");
+            cluster.shutdown().await;
+        }
     }
 }
 
@@ -750,6 +831,12 @@ fn slow_pipeline(builder: &mut DataflowBuilder<u64>) -> Result<()> {
 /// workers then still succeed. node-b tore down without a goodbye, so node-a
 /// must not wait for one (in Shared mode nothing else from node-b could ever
 /// resolve that wait).
+///
+/// R47: node-b's input closes first, so node-b holds nothing node-a's drain
+/// needs when it stops. (Old trigger: node-b was cancelled with its input
+/// open. Under port-counted progress that drain needs node-b's input
+/// capability, which it never released, and node-a fails promptly naming
+/// node-b: the R48 case, see `cluster_drain_failures.rs`.)
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
 async fn peer_cancel_followed_by_local_drain_success_does_not_hang() {
     for mode in MODES {
@@ -763,6 +850,7 @@ async fn peer_cancel_followed_by_local_drain_success_does_not_hang() {
             slow_pipeline,
         )
         .await;
+        cluster.send_and_close("b", 0..0);
         let ja = cluster.join("a", Duration::from_secs(10));
         // node-a's only worker is busy in the slow map when the Cancel lands,
         // so it reports success well after the Cancel was processed.
@@ -786,16 +874,21 @@ async fn peer_cancel_followed_by_local_drain_success_does_not_hang() {
     }
 }
 
-/// node-a broadcasts Cancel after node-b already finished (node-b's goodbye
-/// is stuck behind a paused link, and node-b, already draining, does not
-/// echo the Cancel). node-a's workers drain and succeed: having told every
-/// peer the dataflow is cancelled, it must not wait for their goodbyes.
+/// node-a broadcasts Cancel, then its workers drain and succeed while node-b's
+/// goodbye is stuck behind a paused link: having told every peer the
+/// dataflow is cancelled, node-a must not wait for their goodbyes.
 ///
 /// node-a's only worker is busy in the slow map when the cancellation lands,
 /// so the Cancel is broadcast before the worker succeeds. (With an instant
 /// pipeline the drain, which closes the inputs itself, can finish before the
 /// coordinator sees the cancellation; that is a cancellation racing with
 /// success, which is not broadcast.)
+///
+/// R47: a node finishes only once every node's input has closed. Old trigger:
+/// node-b finished, with node-a's input still open, before node-a's Cancel.
+/// Now node-b also drains on the Cancel, and the b → a link holds only
+/// node-b's goodbye (its progress gets through), so both drains complete
+/// while node-a still has no goodbye from node-b.
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
 async fn local_success_after_broadcasting_cancel_does_not_wait_for_peers() {
     for mode in MODES {
@@ -805,28 +898,33 @@ async fn local_success_after_broadcasting_cancel_does_not_wait_for_peers() {
             mode,
             1024,
             |_, _| Duration::ZERO,
-            drain_on_cancel_at_a,
+            |_| SpawnOptions::new().drain_on_cancel(Duration::from_secs(20)),
             slow_pipeline,
         )
         .await;
         let valve = cluster.mesh.valve("b", "a");
-        valve.pause();
+        valve.pause_before_handshake();
         let jb = cluster.join("b", Duration::from_secs(15));
         cluster.send_and_close("b", 0..1);
-        // node-b finishes; its goodbye to node-a is held by the valve.
-        cluster.wait_finished("b", Duration::from_secs(10));
         // Feed node-a but leave its inputs open: the cancellation's graceful
         // drain closes them (admission gate) and then succeeds.
         for input in &cluster.node("a").inputs {
             input.send(0, vec![1]).unwrap();
         }
+        tokio::time::sleep(Duration::from_millis(100)).await;
         let a = cluster.node("a").cluster.take().unwrap();
         a.cancel();
-        // node-b receives the Cancel (a -> b is open) and stops waiting for us.
-        tokio::time::sleep(Duration::from_millis(300)).await;
         let ja = join_with_timeout(a, Duration::from_secs(5));
         cluster.node("a").inputs.clear();
         let ra = ja.await.unwrap();
+        // node-a may join before node-b has even sent its goodbye; either way
+        // node-a never got it. Non-vacuous: the goodbye must reach the valve
+        // and be held there (the valve passes nothing from it on).
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while valve.held_bytes() == 0 && std::time::Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        let held = valve.held_bytes();
         valve.resume();
         let rb = jb.await.unwrap();
         if !matches!(ra, Some(Ok(()))) || !matches!(rb, Some(Ok(()))) {
@@ -834,6 +932,8 @@ async fn local_success_after_broadcasting_cancel_does_not_wait_for_peers() {
             cluster.leak();
             panic!("{msg}");
         }
+        assert!(held > 0, "{mode:?}: node-b's goodbye was not held");
+        assert_eq!(cluster.total(), Ok(1), "{mode:?}");
         cluster.shutdown().await;
     }
 }
@@ -843,6 +943,11 @@ async fn local_success_after_broadcasting_cancel_does_not_wait_for_peers() {
 /// on C's lost link: it cancels its dataflow and tells A, which stops waiting
 /// for B. A resolves (its workers succeeded), B fails promptly, and nothing
 /// hangs.
+///
+/// R47: a node finishes only once every node's input has closed. Old trigger:
+/// A finished while B's and C's inputs stayed open. Now every input closes,
+/// A's outbound links paused before A's input closes: A gets every release
+/// and finishes, while B and C wait for A's.
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
 async fn crash_while_a_peer_runs_cancels_it_and_releases_the_draining_node() {
     for mode in MODES {
@@ -863,12 +968,22 @@ async fn crash_while_a_peer_runs_cancels_it_and_releases_the_draining_node() {
         let ja = cluster.join("a", Duration::from_secs(30));
         let jb = cluster.join("b", Duration::from_secs(30));
         let jc = cluster.join("c", Duration::from_secs(30));
+        cluster.send_and_close("b", 100..110);
+        cluster.send_and_close("c", 200..210);
         cluster.send_and_close("a", 0..10);
         cluster.wait_finished("a", Duration::from_secs(10));
         tokio::time::sleep(Duration::from_millis(100)).await;
         assert!(
             !ja.is_finished(),
             "{mode:?}: a cannot complete before its peers acknowledge"
+        );
+        assert!(
+            a_to_b.held_bytes() > 0 && a_to_c.held_bytes() > 0,
+            "{mode:?}: the paused links held nothing"
+        );
+        assert!(
+            !jb.is_finished() && !jc.is_finished(),
+            "{mode:?}: b and c must still be running"
         );
 
         let crashed = std::time::Instant::now();
@@ -1008,11 +1123,13 @@ async fn writer_only_failure_never_hangs_or_passes_silently() {
                 // b never received a's records; a must not report success.
                 assert!(matches!(ra, Some(Err(_))), "{msg}");
             }
-            // A failure noticed only while draining makes a declare b lost
-            // and report its own result. Whether b then fails depends on its
-            // completion predicate (C1/C2) and PR 8; here only liveness is
-            // asserted.
-            AfterBreak::FinishAtOnce => {}
+            // The failure may be noticed only while draining. a's records for
+            // b are never consumed, so a's view keeps counting them and b
+            // never gets a's progress: neither may succeed.
+            AfterBreak::FinishAtOnce => {
+                assert!(matches!(ra, Some(Err(_))), "{msg}");
+                assert!(matches!(rb, Some(Err(_))), "{msg}");
+            }
         }
         drop(outs);
         drop_runtimes(vec![rt_a, rt_b]).await;
@@ -1022,6 +1139,12 @@ async fn writer_only_failure_never_hangs_or_passes_silently() {
 /// user token) after its workers finished, while its goodbye is still stuck
 /// on a congested link. That must neither cancel the peers nor lose the
 /// goodbye.
+///
+/// R47: a node finishes only once every node's input has closed. Old trigger:
+/// b's input closed first and a's last; a's goodbye (and, now, its last
+/// progress) is held on the paused a → b link, so b waits for it. The
+/// pipeline has no exchange: an exchange would need a's records to cross the
+/// paused link.
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
 async fn local_shutdown_mid_teardown_does_not_cancel_peers() {
     for mode in MODES {
@@ -1029,7 +1152,7 @@ async fn local_shutdown_mid_teardown_does_not_cancel_peers() {
             let token = tokio_util::sync::CancellationToken::new();
             let spec = [("a", 1), ("b", 1)];
             let a_token = token.clone();
-            let mut cluster = Cluster::start(
+            let mut cluster = Cluster::start_with(
                 &spec,
                 mode,
                 1024,
@@ -1041,6 +1164,7 @@ async fn local_shutdown_mid_teardown_does_not_cancel_peers() {
                         SpawnOptions::new()
                     }
                 },
+                pipeline,
             )
             .await;
             cluster.send_and_close("b", 1000..1010);
@@ -1065,6 +1189,14 @@ async fn local_shutdown_mid_teardown_does_not_cancel_peers() {
                 drop_runtimes(vec![rt]).await;
             }
             tokio::time::sleep(Duration::from_millis(300)).await;
+            assert!(
+                a_to_b.held_bytes() > 0,
+                "{mode:?} token={via_token}: the paused link held nothing"
+            );
+            assert!(
+                !jb.is_finished(),
+                "{mode:?} token={via_token}: b finished without a's progress"
+            );
             a_to_b.resume();
             let (ra, rb) = (ja.await.unwrap(), jb.await.unwrap());
             assert!(
@@ -1146,10 +1278,15 @@ fn tokio_runtime_shutdown_mid_teardown_releases_waiters() {
         (a.join().unwrap().unwrap(), b.join().unwrap().unwrap())
     });
     let (mut ca, mut cb) = (ca, cb);
-    let _oa = collect(ca.take_output::<i64>(0, "out").unwrap());
+    let mut oa = collect(ca.take_output::<i64>(0, "out").unwrap());
     let _ob = collect(cb.take_output::<i64>(0, "out").unwrap());
-    // b keeps running (input open), so it never sends its own goodbye.
-    let _b_input = cb.take_input::<i64>(0, "data").unwrap();
+    // R47: a node finishes only once every node's input has closed. b's input
+    // closes first; with a → b paused, a's last progress (and its goodbye)
+    // is held, so b keeps running and never sends its own goodbye. (Old
+    // trigger: b's input stayed open.)
+    let sb = cb.take_input::<i64>(0, "data").unwrap();
+    sb.send(0, vec![1, 3]).unwrap();
+    drop(sb);
     std::thread::sleep(Duration::from_millis(200));
     valve.pause();
     let sa = ca.take_input::<i64>(0, "data").unwrap();
@@ -1161,11 +1298,16 @@ fn tokio_runtime_shutdown_mid_teardown_releases_waiters() {
     std::thread::spawn(move || {
         let _ = tx.send(ca.join_blocking());
     });
+    assert!(
+        oa.wait_closed(Duration::from_secs(10)),
+        "a's workers did not finish"
+    );
     std::thread::sleep(Duration::from_millis(500));
     assert!(
         rx.try_recv().is_err(),
         "a cannot finish its handshake while paused"
     );
+    assert!(valve.held_bytes() > 0, "the paused link held nothing");
     node_rt.shutdown_background();
     let result = rx.recv_timeout(Duration::from_secs(10));
     assert!(
@@ -1183,11 +1325,15 @@ fn tokio_runtime_shutdown_mid_teardown_releases_waiters() {
 /// After a node retired every link (its peers acknowledged its goodbye), its
 /// connections die abruptly, like a process exiting right after `join`. The
 /// peers are still running and must neither fail nor hang.
+///
+/// R47: a node finishes only once every node's input has closed. Old trigger:
+/// a finished while b's and c's inputs stayed open. Now every input closes
+/// while b and c cannot hear each other (b ↔ c paused): a gets every release
+/// and retires, while b and c each wait for the other's.
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
 async fn peer_vanishing_after_retirement_is_benign() {
     for mode in MODES {
         let spec = [("a", 1), ("b", 1), ("c", 1)];
-        // Without an exchange, a's workers finish while b and c keep running.
         let mut cluster = Cluster::start_with(
             &spec,
             mode,
@@ -1197,18 +1343,30 @@ async fn peer_vanishing_after_retirement_is_benign() {
             pipeline,
         )
         .await;
+        let (b_to_c, c_to_b) = (cluster.mesh.valve("b", "c"), cluster.mesh.valve("c", "b"));
+        b_to_c.pause();
+        c_to_b.pause();
         let jb = cluster.join("b", Duration::from_secs(20));
         let jc = cluster.join("c", Duration::from_secs(20));
-        // a finishes; b and c keep their inputs open.
+        cluster.send_and_close("b", 100..110);
+        cluster.send_and_close("c", 200..210);
         cluster.send_and_close("a", 0..30);
         let ra = cluster.join("a", Duration::from_secs(10)).await.unwrap();
         assert!(matches!(ra, Some(Ok(()))), "{mode:?}: a {}", fmt_join(&ra));
+        assert!(
+            b_to_c.held_bytes() > 0 && c_to_b.held_bytes() > 0,
+            "{mode:?}: the paused links held nothing"
+        );
+        assert!(
+            !jb.is_finished() && !jc.is_finished(),
+            "{mode:?}: b and c must still be running"
+        );
         // a "crashes" after its successful join.
         cluster.mesh.sever("a", "b");
         cluster.mesh.sever("a", "c");
         tokio::time::sleep(Duration::from_millis(300)).await;
-        cluster.send_and_close("b", 100..110);
-        cluster.send_and_close("c", 200..210);
+        b_to_c.resume();
+        c_to_b.resume();
         let results = vec![
             ("b".to_string(), jb.await.unwrap()),
             ("c".to_string(), jc.await.unwrap()),

@@ -67,7 +67,6 @@ async fn broadcast_with_tiny_peer_queue_delivers_one_copy_per_worker() {
 
 /// Several remote copies per batch, one free slot per retry.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "completion needs close sentinels that a single-slot queue drops (tracked separately)"]
 async fn broadcast_with_single_slot_peer_queue_makes_progress() {
     broadcast_exactly_once(
         &[1, 3],

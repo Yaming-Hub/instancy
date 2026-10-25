@@ -109,7 +109,7 @@ fn two_exchanges_one_output_single_worker_frontier_passes_zero() {
 }
 
 #[test]
-#[ignore = "expected failure (H12); see EXPECTED in tests/audit_repros.rs"]
+#[ignore = "audit repro; run by audit_repros_match_table (tests/audit_repros.rs)"]
 fn two_exchanges_one_output_two_workers_frontier_passes_zero() {
     let stuck = run(2, 2);
     assert!(stuck.is_empty(), "probes stuck at <= 0: {stuck:?}");

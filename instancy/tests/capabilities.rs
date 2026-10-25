@@ -100,6 +100,38 @@ fn output_at_a_time_the_call_does_not_justify_fails_the_dataflow() {
     assert_unjustified(result);
 }
 
+/// The progress checker records the rejection as V3, at the operator's
+/// output, without panicking: the production error already fails the run.
+#[cfg(any(debug_assertions, feature = "progress-check"))]
+#[test]
+fn the_checker_records_an_unjustified_call_as_v3() {
+    use instancy::progress::check::{self, Check};
+    let mark = check::mark();
+    let (result, _) = run_single(
+        "v3-recorded",
+        |input| {
+            input.unary("late-v3", |input, output| {
+                while let Some((time, data)) = input.next() {
+                    output.push_vec(time - 1, data);
+                }
+                Ok(())
+            })
+        },
+        vec![(5, vec![1])],
+    );
+    assert_unjustified(result);
+    let recorded: Vec<_> = check::violations_since(mark)
+        .into_iter()
+        .filter(|v| v.check == Check::V3)
+        .collect();
+    assert!(
+        recorded
+            .iter()
+            .any(|v| v.kind == "unjustified" && v.location.as_deref() == Some("late-v3[out 0]")),
+        "{recorded:#?}"
+    );
+}
+
 #[test]
 fn notify_at_justified_only_by_the_frontier_fails_the_dataflow() {
     let (result, _) = run_single(
@@ -234,6 +266,48 @@ fn notify_rearm_after_next_notification_completes() {
     let mut out = out;
     out.sort();
     assert_eq!(out, vec![(101, vec![2]), (102, vec![1])]);
+}
+
+/// `delay` emits each record at a later time: justified by the consumed
+/// input, whose time is at or before it.
+#[test]
+fn delay_completes_with_exact_counts() {
+    let (result, out) = run_single(
+        "v3-delay",
+        |input| count_per_time(input.delay("delay", |t, _x| t + 2)),
+        vec![(0, vec![1, 2]), (1, vec![3])],
+    );
+    result.unwrap();
+    let mut out = out;
+    out.sort();
+    assert_eq!(out, vec![(2, vec![2]), (3, vec![1])]);
+}
+
+/// A source downgrades its capability as its epoch advances: every epoch is
+/// counted exactly, once the source has moved past it.
+#[test]
+fn source_epoch_downgrade_completes_with_exact_counts() {
+    let rt = runtime();
+    let builder = DataflowBuilder::<u64>::new("v3-source-downgrade");
+    count_per_time(builder.input::<u64>("in").unwrap())
+        .output("out")
+        .unwrap();
+    let mut spawned = rt
+        .spawn(builder.build().unwrap(), SpawnOptions::new())
+        .unwrap();
+    let sender = spawned.take_input::<u64>("in").unwrap();
+    let receiver = spawned.take_output::<u64>("out").unwrap();
+    let collector = std::thread::spawn(move || receiver.collect_data());
+    for epoch in 0..5u64 {
+        sender.send(epoch, vec![epoch; epoch as usize + 1]).unwrap();
+        sender.advance_to(epoch + 1).unwrap();
+    }
+    drop(sender);
+    with_timeout("source downgrade", move || spawned.join_blocking()).unwrap();
+    let mut out = collector.join().unwrap();
+    out.sort();
+    let expected: Vec<(u64, Vec<u64>)> = (0..5).map(|e| (e, vec![e + 1])).collect();
+    assert_eq!(out, expected);
 }
 
 /// The retained work of a closure. A fresh instance per worker: cloning

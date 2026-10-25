@@ -3,17 +3,50 @@
 //! These traits abstract over the mechanism of sending and receiving
 //! batches of envelopes through channels. They are used by both
 //! intra-process (bounded queues) and inter-process (network) channels.
-
+//!
+//! Both are sealed: only this crate implements them, so every channel an
+//! operator reaches goes through its operator shell's counted ports (design
+//! §5.2, construction by type).
+//!
+//! ```compile_fail,E0277
+//! use instancy::dataflow::channels::{Envelope, Push};
+//!
+//! struct Raw;
+//! impl Push<u64, u64> for Raw {
+//!     fn push(&mut self, _: Envelope<u64, u64>) -> instancy::Result<()> {
+//!         Ok(())
+//!     }
+//!     fn try_push(
+//!         &mut self,
+//!         _: Envelope<u64, u64>,
+//!     ) -> Result<(), (instancy::Error, Envelope<u64, u64>)> {
+//!         Ok(())
+//!     }
+//!     fn flush(&mut self) -> instancy::Result<()> {
+//!         Ok(())
+//!     }
+//!     fn close(&mut self) {}
+//!     fn is_closed(&self) -> bool {
+//!         false
+//!     }
+//! }
+//! ```
 use crate::error::Result;
 use crate::progress::timestamp::Timestamp;
 
 use super::envelope::Envelope;
 
+/// Seals [`Push`] and [`Pull`] (see the module docs).
+pub(crate) mod sealed {
+    /// Implemented by every channel half in this crate.
+    pub trait Sealed {}
+}
+
 /// A trait for pushing messages into a channel.
 ///
 /// Implementors buffer messages and flush them downstream. The `Push` trait
 /// is the send half of a channel abstraction.
-pub trait Push<T: Timestamp, D, M = ()>: Send {
+pub trait Push<T: Timestamp, D, M = ()>: sealed::Sealed + Send {
     /// Push a single envelope into the channel buffer.
     ///
     /// Returns `Ok(())` if the message was accepted (possibly buffered).
@@ -79,13 +112,30 @@ pub trait Push<T: Timestamp, D, M = ()>: Send {
     fn check_port(&self) -> Option<crate::progress::check::Port<T>> {
         None
     }
+
+    /// The progress checker's view of this endpoint's target input, if the
+    /// channel was wrapped at materialization (checker builds only).
+    #[cfg(any(debug_assertions, feature = "progress-check"))]
+    #[doc(hidden)]
+    fn check_target(&self) -> Option<crate::progress::check::Port<T>> {
+        None
+    }
+
+    /// After `try_push` refused an envelope: the target inputs it has not
+    /// reached yet, if it reached some (a tee that delivered it to some
+    /// branches). `None`: it reached none (checker builds only).
+    #[cfg(any(debug_assertions, feature = "progress-check"))]
+    #[doc(hidden)]
+    fn check_unreached(&self) -> Option<Vec<crate::progress::check::Port<T>>> {
+        None
+    }
 }
 
 /// A trait for pulling messages from a channel.
 ///
 /// Implementors provide access to incoming envelopes. The `Pull` trait
 /// is the receive half of a channel abstraction.
-pub trait Pull<T: Timestamp, D, M = ()>: Send {
+pub trait Pull<T: Timestamp, D, M = ()>: sealed::Sealed + Send {
     /// Try to pull the next envelope from the channel.
     ///
     /// Returns `Some(envelope)` if a message is available.
@@ -139,6 +189,11 @@ mod tests {
         sender_closed: std::sync::Arc<std::sync::atomic::AtomicBool>,
     }
 
+    impl<T: Timestamp, D: Send, M: Send> crate::dataflow::channels::pushpull::sealed::Sealed
+        for VecPush<T, D, M>
+    {
+    }
+
     impl<T: Timestamp, D: Send, M: Send> Push<T, D, M> for VecPush<T, D, M> {
         fn push(&mut self, envelope: Envelope<T, D, M>) -> Result<()> {
             if self.closed {
@@ -185,6 +240,11 @@ mod tests {
         fn is_closed(&self) -> bool {
             self.closed
         }
+    }
+
+    impl<T: Timestamp, D: Send, M: Send> crate::dataflow::channels::pushpull::sealed::Sealed
+        for VecPull<T, D, M>
+    {
     }
 
     impl<T: Timestamp, D: Send, M: Send> Pull<T, D, M> for VecPull<T, D, M> {

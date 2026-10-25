@@ -121,6 +121,11 @@ struct LocalPush<T: Timestamp, D, M> {
     shared: Arc<Mutex<ChannelState<T, D, M>>>,
 }
 
+impl<T: Timestamp, D: Send, M: Send> crate::dataflow::channels::pushpull::sealed::Sealed
+    for LocalPush<T, D, M>
+{
+}
+
 impl<T: Timestamp, D: Send, M: Send> Push<T, D, M> for LocalPush<T, D, M> {
     fn push(&mut self, envelope: Envelope<T, D, M>) -> Result<()> {
         let mut state = self.shared.lock().map_err(|_| Error::LockPoisoned {
@@ -188,6 +193,11 @@ impl<T: Timestamp, D, M> Drop for LocalPush<T, D, M> {
 /// The pull (receive) half of a local bounded channel.
 struct LocalPull<T: Timestamp, D, M> {
     shared: Arc<Mutex<ChannelState<T, D, M>>>,
+}
+
+impl<T: Timestamp, D: Send, M: Send> crate::dataflow::channels::pushpull::sealed::Sealed
+    for LocalPull<T, D, M>
+{
 }
 
 impl<T: Timestamp, D: Send, M: Send> Pull<T, D, M> for LocalPull<T, D, M> {

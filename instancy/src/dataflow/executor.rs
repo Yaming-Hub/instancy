@@ -88,10 +88,6 @@ pub struct ExecutorConfig {
     /// records processed). Overhead is ~1 Instant::now() per activation.
     /// Default: false.
     pub collect_metrics: bool,
-    /// Whether to collect per-exchange-edge channel counters (items and bytes
-    /// transferred). Overhead is ~2 atomic adds per batch push.
-    /// Default: false.
-    pub channel_counters: bool,
     /// When set, cancellation triggers a graceful drain phase instead of
     /// immediate termination. During the drain phase:
     ///
@@ -155,7 +151,6 @@ impl Default for ExecutorConfig {
             max_sweeps_per_poll: 64,
             catch_panics: false,
             collect_metrics: false,
-            channel_counters: false,
             drain_timeout: None,
             stopped_peer_grace: std::time::Duration::from_millis(500),
             channel_metrics_collectors: Vec::new(),
@@ -296,6 +291,7 @@ pub(crate) fn operator_panic_error(
 
 /// Strip the [`OperatorUnwind`] tag so synchronous callers see the original
 /// panic payload.
+#[cfg(any(test, feature = "test-utils"))]
 fn original_panic_payload(payload: Box<dyn std::any::Any + Send>) -> Box<dyn std::any::Any + Send> {
     match payload.downcast::<OperatorUnwind>() {
         Ok(unwind) => unwind.payload,
@@ -919,22 +915,6 @@ impl<T: Timestamp> DataflowExecutor<T> {
         }
     }
 
-    /// Get a shared reference to the external inputs counter.
-    ///
-    /// Used by `ChannelSourceOperator` to decrement when its channel closes.
-    pub fn external_inputs_counter(&self) -> std::sync::Arc<std::sync::atomic::AtomicUsize> {
-        std::sync::Arc::clone(&self.external_inputs_open)
-    }
-
-    /// Set the number of external input sources.
-    ///
-    /// While this count is > 0, the executor will not declare quiescence,
-    /// allowing channel-based input operators to wait for external data.
-    pub fn set_external_inputs_open(&self, count: usize) {
-        self.external_inputs_open
-            .store(count, std::sync::atomic::Ordering::SeqCst);
-    }
-
     /// Get the wake handle for this executor.
     ///
     /// Share this handle with channels so they can notify the executor when
@@ -944,6 +924,7 @@ impl<T: Timestamp> DataflowExecutor<T> {
     /// When an external `WakeHandle` is passed to `materialize()`, this returns
     /// that same handle — ensuring InputSenders, CancellationTokens, and
     /// internal channels all share a single notification path.
+    #[cfg(test)]
     pub fn wake_handle(&self) -> WakeHandle {
         self.wake_handle.clone()
     }
@@ -1068,6 +1049,7 @@ impl<T: Timestamp> DataflowExecutor<T> {
     /// # Panics
     ///
     /// Panics if the order length doesn't match the operator count.
+    #[cfg(test)]
     pub fn enable_fusion(&mut self, order: FusedActivationOrder) {
         // SAFETY: fused order is constructed from this executor's operators
         assert_eq!(
@@ -1188,11 +1170,13 @@ impl<T: Timestamp> DataflowExecutor<T> {
     }
 
     /// Whether stage-task scheduling is enabled.
+    #[cfg(test)]
     pub fn has_stage_tasks(&self) -> bool {
         !self.stage_tasks.is_empty()
     }
 
     /// Whether fused activation is enabled (either via fused_order or stage_tasks).
+    #[cfg(test)]
     pub fn is_fused(&self) -> bool {
         self.fused_order.is_some() || !self.stage_tasks.is_empty()
     }
@@ -1465,6 +1449,10 @@ impl<T: Timestamp> DataflowExecutor<T> {
     /// but not all operators are done — e.g., waiting for external input).
     /// Returns `Err(Error::Cancelled { .. })` if the cancellation token fires.
     /// Returns `Err(...)` if any operator produces an error.
+    ///
+    /// Only `SimpleRuntime` (the `test-utils` feature) and tests drive an
+    /// executor this way.
+    #[cfg(any(test, feature = "test-utils"))]
     pub fn run(&mut self) -> Result<bool> {
         // With catch_panics disabled an operator panic propagates to the
         // caller unchanged (minus the executor's internal operator tag).
@@ -1477,6 +1465,7 @@ impl<T: Timestamp> DataflowExecutor<T> {
         result
     }
 
+    #[cfg(any(test, feature = "test-utils"))]
     fn run_loop(&mut self) -> Result<bool> {
         loop {
             match self.run_one_sweep()? {
@@ -2150,17 +2139,14 @@ impl<T: Timestamp> DataflowExecutor<T> {
         }
     }
 
-    /// Get the number of operators.
-    pub fn operator_count(&self) -> usize {
-        self.operators.len()
-    }
-
     /// Check if all operators have completed.
+    #[cfg(test)]
     pub fn is_complete(&self) -> bool {
         self.done.iter().all(|&d| d)
     }
 
     /// Get the number of completed operators.
+    #[cfg(test)]
     pub fn completed_count(&self) -> usize {
         self.done.iter().filter(|&&d| d).count()
     }
@@ -2170,6 +2156,7 @@ impl<T: Timestamp> DataflowExecutor<T> {
     ///
     /// The notification will fire once the input frontier meets (across all ports)
     /// advances past `time`.
+    #[cfg(test)]
     pub fn notify_at(&mut self, pos: usize, time: T) {
         if let Some(Some(notificator)) = self.notificators.get_mut(pos) {
             notificator.notify_at(time);
@@ -2179,6 +2166,7 @@ impl<T: Timestamp> DataflowExecutor<T> {
     /// Drain ready notifications for the operator at the given position.
     ///
     /// Returns an iterator of timestamps whose frontier has advanced past.
+    #[cfg(test)]
     pub fn drain_notifications(&mut self, pos: usize) -> Vec<T> {
         if let Some(Some(notificator)) = self.notificators.get_mut(pos) {
             let mut times = Vec::new();
@@ -2587,7 +2575,6 @@ mod tests {
                 max_sweeps_per_poll: 0,
                 catch_panics: false,
                 collect_metrics: false,
-                channel_counters: false,
                 drain_timeout: None,
                 stopped_peer_grace: std::time::Duration::from_millis(500),
                 channel_metrics_collectors: Vec::new(),
@@ -2994,7 +2981,6 @@ mod tests {
                 max_sweeps_per_poll: 0, // no budget limit for this test
                 catch_panics: false,
                 collect_metrics: false,
-                channel_counters: false,
                 drain_timeout: None,
                 stopped_peer_grace: std::time::Duration::from_millis(500),
                 channel_metrics_collectors: Vec::new(),
@@ -3089,7 +3075,6 @@ mod tests {
                 max_sweeps_per_poll: 0,
                 catch_panics: false,
                 collect_metrics: false,
-                channel_counters: false,
                 drain_timeout: None,
                 stopped_peer_grace: std::time::Duration::from_millis(500),
                 channel_metrics_collectors: Vec::new(),
@@ -3599,7 +3584,6 @@ mod tests {
                 max_sweeps_per_poll: budget,
                 catch_panics: false,
                 collect_metrics: false,
-                channel_counters: false,
                 drain_timeout: None,
                 stopped_peer_grace: std::time::Duration::from_millis(500),
                 channel_metrics_collectors: Vec::new(),
@@ -3680,7 +3664,6 @@ mod tests {
                 max_sweeps_per_poll: 0, // unlimited
                 catch_panics: false,
                 collect_metrics: false,
-                channel_counters: false,
                 drain_timeout: None,
                 stopped_peer_grace: std::time::Duration::from_millis(500),
                 channel_metrics_collectors: Vec::new(),
@@ -5041,7 +5024,6 @@ mod tests {
             max_sweeps_per_poll: 0,
             catch_panics: false,
             collect_metrics: false,
-            channel_counters: false,
             drain_timeout: Some(std::time::Duration::from_secs(5)),
             stopped_peer_grace: std::time::Duration::from_millis(500),
             channel_metrics_collectors: Vec::new(),
@@ -5078,7 +5060,6 @@ mod tests {
             max_sweeps_per_poll: 0,
             catch_panics: false,
             collect_metrics: false,
-            channel_counters: false,
             drain_timeout: None,
             stopped_peer_grace: std::time::Duration::from_millis(500),
             channel_metrics_collectors: Vec::new(),
@@ -5128,7 +5109,6 @@ mod tests {
             max_sweeps_per_poll: 0,
             catch_panics: false,
             collect_metrics: false,
-            channel_counters: false,
             drain_timeout: Some(std::time::Duration::from_millis(50)),
             stopped_peer_grace: std::time::Duration::from_millis(500),
             channel_metrics_collectors: Vec::new(),
@@ -5166,7 +5146,6 @@ mod tests {
             max_sweeps_per_poll: 0,
             catch_panics: false,
             collect_metrics: false,
-            channel_counters: false,
             drain_timeout: Some(std::time::Duration::from_secs(5)),
             stopped_peer_grace: std::time::Duration::from_millis(500),
             channel_metrics_collectors: Vec::new(),

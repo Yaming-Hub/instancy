@@ -344,6 +344,11 @@ impl<T: Timestamp + ExchangeData, D: ExchangeData> SerializingPush<T, D> {
     }
 }
 
+impl<T: Timestamp + ExchangeData, D: ExchangeData>
+    crate::dataflow::channels::pushpull::sealed::Sealed for SerializingPush<T, D>
+{
+}
+
 impl<T: Timestamp + ExchangeData, D: ExchangeData> Push<T, D, ()> for SerializingPush<T, D> {
     fn push(&mut self, envelope: Envelope<T, D, ()>) -> Result<()> {
         if self.closed {
@@ -418,6 +423,11 @@ impl<T: Timestamp + ExchangeData, D: ExchangeData> DeserializingPull<T, D> {
     fn decode(&self, bytes: &[u8]) -> std::result::Result<Envelope<T, D, ()>, CodecError> {
         decode_envelope(&self.time_codec, &self.data_codec, bytes)
     }
+}
+
+impl<T: Timestamp + ExchangeData, D: ExchangeData>
+    crate::dataflow::channels::pushpull::sealed::Sealed for DeserializingPull<T, D>
+{
 }
 
 impl<T: Timestamp + ExchangeData, D: ExchangeData> Pull<T, D, ()> for DeserializingPull<T, D> {

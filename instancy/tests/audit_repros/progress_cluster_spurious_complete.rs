@@ -215,14 +215,14 @@ async fn run_ext(
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "expected failure (C1); see EXPECTED in tests/audit_repros.rs"]
+#[ignore = "audit repro; run by audit_repros_match_table (tests/audit_repros.rs)"]
 async fn tcp_input_exchange_idle_node_does_not_drop_late_records() {
     let got = run(false, 1).await.unwrap();
     assert_eq!(got.len(), 6, "records lost: {got:?}");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "expected failure (C1, intermittent); see EXPECTED in tests/audit_repros.rs"]
+#[ignore = "audit repro; run by audit_repros_match_table (tests/audit_repros.rs)"]
 async fn tcp_map_exchange_idle_node_does_not_drop_late_records() {
     for round in 0..10 {
         let got = run(true, 1).await.unwrap();
@@ -247,7 +247,7 @@ async fn tcp_map_exchange_control_two_initial_records() {
 
 /// Frequency probe for the wired (map -> exchange) case.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "expected failure (C1, intermittent); see EXPECTED in tests/audit_repros.rs"]
+#[ignore = "audit repro; run by audit_repros_match_table (tests/audit_repros.rs)"]
 async fn tcp_map_exchange_loss_frequency() {
     let mut losses = 0;
     for _ in 0..20 {

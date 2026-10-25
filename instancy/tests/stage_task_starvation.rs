@@ -597,15 +597,11 @@ fn small_burst_through_exchange() {
 /// worker 1, so the sender's own exchange channel fills up while it is still
 /// sending to its peer.
 ///
-/// Ignored: this depends on dataflow completion, which can be declared too
-/// early. A worker's `map` can hold records in its pending output (blocked on a
-/// full exchange channel) that progress tracking can't see, so the peer that
-/// drained the channel may decide the dataflow is complete and force-close.
-/// The blocked worker then either flushes into a channel nobody reads (lost
-/// records) or stays blocked, reports progress every sweep, never reaches its
-/// own idle/force-close path, and spins until the timeout.
+/// A worker's `map` can hold records in its pending output (blocked on a full
+/// exchange channel), so the peer that drained the channel must not decide the
+/// dataflow is complete while those records are pending (audit C1/H1, fixed by
+/// port-counted progress).
 #[test]
-#[ignore = "intermittent premature completion: records held in a blocked operator's pending output are invisible to progress tracking, so the peer force-closes; the blocked worker then loses records or spins on backpressure forever; see doc comment"]
 fn exchange_self_channel_full_two_workers() {
     const BATCHES: u64 = 3_000;
     let rt = runtime();
@@ -780,20 +776,17 @@ fn iterate_with_exchange_burst_single_worker() {
     iterate_with_exchange(1, 3_000);
 }
 
-// With two or more workers, this loop occasionally hangs because one worker
-// declares the whole dataflow complete (and force-closes its operators) while
-// another worker still has records in the loop. That premature completion
-// also happens with the stage-task scheduling fix reverted, at volumes that
-// never fill a channel, so it is a separate progress-tracking bug.
+// With two or more workers, this loop used to hang occasionally because one
+// worker declared the whole dataflow complete (and force-closed its
+// operators) while another worker still had records in the loop (audit C2,
+// fixed by port-counted progress).
 
 #[test]
-#[ignore = "intermittent premature completion of multi-worker loops; see comment"]
 fn iterate_with_exchange_burst_two_workers() {
     iterate_with_exchange(2, 3_000);
 }
 
 #[test]
-#[ignore = "intermittent premature completion of multi-worker loops; see comment"]
 fn iterate_with_exchange_burst_three_workers() {
     iterate_with_exchange(3, 3_000);
 }
@@ -957,14 +950,10 @@ fn concat_of_exchanged_and_local_branches() {
 /// keep getting blocked: a blocked stage must keep the dataflow alive, and
 /// skipping its extra passes must not make the executor look idle.
 ///
-/// Ignored for the same reason as `exchange_self_channel_full_two_workers`,
-/// and more often (about 1% of runs under load) because one idle sweep is
-/// enough for worker 0 to force-close: records held in worker 1's blocked
-/// `map` are invisible to progress tracking, so worker 0 completes early.
-/// Worker 1 then either loses those records or spins on backpressure toward
-/// the closed worker until the timeout.
+/// One idle sweep must not be enough for worker 0 to complete while worker 1's
+/// blocked `map` still holds records (audit C1/H1, fixed by port-counted
+/// progress).
 #[test]
-#[ignore = "intermittent premature completion: records held in a blocked operator's pending output are invisible to progress tracking, so the peer force-closes after one idle sweep; the blocked worker then loses records or spins on backpressure forever; see doc comment"]
 fn eager_quiescence_with_blocked_stage_tasks() {
     const N: u64 = 5_000;
     let rt = runtime();
@@ -1352,14 +1341,11 @@ fn small_capacity_exchange_away_from_worker_zero() {
 }
 
 /// Same matrix, also waiting for the dataflow to complete. With two or more
-/// workers, this occasionally fails, and fails every time with four workers
-/// all routing to worker 0: a worker declares the dataflow complete and
-/// force-closes its operators while records are still held by operators that
-/// are blocked on full channels (their buffered output isn't visible to
-/// progress tracking). With the scheduling fix reverted these cases hang
-/// before reaching that point, so that is a separate progress-tracking bug.
+/// workers (every time with four workers all routing to worker 0) this used
+/// to fail: a worker declared the dataflow complete while operators blocked on
+/// full channels still held records (audit C1/H1, fixed by port-counted
+/// progress).
 #[test]
-#[ignore = "premature completion while blocked operators hold records; see doc comment"]
 fn small_capacity_exchange_then_complete() {
     for route in [
         Route::ToSelf,

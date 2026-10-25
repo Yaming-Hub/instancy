@@ -81,13 +81,13 @@ fn broadcast_then_count_emits_before_close(workers: usize) {
 }
 
 #[test]
-#[ignore = "expected failure (H10); see EXPECTED in tests/audit_repros.rs"]
+#[ignore = "audit repro; run by audit_repros_match_table (tests/audit_repros.rs)"]
 fn broadcast_then_count_emits_before_close_1_worker() {
     broadcast_then_count_emits_before_close(1);
 }
 
 #[test]
-#[ignore = "expected failure (H10); see EXPECTED in tests/audit_repros.rs"]
+#[ignore = "audit repro; run by audit_repros_match_table (tests/audit_repros.rs)"]
 fn broadcast_then_count_emits_before_close_2_workers() {
     broadcast_then_count_emits_before_close(2);
 }
@@ -292,13 +292,13 @@ fn unary_async_then_exchange(with_map: bool) {
 }
 
 #[test]
-#[ignore = "expected failure (O-4/C2); see EXPECTED in tests/audit_repros.rs"]
+#[ignore = "audit repro; run by audit_repros_match_table (tests/audit_repros.rs)"]
 fn unary_async_then_exchange_loses_nothing() {
     unary_async_then_exchange(false);
 }
 
 #[test]
-#[ignore = "expected failure (O-4/H1); see EXPECTED in tests/audit_repros.rs"]
+#[ignore = "audit repro; run by audit_repros_match_table (tests/audit_repros.rs)"]
 fn unary_async_map_then_exchange_loses_nothing() {
     unary_async_then_exchange(true);
 }

@@ -1654,6 +1654,20 @@ impl<T: Timestamp> ProgressTracker<T> {
                 sender.seal();
             }
         }
+        #[cfg(any(debug_assertions, feature = "progress-check"))]
+        self.check_sealed();
+    }
+
+    /// This worker sealed: no store of its operators, in any scope, may
+    /// hold work (V4).
+    #[cfg(any(debug_assertions, feature = "progress-check"))]
+    fn check_sealed(&self) {
+        if let Some(check) = &self.check {
+            check.sealed();
+        }
+        for child in &self.children {
+            child.check_sealed();
+        }
     }
 
     /// Name each worker for errors (by worker index; on a cluster, its
@@ -2176,7 +2190,11 @@ impl<T: Timestamp> ProgressTracker<T> {
             self.tracker
                 .nonzero_pointstamps()
                 .into_iter()
-                .filter(|(location, _, _)| !self.derived.contains(location))
+                // The raw counts of this worker's scope, as exact zero judges
+                // them: a location outside it may legitimately hold work.
+                .filter(|(location, _, _)| {
+                    !self.derived.contains(location) && self.in_scope(location)
+                })
                 .map(|(location, time, count)| format!("{location:?}@{time:?}: {count:+}"))
                 .collect()
         } else {
@@ -2296,6 +2314,8 @@ pub(crate) trait ChildScope<TP: Timestamp>: Send {
     fn check_halt(&self, reason: &str);
     #[cfg(any(debug_assertions, feature = "progress-check"))]
     fn check_finish(&mut self, ok: bool, proven: bool, report_worker: bool);
+    #[cfg(any(debug_assertions, feature = "progress-check"))]
+    fn check_sealed(&self);
 }
 
 /// The builder of an `iterate` loop's scope, in `Product<TP, TI>` time.
@@ -2570,6 +2590,11 @@ impl<TP: Timestamp, TI: Timestamp> ChildScope<TP> for LoopScope<TP, TI> {
     #[cfg(any(debug_assertions, feature = "progress-check"))]
     fn check_finish(&mut self, ok: bool, proven: bool, report_worker: bool) {
         self.tracker.check_finish_with(ok, proven, report_worker);
+    }
+
+    #[cfg(any(debug_assertions, feature = "progress-check"))]
+    fn check_sealed(&self) {
+        self.tracker.check_sealed();
     }
 }
 

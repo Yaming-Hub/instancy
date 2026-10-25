@@ -81,7 +81,7 @@ fn audit_builder_exchange_epoch_completes_while_input_open() {
 }
 
 #[test]
-#[ignore = "expected failure (H10); see EXPECTED in tests/audit_repros.rs"]
+#[ignore = "audit repro; run by audit_repros_match_table (tests/audit_repros.rs)"]
 fn audit_builder_broadcast_epoch_never_completes_while_input_open_multi() {
     let got = run(true, 2);
     eprintln!("broadcast (2 workers): {got:?}");
@@ -92,7 +92,7 @@ fn audit_builder_broadcast_epoch_never_completes_while_input_open_multi() {
 }
 
 #[test]
-#[ignore = "expected failure (H10); see EXPECTED in tests/audit_repros.rs"]
+#[ignore = "audit repro; run by audit_repros_match_table (tests/audit_repros.rs)"]
 fn audit_builder_broadcast_epoch_never_completes_while_input_open_single() {
     let got = run(true, 1);
     eprintln!("broadcast (1 worker): {got:?}");

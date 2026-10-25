@@ -140,6 +140,11 @@ impl<T: Timestamp, D, M> BoundedPush<T, D, M> {
     }
 }
 
+impl<T: Timestamp, D: Send + 'static, M: Send + 'static>
+    crate::dataflow::channels::pushpull::sealed::Sealed for BoundedPush<T, D, M>
+{
+}
+
 impl<T: Timestamp, D: Send + 'static, M: Send + 'static> Push<T, D, M> for BoundedPush<T, D, M> {
     fn push(&mut self, envelope: Envelope<T, D, M>) -> Result<()> {
         let mut state = self.state.lock().map_err(|_| Error::LockPoisoned {
@@ -235,6 +240,11 @@ impl<T: Timestamp, D, M> Drop for BoundedPush<T, D, M> {
             self.mark_closed();
         }
     }
+}
+
+impl<T: Timestamp, D: Send + 'static, M: Send + 'static>
+    crate::dataflow::channels::pushpull::sealed::Sealed for BoundedPull<T, D, M>
+{
 }
 
 impl<T: Timestamp, D: Send + 'static, M: Send + 'static> Pull<T, D, M> for BoundedPull<T, D, M> {

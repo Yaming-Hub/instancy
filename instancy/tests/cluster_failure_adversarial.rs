@@ -473,19 +473,38 @@ async fn cut_during_ready_barrier_fails_every_node() {
     }
 }
 
-/// Draining: node a finished (pipeline) while b still runs; a's goodbye is
-/// held back, then the link is cut. a keeps its (complete) local result; b,
-/// which never got a's goodbye, must fail rather than hang or succeed.
+/// Draining: node a's workers finished while b still runs (b waits for a's
+/// last releases, held with a's goodbye behind the paused a → b link); the
+/// link is then cut. a keeps its (complete) local result; b, which never got
+/// a's goodbye, must fail rather than hang or succeed.
+///
+/// On a cluster every node hosts every operator, so a node finishes only once
+/// every node's input has closed (R47). Old trigger: a's input closed while
+/// b's stayed open. Now b's input closes too, and a's link to b is paused
+/// before a's input closes.
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
 async fn cut_while_draining_keeps_finished_result_and_fails_the_rest() {
     for mode in MODES {
         let mut cluster = Cluster::start(mode, 2, pipeline).await;
-        cluster.mesh.ctl("a", "b").pause();
+        let a_to_b = cluster.mesh.ctl("a", "b");
+        a_to_b.pause();
+        cluster.send("b", 100..110);
+        cluster.close("b");
         cluster.send("a", 0..10);
         cluster.close("a");
         let ja = cluster.join("a", DETECT);
         let jb = cluster.join("b", DETECT);
+        let a_out = cluster.node("a").output.as_mut().unwrap();
+        assert!(
+            a_out.wait_closed(DETECT),
+            "{mode:?}: a's workers did not finish"
+        );
         tokio::time::sleep(Duration::from_millis(300)).await;
+        assert!(a_to_b.holding(), "{mode:?}: the paused link held nothing");
+        assert!(
+            !jb.is_finished(),
+            "{mode:?}: b finished without a's releases"
+        );
         cluster.mesh.cut("a", "b");
         let (ra, rb) = (ja.await.unwrap(), jb.await.unwrap());
         assert!(matches!(ra, Some(Ok(()))), "{mode:?}: a {}", fmt_join(&ra));
@@ -496,22 +515,39 @@ async fn cut_while_draining_keeps_finished_result_and_fails_the_rest() {
 
 /// After retirement: node a finished and every peer retired it; its links
 /// then die. The others are unaffected and finish with every record.
+///
+/// R47: a node finishes only once every node's input has closed. Old
+/// trigger: a finished while b's and c's inputs stayed open. Now every input
+/// closes while b and c cannot hear each other (b ↔ c paused): a gets every
+/// release and retires, while b and c each wait for the other's.
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
 async fn cut_after_retirement_is_benign() {
     for mode in MODES {
         let mut cluster = Cluster::start(mode, 3, pipeline).await;
+        let (b_to_c, c_to_b) = (cluster.mesh.ctl("b", "c"), cluster.mesh.ctl("c", "b"));
+        b_to_c.pause();
+        c_to_b.pause();
         let jb = cluster.join("b", DETECT);
         let jc = cluster.join("c", DETECT);
         cluster.send("a", 0..30);
-        cluster.close("a");
-        let ra = cluster.join("a", DETECT).await.unwrap();
-        assert!(matches!(ra, Some(Ok(()))), "{mode:?}: a {}", fmt_join(&ra));
-        cluster.mesh.cut("a", "b");
-        cluster.mesh.cut("a", "c");
-        tokio::time::sleep(Duration::from_millis(300)).await;
         cluster.send("b", 100..110);
         cluster.send("c", 200..210);
         cluster.close_all();
+        let ra = cluster.join("a", DETECT).await.unwrap();
+        assert!(matches!(ra, Some(Ok(()))), "{mode:?}: a {}", fmt_join(&ra));
+        assert!(
+            b_to_c.holding() && c_to_b.holding(),
+            "{mode:?}: the paused links held nothing"
+        );
+        assert!(
+            !jb.is_finished() && !jc.is_finished(),
+            "{mode:?}: b and c must still be running"
+        );
+        cluster.mesh.cut("a", "b");
+        cluster.mesh.cut("a", "c");
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        b_to_c.resume();
+        c_to_b.resume();
         let (rb, rc) = (jb.await.unwrap(), jc.await.unwrap());
         assert!(
             matches!(rb, Some(Ok(()))) && matches!(rc, Some(Ok(()))),
@@ -524,7 +560,6 @@ async fn cut_after_retirement_is_benign() {
         cluster.shutdown().await;
     }
 }
-
 // ---------------------------------------------------------------------------
 // Corruption
 // ---------------------------------------------------------------------------

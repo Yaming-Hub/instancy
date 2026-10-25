@@ -107,10 +107,7 @@ impl<T: Timestamp> Capability<T> {
         // Atomic paired update: no intermediate state visible.
         self.reporter.downgrade(self.time.clone(), new_time.clone());
         #[cfg(any(debug_assertions, feature = "progress-check"))]
-        {
-            self.reporter.check_hold(new_time, 1);
-            self.reporter.check_hold(&self.time, -1);
-        }
+        self.reporter.check_hold(new_time, 1);
         self.time = new_time.clone();
         Ok(())
     }
@@ -124,9 +121,9 @@ impl<T: Timestamp> Clone for Capability<T> {
 
 impl<T: Timestamp> Drop for Capability<T> {
     fn drop(&mut self) {
-        self.reporter.update(self.time.clone(), -1);
-        #[cfg(any(debug_assertions, feature = "progress-check"))]
-        self.reporter.check_hold(&self.time, -1);
+        // The `-1` and the checker's release land together: a `Retained`
+        // may be dropped on another thread than the one draining.
+        self.reporter.release(self.time.clone());
     }
 }
 

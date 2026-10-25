@@ -82,7 +82,7 @@ fn control_loop_exit_on_entering_worker_completes() {
 
 /// Record enters the loop on worker 0 and leaves it on worker 1 (odd exit value).
 #[test]
-#[ignore = "expected failure (C2); see EXPECTED in tests/audit_repros.rs"]
+#[ignore = "audit repro; run by audit_repros_match_table (tests/audit_repros.rs)"]
 fn loop_exit_on_other_worker_never_converges() {
     let (join, all) = run(11);
     assert!(

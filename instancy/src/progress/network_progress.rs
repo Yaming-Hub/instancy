@@ -375,12 +375,18 @@ pub(crate) fn encode_progress_commit<T: Timestamp>(
         encode_change(&*codecs.root, change, &mut buf)?;
         entries.push((change.diff, buf));
     }
+    #[cfg(any(debug_assertions, feature = "progress-check"))]
+    let mut sections = usize::from(!entries.is_empty());
     for (scope, section) in &batch.scopes {
         let codec = codecs.scopes.get(scope).ok_or_else(|| {
             CodecError::InvalidData(format!("no progress codec for loop scope {scope}"))
         })?;
         let mut encoded = Vec::new();
         codec.encode(section.as_ref(), &mut encoded)?;
+        #[cfg(any(debug_assertions, feature = "progress-check"))]
+        {
+            sections += usize::from(!encoded.is_empty());
+        }
         let prefix = (*scope as u32).to_le_bytes();
         entries.extend(encoded.into_iter().map(|(diff, bytes)| {
             let mut buf = prefix.to_vec();
@@ -403,6 +409,8 @@ pub(crate) fn encode_progress_commit<T: Timestamp>(
     // carried a negative one.
     #[cfg(any(debug_assertions, feature = "progress-check"))]
     let mut negative_sent = false;
+    #[cfg(any(debug_assertions, feature = "progress-check"))]
+    crate::progress::check::note_split_commit(sections);
     while ordered.peek().is_some() {
         let chunk: Vec<&(i64, Vec<u8>)> = ordered.by_ref().take(effective_max).collect();
         #[cfg(any(debug_assertions, feature = "progress-check"))]
@@ -1824,6 +1832,10 @@ mod tests {
 
     #[tokio::test]
     async fn recv_bridge_reports_frame_after_end_of_stream_once() {
+        // The batch after end-of-stream is a V6 violation on purpose (the
+        // bridge runs on this thread).
+        #[cfg(any(debug_assertions, feature = "progress-check"))]
+        let _expect = crate::progress::check::expect_violations();
         use crate::communication::peer_link::LifecycleEvent;
 
         let (tx, rx) = tokio_mpsc::channel::<Vec<u8>>(16);

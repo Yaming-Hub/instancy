@@ -213,12 +213,22 @@ impl OperatorFactory {
     ///
     /// Returns an error if operator construction fails, or if a one-shot
     /// resource captured by the factory has already been consumed.
+    ///
+    /// Every operator it builds is an operator shell, which counts every
+    /// record at its ports (design §5.2, construction by type); debug builds
+    /// check it.
     pub fn build(
         &mut self,
         ctx: &WorkerContext,
         endpoints: ChannelEndpoints,
     ) -> crate::Result<Box<dyn SchedulableOperator>> {
-        (self.0)(ctx, endpoints)
+        let operator = (self.0)(ctx, endpoints)?;
+        debug_assert!(
+            operator.is_shell(),
+            "operator `{}` was built without an operator shell (design §5.2)",
+            operator.name()
+        );
+        Ok(operator)
     }
 }
 

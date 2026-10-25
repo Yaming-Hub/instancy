@@ -284,13 +284,24 @@ fn a_loop_with_one_batch_channels_completes() {
     }
     drop(sender);
     with_timeout("one-batch-loop", move || spawned.join_blocking()).unwrap();
-    let total: usize = collector
+    let mut out: Vec<(u64, u64)> = collector
         .join()
         .unwrap()
-        .iter()
-        .map(|(_, data)| data.len())
-        .sum();
-    assert_eq!(total, 96);
+        .into_iter()
+        .flat_map(|(t, data)| data.into_iter().map(move |x| (t, x)))
+        .collect();
+    out.sort_unstable();
+    assert_eq!(out, next_multiples_of_5());
+}
+
+/// Each of the 96 records `(epoch, epoch * 1000 + i)` of the one-batch loop
+/// tests, stepped up to the next multiple of 5, sorted.
+fn next_multiples_of_5() -> Vec<(u64, u64)> {
+    let mut expected: Vec<(u64, u64)> = (0..4u64)
+        .flat_map(|e| (0..24u64).map(move |i| (e, (e * 1000 + i) / 5 * 5 + 5)))
+        .collect();
+    expected.sort_unstable();
+    expected
 }
 
 /// R44 on two workers with an exchange inside the loop body: every physical
@@ -352,15 +363,69 @@ fn a_loop_with_one_batch_channels_and_an_exchange_completes_on_two_workers() {
         .map(|r| std::thread::spawn(move || r.collect_data()))
         .collect();
     with_timeout("one-batch-loop-exchange", move || multi.join_blocking()).unwrap();
-    let mut out: Vec<u64> = collectors
+    let mut out: Vec<(u64, u64)> = collectors
         .into_iter()
         .flat_map(|c| c.join().unwrap())
-        .flat_map(|(_, data)| data)
+        .flat_map(|(t, data)| data.into_iter().map(move |x| (t, x)))
         .collect();
     out.sort_unstable();
-    let mut expected: Vec<u64> = (0..4u64)
-        .flat_map(|e| (0..24u64).map(move |i| (e * 1000 + i) / 5 * 5 + 5))
+    assert_eq!(out, next_multiples_of_5());
+}
+
+// ---------------------------------------------------------------------------
+// Stage inference (R18)
+// ---------------------------------------------------------------------------
+
+/// A loop after a parallelism change (`exchange_to(1)`, then `iterate`) on
+/// two workers: the loop runs in the one-worker stage, its feedback edge with
+/// it, and the dataflow spawns and completes with exact output.
+#[test]
+fn a_loop_after_a_parallelism_change_spawns_and_completes() {
+    let rt = runtime();
+    let mut multi = rt
+        .spawn_multi(
+            "loop-after-exchange-to",
+            2,
+            |b: &mut DataflowBuilder<u64>| {
+                b.input::<u64>("in")?
+                    .exchange_to("to-one", 1, |x: &u64| *x)?
+                    .iterate::<u32>("loop", 1u32, |var| {
+                        let stepped = var.map("inc", |_t: &Inner, x| x + 1);
+                        IterateResult {
+                            feedback: stepped.clone().filter("again", |_t, x| x % 5 != 0),
+                            output: stepped.filter("done", |_t, x| x % 5 == 0),
+                        }
+                    })
+                    .output("out")?;
+                Ok(())
+            },
+            SpawnOptions::new().per_stage_parallelism(true),
+        )
+        .unwrap();
+    let senders = multi.take_all_inputs::<u64>("in").unwrap();
+    assert_eq!(senders.len(), 2, "the input stage runs on both workers");
+    let receivers = multi.take_all_outputs::<u64>("out").unwrap();
+    for epoch in 0..4u64 {
+        for i in 0..24u64 {
+            senders[(i % 2) as usize]
+                .send(epoch, vec![epoch * 1000 + i])
+                .unwrap();
+        }
+        for sender in &senders {
+            sender.advance_to(epoch + 1).unwrap();
+        }
+    }
+    drop(senders);
+    let collectors: Vec<_> = receivers
+        .into_iter()
+        .map(|r| std::thread::spawn(move || r.collect_data()))
         .collect();
-    expected.sort_unstable();
-    assert_eq!(out, expected);
+    with_timeout("loop-after-exchange-to", move || multi.join_blocking()).unwrap();
+    let mut out: Vec<(u64, u64)> = collectors
+        .into_iter()
+        .flat_map(|c| c.join().unwrap())
+        .flat_map(|(t, data)| data.into_iter().map(move |x| (t, x)))
+        .collect();
+    out.sort_unstable();
+    assert_eq!(out, next_multiples_of_5());
 }

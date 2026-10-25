@@ -477,6 +477,11 @@ fn deliver_to_owed<T: Timestamp, D>(
     }
 }
 
+impl<T: Timestamp, D: Clone + Send + 'static> crate::dataflow::channels::pushpull::sealed::Sealed
+    for ExchangePush<T, D>
+{
+}
+
 impl<T: Timestamp, D: Clone + Send + 'static> Push<T, D> for ExchangePush<T, D> {
     fn push(&mut self, envelope: Envelope<T, D, ()>) -> Result<()> {
         if self.closed {
@@ -693,6 +698,11 @@ impl<T: Timestamp, D: Clone + Send + 'static> BroadcastPush<T, D> {
             owed: vec![false; num_targets],
         }
     }
+}
+
+impl<T: Timestamp, D: Clone + Send + 'static> crate::dataflow::channels::pushpull::sealed::Sealed
+    for BroadcastPush<T, D>
+{
 }
 
 impl<T: Timestamp, D: Clone + Send + 'static> Push<T, D> for BroadcastPush<T, D> {
@@ -995,6 +1005,11 @@ impl<T: Timestamp, D> ExchangePull<T, D> {
             pending_watermarks: VecDeque::new(),
         }
     }
+}
+
+impl<T: Timestamp, D: Send + 'static> crate::dataflow::channels::pushpull::sealed::Sealed
+    for ExchangePull<T, D>
+{
 }
 
 impl<T: Timestamp, D: Send + 'static> Pull<T, D> for ExchangePull<T, D> {
@@ -1875,6 +1890,8 @@ mod tests {
         queue: Arc<Mutex<PeerQueue>>,
         closed: bool,
     }
+
+    impl crate::dataflow::channels::pushpull::sealed::Sealed for PeerQueuePush {}
 
     impl Push<u64, i32> for PeerQueuePush {
         fn push(&mut self, envelope: Envelope<u64, i32>) -> Result<()> {

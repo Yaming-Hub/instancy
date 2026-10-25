@@ -149,6 +149,10 @@ pub struct ProgressReporter<T: Timestamp> {
 struct ReporterState<T: Timestamp> {
     pending: ChangeBatch<T>,
     held: ChangeBatch<T>,
+    /// Releases the progress checker still counts as held: a released
+    /// capability stays in this mailbox until a commit drains it.
+    #[cfg(any(debug_assertions, feature = "progress-check"))]
+    released: Vec<(T, i64)>,
 }
 
 impl<T: Timestamp> ProgressReporter<T> {
@@ -158,6 +162,8 @@ impl<T: Timestamp> ProgressReporter<T> {
             inner: Arc::new(Mutex::new(ReporterState {
                 pending: ChangeBatch::new(),
                 held: ChangeBatch::new(),
+                #[cfg(any(debug_assertions, feature = "progress-check"))]
+                released: Vec::new(),
             })),
             #[cfg(any(debug_assertions, feature = "progress-check"))]
             check: Arc::default(),
@@ -206,6 +212,28 @@ impl<T: Timestamp> ProgressReporter<T> {
         }
     }
 
+    /// Count a capability at `time` released through this reporter, for the
+    /// progress checker: it stays counted (as held) until a commit drains the
+    /// release from this mailbox. Called with the state locked, together with
+    /// the `-1` itself, so a drain (on another thread than a dropped
+    /// `Retained`) never takes the `-1` without the release.
+    #[cfg(any(debug_assertions, feature = "progress-check"))]
+    fn check_release(&self, state: &mut ReporterState<T>, time: &T) {
+        if self.check.get().is_some() {
+            state.released.push((time.clone(), 1));
+        }
+    }
+
+    /// The releases a drain took out of the mailbox leave the checker's count.
+    #[cfg(any(debug_assertions, feature = "progress-check"))]
+    fn check_released(&self, released: Vec<(T, i64)>) {
+        if let Some(port) = self.check.get() {
+            for (time, n) in released {
+                port.count(crate::progress::check::Store::Capability, &time, -n);
+            }
+        }
+    }
+
     /// Tell the progress checker which output this reporter is for.
     #[cfg(any(debug_assertions, feature = "progress-check"))]
     pub(crate) fn set_check_port(&self, port: crate::progress::check::Port<T>) {
@@ -219,12 +247,24 @@ impl<T: Timestamp> ProgressReporter<T> {
         state.held.update(time, diff);
     }
 
+    /// Records a dropped capability at `time` (`-1`), and its release in the
+    /// checker's mailbox, under one lock.
+    pub(crate) fn release(&self, time: T) {
+        let mut state = self.state();
+        #[cfg(any(debug_assertions, feature = "progress-check"))]
+        self.check_release(&mut state, &time);
+        state.pending.update(time.clone(), -1);
+        state.held.update(time, -1);
+    }
+
     /// Records a paired update atomically: `-1` at `old_time`, `+1` at `new_time`.
     ///
     /// Used by [`Capability::downgrade`](super::capability::Capability::downgrade) to
     /// ensure the frontier never sees an intermediate state.
     pub fn downgrade(&self, old_time: T, new_time: T) {
         let mut state = self.state();
+        #[cfg(any(debug_assertions, feature = "progress-check"))]
+        self.check_release(&mut state, &old_time);
         state.pending.update(old_time.clone(), -1);
         state.pending.update(new_time.clone(), 1);
         state.held.update(old_time, -1);
@@ -233,12 +273,27 @@ impl<T: Timestamp> ProgressReporter<T> {
 
     /// Drains all pending changes from this reporter, returning them as a vec.
     pub fn drain(&self) -> Vec<(T, i64)> {
-        self.state().pending.drain().collect()
+        let mut state = self.state();
+        let changes = state.pending.drain().collect();
+        #[cfg(any(debug_assertions, feature = "progress-check"))]
+        {
+            let released = std::mem::take(&mut state.released);
+            drop(state);
+            self.check_released(released);
+        }
+        changes
     }
 
     /// Drains pending changes into the given `ChangeBatch`.
     pub fn drain_into(&self, target: &mut ChangeBatch<T>) {
-        self.state().pending.drain_into(target);
+        let mut state = self.state();
+        state.pending.drain_into(target);
+        #[cfg(any(debug_assertions, feature = "progress-check"))]
+        {
+            let released = std::mem::take(&mut state.released);
+            drop(state);
+            self.check_released(released);
+        }
     }
 
     /// Returns `true` if there are no pending (unread) changes.
