@@ -206,32 +206,27 @@ impl<T: Clone + PartialOrder + Ord> MutableAntichain<T> {
             .sum()
     }
 
-    /// Every timestamp with a non-zero net count.
+    /// Every timestamp with a non-zero net count, in timestamp order, in
+    /// O(n log n) for n updates.
     pub(crate) fn net_counts(&self) -> Vec<(T, i64)> {
-        let mut net: Vec<(T, i64)> = Vec::new();
-        for (time, count) in self.updates.unstable_internal_updates() {
-            match net.iter_mut().find(|(t, _)| t == time) {
-                Some((_, c)) => *c += count,
-                None => net.push((time.clone(), *count)),
+        let mut updates = self.updates.unstable_internal_updates().to_vec();
+        updates.sort_by(|a, b| a.0.cmp(&b.0));
+        let mut net: Vec<(T, i64)> = Vec::with_capacity(updates.len());
+        for (time, count) in updates {
+            match net.last_mut() {
+                Some((last, c)) if *last == time => *c += count,
+                _ => net.push((time, count)),
             }
         }
         net.retain(|(_, c)| *c != 0);
         net
     }
 
-    /// Every timestamp with a non-zero net count (for the progress checker's
-    /// residual report).
-    #[cfg(any(debug_assertions, feature = "progress-check"))]
-    pub(crate) fn nonzero_counts(&self) -> Vec<(T, i64)> {
-        let mut net: Vec<(T, i64)> = Vec::new();
-        for (time, count) in self.updates.unstable_internal_updates() {
-            match net.iter_mut().find(|(t, _)| t == time) {
-                Some((_, c)) => *c += count,
-                None => net.push((time.clone(), *count)),
-            }
-        }
-        net.retain(|(_, c)| *c != 0);
-        net
+    /// Whether every timestamp's net count is zero (none is positive or
+    /// negative). Amortized O(1): it compacts only when the uncompacted
+    /// updates could cancel every compacted one.
+    pub(crate) fn is_zero(&mut self) -> bool {
+        self.updates.is_empty()
     }
 }
 
@@ -402,6 +397,40 @@ mod tests {
     }
 
     // --- count_for ---
+
+    #[test]
+    fn net_counts_merges_sorts_and_drops_zeros() {
+        let mut mac = MutableAntichain::new();
+        // A frontier at 0 first: the updates below are each dominated by it
+        // (or negative and beyond it), so no rebuild compacts them and
+        // `net_counts` sees them raw.
+        mac.update_iter(std::iter::once((0u64, 1)));
+        mac.update_iter(vec![(5u64, 2), (3, 1), (5, -2), (7, -1), (3, 1), (9, 4)]);
+        assert!(
+            mac.updates.unstable_internal_updates().len() > 4,
+            "the updates must still be uncompacted"
+        );
+        assert_eq!(mac.net_counts(), vec![(0, 1), (3, 2), (7, -1), (9, 4)]);
+    }
+
+    #[test]
+    fn is_zero_sees_cancelling_updates() {
+        let mut mac = MutableAntichain::new();
+        assert!(mac.is_zero());
+        for t in 0..100u64 {
+            mac.update_iter(std::iter::once((t, 1)));
+        }
+        assert!(!mac.is_zero());
+        for t in 0..99u64 {
+            mac.update_iter(std::iter::once((t, -1)));
+            assert!(!mac.is_zero(), "{t}");
+        }
+        mac.update_iter(std::iter::once((99, -1)));
+        assert!(mac.is_zero());
+        // A negative count is not zero.
+        mac.update_iter(std::iter::once((4, -1)));
+        assert!(!mac.is_zero());
+    }
 
     #[test]
     fn count_for_returns_accumulated() {

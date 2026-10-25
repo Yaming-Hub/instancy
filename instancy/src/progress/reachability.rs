@@ -314,6 +314,7 @@ impl<T: Timestamp> Builder<T> {
             pushed_changes: ChangeBatch::new(),
             output_changes,
             total_counts: 0,
+            nonzero_counted: 0,
             source_exports,
             target_exports,
             export_changes: (0..self.scope_outputs)
@@ -698,6 +699,11 @@ struct PortInformation<T: Timestamp> {
     /// Propagated implications from all reachable upstream capabilities.
     /// The frontier of this antichain is the port's observable frontier.
     implications: MutableAntichain<T>,
+    /// Whether some time has a non-zero pointstamp count here (positive or
+    /// negative). Refreshed whenever the pointstamps change.
+    nonzero: bool,
+    /// Whether this port counts towards [`Tracker::counted_zero`].
+    counted: bool,
 }
 
 impl<T: Timestamp> PortInformation<T> {
@@ -705,6 +711,8 @@ impl<T: Timestamp> PortInformation<T> {
         Self {
             pointstamps: MutableAntichain::new(),
             implications: MutableAntichain::new(),
+            nonzero: false,
+            counted: true,
         }
     }
 }
@@ -782,6 +790,11 @@ pub struct Tracker<T: Timestamp> {
     /// count never offsets a positive one. Completion is decided by exact
     /// zero over a worker's scope, not by this count.
     total_counts: i64,
+
+    /// The number of counted ports (see [`set_counted`](Self::set_counted))
+    /// whose pointstamps hold a non-zero count, kept up to date as counts
+    /// change: exact zero over the counted ports is `== 0`, in O(1).
+    nonzero_counted: usize,
 
     /// For every source and target of a node other than the boundary node 0,
     /// its paths to each scope output (`[node][port] -> [(output, summaries)]`).
@@ -994,7 +1007,7 @@ impl<T: Timestamp> Tracker<T> {
                 .get(*node)
                 .and_then(|op| op.sources.get(*port)),
         };
-        info.is_none_or(|info| info.pointstamps.net_counts().is_empty())
+        info.is_none_or(|info| !info.nonzero)
     }
 
     /// Whether every pointstamp count of this view is exactly zero.
@@ -1003,8 +1016,48 @@ impl<T: Timestamp> Tracker<T> {
             op.targets
                 .iter()
                 .chain(op.sources.iter())
-                .all(|info| info.pointstamps.net_counts().is_empty())
+                .all(|info| !info.nonzero)
         })
+    }
+
+    /// Decides which ports count towards [`counted_zero`](Self::counted_zero):
+    /// those at whose location `counted` holds. Every port counts until
+    /// this is called.
+    pub(crate) fn set_counted(&mut self, counted: impl Fn(&Location) -> bool) {
+        let mut nonzero_counted = 0;
+        for (node, op) in self.per_operator.iter_mut().enumerate() {
+            for (port, info) in op.targets.iter_mut().enumerate() {
+                info.counted = counted(&Location::target(node, port));
+                nonzero_counted += usize::from(info.counted && info.nonzero);
+            }
+            for (port, info) in op.sources.iter_mut().enumerate() {
+                info.counted = counted(&Location::source(node, port));
+                nonzero_counted += usize::from(info.counted && info.nonzero);
+            }
+        }
+        self.nonzero_counted = nonzero_counted;
+    }
+
+    /// Whether every pointstamp count at every counted port is exactly zero,
+    /// in O(1). Counts are judged one pointstamp at a time, never summed.
+    pub(crate) fn counted_zero(&self) -> bool {
+        self.nonzero_counted == 0
+    }
+
+    /// Refreshes `info.nonzero` after its pointstamps changed, and the
+    /// count of non-zero counted ports with it.
+    fn refresh_nonzero(info: &mut PortInformation<T>, nonzero_counted: &mut usize) {
+        let nonzero = !info.pointstamps.is_zero();
+        if nonzero != info.nonzero {
+            info.nonzero = nonzero;
+            if info.counted {
+                if nonzero {
+                    *nonzero_counted += 1;
+                } else {
+                    *nonzero_counted -= 1;
+                }
+            }
+        }
     }
 
     // -- internal --
@@ -1028,50 +1081,55 @@ impl<T: Timestamp> Tracker<T> {
             let (inputs, outputs) = self.shape[node];
 
             for port in 0..inputs {
+                if self.target_changes[node][port].is_empty_clean() {
+                    continue;
+                }
+                // The port's whole batch at once, as in timely: at most one
+                // frontier rebuild per port and commit, and the frontier
+                // changes are the net ones.
                 let changes: Vec<(T, i64)> = self.target_changes[node][port].drain().collect();
-                for (time, diff) in changes {
-                    let frontier_changes = self.per_operator[node].targets[port]
-                        .pointstamps
-                        .update_iter(std::iter::once((time.clone(), diff)));
-                    for (t, d) in frontier_changes {
-                        self.total_counts += d;
-                        for (output, summaries) in &self.target_exports[node][port] {
-                            for summary in summaries.elements() {
-                                if let Some(exported) = summary.results_in(&t) {
-                                    self.export_changes[*output].update(exported, d);
-                                }
+                let info = &mut self.per_operator[node].targets[port];
+                let frontier_changes = info.pointstamps.update_iter(changes);
+                Self::refresh_nonzero(info, &mut self.nonzero_counted);
+                for (t, d) in frontier_changes {
+                    self.total_counts += d;
+                    for (output, summaries) in &self.target_exports[node][port] {
+                        for summary in summaries.elements() {
+                            if let Some(exported) = summary.results_in(&t) {
+                                self.export_changes[*output].update(exported, d);
                             }
                         }
-                        self.worklist.push(Reverse(WorklistEntry {
-                            time: t,
-                            location: Location::target(node, port),
-                            diff: d,
-                        }));
                     }
+                    self.worklist.push(Reverse(WorklistEntry {
+                        time: t,
+                        location: Location::target(node, port),
+                        diff: d,
+                    }));
                 }
             }
 
             for port in 0..outputs {
+                if self.source_changes[node][port].is_empty_clean() {
+                    continue;
+                }
                 let changes: Vec<(T, i64)> = self.source_changes[node][port].drain().collect();
-                for (time, diff) in changes {
-                    let frontier_changes = self.per_operator[node].sources[port]
-                        .pointstamps
-                        .update_iter(std::iter::once((time.clone(), diff)));
-                    for (t, d) in frontier_changes {
-                        self.total_counts += d;
-                        for (output, summaries) in &self.source_exports[node][port] {
-                            for summary in summaries.elements() {
-                                if let Some(exported) = summary.results_in(&t) {
-                                    self.export_changes[*output].update(exported, d);
-                                }
+                let info = &mut self.per_operator[node].sources[port];
+                let frontier_changes = info.pointstamps.update_iter(changes);
+                Self::refresh_nonzero(info, &mut self.nonzero_counted);
+                for (t, d) in frontier_changes {
+                    self.total_counts += d;
+                    for (output, summaries) in &self.source_exports[node][port] {
+                        for summary in summaries.elements() {
+                            if let Some(exported) = summary.results_in(&t) {
+                                self.export_changes[*output].update(exported, d);
                             }
                         }
-                        self.worklist.push(Reverse(WorklistEntry {
-                            time: t,
-                            location: Location::source(node, port),
-                            diff: d,
-                        }));
                     }
+                    self.worklist.push(Reverse(WorklistEntry {
+                        time: t,
+                        location: Location::source(node, port),
+                        diff: d,
+                    }));
                 }
             }
         }
@@ -1540,6 +1598,83 @@ mod tests {
                 .find_identity_cycle()
                 .is_none()
         );
+    }
+
+    /// The incremental zero tracking (`counts_zero_at`, `counted_zero`)
+    /// agrees with a recount from the pointstamps after every propagation,
+    /// under random updates (cancelling, negative, re-counted ports).
+    #[test]
+    fn incremental_zero_tracking_matches_a_recount() {
+        let (mut tracker, _) = scope_around_one_operator_builder().build();
+        let ports = [
+            Location::target(1, 0),
+            Location::source(1, 0),
+            Location::target(2, 0),
+            Location::source(2, 0),
+        ];
+        let mut counted: Vec<bool> = vec![true; ports.len()];
+        let mut seed = 0x9E37_79B9_7F4A_7C15u64;
+        let mut next = move |bound: u64| {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed % bound
+        };
+        for step in 0..4000 {
+            let port = next(ports.len() as u64) as usize;
+            let time = next(6);
+            let diff = [-2i64, -1, 1, 2][next(4) as usize];
+            match &ports[port] {
+                Location::Target { node, port } => tracker.update_target(*node, *port, time, diff),
+                Location::Source { node, port } => tracker.update_source(*node, *port, time, diff),
+            }
+            if next(5) == 0 {
+                let i = next(ports.len() as u64) as usize;
+                counted[i] = !counted[i];
+                let now = counted.clone();
+                let ports = ports.clone();
+                tracker.set_counted(|l| ports.iter().position(|p| p == l).is_none_or(|i| now[i]));
+            }
+            if next(3) != 0 {
+                continue;
+            }
+            tracker.propagate_all();
+            let mut any_counted_nonzero = false;
+            for (i, location) in ports.iter().enumerate() {
+                let nonzero = tracker
+                    .nonzero_counts()
+                    .iter()
+                    .any(|(l, _, _)| l == location);
+                assert_eq!(
+                    tracker.counts_zero_at(location),
+                    !nonzero,
+                    "step {step}: {location:?}"
+                );
+                any_counted_nonzero |= counted[i] && nonzero;
+            }
+            assert_eq!(tracker.counted_zero(), !any_counted_nonzero, "step {step}");
+            assert_eq!(
+                tracker.all_counts_zero(),
+                tracker.nonzero_counts().is_empty(),
+                "step {step}"
+            );
+            // Drive ports back to exactly zero often, so zero and non-zero
+            // states of counted and uncounted ports all occur.
+            let zero_all = next(4) == 0;
+            let zero_one = next(ports.len() as u64) as usize;
+            for (location, time, count) in tracker.nonzero_counts() {
+                if zero_all || location == ports[zero_one] {
+                    match location {
+                        Location::Target { node, port } => {
+                            tracker.update_target(node, port, time, -count)
+                        }
+                        Location::Source { node, port } => {
+                            tracker.update_source(node, port, time, -count)
+                        }
+                    }
+                }
+            }
+        }
     }
 
     fn scope_around_one_operator_builder() -> Builder<u64> {

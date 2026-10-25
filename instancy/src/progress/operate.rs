@@ -23,6 +23,8 @@
 //! - [`OperatorCore`] — trait that operators implement to declare their shape and
 //!   initial capabilities.
 
+use std::collections::BTreeMap;
+use std::collections::btree_map::Entry;
 use std::fmt::Debug;
 use std::sync::{Arc, Mutex};
 
@@ -148,7 +150,11 @@ pub struct ProgressReporter<T: Timestamp> {
 #[derive(Debug)]
 struct ReporterState<T: Timestamp> {
     pending: ChangeBatch<T>,
-    held: ChangeBatch<T>,
+    /// The capabilities held, per time (no zero entries).
+    held: BTreeMap<T, i64>,
+    /// While a logic call runs (see `Justify`): the minimal times of the
+    /// capabilities released during it, which still justify its output.
+    released_in_call: Option<Antichain<T>>,
     /// Releases the progress checker still counts as held: a released
     /// capability stays in this mailbox until a commit drains it.
     #[cfg(any(debug_assertions, feature = "progress-check"))]
@@ -161,7 +167,8 @@ impl<T: Timestamp> ProgressReporter<T> {
         Self {
             inner: Arc::new(Mutex::new(ReporterState {
                 pending: ChangeBatch::new(),
-                held: ChangeBatch::new(),
+                held: BTreeMap::new(),
+                released_in_call: None,
                 #[cfg(any(debug_assertions, feature = "progress-check"))]
                 released: Vec::new(),
             })),
@@ -178,17 +185,39 @@ impl<T: Timestamp> ProgressReporter<T> {
     /// initial capability, which every tracker seeds from the physical plan
     /// (A4), is held by the operator from the start.
     pub(crate) fn seed_held(&self, time: T, n: i64) {
-        self.state().held.update(time, n);
+        Self::hold(&mut self.state(), time, n);
     }
 
-    /// The times at which this port holds capabilities.
+    /// Changes the held count at `time` by `diff`; a release during a logic
+    /// call is remembered for the call's justification.
+    fn hold(state: &mut ReporterState<T>, time: T, diff: i64) {
+        if diff < 0 {
+            if let Some(released) = &mut state.released_in_call {
+                released.insert_ref(&time);
+            }
+        }
+        match state.held.entry(time) {
+            Entry::Occupied(mut entry) => {
+                *entry.get_mut() += diff;
+                if *entry.get() == 0 {
+                    entry.remove();
+                }
+            }
+            Entry::Vacant(entry) => {
+                if diff != 0 {
+                    entry.insert(diff);
+                }
+            }
+        }
+    }
+
+    /// The minimal times at which this port holds capabilities.
     pub(crate) fn held_frontier(&self) -> Antichain<T> {
-        let mut state = self.state();
-        state.held.compact();
+        let state = self.state();
         let mut frontier = Antichain::new();
-        for (time, count) in state.held.iter() {
+        for (time, count) in &state.held {
             if *count > 0 {
-                frontier.insert(time.clone());
+                frontier.insert_ref(time);
             }
         }
         frontier
@@ -196,9 +225,40 @@ impl<T: Timestamp> ProgressReporter<T> {
 
     /// Whether this port holds any capability.
     pub(crate) fn holds_any(&self) -> bool {
-        let mut state = self.state();
-        state.held.compact();
-        !state.held.is_empty()
+        !self.state().held.is_empty()
+    }
+
+    /// A logic call starts: remember the capabilities released during it
+    /// (see [`justifies`](Self::justifies)).
+    pub(crate) fn begin_call(&self) {
+        self.state().released_in_call = Some(Antichain::new());
+    }
+
+    /// The logic call (and the check of its output) ended.
+    pub(crate) fn end_call(&self) {
+        self.state().released_in_call = None;
+    }
+
+    /// The minimal times of the capabilities released during the current
+    /// logic call.
+    pub(crate) fn released_in_call(&self) -> Antichain<T> {
+        self.state().released_in_call.clone().unwrap_or_default()
+    }
+
+    /// Whether a capability this port holds, or released during the current
+    /// logic call, is at or before `time`. Only times at or before `time` in
+    /// `Ord` can be (`Ord` is a linear extension of the partial order), and
+    /// the scan stops at the first that is: O(log n) for a total order.
+    pub(crate) fn justifies(&self, time: &T) -> bool {
+        let state = self.state();
+        state
+            .released_in_call
+            .as_ref()
+            .is_some_and(|released| released.less_equal(time))
+            || state
+                .held
+                .range(..=time)
+                .any(|(held, count)| *count > 0 && held.less_equal(time))
     }
 
     /// Count `diff` capabilities at `time` held through this reporter, for
@@ -244,7 +304,7 @@ impl<T: Timestamp> ProgressReporter<T> {
     pub fn update(&self, time: T, diff: i64) {
         let mut state = self.state();
         state.pending.update(time.clone(), diff);
-        state.held.update(time, diff);
+        Self::hold(&mut state, time, diff);
     }
 
     /// Records a dropped capability at `time` (`-1`), and its release in the
@@ -254,7 +314,7 @@ impl<T: Timestamp> ProgressReporter<T> {
         #[cfg(any(debug_assertions, feature = "progress-check"))]
         self.check_release(&mut state, &time);
         state.pending.update(time.clone(), -1);
-        state.held.update(time, -1);
+        Self::hold(&mut state, time, -1);
     }
 
     /// Records a paired update atomically: `-1` at `old_time`, `+1` at `new_time`.
@@ -267,8 +327,8 @@ impl<T: Timestamp> ProgressReporter<T> {
         self.check_release(&mut state, &old_time);
         state.pending.update(old_time.clone(), -1);
         state.pending.update(new_time.clone(), 1);
-        state.held.update(old_time, -1);
-        state.held.update(new_time, 1);
+        Self::hold(&mut state, old_time, -1);
+        Self::hold(&mut state, new_time, 1);
     }
 
     /// Drains all pending changes from this reporter, returning them as a vec.
@@ -581,5 +641,51 @@ mod tests {
         clone.update(20, 1);
         let changes = reporter.drain();
         assert_eq!(changes.len(), 2);
+    }
+
+    /// During a call, a capability justifies output if it is held now or
+    /// was released during the call; a release between calls does not carry
+    /// into the next one.
+    #[test]
+    fn reporter_justifies_held_and_released_in_call() {
+        let reporter = ProgressReporter::<u64>::new();
+        reporter.update(10, 1);
+        reporter.update(20, 1);
+        assert_eq!(reporter.held_frontier().elements(), &[10]);
+        assert!(reporter.justifies(&10) && reporter.justifies(&15));
+        assert!(!reporter.justifies(&9));
+
+        reporter.begin_call();
+        reporter.update(10, -1);
+        assert!(reporter.justifies(&10), "released in this call");
+        reporter.end_call();
+        assert!(!reporter.justifies(&15), "only 20 is held now");
+
+        reporter.begin_call();
+        reporter.downgrade(20, 30);
+        assert!(reporter.justifies(&25), "downgraded from 20 in this call");
+        assert_eq!(reporter.released_in_call().elements(), &[20]);
+        reporter.end_call();
+
+        assert!(!reporter.justifies(&25), "only 30 is held now");
+        assert!(reporter.justifies(&30));
+        reporter.update(30, -1);
+        assert!(!reporter.holds_any());
+        assert!(!reporter.justifies(&u64::MAX));
+    }
+
+    #[test]
+    fn reporter_justifies_with_a_partial_order() {
+        use crate::order::Product;
+        let reporter = ProgressReporter::<Product<u64, u32>>::new();
+        reporter.update(Product::new(0, 9), 1);
+        reporter.update(Product::new(1, 7), 1);
+        // (0, 9) comes first in `Ord` but is not at or before (1, 8): the
+        // scan must go on to (1, 7), which is.
+        assert!(reporter.justifies(&Product::new(1, 8)));
+        // Nothing held is at or before (1, 6).
+        assert!(!reporter.justifies(&Product::new(1, 6)));
+        assert!(reporter.justifies(&Product::new(0, 10)), "after (0, 9)");
+        assert!(!reporter.justifies(&Product::new(0, 7)));
     }
 }

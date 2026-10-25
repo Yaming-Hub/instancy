@@ -629,7 +629,7 @@ pub struct NotifyContext<'a, T: Timestamp> {
     /// Each capability represents a promise that the operator may still produce
     /// data at that time. Dropping a capability (via next_notification or explicitly)
     /// decrements the pointstamp count, allowing downstream frontiers to advance.
-    capabilities: &'a mut Vec<Capability<T>>,
+    capabilities: &'a mut std::collections::BTreeMap<T, Capability<T>>,
 
     /// The current call's justification set (see
     /// [`Justify`](crate::dataflow::shell::Justify)).
@@ -650,7 +650,7 @@ impl<'a, T: Timestamp> NotifyContext<'a, T> {
     pub(crate) fn new(
         notificator: &'a mut Notificator<T>,
         reporter: &'a ProgressReporter<T>,
-        capabilities: &'a mut Vec<Capability<T>>,
+        capabilities: &'a mut std::collections::BTreeMap<T, Capability<T>>,
         justify: crate::dataflow::shell::Justify<T>,
     ) -> Self {
         Self {
@@ -721,18 +721,17 @@ impl<'a, T: Timestamp> NotifyContext<'a, T> {
     /// operator.
     pub fn try_notify_at(&mut self, time: T) -> Result<()> {
         self.check_time(&time)?;
-        // Only create a new capability if we don't already hold one at this time.
-        // The notificator deduplicates notification requests internally, but without
-        // this guard, repeated calls (e.g., once per data item) would create redundant
-        // capabilities — each requiring a mutex lock on drop. One capability per time
-        // is sufficient to hold the downstream frontier.
-        if !self.capabilities.iter().any(|c| c.time() == &time) {
+        // One capability per time is enough to hold the downstream frontier:
+        // repeated calls (e.g. once per data item) create no more. The map
+        // keeps both this lookup and the drop in `next_notification` in
+        // O(log n) of the times held.
+        if !self.capabilities.contains_key(&time) {
             // Create an output capability at this time.
             // This increments +1 in the ProgressReporter, which the reachability
             // tracker sees as a pointstamp at (operator, output_port, time).
             // Downstream frontiers cannot advance past `time` while this exists.
             let cap = Capability::new(time.clone(), self.reporter.clone());
-            self.capabilities.push(cap);
+            self.capabilities.insert(time.clone(), cap);
         }
 
         // Register the notification request with the notificator.
@@ -754,21 +753,11 @@ impl<'a, T: Timestamp> NotifyContext<'a, T> {
     /// all capabilities at `time` are gone, downstream frontiers can advance
     /// past `time`.
     ///
-    /// If the operator emits data for `time` BEFORE calling this (via
-    /// `output.push_vec(time, data)`), the data is pushed into the output
-    /// channel in the same activation. The capability drop happens right
-    /// after, so downstream sees both the data arrival and the frontier
-    /// advancement in the next progress propagation cycle.
-    ///
-    /// # Known limitation (backpressure)
-    ///
-    /// If the output channel is full when the operator's activation tries to
-    /// flush `pending_output`, data may remain buffered while the capability
-    /// has already been dropped. In this case, downstream could observe frontier
-    /// advancement before receiving the data. This is a known design limitation
-    /// that will be addressed when message-flight accounting (`consumed`/`produced`
-    /// in `OperatorProgress`) is implemented. In practice, with the default 1024
-    /// envelope channel capacity, this is unlikely to occur.
+    /// The operator may still emit at `time` in this call: the dropped
+    /// capability justifies output for the rest of the call (V3). Output is
+    /// counted at its targets in the same commit as the drop, even if it
+    /// waits in the operator's retry queue for channel capacity, so
+    /// downstream frontiers never pass it.
     ///
     /// Returns `None` when no notifications are ready. More may become ready
     /// in future activations as the frontier continues to advance.
@@ -776,11 +765,9 @@ impl<'a, T: Timestamp> NotifyContext<'a, T> {
         let fired = self.notificator.next()?;
         let time = fired.into_time();
 
-        // Drop ALL capabilities at this time.
-        // There may be multiple if notify_at was called repeatedly for the
-        // same time (e.g., data arrived in multiple batches). Each capability
-        // drop decrements the pointstamp count by 1.
-        self.capabilities.retain(|c| c.time() != &time);
+        // Drop the capability held at this time (`notify_at` holds one per
+        // time), decrementing the pointstamp count.
+        self.capabilities.remove(&time);
 
         Some(time)
     }

@@ -76,6 +76,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   it releases the time, from any thread, and wakes the operator.
 - Add `InputHandle::frontier()`, and `Delivery` on graph edges (how many
   copies of a record its edge delivers; part of the plan digest).
+- Fix the quadratic cost of `unary_notify` and the operators built on it
+  (`count`, `reduce`, `fold`, `distinct`, `delay`) over many distinct
+  times: each `notify_at` and each delivered notification scanned every
+  outstanding time. Both now take O(log n) in the times outstanding.
 - **BREAKING:** with the `transport` feature, `Pipe::iterate`'s inner
   timestamp must be `ExchangeData` (the new `IterateInner` trait), like the
   timestamps of exchanged data: a loop's progress crosses the network on a

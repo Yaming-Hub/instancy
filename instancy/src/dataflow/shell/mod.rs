@@ -67,10 +67,11 @@ pub(crate) struct ShellToken(());
 pub(crate) struct Justify<T: Timestamp>(Arc<Mutex<JustifyState<T>>>);
 
 struct JustifyState<T: Timestamp> {
-    /// Each output's capability reporter (its held capabilities).
+    /// Each output's capability reporter. During a call it answers for the
+    /// capabilities held when the call began: those held now or released
+    /// during the call. The ones acquired during the call are at or after an
+    /// element of `J` themselves, so including them justifies nothing new.
     reporters: Vec<Option<ProgressReporter<T>>>,
-    /// Per output: the times of the capabilities held when the call began.
-    held: Vec<Antichain<T>>,
     /// Times of the batches consumed in this call. Every built-in operator
     /// that checks V3 connects each input to each output with the identity
     /// summary.
@@ -84,7 +85,6 @@ impl<T: Timestamp> Justify<T> {
     pub(crate) fn new(outputs: usize) -> Self {
         Self(Arc::new(Mutex::new(JustifyState {
             reporters: vec![None; outputs],
-            held: vec![Antichain::new(); outputs],
             consumed: Antichain::new(),
             in_call: false,
             violation: None,
@@ -102,15 +102,13 @@ impl<T: Timestamp> Justify<T> {
         }
     }
 
-    /// A logic call starts: `J` holds the capabilities held now.
+    /// A logic call starts: `J` holds the capabilities held now. Nothing
+    /// is copied: each reporter remembers what is released during the call.
     fn begin(&self) {
         let mut state = self.state();
-        let held: Vec<Antichain<T>> = state
-            .reporters
-            .iter()
-            .map(|r| r.as_ref().map(|r| r.held_frontier()).unwrap_or_default())
-            .collect();
-        state.held = held;
+        for reporter in state.reporters.iter().flatten() {
+            reporter.begin_call();
+        }
         state.consumed = Antichain::new();
         state.violation = None;
         state.in_call = true;
@@ -126,15 +124,22 @@ impl<T: Timestamp> Justify<T> {
 
     fn justifies_locked(state: &JustifyState<T>, output: usize, time: &T) -> bool {
         state.consumed.less_equal(time)
-            || state.held.get(output).is_some_and(|h| h.less_equal(time))
+            || state
+                .reporters
+                .get(output)
+                .and_then(Option::as_ref)
+                .is_some_and(|reporter| reporter.justifies(time))
     }
 
     fn describe(state: &JustifyState<T>, output: usize) -> String {
-        let mut elements: Vec<String> = state
-            .held
-            .get(output)
-            .map(|h| h.elements().iter().map(|t| format!("held {t:?}")).collect())
-            .unwrap_or_default();
+        let mut elements: Vec<String> = Vec::new();
+        if let Some(reporter) = state.reporters.get(output).and_then(Option::as_ref) {
+            let mut held = reporter.held_frontier();
+            for time in reporter.released_in_call().elements() {
+                held.insert_ref(time);
+            }
+            elements.extend(held.elements().iter().map(|t| format!("held {t:?}")));
+        }
         elements.extend(
             state
                 .consumed
@@ -202,8 +207,8 @@ impl<T: Timestamp> Justify<T> {
     fn end(&self) {
         let mut state = self.state();
         state.consumed = Antichain::new();
-        for held in &mut state.held {
-            held.clear();
+        for reporter in state.reporters.iter().flatten() {
+            reporter.end_call();
         }
     }
 }

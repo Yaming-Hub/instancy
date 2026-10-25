@@ -30,7 +30,7 @@
 //! }
 //! ```
 
-use std::collections::VecDeque;
+use std::collections::BTreeSet;
 
 use crate::progress::frontier::Antichain;
 use crate::progress::timestamp::Timestamp;
@@ -74,9 +74,10 @@ impl<T: Timestamp> FiredNotification<T> {
 /// a timestamp is complete only when ALL inputs have advanced past it.
 pub struct Notificator<T: Timestamp> {
     /// Timestamps at which notifications have been requested (pending delivery).
-    pending: Vec<T>,
-    /// Notifications that have fired and await consumption by the operator.
-    ready: VecDeque<FiredNotification<T>>,
+    pending: BTreeSet<T>,
+    /// Times whose notifications have fired and await consumption by the
+    /// operator, in `Ord` order.
+    ready: BTreeSet<T>,
     /// Current input frontier (meet of all input port frontiers for this operator).
     frontier: Antichain<T>,
 }
@@ -88,8 +89,8 @@ impl<T: Timestamp> Notificator<T> {
     /// for a freshly started dataflow.
     pub fn new(initial_frontier: Antichain<T>) -> Self {
         Self {
-            pending: Vec::new(),
-            ready: VecDeque::new(),
+            pending: BTreeSet::new(),
+            ready: BTreeSet::new(),
             frontier: initial_frontier,
         }
     }
@@ -102,34 +103,26 @@ impl<T: Timestamp> Notificator<T> {
     /// If the frontier has ALREADY advanced past `time`, the notification is
     /// immediately ready (will be returned on the next `next()` call).
     ///
-    /// Duplicate requests for the same timestamp are coalesced.
+    /// Duplicate requests for the same timestamp are coalesced. O(log n) in
+    /// the number of pending and ready notifications.
     pub fn notify_at(&mut self, time: T) {
-        // Check if already pending or ready
-        if self.pending.iter().any(|t| t == &time) {
+        if self.pending.contains(&time) || self.ready.contains(&time) {
             return;
         }
-        if self.ready.iter().any(|n| n.time == time) {
-            return;
-        }
-
         // If frontier already past this time, fire immediately
         if !self.frontier.less_equal(&time) {
-            self.insert_ready(time);
+            self.ready.insert(time);
         } else {
-            self.pending.push(time);
+            self.pending.insert(time);
         }
-    }
-
-    /// Inserts a fired time into `ready`, keeping it sorted by `Ord`.
-    fn insert_ready(&mut self, time: T) {
-        let pos = self.ready.partition_point(|n| n.time <= time);
-        self.ready.insert(pos, FiredNotification { time });
     }
 
     /// Returns the next ready notification, or `None` if no notifications have fired.
     #[allow(clippy::should_implement_trait)]
     pub fn next(&mut self) -> Option<FiredNotification<T>> {
-        self.ready.pop_front()
+        self.ready
+            .pop_first()
+            .map(|time| FiredNotification { time })
     }
 
     /// Returns true if there are ready notifications waiting to be consumed.
@@ -168,33 +161,12 @@ impl<T: Timestamp> Notificator<T> {
                 false
             }
         });
-        let count = fired.len();
-        if count == 0 {
-            return 0;
-        }
-
-        fired.sort();
         debug_assert!(
             fired.windows(2).all(|w| !w[1].less_than(&w[0])),
             "Timestamp Ord must be a linear extension of PartialOrder: {fired:?}"
         );
-        if self.ready.is_empty() {
-            self.ready
-                .extend(fired.into_iter().map(|time| FiredNotification { time }));
-        } else {
-            let mut merged = VecDeque::with_capacity(self.ready.len() + count);
-            let mut new = fired.into_iter().peekable();
-            for existing in self.ready.drain(..) {
-                while new.peek().is_some_and(|t| *t < existing.time) {
-                    if let Some(time) = new.next() {
-                        merged.push_back(FiredNotification { time });
-                    }
-                }
-                merged.push_back(existing);
-            }
-            merged.extend(new.map(|time| FiredNotification { time }));
-            self.ready = merged;
-        }
+        let count = fired.len();
+        self.ready.extend(fired);
         count
     }
 
@@ -422,5 +394,29 @@ mod tests {
         // Already complete: fires immediately and must be delivered first.
         n.notify_at(2);
         assert_eq!(drain_times(&mut n), vec![2, 4, 8]);
+    }
+
+    /// Requests in any order, repeated, delivered once each in time order,
+    /// whether they were pending or already ready.
+    #[test]
+    fn duplicate_requests_coalesce_and_deliver_in_order() {
+        let mut n = Notificator::new(Antichain::from_elem(10u64));
+        for t in (0..20u64).rev().chain(0..20) {
+            n.notify_at(t);
+        }
+        // 0..10 fired at once (the frontier is past them); 10..20 pend.
+        assert_eq!(n.ready_count(), 10);
+        assert_eq!(n.pending_count(), 10);
+        n.update_frontier(&Antichain::from_elem(15));
+        n.notify_at(12);
+        n.notify_at(17);
+        let fired: Vec<u64> =
+            std::iter::from_fn(|| n.next().map(FiredNotification::into_time)).collect();
+        assert_eq!(fired, (0..15).collect::<Vec<_>>());
+        n.update_frontier(&Antichain::new());
+        let fired: Vec<u64> =
+            std::iter::from_fn(|| n.next().map(FiredNotification::into_time)).collect();
+        assert_eq!(fired, (15..20).collect::<Vec<_>>());
+        assert!(n.is_empty());
     }
 }

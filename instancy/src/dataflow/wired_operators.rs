@@ -516,8 +516,8 @@ pub(crate) struct NotifyLogic<T: Timestamp, D1: Send + 'static, D2: Send + 'stat
     logic: NotifyFn<T, D1, D2>,
     /// Tracks when the input frontier passes requested times.
     notificator: Notificator<T>,
-    /// Output capabilities held for requested notifications.
-    held_capabilities: Vec<Capability<T>>,
+    /// Output capabilities held for requested notifications, one per time.
+    held_capabilities: std::collections::BTreeMap<T, Capability<T>>,
     /// The shell's justification of each call (V3), which `notify_at`
     /// requests are checked against.
     justify: Option<crate::dataflow::shell::Justify<T>>,
@@ -604,7 +604,7 @@ pub(crate) fn notify<T: Timestamp, D1: Send + 'static, D2: Send + 'static>(
         NotifyLogic {
             logic: Box::new(logic),
             notificator: Notificator::new(initial_frontier),
-            held_capabilities: Vec::new(),
+            held_capabilities: std::collections::BTreeMap::new(),
             justify: None,
         },
         input,

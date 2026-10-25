@@ -745,6 +745,10 @@ impl<T: Timestamp> SubgraphBuilder<T> {
         for child in &children {
             derived.extend((0..child.outputs()).map(|o| Location::source(child.node(), o)));
         }
+        // Exact zero judges raw counts only (R38 C2); every location is in
+        // scope until a scope is assigned.
+        let mut tracker = tracker;
+        tracker.set_counted(|location| !derived.contains(location));
 
         let mut operator_indices: Vec<usize> = self.operators.keys().copied().collect();
         operator_indices.sort();
@@ -1097,6 +1101,10 @@ impl<T: Timestamp> ProgressTracker<T> {
             .map(|(_, location)| location.clone())
             .collect();
         scope.sort();
+        let derived = &self.derived;
+        self.tracker.set_counted(|location| {
+            scope.binary_search(location).is_ok() && !derived.contains(location)
+        });
         self.scope = Some(scope);
         for child in &mut self.children {
             child.assign_scope(seen);
@@ -1206,16 +1214,13 @@ impl<T: Timestamp> ProgressTracker<T> {
             .is_none_or(|scope| scope.binary_search(location).is_ok())
     }
 
+    /// O(1) per scope: the tracker keeps the number of in-scope raw
+    /// locations whose count is non-zero (see `Tracker::set_counted`).
     fn raw_zero(&self) -> bool {
         if self.tracker.has_pending() || !self.local_changes.is_empty_clean() {
             return false;
         }
-        let zero = self
-            .tracker
-            .nonzero_counts()
-            .iter()
-            .all(|(location, _, _)| !self.in_scope(location) || self.derived.contains(location));
-        zero && self.children.iter().all(|c| c.raw_zero())
+        self.tracker.counted_zero() && self.children.iter().all(|c| c.raw_zero())
     }
 
     /// Whether every derived count in the worker's scope is zero (in this
