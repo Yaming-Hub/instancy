@@ -144,3 +144,37 @@ foreach ($s in $scopeScenarios) {
     Set-Content -Path (Join-Path $dir "$($s.n).cfg") -Value $lines -Encoding ascii
 }
 "$($scopeScenarios.Count) nested-scope scenarios written to $dir"
+
+# ---- A loop scope on an outer loop's feedback path (NestedScopes.tla, O1) ----
+$nestBase = [ordered]@{ MaxT = '0'; MaxJ = '1'; MaxK = '1'; MaxSends = '1'; LapsO = '1'; LapsI = '1'
+                        Export = '"internal"'; Sat = 'FALSE'; Frag = '"none"'; KeepOpen = 'FALSE'; Track = 'FALSE' }
+$nestSafety = @('InnerSafe', 'OuterSafe', 'RootSafe', 'NoLateData', 'NoDataAtDone', 'CompleteMeansEmpty', 'NoResidual', 'DerivedZero', 'CacheExact')
+$nestMutSafety = $nestSafety | Where-Object { $_ -notin 'DerivedZero', 'CacheExact' }
+$nestScenarios = @(
+    @{ n = 'nest_pcp'; e = 'pass'; d = 'Inner loop on the outer feedback path: no frontier at any level passes outstanding work, nothing is lost, nothing hangs, and the cached links always equal a fresh recompute.' }
+    @{ n = 'nest_pcp_sat'; e = 'pass'; d = 'The same with the outer feedback saturating at MaxJ (unbounded iterations): still finishes.'; o = @{ Sat = 'TRUE' } }
+    @{ n = 'nest_pcp_split'; e = 'pass'; d = 'Commits may be split positives-first across all three levels. One record through both loops, no laps: the split hazard is records crossing levels, which entering and leaving both loops exercises. (Laps make the space too large to finish.)'; o = @{ Frag = '"positivesfirst"'; MaxJ = '0'; LapsO = '0'; LapsI = '0'; MaxK = '0' } }
+    @{ n = 'nest_pcp_twolaps'; e = 'pass'; d = 'Two real outer laps (MaxJ = 2), so a record can re-enter the inner loop twice.'; o = @{ MaxJ = '2'; LapsO = '2'; LapsI = '0'; MaxK = '0' } }
+    @{ n = 'nest_reach'; flags = '-simulate num=5000000 -depth 200'; e = 'violated:NeverCompletesAfterLaps'; d = 'Sanity: a record laps the inner loop, crosses workers on an outer lap, re-enters the inner loop at lap 1, the count reports, and the run completes.'; inv = $nestSafety + 'NeverCompletesAfterLaps'; o = @{ Sat = 'TRUE'; Track = 'TRUE' } }
+    @{ n = 'nest_frontierexport'; e = 'deadlock'; d = 'The inner loop exports its frontier at the exit, import included: its export keeps supporting its own next import, and the run never finishes.'; inv = $nestMutSafety; o = @{ Export = '"frontier"'; Sat = 'TRUE'; MaxSends = '0' } }
+    @{ n = 'nest_frontierexport_derived'; e = 'violated:DerivedZero'; d = 'The same mutation, caught by the R38 assertion: raw counts are zero but the cached export is not.'; inv = $nestMutSafety + 'DerivedZero'; o = @{ Export = '"frontier"'; Sat = 'TRUE'; MaxSends = '0' } }
+    @{ n = 'live_nest'; e = 'pass'; sym = $false; spec = 'LiveSpec'; prop = @('EventuallyDone'); d = 'Every run finishes under fair scheduling, with the outer feedback saturating. One outer lap through the inner loop; no inner laps.'; o = @{ Sat = 'TRUE'; LapsI = '0'; MaxK = '0' } }
+    @{ n = 'live_nest_open'; e = 'pass'; sym = $false; spec = 'LiveSpec'; prop = @('UProgress'); flags = '-deadlock'; d = 'With the input held open at epoch 1, the count after the outer loop still reports epoch 0.'; o = @{ Sat = 'TRUE'; MaxT = '1'; KeepOpen = 'TRUE'; LapsI = '0'; MaxK = '0' } }
+    @{ n = 'live_nest_open_frontierexport'; e = 'temporal'; sym = $false; spec = 'LiveSpec'; prop = @('UProgress'); flags = '-deadlock'; d = 'With the frontier-export mutation, epoch 0 never reports: the inner export never drains.'; inv = $nestMutSafety; o = @{ Export = '"frontier"'; Sat = 'TRUE'; MaxT = '1'; KeepOpen = 'TRUE'; LapsI = '0'; MaxK = '0' } }
+)
+foreach ($s in $nestScenarios) {
+    $c = [ordered]@{}; foreach ($k in $nestBase.Keys) { $c[$k] = $nestBase[$k] }
+    if ($s.o) { foreach ($k in $s.o.Keys) { $c[$k] = $s.o[$k] } }
+    $lines = @('\* MODULE: NestedScopes', "\* EXPECT: $($s.e)")
+    if ($s.flags) { $lines += "\* TLCFLAGS: $($s.flags)" }
+    $lines += "\* $($s.d)"
+    $lines += 'CONSTANTS'; $lines += '    w1 = w1'; $lines += '    w2 = w2'; $lines += '    Workers = {w1, w2}'
+    foreach ($k in $c.Keys) { $lines += "    $k = $($c[$k])" }
+    if ($s.sym -ne $false) { $lines += 'SYMMETRY Sym' }
+    $lines += "SPECIFICATION $(if ($s.spec) { $s.spec } else { 'Spec' })"
+    $inv = if ($s.inv) { $s.inv } else { $nestSafety }
+    $lines += 'INVARIANTS'; foreach ($i in $inv) { $lines += "    $i" }
+    if ($s.prop) { $lines += 'PROPERTIES'; foreach ($p in $s.prop) { $lines += "    $p" } }
+    Set-Content -Path (Join-Path $dir "$($s.n).cfg") -Value $lines -Encoding ascii
+}
+"$($nestScenarios.Count) outer-feedback scenarios written to $dir"
