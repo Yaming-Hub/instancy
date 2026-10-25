@@ -1,9 +1,10 @@
-//! RTT probing and adaptive scaling for shared connection pools.
+//! RTT probing for shared connection pools.
 //!
-//! This module provides the runtime machinery for:
-//! - Sending periodic probe messages on each connection
-//! - Measuring round-trip time from probe responses
-//! - Driving scaling decisions based on measured RTT
+//! A [`SharedPeerManager`](super::shared_transport::SharedPeerManager)
+//! periodically sends a probe on each pooled connection; the peer echoes it
+//! back, and the [`RttProber`] records the round-trip time in the
+//! connection's metrics. The measurements are diagnostics only: they never
+//! open, close or select connections.
 //!
 //! # Probe Protocol
 //!
@@ -21,27 +22,17 @@
 //! └──────────────────┴────────────────┴───────────────┘
 //! ```
 //!
-//! - `probe_seq` (u64): monotonically increasing per connection, for matching
+//! - `probe_seq` (u64): monotonically increasing per peer, for matching
 //!   replies to requests (handles out-of-order or lost probes).
 //! - `send_ts` (u64): nanosecond timestamp from sender's monotonic clock.
 //!   The receiver echoes it back unchanged; RTT = now - send_ts.
-//!
-//! # Scaling Driver
-//!
-//! The [`ScalingDriver`] runs as a background task per peer, periodically:
-//! 1. Sends probes on each connection
-//! 2. Processes probe replies and updates RTT metrics
-//! 3. Evaluates scaling decisions
-//! 4. Notifies the caller of scale-up/scale-down actions via a channel
 
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
-use tokio::sync::mpsc;
 use tokio::time::Instant;
 
-use super::shared_pool::{ConnectionMetrics, PeerPool, ScalingDecision, SharedConnectionConfig};
+use super::shared_pool::ConnectionMetrics;
 use crate::wire;
 
 // ─── Probe Wire Format ───────────────────────────────────────────────────────
@@ -162,76 +153,32 @@ impl Default for ProbeCounter {
     }
 }
 
-// ─── Scaling Events ──────────────────────────────────────────────────────────
+// ─── RTT Prober ──────────────────────────────────────────────────────────────
 
-/// Event emitted by the scaling driver to notify the pool manager.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum ScalingEvent {
-    /// A new connection should be established to this peer.
-    ScaleUp,
-    /// The specified connection should be drained and closed.
-    ScaleDown { connection_id: usize },
-    /// A connection has failed (writer or reader error).
-    ///
-    /// The connection has already been marked dead in the pool.
-    /// The handler should remove it from writer_channels and attempt
-    /// to establish a replacement via ConnectionFactory.
-    ConnectionFailed { connection_id: usize },
-}
-
-// ─── Scaling Driver ──────────────────────────────────────────────────────────
-
-/// Drives RTT-based adaptive scaling for a single peer pool.
+/// Matches probe replies with the probes sent on a peer's connections and
+/// records the measured round-trip times in the connections' metrics.
 ///
-/// The driver is a background task that:
-/// 1. Periodically sends probe requests on each connection
-/// 2. Processes probe replies to update RTT metrics
-/// 3. Evaluates scaling decisions based on configured thresholds
-/// 4. Emits scaling events via a channel
-///
-/// # Usage
-///
-/// ```ignore
-/// let (driver, event_rx) = ScalingDriver::new(pool, config);
-/// tokio::spawn(driver.run(probe_sender, reply_receiver));
-///
-/// while let Some(event) = event_rx.recv().await {
-///     match event {
-///         ScalingEvent::ScaleUp => { /* establish new connection */ }
-///         ScalingEvent::ScaleDown { id } => { /* drain and close */ }
-///     }
-/// }
-/// ```
-pub struct ScalingDriver {
-    config: SharedConnectionConfig,
-    /// Reference to the probe send timestamp for RTT calculation.
-    /// Indexed by probe_seq % PROBE_WINDOW.
+/// The measurements are diagnostics only (see
+/// [`ConnectionSnapshot`](super::shared_pool::ConnectionSnapshot)): nothing
+/// is decided from them.
+pub struct RttProber {
+    /// Send timestamps of outstanding probes, indexed by
+    /// `probe_seq % PROBE_WINDOW`.
     probe_timestamps: Vec<AtomicU64>,
     /// Monotonic timestamp source for consistent RTT measurement.
     timestamp: ProbeTimestamp,
-    /// Event sender for scaling notifications.
-    event_tx: mpsc::Sender<ScalingEvent>,
 }
 
 /// Size of the circular buffer tracking outstanding probe timestamps.
 const PROBE_WINDOW: usize = 256;
 
-impl ScalingDriver {
-    /// Create a new scaling driver.
-    ///
-    /// Returns the driver and a receiver for scaling events.
-    pub fn new(config: SharedConnectionConfig) -> (Self, mpsc::Receiver<ScalingEvent>) {
-        let (event_tx, event_rx) = mpsc::channel(16);
-        let probe_timestamps = (0..PROBE_WINDOW).map(|_| AtomicU64::new(0)).collect();
-        (
-            Self {
-                config,
-                probe_timestamps,
-                timestamp: ProbeTimestamp::new(),
-                event_tx,
-            },
-            event_rx,
-        )
+impl RttProber {
+    /// Create a prober with no outstanding probes.
+    pub fn new() -> Self {
+        Self {
+            probe_timestamps: (0..PROBE_WINDOW).map(|_| AtomicU64::new(0)).collect(),
+            timestamp: ProbeTimestamp::new(),
+        }
     }
 
     /// Get the timestamp source for creating probe requests.
@@ -255,7 +202,7 @@ impl ScalingDriver {
     pub fn process_probe_reply(
         &self,
         reply: &ProbeMessage,
-        connection: &Arc<ConnectionMetrics>,
+        connection: &ConnectionMetrics,
     ) -> Option<Duration> {
         // Only process Reply messages
         if reply.kind != ProbeKind::Reply {
@@ -293,35 +240,11 @@ impl ScalingDriver {
         connection.record_rtt(rtt);
         Some(rtt)
     }
+}
 
-    /// Evaluate the pool and emit a scaling event if needed.
-    pub async fn evaluate_and_emit(&self, pool: &PeerPool) -> crate::Result<()> {
-        let decision = pool.evaluate_scaling().await?;
-        let event = match decision {
-            ScalingDecision::None => return Ok(()),
-            ScalingDecision::ScaleUp => ScalingEvent::ScaleUp,
-            ScalingDecision::ScaleDown { connection_id } => {
-                ScalingEvent::ScaleDown { connection_id }
-            }
-        };
-        // Best-effort send — if the receiver is full, skip this cycle
-        let _ = self.event_tx.try_send(event);
-        Ok(())
-    }
-
-    /// Emit a scaling event directly (e.g., connection failure notification).
-    pub async fn emit_event(&self, event: ScalingEvent) {
-        let _ = self.event_tx.try_send(event);
-    }
-
-    /// Get the configured probe interval.
-    pub fn probe_interval(&self) -> Duration {
-        self.config.probe_interval
-    }
-
-    /// Get the configured reorder timeout.
-    pub fn reorder_timeout(&self) -> Duration {
-        self.config.reorder_timeout
+impl Default for RttProber {
+    fn default() -> Self {
+        Self::new()
     }
 }
 
@@ -454,17 +377,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn scaling_driver_records_and_processes() {
-        let config = SharedConnectionConfig {
-            min_connections: 1,
-            max_connections: 4,
-            rtt_scale_up_threshold: Duration::from_millis(10),
-            probe_interval: Duration::from_millis(50),
-            ..Default::default()
-        };
-        let (driver, _event_rx) = ScalingDriver::new(config.clone());
+    async fn rtt_prober_records_and_processes() {
+        let driver = RttProber::new();
 
-        let conn = Arc::new(ConnectionMetrics::new(0, config.rtt_ema_alpha));
+        let conn = ConnectionMetrics::new(0, 0.2);
 
         // Record probe sent using driver's timestamp source
         let send_ts = driver.timestamp().now_nanos();
@@ -489,11 +405,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn scaling_driver_stale_probe_ignored() {
-        let config = SharedConnectionConfig::default();
-        let (driver, _event_rx) = ScalingDriver::new(config.clone());
+    async fn rtt_prober_stale_probe_ignored() {
+        let driver = RttProber::new();
 
-        let conn = Arc::new(ConnectionMetrics::new(0, config.rtt_ema_alpha));
+        let conn = ConnectionMetrics::new(0, 0.2);
 
         // Process reply without having recorded a send — stale
         let reply = ProbeMessage {
@@ -507,60 +422,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn scaling_driver_emits_scale_up() {
-        let config = SharedConnectionConfig {
-            min_connections: 1,
-            max_connections: 4,
-            rtt_scale_up_threshold: Duration::from_millis(5),
-            ..Default::default()
-        };
-        let pool = PeerPool::new(1, config.clone()).unwrap();
-
-        let (driver, mut event_rx) = ScalingDriver::new(config);
-
-        // Inject high RTT directly
-        pool.connection(0)
-            .unwrap()
-            .unwrap()
-            .record_rtt(Duration::from_millis(10));
-
-        // Evaluate
-        driver.evaluate_and_emit(&pool).await.unwrap();
-
-        // Should receive ScaleUp event
-        let event = event_rx.try_recv().unwrap();
-        assert_eq!(event, ScalingEvent::ScaleUp);
-    }
-
-    #[tokio::test]
-    async fn scaling_driver_no_event_when_healthy() {
-        let config = SharedConnectionConfig {
-            min_connections: 1,
-            max_connections: 4,
-            rtt_scale_up_threshold: Duration::from_millis(10),
-            ..Default::default()
-        };
-        let pool = PeerPool::new(1, config.clone()).unwrap();
-
-        let (driver, mut event_rx) = ScalingDriver::new(config);
-
-        // Healthy RTT
-        pool.connection(0)
-            .unwrap()
-            .unwrap()
-            .record_rtt(Duration::from_millis(2));
-
-        driver.evaluate_and_emit(&pool).await.unwrap();
-
-        // No event
-        assert!(event_rx.try_recv().is_err());
-    }
-
-    #[tokio::test]
-    async fn scaling_driver_rejects_request_kind() {
-        let config = SharedConnectionConfig::default();
-        let (driver, _event_rx) = ScalingDriver::new(config.clone());
-        let conn = Arc::new(ConnectionMetrics::new(0, config.rtt_ema_alpha));
+    async fn rtt_prober_rejects_request_kind() {
+        let driver = RttProber::new();
+        let conn = ConnectionMetrics::new(0, 0.2);
 
         let send_ts = driver.timestamp().now_nanos();
         driver.record_probe_sent(0, send_ts);
@@ -583,11 +447,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn scaling_driver_send_ts_zero_works() {
+    async fn rtt_prober_send_ts_zero_works() {
         // Regression: send_ts=0 is valid (happens at epoch start)
-        let config = SharedConnectionConfig::default();
-        let (driver, _event_rx) = ScalingDriver::new(config.clone());
-        let conn = Arc::new(ConnectionMetrics::new(0, config.rtt_ema_alpha));
+        let driver = RttProber::new();
+        let conn = ConnectionMetrics::new(0, 0.2);
 
         // Use send_ts = 0 explicitly
         driver.record_probe_sent(0, 0);
@@ -604,13 +467,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn scaling_driver_slot_wrap_collision_detected() {
+    async fn rtt_prober_slot_wrap_collision_detected() {
         // If probe_seq wraps around (0 and 256 map to same slot), the newer
         // probe overwrites the old. The old reply should be rejected because
         // its send_ts won't match the stored (newer) timestamp.
-        let config = SharedConnectionConfig::default();
-        let (driver, _event_rx) = ScalingDriver::new(config.clone());
-        let conn = Arc::new(ConnectionMetrics::new(0, config.rtt_ema_alpha));
+        let driver = RttProber::new();
+        let conn = ConnectionMetrics::new(0, 0.2);
 
         let old_ts = driver.timestamp().now_nanos();
         driver.record_probe_sent(0, old_ts); // slot 0
@@ -641,11 +503,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn scaling_driver_mismatched_send_ts_rejected() {
+    async fn rtt_prober_mismatched_send_ts_rejected() {
         // A reply with correct probe_seq but wrong send_ts (spoofed) is rejected
-        let config = SharedConnectionConfig::default();
-        let (driver, _event_rx) = ScalingDriver::new(config.clone());
-        let conn = Arc::new(ConnectionMetrics::new(0, config.rtt_ema_alpha));
+        let driver = RttProber::new();
+        let conn = ConnectionMetrics::new(0, 0.2);
 
         let send_ts = driver.timestamp().now_nanos();
         driver.record_probe_sent(5, send_ts);

@@ -29,6 +29,8 @@ use instancy::communication::{PROGRESS_CHANNEL_BASE, RESERVED_CHANNEL_BASE};
 use crate::support::{Managers, PreEstablished, shared_config};
 
 const HEADER: usize = 28;
+/// Size of each frame checksum (one after the header, one after the payload).
+const CRC: usize = 4;
 
 /// What a frame carries.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -310,15 +312,17 @@ struct FrameReader {
 impl FrameReader {
     async fn next(&mut self, from: &mut ReadHalf<DuplexStream>, ctl: &DirCtl) -> Next {
         loop {
+            // The header, its checksum, then `length` bytes: the payload and
+            // the frame checksum.
             let need = if self.buf.len() < HEADER {
                 HEADER
             } else {
-                HEADER + u32::from_le_bytes(self.buf[24..28].try_into().unwrap()) as usize
+                HEADER + CRC + u32::from_le_bytes(self.buf[24..28].try_into().unwrap()) as usize
             };
             if self.buf.len() >= HEADER && self.buf.len() == need {
                 let frame = std::mem::take(&mut self.buf);
                 let header: [u8; HEADER] = frame[..HEADER].try_into().unwrap();
-                return Next::Frame(header, frame[HEADER..].to_vec());
+                return Next::Frame(header, frame[HEADER + CRC..need - CRC].to_vec());
             }
             let released = ctl.release.notified();
             tokio::pin!(released);
@@ -338,6 +342,27 @@ impl FrameReader {
     }
 }
 
+/// Write a frame with `header`'s dataflow and channel and `payload`, with
+/// fresh checksums (a corrupted payload must reach the peer's decoder, not
+/// its checksum check). Returns false if the link broke.
+async fn write_frame(
+    to: &mut WriteHalf<DuplexStream>,
+    header: &[u8; HEADER],
+    payload: &[u8],
+) -> bool {
+    let frame = instancy::communication::transport::Frame {
+        dataflow_id: instancy::DataflowId::from_bytes(header[..16].try_into().unwrap()),
+        channel_id: u64::from_le_bytes(header[16..24].try_into().unwrap()),
+        payload: payload.to_vec(),
+    };
+    let mut wire = Vec::new();
+    instancy::communication::transport::FramedWriter::new(&mut wire)
+        .write_frame(&frame)
+        .await
+        .unwrap();
+    to.write_all(&wire).await.is_ok()
+}
+
 /// Deliver the parked frames, in order. Returns false if the link broke.
 async fn deliver_parked(to: &mut WriteHalf<DuplexStream>, ctl: &DirCtl) -> bool {
     loop {
@@ -345,7 +370,7 @@ async fn deliver_parked(to: &mut WriteHalf<DuplexStream>, ctl: &DirCtl) -> bool 
             return true;
         };
         ctl.wait_open().await;
-        if to.write_all(&header).await.is_err() || to.write_all(&payload).await.is_err() {
+        if !write_frame(to, &header, &payload).await {
             return false;
         }
     }
@@ -434,7 +459,7 @@ async fn frame_relay(
         ctl.in_hand.store(true, Ordering::SeqCst);
         ctl.wait_open().await;
         ctl.in_hand.store(false, Ordering::SeqCst);
-        if to.write_all(&header).await.is_err() || to.write_all(&payload).await.is_err() {
+        if !write_frame(&mut to, &header, &payload).await {
             break;
         }
         let mut injected: Vec<_> = ctl.inject.lock().unwrap().drain(..).collect();
@@ -447,8 +472,7 @@ async fn frame_relay(
         for (channel_id, payload) in injected {
             let mut extra = header;
             extra[16..24].copy_from_slice(&channel_id.to_le_bytes());
-            extra[24..28].copy_from_slice(&(payload.len() as u32).to_le_bytes());
-            if to.write_all(&extra).await.is_err() || to.write_all(&payload).await.is_err() {
+            if !write_frame(&mut to, &extra, &payload).await {
                 return;
             }
         }

@@ -166,8 +166,21 @@ fn leak_at_a_terminal_sink_is_a_residual() {
 /// and fails with the residual, naming the count the fault left.
 #[cfg(feature = "transport")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
-#[allow(clippy::await_holding_lock)]
 async fn missing_plus_is_a_residual_on_both_nodes_of_a_cluster() {
+    missing_plus_on_a_cluster(false, UNUSED + 5).await;
+}
+
+/// The same over Shared transport, whose progress lane is pinned to one
+/// pooled connection.
+#[cfg(feature = "transport")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn missing_plus_is_a_residual_on_both_nodes_of_a_shared_cluster() {
+    missing_plus_on_a_cluster(true, UNUSED + 8).await;
+}
+
+#[cfg(feature = "transport")]
+#[allow(clippy::await_holding_lock)]
+async fn missing_plus_on_a_cluster(shared: bool, time: u64) {
     use instancy::{ClusterTopology, DataflowId, NodeConfig};
     use support::{Mesh, drop_runtimes, fmt_join, join_with_timeout, spawn_node};
 
@@ -182,12 +195,11 @@ async fn missing_plus_is_a_residual_on_both_nodes_of_a_cluster() {
     let id = DataflowId::new();
     let mut mesh = Mesh::new(&["node-a", "node-b"], 64 * 1024, |_, _| Duration::ZERO);
     let fault = Fault::MissingPlus;
-    let time = UNUSED + 5;
     let ha = spawn_node(
         topology.clone(),
         "node-a",
         id,
-        mesh.dedicated("node-a", 2),
+        mesh.transport("node-a", shared, 2),
         1,
         move |builder| build(builder, fault, time),
     );
@@ -195,7 +207,7 @@ async fn missing_plus_is_a_residual_on_both_nodes_of_a_cluster() {
         topology,
         "node-b",
         id,
-        mesh.dedicated("node-b", 2),
+        mesh.transport("node-b", shared, 2),
         1,
         move |builder| build(builder, fault, time),
     );
@@ -349,14 +361,25 @@ fn a_decode_failure_with_a_residual_fails_with_the_decode_error() {
 /// whose decoder fails.
 #[cfg(feature = "transport")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
-#[allow(clippy::await_holding_lock)]
 async fn a_decode_failure_with_a_residual_fails_a_cluster_with_the_decode_error() {
+    decode_failure_on_a_cluster(false, UNUSED + 7).await;
+}
+
+/// The same over Shared transport.
+#[cfg(feature = "transport")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn a_decode_failure_with_a_residual_fails_a_shared_cluster_with_the_decode_error() {
+    decode_failure_on_a_cluster(true, UNUSED + 9).await;
+}
+
+#[cfg(feature = "transport")]
+#[allow(clippy::await_holding_lock)]
+async fn decode_failure_on_a_cluster(shared: bool, time: u64) {
     use instancy::{ClusterTopology, DataflowId, NodeConfig};
     use support::{Mesh, drop_runtimes, fmt_join, join_with_timeout, spawn_node};
 
     let _serial = serial();
     check::set_mode(Mode::Report);
-    let time = UNUSED + 7;
     let topology = ClusterTopology::multi_node(vec![
         NodeConfig::new("node-a", 1),
         NodeConfig::new("node-b", 1),
@@ -368,7 +391,7 @@ async fn a_decode_failure_with_a_residual_fails_a_cluster_with_the_decode_error(
         topology.clone(),
         "node-a",
         id,
-        mesh.dedicated("node-a", 64),
+        mesh.transport("node-a", shared, 64),
         1,
         move |builder| build_brittle(builder, time),
     );
@@ -376,7 +399,7 @@ async fn a_decode_failure_with_a_residual_fails_a_cluster_with_the_decode_error(
         topology,
         "node-b",
         id,
-        mesh.dedicated("node-b", 64),
+        mesh.transport("node-b", shared, 64),
         1,
         move |builder| build_brittle(builder, time),
     );
@@ -496,8 +519,20 @@ fn an_operator_error_mid_run_fails_promptly_without_a_seal() {
 /// (its peer failed), both promptly, and node-a never seals.
 #[cfg(feature = "transport")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
-#[allow(clippy::await_holding_lock)]
 async fn an_operator_error_mid_run_fails_a_cluster_promptly_without_a_seal() {
+    operator_error_on_a_cluster(false).await;
+}
+
+/// The same over Shared transport.
+#[cfg(feature = "transport")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn an_operator_error_mid_run_fails_a_shared_cluster_promptly_without_a_seal() {
+    operator_error_on_a_cluster(true).await;
+}
+
+#[cfg(feature = "transport")]
+#[allow(clippy::await_holding_lock)]
+async fn operator_error_on_a_cluster(shared: bool) {
     use instancy::{ClusterTopology, DataflowId, NodeConfig};
     use support::{Mesh, drop_runtimes, fmt_join, join_with_timeout, spawn_node};
 
@@ -515,7 +550,7 @@ async fn an_operator_error_mid_run_fails_a_cluster_promptly_without_a_seal() {
         topology.clone(),
         "node-a",
         id,
-        mesh.dedicated("node-a", 64),
+        mesh.transport("node-a", shared, 64),
         1,
         build_poisoned,
     );
@@ -523,7 +558,7 @@ async fn an_operator_error_mid_run_fails_a_cluster_promptly_without_a_seal() {
         topology,
         "node-b",
         id,
-        mesh.dedicated("node-b", 64),
+        mesh.transport("node-b", shared, 64),
         1,
         build_poisoned,
     );

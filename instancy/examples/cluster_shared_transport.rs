@@ -73,16 +73,10 @@ async fn main() {
 
     // Configuration: 2 pooled connections, no scaling during this demo
     let config = SharedConnectionConfig {
-        min_connections: 2,
-        max_connections: 2,
+        connections: 2,
         probe_interval: Duration::from_secs(3600),
-        rtt_scale_up_threshold: Duration::from_secs(3600),
-        rtt_scale_down_threshold: Duration::from_secs(3600),
-        cooldown_period: Duration::from_secs(3600),
-        reorder_timeout: Duration::from_secs(5),
         rtt_ema_alpha: 0.2,
-        idle_timeout: None,
-        enable_frame_crc: false,
+        ..SharedConnectionConfig::default()
     };
 
     let factory = Arc::new(EchoConnectionFactory::default());
@@ -100,7 +94,7 @@ async fn main() {
 
     println!(
         "Created SharedPeerManager with {} eager connections to node-b\n",
-        manager.connection_count().unwrap()
+        manager.connection_count()
     );
 
     // Register two independent dataflows on the same pooled connections
@@ -243,7 +237,7 @@ async fn main() {
     println!("✓ Messages were isolated (no cross-dataflow contamination)");
     println!(
         "✓ All data shared {} pooled connections",
-        manager.connection_count().unwrap()
+        manager.connection_count()
     );
 
     // Cleanup

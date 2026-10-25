@@ -413,7 +413,7 @@ async fn end_to_end_frame_delivery_through_muxer_demuxer() {
     let (node0_write, node1_read) = duplex(65536);
 
     // Node 0: muxer writes frames
-    let (muxer, mux_sender) = Muxer::new(node0_write, MuxConfig { buffer_size: 64 });
+    let (muxer, mux_sender) = Muxer::new(node0_write, MuxConfig { buffer_size: 64 }).unwrap();
 
     // Node 1: demuxer reads frames
     let config = DemuxConfig { channel_buffer: 32 };
@@ -464,7 +464,7 @@ async fn end_to_end_two_dataflows_isolated_on_same_connection() {
 
     let (node0_write, node1_read) = duplex(65536);
 
-    let (muxer, mux_sender) = Muxer::new(node0_write, MuxConfig { buffer_size: 64 });
+    let (muxer, mux_sender) = Muxer::new(node0_write, MuxConfig { buffer_size: 64 }).unwrap();
     let config = DemuxConfig { channel_buffer: 32 };
     let mut demuxer = Demuxer::new(node1_read, config);
 

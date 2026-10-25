@@ -20,6 +20,7 @@ use instancy::communication::shared_pool::SharedConnectionConfig;
 use instancy::communication::shared_transport::{
     ConnectionFactory, DynConnectionFactory, SharedPeerManager,
 };
+use instancy::communication::transport_session::PeerIoEvent;
 use instancy::{ClusterTopology, NodeConfig};
 use instancy::{RuntimeConfig, RuntimeHandle, SpawnOptions};
 
@@ -29,16 +30,10 @@ const TEST_TIMEOUT: Duration = Duration::from_secs(30);
 /// Default shared connection config for tests.
 fn test_shared_config() -> SharedConnectionConfig {
     SharedConnectionConfig {
-        min_connections: 1,
-        max_connections: 2,
+        connections: 1,
         probe_interval: Duration::from_secs(3600),
-        rtt_scale_up_threshold: Duration::from_secs(3600),
-        rtt_scale_down_threshold: Duration::from_secs(3600),
-        cooldown_period: Duration::from_secs(3600),
-        reorder_timeout: Duration::from_secs(10),
         rtt_ema_alpha: 0.2,
-        idle_timeout: None,
-        enable_frame_crc: false,
+        ..SharedConnectionConfig::default()
     }
 }
 
@@ -848,13 +843,11 @@ async fn shared_join_async_keeps_bridges_alive() {
 
 /// Simulates a transient network interruption at the SharedPeerManager level
 /// using in-memory duplex streams (no TCP). Kills the initial connection by
-/// aborting the echo task, then verifies the manager reconnects via the factory
-/// and data flows on the new connection.
-///
-/// Uses a polling loop instead of a fixed sleep to detect reconnect completion,
-/// making this test both fast and deterministic.
+/// aborting the echo task: the dataflow that used it is told (fail-stop, its
+/// frames may be lost), and the next dataflow to register re-establishes the
+/// pool through the factory, and its data flows on the new connection.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn shared_reconnect_after_transient_network_failure() {
+async fn shared_pool_recovers_for_new_dataflows_after_a_transient_failure() {
     use instancy::communication::transport::Frame;
     use tokio::io::{AsyncReadExt, AsyncWriteExt, DuplexStream, ReadHalf, WriteHalf};
 
@@ -925,16 +918,10 @@ async fn shared_reconnect_after_transient_network_failure() {
     }
 
     let config = SharedConnectionConfig {
-        min_connections: 1,
-        max_connections: 2,
+        connections: 1,
         probe_interval: Duration::from_secs(3600),
-        rtt_scale_up_threshold: Duration::from_secs(3600),
-        rtt_scale_down_threshold: Duration::from_secs(3600),
-        cooldown_period: Duration::from_secs(3600),
-        reorder_timeout: Duration::from_secs(10),
         rtt_ema_alpha: 0.2,
-        idle_timeout: None,
-        enable_frame_crc: false,
+        ..SharedConnectionConfig::default()
     };
 
     let factory = Arc::new(ReconnectEchoFactory::new());
@@ -952,7 +939,7 @@ async fn shared_reconnect_after_transient_network_failure() {
 
     // ---------- register a dataflow and verify initial data flow ----------
     let df_id = DataflowId::new();
-    let (mut receivers, _error_rx) = manager.register_dataflow(df_id, &[1], 64).await.unwrap();
+    let (mut receivers, mut error_rx) = manager.register_dataflow(df_id, &[1], 64).await.unwrap();
     let data_rx = receivers.get_mut(&1).unwrap();
 
     // Send a frame — the echo server reflects it back
@@ -975,42 +962,55 @@ async fn shared_reconnect_after_transient_network_failure() {
 
     // ---------- simulate transient network failure ----------
     // Abort the echo task — this closes the remote side of the duplex,
-    // causing the manager's reader_task to detect EOF and report failure.
+    // causing the manager's reader_task to detect EOF.
     factory.abort_first_connection();
 
-    // ---------- wait for reconnect to complete ----------
-    // Poll until live_connection_count recovers to >= 1 (much faster than
-    // a fixed 2s sleep). The failure → monitor → scaling handler → factory
-    // reconnect pipeline typically completes in <100ms with in-memory streams.
-    let reconnect_deadline = tokio::time::Instant::now() + Duration::from_secs(5);
-    loop {
-        tokio::time::sleep(Duration::from_millis(10)).await;
-        if manager.live_connection_count().unwrap() >= 1 {
-            break;
-        }
-        if tokio::time::Instant::now() >= reconnect_deadline {
-            panic!("reconnect did not complete within 5s");
-        }
-    }
+    // ---------- the dataflow that used the connection fails ----------
+    // Frames may have been lost with the connection: its dataflow is told
+    // (never silently continued), and its channels close.
+    let event = tokio::time::timeout(Duration::from_secs(5), error_rx.recv())
+        .await
+        .expect("the failed connection was not reported")
+        .expect("event channel closed");
+    assert!(
+        matches!(
+            event.event(),
+            PeerIoEvent::Closed | PeerIoEvent::WriteFailed(_) | PeerIoEvent::ReadFailed(_)
+        ),
+        "{event:?}"
+    );
+    drop(event);
+    assert!(
+        tokio::time::timeout(Duration::from_secs(5), data_rx.recv())
+            .await
+            .expect("the failed dataflow's channel stayed open")
+            .is_none()
+    );
+    assert_eq!(
+        manager.connection_count(),
+        0,
+        "nothing redials in the background"
+    );
 
-    // ---------- verify data flows on the reconnected connection ----------
+    // ---------- the next dataflow re-establishes the pool ----------
+    let df2 = DataflowId::new();
+    let (mut receivers2, _events2) = manager.register_dataflow(df2, &[1], 64).await.unwrap();
+    assert_eq!(manager.connection_count(), 1);
     let frame2 = Frame {
-        dataflow_id: df_id,
+        dataflow_id: df2,
         channel_id: 1,
         payload: b"after-reconnect".to_vec(),
     };
-    manager
-        .payload_sender()
-        .send((df_id, frame2))
-        .await
-        .unwrap();
+    manager.payload_sender().send((df2, frame2)).await.unwrap();
 
-    let payload = tokio::time::timeout(Duration::from_secs(5), data_rx.recv())
-        .await
-        .expect("timed out waiting for post-reconnect echo")
-        .expect("data channel closed after reconnect");
+    let payload = tokio::time::timeout(
+        Duration::from_secs(5),
+        receivers2.get_mut(&1).unwrap().recv(),
+    )
+    .await
+    .expect("timed out waiting for the echo on the new connection")
+    .expect("data channel closed after reconnect");
     assert_eq!(payload, b"after-reconnect".to_vec());
-
     // ---------- cleanup ----------
     drop(manager);
 }

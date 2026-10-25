@@ -87,16 +87,15 @@ pub(crate) enum LinkEvent {
     ControlClosed,
     /// A control message from the peer could not be decoded.
     ControlUndecodable(String),
-    /// The shared transport reported an error for this peer. Its channels
-    /// stay open.
-    TransportError(TransportError),
     /// A data frame from the peer could not be delivered to the local
     /// operator it was addressed to (the operator had already finished), or
     /// arrived after the channel's close marker.
     InboundDataLost(String),
-    /// The dedicated connection to the peer ended (EOF) or failed; every
-    /// channel from the peer is closing. Reported before those channels
-    /// close (see `PeerIoNotice`).
+    /// The connection to the peer (Dedicated mode), or the pooled connection
+    /// the peer's frames arrive on (Shared mode), ended (EOF) or failed, or
+    /// (Shared mode) a frame from the peer was out of sequence; every channel
+    /// from the peer is closing. Reported before those channels close (see
+    /// `PeerIoNotice`).
     ConnectionFailed(TransportError),
 }
 

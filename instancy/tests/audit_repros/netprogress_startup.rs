@@ -70,7 +70,8 @@ async fn relay(mut from: DuplexStream, mut to: DuplexStream, gate: Arc<Gate>) {
             let ch = u64::from_le_bytes(header[16..24].try_into().unwrap());
             let len = u32::from_le_bytes(header[24..28].try_into().unwrap()) as usize;
             let mut buf = header.to_vec();
-            buf.resize(HEADER + len, 0);
+            // The header's checksum, then the payload and its checksum.
+            buf.resize(HEADER + 4 + len, 0);
             if from.read_exact(&mut buf[HEADER..]).await.is_err() {
                 break;
             }

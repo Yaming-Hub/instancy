@@ -721,6 +721,8 @@ impl ClusterCancelHandle {
 #[cfg(feature = "transport")]
 struct SharedRegistrationCleanup {
     dataflow_id: crate::dataflow::id::DataflowId,
+    /// The token of the registrations to remove (not a later dataflow's).
+    token: u64,
     peer_managers: Option<
         Arc<
             std::collections::HashMap<
@@ -736,6 +738,7 @@ struct SharedRegistrationCleanup {
 impl SharedRegistrationCleanup {
     fn new(
         dataflow_id: crate::dataflow::id::DataflowId,
+        token: u64,
         peer_managers: Arc<
             std::collections::HashMap<
                 String,
@@ -746,6 +749,7 @@ impl SharedRegistrationCleanup {
     ) -> Self {
         Self {
             dataflow_id,
+            token,
             peer_managers: Some(peer_managers),
             runtime_handle: runtime_handle.clone(),
         }
@@ -761,9 +765,10 @@ impl Drop for SharedRegistrationCleanup {
     fn drop(&mut self) {
         if let Some(peer_managers) = self.peer_managers.take() {
             let dataflow_id = self.dataflow_id;
+            let token = self.token;
             self.runtime_handle.spawn(async move {
                 for manager in peer_managers.values() {
-                    manager.unregister_dataflow(&dataflow_id).await;
+                    manager.unregister_registration(&dataflow_id, token).await;
                 }
             });
         }
@@ -800,9 +805,18 @@ struct PeerRegistryState {
     /// Maps peer_node_id → list of registrations referencing that peer.
     entries: std::collections::HashMap<String, Vec<PeerRegistration>>,
     /// Peers that have been reported as down. Registrations against these
-    /// peers are immediately cancelled.
+    /// peers are immediately cancelled. Bounded: the oldest reports are
+    /// forgotten first (see [`MAX_DOWN_PEERS`]).
     down_peers: std::collections::HashSet<String>,
+    /// `down_peers` in the order they were reported.
+    down_order: std::collections::VecDeque<String>,
 }
+
+/// How many departed nodes a [`PeerRegistry`] remembers. A dataflow spawned
+/// against a node forgotten here is no longer cancelled at once; it fails
+/// when it cannot connect or handshake with it.
+#[cfg(feature = "transport")]
+const MAX_DOWN_PEERS: usize = 1024;
 
 #[cfg(feature = "transport")]
 impl PeerRegistry {
@@ -812,6 +826,7 @@ impl PeerRegistry {
             state: Mutex::new(PeerRegistryState {
                 entries: std::collections::HashMap::new(),
                 down_peers: std::collections::HashSet::new(),
+                down_order: std::collections::VecDeque::new(),
             }),
         }
     }
@@ -892,8 +907,15 @@ impl PeerRegistry {
         {
             let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
 
-            // Mark peer as permanently down so future registrations are rejected.
-            state.down_peers.insert(peer_node_id.to_string());
+            // Mark peer as down so future registrations are rejected.
+            if state.down_peers.insert(peer_node_id.to_string()) {
+                state.down_order.push_back(peer_node_id.to_string());
+                while state.down_order.len() > MAX_DOWN_PEERS {
+                    if let Some(oldest) = state.down_order.pop_front() {
+                        state.down_peers.remove(&oldest);
+                    }
+                }
+            }
 
             // Remove the downed peer's bucket and collect non-cancelled handles.
             if let Some(bucket) = state.entries.remove(peer_node_id) {
@@ -940,7 +962,11 @@ impl PeerRegistry {
     /// Returns true if the peer was in the down set.
     fn report_peer_recovered(&self, peer_node_id: &str) -> bool {
         let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
-        state.down_peers.remove(peer_node_id)
+        let was_down = state.down_peers.remove(peer_node_id);
+        if was_down {
+            state.down_order.retain(|peer| peer != peer_node_id);
+        }
+        was_down
     }
 }
 
@@ -2527,13 +2553,8 @@ impl RuntimeHandle {
             tokio::sync::mpsc::Receiver<Vec<u8>>,
         > = std::collections::HashMap::new();
         let dedicated_session: Option<Arc<TransportSession>>;
-        // Error receivers from shared mode (for monitoring tasks).
-        let shared_error_receivers: Option<
-            std::collections::HashMap<
-                String,
-                tokio::sync::mpsc::Receiver<crate::communication::transport::TransportError>,
-            >,
-        >;
+        // Shared mode: the token of this spawn's registrations.
+        let mut shared_registration = None;
         // Shared peer managers Arc (keeps managers alive for the dataflow lifetime).
         let shared_managers_arc: Option<
             Arc<
@@ -2544,8 +2565,8 @@ impl RuntimeHandle {
             >,
         >;
         let mut shared_registration_cleanup = None;
-        // Dedicated mode: per-peer connection events (EOF, read/write failures).
-        let mut dedicated_io_events = None;
+        // Per-peer connection events (EOF, read/write failures, rejected frames).
+        let peer_io_events;
 
         match transport_config {
             ClusterSpawnTransport::Dedicated {
@@ -2645,7 +2666,7 @@ impl RuntimeHandle {
                     runtime_handle,
                 )
                 .map_err(crate::error::CommunicationError::from)?;
-                dedicated_io_events = session.take_io_events();
+                peer_io_events = session.take_io_events();
                 let session = Arc::new(session);
                 transport = Arc::new(ClusterTransport::Dedicated(Arc::clone(&session)));
 
@@ -2657,7 +2678,6 @@ impl RuntimeHandle {
                 }
                 receivers = raw_receivers;
                 dedicated_session = Some(session);
-                shared_error_receivers = None;
                 shared_managers_arc = None;
             }
 
@@ -2732,46 +2752,59 @@ impl RuntimeHandle {
                     }
                 }
 
-                // Register with SharedPeerManagers. The cleanup guard unregisters
-                // if this future is dropped mid-registration or spawn fails later.
+                // Register with SharedPeerManagers, establishing missing pooled
+                // connections first, within the handshake timeout. The cleanup
+                // guard unregisters this spawn's registrations (and only
+                // those: a later dataflow may reuse the id) if this future is
+                // dropped mid-registration or spawn fails later.
+                let registration_token =
+                    crate::communication::shared_transport::new_registration_token();
                 shared_registration_cleanup = Some(SharedRegistrationCleanup::new(
                     dataflow_id,
+                    registration_token,
                     Arc::clone(&peer_managers),
                     runtime_handle,
                 ));
-                let mut session =
-                    match crate::communication::shared_transport::SharedTransportSession::new(
+                let registered = tokio::time::timeout(
+                    handshake_timeout,
+                    crate::communication::shared_transport::SharedTransportSession::with_token(
                         dataflow_id,
+                        registration_token,
                         &peer_managers,
                         &all_channel_ids,
                         capacity,
-                    )
-                    .await
-                    {
-                        Ok(session) => session,
-                        Err(e) => {
-                            // `new` already rolled back its own registrations. The
-                            // guard must not unregister: the rejection may mean the
-                            // dataflow id is registered by another live session.
-                            if let Some(cleanup) = shared_registration_cleanup.as_mut() {
-                                cleanup.disarm();
-                            }
-                            return Err(Error::Communication(e.into()));
-                        }
-                    };
+                    ),
+                )
+                .await;
+                let mut session = match registered {
+                    Ok(Ok(session)) => session,
+                    Ok(Err(e)) => return Err(Error::Communication(e.into())),
+                    Err(_) => {
+                        return Err(Error::Communication(
+                            crate::communication::transport::TransportError::Io(
+                                std::io::Error::new(
+                                    std::io::ErrorKind::TimedOut,
+                                    format!(
+                                        "connecting to the peers took longer than the \
+                                         handshake timeout ({handshake_timeout:?})"
+                                    ),
+                                ),
+                            )
+                            .into(),
+                        ));
+                    }
+                };
 
                 let mut raw_receivers = session.take_receivers().ok_or_else(|| {
                     Error::Runtime(RuntimeError::AlreadyConsumed {
                         resource: "receivers".into(),
                     })
                 })?;
-                let error_rxs = session.take_error_receivers();
+                peer_io_events = session.take_io_events();
 
                 transport = Arc::new(ClusterTransport::Shared {
                     session: Arc::new(session),
-                    error_receivers: None,
                 });
-
                 // Extract control receivers.
                 for (peer_id, peer_map) in raw_receivers.iter_mut() {
                     if let Some(rx) = peer_map.remove(&CONTROL_CHANNEL_ID) {
@@ -2780,7 +2813,7 @@ impl RuntimeHandle {
                 }
                 receivers = raw_receivers;
                 dedicated_session = None;
-                shared_error_receivers = error_rxs;
+                shared_registration = Some(registration_token);
                 shared_managers_arc = Some(peer_managers);
             }
         }
@@ -2990,22 +3023,10 @@ impl RuntimeHandle {
         // Stops the network bridges and the control dispatcher at teardown.
         let bridge_cancel = tokio_util::sync::CancellationToken::new();
 
-        // Shared mode: forward transport errors to the lifecycle coordinator,
-        // which ignores them on retired links (see cluster_lifecycle).
-        if let Some(error_rxs) = shared_error_receivers {
-            for (peer_id, mut error_rx) in error_rxs {
-                let events = events_tx.clone();
-                runtime_handle.spawn(async move {
-                    while let Some(err) = error_rx.recv().await {
-                        #[cfg(feature = "tracing")]
-                        tracing::warn!(peer = %peer_id, error = ?err, "shared transport error");
-                        report_link_event(&events, &peer_id, LinkEvent::TransportError(err));
-                    }
-                });
-            }
-        }
-        // Dedicated mode: forward connection events the same way.
-        if let Some(io_events) = dedicated_io_events {
+        // Forward connection events (both modes) to the lifecycle
+        // coordinator, which ignores them on retired links (see
+        // cluster_lifecycle).
+        if let Some(io_events) = peer_io_events {
             use crate::communication::peer_link::LinkFailure;
             use crate::communication::transport::TransportError;
             use crate::communication::transport_session::PeerIoEvent;
@@ -3028,7 +3049,7 @@ impl RuntimeHandle {
                                 let _ = e;
                                 LinkEvent::OutboundFailed(LinkFailure::SendFailed)
                             }
-                            PeerIoEvent::OversizeDropped(e) => {
+                            PeerIoEvent::FrameRejected(e) => {
                                 LinkEvent::OutboundFailed(LinkFailure::Transport(e))
                             }
                         };
@@ -3040,11 +3061,11 @@ impl RuntimeHandle {
                     }
                 });
             }
-            if let ClusterTransport::Dedicated(session) = &*transport {
-                session.hold_channels_for_io_events();
+            match &*transport {
+                ClusterTransport::Dedicated(session) => session.hold_channels_for_io_events(),
+                ClusterTransport::Shared { session } => session.hold_channels_for_io_events(),
             }
         }
-
         // Create control broadcast for local workers (error propagation + control signals).
         let local_wake_handles: Vec<WakeHandle> = (local_start..local_end)
             .map(|i| wake_handles[i].clone())
@@ -3293,6 +3314,7 @@ impl RuntimeHandle {
                 peer_registry: Arc::clone(&self.peer_registry),
                 peer_registration: peer_reg_id,
                 shared_managers: shared_managers_arc,
+                shared_registration,
                 transport,
                 failure_announced: false,
                 unfinished_announced: false,
@@ -8103,6 +8125,31 @@ mod tests {
     fn peer_registry_unknown_peer_returns_zero() {
         let registry = PeerRegistry::new();
         assert_eq!(registry.report_peer_down("unknown-node"), 0);
+    }
+
+    /// Departed nodes are remembered boundedly: the oldest reports go first.
+    #[cfg(feature = "transport")]
+    #[test]
+    fn peer_registry_remembers_departed_nodes_boundedly() {
+        let registry = PeerRegistry::new();
+        for i in 0..MAX_DOWN_PEERS + 10 {
+            registry.report_peer_down(&format!("node-{i}"));
+        }
+        let state = registry.state.lock().unwrap();
+        assert_eq!(state.down_peers.len(), MAX_DOWN_PEERS);
+        assert_eq!(state.down_order.len(), MAX_DOWN_PEERS);
+        assert!(!state.down_peers.contains("node-0"));
+        assert!(
+            state
+                .down_peers
+                .contains(&format!("node-{}", MAX_DOWN_PEERS + 9))
+        );
+        drop(state);
+        assert!(registry.report_peer_recovered(&format!("node-{}", MAX_DOWN_PEERS + 9)));
+        assert_eq!(
+            registry.state.lock().unwrap().down_order.len(),
+            MAX_DOWN_PEERS - 1
+        );
     }
 
     #[cfg(feature = "transport")]

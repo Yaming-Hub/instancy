@@ -46,8 +46,6 @@ const JOIN_BOUND: Duration = Duration::from_secs(30);
 enum Mode {
     Dedicated,
     Shared,
-    /// Shared transport with frame CRCs (header + payload checksums) enabled.
-    SharedCrc,
 }
 
 type TcpConn = (OwnedReadHalf, OwnedWriteHalf);
@@ -112,17 +110,10 @@ impl ConnectionFactory for PreEstablishedFactory {
     }
 }
 
-fn shared_config(crc: bool) -> SharedConnectionConfig {
+fn shared_config() -> SharedConnectionConfig {
     SharedConnectionConfig {
-        enable_frame_crc: crc,
-        min_connections: 1,
-        max_connections: 1,
+        connections: 1,
         probe_interval: Duration::from_secs(3600),
-        rtt_scale_up_threshold: Duration::from_secs(3600),
-        rtt_scale_down_threshold: Duration::from_secs(3600),
-        cooldown_period: Duration::from_secs(3600),
-        reorder_timeout: Duration::from_secs(10),
-        idle_timeout: None,
         ..SharedConnectionConfig::default()
     }
 }
@@ -192,8 +183,7 @@ where
                 )
             })
         }
-        Mode::Shared | Mode::SharedCrc => {
-            let crc = matches!(mode, Mode::SharedCrc);
+        Mode::Shared => {
             let mut managers = HashMap::new();
             for l in links {
                 let factory: Arc<dyn DynConnectionFactory> = Arc::new(PreEstablishedFactory {
@@ -201,7 +191,7 @@ where
                 });
                 let mgr = SharedPeerManager::new(
                     l.label.clone(),
-                    shared_config(crc),
+                    shared_config(),
                     factory,
                     &handle,
                     tokio::sync::broadcast::channel(16).0,
@@ -1132,7 +1122,7 @@ async fn future_version_peer_is_rejected_with_version_error() {
 /// markers and acknowledgements that teardown waits for.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn version_2_peer_without_shutdown_handshake_is_rejected() {
-    assert_eq!(instancy::communication::CLUSTER_PROTOCOL_VERSION, 5);
+    assert_eq!(instancy::communication::CLUSTER_PROTOCOL_VERSION, 6);
     let err = spawn_against_fake_peer(|df| {
         let mut p = vec![0u8];
         p.extend_from_slice(&2u32.to_le_bytes());
@@ -1171,6 +1161,69 @@ async fn version_3_peer_without_plan_seeding_is_rejected() {
     );
 }
 
+/// A peer on cluster protocol version 5 may spread one dataflow's frames
+/// over several pooled connections, and sends frames without checksums: it
+/// must be rejected at the handshake (a well-formed v5 handshake carried in
+/// today's framing is refused by version).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn version_5_peer_is_rejected() {
+    let err = spawn_against_fake_peer(|df| {
+        let mut p = vec![0u8];
+        p.extend_from_slice(&5u32.to_le_bytes());
+        p.extend_from_slice(&0u64.to_le_bytes());
+        p.extend_from_slice(df.as_bytes());
+        p.extend_from_slice(&6u32.to_le_bytes());
+        p.extend_from_slice(b"node-b");
+        with_crc(p)
+    })
+    .await;
+    assert!(
+        err.contains("protocol version mismatch") && err.contains("remote=5"),
+        "{err}"
+    );
+}
+
+/// A version-5 peer frames its handshake without frame checksums: the
+/// handshake fails (loudly, and within the bound), it is never accepted.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn peer_without_frame_checksums_is_rejected() {
+    use tokio::io::AsyncWriteExt;
+
+    let ((ra, wa), (rb, mut wb)) = tcp_pair().await;
+    let df = DataflowId::new();
+    let fake = tokio::spawn(async move {
+        let _keep_open = rb;
+        let mut payload = vec![0u8];
+        payload.extend_from_slice(&5u32.to_le_bytes());
+        payload.extend_from_slice(&0u64.to_le_bytes());
+        payload.extend_from_slice(df.as_bytes());
+        payload.extend_from_slice(&6u32.to_le_bytes());
+        payload.extend_from_slice(b"node-b");
+        let payload = with_crc(payload);
+        // The version-5 frame layout: header, then the payload.
+        let mut frame = df.as_bytes().to_vec();
+        frame.extend_from_slice(&0u64.to_le_bytes());
+        frame.extend_from_slice(&(payload.len() as u32).to_le_bytes());
+        frame.extend_from_slice(&payload);
+        let _ = wb.write_all(&frame).await;
+        std::future::pending::<()>().await;
+    });
+    let h = spawn_node(
+        Mode::Dedicated,
+        two_nodes(),
+        "node-a",
+        df,
+        vec![Link {
+            label: "node-b".into(),
+            conn: (ra, wa),
+        }],
+        1024,
+        exchange_i64,
+    );
+    let errors = expect_all_rejected(vec![h], "peer without frame checksums").await;
+    fake.abort();
+    assert!(!errors[0].is_empty());
+}
 /// A current-version peer that claims to be a different node.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn peer_claiming_another_identity_is_rejected() {
@@ -1347,11 +1400,6 @@ async fn matching_graphs_three_nodes_complete_dedicated() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
 async fn matching_graphs_three_nodes_complete_shared() {
     matching_exchange_completes(Mode::Shared, &["node-a", "node-b", "node-c"]).await;
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
-async fn matching_graphs_two_nodes_complete_shared_with_frame_crc() {
-    matching_exchange_completes(Mode::SharedCrc, &["node-a", "node-b"]).await;
 }
 
 /// A graph using most builder features (branch, filter, map, both exchange

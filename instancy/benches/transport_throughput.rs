@@ -41,16 +41,10 @@ fn make_frame(dataflow_id: DataflowId, payload: &[u8]) -> Frame {
 
 fn shared_config(num_connections: usize) -> SharedConnectionConfig {
     SharedConnectionConfig {
-        min_connections: num_connections,
-        max_connections: num_connections,
+        connections: num_connections,
         probe_interval: Duration::from_secs(3600), // disable probing during bench
-        rtt_scale_up_threshold: Duration::from_secs(3600),
-        rtt_scale_down_threshold: Duration::from_secs(3600),
-        cooldown_period: Duration::from_secs(3600),
-        reorder_timeout: Duration::from_secs(60),
         rtt_ema_alpha: 0.2,
-        idle_timeout: None, // disable idle cleanup during bench
-        enable_frame_crc: false,
+        ..SharedConnectionConfig::default()
     }
 }
 

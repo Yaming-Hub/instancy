@@ -107,8 +107,14 @@ pub enum ControlProtocolError {
 /// and the graph fingerprint covers the plan's digest; version 5 (port-counted
 /// progress) carries a progress scope id on every progress change, so a
 /// loop's progress travels in its own scope's time, and adds the seal marker
-/// (`u32::MAX - 2`), which a worker sends behind its last progress batch.
-pub const PROTOCOL_VERSION: u32 = 5;
+/// (`u32::MAX - 2`), which a worker sends behind its last progress batch;
+/// version 6 checksums every frame (a header checksum and a frame checksum
+/// are always present, in both transport modes) and, in Shared mode, pins
+/// each dataflow's lane to one pooled connection: the receiver requires each
+/// payload frame to carry exactly the lane's next sequence number and treats
+/// anything else as corruption (a version-5 sender may spread a lane over
+/// several connections, which a version-6 receiver would take for loss).
+pub const PROTOCOL_VERSION: u32 = 6;
 
 /// Protocol version reported for an unversioned (0.1.x) handshake.
 #[cfg(feature = "transport")]
@@ -213,6 +219,20 @@ const MSG_TYPE_HANDSHAKE: u8 = 0;
 const MSG_TYPE_READY: u8 = 1;
 #[cfg(feature = "transport")]
 const MSG_TYPE_CANCEL: u8 = 2;
+
+/// Whether an encoded control message is a handshake (without decoding or
+/// checking it): the first message of a dataflow run.
+#[cfg(feature = "transport")]
+pub(crate) fn is_handshake(payload: &[u8]) -> bool {
+    payload.first() == Some(&MSG_TYPE_HANDSHAKE)
+}
+
+/// Whether an encoded control message is a `Cancel` (without decoding or
+/// checking it).
+#[cfg(feature = "transport")]
+pub(crate) fn is_cancel(payload: &[u8]) -> bool {
+    payload.first() == Some(&MSG_TYPE_CANCEL)
+}
 
 // ---------------------------------------------------------------------------
 // Encode / Decode with CRC32
