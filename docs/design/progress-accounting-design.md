@@ -54,7 +54,7 @@ Rev `0286a9d` is the revision under review. It has since been rebased onto `e7ac
       - the scope export.
     - **Completion checks:** today's signed-sum completion fails even with complete counting and idle-gated force-close. timely's check and exact zero both pass.
     - **Reviews:** GPT-6 Astra reviewed the acyclic model and the loop models for fidelity. Both models were revised.
-    - **Limit:** the recursive-export regression (a scope on an outer feedback path) needs a stateful bridge model.
+    - **Limit:** the recursive-export regression (a scope on an outer feedback path) needed a stateful bridge model. *Since modelled:* [`tla/NestedScopes.tla`](./tla/NestedScopes.tla) (item 15).
 11. **The migration plan is now four steps** (§5.7; §7 questions 4, 11, 12 and 13; label table at the top of Appendix B). This was directed by the user: nobody depends on instancy yet. So no step needs to keep users safe on the way:
     - **dropped:** the PR5 stopgap step and its build-time rejections; the rule that no step may weaken a success condition until counting is complete; the interim loop guard edge and the in-loop restrictions; PR12a's shadow mode; the compatibility questions;
     - **step 1, test harness** (was PR4a);
@@ -79,11 +79,20 @@ Rev `0286a9d` is the revision under review. It has since been rebased onto `e7ac
     - **Broadcast multiplicity has a source** (R35): each planned edge carries a delivery kind, included in the plan digest (§5.1.4).
     - **`J` lives for one logic call, not until the commit** (R36). One commit batches many calls, so `J` must not leak across them. A logic `Done` is only a hint; only S2a shuts an operator down (§5.1.1, §5.1.3).
     - **Egress uses a credit token** (R37), and seals wait for release mailboxes (§2.2, §5.1.1).
+15. **Step-3 implementation rulings** (decision log R38–R49), made as the design authority while step 3 was built:
+    - **Nested scopes** (R38): one pass per apply, exports bottom-up then imports top-down; commits and exact zero use raw counts only; every worker keeps every scope tracker; the scope node has its own id; identity cycles are rejected twice (§5.1.7, item 7).
+    - **"Exhausted" is defined** for the seal condition (R39, §2.2).
+    - **Public-API deltas** approved by the coordinator (R40, R42; §5.6).
+    - **Progress is per location, not per worker,** as in timely (R41): early finishing comes from heterogeneous hosting, not pipeline locality. On today's uniform clusters, no node finishes before every input closes, which corrects an earlier claim that PR7's early-finisher behaviour was kept (R47).
+    - **PR7's drain heuristic** no longer treats an open inbound channel from a stopped peer as needing it; a draining worker fails fast once no more progress can arrive and its view is still non-zero (R48).
+    - **Liveness rule L6** (R44): every cycle has an unbounded channel, so a loop's back-edge is unbounded (§2.6).
+    - **One final call when the input frontier empties** for every closure (R45), so stash-and-flush fails loudly (§5.1.3).
+    - **The recursive-export regression is modelled** in [`tla/NestedScopes.tla`](./tla/NestedScopes.tla) (decision log O1, §5.8, §5.9).
 
 ---
 
-**Status:** design approved; implementation under way. Step 1 (#293) is merged as `ba1bd37`, and step 2 (#295) as `6cb3ced`. Steps 3 and 4 follow (§5.7). Targeted experiments ran on a local branch, `exp-pcp-verify`, last re-run on `e7ac01e`; §5.9 lists what they verified.
-**Date:** 2026-10-23 (first written 2026-10-20). **instancy base:** `main` @ `6cb3ced`, which includes #285–#295, among them PR7 (#291), PR8 (#292), step 1 (#293) and step 2 (#295). Line citations elsewhere in this doc were last checked on `e7ac01e`; §5.1.8 is checked on `ba1bd37`. The step-3 brief carries citations checked on `6cb3ced`.
+**Status:** design approved; implementation under way. Step 1 (#293) is merged as `ba1bd37`, and step 2 (#295) as `6cb3ced`. Step 3 is in progress; step 4 follows (§5.7). Targeted experiments ran on a local branch, `exp-pcp-verify`, last re-run on `e7ac01e`; §5.9 lists what they verified.
+**Date:** 2026-10-24 (first written 2026-10-20). **instancy base:** `main` @ `6cb3ced`, which includes #285–#295, among them PR7 (#291), PR8 (#292), step 1 (#293) and step 2 (#295). Line citations elsewhere in this doc were last checked on `e7ac01e`; §5.1.8 is checked on `ba1bd37`. The step-3 brief carries citations checked on `6cb3ced`.
 **timely reference:** `TimelyDataflow/timely-dataflow` `master` @ `3012f8f` (2026-10-16). The latest release is **timely v0.31.0** (2026-07-14). instancy's `timely` 0.12 dev-dependency (2021) is used only to say what changed.
 **Scope:** audit root causes 1, 2 and 4 (fragile counting, opt-in accounting, duplicated paths), and how a new design interacts with root cause 3 (PR7 #291, merged, and PR8 #292). The bug tracker's PR4, PR5, PR6 and PR12 are replaced by the four steps in §5.7.
 
@@ -150,7 +159,7 @@ Round 7's H1-exposure sequence was not reproduced under default fused scheduling
 - **Each core rule is needed.** Removing any one of them, or reverting it to today's rule, produces a counterexample. That includes the scope import and export. Flattened loops without a guard edge reproduce today's H11 bug.
 - **Today's signed-sum completion** loses a record even with complete counting.
 
-The design's recursive-export regression (§5.1.7) is not yet modelled.
+The design's recursive-export regression (§5.1.7) is modelled too, in [`tla/NestedScopes.tla`](./tla/NestedScopes.tla): a loop on another loop's feedback path, with imports and exports cached between applies. The design passes; exporting the imported frontier never drains, and step 3's `DerivedZero` assertion catches it.
 
 Appendix B logs every finding and how it was resolved.
 
@@ -195,12 +204,12 @@ The correctness audit (kept outside the repository) grouped the progress finding
     - (c) its view holds **no non-zero count** (positive *or* negative) at any location from which one of its hosted locations is reachable in the *data* graph. Reachability here ignores timestamps and includes back-edges, and hosted locations include the locations of every probe handle and output port it serves.
 
     If (c) fails, the worker keeps processing progress; it is *not ready*, not failed. A non-zero count becomes a **proven residual** (an error) only after the *final accounting boundary*: this worker has applied a **seal marker** from every peer and from itself, and the count is still non-zero.
-    - **Sealing is independent of success, but not of failure.** A worker seals its progress stream once it can produce no further updates: all its hosted operators are exhausted or shut down, no capability or input credit is held, and its ledgers and release mailboxes are committed. A worker stuck on a residual still seals. A *failed* worker does not seal (R34): failure is fatal to the whole dataflow through cancellation, so no peer waits for its seal, and a seal over a failed worker's live capabilities would make every peer report a misleading residual instead of the original error.
+    - **Sealing is independent of success, but not of failure.** A worker seals its progress stream once it can produce no further updates: all its hosted operators are exhausted or shut down, no capability or input credit is held, and its ledgers and release mailboxes are committed. An operator is **exhausted** (R39) once every input has seen data-plane end-of-stream from every sender, its input buffers are empty, it holds no capability, it has nothing left to hand over, and its ledger is committed; a source is exhausted once it releases its capability. Exhaustion is latched and never closes outputs; only S2a does. A worker stuck on a residual still seals. A *failed* worker does not seal (R34): failure is fatal to the whole dataflow through cancellation, so no peer waits for its seal, and a seal over a failed worker's live capabilities would make every peer report a misleading residual instead of the original error.
     - The seal marker travels *in order* on the worker's progress stream: as a marker entry in the in-process channel, and as a reserved progress frame in a cluster. There is no self lane, so a worker records its own seal locally, right after self-applying its final batch.
     - A receiver counts a peer as sealed only when it *applies* that marker, after every earlier batch from that peer. Receiving a frame at the bridge is not enough.
     - So two workers that are both exhausted and both stuck on a genuine residual still reach the boundary, and both report it.
 
-    After retirement, peers treat the worker as retired: PR7 already discards progress sent to it. A worker that hosts nothing downstream may therefore finish before the rest of the dataflow, which preserves PR7's early-finisher behaviour.
+    After retirement, peers treat the worker as retired: PR7 already discards progress sent to it. A worker that hosts nothing downstream may therefore finish before the rest of the dataflow. That keeps PR7's early-finisher behaviour **only under heterogeneous hosting**, which is in-process only today. On a cluster every node hosts every operator (uniform parallelism, O8), so every location is in every node's scope, and no node finishes until every node's input has closed and every record is consumed, as in timely (R47). After that, nodes still finish independently: `join()` doesn't wait for a peer's teardown.
   - **S2c, dataflow completion.** Every worker has succeeded under S2b. ◇ No surviving observer is needed. Every location belongs to an operator that at least one worker hosts, so the scoped checks in (c) jointly cover every location.
     - Suppose worker H retired with an exactly-zero scope.
     - Any later change at a location in H's scope needs either new production into it, which requires a capability that could reach it, or consumption of data already in it, which requires a positive count there.
@@ -274,6 +283,7 @@ Once ports make A5 hold by construction, completion could use timely's positive 
 - **L3.** A frontier change wakes the affected operators (see M11, the lost wakeup).
 - **L4.** Accounting never blocks data flow, so there is no cyclic wait between backpressure and progress.
 - **L5.** If progress sends are delayed (demand mode), the delay is bounded. Naiad's accumulation rule is: *"Updates may be accumulated as long as every buffered pointstamp p satisfies one of two properties: either some other element of the local frontier could-result-in p, or … net update … is strictly positive"*.
+- **L6.** Every cycle in the data graph contains at least one unbounded channel (R44). A cycle of bounded channels, whose operators must flush their retry queues before pulling more, can fill up and deadlock for data-plane reasons alone. In a loop scope the back-edge is unbounded and stays worker-local, and every cycle passes through it. A loop body therefore has no internal backpressure; inflow is throttled at the loop's entry, as in timely.
 
 ### 2.7 What changed in timely since 0.12 (instancy was modelled on 0.12)
 
@@ -600,7 +610,7 @@ A request based only on an earlier activation's data, without a held capability,
 - **`unary_async`:** the shell acquires a capability at `t` in the activation that consumes a batch into `pending_input`. It holds the capability through the pending, running and finished-but-not-collected states. It releases it in the activation that hands the result to `CountedOutput`, so the produced count and the release land in one commit (A2). Cancellation and task failure release it only together with failing the operator.
 - **Generic `unary` / `binary` closures** get no implicit capability. Data may wait in `CountedInput`, where it is counted. To keep data across activations correctly, the borrowed **output** handle gains `output.retain(t) -> Retained<T>`: a capability for that output, released on drop. The closure signatures don't change.
   - An operator that holds a `Retained` is re-activated when its input frontier changes. The closure can read `input.frontier()` and `input.is_exhausted()`.
-  - **The final flush call is triggered when the input frontier becomes empty, not by channel exhaustion.** A frontier empties as soon as no upstream work can reach the operator, which happens before end-of-stream.
+  - **The final flush call is triggered when the input frontier becomes empty, not by channel exhaustion.** A frontier empties as soon as no upstream work can reach the operator, which happens before end-of-stream. Every closure-based operator gets this one final call, whether or not it holds a `Retained` (R45); calls on earlier frontier changes happen only while it holds one.
   - **Rule for every shell-owned obligation:** no capability or input credit may be released *only* on channel exhaustion. Inside a loop, end-of-stream arrives only after the loop's operators shut down (S2a), and they can't shut down while a capability that reaches them around the back-edge is held, so the two would wait for each other. Elsewhere, releasing on the frontier still lets results flow before end-of-stream.
   - Inside `iterate`, `retain` uses the nested scope's frontiers (§5.1.7).
 - **What V3 can and cannot catch.**
@@ -637,7 +647,7 @@ An operator instance is shut down by S2a, after which it closes its outputs (end
   - By S1, (c) is safe even though the view may be stale.
   - A worker with an unfinished probe cannot retire. When it does retire, its probe writers finish with an empty frontier.
   - A retired worker's view is frozen, because PR7 discards later progress sent to it. Entries it may keep are outside its scope.
-- **S2c (dataflow completion)** is every worker succeeding. Because every location is hosted somewhere, the scoped checks jointly cover the whole graph (§2.2), so no worker has to stay behind as a final observer. This preserves PR7's early-finisher behaviour, where `join()` doesn't wait for peers to complete.
+- **S2c (dataflow completion)** is every worker succeeding. Because every location is hosted somewhere, the scoped checks jointly cover the whole graph (§2.2), so no worker has to stay behind as a final observer, and `join()` doesn't wait for a peer's teardown. A worker can finish *early*, while peers' inputs are still open, only if it hosts nothing those inputs reach; on today's uniform clusters that never happens (§2.2, R47).
 
 #### 5.1.6 Wire rules
 
@@ -668,6 +678,12 @@ An operator instance is shut down by S2a, after which it closes its outputs (end
    - A message that has left is therefore not part of the internal-work projection.
 5. **Cross-scope atomicity.** All sections of one commit travel in one batch, fragmented positives-first across sections. A receiver applies the parent section and runs the downward import before computing child frontiers.
 6. **Wire format.** Progress entries gain a scope id, and each scope encodes its own timestamp type. This is a progress-frame format change, versioned in the handshake (#286). It ships together with the seal marker in step 3's version bump, to v5 (§5.5).
+7. **Implementation rules** (R38, from step 3's design note):
+   - **One pass per apply.** After applying every section's raw counts, compute exports bottom-up, then propagate top-down: the parent, then the import into the child, then the child, recursively. Exports don't depend on imports, so one pass is exact; `initialize` follows the same order.
+   - **Raw counts only, everywhere decisions count.** Commits carry raw counts only, never import or export entries. Exact zero and residual reports ignore the derived locations: child `Source(0, i)` and the parent's `Source(scope, o)`. A debug assertion checks that a worker's derived entries are empty whenever its raw counts in scope are zero.
+   - **Every worker has every scope tracker**, whether or not it hosts a body operator, because its parent view needs the scope's export. A4 seeding applies in each scope.
+   - **The scope node gets its own id** in the parent, outside the operator range, so no lookup can confuse it with the `enter` operator.
+   - **Identity cycles are rejected twice:** at `iterate`, with a clear error, and by a general check in the tracker builder on every scope graph.
 
 Required regressions:
 - A parent input stays open while the child temporarily holds no messages. An aggregate inside the loop must not fire.
@@ -859,7 +875,12 @@ There are no compatibility constraints. Nobody depends on instancy yet; downstre
   - `notify_at` and `retain` must be justified by input consumed in this activation or by a held capability. The input frontier alone no longer suffices (§5.1.3);
   - error envelopes are fatal on every transport;
   - data held in a closure's input queue holds that input's frontier;
-  - a probe includes data queued on the probed stream.
+  - a probe includes data queued on the probed stream;
+  - every closure-based operator gets one final call when its input frontiers empty (R45), so stash-and-flush without `retain` fails with `Unjustified` instead of losing data silently;
+  - on a cluster, a node finishes only once every node's input has closed and every record is consumed, as in timely; PR7's per-node early finish is gone on uniform clusters (R47);
+  - a loop's feedback channel is unbounded, and `with_capacity` on the feedback pipe is ignored (R44, liveness rule L6);
+  - under the `transport` feature, `iterate` requires `TInner: ExchangeData`, as `exchange` already requires of its types (R42, breaking).
+- **Additions and removals approved during step 3** (R40): `InputHandle::frontier()`; `Retained<T>` (`Send`, not `Clone`); `EdgeInfo.delivery` and `Delivery { One, AllTargetHosts }`; `ProgressError` gains `Unjustified`, `UpstreamError`, `RecordAfterShutdown` and `Residual`, and loses `InvalidNotificationTime`; `ChannelSourceOperator` and `ChannelSinkOperator` leave the re-exports.
 - **Public-but-internal types:** `SchedulableOperator`, `OperatorFactory`, `ChannelEndpoints`, `Push`, `Pull` and `DataflowExecutor` (`dataflow/mod.rs:34`, `:40`; `channels/mod.rs:26`), plus `InputHandle::{new, push_vec, mark_exhausted}` and `OutputHandle::drain` (`handles.rs:35-55`, `:196-202`). They become sealed or crate-private. That is a breaking change, which costs nothing today; there's no public way to register a custom factory anyway.
 - **CHANGELOG** entries are needed for the behaviour changes and for removing `set_inflight_reporter`.
 
@@ -948,10 +969,12 @@ This tests the protocol and PCP's claimed refinement (§2.5), not just examples.
 - enter and leave as port counts;
 - commits split across both levels.
 
+[`tla/NestedScopes.tla`](./tla/NestedScopes.tla) puts one loop on another's feedback path, three levels deep, and caches imports and exports between applies, recomputing them in one pass per apply as step 3 implements them. Its mutation exports the imported frontier.
+
 Switches select PCP, today's rules, or PCP with one rule removed. Each scenario in [`tla/make-models.ps1`](./tla/make-models.ps1) declares its exact expected result, and [`tla/run.ps1`](./tla/run.ps1) checks it. Results and limits are in §5.9 and the [model README](./tla/README.md).
 
 Next models, in order of risk:
-1. **The recursive-export regression.** A stateful bridge with cached import and export, and a scope on an outer feedback path. Mutations: export the child frontier, and broadcast the export.
+1. ~~**The recursive-export regression.**~~ Done: `NestedScopes.tla` (decision log O1). Broadcasting the export is left to a debug assertion and the Rust protocol test (R38).
 2. **Binary operators and `retain`.** Justification across inputs with different summaries.
 3. **Scoped retirement through a back-edge,** with heterogeneous hosting of loop operators.
 
@@ -1029,6 +1052,8 @@ Every scenario's result matched its expectation exactly. Full table: [model READ
 | PCP must pass | direct, two-epoch chain with splitting (13.75M states), pipeline, async + broadcast, fan-out of two exchanges, broadcast to a subset, heterogeneous stages, sink egress, three workers (11.7M and 30.3M states); liveness: every worker eventually succeeds, and a count is reported while the input stays open | all pass: no S1, S2c or S3 violation, no deadlock, liveness holds |
 | Loops flattened as today, with the guard edge an earlier plan proposed (no longer planned), must pass | loop with an exchange inside, explicit leave and a count after it (4.3M states); liveness; progress while the input stays open | all pass: the count after the loop never fires while a record can still leave the loop |
 | Nested scopes (step 3), must pass | two records, whole commits; one record, commits split positives-first across both levels; liveness; progress of both counts while the input stays open, including after a lap | all pass: S1 inside and after the loop |
+| A loop on another loop's feedback path (O1), must pass | three levels with cached imports and exports; whole and split commits; capped outer iterations; two real outer laps; liveness; progress while the input stays open | all pass: S1 at every level, and the cached links equal a fresh recompute (`CacheExact`) |
+| Recursive-export mutation (O1) | the inner loop exports its imported frontier | never drains: deadlock, a `DerivedZero` violation, and no progress while the input is open |
 | Completion checks under idle-gated force-close, with records in transit | today's signed sum; timely's positive count; exact zero | **signed sum loses a record** (C1, even with complete counting); positive and exact zero pass |
 | Mutations of PCP, or today's rules | opt-in counting (C2, H1); per-output key (H12); capabilities-first split; frontier-justified `notify_at` (P-9); async without capability; local-only seeding (H13); sink releasing credit early (C-15) | each produces a counterexample to S1, or completes with a pending send |
 | Loop mutations | no guard edge (today's tracker); frontiers observed inside a flattened loop body; a count inside a flattened body; no scope import; no scope export; split by level, parent first or child first | each produces a counterexample. No guard edge reproduces "probe after a loop is done too early" (H11). |
@@ -1053,7 +1078,7 @@ GPT-6 Astra reviewed the acyclic model, then the loop models, for fidelity. Neit
   - progress checks while the input stays open.
 
 **Still reasoning only, not yet tested by experiment or model:**
-- the recursive-export regression: a scope on an outer feedback path must eventually export nothing, and cached import and export must not support each other;
+- broadcasting a scope's export (a debug assertion in step 3, R38);
 - scoped retirement through a back-edge;
 - binary operators, `retain` and the full justification set `J`;
 - the refinement to ITP's exchange model for all sizes;

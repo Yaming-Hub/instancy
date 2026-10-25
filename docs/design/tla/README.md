@@ -13,9 +13,10 @@ There are three kinds of scenario:
 - **Bug scenarios** use today's rules, or the design with one rule removed. Each must break in the named way. That shows the model is detailed enough to catch the real bug, and that the rule is needed.
 - **Sanity scenarios** show that the interesting outcomes actually happen, for example that a run with real traffic, including a loop, can finish. Without them a "pass" could be empty.
 
-There are two specs:
+There are three specs:
 - **[`PortCountedProgress.tla`](./PortCountedProgress.tla)** is generic over small graphs. It covers acyclic dataflows, and loops folded into the outer book as instancy tracks them today, with and without the guard edge an earlier plan proposed. That loop handling is no longer planned (design doc §5.1.7). The model is kept because, without the guard, it reproduces today's "probe after a loop" bug (H11).
 - **[`LoopScopes.tla`](./LoopScopes.tla)** is a focused model of nested loop scopes, the end state built in step 3 of the plan, with timestamps of the form (minute, lap).
+- **[`NestedScopes.tla`](./NestedScopes.tla)** puts one loop on another loop's feedback path, three levels deep, and keeps the links between levels cached as an incremental tracker does (decision log O1).
 
 **Old labels in the files.** Comments in the specs, MC modules and `make-models.ps1` still use the earlier plan's labels: "PR4c", "PR5", "PR6a" and "interim". All of them are now part of step 3 (design doc §5.7; label table in Appendix B), and "interim" means flattened loops. The comments were left unchanged so that the spec and config hashes recorded with the results still match.
 
@@ -26,13 +27,15 @@ There are two specs:
 | `FrontierSafe` | While any work is outstanding, every live worker's book still shows something that could produce it, so no frontier passes outstanding work. Work includes records on edges, records a sink has not handed over yet, and anything an operator holds. | S1 (§2.2). This is the property that Naiad, FORTE 2013 and ITP 2021 prove for timely. |
 | `ObserverSafe` | The claim an earlier plan made for flattened loops. At every location *outside* loop bodies, the tracker never lets a frontier pass work that can still reach that location through the real data graph, laps included. | §5.1.7 (no longer planned) |
 | `ScopeSafe`, `ParentSafe` | Nested scopes. Frontiers inside the loop, in (minute, lap) time, and after it, in minutes, never pass outstanding work. | §5.1.7, scope bridge |
+| `InnerSafe`, `OuterSafe`, `RootSafe` | The same at each of three levels, with the inner loop on the outer loop's feedback path. | §5.1.7 |
+| `DerivedZero` | When every raw count in a worker's book is zero, its cached imports and exports are empty too. This is the debug assertion the design authority required (decision log R38). | §5.1.7: "its exported capability set must become empty" |
 | `NoDataAtDone` | No record ever reaches an operator that has shut down. | S3 |
 | `NoLateData` | A counting operator never receives a record at or before a time it has already reported. | The user-visible effect of S1. |
 | `CompleteMeansEmpty` | When every worker reports success, no work is left anywhere, including pending sends to the user. | S2c |
 | `NoResidual` | Once every worker's seal has been applied, all counts are zero. | S2b, V5 |
 | no deadlock | The run never gets stuck before every worker succeeds. | §2.6 |
 | `EventuallyDone` | Under fair scheduling, every worker eventually succeeds. | L1–L4 |
-| `NotifyProgress`, `ScopeProgress` | Under fair scheduling, with the input held open at the last epoch, counts at earlier epochs are still eventually reported, inside and after loops. | Frontiers advance while the input is open. |
+| `NotifyProgress`, `ScopeProgress`, `UProgress` | Under fair scheduling, with the input held open at the last epoch, counts at earlier epochs are still eventually reported, inside and after loops. | Frontiers advance while the input is open. |
 
 ## What is modelled
 
@@ -79,6 +82,10 @@ A commit may be split across both levels, positives first. To keep the search sm
 - each activation is committed before the same worker's next one (batching is checked in the generic spec);
 - a worker shuts down all its eligible operators in one step. That is the harshest timing for S3, because an eligible operator has nothing left to do.
 
+**In `NestedScopes.tla`** (decision log O1). Three levels: `in → [outer loop O] → count u`, where O's body is `[inner loop I] → branch → (exchange) feedback (outer lap + 1) → I`, or `→ leave`, and I's body is `branch → feedback (inner lap + 1) → branch`, or `→ leave`. Every outer lap passes through I, so I lies on O's feedback path. Each worker keeps one book of raw port counts per level, and **caches** the four derived links (two imports, two exports) between applies. Every apply, of its own commit or of a peer's batch, recomputes them in one pass: exports bottom-up, then imports top-down. This is the order step 3 implements. The derived links are never sent, and exact zero reads raw counts only.
+
+The mutation `Export = "frontier"` exports a scope's frontier at its exit, which includes its import. On O's feedback path, I's export then supports O's frontier at I's input one lap later, which is I's next import. With real, unbounded iteration counters that support climbs one lap per pass and never ends. With `Sat = TRUE` the model caps O's feedback at `MaxJ`, which turns the endless climb into a fixed point TLC can see. The cap only adds paths, so it can make a run hang but never makes one finish early; safety is also checked without it.
+
 ## Switches
 
 The scenarios are defined in **one table, in [`make-models.ps1`](./make-models.ps1)**. It writes `models/*.cfg`, which are generated and not committed. The proposal's values are:
@@ -94,21 +101,22 @@ The scenarios are defined in **one table, in [`make-models.ps1`](./make-models.p
 | `BcastMult` | `"hosts"` | `"workers"` (wrong when a broadcast reaches a subset) |
 | `Egress` | `"keep"`: the sink keeps its input credit until the receiver accepts | `"release"`: credit released when the sink takes the record (today, C-15). `"none"`: the sink hands over at once. |
 | `Guards` | the guard edge `Out(feedback) → Tgt(leave)` | none: today's tracker, which misses the feedback path |
-| `Import`, `Export` | `TRUE`, `"internal"` | `FALSE`; `"none"` |
-| `Transit`, `KeepOpen`, `MaxLaps`, `MaxIter` | modelling options, not design choices | — |
+| `Import`, `Export` | `TRUE`, `"internal"` | `FALSE`; `"none"`. `NestedScopes` adds `"frontier"`: the scope also exports its imported frontier. |
+| `Transit`, `KeepOpen`, `MaxLaps`, `MaxIter`, `Sat` | modelling options, not design choices | — |
 
 ## Results
 
 All scenarios ran with TLC 2.19 (rev 5a47802), against these specs:
 - `PortCountedProgress.tla`, sha256 `8DE13BE6FFCA…`;
-- `LoopScopes.tla`, sha256 `4CA89DD127BB…`.
+- `LoopScopes.tla`, sha256 `4CA89DD127BB…`;
+- `NestedScopes.tla`, sha256 `FC07CE14C1A4…`.
 
 **Every result matched its expectation exactly.**
 
 Bounds:
 - **Workers:** 2, or 3 where the name ends in `3`.
 - **Timestamps:** `0..MaxT`, with `MaxT = 1` unless "one timestamp" is noted.
-- **Traffic:** each worker's input sends 1 record (2 in the force-close controls). In `LoopScopes`, 2 records in total.
+- **Traffic:** each worker's input sends 1 record (2 in the force-close controls). In `LoopScopes`, 2 records in total. In `NestedScopes`, 1 record in total.
 - **Laps:** one lap in total.
 - **Splitting:** "whole" means commits are never split.
 
@@ -197,12 +205,30 @@ The graph is `MC_Loop`: in → branch; branch -exchange-> feedback → branch (r
 | `scope_parentfirst` | `ScopeSafe` | **Fails as expected.** A split commit sends the parent's part first: right after a record enters, a peer applies the parent `−1` before the loop's `+1`, and the record briefly has no support. |
 | `scope_childfirst` | `ParentSafe` | **Fails as expected.** A split commit sends the loop's part first: right after a record leaves, a peer sees it neither inside nor outside. |
 
+### A loop on another loop's feedback path (`NestedScopes.tla`, decision log O1)
+
+Bounds: 2 workers, one epoch (two with the input held open), outer laps `0..1` and inner laps `0..1`, 1 record, one lap of each loop. The outer lap goes to either worker.
+
+| Scenario | Expected | Result |
+|---|---|---|
+| `nest_pcp` | pass | **Pass**, 538,731 states (whole commits): no frontier at any of the three levels passes outstanding work, nothing is lost, nothing hangs, the cached links always equal a fresh recompute (`CacheExact`), and they are empty whenever raw counts are (`DerivedZero`). |
+| `nest_pcp_sat` | pass | **Pass**, 500,541 states: the same with the outer feedback capped at `MaxJ`, standing in for unbounded iteration counters. |
+| `nest_pcp_split` | pass | **Pass**, 329,871 states: commits split positives-first across all three levels. One record passes through both loops with no laps; with laps the space grew past 13 million states without finishing. |
+| `nest_pcp_twolaps` | pass | **Pass**, 974,079 states: two real outer laps, so a record re-enters the inner loop twice (no inner laps). |
+| `live_nest` | pass | **Pass**: every run finishes under fair scheduling, including an outer lap through the inner loop (250,238 states). |
+| `live_nest_open` | pass | **Pass**: with the input held open at epoch 1, the count after the outer loop still reports epoch 0 (82,264 states). |
+| `nest_reach` (simulated) | violated | A record laps the inner loop, crosses workers on an outer lap, re-enters the inner loop at outer lap 1, the count reports, and the run completes. |
+| `nest_frontierexport` | deadlock | **Fails as expected.** The inner loop exports its frontier, import included. After the input closes, its export `{(0,1)}` keeps supporting its own import `{(0,1)}` through the outer feedback, the outer export `{0}` holds the count, and the run never finishes. |
+| `nest_frontierexport_derived` | `DerivedZero` | **Fails as expected.** The same mutation is caught by the assertion step 3 adds: every raw count is zero, but the cached export is not. |
+| `live_nest_open_frontierexport` | temporal | **Fails as expected.** With the input held open, epoch 0 is never reported. |
+
 ## What this does and does not show
 
 **It shows,** for these graphs and bounds:
 - **Acyclic dataflows.** The proposal's rules never let a frontier pass outstanding work, never drop a record, never complete with work left (pending sends included), and never get stuck. Every worker eventually finishes, and frontiers advance while an input is still open.
 - **Flattened loops.** With the guard edge, counts after a loop are safe and the dataflow finishes. Without it, today's bug appears. Frontiers inside flattened loop bodies really are unsafe, which is why the end state uses nested scopes.
 - **Nested scopes.** The import and the internal-only export are both necessary. With both, counts inside and after the loop are safe, everything finishes, and both counts make progress while the input is open. Commits must be split positives-first across levels; splitting by level fails both ways.
+- **A loop on another loop's feedback path** (`NestedScopes`). With imports and exports cached between applies and recomputed in one pass (exports bottom-up, then imports top-down), every level stays safe, everything finishes, and the count after the outer loop reports earlier epochs while the input is open. Exporting the imported frontier is not just wasteful: on a feedback path it supports itself and never drains, and `DerivedZero` catches it.
 - **Each core rule is needed.** Removing any one of these breaks safety, and TLC finds the breaking sequence:
   - per-edge counting;
   - positives-first splitting;
@@ -217,15 +243,15 @@ The graph is `MC_Loop`: in → branch; branch -exchange-> feedback → branch (r
 - **Accounting faults are loud.** A wrong multiplicity hangs instead of losing data, and a missing `+n` is reported at the seal boundary.
 
 **It does not show:**
-- **The design's recursive-export regression** (§5.1.7): a scope on an *outer* feedback path must eventually export nothing. The models have no outer loop, and their import and export are computed fresh from the books rather than cached. So exporting the child's whole frontier, or broadcasting the export, can't be expressed. This needs a small stateful bridge model with cached import/export; it is the next step for loops.
+- **Broadcasting the export.** `NestedScopes` never sends derived links. Step 3 makes that a debug assertion (decision log R38), and the Rust protocol property test's `BroadcastDerived` mutants check it.
 - **Scoped worker success through a back-edge** (S2b(c) uses data reachability, back-edges included). The loop graphs host every operator on every worker, so they don't exercise it.
-- **Exact implementation timing of the import.** The model computes it fresh at every step. The design requires the receiver to apply the parent section and refresh the import before computing child frontiers.
+- **Exact implementation timing of the import.** `LoopScopes` computes it fresh at every step; `NestedScopes` caches it and recomputes it once per apply, in the order step 3 implements.
 - **Several features:**
   - binary operators, and justification across inputs with different summaries;
   - `retain` and its cross-task release;
   - failures and transport loss;
   - batches of more than one record;
-  - more than one loop.
+  - sibling loops, and more than two levels of nesting.
 - **The real executor's scheduling.** Scheduling, wake-ups and backpressure are abstracted away; liveness assumes fair scheduling.
 - **Larger systems.** Model checking covers only these bounds. It is strong evidence, not a proof for every size; that would need TLAPS or Isabelle (design doc §5.8).
 - **That the Rust code matches the model.** The conformance matrix, the debug checker and the planned code-level checks cover that.
@@ -258,6 +284,16 @@ GPT-6 Astra reviewed each model for fidelity. Neither review found a counterexam
 | The interim graph had no explicit leave | medium | Added a leave operator; the guard edge now ends at its input, which is checked |
 | Loop scoped retirement not exercised | medium | Stated as a limit |
 | No progress check while a later epoch is open | medium | Added `live_loop_open` and `live_scope_open` |
+
+**Third review, of `NestedScopes.tla`** (a rubber-duck review; no counterexample to the proposal, no `UNCHANGED` or `EXCEPT` errors):
+
+| Finding | Severity | Resolution |
+|---|---|---|
+| The sanity witness didn't prove that the cross-worker outer lap and the re-entry into the inner loop happened | medium | Added a `Track` switch and `hist` flags; `nest_reach` now requires both |
+| The mutation changed both loops, and extra propagation passes were allowed with an uncommitted ledger | medium | The mutation changes only the inner loop; extra passes need a committed ledger |
+| No invariant stated that a loop never exports its import while raw counts are non-zero | medium | Added `CacheExact`: the cache always equals a fresh recompute from raw counts; `DerivedZero` is also checked after success |
+| Only one real outer lap | low | Added `nest_pcp_twolaps` |
+| Results lacked the new spec's hash | low | Added |
 
 ## Running it
 
