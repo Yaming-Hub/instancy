@@ -140,10 +140,10 @@ struct BuilderState<T: Timestamp> {
     contexts: SharedContext,
     /// Whether to catch panics in operator activation.
     catch_panics: bool,
-    /// Optional override for the executor's `max_idle_sweeps` (force-close
-    /// quiescence threshold). `None` uses the runtime default. Primarily a test
-    /// seam: correctness must hold regardless of how eagerly the executor
-    /// declares quiescence.
+    /// Optional override for the executor's `max_idle_sweeps` (how many
+    /// sweeps without progress before an idle worker parks). `None` uses the
+    /// runtime default. Primarily a test seam: correctness must hold
+    /// regardless of how eagerly a worker parks.
     max_idle_sweeps: Option<usize>,
     /// Projection of this scope's timestamps onto the dataflow's root
     /// timestamp. `None` at the root; set for `iterate` bodies so outputs
@@ -483,14 +483,14 @@ impl<T: Timestamp> DataflowBuilder<T> {
         self
     }
 
-    /// Override the executor's `max_idle_sweeps` — the number of consecutive
-    /// no-progress sweeps the executor tolerates before force-closing quiescent
-    /// operators (feedback cycles that have converged).
+    /// Override the executor's `max_idle_sweeps`: the number of consecutive
+    /// sweeps without progress after which an idle worker parks until
+    /// something (data, progress from a peer, a released capability) wakes it.
     ///
-    /// This is a latency/responsiveness knob: lower values shut a completed
-    /// dataflow down sooner at the cost of more eager quiescence checks. Leaving
-    /// it unset uses the runtime default. Correctness is independent of this
-    /// value — a converged dataflow yields the same results at any threshold.
+    /// This is a CPU/latency knob: lower values park sooner, higher values
+    /// spin longer before parking. Leaving it unset uses the runtime default.
+    /// Completion is decided by the progress tracker alone, so results never
+    /// depend on this value.
     pub fn max_idle_sweeps(&self, sweeps: usize) -> &Self {
         self.state.borrow_mut().max_idle_sweeps = Some(sweeps);
         self
@@ -2328,6 +2328,34 @@ impl<T: Timestamp, D: Clone + Send + 'static> Pipe<T, D> {
     /// `summary` must advance the iteration counter: a loop whose summary
     /// does not (for example `0u32`) would be an identity cycle, whose
     /// frontier could never advance, and the dataflow fails to build.
+    ///
+    /// # Inner timestamps
+    ///
+    /// The iteration counter `TInner` is usually `u32` or `u64`. With the
+    /// `transport` feature it must also be
+    /// [`ExchangeData`](crate::communication::codec::ExchangeData) (see
+    /// [`IterateInner`]), because on a cluster a loop's progress crosses the
+    /// network. The built-in integer types qualify, and so does `Product` (a
+    /// nested loop's time):
+    ///
+    /// ```
+    /// use instancy::order::Product;
+    /// use instancy::{DataflowBuilder, IterateResult};
+    ///
+    /// let builder = DataflowBuilder::<u64>::new("laps");
+    /// builder
+    ///     .input::<u64>("in")?
+    ///     .iterate::<u64>("laps", 1u64, |var| {
+    ///         let next = var.map("inc", |_t: &Product<u64, u64>, x| x + 1);
+    ///         IterateResult {
+    ///             feedback: next.clone().filter("again", |_t, x| *x < 10),
+    ///             output: next.filter("done", |_t, x| *x >= 10),
+    ///         }
+    ///     })
+    ///     .output("out")?;
+    /// let _dataflow = builder.build()?;
+    /// # Ok::<(), instancy::Error>(())
+    /// ```
     ///
     /// # Backpressure
     ///

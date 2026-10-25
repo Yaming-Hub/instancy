@@ -7,6 +7,104 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Port-counted progress (step 3 of the progress-accounting redesign)
+
+- Progress is now counted at operator ports, as in timely dataflow. Every
+  operator runs inside an operator shell that counts the records it consumes
+  and produces at each port. A record is counted at its target from the
+  commit that produces it until the commit that consumes it, wherever it is:
+  in a channel, a network queue, or an operator's input buffer. A frontier
+  therefore never passes a record that still exists. This fixes premature
+  completion and lost or late records in multi-worker and cluster
+  dataflows, including loops, exchanges after loops, broadcasts and
+  fan-outs (audit C1, C2, H1, H10–H13). The executor no longer force-closes
+  quiescent operators after idle sweeps, and no longer reports success when
+  every local operator is done. A worker finishes only once its view of
+  every location that can reach its operators is empty, and the decision is
+  taken after its progress is propagated.
+- Each `iterate` loop, nested loops included, is its own progress scope in
+  `Product` time, bridged to its parent. Probes, `retain` and
+  `unary_notify` inside a loop body observe the body's own frontiers.
+- A worker that has finished seals its progress stream. Once a worker has
+  applied every worker's seal, no further update can arrive. A count still
+  left in its view is an accounting bug, reported as
+  `ProgressError::Residual` ("progress residual at completion") instead of
+  a hang. A worker that fails never seals: the dataflow fails with its
+  error, through cancellation.
+- **Behaviour change:** output at a time that no capability the operator
+  holds, and no input it consumed in the same call, justifies is an error
+  in every build (`ProgressError::Unjustified`). So is a capability request
+  (`notify_at`, `retain`, a downgrade) at such a time. A notification
+  justified only by the input frontier, which used to be accepted, is now
+  rejected. To emit stashed data in a later call, hold it with
+  `OutputHandle::retain`.
+- **Behaviour change:** every closure-based operator (`unary`, `binary`,
+  the `notify` family) gets exactly one final call when its input
+  frontiers become empty, whether or not it holds a `Retained`. Stashing
+  data without `retain` and emitting it in that call fails loudly
+  (`Unjustified`) instead of silently dropping it.
+- **Behaviour change:** error envelopes are fatal at an operator's input on
+  every transport (`ProgressError::UpstreamError`).
+- **Behaviour change:** data in a closure's input queue holds that input's
+  frontier, and a probe includes data still queued on the probed stream.
+- **Behaviour change:** every probe is done after a successful run,
+  including on `SimpleRuntime::spawn_multi`, on clusters, and inside loop
+  bodies. Probes used to keep a stale frontier there.
+- **Behaviour change:** a loop's back-edge is never bounded, and a capacity
+  set on the pipe returned as `feedback` is ignored. A cycle of bounded
+  channels can always fill up and deadlock. A loop body therefore gets no
+  internal backpressure: inflow is still throttled at the loop's entry, and
+  memory is bounded by the loop's working set, as in timely.
+- **Behaviour change:** on a cluster, a node finishes only once every
+  node's input has closed and every record is consumed, as in timely.
+  `join` still doesn't wait for a peer's teardown. Early finish still
+  applies to in-process plans whose stages run on different workers. On a
+  cluster, early finish only ever mattered when no records could flow from
+  the still-open node to the finished one: with any exchange or broadcast,
+  it was reachable only through premature completion.
+- **Behaviour change:** when a peer stops in the middle of a graceful drain
+  (`drain_on_cancel`) while the drain still needs it, the draining node
+  fails promptly with "peer … stopped before finishing its part of the
+  cancelled dataflow, which the drain needs", instead of waiting for the
+  drain deadline. A stopped peer whose late records or progress are still
+  arriving is given a 500 ms quiet grace.
+- **Behaviour change:** a loop whose summary doesn't advance the iteration
+  counter (for example `0u32`) is an identity cycle, and the dataflow
+  fails to build.
+- Add `OutputHandle::retain(time)`, which returns a `Retained` capability
+  that keeps `time` open across calls. `Retained` is not `Clone`. Dropping
+  it releases the time, from any thread, and wakes the operator.
+- Add `InputHandle::frontier()`, and `Delivery` on graph edges (how many
+  copies of a record its edge delivers; part of the plan digest).
+- **BREAKING:** with the `transport` feature, `Pipe::iterate`'s inner
+  timestamp must be `ExchangeData` (the new `IterateInner` trait), like the
+  timestamps of exchanged data: a loop's progress crosses the network on a
+  cluster. `u32`, `u64` and the other built-in integer types already
+  qualify. `Product<A, B>` is `ExchangeData` when `A` and `B` are, so nested
+  loops work too.
+- **BREAKING:** `ProgressError::InvalidNotificationTime` is replaced by
+  `ProgressError::Unjustified`. New variants: `UpstreamError`,
+  `RecordAfterShutdown` and `Residual`.
+- **BREAKING:** operators are built only through `DataflowBuilder`. The
+  re-exports of `DataflowExecutor`, `ExecutorConfig`, `SchedulableOperator`,
+  `OperatorFactory`, `ChannelEndpoints`, `ActivationOutcome`,
+  `ChannelSourceOperator` and `ChannelSinkOperator` are removed. `Push` and
+  `Pull` are sealed, and their `set_inflight_reporter` is removed.
+  `InputHandle::{new, push_vec, mark_exhausted}` and `OutputHandle::drain`
+  are crate-private.
+- **BREAKING (wire format):** cluster protocol version 5
+  (`PROTOCOL_VERSION`). A progress commit carries one section per loop
+  scope, and a commit split into several frames sends every positive change,
+  of every section, before any negative one. Progress streams carry seal and
+  abandon markers.
+- The progress checker panics on a violation by default in debug builds.
+  `INSTANCY_PROGRESS_CHECK` still selects the mode. It checks output
+  justification (V3, recorded alongside the production error), proven
+  residuals (V5), and that a sealing worker holds no work (V4). The
+  conformance matrix and the audit repros are judged strictly: the golden
+  file and the expected-failure tables are empty. The protocol property test
+  models loop scopes and catches five more mutants.
+
 ### One executor core (step 2 of the progress-accounting redesign)
 
 - Every path now runs on one executor core. A **physical plan**, computed
@@ -37,10 +135,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   nodes that would seed different capabilities fail the handshake.
 - Remove `ExchangeMessage::FrontierUpdate` and `ExchangeMessage::SenderDone`,
   which only the staged executor used.
-- Until step 3, the per-stage path and `SimpleRuntime::spawn_multi` share
-  the uniform path's known progress bugs (recorded in the conformance
-  matrix's golden file): for example, a multi-worker loop followed by an
-  exchange from its exit still hangs (audit C2).
 
 ### Progress test harness
 
@@ -51,8 +145,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   occupancy from channels, operator queues and capability objects rather than
   from the progress accounting, that no frontier passes outstanding work
   (V7). It also reports a worker's residual counts at finish (V5). Select its
-  behaviour with `INSTANCY_PROGRESS_CHECK` (`report`, the default; `verbose`;
-  `panic`; `off`). It never changes how a dataflow runs.
+  behaviour with `INSTANCY_PROGRESS_CHECK` (`panic`, the default in debug
+  builds; `report`, the default otherwise; `verbose`; `off`). It never
+  changes how a dataflow runs.
 - Add a progress conformance matrix (`tests/progress_conformance.rs`, a
   bounded subset in CI) whose golden file records exactly how each case fails
   today, by operator port, explained by audit finding; and the correctness
@@ -65,10 +160,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   violations when it is full (`log_complete_since`).
 - The checker does its checking on a background thread
   (`instancy-progress-check`): hooks on the dataflow's threads only queue
-  events, which keeps it from changing the interleavings it observes. A test
-  can run a dataflow without it with `DataflowBuilder::skip_progress_check`
-  (debug builds only); `tests/multi_worker_iterate.rs` does so for two loops
-  that hit a pre-existing lost-wakeup race (audit M11) more often under it.
+  events, which keeps it from changing the interleavings it observes.
 
 ### Exchange and broadcast retry fixes
 

@@ -221,20 +221,20 @@ completion.await?;
 
 #### Sweep model
 
-A **sweep** is one full pass through the executor's ready queue: it activates each queued operator once (up to `max_activations_per_step`), then propagates progress and updates quiescence counters. Think of it as a single clock tick in a reactor loop:
+A **sweep** is one full pass through the executor's ready queue: it activates each queued operator once (up to `max_activations_per_step`), then commits and propagates progress, and decides (shuts operators down, checks whether the worker has finished; see [progress-tracking.md §11.6](./progress-tracking.md)). Think of it as a single clock tick in a reactor loop:
 
-- **Sweep** = scan all ready operators, activate each, propagate progress, check quiescence.
+- **Sweep** = scan all ready operators, activate each, commit and propagate progress, decide.
 - **Run** = repeated sweeps until completion or idle.
 
 Each sweep returns a `SweepOutcome` that tells the caller what happened:
 
 | Outcome | Meaning |
 |---|---|
-| `Completed` | All operators are done - dataflow finished normally |
-| `Quiescent` | No operator made progress for N consecutive sweeps, no external inputs |
+| `Completed` | The worker succeeded: every hosted operator is shut down and its view of every location that can reach them is exactly zero |
+| `Quiescent` | A single worker with nothing that can wake it made no progress for `max_idle_sweeps` sweeps |
 | `MadeProgress` | At least one operator made progress - more sweeps likely needed |
-| `Idle` | No progress this sweep, but quiescence threshold not yet reached |
-| `WaitingForInput` | Idle threshold reached but external inputs still open |
+| `Idle` | No progress this sweep, but the idle threshold (`max_idle_sweeps`) is not reached yet |
+| `WaitingForInput` | Idle threshold reached: park until data, a peer's progress, a released capability, an async task or an external input wakes the worker |
 
 The spawned executor repeatedly calls `run_one_sweep()`. The async executor path uses `poll_run()` to register a waker and return `Pending` when the dataflow is idle.
 
@@ -814,7 +814,7 @@ Operator full identity: (worker_id, operator_index)
 
 **How instantiation works:**
 
-Each worker runs the graph-building code independently (this is the "single program" in SPMD). Each worker's `.unary(name, logic)` call creates a **new `OperatorFactory`** which, when called at materialization time, produces a new operator with fresh state. The factory closure is `FnMut` and clones the user logic on each `build()` call, giving each worker an independent copy.
+Each worker runs the graph-building code independently (this is the "single program" in SPMD). Each worker's `.unary(name, logic)` call creates a **new `OperatorFactory`** (a crate-private type) which, when called at materialization time, produces a new operator with fresh state. The factory closure is `FnMut` and clones the user logic on each `build()` call, giving each worker an independent copy.
 
 ```rust
 // This code runs on EACH worker independently:
@@ -834,37 +834,38 @@ stream.unary("word_count", |input, output| {
 
 #### 5.4.5 Dynamic Operator Generation (Query Engine Integration)
 
-The `OperatorFactory` pattern supports **dynamic operator generation** — operators created at runtime from a query plan or other configuration rather than being statically coded. This is essential for integration with query engines like Apache DataFusion, where SQL logical plans are compiled into physical instancy operators.
+Operators can be generated at runtime from a query plan or other configuration rather than being statically coded. This is how a query engine compiles a logical plan into an instancy dataflow.
 
-**Use case: datafusion-instancy (distributed SQL execution)**
+Operators are built only through `DataflowBuilder` and its `Pipe` methods (construction by type, `progress-accounting-design.md` §5.2). `OperatorFactory`, `SchedulableOperator`, `ChannelEndpoints`, `DataflowExecutor`, `ExecutorConfig` and `ActivationOutcome` are crate-private, and `Push` and `Pull` are sealed. This keeps every operator inside the operator shell, which does its progress accounting: an operator written directly against those types could bypass it. Dynamic generation doesn't need them: the planner walks its plan and calls builder methods for each node.
 
-A `datafusion-instancy` extension crate would convert DataFusion logical plans into instancy dataflow graphs:
+**Use case: distributed SQL execution**
 
-1. DataFusion produces a logical plan: `Scan → Filter → Project → HashAgg → Exchange → MergeAgg`
-2. The extension crate walks the plan and creates an `OperatorFactory` for each node, capturing the node's **serializable configuration** (filter expressions, column projections, aggregation functions, join keys)
-3. Factories are registered in the `DataflowGraph`
-4. At materialization, each factory creates the concrete physical operator
+A distributed SQL engine built on instancy (a downstream project, outside this repository) converts its logical plans into instancy dataflows:
 
-```rust
-/// Example: converting a logical plan node to an OperatorFactory.
+1. The engine produces a logical plan: `Scan → Filter → Project → HashAgg → Exchange → MergeAgg`
+2. It walks the plan and, for each node, calls the matching `Pipe` methods (`map_batch`, `filter`, `exchange`, `unary`, `binary`, `unary_notify`, `unary_async`, ...). Each closure captures the node's **serializable configuration** (filter expressions, column projections, aggregation functions, join keys)
+3. `DataflowBuilder::build()` records each operator, with its factory, in the `DataflowGraph`
+4. At materialization, each worker gets its own instance of every operator it hosts, with a fresh clone of the closure
+
+```ignore
+/// Example: lowering a logical plan onto builder calls.
 /// This runs on each node independently (SPMD) after receiving the plan.
-fn plan_node_to_factory(node: &LogicalPlan) -> OperatorFactory {
-    match node {
-        LogicalPlan::Filter { predicate, .. } => {
+fn lower(plan: &LogicalPlan, builder: &DataflowBuilder<u64>) -> Result<Pipe<u64, RecordBatch>> {
+    Ok(match plan {
+        LogicalPlan::Scan { table } => builder.input(table.as_str())?,
+        LogicalPlan::Filter { predicate, input } => {
             let expr = compile_predicate(predicate); // serializable config
-            Box::new(move |endpoints: ChannelEndpoints| {
-                Box::new(FilterOperator::new(expr, endpoints))
-            })
+            lower(input, builder)?.map_batch("filter", move |_t, batches| expr.apply(batches))
         }
-        LogicalPlan::HashAggregate { group_by, aggr_fns, .. } => {
-            let keys = group_by.clone();
-            let fns = aggr_fns.clone();
-            Box::new(move |endpoints| {
-                Box::new(HashAggOperator::new(keys, fns, endpoints))
-            })
+        LogicalPlan::HashAggregate { group_by, aggr_fns, input } => {
+            let agg = HashAgg::new(group_by.clone(), aggr_fns.clone());
+            let key = agg.clone();
+            lower(input, builder)?
+                .exchange("partition", move |batch| key.partition_key(batch))
+                .unary_notify("hash_agg", move |input, output, ctx| agg.step(input, output, ctx))
         }
-        // Each logical plan node type maps to a physical operator
-    }
+        // Each logical plan node type maps to one or more builder calls.
+    })
 }
 ```
 
@@ -872,16 +873,16 @@ fn plan_node_to_factory(node: &LogicalPlan) -> OperatorFactory {
 
 - The logical plan is **serializable data** (expressions, column names, types) — not Rust closures
 - The coordinator sends the plan (protobuf/JSON) to each participating node
-- Each node deserializes the plan, calls `plan_node_to_factory()` for each node, builds the graph, and runs
-- The `datafusion-instancy` crate defines extended operator types (FilterOperator, HashAggOperator, etc.) that implement `SchedulableOperator`
+- Each node deserializes the plan, calls `lower()` on it, builds the dataflow, and runs
+- The engine implements no instancy trait: each of its operators is a builder call with a closure over that node's configuration
 - All operators work with `RecordBatch` (Arrow columnar format) as the data type `D`
 
 **Design requirements this imposes on instancy:**
 
-- `OperatorFactory` must remain a simple concrete struct wrapping `FnMut(&WorkerContext, ChannelEndpoints) -> Result<Box<dyn SchedulableOperator>>` — no complex trait hierarchies that prevent dynamic dispatch
-- `SchedulableOperator` trait must be implementable by external crates (no sealed traits, no unstable associated types)
+- The builder must be able to express every plan node: the pipe methods, plus the generic closure operators (`unary`, `binary`, `unary_notify`, `unary_async`) for anything else
+- Builder methods must work when driven by data at runtime, in any order and number, not only from statically written code. Closures must be `Clone + Send + 'static`, so each worker gets its own copy
 - Channel data type `D` must support `RecordBatch` and similar large columnar types efficiently (zero-copy where possible)
-- The `DataflowGraph` metadata must be constructable programmatically (not only via the `.unary()` / `.binary()` extension traits) so query planners can build graphs from plan trees
+- The resulting `DataflowGraph` stays inspectable (operators, edges, `to_dot`), so a planner can check and explain what it built
 
 ### 5.4.6 Input Streams
 
@@ -1319,6 +1320,8 @@ With per-stage parallelism:
 
 The user never specifies "local" vs "global" — the runtime infers it from the cluster topology and stage placement. This keeps the logical API clean and topology-agnostic.
 
+> **Superseded** by the one executor core and port-counted progress (`progress-accounting-design.md` §5.1.8, §5.1).
+
 **Current status:** Per-stage parallelism is fully implemented via `StageExecutor` — each stage×worker combination runs as an independent executor with inline frontier tracking. `spawn_multi` with `per_stage_parallelism(true)` (the default) creates `max(P_i)` workers, each running a `CombinedStageExecutor` that polls only the stages that worker participates in. Cross-stage data flows through boundary exchange channels; cross-stage feedback loops (from `iterate()` with exchange inside the loop body) use 1:1 feedback boundary channels with dependency tracking for quiescence detection.
 
 
@@ -1572,6 +1575,8 @@ The existing `ExchangeChannelBuilder` already supports cross-worker routing — 
 
 ### Step 6: Progress tracking across stages
 
+> **Superseded** by one whole-graph progress tracker per worker and port-counted progress (`progress-accounting-design.md` §5.1.8, §5.1).
+
 Each stage's workers form an independent progress-tracking group:
 
 - **Within a stage**: Workers exchange progress messages among themselves (same as today's multi-worker progress tracking).
@@ -1682,6 +1687,8 @@ stream
 - Backward compatible: symmetric (M==N) path unchanged
 
 ### Phase 6: Per-stage progress tracking & validation ✅
+> **Superseded** by one whole-graph progress tracker per worker and port-counted progress (`progress-accounting-design.md` §5.1.8, §5.1).
+
 - Cross-stage frontier propagation handled by `ExchangePull::FrontierAggregator`
   (aggregates watermarks from M sources → emits progress to downstream)
 - Each executor's `ProgressTracker` tracks only its own operators; exchange channels
@@ -1801,6 +1808,8 @@ Worker allocation for stages [par=1, par=4, par=1]:
 
 ### Progress Tracking Per Stage
 
+> **Superseded** by one whole-graph progress tracker per worker and port-counted progress (`progress-accounting-design.md` §5.1.8, §5.1).
+
 Each stage forms an independent progress-tracking group:
 
 - **Workers in the same stage** exchange progress among themselves
@@ -1837,6 +1846,8 @@ empty progress messages.
 - Workers only materialize operators for stages they participate in (PR #196)
 
 ### Phase 9: Ghost operators for cross-stage frontier propagation ✅ (superseded)
+> Its replacement, the `StageExecutor` design, was itself superseded by the one executor core and port-counted progress (`progress-accounting-design.md` §5.1.8, §5.1).
+
 - Originally: `SubgraphBuilder::mark_ghost_operators()` kept shapes and connectivity in
   reachability graph for non-participating operators
 - **Superseded by StageExecutor architecture** (PRs #256–#260): each stage×worker runs its
