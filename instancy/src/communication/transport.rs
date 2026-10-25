@@ -39,8 +39,10 @@
 
 use std::io;
 
+#[cfg(any(test, feature = "transport"))]
 use crate::communication::codec::MAX_MESSAGE_SIZE;
 use crate::dataflow::id::DataflowId;
+#[cfg(feature = "transport")]
 use crate::wire;
 
 /// A single frame in the wire protocol.
@@ -58,6 +60,7 @@ pub struct Frame {
 }
 
 /// Header size: 16 (dataflow_id UUID) + 8 (channel_id) + 4 (length) = 28 bytes.
+#[cfg(feature = "transport")]
 const HEADER_SIZE: usize = 28;
 
 /// Size of each optional CRC32 field (header checksum and frame checksum).

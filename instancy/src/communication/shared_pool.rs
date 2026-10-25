@@ -693,7 +693,7 @@ impl PeerPool {
     /// Spawns a thread that acquires a write guard and panics, leaving
     /// the lock permanently poisoned. Subsequent calls to `select_connection`
     /// etc. will return `Err(LockPoisoned)`.
-    #[cfg(test)]
+    #[cfg(all(test, feature = "transport"))]
     pub(crate) fn poison_for_test(self: &Arc<Self>) {
         let pool = Arc::clone(self);
         let _ = std::thread::spawn(move || {

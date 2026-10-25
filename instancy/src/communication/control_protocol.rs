@@ -48,6 +48,7 @@
 use crate::cancellation::{CancellationReason, CancellationToken};
 #[cfg(feature = "transport")]
 use crate::dataflow::id::DataflowId;
+#[cfg(feature = "transport")]
 use crate::wire;
 
 // ---------------------------------------------------------------------------

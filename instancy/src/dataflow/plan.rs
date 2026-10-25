@@ -360,6 +360,13 @@ impl PhysicalPlan {
     }
 
     /// Whether every operator runs on every worker.
+    #[cfg(any(
+        test,
+        all(
+            feature = "transport",
+            any(debug_assertions, feature = "progress-check")
+        )
+    ))]
     pub(crate) fn is_uniform(&self) -> bool {
         self.operators
             .values()
@@ -420,6 +427,7 @@ impl PhysicalPlan {
 
     /// A canonical digest of the plan, identical on every node that computes
     /// the same plan.
+    #[cfg_attr(not(feature = "transport"), allow(dead_code))]
     pub(crate) fn digest(&self) -> u64 {
         self.digest
     }

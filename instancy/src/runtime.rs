@@ -32,9 +32,12 @@ use crate::dataflow::channels::wake::WakeHandle;
 use crate::dataflow::control::{ControlBroadcast, ControlReceiver, ControlSender};
 use crate::dataflow::dataflow_builder::{DataflowBuilder, LogicalDataflow};
 use crate::dataflow::executor::{DataflowExecutor, ExecutorConfig};
+#[cfg(any(feature = "transport", feature = "test-utils"))]
 use crate::dataflow::graph::OperatorInfo;
 use crate::dataflow::plan::{Parallelism, PhysicalPlan};
-use crate::error::{Error, Result, RuntimeError, TopologyError};
+#[cfg(feature = "transport")]
+use crate::error::TopologyError;
+use crate::error::{Error, Result, RuntimeError};
 use crate::progress::progress_channel::{WorkerProgressChannels, create_progress_channels};
 use crate::progress::timestamp::Timestamp;
 use crate::scheduler::policy::SchedulePolicy;
@@ -5437,6 +5440,7 @@ impl Future for MultiDataflowCompletion {
 /// Checks: operator count, edge count, feedback edge count, input port
 /// names/types, and output port names/types. All must match across replicas
 /// for correct replicated execution.
+#[cfg(any(feature = "transport", feature = "test-utils"))]
 fn validate_multi_worker_topologies<T: Timestamp>(dataflows: &[LogicalDataflow<T>]) -> Result<()> {
     if dataflows.len() <= 1 {
         return Ok(());
@@ -5677,8 +5681,9 @@ fn materialize_executor<T: Timestamp>(
             executor.enable_stage_tasks(&dataflow.stages);
         } else {
             // Fallback: enable whole-graph fused activation.
-            if let Err(e) = executor.enable_fusion_from_graph(&dataflow.graph) {
-                tracing::debug!("Fused activation disabled: {e}");
+            if let Err(_e) = executor.enable_fusion_from_graph(&dataflow.graph) {
+                #[cfg(feature = "tracing")]
+                tracing::debug!("Fused activation disabled: {_e}");
             }
         }
     }
