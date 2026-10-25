@@ -26,6 +26,25 @@ jobs:
         run: cargo clippy -p instancy --all-features --lib --tests -- -D warnings
       - name: Build examples (all features)
         run: cargo build -p instancy --examples --all-features
+      # Release builds compile out debug-only code (the progress checker), so
+      # code used only there must not leave dead code behind.
+      - name: cargo check (release, default features)
+        run: cargo check -p instancy --release
+
+  no-default-features:
+    name: No default features
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: cargo build (no default features)
+        run: cargo build -p instancy --no-default-features
+      - name: cargo build (no default features, release)
+        run: cargo build -p instancy --no-default-features --release
+      # The library's own tests need the `test-utils` feature.
+      - name: Tests (no default features)
+        run: cargo test -p instancy --no-default-features --features test-utils --lib --tests -- --test-threads=4
 
   test:
     name: Test
@@ -40,6 +59,25 @@ jobs:
         run: cargo test -p instancy --tests --all-features -- --test-threads=4
       - name: Doc tests
         run: cargo test -p instancy --doc --all-features
+      # Every audit repro must pass. Each runs in its own child process with
+      # a 120 s timeout; two at a time, as more oversubscribe the runner.
+      - name: Audit repros
+        run: cargo test -p instancy --all-features --test audit_repros -- --ignored --exact audit_repros_match_table --nocapture
+        env:
+          AUDIT_REPROS_JOBS: 2
+          AUDIT_REPROS_REPORT: 1
+
+  conformance:
+    name: Full conformance matrix
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      # The `test` job runs a subset; this runs all of it, in parallel with
+      # the other jobs.
+      - name: Progress conformance matrix (full)
+        run: cargo test -p instancy --all-features --test progress_conformance -- --ignored --exact --test-threads=1 full_conformance_matrix
 
   doc:
     name: Documentation
