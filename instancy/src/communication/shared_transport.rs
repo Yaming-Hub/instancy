@@ -45,11 +45,14 @@
 //! stops on any connection error):
 //!
 //! - when its writer fails, every dataflow whose lane is pinned to it is told
-//!   ([`PeerIoEvent::WriteFailed`]);
-//! - when its reader ends (EOF, an I/O error, a corrupt or oversize frame),
-//!   every dataflow whose frames from the peer arrive on it, or whose lane is
-//!   pinned to it, is told, and the channels of a dataflow whose frames
-//!   arrive on it close;
+//!   ([`PeerIoEvent::WriteFailed`]), and the whole connection is closed
+//!   (its reader stops too), so the peer sees it end even when the write
+//!   half alone would tell it nothing (`tokio::io::split` halves, as with
+//!   TLS);
+//! - when its reader ends (EOF, an I/O error, a corrupt or oversize frame,
+//!   or the writer's failure), every dataflow whose frames from the peer
+//!   arrive on it, or whose lane is pinned to it, is told, and the channels
+//!   of a dataflow whose frames arrive on it close;
 //! - a payload frame that cannot be sent (its connection failed, or it
 //!   exceeds the frame size limit) fails its dataflow and nobody else's.
 //!
@@ -679,6 +682,7 @@ impl Inner {
     /// Add an established connection to the pool and start its tasks.
     fn add_connection(self: &Arc<Self>, reader: DynReader, writer: DynWriter) -> usize {
         let (tx, rx) = tokio_mpsc::channel::<Frame>(WRITER_QUEUE);
+        let (close_tx, close_rx) = tokio::sync::oneshot::channel();
         let (conn_id, metrics) = {
             let mut state = self.state();
             let conn_id = state.next_conn_id;
@@ -700,10 +704,11 @@ impl Inner {
             writer,
             rx,
             metrics,
+            close_tx,
         ));
         let reader_handle =
             self.runtime_handle
-                .spawn(reader_task(Arc::clone(self), conn_id, reader));
+                .spawn(reader_task(Arc::clone(self), conn_id, reader, close_rx));
         push_task_handle(&self.task_handles.writers, writer_handle);
         push_task_handle(&self.task_handles.readers, reader_handle);
         conn_id
@@ -968,10 +973,11 @@ impl Inner {
         }
     }
 
-    /// Writing to connection `conn_id` failed (or its writer stopped): the
-    /// frames queued on it are lost. Fail every dataflow whose lane is
-    /// pinned to it, and stop using it. Its reader keeps going until the
-    /// connection ends (see [`Self::fail_inbound`]).
+    /// Writing to connection `conn_id` failed: the frames queued on it are
+    /// lost. Fail every dataflow whose lane is pinned to it, and stop using
+    /// it. Its reader is stopped next, which closes the whole connection
+    /// (see [`writer_task`]) and fails the dataflows reading from it (see
+    /// [`Self::fail_inbound`]).
     fn fail_outbound(self: &Arc<Self>, conn_id: usize, error: TransportError) {
         let reports = {
             let mut state = self.state();
@@ -1127,23 +1133,35 @@ pub(crate) fn new_registration_token() -> u64 {
 /// Per-connection writer task: writes queued frames to the connection.
 ///
 /// On a write error the frames queued on the connection are lost: it fails
-/// the dataflows pinned to the connection and drops its write half, so the
-/// peer sees the connection end too.
+/// the dataflows pinned to the connection, then has the reader stop
+/// (`close`), so both halves are dropped and the whole connection closes.
+/// Dropping only the write half would tell the peer nothing with halves
+/// such as `tokio::io::split`'s (TLS streams, pipes): the peer would wait
+/// for frames that never come, and keep the connection in its pool while
+/// this side replaces it. With the connection closed, the peer fails the
+/// same dataflows and both pools refill together.
 async fn writer_task(
     inner: std::sync::Weak<Inner>,
     conn_id: usize,
     writer: DynWriter,
     mut rx: tokio_mpsc::Receiver<Frame>,
     metrics: Arc<ConnectionMetrics>,
+    close: tokio::sync::oneshot::Sender<TransportError>,
 ) {
     let mut framed = FramedWriter::new(writer);
     while let Some(frame) = rx.recv().await {
         let payload_size = frame.payload.len();
         let is_user_traffic = frame.channel_id != PROBE_CHANNEL_ID;
         if let Err(error) = framed.write_frame(&frame).await {
+            let detail = error.to_string();
             if let Some(inner) = inner.upgrade() {
                 inner.fail_outbound(conn_id, error);
             }
+            drop(framed);
+            let _ = close.send(TransportError::Io(std::io::Error::new(
+                std::io::ErrorKind::ConnectionAborted,
+                format!("the pooled connection was closed after writing to it failed: {detail}"),
+            )));
             return;
         }
         metrics.record_write(payload_size, is_user_traffic);
@@ -1151,25 +1169,44 @@ async fn writer_task(
     // Nothing more will be written: tell the peer. Only some write halves
     // do that when dropped (`OwnedWriteHalf`); with others (TLS streams,
     // pipes, `tokio::io::split`) the peer would not see the end of the
-    // stream until the whole connection is dropped.
+    // stream until the whole connection is dropped. The reader keeps going
+    // (`close` is dropped unsent) until the peer closes its side.
     let _ = tokio::time::timeout(WRITER_DRAIN_GRACE, framed.into_inner().shutdown()).await;
 }
 
 /// Per-connection reader task: reads frames and hands them to
-/// [`Inner::on_frame`] until the connection ends.
-async fn reader_task(inner: Arc<Inner>, conn_id: usize, reader: DynReader) {
+/// [`Inner::on_frame`] until the connection ends, or until the writer
+/// failed and sends `close`.
+async fn reader_task(
+    inner: Arc<Inner>,
+    conn_id: usize,
+    reader: DynReader,
+    close: tokio::sync::oneshot::Receiver<TransportError>,
+) {
     let mut framed = FramedReader::new(reader);
-    let end = loop {
-        match framed.read_frame().await {
-            Ok(frame) => inner.on_frame(conn_id, frame).await,
-            Err(TransportError::ConnectionClosed) => break InboundEnd::Closed,
-            Err(error) => {
-                break InboundEnd::Failed {
-                    error,
-                    owner: framed.verified_dataflow(),
-                };
+    let reading = async {
+        loop {
+            match framed.read_frame().await {
+                Ok(frame) => inner.on_frame(conn_id, frame).await,
+                Err(TransportError::ConnectionClosed) => break InboundEnd::Closed,
+                Err(error) => {
+                    break InboundEnd::Failed {
+                        error,
+                        owner: framed.verified_dataflow(),
+                    };
+                }
             }
         }
+    };
+    // A frame cut off by `close` belongs to a lane on this connection,
+    // which `fail_inbound` fails. A `close` dropped unsent (the writer
+    // finished normally) disables its branch; reading goes on. `close` is
+    // polled first: under sustained traffic `reading` uses up the task's
+    // cooperative budget, and a `close` polled after it would never fire.
+    let end = tokio::select! {
+        biased;
+        Ok(error) = close => InboundEnd::Failed { error, owner: None },
+        end = reading => end,
     };
     inner.fail_inbound(conn_id, end);
 }
@@ -2549,6 +2586,119 @@ mod tests {
             next_event(&mut events).await,
             PeerIoEvent::WriteFailed(_) | PeerIoEvent::Closed | PeerIoEvent::ReadFailed(_)
         ));
+    }
+
+    /// A write half that fails every write once `broken` is set, like a
+    /// local error on one half of a TLS stream: the read half and the peer's
+    /// end stay open.
+    struct BreakableWriter {
+        inner: tokio::io::WriteHalf<DuplexStream>,
+        broken: Arc<AtomicBool>,
+    }
+
+    impl tokio::io::AsyncWrite for BreakableWriter {
+        fn poll_write(
+            mut self: std::pin::Pin<&mut Self>,
+            cx: &mut std::task::Context<'_>,
+            buf: &[u8],
+        ) -> std::task::Poll<std::io::Result<usize>> {
+            if self.broken.load(Ordering::SeqCst) {
+                return std::task::Poll::Ready(Err(std::io::Error::other("local write error")));
+            }
+            std::pin::Pin::new(&mut self.inner).poll_write(cx, buf)
+        }
+
+        fn poll_flush(
+            mut self: std::pin::Pin<&mut Self>,
+            cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            std::pin::Pin::new(&mut self.inner).poll_flush(cx)
+        }
+
+        fn poll_shutdown(
+            mut self: std::pin::Pin<&mut Self>,
+            cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            std::pin::Pin::new(&mut self.inner).poll_shutdown(cx)
+        }
+    }
+
+    struct Breakable(Mutex<Option<(DuplexStream, Arc<AtomicBool>)>>);
+
+    impl ConnectionFactory for Breakable {
+        type Reader = tokio::io::ReadHalf<DuplexStream>;
+        type Writer = BreakableWriter;
+
+        async fn establish(
+            &self,
+            _peer_node_id: &str,
+        ) -> Result<(Self::Reader, Self::Writer), Box<dyn std::error::Error + Send + Sync>>
+        {
+            let (stream, broken) = self.0.lock().unwrap().take().ok_or("no more connections")?;
+            let (reader, inner) = tokio::io::split(stream);
+            Ok((reader, BreakableWriter { inner, broken }))
+        }
+    }
+
+    /// A local write error closes the whole connection, not just its write
+    /// half (which, split from a stream, tells the peer nothing): the peer
+    /// sees the end and fails the same dataflows, and the dataflows reading
+    /// from the connection here fail too, so the two pools stay paired.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn write_error_closes_the_whole_connection() {
+        let (ours, theirs) = duplex(1 << 20);
+        let broken = Arc::new(AtomicBool::new(false));
+        let factory: Arc<dyn DynConnectionFactory> =
+            Arc::new(Breakable(Mutex::new(Some((ours, Arc::clone(&broken))))));
+        let manager = SharedPeerManager::new(
+            "peer".into(),
+            config(1),
+            factory,
+            &tokio::runtime::Handle::current(),
+            health_tx(),
+        )
+        .unwrap();
+        let df = DataflowId::new();
+        let (mut rx, mut events) = manager.register_dataflow(df, &[1], 16).await.unwrap();
+        let (peer_read, peer_write) = tokio::io::split(theirs);
+        let mut peer_reader = FramedReader::new(peer_read);
+        let mut peer_writer = FramedWriter::new(peer_write);
+        // The lane works both ways.
+        send(&manager, df, 1, b"out".to_vec()).await;
+        assert_eq!(
+            peer_reader.read_frame().await.unwrap().payload[8..],
+            *b"out"
+        );
+        peer_writer
+            .write_frame(&sequenced(df, 1, 0, b"in"))
+            .await
+            .unwrap();
+        assert_eq!(recv(rx.get_mut(&1).unwrap()).await.unwrap(), b"in");
+
+        broken.store(true, Ordering::SeqCst);
+        send(&manager, df, 1, b"lost".to_vec()).await;
+        let mut seen = Vec::new();
+        while seen.len() < 2 {
+            seen.push(next_event(&mut events).await);
+        }
+        assert!(
+            matches!(seen[0], PeerIoEvent::WriteFailed(_)),
+            "the lost frame is reported first: {seen:?}"
+        );
+        assert!(
+            matches!(&seen[1], PeerIoEvent::ReadFailed(e) if !matches!(e, TransportError::ChecksumMismatch { .. })),
+            "reading from the closed connection fails too: {seen:?}"
+        );
+        assert_eq!(recv(rx.get_mut(&1).unwrap()).await, None);
+        // The peer sees the connection end (it waited forever before).
+        let end = tokio::time::timeout(Duration::from_secs(5), peer_reader.read_frame())
+            .await
+            .expect("the peer never saw the connection end");
+        assert!(
+            matches!(end, Err(TransportError::ConnectionClosed)),
+            "{end:?}"
+        );
+        assert_eq!(manager.connection_count(), 0);
     }
 
     /// A failed connection fails exactly the dataflows that used it, on both

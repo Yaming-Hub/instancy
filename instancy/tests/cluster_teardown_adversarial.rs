@@ -1045,6 +1045,18 @@ enum AfterBreak {
 /// frames. Detecting a writer error by itself is PR 8's failure detection.
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
 async fn writer_only_failure_never_hangs_or_passes_silently() {
+    writer_only_failure(false).await;
+}
+
+/// The same in Shared mode: the pooled connection's write error closes the
+/// whole connection, so b sees it end instead of waiting for frames that
+/// never come.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn shared_writer_only_failure_never_hangs_or_passes_silently() {
+    writer_only_failure(true).await;
+}
+
+async fn writer_only_failure(shared: bool) {
     use std::sync::atomic::{AtomicBool, Ordering};
     for variant in [
         AfterBreak::StayRunning,
@@ -1057,11 +1069,23 @@ async fn writer_only_failure_never_hangs_or_passes_silently() {
         let mut mesh = Mesh::new(&["a", "b"], 1 << 16, |_, _| Duration::ZERO);
         let broken = Arc::new(AtomicBool::new(false));
         let id = DataflowId::new();
+        // Shared managers live on after the dataflow, as long-lived managers
+        // do: b must see the connection end without a's managers being
+        // dropped.
+        let (transport_a, _managers_a) = if shared {
+            let (transport, managers) = mesh.shared_breakable("a", 1024, Arc::clone(&broken));
+            (transport, Some(managers))
+        } else {
+            (
+                mesh.dedicated_breakable("a", 1024, Arc::clone(&broken)),
+                None,
+            )
+        };
         let ha = spawn_node_with_options(
             topology.clone(),
             "a",
             id,
-            mesh.dedicated_breakable("a", 1024, Arc::clone(&broken)),
+            transport_a,
             1,
             notify_sum,
             SpawnOptions::new(),
@@ -1070,7 +1094,7 @@ async fn writer_only_failure_never_hangs_or_passes_silently() {
             topology,
             "b",
             id,
-            mesh.dedicated("b", 1024),
+            mesh.transport("b", shared, 1024),
             1,
             notify_sum,
             SpawnOptions::new(),
@@ -1105,7 +1129,8 @@ async fn writer_only_failure_never_hangs_or_passes_silently() {
         let elapsed = start.elapsed();
         drop(held);
         let msg = format!(
-            "{variant:?}: a={}, b={} after {elapsed:?}",
+            "{} {variant:?}: a={}, b={} after {elapsed:?}",
+            if shared { "shared" } else { "dedicated" },
             fmt_join(&ra),
             fmt_join(&rb)
         );

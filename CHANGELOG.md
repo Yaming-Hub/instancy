@@ -16,7 +16,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   is now fail-stop on link loss, like Dedicated mode and like timely: a
   pooled connection that fails (a write error, or the read side ending)
   fails every dataflow that used it, on both nodes, and a frame that cannot
-  be sent fails its dataflow. The failed connection leaves the pool; the
+  be sent fails its dataflow. A write error closes the whole connection, so
+  the peer sees it end even with split stream halves (TLS) whose write half
+  alone would tell it nothing. The failed connection leaves the pool; the
   next dataflow that registers re-establishes it through the application's
   `ConnectionFactory`. There is no background redial any more.
 - **Each dataflow's lane is pinned to one pooled connection.** A dataflow's

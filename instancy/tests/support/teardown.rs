@@ -436,6 +436,53 @@ impl Mesh {
         ClusterSpawnTransport::dedicated(conns, capacity)
     }
 
+    /// Shared-mode counterpart of [`dedicated_breakable`](Self::dedicated_breakable):
+    /// `node`'s pooled connection writers fail once `broken` is set, while
+    /// the readers and the peers' ends stay open. Also returns the managers,
+    /// so the test can keep them alive (as long-lived managers are) after
+    /// the dataflow ends.
+    pub fn shared_breakable(
+        &mut self,
+        node: &str,
+        capacity: usize,
+        broken: Arc<AtomicBool>,
+    ) -> (
+        ClusterSpawnTransport<ReadHalf<DuplexStream>, BreakableWriter<WriteHalf<DuplexStream>>>,
+        Managers,
+    ) {
+        let handle = tokio::runtime::Handle::current();
+        let mut managers = HashMap::new();
+        for (peer, stream) in self.take_ends(node) {
+            let (reader, writer) = tokio::io::split(stream);
+            let writer = BreakableWriter {
+                inner: writer,
+                broken: Arc::clone(&broken),
+            };
+            let factory: Arc<dyn DynConnectionFactory> = Arc::new(PreEstablished(Mutex::new(
+                VecDeque::from([(reader, writer)]),
+            )));
+            managers.insert(
+                peer.clone(),
+                SharedPeerManager::new(
+                    peer,
+                    shared_config(1),
+                    factory,
+                    &handle,
+                    tokio::sync::broadcast::channel(16).0,
+                )
+                .unwrap(),
+            );
+        }
+        let managers = Arc::new(managers);
+        (
+            ClusterSpawnTransport::Shared {
+                peer_managers: Arc::clone(&managers),
+                capacity,
+            },
+            managers,
+        )
+    }
+
     /// Shared-mode peer managers for `node` whose factories hand out the
     /// mesh connection once and then "reconnect" to a peer that accepts but
     /// never answers (see [`ReconnectToSilentPeer`]).
