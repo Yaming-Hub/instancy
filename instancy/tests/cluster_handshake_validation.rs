@@ -1132,7 +1132,7 @@ async fn future_version_peer_is_rejected_with_version_error() {
 /// markers and acknowledgements that teardown waits for.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn version_2_peer_without_shutdown_handshake_is_rejected() {
-    assert_eq!(instancy::communication::CLUSTER_PROTOCOL_VERSION, 4);
+    assert_eq!(instancy::communication::CLUSTER_PROTOCOL_VERSION, 5);
     let err = spawn_against_fake_peer(|df| {
         let mut p = vec![0u8];
         p.extend_from_slice(&2u32.to_le_bytes());

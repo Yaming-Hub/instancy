@@ -72,12 +72,8 @@ async fn early_finisher_keeps_frames_queued_behind_another_dataflow() {
         collect(xa.take_output::<u64>(0, "out").unwrap()),
         collect(xb.take_output::<u64>(0, "out").unwrap()),
     ];
-    // X's node-b keeps its (unused) input open until X's burst has arrived:
-    // a receiver with no capability of its own can still complete after
-    // consuming the first record, before the producer's matching progress
-    // arrives (signed-sum completion predicate, audit C1/C2; see
-    // `many_small_frames_then_complete_*`). X only generates congestion here.
-    let xb_in = xb.take_input::<u64>(0, "data").unwrap();
+    // X only generates congestion here; node-b has no X input.
+    drop(xb.take_input::<u64>(0, "data").unwrap());
     let x_in = xa.take_input::<u64>(0, "data").unwrap();
 
     // node-b has no Y input; let its "input closed" progress reach node-a.
@@ -117,8 +113,6 @@ async fn early_finisher_keeps_frames_queued_behind_another_dataflow() {
     assert_eq!(y_records, 20);
 
     x_feeder.join().unwrap();
-    tokio::time::sleep(Duration::from_secs(1)).await;
-    drop(xb_in);
     let (rxa, rxb) = (
         join_with_timeout(xa, Duration::from_secs(20)),
         join_with_timeout(xb, Duration::from_secs(20)),
@@ -185,10 +179,8 @@ async fn cancelled_drain_flushes_final_progress_queued_behind_another_dataflow()
         collect(xa.take_output::<u64>(0, "out").unwrap()),
         collect(xb.take_output::<u64>(0, "out").unwrap()),
     ];
-    // As in `early_finisher_keeps_frames_queued_behind_another_dataflow`, X's
-    // node-b keeps its (unused) input open until X's burst has arrived: X only
-    // generates congestion here (audit C1/C2).
-    let xb_in = xb.take_input::<u64>(0, "data").unwrap();
+    // X only generates congestion here; node-b has no X input.
+    drop(xb.take_input::<u64>(0, "data").unwrap());
     let x_in = xa.take_input::<u64>(0, "data").unwrap();
     tokio::time::sleep(Duration::from_millis(300)).await;
 
@@ -221,8 +213,6 @@ async fn cancelled_drain_flushes_final_progress_queued_behind_another_dataflow()
         fmt_join(&rb)
     );
     x_feeder.join().unwrap();
-    tokio::time::sleep(Duration::from_secs(1)).await;
-    drop(xb_in);
     let (rxa, rxb) = (
         join_with_timeout(xa, Duration::from_secs(20)),
         join_with_timeout(xb, Duration::from_secs(20)),
@@ -255,25 +245,14 @@ enum Producer {
     Map,
 }
 
-/// How a burst round ended when it did not fail.
-#[derive(Debug)]
-enum Burst {
-    /// Every node succeeded and every record arrived exactly once.
-    Exact,
-    /// A node reported the loss (see `many_small_frames_then_complete_shared`).
-    LoudLoss(String),
-}
-
 /// node-a sends `records` records of `size` bytes (at least 8; the first 8
 /// carry the record's index), all routed to node-b, and closes its input;
-/// node-b's input is closed at start. node-a can observe global completion
-/// while its frames are still queued.
+/// node-b's input is closed at start. node-a's input closes while most of
+/// its frames are still queued.
 ///
-/// The round is exact if both nodes succeed and node-b received every record
-/// exactly once. It is a loud loss only if every failed node reports a data
-/// loss, node-b received no record twice (and node-a none), at least one
-/// record is missing, and the missing records are the tail of the stream.
-/// Anything else (a hang, an unexplained error, silent loss, a gap) is an
+/// The round is exact if both nodes succeed, node-a fed every record and
+/// node-b received every record exactly once (and node-a none). Anything
+/// else (a hang, an error, a lost, duplicated or unknown record) is an
 /// error.
 async fn burst_then_complete<R, W>(
     ta: ClusterSpawnTransport<R, W>,
@@ -281,7 +260,7 @@ async fn burst_then_complete<R, W>(
     records: usize,
     size: usize,
     producer: Producer,
-) -> std::result::Result<Burst, String>
+) -> std::result::Result<(), String>
 where
     R: tokio::io::AsyncRead + Unpin + Send + 'static,
     W: tokio::io::AsyncWrite + Unpin + Send + 'static,
@@ -349,48 +328,14 @@ where
         fmt_join(&ra),
         fmt_join(&rb)
     );
-    if duplicated > 0 || unknown > 0 || got_a > 0 {
-        return Err(report);
-    }
-    let error = |r: &Option<Result<()>>| match r {
-        Some(Err(e)) => Some(e.to_string()),
-        _ => None,
-    };
-    let (ea, eb) = (error(&ra), error(&rb));
-    if ea.is_none() && eb.is_none() && feed_error.is_none() {
-        return if missing == 0 {
-            Ok(Burst::Exact)
-        } else {
-            Err(format!("silent loss: {report}"))
-        };
-    }
-    if [&ea, &eb]
-        .iter()
-        .any(|e| e.as_ref().is_some_and(|e| !e.contains("data lost")))
-    {
-        return Err(format!("a failure without a data loss: {report}"));
-    }
-    if feed_error.is_some() && ea.is_none() {
-        return Err(format!("node-a succeeded but its input failed: {report}"));
-    }
-    if missing == 0 {
-        return Err(format!(
-            "a data loss was reported but nothing is missing: {report}"
-        ));
-    }
-    let first_missing = (0..sent as u64).find(|k| got_b.binary_search(k).is_err());
-    // A legitimate loss stops the stream for good (node-a stops at its first
-    // failed push, node-b consumes nothing after it finished, the channel is
-    // FIFO): a gap before a received record is a lost frame. A tail is
-    // explained: by now node-a or node-b failed with a data loss.
-    if let (Some(&last), Some(first)) = (got_b.last(), first_missing) {
-        if last > first {
-            return Err(format!(
-                "records missing before the last received: {report}"
-            ));
-        }
-    }
-    Ok(Burst::LoudLoss(report))
+    let exact = matches!(ra, Some(Ok(())))
+        && matches!(rb, Some(Ok(())))
+        && feed_error.is_none()
+        && duplicated == 0
+        && unknown == 0
+        && missing == 0
+        && got_a == 0;
+    if exact { Ok(()) } else { Err(report) }
 }
 
 async fn dedicated_pair(capacity: usize) -> (support::TcpTransport, support::TcpTransport) {
@@ -406,70 +351,39 @@ async fn shared_pair() -> (Managers, Managers) {
     (managers.remove("a").unwrap(), managers.remove("b").unwrap())
 }
 
-/// Runs `rounds` burst rounds; fails on any hang, unexplained error or
-/// silent loss, and unless at least `min_exact` rounds delivered every
-/// record (so a regression that makes every round fail loudly is caught).
-async fn assert_no_silent_loss<F, Fut>(what: &str, rounds: usize, min_exact: usize, mut round: F)
+/// Runs `rounds` burst rounds; every round must be exact (see
+/// `burst_then_complete`).
+async fn assert_every_round_exact<F, Fut>(what: &str, rounds: usize, mut round: F)
 where
     F: FnMut(usize) -> Fut,
-    Fut: std::future::Future<Output = std::result::Result<Burst, String>>,
+    Fut: std::future::Future<Output = std::result::Result<(), String>>,
 {
     let mut failures = Vec::new();
-    let mut loud = Vec::new();
     for i in 0..rounds {
-        match round(i).await {
-            Ok(Burst::Exact) => {}
-            Ok(Burst::LoudLoss(report)) => loud.push(format!("round {i}: {report}")),
-            Err(report) => failures.push(format!("round {i}: {report}")),
+        if let Err(report) = round(i).await {
+            failures.push(format!("round {i}: {report}"));
         }
     }
-    let exact = rounds - loud.len() - failures.len();
-    eprintln!("{what}: {exact} of {rounds} rounds delivered every record");
-    if !loud.is_empty() {
-        eprintln!(
-            "{what}: {} round(s) failed loudly with data loss: {loud:#?}",
-            loud.len()
-        );
-    }
-    assert!(failures.is_empty(), "{what}: {failures:#?}");
-    assert!(
-        exact >= min_exact,
-        "{what}: only {exact} of {rounds} rounds delivered every record \
-         (expected at least {min_exact})"
+    eprintln!(
+        "{what}: {} of {rounds} rounds delivered every record",
+        rounds - failures.len()
     );
+    assert!(failures.is_empty(), "{what}: {failures:#?}");
 }
-
-/// Minimum exact rounds out of 5 small-frame rounds (see
-/// `assert_no_silent_loss`): none. This shape's exact rounds depend on how
-/// often node-b completes early (audit C1/C2), which grows with machine load:
-/// 5 of 5 on an idle machine, as few as 2 of 5 with three test binaries
-/// running at once (same for the code before and after the last review
-/// round), and 1 of 5 on a busy CI runner. The large-record rounds below (and
-/// routing scenarios 1 and 2) catch a regression to "always loud" instead.
-const MIN_EXACT_SMALL: usize = 0;
-/// Minimum exact rounds out of 10 large-record rounds. In 24 runs per
-/// combination the fewest were 5 of 10 and the worst combination lost loudly
-/// in 23% of rounds; with three test binaries running at once the fewest
-/// were 6 of 10. Even at 50% loud, two exact rounds fail to appear in about 1%
-/// of runs.
-const MIN_EXACT_LARGE: usize = 2;
 
 /// Shared mode with long-lived managers: thousands of small frames are still
 /// queued when node-a completes locally.
 ///
 /// On the pre-handshake runtime almost every round hangs or fails with a
 /// spurious transport error (the queued frames were dropped at unregister).
-/// Roughly one round in 60-100 still hits the signed-sum completion bug
-/// (audit C1/C2): node-b consumes the first record before node-a's matching
-/// produced-message count arrives and finishes early. Before, that round
-/// returned `a=Ok b=Ok received_at_b=1/3000`; now the records that reach
-/// node-b after its operator finished (or that node-a sends after node-b's
-/// end-of-stream) are reported as data loss and the run fails. Silent loss
-/// is never acceptable.
+/// node-b also used to finish early in some rounds: it consumed the first
+/// record before node-a's matching produced-message count arrived
+/// (`a=Ok b=Ok received_at_b=1/3000`). node-b now finishes only once it has
+/// consumed every record node-a sent it, so every round must be exact.
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
 async fn many_small_frames_then_complete_shared() {
     let (ma, mb) = shared_pair().await;
-    assert_no_silent_loss("shared", 5, MIN_EXACT_SMALL, |_| {
+    assert_every_round_exact("shared", 5, |_| {
         burst_then_complete(shared(&ma), shared(&mb), 3000, 64, Producer::Map)
     })
     .await;
@@ -478,7 +392,7 @@ async fn many_small_frames_then_complete_shared() {
 /// Dedicated-mode counterpart.
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
 async fn many_small_frames_then_complete_dedicated() {
-    assert_no_silent_loss("dedicated", 5, MIN_EXACT_SMALL, |_| async {
+    assert_every_round_exact("dedicated", 5, |_| async {
         let (ta, tb) = dedicated_pair(1024).await;
         burst_then_complete(ta, tb, 3000, 64, Producer::Map).await
     })
@@ -487,33 +401,22 @@ async fn many_small_frames_then_complete_dedicated() {
 
 /// Large records routed to node-b while node-a finishes first.
 ///
-/// This shape hits the C1/C2 premature completion often: node-b used to
-/// report success after receiving only part of the burst (typically one
-/// record). With the handshake, node-a's frames reach node-b before node-a
-/// releases the connection, and records that arrive after node-b's operator
-/// finished fail the run loudly instead of vanishing.
+/// node-b used to report success after receiving only part of the burst
+/// (typically one record). With the handshake, node-a's frames reach node-b
+/// before node-a releases the connection, and node-b cannot finish before it
+/// has consumed them: every round must be exact.
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
 async fn large_records_from_early_finisher_never_vanish() {
     for producer in [Producer::Input, Producer::Map] {
-        assert_no_silent_loss(
-            &format!("dedicated {producer:?}"),
-            10,
-            MIN_EXACT_LARGE,
-            |_| async {
-                let (ta, tb) = dedicated_pair(1024).await;
-                burst_then_complete(ta, tb, 40, 1 << 20, producer).await
-            },
-        )
+        assert_every_round_exact(&format!("dedicated {producer:?}"), 10, |_| async {
+            let (ta, tb) = dedicated_pair(1024).await;
+            burst_then_complete(ta, tb, 40, 1 << 20, producer).await
+        })
         .await;
-        assert_no_silent_loss(
-            &format!("shared {producer:?}"),
-            10,
-            MIN_EXACT_LARGE,
-            |_| async {
-                let (ma, mb) = shared_pair().await;
-                burst_then_complete(shared(&ma), shared(&mb), 40, 1 << 20, producer).await
-            },
-        )
+        assert_every_round_exact(&format!("shared {producer:?}"), 10, |_| async {
+            let (ma, mb) = shared_pair().await;
+            burst_then_complete(shared(&ma), shared(&mb), 40, 1 << 20, producer).await
+        })
         .await;
     }
 }
@@ -619,6 +522,13 @@ async fn per_job_managers_released_by_early_finisher() {
 /// the handshake timeout) and node-b gets them promptly. Rounds alternate
 /// between reconnecting factories (the old failure is a hang) and
 /// pre-established connections only (the old failure is the slow fallback).
+///
+/// R47: a node finishes only once every node's input has closed. Old
+/// trigger: node-b finished first with node-a's input still open. Now both
+/// inputs close, and the a -> b link is paused in front of node-a's first
+/// handshake frame: node-a's records and progress reach node-b, so both
+/// finish, while node-a's goodbye and its acknowledgement of node-b's stay
+/// queued.
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
 async fn owned_managers_write_queued_frames_before_closing() {
     let build = |b: &mut DataflowBuilder<u64>| -> Result<()> {
@@ -666,26 +576,30 @@ async fn owned_managers_write_queued_frames_before_closing() {
         let mut ob = collect(cb.take_output::<u64>(0, "out").unwrap());
         let ia = ca.take_input::<u64>(0, "data").unwrap();
         let ib = cb.take_input::<u64>(0, "data").unwrap();
-        a_to_b.pause();
+        a_to_b.pause_before_handshake();
         let ja = join_with_timeout(ca, Duration::from_secs(30));
         let jb = join_with_timeout(cb, Duration::from_secs(30));
 
-        // node-b finishes; its goodbye reaches node-a, whose ack is stalled.
+        // Both finish; node-b's goodbye reaches node-a, whose goodbye and
+        // acknowledgement are stalled.
         ib.send(0, (10..20).collect()).unwrap();
         drop(ib);
+        ia.send(0, (0..10).collect()).unwrap();
+        drop(ia);
         assert!(
             ob.wait_closed(Duration::from_secs(10)),
             "node-b did not finish"
         );
-        tokio::time::sleep(Duration::from_millis(200)).await;
         // node-a finishes and tears down: every link is retired.
-        ia.send(0, (0..10).collect()).unwrap();
-        drop(ia);
         assert!(
             oa.wait_closed(Duration::from_secs(10)),
             "node-a did not finish"
         );
         tokio::time::sleep(Duration::from_millis(500)).await;
+        assert!(
+            a_to_b.held_bytes() > 0,
+            "round {round}: the paused link held nothing"
+        );
         assert!(
             !ja.is_finished(),
             "round {round}: node-a released its connection before writing its queued frames"

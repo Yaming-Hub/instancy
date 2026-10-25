@@ -11,8 +11,9 @@
 //! | Check | Statement |
 //! |---|---|
 //! | [`Check::V1`] | Every batch a worker consumes at input `(op, port)` and time `t` is at or after that worker's input frontier: data never arrives behind the frontier. |
-//! | [`Check::V4`] | A worker never force-closes, or reports completion, while work is outstanding; an input whose every channel is exhausted gets an empty frontier within a bounded number of propagations. |
-//! | [`Check::V5`] | Report only: the non-zero counts left in a worker's view when it finishes. A negative count means a missing `+n`, a positive one a leak. |
+//! | [`Check::V3`] | Recorded, never panics: a logic call emitted output, retained a capability or asked for a notification at a time it does not justify. Production code enforces this and fails the operator (`ProgressError::Unjustified`). |
+//! | [`Check::V4`] | A worker never force-closes, seals, or reports completion while work it holds is outstanding; an input whose every channel is exhausted gets an empty frontier within a bounded number of propagations. |
+//! | [`Check::V5`] | The non-zero counts left in a worker's view once they are final: it succeeded, or every worker's seal is applied (a proven residual). A negative count means a missing `+n`, a positive one a leak. |
 //! | [`Check::V6`] | Wire rules: split progress batches are positives-first, and nothing follows a progress end-of-stream. (Frames carry no per-sender sequence number to check order with.) |
 //! | [`Check::V7`] | The oracle. It measures where work physically is, independently of the accounting under test, and asserts that no worker's view claims a location is done while work is still there. At successful completion every store must be empty. |
 //!
@@ -22,17 +23,23 @@
 //! other ledger. It counts work from the stores themselves:
 //!
 //! - **channels**: every channel is wrapped where it is materialized
-//!   ([`DataflowExecutor::materialize`](crate::dataflow::DataflowExecutor),
+//!   (the executor's materialization,
 //!   the one materialization point of every path). An envelope counts
 //!   from the moment a producer first offers it (so the inside of composite
 //!   pushers, exchange buckets, network queues and receive bridges is all
 //!   covered) until a consumer pulls it. Broadcast edges count one copy per
 //!   target worker;
-//! - **operator stores**: `InputHandle` buffers, `pending_output` retry
-//!   queues, channel-sink egress (`pending_send`) and `unary_async` input,
-//!   task and result queues, each measured from its own contents;
+//! - **operator stores**: the shell's input buffers (`InputHandle`), the
+//!   output a logic call emitted until the shell takes it (`OutputHandle`),
+//!   retry queues, channel-sink egress (`pending_send`) and `unary_async`
+//!   input, task and result queues, each measured from its own contents;
 //! - **capabilities**: live [`Capability`](crate::progress::capability::Capability)
-//!   objects and the capability an input source holds.
+//!   objects (a `Retained` holds one), counted from when the object is
+//!   created until a commit drains its release from the port's release
+//!   mailbox (its reporter).
+//!
+//! When a worker seals its progress stream, every store of its own operators
+//! must be empty (V4).
 //!
 //! Every worker publishes its frontiers after each propagation. The oracle
 //! checks each publication against all work currently counted, and checks
@@ -57,23 +64,22 @@
 //! first. In `panic` mode the hook applies the queue itself, so that the
 //! violating thread panics.
 //!
-//! A test whose outcome the checker's timing still changes can run its
-//! dataflow without it (`DataflowBuilder::skip_progress_check`).
-//!
 //! # Modes
 //!
 //! The environment variable `INSTANCY_PROGRESS_CHECK` selects what happens
 //! on a violation:
 //!
-//! - unset or `report`: violations are recorded in a process-wide log (see
+//! - `report`: violations are recorded in a process-wide log (see
 //!   [`violations_since`]) and emitted as `tracing` warnings;
 //! - `verbose`: as `report`, and each recorded violation is also printed to
 //!   standard error;
-//! - `panic`: as `report`, then the violating thread panics (V5 reports never
-//!   panic);
+//! - `panic`: as `report`, then the violating thread panics (a V3 record
+//!   never panics: its production error already fails the run);
 //! - `off`: no checking.
 //!
-//! [`set_mode`] overrides the variable for the whole process.
+//! Unset, it is `panic` in debug builds and `report` otherwise: after
+//! port-counted progress every finding is a bug. [`set_mode`] overrides the
+//! variable for the whole process.
 //!
 //! Each violation names the operator port it is about
 //! ([`Violation::location`]). The same kind of violation is logged at most
@@ -108,10 +114,15 @@ use crate::progress::timestamp::Timestamp;
 pub enum Check {
     /// Late data: a batch consumed behind the consuming worker's frontier.
     V1,
+    /// Justification: output, a retained capability or a notification at a
+    /// time the logic call does not justify. Production code enforces it
+    /// (`ProgressError::Unjustified`); the checker records it.
+    V3,
     /// Termination: completion or force-close with work outstanding, or an
     /// exhausted input whose frontier never empties.
     V4,
-    /// Residual report: non-zero counts in a finished worker's view.
+    /// Residual: non-zero counts in a worker's view once they are final (it
+    /// succeeded, or every worker's seal is applied).
     V5,
     /// Wire rules for progress traffic.
     V6,
@@ -121,10 +132,10 @@ pub enum Check {
 }
 
 impl Check {
-    /// Whether this check only reports (never fails a run, even in
-    /// [`Mode::Panic`]).
+    /// Whether this check only records (never panics, even in
+    /// [`Mode::Panic`]): V3, whose production error already fails the run.
     pub fn is_report(self) -> bool {
-        matches!(self, Check::V5)
+        matches!(self, Check::V3)
     }
 }
 
@@ -132,6 +143,7 @@ impl fmt::Display for Check {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let name = match self {
             Check::V1 => "V1",
+            Check::V3 => "V3",
             Check::V4 => "V4",
             Check::V5 => "V5",
             Check::V6 => "V6",
@@ -205,6 +217,10 @@ fn mode_from_env() -> Mode {
         "off" | "0" | "false" | "none" => Mode::Off,
         "panic" | "strict" => Mode::Panic,
         "verbose" => Mode::Verbose,
+        "report" => Mode::Report,
+        // After port-counted progress every finding is a bug: debug builds
+        // panic on it by default.
+        _ if cfg!(debug_assertions) => Mode::Panic,
         _ => Mode::Report,
     }
 }
@@ -218,7 +234,8 @@ fn encode_mode(mode: Mode) -> u8 {
     }
 }
 
-/// The current mode (from `INSTANCY_PROGRESS_CHECK` unless overridden).
+/// The current mode (from `INSTANCY_PROGRESS_CHECK` unless overridden; see
+/// the [module docs](self#modes)).
 pub fn mode() -> Mode {
     match MODE.load(Ordering::Relaxed) {
         1 => Mode::Off,
@@ -330,7 +347,68 @@ pub fn log_complete_since(mark: u64) -> bool {
     log().evicted_through < mark
 }
 
-/// Record a violation (a V5 report is recorded but never panics).
+static SPLIT_COMMITS: AtomicU64 = AtomicU64::new(0);
+static SPLIT_ACROSS_SECTIONS: AtomicU64 = AtomicU64::new(0);
+
+/// Progress commits sent on a cluster in several frames (see
+/// `DataflowBuilder::check_progress_batch_cap`), process-wide.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct SplitCommits {
+    /// Commits split into more than one frame.
+    pub split: u64,
+    /// Of those, commits with changes in more than one scope section (the
+    /// parent's and a loop scope's): their frames separate the sections.
+    pub across_sections: u64,
+}
+
+/// See [`SplitCommits`].
+pub fn split_commits() -> SplitCommits {
+    SplitCommits {
+        split: SPLIT_COMMITS.load(Ordering::Relaxed),
+        across_sections: SPLIT_ACROSS_SECTIONS.load(Ordering::Relaxed),
+    }
+}
+
+/// A commit with changes in `sections` scope sections was split into
+/// several frames.
+#[cfg(feature = "transport")]
+pub(crate) fn note_split_commit(sections: usize) {
+    SPLIT_COMMITS.fetch_add(1, Ordering::Relaxed);
+    if sections > 1 {
+        SPLIT_ACROSS_SECTIONS.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+thread_local! {
+    /// Live [`ExpectViolations`] guards on this thread.
+    static EXPECTING: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+fn expecting() -> bool {
+    EXPECTING.with(|e| e.get() > 0)
+}
+
+/// While it is alive, violations recorded on this thread never panic (they
+/// are still recorded): for a test that provokes violations on purpose and
+/// checks them in the log, in a process whose mode is [`Mode::Panic`]. In
+/// that mode the thread whose hook finds a violation records it.
+#[doc(hidden)]
+pub struct ExpectViolations(std::marker::PhantomData<*const ()>);
+
+/// See [`ExpectViolations`].
+#[doc(hidden)]
+pub fn expect_violations() -> ExpectViolations {
+    EXPECTING.with(|e| e.set(e.get() + 1));
+    ExpectViolations(std::marker::PhantomData)
+}
+
+impl Drop for ExpectViolations {
+    fn drop(&mut self) {
+        EXPECTING.with(|e| e.set(e.get() - 1));
+    }
+}
+
+/// Record a violation (a V3 record never panics).
 pub(crate) fn record(
     check: Check,
     kind: &'static str,
@@ -354,7 +432,8 @@ pub(crate) fn record(
     };
     #[cfg(feature = "tracing")]
     tracing::warn!(target: "instancy::progress::check", "{violation}");
-    if mode == Mode::Verbose || (mode == Mode::Panic && !check.is_report()) {
+    let panics = mode == Mode::Panic && !check.is_report() && !expecting();
+    if mode == Mode::Verbose || panics {
         if std::thread::current().name() == Some(CHECK_THREAD) {
             // The background thread inherited the output capture of the
             // test that started it, which it outlives: write past it.
@@ -367,7 +446,7 @@ pub(crate) fn record(
             eprintln!("instancy progress check: {violation}");
         }
     }
-    let message = (mode == Mode::Panic && !check.is_report()).then(|| violation.to_string());
+    let message = panics.then(|| violation.to_string());
     {
         let mut log = log();
         if log.entries.len() >= LOG_CAPACITY {
@@ -424,6 +503,8 @@ pub struct OracleStats {
     pub units_counted: u64,
     /// Workers that finished successfully.
     pub succeeded_workers: usize,
+    /// Workers that sealed their progress stream, in the order they did.
+    pub sealed_workers: Vec<usize>,
     /// Whether the end-state check ran (every worker succeeded).
     pub end_state_checked: bool,
     /// Why checking stopped early (cancellation or failure), if it did.
@@ -490,10 +571,19 @@ pub(crate) enum Store {
     InputBuffer,
     /// A channel sink's undelivered event (at its input).
     Egress,
-    /// `unary_async` input waiting for a task slot (at its input).
+    /// `unary_async` input waiting for a task slot (at its output: the
+    /// input is consumed, and covered by a capability).
     AsyncInput,
     /// An operator's `pending_output` (at its output).
     PendingOutput,
+    /// Output a logic call emitted, until its operator shell takes it (at its
+    /// output). Checked when a view publishes, not when the logic emits: the
+    /// shell checks the call's output (V3) as it takes it, and output it
+    /// takes is counted (and checked) in the retry queue or the channel.
+    OutputSession,
+    /// A retry envelope a tee has delivered to some of its branches (at each
+    /// target input it has not reached yet, R46).
+    PendingDelivery,
     /// `unary_async` tasks running or finished but not yet collected (at its
     /// output; counted in tasks).
     AsyncTask,
@@ -506,7 +596,11 @@ impl Store {
     fn at_output(self) -> bool {
         matches!(
             self,
-            Store::PendingOutput | Store::AsyncTask | Store::Capability
+            Store::PendingOutput
+                | Store::OutputSession
+                | Store::AsyncInput
+                | Store::AsyncTask
+                | Store::Capability
         )
     }
 }
@@ -585,17 +679,6 @@ impl<S: Timestamp> Port<S> {
         }
     }
 
-    /// A port at `loc` for work that belongs to no worker in particular
-    /// (counted for every view and at the end state).
-    pub(crate) fn new_shared(
-        sink: Arc<dyn Sink>,
-        worker: usize,
-        loc: Loc,
-        project: Option<Projector<S>>,
-    ) -> Self {
-        Self::new(sink, worker, loc, project).shared()
-    }
-
     fn with_root<R>(&self, time: &S, f: impl FnOnce(&dyn Any) -> R) -> R {
         match &self.project {
             Some(project) => {
@@ -615,6 +698,14 @@ impl<S: Timestamp> Port<S> {
             self.sink
                 .count_any(store, self.loc, self.owner, root, diff, self.worker)
         });
+    }
+
+    /// A logic call of the operator this port belongs to was unjustified
+    /// (V3): production code fails the operator; the checker records it.
+    pub(crate) fn unjustified(&self, detail: String) {
+        if enabled() {
+            self.sink.unjustified(self.worker, self.loc, detail);
+        }
     }
 
     /// A consumer at this (input) port took `n` records at `time` out of the
@@ -649,19 +740,105 @@ pub(crate) trait Sink: Send + Sync + 'static {
     fn consumed_any(&self, loc: Loc, owner: Owner, time: &dyn Any, n: i64, worker: usize);
     fn exhausted(&self, loc: Loc, worker: usize);
     fn register_channel(&self, source: Loc, target: Loc);
+    /// A logic call at `loc` (an output) was unjustified (V3).
+    fn unjustified(&self, worker: usize, loc: Loc, detail: String);
     fn coverage_gap(&self, worker: Option<usize>, what: String);
     fn stats(&self) -> OracleStats;
     /// Apply the queued events.
     fn drain(&self);
     /// Applying the queue panicked (a checker bug): halt and report it.
     fn failed(&self, what: String);
+    /// Name the dataflow's operators (see [`Oracle::register_names`]).
+    fn register_names_vec(&self, operators: Vec<(usize, String)>);
 }
 
-/// Materialization context: the oracle and the worker being materialized.
+/// Creates (or finds) the oracle of one nested scope of a dataflow, in the
+/// scope's own time: `(dataflow id, total workers)` to the oracle, as a sink
+/// and as `Arc<Oracle<S>>`.
+pub(crate) type ScopeOracleFn = Arc<
+    dyn Fn(DataflowId, usize) -> Option<(Arc<dyn Sink>, Arc<dyn Any + Send + Sync>)> + Send + Sync,
+>;
+
+/// The [`ScopeOracleFn`] of nested scope `scope`, whose time is `S`.
+pub(crate) fn scope_oracle_fn<S: Timestamp>(scope: usize) -> ScopeOracleFn {
+    Arc::new(move |id, total_workers| {
+        oracle_scoped::<S>(id, scope, total_workers).map(|oracle| {
+            let sink: Arc<dyn Sink> = oracle.clone();
+            let typed: Arc<dyn Any + Send + Sync> = oracle;
+            (sink, typed)
+        })
+    })
+}
+
+/// Materialization context: the oracles and the worker being materialized.
+///
+/// Every progress scope has its own oracle in its own time (design §5.1.7):
+/// the root scope's is `sink`, and each nested scope's (a loop body, in
+/// `Product` time) is in `scopes`. A channel, store or tracker of a scope
+/// reports to that scope's oracle, so loop-body work is judged against the
+/// loop's own frontiers, never projected onto the outer time.
 #[derive(Clone)]
 pub(crate) struct Ctx {
     pub(crate) sink: Arc<dyn Sink>,
     pub(crate) worker: usize,
+    id: Option<DataflowId>,
+    total_workers: usize,
+    typed: Arc<dyn Any + Send + Sync>,
+    scopes: Arc<HashMap<usize, (Arc<dyn Sink>, Arc<dyn Any + Send + Sync>)>>,
+}
+
+impl Ctx {
+    /// This context, with the oracle of every nested scope `scopes`
+    /// describes. `names` names the dataflow's operators for them.
+    pub(crate) fn with_scopes(
+        mut self,
+        scopes: &[(usize, ScopeOracleFn)],
+        names: &[(usize, String)],
+    ) -> Self {
+        let Some(id) = self.id else {
+            return self;
+        };
+        let mut map = HashMap::new();
+        for (scope, make) in scopes {
+            if let Some((sink, typed)) = make(id, self.total_workers) {
+                sink.register_names_vec(names.to_vec());
+                map.insert(*scope, (sink, typed));
+            }
+        }
+        self.scopes = Arc::new(map);
+        self
+    }
+
+    /// The sink of scope `scope` (0: the root). A scope without an oracle
+    /// falls back to the root's, which reports the time mismatch as a
+    /// coverage gap.
+    pub(crate) fn sink_for(&self, scope: usize) -> Arc<dyn Sink> {
+        if scope == 0 {
+            return self.sink.clone();
+        }
+        match self.scopes.get(&scope) {
+            Some((sink, _)) => sink.clone(),
+            None => self.sink.clone(),
+        }
+    }
+
+    /// This context with scope `scope`'s oracle as its sink.
+    pub(crate) fn for_scope(&self, scope: usize) -> Ctx {
+        Ctx {
+            sink: self.sink_for(scope),
+            ..self.clone()
+        }
+    }
+
+    /// Scope `scope`'s oracle, if its time is `S`.
+    pub(crate) fn typed_oracle<S: Timestamp>(&self, scope: usize) -> Option<Arc<Oracle<S>>> {
+        let typed = if scope == 0 {
+            self.typed.clone()
+        } else {
+            self.scopes.get(&scope)?.1.clone()
+        };
+        typed.downcast::<Oracle<S>>().ok()
+    }
 }
 
 impl fmt::Debug for Ctx {
@@ -679,38 +856,35 @@ struct Entry {
     typed: Weak<dyn Any + Send + Sync>,
 }
 
-fn registry() -> MutexGuard<'static, HashMap<DataflowId, Entry>> {
-    static REGISTRY: OnceLock<Mutex<HashMap<DataflowId, Entry>>> = OnceLock::new();
+fn registry() -> MutexGuard<'static, HashMap<(DataflowId, usize), Entry>> {
+    static REGISTRY: OnceLock<Mutex<HashMap<(DataflowId, usize), Entry>>> = OnceLock::new();
     REGISTRY
         .get_or_init(Default::default)
         .lock()
         .unwrap_or_else(|e| e.into_inner())
 }
 
-/// [`oracle`], unless the dataflow runs without the checker
-/// (`DataflowBuilder::skip_progress_check`).
-pub(crate) fn oracle_unless<T: Timestamp>(
-    skip: bool,
-    id: DataflowId,
-    total_workers: usize,
-) -> Option<Arc<Oracle<T>>> {
-    if skip {
-        None
-    } else {
-        oracle(id, total_workers)
-    }
-}
-
 /// The oracle for dataflow `id`, created on first use. Every node of a
 /// cluster in this process gets the same one. Returns `None` when checking
 /// is off.
 pub(crate) fn oracle<T: Timestamp>(id: DataflowId, total_workers: usize) -> Option<Arc<Oracle<T>>> {
+    oracle_scoped(id, 0, total_workers)
+}
+
+/// The oracle of progress scope `scope` (0: the root) of dataflow `id`, in
+/// the scope's time `T`, created on first use.
+pub(crate) fn oracle_scoped<T: Timestamp>(
+    id: DataflowId,
+    scope: usize,
+    total_workers: usize,
+) -> Option<Arc<Oracle<T>>> {
     if !enabled() {
         return None;
     }
+    let id_key = (id, scope);
     let mut registry = registry();
     registry.retain(|_, entry| entry.sink.strong_count() > 0);
-    if let Some(existing) = registry.get(&id).and_then(|e| e.typed.upgrade()) {
+    if let Some(existing) = registry.get(&id_key).and_then(|e| e.typed.upgrade()) {
         match existing.downcast::<Oracle<T>>() {
             Ok(oracle) if oracle.total_workers == total_workers => return Some(oracle),
             _ => {
@@ -733,7 +907,7 @@ pub(crate) fn oracle<T: Timestamp>(id: DataflowId, total_workers: usize) -> Opti
     watch(&sink);
     let typed: Arc<dyn Any + Send + Sync> = oracle.clone();
     registry.insert(
-        id,
+        id_key,
         Entry {
             sink: Arc::downgrade(&sink),
             typed: Arc::downgrade(&typed),
@@ -988,10 +1162,15 @@ enum Event<T: Timestamp> {
         at: std::time::Instant,
     },
     Exhausted(Loc),
-    ForceClose(u64),
     WorkerFinished {
         worker: usize,
         ok: bool,
+    },
+    WorkerSealed(usize),
+    Unjustified {
+        worker: usize,
+        loc: Loc,
+        detail: String,
     },
     RetireView(u64),
     Halt(String),
@@ -1176,10 +1355,21 @@ impl<T: Timestamp> Oracle<T> {
                 at,
             } => self.publish_locked(state, view, targets, sources, at, found),
             Event::Exhausted(loc) => *state.exhausted.entry(loc).or_insert(0) += 1,
-            Event::ForceClose(view) => self.force_close_locked(state, view, found),
             Event::WorkerFinished { worker, ok } => {
                 self.worker_finished_locked(state, worker, ok, found)
             }
+            Event::WorkerSealed(worker) => self.worker_sealed_locked(state, worker, found),
+            Event::Unjustified {
+                worker,
+                loc,
+                detail,
+            } => found.push(Found {
+                check: Check::V3,
+                kind: "unjustified",
+                worker: Some(worker),
+                site: Some((loc, true)),
+                detail,
+            }),
             Event::RetireView(view) => {
                 state.views.remove(&view);
             }
@@ -1267,9 +1457,14 @@ impl<T: Timestamp> Oracle<T> {
 
     /// A context for materializing `worker`'s channels.
     pub(crate) fn ctx(self: &Arc<Self>, worker: usize) -> Ctx {
+        let typed: Arc<dyn Any + Send + Sync> = self.clone();
         Ctx {
             sink: self.clone(),
             worker,
+            id: self.id,
+            total_workers: self.total_workers,
+            typed,
+            scopes: Arc::new(HashMap::new()),
         }
     }
 
@@ -1418,12 +1613,23 @@ impl<T: Timestamp> Oracle<T> {
                 })
                 .map(|(loc, _)| *loc)
                 .collect();
+            // Records still at the input (in a channel or an input buffer, of
+            // any worker: the location is shared) legitimately hold its
+            // frontier; the grace starts once it is physically empty.
+            let occupied: BTreeSet<Loc> = state
+                .counts
+                .iter()
+                .filter(|((store, loc, _), times)| {
+                    !store.at_output() && exhausted.contains(loc) && times.values().any(|n| *n != 0)
+                })
+                .map(|((_, loc, _), _)| *loc)
+                .collect();
             let v = state.views.get_mut(&view).expect("view exists");
             for loc in exhausted {
                 let Some(frontier) = v.targets.get(&loc) else {
                     continue;
                 };
-                if frontier.is_empty() {
+                if frontier.is_empty() || occupied.contains(&loc) {
                     v.stuck.remove(&loc);
                     continue;
                 }
@@ -1443,9 +1649,10 @@ impl<T: Timestamp> Oracle<T> {
                         worker: Some(v.worker),
                         site: Some((loc, false)),
                         detail: format!(
-                            "every channel into input {loc:?} is exhausted, but the {} \
-                             view still has frontier {:?} there after {EXHAUSTED_GRACE} \
-                             propagations and {EXHAUSTED_GRACE_TIME:?}",
+                            "every channel into input {loc:?} is exhausted and no record \
+                             is left there, but the {} view still has frontier {:?} there \
+                             after {EXHAUSTED_GRACE} propagations and \
+                             {EXHAUSTED_GRACE_TIME:?}",
                             v.label,
                             frontier.elements()
                         ),
@@ -1455,56 +1662,47 @@ impl<T: Timestamp> Oracle<T> {
         }
     }
 
-    /// A worker force-closes its operators because its tracker reports
-    /// completion: nothing may still be outstanding in its view's locations.
-    pub(crate) fn force_close(&self, view: u64) {
-        self.enqueue(Event::ForceClose(view));
-    }
-
-    /// `force_close`, applied.
-    fn force_close_locked(&self, state: &mut State<T>, view: u64, found: &mut Vec<Found>) {
-        if self.partial(state) || state.halted.is_some() {
-            return;
-        }
-        let Some(v) = state.views.get(&view) else {
-            return;
-        };
-        let mut outstanding = Vec::new();
-        for ((store, loc, owner), times) in &state.counts {
-            if !view_covers(v, &state.out_edges, *store, *loc) {
-                continue;
-            }
-            for (time, &n) in times {
-                if n > 0 {
-                    outstanding.push(format!(
-                        "{n} in {store:?} at {loc:?}@{time:?}{}",
-                        owner_suffix(*owner)
-                    ));
-                }
-            }
-        }
-        if !outstanding.is_empty() {
-            outstanding.truncate(8);
-            found.push(Found {
-                check: Check::V4,
-                kind: "force-close-with-work",
-                worker: Some(v.worker),
-                site: None,
-                detail: format!(
-                    "its {} reports completion and it force-closes its operators while \
-                     work is outstanding: {}",
-                    v.label,
-                    outstanding.join(", ")
-                ),
-            });
-        }
-    }
-
     /// A worker's executor finished (`ok`: it reports success). Its own
     /// stores must then be empty and it may hold no capability; when every
     /// worker has succeeded, the channels between workers must be empty too.
     pub(crate) fn worker_finished(&self, worker: usize, ok: bool) {
         self.enqueue(Event::WorkerFinished { worker, ok });
+    }
+
+    /// A worker sealed its progress stream: every operator it hosts is shut
+    /// down or exhausted, so none may hold work (V4). Channels are not its own
+    /// stores: records it sent may still be on their way.
+    pub(crate) fn worker_sealed(&self, worker: usize) {
+        self.enqueue(Event::WorkerSealed(worker));
+    }
+
+    /// `worker_sealed`, applied.
+    fn worker_sealed_locked(&self, state: &mut State<T>, worker: usize, found: &mut Vec<Found>) {
+        if !state.stats.sealed_workers.contains(&worker) {
+            state.stats.sealed_workers.push(worker);
+        }
+        if state.halted.is_some() || self.partial(state) {
+            return;
+        }
+        for ((store, loc, owner), times) in &state.counts {
+            if *owner != Some(worker) || *store == Store::Channel {
+                continue;
+            }
+            for (time, &n) in times {
+                if n != 0 {
+                    found.push(Found {
+                        check: Check::V4,
+                        kind: "sealed-holding-work",
+                        worker: Some(worker),
+                        site: Some((*loc, store.at_output())),
+                        detail: format!(
+                            "worker {worker} sealed its progress while {n} unit(s) of {store:?} \
+                             at {loc:?}@{time:?} were still there"
+                        ),
+                    });
+                }
+            }
+        }
     }
 
     /// `worker_finished`, applied.
@@ -1628,7 +1826,11 @@ impl<T: Timestamp> Oracle<T> {
                 ),
             });
         }
-        if diff > 0 && now > 0 && !v7_saturated(&state.site_logged, &state.out_edges, store, loc) {
+        if diff > 0
+            && now > 0
+            && store != Store::OutputSession
+            && !v7_saturated(&state.site_logged, &state.out_edges, store, loc)
+        {
             let mut budget = Budget::new(&state.site_logged);
             for v in state.views.values() {
                 check_one(
@@ -1732,22 +1934,6 @@ fn residual<T: Timestamp>(store: Store, loc: Loc, owner: Owner, time: &T, n: i64
             "reported success with {n} unit(s) left in {store:?} at {loc:?}@{time:?}{}: {what}",
             owner_suffix(owner)
         ),
-    }
-}
-
-/// Whether view `v` tracks the location `(store, loc)` is checked against.
-fn view_covers<T: Timestamp>(
-    v: &View<T>,
-    out_edges: &LocMap<BTreeSet<Loc>>,
-    store: Store,
-    loc: Loc,
-) -> bool {
-    match store {
-        Store::Capability => v.sources.contains_key(&loc),
-        s if s.at_output() => out_edges
-            .get(&loc)
-            .is_some_and(|targets| targets.iter().any(|t| v.targets.contains_key(t))),
-        _ => v.targets.contains_key(&loc),
     }
 }
 
@@ -1866,6 +2052,14 @@ impl<T: Timestamp> Sink for Oracle<T> {
         state.stats.wrapped_channels += 1;
     }
 
+    fn unjustified(&self, worker: usize, loc: Loc, detail: String) {
+        self.enqueue(Event::Unjustified {
+            worker,
+            loc,
+            detail,
+        });
+    }
+
     fn coverage_gap(&self, worker: Option<usize>, what: String) {
         self.lock().stats.coverage_gaps += 1;
         self.emit(vec![Found {
@@ -1896,6 +2090,10 @@ impl<T: Timestamp> Sink for Oracle<T> {
         }
         self.queue.lock().unwrap_or_else(|e| e.into_inner()).clear();
         record(Check::V7, "checker-failed", self.id, None, None, reason);
+    }
+
+    fn register_names_vec(&self, operators: Vec<(usize, String)>) {
+        self.register_names(operators);
     }
 }
 
@@ -1945,22 +2143,24 @@ impl<T: Timestamp> TrackerCheck<T> {
         self.oracle.publish(self.view, targets, sources);
     }
 
-    pub(crate) fn force_close(&self) {
-        self.oracle.force_close(self.view);
-    }
-
     pub(crate) fn halt(&self, reason: &str) {
         self.oracle.halt(reason);
     }
 
+    /// The tracker's worker sealed its progress stream (see
+    /// [`Oracle::worker_sealed`]).
+    pub(crate) fn sealed(&self) {
+        self.oracle.worker_sealed(self.worker);
+    }
+
     /// The tracker's executor finished; `residual` lists the view's non-zero
-    /// counts (V5 report).
+    /// counts (V5 report), when they are final (empty otherwise).
     pub(crate) fn finish(&mut self, ok: bool, residual: Vec<String>, report_worker: bool) {
         if self.finished {
             return;
         }
         self.finished = true;
-        if ok && !residual.is_empty() {
+        if !residual.is_empty() {
             let total = residual.len();
             let shown: Vec<String> = residual.into_iter().take(8).collect();
             record(
@@ -2040,6 +2240,11 @@ impl<S: Timestamp, D, M> CheckedPush<S, D, M> {
     }
 }
 
+impl<S: Timestamp, D: 'static, M: 'static> crate::dataflow::channels::pushpull::sealed::Sealed
+    for CheckedPush<S, D, M>
+{
+}
+
 impl<S: Timestamp, D: 'static, M: 'static> Push<S, D, M> for CheckedPush<S, D, M> {
     fn push(&mut self, envelope: Envelope<S, D, M>) -> crate::error::Result<()> {
         self.offer(&envelope);
@@ -2084,12 +2289,12 @@ impl<S: Timestamp, D: 'static, M: 'static> Push<S, D, M> for CheckedPush<S, D, M
         self.inner.available_capacity()
     }
 
-    fn set_inflight_reporter(&mut self, reporter: crate::progress::operate::ProgressReporter<S>) {
-        self.inner.set_inflight_reporter(reporter);
-    }
-
     fn check_port(&self) -> Option<Port<S>> {
         Some(self.source.clone())
+    }
+
+    fn check_target(&self) -> Option<Port<S>> {
+        Some(self.target.clone())
     }
 }
 
@@ -2099,6 +2304,11 @@ pub(crate) struct CheckedPull<S: Timestamp, D, M> {
     inner: Box<dyn Pull<S, D, M>>,
     target: Port<S>,
     exhausted: std::sync::atomic::AtomicBool,
+}
+
+impl<S: Timestamp, D: 'static, M: 'static> crate::dataflow::channels::pushpull::sealed::Sealed
+    for CheckedPull<S, D, M>
+{
 }
 
 impl<S: Timestamp, D: 'static, M: 'static> Pull<S, D, M> for CheckedPull<S, D, M> {
@@ -2118,10 +2328,6 @@ impl<S: Timestamp, D: 'static, M: 'static> Pull<S, D, M> for CheckedPull<S, D, M
                 .exhausted(self.target.loc, self.target.worker);
         }
         exhausted
-    }
-
-    fn set_inflight_reporter(&mut self, reporter: crate::progress::operate::ProgressReporter<S>) {
-        self.inner.set_inflight_reporter(reporter);
     }
 
     fn check_port(&self) -> Option<Port<S>> {
@@ -2266,6 +2472,9 @@ impl<S: Timestamp> fmt::Debug for StoreCheck<S> {
 pub(crate) struct PendingOutput<S: Timestamp, D, M = ()> {
     queue: std::collections::VecDeque<Envelope<S, D, M>>,
     check: Option<StoreCheck<S>>,
+    /// The front envelope, if a tee delivered it to some branches: counted
+    /// only at the target inputs it has not reached (R46).
+    front: Option<Vec<StoreCheck<S>>>,
 }
 
 /// Records in a data envelope.
@@ -2281,6 +2490,7 @@ impl<S: Timestamp, D, M> PendingOutput<S, D, M> {
         Self {
             queue: std::collections::VecDeque::new(),
             check: None,
+            front: None,
         }
     }
 
@@ -2315,8 +2525,43 @@ impl<S: Timestamp, D, M> PendingOutput<S, D, M> {
 
     pub(crate) fn pop_front(&mut self) -> Option<Envelope<S, D, M>> {
         let envelope = self.queue.pop_front()?;
-        self.removed(&envelope);
+        match self.front.take() {
+            Some(targets) => {
+                if let Some((time, n)) = records(&envelope) {
+                    for target in &targets {
+                        target.remove(time, n);
+                    }
+                }
+            }
+            None => self.removed(&envelope),
+        }
         Some(envelope)
+    }
+
+    /// Put back an envelope the push end refused. `unreached`: the target
+    /// inputs it has not reached, if it reached some (see
+    /// [`Push::check_unreached`]); it counts only there.
+    pub(crate) fn push_front_refused(
+        &mut self,
+        envelope: Envelope<S, D, M>,
+        unreached: Option<Vec<Port<S>>>,
+    ) {
+        match unreached {
+            Some(ports) if self.check.is_some() => {
+                let targets: Vec<StoreCheck<S>> = ports
+                    .into_iter()
+                    .map(|port| StoreCheck::new(port, Store::PendingDelivery))
+                    .collect();
+                if let Some((time, n)) = records(&envelope) {
+                    for target in &targets {
+                        target.add(time, n);
+                    }
+                }
+                self.front = Some(targets);
+                self.queue.push_front(envelope);
+            }
+            _ => self.push_front(envelope),
+        }
     }
 
     pub(crate) fn is_empty(&self) -> bool {
@@ -2353,7 +2598,6 @@ mod tests {
         // Records sent to the other process, never pulled here.
         oracle.count(Store::Channel, (2, 0), None, &1, 3, 0);
         oracle.publish(view, [((2, 0), frontier(4))], []);
-        oracle.force_close(view);
         assert!(
             violations_for(id).iter().all(|v| v.check.is_report()),
             "{:?}",
@@ -2364,6 +2608,8 @@ mod tests {
     /// With every worker registered, the same counts are violations.
     #[test]
     fn oracle_with_every_worker_reports_negative_occupancy_and_late_frontier() {
+        // Provokes violations on purpose.
+        let _expect = expect_violations();
         let id = DataflowId::new();
         let oracle = oracle::<u64>(id, 1).expect("checking is on in tests");
         oracle.register_worker(0);
@@ -2381,6 +2627,8 @@ mod tests {
     /// however long it stays stuck.
     #[test]
     fn exhausted_input_is_reported_once() {
+        // Provokes violations on purpose.
+        let _expect = expect_violations();
         let id = DataflowId::new();
         let oracle = oracle::<u64>(id, 1).expect("checking is on in tests");
         oracle.register_worker(0);
@@ -2404,6 +2652,8 @@ mod tests {
     /// invariant on every record) does not hide another location's.
     #[test]
     fn a_saturated_location_does_not_hide_another() {
+        // Provokes violations on purpose.
+        let _expect = expect_violations();
         let id = DataflowId::new();
         let oracle = oracle::<u64>(id, 1).expect("checking is on in tests");
         oracle.register_worker(0);
@@ -2435,6 +2685,8 @@ mod tests {
     /// checked against advances past it, whichever store holds it.
     #[test]
     fn a_frontier_advancing_past_held_work_is_found() {
+        // Provokes violations on purpose.
+        let _expect = expect_violations();
         let id = DataflowId::new();
         let oracle = oracle::<u64>(id, 1).expect("checking is on in tests");
         oracle.register_worker(0);
@@ -2477,6 +2729,8 @@ mod tests {
     /// order; an unnamed operator is named by its index.
     #[test]
     fn violation_locations_name_operators() {
+        // Provokes violations on purpose.
+        let _expect = expect_violations();
         let id = DataflowId::new();
         let oracle = oracle::<u64>(id, 1).expect("checking is on in tests");
         oracle.register_worker(0);
@@ -2504,5 +2758,56 @@ mod tests {
             .map(String::from)
             .collect();
         assert_eq!(locations, expected);
+    }
+
+    /// A worker that seals while one of its own operators still holds work
+    /// is a V4 violation. Records it sent are not its store: they may still
+    /// be on their way.
+    #[test]
+    fn sealing_with_work_held_is_found() {
+        // Provokes a violation on purpose.
+        let _expect = expect_violations();
+        let id = DataflowId::new();
+        let oracle = oracle::<u64>(id, 1).expect("checking is on in tests");
+        oracle.register_worker(0);
+        oracle.register_channel((1, 0), (2, 0));
+        oracle.count(Store::Channel, (2, 0), Some(0), &0, 3, 0);
+        oracle.worker_sealed(0);
+        assert!(violations_for(id).is_empty(), "{:?}", violations_for(id));
+        oracle.count(Store::OutputSession, (1, 0), Some(0), &0, 1, 0);
+        oracle.worker_sealed(0);
+        let sealed: Vec<Violation> = violations_for(id)
+            .into_iter()
+            .filter(|v| v.check == Check::V4 && v.kind == "sealed-holding-work")
+            .collect();
+        assert_eq!(sealed.len(), 1, "{sealed:?}");
+    }
+
+    /// A released capability stays counted until a commit drains its
+    /// release from the port's mailbox (its reporter).
+    #[test]
+    fn a_release_counts_until_a_commit_drains_it() {
+        use crate::progress::capability::Capability;
+        use crate::progress::operate::ProgressReporter;
+        let id = DataflowId::new();
+        let oracle = oracle::<u64>(id, 1).expect("checking is on in tests");
+        oracle.register_worker(0);
+        let sink: Arc<dyn Sink> = oracle.clone();
+        let reporter = ProgressReporter::<u64>::new();
+        reporter.set_check_port(Port::new(sink, 0, (1, 0), None));
+        let held = |oracle: &Oracle<u64>| -> i64 {
+            oracle
+                .sync()
+                .counts
+                .get(&(Store::Capability, (1, 0), Some(0)))
+                .map(|times| times.values().sum())
+                .unwrap_or(0)
+        };
+        let capability = Capability::new(4, reporter.clone());
+        assert_eq!(held(&oracle), 1);
+        drop(capability);
+        assert_eq!(held(&oracle), 1, "released, but not committed yet");
+        let _ = reporter.drain();
+        assert_eq!(held(&oracle), 0);
     }
 }

@@ -200,16 +200,36 @@ pub enum ProgressError {
     #[error("no capability in set dominates time {time}")]
     NoDominatingCapability { time: String },
 
-    /// An operator requested a notification (and output capability) at a time
-    /// it cannot hold: the time is not at or after the operator's input
-    /// frontier, a capability it already holds, or the time of an input batch
-    /// it is processing. Holding such a capability would move downstream
-    /// frontiers backwards.
+    /// An error envelope reached an operator input. Error envelopes are
+    /// fatal on every transport: the operator fails the dataflow.
+    #[error("operator input received an error from '{source_operator}': {message}")]
+    UpstreamError {
+        source_operator: String,
+        message: String,
+    },
+
+    /// An operator emitted output, or acquired or downgraded a capability,
+    /// at a time nothing justifies (V3): no capability it held when its
+    /// logic was called, and no input it consumed in that call, is at or
+    /// before the time. Output at such a time could arrive behind a
+    /// frontier that already passed it (late data). Hold the work with
+    /// `retain` (or `notify_at`) to emit it in a later call.
     #[error(
-        "cannot request a notification at {time}: not at or after the input frontier \
-         {frontier}, a held capability, or a pending input time"
+        "unjustified {what}: nothing held or consumed in this call is at or before it \
+         (justified: {justified})"
     )]
-    InvalidNotificationTime { time: String, frontier: String },
+    Unjustified { what: String, justified: String },
+
+    /// A record reached an operator instance that had already shut down
+    /// (S3: it would be silently dropped).
+    #[error("operator '{operator}' received a record at {time} after it shut down")]
+    RecordAfterShutdown { operator: String, time: String },
+
+    /// After every worker's seal was applied, this worker's view still held
+    /// non-zero counts in its scope: an accounting bug (a leaked `+n`, or a
+    /// `-n` without its `+n`).
+    #[error("progress residual at completion: {residual}")]
+    Residual { residual: String },
 }
 
 /// Errors related to cluster topology management.

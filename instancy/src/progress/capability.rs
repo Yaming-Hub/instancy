@@ -52,6 +52,17 @@ impl<T: Timestamp> Capability<T> {
         Self { time, reporter }
     }
 
+    /// The capability an operator instance holds from the start: one of the
+    /// initial capabilities its operator declares, which every progress
+    /// tracker seeds from the physical plan (A4). Nothing is reported when
+    /// it is created; dropping or downgrading it reports as usual.
+    pub(crate) fn seeded(time: T, reporter: ProgressReporter<T>) -> Self {
+        reporter.seed_held(time.clone(), 1);
+        #[cfg(any(debug_assertions, feature = "progress-check"))]
+        reporter.check_hold(&time, 1);
+        Self { time, reporter }
+    }
+
     /// Returns the timestamp this capability permits.
     pub fn time(&self) -> &T {
         &self.time
@@ -96,10 +107,7 @@ impl<T: Timestamp> Capability<T> {
         // Atomic paired update: no intermediate state visible.
         self.reporter.downgrade(self.time.clone(), new_time.clone());
         #[cfg(any(debug_assertions, feature = "progress-check"))]
-        {
-            self.reporter.check_hold(new_time, 1);
-            self.reporter.check_hold(&self.time, -1);
-        }
+        self.reporter.check_hold(new_time, 1);
         self.time = new_time.clone();
         Ok(())
     }
@@ -113,9 +121,9 @@ impl<T: Timestamp> Clone for Capability<T> {
 
 impl<T: Timestamp> Drop for Capability<T> {
     fn drop(&mut self) {
-        self.reporter.update(self.time.clone(), -1);
-        #[cfg(any(debug_assertions, feature = "progress-check"))]
-        self.reporter.check_hold(&self.time, -1);
+        // The `-1` and the checker's release land together: a `Retained`
+        // may be dropped on another thread than the one draining.
+        self.reporter.release(self.time.clone());
     }
 }
 

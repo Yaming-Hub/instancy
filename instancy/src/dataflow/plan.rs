@@ -34,7 +34,7 @@
 use std::collections::BTreeMap;
 use std::hash::Hasher;
 
-use crate::dataflow::graph::DataflowGraph;
+use crate::dataflow::graph::{DataflowGraph, Delivery};
 use crate::dataflow::stage::StageInfo;
 use crate::dataflow::stream::Slot;
 use crate::error::{Error, Result, RuntimeError};
@@ -111,6 +111,8 @@ pub(crate) struct EdgePlan {
     pub(crate) target_hosts: usize,
     /// Whether both ends are in the same stage.
     pub(crate) same_stage: bool,
+    /// How many copies of each record the edge delivers (R35).
+    pub(crate) delivery: Delivery,
 }
 
 impl EdgePlan {
@@ -127,6 +129,15 @@ impl EdgePlan {
     /// Whether `worker` runs the edge's target.
     pub(crate) fn runs_target(&self, worker: usize) -> bool {
         worker < self.target_hosts
+    }
+
+    /// How many records reach the target per record produced at the
+    /// source: 1, or `hosts(target)` for a broadcast.
+    pub(crate) fn multiplicity(&self) -> i64 {
+        match self.delivery {
+            Delivery::One => 1,
+            Delivery::AllTargetHosts => self.target_hosts as i64,
+        }
     }
 }
 
@@ -305,6 +316,7 @@ impl PhysicalPlan {
                 source_hosts: source.hosts,
                 target_hosts: target.hosts,
                 same_stage: source.stage == target.stage,
+                delivery: edge.delivery,
             });
         }
 
@@ -440,6 +452,10 @@ impl PhysicalPlan {
             h.write_u64(edge.source_hosts as u64);
             h.write_u64(edge.target_hosts as u64);
             h.write_u64(u64::from(edge.same_stage));
+            h.write_u64(match edge.delivery {
+                Delivery::One => 0,
+                Delivery::AllTargetHosts => 1,
+            });
         }
         h.finish()
     }
@@ -730,11 +746,11 @@ mod tests {
     }
 
     /// A loop after a parallelism change (`exchange_to(1)` then `iterate` on 2
-    /// workers) is rejected through its feedback edge, as before step 2: stage
-    /// inference puts the loop's feedback operator, which has no regular
-    /// input, in stage 0.
+    /// workers) plans like any other stage (R18): stage inference puts the
+    /// loop's feedback operator, which has no regular input, in its loop's
+    /// stage, so the feedback edge stays within one stage.
     #[test]
-    fn loop_after_parallelism_change_reports_its_feedback_edge() {
+    fn loop_after_parallelism_change_plans_its_feedback_in_the_loop_stage() {
         let b = DataflowBuilder::<u64>::new("plan");
         b.input::<u64>("in")
             .unwrap()
@@ -750,10 +766,19 @@ mod tests {
             .output("out")
             .unwrap();
         let df = b.build().unwrap();
-        let err = PhysicalPlan::new(&df.graph, &df.stages, Parallelism::PerStage { default: 2 })
-            .unwrap_err()
-            .to_string();
-        assert!(err.contains("cross-stage feedback edge"), "{err}");
+        let plan =
+            PhysicalPlan::new(&df.graph, &df.stages, Parallelism::PerStage { default: 2 }).unwrap();
+        let feedback = df.graph.feedback_edges()[0].target.operator_index;
+        let concat = df
+            .graph
+            .edges()
+            .iter()
+            .find(|e| e.source.operator_index == feedback)
+            .unwrap()
+            .target
+            .operator_index;
+        assert_eq!(plan.hosts(feedback), plan.hosts(concat));
+        assert_eq!(plan.hosts(feedback), 1);
     }
 
     #[test]

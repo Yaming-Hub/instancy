@@ -32,5 +32,6 @@ pub use envelope::{ControlSignal, Envelope, Payload};
 pub use pact::{ExchangeFn, PartitionStrategy, Router};
 pub use pushpull::{ChannelPair, Pull, Push};
 pub use spsc::{SpscPull, SpscPush, spsc_channel};
+pub(crate) use tee::NullPush;
 pub use tee::{TeePush, tee_or_single};
 pub use wake::WakeHandle;

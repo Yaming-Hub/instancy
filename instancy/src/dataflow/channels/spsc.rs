@@ -157,6 +157,11 @@ pub struct SpscPush<T: Timestamp, D, M = ()> {
 // Safety: SpscPush is Send because it is the sole producer.
 unsafe impl<T: Timestamp, D: Send, M: Send> Send for SpscPush<T, D, M> {}
 
+impl<T: Timestamp, D: Send + 'static, M: Send + 'static>
+    crate::dataflow::channels::pushpull::sealed::Sealed for SpscPush<T, D, M>
+{
+}
+
 impl<T: Timestamp, D: Send + 'static, M: Send + 'static> Push<T, D, M> for SpscPush<T, D, M> {
     fn push(&mut self, envelope: Envelope<T, D, M>) -> Result<()> {
         if self.ring.closed.load(Ordering::Acquire) {
@@ -264,6 +269,11 @@ pub struct SpscPull<T: Timestamp, D, M = ()> {
 
 // Safety: SpscPull is Send because it is the sole consumer.
 unsafe impl<T: Timestamp, D: Send, M: Send> Send for SpscPull<T, D, M> {}
+
+impl<T: Timestamp, D: Send + 'static, M: Send + 'static>
+    crate::dataflow::channels::pushpull::sealed::Sealed for SpscPull<T, D, M>
+{
+}
 
 impl<T: Timestamp, D: Send + 'static, M: Send + 'static> Pull<T, D, M> for SpscPull<T, D, M> {
     fn pull(&mut self) -> Option<Envelope<T, D, M>> {

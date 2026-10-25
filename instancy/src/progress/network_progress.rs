@@ -45,7 +45,7 @@
 //! that is benign (the link was already retired) or a failure.
 
 #[cfg(feature = "transport")]
-use std::collections::{HashMap, VecDeque};
+use std::collections::HashMap;
 #[cfg(feature = "transport")]
 use std::sync::{Arc, Mutex};
 
@@ -68,7 +68,7 @@ use crate::dataflow::id::DataflowId;
 use crate::error::LockResultExt;
 #[cfg(feature = "transport")]
 use crate::progress::progress_channel::{
-    ProgressChange, ProgressKind, ProgressReceiver, ProgressSender, SharedBuffer,
+    ProgressBatch, ProgressChange, ProgressKind, ProgressReceiver, ProgressSender, SharedBuffer,
     WorkerProgressChannels,
 };
 #[cfg(feature = "transport")]
@@ -86,61 +86,336 @@ use crate::wire;
 /// - The encoder splits large batches into multiple frames.
 /// - The decoder rejects batches exceeding this limit to prevent OOM.
 ///
-/// Override via `max_batch_size` parameter in [`encode_progress_batch`],
-/// [`decode_progress_batch`], and [`create_network_progress_channels`].
+/// Override via the `max_batch_size` parameter of [`encode_progress_commit`],
+/// [`decode_progress_commit`] and [`create_network_progress_channels`].
 #[cfg(feature = "transport")]
 pub const DEFAULT_MAX_BATCH_SIZE: usize = 1_000_000;
 
-/// Encode a batch of progress changes into bytes.
+/// Encodes and decodes the times of one progress scope.
+#[cfg(feature = "transport")]
+pub(crate) trait TimeCodec<S>: Send + Sync {
+    fn encode(&self, time: &S, buf: &mut Vec<u8>) -> Result<(), CodecError>;
+    fn decode(&self, buf: &[u8]) -> Result<(S, usize), CodecError>;
+}
+
+#[cfg(feature = "transport")]
+struct ExchangeTimeCodec<S: ExchangeData>(S::CodecType);
+
+#[cfg(feature = "transport")]
+impl<S: ExchangeData> TimeCodec<S> for ExchangeTimeCodec<S> {
+    fn encode(&self, time: &S, buf: &mut Vec<u8>) -> Result<(), CodecError> {
+        self.0.encode(time, buf)
+    }
+    fn decode(&self, buf: &[u8]) -> Result<(S, usize), CodecError> {
+        self.0.decode(buf)
+    }
+}
+
+/// The time codec of an exchangeable time (the root scope's).
+#[cfg(feature = "transport")]
+pub(crate) fn exchange_time_codec<S: ExchangeData>() -> Arc<dyn TimeCodec<S>> {
+    Arc::new(ExchangeTimeCodec::<S>(S::codec()))
+}
+
+#[cfg(feature = "transport")]
+struct ProductTimeCodec<P, I: ExchangeData> {
+    outer: Arc<dyn TimeCodec<P>>,
+    inner: I::CodecType,
+}
+
+#[cfg(feature = "transport")]
+impl<P: 'static, I: ExchangeData> TimeCodec<crate::order::Product<P, I>>
+    for ProductTimeCodec<P, I>
+{
+    fn encode(
+        &self,
+        time: &crate::order::Product<P, I>,
+        buf: &mut Vec<u8>,
+    ) -> Result<(), CodecError> {
+        self.outer.encode(&time.outer, buf)?;
+        self.inner.encode(&time.inner, buf)
+    }
+    fn decode(&self, buf: &[u8]) -> Result<(crate::order::Product<P, I>, usize), CodecError> {
+        let (outer, used) = self.outer.decode(buf)?;
+        let (inner, more) = self.inner.decode(&buf[used..])?;
+        Ok((crate::order::Product::new(outer, inner), used + more))
+    }
+}
+
+/// The time codec of a loop scope (`Product<P, I>`), from its parent's.
+#[cfg(feature = "transport")]
+pub(crate) fn product_time_codec<P: Send + Sync + 'static, I: ExchangeData>(
+    outer: Arc<dyn TimeCodec<P>>,
+) -> Arc<dyn TimeCodec<crate::order::Product<P, I>>> {
+    Arc::new(ProductTimeCodec::<P, I> {
+        outer,
+        inner: I::codec(),
+    })
+}
+
+/// A nested scope's section codec, its time erased: a section is a
+/// `Vec<ProgressChange<S>>` of the scope's time `S`.
+#[cfg(feature = "transport")]
+pub(crate) trait SectionCodec: Send + Sync {
+    /// Encode each change of `section`: `(diff, bytes)` per change.
+    fn encode(
+        &self,
+        section: &(dyn std::any::Any + Send + Sync),
+        out: &mut Vec<(i64, Vec<u8>)>,
+    ) -> Result<(), CodecError>;
+    /// Decode one change from `data` onto `section` (from
+    /// [`new_section`](Self::new_section)); returns the bytes consumed.
+    fn decode_into(
+        &self,
+        data: &[u8],
+        section: &mut (dyn std::any::Any + Send + Sync),
+    ) -> Result<usize, CodecError>;
+    /// An empty section.
+    fn new_section(&self) -> Box<dyn std::any::Any + Send + Sync>;
+}
+
+#[cfg(feature = "transport")]
+struct TypedSection<S>(Arc<dyn TimeCodec<S>>);
+
+#[cfg(feature = "transport")]
+impl<S: Timestamp> SectionCodec for TypedSection<S> {
+    fn encode(
+        &self,
+        section: &(dyn std::any::Any + Send + Sync),
+        out: &mut Vec<(i64, Vec<u8>)>,
+    ) -> Result<(), CodecError> {
+        let changes = section
+            .downcast_ref::<Vec<ProgressChange<S>>>()
+            .ok_or_else(|| CodecError::InvalidData("progress section of the wrong time".into()))?;
+        for change in changes {
+            let mut buf = Vec::new();
+            encode_change(&*self.0, change, &mut buf)?;
+            out.push((change.diff, buf));
+        }
+        Ok(())
+    }
+
+    fn decode_into(
+        &self,
+        data: &[u8],
+        section: &mut (dyn std::any::Any + Send + Sync),
+    ) -> Result<usize, CodecError> {
+        let changes = section
+            .downcast_mut::<Vec<ProgressChange<S>>>()
+            .ok_or_else(|| CodecError::InvalidData("progress section of the wrong time".into()))?;
+        let (change, used) = decode_change(&*self.0, data)?;
+        changes.push(change);
+        Ok(used)
+    }
+
+    fn new_section(&self) -> Box<dyn std::any::Any + Send + Sync> {
+        Box::new(Vec::<ProgressChange<S>>::new())
+    }
+}
+
+/// The section codec of a scope whose times `codec` encodes.
+#[cfg(feature = "transport")]
+pub(crate) fn section_codec<S: Timestamp>(codec: Arc<dyn TimeCodec<S>>) -> Arc<dyn SectionCodec> {
+    Arc::new(TypedSection(codec))
+}
+
+/// Builds the section codecs of nested scopes from their parent scope's
+/// time codec (see `Pipe::iterate`).
+#[cfg(feature = "transport")]
+pub(crate) type ScopeCodecMaker<T> =
+    Arc<dyn Fn(&Arc<dyn TimeCodec<T>>, &mut HashMap<usize, Arc<dyn SectionCodec>>) + Send + Sync>;
+
+/// The codecs of a dataflow's progress: the root time's and each nested
+/// (loop) scope's, by scope id.
+#[cfg(feature = "transport")]
+pub(crate) struct ProgressCodecs<T> {
+    root: Arc<dyn TimeCodec<T>>,
+    scopes: HashMap<usize, Arc<dyn SectionCodec>>,
+}
+
+#[cfg(feature = "transport")]
+impl<T> Clone for ProgressCodecs<T> {
+    fn clone(&self) -> Self {
+        Self {
+            root: Arc::clone(&self.root),
+            scopes: self.scopes.clone(),
+        }
+    }
+}
+
+#[cfg(feature = "transport")]
+impl<T: Timestamp + ExchangeData> ProgressCodecs<T> {
+    /// The codecs of a dataflow without loops.
+    #[cfg(test)]
+    pub(crate) fn flat() -> Self {
+        Self::new(&[])
+    }
+
+    /// The codecs of a dataflow whose loops registered `makers`.
+    pub(crate) fn new(makers: &[ScopeCodecMaker<T>]) -> Self {
+        let root = exchange_time_codec::<T>();
+        let mut scopes = HashMap::new();
+        for make in makers {
+            make(&root, &mut scopes);
+        }
+        Self { root, scopes }
+    }
+}
+
+/// Encode one change: `[kind u8][node u64][port u64][time][diff i64]`.
+#[cfg(feature = "transport")]
+fn encode_change<S>(
+    codec: &dyn TimeCodec<S>,
+    change: &ProgressChange<S>,
+    buf: &mut Vec<u8>,
+) -> Result<(), CodecError> {
+    buf.push(match change.kind {
+        ProgressKind::Source => 0,
+        ProgressKind::Target => 1,
+    });
+    buf.extend_from_slice(&(change.node as u64).to_le_bytes());
+    buf.extend_from_slice(&(change.port as u64).to_le_bytes());
+    codec.encode(&change.time, buf)?;
+    buf.extend_from_slice(&change.diff.to_le_bytes());
+    Ok(())
+}
+
+/// Decode one change (see [`encode_change`]); returns the bytes consumed.
+#[cfg(feature = "transport")]
+fn decode_change<S>(
+    codec: &dyn TimeCodec<S>,
+    payload: &[u8],
+) -> Result<(ProgressChange<S>, usize), CodecError> {
+    let need = |offset: usize, n: usize| {
+        if offset + n > payload.len() {
+            Err(CodecError::InsufficientData {
+                needed: offset + n,
+                available: payload.len(),
+            })
+        } else {
+            Ok(())
+        }
+    };
+    need(0, 1)?;
+    let kind = match payload[0] {
+        0 => ProgressKind::Source,
+        1 => ProgressKind::Target,
+        other => {
+            return Err(CodecError::InvalidData(format!(
+                "invalid progress change kind byte: {other}"
+            )));
+        }
+    };
+    let mut offset = 1;
+    need(offset, 8)?;
+    let node = wire::read_u64(payload, offset)
+        .map_err(|e| CodecError::InvalidData(e.to_string()))? as usize;
+    offset += 8;
+    need(offset, 8)?;
+    let port = wire::read_u64(payload, offset)
+        .map_err(|e| CodecError::InvalidData(e.to_string()))? as usize;
+    offset += 8;
+    let (time, used) = codec.decode(&payload[offset..])?;
+    offset += used;
+    need(offset, 8)?;
+    let diff =
+        wire::read_i64(payload, offset).map_err(|e| CodecError::InvalidData(e.to_string()))?;
+    offset += 8;
+    Ok((
+        ProgressChange {
+            kind,
+            node,
+            port,
+            time,
+            diff,
+        },
+        offset,
+    ))
+}
+
+/// Encode one commit (every scope's section) into frames (wire format v5).
 ///
 /// Wire format (per frame):
 /// ```text
 /// [count: u32]
 /// for each change:
-///   [kind: u8]   ← 0 = Source (capability), 1 = Target (in-flight message)
-///   [operator_index: u64]
+///   [scope: u32]  ← 0 = the root scope, else a loop scope's id
+///   [kind: u8]    ← 0 = Source (capability), 1 = Target (records at an input)
+///   [node: u64]
 ///   [port: u64]
-///   [timestamp: T encoded by T::codec()]
+///   [timestamp: the scope's time, encoded by its codec]
 ///   [diff: i64]
 /// [crc32: u32]   ← CRC32 of all preceding bytes
 /// ```
 ///
-/// If `changes.len()` exceeds `max_batch_size`, the batch is split into
-/// multiple frames appended sequentially to `bufs`. Each frame is a
-/// self-contained encoded batch with its own CRC32. A split batch sends its
-/// positive changes first (otherwise in order): a receiver applies each frame
-/// as it arrives, and a capability released in an earlier frame than the one
-/// that replaces it (or an in-flight count) could let its frontier advance
-/// too early. Positives first only ever hold the frontier back.
+/// If the commit has more than `max_batch_size` changes, it is split into
+/// several frames, each self-contained with its own CRC32. A split commit
+/// sends every positive change, of every scope, before any negative one:
+/// a receiver applies each frame as it arrives, and a capability released in
+/// an earlier frame than the one that replaces it (or a record count) could
+/// let a frontier advance too early. Positives first only ever hold
+/// frontiers back.
 #[cfg(feature = "transport")]
-pub fn encode_progress_batch<T: Timestamp + ExchangeData>(
-    changes: &[ProgressChange<T>],
+pub(crate) fn encode_progress_commit<T: Timestamp>(
+    batch: &ProgressBatch<T>,
+    codecs: &ProgressCodecs<T>,
     bufs: &mut Vec<Vec<u8>>,
     max_batch_size: usize,
 ) -> Result<(), CodecError> {
     // Cap below the reserved counts: the wire format uses a u32 count field,
-    // and `u32::MAX` / `u32::MAX - 1` mark end-of-stream / acknowledgement.
-    let effective_max = max_batch_size.min(PROGRESS_ACK_COUNT as usize - 1).max(1);
+    // and the top four values mark end-of-stream, acknowledgement, seal and
+    // abandonment.
+    let effective_max = max_batch_size
+        .min(PROGRESS_ABANDON_COUNT as usize - 1)
+        .max(1);
 
-    // An empty batch is still one frame (count=0 + CRC).
-    if changes.len() <= effective_max {
-        bufs.push(encode_progress_frame(changes)?);
+    let mut entries: Vec<(i64, Vec<u8>)> = Vec::new();
+    for change in &batch.root {
+        let mut buf = 0u32.to_le_bytes().to_vec();
+        encode_change(&*codecs.root, change, &mut buf)?;
+        entries.push((change.diff, buf));
+    }
+    #[cfg(any(debug_assertions, feature = "progress-check"))]
+    let mut sections = usize::from(!entries.is_empty());
+    for (scope, section) in &batch.scopes {
+        let codec = codecs.scopes.get(scope).ok_or_else(|| {
+            CodecError::InvalidData(format!("no progress codec for loop scope {scope}"))
+        })?;
+        let mut encoded = Vec::new();
+        codec.encode(section.as_ref(), &mut encoded)?;
+        #[cfg(any(debug_assertions, feature = "progress-check"))]
+        {
+            sections += usize::from(!encoded.is_empty());
+        }
+        let prefix = (*scope as u32).to_le_bytes();
+        entries.extend(encoded.into_iter().map(|(diff, bytes)| {
+            let mut buf = prefix.to_vec();
+            buf.extend_from_slice(&bytes);
+            (diff, buf)
+        }));
+    }
+
+    // An empty commit is still one frame (count=0 + CRC).
+    if entries.len() <= effective_max {
+        bufs.push(encode_frame(entries.iter().map(|(_, bytes)| bytes)));
         return Ok(());
     }
-    let mut ordered = changes
+    let mut ordered = entries
         .iter()
-        .filter(|change| change.diff > 0)
-        .chain(changes.iter().filter(|change| change.diff <= 0))
+        .filter(|(diff, _)| *diff > 0)
+        .chain(entries.iter().filter(|(diff, _)| *diff <= 0))
         .peekable();
     // V6: no fragment may carry a positive change after an earlier fragment
     // carried a negative one.
     #[cfg(any(debug_assertions, feature = "progress-check"))]
     let mut negative_sent = false;
+    #[cfg(any(debug_assertions, feature = "progress-check"))]
+    crate::progress::check::note_split_commit(sections);
     while ordered.peek().is_some() {
-        let chunk: Vec<&ProgressChange<T>> = ordered.by_ref().take(effective_max).collect();
+        let chunk: Vec<&(i64, Vec<u8>)> = ordered.by_ref().take(effective_max).collect();
         #[cfg(any(debug_assertions, feature = "progress-check"))]
         {
-            if negative_sent && chunk.iter().any(|change| change.diff > 0) {
+            if negative_sent && chunk.iter().any(|(diff, _)| *diff > 0) {
                 crate::progress::check::record(
                     crate::progress::check::Check::V6,
                     "fragment-order",
@@ -148,60 +423,44 @@ pub fn encode_progress_batch<T: Timestamp + ExchangeData>(
                     None,
                     None,
                     format!(
-                        "a progress batch of {} changes was split with a positive change \
+                        "a progress commit of {} changes was split with a positive change \
                          after a fragment that carried a negative one",
-                        changes.len()
+                        entries.len()
                     ),
                 );
             }
-            negative_sent |= chunk.iter().any(|change| change.diff < 0);
+            negative_sent |= chunk.iter().any(|(diff, _)| *diff < 0);
         }
-        bufs.push(encode_progress_frame(chunk)?);
+        bufs.push(encode_frame(chunk.into_iter().map(|(_, bytes)| bytes)));
     }
     Ok(())
 }
 
-/// Encode one frame (`count` + changes + CRC32); `changes` must fit the
-/// count field (see [`encode_progress_batch`]).
+/// One frame: `[count]` + the encoded entries + CRC32.
 #[cfg(feature = "transport")]
-fn encode_progress_frame<'a, T: Timestamp + ExchangeData>(
-    changes: impl IntoIterator<Item = &'a ProgressChange<T>, IntoIter: ExactSizeIterator>,
-) -> Result<Vec<u8>, CodecError> {
-    let changes = changes.into_iter();
-    let mut buf = Vec::new();
-    // Callers cap the length below the reserved counts (u32::MAX - 1).
-    let count = changes.len() as u32;
-    buf.extend_from_slice(&count.to_le_bytes());
-
-    let codec = T::codec();
-    for change in changes {
-        let kind_byte: u8 = match change.kind {
-            ProgressKind::Source => 0,
-            ProgressKind::Target => 1,
-        };
-        buf.push(kind_byte);
-        buf.extend_from_slice(&(change.node as u64).to_le_bytes());
-        buf.extend_from_slice(&(change.port as u64).to_le_bytes());
-        codec.encode(&change.time, &mut buf)?;
-        buf.extend_from_slice(&change.diff.to_le_bytes());
+fn encode_frame<'a>(entries: impl ExactSizeIterator<Item = &'a Vec<u8>>) -> Vec<u8> {
+    // Callers cap the length below the reserved counts.
+    let count = entries.len() as u32;
+    let mut buf = count.to_le_bytes().to_vec();
+    for entry in entries {
+        buf.extend_from_slice(entry);
     }
-
-    // Append CRC32 checksum of the payload.
     let crc = crc32fast::hash(&buf);
     buf.extend_from_slice(&crc.to_le_bytes());
-    Ok(buf)
+    buf
 }
 
-/// Decode a batch of progress changes from bytes.
+/// Decode one frame of a commit (see [`encode_progress_commit`]).
 ///
-/// Verifies the trailing CRC32 checksum before parsing. Returns the
-/// decoded batch or a codec error on malformed/corrupted input.
-/// Rejects batches with `count > max_batch_size` to prevent OOM.
+/// Verifies the trailing CRC32 checksum before parsing. Rejects frames with
+/// `count > max_batch_size` to prevent OOM, and changes of a scope without
+/// a codec.
 #[cfg(feature = "transport")]
-pub fn decode_progress_batch<T: Timestamp + ExchangeData>(
+pub(crate) fn decode_progress_commit<T: Timestamp>(
     data: &[u8],
+    codecs: &ProgressCodecs<T>,
     max_batch_size: usize,
-) -> Result<Vec<ProgressChange<T>>, CodecError> {
+) -> Result<ProgressBatch<T>, CodecError> {
     // Minimum: 4 bytes count + 4 bytes CRC32.
     if data.len() < 8 {
         return Err(CodecError::InsufficientData {
@@ -222,84 +481,44 @@ pub fn decode_progress_batch<T: Timestamp + ExchangeData>(
         });
     }
 
-    // Now decode the verified payload.
     let count =
         wire::read_u32(payload, 0).map_err(|e| CodecError::InvalidData(e.to_string()))? as usize;
-
     if count > max_batch_size {
         return Err(CodecError::InvalidData(format!(
             "progress batch count {count} exceeds maximum {max_batch_size}"
         )));
     }
 
-    let mut changes = Vec::with_capacity(count);
-    let codec = T::codec();
+    let mut root = Vec::with_capacity(count);
+    let mut sections: Vec<(usize, Box<dyn std::any::Any + Send + Sync>)> = Vec::new();
     let mut offset = 4;
-
     for _ in 0..count {
-        // kind (u8): 0 = Source, 1 = Target
-        if offset + 1 > payload.len() {
+        if offset + 4 > payload.len() {
             return Err(CodecError::InsufficientData {
-                needed: offset + 1,
+                needed: offset + 4,
                 available: payload.len(),
             });
         }
-        let kind = match payload[offset] {
-            0 => ProgressKind::Source,
-            1 => ProgressKind::Target,
-            other => {
-                return Err(CodecError::InvalidData(format!(
-                    "invalid progress change kind byte: {other}"
-                )));
+        let scope = wire::read_u32(payload, offset)
+            .map_err(|e| CodecError::InvalidData(e.to_string()))? as usize;
+        offset += 4;
+        if scope == 0 {
+            let (change, used) = decode_change(&*codecs.root, &payload[offset..])?;
+            root.push(change);
+            offset += used;
+            continue;
+        }
+        let codec = codecs.scopes.get(&scope).ok_or_else(|| {
+            CodecError::InvalidData(format!("progress change for unknown loop scope {scope}"))
+        })?;
+        let index = match sections.iter().position(|(s, _)| *s == scope) {
+            Some(index) => index,
+            None => {
+                sections.push((scope, codec.new_section()));
+                sections.len() - 1
             }
         };
-        offset += 1;
-
-        // operator_index (u64)
-        if offset + 8 > payload.len() {
-            return Err(CodecError::InsufficientData {
-                needed: offset + 8,
-                available: payload.len(),
-            });
-        }
-        let op_idx = wire::read_u64(payload, offset)
-            .map_err(|e| CodecError::InvalidData(e.to_string()))? as usize;
-        offset += 8;
-
-        // output_port (u64)
-        if offset + 8 > payload.len() {
-            return Err(CodecError::InsufficientData {
-                needed: offset + 8,
-                available: payload.len(),
-            });
-        }
-        let output_port = wire::read_u64(payload, offset)
-            .map_err(|e| CodecError::InvalidData(e.to_string()))?
-            as usize;
-        offset += 8;
-
-        // timestamp (variable size via codec)
-        let (time, consumed) = codec.decode(&payload[offset..])?;
-        offset += consumed;
-
-        // diff (i64)
-        if offset + 8 > payload.len() {
-            return Err(CodecError::InsufficientData {
-                needed: offset + 8,
-                available: payload.len(),
-            });
-        }
-        let diff =
-            wire::read_i64(payload, offset).map_err(|e| CodecError::InvalidData(e.to_string()))?;
-        offset += 8;
-
-        changes.push(ProgressChange {
-            kind,
-            node: op_idx,
-            port: output_port,
-            time,
-            diff,
-        });
+        offset += codec.decode_into(&payload[offset..], sections[index].1.as_mut())?;
     }
 
     // Reject trailing bytes (before the CRC32 that we already stripped).
@@ -310,7 +529,39 @@ pub fn decode_progress_batch<T: Timestamp + ExchangeData>(
         )));
     }
 
-    Ok(changes)
+    Ok(ProgressBatch {
+        root,
+        scopes: sections
+            .into_iter()
+            .map(|(scope, section)| (scope, Arc::from(section)))
+            .collect(),
+    })
+}
+
+/// Encode a batch of root-scope progress changes (a dataflow without loops)
+/// into frames; see [`encode_progress_commit`].
+#[cfg(all(test, feature = "transport"))]
+pub fn encode_progress_batch<T: Timestamp + ExchangeData>(
+    changes: &[ProgressChange<T>],
+    bufs: &mut Vec<Vec<u8>>,
+    max_batch_size: usize,
+) -> Result<(), CodecError> {
+    encode_progress_commit(
+        &ProgressBatch::flat(changes.to_vec()),
+        &ProgressCodecs::flat(),
+        bufs,
+        max_batch_size,
+    )
+}
+
+/// Decode a frame of root-scope progress changes (a dataflow without loops);
+/// see [`decode_progress_commit`].
+#[cfg(all(test, feature = "transport"))]
+pub fn decode_progress_batch<T: Timestamp + ExchangeData>(
+    data: &[u8],
+    max_batch_size: usize,
+) -> Result<Vec<ProgressChange<T>>, CodecError> {
+    decode_progress_commit(data, &ProgressCodecs::<T>::flat(), max_batch_size).map(|b| b.root)
 }
 
 /// Count value reserved for the progress end-of-stream marker.
@@ -320,6 +571,11 @@ pub(crate) const PROGRESS_END_OF_STREAM_COUNT: u32 = u32::MAX;
 /// Count value reserved for the end-of-stream acknowledgement.
 #[cfg(feature = "transport")]
 pub(crate) const PROGRESS_ACK_COUNT: u32 = u32::MAX - 1;
+
+/// Count value reserved for the seal marker: the sender will produce no
+/// further progress updates (design §2.2).
+#[cfg(feature = "transport")]
+pub(crate) const PROGRESS_SEAL_COUNT: u32 = u32::MAX - 2;
 
 /// Encode a marker frame: `[count][crc32]` with a reserved count.
 #[cfg(feature = "transport")]
@@ -351,28 +607,67 @@ pub(crate) fn encode_progress_ack() -> Vec<u8> {
     encode_progress_marker(PROGRESS_ACK_COUNT)
 }
 
+/// Count value reserved for the abandon marker: the sender's stream ended
+/// without a seal (its worker failed, or stopped without finishing its part).
+#[cfg(feature = "transport")]
+pub(crate) const PROGRESS_ABANDON_COUNT: u32 = u32::MAX - 3;
+
+/// Encode the abandon marker of a worker's progress stream.
+///
+/// Wire format: `[count = u32::MAX - 3][crc32]`. It travels in order behind
+/// the worker's last batch, when the worker stops without sealing.
+#[cfg(feature = "transport")]
+pub(crate) fn encode_progress_abandon() -> Vec<u8> {
+    encode_progress_marker(PROGRESS_ABANDON_COUNT)
+}
+
+/// Encode the seal marker of a worker's progress stream.
+///
+/// Wire format: `[count = u32::MAX - 2][crc32]`. It travels in order behind
+/// the worker's last batch and ahead of the end-of-stream.
+#[cfg(feature = "transport")]
+pub(crate) fn encode_progress_seal() -> Vec<u8> {
+    encode_progress_marker(PROGRESS_SEAL_COUNT)
+}
+
 /// A decoded progress-channel frame.
 #[cfg(feature = "transport")]
-#[derive(Debug, PartialEq)]
+#[derive(Debug)]
 pub(crate) enum ProgressFrame<T> {
-    /// A batch of progress changes.
-    Batch(Vec<ProgressChange<T>>),
+    /// A batch of progress changes (a whole commit, or a fragment of one).
+    Batch(ProgressBatch<T>),
+    /// The sender sealed its stream: no further progress updates follow.
+    Seal,
+    /// The sender's stream ended without a seal: its worker stopped
+    /// unfinished.
+    Abandon,
     /// The sender will send nothing more on this channel.
     EndOfStream,
     /// The sender has received our complete end-of-stream.
     Ack,
 }
 
-/// Decode a progress-channel frame: a batch, the end-of-stream marker or the
-/// acknowledgement.
+/// Decode a progress-channel frame: a batch, or the seal, end-of-stream or
+/// acknowledgement marker.
 #[cfg(feature = "transport")]
-pub(crate) fn decode_progress_frame<T: Timestamp + ExchangeData>(
+pub(crate) fn decode_progress_frame_with<T: Timestamp>(
     data: &[u8],
+    codecs: &ProgressCodecs<T>,
     max_batch_size: usize,
 ) -> Result<ProgressFrame<T>, CodecError> {
     let marker = |count: u32| data.len() == 8 && data[..4] == count.to_le_bytes();
-    let is_end_of_stream = marker(PROGRESS_END_OF_STREAM_COUNT);
-    if is_end_of_stream || marker(PROGRESS_ACK_COUNT) {
+    let frame = if marker(PROGRESS_END_OF_STREAM_COUNT) {
+        Some(ProgressFrame::EndOfStream)
+    } else if marker(PROGRESS_ACK_COUNT) {
+        Some(ProgressFrame::Ack)
+    } else if marker(PROGRESS_SEAL_COUNT) {
+        Some(ProgressFrame::Seal)
+    } else if marker(PROGRESS_ABANDON_COUNT) {
+        Some(ProgressFrame::Abandon)
+    } else {
+        None
+    };
+    if let Some(frame) = frame {
         let expected_crc =
             wire::read_u32(data, 4).map_err(|e| CodecError::InvalidData(e.to_string()))?;
         let actual_crc = crc32fast::hash(&data[..4]);
@@ -382,13 +677,18 @@ pub(crate) fn decode_progress_frame<T: Timestamp + ExchangeData>(
                 actual: actual_crc,
             });
         }
-        return Ok(if is_end_of_stream {
-            ProgressFrame::EndOfStream
-        } else {
-            ProgressFrame::Ack
-        });
+        return Ok(frame);
     }
-    decode_progress_batch(data, max_batch_size).map(ProgressFrame::Batch)
+    decode_progress_commit(data, codecs, max_batch_size).map(ProgressFrame::Batch)
+}
+
+/// [`decode_progress_frame_with`] for a dataflow without loops.
+#[cfg(all(test, feature = "transport"))]
+pub(crate) fn decode_progress_frame<T: Timestamp + ExchangeData>(
+    data: &[u8],
+    max_batch_size: usize,
+) -> Result<ProgressFrame<T>, CodecError> {
+    decode_progress_frame_with(data, &ProgressCodecs::<T>::flat(), max_batch_size)
 }
 
 // ---------------------------------------------------------------------------
@@ -410,7 +710,9 @@ pub(crate) fn decode_progress_frame<T: Timestamp + ExchangeData>(
 /// to decode, or the buffer lock is poisoned before that marker, the bridge
 /// reports [`LinkEvent::ProgressChannelEnded`] and exits; the lifecycle
 /// coordinator decides whether that is a failure. `cancel` stops the bridge
-/// during teardown.
+/// during teardown. `lane_close` (the peer stopped without finishing its
+/// part) records the lane as closed once every frame that already arrived is
+/// queued, and the bridge keeps reading as before.
 #[cfg(feature = "transport")]
 #[allow(clippy::too_many_arguments)]
 async fn progress_recv_bridge<T: Timestamp + ExchangeData>(
@@ -418,56 +720,126 @@ async fn progress_recv_bridge<T: Timestamp + ExchangeData>(
     buffer: Arc<Mutex<SharedBuffer<T>>>,
     wake_handle: WakeHandle,
     cancel: tokio_util::sync::CancellationToken,
+    lane_close: tokio_util::sync::CancellationToken,
     peer_id: String,
     channel_id: u64,
     max_batch_size: usize,
     events: LifecycleEventSender,
+    codecs: ProgressCodecs<T>,
 ) {
+    // Records how the lane ended for the worker (`LaneState`), after the
+    // batches before it: a seal, then the end-of-stream or a failure.
+    let mark = |sealed: bool| match buffer.lock().or_poison("progress buffer") {
+        Ok(mut buf) => {
+            if sealed {
+                buf.sealed = true;
+            } else {
+                buf.closed = true;
+            }
+            wake_handle.notify();
+            true
+        }
+        Err(_) => false,
+    };
+    let mut sealed = false;
+    // `lane_close` fired: frames that already arrived are queued first.
+    let mut closing = false;
+    let mut closed = false;
     let failure = loop {
-        tokio::select! {
-            biased;
-            _ = cancel.cancelled() => return,
-            data = rx.recv() => match data {
-                Some(bytes) => match decode_progress_frame::<T>(&bytes, max_batch_size) {
-                    Ok(ProgressFrame::Batch(changes)) => {
-                        if !changes.is_empty() {
-                            match buffer.lock().or_poison("progress buffer") {
-                                Ok(mut buf) => buf.queue.push_back(changes),
-                                Err(_) => break LinkFailure::LockPoisoned,
+        let data = if closing {
+            match rx.try_recv() {
+                Ok(bytes) => Some(bytes),
+                Err(tokio_mpsc::error::TryRecvError::Empty) => {
+                    closing = false;
+                    if !mark(false) {
+                        break LinkFailure::LockPoisoned;
+                    }
+                    continue;
+                }
+                Err(tokio_mpsc::error::TryRecvError::Disconnected) => None,
+            }
+        } else {
+            tokio::select! {
+                biased;
+                _ = cancel.cancelled() => return,
+                _ = lane_close.cancelled(), if !closed => {
+                    closed = true;
+                    closing = true;
+                    continue;
+                }
+                data = rx.recv() => data,
+            }
+        };
+        {
+            match data {
+                Some(bytes) => {
+                    match decode_progress_frame_with::<T>(&bytes, &codecs, max_batch_size) {
+                        Ok(ProgressFrame::Batch(batch)) => {
+                            if sealed {
+                                break LinkFailure::ProtocolViolation(format!(
+                                    "progress batch on channel {channel_id} after the sender's seal"
+                                ));
                             }
-                            wake_handle.notify();
+                            if !batch.is_empty() {
+                                match buffer.lock().or_poison("progress buffer") {
+                                    Ok(mut buf) => buf.queue.push_back(batch),
+                                    Err(_) => break LinkFailure::LockPoisoned,
+                                }
+                                wake_handle.notify();
+                            }
+                        }
+                        Ok(ProgressFrame::Abandon) => {
+                            // The peer's worker stopped unfinished: nothing more
+                            // comes on this lane, and the lane was never sealed.
+                            if !mark(false) {
+                                break LinkFailure::LockPoisoned;
+                            }
+                        }
+                        Ok(ProgressFrame::Seal) => {
+                            if sealed {
+                                break LinkFailure::ProtocolViolation(format!(
+                                    "second seal on progress channel {channel_id}"
+                                ));
+                            }
+                            sealed = true;
+                            if !mark(true) {
+                                break LinkFailure::LockPoisoned;
+                            }
+                        }
+                        Ok(ProgressFrame::EndOfStream) => {
+                            mark(false);
+                            report_link_event(&events, &peer_id, LinkEvent::ProgressEndOfStream);
+                            watch_after_end_of_stream::<T>(
+                                &mut rx,
+                                &cancel,
+                                &peer_id,
+                                channel_id,
+                                max_batch_size,
+                                &events,
+                                &codecs,
+                            )
+                            .await;
+                            return;
+                        }
+                        Ok(ProgressFrame::Ack) => {
+                            report_link_event(&events, &peer_id, LinkEvent::AckReceived);
+                        }
+                        Err(e) => {
+                            #[cfg(feature = "tracing")]
+                            tracing::error!(
+                                %peer_id,
+                                channel_id,
+                                "progress recv bridge: decode error: {e}"
+                            );
+                            break LinkFailure::Decode(e.to_string());
                         }
                     }
-                    Ok(ProgressFrame::EndOfStream) => {
-                        report_link_event(&events, &peer_id, LinkEvent::ProgressEndOfStream);
-                        watch_after_end_of_stream::<T>(
-                            &mut rx,
-                            &cancel,
-                            &peer_id,
-                            channel_id,
-                            max_batch_size,
-                            &events,
-                        )
-                        .await;
-                        return;
-                    }
-                    Ok(ProgressFrame::Ack) => {
-                        report_link_event(&events, &peer_id, LinkEvent::AckReceived);
-                    }
-                    Err(e) => {
-                        #[cfg(feature = "tracing")]
-                        tracing::error!(
-                            %peer_id,
-                            channel_id,
-                            "progress recv bridge: decode error: {e}"
-                        );
-                        break LinkFailure::Decode(e.to_string());
-                    }
-                },
+                }
                 None => break LinkFailure::ChannelClosed,
             }
         }
     };
+    mark(false);
     report_link_event(&events, &peer_id, LinkEvent::ProgressChannelEnded(failure));
 }
 
@@ -482,6 +854,7 @@ async fn watch_after_end_of_stream<T: Timestamp + ExchangeData>(
     channel_id: u64,
     max_batch_size: usize,
     events: &LifecycleEventSender,
+    codecs: &ProgressCodecs<T>,
 ) {
     let mut reported = false;
     loop {
@@ -490,7 +863,7 @@ async fn watch_after_end_of_stream<T: Timestamp + ExchangeData>(
             _ = cancel.cancelled() => return,
             data = rx.recv() => match data {
                 Some(bytes) => {
-                    let failure = match decode_progress_frame::<T>(&bytes, max_batch_size) {
+                    let failure = match decode_progress_frame_with::<T>(&bytes, codecs, max_batch_size) {
                         Ok(ProgressFrame::Ack) => {
                             report_link_event(events, peer_id, LinkEvent::AckReceived);
                             continue;
@@ -576,6 +949,24 @@ pub fn progress_channel_id(
 pub struct NetworkProgressHandles {
     cancel: tokio_util::sync::CancellationToken,
     recv_handles: Vec<tokio::task::JoinHandle<()>>,
+    /// Per peer, the tokens that close the progress lanes from it (see
+    /// [`close_peer`](Self::close_peer)).
+    peer_lanes: HashMap<String, Vec<tokio_util::sync::CancellationToken>>,
+}
+
+#[cfg(feature = "transport")]
+impl NetworkProgressHandles {
+    /// The peer stopped without finishing its part: its progress lanes close
+    /// once their bridges have queued every frame that already arrived.
+    /// Frames still on their way (the stop is announced on the control path,
+    /// which can overtake them) are applied all the same when they arrive: a
+    /// closed lane only lets a draining worker conclude, after a quiet grace,
+    /// that its drain waits for the peer (R48). Idempotent.
+    pub(crate) fn close_peer(&self, peer: &str) {
+        for lane in self.peer_lanes.get(peer).into_iter().flatten() {
+            lane.cancel();
+        }
+    }
 }
 
 #[cfg(feature = "transport")]
@@ -623,6 +1014,7 @@ impl Drop for NetworkProgressHandles {
 ///   decoder rejects batches exceeding this limit. Use
 ///   [`DEFAULT_MAX_BATCH_SIZE`] for the default (1,000,000).
 /// - `runtime_handle`: Tokio runtime for spawning bridge tasks.
+/// - `codecs`: the time codecs of the dataflow's progress scopes.
 ///
 /// # Errors
 ///
@@ -643,6 +1035,7 @@ pub(crate) fn create_network_progress_channels<T: Timestamp + ExchangeData>(
     events: LifecycleEventSender,
     max_batch_size: usize,
     runtime_handle: &tokio::runtime::Handle,
+    codecs: ProgressCodecs<T>,
 ) -> Result<
     (Vec<WorkerProgressChannels<T>>, NetworkProgressHandles),
     crate::error::CommunicationError,
@@ -700,14 +1093,17 @@ pub(crate) fn create_network_progress_channels<T: Timestamp + ExchangeData>(
                 let df_id = dataflow_id;
                 let outbox = outbox.clone();
 
-                let sender = ProgressSender::network(move |changes: Vec<ProgressChange<T>>| {
+                let seal_outbox = outbox.clone();
+                let send_codecs = codecs.clone();
+                let send = move |batch: ProgressBatch<T>| {
                     // A retired peer has finished or already holds everything
                     // it needs from us; deltas to it are irrelevant.
                     if outbox.is_retired() {
                         return;
                     }
                     let mut bufs = Vec::new();
-                    if let Err(e) = encode_progress_batch::<T>(&changes, &mut bufs, max_batch_size)
+                    if let Err(e) =
+                        encode_progress_commit::<T>(&batch, &send_codecs, &mut bufs, max_batch_size)
                     {
                         #[cfg(feature = "tracing")]
                         tracing::error!(
@@ -732,7 +1128,33 @@ pub(crate) fn create_network_progress_channels<T: Timestamp + ExchangeData>(
                             return;
                         }
                     }
-                });
+                };
+                // The seal (and the abandon marker) travel on the same ordered
+                // lane, behind every batch this worker sent to the peer.
+                let abandon_outbox = seal_outbox.clone();
+                let seal = move || {
+                    if seal_outbox.is_retired() {
+                        return;
+                    }
+                    let _ = seal_outbox.send(Frame {
+                        dataflow_id: df_id,
+                        channel_id: ch_id,
+                        payload: encode_progress_seal(),
+                    });
+                };
+                // A worker that stops without sealing (it failed, or was
+                // cancelled without draining) says so on the same lane.
+                let abandon = move || {
+                    if abandon_outbox.is_retired() {
+                        return;
+                    }
+                    let _ = abandon_outbox.send(Frame {
+                        dataflow_id: df_id,
+                        channel_id: ch_id,
+                        payload: encode_progress_abandon(),
+                    });
+                };
+                let sender = ProgressSender::network(send, seal, abandon);
 
                 local_channels[local_idx].senders[remote_w] = Some(sender);
             }
@@ -740,6 +1162,7 @@ pub(crate) fn create_network_progress_channels<T: Timestamp + ExchangeData>(
     }
 
     // --- Receive side: one bridge task per (remote_src, local_dst) pair ---
+    let mut peer_lanes: HashMap<String, Vec<tokio_util::sync::CancellationToken>> = HashMap::new();
     for (peer_id, peer_start, peer_end) in remote_peers {
         let peer_map = receivers.get_mut(peer_id.as_str()).ok_or_else(|| {
             crate::error::CommunicationError::InvalidSetup(format!(
@@ -761,10 +1184,13 @@ pub(crate) fn create_network_progress_channels<T: Timestamp + ExchangeData>(
                 })?;
 
                 // Create shared buffer + receiver for this (remote→local) pair.
-                let shared = Arc::new(Mutex::new(SharedBuffer {
-                    queue: VecDeque::new(),
-                }));
+                let shared = Arc::new(Mutex::new(SharedBuffer::new()));
                 let receiver = ProgressReceiver::new(Arc::clone(&shared));
+                let lane_close = tokio_util::sync::CancellationToken::new();
+                peer_lanes
+                    .entry(peer_id.clone())
+                    .or_default()
+                    .push(lane_close.clone());
 
                 // Spawn receive bridge task.
                 let wake = wake_handles[local_w].clone();
@@ -775,10 +1201,12 @@ pub(crate) fn create_network_progress_channels<T: Timestamp + ExchangeData>(
                     shared,
                     wake,
                     cancel_clone,
+                    lane_close,
                     peer_id_clone,
                     ch_id,
                     max_batch_size,
                     events.clone(),
+                    codecs.clone(),
                 ));
                 recv_handles.push(handle);
 
@@ -790,6 +1218,7 @@ pub(crate) fn create_network_progress_channels<T: Timestamp + ExchangeData>(
     let handles = NetworkProgressHandles {
         cancel: cancel.clone(),
         recv_handles,
+        peer_lanes,
     };
 
     Ok((local_channels, handles))
@@ -806,13 +1235,18 @@ impl<T: Timestamp> ProgressSender<T> {
     /// The closure captures the codec, channel ID, and unbounded sender
     /// at construction time. This allows `ProgressSender<T>` to work
     /// without requiring `T: ExchangeData` on the struct itself.
-    pub(crate) fn network<F>(send_fn: F) -> Self
+    pub(crate) fn network<F, S, A>(send_fn: F, seal_fn: S, abandon_fn: A) -> Self
     where
-        F: Fn(Vec<ProgressChange<T>>) + Send + Sync + 'static,
+        F: Fn(super::progress_channel::ProgressBatch<T>) + Send + Sync + 'static,
+        S: Fn() + Send + Sync + 'static,
+        A: Fn() + Send + Sync + 'static,
     {
         Self {
             inner: super::progress_channel::SenderInner::Network {
                 send_fn: Box::new(send_fn),
+                seal_fn: Box::new(seal_fn),
+                abandon_fn: Box::new(abandon_fn),
+                sealed: std::sync::atomic::AtomicBool::new(false),
             },
         }
     }
@@ -985,20 +1419,26 @@ mod tests {
     #[test]
     fn end_of_stream_roundtrip_and_is_distinct_from_batches() {
         let eos = encode_progress_end_of_stream();
-        assert_eq!(
+        assert!(matches!(
             decode_progress_frame::<u64>(&eos, DEFAULT_MAX_BATCH_SIZE).unwrap(),
             ProgressFrame::EndOfStream
-        );
+        ));
         let ack = encode_progress_ack();
-        assert_eq!(
+        assert!(matches!(
             decode_progress_frame::<u64>(&ack, DEFAULT_MAX_BATCH_SIZE).unwrap(),
             ProgressFrame::Ack
-        );
+        ));
+        let seal = encode_progress_seal();
+        assert!(matches!(
+            decode_progress_frame::<u64>(&seal, DEFAULT_MAX_BATCH_SIZE).unwrap(),
+            ProgressFrame::Seal
+        ));
+        assert!(decode_progress_batch::<u64>(&seal, DEFAULT_MAX_BATCH_SIZE).is_err());
         // Legacy batch decoding never accepts the markers as batches.
         assert!(decode_progress_batch::<u64>(&eos, DEFAULT_MAX_BATCH_SIZE).is_err());
         assert!(decode_progress_batch::<u64>(&ack, DEFAULT_MAX_BATCH_SIZE).is_err());
 
-        for marker in [&eos, &ack] {
+        for marker in [&eos, &ack, &seal] {
             let mut corrupted = marker.clone();
             corrupted[5] ^= 0x01;
             assert!(decode_progress_frame::<u64>(&corrupted, DEFAULT_MAX_BATCH_SIZE).is_err());
@@ -1011,10 +1451,13 @@ mod tests {
             DEFAULT_MAX_BATCH_SIZE,
         )
         .unwrap();
-        assert_eq!(
-            decode_progress_frame::<u64>(&bufs[0], DEFAULT_MAX_BATCH_SIZE).unwrap(),
-            ProgressFrame::Batch(vec![ProgressChange::source(0, 0, 1u64, 1)])
-        );
+        match decode_progress_frame::<u64>(&bufs[0], DEFAULT_MAX_BATCH_SIZE).unwrap() {
+            ProgressFrame::Batch(batch) => {
+                assert_eq!(batch.root, vec![ProgressChange::source(0, 0, 1u64, 1)]);
+                assert!(batch.scopes.is_empty());
+            }
+            other => panic!("expected a batch, got {other:?}"),
+        }
     }
 
     #[test]
@@ -1044,18 +1487,283 @@ mod tests {
             Arc::clone(shared),
             WakeHandle::new(),
             cancel.clone(),
+            tokio_util::sync::CancellationToken::new(),
             "test-peer".into(),
             42,
             DEFAULT_MAX_BATCH_SIZE,
             events,
+            ProgressCodecs::flat(),
         ));
         (handle, events_rx)
     }
 
     fn new_shared() -> Arc<Mutex<SharedBuffer<u64>>> {
-        Arc::new(Mutex::new(SharedBuffer::<u64> {
-            queue: VecDeque::new(),
-        }))
+        Arc::new(Mutex::new(SharedBuffer::<u64>::new()))
+    }
+
+    type Inner = crate::order::Product<u64, u32>;
+    type Nested = crate::order::Product<Inner, u64>;
+
+    /// Codecs of a dataflow with a loop (scope 1, `Product<u64, u32>`) and a
+    /// loop nested in it (scope 2).
+    fn loop_codecs() -> ProgressCodecs<u64> {
+        let root = exchange_time_codec::<u64>();
+        let inner = product_time_codec::<u64, u32>(Arc::clone(&root));
+        let nested = product_time_codec::<Inner, u64>(Arc::clone(&inner));
+        let mut scopes = HashMap::new();
+        scopes.insert(1, section_codec(inner));
+        scopes.insert(2, section_codec(nested));
+        ProgressCodecs { root, scopes }
+    }
+
+    fn section<S: Clone + 'static>(
+        batch: &ProgressBatch<u64>,
+        scope: usize,
+    ) -> Vec<ProgressChange<S>> {
+        batch
+            .scopes
+            .iter()
+            .filter(|(id, _)| *id == scope)
+            .flat_map(|(_, section)| {
+                section
+                    .downcast_ref::<Vec<ProgressChange<S>>>()
+                    .expect("a section of the scope's time")
+                    .clone()
+            })
+            .collect()
+    }
+
+    /// A commit carries each loop scope's section in the scope's own time,
+    /// nested scopes included.
+    #[test]
+    fn commit_with_loop_sections_roundtrips() {
+        let codecs = loop_codecs();
+        let root = vec![ProgressChange::source(0, 0, 1u64, -1)];
+        let inner = vec![
+            ProgressChange::source(1, 0, Inner::new(3, 7), 1),
+            ProgressChange::target(2, 1, Inner::new(4, 0), -2),
+        ];
+        let nested = vec![ProgressChange::target(
+            1,
+            0,
+            Nested::new(Inner::new(5, 1), 9),
+            3,
+        )];
+        let batch = ProgressBatch {
+            root: root.clone(),
+            scopes: vec![
+                (
+                    1,
+                    Arc::new(inner.clone()) as Arc<dyn std::any::Any + Send + Sync>,
+                ),
+                (2, Arc::new(nested.clone())),
+            ],
+        };
+        let mut bufs = Vec::new();
+        encode_progress_commit(&batch, &codecs, &mut bufs, DEFAULT_MAX_BATCH_SIZE).unwrap();
+        assert_eq!(bufs.len(), 1);
+        let decoded = decode_progress_commit(&bufs[0], &codecs, DEFAULT_MAX_BATCH_SIZE).unwrap();
+        assert_eq!(decoded.root, root);
+        assert_eq!(section::<Inner>(&decoded, 1), inner);
+        assert_eq!(section::<Nested>(&decoded, 2), nested);
+
+        // A scope without a codec fails loudly on either side.
+        let flat = ProgressCodecs::<u64>::flat();
+        assert!(encode_progress_commit(&batch, &flat, &mut Vec::new(), 64).is_err());
+        assert!(decode_progress_commit(&bufs[0], &flat, 64).is_err());
+    }
+
+    /// A split commit sends the positive changes of every scope before any
+    /// negative one, whichever section they belong to.
+    #[test]
+    fn split_commit_sends_positives_first_across_sections() {
+        let codecs = loop_codecs();
+        let batch = ProgressBatch {
+            root: vec![
+                ProgressChange::source(0, 0, 1u64, -1),
+                ProgressChange::source(0, 0, 2u64, 1),
+            ],
+            scopes: vec![
+                (
+                    1,
+                    Arc::new(vec![
+                        ProgressChange::target(1, 0, Inner::new(1, 0), -1),
+                        ProgressChange::target(1, 0, Inner::new(1, 1), 1),
+                    ]) as Arc<dyn std::any::Any + Send + Sync>,
+                ),
+                (
+                    2,
+                    Arc::new(vec![
+                        ProgressChange::source(1, 0, Nested::new(Inner::new(1, 1), 0), -1),
+                        ProgressChange::source(1, 0, Nested::new(Inner::new(1, 1), 1), 1),
+                    ]),
+                ),
+            ],
+        };
+        let mut bufs = Vec::new();
+        encode_progress_commit(&batch, &codecs, &mut bufs, 2).unwrap();
+        assert_eq!(bufs.len(), 3);
+        // Each frame applies as a whole: no frame may carry a positive change
+        // after one that carried a negative.
+        let mut negative_seen = false;
+        let mut total = 0;
+        for buf in &bufs {
+            let frame = decode_progress_commit(buf, &codecs, 2).unwrap();
+            let mut diffs: Vec<i64> = frame.root.iter().map(|c| c.diff).collect();
+            diffs.extend(section::<Inner>(&frame, 1).iter().map(|c| c.diff));
+            diffs.extend(section::<Nested>(&frame, 2).iter().map(|c| c.diff));
+            assert!(
+                !(negative_seen && diffs.iter().any(|&d| d > 0)),
+                "a positive change after a negative one: {diffs:?}"
+            );
+            negative_seen |= diffs.iter().any(|&d| d < 0);
+            total += diffs.len();
+        }
+        assert_eq!(total, 6);
+    }
+
+    /// The seal and abandonment markers decode as such and never collide with
+    /// a batch.
+    #[test]
+    fn seal_and_abandon_markers_roundtrip() {
+        let codecs = ProgressCodecs::<u64>::flat();
+        assert!(matches!(
+            decode_progress_frame_with(&encode_progress_seal(), &codecs, 64),
+            Ok(ProgressFrame::Seal)
+        ));
+        assert!(matches!(
+            decode_progress_frame_with(&encode_progress_abandon(), &codecs, 64),
+            Ok(ProgressFrame::Abandon)
+        ));
+        let mut seal = encode_progress_seal();
+        seal[5] ^= 1;
+        assert!(decode_progress_frame_with(&seal, &codecs, 64).is_err());
+    }
+
+    /// A seal records the lane as sealed behind the batches before it; any
+    /// batch after it breaks the protocol. An abandonment closes the lane
+    /// unsealed.
+    #[tokio::test]
+    async fn recv_bridge_records_seal_and_abandonment() {
+        use crate::communication::peer_link::LifecycleEvent;
+
+        let mut bufs = Vec::new();
+        encode_progress_batch(
+            &[ProgressChange::source(0, 0, 1u64, -1)],
+            &mut bufs,
+            DEFAULT_MAX_BATCH_SIZE,
+        )
+        .unwrap();
+        let batch = bufs.remove(0);
+
+        let (tx, rx) = tokio_mpsc::channel::<Vec<u8>>(16);
+        let shared = new_shared();
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let (handle, mut events_rx) = spawn_recv_bridge(rx, &shared, &cancel);
+        tx.send(batch.clone()).await.unwrap();
+        tx.send(encode_progress_seal()).await.unwrap();
+        tx.send(batch.clone()).await.unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(2), handle)
+            .await
+            .expect("the bridge stops on the batch after the seal")
+            .unwrap();
+        assert!(matches!(
+            events_rx.try_recv(),
+            Ok(LifecycleEvent::Link {
+                event: LinkEvent::ProgressChannelEnded(LinkFailure::ProtocolViolation(_)),
+                ..
+            })
+        ));
+        {
+            let buf = shared.lock().unwrap();
+            assert_eq!(buf.queue.len(), 1, "only the batch before the seal");
+            assert!(buf.sealed);
+        }
+
+        let (tx, rx) = tokio_mpsc::channel::<Vec<u8>>(16);
+        let shared = new_shared();
+        let (handle, _events_rx) = spawn_recv_bridge(rx, &shared, &cancel_fresh());
+        tx.send(batch).await.unwrap();
+        tx.send(encode_progress_abandon()).await.unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            {
+                let buf = shared.lock().unwrap();
+                if buf.closed {
+                    assert_eq!(buf.queue.len(), 1);
+                    assert!(!buf.sealed);
+                    break;
+                }
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the lane never closed"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+        }
+        drop(tx);
+        tokio::time::timeout(std::time::Duration::from_secs(2), handle)
+            .await
+            .expect("the bridge exits once the channel closes")
+            .unwrap();
+    }
+
+    fn cancel_fresh() -> tokio_util::sync::CancellationToken {
+        tokio_util::sync::CancellationToken::new()
+    }
+    /// Closing a lane (its peer stopped without finishing its part) records
+    /// it as closed, unsealed, behind the frames that had already arrived;
+    /// the bridge keeps running until teardown.
+    #[tokio::test]
+    async fn recv_bridge_closes_a_lane_behind_frames_already_received() {
+        let (tx, rx) = tokio_mpsc::channel::<Vec<u8>>(16);
+        let shared = new_shared();
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let lane_close = tokio_util::sync::CancellationToken::new();
+        let mut bufs = Vec::new();
+        encode_progress_batch(
+            &[ProgressChange::source(0, 0, 7u64, 1)],
+            &mut bufs,
+            DEFAULT_MAX_BATCH_SIZE,
+        )
+        .unwrap();
+        for buf in bufs {
+            tx.send(buf).await.unwrap();
+        }
+        lane_close.cancel();
+        let (events, _events_rx) = tokio_mpsc::unbounded_channel();
+        let handle = tokio::spawn(progress_recv_bridge::<u64>(
+            rx,
+            Arc::clone(&shared),
+            WakeHandle::new(),
+            cancel.clone(),
+            lane_close,
+            "test-peer".into(),
+            42,
+            DEFAULT_MAX_BATCH_SIZE,
+            events,
+            ProgressCodecs::flat(),
+        ));
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            {
+                let buf = shared.lock().unwrap();
+                if buf.closed {
+                    assert_eq!(buf.queue.len(), 1, "the frame before the close is queued");
+                    assert!(!buf.sealed);
+                    break;
+                }
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the lane never closed"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+        }
+        assert!(!handle.is_finished(), "the bridge keeps reading");
+        cancel.cancel();
+        handle.await.unwrap();
+        drop(tx);
     }
 
     #[tokio::test]
@@ -1073,10 +1781,12 @@ mod tests {
             Arc::clone(&shared),
             wake.clone(),
             cancel.clone(),
+            tokio_util::sync::CancellationToken::new(),
             "test-peer".into(),
             42,
             DEFAULT_MAX_BATCH_SIZE,
             events,
+            ProgressCodecs::flat(),
         ));
 
         // Serialize a batch and send it, followed by the end-of-stream marker.
@@ -1101,7 +1811,7 @@ mod tests {
         let receiver = ProgressReceiver::<u64>::new(Arc::clone(&shared));
         let batches = receiver.drain_all().unwrap();
         assert_eq!(batches.len(), 1);
-        assert_eq!(batches[0], changes);
+        assert_eq!(batches[0].root, changes);
         // The ack does not end the channel.
         assert!(matches!(
             events_rx.recv().await,
@@ -1122,6 +1832,10 @@ mod tests {
 
     #[tokio::test]
     async fn recv_bridge_reports_frame_after_end_of_stream_once() {
+        // The batch after end-of-stream is a V6 violation on purpose (the
+        // bridge runs on this thread).
+        #[cfg(any(debug_assertions, feature = "progress-check"))]
+        let _expect = crate::progress::check::expect_violations();
         use crate::communication::peer_link::LifecycleEvent;
 
         let (tx, rx) = tokio_mpsc::channel::<Vec<u8>>(16);
@@ -1238,18 +1952,23 @@ mod tests {
         let ch_id = PROGRESS_CHANNEL_BASE + 5;
 
         let tx_clone = unbounded_tx.clone();
-        let sender = ProgressSender::<u64>::network(move |changes: Vec<ProgressChange<u64>>| {
-            let mut bufs = Vec::new();
-            encode_progress_batch::<u64>(&changes, &mut bufs, DEFAULT_MAX_BATCH_SIZE).unwrap();
-            for buf in bufs {
-                let frame = Frame {
-                    dataflow_id: df_id,
-                    channel_id: ch_id,
-                    payload: buf,
-                };
-                let _ = tx_clone.send(frame);
-            }
-        });
+        let sender = ProgressSender::<u64>::network(
+            move |batch: ProgressBatch<u64>| {
+                let changes = batch.root;
+                let mut bufs = Vec::new();
+                encode_progress_batch::<u64>(&changes, &mut bufs, DEFAULT_MAX_BATCH_SIZE).unwrap();
+                for buf in bufs {
+                    let frame = Frame {
+                        dataflow_id: df_id,
+                        channel_id: ch_id,
+                        payload: buf,
+                    };
+                    let _ = tx_clone.send(frame);
+                }
+            },
+            || {},
+            || {},
+        );
 
         sender.send(vec![ProgressChange::source(0, 0, 99u64, 1)]);
 
@@ -1264,18 +1983,23 @@ mod tests {
         let (unbounded_tx, mut unbounded_rx) = tokio_mpsc::unbounded_channel::<Frame>();
 
         let tx_clone = unbounded_tx.clone();
-        let sender = ProgressSender::<u64>::network(move |changes: Vec<ProgressChange<u64>>| {
-            let mut bufs = Vec::new();
-            encode_progress_batch::<u64>(&changes, &mut bufs, DEFAULT_MAX_BATCH_SIZE).unwrap();
-            for buf in bufs {
-                let frame = Frame {
-                    dataflow_id: DataflowId::new(),
-                    channel_id: 0,
-                    payload: buf,
-                };
-                let _ = tx_clone.send(frame);
-            }
-        });
+        let sender = ProgressSender::<u64>::network(
+            move |batch: ProgressBatch<u64>| {
+                let changes = batch.root;
+                let mut bufs = Vec::new();
+                encode_progress_batch::<u64>(&changes, &mut bufs, DEFAULT_MAX_BATCH_SIZE).unwrap();
+                for buf in bufs {
+                    let frame = Frame {
+                        dataflow_id: DataflowId::new(),
+                        channel_id: 0,
+                        payload: buf,
+                    };
+                    let _ = tx_clone.send(frame);
+                }
+            },
+            || {},
+            || {},
+        );
 
         // Empty batch — should not send (ProgressSender::send filters empty).
         sender.send(vec![]);
@@ -1400,6 +2124,7 @@ mod tests {
             events.clone(),
             DEFAULT_MAX_BATCH_SIZE,
             &rt,
+            ProgressCodecs::flat(),
         )
         .expect("node-A progress channel setup should succeed");
 
@@ -1425,6 +2150,7 @@ mod tests {
             events.clone(),
             DEFAULT_MAX_BATCH_SIZE,
             &rt,
+            ProgressCodecs::flat(),
         )
         .expect("node-B progress channel setup should succeed");
 
@@ -1448,7 +2174,7 @@ mod tests {
         let batches = receiver.drain_all().unwrap();
         assert_eq!(batches.len(), 1, "expected 1 batch, got {}", batches.len());
         assert_eq!(
-            batches[0],
+            batches[0].root,
             vec![
                 ProgressChange::source(0, 0, 42u64, 1),
                 ProgressChange::source(1, 0, 100u64, -1),
@@ -1514,6 +2240,7 @@ mod tests {
             events,
             DEFAULT_MAX_BATCH_SIZE,
             &tokio::runtime::Handle::current(),
+            ProgressCodecs::flat(),
         )
         .unwrap();
         let sender = channels[0].senders[1].as_ref().unwrap();

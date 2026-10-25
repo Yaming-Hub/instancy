@@ -65,6 +65,14 @@ pub struct DirCtl {
     /// Withhold progress batches; end-of-stream and acknowledgement markers
     /// still pass.
     stash_progress_batches: AtomicBool,
+    /// Park frames of this kind, in order, until released; others pass.
+    hold_kind: Mutex<Option<FrameKind>>,
+    parked: Mutex<VecDeque<([u8; HEADER], Vec<u8>)>>,
+    release: Notify,
+    /// Armed by [`pause_before_handshake`](Self::pause_before_handshake).
+    before_handshake: AtomicBool,
+    /// A frame waits in the relay for the pause to end.
+    in_hand: AtomicBool,
 }
 
 impl DirCtl {
@@ -76,6 +84,22 @@ impl DirCtl {
     pub fn resume(&self) {
         self.paused.store(false, Ordering::SeqCst);
         self.notify.notify_waiters();
+    }
+
+    /// Keep forwarding until the first shutdown-handshake frame (a progress
+    /// channel's end-of-stream marker or acknowledgement), then pause in
+    /// front of it: everything the sender committed before its goodbye gets
+    /// through, the goodbye and what follows is held until
+    /// [`resume`](Self::resume). Works for both framings (nothing is
+    /// reordered).
+    pub fn pause_before_handshake(&self) {
+        self.before_handshake.store(true, Ordering::SeqCst);
+    }
+
+    /// Whether the relay holds something back now: a frame waiting for a
+    /// pause to end, or frames parked by [`hold_kind`](Self::hold_kind).
+    pub fn holding(&self) -> bool {
+        self.in_hand.load(Ordering::SeqCst) || self.parked() > 0
     }
 
     /// Pause forwarding in front of the `n`-th frame of `kind` (1-based), so
@@ -106,6 +130,45 @@ impl DirCtl {
     /// frames count in [`stashed`](Self::stashed). Dedicated framing only.
     pub fn stash_progress_batches(&self) {
         self.stash_progress_batches.store(true, Ordering::SeqCst);
+    }
+
+    /// Delay every frame of `kind` from now on, in order, while frames of
+    /// other kinds keep flowing (for example, a peer's progress lane paused
+    /// while its data and control pass, or its data held back while its
+    /// progress and control overtake it). Nothing is dropped:
+    /// [`release_kind`](Self::release_kind) delivers the parked frames ahead
+    /// of later ones; the end of the connection waits for the release, so the
+    /// parked frames still arrive before it. Dedicated framing
+    /// only (shared managers number their frames, and a gap blocks the
+    /// receiver).
+    pub fn hold_kind(&self, kind: FrameKind) {
+        *self.hold_kind.lock().unwrap() = Some(kind);
+    }
+
+    /// Stop [`hold_kind`](Self::hold_kind) and deliver the parked frames.
+    pub fn release_kind(&self) {
+        *self.hold_kind.lock().unwrap() = None;
+        self.release.notify_waiters();
+    }
+
+    /// Frames parked by [`hold_kind`](Self::hold_kind) and not yet delivered.
+    pub fn parked(&self) -> usize {
+        self.parked.lock().unwrap().len()
+    }
+
+    /// Whether a data channel's close sentinel is parked: its sender has sent
+    /// everything on that channel (dedicated framing).
+    pub fn parked_close_sentinel(&self) -> bool {
+        self.parked
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|(_, payload)| payload.as_slice() == [0xFF])
+    }
+
+    /// Whether parked frames may be delivered now.
+    fn releasable(&self) -> bool {
+        self.hold_kind.lock().unwrap().is_none() && !self.parked.lock().unwrap().is_empty()
     }
 
     /// Frames withheld by [`stash_from`](Self::stash_from) and
@@ -228,23 +291,99 @@ impl Classifier {
     }
 }
 
+/// What the relay does next.
+enum Next {
+    Frame([u8; HEADER], Vec<u8>),
+    /// Parked frames became deliverable.
+    Release,
+    Eof,
+}
+
+/// Reads whole frames, never more bytes than the current frame needs (so a
+/// paused relay leaves the sender's backpressure as before), and returns
+/// early when parked frames become deliverable. Cancel-safe: bytes read stay
+/// in `buf`.
+struct FrameReader {
+    buf: Vec<u8>,
+}
+
+impl FrameReader {
+    async fn next(&mut self, from: &mut ReadHalf<DuplexStream>, ctl: &DirCtl) -> Next {
+        loop {
+            let need = if self.buf.len() < HEADER {
+                HEADER
+            } else {
+                HEADER + u32::from_le_bytes(self.buf[24..28].try_into().unwrap()) as usize
+            };
+            if self.buf.len() >= HEADER && self.buf.len() == need {
+                let frame = std::mem::take(&mut self.buf);
+                let header: [u8; HEADER] = frame[..HEADER].try_into().unwrap();
+                return Next::Frame(header, frame[HEADER..].to_vec());
+            }
+            let released = ctl.release.notified();
+            tokio::pin!(released);
+            released.as_mut().enable();
+            if ctl.releasable() {
+                return Next::Release;
+            }
+            let mut tmp = vec![0u8; need - self.buf.len()];
+            tokio::select! {
+                read = from.read(&mut tmp) => match read {
+                    Ok(0) | Err(_) => return Next::Eof,
+                    Ok(n) => self.buf.extend_from_slice(&tmp[..n]),
+                },
+                _ = &mut released => {}
+            }
+        }
+    }
+}
+
+/// Deliver the parked frames, in order. Returns false if the link broke.
+async fn deliver_parked(to: &mut WriteHalf<DuplexStream>, ctl: &DirCtl) -> bool {
+    loop {
+        let Some((header, payload)) = ctl.parked.lock().unwrap().pop_front() else {
+            return true;
+        };
+        ctl.wait_open().await;
+        if to.write_all(&header).await.is_err() || to.write_all(&payload).await.is_err() {
+            return false;
+        }
+    }
+}
+
 async fn frame_relay(
     mut from: ReadHalf<DuplexStream>,
     mut to: WriteHalf<DuplexStream>,
     ctl: Arc<DirCtl>,
     classifier: Classifier,
 ) {
+    let mut reader = FrameReader { buf: Vec::new() };
     loop {
-        let mut header = [0u8; HEADER];
-        if from.read_exact(&mut header).await.is_err() {
-            break;
-        }
+        let (header, mut payload) = match reader.next(&mut from, &ctl).await {
+            Next::Frame(header, payload) => (header, payload),
+            Next::Release => {
+                if !deliver_parked(&mut to, &ctl).await {
+                    return;
+                }
+                continue;
+            }
+            Next::Eof => {
+                // Whatever is parked was sent before the connection ended:
+                // it is delivered (once released) before the end.
+                loop {
+                    let released = ctl.release.notified();
+                    tokio::pin!(released);
+                    released.as_mut().enable();
+                    if ctl.hold_kind.lock().unwrap().is_none() {
+                        break;
+                    }
+                    released.await;
+                }
+                deliver_parked(&mut to, &ctl).await;
+                break;
+            }
+        };
         let channel_id = u64::from_le_bytes(header[16..24].try_into().unwrap());
-        let len = u32::from_le_bytes(header[24..28].try_into().unwrap()) as usize;
-        let mut payload = vec![0u8; len];
-        if from.read_exact(&mut payload).await.is_err() {
-            break;
-        }
         let kind = classifier.kind(channel_id);
         let seen = match kind {
             FrameKind::Control => ctl.control.fetch_add(1, Ordering::SeqCst),
@@ -269,6 +408,21 @@ async fn frame_relay(
             ctl.stashed.fetch_add(1, Ordering::SeqCst);
             continue;
         }
+        if *ctl.hold_kind.lock().unwrap() == Some(kind) {
+            ctl.parked.lock().unwrap().push_back((header, payload));
+            continue;
+        }
+        // Parked frames that became deliverable go first.
+        if ctl.hold_kind.lock().unwrap().is_none() && !deliver_parked(&mut to, &ctl).await {
+            break;
+        }
+        if kind == FrameKind::Progress
+            && ctl.before_handshake.load(Ordering::SeqCst)
+            && classifier.is_progress_marker(&payload)
+        {
+            ctl.before_handshake.store(false, Ordering::SeqCst);
+            ctl.paused.store(true, Ordering::SeqCst);
+        }
         {
             let mut corrupt = ctl.corrupt_next.lock().unwrap();
             if *corrupt == Some(kind) {
@@ -277,7 +431,9 @@ async fn frame_relay(
                 ctl.corrupted.store(true, Ordering::SeqCst);
             }
         }
+        ctl.in_hand.store(true, Ordering::SeqCst);
         ctl.wait_open().await;
+        ctl.in_hand.store(false, Ordering::SeqCst);
         if to.write_all(&header).await.is_err() || to.write_all(&payload).await.is_err() {
             break;
         }

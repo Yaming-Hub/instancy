@@ -74,7 +74,7 @@ fn count_emits_single_result_per_time_under_backpressure() {
 /// Same as above but with an external input + explicit advance_to, the common
 /// streaming shape (input -> map -> count).
 #[test]
-#[ignore = "expected failure (C2); see EXPECTED in tests/audit_repros.rs"]
+#[ignore = "audit repro; run by audit_repros_match_table (tests/audit_repros.rs)"]
 fn count_emits_single_result_per_epoch_with_input_advance() {
     let rt = RuntimeHandle::new(RuntimeConfig::default()).unwrap();
     let builder = DataflowBuilder::<u64>::new("gap_count_input");

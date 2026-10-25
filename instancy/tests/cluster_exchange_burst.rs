@@ -18,9 +18,9 @@
 //! - Cross-node traffic stays well below the per-peer frame queue, so close
 //!   sentinels are never dropped for lack of queue space.
 //! - Shared mode uses a single pooled connection per peer.
-//! - The active tests keep every input open until worker 0 has every record,
-//!   then cancel the dataflow, so they don't depend on cluster completion
-//!   (see the ignored `*_then_complete` tests at the bottom).
+//! - Most tests keep every input open until worker 0 has every record, then
+//!   cancel the dataflow, so they don't depend on cluster completion (the
+//!   `*_then_complete` tests at the bottom also wait for completion).
 
 #![cfg(feature = "transport")]
 
@@ -439,35 +439,28 @@ async fn shared_three_nodes_exchange_chain() {
 }
 
 // The tests below also close the inputs and wait for the whole cluster to
-// complete. They fail intermittently (a few percent of runs under load) due
-// to a cluster completion bug that is independent of stage-task scheduling
-// and is tracked separately: completion is decided from the signed sum of
-// capability and in-flight counts, so a consumer's in-flight `-n` that is
-// seen before the producer's `+n` (or records held in a blocked operator's
-// pending output, which progress tracking cannot see) can make a worker
-// declare completion early and drop records (audit C1/H1). The first-finisher
-// teardown that also made peers hang here (audit C6) is fixed.
+// complete. Completion must not be declared while a consumer's in-flight
+// `-n` is seen before the producer's `+n`, or while a blocked operator still
+// holds records in its pending output (audit C1/H1, fixed by port-counted
+// progress). The first-finisher teardown that also made peers hang here
+// (audit C6) is fixed.
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
-#[ignore = "intermittent: early completion in clusters (audit C1/H1); see comment"]
 async fn dedicated_two_nodes_burst_to_worker_zero_then_complete() {
     run(TWO_NODES, false, Shape::ToWorkerZero, 1, Finish::Join).await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
-#[ignore = "intermittent: early completion in clusters (audit C1/H1); see comment"]
 async fn shared_two_nodes_burst_to_worker_zero_then_complete() {
     run(TWO_NODES, true, Shape::ToWorkerZero, 1, Finish::Join).await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
-#[ignore = "intermittent: early completion in clusters (audit C1/H1); see comment"]
 async fn dedicated_three_nodes_exchange_chain_then_complete() {
     run(THREE_NODES, false, Shape::Chain, 1, Finish::Join).await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
-#[ignore = "intermittent: early completion in clusters (audit C1/H1); see comment"]
 async fn shared_three_nodes_exchange_chain_then_complete() {
     run(THREE_NODES, true, Shape::Chain, 1, Finish::Join).await;
 }

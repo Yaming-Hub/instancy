@@ -116,7 +116,7 @@ fn run_once(per_worker: u64) -> (Vec<u64>, u64) {
 }
 
 #[test]
-#[ignore = "expected failure (H1); see EXPECTED in tests/audit_repros.rs"]
+#[ignore = "audit repro; run by audit_repros_match_table (tests/audit_repros.rs)"]
 fn notification_fires_while_consumed_exchange_data_is_still_buffered() {
     let per_worker = 300;
     let mut failures = Vec::new();

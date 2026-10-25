@@ -27,14 +27,15 @@ use crate::cancellation::CancellationToken;
 use crate::dataflow::channels::wake::WakeHandle;
 use crate::dataflow::control::{ControlReceiver, ControlSender, WorkerControl};
 use crate::dataflow::graph::DataflowGraph;
-use crate::dataflow::probe::{AttachedProbe, ProbeRegistration};
+use crate::dataflow::probe::ErasedProbe;
 use crate::dataflow::schedulable::{
     ActivationOutcome, ChannelEndpoints, ChannelFactory, OperatorFactory, SchedulableOperator,
     group_by_port,
 };
 use crate::dataflow::stage::FusedActivationOrder;
-use crate::error::{DataflowError, Error, Result};
+use crate::error::{DataflowError, Error, ProgressError, Result};
 use crate::metrics::{DataflowMetrics, OperatorMetricsCollector};
+use crate::progress::frontier::Antichain;
 use crate::progress::notificator::Notificator;
 use crate::progress::subgraph::ProgressTracker;
 use crate::progress::timestamp::Timestamp;
@@ -87,10 +88,6 @@ pub struct ExecutorConfig {
     /// records processed). Overhead is ~1 Instant::now() per activation.
     /// Default: false.
     pub collect_metrics: bool,
-    /// Whether to collect per-exchange-edge channel counters (items and bytes
-    /// transferred). Overhead is ~2 atomic adds per batch push.
-    /// Default: false.
-    pub channel_counters: bool,
     /// When set, cancellation triggers a graceful drain phase instead of
     /// immediate termination. During the drain phase:
     ///
@@ -111,6 +108,17 @@ pub struct ExecutorConfig {
     ///
     /// Default: `None` (immediate cancellation).
     pub drain_timeout: Option<std::time::Duration>,
+    /// How long a draining worker waits, with its progress view unchanged,
+    /// before it fails because a peer stopped without releasing what the
+    /// drain still needs (R48, R50). The grace covers the window in which a
+    /// stopped peer's records, or its last progress, arrive after its stop
+    /// announcement (they travel on other channels, which it can overtake):
+    /// anything that changes the view restarts it. It can only turn a drain
+    /// that would wait for its deadline into a prompt failure, never into a
+    /// success.
+    ///
+    /// Default: 500 ms.
+    pub stopped_peer_grace: std::time::Duration,
     /// Pre-created channel metrics collectors for exchange edges.
     /// These are shared across workers and registered in `DataflowMetrics`
     /// during executor materialization. Empty when `channel_counters` is false.
@@ -143,8 +151,8 @@ impl Default for ExecutorConfig {
             max_sweeps_per_poll: 64,
             catch_panics: false,
             collect_metrics: false,
-            channel_counters: false,
             drain_timeout: None,
+            stopped_peer_grace: std::time::Duration::from_millis(500),
             channel_metrics_collectors: Vec::new(),
             activation_timeline: false,
             frontier_timeline: false,
@@ -192,6 +200,17 @@ pub(crate) enum SweepOutcome {
     /// In sync mode, the caller should sleep briefly. In async mode, the
     /// caller should register a waker and return Pending.
     WaitingForInput,
+}
+
+/// What the decision module decided after a commit.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Decision {
+    /// The worker succeeded (S2b).
+    Succeeded,
+    /// Some operator shut down (S2a); the worker has not succeeded yet.
+    ShutDown,
+    /// Nothing changed: not ready.
+    NotReady,
 }
 
 // ---------------------------------------------------------------------------
@@ -272,6 +291,7 @@ pub(crate) fn operator_panic_error(
 
 /// Strip the [`OperatorUnwind`] tag so synchronous callers see the original
 /// panic payload.
+#[cfg(any(test, feature = "test-utils"))]
 fn original_panic_payload(payload: Box<dyn std::any::Any + Send>) -> Box<dyn std::any::Any + Send> {
     match payload.downcast::<OperatorUnwind>() {
         Ok(unwind) => unwind.payload,
@@ -509,10 +529,6 @@ pub struct DataflowExecutor<T: Timestamp = u64> {
     /// Per-operator notificators, indexed by position in `operators` vec.
     /// Only populated when a progress tracker is attached.
     notificators: Vec<Option<Notificator<T>>>,
-    /// Registered probes, each observing one stream (an operator output).
-    /// Updated during progress propagation with the stream's frontier; drained
-    /// (and told the executor finished) on completion.
-    probes: Vec<AttachedProbe<T>>,
     /// Number of external input sources still open (e.g., channel-based inputs
     /// fed by the caller via `DataflowHandle`). While > 0, the executor will
     /// not declare quiescence — it waits for external data instead.
@@ -749,8 +765,8 @@ impl<T: Timestamp> DataflowExecutor<T> {
             // Collect input pullers sorted by port index.
             let mut inputs = op_input_pullers.remove(&op_idx).unwrap_or_default();
             inputs.sort_by_key(|(port, _)| *port);
-            let input_pullers: Vec<Box<dyn std::any::Any + Send>> =
-                inputs.into_iter().map(|(_, pull)| pull).collect();
+            let input_pullers: Vec<Option<Box<dyn std::any::Any + Send>>> =
+                inputs.into_iter().map(|(_, pull)| Some(pull)).collect();
 
             // Collect output pushers grouped by port index.
             let mut outputs = op_output_pushers.remove(&op_idx).unwrap_or_default();
@@ -758,6 +774,7 @@ impl<T: Timestamp> DataflowExecutor<T> {
             let output_pushers = group_by_port(outputs);
 
             let endpoints = ChannelEndpoints {
+                operator: op_idx,
                 input_pullers,
                 output_pushers,
                 wake_handle: Some(wake_handle.clone()),
@@ -858,7 +875,6 @@ impl<T: Timestamp> DataflowExecutor<T> {
             cancel,
             progress_tracker: None,
             notificators: Vec::new(),
-            probes: Vec::new(),
             external_inputs_open: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             wake_handle,
             consecutive_idle: 0,
@@ -899,22 +915,6 @@ impl<T: Timestamp> DataflowExecutor<T> {
         }
     }
 
-    /// Get a shared reference to the external inputs counter.
-    ///
-    /// Used by `ChannelSourceOperator` to decrement when its channel closes.
-    pub fn external_inputs_counter(&self) -> std::sync::Arc<std::sync::atomic::AtomicUsize> {
-        std::sync::Arc::clone(&self.external_inputs_open)
-    }
-
-    /// Set the number of external input sources.
-    ///
-    /// While this count is > 0, the executor will not declare quiescence,
-    /// allowing channel-based input operators to wait for external data.
-    pub fn set_external_inputs_open(&self, count: usize) {
-        self.external_inputs_open
-            .store(count, std::sync::atomic::Ordering::SeqCst);
-    }
-
     /// Get the wake handle for this executor.
     ///
     /// Share this handle with channels so they can notify the executor when
@@ -924,6 +924,7 @@ impl<T: Timestamp> DataflowExecutor<T> {
     /// When an external `WakeHandle` is passed to `materialize()`, this returns
     /// that same handle — ensuring InputSenders, CancellationTokens, and
     /// internal channels all share a single notification path.
+    #[cfg(test)]
     pub fn wake_handle(&self) -> WakeHandle {
         self.wake_handle.clone()
     }
@@ -971,31 +972,53 @@ impl<T: Timestamp> DataflowExecutor<T> {
     /// Register a probe observing the stream at `registration.operator`'s
     /// output `registration.output`.
     ///
-    /// The probe's frontier is updated during each progress propagation step
-    /// with the stream's frontier (see [`ProgressTracker::stream_frontier`]).
-    /// `writers` is the number of workers that run the probed operator
+    /// The progress scope that counts the stream (the root, or the loop body
+    /// the stream is in) updates the probe with the stream's frontier, in its
+    /// own time, on every propagation (see
+    /// [`ProgressTracker::stream_frontier`]). `writers` is the number of
+    /// workers that run the probed operator
     /// ([`PhysicalPlan::probe_writers`](crate::dataflow::plan::PhysicalPlan::probe_writers));
     /// the probe uses it to decide whether its writers cover every worker.
     /// On registration, the probe is immediately seeded with the current frontier.
-    pub(crate) fn register_probe(&mut self, registration: &ProbeRegistration<T>, writers: usize) {
-        let mut probe = AttachedProbe::new(registration, writers);
-        if let Some(ref tracker) = self.progress_tracker {
-            probe
-                .writer
-                .update(&tracker.stream_frontier(probe.operator, probe.output));
+    pub(crate) fn register_probe(
+        &mut self,
+        registration: &ErasedProbe,
+        writers: usize,
+    ) -> Result<()> {
+        let tracker = self.progress_tracker.as_mut().ok_or_else(|| {
+            Error::Dataflow(DataflowError::InvalidGraph(
+                "a probe needs the executor's progress tracker".into(),
+            ))
+        })?;
+        if tracker.register_probe(
+            registration.operator,
+            registration.output,
+            registration.registration.as_ref(),
+            writers,
+        ) {
+            Ok(())
+        } else {
+            Err(Error::Dataflow(DataflowError::InvalidGraph(format!(
+                "no progress scope counts the stream probed at output {} of operator {}",
+                registration.output, registration.operator
+            ))))
         }
-        self.probes.push(probe);
     }
 
-    /// Reports this executor's completion to its probes (once).
+    /// Reports this executor's success to its probes (once): every probe
+    /// finishes with an empty frontier, as the worker retired with nothing
+    /// left in its scope.
     fn finish_probes(&mut self) {
-        if self.probes.is_empty() {
-            return;
+        if let Some(tracker) = &mut self.progress_tracker {
+            tracker.finish_probes(true);
         }
-        let tracker = self.progress_tracker.as_ref();
-        for mut probe in self.probes.drain(..) {
-            let last = tracker.map(|tracker| tracker.stream_frontier(probe.operator, probe.output));
-            probe.writer.finish(last.as_ref());
+    }
+
+    /// Name each worker's peer for errors (by worker index; on a cluster,
+    /// its node's id). Unnamed workers are reported as `worker N`.
+    pub(crate) fn set_peer_names(&mut self, names: Vec<String>) {
+        if let Some(tracker) = &mut self.progress_tracker {
+            tracker.set_peer_names(names);
         }
     }
 
@@ -1026,6 +1049,7 @@ impl<T: Timestamp> DataflowExecutor<T> {
     /// # Panics
     ///
     /// Panics if the order length doesn't match the operator count.
+    #[cfg(test)]
     pub fn enable_fusion(&mut self, order: FusedActivationOrder) {
         // SAFETY: fused order is constructed from this executor's operators
         assert_eq!(
@@ -1146,11 +1170,13 @@ impl<T: Timestamp> DataflowExecutor<T> {
     }
 
     /// Whether stage-task scheduling is enabled.
+    #[cfg(test)]
     pub fn has_stage_tasks(&self) -> bool {
         !self.stage_tasks.is_empty()
     }
 
     /// Whether fused activation is enabled (either via fused_order or stage_tasks).
+    #[cfg(test)]
     pub fn is_fused(&self) -> bool {
         self.fused_order.is_some() || !self.stage_tasks.is_empty()
     }
@@ -1176,15 +1202,30 @@ impl<T: Timestamp> DataflowExecutor<T> {
 
         let dirty: Vec<usize> = tracker.propagate()?.to_vec();
 
-        // Collect frontier updates for dirty operators before releasing tracker borrow.
-        let frontier_updates: Vec<(usize, _)> = dirty
+        // Collect frontier updates for dirty operators before releasing
+        // tracker borrow. Each operator's inputs are counted by one progress
+        // scope (the root, or the loop body it is in), so its frontiers come
+        // type-erased, in that scope's time.
+        #[allow(clippy::type_complexity)]
+        let frontier_updates: Vec<(
+            usize,
+            Box<dyn std::any::Any + Send>,
+            Vec<Box<dyn std::any::Any + Send>>,
+            Option<String>,
+        )> = dirty
             .iter()
             .filter_map(|&op_idx| {
                 if op_idx < self.index_to_pos.len() {
                     let pos = self.index_to_pos[op_idx];
                     if pos != usize::MAX && pos < self.operators.len() {
-                        let frontier = tracker.operator_input_frontier_meet(op_idx);
-                        return Some((pos, frontier));
+                        let meet = tracker.input_meet_any(op_idx)?;
+                        let ports = tracker.input_frontiers_any(op_idx).unwrap_or_default();
+                        let debug = self
+                            .config
+                            .frontier_timeline
+                            .then(|| tracker.input_debug(op_idx))
+                            .flatten();
+                        return Some((pos, meet, ports, debug));
                     }
                 }
                 None
@@ -1193,20 +1234,22 @@ impl<T: Timestamp> DataflowExecutor<T> {
 
         // Apply frontier updates to:
         // 1. Executor-owned notificators (legacy path, for operators that don't
-        //    override update_input_frontier — i.e., regular unary/binary operators).
-        // 2. The operators themselves (for notify-capable operators that manage
-        //    their own internal notificator). The default implementation is a no-op,
-        //    so this is safe to call on all operators.
-        for (pos, frontier) in &frontier_updates {
-            // Legacy path: executor-owned notificator
-            if *pos < self.notificators.len() {
-                if let Some(notificator) = &mut self.notificators[*pos] {
-                    notificator.update_frontier(frontier);
+        //    override update_input_frontier; root-scope operators only).
+        // 2. The operators themselves: every input port's frontier, and the
+        //    meet for operator-owned notificators (the operator downcasts the
+        //    `&dyn Any` to its own time).
+        for (pos, meet, ports, _) in &frontier_updates {
+            if let Some(frontier) = meet.downcast_ref::<Antichain<T>>() {
+                if *pos < self.notificators.len() {
+                    if let Some(notificator) = &mut self.notificators[*pos] {
+                        notificator.update_frontier(frontier);
+                    }
                 }
             }
-            // New path: operator-owned notificator (WiredUnaryNotifyOperator etc.)
-            // The operator downcasts &dyn Any to &Antichain<T> internally.
-            self.operators[*pos].update_input_frontier(frontier);
+            for (port, port_frontier) in ports.iter().enumerate() {
+                self.operators[*pos].update_port_frontier(port, port_frontier.as_ref());
+            }
+            self.operators[*pos].update_input_frontier(meet.as_ref());
         }
 
         // Record frontier events for dirty operators when frontier timeline is enabled.
@@ -1214,8 +1257,11 @@ impl<T: Timestamp> DataflowExecutor<T> {
         // be marked for output-frontier-only changes).
         if self.config.frontier_timeline {
             if let Some(ref tc) = self.timeline_collector {
-                for &(pos, ref frontier) in &frontier_updates {
-                    let s = format!("{:?}", frontier);
+                for (pos, _, _, debug) in &frontier_updates {
+                    let pos = *pos;
+                    let Some(s) = debug.clone() else {
+                        continue;
+                    };
                     if pos < self.last_recorded_frontiers.len()
                         && self.last_recorded_frontiers[pos] != s
                     {
@@ -1301,22 +1347,96 @@ impl<T: Timestamp> DataflowExecutor<T> {
             }
         }
 
-        // Update registered probes with the frontiers of their streams. Every
-        // view is seeded with every worker's initial capabilities (A4), so it
-        // is never missing a peer's initial state.
-        if !self.probes.is_empty() {
-            let tracker = self.progress_tracker.as_ref().ok_or_else(|| {
-                Error::Dataflow(DataflowError::InvalidGraph(
-                    "progress tracker missing while probes are registered".into(),
-                ))
-            })?;
-            for probe in &mut self.probes {
-                let frontier = tracker.stream_frontier(probe.operator, probe.output);
-                probe.writer.update(&frontier);
+        Ok(activated)
+    }
+
+    /// The decision module: the only place that shuts operators down (S2a)
+    /// and the only place that reports this worker's success (S2b). Runs
+    /// right after a commit ([`propagate_progress`](Self::propagate_progress)),
+    /// so it only ever acts on committed state (R26).
+    ///
+    /// - **S2a:** an operator shuts down once every input frontier is empty
+    ///   in this worker's view and it holds nothing (no capability, nothing
+    ///   left to hand over). It then closes its outputs.
+    /// - **S2b:** the worker succeeds once every hosted operator is shut down
+    ///   and every count in its scope is exactly zero.
+    ///
+    /// An operator's own `Done` or exhaustion is only a hint. Without a
+    /// progress tracker (unit tests of the executor), an exhausted operator
+    /// shuts down and the worker succeeds once all have.
+    fn decide(&mut self) -> Result<Decision> {
+        let mut shut_down = false;
+        for pos in 0..self.operators.len() {
+            if self.done[pos] || !self.operators[pos].can_shut_down() {
+                continue;
+            }
+            let ready = match &self.progress_tracker {
+                Some(tracker) => tracker.inputs_empty(self.operators[pos].index()),
+                None => self.operators[pos].exhausted(),
+            };
+            if ready {
+                self.operators[pos].shut_down();
+                self.done[pos] = true;
+                self.async_waiting[pos] = false;
+                self.propagate_completion(pos);
+                shut_down = true;
             }
         }
 
-        Ok(activated)
+        // Seal: once every hosted operator is shut down or exhausted (R39),
+        // this worker can produce no further progress update; its last
+        // commit was just sent, and the seal follows it. Exhaustion is read
+        // after the commit, so a release made since (a `Retained` dropped on
+        // another thread) may still be uncollected: the seal then waits for
+        // the next commit, which carries it.
+        let all_exhausted =
+            (0..self.operators.len()).all(|pos| self.done[pos] || self.operators[pos].exhausted());
+        if let Some(tracker) = &mut self.progress_tracker {
+            if all_exhausted && !tracker.is_sealed() {
+                if tracker.uncollected() {
+                    shut_down = true;
+                } else {
+                    tracker.seal();
+                }
+            }
+        }
+
+        let all_done = self.done.iter().all(|&d| d);
+        let scope_zero = self
+            .progress_tracker
+            .as_ref()
+            .is_none_or(ProgressTracker::is_completed);
+        if !all_done || !scope_zero {
+            // Once every worker's seal is applied (its own included), no
+            // further progress update can arrive: a non-zero raw count in
+            // this worker's scope is an accounting bug, never a wait.
+            if let Some(tracker) = &self.progress_tracker {
+                if !scope_zero && tracker.all_sealed() {
+                    let mut residual = tracker.scope_residual();
+                    residual.sort();
+                    let more = residual.len().saturating_sub(16);
+                    residual.truncate(16);
+                    if more > 0 {
+                        residual.push(format!("... and {more} more"));
+                    }
+                    return Err(Error::Progress(ProgressError::Residual {
+                        residual: format!("worker {}: {}", self.worker_index, residual.join(", ")),
+                    }));
+                }
+            }
+            return Ok(if shut_down {
+                Decision::ShutDown
+            } else {
+                Decision::NotReady
+            });
+        }
+        // S3: nothing may have reached a shut-down operator.
+        for op in &mut self.operators {
+            let name = op.name().to_string();
+            op.check_after_shutdown()
+                .map_err(|e| e.with_operator_context(name, self.worker_index))?;
+        }
+        Ok(Decision::Succeeded)
     }
 
     /// Run the dataflow to completion or cancellation using a simple single-threaded
@@ -1329,6 +1449,10 @@ impl<T: Timestamp> DataflowExecutor<T> {
     /// but not all operators are done — e.g., waiting for external input).
     /// Returns `Err(Error::Cancelled { .. })` if the cancellation token fires.
     /// Returns `Err(...)` if any operator produces an error.
+    ///
+    /// Only `SimpleRuntime` (the `test-utils` feature) and tests drive an
+    /// executor this way.
+    #[cfg(any(test, feature = "test-utils"))]
     pub fn run(&mut self) -> Result<bool> {
         // With catch_panics disabled an operator panic propagates to the
         // caller unchanged (minus the executor's internal operator tag).
@@ -1341,6 +1465,7 @@ impl<T: Timestamp> DataflowExecutor<T> {
         result
     }
 
+    #[cfg(any(test, feature = "test-utils"))]
     fn run_loop(&mut self) -> Result<bool> {
         loop {
             match self.run_one_sweep()? {
@@ -1405,29 +1530,22 @@ impl<T: Timestamp> DataflowExecutor<T> {
     ///
     /// This is the original scheduling strategy. Each operator is independently
     /// scheduled; data flowing from op A to op B requires multiple sweeps.
+    ///
+    /// Every sweep considers every operator that is not done, as the fused
+    /// and stage-task paths do: data arriving on a channel wakes the worker
+    /// but does not enqueue the channel's consumer. Enqueueing only when the
+    /// queue was empty let an operator blocked on a full channel re-queue
+    /// itself every sweep while the consumer that would drain that channel,
+    /// idle when last run, never ran again (a livelock).
     fn run_unfused_activation(&mut self) -> Result<bool> {
-        // If the ready queue is empty, re-populate with non-done operators.
-        // Also enqueue any operators waiting for async task completion —
-        // a wake notification means their results may be ready to collect.
+        for pos in 0..self.operators.len() {
+            if !self.done[pos] && !self.in_queue[pos] {
+                self.ready_queue.push_back(pos);
+                self.in_queue[pos] = true;
+            }
+        }
         if self.ready_queue.is_empty() {
-            for pos in 0..self.operators.len() {
-                if !self.done[pos] {
-                    self.ready_queue.push_back(pos);
-                    self.in_queue[pos] = true;
-                }
-            }
-            if self.ready_queue.is_empty() {
-                return Ok(false);
-            }
-        } else {
-            // Queue not empty, but async-waiting operators may need activation
-            // after a wake notification. Enqueue them if not already queued.
-            for pos in 0..self.async_waiting.len() {
-                if self.async_waiting[pos] && !self.in_queue[pos] && !self.done[pos] {
-                    self.ready_queue.push_back(pos);
-                    self.in_queue[pos] = true;
-                }
-            }
+            return Ok(false);
         }
 
         let mut any_progress = false;
@@ -1463,10 +1581,10 @@ impl<T: Timestamp> DataflowExecutor<T> {
                     self.async_waiting[pos] = false;
                 }
                 ActivationOutcome::WaitingForAsync => {
-                    // Don't re-queue immediately — wake_handle.notify() will
-                    // wake the executor when a task completes. The per-operator
-                    // async_waiting flag prevents premature quiescence and
-                    // ensures re-enqueue on the next sweep.
+                    // Don't re-queue immediately: wake_handle.notify() wakes
+                    // the executor when a task completes, and the next sweep
+                    // enqueues every live operator. The per-operator
+                    // async_waiting flag prevents premature quiescence.
                     self.async_waiting[pos] = true;
                 }
                 ActivationOutcome::BlockedOnBackpressure => {
@@ -1778,11 +1896,6 @@ impl<T: Timestamp> DataflowExecutor<T> {
             }
         }
 
-        // If all operators are done, we're finished.
-        if self.done.iter().all(|&d| d) {
-            return Ok(SweepOutcome::Completed);
-        }
-
         // Activate operators — stage-task, fused, or unfused path.
         let any_progress = if !self.stage_tasks.is_empty() {
             self.run_stage_task_activation()?
@@ -1798,85 +1911,80 @@ impl<T: Timestamp> DataflowExecutor<T> {
             self.consecutive_idle += 1;
         }
 
-        // After each batch, propagate progress and enqueue dirty operators.
+        // Commit: drain every hosted ledger and capability reporter, apply
+        // the batch to this worker's view, send it to every peer and absorb
+        // theirs. Then enqueue the operators whose frontiers changed.
         if self.propagate_progress()? {
             self.consecutive_idle = 0;
         }
 
+        // Only now, on committed state, decide.
+        match self.decide()? {
+            Decision::Succeeded => return Ok(SweepOutcome::Completed),
+            Decision::ShutDown => self.consecutive_idle = 0,
+            Decision::NotReady => {}
+        }
+
+        // `max_idle_sweeps` only decides when to park.
         if self.consecutive_idle >= self.config.max_idle_sweeps {
-            // If any operators have in-flight async tasks, don't declare
-            // quiescence — results will arrive and trigger a wake notification.
-            if self.async_waiting.iter().any(|&w| w) {
-                self.consecutive_idle = 0;
-                return Ok(SweepOutcome::WaitingForInput);
-            }
-
-            // Check if external inputs are still open — if so, don't
-            // declare quiescence, but signal the caller to wait.
-            // During drain mode, we ignore external inputs (they should
-            // close naturally; we don't want to wait for them).
-            if !self.draining
-                && self
-                    .external_inputs_open
-                    .load(std::sync::atomic::Ordering::SeqCst)
-                    > 0
-            {
-                self.consecutive_idle = 0;
-                return Ok(SweepOutcome::WaitingForInput);
-            }
-
-            if let Some(ref tracker) = self.progress_tracker {
-                // If the tracker reports completion AND no peer progress is
-                // pending, force-close any remaining operators (feedback
-                // cycles that quiesced).
-                if tracker.is_completed() && !tracker.has_pending_peer_progress()? {
-                    #[cfg(any(debug_assertions, feature = "progress-check"))]
-                    tracker.check_force_close();
-                    for pos in 0..self.operators.len() {
-                        if !self.done[pos] {
-                            self.operators[pos].close_inputs();
-                            self.done[pos] = true;
-                        }
-                    }
-                    return Ok(SweepOutcome::Completed);
-                }
-
-                // Any of these conditions means the global dataflow is still
-                // active and we should wait rather than declare quiescence:
-                // - Tracker not completed: outstanding capabilities somewhere
-                // - Pending peer progress: buffered updates not yet absorbed
-                //
-                // During drain mode, we don't wait — the drain deadline
-                // controls when to give up, not the progress tracker.
-                if !self.draining
-                    && (!tracker.is_completed() || tracker.has_pending_peer_progress()?)
-                {
-                    self.consecutive_idle = 0;
-                    return Ok(SweepOutcome::WaitingForInput);
-                }
-            }
-
-            // Quiescent — no operator made progress.
-            // During drain mode, quiescence means all in-flight data has been
-            // processed — treat this as successful completion, BUT only if the
-            // progress tracker agrees (if present). If the tracker shows
-            // outstanding capabilities, the dataflow isn't truly done — keep
-            // draining until the deadline.
+            self.consecutive_idle = 0;
             if self.draining {
-                let tracker_active = self
-                    .progress_tracker
-                    .as_ref()
-                    .is_some_and(|t| !t.is_completed());
-                if tracker_active {
-                    // Dataflow still has outstanding capabilities but no progress.
-                    // Return Idle to let the drain deadline check fire next sweep.
-                    // In sync mode, run_loop adds a brief sleep to avoid spin-busy.
-                    // In async mode, Idle respects poll budget and self-wakes.
-                    self.consecutive_idle = 0;
-                    return Ok(SweepOutcome::Idle);
+                // R48: a peer stopped (its lane closed without a seal) and no
+                // further progress update can arrive, while nothing here can
+                // run and this worker's view still holds work: the drain needs
+                // what the stopped peer never released, so it fails now
+                // rather than at the drain deadline. Once that has held for a
+                // short grace with the view unchanged: records the peer sent
+                // before it stopped may still be arriving.
+                if let Some(tracker) = &mut self.progress_tracker {
+                    let stopped = tracker.stopped_peers();
+                    let waiting = !stopped.is_empty()
+                        && tracker.peer_lanes_final()
+                        && !tracker.is_completed()
+                        && !self.async_waiting.iter().any(|&w| w);
+                    if !waiting {
+                        tracker.not_stopped();
+                    } else if tracker.stopped_and_quiet(self.config.stopped_peer_grace) {
+                        // A failure forwarded during this sweep explains
+                        // the stop better.
+                        if let Some(reason) = self.cancel.escalation() {
+                            return Err(Error::Cancelled {
+                                reason: Some(reason),
+                            });
+                        }
+                        let mut peers: Vec<String> =
+                            stopped.iter().map(|&w| tracker.peer_name(w)).collect();
+                        peers.dedup();
+                        return Err(Error::Cancelled {
+                            reason: Some(crate::cancellation::CancellationReason::NetworkError {
+                                detail: format!(
+                                    "peer {} stopped before finishing its part of the cancelled \
+                                     dataflow, which the drain needs",
+                                    peers.join(", ")
+                                ),
+                            }),
+                        });
+                    }
                 }
-                return Ok(SweepOutcome::Completed);
+                // Keep sweeping (and exchanging progress) until the worker
+                // succeeds or the drain deadline fails the run (M12).
+                return Ok(SweepOutcome::Idle);
             }
+            // Something can still wake this worker: an async task, an
+            // external input, or a peer's progress.
+            let external_open = self
+                .external_inputs_open
+                .load(std::sync::atomic::Ordering::SeqCst)
+                > 0;
+            let has_peers = self
+                .progress_tracker
+                .as_ref()
+                .is_some_and(ProgressTracker::has_peers);
+            if self.async_waiting.iter().any(|&w| w) || external_open || has_peers {
+                return Ok(SweepOutcome::WaitingForInput);
+            }
+            // A single worker with nothing that can wake it: it cannot make
+            // progress any more.
             return Ok(SweepOutcome::Quiescent);
         }
 
@@ -2024,17 +2132,14 @@ impl<T: Timestamp> DataflowExecutor<T> {
         }
     }
 
-    /// Get the number of operators.
-    pub fn operator_count(&self) -> usize {
-        self.operators.len()
-    }
-
     /// Check if all operators have completed.
+    #[cfg(test)]
     pub fn is_complete(&self) -> bool {
         self.done.iter().all(|&d| d)
     }
 
     /// Get the number of completed operators.
+    #[cfg(test)]
     pub fn completed_count(&self) -> usize {
         self.done.iter().filter(|&&d| d).count()
     }
@@ -2044,6 +2149,7 @@ impl<T: Timestamp> DataflowExecutor<T> {
     ///
     /// The notification will fire once the input frontier meets (across all ports)
     /// advances past `time`.
+    #[cfg(test)]
     pub fn notify_at(&mut self, pos: usize, time: T) {
         if let Some(Some(notificator)) = self.notificators.get_mut(pos) {
             notificator.notify_at(time);
@@ -2053,6 +2159,7 @@ impl<T: Timestamp> DataflowExecutor<T> {
     /// Drain ready notifications for the operator at the given position.
     ///
     /// Returns an iterator of timestamps whose frontier has advanced past.
+    #[cfg(test)]
     pub fn drain_notifications(&mut self, pos: usize) -> Vec<T> {
         if let Some(Some(notificator)) = self.notificators.get_mut(pos) {
             let mut times = Vec::new();
@@ -2142,7 +2249,6 @@ mod tests {
                 cancel: CancellationToken::new(),
                 progress_tracker: None,
                 notificators: Vec::new(),
-                probes: Vec::new(),
                 external_inputs_open: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
                 wake_handle: WakeHandle::new(),
                 consecutive_idle: 0,
@@ -2205,10 +2311,6 @@ mod tests {
         fn stage_id(&self) -> crate::dataflow::stage::StageId {
             self.stage_id
         }
-
-        fn close_inputs(&mut self) {
-            self.remaining = 0;
-        }
     }
 
     /// An operator that always returns Idle — never makes progress, never finishes.
@@ -2242,10 +2344,6 @@ mod tests {
         fn stage_id(&self) -> crate::dataflow::stage::StageId {
             self.stage_id
         }
-
-        fn close_inputs(&mut self) {
-            self.closed = true;
-        }
     }
 
     #[test]
@@ -2265,7 +2363,6 @@ mod tests {
             cancel: CancellationToken::new(),
             progress_tracker: None,
             notificators: Vec::new(),
-            probes: Vec::new(),
             external_inputs_open: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             wake_handle: WakeHandle::new(),
             consecutive_idle: 0,
@@ -2315,7 +2412,6 @@ mod tests {
             cancel,
             progress_tracker: None,
             notificators: Vec::new(),
-            probes: Vec::new(),
             external_inputs_open: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             wake_handle: WakeHandle::new(),
             consecutive_idle: 0,
@@ -2369,7 +2465,6 @@ mod tests {
             cancel: CancellationToken::new(),
             progress_tracker: None,
             notificators: Vec::new(),
-            probes: Vec::new(),
             external_inputs_open: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             wake_handle: WakeHandle::new(),
             consecutive_idle: 0,
@@ -2411,7 +2506,6 @@ mod tests {
             cancel: CancellationToken::new(),
             progress_tracker: None,
             notificators: Vec::new(),
-            probes: Vec::new(),
             external_inputs_open: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             wake_handle: WakeHandle::new(),
             consecutive_idle: 0,
@@ -2460,7 +2554,6 @@ mod tests {
             fn stage_id(&self) -> crate::dataflow::stage::StageId {
                 crate::dataflow::stage::StageId::new(0)
             }
-            fn close_inputs(&mut self) {}
         }
 
         let mut executor: DataflowExecutor<u64> = DataflowExecutor {
@@ -2475,8 +2568,8 @@ mod tests {
                 max_sweeps_per_poll: 0,
                 catch_panics: false,
                 collect_metrics: false,
-                channel_counters: false,
                 drain_timeout: None,
+                stopped_peer_grace: std::time::Duration::from_millis(500),
                 channel_metrics_collectors: Vec::new(),
                 activation_timeline: false,
                 frontier_timeline: false,
@@ -2488,7 +2581,6 @@ mod tests {
             cancel: CancellationToken::new(),
             progress_tracker: None,
             notificators: Vec::new(),
-            probes: Vec::new(),
             external_inputs_open: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             wake_handle: WakeHandle::new(),
             consecutive_idle: 0,
@@ -2524,23 +2616,22 @@ mod tests {
         use crate::communication::allocator::ChannelAllocator;
         use crate::dataflow::operators::handles::{InputHandle, OutputHandle};
         use crate::dataflow::stage::StageId;
-        use crate::dataflow::wired_operators::{
-            WiredSinkOperator, WiredSourceOperator, WiredUnaryOperator,
-        };
+        use crate::dataflow::wired_operators::{self as wired, tests::input, tests::output};
 
         let mut alloc = ChannelAllocator::new();
         let ch1 = alloc.allocate::<u64, i32, ()>();
         let ch2 = alloc.allocate::<u64, i32, ()>();
 
-        let source: Box<dyn SchedulableOperator> = Box::new(WiredSourceOperator::new(
+        let source = wired::source(
             "source",
             0,
             StageId::new(0),
             vec![(0u64, vec![1, 2, 3]), (1u64, vec![10, 20])],
-            ch1.pusher,
-        ));
+            output(ch1.pusher),
+        )
+        .boxed();
 
-        let double: Box<dyn SchedulableOperator> = Box::new(WiredUnaryOperator::new(
+        let double = wired::unary(
             "double",
             1,
             StageId::new(0),
@@ -2553,16 +2644,12 @@ mod tests {
                 }
                 Ok(())
             },
-            ch1.puller,
-            ch2.pusher,
-        ));
+            input(ch1.puller),
+            output(ch2.pusher),
+        )
+        .boxed();
 
-        let sink: Box<dyn SchedulableOperator> = Box::new(WiredSinkOperator::new(
-            "sink",
-            2,
-            StageId::new(0),
-            ch2.puller,
-        ));
+        let sink = wired::sink("sink", 2, StageId::new(0), |_, _| {}, input(ch2.puller)).boxed();
 
         let mut executor: DataflowExecutor<u64> = DataflowExecutor {
             operators: vec![source, double, sink],
@@ -2574,7 +2661,6 @@ mod tests {
             cancel: CancellationToken::new(),
             progress_tracker: None,
             notificators: Vec::new(),
-            probes: Vec::new(),
             external_inputs_open: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             wake_handle: WakeHandle::new(),
             consecutive_idle: 0,
@@ -2642,7 +2728,6 @@ mod tests {
             cancel: CancellationToken::new(),
             progress_tracker: None,
             notificators: Vec::new(),
-            probes: Vec::new(),
             external_inputs_open: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             wake_handle: WakeHandle::new(),
             consecutive_idle: 0,
@@ -2696,7 +2781,6 @@ mod tests {
             cancel: CancellationToken::new(),
             progress_tracker: None,
             notificators: vec![Some(Notificator::new(Antichain::from_elem(0u64)))],
-            probes: Vec::new(),
             external_inputs_open: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             wake_handle: WakeHandle::new(),
             consecutive_idle: 0,
@@ -2763,7 +2847,6 @@ mod tests {
             cancel: CancellationToken::new(),
             progress_tracker: None,
             notificators: vec![Some(Notificator::new(Antichain::new()))],
-            probes: Vec::new(),
             external_inputs_open: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             wake_handle: WakeHandle::new(),
             consecutive_idle: 0,
@@ -2823,7 +2906,6 @@ mod tests {
             cancel: CancellationToken::new(),
             progress_tracker: None,
             notificators: Vec::new(),
-            probes: Vec::new(),
             external_inputs_open: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             wake_handle: WakeHandle::new(),
             consecutive_idle: 0,
@@ -2892,8 +2974,8 @@ mod tests {
                 max_sweeps_per_poll: 0, // no budget limit for this test
                 catch_panics: false,
                 collect_metrics: false,
-                channel_counters: false,
                 drain_timeout: None,
+                stopped_peer_grace: std::time::Duration::from_millis(500),
                 channel_metrics_collectors: Vec::new(),
                 activation_timeline: false,
                 frontier_timeline: false,
@@ -2905,7 +2987,6 @@ mod tests {
             cancel: CancellationToken::new(),
             progress_tracker: None,
             notificators: Vec::new(),
-            probes: Vec::new(),
             external_inputs_open: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(1)),
             wake_handle: WakeHandle::new(),
             consecutive_idle: 0,
@@ -2987,8 +3068,8 @@ mod tests {
                 max_sweeps_per_poll: 0,
                 catch_panics: false,
                 collect_metrics: false,
-                channel_counters: false,
                 drain_timeout: None,
+                stopped_peer_grace: std::time::Duration::from_millis(500),
                 channel_metrics_collectors: Vec::new(),
                 activation_timeline: false,
                 frontier_timeline: false,
@@ -3000,7 +3081,6 @@ mod tests {
             cancel: CancellationToken::new(),
             progress_tracker: None,
             notificators: Vec::new(),
-            probes: Vec::new(),
             external_inputs_open: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(1)),
             wake_handle: WakeHandle::new(),
             consecutive_idle: 0,
@@ -3069,7 +3149,6 @@ mod tests {
             cancel,
             progress_tracker: None,
             notificators: Vec::new(),
-            probes: Vec::new(),
             external_inputs_open: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             wake_handle: WakeHandle::new(),
             consecutive_idle: 0,
@@ -3498,8 +3577,8 @@ mod tests {
                 max_sweeps_per_poll: budget,
                 catch_panics: false,
                 collect_metrics: false,
-                channel_counters: false,
                 drain_timeout: None,
+                stopped_peer_grace: std::time::Duration::from_millis(500),
                 channel_metrics_collectors: Vec::new(),
                 activation_timeline: false,
                 frontier_timeline: false,
@@ -3511,7 +3590,6 @@ mod tests {
             cancel: CancellationToken::new(),
             progress_tracker: None,
             notificators: Vec::new(),
-            probes: Vec::new(),
             external_inputs_open: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             wake_handle: wake_handle.clone(),
             consecutive_idle: 0,
@@ -3579,8 +3657,8 @@ mod tests {
                 max_sweeps_per_poll: 0, // unlimited
                 catch_panics: false,
                 collect_metrics: false,
-                channel_counters: false,
                 drain_timeout: None,
+                stopped_peer_grace: std::time::Duration::from_millis(500),
                 channel_metrics_collectors: Vec::new(),
                 activation_timeline: false,
                 frontier_timeline: false,
@@ -3592,7 +3670,6 @@ mod tests {
             cancel: CancellationToken::new(),
             progress_tracker: None,
             notificators: Vec::new(),
-            probes: Vec::new(),
             external_inputs_open: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             wake_handle: WakeHandle::new(),
             consecutive_idle: 0,
@@ -3648,7 +3725,6 @@ mod tests {
             cancel: CancellationToken::new(),
             progress_tracker: None,
             notificators: Vec::new(),
-            probes: Vec::new(),
             external_inputs_open: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             wake_handle: WakeHandle::new(),
             consecutive_idle: 0,
@@ -3716,7 +3792,6 @@ mod tests {
             cancel: CancellationToken::new(),
             progress_tracker: None,
             notificators: Vec::new(),
-            probes: Vec::new(),
             external_inputs_open: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             wake_handle: WakeHandle::new(),
             consecutive_idle: 0,
@@ -3773,7 +3848,6 @@ mod tests {
             cancel: CancellationToken::new(),
             progress_tracker: None,
             notificators: Vec::new(),
-            probes: Vec::new(),
             external_inputs_open: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             wake_handle: WakeHandle::new(),
             consecutive_idle: 0,
@@ -3829,7 +3903,6 @@ mod tests {
             cancel,
             progress_tracker: None,
             notificators: Vec::new(),
-            probes: Vec::new(),
             external_inputs_open: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             wake_handle: WakeHandle::new(),
             consecutive_idle: 0,
@@ -3885,7 +3958,6 @@ mod tests {
             cancel: CancellationToken::new(),
             progress_tracker: None,
             notificators: Vec::new(),
-            probes: Vec::new(),
             external_inputs_open: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             wake_handle: WakeHandle::new(),
             consecutive_idle: 0,
@@ -3976,7 +4048,6 @@ mod tests {
             cancel: CancellationToken::new(),
             progress_tracker: None,
             notificators: Vec::new(),
-            probes: Vec::new(),
             external_inputs_open: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             wake_handle: WakeHandle::new(),
             consecutive_idle: 0,
@@ -4045,7 +4116,6 @@ mod tests {
             cancel: CancellationToken::new(),
             progress_tracker: None,
             notificators: Vec::new(),
-            probes: Vec::new(),
             external_inputs_open: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             wake_handle: WakeHandle::new(),
             consecutive_idle: 0,
@@ -4112,7 +4182,6 @@ mod tests {
             cancel: CancellationToken::new(),
             progress_tracker: None,
             notificators: Vec::new(),
-            probes: Vec::new(),
             external_inputs_open: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             wake_handle: WakeHandle::new(),
             consecutive_idle: 0,
@@ -4182,7 +4251,6 @@ mod tests {
             cancel: CancellationToken::new(),
             progress_tracker: None,
             notificators: Vec::new(),
-            probes: Vec::new(),
             external_inputs_open: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             wake_handle: WakeHandle::new(),
             consecutive_idle: 0,
@@ -4266,7 +4334,6 @@ mod tests {
             cancel: CancellationToken::new(),
             progress_tracker: None,
             notificators: Vec::new(),
-            probes: Vec::new(),
             external_inputs_open: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             wake_handle: WakeHandle::new(),
             consecutive_idle: 0,
@@ -4323,7 +4390,6 @@ mod tests {
             cancel: CancellationToken::new(),
             progress_tracker: None,
             notificators: Vec::new(),
-            probes: Vec::new(),
             external_inputs_open: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             wake_handle: WakeHandle::new(),
             consecutive_idle: 0,
@@ -4430,7 +4496,6 @@ mod tests {
         fn stage_id(&self) -> crate::dataflow::stage::StageId {
             crate::dataflow::stage::StageId::new(0)
         }
-        fn close_inputs(&mut self) {}
     }
 
     /// Drains the shared queue; done once the producer is done and the queue
@@ -4465,7 +4530,6 @@ mod tests {
         fn stage_id(&self) -> crate::dataflow::stage::StageId {
             crate::dataflow::stage::StageId::new(1)
         }
-        fn close_inputs(&mut self) {}
     }
 
     /// Reports `MadeProgress` on every activation without ever finishing, like
@@ -4490,7 +4554,6 @@ mod tests {
         fn stage_id(&self) -> crate::dataflow::stage::StageId {
             crate::dataflow::stage::StageId::new(0)
         }
-        fn close_inputs(&mut self) {}
     }
 
     fn two_stage_tasks(
@@ -4556,7 +4619,6 @@ mod tests {
         fn stage_id(&self) -> crate::dataflow::stage::StageId {
             crate::dataflow::stage::StageId::new(1)
         }
-        fn close_inputs(&mut self) {}
     }
 
     /// Runs sweeps until the executor completes; panics after `max_sweeps`
@@ -4730,7 +4792,6 @@ mod tests {
             fn stage_id(&self) -> crate::dataflow::stage::StageId {
                 crate::dataflow::stage::StageId::new(0)
             }
-            fn close_inputs(&mut self) {}
         }
 
         for drain in [false, true] {
@@ -4816,7 +4877,6 @@ mod tests {
         fn stage_id(&self) -> crate::dataflow::stage::StageId {
             self.stage_id
         }
-        fn close_inputs(&mut self) {}
     }
 
     #[test]
@@ -4957,8 +5017,8 @@ mod tests {
             max_sweeps_per_poll: 0,
             catch_panics: false,
             collect_metrics: false,
-            channel_counters: false,
             drain_timeout: Some(std::time::Duration::from_secs(5)),
+            stopped_peer_grace: std::time::Duration::from_millis(500),
             channel_metrics_collectors: Vec::new(),
             activation_timeline: false,
             frontier_timeline: false,
@@ -4993,8 +5053,8 @@ mod tests {
             max_sweeps_per_poll: 0,
             catch_panics: false,
             collect_metrics: false,
-            channel_counters: false,
             drain_timeout: None,
+            stopped_peer_grace: std::time::Duration::from_millis(500),
             channel_metrics_collectors: Vec::new(),
             activation_timeline: false,
             frontier_timeline: false,
@@ -5031,7 +5091,6 @@ mod tests {
             fn stage_id(&self) -> crate::dataflow::stage::StageId {
                 crate::dataflow::stage::StageId(0)
             }
-            fn close_inputs(&mut self) {}
             fn is_done(&self) -> bool {
                 false
             }
@@ -5043,8 +5102,8 @@ mod tests {
             max_sweeps_per_poll: 0,
             catch_panics: false,
             collect_metrics: false,
-            channel_counters: false,
             drain_timeout: Some(std::time::Duration::from_millis(50)),
+            stopped_peer_grace: std::time::Duration::from_millis(500),
             channel_metrics_collectors: Vec::new(),
             activation_timeline: false,
             frontier_timeline: false,
@@ -5080,8 +5139,8 @@ mod tests {
             max_sweeps_per_poll: 0,
             catch_panics: false,
             collect_metrics: false,
-            channel_counters: false,
             drain_timeout: Some(std::time::Duration::from_secs(5)),
+            stopped_peer_grace: std::time::Duration::from_millis(500),
             channel_metrics_collectors: Vec::new(),
             activation_timeline: false,
             frontier_timeline: false,
@@ -5133,6 +5192,7 @@ mod tests {
             let config = ExecutorConfig {
                 max_sweeps_per_poll: 0,
                 drain_timeout: Some(std::time::Duration::from_secs(60)),
+                stopped_peer_grace: std::time::Duration::from_millis(500),
                 ..Default::default()
             };
             let mut executor = DataflowExecutor::new_test(vec![Box::new(op)], config, 0);
@@ -5158,6 +5218,7 @@ mod tests {
         let config = ExecutorConfig {
             max_sweeps_per_poll: 0,
             drain_timeout: Some(std::time::Duration::from_secs(60)),
+            stopped_peer_grace: std::time::Duration::from_millis(500),
             ..Default::default()
         };
         let mut executor = DataflowExecutor::new_test(vec![Box::new(op)], config, 0);
@@ -5206,7 +5267,6 @@ mod tests {
             fn stage_id(&self) -> crate::dataflow::stage::StageId {
                 crate::dataflow::stage::StageId(0)
             }
-            fn close_inputs(&mut self) {}
             fn is_done(&self) -> bool {
                 false
             }
@@ -5215,6 +5275,7 @@ mod tests {
         let config = ExecutorConfig {
             max_sweeps_per_poll: 0,
             drain_timeout: Some(std::time::Duration::from_secs(60)),
+            stopped_peer_grace: std::time::Duration::from_millis(500),
             ..Default::default()
         };
         let mut executor = DataflowExecutor::new_test(vec![Box::new(Forever)], config, 0);

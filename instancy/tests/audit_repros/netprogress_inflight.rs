@@ -188,7 +188,7 @@ async fn control_map_before_exchange_is_correct() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "expected failure (C2); see EXPECTED in tests/audit_repros.rs"]
+#[ignore = "audit repro; run by audit_repros_match_table (tests/audit_repros.rs)"]
 async fn cluster_input_exchange_completes_prematurely_and_loses_data() {
     let (premature, data_a) = run_cluster(build_direct).await;
     assert!(
@@ -200,7 +200,7 @@ async fn cluster_input_exchange_completes_prematurely_and_loses_data() {
 
 /// Same root cause, single process (`spawn_multi`, 2 workers).
 #[test]
-#[ignore = "expected failure (C2); see EXPECTED in tests/audit_repros.rs"]
+#[ignore = "audit repro; run by audit_repros_match_table (tests/audit_repros.rs)"]
 fn multi_worker_input_exchange_completes_prematurely_and_loses_data() {
     let rt = RuntimeHandle::new(RuntimeConfig {
         worker_threads: 2,
@@ -320,7 +320,7 @@ fn control_map_exchange_then_iterate_completes() {
 }
 
 #[test]
-#[ignore = "expected failure (C2); see EXPECTED in tests/audit_repros.rs"]
+#[ignore = "audit repro; run by audit_repros_match_table (tests/audit_repros.rs)"]
 fn multi_worker_input_exchange_then_iterate_never_completes() {
     let (join, all) = run_iterate(false);
     assert!(

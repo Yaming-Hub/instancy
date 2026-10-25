@@ -281,53 +281,6 @@ impl Run<'_> {
     }
 }
 
-/// The data-loss signature of a premature completion elsewhere (audit
-/// C1/C2, triggered by the duplicate deliveries of PR 2's partial pushes):
-/// records pushed to, or arriving at, an operator that had already finished.
-/// It is reported (the dataflow fails instead of returning `Ok` with records
-/// missing), but it is not what these tests look for, so such a round is
-/// re-run once, as in `cluster_early_finisher_routing`.
-fn is_early_completion(failure: &str) -> bool {
-    [
-        "records sent after the peer finished",
-        "records sent while the peer was finishing",
-        "after the receiving operator finished",
-        "as the receiving operator finished",
-        "never consumed",
-    ]
-    .iter()
-    .any(|signature| failure.contains(signature))
-}
-
-/// Runs `run`, re-running it (up to three attempts in all) after an
-/// early-completion failure (audit C1/C2, PR4/PR5). Returns
-/// the failure to report, if any; early completions are logged.
-async fn run_checked(
-    run: &Run<'_>,
-    pooled: Option<&HashMap<String, Managers>>,
-    label: &str,
-) -> std::result::Result<(), String> {
-    // A slow node makes early completions likelier, and a re-run repeats
-    // the same round: allow two re-runs before calling it a failure.
-    const ATTEMPTS: usize = 3;
-    let mut early = Vec::new();
-    loop {
-        match run.go(pooled).await {
-            Err(e) if is_early_completion(&e) && early.len() + 1 < ATTEMPTS => {
-                eprintln!("{label}: early completion (C1/C2), re-running: {e}");
-                early.push(e);
-            }
-            Err(e) if !early.is_empty() => {
-                return Err(format!(
-                    "{e} (after early completions: {}",
-                    early.join("; ")
-                ));
-            }
-            other => return other,
-        }
-    }
-}
-
 fn rotate<'a>(names: &[&'a str], by: usize) -> Vec<&'a str> {
     let mut v = names.to_vec();
     v.rotate_left(by % names.len());
@@ -374,7 +327,7 @@ async fn idle_routes_never_report_data_loss() {
                 drain_cancel_at: None,
             };
             let label = format!("{mode:?} round {round}");
-            if let Err(e) = run_checked(&run, Some(&pooled), &label).await {
+            if let Err(e) = run.go(Some(&pooled)).await {
                 failures.push(format!("{label}: {e}"));
             }
         }
@@ -430,15 +383,11 @@ async fn healthy_soak(modes: &[Mode], pooled_config: SharedConnectionConfig) {
                     late: (round % 2 == 1).then(|| names[(round + shift) % n]),
                     drain_cancel_at: None,
                 };
-                let label = format!("{mode:?} n={n} round {round}");
                 let (r1, r2) = if mode == Mode::SharedPooled {
                     let (first, second) = (run(0), run(1));
-                    tokio::join!(
-                        run_checked(&first, Some(&pooled), &label),
-                        run_checked(&second, Some(&pooled), &label)
-                    )
+                    tokio::join!(first.go(Some(&pooled)), second.go(Some(&pooled)))
                 } else {
-                    (run_checked(&run(0), None, &label).await, Ok(()))
+                    (run(0).go(None).await, Ok(()))
                 };
                 for r in [r1, r2] {
                     if let Err(e) = r {
@@ -476,7 +425,7 @@ async fn cluster_drain_on_cancel_completes_with_every_record() {
                 drain_cancel_at: Some(names[round % 3]),
             };
             let label = format!("{mode:?} round {round}");
-            if let Err(e) = run_checked(&run, Some(&pooled), &label).await {
+            if let Err(e) = run.go(Some(&pooled)).await {
                 failures.push(format!("{label}: {e}"));
             }
         }

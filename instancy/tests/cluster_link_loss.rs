@@ -596,21 +596,18 @@ fn all_to_node_b(builder: &mut DataflowBuilder<u64>) -> Result<()> {
 }
 
 /// Node-b's own input is closed, so it only waits for node-a's records.
-/// node-a's data frames from the `stash_at`-th on never arrive, while its
-/// goodbye and its teardown do: the records are lost with the connection.
-/// Node-b's data channel from node-a closes without its close sentinel.
-/// Previously the dedicated bridge forwarded that as the end of input and
-/// `NetworkPull` counted the disconnect as exhaustion, so node-b finished
-/// `Ok` with records missing (node-a had said goodbye, so its lost link
-/// looked benign). It must fail with `DataLoss` instead, and never hang.
+/// node-a's data frames from the `stash_at`-th on never arrive: the records
+/// are lost on the wire, and the link is then cut.
 ///
-/// node-a's progress batches are withheld too (its markers pass). Otherwise
-/// node-b's frontier would complete as soon as node-a's last batch arrived:
-/// node-a itself finishes with its records unconsumed, which only the
-/// in-flight accounting gap (audit C1/C2, PR4/PR5) allows, and on a starved
-/// machine node-b's executor then completed on that frontier before the lost
-/// channel was even reported. Without those batches node-b can only finish
-/// by its inputs, which is what this test is about.
+/// Before port-counted progress, node-a could finish and say goodbye with its
+/// records still on the wire (the in-flight accounting gap, audit C1/C2), and
+/// node-b then had to tell the lost data from an end of input. Now node-b
+/// never consumes those records, so node-a's view keeps counting them: it can
+/// neither finish nor say goodbye, and the scenario is unreachable. This test
+/// pins that: node-a never completes `Ok` while its records are unconsumed;
+/// after the cut neither node completes `Ok`; node-b fails with the link
+/// failure, not `DataLoss` (an assertion that must never fire); nothing hangs
+/// (R49).
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
 async fn records_lost_behind_the_senders_goodbye_never_complete_ok() {
     const BATCHES: u64 = 40;
@@ -621,7 +618,6 @@ async fn records_lost_behind_the_senders_goodbye_never_complete_ok() {
         let mut mesh = FaultMesh::new(&names, 2, false);
         let a_to_b = mesh.ctl("node-a", "node-b");
         a_to_b.stash_from(FrameKind::Data, stash_at);
-        a_to_b.stash_progress_batches();
         let mut nodes = start(&mut mesh, Mode::Dedicated, &names, all_to_node_b).await;
         let _oa = nodes[0].df().take_output::<u64>(0, "out").unwrap();
         let ob = nodes[1].df().take_output::<u64>(0, "out").unwrap();
@@ -635,19 +631,23 @@ async fn records_lost_behind_the_senders_goodbye_never_complete_ok() {
         let ja = nodes[0].join(DETECT);
         let jb = nodes[1].join(DETECT);
         tokio::time::sleep(Duration::from_millis(500)).await;
-        // Node-a dies (if its teardown has not closed the link already).
+        assert!(
+            a_to_b.stashed() > 0,
+            "{what}: precondition: records withheld"
+        );
+        assert!(
+            !ja.is_finished() && !jb.is_finished(),
+            "{what}: no node may complete while node-a's records are unconsumed"
+        );
+        // Node-a dies.
         mesh.cut("node-a", "node-b");
-        let rb = jb.await.unwrap();
+        let (ra, rb) = (ja.await.unwrap(), jb.await.unwrap());
         let mut got = 0u64;
         while let Some(event) = ob.try_recv() {
             if let instancy::dataflow::OutputEvent::Data { data, .. } = event {
                 got += data.len() as u64;
             }
         }
-        assert!(
-            a_to_b.stashed() > 0,
-            "{what}: precondition: records withheld"
-        );
         match &rb {
             Some(Ok(())) => panic!(
                 "{what}: node-b returned Ok with {got} of {} records",
@@ -655,17 +655,20 @@ async fn records_lost_behind_the_senders_goodbye_never_complete_ok() {
             ),
             None => panic!("{what}: node-b hung"),
             Some(Err(_)) => assert!(
-                data_loss_from(&rb, "node-a"),
-                "{what}: node-b must report the lost records: {}",
+                !data_loss_from(&rb, "node-a")
+                    && fmt_join(&rb).contains("link to peer node-a failed"),
+                "{what}: node-b must fail with the link failure: {}",
                 fmt_join(&rb)
             ),
         }
-        let ra = ja.await.unwrap();
-        assert!(ra.is_some(), "{what}: node-a hung");
+        assert!(
+            matches!(ra, Some(Err(_))),
+            "{what}: node-a must fail (or not hang): {}",
+            fmt_join(&ra)
+        );
         shutdown(nodes).await;
     }
 }
-
 /// Node-b's own input is closed, so it only waits for node-a's records.
 /// Node-a dies while streaming them: the link stops in front of the
 /// `hold_at`-th data frame (part of the stream was delivered) and is then
@@ -786,6 +789,12 @@ async fn corrupted_data_frame_fails_every_node() {
 /// injected by the relay) means the sender broke the protocol: the receiver
 /// already treated the channel as complete. Node-b (still running) fails at
 /// once with `DataLoss` and cancels node-a.
+///
+/// R47: an operator closes its output only once its input frontier is empty,
+/// which on a cluster takes every node's input to close. Old trigger: node-b's
+/// input stayed open (so node-b kept running). Now node-b's input closes too,
+/// and node-a's progress to node-b is held, so node-b is still running when
+/// the violation arrives.
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
 async fn data_after_close_sentinel_fails_the_receiver() {
     let names = ["node-a", "node-b"];
@@ -794,8 +803,7 @@ async fn data_after_close_sentinel_fails_the_receiver() {
     let _oa = nodes[0].df().take_output::<u64>(0, "out").unwrap();
     let _ob = nodes[1].df().take_output::<u64>(0, "out").unwrap();
     let sa = nodes[0].df().take_input::<u64>(0, "data").unwrap();
-    // node-b keeps its input open: it is running when the violation arrives.
-    let sb = nodes[1].df().take_input::<u64>(0, "data").unwrap();
+    drop(nodes[1].df().take_input::<u64>(0, "data").unwrap());
 
     // A valid data envelope (time 0, one u64 record) for the same channel.
     let mut late = vec![0x01];
@@ -804,6 +812,9 @@ async fn data_after_close_sentinel_fails_the_receiver() {
     late.extend_from_slice(&42u64.to_le_bytes());
     let a_to_b = mesh.ctl("node-a", "node-b");
     a_to_b.inject_after_close_sentinel(late);
+    // Node-b cannot finish without node-a's progress: it is running when the
+    // violation arrives.
+    a_to_b.hold_kind(FrameKind::Progress);
 
     // Odd values are routed to node-b; closing node-a's input makes its
     // pre-exchange operator close the channel (sentinel) right away.
@@ -833,7 +844,11 @@ async fn data_after_close_sentinel_fails_the_receiver() {
         "node-a must be cancelled by node-b: {}",
         fmt_join(&ra)
     );
-    drop(sb);
+    assert!(
+        a_to_b.parked() > 0,
+        "precondition: node-a's progress to node-b was held"
+    );
+    a_to_b.release_kind();
     shutdown(nodes).await;
 }
 

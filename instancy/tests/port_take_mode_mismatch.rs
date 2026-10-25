@@ -65,13 +65,14 @@ fn sorted(mut values: Vec<u64>) -> Vec<u64> {
     values
 }
 
-/// Wrong-mode and wrong-type takes on a sync handle, then the correct takes;
-/// returns everything the dataflow emits for `values`.
-fn sync_after_mistakes(
+/// Wrong-mode and wrong-type takes on a sync handle, then the correct takes.
+fn sync_take_after_mistakes(
     handle: &mut SpawnedDataflow<u64>,
-    values: Vec<u64>,
     context: &str,
-) -> Vec<u64> {
+) -> (
+    instancy::InputSender<u64, u64>,
+    instancy::OutputReceiver<u64, u64>,
+) {
     assert_mode_mismatch(
         handle.take_async_output::<u64>("results"),
         "take_output()",
@@ -93,10 +94,18 @@ fn sync_after_mistakes(
         .unwrap_or_else(|e| panic!("{context}: corrected input take failed: {e}"));
     assert!(handle.take_output::<u64>("results").is_err(), "taken once");
     assert!(handle.take_input::<u64>("data").is_err(), "taken once");
+    (sender, receiver)
+}
 
+/// Send `values` on `sender`, close it, and collect what `receiver` gets.
+fn send_and_collect(
+    sender: instancy::InputSender<u64, u64>,
+    receiver: instancy::OutputReceiver<u64, u64>,
+    values: Vec<u64>,
+) -> std::thread::JoinHandle<Vec<u64>> {
     sender.send(0, values).unwrap();
     drop(sender);
-    within(move || {
+    std::thread::spawn(move || {
         receiver
             .collect_data()
             .into_iter()
@@ -105,12 +114,26 @@ fn sync_after_mistakes(
     })
 }
 
-/// Async counterpart of [`sync_after_mistakes`].
-async fn async_after_mistakes(
+/// [`sync_take_after_mistakes`], then everything the dataflow emits for
+/// `values`.
+fn sync_after_mistakes(
     handle: &mut SpawnedDataflow<u64>,
     values: Vec<u64>,
     context: &str,
 ) -> Vec<u64> {
+    let (sender, receiver) = sync_take_after_mistakes(handle, context);
+    let collector = send_and_collect(sender, receiver, values);
+    within(move || collector.join().unwrap())
+}
+
+/// Async counterpart of [`sync_take_after_mistakes`].
+fn async_take_after_mistakes(
+    handle: &mut SpawnedDataflow<u64>,
+    context: &str,
+) -> (
+    instancy::AsyncInputSender<u64, u64>,
+    instancy::AsyncOutputReceiver<u64, u64>,
+) {
     assert_mode_mismatch(
         handle.take_output::<u64>("results"),
         "take_async_output()",
@@ -124,7 +147,7 @@ async fn async_after_mistakes(
     assert!(handle.take_async_output::<i32>("results").is_err());
     assert!(handle.take_async_input::<i32>("data").is_err());
 
-    let mut receiver = handle
+    let receiver = handle
         .take_async_output::<u64>("results")
         .unwrap_or_else(|e| panic!("{context}: corrected output take failed: {e}"));
     let sender = handle
@@ -138,7 +161,16 @@ async fn async_after_mistakes(
         handle.take_async_input::<u64>("data").is_err(),
         "taken once"
     );
+    (sender, receiver)
+}
 
+/// Async counterpart of [`sync_after_mistakes`].
+async fn async_after_mistakes(
+    handle: &mut SpawnedDataflow<u64>,
+    values: Vec<u64>,
+    context: &str,
+) -> Vec<u64> {
+    let (sender, mut receiver) = async_take_after_mistakes(handle, context);
     sender.send(0, values).await.unwrap();
     drop(sender);
     tokio::time::timeout(TIMEOUT, receiver.collect_data())
@@ -247,15 +279,24 @@ fn multi_worker_async_take_on_sync_ports_leaves_them_in_place() {
     assert!(multi.take_all_async_outputs::<u64>("results").is_err());
     assert!(multi.take_all_async_inputs::<u64>("data").is_err());
 
-    let mut out = Vec::new();
-    for w in 0..3 {
-        let values = vec![w as u64 * 10, w as u64 * 10 + 1];
-        out.extend(sync_after_mistakes(
-            multi.worker_mut(w),
-            values,
-            &format!("multi sync worker {w}"),
-        ));
-    }
+    // Every worker's input must close before any worker's output does: a
+    // worker's sink is downstream of every worker's input operator.
+    let ports: Vec<_> = (0..3)
+        .map(|w| sync_take_after_mistakes(multi.worker_mut(w), &format!("multi sync worker {w}")))
+        .collect();
+    let collectors: Vec<_> = ports
+        .into_iter()
+        .enumerate()
+        .map(|(w, (sender, receiver))| {
+            send_and_collect(sender, receiver, vec![w as u64 * 10, w as u64 * 10 + 1])
+        })
+        .collect();
+    let out: Vec<u64> = within(move || {
+        collectors
+            .into_iter()
+            .flat_map(|c| c.join().unwrap())
+            .collect()
+    });
     within(move || multi.join_blocking()).unwrap();
     assert_eq!(sorted(out), vec![0, 2, 20, 22, 40, 42]);
 }
@@ -302,16 +343,28 @@ async fn multi_worker_sync_take_on_async_ports_leaves_them_in_place() {
     assert!(multi.take_all_outputs::<u64>("results").is_err());
     assert!(multi.take_all_inputs::<u64>("data").is_err());
 
+    // Every worker's input must close before any worker's output does: a
+    // worker's sink is downstream of every worker's input operator.
+    let ports: Vec<_> = (0..3)
+        .map(|w| async_take_after_mistakes(multi.worker_mut(w), &format!("multi async worker {w}")))
+        .collect();
+    let mut receivers = Vec::new();
+    for (w, (sender, receiver)) in ports.into_iter().enumerate() {
+        sender
+            .send(0, vec![w as u64 * 10, w as u64 * 10 + 1])
+            .await
+            .unwrap();
+        drop(sender);
+        receivers.push(receiver);
+    }
     let mut out = Vec::new();
-    for w in 0..3 {
-        let values = vec![w as u64 * 10, w as u64 * 10 + 1];
+    for mut receiver in receivers {
         out.extend(
-            async_after_mistakes(
-                multi.worker_mut(w),
-                values,
-                &format!("multi async worker {w}"),
-            )
-            .await,
+            tokio::time::timeout(TIMEOUT, receiver.collect_data())
+                .await
+                .expect("output never closed")
+                .into_iter()
+                .flat_map(|(_, d)| d),
         );
     }
     tokio::time::timeout(TIMEOUT, multi.join())

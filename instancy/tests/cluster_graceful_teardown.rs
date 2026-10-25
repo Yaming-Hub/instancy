@@ -519,14 +519,10 @@ fn expected_iterate() -> Vec<i64> {
 
 /// Whichever node finishes the loop first must not cut the others off.
 ///
-/// Ignored because of a separate, pre-existing executor bug: this iterate
-/// dataflow occasionally hangs with one worker still active even in a single
-/// process with no network (`spawn_multi`, 3 workers: about 1 in 300 runs).
-/// In the cluster version the stuck node has already received every frame
-/// (its peers retired their links only after it acknowledged their
-/// end-of-stream), so the hang is not a teardown loss.
+/// This used to hang occasionally (also in a single process with no network,
+/// about 1 in 300 runs with 3 workers) because of an iterate executor bug, not
+/// a teardown loss (audit C2, fixed by port-counted progress).
 #[tokio::test(flavor = "multi_thread", worker_threads = 6)]
-#[ignore = "pre-existing iterate executor hang (reproducible in-process ~1/300); not a teardown loss"]
 async fn three_nodes_iterate_completes_whichever_node_holds_the_data() {
     let nodes = ["node-a", "node-b", "node-c"];
     let mut failures = Vec::new();

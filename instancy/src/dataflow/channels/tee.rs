@@ -72,6 +72,11 @@ impl<T: Timestamp, D: Clone + Send + 'static, M: Clone + Default + Send + 'stati
     }
 }
 
+impl<T: Timestamp, D: Clone + Send + 'static, M: Clone + Default + Send + 'static>
+    crate::dataflow::channels::pushpull::sealed::Sealed for TeePush<T, D, M>
+{
+}
+
 impl<T: Timestamp, D: Clone + Send + 'static, M: Clone + Default + Send + 'static> Push<T, D, M>
     for TeePush<T, D, M>
 {
@@ -150,18 +155,24 @@ impl<T: Timestamp, D: Clone + Send + 'static, M: Clone + Default + Send + 'stati
         self.closed
     }
 
-    fn set_inflight_reporter(&mut self, reporter: crate::progress::operate::ProgressReporter<T>) {
-        // Propagate to every branch. Only exchange branches record; regular
-        // branches no-op — so in-flight accounting stays tee-safe.
-        for target in &mut self.targets {
-            target.set_inflight_reporter(reporter.clone());
-        }
-    }
-
     #[cfg(any(debug_assertions, feature = "progress-check"))]
     fn check_port(&self) -> Option<crate::progress::check::Port<T>> {
         // Every branch shares the producing output.
         self.targets.iter().find_map(|target| target.check_port())
+    }
+
+    #[cfg(any(debug_assertions, feature = "progress-check"))]
+    fn check_unreached(&self) -> Option<Vec<crate::progress::check::Port<T>>> {
+        // Branches before the cursor accepted the envelope (R46).
+        match self.retry_from {
+            Some(from) if from > 0 => Some(
+                self.targets[from..]
+                    .iter()
+                    .filter_map(|target| target.check_target())
+                    .collect(),
+            ),
+            _ => None,
+        }
     }
 }
 
@@ -185,6 +196,35 @@ pub fn tee_or_single<
         }
         _ => Some(Box::new(TeePush::new(pushers)?)),
     })
+}
+
+/// A push end that discards everything: the output of an operator whose
+/// output has no consumer.
+pub(crate) struct NullPush;
+
+impl crate::dataflow::channels::pushpull::sealed::Sealed for NullPush {}
+
+impl<T: Timestamp, D: Send + 'static> Push<T, D> for NullPush {
+    fn push(&mut self, _envelope: super::Envelope<T, D>) -> crate::error::Result<()> {
+        Ok(())
+    }
+
+    fn try_push(
+        &mut self,
+        _envelope: super::Envelope<T, D>,
+    ) -> std::result::Result<(), (crate::error::Error, super::Envelope<T, D>)> {
+        Ok(())
+    }
+
+    fn flush(&mut self) -> crate::error::Result<()> {
+        Ok(())
+    }
+
+    fn close(&mut self) {}
+
+    fn is_closed(&self) -> bool {
+        false
+    }
 }
 
 #[cfg(test)]
@@ -274,6 +314,11 @@ mod tests {
                 closed: false,
             }
         }
+    }
+
+    impl<T: Timestamp, D: Send + 'static> crate::dataflow::channels::pushpull::sealed::Sealed
+        for RecordingPush<T, D>
+    {
     }
 
     impl<T: Timestamp, D: Send + 'static> Push<T, D> for RecordingPush<T, D> {

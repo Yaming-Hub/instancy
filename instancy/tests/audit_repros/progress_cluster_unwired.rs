@@ -185,7 +185,7 @@ async fn tcp_map_exchange_iterate_completes() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "expected failure (C2); see EXPECTED in tests/audit_repros.rs"]
+#[ignore = "audit repro; run by audit_repros_match_table (tests/audit_repros.rs)"]
 async fn tcp_input_exchange_iterate_completes() {
     assert_eq!(run(false).await.unwrap(), expected());
 }

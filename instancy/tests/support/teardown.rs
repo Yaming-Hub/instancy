@@ -43,11 +43,32 @@ pub type Managers = Arc<HashMap<String, SharedPeerManager>>;
 pub struct Valve {
     paused: AtomicBool,
     notify: Notify,
+    /// Armed by [`pause_before_handshake`](Self::pause_before_handshake).
+    before_handshake: AtomicBool,
+    /// Bytes the relay holds (read, not yet forwarded).
+    held: AtomicUsize,
 }
 
 impl Valve {
     pub fn pause(&self) {
         self.paused.store(true, Ordering::SeqCst);
+    }
+
+    /// Keep forwarding whole frames until the first shutdown-handshake frame
+    /// (a progress channel's end-of-stream marker or acknowledgement), then
+    /// pause in front of it: everything the sender committed before its
+    /// goodbye (progress batches, its seal) gets through, the goodbye and
+    /// what follows is held until [`resume`](Self::resume). Nothing is
+    /// dropped or reordered, so it works for shared managers' numbered frames
+    /// too.
+    pub fn pause_before_handshake(&self) {
+        self.before_handshake.store(true, Ordering::SeqCst);
+    }
+
+    /// Bytes the relay holds now: something the sender wrote while the valve
+    /// was paused (non-zero means the pause is doing something).
+    pub fn held_bytes(&self) -> usize {
+        self.held.load(Ordering::SeqCst)
     }
 
     pub fn resume(&self) {
@@ -68,6 +89,45 @@ impl Valve {
     }
 }
 
+/// The transport's frame header: `[..16]` (unused here), the channel id
+/// `[16..24]`, the payload length `[24..28]`.
+const FRAME_HEADER: usize = 28;
+
+/// Whether a frame is a shutdown-handshake frame: an end-of-stream marker or
+/// an acknowledgement on a progress channel (count `u32::MAX` or
+/// `u32::MAX - 1`, then the CRC; shared managers prefix 8 sequence bytes).
+fn is_handshake_frame(channel: u64, payload: &[u8]) -> bool {
+    use instancy::communication::{PROGRESS_CHANNEL_BASE, RESERVED_CHANNEL_BASE};
+    if !(PROGRESS_CHANNEL_BASE..RESERVED_CHANNEL_BASE).contains(&channel) {
+        return false;
+    }
+    let count = match payload.len() {
+        8 => &payload[..4],
+        16 => &payload[8..12],
+        _ => return false,
+    };
+    u32::from_le_bytes(count.try_into().unwrap()) >= u32::MAX - 1
+}
+
+/// The length of the whole frames at the start of `bytes` that come before
+/// the first handshake frame, and whether one follows them.
+fn before_handshake(bytes: &[u8]) -> (usize, bool) {
+    let mut at = 0;
+    while at + FRAME_HEADER <= bytes.len() {
+        let channel = u64::from_le_bytes(bytes[at + 16..at + 24].try_into().unwrap());
+        let len = u32::from_le_bytes(bytes[at + 24..at + 28].try_into().unwrap()) as usize;
+        let end = at + FRAME_HEADER + len;
+        if end > bytes.len() {
+            break;
+        }
+        if is_handshake_frame(channel, &bytes[at + FRAME_HEADER..end]) {
+            return (at, true);
+        }
+        at = end;
+    }
+    (at, false)
+}
+
 /// Relay one direction: stops reading while paused (backpressure) and
 /// delivers each chunk `latency` after it was read. Shuts the far side down
 /// on EOF.
@@ -81,21 +141,56 @@ fn relay(
         let (tx, mut rx) = tokio::sync::mpsc::channel::<(tokio::time::Instant, Vec<u8>)>(64);
         let reader = async move {
             let mut buf = vec![0u8; 16 * 1024];
+            // Bytes read but not forwarded yet: while paused the relay holds
+            // one read (so a test can see that the valve held something) and
+            // then stops reading, which backs the sender up.
+            let mut held: Vec<u8> = Vec::new();
             loop {
-                valve.wait_open().await;
+                let paused = valve.paused.load(Ordering::SeqCst);
+                if paused && !held.is_empty() {
+                    valve.wait_open().await;
+                    continue;
+                }
+                if !paused && !held.is_empty() && !valve.before_handshake.load(Ordering::SeqCst) {
+                    valve.held.store(0, Ordering::SeqCst);
+                    let due = tokio::time::Instant::now() + latency;
+                    if tx.send((due, std::mem::take(&mut held))).await.is_err() {
+                        break;
+                    }
+                }
                 match from.read(&mut buf).await {
                     Ok(0) | Err(_) => break,
                     Ok(n) => {
-                        // A read already in progress when the valve closed
-                        // must not slip through.
-                        valve.wait_open().await;
-                        let due = tokio::time::Instant::now() + latency;
-                        if tx.send((due, buf[..n].to_vec())).await.is_err() {
-                            break;
+                        held.extend_from_slice(&buf[..n]);
+                        let forward = if valve.paused.load(Ordering::SeqCst) {
+                            0
+                        } else if valve.before_handshake.load(Ordering::SeqCst) {
+                            let (forward, found) = before_handshake(&held);
+                            if found {
+                                valve.before_handshake.store(false, Ordering::SeqCst);
+                                valve.pause();
+                            }
+                            forward
+                        } else {
+                            held.len()
+                        };
+                        if forward > 0 {
+                            let due = tokio::time::Instant::now() + latency;
+                            let bytes: Vec<u8> = held.drain(..forward).collect();
+                            if tx.send((due, bytes)).await.is_err() {
+                                break;
+                            }
                         }
+                        valve.held.store(held.len(), Ordering::SeqCst);
                     }
                 }
             }
+            if !held.is_empty() {
+                valve.wait_open().await;
+                let due = tokio::time::Instant::now() + latency;
+                let _ = tx.send((due, held)).await;
+            }
+            valve.held.store(0, Ordering::SeqCst);
         };
         let writer = async move {
             while let Some((due, bytes)) = rx.recv().await {

@@ -13,8 +13,9 @@
 use std::collections::VecDeque;
 use std::fmt;
 
-use crate::error::{Error, ProgressError, Result};
+use crate::error::{Error, Result};
 use crate::progress::capability::Capability;
+use crate::progress::change_batch::ChangeBatch;
 use crate::progress::frontier::Antichain;
 use crate::progress::notificator::Notificator;
 use crate::progress::operate::ProgressReporter;
@@ -25,6 +26,11 @@ use crate::progress::timestamp::Timestamp;
 /// An `InputHandle` presents incoming data organized by timestamp.
 /// Operators call [`next`](InputHandle::next) to receive the next
 /// available batch.
+///
+/// It is the logic's view of a counted input port: data waiting here is
+/// still counted at the input (it holds the input's frontier), and taking a
+/// batch with `next` is what consumes it. The handle cannot inject or
+/// re-queue data.
 pub struct InputHandle<T: Timestamp, D> {
     /// Name of this input (for diagnostics).
     name: String,
@@ -32,6 +38,12 @@ pub struct InputHandle<T: Timestamp, D> {
     pending: VecDeque<(T, Vec<D>)>,
     /// Whether the input is complete (no more data will arrive).
     exhausted: bool,
+    /// The input's frontier in this worker's view.
+    frontier: Antichain<T>,
+    /// Records taken in the current logic call, not yet committed.
+    consumed: ChangeBatch<T>,
+    /// The current logic call's justification, and this input's index in it.
+    justify: Option<(usize, crate::dataflow::shell::Justify<T>)>,
     /// The progress checker's count of `pending` (set when the handle is
     /// fed by a channel the checker observes).
     #[cfg(any(debug_assertions, feature = "progress-check"))]
@@ -40,11 +52,14 @@ pub struct InputHandle<T: Timestamp, D> {
 
 impl<T: Timestamp, D> InputHandle<T, D> {
     /// Create a new input handle.
-    pub fn new(name: impl Into<String>) -> Self {
+    pub(crate) fn new(name: impl Into<String>) -> Self {
         Self {
             name: name.into(),
             pending: VecDeque::new(),
             exhausted: false,
+            frontier: Antichain::from_elem(T::minimum()),
+            consumed: ChangeBatch::new(),
+            justify: None,
             #[cfg(any(debug_assertions, feature = "progress-check"))]
             check: None,
         }
@@ -64,7 +79,7 @@ impl<T: Timestamp, D> InputHandle<T, D> {
 
     /// Push a batch of data for the given timestamp.
     /// Used internally by the runtime to feed data into the operator.
-    pub fn push_vec(&mut self, time: T, data: Vec<D>) {
+    pub(crate) fn push_vec(&mut self, time: T, data: Vec<D>) {
         if !data.is_empty() {
             #[cfg(any(debug_assertions, feature = "progress-check"))]
             if let Some(check) = &self.check {
@@ -75,20 +90,66 @@ impl<T: Timestamp, D> InputHandle<T, D> {
     }
 
     /// Mark this input as exhausted — no more data will arrive.
-    pub fn mark_exhausted(&mut self) {
+    pub(crate) fn mark_exhausted(&mut self) {
         self.exhausted = true;
+    }
+
+    /// Set the input's frontier (the operator shell does, after each
+    /// progress propagation). Returns whether it changed.
+    pub(crate) fn set_frontier(&mut self, frontier: Antichain<T>) -> bool {
+        if self.frontier == frontier {
+            return false;
+        }
+        self.frontier = frontier;
+        true
+    }
+
+    /// Attach the justification of this operator's logic calls.
+    pub(crate) fn set_justify(
+        &mut self,
+        input: usize,
+        justify: crate::dataflow::shell::Justify<T>,
+    ) {
+        self.justify = Some((input, justify));
+    }
+
+    /// The records taken by the current logic call, for the shell to commit.
+    pub(crate) fn take_consumed(&mut self) -> &mut ChangeBatch<T> {
+        &mut self.consumed
+    }
+
+    /// Takes the next batch without consuming it: the caller (a shell store
+    /// that holds consumed data off the ledger, such as a sink's egress)
+    /// must redeem the returned credit, with
+    /// [`Credit::redeem`](crate::dataflow::shell::Credit::redeem), once the
+    /// data is handed over or explicitly discarded.
+    pub(crate) fn next_on_credit(&mut self) -> Option<(T, Vec<D>, (T, i64))> {
+        let (time, data) = self.pending.pop_front()?;
+        #[cfg(any(debug_assertions, feature = "progress-check"))]
+        if let Some(check) = &self.check {
+            check.remove(&time, data.len());
+        }
+        let credit = (time.clone(), data.len() as i64);
+        Some((time, data, credit))
     }
 
     /// Get the next available batch of data.
     ///
     /// Returns `Some((time, data))` if a batch is available,
-    /// `None` if no data is currently pending.
+    /// `None` if no data is currently pending. Taking a batch consumes it:
+    /// from now on, the operator's logic is responsible for it.
     #[allow(clippy::should_implement_trait)]
     pub fn next(&mut self) -> Option<(T, Vec<D>)> {
         let batch = self.pending.pop_front();
-        #[cfg(any(debug_assertions, feature = "progress-check"))]
-        if let (Some(check), Some((time, data))) = (&self.check, &batch) {
-            check.remove(time, data.len());
+        if let Some((time, data)) = &batch {
+            #[cfg(any(debug_assertions, feature = "progress-check"))]
+            if let Some(check) = &self.check {
+                check.remove(time, data.len());
+            }
+            self.consumed.update(time.clone(), data.len() as i64);
+            if let Some((input, justify)) = &self.justify {
+                justify.consumed(*input, time);
+            }
         }
         batch
     }
@@ -103,19 +164,22 @@ impl<T: Timestamp, D> InputHandle<T, D> {
         self.pending.len()
     }
 
-    /// Timestamps of the batches currently pending in this handle.
-    pub(crate) fn pending_times(&self) -> impl Iterator<Item = &T> {
-        self.pending.iter().map(|(time, _)| time)
-    }
-
     /// Whether the input is complete (exhausted and no pending data).
     pub fn is_done(&self) -> bool {
         self.exhausted && self.pending.is_empty()
     }
 
-    /// Whether the input has been marked as exhausted.
+    /// Whether the input has been marked as exhausted: its channel has
+    /// ended, so no more data will arrive. Batches may still be pending.
     pub fn is_exhausted(&self) -> bool {
         self.exhausted
+    }
+
+    /// The input's frontier: the times at which data may still arrive at
+    /// this input (including data already pending here). Empty once no
+    /// more data can arrive.
+    pub fn frontier(&self) -> &Antichain<T> {
+        &self.frontier
     }
 
     /// Name of this input handle.
@@ -145,6 +209,9 @@ pub struct OutputSession<'a, T: Timestamp, D> {
     buffer: &'a mut Vec<(T, Vec<D>)>,
     /// Accumulated records for this session.
     session_data: Vec<D>,
+    /// The progress checker's measure of the handle's buffer.
+    #[cfg(any(debug_assertions, feature = "progress-check"))]
+    check: Option<&'a crate::progress::check::StoreCheck<T>>,
 }
 
 impl<'a, T: Timestamp + Clone, D> OutputSession<'a, T, D> {
@@ -173,6 +240,10 @@ impl<'a, T: Timestamp + Clone, D> Drop for OutputSession<'a, T, D> {
     fn drop(&mut self) {
         if !self.session_data.is_empty() {
             let data = std::mem::take(&mut self.session_data);
+            #[cfg(any(debug_assertions, feature = "progress-check"))]
+            if let Some(check) = self.check {
+                check.add(&self.time, data.len());
+            }
             self.buffer.push((self.time.clone(), data));
         }
     }
@@ -182,20 +253,140 @@ impl<'a, T: Timestamp + Clone, D> Drop for OutputSession<'a, T, D> {
 ///
 /// An `OutputHandle` collects output batches produced by operator logic.
 /// Operators create [`OutputSession`]s at specific timestamps to emit records.
-/// After the operator completes, the runtime drains the buffered output.
+/// After the operator's logic returns, the runtime takes the buffered output
+/// and counts it as produced.
 pub struct OutputHandle<T: Timestamp, D> {
     /// Name of this output (for diagnostics).
     name: String,
     /// Buffered output batches: (timestamp, data).
     buffer: Vec<(T, Vec<D>)>,
+    /// What [`retain`](Self::retain) needs: this output's index, the call's
+    /// justification, the output's capability reporter and the executor's
+    /// wake handle.
+    retain: Option<RetainCtx<T>>,
+    /// The progress checker's measure of `buffer` (output a call emitted,
+    /// until its shell takes it).
+    #[cfg(any(debug_assertions, feature = "progress-check"))]
+    check: Option<crate::progress::check::StoreCheck<T>>,
+}
+
+struct RetainCtx<T: Timestamp> {
+    output: usize,
+    justify: crate::dataflow::shell::Justify<T>,
+    reporter: ProgressReporter<T>,
+    wake: Option<crate::dataflow::channels::wake::WakeHandle>,
+    live: std::sync::Arc<std::sync::atomic::AtomicUsize>,
 }
 
 impl<T: Timestamp, D> OutputHandle<T, D> {
     /// Create a new output handle.
-    pub fn new(name: impl Into<String>) -> Self {
+    pub(crate) fn new(name: impl Into<String>) -> Self {
         Self {
             name: name.into(),
             buffer: Vec::new(),
+            retain: None,
+            #[cfg(any(debug_assertions, feature = "progress-check"))]
+            check: None,
+        }
+    }
+
+    /// Measure the buffer as work held for `push`'s output.
+    #[cfg(any(debug_assertions, feature = "progress-check"))]
+    pub(crate) fn observe(&mut self, push: &dyn crate::dataflow::channels::pushpull::Push<T, D>) {
+        self.check = push.check_port().map(|port| {
+            crate::progress::check::StoreCheck::new(
+                port,
+                crate::progress::check::Store::OutputSession,
+            )
+        });
+    }
+
+    /// Connect the handle to its operator's capabilities (the shell does).
+    pub(crate) fn set_retain(
+        &mut self,
+        output: usize,
+        justify: crate::dataflow::shell::Justify<T>,
+        reporter: ProgressReporter<T>,
+        wake: Option<crate::dataflow::channels::wake::WakeHandle>,
+        live: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    ) {
+        self.retain = Some(RetainCtx {
+            output,
+            justify,
+            reporter,
+            wake,
+            live,
+        });
+    }
+
+    /// Keep a capability for this output at `time`, released when the
+    /// returned [`Retained`](crate::dataflow::Retained) is dropped.
+    ///
+    /// Data a closure keeps across calls must be covered by a capability:
+    /// output at a time that nothing justifies is late and fails the
+    /// operator. While the `Retained` exists, downstream frontiers cannot
+    /// pass `time`, and the closure may emit at or after `time` in any later
+    /// call; the operator is called again whenever its input frontier
+    /// changes, including the call in which it becomes empty (the last
+    /// chance to flush). The `Retained` may be dropped on any thread, so
+    /// while one is alive its worker waits for that drop instead of
+    /// reporting that it can make no further progress: a `Retained` that is
+    /// never dropped keeps the dataflow running.
+    ///
+    /// `time` must be justified in the current call: at or after a
+    /// capability the operator held when the call started (another
+    /// `Retained`, for example), or at or after the time of a batch the call
+    /// took from an input. Otherwise the operator fails once the call
+    /// returns.
+    ///
+    /// Operator closures are `Clone` (one copy per worker, made before any
+    /// call) and `Retained` is not, so keep retained work in a type whose
+    /// `Clone` starts empty:
+    ///
+    /// ```ignore
+    /// #[derive(Default)]
+    /// struct Held(Vec<(Retained<u64>, Vec<u64>)>);
+    /// impl Clone for Held {
+    ///     fn clone(&self) -> Self {
+    ///         Held::default()
+    ///     }
+    /// }
+    ///
+    /// stream.unary("hold", {
+    ///     let mut held = Held::default();
+    ///     move |input, output| {
+    ///         let held = &mut held;
+    ///         while let Some((time, data)) = input.next() {
+    ///             held.0.push((output.retain(time), data));
+    ///         }
+    ///         let frontier = input.frontier().clone();
+    ///         held.0.retain_mut(|(retained, data)| {
+    ///             if frontier.less_equal(retained.time()) {
+    ///                 return true;
+    ///             }
+    ///             output.push_vec(*retained.time(), std::mem::take(data));
+    ///             false
+    ///         });
+    ///         Ok(())
+    ///     }
+    /// })
+    /// ```
+    pub fn retain(&mut self, time: T) -> crate::dataflow::Retained<T> {
+        match &self.retain {
+            Some(ctx) => {
+                let capability = ctx
+                    .justify
+                    .acquire(ctx.output, &time, "retain")
+                    .ok()
+                    .map(|()| Capability::new(time.clone(), ctx.reporter.clone()));
+                crate::dataflow::Retained::new(
+                    capability,
+                    time,
+                    ctx.wake.clone(),
+                    Some(ctx.live.clone()),
+                )
+            }
+            None => crate::dataflow::Retained::new(None, time, None, None),
         }
     }
 
@@ -211,12 +402,18 @@ impl<T: Timestamp, D> OutputHandle<T, D> {
             time,
             buffer: &mut self.buffer,
             session_data: Vec::new(),
+            #[cfg(any(debug_assertions, feature = "progress-check"))]
+            check: self.check.as_ref(),
         }
     }
 
     /// Directly push a batch of records at a given timestamp.
     pub fn push_vec(&mut self, time: T, data: Vec<D>) {
         if !data.is_empty() {
+            #[cfg(any(debug_assertions, feature = "progress-check"))]
+            if let Some(check) = &self.check {
+                check.add(&time, data.len());
+            }
             self.buffer.push((time, data));
         }
     }
@@ -225,8 +422,20 @@ impl<T: Timestamp, D> OutputHandle<T, D> {
     ///
     /// Returns an iterator over `(time, data)` pairs. This is called
     /// by the runtime after the operator completes a step.
-    pub fn drain(&mut self) -> impl Iterator<Item = (T, Vec<D>)> + '_ {
-        self.buffer.drain(..)
+    pub(crate) fn drain(&mut self) -> std::vec::IntoIter<(T, Vec<D>)> {
+        let batches = std::mem::take(&mut self.buffer);
+        #[cfg(any(debug_assertions, feature = "progress-check"))]
+        if let Some(check) = &self.check {
+            for (time, data) in &batches {
+                check.remove(time, data.len());
+            }
+        }
+        batches.into_iter()
+    }
+
+    /// Times of the buffered batches.
+    pub(crate) fn buffered_times(&self) -> impl Iterator<Item = &T> {
+        self.buffer.iter().map(|(time, _)| time)
     }
 
     /// Number of buffered batches.
@@ -390,15 +599,16 @@ impl<T: Timestamp + fmt::Debug> fmt::Debug for NotificationHandle<T> {
 ///
 /// # Which times may be requested
 ///
-/// [`notify_at(time)`](Self::notify_at) is only valid for a time the operator
-/// can legitimately hold a capability for: a time at or after (in the partial
-/// order) its current input frontier, a capability it holds (or held when the
-/// activation started, so a notification handler may re-arm or delay the time
-/// it is handling), or the time of an input batch available in this
-/// activation. Any other time has already been passed by the frontier, so
-/// holding a capability for it would move downstream frontiers backwards; such
-/// a request is rejected and fails the operator with
-/// [`ProgressError::InvalidNotificationTime`]. Use
+/// [`notify_at(time)`](Self::notify_at) holds a capability at `time`, so it
+/// must be *justified* in the current call (V3): `time` must be at or after
+/// a capability the operator held when the call started (including one
+/// [`next_notification`](Self::next_notification) dropped during the call,
+/// so a notification handler may re-arm or delay the time it is handling),
+/// or at or after the time of a batch the call took from its input. The
+/// input frontier alone never justifies a request, and neither does a
+/// batch that is waiting but not taken. An unjustified request is rejected
+/// and fails the operator with
+/// [`ProgressError::Unjustified`](crate::error::ProgressError::Unjustified). Use
 /// [`try_notify_at`](Self::try_notify_at) to handle the rejection instead.
 ///
 /// # Thread safety
@@ -419,15 +629,11 @@ pub struct NotifyContext<'a, T: Timestamp> {
     /// Each capability represents a promise that the operator may still produce
     /// data at that time. Dropping a capability (via next_notification or explicitly)
     /// decrements the pointstamp count, allowing downstream frontiers to advance.
-    capabilities: &'a mut Vec<Capability<T>>,
+    capabilities: &'a mut std::collections::BTreeMap<T, Capability<T>>,
 
-    /// Times the operator held when this activation started: its capabilities
-    /// and the times of the available input batches. Like a held capability,
-    /// an available message at time `t` entitles the operator to a capability
-    /// at any time `>= t`. A capability dropped by `next_notification` during
-    /// the activation still justifies requests, because its drop and the new
-    /// capability are reported to the progress tracker together.
-    activation_times: Antichain<T>,
+    /// The current call's justification set (see
+    /// [`Justify`](crate::dataflow::shell::Justify)).
+    justify: crate::dataflow::shell::Justify<T>,
 
     /// First invalid `notify_at` request of this activation, reported as the
     /// activation's error once the operator logic returns.
@@ -437,21 +643,21 @@ pub struct NotifyContext<'a, T: Timestamp> {
 impl<'a, T: Timestamp> NotifyContext<'a, T> {
     /// Creates a new `NotifyContext` from operator-internal state.
     ///
-    /// Called by `WiredUnaryNotifyOperator::activate()` before invoking the
-    /// user closure. The borrows are released when the closure returns.
-    /// `activation_times` are the times of the capabilities held and of the
-    /// input batches available when the activation starts.
+    /// Called by the notify operator's logic before invoking the user
+    /// closure. The borrows are released when the closure returns.
+    /// `justify` is the call's justification set; requests are checked
+    /// against it for the operator's output 0.
     pub(crate) fn new(
         notificator: &'a mut Notificator<T>,
         reporter: &'a ProgressReporter<T>,
-        capabilities: &'a mut Vec<Capability<T>>,
-        activation_times: Antichain<T>,
+        capabilities: &'a mut std::collections::BTreeMap<T, Capability<T>>,
+        justify: crate::dataflow::shell::Justify<T>,
     ) -> Self {
         Self {
             notificator,
             reporter,
             capabilities,
-            activation_times,
+            justify,
             error: None,
         }
     }
@@ -461,22 +667,9 @@ impl<'a, T: Timestamp> NotifyContext<'a, T> {
         self.error.take()
     }
 
-    /// Checks that the operator may hold a capability at `time`.
+    /// Checks that the call justifies a capability at `time` (V3).
     fn check_time(&self, time: &T) -> Result<()> {
-        if self.notificator.frontier().less_equal(time)
-            || self
-                .capabilities
-                .iter()
-                .any(|cap| cap.time().less_equal(time))
-            || self.activation_times.less_equal(time)
-        {
-            Ok(())
-        } else {
-            Err(Error::Progress(ProgressError::InvalidNotificationTime {
-                time: format!("{time:?}"),
-                frontier: format!("{:?}", self.notificator.frontier().elements()),
-            }))
-        }
+        self.justify.check(0, time, "notify_at")
     }
 
     /// Request notification when the input frontier advances past `time`.
@@ -509,15 +702,14 @@ impl<'a, T: Timestamp> NotifyContext<'a, T> {
     /// - **Not consuming notifications**: If you call `notify_at()` but never call
     ///   `next_notification()`, capabilities accumulate and downstream operators
     ///   will stall indefinitely.
-    /// - **Past times**: `time` must be at or after the input frontier, a
-    ///   capability held at the start of the activation, or the time of an
-    ///   input batch available in this activation (see the
-    ///   [type-level docs](Self#which-times-may-be-requested)). A valid request
-    ///   whose time the frontier has already passed (e.g. re-arming the time
-    ///   being handled, or a batch that arrived late) fires on the next
-    ///   activation. An invalid request is ignored and fails the operator once
-    ///   its logic returns; use [`try_notify_at`](Self::try_notify_at) to
-    ///   handle it instead.
+    /// - **Unjustified times**: `time` must be at or after a capability held
+    ///   when the call started or the time of a batch the call took from its
+    ///   input (see the [type-level docs](Self#which-times-may-be-requested)).
+    ///   A justified request whose time the frontier has already passed (e.g.
+    ///   re-arming the time being handled) fires on the next call. An
+    ///   unjustified request is ignored and fails the operator once its logic
+    ///   returns; use [`try_notify_at`](Self::try_notify_at) to handle it
+    ///   instead.
     pub fn notify_at(&mut self, time: T) {
         if let Err(error) = self.try_notify_at(time) {
             self.error.get_or_insert(error);
@@ -525,22 +717,21 @@ impl<'a, T: Timestamp> NotifyContext<'a, T> {
     }
 
     /// Like [`notify_at`](Self::notify_at), but returns an error (and requests
-    /// nothing) if `time` is not a time the operator can hold, instead of
-    /// failing the operator.
+    /// nothing) if this call does not justify `time`, instead of failing the
+    /// operator.
     pub fn try_notify_at(&mut self, time: T) -> Result<()> {
         self.check_time(&time)?;
-        // Only create a new capability if we don't already hold one at this time.
-        // The notificator deduplicates notification requests internally, but without
-        // this guard, repeated calls (e.g., once per data item) would create redundant
-        // capabilities — each requiring a mutex lock on drop. One capability per time
-        // is sufficient to hold the downstream frontier.
-        if !self.capabilities.iter().any(|c| c.time() == &time) {
+        // One capability per time is enough to hold the downstream frontier:
+        // repeated calls (e.g. once per data item) create no more. The map
+        // keeps both this lookup and the drop in `next_notification` in
+        // O(log n) of the times held.
+        if !self.capabilities.contains_key(&time) {
             // Create an output capability at this time.
             // This increments +1 in the ProgressReporter, which the reachability
             // tracker sees as a pointstamp at (operator, output_port, time).
             // Downstream frontiers cannot advance past `time` while this exists.
             let cap = Capability::new(time.clone(), self.reporter.clone());
-            self.capabilities.push(cap);
+            self.capabilities.insert(time.clone(), cap);
         }
 
         // Register the notification request with the notificator.
@@ -562,21 +753,11 @@ impl<'a, T: Timestamp> NotifyContext<'a, T> {
     /// all capabilities at `time` are gone, downstream frontiers can advance
     /// past `time`.
     ///
-    /// If the operator emits data for `time` BEFORE calling this (via
-    /// `output.push_vec(time, data)`), the data is pushed into the output
-    /// channel in the same activation. The capability drop happens right
-    /// after, so downstream sees both the data arrival and the frontier
-    /// advancement in the next progress propagation cycle.
-    ///
-    /// # Known limitation (backpressure)
-    ///
-    /// If the output channel is full when the operator's activation tries to
-    /// flush `pending_output`, data may remain buffered while the capability
-    /// has already been dropped. In this case, downstream could observe frontier
-    /// advancement before receiving the data. This is a known design limitation
-    /// that will be addressed when message-flight accounting (`consumed`/`produced`
-    /// in `OperatorProgress`) is implemented. In practice, with the default 1024
-    /// envelope channel capacity, this is unlikely to occur.
+    /// The operator may still emit at `time` in this call: the dropped
+    /// capability justifies output for the rest of the call (V3). Output is
+    /// counted at its targets in the same commit as the drop, even if it
+    /// waits in the operator's retry queue for channel capacity, so
+    /// downstream frontiers never pass it.
     ///
     /// Returns `None` when no notifications are ready. More may become ready
     /// in future activations as the frontier continues to advance.
@@ -584,11 +765,9 @@ impl<'a, T: Timestamp> NotifyContext<'a, T> {
         let fired = self.notificator.next()?;
         let time = fired.into_time();
 
-        // Drop ALL capabilities at this time.
-        // There may be multiple if notify_at was called repeatedly for the
-        // same time (e.g., data arrived in multiple batches). Each capability
-        // drop decrements the pointstamp count by 1.
-        self.capabilities.retain(|c| c.time() != &time);
+        // Drop the capability held at this time (`notify_at` holds one per
+        // time), decrementing the pointstamp count.
+        self.capabilities.remove(&time);
 
         Some(time)
     }

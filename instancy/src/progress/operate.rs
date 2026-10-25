@@ -23,6 +23,8 @@
 //! - [`OperatorCore`] — trait that operators implement to declare their shape and
 //!   initial capabilities.
 
+use std::collections::BTreeMap;
+use std::collections::btree_map::Entry;
 use std::fmt::Debug;
 use std::sync::{Arc, Mutex};
 
@@ -128,23 +130,135 @@ impl<S: Clone + Debug + PartialEq + PartialOrder> PortConnectivity<S> {
 /// Shared between [`Capability`](super::capability::Capability) instances and the
 /// progress tracking system. All capability create/clone/drop/downgrade operations
 /// go through this handle so changes are observed atomically.
+///
+/// Besides the changes the tracker has not drained yet, the reporter keeps
+/// the capabilities its port currently holds (`held`, never drained). The
+/// operator shell reads it to justify output (V3) and to decide whether the
+/// operator still holds a capability (S2a, seals). A release from another
+/// task (a dropped [`Retained`](crate::dataflow::Retained)) lands here too:
+/// the reporter is the port's release mailbox.
 #[derive(Clone, Debug)]
 pub struct ProgressReporter<T: Timestamp> {
-    inner: Arc<Mutex<ChangeBatch<T>>>,
+    inner: Arc<Mutex<ReporterState<T>>>,
     /// Where the progress checker counts capabilities held through this
     /// reporter (set when the reporter's tracker is attached to an oracle).
     #[cfg(any(debug_assertions, feature = "progress-check"))]
     check: Arc<std::sync::OnceLock<crate::progress::check::Port<T>>>,
 }
 
+/// A reporter's changes not yet drained, and the capabilities held.
+#[derive(Debug)]
+struct ReporterState<T: Timestamp> {
+    pending: ChangeBatch<T>,
+    /// The capabilities held, per time (no zero entries).
+    held: BTreeMap<T, i64>,
+    /// While a logic call runs (see `Justify`): the minimal times of the
+    /// capabilities released during it, which still justify its output.
+    released_in_call: Option<Antichain<T>>,
+    /// Releases the progress checker still counts as held: a released
+    /// capability stays in this mailbox until a commit drains it.
+    #[cfg(any(debug_assertions, feature = "progress-check"))]
+    released: Vec<(T, i64)>,
+}
+
 impl<T: Timestamp> ProgressReporter<T> {
     /// Creates a new reporter with an empty change batch.
     pub fn new() -> Self {
         Self {
-            inner: Arc::new(Mutex::new(ChangeBatch::new())),
+            inner: Arc::new(Mutex::new(ReporterState {
+                pending: ChangeBatch::new(),
+                held: BTreeMap::new(),
+                released_in_call: None,
+                #[cfg(any(debug_assertions, feature = "progress-check"))]
+                released: Vec::new(),
+            })),
             #[cfg(any(debug_assertions, feature = "progress-check"))]
             check: Arc::default(),
         }
+    }
+
+    fn state(&self) -> std::sync::MutexGuard<'_, ReporterState<T>> {
+        self.inner.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// Record `n` capabilities at `time` as held without reporting them: an
+    /// initial capability, which every tracker seeds from the physical plan
+    /// (A4), is held by the operator from the start.
+    pub(crate) fn seed_held(&self, time: T, n: i64) {
+        Self::hold(&mut self.state(), time, n);
+    }
+
+    /// Changes the held count at `time` by `diff`; a release during a logic
+    /// call is remembered for the call's justification.
+    fn hold(state: &mut ReporterState<T>, time: T, diff: i64) {
+        if diff < 0 {
+            if let Some(released) = &mut state.released_in_call {
+                released.insert_ref(&time);
+            }
+        }
+        match state.held.entry(time) {
+            Entry::Occupied(mut entry) => {
+                *entry.get_mut() += diff;
+                if *entry.get() == 0 {
+                    entry.remove();
+                }
+            }
+            Entry::Vacant(entry) => {
+                if diff != 0 {
+                    entry.insert(diff);
+                }
+            }
+        }
+    }
+
+    /// The minimal times at which this port holds capabilities.
+    pub(crate) fn held_frontier(&self) -> Antichain<T> {
+        let state = self.state();
+        let mut frontier = Antichain::new();
+        for (time, count) in &state.held {
+            if *count > 0 {
+                frontier.insert_ref(time);
+            }
+        }
+        frontier
+    }
+
+    /// Whether this port holds any capability.
+    pub(crate) fn holds_any(&self) -> bool {
+        !self.state().held.is_empty()
+    }
+
+    /// A logic call starts: remember the capabilities released during it
+    /// (see [`justifies`](Self::justifies)).
+    pub(crate) fn begin_call(&self) {
+        self.state().released_in_call = Some(Antichain::new());
+    }
+
+    /// The logic call (and the check of its output) ended.
+    pub(crate) fn end_call(&self) {
+        self.state().released_in_call = None;
+    }
+
+    /// The minimal times of the capabilities released during the current
+    /// logic call.
+    pub(crate) fn released_in_call(&self) -> Antichain<T> {
+        self.state().released_in_call.clone().unwrap_or_default()
+    }
+
+    /// Whether a capability this port holds, or released during the current
+    /// logic call, is at or before `time`. Only times at or before `time` in
+    /// `Ord` can be (`Ord` is a linear extension of the partial order), and
+    /// the scan stops at the first that is: O(log n) for a total order.
+    pub(crate) fn justifies(&self, time: &T) -> bool {
+        let state = self.state();
+        state
+            .released_in_call
+            .as_ref()
+            .is_some_and(|released| released.less_equal(time))
+            || state
+                .held
+                .range(..=time)
+                .any(|(held, count)| *count > 0 && held.less_equal(time))
     }
 
     /// Count `diff` capabilities at `time` held through this reporter, for
@@ -158,6 +272,28 @@ impl<T: Timestamp> ProgressReporter<T> {
         }
     }
 
+    /// Count a capability at `time` released through this reporter, for the
+    /// progress checker: it stays counted (as held) until a commit drains the
+    /// release from this mailbox. Called with the state locked, together with
+    /// the `-1` itself, so a drain (on another thread than a dropped
+    /// `Retained`) never takes the `-1` without the release.
+    #[cfg(any(debug_assertions, feature = "progress-check"))]
+    fn check_release(&self, state: &mut ReporterState<T>, time: &T) {
+        if self.check.get().is_some() {
+            state.released.push((time.clone(), 1));
+        }
+    }
+
+    /// The releases a drain took out of the mailbox leave the checker's count.
+    #[cfg(any(debug_assertions, feature = "progress-check"))]
+    fn check_released(&self, released: Vec<(T, i64)>) {
+        if let Some(port) = self.check.get() {
+            for (time, n) in released {
+                port.count(crate::progress::check::Store::Capability, &time, -n);
+            }
+        }
+    }
+
     /// Tell the progress checker which output this reporter is for.
     #[cfg(any(debug_assertions, feature = "progress-check"))]
     pub(crate) fn set_check_port(&self, port: crate::progress::check::Port<T>) {
@@ -166,10 +302,19 @@ impl<T: Timestamp> ProgressReporter<T> {
 
     /// Records a change: `+1` for a new capability, `-1` for a dropped one.
     pub fn update(&self, time: T, diff: i64) {
-        self.inner
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .update(time, diff);
+        let mut state = self.state();
+        state.pending.update(time.clone(), diff);
+        Self::hold(&mut state, time, diff);
+    }
+
+    /// Records a dropped capability at `time` (`-1`), and its release in the
+    /// checker's mailbox, under one lock.
+    pub(crate) fn release(&self, time: T) {
+        let mut state = self.state();
+        #[cfg(any(debug_assertions, feature = "progress-check"))]
+        self.check_release(&mut state, &time);
+        state.pending.update(time.clone(), -1);
+        Self::hold(&mut state, time, -1);
     }
 
     /// Records a paired update atomically: `-1` at `old_time`, `+1` at `new_time`.
@@ -177,12 +322,95 @@ impl<T: Timestamp> ProgressReporter<T> {
     /// Used by [`Capability::downgrade`](super::capability::Capability::downgrade) to
     /// ensure the frontier never sees an intermediate state.
     pub fn downgrade(&self, old_time: T, new_time: T) {
-        let mut batch = self.inner.lock().unwrap_or_else(|e| e.into_inner());
-        batch.update(old_time, -1);
-        batch.update(new_time, 1);
+        let mut state = self.state();
+        #[cfg(any(debug_assertions, feature = "progress-check"))]
+        self.check_release(&mut state, &old_time);
+        state.pending.update(old_time.clone(), -1);
+        state.pending.update(new_time.clone(), 1);
+        Self::hold(&mut state, old_time, -1);
+        Self::hold(&mut state, new_time, 1);
     }
 
     /// Drains all pending changes from this reporter, returning them as a vec.
+    pub fn drain(&self) -> Vec<(T, i64)> {
+        let mut state = self.state();
+        let changes = state.pending.drain().collect();
+        #[cfg(any(debug_assertions, feature = "progress-check"))]
+        {
+            let released = std::mem::take(&mut state.released);
+            drop(state);
+            self.check_released(released);
+        }
+        changes
+    }
+
+    /// Drains pending changes into the given `ChangeBatch`.
+    pub fn drain_into(&self, target: &mut ChangeBatch<T>) {
+        let mut state = self.state();
+        state.pending.drain_into(target);
+        #[cfg(any(debug_assertions, feature = "progress-check"))]
+        {
+            let released = std::mem::take(&mut state.released);
+            drop(state);
+            self.check_released(released);
+        }
+    }
+
+    /// Returns `true` if there are no pending (unread) changes.
+    pub fn is_empty(&self) -> bool {
+        self.state().pending.is_empty()
+    }
+}
+
+impl<T: Timestamp> Default for ProgressReporter<T> {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+// ---------------------------------------------------------------------------
+// PortLedger — a port's consumed or produced counts
+// ---------------------------------------------------------------------------
+
+/// The port-count ledger of one operator port: records the operator shell
+/// consumed at an input, or produced at an output, since the tracker last
+/// drained it.
+///
+/// Only the shell writes to it, once per logic call and after the call's
+/// output was validated; the tracker drains it at each commit. Data sitting
+/// between a producing and a consuming port is therefore counted at the
+/// consuming input from the moment the shell takes it from the producer's
+/// logic until the consumer's logic takes it.
+#[derive(Clone, Debug)]
+pub struct PortLedger<T: Timestamp> {
+    inner: Arc<Mutex<ChangeBatch<T>>>,
+}
+
+impl<T: Timestamp> PortLedger<T> {
+    /// An empty ledger.
+    pub fn new() -> Self {
+        Self {
+            inner: Arc::new(Mutex::new(ChangeBatch::new())),
+        }
+    }
+
+    /// Adds every change of `changes` to the ledger, draining `changes`.
+    pub(crate) fn absorb(&self, changes: &mut ChangeBatch<T>) {
+        if changes.is_empty() {
+            return;
+        }
+        changes.drain_into(&mut self.inner.lock().unwrap_or_else(|e| e.into_inner()));
+    }
+
+    /// Adds `diff` records at `time`.
+    pub(crate) fn update(&self, time: T, diff: i64) {
+        self.inner
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .update(time, diff);
+    }
+
+    /// Drains the recorded counts.
     pub fn drain(&self) -> Vec<(T, i64)> {
         self.inner
             .lock()
@@ -191,15 +419,7 @@ impl<T: Timestamp> ProgressReporter<T> {
             .collect()
     }
 
-    /// Drains pending changes into the given `ChangeBatch`.
-    pub fn drain_into(&self, target: &mut ChangeBatch<T>) {
-        self.inner
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .drain_into(target);
-    }
-
-    /// Returns `true` if there are no pending (unread) changes.
+    /// Whether nothing is recorded.
     pub fn is_empty(&self) -> bool {
         self.inner
             .lock()
@@ -208,7 +428,7 @@ impl<T: Timestamp> ProgressReporter<T> {
     }
 }
 
-impl<T: Timestamp> Default for ProgressReporter<T> {
+impl<T: Timestamp> Default for PortLedger<T> {
     fn default() -> Self {
         Self::new()
     }
@@ -220,22 +440,21 @@ impl<T: Timestamp> Default for ProgressReporter<T> {
 
 /// Shared progress buffers between an operator and the progress tracker.
 ///
-/// Each operator has one `OperatorProgress` instance. Capabilities write to
-/// `internal` (via [`ProgressReporter`]) and the progress tracker drains those
-/// changes during propagation.
+/// Each operator has one `OperatorProgress` instance per worker:
+/// - `consumed[i]`: records the operator shell took from input `i`;
+/// - `produced[o]`: records the shell took from the logic at output `o`;
+/// - `internal[o]`: capability changes at output `o` (capabilities write
+///   here through [`ProgressReporter`]).
 ///
-/// In-flight **message** accounting (for boundary channels such as exchange)
-/// does not flow through these per-operator buffers — it is tracked by
-/// target-bound in-flight reporters registered directly on the
-/// [`ProgressTracker`](crate::progress::subgraph::ProgressTracker), so a message
-/// can be accounted against the specific downstream input it targets regardless
-/// of tee/fan-out on the producing output.
+/// The tracker drains all three at each commit: consumed as `-n` at the
+/// input, produced as `+n` at every target of the output's edges, internal
+/// at the output.
 #[derive(Debug, Clone)]
 pub struct OperatorProgress<T: Timestamp> {
-    /// Per-input consumed changes — reserved for future message-flight accounting.
-    pub consumed: Vec<ChangeBatch<T>>,
-    /// Per-output produced changes — reserved for future message-flight accounting.
-    pub produced: Vec<ChangeBatch<T>>,
+    /// Per-input consumed records.
+    pub consumed: Vec<PortLedger<T>>,
+    /// Per-output produced records.
+    pub produced: Vec<PortLedger<T>>,
     /// Per-output capability reporters (capabilities write here via ProgressReporter).
     pub internal: Vec<ProgressReporter<T>>,
 }
@@ -244,28 +463,21 @@ impl<T: Timestamp> OperatorProgress<T> {
     /// Creates progress buffers for an operator with the given port counts.
     pub fn new(inputs: usize, outputs: usize) -> Self {
         Self {
-            consumed: (0..inputs).map(|_| ChangeBatch::new()).collect(),
-            produced: (0..outputs).map(|_| ChangeBatch::new()).collect(),
+            consumed: (0..inputs).map(|_| PortLedger::new()).collect(),
+            produced: (0..outputs).map(|_| PortLedger::new()).collect(),
             internal: (0..outputs).map(|_| ProgressReporter::new()).collect(),
         }
     }
 
-    /// Creates an independent deep copy with fresh [`ProgressReporter`]s.
+    /// Creates an independent deep copy with fresh ledgers and
+    /// [`ProgressReporter`]s.
     ///
     /// Unlike `clone()` (which shares `Arc`-backed reporters), this creates
     /// new reporters with empty change batches. Used when cloning a
     /// `SubgraphBuilder` for multi-worker materialization so each worker
     /// gets independent progress state.
     pub fn deep_clone(&self) -> Self {
-        Self {
-            consumed: self.consumed.clone(),
-            produced: self.produced.clone(),
-            internal: self
-                .internal
-                .iter()
-                .map(|_| ProgressReporter::new())
-                .collect(),
-        }
+        Self::new(self.consumed.len(), self.produced.len())
     }
 
     /// Returns the reporter for the given output port.
@@ -429,5 +641,51 @@ mod tests {
         clone.update(20, 1);
         let changes = reporter.drain();
         assert_eq!(changes.len(), 2);
+    }
+
+    /// During a call, a capability justifies output if it is held now or
+    /// was released during the call; a release between calls does not carry
+    /// into the next one.
+    #[test]
+    fn reporter_justifies_held_and_released_in_call() {
+        let reporter = ProgressReporter::<u64>::new();
+        reporter.update(10, 1);
+        reporter.update(20, 1);
+        assert_eq!(reporter.held_frontier().elements(), &[10]);
+        assert!(reporter.justifies(&10) && reporter.justifies(&15));
+        assert!(!reporter.justifies(&9));
+
+        reporter.begin_call();
+        reporter.update(10, -1);
+        assert!(reporter.justifies(&10), "released in this call");
+        reporter.end_call();
+        assert!(!reporter.justifies(&15), "only 20 is held now");
+
+        reporter.begin_call();
+        reporter.downgrade(20, 30);
+        assert!(reporter.justifies(&25), "downgraded from 20 in this call");
+        assert_eq!(reporter.released_in_call().elements(), &[20]);
+        reporter.end_call();
+
+        assert!(!reporter.justifies(&25), "only 30 is held now");
+        assert!(reporter.justifies(&30));
+        reporter.update(30, -1);
+        assert!(!reporter.holds_any());
+        assert!(!reporter.justifies(&u64::MAX));
+    }
+
+    #[test]
+    fn reporter_justifies_with_a_partial_order() {
+        use crate::order::Product;
+        let reporter = ProgressReporter::<Product<u64, u32>>::new();
+        reporter.update(Product::new(0, 9), 1);
+        reporter.update(Product::new(1, 7), 1);
+        // (0, 9) comes first in `Ord` but is not at or before (1, 8): the
+        // scan must go on to (1, 7), which is.
+        assert!(reporter.justifies(&Product::new(1, 8)));
+        // Nothing held is at or before (1, 6).
+        assert!(!reporter.justifies(&Product::new(1, 6)));
+        assert!(reporter.justifies(&Product::new(0, 10)), "after (0, 9)");
+        assert!(!reporter.justifies(&Product::new(0, 7)));
     }
 }

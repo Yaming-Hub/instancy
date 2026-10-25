@@ -178,14 +178,6 @@ async fn multi_worker_iterate_collatz() {
         "mw-collatz",
         2,
         |builder| {
-            // Audit M11 (a lost wakeup at loop quiescence, C2 family): this
-            // loop sometimes hangs on today's executor, and the progress
-            // checker's timing makes that likelier on oversubscribed cores
-            // (2 cores: 2.7% of runs hang without it, 6% with it). Re-enable
-            // the checker once step 3 of the progress-accounting redesign
-            // fixes the hang.
-            #[cfg(any(debug_assertions, feature = "progress-check"))]
-            builder.skip_progress_check();
             let input = builder.input::<i64>("data").unwrap();
             let output = input.iterate::<u32>("collatz-loop", 1u32, |iter_var| {
                 let stepped = iter_var
@@ -220,68 +212,11 @@ async fn multi_worker_iterate_collatz() {
 /// message accounting, eager force-close tore down the loop while exchange data
 /// was still in flight, silently dropping it.
 ///
-/// IGNORED — tracks a SEPARATE executor liveness bug, not the #277 data-loss fix
-/// (which this test would otherwise exercise end-to-end). See the data-loss fix's
-/// real coverage below before changing anything here.
-///
-/// ## Why it's ignored
-///
-/// At `max_idle_sweeps = 1` this test HANGS (it does not lose data — the
-/// in-flight accounting correctly refuses to declare completion — it simply
-/// never drains the last record). The hang is a wake/quiescence race in the
-/// executor core, *independent* of the #277 accounting fix:
-///
-/// - With ≥2 workers, one worker can finish its local work and park (its stage
-///   returns `WaitingForInput` → `Poll::Pending`) in the narrow window between a
-///   peer pushing the loop's final record into this worker's exchange channel
-///   and this worker's exchange-consumer operator pulling it. The record sits
-///   buffered in the SPSC ring; the consumer operator is alive (never marked
-///   `done`/exhausted — verified) but is not re-polled to drain it. The
-///   producer's `wakes.wake(target)` fires a present handle, yet the woken
-///   worker does not make progress on the buffered record.
-/// - Empirically the threshold is sharp: `max_idle_sweeps` of 1/2/3 hang,
-///   5/8/64 pass. Production hardcodes 64 (runtime.rs), which is *why* the slack
-///   exists — cross-worker push→wake→pull needs more than one idle sweep to
-///   settle. `idle = 1` is below that coordination floor, i.e. an unsupported
-///   configuration for cross-worker feedback loops, not a data-loss defect.
-///
-/// ## Where the #277 data-loss fix IS verified (do not rely on this test for it)
-///
-/// - `inflight_message_keeps_tracker_incomplete_until_consumed` (lib unit test):
-///   deterministic, no threads — proves the tracker stays incomplete while a
-///   message is in flight. This is the rigorous proof the fix works.
-/// - The full non-eager `multi_worker_iterate` suite (collatz, doubling,
-///   immediate-exit, multi-epoch, three-workers, staged feedback) and the TCP
-///   cross-node test — all green at the production idle budget.
-///
-/// ## What remains to be done to un-ignore this (the actual fix)
-///
-/// Root-cause and fix the wake/quiescence race so `idle = 1` drains
-/// deterministically (timing must stop mattering), WITHOUT regressing throughput
-/// (the fix must live at sweep/quiescence boundaries, never the per-record hot
-/// path). Concretely:
-/// 1. Build a DETERMINISTIC repro first: a `current_thread` tokio runtime (single
-///    threaded) so the wake protocol can be stepped through. Multi-threaded
-///    `eprintln` tracing is unreliable here — output is dropped/reordered while
-///    the process hangs, which is what blocked the live investigation.
-/// 2. Confirm the exact park path. The stuck stage returns `WaitingForInput`
-///    (not `Quiescent`) — so it is gated by `async_waiting` or
-///    `external_inputs_open` (the `run_one_sweep` of the staged executor, since
-///    removed; re-establish the park path on the executor core). Establish which,
-///    and why the consumer's `pull_input()` returns empty even though the SPSC
-///    ring holds the record (the ring's own Acquire/Release should make the
-///    pushed record visible — verify there isn't a missed re-poll instead).
-/// 3. Enforce the invariant: while the shared loop in-flight counter is > 0
-///    (loop not globally drained), a parked worker MUST be reliably re-roused to
-///    drain its exchange inputs — no lost wakeup. A self-wake gated on
-///    `all_remaining_quiesced && !loops_drained` was tried and did NOT fire
-///    (because the stuck stage returns `Pending`, not `Quiescent`), so the fix
-///    likely belongs on the `WaitingForInput`/`Pending` park path or in the wake
-///    delivery itself, not the convergence branch.
-/// 4. Re-enable BOTH eager tests (this one and
-///    `staged_iterate_cross_stage_feedback_eager_quiescence`) and run each many
-///    times to confirm determinism (no flakiness) before removing `#[ignore]`.
-#[ignore = "idle=1 wake/quiescence race (separate from #277 data-loss fix); see doc comment"]
+/// This used to hang at `max_idle_sweeps = 1` on a wake/quiescence race
+/// (audit M11, C2 family): a worker could park while a peer's final loop
+/// record sat buffered in its exchange channel, and was not re-roused to
+/// drain it. Port-counted progress fixes that race, so the loop must drain
+/// at any idle budget.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn multi_worker_iterate_collatz_eager_quiescence() {
     let results = run_multi_worker_iterate(
@@ -326,11 +261,6 @@ async fn multi_worker_iterate_multiple_epochs() {
         "mw-multi-epoch",
         2,
         |builder| {
-            // Audit M11, as in `multi_worker_iterate_collatz`: it hung only
-            // with the progress checker on (2 cores). Re-enable the checker
-            // once step 3 of the progress-accounting redesign fixes M11.
-            #[cfg(any(debug_assertions, feature = "progress-check"))]
-            builder.skip_progress_check();
             let input = builder.input::<i64>("data").unwrap();
             let output = input.iterate::<u32>("inc-loop", 1u32, |iter_var| {
                 let incremented = iter_var
@@ -479,7 +409,6 @@ async fn multi_worker_iterate_input_from_all_workers() {
 /// Stage 1 (par=2): exchange target, done/again filters, branch, leave
 /// Stage 2 (par=1): gather results
 /// Feedback: stage 1 → stage 0 (cross-stage, equal parallelism)
-#[ignore = "C2 (step 3): a multi-worker loop followed by an exchange from its leave never completes (the exchange's consumer records -n, the leave never records +n); uniform analog: audit repro operators_iterate::iterate_then_exchange_two_workers"]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn staged_iterate_cross_stage_feedback() {
     let rt = RuntimeHandle::new(RuntimeConfig::default()).unwrap();
@@ -563,16 +492,9 @@ async fn staged_iterate_cross_stage_feedback() {
 /// counter, the staged executor declared convergence on local quiescence and
 /// dropped in-flight loop data. This fails deterministically without the fix.
 ///
-/// IGNORED — same `idle = 1` wake/quiescence race as
-/// `multi_worker_iterate_collatz_eager_quiescence`; see that test's doc comment
-/// for the full root-cause analysis and the plan to un-ignore. This is the
-/// staged (cross-stage feedback) variant of the same liveness bug, NOT a
-/// data-loss defect: the staged path's loop in-flight counter correctly refuses
-/// to converge while a record is in flight, so the loop hangs instead of losing
-/// data at this unsupported idle budget. The #277 staged-path fix itself is
-/// verified by `staged_iterate_cross_stage_feedback` (non-eager, green at the
-/// production idle budget).
-#[ignore = "idle=1 wake/quiescence race (separate from #277 data-loss fix); see collatz-eager doc comment"]
+/// The staged (cross-stage feedback) variant of
+/// `multi_worker_iterate_collatz_eager_quiescence`: it used to hang on the same
+/// `idle = 1` wake/quiescence race (audit M11), fixed by port-counted progress.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn staged_iterate_cross_stage_feedback_eager_quiescence() {
     let rt = RuntimeHandle::new(RuntimeConfig::default()).unwrap();
@@ -644,7 +566,6 @@ async fn staged_iterate_cross_stage_feedback_eager_quiescence() {
 /// Staged iterate with immediate exit: all values already meet the condition.
 ///
 /// Tests that cross-stage feedback handles the zero-iteration case correctly.
-#[ignore = "C2 (step 3): a multi-worker loop followed by an exchange from its leave never completes (the exchange's consumer records -n, the leave never records +n); uniform analog: audit repro operators_iterate::iterate_then_exchange_two_workers"]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn staged_iterate_cross_stage_immediate_exit() {
     let rt = RuntimeHandle::new(RuntimeConfig::default()).unwrap();
@@ -825,29 +746,12 @@ async fn staged_iterate_rejects_unequal_feedback_parallelism() {
 /// would project it onto its outer coordinate `Product<u64, u32>`, and the outer
 /// scope in turn onto the root epoch `u64`.
 ///
-/// IGNORED — hangs with 2 workers, for a reason unrelated to nesting itself.
-///
-/// Nested `iterate` used to fail at materialization (`MissingFactory`) because
-/// the loop-body merge computed the feedback-factory offset after appending the
-/// body's feedback edges, and the in-flight binding of an exchange in a
-/// doubly-nested body was projected through one scope level only (so the
-/// channel silently ran without in-flight accounting). Both are fixed; nested
-/// loops with exchanges in either body are covered by
-/// `tests/iterate_nesting.rs`. This test still hangs deterministically with 2
-/// workers because `outer-redist` consumes the inner loop's `leave` output
-/// directly. Only `map`/`filter`-style unary operators (and the loop concat)
-/// record the producer-side in-flight `+count` for an exchange they feed;
-/// `leave` (like sources, `unary_notify`/`reduce`, `binary`, `concat`, ...)
-/// does not, while the exchange consumer always records `-count`, so the
-/// loop is never recognized as complete (the same `leave -> exchange` shape
-/// hangs with a single loop level). Inserting a `map` between `leave` and the
-/// exchange makes the dataflow complete.
-///
-/// Un-ignore once every exchange-feeding operator sources in-flight counts.
+/// Issue #281: this used to hang with 2 workers because `outer-redist`
+/// consumes the inner loop's `leave` output directly and `leave` recorded no
+/// producer-side in-flight count for the exchange it feeds, while the exchange
+/// consumer always recorded `-count`. Port-counted progress counts every
+/// exchange-feeding port, so the dataflow must complete.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "hangs with 2 workers: the inner loop's leave feeds an exchange \
-            directly and leave records no producer-side in-flight count; \
-            nested iterate itself works (see doc comment)"]
 async fn multi_worker_nested_iterate_inner_exchange() {
     let results = run_multi_worker_iterate(
         "mw-nested",

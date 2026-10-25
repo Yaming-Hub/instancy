@@ -18,9 +18,13 @@ use instancy::{
 mod cluster_loopback;
 
 const TIMEOUT: Duration = Duration::from_secs(20);
-/// More records than the input (256) and output (256) channels plus every
-/// internal channel can hold, so a stalled sink always blocks the sender.
-const RECORDS: u64 = 5_000;
+/// More records than the pipeline can hold, so a stalled sink always blocks
+/// the sender. Each record is its own batch; the pipeline holds at most about
+/// 6700: the input (256) and output (256) channels, two internal channels
+/// (1024 each), and what the operators hold for one call (the source's retry
+/// queue, up to its 1024-batch budget; the map's input buffer and retry queue;
+/// the sink's input buffer).
+const RECORDS: u64 = 12_000;
 /// Exchange tests send fewer records (well under one exchange channel's
 /// capacity, so the exchange itself never backs up) and shrink the sink's
 /// input edge instead, so a sink that stops consuming still stalls the

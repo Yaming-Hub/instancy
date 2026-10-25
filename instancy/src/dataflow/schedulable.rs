@@ -23,7 +23,9 @@ use crate::worker::WorkerContext;
 
 /// The result of activating an operator once.
 ///
-/// Used by the executor to decide which operators to re-schedule.
+/// Used by the executor to decide which operators to re-schedule. An
+/// operator's own view of its end ([`Done`](Self::Done), or exhaustion) is
+/// only a hint: only the executor's decision module shuts an operator down.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ActivationOutcome {
     /// The operator processed data or made meaningful progress.
@@ -86,11 +88,31 @@ pub trait SchedulableOperator: Send {
     /// The execution stage this operator belongs to.
     fn stage_id(&self) -> StageId;
 
-    /// Close all input channels to signal no more data will arrive.
-    ///
-    /// Called by the executor when upstream operators have completed or
-    /// the dataflow is shutting down.
-    fn close_inputs(&mut self);
+    /// Whether the operator could shut down: it holds no capability and has
+    /// nothing left to hand over (input waiting for its logic, output
+    /// waiting for a channel, external egress, async work). The executor
+    /// shuts it down (S2a) once, in addition, every input frontier is empty
+    /// in its worker's view.
+    fn can_shut_down(&self) -> bool {
+        true
+    }
+
+    /// Shut the operator down (S2a): it closes its outputs and is never
+    /// activated again. Only the executor's decision module calls this.
+    fn shut_down(&mut self) {}
+
+    /// Whether the operator is exhausted (latched, R39): every input has
+    /// reached end of stream, its input buffers are empty, it holds no
+    /// capability and has nothing to hand over. An exhausted operator does
+    /// not close its outputs; only [`shut_down`](Self::shut_down) does.
+    fn exhausted(&self) -> bool {
+        self.is_done()
+    }
+
+    /// After the operator shut down: fail if a record reached it (S3).
+    fn check_after_shutdown(&mut self) -> Result<()> {
+        Ok(())
+    }
 
     /// Stop accepting data from outside the dataflow (graceful drain).
     ///
@@ -110,6 +132,16 @@ pub trait SchedulableOperator: Send {
     /// fires ready notifications when the frontier advances past requested
     /// timestamps. Regular operators leave this as a no-op.
     fn update_input_frontier(&mut self, _frontier: &dyn std::any::Any) {}
+
+    /// Update the frontier of input `port` (an `Antichain` of the port's
+    /// time), after progress propagation.
+    fn update_port_frontier(&mut self, _port: usize, _frontier: &dyn std::any::Any) {}
+
+    /// Whether this operator is an operator shell, as every production
+    /// operator must be (design §5.2).
+    fn is_shell(&self) -> bool {
+        false
+    }
 
     /// Whether this operator has ready notifications that need processing.
     ///
@@ -181,42 +213,165 @@ impl OperatorFactory {
     ///
     /// Returns an error if operator construction fails, or if a one-shot
     /// resource captured by the factory has already been consumed.
+    ///
+    /// Every operator it builds is an operator shell, which counts every
+    /// record at its ports (design §5.2, construction by type); debug builds
+    /// check it.
     pub fn build(
         &mut self,
         ctx: &WorkerContext,
         endpoints: ChannelEndpoints,
     ) -> crate::Result<Box<dyn SchedulableOperator>> {
-        (self.0)(ctx, endpoints)
+        let operator = (self.0)(ctx, endpoints)?;
+        debug_assert!(
+            operator.is_shell(),
+            "operator `{}` was built without an operator shell (design §5.2)",
+            operator.name()
+        );
+        Ok(operator)
     }
 }
 
 /// Channel endpoints provided to an operator factory during materialization.
 ///
-/// Each entry is a `Box<dyn Any + Send>` that the factory downcasts to the
-/// concrete `Box<dyn Pull<T, D, M>>` or `Box<dyn Push<T, D, M>>` type.
+/// Each entry is a `Box<dyn Any + Send>` that the factory turns into a
+/// counted port: only the materializer builds counted ports, so operator
+/// logic never sees a raw `Push` or `Pull`.
 #[derive(Default)]
 pub struct ChannelEndpoints {
+    /// The operator these endpoints are for.
+    pub(crate) operator: usize,
     /// Input pullers, one per input port. Each is `Box<dyn Pull<T, D, M>>`.
-    pub input_pullers: Vec<Box<dyn std::any::Any + Send>>,
+    pub(crate) input_pullers: Vec<Option<Box<dyn std::any::Any + Send>>>,
     /// Output pushers grouped by output port.
     ///
     /// `output_pushers[port]` is a `Vec` of all pushers for that port
     /// (multiple pushers when the output fans out to multiple downstream
     /// consumers). Each inner element is a `Box<dyn Push<T, D, M>>`.
-    pub output_pushers: Vec<Vec<Box<dyn std::any::Any + Send>>>,
+    pub(crate) output_pushers: Vec<Vec<Box<dyn std::any::Any + Send>>>,
     /// Wake handle for operators that need to notify the executor asynchronously
     /// (e.g., when an in-flight async task completes). Operators that don't need
     /// async waking can ignore this field.
-    pub wake_handle: Option<crate::dataflow::channels::wake::WakeHandle>,
+    pub(crate) wake_handle: Option<crate::dataflow::channels::wake::WakeHandle>,
     /// Progress reporters for this operator, keyed by `(operator_index, output_port)`.
     ///
     /// Populated during materialization from the `SubgraphBuilder` clone used
     /// to build the worker's progress tracker, so factories can bind operators
     /// to the same progress state the executor will later observe.
-    pub progress_reporters: Option<Arc<dyn Any + Send + Sync>>,
+    pub(crate) progress_reporters: Option<Arc<dyn Any + Send + Sync>>,
 }
 
 impl ChannelEndpoints {
+    fn reporters(&self) -> Option<&crate::progress::subgraph::MaterializationReporters> {
+        self.progress_reporters
+            .as_ref()?
+            .downcast_ref::<crate::progress::subgraph::MaterializationReporters>()
+    }
+
+    /// The counted input port `port` of the operator, of time `T` and data
+    /// `D`, bound to the port's consumed ledger.
+    pub(crate) fn take_input<T, D>(
+        &mut self,
+        port: usize,
+        operator: &str,
+    ) -> crate::Result<crate::dataflow::shell::CountedInput<T, D>>
+    where
+        T: crate::progress::timestamp::Timestamp,
+        D: Send + 'static,
+    {
+        use crate::error::{DataflowError, Error};
+        let pull = self
+            .input_pullers
+            .get_mut(port)
+            .and_then(Option::take)
+            .ok_or_else(|| {
+                Error::Dataflow(DataflowError::MissingEndpoint {
+                    operator: operator.into(),
+                    port: format!("input {port}"),
+                })
+            })?;
+        let pull = *pull
+            .downcast::<Box<dyn crate::dataflow::channels::pushpull::Pull<T, D>>>()
+            .map_err(|_| {
+                Error::Dataflow(DataflowError::TypeMismatch {
+                    operator: operator.into(),
+                    port: format!("input {port}"),
+                })
+            })?;
+
+        let ledger = self
+            .reporters()
+            .and_then(|r| r.consumed::<T>(self.operator, port))
+            .unwrap_or_default();
+        Ok(crate::dataflow::shell::CountedInput::new(
+            format!("{operator}:input{port}"),
+            pull,
+            ledger,
+        ))
+    }
+
+    /// Every remaining input port, in port order (for an operator with a
+    /// list of same-typed inputs).
+    pub(crate) fn take_inputs<T, D>(
+        &mut self,
+        operator: &str,
+    ) -> crate::Result<Vec<crate::dataflow::shell::CountedInput<T, D>>>
+    where
+        T: crate::progress::timestamp::Timestamp,
+        D: Send + 'static,
+    {
+        (0..self.input_pullers.len())
+            .map(|port| self.take_input(port, operator))
+            .collect()
+    }
+
+    /// The counted output port `port` of the operator: every consumer's
+    /// push end (a tee for several), bound to the port's produced ledger
+    /// and capability reporter.
+    pub(crate) fn take_output<T, D>(
+        &mut self,
+        port: usize,
+        operator: &str,
+    ) -> crate::Result<crate::dataflow::shell::CountedOutput<T, D>>
+    where
+        T: crate::progress::timestamp::Timestamp,
+        D: Clone + Send + 'static,
+    {
+        use crate::dataflow::channels::pushpull::Push;
+        use crate::error::{DataflowError, Error};
+        let pushers: Vec<Box<dyn Push<T, D>>> = self
+            .take_port_pushers(port)
+            .into_iter()
+            .map(|any| {
+                any.downcast::<Box<dyn Push<T, D>>>()
+                    .map(|boxed| *boxed)
+                    .map_err(|_| {
+                        Error::Dataflow(DataflowError::TypeMismatch {
+                            operator: operator.into(),
+                            port: format!("output {port}"),
+                        })
+                    })
+            })
+            .collect::<crate::Result<_>>()?;
+        let push: Box<dyn Push<T, D>> = crate::dataflow::channels::tee::tee_or_single(pushers)?
+            .unwrap_or_else(|| Box::new(crate::dataflow::channels::NullPush));
+
+        let ledger = self
+            .reporters()
+            .and_then(|r| r.produced::<T>(self.operator, port))
+            .unwrap_or_default();
+        let reporter = self
+            .progress_reporter::<T>(self.operator, port)
+            .unwrap_or_default();
+        Ok(crate::dataflow::shell::CountedOutput::new(
+            format!("{operator}:output{port}"),
+            push,
+            ledger,
+            reporter,
+            self.wake_handle.clone(),
+        ))
+    }
+
     /// Returns the progress reporter for the given operator output, if one was
     /// explicitly passed for this materialization.
     pub fn progress_reporter<T: crate::progress::timestamp::Timestamp>(
@@ -224,85 +379,7 @@ impl ChannelEndpoints {
         operator: usize,
         output: usize,
     ) -> Option<crate::progress::operate::ProgressReporter<T>> {
-        self.progress_reporters
-            .as_ref()?
-            .downcast_ref::<crate::progress::subgraph::MaterializationReporters>()?
-            .internal::<T>(operator, output)
-    }
-
-    /// Returns the in-flight reporter for a boundary edge whose **source** is
-    /// `(operator, output)` — i.e. the produced reporter the sender's output
-    /// pusher should record into. `T` is the *channel's* timestamp (which is
-    /// `Product<…>` for an exchange inside a loop, not the worker tracker's `T`).
-    pub fn inflight_reporter_by_source<T: crate::progress::timestamp::Timestamp>(
-        &self,
-        operator: usize,
-        output: usize,
-    ) -> Option<crate::progress::operate::ProgressReporter<T>> {
-        self.progress_reporters
-            .as_ref()?
-            .downcast_ref::<crate::progress::subgraph::MaterializationReporters>()?
-            .inflight_by_source::<T>(operator, output)
-    }
-
-    /// Returns the in-flight reporter for a boundary edge whose **target** is
-    /// `(operator, input)` — i.e. the consumed reporter the consumer's input
-    /// puller should record into.
-    pub fn inflight_reporter_by_target<T: crate::progress::timestamp::Timestamp>(
-        &self,
-        operator: usize,
-        input: usize,
-    ) -> Option<crate::progress::operate::ProgressReporter<T>> {
-        self.progress_reporters
-            .as_ref()?
-            .downcast_ref::<crate::progress::subgraph::MaterializationReporters>()?
-            .inflight_by_target::<T>(operator, input)
-    }
-
-    /// Wire the **producing** side of a boundary (exchange) edge: if an
-    /// in-flight reporter is registered for the edge sourced at
-    /// `(operator, output)`, attach it to `pusher` so every batch it sends
-    /// records `+count`.
-    ///
-    /// This is the single, canonical place to source an exchange's producing
-    /// side. Centralizing the lookup+attach in one call (instead of the two
-    /// separate steps at each operator factory) means the `set_inflight_reporter`
-    /// can't be forgotten after the lookup: forgetting the `+count` while the
-    /// consumer still records `-count` drives the in-flight net negative and
-    /// hangs the dataflow (the `iter_var.exchange` failure mode). Any future
-    /// exchange-sourcing operator factory should call this rather than re-deriving
-    /// the pattern. No-op for non-exchange outputs.
-    pub fn wire_inflight_source<T, D, M>(
-        &self,
-        operator: usize,
-        output: usize,
-        pusher: &mut (dyn crate::dataflow::channels::pushpull::Push<T, D, M> + '_),
-    ) where
-        T: crate::progress::timestamp::Timestamp,
-    {
-        if let Some(reporter) = self.inflight_reporter_by_source::<T>(operator, output) {
-            pusher.set_inflight_reporter(reporter);
-        }
-    }
-
-    /// Wire the **consuming** side of a boundary (exchange) edge: if an in-flight
-    /// reporter is registered for the edge targeted at `(operator, input)`,
-    /// attach it to `puller` so every delivered batch records `-count`.
-    ///
-    /// Counterpart to [`wire_inflight_source`](Self::wire_inflight_source); the
-    /// producing `+count` and this consuming `-count` must be wired symmetrically.
-    /// No-op for non-exchange inputs.
-    pub fn wire_inflight_target<T, D, M>(
-        &self,
-        operator: usize,
-        input: usize,
-        puller: &mut (dyn crate::dataflow::channels::pushpull::Pull<T, D, M> + '_),
-    ) where
-        T: crate::progress::timestamp::Timestamp,
-    {
-        if let Some(reporter) = self.inflight_reporter_by_target::<T>(operator, input) {
-            puller.set_inflight_reporter(reporter);
-        }
+        self.reporters()?.internal::<T>(operator, output)
     }
 
     /// Take all output pushers for the given port, leaving the slot empty.
@@ -392,10 +469,10 @@ pub struct ChannelFactory {
     /// Wraps a pair this factory built (monomorphized for its types).
     #[cfg(any(debug_assertions, feature = "progress-check"))]
     check_wrap: crate::progress::check::WrapFn,
-    /// Projects the channel's timestamp onto the root timestamp (a
-    /// `check::Projector<S>`); set for channels inside `iterate`.
+    /// The progress scope whose oracle observes this channel (its time's
+    /// scope; `None`: the root). Set for channels inside `iterate`.
     #[cfg(any(debug_assertions, feature = "progress-check"))]
-    check_projector: Option<Arc<dyn Any + Send + Sync>>,
+    check_scope: Option<usize>,
     /// Copies each pushed record becomes (target workers of a broadcast).
     #[cfg(any(debug_assertions, feature = "progress-check"))]
     check_fanout: i64,
@@ -462,7 +539,7 @@ impl ChannelFactory {
             #[cfg(any(debug_assertions, feature = "progress-check"))]
             check_wrap: crate::progress::check::wrap_pair::<T, D, M>,
             #[cfg(any(debug_assertions, feature = "progress-check"))]
-            check_projector: None,
+            check_scope: None,
             #[cfg(any(debug_assertions, feature = "progress-check"))]
             check_fanout: 1,
             #[cfg(any(debug_assertions, feature = "progress-check"))]
@@ -507,15 +584,16 @@ impl ChannelFactory {
         let pair = self.build(ctx, wake_handle)?;
         #[cfg(any(debug_assertions, feature = "progress-check"))]
         if let Some(check) = check {
+            let scoped = check.for_scope(self.check_scope.unwrap_or(0));
             let site = crate::progress::check::ChannelSite {
-                ctx: check,
+                ctx: &scoped,
                 source: (source.operator_index, source.slot_index),
                 target: (target.operator_index, target.slot_index),
             };
             return Ok((self.check_wrap)(
                 pair,
                 &site,
-                self.check_projector.as_deref(),
+                None,
                 self.check_fanout,
                 self.check_cross_worker,
             ));
@@ -561,27 +639,23 @@ impl ChannelFactory {
         self
     }
 
-    /// Give the checker the projection of this channel's timestamp onto the
-    /// root timestamp, unless a deeper scope already did. Only the progress
-    /// checker uses this; without it compiled in, a no-op.
-    pub(crate) fn set_check_projector<S: crate::progress::timestamp::Timestamp>(
-        &mut self,
-        projector: &Arc<dyn Fn(&S) -> Box<dyn Any + Send> + Send + Sync>,
-    ) {
+    /// Tell the checker which progress scope this channel is in (the scope
+    /// of its timestamp), unless a deeper scope already did. Only the
+    /// progress checker uses this; without it compiled in, a no-op.
+    #[cfg_attr(
+        not(any(debug_assertions, feature = "progress-check")),
+        allow(unused_variables)
+    )]
+    pub(crate) fn set_check_scope(&mut self, scope: usize) {
         #[cfg(any(debug_assertions, feature = "progress-check"))]
-        if self.check_projector.is_none() {
-            self.check_projector = Some(Arc::new(projector.clone()));
+        if self.check_scope.is_none() {
+            self.check_scope = Some(scope);
         }
-        #[cfg(not(any(debug_assertions, feature = "progress-check")))]
-        let _ = projector;
     }
 
-    /// [`set_check_projector`](Self::set_check_projector), by value.
-    pub(crate) fn with_check_projector<S: crate::progress::timestamp::Timestamp>(
-        mut self,
-        projector: &Arc<dyn Fn(&S) -> Box<dyn Any + Send> + Send + Sync>,
-    ) -> Self {
-        self.set_check_projector(projector);
+    /// [`set_check_scope`](Self::set_check_scope), by value.
+    pub(crate) fn with_check_scope(mut self, scope: usize) -> Self {
+        self.set_check_scope(scope);
         self
     }
 }

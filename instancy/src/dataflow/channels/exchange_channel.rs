@@ -59,7 +59,6 @@ use crate::error::{DataflowError, Error, Result};
 #[cfg(test)]
 use crate::progress::frontier::Antichain;
 use crate::progress::mutable_antichain::MutableAntichain;
-use crate::progress::operate::ProgressReporter;
 use crate::progress::timestamp::Timestamp;
 
 // ---------------------------------------------------------------------------
@@ -335,12 +334,6 @@ pub struct ExchangePush<T: Timestamp, D: Send + 'static> {
     owed: Vec<bool>,
     /// Optional channel metrics collector (enabled via `MetricsConfig::channel_counters`).
     channel_metrics: Option<Arc<crate::metrics::ChannelMetricsCollector>>,
-    /// Optional in-flight message reporter. When set, each sub-batch of `n`
-    /// data records handed to a target records `+n` at the batch timestamp,
-    /// accounting the records as in flight toward the exchange's downstream
-    /// input until they are consumed (see [`ExchangePull`]'s reporter). Bound
-    /// to the same per-worker reporter registered on the progress tracker.
-    inflight: Option<ProgressReporter<T>>,
 }
 
 impl<T: Timestamp, D: Send + 'static> ExchangePush<T, D> {
@@ -362,7 +355,6 @@ impl<T: Timestamp, D: Send + 'static> ExchangePush<T, D> {
             pending: None,
             owed: vec![false; num_targets],
             channel_metrics: None,
-            inflight: None,
         }
     }
 
@@ -378,13 +370,6 @@ impl<T: Timestamp, D: Send + 'static> ExchangePush<T, D> {
         push
     }
 
-    /// Add `diff` in-flight records at `time` to the attached reporter.
-    fn record_inflight(&self, time: &T, diff: i64) {
-        if let Some(ref inflight) = self.inflight {
-            inflight.update(time.clone(), diff);
-        }
-    }
-
     /// Hand every non-empty bucket to its target. A bucket a target refuses
     /// stays in place for the retry; accepted buckets are left empty.
     ///
@@ -397,14 +382,10 @@ impl<T: Timestamp, D: Send + 'static> ExchangePush<T, D> {
                 continue;
             }
             let bucket = std::mem::take(&mut self.buckets[target_idx]);
-            let count = bucket.len() as i64;
-            // Account the records before the target can consume them, so the
-            // in-flight count never runs ahead negative; retract on refusal.
-            self.record_inflight(time, count);
+
             match self.targets[target_idx].try_push(Envelope::data(time.clone(), bucket)) {
                 Ok(()) => self.wakes.wake(target_idx),
                 Err((err, returned)) => {
-                    self.record_inflight(time, -count);
                     match returned.payload {
                         Payload::Data { data, .. } => self.buckets[target_idx] = data,
                         Payload::Control(_) => return Err(returned_wrong_envelope()),
@@ -494,6 +475,11 @@ fn deliver_to_owed<T: Timestamp, D>(
     } else {
         Ok(())
     }
+}
+
+impl<T: Timestamp, D: Clone + Send + 'static> crate::dataflow::channels::pushpull::sealed::Sealed
+    for ExchangePush<T, D>
+{
 }
 
 impl<T: Timestamp, D: Clone + Send + 'static> Push<T, D> for ExchangePush<T, D> {
@@ -651,10 +637,6 @@ impl<T: Timestamp, D: Clone + Send + 'static> Push<T, D> for ExchangePush<T, D> 
     fn is_closed(&self) -> bool {
         self.closed
     }
-
-    fn set_inflight_reporter(&mut self, reporter: ProgressReporter<T>) {
-        self.inflight = Some(reporter);
-    }
 }
 
 impl<T: Timestamp, D: Send + 'static> Drop for ExchangePush<T, D> {
@@ -716,6 +698,11 @@ impl<T: Timestamp, D: Clone + Send + 'static> BroadcastPush<T, D> {
             owed: vec![false; num_targets],
         }
     }
+}
+
+impl<T: Timestamp, D: Clone + Send + 'static> crate::dataflow::channels::pushpull::sealed::Sealed
+    for BroadcastPush<T, D>
+{
 }
 
 impl<T: Timestamp, D: Clone + Send + 'static> Push<T, D> for BroadcastPush<T, D> {
@@ -999,11 +986,6 @@ pub struct ExchangePull<T: Timestamp, D> {
     frontier_agg: FrontierAggregator<T>,
     /// Buffered watermark envelopes produced by frontier aggregation.
     pending_watermarks: VecDeque<T>,
-    /// Optional in-flight message reporter. When set, each batch of `n` data
-    /// records delivered to the consumer records `-n` at the batch timestamp,
-    /// retiring the in-flight messages accounted by the sending [`ExchangePush`].
-    /// Bound to the same per-worker reporter registered on the progress tracker.
-    inflight: Option<ProgressReporter<T>>,
 }
 
 impl<T: Timestamp, D> ExchangePull<T, D> {
@@ -1021,20 +1003,13 @@ impl<T: Timestamp, D> ExchangePull<T, D> {
             wakes,
             frontier_agg,
             pending_watermarks: VecDeque::new(),
-            inflight: None,
         }
     }
+}
 
-    /// Record consumed (`-count`) for a delivered data envelope, if a reporter
-    /// is attached.
-    #[inline]
-    fn record_consumed(&self, env: &Envelope<T, D, ()>) {
-        if let Some(ref inflight) = self.inflight {
-            if let Payload::Data { time, data } = &env.payload {
-                inflight.update(time.clone(), -(data.len() as i64));
-            }
-        }
-    }
+impl<T: Timestamp, D: Send + 'static> crate::dataflow::channels::pushpull::sealed::Sealed
+    for ExchangePull<T, D>
+{
 }
 
 impl<T: Timestamp, D: Send + 'static> Pull<T, D> for ExchangePull<T, D> {
@@ -1066,7 +1041,6 @@ impl<T: Timestamp, D: Send + 'static> Pull<T, D> for ExchangePull<T, D> {
 
                     match env.payload {
                         Payload::Data { .. } => {
-                            self.record_consumed(&env);
                             return Some(env);
                         }
                         Payload::Control(ControlSignal::Watermark(t)) => {
@@ -1116,7 +1090,6 @@ impl<T: Timestamp, D: Send + 'static> Pull<T, D> for ExchangePull<T, D> {
 
                     match env.payload {
                         Payload::Data { .. } => {
-                            self.record_consumed(&env);
                             buffer.push(env);
                             count += 1;
                         }
@@ -1145,10 +1118,6 @@ impl<T: Timestamp, D: Send + 'static> Pull<T, D> for ExchangePull<T, D> {
     fn is_exhausted(&self) -> bool {
         self.sources.iter().all(|s| s.is_exhausted())
     }
-
-    fn set_inflight_reporter(&mut self, reporter: ProgressReporter<T>) {
-        self.inflight = Some(reporter);
-    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1175,16 +1144,16 @@ pub(crate) type ExchangeFactoryCreatorFn = Box<
 >;
 
 /// Wrap a loop body's exchange creator so every channel factory it creates
-/// carries the loop's time projection, for the progress checker.
+/// reports to the loop scope's oracle, for the progress checker.
 #[cfg(any(debug_assertions, feature = "progress-check"))]
-pub(crate) fn with_check_projector<S: Timestamp>(
+pub(crate) fn with_check_scope(
     mut creator: ExchangeFactoryCreatorFn,
-    projector: Arc<dyn Fn(&S) -> Box<dyn std::any::Any + Send> + Send + Sync>,
+    scope: usize,
 ) -> ExchangeFactoryCreatorFn {
     Box::new(move |sources, targets, capacity, metrics| {
         let mut factories = creator(sources, targets, capacity, metrics);
         for factory in &mut factories {
-            factory.set_check_projector(&projector);
+            factory.set_check_scope(scope);
         }
         factories
     })
@@ -1301,22 +1270,22 @@ pub(crate) trait NetworkExchangeCreator: Send {
     ) -> Vec<super::super::schedulable::ChannelFactory>;
 }
 
-/// A loop body's network exchange creator whose channel factories carry the
-/// loop's time projection, for the progress checker.
+/// A loop body's network exchange creator whose channel factories report to
+/// the loop scope's oracle, for the progress checker.
 #[cfg(all(
     feature = "transport",
     any(debug_assertions, feature = "progress-check")
 ))]
-struct CheckProjectedCreator<S: Timestamp> {
+struct CheckScopedCreator {
     inner: Box<dyn NetworkExchangeCreator>,
-    projector: Arc<dyn Fn(&S) -> Box<dyn std::any::Any + Send> + Send + Sync>,
+    scope: usize,
 }
 
 #[cfg(all(
     feature = "transport",
     any(debug_assertions, feature = "progress-check")
 ))]
-impl<S: Timestamp> NetworkExchangeCreator for CheckProjectedCreator<S> {
+impl NetworkExchangeCreator for CheckScopedCreator {
     fn create(
         self: Box<Self>,
         params: NetworkMaterializerParams,
@@ -1324,7 +1293,7 @@ impl<S: Timestamp> NetworkExchangeCreator for CheckProjectedCreator<S> {
         let this = *self;
         let mut factories = this.inner.create(params)?;
         for factory in &mut factories {
-            factory.set_check_projector(&this.projector);
+            factory.set_check_scope(this.scope);
         }
         Ok(factories)
     }
@@ -1353,25 +1322,25 @@ impl<S: Timestamp> NetworkExchangeCreator for CheckProjectedCreator<S> {
         let this = *self;
         let mut factories = this.inner.create_mock(num_workers, capacity);
         for factory in &mut factories {
-            factory.set_check_projector(&this.projector);
+            factory.set_check_scope(this.scope);
         }
         factories
     }
 }
 
 /// Wrap a loop body's network exchange creator so every channel factory it
-/// creates carries the loop's time projection, for the progress checker.
+/// creates reports to the loop scope's oracle, for the progress checker.
 #[cfg(all(
     feature = "transport",
     any(debug_assertions, feature = "progress-check")
 ))]
-pub(crate) fn network_with_check_projector<S: Timestamp>(
+pub(crate) fn network_with_check_scope(
     creator: Box<dyn NetworkExchangeCreator>,
-    projector: Arc<dyn Fn(&S) -> Box<dyn std::any::Any + Send> + Send + Sync>,
+    scope: usize,
 ) -> Box<dyn NetworkExchangeCreator> {
-    Box::new(CheckProjectedCreator {
+    Box::new(CheckScopedCreator {
         inner: creator,
-        projector,
+        scope,
     })
 }
 
@@ -1816,34 +1785,19 @@ mod tests {
     }
 
     #[test]
-    fn exchange_push_records_produced_and_pull_records_consumed() {
-        use crate::progress::operate::ProgressReporter;
-        // One worker pushing to itself: the same in-flight reporter is shared by
-        // the push (records +count produced) and pull (records -count consumed).
+    fn exchange_push_delivers_every_record_to_its_pull() {
         let mut set = ExchangeChannelSet::<u64, i32>::new(1, 16);
         let wakes = Arc::new(SharedWakeRegistry::new(1));
         let (pushers, pullers) = set.take_pair(0).unwrap();
-
-        let inflight = ProgressReporter::<u64>::new();
         let exchange_fn = ExchangeFn::new("self", |_x: &i32| 0u64);
         let mut push = ExchangePush::new(pushers, exchange_fn, wakes.clone());
-        push.set_inflight_reporter(inflight.clone());
-
         push.push(Envelope::data(5u64, vec![1, 2, 3])).unwrap();
-        assert!(
-            !inflight.is_empty(),
-            "push must record produced messages in flight"
-        );
-
         let mut pull = ExchangePull::new(pullers, wakes);
-        pull.set_inflight_reporter(inflight.clone());
-        while pull.pull().is_some() {}
-
-        let net: i64 = inflight.drain().into_iter().map(|(_, d)| d).sum();
-        assert_eq!(
-            net, 0,
-            "produced (+3) and consumed (-3) must net to zero once drained"
-        );
+        let mut seen = Vec::new();
+        while let Some(env) = pull.pull() {
+            seen.extend(env.as_data().unwrap().1.clone());
+        }
+        assert_eq!(seen, vec![1, 2, 3]);
     }
 
     #[test]
@@ -1936,6 +1890,8 @@ mod tests {
         queue: Arc<Mutex<PeerQueue>>,
         closed: bool,
     }
+
+    impl crate::dataflow::channels::pushpull::sealed::Sealed for PeerQueuePush {}
 
     impl Push<u64, i32> for PeerQueuePush {
         fn push(&mut self, envelope: Envelope<u64, i32>) -> Result<()> {
@@ -2095,49 +2051,6 @@ mod tests {
             .collect();
         seen.sort();
         assert_eq!(seen, vec![10, 20, 30], "every record exactly once");
-    }
-
-    #[test]
-    fn exchange_try_push_inflight_accounting_is_exactly_once_across_retries() {
-        use crate::progress::operate::ProgressReporter;
-        let inflight = ProgressReporter::<u64>::new();
-        let queue = peer_queue(0);
-        let (local, local_rx) = local_target();
-        let mut push = mod_exchange(vec![local, peer_target(1, &queue)]);
-        push.set_inflight_reporter(inflight.clone());
-        let wakes = Arc::new(SharedWakeRegistry::new(1));
-        let mut consumer =
-            ExchangePull::new(vec![Box::new(local_rx) as Box<dyn Pull<_, _>>], wakes);
-        consumer.set_inflight_reporter(inflight.clone());
-
-        // The running in-flight count may never drop below zero: a record is
-        // accounted (+1) no later than it can be consumed (-1).
-        let mut net = 0i64;
-        let drain = |net: &mut i64| {
-            *net += inflight.drain().into_iter().map(|(_, d)| d).sum::<i64>();
-            assert!(*net >= 0, "in-flight count went negative: {net}");
-        };
-
-        let (_, mut envelope) = push
-            .try_push(Envelope::data(3u64, vec![0, 1, 2, 3]))
-            .unwrap_err();
-        while consumer.pull().is_some() {}
-        drain(&mut net);
-        for _ in 0..3 {
-            envelope = push.try_push(envelope).unwrap_err().1;
-            while consumer.pull().is_some() {}
-            drain(&mut net);
-        }
-        queue.lock().unwrap().capacity = 1;
-        push.try_push(envelope).unwrap();
-        while consumer.pull().is_some() {}
-        drain(&mut net);
-
-        // The remote receiver consumes its sub-batch.
-        let (_, remote) = pop_frame(&queue).unwrap();
-        inflight.update(3, -(remote.as_data().unwrap().1.len() as i64));
-        drain(&mut net);
-        assert_eq!(net, 0, "every produced record is consumed exactly once");
     }
 
     #[test]

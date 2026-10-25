@@ -5,16 +5,11 @@
 //! where delivery stopped: no duplicates, no losses, and in-flight accounting
 //! that lets the dataflow complete.
 //!
-//! These tests are ignored until the dataflow-completion fixes land (tracked
-//! separately). With one-slot channels, operators blocked on backpressure hold
-//! records in their pending output, which progress tracking can't see. A
-//! worker can then decide the dataflow is complete and force-close its
-//! operators while other workers still hold records. The blocked workers
-//! either lose records or keep reporting progress while blocked toward the
-//! closed worker and spin until the timeout. The stage-task scheduling fix
-//! removed the earlier livelock, but these runs still hang this way. Run them
-//! with `--ignored`; the exchange retry logic itself is also covered by unit
-//! tests in `exchange_channel.rs`.
+//! With one-slot channels, operators blocked on backpressure hold records in
+//! their pending output, so completion must account for those records too: a
+//! worker must not decide the dataflow is complete while other workers still
+//! hold records (audit C1/H1, fixed by port-counted progress). The exchange
+//! retry logic itself is also covered by unit tests in `exchange_channel.rs`.
 
 use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -142,7 +137,6 @@ fn away_from_feeder(workers: u64) -> impl Fn(&u64) -> u64 + Send + Sync + 'stati
 }
 
 #[test]
-#[ignore = "needs the dataflow-completion fixes: records held by blocked operators are invisible to progress tracking, so a worker force-closes early; see module docs"]
 fn exchange_to_other_workers_with_one_slot_channels() {
     let data = vec![batches(2000, 9, 0)];
     let expected = records(&data);
@@ -172,7 +166,6 @@ fn exchange_to_other_workers_with_one_slot_channels() {
 /// Round-robin routing (as `rebalance` does) partitions differently on every
 /// call, so a retry must reuse the first partition.
 #[test]
-#[ignore = "needs the dataflow-completion fixes: records held by blocked operators are invisible to progress tracking, so a worker force-closes early; see module docs"]
 fn round_robin_to_other_workers_with_one_slot_channels() {
     let data = vec![batches(2000, 7, 0)];
     let expected = records(&data);
@@ -199,7 +192,6 @@ fn round_robin_to_other_workers_with_one_slot_channels() {
 /// One output feeding two exchanges: the fan-out retries a partially
 /// delivered exchange branch, which in turn resumes its own partial delivery.
 #[test]
-#[ignore = "needs the dataflow-completion fixes: records held by blocked operators are invisible to progress tracking, so a worker force-closes early; see module docs"]
 fn branch_into_two_exchanges_with_one_slot_channels() {
     let data = vec![batches(1500, 6, 0)];
     let mut expected: Vec<(u64, u64)> = records(&data)
@@ -233,7 +225,6 @@ fn branch_into_two_exchanges_with_one_slot_channels() {
 }
 
 #[test]
-#[ignore = "needs the dataflow-completion fixes: records held by blocked operators are invisible to progress tracking, so a worker force-closes early; see module docs"]
 fn exchange_from_every_worker_with_one_slot_channels() {
     let data: Vec<Batches> = (0..4).map(|w| batches(300, 8, w * 10_000)).collect();
     let expected = records(&data);
@@ -254,7 +245,6 @@ fn exchange_from_every_worker_with_one_slot_channels() {
 }
 
 #[test]
-#[ignore = "needs the dataflow-completion fixes: records held by blocked operators are invisible to progress tracking, so a worker force-closes early; see module docs"]
 fn broadcast_between_workers_with_one_slot_channels() {
     let data = vec![batches(300, 4, 0)];
     let expected = records(&data);

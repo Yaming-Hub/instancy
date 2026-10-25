@@ -216,7 +216,7 @@ impl<S: Scope, D: 'static> StreamEdge<S, D> {
             ))
             // SAFETY: operator index freshly allocated by allocate_operator_index()
             .expect("operator index should be unique");
-        scope.add_edge(crate::dataflow::graph::EdgeInfo::exchange(
+        scope.add_edge(crate::dataflow::graph::EdgeInfo::broadcast(
             *self.source(),
             Slot::new(op_index, 0),
             source_stage,
