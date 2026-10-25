@@ -474,10 +474,6 @@ where
         }
         Ok(did)
     }
-
-    fn checks_justification(&self) -> bool {
-        false
-    }
 }
 
 /// A loop's feedback operator.

@@ -68,7 +68,7 @@ use crate::dataflow::id::DataflowId;
 use crate::error::LockResultExt;
 #[cfg(feature = "transport")]
 use crate::progress::progress_channel::{
-    ProgressChange, ProgressKind, ProgressReceiver, ProgressSender, SharedBuffer,
+    ProgressBatch, ProgressChange, ProgressKind, ProgressReceiver, ProgressSender, SharedBuffer,
     WorkerProgressChannels,
 };
 #[cfg(feature = "transport")]
@@ -432,7 +432,7 @@ async fn progress_recv_bridge<T: Timestamp + ExchangeData>(
                     Ok(ProgressFrame::Batch(changes)) => {
                         if !changes.is_empty() {
                             match buffer.lock().or_poison("progress buffer") {
-                                Ok(mut buf) => buf.queue.push_back(changes),
+                                Ok(mut buf) => buf.queue.push_back(ProgressBatch::flat(changes)),
                                 Err(_) => break LinkFailure::LockPoisoned,
                             }
                             wake_handle.notify();
@@ -700,12 +700,19 @@ pub(crate) fn create_network_progress_channels<T: Timestamp + ExchangeData>(
                 let df_id = dataflow_id;
                 let outbox = outbox.clone();
 
-                let sender = ProgressSender::network(move |changes: Vec<ProgressChange<T>>| {
+                let sender = ProgressSender::network(move |batch: ProgressBatch<T>| {
                     // A retired peer has finished or already holds everything
                     // it needs from us; deltas to it are irrelevant.
                     if outbox.is_retired() {
                         return;
                     }
+                    // Loop scopes' sections need wire format v5 (commit 5 of
+                    // the redesign); until then a cluster cannot carry them.
+                    assert!(
+                        batch.scopes.is_empty(),
+                        "progress for a loop scope cannot cross the network yet"
+                    );
+                    let changes = batch.root;
                     let mut bufs = Vec::new();
                     if let Err(e) = encode_progress_batch::<T>(&changes, &mut bufs, max_batch_size)
                     {
@@ -808,7 +815,7 @@ impl<T: Timestamp> ProgressSender<T> {
     /// without requiring `T: ExchangeData` on the struct itself.
     pub(crate) fn network<F>(send_fn: F) -> Self
     where
-        F: Fn(Vec<ProgressChange<T>>) + Send + Sync + 'static,
+        F: Fn(super::progress_channel::ProgressBatch<T>) + Send + Sync + 'static,
     {
         Self {
             inner: super::progress_channel::SenderInner::Network {
@@ -1101,7 +1108,7 @@ mod tests {
         let receiver = ProgressReceiver::<u64>::new(Arc::clone(&shared));
         let batches = receiver.drain_all().unwrap();
         assert_eq!(batches.len(), 1);
-        assert_eq!(batches[0], changes);
+        assert_eq!(batches[0].root, changes);
         // The ack does not end the channel.
         assert!(matches!(
             events_rx.recv().await,
@@ -1238,7 +1245,8 @@ mod tests {
         let ch_id = PROGRESS_CHANNEL_BASE + 5;
 
         let tx_clone = unbounded_tx.clone();
-        let sender = ProgressSender::<u64>::network(move |changes: Vec<ProgressChange<u64>>| {
+        let sender = ProgressSender::<u64>::network(move |batch: ProgressBatch<u64>| {
+            let changes = batch.root;
             let mut bufs = Vec::new();
             encode_progress_batch::<u64>(&changes, &mut bufs, DEFAULT_MAX_BATCH_SIZE).unwrap();
             for buf in bufs {
@@ -1264,7 +1272,8 @@ mod tests {
         let (unbounded_tx, mut unbounded_rx) = tokio_mpsc::unbounded_channel::<Frame>();
 
         let tx_clone = unbounded_tx.clone();
-        let sender = ProgressSender::<u64>::network(move |changes: Vec<ProgressChange<u64>>| {
+        let sender = ProgressSender::<u64>::network(move |batch: ProgressBatch<u64>| {
+            let changes = batch.root;
             let mut bufs = Vec::new();
             encode_progress_batch::<u64>(&changes, &mut bufs, DEFAULT_MAX_BATCH_SIZE).unwrap();
             for buf in bufs {
@@ -1448,7 +1457,7 @@ mod tests {
         let batches = receiver.drain_all().unwrap();
         assert_eq!(batches.len(), 1, "expected 1 batch, got {}", batches.len());
         assert_eq!(
-            batches[0],
+            batches[0].root,
             vec![
                 ProgressChange::source(0, 0, 42u64, 1),
                 ProgressChange::source(1, 0, 100u64, -1),

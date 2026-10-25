@@ -459,10 +459,10 @@ pub struct ChannelFactory {
     /// Wraps a pair this factory built (monomorphized for its types).
     #[cfg(any(debug_assertions, feature = "progress-check"))]
     check_wrap: crate::progress::check::WrapFn,
-    /// Projects the channel's timestamp onto the root timestamp (a
-    /// `check::Projector<S>`); set for channels inside `iterate`.
+    /// The progress scope whose oracle observes this channel (its time's
+    /// scope; `None`: the root). Set for channels inside `iterate`.
     #[cfg(any(debug_assertions, feature = "progress-check"))]
-    check_projector: Option<Arc<dyn Any + Send + Sync>>,
+    check_scope: Option<usize>,
     /// Copies each pushed record becomes (target workers of a broadcast).
     #[cfg(any(debug_assertions, feature = "progress-check"))]
     check_fanout: i64,
@@ -529,7 +529,7 @@ impl ChannelFactory {
             #[cfg(any(debug_assertions, feature = "progress-check"))]
             check_wrap: crate::progress::check::wrap_pair::<T, D, M>,
             #[cfg(any(debug_assertions, feature = "progress-check"))]
-            check_projector: None,
+            check_scope: None,
             #[cfg(any(debug_assertions, feature = "progress-check"))]
             check_fanout: 1,
             #[cfg(any(debug_assertions, feature = "progress-check"))]
@@ -574,15 +574,16 @@ impl ChannelFactory {
         let pair = self.build(ctx, wake_handle)?;
         #[cfg(any(debug_assertions, feature = "progress-check"))]
         if let Some(check) = check {
+            let scoped = check.for_scope(self.check_scope.unwrap_or(0));
             let site = crate::progress::check::ChannelSite {
-                ctx: check,
+                ctx: &scoped,
                 source: (source.operator_index, source.slot_index),
                 target: (target.operator_index, target.slot_index),
             };
             return Ok((self.check_wrap)(
                 pair,
                 &site,
-                self.check_projector.as_deref(),
+                None,
                 self.check_fanout,
                 self.check_cross_worker,
             ));
@@ -628,27 +629,23 @@ impl ChannelFactory {
         self
     }
 
-    /// Give the checker the projection of this channel's timestamp onto the
-    /// root timestamp, unless a deeper scope already did. Only the progress
-    /// checker uses this; without it compiled in, a no-op.
-    pub(crate) fn set_check_projector<S: crate::progress::timestamp::Timestamp>(
-        &mut self,
-        projector: &Arc<dyn Fn(&S) -> Box<dyn Any + Send> + Send + Sync>,
-    ) {
+    /// Tell the checker which progress scope this channel is in (the scope
+    /// of its timestamp), unless a deeper scope already did. Only the
+    /// progress checker uses this; without it compiled in, a no-op.
+    #[cfg_attr(
+        not(any(debug_assertions, feature = "progress-check")),
+        allow(unused_variables)
+    )]
+    pub(crate) fn set_check_scope(&mut self, scope: usize) {
         #[cfg(any(debug_assertions, feature = "progress-check"))]
-        if self.check_projector.is_none() {
-            self.check_projector = Some(Arc::new(projector.clone()));
+        if self.check_scope.is_none() {
+            self.check_scope = Some(scope);
         }
-        #[cfg(not(any(debug_assertions, feature = "progress-check")))]
-        let _ = projector;
     }
 
-    /// [`set_check_projector`](Self::set_check_projector), by value.
-    pub(crate) fn with_check_projector<S: crate::progress::timestamp::Timestamp>(
-        mut self,
-        projector: &Arc<dyn Fn(&S) -> Box<dyn Any + Send> + Send + Sync>,
-    ) -> Self {
-        self.set_check_projector(projector);
+    /// [`set_check_scope`](Self::set_check_scope), by value.
+    pub(crate) fn with_check_scope(mut self, scope: usize) -> Self {
+        self.set_check_scope(scope);
         self
     }
 }

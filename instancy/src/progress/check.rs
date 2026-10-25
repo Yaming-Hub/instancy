@@ -586,17 +586,6 @@ impl<S: Timestamp> Port<S> {
         }
     }
 
-    /// A port at `loc` for work that belongs to no worker in particular
-    /// (counted for every view and at the end state).
-    pub(crate) fn new_shared(
-        sink: Arc<dyn Sink>,
-        worker: usize,
-        loc: Loc,
-        project: Option<Projector<S>>,
-    ) -> Self {
-        Self::new(sink, worker, loc, project).shared()
-    }
-
     fn with_root<R>(&self, time: &S, f: impl FnOnce(&dyn Any) -> R) -> R {
         match &self.project {
             Some(project) => {
@@ -656,13 +645,97 @@ pub(crate) trait Sink: Send + Sync + 'static {
     fn drain(&self);
     /// Applying the queue panicked (a checker bug): halt and report it.
     fn failed(&self, what: String);
+    /// Name the dataflow's operators (see [`Oracle::register_names`]).
+    fn register_names_vec(&self, operators: Vec<(usize, String)>);
 }
 
-/// Materialization context: the oracle and the worker being materialized.
+/// Creates (or finds) the oracle of one nested scope of a dataflow, in the
+/// scope's own time: `(dataflow id, total workers)` to the oracle, as a sink
+/// and as `Arc<Oracle<S>>`.
+pub(crate) type ScopeOracleFn = Arc<
+    dyn Fn(DataflowId, usize) -> Option<(Arc<dyn Sink>, Arc<dyn Any + Send + Sync>)> + Send + Sync,
+>;
+
+/// The [`ScopeOracleFn`] of nested scope `scope`, whose time is `S`.
+pub(crate) fn scope_oracle_fn<S: Timestamp>(scope: usize) -> ScopeOracleFn {
+    Arc::new(move |id, total_workers| {
+        oracle_scoped::<S>(id, scope, total_workers).map(|oracle| {
+            let sink: Arc<dyn Sink> = oracle.clone();
+            let typed: Arc<dyn Any + Send + Sync> = oracle;
+            (sink, typed)
+        })
+    })
+}
+
+/// Materialization context: the oracles and the worker being materialized.
+///
+/// Every progress scope has its own oracle in its own time (design §5.1.7):
+/// the root scope's is `sink`, and each nested scope's (a loop body, in
+/// `Product` time) is in `scopes`. A channel, store or tracker of a scope
+/// reports to that scope's oracle, so loop-body work is judged against the
+/// loop's own frontiers, never projected onto the outer time.
 #[derive(Clone)]
 pub(crate) struct Ctx {
     pub(crate) sink: Arc<dyn Sink>,
     pub(crate) worker: usize,
+    id: Option<DataflowId>,
+    total_workers: usize,
+    typed: Arc<dyn Any + Send + Sync>,
+    scopes: Arc<HashMap<usize, (Arc<dyn Sink>, Arc<dyn Any + Send + Sync>)>>,
+}
+
+impl Ctx {
+    /// This context, with the oracle of every nested scope `scopes`
+    /// describes. `names` names the dataflow's operators for them.
+    pub(crate) fn with_scopes(
+        mut self,
+        scopes: &[(usize, ScopeOracleFn)],
+        names: &[(usize, String)],
+    ) -> Self {
+        let Some(id) = self.id else {
+            return self;
+        };
+        let mut map = HashMap::new();
+        for (scope, make) in scopes {
+            if let Some((sink, typed)) = make(id, self.total_workers) {
+                sink.register_names_vec(names.to_vec());
+                map.insert(*scope, (sink, typed));
+            }
+        }
+        self.scopes = Arc::new(map);
+        self
+    }
+
+    /// The sink of scope `scope` (0: the root). A scope without an oracle
+    /// falls back to the root's, which reports the time mismatch as a
+    /// coverage gap.
+    pub(crate) fn sink_for(&self, scope: usize) -> Arc<dyn Sink> {
+        if scope == 0 {
+            return self.sink.clone();
+        }
+        match self.scopes.get(&scope) {
+            Some((sink, _)) => sink.clone(),
+            None => self.sink.clone(),
+        }
+    }
+
+    /// This context with scope `scope`'s oracle as its sink.
+    pub(crate) fn for_scope(&self, scope: usize) -> Ctx {
+        Ctx {
+            sink: self.sink_for(scope),
+            ..self.clone()
+        }
+    }
+
+    /// Scope `scope`'s oracle, if its time is `S`.
+    pub(crate) fn typed_oracle<S: Timestamp>(&self, scope: usize) -> Option<Arc<Oracle<S>>> {
+        let typed = if scope == 0 {
+            self.typed.clone()
+        } else {
+            self.scopes.get(&scope)?.1.clone()
+        };
+        typed.downcast::<Oracle<S>>().ok()
+    }
 }
 
 impl fmt::Debug for Ctx {
@@ -680,8 +753,8 @@ struct Entry {
     typed: Weak<dyn Any + Send + Sync>,
 }
 
-fn registry() -> MutexGuard<'static, HashMap<DataflowId, Entry>> {
-    static REGISTRY: OnceLock<Mutex<HashMap<DataflowId, Entry>>> = OnceLock::new();
+fn registry() -> MutexGuard<'static, HashMap<(DataflowId, usize), Entry>> {
+    static REGISTRY: OnceLock<Mutex<HashMap<(DataflowId, usize), Entry>>> = OnceLock::new();
     REGISTRY
         .get_or_init(Default::default)
         .lock()
@@ -706,12 +779,23 @@ pub(crate) fn oracle_unless<T: Timestamp>(
 /// cluster in this process gets the same one. Returns `None` when checking
 /// is off.
 pub(crate) fn oracle<T: Timestamp>(id: DataflowId, total_workers: usize) -> Option<Arc<Oracle<T>>> {
+    oracle_scoped(id, 0, total_workers)
+}
+
+/// The oracle of progress scope `scope` (0: the root) of dataflow `id`, in
+/// the scope's time `T`, created on first use.
+pub(crate) fn oracle_scoped<T: Timestamp>(
+    id: DataflowId,
+    scope: usize,
+    total_workers: usize,
+) -> Option<Arc<Oracle<T>>> {
     if !enabled() {
         return None;
     }
+    let id_key = (id, scope);
     let mut registry = registry();
     registry.retain(|_, entry| entry.sink.strong_count() > 0);
-    if let Some(existing) = registry.get(&id).and_then(|e| e.typed.upgrade()) {
+    if let Some(existing) = registry.get(&id_key).and_then(|e| e.typed.upgrade()) {
         match existing.downcast::<Oracle<T>>() {
             Ok(oracle) if oracle.total_workers == total_workers => return Some(oracle),
             _ => {
@@ -734,7 +818,7 @@ pub(crate) fn oracle<T: Timestamp>(id: DataflowId, total_workers: usize) -> Opti
     watch(&sink);
     let typed: Arc<dyn Any + Send + Sync> = oracle.clone();
     registry.insert(
-        id,
+        id_key,
         Entry {
             sink: Arc::downgrade(&sink),
             typed: Arc::downgrade(&typed),
@@ -989,7 +1073,6 @@ enum Event<T: Timestamp> {
         at: std::time::Instant,
     },
     Exhausted(Loc),
-    ForceClose(u64),
     WorkerFinished {
         worker: usize,
         ok: bool,
@@ -1177,7 +1260,6 @@ impl<T: Timestamp> Oracle<T> {
                 at,
             } => self.publish_locked(state, view, targets, sources, at, found),
             Event::Exhausted(loc) => *state.exhausted.entry(loc).or_insert(0) += 1,
-            Event::ForceClose(view) => self.force_close_locked(state, view, found),
             Event::WorkerFinished { worker, ok } => {
                 self.worker_finished_locked(state, worker, ok, found)
             }
@@ -1268,9 +1350,14 @@ impl<T: Timestamp> Oracle<T> {
 
     /// A context for materializing `worker`'s channels.
     pub(crate) fn ctx(self: &Arc<Self>, worker: usize) -> Ctx {
+        let typed: Arc<dyn Any + Send + Sync> = self.clone();
         Ctx {
             sink: self.clone(),
             worker,
+            id: self.id,
+            total_workers: self.total_workers,
+            typed,
+            scopes: Arc::new(HashMap::new()),
         }
     }
 
@@ -1453,51 +1540,6 @@ impl<T: Timestamp> Oracle<T> {
                     });
                 }
             }
-        }
-    }
-
-    /// A worker force-closes its operators because its tracker reports
-    /// completion: nothing may still be outstanding in its view's locations.
-    pub(crate) fn force_close(&self, view: u64) {
-        self.enqueue(Event::ForceClose(view));
-    }
-
-    /// `force_close`, applied.
-    fn force_close_locked(&self, state: &mut State<T>, view: u64, found: &mut Vec<Found>) {
-        if self.partial(state) || state.halted.is_some() {
-            return;
-        }
-        let Some(v) = state.views.get(&view) else {
-            return;
-        };
-        let mut outstanding = Vec::new();
-        for ((store, loc, owner), times) in &state.counts {
-            if !view_covers(v, &state.out_edges, *store, *loc) {
-                continue;
-            }
-            for (time, &n) in times {
-                if n > 0 {
-                    outstanding.push(format!(
-                        "{n} in {store:?} at {loc:?}@{time:?}{}",
-                        owner_suffix(*owner)
-                    ));
-                }
-            }
-        }
-        if !outstanding.is_empty() {
-            outstanding.truncate(8);
-            found.push(Found {
-                check: Check::V4,
-                kind: "force-close-with-work",
-                worker: Some(v.worker),
-                site: None,
-                detail: format!(
-                    "its {} reports completion and it force-closes its operators while \
-                     work is outstanding: {}",
-                    v.label,
-                    outstanding.join(", ")
-                ),
-            });
         }
     }
 
@@ -1736,22 +1778,6 @@ fn residual<T: Timestamp>(store: Store, loc: Loc, owner: Owner, time: &T, n: i64
     }
 }
 
-/// Whether view `v` tracks the location `(store, loc)` is checked against.
-fn view_covers<T: Timestamp>(
-    v: &View<T>,
-    out_edges: &LocMap<BTreeSet<Loc>>,
-    store: Store,
-    loc: Loc,
-) -> bool {
-    match store {
-        Store::Capability => v.sources.contains_key(&loc),
-        s if s.at_output() => out_edges
-            .get(&loc)
-            .is_some_and(|targets| targets.iter().any(|t| v.targets.contains_key(t))),
-        _ => v.targets.contains_key(&loc),
-    }
-}
-
 /// Check one unit of work against one view (V7).
 #[allow(clippy::too_many_arguments)]
 fn check_one<T: Timestamp>(
@@ -1898,6 +1924,10 @@ impl<T: Timestamp> Sink for Oracle<T> {
         self.queue.lock().unwrap_or_else(|e| e.into_inner()).clear();
         record(Check::V7, "checker-failed", self.id, None, None, reason);
     }
+
+    fn register_names_vec(&self, operators: Vec<(usize, String)>) {
+        self.register_names(operators);
+    }
 }
 
 impl<T: Timestamp> Drop for Oracle<T> {
@@ -1944,10 +1974,6 @@ impl<T: Timestamp> TrackerCheck<T> {
         sources: impl IntoIterator<Item = (Loc, Antichain<T>)>,
     ) {
         self.oracle.publish(self.view, targets, sources);
-    }
-
-    pub(crate) fn force_close(&self) {
-        self.oracle.force_close(self.view);
     }
 
     pub(crate) fn halt(&self, reason: &str) {
@@ -2346,7 +2372,6 @@ mod tests {
         // Records sent to the other process, never pulled here.
         oracle.count(Store::Channel, (2, 0), None, &1, 3, 0);
         oracle.publish(view, [((2, 0), frontier(4))], []);
-        oracle.force_close(view);
         assert!(
             violations_for(id).iter().all(|v| v.check.is_report()),
             "{:?}",

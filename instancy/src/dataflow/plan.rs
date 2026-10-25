@@ -746,11 +746,11 @@ mod tests {
     }
 
     /// A loop after a parallelism change (`exchange_to(1)` then `iterate` on 2
-    /// workers) is rejected through its feedback edge, as before step 2: stage
-    /// inference puts the loop's feedback operator, which has no regular
-    /// input, in stage 0.
+    /// workers) plans like any other stage (R18): stage inference puts the
+    /// loop's feedback operator, which has no regular input, in its loop's
+    /// stage, so the feedback edge stays within one stage.
     #[test]
-    fn loop_after_parallelism_change_reports_its_feedback_edge() {
+    fn loop_after_parallelism_change_plans_its_feedback_in_the_loop_stage() {
         let b = DataflowBuilder::<u64>::new("plan");
         b.input::<u64>("in")
             .unwrap()
@@ -766,10 +766,19 @@ mod tests {
             .output("out")
             .unwrap();
         let df = b.build().unwrap();
-        let err = PhysicalPlan::new(&df.graph, &df.stages, Parallelism::PerStage { default: 2 })
-            .unwrap_err()
-            .to_string();
-        assert!(err.contains("cross-stage feedback edge"), "{err}");
+        let plan =
+            PhysicalPlan::new(&df.graph, &df.stages, Parallelism::PerStage { default: 2 }).unwrap();
+        let feedback = df.graph.feedback_edges()[0].target.operator_index;
+        let concat = df
+            .graph
+            .edges()
+            .iter()
+            .find(|e| e.source.operator_index == feedback)
+            .unwrap()
+            .target
+            .operator_index;
+        assert_eq!(plan.hosts(feedback), plan.hosts(concat));
+        assert_eq!(plan.hosts(feedback), 1);
     }
 
     #[test]

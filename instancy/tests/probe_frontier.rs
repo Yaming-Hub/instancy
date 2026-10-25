@@ -10,7 +10,7 @@
 //!   stream.
 
 use std::collections::BTreeMap;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, mpsc};
 use std::time::{Duration, Instant};
 
@@ -919,10 +919,12 @@ type P2 = Product<P1, u32>;
 
 /// A loop body `map -> probe -> filter(< N) -> feedback` iterates epoch 0
 /// thousands of times (more than one executor sweep's activation budget)
-/// after the input has already advanced past it. Progress tracking
-/// cannot see data circulating on the feedback edge, so the outer frontier of
-/// the body stream passes epoch 0 after the first sweep; the probe must still
-/// never report `(0, i)` complete while `(0, i)` data appears on the stream.
+/// after the input has already advanced past it. The records circulating on
+/// the feedback edge are counted, so the body probe's frontier (in the loop's
+/// `Product` time) holds epoch 0 until the record leaves the loop. It
+/// advances with the iterations: `(0, i)` is complete once the record has
+/// passed iteration `i`, and never before (nor while `(0, i)` data still
+/// appears on the stream).
 #[test]
 fn loop_body_probe_never_reports_an_epoch_complete_while_the_loop_iterates() {
     const ITERATIONS: u64 = 3000;
@@ -931,12 +933,20 @@ fn loop_body_probe_never_reports_an_epoch_complete_while_the_loop_iterates() {
         let violations: Arc<Mutex<Vec<String>>> = Arc::default();
         let slot: ProbeSlot<P1> = Arc::default();
         let (v, s2) = (Arc::clone(&violations), Arc::clone(&slot));
+        // The highest iteration of epoch 0 the body stream has carried.
+        let reached = Arc::new(AtomicU64::new(0));
+        let r2 = Arc::clone(&reached);
         let builder = DataflowBuilder::<u64>::new("loop-body-probe");
         let out = builder
             .input::<u64>("data")
             .unwrap()
             .iterate::<u32>("loop", 1u32, move |var| {
-                let stepped = var.map("inc", |_t: &P1, x: u64| x + 1);
+                let stepped = var.map("inc", move |t: &P1, x: u64| {
+                    if t.outer == 0 {
+                        r2.fetch_max(u64::from(t.inner), Ordering::SeqCst);
+                    }
+                    x + 1
+                });
                 let (stepped, probe) = checked_probe(stepped, "loop-body", &v);
                 *s2.lock().unwrap() = Some(probe);
                 IterateResult {
@@ -954,14 +964,16 @@ fn loop_body_probe_never_reports_an_epoch_complete_while_the_loop_iterates() {
         let rx = h.take_output::<u64>("out").unwrap();
         tx.send(0, vec![round]).unwrap();
         tx.advance_to(1).unwrap();
-        // While epoch 0 iterates, (0, ITERATIONS / 2) must not be reported
-        // complete.
+        // While epoch 0 iterates, (0, ITERATIONS / 2) may be reported
+        // complete only once the record has passed that iteration.
+        let mid = ITERATIONS as u32 / 2;
         let start = Instant::now();
         let mut got = None;
         while got.is_none() && start.elapsed() < Duration::from_secs(10) {
-            if probe.done_with(&P1::new(0, ITERATIONS as u32 / 2)) {
+            if probe.done_with(&P1::new(0, mid)) && reached.load(Ordering::SeqCst) < u64::from(mid)
+            {
                 violations.lock().unwrap().push(format!(
-                    "done_with((0, ITERATIONS / 2)) before epoch 0 left the loop: {:?}",
+                    "done_with((0, {mid})) before the body carried iteration {mid}: {:?}",
                     probe.frontier()
                 ));
                 break;

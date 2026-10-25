@@ -1129,16 +1129,16 @@ pub(crate) type ExchangeFactoryCreatorFn = Box<
 >;
 
 /// Wrap a loop body's exchange creator so every channel factory it creates
-/// carries the loop's time projection, for the progress checker.
+/// reports to the loop scope's oracle, for the progress checker.
 #[cfg(any(debug_assertions, feature = "progress-check"))]
-pub(crate) fn with_check_projector<S: Timestamp>(
+pub(crate) fn with_check_scope(
     mut creator: ExchangeFactoryCreatorFn,
-    projector: Arc<dyn Fn(&S) -> Box<dyn std::any::Any + Send> + Send + Sync>,
+    scope: usize,
 ) -> ExchangeFactoryCreatorFn {
     Box::new(move |sources, targets, capacity, metrics| {
         let mut factories = creator(sources, targets, capacity, metrics);
         for factory in &mut factories {
-            factory.set_check_projector(&projector);
+            factory.set_check_scope(scope);
         }
         factories
     })
@@ -1255,22 +1255,22 @@ pub(crate) trait NetworkExchangeCreator: Send {
     ) -> Vec<super::super::schedulable::ChannelFactory>;
 }
 
-/// A loop body's network exchange creator whose channel factories carry the
-/// loop's time projection, for the progress checker.
+/// A loop body's network exchange creator whose channel factories report to
+/// the loop scope's oracle, for the progress checker.
 #[cfg(all(
     feature = "transport",
     any(debug_assertions, feature = "progress-check")
 ))]
-struct CheckProjectedCreator<S: Timestamp> {
+struct CheckScopedCreator {
     inner: Box<dyn NetworkExchangeCreator>,
-    projector: Arc<dyn Fn(&S) -> Box<dyn std::any::Any + Send> + Send + Sync>,
+    scope: usize,
 }
 
 #[cfg(all(
     feature = "transport",
     any(debug_assertions, feature = "progress-check")
 ))]
-impl<S: Timestamp> NetworkExchangeCreator for CheckProjectedCreator<S> {
+impl NetworkExchangeCreator for CheckScopedCreator {
     fn create(
         self: Box<Self>,
         params: NetworkMaterializerParams,
@@ -1278,7 +1278,7 @@ impl<S: Timestamp> NetworkExchangeCreator for CheckProjectedCreator<S> {
         let this = *self;
         let mut factories = this.inner.create(params)?;
         for factory in &mut factories {
-            factory.set_check_projector(&this.projector);
+            factory.set_check_scope(this.scope);
         }
         Ok(factories)
     }
@@ -1307,25 +1307,25 @@ impl<S: Timestamp> NetworkExchangeCreator for CheckProjectedCreator<S> {
         let this = *self;
         let mut factories = this.inner.create_mock(num_workers, capacity);
         for factory in &mut factories {
-            factory.set_check_projector(&this.projector);
+            factory.set_check_scope(this.scope);
         }
         factories
     }
 }
 
 /// Wrap a loop body's network exchange creator so every channel factory it
-/// creates carries the loop's time projection, for the progress checker.
+/// creates reports to the loop scope's oracle, for the progress checker.
 #[cfg(all(
     feature = "transport",
     any(debug_assertions, feature = "progress-check")
 ))]
-pub(crate) fn network_with_check_projector<S: Timestamp>(
+pub(crate) fn network_with_check_scope(
     creator: Box<dyn NetworkExchangeCreator>,
-    projector: Arc<dyn Fn(&S) -> Box<dyn std::any::Any + Send> + Send + Sync>,
+    scope: usize,
 ) -> Box<dyn NetworkExchangeCreator> {
-    Box::new(CheckProjectedCreator {
+    Box::new(CheckScopedCreator {
         inner: creator,
-        projector,
+        scope,
     })
 }
 

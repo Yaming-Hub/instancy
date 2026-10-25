@@ -53,7 +53,7 @@
 //!   multiple paths with different summaries may exist between two ports).
 
 use std::cmp::Reverse;
-use std::collections::BinaryHeap;
+use std::collections::{BinaryHeap, HashMap};
 use std::fmt::Debug;
 
 use crate::error::DataflowError;
@@ -281,6 +281,13 @@ impl<T: Timestamp> Builder<T> {
         // Compute scope-level summary via fixed-point iteration.
         let scope_summary = self.compute_scope_summary();
 
+        // Every location's paths to the scope outputs, for the export of
+        // internal work to the parent scope. Boundary node 0 is excluded: the
+        // parent's own input frontier, imported there, is not internal work.
+        let (source_tables, target_tables) = self.backward_tables();
+        let source_exports = export_table::<T>(source_tables);
+        let target_exports = export_table::<T>(target_tables);
+
         // Compile the forward path summaries for propagation.
         // target_summaries[node][input] → Vec<(Location, Antichain<Summary>)>
         // source_summaries[node][output] → Vec<(Location, Antichain<Summary>)>
@@ -307,9 +314,81 @@ impl<T: Timestamp> Builder<T> {
             pushed_changes: ChangeBatch::new(),
             output_changes,
             total_counts: 0,
+            source_exports,
+            target_exports,
+            export_changes: (0..self.scope_outputs)
+                .map(|_| ChangeBatch::new())
+                .collect(),
         };
 
         (tracker, scope_summary)
+    }
+
+    /// Reject identity cycles (design §5.1.7, R38 C5): a cycle whose
+    /// composed summary does not advance the timestamp (at or below the
+    /// default summary) lets a pointstamp support itself around the loop, so
+    /// the frontier there could never advance. Returns the location the
+    /// cycle passes through and the cycle's summary.
+    pub(crate) fn find_identity_cycle(&self) -> Option<(Location, T::Summary)> {
+        let identity = T::Summary::default();
+        for node in 1..self.shape.len() {
+            let (inputs, _) = self.shape[node];
+            for input in 0..inputs {
+                let start = Location::target(node, input);
+                // Summaries of paths from `start` to every location (minimal
+                // ones only), one step at a time.
+                let mut reached: HashMap<Location, Antichain<T::Summary>> = HashMap::new();
+                let mut stack: Vec<(Location, T::Summary)> =
+                    vec![(start.clone(), identity.clone())];
+                while let Some((location, summary)) = stack.pop() {
+                    let next: Vec<(Location, T::Summary)> = match &location {
+                        Location::Target { node, port } => {
+                            let Some(Some(conn)) = self.nodes.get(*node) else {
+                                continue;
+                            };
+                            let (_, outputs) = self.shape[*node];
+                            (0..outputs)
+                                .flat_map(|output| {
+                                    conn.path(*port, output)
+                                        .elements()
+                                        .iter()
+                                        .filter_map(|s| summary.followed_by(s))
+                                        .map(move |s| (Location::source(*node, output), s))
+                                        .collect::<Vec<_>>()
+                                })
+                                .collect()
+                        }
+                        Location::Source { node, port } => self
+                            .edges
+                            .get(*node)
+                            .and_then(|ports| ports.get(*port))
+                            .map(|targets| {
+                                targets
+                                    .iter()
+                                    .map(|target| (target.clone(), summary.clone()))
+                                    .collect()
+                            })
+                            .unwrap_or_default(),
+                    };
+                    for (location, summary) in next {
+                        if location == start {
+                            if crate::order::PartialOrder::less_equal(&summary, &identity) {
+                                return Some((start, summary));
+                            }
+                            continue;
+                        }
+                        if reached
+                            .entry(location.clone())
+                            .or_default()
+                            .insert(summary.clone())
+                        {
+                            stack.push((location, summary));
+                        }
+                    }
+                }
+            }
+        }
+        None
     }
 
     fn ensure_node(&mut self, index: usize) {
@@ -355,8 +434,30 @@ impl<T: Timestamp> Builder<T> {
     /// source-to-output entries.
     #[allow(clippy::needless_range_loop)]
     fn compute_scope_summary(&self) -> PortConnectivity<T::Summary> {
+        let (source_to_output, _) = self.backward_tables();
         let mut summary = PortConnectivity::new(self.scope_inputs, self.scope_outputs);
+        // Scope inputs are graph node 0's outputs.
+        for si in 0..self.scope_inputs {
+            if si < source_to_output[0].len() {
+                for so in 0..self.scope_outputs {
+                    for s in source_to_output[0][si][so].elements() {
+                        summary.path_mut(si, so).insert(s.clone());
+                    }
+                }
+            }
+        }
+        summary
+    }
 
+    /// For every location, the summaries of its paths to each scope output
+    /// (`[node][port][scope_output]`), for sources and for targets.
+    #[allow(clippy::needless_range_loop, clippy::type_complexity)]
+    fn backward_tables(
+        &self,
+    ) -> (
+        Vec<Vec<Vec<Antichain<T::Summary>>>>,
+        Vec<Vec<Vec<Antichain<T::Summary>>>>,
+    ) {
         // Two parallel lookup tables for backward reachability:
         // - source_to_output[node][output_port][scope_output] = Antichain<Summary>
         //   "What summaries can reach scope output `so` from Source(node, output_port)?"
@@ -442,19 +543,7 @@ impl<T: Timestamp> Builder<T> {
             }
         }
 
-        // Extract scope-level summary: scope input → scope output.
-        // Scope inputs are graph node 0's outputs.
-        for si in 0..self.scope_inputs {
-            if si < source_to_output[0].len() {
-                for so in 0..self.scope_outputs {
-                    for s in source_to_output[0][si][so].elements() {
-                        summary.path_mut(si, so).insert(s.clone());
-                    }
-                }
-            }
-        }
-
-        summary
+        (source_to_output, target_to_output)
     }
 
     /// Compiles forward propagation paths used by the Tracker at build time.
@@ -527,6 +616,34 @@ impl<T: Timestamp> Builder<T> {
 
         (target_summaries, source_summaries)
     }
+}
+
+/// For every location of every node, its paths to each scope output:
+/// `[node][port] -> [(scope output, summaries)]`.
+type ExportTable<T> = Vec<Vec<Vec<(usize, Antichain<<T as Timestamp>::Summary>)>>>;
+
+/// The export table of a `[node][port][scope output]` table of path
+/// summaries, without boundary node 0 and without unreachable outputs.
+fn export_table<T: Timestamp>(tables: Vec<Vec<Vec<Antichain<T::Summary>>>>) -> ExportTable<T> {
+    tables
+        .into_iter()
+        .enumerate()
+        .map(|(node, ports)| {
+            ports
+                .into_iter()
+                .map(|outputs| {
+                    if node == 0 {
+                        return Vec::new();
+                    }
+                    outputs
+                        .into_iter()
+                        .enumerate()
+                        .filter(|(_, summaries)| !summaries.is_empty())
+                        .collect()
+                })
+                .collect()
+        })
+        .collect()
 }
 
 // ---------------------------------------------------------------------------
@@ -665,6 +782,15 @@ pub struct Tracker<T: Timestamp> {
     /// count never offsets a positive one. Completion is decided by exact
     /// zero over a worker's scope, not by this count.
     total_counts: i64,
+
+    /// For every source and target of a node other than the boundary node 0,
+    /// its paths to each scope output (`[node][port] -> [(output, summaries)]`).
+    source_exports: ExportTable<T>,
+    target_exports: ExportTable<T>,
+    /// The scope's internal work, projected onto its outputs: changes of the
+    /// pointstamp frontiers of every location but node 0's, carried along
+    /// `*_exports` (design §5.1.7, the upward export). Positive semantics.
+    export_changes: Vec<ChangeBatch<T>>,
 }
 
 impl<T: Timestamp> Tracker<T> {
@@ -720,7 +846,21 @@ impl<T: Timestamp> Tracker<T> {
     pub fn propagate_all(&mut self) {
         // Step 1: Drain pending changes into pointstamps and seed the worklist.
         self.drain_pending_changes();
+        self.propagate_worklist();
+    }
 
+    /// Step 1 of [`propagate_all`](Self::propagate_all) alone: applies the
+    /// posted changes to the pointstamps, records the resulting export
+    /// changes and seeds the worklist. A nested scope runs this for every
+    /// scope (bottom-up, so each scope's export reaches its parent) before
+    /// any scope propagates.
+    pub(crate) fn apply_pending(&mut self) {
+        self.drain_pending_changes();
+    }
+
+    /// Step 2 of [`propagate_all`](Self::propagate_all) alone: propagates
+    /// the seeded frontier changes to every implication.
+    pub(crate) fn propagate_worklist(&mut self) {
         // Step 2: Process worklist entries in timestamp order.
         while let Some(Reverse(entry)) = self.worklist.pop() {
             // Accumulate all entries with the same (time, location).
@@ -762,6 +902,12 @@ impl<T: Timestamp> Tracker<T> {
     /// Drains scope output frontier changes for the given output index.
     pub fn drain_output_changes(&mut self, output: usize) -> Vec<(T, i64)> {
         self.output_changes[output].drain().collect()
+    }
+
+    /// Drains the export changes of scope output `output`: how the scope's
+    /// internal work (node 0 excluded) projected onto that output changed.
+    pub(crate) fn drain_export_changes(&mut self, output: usize) -> Vec<(T, i64)> {
+        self.export_changes[output].drain().collect()
     }
 
     /// Returns `true` if the tracker is still tracking any outstanding capabilities
@@ -889,6 +1035,13 @@ impl<T: Timestamp> Tracker<T> {
                         .update_iter(std::iter::once((time.clone(), diff)));
                     for (t, d) in frontier_changes {
                         self.total_counts += d;
+                        for (output, summaries) in &self.target_exports[node][port] {
+                            for summary in summaries.elements() {
+                                if let Some(exported) = summary.results_in(&t) {
+                                    self.export_changes[*output].update(exported, d);
+                                }
+                            }
+                        }
                         self.worklist.push(Reverse(WorklistEntry {
                             time: t,
                             location: Location::target(node, port),
@@ -906,6 +1059,13 @@ impl<T: Timestamp> Tracker<T> {
                         .update_iter(std::iter::once((time.clone(), diff)));
                     for (t, d) in frontier_changes {
                         self.total_counts += d;
+                        for (output, summaries) in &self.source_exports[node][port] {
+                            for summary in summaries.elements() {
+                                if let Some(exported) = summary.results_in(&t) {
+                                    self.export_changes[*output].update(exported, d);
+                                }
+                            }
+                        }
                         self.worklist.push(Reverse(WorklistEntry {
                             time: t,
                             location: Location::source(node, port),
@@ -1272,5 +1432,125 @@ mod tests {
             output_changes.iter().any(|(t, d)| *t == 10 && *d > 0),
             "scope output should see capability at 10"
         );
+    }
+
+    /// A one-input, one-output scope around operator 1 (identity summary).
+    fn scope_around_one_operator() -> Tracker<u64> {
+        let mut builder = Builder::<u64>::new(1, 1);
+        let mut conn = PortConnectivity::new(1, 1);
+        conn.path_mut(0, 0).insert(0);
+        builder.add_node(1, 1, 1, conn).unwrap();
+        builder
+            .add_edge(Location::source(0, 0), Location::target(1, 0))
+            .unwrap();
+        builder
+            .add_edge(Location::source(1, 0), Location::target(0, 0))
+            .unwrap();
+        builder.build().0
+    }
+
+    fn sorted<T: Ord>(mut v: Vec<T>) -> Vec<T> {
+        v.sort();
+        v
+    }
+
+    #[test]
+    fn export_projects_internal_work_and_never_the_import() {
+        let mut tracker = scope_around_one_operator();
+        // The parent's frontier, imported at boundary node 0: never exported.
+        tracker.update_source(0, 0, 3, 1);
+        tracker.apply_pending();
+        assert!(tracker.drain_export_changes(0).is_empty());
+        tracker.propagate_worklist();
+        // A capability of operator 1 and a record waiting at its input are
+        // internal work, projected onto the scope output.
+        tracker.update_source(1, 0, 5, 1);
+        tracker.update_target(1, 0, 4, 1);
+        tracker.apply_pending();
+        assert_eq!(
+            sorted(tracker.drain_export_changes(0)),
+            vec![(4, 1), (5, 1)]
+        );
+        tracker.propagate_worklist();
+        tracker.update_source(1, 0, 5, -1);
+        tracker.update_target(1, 0, 4, -1);
+        tracker.apply_pending();
+        assert_eq!(
+            sorted(tracker.drain_export_changes(0)),
+            vec![(4, -1), (5, -1)]
+        );
+    }
+
+    #[test]
+    fn export_follows_frontier_changes_only() {
+        let mut tracker = scope_around_one_operator();
+        tracker.update_source(1, 0, 5, 1);
+        tracker.apply_pending();
+        assert_eq!(tracker.drain_export_changes(0), vec![(5, 1)]);
+        // A second capability at a later time leaves the frontier unchanged.
+        tracker.update_source(1, 0, 7, 1);
+        tracker.apply_pending();
+        assert!(tracker.drain_export_changes(0).is_empty());
+        // Releasing the earlier one moves the frontier to 7.
+        tracker.update_source(1, 0, 5, -1);
+        tracker.apply_pending();
+        assert_eq!(
+            sorted(tracker.drain_export_changes(0)),
+            vec![(5, -1), (7, 1)]
+        );
+    }
+
+    /// A loop: concat (node 1, two inputs) feeds a feedback node (node 2)
+    /// with `summary`, back into concat's second input.
+    fn loop_with_summary<T: Timestamp>(summary: T::Summary) -> Builder<T> {
+        let mut builder = Builder::<T>::new(0, 0);
+        let mut concat = PortConnectivity::new(2, 1);
+        concat.path_mut(0, 0).insert(T::Summary::default());
+        concat.path_mut(1, 0).insert(T::Summary::default());
+        builder.add_node(1, 2, 1, concat).unwrap();
+        let mut feedback = PortConnectivity::new(1, 1);
+        feedback.path_mut(0, 0).insert(summary);
+        builder.add_node(2, 1, 1, feedback).unwrap();
+        builder
+            .add_edge(Location::source(1, 0), Location::target(2, 0))
+            .unwrap();
+        builder
+            .add_edge(Location::source(2, 0), Location::target(1, 1))
+            .unwrap();
+        builder
+    }
+
+    #[test]
+    fn identity_cycles_are_found() {
+        assert!(loop_with_summary::<u64>(0).find_identity_cycle().is_some());
+        assert!(loop_with_summary::<u64>(1).find_identity_cycle().is_none());
+        assert!(
+            loop_with_summary::<Product<u64, u32>>(Product::new(0, 0))
+                .find_identity_cycle()
+                .is_some()
+        );
+        assert!(
+            loop_with_summary::<Product<u64, u32>>(Product::new(0, 1))
+                .find_identity_cycle()
+                .is_none()
+        );
+        // An acyclic graph has no cycle at all.
+        assert!(
+            scope_around_one_operator_builder()
+                .find_identity_cycle()
+                .is_none()
+        );
+    }
+
+    fn scope_around_one_operator_builder() -> Builder<u64> {
+        let mut builder = Builder::<u64>::new(0, 0);
+        let mut conn = PortConnectivity::new(1, 1);
+        conn.path_mut(0, 0).insert(0);
+        builder.add_node(1, 1, 1, conn.clone()).unwrap();
+        builder.add_node(2, 1, 1, conn).unwrap();
+        builder
+            .add_edge(Location::source(1, 0), Location::target(2, 0))
+            .unwrap();
+        builder
     }
 }

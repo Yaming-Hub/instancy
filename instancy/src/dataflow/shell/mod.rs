@@ -527,6 +527,8 @@ pub(crate) trait InputPorts: Send + 'static {
     /// Forget the call's consumption (the call failed).
     fn discard(&mut self, tok: &ShellToken);
 
+    /// Whether every input's frontier is empty: no more input can arrive.
+    fn frontiers_empty(&self) -> bool;
     /// Set input `port`'s frontier (an `Antichain` of the port's time).
     /// Returns whether it changed.
     fn set_frontier(&mut self, tok: &ShellToken, port: usize, frontier: &dyn Any) -> bool;
@@ -551,6 +553,9 @@ impl InputPorts for () {
     fn commit(&mut self, _: &ShellToken) {}
     fn discard(&mut self, _: &ShellToken) {}
 
+    fn frontiers_empty(&self) -> bool {
+        false
+    }
     fn set_frontier(&mut self, _: &ShellToken, _: usize, _: &dyn Any) -> bool {
         false
     }
@@ -577,6 +582,9 @@ impl<T: Timestamp, D: Send + 'static> InputPorts for CountedInput<T, D> {
         CountedInput::discard(self, tok);
     }
 
+    fn frontiers_empty(&self) -> bool {
+        self.handle.frontier().is_empty()
+    }
     fn set_frontier(&mut self, _: &ShellToken, port: usize, frontier: &dyn Any) -> bool {
         port == 0
             && frontier
@@ -614,6 +622,9 @@ impl<A: InputPorts, B: InputPorts> InputPorts for (A, B) {
         self.1.discard(tok);
     }
 
+    fn frontiers_empty(&self) -> bool {
+        self.0.frontiers_empty() && self.1.frontiers_empty()
+    }
     fn set_frontier(&mut self, tok: &ShellToken, port: usize, frontier: &dyn Any) -> bool {
         let split = self.0.len();
         if port < split {
@@ -655,6 +666,9 @@ impl<T: Timestamp, D: Send + 'static> InputPorts for Vec<CountedInput<T, D>> {
             .for_each(|input| CountedInput::discard(input, tok));
     }
 
+    fn frontiers_empty(&self) -> bool {
+        self.iter().all(InputPorts::frontiers_empty)
+    }
     fn set_frontier(&mut self, tok: &ShellToken, port: usize, frontier: &dyn Any) -> bool {
         self.get_mut(port)
             .is_some_and(|input| InputPorts::set_frontier(input, tok, 0, frontier))
@@ -865,9 +879,10 @@ pub(crate) trait OperatorLogic: Send + 'static {
 
     /// Whether V3 checks this operator's output against its calls'
     /// justification. Operators that translate times between scopes (enter,
-    /// leave, feedback) emit exactly the translated time of the batch they
-    /// consume in the same call, so their output is justified by
-    /// construction.
+    /// leave) emit exactly the translated time of the batch they consume in
+    /// the same call, in another time type, so they opt out. (A loop's
+    /// feedback stays in one time and is checked: its `(t, i + 1)` output is
+    /// justified by the `(t, i)` batch it consumes.)
     fn checks_justification(&self) -> bool {
         true
     }
@@ -877,10 +892,11 @@ pub(crate) trait OperatorLogic: Send + 'static {
     /// when the shell is built.
     fn attach_justify(&mut self, _justify: &dyn Any) {}
 
-    /// Whether the logic must also be called when its input frontier
-    /// changes while one of its outputs' [`Retained`]s is alive: user
-    /// closures that keep work with [`OutputHandle::retain`] flush it then,
-    /// including when the frontier becomes empty.
+    /// Whether the logic is a user closure: it is called when its input
+    /// frontier changes while one of its outputs' [`Retained`]s is alive,
+    /// and once more, whether or not it holds one, when its input frontiers
+    /// become empty (R45). A closure that keeps work with
+    /// [`OutputHandle::retain`] flushes it then.
     fn calls_on_frontier(&self) -> bool {
         false
     }
@@ -905,6 +921,12 @@ pub(crate) struct OperatorShell<L: OperatorLogic> {
     exhausted: bool,
     /// An input frontier changed since the logic was last called.
     frontier_changed: bool,
+    /// The logic had its final call, the one in which its input frontiers
+    /// were empty (R45).
+    final_called: bool,
+    /// A progress tracker delivers this operator's input frontiers (not so in
+    /// executor unit tests without one).
+    frontier_known: bool,
     shut_down: bool,
 }
 
@@ -934,6 +956,8 @@ impl<L: OperatorLogic> OperatorShell<L> {
             justify,
             exhausted: false,
             frontier_changed: false,
+            final_called: false,
+            frontier_known: false,
             shut_down: false,
         }
     }
@@ -947,10 +971,23 @@ impl<L: OperatorLogic> OperatorShell<L> {
     /// no output waiting for a channel, no capability and no work its logic
     /// keeps.
     fn holds_nothing(&self) -> bool {
-        !self.inputs.buffered()
+        !self.final_call_due()
+            && !self.inputs.buffered()
             && !self.outputs.pending()
             && !self.outputs.holds_capability()
             && !self.logic.holds_work()
+    }
+
+    /// Whether the logic is owed its final call (R45): it is a closure
+    /// (`calls_on_frontier`) with inputs, and has not yet been called with
+    /// every input frontier empty. Until then the operator cannot shut down,
+    /// so a closure that keeps data without `retain` and emits it in that
+    /// call fails loudly (V3) instead of losing it.
+    fn final_call_due(&self) -> bool {
+        self.frontier_known
+            && !self.final_called
+            && self.logic.calls_on_frontier()
+            && self.inputs.len() > 0
     }
 
     /// Run the logic once, then commit its consumption and output.
@@ -1016,8 +1053,14 @@ impl<L: OperatorLogic> SchedulableOperator for OperatorShell<L> {
         // input frontier changed, so it can flush.
         let frontier_call =
             self.frontier_changed && self.logic.calls_on_frontier() && self.outputs.retained();
-        if self.logic.wants_call(&self.inputs) || frontier_call {
+        // Every closure is called once more when its input frontiers become
+        // empty (R45), its last chance to emit what it holds under `retain`.
+        let final_call = self.final_call_due() && self.inputs.frontiers_empty();
+        if self.logic.wants_call(&self.inputs) || frontier_call || final_call {
             self.frontier_changed = false;
+            if self.inputs.frontiers_empty() {
+                self.final_called = true;
+            }
             did |= self.run_call(&tok)?;
             if !self.outputs.flush(&tok)? {
                 return Ok(ActivationOutcome::BlockedOnBackpressure);
@@ -1092,6 +1135,7 @@ impl<L: OperatorLogic> SchedulableOperator for OperatorShell<L> {
 
     fn update_port_frontier(&mut self, port: usize, frontier: &dyn Any) {
         let tok = ShellToken(());
+        self.frontier_known = true;
         if self.inputs.set_frontier(&tok, port, frontier) {
             self.frontier_changed = true;
         }

@@ -150,6 +150,60 @@ fn stashed_data_emitted_in_a_later_call_without_retain_fails_the_dataflow() {
 // Legitimate patterns
 // ---------------------------------------------------------------------------
 
+/// Stash every batch and emit it once the input frontier is empty, without
+/// `retain`: the anti-pattern `retain` exists for.
+fn stash_until_frontier_empty<T: instancy::Timestamp + Copy>(input: Pipe<T, u64>) -> Pipe<T, u64> {
+    input.unary("stash-no-retain", {
+        let mut stash: Vec<(T, Vec<u64>)> = Vec::new();
+        move |input, output| {
+            while let Some(batch) = input.next() {
+                stash.push(batch);
+            }
+            if input.frontier().is_empty() {
+                for (time, data) in stash.drain(..) {
+                    output.push_vec(time, data);
+                }
+            }
+            Ok(())
+        }
+    })
+}
+
+/// R45: every closure gets a final call when its input frontier becomes
+/// empty, so stashing without `retain` and emitting then fails loudly (V3)
+/// instead of silently dropping the data.
+#[test]
+fn stash_and_flush_without_retain_fails_loudly() {
+    let (result, out) = run_single(
+        "stash-no-retain",
+        stash_until_frontier_empty,
+        vec![(1, vec![1, 2]), (2, vec![3])],
+    );
+    assert!(out.is_empty(), "nothing may be emitted late: {out:?}");
+    assert_unjustified(result);
+}
+
+/// The same inside a loop body: its frontier empties once the loop's input
+/// is closed and nothing circulates.
+#[test]
+fn stash_and_flush_without_retain_inside_a_loop_body_fails_loudly() {
+    let (result, out) = run_single(
+        "stash-no-retain-in-loop",
+        |input| {
+            input.iterate::<u32>("loop", 1u32, |var| {
+                let flushed = stash_until_frontier_empty(var);
+                IterateResult {
+                    feedback: flushed.clone().filter("never", |_t, _x| false),
+                    output: flushed,
+                }
+            })
+        },
+        vec![(1, vec![1, 2]), (2, vec![3])],
+    );
+    assert!(out.is_empty(), "nothing may be emitted late: {out:?}");
+    assert_unjustified(result);
+}
+
 /// A notification handler re-arms the time it handles, later.
 #[test]
 fn notify_rearm_after_next_notification_completes() {
@@ -250,7 +304,6 @@ fn retain_then_emit_completes_with_exact_counts() {
 /// input frontier empties (never only on channel exhaustion: inside a loop,
 /// end-of-stream would wait for the capability).
 #[test]
-#[ignore = "loop scopes are tracked from the nested-scope commit"]
 fn loop_feeding_a_retain_that_flushes_when_its_frontier_empties_completes() {
     let (result, out) = run_single(
         "loop-retain-flush",

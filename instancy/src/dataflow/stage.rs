@@ -144,6 +144,22 @@ pub fn infer_stages(graph: &DataflowGraph) -> Result<Vec<StageInfo>> {
         }
     }
 
+    // R18: a loop's feedback operator has no regular input (its input is the
+    // loop's feedback edge), so the pass above put it in stage 0. It belongs
+    // to its loop's stage: that of the operator it feeds (the loop's concat).
+    for feedback in graph.feedback_edges() {
+        let op = feedback.target.operator_index;
+        let stage = graph
+            .edges()
+            .iter()
+            .filter(|edge| edge.source.operator_index == op)
+            .filter_map(|edge| op_stage.get(&edge.target.operator_index).copied())
+            .max();
+        if let Some(stage) = stage {
+            op_stage.insert(op, stage);
+        }
+    }
+
     let max_stage = op_stage.values().copied().max().unwrap_or(0);
     let mut stage_ops: Vec<Vec<usize>> = vec![Vec::new(); max_stage + 1];
     for &op_idx in &topo_order {

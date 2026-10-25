@@ -2962,6 +2962,20 @@ impl RuntimeHandle {
 
         // Phase 6: Create progress channels (wake handles already created in Phase 5).
 
+        // A loop's progress travels in its own scope's section, which the
+        // progress wire format does not carry yet.
+        if num_local < total_workers
+            && dataflows
+                .first()
+                .is_some_and(|df| df.subgraph_builder.has_nested_scopes())
+        {
+            return Err(Error::Runtime(RuntimeError::InvalidConfig(
+                "iterate is not supported on a multi-node cluster yet: a loop's progress \
+                 cannot cross the network"
+                    .into(),
+            )));
+        }
+
         // Create local progress channels between local workers.
         let all_local_progress = create_progress_channels::<T>(total_workers, &wake_handles)?;
 
@@ -5609,26 +5623,31 @@ fn materialize_executor<T: Timestamp>(
         timeline_start_time,
     };
     let mut worker_subgraph_builder = dataflow.subgraph_builder.clone();
-    // Progress edges are the materialized graph's data edges (P-8).
-    worker_subgraph_builder.set_edges_from_graph(&dataflow.graph);
+    // Progress edges are the materialized graph's data edges (P-8), each in
+    // its progress scope and counted with the plan's multiplicity (R35).
+    worker_subgraph_builder.assign_graph(&dataflow.graph, Some(plan))?;
     #[cfg(any(debug_assertions, feature = "progress-check"))]
     let check_oracle = dataflow.check.clone();
     #[cfg(any(debug_assertions, feature = "progress-check"))]
-    if let Some(oracle) = &check_oracle {
-        oracle.register_names(
-            dataflow
-                .graph
-                .operators()
-                .map(|op| (op.index, op.name.clone())),
-        );
-        worker_subgraph_builder.attach_check_reporters(oracle, worker_context.worker_index());
-    }
+    let check: crate::progress::CheckCtx = check_oracle.as_ref().map(|oracle| {
+        let names: Vec<(usize, String)> = dataflow
+            .graph
+            .operators()
+            .map(|op| (op.index, op.name.clone()))
+            .collect();
+        oracle.register_names(names.clone());
+        oracle
+            .ctx(worker_context.worker_index())
+            .with_scopes(&dataflow.check_scopes, &names)
+    });
     #[cfg(any(debug_assertions, feature = "progress-check"))]
-    let check: crate::progress::CheckCtx = check_oracle
-        .as_ref()
-        .map(|oracle| oracle.ctx(worker_context.worker_index()));
+    if let Some(ctx) = &check {
+        worker_subgraph_builder.attach_check_reporters(ctx);
+    }
     #[cfg(not(any(debug_assertions, feature = "progress-check")))]
     let check: crate::progress::CheckCtx = ();
+    #[cfg(any(debug_assertions, feature = "progress-check"))]
+    let check_ctx = check.clone();
     let progress_reporters = progress_reporters.or_else(|| {
         Some(
             Arc::new(worker_subgraph_builder.materialization_reporters())
@@ -5683,10 +5702,11 @@ fn materialize_executor<T: Timestamp>(
     // is attached to cross-worker progress channels, so it broadcasts its
     // changes to peers and absorbs theirs: every worker's view covers the
     // whole graph and every worker.
-    let mut tracker = worker_subgraph_builder.build();
+    let mut tracker = worker_subgraph_builder.try_build()?;
     #[cfg(any(debug_assertions, feature = "progress-check"))]
-    if let Some(oracle) = check_oracle {
+    if let (Some(oracle), Some(ctx)) = (check_oracle, &check_ctx) {
         tracker.attach_check(oracle, worker_context.worker_index(), "worker tracker");
+        tracker.attach_check_children(ctx, "worker tracker");
     }
     if let Some(channels) = progress_channels {
         tracker.set_progress_channels(channels)?;
@@ -5703,7 +5723,7 @@ fn materialize_executor<T: Timestamp>(
     // (see `dataflow::probe`).
     for registration in &dataflow.probes {
         if plan.runs(worker_context.worker_index(), registration.operator) {
-            executor.register_probe(registration, plan.probe_writers(registration.operator));
+            executor.register_probe(registration, plan.probe_writers(registration.operator))?;
         }
     }
 

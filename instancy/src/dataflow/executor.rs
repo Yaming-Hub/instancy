@@ -27,7 +27,7 @@ use crate::cancellation::CancellationToken;
 use crate::dataflow::channels::wake::WakeHandle;
 use crate::dataflow::control::{ControlReceiver, ControlSender, WorkerControl};
 use crate::dataflow::graph::DataflowGraph;
-use crate::dataflow::probe::{AttachedProbe, ProbeRegistration};
+use crate::dataflow::probe::ErasedProbe;
 use crate::dataflow::schedulable::{
     ActivationOutcome, ChannelEndpoints, ChannelFactory, OperatorFactory, SchedulableOperator,
     group_by_port,
@@ -521,10 +521,6 @@ pub struct DataflowExecutor<T: Timestamp = u64> {
     /// Per-operator notificators, indexed by position in `operators` vec.
     /// Only populated when a progress tracker is attached.
     notificators: Vec<Option<Notificator<T>>>,
-    /// Registered probes, each observing one stream (an operator output).
-    /// Updated during progress propagation with the stream's frontier; drained
-    /// (and told the executor finished) on completion.
-    probes: Vec<AttachedProbe<T>>,
     /// Number of external input sources still open (e.g., channel-based inputs
     /// fed by the caller via `DataflowHandle`). While > 0, the executor will
     /// not declare quiescence — it waits for external data instead.
@@ -871,7 +867,6 @@ impl<T: Timestamp> DataflowExecutor<T> {
             cancel,
             progress_tracker: None,
             notificators: Vec::new(),
-            probes: Vec::new(),
             external_inputs_open: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             wake_handle,
             consecutive_idle: 0,
@@ -984,31 +979,45 @@ impl<T: Timestamp> DataflowExecutor<T> {
     /// Register a probe observing the stream at `registration.operator`'s
     /// output `registration.output`.
     ///
-    /// The probe's frontier is updated during each progress propagation step
-    /// with the stream's frontier (see [`ProgressTracker::stream_frontier`]).
-    /// `writers` is the number of workers that run the probed operator
+    /// The progress scope that counts the stream (the root, or the loop body
+    /// the stream is in) updates the probe with the stream's frontier, in its
+    /// own time, on every propagation (see
+    /// [`ProgressTracker::stream_frontier`]). `writers` is the number of
+    /// workers that run the probed operator
     /// ([`PhysicalPlan::probe_writers`](crate::dataflow::plan::PhysicalPlan::probe_writers));
     /// the probe uses it to decide whether its writers cover every worker.
     /// On registration, the probe is immediately seeded with the current frontier.
-    pub(crate) fn register_probe(&mut self, registration: &ProbeRegistration<T>, writers: usize) {
-        let mut probe = AttachedProbe::new(registration, writers);
-        if let Some(ref tracker) = self.progress_tracker {
-            probe
-                .writer
-                .update(&tracker.stream_frontier(probe.operator, probe.output));
+    pub(crate) fn register_probe(
+        &mut self,
+        registration: &ErasedProbe,
+        writers: usize,
+    ) -> Result<()> {
+        let tracker = self.progress_tracker.as_mut().ok_or_else(|| {
+            Error::Dataflow(DataflowError::InvalidGraph(
+                "a probe needs the executor's progress tracker".into(),
+            ))
+        })?;
+        if tracker.register_probe(
+            registration.operator,
+            registration.output,
+            registration.registration.as_ref(),
+            writers,
+        ) {
+            Ok(())
+        } else {
+            Err(Error::Dataflow(DataflowError::InvalidGraph(format!(
+                "no progress scope counts the stream probed at output {} of operator {}",
+                registration.output, registration.operator
+            ))))
         }
-        self.probes.push(probe);
     }
 
-    /// Reports this executor's completion to its probes (once).
+    /// Reports this executor's success to its probes (once): every probe
+    /// finishes with an empty frontier, as the worker retired with nothing
+    /// left in its scope.
     fn finish_probes(&mut self) {
-        if self.probes.is_empty() {
-            return;
-        }
-        let tracker = self.progress_tracker.as_ref();
-        for mut probe in self.probes.drain(..) {
-            let last = tracker.map(|tracker| tracker.stream_frontier(probe.operator, probe.output));
-            probe.writer.finish(last.as_ref());
+        if let Some(tracker) = &mut self.progress_tracker {
+            tracker.finish_probes(true);
         }
     }
 
@@ -1189,17 +1198,30 @@ impl<T: Timestamp> DataflowExecutor<T> {
 
         let dirty: Vec<usize> = tracker.propagate()?.to_vec();
 
-        // Collect frontier updates for dirty operators before releasing tracker borrow.
+        // Collect frontier updates for dirty operators before releasing
+        // tracker borrow. Each operator's inputs are counted by one progress
+        // scope (the root, or the loop body it is in), so its frontiers come
+        // type-erased, in that scope's time.
         #[allow(clippy::type_complexity)]
-        let frontier_updates: Vec<(usize, _, Vec<Antichain<T>>)> = dirty
+        let frontier_updates: Vec<(
+            usize,
+            Box<dyn std::any::Any + Send>,
+            Vec<Box<dyn std::any::Any + Send>>,
+            Option<String>,
+        )> = dirty
             .iter()
             .filter_map(|&op_idx| {
                 if op_idx < self.index_to_pos.len() {
                     let pos = self.index_to_pos[op_idx];
                     if pos != usize::MAX && pos < self.operators.len() {
-                        let frontier = tracker.operator_input_frontier_meet(op_idx);
-                        let ports = tracker.operator_input_frontiers(op_idx);
-                        return Some((pos, frontier, ports));
+                        let meet = tracker.input_meet_any(op_idx)?;
+                        let ports = tracker.input_frontiers_any(op_idx).unwrap_or_default();
+                        let debug = self
+                            .config
+                            .frontier_timeline
+                            .then(|| tracker.input_debug(op_idx))
+                            .flatten();
+                        return Some((pos, meet, ports, debug));
                     }
                 }
                 None
@@ -1208,23 +1230,22 @@ impl<T: Timestamp> DataflowExecutor<T> {
 
         // Apply frontier updates to:
         // 1. Executor-owned notificators (legacy path, for operators that don't
-        //    override update_input_frontier — i.e., regular unary/binary operators).
-        // 2. The operators themselves (for notify-capable operators that manage
-        //    their own internal notificator). The default implementation is a no-op,
-        //    so this is safe to call on all operators.
-        for (pos, frontier, ports) in &frontier_updates {
-            // Legacy path: executor-owned notificator
-            if *pos < self.notificators.len() {
-                if let Some(notificator) = &mut self.notificators[*pos] {
-                    notificator.update_frontier(frontier);
+        //    override update_input_frontier; root-scope operators only).
+        // 2. The operators themselves: every input port's frontier, and the
+        //    meet for operator-owned notificators (the operator downcasts the
+        //    `&dyn Any` to its own time).
+        for (pos, meet, ports, _) in &frontier_updates {
+            if let Some(frontier) = meet.downcast_ref::<Antichain<T>>() {
+                if *pos < self.notificators.len() {
+                    if let Some(notificator) = &mut self.notificators[*pos] {
+                        notificator.update_frontier(frontier);
+                    }
                 }
             }
             for (port, port_frontier) in ports.iter().enumerate() {
-                self.operators[*pos].update_port_frontier(port, port_frontier);
+                self.operators[*pos].update_port_frontier(port, port_frontier.as_ref());
             }
-            // New path: operator-owned notificator (WiredUnaryNotifyOperator etc.)
-            // The operator downcasts &dyn Any to &Antichain<T> internally.
-            self.operators[*pos].update_input_frontier(frontier);
+            self.operators[*pos].update_input_frontier(meet.as_ref());
         }
 
         // Record frontier events for dirty operators when frontier timeline is enabled.
@@ -1232,9 +1253,11 @@ impl<T: Timestamp> DataflowExecutor<T> {
         // be marked for output-frontier-only changes).
         if self.config.frontier_timeline {
             if let Some(ref tc) = self.timeline_collector {
-                for (pos, frontier, _) in &frontier_updates {
+                for (pos, _, _, debug) in &frontier_updates {
                     let pos = *pos;
-                    let s = format!("{:?}", frontier);
+                    let Some(s) = debug.clone() else {
+                        continue;
+                    };
                     if pos < self.last_recorded_frontiers.len()
                         && self.last_recorded_frontiers[pos] != s
                     {
@@ -1320,21 +1343,6 @@ impl<T: Timestamp> DataflowExecutor<T> {
             }
         }
 
-        // Update registered probes with the frontiers of their streams. Every
-        // view is seeded with every worker's initial capabilities (A4), so it
-        // is never missing a peer's initial state.
-        if !self.probes.is_empty() {
-            let tracker = self.progress_tracker.as_ref().ok_or_else(|| {
-                Error::Dataflow(DataflowError::InvalidGraph(
-                    "progress tracker missing while probes are registered".into(),
-                ))
-            })?;
-            for probe in &mut self.probes {
-                let frontier = tracker.stream_frontier(probe.operator, probe.output);
-                probe.writer.update(&frontier);
-            }
-        }
-
         Ok(activated)
     }
 
@@ -1359,10 +1367,7 @@ impl<T: Timestamp> DataflowExecutor<T> {
                 continue;
             }
             let ready = match &self.progress_tracker {
-                Some(tracker) => tracker
-                    .operator_input_frontiers(self.operators[pos].index())
-                    .iter()
-                    .all(Antichain::is_empty),
+                Some(tracker) => tracker.inputs_empty(self.operators[pos].index()),
                 None => self.operators[pos].exhausted(),
             };
             if ready {
@@ -2177,7 +2182,6 @@ mod tests {
                 cancel: CancellationToken::new(),
                 progress_tracker: None,
                 notificators: Vec::new(),
-                probes: Vec::new(),
                 external_inputs_open: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
                 wake_handle: WakeHandle::new(),
                 consecutive_idle: 0,
@@ -2292,7 +2296,6 @@ mod tests {
             cancel: CancellationToken::new(),
             progress_tracker: None,
             notificators: Vec::new(),
-            probes: Vec::new(),
             external_inputs_open: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             wake_handle: WakeHandle::new(),
             consecutive_idle: 0,
@@ -2342,7 +2345,6 @@ mod tests {
             cancel,
             progress_tracker: None,
             notificators: Vec::new(),
-            probes: Vec::new(),
             external_inputs_open: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             wake_handle: WakeHandle::new(),
             consecutive_idle: 0,
@@ -2396,7 +2398,6 @@ mod tests {
             cancel: CancellationToken::new(),
             progress_tracker: None,
             notificators: Vec::new(),
-            probes: Vec::new(),
             external_inputs_open: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             wake_handle: WakeHandle::new(),
             consecutive_idle: 0,
@@ -2438,7 +2439,6 @@ mod tests {
             cancel: CancellationToken::new(),
             progress_tracker: None,
             notificators: Vec::new(),
-            probes: Vec::new(),
             external_inputs_open: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             wake_handle: WakeHandle::new(),
             consecutive_idle: 0,
@@ -2514,7 +2514,6 @@ mod tests {
             cancel: CancellationToken::new(),
             progress_tracker: None,
             notificators: Vec::new(),
-            probes: Vec::new(),
             external_inputs_open: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             wake_handle: WakeHandle::new(),
             consecutive_idle: 0,
@@ -2595,7 +2594,6 @@ mod tests {
             cancel: CancellationToken::new(),
             progress_tracker: None,
             notificators: Vec::new(),
-            probes: Vec::new(),
             external_inputs_open: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             wake_handle: WakeHandle::new(),
             consecutive_idle: 0,
@@ -2663,7 +2661,6 @@ mod tests {
             cancel: CancellationToken::new(),
             progress_tracker: None,
             notificators: Vec::new(),
-            probes: Vec::new(),
             external_inputs_open: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             wake_handle: WakeHandle::new(),
             consecutive_idle: 0,
@@ -2717,7 +2714,6 @@ mod tests {
             cancel: CancellationToken::new(),
             progress_tracker: None,
             notificators: vec![Some(Notificator::new(Antichain::from_elem(0u64)))],
-            probes: Vec::new(),
             external_inputs_open: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             wake_handle: WakeHandle::new(),
             consecutive_idle: 0,
@@ -2784,7 +2780,6 @@ mod tests {
             cancel: CancellationToken::new(),
             progress_tracker: None,
             notificators: vec![Some(Notificator::new(Antichain::new()))],
-            probes: Vec::new(),
             external_inputs_open: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             wake_handle: WakeHandle::new(),
             consecutive_idle: 0,
@@ -2844,7 +2839,6 @@ mod tests {
             cancel: CancellationToken::new(),
             progress_tracker: None,
             notificators: Vec::new(),
-            probes: Vec::new(),
             external_inputs_open: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             wake_handle: WakeHandle::new(),
             consecutive_idle: 0,
@@ -2926,7 +2920,6 @@ mod tests {
             cancel: CancellationToken::new(),
             progress_tracker: None,
             notificators: Vec::new(),
-            probes: Vec::new(),
             external_inputs_open: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(1)),
             wake_handle: WakeHandle::new(),
             consecutive_idle: 0,
@@ -3021,7 +3014,6 @@ mod tests {
             cancel: CancellationToken::new(),
             progress_tracker: None,
             notificators: Vec::new(),
-            probes: Vec::new(),
             external_inputs_open: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(1)),
             wake_handle: WakeHandle::new(),
             consecutive_idle: 0,
@@ -3090,7 +3082,6 @@ mod tests {
             cancel,
             progress_tracker: None,
             notificators: Vec::new(),
-            probes: Vec::new(),
             external_inputs_open: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             wake_handle: WakeHandle::new(),
             consecutive_idle: 0,
@@ -3532,7 +3523,6 @@ mod tests {
             cancel: CancellationToken::new(),
             progress_tracker: None,
             notificators: Vec::new(),
-            probes: Vec::new(),
             external_inputs_open: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             wake_handle: wake_handle.clone(),
             consecutive_idle: 0,
@@ -3613,7 +3603,6 @@ mod tests {
             cancel: CancellationToken::new(),
             progress_tracker: None,
             notificators: Vec::new(),
-            probes: Vec::new(),
             external_inputs_open: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             wake_handle: WakeHandle::new(),
             consecutive_idle: 0,
@@ -3669,7 +3658,6 @@ mod tests {
             cancel: CancellationToken::new(),
             progress_tracker: None,
             notificators: Vec::new(),
-            probes: Vec::new(),
             external_inputs_open: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             wake_handle: WakeHandle::new(),
             consecutive_idle: 0,
@@ -3737,7 +3725,6 @@ mod tests {
             cancel: CancellationToken::new(),
             progress_tracker: None,
             notificators: Vec::new(),
-            probes: Vec::new(),
             external_inputs_open: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             wake_handle: WakeHandle::new(),
             consecutive_idle: 0,
@@ -3794,7 +3781,6 @@ mod tests {
             cancel: CancellationToken::new(),
             progress_tracker: None,
             notificators: Vec::new(),
-            probes: Vec::new(),
             external_inputs_open: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             wake_handle: WakeHandle::new(),
             consecutive_idle: 0,
@@ -3850,7 +3836,6 @@ mod tests {
             cancel,
             progress_tracker: None,
             notificators: Vec::new(),
-            probes: Vec::new(),
             external_inputs_open: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             wake_handle: WakeHandle::new(),
             consecutive_idle: 0,
@@ -3906,7 +3891,6 @@ mod tests {
             cancel: CancellationToken::new(),
             progress_tracker: None,
             notificators: Vec::new(),
-            probes: Vec::new(),
             external_inputs_open: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             wake_handle: WakeHandle::new(),
             consecutive_idle: 0,
@@ -3997,7 +3981,6 @@ mod tests {
             cancel: CancellationToken::new(),
             progress_tracker: None,
             notificators: Vec::new(),
-            probes: Vec::new(),
             external_inputs_open: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             wake_handle: WakeHandle::new(),
             consecutive_idle: 0,
@@ -4066,7 +4049,6 @@ mod tests {
             cancel: CancellationToken::new(),
             progress_tracker: None,
             notificators: Vec::new(),
-            probes: Vec::new(),
             external_inputs_open: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             wake_handle: WakeHandle::new(),
             consecutive_idle: 0,
@@ -4133,7 +4115,6 @@ mod tests {
             cancel: CancellationToken::new(),
             progress_tracker: None,
             notificators: Vec::new(),
-            probes: Vec::new(),
             external_inputs_open: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             wake_handle: WakeHandle::new(),
             consecutive_idle: 0,
@@ -4203,7 +4184,6 @@ mod tests {
             cancel: CancellationToken::new(),
             progress_tracker: None,
             notificators: Vec::new(),
-            probes: Vec::new(),
             external_inputs_open: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             wake_handle: WakeHandle::new(),
             consecutive_idle: 0,
@@ -4287,7 +4267,6 @@ mod tests {
             cancel: CancellationToken::new(),
             progress_tracker: None,
             notificators: Vec::new(),
-            probes: Vec::new(),
             external_inputs_open: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             wake_handle: WakeHandle::new(),
             consecutive_idle: 0,
@@ -4344,7 +4323,6 @@ mod tests {
             cancel: CancellationToken::new(),
             progress_tracker: None,
             notificators: Vec::new(),
-            probes: Vec::new(),
             external_inputs_open: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             wake_handle: WakeHandle::new(),
             consecutive_idle: 0,

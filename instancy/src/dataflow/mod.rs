@@ -27,7 +27,7 @@ pub use channels::{ControlSignal, Envelope, PartitionStrategy, Payload};
 pub use context::SharedContext;
 pub use control::{ControlReceiver, ControlSender, WorkerControl};
 pub use dataflow_builder::{
-    DataflowBuilder, DataflowBuilderConfig, LogicalDataflow, OutputPort, Pipe,
+    DataflowBuilder, DataflowBuilderConfig, IterateInner, LogicalDataflow, OutputPort, Pipe,
 };
 pub use executor::{DataflowExecutor, ExecutorConfig};
 pub use graph::{ChannelKind, DataflowGraph, Delivery, EdgeInfo, OperatorInfo};

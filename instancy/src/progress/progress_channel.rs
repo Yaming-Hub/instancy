@@ -107,9 +107,48 @@ impl<T> ProgressChange<T> {
     }
 }
 
+/// One commit of one worker: the root scope's changes, plus one section per
+/// nested (loop) scope that changed, each a `Vec<ProgressChange<_>>` of that
+/// scope's time. A commit's sections always travel together, so a receiver
+/// applies all of them before any scope propagates (design §5.1.7).
+#[derive(Clone)]
+pub(crate) struct ProgressBatch<T> {
+    /// The root scope's changes.
+    pub(crate) root: Vec<ProgressChange<T>>,
+    /// `(scope id, Vec<ProgressChange<scope time>>)` per nested scope.
+    pub(crate) scopes: Vec<(usize, Arc<dyn std::any::Any + Send + Sync>)>,
+}
+
+impl<T> ProgressBatch<T> {
+    /// A batch of root-scope changes only.
+    pub(crate) fn flat(root: Vec<ProgressChange<T>>) -> Self {
+        Self {
+            root,
+            scopes: Vec::new(),
+        }
+    }
+
+    /// Whether the batch changes nothing.
+    pub(crate) fn is_empty(&self) -> bool {
+        self.root.is_empty() && self.scopes.is_empty()
+    }
+}
+
+impl<T: std::fmt::Debug> std::fmt::Debug for ProgressBatch<T> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ProgressBatch")
+            .field("root", &self.root)
+            .field(
+                "scopes",
+                &self.scopes.iter().map(|(s, _)| *s).collect::<Vec<_>>(),
+            )
+            .finish()
+    }
+}
+
 /// Shared buffer between a sender/receiver pair.
 pub(crate) struct SharedBuffer<T> {
-    pub(crate) queue: VecDeque<Vec<ProgressChange<T>>>,
+    pub(crate) queue: VecDeque<ProgressBatch<T>>,
 }
 
 /// Sends progress updates to a single peer worker.
@@ -138,7 +177,7 @@ pub(crate) enum SenderInner<T: Timestamp> {
         /// Captures the codec, channel IDs, and unbounded sender at
         /// construction time so ProgressSender<T> doesn't require
         /// T: ExchangeData.
-        send_fn: Box<dyn Fn(Vec<ProgressChange<T>>) + Send + Sync>,
+        send_fn: Box<dyn Fn(ProgressBatch<T>) + Send + Sync>,
     },
 }
 
@@ -188,6 +227,11 @@ impl<T: Timestamp> ProgressSender<T> {
     /// unbounded channel for reliable delivery. The send never fails
     /// (unless the bridge task has exited, which indicates a fatal error).
     pub fn send(&self, changes: Vec<ProgressChange<T>>) {
+        self.send_batch(ProgressBatch::flat(changes));
+    }
+
+    /// Send one commit (every scope's section) to the peer.
+    pub(crate) fn send_batch(&self, changes: ProgressBatch<T>) {
         if changes.is_empty() {
             return;
         }
@@ -225,11 +269,8 @@ impl<T: Timestamp> ProgressReceiver<T> {
         Self { buffer }
     }
 
-    /// Drain all queued progress batches from this peer.
-    ///
-    /// Returns an iterator over batches in FIFO order.
-    /// Each batch is a `Vec<ProgressChange<T>>` as sent by the peer.
-    pub fn drain_all(&self) -> crate::Result<Vec<Vec<ProgressChange<T>>>> {
+    /// Drain all queued progress batches from this peer, in FIFO order.
+    pub(crate) fn drain_all(&self) -> crate::Result<Vec<ProgressBatch<T>>> {
         let mut buf = self.buffer.lock().or_poison("progress channel")?;
         Ok(buf.queue.drain(..).collect())
     }
@@ -320,8 +361,14 @@ mod tests {
         let w1 = &channels[1];
         let batches = w1.receivers[0].as_ref().unwrap().drain_all().unwrap();
         assert_eq!(batches.len(), 2);
-        assert_eq!(batches[0], vec![ProgressChange::source(0, 0, 42u64, 1)]);
-        assert_eq!(batches[1], vec![ProgressChange::source(0, 0, 42u64, -1)]);
+        assert_eq!(
+            batches[0].root,
+            vec![ProgressChange::source(0, 0, 42u64, 1)]
+        );
+        assert_eq!(
+            batches[1].root,
+            vec![ProgressChange::source(0, 0, 42u64, -1)]
+        );
     }
 
     #[test]
@@ -357,7 +404,7 @@ mod tests {
             .unwrap();
         assert_eq!(batches.len(), 10);
         for (i, batch) in batches.iter().enumerate() {
-            assert_eq!(batch[0].time, i as u64);
+            assert_eq!(batch.root[0].time, i as u64);
         }
     }
 

@@ -44,7 +44,7 @@ use crate::dataflow::graph::DataflowGraph;
 use crate::dataflow::operators::handles::{InputHandle, NotifyContext, OutputHandle};
 use crate::dataflow::operators::input::InputEvent;
 use crate::dataflow::operators::output::OutputEvent;
-use crate::dataflow::probe::{ProbeHandle, ProbeRegistration};
+use crate::dataflow::probe::{ErasedProbe, ProbeHandle, ProbeRegistration};
 use crate::dataflow::schedulable::{ChannelEndpoints, ChannelFactory, OperatorFactory};
 use crate::dataflow::stage::StageId;
 use crate::dataflow::stream::Slot;
@@ -55,7 +55,7 @@ use crate::progress::change_batch::ChangeBatch;
 use crate::progress::frontier::Antichain;
 use crate::progress::operate::{PortConnectivity, ProgressReporter};
 use crate::progress::reachability::Location;
-use crate::progress::subgraph::SubgraphBuilder;
+use crate::progress::subgraph::{LoopBuilder, PortAt, Side, SubgraphBuilder};
 use crate::progress::timestamp::Timestamp;
 
 // ---------------------------------------------------------------------------
@@ -110,9 +110,9 @@ struct BuilderState<T: Timestamp> {
     /// ChannelSourceOperator + pump task at spawn time.
     /// Tuple: (operator_index, wiring_closure).
     async_source_wiring: Vec<(usize, AsyncSourceWiring)>,
-    /// Probes attached to streams of this scope (including probes declared in
-    /// nested `iterate` bodies, lifted to this scope's timestamp).
-    probes: Vec<ProbeRegistration<T>>,
+    /// Probes attached to streams of this scope and of nested `iterate`
+    /// bodies, each in its own scope's timestamp.
+    probes: Vec<ErasedProbe>,
     /// Type-erased exchange factory creators — one per exchange edge.
     /// Tuple: (edge_index, capacity, creator_fn).
     exchange_creators: Vec<(
@@ -149,6 +149,12 @@ struct BuilderState<T: Timestamp> {
     /// timestamp. `None` at the root; set for `iterate` bodies so outputs
     /// declared inside a loop report at the root timestamp.
     root_time_projector: Option<RootTimeProjector<T>>,
+    /// The next progress scope id (shared by every nested builder of the
+    /// dataflow: loops get ids 1, 2, ... in the order they are built).
+    scope_counter: Rc<std::cell::Cell<usize>>,
+    /// The progress checker's oracle constructor of every nested scope.
+    #[cfg(any(debug_assertions, feature = "progress-check"))]
+    check_scopes: Vec<(usize, crate::progress::check::ScopeOracleFn)>,
     /// Errors encountered during graph construction. Checked in `build()`.
     builder_errors: Vec<Error>,
     /// Forced activation strategy (progress-checker test knob).
@@ -167,6 +173,25 @@ struct BuilderState<T: Timestamp> {
 
 /// Projects a timestamp onto the dataflow's root timestamp, type-erased.
 type RootTimeProjector<T> = Arc<dyn Fn(&T) -> Box<dyn std::any::Any + Send> + Send + Sync>;
+
+/// The inner timestamp of an [`iterate`](Pipe::iterate) loop (its iteration
+/// counter, typically `u32` or `u64`).
+///
+/// With the `transport` feature, a loop's progress may cross the network on
+/// a cluster, so its inner timestamp must also be
+/// [`ExchangeData`](crate::communication::codec::ExchangeData), like the
+/// timestamps of exchanged data.
+#[cfg(feature = "transport")]
+pub trait IterateInner: Timestamp + crate::communication::codec::ExchangeData {}
+#[cfg(feature = "transport")]
+impl<T: Timestamp + crate::communication::codec::ExchangeData> IterateInner for T {}
+
+/// The inner timestamp of an [`iterate`](Pipe::iterate) loop (its iteration
+/// counter, typically `u32` or `u64`).
+#[cfg(not(feature = "transport"))]
+pub trait IterateInner: Timestamp {}
+#[cfg(not(feature = "transport"))]
+impl<T: Timestamp> IterateInner for T {}
 
 /// Type-erased closure for wiring an input port during spawn().
 /// Captures the data type D and creates:
@@ -334,6 +359,9 @@ impl<T: Timestamp> DataflowBuilder<T> {
                 catch_panics: false,
                 max_idle_sweeps: None,
                 root_time_projector: None,
+                scope_counter: Rc::new(std::cell::Cell::new(1)),
+                #[cfg(any(debug_assertions, feature = "progress-check"))]
+                check_scopes: Vec::new(),
                 builder_errors: Vec::new(),
                 #[cfg(any(debug_assertions, feature = "progress-check"))]
                 check_activation: None,
@@ -1015,6 +1043,12 @@ impl<T: Timestamp> DataflowBuilder<T> {
             return Err(err);
         }
 
+        // Every loop's node in its parent's progress scope gets an id after
+        // every operator's (R38 C1).
+        state
+            .subgraph_builder
+            .assign_scope_nodes(state.next_operator_index);
+
         // Validate the graph for structural correctness (missing endpoints,
         // port bounds, duplicate edges, cycles outside feedback scopes).
         state.graph.validate()?;
@@ -1031,6 +1065,8 @@ impl<T: Timestamp> DataflowBuilder<T> {
             output_port_wiring: state.output_port_wiring,
             async_source_wiring: state.async_source_wiring,
             probes: state.probes,
+            #[cfg(any(debug_assertions, feature = "progress-check"))]
+            check_scopes: state.check_scopes,
             exchange_creators: state.exchange_creators,
             #[cfg(feature = "transport")]
             exchange_network_creators: state.exchange_network_creators,
@@ -1123,6 +1159,10 @@ impl<T: Timestamp, D: Clone + Send + 'static> Pipe<T, D> {
     /// `filter`, `unary`, `binary`, `output`, `exchange`, etc.) and is
     /// **not** propagated further. Methods that do not create an edge
     /// (e.g., `probe`) pass the override through unchanged.
+    ///
+    /// A loop's back-edge is never bounded: a capacity set on the pipe an
+    /// [`iterate`](Self::iterate) body returns as `feedback` does not apply to
+    /// it (see `iterate`'s "Backpressure").
     ///
     /// # Panics
     ///
@@ -2212,22 +2252,33 @@ impl<T: Timestamp, D: Clone + Send + 'static> Pipe<T, D> {
     ///
     /// # Nested scopes
     ///
-    /// Loop bodies may contain further `iterate` scopes, probes and named
-    /// outputs. A named output inside a body delivers each batch at the
-    /// dataflow's outer timestamp. A probe inside a body stays at the minimum
-    /// time until the workers writing it have completed (see
-    /// [`probe`](Self::probe)): progress tracking cannot yet see data
-    /// circulating on the feedback edge, so no earlier answer would be safe.
+    /// A loop is its own progress scope, in `Product<T, TInner>` time. Loop
+    /// bodies may contain further `iterate` scopes, probes, `retain` and named
+    /// outputs:
     ///
-    /// # Limitations
+    /// - a probe inside a body observes the body's own frontiers, in
+    ///   `Product<T, TInner>` time: it passes `(e, i)` once nothing at or
+    ///   before it can still reach the probed stream, including records still
+    ///   circulating on the feedback edge;
+    /// - `retain` and `unary_notify` inside a body hold and wait on the
+    ///   body's frontiers too;
+    /// - a named output inside a body delivers each batch at the dataflow's
+    ///   outer timestamp.
     ///
-    /// Only `map`/`filter`-style unary operators (and the loop's internal
-    /// concat) record the sending side of the in-flight accounting for an
-    /// `exchange` they feed. When any other operator feeds an `exchange` (for
-    /// example a loop's output, or `reduce`/`unary_notify`, `binary`,
-    /// `concat` or a source inside a loop body), a multi-worker loop may never
-    /// be recognized as complete and the dataflow may not terminate. Insert a
-    /// `map` in front of such an exchange.
+    /// Outside the loop, the loop's output frontier holds each outer time
+    /// until no record of that time remains anywhere in the loop.
+    ///
+    /// `summary` must advance the iteration counter: a loop whose summary
+    /// does not (for example `0u32`) would be an identity cycle, whose
+    /// frontier could never advance, and the dataflow fails to build.
+    ///
+    /// # Backpressure
+    ///
+    /// Every channel of a loop is bounded, except its back-edge (into the loop
+    /// from the pipe returned as `feedback`), which never pushes back:
+    /// otherwise a loop whose channels are all full could deadlock. A capacity
+    /// set on the `feedback` pipe does not bound it. Records circulating in a
+    /// loop are bounded by the loop's own working set.
     ///
     /// # Example
     /// ```ignore
@@ -2245,8 +2296,7 @@ impl<T: Timestamp, D: Clone + Send + 'static> Pipe<T, D> {
         body: impl FnOnce(Pipe<Product<T, TInner>, D>) -> IterateResult<Product<T, TInner>, D>,
     ) -> Pipe<T, D>
     where
-        TInner: Timestamp,
-        Product<T, TInner>: Timestamp,
+        TInner: IterateInner,
     {
         let name = name.into();
         let stage_id = StageId::new(0);
@@ -2257,8 +2307,7 @@ impl<T: Timestamp, D: Clone + Send + 'static> Pipe<T, D> {
         let prealloc = self.state.borrow().channel_preallocate;
 
         // Projects a loop-body time onto the dataflow's root time (through
-        // every enclosing loop). Used by outputs inside the body and by the
-        // progress checker for the loop's channels.
+        // every enclosing loop), for outputs declared inside the body.
         let inner_projector: RootTimeProjector<PT<T, TInner>> =
             match self.state.borrow().root_time_projector.clone() {
                 Some(project) => Arc::new(move |time: &PT<T, TInner>| project(&time.outer)),
@@ -2267,8 +2316,30 @@ impl<T: Timestamp, D: Clone + Send + 'static> Pipe<T, D> {
                 }),
             };
 
-        // Phase 1: Allocate enter, feedback, concat operators in parent state.
-        // We also create a separate inner BuilderState for the loop body.
+        // A summary that does not advance the iteration counter makes the
+        // loop an identity cycle (R38 C5).
+        if crate::order::PartialOrder::less_equal(&summary, &TInner::Summary::default()) {
+            self.state.borrow_mut().builder_errors.push(Error::Dataflow(
+                DataflowError::InvalidConfig(format!(
+                    "iterate '{name}': its summary {summary:?} does not advance the iteration \
+                     counter, so records could circulate at the same time forever and the \
+                     loop's frontier could never advance; use a summary that advances it \
+                     (for example 1)"
+                )),
+            ));
+        }
+
+        // The loop's progress scope (identical ids on every worker).
+        let scope_id = {
+            let state = self.state.borrow();
+            let id = state.scope_counter.get();
+            state.scope_counter.set(id + 1);
+            id
+        };
+
+        // Phase 1: Allocate the loop's operators. The data graph stays flat;
+        // progress is nested: enter's input and leave's output are counted
+        // at the loop's node in this scope, everything else in the loop's.
         let enter_idx;
         let feedback_idx;
         let concat_idx;
@@ -2299,19 +2370,18 @@ impl<T: Timestamp, D: Clone + Send + 'static> Pipe<T, D> {
                 stage_id,
                 stage_id,
             ));
-            // Subgraph registration for enter
-            if let Err(e) = state.subgraph_builder.add_operator(
+            // In this scope, enter's input is the loop node's input.
+            state
+                .subgraph_builder
+                .add_port_owner(enter_idx, format!("{name}::enter"), 1, 1);
+            state.subgraph_builder.map_port(
+                Side::Input,
                 enter_idx,
-                format!("{name}::enter"),
-                1,
-                1,
-                PortConnectivity::identity(T::Summary::default()),
-            ) {
-                state.builder_errors.push(e);
-            }
-            state.subgraph_builder.add_edge(
-                Location::source(self.op_idx, self.output_slot),
-                Location::target(enter_idx, 0),
+                0,
+                PortAt::ScopeNode {
+                    scope: scope_id,
+                    port: 0,
+                },
             );
 
             // Enter operator factory
@@ -2359,16 +2429,6 @@ impl<T: Timestamp, D: Clone + Send + 'static> Pipe<T, D> {
             state
                 .graph
                 .set_operator_kind(feedback_idx, "iterate_feedback");
-            // Subgraph registration for feedback
-            if let Err(e) = state.subgraph_builder.add_operator(
-                feedback_idx,
-                format!("{name}::feedback"),
-                1,
-                1,
-                PortConnectivity::identity(T::Summary::default()),
-            ) {
-                state.builder_errors.push(e);
-            }
 
             // Feedback operator factory
             let fb_name = format!("{name}::feedback");
@@ -2421,32 +2481,6 @@ impl<T: Timestamp, D: Clone + Send + 'static> Pipe<T, D> {
             ));
             let fb_concat_edge_idx = state.graph.edges().len() - 1;
 
-            // Subgraph for concat
-            let mut concat_connectivity = PortConnectivity::new(2, 1);
-            concat_connectivity
-                .path_mut(0, 0)
-                .insert(T::Summary::default());
-            concat_connectivity
-                .path_mut(1, 0)
-                .insert(T::Summary::default());
-            if let Err(e) = state.subgraph_builder.add_operator(
-                concat_idx,
-                format!("{name}::concat"),
-                2,
-                1,
-                concat_connectivity,
-            ) {
-                state.builder_errors.push(e);
-            }
-            state.subgraph_builder.add_edge(
-                Location::source(enter_idx, 0),
-                Location::target(concat_idx, 0),
-            );
-            state.subgraph_builder.add_edge(
-                Location::source(feedback_idx, 0),
-                Location::target(concat_idx, 1),
-            );
-
             // Concat operator factory
             let concat_name = format!("{name}::concat");
             let concat_factory: OperatorFactory =
@@ -2460,7 +2494,7 @@ impl<T: Timestamp, D: Clone + Send + 'static> Pipe<T, D> {
                 });
             state.operator_factories.push((concat_idx, concat_factory));
 
-            // Channel factories for concat inputs
+            // Channel factories for concat inputs (in the loop's scope).
             let cap = capacity;
             let cf1: ChannelFactory = ChannelFactory::new(move |_ctx, wake: Option<WakeHandle>| {
                 let (push, pull) =
@@ -2470,7 +2504,7 @@ impl<T: Timestamp, D: Clone + Send + 'static> Pipe<T, D> {
                     Box::new(pull) as Box<dyn Pull<PT<T, TInner>, D>>,
                 ))
             })
-            .with_check_projector(&inner_projector);
+            .with_check_scope(scope_id);
             state.channel_factories.push((enter_concat_edge_idx, cf1));
 
             let cap = capacity;
@@ -2482,7 +2516,7 @@ impl<T: Timestamp, D: Clone + Send + 'static> Pipe<T, D> {
                     Box::new(pull) as Box<dyn Pull<PT<T, TInner>, D>>,
                 ))
             })
-            .with_check_projector(&inner_projector);
+            .with_check_scope(scope_id);
             state.channel_factories.push((fb_concat_edge_idx, cf2));
 
             // Leave operator: 1 input (Product<T,TInner>,D), 1 output (T,D)
@@ -2498,31 +2532,89 @@ impl<T: Timestamp, D: Clone + Send + 'static> Pipe<T, D> {
                 ))
                 .unwrap_or_else(|e| state.builder_errors.push(e));
             state.graph.set_operator_kind(leave_idx, "iterate_leave");
-            // Subgraph registration for leave
-            if let Err(e) = state.subgraph_builder.add_operator(
+            // In this scope, leave's output is the loop node's output.
+            state
+                .subgraph_builder
+                .add_port_owner(leave_idx, format!("{name}::leave"), 1, 1);
+            state.subgraph_builder.map_port(
+                Side::Output,
                 leave_idx,
-                format!("{name}::leave"),
-                1,
-                1,
-                PortConnectivity::identity(T::Summary::default()),
-            ) {
-                state.builder_errors.push(e);
-            }
+                0,
+                PortAt::ScopeNode {
+                    scope: scope_id,
+                    port: 0,
+                },
+            );
 
             // Leave factory will be added after we know the output pipe from body
             // For now, record where the inner builder should start
             inner_start_idx = state.next_operator_index;
         }
 
+        // The loop's progress scope: concat, feedback, the body and leave are
+        // its nodes; enter's output is its boundary input `Source(0, 0)`, and
+        // leave feeds its boundary output `Target(0, 0)`.
+        let mut inner_subgraph: SubgraphBuilder<PT<T, TInner>> =
+            SubgraphBuilder::nested(scope_id, 1, 1);
+        inner_subgraph.add_port_owner(enter_idx, format!("{name}::enter"), 1, 1);
+        inner_subgraph.map_port(Side::Output, enter_idx, 0, PortAt::Boundary(0));
+        let mut concat_connectivity = PortConnectivity::new(2, 1);
+        concat_connectivity
+            .path_mut(0, 0)
+            .insert(<PT<T, TInner> as Timestamp>::Summary::default());
+        concat_connectivity
+            .path_mut(1, 0)
+            .insert(<PT<T, TInner> as Timestamp>::Summary::default());
+        let mut feedback_connectivity = PortConnectivity::new(1, 1);
+        feedback_connectivity
+            .path_mut(0, 0)
+            .insert(Product::new(T::Summary::default(), summary.clone()));
+        let registrations = [
+            inner_subgraph
+                .add_operator(
+                    concat_idx,
+                    format!("{name}::concat"),
+                    2,
+                    1,
+                    concat_connectivity,
+                )
+                .map(|_| ()),
+            inner_subgraph
+                .add_operator(
+                    feedback_idx,
+                    format!("{name}::feedback"),
+                    1,
+                    1,
+                    feedback_connectivity,
+                )
+                .map(|_| ()),
+            inner_subgraph
+                .add_operator(
+                    leave_idx,
+                    format!("{name}::leave"),
+                    1,
+                    1,
+                    PortConnectivity::identity(<PT<T, TInner> as Timestamp>::Summary::default()),
+                )
+                .map(|_| ()),
+        ];
+        for result in registrations {
+            if let Err(e) = result {
+                self.state.borrow_mut().builder_errors.push(e);
+            }
+        }
+        inner_subgraph.map_port(Side::Output, leave_idx, 0, PortAt::Elsewhere);
+        inner_subgraph.add_fixed_edge(Location::source(leave_idx, 0), Location::target(0, 0));
         // Phase 2: Create inner builder for loop body and call body closure.
         // Inherit parent context so operators inside loops can access the same
         // context values. SharedContext::clone() is cheap (shares Arc pointers).
         let parent_contexts = self.state.borrow().contexts.clone();
         let parent_collect_index = self.state.borrow().next_collect_index;
+        let scope_counter = Rc::clone(&self.state.borrow().scope_counter);
         let inner_state: Rc<RefCell<BuilderState<Product<T, TInner>>>> =
             Rc::new(RefCell::new(BuilderState {
                 graph: DataflowGraph::new(),
-                subgraph_builder: SubgraphBuilder::new(0, 0),
+                subgraph_builder: inner_subgraph,
                 operator_factories: Vec::new(),
                 channel_factories: Vec::new(),
                 feedback_channel_factories: Vec::new(),
@@ -2543,6 +2635,9 @@ impl<T: Timestamp, D: Clone + Send + 'static> Pipe<T, D> {
                 catch_panics: false,
                 max_idle_sweeps: None,
                 root_time_projector: Some(inner_projector.clone()),
+                scope_counter,
+                #[cfg(any(debug_assertions, feature = "progress-check"))]
+                check_scopes: Vec::new(),
                 builder_errors: Vec::new(),
                 #[cfg(any(debug_assertions, feature = "progress-check"))]
                 check_activation: None,
@@ -2569,7 +2664,6 @@ impl<T: Timestamp, D: Clone + Send + 'static> Pipe<T, D> {
         // Extract info and capacity overrides from result pipes before dropping them
         let feedback_op_idx = result.feedback.op_idx;
         let feedback_output_slot = result.feedback.output_slot;
-        let feedback_capacity = result.feedback.resolve_capacity();
         let output_op_idx = result.output.op_idx;
         let output_output_slot = result.output.output_slot;
         let output_capacity = result.output.resolve_capacity();
@@ -2602,7 +2696,7 @@ impl<T: Timestamp, D: Clone + Send + 'static> Pipe<T, D> {
                 state.next_operator_index = inner.next_operator_index;
             }
 
-            // Merge inner operators into parent graph
+            // Merge inner operators into parent graph (execution stays flat).
             for op in inner.graph.operators() {
                 state
                     .graph
@@ -2624,51 +2718,36 @@ impl<T: Timestamp, D: Clone + Send + 'static> Pipe<T, D> {
                 state.graph.add_feedback_edge(edge.clone());
             }
 
-            // Merge inner subgraph builder operators and edges into parent.
-            // Inner operators use Product<T,TInner> timestamps internally, but for
-            // the parent's progress tracker we register them with identity T::Summary
-            // connectivity (sufficient for activation scheduling).
-            for shape in inner.subgraph_builder.operator_shapes() {
-                let mut conn: PortConnectivity<T::Summary> =
-                    PortConnectivity::new(shape.inputs, shape.outputs);
-                for i in 0..shape.inputs {
-                    for o in 0..shape.outputs {
-                        conn.path_mut(i, o).insert(T::Summary::default());
-                    }
-                }
-                if let Err(e) = state.subgraph_builder.add_operator(
-                    shape.index,
-                    &shape.name,
-                    shape.inputs,
-                    shape.outputs,
-                    conn,
-                ) {
-                    state.builder_errors.push(e);
-                }
-            }
-            for (src, tgt) in inner.subgraph_builder.edges() {
-                state.subgraph_builder.add_edge(src.clone(), tgt.clone());
-            }
-
-            #[cfg(any(debug_assertions, feature = "progress-check"))]
+            // Progress does not merge: the body is the loop's own scope, a
+            // nested scope of this one (design §5.1.7).
             state
                 .subgraph_builder
-                .adopt_loop_check_reporters(&inner.subgraph_builder, &inner_projector);
+                .add_child(Box::new(LoopBuilder::<T, TInner>::new(
+                    inner.subgraph_builder,
+                )));
+            #[cfg(any(debug_assertions, feature = "progress-check"))]
+            {
+                state.check_scopes.push((
+                    scope_id,
+                    crate::progress::check::scope_oracle_fn::<PT<T, TInner>>(scope_id),
+                ));
+                state.check_scopes.extend(inner.check_scopes);
+            }
 
             // Merge factories (offset inner channel factory indices). Every
-            // inner channel carries the loop's time; the checker needs it
-            // projected onto the root time (channels of deeper loops already
-            // have their own projection).
+            // inner channel is in the loop's scope (channels of deeper loops
+            // already have theirs), so the checker observes it with the
+            // loop's oracle, in the loop's time.
             state.operator_factories.extend(inner.operator_factories);
             for (edge_idx, mut factory) in inner.channel_factories {
-                factory.set_check_projector(&inner_projector);
+                factory.set_check_scope(scope_id);
                 state
                     .channel_factories
                     .push((edge_idx + inner_edge_offset, factory));
             }
             // Merge inner feedback channel factories (offset by parent's existing feedback edges)
             for (fb_idx, mut factory) in inner.feedback_channel_factories {
-                factory.set_check_projector(&inner_projector);
+                factory.set_check_scope(scope_id);
                 state
                     .feedback_channel_factories
                     .push((fb_idx + fb_offset, factory));
@@ -2676,9 +2755,8 @@ impl<T: Timestamp, D: Clone + Send + 'static> Pipe<T, D> {
             // Merge inner exchange creators (offset edge indices to match parent graph)
             for (edge_idx, capacity, creator) in inner.exchange_creators {
                 #[cfg(any(debug_assertions, feature = "progress-check"))]
-                let creator = crate::dataflow::channels::exchange_channel::with_check_projector(
-                    creator,
-                    inner_projector.clone(),
+                let creator = crate::dataflow::channels::exchange_channel::with_check_scope(
+                    creator, scope_id,
                 );
                 state
                     .exchange_creators
@@ -2688,11 +2766,9 @@ impl<T: Timestamp, D: Clone + Send + 'static> Pipe<T, D> {
             #[cfg(feature = "transport")]
             for (edge_idx, capacity, creator) in inner.exchange_network_creators {
                 #[cfg(any(debug_assertions, feature = "progress-check"))]
-                let creator =
-                    crate::dataflow::channels::exchange_channel::network_with_check_projector(
-                        creator,
-                        inner_projector.clone(),
-                    );
+                let creator = crate::dataflow::channels::exchange_channel::network_with_check_scope(
+                    creator, scope_id,
+                );
                 state.exchange_network_creators.push((
                     edge_idx + inner_edge_offset,
                     capacity,
@@ -2704,14 +2780,9 @@ impl<T: Timestamp, D: Clone + Send + 'static> Pipe<T, D> {
                 state.graph.set_exchange_parallelism(*op_idx, *par);
             }
             // Carry up what the loop body declared for the runtime: probes
-            // (re-expressed in this scope's timestamp) and output ports (their
-            // sinks already report at the root timestamp).
-            state.probes.extend(
-                inner
-                    .probes
-                    .into_iter()
-                    .map(ProbeRegistration::lift_to_outer),
-            );
+            // (each observes its own scope's frontiers) and output ports
+            // (their sinks already report at the root timestamp).
+            state.probes.extend(inner.probes);
             for (port, wiring) in inner.output_ports.into_iter().zip(inner.output_port_wiring) {
                 if state.output_ports.iter().any(|p| p.name == port.name) {
                     state
@@ -2738,13 +2809,9 @@ impl<T: Timestamp, D: Clone + Send + 'static> Pipe<T, D> {
             ));
             let leave_edge_idx = state.graph.edges().len() - 1;
 
-            // Subgraph edge for leave
-            state.subgraph_builder.add_edge(
-                Location::source(output_op_idx, output_output_slot),
-                Location::target(leave_idx, 0),
-            );
-
-            // Wire feedback: result.feedback → feedback_op input (as feedback edge, not regular)
+            // Wire feedback: result.feedback → feedback_op input (a feedback
+            // edge of the data graph; in the loop's progress scope, an edge
+            // like any other, made acyclic in time by feedback's summary).
             state
                 .graph
                 .add_feedback_edge(crate::dataflow::graph::EdgeInfo::new(
@@ -2754,15 +2821,15 @@ impl<T: Timestamp, D: Clone + Send + 'static> Pipe<T, D> {
                     stage_id,
                 ));
 
-            // NOTE: We do NOT add the feedback edge to subgraph_builder because it's
-            // a back-edge. Adding it would create a cycle in the reachability graph
-            // and prevent termination detection.
-
             // Channel factory for feedback edge.
             // Stored separately; merged with correct indices at build() time.
             // Index by position in feedback_edges (0-based).
             let fb_position = state.graph.feedback_edges().len() - 1;
-            let cap = feedback_capacity;
+            // The back-edge never pushes back. Every cycle of the loop passes
+            // through it, so with bounded channels all around a cycle, each
+            // operator on it could wait for the next to make room, forever.
+            // Records waiting here stay counted at feedback's input.
+            let cap = usize::MAX;
             let cf_fb: ChannelFactory =
                 ChannelFactory::new(move |_ctx, wake: Option<WakeHandle>| {
                     let (push, pull) = bounded_channel_with_wake::<PT<T, TInner>, D, ()>(
@@ -2775,7 +2842,7 @@ impl<T: Timestamp, D: Clone + Send + 'static> Pipe<T, D> {
                         Box::new(pull) as Box<dyn Pull<PT<T, TInner>, D>>,
                     ))
                 })
-                .with_check_projector(&inner_projector);
+                .with_check_scope(scope_id);
             state.feedback_channel_factories.push((fb_position, cf_fb));
 
             // Leave operator factory
@@ -2795,7 +2862,7 @@ impl<T: Timestamp, D: Clone + Send + 'static> Pipe<T, D> {
                 });
             state.operator_factories.push((leave_idx, leave_factory));
 
-            // Channel factory for leave's input edge
+            // Channel factory for leave's input edge (in the loop's scope)
             let cap = output_capacity;
             let cf_leave: ChannelFactory =
                 ChannelFactory::new(move |_ctx, wake: Option<WakeHandle>| {
@@ -2809,7 +2876,7 @@ impl<T: Timestamp, D: Clone + Send + 'static> Pipe<T, D> {
                         Box::new(pull) as Box<dyn Pull<PT<T, TInner>, D>>,
                     ))
                 })
-                .with_check_projector(&inner_projector);
+                .with_check_scope(scope_id);
             state.channel_factories.push((leave_edge_idx, cf_leave));
         }
 
@@ -4109,19 +4176,15 @@ impl<T: Timestamp, D: Clone + Send + 'static> Pipe<T, D> {
     /// In a multi-worker dataflow the probe is monotone and conservative: it
     /// reports the meet of the workers' views.
     ///
+    /// # Probes in and after loops
+    ///
+    /// A probe **inside** an `iterate` body observes the body's own progress
+    /// scope, in `Product<T, TInner>` time: it passes `(e, i)` only once no
+    /// record at or before it can still reach the probed stream, including
+    /// records circulating on the loop's feedback edge. A probe **downstream**
+    /// of a loop holds each epoch until no record of it remains in the loop.
+    ///
     /// # Limitations
-    ///
-    /// Progress tracking cannot yet see data circulating on an `iterate`
-    /// loop's feedback edge:
-    ///
-    /// - A probe **inside** a loop body therefore stays at the minimum time
-    ///   while the dataflow runs, and becomes done once the workers writing it
-    ///   have completed (except in a cluster, see below). It never reports an
-    ///   iteration complete early, but it reports no per-epoch progress
-    ///   either.
-    /// - A probe **downstream** of a loop (on the loop's output, or anything
-    ///   after it) can report an epoch complete while the loop is still
-    ///   iterating that epoch.
     ///
     /// In a cluster (`spawn_cluster`) and with `SimpleRuntime::spawn_multi`,
     /// each worker builds its own probe, so a probe has a single writer among
@@ -4130,7 +4193,7 @@ impl<T: Timestamp, D: Clone + Send + 'static> Pipe<T, D> {
     /// work is done. A worker completes once its local operators are done,
     /// without waiting until its view reflects every peer's final progress, so
     /// after a successful run the probe usually stays at a stale frontier and
-    /// never becomes done (a probe inside a loop body never does).
+    /// never becomes done.
     /// `RuntimeHandle::spawn_multi` builds the dataflow once: a probe has one
     /// writer per worker that runs the probed operator (with stages of
     /// differing parallelism, the workers of that operator's stage), and it
@@ -4150,7 +4213,10 @@ impl<T: Timestamp, D: Clone + Send + 'static> Pipe<T, D> {
     /// ```
     pub fn probe(self) -> (Self, ProbeHandle<T>) {
         let (registration, probe) = ProbeRegistration::new(self.op_idx, self.output_slot);
-        self.state.borrow_mut().probes.push(registration);
+        self.state
+            .borrow_mut()
+            .probes
+            .push(ErasedProbe::new(registration));
         (self, probe)
     }
 
@@ -4963,7 +5029,10 @@ pub struct LogicalDataflow<T: Timestamp> {
     /// Consumed at spawn time to create pump tasks.
     /// Tuple: (operator_index, wiring_closure).
     pub(crate) async_source_wiring: Vec<(usize, AsyncSourceWiring)>,
-    pub(crate) probes: Vec<ProbeRegistration<T>>,
+    pub(crate) probes: Vec<ErasedProbe>,
+    /// The progress checker's oracle constructor of every nested (loop) scope.
+    #[cfg(any(debug_assertions, feature = "progress-check"))]
+    pub(crate) check_scopes: Vec<(usize, crate::progress::check::ScopeOracleFn)>,
     /// Type-erased exchange factory creators — one per exchange edge.
     /// Consumed by `spawn_multi` to produce shared cross-worker channel factories.
     /// Tuple: (edge_index, capacity, creator_fn).
