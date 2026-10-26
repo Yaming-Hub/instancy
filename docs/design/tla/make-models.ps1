@@ -178,3 +178,63 @@ foreach ($s in $nestScenarios) {
     Set-Content -Path (Join-Path $dir "$($s.n).cfg") -Value $lines -Encoding ascii
 }
 "$($nestScenarios.Count) outer-feedback scenarios written to $dir"
+
+# ---- Cluster transport and teardown (ClusterTransport.tla, O16) ----
+# The PR9 design, and the bounds used unless a scenario overrides them.
+$ctBase = [ordered]@{
+    Conns = '{1}'; Runs = '{1}'; Concurrent = 'FALSE'; Crosswise = 'FALSE'; Reuse = 'FALSE'; Faults = '{}'
+    MaxFaults = '0'; FaultsRun1 = 'FALSE'; MaxStops = '0'; MaxFails = '0'; PerJob = 'TRUE'
+    Pin = 'TRUE'; WriteErrClose = 'TRUE'; Split = 'TRUE'; CleanEof = '"keep"'; Linger = 'TRUE'
+    RunIds = '"pr9"'; RejectCancel = 'FALSE'; Crc = 'TRUE'
+}
+$ctSafety = @('TypeOK', 'NoLossOk', 'NoCrossRun', 'NoCorruptAccepted', 'NoNeedlessDrop', 'NoSpuriousFail')
+$allFaults = '{"reset", "writeerr", "corrupt"}'
+$ctScenarios = @(
+    # ---- PR9: must pass ----
+    @{ n = 'ct_pr9'; e = 'pass'; d = 'PR9, healthy transport, with a requested stop: nothing lost, crossed or dropped, no run fails, nothing hangs.'; o = @{ MaxStops = '1' } }
+    @{ n = 'ct_pr9_faults'; e = 'pass'; d = 'PR9 with one reset, write error or corrupted frame, and a requested stop: never Ok with lost or corrupted data.'; o = @{ Faults = $allFaults; MaxFaults = '1'; MaxStops = '1' } }
+    @{ n = 'ct_pr9_concurrent'; e = 'pass'; d = 'PR9: two dataflows pinned alike to two connections, one fault: it fails only the dataflow using that connection.'; o = @{ Conns = '{1, 2}'; Runs = '{1, 2}'; Concurrent = 'TRUE'; Faults = $allFaults; MaxFaults = '1' }; inv = $ctSafety + 'NoCollateralFail' }
+    @{ n = 'ct_pr9_crosswise'; e = 'pass'; d = 'PR9: two dataflows pinned crosswise (node b registered them in the other order), so each connection carries both; one reset (every fault kind breaks the whole connection), managers kept: a dataflow fails only if it used the faulted connection in either direction.'; o = @{ Conns = '{1, 2}'; Runs = '{1, 2}'; Concurrent = 'TRUE'; Crosswise = 'TRUE'; PerJob = 'FALSE'; Faults = '{"reset"}'; MaxFaults = '1' }; inv = $ctSafety + 'NoCollateralFail' }
+    @{ n = 'ct_pr9_retry'; e = 'pass'; d = 'PR9: run 1 fails on one node, and the retry with a fresh DataflowId succeeds on both, never taking run 1''s late frames.'; o = @{ Runs = '{1, 2}'; PerJob = 'FALSE'; MaxFails = '1' }; inv = $ctSafety + 'FreshRetryOk' }
+    @{ n = 'ct_pr9_reuse'; e = 'pass'; d = 'PR9 with the spawn guard fixed (sends nothing under an id that is another run''s): a retry that reuses the DataflowId is refused on both nodes, and no run takes another run''s frames or fails because of the refusal.'; o = @{ Runs = '{1, 2}'; Reuse = 'TRUE'; PerJob = 'FALSE'; MaxFails = '1' }; inv = @('TypeOK', 'NoLossOk', 'NoCrossRun', 'ReuseRejected', 'NoSpuriousFail') }
+    @{ n = 'live_ct'; e = 'pass'; sym = $false; spec = 'LiveSpec'; prop = @('Termination'); d = 'PR9: with one fault of any kind and a requested stop, every run ends and every connection closes on both nodes.'; o = @{ Faults = $allFaults; MaxFaults = '1'; MaxStops = '1' } }
+    @{ n = 'live_ct_retry'; e = 'pass'; sym = $false; spec = 'LiveSpec'; prop = @('Termination', 'RetryEventuallyOk'); d = 'PR9: a reset during run 1 fails it; once each node noticed the reset, its retry''s registration refills the pool and the retry succeeds on both nodes.'; o = @{ Runs = '{1, 2}'; PerJob = 'FALSE'; Faults = '{"reset"}'; MaxFaults = '1'; FaultsRun1 = 'TRUE' } }
+    @{ n = 'live_ct_lostcancel'; e = 'pass'; sym = $false; spec = 'LiveSpec'; prop = @('Termination'); d = 'PR9: a reset may hit either run, including a retry whose peer has not registered yet, so its Cancel is lost with the connection; the peer''s retry then ends by the handshake timeout, never hangs.'; o = @{ Runs = '{1, 2}'; PerJob = 'FALSE'; Faults = '{"reset"}'; MaxFaults = '1' } }
+    @{ n = 'live_ct_freshretry'; e = 'pass'; sym = $false; spec = 'LiveSpec'; prop = @('Termination', 'RetryEventuallyOk'); d = 'PR9: run 1 may fail on one node; the retry with a fresh DataflowId eventually succeeds on both nodes.'; o = @{ Runs = '{1, 2}'; PerJob = 'FALSE'; MaxFails = '1' } }
+    @{ n = 'live_ct_reuse'; e = 'pass'; sym = $false; spec = 'LiveSpec'; prop = @('Termination', 'ReuseEventuallyRejected'); d = 'PR9 with R53''s rule: a retry that reuses the DataflowId is eventually refused on both nodes, and every run ends.'; o = @{ Runs = '{1, 2}'; Reuse = 'TRUE'; PerJob = 'FALSE'; MaxFails = '1' } }
+
+    # ---- Sanity: each must be violated, which shows the behaviour is reachable ----
+    @{ n = 'ct_reach_stop'; e = 'violated:NeverOkAfterStop'; d = 'A requested stop drains to success on both nodes.'; o = @{ MaxStops = '1' }; inv = $ctSafety + 'NeverOkAfterStop' }
+    @{ n = 'ct_reach_retry'; e = 'violated:NeverRetryOk'; d = 'Run 1 fails, and the retry succeeds on both nodes.'; o = @{ Runs = '{1, 2}'; PerJob = 'FALSE'; MaxFails = '1' }; inv = $ctSafety + 'NeverRetryOk' }
+    @{ n = 'ct_reach_contained'; e = 'violated:NeverContained'; d = 'A fault fails the dataflow on one connection while the other dataflow succeeds on both nodes.'; o = @{ Conns = '{1, 2}'; Runs = '{1, 2}'; Concurrent = 'TRUE'; Faults = '{"reset"}'; MaxFaults = '1' }; inv = $ctSafety + 'NeverContained' }
+
+    # ---- This round's bugs: the fix removed, must fail as named ----
+    @{ n = 'ct_c7'; e = 'violated:NoLossOk'; flags = '-deadlock'; d = 'Audit C7: in the earlier design, frames the bridge accepted while the reset connection was being redialled are dropped without a number; the peer completes without the record.'; o = @{ Pin = 'FALSE'; Faults = '{"reset"}'; MaxFaults = '1' }; inv = @('NoLossOk') }
+    @{ n = 'ct_c7_hang'; e = 'deadlock'; d = 'The earlier design''s other silent failure: frames lost with a redialled connection, with nothing after them to show a gap, leave both runs waiting forever.'; o = @{ Pin = 'FALSE'; Faults = '{"reset"}'; MaxFaults = '1' }; inv = @('NoLossOk') }
+    @{ n = 'ct_old_healthy'; e = 'pass'; d = 'Control: the earlier design with one connection and no fault loses nothing; the reconnect is what loses frames.'; o = @{ Pin = 'FALSE' } }
+    @{ n = 'ct_h7'; e = 'violated:NoSpuriousFail'; d = 'Audit H7: with a healthy transport, the earlier design''s gap timer fails a run whose frames are only reordered across connections.'; o = @{ Pin = 'FALSE'; Conns = '{1, 2}' }; inv = @('NoSpuriousFail') }
+    @{ n = 'ct_writeerr_halfclose'; e = 'deadlock'; d = 'Before 4be0e70: a write error drops only the write half; with split halves the peer sees nothing and its run waits forever. (PerJob off: the deadlock must be a run hang, not the model''s unbounded linger.)'; o = @{ WriteErrClose = 'FALSE'; PerJob = 'FALSE'; Faults = '{"writeerr"}'; MaxFaults = '1' } }
+    @{ n = 'ct_writeerr_halfclose_owned'; e = 'pass'; d = 'Control: the same with owned halves, whose drop sends FIN, ends cleanly. Split halves are what made the bug.'; o = @{ WriteErrClose = 'FALSE'; Split = 'FALSE'; PerJob = 'FALSE'; Faults = '{"writeerr"}'; MaxFaults = '1' } }
+    @{ n = 'ct_cleaneof_fails'; e = 'violated:NoNeedlessDrop'; d = 'Before 3a77274: a peer''s clean close fails the lanes pinned to the connection, so frames are dropped although the peer is still reading.'; o = @{ CleanEof = '"fail"'; MaxStops = '1' }; inv = @('NoNeedlessDrop') }
+    @{ n = 'ct_nolinger'; e = 'violated:NoSpuriousFail'; d = 'A release that closes its sockets at once drops the frames still queued (or resets a connection with unread input), and the peer loses the last frames it needed.'; o = @{ Linger = 'FALSE'; MaxStops = '1' }; inv = @('NoSpuriousFail') }
+    @{ n = 'ct_reuse_old'; e = 'violated:NoCrossRun'; d = 'Before 52314fb: a retry that reuses the DataflowId takes the earlier run''s frames as its own.'; o = @{ Runs = '{1, 2}'; Reuse = 'TRUE'; PerJob = 'FALSE'; MaxFails = '1'; RunIds = '"old"' }; inv = @('NoCrossRun') }
+    @{ n = 'ct_nocrc'; e = 'violated:NoCorruptAccepted'; d = 'Before protocol v6 (Dedicated mode never checksummed frames): a corrupted record is accepted.'; o = @{ Crc = 'FALSE'; Faults = '{"corrupt"}'; MaxFaults = '1' }; inv = @('NoCorruptAccepted') }
+
+    # ---- Open on main (a7c4b1c): must fail as named until fixed ----
+    @{ n = 'ct_reuse_cancel'; e = 'violated:NoSpuriousFail'; d = 'a7c4b1c: a spawn refused for a reused DataflowId broadcasts a failure Cancel under that id; the peer''s run 1, which a finished with, takes it as its own and fails although nothing failed.'; o = @{ Runs = '{1, 2}'; Reuse = 'TRUE'; PerJob = 'FALSE'; RejectCancel = 'TRUE' }; inv = @('NoSpuriousFail') }
+)
+foreach ($s in $ctScenarios) {
+    $c = [ordered]@{}; foreach ($k in $ctBase.Keys) { $c[$k] = $ctBase[$k] }
+    if ($s.o) { foreach ($k in $s.o.Keys) { $c[$k] = $s.o[$k] } }
+    $lines = @('\* MODULE: ClusterTransport', "\* EXPECT: $($s.e)")
+    if ($s.flags) { $lines += "\* TLCFLAGS: $($s.flags)" }
+    $lines += "\* $($s.d)"
+    $lines += 'CONSTANTS'
+    foreach ($k in $c.Keys) { $lines += "    $k = $($c[$k])" }
+    $lines += "SPECIFICATION $(if ($s.spec) { $s.spec } else { 'Spec' })"
+    $inv = if ($s.inv) { $s.inv } else { $ctSafety }
+    $lines += 'INVARIANTS'; foreach ($i in $inv) { $lines += "    $i" }
+    if ($s.prop) { $lines += 'PROPERTIES'; foreach ($p in $s.prop) { $lines += "    $p" } }
+    Set-Content -Path (Join-Path $dir "$($s.n).cfg") -Value $lines -Encoding ascii
+}
+"$($ctScenarios.Count) cluster-transport scenarios written to $dir"

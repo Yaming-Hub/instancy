@@ -91,11 +91,15 @@ Rev `0286a9d` is the revision under review. It has since been rebased onto `e7ac
 16. **Step 3 merged** (#298, `bad90a1`; decision log R50–R51).
     - **Stopped-peer grace** (R50): a draining worker fails under R48 only after its view has stayed unchanged for `stopped_peer_grace` (500 ms), because a stopped peer's records and progress can arrive after its stop announcement. It can turn a drain into a failure, never into a false success.
     - **Final design-fidelity review** (R51) passed with no blockers. It added the abandon wire marker (§5.5), `ExecutorConfig` leaving the public API (§5.6), and the note on `J`'s summaries (§5.1.3).
+17. **PR9 merged** (#300, `65912c4`; decision log R52–R53, O16).
+    - **Pinned lanes keep the v5 ordering** (R52). PR9 pins each (dataflow, peer) lane to one pooled connection and makes a sequence gap fatal, so a lane is the connection's FIFO. Protocol v6 (§5.5).
+    - **A model of the cluster transport**, [`tla/ClusterTransport.tla`](./tla/ClusterTransport.tla) (O16, §5.8). PR9 passes. Mutations reproduce this round's transport bugs.
+    - **The model found R53:** a spawn refused for a reused `DataflowId` broadcasts `Cancel` under that id and can fail the run that owns it. A standalone fix follows.
 
 ---
 
-**Status:** design approved and implemented. Step 1 (#293) is merged as `ba1bd37`, step 2 (#295) as `6cb3ced`, and step 3 (#298) as `bad90a1`. PR9 (shared-transport reliability) comes next; step 4 (downstream projects) follows it, and step 5 (confidence against the latest timely, decision log O14) after that (§5.7). Targeted experiments ran on a local branch, `exp-pcp-verify`, last re-run on `e7ac01e`; §5.9 lists what they verified.
-**Date:** 2026-10-25 (first written 2026-10-20). **instancy base:** `main` @ `bad90a1`, which includes #285–#298. Line citations elsewhere in this doc were last checked on `e7ac01e`; §5.1.8 is checked on `ba1bd37`. The step-3 brief carries citations checked on `6cb3ced`; the code after step 3 is described in `progress-tracking.md`.
+**Status:** design approved and implemented. Step 1 (#293) is merged as `ba1bd37`, step 2 (#295) as `6cb3ced`, step 3 (#298) as `bad90a1`, and PR9 (#300, shared-transport reliability) as `65912c4`. Next come the progress trace recorder and R53's fix; step 4 (downstream projects) follows, and step 5 (confidence against the latest timely, decision log O14) after that (§5.7). Targeted experiments ran on a local branch, `exp-pcp-verify`, last re-run on `e7ac01e`; §5.9 lists what they verified.
+**Date:** 2026-10-26 (first written 2026-10-20). **instancy base:** `main` @ `a7c4b1c`, which includes #285–#300. Line citations elsewhere in this doc were last checked on `e7ac01e`; §5.1.8 is checked on `ba1bd37`. The step-3 brief carries citations checked on `6cb3ced`; the code after step 3 is described in `progress-tracking.md`.
 **timely reference:** `TimelyDataflow/timely-dataflow` `master` @ `3012f8f` (2026-10-16). The latest release is **timely v0.31.0** (2026-07-14). instancy's `timely` 0.12 dev-dependency (2021) is used only to say what changed.
 **Scope:** audit root causes 1, 2 and 4 (fragile counting, opt-in accounting, duplicated paths), and how a new design interacts with root cause 3 (PR7 #291, merged, and PR8 #292). The bug tracker's PR4, PR5, PR6 and PR12 are replaced by the four steps in §5.7.
 
@@ -775,6 +779,7 @@ PCP changes the protocol twice, each time with one version bump. `ba1bd37` is st
   - the seal marker, as a third reserved count, `u32::MAX − 2`, with the encoder cap lowered below it;
   - an abandon marker, `u32::MAX − 3`, sent in order behind a worker's last batch when it stops without sealing (a failure, R34, or a stop mid-drain). It only marks the lane as stopped unsealed, which feeds R48's fail-fast, so it can cause a failure but never a success (R51);
   - scope ids on progress entries (§5.1.7).
+- **PR9, v6** (#300, R52). Each (dataflow, peer) lane is pinned to one pooled connection, a sequence gap or duplicate is fatal, and frame checksums are always on. No progress frame changes. A lane is now the connection's FIFO, so seals stay behind a worker's last batch and ahead of end-of-stream. `Cancel` stays on the priority path and is never end-of-stream.
 - Positives-first ordering needed no bump, and PR8 already ships it.
 
 **Ordering on `e7ac01e`.**
@@ -975,6 +980,8 @@ This tests the protocol and PCP's claimed refinement (§2.5), not just examples.
 - commits split across both levels.
 
 [`tla/NestedScopes.tla`](./tla/NestedScopes.tla) puts one loop on another's feedback path, three levels deep, and caches imports and exports between applies, recomputing them in one pass per apply as step 3 implements them. Its mutation exports the imported frontier.
+
+[`tla/ClusterTransport.tla`](./tla/ClusterTransport.tla) (O16) models what the progress models abstract as one FIFO lane per sender: PR9's pooled connections with pinned, numbered lanes, each connection direction with FIN and resets, faults, clean closes, linger, `Cancel` and `DataflowId` reuse, under a simplified teardown. PR9 passes, mutations reproduce this round's transport bugs, and the model found R53.
 
 Switches select PCP, today's rules, or PCP with one rule removed. Each scenario in [`tla/make-models.ps1`](./tla/make-models.ps1) declares its exact expected result, and [`tla/run.ps1`](./tla/run.ps1) checks it. Results and limits are in §5.9 and the [model README](./tla/README.md).
 
